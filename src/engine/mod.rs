@@ -1,10 +1,13 @@
 pub mod capabilities;
 pub mod decide_actions;
 pub mod execute_actions;
+pub mod io_profiler;
 pub mod journal;
 pub mod llm;
+pub mod memory_analyzer;
 pub mod profile_governor;
 pub mod protocol;
 pub mod safety;
+pub mod thermal_manager;
 pub mod types;
 pub mod usage_model;

@@ -198,11 +198,21 @@ impl UsageModel {
         entries.retain(|e| !protected.iter().any(|p| e.name.contains(p)));
 
         let mut interactive = entries.clone();
-        interactive.sort_by(|a, b| b.usage_score.partial_cmp(&a.usage_score).unwrap());
+        // BUG 20 fix: unwrap on partial_cmp could panic if NaN. Use unwrap_or(Equal).
+        interactive.sort_by(|a, b| {
+            b.usage_score
+                .partial_cmp(&a.usage_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         interactive.truncate(limit);
 
         let mut noise = entries;
-        noise.sort_by(|a, b| b.noise_score.partial_cmp(&a.noise_score).unwrap());
+        // BUG 21 fix: same as BUG 20 for noise_score.
+        noise.sort_by(|a, b| {
+            b.noise_score
+                .partial_cmp(&a.noise_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         noise.retain(|n| !interactive.iter().any(|i| i.name == n.name));
         noise.truncate(limit);
 
@@ -255,7 +265,12 @@ impl UsageModel {
 
         // Interactive promotions.
         let mut interactive = candidates.clone();
-        interactive.sort_by(|a, b| b.usage_score.partial_cmp(&a.usage_score).unwrap());
+        // BUG 22 fix: unwrap on partial_cmp could panic if NaN.
+        interactive.sort_by(|a, b| {
+            b.usage_score
+                .partial_cmp(&a.usage_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for e in interactive {
             if promotions.len() as u32 >= cap - daily_promotions_used {
                 break;
@@ -277,7 +292,12 @@ impl UsageModel {
 
         // Noise promotions.
         let mut noise = candidates;
-        noise.sort_by(|a, b| b.noise_score.partial_cmp(&a.noise_score).unwrap());
+        // BUG 23 fix: unwrap on partial_cmp could panic if NaN.
+        noise.sort_by(|a, b| {
+            b.noise_score
+                .partial_cmp(&a.noise_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for e in noise {
             if promotions.len() as u32 >= cap - daily_promotions_used {
                 break;
