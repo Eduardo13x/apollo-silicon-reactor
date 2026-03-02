@@ -96,8 +96,9 @@ impl ThermalManager {
         for i in 1..recent.len() {
             let older = recent[i];
             let newer = recent[i - 1];
-            let temp_older = (older.cpu_temp + older.gpu_temp) / 2.0;
-            let temp_newer = (newer.cpu_temp + newer.gpu_temp) / 2.0;
+            // Use all three temp sensors for accurate trend (CPU, GPU, Memory)
+            let temp_older = (older.cpu_temp + older.gpu_temp + older.mem_temp) / 3.0;
+            let temp_newer = (newer.cpu_temp + newer.gpu_temp + newer.mem_temp) / 3.0;
             deltas.push(temp_newer - temp_older);
         }
 
@@ -123,7 +124,7 @@ impl ThermalManager {
         }
 
         let last = &self.history[self.history.len() - 1];
-        let avg_temp = (last.cpu_temp + last.gpu_temp) / 2.0;
+        let avg_temp = (last.cpu_temp + last.gpu_temp + last.mem_temp) / 3.0;
 
         let base_throttle = if avg_temp > self.shutdown_threshold {
             100
@@ -134,7 +135,7 @@ impl ThermalManager {
             0
         };
 
-        // Adjust based on trend
+        // Adjust based on trend and current throttle level
         let trend_adjustment = match self.calculate_trend() {
             ThermalTrend::Cooling => -5,
             ThermalTrend::Stable => 0,
@@ -142,7 +143,10 @@ impl ThermalManager {
             ThermalTrend::Critical => 20,
         };
 
-        ((base_throttle as i16 + trend_adjustment).max(0) as u8).min(100)
+        // Blend with actual current throttle level for smoother prediction
+        let predicted = ((base_throttle as i16 + trend_adjustment).max(0) as u8).min(100);
+        let smoothed = ((predicted as i16 + last.throttle_level as i16) / 2) as u8;
+        smoothed
     }
 
     fn time_to_throttle(&self, current_temp: f32) -> i32 {
