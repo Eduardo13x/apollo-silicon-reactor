@@ -144,8 +144,7 @@ impl UsageModel {
 
             let dt = entry
                 .last_seen_at
-                .map(|t| (now - t).to_std().ok())
-                .flatten()
+                .and_then(|t| (now - t).to_std().ok())
                 .unwrap_or_default();
             let decay_presence = decay_factor(dt.as_secs_f64(), PRESENCE_HALF_LIFE_DAYS);
             let decay_jank = decay_factor(dt.as_secs_f64(), JANK_HALF_LIFE_DAYS);

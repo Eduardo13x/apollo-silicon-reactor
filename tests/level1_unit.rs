@@ -59,7 +59,7 @@ fn tick_rate_gt_15_maps_to_300s() {
 #[test]
 fn tick_rate_eq_15_does_not_map_to_300s() {
     // Exactly 15 must NOT trigger the 300s sleep branch.
-    assert!(!(15u64 > 15), "pro-mode tick (15s) must NOT sleep 300s");
+    assert_eq!(15u64.cmp(&15), std::cmp::Ordering::Equal, "pro-mode tick must be exactly 15");
 }
 
 // ── SafetyPolicy invariants ───────────────────────────────────────────────────

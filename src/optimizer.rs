@@ -18,6 +18,7 @@ pub struct HeuristicEngine {
     noise_patterns: Vec<String>,
 }
 
+#[allow(clippy::new_without_default)]
 impl HeuristicEngine {
     pub fn new() -> Self {
         Self {
@@ -122,6 +123,7 @@ fn safe_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+#[allow(clippy::new_without_default)]
 impl OptimizerEngine {
     pub fn new() -> Self {
         let mut system_critical = HashSet::new();
@@ -713,7 +715,7 @@ impl OptimizerEngine {
             for proc in &snapshot.top_processes {
                 process_traces
                     .entry(proc.name.clone())
-                    .or_insert(vec![])
+                    .or_default()
                     .push(proc.memory_usage);
             }
         }
@@ -824,7 +826,7 @@ impl OptimizerEngine {
         println!("Configuring Smart Startup...");
         // Disable "Reopen windows when logging back in"
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "com.apple.loginwindow",
                 "TALLogoutSavesState",
@@ -833,7 +835,7 @@ impl OptimizerEngine {
             ])
             .output();
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "com.apple.loginwindow",
                 "LoginwindowLaunchesRelaunchApps",
@@ -849,7 +851,7 @@ impl OptimizerEngine {
         // 1. Disable Animations (Speed up UI)
         println!("Disabling UI animations...");
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "NSGlobalDomain",
                 "NSAutomaticWindowAnimationsEnabled",
@@ -858,7 +860,7 @@ impl OptimizerEngine {
             ])
             .output();
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "NSGlobalDomain",
                 "NSWindowResizeTime",
@@ -867,7 +869,7 @@ impl OptimizerEngine {
             ])
             .output();
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "com.apple.finder",
                 "DisableAllAnimations",
@@ -876,10 +878,10 @@ impl OptimizerEngine {
             ])
             .output();
         let _ = Command::new("defaults")
-            .args(&["write", "com.apple.dock", "launchanim", "-bool", "false"])
+            .args(["write", "com.apple.dock", "launchanim", "-bool", "false"])
             .output();
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "com.apple.dock",
                 "expose-animation-duration",
@@ -891,7 +893,7 @@ impl OptimizerEngine {
         // Fix for WindowServer "Bad Coding" - Disable Window Shadows (Performance Workaround)
         println!("Applying WindowServer performance workaround (Disable shadows)...");
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "com.apple.WindowManager",
                 "AppWindowShadows",
@@ -906,7 +908,7 @@ impl OptimizerEngine {
 
         // 3. Disable Dashboard / Widgets (Save RAM)
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "com.apple.dashboard",
                 "mcx-disabled",
@@ -956,17 +958,17 @@ impl OptimizerEngine {
 
                 // Max Performance Core preference
                 let _ = Command::new("taskpolicy")
-                    .args(&["-d", "-p", &pid_u32.to_string()])
+                    .args(["-d", "-p", &pid_u32.to_string()])
                     .output();
 
                 // Priority Tier 1 (Highest)
                 let _ = Command::new("taskpolicy")
-                    .args(&["-t", "1", "-p", &pid_u32.to_string()])
+                    .args(["-t", "1", "-p", &pid_u32.to_string()])
                     .output();
 
                 // Max renice (requires root for negative, but we set to 0)
                 let _ = Command::new("renice")
-                    .args(&["-5", "-p", &pid_u32.to_string()]) // Trying -5 for LLM apps (might fail if not root)
+                    .args(["-5", "-p", &pid_u32.to_string()]) // Trying -5 for LLM apps (might fail if not root)
                     .output();
             }
         }
@@ -1028,7 +1030,7 @@ impl OptimizerEngine {
 
         // 1. Disable Apple Intelligence Reporting (Background Agent)
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "com.apple.Siri",
                 "AppleIntelligenceReportEnabled",
@@ -1081,7 +1083,7 @@ impl OptimizerEngine {
 
         for daemon in daemons {
             println!("{} device service: {}", action, daemon);
-            let _ = Command::new("killall").args(&[signal, daemon]).output();
+            let _ = Command::new("killall").args([signal, daemon]).output();
         }
     }
 
@@ -1096,7 +1098,7 @@ impl OptimizerEngine {
 
         // Disable Window Shadows when eco mode is active (huge GPU savings on M1).
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "com.apple.WindowManager",
                 "AppWindowShadows",
@@ -1107,7 +1109,7 @@ impl OptimizerEngine {
 
         // Reduce Transparency
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "com.apple.universalaccess",
                 "reduceTransparency",
@@ -1118,7 +1120,7 @@ impl OptimizerEngine {
 
         // Reduce Motion
         let _ = Command::new("defaults")
-            .args(&[
+            .args([
                 "write",
                 "com.apple.universalaccess",
                 "reduceMotion",
@@ -1235,10 +1237,10 @@ impl OptimizerEngine {
 
             // For Mach-level tiers on other PIDs we use the CLI.
             let _ = Command::new("taskpolicy")
-                .args(&["-l", "0", "-p", &pid.to_string()])
+                .args(["-l", "0", "-p", &pid.to_string()])
                 .output();
             let _ = Command::new("taskpolicy")
-                .args(&["-t", "0", "-p", &pid.to_string()])
+                .args(["-t", "0", "-p", &pid.to_string()])
                 .output();
         }
     }
@@ -1253,12 +1255,12 @@ impl OptimizerEngine {
             // 2. Background QoS & I/O Throttling (forces E-Cores)
             // Using CLI for Mach-level QoS on other PIDs.
             let _ = Command::new("taskpolicy")
-                .args(&["-b", "-p", &pid.to_string()])
+                .args(["-b", "-p", &pid.to_string()])
                 .output();
 
             let tier = if aggressive { "4" } else { "2" };
             let _ = Command::new("taskpolicy")
-                .args(&["-l", tier, "-p", &pid.to_string()])
+                .args(["-l", tier, "-p", &pid.to_string()])
                 .output();
         }
     }
@@ -1336,6 +1338,7 @@ impl OptimizerEngine {
     }
 }
 
+#[allow(clashing_extern_declarations)]
 extern "C" {
     fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
     fn task_policy_set(task: u32, flavor: u32, policy_info: *mut i32, count: u32) -> i32;

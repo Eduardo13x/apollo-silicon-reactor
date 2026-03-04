@@ -71,6 +71,7 @@ pub struct SystemCollector {
     prev_swap_at: Option<Instant>,
 }
 
+#[allow(clippy::new_without_default, dead_code)]
 impl SystemCollector {
     pub fn new() -> Self {
         let mut sys = System::new_all();
@@ -84,6 +85,10 @@ impl SystemCollector {
             prev_swap_used_bytes: None,
             prev_swap_at: None,
         }
+    }
+
+    pub fn system(&self) -> &System {
+        &self.sys
     }
 
     pub fn collect_snapshot(&mut self) -> SystemSnapshot {

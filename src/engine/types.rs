@@ -248,6 +248,29 @@ pub struct RuntimeMetrics {
     pub dev_session_active: bool,
     pub interactive_heavy: bool,
     pub profile_floor_hits: u64,
+    // Heuristic module metrics
+    pub heuristic_decisions: u64,
+    pub heuristic_throttles: u64,
+    pub heuristic_freezes: u64,
+    pub heuristic_kills_downgraded: u64,
+    pub zombies_detected: u64,
+    #[serde(default)]
+    pub kills_applied: u64,
+    #[serde(default)]
+    pub survival_mode_activations: u64,
+    pub qos_foreground_count: u64,
+    pub qos_background_count: u64,
+    pub qos_errors: u64,
+    pub iokit_snapshots: u64,
+    pub iokit_errors: u64,
+    pub iokit_p_cluster_temp: Option<f32>,
+    pub iokit_e_cluster_temp: Option<f32>,
+    pub iokit_package_watts: Option<f32>,
+    pub current_workload: String,
+    #[serde(default)]
+    pub ml_confidence: f32, // 0.0–1.0; 0.0 until first classification
+    #[serde(default)]
+    pub ml_sources: Vec<String>, // evidence sources from last ML classification
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

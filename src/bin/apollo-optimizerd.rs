@@ -30,10 +30,26 @@ use apollo_optimizer::engine::types::{
     LlmStatus, OptimizationProfile, ProfileTransition, RootAction, RuntimeMetrics, SafetyPolicy,
     UsageResponse,
 };
+use apollo_optimizer::engine::adaptive_governor::{AdaptiveGovernor, GovernerDecision, ProcessDecision};
+use apollo_optimizer::engine::user_profile::{UserProfile, UserProfilePersisted};
+use apollo_optimizer::engine::iokit_sensors::{HardwareSnapshot, IOKitSensorReader};
+use apollo_optimizer::engine::mach_qos::{MachQoSManager, SchedulingTier};
+use apollo_optimizer::engine::process_classifier::{ProcessSnapshot, ProcessTier};
 use apollo_optimizer::engine::usage_model::{usage_model_path_root, UsageModel};
+use apollo_optimizer::engine::zombie_hunter::HuntSnapshot;
 use chrono::{DateTime, Duration as ChronoDuration, Local, Timelike, Utc};
+use sysinfo::ProcessStatus;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use apollo_optimizer::engine::analytics::AnalyticsEngine;
+use apollo_optimizer::engine::gpu_manager::GPUManager;
+use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
+use apollo_optimizer::engine::network_optimizer::NetworkOptimizer;
+use apollo_optimizer::engine::power_management::PowerManager;
+use apollo_optimizer::engine::process_recovery::ProcessRecoveryManager;
+use apollo_optimizer::engine::swap_predictor::SwapPredictor;
+use apollo_optimizer::engine::thermal_manager::ThermalManager;
+use apollo_optimizer::engine::wake_storm_detector::WakeStormDetector;
 
 const FREEZE_TTL_SECS: i64 = 10 * 60;
 const REACTOR_FAST_TICK_SECS: u64 = 30;
@@ -161,6 +177,17 @@ struct SharedState {
     usage_last_persist_at: Arc<Mutex<Option<DateTime<Utc>>>>,
     usage_promotions_day: Arc<Mutex<Option<String>>>,
     usage_promotions_today: Arc<Mutex<u32>>,
+
+    // Heuristic modules
+    adaptive_governor: Arc<Mutex<AdaptiveGovernor>>,
+    mach_qos: Arc<Mutex<MachQoSManager>>,
+    iokit_reader: Arc<IOKitSensorReader>,
+    last_hw_snapshot: Arc<Mutex<Option<HardwareSnapshot>>>,
+    iokit_cycle_counter: Arc<Mutex<u32>>,
+
+    // ML Ligero
+    discrepancy_log_path: PathBuf,
+    user_profile_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1080,6 +1107,14 @@ fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonResponse {
                 }
             }
         }
+        DaemonRequest::GetLearnedPolicy => {
+            let policy = state
+                .learned_policy
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            DaemonResponse::LearnedPolicy(policy)
+        }
         DaemonRequest::Feedback { rating, note } => {
             let entry = FeedbackEntry {
                 at: Utc::now(),
@@ -1220,7 +1255,7 @@ fn llm_reactive_tick(
     let today = now_local.date_naive().to_string();
     let quiet_hours = {
         let h = now_local.hour();
-        h >= 1 && h < 8
+        (1..8).contains(&h)
     };
 
     let (mode, daily_budget, min_interval_secs, max_calls_per_hour, pattern_budget_per_day) = {
@@ -1568,6 +1603,11 @@ fn llm_reactive_tick(
                     policy.learned_at = Some(now);
                     write_json(&state.learned_policy_path, &*policy, Some(0o600));
                     llm_state.policy_updates_today += added;
+                    // Propagate updated patterns to the ML Ligero classifier.
+                    {
+                        let mut gov = state.adaptive_governor.lock().unwrap_or_else(|e| e.into_inner());
+                        gov.update_learned_policy(&policy);
+                    }
                 }
                 write_json(&state.llm_state_path, &*llm_state, Some(0o600));
             }
@@ -1736,6 +1776,11 @@ fn usage_learning_tick(
             policy.protected_patterns.sort();
             policy.learned_at = Some(now);
             write_json(&state.learned_policy_path, &*policy, Some(0o600));
+            // Propagate updated patterns to the ML Ligero classifier.
+            {
+                let mut gov = state.adaptive_governor.lock().unwrap_or_else(|e| e.into_inner());
+                gov.update_learned_policy(&policy);
+            }
         }
     }
 
@@ -1860,6 +1905,207 @@ fn context_to_thermal(context: InteractiveContext) -> String {
     }
 }
 
+fn get_foreground_app_inner() -> Option<String> {
+    // lsappinfo works as root and doesn't require a GUI session token.
+    // Output format varies by session context:
+    //   user session:  "AppName" ASN:0x0-0x2c02c: ...
+    //   root session:  ASN:0x0-0x46046: "AppName" ...
+    // Extract the first double-quoted string to handle both formats.
+    let output = std::process::Command::new("lsappinfo")
+        .arg("front")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let name = text.split('"').nth(1)?.trim().to_string();
+    if name.is_empty() || name.starts_with("ASN:") {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn get_foreground_app() -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(get_foreground_app_inner());
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(100))
+        .ok()
+        .flatten()
+}
+
+fn append_discrepancy_log(
+    path: &std::path::Path,
+    protected_app: &str,
+    actions_removed: usize,
+    workload: &str,
+    confidence: f32,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut f = std::fs::OpenOptions::new().append(true).create(true).open(path)?;
+    let entry = serde_json::json!({
+        "at": chrono::Utc::now().to_rfc3339(),
+        "event": "safety_precedence_override",
+        "protected_app": protected_app,
+        "actions_removed": actions_removed,
+        "ml_workload": workload,
+        "ml_confidence": confidence,
+    });
+    writeln!(f, "{}", entry)
+}
+
+fn build_enriched_process_data(
+    sys: &sysinfo::System,
+    foreground_app: Option<&str>,
+) -> (Vec<ProcessSnapshot>, Vec<HuntSnapshot>) {
+    let mut proc_snaps = Vec::new();
+    let mut hunt_snaps = Vec::new();
+
+    for (pid, process) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        let name = process.name().to_string();
+        let is_foreground = foreground_app
+            .map(|fg| name.contains(fg) || fg.contains(&name))
+            .unwrap_or(false);
+        // On UNIX, the kernel automatically re-parents orphaned processes to PID 1 (launchd).
+        // So any process with ppid > 0 has a living parent — we must NOT rely on sysinfo
+        // to enumerate the parent, because sysinfo misses many privileged system processes.
+        let ppid = process.parent().map(|p| p.as_u32()).unwrap_or(0);
+        let parent_alive = ppid > 0;
+        let is_zombie = process.status() == ProcessStatus::Zombie;
+        let rss = process.memory();
+        let cpu = process.cpu_usage();
+
+        proc_snaps.push(ProcessSnapshot {
+            pid: pid_u32,
+            name: name.clone(),
+            cpu_percent: cpu,
+            rss_bytes: rss,
+            is_zombie,
+            secs_since_foreground: if is_foreground { 0 } else { 3600 },
+            secs_since_user_interaction: if is_foreground { 0 } else { 3600 },
+            has_network: false,
+            has_gui_window: is_foreground,
+            wakeups_per_sec: 0.0,
+            parent_alive,
+        });
+
+        hunt_snaps.push(HuntSnapshot {
+            pid: pid_u32,
+            ppid: process.parent().map(|p| p.as_u32()).unwrap_or(0),
+            name,
+            is_kernel_zombie: is_zombie,
+            parent_alive,
+            has_gui_window: is_foreground,
+            rss_bytes: rss,
+            cpu_percent: cpu,
+            wakeups_per_sec: 0.0,
+            secs_since_user_interaction: if is_foreground { 0 } else { 3600 },
+            host_app_pid: process.parent().map(|p| p.as_u32()),
+            host_app_running: parent_alive,
+            host_app_absent_secs: if parent_alive { 0 } else { 3600 },
+        });
+    }
+
+    (proc_snaps, hunt_snaps)
+}
+
+struct HeuristicStats {
+    decisions_total: u64,
+    throttles: u64,
+    freezes: u64,
+    kills_downgraded: u64,
+    zombies_detected: u64,
+}
+
+fn convert_and_merge_heuristic_decisions(
+    decisions: &[ProcessDecision],
+    existing_actions: &[RootAction],
+    critical_pids: &HashSet<u32>,
+) -> (Vec<RootAction>, HeuristicStats) {
+    let mut stats = HeuristicStats {
+        decisions_total: decisions.len() as u64,
+        throttles: 0,
+        freezes: 0,
+        kills_downgraded: 0,
+        zombies_detected: 0,
+    };
+
+    // Build set of PIDs already acted on by decide_actions + learned_policy
+    let existing_pids: HashSet<u32> = existing_actions
+        .iter()
+        .filter_map(|a| match a {
+            RootAction::BoostProcess { pid, .. }
+            | RootAction::ThrottleProcess { pid, .. }
+            | RootAction::FreezeProcess { pid, .. } => Some(*pid),
+            _ => None,
+        })
+        .collect();
+
+    let mut new_actions = Vec::new();
+
+    for decision in decisions {
+        // Count zombies
+        if decision.tier == ProcessTier::ZombieOrphan {
+            stats.zombies_detected += 1;
+        }
+
+        // Skip if Allow
+        if decision.decision == GovernerDecision::Allow {
+            continue;
+        }
+
+        // Skip if already has an action from decide_actions/learned_policy
+        if existing_pids.contains(&decision.pid) {
+            continue;
+        }
+
+        // Skip critical processes
+        if critical_pids.contains(&decision.pid) {
+            continue;
+        }
+
+        match decision.decision {
+            GovernerDecision::Throttle => {
+                new_actions.push(RootAction::ThrottleProcess {
+                    pid: decision.pid,
+                    name: decision.name.clone(),
+                    aggressive: false,
+                    reason: format!("heuristic: {}", decision.reason),
+                });
+                stats.throttles += 1;
+            }
+            GovernerDecision::Freeze => {
+                new_actions.push(RootAction::FreezeProcess {
+                    pid: decision.pid,
+                    name: decision.name.clone(),
+                    reason: format!("heuristic: {}", decision.reason),
+                });
+                stats.freezes += 1;
+            }
+            GovernerDecision::Kill => {
+                // Safety: downgrade Kill to Freeze — never auto-kill from heuristics
+                new_actions.push(RootAction::FreezeProcess {
+                    pid: decision.pid,
+                    name: decision.name.clone(),
+                    reason: format!("heuristic (kill→freeze): {}", decision.reason),
+                });
+                stats.kills_downgraded += 1;
+                stats.freezes += 1;
+            }
+            GovernerDecision::Allow => unreachable!(),
+        }
+    }
+
+    (new_actions, stats)
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -1913,6 +2159,7 @@ fn main() -> anyhow::Result<()> {
                     throttle_level: "balanced".to_string(),
                     thermal_state: "nominal".to_string(),
                     thermal_level: "unknown".to_string(),
+                    current_workload: "idle".to_string(),
                     ..RuntimeMetrics::default()
                 })),
                 frozen: Arc::new(Mutex::new(HashSet::new())),
@@ -1954,7 +2201,37 @@ fn main() -> anyhow::Result<()> {
                 usage_last_persist_at: Arc::new(Mutex::new(None)),
                 usage_promotions_day: Arc::new(Mutex::new(None)),
                 usage_promotions_today: Arc::new(Mutex::new(0)),
+
+                adaptive_governor: Arc::new(Mutex::new(AdaptiveGovernor::new())),
+                mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
+                iokit_reader: Arc::new(IOKitSensorReader::new()),
+                last_hw_snapshot: Arc::new(Mutex::new(None)),
+                iokit_cycle_counter: Arc::new(Mutex::new(0)),
+
+                discrepancy_log_path: if is_root {
+                    PathBuf::from("/var/lib/apollo/discrepancy.jsonl")
+                } else {
+                    PathBuf::from("/tmp/apollo-discrepancy.jsonl")
+                },
+                user_profile_path: if is_root {
+                    PathBuf::from("/var/lib/apollo/user_profile.json")
+                } else {
+                    PathBuf::from("/tmp/apollo-user_profile.json")
+                },
             };
+
+            // Load persisted UserProfile (learning survives daemon restarts).
+            if let Some(persisted) = read_json::<UserProfilePersisted>(&state.user_profile_path) {
+                let mut gov = state.adaptive_governor.lock().unwrap_or_else(|e| e.into_inner());
+                gov.user_profile = UserProfile::from_persisted(persisted);
+            }
+
+            // Initialize ML Ligero classifier with the already-loaded LearnedPolicy.
+            {
+                let policy = state.learned_policy.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let mut gov = state.adaptive_governor.lock().unwrap_or_else(|e| e.into_inner());
+                gov.update_learned_policy(&policy);
+            }
 
             let reactor_state = state.clone();
             thread::spawn(move || {
@@ -1995,6 +2272,21 @@ fn main() -> anyhow::Result<()> {
             let mut override_was_active = false;
             let daemon_start = Instant::now();
             let mut llm_advisor = LlmAdvisor::new(state.llm_cfg.as_ref().clone());
+
+            // Secondary optimization modules — all run each cycle without locks.
+            let mut analytics = AnalyticsEngine::new();
+            let gpu_mgr = GPUManager::new();
+            let mut mem_analyzer = MemoryAnalyzer::new();
+            let net_optimizer = NetworkOptimizer::new();
+            let power_mgr = PowerManager::new();
+            let mut proc_recovery = ProcessRecoveryManager::new();
+            let mut swap_predictor = SwapPredictor::new();
+            let mut thermal_mgr = ThermalManager::new();
+            let mut wake_storm = WakeStormDetector::new();
+            // Freeze confirmation cache: pid → consecutive cycles flagged.
+            // Only freeze processes that have been candidates for 2+ cycles,
+            // filtering out short-lived transients that die before execute_actions.
+            let mut freeze_candidates: HashMap<u32, u8> = HashMap::new();
 
             loop {
                 if state.stop.load(Ordering::SeqCst) {
@@ -2071,6 +2363,104 @@ fn main() -> anyhow::Result<()> {
                     .latency_target
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+
+                // Heuristic: collect foreground app and build enriched process data
+                let foreground_app = get_foreground_app();
+                let (proc_snaps, hunt_snaps) = build_enriched_process_data(
+                    collector.system(),
+                    foreground_app.as_deref(),
+                );
+                let all_proc_names: Vec<&str> = proc_snaps.iter().map(|p| p.name.as_str()).collect();
+                let hour_of_day = Utc::now().hour() as u8;
+
+                // MemoryAnalyzer: profile top-50 processes for memory leaks each cycle.
+                for snap in proc_snaps.iter().take(50) {
+                    let profile = mem_analyzer.analyze_process(
+                        snap.pid,
+                        &snap.name,
+                        snap.rss_bytes,
+                        snap.rss_bytes, // vms not tracked at this level; use rss as proxy
+                        0,              // page_faults not available from sysinfo
+                    );
+                    if profile.memory_leak_probability >= 0.75 {
+                        proc_recovery.register_leak(
+                            snap.pid,
+                            snap.name.clone(),
+                            profile.memory_leak_probability,
+                            snap.rss_bytes,
+                        );
+                    }
+                }
+                proc_recovery.cleanup_resolved();
+
+                // WakeStormDetector: record wakeups for any process reporting elevated rates.
+                for snap in proc_snaps.iter().take(50) {
+                    if snap.wakeups_per_sec > 10.0 {
+                        wake_storm.record_wakeup(snap.pid, snap.name.clone());
+                    }
+                }
+                wake_storm.cleanup_stale(Duration::from_secs(300));
+
+                // Heuristic: IOKit tick every 5th cycle
+                {
+                    let mut iokit_counter = state.iokit_cycle_counter.lock().unwrap_or_else(|e| e.into_inner());
+                    *iokit_counter += 1;
+                    if *iokit_counter >= 5 {
+                        *iokit_counter = 0;
+                        drop(iokit_counter);
+                        match state.iokit_reader.snapshot() {
+                            Ok(hw) => {
+                                if let Ok(mut m) = state.metrics.lock() {
+                                    m.iokit_snapshots += 1;
+                                    m.iokit_p_cluster_temp = hw.temps.p_cluster_celsius;
+                                    m.iokit_e_cluster_temp = hw.temps.e_cluster_celsius;
+                                    m.iokit_package_watts = hw.power.package_watts;
+                                }
+                                *state.last_hw_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hw);
+                            }
+                            Err(_) => {
+                                if let Ok(mut m) = state.metrics.lock() {
+                                    m.iokit_errors += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // F4: Thermal master switch — computed once after IOKit data is fresh.
+                let thermal_emergency = state
+                    .last_hw_snapshot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|h| h.temps.p_cluster_celsius)
+                    .map(|t| t > 95.0)
+                    .unwrap_or(false);
+
+                // ThermalManager + GPUManager: tick every cycle with latest IOKit temperatures.
+                {
+                    let hw_snap = state
+                        .last_hw_snapshot
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    if let Some(hw) = &hw_snap {
+                        let cpu_t = hw.temps.p_cluster_celsius.unwrap_or(0.0);
+                        let gpu_t = hw.temps.e_cluster_celsius.unwrap_or(cpu_t);
+                        let _thermal_state = thermal_mgr.update(cpu_t, gpu_t, 0.0, 0);
+                        let _gpu_power = gpu_mgr.recommend_power_state(0.0, cpu_t);
+                    }
+                }
+
+                // SwapPredictor: update trend forecast every cycle.
+                let _swap_forecast = swap_predictor.update(
+                    snapshot.pressure.swap_used_bytes,
+                    snapshot.pressure.swap_total_bytes,
+                );
+
+                // NetworkOptimizer + PowerManager: advisory tick (no real sensor data yet).
+                let _net_profile = net_optimizer.recommend_profile();
+                let _power_rec = power_mgr.get_recommendation();
 
                 // Online usage learning (root-only, no UI sensors): infer frequently-used apps
                 // and processes correlated with jank, then promote patterns conservatively.
@@ -2189,7 +2579,7 @@ fn main() -> anyhow::Result<()> {
                 drop(governor);
 
                 let decision =
-                    decide_actions(&snapshot, current_profile, latency_target, *reactor_weight);
+                    decide_actions(&snapshot, collector.system(), current_profile, latency_target, *reactor_weight);
                 *state
                     .last_blockers
                     .lock()
@@ -2208,6 +2598,171 @@ fn main() -> anyhow::Result<()> {
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
                     actions = apply_learned_policy_actions(&snapshot, &policy, actions);
+                }
+
+                // Heuristic pass: AdaptiveGovernor
+                let heuristic_decisions = {
+                    let mut gov = state.adaptive_governor.lock().unwrap_or_else(|e| e.into_inner());
+                    gov.decide_all(
+                        &proc_snaps,
+                        &hunt_snaps,
+                        foreground_app.as_deref(),
+                        &all_proc_names,
+                        hour_of_day,
+                    )
+                };
+
+                // Build critical_pids set for heuristic merge (same logic as decide_actions)
+                let heuristic_critical_pids: HashSet<u32> = {
+                    let sys = collector.system();
+                    let critical_pats = critical_background_processes();
+                    let mut cpids: HashSet<u32> = HashSet::new();
+                    for (pid, process) in sys.processes() {
+                        let name = process.name().to_string();
+                        if critical_pats.iter().any(|p| name.contains(p)) {
+                            cpids.insert(pid.as_u32());
+                        }
+                    }
+                    cpids
+                };
+
+                // Convert heuristic decisions to RootActions and merge
+                let (heuristic_actions, heuristic_stats) = convert_and_merge_heuristic_decisions(
+                    &heuristic_decisions,
+                    &actions,
+                    &heuristic_critical_pids,
+                );
+                actions.extend(heuristic_actions);
+
+                // Survival Mode: active when memory pressure is critical or swap is thrashing.
+                // swap_delta_bps > 1MB/s means we're actively writing to swap (thrashing).
+                let survival_mode = snapshot.pressure.memory_pressure > 0.85
+                    || snapshot.pressure.swap_delta_bytes_per_sec > 1_000_000.0;
+
+                // ProcessRecoveryManager: freeze (or kill in survival mode) confirmed leakers.
+                let recovery_targets = proc_recovery.get_recovery_targets();
+                for target in &recovery_targets {
+                    if heuristic_critical_pids.contains(&target.pid) {
+                        continue;
+                    }
+                    // Jetsam Kill: under critical pressure, kill confirmed long-running leakers
+                    // instead of freezing. Requires: survival_mode + rss > 200MB + 2+ attempts.
+                    if survival_mode
+                        && target.rss_bytes > 200 * 1024 * 1024
+                        && target.recovery_attempts >= 2
+                    {
+                        if unsafe { libc::kill(target.pid as i32, 0) } == 0 {
+                            unsafe { libc::kill(target.pid as i32, libc::SIGKILL); }
+                            proc_recovery.record_kill_attempt(target.pid);
+                            if let Ok(mut m) = state.metrics.lock() {
+                            m.kills_applied += 1;
+                            m.survival_mode_activations += 1;
+                        }
+                        }
+                    } else {
+                        actions.push(RootAction::FreezeProcess {
+                            pid: target.pid,
+                            name: target.name.clone(),
+                            reason: format!(
+                                "memory-leak recovery: prob={:.2} rss={}MB attempts={}",
+                                target.leak_probability,
+                                target.rss_bytes / 1024 / 1024,
+                                target.recovery_attempts,
+                            ),
+                        });
+                        proc_recovery.record_kill_attempt(target.pid);
+                    }
+                }
+
+                // WakeStormDetector: throttle processes generating excessive wakeups.
+                let storms = wake_storm.detect_storms();
+                for storm in &storms {
+                    if !heuristic_critical_pids.contains(&storm.pid) {
+                        actions.push(RootAction::ThrottleProcess {
+                            pid: storm.pid,
+                            name: storm.name.clone(),
+                            aggressive: false,
+                            reason: format!(
+                                "wake-storm: {:.0} wakeups/sec",
+                                storm.wakeups_per_second
+                            ),
+                        });
+                    }
+                }
+
+                // Paging hints: send memory pressure signal to idle memory hoarders.
+                // Triggers the process's pressure handler to release caches.
+                // Only when memory pressure is elevated (>0.5) and swap is in use.
+                let mem_pressure = snapshot.pressure.memory_pressure;
+                let swap_active = snapshot.pressure.swap_used_bytes > 512 * 1024 * 1024;
+                if mem_pressure > 0.5 && swap_active {
+                    for snap in proc_snaps.iter().take(100) {
+                        let is_hoarder = snap.rss_bytes > 200 * 1024 * 1024
+                            && snap.secs_since_user_interaction > 600
+                            && !snap.has_gui_window;
+                        if is_hoarder && !heuristic_critical_pids.contains(&snap.pid) {
+                            actions.push(RootAction::SetMemorystatus {
+                                pid: snap.pid,
+                                priority: -1,
+                                reason: format!(
+                                    "memory-pressure hint: {}MB RSS idle",
+                                    snap.rss_bytes / 1024 / 1024
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                // Update heuristic metrics
+                {
+                    if let Ok(mut m) = state.metrics.lock() {
+                        m.heuristic_decisions += heuristic_stats.decisions_total;
+                        m.heuristic_throttles += heuristic_stats.throttles;
+                        m.heuristic_freezes += heuristic_stats.freezes;
+                        m.heuristic_kills_downgraded += heuristic_stats.kills_downgraded;
+                        m.zombies_detected += heuristic_stats.zombies_detected;
+                        // Update current workload from adaptive governor's user profile
+                        let gov = state.adaptive_governor.lock().unwrap_or_else(|e| e.into_inner());
+                        m.current_workload = format!("{:?}", gov.user_profile.current_workload());
+                    }
+                }
+
+                // F2 — ML Ligero: read classification result (computed inside decide_all this cycle).
+                // GovernorConfig aggressiveness was already updated inside decide_all().
+                let ml_class = {
+                    let gov = state.adaptive_governor.lock().unwrap_or_else(|e| e.into_inner());
+                    gov.last_ml_classification().clone()
+                };
+                if let Ok(mut m) = state.metrics.lock() {
+                    m.ml_confidence = ml_class.confidence;
+                    m.current_workload = format!("{:?}", ml_class.workload).to_lowercase();
+                    m.ml_sources = ml_class.sources_summary();
+                }
+
+                // F3 — Safety Precedence: foreground app is NEVER throttled or frozen.
+                if let Some(fg) = &foreground_app {
+                    let before = actions.len();
+                    actions.retain(|a| match a {
+                        RootAction::ThrottleProcess { name, .. } => !name.contains(fg.as_str()),
+                        RootAction::FreezeProcess { name, .. } => !name.contains(fg.as_str()),
+                        _ => true,
+                    });
+                    let removed = before - actions.len();
+                    if removed > 0 {
+                        // Discrepancy log — gold data for LLM retraining
+                        let _ = append_discrepancy_log(
+                            &state.discrepancy_log_path,
+                            fg,
+                            removed,
+                            &format!("{:?}", ml_class.workload),
+                            ml_class.confidence,
+                        );
+                    }
+                }
+
+                // F4 — Thermal Master Switch: >95°C P-cluster — suppress all Boost actions.
+                if thermal_emergency {
+                    actions.retain(|a| !matches!(a, RootAction::BoostProcess { .. }));
                 }
 
                 let policy = SafetyPolicy::for_profile(current_profile);
@@ -2262,7 +2817,24 @@ fn main() -> anyhow::Result<()> {
                     metrics.post_wake_throttle_suppressed += throttle_suppressed;
                     metrics.post_wake_freeze_suppressed += freeze_suppressed;
 
-                    let filtered = filter_boost_cooldown(graced_actions, &policy, &mut thrash);
+                    // Freeze confirmation: only freeze PIDs flagged for 2+ consecutive cycles.
+                    // This filters out short-lived transients that die before execute_actions.
+                    let confirmed_actions: Vec<RootAction> = graced_actions.into_iter().filter(|a| {
+                        if let RootAction::FreezeProcess { pid, .. } = a {
+                            let count = freeze_candidates.entry(*pid).or_insert(0);
+                            *count += 1;
+                            *count >= 2
+                        } else {
+                            true
+                        }
+                    }).collect();
+                    // Decay: remove PIDs no longer proposed for freeze this cycle.
+                    let freeze_pids_this_cycle: HashSet<u32> = confirmed_actions.iter()
+                        .filter_map(|a| if let RootAction::FreezeProcess { pid, .. } = a { Some(*pid) } else { None })
+                        .collect();
+                    freeze_candidates.retain(|pid, _| freeze_pids_this_cycle.contains(pid));
+
+                    let filtered = filter_boost_cooldown(confirmed_actions, &policy, &mut thrash);
                     let minute_cap = match latency_target {
                         LatencyTarget::Max => 120,
                         LatencyTarget::Low => 50,
@@ -2304,6 +2876,55 @@ fn main() -> anyhow::Result<()> {
                     outcomes
                     // frozen and frozen_since locks released here
                 };
+
+                // F5 — MachQoS: route processes to P-Cores / E-Cores based on heuristic decisions.
+                // Skip SIGSTOP'd processes; force E-Cores for all during thermal emergency.
+                {
+                    let frozen_pids = state.frozen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let qos_changes: Vec<(u32, SchedulingTier)> = heuristic_decisions
+                        .iter()
+                        .filter(|d| {
+                            !frozen_pids.contains(&d.pid)
+                                && !heuristic_critical_pids.contains(&d.pid)
+                        })
+                        .map(|decision| {
+                            let tier = if thermal_emergency {
+                                // Force all to E-Cores during thermal emergency
+                                SchedulingTier::Background
+                            } else {
+                                match decision.decision {
+                                    GovernerDecision::Allow => {
+                                        if decision.tier == ProcessTier::ActiveForeground {
+                                            SchedulingTier::Foreground
+                                        } else {
+                                            SchedulingTier::Normal
+                                        }
+                                    }
+                                    GovernerDecision::Throttle => SchedulingTier::Normal,
+                                    GovernerDecision::Freeze | GovernerDecision::Kill => {
+                                        SchedulingTier::Background
+                                    }
+                                }
+                            };
+                            (decision.pid, tier)
+                        })
+                        .collect();
+
+                    let mut qos = state.mach_qos.lock().unwrap_or_else(|e| e.into_inner());
+                    qos.tick_backoff();
+                    let outcomes = qos.apply_batch(&qos_changes);
+                    if let Ok(mut m) = state.metrics.lock() {
+                        m.qos_foreground_count += outcomes
+                            .iter()
+                            .filter(|o| o.tier == SchedulingTier::Foreground && o.success)
+                            .count() as u64;
+                        m.qos_background_count += outcomes
+                            .iter()
+                            .filter(|o| o.tier == SchedulingTier::Background && o.success)
+                            .count() as u64;
+                        m.qos_errors += outcomes.iter().filter(|o| !o.success).count() as u64;
+                    }
+                }
 
                 // Phase 3: Merge outcomes into metrics (reacquire lock after I/O).
                 {
@@ -2391,6 +3012,46 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     write_metrics(&metrics_path, &metrics);
+                }
+
+                // Analytics: record this cycle's metrics for trend tracking.
+                {
+                    let thermal_now = state
+                        .last_hw_snapshot
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .and_then(|h| h.temps.p_cluster_celsius)
+                        .unwrap_or(0.0);
+                    analytics.record_optimization(
+                        snapshot.cpu.global_usage,
+                        snapshot.cpu.global_usage,
+                        snapshot.memory.used_ram,
+                        snapshot.memory.used_ram,
+                        thermal_now,
+                        thermal_now,
+                        (exec_outcomes.boosts_applied
+                            + exec_outcomes.throttles_applied
+                            + exec_outcomes.freezes_applied) as u32,
+                    );
+                }
+
+                // Persist UserProfile every 10 cycles (~5 min at 30 s/cycle) so learning
+                // survives daemon restarts.
+                {
+                    let cycles = state
+                        .metrics
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .cycles;
+                    if cycles % 10 == 0 {
+                        let persisted = {
+                            let gov =
+                                state.adaptive_governor.lock().unwrap_or_else(|e| e.into_inner());
+                            gov.user_profile.to_persisted()
+                        };
+                        write_json(&state.user_profile_path, &persisted, None);
+                    }
                 }
 
                 let fast = state

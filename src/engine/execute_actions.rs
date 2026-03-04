@@ -111,10 +111,12 @@ pub fn execute_actions(
                     }
                     if caps.can_taskpolicy {
                         let tier = if aggressive { "4" } else { "2" };
-                        let _ = run(
-                            "/usr/sbin/taskpolicy",
-                            &["-l", tier, "-p", &pid.to_string()],
-                        );
+                        let pid_str = pid.to_string();
+                        // CPU tier: route to E-Cores
+                        let _ = run("/usr/sbin/taskpolicy", &["-l", tier, "-p", &pid_str]);
+                        // Disk I/O throttle: background gets lowest SSD priority.
+                        // This gives foreground apps uncontested swap I/O bandwidth.
+                        let _ = run("/usr/sbin/taskpolicy", &["-d", "4", "-p", &pid_str]);
                     }
                     let nice = if aggressive { "+20" } else { "+10" };
                     let _ = run("/usr/bin/renice", &[nice, "-p", &pid.to_string()]);
@@ -129,9 +131,14 @@ pub fn execute_actions(
                         out.push_skip(format!("critical-bg:{}", name));
                         return Ok(());
                     }
-                    // Validate process exists before sending SIGSTOP (BUG 4 fix).
+                    // Validate process exists before sending SIGSTOP.
                     if unsafe { libc::kill(*pid as i32, 0) } != 0 {
                         return Ok(());
+                    }
+                    // Demote disk I/O to throttle before SIGSTOP.
+                    // This prevents the process from hoarding SSD bandwidth on resume.
+                    if caps.can_taskpolicy {
+                        let _ = run("/usr/sbin/taskpolicy", &["-d", "4", "-p", &pid.to_string()]);
                     }
                     unsafe {
                         libc::kill(*pid as i32, libc::SIGSTOP);
@@ -182,8 +189,17 @@ pub fn execute_actions(
                     }
                     out.sysctl_applied += 1;
                 }
-                RootAction::SetMemorystatus { .. } => {
+                RootAction::SetMemorystatus { pid, .. } => {
                     if caps.can_memorystatus {
+                        // Send simulated memory pressure notification to the process.
+                        // This triggers the process's memory pressure handler, causing it
+                        // to release caches and compressed memory back to the system.
+                        // Requires root. Uses kern.memorystatus_vm_pressure_send sysctl.
+                        let pid_str = pid.to_string();
+                        let _ = run(
+                            "/usr/sbin/sysctl",
+                            &["-w", &format!("kern.memorystatus_vm_pressure_send={}", pid_str)],
+                        );
                         out.paging_hints_applied += 1;
                     }
                 }

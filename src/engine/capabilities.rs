@@ -6,7 +6,7 @@ fn can_run_with_exit_codes(program: &str, args: &[&str], ok: &[i32]) -> bool {
     Command::new(program)
         .args(args)
         .output()
-        .map_or(false, |out| {
+        .is_ok_and(|out| {
             if out.status.success() {
                 return true;
             }

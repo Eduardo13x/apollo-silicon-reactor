@@ -141,6 +141,7 @@ impl SystemReactor {
                 loop {
                     let n = libc::kevent(kq, std::ptr::null(), 0, &mut out_ev, 1, std::ptr::null());
 
+                    #[allow(clippy::comparison_chain)]
                     if n > 0 {
                         let id = out_ev.udata as usize;
                         let mut collector = SystemCollector::new();

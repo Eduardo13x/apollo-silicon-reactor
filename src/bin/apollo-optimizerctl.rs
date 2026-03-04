@@ -50,6 +50,7 @@ enum Commands {
         #[command(subcommand)]
         command: LlmCommands,
     },
+    DumpPolicy,
     Feedback {
         #[arg(value_parser = ["good", "bad"])]
         rating: String,
@@ -163,6 +164,7 @@ fn main() -> anyhow::Result<()> {
                 })
             }
         },
+        Commands::DumpPolicy => send_request(DaemonRequest::GetLearnedPolicy),
         Commands::Feedback { rating, note } => {
             send_request(DaemonRequest::Feedback { rating, note })
         }
@@ -198,6 +200,7 @@ fn main() -> anyhow::Result<()> {
                 }))?
             )
         }
+        DaemonResponse::LearnedPolicy(p) => println!("{}", serde_json::to_string_pretty(&p)?),
         DaemonResponse::Usage(u) => println!("{}", serde_json::to_string_pretty(&u)?),
         DaemonResponse::Doctor { checks } => {
             for c in checks {

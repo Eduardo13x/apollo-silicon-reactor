@@ -423,7 +423,7 @@ Constraints:
             Err(ureq::Error::Status(code, r)) => {
                 let body = r.into_string().ok();
                 return Err(LlmCallError::HttpStatus {
-                    code: code as u16,
+                    code,
                     body_excerpt: body.as_deref().map(excerpt_200),
                 });
             }

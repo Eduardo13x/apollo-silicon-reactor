@@ -54,7 +54,10 @@ sudo chmod 600 /etc/apollo-optimizer/config.toml
 sudo touch /var/log/apollo-optimizer.out.log /var/log/apollo-optimizer.err.log
 sudo chown root:wheel /var/log/apollo-optimizer.out.log /var/log/apollo-optimizer.err.log
 
-sudo launchctl bootout system/$LABEL >/dev/null 2>&1 || true
+# Unload existing service and wait for launchd to finish processing it.
+sudo launchctl bootout system/$LABEL 2>/dev/null || true
+sleep 2
+
 sudo launchctl bootstrap system "$PLIST_DST"
 sudo launchctl kickstart -k system/$LABEL
 sudo launchctl print system/$LABEL | sed -n '1,120p'

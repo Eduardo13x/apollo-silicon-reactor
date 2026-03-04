@@ -55,7 +55,7 @@ impl MemoryAnalyzer {
         // Store history
         self.process_history
             .entry(pid)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(snapshot.clone());
 
         // Trim history

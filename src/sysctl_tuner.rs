@@ -2,6 +2,7 @@ use std::process::Command;
 
 pub struct SysctlTuner;
 
+#[allow(clippy::new_without_default)]
 impl SysctlTuner {
     pub fn new() -> Self {
         Self
@@ -104,7 +105,7 @@ impl SysctlTuner {
     fn set_sysctl(&self, key: &str, value: &str) {
         // Attempt to set sysctl. This might fail without sudo.
         let output = Command::new("sysctl")
-            .args(&["-w", &format!("{}={}", key, value)])
+            .args(["-w", &format!("{}={}", key, value)])
             .output();
 
         match output {

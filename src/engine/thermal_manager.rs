@@ -145,8 +145,7 @@ impl ThermalManager {
 
         // Blend with actual current throttle level for smoother prediction
         let predicted = ((base_throttle as i16 + trend_adjustment).max(0) as u8).min(100);
-        let smoothed = ((predicted as i16 + last.throttle_level as i16) / 2) as u8;
-        smoothed
+        ((predicted as i16 + last.throttle_level as i16) / 2) as u8
     }
 
     fn time_to_throttle(&self, current_temp: f32) -> i32 {

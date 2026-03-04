@@ -126,13 +126,12 @@ fn top_blockers(
 
 pub fn decide_actions(
     snapshot: &SystemSnapshot,
+    sys: &System,
     profile: OptimizationProfile,
     latency_target: LatencyTarget,
     reactor_event_weight: f64,
 ) -> DecisionOutput {
     let mut actions = Vec::new();
-    let mut sys = System::new_all();
-    sys.refresh_processes();
 
     // Dev-first: protect critical background workloads and their children.
     let critical_patterns = critical_background_processes();
@@ -146,7 +145,7 @@ pub fn decide_actions(
     // Add children-of-critical by walking parent chain once.
     // Depth-limited to prevent infinite loops from PID recycling (BUG 10 fix).
     const MAX_PARENT_DEPTH: usize = 20;
-    for (pid, _process) in sys.processes() {
+    for pid in sys.processes().keys() {
         let mut cur = Some(*pid);
         let mut is_child = false;
         let mut depth = 0usize;
@@ -167,7 +166,7 @@ pub fn decide_actions(
     }
 
     let context = context_from_pressure(snapshot);
-    let blockers = top_blockers(&sys, snapshot, reactor_event_weight);
+    let blockers = top_blockers(sys, snapshot, reactor_event_weight);
 
     // 1) Wait-graph practical: temporary boost for top blockers.
     let blocker_boost_count = match latency_target {
