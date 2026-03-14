@@ -164,3 +164,169 @@ impl OutcomeTracker {
             && self.weights.values().any(|w| w.is_low_value())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PatternWeight unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn pattern_weight_default_is_neutral() {
+        let w = PatternWeight::default();
+        // Laplace smoothing: (0+1)/(0+2) = 0.5
+        assert!((w.effectiveness() - 0.5).abs() < 1e-6);
+        assert!(!w.is_low_value(), "fresh weight must not be low-value");
+        assert!(!w.is_high_value(), "fresh weight must not be high-value");
+    }
+
+    #[test]
+    fn pattern_weight_low_value_threshold() {
+        // ≥5 throttles, <30% effectiveness → low_value
+        let mut w = PatternWeight {
+            throttle_count: 5,
+            effective_count: 0,
+        };
+        // effectiveness = (0+1)/(5+2) ≈ 0.143 < 0.30
+        assert!(w.is_low_value());
+        assert!(!w.is_high_value());
+
+        // One effective result pushes it above 30% at count=5
+        w.effective_count = 1;
+        // effectiveness = (1+1)/(5+2) ≈ 0.286 < 0.30 → still low
+        assert!(w.is_low_value());
+
+        w.effective_count = 2;
+        // effectiveness = (2+1)/(5+2) ≈ 0.429 → no longer low-value
+        assert!(!w.is_low_value());
+    }
+
+    #[test]
+    fn pattern_weight_high_value_threshold() {
+        // ≥3 throttles, >75% effectiveness → high_value
+        let w = PatternWeight {
+            throttle_count: 3,
+            effective_count: 3,
+        };
+        // effectiveness = (3+1)/(3+2) = 0.8 > 0.75
+        assert!(w.is_high_value());
+        assert!(!w.is_low_value());
+    }
+
+    #[test]
+    fn pattern_weight_not_enough_data() {
+        // <5 throttles → never low_value, regardless of effectiveness
+        let w = PatternWeight {
+            throttle_count: 4,
+            effective_count: 0,
+        };
+        assert!(!w.is_low_value(), "need ≥5 throttles for low_value verdict");
+    }
+
+    // ── OutcomeTracker integration tests ─────────────────────────────────────
+
+    #[test]
+    fn record_throttle_increments_count() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.record_throttle("Dropbox", 0.70, 1.5);
+        tracker.record_throttle("Dropbox", 0.70, 1.5);
+
+        let w = tracker.weights.get("Dropbox").unwrap();
+        assert_eq!(w.throttle_count, 2);
+        assert_eq!(w.effective_count, 0);
+    }
+
+    #[test]
+    fn tick_marks_effective_when_pressure_drops() {
+        let mut tracker = OutcomeTracker::new();
+        // Simulate a throttle that happened 31s ago by manipulating pending directly.
+        tracker.pending.push_back(super::PendingOutcome {
+            process_name: "Dropbox".to_string(),
+            throttled_at: Instant::now() - Duration::from_secs(31),
+            pressure_before: 0.80,
+            watts_before: 2.0,
+        });
+        // Also add throttle_count so weights exist.
+        tracker.weights.insert(
+            "Dropbox".to_string(),
+            PatternWeight {
+                throttle_count: 1,
+                effective_count: 0,
+            },
+        );
+
+        // Pressure dropped by 0.05 (≥ 0.02 threshold) → effective.
+        let batch = tracker.tick(0.75);
+        assert_eq!(batch.effective_names, vec!["Dropbox"]);
+        assert!(batch.savings_watts > 0.0);
+
+        let w = tracker.weights.get("Dropbox").unwrap();
+        assert_eq!(w.effective_count, 1);
+    }
+
+    #[test]
+    fn tick_does_not_mark_effective_when_pressure_stable() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.pending.push_back(super::PendingOutcome {
+            process_name: "Dropbox".to_string(),
+            throttled_at: Instant::now() - Duration::from_secs(31),
+            pressure_before: 0.80,
+            watts_before: 2.0,
+        });
+        tracker.weights.insert(
+            "Dropbox".to_string(),
+            PatternWeight {
+                throttle_count: 1,
+                effective_count: 0,
+            },
+        );
+
+        // Pressure barely dropped (< 0.02) → ineffective.
+        let batch = tracker.tick(0.79);
+        assert!(batch.effective_names.is_empty());
+
+        let w = tracker.weights.get("Dropbox").unwrap();
+        assert_eq!(w.effective_count, 0);
+    }
+
+    #[test]
+    fn low_value_names_reported_after_enough_ineffective_throttles() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.weights.insert(
+            "suggestd".to_string(),
+            PatternWeight {
+                throttle_count: 6,
+                effective_count: 0,
+            },
+        );
+        // No pending outcomes — tick just collects low_value names.
+        let batch = tracker.tick(0.50);
+        assert!(
+            batch.low_value_names.contains(&"suggestd".to_string()),
+            "suggestd should be reported as low-value"
+        );
+    }
+
+    #[test]
+    fn overall_effectiveness_neutral_with_few_resolved() {
+        let tracker = OutcomeTracker::new();
+        // < 5 resolved → returns neutral 0.5
+        assert!((tracker.overall_effectiveness() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn heuristic_not_struggling_with_insufficient_data() {
+        let mut tracker = OutcomeTracker::new();
+        // Only 9 resolved — below the 10 required
+        tracker.total_resolved = 9;
+        tracker.total_effective = 0;
+        tracker.weights.insert(
+            "some_proc".to_string(),
+            PatternWeight {
+                throttle_count: 9,
+                effective_count: 0,
+            },
+        );
+        assert!(!tracker.heuristic_is_struggling());
+    }
+}

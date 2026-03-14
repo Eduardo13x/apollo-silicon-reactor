@@ -1,13 +1,15 @@
+use std::collections::{HashMap, HashSet};
+
 use sysinfo::System;
 
 use crate::collector::SystemSnapshot;
 use crate::engine::amx_detector;
+use crate::engine::outcome_tracker::PatternWeight;
 use crate::engine::overflow_guard::OverflowThresholds;
 use crate::engine::safety::critical_background_processes;
 use crate::engine::types::{
     BlockerScore, InteractiveContext, LatencyTarget, OptimizationProfile, RootAction,
 };
-use std::collections::HashSet;
 
 const INTERACTIVE_APPS: [&str; 9] = [
     "Code",
@@ -150,6 +152,9 @@ pub fn decide_actions(
     learned_noise: &[String],
     thresholds: OverflowThresholds,
     mut qos_mgr: Option<&mut crate::engine::mach_qos::MachQoSManager>,
+    // Bayesian weights from OutcomeTracker — processes with `is_low_value()` true
+    // are skipped in the noise throttle loop (throttled ≥5× with <30% effectiveness).
+    pattern_weights: &HashMap<String, PatternWeight>,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -248,6 +253,17 @@ pub fn decide_actions(
         }
 
         if is_background_noise(&name) {
+            // Outcome-tracker feedback: skip processes confirmed as low-value.
+            // A low-value process has been throttled ≥5 times with <30% effectiveness —
+            // continuing to throttle it wastes budget without reducing memory pressure.
+            if pattern_weights
+                .get(&name)
+                .map(|w| w.is_low_value())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
             // BUG 11 fix: ThermalConstrained was less aggressive than BackgroundPressure.
             // Under thermal constraint, throttle aggressively; under BackgroundPressure,
             // also throttle aggressively. InteractiveFocus uses profile-driven policy.
