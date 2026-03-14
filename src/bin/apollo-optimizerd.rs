@@ -3813,8 +3813,17 @@ fn main() -> anyhow::Result<()> {
                 let survival_mode = snapshot.pressure.memory_pressure > 0.85
                     || snapshot.pressure.swap_delta_bytes_per_sec > 1_000_000.0;
 
-                // Overflow guard: registrar si estamos en survival mode para ajustar thresholds.
-                if survival_mode {
+                // Overflow guard: only record as overflow when there is real memory
+                // pressure (≥ 0.60).  Swap storms at low pressure (36-42%) were
+                // poisoning the guard with false positives, keeping thresholds
+                // permanently at the floor and making Apollo overly aggressive.
+                //
+                // survival_mode still gates aggressive actions (jetsam kill,
+                // freeze recovery) regardless of this gate — we just don't let
+                // low-pressure swap storms train the adaptive thresholds.
+                let real_overflow = survival_mode
+                    && snapshot.pressure.memory_pressure >= 0.60;
+                if real_overflow {
                     let heavy: Vec<String> = snapshot
                         .top_processes
                         .iter()
