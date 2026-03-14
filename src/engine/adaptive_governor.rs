@@ -237,6 +237,26 @@ impl AdaptiveGovernor {
             };
         }
 
+        // Ephemeral XPC on-demand services exit on their own within seconds.
+        // Throttling them wastes cycles and the action is always stale by
+        // the time execute_actions runs (~127ms later). Threshold: 8s gives
+        // enough margin for a full cycle without catching persistent daemons
+        // (which typically stay alive for minutes or hours).
+        if snap.process_uptime_secs < 8 {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Allow,
+                tier,
+                utility_score: utility,
+                waste_score: waste,
+                reason: format!(
+                    "ephemeral XPC (uptime={}s < 8s) — will exit on its own",
+                    snap.process_uptime_secs
+                ),
+            };
+        }
+
         // AppHelper (browser renderers, Electron helpers…) — throttle only, nunca freeze.
         // Chromium/WebKit tienen un watchdog que crashea la tab si el renderer
         // deja de responder (SIGSTOP). Además, wakeups altos = audio/video en curso.

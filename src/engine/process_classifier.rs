@@ -133,6 +133,10 @@ pub struct ProcessSnapshot {
     pub wakeups_per_sec: f32,
     /// Parent process is still alive.
     pub parent_alive: bool,
+    /// Seconds the process has been running. Used to skip ephemeral XPC
+    /// on-demand services that will exit on their own before any action
+    /// can be applied.
+    pub process_uptime_secs: u64,
 }
 
 /// Score a process's "user utility" on a 0.0–1.0 scale.

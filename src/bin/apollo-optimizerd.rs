@@ -2209,6 +2209,11 @@ fn build_enriched_process_data_with_tree(
     let mut proc_snaps = Vec::new();
     let mut hunt_snaps = Vec::new();
 
+    let now_unix_secs: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     for (pid, process) in sys.processes() {
         let pid_u32 = pid.as_u32();
         let name = process.name().to_string();
@@ -2218,6 +2223,15 @@ fn build_enriched_process_data_with_tree(
         let is_zombie = process.status() == ProcessStatus::Zombie;
         let rss = process.memory();
         let cpu = process.cpu_usage();
+        // process.start_time() → seconds since Unix epoch; 0 if unknown.
+        let process_uptime_secs = {
+            let start = process.start_time();
+            if start > 0 {
+                now_unix_secs.saturating_sub(start)
+            } else {
+                u64::MAX // unknown start → treat as long-lived
+            }
+        };
 
         // Real idle wakeups from proc_pid_rusage — the #1 signal for wasteful daemons.
         // Estimate wakeups/sec: idle_wakeups is cumulative, divide by uptime estimate.
@@ -2251,6 +2265,7 @@ fn build_enriched_process_data_with_tree(
             has_gui_window: is_foreground,
             wakeups_per_sec,
             parent_alive,
+            process_uptime_secs,
         });
 
         hunt_snaps.push(HuntSnapshot {
