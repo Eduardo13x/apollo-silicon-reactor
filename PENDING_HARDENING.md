@@ -42,7 +42,7 @@ Actualizado: 2026-03-13
 
 | Item | Detalle |
 |------|---------|
-| `src/sysctl_tuner.rs` | Archivo huerfano en disco — ya no se compila. Borrar. |
+| ~~`src/sysctl_tuner.rs`~~ | Borrado (2026-03-14) — era huerfano, cero referencias. |
 | `silicon_probe::read_rndr` | Test `#[ignore]` por SIGILL en EL0 — limitacion de hardware, no es bug. |
 
 ## Pendientes — Operacional
