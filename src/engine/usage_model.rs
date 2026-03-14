@@ -344,6 +344,12 @@ fn never_promote_interactive() -> Vec<&'static str> {
     vec![
         // The optimizer itself (circular dependency)
         "apollo-optimizerd",
+        // Rust toolchain wrapper — rustup antepone "stable"/"nightly"/etc. como
+        // proceso padre de rustc durante compilación. Consume RAM proporcional
+        // al build y NO es una app interactiva del usuario.
+        "stable",
+        "nightly",
+        "beta",
         // Telemetry / analytics
         "UsageTrackingAgent",
         "amsengagementd",

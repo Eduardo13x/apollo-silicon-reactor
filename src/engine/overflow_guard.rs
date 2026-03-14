@@ -86,8 +86,10 @@ pub struct OverflowGuard {
 }
 
 /// Herramientas de compilación que causan picos de RAM.
+/// "stable" es el wrapper del Rust toolchain que rustup antepone a rustc/cargo —
+/// aparece como proceso padre durante compilación y consume RAM proporcional.
 const BUILD_TOOLS: &[&str] = &[
-    "rustc", "cargo", "swift", "clang", "make", "gcc", "ld", "link",
+    "rustc", "cargo", "swift", "clang", "make", "gcc", "ld", "link", "stable",
 ];
 
 impl OverflowGuard {

@@ -3219,9 +3219,13 @@ fn main() -> anyhow::Result<()> {
                                             level
                                         );
                                         // Registrar overflow: ajustar thresholds para prevenir próxima vez.
+                                        // Excluir el propio daemon — aparece en top_processes durante
+                                        // survival-mode por el trabajo intensivo que hace, contaminando
+                                        // el diagnóstico de causa del overflow.
                                         let heavy: Vec<String> = snapshot
                                             .top_processes
                                             .iter()
+                                            .filter(|p| p.name != "apollo-optimizerd")
                                             .take(8)
                                             .map(|p| p.name.clone())
                                             .collect();
@@ -3707,6 +3711,7 @@ fn main() -> anyhow::Result<()> {
                     let heavy: Vec<String> = snapshot
                         .top_processes
                         .iter()
+                        .filter(|p| p.name != "apollo-optimizerd")
                         .take(8)
                         .map(|p| p.name.clone())
                         .collect();

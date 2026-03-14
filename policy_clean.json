@@ -43,8 +43,7 @@
     "ollama",
     "ollama_llama_server",
     "opencode",
-    "rustc",
-    "stable"
+    "rustc"
   ],
   "noise_patterns": [
     "ASPCarryLog",
