@@ -33,9 +33,15 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
 fn verify_pid_identity(pid: u32, expected_name: &str, start_sec: u64, start_usec: u64) -> bool {
     match ProcessIdentity::from_pid(pid) {
         Some(current) => {
-            // If we have a captured start-time, verify it matches exactly.
-            if start_sec > 0 && (current.start_sec != start_sec || current.start_usec != start_usec)
-            {
+            // start_sec check: guards against PID recycling between snapshot and execution.
+            if start_sec > 0 && current.start_sec != start_sec {
+                return false;
+            }
+            // start_usec check: only when explicitly provided (non-zero).
+            // decide_actions passes start_usec=0 because sysinfo doesn't expose
+            // sub-second precision — treating 0 as "not provided" prevents false
+            // positives where pbi_start_tvusec != 0 for every live process.
+            if start_sec > 0 && start_usec > 0 && current.start_usec != start_usec {
                 return false;
             }
             // Name check as defense-in-depth (handles start_sec==0 fallback too).
