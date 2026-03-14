@@ -444,7 +444,12 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             data: 0,
             udata: 1 as *mut libc::c_void, // ID 1 = Memory
         };
-        let _ = libc::kevent(kq, &mem_kev, 1, std::ptr::null_mut(), 0, std::ptr::null());
+        let reg_rc = libc::kevent(kq, &mem_kev, 1, std::ptr::null_mut(), 0, std::ptr::null());
+        if reg_rc < 0 {
+            let errno = *libc::__error();
+            *state.reactor_last_error.lock_recover() =
+                Some(format!("EVFILT_VM registration failed errno={}", errno));
+        }
 
         // notify -> thermal
         let mut thermal_fd: libc::c_int = 0;
@@ -476,32 +481,27 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
         }
 
         // notify -> lifecycle spawn
-        let mut launch_fd: libc::c_int = 0;
-        let mut launch_token: libc::c_int = 0;
-        let launch_name =
-            CString::new("com.apple.launchd.spawn").expect("static string should not contain NUL");
-        let launch_reg = notify_register_file_descriptor(
-            launch_name.as_ptr(),
-            &mut launch_fd,
-            0,
-            &mut launch_token,
-        );
-        if launch_reg != 0 {
+        // NOTE: com.apple.launchd.spawn is a private notification and never
+        // delivers to external processes (reactor_events_spawn stays 0).
+        // Replaced with EVFILT_PROC NOTE_FORK on launchd PID 1 — fires on
+        // every process fork from launchd, which is the actual mechanism we
+        // wanted to observe.
+        let launch_fd: libc::c_int = -1;
+        let launchd_kev = libc::kevent {
+            ident: 1, // launchd PID
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+            fflags: libc::NOTE_FORK as u32,
+            data: 0,
+            udata: 3 as *mut libc::c_void, // ID 3 = Lifecycle
+        };
+        let fork_rc = libc::kevent(kq, &launchd_kev, 1, std::ptr::null_mut(), 0, std::ptr::null());
+        if fork_rc < 0 {
+            let errno = *libc::__error();
             *state.reactor_last_error.lock_recover() = Some(format!(
-                "launch notify_register_file_descriptor failed: {}",
-                launch_reg
+                "EVFILT_PROC NOTE_FORK on launchd failed errno={}",
+                errno
             ));
-        }
-        if launch_fd > 0 {
-            let kev = libc::kevent {
-                ident: launch_fd as usize,
-                filter: libc::EVFILT_READ,
-                flags: libc::EV_ADD | libc::EV_ENABLE,
-                fflags: 0,
-                data: 0,
-                udata: 3 as *mut libc::c_void, // ID 3 = Lifecycle
-            };
-            let _ = libc::kevent(kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null());
         }
 
         // notify -> power
@@ -612,10 +612,9 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
                     Some(Instant::now() + Duration::from_secs(REACTOR_FAST_TICK_SECS));
             }
 
-            {
-                let mut metrics = state.metrics.lock_recover();
-                metrics.reactor_pulses += 1;
-            }
+            // NOTE: reactor_pulses is already incremented once per loop
+            // iteration at the top of the loop (including timeouts). Do not
+            // increment again here — that would double-count real events.
 
             // Wake the main loop immediately via condvar.
             {
@@ -629,9 +628,8 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
         if thermal_fd > 0 {
             libc::close(thermal_fd);
         }
-        if launch_fd > 0 {
-            libc::close(launch_fd);
-        }
+        // launch_fd removed: now using EVFILT_PROC on launchd PID 1 (no fd to close)
+        let _ = launch_fd; // suppress unused variable warning
         if power_fd > 0 {
             libc::close(power_fd);
         }
