@@ -241,15 +241,7 @@ struct SharedState {
     reactor_event_weight: Arc<Mutex<f64>>,
     fast_tick_until: Arc<Mutex<Option<Instant>>>,
     thermal_level_real: Arc<Mutex<String>>,
-    reactor_events_total: Arc<Mutex<u64>>,
-    reactor_events_mem: Arc<Mutex<u64>>,
-    reactor_events_thermal: Arc<Mutex<u64>>,
-    reactor_events_spawn: Arc<Mutex<u64>>,
-    reactor_events_power: Arc<Mutex<u64>>,
-    reactor_last_event_at: Arc<Mutex<Option<DateTime<Utc>>>>,
-    reactor_last_error: Arc<Mutex<Option<String>>>,
-    reactor_mode: Arc<Mutex<String>>,
-    reactor_health: Arc<Mutex<String>>,
+    reactor_status: Arc<Mutex<ReactorStatus>>,
     governor: Arc<Mutex<ProfileGovernor>>,
     timeline: Arc<Mutex<VecDeque<ProfileTransition>>>,
     wake_state: Arc<Mutex<WakeRuntimeState>>,
@@ -269,9 +261,7 @@ struct SharedState {
     usage_model: Arc<Mutex<UsageModel>>,
     usage_model_path: PathBuf,
     usage_events_path: PathBuf,
-    usage_last_persist_at: Arc<Mutex<Option<DateTime<Utc>>>>,
-    usage_promotions_day: Arc<Mutex<Option<String>>>,
-    usage_promotions_today: Arc<Mutex<u32>>,
+    usage_tracker: Arc<Mutex<UsageTrackerState>>,
 
     // Heuristic modules
     adaptive_governor: Arc<Mutex<AdaptiveGovernor>>,
@@ -292,6 +282,45 @@ struct SharedState {
 
     /// Clientes suscritos a push de estado (menubar, etc.)
     subscribers: Arc<Mutex<Vec<UnixStream>>>,
+}
+
+/// Reactor thread counters and status — 9 fields merged into 1 Mutex.
+struct ReactorStatus {
+    events_total: u64,
+    events_mem: u64,
+    events_thermal: u64,
+    events_spawn: u64,
+    events_power: u64,
+    last_event_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    /// "normal" | "degraded"
+    mode: String,
+    /// "ok" | "stalled" | "collector-stalled"
+    health: String,
+}
+
+impl Default for ReactorStatus {
+    fn default() -> Self {
+        Self {
+            events_total: 0,
+            events_mem: 0,
+            events_thermal: 0,
+            events_spawn: 0,
+            events_power: 0,
+            last_event_at: None,
+            last_error: None,
+            mode: "normal".to_string(),
+            health: "ok".to_string(),
+        }
+    }
+}
+
+/// Usage model lifecycle counters — 3 fields merged into 1 Mutex.
+#[derive(Default)]
+struct UsageTrackerState {
+    last_persist_at: Option<DateTime<Utc>>,
+    promotions_day: Option<String>,
+    promotions_today: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,7 +460,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
     unsafe {
         let kq = libc::kqueue();
         if kq == -1 {
-            *state.reactor_last_error.lock_recover() = Some("kqueue failed".to_string());
+            state.reactor_status.lock_recover().last_error = Some("kqueue failed".to_string());
             return Ok(());
         }
 
@@ -447,7 +476,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
         let reg_rc = libc::kevent(kq, &mem_kev, 1, std::ptr::null_mut(), 0, std::ptr::null());
         if reg_rc < 0 {
             let errno = *libc::__error();
-            *state.reactor_last_error.lock_recover() =
+            state.reactor_status.lock_recover().last_error =
                 Some(format!("EVFILT_VM registration failed errno={}", errno));
         }
 
@@ -463,7 +492,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             &mut thermal_token,
         );
         if thermal_reg != 0 {
-            *state.reactor_last_error.lock_recover() = Some(format!(
+            state.reactor_status.lock_recover().last_error = Some(format!(
                 "thermal notify_register_file_descriptor failed: {}",
                 thermal_reg
             ));
@@ -498,7 +527,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
         let fork_rc = libc::kevent(kq, &launchd_kev, 1, std::ptr::null_mut(), 0, std::ptr::null());
         if fork_rc < 0 {
             let errno = *libc::__error();
-            *state.reactor_last_error.lock_recover() = Some(format!(
+            state.reactor_status.lock_recover().last_error = Some(format!(
                 "EVFILT_PROC NOTE_FORK on launchd failed errno={}",
                 errno
             ));
@@ -516,7 +545,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             &mut power_token,
         );
         if power_reg != 0 {
-            *state.reactor_last_error.lock_recover() = Some(format!(
+            state.reactor_status.lock_recover().last_error = Some(format!(
                 "power notify_register_file_descriptor failed: {}",
                 power_reg
             ));
@@ -555,21 +584,26 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
                 // kevent error (e.g. EINTR).  Record the error and retry.
                 let errno = *libc::__error();
                 if errno != libc::EINTR {
-                    *state.reactor_last_error.lock_recover() =
+                    state.reactor_status.lock_recover().last_error =
                         Some(format!("kevent error errno={}", errno));
                 }
                 continue;
             }
 
             let id = out_ev.udata as usize;
-            *state.reactor_events_total.lock_recover() += 1;
-            *state.reactor_last_event_at.lock_recover() = Some(Utc::now());
-            *state.reactor_health.lock_recover() = "ok".to_string();
+            // Update shared counters + status in one lock acquisition.
+            let reactor_mode = {
+                let mut rs = state.reactor_status.lock_recover();
+                rs.events_total += 1;
+                rs.last_event_at = Some(Utc::now());
+                rs.health = "ok".to_string();
+                rs.mode.clone()
+            };
             if id == 2 {
                 // Drain thermal pipe
                 let mut dummy: i32 = 0;
                 let _ = libc::read(thermal_fd, &mut dummy as *mut _ as *mut libc::c_void, 4);
-                *state.reactor_events_thermal.lock_recover() += 1;
+                state.reactor_status.lock_recover().events_thermal += 1;
                 let level = match dummy {
                     0 => "nominal",
                     1 => "moderate",
@@ -587,18 +621,18 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             } else if id == 3 {
                 let mut dummy: i32 = 0;
                 let _ = libc::read(launch_fd, &mut dummy as *mut _ as *mut libc::c_void, 4);
-                *state.reactor_events_spawn.lock_recover() += 1;
+                state.reactor_status.lock_recover().events_spawn += 1;
             } else if id == 4 {
                 let mut dummy: i32 = 0;
                 let _ = libc::read(power_fd, &mut dummy as *mut _ as *mut libc::c_void, 4);
-                *state.reactor_events_power.lock_recover() += 1;
+                state.reactor_status.lock_recover().events_power += 1;
                 // Signal resource sentinel for power source changes.
                 state
                     .resource_interrupt
                     .power_signal
                     .store(true, Ordering::Release);
             } else if id == 1 {
-                *state.reactor_events_mem.lock_recover() += 1;
+                state.reactor_status.lock_recover().events_mem += 1;
                 // Signal resource sentinel for memory pressure events.
                 state
                     .resource_interrupt
@@ -607,7 +641,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             }
 
             *state.reactor_event_weight.lock_recover() = 1.0;
-            if state.reactor_mode.lock_recover().as_str() == "normal" {
+            if reactor_mode.as_str() == "normal" {
                 *state.fast_tick_until.lock_recover() =
                     Some(Instant::now() + Duration::from_secs(REACTOR_FAST_TICK_SECS));
             }
@@ -868,8 +902,10 @@ fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonResponse {
                 .and_then(|t| (t - now).to_std().ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let reactor_mode = state.reactor_mode.lock_recover().clone();
-            let reactor_health = state.reactor_health.lock_recover().clone();
+            let (reactor_mode, reactor_health) = {
+                let rs = state.reactor_status.lock_recover();
+                (rs.mode.clone(), rs.health.clone())
+            };
             let status = DaemonStatus {
                 running: !state.stop.load(Ordering::Acquire),
                 profile,
@@ -972,14 +1008,14 @@ fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonResponse {
                 format!("tmutil: {}", caps.can_tmutil),
                 format!("socket_exists: {}", Path::new(socket_path()).exists()),
                 format!("kill_switch: {}", Path::new(kill_switch_path()).exists()),
-                format!(
-                    "reactor_mode: {}",
-                    state.reactor_mode.lock_recover().clone()
-                ),
-                format!(
-                    "reactor_health: {}",
-                    state.reactor_health.lock_recover().clone()
-                ),
+                {
+                    let rs = state.reactor_status.lock_recover();
+                    format!("reactor_mode: {}", rs.mode)
+                },
+                {
+                    let rs = state.reactor_status.lock_recover();
+                    format!("reactor_health: {}", rs.health)
+                },
                 format!(
                     "swapusage_readable: {}",
                     std::process::Command::new("/usr/sbin/sysctl")
@@ -1882,30 +1918,31 @@ fn usage_learning_tick(
 
     // Persist usage model periodically (every ~2 minutes).
     {
-        let mut last = state.usage_last_persist_at.lock_recover();
-        let due = last
+        let tracker = state.usage_tracker.lock_recover();
+        let due = tracker
+            .last_persist_at
             .map(|t| now - t > ChronoDuration::minutes(2))
             .unwrap_or(true);
         if due {
+            drop(tracker); // release before locking usage_model
             {
                 let model = state.usage_model.lock_recover();
                 model.persist(&state.usage_model_path);
             }
-            *last = Some(now);
+            state.usage_tracker.lock_recover().last_persist_at = Some(now);
         }
     }
 
     // Daily promotion counters (conservative).
     let today = Local::now().date_naive().to_string();
-    {
-        let mut day = state.usage_promotions_day.lock_recover();
-        if day.as_deref() != Some(&today) {
-            *day = Some(today.clone());
-            *state.usage_promotions_today.lock_recover() = 0;
+    let promotions_used = {
+        let mut tracker = state.usage_tracker.lock_recover();
+        if tracker.promotions_day.as_deref() != Some(&today) {
+            tracker.promotions_day = Some(today.clone());
+            tracker.promotions_today = 0;
         }
-    }
-
-    let promotions_used = *state.usage_promotions_today.lock_recover();
+        tracker.promotions_today
+    };
     // Propose promotions without holding locks across scoring.
     let (started_at, existing_interactive, existing_noise, existing_protected) = {
         let model = state.usage_model.lock_recover();
@@ -1985,8 +2022,7 @@ fn usage_learning_tick(
     }
 
     if applied > 0 {
-        let mut used = state.usage_promotions_today.lock_recover();
-        *used += applied;
+        state.usage_tracker.lock_recover().promotions_today += applied;
         append_jsonl(
             &state.usage_events_path,
             &serde_json::json!({"at": now, "promotions": promotions}),
@@ -2464,15 +2500,7 @@ fn main() -> anyhow::Result<()> {
                 reactor_event_weight: Arc::new(Mutex::new(0.0)),
                 fast_tick_until: Arc::new(Mutex::new(None)),
                 thermal_level_real: Arc::new(Mutex::new("unknown".to_string())),
-                reactor_events_total: Arc::new(Mutex::new(0)),
-                reactor_events_mem: Arc::new(Mutex::new(0)),
-                reactor_events_thermal: Arc::new(Mutex::new(0)),
-                reactor_events_spawn: Arc::new(Mutex::new(0)),
-                reactor_events_power: Arc::new(Mutex::new(0)),
-                reactor_last_event_at: Arc::new(Mutex::new(None)),
-                reactor_last_error: Arc::new(Mutex::new(None)),
-                reactor_mode: Arc::new(Mutex::new("normal".to_string())),
-                reactor_health: Arc::new(Mutex::new("ok".to_string())),
+                reactor_status: Arc::new(Mutex::new(ReactorStatus::default())),
                 governor: Arc::new(Mutex::new(governor)),
                 timeline: Arc::new(Mutex::new(VecDeque::new())),
                 wake_state: Arc::new(Mutex::new(wake_state)),
@@ -2492,9 +2520,7 @@ fn main() -> anyhow::Result<()> {
                 usage_model: Arc::new(Mutex::new(usage_model)),
                 usage_model_path,
                 usage_events_path,
-                usage_last_persist_at: Arc::new(Mutex::new(None)),
-                usage_promotions_day: Arc::new(Mutex::new(None)),
-                usage_promotions_today: Arc::new(Mutex::new(0)),
+                usage_tracker: Arc::new(Mutex::new(UsageTrackerState::default())),
 
                 adaptive_governor: Arc::new(Mutex::new(AdaptiveGovernor::new())),
                 mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
@@ -2817,15 +2843,18 @@ fn main() -> anyhow::Result<()> {
                 if daemon_start.elapsed() > Duration::from_secs(60) {
                     let pulses = state.metrics.lock_recover().reactor_pulses;
                     if pulses == 0 {
-                        *state.reactor_mode.lock_recover() = "degraded".to_string();
-                        *state.reactor_health.lock_recover() = "stalled".to_string();
+                        {
+                            let mut rs = state.reactor_status.lock_recover();
+                            rs.mode = "degraded".to_string();
+                            rs.health = "stalled".to_string();
+                        }
                         *state.fast_tick_until.lock_recover() = None;
                     } else {
                         // Reactor thread is alive; health tracks actual events.
-                        let current_mode = state.reactor_mode.lock_recover().clone();
-                        if current_mode == "degraded" {
-                            *state.reactor_mode.lock_recover() = "normal".to_string();
-                            *state.reactor_health.lock_recover() = "ok".to_string();
+                        let mut rs = state.reactor_status.lock_recover();
+                        if rs.mode == "degraded" {
+                            rs.mode = "normal".to_string();
+                            rs.health = "ok".to_string();
                         }
                     }
 
@@ -2839,7 +2868,7 @@ fn main() -> anyhow::Result<()> {
                             m.collector_smc_alive = smc_alive;
                         }
                         if !pressure_alive || !smc_alive {
-                            *state.reactor_health.lock_recover() = "collector-stalled".to_string();
+                            state.reactor_status.lock_recover().health = "collector-stalled".to_string();
                             // Respawn stalled collectors so the main loop gets fresh data.
                             if !smc_alive {
                                 eprintln!("watchdog: SmcReader stalled — respawning");
@@ -3280,15 +3309,18 @@ fn main() -> anyhow::Result<()> {
                     metrics.swap_delta_bps = snapshot.pressure.swap_delta_bytes_per_sec;
                     metrics.memory_pressure = snapshot.pressure.memory_pressure;
                     metrics.thermal_level = snapshot.pressure.thermal_level.clone();
-                    metrics.reactor_events_total = *state.reactor_events_total.lock_recover();
-                    metrics.reactor_events_mem = *state.reactor_events_mem.lock_recover();
-                    metrics.reactor_events_thermal = *state.reactor_events_thermal.lock_recover();
-                    metrics.reactor_events_spawn = *state.reactor_events_spawn.lock_recover();
-                    metrics.reactor_events_power = *state.reactor_events_power.lock_recover();
-                    metrics.reactor_last_event_at = *state.reactor_last_event_at.lock_recover();
-                    metrics.reactor_last_error = state.reactor_last_error.lock_recover().clone();
-                    metrics.reactor_mode = state.reactor_mode.lock_recover().clone();
-                    metrics.reactor_health = state.reactor_health.lock_recover().clone();
+                    {
+                        let rs = state.reactor_status.lock_recover();
+                        metrics.reactor_events_total = rs.events_total;
+                        metrics.reactor_events_mem = rs.events_mem;
+                        metrics.reactor_events_thermal = rs.events_thermal;
+                        metrics.reactor_events_spawn = rs.events_spawn;
+                        metrics.reactor_events_power = rs.events_power;
+                        metrics.reactor_last_event_at = rs.last_event_at;
+                        metrics.reactor_last_error = rs.last_error.clone();
+                        metrics.reactor_mode = rs.mode.clone();
+                        metrics.reactor_health = rs.health.clone();
+                    }
                     metrics.dev_session_active = dev_session_active;
                     metrics.interactive_heavy = interactive_heavy;
                     metrics.context_switches_5min = context_switches_5min;
