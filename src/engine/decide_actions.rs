@@ -48,6 +48,9 @@ pub struct DecisionOutput {
     pub reactor_event_weight: f64,
     pub blockers: Vec<BlockerScore>,
     pub actions: Vec<RootAction>,
+    /// Procesos skipeados en esta decisión por ser low_value según OutcomeTracker.
+    /// Aparecen en `metrics.top_skipped_processes` para observabilidad.
+    pub low_value_skipped: Vec<String>,
 }
 
 fn is_interactive_base(name: &str) -> bool {
@@ -180,6 +183,7 @@ pub fn decide_actions(
     };
 
     let mut actions = Vec::new();
+    let mut low_value_skipped: Vec<String> = Vec::new();
 
     // Dev-first: protect critical background workloads and their children.
     let critical_patterns = critical_background_processes();
@@ -265,6 +269,7 @@ pub fn decide_actions(
                 .map(|w| w.is_low_value_vs_baseline(outcome_baseline))
                 .unwrap_or(false)
             {
+                low_value_skipped.push(name);
                 continue;
             }
 
@@ -416,5 +421,6 @@ pub fn decide_actions(
         reactor_event_weight,
         blockers,
         actions,
+        low_value_skipped,
     }
 }

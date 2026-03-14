@@ -163,44 +163,53 @@ impl OverflowGuard {
         self.persist();
     }
 
-    /// Decaimiento gradual de los thresholds. Llamar una vez por ciclo.
-    /// Si han pasado > 60 min desde el último overflow, sube el threshold 1 pp.
+    /// Cómputo dinámico del offset de threshold, ponderado exponencialmente
+    /// por la antigüedad de cada evento (half-life = 8 horas).
+    ///
+    /// Cada evento contribuye `-0.05 * 2^(-age_h / 8)` al offset.
+    /// Efectos: un evento de hace 8h aporta -0.025; de hace 24h, -0.006;
+    /// de hace 48h, < -0.001. Así el offset se recupera naturalmente
+    /// sin necesitar un tick de decay — la calma ya es su propia recompensa.
+    pub fn compute_dynamic_offset(&self) -> f64 {
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let raw: f64 = self
+            .history
+            .events
+            .iter()
+            .map(|e| {
+                let age_h = now_secs.saturating_sub(e.timestamp_secs) as f64 / 3600.0;
+                // Contribución decae a la mitad cada 8 horas.
+                -0.05 * (2.0_f64).powf(-age_h / 8.0)
+            })
+            .sum();
+
+        raw.max(-0.20) // piso: nunca más de 20pp de ajuste
+    }
+
+    /// Mantiene `history.threshold_offset` sincronizado con el offset dinámico.
+    /// Llamar una vez por ciclo para que las métricas sean precisas.
     pub fn tick_decay(&mut self) {
         if self.last_decay_check.elapsed() < Duration::from_secs(600) {
             return; // Revisar cada 10 minutos máximo.
         }
         self.last_decay_check = Instant::now();
 
-        if self.history.threshold_offset >= 0.0 {
-            return; // Ya en baseline.
-        }
+        let dynamic = self.compute_dynamic_offset();
+        let prev = self.history.threshold_offset;
 
-        // ¿Cuánto tiempo hace que ocurrió el último overflow?
-        let last_event_secs = self
-            .history
-            .events
-            .last()
-            .map(|e| e.timestamp_secs)
-            .unwrap_or(0);
-        let now_secs = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let secs_since = now_secs.saturating_sub(last_event_secs);
-
-        // Recuperar 1 pp por cada hora de calma (más de 1h sin overflow).
-        if secs_since >= 3600 {
-            let hours_calm = (secs_since / 3600) as f64;
-            let recovery = (0.01 * hours_calm).min(0.05); // máx 5 pp por tick
-            self.history.threshold_offset = (self.history.threshold_offset + recovery).min(0.0);
-            if recovery > 0.001 {
-                eprintln!(
-                    "overflow-guard: decay {:.0}h de calma → offset={:+.0}%pp",
-                    hours_calm,
-                    self.history.threshold_offset * 100.0
-                );
-                self.persist();
-            }
+        if (dynamic - prev).abs() > 0.005 {
+            self.history.threshold_offset = dynamic;
+            eprintln!(
+                "overflow-guard: offset dinámico {:.0}%pp → {:.0}%pp ({} eventos)",
+                prev * 100.0,
+                dynamic * 100.0,
+                self.history.events.len(),
+            );
+            self.persist();
         }
     }
 
@@ -209,7 +218,9 @@ impl OverflowGuard {
     /// # Parámetros
     /// - `proc_names`: nombres de todos los procesos corriendo (para detectar build mode).
     pub fn thresholds(&self, proc_names: &[&str]) -> OverflowThresholds {
-        let off = self.history.threshold_offset;
+        // Usar offset dinámico para que los thresholds reflejen la edad real
+        // de los eventos, no un acumulador estático que queda atrapado en el piso.
+        let off = self.compute_dynamic_offset();
         let build_mode = Self::detect_build_mode(proc_names);
 
         // En build mode, actuar aún más temprano (compile pica RAM rápido).
@@ -273,5 +284,95 @@ impl OverflowGuard {
         if let Ok(json) = serde_json::to_string_pretty(&self.history) {
             let _ = std::fs::write(&self.path, json);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_guard_with_events(event_ages_hours: &[f64]) -> OverflowGuard {
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut history = OverflowHistory::default();
+        for &age_h in event_ages_hours {
+            let ts = now_secs.saturating_sub((age_h * 3600.0) as u64);
+            history.events.push(OverflowEvent {
+                timestamp_secs: ts,
+                memory_pressure: 0.90,
+                swap_delta_bps: 0.0,
+                heavy_apps: vec![],
+                cause: "test".to_string(),
+            });
+        }
+        history.threshold_offset = -0.20; // simula estado anterior al fix
+        OverflowGuard {
+            history,
+            path: PathBuf::from("/tmp/test_overflow.json"),
+            last_decay_check: Instant::now(),
+            last_event_at: None,
+        }
+    }
+
+    #[test]
+    fn dynamic_offset_zero_with_no_events() {
+        let guard = make_guard_with_events(&[]);
+        assert_eq!(guard.compute_dynamic_offset(), 0.0);
+    }
+
+    #[test]
+    fn dynamic_offset_decays_with_age() {
+        // Evento de hace 8 horas contribuye -0.05 * 0.5 = -0.025
+        let guard_fresh = make_guard_with_events(&[0.0]); // recién ocurrido
+        let guard_old = make_guard_with_events(&[8.0]);   // hace 8 horas
+
+        let offset_fresh = guard_fresh.compute_dynamic_offset();
+        let offset_old = guard_old.compute_dynamic_offset();
+
+        // Evento reciente: ≈ -0.05; hace 8h: ≈ -0.025
+        assert!(offset_fresh < -0.04, "evento reciente debe tener offset alto: {}", offset_fresh);
+        assert!(offset_old > -0.03, "evento de 8h debe tener offset reducido: {}", offset_old);
+        assert!(offset_old > offset_fresh, "evento más viejo debe tener menor impacto");
+    }
+
+    #[test]
+    fn dynamic_offset_recovers_after_24h_calm() {
+        // 20 eventos pero todos de hace 24+ horas — simula la situación del usuario
+        let ages: Vec<f64> = (24..=168).step_by(8).map(|h| h as f64).collect();
+        let guard = make_guard_with_events(&ages);
+
+        let offset = guard.compute_dynamic_offset();
+        // Con todos los eventos a 24h+, el offset debe ser mucho menor que -20pp
+        assert!(
+            offset > -0.10,
+            "20 eventos de 24h+ no deben mantener offset al piso: {}",
+            offset
+        );
+    }
+
+    #[test]
+    fn dynamic_offset_capped_at_floor() {
+        // 5 eventos muy recientes — impacto máximo pero limitado al piso -20pp
+        let guard = make_guard_with_events(&[0.1, 0.2, 0.3, 0.4, 0.5]);
+        let offset = guard.compute_dynamic_offset();
+        assert!(offset >= -0.20, "offset nunca debe bajar del piso -20pp: {}", offset);
+    }
+
+    #[test]
+    fn thresholds_recover_when_events_age() {
+        // Mismo escenario: 20 eventos de hace 24h
+        let ages: Vec<f64> = (24..=168).step_by(8).map(|h| h as f64).collect();
+        let guard = make_guard_with_events(&ages);
+
+        let t = guard.thresholds(&[]);
+        // bg_pressure debe estar por encima de 0.70 (el piso cuando offset=-0.08 aprox)
+        assert!(
+            t.bg_pressure > 0.70,
+            "bg_pressure debe haberse recuperado: {}",
+            t.bg_pressure
+        );
+        assert!(t.bg_pressure <= 0.78, "no puede superar el default: {}", t.bg_pressure);
     }
 }

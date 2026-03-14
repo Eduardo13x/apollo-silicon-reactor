@@ -3567,6 +3567,18 @@ fn main() -> anyhow::Result<()> {
                 *state.last_blockers.lock_recover() = decision.blockers.clone();
                 *state.thermal_state.lock_recover() = context_to_thermal(decision.context);
 
+                // Propagar skips de OutcomeTracker a top_skipped_processes para observabilidad.
+                {
+                    let mut metrics = state.metrics.lock_recover();
+                    for name in &decision.low_value_skipped {
+                        if metrics.top_skipped_processes.len() < 12
+                            && !metrics.top_skipped_processes.contains(name)
+                        {
+                            metrics.top_skipped_processes.push(name.clone());
+                        }
+                    }
+                }
+
                 // Apply any locally learned policy patterns (and keep them even after LLM is disabled).
                 let mut actions = decision.actions;
                 {
@@ -4486,7 +4498,7 @@ fn main() -> anyhow::Result<()> {
                     metrics.overflow_events_total = overflow_guard.history.total_overflows;
                     metrics.overflow_events_7d = overflow_guard.recent_overflow_count(7);
                     metrics.overflow_threshold_offset_pp =
-                        (overflow_guard.history.threshold_offset * 100.0).round() as i32;
+                        (overflow_guard.compute_dynamic_offset() * 100.0).round() as i32;
                     metrics.overflow_build_mode = overflow_thresholds.build_mode;
 
                     write_metrics(&metrics_path, &metrics);
