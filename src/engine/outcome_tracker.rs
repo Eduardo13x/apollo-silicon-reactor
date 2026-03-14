@@ -30,9 +30,18 @@ impl PatternWeight {
         (self.effective_count as f64 + 1.0) / (self.throttle_count as f64 + 2.0)
     }
 
-    /// Proceso con ≥5 throttles y efectividad <30% — heurístico gastando budget en vano.
+    /// Umbral fijo (legacy). Usado en tests y cuando no hay baseline disponible.
     pub fn is_low_value(&self) -> bool {
         self.throttle_count >= 5 && self.effectiveness() < 0.30
+    }
+
+    /// Umbral calibrado contra la tasa base de fluctuación natural de presión.
+    ///
+    /// Un proceso es low-value solo si su efectividad es < 90% del baseline.
+    /// Si baseline ≈ 0.25 (fluctuación natural), el umbral queda en ≈ 0.225.
+    /// Requiere ≥20 throttles para tener suficiente señal estadística.
+    pub fn is_low_value_vs_baseline(&self, baseline: f64) -> bool {
+        self.throttle_count >= 20 && self.effectiveness() < baseline * 0.90
     }
 
     /// Proceso con ≥3 throttles y efectividad >75% — patrón de ruido confirmado.
@@ -70,6 +79,13 @@ pub struct OutcomeTracker {
     pub total_effective: u32,
     /// Total de throttles resueltos.
     pub total_resolved: u32,
+    /// EMA de tasa de caída de presión natural (≥2% en ventana de 30s),
+    /// independientemente de qué proceso se throttleó. Calibra el umbral
+    /// de is_low_value_vs_baseline contra la fluctuación de fondo.
+    /// alpha ≈ 0.01 → half-life ≈ 69 observaciones.
+    baseline_drop_ema: f64,
+    /// Número de outcomes resueltos que alimentan el baseline.
+    baseline_samples: u32,
 }
 
 impl OutcomeTracker {
@@ -79,7 +95,21 @@ impl OutcomeTracker {
             weights: HashMap::new(),
             total_effective: 0,
             total_resolved: 0,
+            baseline_drop_ema: 0.0,
+            baseline_samples: 0,
         }
+    }
+
+    /// Umbral calibrado para is_low_value_vs_baseline.
+    ///
+    /// Requiere ≥50 muestras para estar bien establecido. Antes de eso
+    /// retorna 0.15 (conservador — casi nada se skipea).
+    /// Con baseline ≈ 0.25: threshold = 0.225.
+    pub fn calibrated_threshold(&self) -> f64 {
+        if self.baseline_samples < 50 {
+            return 0.15; // sin datos suficientes: umbral conservador
+        }
+        (self.baseline_drop_ema * 0.90).max(0.10)
     }
 
     /// Registra un throttle aplicado. Llamar justo después de ejecutar la acción.
@@ -105,6 +135,7 @@ impl OutcomeTracker {
     /// Retorna un batch con los resultados para que el llamador actualice
     /// el EnergyTracker y la LearnedPolicy.
     pub fn tick(&mut self, current_pressure: f64) -> OutcomeBatch {
+        const BASELINE_ALPHA: f64 = 0.01; // half-life ≈ 69 observaciones
         let check_after = Duration::from_secs(30);
         let mut effective_names = Vec::new();
         let mut savings_watts = 0.0_f64;
@@ -117,6 +148,14 @@ impl OutcomeTracker {
             let pressure_drop = outcome.pressure_before - current_pressure;
             let effective = pressure_drop >= 0.02;
 
+            // Actualiza el baseline de fluctuación natural: ¿bajó la presión ≥2%
+            // en esta ventana de 30s, independientemente de qué proceso causó qué?
+            // Este EMA nos dice cuán frecuentemente la presión cae sola.
+            let dropped = if effective { 1.0 } else { 0.0 };
+            self.baseline_drop_ema =
+                self.baseline_drop_ema * (1.0 - BASELINE_ALPHA) + dropped * BASELINE_ALPHA;
+            self.baseline_samples = self.baseline_samples.saturating_add(1);
+
             if let Some(w) = self.weights.get_mut(&outcome.process_name) {
                 if effective {
                     w.effective_count += 1;
@@ -127,16 +166,17 @@ impl OutcomeTracker {
             if effective {
                 self.total_effective += 1;
                 effective_names.push(outcome.process_name.clone());
-                // El proceso ya no está usando esos watts — anotamos el ahorro.
                 savings_watts += outcome.watts_before;
             }
         }
 
-        // Detecta patrones que ya tienen suficientes datos y siguen siendo low-value.
+        // Detecta patrones que ya tienen suficientes datos y están por debajo
+        // del baseline calibrado — throttlearlos no aporta más que la fluctuación natural.
+        let threshold = self.calibrated_threshold();
         let low_value_names: Vec<String> = self
             .weights
             .iter()
-            .filter(|(_, w)| w.is_low_value())
+            .filter(|(_, w)| w.is_low_value_vs_baseline(threshold))
             .map(|(name, _)| name.clone())
             .collect();
 
@@ -182,7 +222,7 @@ mod tests {
 
     #[test]
     fn pattern_weight_low_value_threshold() {
-        // ≥5 throttles, <30% effectiveness → low_value
+        // ≥5 throttles, <30% effectiveness → low_value (legacy method)
         let mut w = PatternWeight {
             throttle_count: 5,
             effective_count: 0,
@@ -199,6 +239,70 @@ mod tests {
         w.effective_count = 2;
         // effectiveness = (2+1)/(5+2) ≈ 0.429 → no longer low-value
         assert!(!w.is_low_value());
+    }
+
+    #[test]
+    fn pattern_weight_low_value_vs_baseline_calibrated() {
+        // baseline = 0.25 (fluctuación natural ~25%) → threshold = 0.225
+        let baseline = 0.25_f64;
+
+        // ≥20 throttles requeridos; con 19 nunca es low_value
+        let w_insufficient = PatternWeight {
+            throttle_count: 19,
+            effective_count: 0,
+        };
+        assert!(!w_insufficient.is_low_value_vs_baseline(baseline));
+
+        // 20 throttles, efectividad ≈ 0.143 < 0.225 → low_value
+        let w_low = PatternWeight {
+            throttle_count: 20,
+            effective_count: 0,
+        };
+        // (0+1)/(20+2) ≈ 0.045 < 0.225
+        assert!(w_low.is_low_value_vs_baseline(baseline));
+
+        // 100 throttles, efectividad ≈ 0.248 > 0.225 → NOT low_value
+        // (simula el caso real de nsurlsessiond con baseline ≈ 0.25)
+        let w_borderline = PatternWeight {
+            throttle_count: 100,
+            effective_count: 24,
+        };
+        // (24+1)/(100+2) ≈ 0.245 > 0.225 → sigue throttleándose
+        assert!(!w_borderline.is_low_value_vs_baseline(baseline));
+
+        // 100 throttles, efectividad ≈ 0.158 < 0.225 → definitivamente low_value
+        let w_confirmed = PatternWeight {
+            throttle_count: 100,
+            effective_count: 15,
+        };
+        // (15+1)/(100+2) ≈ 0.157 < 0.225
+        assert!(w_confirmed.is_low_value_vs_baseline(baseline));
+    }
+
+    #[test]
+    fn calibrated_threshold_conservative_until_enough_samples() {
+        let mut tracker = OutcomeTracker::new();
+        // < 50 muestras → umbral conservador 0.15
+        assert!((tracker.calibrated_threshold() - 0.15).abs() < 1e-6);
+
+        // Simular 50 muestras con baseline ≈ 0.25
+        // EMA converge desde 0.0 — necesitamos muchas para llegar a 0.25
+        // En lugar de eso, seteamos directamente para testear la lógica
+        tracker.baseline_drop_ema = 0.25;
+        tracker.baseline_samples = 50;
+        // threshold = 0.25 * 0.90 = 0.225, max(0.10, 0.225) = 0.225
+        let t = tracker.calibrated_threshold();
+        assert!((t - 0.225).abs() < 1e-6, "expected 0.225, got {}", t);
+    }
+
+    #[test]
+    fn calibrated_threshold_never_below_floor() {
+        let mut tracker = OutcomeTracker::new();
+        // baseline muy bajo (presión casi nunca fluctúa) → threshold = max(0.10, baseline*0.90)
+        tracker.baseline_drop_ema = 0.05;
+        tracker.baseline_samples = 100;
+        // 0.05 * 0.90 = 0.045 → se aplica el floor: 0.10
+        assert!((tracker.calibrated_threshold() - 0.10).abs() < 1e-6);
     }
 
     #[test]
@@ -292,18 +396,23 @@ mod tests {
     #[test]
     fn low_value_names_reported_after_enough_ineffective_throttles() {
         let mut tracker = OutcomeTracker::new();
+        // El método calibrado requiere ≥20 throttles y baseline establecido.
         tracker.weights.insert(
             "suggestd".to_string(),
             PatternWeight {
-                throttle_count: 6,
+                throttle_count: 25,
                 effective_count: 0,
             },
         );
-        // No pending outcomes — tick just collects low_value names.
+        // Establecer baseline con ≥50 muestras para que calibrated_threshold() sea activo.
+        tracker.baseline_drop_ema = 0.25;
+        tracker.baseline_samples = 50;
+        // threshold = 0.225; suggestd effectiveness = (0+1)/(25+2) ≈ 0.037 < 0.225
+
         let batch = tracker.tick(0.50);
         assert!(
             batch.low_value_names.contains(&"suggestd".to_string()),
-            "suggestd should be reported as low-value"
+            "suggestd should be reported as low-value (25 throttles, 0 effective)"
         );
     }
 

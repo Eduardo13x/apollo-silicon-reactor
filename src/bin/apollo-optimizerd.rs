@@ -3417,12 +3417,13 @@ fn main() -> anyhow::Result<()> {
                 write_governor_state(&governor_state_path, &governor);
                 drop(governor);
 
-                let (decide_interactive, decide_noise, decide_weights) = {
+                let (decide_interactive, decide_noise, decide_weights, outcome_baseline) = {
                     let policy = state.learned_policy.lock_recover();
                     (
                         policy.interactive_patterns.clone(),
                         policy.noise_patterns.clone(),
                         policy.pattern_weights.clone(),
+                        outcome_tracker.calibrated_threshold(),
                     )
                 };
                 // Thresholds adaptativos: más conservadores si hubo overflows recientes,
@@ -3560,6 +3561,7 @@ fn main() -> anyhow::Result<()> {
                         overflow_thresholds,
                         Some(&mut qos),
                         &decide_weights,
+                        outcome_baseline,
                     )
                 };
                 *state.last_blockers.lock_recover() = decision.blockers.clone();

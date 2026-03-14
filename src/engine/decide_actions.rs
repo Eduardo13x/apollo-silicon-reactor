@@ -152,9 +152,12 @@ pub fn decide_actions(
     learned_noise: &[String],
     thresholds: OverflowThresholds,
     mut qos_mgr: Option<&mut crate::engine::mach_qos::MachQoSManager>,
-    // Bayesian weights from OutcomeTracker — processes with `is_low_value()` true
-    // are skipped in the noise throttle loop (throttled ≥5× with <30% effectiveness).
+    // Bayesian weights from OutcomeTracker.
     pattern_weights: &HashMap<String, PatternWeight>,
+    // Tasa base de caídas de presión naturales (sin acción). Calibrada por
+    // OutcomeTracker. Un proceso se skipea solo si su efectividad es <90%
+    // de este baseline — i.e., no aporta más que la fluctuación de fondo.
+    outcome_baseline: f64,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -253,12 +256,13 @@ pub fn decide_actions(
         }
 
         if is_background_noise(&name) {
-            // Outcome-tracker feedback: skip processes confirmed as low-value.
-            // A low-value process has been throttled ≥5 times with <30% effectiveness —
-            // continuing to throttle it wastes budget without reducing memory pressure.
+            // Outcome-tracker feedback: skip processes whose effectiveness is
+            // not meaningfully above the natural baseline fluctuation rate.
+            // Uses calibrated threshold (90% of baseline) to avoid false positives
+            // from correlated pressure drops. Requires ≥20 throttle observations.
             if pattern_weights
                 .get(&name)
-                .map(|w| w.is_low_value())
+                .map(|w| w.is_low_value_vs_baseline(outcome_baseline))
                 .unwrap_or(false)
             {
                 continue;
