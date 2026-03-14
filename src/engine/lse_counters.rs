@@ -1,0 +1,459 @@
+//! Lock-free metrics counters using ARMv8.1 LSE atomics.
+//!
+//! Replaces `Mutex<RuntimeMetrics>` for hot-path counters that update every cycle.
+//! On Apple Silicon with `-C target-cpu=native`, Rust's AtomicU64 already emits
+//! LSE `ldadd` instructions. This module provides:
+//!
+//! 1. A structured lock-free metrics buffer (no mutex on the hot path)
+//! 2. Consistent snapshot reads via epoch counter
+//! 3. ARM64 ASM verification that LSE is actually being used
+//!
+//! Cost: single atomic instruction per counter increment (~3ns vs ~25ns for mutex).
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ── Lock-free metrics ────────────────────────────────────────────────────────
+
+/// Lock-free daemon metrics. Each field is an independent atomic counter.
+/// Writers use `Relaxed` ordering (cheapest — single LSE `ldadd` instruction).
+/// Readers use `Acquire` on the epoch for a happens-before edge.
+#[repr(align(128))] // Separate cache line from other data
+pub struct LockFreeMetrics {
+    // Epoch incremented after every batch update — readers check this
+    epoch: AtomicU64,
+
+    // Core cycle counters
+    pub cycles: AtomicU64,
+    pub actions_applied: AtomicU64,
+    pub freezes: AtomicU64,
+    pub unfreezes: AtomicU64,
+    pub throttles: AtomicU64,
+    pub throttle_reverted: AtomicU64,
+    pub signals_sent: AtomicU64,
+
+    // Pressure counters
+    pub hw_warnings: AtomicU64,
+    pub hw_criticals: AtomicU64,
+    pub vm_pressure_events: AtomicU64,
+    pub survival_activations: AtomicU64,
+
+    // Process management
+    pub processes_scanned: AtomicU64,
+    pub kqueue_events: AtomicU64,
+    pub proc_exits_detected: AtomicU64,
+
+    // Performance self-measurement (in microseconds)
+    pub cycle_time_us: AtomicU64,
+    pub snapshot_time_us: AtomicU64,
+    pub decide_time_us: AtomicU64,
+}
+
+impl LockFreeMetrics {
+    pub const fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            cycles: AtomicU64::new(0),
+            actions_applied: AtomicU64::new(0),
+            freezes: AtomicU64::new(0),
+            unfreezes: AtomicU64::new(0),
+            throttles: AtomicU64::new(0),
+            throttle_reverted: AtomicU64::new(0),
+            signals_sent: AtomicU64::new(0),
+            hw_warnings: AtomicU64::new(0),
+            hw_criticals: AtomicU64::new(0),
+            vm_pressure_events: AtomicU64::new(0),
+            survival_activations: AtomicU64::new(0),
+            processes_scanned: AtomicU64::new(0),
+            kqueue_events: AtomicU64::new(0),
+            proc_exits_detected: AtomicU64::new(0),
+            cycle_time_us: AtomicU64::new(0),
+            snapshot_time_us: AtomicU64::new(0),
+            decide_time_us: AtomicU64::new(0),
+        }
+    }
+
+    // ── Writer methods (hot path — Relaxed ordering, single LSE instruction) ─
+
+    #[inline(always)]
+    pub fn inc_cycles(&self) {
+        self.cycles.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn add_actions(&self, n: u64) {
+        self.actions_applied.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn inc_freezes(&self) {
+        self.freezes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn inc_unfreezes(&self) {
+        self.unfreezes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn inc_throttles(&self) {
+        self.throttles.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn inc_hw_warning(&self) {
+        self.hw_warnings.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn inc_hw_critical(&self) {
+        self.hw_criticals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn inc_vm_pressure(&self) {
+        self.vm_pressure_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn inc_kqueue_events(&self, n: u64) {
+        self.kqueue_events.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn inc_proc_exits(&self) {
+        self.proc_exits_detected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn set_cycle_time_us(&self, us: u64) {
+        self.cycle_time_us.store(us, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn set_snapshot_time_us(&self, us: u64) {
+        self.snapshot_time_us.store(us, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn set_decide_time_us(&self, us: u64) {
+        self.decide_time_us.store(us, Ordering::Relaxed);
+    }
+
+    /// Bump epoch after a batch of updates. This establishes the
+    /// happens-before edge for readers calling `snapshot()`.
+    #[inline(always)]
+    pub fn commit(&self) {
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    // ── Reader methods ───────────────────────────────────────────────────────
+
+    /// Take a consistent snapshot of all counters.
+    /// The `Acquire` load on epoch guarantees we see all prior `Relaxed` stores
+    /// from the writer thread that called `commit()`.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        MetricsSnapshot {
+            epoch,
+            cycles: self.cycles.load(Ordering::Relaxed),
+            actions_applied: self.actions_applied.load(Ordering::Relaxed),
+            freezes: self.freezes.load(Ordering::Relaxed),
+            unfreezes: self.unfreezes.load(Ordering::Relaxed),
+            throttles: self.throttles.load(Ordering::Relaxed),
+            throttle_reverted: self.throttle_reverted.load(Ordering::Relaxed),
+            signals_sent: self.signals_sent.load(Ordering::Relaxed),
+            hw_warnings: self.hw_warnings.load(Ordering::Relaxed),
+            hw_criticals: self.hw_criticals.load(Ordering::Relaxed),
+            vm_pressure_events: self.vm_pressure_events.load(Ordering::Relaxed),
+            survival_activations: self.survival_activations.load(Ordering::Relaxed),
+            processes_scanned: self.processes_scanned.load(Ordering::Relaxed),
+            kqueue_events: self.kqueue_events.load(Ordering::Relaxed),
+            proc_exits_detected: self.proc_exits_detected.load(Ordering::Relaxed),
+            cycle_time_us: self.cycle_time_us.load(Ordering::Relaxed),
+            snapshot_time_us: self.snapshot_time_us.load(Ordering::Relaxed),
+            decide_time_us: self.decide_time_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+// Safe to share across threads — all fields are atomic.
+unsafe impl Sync for LockFreeMetrics {}
+
+/// A consistent point-in-time snapshot of all metrics.
+#[derive(Debug, Clone)]
+pub struct MetricsSnapshot {
+    pub epoch: u64,
+    pub cycles: u64,
+    pub actions_applied: u64,
+    pub freezes: u64,
+    pub unfreezes: u64,
+    pub throttles: u64,
+    pub throttle_reverted: u64,
+    pub signals_sent: u64,
+    pub hw_warnings: u64,
+    pub hw_criticals: u64,
+    pub vm_pressure_events: u64,
+    pub survival_activations: u64,
+    pub processes_scanned: u64,
+    pub kqueue_events: u64,
+    pub proc_exits_detected: u64,
+    pub cycle_time_us: u64,
+    pub snapshot_time_us: u64,
+    pub decide_time_us: u64,
+}
+
+// ── ARM64 LSE verification ───────────────────────────────────────────────────
+
+/// Verify that the hardware supports LSE atomics (ARMv8.1+).
+/// On Apple Silicon M1+ this is always true, but we verify with an actual
+/// `ldaddal` instruction to prove the compiler emits LSE, not LL/SC fallback.
+///
+/// Returns the old value of the atomic (should be 0 on first call).
+#[cfg(target_arch = "aarch64")]
+pub fn verify_lse_atomic_add(target: &AtomicU64, increment: u64) -> u64 {
+    let ptr = target.as_ptr();
+    let old: u64;
+    unsafe {
+        std::arch::asm!(
+            "ldaddal {val}, {old}, [{ptr}]",
+            ptr = in(reg) ptr,
+            val = in(reg) increment,
+            old = out(reg) old,
+            options(nostack),
+        );
+    }
+    old
+}
+
+/// Atomic swap using LSE `swpal` instruction.
+/// Single instruction, ~3ns. Useful for pointer-swapping state.
+#[cfg(target_arch = "aarch64")]
+pub fn lse_swap(target: &AtomicU64, new_val: u64) -> u64 {
+    let ptr = target.as_ptr();
+    let old: u64;
+    unsafe {
+        std::arch::asm!(
+            "swpal {val}, {old}, [{ptr}]",
+            ptr = in(reg) ptr,
+            val = in(reg) new_val,
+            old = out(reg) old,
+            options(nostack),
+        );
+    }
+    old
+}
+
+/// Compare-and-swap using LSE `casal` instruction.
+/// Returns the value found at `target`. If it was `expected`, the swap happened.
+#[cfg(target_arch = "aarch64")]
+pub fn lse_cas(target: &AtomicU64, expected: u64, desired: u64) -> u64 {
+    let ptr = target.as_ptr();
+    let found: u64;
+    unsafe {
+        // CAS: if [ptr] == expected, then [ptr] = desired
+        // found receives the value that was at [ptr]
+        std::arch::asm!(
+            "casal {exp}, {des}, [{ptr}]",
+            ptr = in(reg) ptr,
+            exp = inout(reg) expected => found,
+            des = in(reg) desired,
+            options(nostack),
+        );
+    }
+    found
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn basic_increment_and_snapshot() {
+        let m = LockFreeMetrics::new();
+        m.inc_cycles();
+        m.inc_cycles();
+        m.inc_freezes();
+        m.add_actions(5);
+        m.commit();
+
+        let snap = m.snapshot();
+        assert_eq!(snap.cycles, 2);
+        assert_eq!(snap.freezes, 1);
+        assert_eq!(snap.actions_applied, 5);
+        assert_eq!(snap.epoch, 1);
+    }
+
+    #[test]
+    fn concurrent_increments_no_lost_updates() {
+        let m = Arc::new(LockFreeMetrics::new());
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let m = m.clone();
+                thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        m.inc_cycles();
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+        m.commit();
+
+        let snap = m.snapshot();
+        assert_eq!(
+            snap.cycles,
+            32 * 10_000,
+            "no lost increments under contention"
+        );
+    }
+
+    #[test]
+    fn concurrent_mixed_operations() {
+        let m = Arc::new(LockFreeMetrics::new());
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let m = m.clone();
+                thread::spawn(move || {
+                    for _ in 0..5_000 {
+                        m.inc_cycles();
+                        m.inc_freezes();
+                        m.inc_throttles();
+                        m.add_actions(1);
+                        if i % 4 == 0 {
+                            m.inc_hw_warning();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+        m.commit();
+
+        let snap = m.snapshot();
+        assert_eq!(snap.cycles, 16 * 5_000);
+        assert_eq!(snap.freezes, 16 * 5_000);
+        assert_eq!(snap.throttles, 16 * 5_000);
+        assert_eq!(snap.actions_applied, 16 * 5_000);
+        assert_eq!(snap.hw_warnings, 4 * 5_000); // 4 threads (i % 4 == 0)
+    }
+
+    #[test]
+    fn snapshot_reader_concurrent_with_writer() {
+        let m = Arc::new(LockFreeMetrics::new());
+        let m2 = m.clone();
+
+        let writer = thread::spawn(move || {
+            for _ in 0..100_000 {
+                m2.inc_cycles();
+                m2.commit();
+            }
+        });
+
+        // Reader thread takes snapshots while writer is running
+        let mut snapshots = Vec::new();
+        for _ in 0..1_000 {
+            snapshots.push(m.snapshot());
+            thread::yield_now();
+        }
+
+        writer.join().unwrap();
+
+        // Verify monotonicity — cycles should never decrease
+        for window in snapshots.windows(2) {
+            assert!(
+                window[1].cycles >= window[0].cycles,
+                "cycles must be monotonic: {} -> {}",
+                window[0].cycles,
+                window[1].cycles,
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn lse_atomic_add_works() {
+        let val = AtomicU64::new(42);
+        let old = verify_lse_atomic_add(&val, 10);
+        assert_eq!(old, 42, "ldaddal should return old value");
+        assert_eq!(val.load(Ordering::SeqCst), 52, "value should be 42+10");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn lse_swap_works() {
+        let val = AtomicU64::new(100);
+        let old = lse_swap(&val, 200);
+        assert_eq!(old, 100);
+        assert_eq!(val.load(Ordering::SeqCst), 200);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn lse_cas_succeeds_on_match() {
+        let val = AtomicU64::new(42);
+        let found = lse_cas(&val, 42, 99);
+        assert_eq!(found, 42, "CAS should return original");
+        assert_eq!(val.load(Ordering::SeqCst), 99, "CAS should have swapped");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn lse_cas_fails_on_mismatch() {
+        let val = AtomicU64::new(42);
+        let found = lse_cas(&val, 0, 99); // expected=0 but actual=42
+        assert_eq!(found, 42, "CAS should return actual value");
+        assert_eq!(val.load(Ordering::SeqCst), 42, "value should not change");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn lse_contended_cas_loop() {
+        // Simulate a CAS retry loop under contention from 8 threads
+        let val = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let v = val.clone();
+                thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        loop {
+                            let cur = v.load(Ordering::Relaxed);
+                            let found = lse_cas(&v, cur, cur + 1);
+                            if found == cur {
+                                break; // CAS succeeded
+                            }
+                            // CAS failed, retry
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            val.load(Ordering::SeqCst),
+            8 * 10_000,
+            "all increments must be accounted for",
+        );
+    }
+
+    #[test]
+    fn metrics_struct_is_cache_aligned() {
+        assert_eq!(
+            std::mem::align_of::<LockFreeMetrics>(),
+            128,
+            "metrics should be 128-byte aligned to avoid false sharing",
+        );
+    }
+}

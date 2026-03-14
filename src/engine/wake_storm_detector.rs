@@ -25,12 +25,13 @@ pub enum StormSeverity {
 
 pub struct WakeStormDetector {
     processes: HashMap<u32, ProcessWakeData>,
-    storm_threshold: f32,  // 10 wakeups/sec
+    storm_threshold: f32, // 10 wakeups/sec
     detection_window: Duration,
 }
 
 #[derive(Debug, Clone)]
 struct ProcessWakeData {
+    name: String,
     wakeup_times: Vec<Instant>,
     last_check: Instant,
 }
@@ -45,17 +46,24 @@ impl WakeStormDetector {
     }
 
     /// Record a wakeup event for a process
-    pub fn record_wakeup(&mut self, pid: u32, _name: String) {
+    pub fn record_wakeup(&mut self, pid: u32, name: String) {
         self.processes
             .entry(pid)
             .and_modify(|data| {
                 let now = Instant::now();
                 data.wakeup_times.push(now);
+                data.last_check = now;
+                data.name = name.clone();
                 // Keep only recent wakeups within detection window
                 data.wakeup_times
                     .retain(|t| now.duration_since(*t) < self.detection_window);
+                // Cap to prevent memory growth from pathological wakeup rates
+                if data.wakeup_times.len() > 10_000 {
+                    data.wakeup_times.drain(..data.wakeup_times.len() - 10_000);
+                }
             })
             .or_insert(ProcessWakeData {
+                name,
                 wakeup_times: vec![Instant::now()],
                 last_check: Instant::now(),
             });
@@ -76,7 +84,7 @@ impl WakeStormDetector {
             if wakeups_per_sec > self.storm_threshold {
                 storms.push(WakePattern {
                     pid: *pid,
-                    name: String::new(), // Would be filled from process list
+                    name: data.name.clone(),
                     wakeup_count,
                     time_window: self.detection_window,
                     wakeups_per_second: wakeups_per_sec,
@@ -132,9 +140,8 @@ impl WakeStormDetector {
     /// Clean up stale process data
     pub fn cleanup_stale(&mut self, max_age: Duration) {
         let now = Instant::now();
-        self.processes.retain(|_, data| {
-            now.duration_since(data.last_check) < max_age
-        });
+        self.processes
+            .retain(|_, data| now.duration_since(data.last_check) < max_age);
     }
 }
 

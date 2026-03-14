@@ -23,6 +23,8 @@ pub struct GovernorInput {
     pub thermal_constrained: bool,
     pub dev_session_active: bool,
     pub interactive_heavy: bool,
+    /// Usuario cambió de app 3+ veces en los últimos 5 min → modo burst de cambio de contexto.
+    pub context_switch_burst: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +224,21 @@ impl ProfileGovernor {
             } else {
                 "interactive-floor balanced-root".to_string()
             };
+        }
+
+        // Context-switch burst: usuario cambia de app frecuentemente (TDA-aware).
+        // Empuja hacia aggressive-root para maximizar la respuesta del app en primer plano.
+        // Cede ante thermal-constrained, ante el mecanismo anti-thrash (balanced_lock_until),
+        // y ante presión de RAM alta (>70%): con muchas ventanas y RAM alta, subir a
+        // aggressive causaría más freezes/throttles justo cuando el sistema más lo necesita.
+        if input.context_switch_burst
+            && !input.thermal_constrained
+            && input.ram_pressure < 0.70
+            && self.balanced_lock_until.map_or(true, |t| t <= now)
+            && target != OptimizationProfile::AggressiveRoot
+        {
+            target = OptimizationProfile::AggressiveRoot;
+            reason = "context-switch-burst".to_string();
         }
 
         let transition = if target != current {

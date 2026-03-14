@@ -3,7 +3,7 @@
 //! These are the highest-priority missing optimization features
 
 use apollo_optimizer::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
-use apollo_optimizer::engine::process_recovery::{ProcessRecoveryManager, LeakingProcess};
+use apollo_optimizer::engine::process_recovery::{LeakingProcess, ProcessRecoveryManager};
 use apollo_optimizer::engine::swap_predictor::{SwapPredictor, SwapTrend};
 use std::time::{Duration, Instant};
 
@@ -49,7 +49,7 @@ fn test_gpu_power_state_throttled_temp() {
 #[test]
 fn test_gpu_power_state_dynamic_high_temp() {
     let manager = GPUManager::new();
-    let state = manager.recommend_power_state(50.0, 88.0); // Above throttle threshold
+    let state = manager.recommend_power_state(50.0, 95.0); // Above 90°C throttle threshold
     assert_eq!(state, GPUPowerState::Dynamic);
 }
 
@@ -57,7 +57,7 @@ fn test_gpu_power_state_dynamic_high_temp() {
 fn test_gpu_needs_cooling() {
     let manager = GPUManager::new();
     let metrics = GPUMetrics {
-        gpu_temp: 90.0, // Above 85 threshold
+        gpu_temp: 95.0, // Above 90°C throttle threshold
         gpu_utilization: 50.0,
         gpu_frequency: 1000,
         gpu_memory_used: 1024 * 1024 * 1024,
@@ -72,7 +72,7 @@ fn test_gpu_needs_cooling() {
 fn test_gpu_does_not_need_cooling() {
     let manager = GPUManager::new();
     let metrics = GPUMetrics {
-        gpu_temp: 70.0, // Below 85 threshold
+        gpu_temp: 70.0, // Below 90°C throttle threshold
         gpu_utilization: 50.0,
         gpu_frequency: 1000,
         gpu_memory_used: 1024 * 1024 * 1024,
@@ -129,7 +129,7 @@ fn test_gpu_thermal_recommendations_critical() {
 fn test_gpu_thermal_recommendations_warning() {
     let manager = GPUManager::new();
     let metrics = GPUMetrics {
-        gpu_temp: 90.0, // Above throttle (85) but below max (100)
+        gpu_temp: 95.0, // Above throttle (90) but below max (100)
         gpu_utilization: 50.0,
         gpu_frequency: 1000,
         gpu_memory_used: 1024 * 1024 * 1024,
@@ -274,7 +274,10 @@ fn test_swap_predictor_stable_trend() {
 
     let forecast = predictor.update(500 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
     // With no growth, should be stable or decreasing (no increases detected)
-    assert!(matches!(forecast.swap_trend, SwapTrend::Stable | SwapTrend::Decreasing));
+    assert!(matches!(
+        forecast.swap_trend,
+        SwapTrend::Stable | SwapTrend::Decreasing
+    ));
 }
 
 #[test]
@@ -289,7 +292,10 @@ fn test_swap_predictor_increasing_trend() {
 
         if i >= 3 {
             // After enough samples, should detect increasing trend
-            assert!(matches!(forecast.swap_trend, SwapTrend::Increasing | SwapTrend::Stable));
+            assert!(matches!(
+                forecast.swap_trend,
+                SwapTrend::Increasing | SwapTrend::Stable
+            ));
         }
     }
 }
@@ -352,7 +358,10 @@ fn test_swap_predictor_recommendations_critical() {
 
     let forecast = predictor.update(1100 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
     assert!(!forecast.recommended_actions.is_empty());
-    assert!(forecast.recommended_actions.iter().any(|r| r.contains("CRITICAL")));
+    assert!(forecast
+        .recommended_actions
+        .iter()
+        .any(|r| r.contains("CRITICAL")));
 }
 
 #[test]
@@ -423,12 +432,13 @@ fn test_gpu_thermal_integration() {
     };
 
     // Should recommend Dynamic or lower due to high temp
-    let recommended = manager.recommend_power_state(
-        hot_metrics.gpu_utilization,
-        hot_metrics.gpu_temp,
-    );
+    let recommended =
+        manager.recommend_power_state(hot_metrics.gpu_utilization, hot_metrics.gpu_temp);
 
-    assert!(matches!(recommended, GPUPowerState::Dynamic | GPUPowerState::Throttled));
+    assert!(matches!(
+        recommended,
+        GPUPowerState::Dynamic | GPUPowerState::Throttled
+    ));
 }
 
 // ============================================================================
@@ -450,7 +460,10 @@ fn test_recovery_and_swap_integration() {
         swap_used += 50 * 1024 * 1024;
 
         // If swap is increasing, should coordinate with process recovery
-        if matches!(forecast.swap_trend, SwapTrend::Increasing | SwapTrend::Critical) {
+        if matches!(
+            forecast.swap_trend,
+            SwapTrend::Increasing | SwapTrend::Critical
+        ) {
             // Recovery module should also be active
         }
     }

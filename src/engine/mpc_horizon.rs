@@ -1,0 +1,284 @@
+//! MPC Horizon — Model Predictive Control con horizonte de N ciclos.
+//!
+//! ## Idea (Control óptimo, Bellman 1957 / Mayne 2000)
+//!
+//! En vez de elegir la mejor acción AHORA, simula un horizonte de H pasos
+//! y elige la primera acción de la secuencia que minimiza el costo acumulado.
+//!
+//! ## Modelo del sistema
+//! Estado: pressure (escalar, 0–1)
+//! Transición: pressure_next = pressure + velocity * dt + effect(action)
+//!
+//! Donde velocity viene del Kalman y effect(action) es el impacto estimado
+//! de cada intervención (aprendido online).
+//!
+//! ## Costo por paso
+//! J = Σᵢ [ pressure_i² + λ · cost(action_i) ]
+//!
+//! - pressure²: penaliza presión alta cuadráticamente (más urgente cuanto más alto)
+//! - λ · cost: penaliza intervenciones innecesarias
+//!
+//! ## Optimización
+//! Con 5 acciones y horizonte 5 → 5⁵ = 3125 secuencias.
+//! Enumerar todas es viable (~1µs cada una). Sin heurísticas necesarias.
+
+/// Número de acciones posibles.
+const N_ACTIONS: usize = 5;
+/// Horizonte máximo (pasos hacia adelante).
+const MAX_HORIZON: usize = 5;
+
+/// Efecto estimado de cada acción sobre la presión.
+/// Negativo = reduce presión, 0 = noop.
+/// Orden: [Observe, TightenThresholds, SuggestAggressive, PreThrottleNoise, ProactivePurge]
+const DEFAULT_EFFECTS: [f64; N_ACTIONS] = [
+    0.00,   // Observe: no effect
+    -0.02,  // TightenThresholds: slight reduction
+    -0.03,  // SuggestAggressive: moderate reduction
+    -0.01,  // PreThrottleNoise: small reduction
+    -0.015, // ProactivePurge: small-moderate reduction
+];
+
+/// Costo de ejecutar cada acción (penalización por acción innecesaria).
+const ACTION_COSTS: [f64; N_ACTIONS] = [
+    0.00,  // Observe: free
+    0.01,  // TightenThresholds: cheap
+    0.03,  // SuggestAggressive: moderate (changes profile)
+    0.02,  // PreThrottleNoise: moderate
+    0.015, // ProactivePurge: moderate
+];
+
+/// Controlador MPC con horizonte finito.
+#[derive(Debug, Clone)]
+pub struct MpcController {
+    /// Efectos estimados por acción (aprendidos online).
+    effects: [f64; N_ACTIONS],
+    /// Horizonte de planificación (pasos).
+    horizon: usize,
+    /// Peso del costo de acción vs presión (λ).
+    action_cost_weight: f64,
+    /// dt por paso (segundos).
+    dt_per_step: f64,
+    /// Última secuencia óptima encontrada (para diagnóstico).
+    last_plan: [usize; MAX_HORIZON],
+    /// Costo de la última secuencia óptima.
+    last_cost: f64,
+}
+
+impl MpcController {
+    /// Crea un controlador MPC.
+    ///
+    /// - `horizon`: pasos hacia adelante (2–5 recomendado).
+    /// - `dt_per_step`: duración de cada paso en segundos (0.5 para el ciclo normal).
+    pub fn new(horizon: usize, dt_per_step: f64) -> Self {
+        Self {
+            effects: DEFAULT_EFFECTS,
+            horizon: horizon.min(MAX_HORIZON),
+            action_cost_weight: 0.5,
+            dt_per_step,
+            last_plan: [0; MAX_HORIZON],
+            last_cost: f64::MAX,
+        }
+    }
+
+    /// Resuelve el MPC: dada la presión actual y su velocidad,
+    /// encuentra la secuencia óptima de acciones en el horizonte.
+    ///
+    /// Retorna el índice de la PRIMERA acción de la secuencia óptima.
+    ///
+    /// - `pressure`: presión actual (0–1).
+    /// - `velocity`: velocidad de cambio (del Kalman, unidades/segundo).
+    pub fn solve(&mut self, pressure: f64, velocity: f64) -> usize {
+        let h = self.horizon;
+
+        // Para horizonte ≤ 3, enumerar todas las secuencias.
+        // Para horizonte > 3, usar greedy por paso (evitar 5⁵ = 3125 evaluaciones).
+        if h <= 3 {
+            self.solve_exhaustive(pressure, velocity)
+        } else {
+            self.solve_greedy(pressure, velocity)
+        }
+    }
+
+    /// Enumeración exhaustiva (horizonte ≤ 3, máx 125 evaluaciones).
+    fn solve_exhaustive(&mut self, pressure: f64, velocity: f64) -> usize {
+        let h = self.horizon;
+        let mut best_cost = f64::MAX;
+        let mut best_first_action = 0usize;
+        let mut best_plan = [0usize; MAX_HORIZON];
+
+        let total_sequences = N_ACTIONS.pow(h as u32);
+        for seq_idx in 0..total_sequences {
+            // Decode sequence index into action indices.
+            let mut actions = [0usize; MAX_HORIZON];
+            let mut tmp = seq_idx;
+            for slot in actions.iter_mut().take(h) {
+                *slot = tmp % N_ACTIONS;
+                tmp /= N_ACTIONS;
+            }
+
+            let cost = self.evaluate_sequence(pressure, velocity, &actions[..h]);
+            if cost < best_cost {
+                best_cost = cost;
+                best_first_action = actions[0];
+                best_plan = actions;
+            }
+        }
+
+        self.last_plan = best_plan;
+        self.last_cost = best_cost;
+        best_first_action
+    }
+
+    /// Greedy por paso (horizonte > 3).
+    fn solve_greedy(&mut self, pressure: f64, velocity: f64) -> usize {
+        let h = self.horizon;
+        let mut plan = [0usize; MAX_HORIZON];
+        let mut p = pressure;
+        let mut v = velocity;
+
+        for slot in plan.iter_mut().take(h) {
+            let mut best_action = 0;
+            let mut best_cost = f64::MAX;
+            for (a, (&effect, &ac)) in self.effects.iter().zip(ACTION_COSTS.iter()).enumerate() {
+                let p_next = (p + v * self.dt_per_step + effect).clamp(0.0, 1.0);
+                let cost = p_next * p_next + self.action_cost_weight * ac;
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_action = a;
+                }
+            }
+            *slot = best_action;
+            p = (p + v * self.dt_per_step + self.effects[best_action]).clamp(0.0, 1.0);
+            // Velocity decays slightly towards zero (mean reversion assumption).
+            v *= 0.9;
+        }
+
+        self.last_plan = plan;
+        self.last_cost = self.evaluate_sequence(pressure, velocity, &plan[..h]);
+        plan[0]
+    }
+
+    /// Evalúa el costo total de una secuencia de acciones.
+    fn evaluate_sequence(&self, pressure: f64, velocity: f64, actions: &[usize]) -> f64 {
+        let mut total_cost = 0.0;
+        let mut p = pressure;
+        let mut v = velocity;
+
+        for &a in actions {
+            p = (p + v * self.dt_per_step + self.effects[a]).clamp(0.0, 1.0);
+            v *= 0.9; // mean reversion
+                      // Stage cost: pressure² + λ · action_cost
+            total_cost += p * p + self.action_cost_weight * ACTION_COSTS[a];
+        }
+        total_cost
+    }
+
+    /// Actualiza el efecto estimado de una acción observando el resultado real.
+    ///
+    /// - `action`: índice de la acción ejecutada.
+    /// - `pressure_before`: presión antes de la acción.
+    /// - `pressure_after`: presión después de la acción (siguiente ciclo).
+    /// - `velocity`: velocidad estimada (para separar efecto de acción vs tendencia natural).
+    pub fn update_effect(
+        &mut self,
+        action: usize,
+        pressure_before: f64,
+        pressure_after: f64,
+        velocity: f64,
+    ) {
+        if action >= N_ACTIONS {
+            return;
+        }
+        // efecto observado = cambio real - cambio por tendencia
+        let expected_change = velocity * self.dt_per_step;
+        let actual_change = pressure_after - pressure_before;
+        let observed_effect = actual_change - expected_change;
+
+        // EWMA update (α = 0.1)
+        self.effects[action] = 0.9 * self.effects[action] + 0.1 * observed_effect;
+        // Clamp effects to reasonable range.
+        self.effects[action] = self.effects[action].clamp(-0.10, 0.02);
+    }
+
+    /// Plan actual (para diagnóstico).
+    pub fn last_plan(&self) -> &[usize; MAX_HORIZON] {
+        &self.last_plan
+    }
+
+    /// Costo del plan actual.
+    pub fn last_cost(&self) -> f64 {
+        self.last_cost
+    }
+
+    /// Efectos aprendidos por acción.
+    pub fn learned_effects(&self) -> &[f64; N_ACTIONS] {
+        &self.effects
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_low_pressure_cost_minimal() {
+        let mut mpc = MpcController::new(3, 0.5);
+        // Low pressure, no velocity → cost should be near-zero regardless of choice.
+        let action = mpc.solve(0.1, 0.0);
+        assert!(action < N_ACTIONS);
+        assert!(
+            mpc.last_cost() < 0.1,
+            "cost should be minimal at low pressure, got {}",
+            mpc.last_cost()
+        );
+    }
+
+    #[test]
+    fn test_high_pressure_rising_chooses_action() {
+        let mut mpc = MpcController::new(3, 0.5);
+        // High pressure + rising → should choose intervention.
+        let action = mpc.solve(0.85, 0.1);
+        assert_ne!(action, 0, "high+rising pressure should NOT choose Observe");
+    }
+
+    #[test]
+    fn test_moderate_pressure_falling_may_observe() {
+        let mut mpc = MpcController::new(3, 0.5);
+        // Moderate pressure but falling → might choose Observe (problem resolving itself).
+        let action = mpc.solve(0.70, -0.05);
+        // This is a valid case for either Observe or mild intervention.
+        assert!(action < N_ACTIONS);
+    }
+
+    #[test]
+    fn test_update_effect_changes_estimates() {
+        let mut mpc = MpcController::new(3, 0.5);
+        let before = mpc.effects[1]; // TightenThresholds
+                                     // Simulate: action 1 was applied, pressure dropped more than expected.
+        mpc.update_effect(1, 0.80, 0.70, 0.0);
+        // Observed effect = (0.70 - 0.80) - 0.0 = -0.10
+        assert!(
+            mpc.effects[1] < before,
+            "effect should decrease (become more negative)"
+        );
+    }
+
+    #[test]
+    fn test_greedy_fallback_for_long_horizon() {
+        let mut mpc = MpcController::new(5, 0.5);
+        let action = mpc.solve(0.80, 0.05);
+        assert!(action < N_ACTIONS);
+        // Should produce a plan.
+        assert!(mpc.last_cost() < f64::MAX);
+    }
+
+    #[test]
+    fn test_sequence_evaluation_bounded() {
+        let mpc = MpcController::new(3, 0.5);
+        let cost = mpc.evaluate_sequence(0.5, 0.0, &[0, 0, 0]);
+        assert!(cost >= 0.0, "cost should be non-negative");
+        assert!(cost < 10.0, "cost should be bounded");
+    }
+}

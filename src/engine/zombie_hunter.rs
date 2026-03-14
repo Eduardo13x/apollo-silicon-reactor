@@ -89,10 +89,10 @@ pub struct HunterConfig {
 impl Default for HunterConfig {
     fn default() -> Self {
         Self {
-            ghost_helper_threshold_secs: 86_400,             // 24 h
-            wakeup_burner_threshold: 20.0,                   // 20 wakeups/sec
+            ghost_helper_threshold_secs: 86_400,               // 24 h
+            wakeup_burner_threshold: 20.0,                     // 20 wakeups/sec
             memory_hoarder_threshold_bytes: 256 * 1024 * 1024, // 256 MB (was 512 MB)
-            hoarder_idle_threshold_secs: 1800,               // 30 min (was 1 h)
+            hoarder_idle_threshold_secs: 1800,                 // 30 min (was 1 h)
         }
     }
 }
@@ -240,15 +240,10 @@ impl ZombieHunter {
     /// Evaluate many snapshots and return all dead-weight processes, sorted
     /// by `wasted_rss_bytes` descending (biggest memory waste first).
     pub fn evaluate_all(&mut self, snaps: &[HuntSnapshot]) -> Vec<DeadWeightProcess> {
-        let mut dead_weight: Vec<DeadWeightProcess> = snaps
-            .iter()
-            .filter_map(|s| self.evaluate(s))
-            .collect();
+        let mut dead_weight: Vec<DeadWeightProcess> =
+            snaps.iter().filter_map(|s| self.evaluate(s)).collect();
 
-        dead_weight.sort_by(|a, b| {
-            b.wasted_rss_bytes
-                .cmp(&a.wasted_rss_bytes)
-        });
+        dead_weight.sort_by(|a, b| b.wasted_rss_bytes.cmp(&a.wasted_rss_bytes));
 
         dead_weight
     }
@@ -256,7 +251,8 @@ impl ZombieHunter {
     /// Remove stale entries for PIDs that are gone.
     pub fn cleanup(&mut self, live_pids: &[u32]) {
         let live_set: std::collections::HashSet<u32> = live_pids.iter().copied().collect();
-        self.suspicious_history.retain(|pid, _| live_set.contains(pid));
+        self.suspicious_history
+            .retain(|pid, _| live_set.contains(pid));
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 use crate::collector::SystemSnapshot;
-use crate::sysctl_tuner::SysctlTuner;
+use crate::engine::sysctl_governor::SysctlGovernor;
+use crate::engine::types::HardPath;
 use libc::{kill, SIGCONT, SIGSTOP};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -50,7 +51,8 @@ impl HeuristicEngine {
         let now = Instant::now();
 
         // BUG 15 fix: purge entries not seen in the last 10 minutes to prevent unbounded growth.
-        noise_map.retain(|_, (_, last_seen)| now.duration_since(*last_seen) < Duration::from_secs(600));
+        noise_map
+            .retain(|_, (_, last_seen)| now.duration_since(*last_seen) < Duration::from_secs(600));
 
         for process in &snapshot.top_processes {
             // Heuristic 1: Constant CPU (>5%) in a daemon/agent/helper
@@ -379,8 +381,8 @@ impl OptimizerEngine {
             let mut mode = safe_lock(&self.current_mode);
             if *mode != "pro" {
                 println!("🚀 Pro-Workload detected (LLM/Dev/Media)! Activating Apollo Performance Mode...");
-                let tuner = SysctlTuner::new();
-                tuner.apply_performance_tuning();
+                let gov = SysctlGovernor::new(unsafe { libc::geteuid() } == 0);
+                gov.apply_tuning_direct();
                 self.quarantine_apple_bloat(true);
                 self.apply_gpu_eco_mode(true);
                 *mode = "pro".to_string();
@@ -633,7 +635,7 @@ impl OptimizerEngine {
         }
 
         if projected_pressure > 86.0 {
-            let _ = Command::new("purge").output();
+            let _ = Command::new("/usr/bin/purge").output();
         }
     }
 
@@ -800,7 +802,7 @@ impl OptimizerEngine {
         if pressure_percentage > 80.0 || force_purge {
             println!("High memory pressure detected (or Turbo engaged)! Attempting to purge...");
             // Attempt to purge inactive memory
-            let _ = Command::new("purge").output();
+            let _ = Command::new("/usr/bin/purge").output();
 
             // Port from ram-guardian.sh: Guard against memory-hungry system apps
             for process in &snapshot.top_processes {
@@ -809,14 +811,14 @@ impl OptimizerEngine {
                         "🚀 RAM Guardian: Restarting Finder (High Memory: {}MB)",
                         process.memory_usage / 1024 / 1024
                     );
-                    let _ = Command::new("killall").arg("Finder").output();
+                    let _ = Command::new("/usr/bin/killall").arg("Finder").output();
                 }
                 if process.name == "Dock" && process.memory_usage > 300 * 1024 * 1024 {
                     println!(
                         "🚀 RAM Guardian: Restarting Dock (High Memory: {}MB)",
                         process.memory_usage / 1024 / 1024
                     );
-                    let _ = Command::new("killall").arg("Dock").output();
+                    let _ = Command::new("/usr/bin/killall").arg("Dock").output();
                 }
             }
         }
@@ -825,7 +827,7 @@ impl OptimizerEngine {
     pub fn configure_startup(&self) {
         println!("Configuring Smart Startup...");
         // Disable "Reopen windows when logging back in"
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "com.apple.loginwindow",
@@ -834,7 +836,7 @@ impl OptimizerEngine {
                 "false",
             ])
             .output();
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "com.apple.loginwindow",
@@ -850,7 +852,7 @@ impl OptimizerEngine {
 
         // 1. Disable Animations (Speed up UI)
         println!("Disabling UI animations...");
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "NSGlobalDomain",
@@ -859,7 +861,7 @@ impl OptimizerEngine {
                 "false",
             ])
             .output();
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "NSGlobalDomain",
@@ -868,7 +870,7 @@ impl OptimizerEngine {
                 "0.001",
             ])
             .output();
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "com.apple.finder",
@@ -877,10 +879,10 @@ impl OptimizerEngine {
                 "true",
             ])
             .output();
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args(["write", "com.apple.dock", "launchanim", "-bool", "false"])
             .output();
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "com.apple.dock",
@@ -892,7 +894,7 @@ impl OptimizerEngine {
 
         // Fix for WindowServer "Bad Coding" - Disable Window Shadows (Performance Workaround)
         println!("Applying WindowServer performance workaround (Disable shadows)...");
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "com.apple.WindowManager",
@@ -902,12 +904,12 @@ impl OptimizerEngine {
             ])
             .output();
 
-        // 2. Network Optimization (Sysctl via SysctlTuner)
-        let tuner = SysctlTuner::new();
-        tuner.apply_performance_tuning();
+        // 2. Kernel performance tuning (via SysctlGovernor — captures defaults for safe revert)
+        let gov = SysctlGovernor::new(unsafe { libc::geteuid() } == 0);
+        gov.apply_tuning_direct();
 
         // 3. Disable Dashboard / Widgets (Save RAM)
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "com.apple.dashboard",
@@ -919,8 +921,8 @@ impl OptimizerEngine {
 
         // 4. Restart Dock and Finder to apply
         println!("Restarting UI components...");
-        let _ = Command::new("killall").arg("Dock").output();
-        let _ = Command::new("killall").arg("Finder").output();
+        let _ = Command::new("/usr/bin/killall").arg("Dock").output();
+        let _ = Command::new("/usr/bin/killall").arg("Finder").output();
 
         // 5. GPU Eco Mode
         self.apply_gpu_eco_mode(true);
@@ -931,10 +933,10 @@ impl OptimizerEngine {
     pub fn apply_llm_mode(&self) {
         println!("🚀 ENGAGING LLM MODE (Max GPU & AI Priority)...");
 
-        // 1. Apply Performance Kernel Tuning
-        let tuner = SysctlTuner::new();
-        tuner.apply_performance_tuning();
-        tuner.check_server_mode();
+        // 1. Apply Performance Kernel Tuning (via SysctlGovernor — captures defaults for safe revert)
+        let gov = SysctlGovernor::new(unsafe { libc::geteuid() } == 0);
+        gov.apply_tuning_direct();
+        SysctlGovernor::check_server_mode();
 
         // 2. Reduce Background Noise & Quarantine
         self.disable_background_noise();
@@ -943,7 +945,7 @@ impl OptimizerEngine {
 
         // 3. Hard RAM Purge to make room for models
         println!("🧹 Clearing inactive RAM for models...");
-        let _ = Command::new("purge").output();
+        let _ = Command::new("/usr/bin/purge").output();
 
         // 3. Identify and boost AI processes
         let mut sys = System::new_all();
@@ -957,17 +959,17 @@ impl OptimizerEngine {
                 println!("🔝 BOOSTING AI PROCESS: {} (PID {})", name, pid_u32);
 
                 // Max Performance Core preference
-                let _ = Command::new("taskpolicy")
+                let _ = Command::new("/usr/sbin/taskpolicy")
                     .args(["-d", "-p", &pid_u32.to_string()])
                     .output();
 
                 // Priority Tier 1 (Highest)
-                let _ = Command::new("taskpolicy")
+                let _ = Command::new("/usr/sbin/taskpolicy")
                     .args(["-t", "1", "-p", &pid_u32.to_string()])
                     .output();
 
                 // Max renice (requires root for negative, but we set to 0)
-                let _ = Command::new("renice")
+                let _ = Command::new("/usr/bin/renice")
                     .args(["-5", "-p", &pid_u32.to_string()]) // Trying -5 for LLM apps (might fail if not root)
                     .output();
             }
@@ -1029,7 +1031,7 @@ impl OptimizerEngine {
         println!("🔇 Reducing Background Noise (Extreme Mode)...");
 
         // 1. Disable Apple Intelligence Reporting (Background Agent)
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "com.apple.Siri",
@@ -1053,7 +1055,9 @@ impl OptimizerEngine {
             for &pid in frozen.iter() {
                 let exists = unsafe { libc::kill(pid as i32, 0) == 0 };
                 if exists {
-                    unsafe { kill(pid as i32, SIGCONT); }
+                    unsafe {
+                        kill(pid as i32, SIGCONT);
+                    }
                 }
             }
             frozen.clear();
@@ -1083,7 +1087,9 @@ impl OptimizerEngine {
 
         for daemon in daemons {
             println!("{} device service: {}", action, daemon);
-            let _ = Command::new("killall").args([signal, daemon]).output();
+            let _ = Command::new("/usr/bin/killall")
+                .args([signal, daemon])
+                .output();
         }
     }
 
@@ -1097,7 +1103,7 @@ impl OptimizerEngine {
         println!("{} GPU Eco-Mode (UI Optimization)...", action);
 
         // Disable Window Shadows when eco mode is active (huge GPU savings on M1).
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "com.apple.WindowManager",
@@ -1108,7 +1114,7 @@ impl OptimizerEngine {
             .output();
 
         // Reduce Transparency
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "com.apple.universalaccess",
@@ -1119,7 +1125,7 @@ impl OptimizerEngine {
             .output();
 
         // Reduce Motion
-        let _ = Command::new("defaults")
+        let _ = Command::new("/usr/bin/defaults")
             .args([
                 "write",
                 "com.apple.universalaccess",
@@ -1141,14 +1147,17 @@ impl OptimizerEngine {
         // destroying gigabytes of data that take hours to rebuild.
         let caches_path = home_path.join("Library/Caches");
         println!("Cleaning {:?}", caches_path);
-        self.clear_directory_contents(&caches_path, &[
-            "com.apple.Safari",
-            "com.google.Chrome",
-            "com.brave.Browser",
-            "org.mozilla.firefox",
-            "com.apple.dt.Xcode",     // DerivedData cache
-            "com.apple.metal",         // GPU shader cache
-        ]);
+        self.clear_directory_contents(
+            &caches_path,
+            &[
+                "com.apple.Safari",
+                "com.google.Chrome",
+                "com.brave.Browser",
+                "org.mozilla.firefox",
+                "com.apple.dt.Xcode", // DerivedData cache
+                "com.apple.metal",    // GPU shader cache
+            ],
+        );
 
         // 2. Clean User Logs
         let logs_path = home_path.join("Library/Logs");
@@ -1177,7 +1186,7 @@ impl OptimizerEngine {
             // Ported from disk-cleanup.sh
             if let Some(path_str) = telegram_path.to_str() {
                 self.run_best_effort(
-                    "find",
+                    "/usr/bin/find",
                     &[
                         path_str,
                         "-path",
@@ -1200,7 +1209,10 @@ impl OptimizerEngine {
 
         // 8. APFS Snapshot Management (Apple Silicon Efficiency)
         println!("Purging old APFS local snapshots...");
-        self.run_best_effort("tmutil", &["thinlocalsnapshots", "/", "10000000000", "4"]);
+        self.run_best_effort(
+            "/usr/bin/tmutil",
+            &["thinlocalsnapshots", "/", "10000000000", "4"],
+        );
 
         println!("Disk Cleanup Complete.");
     }
@@ -1236,10 +1248,10 @@ impl OptimizerEngine {
             libc::setpriority(libc::PRIO_PROCESS, pid, -20);
 
             // For Mach-level tiers on other PIDs we use the CLI.
-            let _ = Command::new("taskpolicy")
+            let _ = Command::new("/usr/sbin/taskpolicy")
                 .args(["-l", "0", "-p", &pid.to_string()])
                 .output();
-            let _ = Command::new("taskpolicy")
+            let _ = Command::new("/usr/sbin/taskpolicy")
                 .args(["-t", "0", "-p", &pid.to_string()])
                 .output();
         }
@@ -1254,12 +1266,12 @@ impl OptimizerEngine {
 
             // 2. Background QoS & I/O Throttling (forces E-Cores)
             // Using CLI for Mach-level QoS on other PIDs.
-            let _ = Command::new("taskpolicy")
+            let _ = Command::new("/usr/sbin/taskpolicy")
                 .args(["-b", "-p", &pid.to_string()])
                 .output();
 
             let tier = if aggressive { "4" } else { "2" };
-            let _ = Command::new("taskpolicy")
+            let _ = Command::new("/usr/sbin/taskpolicy")
                 .args(["-l", tier, "-p", &pid.to_string()])
                 .output();
         }
@@ -1329,7 +1341,7 @@ impl OptimizerEngine {
     fn load_profiles() -> HashMap<String, AppProfile> {
         let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
         let path = PathBuf::from(home_dir).join(".apollo_profiles.json");
-        if let Ok(content) = std::fs::read_to_string(path) {
+        if let Ok(content) = HardPath::read_to_string_limited(&path, 5 * 1024 * 1024) {
             if let Ok(profiles) = serde_json::from_str(&content) {
                 return profiles;
             }
@@ -1444,8 +1456,7 @@ mod tests {
     #[test]
     fn thread_basic_info_count_is_10() {
         assert_eq!(
-            THREAD_BASIC_INFO_COUNT,
-            10,
+            THREAD_BASIC_INFO_COUNT, 10,
             "THREAD_BASIC_INFO_COUNT must equal 10 to match the kernel ABI"
         );
     }

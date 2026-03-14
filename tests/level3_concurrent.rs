@@ -93,8 +93,15 @@ fn concurrent_budget_enforcement_no_overflow() {
 
                 // Phase 2: execute without any lock.
                 let mut frozen = HashSet::new();
-                let _outcomes =
-                    execute_actions(final_actions.clone(), &no_caps(), null_journal(), &mut frozen);
+                let _outcomes = execute_actions(
+                    final_actions.clone(),
+                    &no_caps(),
+                    null_journal(),
+                    &mut frozen,
+                    &[],
+                    &[],
+                    None,
+                );
 
                 final_actions.len()
             })
@@ -153,7 +160,15 @@ fn three_phase_cycles_all_complete_with_correct_totals() {
                 // Phase 2: execute WITHOUT metrics lock (the BUG 5 fix).
                 let outcomes = {
                     let mut frozen = frozen_state.lock().unwrap();
-                    execute_actions(final_actions, &no_caps(), null_journal(), &mut frozen)
+                    execute_actions(
+                        final_actions,
+                        &no_caps(),
+                        null_journal(),
+                        &mut frozen,
+                        &[],
+                        &[],
+                        None,
+                    )
                 };
 
                 // Phase 3: reacquire metrics lock to merge.
@@ -174,7 +189,11 @@ fn three_phase_cycles_all_complete_with_correct_totals() {
     }
 
     let m = metrics.lock().unwrap();
-    assert_eq!(m.cycles, n_threads as u64, "all {} cycles must complete", n_threads);
+    assert_eq!(
+        m.cycles, n_threads as u64,
+        "all {} cycles must complete",
+        n_threads
+    );
     assert_eq!(m.failures, 0, "no failures expected for dead PIDs");
     // Dead PIDs → PID validation fires → nothing applied.
     assert_eq!(m.boosts_applied, 0, "no boosts on dead PIDs");
@@ -222,9 +241,15 @@ fn execute_outcomes_accumulation_is_exact() {
     }
 
     assert_eq!(*total_boosts.lock().unwrap(), n_threads as u64 * boosts_per);
-    assert_eq!(*total_throttles.lock().unwrap(), n_threads as u64 * throttles_per);
+    assert_eq!(
+        *total_throttles.lock().unwrap(),
+        n_threads as u64 * throttles_per
+    );
     assert_eq!(*total_sysctl.lock().unwrap(), n_threads as u64 * sysctl_per);
-    assert_eq!(*total_failures.lock().unwrap(), n_threads as u64 * failures_per);
+    assert_eq!(
+        *total_failures.lock().unwrap(),
+        n_threads as u64 * failures_per
+    );
 }
 
 // ── Test 4: Lock ordering — frozen then frozen_since never deadlocks ──────────
@@ -289,7 +314,9 @@ fn lock_ordering_frozen_then_frozen_since_no_deadlock() {
 fn shared_budget_invariant_holds_under_max_contention() {
     let global_cap = 50usize;
     let budget = Arc::new(Mutex::new(ActionBudgetState::default()));
-    let policy = Arc::new(SafetyPolicy::for_profile(OptimizationProfile::AggressiveRoot));
+    let policy = Arc::new(SafetyPolicy::for_profile(
+        OptimizationProfile::AggressiveRoot,
+    ));
     let n_threads = 64usize;
 
     let handles: Vec<_> = (0..n_threads)
@@ -349,12 +376,14 @@ fn concurrent_freeze_unfreeze_frozen_set_is_consistent() {
                         pid: base + i,
                         name: format!("bg-{}", t),
                         reason: "test freeze".into(),
+                        start_sec: 0,
+                        start_usec: 0,
                     })
                     .collect();
                 let mut f = frozen.lock().unwrap();
                 // Dead PIDs → PID validation skips them; frozen set should not grow.
                 let _outcomes =
-                    execute_actions(actions, &no_caps(), null_journal(), &mut f);
+                    execute_actions(actions, &no_caps(), null_journal(), &mut f, &[], &[], None);
             })
         })
         .collect();

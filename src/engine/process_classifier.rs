@@ -158,8 +158,14 @@ pub fn score_utility(snap: &ProcessSnapshot) -> f32 {
         score += 0.3;
     }
 
-    // Normalise to 0..1
-    (score / 1.3).min(1.0)
+    // Active network connections → el proceso está sirviendo trabajo real
+    // (daemons de red, sync, audio, etc. nunca tienen interacción de usuario)
+    if snap.has_network {
+        score += 0.25;
+    }
+
+    // Normalise to 0..1 (max raw = 1.0 + 0.3 + 0.25 = 1.55)
+    (score / 1.55).min(1.0)
 }
 
 /// Score a process's resource waste on a 0.0–1.0 scale.
@@ -205,9 +211,7 @@ impl ProcessClassifier {
         }
 
         // Heuristic rules
-        let is_helper = helper_name_patterns()
-            .iter()
-            .any(|p| snap.name.contains(p));
+        let is_helper = helper_name_patterns().iter().any(|p| snap.name.contains(p));
 
         if snap.secs_since_user_interaction > 86400 {
             return ProcessTier::Stale;
@@ -224,7 +228,10 @@ impl ProcessClassifier {
     }
 
     /// Classify many processes and return sorted by descending waste score.
-    pub fn classify_all(&self, snaps: &[ProcessSnapshot]) -> Vec<(ProcessSnapshot, ProcessTier, f32)> {
+    pub fn classify_all(
+        &self,
+        snaps: &[ProcessSnapshot],
+    ) -> Vec<(ProcessSnapshot, ProcessTier, f32)> {
         let mut results: Vec<(ProcessSnapshot, ProcessTier, f32)> = snaps
             .iter()
             .map(|s| {
@@ -234,10 +241,7 @@ impl ProcessClassifier {
             })
             .collect();
 
-        results.sort_by(|a, b| {
-            b.2.partial_cmp(&a.2)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
         results
     }

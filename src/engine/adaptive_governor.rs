@@ -8,17 +8,19 @@
 //! No LLM, no external service, zero latency.
 
 use crate::engine::{
+    hw_bayes::HwFeatures,
     llm::LearnedPolicy,
-    process_classifier::{ProcessClassifier, ProcessSnapshot, ProcessTier, score_utility},
+    process_classifier::{score_utility, ProcessClassifier, ProcessSnapshot, ProcessTier},
+    silicon_probe::{fast_entropy, SiliconInfo},
     user_profile::{UserProfile, WorkloadType},
     workload_classifier::{WorkloadClassification, WorkloadClassifier},
-    zombie_hunter::{HuntSnapshot, ZombieHunter, ZombieAction},
+    zombie_hunter::{HuntSnapshot, ZombieAction, ZombieHunter},
 };
 
 // ── Decision ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GovernerDecision {
+pub enum GovernorDecision {
     /// Let the process run normally.
     Allow,
     /// Reduce CPU scheduling priority (renice to +10).
@@ -33,7 +35,7 @@ pub enum GovernerDecision {
 pub struct ProcessDecision {
     pub pid: u32,
     pub name: String,
-    pub decision: GovernerDecision,
+    pub decision: GovernorDecision,
     pub tier: ProcessTier,
     pub utility_score: f32,
     pub waste_score: f32,
@@ -57,8 +59,10 @@ pub struct GovernorConfig {
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
-            throttle_utility_threshold: 0.4,
-            freeze_utility_threshold: 0.1,
+            // Conservador: solo throttlear procesos genuinamente inactivos.
+            // Daemons con red activa tienen utility ~0.23, así pasan el threshold.
+            throttle_utility_threshold: 0.20,
+            freeze_utility_threshold: 0.05,
             waste_override_threshold: 0.9,
             aggressive_in_coding: true,
             aggressive_in_video_edit: true,
@@ -79,8 +83,12 @@ pub struct AdaptiveGovernor {
 
 impl AdaptiveGovernor {
     pub fn new() -> Self {
+        // Calibrar thresholds según el chip real — leído del hardware sin syscall pesada.
+        // M1 (8 cores, 8GB) = más conservador. M3 Max (16 cores, 96GB) = más agresivo.
+        let hw = SiliconInfo::read();
+        let config = calibrate_config_for_hardware(&hw);
         Self {
-            config: GovernorConfig::default(),
+            config,
             classifier: ProcessClassifier::new(),
             zombie_hunter: ZombieHunter::new(),
             user_profile: UserProfile::new(),
@@ -106,22 +114,50 @@ impl AdaptiveGovernor {
         all_proc_names: &[&str],
         hour_of_day: u8,
     ) -> Vec<ProcessDecision> {
+        self.decide_all_with_hw(
+            proc_snaps,
+            hunt_snaps,
+            foreground_app,
+            all_proc_names,
+            hour_of_day,
+            None,
+        )
+    }
+
+    /// Versión con features de hardware para clasificación Bayesiana completa.
+    pub fn decide_all_with_hw(
+        &mut self,
+        proc_snaps: &[ProcessSnapshot],
+        hunt_snaps: &[HuntSnapshot],
+        foreground_app: Option<&str>,
+        all_proc_names: &[&str],
+        hour_of_day: u8,
+        hw: Option<HwFeatures>,
+    ) -> Vec<ProcessDecision> {
         // 1. Update user profile
         self.user_profile
             .observe(foreground_app, all_proc_names, hour_of_day);
 
-        // 1b. ML Ligero: classify workload BEFORE heuristic decisions so F1 uses ML result.
-        // Clone to avoid split-borrow (user_profile + workload_classifier on self simultaneously).
+        // 1b. ML: Gaussian NB de hardware + clasificador de texto fusionados.
         {
             let hour_model = self.user_profile.hour_model_ref().clone();
             let app_stats = self.user_profile.app_stats_ref().clone();
-            let classification = self.workload_classifier.classify(
+            let classification = self.workload_classifier.classify_with_hw(
                 foreground_app,
                 all_proc_names,
                 &hour_model,
                 &app_stats,
                 hour_of_day,
+                hw.as_ref(),
             );
+            // Aprendizaje online: si texto+hora tienen confianza alta, entrena el NB de HW.
+            if let Some(ref hw_feat) = hw {
+                self.workload_classifier.maybe_observe(
+                    hw_feat,
+                    classification.workload,
+                    classification.confidence,
+                );
+            }
             if classification.confidence >= 0.60 {
                 self.config.aggressive_in_coding = matches!(
                     classification.workload,
@@ -160,9 +196,9 @@ impl AdaptiveGovernor {
         // 4. Append zombie / dead-weight decisions
         for dw in &dead_weight {
             let gov_decision = match dw.recommended_action {
-                ZombieAction::Kill => GovernerDecision::Kill,
-                ZombieAction::Suspend => GovernerDecision::Freeze,
-                ZombieAction::NiceToMax => GovernerDecision::Throttle,
+                ZombieAction::Kill => GovernorDecision::Kill,
+                ZombieAction::Suspend => GovernorDecision::Freeze,
+                ZombieAction::NiceToMax => GovernorDecision::Throttle,
             };
             decisions.push(ProcessDecision {
                 pid: dw.pid,
@@ -193,7 +229,7 @@ impl AdaptiveGovernor {
             return ProcessDecision {
                 pid: snap.pid,
                 name: snap.name.clone(),
-                decision: GovernerDecision::Allow,
+                decision: GovernorDecision::Allow,
                 tier,
                 utility_score: utility,
                 waste_score: waste,
@@ -201,12 +237,48 @@ impl AdaptiveGovernor {
             };
         }
 
+        // AppHelper (browser renderers, Electron helpers…) — throttle only, nunca freeze.
+        // Chromium/WebKit tienen un watchdog que crashea la tab si el renderer
+        // deja de responder (SIGSTOP). Además, wakeups altos = audio/video en curso.
+        if tier == ProcessTier::AppHelper {
+            if snap.wakeups_per_sec > 5.0 || snap.has_network {
+                // Audio, video, o cargando contenido → no tocar
+                return ProcessDecision {
+                    pid: snap.pid,
+                    name: snap.name.clone(),
+                    decision: GovernorDecision::Allow,
+                    tier,
+                    utility_score: utility,
+                    waste_score: waste,
+                    reason: "AppHelper activo (audio/video/red) — protegido".into(),
+                };
+            }
+            // Sin actividad → throttle suave, pero NUNCA freeze
+            let decision = if utility < self.config.throttle_utility_threshold {
+                GovernorDecision::Throttle
+            } else {
+                GovernorDecision::Allow
+            };
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision,
+                tier,
+                utility_score: utility,
+                waste_score: waste,
+                reason: format!(
+                    "AppHelper inactivo — throttle-only (utility={:.2})",
+                    utility
+                ),
+            };
+        }
+
         // Telemetry — always throttle (or freeze under heavy load)
         if tier == ProcessTier::Telemetry {
             let d = if self.is_heavy_workload(workload) {
-                GovernerDecision::Freeze
+                GovernorDecision::Freeze
             } else {
-                GovernerDecision::Throttle
+                GovernorDecision::Throttle
             };
             return ProcessDecision {
                 pid: snap.pid,
@@ -228,7 +300,7 @@ impl AdaptiveGovernor {
             return ProcessDecision {
                 pid: snap.pid,
                 name: snap.name.clone(),
-                decision: GovernerDecision::Freeze,
+                decision: GovernorDecision::Freeze,
                 tier,
                 utility_score: adjusted_utility,
                 waste_score: waste,
@@ -238,29 +310,84 @@ impl AdaptiveGovernor {
 
         // Waste override — even "useful" processes get throttled if they're
         // burning too many resources while the user isn't using them.
-        if waste >= self.config.waste_override_threshold
-            && adjusted_utility < 0.6
-        {
+        if waste >= self.config.waste_override_threshold && adjusted_utility < 0.6 {
             return ProcessDecision {
                 pid: snap.pid,
                 name: snap.name.clone(),
-                decision: GovernerDecision::Throttle,
+                decision: GovernorDecision::Throttle,
                 tier,
                 utility_score: adjusted_utility,
                 waste_score: waste,
-                reason: format!("High waste ({:.2}) with low utility ({:.2})", waste, adjusted_utility),
+                reason: format!(
+                    "High waste ({:.2}) with low utility ({:.2})",
+                    waste, adjusted_utility
+                ),
             };
         }
 
-        // Normal utility-based decision
-        let decision = if adjusted_utility < self.config.freeze_utility_threshold
+        // Normal utility-based decision with stochastic tie-breaking.
+        //
+        // Cuando varios procesos caen exactamente en la zona gris alrededor de un
+        // threshold (utility ≈ threshold ± GRAY_ZONE), Apollo sin entropía los actuaría
+        // a TODOS en el mismo ciclo → stutter visible o thundering herd de wakeups.
+        //
+        // fast_entropy(pid) usa cntvct_el0 + xorshift64 (~3 ns, sin syscall) para
+        // distribuir esas decisiones en ciclos sucesivos sin introducir ningún estado.
+        const GRAY_ZONE: f32 = 0.02;
+
+        let near_freeze =
+            (adjusted_utility - self.config.freeze_utility_threshold).abs() < GRAY_ZONE;
+        let near_throttle =
+            (adjusted_utility - self.config.throttle_utility_threshold).abs() < GRAY_ZONE;
+
+        let (decision, reason) = if adjusted_utility < self.config.freeze_utility_threshold
             && self.is_heavy_workload(workload)
         {
-            GovernerDecision::Freeze
+            if near_freeze {
+                // Gray zone: stagger freeze/throttle con entropía para evitar herd
+                let d = if fast_entropy(snap.pid as u64) % 2 == 0 {
+                    GovernorDecision::Freeze
+                } else {
+                    GovernorDecision::Throttle
+                };
+                let r = format!(
+                    "utility={:.2} waste={:.2} workload={:?} (gray-zone entropy)",
+                    adjusted_utility, waste, workload
+                );
+                (d, r)
+            } else {
+                let r = format!(
+                    "utility={:.2} waste={:.2} workload={:?}",
+                    adjusted_utility, waste, workload
+                );
+                (GovernorDecision::Freeze, r)
+            }
         } else if adjusted_utility < self.config.throttle_utility_threshold {
-            GovernerDecision::Throttle
+            if near_throttle {
+                // Gray zone: stagger throttle/allow
+                let d = if fast_entropy(snap.pid as u64) % 2 == 0 {
+                    GovernorDecision::Throttle
+                } else {
+                    GovernorDecision::Allow
+                };
+                let r = format!(
+                    "utility={:.2} waste={:.2} workload={:?} (gray-zone entropy)",
+                    adjusted_utility, waste, workload
+                );
+                (d, r)
+            } else {
+                let r = format!(
+                    "utility={:.2} waste={:.2} workload={:?}",
+                    adjusted_utility, waste, workload
+                );
+                (GovernorDecision::Throttle, r)
+            }
         } else {
-            GovernerDecision::Allow
+            let r = format!(
+                "utility={:.2} waste={:.2} workload={:?}",
+                adjusted_utility, waste, workload
+            );
+            (GovernorDecision::Allow, r)
         };
 
         ProcessDecision {
@@ -270,10 +397,7 @@ impl AdaptiveGovernor {
             tier,
             utility_score: adjusted_utility,
             waste_score: waste,
-            reason: format!(
-                "utility={:.2} waste={:.2} workload={:?}",
-                adjusted_utility, waste, workload
-            ),
+            reason,
         }
     }
 
@@ -316,8 +440,13 @@ impl AdaptiveGovernor {
     // ── Helpers ───────────────────────────────────────────────────────────
 
     fn is_heavy_workload(&self, wl: WorkloadType) -> bool {
-        matches!(wl, WorkloadType::Coding | WorkloadType::VideoEdit | WorkloadType::VideoCall)
-            && (self.config.aggressive_in_coding || self.config.aggressive_in_video_edit)
+        match wl {
+            WorkloadType::Coding | WorkloadType::CommandLine => self.config.aggressive_in_coding,
+            WorkloadType::VideoEdit | WorkloadType::VideoCall => {
+                self.config.aggressive_in_video_edit
+            }
+            _ => false,
+        }
     }
 
     /// Summary statistics for the last decision run.
@@ -325,10 +454,10 @@ impl AdaptiveGovernor {
         let mut summary = GovernorSummary::default();
         for d in decisions {
             match d.decision {
-                GovernerDecision::Allow => summary.allowed += 1,
-                GovernerDecision::Throttle => summary.throttled += 1,
-                GovernerDecision::Freeze => summary.frozen += 1,
-                GovernerDecision::Kill => summary.killed += 1,
+                GovernorDecision::Allow => summary.allowed += 1,
+                GovernorDecision::Throttle => summary.throttled += 1,
+                GovernorDecision::Freeze => summary.frozen += 1,
+                GovernorDecision::Kill => summary.killed += 1,
             }
         }
         summary.total = decisions.len();
@@ -349,4 +478,35 @@ pub struct GovernorSummary {
     pub throttled: usize,
     pub frozen: usize,
     pub killed: usize,
+}
+
+/// Calibra los thresholds del governor según el hardware real del chip.
+///
+/// Leído una sola vez al inicio via sysctl (sin root, sin entitlement).
+/// Evita hardcodear valores que asuman M1 cuando corre en M3 Max.
+fn calibrate_config_for_hardware(hw: &SiliconInfo) -> GovernorConfig {
+    let mut cfg = GovernorConfig::default();
+    let cores = hw.physical_cores;
+    let ram_gb = hw.memory_bytes / 1024 / 1024 / 1024;
+
+    // Más cores = más margen para congelar procesos background agresivamente,
+    // porque el workload activo tiene más cores propios disponibles.
+    if cores >= 12 {
+        // M3 Pro/Max, M4 Pro/Max — más cores, algo más agresivo pero sin pasarse
+        cfg.freeze_utility_threshold = 0.08;
+        cfg.throttle_utility_threshold = 0.25;
+    } else if cores >= 10 {
+        // M2 Pro, M3 — tier intermedio
+        cfg.freeze_utility_threshold = 0.06;
+        cfg.throttle_utility_threshold = 0.22;
+    }
+    // M1/M2 base (8 cores) — usa defaults (0.20/0.05)
+
+    // Con poca RAM (8GB), congelar un poco más agresivo para evitar swap.
+    if ram_gb <= 8 {
+        cfg.freeze_utility_threshold = cfg.freeze_utility_threshold.max(0.07);
+        cfg.waste_override_threshold = 0.85;
+    }
+
+    cfg
 }

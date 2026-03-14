@@ -5,6 +5,8 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
+
 #[derive(Debug, Clone)]
 pub struct OptimizationMetric {
     pub timestamp: Instant,
@@ -29,7 +31,7 @@ pub struct Analytics {
 #[derive(Debug, Clone)]
 pub struct Report {
     pub title: String,
-    pub generated_at: Instant,
+    pub generated_at: DateTime<Utc>,
     pub analytics: Analytics,
     pub top_optimizations: Vec<String>,
     pub energy_saved_wh: f32,
@@ -100,8 +102,7 @@ impl AnalyticsEngine {
         for metric in &self.metrics {
             total_cpu_improve += (metric.cpu_usage_before - metric.cpu_usage_after).max(0.0);
             total_mem_freed += metric.memory_before.saturating_sub(metric.memory_after);
-            total_thermal_improve +=
-                (metric.thermal_before - metric.thermal_after).max(0.0);
+            total_thermal_improve += (metric.thermal_before - metric.thermal_after).max(0.0);
         }
 
         Analytics {
@@ -136,15 +137,17 @@ impl AnalyticsEngine {
             top_optimizations.push("High-frequency optimization successful".to_string());
         }
 
-        // Estimate energy saved (1% CPU reduction ≈ 0.5W on typical MacBook)
-        let energy_saved_wh = (analytics.avg_cpu_improvement_percent * 0.5 * analytics.uptime_seconds as f32) / 3600.0;
+        // Estimate energy saved (1% CPU reduction ≈ 0.15W on Apple Silicon)
+        let energy_saved_wh =
+            (analytics.avg_cpu_improvement_percent * 0.15 * analytics.uptime_seconds as f32)
+                / 3600.0;
 
-        // CO2 avoided (0.075g per Wh for grid power)
-        let co2_avoided_grams = energy_saved_wh * 0.075;
+        // CO2 avoided (0.39 g per Wh — US grid average, aligned with EnergyTracker)
+        let co2_avoided_grams = energy_saved_wh * 0.39;
 
         Report {
             title: "Apollo Optimizer Performance Report".to_string(),
-            generated_at: Instant::now(),
+            generated_at: Utc::now(),
             analytics,
             top_optimizations,
             energy_saved_wh,
@@ -167,24 +170,6 @@ impl AnalyticsEngine {
                 )
             })
             .collect()
-    }
-
-    /// Estimate when next major optimization might be needed
-    pub fn estimate_next_optimization(&self) -> u64 {
-        if self.metrics.is_empty() {
-            return 0;
-        }
-
-        // If we've freed >1GB total, probably need another optimization in 2 hours
-        let total_mem = self.metrics.iter()
-            .map(|m| m.memory_before.saturating_sub(m.memory_after))
-            .sum::<u64>();
-
-        if total_mem > 1024 * 1024 * 1024 {
-            7200 // 2 hours in seconds
-        } else {
-            3600 // 1 hour
-        }
     }
 }
 

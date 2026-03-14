@@ -1,8 +1,8 @@
 //! Level 6: TIER 2 Features Tests
 //! Tests for wake_storm_detector and network_optimizer
 
-use apollo_optimizer::engine::wake_storm_detector::{WakeStormDetector, StormSeverity};
 use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfile, NetworkStats};
+use apollo_optimizer::engine::wake_storm_detector::{StormSeverity, WakeStormDetector};
 
 // ============================================================================
 // Wake Storm Detector Tests

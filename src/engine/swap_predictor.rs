@@ -15,17 +15,16 @@ pub struct SwapForecast {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwapTrend {
-    Decreasing,  // Swap usage going down
-    Stable,      // No significant change
-    Increasing,  // Gradual increase
-    Critical,    // Rapid increase
+    Decreasing, // Swap usage going down
+    Stable,     // No significant change
+    Increasing, // Gradual increase
+    Critical,   // Rapid increase
 }
 
 pub struct SwapPredictor {
     history: VecDeque<SwapSnapshot>,
     max_history: usize,
-    swap_critical_threshold: u64, // When to alert (1GB)
-    swap_max_safe: u64,           // Max safe swap (2GB)
+    swap_total: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -39,15 +38,15 @@ impl SwapPredictor {
         Self {
             history: VecDeque::new(),
             max_history: 120, // 2 minutes at 1Hz
-            swap_critical_threshold: 1024 * 1024 * 1024, // 1GB
-            swap_max_safe: 2 * 1024 * 1024 * 1024,       // 2GB
+            swap_total: 0,
         }
     }
 
     /// Update swap metrics and generate forecast.
-    /// `swap_total` is accepted for future use (e.g. percentage-based thresholds).
     pub fn update(&mut self, swap_used: u64, swap_total: u64) -> SwapForecast {
-        let _ = swap_total;
+        if swap_total > 0 {
+            self.swap_total = swap_total;
+        }
         let snapshot = SwapSnapshot {
             timestamp: std::time::Instant::now(),
             swap_used,
@@ -72,27 +71,47 @@ impl SwapPredictor {
         }
     }
 
+    /// Critical threshold: 50% of swap space, minimum 512MB
+    fn critical_threshold(&self) -> u64 {
+        if self.swap_total > 0 {
+            (self.swap_total / 2).max(512 * 1024 * 1024)
+        } else {
+            1024 * 1024 * 1024 // 1GB fallback when swap_total unknown
+        }
+    }
+
+    /// Max safe: 80% of swap space, minimum 1GB
+    fn max_safe(&self) -> u64 {
+        if self.swap_total > 0 {
+            (self.swap_total * 4 / 5).max(1024 * 1024 * 1024)
+        } else {
+            2 * 1024 * 1024 * 1024 // 2GB fallback
+        }
+    }
+
     fn calculate_trend(&self) -> SwapTrend {
         if self.history.len() < 3 {
             return SwapTrend::Stable;
         }
 
         let recent: Vec<_> = self.history.iter().rev().take(10).collect();
-        let mut increases = 0;
+        let mut growth_count = 0;
 
+        // `recent` is in reverse-chronological order: [newest, ..., oldest].
+        // Growth means the newer sample (i-1) has MORE swap than the older (i).
         for i in 1..recent.len() {
-            if recent[i].swap_used < recent[i - 1].swap_used {
-                increases += 1;
+            if recent[i - 1].swap_used > recent[i].swap_used {
+                growth_count += 1;
             }
         }
 
-        let increase_ratio = increases as f32 / (recent.len() - 1).max(1) as f32;
+        let growth_ratio = growth_count as f32 / (recent.len() - 1).max(1) as f32;
 
-        if recent[0].swap_used > self.swap_critical_threshold {
+        if recent[0].swap_used > self.critical_threshold() {
             SwapTrend::Critical
-        } else if increase_ratio > 0.7 {
+        } else if growth_ratio > 0.7 {
             SwapTrend::Increasing
-        } else if increase_ratio > 0.3 {
+        } else if growth_ratio > 0.3 {
             SwapTrend::Stable
         } else {
             SwapTrend::Decreasing
@@ -120,14 +139,14 @@ impl SwapPredictor {
         if rate > 0.0 {
             // Extrapolate 30 seconds into future
             let predicted = (last.swap_used as f64 + (rate * 30.0)).max(0.0) as u64;
-            predicted.min(self.swap_max_safe * 2)
+            predicted.min(self.max_safe() * 2)
         } else {
             last.swap_used
         }
     }
 
     fn time_to_critical(&self, current_swap: u64) -> i32 {
-        if current_swap >= self.swap_critical_threshold {
+        if current_swap >= self.critical_threshold() {
             return 0;
         }
 
@@ -151,7 +170,7 @@ impl SwapPredictor {
         }
 
         let rate = swap_delta / time_delta;
-        let threshold_delta = self.swap_critical_threshold as f64 - current_swap as f64;
+        let threshold_delta = self.critical_threshold() as f64 - current_swap as f64;
         let seconds = (threshold_delta / rate) as i32;
 
         seconds.max(0)
@@ -162,12 +181,15 @@ impl SwapPredictor {
 
         match trend {
             SwapTrend::Critical => {
-                recommendations.push("🔴 CRITICAL: Enable aggressive memory compression".to_string());
+                recommendations
+                    .push("🔴 CRITICAL: Enable aggressive memory compression".to_string());
                 recommendations.push("🔴 Kill non-essential processes immediately".to_string());
             }
             SwapTrend::Increasing => {
-                if swap_used > self.swap_critical_threshold / 2 {
-                    recommendations.push("🟡 Swap usage increasing: Consider reducing background load".to_string());
+                if swap_used > self.critical_threshold() / 2 {
+                    recommendations.push(
+                        "🟡 Swap usage increasing: Consider reducing background load".to_string(),
+                    );
                 }
             }
             _ => {}

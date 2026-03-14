@@ -1,3 +1,4 @@
+use crate::engine::types::HardPath;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -81,7 +82,7 @@ pub struct UsageModel {
 
 impl UsageModel {
     pub fn load(path: &Path) -> Self {
-        let data = std::fs::read_to_string(path).ok();
+        let data = HardPath::read_to_string_limited(path, 10 * 1024 * 1024).ok();
         if let Some(data) = data {
             if let Ok(mut p) = serde_json::from_str::<UsageModelPersisted>(&data) {
                 if p.schema_version == 0 {
@@ -101,17 +102,7 @@ impl UsageModel {
     }
 
     pub fn persist(&self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&self.persisted) {
-            let _ = std::fs::write(path, json);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
+        crate::engine::llm::write_json(path, &self.persisted, Some(0o600));
     }
 
     pub fn update_from_snapshot(
@@ -228,6 +219,7 @@ impl UsageModel {
         now: DateTime<Utc>,
         existing_interactive: &[String],
         existing_noise: &[String],
+        existing_protected: &[String],
         daily_promotions_used: u32,
         started_at: Option<DateTime<Utc>>,
     ) -> Vec<(String, String)> {
@@ -245,6 +237,7 @@ impl UsageModel {
         }
 
         let protected = protected_processes();
+        let never_interactive = never_promote_interactive();
         let mut candidates: Vec<UsageEntrySummary> = self
             .persisted
             .entries
@@ -252,6 +245,7 @@ impl UsageModel {
             .map(summarize_entry)
             .collect();
         candidates.retain(|e| !protected.iter().any(|p| e.name.contains(p)));
+        candidates.retain(|e| !never_interactive.iter().any(|p| e.name.contains(p)));
 
         // Conservative: require age.
         candidates.retain(|e| {
@@ -290,6 +284,7 @@ impl UsageModel {
         }
 
         // Noise promotions.
+        let protected_candidates = candidates.clone();
         let mut noise = candidates;
         // BUG 23 fix: unwrap on partial_cmp could panic if NaN.
         noise.sort_by(|a, b| {
@@ -316,8 +311,94 @@ impl UsageModel {
             promotions.push(("noise".to_string(), e.name));
         }
 
+        // Protected promotions: apps the user switches to frequently and
+        // consistently get a "protected" safety label.  Unlike interactive/noise
+        // promotions these do NOT count against the daily cap — they are safety
+        // annotations that prevent the optimizer from freezing an app the user
+        // actively uses as a secondary window (e.g. Antigravity while Chrome is
+        // in the foreground).
+        //
+        // Thresholds are intentionally high: interactive_ema > 0.55 means the
+        // app was observed as the foreground app in the majority of recent cycles.
+        for e in &protected_candidates {
+            if e.interactive_ema > 0.55
+                && e.presence_ema > 0.40
+                && !existing_protected
+                    .iter()
+                    .any(|p| e.name.contains(p.as_str()))
+                && !promotions.iter().any(|(_, n)| n == &e.name)
+            {
+                promotions.push(("protected".to_string(), e.name.clone()));
+                break; // One per call — policy accumulates over cycles.
+            }
+        }
+
         promotions
     }
+}
+
+/// Processes that must never be promoted to interactive patterns.
+/// These are background daemons, telemetry, and transient launchers that
+/// appear frequently but do not benefit from priority boosting.
+fn never_promote_interactive() -> Vec<&'static str> {
+    vec![
+        // The optimizer itself (circular dependency)
+        "apollo-optimizerd",
+        // Telemetry / analytics
+        "UsageTrackingAgent",
+        "amsengagementd",
+        "ecosystemanalyticsd",
+        "PerfPowerServices",
+        "triald",
+        // Background asset / sync daemons
+        "assetsubscriptiond",
+        "mobileassetd",
+        "searchpartyd",
+        "cloudd",
+        "fileproviderd",
+        "photolibraryd",
+        "softwareupdated",
+        "accessoryupdaterd",
+        // Background ML / analysis
+        "photoanalysisd",
+        "mediaanalysisd",
+        "ModelCatalogAgent",
+        "duetexpertd",
+        // Spotlight / indexing
+        "corespotlightd",
+        "spotlightknowledged",
+        "spindump",
+        // System daemons (no user-visible latency impact)
+        "dasd",
+        "deleted",
+        "ecosystemd",
+        "fseventsd",
+        "logd",
+        "runningboardd",
+        "airportd",
+        "corebrightnessd",
+        // Siri / assistant background
+        "assistantd",
+        "contextstored",
+        "corespeechd",
+        "com.apple.siri.embeddedspeech",
+        "suggestd",
+        // Preference / contacts sync
+        "cfprefsd",
+        "contactsd",
+        // Updaters (not drivers)
+        "logioptionsplus_updater",
+        // Security scanners
+        "XprotectService",
+        // Decorative
+        "WallpaperAerialsExtension",
+        // Transient launchers
+        "xpcproxy",
+        "iconservicesagent",
+        "linkd",
+        "siriactionsd",
+        "com.apple.Safari.SafeBrowsing.Service",
+    ]
 }
 
 pub fn usage_model_path_root(is_root: bool) -> PathBuf {
@@ -347,7 +428,24 @@ fn ema_update(prev: f64, value: f64, decay: f64) -> f64 {
 
 fn summarize_entry(e: &UsageEntry) -> UsageEntrySummary {
     let impact = ((e.cpu_ema + e.mem_ema) * 0.5).clamp(0.0, 1.0);
-    let usage_score = (0.50 * e.presence_ema) + (0.35 * e.interactive_ema) + (0.15 * impact);
+
+    // Memory footprint signal: user-facing apps hold more resident memory
+    // (~50MB-2GB) than background daemons (~1-20MB).  mem_ema is normalised
+    // to 4 GB, so 100 MB → 0.024; amplify 15× to make it meaningful.
+    let mem_signal = (e.mem_ema * 15.0).clamp(0.0, 1.0);
+
+    // Cap presence at 0.6 — beyond this, always-on daemons and heavy user
+    // apps are indistinguishable.  The cap prevents 24/7 daemons from
+    // dominating the ranking solely because of constant uptime.
+    let capped_presence = e.presence_ema.min(0.6);
+
+    // Old formula: 0.50 * presence + 0.35 * interactive + 0.15 * impact
+    // Problem: daemons with presence ~0.91 dominated; real apps ranked below.
+    let usage_score = (0.25 * capped_presence)
+        + (0.35 * e.interactive_ema)
+        + (0.15 * impact)
+        + (0.25 * mem_signal);
+
     let noise_score = (0.60 * e.jank_ema) + (0.40 * impact);
     UsageEntrySummary {
         name: e.raw_name.clone(),

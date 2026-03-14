@@ -1,4 +1,7 @@
 [build]
+# M1 MacBook Air 8GB: limitar a 4 jobs para no reventar la RAM compilando.
+# Rust+LTO puede usar 1-2GB por job; con 4 quedamos en ~5-6GB máximo.
+jobs = 4
 rustflags = ["-C", "target-cpu=native"]
 
 [profile.release]

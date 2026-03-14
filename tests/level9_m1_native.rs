@@ -3,13 +3,11 @@
 //! Tests for mach_qos (P/E-Core routing) and iokit_sensors (hardware telemetry).
 //! All tests are non-root-safe: they verify logic, parsing, and mapping only.
 
-use apollo_optimizer::engine::mach_qos::{
-    MachQoSManager, SchedulingTier, tier_for_process,
-};
-use apollo_optimizer::engine::process_classifier::ProcessTier;
 use apollo_optimizer::engine::iokit_sensors::{
-    IOKitSensorReader, ThermalState, HardwareSnapshot, ClusterTemps, PowerReading,
+    ClusterTemps, HardwareSnapshot, IOKitSensorReader, PowerReading, ThermalState,
 };
+use apollo_optimizer::engine::mach_qos::{tier_for_process, MachQoSManager, SchedulingTier};
+use apollo_optimizer::engine::process_classifier::ProcessTier;
 
 // ── MachQoS unit tests ────────────────────────────────────────────────────────
 
@@ -225,8 +223,18 @@ fn test_parse_powermetrics_inferred_moderate_from_temp() {
 fn test_is_throttled_normal_is_false() {
     let snap = HardwareSnapshot {
         thermal_state: ThermalState::Normal,
-        temps: ClusterTemps { p_cluster_celsius: None, e_cluster_celsius: None, gpu_celsius: None, nand_celsius: None },
-        power: PowerReading { package_watts: None, cpu_watts: None, gpu_watts: None, dram_watts: None },
+        temps: ClusterTemps {
+            p_cluster_celsius: None,
+            e_cluster_celsius: None,
+            gpu_celsius: None,
+            nand_celsius: None,
+        },
+        power: PowerReading {
+            package_watts: None,
+            cpu_watts: None,
+            gpu_watts: None,
+            dram_watts: None,
+        },
         p_cluster_util: None,
         e_cluster_util: None,
         battery_percent: None,
@@ -239,8 +247,18 @@ fn test_is_throttled_normal_is_false() {
 fn test_is_throttled_moderate_is_true() {
     let snap = HardwareSnapshot {
         thermal_state: ThermalState::Moderate,
-        temps: ClusterTemps { p_cluster_celsius: None, e_cluster_celsius: None, gpu_celsius: None, nand_celsius: None },
-        power: PowerReading { package_watts: None, cpu_watts: None, gpu_watts: None, dram_watts: None },
+        temps: ClusterTemps {
+            p_cluster_celsius: None,
+            e_cluster_celsius: None,
+            gpu_celsius: None,
+            nand_celsius: None,
+        },
+        power: PowerReading {
+            package_watts: None,
+            cpu_watts: None,
+            gpu_watts: None,
+            dram_watts: None,
+        },
         p_cluster_util: None,
         e_cluster_util: None,
         battery_percent: None,
@@ -253,12 +271,22 @@ fn test_is_throttled_moderate_is_true() {
 fn test_battery_critical_detection() {
     let snap = HardwareSnapshot {
         thermal_state: ThermalState::Normal,
-        temps: ClusterTemps { p_cluster_celsius: None, e_cluster_celsius: None, gpu_celsius: None, nand_celsius: None },
-        power: PowerReading { package_watts: None, cpu_watts: None, gpu_watts: None, dram_watts: None },
+        temps: ClusterTemps {
+            p_cluster_celsius: None,
+            e_cluster_celsius: None,
+            gpu_celsius: None,
+            nand_celsius: None,
+        },
+        power: PowerReading {
+            package_watts: None,
+            cpu_watts: None,
+            gpu_watts: None,
+            dram_watts: None,
+        },
         p_cluster_util: None,
         e_cluster_util: None,
         battery_percent: Some(15), // Below 20%
-        battery_watts: Some(8.0), // Positive = discharging
+        battery_watts: Some(8.0),  // Positive = discharging
     };
     assert!(IOKitSensorReader::is_battery_critical(&snap));
 }
@@ -267,8 +295,18 @@ fn test_battery_critical_detection() {
 fn test_battery_not_critical_when_charging() {
     let snap = HardwareSnapshot {
         thermal_state: ThermalState::Normal,
-        temps: ClusterTemps { p_cluster_celsius: None, e_cluster_celsius: None, gpu_celsius: None, nand_celsius: None },
-        power: PowerReading { package_watts: None, cpu_watts: None, gpu_watts: None, dram_watts: None },
+        temps: ClusterTemps {
+            p_cluster_celsius: None,
+            e_cluster_celsius: None,
+            gpu_celsius: None,
+            nand_celsius: None,
+        },
+        power: PowerReading {
+            package_watts: None,
+            cpu_watts: None,
+            gpu_watts: None,
+            dram_watts: None,
+        },
         p_cluster_util: None,
         e_cluster_util: None,
         battery_percent: Some(15),
@@ -281,8 +319,18 @@ fn test_battery_not_critical_when_charging() {
 fn test_should_push_to_ecores_when_throttled() {
     let snap = HardwareSnapshot {
         thermal_state: ThermalState::Severe,
-        temps: ClusterTemps { p_cluster_celsius: None, e_cluster_celsius: None, gpu_celsius: None, nand_celsius: None },
-        power: PowerReading { package_watts: None, cpu_watts: None, gpu_watts: None, dram_watts: None },
+        temps: ClusterTemps {
+            p_cluster_celsius: None,
+            e_cluster_celsius: None,
+            gpu_celsius: None,
+            nand_celsius: None,
+        },
+        power: PowerReading {
+            package_watts: None,
+            cpu_watts: None,
+            gpu_watts: None,
+            dram_watts: None,
+        },
         p_cluster_util: None,
         e_cluster_util: None,
         battery_percent: Some(80),
@@ -295,8 +343,18 @@ fn test_should_push_to_ecores_when_throttled() {
 fn test_should_push_to_ecores_when_battery_critical() {
     let snap = HardwareSnapshot {
         thermal_state: ThermalState::Normal,
-        temps: ClusterTemps { p_cluster_celsius: None, e_cluster_celsius: None, gpu_celsius: None, nand_celsius: None },
-        power: PowerReading { package_watts: None, cpu_watts: None, gpu_watts: None, dram_watts: None },
+        temps: ClusterTemps {
+            p_cluster_celsius: None,
+            e_cluster_celsius: None,
+            gpu_celsius: None,
+            nand_celsius: None,
+        },
+        power: PowerReading {
+            package_watts: None,
+            cpu_watts: None,
+            gpu_watts: None,
+            dram_watts: None,
+        },
         p_cluster_util: None,
         e_cluster_util: None,
         battery_percent: Some(10),

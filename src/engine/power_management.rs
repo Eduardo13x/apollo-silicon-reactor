@@ -1,26 +1,29 @@
 //! Power Management Optimization for macOS / Apple Silicon
 //!
-//! Manages power profiles, battery awareness, and pmset-based tuning.
-//! On M1, the OS handles frequency scaling — our lever is QoS class routing
-//! (see mach_qos.rs) plus pmset/sysctl parameters.
+//! Manages power profiles, battery awareness, and real hardware detection.
+//! On M1/M2/M3, the OS handles frequency scaling — our lever is QoS class routing
+//! (see mach_qos.rs). This module is advisory: it reports real state and recommends
+//! power profiles, but does NOT directly control CPU frequency.
+
+use std::process::Command;
 
 // ── Power Mode ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerMode {
-    Performance,  // Max performance, high power
-    Balanced,     // Balanced performance/power
-    Efficiency,   // Maximize efficiency, lower power
-    Battery,      // Maximum battery life
+    Performance, // Max performance, high power
+    Balanced,    // Balanced performance/power
+    Efficiency,  // Maximize efficiency, lower power
+    Battery,     // Maximum battery life
 }
 
 // ── Battery types (merged from battery_optimizer) ────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatteryMode {
-    Normal,    // AC power or >50% battery
-    LowPower,  // 20–50% battery
-    Critical,  // <20% battery
+    Normal,   // AC power or >50% battery
+    LowPower, // 20–50% battery
+    Critical, // <20% battery
 }
 
 #[derive(Debug, Clone)]
@@ -69,62 +72,121 @@ pub struct PowerManager {
     current_mode: PowerMode,
     pub power_state: PowerState,
     // Battery sub-state
-    battery_status: BatteryStatus,
+    pub battery_status: BatteryStatus,
     baseline_discharge_rate: f32,
+}
+
+/// Detect real CPU power state from the system via sysctl.
+///
+/// - `core_count_active`: from `sysctl hw.ncpu` (logical CPUs available).
+/// - `cpu_frequency_mhz`: from `sysctl hw.cpufrequency_max` (Hz, divided by 1_000_000).
+///   Falls back to `sysctl hw.tbfrequency` if cpufrequency_max is unavailable.
+/// - `power_draw_watts`: 0.0 (must be provided externally from IOKit/powermetrics).
+/// - `thermal_headroom`: 100.0 (must be updated externally from IOKit thermal data).
+/// - `idle_percentage`: 50.0 (must be updated externally from system metrics).
+pub fn detect_power_state() -> PowerState {
+    let core_count = read_sysctl_u64("hw.ncpu").unwrap_or(1) as u32;
+
+    let cpu_freq_mhz = read_sysctl_u64("hw.cpufrequency_max")
+        .map(|hz| (hz / 1_000_000) as u32)
+        .or_else(|| read_sysctl_u64("hw.tbfrequency").map(|hz| (hz / 1_000_000) as u32))
+        .unwrap_or(0);
+
+    PowerState {
+        cpu_frequency_mhz: cpu_freq_mhz,
+        core_count_active: core_count,
+        power_draw_watts: 0.0, // No fake value; must come from IOKit/powermetrics
+        thermal_headroom: 100.0, // Assume full headroom until IOKit provides real data
+        idle_percentage: 50.0, // Updated externally by daemon cycle
+    }
+}
+
+/// Read a sysctl value as u64 via `sysctl -n <key>`.
+fn read_sysctl_u64(key: &str) -> Option<u64> {
+    let output = Command::new("/usr/sbin/sysctl")
+        .args(["-n", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim().parse::<u64>().ok()
 }
 
 impl PowerManager {
     pub fn new() -> Self {
+        let power_state = detect_power_state();
+
+        // Detect initial battery status; fall back to sensible defaults (AC power).
+        let battery_status = detect_battery_status().unwrap_or(BatteryStatus {
+            percentage: 100,
+            time_remaining_minutes: 0,
+            is_charging: true,
+            charge_rate_percent_per_hour: 0.0,
+            discharge_rate_percent_per_hour: 0.0,
+        });
+
+        // Initial baseline: use detected discharge rate if discharging, else 0.0.
+        let baseline_discharge_rate = if battery_status.discharge_rate_percent_per_hour > 0.0 {
+            battery_status.discharge_rate_percent_per_hour
+        } else {
+            0.0
+        };
+
         Self {
             current_mode: PowerMode::Balanced,
-            power_state: PowerState {
-                cpu_frequency_mhz: 2400,
-                core_count_active: 8,
-                power_draw_watts: 5.0,
-                thermal_headroom: 15.0,
-                idle_percentage: 50.0,
-            },
-            battery_status: BatteryStatus {
-                percentage: 100,
-                time_remaining_minutes: 600,
-                is_charging: true,
-                charge_rate_percent_per_hour: 50.0,
-                discharge_rate_percent_per_hour: 10.0,
-            },
-            baseline_discharge_rate: 10.0,
+            power_state,
+            battery_status,
+            baseline_discharge_rate,
         }
     }
 
-    /// Get power recommendation for current mode
+    /// Get power recommendation for current mode.
+    ///
+    /// Advisory only — on Apple Silicon, macOS controls actual frequency.
+    /// `target_frequency` is expressed as a percentage of the detected max frequency.
+    /// `active_cores` is expressed as a fraction of detected core count.
     pub fn get_recommendation(&self) -> PowerRecommendation {
+        let max_freq = self.power_state.cpu_frequency_mhz;
+        let max_cores = self.power_state.core_count_active;
+
         match self.current_mode {
             PowerMode::Performance => PowerRecommendation {
                 mode: PowerMode::Performance,
-                target_frequency: 3200,
-                active_cores: 8,
+                // 100% of detected max frequency
+                target_frequency: max_freq,
+                active_cores: max_cores,
                 deep_sleep_enabled: false,
-                expected_power_mw: 12000,
+                // Estimate: ~1.5W per core at full frequency
+                expected_power_mw: (max_cores * 1500).max(2000),
             },
             PowerMode::Balanced => PowerRecommendation {
                 mode: PowerMode::Balanced,
-                target_frequency: 2400,
-                active_cores: 6,
+                // 75% of detected max frequency
+                target_frequency: (max_freq as f32 * 0.75) as u32,
+                // 75% of cores (at least 1)
+                active_cores: ((max_cores as f32 * 0.75) as u32).max(1),
                 deep_sleep_enabled: true,
-                expected_power_mw: 8000,
+                expected_power_mw: (max_cores * 1000).max(1000),
             },
             PowerMode::Efficiency => PowerRecommendation {
                 mode: PowerMode::Efficiency,
-                target_frequency: 1800,
-                active_cores: 4,
+                // 50% of detected max frequency
+                target_frequency: (max_freq as f32 * 0.50) as u32,
+                // 50% of cores (at least 1)
+                active_cores: ((max_cores as f32 * 0.50) as u32).max(1),
                 deep_sleep_enabled: true,
-                expected_power_mw: 4000,
+                expected_power_mw: (max_cores * 500).max(500),
             },
             PowerMode::Battery => PowerRecommendation {
                 mode: PowerMode::Battery,
-                target_frequency: 1200,
-                active_cores: 2,
+                // 30% of detected max frequency
+                target_frequency: (max_freq as f32 * 0.30) as u32,
+                // 25% of cores (at least 1)
+                active_cores: ((max_cores as f32 * 0.25) as u32).max(1),
                 deep_sleep_enabled: true,
-                expected_power_mw: 2000,
+                expected_power_mw: (max_cores * 250).max(250),
             },
         }
     }
@@ -134,89 +196,53 @@ impl PowerManager {
         self.current_mode = mode;
     }
 
-    /// Optimize idle behaviour based on workload.
-    /// On M1 macOS the OS controls C-states; we can only influence
-    /// pmset settings like standbydelay and autopoweroff.
-    pub fn optimize_idle_states(&mut self) {
-        // High idle: encourage deeper sleep via pmset tuning
-        // Low idle: keep cores responsive
-        // The actual pmset changes are surfaced via get_pmset_recommendations()
-    }
-
-    /// Estimate power consumption for a workload
+    /// Estimate power consumption for a workload, parameterized by the real system state.
+    ///
+    /// Uses the detected `cpu_frequency_mhz` and `core_count_active` as the baseline
+    /// instead of hardcoded constants. Returns estimated watts.
     pub fn estimate_power(
         &self,
         frequency_mhz: u32,
         core_count: u32,
         utilization_percent: f32,
     ) -> f32 {
-        let base_power = 2.0; // Watts (SoC base)
-        let freq_factor = (frequency_mhz as f32 / 2400.0) * 3.0;
-        let core_factor = (core_count as f32 / 8.0) * 2.0;
+        // Base SoC power floor (always consumed even at idle)
+        let base_power: f32 = 1.0;
+
+        // Frequency contribution: proportional to requested vs detected max
+        let max_freq = self.power_state.cpu_frequency_mhz.max(1) as f32;
+        let freq_factor = (frequency_mhz as f32 / max_freq) * 3.0;
+
+        // Core contribution: proportional to requested vs detected total
+        let max_cores = self.power_state.core_count_active.max(1) as f32;
+        let core_factor = (core_count as f32 / max_cores) * 2.0;
+
+        // Utilization contribution
         let util_factor = (utilization_percent / 100.0) * 2.0;
 
         base_power + freq_factor + core_factor + util_factor
     }
 
-    /// macOS sysctl recommendations for power management.
-    /// Note: `pm.powernap` is actually a `pmset` parameter, not a sysctl.
-    /// We include both real sysctls and pmset recommendations here,
-    /// tagged by their namespace.
-    pub fn get_sysctl_recommendations(&self, mode: PowerMode) -> Vec<(String, String)> {
-        let mut recommendations = Vec::new();
-
-        match mode {
-            PowerMode::Performance => {
-                // Raise file descriptor limits for heavy workloads
-                recommendations.push(("kern.maxfiles".to_string(), "200000".to_string()));
-                // Disable Power Nap to prevent background activity
-                recommendations.push(("pmset.powernap".to_string(), "0".to_string()));
-                // Keep disks spinning
-                recommendations.push(("pmset.disksleep".to_string(), "0".to_string()));
-            }
-            PowerMode::Balanced => {
-                recommendations.push(("pmset.powernap".to_string(), "1".to_string()));
-                recommendations.push(("pmset.disksleep".to_string(), "10".to_string()));
-            }
-            PowerMode::Efficiency => {
-                recommendations.push(("pmset.powernap".to_string(), "1".to_string()));
-                recommendations.push(("pmset.disksleep".to_string(), "5".to_string()));
-                recommendations.push(("pmset.sleep".to_string(), "10".to_string()));
-            }
-            PowerMode::Battery => {
-                recommendations.push(("pmset.powernap".to_string(), "0".to_string()));
-                recommendations.push(("pmset.disksleep".to_string(), "2".to_string()));
-                recommendations.push(("pmset.sleep".to_string(), "5".to_string()));
-                recommendations.push(("pmset.lessbright".to_string(), "1".to_string()));
-            }
-        }
-
-        recommendations
-    }
-
-    /// Check if CPU frequency scaling would be beneficial
-    pub fn needs_frequency_scaling(&self) -> bool {
-        self.power_state.idle_percentage > 70.0 && self.power_state.cpu_frequency_mhz > 1800
-    }
-
-    /// Get thermal headroom for increasing frequency
-    pub fn get_thermal_headroom(&self) -> f32 {
-        self.power_state.thermal_headroom
-    }
-
     // ── Battery management (merged from battery_optimizer) ───────────────────
 
-    /// Determine battery mode from percentage
+    /// Determine battery mode from percentage.
+    /// Uses open-ended range for Normal (50..) to handle any value >= 50.
     pub fn get_battery_mode(&self, percentage: u32) -> BatteryMode {
         match percentage {
-            50..=100 => BatteryMode::Normal,
+            50.. => BatteryMode::Normal,
             20..=49 => BatteryMode::LowPower,
             _ => BatteryMode::Critical,
         }
     }
 
-    /// Update battery status
+    /// Update battery status and recalibrate baseline discharge rate.
+    ///
+    /// When the system is discharging, the real discharge rate becomes the new baseline
+    /// for time-remaining predictions.
     pub fn update_battery_status(&mut self, status: BatteryStatus) {
+        if status.discharge_rate_percent_per_hour > 0.0 {
+            self.baseline_discharge_rate = status.discharge_rate_percent_per_hour;
+        }
         self.battery_status = status;
     }
 
@@ -255,8 +281,15 @@ impl PowerManager {
         }
     }
 
-    /// Predict time remaining with or without optimizations
+    /// Predict time remaining with or without optimizations.
+    ///
+    /// Uses the dynamically-calibrated `baseline_discharge_rate` (updated from
+    /// real battery readings) rather than a hardcoded constant.
     pub fn predict_time_remaining(&self, with_optimization: bool) -> u32 {
+        if self.baseline_discharge_rate <= 0.0 {
+            // No discharge data available (AC power or no battery)
+            return 0;
+        }
         if with_optimization {
             let reduced_rate = self.baseline_discharge_rate * 0.6;
             let remaining_percent = self.battery_status.percentage as f32;
@@ -266,46 +299,14 @@ impl PowerManager {
         }
     }
 
-    /// Aggressive power actions for critical battery
-    pub fn get_critical_actions(&self) -> Vec<String> {
-        vec![
-            "Reduce CPU frequency to minimum".to_string(),
-            "Disable GPU acceleration".to_string(),
-            "Disable background app refresh".to_string(),
-            "Reduce screen brightness to 40%".to_string(),
-            "Disable Wi-Fi scanning".to_string(),
-            "Disable Bluetooth".to_string(),
-            "Close non-essential applications".to_string(),
-        ]
+    /// Returns true when the machine is running on battery (not charging).
+    pub fn is_on_battery(&self) -> bool {
+        !self.battery_status.is_charging
     }
 
-    /// Estimate power savings from battery mode
-    pub fn estimate_power_savings_percent(&self, mode: BatteryMode) -> f32 {
-        match mode {
-            BatteryMode::Normal => 0.0,
-            BatteryMode::LowPower => 25.0,
-            BatteryMode::Critical => 50.0,
-        }
-    }
-
-    /// macOS services that should be disabled in each battery mode
-    pub fn get_apps_to_disable(&self, mode: BatteryMode) -> Vec<String> {
-        match mode {
-            BatteryMode::Normal => vec![],
-            BatteryMode::LowPower => vec![
-                "Spotlight indexing".to_string(),
-                "Time Machine".to_string(),
-                "iCloud sync".to_string(),
-            ],
-            BatteryMode::Critical => vec![
-                "Spotlight indexing".to_string(),
-                "Time Machine".to_string(),
-                "iCloud sync".to_string(),
-                "Dropbox sync".to_string(),
-                "Mail fetch".to_string(),
-                "Photo library sync".to_string(),
-            ],
-        }
+    /// Returns the current BatteryMode derived from the current battery percentage.
+    pub fn battery_mode_current(&self) -> BatteryMode {
+        self.get_battery_mode(self.battery_status.percentage)
     }
 
     /// Check if battery needs emergency intervention
@@ -315,17 +316,258 @@ impl PowerManager {
 
     /// Calculate time until critical level (20%)
     pub fn time_to_critical(&self) -> u32 {
-        if self.battery_status.percentage <= 20 {
+        if self.battery_status.percentage <= 20 || self.baseline_discharge_rate <= 0.0 {
             0
         } else {
             let percent_to_critical = self.battery_status.percentage - 20;
             ((percent_to_critical as f32) / self.baseline_discharge_rate * 60.0) as u32
         }
     }
+
+    /// Update thermal headroom from IOKit thermal level.
+    ///
+    /// `thermal_level` is a 0.0–1.0 value where 0.0 = cool, 1.0 = critical.
+    /// Headroom = 100.0 - (thermal_level * 100.0), clamped to [0, 100].
+    pub fn update_thermal_headroom(&mut self, thermal_level: f32) {
+        self.power_state.thermal_headroom = (100.0 - thermal_level * 100.0).clamp(0.0, 100.0);
+    }
+
+    /// Update power draw from IOKit/powermetrics data.
+    pub fn update_power_draw(&mut self, watts: f32) {
+        self.power_state.power_draw_watts = watts;
+    }
+
+    /// Update idle percentage from system metrics.
+    pub fn update_idle_percentage(&mut self, idle: f32) {
+        self.power_state.idle_percentage = idle;
+    }
+}
+
+/// Detect real battery status from the system.
+/// Uses `pmset -g batt` as the data source.
+/// Returns `None` if battery info cannot be determined (e.g., desktop Mac, pmset unavailable).
+///
+/// Example output from `pmset -g batt`:
+/// ```text
+/// Now drawing from 'Battery Power'
+///  -InternalBattery-0 (id=xxx)    72%; discharging; 3:42 remaining present: true
+/// ```
+/// or:
+/// ```text
+/// Now drawing from 'AC Power'
+///  -InternalBattery-0 (id=xxx)    100%; charged; 0:00 remaining present: true
+/// ```
+pub fn detect_battery_status() -> Option<BatteryStatus> {
+    let output = Command::new("/usr/bin/pmset")
+        .args(["-g", "batt"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_pmset_battery(&text)
+}
+
+/// Parse the text output of `pmset -g batt` into a `BatteryStatus`.
+/// Returns `None` if no internal battery is found (desktop Mac) or output is unparseable.
+fn parse_pmset_battery(text: &str) -> Option<BatteryStatus> {
+    // Determine charging state from the first line.
+    // "Now drawing from 'Battery Power'" => not charging
+    // "Now drawing from 'AC Power'"      => charging (or charged)
+    let first_line = text.lines().next().unwrap_or("");
+    let drawing_from_battery = first_line.contains("Battery Power");
+
+    // Find the battery detail line (contains "InternalBattery").
+    let battery_line = text.lines().find(|l| l.contains("InternalBattery"))?;
+
+    // Parse percentage: look for "XX%"
+    let percentage = {
+        let mut pct: Option<u32> = None;
+        for token in battery_line.split([';', '\t', ' ']) {
+            let trimmed = token.trim();
+            if let Some(num_str) = trimmed.strip_suffix('%') {
+                if let Ok(v) = num_str.parse::<u32>() {
+                    pct = Some(v);
+                    break;
+                }
+            }
+        }
+        pct?
+    };
+
+    // Parse state: "charging", "discharging", "charged", "finishing charge", "(no estimate)"
+    let is_charging = !drawing_from_battery
+        && (battery_line.contains("charging") || battery_line.contains("charged"))
+        && !battery_line.contains("discharging");
+
+    // Parse time remaining: "H:MM remaining"
+    let time_remaining_minutes = parse_time_remaining(battery_line);
+
+    // Estimate discharge/charge rates from percentage and time remaining.
+    let (charge_rate, discharge_rate) = if let Some(mins) = time_remaining_minutes {
+        if mins > 0 {
+            if is_charging {
+                let remaining_to_full = 100u32.saturating_sub(percentage);
+                let rate = (remaining_to_full as f32 / mins as f32) * 60.0;
+                (rate, 0.0)
+            } else {
+                let rate = (percentage as f32 / mins as f32) * 60.0;
+                (0.0, rate)
+            }
+        } else {
+            (0.0, 0.0)
+        }
+    } else {
+        // No time estimate available — use conservative defaults.
+        if is_charging {
+            (20.0, 0.0)
+        } else {
+            (0.0, 10.0)
+        }
+    };
+
+    Some(BatteryStatus {
+        percentage,
+        time_remaining_minutes: time_remaining_minutes.unwrap_or(0),
+        is_charging,
+        charge_rate_percent_per_hour: charge_rate,
+        discharge_rate_percent_per_hour: discharge_rate,
+    })
+}
+
+/// Parse "H:MM remaining" from a pmset battery line.
+/// Returns total minutes, or None if no time estimate is available.
+fn parse_time_remaining(line: &str) -> Option<u32> {
+    // "(no estimate)" or "not charging" — no time info.
+    if line.contains("no estimate") || line.contains("not charging") {
+        return None;
+    }
+    // Look for a token matching "H:MM" followed by "remaining".
+    let parts: Vec<&str> = line.split(';').collect();
+    for part in &parts {
+        let trimmed = part.trim();
+        if trimmed.contains("remaining") {
+            // Extract "H:MM" from e.g. "3:42 remaining"
+            for token in trimmed.split_whitespace() {
+                if token.contains(':') {
+                    let hm: Vec<&str> = token.split(':').collect();
+                    if hm.len() == 2 {
+                        if let (Ok(h), Ok(m)) = (hm[0].parse::<u32>(), hm[1].parse::<u32>()) {
+                            return Some(h * 60 + m);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 impl Default for PowerManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_power_state_returns_real_values() {
+        let state = detect_power_state();
+        // On any real macOS machine, hw.ncpu should return >= 1
+        assert!(
+            state.core_count_active >= 1,
+            "core_count_active should be >= 1, got {}",
+            state.core_count_active
+        );
+        // cpu_frequency_mhz: on Apple Silicon hw.cpufrequency_max may not exist,
+        // but hw.tbfrequency should. Either way the result is >= 0.
+        // power_draw_watts should be 0.0 (not invented)
+        assert_eq!(state.power_draw_watts, 0.0);
+        // thermal_headroom should be 100.0 (full headroom until real data)
+        assert_eq!(state.thermal_headroom, 100.0);
+    }
+
+    #[test]
+    fn test_parse_battery_power() {
+        let output = "Now drawing from 'Battery Power'\n \
+            -InternalBattery-0 (id=12345678)\t72%; discharging; 3:42 remaining present: true\n";
+        let status = parse_pmset_battery(output).unwrap();
+        assert_eq!(status.percentage, 72);
+        assert!(!status.is_charging);
+        assert_eq!(status.time_remaining_minutes, 222); // 3*60+42
+        assert!(status.discharge_rate_percent_per_hour > 0.0);
+        assert_eq!(status.charge_rate_percent_per_hour, 0.0);
+    }
+
+    #[test]
+    fn test_parse_ac_power_charging() {
+        let output = "Now drawing from 'AC Power'\n \
+            -InternalBattery-0 (id=12345678)\t85%; charging; 0:45 remaining present: true\n";
+        let status = parse_pmset_battery(output).unwrap();
+        assert_eq!(status.percentage, 85);
+        assert!(status.is_charging);
+        assert_eq!(status.time_remaining_minutes, 45);
+        assert!(status.charge_rate_percent_per_hour > 0.0);
+        assert_eq!(status.discharge_rate_percent_per_hour, 0.0);
+    }
+
+    #[test]
+    fn test_parse_ac_power_charged() {
+        let output = "Now drawing from 'AC Power'\n \
+            -InternalBattery-0 (id=12345678)\t100%; charged; 0:00 remaining present: true\n";
+        let status = parse_pmset_battery(output).unwrap();
+        assert_eq!(status.percentage, 100);
+        assert!(status.is_charging);
+        assert_eq!(status.time_remaining_minutes, 0);
+    }
+
+    #[test]
+    fn test_parse_no_battery_desktop() {
+        let output = "Now drawing from 'AC Power'\n";
+        let status = parse_pmset_battery(output);
+        assert!(status.is_none());
+    }
+
+    #[test]
+    fn test_parse_no_estimate() {
+        let output = "Now drawing from 'Battery Power'\n \
+            -InternalBattery-0 (id=12345678)\t55%; discharging; (no estimate) present: true\n";
+        let status = parse_pmset_battery(output).unwrap();
+        assert_eq!(status.percentage, 55);
+        assert!(!status.is_charging);
+        assert_eq!(status.time_remaining_minutes, 0);
+    }
+
+    #[test]
+    fn test_battery_mode_high_percentage() {
+        // Verify that percentages > 100 (edge case) map to Normal, not panic
+        let manager = PowerManager::new();
+        assert_eq!(manager.get_battery_mode(150), BatteryMode::Normal);
+        assert_eq!(manager.get_battery_mode(100), BatteryMode::Normal);
+        assert_eq!(manager.get_battery_mode(50), BatteryMode::Normal);
+    }
+
+    #[test]
+    fn test_update_battery_status_calibrates_baseline() {
+        let mut manager = PowerManager::new();
+        let status = BatteryStatus {
+            percentage: 60,
+            time_remaining_minutes: 180,
+            is_charging: false,
+            charge_rate_percent_per_hour: 0.0,
+            discharge_rate_percent_per_hour: 15.0,
+        };
+        manager.update_battery_status(status);
+        // baseline_discharge_rate should now be 15.0
+        // Verify via time_to_critical which uses baseline_discharge_rate
+        let ttc = manager.time_to_critical();
+        // (60 - 20) / 15.0 * 60 = 160 minutes
+        assert_eq!(ttc, 160);
     }
 }

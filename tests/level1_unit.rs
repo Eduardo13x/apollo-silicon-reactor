@@ -5,8 +5,8 @@
 //! and EMA convergence (BUG 13).
 
 use apollo_optimizer::engine::safety::{
-    allowlisted_sysctls, critical_background_processes, enforce_limits,
-    enforce_limits_with_budget, protected_processes,
+    allowlisted_sysctls, critical_background_processes, enforce_limits, enforce_limits_with_budget,
+    protected_processes,
 };
 use apollo_optimizer::engine::types::{
     ActionBudgetState, OptimizationProfile, RootAction, SafetyPolicy,
@@ -31,6 +31,8 @@ fn make_throttles(n: usize) -> Vec<RootAction> {
             name: format!("bg-{}", i),
             aggressive: false,
             reason: "test throttle".into(),
+            start_sec: 0,
+            start_usec: 0,
         })
         .collect()
 }
@@ -41,6 +43,8 @@ fn make_freezes(n: usize) -> Vec<RootAction> {
             pid: (3000 + i) as u32,
             name: format!("slack-{}", i),
             reason: "test freeze".into(),
+            start_sec: 0,
+            start_usec: 0,
         })
         .collect()
 }
@@ -59,7 +63,11 @@ fn tick_rate_gt_15_maps_to_300s() {
 #[test]
 fn tick_rate_eq_15_does_not_map_to_300s() {
     // Exactly 15 must NOT trigger the 300s sleep branch.
-    assert_eq!(15u64.cmp(&15), std::cmp::Ordering::Equal, "pro-mode tick must be exactly 15");
+    assert_eq!(
+        15u64.cmp(&15),
+        std::cmp::Ordering::Equal,
+        "pro-mode tick must be exactly 15"
+    );
 }
 
 // ── SafetyPolicy invariants ───────────────────────────────────────────────────
@@ -75,12 +83,8 @@ fn aggressive_profile_has_higher_caps_than_safe() {
         aggressive.max_boosts_per_cycle,
         safe.max_boosts_per_cycle
     );
-    assert!(
-        aggressive.max_throttles_per_cycle > safe.max_throttles_per_cycle
-    );
-    assert!(
-        aggressive.max_freezes_per_cycle > safe.max_freezes_per_cycle
-    );
+    assert!(aggressive.max_throttles_per_cycle > safe.max_throttles_per_cycle);
+    assert!(aggressive.max_freezes_per_cycle > safe.max_freezes_per_cycle);
 }
 
 #[test]
@@ -116,7 +120,10 @@ fn enforce_limits_caps_boosts_at_policy_max() {
         .iter()
         .filter(|a| matches!(a, RootAction::BoostProcess { .. }))
         .count();
-    assert_eq!(count, policy.max_boosts_per_cycle, "boosts must be capped at policy max");
+    assert_eq!(
+        count, policy.max_boosts_per_cycle,
+        "boosts must be capped at policy max"
+    );
 }
 
 #[test]
@@ -144,7 +151,7 @@ fn enforce_limits_caps_freezes_at_policy_max() {
 }
 
 #[test]
-fn enforce_limits_allows_all_sysctl_actions() {
+fn enforce_limits_caps_sysctl_at_policy_max() {
     let policy = SafetyPolicy::for_profile(OptimizationProfile::BalancedRoot);
     let actions: Vec<RootAction> = (0..30)
         .map(|i| RootAction::SetSysctl {
@@ -153,9 +160,15 @@ fn enforce_limits_allows_all_sysctl_actions() {
             reason: "test".into(),
         })
         .collect();
-    // Sysctl actions have no per-cycle policy cap; all pass through enforce_limits.
     let filtered = enforce_limits(actions, &policy);
-    assert_eq!(filtered.len(), 30, "all sysctl actions pass enforce_limits");
+    let count = filtered
+        .iter()
+        .filter(|a| matches!(a, RootAction::SetSysctl { .. }))
+        .count();
+    assert_eq!(
+        count, policy.max_sysctl_writes_per_cycle,
+        "sysctl actions must be capped at policy max"
+    );
 }
 
 // ── enforce_limits_with_budget: minute cap ───────────────────────────────────
@@ -165,7 +178,10 @@ fn budget_minute_cap_stops_actions_exactly() {
     let policy = SafetyPolicy::for_profile(OptimizationProfile::AggressiveRoot);
     let minute_cap = 5;
     let mut budget = ActionBudgetState::default();
-    let actions: Vec<RootAction> = make_boosts(10).into_iter().chain(make_throttles(10)).collect();
+    let actions: Vec<RootAction> = make_boosts(10)
+        .into_iter()
+        .chain(make_throttles(10))
+        .collect();
 
     let filtered = enforce_limits_with_budget(actions, &policy, &mut budget, minute_cap);
 
@@ -242,8 +258,16 @@ fn allowlist_contains_required_vm_and_net_keys() {
 #[test]
 fn allowlist_excludes_dangerous_sysctls() {
     let allowed = allowlisted_sysctls();
-    for key in &["kern.securelevel", "vm.swapfileprefix", "security.mac.sandbox.enable"] {
-        assert!(!allowed.contains(*key), "'{}' must NOT be in allowlist", key);
+    for key in &[
+        "kern.securelevel",
+        "vm.swapfileprefix",
+        "security.mac.sandbox.enable",
+    ] {
+        assert!(
+            !allowed.contains(*key),
+            "'{}' must NOT be in allowlist",
+            key
+        );
     }
 }
 
@@ -252,8 +276,18 @@ fn allowlist_excludes_dangerous_sysctls() {
 #[test]
 fn protected_always_contains_kernel_essentials() {
     let protected = protected_processes();
-    for name in &["kernel_task", "launchd", "WindowServer", "loginwindow", "securityd"] {
-        assert!(protected.contains(*name), "'{}' must be in protected_processes", name);
+    for name in &[
+        "kernel_task",
+        "launchd",
+        "WindowServer",
+        "loginwindow",
+        "securityd",
+    ] {
+        assert!(
+            protected.contains(*name),
+            "'{}' must be in protected_processes",
+            name
+        );
     }
 }
 
@@ -261,7 +295,11 @@ fn protected_always_contains_kernel_essentials() {
 fn protected_contains_spotlight_stack() {
     let protected = protected_processes();
     for name in &["mds", "mds_stores", "mdworker"] {
-        assert!(protected.contains(*name), "Spotlight process '{}' must be protected", name);
+        assert!(
+            protected.contains(*name),
+            "Spotlight process '{}' must be protected",
+            name
+        );
     }
 }
 
@@ -270,7 +308,14 @@ fn protected_contains_spotlight_stack() {
 #[test]
 fn critical_bg_contains_dev_workloads() {
     let critical = critical_background_processes();
-    for name in &["docker", "postgres", "redis-server", "nginx", "node", "python"] {
+    for name in &[
+        "docker",
+        "postgres",
+        "redis-server",
+        "nginx",
+        "node",
+        "python",
+    ] {
         assert!(
             critical.contains(*name),
             "'{}' must be in critical_background_processes",

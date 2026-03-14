@@ -65,7 +65,9 @@ impl SysctlTuner {
 
     pub fn check_server_mode(&self) {
         println!("🔍 Checking Server Performance Mode...");
-        let output = Command::new("serverinfo").arg("--perfmode").output();
+        let output = Command::new("/usr/sbin/serverinfo")
+            .arg("--perfmode")
+            .output();
 
         match output {
             Ok(out) => {
@@ -104,7 +106,7 @@ impl SysctlTuner {
 
     fn set_sysctl(&self, key: &str, value: &str) {
         // Attempt to set sysctl. This might fail without sudo.
-        let output = Command::new("sysctl")
+        let output = Command::new("/usr/sbin/sysctl")
             .args(["-w", &format!("{}={}", key, value)])
             .output();
 

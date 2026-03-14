@@ -12,6 +12,21 @@ cd "$ROOT_DIR"
 
 cargo build --release
 
+# ── Code signing (optional, requires Apple Developer certificate) ─────────────
+# If APOLLO_SIGN_ID is set, sign with entitlements to unlock private APIs.
+# Example: APOLLO_SIGN_ID="Developer ID Application: Tu Nombre (TEAMID)" ./install-root-daemon.sh
+ENTITLEMENTS="$ROOT_DIR/scripts/apollo-optimizerd.entitlements"
+if [[ -n "${APOLLO_SIGN_ID:-}" ]]; then
+    echo "Signing with identity: $APOLLO_SIGN_ID"
+    codesign --force --options runtime \
+        --entitlements "$ENTITLEMENTS" \
+        --sign "$APOLLO_SIGN_ID" \
+        "$ROOT_DIR/target/release/apollo-optimizerd"
+    codesign --force --options runtime \
+        --sign "$APOLLO_SIGN_ID" \
+        "$ROOT_DIR/target/release/apollo-optimizerctl"
+fi
+
 sudo mkdir -p /usr/local/libexec /usr/local/bin /var/lib/apollo /etc/apollo-optimizer /var/log
 sudo cp "$ROOT_DIR/target/release/apollo-optimizerd" "$DAEMON_DST"
 sudo cp "$ROOT_DIR/target/release/apollo-optimizerctl" "$CTL_DST"

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <!-- ── Hardened runtime base ─────────────────────────────────────────── -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <false/>
+
+    <!-- ── task_for_pid: read task ports of any process (incl. SIP-protected) -->
+    <!-- Requires Apple Developer Program + entitlement approval               -->
+    <key>com.apple.system-task-ports</key>
+    <true/>
+
+    <!-- ── Jetsam / memorystatus_control ────────────────────────────────── -->
+    <!-- Works as root without this, but needed for non-root distribution    -->
+    <key>com.apple.private.memorystatus</key>
+    <true/>
+
+    <!-- ── Energy usage: real mW per process (like Activity Monitor)        -->
+    <!-- Requires Apple partnership request                                   -->
+    <key>com.apple.private.energyusage</key>
+    <true/>
+
+    <!-- ── Thermal daemon client: pre-throttle notifications from kernel     -->
+    <!-- Requires Apple partnership request                                   -->
+    <key>com.apple.private.thermald.client</key>
+    <true/>
+
+    <!-- ── Network Extension: per-process traffic filtering/throttling       -->
+    <!-- Available via Apple Developer portal request (used by Little Snitch) -->
+    <key>com.apple.developer.network-filter.packets</key>
+    <true/>
+
+    <!-- ── IOKit: direct SMC access (fans, voltages, power per core)         -->
+    <key>com.apple.private.iokit.access</key>
+    <true/>
+
+</dict>
+</plist>

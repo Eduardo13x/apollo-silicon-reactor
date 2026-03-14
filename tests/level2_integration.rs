@@ -51,9 +51,23 @@ fn execute_boost_dead_pid_is_skipped() {
         reason: "test".into(),
     }];
     let mut frozen = HashSet::new();
-    let outcomes = execute_actions(actions, &no_caps(), null_journal(), &mut frozen);
-    assert_eq!(outcomes.failures, 0, "dead-PID boost must not count as failure");
-    assert_eq!(outcomes.boosts_applied, 0, "boost must not be counted on dead PID");
+    let outcomes = execute_actions(
+        actions,
+        &no_caps(),
+        null_journal(),
+        &mut frozen,
+        &[],
+        &[],
+        None,
+    );
+    assert_eq!(
+        outcomes.failures, 0,
+        "dead-PID boost must not count as failure"
+    );
+    assert_eq!(
+        outcomes.boosts_applied, 0,
+        "boost must not be counted on dead PID"
+    );
 }
 
 /// Freeze action on a dead PID must be silently skipped.
@@ -63,12 +77,28 @@ fn execute_freeze_dead_pid_is_skipped() {
         pid: dead_pid(),
         name: "ghost-app".into(),
         reason: "test".into(),
+        start_sec: 0,
+        start_usec: 0,
     }];
     let mut frozen = HashSet::new();
-    let outcomes = execute_actions(actions, &no_caps(), null_journal(), &mut frozen);
-    assert_eq!(outcomes.freezes_applied, 0, "dead PID must not be counted as frozen");
+    let outcomes = execute_actions(
+        actions,
+        &no_caps(),
+        null_journal(),
+        &mut frozen,
+        &[],
+        &[],
+        None,
+    );
+    assert_eq!(
+        outcomes.freezes_applied, 0,
+        "dead PID must not be counted as frozen"
+    );
     assert_eq!(outcomes.failures, 0);
-    assert!(!frozen.contains(&dead_pid()), "dead PID must not appear in frozen set");
+    assert!(
+        !frozen.contains(&dead_pid()),
+        "dead PID must not appear in frozen set"
+    );
 }
 
 /// Throttle action on a dead PID must be silently skipped.
@@ -79,9 +109,19 @@ fn execute_throttle_dead_pid_is_skipped() {
         name: "ghost-app".into(),
         aggressive: true,
         reason: "test".into(),
+        start_sec: 0,
+        start_usec: 0,
     }];
     let mut frozen = HashSet::new();
-    let outcomes = execute_actions(actions, &no_caps(), null_journal(), &mut frozen);
+    let outcomes = execute_actions(
+        actions,
+        &no_caps(),
+        null_journal(),
+        &mut frozen,
+        &[],
+        &[],
+        None,
+    );
     assert_eq!(outcomes.throttles_applied, 0);
     assert_eq!(outcomes.failures, 0);
 }
@@ -95,10 +135,24 @@ fn execute_unfreeze_dead_pid_is_safe() {
     }];
     let mut frozen = HashSet::new();
     frozen.insert(dead_pid());
-    let outcomes = execute_actions(actions, &no_caps(), null_journal(), &mut frozen);
+    let outcomes = execute_actions(
+        actions,
+        &no_caps(),
+        null_journal(),
+        &mut frozen,
+        &[],
+        &[],
+        None,
+    );
     // Unfreeze always increments even on dead PID (SIGCONT to dead PID is a no-op).
-    assert_eq!(outcomes.failures, 0, "unfreeze of dead PID must not be a failure");
-    assert!(!frozen.contains(&dead_pid()), "PID removed from frozen set after unfreeze");
+    assert_eq!(
+        outcomes.failures, 0,
+        "unfreeze of dead PID must not be a failure"
+    );
+    assert!(
+        !frozen.contains(&dead_pid()),
+        "PID removed from frozen set after unfreeze"
+    );
 }
 
 // ── Sysctl allowlist enforcement ─────────────────────────────────────────────
@@ -115,9 +169,15 @@ fn execute_non_allowlisted_sysctl_is_denied() {
     let mut caps = no_caps();
     caps.can_sysctl = true; // cap granted, but key is not in allowlist
 
-    let outcomes = execute_actions(actions, &caps, null_journal(), &mut frozen);
-    assert_eq!(outcomes.sysctl_applied, 0, "non-allowlisted sysctl must not be applied");
-    assert_eq!(outcomes.failures, 0, "denied allowlist check must not count as failure");
+    let outcomes = execute_actions(actions, &caps, null_journal(), &mut frozen, &[], &[], None);
+    assert_eq!(
+        outcomes.sysctl_applied, 0,
+        "non-allowlisted sysctl must not be applied"
+    );
+    assert_eq!(
+        outcomes.failures, 0,
+        "denied allowlist check must not count as failure"
+    );
 }
 
 /// Allowlisted sysctl without can_sysctl capability must be skipped.
@@ -131,8 +191,11 @@ fn execute_sysctl_without_cap_is_skipped() {
     let mut frozen = HashSet::new();
     let caps = no_caps(); // can_sysctl = false
 
-    let outcomes = execute_actions(actions, &caps, null_journal(), &mut frozen);
-    assert_eq!(outcomes.sysctl_applied, 0, "sysctl without capability must be skipped");
+    let outcomes = execute_actions(actions, &caps, null_journal(), &mut frozen, &[], &[], None);
+    assert_eq!(
+        outcomes.sysctl_applied, 0,
+        "sysctl without capability must be skipped"
+    );
     assert_eq!(outcomes.failures, 0);
 }
 
@@ -158,11 +221,15 @@ fn execute_outcomes_all_zero_for_dead_pids() {
             name: "dead3".into(),
             aggressive: false,
             reason: "test".into(),
+            start_sec: 0,
+            start_usec: 0,
         },
         RootAction::FreezeProcess {
             pid: dead + 3,
             name: "dead4".into(),
             reason: "test".into(),
+            start_sec: 0,
+            start_usec: 0,
         },
         RootAction::SetSysctl {
             key: "kern.securelevel".into(),
@@ -172,7 +239,15 @@ fn execute_outcomes_all_zero_for_dead_pids() {
     ];
 
     let mut frozen = HashSet::new();
-    let outcomes = execute_actions(actions, &no_caps(), null_journal(), &mut frozen);
+    let outcomes = execute_actions(
+        actions,
+        &no_caps(),
+        null_journal(),
+        &mut frozen,
+        &[],
+        &[],
+        None,
+    );
 
     assert_eq!(outcomes.boosts_applied, 0);
     assert_eq!(outcomes.throttles_applied, 0);
@@ -204,11 +279,15 @@ fn full_pipeline_respects_all_caps() {
                 name: format!("bg-{}", i),
                 aggressive: true,
                 reason: "noise".into(),
+                start_sec: 0,
+                start_usec: 0,
             },
             _ => RootAction::FreezeProcess {
                 pid: (3000 + i) as u32,
                 name: format!("idle-{}", i),
                 reason: "pressure".into(),
+                start_sec: 0,
+                start_usec: 0,
             },
         })
         .collect();
@@ -228,10 +307,20 @@ fn full_pipeline_respects_all_caps() {
         .filter(|a| matches!(a, RootAction::FreezeProcess { .. }))
         .count();
 
-    assert!(boosts <= policy.max_boosts_per_cycle, "boosts {} > cap {}", boosts, policy.max_boosts_per_cycle);
+    assert!(
+        boosts <= policy.max_boosts_per_cycle,
+        "boosts {} > cap {}",
+        boosts,
+        policy.max_boosts_per_cycle
+    );
     assert!(throttles <= policy.max_throttles_per_cycle);
     assert!(freezes <= policy.max_freezes_per_cycle);
-    assert!(final_actions.len() <= minute_cap, "total {} > minute cap {}", final_actions.len(), minute_cap);
+    assert!(
+        final_actions.len() <= minute_cap,
+        "total {} > minute cap {}",
+        final_actions.len(),
+        minute_cap
+    );
     assert_eq!(budget.minute_actions, final_actions.len());
 }
 
@@ -246,7 +335,11 @@ fn kernel_processes_not_in_critical_bg() {
     let critical = critical_background_processes();
 
     for p in &["kernel_task", "launchd", "WindowServer", "securityd"] {
-        assert!(protected.contains(*p), "'{}' must be in protected_processes", p);
+        assert!(
+            protected.contains(*p),
+            "'{}' must be in protected_processes",
+            p
+        );
         assert!(
             !critical.contains(*p),
             "'{}' must NOT be in critical_background_processes",
@@ -311,11 +404,16 @@ fn budget_cycle_counters_reset_but_minute_counter_persists() {
             name: format!("bg-{}", i),
             aggressive: false,
             reason: "test".into(),
+            start_sec: 0,
+            start_usec: 0,
         })
         .collect();
     enforce_limits_with_budget(actions2, &policy, &mut budget, 100);
 
-    assert_eq!(budget.cycle_boosts, 0, "cycle boost counter should be reset");
+    assert_eq!(
+        budget.cycle_boosts, 0,
+        "cycle boost counter should be reset"
+    );
     assert_eq!(budget.cycle_throttles, 2);
     assert_eq!(
         budget.minute_actions,
@@ -335,7 +433,15 @@ fn execute_actions_skips_protected_name_regardless_of_pid() {
         reason: "test".into(),
     }];
     let mut frozen = HashSet::new();
-    let outcomes = execute_actions(actions, &no_caps(), null_journal(), &mut frozen);
+    let outcomes = execute_actions(
+        actions,
+        &no_caps(),
+        null_journal(),
+        &mut frozen,
+        &[],
+        &[],
+        None,
+    );
     // Protected name → skipped. No failure, no boost counted.
     assert_eq!(outcomes.failures, 0);
     assert_eq!(outcomes.boosts_applied, 0);

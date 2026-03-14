@@ -1,7 +1,8 @@
+#![allow(dead_code)]
 mod collector;
+mod engine;
 mod optimizer;
 mod reactor;
-mod sysctl_tuner;
 
 use clap::{Parser, Subcommand};
 use collector::SystemCollector;

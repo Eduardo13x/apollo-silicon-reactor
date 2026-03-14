@@ -46,6 +46,70 @@ pub enum DaemonRequest {
         rating: String,
         note: Option<String>,
     },
+    SetLearnedPolicy {
+        policy: LearnedPolicy,
+    },
+    GetSysctlGovernor,
+    /// Suscripcion push: el daemon enviara StatusPush en cada ciclo de optimizacion.
+    /// La conexion se mantiene abierta indefinidamente.
+    Subscribe,
+}
+
+impl DaemonRequest {
+    pub fn is_privileged(&self) -> bool {
+        match self {
+            Self::GetStatus
+            | Self::GetMetrics
+            | Self::GetTopBlockers
+            | Self::GetCapabilities
+            | Self::GetProfileTimeline
+            | Self::Doctor
+            | Self::GetLlmStatus
+            | Self::UsageTop { .. }
+            | Self::UsageExplain { .. }
+            | Self::GetLearnedPolicy
+            | Self::GetSysctlGovernor
+            | Self::Subscribe => false,
+
+            Self::SetProfile { .. }
+            | Self::SetLatencyTarget { .. }
+            | Self::SetAutoProfile { .. }
+            | Self::ClearProfileOverride
+            | Self::Restore
+            | Self::PanicRestore
+            | Self::LlmSetKey { .. }
+            | Self::LlmDisable
+            | Self::LlmTest
+            | Self::Feedback { .. }
+            | Self::SetLearnedPolicy { .. } => true,
+        }
+    }
+
+    pub fn sanitize(&mut self) {
+        match self {
+            Self::LlmSetKey { api_key, .. } => {
+                if api_key.len() > 1024 {
+                    api_key.truncate(1024);
+                }
+            }
+            Self::UsageExplain { name } => {
+                if name.len() > 256 {
+                    name.truncate(256);
+                }
+            }
+            Self::Feedback { rating, note } => {
+                if rating.len() > 32 {
+                    rating.truncate(32);
+                }
+                if let Some(n) = note {
+                    if n.len() > 1024 {
+                        n.truncate(1024);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,6 +134,9 @@ pub enum DaemonResponse {
         suggestion: Option<LlmSuggestion>,
     },
     Usage(UsageResponse),
+    SysctlGovernor(crate::engine::sysctl_governor::SysctlGovernorStatus),
+    /// Evento push enviado por el daemon a los suscriptores en cada ciclo.
+    StatusPush(DaemonStatus),
     Error {
         message: String,
     },

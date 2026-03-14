@@ -2,22 +2,22 @@
 //!
 //! Provides deeper insights into process memory usage patterns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone)]
 pub struct MemoryProfile {
     pub pid: u32,
     pub name: String,
-    pub rss_bytes: u64,           // Resident set size
-    pub vms_bytes: u64,           // Virtual memory size
-    pub wss_bytes: u64,           // Working set size (estimated)
+    pub rss_bytes: u64, // Resident set size
+    pub vms_bytes: u64, // Virtual memory size
+    pub wss_bytes: u64, // Working set size (estimated)
     pub page_faults_per_sec: f64,
     pub memory_leak_probability: f64, // 0.0-1.0
-    pub memory_efficiency: f64,   // WSS / RSS ratio (0.0-1.0)
+    pub memory_efficiency: f64,       // WSS / RSS ratio (0.0-1.0)
 }
 
 pub struct MemoryAnalyzer {
-    process_history: HashMap<u32, Vec<MemorySnapshot>>,
+    process_history: HashMap<u32, VecDeque<MemorySnapshot>>,
     history_limit: usize,
 }
 
@@ -53,16 +53,10 @@ impl MemoryAnalyzer {
         };
 
         // Store history
-        self.process_history
-            .entry(pid)
-            .or_default()
-            .push(snapshot.clone());
-
-        // Trim history
-        if let Some(history) = self.process_history.get_mut(&pid) {
-            if history.len() > self.history_limit {
-                let _ = history.remove(0);
-            }
+        let history = self.process_history.entry(pid).or_default();
+        history.push_back(snapshot.clone());
+        while history.len() > self.history_limit {
+            history.pop_front();
         }
 
         let history = self.process_history.get(&pid).unwrap();
@@ -83,22 +77,23 @@ impl MemoryAnalyzer {
         }
     }
 
-    fn detect_memory_leak(&self, _pid: u32, history: &[MemorySnapshot]) -> f64 {
+    fn detect_memory_leak(&self, _pid: u32, history: &VecDeque<MemorySnapshot>) -> f64 {
         if history.len() < 5 {
             return 0.0; // Not enough samples
         }
 
         // Simple heuristic: is RSS consistently growing?
-        let recent = &history[history.len().saturating_sub(10)..];
+        let start = history.len().saturating_sub(10);
+        let recent_len = history.len() - start;
         let mut growth_count = 0;
 
-        for i in 1..recent.len() {
-            if recent[i].rss > recent[i - 1].rss {
+        for i in 1..recent_len {
+            if history[start + i].rss > history[start + i - 1].rss {
                 growth_count += 1;
             }
         }
 
-        let growth_rate = growth_count as f64 / (recent.len() - 1).max(1) as f64;
+        let growth_rate = growth_count as f64 / (recent_len - 1).max(1) as f64;
 
         // If growing in > 70% of samples, likely a leak
         if growth_rate > 0.7 {
@@ -108,7 +103,7 @@ impl MemoryAnalyzer {
         }
     }
 
-    fn calculate_page_fault_rate(&self, history: &[MemorySnapshot]) -> f64 {
+    fn calculate_page_fault_rate(&self, history: &VecDeque<MemorySnapshot>) -> f64 {
         if history.len() < 2 {
             return 0.0;
         }
@@ -128,7 +123,11 @@ impl MemoryAnalyzer {
     fn estimate_wss(&self, rss: u64, page_faults_per_sec: f64) -> u64 {
         // Heuristic: WSS ≈ RSS * (1 - page_fault_ratio)
         // More page faults = less efficient WSS
-        let fault_impact = (page_faults_per_sec / 1000.0).min(1.0);
+        let fault_impact = if page_faults_per_sec.is_finite() && page_faults_per_sec >= 0.0 {
+            (page_faults_per_sec / 1000.0).min(1.0)
+        } else {
+            0.0
+        };
         let wss_ratio = 1.0 - (fault_impact * 0.3); // 30% max impact
 
         ((rss as f64) * wss_ratio) as u64
@@ -174,6 +173,12 @@ impl MemoryAnalyzer {
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results
+    }
+
+    /// Remove entries for PIDs not present in the live set.
+    pub fn cleanup_dead_pids(&mut self, live_pids: &[u32]) {
+        let live: std::collections::HashSet<u32> = live_pids.iter().copied().collect();
+        self.process_history.retain(|pid, _| live.contains(pid));
     }
 }
 

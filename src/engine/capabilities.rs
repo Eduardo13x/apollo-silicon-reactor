@@ -3,15 +3,12 @@ use std::process::Command;
 use crate::engine::types::CapabilityReport;
 
 fn can_run_with_exit_codes(program: &str, args: &[&str], ok: &[i32]) -> bool {
-    Command::new(program)
-        .args(args)
-        .output()
-        .is_ok_and(|out| {
-            if out.status.success() {
-                return true;
-            }
-            out.status.code().is_some_and(|c| ok.contains(&c))
-        })
+    Command::new(program).args(args).output().is_ok_and(|out| {
+        if out.status.success() {
+            return true;
+        }
+        out.status.code().is_some_and(|c| ok.contains(&c))
+    })
 }
 
 pub fn detect_capabilities() -> CapabilityReport {
@@ -23,7 +20,7 @@ pub fn detect_capabilities() -> CapabilityReport {
         unavailable.push("taskpolicy".to_string());
     }
 
-    let can_sysctl = can_run_with_exit_codes("sysctl", &["-a"], &[]);
+    let can_sysctl = can_run_with_exit_codes("sysctl", &["-n", "kern.ostype"], &[]);
     if !can_sysctl {
         unavailable.push("sysctl".to_string());
     }

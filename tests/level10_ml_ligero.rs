@@ -24,7 +24,11 @@ fn test_classifier_new_has_no_learned_weights() {
     });
     let app_stats = HashMap::new();
     let result = classifier.classify(None, &[], &hour_model, &app_stats, 12);
-    assert!(result.confidence <= 0.30, "confidence={}", result.confidence);
+    assert!(
+        result.confidence <= 0.30,
+        "confidence={}",
+        result.confidence
+    );
 }
 
 #[test]
@@ -39,7 +43,11 @@ fn test_classifier_foreground_cursor_is_coding() {
     let procs = vec!["Cursor", "cargo", "rustc"];
     let result = classifier.classify(Some("Cursor"), &procs, &hour_model, &app_stats, 10);
     assert_eq!(result.workload, WorkloadType::Coding);
-    assert!(result.confidence > 0.5, "expected high confidence, got {}", result.confidence);
+    assert!(
+        result.confidence > 0.5,
+        "expected high confidence, got {}",
+        result.confidence
+    );
 }
 
 #[test]
@@ -51,7 +59,13 @@ fn test_classifier_idle_when_no_foreground_and_weak_evidence() {
     let hour_model: [_; 24] = std::array::from_fn(|_| HashMap::new());
     let app_stats = HashMap::new();
     // Non-matching processes → no process-mix score
-    let result = classifier.classify(None, &["some-daemon", "launchd"], &hour_model, &app_stats, 3);
+    let result = classifier.classify(
+        None,
+        &["some-daemon", "launchd"],
+        &hour_model,
+        &app_stats,
+        3,
+    );
     assert_eq!(result.workload, WorkloadType::Idle);
 }
 
@@ -78,6 +92,7 @@ fn test_classifier_llm_learned_boost_increases_confidence() {
         noise_patterns: vec![],
         protected_patterns: vec![],
         learned_at: None,
+        pattern_weights: std::collections::HashMap::new(),
     };
     classifier.update_learned_policy(&policy);
 
@@ -90,7 +105,11 @@ fn test_classifier_llm_learned_boost_increases_confidence() {
     let procs = vec!["Cursor", "cargo"];
     let result = classifier.classify(Some("Cursor"), &procs, &hour_model, &app_stats, 10);
     assert_eq!(result.workload, WorkloadType::Coding);
-    assert!(result.confidence > 0.6, "LLM boost should push confidence high, got {}", result.confidence);
+    assert!(
+        result.confidence > 0.6,
+        "LLM boost should push confidence high, got {}",
+        result.confidence
+    );
 }
 
 #[test]
@@ -105,7 +124,10 @@ fn test_classifier_hour_prior_contributes_as_source() {
     hour_model[10].insert(WorkloadType::Coding, 50.0);
     let app_stats = HashMap::new();
     let result = classifier.classify(None, &[], &hour_model, &app_stats, 10);
-    let has_hour_prior = result.sources.iter().any(|s| matches!(s, ClassifierSource::HourPrior));
+    let has_hour_prior = result
+        .sources
+        .iter()
+        .any(|s| matches!(s, ClassifierSource::HourPrior));
     assert!(has_hour_prior, "HourPrior source should be present");
 }
 
@@ -120,7 +142,10 @@ fn test_classifier_process_mix_contributes_as_source() {
     let app_stats = HashMap::new();
     let procs = vec!["cargo", "rustc", "clang", "git"];
     let result = classifier.classify(None, &procs, &hour_model, &app_stats, 12);
-    let has_mix = result.sources.iter().any(|s| matches!(s, ClassifierSource::ProcessMix(_)));
+    let has_mix = result
+        .sources
+        .iter()
+        .any(|s| matches!(s, ClassifierSource::ProcessMix(_)));
     assert!(has_mix, "ProcessMix source should be present");
 }
 
@@ -139,7 +164,9 @@ fn test_classifier_sources_summary_returns_strings() {
     assert!(!summary.is_empty(), "sources_summary should not be empty");
     // Expected values from implementation: "foreground-app", "hour-prior", "process-mix:N"
     assert!(
-        summary.iter().any(|s| s == "foreground-app" || s.contains("prior") || s.contains("mix")),
+        summary
+            .iter()
+            .any(|s| s == "foreground-app" || s.contains("prior") || s.contains("mix")),
         "unexpected summary: {:?}",
         summary
     );
@@ -165,8 +192,8 @@ fn test_adaptive_governor_ml_classification_in_decide_all() {
     let mut governor = AdaptiveGovernor::new();
     // Call decide_all with a coding foreground
     let result = governor.decide_all(
-        &[],  // no proc snapshots
-        &[],  // no hunt snapshots
+        &[], // no proc snapshots
+        &[], // no hunt snapshots
         Some("Cursor"),
         &["Cursor", "cargo", "rustc"],
         10,
@@ -252,7 +279,10 @@ fn test_classifier_foreground_app_source_present() {
         .sources
         .iter()
         .any(|s| matches!(s, ClassifierSource::ForegroundApp));
-    assert!(has_fg, "ForegroundApp source should be present when foreground matches a signature");
+    assert!(
+        has_fg,
+        "ForegroundApp source should be present when foreground matches a signature"
+    );
 }
 
 #[test]
@@ -267,7 +297,11 @@ fn test_classifier_video_edit_detected() {
     let procs = vec!["Final Cut", "HandBrake", "ffmpeg"];
     let result = classifier.classify(Some("Final Cut"), &procs, &hour_model, &app_stats, 16);
     assert_eq!(result.workload, WorkloadType::VideoEdit);
-    assert!(result.confidence > 0.5, "Video edit confidence should be high, got {}", result.confidence);
+    assert!(
+        result.confidence > 0.5,
+        "Video edit confidence should be high, got {}",
+        result.confidence
+    );
 }
 
 #[test]
@@ -293,6 +327,7 @@ fn test_governor_update_learned_policy_affects_classification() {
         noise_patterns: vec![],
         protected_patterns: vec![],
         learned_at: None,
+        pattern_weights: std::collections::HashMap::new(),
     };
     governor.update_learned_policy(&policy);
 
@@ -346,6 +381,7 @@ fn test_classifier_llm_noise_pattern_reduces_score() {
         noise_patterns: vec!["analyticsd".to_string()],
         protected_patterns: vec![],
         learned_at: None,
+        pattern_weights: std::collections::HashMap::new(),
     };
     classifier.update_learned_policy(&policy);
 
@@ -356,13 +392,7 @@ fn test_classifier_llm_noise_pattern_reduces_score() {
     });
     let app_stats = HashMap::new();
     // analyticsd in foreground (unusual, but tests noise logic)
-    let result = classifier.classify(
-        None,
-        &["analyticsd"],
-        &hour_model,
-        &app_stats,
-        12,
-    );
+    let result = classifier.classify(None, &["analyticsd"], &hour_model, &app_stats, 12);
     // Should not classify as Coding / VideoCall / etc.
     assert!(
         matches!(result.workload, WorkloadType::General | WorkloadType::Idle),

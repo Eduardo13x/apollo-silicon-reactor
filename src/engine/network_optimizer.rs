@@ -31,10 +31,10 @@ impl Default for NetworkStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkProfile {
-    HighThroughput,  // Maximize bandwidth (video streaming, downloads)
-    LowLatency,      // Minimize delay (interactive apps, gaming)
-    Balanced,        // General purpose
-    Battery,         // Minimize power consumption
+    HighThroughput, // Maximize bandwidth (video streaming, downloads)
+    LowLatency,     // Minimize delay (interactive apps, gaming)
+    Balanced,       // General purpose
+    Battery,        // Minimize power consumption
 }
 
 /// macOS-appropriate network optimization settings.
@@ -80,7 +80,7 @@ impl NetworkOptimizer {
             },
             NetworkProfile::LowLatency => NetworkOptimization {
                 profile,
-                tcp_send_buffer: 65_536,    // 64KB — small buffers reduce latency
+                tcp_send_buffer: 65_536, // 64KB — small buffers reduce latency
                 tcp_recv_buffer: 65_536,
                 tcp_window_scale: 4,
                 tcp_delayed_ack: 0, // No delayed ACKs
@@ -96,7 +96,7 @@ impl NetworkOptimizer {
             },
             NetworkProfile::Battery => NetworkOptimization {
                 profile,
-                tcp_send_buffer: 262_144,   // 256KB — smaller buffers, less wake
+                tcp_send_buffer: 262_144, // 256KB — smaller buffers, less wake
                 tcp_recv_buffer: 262_144,
                 tcp_window_scale: 4,
                 tcp_delayed_ack: 3, // Combine ACKs to reduce CPU wake
@@ -153,7 +153,8 @@ impl NetworkOptimizer {
         issues
     }
 
-    /// Get macOS sysctl recommendations for network tuning
+    /// Get macOS sysctl recommendations for network tuning.
+    /// Only emits keys on the safety allowlist.
     pub fn get_sysctl_recommendations(&self, profile: NetworkProfile) -> Vec<(String, String)> {
         let opt = self.get_optimization(profile);
         vec![
@@ -172,10 +173,6 @@ impl NetworkOptimizer {
             (
                 "net.inet.tcp.delayed_ack".to_string(),
                 opt.tcp_delayed_ack.to_string(),
-            ),
-            (
-                "net.inet.tcp.mssdflt".to_string(),
-                opt.tcp_mss_default.to_string(),
             ),
         ]
     }

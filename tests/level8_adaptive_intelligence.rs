@@ -3,16 +3,14 @@
 //! Tests for the heuristic-based intelligent system:
 //! process_classifier, zombie_hunter, user_profile, adaptive_governor
 
+use apollo_optimizer::engine::adaptive_governor::{AdaptiveGovernor, GovernorDecision};
 use apollo_optimizer::engine::process_classifier::{
-    ProcessClassifier, ProcessSnapshot, ProcessTier, score_utility, score_waste,
-    essential_process_names, telemetry_process_names,
-};
-use apollo_optimizer::engine::zombie_hunter::{
-    ZombieHunter, HuntSnapshot, ZombieClass, ZombieAction,
+    essential_process_names, score_utility, score_waste, telemetry_process_names,
+    ProcessClassifier, ProcessSnapshot, ProcessTier,
 };
 use apollo_optimizer::engine::user_profile::{UserProfile, WorkloadType};
-use apollo_optimizer::engine::adaptive_governor::{
-    AdaptiveGovernor, GovernerDecision,
+use apollo_optimizer::engine::zombie_hunter::{
+    HuntSnapshot, ZombieAction, ZombieClass, ZombieHunter,
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -133,14 +131,22 @@ fn test_classifier_silent_daemon() {
 fn test_utility_score_active() {
     let snap = make_snap("Xcode", 30.0, 5, true);
     let score = score_utility(&snap);
-    assert!(score > 0.7, "Active process should have high utility: {}", score);
+    assert!(
+        score > 0.7,
+        "Active process should have high utility: {}",
+        score
+    );
 }
 
 #[test]
 fn test_utility_score_stale() {
     let snap = make_snap("StaleApp", 1.0, 100_000, false);
     let score = score_utility(&snap);
-    assert!(score < 0.2, "Stale process should have low utility: {}", score);
+    assert!(
+        score < 0.2,
+        "Stale process should have low utility: {}",
+        score
+    );
 }
 
 #[test]
@@ -148,7 +154,11 @@ fn test_waste_score_high_cpu() {
     let mut snap = make_snap("burner", 9.0, 7200, false);
     snap.wakeups_per_sec = 45.0;
     let waste = score_waste(&snap);
-    assert!(waste > 0.7, "High-CPU process should have high waste: {}", waste);
+    assert!(
+        waste > 0.7,
+        "High-CPU process should have high waste: {}",
+        waste
+    );
 }
 
 #[test]
@@ -156,15 +166,19 @@ fn test_waste_score_idle_process() {
     let mut snap = make_snap("idle_proc", 0.0, 7200, false);
     snap.wakeups_per_sec = 0.0;
     let waste = score_waste(&snap);
-    assert!(waste < 0.1, "Idle process should have near-zero waste: {}", waste);
+    assert!(
+        waste < 0.1,
+        "Idle process should have near-zero waste: {}",
+        waste
+    );
 }
 
 #[test]
 fn test_classifier_throttle_candidates() {
     let classifier = ProcessClassifier::new();
     let snaps = vec![
-        make_snap("kernel_task", 50.0, 0, false),             // Essential
-        make_snap("analyticsd", 2.0, 600, false),             // Telemetry
+        make_snap("kernel_task", 50.0, 0, false), // Essential
+        make_snap("analyticsd", 2.0, 600, false), // Telemetry
         {
             let mut s = make_snap("StaleApp", 1.0, 90_000, false);
             s.pid = 1001;
@@ -314,7 +328,7 @@ fn test_zombie_hunter_cleanup() {
     hunter.evaluate(&snap);
 
     hunter.cleanup(&[9999]); // PID 2000 not in live list
-    // Should not crash and counter should be cleared
+                             // Should not crash and counter should be cleared
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -380,7 +394,11 @@ fn test_user_profile_process_relevance_known_workload() {
 
     // cargo is directly relevant to Coding workload
     let relevance = profile.process_relevance("cargo");
-    assert!(relevance > 0.5, "cargo should be relevant during Coding: {}", relevance);
+    assert!(
+        relevance > 0.5,
+        "cargo should be relevant during Coding: {}",
+        relevance
+    );
 }
 
 #[test]
@@ -390,7 +408,11 @@ fn test_user_profile_process_relevance_irrelevant() {
 
     // zoom.us is not relevant to Coding
     let relevance = profile.process_relevance("zoom.us");
-    assert!(relevance < 0.5, "zoom.us should not be relevant during Coding: {}", relevance);
+    assert!(
+        relevance < 0.5,
+        "zoom.us should not be relevant during Coding: {}",
+        relevance
+    );
 }
 
 #[test]
@@ -416,7 +438,7 @@ fn test_governor_protects_essentials() {
 
     let kt = decisions.iter().find(|d| d.name == "kernel_task");
     assert!(kt.is_some());
-    assert_eq!(kt.unwrap().decision, GovernerDecision::Allow);
+    assert_eq!(kt.unwrap().decision, GovernorDecision::Allow);
 }
 
 #[test]
@@ -432,7 +454,7 @@ fn test_governor_kills_true_zombie() {
 
     let zombie = decisions.iter().find(|d| d.name == "crashed_app");
     assert!(zombie.is_some());
-    assert_eq!(zombie.unwrap().decision, GovernerDecision::Kill);
+    assert_eq!(zombie.unwrap().decision, GovernorDecision::Kill);
 }
 
 #[test]
@@ -448,7 +470,7 @@ fn test_governor_throttles_telemetry() {
     assert!(telem.is_some());
     assert!(matches!(
         telem.unwrap().decision,
-        GovernerDecision::Throttle | GovernerDecision::Freeze
+        GovernorDecision::Throttle | GovernorDecision::Freeze
     ));
 }
 
@@ -470,7 +492,7 @@ fn test_governor_freezes_telemetry_during_coding() {
 
     let telem = decisions.iter().find(|d| d.name == "analyticsd");
     assert!(telem.is_some());
-    assert_eq!(telem.unwrap().decision, GovernerDecision::Freeze);
+    assert_eq!(telem.unwrap().decision, GovernorDecision::Freeze);
 }
 
 #[test]
@@ -480,12 +502,11 @@ fn test_governor_allows_active_foreground() {
     let procs = vec![make_snap("Xcode", 30.0, 0, true)];
     let hunts: Vec<HuntSnapshot> = vec![];
 
-    let decisions =
-        gov.decide_all(&procs, &hunts, Some("Xcode"), &["Xcode"], 10);
+    let decisions = gov.decide_all(&procs, &hunts, Some("Xcode"), &["Xcode"], 10);
 
     let xcode = decisions.iter().find(|d| d.name == "Xcode");
     assert!(xcode.is_some());
-    assert_eq!(xcode.unwrap().decision, GovernerDecision::Allow);
+    assert_eq!(xcode.unwrap().decision, GovernorDecision::Allow);
 }
 
 #[test]
@@ -501,7 +522,7 @@ fn test_governor_throttles_stale_process() {
     assert!(old.is_some());
     assert!(matches!(
         old.unwrap().decision,
-        GovernerDecision::Throttle | GovernerDecision::Freeze
+        GovernorDecision::Throttle | GovernorDecision::Freeze
     ));
 }
 
@@ -515,8 +536,13 @@ fn test_governor_summary_counts() {
     ];
     let hunts = vec![make_hunt("crashed_app", true, true)];
 
-    let decisions =
-        gov.decide_all(&procs, &hunts, Some("Xcode"), &["Xcode", "kernel_task", "analyticsd"], 10);
+    let decisions = gov.decide_all(
+        &procs,
+        &hunts,
+        Some("Xcode"),
+        &["Xcode", "kernel_task", "analyticsd"],
+        10,
+    );
 
     let summary = AdaptiveGovernor::summarise(&decisions);
     assert_eq!(summary.total, decisions.len());
@@ -538,6 +564,6 @@ fn test_governor_waste_override() {
     assert!(burner.is_some());
     assert!(matches!(
         burner.unwrap().decision,
-        GovernerDecision::Throttle | GovernerDecision::Freeze
+        GovernorDecision::Throttle | GovernorDecision::Freeze
     ));
 }

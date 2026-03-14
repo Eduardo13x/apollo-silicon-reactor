@@ -4,22 +4,22 @@
 
 #[derive(Debug, Clone)]
 pub struct GPUMetrics {
-    pub gpu_temp: f32,           // Celsius
-    pub gpu_utilization: f32,    // 0-100%
-    pub gpu_frequency: u32,      // MHz
-    pub gpu_memory_used: u64,    // bytes
-    pub gpu_memory_total: u64,   // bytes
+    pub gpu_temp: f32,         // Celsius
+    pub gpu_utilization: f32,  // 0-100%
+    pub gpu_frequency: u32,    // MHz
+    pub gpu_memory_used: u64,  // bytes
+    pub gpu_memory_total: u64, // bytes
     pub throttle_active: bool,
     pub power_state: GPUPowerState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GPUPowerState {
-    Off,         // GPU powered down
-    Idle,        // Minimal power
-    Dynamic,     // Variable frequency
-    Maximum,     // Full frequency
-    Throttled,   // Thermally throttled
+    Off,       // GPU powered down
+    Idle,      // Minimal power
+    Dynamic,   // Variable frequency
+    Maximum,   // Full frequency
+    Throttled, // Thermally throttled
 }
 
 pub struct GPUManager {
@@ -30,8 +30,8 @@ pub struct GPUManager {
 impl GPUManager {
     pub fn new() -> Self {
         Self {
-            max_safe_temp: 100.0,       // Max safe temp on Apple Silicon
-            throttle_threshold: 85.0,   // Start throttling at 85°C
+            max_safe_temp: 100.0, // Max safe temp on Apple Silicon (aligns with ThermalManager shutdown)
+            throttle_threshold: 90.0, // Start throttling at 90°C (aligns with ThermalManager/Sentinel)
         }
     }
 
@@ -56,10 +56,7 @@ impl GPUManager {
     }
 
     /// Apply GPU optimization based on workload
-    pub fn optimize_for_workload(
-        &self,
-        workload: &str,
-    ) -> Vec<String> {
+    pub fn optimize_for_workload(&self, workload: &str) -> Vec<String> {
         let mut actions = Vec::new();
 
         match workload {

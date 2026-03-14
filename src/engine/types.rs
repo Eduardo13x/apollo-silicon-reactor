@@ -1,7 +1,78 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::engine::usage_model::{UsageEntrySummary, UsageTopReport};
+
+/// Centralized utility for hardened file system operations to prevent TOCTOU and symlink attacks.
+pub struct HardPath;
+
+impl HardPath {
+    /// Verifies that a path exists and is NOT a symlink.
+    /// Returns Ok(()) if it's a real file/dir, or an Err if it's a symlink or missing.
+    pub fn verify_no_symlink(path: &Path) -> anyhow::Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            // macOS standard system symlinks are allowed
+            #[cfg(target_os = "macos")]
+            {
+                if path == Path::new("/var")
+                    || path == Path::new("/etc")
+                    || path == Path::new("/tmp")
+                {
+                    return Ok(());
+                }
+            }
+            anyhow::bail!("security violation: path {} is a symlink", path.display());
+        }
+        Ok(())
+    }
+
+    /// Recursively creates directories while ensuring no component is a symlink.
+    pub fn secure_create_dir_all(path: &Path) -> anyhow::Result<()> {
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component);
+            if current.exists() {
+                let meta = fs::symlink_metadata(&current)?;
+                if meta.file_type().is_symlink() {
+                    // macOS standard system symlinks are allowed
+                    #[cfg(target_os = "macos")]
+                    {
+                        if current == Path::new("/var")
+                            || current == Path::new("/etc")
+                            || current == Path::new("/tmp")
+                        {
+                            continue;
+                        }
+                    }
+                    anyhow::bail!(
+                        "security violation: path component {} is a symlink",
+                        current.display()
+                    );
+                }
+            } else {
+                fs::create_dir(&current)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads a file to string with a maximum byte limit.
+    pub fn read_to_string_limited(path: &Path, max_bytes: u64) -> anyhow::Result<String> {
+        use std::io::Read;
+        let file = fs::File::open(path)?;
+        let mut reader = file.take(max_bytes);
+        let mut string = String::new();
+        reader.read_to_string(&mut string)?;
+        Ok(string)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -47,7 +118,15 @@ pub struct SafetyPolicy {
     pub max_throttles_per_cycle: usize,
     pub max_paging_hints_per_cycle: usize,
     pub max_freezes_per_cycle: usize,
+    pub max_sysctl_writes_per_cycle: usize,
     pub cooldown_seconds: u64,
+    /// Maximum per-thread QoS changes per cycle (Phase 1: thread-level scheduling).
+    #[serde(default = "default_thread_qos")]
+    pub max_thread_qos_per_cycle: usize,
+}
+
+fn default_thread_qos() -> usize {
+    10
 }
 
 impl SafetyPolicy {
@@ -58,21 +137,27 @@ impl SafetyPolicy {
                 max_throttles_per_cycle: 20,
                 max_paging_hints_per_cycle: 12,
                 max_freezes_per_cycle: 8,
+                max_sysctl_writes_per_cycle: 8,
                 cooldown_seconds: 10,
+                max_thread_qos_per_cycle: 20,
             },
             OptimizationProfile::SafeRoot => Self {
                 max_boosts_per_cycle: 3,
                 max_throttles_per_cycle: 6,
                 max_paging_hints_per_cycle: 3,
                 max_freezes_per_cycle: 2,
+                max_sysctl_writes_per_cycle: 2,
                 cooldown_seconds: 45,
+                max_thread_qos_per_cycle: 4,
             },
             OptimizationProfile::BalancedRoot => Self {
                 max_boosts_per_cycle: 6,
                 max_throttles_per_cycle: 12,
                 max_paging_hints_per_cycle: 6,
                 max_freezes_per_cycle: 4,
+                max_sysctl_writes_per_cycle: 4,
                 cooldown_seconds: 20,
+                max_thread_qos_per_cycle: 10,
             },
         }
     }
@@ -103,8 +188,11 @@ pub struct ActionBudgetState {
     pub cycle_throttles: usize,
     pub cycle_hints: usize,
     pub cycle_freezes: usize,
+    pub cycle_sysctl_writes: usize,
     pub minute_actions: usize,
     pub boost_denied_cooldown: usize,
+    #[serde(default)]
+    pub cycle_thread_qos: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,11 +218,21 @@ pub enum RootAction {
         name: String,
         aggressive: bool,
         reason: String,
+        /// Kernel start-time for PID identity validation (prevents A-B-A recycling).
+        #[serde(default)]
+        start_sec: u64,
+        #[serde(default)]
+        start_usec: u64,
     },
     FreezeProcess {
         pid: u32,
         name: String,
         reason: String,
+        /// Kernel start-time for PID identity validation (prevents A-B-A recycling).
+        #[serde(default)]
+        start_sec: u64,
+        #[serde(default)]
+        start_usec: u64,
     },
     UnfreezeProcess {
         pid: u32,
@@ -159,6 +257,39 @@ pub enum RootAction {
         active: bool,
         reason: String,
     },
+    /// Per-thread QoS: route a specific thread to P-core or E-core.
+    SetThreadQoS {
+        pid: u32,
+        name: String,
+        thread_index: u32,
+        /// "interactive", "background", or "utility"
+        tier: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FreezeSource {
+    MainLoop,
+    Sentinel,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrozenEntry {
+    pub frozen_at: DateTime<Utc>,
+    pub source: FreezeSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrozenPidEntry {
+    pub pid: u32,
+    pub since: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrozenStatePersisted {
+    pub frozen: Vec<FrozenPidEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,7 +345,7 @@ pub struct RuntimeMetrics {
     pub throttle_level: String,
     pub thermal_state: String,
     pub last_blockers: Vec<BlockerScore>,
-    pub cycle_durations_ms: Vec<u64>,
+    pub cycle_durations_ms: VecDeque<u64>,
     pub budgets: ActionBudgetState,
     pub profile_switches: u64,
     pub last_pressure_score: f64,
@@ -271,6 +402,139 @@ pub struct RuntimeMetrics {
     pub ml_confidence: f32, // 0.0–1.0; 0.0 until first classification
     #[serde(default)]
     pub ml_sources: Vec<String>, // evidence sources from last ML classification
+    // Foreground app detection
+    #[serde(default)]
+    pub foreground_app: Option<ForegroundAppInfo>,
+    #[serde(default)]
+    pub foreground_idle: bool,
+    /// Cambios de app en los últimos 5 minutos (detector TDA).
+    #[serde(default)]
+    pub context_switches_5min: u32,
+    /// true cuando context_switches_5min >= 3 → perfil burst activo.
+    #[serde(default)]
+    pub context_switch_burst: bool,
+    // Energy tracking
+    #[serde(default)]
+    pub energy_cpu_watts: Option<f64>,
+    #[serde(default)]
+    pub energy_gpu_watts: Option<f64>,
+    #[serde(default)]
+    pub energy_package_watts: Option<f64>,
+    #[serde(default)]
+    pub energy_session_wh: Option<f64>,
+    #[serde(default)]
+    pub energy_co2_avoided_g: Option<f64>,
+    #[serde(default)]
+    pub energy_savings_wh: Option<f64>,
+    #[serde(default)]
+    pub energy_top_consumers: Vec<EnergyConsumerInfo>,
+    #[serde(default)]
+    pub energy_package_wh: Option<f64>,
+    // Process tree metrics
+    #[serde(default)]
+    pub process_tree_groups: usize,
+    #[serde(default)]
+    pub process_tree_total: usize,
+    // SysctlGovernor metrics
+    #[serde(default)]
+    pub sysctl_reactive_writes: u64,
+    #[serde(default)]
+    pub sysctl_governor_active_tunings: usize,
+    #[serde(default)]
+    pub sysctl_governor_total_writes: u64,
+    // Network monitor metrics
+    #[serde(default)]
+    pub network_retransmit_ratio: f64,
+    #[serde(default)]
+    pub network_listen_drop_rate: f64,
+    // Resource interrupt (sentinel) metrics
+    #[serde(default)]
+    pub resource_interrupts_total: u64,
+    #[serde(default)]
+    pub resource_interrupt_last_phase: u8,
+    #[serde(default)]
+    pub resource_interrupt_active: bool,
+    #[serde(default)]
+    pub resource_interrupt_latency_us: u64,
+    #[serde(default)]
+    pub resource_interrupt_processes_frozen: u64,
+    #[serde(default)]
+    pub resource_interrupt_processes_migrated: u64,
+    #[serde(default)]
+    pub resource_interrupt_recovery_count: u64,
+    // Hardening & collector health metrics
+    #[serde(default)]
+    pub collector_pressure_alive: bool,
+    #[serde(default)]
+    pub collector_smc_alive: bool,
+    #[serde(default)]
+    pub invalid_sysctl_value_denied: u64,
+    #[serde(default)]
+    pub journal_rotations: u64,
+    #[serde(default)]
+    pub symlink_attacks_blocked: u64,
+    #[serde(default)]
+    pub policy_patterns_rejected: u64,
+    #[serde(default)]
+    pub request_size_exceeded: u64,
+    // Overflow guard metrics
+    #[serde(default)]
+    pub overflow_events_total: u64,
+    #[serde(default)]
+    pub overflow_events_7d: usize,
+    /// Ajuste actual al threshold de presión (negativo = más conservador).
+    #[serde(default)]
+    pub overflow_threshold_offset_pp: i32,
+    /// true cuando hay compilación activa (build_mode).
+    #[serde(default)]
+    pub overflow_build_mode: bool,
+    // Predictive agent metrics
+    #[serde(default)]
+    pub predictive_agent_active: bool,
+    #[serde(default)]
+    pub predictive_agent_cycles: u64,
+    #[serde(default)]
+    pub predictive_agent_arm_pulls: [u64; 5],
+    #[serde(default)]
+    pub predictive_agent_last_intervention: String,
+    // Signal intelligence metrics
+    #[serde(default)]
+    pub si_pressure_smooth: f64,
+    #[serde(default)]
+    pub si_pressure_velocity: f64,
+    #[serde(default)]
+    pub si_p_oom_30s: f64,
+    #[serde(default)]
+    pub si_urgency: f64,
+    #[serde(default)]
+    pub si_regime_shifts: u64,
+    #[serde(default)]
+    pub si_monopoly_risk: f64,
+    #[serde(default)]
+    pub si_entropy_anomaly: f64,
+    // Thread-level QoS metrics (Phase 1)
+    #[serde(default)]
+    pub thread_qos_applied: u64,
+    #[serde(default)]
+    pub thread_qos_hot_routes: u64,
+    #[serde(default)]
+    pub thread_qos_cold_routes: u64,
+}
+
+/// Serializable foreground app info for the protocol/dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForegroundAppInfo {
+    pub pid: u32,
+    pub name: String,
+    pub bundle_id: Option<String>,
+}
+
+/// Serializable per-app energy info for the protocol/dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnergyConsumerInfo {
+    pub name: String,
+    pub current_watts: f64,
+    pub percentage: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

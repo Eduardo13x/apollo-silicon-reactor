@@ -3,7 +3,7 @@
 
 use apollo_optimizer::engine::analytics::AnalyticsEngine;
 use apollo_optimizer::engine::power_management::{
-    PowerManager, PowerMode, BatteryMode, BatteryStatus,
+    BatteryMode, BatteryStatus, PowerManager, PowerMode,
 };
 
 // ============================================================================
@@ -20,7 +20,15 @@ fn test_analytics_engine_new() {
 #[test]
 fn test_analytics_engine_record_optimization() {
     let mut engine = AnalyticsEngine::new();
-    engine.record_optimization(50.0, 40.0, 8 * 1024 * 1024 * 1024, 7 * 1024 * 1024 * 1024, 80.0, 75.0, 5);
+    engine.record_optimization(
+        50.0,
+        40.0,
+        8 * 1024 * 1024 * 1024,
+        7 * 1024 * 1024 * 1024,
+        80.0,
+        75.0,
+        5,
+    );
 
     let analytics = engine.calculate_analytics();
     assert_eq!(analytics.total_optimizations, 1);
@@ -33,9 +41,12 @@ fn test_analytics_engine_multiple_optimizations() {
 
     for _ in 0..10 {
         engine.record_optimization(
-            50.0, 40.0,
-            8 * 1024 * 1024 * 1024, 7 * 1024 * 1024 * 1024,
-            80.0, 75.0,
+            50.0,
+            40.0,
+            8 * 1024 * 1024 * 1024,
+            7 * 1024 * 1024 * 1024,
+            80.0,
+            75.0,
             5,
         );
     }
@@ -47,7 +58,15 @@ fn test_analytics_engine_multiple_optimizations() {
 #[test]
 fn test_analytics_engine_cpu_improvement() {
     let mut engine = AnalyticsEngine::new();
-    engine.record_optimization(50.0, 30.0, 8 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024, 80.0, 80.0, 1);
+    engine.record_optimization(
+        50.0,
+        30.0,
+        8 * 1024 * 1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+        80.0,
+        80.0,
+        1,
+    );
 
     let analytics = engine.calculate_analytics();
     assert!(analytics.avg_cpu_improvement_percent >= 20.0);
@@ -58,10 +77,12 @@ fn test_analytics_engine_memory_freed() {
     let mut engine = AnalyticsEngine::new();
     let mem_freed = 1024 * 1024 * 1024; // 1GB
     engine.record_optimization(
-        50.0, 50.0,
+        50.0,
+        50.0,
         8 * 1024 * 1024 * 1024,
         8 * 1024 * 1024 * 1024 - mem_freed,
-        80.0, 80.0,
+        80.0,
+        80.0,
         1,
     );
 
@@ -73,9 +94,12 @@ fn test_analytics_engine_memory_freed() {
 fn test_analytics_engine_thermal_reduction() {
     let mut engine = AnalyticsEngine::new();
     engine.record_optimization(
-        50.0, 50.0,
-        8 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024,
-        90.0, 70.0,
+        50.0,
+        50.0,
+        8 * 1024 * 1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+        90.0,
+        70.0,
         1,
     );
 
@@ -87,7 +111,15 @@ fn test_analytics_engine_thermal_reduction() {
 fn test_analytics_engine_generate_report() {
     let mut engine = AnalyticsEngine::new();
     for _ in 0..100 {
-        engine.record_optimization(50.0, 40.0, 8 * 1024 * 1024 * 1024, 7 * 1024 * 1024 * 1024, 80.0, 75.0, 5);
+        engine.record_optimization(
+            50.0,
+            40.0,
+            8 * 1024 * 1024 * 1024,
+            7 * 1024 * 1024 * 1024,
+            80.0,
+            75.0,
+            5,
+        );
     }
 
     let report = engine.generate_report();
@@ -99,7 +131,15 @@ fn test_analytics_engine_generate_report() {
 #[test]
 fn test_analytics_engine_energy_calculation() {
     let mut engine = AnalyticsEngine::new();
-    engine.record_optimization(50.0, 30.0, 8 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024, 80.0, 80.0, 1);
+    engine.record_optimization(
+        50.0,
+        30.0,
+        8 * 1024 * 1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+        80.0,
+        80.0,
+        1,
+    );
 
     let report = engine.generate_report();
     assert!(report.energy_saved_wh >= 0.0);
@@ -110,28 +150,19 @@ fn test_analytics_engine_energy_calculation() {
 fn test_analytics_engine_trend() {
     let mut engine = AnalyticsEngine::new();
     for _ in 0..5 {
-        engine.record_optimization(50.0, 40.0, 8 * 1024 * 1024 * 1024, 7 * 1024 * 1024 * 1024, 80.0, 75.0, 5);
-    }
-
-    let trend = engine.get_trend(3);
-    assert!(!trend.is_empty());
-}
-
-#[test]
-fn test_analytics_engine_next_optimization_time() {
-    let mut engine = AnalyticsEngine::new();
-    for _ in 0..50 {
         engine.record_optimization(
-            50.0, 40.0,
+            50.0,
+            40.0,
             8 * 1024 * 1024 * 1024,
-            6 * 1024 * 1024 * 1024,
-            80.0, 75.0,
+            7 * 1024 * 1024 * 1024,
+            80.0,
+            75.0,
             5,
         );
     }
 
-    let next_time = engine.estimate_next_optimization();
-    assert!(next_time > 0);
+    let trend = engine.get_trend(3);
+    assert!(!trend.is_empty());
 }
 
 // ============================================================================
@@ -140,14 +171,14 @@ fn test_analytics_engine_next_optimization_time() {
 
 #[test]
 fn test_power_manager_new() {
-    let _manager = PowerManager::new();
-}
-
-#[test]
-fn test_power_manager_performance_mode() {
     let manager = PowerManager::new();
-    let rec = manager.get_recommendation();
-    assert!(rec.target_frequency < 4000);
+    // PowerState should come from real sysctl detection
+    assert!(
+        manager.power_state.core_count_active >= 1,
+        "core_count_active must be >= 1"
+    );
+    // power_draw_watts should be 0.0 (not invented)
+    assert_eq!(manager.power_state.power_draw_watts, 0.0);
 }
 
 #[test]
@@ -162,7 +193,9 @@ fn test_power_manager_performance_recommendation() {
     manager.set_mode(PowerMode::Performance);
     let rec = manager.get_recommendation();
     assert_eq!(rec.mode, PowerMode::Performance);
-    assert!(rec.target_frequency > 3000);
+    // Performance uses 100% of detected frequency
+    assert_eq!(rec.target_frequency, manager.power_state.cpu_frequency_mhz);
+    assert_eq!(rec.active_cores, manager.power_state.core_count_active);
     assert!(!rec.deep_sleep_enabled);
 }
 
@@ -173,6 +206,8 @@ fn test_power_manager_balanced_recommendation() {
     let rec = manager.get_recommendation();
     assert_eq!(rec.mode, PowerMode::Balanced);
     assert!(rec.deep_sleep_enabled);
+    // Balanced uses 75% of max frequency
+    assert!(rec.target_frequency <= manager.power_state.cpu_frequency_mhz);
 }
 
 #[test]
@@ -181,22 +216,31 @@ fn test_power_manager_battery_recommendation() {
     manager.set_mode(PowerMode::Battery);
     let rec = manager.get_recommendation();
     assert_eq!(rec.mode, PowerMode::Battery);
-    assert!(rec.target_frequency < 2000);
+    // Battery uses 30% of max — should be less than max
+    assert!(rec.target_frequency <= manager.power_state.cpu_frequency_mhz);
     assert!(rec.deep_sleep_enabled);
 }
 
 #[test]
-fn test_power_manager_optimize_idle_states_high_idle() {
+fn test_power_manager_recommendation_ordering() {
+    // Performance > Balanced > Efficiency > Battery in target_frequency
     let mut manager = PowerManager::new();
-    manager.power_state.idle_percentage = 85.0;
-    manager.optimize_idle_states();
-}
 
-#[test]
-fn test_power_manager_optimize_idle_states_low_idle() {
-    let mut manager = PowerManager::new();
-    manager.power_state.idle_percentage = 10.0;
-    manager.optimize_idle_states();
+    manager.set_mode(PowerMode::Performance);
+    let perf = manager.get_recommendation();
+
+    manager.set_mode(PowerMode::Balanced);
+    let balanced = manager.get_recommendation();
+
+    manager.set_mode(PowerMode::Efficiency);
+    let efficiency = manager.get_recommendation();
+
+    manager.set_mode(PowerMode::Battery);
+    let battery = manager.get_recommendation();
+
+    assert!(perf.target_frequency >= balanced.target_frequency);
+    assert!(balanced.target_frequency >= efficiency.target_frequency);
+    assert!(efficiency.target_frequency >= battery.target_frequency);
 }
 
 #[test]
@@ -215,18 +259,24 @@ fn test_power_manager_power_increases_with_frequency() {
 }
 
 #[test]
-fn test_power_manager_frequency_scaling_needed() {
+fn test_power_manager_update_thermal_headroom() {
     let mut manager = PowerManager::new();
-    manager.power_state.idle_percentage = 80.0;
-    manager.power_state.cpu_frequency_mhz = 2400;
-    assert!(manager.needs_frequency_scaling());
+    // Initial headroom is 100.0
+    assert_eq!(manager.power_state.thermal_headroom, 100.0);
+    // Moderate thermal pressure (0.5 = 50% thermal)
+    manager.update_thermal_headroom(0.5);
+    assert!((manager.power_state.thermal_headroom - 50.0).abs() < 0.01);
+    // Critical thermal (1.0 = 100% thermal)
+    manager.update_thermal_headroom(1.0);
+    assert!((manager.power_state.thermal_headroom - 0.0).abs() < 0.01);
 }
 
 #[test]
-fn test_power_manager_sysctl_recommendations() {
-    let manager = PowerManager::new();
-    let recs = manager.get_sysctl_recommendations(PowerMode::Performance);
-    assert!(!recs.is_empty());
+fn test_power_manager_update_power_draw() {
+    let mut manager = PowerManager::new();
+    assert_eq!(manager.power_state.power_draw_watts, 0.0);
+    manager.update_power_draw(8.5);
+    assert!((manager.power_state.power_draw_watts - 8.5).abs() < 0.01);
 }
 
 // ============================================================================
@@ -306,33 +356,28 @@ fn test_battery_optimization_critical() {
 }
 
 #[test]
-fn test_battery_critical_actions() {
+fn test_battery_mode_covers_high_percentage() {
+    // Verify percentages > 100 map to Normal (open-ended range)
     let manager = PowerManager::new();
-    let actions = manager.get_critical_actions();
-    assert!(actions.len() >= 5);
-    assert!(actions.iter().any(|a| a.contains("CPU")));
+    assert_eq!(manager.get_battery_mode(150), BatteryMode::Normal);
+    assert_eq!(manager.get_battery_mode(255), BatteryMode::Normal);
 }
 
 #[test]
-fn test_battery_power_savings() {
-    let manager = PowerManager::new();
-    let normal = manager.estimate_power_savings_percent(BatteryMode::Normal);
-    let low = manager.estimate_power_savings_percent(BatteryMode::LowPower);
-    let critical = manager.estimate_power_savings_percent(BatteryMode::Critical);
-
-    assert_eq!(normal, 0.0);
-    assert!(low > normal);
-    assert!(critical > low);
-}
-
-#[test]
-fn test_battery_apps_to_disable() {
-    let manager = PowerManager::new();
-    let normal_apps = manager.get_apps_to_disable(BatteryMode::Normal);
-    let critical_apps = manager.get_apps_to_disable(BatteryMode::Critical);
-
-    assert!(normal_apps.is_empty());
-    assert!(!critical_apps.is_empty());
+fn test_update_battery_calibrates_baseline() {
+    let mut manager = PowerManager::new();
+    let status = BatteryStatus {
+        percentage: 60,
+        time_remaining_minutes: 180,
+        is_charging: false,
+        charge_rate_percent_per_hour: 0.0,
+        discharge_rate_percent_per_hour: 15.0,
+    };
+    manager.update_battery_status(status);
+    // baseline_discharge_rate should now be 15.0
+    // Verify via time_to_critical: (60 - 20) / 15.0 * 60 = 160
+    let ttc = manager.time_to_critical();
+    assert_eq!(ttc, 160);
 }
 
 #[test]
@@ -392,9 +437,12 @@ fn test_analytics_battery_integration() {
 
     for _ in 0..10 {
         analytics.record_optimization(
-            50.0, 40.0,
-            8 * 1024 * 1024 * 1024, 7 * 1024 * 1024 * 1024,
-            80.0, 75.0,
+            50.0,
+            40.0,
+            8 * 1024 * 1024 * 1024,
+            7 * 1024 * 1024 * 1024,
+            80.0,
+            75.0,
             5,
         );
     }
@@ -424,9 +472,12 @@ fn test_power_analytics_integration() {
     let rec = power.get_recommendation();
 
     analytics.record_optimization(
-        80.0, 60.0,
-        8 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024,
-        80.0, 75.0,
+        80.0,
+        60.0,
+        8 * 1024 * 1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+        80.0,
+        75.0,
         1,
     );
 

@@ -18,7 +18,6 @@ pub struct LeakingProcess {
 pub struct ProcessRecoveryManager {
     leaking_processes: HashMap<u32, LeakingProcess>,
     max_recovery_attempts: u32,
-    recovery_cooldown: Duration,
 }
 
 impl ProcessRecoveryManager {
@@ -26,14 +25,13 @@ impl ProcessRecoveryManager {
         Self {
             leaking_processes: HashMap::new(),
             max_recovery_attempts: 3,
-            recovery_cooldown: Duration::from_secs(300), // 5 min cooldown
         }
     }
 
     /// Register a detected memory leak
     pub fn register_leak(&mut self, pid: u32, name: String, leak_prob: f64, rss: u64) {
-        if leak_prob < 0.75 {
-            return; // Only track high-confidence leaks
+        if !leak_prob.is_finite() || !(0.75..=1.0).contains(&leak_prob) {
+            return; // Only track high-confidence, valid leaks
         }
 
         self.leaking_processes
@@ -57,7 +55,8 @@ impl ProcessRecoveryManager {
         if let Some(proc) = self.leaking_processes.get(&pid) {
             // Kill if: leaked for > 30min AND attempts < max
             let elapsed = proc.first_detected_at.elapsed();
-            elapsed > Duration::from_secs(1800) && proc.recovery_attempts < self.max_recovery_attempts
+            elapsed > Duration::from_secs(1800)
+                && proc.recovery_attempts < self.max_recovery_attempts
         } else {
             false
         }
@@ -72,10 +71,11 @@ impl ProcessRecoveryManager {
 
     /// Clear resolved processes (no longer leaking)
     pub fn cleanup_resolved(&mut self) {
+        let max_attempts = self.max_recovery_attempts;
         self.leaking_processes.retain(|_, proc| {
-            // Keep if: still leaking OR within cooldown
-            let cooldown_active = proc.first_detected_at.elapsed() < self.recovery_cooldown;
-            proc.leak_probability > 0.7 || cooldown_active
+            // Remove entries older than 1 hour or that exhausted recovery attempts
+            proc.first_detected_at.elapsed() < Duration::from_secs(3600)
+                && proc.recovery_attempts < max_attempts
         });
     }
 

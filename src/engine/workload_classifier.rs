@@ -14,8 +14,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{
+    hw_bayes::{HwBayesClassifier, HwFeatures},
     llm::LearnedPolicy,
-    user_profile::{AppStats, HourProfile, WorkloadType, workload_signatures},
+    user_profile::{workload_signatures, AppStats, HourProfile, WorkloadType},
 };
 
 /// How a particular piece of evidence contributed to the classification.
@@ -61,12 +62,16 @@ struct PatternWeight {
 
 pub struct WorkloadClassifier {
     learned_weights: Vec<PatternWeight>,
+    /// Gaussian NB sobre features de hardware ARM64.
+    /// Se actualiza online con cada ciclo donde la confianza de texto es alta.
+    pub hw_bayes: HwBayesClassifier,
 }
 
 impl WorkloadClassifier {
     pub fn new() -> Self {
         Self {
             learned_weights: Vec::new(),
+            hw_bayes: HwBayesClassifier::new(),
         }
     }
 
@@ -99,6 +104,9 @@ impl WorkloadClassifier {
     }
 
     /// Bayesian workload classification.
+    ///
+    /// `hw`: features de hardware medidas con assembly (throughput, jitter, cache).
+    /// Si es None, solo usa texto/hora (comportamiento anterior).
     pub fn classify(
         &self,
         foreground_app: Option<&str>,
@@ -106,6 +114,27 @@ impl WorkloadClassifier {
         hour_model: &[HourProfile; 24],
         app_stats: &HashMap<String, AppStats>,
         hour_of_day: u8,
+    ) -> WorkloadClassification {
+        self.classify_with_hw(
+            foreground_app,
+            all_proc_names,
+            hour_model,
+            app_stats,
+            hour_of_day,
+            None,
+        )
+    }
+
+    /// Versión con features de hardware. Fusiona el score de texto con el
+    /// log-posterior del Gaussian NB de hardware en log-space.
+    pub fn classify_with_hw(
+        &self,
+        foreground_app: Option<&str>,
+        all_proc_names: &[&str],
+        hour_model: &[HourProfile; 24],
+        app_stats: &HashMap<String, AppStats>,
+        hour_of_day: u8,
+        hw: Option<&HwFeatures>,
     ) -> WorkloadClassification {
         // Score accumulator: WorkloadType → f32
         let mut scores: HashMap<WorkloadType, f32> = HashMap::new();
@@ -177,6 +206,23 @@ impl WorkloadClassifier {
             sources.push(ClassifierSource::ProcessMix(mix_count));
         }
 
+        // Fusión con Gaussian NB de hardware (si hay features disponibles).
+        // Suma el log-posterior normalizado como boost adicional al score de texto.
+        if let Some(hw_features) = hw {
+            let (hw_wl, hw_prob) = self.hw_bayes.classify(hw_features);
+            // Peso del hardware: 0.5 si es muy seguro (>0.8), 0.2 si es débil (<0.5)
+            let hw_weight = if hw_prob > 0.80 {
+                0.5f32
+            } else if hw_prob > 0.60 {
+                0.35
+            } else if hw_prob > 0.40 {
+                0.20
+            } else {
+                0.10
+            };
+            *scores.entry(hw_wl).or_insert(0.0) += hw_weight * hw_prob as f32;
+        }
+
         // Winner + confidence
         let total: f32 = scores.values().map(|v| v.max(0.0)).sum::<f32>().max(1.0);
         let (best_wl, best_score) = scores
@@ -198,6 +244,16 @@ impl WorkloadClassifier {
             workload: final_workload,
             confidence,
             sources,
+        }
+    }
+
+    /// Aprendizaje online: si la clasificación de texto tiene confianza alta
+    /// Y hay features de hardware, entrena el Gaussian NB con esta observación.
+    ///
+    /// Llamar después de classify_with_hw cuando confidence > 0.70.
+    pub fn maybe_observe(&mut self, hw: &HwFeatures, workload: WorkloadType, text_confidence: f32) {
+        if text_confidence >= 0.70 {
+            self.hw_bayes.observe(hw, workload);
         }
     }
 }

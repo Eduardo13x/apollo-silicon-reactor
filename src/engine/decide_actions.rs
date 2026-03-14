@@ -1,6 +1,8 @@
 use sysinfo::System;
 
 use crate::collector::SystemSnapshot;
+use crate::engine::amx_detector;
+use crate::engine::overflow_guard::OverflowThresholds;
 use crate::engine::safety::critical_background_processes;
 use crate::engine::types::{
     BlockerScore, InteractiveContext, LatencyTarget, OptimizationProfile, RootAction,
@@ -46,11 +48,11 @@ pub struct DecisionOutput {
     pub actions: Vec<RootAction>,
 }
 
-fn is_interactive(name: &str) -> bool {
+fn is_interactive_base(name: &str) -> bool {
     INTERACTIVE_APPS.iter().any(|n| name.contains(n))
 }
 
-fn is_background_noise(name: &str) -> bool {
+fn is_background_noise_base(name: &str) -> bool {
     NOISE_APPS.iter().any(|n| name.contains(n))
 }
 
@@ -58,13 +60,16 @@ fn is_known_blocker(name: &str) -> bool {
     BLOCKER_APPS.iter().any(|n| name.contains(n))
 }
 
-fn context_from_pressure(snapshot: &SystemSnapshot) -> InteractiveContext {
-    let ram_pressure = snapshot.pressure.memory_pressure * 100.0;
+fn context_from_pressure(
+    snapshot: &SystemSnapshot,
+    thresholds: &OverflowThresholds,
+) -> InteractiveContext {
+    let ram_pressure = snapshot.pressure.memory_pressure;
     let cpu_pressure = snapshot.cpu.global_usage as f64;
 
-    if cpu_pressure > 88.0 || ram_pressure > 90.0 {
+    if cpu_pressure > 88.0 || ram_pressure > thresholds.critical_pressure {
         InteractiveContext::ThermalConstrained
-    } else if cpu_pressure > 72.0 || ram_pressure > 78.0 {
+    } else if cpu_pressure > 72.0 || ram_pressure > thresholds.bg_pressure {
         InteractiveContext::BackgroundPressure
     } else {
         InteractiveContext::InteractiveFocus
@@ -75,14 +80,24 @@ fn top_blockers(
     sys: &System,
     snapshot: &SystemSnapshot,
     reactor_event_weight: f64,
+    learned_interactive: &[String],
 ) -> Vec<BlockerScore> {
     let mut blockers = Vec::new();
 
+    // Pre-lowercase learned patterns once for this function.
+    let interactive_lc: Vec<String> = learned_interactive
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
     let interactive_waiters = snapshot
         .top_processes
         .iter()
         .filter(|p| {
-            is_interactive(&p.name) && p.cpu_usage < 8.0 && p.memory_usage > 100 * 1024 * 1024
+            let lc = p.name.to_ascii_lowercase();
+            (is_interactive_base(&p.name)
+                || interactive_lc.iter().any(|pat| lc.contains(pat.as_str())))
+                && p.cpu_usage < 8.0
+                && p.memory_usage > 100 * 1024 * 1024
         })
         .count() as f64;
 
@@ -124,13 +139,38 @@ fn top_blockers(
     blockers
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn decide_actions(
     snapshot: &SystemSnapshot,
     sys: &System,
     profile: OptimizationProfile,
     latency_target: LatencyTarget,
     reactor_event_weight: f64,
+    learned_interactive: &[String],
+    learned_noise: &[String],
+    thresholds: OverflowThresholds,
+    mut qos_mgr: Option<&mut crate::engine::mach_qos::MachQoSManager>,
 ) -> DecisionOutput {
+    // Pre-lowercase learned patterns once (avoids per-process allocations).
+    let interactive_lc: Vec<String> = learned_interactive
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    let noise_lc: Vec<String> = learned_noise
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+
+    // Build closures that merge hardcoded lists with the learned policy.
+    let is_interactive = |name: &str| -> bool {
+        let name_lc = name.to_ascii_lowercase();
+        is_interactive_base(name) || interactive_lc.iter().any(|p| name_lc.contains(p.as_str()))
+    };
+    let is_background_noise = |name: &str| -> bool {
+        let name_lc = name.to_ascii_lowercase();
+        is_background_noise_base(name) || noise_lc.iter().any(|p| name_lc.contains(p.as_str()))
+    };
+
     let mut actions = Vec::new();
 
     // Dev-first: protect critical background workloads and their children.
@@ -142,6 +182,13 @@ pub fn decide_actions(
             critical_pids.insert(pid.as_u32());
         }
     }
+    // AMX/ML protection: ML inference workloads must NEVER be throttled or frozen.
+    // They run on P-cores, are expensive to restart, and are user-initiated.
+    let ml_protected = amx_detector::ml_protected_pids();
+    for &ml_pid in &ml_protected {
+        critical_pids.insert(ml_pid);
+    }
+
     // Add children-of-critical by walking parent chain once.
     // Depth-limited to prevent infinite loops from PID recycling (BUG 10 fix).
     const MAX_PARENT_DEPTH: usize = 20;
@@ -165,8 +212,8 @@ pub fn decide_actions(
         }
     }
 
-    let context = context_from_pressure(snapshot);
-    let blockers = top_blockers(sys, snapshot, reactor_event_weight);
+    let context = context_from_pressure(snapshot, &thresholds);
+    let blockers = top_blockers(sys, snapshot, reactor_event_weight, learned_interactive);
 
     // 1) Wait-graph practical: temporary boost for top blockers.
     let blocker_boost_count = match latency_target {
@@ -216,16 +263,100 @@ pub fn decide_actions(
                 name,
                 aggressive,
                 reason: format!("context-aware throttle ({:?})", context),
+                start_sec: process.start_time(),
+                start_usec: 0,
             });
         }
     }
 
-    // 3) Pressure actions with hysteresis-ish behavior by context.
+    // 3) ML workload boost: route AMX/ML inference processes to P-cores.
+    // These are user-initiated, expensive to restart, and need maximum bandwidth.
+    for &ml_pid in &ml_protected {
+        if let Some(process) = sys.process(sysinfo::Pid::from_u32(ml_pid)) {
+            actions.push(RootAction::BoostProcess {
+                pid: ml_pid,
+                name: process.name().to_string(),
+                reason: "ML/AMX workload — P-core routing".to_string(),
+            });
+        }
+    }
+
+    // 4) Phase 1: Thread-level scheduling for multi-threaded processes.
+    // For non-interactive, non-critical processes using >15% CPU with multiple threads,
+    // route hot threads to P-cores and cold threads to E-cores.
+    if let Some(ref mut mgr) = qos_mgr {
+        let thread_cpu_threshold = 15.0;
+        let mut thread_actions_emitted = 0usize;
+        let max_thread_actions = match profile {
+            OptimizationProfile::AggressiveRoot => 20,
+            OptimizationProfile::SafeRoot => 4,
+            OptimizationProfile::BalancedRoot => 10,
+        };
+
+        for (pid, process) in sys.processes() {
+            if thread_actions_emitted >= max_thread_actions {
+                break;
+            }
+            let pid_u32 = pid.as_u32();
+            let name = process.name().to_string();
+            let cpu = process.cpu_usage();
+
+            // Skip critical, interactive, and low-CPU processes.
+            if critical_pids.contains(&pid_u32)
+                || is_interactive(&name)
+                || cpu < thread_cpu_threshold
+            {
+                continue;
+            }
+
+            // Enumerate threads and classify hot/cold.
+            if let Some(threads) = mgr.enumerate_threads(pid_u32) {
+                if threads.len() < 2 {
+                    continue; // Single-threaded: task-level scheduling is sufficient.
+                }
+
+                let (hot, cold) = mgr.classify_threads(pid_u32, &threads);
+
+                // Emit SetThreadQoS actions for hot threads → P-core routing.
+                for &idx in &hot {
+                    if thread_actions_emitted >= max_thread_actions {
+                        break;
+                    }
+                    actions.push(RootAction::SetThreadQoS {
+                        pid: pid_u32,
+                        name: name.clone(),
+                        thread_index: idx,
+                        tier: "interactive".to_string(),
+                        reason: format!("hot thread #{} in {} (cpu={:.1}%)", idx, name, cpu),
+                    });
+                    thread_actions_emitted += 1;
+                }
+
+                // Cold threads → E-core routing.
+                for &idx in &cold {
+                    if thread_actions_emitted >= max_thread_actions {
+                        break;
+                    }
+                    actions.push(RootAction::SetThreadQoS {
+                        pid: pid_u32,
+                        name: name.clone(),
+                        thread_index: idx,
+                        tier: "background".to_string(),
+                        reason: format!("cold thread #{} in {} (waiting)", idx, name),
+                    });
+                    thread_actions_emitted += 1;
+                }
+            }
+        }
+    }
+
+    // 5) Pressure actions with hysteresis-ish behavior by context.
     match context {
         InteractiveContext::BackgroundPressure | InteractiveContext::ThermalConstrained => {
             // Dev-first: no-freeze by default. Only consider freeze under extreme memory pressure
             // AND swap growth, and never for protected/critical workloads.
-            let extreme_freeze_ok = snapshot.pressure.memory_pressure >= 0.90
+            let extreme_freeze_ok = snapshot.pressure.memory_pressure
+                >= thresholds.extreme_pressure
                 && snapshot.pressure.swap_delta_bytes_per_sec > (5.0 * 1024.0 * 1024.0);
             if extreme_freeze_ok {
                 for (pid, process) in sys.processes() {
@@ -234,6 +365,10 @@ pub fn decide_actions(
                         continue;
                     }
                     let name = process.name().to_string();
+                    // Never freeze interactive apps even under extreme pressure.
+                    if is_interactive(&name) {
+                        continue;
+                    }
                     if ["Slack", "Discord", "Spotify", "Teams"]
                         .iter()
                         .any(|n| name.contains(n))
@@ -242,23 +377,17 @@ pub fn decide_actions(
                             pid,
                             name,
                             reason: format!("extreme pressure quarantine under {:?}", context),
+                            start_sec: process.start_time(),
+                            start_usec: 0,
                         });
                     }
                 }
             }
 
-            actions.push(RootAction::SetSysctl {
-                key: "vm.compressor_poll_interval".to_string(),
-                value: "20".to_string(),
-                reason: "pre-emptive paging tune".to_string(),
-            });
+            // SysctlGovernor now owns vm.compressor_poll_interval tuning
         }
         InteractiveContext::InteractiveFocus => {
-            actions.push(RootAction::SetSysctl {
-                key: "debug.lowpri_throttle_enabled".to_string(),
-                value: "0".to_string(),
-                reason: "favor interactive I/O latency".to_string(),
-            });
+            // SysctlGovernor now owns debug.lowpri_throttle_enabled tuning
         }
     }
 

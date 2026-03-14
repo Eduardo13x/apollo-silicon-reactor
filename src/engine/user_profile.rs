@@ -8,9 +8,9 @@
 //! The resulting `UserProfile` is used by the adaptive governor to decide
 //! what to freeze/unfreeze without ever asking the user.
 
-use std::collections::HashMap;
-use std::time::Instant;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 // ── Workload Detection ────────────────────────────────────────────────────────
 
@@ -42,44 +42,90 @@ pub fn workload_signatures() -> Vec<(WorkloadType, Vec<&'static str>)> {
         (
             WorkloadType::Coding,
             vec![
-                "Xcode", "xcodebuild", "cargo", "rustc", "clang", "gcc", "make",
-                "cmake", "git", "IntelliJ", "CLion", "VSCode", "code", "Cursor",
-                "lldb", "gdb", "python3", "node",
+                "Xcode",
+                "xcodebuild",
+                "cargo",
+                "rustc",
+                "clang",
+                "gcc",
+                "make",
+                "cmake",
+                "git",
+                "IntelliJ",
+                "CLion",
+                "VSCode",
+                "code",
+                "Cursor",
+                "lldb",
+                "gdb",
+                "python3",
+                "node",
             ],
         ),
         (
             WorkloadType::VideoCall,
             vec![
-                "zoom.us", "Teams", "Google Meet", "Slack", "FaceTime",
-                "webex", "Discord",
+                "zoom.us",
+                "Teams",
+                "Google Meet",
+                "Slack",
+                "FaceTime",
+                "webex",
+                "Discord",
             ],
         ),
         (
             WorkloadType::MediaPlayback,
             vec![
-                "IINA", "VLC", "QuickTime", "Infuse", "Plex",
-                "Music", "Spotify", "Podcasts",
+                "IINA",
+                "VLC",
+                "QuickTime",
+                "Infuse",
+                "Plex",
+                "Music",
+                "Spotify",
+                "Podcasts",
             ],
         ),
         (
             WorkloadType::VideoEdit,
             vec![
-                "Final Cut", "DaVinci", "Premiere", "HandBrake",
-                "Motion", "Compressor", "ffmpeg",
+                "Final Cut",
+                "DaVinci",
+                "Premiere",
+                "HandBrake",
+                "Motion",
+                "Compressor",
+                "ffmpeg",
             ],
         ),
         (
             WorkloadType::OfficeWork,
             vec![
-                "Mail", "Calendar", "Notes", "Pages", "Numbers", "Keynote",
-                "Word", "Excel", "PowerPoint", "Notion",
+                "Mail",
+                "Calendar",
+                "Notes",
+                "Pages",
+                "Numbers",
+                "Keynote",
+                "Word",
+                "Excel",
+                "PowerPoint",
+                "Notion",
             ],
         ),
         (
             WorkloadType::CommandLine,
             vec![
-                "Terminal", "iTerm", "Warp", "Alacritty", "kitty",
-                "ssh", "tmux", "zsh", "bash",
+                "Terminal",
+                "iTerm",
+                "Warp",
+                "Alacritty",
+                "kitty",
+                "ssh",
+                "tmux",
+                "zsh",
+                "bash",
             ],
         ),
     ]
@@ -131,7 +177,7 @@ pub struct UserProfile {
     /// When the current foreground session started.
     session_start: Option<Instant>,
     /// Recent session history (last 200 sessions).
-    session_history: Vec<AppSession>,
+    session_history: VecDeque<AppSession>,
     /// Classifiers
     workload_sigs: Vec<(WorkloadType, Vec<&'static str>)>,
     /// Timestamp of last observe() call, for computing secs_since_last_use.
@@ -153,7 +199,7 @@ impl UserProfile {
             current_workload: WorkloadType::Idle,
             current_foreground: None,
             session_start: None,
-            session_history: Vec::new(),
+            session_history: VecDeque::new(),
             workload_sigs: workload_signatures(),
             last_observe: None,
         }
@@ -170,14 +216,16 @@ impl UserProfile {
         hour_of_day: u8,
     ) {
         // Track staleness: increment secs_since_last_use for all apps NOT in foreground.
-        let elapsed_secs = self.last_observe.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        let elapsed_secs = self
+            .last_observe
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
         self.last_observe = Some(Instant::now());
         for (name, stats) in &mut self.app_stats {
             if foreground_app == Some(name.as_str()) {
                 stats.secs_since_last_use = 0;
             } else {
-                stats.secs_since_last_use =
-                    stats.secs_since_last_use.saturating_add(elapsed_secs);
+                stats.secs_since_last_use = stats.secs_since_last_use.saturating_add(elapsed_secs);
             }
         }
 
@@ -282,11 +330,7 @@ impl UserProfile {
 
     // ── Internal helpers ──────────────────────────────────────────────────
 
-    fn detect_workload(
-        &self,
-        foreground: Option<&str>,
-        all_procs: &[&str],
-    ) -> WorkloadType {
+    fn detect_workload(&self, foreground: Option<&str>, all_procs: &[&str]) -> WorkloadType {
         let mut scores: HashMap<WorkloadType, u32> = HashMap::new();
 
         let check_target = |name: &str| {
@@ -338,12 +382,15 @@ impl UserProfile {
         stats.launch_count += 1;
         stats.avg_session_secs = stats.total_foreground_secs / stats.launch_count as u64;
         stats.secs_since_last_use = 0;
-        stats.dominant_workload = Some(workload);
+        // Only set dominant_workload if not yet determined
+        if stats.dominant_workload.is_none() {
+            stats.dominant_workload = Some(workload);
+        }
 
         if self.session_history.len() >= 200 {
-            self.session_history.remove(0);
+            self.session_history.pop_front();
         }
-        self.session_history.push(AppSession {
+        self.session_history.push_back(AppSession {
             app_name: app,
             started_at: Instant::now(),
             duration_secs,

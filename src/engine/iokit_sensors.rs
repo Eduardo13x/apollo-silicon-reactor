@@ -28,10 +28,10 @@ use std::process::Command;
 /// Thermal state of the entire SoC — mirrors IOPMrootDomain values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThermalState {
-    Normal,    // < ~80 °C — all cores available
-    Moderate,  // ~80–90 °C — P-Cores may be gated
-    Severe,    // ~90–100 °C — mandatory frequency reduction
-    Critical,  // > 100 °C — emergency throttle, may halt P-Cores entirely
+    Normal,   // < ~80 °C — all cores available
+    Moderate, // ~80–90 °C — P-Cores may be gated
+    Severe,   // ~90–100 °C — mandatory frequency reduction
+    Critical, // > 100 °C — emergency throttle, may halt P-Cores entirely
 }
 
 /// Per-cluster temperature readings.
@@ -94,8 +94,15 @@ impl IOKitSensorReader {
         // The smc sampler can hang on some systems; cpu_power covers power + utilisation.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = Command::new("powermetrics")
-                .args(["--samplers", "cpu_power,thermal,battery", "-n", "1", "-i", "500"])
+            let result = Command::new("/usr/bin/powermetrics")
+                .args([
+                    "--samplers",
+                    "cpu_power,thermal,battery",
+                    "-n",
+                    "1",
+                    "-i",
+                    "500",
+                ])
                 .output();
             let _ = tx.send(result);
         });
@@ -111,14 +118,6 @@ impl IOKitSensorReader {
         }
 
         let text = String::from_utf8_lossy(&output.stdout);
-        // Debug: write output to file for inspection
-        if text.len() > 0 {
-            use std::fs::File;
-            use std::io::Write;
-            if let Ok(mut f) = File::create("/tmp/powermetrics.last") {
-                let _ = writeln!(f, "{}", text);
-            }
-        }
         Ok(self.parse_powermetrics(&text))
     }
 
@@ -136,6 +135,7 @@ impl IOKitSensorReader {
         let mut batt_pct: Option<u32> = None;
         let mut batt_watts: Option<f32> = None;
         let mut thermal_state = ThermalState::Normal;
+        let mut thermal_state_explicit = false;
 
         for line in text.lines() {
             let line = line.trim();
@@ -147,7 +147,8 @@ impl IOKitSensorReader {
             // If temps are unavailable, infer from thermal pressure level (below).
             if line.starts_with("CPU P-cluster temp:") || line.starts_with("P-cluster temp:") {
                 p_temp = parse_float_after_colon(line);
-            } else if line.starts_with("CPU E-cluster temp:") || line.starts_with("E-cluster temp:") {
+            } else if line.starts_with("CPU E-cluster temp:") || line.starts_with("E-cluster temp:")
+            {
                 e_temp = parse_float_after_colon(line);
             } else if line.starts_with("GPU die temp:") || line.starts_with("GPU temp:") {
                 gpu_temp = parse_float_after_colon(line);
@@ -157,9 +158,7 @@ impl IOKitSensorReader {
             //   Apple Silicon:  "Combined Power (CPU + GPU + ANE): 170 mW"
             //                   "CPU Power: 170 mW"
             // Values may be in W or mW; normalise to W.
-            else if line.starts_with("Package power:") {
-                pkg_watts = parse_power_watts(line);
-            } else if line.starts_with("Combined Power") {
+            else if line.starts_with("Package power:") || line.starts_with("Combined Power") {
                 pkg_watts = parse_power_watts(line);
             } else if line.starts_with("CPU Power:") || line.starts_with("CPU power:") {
                 cpu_watts = parse_power_watts(line);
@@ -167,9 +166,13 @@ impl IOKitSensorReader {
                 gpu_watts = parse_power_watts(line);
             }
             // Utilisation: "P-Cluster HW active residency: 38.3%" (case varies by OS version)
-            else if line.to_ascii_lowercase().contains("p-cluster") && line.contains("active residency") {
+            else if line.to_ascii_lowercase().contains("p-cluster")
+                && line.contains("active residency")
+            {
                 p_util = parse_percent(line);
-            } else if line.to_ascii_lowercase().contains("e-cluster") && line.contains("active residency") {
+            } else if line.to_ascii_lowercase().contains("e-cluster")
+                && line.contains("active residency")
+            {
                 e_util = parse_percent(line);
             }
             // Battery: "Capacity: 87% (charging)"
@@ -186,13 +189,31 @@ impl IOKitSensorReader {
             // Thermal state — multiple line formats depending on macOS version:
             //   Old: "System thermal state: MODERATE"
             //   New: "Current pressure level: Nominal" / "High" / "Critical"
-            else if line.starts_with("System thermal state:") || line.starts_with("Current pressure level:") {
+            else if line.starts_with("System thermal state:")
+                || line.starts_with("Current pressure level:")
+            {
+                thermal_state_explicit = true;
                 let upper = line.to_uppercase();
                 thermal_state = if upper.contains("CRITICAL") {
                     ThermalState::Critical
-                } else if upper.contains("SEVERE") || upper.contains("SEVERE") {
+                } else if upper.contains("SEVERE") || upper.contains("HEAVY") {
                     ThermalState::Severe
                 } else if upper.contains("MODERATE") || upper.contains("HIGH") {
+                    ThermalState::Moderate
+                } else {
+                    ThermalState::Normal
+                };
+            }
+        }
+
+        // Infer thermal_state from P-cluster temp when no explicit thermal line was found.
+        if !thermal_state_explicit {
+            if let Some(t) = p_temp {
+                thermal_state = if t >= 100.0 {
+                    ThermalState::Critical
+                } else if t >= 90.0 {
+                    ThermalState::Severe
+                } else if t >= 80.0 {
                     ThermalState::Moderate
                 } else {
                     ThermalState::Normal
@@ -204,9 +225,9 @@ impl IOKitSensorReader {
         // Modern macOS hides core temps; we estimate based on pressure level + utilisation.
         if p_temp.is_none() && e_temp.is_none() {
             let (est_p, est_e) = match thermal_state {
-                ThermalState::Normal => (60.0, 45.0),   // Cool idle
-                ThermalState::Moderate => (80.0, 65.0), // Warm, some activity
-                ThermalState::Severe => (95.0, 80.0),   // Hot, heavy load
+                ThermalState::Normal => (60.0, 45.0),    // Cool idle
+                ThermalState::Moderate => (80.0, 65.0),  // Warm, some activity
+                ThermalState::Severe => (95.0, 80.0),    // Hot, heavy load
                 ThermalState::Critical => (110.0, 95.0), // Throttled, emergency
             };
             p_temp = Some(est_p);
@@ -262,7 +283,7 @@ impl Default for IOKitSensorReader {
 /// Parse a power value after the last colon, converting mW → W automatically.
 /// Handles: "CPU Power: 170 mW", "Package power: 4.532 W"
 fn parse_power_watts(line: &str) -> Option<f32> {
-    let after_colon = line.split(':').last()?;
+    let after_colon = line.split(':').next_back()?;
     let mut tokens = after_colon.split_whitespace();
     let value: f32 = tokens.next()?.parse().ok()?;
     let unit = tokens.next().unwrap_or("W");

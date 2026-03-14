@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::collector::SystemSnapshot;
-use crate::engine::types::{LatencyTarget, LlmRunMode, OptimizationProfile};
+use crate::engine::types::{HardPath, LatencyTarget, LlmRunMode, OptimizationProfile};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RepoConfig {
@@ -63,8 +63,8 @@ impl LlmConfig {
 }
 
 pub fn load_repo_config(path: &Path) -> RepoConfig {
-    let data = match fs::read_to_string(path) {
-        Ok(v) => v,
+    let data = match HardPath::read_to_string_limited(path, 1024 * 1024) {
+        Ok(s) => s,
         Err(_) => return RepoConfig::default(),
     };
     toml::from_str(&data).unwrap_or_default()
@@ -143,44 +143,91 @@ pub struct LearnedPolicy {
     pub noise_patterns: Vec<String>,
     pub protected_patterns: Vec<String>,
     pub learned_at: Option<DateTime<Utc>>,
+    /// Pesos Bayesianos por proceso: cuántas veces se throttleó y cuántas fue efectivo.
+    /// Backward-compatible: campo opcional, deserializa a HashMap vacío si ausente.
+    #[serde(default)]
+    pub pattern_weights:
+        std::collections::HashMap<String, crate::engine::outcome_tracker::PatternWeight>,
 }
 
 pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
-    let data = fs::read_to_string(path).ok()?;
+    let data = HardPath::read_to_string_limited(path, 1024 * 1024).ok()?;
     serde_json::from_str(&data).ok()
 }
 
 pub fn write_json(path: &Path, value: &impl Serialize, mode: Option<u32>) {
+    let _ = HardPath::verify_no_symlink(path);
+
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        let _ = HardPath::secure_create_dir_all(parent);
+        // Restrict parent directory to root-only if we're root.
+        #[cfg(unix)]
+        if unsafe { libc::getuid() } == 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
     }
     if let Ok(json) = serde_json::to_string_pretty(value) {
-        let _ = fs::write(path, json);
-        if let Some(mode) = mode {
-            #[cfg(unix)]
+        // Atomic write: temp file → fsync → rename.
+        // rename() on the same filesystem is atomic in POSIX, so a crash mid-write
+        // leaves the old file intact rather than a truncated/empty file.
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt;
+            let tmp_path = path.with_extension("tmp");
+            let m = mode.unwrap_or(0o644);
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(m)
+                .open(&tmp_path)
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+                if f.write_all(json.as_bytes()).is_ok() && f.sync_all().is_ok() {
+                    if fs::rename(&tmp_path, path).is_ok() {
+                        return;
+                    }
+                }
+                // Cleanup temp on failure.
+                let _ = fs::remove_file(&tmp_path);
             }
         }
+        // Fallback for non-unix or if atomic write failed.
+        let _ = fs::write(path, json);
     }
 }
 
 pub fn write_secret(path: &Path, value: &str) -> anyhow::Result<()> {
+    HardPath::verify_no_symlink(path)?;
+
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        HardPath::secure_create_dir_all(parent)?;
     }
-    fs::write(path, value)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(value.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, value)?;
     }
     Ok(())
 }
 
 pub fn delete_file_best_effort(path: &Path) {
-    let _ = fs::remove_file(path);
+    if HardPath::verify_no_symlink(path).is_ok() {
+        let _ = fs::remove_file(path);
+    }
 }
 
 pub fn state_paths_root(is_root: bool) -> (PathBuf, PathBuf) {
@@ -213,10 +260,27 @@ pub struct FeedbackEntry {
 }
 
 pub fn append_jsonl(path: &Path, value: &impl Serialize) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+    if HardPath::verify_no_symlink(path).is_err() {
+        return;
     }
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+
+    if let Some(parent) = path.parent() {
+        if HardPath::secure_create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    #[cfg(unix)]
+    let open_result = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let open_result = fs::OpenOptions::new().create(true).append(true).open(path);
+    if let Ok(mut f) = open_result {
         if let Ok(line) = serde_json::to_string(value) {
             let _ = writeln!(f, "{}", line);
         }
@@ -347,6 +411,7 @@ impl LlmAdvisor {
         &mut self,
         snapshot: &SystemSnapshot,
         api_key: &str,
+        policy: Option<&LearnedPolicy>,
     ) -> Result<LlmSuggestion, LlmCallError> {
         // Extra guard: don't try too frequently on repeated failures.
         if let Some(last) = self.last_attempt {
@@ -357,6 +422,7 @@ impl LlmAdvisor {
         self.last_attempt = Some(Instant::now());
 
         let summary = build_summary(snapshot);
+        let policy_context = policy.map(build_policy_context).unwrap_or_default();
         let system_prompt = r#"You are an optimization advisor for a macOS system optimizer daemon.
 
 Return ONLY valid JSON with this shape:
@@ -376,11 +442,14 @@ Constraints:
 - Do NOT suggest touching Spotlight stack (mds/mdworker/mds_stores/Spotlight).
 - Keep pattern strings short substrings; no regex.
 - If unsure, set suggestions to null and confidence low.
+- Do NOT add processes already in the current policy lists (they are already classified).
+- Do NOT put the same process in both noise and protected.
+- low-value processes have been throttled many times with no effect; consider adding them to protected instead of noise.
 "#;
 
         let user_prompt = format!(
-            "SystemSummary:\n{}\n\nGoal: maximize perceived responsiveness and stability.",
-            summary
+            "SystemSummary:\n{}\n\n{}\nGoal: maximize perceived responsiveness and stability.",
+            summary, policy_context
         );
 
         let req = OpenAiChatRequest {
@@ -406,6 +475,17 @@ Constraints:
         };
 
         let timeout = self.cfg.timeout();
+        let endpoint = self.cfg.endpoint();
+        // Allow HTTP only for loopback endpoints (Ollama, llama.cpp, LM Studio, etc.).
+        // Remote endpoints must use HTTPS to protect the API key.
+        let is_loopback = endpoint.starts_with("http://localhost")
+            || endpoint.starts_with("http://127.0.0.1")
+            || endpoint.starts_with("http://[::1]");
+        if !endpoint.starts_with("https://") && !is_loopback {
+            return Err(LlmCallError::Rejected(
+                "LLM endpoint must use HTTPS to protect API key".to_string(),
+            ));
+        }
         let payload = serde_json::to_value(&req)
             .map_err(|e| LlmCallError::Parse(format!("request serialize: {}", e)))?;
         let response = ureq::AgentBuilder::new()
@@ -430,8 +510,11 @@ Constraints:
             Err(e) => return Err(LlmCallError::Transport(e.to_string())),
         };
 
-        let response_text = response
-            .into_string()
+        let mut response_text = String::new();
+        response
+            .into_reader()
+            .take(1024 * 1024) // 1MB limit for LLM response
+            .read_to_string(&mut response_text)
             .map_err(|e| LlmCallError::Transport(e.to_string()))?;
 
         let parsed: OpenAiChatResponse = serde_json::from_str(&response_text)
@@ -461,7 +544,13 @@ Constraints:
             add_noise_patterns: sanitize_pattern_list(lists.add_noise_patterns, 6),
             add_protected_patterns: sanitize_pattern_list(lists.add_protected_patterns, 6),
             confidence: wire.confidence.unwrap_or(0.0).clamp(0.0, 1.0),
-            rationale: wire.rationale.unwrap_or_default(),
+            rationale: {
+                let mut r = wire.rationale.unwrap_or_default();
+                if r.len() > 1024 {
+                    r.truncate(1024);
+                }
+                r
+            },
         };
 
         // Hard guard: never accept Spotlight stack patterns.
@@ -540,6 +629,46 @@ fn extract_first_json_object(s: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn build_policy_context(policy: &LearnedPolicy) -> String {
+    // Truncate lists to keep prompt short for small local models.
+    fn join_truncated(v: &[String], max: usize) -> String {
+        let slice = if v.len() > max { &v[..max] } else { v };
+        slice.join(", ")
+    }
+    let low_value: Vec<String> = policy
+        .pattern_weights
+        .iter()
+        .filter(|(_, w)| w.is_low_value())
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut out = String::from("CurrentPolicy (already classified — do NOT re-add these):\n");
+    if !policy.interactive_patterns.is_empty() {
+        out.push_str(&format!(
+            "  interactive: {}\n",
+            join_truncated(&policy.interactive_patterns, 20)
+        ));
+    }
+    if !policy.noise_patterns.is_empty() {
+        out.push_str(&format!(
+            "  noise: {}\n",
+            join_truncated(&policy.noise_patterns, 20)
+        ));
+    }
+    if !policy.protected_patterns.is_empty() {
+        out.push_str(&format!(
+            "  protected: {}\n",
+            join_truncated(&policy.protected_patterns, 20)
+        ));
+    }
+    if !low_value.is_empty() {
+        out.push_str(&format!(
+            "  low-value (throttled ≥5×, zero effect — move to protected or leave alone): {}\n",
+            join_truncated(&low_value, 15)
+        ));
+    }
+    out
 }
 
 fn build_summary(snapshot: &SystemSnapshot) -> String {
