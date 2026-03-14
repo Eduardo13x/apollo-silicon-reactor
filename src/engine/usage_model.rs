@@ -48,9 +48,19 @@ pub struct UsageEntry {
     pub interactive_ema: f64,
     pub jank_ema: f64,
 
+    /// EMA of cpu_wall_ratio from proc_pid_rusage deltas.
+    /// Low (< 0.05) = I/O-bound (behavior-interactive), high (> 0.70) = CPU-bound.
+    /// Initialized to 0.5 (neutral) for cold-start / schema migration.
+    #[serde(default = "default_cpu_wall_ratio_ema")]
+    pub cpu_wall_ratio_ema: f64,
+
     pub seen_count_total: u64,
     pub seen_interactive_total: u64,
     pub seen_jank_total: u64,
+}
+
+fn default_cpu_wall_ratio_ema() -> f64 {
+    0.5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +73,7 @@ pub struct UsageEntrySummary {
     pub jank_ema: f64,
     pub cpu_ema: f64,
     pub mem_ema: f64,
+    pub cpu_wall_ratio_ema: f64,
     pub first_seen_at: Option<DateTime<Utc>>,
     pub last_seen_at: Option<DateTime<Utc>>,
 }
@@ -88,12 +99,23 @@ impl UsageModel {
                 if p.schema_version == 0 {
                     p.schema_version = 1;
                 }
+                // Schema v1 → v2 migration: initialize cpu_wall_ratio_ema to
+                // neutral 0.5 for all existing entries (serde default handles
+                // missing fields, but bump version to track the migration).
+                if p.schema_version < 2 {
+                    for entry in p.entries.values_mut() {
+                        if entry.cpu_wall_ratio_ema == 0.0 {
+                            entry.cpu_wall_ratio_ema = 0.5;
+                        }
+                    }
+                    p.schema_version = 2;
+                }
                 return Self { persisted: p };
             }
         }
         Self {
             persisted: UsageModelPersisted {
-                schema_version: 1,
+                schema_version: 2,
                 started_at: None,
                 updated_at: None,
                 entries: HashMap::new(),
@@ -112,6 +134,7 @@ impl UsageModel {
         interactive_proxy: bool,
         jank_proxy: bool,
         top_n: usize,
+        cpu_wall_ratios: &HashMap<String, f32>,
     ) {
         if self.persisted.started_at.is_none() {
             self.persisted.started_at = Some(now);
@@ -166,6 +189,14 @@ impl UsageModel {
             } else {
                 entry.jank_ema = ema_update(entry.jank_ema, 0.0, decay_jank);
             }
+
+            // EMA-update cpu_wall_ratio if we have a measurement for this process.
+            // This is a PARALLEL signal to interactive_ema — does NOT replace it.
+            if let Some(&ratio) = cpu_wall_ratios.get(&p.name) {
+                let ratio_f64 = (ratio as f64).clamp(0.0, 1.0);
+                entry.cpu_wall_ratio_ema =
+                    ema_update(entry.cpu_wall_ratio_ema, ratio_f64, decay_presence);
+            }
         }
     }
 
@@ -212,6 +243,11 @@ impl UsageModel {
             model_started_at: self.persisted.started_at,
             model_updated_at: self.persisted.updated_at,
         }
+    }
+
+    /// Access the raw entries map (e.g. to build behavior-interactive PID sets).
+    pub fn entries(&self) -> &HashMap<String, UsageEntry> {
+        &self.persisted.entries
     }
 
     pub fn maybe_promote_patterns(
@@ -407,6 +443,21 @@ fn never_promote_interactive() -> Vec<&'static str> {
     ]
 }
 
+/// Behavior-based interactivity detection via cpu_wall_ratio EMA.
+///
+/// A process is "behavior-interactive" when:
+/// 1. Its cpu_wall_ratio EMA is low (< 0.05) — I/O-bound, waiting on user input
+/// 2. It has sustained presence (presence_ema >= 0.15) — not a transient process
+/// 3. It has been seen enough times (>= 10) — cold-start protection
+///
+/// This is analogous to Linux CFS's interactivity estimator: processes that
+/// spend most of their time sleeping (low CPU/wall ratio) are interactive.
+pub fn is_behavior_interactive(entry: &UsageEntry) -> bool {
+    entry.cpu_wall_ratio_ema < 0.05
+        && entry.presence_ema >= 0.15
+        && entry.seen_count_total >= 10
+}
+
 pub fn usage_model_path_root(is_root: bool) -> PathBuf {
     if is_root {
         PathBuf::from("/var/lib/apollo/usage_model.json")
@@ -462,7 +513,177 @@ fn summarize_entry(e: &UsageEntry) -> UsageEntrySummary {
         jank_ema: e.jank_ema,
         cpu_ema: e.cpu_ema,
         mem_ema: e.mem_ema,
+        cpu_wall_ratio_ema: e.cpu_wall_ratio_ema,
         first_seen_at: e.first_seen_at,
         last_seen_at: e.last_seen_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_entry(cpu_wall_ratio_ema: f64, presence_ema: f64, seen_count: u64) -> UsageEntry {
+        UsageEntry {
+            raw_name: "TestApp".to_string(),
+            norm_name: "TestApp".to_string(),
+            first_seen_at: None,
+            last_seen_at: None,
+            presence_ema,
+            cpu_ema: 0.0,
+            mem_ema: 0.0,
+            interactive_ema: 0.0,
+            jank_ema: 0.0,
+            cpu_wall_ratio_ema,
+            seen_count_total: seen_count,
+            seen_interactive_total: 0,
+            seen_jank_total: 0,
+        }
+    }
+
+    fn make_snapshot(names: &[&str]) -> SystemSnapshot {
+        use crate::collector::*;
+        SystemSnapshot {
+            timestamp: Utc::now(),
+            cpu: CpuStats {
+                global_usage: 10.0,
+                core_count: 8,
+            },
+            memory: MemoryStats {
+                total_ram: 8 * 1024 * 1024 * 1024,
+                used_ram: 4 * 1024 * 1024 * 1024,
+                free_ram: 4 * 1024 * 1024 * 1024,
+                total_swap: 0,
+                used_swap: 0,
+            },
+            pressure: PressureStats {
+                memory_pressure: 0.3,
+                swap_used_bytes: 0,
+                swap_total_bytes: 0,
+                swap_delta_bytes_per_sec: 0.0,
+                thermal_level: "nominal".to_string(),
+                compressor_pressure: 0.0,
+            },
+            disks: vec![],
+            networks: vec![],
+            top_processes: names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| ProcessStats {
+                    pid: (i + 1) as u32,
+                    name: n.to_string(),
+                    cpu_usage: 5.0,
+                    memory_usage: 100 * 1024 * 1024,
+                    cpu_wall_ratio: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_cpu_wall_ratio_ema_update() {
+        let mut model = UsageModel::default();
+        let snapshot = make_snapshot(&["TestApp"]);
+        let now = Utc::now();
+
+        // Feed a constant low ratio (0.02) for many cycles.
+        let mut ratios = HashMap::new();
+        ratios.insert("TestApp".to_string(), 0.02_f32);
+
+        for i in 0..50 {
+            let t = now + ChronoDuration::seconds(i * 3);
+            model.update_from_snapshot(&snapshot, t, false, false, 10, &ratios);
+        }
+
+        let entry = model.entries().get("TestApp").unwrap();
+        // After 50 updates with ratio=0.02, the EMA should converge close to 0.02.
+        assert!(
+            entry.cpu_wall_ratio_ema < 0.06,
+            "EMA should converge near 0.02, got {}",
+            entry.cpu_wall_ratio_ema
+        );
+        assert!(
+            entry.cpu_wall_ratio_ema > 0.0,
+            "EMA should be positive, got {}",
+            entry.cpu_wall_ratio_ema
+        );
+    }
+
+    #[test]
+    fn test_is_behavior_interactive_low_ratio() {
+        // Low ratio, high presence, enough observations → interactive.
+        let entry = make_entry(0.03, 0.30, 20);
+        assert!(
+            is_behavior_interactive(&entry),
+            "low cpu_wall_ratio + high presence + enough seen → should be interactive"
+        );
+    }
+
+    #[test]
+    fn test_is_behavior_interactive_high_ratio() {
+        // High ratio (CPU-bound) → NOT interactive.
+        let entry = make_entry(0.80, 0.30, 20);
+        assert!(
+            !is_behavior_interactive(&entry),
+            "high cpu_wall_ratio → should NOT be interactive"
+        );
+
+        // Borderline: ratio = 0.10 (above 0.05 threshold) → NOT interactive.
+        let entry2 = make_entry(0.10, 0.30, 20);
+        assert!(
+            !is_behavior_interactive(&entry2),
+            "ratio 0.10 (> 0.05 threshold) → should NOT be interactive"
+        );
+    }
+
+    #[test]
+    fn test_is_behavior_interactive_insufficient_presence() {
+        // Low ratio but low presence → NOT interactive (transient process).
+        let entry = make_entry(0.02, 0.10, 20);
+        assert!(
+            !is_behavior_interactive(&entry),
+            "low presence_ema → should NOT be interactive"
+        );
+    }
+
+    #[test]
+    fn test_is_behavior_interactive_insufficient_seen_count() {
+        // Low ratio, high presence, but too few observations → NOT interactive (cold start).
+        let entry = make_entry(0.02, 0.30, 5);
+        assert!(
+            !is_behavior_interactive(&entry),
+            "seen_count < 10 → should NOT be interactive (cold start)"
+        );
+    }
+
+    #[test]
+    fn test_cpu_wall_ratio_ema_no_ratio_preserves_default() {
+        let mut model = UsageModel::default();
+        let snapshot = make_snapshot(&["NoRatioApp"]);
+        let now = Utc::now();
+
+        // Update WITHOUT providing a ratio for this process.
+        let empty_ratios: HashMap<String, f32> = HashMap::new();
+        model.update_from_snapshot(&snapshot, now, false, false, 10, &empty_ratios);
+
+        let entry = model.entries().get("NoRatioApp").unwrap();
+        // Default cpu_wall_ratio_ema should be 0.0 (Default trait) since it's
+        // a new entry and no ratio was provided. The serde default (0.5) only
+        // applies when deserializing from JSON.
+        assert!(
+            (entry.cpu_wall_ratio_ema - 0.0).abs() < f64::EPSILON,
+            "new entry without ratio should keep default 0.0, got {}",
+            entry.cpu_wall_ratio_ema
+        );
+    }
+
+    #[test]
+    fn test_summarize_entry_includes_cpu_wall_ratio_ema() {
+        let entry = make_entry(0.03, 0.30, 20);
+        let summary = summarize_entry(&entry);
+        assert!(
+            (summary.cpu_wall_ratio_ema - 0.03).abs() < f64::EPSILON,
+            "summary should include cpu_wall_ratio_ema"
+        );
     }
 }

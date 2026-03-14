@@ -572,6 +572,7 @@ mod tests {
             name: "test_proc".to_string(),
             cpu_usage: 3.5,
             memory_usage: 9999,
+            cpu_wall_ratio: None,
         };
         let pe = ProcessEntry::from_stats(&stats, 1);
         assert_eq!(pe.pid, 42);

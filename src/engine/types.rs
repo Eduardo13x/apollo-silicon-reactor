@@ -485,9 +485,9 @@ pub struct RuntimeMetrics {
     /// Ajuste actual al threshold de presión (negativo = más conservador).
     #[serde(default)]
     pub overflow_threshold_offset_pp: i32,
-    /// true cuando hay compilación activa (build_mode).
+    /// Workload mode detected by the feature-based classifier (Phase 3).
     #[serde(default)]
-    pub overflow_build_mode: bool,
+    pub overflow_workload_mode: String,
     // Predictive agent metrics
     #[serde(default)]
     pub predictive_agent_active: bool,
@@ -519,6 +519,13 @@ pub struct RuntimeMetrics {
     pub thread_qos_hot_routes: u64,
     #[serde(default)]
     pub thread_qos_cold_routes: u64,
+    // RL threshold agent metrics (Phase 4)
+    #[serde(default)]
+    pub rl_adjustment_pp: i32,
+    #[serde(default)]
+    pub rl_total_ticks: u64,
+    #[serde(default)]
+    pub rl_total_overflows: u64,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.

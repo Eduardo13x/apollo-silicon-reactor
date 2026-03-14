@@ -263,3 +263,178 @@ impl Default for WorkloadClassifier {
         Self::new()
     }
 }
+
+// ── Phase 3: Feature-based Workload Mode Classifier ─────────────────────────
+//
+// Nearest-centroid classification (Cover & Hart, 1967).
+// Uses a 5-dimensional feature vector and 4 pre-defined centroids tuned
+// for Apple Silicon laptops with 8 GB RAM.
+//
+// Orthogonal to the text-based WorkloadClassifier above — this produces
+// a coarser WorkloadMode used for overflow_guard threshold tuning.
+
+/// Coarse workload mode for threshold tuning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkloadMode {
+    Build,
+    LlmInference,
+    Browsing,
+    Idle,
+}
+
+impl WorkloadMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::LlmInference => "llm-inference",
+            Self::Browsing => "browsing",
+            Self::Idle => "idle",
+        }
+    }
+
+    /// Threshold bonus for overflow_guard. Negative = more conservative.
+    pub fn threshold_bonus(&self) -> f64 {
+        match self {
+            Self::Build => -0.08,
+            Self::LlmInference => -0.04,
+            Self::Browsing => 0.0,
+            Self::Idle => 0.03,
+        }
+    }
+}
+
+impl Default for WorkloadMode {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+/// Feature vector for nearest-centroid classification.
+pub struct WorkloadFeatures {
+    /// Mean cpu_wall_ratio across all processes (0.0–1.0).
+    pub avg_cpu_wall_ratio: f64,
+    /// Count of active build tool processes (rustc, cargo, clang, etc.).
+    pub build_tool_count: f64,
+    /// 1.0 if GPU power > 2W, else 0.0.
+    pub gpu_active: f64,
+    /// Total RSS of all processes in GB.
+    pub total_rss_gb: f64,
+    /// Count of behavior-interactive PIDs (Phase 2).
+    pub interactive_count: f64,
+}
+
+/// Pre-defined centroids tuned for M1 8GB MacBook Air.
+/// Dimensions: [avg_cpu_wall_ratio, build_tool_count, gpu_active, total_rss_gb, interactive_count]
+const CENTROIDS: [(WorkloadMode, [f64; 5]); 4] = [
+    (WorkloadMode::Build, [0.75, 3.0, 0.0, 5.0, 2.0]),
+    (WorkloadMode::LlmInference, [0.60, 0.0, 1.0, 4.0, 1.0]),
+    (WorkloadMode::Browsing, [0.03, 0.0, 0.3, 3.0, 5.0]),
+    (WorkloadMode::Idle, [0.01, 0.0, 0.0, 1.0, 0.0]),
+];
+
+/// Normalization ranges per feature dimension (prevents scale bias).
+const FEATURE_RANGES: [f64; 5] = [1.0, 4.0, 1.0, 6.0, 6.0];
+
+/// Classify the current system state into one of 4 workload modes.
+/// Returns (mode, confidence) where confidence ∈ [0, 1].
+pub fn classify_workload_mode(features: &WorkloadFeatures) -> (WorkloadMode, f64) {
+    let fv = [
+        features.avg_cpu_wall_ratio,
+        features.build_tool_count,
+        features.gpu_active,
+        features.total_rss_gb,
+        features.interactive_count,
+    ];
+
+    let mut distances: Vec<(WorkloadMode, f64)> = CENTROIDS
+        .iter()
+        .map(|(mode, centroid)| {
+            let d: f64 = fv
+                .iter()
+                .zip(centroid.iter())
+                .zip(FEATURE_RANGES.iter())
+                .map(|((v, c), r)| ((v - c) / r).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            (*mode, d)
+        })
+        .collect();
+
+    distances.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let d_min = distances[0].1;
+    let d_second = distances[1].1;
+    let confidence = if d_min + d_second > 0.0 {
+        1.0 - d_min / (d_min + d_second)
+    } else {
+        0.5
+    };
+
+    (distances[0].0, confidence.clamp(0.0, 1.0))
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+
+    #[test]
+    fn build_centroid_match() {
+        let (mode, conf) = classify_workload_mode(&WorkloadFeatures {
+            avg_cpu_wall_ratio: 0.80,
+            build_tool_count: 4.0,
+            gpu_active: 0.0,
+            total_rss_gb: 5.5,
+            interactive_count: 1.0,
+        });
+        assert_eq!(mode, WorkloadMode::Build);
+        assert!(conf > 0.5, "confidence={}", conf);
+    }
+
+    #[test]
+    fn idle_centroid_match() {
+        let (mode, _) = classify_workload_mode(&WorkloadFeatures {
+            avg_cpu_wall_ratio: 0.01,
+            build_tool_count: 0.0,
+            gpu_active: 0.0,
+            total_rss_gb: 0.8,
+            interactive_count: 0.0,
+        });
+        assert_eq!(mode, WorkloadMode::Idle);
+    }
+
+    #[test]
+    fn browsing_centroid_match() {
+        let (mode, _) = classify_workload_mode(&WorkloadFeatures {
+            avg_cpu_wall_ratio: 0.02,
+            build_tool_count: 0.0,
+            gpu_active: 0.2,
+            total_rss_gb: 3.5,
+            interactive_count: 6.0,
+        });
+        assert_eq!(mode, WorkloadMode::Browsing);
+    }
+
+    #[test]
+    fn llm_centroid_match() {
+        let (mode, _) = classify_workload_mode(&WorkloadFeatures {
+            avg_cpu_wall_ratio: 0.55,
+            build_tool_count: 0.0,
+            gpu_active: 1.0,
+            total_rss_gb: 4.5,
+            interactive_count: 1.0,
+        });
+        assert_eq!(mode, WorkloadMode::LlmInference);
+    }
+
+    #[test]
+    fn threshold_bonus_values() {
+        assert!((WorkloadMode::Build.threshold_bonus() - (-0.08)).abs() < 1e-6);
+        assert!((WorkloadMode::LlmInference.threshold_bonus() - (-0.04)).abs() < 1e-6);
+        assert!((WorkloadMode::Browsing.threshold_bonus() - 0.0).abs() < 1e-6);
+        assert!((WorkloadMode::Idle.threshold_bonus() - 0.03).abs() < 1e-6);
+    }
+}

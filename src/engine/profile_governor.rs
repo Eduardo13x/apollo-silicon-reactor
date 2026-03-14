@@ -2,6 +2,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::types::{GovernorState, ManualOverride, OptimizationProfile, ProfileTransition};
+use crate::engine::workload_classifier::WorkloadMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernorPersisted {
@@ -25,6 +26,8 @@ pub struct GovernorInput {
     pub interactive_heavy: bool,
     /// Usuario cambió de app 3+ veces en los últimos 5 min → modo burst de cambio de contexto.
     pub context_switch_burst: bool,
+    /// Workload mode from Phase 3 feature-based classifier (None for backward compat).
+    pub workload_mode: Option<WorkloadMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,7 +198,7 @@ impl ProfileGovernor {
             } else {
                 self.accumulate_counters(pressure_score);
                 if !self.in_cooldown(now) {
-                    target = self.transition_target(current, pressure_score);
+                    target = self.transition_target(current, pressure_score, input.workload_mode);
                     if target != current {
                         reason = format!(
                             "pressure {:.2} transition {} -> {}",
@@ -318,12 +321,26 @@ impl ProfileGovernor {
         &self,
         current: OptimizationProfile,
         pressure_score: f64,
+        workload_mode: Option<WorkloadMode>,
     ) -> OptimizationProfile {
+        let consecutive_high_threshold = match workload_mode {
+            Some(WorkloadMode::Build) => 2,
+            _ => 3,
+        };
+        let safe_low_threshold = match workload_mode {
+            Some(WorkloadMode::Idle) => 4,
+            _ => 6,
+        };
+
         match current {
             OptimizationProfile::BalancedRoot => {
-                if pressure_score >= 0.72 && self.state.consecutive_high >= 3 {
+                if pressure_score >= 0.72
+                    && self.state.consecutive_high >= consecutive_high_threshold
+                {
                     OptimizationProfile::AggressiveRoot
-                } else if pressure_score <= 0.28 && self.safe_low_consecutive >= 6 {
+                } else if pressure_score <= 0.28
+                    && self.safe_low_consecutive >= safe_low_threshold
+                {
                     OptimizationProfile::SafeRoot
                 } else {
                     current

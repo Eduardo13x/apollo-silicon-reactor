@@ -28,6 +28,7 @@ fn make_snap(name: &str, cpu: f32, secs_idle: u64, has_gui: bool) -> ProcessSnap
         has_gui_window: has_gui,
         wakeups_per_sec: 1.0,
         parent_alive: true,
+        process_uptime_secs: 300,
     }
 }
 

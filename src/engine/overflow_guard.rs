@@ -14,11 +14,16 @@
 //! 3. **Build mode**: si hay procesos de compilación corriendo, Apollo anticipa
 //!    el pico de RAM y actúa desde el 65% de presión.
 //! 4. **Persistencia**: el historial sobrevive reboots en `/var/lib/apollo/overflow_history.json`.
+//! 5. **RL tuning (Phase 4)**: Q-learning agent adjusts thresholds online based on
+//!    observed stability vs. overflow events.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
+
+use crate::engine::rl_threshold::{RlState, RlThresholdAgent, RL_ABSOLUTE_FLOOR};
+use crate::engine::workload_classifier::WorkloadMode;
 
 // ── Thresholds ────────────────────────────────────────────────────────────────
 
@@ -31,8 +36,8 @@ pub struct OverflowThresholds {
     pub critical_pressure: f64,
     /// Por encima de este valor → extreme freeze activo (la vieja 0.90 fija).
     pub extreme_pressure: f64,
-    /// Modo build: compilación detectada → actuar más temprano.
-    pub build_mode: bool,
+    /// Workload mode: determines threshold bonus (Phase 3).
+    pub workload_mode: WorkloadMode,
 }
 
 impl Default for OverflowThresholds {
@@ -41,7 +46,7 @@ impl Default for OverflowThresholds {
             bg_pressure: 0.78,
             critical_pressure: 0.88,
             extreme_pressure: 0.90,
-            build_mode: false,
+            workload_mode: WorkloadMode::Idle,
         }
     }
 }
@@ -83,27 +88,32 @@ pub struct OverflowGuard {
     last_decay_check: Instant,
     /// Evitar registrar múltiples eventos del mismo overflow en rápida sucesión.
     last_event_at: Option<Instant>,
+    /// Q-learning RL agent for adaptive threshold tuning (Phase 4).
+    pub rl_agent: Option<RlThresholdAgent>,
 }
 
 /// Herramientas de compilación que causan picos de RAM.
 /// "stable" es el wrapper del Rust toolchain que rustup antepone a rustc/cargo —
 /// aparece como proceso padre durante compilación y consume RAM proporcional.
-const BUILD_TOOLS: &[&str] = &[
+pub const BUILD_TOOLS: &[&str] = &[
     "rustc", "cargo", "swift", "clang", "make", "gcc", "ld", "link", "stable",
 ];
 
 impl OverflowGuard {
     /// Carga el historial desde disco, o crea uno vacío si no existe.
-    pub fn load_or_default(path: &Path) -> Self {
+    /// If `rl_path` is provided, also loads the RL threshold agent from that path.
+    pub fn load_or_default(path: &Path, rl_path: Option<&Path>) -> Self {
         let history = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        let rl_agent = rl_path.map(RlThresholdAgent::load_or_default);
         Self {
             history,
             path: path.to_path_buf(),
             last_decay_check: Instant::now(),
             last_event_at: None,
+            rl_agent,
         }
     }
 
@@ -111,12 +121,15 @@ impl OverflowGuard {
     /// - kqueue dispara VmPressureLevel::Critical o SuddenTerminate
     /// - survival_mode se activa
     /// - presión RAM > 0.92 sostenida
+    ///
+    /// `compressor_pressure` is the raw compressor ratio (0.0-1.0) for RL state.
     pub fn record_event(
         &mut self,
         memory_pressure: f64,
         swap_delta_bps: f64,
         heavy_apps: &[String],
         cause: &str,
+        compressor_pressure: f64,
     ) {
         // Deduplicar: no registrar dos eventos del mismo overflow (ventana 60s).
         if let Some(last) = self.last_event_at {
@@ -162,6 +175,15 @@ impl OverflowGuard {
                 .join(", ")
         );
 
+        // RL agent: tick with overflow=true.
+        let overflows_1h = self.recent_overflow_count_hours(1);
+        if let Some(rl) = &mut self.rl_agent {
+            let rl_state =
+                RlState::from_metrics(memory_pressure, compressor_pressure, overflows_1h);
+            rl.tick(rl_state, true);
+            rl.persist();
+        }
+
         self.persist();
     }
 
@@ -184,19 +206,33 @@ impl OverflowGuard {
             .iter()
             .map(|e| {
                 let age_h = now_secs.saturating_sub(e.timestamp_secs) as f64 / 3600.0;
-                // Contribución decae a la mitad cada 8 horas.
                 -0.05 * (2.0_f64).powf(-age_h / 8.0)
             })
             .sum();
 
-        raw.max(-0.20) // piso: nunca más de 20pp de ajuste
+        raw.max(-0.20)
     }
 
     /// Mantiene `history.threshold_offset` sincronizado con el offset dinámico.
     /// Llamar una vez por ciclo para que las métricas sean precisas.
-    pub fn tick_decay(&mut self) {
+    ///
+    /// `memory_pressure` and `compressor_pressure` feed the RL agent state
+    /// so it can learn from stable (no-overflow) ticks.
+    pub fn tick_decay(&mut self, memory_pressure: f64, compressor_pressure: f64) {
+        // RL agent: tick every cycle (stable tick, no overflow).
+        // Compute overflows_1h BEFORE taking &mut self.rl_agent to avoid borrow conflict.
+        let overflows_1h = self.recent_overflow_count_hours(1);
+        if let Some(rl) = &mut self.rl_agent {
+            let rl_state =
+                RlState::from_metrics(memory_pressure, compressor_pressure, overflows_1h);
+            rl.tick(rl_state, false);
+            if rl.total_ticks() % 50 == 0 {
+                rl.persist();
+            }
+        }
+
         if self.last_decay_check.elapsed() < Duration::from_secs(600) {
-            return; // Revisar cada 10 minutos máximo.
+            return;
         }
         self.last_decay_check = Instant::now();
 
@@ -217,32 +253,29 @@ impl OverflowGuard {
 
     /// Calcula los thresholds adaptativos para este ciclo.
     ///
-    /// # Parámetros
-    /// - `proc_names`: nombres de todos los procesos corriendo (para detectar build mode).
-    pub fn thresholds(&self, proc_names: &[&str]) -> OverflowThresholds {
-        // Usar offset dinámico para que los thresholds reflejen la edad real
-        // de los eventos, no un acumulador estático que queda atrapado en el piso.
+    /// `workload_mode` comes from the nearest-centroid classifier (Phase 3).
+    /// Each mode applies a different threshold bonus via `WorkloadMode::threshold_bonus()`.
+    pub fn thresholds(&self, workload_mode: WorkloadMode) -> OverflowThresholds {
         let off = self.compute_dynamic_offset();
-        let build_mode = Self::detect_build_mode(proc_names);
+        let workload_bonus = workload_mode.threshold_bonus();
 
-        // En build mode, actuar aún más temprano (compile pica RAM rápido).
-        let build_bonus = if build_mode { -0.08 } else { 0.0 };
-        let total_offset = off + build_bonus;
+        // RL adjustment: additive correction learned via Q-learning (Phase 4).
+        let rl_adj = self
+            .rl_agent
+            .as_ref()
+            .map(|r| r.current_adjustment)
+            .unwrap_or(0.0);
+        let total_offset = off + workload_bonus + rl_adj;
 
         OverflowThresholds {
-            // BackgroundPressure threshold: default 0.78, piso 0.55
-            bg_pressure: (0.78 + total_offset).max(0.55),
-            // ThermalConstrained threshold: default 0.88, piso 0.65
+            bg_pressure: (0.78 + total_offset).max(RL_ABSOLUTE_FLOOR),
             critical_pressure: (0.88 + total_offset).max(0.65),
-            // Extreme freeze threshold: default 0.90, piso 0.70
             extreme_pressure: (0.90 + total_offset).max(0.70),
-            build_mode,
+            workload_mode,
         }
     }
 
     /// ¿Hay herramientas de compilación corriendo activamente?
-    /// Requiere al menos 2 procesos de build para evitar falsos positivos
-    /// (p.ej. un `cargo` idle en background).
     pub fn detect_build_mode(proc_names: &[&str]) -> bool {
         let count = proc_names
             .iter()
@@ -265,8 +298,21 @@ impl OverflowGuard {
             .count()
     }
 
+    /// Número de overflows en las últimas N horas.
+    pub fn recent_overflow_count_hours(&self, hours: u64) -> usize {
+        let cutoff = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(hours * 3600);
+        self.history
+            .events
+            .iter()
+            .filter(|e| e.timestamp_secs >= cutoff)
+            .count()
+    }
+
     /// ¿Se parece la carga actual a una que causó overflow antes?
-    /// Útil para mostrar advertencias al usuario y subir el reactor_weight.
     pub fn resembles_past_overflow(&self, proc_names: &[&str]) -> bool {
         for event in &self.history.events {
             let matches = event
@@ -274,8 +320,10 @@ impl OverflowGuard {
                 .iter()
                 .filter(|app| proc_names.iter().any(|n| n.contains(app.as_str())))
                 .count();
-            // Coinciden ≥3 apps pesadas Y es al menos la mitad del escenario pasado.
-            if matches >= 3 && event.heavy_apps.len() > 0 && matches * 2 >= event.heavy_apps.len() {
+            if matches >= 3
+                && !event.heavy_apps.is_empty()
+                && matches * 2 >= event.heavy_apps.len()
+            {
                 return true;
             }
         }
@@ -309,12 +357,13 @@ mod tests {
                 cause: "test".to_string(),
             });
         }
-        history.threshold_offset = -0.20; // simula estado anterior al fix
+        history.threshold_offset = -0.20;
         OverflowGuard {
             history,
             path: PathBuf::from("/tmp/test_overflow.json"),
             last_decay_check: Instant::now(),
             last_event_at: None,
+            rl_agent: None,
         }
     }
 
@@ -326,14 +375,12 @@ mod tests {
 
     #[test]
     fn dynamic_offset_decays_with_age() {
-        // Evento de hace 8 horas contribuye -0.05 * 0.5 = -0.025
-        let guard_fresh = make_guard_with_events(&[0.0]); // recién ocurrido
-        let guard_old = make_guard_with_events(&[8.0]);   // hace 8 horas
+        let guard_fresh = make_guard_with_events(&[0.0]);
+        let guard_old = make_guard_with_events(&[8.0]);
 
         let offset_fresh = guard_fresh.compute_dynamic_offset();
         let offset_old = guard_old.compute_dynamic_offset();
 
-        // Evento reciente: ≈ -0.05; hace 8h: ≈ -0.025
         assert!(offset_fresh < -0.04, "evento reciente debe tener offset alto: {}", offset_fresh);
         assert!(offset_old > -0.03, "evento de 8h debe tener offset reducido: {}", offset_old);
         assert!(offset_old > offset_fresh, "evento más viejo debe tener menor impacto");
@@ -341,22 +388,14 @@ mod tests {
 
     #[test]
     fn dynamic_offset_recovers_after_24h_calm() {
-        // 20 eventos pero todos de hace 24+ horas — simula la situación del usuario
         let ages: Vec<f64> = (24..=168).step_by(8).map(|h| h as f64).collect();
         let guard = make_guard_with_events(&ages);
-
         let offset = guard.compute_dynamic_offset();
-        // Con todos los eventos a 24h+, el offset debe ser mucho menor que -20pp
-        assert!(
-            offset > -0.10,
-            "20 eventos de 24h+ no deben mantener offset al piso: {}",
-            offset
-        );
+        assert!(offset > -0.10, "20 eventos de 24h+ no deben mantener offset al piso: {}", offset);
     }
 
     #[test]
     fn dynamic_offset_capped_at_floor() {
-        // 5 eventos muy recientes — impacto máximo pero limitado al piso -20pp
         let guard = make_guard_with_events(&[0.1, 0.2, 0.3, 0.4, 0.5]);
         let offset = guard.compute_dynamic_offset();
         assert!(offset >= -0.20, "offset nunca debe bajar del piso -20pp: {}", offset);
@@ -364,17 +403,11 @@ mod tests {
 
     #[test]
     fn thresholds_recover_when_events_age() {
-        // Mismo escenario: 20 eventos de hace 24h
         let ages: Vec<f64> = (24..=168).step_by(8).map(|h| h as f64).collect();
         let guard = make_guard_with_events(&ages);
-
-        let t = guard.thresholds(&[]);
-        // bg_pressure debe estar por encima de 0.70 (el piso cuando offset=-0.08 aprox)
-        assert!(
-            t.bg_pressure > 0.70,
-            "bg_pressure debe haberse recuperado: {}",
-            t.bg_pressure
-        );
-        assert!(t.bg_pressure <= 0.78, "no puede superar el default: {}", t.bg_pressure);
+        let t = guard.thresholds(WorkloadMode::Idle);
+        assert!(t.bg_pressure > 0.70, "bg_pressure debe haberse recuperado: {}", t.bg_pressure);
+        // Idle mode adds +0.03 bonus, so ceiling is 0.78 + 0.03 = 0.81.
+        assert!(t.bg_pressure <= 0.81, "no puede superar el default + idle bonus: {}", t.bg_pressure);
     }
 }

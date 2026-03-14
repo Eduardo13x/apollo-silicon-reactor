@@ -161,6 +161,10 @@ pub fn decide_actions(
     // OutcomeTracker. Un proceso se skipea solo si su efectividad es <90%
     // de este baseline — i.e., no aporta más que la fluctuación de fondo.
     outcome_baseline: f64,
+    // PIDs detected as behavior-interactive via cpu_wall_ratio EMA.
+    // These are I/O-bound processes (low CPU/wall ratio) that behave like
+    // interactive apps regardless of their name.
+    behavior_interactive_pids: &HashSet<u32>,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -173,9 +177,12 @@ pub fn decide_actions(
         .collect();
 
     // Build closures that merge hardcoded lists with the learned policy.
-    let is_interactive = |name: &str| -> bool {
+    // Also checks behavior-interactive PIDs (cpu_wall_ratio EMA < 0.05).
+    let is_interactive = |name: &str, pid: u32| -> bool {
         let name_lc = name.to_ascii_lowercase();
-        is_interactive_base(name) || interactive_lc.iter().any(|p| name_lc.contains(p.as_str()))
+        is_interactive_base(name)
+            || interactive_lc.iter().any(|p| name_lc.contains(p.as_str()))
+            || behavior_interactive_pids.contains(&pid)
     };
     let is_background_noise = |name: &str| -> bool {
         let name_lc = name.to_ascii_lowercase();
@@ -250,7 +257,7 @@ pub fn decide_actions(
             continue;
         }
 
-        if is_interactive(&name) {
+        if is_interactive(&name, pid) {
             actions.push(RootAction::BoostProcess {
                 pid,
                 name,
@@ -328,7 +335,7 @@ pub fn decide_actions(
 
             // Skip critical, interactive, and low-CPU processes.
             if critical_pids.contains(&pid_u32)
-                || is_interactive(&name)
+                || is_interactive(&name, pid_u32)
                 || cpu < thread_cpu_threshold
             {
                 continue;
@@ -391,7 +398,7 @@ pub fn decide_actions(
                     }
                     let name = process.name().to_string();
                     // Never freeze interactive apps even under extreme pressure.
-                    if is_interactive(&name) {
+                    if is_interactive(&name, pid) {
                         continue;
                     }
                     if ["Slack", "Discord", "Spotify", "Teams"]

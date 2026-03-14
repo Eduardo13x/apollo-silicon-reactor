@@ -37,6 +37,10 @@ pub struct PressureStats {
     pub swap_total_bytes: u64,
     pub swap_delta_bytes_per_sec: f64,
     pub thermal_level: String,
+    /// Raw compressor pressure (0.0-1.0): ratio of uncompressed pages in compressor
+    /// to total physical pages, scaled by 0.85. Used by the RL threshold agent.
+    #[serde(default)]
+    pub compressor_pressure: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -60,6 +64,11 @@ pub struct ProcessStats {
     pub name: String,
     pub cpu_usage: f32,
     pub memory_usage: u64,
+    /// CPU/wall-clock ratio from proc_pid_rusage delta.
+    /// Low (< 0.05) = I/O-bound (interactive), high (> 0.70) = CPU-bound (build).
+    /// Populated by the daemon's main loop; None in one-shot snapshots.
+    #[serde(default)]
+    pub cpu_wall_ratio: Option<f32>,
 }
 
 pub struct SystemCollector {
@@ -108,7 +117,8 @@ impl SystemCollector {
         let used_swap = self.sys.used_swap();
 
         // Pressure (public commands, no private APIs)
-        let (mem_pressure, swap_used_bytes, swap_total_bytes) = collect_pressure_facts();
+        let (mem_pressure, swap_used_bytes, swap_total_bytes, compressor_pressure) =
+            collect_pressure_facts();
         let nowi = Instant::now();
         let swap_delta_bps = match (self.prev_swap_used_bytes, self.prev_swap_at) {
             (Some(prev_used), Some(prev_at)) => {
@@ -153,6 +163,7 @@ impl SystemCollector {
                 name: process.name().to_string(),
                 cpu_usage: process.cpu_usage(),
                 memory_usage: process.memory(),
+                cpu_wall_ratio: None,
             })
             .collect();
 
@@ -183,6 +194,7 @@ impl SystemCollector {
                 swap_total_bytes,
                 swap_delta_bytes_per_sec: swap_delta_bps,
                 thermal_level: "unknown".to_string(),
+                compressor_pressure,
             },
             disks,
             networks,
@@ -207,7 +219,8 @@ impl SystemCollector {
         let total_swap = self.sys.total_swap();
         let used_swap = self.sys.used_swap();
 
-        let (mem_pressure, swap_used_bytes, swap_total_bytes) = collect_pressure_facts();
+        let (mem_pressure, swap_used_bytes, swap_total_bytes, compressor_pressure) =
+            collect_pressure_facts();
         let nowi = Instant::now();
         let swap_delta_bps = match (self.prev_swap_used_bytes, self.prev_swap_at) {
             (Some(prev_used), Some(prev_at)) => {
@@ -228,6 +241,7 @@ impl SystemCollector {
                 name: process.name().to_string(),
                 cpu_usage: process.cpu_usage(),
                 memory_usage: process.memory(),
+                cpu_wall_ratio: None,
             })
             .collect();
         processes.sort_by(|a, b| {
@@ -256,6 +270,7 @@ impl SystemCollector {
                 swap_total_bytes,
                 swap_delta_bytes_per_sec: swap_delta_bps,
                 thermal_level: "unknown".to_string(),
+                compressor_pressure,
             },
             disks: vec![],    // skipped in light mode
             networks: vec![], // skipped in light mode
@@ -284,7 +299,8 @@ fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
     }
 }
 
-fn collect_pressure_facts() -> (f64, u64, u64) {
+/// Returns (memory_pressure, swap_used_bytes, swap_total_bytes, compressor_pressure).
+fn collect_pressure_facts() -> (f64, u64, u64, f64) {
     // kern.memorystatus_level: 0–100 (% memory available).
     // Faster than spawning /usr/bin/memory_pressure — direct kernel read.
     let kernel_pressure = sysctl_u64(c"kern.memorystatus_level")
@@ -397,5 +413,5 @@ fn collect_pressure_facts() -> (f64, u64, u64) {
         (0, 0)
     };
 
-    (memory_pressure, swap_used_bytes, swap_total_bytes)
+    (memory_pressure, swap_used_bytes, swap_total_bytes, compressor_pressure)
 }

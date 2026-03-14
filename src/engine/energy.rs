@@ -499,6 +499,7 @@ mod tests {
             name: name.to_string(),
             cpu_usage,
             memory_usage: 0,
+            cpu_wall_ratio: None,
         }
     }
 
@@ -646,6 +647,7 @@ mod tests {
                 name: "Bad".to_string(),
                 cpu_usage: f32::NAN,
                 memory_usage: 0,
+                cpu_wall_ratio: None,
             },
         ];
 
@@ -894,12 +896,14 @@ mod tests {
                 name: "Chrome Helper".to_string(),
                 cpu_usage: 80.0,
                 memory_usage: 0,
+                cpu_wall_ratio: None,
             },
             ProcessStats {
                 pid: 101,
                 name: "Chrome Helper".to_string(),
                 cpu_usage: 20.0,
                 memory_usage: 0,
+                cpu_wall_ratio: None,
             },
         ];
 

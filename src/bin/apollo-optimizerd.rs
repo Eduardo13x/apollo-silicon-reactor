@@ -54,7 +54,10 @@ use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
 use apollo_optimizer::engine::network_monitor::NetworkMonitor;
 use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfile};
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
-use apollo_optimizer::engine::overflow_guard::OverflowGuard;
+use apollo_optimizer::engine::overflow_guard::{OverflowGuard, BUILD_TOOLS};
+use apollo_optimizer::engine::workload_classifier::{
+    classify_workload_mode, WorkloadFeatures, WorkloadMode,
+};
 use apollo_optimizer::engine::power_management::{detect_battery_status, PowerManager};
 use apollo_optimizer::engine::predictive_agent::{AgentContext, Intervention, PredictiveAgent};
 use apollo_optimizer::engine::proc_taskinfo;
@@ -180,6 +183,14 @@ fn overflow_history_path() -> &'static str {
         "/var/lib/apollo/overflow_history.json"
     } else {
         "/tmp/apollo-overflow_history.json"
+    }
+}
+
+fn rl_threshold_path() -> &'static str {
+    if unsafe { libc::geteuid() } == 0 {
+        "/var/lib/apollo/rl_threshold.json"
+    } else {
+        "/tmp/apollo-rl_threshold.json"
     }
 }
 
@@ -1893,6 +1904,7 @@ fn usage_learning_tick(
     state: &SharedState,
     snapshot: &apollo_optimizer::collector::SystemSnapshot,
     has_foreground: bool,
+    cpu_wall_ratios: &HashMap<String, f32>,
 ) {
     let now = Utc::now();
     let ws_cpu = windowserver_cpu(snapshot);
@@ -1913,7 +1925,7 @@ fn usage_learning_tick(
 
     {
         let mut model = state.usage_model.lock_recover();
-        model.update_from_snapshot(snapshot, now, interactive_proxy, jank_proxy, 10);
+        model.update_from_snapshot(snapshot, now, interactive_proxy, jank_proxy, 10, cpu_wall_ratios);
     }
 
     // Persist usage model periodically (every ~2 minutes).
@@ -2746,7 +2758,10 @@ fn main() -> anyhow::Result<()> {
             );
             // Overflow guard: aprende de eventos OOM y ajusta thresholds adaptativamente.
             let mut overflow_guard =
-                OverflowGuard::load_or_default(std::path::Path::new(overflow_history_path()));
+                OverflowGuard::load_or_default(
+                std::path::Path::new(overflow_history_path()),
+                Some(std::path::Path::new(rl_threshold_path())),
+            );
             // Predictive agent: LinUCB contextual bandit for proactive interventions.
             let mut predictive_agent =
                 PredictiveAgent::load_or_default(std::path::Path::new(predictive_agent_path()));
@@ -2768,6 +2783,11 @@ fn main() -> anyhow::Result<()> {
             let mut last_fg_name: Option<String> = None;
             // Track last hw_pressure level to decide light vs full snapshot.
             let mut last_hw_pressure = HwPressure::Nominal;
+            // EMA interactivity classifier: track per-PID rusage CPU deltas
+            // to compute cpu_wall_ratio. Key = PID, value = (prev_user_ns,
+            // prev_system_ns, proc_start_abstime) for delta computation.
+            let mut rusage_cpu_prev: HashMap<u32, (u64, u64, u64)> = HashMap::new();
+            let mut last_rusage_at = Instant::now();
             // Lock-free metrics for hot-path counters (no mutex overhead).
             let lf_metrics = std::sync::Arc::new(LockFreeMetrics::new());
             // vm_surgeon: pin the lock-free metrics buffer in physical RAM.
@@ -3178,12 +3198,49 @@ fn main() -> anyhow::Result<()> {
                 // PowerManager: advisory tick (no real sensor data yet).
                 let _power_rec = power_mgr.get_recommendation();
 
+                // EMA interactivity classifier: compute cpu_wall_ratio per PID
+                // from proc_pid_rusage deltas. This measures how CPU-bound each
+                // process is (low ratio = I/O-bound/interactive, high = CPU-bound).
+                let elapsed_rusage = last_rusage_at.elapsed();
+                last_rusage_at = Instant::now();
+                let mut cpu_wall_ratios: HashMap<String, f32> = HashMap::new();
+                let mut new_rusage_prev: HashMap<u32, (u64, u64, u64)> = HashMap::new();
+                for p in &snapshot.top_processes {
+                    if let Some(ri) = proc_taskinfo::get_rusage_info(p.pid) {
+                        let total_cpu = ri.user_time_ns + ri.system_time_ns;
+                        if let Some(&(prev_user, prev_system, prev_start)) =
+                            rusage_cpu_prev.get(&p.pid)
+                        {
+                            // PID recycling guard: if proc_start_abstime changed,
+                            // this is a different process reusing the PID.
+                            if ri.proc_start_abstime == prev_start {
+                                let prev_total = prev_user + prev_system;
+                                if total_cpu >= prev_total {
+                                    let delta_cpu = total_cpu - prev_total;
+                                    let delta_wall = elapsed_rusage.as_nanos() as u64;
+                                    if delta_wall > 0 {
+                                        let ratio =
+                                            (delta_cpu as f64 / delta_wall as f64).min(1.0) as f32;
+                                        cpu_wall_ratios.insert(p.name.clone(), ratio);
+                                    }
+                                }
+                            }
+                        }
+                        new_rusage_prev.insert(
+                            p.pid,
+                            (ri.user_time_ns, ri.system_time_ns, ri.proc_start_abstime),
+                        );
+                    }
+                }
+                rusage_cpu_prev = new_rusage_prev;
+
                 // Online usage learning (root-only, no UI sensors): infer frequently-used apps
                 // and processes correlated with jank, then promote patterns conservatively.
                 usage_learning_tick(
                     &state,
                     &snapshot,
                     !foreground_idle && foreground_app.is_some(),
+                    &cpu_wall_ratios,
                 );
 
                 // LLM teacher mode (cloud) - optional, rate-limited, and guarded.
@@ -3234,6 +3291,7 @@ fn main() -> anyhow::Result<()> {
                                             snapshot.pressure.swap_delta_bytes_per_sec,
                                             &heavy,
                                             &format!("kqueue-{:?}", level),
+                                            snapshot.pressure.compressor_pressure,
                                         );
                                         // Teach hazard model about this overflow.
                                         let sr = if snapshot.pressure.swap_total_bytes > 0 {
@@ -3400,6 +3458,42 @@ fn main() -> anyhow::Result<()> {
                     metrics.process_tree_total = process_tree.len();
                 }
 
+                let (decide_interactive, decide_noise, decide_weights, outcome_baseline) = {
+                    let policy = state.learned_policy.lock_recover();
+                    (
+                        policy.interactive_patterns.clone(),
+                        policy.noise_patterns.clone(),
+                        policy.pattern_weights.clone(),
+                        outcome_tracker.calibrated_threshold(),
+                    )
+                };
+
+                // Phase 3: Feature-based workload classification.
+                let workload_mode: WorkloadMode = {
+                    let ratios: Vec<f64> = snapshot.top_processes.iter()
+                        .filter_map(|p| p.cpu_wall_ratio.map(|r| r as f64)).collect();
+                    let avg_cpu_wall_ratio = if ratios.is_empty() { 0.0 }
+                        else { ratios.iter().sum::<f64>() / ratios.len() as f64 };
+                    let build_tool_count = all_proc_names.iter()
+                        .filter(|n| BUILD_TOOLS.iter().any(|t| n.to_lowercase().contains(t)))
+                        .count() as f64;
+                    let gpu_watts = cycle_hw_snap.as_ref()
+                        .and_then(|h| h.power.gpu_watts).unwrap_or(0.0);
+                    let gpu_active = if gpu_watts > 2.0 { 1.0 } else { 0.0 };
+                    let total_rss_gb = snapshot.top_processes.iter()
+                        .map(|p| p.memory_usage as f64).sum::<f64>() / (1024.0 * 1024.0 * 1024.0);
+                    let interactive_count = snapshot.top_processes.iter()
+                        .filter(|p| decide_interactive.iter().any(|pat|
+                            p.name.to_ascii_lowercase().contains(&pat.to_ascii_lowercase())))
+                        .count() as f64;
+                    let features = WorkloadFeatures {
+                        avg_cpu_wall_ratio, build_tool_count, gpu_active,
+                        total_rss_gb, interactive_count,
+                    };
+                    let (mode, _confidence) = classify_workload_mode(&features);
+                    mode
+                };
+
                 let mut governor = state.governor.lock_recover();
                 let governor_decision = governor.evaluate(GovernorInput {
                     cpu_pressure: pressure_cpu,
@@ -3413,6 +3507,7 @@ fn main() -> anyhow::Result<()> {
                     dev_session_active,
                     interactive_heavy,
                     context_switch_burst,
+                    workload_mode: Some(workload_mode),
                 });
                 if governor_decision.transition_reason.contains("floor") {
                     state.metrics.lock_recover().profile_floor_hits += 1;
@@ -3421,18 +3516,8 @@ fn main() -> anyhow::Result<()> {
                 write_governor_state(&governor_state_path, &governor);
                 drop(governor);
 
-                let (decide_interactive, decide_noise, decide_weights, outcome_baseline) = {
-                    let policy = state.learned_policy.lock_recover();
-                    (
-                        policy.interactive_patterns.clone(),
-                        policy.noise_patterns.clone(),
-                        policy.pattern_weights.clone(),
-                        outcome_tracker.calibrated_threshold(),
-                    )
-                };
-                // Thresholds adaptativos: más conservadores si hubo overflows recientes,
-                // y aún más si hay una compilación activa.
-                let mut overflow_thresholds = overflow_guard.thresholds(&all_proc_names);
+                // Thresholds adaptativos: workload-aware via Phase 3 classifier.
+                let mut overflow_thresholds = overflow_guard.thresholds(workload_mode);
 
                 // Signal intelligence: Kalman + CUSUM + Entropy + Hazard + LV + MPC.
                 let signal_digest = {
@@ -3552,6 +3637,27 @@ fn main() -> anyhow::Result<()> {
                     intervention
                 };
 
+                // Build behavior-interactive PID set from usage model EMA data.
+                // Processes with sustained low cpu_wall_ratio are I/O-bound (interactive).
+                let behavior_interactive_pids: HashSet<u32> = {
+                    let model = state.usage_model.lock_recover();
+                    let interactive_names: HashSet<&str> = model
+                        .entries()
+                        .iter()
+                        .filter(|(_, entry)| {
+                            apollo_optimizer::engine::usage_model::is_behavior_interactive(entry)
+                        })
+                        .map(|(name, _)| name.as_str())
+                        .collect();
+                    // Map interactive names back to running PIDs.
+                    snapshot
+                        .top_processes
+                        .iter()
+                        .filter(|p| interactive_names.contains(p.name.as_str()))
+                        .map(|p| p.pid)
+                        .collect()
+                };
+
                 let decision = {
                     let mut qos = state.mach_qos.lock_recover();
                     decide_actions(
@@ -3566,6 +3672,7 @@ fn main() -> anyhow::Result<()> {
                         Some(&mut qos),
                         &decide_weights,
                         outcome_baseline,
+                        &behavior_interactive_pids,
                     )
                 };
                 *state.last_blockers.lock_recover() = decision.blockers.clone();
@@ -3720,6 +3827,7 @@ fn main() -> anyhow::Result<()> {
                         snapshot.pressure.swap_delta_bytes_per_sec,
                         &heavy,
                         "survival-mode",
+                        snapshot.pressure.compressor_pressure,
                     );
                     let sr = if snapshot.pressure.swap_total_bytes > 0 {
                         snapshot.pressure.swap_used_bytes as f64
@@ -3735,7 +3843,10 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
                 // Decaimiento gradual: si el sistema está en calma, relajar thresholds.
-                overflow_guard.tick_decay();
+                overflow_guard.tick_decay(
+                    snapshot.pressure.memory_pressure,
+                    snapshot.pressure.compressor_pressure,
+                );
 
                 // ProcessRecoveryManager: freeze (or kill in survival mode) confirmed leakers.
                 let recovery_targets = proc_recovery.get_recovery_targets();
@@ -4504,7 +4615,16 @@ fn main() -> anyhow::Result<()> {
                     metrics.overflow_events_7d = overflow_guard.recent_overflow_count(7);
                     metrics.overflow_threshold_offset_pp =
                         (overflow_guard.compute_dynamic_offset() * 100.0).round() as i32;
-                    metrics.overflow_build_mode = overflow_thresholds.build_mode;
+                    metrics.overflow_workload_mode =
+                        overflow_thresholds.workload_mode.as_str().to_string();
+
+                    // RL threshold agent metrics (Phase 4).
+                    if let Some(rl) = &overflow_guard.rl_agent {
+                        metrics.rl_adjustment_pp =
+                            (rl.current_adjustment * 100.0).round() as i32;
+                        metrics.rl_total_ticks = rl.total_ticks();
+                        metrics.rl_total_overflows = rl.total_overflows();
+                    }
 
                     write_metrics(&metrics_path, &metrics);
                 }

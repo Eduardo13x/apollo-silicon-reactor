@@ -155,6 +155,9 @@ pub struct RusageInfo {
     pub cycles: u64,
     pub billed_energy: u64,
     pub runnable_time_ns: u64,
+    /// Absolute time (mach_absolute_time units) when the process started.
+    /// Used for PID-recycling detection: if this changes, the PID was reused.
+    pub proc_start_abstime: u64,
     /// CPU time breakdown by QoS class.
     pub qos_time: QoSBreakdown,
 }
@@ -241,6 +244,7 @@ pub fn get_rusage_info(pid: u32) -> Option<RusageInfo> {
         cycles: raw.ri_cycles,
         billed_energy: raw.ri_billed_energy,
         runnable_time_ns: raw.ri_runnable_time,
+        proc_start_abstime: raw.ri_proc_start_abstime,
         qos_time: QoSBreakdown {
             default_ns: raw.ri_cpu_time_qos_default,
             maintenance_ns: raw.ri_cpu_time_qos_maintenance,
