@@ -164,6 +164,7 @@ pub fn execute_actions(
                     ..
                 } => {
                     if protected.iter().any(|p| name.contains(p)) {
+                        out.push_skip(format!("protected:{}", name));
                         return Ok(());
                     }
                     // ML/AMX protection: never throttle inference workloads.
@@ -177,6 +178,7 @@ pub fn execute_actions(
                             .iter()
                             .any(|p| name_lc.contains(p.as_str()))
                         {
+                            out.push_skip(format!("learned-protected:{}", name));
                             return Ok(());
                         }
                         // Never throttle interactive apps (they deserve boosted priority).
@@ -190,6 +192,7 @@ pub fn execute_actions(
                     }
                     // Validate PID identity with start-time (prevents A-B-A recycling).
                     if !verify_pid_identity(*pid, name, *start_sec, *start_usec) {
+                        out.push_skip(format!("pid-recycled:{}", name));
                         return Ok(());
                     }
                     let is_critical_bg = critical_bg.iter().any(|p| name.contains(p));
@@ -202,9 +205,9 @@ pub fn execute_actions(
                         // Phase 2: direct Mach syscalls for CPU tier routing.
                         if let Some(ref mut mgr) = qos_mgr {
                             let sched_tier = if aggressive {
-                                crate::engine::mach_qos::SchedulingTier::Background
+                                crate::engine::mach_qos::SchedulingTier::Background // E-cores only
                             } else {
-                                crate::engine::mach_qos::SchedulingTier::Background
+                                crate::engine::mach_qos::SchedulingTier::Normal     // scheduler decides, less invasive than E-cores-only
                             };
                             mgr.set_tier(*pid, sched_tier);
                             let lat = if aggressive {
