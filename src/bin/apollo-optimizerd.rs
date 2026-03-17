@@ -39,6 +39,7 @@ use apollo_optimizer::engine::execute_actions::execute_actions;
 use apollo_optimizer::engine::focus_markov::FocusMarkov;
 use apollo_optimizer::engine::holt_winters::HoltWinters;
 use apollo_optimizer::engine::jetsam_control;
+use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
 use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
 use apollo_optimizer::engine::foreground::{ForegroundDetector, ForegroundState};
 use apollo_optimizer::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
@@ -3826,9 +3827,58 @@ fn main() -> anyhow::Result<()> {
                         // Scale adjustment by confidence and how high the forecast is.
                         let hw_adjustment = (forecast_1h - 0.75) * confidence * 0.10;
                         let hw_adjustment = hw_adjustment.min(0.04); // Max 4pp from forecast
-                        overflow_thresholds.bg_pressure -= hw_adjustment;
-                        overflow_thresholds.critical_pressure -= hw_adjustment;
-                        overflow_thresholds.extreme_pressure -= hw_adjustment;
+
+                        // Cross-reference with UserProfile: if the next hour is typically
+                        // a build session, apply extra tightening (builds spike fast).
+                        let next_hour = (hour_of_day + 1) % 24;
+                        let next_workload = {
+                            let gov = state.adaptive_governor.lock_recover();
+                            gov.user_profile.likely_workload_at_hour(next_hour)
+                        };
+                        let workload_multiplier = match next_workload {
+                            apollo_optimizer::engine::user_profile::WorkloadType::Coding => 1.5,
+                            apollo_optimizer::engine::user_profile::WorkloadType::VideoEdit => 1.3,
+                            _ => 1.0,
+                        };
+
+                        let final_adjustment = (hw_adjustment * workload_multiplier).min(0.06);
+                        overflow_thresholds.bg_pressure -= final_adjustment;
+                        overflow_thresholds.critical_pressure -= final_adjustment;
+                        overflow_thresholds.extreme_pressure -= final_adjustment;
+                    }
+                }
+
+                // Perceptual latency monitor: composite score from existing signals.
+                // If UI responsiveness is degraded, boost reactor_weight to trigger
+                // faster/more aggressive scheduling decisions.
+                {
+                    let fg_cpu = foreground_pid
+                        .and_then(|pid| {
+                            proc_snaps.iter().find(|s| s.pid == pid).map(|s| s.cpu_percent as f64)
+                        })
+                        .unwrap_or(0.0);
+                    let fg_csw = foreground_pid
+                        .and_then(|pid| proc_taskinfo::get_task_info(pid))
+                        .map(|ti| {
+                            // Rough csw/s: divide cumulative by uptime (capped).
+                            let uptime = proc_snaps
+                                .iter()
+                                .find(|s| s.pid == foreground_pid.unwrap_or(0))
+                                .map(|s| s.process_uptime_secs.max(1))
+                                .unwrap_or(1);
+                            ti.context_switches as f64 / uptime as f64
+                        })
+                        .unwrap_or(0.0);
+                    let latency = latency_monitor::compute_latency(&LatencySignals {
+                        jitter_us: jitter_us as f64,
+                        windowserver_cpu: windowserver_cpu(&snapshot) as f64,
+                        foreground_cpu: fg_cpu,
+                        foreground_csw_per_sec: fg_csw,
+                        has_foreground: foreground_pid.is_some(),
+                    });
+                    if latency.needs_boost {
+                        // Elevate reactor weight → faster tick + more aggressive decisions.
+                        *reactor_weight = (*reactor_weight + 0.25).min(1.0);
                     }
                 }
 

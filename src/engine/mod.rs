@@ -22,6 +22,7 @@ pub mod jetsam_control;
 pub mod journal;
 pub mod kalman;
 pub mod llm;
+pub mod latency_monitor;
 pub mod lock_ext;
 pub mod lotka_volterra;
 pub mod mach_qos;
