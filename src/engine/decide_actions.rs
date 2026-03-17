@@ -341,42 +341,115 @@ pub fn decide_actions(
                 continue;
             }
 
-            // Enumerate threads and classify hot/cold.
+            // Enumerate threads and analyze patterns.
             if let Some(threads) = mgr.enumerate_threads(pid_u32) {
                 if threads.len() < 2 {
                     continue; // Single-threaded: task-level scheduling is sufficient.
                 }
 
-                let (hot, cold) = mgr.classify_threads(pid_u32, &threads);
+                let analysis = mgr.analyze_threads(pid_u32, &threads);
 
-                // Emit SetThreadQoS actions for hot threads → P-core routing.
-                for &idx in &hot {
-                    if thread_actions_emitted >= max_thread_actions {
-                        break;
+                // Pattern-aware scheduling:
+                match analysis.pattern {
+                    crate::engine::mach_qos::ThreadPattern::Runaway => {
+                        // Runaway thread: throttle only the hot thread(s),
+                        // don't penalize the whole process.
+                        for &idx in &analysis.hot {
+                            if thread_actions_emitted >= max_thread_actions {
+                                break;
+                            }
+                            actions.push(RootAction::SetThreadQoS {
+                                pid: pid_u32,
+                                name: name.clone(),
+                                thread_index: idx,
+                                tier: "utility".to_string(),
+                                reason: format!(
+                                    "runaway thread #{} in {} (1 hot / {} threads)",
+                                    idx, name, analysis.thread_count
+                                ),
+                            });
+                            thread_actions_emitted += 1;
+                        }
                     }
-                    actions.push(RootAction::SetThreadQoS {
-                        pid: pid_u32,
-                        name: name.clone(),
-                        thread_index: idx,
-                        tier: "interactive".to_string(),
-                        reason: format!("hot thread #{} in {} (cpu={:.1}%)", idx, name, cpu),
-                    });
-                    thread_actions_emitted += 1;
-                }
-
-                // Cold threads → E-core routing.
-                for &idx in &cold {
-                    if thread_actions_emitted >= max_thread_actions {
-                        break;
+                    crate::engine::mach_qos::ThreadPattern::Saturated => {
+                        // CPU-bound saturation: legitimate workload (build, render).
+                        // Don't interfere — the process needs all its threads on P-cores.
+                        // Only route truly idle threads to E-cores.
+                        for &idx in &analysis.cold {
+                            if thread_actions_emitted >= max_thread_actions {
+                                break;
+                            }
+                            actions.push(RootAction::SetThreadQoS {
+                                pid: pid_u32,
+                                name: name.clone(),
+                                thread_index: idx,
+                                tier: "background".to_string(),
+                                reason: format!(
+                                    "cold thread #{} in saturated {} ({}/{} active)",
+                                    idx, name, analysis.active_count, analysis.thread_count
+                                ),
+                            });
+                            thread_actions_emitted += 1;
+                        }
                     }
-                    actions.push(RootAction::SetThreadQoS {
-                        pid: pid_u32,
-                        name: name.clone(),
-                        thread_index: idx,
-                        tier: "background".to_string(),
-                        reason: format!("cold thread #{} in {} (waiting)", idx, name),
-                    });
-                    thread_actions_emitted += 1;
+                    crate::engine::mach_qos::ThreadPattern::IoBound => {
+                        // I/O-bound: most threads waiting. Move entire process
+                        // to E-cores aggressively — it's not using CPU anyway.
+                        for &idx in &analysis.cold {
+                            if thread_actions_emitted >= max_thread_actions {
+                                break;
+                            }
+                            actions.push(RootAction::SetThreadQoS {
+                                pid: pid_u32,
+                                name: name.clone(),
+                                thread_index: idx,
+                                tier: "background".to_string(),
+                                reason: format!(
+                                    "I/O-bound thread #{} in {} ({}/{} waiting)",
+                                    idx,
+                                    name,
+                                    analysis.cold.len(),
+                                    analysis.thread_count,
+                                ),
+                            });
+                            thread_actions_emitted += 1;
+                        }
+                    }
+                    crate::engine::mach_qos::ThreadPattern::Normal => {
+                        // Normal mixed pattern: original hot→P-core, cold→E-core logic.
+                        for &idx in &analysis.hot {
+                            if thread_actions_emitted >= max_thread_actions {
+                                break;
+                            }
+                            actions.push(RootAction::SetThreadQoS {
+                                pid: pid_u32,
+                                name: name.clone(),
+                                thread_index: idx,
+                                tier: "interactive".to_string(),
+                                reason: format!(
+                                    "hot thread #{} in {} (cpu={:.1}%)",
+                                    idx, name, cpu
+                                ),
+                            });
+                            thread_actions_emitted += 1;
+                        }
+                        for &idx in &analysis.cold {
+                            if thread_actions_emitted >= max_thread_actions {
+                                break;
+                            }
+                            actions.push(RootAction::SetThreadQoS {
+                                pid: pid_u32,
+                                name: name.clone(),
+                                thread_index: idx,
+                                tier: "background".to_string(),
+                                reason: format!(
+                                    "cold thread #{} in {} (waiting)",
+                                    idx, name
+                                ),
+                            });
+                            thread_actions_emitted += 1;
+                        }
+                    }
                 }
             }
         }

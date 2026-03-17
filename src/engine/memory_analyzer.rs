@@ -1,6 +1,16 @@
-//! Advanced memory analysis - Working Set Size (WSS), memory leak detection
+//! Advanced memory analysis — Working Set Size (WSS), thrashing detection, leak detection.
 //!
-//! Provides deeper insights into process memory usage patterns.
+//! Key insight (Denning 1968, "The Working Set Model for Program Behavior"):
+//! A process thrashes when its working set exceeds available physical pages.
+//! The observable signal is **major page faults (page-ins)** — pages fetched
+//! from disk/swap/compressor.  Minor faults (soft remaps) are cheap and normal.
+//!
+//! On macOS, `PROC_PIDTASKINFO` gives us:
+//!   - `pti_faults`  — total VM faults (major + minor), cumulative counter
+//!   - `pti_pageins` — page-ins from backing store (major faults only)
+//!
+//! Therefore: `minor_faults = faults - pageins`, `major_faults = pageins`.
+//! We track page-in rate (Δpageins / Δt) as the primary thrashing signal.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -8,12 +18,19 @@ use std::collections::{HashMap, VecDeque};
 pub struct MemoryProfile {
     pub pid: u32,
     pub name: String,
-    pub rss_bytes: u64, // Resident set size
-    pub vms_bytes: u64, // Virtual memory size
-    pub wss_bytes: u64, // Working set size (estimated)
-    pub page_faults_per_sec: f64,
-    pub memory_leak_probability: f64, // 0.0-1.0
-    pub memory_efficiency: f64,       // WSS / RSS ratio (0.0-1.0)
+    pub rss_bytes: u64,
+    pub vms_bytes: u64,
+    pub wss_bytes: u64,
+    /// Major page faults per second (page-ins from disk/swap/compressor).
+    /// This is the thrashing signal: > 50/s = moderate, > 200/s = severe.
+    pub major_faults_per_sec: f64,
+    /// Minor page faults per second (soft remaps, cheap).
+    pub minor_faults_per_sec: f64,
+    pub memory_leak_probability: f64,
+    /// WSS / RSS ratio.  Low (<0.5) = process has lots of cold pages in RAM.
+    pub memory_efficiency: f64,
+    /// True if process is actively thrashing (major faults > threshold).
+    pub is_thrashing: bool,
 }
 
 pub struct MemoryAnalyzer {
@@ -25,18 +42,29 @@ pub struct MemoryAnalyzer {
 struct MemorySnapshot {
     timestamp: std::time::Instant,
     rss: u64,
-    page_faults: u64,
+    /// Cumulative page-ins (major faults) from `pti_pageins`.
+    pageins: u64,
 }
+
+/// Thrashing thresholds (page-ins per second).
+/// Calibrated for Apple M1 with 16 KB pages:
+///   50 page-ins/s × 16 KB = 800 KB/s of swap/compressor I/O
+///   200 page-ins/s × 16 KB = 3.2 MB/s — noticeable latency
+const THRASHING_MODERATE: f64 = 50.0;
+const THRASHING_SEVERE: f64 = 200.0;
 
 impl MemoryAnalyzer {
     pub fn new() -> Self {
         Self {
             process_history: HashMap::new(),
-            history_limit: 60, // Keep 60 samples
+            history_limit: 60,
         }
     }
 
-    /// Analyze a process for memory leaks based on growth pattern
+    /// Analyze a process's memory behavior.
+    ///
+    /// `page_faults` should be the cumulative `pti_pageins` (major faults)
+    /// from `PROC_PIDTASKINFO`.  If unavailable, pass 0 (degrades gracefully).
     pub fn analyze_process(
         &mut self,
         pid: u32,
@@ -49,21 +77,33 @@ impl MemoryAnalyzer {
         let snapshot = MemorySnapshot {
             timestamp: now,
             rss: rss_bytes,
-            page_faults,
+            pageins: page_faults,
         };
 
-        // Store history
         let history = self.process_history.entry(pid).or_default();
-        history.push_back(snapshot.clone());
+        history.push_back(snapshot);
         while history.len() > self.history_limit {
             history.pop_front();
         }
 
         let history = self.process_history.get(&pid).unwrap();
-        let leak_prob = self.detect_memory_leak(pid, history);
-        let page_faults_per_sec = self.calculate_page_fault_rate(history);
-        let wss = self.estimate_wss(rss_bytes, page_faults_per_sec);
-        let efficiency = (wss as f64 / rss_bytes.max(1) as f64).clamp(0.0, 1.0);
+        let leak_prob = self.detect_memory_leak(history);
+        let major_faults_per_sec = Self::calculate_pagein_rate(history);
+
+        // Denning WSS estimation:
+        // If major fault rate is near zero → WSS ≈ RSS (everything fits in RAM).
+        // If major fault rate is high → WSS > RSS, estimate overshoot.
+        // WSS ≈ RSS × (1 + major_faults_rate / THRASHING_SEVERE)
+        // Clamped so WSS ≥ RSS (by definition, working set can exceed resident set).
+        let wss = if major_faults_per_sec > 1.0 {
+            let overshoot = (major_faults_per_sec / THRASHING_SEVERE).min(2.0);
+            ((rss_bytes as f64) * (1.0 + overshoot)) as u64
+        } else {
+            rss_bytes
+        };
+
+        let efficiency = (rss_bytes as f64 / wss.max(1) as f64).clamp(0.0, 1.0);
+        let is_thrashing = major_faults_per_sec >= THRASHING_MODERATE;
 
         MemoryProfile {
             pid,
@@ -71,18 +111,37 @@ impl MemoryAnalyzer {
             rss_bytes,
             vms_bytes,
             wss_bytes: wss,
-            page_faults_per_sec,
+            major_faults_per_sec,
+            minor_faults_per_sec: 0.0, // Not tracked separately (would need pti_faults too)
             memory_leak_probability: leak_prob,
             memory_efficiency: efficiency,
+            is_thrashing,
         }
     }
 
-    fn detect_memory_leak(&self, _pid: u32, history: &VecDeque<MemorySnapshot>) -> f64 {
-        if history.len() < 5 {
-            return 0.0; // Not enough samples
+    /// Page-in rate (Δpageins / Δt) using the most recent vs earliest snapshot.
+    fn calculate_pagein_rate(history: &VecDeque<MemorySnapshot>) -> f64 {
+        if history.len() < 2 {
+            return 0.0;
         }
 
-        // Simple heuristic: is RSS consistently growing?
+        let first = &history[0];
+        let last = &history[history.len() - 1];
+        let dt = last
+            .timestamp
+            .duration_since(first.timestamp)
+            .as_secs_f64()
+            .max(0.1);
+        let delta = last.pageins.saturating_sub(first.pageins);
+
+        delta as f64 / dt
+    }
+
+    fn detect_memory_leak(&self, history: &VecDeque<MemorySnapshot>) -> f64 {
+        if history.len() < 5 {
+            return 0.0;
+        }
+
         let start = history.len().saturating_sub(10);
         let recent_len = history.len() - start;
         let mut growth_count = 0;
@@ -94,46 +153,13 @@ impl MemoryAnalyzer {
         }
 
         let growth_rate = growth_count as f64 / (recent_len - 1).max(1) as f64;
-
-        // If growing in > 70% of samples, likely a leak
         if growth_rate > 0.7 {
-            growth_rate // Return leak probability 0.7-1.0
+            growth_rate
         } else {
             0.0
         }
     }
 
-    fn calculate_page_fault_rate(&self, history: &VecDeque<MemorySnapshot>) -> f64 {
-        if history.len() < 2 {
-            return 0.0;
-        }
-
-        let first = &history[0];
-        let last = &history[history.len() - 1];
-        let time_delta = last
-            .timestamp
-            .duration_since(first.timestamp)
-            .as_secs_f64()
-            .max(1.0);
-        let fault_delta = last.page_faults.saturating_sub(first.page_faults);
-
-        fault_delta as f64 / time_delta
-    }
-
-    fn estimate_wss(&self, rss: u64, page_faults_per_sec: f64) -> u64 {
-        // Heuristic: WSS ≈ RSS * (1 - page_fault_ratio)
-        // More page faults = less efficient WSS
-        let fault_impact = if page_faults_per_sec.is_finite() && page_faults_per_sec >= 0.0 {
-            (page_faults_per_sec / 1000.0).min(1.0)
-        } else {
-            0.0
-        };
-        let wss_ratio = 1.0 - (fault_impact * 0.3); // 30% max impact
-
-        ((rss as f64) * wss_ratio) as u64
-    }
-
-    /// Identify memory-inefficient processes
     pub fn find_inefficient_processes(&self, threshold: f64) -> Vec<(u32, f64)> {
         let mut results = Vec::new();
 
@@ -143,9 +169,14 @@ impl MemoryAnalyzer {
             }
 
             let last = &history[history.len() - 1];
-            let page_faults_per_sec = self.calculate_page_fault_rate(history);
-            let wss = self.estimate_wss(last.rss, page_faults_per_sec);
-            let efficiency = (wss as f64 / last.rss.max(1) as f64).clamp(0.0, 1.0);
+            let major_rate = Self::calculate_pagein_rate(history);
+            let wss = if major_rate > 1.0 {
+                let overshoot = (major_rate / THRASHING_SEVERE).min(2.0);
+                ((last.rss as f64) * (1.0 + overshoot)) as u64
+            } else {
+                last.rss
+            };
+            let efficiency = (last.rss as f64 / wss.max(1) as f64).clamp(0.0, 1.0);
 
             if efficiency < threshold {
                 results.push((*pid, efficiency));
@@ -156,7 +187,6 @@ impl MemoryAnalyzer {
         results
     }
 
-    /// Get processes with probable memory leaks
     pub fn find_memory_leaks(&self, threshold: f64) -> Vec<(u32, f64)> {
         let mut results = Vec::new();
 
@@ -165,7 +195,7 @@ impl MemoryAnalyzer {
                 continue;
             }
 
-            let leak_prob = self.detect_memory_leak(*pid, history);
+            let leak_prob = self.detect_memory_leak(history);
             if leak_prob >= threshold {
                 results.push((*pid, leak_prob));
             }
@@ -179,6 +209,30 @@ impl MemoryAnalyzer {
     pub fn cleanup_dead_pids(&mut self, live_pids: &[u32]) {
         let live: std::collections::HashSet<u32> = live_pids.iter().copied().collect();
         self.process_history.retain(|pid, _| live.contains(pid));
+    }
+
+    /// Get the current major page-in rate for a specific process.
+    /// Returns 0.0 if the process has no history.
+    pub fn major_fault_rate(&self, pid: u32) -> f64 {
+        self.process_history
+            .get(&pid)
+            .map(|h| Self::calculate_pagein_rate(h))
+            .unwrap_or(0.0)
+    }
+
+    /// Return processes currently thrashing (major faults > moderate threshold).
+    pub fn find_thrashing_processes(&self) -> Vec<(u32, f64)> {
+        let mut results = Vec::new();
+
+        for (pid, history) in &self.process_history {
+            let rate = Self::calculate_pagein_rate(history);
+            if rate >= THRASHING_MODERATE {
+                results.push((*pid, rate));
+            }
+        }
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results
     }
 }
 

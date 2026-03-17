@@ -9,6 +9,7 @@ pub mod decide_actions;
 pub mod energy;
 pub mod entropy_anomaly;
 pub mod execute_actions;
+pub mod focus_markov;
 pub mod foreground;
 pub mod gpu_manager;
 pub mod hazard_model;

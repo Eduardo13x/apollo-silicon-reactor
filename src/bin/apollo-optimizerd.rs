@@ -36,6 +36,7 @@ use apollo_optimizer::engine::compressor_aware::{
 use apollo_optimizer::engine::decide_actions::decide_actions;
 use apollo_optimizer::engine::energy::EnergyTracker;
 use apollo_optimizer::engine::execute_actions::execute_actions;
+use apollo_optimizer::engine::focus_markov::FocusMarkov;
 use apollo_optimizer::engine::foreground::{ForegroundDetector, ForegroundState};
 use apollo_optimizer::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
 use apollo_optimizer::engine::hw_bayes::HwFeatures;
@@ -199,6 +200,14 @@ fn predictive_agent_path() -> &'static str {
         "/var/lib/apollo/predictive_agent.json"
     } else {
         "/tmp/apollo-predictive_agent.json"
+    }
+}
+
+fn markov_path() -> &'static str {
+    if unsafe { libc::geteuid() } == 0 {
+        "/var/lib/apollo/markov_transitions.json"
+    } else {
+        "/tmp/apollo-markov_transitions.json"
     }
 }
 
@@ -2236,7 +2245,8 @@ fn build_enriched_process_data_with_tree(
 
     // Bulk-read idle_wakeups + Mach messages via proc_taskinfo (~1.3ms for ~400 pids).
     // This replaces the hardcoded wakeups_per_sec: 0.0 with REAL kernel data.
-    let mut rusage_map: HashMap<u32, (u64, u32)> = HashMap::new(); // pid → (idle_wakeups, mach_msgs)
+    // pid → (idle_wakeups, mach_msgs, faults, pageins)
+    let mut rusage_map: HashMap<u32, (u64, u32, u32, u32)> = HashMap::new();
     for &pid in &fg_family {
         // Only enrich non-foreground in the loop below
         let _ = pid;
@@ -2247,9 +2257,12 @@ fn build_enriched_process_data_with_tree(
         if let Some(ri) = proc_taskinfo::get_rusage_info(pid_u32) {
             let idle_wk = ri.idle_wakeups;
             if let Some(ti) = proc_taskinfo::get_task_info(pid_u32) {
-                rusage_map.insert(pid_u32, (idle_wk, ti.messages_sent + ti.messages_received));
+                rusage_map.insert(
+                    pid_u32,
+                    (idle_wk, ti.messages_sent + ti.messages_received, ti.faults, ti.pageins),
+                );
             } else {
-                rusage_map.insert(pid_u32, (idle_wk, 0));
+                rusage_map.insert(pid_u32, (idle_wk, 0, 0, 0));
             }
         }
     }
@@ -2284,8 +2297,9 @@ fn build_enriched_process_data_with_tree(
         // Real idle wakeups from proc_pid_rusage — the #1 signal for wasteful daemons.
         // Estimate wakeups/sec: idle_wakeups is cumulative, divide by uptime estimate.
         // Mach messages > 0 implies the process has active IPC (network, XPC, etc.)
-        let (wakeups_per_sec, has_network_signal) = match rusage_map.get(&pid_u32) {
-            Some(&(idle_wk, mach_msgs)) => {
+        let (wakeups_per_sec, has_network_signal, faults_total, pageins_total) =
+            match rusage_map.get(&pid_u32) {
+            Some(&(idle_wk, mach_msgs, faults, pageins)) => {
                 // Rough estimate: if idle_wakeups > 1000, it's a chatty daemon
                 let wps = if idle_wk > 10_000 {
                     (idle_wk as f32 / 3600.0).min(100.0)
@@ -2296,9 +2310,9 @@ fn build_enriched_process_data_with_tree(
                 };
                 // Mach messages indicate IPC activity (XPC, network, etc.)
                 let has_net = mach_msgs > 100;
-                (wps, has_net)
+                (wps, has_net, faults, pageins)
             }
-            None => (0.0, false),
+            None => (0.0, false, 0, 0),
         };
 
         proc_snaps.push(ProcessSnapshot {
@@ -2314,6 +2328,8 @@ fn build_enriched_process_data_with_tree(
             wakeups_per_sec,
             parent_alive,
             process_uptime_secs,
+            faults_total,
+            pageins_total,
         });
 
         hunt_snaps.push(HuntSnapshot {
@@ -2721,6 +2737,7 @@ fn main() -> anyhow::Result<()> {
             // Secondary optimization modules — all run each cycle without locks.
             let mut analytics = AnalyticsEngine::new();
             let mut mem_analyzer = MemoryAnalyzer::new();
+            let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
             let mut power_mgr = PowerManager::new();
             let mut proc_recovery = ProcessRecoveryManager::new();
             let mut swap_predictor = SwapPredictor::new();
@@ -2966,6 +2983,31 @@ fn main() -> anyhow::Result<()> {
                 let foreground_pid = fg_state.pid();
                 let foreground_idle = fg_state.is_idle();
 
+                // Markov chain: observe foreground transition, predict next app.
+                // Pre-warm the predicted app by unfreezing + boosting QoS before
+                // the user switches to it — eliminates perceived switch latency.
+                let markov_prediction = focus_markov.observe(foreground_app.as_deref());
+                if let Some(ref pred) = markov_prediction {
+                    // Find the PID of the predicted app in the process table.
+                    let pred_name_lc = pred.app_name.to_ascii_lowercase();
+                    let predicted_pid: Option<u32> = collector
+                        .system()
+                        .processes()
+                        .iter()
+                        .find(|(_, p)| p.name().to_ascii_lowercase() == pred_name_lc)
+                        .map(|(pid, _)| pid.as_u32());
+
+                    if let Some(pid) = predicted_pid {
+                        // Pre-warm: if predicted app is frozen, unfreeze it now.
+                        let mut frozen_guard = state.frozen_state.lock_recover();
+                        if frozen_guard.remove(&pid).is_some() {
+                            unfreeze_pids(std::iter::once(pid));
+                            write_frozen_state(&frozen_state_path, &frozen_guard);
+                            state.metrics.lock_recover().unfreezes_applied += 1;
+                        }
+                    }
+                }
+
                 // Context-switch burst detector + reactive unfreeze.
                 // Si el foreground cambió y el nuevo app estaba congelado, lo descongelamos
                 // de inmediato — sin esperar al siguiente ciclo de optimización.
@@ -3033,7 +3075,7 @@ fn main() -> anyhow::Result<()> {
                         &snap.name,
                         snap.rss_bytes,
                         snap.rss_bytes, // vms not tracked at this level; use rss as proxy
-                        0,              // page_faults not available from sysinfo
+                        snap.pageins_total as u64, // major faults (page-ins from disk/swap/compressor)
                     );
                     if profile.memory_leak_probability >= 0.75 {
                         proc_recovery.register_leak(
@@ -3658,6 +3700,18 @@ fn main() -> anyhow::Result<()> {
                         .collect()
                 };
 
+                // PID integral adjustment: if pressure has been chronically above target,
+                // lower thresholds proportionally. Ki = 0.02 → 1.0 pressure-second of
+                // integral error lowers thresholds by 0.02 (2 percentage points).
+                // Clamped to max 5pp reduction from integral alone.
+                if signal_digest.pressure_integral > 0.5 {
+                    let ki = 0.02;
+                    let integral_adjustment = (signal_digest.pressure_integral * ki).min(0.05);
+                    overflow_thresholds.bg_pressure -= integral_adjustment;
+                    overflow_thresholds.critical_pressure -= integral_adjustment;
+                    overflow_thresholds.extreme_pressure -= integral_adjustment;
+                }
+
                 let decision = {
                     let mut qos = state.mach_qos.lock_recover();
                     decide_actions(
@@ -4193,7 +4247,8 @@ fn main() -> anyhow::Result<()> {
                     let confirmed_actions: Vec<RootAction> = confirmed_actions.into_iter().filter_map(|a| {
                         if let RootAction::FreezeProcess { pid, name: _, ref reason, .. } = a {
                             if let Some(profile) = query_memory_profile(pid) {
-                                match decide_memory_action(&profile, metrics.memory_pressure) {
+                                let fault_rate = mem_analyzer.major_fault_rate(pid);
+                                match decide_memory_action(&profile, metrics.memory_pressure, fault_rate) {
                                     MemoryAction::PressureHint => {
                                         Some(RootAction::SetMemorystatus {
                                             pid,
@@ -4703,6 +4758,9 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+
+            // Persist Markov chain state on shutdown.
+            focus_markov.persist();
 
             // Revert sysctls to defaults on shutdown.
             {

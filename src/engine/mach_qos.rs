@@ -191,6 +191,38 @@ pub enum SchedulingTier {
     Background,
 }
 
+/// Thread activity pattern detected within a process.
+/// Used by decide_actions for differentiated scheduling decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadPattern {
+    /// One thread consuming >80% CPU while most others are waiting.
+    /// Possible infinite loop, regex backtracking, or spinlock.
+    Runaway,
+    /// All (or nearly all) threads are actively consuming CPU.
+    /// Legitimate CPU-bound workload (compilation, rendering).
+    Saturated,
+    /// Most threads are waiting (I/O-bound / interactive behavior).
+    /// Process is waiting on user input, network, or disk.
+    IoBound,
+    /// Mixed or not enough threads to classify.
+    Normal,
+}
+
+/// Result of thread analysis within a process.
+#[derive(Debug, Clone)]
+pub struct ThreadAnalysis {
+    /// Indices of hot threads (high CPU delta).
+    pub hot: Vec<u32>,
+    /// Indices of cold threads (waiting, low CPU).
+    pub cold: Vec<u32>,
+    /// Detected pattern.
+    pub pattern: ThreadPattern,
+    /// Total thread count.
+    pub thread_count: usize,
+    /// Number of threads actively running (not waiting).
+    pub active_count: usize,
+}
+
 /// Per-thread QoS tier for big.LITTLE thread-level scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadTier {
@@ -453,28 +485,80 @@ impl MachQoSManager {
         pid: u32,
         threads: &[ThreadSnapshot],
     ) -> (Vec<u32>, Vec<u32>) {
+        let analysis = self.analyze_threads(pid, threads);
+        (analysis.hot, analysis.cold)
+    }
+
+    /// Full thread analysis: hot/cold classification + pattern detection.
+    ///
+    /// Pattern detection (based on thread state distribution):
+    /// - Runaway: 1 thread >80% CPU raw while >75% of threads are WAITING
+    /// - Saturated: >75% of threads are hot (legitimate CPU-bound workload)
+    /// - IoBound: >80% of threads are cold/waiting
+    /// - Normal: mixed or insufficient data
+    pub fn analyze_threads(
+        &mut self,
+        pid: u32,
+        threads: &[ThreadSnapshot],
+    ) -> ThreadAnalysis {
         let mut hot = Vec::new();
         let mut cold = Vec::new();
+        let mut active_count = 0usize;
 
         for t in threads {
             let key = (pid, t.thread_index);
             let total_cpu = t.user_time_us + t.system_time_us;
+
+            let is_waiting = t.run_state == mach_sys::TH_STATE_WAITING;
+            if !is_waiting {
+                active_count += 1;
+            }
 
             if let Some(&prev_cpu) = self.prev_thread_cpu.get(&key) {
                 let delta = total_cpu.saturating_sub(prev_cpu);
                 // Hot: >50ms of CPU in the last cycle (roughly 5% of a 1s cycle).
                 if delta > 50_000 || t.cpu_usage_raw > 50 {
                     hot.push(t.thread_index);
-                } else if t.run_state == mach_sys::TH_STATE_WAITING && t.cpu_usage_raw < 5 {
+                } else if is_waiting && t.cpu_usage_raw < 5 {
                     cold.push(t.thread_index);
                 }
             }
-            // First observation: no delta available, skip classification.
 
             self.prev_thread_cpu.insert(key, total_cpu);
         }
 
-        (hot, cold)
+        let n = threads.len();
+        let pattern = if n < 2 {
+            ThreadPattern::Normal
+        } else {
+            // Runaway: exactly 1 very hot thread + most others waiting.
+            let very_hot = threads.iter().filter(|t| t.cpu_usage_raw > 800).count();
+            let waiting = threads
+                .iter()
+                .filter(|t| t.run_state == mach_sys::TH_STATE_WAITING)
+                .count();
+
+            if very_hot == 1 && waiting * 4 >= n * 3 {
+                // 1 thread at >80% CPU, ≥75% threads waiting → runaway
+                ThreadPattern::Runaway
+            } else if hot.len() * 4 >= n * 3 {
+                // ≥75% threads are hot → CPU-bound saturation
+                ThreadPattern::Saturated
+            } else if cold.len() * 5 >= n * 4 {
+                // ≥80% threads are cold → I/O-bound
+                ThreadPattern::IoBound
+            } else {
+                ThreadPattern::Normal
+            }
+        };
+
+        ThreadAnalysis {
+            hot,
+            cold,
+            pattern,
+            thread_count: n,
+            active_count,
+        }
     }
 
     /// Apply a per-thread QoS tier to a specific thread within a process.

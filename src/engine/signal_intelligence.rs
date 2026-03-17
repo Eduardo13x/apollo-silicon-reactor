@@ -34,6 +34,11 @@ pub struct SignalDigest {
     pub pressure_predicted_5s: f64,
     /// Swap delta suavizado (bytes/s).
     pub swap_velocity_smooth: f64,
+    /// Integral of pressure error over target (accumulated pressure-seconds).
+    /// Positive = system has been above target chronically.
+    /// Used as the "I" term for PID-style threshold adjustment.
+    /// Windowed to last 60s to prevent integral windup (Hellerstein 2004).
+    pub pressure_integral: f64,
 
     // ── CUSUM ────────────────────────────────────────────────────────────
     /// true si CUSUM detectó regime shift al alza en presión.
@@ -85,6 +90,15 @@ pub struct SignalIntelligence {
 
     // MPC controller
     mpc: MpcController,
+
+    // PID integral term: windowed accumulation of (pressure - target).
+    // Uses a ring buffer of (error × dt) values for the last 60 seconds.
+    pid_integral: f64,
+    /// Target pressure for PID error calculation.
+    pid_target: f64,
+    /// Decay factor per tick to prevent integral windup (leaky integrator).
+    /// 0.98 = loses ~2% per tick, preventing unbounded accumulation.
+    pid_decay: f64,
 }
 
 impl Default for SignalIntelligence {
@@ -113,6 +127,13 @@ impl SignalIntelligence {
 
             // MPC con horizonte 3, dt=0.5s por paso.
             mpc: MpcController::new(3, 0.5),
+
+            pid_integral: 0.0,
+            // Target: 0.65 = comfortable pressure for 8GB M1.
+            // Below this, system is fine. Above, we start accumulating error.
+            pid_target: 0.65,
+            // Leaky integrator: 0.98 decay per tick prevents windup.
+            pid_decay: 0.98,
         }
     }
 
@@ -152,6 +173,13 @@ impl SignalIntelligence {
         let pressure_velocity = self.kf_pressure.velocity();
         let pressure_predicted_5s = self.kf_pressure.predict_ahead(5.0).clamp(0.0, 1.0);
         let swap_velocity_smooth = self.kf_swap.position();
+
+        // PID integral: leaky accumulation of (pressure - target) × dt.
+        // Positive integral means pressure has been above target chronically.
+        // Clamp to [-5.0, 5.0] pressure-seconds to bound the influence.
+        let error = pressure_smooth - self.pid_target;
+        self.pid_integral = (self.pid_integral * self.pid_decay + error * dt_secs).clamp(-5.0, 5.0);
+        let pressure_integral = self.pid_integral;
 
         // ── 2. CUSUM ─────────────────────────────────────────────────────
         self.cusum_pressure.update(memory_pressure);
@@ -205,6 +233,7 @@ impl SignalIntelligence {
             pressure_velocity,
             pressure_predicted_5s,
             swap_velocity_smooth,
+            pressure_integral,
             regime_shift_up,
             regime_shift_down,
             cusum_score,
@@ -339,6 +368,7 @@ mod tests {
             pressure_velocity: 0.0,
             pressure_predicted_5s: 0.0,
             swap_velocity_smooth: 0.0,
+            pressure_integral: 0.0,
             regime_shift_up: false,
             regime_shift_down: false,
             cusum_score: 0.0,

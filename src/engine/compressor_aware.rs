@@ -134,9 +134,33 @@ pub fn query_memory_profile(_pid: u32) -> Option<ProcessMemoryProfile> {
 }
 
 /// Decide whether to freeze, hint, or skip based on memory profile.
-pub fn decide_memory_action(profile: &ProcessMemoryProfile, system_pressure: f64) -> MemoryAction {
+///
+/// Decision matrix (Denning & Schwartz 1972, adapted for macOS compressor):
+///   - High ratio (≥2.0): data compresses well → freeze is cheap (~1-5µs decompress)
+///   - Low ratio (<1.5) + large footprint: freeze → swap I/O → expensive SIGCONT
+///   - Thrashing process (high page-in rate): compressor is in a decompress→recompress
+///     loop — freezing breaks the loop (good), but only if ratio is decent
+///   - Purgeable pages: kernel can discard without I/O → hint is enough
+pub fn decide_memory_action(
+    profile: &ProcessMemoryProfile,
+    system_pressure: f64,
+    major_faults_per_sec: f64,
+) -> MemoryAction {
     // Lots of purgeable memory → a hint is enough, no need to freeze.
     if profile.purgeable_bytes > 50 * 1024 * 1024 {
+        return MemoryAction::PressureHint;
+    }
+
+    // Process is actively thrashing (high page-in rate).
+    // If compression ratio is decent, freezing breaks the thrash loop — do it.
+    // If ratio is low, the compressor can't help — freeze would cause swap storm.
+    if major_faults_per_sec > 50.0 {
+        if profile.compression_ratio >= 1.5 {
+            // Thrashing but compressible: freeze breaks the decompress→use→recompress loop.
+            return MemoryAction::Freeze;
+        }
+        // Thrashing and incompressible: freezing would cause massive swap I/O.
+        // Send pressure hint so the app releases caches voluntarily.
         return MemoryAction::PressureHint;
     }
 
@@ -155,4 +179,28 @@ pub fn decide_memory_action(profile: &ProcessMemoryProfile, system_pressure: f64
     }
 
     MemoryAction::Freeze
+}
+
+/// Assess how efficiently the compressor is serving this process.
+/// Returns a score in [0.0, 1.0]:
+///   - 1.0 = compressor is very effective (high ratio, worth keeping compressed)
+///   - 0.0 = compressor is wasting effort (low ratio, large footprint)
+///
+/// Used for throttle prioritization: processes with low compressor efficiency
+/// should be throttled earlier because they waste compressor bandwidth.
+pub fn compressor_efficiency_score(profile: &ProcessMemoryProfile) -> f64 {
+    if profile.compressed_bytes == 0 {
+        return 1.0; // Nothing compressed → not burdening the compressor
+    }
+
+    // Ratio contribution: 1.0 is no compression, 4.0+ is excellent.
+    // Map [1.0, 4.0] → [0.0, 1.0] linearly.
+    let ratio_score = ((profile.compression_ratio - 1.0) / 3.0).clamp(0.0, 1.0);
+
+    // Size contribution: larger compressed footprint = more compressor work.
+    // Penalize processes with >500MB compressed (on 8GB system, that's significant).
+    let size_penalty = (profile.compressed_bytes as f64 / (500.0 * 1024.0 * 1024.0)).min(1.0);
+
+    // Combine: good ratio offsets large size, but very large size always penalizes.
+    (ratio_score * 0.7 + (1.0 - size_penalty) * 0.3).clamp(0.0, 1.0)
 }

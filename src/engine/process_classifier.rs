@@ -137,6 +137,11 @@ pub struct ProcessSnapshot {
     /// on-demand services that will exit on their own before any action
     /// can be applied.
     pub process_uptime_secs: u64,
+    /// Total VM faults (major + minor) — cumulative counter from Mach task info.
+    pub faults_total: u32,
+    /// Page-ins (major faults) — pages fetched from disk/swap/compressor.
+    /// This is the expensive signal: high rate = process is thrashing.
+    pub pageins_total: u32,
 }
 
 /// Score a process's "user utility" on a 0.0–1.0 scale.
