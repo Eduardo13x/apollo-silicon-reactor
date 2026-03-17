@@ -48,7 +48,7 @@ struct TaskVmInfo {
     phys_footprint: u64,
 }
 
-/// Per-process memory profile relevant to freeze decisions.
+/// Per-process memory profile relevant to freeze and budget decisions.
 #[derive(Debug, Clone)]
 pub struct ProcessMemoryProfile {
     pub pid: u32,
@@ -61,6 +61,11 @@ pub struct ProcessMemoryProfile {
     /// Compression ratio: phys_footprint / (phys_footprint + compressed).
     /// Higher = more compressible = cheaper to freeze.
     pub compression_ratio: f64,
+    /// Working set size estimate (bytes): internal + external - reusable pages.
+    /// Proxy for Denning's WSS — pages the process actually needs in RAM.
+    pub working_set_bytes: u64,
+    /// Resident pages in physical RAM (bytes).
+    pub resident_bytes: u64,
 }
 
 /// What action to take based on memory profile.
@@ -111,6 +116,7 @@ pub fn query_memory_profile(pid: u32) -> Option<ProcessMemoryProfile> {
         let compressed_bytes = info.compressed * page_size;
         let purgeable_bytes = info.purgeable_volatile_resident * page_size;
         let phys = info.phys_footprint;
+        let resident_bytes = info.resident_size;
 
         let compression_ratio = if compressed_bytes > 0 {
             (phys + compressed_bytes) as f64 / phys.max(1) as f64
@@ -118,12 +124,22 @@ pub fn query_memory_profile(pid: u32) -> Option<ProcessMemoryProfile> {
             1.0
         };
 
+        // WSS estimate: internal (private heap/stack) + external (shared/file-backed)
+        // minus reusable (pages the kernel can reclaim without I/O).
+        // All values are in pages → multiply by page_size.
+        let internal_bytes = info.internal * page_size;
+        let external_bytes = info.external * page_size;
+        let reusable_bytes = info.reusable * page_size;
+        let working_set_bytes = (internal_bytes + external_bytes).saturating_sub(reusable_bytes);
+
         Some(ProcessMemoryProfile {
             pid,
             phys_footprint: phys,
             compressed_bytes,
             purgeable_bytes,
             compression_ratio,
+            working_set_bytes,
+            resident_bytes,
         })
     }
 }

@@ -31,6 +31,8 @@ pub struct MemoryProfile {
     pub memory_efficiency: f64,
     /// True if process is actively thrashing (major faults > threshold).
     pub is_thrashing: bool,
+    /// True if WSS was measured via Mach TASK_VM_INFO (not heuristic).
+    pub wss_is_measured: bool,
 }
 
 pub struct MemoryAnalyzer {
@@ -116,6 +118,7 @@ impl MemoryAnalyzer {
             memory_leak_probability: leak_prob,
             memory_efficiency: efficiency,
             is_thrashing,
+            wss_is_measured: false, // Heuristic; caller can override via refine_wss()
         }
     }
 
@@ -209,6 +212,15 @@ impl MemoryAnalyzer {
     pub fn cleanup_dead_pids(&mut self, live_pids: &[u32]) {
         let live: std::collections::HashSet<u32> = live_pids.iter().copied().collect();
         self.process_history.retain(|pid, _| live.contains(pid));
+    }
+
+    /// Refine a MemoryProfile with real WSS data from Mach TASK_VM_INFO.
+    /// Call after `analyze_process` when `query_memory_profile` data is available.
+    pub fn refine_wss(profile: &mut MemoryProfile, measured_wss_bytes: u64) {
+        profile.wss_bytes = measured_wss_bytes;
+        profile.wss_is_measured = true;
+        profile.memory_efficiency =
+            (profile.rss_bytes as f64 / measured_wss_bytes.max(1) as f64).clamp(0.0, 1.0);
     }
 
     /// Get the current major page-in rate for a specific process.

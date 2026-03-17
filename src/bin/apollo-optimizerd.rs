@@ -3069,14 +3069,21 @@ fn main() -> anyhow::Result<()> {
                 let hour_of_day = Utc::now().hour() as u8;
 
                 // MemoryAnalyzer: profile top-50 processes for memory leaks each cycle.
-                for snap in proc_snaps.iter().take(50) {
-                    let profile = mem_analyzer.analyze_process(
+                // For the top-10 by RSS, refine WSS with real TASK_VM_INFO data.
+                for (i, snap) in proc_snaps.iter().take(50).enumerate() {
+                    let mut profile = mem_analyzer.analyze_process(
                         snap.pid,
                         &snap.name,
                         snap.rss_bytes,
                         snap.rss_bytes, // vms not tracked at this level; use rss as proxy
                         snap.pageins_total as u64, // major faults (page-ins from disk/swap/compressor)
                     );
+                    // Top-10 by RSS: refine WSS with Mach TASK_VM_INFO (~50µs per call).
+                    if i < 10 {
+                        if let Some(mem_profile) = query_memory_profile(snap.pid) {
+                            MemoryAnalyzer::refine_wss(&mut profile, mem_profile.working_set_bytes);
+                        }
+                    }
                     if profile.memory_leak_probability >= 0.75 {
                         proc_recovery.register_leak(
                             snap.pid,
