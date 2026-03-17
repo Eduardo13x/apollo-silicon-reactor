@@ -15,12 +15,16 @@
 //! La salida es `SignalDigest`: un resumen compacto que el PredictiveAgent
 //! puede consumir como features adicionales o como override de su decisión.
 
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
 use crate::engine::cusum::Cusum;
 use crate::engine::entropy_anomaly::EntropyDetector;
 use crate::engine::hazard_model::HazardModel;
 use crate::engine::kalman::Kalman1D;
 use crate::engine::lotka_volterra::CompetitionState;
-use crate::engine::mpc_horizon::MpcController;
+use crate::engine::mpc_horizon::{MpcController, MpcPersisted};
 
 /// Resumen compacto de las señales procesadas. Todo normalizado 0–1 o con signo.
 #[derive(Debug, Clone)]
@@ -262,7 +266,7 @@ impl SignalIntelligence {
         self.hazard.record_event(&features, hours_since_last);
     }
 
-    /// Feedback al MPC: qué pasó después de ejecutar una acción.
+        /// Feedback al MPC: qué pasó después de ejecutar una acción.
     pub fn mpc_feedback(&mut self, action: usize, pressure_before: f64, pressure_after: f64) {
         self.mpc.update_effect(
             action,
@@ -281,6 +285,46 @@ impl SignalIntelligence {
     pub fn hazard_beta(&self) -> [f64; 4] {
         self.hazard.beta_weights()
     }
+
+    /// Persist learned state to disk.
+    ///
+    /// Persists: HazardModel (accumulated OOM history, calibrated base_rate, learned β weights)
+    /// and MPC effects (learned action impact magnitudes).
+    ///
+    /// Not persisted: CUSUM target (must reflect current regime), Entropy history
+    /// (adapts in <20 cycles), Lotka-Volterra (resets when dominant process changes).
+    pub fn persist(&self, path: &Path) {
+        let persisted = SignalIntelligencePersisted {
+            hazard: self.hazard.clone(),
+            mpc: self.mpc.to_persisted(),
+        };
+        if let Ok(json) = serde_json::to_string(&persisted) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    /// Load persisted state from disk, if available.
+    ///
+    /// Returns `None` on any read/parse error (cold start is safe).
+    pub fn load(path: &Path) -> Option<SignalIntelligencePersisted> {
+        let data = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    /// Apply a persisted snapshot, restoring the hazard model and MPC effects.
+    pub fn restore(&mut self, p: SignalIntelligencePersisted) {
+        self.hazard = p.hazard;
+        self.mpc.restore_effects(&p.mpc);
+    }
+}
+
+/// Serializable snapshot of the state worth keeping across restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalIntelligencePersisted {
+    /// Cox hazard model: calibrated base_rate, learned β weights, total_hours/events.
+    pub hazard: HazardModel,
+    /// MPC action effect estimates (learned from live pressure feedback).
+    pub mpc: MpcPersisted,
 }
 
 /// Score compuesto de urgencia, combinación ponderada de todas las señales.

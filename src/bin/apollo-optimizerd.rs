@@ -215,6 +215,14 @@ fn markov_path() -> &'static str {
     }
 }
 
+fn signal_intelligence_path() -> &'static str {
+    if unsafe { libc::geteuid() } == 0 {
+        "/var/lib/apollo/signal_intelligence.json"
+    } else {
+        "/tmp/apollo-signal_intelligence.json"
+    }
+}
+
 fn holt_winters_path() -> &'static str {
     if unsafe { libc::geteuid() } == 0 {
         "/var/lib/apollo/holt_winters.json"
@@ -2800,7 +2808,14 @@ fn main() -> anyhow::Result<()> {
             let mut predictive_agent =
                 PredictiveAgent::load_or_default(std::path::Path::new(predictive_agent_path()));
             // Signal intelligence: Kalman + CUSUM + Entropy + Hazard + LV + MPC.
+            // Restore persisted hazard model + MPC effects so the system doesn't cold-start
+            // after a reboot (Cox hazard base_rate calibrates over days of observation).
             let mut signal_intel = SignalIntelligence::new();
+            if let Some(si_persisted) =
+                SignalIntelligence::load(std::path::Path::new(signal_intelligence_path()))
+            {
+                signal_intel.restore(si_persisted);
+            }
             // Audit fix #6: Multi-phase thermal bail-out with hysteresis.
             let mut thermal_bailout = ThermalBailout::new();
             // Freeze confirmation cache: pid → consecutive cycles flagged.
@@ -4655,6 +4670,12 @@ fn main() -> anyhow::Result<()> {
                     signal_digest.pressure_smooth,
                     snapshot.pressure.memory_pressure,
                 );
+                // Persist signal intelligence state every 100 cycles so hazard model + MPC
+                // effects survive crashes (not just clean shutdowns).
+                if cycle_count % 100 == 0 {
+                    signal_intel
+                        .persist(std::path::Path::new(signal_intelligence_path()));
+                }
                 // Update predictive agent + signal intelligence metrics for status reporting.
                 {
                     let mut m = state.metrics.lock_recover();
@@ -4929,9 +4950,10 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Persist Markov chain + Holt-Winters state on shutdown.
+            // Persist Markov chain + Holt-Winters + SignalIntelligence state on shutdown.
             focus_markov.persist();
             holt_winters.persist(&hw_path);
+            signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
 
             // Revert sysctls to defaults on shutdown.
             {

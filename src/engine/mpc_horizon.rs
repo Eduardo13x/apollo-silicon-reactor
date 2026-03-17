@@ -22,10 +22,18 @@
 //! Con 5 acciones y horizonte 5 → 5⁵ = 3125 secuencias.
 //! Enumerar todas es viable (~1µs cada una). Sin heurísticas necesarias.
 
+use serde::{Deserialize, Serialize};
+
 /// Número de acciones posibles.
 const N_ACTIONS: usize = 5;
 /// Horizonte máximo (pasos hacia adelante).
 const MAX_HORIZON: usize = 5;
+
+/// Persisted subset of MPC state — learned effects only (plan/cost are transient).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MpcPersisted {
+    pub effects: [f64; N_ACTIONS],
+}
 
 /// Efecto estimado de cada acción sobre la presión.
 /// Negativo = reduce presión, 0 = noop.
@@ -213,6 +221,19 @@ impl MpcController {
     /// Efectos aprendidos por acción.
     pub fn learned_effects(&self) -> &[f64; N_ACTIONS] {
         &self.effects
+    }
+
+    /// Snapshot of learned state for persistence.
+    pub fn to_persisted(&self) -> MpcPersisted {
+        MpcPersisted {
+            effects: self.effects,
+        }
+    }
+
+    /// Restore learned state from a persisted snapshot.
+    /// Horizon and dt_per_step must still be set by the caller.
+    pub fn restore_effects(&mut self, persisted: &MpcPersisted) {
+        self.effects = persisted.effects;
     }
 }
 
