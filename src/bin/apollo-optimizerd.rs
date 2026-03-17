@@ -37,6 +37,9 @@ use apollo_optimizer::engine::decide_actions::decide_actions;
 use apollo_optimizer::engine::energy::EnergyTracker;
 use apollo_optimizer::engine::execute_actions::execute_actions;
 use apollo_optimizer::engine::focus_markov::FocusMarkov;
+use apollo_optimizer::engine::holt_winters::HoltWinters;
+use apollo_optimizer::engine::jetsam_control;
+use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
 use apollo_optimizer::engine::foreground::{ForegroundDetector, ForegroundState};
 use apollo_optimizer::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
 use apollo_optimizer::engine::hw_bayes::HwFeatures;
@@ -208,6 +211,14 @@ fn markov_path() -> &'static str {
         "/var/lib/apollo/markov_transitions.json"
     } else {
         "/tmp/apollo-markov_transitions.json"
+    }
+}
+
+fn holt_winters_path() -> &'static str {
+    if unsafe { libc::geteuid() } == 0 {
+        "/var/lib/apollo/holt_winters.json"
+    } else {
+        "/tmp/apollo-holt_winters.json"
     }
 }
 
@@ -2738,6 +2749,11 @@ fn main() -> anyhow::Result<()> {
             let mut analytics = AnalyticsEngine::new();
             let mut mem_analyzer = MemoryAnalyzer::new();
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
+            let hw_path = PathBuf::from(holt_winters_path());
+            let mut holt_winters = HoltWinters::load(&hw_path).unwrap_or_default();
+            let mut hw_last_hour: Option<u8> = None;
+            let mut hw_pressure_accum: f64 = 0.0;
+            let mut hw_pressure_count: u32 = 0;
             let mut power_mgr = PowerManager::new();
             let mut proc_recovery = ProcessRecoveryManager::new();
             let mut swap_predictor = SwapPredictor::new();
@@ -3005,6 +3021,16 @@ fn main() -> anyhow::Result<()> {
                             write_frozen_state(&frozen_state_path, &frozen_guard);
                             state.metrics.lock_recover().unfreezes_applied += 1;
                         }
+                        drop(frozen_guard);
+
+                        // Boost jetsam priority so kernel protects this app's pages
+                        // before the user switches to it (pages stay resident).
+                        if pred.probability >= 0.50 {
+                            let _ = jetsam_control::set_priority(
+                                pid,
+                                jetsam_control::priority::FOREGROUND,
+                            );
+                        }
                     }
                 }
 
@@ -3102,6 +3128,63 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 wake_storm.cleanup_stale(Duration::from_secs(300));
+
+                // Memory budgets: compute and enforce jetsam limits when pressure ≥ 0.60.
+                // Only recompute under pressure to avoid unnecessary syscalls in idle.
+                if snapshot.pressure.memory_pressure >= 0.60 {
+                    let usage_model = state.usage_model.lock_recover();
+                    let budget_inputs: Vec<ProcessBudgetInput> = proc_snaps
+                        .iter()
+                        .take(30) // Top 30 processes
+                        .filter(|s| s.rss_bytes > 50 * 1024 * 1024) // Only >50MB
+                        .map(|s| {
+                            let (presence, interactive) = usage_model
+                                .entries()
+                                .get(&s.name.to_ascii_lowercase())
+                                .map(|e| (e.presence_ema, e.interactive_ema))
+                                .unwrap_or((0.1, 0.0));
+                            // Use real WSS from TASK_VM_INFO when available,
+                            // fall back to fault-rate heuristic.
+                            let wss_bytes = query_memory_profile(s.pid)
+                                .map(|p| p.working_set_bytes)
+                                .unwrap_or_else(|| {
+                                    let fault_rate = mem_analyzer.major_fault_rate(s.pid);
+                                    if fault_rate > 50.0 {
+                                        (s.rss_bytes as f64 * 1.3) as u64
+                                    } else {
+                                        s.rss_bytes
+                                    }
+                                });
+                            ProcessBudgetInput {
+                                pid: s.pid,
+                                name: s.name.clone(),
+                                rss_bytes: s.rss_bytes,
+                                working_set_bytes: wss_bytes,
+                                is_foreground: s.has_gui_window && s.secs_since_foreground == 0,
+                                is_build_tool: BUILD_TOOLS
+                                    .iter()
+                                    .any(|t| s.name.contains(t)),
+                                presence_ema: presence,
+                                interactive_ema: interactive,
+                            }
+                        })
+                        .collect();
+                    drop(usage_model);
+
+                    if !budget_inputs.is_empty() {
+                        let budgets =
+                            memory_budget::compute_budgets(snapshot.memory.total_ram, &budget_inputs);
+
+                        // Apply jetsam inactive limits for over-budget processes.
+                        for budget in budgets.iter().filter(|b| b.over_budget) {
+                            let _ = jetsam_control::set_memlimit(
+                                budget.pid,
+                                0, // active: unlimited (don't kill foreground)
+                                budget.inactive_limit_mb,
+                            );
+                        }
+                    }
+                }
 
                 // Audit fix #5: Read cached hardware data from background SmcReader thread.
                 // No more blocking 500 ms powermetrics calls on the hot path.
@@ -3717,6 +3800,36 @@ fn main() -> anyhow::Result<()> {
                     overflow_thresholds.bg_pressure -= integral_adjustment;
                     overflow_thresholds.critical_pressure -= integral_adjustment;
                     overflow_thresholds.extreme_pressure -= integral_adjustment;
+                }
+
+                // Holt-Winters seasonal forecasting: accumulate pressure samples,
+                // observe once per hour, and use forecast to proactively lower thresholds
+                // before predicted high-pressure periods.
+                {
+                    hw_pressure_accum += snapshot.pressure.memory_pressure;
+                    hw_pressure_count += 1;
+
+                    // When the hour changes, feed the average pressure to Holt-Winters.
+                    if hw_last_hour != Some(hour_of_day) {
+                        if hw_last_hour.is_some() && hw_pressure_count > 0 {
+                            let avg = hw_pressure_accum / hw_pressure_count as f64;
+                            holt_winters.observe(hw_last_hour.unwrap(), avg);
+                        }
+                        hw_last_hour = Some(hour_of_day);
+                        hw_pressure_accum = 0.0;
+                        hw_pressure_count = 0;
+                    }
+
+                    // Forecast: if next hour's predicted pressure is high, tighten now.
+                    let (forecast_1h, confidence) = holt_winters.forecast(hour_of_day, 1);
+                    if confidence > 0.3 && forecast_1h > 0.75 {
+                        // Scale adjustment by confidence and how high the forecast is.
+                        let hw_adjustment = (forecast_1h - 0.75) * confidence * 0.10;
+                        let hw_adjustment = hw_adjustment.min(0.04); // Max 4pp from forecast
+                        overflow_thresholds.bg_pressure -= hw_adjustment;
+                        overflow_thresholds.critical_pressure -= hw_adjustment;
+                        overflow_thresholds.extreme_pressure -= hw_adjustment;
+                    }
                 }
 
                 let decision = {
@@ -4766,8 +4879,9 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Persist Markov chain state on shutdown.
+            // Persist Markov chain + Holt-Winters state on shutdown.
             focus_markov.persist();
+            holt_winters.persist(&hw_path);
 
             // Revert sysctls to defaults on shutdown.
             {
