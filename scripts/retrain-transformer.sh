@@ -1,21 +1,19 @@
 #!/bin/bash
 # retrain-transformer.sh — Automatic Transformer retraining for Apollo.
 #
-# Called by launchd (com.eduardocortez.apollo-retrain.plist) nightly.
-# Checks prerequisites, system idle state, and minimum data before training.
+# Called by launchd every 6 hours.  The Python script handles ALL smart
+# decisions (data maturity, quality gates, warm-start, etc.).  This shell
+# script only verifies prerequisites (Python, PyTorch, data directory).
 #
-# Flow:
-#   1. Verify Python + PyTorch available
-#   2. Check system memory pressure (skip if under pressure)
-#   3. Check minimum telemetry data accumulated
-#   4. Train with warm-start (reuses previous weights)
-#   5. Deploy ONNX model → daemon hot-reloads automatically
-#
-# All output goes to /var/lib/apollo/retrain.log (or /tmp/ for non-root).
+# Quality gates handled by train_transformer.py --auto:
+#   - Immature data (< 7 days) → skip, keep collecting
+#   - Low feature diversity → skip, need varied workloads
+#   - Low hour coverage → skip, need more of the daily cycle
+#   - System under memory pressure → skip, try next interval
+#   - Less than 20% new data since last training → skip
+#   - Less than 12 hours since last training → skip
 
 set -euo pipefail
-
-# ── Paths ────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TRAIN_SCRIPT="${SCRIPT_DIR}/train_transformer.py"
@@ -34,7 +32,7 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
 
-# ── Gate 1: Python + torch available ────────────────────────────────────
+# ── Prerequisite: Python ────────────────────────────────────────────────
 
 PYTHON=""
 for candidate in python3 python; do
@@ -45,58 +43,40 @@ for candidate in python3 python; do
 done
 
 if [ -z "$PYTHON" ]; then
-    log "ERROR: python3 not found, skipping retrain"
+    log "python3 not found, skipping"
     exit 0
 fi
 
 if ! "$PYTHON" -c "import torch" 2>/dev/null; then
-    log "ERROR: PyTorch not installed (pip install torch), skipping"
+    log "PyTorch not installed (pip install torch), skipping"
     exit 0
 fi
 
-# ── Gate 2: data directory exists ───────────────────────────────────────
+# ── Prerequisite: data directory ────────────────────────────────────────
 
 if [ ! -d "$DATA_DIR" ]; then
-    log "No telemetry directory yet ($DATA_DIR), skipping"
+    log "No telemetry directory ($DATA_DIR), skipping"
     exit 0
 fi
 
-N_FILES=$(find "$DATA_DIR" -name "*.bin" -type f 2>/dev/null | wc -l | tr -d ' ')
-log "Found $N_FILES telemetry files in $DATA_DIR"
-
-if [ "$N_FILES" -lt 200 ]; then
-    log "Not enough data ($N_FILES < 200 files), skipping"
-    exit 0
-fi
-
-# ── Gate 3: system memory pressure ──────────────────────────────────────
-
-PRESSURE=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo "1")
-if [ "$PRESSURE" -gt 1 ]; then
-    log "System under memory pressure (level=$PRESSURE), skipping"
-    exit 0
-fi
-
-# ── Gate 4: not already running ─────────────────────────────────────────
+# ── Lock (prevent concurrent runs) ─────────────────────────────────────
 
 LOCK_FILE="${DEPLOY_DIR}/.retrain.lock"
 if [ -f "$LOCK_FILE" ]; then
-    # Check if the lock is stale (> 1 hour old).
     if [ "$(find "$LOCK_FILE" -mmin +60 2>/dev/null)" ]; then
-        log "Removing stale lock file"
         rm -f "$LOCK_FILE"
     else
-        log "Training already in progress (lock exists), skipping"
+        log "Already running (lock exists), skipping"
         exit 0
     fi
 fi
 
-# ── Train ───────────────────────────────────────────────────────────────
-
 touch "$LOCK_FILE"
 trap 'rm -f "$LOCK_FILE"' EXIT
 
-log "Starting automatic training (warm-start)"
+# ── Run training (all smart decisions are in the Python script) ─────────
+
+log "Invoking train_transformer.py --auto"
 
 "$PYTHON" "$TRAIN_SCRIPT" \
     --auto \
@@ -104,11 +84,4 @@ log "Starting automatic training (warm-start)"
     --deploy-dir "$DEPLOY_DIR" \
     2>&1 | tee -a "$LOG_FILE"
 
-EXIT_CODE=${PIPESTATUS[0]}
-
-if [ "$EXIT_CODE" -eq 0 ]; then
-    log "Training complete, model deployed to $DEPLOY_DIR"
-    log "Daemon will hot-reload on next hourly check"
-else
-    log "Training exited with code $EXIT_CODE"
-fi
+log "Done (exit code: ${PIPESTATUS[0]})"
