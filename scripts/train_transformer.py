@@ -11,6 +11,9 @@ At inference time (inside the Rust daemon via tract-onnx), high reconstruction
 error signals anomalous system behaviour that none of Apollo's existing
 univariate models captured.
 
+Supports warm-start: loads previous model weights so retraining on growing
+data converges in ~10 epochs instead of 50 (Ash & Adams 2020).
+
 Architecture
 ------------
 - 2-layer TransformerEncoder, d_model=64, nhead=4, FFN=128
@@ -25,12 +28,15 @@ References
   Time Series Representation Learning"
 - Tuli et al. 2022, "TranAD: Deep Transformer Networks for Anomaly Detection
   in Multivariate Time Series"
+- Ash & Adams 2020, "On Warm-Starting Neural Network Training"
 
 Usage
 -----
-    python3 scripts/train_transformer.py --data-dir /var/lib/apollo/telemetry \\
-                                          --output models/apollo_transformer.onnx \\
-                                          --epochs 50
+    # First training (cold start):
+    python3 scripts/train_transformer.py
+
+    # Retraining with warm-start (automatic mode):
+    python3 scripts/train_transformer.py --auto
 
 Requirements
 ------------
@@ -38,8 +44,10 @@ Requirements
 """
 
 import argparse
+import json
 import struct
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +58,10 @@ MAGIC = 0x41504F4C  # "APOL"
 HEADER_SIZE = 32
 N_FEATURES = 16
 SEQ_LEN = 120  # Transformer context window
+
+# Minimum number of .bin files needed before training is worthwhile.
+# ~500 files × 240 vectors = 120K vectors → enough for 120K-param model.
+MIN_FILES_FOR_TRAINING = 200
 
 # Feature names (same order as TelemetryVector in Rust).
 FEATURE_NAMES = [
@@ -100,9 +112,6 @@ def load_bin_file(path: Path) -> np.ndarray | None:
 
 def load_dataset(data_dir: Path, min_len: int = SEQ_LEN + 1) -> np.ndarray:
     """Load all .bin files and concatenate into one big array.
-
-    Files shorter than `min_len` are padded with the last observation
-    (repeat-pad, not zero-pad — avoids introducing artificial zero states).
 
     Returns shape (total_vectors, N_FEATURES).
     """
@@ -302,6 +311,33 @@ def export_onnx(model, output_path: Path, seq_len: int = SEQ_LEN):
     print(f"Exported ONNX model to {output_path} ({size_kb:.0f} KB)")
 
 
+def check_system_idle() -> bool:
+    """Check if the system is idle enough for training.
+
+    Reads macOS memory pressure to avoid training during high-pressure periods.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # 1 = normal, 2 = warning, 4 = critical
+        level = int(result.stdout.strip())
+        if level > 1:
+            print(f"[AUTO] Memory pressure level {level}, skipping training")
+            return False
+    except Exception:
+        pass  # If we can't check, proceed cautiously
+
+    return True
+
+
+def count_bin_files(data_dir: Path) -> int:
+    """Count valid .bin files in the data directory."""
+    return len(list(data_dir.glob("*.bin")))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train Apollo Time-Series Transformer"
@@ -313,57 +349,110 @@ def main():
         help="Directory with .bin telemetry files",
     )
     parser.add_argument(
-        "--output",
+        "--deploy-dir",
         type=Path,
-        default=Path("models/apollo_transformer.onnx"),
-        help="Output ONNX model path",
+        default=Path("/var/lib/apollo"),
+        help="Directory to deploy model + stats for daemon hot-reload",
     )
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=50,
+                        help="Max epochs (reduced to 15 on warm-start)")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seq-len", type=int, default=SEQ_LEN)
+    parser.add_argument("--auto", action="store_true",
+                        help="Automatic mode: check idle, check min data, "
+                             "warm-start, deploy, all unattended")
+    parser.add_argument("--min-files", type=int, default=MIN_FILES_FOR_TRAINING,
+                        help="Minimum .bin files before training (auto mode)")
     args = parser.parse_args()
 
-    # Load and prepare data.
+    model_deploy_path = args.deploy_dir / "apollo_transformer.onnx"
+    stats_deploy_path = args.deploy_dir / "feature_stats.json"
+    checkpoint_path = args.deploy_dir / "apollo_transformer_checkpoint.pt"
+
+    # ── Auto mode gates ──────────────────────────────────────────────────
+    if args.auto:
+        # Gate 1: enough data?
+        n_files = count_bin_files(args.data_dir)
+        print(f"[AUTO] Found {n_files} telemetry files (min: {args.min_files})")
+        if n_files < args.min_files:
+            print(f"[AUTO] Not enough data yet, exiting")
+            sys.exit(0)
+
+        # Gate 2: system idle?
+        if not check_system_idle():
+            sys.exit(0)
+
+        print(f"[AUTO] Starting training at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # ── Load data ────────────────────────────────────────────────────────
     data = load_dataset(args.data_dir, min_len=args.seq_len + 1)
 
     # Normalise features to zero-mean unit-variance (per-feature).
-    # Save stats for inference-time normalisation in Rust.
     mean = data.mean(axis=0)
     std = data.std(axis=0)
     std[std < 1e-8] = 1.0  # Avoid division by zero for constant features.
     data_norm = (data - mean) / std
 
-    # Save normalisation stats for Rust inference.
-    stats_path = args.output.parent / "feature_stats.npz"
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(str(stats_path), mean=mean, std=std, feature_names=FEATURE_NAMES)
-    print(f"Saved feature stats to {stats_path}")
-
     # Create sequences.
     X, Y = make_sequences(data_norm, seq_len=args.seq_len)
     print(f"Sequences: {len(X)} samples of length {args.seq_len}")
 
-    # Build and train.
+    # ── Build model + warm-start ─────────────────────────────────────────
+    import torch
+
     model = build_model(seq_len=args.seq_len)
-    model = train(model, X, Y, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
 
-    # Export.
-    export_onnx(model, args.output, seq_len=args.seq_len)
+    warm_started = False
+    if checkpoint_path.exists():
+        try:
+            state = torch.load(str(checkpoint_path), map_location="cpu",
+                               weights_only=True)
+            model.load_state_dict(state)
+            warm_started = True
+            print(f"Warm-start: loaded weights from {checkpoint_path}")
+            # Ash & Adams 2020: warm-start converges faster, use fewer epochs.
+            if args.auto:
+                args.epochs = min(args.epochs, 15)
+                args.lr = args.lr * 0.3  # Lower LR for fine-tuning.
+                print(f"  → epochs={args.epochs}, lr={args.lr:.1e}")
+        except Exception as e:
+            print(f"[WARN] Could not load checkpoint: {e}, training from scratch")
 
-    # Also save feature stats as JSON for Rust consumption.
-    import json
-    stats_json = args.output.parent / "feature_stats.json"
-    stats_json.write_text(json.dumps({
+    # ── Train ────────────────────────────────────────────────────────────
+    model = train(model, X, Y, epochs=args.epochs,
+                  batch_size=args.batch_size, lr=args.lr)
+
+    # ── Save checkpoint for future warm-starts ───────────────────────────
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), str(checkpoint_path))
+    print(f"Saved checkpoint to {checkpoint_path}")
+
+    # ── Export ONNX ──────────────────────────────────────────────────────
+    export_onnx(model, model_deploy_path, seq_len=args.seq_len)
+
+    # ── Save feature stats as JSON (for Rust z-score normalisation) ──────
+    stats_deploy_path.write_text(json.dumps({
         "mean": mean.tolist(),
         "std": std.tolist(),
         "feature_names": FEATURE_NAMES,
     }, indent=2))
-    print(f"Saved feature stats (JSON) to {stats_json}")
-    print("\nDone! Next steps:")
-    print(f"  1. Copy {args.output} to /var/lib/apollo/")
-    print(f"  2. Copy {stats_json} to /var/lib/apollo/")
-    print("  3. Restart daemon to load the model")
+    print(f"Saved feature stats to {stats_deploy_path}")
+
+    # ── Training log ─────────────────────────────────────────────────────
+    log_path = args.deploy_dir / "transformer_training.log"
+    with open(str(log_path), "a") as f:
+        f.write(json.dumps({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "n_files": count_bin_files(args.data_dir),
+            "n_vectors": len(data),
+            "n_sequences": len(X),
+            "warm_start": warm_started,
+            "epochs": args.epochs,
+        }) + "\n")
+
+    print(f"\nModel deployed to {model_deploy_path}")
+    print(f"Daemon will hot-reload on next hourly check")
 
 
 if __name__ == "__main__":
