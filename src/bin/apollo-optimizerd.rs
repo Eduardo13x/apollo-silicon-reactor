@@ -2835,36 +2835,39 @@ fn main() -> anyhow::Result<()> {
                 signal_intel.restore(si_persisted);
             }
             // Telemetry logger: ring-buffer data collector for Transformer training.
-            // Zerveas et al. 2021 — periodic + event-triggered dumps for self-supervised
-            // pre-training of time-series anomaly detection models.
-            let telemetry_dir = if unsafe { libc::geteuid() } == 0 {
-                std::path::PathBuf::from("/var/lib/apollo/telemetry")
-            } else {
-                std::path::PathBuf::from("/tmp/apollo-telemetry")
-            };
-            let mut telemetry_logger =
-                apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(
-                    telemetry_dir.clone(),
-                );
+            // Telemetry logger + Transformer disabled: classical stack is sufficient.
+            // Code preserved for future evaluation.
+            // let telemetry_dir = if unsafe { libc::geteuid() } == 0 {
+            //     std::path::PathBuf::from("/var/lib/apollo/telemetry")
+            // } else {
+            //     std::path::PathBuf::from("/tmp/apollo-telemetry")
+            // };
+            // let mut telemetry_logger =
+            //     apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(
+            //         telemetry_dir.clone(),
+            //     );
             // File cache warmer: pre-read predicted app executables into buffer cache.
             // Cao et al. 1994 — app-controlled prefetch eliminates cold page faults.
             let mut cache_warmer = apollo_optimizer::engine::cache_warmer::CacheWarmer::new();
             // Transformer predictor: ONNX inference for anomaly detection.
             // Without `transformer` feature flag, this is a zero-cost no-op.
             // With the flag + trained model, it runs real inference each cycle.
-            let transformer_model_path = telemetry_dir
-                .parent()
-                .unwrap_or(std::path::Path::new("/var/lib/apollo"))
-                .join("apollo_transformer.onnx");
-            let transformer_stats_path = telemetry_dir
-                .parent()
-                .unwrap_or(std::path::Path::new("/var/lib/apollo"))
-                .join("feature_stats.json");
-            let mut transformer_predictor =
-                apollo_optimizer::engine::transformer_predictor::TransformerPredictor::new(
-                    &transformer_model_path,
-                    &transformer_stats_path,
-                );
+            // let transformer_model_path = telemetry_dir
+            //     .parent()
+            //     .unwrap_or(std::path::Path::new("/var/lib/apollo"))
+            //     .join("apollo_transformer.onnx");
+            // let transformer_stats_path = telemetry_dir
+            //     .parent()
+            //     .unwrap_or(std::path::Path::new("/var/lib/apollo"))
+            //     .join("feature_stats.json");
+            // Transformer disabled: the classical stack (Kalman + CUSUM + Hazard +
+            // Holt-Winters + Markov + Temporal) already covers anomaly detection and
+            // prediction.  Code preserved for future evaluation.
+            // let mut transformer_predictor =
+            //     apollo_optimizer::engine::transformer_predictor::TransformerPredictor::new(
+            //         &transformer_model_path,
+            //         &transformer_stats_path,
+            //     );
             // Display-Off Turbo: Android Doze-like mode for macOS.
             // Project Volta (Google 2014) — freeze non-essential when display off,
             // instant restore on wake. Saves 15-25% battery (Chuang et al. 2013).
@@ -3878,7 +3881,7 @@ fn main() -> anyhow::Result<()> {
                 let mut overflow_thresholds = overflow_guard.thresholds(workload_mode);
 
                 // Signal intelligence: Kalman + CUSUM + Entropy + Hazard + LV + MPC.
-                let mut signal_digest = {
+                let signal_digest = {
                     let cpu_vals: Vec<f64> = snapshot
                         .top_processes
                         .iter()
@@ -4076,7 +4079,7 @@ fn main() -> anyhow::Result<()> {
                 // Perceptual latency monitor: composite score from existing signals.
                 // If UI responsiveness is degraded, boost reactor_weight to trigger
                 // faster/more aggressive scheduling decisions.
-                let latency_score_val = {
+                let _latency_score_val = {
                     let fg_cpu = foreground_pid
                         .and_then(|pid| {
                             proc_snaps
@@ -4111,59 +4114,10 @@ fn main() -> anyhow::Result<()> {
                     latency.score
                 };
 
-                // ── Telemetry logger: record feature vector for Transformer training ──
-                // Zerveas et al. 2021 — self-supervised pre-training requires both
-                // periodic samples (normal regime) and event-triggered dumps (anomalies).
-                {
-                    use apollo_optimizer::engine::telemetry_logger::{
-                        thermal_str_to_score, TelemetryVector,
-                    };
-                    let total_used: u64 =
-                        snapshot.top_processes.iter().map(|p| p.memory_usage).sum();
-                    let dom_share = if total_used > 0 {
-                        snapshot
-                            .top_processes
-                            .iter()
-                            .map(|p| p.memory_usage)
-                            .max()
-                            .unwrap_or(0) as f32
-                            / total_used as f32
-                    } else {
-                        0.0
-                    };
-                    let tvec = TelemetryVector {
-                        pressure_smooth: signal_digest.pressure_smooth as f32,
-                        pressure_velocity: signal_digest.pressure_velocity as f32,
-                        pressure_predicted_5s: signal_digest.pressure_predicted_5s as f32,
-                        swap_velocity_smooth: signal_digest.swap_velocity_smooth as f32,
-                        pressure_integral: signal_digest.pressure_integral as f32,
-                        cusum_score: signal_digest.cusum_score as f32,
-                        entropy_anomaly: signal_digest.entropy_anomaly as f32,
-                        p_oom_30s: signal_digest.p_oom_30s as f32,
-                        monopoly_risk: signal_digest.monopoly_risk as f32,
-                        urgency: signal_digest.urgency as f32,
-                        cpu_total: snapshot.cpu.global_usage / 100.0,
-                        compressor_ratio: snapshot.pressure.compressor_pressure as f32,
-                        dominant_share: dom_share,
-                        latency_score: latency_score_val as f32,
-                        active_proc_count: (snapshot.top_processes.len() as f32 / 200.0).min(1.0),
-                        thermal_score: thermal_str_to_score(
-                            snapshot.pressure.thermal_level.as_str(),
-                        ),
-                    };
-                    telemetry_logger.record(tvec);
-
-                    // Transformer anomaly detection: feed the same vector to the predictor.
-                    // Without `transformer` feature or without a trained model, returns 0.0.
-                    let t_anomaly = transformer_predictor.score(&tvec);
-                    signal_digest.transformer_anomaly = t_anomaly;
-
-                    // If the Transformer detects a significant anomaly, boost urgency.
-                    // Tuli et al. 2022 — reconstruction-error-based anomaly boosting.
-                    if t_anomaly > 0.5 {
-                        *reactor_weight = (*reactor_weight + 0.2).min(1.0);
-                    }
-                }
+                // Telemetry logger + Transformer scoring disabled.
+                // Classical signal stack (Kalman/CUSUM/Hazard/HW/Markov/Temporal)
+                // already covers anomaly detection and prediction.
+                // Code preserved in telemetry_logger.rs / transformer_predictor.rs.
 
                 let decision = {
                     let mut qos = state.mach_qos.lock_recover();
@@ -4942,24 +4896,13 @@ fn main() -> anyhow::Result<()> {
                 if cycle_count % 100 == 0 {
                     signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
                 }
-                // Prune old telemetry files once per hour (7200 cycles × 500ms).
-                // Keep 30 days of data for Transformer training datasets.
+                // Hourly housekeeping (7200 cycles × 500ms ≈ 1 hour).
                 if cycle_count % 7200 == 1 {
-                    let _ = apollo_optimizer::engine::telemetry_logger::prune_old_files(
-                        telemetry_logger.output_dir(),
-                        30,
-                    );
                     // GC stale entries from cache warmer + I/O shaper.
                     cache_warmer.gc();
                     io_shaper.gc();
                     // Persist temporal predictor state.
                     temporal_predictor.persist();
-                    // Hot-reload Transformer model if a new ONNX file appeared
-                    // (e.g. after offline retraining).
-                    if !transformer_predictor.is_ready() {
-                        transformer_predictor
-                            .reload(&transformer_model_path, &transformer_stats_path);
-                    }
                 }
                 // Update predictive agent + signal intelligence metrics for status reporting.
                 {
