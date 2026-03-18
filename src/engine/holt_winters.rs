@@ -92,12 +92,11 @@ impl HoltWinters {
 
         // Holt-Winters multiplicative update equations:
         // L(t) = α × y(t)/S(t-L) + (1-α) × (L(t-1) + T(t-1))
-        let new_level = ALPHA * (pressure / s_prev)
-            + (1.0 - ALPHA) * (self.state.level + self.state.trend);
+        let new_level =
+            ALPHA * (pressure / s_prev) + (1.0 - ALPHA) * (self.state.level + self.state.trend);
 
         // T(t) = β × (L(t) - L(t-1)) + (1-β) × T(t-1)
-        let new_trend =
-            BETA * (new_level - self.state.level) + (1.0 - BETA) * self.state.trend;
+        let new_trend = BETA * (new_level - self.state.level) + (1.0 - BETA) * self.state.trend;
 
         // S(t) = γ × y(t)/L(t) + (1-γ) × S(t-L)
         let new_seasonal = if new_level.abs() > 0.001 {
@@ -122,8 +121,7 @@ impl HoltWinters {
         let target_hour = ((current_hour as usize + hours_ahead as usize) % PERIOD) as usize;
         let seasonal = self.state.seasonal[target_hour];
 
-        let forecast =
-            (self.state.level + self.state.trend * hours_ahead as f64) * seasonal;
+        let forecast = (self.state.level + self.state.trend * hours_ahead as f64) * seasonal;
 
         // Confidence: ramp up from 0 to 1 over 48 observations (2 full days).
         let confidence = (self.state.observations as f64 / 48.0).min(1.0);
@@ -205,11 +203,7 @@ mod tests {
             "level {} should be ~0.50",
             hw.level()
         );
-        assert!(
-            hw.trend().abs() < 0.01,
-            "trend {} should be ~0",
-            hw.trend()
-        );
+        assert!(hw.trend().abs() < 0.01, "trend {} should be ~0", hw.trend());
     }
 
     #[test]
@@ -264,7 +258,12 @@ mod tests {
         }
         let (_, c48) = hw.forecast(0, 1);
 
-        assert!(c48 > c1, "confidence after 48h ({}) > after 1h ({})", c48, c1);
+        assert!(
+            c48 > c1,
+            "confidence after 48h ({}) > after 1h ({})",
+            c48,
+            c1
+        );
         assert!((c48 - 1.0).abs() < 0.01, "48h should reach full confidence");
     }
 }

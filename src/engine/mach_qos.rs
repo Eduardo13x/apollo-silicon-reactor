@@ -496,11 +496,7 @@ impl MachQoSManager {
     /// - Saturated: >75% of threads are hot (legitimate CPU-bound workload)
     /// - IoBound: >80% of threads are cold/waiting
     /// - Normal: mixed or insufficient data
-    pub fn analyze_threads(
-        &mut self,
-        pid: u32,
-        threads: &[ThreadSnapshot],
-    ) -> ThreadAnalysis {
+    pub fn analyze_threads(&mut self, pid: u32, threads: &[ThreadSnapshot]) -> ThreadAnalysis {
         let mut hot = Vec::new();
         let mut cold = Vec::new();
         let mut active_count = 0usize;

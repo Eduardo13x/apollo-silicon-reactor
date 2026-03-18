@@ -127,8 +127,7 @@ impl OnnxBackend {
     fn predict(&self, input: &[[f32; N_FEATURES]; SEQ_LEN]) -> Option<Vec<f32>> {
         let flat: Vec<f32> = input.iter().flat_map(|row| row.iter().copied()).collect();
 
-        let tensor =
-            tract_ndarray::Array3::from_shape_vec((1, SEQ_LEN, N_FEATURES), flat).ok()?;
+        let tensor = tract_ndarray::Array3::from_shape_vec((1, SEQ_LEN, N_FEATURES), flat).ok()?;
 
         let result = self.model.run(tvec!(tensor.into_tensor().into())).ok()?;
         let output = result[0].to_array_view::<f32>().ok()?;
@@ -267,7 +266,10 @@ impl TransformerPredictor {
             self.backend = Some(new_backend);
             self.ready = true;
             self.error_ewma = 0.0; // Reset baseline for new model.
-            eprintln!("[transformer] Model hot-reloaded from {}", model_path.display());
+            eprintln!(
+                "[transformer] Model hot-reloaded from {}",
+                model_path.display()
+            );
             true
         } else {
             false

@@ -273,8 +273,8 @@ impl TelemetryLogger {
 /// Delete telemetry files older than `max_age_days`.
 /// Call periodically (e.g. once per day) to prevent unbounded disk growth.
 pub fn prune_old_files(dir: &Path, max_age_days: u32) -> std::io::Result<u32> {
-    let cutoff = std::time::SystemTime::now()
-        - std::time::Duration::from_secs(max_age_days as u64 * 86400);
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(max_age_days as u64 * 86400);
     let mut removed = 0u32;
 
     if !dir.exists() {

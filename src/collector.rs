@@ -413,5 +413,10 @@ fn collect_pressure_facts() -> (f64, u64, u64, f64) {
         (0, 0)
     };
 
-    (memory_pressure, swap_used_bytes, swap_total_bytes, compressor_pressure)
+    (
+        memory_pressure,
+        swap_used_bytes,
+        swap_total_bytes,
+        compressor_pressure,
+    )
 }

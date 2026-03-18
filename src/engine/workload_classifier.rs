@@ -361,10 +361,7 @@ pub fn classify_workload_mode(features: &WorkloadFeatures) -> (WorkloadMode, f64
         })
         .collect();
 
-    distances.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let d_min = distances[0].1;
     let d_second = distances[1].1;

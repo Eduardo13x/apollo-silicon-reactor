@@ -442,10 +442,7 @@ pub fn decide_actions(
                                 name: name.clone(),
                                 thread_index: idx,
                                 tier: "background".to_string(),
-                                reason: format!(
-                                    "cold thread #{} in {} (waiting)",
-                                    idx, name
-                                ),
+                                reason: format!("cold thread #{} in {} (waiting)", idx, name),
                             });
                             thread_actions_emitted += 1;
                         }

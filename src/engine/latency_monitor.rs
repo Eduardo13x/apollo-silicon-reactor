@@ -82,8 +82,8 @@ pub fn compute_latency(signals: &LatencySignals) -> LatencyScore {
     let ws_norm = ((signals.windowserver_cpu - WS_CPU_NOMINAL) / (WS_CPU_BAD - WS_CPU_NOMINAL))
         .clamp(0.0, 1.0);
 
-    let csw_norm = ((signals.foreground_csw_per_sec - CSW_NOMINAL) / (CSW_BAD - CSW_NOMINAL))
-        .clamp(0.0, 1.0);
+    let csw_norm =
+        ((signals.foreground_csw_per_sec - CSW_NOMINAL) / (CSW_BAD - CSW_NOMINAL)).clamp(0.0, 1.0);
 
     // Foreground CPU: both extremes are bad.
     // Too low (<2%) = starved by other processes.

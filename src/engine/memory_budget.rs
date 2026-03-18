@@ -225,7 +225,10 @@ mod tests {
         ];
         let budgets = compute_budgets(RAM_8GB, &inputs);
         let brave = budgets.iter().find(|b| b.name == "Brave").unwrap();
-        assert!(brave.over_budget, "2.5GB Brave (WSS=800MB) should be over budget");
+        assert!(
+            brave.over_budget,
+            "2.5GB Brave (WSS=800MB) should be over budget"
+        );
         assert!(brave.excess_bytes > 0);
     }
 

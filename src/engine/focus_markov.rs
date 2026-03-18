@@ -216,9 +216,7 @@ impl FocusMarkov {
         }
 
         // Find the most likely target.
-        let (best_name, best_stats) = targets
-            .iter()
-            .max_by_key(|(_, v)| v.count)?;
+        let (best_name, best_stats) = targets.iter().max_by_key(|(_, v)| v.count)?;
 
         let probability = best_stats.count as f64 / total as f64;
         if probability < MIN_CONFIDENCE {
@@ -339,8 +337,8 @@ mod tests {
 
         // Claude → Brave (3x), Claude → Terminal (2x)
         let sequence = [
-            "Claude", "Brave", "Claude", "Brave", "Claude", "Terminal",
-            "Claude", "Brave", "Claude", "Terminal", "Claude",
+            "Claude", "Brave", "Claude", "Brave", "Claude", "Terminal", "Claude", "Brave",
+            "Claude", "Terminal", "Claude",
         ];
         for app in &sequence {
             m.observe(Some(app));
@@ -376,9 +374,9 @@ mod tests {
 
         // Build up: Claude→Brave(4), Claude→Terminal(3), Claude→Finder(1)
         let sequence = [
-            "Claude", "Brave", "Claude", "Brave", "Claude", "Terminal",
-            "Claude", "Brave", "Claude", "Terminal", "Claude", "Brave",
-            "Claude", "Terminal", "Claude", "Finder", "Claude",
+            "Claude", "Brave", "Claude", "Brave", "Claude", "Terminal", "Claude", "Brave",
+            "Claude", "Terminal", "Claude", "Brave", "Claude", "Terminal", "Claude", "Finder",
+            "Claude",
         ];
         for app in &sequence {
             m.observe(Some(app));

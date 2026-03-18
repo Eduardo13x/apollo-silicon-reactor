@@ -82,13 +82,7 @@ fn advise_prefetch(path: &std::path::Path, max_bytes: u64) -> std::io::Result<u6
         ra_offset: 0,
         ra_count: prefetch_size as libc::c_int,
     };
-    let ret = unsafe {
-        libc::fcntl(
-            file.as_raw_fd(),
-            F_RDADVISE,
-            &advisory as *const Radvisory,
-        )
-    };
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), F_RDADVISE, &advisory as *const Radvisory) };
 
     if ret == 0 {
         return Ok(prefetch_size);

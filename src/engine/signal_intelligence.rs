@@ -273,7 +273,7 @@ impl SignalIntelligence {
         self.hazard.record_event(&features, hours_since_last);
     }
 
-        /// Feedback al MPC: qué pasó después de ejecutar una acción.
+    /// Feedback al MPC: qué pasó después de ejecutar una acción.
     pub fn mpc_feedback(&mut self, action: usize, pressure_before: f64, pressure_after: f64) {
         self.mpc.update_effect(
             action,

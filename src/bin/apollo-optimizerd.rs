@@ -37,16 +37,15 @@ use apollo_optimizer::engine::decide_actions::decide_actions;
 use apollo_optimizer::engine::energy::EnergyTracker;
 use apollo_optimizer::engine::execute_actions::execute_actions;
 use apollo_optimizer::engine::focus_markov::FocusMarkov;
-use apollo_optimizer::engine::holt_winters::HoltWinters;
-use apollo_optimizer::engine::jetsam_control;
-use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
-use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
 use apollo_optimizer::engine::foreground::{ForegroundDetector, ForegroundState};
 use apollo_optimizer::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
+use apollo_optimizer::engine::holt_winters::HoltWinters;
 use apollo_optimizer::engine::hw_bayes::HwFeatures;
 use apollo_optimizer::engine::hw_predictor::{sample_hw_pressure, HwPressure};
 use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
+use apollo_optimizer::engine::jetsam_control;
 use apollo_optimizer::engine::kqueue_pressure;
+use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
 use apollo_optimizer::engine::llm::{
     append_jsonl, delete_file_best_effort, feedback_path_root, load_repo_config, policy_path_root,
     read_json, state_paths_root, suggestions_path_root, write_json, write_secret, FeedbackEntry,
@@ -56,13 +55,11 @@ use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
 use apollo_optimizer::engine::mach_qos::{MachQoSManager, SchedulingTier};
 use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
+use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
 use apollo_optimizer::engine::network_monitor::NetworkMonitor;
 use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfile};
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
 use apollo_optimizer::engine::overflow_guard::{OverflowGuard, BUILD_TOOLS};
-use apollo_optimizer::engine::workload_classifier::{
-    classify_workload_mode, WorkloadFeatures, WorkloadMode,
-};
 use apollo_optimizer::engine::power_management::{detect_battery_status, PowerManager};
 use apollo_optimizer::engine::predictive_agent::{AgentContext, Intervention, PredictiveAgent};
 use apollo_optimizer::engine::proc_taskinfo;
@@ -99,6 +96,9 @@ use apollo_optimizer::engine::usage_model::{usage_model_path_root, UsageModel};
 use apollo_optimizer::engine::user_profile::{UserProfile, UserProfilePersisted};
 use apollo_optimizer::engine::wait_graph;
 use apollo_optimizer::engine::wake_storm_detector::WakeStormDetector;
+use apollo_optimizer::engine::workload_classifier::{
+    classify_workload_mode, WorkloadFeatures, WorkloadMode,
+};
 use apollo_optimizer::engine::zombie_hunter::HuntSnapshot;
 use chrono::{DateTime, Duration as ChronoDuration, Local, Timelike, Utc};
 use clap::{Parser, Subcommand};
@@ -564,7 +564,14 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             data: 0,
             udata: 3 as *mut libc::c_void, // ID 3 = Lifecycle
         };
-        let fork_rc = libc::kevent(kq, &launchd_kev, 1, std::ptr::null_mut(), 0, std::ptr::null());
+        let fork_rc = libc::kevent(
+            kq,
+            &launchd_kev,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        );
         if fork_rc < 0 {
             let errno = *libc::__error();
             state.reactor_status.lock_recover().last_error = Some(format!(
@@ -1954,7 +1961,14 @@ fn usage_learning_tick(
 
     {
         let mut model = state.usage_model.lock_recover();
-        model.update_from_snapshot(snapshot, now, interactive_proxy, jank_proxy, 10, cpu_wall_ratios);
+        model.update_from_snapshot(
+            snapshot,
+            now,
+            interactive_proxy,
+            jank_proxy,
+            10,
+            cpu_wall_ratios,
+        );
     }
 
     // Persist usage model periodically (every ~2 minutes).
@@ -2279,7 +2293,12 @@ fn build_enriched_process_data_with_tree(
             if let Some(ti) = proc_taskinfo::get_task_info(pid_u32) {
                 rusage_map.insert(
                     pid_u32,
-                    (idle_wk, ti.messages_sent + ti.messages_received, ti.faults, ti.pageins),
+                    (
+                        idle_wk,
+                        ti.messages_sent + ti.messages_received,
+                        ti.faults,
+                        ti.pageins,
+                    ),
                 );
             } else {
                 rusage_map.insert(pid_u32, (idle_wk, 0, 0, 0));
@@ -2319,21 +2338,21 @@ fn build_enriched_process_data_with_tree(
         // Mach messages > 0 implies the process has active IPC (network, XPC, etc.)
         let (wakeups_per_sec, has_network_signal, faults_total, pageins_total) =
             match rusage_map.get(&pid_u32) {
-            Some(&(idle_wk, mach_msgs, faults, pageins)) => {
-                // Rough estimate: if idle_wakeups > 1000, it's a chatty daemon
-                let wps = if idle_wk > 10_000 {
-                    (idle_wk as f32 / 3600.0).min(100.0)
-                } else if idle_wk > 100 {
-                    (idle_wk as f32 / 7200.0).min(50.0)
-                } else {
-                    0.0
-                };
-                // Mach messages indicate IPC activity (XPC, network, etc.)
-                let has_net = mach_msgs > 100;
-                (wps, has_net, faults, pageins)
-            }
-            None => (0.0, false, 0, 0),
-        };
+                Some(&(idle_wk, mach_msgs, faults, pageins)) => {
+                    // Rough estimate: if idle_wakeups > 1000, it's a chatty daemon
+                    let wps = if idle_wk > 10_000 {
+                        (idle_wk as f32 / 3600.0).min(100.0)
+                    } else if idle_wk > 100 {
+                        (idle_wk as f32 / 7200.0).min(50.0)
+                    } else {
+                        0.0
+                    };
+                    // Mach messages indicate IPC activity (XPC, network, etc.)
+                    let has_net = mach_msgs > 100;
+                    (wps, has_net, faults, pageins)
+                }
+                None => (0.0, false, 0, 0),
+            };
 
         proc_snaps.push(ProcessSnapshot {
             pid: pid_u32,
@@ -2799,8 +2818,7 @@ fn main() -> anyhow::Result<()> {
                 Some(state.mach_qos.clone()),
             );
             // Overflow guard: aprende de eventos OOM y ajusta thresholds adaptativamente.
-            let mut overflow_guard =
-                OverflowGuard::load_or_default(
+            let mut overflow_guard = OverflowGuard::load_or_default(
                 std::path::Path::new(overflow_history_path()),
                 Some(std::path::Path::new(rl_threshold_path())),
             );
@@ -2825,17 +2843,21 @@ fn main() -> anyhow::Result<()> {
                 std::path::PathBuf::from("/tmp/apollo-telemetry")
             };
             let mut telemetry_logger =
-                apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(telemetry_dir.clone());
+                apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(
+                    telemetry_dir.clone(),
+                );
             // File cache warmer: pre-read predicted app executables into buffer cache.
             // Cao et al. 1994 — app-controlled prefetch eliminates cold page faults.
             let mut cache_warmer = apollo_optimizer::engine::cache_warmer::CacheWarmer::new();
             // Transformer predictor: ONNX inference for anomaly detection.
             // Without `transformer` feature flag, this is a zero-cost no-op.
             // With the flag + trained model, it runs real inference each cycle.
-            let transformer_model_path = telemetry_dir.parent()
+            let transformer_model_path = telemetry_dir
+                .parent()
                 .unwrap_or(std::path::Path::new("/var/lib/apollo"))
                 .join("apollo_transformer.onnx");
-            let transformer_stats_path = telemetry_dir.parent()
+            let transformer_stats_path = telemetry_dir
+                .parent()
                 .unwrap_or(std::path::Path::new("/var/lib/apollo"))
                 .join("feature_stats.json");
             let mut transformer_predictor =
@@ -2843,6 +2865,24 @@ fn main() -> anyhow::Result<()> {
                     &transformer_model_path,
                     &transformer_stats_path,
                 );
+            // Display-Off Turbo: Android Doze-like mode for macOS.
+            // Project Volta (Google 2014) — freeze non-essential when display off,
+            // instant restore on wake. Saves 15-25% battery (Chuang et al. 2013).
+            let mut display_turbo = apollo_optimizer::engine::display_turbo::DisplayTurbo::new();
+            // Temporal app predictor: time-of-day aware app launch prediction.
+            // Shin et al. 2012 — temporal patterns predict app launches with ~80% accuracy.
+            // Combined with Markov chain for 85% top-3 accuracy (Baeza-Yates et al. 2015).
+            let temporal_path = if unsafe { libc::geteuid() } == 0 {
+                std::path::PathBuf::from("/var/lib/apollo/temporal_histograms.json")
+            } else {
+                std::path::PathBuf::from("/tmp/apollo-temporal_histograms.json")
+            };
+            let mut temporal_predictor =
+                apollo_optimizer::engine::temporal_predictor::TemporalPredictor::new(temporal_path);
+            // I/O Traffic Shaper: foreground-aware disk bandwidth allocation.
+            // Iyer & Druschel 2001 — anticipatory scheduling reduces foreground I/O
+            // latency by 50-70% under concurrent background load.
+            let mut io_shaper = apollo_optimizer::engine::io_tiering::IoShaper::new();
             // Audit fix #6: Multi-phase thermal bail-out with hysteresis.
             let mut thermal_bailout = ThermalBailout::new();
             // Freeze confirmation cache: pid → consecutive cycles flagged.
@@ -2964,7 +3004,8 @@ fn main() -> anyhow::Result<()> {
                             m.collector_smc_alive = smc_alive;
                         }
                         if !pressure_alive || !smc_alive {
-                            state.reactor_status.lock_recover().health = "collector-stalled".to_string();
+                            state.reactor_status.lock_recover().health =
+                                "collector-stalled".to_string();
                             // Respawn stalled collectors so the main loop gets fresh data.
                             if !smc_alive {
                                 eprintln!("watchdog: SmcReader stalled — respawning");
@@ -3009,6 +3050,76 @@ fn main() -> anyhow::Result<()> {
                 wake_state_guard.last_cycle_wallclock = now_wall;
                 write_wake_state(&wake_state_path, &wake_state_guard);
                 drop(wake_state_guard);
+
+                // Display-Off Turbo: Android Doze-like power management.
+                // When display is off for >5s, freeze all non-essential processes.
+                // On display-on, instantly unfreeze everything we froze.
+                {
+                    use apollo_optimizer::engine::display_turbo::TurboAction;
+                    match display_turbo.tick() {
+                        TurboAction::ActivateTurbo => {
+                            // Freeze non-essential background processes.
+                            let critical_pats = critical_background_processes();
+                            let protected_pats = protected_processes();
+                            let policy_protected = state
+                                .learned_policy
+                                .lock_recover()
+                                .protected_patterns
+                                .clone();
+                            let fg_pid = fg_detector.detect().pid();
+                            let mut frozen_guard = state.frozen_state.lock_recover();
+                            let mut turbo_frozen = 0u32;
+                            let max_freeze = display_turbo.max_freeze_count();
+
+                            for (pid, process) in collector.system().processes() {
+                                let pid_u32 = pid.as_u32();
+                                let name = process.name().to_string();
+                                // Never freeze: foreground, essential, protected, Apollo itself.
+                                if Some(pid_u32) == fg_pid
+                                    || critical_pats.iter().any(|p| name.contains(p))
+                                    || protected_pats.iter().any(|p| name.contains(p))
+                                    || policy_protected.iter().any(|p| name.contains(p.as_str()))
+                                    || name == "apollo-optimizerd"
+                                    || frozen_guard.contains_key(&pid_u32)
+                                {
+                                    continue;
+                                }
+                                if turbo_frozen as usize >= max_freeze {
+                                    break;
+                                }
+                                // SIGSTOP the process.
+                                if unsafe { libc::kill(pid_u32 as i32, libc::SIGSTOP) } == 0 {
+                                    display_turbo.record_turbo_freeze(pid_u32);
+                                    frozen_guard.insert(
+                                        pid_u32,
+                                        FrozenEntry {
+                                            frozen_at: Utc::now(),
+                                            source: FreezeSource::MainLoop,
+                                        },
+                                    );
+                                    turbo_frozen += 1;
+                                }
+                            }
+                            write_frozen_state(&frozen_state_path, &frozen_guard);
+                            drop(frozen_guard);
+                            state.metrics.lock_recover().freezes_applied += turbo_frozen as u64;
+                        }
+                        TurboAction::DeactivateTurbo {
+                            unfreeze_pids: pids,
+                        } => {
+                            // Unfreeze all PIDs we froze during turbo.
+                            let unfreeze_count = unfreeze_pids(pids.iter().copied());
+                            let mut frozen_guard = state.frozen_state.lock_recover();
+                            for pid in &pids {
+                                frozen_guard.remove(pid);
+                            }
+                            write_frozen_state(&frozen_state_path, &frozen_guard);
+                            drop(frozen_guard);
+                            state.metrics.lock_recover().unfreezes_applied += unfreeze_count;
+                        }
+                        TurboAction::None => {}
+                    }
+                }
 
                 // Adaptive snapshot: use lightweight path (no disk/net, direct sysctl)
                 // when hw pressure was Nominal last cycle AND memory is not stressed.
@@ -3077,6 +3188,51 @@ fn main() -> anyhow::Result<()> {
                             // the buffer cache so code pages don't fault from SSD.
                             // Cao et al. 1994 — app-controlled prefetch cuts I/O wait 50%.
                             cache_warmer.warm_pid(pid);
+                        }
+                    }
+                }
+
+                // Temporal app predictor: observe foreground app + hour for time-of-day patterns.
+                // Shin et al. 2012 — temporal patterns predict app launches with ~80% accuracy.
+                // On foreground change, record observation + get temporal prediction for
+                // proactive pre-warming of apps the user habitually opens at this hour.
+                if let Some(ref fg_name) = foreground_app {
+                    let now_chrono = Utc::now();
+                    let hour = now_chrono.hour() as u8;
+                    let weekday =
+                        chrono::Datelike::weekday(&now_chrono).num_days_from_monday() as u8;
+                    temporal_predictor.observe(fg_name, hour, weekday);
+
+                    // Build Markov probability map for blending with temporal model.
+                    let markov_probs: std::collections::HashMap<String, f64> = focus_markov
+                        .predict_top_n(fg_name, 5)
+                        .into_iter()
+                        .map(|p| (p.app_name, p.probability))
+                        .collect();
+
+                    // Get temporal-blended predictions: apps likely needed at this time.
+                    let temporal_preds = temporal_predictor.predict(hour, weekday, &markov_probs);
+
+                    // Pre-warm temporal predictions that Markov alone wouldn't catch.
+                    // Only warm if temporal_score > 0.3 (strong time signal) and
+                    // probability > 0.15 (avoid warming everything).
+                    for tpred in &temporal_preds {
+                        if tpred.temporal_score > 0.3
+                            && tpred.probability > 0.15
+                            && tpred.markov_score < 0.30
+                        {
+                            // This is a purely temporal prediction — Markov wouldn't
+                            // have caught it.  Pre-warm via cache warmer.
+                            let pred_lc = tpred.app_name.to_ascii_lowercase();
+                            if let Some(pid) = collector
+                                .system()
+                                .processes()
+                                .iter()
+                                .find(|(_, p)| p.name().to_ascii_lowercase() == pred_lc)
+                                .map(|(pid, _)| pid.as_u32())
+                            {
+                                cache_warmer.warm_pid(pid);
+                            }
                         }
                     }
                 }
@@ -3208,9 +3364,7 @@ fn main() -> anyhow::Result<()> {
                                 rss_bytes: s.rss_bytes,
                                 working_set_bytes: wss_bytes,
                                 is_foreground: s.has_gui_window && s.secs_since_foreground == 0,
-                                is_build_tool: BUILD_TOOLS
-                                    .iter()
-                                    .any(|t| s.name.contains(t)),
+                                is_build_tool: BUILD_TOOLS.iter().any(|t| s.name.contains(t)),
                                 presence_ema: presence,
                                 interactive_ema: interactive,
                             }
@@ -3219,8 +3373,10 @@ fn main() -> anyhow::Result<()> {
                     drop(usage_model);
 
                     if !budget_inputs.is_empty() {
-                        let budgets =
-                            memory_budget::compute_budgets(snapshot.memory.total_ram, &budget_inputs);
+                        let budgets = memory_budget::compute_budgets(
+                            snapshot.memory.total_ram,
+                            &budget_inputs,
+                        );
 
                         // Apply jetsam inactive limits for over-budget processes.
                         for budget in budgets.iter().filter(|b| b.over_budget) {
@@ -3649,25 +3805,48 @@ fn main() -> anyhow::Result<()> {
 
                 // Phase 3: Feature-based workload classification.
                 let workload_mode: WorkloadMode = {
-                    let ratios: Vec<f64> = snapshot.top_processes.iter()
-                        .filter_map(|p| p.cpu_wall_ratio.map(|r| r as f64)).collect();
-                    let avg_cpu_wall_ratio = if ratios.is_empty() { 0.0 }
-                        else { ratios.iter().sum::<f64>() / ratios.len() as f64 };
-                    let build_tool_count = all_proc_names.iter()
+                    let ratios: Vec<f64> = snapshot
+                        .top_processes
+                        .iter()
+                        .filter_map(|p| p.cpu_wall_ratio.map(|r| r as f64))
+                        .collect();
+                    let avg_cpu_wall_ratio = if ratios.is_empty() {
+                        0.0
+                    } else {
+                        ratios.iter().sum::<f64>() / ratios.len() as f64
+                    };
+                    let build_tool_count = all_proc_names
+                        .iter()
                         .filter(|n| BUILD_TOOLS.iter().any(|t| n.to_lowercase().contains(t)))
                         .count() as f64;
-                    let gpu_watts = cycle_hw_snap.as_ref()
-                        .and_then(|h| h.power.gpu_watts).unwrap_or(0.0);
+                    let gpu_watts = cycle_hw_snap
+                        .as_ref()
+                        .and_then(|h| h.power.gpu_watts)
+                        .unwrap_or(0.0);
                     let gpu_active = if gpu_watts > 2.0 { 1.0 } else { 0.0 };
-                    let total_rss_gb = snapshot.top_processes.iter()
-                        .map(|p| p.memory_usage as f64).sum::<f64>() / (1024.0 * 1024.0 * 1024.0);
-                    let interactive_count = snapshot.top_processes.iter()
-                        .filter(|p| decide_interactive.iter().any(|pat|
-                            p.name.to_ascii_lowercase().contains(&pat.to_ascii_lowercase())))
+                    let total_rss_gb = snapshot
+                        .top_processes
+                        .iter()
+                        .map(|p| p.memory_usage as f64)
+                        .sum::<f64>()
+                        / (1024.0 * 1024.0 * 1024.0);
+                    let interactive_count = snapshot
+                        .top_processes
+                        .iter()
+                        .filter(|p| {
+                            decide_interactive.iter().any(|pat| {
+                                p.name
+                                    .to_ascii_lowercase()
+                                    .contains(&pat.to_ascii_lowercase())
+                            })
+                        })
                         .count() as f64;
                     let features = WorkloadFeatures {
-                        avg_cpu_wall_ratio, build_tool_count, gpu_active,
-                        total_rss_gb, interactive_count,
+                        avg_cpu_wall_ratio,
+                        build_tool_count,
+                        gpu_active,
+                        total_rss_gb,
+                        interactive_count,
                     };
                     let (mode, _confidence) = classify_workload_mode(&features);
                     mode
@@ -3900,7 +4079,10 @@ fn main() -> anyhow::Result<()> {
                 let latency_score_val = {
                     let fg_cpu = foreground_pid
                         .and_then(|pid| {
-                            proc_snaps.iter().find(|s| s.pid == pid).map(|s| s.cpu_percent as f64)
+                            proc_snaps
+                                .iter()
+                                .find(|s| s.pid == pid)
+                                .map(|s| s.cpu_percent as f64)
                         })
                         .unwrap_or(0.0);
                     let fg_csw = foreground_pid
@@ -3934,7 +4116,7 @@ fn main() -> anyhow::Result<()> {
                 // periodic samples (normal regime) and event-triggered dumps (anomalies).
                 {
                     use apollo_optimizer::engine::telemetry_logger::{
-                        TelemetryVector, thermal_str_to_score,
+                        thermal_str_to_score, TelemetryVector,
                     };
                     let total_used: u64 =
                         snapshot.top_processes.iter().map(|p| p.memory_usage).sum();
@@ -4146,8 +4328,7 @@ fn main() -> anyhow::Result<()> {
                 // survival_mode still gates aggressive actions (jetsam kill,
                 // freeze recovery) regardless of this gate — we just don't let
                 // low-pressure swap storms train the adaptive thresholds.
-                let real_overflow = survival_mode
-                    && snapshot.pressure.memory_pressure >= 0.60;
+                let real_overflow = survival_mode && snapshot.pressure.memory_pressure >= 0.60;
                 if real_overflow {
                     let heavy: Vec<String> = snapshot
                         .top_processes
@@ -4759,8 +4940,7 @@ fn main() -> anyhow::Result<()> {
                 // Persist signal intelligence state every 100 cycles so hazard model + MPC
                 // effects survive crashes (not just clean shutdowns).
                 if cycle_count % 100 == 0 {
-                    signal_intel
-                        .persist(std::path::Path::new(signal_intelligence_path()));
+                    signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
                 }
                 // Prune old telemetry files once per hour (7200 cycles × 500ms).
                 // Keep 30 days of data for Transformer training datasets.
@@ -4769,15 +4949,16 @@ fn main() -> anyhow::Result<()> {
                         telemetry_logger.output_dir(),
                         30,
                     );
-                    // GC stale entries from cache warmer.
+                    // GC stale entries from cache warmer + I/O shaper.
                     cache_warmer.gc();
+                    io_shaper.gc();
+                    // Persist temporal predictor state.
+                    temporal_predictor.persist();
                     // Hot-reload Transformer model if a new ONNX file appeared
                     // (e.g. after offline retraining).
                     if !transformer_predictor.is_ready() {
-                        transformer_predictor.reload(
-                            &transformer_model_path,
-                            &transformer_stats_path,
-                        );
+                        transformer_predictor
+                            .reload(&transformer_model_path, &transformer_stats_path);
                     }
                 }
                 // Update predictive agent + signal intelligence metrics for status reporting.
@@ -4796,6 +4977,30 @@ fn main() -> anyhow::Result<()> {
                     }
                     m.si_monopoly_risk = signal_digest.monopoly_risk;
                     m.si_entropy_anomaly = signal_digest.entropy_anomaly;
+                }
+
+                // I/O Traffic Shaping: foreground-aware disk bandwidth allocation.
+                // Iyer & Druschel 2001 — anticipatory scheduling + I/O priority classes
+                // reduce foreground I/O latency by 50-70% under concurrent background load.
+                // Runs every 5 cycles (~2.5s) to avoid excessive syscall overhead.
+                if cycle_count % 5 == 0 && is_root {
+                    let fg_family_io = build_foreground_family(foreground_pid, &process_tree);
+                    let fg_pids: Vec<u32> = fg_family_io.iter().copied().collect();
+                    let process_tiers: Vec<(
+                        u32,
+                        apollo_optimizer::engine::process_classifier::ProcessTier,
+                    )> = heuristic_decisions
+                        .iter()
+                        .map(|d| (d.pid, d.tier))
+                        .collect();
+                    let under_pressure = snapshot.pressure.memory_pressure > 0.60;
+                    let mut qos = state.mach_qos.lock_recover();
+                    let io_changes =
+                        io_shaper.shape(&fg_pids, &process_tiers, under_pressure, Some(&mut qos));
+                    drop(qos);
+                    if io_changes > 0 {
+                        state.metrics.lock_recover().sysctl_reactive_writes += io_changes as u64;
+                    }
                 }
 
                 // F5 — MachQoS: route processes to P-Cores / E-Cores based on heuristic decisions.
@@ -4979,8 +5184,7 @@ fn main() -> anyhow::Result<()> {
 
                     // RL threshold agent metrics (Phase 4).
                     if let Some(rl) = &overflow_guard.rl_agent {
-                        metrics.rl_adjustment_pp =
-                            (rl.current_adjustment * 100.0).round() as i32;
+                        metrics.rl_adjustment_pp = (rl.current_adjustment * 100.0).round() as i32;
                         metrics.rl_total_ticks = rl.total_ticks();
                         metrics.rl_total_overflows = rl.total_overflows();
                     }

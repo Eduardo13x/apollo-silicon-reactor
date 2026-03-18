@@ -338,8 +338,7 @@ impl ProfileGovernor {
                     && self.state.consecutive_high >= consecutive_high_threshold
                 {
                     OptimizationProfile::AggressiveRoot
-                } else if pressure_score <= 0.28
-                    && self.safe_low_consecutive >= safe_low_threshold
+                } else if pressure_score <= 0.28 && self.safe_low_consecutive >= safe_low_threshold
                 {
                     OptimizationProfile::SafeRoot
                 } else {

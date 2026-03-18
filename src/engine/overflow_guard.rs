@@ -320,9 +320,7 @@ impl OverflowGuard {
                 .iter()
                 .filter(|app| proc_names.iter().any(|n| n.contains(app.as_str())))
                 .count();
-            if matches >= 3
-                && !event.heavy_apps.is_empty()
-                && matches * 2 >= event.heavy_apps.len()
+            if matches >= 3 && !event.heavy_apps.is_empty() && matches * 2 >= event.heavy_apps.len()
             {
                 return true;
             }
@@ -381,9 +379,20 @@ mod tests {
         let offset_fresh = guard_fresh.compute_dynamic_offset();
         let offset_old = guard_old.compute_dynamic_offset();
 
-        assert!(offset_fresh < -0.04, "evento reciente debe tener offset alto: {}", offset_fresh);
-        assert!(offset_old > -0.03, "evento de 8h debe tener offset reducido: {}", offset_old);
-        assert!(offset_old > offset_fresh, "evento más viejo debe tener menor impacto");
+        assert!(
+            offset_fresh < -0.04,
+            "evento reciente debe tener offset alto: {}",
+            offset_fresh
+        );
+        assert!(
+            offset_old > -0.03,
+            "evento de 8h debe tener offset reducido: {}",
+            offset_old
+        );
+        assert!(
+            offset_old > offset_fresh,
+            "evento más viejo debe tener menor impacto"
+        );
     }
 
     #[test]
@@ -391,14 +400,22 @@ mod tests {
         let ages: Vec<f64> = (24..=168).step_by(8).map(|h| h as f64).collect();
         let guard = make_guard_with_events(&ages);
         let offset = guard.compute_dynamic_offset();
-        assert!(offset > -0.10, "20 eventos de 24h+ no deben mantener offset al piso: {}", offset);
+        assert!(
+            offset > -0.10,
+            "20 eventos de 24h+ no deben mantener offset al piso: {}",
+            offset
+        );
     }
 
     #[test]
     fn dynamic_offset_capped_at_floor() {
         let guard = make_guard_with_events(&[0.1, 0.2, 0.3, 0.4, 0.5]);
         let offset = guard.compute_dynamic_offset();
-        assert!(offset >= -0.20, "offset nunca debe bajar del piso -20pp: {}", offset);
+        assert!(
+            offset >= -0.20,
+            "offset nunca debe bajar del piso -20pp: {}",
+            offset
+        );
     }
 
     #[test]
@@ -406,8 +423,16 @@ mod tests {
         let ages: Vec<f64> = (24..=168).step_by(8).map(|h| h as f64).collect();
         let guard = make_guard_with_events(&ages);
         let t = guard.thresholds(WorkloadMode::Idle);
-        assert!(t.bg_pressure > 0.70, "bg_pressure debe haberse recuperado: {}", t.bg_pressure);
+        assert!(
+            t.bg_pressure > 0.70,
+            "bg_pressure debe haberse recuperado: {}",
+            t.bg_pressure
+        );
         // Idle mode adds +0.03 bonus, so ceiling is 0.78 + 0.03 = 0.81.
-        assert!(t.bg_pressure <= 0.81, "no puede superar el default + idle bonus: {}", t.bg_pressure);
+        assert!(
+            t.bg_pressure <= 0.81,
+            "no puede superar el default + idle bonus: {}",
+            t.bg_pressure
+        );
     }
 }

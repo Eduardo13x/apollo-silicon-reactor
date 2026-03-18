@@ -67,7 +67,11 @@ impl RlState {
             2
         };
         let overflow_last_hour = (overflows_last_hour as u8).min(3);
-        Self { pressure_band, compressor_band, overflow_last_hour }
+        Self {
+            pressure_band,
+            compressor_band,
+            overflow_last_hour,
+        }
     }
 
     pub fn index(&self) -> usize {
@@ -132,18 +136,30 @@ impl RlThresholdAgent {
                 .unwrap_or(([[0.0; NUM_ACTIONS]; NUM_STATES], 0.0, 0, 0));
 
         Self {
-            q_table, last_state: None, last_action: None,
-            current_adjustment, total_ticks, total_overflows,
+            q_table,
+            last_state: None,
+            last_action: None,
+            current_adjustment,
+            total_ticks,
+            total_overflows,
             path: path.to_path_buf(),
         }
     }
 
     pub fn epsilon(&self) -> f64 {
-        if self.total_ticks < EPSILON_DECAY_TICKS { EPSILON_INITIAL } else { EPSILON_STABLE }
+        if self.total_ticks < EPSILON_DECAY_TICKS {
+            EPSILON_INITIAL
+        } else {
+            EPSILON_STABLE
+        }
     }
 
-    pub fn total_ticks(&self) -> u64 { self.total_ticks }
-    pub fn total_overflows(&self) -> u64 { self.total_overflows }
+    pub fn total_ticks(&self) -> u64 {
+        self.total_ticks
+    }
+    pub fn total_overflows(&self) -> u64 {
+        self.total_overflows
+    }
 
     fn select_action(&self, state: RlState) -> RlAction {
         let eps = self.epsilon();
@@ -156,7 +172,10 @@ impl RlThresholdAgent {
             let mut best_idx = 0;
             let mut best_val = row[0];
             for (i, &q) in row.iter().enumerate().skip(1) {
-                if q > best_val { best_val = q; best_idx = i; }
+                if q > best_val {
+                    best_val = q;
+                    best_idx = i;
+                }
             }
             RlAction::from_index(best_idx)
         }
@@ -174,7 +193,10 @@ impl RlThresholdAgent {
             let s = prev_state.index();
             let a = prev_action as usize;
             let s_prime = state.index();
-            let max_q_next = self.q_table[s_prime].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let max_q_next = self.q_table[s_prime]
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
             let old_q = self.q_table[s][a];
             self.q_table[s][a] = old_q + ALPHA * (reward + GAMMA * max_q_next - old_q);
         }
@@ -185,7 +207,9 @@ impl RlThresholdAgent {
             RlAction::Hold => {}
             RlAction::Raise1pp => self.current_adjustment += 0.01,
         }
-        self.current_adjustment = self.current_adjustment.clamp(ADJUSTMENT_FLOOR, ADJUSTMENT_CEIL);
+        self.current_adjustment = self
+            .current_adjustment
+            .clamp(ADJUSTMENT_FLOOR, ADJUSTMENT_CEIL);
 
         self.last_state = Some(state);
         self.last_action = Some(action);
@@ -193,7 +217,11 @@ impl RlThresholdAgent {
     }
 
     pub fn persist(&self) {
-        let flattened: Vec<f64> = self.q_table.iter().flat_map(|row| row.iter().copied()).collect();
+        let flattened: Vec<f64> = self
+            .q_table
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect();
         let persisted = RlPersisted {
             q_table: flattened,
             current_adjustment: self.current_adjustment,
@@ -213,8 +241,11 @@ mod tests {
     fn make_agent() -> RlThresholdAgent {
         RlThresholdAgent {
             q_table: [[0.0; NUM_ACTIONS]; NUM_STATES],
-            last_state: None, last_action: None,
-            current_adjustment: 0.0, total_ticks: 0, total_overflows: 0,
+            last_state: None,
+            last_action: None,
+            current_adjustment: 0.0,
+            total_ticks: 0,
+            total_overflows: 0,
             path: PathBuf::from("/dev/null"),
         }
     }
@@ -225,9 +256,18 @@ mod tests {
         for pb in 0..3u8 {
             for cb in 0..3u8 {
                 for oh in 0..4u8 {
-                    let state = RlState { pressure_band: pb, compressor_band: cb, overflow_last_hour: oh };
+                    let state = RlState {
+                        pressure_band: pb,
+                        compressor_band: cb,
+                        overflow_last_hour: oh,
+                    };
                     let idx = state.index();
-                    assert!(idx < NUM_STATES, "index {} out of range for {:?}", idx, state);
+                    assert!(
+                        idx < NUM_STATES,
+                        "index {} out of range for {:?}",
+                        idx,
+                        state
+                    );
                     seen.insert(idx);
                 }
             }
@@ -239,7 +279,9 @@ mod tests {
     fn test_initial_q_values_zero() {
         let agent = make_agent();
         for row in &agent.q_table {
-            for &val in row { assert_eq!(val, 0.0); }
+            for &val in row {
+                assert_eq!(val, 0.0);
+            }
         }
     }
 
@@ -254,27 +296,42 @@ mod tests {
         let state2 = RlState::from_metrics(0.90, 0.70, 1);
         agent.tick(state2, true);
         let new_q = agent.q_table[prev_state.index()][prev_action as usize];
-        assert!(new_q < prev_q, "overflow must decrease Q: prev={} new={}", prev_q, new_q);
+        assert!(
+            new_q < prev_q,
+            "overflow must decrease Q: prev={} new={}",
+            prev_q,
+            new_q
+        );
     }
 
     #[test]
     fn test_stable_rewards_action() {
         let mut agent = make_agent();
         let state = RlState::from_metrics(0.30, 0.10, 0);
-        for _ in 0..50 { agent.tick(state, false); }
+        for _ in 0..50 {
+            agent.tick(state, false);
+        }
         let row = &agent.q_table[state.index()];
         let max_q = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        assert!(max_q > 0.0, "after many stable ticks, best Q should be positive: {}", max_q);
+        assert!(
+            max_q > 0.0,
+            "after many stable ticks, best Q should be positive: {}",
+            max_q
+        );
     }
 
     #[test]
     fn test_adjustment_clamped() {
         let mut agent = make_agent();
         let state = RlState::from_metrics(0.90, 0.80, 3);
-        for _ in 0..100 { agent.tick(state, true); }
+        for _ in 0..100 {
+            agent.tick(state, true);
+        }
         assert!(agent.current_adjustment >= ADJUSTMENT_FLOOR);
         let calm = RlState::from_metrics(0.10, 0.05, 0);
-        for _ in 0..200 { agent.tick(calm, false); }
+        for _ in 0..200 {
+            agent.tick(calm, false);
+        }
         assert!(agent.current_adjustment <= ADJUSTMENT_CEIL);
     }
 
@@ -283,7 +340,9 @@ mod tests {
         let mut agent = make_agent();
         assert_eq!(agent.epsilon(), EPSILON_INITIAL);
         let state = RlState::from_metrics(0.50, 0.30, 0);
-        for _ in 0..EPSILON_DECAY_TICKS { agent.tick(state, false); }
+        for _ in 0..EPSILON_DECAY_TICKS {
+            agent.tick(state, false);
+        }
         assert_eq!(agent.epsilon(), EPSILON_STABLE);
     }
 
@@ -293,7 +352,8 @@ mod tests {
         agent.current_adjustment = ADJUSTMENT_FLOOR;
         let effective = (0.78 + agent.current_adjustment).max(RL_ABSOLUTE_FLOOR);
         assert!(effective >= RL_ABSOLUTE_FLOOR);
-        let effective2 = (0.78 + (-0.20) + (-0.08) + agent.current_adjustment).max(RL_ABSOLUTE_FLOOR);
+        let effective2 =
+            (0.78 + (-0.20) + (-0.08) + agent.current_adjustment).max(RL_ABSOLUTE_FLOOR);
         assert!(effective2 >= RL_ABSOLUTE_FLOOR);
     }
 
@@ -315,12 +375,20 @@ mod tests {
     fn test_persistence_roundtrip() {
         let mut agent = make_agent();
         let state = RlState::from_metrics(0.60, 0.40, 1);
-        for _ in 0..10 { agent.tick(state, false); }
+        for _ in 0..10 {
+            agent.tick(state, false);
+        }
         agent.tick(state, true);
-        let flattened: Vec<f64> = agent.q_table.iter().flat_map(|row| row.iter().copied()).collect();
+        let flattened: Vec<f64> = agent
+            .q_table
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect();
         let persisted = RlPersisted {
-            q_table: flattened, current_adjustment: agent.current_adjustment,
-            total_ticks: agent.total_ticks, total_overflows: agent.total_overflows,
+            q_table: flattened,
+            current_adjustment: agent.current_adjustment,
+            total_ticks: agent.total_ticks,
+            total_overflows: agent.total_overflows,
         };
         let json = serde_json::to_string(&persisted).unwrap();
         let loaded: RlPersisted = serde_json::from_str(&json).unwrap();

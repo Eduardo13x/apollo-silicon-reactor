@@ -211,9 +211,10 @@ pub fn execute_actions(
                         // Phase 2: direct Mach syscalls for CPU tier routing.
                         if let Some(ref mut mgr) = qos_mgr {
                             let sched_tier = if aggressive {
-                                crate::engine::mach_qos::SchedulingTier::Background // E-cores only
+                                crate::engine::mach_qos::SchedulingTier::Background
+                            // E-cores only
                             } else {
-                                crate::engine::mach_qos::SchedulingTier::Normal     // scheduler decides, less invasive than E-cores-only
+                                crate::engine::mach_qos::SchedulingTier::Normal // scheduler decides, less invasive than E-cores-only
                             };
                             mgr.set_tier(*pid, sched_tier);
                             let lat = if aggressive {

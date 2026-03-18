@@ -453,9 +453,7 @@ fn never_promote_interactive() -> Vec<&'static str> {
 /// This is analogous to Linux CFS's interactivity estimator: processes that
 /// spend most of their time sleeping (low CPU/wall ratio) are interactive.
 pub fn is_behavior_interactive(entry: &UsageEntry) -> bool {
-    entry.cpu_wall_ratio_ema < 0.05
-        && entry.presence_ema >= 0.15
-        && entry.seen_count_total >= 10
+    entry.cpu_wall_ratio_ema < 0.05 && entry.presence_ema >= 0.15 && entry.seen_count_total >= 10
 }
 
 pub fn usage_model_path_root(is_root: bool) -> PathBuf {
