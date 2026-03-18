@@ -2816,6 +2816,16 @@ fn main() -> anyhow::Result<()> {
             {
                 signal_intel.restore(si_persisted);
             }
+            // Telemetry logger: ring-buffer data collector for Transformer training.
+            // Zerveas et al. 2021 — periodic + event-triggered dumps for self-supervised
+            // pre-training of time-series anomaly detection models.
+            let telemetry_dir = if unsafe { libc::geteuid() } == 0 {
+                std::path::PathBuf::from("/var/lib/apollo/telemetry")
+            } else {
+                std::path::PathBuf::from("/tmp/apollo-telemetry")
+            };
+            let mut telemetry_logger =
+                apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(telemetry_dir);
             // Audit fix #6: Multi-phase thermal bail-out with hysteresis.
             let mut thermal_bailout = ThermalBailout::new();
             // Freeze confirmation cache: pid → consecutive cycles flagged.
@@ -3866,7 +3876,7 @@ fn main() -> anyhow::Result<()> {
                 // Perceptual latency monitor: composite score from existing signals.
                 // If UI responsiveness is degraded, boost reactor_weight to trigger
                 // faster/more aggressive scheduling decisions.
-                {
+                let latency_score_val = {
                     let fg_cpu = foreground_pid
                         .and_then(|pid| {
                             proc_snaps.iter().find(|s| s.pid == pid).map(|s| s.cpu_percent as f64)
@@ -3895,6 +3905,50 @@ fn main() -> anyhow::Result<()> {
                         // Elevate reactor weight → faster tick + more aggressive decisions.
                         *reactor_weight = (*reactor_weight + 0.25).min(1.0);
                     }
+                    latency.score
+                };
+
+                // ── Telemetry logger: record feature vector for Transformer training ──
+                // Zerveas et al. 2021 — self-supervised pre-training requires both
+                // periodic samples (normal regime) and event-triggered dumps (anomalies).
+                {
+                    use apollo_optimizer::engine::telemetry_logger::{
+                        TelemetryVector, thermal_str_to_score,
+                    };
+                    let total_used: u64 =
+                        snapshot.top_processes.iter().map(|p| p.memory_usage).sum();
+                    let dom_share = if total_used > 0 {
+                        snapshot
+                            .top_processes
+                            .iter()
+                            .map(|p| p.memory_usage)
+                            .max()
+                            .unwrap_or(0) as f32
+                            / total_used as f32
+                    } else {
+                        0.0
+                    };
+                    let tvec = TelemetryVector {
+                        pressure_smooth: signal_digest.pressure_smooth as f32,
+                        pressure_velocity: signal_digest.pressure_velocity as f32,
+                        pressure_predicted_5s: signal_digest.pressure_predicted_5s as f32,
+                        swap_velocity_smooth: signal_digest.swap_velocity_smooth as f32,
+                        pressure_integral: signal_digest.pressure_integral as f32,
+                        cusum_score: signal_digest.cusum_score as f32,
+                        entropy_anomaly: signal_digest.entropy_anomaly as f32,
+                        p_oom_30s: signal_digest.p_oom_30s as f32,
+                        monopoly_risk: signal_digest.monopoly_risk as f32,
+                        urgency: signal_digest.urgency as f32,
+                        cpu_total: snapshot.cpu.global_usage / 100.0,
+                        compressor_ratio: snapshot.pressure.compressor_pressure as f32,
+                        dominant_share: dom_share,
+                        latency_score: latency_score_val as f32,
+                        active_proc_count: (snapshot.top_processes.len() as f32 / 200.0).min(1.0),
+                        thermal_score: thermal_str_to_score(
+                            snapshot.pressure.thermal_level.as_str(),
+                        ),
+                    };
+                    telemetry_logger.record(tvec);
                 }
 
                 let decision = {
@@ -4675,6 +4729,14 @@ fn main() -> anyhow::Result<()> {
                 if cycle_count % 100 == 0 {
                     signal_intel
                         .persist(std::path::Path::new(signal_intelligence_path()));
+                }
+                // Prune old telemetry files once per hour (7200 cycles × 500ms).
+                // Keep 30 days of data for Transformer training datasets.
+                if cycle_count % 7200 == 1 {
+                    let _ = apollo_optimizer::engine::telemetry_logger::prune_old_files(
+                        telemetry_logger.output_dir(),
+                        30,
+                    );
                 }
                 // Update predictive agent + signal intelligence metrics for status reporting.
                 {

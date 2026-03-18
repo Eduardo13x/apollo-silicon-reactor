@@ -47,6 +47,7 @@ pub mod signal_intelligence;
 pub mod silicon_probe;
 pub mod smc_reader;
 pub mod swap_predictor;
+pub mod telemetry_logger;
 pub mod sysctl_governor;
 pub mod thermal_bailout;
 pub mod thermal_interrupt;
