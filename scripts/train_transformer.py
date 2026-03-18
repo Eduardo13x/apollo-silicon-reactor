@@ -80,9 +80,9 @@ FEATURE_NAMES = [
 #   5000 dumps × 240 vectors = 1.2M vectors → 1.2M sequences (10x rule met)
 
 # Periodic dumps = 6/hour × 24h = 144/day.  Plus event dumps.
-MATURITY_IMMATURE_FILES = 700       # ~5 days — not enough diversity
-MATURITY_JUVENILE_FILES = 2000      # ~14 days — train with caution
-MATURITY_STABLE_FILES   = 4000      # ~28 days — reliable training
+MATURITY_IMMATURE_FILES = 400       # ~3 days of active use
+MATURITY_JUVENILE_FILES = 1000      # ~7 days of active use — train with caution
+MATURITY_STABLE_FILES   = 2500      # ~18 days of active use — reliable training
 MATURITY_SKIP_NEW_PCT   = 0.20      # mature: skip if < 20% new data
 
 
@@ -171,14 +171,17 @@ def assess_data_quality(data: np.ndarray, metas: list[dict]) -> dict:
     """
     n_files = len(metas)
 
-    # 1. Temporal coverage: how many distinct hours of the day are represented?
+    # 1. Temporal coverage: how many distinct hours have data?
+    # We don't require 24h coverage — the user may only use the Mac
+    # a few hours per day.  We just need ≥4 distinct hours to have
+    # some variety in system state.
     hours_seen = set()
     for m in metas:
         ts = m.get("timestamp", 0)
         if ts > 0:
             hour = (ts // 3600) % 24
             hours_seen.add(hour)
-    hour_coverage = len(hours_seen) / 24.0  # 0-1
+    hours_covered = len(hours_seen)
 
     # 2. Event diversity: ratio of event-triggered vs periodic dumps.
     n_events = sum(1 for m in metas if m.get("event_kind", 0) > 0)
@@ -199,11 +202,11 @@ def assess_data_quality(data: np.ndarray, metas: list[dict]) -> dict:
         span_days = 0.0
 
     # 5. Determine maturity level.
-    if n_files < MATURITY_IMMATURE_FILES or span_days < 5:
+    if n_files < MATURITY_IMMATURE_FILES or span_days < 3:
         maturity = "immature"
-    elif n_files < MATURITY_JUVENILE_FILES or span_days < 12:
+    elif n_files < MATURITY_JUVENILE_FILES or span_days < 7:
         maturity = "juvenile"
-    elif n_files < MATURITY_STABLE_FILES or span_days < 25:
+    elif n_files < MATURITY_STABLE_FILES or span_days < 14:
         maturity = "stable"
     else:
         maturity = "mature"
@@ -212,7 +215,7 @@ def assess_data_quality(data: np.ndarray, metas: list[dict]) -> dict:
         "n_files": n_files,
         "n_vectors": len(data),
         "span_days": round(span_days, 1),
-        "hour_coverage": round(hour_coverage, 2),
+        "hours_covered": hours_covered,
         "n_events": n_events,
         "n_periodic": n_periodic,
         "event_ratio": round(event_ratio, 3),
@@ -231,7 +234,7 @@ def print_quality_report(q: dict):
     print(f"  Files:            {q['n_files']:,}")
     print(f"  Vectors:          {q['n_vectors']:,}")
     print(f"  Span:             {q['span_days']} days")
-    print(f"  Hour coverage:    {q['hour_coverage']*100:.0f}% of 24h cycle")
+    print(f"  Hours covered:    {q['hours_covered']} distinct hours")
     print(f"  Event dumps:      {q['n_events']} ({q['event_ratio']*100:.1f}%)")
     print(f"  Periodic dumps:   {q['n_periodic']}")
     print(f"  Active features:  {q['active_features']}/{N_FEATURES}")
@@ -471,7 +474,7 @@ def main():
         # Gate 1: data maturity.
         if quality["maturity"] == "immature":
             print(f"[AUTO] Data immature ({quality['span_days']} days, "
-                  f"{quality['n_files']} files). Need ≥5 days + ≥{MATURITY_IMMATURE_FILES} files.")
+                  f"{quality['n_files']} files). Need ≥3 days + ≥{MATURITY_IMMATURE_FILES} files.")
             print(f"[AUTO] Keep collecting data. Will train automatically when ready.")
             sys.exit(0)
 
@@ -481,10 +484,10 @@ def main():
                   f"Data may be too uniform. Waiting for more varied workloads.")
             sys.exit(0)
 
-        # Gate 3: temporal coverage (need at least 12 hours of the daily cycle).
-        if quality["hour_coverage"] < 0.5:
-            print(f"[AUTO] Only {quality['hour_coverage']*100:.0f}% hour coverage. "
-                  f"Need at least 50% of daily cycle represented.")
+        # Gate 3: minimal temporal variety (at least 4 distinct hours seen).
+        if quality["hours_covered"] < 4:
+            print(f"[AUTO] Only {quality['hours_covered']} distinct hours seen. "
+                  f"Need at least 4 for minimal variety.")
             sys.exit(0)
 
         # Gate 4: system idle.
@@ -579,7 +582,7 @@ def main():
             "epochs_used": epochs,
             "best_val_loss": round(best_val_loss, 8),
             "span_days": quality["span_days"],
-            "hour_coverage": quality["hour_coverage"],
+            "hours_covered": quality["hours_covered"],
             "event_ratio": quality["event_ratio"],
         }) + "\n")
 
