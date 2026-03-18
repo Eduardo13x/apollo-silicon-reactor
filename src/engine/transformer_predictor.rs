@@ -4,18 +4,15 @@
 //! and runs inference each daemon cycle to detect anomalous system behaviour that
 //! Apollo's existing univariate models miss.
 //!
-//! ## Dual-mode operation
-//!
-//! - **Without `transformer` feature flag**: all methods are no-ops returning 0.0.
-//!   Zero runtime overhead, zero dependencies.  Apollo works exactly as before.
-//! - **With `transformer` feature flag**: loads ONNX model via `tract-onnx` and
-//!   runs real inference (~1-2ms per cycle on M1 ARM NEON).
+//! When no ONNX model file is present (e.g. before first training), all methods
+//! gracefully return 0.0 — Apollo works exactly as before.  Once the nightly
+//! retrain job produces a model, the daemon hot-reloads it automatically.
 //!
 //! ## Anomaly score
 //!
 //! The model predicts the next system state vector given the last 120 observations.
 //! The anomaly score is the normalised reconstruction error (MSE between predicted
-//! and actual state).  High score = system is behaving in a way the model hasn't
+//! and actual state).  High score = system behaving in a way the model hasn't
 //! seen during training = potential emerging problem.
 //!
 //! Score normalisation uses an EWMA of recent errors (Holt 1957) so the score
@@ -30,15 +27,14 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
+use tract_onnx::prelude::*;
+
 use crate::engine::telemetry_logger::{TelemetryVector, N_FEATURES};
 
 /// Transformer context window length (must match training seq_len).
 const SEQ_LEN: usize = 120;
 
 /// EWMA smoothing factor for error baseline (α=0.05 → slow adaptation).
-/// Lower values make the baseline more stable; higher values track recent
-/// behaviour more closely.  0.05 gives ~20-cycle half-life.
-#[allow(dead_code)] // Used only with `transformer` feature.
 const EWMA_ALPHA: f32 = 0.05;
 
 /// Feature normalisation statistics (mean and std per feature).
@@ -96,104 +92,90 @@ impl Default for FeatureStats {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// tract-onnx inference backend (only compiled with `transformer` feature)
+// tract-onnx inference backend
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "transformer")]
-mod backend {
-    use super::*;
-    use tract_onnx::prelude::*;
+/// Compiled ONNX model ready for inference.
+type RunModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
-    /// Compiled ONNX model ready for inference.
-    type RunModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+struct OnnxBackend {
+    model: RunModel,
+}
 
-    pub struct OnnxBackend {
-        model: RunModel,
+impl OnnxBackend {
+    fn load(model_path: &Path) -> Option<Self> {
+        let model = tract_onnx::onnx()
+            .model_for_path(model_path)
+            .ok()?
+            .with_input_fact(
+                0,
+                InferenceFact::dt_shape(
+                    f32::datum_type(),
+                    tvec![1, SEQ_LEN as i64, N_FEATURES as i64],
+                ),
+            )
+            .ok()?
+            .into_optimized()
+            .ok()?
+            .into_runnable()
+            .ok()?;
+        Some(OnnxBackend { model })
     }
 
-    impl OnnxBackend {
-        pub fn load(model_path: &Path) -> Option<Self> {
-            let model = tract_onnx::onnx()
-                .model_for_path(model_path)
-                .ok()?
-                .with_input_fact(
-                    0,
-                    InferenceFact::dt_shape(f32::datum_type(), tvec![1, SEQ_LEN as i64, N_FEATURES as i64]),
-                )
-                .ok()?
-                .into_optimized()
-                .ok()?
-                .into_runnable()
-                .ok()?;
-            Some(OnnxBackend { model })
-        }
+    /// Run inference on a normalised sequence [SEQ_LEN, N_FEATURES].
+    /// Returns predicted sequence [SEQ_LEN, N_FEATURES].
+    fn predict(&self, input: &[[f32; N_FEATURES]; SEQ_LEN]) -> Option<Vec<f32>> {
+        let flat: Vec<f32> = input.iter().flat_map(|row| row.iter().copied()).collect();
 
-        /// Run inference on a normalised sequence [SEQ_LEN, N_FEATURES].
-        /// Returns predicted sequence [SEQ_LEN, N_FEATURES].
-        pub fn predict(&self, input: &[[f32; N_FEATURES]; SEQ_LEN]) -> Option<Vec<f32>> {
-            // Flatten to contiguous f32 array.
-            let flat: Vec<f32> = input.iter().flat_map(|row| row.iter().copied()).collect();
+        let tensor =
+            tract_ndarray::Array3::from_shape_vec((1, SEQ_LEN, N_FEATURES), flat).ok()?;
 
-            let tensor = tract_ndarray::Array3::from_shape_vec(
-                (1, SEQ_LEN, N_FEATURES),
-                flat,
-            )
-            .ok()?;
-
-            let result = self.model.run(tvec!(tensor.into_tensor().into())).ok()?;
-            let output = result[0].to_array_view::<f32>().ok()?;
-            Some(output.iter().copied().collect())
-        }
+        let result = self.model.run(tvec!(tensor.into_tensor().into())).ok()?;
+        let output = result[0].to_array_view::<f32>().ok()?;
+        Some(output.iter().copied().collect())
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Public predictor (works with or without `transformer` feature)
+// Public predictor
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Transformer-based anomaly predictor.
 ///
-/// Without the `transformer` feature flag, this is a zero-cost no-op.
-/// With the flag and a valid ONNX model, it runs real inference each cycle.
+/// If no ONNX model is present, `score()` returns 0.0.  Once a model appears
+/// (via nightly retrain + hot-reload), inference activates automatically.
 pub struct TransformerPredictor {
     /// Ring buffer of normalised feature vectors (last SEQ_LEN observations).
     ring: VecDeque<[f32; N_FEATURES]>,
     /// Feature normalisation statistics.
     stats: FeatureStats,
     /// EWMA of reconstruction error (baseline for normalisation).
-    #[allow(dead_code)] // Used only with `transformer` feature.
     error_ewma: f32,
     /// Whether the predictor has a loaded model and is ready.
     ready: bool,
-    /// Compiled ONNX backend (only present with `transformer` feature + valid model).
-    #[cfg(feature = "transformer")]
-    backend: Option<backend::OnnxBackend>,
+    /// Compiled ONNX backend.
+    backend: Option<OnnxBackend>,
 }
 
 impl TransformerPredictor {
     /// Create a new predictor.  Attempts to load the ONNX model and feature stats.
     ///
     /// If either file is missing, the predictor operates in no-op mode
-    /// (returns 0.0 for all scores) until the files become available.
+    /// (returns 0.0 for all scores) until `reload()` succeeds.
     pub fn new(model_path: &Path, stats_path: &Path) -> Self {
         let stats = FeatureStats::load(stats_path).unwrap_or_default();
-
-        #[cfg(feature = "transformer")]
-        let backend = backend::OnnxBackend::load(model_path);
-        #[cfg(feature = "transformer")]
+        let backend = OnnxBackend::load(model_path);
         let ready = backend.is_some();
 
-        #[cfg(not(feature = "transformer"))]
-        let _ = model_path; // suppress unused warning
-        #[cfg(not(feature = "transformer"))]
-        let ready = false;
+        if ready {
+            eprintln!("[transformer] Model loaded from {}", model_path.display());
+        }
 
         TransformerPredictor {
             ring: VecDeque::with_capacity(SEQ_LEN),
             stats,
             error_ewma: 0.0,
             ready,
-            #[cfg(feature = "transformer")]
             backend,
         }
     }
@@ -201,7 +183,7 @@ impl TransformerPredictor {
     /// Record a new telemetry vector and return the anomaly score.
     ///
     /// Returns a value in `[0.0, 1.0]`:
-    /// - `0.0`: no anomaly (or predictor not ready / model not loaded)
+    /// - `0.0`: no anomaly (or model not loaded yet)
     /// - `> 0.5`: significant deviation from learned normal behaviour
     /// - `> 0.8`: severe anomaly — system behaving in unprecedented ways
     pub fn score(&mut self, vec: &TelemetryVector) -> f64 {
@@ -223,7 +205,6 @@ impl TransformerPredictor {
     }
 
     /// Run the actual model inference and compute anomaly score.
-    #[cfg(feature = "transformer")]
     fn run_inference(&mut self) -> f64 {
         let Some(ref backend) = self.backend else {
             return 0.0;
@@ -240,8 +221,6 @@ impl TransformerPredictor {
         };
 
         // Compute MSE between the last predicted step and the actual last observation.
-        // We compare the model's prediction for position SEQ_LEN-1 against what
-        // actually happened (the last vector in the ring buffer).
         let pred_offset = (SEQ_LEN - 1) * N_FEATURES;
         if output.len() < pred_offset + N_FEATURES {
             return 0.0;
@@ -268,12 +247,6 @@ impl TransformerPredictor {
         (ratio / 3.0).min(1.0) as f64
     }
 
-    /// No-op inference when the `transformer` feature is disabled.
-    #[cfg(not(feature = "transformer"))]
-    fn run_inference(&mut self) -> f64 {
-        0.0
-    }
-
     /// Whether the predictor has a loaded model ready for inference.
     pub fn is_ready(&self) -> bool {
         self.ready
@@ -286,25 +259,19 @@ impl TransformerPredictor {
 
     /// Try to hot-reload the model (e.g. after retraining).
     /// Returns true if the model was successfully loaded.
-    #[cfg(feature = "transformer")]
     pub fn reload(&mut self, model_path: &Path, stats_path: &Path) -> bool {
         if let Some(new_stats) = FeatureStats::load(stats_path) {
             self.stats = new_stats;
         }
-        if let Some(new_backend) = backend::OnnxBackend::load(model_path) {
+        if let Some(new_backend) = OnnxBackend::load(model_path) {
             self.backend = Some(new_backend);
             self.ready = true;
             self.error_ewma = 0.0; // Reset baseline for new model.
+            eprintln!("[transformer] Model hot-reloaded from {}", model_path.display());
             true
         } else {
             false
         }
-    }
-
-    /// No-op reload when the `transformer` feature is disabled.
-    #[cfg(not(feature = "transformer"))]
-    pub fn reload(&mut self, _model_path: &Path, _stats_path: &Path) -> bool {
-        false
     }
 }
 
@@ -339,7 +306,6 @@ mod tests {
         let stats_path = Path::new("/nonexistent/stats.json");
         let mut predictor = TransformerPredictor::new(model_path, stats_path);
 
-        // Fill buffer.
         for _ in 0..SEQ_LEN {
             let score = predictor.score(&make_vec(0.5));
             assert!((score - 0.0).abs() < 1e-6);
@@ -393,7 +359,6 @@ mod tests {
         };
         let raw = [0.6f32; N_FEATURES];
         let norm = stats.normalise(&raw);
-        // (0.6 - 0.5) / 0.1 = 1.0
         for v in &norm {
             assert!((*v - 1.0).abs() < 1e-5);
         }

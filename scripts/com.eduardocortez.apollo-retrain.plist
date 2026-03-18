@@ -10,14 +10,11 @@
         <string>/usr/local/bin/apollo-retrain.sh</string>
     </array>
 
-    <!-- Run nightly at 3:00 AM -->
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>3</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
+    <!-- Run every 6 hours (21600 seconds).
+         macOS queues missed intervals during sleep and fires on wake.
+         The script itself checks memory pressure before training. -->
+    <key>StartInterval</key>
+    <integer>21600</integer>
 
     <!-- Low priority: nice 15, throttle I/O -->
     <key>Nice</key>
@@ -26,18 +23,6 @@
     <true/>
     <key>LowPriorityBackgroundIO</key>
     <true/>
-
-    <!-- Resource limits: cap memory at 3GB to leave room for Apollo + OS -->
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>MemoryLock</key>
-        <integer>3221225472</integer>
-    </dict>
-    <key>HardResourceLimits</key>
-    <dict>
-        <key>MemoryLock</key>
-        <integer>3221225472</integer>
-    </dict>
 
     <!-- Timeout: kill if running more than 30 minutes -->
     <key>TimeOut</key>
