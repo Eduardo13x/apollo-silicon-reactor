@@ -3,6 +3,7 @@ pub mod adaptive_governor;
 pub mod analytics;
 pub mod background_collectors;
 pub mod capabilities;
+pub mod cache_warmer;
 pub mod compressor_aware;
 pub mod cusum;
 pub mod decide_actions;

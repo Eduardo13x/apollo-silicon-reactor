@@ -2826,6 +2826,9 @@ fn main() -> anyhow::Result<()> {
             };
             let mut telemetry_logger =
                 apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(telemetry_dir.clone());
+            // File cache warmer: pre-read predicted app executables into buffer cache.
+            // Cao et al. 1994 — app-controlled prefetch eliminates cold page faults.
+            let mut cache_warmer = apollo_optimizer::engine::cache_warmer::CacheWarmer::new();
             // Transformer predictor: ONNX inference for anomaly detection.
             // Without `transformer` feature flag, this is a zero-cost no-op.
             // With the flag + trained model, it runs real inference each cycle.
@@ -3070,6 +3073,10 @@ fn main() -> anyhow::Result<()> {
                                 pid,
                                 jetsam_control::priority::FOREGROUND,
                             );
+                            // File cache warming: pre-read the app's executable into
+                            // the buffer cache so code pages don't fault from SSD.
+                            // Cao et al. 1994 — app-controlled prefetch cuts I/O wait 50%.
+                            cache_warmer.warm_pid(pid);
                         }
                     }
                 }
@@ -4762,6 +4769,8 @@ fn main() -> anyhow::Result<()> {
                         telemetry_logger.output_dir(),
                         30,
                     );
+                    // GC stale entries from cache warmer.
+                    cache_warmer.gc();
                     // Hot-reload Transformer model if a new ONNX file appeared
                     // (e.g. after offline retraining).
                     if !transformer_predictor.is_ready() {
