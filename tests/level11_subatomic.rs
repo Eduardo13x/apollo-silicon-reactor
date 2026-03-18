@@ -293,7 +293,8 @@ fn proc_path_known_processes() {
 #[test]
 fn proc_adversarial_pids() {
     // These should all return None without panicking
-    assert!(proc_taskinfo::get_task_info(0).is_some() || true); // kernel_task, may need root
+    // kernel_task (PID 0): may fail without root — just verify no panic.
+    let _ = proc_taskinfo::get_task_info(0);
     assert!(proc_taskinfo::get_task_info(u32::MAX).is_none());
     assert!(proc_taskinfo::get_rusage_info(u32::MAX).is_none());
     assert!(proc_taskinfo::get_proc_path(u32::MAX).is_none());

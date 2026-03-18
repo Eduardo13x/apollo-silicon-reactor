@@ -35,6 +35,7 @@ pub mod network_monitor;
 pub mod network_optimizer;
 pub mod outcome_tracker;
 pub mod overflow_guard;
+pub mod page_reclaim;
 pub mod power_management;
 pub mod predictive_agent;
 pub mod process_classifier;
