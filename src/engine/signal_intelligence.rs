@@ -72,6 +72,12 @@ pub struct SignalDigest {
     // ── Meta ─────────────────────────────────────────────────────────────
     /// Score compuesto de urgencia (0–1). Combina todas las señales.
     pub urgency: f64,
+
+    // ── Transformer ────────────────────────────────────────────────────
+    /// Anomaly score from Time-Series Transformer (0–1).
+    /// 0.0 = normal (or model not loaded). > 0.5 = significant deviation.
+    /// Set by the daemon after calling TransformerPredictor::score().
+    pub transformer_anomaly: f64,
 }
 
 /// Orquestador de señales. Inicializar una vez en el daemon, llamar tick() cada ciclo.
@@ -246,6 +252,7 @@ impl SignalIntelligence {
             monopoly_risk,
             mpc_recommendation,
             urgency,
+            transformer_anomaly: 0.0, // Set by daemon after TransformerPredictor::score()
         }
     }
 
@@ -421,6 +428,7 @@ mod tests {
             monopoly_risk: 0.0,
             mpc_recommendation: 0,
             urgency: 0.0,
+            transformer_anomaly: 0.0,
         };
         for _ in 0..20 {
             digest = tick_nominal(&mut si);

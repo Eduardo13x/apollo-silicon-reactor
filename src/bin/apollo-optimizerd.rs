@@ -2825,7 +2825,21 @@ fn main() -> anyhow::Result<()> {
                 std::path::PathBuf::from("/tmp/apollo-telemetry")
             };
             let mut telemetry_logger =
-                apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(telemetry_dir);
+                apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(telemetry_dir.clone());
+            // Transformer predictor: ONNX inference for anomaly detection.
+            // Without `transformer` feature flag, this is a zero-cost no-op.
+            // With the flag + trained model, it runs real inference each cycle.
+            let transformer_model_path = telemetry_dir.parent()
+                .unwrap_or(std::path::Path::new("/var/lib/apollo"))
+                .join("apollo_transformer.onnx");
+            let transformer_stats_path = telemetry_dir.parent()
+                .unwrap_or(std::path::Path::new("/var/lib/apollo"))
+                .join("feature_stats.json");
+            let mut transformer_predictor =
+                apollo_optimizer::engine::transformer_predictor::TransformerPredictor::new(
+                    &transformer_model_path,
+                    &transformer_stats_path,
+                );
             // Audit fix #6: Multi-phase thermal bail-out with hysteresis.
             let mut thermal_bailout = ThermalBailout::new();
             // Freeze confirmation cache: pid → consecutive cycles flagged.
@@ -3678,7 +3692,7 @@ fn main() -> anyhow::Result<()> {
                 let mut overflow_thresholds = overflow_guard.thresholds(workload_mode);
 
                 // Signal intelligence: Kalman + CUSUM + Entropy + Hazard + LV + MPC.
-                let signal_digest = {
+                let mut signal_digest = {
                     let cpu_vals: Vec<f64> = snapshot
                         .top_processes
                         .iter()
@@ -3949,6 +3963,17 @@ fn main() -> anyhow::Result<()> {
                         ),
                     };
                     telemetry_logger.record(tvec);
+
+                    // Transformer anomaly detection: feed the same vector to the predictor.
+                    // Without `transformer` feature or without a trained model, returns 0.0.
+                    let t_anomaly = transformer_predictor.score(&tvec);
+                    signal_digest.transformer_anomaly = t_anomaly;
+
+                    // If the Transformer detects a significant anomaly, boost urgency.
+                    // Tuli et al. 2022 — reconstruction-error-based anomaly boosting.
+                    if t_anomaly > 0.5 {
+                        *reactor_weight = (*reactor_weight + 0.2).min(1.0);
+                    }
                 }
 
                 let decision = {
@@ -4737,6 +4762,14 @@ fn main() -> anyhow::Result<()> {
                         telemetry_logger.output_dir(),
                         30,
                     );
+                    // Hot-reload Transformer model if a new ONNX file appeared
+                    // (e.g. after offline retraining).
+                    if !transformer_predictor.is_ready() {
+                        transformer_predictor.reload(
+                            &transformer_model_path,
+                            &transformer_stats_path,
+                        );
+                    }
                 }
                 // Update predictive agent + signal intelligence metrics for status reporting.
                 {

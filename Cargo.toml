@@ -14,6 +14,11 @@ libc = "0.2"
 ctrlc = { version = "3.4", features = ["termination"] }
 toml = "0.8"
 ureq = { version = "2.12", features = ["json"] }
+tract-onnx = { version = "0.21", optional = true }
+
+[features]
+default = []
+transformer = ["tract-onnx"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = "0.14"
