@@ -74,9 +74,7 @@ pub struct SignalDigest {
     pub urgency: f64,
 
     // ── Transformer ────────────────────────────────────────────────────
-    /// Anomaly score from Time-Series Transformer (0–1).
-    /// 0.0 = normal (or model not loaded). > 0.5 = significant deviation.
-    /// Set by the daemon after calling TransformerPredictor::score().
+    /// Reserved for future Transformer integration. Always 0.0 (Transformer disabled).
     pub transformer_anomaly: f64,
 }
 
@@ -252,7 +250,7 @@ impl SignalIntelligence {
             monopoly_risk,
             mpc_recommendation,
             urgency,
-            transformer_anomaly: 0.0, // Set by daemon after TransformerPredictor::score()
+            transformer_anomaly: 0.0,
         }
     }
 

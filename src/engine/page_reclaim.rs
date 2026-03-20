@@ -84,19 +84,21 @@ fn inactive_page_bytes() -> u64 {
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Parse: "Pages inactive:          123456."
+    // Sum "Pages inactive:" + "Pages speculative:" — both are reclaimable.
+    // Must accumulate, not return early on first match.
+    let mut total_pages: u64 = 0;
     for line in stdout.lines() {
         if line.starts_with("Pages inactive:") || line.starts_with("Pages speculative:") {
             if let Some(num_str) = line.split(':').nth(1) {
                 let cleaned = num_str.trim().trim_end_matches('.');
                 if let Ok(pages) = cleaned.parse::<u64>() {
-                    // macOS page size is always 16384 on ARM64.
-                    return pages * 16384;
+                    total_pages = total_pages.saturating_add(pages);
                 }
             }
         }
     }
-    0
+    // macOS page size is always 16384 on ARM64.
+    total_pages * 16384
 }
 
 // ── Adaptive Reclaim Controller ─────────────────────────────────────────────

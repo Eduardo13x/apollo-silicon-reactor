@@ -3204,12 +3204,17 @@ fn main() -> anyhow::Result<()> {
                 // Shin et al. 2012 — temporal patterns predict app launches with ~80% accuracy.
                 // On foreground change, record observation + get temporal prediction for
                 // proactive pre-warming of apps the user habitually opens at this hour.
+                // Observe only on app transition (not every cycle) to avoid count inflation
+                // and excess disk writes. last_fg_name is updated at end of ctx-switch block.
                 if let Some(ref fg_name) = foreground_app {
                     let now_chrono = Utc::now();
                     let hour = now_chrono.hour() as u8;
                     let weekday =
                         chrono::Datelike::weekday(&now_chrono).num_days_from_monday() as u8;
-                    temporal_predictor.observe(fg_name, hour, weekday);
+                    let fg_changed = last_fg_name.as_deref() != Some(fg_name.as_str());
+                    if fg_changed {
+                        temporal_predictor.observe(fg_name, hour, weekday);
+                    }
 
                     // Build Markov probability map for blending with temporal model.
                     let markov_probs: std::collections::HashMap<String, f64> = focus_markov
@@ -3663,6 +3668,9 @@ fn main() -> anyhow::Result<()> {
                                     write_frozen_state(&frozen_state_path, &frozen_state);
                                     state.metrics.lock_recover().unfreezes_applied += 1;
                                 }
+                                // Also clean up display turbo's set — prevents unbounded
+                                // growth if many processes die while frozen during turbo.
+                                display_turbo.remove_pid(pid);
                             }
                             kqueue_pressure::PressureEvent::TimerTick => {}
                         }
