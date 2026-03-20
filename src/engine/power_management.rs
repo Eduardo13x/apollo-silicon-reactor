@@ -5,7 +5,7 @@
 //! (see mach_qos.rs). This module is advisory: it reports real state and recommends
 //! power profiles, but does NOT directly control CPU frequency.
 
-use std::process::Command;
+use crate::engine::sysctl_direct;
 
 // ── Power Mode ──────────────────────────────────────────────────────────────
 
@@ -101,17 +101,8 @@ pub fn detect_power_state() -> PowerState {
     }
 }
 
-/// Read a sysctl value as u64 via `sysctl -n <key>`.
 fn read_sysctl_u64(key: &str) -> Option<u64> {
-    let output = Command::new("/usr/sbin/sysctl")
-        .args(["-n", key])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.trim().parse::<u64>().ok()
+    sysctl_direct::read_u64(key)
 }
 
 impl PowerManager {
@@ -343,34 +334,202 @@ impl PowerManager {
     }
 }
 
-/// Detect real battery status from the system.
-/// Uses `pmset -g batt` as the data source.
-/// Returns `None` if battery info cannot be determined (e.g., desktop Mac, pmset unavailable).
-///
-/// Example output from `pmset -g batt`:
-/// ```text
-/// Now drawing from 'Battery Power'
-///  -InternalBattery-0 (id=xxx)    72%; discharging; 3:42 remaining present: true
-/// ```
-/// or:
-/// ```text
-/// Now drawing from 'AC Power'
-///  -InternalBattery-0 (id=xxx)    100%; charged; 0:00 remaining present: true
-/// ```
+/// Detect real battery status from the system using IOKit power source APIs.
+/// Returns `None` if battery info cannot be determined (e.g., desktop Mac).
 pub fn detect_battery_status() -> Option<BatteryStatus> {
-    let output = Command::new("/usr/bin/pmset")
-        .args(["-g", "batt"])
-        .output()
-        .ok()?;
+    #[cfg(not(target_os = "macos"))]
+    { return None; }
 
-    if !output.status.success() {
-        return None;
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn IOPSCopyPowerSourcesInfo() -> *const std::ffi::c_void;
+            fn IOPSCopyPowerSourcesList(blob: *const std::ffi::c_void) -> *const std::ffi::c_void;
+            fn IOPSGetPowerSourceDescription(
+                blob: *const std::ffi::c_void,
+                ps: *const std::ffi::c_void,
+            ) -> *const std::ffi::c_void;
+            fn CFArrayGetCount(array: *const std::ffi::c_void) -> i64;
+            fn CFArrayGetValueAtIndex(
+                array: *const std::ffi::c_void,
+                idx: i64,
+            ) -> *const std::ffi::c_void;
+            fn CFDictionaryGetValue(
+                dict: *const std::ffi::c_void,
+                key: *const std::ffi::c_void,
+            ) -> *const std::ffi::c_void;
+            fn CFStringCreateWithCString(
+                alloc: *const std::ffi::c_void,
+                cstr: *const i8,
+                encoding: u32,
+            ) -> *const std::ffi::c_void;
+            fn CFGetTypeID(cf: *const std::ffi::c_void) -> u64;
+            fn CFNumberGetTypeID() -> u64;
+            fn CFNumberGetValue(
+                number: *const std::ffi::c_void,
+                the_type: i64,
+                value_ptr: *mut std::ffi::c_void,
+            ) -> bool;
+            fn CFStringGetTypeID() -> u64;
+            fn CFStringGetCString(
+                the_string: *const std::ffi::c_void,
+                buffer: *mut i8,
+                buffer_size: i64,
+                encoding: u32,
+            ) -> bool;
+            fn CFBooleanGetTypeID() -> u64;
+            fn CFBooleanGetValue(boolean: *const std::ffi::c_void) -> bool;
+            fn CFRelease(cf: *const std::ffi::c_void);
+        }
+
+        const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+        const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
+
+        unsafe {
+            let blob = IOPSCopyPowerSourcesInfo();
+            if blob.is_null() {
+                return None;
+            }
+
+            let sources = IOPSCopyPowerSourcesList(blob);
+            if sources.is_null() {
+                CFRelease(blob);
+                return None;
+            }
+
+            let count = CFArrayGetCount(sources);
+            if count <= 0 {
+                CFRelease(sources);
+                CFRelease(blob);
+                return None;
+            }
+
+            // Use first power source (InternalBattery).
+            let ps = CFArrayGetValueAtIndex(sources, 0);
+            let desc = IOPSGetPowerSourceDescription(blob, ps);
+            if desc.is_null() {
+                CFRelease(sources);
+                CFRelease(blob);
+                return None;
+            }
+
+            let get_int = |key_name: &[u8]| -> Option<i32> {
+                let cf_key = CFStringCreateWithCString(
+                    std::ptr::null(),
+                    key_name.as_ptr() as *const i8,
+                    K_CF_STRING_ENCODING_UTF8,
+                );
+                if cf_key.is_null() {
+                    return None;
+                }
+                let val = CFDictionaryGetValue(desc, cf_key);
+                CFRelease(cf_key);
+                if val.is_null() || CFGetTypeID(val) != CFNumberGetTypeID() {
+                    return None;
+                }
+                let mut n: i32 = 0;
+                if CFNumberGetValue(val, K_CF_NUMBER_SINT32_TYPE, &mut n as *mut _ as *mut _) {
+                    Some(n)
+                } else {
+                    None
+                }
+            };
+
+            let get_bool = |key_name: &[u8]| -> Option<bool> {
+                let cf_key = CFStringCreateWithCString(
+                    std::ptr::null(),
+                    key_name.as_ptr() as *const i8,
+                    K_CF_STRING_ENCODING_UTF8,
+                );
+                if cf_key.is_null() {
+                    return None;
+                }
+                let val = CFDictionaryGetValue(desc, cf_key);
+                CFRelease(cf_key);
+                if val.is_null() || CFGetTypeID(val) != CFBooleanGetTypeID() {
+                    return None;
+                }
+                Some(CFBooleanGetValue(val))
+            };
+
+            let get_string = |key_name: &[u8]| -> Option<String> {
+                let cf_key = CFStringCreateWithCString(
+                    std::ptr::null(),
+                    key_name.as_ptr() as *const i8,
+                    K_CF_STRING_ENCODING_UTF8,
+                );
+                if cf_key.is_null() {
+                    return None;
+                }
+                let val = CFDictionaryGetValue(desc, cf_key);
+                CFRelease(cf_key);
+                if val.is_null() || CFGetTypeID(val) != CFStringGetTypeID() {
+                    return None;
+                }
+                let mut buf = [0i8; 128];
+                if CFStringGetCString(val, buf.as_mut_ptr(), 128, K_CF_STRING_ENCODING_UTF8) {
+                    let s = std::ffi::CStr::from_ptr(buf.as_ptr())
+                        .to_string_lossy()
+                        .to_string();
+                    Some(s)
+                } else {
+                    None
+                }
+            };
+
+            let current_capacity = get_int(b"Current Capacity\0").unwrap_or(0);
+            let max_capacity = get_int(b"Max Capacity\0").unwrap_or(100);
+            let percentage = if max_capacity > 0 {
+                ((current_capacity as f64 / max_capacity as f64) * 100.0) as u32
+            } else {
+                0
+            };
+
+            let is_charging = get_bool(b"Is Charging\0").unwrap_or(false);
+            let time_to_empty = get_int(b"Time to Empty\0").unwrap_or(-1);
+            let time_to_full = get_int(b"Time to Full Charge\0").unwrap_or(-1);
+
+            let power_source_state = get_string(b"Power Source State\0").unwrap_or_default();
+            let on_ac = power_source_state.contains("AC") || is_charging;
+
+            let time_remaining_minutes = if is_charging {
+                if time_to_full > 0 { time_to_full as u32 } else { 0 }
+            } else if time_to_empty > 0 {
+                time_to_empty as u32
+            } else {
+                0
+            };
+
+            let (charge_rate, discharge_rate) = if time_remaining_minutes > 0 {
+                if is_charging {
+                    let remaining_to_full = 100u32.saturating_sub(percentage);
+                    let rate = (remaining_to_full as f32 / time_remaining_minutes as f32) * 60.0;
+                    (rate, 0.0)
+                } else {
+                    let rate = (percentage as f32 / time_remaining_minutes as f32) * 60.0;
+                    (0.0, rate)
+                }
+            } else if on_ac {
+                (20.0, 0.0)
+            } else {
+                (0.0, 10.0)
+            };
+
+            CFRelease(sources);
+            CFRelease(blob);
+
+            Some(BatteryStatus {
+                percentage,
+                time_remaining_minutes,
+                is_charging: on_ac,
+                charge_rate_percent_per_hour: charge_rate,
+                discharge_rate_percent_per_hour: discharge_rate,
+            })
+        }
     }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_pmset_battery(&text)
 }
 
+#[cfg(test)]
 /// Parse the text output of `pmset -g batt` into a `BatteryStatus`.
 /// Returns `None` if no internal battery is found (desktop Mac) or output is unparseable.
 fn parse_pmset_battery(text: &str) -> Option<BatteryStatus> {
@@ -438,6 +597,7 @@ fn parse_pmset_battery(text: &str) -> Option<BatteryStatus> {
     })
 }
 
+#[cfg(test)]
 /// Parse "H:MM remaining" from a pmset battery line.
 /// Returns total minutes, or None if no time estimate is available.
 fn parse_time_remaining(line: &str) -> Option<u32> {

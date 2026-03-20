@@ -1,36 +1,28 @@
-use std::process::Command;
-
 use crate::engine::types::CapabilityReport;
-
-fn can_run_with_exit_codes(program: &str, args: &[&str], ok: &[i32]) -> bool {
-    Command::new(program).args(args).output().is_ok_and(|out| {
-        if out.status.success() {
-            return true;
-        }
-        out.status.code().is_some_and(|c| ok.contains(&c))
-    })
-}
 
 pub fn detect_capabilities() -> CapabilityReport {
     let mut unavailable = Vec::new();
 
-    // On macOS `taskpolicy -h` returns EX_USAGE (64) on some builds.
-    let can_taskpolicy = can_run_with_exit_codes("taskpolicy", &["-h"], &[64]);
+    // taskpolicy: check if setpriority works (always available on macOS).
+    let can_taskpolicy = cfg!(target_os = "macos");
     if !can_taskpolicy {
         unavailable.push("taskpolicy".to_string());
     }
 
-    let can_sysctl = can_run_with_exit_codes("sysctl", &["-n", "kern.ostype"], &[]);
+    // sysctl: probe via direct sysctlbyname.
+    let can_sysctl = crate::engine::sysctl_direct::exists("kern.ostype");
     if !can_sysctl {
         unavailable.push("sysctl".to_string());
     }
 
-    let can_mdutil = can_run_with_exit_codes("mdutil", &["-s", "/"], &[]);
+    // mdutil: check if binary exists (Spotlight control).
+    let can_mdutil = std::path::Path::new("/usr/bin/mdutil").exists();
     if !can_mdutil {
         unavailable.push("mdutil".to_string());
     }
 
-    let can_tmutil = can_run_with_exit_codes("tmutil", &["listlocalsnapshots", "/"], &[]);
+    // tmutil: check if binary exists (Time Machine).
+    let can_tmutil = std::path::Path::new("/usr/bin/tmutil").exists();
     if !can_tmutil {
         unavailable.push("tmutil".to_string());
     }

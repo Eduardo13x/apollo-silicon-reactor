@@ -6,7 +6,7 @@
 //! governor.
 
 use std::collections::VecDeque;
-use std::process::Command;
+use crate::engine::sysctl_direct;
 use std::time::{Duration, Instant};
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -264,147 +264,62 @@ impl Default for NetworkMonitor {
 
 // ── netstat parser ───────────────────────────────────────────────────────────
 
-/// Parse `netstat -s -p tcp` on macOS into cumulative counters.
+/// Read TCP statistics directly from the kernel via `sysctlbyname("net.inet.tcp.stats")`.
 ///
-/// The output contains lines like:
-/// ```text
-///     12345 packets sent
-///     67890 data packets (12345678 bytes)
-///     100 data packets (50000 bytes) retransmitted
-///     54321 packets received
-///     5 connection resets received
-///     2 listen queue overflows
-///     99 connections established (including accepts)
-/// ```
-///
-/// We use simple `contains` + `split` matching -- no regex needed.
+/// This reads the XNU `tcpstat` struct (~600 bytes) in a single syscall (~1 us),
+/// replacing the previous `netstat -s -p tcp` subprocess which took ~30 ms.
 fn parse_netstat() -> RawTcpCounters {
     let mut counters = RawTcpCounters {
         timestamp: Instant::now(),
         ..Default::default()
     };
 
-    let output = match Command::new("/usr/sbin/netstat")
-        .args(["-s", "-p", "tcp"])
-        .output()
-    {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
+    // Read tcpstat struct via sysctl — same data as `netstat -s -p tcp` but ~1µs.
+    let mut buf = [0u8; 1024]; // tcpstat is ~600 bytes on macOS
+    let size = match sysctl_direct::read_raw("net.inet.tcp.stats", &mut buf) {
+        Some(s) if s >= 240 => s,
         _ => return counters,
     };
+    let _ = size; // we only need first 240 bytes
 
-    for line in output.lines() {
-        let trimmed = line.trim();
-
-        // Order matters: more specific patterns first to avoid false matches.
-
-        // "100 data packets (50000 bytes) retransmitted" or singular "1 data packet ..."
-        if trimmed.contains("retransmitted")
-            && (trimmed.contains("data packets") || trimmed.contains("data packet"))
-        {
-            if let Some(n) = first_number(trimmed) {
-                counters.retransmitted_packets = n;
-            }
-            continue;
+    let read_u32 = |offset: usize| -> u32 {
+        if offset + 4 <= buf.len() {
+            u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap_or([0; 4]))
+        } else {
+            0
         }
+    };
 
-        // "67890 data packets (12345678 bytes)" — sent data with byte count
-        // Must come after the retransmitted check.
-        // Handle singular "data packet" and "byte" forms from macOS netstat.
-        // The "byte"/"bytes" check prevents false matches with
-        // "data packet sent after flow control" which has no byte count.
-        if (trimmed.contains("data packets") || trimmed.contains("data packet"))
-            && (trimmed.contains("bytes") || trimmed.contains("byte"))
-            && !trimmed.contains("received")
-        {
-            if let Some(bytes) = extract_parenthesized_bytes(trimmed) {
-                counters.data_bytes_sent = bytes;
-            }
-            continue;
-        }
-
-        // "12345 packets sent" or "1 packet sent"
-        if (trimmed.contains("packets sent") || trimmed.contains("packet sent"))
-            && !trimmed.contains("data")
-        {
-            if let Some(n) = first_number(trimmed) {
-                counters.packets_sent = n;
-            }
-            continue;
-        }
-
-        // Data bytes received: "NNNNN data packets (MMMMM bytes)" under the received section.
-        // macOS netstat groups sent and received data; the received line often reads:
-        //   "12345 data packets (67890 bytes)"
-        // We need a secondary pass or rely on ordering.  For robustness we also
-        // check for "received in-sequence" or simply parse "packets received" for
-        // segment count.  Byte-level recv is handled below.
-        if trimmed.contains("received in-sequence")
-            && (trimmed.contains("bytes") || trimmed.contains("byte"))
-        {
-            if let Some(bytes) = extract_parenthesized_bytes(trimmed) {
-                counters.data_bytes_received = bytes;
-            }
-            continue;
-        }
-
-        // "54321 packets received" or "1 packet received"
-        if trimmed.contains("packets received") || trimmed.contains("packet received") {
-            if let Some(n) = first_number(trimmed) {
-                counters.packets_received = n;
-            }
-            continue;
-        }
-
-        // "5 connection resets received" or "5 resets" or "5 bad resets"
-        if trimmed.contains("connection reset")
-            || trimmed.contains("resets received")
-            || trimmed.contains("bad reset")
-        {
-            if let Some(n) = first_number(trimmed) {
-                counters.resets_received = n;
-            }
-            continue;
-        }
-
-        // "2 listen queue overflows"
-        if trimmed.contains("listen queue overflow") {
-            if let Some(n) = first_number(trimmed) {
-                counters.listen_queue_overflows = n;
-            }
-            continue;
-        }
-
-        // "99 connections established (including accepts)" or "1 connection established"
-        if trimmed.contains("connections established") || trimmed.contains("connection established")
-        {
-            if let Some(n) = first_number(trimmed) {
-                counters.connections_opened = n;
-            }
-            continue;
-        }
-    }
+    counters.packets_sent = read_u32(60) as u64;
+    counters.data_bytes_sent = read_u32(68) as u64;
+    counters.retransmitted_packets = read_u32(72) as u64;
+    counters.packets_received = read_u32(100) as u64;
+    counters.data_bytes_received = read_u32(108) as u64;
+    counters.resets_received = read_u32(16) as u64;
+    counters.listen_queue_overflows = read_u32(236) as u64;
+    counters.connections_opened = read_u32(8) as u64;
 
     counters
-}
-
-/// Extract the first decimal number from a string.
-fn first_number(s: &str) -> Option<u64> {
-    s.split_whitespace()
-        .find_map(|word| word.parse::<u64>().ok())
-}
-
-/// Extract the number inside parentheses from a pattern like "(12345 bytes)".
-/// Uses `"byte"` which matches both the singular "byte" and plural "bytes".
-fn extract_parenthesized_bytes(s: &str) -> Option<u64> {
-    let start = s.find('(')? + 1;
-    let end = s.find("byte")?;
-    let inner = s.get(start..end)?.trim();
-    inner.parse::<u64>().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Extract the first decimal number from a string.
+    fn first_number(s: &str) -> Option<u64> {
+        s.split_whitespace()
+            .find_map(|word| word.parse::<u64>().ok())
+    }
+
+    /// Extract the number inside parentheses from a pattern like "(12345 bytes)".
+    /// Uses `"byte"` which matches both the singular "byte" and plural "bytes".
+    fn extract_parenthesized_bytes(s: &str) -> Option<u64> {
+        let start = s.find('(')? + 1;
+        let end = s.find("byte")?;
+        let inner = s.get(start..end)?.trim();
+        inner.parse::<u64>().ok()
+    }
 
     #[test]
     fn parse_first_number() {

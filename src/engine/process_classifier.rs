@@ -142,6 +142,15 @@ pub struct ProcessSnapshot {
     /// Page-ins (major faults) — pages fetched from disk/swap/compressor.
     /// This is the expensive signal: high rate = process is thrashing.
     pub pageins_total: u32,
+    /// True if running under Rosetta 2 binary translation (x86_64→ARM64).
+    /// Rosetta processes incur ~10-30% JIT overhead — freezing them first
+    /// under pressure recovers more real throughput than native ARM64 processes.
+    #[allow(dead_code)]
+    pub is_translated: bool,
+    /// Number of Mach port rights held by this process.
+    /// >5000 indicates IPC flooding or port leak; 0 = not measured.
+    #[allow(dead_code)]
+    pub mach_port_count: u32,
 }
 
 /// Score a process's "user utility" on a 0.0–1.0 scale.

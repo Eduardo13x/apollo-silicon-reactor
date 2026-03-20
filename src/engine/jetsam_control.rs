@@ -153,6 +153,47 @@ pub fn get_memlimit(pid: u32) -> Result<MemorystatusMemlimitProperties, String> 
     }
 }
 
+/// Send a targeted memory pressure notification to a process without killing it.
+///
+/// Sets a **non-fatal** inactive memory limit (`memlimit_inactive_attr = 0`,
+/// no `MEMORYSTATUS_MEMLIMIT_ATTR_FATAL`).  When the process's RSS exceeds
+/// `warn_mb`, the kernel sends it a `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`
+/// notification — prompting it to release caches — but does NOT terminate it.
+///
+/// This is a surgical alternative to system-wide memory pressure:
+/// only the target process is poked, all others are unaffected.
+///
+/// Pass `warn_mb = 0` to clear the warn limit (restore unlimited).
+pub fn set_warn_limit(pid: u32, warn_mb: i32) -> Result<(), String> {
+    // Preserve the current active limit to avoid unintentionally changing it.
+    let current = get_memlimit(pid).unwrap_or_default();
+    let mut props = MemorystatusMemlimitProperties {
+        memlimit_active:      current.memlimit_active,
+        memlimit_active_attr: current.memlimit_active_attr,
+        memlimit_inactive:    warn_mb,
+        memlimit_inactive_attr: 0, // 0 = non-fatal (no MEMORYSTATUS_MEMLIMIT_ATTR_FATAL=0x1)
+    };
+    let ret = unsafe {
+        memorystatus_control(
+            MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES,
+            pid as i32,
+            0,
+            &mut props as *mut _ as *mut c_void,
+            std::mem::size_of::<MemorystatusMemlimitProperties>(),
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "memorystatus_control SET_WARN_LIMIT pid={} warn={}MB: errno={}",
+            pid,
+            warn_mb,
+            unsafe { *libc::__error() }
+        ))
+    }
+}
+
 /// Apply Jetsam policy based on Apollo process classification.
 ///
 /// - interactive → FOREGROUND priority, no memory limit

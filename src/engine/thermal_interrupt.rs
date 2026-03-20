@@ -10,7 +10,7 @@
 //! main loop.
 
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
+use crate::engine::sysctl_direct;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -635,10 +635,10 @@ fn migrate_to_ecores(
         if let Some(ref mut mgr) = qos_guard {
             mgr.set_tier(pid_u32, SchedulingTier::Background);
         } else {
-            // Fallback: CLI if QoS manager unavailable.
-            let _ = Command::new("/usr/sbin/taskpolicy")
-                .args(["-b", "-p", &pid_u32.to_string()])
-                .output();
+            // Fallback: direct setpriority if QoS manager unavailable.
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, pid_u32, 20);
+            }
         }
         migrated += 1;
     }
@@ -744,23 +744,17 @@ fn freeze_non_critical(
 
 /// Send memory pressure hint via sysctl to trigger kernel-level page reclaim.
 fn send_memory_pressure_hint() {
-    let _ = Command::new("/usr/sbin/sysctl")
-        .args(["-w", "kern.memorystatus_vm_pressure_send=1"])
-        .output();
+    sysctl_direct::write_i32("kern.memorystatus_vm_pressure_send", 1);
 }
 
 /// Enable I/O throttle sysctl during SuperEmergency.
 fn enable_io_throttle() {
-    let _ = Command::new("/usr/sbin/sysctl")
-        .args(["-w", "debug.lowpri_throttle_enabled=1"])
-        .output();
+    sysctl_direct::write_i32("debug.lowpri_throttle_enabled", 1);
 }
 
 /// Disable I/O throttle sysctl on recovery.
 fn disable_io_throttle() {
-    let _ = Command::new("/usr/sbin/sysctl")
-        .args(["-w", "debug.lowpri_throttle_enabled=0"])
-        .output();
+    sysctl_direct::write_i32("debug.lowpri_throttle_enabled", 0);
 }
 
 /// Recover: SIGCONT all interrupt-frozen PIDs, disable I/O throttle, remove from tracking.

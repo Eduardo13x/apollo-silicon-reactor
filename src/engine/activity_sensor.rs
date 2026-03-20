@@ -8,39 +8,99 @@
 //!    (terminals running builds, scripts, long-running commands, etc.).
 
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
 
-/// Parse `pmset -g assertions` and return the set of PIDs that hold any
-/// active power assertion. These processes are actively doing something
-/// the user or system considers important — freezing them would break it.
+/// Return the set of PIDs that hold any active power assertion via IOKit.
+/// These processes are actively doing something the user or system considers
+/// important — freezing them would break it.
 ///
-/// Cost: ~10-20ms (one subprocess call). Cache the result per freeze cycle.
+/// Cost: ~0.1ms (direct IOKit call, no subprocess). Cache the result per freeze cycle.
 pub fn pids_with_assertions() -> HashSet<u32> {
-    let output = match Command::new("pmset").args(["-g", "assertions"]).output() {
-        Ok(o) => o,
-        Err(_) => return HashSet::new(),
-    };
+    #[cfg(not(target_os = "macos"))]
+    { return HashSet::new(); }
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut pids = HashSet::new();
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn IOPMCopyAssertionsByProcess(
+                assertions_by_pid: *mut *const std::ffi::c_void,
+            ) -> i32;
+            fn CFArrayGetCount(array: *const std::ffi::c_void) -> i64;
+            #[allow(dead_code)]
+            fn CFArrayGetValueAtIndex(
+                array: *const std::ffi::c_void,
+                idx: i64,
+            ) -> *const std::ffi::c_void;
+            fn CFDictionaryGetCount(dict: *const std::ffi::c_void) -> i64;
+            fn CFDictionaryGetKeysAndValues(
+                dict: *const std::ffi::c_void,
+                keys: *mut *const std::ffi::c_void,
+                values: *mut *const std::ffi::c_void,
+            );
+            fn CFGetTypeID(cf: *const std::ffi::c_void) -> u64;
+            fn CFNumberGetTypeID() -> u64;
+            fn CFNumberGetValue(
+                number: *const std::ffi::c_void,
+                the_type: i64,
+                value_ptr: *mut std::ffi::c_void,
+            ) -> bool;
+            fn CFArrayGetTypeID() -> u64;
+            fn CFRelease(cf: *const std::ffi::c_void);
+        }
 
-    for line in text.lines() {
-        let line = line.trim();
-        // Lines with a PID look like: "pid 92974(Electron): [0x...] ..."
-        if !line.starts_with("pid ") {
-            continue;
+        const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
+        // IOPMCopyAssertionsByProcess returns a CFDictionary where:
+        //   keys = CFNumber (PID)
+        //   values = CFArray of assertion dictionaries
+        // Any PID with a non-empty assertion array is "active".
+
+        let mut dict_ref: *const std::ffi::c_void = std::ptr::null();
+        let mut pids = HashSet::new();
+
+        unsafe {
+            let kr = IOPMCopyAssertionsByProcess(&mut dict_ref);
+            if kr != 0 || dict_ref.is_null() {
+                return pids;
+            }
+
+            let count = CFDictionaryGetCount(dict_ref);
+            if count <= 0 {
+                CFRelease(dict_ref);
+                return pids;
+            }
+
+            let mut keys = vec![std::ptr::null(); count as usize];
+            let mut values = vec![std::ptr::null(); count as usize];
+            CFDictionaryGetKeysAndValues(dict_ref, keys.as_mut_ptr(), values.as_mut_ptr());
+
+            for i in 0..count as usize {
+                let key = keys[i];
+                let value = values[i];
+
+                // key is CFNumber (PID)
+                if key.is_null() || CFGetTypeID(key) != CFNumberGetTypeID() {
+                    continue;
+                }
+                // value is CFArray of assertions — if non-empty, PID is active
+                if value.is_null() || CFGetTypeID(value) != CFArrayGetTypeID() {
+                    continue;
+                }
+                if CFArrayGetCount(value) == 0 {
+                    continue;
+                }
+
+                let mut pid: i32 = 0;
+                if CFNumberGetValue(key, K_CF_NUMBER_SINT32_TYPE, &mut pid as *mut _ as *mut _) {
+                    if pid > 0 {
+                        pids.insert(pid as u32);
+                    }
+                }
+            }
+
+            CFRelease(dict_ref);
         }
-        let after_pid = &line[4..];
-        let pid_end = match after_pid.find('(') {
-            Some(i) => i,
-            None => continue,
-        };
-        if let Ok(pid) = after_pid[..pid_end].trim().parse::<u32>() {
-            pids.insert(pid);
-        }
+
+        pids
     }
-
-    pids
 }
 
 /// Return the set of parent PIDs whose children are collectively consuming

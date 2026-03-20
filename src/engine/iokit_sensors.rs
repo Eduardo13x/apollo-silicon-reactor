@@ -13,15 +13,15 @@
 //!
 //! Implementation strategy
 //! -----------------------
-//! Direct IOKit FFI is complex; we use a two-tier approach:
-//!   Tier 1: Shell out to `powermetrics` (available on all Macs, requires root)
-//!   Tier 2: Parse `/tmp/apollo_powermetrics.json` if powermetrics runs as a
-//!           background job (daemon integration)
+//! `snapshot()` reads thermal state directly from IOPMrootDomain via
+//! `thermal_iokit::read_iopm_state()` (~20 us, no subprocess).
+//! Power and utilisation are provided by `IOReportReader` and `SmcDirect`
+//! in the daemon, so `snapshot()` only fills thermal + estimated temps.
 //!
-//! This gives us real numbers without needing to reverse-engineer undocumented
-//! SMC key names for each SoC generation.
+//! `parse_powermetrics()` is retained for backwards compatibility and
+//! diagnostic use (parsing raw `powermetrics` text output).
 
-use std::process::Command;
+use crate::engine::thermal_iokit;
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -85,40 +85,54 @@ impl IOKitSensorReader {
         Self
     }
 
-    /// Take a one-shot snapshot using `powermetrics`.
-    /// Requires root; returns `Err` if not available or permission denied.
+    /// Take a one-shot snapshot using direct IOKit APIs (~20 us).
     ///
-    /// `powermetrics -n 1 -i 500` samples once with a 500 ms interval.
+    /// Reads thermal state from `IOPMrootDomain` via `thermal_iokit` and
+    /// infers temperatures from the thermal warning level.  Power and
+    /// utilisation data are left as `None` here — the daemon obtains those
+    /// from `IOReportReader` and `SmcDirect` which provide sub-millisecond
+    /// real telemetry without spawning a subprocess.
+    ///
+    /// Previously this method shelled out to `/usr/bin/powermetrics` which
+    /// blocked for 500 ms and required root.
     pub fn snapshot(&self) -> Result<HardwareSnapshot, String> {
-        // Run powermetrics in a thread with a 3-second timeout.
-        // The smc sampler can hang on some systems; cpu_power covers power + utilisation.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = Command::new("/usr/bin/powermetrics")
-                .args([
-                    "--samplers",
-                    "cpu_power,thermal,battery",
-                    "-n",
-                    "1",
-                    "-i",
-                    "500",
-                ])
-                .output();
-            let _ = tx.send(result);
-        });
+        let iopm = thermal_iokit::read_iopm_state();
 
-        let output = rx
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .map_err(|_| "powermetrics timed out after 3s".to_string())?
-            .map_err(|e| format!("powermetrics exec failed: {}", e))?;
+        let thermal_state = match iopm.as_ref().map(|s| s.thermal_warning) {
+            Some(thermal_iokit::ThermalWarning::Critical) => ThermalState::Critical,
+            Some(thermal_iokit::ThermalWarning::Severe) => ThermalState::Severe,
+            Some(thermal_iokit::ThermalWarning::Moderate) => ThermalState::Moderate,
+            _ => ThermalState::Normal,
+        };
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("powermetrics error: {}", stderr));
-        }
+        // Estimate temperatures from thermal state (same logic as the old
+        // powermetrics fallback — modern macOS hides core temps anyway).
+        let (est_p, est_e) = match thermal_state {
+            ThermalState::Normal => (60.0, 45.0),
+            ThermalState::Moderate => (80.0, 65.0),
+            ThermalState::Severe => (95.0, 80.0),
+            ThermalState::Critical => (110.0, 95.0),
+        };
 
-        let text = String::from_utf8_lossy(&output.stdout);
-        Ok(self.parse_powermetrics(&text))
+        Ok(HardwareSnapshot {
+            thermal_state,
+            temps: ClusterTemps {
+                p_cluster_celsius: Some(est_p),
+                e_cluster_celsius: Some(est_e),
+                gpu_celsius: None,
+                nand_celsius: None,
+            },
+            power: PowerReading {
+                package_watts: None,
+                cpu_watts: None,
+                gpu_watts: None,
+                dram_watts: None,
+            },
+            p_cluster_util: None,
+            e_cluster_util: None,
+            battery_percent: None,
+            battery_watts: None,
+        })
     }
 
     /// Parse the text output of `powermetrics`.

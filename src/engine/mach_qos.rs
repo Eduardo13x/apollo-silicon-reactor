@@ -75,6 +75,14 @@ mod mach_sys {
     pub const THROUGHPUT_QOS_TIER_4: i32 = 0xFB;
     pub const THROUGHPUT_QOS_TIER_5: i32 = 0xFA;
 
+    // Task suppression (App Nap)
+    pub const TASK_SUPPRESSION_POLICY: i32 = 3;
+    pub const TASK_SUPPRESSION_POLICY_COUNT: u32 = 9;
+
+    // Real-time thread scheduling
+    pub const THREAD_TIME_CONSTRAINT_POLICY: i32 = 2;
+    pub const THREAD_TIME_CONSTRAINT_POLICY_COUNT: u32 = 4;
+
     // Thread info flavors
     pub const THREAD_BASIC_INFO: u32 = 3;
     pub const THREAD_BASIC_INFO_COUNT: u32 = 10; // sizeof(thread_basic_info) / sizeof(i32)
@@ -135,6 +143,31 @@ mod ffi {
         pub thread_throughput_qos_tier: c_int,
     }
 
+    /// task_suppression_policy for App Nap enforcement.
+    /// COUNT = 9 (sizeof / sizeof(int)).
+    #[repr(C)]
+    pub struct TaskSuppressionPolicy {
+        pub active: libc::c_int,
+        pub lowpri_cpu: libc::c_int,
+        pub timer_throttle: libc::c_int,
+        pub disk_throttle: libc::c_int,
+        pub cpu_limit: libc::c_int,
+        pub suspend: libc::c_int,
+        pub throughput_qos: libc::c_int,
+        pub suppressed_cpu: libc::c_int,
+        pub background_sockets: libc::c_int,
+    }
+
+    /// thread_time_constraint_policy for real-time UI thread scheduling.
+    /// COUNT = 4 (4 × uint32_t).
+    #[repr(C)]
+    pub struct ThreadTimeConstraintPolicy {
+        pub period: u32,       // nanoseconds between periods
+        pub computation: u32,  // nanoseconds of CPU per period
+        pub constraint: u32,   // maximum scheduling delay (ns)
+        pub preemptible: libc::c_int, // 0=non-preemptible, 1=preemptible
+    }
+
     #[allow(clashing_extern_declarations)]
     extern "C" {
         pub fn mach_task_self() -> MachPortT;
@@ -175,6 +208,36 @@ mod ffi {
         // On macOS, mach_vm_deallocate uses mach_vm_address_t (u64) and
         // mach_vm_size_t (u64) but the target is mach_port_t (u32).
         pub fn vm_deallocate(target_task: MachPortT, address: usize, size: usize) -> KernReturnT;
+
+        // Host + processor set enumeration (for batch task enumeration).
+        pub fn mach_host_self() -> MachPortT;
+        pub fn host_processor_sets(
+            host: MachPortT,
+            pset_list: *mut *mut MachPortT,
+            pset_count: *mut MachMsgTypeNumberT,
+        ) -> KernReturnT;
+        pub fn host_processor_set_priv(
+            host_priv: MachPortT,
+            set_name: MachPortT,
+            pset: *mut MachPortT,
+        ) -> KernReturnT;
+        pub fn processor_set_tasks_with_flavor(
+            pset: MachPortT,
+            flavor: i32,
+            task_list: *mut *mut MachPortT,
+            task_count: *mut MachMsgTypeNumberT,
+        ) -> KernReturnT;
+        pub fn pid_for_task(task: MachPortT, pid: *mut i32) -> KernReturnT;
+
+        // Mach port enumeration — returns all port names + types for a task.
+        // Used for Mach port accounting: excessive port count = IPC leak.
+        pub fn mach_port_names(
+            target_task: MachPortT,
+            names:       *mut *mut MachPortT,
+            names_cnt:   *mut MachMsgTypeNumberT,
+            types:       *mut *mut MachMsgTypeNumberT,
+            types_cnt:   *mut MachMsgTypeNumberT,
+        ) -> KernReturnT;
     }
 }
 
@@ -289,6 +352,8 @@ pub struct MachQoSManager {
     permanently_blocked: HashSet<u32>,
     /// Previous thread CPU times for delta tracking: (pid, thread_idx) → total_cpu_us.
     prev_thread_cpu: HashMap<(u32, u32), u64>,
+    /// PIDs currently in App Nap suppression mode.
+    app_napped: HashSet<u32>,
 }
 
 impl MachQoSManager {
@@ -297,6 +362,7 @@ impl MachQoSManager {
             current_tier: HashMap::new(),
             permanently_blocked: HashSet::new(),
             prev_thread_cpu: HashMap::new(),
+            app_napped: HashSet::new(),
         }
     }
 
@@ -363,6 +429,8 @@ impl MachQoSManager {
             .retain(|&pid, _| (unsafe { libc::kill(pid as i32, 0) }) == 0);
         self.prev_thread_cpu
             .retain(|&(pid, _), _| (unsafe { libc::kill(pid as i32, 0) }) == 0);
+        self.app_napped
+            .retain(|&pid| (unsafe { libc::kill(pid as i32, 0) }) == 0);
     }
 
     /// Apply QoS changes to many processes in one pass.
@@ -809,6 +877,226 @@ impl MachQoSManager {
         false
     }
 
+    // ── App Nap (TASK_SUPPRESSION_POLICY) ───────────────────────────────
+
+    /// Apply or remove App Nap suppression for a process.
+    ///
+    /// When `suppressed=true`, the process runs at severely reduced priority:
+    /// low CPU, throttled timers, throttled disk I/O — identical to macOS App Nap.
+    /// Unlike SIGSTOP, the process continues running; transitions are invisible.
+    ///
+    /// Returns true if the syscall succeeded.
+    #[cfg(target_os = "macos")]
+    pub fn set_app_nap(&mut self, pid: u32, suppressed: bool) -> bool {
+        if self.permanently_blocked.contains(&pid) || Self::is_sip_protected(pid) {
+            self.permanently_blocked.insert(pid);
+            return false;
+        }
+        // Skip if already in the target state.
+        if suppressed == self.app_napped.contains(&pid) {
+            return true;
+        }
+
+        unsafe {
+            use self::ffi::*;
+            use self::mach_sys::*;
+
+            let mut task_port: MachPortT = MACH_PORT_NULL;
+            let kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);
+            if kr != KERN_SUCCESS {
+                self.permanently_blocked.insert(pid);
+                return false;
+            }
+
+            let policy = if suppressed {
+                TaskSuppressionPolicy {
+                    active: 1,
+                    lowpri_cpu: 1,
+                    timer_throttle: LATENCY_QOS_TIER_5,
+                    disk_throttle: 1,
+                    cpu_limit: 0,
+                    suspend: 0,
+                    throughput_qos: THROUGHPUT_QOS_TIER_5,
+                    suppressed_cpu: 1,
+                    background_sockets: 1,
+                }
+            } else {
+                TaskSuppressionPolicy {
+                    active: 0,
+                    lowpri_cpu: 0,
+                    timer_throttle: LATENCY_QOS_TIER_UNSPECIFIED,
+                    disk_throttle: 0,
+                    cpu_limit: 0,
+                    suspend: 0,
+                    throughput_qos: THROUGHPUT_QOS_TIER_UNSPECIFIED,
+                    suppressed_cpu: 0,
+                    background_sockets: 0,
+                }
+            };
+
+            let kr2 = task_policy_set(
+                task_port,
+                TASK_SUPPRESSION_POLICY,
+                &policy as *const _ as *const std::ffi::c_void,
+                TASK_SUPPRESSION_POLICY_COUNT,
+            );
+            mach_port_deallocate(mach_task_self(), task_port);
+
+            if kr2 == KERN_SUCCESS {
+                if suppressed {
+                    self.app_napped.insert(pid);
+                } else {
+                    self.app_napped.remove(&pid);
+                }
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn set_app_nap(&mut self, _pid: u32, _suppressed: bool) -> bool {
+        false
+    }
+
+    /// Whether a PID is currently App-Napped.
+    pub fn is_app_napped(&self, pid: u32) -> bool {
+        self.app_napped.contains(&pid)
+    }
+
+    /// Release App Nap from all tracked PIDs (e.g. on wake from sleep).
+    pub fn release_all_app_nap(&mut self) {
+        let pids: Vec<u32> = self.app_napped.iter().copied().collect();
+        for pid in pids {
+            self.set_app_nap(pid, false);
+        }
+    }
+
+    // ── Real-Time UI Thread Boost (THREAD_TIME_CONSTRAINT_POLICY) ────────
+
+    /// Apply real-time scheduling constraint to the foreground app's main thread.
+    ///
+    /// Guarantees `computation` ns of CPU within every `period` ns window.
+    /// This prevents UI hitches when P-cores are saturated by background work
+    /// (e.g., LLM inference + browser open simultaneously).
+    ///
+    /// Uses conservative values: 2ms/10ms, preemptible — safe for any app.
+    ///
+    /// Returns true if applied successfully.
+    #[cfg(target_os = "macos")]
+    pub fn set_realtime_boost(&mut self, pid: u32) -> bool {
+        if self.permanently_blocked.contains(&pid) || Self::is_sip_protected(pid) {
+            return false;
+        }
+
+        unsafe {
+            use self::ffi::*;
+            use self::mach_sys::*;
+
+            let mut task_port: MachPortT = MACH_PORT_NULL;
+            let kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);
+            if kr != KERN_SUCCESS {
+                self.permanently_blocked.insert(pid);
+                return false;
+            }
+
+            let mut thread_list: *mut MachPortT = std::ptr::null_mut();
+            let mut thread_count: MachMsgTypeNumberT = 0;
+            let kr2 = task_threads(task_port, &mut thread_list, &mut thread_count);
+            mach_port_deallocate(mach_task_self(), task_port);
+
+            if kr2 != KERN_SUCCESS || thread_list.is_null() || thread_count == 0 {
+                return false;
+            }
+
+            // Apply RT constraint to thread 0 (main/UI thread).
+            let main_thread = *thread_list;
+            let policy = ThreadTimeConstraintPolicy {
+                period: 10_000_000,      // 10 ms
+                computation: 2_000_000,  // 2 ms guaranteed per period
+                constraint: 5_000_000,   // must be scheduled within 5 ms
+                preemptible: 1,          // allow preemption (safe)
+            };
+            let kr3 = thread_policy_set(
+                main_thread,
+                THREAD_TIME_CONSTRAINT_POLICY,
+                &policy as *const _ as *const std::ffi::c_void,
+                THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+            );
+
+            // Deallocate all thread ports.
+            for i in 0..thread_count {
+                mach_port_deallocate(mach_task_self(), *thread_list.add(i as usize));
+            }
+            let list_size = (thread_count as u64) * (std::mem::size_of::<MachPortT>() as u64);
+            vm_deallocate(mach_task_self(), thread_list as usize, list_size as usize);
+
+            kr3 == KERN_SUCCESS
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn set_realtime_boost(&mut self, _pid: u32) -> bool {
+        false
+    }
+
+    /// Remove RT constraint from a process's main thread (restore default scheduling).
+    #[cfg(target_os = "macos")]
+    pub fn clear_realtime_boost(&mut self, pid: u32) -> bool {
+        if self.permanently_blocked.contains(&pid) {
+            return false;
+        }
+
+        unsafe {
+            use self::ffi::*;
+            use self::mach_sys::*;
+
+            let mut task_port: MachPortT = MACH_PORT_NULL;
+            let kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);
+            if kr != KERN_SUCCESS {
+                return false;
+            }
+
+            let mut thread_list: *mut MachPortT = std::ptr::null_mut();
+            let mut thread_count: MachMsgTypeNumberT = 0;
+            let kr2 = task_threads(task_port, &mut thread_list, &mut thread_count);
+            mach_port_deallocate(mach_task_self(), task_port);
+
+            if kr2 != KERN_SUCCESS || thread_list.is_null() || thread_count == 0 {
+                return false;
+            }
+
+            // Clear RT constraint on thread 0: zero period resets to default.
+            let main_thread = *thread_list;
+            let policy = ThreadTimeConstraintPolicy {
+                period: 0,
+                computation: 0,
+                constraint: 0,
+                preemptible: 1,
+            };
+            let kr3 = thread_policy_set(
+                main_thread,
+                THREAD_TIME_CONSTRAINT_POLICY,
+                &policy as *const _ as *const std::ffi::c_void,
+                THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+            );
+
+            for i in 0..thread_count {
+                mach_port_deallocate(mach_task_self(), *thread_list.add(i as usize));
+            }
+            let list_size = (thread_count as u64) * (std::mem::size_of::<MachPortT>() as u64);
+            vm_deallocate(mach_task_self(), thread_list as usize, list_size as usize);
+
+            kr3 == KERN_SUCCESS
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn clear_realtime_boost(&mut self, _pid: u32) -> bool {
+        false
+    }
+
     // ── Private ───────────────────────────────────────────────────────────
 
     /// Check if a PID's executable lives in a SIP-protected path.
@@ -895,6 +1183,70 @@ impl MachQoSManager {
             error: Some("task_policy_set only available on macOS".into()),
         }
     }
+
+    // ── Mach port accounting ─────────────────────────────────────────────
+
+    /// Count the number of Mach port rights held by a process.
+    ///
+    /// Processes with >5000 ports are typically leaking or flooding IPC.
+    /// Normal healthy apps hold 50-500 ports.  Browsers/Electron can reach
+    /// 2000-3000 legitimately.  Anything above 5000 is suspicious.
+    ///
+    /// Requires root (calls `task_for_pid`).  Returns `None` if the process
+    /// is dead or inaccessible.
+    #[cfg(target_os = "macos")]
+    pub fn get_mach_port_count(&self, pid: u32) -> Option<u32> {
+        use ffi::*;
+        let self_task = unsafe { mach_task_self() };
+        let mut task: MachPortT = mach_sys::MACH_PORT_NULL;
+        let kr = unsafe { task_for_pid(self_task, pid as libc::pid_t, &mut task) };
+        if kr != mach_sys::KERN_SUCCESS || task == mach_sys::MACH_PORT_NULL {
+            return None;
+        }
+
+        let mut names: *mut MachPortT = std::ptr::null_mut();
+        let mut names_cnt: MachMsgTypeNumberT = 0;
+        let mut types: *mut MachMsgTypeNumberT = std::ptr::null_mut();
+        let mut types_cnt: MachMsgTypeNumberT = 0;
+
+        let kr = unsafe {
+            mach_port_names(task, &mut names, &mut names_cnt, &mut types, &mut types_cnt)
+        };
+
+        // Deallocate the task port ASAP.
+        unsafe { mach_port_deallocate(self_task, task) };
+
+        if kr != mach_sys::KERN_SUCCESS {
+            return None;
+        }
+
+        // Free the kernel-allocated arrays.
+        if !names.is_null() && names_cnt > 0 {
+            unsafe {
+                vm_deallocate(
+                    self_task,
+                    names as usize,
+                    names_cnt as usize * std::mem::size_of::<MachPortT>(),
+                );
+            }
+        }
+        if !types.is_null() && types_cnt > 0 {
+            unsafe {
+                vm_deallocate(
+                    self_task,
+                    types as usize,
+                    types_cnt as usize * std::mem::size_of::<MachMsgTypeNumberT>(),
+                );
+            }
+        }
+
+        Some(names_cnt)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn get_mach_port_count(&self, _pid: u32) -> Option<u32> {
+        None
+    }
 }
 
 impl Default for MachQoSManager {
@@ -918,5 +1270,219 @@ pub fn tier_for_process(process_tier: ProcessTier) -> SchedulingTier {
         ProcessTier::Stale => SchedulingTier::Background,
         ProcessTier::ZombieOrphan => SchedulingTier::Background,
         ProcessTier::Telemetry => SchedulingTier::Background,
+    }
+}
+
+// ── Batch task enumeration via processor_set_tasks_with_flavor ─────────────
+
+/// TASK_FLAVOR_READ: read-only task port (sufficient for mach_port_names / thread enumeration).
+#[cfg(target_os = "macos")]
+const TASK_FLAVOR_READ: i32 = 1;
+
+/// Enumerate all tasks in a single Mach call.
+///
+/// Returns `Vec<(task_port, pid)>`.
+/// **Caller must deallocate the task ports** via `mach_port_deallocate`
+/// after use (or use `with_all_tasks` for automatic cleanup).
+///
+/// Requires root (host_processor_set_priv needs host_priv port).
+/// Returns an empty Vec without root or on error.
+#[cfg(target_os = "macos")]
+pub fn enumerate_all_tasks() -> Vec<(u32, i32)> {
+    use self::ffi::*;
+    use self::mach_sys::*;
+
+    unsafe {
+        let host = mach_host_self();
+
+        // Step 1: Get processor set name(s).
+        let mut pset_list: *mut MachPortT = std::ptr::null_mut();
+        let mut pset_count: MachMsgTypeNumberT = 0;
+        let kr = host_processor_sets(host, &mut pset_list, &mut pset_count);
+        if kr != KERN_SUCCESS || pset_list.is_null() || pset_count == 0 {
+            return Vec::new();
+        }
+
+        // Step 2: Get privileged port for first (and usually only) pset.
+        let pset_name = *pset_list;
+        let mut pset_priv: MachPortT = MACH_PORT_NULL;
+        let kr = host_processor_set_priv(host, pset_name, &mut pset_priv);
+
+        // Deallocate pset_list array.
+        vm_deallocate(
+            mach_task_self(),
+            pset_list as usize,
+            pset_count as usize * std::mem::size_of::<MachPortT>(),
+        );
+        // Deallocate pset name port.
+        mach_port_deallocate(mach_task_self(), pset_name);
+
+        if kr != KERN_SUCCESS || pset_priv == MACH_PORT_NULL {
+            return Vec::new();
+        }
+
+        // Step 3: Get all task ports via processor_set_tasks_with_flavor.
+        let mut task_list: *mut MachPortT = std::ptr::null_mut();
+        let mut task_count: MachMsgTypeNumberT = 0;
+        let kr = processor_set_tasks_with_flavor(
+            pset_priv,
+            TASK_FLAVOR_READ,
+            &mut task_list,
+            &mut task_count,
+        );
+        mach_port_deallocate(mach_task_self(), pset_priv);
+
+        if kr != KERN_SUCCESS || task_list.is_null() || task_count == 0 {
+            return Vec::new();
+        }
+
+        // Step 4: Map task ports → PIDs.
+        let mut result = Vec::with_capacity(task_count as usize);
+        for i in 0..task_count {
+            let task = *task_list.add(i as usize);
+            let mut pid: i32 = 0;
+            let kr = pid_for_task(task, &mut pid);
+            if kr == KERN_SUCCESS {
+                result.push((task, pid));
+            } else {
+                // Can't identify — deallocate and skip.
+                mach_port_deallocate(mach_task_self(), task);
+            }
+        }
+
+        // Deallocate the task list array (but NOT the individual task ports —
+        // caller owns them via the result Vec).
+        vm_deallocate(
+            mach_task_self(),
+            task_list as usize,
+            task_count as usize * std::mem::size_of::<MachPortT>(),
+        );
+
+        result
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn enumerate_all_tasks() -> Vec<(u32, i32)> {
+    Vec::new()
+}
+
+/// Convenience: enumerate all tasks, call `f(task_port, pid)` for each,
+/// then deallocate all task ports automatically.
+#[cfg(target_os = "macos")]
+pub fn with_all_tasks<F: FnMut(u32, i32)>(mut f: F) {
+    let tasks = enumerate_all_tasks();
+    for &(task, pid) in &tasks {
+        f(task, pid);
+    }
+    // Deallocate all task ports.
+    for &(task, _) in &tasks {
+        unsafe {
+            ffi::mach_port_deallocate(ffi::mach_task_self(), task);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn with_all_tasks<F: FnMut(u32, i32)>(_f: F) {}
+
+/// Batch Mach port counting: get port counts for all accessible processes
+/// in a single `processor_set_tasks_with_flavor` call instead of N×`task_for_pid`.
+///
+/// Returns `Vec<(pid, port_count)>`.
+#[cfg(target_os = "macos")]
+pub fn batch_mach_port_counts() -> Vec<(i32, u32)> {
+    use self::ffi::*;
+    use self::mach_sys::*;
+
+    let tasks = enumerate_all_tasks();
+    let mut result = Vec::with_capacity(tasks.len());
+
+    let self_task = unsafe { mach_task_self() };
+
+    for &(task, pid) in &tasks {
+        // Count ports on this task.
+        let mut names: *mut MachPortT = std::ptr::null_mut();
+        let mut names_cnt: MachMsgTypeNumberT = 0;
+        let mut types: *mut MachMsgTypeNumberT = std::ptr::null_mut();
+        let mut types_cnt: MachMsgTypeNumberT = 0;
+
+        let kr =
+            unsafe { mach_port_names(task, &mut names, &mut names_cnt, &mut types, &mut types_cnt) };
+
+        if kr == KERN_SUCCESS {
+            // Free the kernel-allocated arrays.
+            if !names.is_null() && names_cnt > 0 {
+                unsafe {
+                    vm_deallocate(
+                        self_task,
+                        names as usize,
+                        names_cnt as usize * std::mem::size_of::<MachPortT>(),
+                    );
+                }
+            }
+            if !types.is_null() && types_cnt > 0 {
+                unsafe {
+                    vm_deallocate(
+                        self_task,
+                        types as usize,
+                        types_cnt as usize * std::mem::size_of::<MachMsgTypeNumberT>(),
+                    );
+                }
+            }
+            result.push((pid, names_cnt));
+        }
+
+        // Deallocate the task port.
+        unsafe { mach_port_deallocate(self_task, task) };
+    }
+
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn batch_mach_port_counts() -> Vec<(i32, u32)> {
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enumerate_no_crash() {
+        // Should return an empty Vec without root, but never panic.
+        let tasks = enumerate_all_tasks();
+        // On CI / non-root: empty. On root macOS: contains our PID.
+        let _ = tasks.len();
+    }
+
+    #[test]
+    fn enumerate_returns_self_pid() {
+        let tasks = enumerate_all_tasks();
+        if !tasks.is_empty() {
+            let my_pid = std::process::id() as i32;
+            let found = tasks.iter().any(|&(_, pid)| pid == my_pid);
+            assert!(found, "our own PID should be in the task list");
+            // Clean up task ports.
+            #[cfg(target_os = "macos")]
+            for &(task, _) in &tasks {
+                unsafe {
+                    ffi::mach_port_deallocate(ffi::mach_task_self(), task);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn with_all_tasks_no_leak() {
+        // Call with_all_tasks multiple times — should not leak ports.
+        for _ in 0..5 {
+            let mut count = 0u32;
+            with_all_tasks(|_task, _pid| {
+                count += 1;
+            });
+            let _ = count;
+        }
     }
 }

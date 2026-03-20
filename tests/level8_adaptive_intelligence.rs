@@ -31,6 +31,8 @@ fn make_snap(name: &str, cpu: f32, secs_idle: u64, has_gui: bool) -> ProcessSnap
         process_uptime_secs: 300,
         faults_total: 0,
         pageins_total: 0,
+        is_translated: false,
+        mach_port_count: 0,
     }
 }
 

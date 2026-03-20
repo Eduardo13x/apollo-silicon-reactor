@@ -16,6 +16,9 @@ toml = "0.8"
 ureq = { version = "2.12", features = ["json"] }
 tract-onnx = { version = "0.21", optional = true }
 
+[build-dependencies]
+cc = "1.0"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = "0.14"
 winit = "0.29"

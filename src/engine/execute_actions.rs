@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::process::Command;
+use crate::engine::sysctl_direct;
 
 use chrono::Utc;
 
@@ -9,19 +9,72 @@ use crate::engine::io_tiering::{apply_io_tier, io_tier_for_throttle};
 use crate::engine::jetsam_control::{apply_apollo_policy, JetsamClass};
 use crate::engine::journal::append_journal;
 use crate::engine::mach_qos::{LatencyTier, MachQoSManager, ThreadTier, ThroughputTier};
-use crate::engine::process_identity::ProcessIdentity;
+use crate::engine::proc_taskinfo;
+use crate::engine::process_identity::{self, ProcessIdentity};
 use crate::engine::safety::{
     allowlisted_sysctls, allowlisted_sysctls_with_ranges, critical_background_processes,
     protected_processes,
 };
 use crate::engine::types::{CapabilityReport, JournalEntry, RootAction};
 
-fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
-    let out = Command::new(program).args(args).output()?;
-    if out.status.success() {
+/// Set the nice value for a process via `setpriority(2)`.
+/// Returns `Ok(())` on success, or an error if the call failed.
+fn set_nice(pid: u32, nice: i32) -> anyhow::Result<()> {
+    // errno must be cleared before setpriority — a return of -1 is ambiguous
+    // because -1 is a valid priority.  We use the errno convention instead.
+    unsafe {
+        *libc::__error() = 0;
+        let rc = libc::setpriority(libc::PRIO_PROCESS, pid, nice);
+        if rc == -1 && *libc::__error() != 0 {
+            anyhow::bail!(
+                "setpriority({}, {}) failed: {}",
+                pid,
+                nice,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Send a signal to all processes whose name matches `daemon` exactly.
+/// Equivalent to `/usr/bin/killall <signal> <daemon>` but without fork/exec.
+fn killall_by_name(daemon: &str, signal: i32) -> anyhow::Result<()> {
+    let pids = proc_taskinfo::list_all_pids();
+    let mut matched = 0u32;
+    for pid in pids {
+        if let Some(name) = process_identity::proc_name_for_pid(pid) {
+            if name == daemon {
+                let rc = unsafe { libc::kill(pid as i32, signal) };
+                if rc == 0 {
+                    matched += 1;
+                }
+            }
+        }
+    }
+    if matched == 0 {
+        anyhow::bail!("no process found matching '{}'", daemon);
+    }
+    Ok(())
+}
+
+/// Toggle Spotlight indexing via `mdutil -a -i on/off`.
+///
+/// mdutil communicates with the Spotlight server via XPC (com.apple.spotlightserver).
+/// There is no public or private framework function equivalent — MDSetIndexingEnabled
+/// does not exist in the dyld shared cache on Apple Silicon macOS 15.
+fn spotlight_set_indexing(enabled: bool) {
+    let flag = if enabled { "on" } else { "off" };
+    let _ = std::process::Command::new("/usr/bin/mdutil")
+        .args(["-a", "-i", flag])
+        .status();
+}
+
+fn run_sysctl_write(key: &str, value: &str) -> anyhow::Result<()> {
+    if sysctl_direct::write_str_value(key, value) {
         Ok(())
     } else {
-        anyhow::bail!(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        anyhow::bail!("sysctl write failed: {}={}", key, value)
     }
 }
 
@@ -148,17 +201,11 @@ pub fn execute_actions(
                                 LatencyTier::Interactive,
                                 ThroughputTier::High,
                             );
-                        } else {
-                            // Fallback to CLI if no QoS manager provided.
-                            let _ =
-                                run("/usr/sbin/taskpolicy", &["-l", "0", "-p", &pid.to_string()]);
-                            let _ =
-                                run("/usr/sbin/taskpolicy", &["-t", "0", "-p", &pid.to_string()]);
                         }
                         // Boost I/O tier to Interactive.
                         apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Interactive);
                     }
-                    let _ = run("/usr/bin/renice", &["-10", "-p", &pid.to_string()]);
+                    let _ = set_nice(*pid, -10);
                     out.boosts_applied += 1;
                 }
                 RootAction::ThrottleProcess {
@@ -228,17 +275,13 @@ pub fn execute_actions(
                                 ThroughputTier::Default
                             };
                             mgr.set_latency_and_throughput(*pid, lat, thr);
-                        } else {
-                            let tier = if aggressive { "4" } else { "2" };
-                            let pid_str = pid.to_string();
-                            let _ = run("/usr/sbin/taskpolicy", &["-l", tier, "-p", &pid_str]);
                         }
                         // Granular I/O tiering based on aggressiveness.
                         let io_tier = io_tier_for_throttle(aggressive);
                         apply_io_tier(*pid, io_tier);
                     }
-                    let nice = if aggressive { "+20" } else { "+10" };
-                    let _ = run("/usr/bin/renice", &[nice, "-p", &pid.to_string()]);
+                    let nice_val: i32 = if aggressive { 20 } else { 10 };
+                    let _ = set_nice(*pid, nice_val);
                     out.throttles_applied += 1;
                 }
                 RootAction::FreezeProcess {
@@ -346,26 +389,19 @@ pub fn execute_actions(
                         }
                     }
                     // Read current value — doubles as existence check.
-                    let read_result = Command::new("/usr/sbin/sysctl").args(["-n", key]).output();
+                    let read_result = sysctl_direct::read_str(key);
                     match read_result {
-                        Ok(o) if o.status.success() => {
-                            before = Some(String::from_utf8_lossy(&o.stdout).trim().to_string());
+                        Some(val) => {
+                            before = Some(val);
                         }
-                        _ => {
-                            // Key doesn't exist on this kernel build.
+                        None => {
                             out.invalid_sysctl_denied += 1;
                             out.push_skip(format!("invalid-sysctl:{}", key));
                             return Ok(());
                         }
                     }
-                    run("/usr/sbin/sysctl", &["-w", &format!("{}={}", key, value)])?;
-                    let after_out = Command::new("/usr/sbin/sysctl")
-                        .args(["-n", key])
-                        .output()
-                        .ok();
-                    if let Some(o) = after_out {
-                        after = Some(String::from_utf8_lossy(&o.stdout).trim().to_string());
-                    }
+                    run_sysctl_write(key, value)?;
+                    after = sysctl_direct::read_str(key);
                     out.sysctl_applied += 1;
                 }
                 RootAction::SetMemorystatus { pid, .. } => {
@@ -385,13 +421,9 @@ pub fn execute_actions(
                         if is_protected {
                             // Skip — do not pressure protected processes.
                         } else {
-                            let pid_str = pid.to_string();
-                            let _ = run(
-                                "/usr/sbin/sysctl",
-                                &[
-                                    "-w",
-                                    &format!("kern.memorystatus_vm_pressure_send={}", pid_str),
-                                ],
+                            let _ = sysctl_direct::write_i32(
+                                "kern.memorystatus_vm_pressure_send",
+                                *pid as i32,
                             );
                             out.paging_hints_applied += 1;
                         }
@@ -399,8 +431,7 @@ pub fn execute_actions(
                 }
                 RootAction::ToggleSpotlight { enabled, .. } => {
                     if caps.can_mdutil {
-                        let state = if *enabled { "on" } else { "off" };
-                        let _ = run("/usr/sbin/mdutil", &["-i", state, "/"]);
+                        spotlight_set_indexing(*enabled);
                     }
                 }
                 RootAction::QuarantineDaemon { daemon, active, .. } => {
@@ -423,8 +454,8 @@ pub fn execute_actions(
                     } else if !name_valid {
                         // Skip — daemon name contains invalid characters.
                     } else {
-                        let signal = if *active { "-STOP" } else { "-CONT" };
-                        let _ = run("/usr/bin/killall", &[signal, daemon]);
+                        let signal = if *active { libc::SIGSTOP } else { libc::SIGCONT };
+                        let _ = killall_by_name(daemon, signal);
                     }
                 }
                 RootAction::SetThreadQoS {

@@ -4,7 +4,8 @@
 //! out of the main daemon loop into a dedicated background thread that polls
 //! at a configurable interval.  The main loop reads cached data in <1 μs.
 
-use std::process::Command;
+use crate::engine::host_vm_info;
+use crate::engine::sysctl_direct;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -134,42 +135,20 @@ impl PressureCollector {
     }
 }
 
-/// Collect pressure facts via subprocesses (blocking, ~50–200 ms).
 fn collect_pressure_facts() -> (f64, u64, u64) {
-    let mut memory_pressure = 0.0;
-    if let Ok(out) = Command::new("/usr/bin/memory_pressure")
-        .args(["-Q"])
-        .output()
-    {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                if let Some(rest) = line.strip_prefix("System-wide memory free percentage:") {
-                    let s = rest.trim().trim_end_matches('%').trim();
-                    if let Ok(free_pct) = s.parse::<f64>() {
-                        memory_pressure = (1.0 - (free_pct / 100.0)).clamp(0.0, 1.0);
-                    }
-                }
-            }
-        }
-    }
+    // Memory pressure via Mach host_statistics64 (~1µs vs 50ms for subprocess).
+    let memory_pressure = host_vm_info::read_vm_stats()
+        .map(|s| s.pressure())
+        .unwrap_or(0.0);
 
-    let mut swap_used_bytes = 0_u64;
-    let mut swap_total_bytes = 0_u64;
-    if let Ok(out) = Command::new("/usr/sbin/sysctl")
-        .args(["vm.swapusage"])
-        .output()
-    {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            swap_total_bytes = parse_sysctl_size(&text, "total").unwrap_or(0);
-            swap_used_bytes = parse_sysctl_size(&text, "used").unwrap_or(0);
-        }
-    }
+    // Swap usage via direct sysctl struct read (~1µs vs 10ms for subprocess).
+    let (swap_total_bytes, swap_used_bytes) =
+        sysctl_direct::read_swap_usage().unwrap_or((0, 0));
 
     (memory_pressure, swap_used_bytes, swap_total_bytes)
 }
 
+#[cfg(test)]
 fn parse_sysctl_size(s: &str, key: &str) -> Option<u64> {
     let needle = format!("{key} =");
     let idx = s.find(&needle)?;

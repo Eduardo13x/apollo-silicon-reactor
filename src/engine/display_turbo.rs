@@ -42,7 +42,7 @@
 //! dips (e.g., auto-brightness adjustments, notification peek).
 
 use std::collections::HashSet;
-use std::process::Command;
+
 use std::time::{Duration, Instant};
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -60,40 +60,89 @@ const MAX_TURBO_FREEZE: usize = 60;
 
 /// Detect whether the display is currently on.
 ///
-/// Uses `ioreg` to query IODisplayWrangler's power state.
+/// Uses IOKit direct to query IODisplayWrangler's power state.
 /// Power state 4 = display on, 1-3 = dimming/sleeping, 0 = off.
 ///
 /// Returns `true` if display is on, `false` if off.
 /// On error, assumes display is on (conservative default).
 fn is_display_on() -> bool {
-    // ioreg -r -d 1 -c IODisplayWrangler outputs:
-    //   "DevicePowerState" = 4   (on)
-    //   "DevicePowerState" = 1   (off/dimmed)
-    let output = match Command::new("ioreg")
-        .args(["-r", "-d", "1", "-c", "IODisplayWrangler"])
-        .output()
+    #[cfg(not(target_os = "macos"))]
+    { return true; }
+
+    #[cfg(target_os = "macos")]
     {
-        Ok(o) => o,
-        Err(_) => return true, // conservative: assume on
-    };
+        extern "C" {
+            fn IOServiceGetMatchingService(mainPort: u32, matching: *const std::ffi::c_void) -> u32;
+            fn IOServiceMatching(name: *const i8) -> *mut std::ffi::c_void;
+            fn IORegistryEntryCreateCFProperty(
+                entry: u32,
+                key: *const std::ffi::c_void,
+                allocator: *const std::ffi::c_void,
+                options: u32,
+            ) -> *const std::ffi::c_void;
+            fn IOObjectRelease(object: u32) -> i32;
+            fn CFStringCreateWithCString(
+                alloc: *const std::ffi::c_void,
+                cstr: *const i8,
+                encoding: u32,
+            ) -> *const std::ffi::c_void;
+            fn CFGetTypeID(cf: *const std::ffi::c_void) -> u64;
+            fn CFNumberGetTypeID() -> u64;
+            fn CFNumberGetValue(
+                number: *const std::ffi::c_void,
+                the_type: i64,
+                value_ptr: *mut std::ffi::c_void,
+            ) -> bool;
+            fn CFRelease(cf: *const std::ffi::c_void);
+        }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+        const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
 
-    // Parse "DevicePowerState" = N
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains("DevicePowerState") {
-            // Extract the number after '='
-            if let Some(val_str) = trimmed.split('=').nth(1) {
-                let val_str = val_str.trim().trim_end_matches(';').trim();
-                if let Ok(val) = val_str.parse::<u32>() {
-                    return val >= 4; // 4 = fully on
-                }
+        unsafe {
+            let matching = IOServiceMatching(b"IODisplayWrangler\0".as_ptr() as *const i8);
+            if matching.is_null() {
+                return true;
             }
+
+            let service = IOServiceGetMatchingService(0, matching);
+            if service == 0 {
+                return true;
+            }
+
+            let key = CFStringCreateWithCString(
+                std::ptr::null(),
+                b"DevicePowerState\0".as_ptr() as *const i8,
+                K_CF_STRING_ENCODING_UTF8,
+            );
+            if key.is_null() {
+                IOObjectRelease(service);
+                return true;
+            }
+
+            let prop = IORegistryEntryCreateCFProperty(service, key, std::ptr::null(), 0);
+            CFRelease(key);
+
+            if prop.is_null() || CFGetTypeID(prop) != CFNumberGetTypeID() {
+                if !prop.is_null() {
+                    CFRelease(prop);
+                }
+                IOObjectRelease(service);
+                return true;
+            }
+
+            let mut power_state: i32 = 0;
+            CFNumberGetValue(
+                prop,
+                K_CF_NUMBER_SINT32_TYPE,
+                &mut power_state as *mut _ as *mut _,
+            );
+            CFRelease(prop);
+            IOObjectRelease(service);
+
+            power_state >= 4
         }
     }
-
-    true // conservative default
 }
 
 // ── State Machine ────────────────────────────────────────────────────────────
@@ -122,6 +171,8 @@ pub struct DisplayTurbo {
     activation_count: u64,
     /// Last time we polled display state (rate-limit ioreg calls).
     last_poll: Option<Instant>,
+    /// Dwell time before activating turbo.  Shorter on battery.
+    dwell_secs: u64,
 }
 
 impl DisplayTurbo {
@@ -132,7 +183,14 @@ impl DisplayTurbo {
             turbo_frozen_pids: HashSet::new(),
             activation_count: 0,
             last_poll: None,
+            dwell_secs: DWELL_BEFORE_TURBO_SECS,
         }
+    }
+
+    /// Adjust the dwell timer.  Call each cycle with the battery-aware value.
+    /// Shorter on battery (e.g. 2s) → turbo activates faster to save power.
+    pub fn set_dwell_secs(&mut self, secs: u64) {
+        self.dwell_secs = secs.max(1);
     }
 
     /// Poll display state and return what action the daemon should take.
@@ -166,7 +224,7 @@ impl DisplayTurbo {
                     self.display_off_since = None;
                     TurboAction::None
                 } else if let Some(off_since) = self.display_off_since {
-                    if now.duration_since(off_since) >= Duration::from_secs(DWELL_BEFORE_TURBO_SECS)
+                    if now.duration_since(off_since) >= Duration::from_secs(self.dwell_secs)
                     {
                         // Dwell timer expired — activate turbo.
                         self.state = TurboState::TurboActive;
@@ -276,7 +334,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn display_detection_does_not_crash() {
-        // Just verify the ioreg-based detection doesn't panic.
+        // Just verify the IOKit-based detection doesn't panic.
         let _on = is_display_on();
     }
 }

@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
+use crate::engine::sysctl_direct;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -469,21 +469,19 @@ impl SysctlGovernor {
     /// Check if macOS Server Performance Mode is enabled.
     pub fn check_server_mode() {
         println!("Checking Server Performance Mode...");
-        let output = Command::new("/usr/sbin/serverinfo")
-            .arg("--perfmode")
-            .output();
-        match output {
-            Ok(out) => {
-                let status = String::from_utf8_lossy(&out.stdout);
-                if status.contains("enabled") {
+        // serverinfo is only present on macOS Server — check via file existence.
+        if std::path::Path::new("/usr/sbin/serverinfo").exists() {
+            if let Some(val) = sysctl_direct::read_str("kern.iossupportversion") {
+                if val.contains("server") {
                     println!("Server Performance Mode: ENABLED");
                 } else {
                     println!("Server Performance Mode: DISABLED");
                 }
+            } else {
+                println!("Server Performance Mode: DISABLED");
             }
-            Err(_) => {
-                eprintln!("'serverinfo' not found — standard macOS install");
-            }
+        } else {
+            eprintln!("'serverinfo' not found — standard macOS install");
         }
     }
 
@@ -500,20 +498,10 @@ impl SysctlGovernor {
         println!("Applying kernel performance tuning...");
         for action in self.apply_initial_tuning() {
             if let RootAction::SetSysctl { key, value, .. } = &action {
-                let output = Command::new("/usr/sbin/sysctl")
-                    .args(["-w", &format!("{}={}", key, value)])
-                    .output();
-                match output {
-                    Ok(out) if out.status.success() => {
-                        println!("  {} = {}", key, value);
-                    }
-                    Ok(out) => {
-                        let err = String::from_utf8_lossy(&out.stderr);
-                        eprintln!("  WARN: failed to set {}: {}", key, err.trim());
-                    }
-                    Err(e) => {
-                        eprintln!("  WARN: system error setting {}: {}", key, e);
-                    }
+                if sysctl_direct::write_str_value(key, value) {
+                    println!("  {} = {}", key, value);
+                } else {
+                    eprintln!("  WARN: failed to set {} = {}", key, value);
                 }
             }
         }
@@ -1039,14 +1027,9 @@ impl Default for SysctlGovernor {
 
 // ── System helpers ───────────────────────────────────────────────────────────
 
-/// Read a sysctl value via `sysctl -n <key>`.  Returns `None` on failure.
+/// Read a sysctl value via the direct API.  Returns `None` on failure.
 fn read_sysctl(key: &str) -> Option<String> {
-    Command::new("/usr/sbin/sysctl")
-        .args(["-n", key])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    sysctl_direct::read_str(key)
 }
 
 /// Managed sysctl keys.

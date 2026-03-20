@@ -124,6 +124,42 @@ pub fn proc_name_for_pid(_pid: u32) -> Option<String> {
     None
 }
 
+// ── Rosetta 2 detection ──────────────────────────────────────────────────────
+
+/// P_TRANSLATED flag from XNU `bsd/sys/proc_internal.h`.
+/// Set when a process is running under Rosetta 2 binary translation (x86_64→ARM64).
+#[cfg(target_os = "macos")]
+const P_TRANSLATED: u32 = 0x0002_0000;
+
+/// Returns `true` if `pid` is running under Rosetta 2 (x86_64 binary on ARM64).
+///
+/// Rosetta processes incur ~10-30% CPU overhead from JIT translation.
+/// Under memory/CPU pressure, freezing them first recovers more real throughput
+/// than freezing a native ARM64 process at the same reported CPU%.
+#[cfg(target_os = "macos")]
+pub fn is_translated(pid: u32) -> bool {
+    let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcBsdInfo>() as i32;
+    let ret = unsafe {
+        proc_pidinfo(
+            pid as i32,
+            PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut c_void,
+            size,
+        )
+    };
+    if ret <= 0 {
+        return false;
+    }
+    info.pbi_flags & P_TRANSLATED != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_translated(_pid: u32) -> bool {
+    false
+}
+
 /// Validate that `pid` still corresponds to a process named `expected_name`.
 ///
 /// Returns `true` if the process is alive AND its name matches.
@@ -159,5 +195,33 @@ pub fn validate_pid(pid: u32, expected_name: &str) -> bool {
             false
         }
         None => false,
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn own_process_is_not_translated() {
+        // cargo test itself is a native ARM64 binary — should NOT be Rosetta.
+        let own_pid = std::process::id();
+        assert!(
+            !is_translated(own_pid),
+            "test binary should be native ARM64, not Rosetta"
+        );
+    }
+
+    #[test]
+    fn dead_pid_is_not_translated() {
+        assert!(!is_translated(999_999_999));
+    }
+
+    #[test]
+    fn launchd_is_not_translated() {
+        // PID 1 (launchd) is always native.
+        assert!(!is_translated(1));
     }
 }

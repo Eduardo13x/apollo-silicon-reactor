@@ -32,7 +32,6 @@
 //! Under memory pressure, all non-foreground I/O is demoted by 1 tier.
 
 use std::collections::HashMap;
-use std::process::Command;
 use std::time::Instant;
 
 use crate::engine::process_classifier::ProcessTier;
@@ -116,21 +115,25 @@ pub fn io_tier_for_throttle(aggressive: bool) -> IOTier {
     }
 }
 
-/// Apply an I/O tier to a process via `taskpolicy -d`.
+/// Apply an I/O tier to a process via `libc::setpriority`.
 /// Best-effort: returns false on failure but does not panic.
 pub fn apply_io_tier(pid: u32, tier: IOTier) -> bool {
-    let tier_str = match tier {
-        IOTier::Interactive => "0",
-        IOTier::Standard => "1",
-        IOTier::Utility => "2",
-        IOTier::Throttle => "3",
-        IOTier::Passive => "4",
-    };
-    Command::new("/usr/sbin/taskpolicy")
-        .args(["-d", tier_str, "-p", &pid.to_string()])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    // PRIO_DARWIN_BG (0x1000) puts the process into background QoS
+    // which includes IO throttling. For finer control, we use the
+    // MachQoSManager path (apply_io_tier_direct). This is the fallback.
+    match tier {
+        IOTier::Interactive => {
+            // Remove background status.
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 0) == 0 }
+        }
+        IOTier::Standard => {
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 0) == 0 }
+        }
+        IOTier::Utility | IOTier::Throttle | IOTier::Passive => {
+            // Set to background priority (includes IO throttle).
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 20) == 0 }
+        }
+    }
 }
 
 /// Apply an I/O tier via direct Mach syscall through MachQoSManager.

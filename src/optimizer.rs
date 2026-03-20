@@ -4,11 +4,105 @@ use crate::engine::types::HardPath;
 use libc::{kill, SIGCONT, SIGSTOP};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use sysinfo::System;
+
+enum DefaultsValue {
+    Bool(bool),
+    Float(f64),
+}
+
+/// Write a macOS user defaults value via CoreFoundation CFPreferences.
+/// Replaces `defaults write domain key [-type] value`.
+fn defaults_write(domain: &str, key: &str, value: DefaultsValue) {
+    #[cfg(not(target_os = "macos"))]
+    { let _ = (domain, key, value); return; }
+
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn CFStringCreateWithCString(
+                alloc: *const std::ffi::c_void,
+                cstr: *const i8,
+                encoding: u32,
+            ) -> *const std::ffi::c_void;
+            fn CFPreferencesSetAppValue(
+                key: *const std::ffi::c_void,
+                value: *const std::ffi::c_void,
+                app_id: *const std::ffi::c_void,
+            );
+            fn CFPreferencesAppSynchronize(app_id: *const std::ffi::c_void) -> bool;
+            fn CFRelease(cf: *const std::ffi::c_void);
+
+            // kCFBooleanTrue / kCFBooleanFalse
+            static kCFBooleanTrue: *const std::ffi::c_void;
+            static kCFBooleanFalse: *const std::ffi::c_void;
+
+            fn CFNumberCreate(
+                alloc: *const std::ffi::c_void,
+                the_type: i64,
+                value_ptr: *const std::ffi::c_void,
+            ) -> *const std::ffi::c_void;
+        }
+
+        const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+        const K_CF_NUMBER_FLOAT64_TYPE: i64 = 13;
+
+        unsafe {
+            let cf_domain = CFStringCreateWithCString(
+                std::ptr::null(),
+                std::ffi::CString::new(domain).unwrap().as_ptr(),
+                K_CF_STRING_ENCODING_UTF8,
+            );
+            let cf_key = CFStringCreateWithCString(
+                std::ptr::null(),
+                std::ffi::CString::new(key).unwrap().as_ptr(),
+                K_CF_STRING_ENCODING_UTF8,
+            );
+            if cf_domain.is_null() || cf_key.is_null() {
+                if !cf_domain.is_null() { CFRelease(cf_domain); }
+                if !cf_key.is_null() { CFRelease(cf_key); }
+                return;
+            }
+
+            match value {
+                DefaultsValue::Bool(b) => {
+                    let cf_val = if b { kCFBooleanTrue } else { kCFBooleanFalse };
+                    CFPreferencesSetAppValue(cf_key, cf_val, cf_domain);
+                }
+                DefaultsValue::Float(f) => {
+                    let cf_num = CFNumberCreate(
+                        std::ptr::null(),
+                        K_CF_NUMBER_FLOAT64_TYPE,
+                        &f as *const f64 as *const _,
+                    );
+                    if !cf_num.is_null() {
+                        CFPreferencesSetAppValue(cf_key, cf_num, cf_domain);
+                        CFRelease(cf_num);
+                    }
+                }
+            }
+
+            CFPreferencesAppSynchronize(cf_domain);
+            CFRelease(cf_domain);
+            CFRelease(cf_key);
+        }
+    }
+}
+
+/// Send a signal to all processes matching a name. Replaces `killall`.
+fn signal_process_by_name(name: &str, signal: i32) {
+    let sys = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::new().with_processes(sysinfo::ProcessRefreshKind::new()),
+    );
+    for (pid, proc_info) in sys.processes() {
+        if proc_info.name() == name {
+            unsafe { libc::kill(pid.as_u32() as i32, signal); }
+        }
+    }
+}
 
 pub struct HeuristicEngine {
     // Process Name -> (consecutive high-CPU count, last_seen Instant)
@@ -635,7 +729,7 @@ impl OptimizerEngine {
         }
 
         if projected_pressure > 86.0 {
-            let _ = Command::new("/usr/bin/purge").output();
+            crate::engine::host_vm_info::trigger_purge();
         }
     }
 
@@ -802,7 +896,7 @@ impl OptimizerEngine {
         if pressure_percentage > 80.0 || force_purge {
             println!("High memory pressure detected (or Turbo engaged)! Attempting to purge...");
             // Attempt to purge inactive memory
-            let _ = Command::new("/usr/bin/purge").output();
+            crate::engine::host_vm_info::trigger_purge();
 
             // Port from ram-guardian.sh: Guard against memory-hungry system apps
             for process in &snapshot.top_processes {
@@ -811,14 +905,14 @@ impl OptimizerEngine {
                         "🚀 RAM Guardian: Restarting Finder (High Memory: {}MB)",
                         process.memory_usage / 1024 / 1024
                     );
-                    let _ = Command::new("/usr/bin/killall").arg("Finder").output();
+                    signal_process_by_name("Finder", libc::SIGHUP);
                 }
                 if process.name == "Dock" && process.memory_usage > 300 * 1024 * 1024 {
                     println!(
                         "🚀 RAM Guardian: Restarting Dock (High Memory: {}MB)",
                         process.memory_usage / 1024 / 1024
                     );
-                    let _ = Command::new("/usr/bin/killall").arg("Dock").output();
+                    signal_process_by_name("Dock", libc::SIGHUP);
                 }
             }
         }
@@ -827,24 +921,8 @@ impl OptimizerEngine {
     pub fn configure_startup(&self) {
         println!("Configuring Smart Startup...");
         // Disable "Reopen windows when logging back in"
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "com.apple.loginwindow",
-                "TALLogoutSavesState",
-                "-bool",
-                "false",
-            ])
-            .output();
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "com.apple.loginwindow",
-                "LoginwindowLaunchesRelaunchApps",
-                "-bool",
-                "false",
-            ])
-            .output();
+        defaults_write("com.apple.loginwindow", "TALLogoutSavesState", DefaultsValue::Bool(false));
+        defaults_write("com.apple.loginwindow", "LoginwindowLaunchesRelaunchApps", DefaultsValue::Bool(false));
     }
 
     pub fn apply_turbo_mode(&self) {
@@ -852,77 +930,27 @@ impl OptimizerEngine {
 
         // 1. Disable Animations (Speed up UI)
         println!("Disabling UI animations...");
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "NSGlobalDomain",
-                "NSAutomaticWindowAnimationsEnabled",
-                "-bool",
-                "false",
-            ])
-            .output();
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "NSGlobalDomain",
-                "NSWindowResizeTime",
-                "-float",
-                "0.001",
-            ])
-            .output();
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "com.apple.finder",
-                "DisableAllAnimations",
-                "-bool",
-                "true",
-            ])
-            .output();
-        let _ = Command::new("/usr/bin/defaults")
-            .args(["write", "com.apple.dock", "launchanim", "-bool", "false"])
-            .output();
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "com.apple.dock",
-                "expose-animation-duration",
-                "-float",
-                "0.1",
-            ])
-            .output();
+        defaults_write("NSGlobalDomain", "NSAutomaticWindowAnimationsEnabled", DefaultsValue::Bool(false));
+        defaults_write("NSGlobalDomain", "NSWindowResizeTime", DefaultsValue::Float(0.001));
+        defaults_write("com.apple.finder", "DisableAllAnimations", DefaultsValue::Bool(true));
+        defaults_write("com.apple.dock", "launchanim", DefaultsValue::Bool(false));
+        defaults_write("com.apple.dock", "expose-animation-duration", DefaultsValue::Float(0.1));
 
         // Fix for WindowServer "Bad Coding" - Disable Window Shadows (Performance Workaround)
         println!("Applying WindowServer performance workaround (Disable shadows)...");
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "com.apple.WindowManager",
-                "AppWindowShadows",
-                "-bool",
-                "false",
-            ])
-            .output();
+        defaults_write("com.apple.WindowManager", "AppWindowShadows", DefaultsValue::Bool(false));
 
         // 2. Kernel performance tuning (via SysctlGovernor — captures defaults for safe revert)
         let gov = SysctlGovernor::new(unsafe { libc::geteuid() } == 0);
         gov.apply_tuning_direct();
 
         // 3. Disable Dashboard / Widgets (Save RAM)
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "com.apple.dashboard",
-                "mcx-disabled",
-                "-bool",
-                "true",
-            ])
-            .output();
+        defaults_write("com.apple.dashboard", "mcx-disabled", DefaultsValue::Bool(true));
 
         // 4. Restart Dock and Finder to apply
         println!("Restarting UI components...");
-        let _ = Command::new("/usr/bin/killall").arg("Dock").output();
-        let _ = Command::new("/usr/bin/killall").arg("Finder").output();
+        signal_process_by_name("Dock", libc::SIGHUP);
+        signal_process_by_name("Finder", libc::SIGHUP);
 
         // 5. GPU Eco Mode
         self.apply_gpu_eco_mode(true);
@@ -945,7 +973,7 @@ impl OptimizerEngine {
 
         // 3. Hard RAM Purge to make room for models
         println!("🧹 Clearing inactive RAM for models...");
-        let _ = Command::new("/usr/bin/purge").output();
+        crate::engine::host_vm_info::trigger_purge();
 
         // 3. Identify and boost AI processes
         let mut sys = System::new_all();
@@ -958,20 +986,9 @@ impl OptimizerEngine {
             if self.llm_apps.iter().any(|app| name.contains(app)) {
                 println!("🔝 BOOSTING AI PROCESS: {} (PID {})", name, pid_u32);
 
-                // Max Performance Core preference
-                let _ = Command::new("/usr/sbin/taskpolicy")
-                    .args(["-d", "-p", &pid_u32.to_string()])
-                    .output();
-
-                // Priority Tier 1 (Highest)
-                let _ = Command::new("/usr/sbin/taskpolicy")
-                    .args(["-t", "1", "-p", &pid_u32.to_string()])
-                    .output();
-
-                // Max renice (requires root for negative, but we set to 0)
-                let _ = Command::new("/usr/bin/renice")
-                    .args(["-5", "-p", &pid_u32.to_string()]) // Trying -5 for LLM apps (might fail if not root)
-                    .output();
+                unsafe {
+                    libc::setpriority(libc::PRIO_PROCESS, pid_u32, -5);
+                }
             }
         }
 
@@ -981,7 +998,7 @@ impl OptimizerEngine {
     }
 
     fn run_best_effort(&self, program: &str, args: &[&str]) {
-        match Command::new(program).args(args).output() {
+        match std::process::Command::new(program).args(args).output() {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr);
@@ -1031,19 +1048,11 @@ impl OptimizerEngine {
         println!("🔇 Reducing Background Noise (Extreme Mode)...");
 
         // 1. Disable Apple Intelligence Reporting (Background Agent)
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "com.apple.Siri",
-                "AppleIntelligenceReportEnabled",
-                "-bool",
-                "false",
-            ])
-            .output();
+        defaults_write("com.apple.Siri", "AppleIntelligenceReportEnabled", DefaultsValue::Bool(false));
 
         // 2. Close non-essential background daemons (if possible)
-        self.run_best_effort("killall", &["SocialLayerAgent"]); // Shared with You
-        self.run_best_effort("killall", &["CloudPhotoLibrary"]); // Photo Sync
+        signal_process_by_name("SocialLayerAgent", libc::SIGTERM);
+        signal_process_by_name("CloudPhotoLibrary", libc::SIGTERM);
     }
 
     pub fn restore_background_noise(&self) {
@@ -1078,7 +1087,6 @@ impl OptimizerEngine {
             "generative-experiences-daemon", // AI Assets
         ];
 
-        let signal = if active { "-STOP" } else { "-CONT" };
         let action = if active {
             "🔒 QUARANTINING"
         } else {
@@ -1087,53 +1095,20 @@ impl OptimizerEngine {
 
         for daemon in daemons {
             println!("{} device service: {}", action, daemon);
-            let _ = Command::new("/usr/bin/killall")
-                .args([signal, daemon])
-                .output();
+            signal_process_by_name(daemon, if active { libc::SIGSTOP } else { libc::SIGCONT });
         }
     }
 
     pub fn apply_gpu_eco_mode(&self, active: bool) {
-        let val = if active { "true" } else { "false" };
-        // BUG 3 fix: AppWindowShadows semantics are inverted relative to reduceTransparency.
-        // Setting AppWindowShadows=false DISABLES shadows (saves GPU). Eco mode ON → shadows OFF.
-        let val_shadows = if active { "false" } else { "true" };
         let action = if active { "Applying" } else { "Restoring" };
 
         println!("{} GPU Eco-Mode (UI Optimization)...", action);
 
-        // Disable Window Shadows when eco mode is active (huge GPU savings on M1).
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "com.apple.WindowManager",
-                "AppWindowShadows",
-                "-bool",
-                val_shadows,
-            ])
-            .output();
-
-        // Reduce Transparency
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "com.apple.universalaccess",
-                "reduceTransparency",
-                "-bool",
-                val,
-            ])
-            .output();
-
-        // Reduce Motion
-        let _ = Command::new("/usr/bin/defaults")
-            .args([
-                "write",
-                "com.apple.universalaccess",
-                "reduceMotion",
-                "-bool",
-                val,
-            ])
-            .output();
+        // BUG 3 fix: AppWindowShadows semantics are inverted relative to reduceTransparency.
+        // Setting AppWindowShadows=false DISABLES shadows (saves GPU). Eco mode ON → shadows OFF.
+        defaults_write("com.apple.WindowManager", "AppWindowShadows", DefaultsValue::Bool(!active));
+        defaults_write("com.apple.universalaccess", "reduceTransparency", DefaultsValue::Bool(active));
+        defaults_write("com.apple.universalaccess", "reduceMotion", DefaultsValue::Bool(active));
     }
 
     pub fn clean_disk(&self) {
@@ -1246,34 +1221,14 @@ impl OptimizerEngine {
             // BUG 16 fix: self-boost moved to boost_self_once(), called once at startup.
             // Scheduling Priority (Boosted) - only for the target PID.
             libc::setpriority(libc::PRIO_PROCESS, pid, -20);
-
-            // For Mach-level tiers on other PIDs we use the CLI.
-            let _ = Command::new("/usr/sbin/taskpolicy")
-                .args(["-l", "0", "-p", &pid.to_string()])
-                .output();
-            let _ = Command::new("/usr/sbin/taskpolicy")
-                .args(["-t", "0", "-p", &pid.to_string()])
-                .output();
         }
     }
 
     fn set_low_priority(&self, pid: u32, _name: &str, aggressive: bool) {
         // --- CHIP-LEVEL EFFICIENCY SCALING (NATIVE) ---
         unsafe {
-            // 1. Native CPU Scheduling Priority (Throttled)
             let val = if aggressive { 20 } else { 10 };
             libc::setpriority(libc::PRIO_PROCESS, pid, val);
-
-            // 2. Background QoS & I/O Throttling (forces E-Cores)
-            // Using CLI for Mach-level QoS on other PIDs.
-            let _ = Command::new("/usr/sbin/taskpolicy")
-                .args(["-b", "-p", &pid.to_string()])
-                .output();
-
-            let tier = if aggressive { "4" } else { "2" };
-            let _ = Command::new("/usr/sbin/taskpolicy")
-                .args(["-l", tier, "-p", &pid.to_string()])
-                .output();
         }
     }
 

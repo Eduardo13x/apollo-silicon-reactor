@@ -34,7 +34,7 @@
 //! 5. **Night boost**: During display-off (turbo mode), lower the pressure gate
 //!    to 0.40 for more aggressive reclaim when nobody is watching
 
-use std::process::Command;
+use crate::engine::host_vm_info;
 use std::time::{Duration, Instant};
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -64,41 +64,25 @@ const MAX_PURGES_PER_HOUR: u32 = 6;
 /// Requires root privileges.  Returns estimated bytes freed (based on
 /// inactive page count delta before/after).
 fn execute_purge() -> u64 {
-    // Sample inactive pages before purge.
-    let before = inactive_page_bytes();
+    let before = host_vm_info::read_vm_stats()
+        .map(|s| s.reclaimable_bytes())
+        .unwrap_or(0);
 
-    // `purge` is a macOS built-in: sync + flush VM page cache.
-    let _ = Command::new("/usr/sbin/purge").output();
+    host_vm_info::trigger_purge();
 
-    // Sample after.
-    let after = inactive_page_bytes();
+    let after = host_vm_info::read_vm_stats()
+        .map(|s| s.reclaimable_bytes())
+        .unwrap_or(0);
 
     before.saturating_sub(after)
 }
 
-/// Get current inactive page count in bytes via `vm_stat`.
+/// Get current reclaimable page bytes via host_vm_info.
+#[cfg(test)]
 fn inactive_page_bytes() -> u64 {
-    let output = match Command::new("vm_stat").output() {
-        Ok(o) => o,
-        Err(_) => return 0,
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Sum "Pages inactive:" + "Pages speculative:" — both are reclaimable.
-    // Must accumulate, not return early on first match.
-    let mut total_pages: u64 = 0;
-    for line in stdout.lines() {
-        if line.starts_with("Pages inactive:") || line.starts_with("Pages speculative:") {
-            if let Some(num_str) = line.split(':').nth(1) {
-                let cleaned = num_str.trim().trim_end_matches('.');
-                if let Ok(pages) = cleaned.parse::<u64>() {
-                    total_pages = total_pages.saturating_add(pages);
-                }
-            }
-        }
-    }
-    // macOS page size is always 16384 on ARM64.
-    total_pages * 16384
+    host_vm_info::read_vm_stats()
+        .map(|s| s.reclaimable_bytes())
+        .unwrap_or(0)
 }
 
 // ── Adaptive Reclaim Controller ─────────────────────────────────────────────
