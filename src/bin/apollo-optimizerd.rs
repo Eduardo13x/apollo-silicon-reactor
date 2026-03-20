@@ -43,6 +43,8 @@ use apollo_optimizer::engine::holt_winters::HoltWinters;
 use apollo_optimizer::engine::hw_bayes::HwFeatures;
 use apollo_optimizer::engine::hw_predictor::{sample_hw_pressure, HwPressure};
 use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
+use apollo_optimizer::engine::coalition::CoalitionTracker;
+use apollo_optimizer::engine::ioreport::IOReportReader;
 use apollo_optimizer::engine::jetsam_control;
 use apollo_optimizer::engine::kqueue_pressure;
 use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
@@ -107,6 +109,27 @@ use sysinfo::ProcessStatus;
 
 const FREEZE_TTL_SECS: i64 = 10 * 60;
 const REACTOR_FAST_TICK_SECS: u64 = 30;
+
+/// Battery-aware pressure boost: on battery, effective pressure is raised so
+/// all decision gates trigger sooner.  This proactively freezes backgrounds
+/// before hardware thermal throttling kicks in (critical on fanless M1 Air).
+///
+/// Returns a value to ADD to the raw memory_pressure reading:
+///   AC power  → 0.00  (no change)
+///   Battery >50% → +0.04  (slightly more aggressive)
+///   Battery 20-50% → +0.10  (noticeably more aggressive)
+///   Battery <20%  → +0.18  (maximum aggressiveness)
+fn battery_pressure_boost(power_mgr: &PowerManager) -> f64 {
+    use apollo_optimizer::engine::power_management::BatteryMode;
+    if !power_mgr.is_on_battery() {
+        return 0.0;
+    }
+    match power_mgr.battery_mode_current() {
+        BatteryMode::Normal => 0.04,
+        BatteryMode::LowPower => 0.10,
+        BatteryMode::Critical => 0.18,
+    }
+}
 
 /// Seed policy embedded at compile time — guarantees Brave, Claude, Warp, etc.
 /// are always in interactive_patterns even on fresh installs or corrupt disk policy.
@@ -504,21 +527,9 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        // EVFILT_VM / NOTE_VM_PRESSURE
-        let mem_kev = libc::kevent {
-            ident: 0,
-            filter: -12, // EVFILT_VM (Darwin)
-            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-            fflags: 0x80000000, // NOTE_VM_PRESSURE
-            data: 0,
-            udata: 1 as *mut libc::c_void, // ID 1 = Memory
-        };
-        let reg_rc = libc::kevent(kq, &mem_kev, 1, std::ptr::null_mut(), 0, std::ptr::null());
-        if reg_rc < 0 {
-            let errno = *libc::__error();
-            state.reactor_status.lock_recover().last_error =
-                Some(format!("EVFILT_VM registration failed errno={}", errno));
-        }
+        // Memory pressure via sysctl polling (all push APIs are broken on macOS 15).
+        // Polls kern.memorystatus_vm_pressure_level (~1µs) on each loop iteration.
+        let mut pressure_monitor = apollo_optimizer::engine::dispatch_pressure::KernelPressureMonitor::new();
 
         // notify -> thermal
         let mut thermal_fd: libc::c_int = 0;
@@ -622,6 +633,25 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
                 let mut m = state.metrics.lock_recover();
                 m.reactor_pulses += 1;
             }
+            // Poll kernel pressure level on every iteration (~1µs sysctl read).
+            // Fires memory signal on level transitions (Normal↔Warning↔Critical).
+            if let Some(level) = pressure_monitor.poll() {
+                use apollo_optimizer::engine::dispatch_pressure::KernelPressureLevel;
+                if level >= KernelPressureLevel::Warning {
+                    state
+                        .resource_interrupt
+                        .memory_signal
+                        .store(true, Ordering::Release);
+                }
+                state.reactor_status.lock_recover().events_mem += 1;
+                // Wake main loop for pressure transition.
+                {
+                    let (lock, cvar) = &*state.cycle_condvar;
+                    let mut triggered = lock.lock_recover();
+                    *triggered = true;
+                    cvar.notify_one();
+                }
+            }
             if n == 0 {
                 // Timeout — no events within 1 second.  Continue the loop so the
                 // condvar pulse above keeps the main loop aware the reactor is alive.
@@ -680,7 +710,6 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
                     .store(true, Ordering::Release);
             } else if id == 1 {
                 state.reactor_status.lock_recover().events_mem += 1;
-                // Signal resource sentinel for memory pressure events.
                 state
                     .resource_interrupt
                     .memory_signal
@@ -1065,19 +1094,11 @@ fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonResponse {
                 },
                 format!(
                     "swapusage_readable: {}",
-                    std::process::Command::new("/usr/sbin/sysctl")
-                        .args(["vm.swapusage"])
-                        .output()
-                        .map(|o| o.status.success())
-                        .unwrap_or(false)
+                    apollo_optimizer::engine::sysctl_direct::read_swap_usage().is_some()
                 ),
                 format!(
                     "memory_pressure_readable: {}",
-                    std::process::Command::new("/usr/bin/memory_pressure")
-                        .args(["-Q"])
-                        .output()
-                        .map(|o| o.status.success())
-                        .unwrap_or(false)
+                    apollo_optimizer::engine::host_vm_info::read_vm_stats().is_some()
                 ),
             ];
             DaemonResponse::Doctor { checks }
@@ -2369,6 +2390,8 @@ fn build_enriched_process_data_with_tree(
             process_uptime_secs,
             faults_total,
             pageins_total,
+            is_translated: apollo_optimizer::engine::process_identity::is_translated(pid_u32),
+            mach_port_count: 0, // populated lazily for hoarder candidates only
         });
 
         hunt_snaps.push(HuntSnapshot {
@@ -2488,6 +2511,18 @@ fn convert_and_merge_heuristic_decisions(
     }
 
     (new_actions, stats)
+}
+
+/// Toggle Spotlight indexing via `mdutil -a -i on/off`.
+///
+/// mdutil communicates with the Spotlight server via XPC (com.apple.spotlightserver).
+/// There is no public or private framework function equivalent — MDSetIndexingEnabled
+/// does not exist in the dyld shared cache on Apple Silicon macOS 15.
+fn spotlight_set_indexing(enabled: bool) {
+    let flag = if enabled { "on" } else { "off" };
+    let _ = std::process::Command::new("/usr/bin/mdutil")
+        .args(["-a", "-i", flag])
+        .status();
 }
 
 fn main() -> anyhow::Result<()> {
@@ -2893,6 +2928,84 @@ fn main() -> anyhow::Result<()> {
                 apollo_optimizer::engine::page_reclaim::PageReclaim::new(is_root);
             // Audit fix #6: Multi-phase thermal bail-out with hysteresis.
             let mut thermal_bailout = ThermalBailout::new();
+
+            // ── Coalition tracker (kernel-authoritative process families) ─────
+            // Groups app + all XPC/GPU/framework helpers by kernel coalition ID.
+            // Used to augment foreground family detection beyond heuristic name-matching.
+            let coalition_tracker = CoalitionTracker::new();
+
+            // ── IOReport reader (hardware telemetry without subprocess overhead) ─
+            // Provides P/E cluster utilization, GPU%, ANE activity, per-component mW.
+            // Samples the first baseline here; delta is computed each cycle.
+            let mut ioreport = IOReportReader::new();
+            if ioreport.available {
+                #[cfg(target_os = "macos")]
+                ioreport.begin_sample();
+                println!("[ioreport] IOReport subscription active");
+            } else {
+                println!("[ioreport] IOReport unavailable, using SMC fallback");
+            }
+            // Last IOReport snapshot (updated each cycle).
+            let mut last_ioreport: Option<apollo_optimizer::engine::ioreport::IOReportSnapshot> = None;
+            // Throttle IOReport to every ~2 cycles (≥1s between samples).
+            let mut last_ioreport_sample = Instant::now();
+
+            // ── Warn-limit tracking (non-fatal targeted memory pressure) ──────
+            // PIDs that have an active warn_limit set; cleared after 3 cycles.
+            let mut warn_limit_pids: HashMap<u32, u8> = HashMap::new();
+
+            // ── Feature 1: LLM Inference Mode ────────────────────────────────
+            // Auto-detect ollama / llama.cpp / MLX / LM Studio inference.
+            // When active: +20pp pressure boost, Spotlight off, App Nap non-essential.
+            let mut llm_detector =
+                apollo_optimizer::engine::llm_inference_mode::LlmInferenceDetector::new();
+            let mut llm_spotlight_disabled = false;
+
+            // ── Feature 3: RT Boost for Foreground ───────────────────────────
+            // THREAD_TIME_CONSTRAINT_POLICY: guarantee 2ms/10ms to foreground UI thread.
+            // Eliminates UI hitches during heavy CPU load (e.g., LLM inference + browser).
+            let mut rt_boosted_pid: Option<u32> = None;
+
+            // ── Feature 4: Post-Wake Suppression ─────────────────────────────
+            // Detect sleep/wake by comparing elapsed time vs cycle interval.
+            // 60s App-Nap window after wake suppresses background update storms.
+            // (reuses last_cycle_instant declared above for energy dt tracking)
+            let mut wake_suppression_until: Option<Instant> = None;
+
+            // ── SMC Direct Read ──────────────────────────────────────────────
+            // Sub-100µs power, lid, sleep/wake, battery telemetry (replaces powermetrics).
+            let smc_direct = apollo_optimizer::engine::smc_direct::SmcDirectReader::new();
+            let mut last_smc: Option<apollo_optimizer::engine::smc_direct::SmcSnapshot> = None;
+            if smc_direct.available {
+                println!("[smc-direct] SMC direct reader active");
+            } else {
+                println!("[smc-direct] SMC direct reader unavailable");
+            }
+
+            // ── KPC Hardware Performance Counters ────────────────────────────
+            // Per-core IPC via libkpc.dylib (fixed counters: cycles + instructions).
+            let mut kpc_reader = apollo_optimizer::engine::kpc_counters::KpcReader::new();
+            if kpc_reader.available {
+                println!("[kpc] Hardware performance counters active");
+            } else {
+                println!("[kpc] KPC counters unavailable (SIP or not root)");
+            }
+
+            // ── Rosetta AOT Monitor ─────────────────────────────────────────
+            // Watches /var/db/oah/ for write events → suppress freezing oahd.
+            let mut rosetta_monitor = apollo_optimizer::engine::rosetta_monitor::RosettaMonitor::new();
+            if rosetta_monitor.available {
+                println!("[rosetta] AOT compilation monitor active");
+            } else {
+                println!("[rosetta] Rosetta not installed or /var/db/oah inaccessible");
+            }
+
+            // ── Per-Process Energy Ranking (ri_billed_energy) ────────────────
+            let mut energy_pid_tracker = apollo_optimizer::engine::energy_pid::EnergyPidTracker::new();
+
+            // ── Daemon self-IPC monitoring (thread_selfcounts syscall 186) ───
+            let mut cycle_ipc_tracker = apollo_optimizer::engine::thread_selfcounts::CycleIpcTracker::new();
+
             // Freeze confirmation cache: pid → consecutive cycles flagged.
             // Only freeze processes that have been candidates for 2+ cycles,
             // filtering out short-lived transients that die before execute_actions.
@@ -2950,6 +3063,26 @@ fn main() -> anyhow::Result<()> {
                 cycle_count += 1;
                 lf_metrics.inc_cycles();
                 println!(">>> Daemon cycle: {}", cycle_count);
+
+                // ── Feature 4: Post-Wake Suppression ─────────────────────────
+                // If more than 30s passed since the last cycle, the system was
+                // sleeping. Apply 60s App-Nap window to all non-essential
+                // backgrounds so the foreground app restores its state first.
+                let elapsed_since_last_cycle = last_cycle_instant.elapsed();
+                if elapsed_since_last_cycle > Duration::from_secs(30) {
+                    wake_suppression_until = Some(Instant::now() + Duration::from_secs(60));
+                    println!(
+                        "[wake] System woke from sleep ({}s gap) — 60s background suppression active",
+                        elapsed_since_last_cycle.as_secs()
+                    );
+                    // Release any App Nap set before sleep; re-evaluate fresh.
+                    let mut qos = state.mach_qos.lock_recover();
+                    qos.release_all_app_nap();
+                }
+                last_cycle_instant = Instant::now();
+                let in_wake_suppression = wake_suppression_until
+                    .map(|t| Instant::now() < t)
+                    .unwrap_or(false);
 
                 // Enforce minimum 300ms between cycles to prevent event-storm CPU burn.
                 let since_last = last_cycle_end.elapsed();
@@ -3060,7 +3193,11 @@ fn main() -> anyhow::Result<()> {
                 drop(wake_state_guard);
 
                 // Display-Off Turbo: Android Doze-like power management.
-                // When display is off for >5s, freeze all non-essential processes.
+                // Battery-aware dwell: on battery shorten dwell to 2s so turbo activates
+                // faster → more aggressive power savings when user steps away.
+                display_turbo.set_dwell_secs(if power_mgr.is_on_battery() { 2 } else { 5 });
+
+                // When display is off for >5s (or 2s on battery), freeze all non-essential processes.
                 // On display-on, instantly unfreeze everything we froze.
                 {
                     use apollo_optimizer::engine::display_turbo::TurboAction;
@@ -3469,6 +3606,102 @@ fn main() -> anyhow::Result<()> {
                     }
                 };
                 let thermal_emergency = thermal_action.force_ecores;
+                // Thermal pre-throttle boost: raise effective pressure early (Phase1=80°C)
+                // so page_reclaim + io_shaper + governor act before hardware throttles.
+                // M1 Air has no fan — acting 5-10°C before the hardware ceiling prevents
+                // visible stutter caused by hardware-level frequency reduction.
+                let thermal_pressure_boost = match thermal_action.phase {
+                    apollo_optimizer::engine::thermal_bailout::CoolingPhase::Normal => 0.0,
+                    apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase1Gentle => 0.07,
+                    apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase2Moderate => 0.15,
+                    apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase3Aggressive => 0.25,
+                    apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase4Emergency => 0.40,
+                };
+
+                // Thermal Pre-Throttle: proactively freeze SilentDaemon/Stale backgrounds at
+                // Phase3Aggressive (≥90°C) before hardware throttling causes visible stutter.
+                // M1 Air has no fan — acting here is 5-10°C ahead of the hardware ceiling.
+                // Unfreeze when temperature drops back to Phase2 or below (hysteresis built into
+                // ThermalBailout keeps us from thrashing).
+                if thermal_action.freeze_background || thermal_action.freeze_all_non_critical {
+                    let critical_pats = critical_background_processes();
+                    let protected_pats = protected_processes();
+                    let policy_protected = state
+                        .learned_policy
+                        .lock_recover()
+                        .protected_patterns
+                        .clone();
+                    let fg_pid = foreground_pid;
+                    let mut frozen_guard = state.frozen_state.lock_recover();
+                    let mut thermal_frozen = 0u32;
+                    // Phase3: only freeze idle backgrounds (<2% CPU).
+                    // Phase4: freeze everything non-critical regardless of CPU.
+                    let cpu_threshold: f32 = if thermal_action.freeze_all_non_critical {
+                        100.0 // Phase4: no CPU filter
+                    } else {
+                        2.0 // Phase3: only idle processes
+                    };
+
+                    for (pid, process) in collector.system().processes() {
+                        let pid_u32 = pid.as_u32();
+                        let name = process.name().to_string();
+                        let cpu = process.cpu_usage();
+                        if cpu > cpu_threshold
+                            || Some(pid_u32) == fg_pid
+                            || critical_pats.iter().any(|p| name.contains(p))
+                            || protected_pats.iter().any(|p| name.contains(p))
+                            || policy_protected.iter().any(|p| name.contains(p.as_str()))
+                            || name == "apollo-optimizerd"
+                            || frozen_guard.contains_key(&pid_u32)
+                        {
+                            continue;
+                        }
+                        if thermal_frozen >= 80 {
+                            break;
+                        }
+                        if unsafe { libc::kill(pid_u32 as i32, libc::SIGSTOP) } == 0 {
+                            frozen_guard.insert(
+                                pid_u32,
+                                FrozenEntry {
+                                    frozen_at: Utc::now(),
+                                    source: FreezeSource::ThermalPreThrottle,
+                                },
+                            );
+                            thermal_frozen += 1;
+                        }
+                    }
+                    if thermal_frozen > 0 {
+                        write_frozen_state(&frozen_state_path, &frozen_guard);
+                        state.metrics.lock_recover().freezes_applied += thermal_frozen as u64;
+                        println!(
+                            "[thermal] Phase {:?}: froze {} background processes (pre-throttle)",
+                            thermal_action.phase, thermal_frozen
+                        );
+                    }
+                    drop(frozen_guard);
+                } else {
+                    // Temperature dropped back to Phase2 or below — unfreeze any PIDs we froze
+                    // thermally so the system returns to normal when it's cool enough.
+                    let thermal_frozen_pids: Vec<u32> = {
+                        let frozen_guard = state.frozen_state.lock_recover();
+                        frozen_guard
+                            .iter()
+                            .filter(|(_, e)| e.source == FreezeSource::ThermalPreThrottle)
+                            .map(|(&pid, _)| pid)
+                            .collect()
+                    };
+                    if !thermal_frozen_pids.is_empty() {
+                        let n = unfreeze_pids(thermal_frozen_pids.iter().copied());
+                        let mut frozen_guard = state.frozen_state.lock_recover();
+                        for pid in &thermal_frozen_pids {
+                            frozen_guard.remove(pid);
+                        }
+                        write_frozen_state(&frozen_state_path, &frozen_guard);
+                        drop(frozen_guard);
+                        state.metrics.lock_recover().unfreezes_applied += n;
+                        println!("[thermal] Cooled: unfroze {} pre-throttled processes", n);
+                    }
+                }
 
                 // HwPredictor: sample hardware signals every 5 cycles (~2.5s at normal rate).
                 // Runs in <50ms and gives advance warning before metrics APIs catch up.
@@ -3685,7 +3918,182 @@ fn main() -> anyhow::Result<()> {
                 };
                 let pressure_cpu =
                     ((snapshot.cpu.global_usage as f64 / 100.0) + hw_boost).clamp(0.0, 1.0);
-                let pressure_ram = (snapshot.pressure.memory_pressure + hw_boost).clamp(0.0, 1.0);
+                let batt_boost = battery_pressure_boost(&power_mgr);
+
+                // ── IOReport: P/E cluster utilization + real power telemetry ──
+                // Sample delta every cycle (≥500ms interval typical).
+                // end_sample() + begin_sample() gives rolling inter-cycle window.
+                if ioreport.available && last_ioreport_sample.elapsed() >= Duration::from_millis(900) {
+                    #[cfg(target_os = "macos")]
+                    {
+                        last_ioreport = ioreport.end_sample();
+                        ioreport.begin_sample();
+                    }
+                    last_ioreport_sample = Instant::now();
+                }
+
+                // ── SMC Direct: power, lid, sleep/wake, battery ─────────────
+                if smc_direct.available {
+                    last_smc = smc_direct.read_snapshot();
+                }
+
+                // ── KPC: hardware performance counters (IPC) ────────────────
+                let kpc_snap = if kpc_reader.available {
+                    kpc_reader.sample()
+                } else {
+                    None
+                };
+
+                // ── Rosetta AOT: poll for oahd-helper activity ──────────────
+                rosetta_monitor.poll();
+
+                // ── Per-process energy ranking (ri_billed_energy) ────────────
+                let energy_pid_results = {
+                    let procs: Vec<(u32, &str)> = snapshot
+                        .top_processes
+                        .iter()
+                        .map(|p| (p.pid, p.name.as_str()))
+                        .collect();
+                    energy_pid_tracker.sample(&procs, cycle_dt_secs)
+                };
+
+                // Build IPC hint map for decide_actions (pid → IPC from rusage).
+                let ipc_hints: HashMap<u32, f64> = energy_pid_results
+                    .iter()
+                    .filter(|e| e.ipc > 0.0)
+                    .map(|e| (e.pid, e.ipc))
+                    .collect();
+
+                // ── IOPMrootDomain direct thermal (every 5 cycles) ──────────
+                let iopm_snap = if cycle_count % 5 == 0 {
+                    apollo_optimizer::engine::thermal_iokit::read_iopm_state()
+                } else {
+                    None
+                };
+
+                // ── Memory bandwidth pressure boost ─────────────────────────
+                // AMC bandwidth > 80% = memory-bound → freeze more aggressively.
+                let mem_bw_boost = last_ioreport
+                    .as_ref()
+                    .filter(|ir| ir.memory_bandwidth_saturated())
+                    .map(|_| 0.10)
+                    .unwrap_or(0.0);
+
+                // ── SMC thermal direct boost ────────────────────────────────
+                // CPU temp from SMC is real-time (<100µs). Use it to augment
+                // thermal_bailout when powermetrics is stale.
+                let smc_thermal_boost = last_smc
+                    .as_ref()
+                    .and_then(|s| s.cpu_temp_celsius)
+                    .map(|t| {
+                        if t >= 100.0 { 0.30 }      // critical
+                        else if t >= 90.0 { 0.15 }   // severe
+                        else if t >= 80.0 { 0.05 }    // moderate
+                        else { 0.0 }
+                    })
+                    .unwrap_or(0.0);
+
+                // ── Battery overheat protection ─────────────────────────────
+                let battery_overheat_boost = last_smc
+                    .as_ref()
+                    .filter(|s| s.battery_overheating())
+                    .map(|_| 0.12)
+                    .unwrap_or(0.0);
+
+                // ── Feature 1: LLM Inference Mode ─────────────────────────────
+                // Detect ollama/llama.cpp/MLX and boost pressure gates aggressively.
+                let llm_boost = {
+                    let proc_iter = snapshot
+                        .top_processes
+                        .iter()
+                        .map(|p| (p.pid, p.name.as_str(), p.cpu_usage));
+                    llm_detector.observe(proc_iter);
+                    llm_detector.pressure_boost()
+                };
+                let llm_active = llm_detector.is_active();
+
+                // Spotlight management: disable during LLM inference, re-enable when done.
+                if is_root {
+                    if llm_active && !llm_spotlight_disabled {
+                        spotlight_set_indexing(false);
+                        llm_spotlight_disabled = true;
+                        println!("[llm-mode] Spotlight indexing disabled for inference");
+                    } else if !llm_active && llm_spotlight_disabled {
+                        spotlight_set_indexing(true);
+                        llm_spotlight_disabled = false;
+                        println!("[llm-mode] Spotlight indexing re-enabled");
+                    }
+                }
+
+                // ── Feature 3: RT Boost for Foreground ────────────────────────
+                // Apply THREAD_TIME_CONSTRAINT_POLICY to foreground UI thread.
+                // Only when thermal is not critical (Phase3+ would negate the benefit).
+                if thermal_action.phase < apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase3Aggressive {
+                    if let Some(fg_pid) = foreground_pid {
+                        if rt_boosted_pid != Some(fg_pid) {
+                            // Clear RT boost from previous foreground.
+                            if let Some(old_pid) = rt_boosted_pid {
+                                let mut qos = state.mach_qos.lock_recover();
+                                qos.clear_realtime_boost(old_pid);
+                            }
+                            // Apply RT boost to new foreground.
+                            let mut qos = state.mach_qos.lock_recover();
+                            if qos.set_realtime_boost(fg_pid) {
+                                rt_boosted_pid = Some(fg_pid);
+                            } else {
+                                rt_boosted_pid = None;
+                            }
+                        }
+                    } else if let Some(old_pid) = rt_boosted_pid {
+                        // No foreground — clear boost.
+                        let mut qos = state.mach_qos.lock_recover();
+                        qos.clear_realtime_boost(old_pid);
+                        rt_boosted_pid = None;
+                    }
+                }
+
+                // ── Charging thermal stress ──────────────────────────────────
+                // On fanless M1 Air, charging + heavy compute simultaneously
+                // causes SoC thermal throttling.  IOReport total_watts > 8W
+                // while charging is a strong indicator.
+                // Boost pressure by 0.06 to proactively freeze backgrounds
+                // before hardware throttles.
+                // Prefer SMC PSTR (real-time, <100µs) over IOReport total_watts.
+                let system_watts = last_smc
+                    .as_ref()
+                    .and_then(|s| s.system_power_watts)
+                    .or_else(|| last_ioreport.as_ref().map(|ir| ir.total_watts()));
+
+                let charging_stress_boost = if let Some(watts) = system_watts {
+                    let is_charging = last_smc
+                        .as_ref()
+                        .and_then(|s| s.charger_watts)
+                        .map(|cw| cw > 0.0)
+                        .unwrap_or_else(|| {
+                            cycle_hw_snap
+                                .as_ref()
+                                .and_then(|h| h.battery_watts)
+                                .map(|w| w < 0.0) // negative = charging
+                                .unwrap_or(false)
+                        });
+                    if is_charging && watts > 8.0 {
+                        0.06
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+
+                // ── Battery aggressiveness: B0TE < 20 min → extra pressure ──
+                let battery_low_boost = last_smc
+                    .as_ref()
+                    .and_then(|s| s.battery_time_to_empty_min)
+                    .filter(|&tte| tte < 20)
+                    .map(|_| 0.08)
+                    .unwrap_or(0.0);
+
+                let pressure_ram = (snapshot.pressure.memory_pressure + hw_boost + batt_boost + thermal_pressure_boost + llm_boost + charging_stress_boost + battery_low_boost + mem_bw_boost + smc_thermal_boost + battery_overheat_boost).clamp(0.0, 1.0);
                 let pressure_wait = snapshot
                     .top_processes
                     .iter()
@@ -3807,6 +4215,58 @@ fn main() -> anyhow::Result<()> {
                     // Process tree metrics (informational).
                     metrics.process_tree_groups = process_tree.group_count();
                     metrics.process_tree_total = process_tree.len();
+
+                    // IOReport hardware telemetry.
+                    if let Some(ref ir) = last_ioreport {
+                        metrics.ioreport_p_cluster_pct = ir.p_cluster_pct;
+                        metrics.ioreport_e_cluster_pct = ir.e_cluster_pct;
+                        metrics.ioreport_gpu_pct = ir.gpu_pct;
+                        metrics.ioreport_ane_busy = ir.ane_busy;
+                        metrics.ioreport_cpu_mw = ir.cpu_mw;
+                        metrics.ioreport_total_watts = ir.total_watts();
+                    }
+
+                    // SMC direct metrics
+                    if let Some(ref smc) = last_smc {
+                        metrics.smc_system_power_watts = smc.system_power_watts;
+                        metrics.smc_lid_closed = smc.lid_closed;
+                        metrics.smc_charger_watts = smc.charger_watts;
+                        metrics.smc_battery_tte_min = smc.battery_time_to_empty_min;
+                        metrics.smc_cpu_temp_celsius = smc.cpu_temp_celsius;
+                        metrics.smc_gpu_temp_celsius = smc.gpu_temp_celsius;
+                        metrics.smc_battery_temp_celsius = smc.battery_temp_celsius;
+                        metrics.smc_cpu_voltage = smc.cpu_voltage;
+                        metrics.smc_p_cluster_watts = smc.p_cluster_watts;
+                    }
+
+                    // KPC IPC metric
+                    if let Some(ref kpc) = kpc_snap {
+                        metrics.kpc_ipc = kpc.ipc;
+                    }
+
+                    // Rosetta AOT state
+                    metrics.rosetta_aot_active = rosetta_monitor.is_compiling();
+
+                    // IOReport AMC bandwidth
+                    if let Some(ref ir) = last_ioreport {
+                        metrics.ioreport_amc_bandwidth_pct = ir.amc_bandwidth_pct;
+                    }
+
+                    // IOPMrootDomain thermal
+                    if let Some(ref iopm) = iopm_snap {
+                        metrics.iopm_thermal_warning = format!("{:?}", iopm.thermal_warning);
+                        metrics.iopm_power_source = format!("{:?}", iopm.power_source);
+                    }
+
+                    // Per-process energy top consumer
+                    if let Some(top) = energy_pid_results.first() {
+                        metrics.energy_top_pid_name = top.name.clone();
+                        metrics.energy_top_pid_mw = top.power_mw;
+                    }
+
+                    // Daemon self-IPC (thread_selfcounts syscall 186)
+                    let _cycle_ipc = cycle_ipc_tracker.tick();
+                    metrics.daemon_cycle_ipc = cycle_ipc_tracker.ema_ipc();
                 }
 
                 let (decide_interactive, decide_noise, decide_weights, outcome_baseline) = {
@@ -4135,8 +4595,8 @@ fn main() -> anyhow::Result<()> {
                 // Runs every 10 cycles (~5s) to avoid vm_stat overhead every cycle.
                 if cycle_count % 10 == 0 {
                     let freed = page_reclaim.tick(
-                        snapshot.pressure.memory_pressure,
-                        display_turbo.is_turbo_active(),
+                        (snapshot.pressure.memory_pressure + battery_pressure_boost(&power_mgr) + thermal_pressure_boost).clamp(0.0, 1.0),
+                        display_turbo.is_turbo_active() || thermal_action.phase >= apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase2Moderate,
                         foreground_idle,
                     );
                     if freed > 0 {
@@ -4164,6 +4624,7 @@ fn main() -> anyhow::Result<()> {
                         &decide_weights,
                         outcome_baseline,
                         &behavior_interactive_pids,
+                        &ipc_hints,
                     )
                 };
                 *state.last_blockers.lock_recover() = decision.blockers.clone();
@@ -4388,74 +4849,180 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // WakeStormDetector: throttle processes generating excessive wakeups.
+                // ── Feature 5: Wakeup Budget Enforcer ───────────────────────
+                // Upgrade from ThrottleProcess to App Nap for wakeup offenders.
+                // App Nap suppresses CPU + timers + I/O without SIGSTOP artifacts.
+                // Processes that calm down (storm cleared) are released automatically.
                 let storms = wake_storm.detect_storms();
-                for storm in &storms {
-                    if !heuristic_critical_pids.contains(&storm.pid) {
-                        let (ss, su) = pid_start_time(storm.pid);
-                        actions.push(RootAction::ThrottleProcess {
-                            pid: storm.pid,
-                            name: storm.name.clone(),
-                            aggressive: false,
-                            reason: format!(
-                                "wake-storm: {:.0} wakeups/sec",
-                                storm.wakeups_per_second
-                            ),
-                            start_sec: ss,
-                            start_usec: su,
-                        });
+                {
+                    let storm_pids: std::collections::HashSet<u32> =
+                        storms.iter().map(|s| s.pid).collect();
+                    let mut qos = state.mach_qos.lock_recover();
+
+                    // App-Nap new offenders.
+                    for storm in &storms {
+                        if !heuristic_critical_pids.contains(&storm.pid)
+                            && Some(storm.pid) != foreground_pid
+                        {
+                            qos.set_app_nap(storm.pid, true);
+                        }
+                    }
+
+                    // Release App Nap for pids that are no longer in a storm.
+                    // (gc_dead_pids handles dead pids; this handles calmed pids)
+                    let app_napped_snapshot: Vec<u32> = qos
+                        .current_tier_keys()
+                        .iter()
+                        .filter(|(pid, _)| qos.is_app_napped(*pid))
+                        .map(|(pid, _)| *pid)
+                        .collect();
+                    for pid in app_napped_snapshot {
+                        if !storm_pids.contains(&pid) {
+                            qos.set_app_nap(pid, false);
+                        }
                     }
                 }
 
-                // Paging hints: send memory pressure signal to idle memory hoarders.
-                // Triggers the process's pressure handler to release caches.
+                // ── Feature 2 + 4: App Nap for LLM mode and post-wake window ──
+                // During LLM inference: App-Nap all non-foreground non-essential.
+                // During wake suppression: same, to give foreground first crack.
+                if llm_active || in_wake_suppression {
+                    let protected_pats = protected_processes();
+                    let policy_protected = state
+                        .learned_policy
+                        .lock_recover()
+                        .protected_patterns
+                        .clone();
+                    let mut qos = state.mach_qos.lock_recover();
+                    for (pid, process) in collector.system().processes() {
+                        let pid_u32 = pid.as_u32();
+                        let name = process.name();
+                        if Some(pid_u32) == foreground_pid
+                            || heuristic_critical_pids.contains(&pid_u32)
+                            || protected_pats.iter().any(|p| name.contains(p))
+                            || policy_protected.iter().any(|p| name.contains(p.as_str()))
+                            || name == "apollo-optimizerd"
+                        {
+                            // Foreground and protected: ensure NOT app-napped.
+                            if qos.is_app_napped(pid_u32) {
+                                qos.set_app_nap(pid_u32, false);
+                            }
+                            continue;
+                        }
+                        // Skip if already app-napped (dedup).
+                        if !qos.is_app_napped(pid_u32) {
+                            qos.set_app_nap(pid_u32, true);
+                        }
+                    }
+                } else if !in_wake_suppression && !llm_active {
+                    // Neither LLM nor wake: release any LLM/wake App Naps that
+                    // aren't also wake-storm offenders.
+                    let storm_pids: std::collections::HashSet<u32> =
+                        storms.iter().map(|s| s.pid).collect();
+                    let mut qos = state.mach_qos.lock_recover();
+                    let app_napped: Vec<u32> = qos
+                        .current_tier_keys()
+                        .iter()
+                        .filter(|(pid, _)| qos.is_app_napped(*pid) && !storm_pids.contains(pid))
+                        .map(|(pid, _)| *pid)
+                        .collect();
+                    for pid in app_napped {
+                        qos.set_app_nap(pid, false);
+                    }
+                }
+
+                // Paging hints: targeted non-fatal memory pressure to idle hoarders.
+                // Uses memorystatus_control warn limit (non-fatal memlimit_inactive)
+                // to send DISPATCH_SOURCE_TYPE_MEMORYPRESSURE to specific processes —
+                // much more surgical than system-wide vm_pressure_notify().
+                // Coalition API augments the foreground family beyond heuristic name-matching:
+                // browser XPC helpers and GPU processes share the foreground coalition.
                 let mem_pressure = snapshot.pressure.memory_pressure;
                 let swap_active = snapshot.pressure.swap_used_bytes > 256 * 1024 * 1024;
-                if mem_pressure > 0.45 && swap_active {
-                    // Build foreground process family to avoid hinting active renderers.
-                    let fg_pids = build_foreground_family(foreground_pid, &process_tree);
-                    // Collect interactive pattern names — never hint these even in background.
+                if mem_pressure > 0.45 && swap_active && is_root {
+                    // Build foreground family via process tree (heuristic).
+                    let mut fg_pids = build_foreground_family(foreground_pid, &process_tree);
+                    // Augment with kernel-authoritative coalition membership.
+                    // Any PID sharing a coalition with the foreground PID is excluded.
+                    if let Some(fg_pid) = foreground_pid {
+                        let all_pids: Vec<u32> = proc_snaps.iter().map(|s| s.pid).collect();
+                        for coalition_pid in coalition_tracker.family_of(fg_pid, &all_pids) {
+                            fg_pids.insert(coalition_pid);
+                        }
+                    }
                     let interactive_pats: Vec<String> = state
                         .learned_policy
                         .lock_recover()
                         .interactive_patterns
                         .clone();
                     for snap in proc_snaps.iter().take(100) {
-                        if heuristic_critical_pids.contains(&snap.pid) {
+                        if heuristic_critical_pids.contains(&snap.pid)
+                            || fg_pids.contains(&snap.pid)
+                        {
                             continue;
                         }
-                        // Skip interactive apps (e.g. Claude Helper, Spotify Helper, Code Helper).
                         if interactive_pats
                             .iter()
                             .any(|p| snap.name.contains(p.as_str()))
                         {
                             continue;
                         }
-                        // Classic hoarder: large, idle, no GUI window.
-                        let is_hoarder = snap.rss_bytes > 120 * 1024 * 1024
+                        // Rosetta 2 processes incur ~10-30% JIT overhead.
+                        // Under memory pressure, they get a lower RSS threshold
+                        // because freezing them recovers more real throughput.
+                        let rss_threshold = if snap.is_translated {
+                            80 * 1024 * 1024 // 80MB for Rosetta (vs 120MB for native)
+                        } else {
+                            120 * 1024 * 1024
+                        };
+                        let is_hoarder = snap.rss_bytes > rss_threshold
                             && snap.secs_since_user_interaction > 120
                             && !snap.has_gui_window;
-                        // Background renderer: browser/Electron helper not in
-                        // the foreground app's process family and not interactive.
                         let is_bg_renderer = snap.rss_bytes > 60 * 1024 * 1024
                             && snap.secs_since_user_interaction > 120
                             && (snap.name.contains("Helper (Renderer)")
                                 || snap.name.contains("Helper (Plugin)")
-                                || snap.name.contains(" Renderer"))
-                            && !fg_pids.contains(&snap.pid);
-                        if is_hoarder || is_bg_renderer {
-                            actions.push(RootAction::SetMemorystatus {
-                                pid: snap.pid,
-                                priority: -1,
-                                reason: format!(
-                                    "memory-pressure hint: {}MB RSS bg={}",
-                                    snap.rss_bytes / 1024 / 1024,
-                                    is_bg_renderer
-                                ),
-                            });
+                                || snap.name.contains(" Renderer"));
+                        // Mach port leak: >5000 ports is suspicious IPC flooding.
+                        // Only check lazily for processes already meeting RSS threshold.
+                        let is_port_leaker = if snap.rss_bytes > 50 * 1024 * 1024
+                            && snap.secs_since_user_interaction > 60
+                        {
+                            let qos = state.mach_qos.lock_recover();
+                            qos.get_mach_port_count(snap.pid)
+                                .map(|c| c > 5000)
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        if is_hoarder || is_bg_renderer || is_port_leaker {
+                            // Targeted non-fatal warn limit: set to 75% of current RSS.
+                            // Rosetta processes get a tighter squeeze (60% of RSS).
+                            let ratio = if snap.is_translated { 3u64 } else { 4u64 };
+                            let warn_mb = (snap.rss_bytes * ratio / 5 / 1024 / 1024) as i32;
+                            let warn_mb = warn_mb.max(32); // floor: 32 MB
+                            if let Err(e) = jetsam_control::set_warn_limit(snap.pid, warn_mb) {
+                                // Non-fatal: log at debug level and continue.
+                                if cfg!(debug_assertions) {
+                                    eprintln!("[warn-limit] {}", e);
+                                }
+                            } else {
+                                warn_limit_pids.insert(snap.pid, 3); // clear after 3 cycles
+                            }
                         }
                     }
                 }
+
+                // Clear expired warn limits (process has had time to respond).
+                warn_limit_pids.retain(|&pid, countdown| {
+                    *countdown -= 1;
+                    if *countdown == 0 {
+                        let _ = jetsam_control::set_warn_limit(pid, 0);
+                        false
+                    } else {
+                        true
+                    }
+                });
 
                 // Update heuristic metrics
                 {
@@ -4707,6 +5274,23 @@ fn main() -> anyhow::Result<()> {
                             Some(a)
                         }
                     }).collect();
+
+                    // Rosetta AOT: skip freezing oahd/oahd-helper during AOT compilation.
+                    let confirmed_actions: Vec<RootAction> = if rosetta_monitor.is_compiling() {
+                        let rosetta_immune = apollo_optimizer::engine::rosetta_monitor::RosettaMonitor::immune_processes();
+                        confirmed_actions
+                            .into_iter()
+                            .filter(|a| {
+                                if let RootAction::FreezeProcess { name, .. } = a {
+                                    !rosetta_immune.iter().any(|ri| name.contains(ri))
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect()
+                    } else {
+                        confirmed_actions
+                    };
 
                     // Subatomic: skip freeze for processes with tiny RSS (< 5MB).
                     // These processes are already idle/paged-out — SIGSTOP adds no value
@@ -4966,7 +5550,7 @@ fn main() -> anyhow::Result<()> {
                         .iter()
                         .map(|d| (d.pid, d.tier))
                         .collect();
-                    let under_pressure = snapshot.pressure.memory_pressure > 0.60;
+                    let under_pressure = snapshot.pressure.memory_pressure + battery_pressure_boost(&power_mgr) + thermal_pressure_boost > 0.60;
                     let mut qos = state.mach_qos.lock_recover();
                     let io_changes =
                         io_shaper.shape(&fg_pids, &process_tiers, under_pressure, Some(&mut qos));
@@ -5002,8 +5586,9 @@ fn main() -> anyhow::Result<()> {
                                 && !interrupt_frozen.contains(&d.pid)
                         })
                         .filter_map(|decision| {
-                            let tier = if thermal_emergency {
-                                // Force all to E-Cores during thermal emergency
+                            let tier = if thermal_action.force_ecores && !fg_family.contains(&decision.pid) {
+                                // Thermal pre-throttle: route backgrounds to E-Cores at Phase2+ (85°C).
+                                // Foreground app stays on P-Cores for responsiveness.
                                 SchedulingTier::Background
                             } else if fg_family.contains(&decision.pid) {
                                 // Process tree cascade: children of the foreground app

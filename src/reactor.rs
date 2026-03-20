@@ -25,18 +25,10 @@ impl SystemReactor {
                     return;
                 }
 
-                // --- NERVE 1: Memory Pressure (Direct Kernel Filter) ---
-                let mem_kev = libc::kevent {
-                    ident: 0,
-                    filter: -12, // EVFILT_VM (Hardcoded for Darwin)
-                    flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-                    fflags: 0x80000000, // NOTE_VM_PRESSURE
-                    data: 0,
-                    udata: 1 as *mut libc::c_void, // ID 1 = Memory
-                };
-                if libc::kevent(kq, &mem_kev, 1, std::ptr::null_mut(), 0, std::ptr::null()) == -1 {
-                    println!("⚠️ [Reactor] Failed to register memory-pressure nerve.");
-                }
+                // --- NERVE 1: Memory Pressure (sysctl polling) ---
+                // All push APIs (EVFILT_VM, dispatch source, Darwin notify) are broken
+                // on macOS 15 Apple Silicon. Poll kern.memorystatus_vm_pressure_level instead.
+                let mut pressure_monitor = crate::engine::dispatch_pressure::KernelPressureMonitor::new();
 
                 // --- NERVE 2: Thermal Pressure (Darwin Notification -> FD) ---
                 let mut thermal_fd = 0;
@@ -147,8 +139,15 @@ impl SystemReactor {
                         let mut collector = SystemCollector::new();
                         let snapshot = collector.collect_snapshot();
 
+                        // Poll kernel pressure level on each event (~1µs).
+                        if let Some(_level) = pressure_monitor.poll() {
+                            println!("🚨 REACTIVE PULSE: Memory Pressure Transition.");
+                            opt.optimize(&snapshot);
+                        }
+
                         match id {
                             1 => {
+                                // Legacy: if EVFILT_VM ever fires (shouldn't on macOS 15).
                                 println!("🚨 REACTIVE PULSE: Memory Pressure Change.");
                                 opt.optimize(&snapshot);
                                 if snapshot.memory.used_ram as f64

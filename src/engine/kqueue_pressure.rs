@@ -1,30 +1,24 @@
-//! kqueue-based event-driven VM pressure + process exit monitoring.
+//! kqueue-based event-driven pressure + process exit monitoring.
 //!
-//! Replaces polling with kernel push events:
-//! - EVFILT_VM + NOTE_VM_PRESSURE: system memory pressure changed
+//! Multiplexes:
+//! - Memory pressure: polls `kern.memorystatus_vm_pressure_level` sysctl on each
+//!   timer tick (~1µs). All push APIs (EVFILT_VM, DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,
+//!   Darwin notify) are broken on macOS 15 Apple Silicon.
 //! - EVFILT_PROC + NOTE_EXIT: watched process exited (frozen process died)
 //! - EVFILT_TIMER: periodic tick (replaces sleep)
-//!
-//! Cost: zero CPU when idle. Latency: <1ms from kernel event to reaction.
-//! This is the theoretical floor for event delivery on macOS — there is
-//! nothing faster in userspace (EL0).
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 use std::time::Instant;
 
-// ── macOS kqueue constants not in libc crate ────────────────────────────────
-
-const NOTE_VM_PRESSURE: u32 = 0x8000_0000;
-const NOTE_VM_PRESSURE_TERMINATE: u32 = 0x4000_0000;
-const NOTE_VM_PRESSURE_SUDDEN_TERMINATE: u32 = 0x2000_0000;
+use crate::engine::dispatch_pressure::{KernelPressureLevel, KernelPressureMonitor};
 
 // Timer ident namespace (arbitrary, must not collide with PIDs)
 const TIMER_IDENT_PERIODIC: usize = 0xAF01_0001;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-/// VM pressure level as reported by the kernel via kqueue.
+/// VM pressure level as reported by the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VmPressureLevel {
     /// No pressure — system has plenty of free memory.
@@ -54,7 +48,7 @@ pub enum PressureEvent {
 ///
 /// # Architecture
 /// Single kqueue fd multiplexes:
-///   1. System-wide VM pressure notifications (EVFILT_VM)
+///   1. Memory pressure via sysctl polling on timer tick (~1µs per read)
 ///   2. Per-PID exit notifications (EVFILT_PROC, one-shot)
 ///   3. Optional periodic timer (EVFILT_TIMER)
 ///
@@ -67,48 +61,29 @@ pub struct KqueuePressure {
     last_event_at: Instant,
     vm_registered: bool,
     timer_registered: bool,
+    /// Sysctl-based kernel pressure level monitor.
+    pressure_monitor: KernelPressureMonitor,
 }
 
 impl KqueuePressure {
-    /// Create a new kqueue reactor and register the VM pressure filter.
+    /// Create a new kqueue reactor with sysctl-based pressure monitoring.
     pub fn new() -> std::io::Result<Self> {
         let kq = unsafe { libc::kqueue() };
         if kq < 0 {
             return Err(std::io::Error::last_os_error());
         }
 
-        let mut reactor = Self {
+        let reactor = Self {
             kq,
             watched_pids: HashMap::new(),
             last_vm_level: VmPressureLevel::Normal,
             last_event_at: Instant::now(),
-            vm_registered: false,
+            vm_registered: true, // sysctl polling always works
             timer_registered: false,
+            pressure_monitor: KernelPressureMonitor::new(),
         };
-
-        // Register VM pressure — best-effort (may fail in sandbox)
-        reactor.vm_registered = reactor.register_vm_pressure().is_ok();
 
         Ok(reactor)
-    }
-
-    fn register_vm_pressure(&self) -> std::io::Result<()> {
-        let ev = libc::kevent {
-            ident: 0,
-            filter: libc::EVFILT_VM,
-            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-            fflags: NOTE_VM_PRESSURE
-                | NOTE_VM_PRESSURE_TERMINATE
-                | NOTE_VM_PRESSURE_SUDDEN_TERMINATE,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        };
-        let rc =
-            unsafe { libc::kevent(self.kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
     }
 
     /// Start a periodic timer that fires every `interval_ms` milliseconds.
@@ -220,29 +195,29 @@ impl KqueuePressure {
         };
 
         let mut result = Vec::new();
+
+        // Check kernel pressure level on every drain (timer tick or event).
+        // Cost: ~1µs via sysctlbyname. Fires VmPressure on level transitions.
+        if let Some(level) = self.pressure_monitor.poll() {
+            let vm_level = match level {
+                KernelPressureLevel::Critical => VmPressureLevel::Critical,
+                KernelPressureLevel::Warning => VmPressureLevel::Warning,
+                KernelPressureLevel::Normal => VmPressureLevel::Normal,
+            };
+            self.last_vm_level = vm_level;
+            self.last_event_at = Instant::now();
+            result.push(PressureEvent::VmPressure(vm_level));
+        }
+
         if n <= 0 {
             return result;
         }
 
         for ev in &buf[..n as usize] {
             if ev.flags & libc::EV_ERROR != 0 {
-                continue; // skip error events
+                continue;
             }
             match ev.filter {
-                libc::EVFILT_VM => {
-                    let level = if ev.fflags & NOTE_VM_PRESSURE_SUDDEN_TERMINATE != 0 {
-                        VmPressureLevel::SuddenTerminate
-                    } else if ev.fflags & NOTE_VM_PRESSURE_TERMINATE != 0 {
-                        VmPressureLevel::Critical
-                    } else if ev.fflags & NOTE_VM_PRESSURE != 0 {
-                        VmPressureLevel::Warning
-                    } else {
-                        VmPressureLevel::Normal
-                    };
-                    self.last_vm_level = level;
-                    self.last_event_at = Instant::now();
-                    result.push(PressureEvent::VmPressure(level));
-                }
                 libc::EVFILT_PROC => {
                     let pid = ev.ident as u32;
                     self.watched_pids.remove(&pid);
@@ -310,14 +285,13 @@ mod tests {
     fn kqueue_creates_successfully() {
         let reactor = KqueuePressure::new().expect("kqueue should work on macOS");
         assert!(reactor.kq_fd() >= 0);
+        assert!(reactor.vm_registered());
     }
 
     #[test]
     fn poll_returns_empty_when_no_pressure() {
         let mut reactor = KqueuePressure::new().unwrap();
         let events = reactor.poll_events();
-        // No pressure right now → empty (or a VM event if the system is under load)
-        // Either way, no panic.
         assert!(events.len() < 100); // sanity
     }
 
@@ -337,7 +311,6 @@ mod tests {
             events,
             elapsed,
         );
-        // Timer should fire around 50ms, not 200ms
         assert!(elapsed < 150, "timer took too long: {}ms", elapsed);
     }
 
@@ -345,7 +318,6 @@ mod tests {
     fn watch_child_exit() {
         let mut reactor = KqueuePressure::new().unwrap();
 
-        // Spawn a child that exits immediately
         let child = std::process::Command::new("/usr/bin/true")
             .spawn()
             .expect("spawn true");
@@ -356,7 +328,6 @@ mod tests {
             .expect("watch should work as same user");
         assert_eq!(reactor.watched_pid_count(), 1);
 
-        // Wait for the child to exit
         let events = reactor.wait_events(2000);
         assert!(
             events.contains(&PressureEvent::ProcessExited(pid)),
@@ -369,7 +340,6 @@ mod tests {
     #[test]
     fn watch_nonexistent_pid_fails() {
         let mut reactor = KqueuePressure::new().unwrap();
-        // PID 999999999 almost certainly doesn't exist
         let result = reactor.watch_pid(999_999_999);
         assert!(result.is_err(), "watching non-existent PID should fail");
     }
@@ -377,7 +347,7 @@ mod tests {
     #[test]
     fn unwatch_is_idempotent() {
         let mut reactor = KqueuePressure::new().unwrap();
-        reactor.unwatch_pid(12345); // never watched — should not panic
-        reactor.unwatch_pid(12345); // again
+        reactor.unwatch_pid(12345);
+        reactor.unwatch_pid(12345);
     }
 }
