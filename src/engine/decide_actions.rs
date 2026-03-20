@@ -7,6 +7,7 @@ use crate::engine::amx_detector;
 use crate::engine::outcome_tracker::PatternWeight;
 use crate::engine::overflow_guard::OverflowThresholds;
 use crate::engine::safety::critical_background_processes;
+use crate::engine::thread_selfcounts::IpcClass;
 use crate::engine::types::{
     BlockerScore, InteractiveContext, LatencyTarget, OptimizationProfile, RootAction,
 };
@@ -165,6 +166,10 @@ pub fn decide_actions(
     // These are I/O-bound processes (low CPU/wall ratio) that behave like
     // interactive apps regardless of their name.
     behavior_interactive_pids: &HashSet<u32>,
+    // Per-process IPC hints from energy_pid tracker (ri_instructions/ri_cycles).
+    // Used for IPC-aware throttling: low IPC = memory-bound (safe to throttle),
+    // high IPC = compute-bound (throttling hurts throughput).
+    ipc_hints: &HashMap<u32, f64>,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -280,21 +285,46 @@ pub fn decide_actions(
                 continue;
             }
 
-            // BUG 11 fix: ThermalConstrained was less aggressive than BackgroundPressure.
-            // Under thermal constraint, throttle aggressively; under BackgroundPressure,
-            // also throttle aggressively. InteractiveFocus uses profile-driven policy.
+            // IPC-aware throttling: use per-process IPC to modulate aggressiveness.
+            // Low IPC = memory-bound (stalled on cache misses) → throttle won't slow it down.
+            // High IPC = compute-efficient → throttling directly hurts throughput.
+            let ipc_class = ipc_hints
+                .get(&pid)
+                .map(|&ipc| IpcClass::from_ipc(ipc))
+                .unwrap_or(IpcClass::Mixed);
+
+            // Skip throttling for highly optimized compute-bound processes
+            // unless we're in thermal emergency.
+            if !ipc_class.safe_to_throttle()
+                && !matches!(context, InteractiveContext::ThermalConstrained)
+            {
+                low_value_skipped.push(format!("ipc-protected:{}", name));
+                continue;
+            }
+
             let aggressive = match context {
                 InteractiveContext::ThermalConstrained => true,
-                InteractiveContext::BackgroundPressure => true,
+                InteractiveContext::BackgroundPressure => {
+                    // Memory-bound processes: always throttle aggressively
+                    // (throttling won't make them slower).
+                    // Mixed/other: aggressive only if profile says so.
+                    ipc_class.safe_to_throttle_aggressive()
+                        || matches!(profile, OptimizationProfile::AggressiveRoot)
+                }
                 InteractiveContext::InteractiveFocus => {
-                    matches!(profile, OptimizationProfile::AggressiveRoot)
+                    ipc_class.safe_to_throttle_aggressive()
+                        && matches!(profile, OptimizationProfile::AggressiveRoot)
                 }
             };
             actions.push(RootAction::ThrottleProcess {
                 pid,
                 name,
                 aggressive,
-                reason: format!("context-aware throttle ({:?})", context),
+                reason: format!(
+                    "ipc-aware throttle ({:?}, ipc={:.2})",
+                    context,
+                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
+                ),
                 start_sec: process.start_time(),
                 start_usec: 0,
             });

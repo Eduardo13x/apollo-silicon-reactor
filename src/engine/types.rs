@@ -273,6 +273,8 @@ pub enum FreezeSource {
     MainLoop,
     Sentinel,
     Manual,
+    /// Frozen by thermal pre-throttle (Phase3Aggressive ≥90°C).
+    ThermalPreThrottle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -526,6 +528,62 @@ pub struct RuntimeMetrics {
     pub rl_total_ticks: u64,
     #[serde(default)]
     pub rl_total_overflows: u64,
+    // IOReport hardware telemetry (P/E cluster utilization, power)
+    #[serde(default)]
+    pub ioreport_p_cluster_pct: f64,
+    #[serde(default)]
+    pub ioreport_e_cluster_pct: f64,
+    #[serde(default)]
+    pub ioreport_gpu_pct: f64,
+    #[serde(default)]
+    pub ioreport_ane_busy: bool,
+    #[serde(default)]
+    pub ioreport_cpu_mw: f64,
+    #[serde(default)]
+    pub ioreport_total_watts: f64,
+    // SMC direct telemetry
+    #[serde(default)]
+    pub smc_system_power_watts: Option<f64>,
+    #[serde(default)]
+    pub smc_lid_closed: bool,
+    #[serde(default)]
+    pub smc_charger_watts: Option<f64>,
+    #[serde(default)]
+    pub smc_battery_tte_min: Option<u16>,
+    // KPC hardware performance counters
+    #[serde(default)]
+    pub kpc_ipc: f64,
+    // Rosetta AOT compilation
+    #[serde(default)]
+    pub rosetta_aot_active: bool,
+    // SMC thermal (direct, <100µs)
+    #[serde(default)]
+    pub smc_cpu_temp_celsius: Option<f64>,
+    #[serde(default)]
+    pub smc_gpu_temp_celsius: Option<f64>,
+    #[serde(default)]
+    pub smc_battery_temp_celsius: Option<f64>,
+    #[serde(default)]
+    pub smc_cpu_voltage: Option<f64>,
+    #[serde(default)]
+    pub smc_p_cluster_watts: Option<f64>,
+    // IOReport memory bandwidth
+    #[serde(default)]
+    pub ioreport_amc_bandwidth_pct: f64,
+    // IOPMrootDomain direct thermal
+    #[serde(default)]
+    pub iopm_thermal_warning: String,
+    #[serde(default)]
+    pub iopm_power_source: String,
+    // Per-process energy (ri_billed_energy) — top consumer
+    #[serde(default)]
+    pub energy_top_pid_name: String,
+    #[serde(default)]
+    pub energy_top_pid_mw: f64,
+
+    // Daemon self-IPC (thread_selfcounts syscall 186)
+    #[serde(default)]
+    pub daemon_cycle_ipc: f64,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.
