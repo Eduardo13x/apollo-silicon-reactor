@@ -206,7 +206,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn over_budget_detection() {
         // Brave at 2.5GB RSS but WSS only 800MB (lots of cached/stale tabs).
         let inputs = vec![
