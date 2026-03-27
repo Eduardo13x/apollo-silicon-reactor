@@ -137,24 +137,40 @@ static SEED_POLICY: &str = include_str!("../../policy_clean.json");
 
 /// Merge seed policy patterns into `policy` as a floor.
 /// Seed patterns are always present — they can be added to but never removed.
+/// Deduplicates across lists: a pattern in protected won't be added to interactive/noise.
 fn merge_seed_into(policy: &mut LearnedPolicy) {
     let seed: LearnedPolicy =
         serde_json::from_str(SEED_POLICY).expect("BUG: embedded policy_clean.json is invalid");
-    for pat in &seed.interactive_patterns {
-        if !policy.interactive_patterns.contains(pat) {
-            policy.interactive_patterns.push(pat.clone());
-        }
-    }
-    for pat in &seed.noise_patterns {
-        if !policy.noise_patterns.contains(pat) {
-            policy.noise_patterns.push(pat.clone());
-        }
-    }
+    // Protected first (highest priority).
     for pat in &seed.protected_patterns {
         if !policy.protected_patterns.contains(pat) {
             policy.protected_patterns.push(pat.clone());
         }
     }
+    // Interactive: skip if already in protected.
+    for pat in &seed.interactive_patterns {
+        if !policy.interactive_patterns.contains(pat)
+            && !policy.protected_patterns.contains(pat)
+        {
+            policy.interactive_patterns.push(pat.clone());
+        }
+    }
+    // Noise: skip if already in protected or interactive.
+    for pat in &seed.noise_patterns {
+        if !policy.noise_patterns.contains(pat)
+            && !policy.protected_patterns.contains(pat)
+            && !policy.interactive_patterns.contains(pat)
+        {
+            policy.noise_patterns.push(pat.clone());
+        }
+    }
+    // Clean up cross-list conflicts: protected wins over interactive/noise.
+    policy
+        .interactive_patterns
+        .retain(|p| !policy.protected_patterns.contains(p));
+    policy
+        .noise_patterns
+        .retain(|p| !policy.protected_patterns.contains(p) && !policy.interactive_patterns.contains(p));
 }
 
 /// Query kernel start-time for a PID. Returns `(start_sec, start_usec)`.
