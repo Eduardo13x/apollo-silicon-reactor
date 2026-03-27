@@ -2270,6 +2270,7 @@ fn append_discrepancy_log(
         "reason": reason,
     });
     append_jsonl(path, &entry);
+    rotate_timeline(path);
 }
 
 /// Tree-aware enriched process data builder.

@@ -23,6 +23,11 @@ pub fn protected_processes() -> HashSet<&'static str> {
         "syspolicyd",
         "tccd",
         "CoreServicesUIAgent",
+        // XPC infrastructure — xpcproxy is the XPC service launcher; freezing it
+        // is a no-op (kernel re-spawns immediately) that spams the journal.
+        "xpcproxy",
+        "trustd",
+        "distnoted",
         // Spotlight stack (never touch — throttling these breaks app search).
         "Spotlight",
         "mds",
