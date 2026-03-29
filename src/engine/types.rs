@@ -281,6 +281,16 @@ pub enum FreezeSource {
 pub struct FrozenEntry {
     pub frozen_at: DateTime<Utc>,
     pub source: FreezeSource,
+    /// Memory pressure at the time this process was frozen.
+    /// Used by adaptive unfreeze: if pressure drops enough, unfreeze early.
+    /// Defaults to 1.0 (max) for entries loaded from disk without this field,
+    /// ensuring only the TTL path triggers for pre-existing freezes.
+    #[serde(default = "frozen_entry_pressure_default")]
+    pub pressure_at_freeze: f64,
+}
+
+fn frozen_entry_pressure_default() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

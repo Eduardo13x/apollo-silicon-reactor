@@ -732,6 +732,9 @@ fn freeze_non_critical(
                 mf.entry(pid).or_insert_with(|| FrozenEntry {
                     frozen_at: now,
                     source: FreezeSource::Sentinel,
+                    // Pressure not available in interrupt context; use 1.0 so
+                    // only the TTL path can trigger early unfreeze for these entries.
+                    pressure_at_freeze: 1.0,
                 });
             }
         }
