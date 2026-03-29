@@ -131,6 +131,106 @@ pub fn tally_votes(votes: &[SpecialistVote]) -> VotingResult {
     }
 }
 
+// ── Specialist accuracy tracker ─────────────────────────────────────────────
+
+/// Specialist indices used by [`SpecialistAccuracyTracker`].
+pub mod specialist {
+    pub const LINUCB: usize = 0;
+    pub const HAZARD: usize = 1;
+    pub const MONOPOLY: usize = 2;
+    pub const KALMAN: usize = 3;
+    pub const COUNT: usize = 4;
+
+    /// Human-readable names, indexed by the constants above.
+    pub const NAMES: [&str; COUNT] = ["linucb", "hazard", "monopoly", "kalman"];
+
+    /// Map a specialist name string to its index, or return `None`.
+    pub fn index_of(name: &str) -> Option<usize> {
+        NAMES.iter().position(|&n| n == name)
+    }
+}
+
+/// Per-specialist EMA accuracy tracker (Super Learner–style adaptive weights).
+///
+/// Each specialist starts at 0.70 accuracy (matching the legacy hardcoded
+/// multipliers). After each cycle outcome is known the tracker receives a
+/// binary correct/incorrect signal and the EMA decays toward it:
+///
+/// ```text
+/// accuracy[i] = 0.97 * accuracy[i] + 0.03 * (1 if correct else 0)
+/// ```
+///
+/// The resulting accuracy value is used as the confidence multiplier when
+/// building [`SpecialistVote`]s instead of fixed constants.
+#[derive(Debug, Clone)]
+pub struct SpecialistAccuracyTracker {
+    /// EMA accuracy per specialist, range [0, 1]. Init: 0.70.
+    accuracy: [f64; specialist::COUNT],
+    /// Total updates applied (for diagnostics / test assertions).
+    updates: u64,
+}
+
+impl Default for SpecialistAccuracyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpecialistAccuracyTracker {
+    const EMA_ALPHA: f64 = 0.03;
+    const INIT_ACCURACY: f64 = 0.70;
+
+    /// Create a new tracker with all specialists at 0.70.
+    pub fn new() -> Self {
+        Self {
+            accuracy: [Self::INIT_ACCURACY; specialist::COUNT],
+            updates: 0,
+        }
+    }
+
+    /// Update accuracy for a single specialist.
+    ///
+    /// `correct` = true when the specialist's prediction was confirmed by the
+    /// observed outcome (pressure spiked when predicted high, or stayed calm
+    /// when predicted low).
+    pub fn update(&mut self, specialist_idx: usize, correct: bool) {
+        if specialist_idx < specialist::COUNT {
+            let signal = if correct { 1.0 } else { 0.0 };
+            self.accuracy[specialist_idx] =
+                (1.0 - Self::EMA_ALPHA) * self.accuracy[specialist_idx]
+                    + Self::EMA_ALPHA * signal;
+            self.updates += 1;
+        }
+    }
+
+    /// Update accuracy by specialist name. No-op for unknown names.
+    pub fn update_by_name(&mut self, name: &str, correct: bool) {
+        if let Some(idx) = specialist::index_of(name) {
+            self.update(idx, correct);
+        }
+    }
+
+    /// Return the learned accuracy weight for a specialist (range [0, 1]).
+    /// Used as the confidence multiplier when building `SpecialistVote`s.
+    pub fn weight(&self, specialist_idx: usize) -> f64 {
+        if specialist_idx < specialist::COUNT {
+            self.accuracy[specialist_idx]
+        } else {
+            Self::INIT_ACCURACY
+        }
+    }
+
+    /// Return all accuracy weights as a slice.
+    pub fn weights(&self) -> &[f64; specialist::COUNT] {
+        &self.accuracy
+    }
+
+    /// Total update calls (diagnostic).
+    pub fn total_updates(&self) -> u64 {
+        self.updates
+    }
+}
+
 // ── Context vector ───────────────────────────────────────────────────────────
 
 /// 12-dimensional context built from already-collected signals.
@@ -1019,5 +1119,79 @@ mod tests {
         let result = tally_votes(&votes);
         // Equal scores → lower index (Observe=0) wins.
         assert_eq!(result.intervention, Intervention::Observe);
+    }
+
+    // ── SpecialistAccuracyTracker tests ──────────────────────────────────────
+
+    #[test]
+    fn test_specialist_accuracy_tracker_init_is_0_70() {
+        let tracker = SpecialistAccuracyTracker::new();
+        for i in 0..specialist::COUNT {
+            assert!(
+                (tracker.weight(i) - 0.70).abs() < 1e-12,
+                "specialist {} should init to 0.70, got {}",
+                specialist::NAMES[i],
+                tracker.weight(i)
+            );
+        }
+        assert_eq!(tracker.total_updates(), 0);
+    }
+
+    #[test]
+    fn test_specialist_accuracy_increases_on_correct_predictions() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        let initial = tracker.weight(specialist::HAZARD);
+        // Many correct predictions should push accuracy above initial.
+        for _ in 0..50 {
+            tracker.update(specialist::HAZARD, true);
+        }
+        assert!(
+            tracker.weight(specialist::HAZARD) > initial,
+            "accuracy should rise after many correct predictions: {} > {}",
+            tracker.weight(specialist::HAZARD),
+            initial
+        );
+        assert_eq!(tracker.total_updates(), 50);
+    }
+
+    #[test]
+    fn test_specialist_accuracy_decreases_on_false_alarms() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        let initial = tracker.weight(specialist::MONOPOLY);
+        // Many incorrect predictions should push accuracy below initial.
+        for _ in 0..50 {
+            tracker.update(specialist::MONOPOLY, false);
+        }
+        assert!(
+            tracker.weight(specialist::MONOPOLY) < initial,
+            "accuracy should drop after many false alarms: {} < {}",
+            tracker.weight(specialist::MONOPOLY),
+            initial
+        );
+    }
+
+    #[test]
+    fn test_specialist_accuracy_update_by_name() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        let before = tracker.weight(specialist::KALMAN);
+        tracker.update_by_name("kalman", true);
+        let after = tracker.weight(specialist::KALMAN);
+        // One correct update: 0.97 * 0.70 + 0.03 * 1.0 = 0.709
+        let expected = 0.97 * 0.70 + 0.03 * 1.0;
+        assert!(
+            (after - expected).abs() < 1e-12,
+            "after one correct update: expected {expected}, got {after}"
+        );
+        assert!(after > before);
+    }
+
+    #[test]
+    fn test_specialist_accuracy_unknown_name_is_noop() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        let before: Vec<f64> = (0..specialist::COUNT).map(|i| tracker.weight(i)).collect();
+        tracker.update_by_name("nonexistent", true);
+        let after: Vec<f64> = (0..specialist::COUNT).map(|i| tracker.weight(i)).collect();
+        assert_eq!(before, after, "unknown specialist name should be a no-op");
+        assert_eq!(tracker.total_updates(), 0);
     }
 }

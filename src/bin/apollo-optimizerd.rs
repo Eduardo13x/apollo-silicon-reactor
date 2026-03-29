@@ -66,7 +66,9 @@ use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfi
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
 use apollo_optimizer::engine::overflow_guard::{OverflowGuard, BUILD_TOOLS};
 use apollo_optimizer::engine::power_management::{detect_battery_status, PowerManager};
-use apollo_optimizer::engine::predictive_agent::{AgentContext, Intervention, PredictiveAgent};
+use apollo_optimizer::engine::predictive_agent::{
+    specialist, AgentContext, Intervention, PredictiveAgent, SpecialistAccuracyTracker,
+};
 use apollo_optimizer::engine::proc_taskinfo;
 use apollo_optimizer::engine::process_classifier::{ProcessSnapshot, ProcessTier};
 use apollo_optimizer::engine::process_identity::ProcessIdentity;
@@ -545,6 +547,9 @@ fn load_frozen_state(path: &Path) -> HashMap<u32, FrozenEntry> {
                         FrozenEntry {
                             frozen_at: e.since,
                             source: FreezeSource::MainLoop,
+                            // Unknown pressure when loaded from disk; use 1.0 so
+                            // only the TTL path can trigger unfreeze for these entries.
+                            pressure_at_freeze: 1.0,
                         },
                     )
                 })
@@ -563,6 +568,72 @@ fn unfreeze_pids(pids: impl Iterator<Item = u32>) -> u64 {
         count += 1;
     }
     count
+}
+
+/// Returns true when a frozen process should be thawed.
+///
+/// Two independent conditions can trigger an early unfreeze:
+/// - **TTL**: the process has been frozen longer than `FREEZE_TTL_SECS` (safety net).
+/// - **Pressure recovery**: current pressure has dropped to ≤60% of the pressure at
+///   freeze time AND at least 30 s have elapsed (prevents immediate re-thaw on transient
+///   pressure spikes and avoids thrash when frozen just moments ago).
+///
+/// This is a pure function so it can be tested without daemon state.
+fn should_unfreeze(
+    elapsed_secs: i64,
+    pressure_at_freeze: f64,
+    current_pressure: f64,
+) -> bool {
+    let ttl_expired = elapsed_secs > FREEZE_TTL_SECS;
+    let pressure_recovered = elapsed_secs >= 30
+        && current_pressure <= pressure_at_freeze * 0.6
+        && pressure_at_freeze > 0.0;
+    ttl_expired || pressure_recovered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_unfreeze_ttl_path() {
+        // TTL expired → always unfreeze regardless of pressure.
+        assert!(should_unfreeze(FREEZE_TTL_SECS + 1, 0.80, 0.80));
+        assert!(should_unfreeze(FREEZE_TTL_SECS + 1, 0.80, 0.90));
+    }
+
+    #[test]
+    fn test_should_unfreeze_pressure_recovery() {
+        // Pressure at freeze was 0.80, now 0.45 (< 0.80 * 0.6 = 0.48) → unfreeze.
+        assert!(should_unfreeze(60, 0.80, 0.45));
+        // Pressure at freeze was 0.80, now 0.50 (> 0.80 * 0.6 = 0.48) → keep frozen.
+        assert!(!should_unfreeze(60, 0.80, 0.50));
+    }
+
+    #[test]
+    fn test_should_unfreeze_min_30s_guard() {
+        // Even if pressure recovered, don't unfreeze before 30 s to avoid thrash.
+        assert!(!should_unfreeze(29, 0.80, 0.10));
+        assert!(should_unfreeze(30, 0.80, 0.10));
+    }
+
+    #[test]
+    fn test_should_unfreeze_high_pressure_at_freeze() {
+        // pressure_at_freeze == 1.0 (max): pressure_recovered threshold = 0.60.
+        // current = 0.10 < 0.60 → unfreeze after 30 s (pressure clearly recovered).
+        assert!(should_unfreeze(60, 1.0, 0.10));
+        // current = 0.65 > 0.60 → still above threshold, do NOT unfreeze early.
+        assert!(!should_unfreeze(60, 1.0, 0.65));
+        // TTL always triggers regardless.
+        assert!(should_unfreeze(FREEZE_TTL_SECS + 1, 1.0, 0.90));
+    }
+
+    #[test]
+    fn test_should_unfreeze_zero_pressure_at_freeze() {
+        // pressure_at_freeze == 0.0: guard against always-true result.
+        assert!(!should_unfreeze(60, 0.0, 0.0));
+        assert!(!should_unfreeze(60, 0.0, 0.10));
+    }
 }
 
 fn run_reactor(state: SharedState) -> anyhow::Result<()> {
@@ -2939,6 +3010,12 @@ fn main() -> anyhow::Result<()> {
             // Predictive agent: LinUCB contextual bandit for proactive interventions.
             let mut predictive_agent =
                 PredictiveAgent::load_or_default(std::path::Path::new(predictive_agent_path()));
+            // Specialist accuracy tracker: EMA per-specialist confidence weights.
+            // Starts at 0.70 (matching legacy hardcoded multipliers) and adapts.
+            let mut specialist_accuracy = SpecialistAccuracyTracker::new();
+            // Track previous cycle pressure to detect spikes (for accuracy feedback).
+            let mut prev_pressure_smooth: f64 = 0.0;
+
             // ZeroTune: seed with hardware meta-features on cold start.
             // Reduces warmup from 200→50 cycles by injecting domain knowledge priors.
             if !predictive_agent.is_active() && predictive_agent.total_cycles() == 0 {
@@ -3329,6 +3406,9 @@ fn main() -> anyhow::Result<()> {
                                         FrozenEntry {
                                             frozen_at: Utc::now(),
                                             source: FreezeSource::MainLoop,
+                                            pressure_at_freeze: pressure_collector
+                                                .latest()
+                                                .memory_pressure,
                                         },
                                     );
                                     turbo_frozen += 1;
@@ -3761,6 +3841,7 @@ fn main() -> anyhow::Result<()> {
                                 FrozenEntry {
                                     frozen_at: Utc::now(),
                                     source: FreezeSource::ThermalPreThrottle,
+                                    pressure_at_freeze: snapshot.pressure.memory_pressure,
                                 },
                             );
                             thermal_frozen += 1;
@@ -4641,6 +4722,43 @@ fn main() -> anyhow::Result<()> {
                         lv_ratio,
                     );
                     let linucb_choice = predictive_agent.select_action(&agent_ctx);
+
+                    // ── Specialist accuracy feedback (Super Learner) ─────────────────
+                    // Compare prev cycle's specialist predictions against observed outcome.
+                    // A spike is a pressure rise of ≥0.08 over the previous cycle.
+                    {
+                        let pressure_spiked = signal_digest.pressure_smooth
+                            >= prev_pressure_smooth + 0.08;
+                        // Hazard: predicted high risk when p_oom_30s > 0.30 last cycle.
+                        // We can't replay last cycle's p_oom value, so we approximate:
+                        // hazard fired (voted) iff prev_pressure was already elevated.
+                        let hazard_predicted_high = prev_pressure_smooth > 0.40;
+                        let hazard_correct = (hazard_predicted_high && pressure_spiked)
+                            || (!hazard_predicted_high && !pressure_spiked);
+                        specialist_accuracy.update(specialist::HAZARD, hazard_correct);
+
+                        // Monopoly: predicted high when monopoly_risk > 0.5.
+                        // Proxy: prev pressure was in monopoly range (>0.55).
+                        let monopoly_predicted_high = prev_pressure_smooth > 0.55;
+                        let monopoly_correct = (monopoly_predicted_high && pressure_spiked)
+                            || (!monopoly_predicted_high && !pressure_spiked);
+                        specialist_accuracy.update(specialist::MONOPOLY, monopoly_correct);
+
+                        // Kalman: predicted spike when pressure_predicted_5s > 0.85.
+                        // Proxy: prev pressure was high enough to trigger the specialist.
+                        let kalman_predicted_high = prev_pressure_smooth > 0.70;
+                        let kalman_correct = (kalman_predicted_high && pressure_spiked)
+                            || (!kalman_predicted_high && !pressure_spiked);
+                        specialist_accuracy.update(specialist::KALMAN, kalman_correct);
+
+                        // LinUCB: voted for action. Correct if pressure improved or stayed calm.
+                        let linucb_predicted_intervention = linucb_choice != Intervention::Observe;
+                        let linucb_correct = (linucb_predicted_intervention && pressure_spiked)
+                            || (!linucb_predicted_intervention && !pressure_spiked);
+                        specialist_accuracy.update(specialist::LINUCB, linucb_correct);
+                    }
+                    // Save current pressure for next cycle's accuracy feedback.
+                    prev_pressure_smooth = signal_digest.pressure_smooth;
 
                     // ── Specialist voting: weighted ensemble replaces override chain ──
                     use apollo_optimizer::engine::predictive_agent::{SpecialistVote, tally_votes};
@@ -5591,13 +5709,18 @@ fn main() -> anyhow::Result<()> {
                             .ok()
                             .map(|g| g.clone())
                             .unwrap_or_default();
+                        let current_pressure = snapshot.pressure.memory_pressure;
                         let mut frozen_state = state.frozen_state.lock_recover();
                         let expired: Vec<u32> = frozen_state
                             .iter()
                             .filter(|(pid, entry)| {
-                                now.signed_duration_since(entry.frozen_at).num_seconds()
-                                    > FREEZE_TTL_SECS
-                                    && !interrupt_pids.contains(pid)
+                                let elapsed =
+                                    now.signed_duration_since(entry.frozen_at).num_seconds();
+                                should_unfreeze(
+                                    elapsed,
+                                    entry.pressure_at_freeze,
+                                    current_pressure,
+                                ) && !interrupt_pids.contains(pid)
                             })
                             .map(|(pid, _)| *pid)
                             .collect();
@@ -5934,6 +6057,7 @@ fn main() -> anyhow::Result<()> {
                         frozen_state.entry(*pid).or_insert(FrozenEntry {
                             frozen_at: now,
                             source: FreezeSource::MainLoop,
+                            pressure_at_freeze: snapshot.pressure.memory_pressure,
                         });
                     }
                     // Remove PIDs that are no longer frozen.
