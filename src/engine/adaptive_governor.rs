@@ -361,11 +361,17 @@ impl AdaptiveGovernor {
             };
         }
 
-        // Waste override — even "useful" processes get throttled if they're
-        // burning too many resources while the user isn't using them.
-        // Graduated: soft threshold at waste>0.5 + utility<0.40 catches
-        // medium-waste daemons that the hard threshold misses.
-        if waste > 0.5 && adjusted_utility < 0.40 && !snap.has_gui_window {
+        // Waste override — graduated curve: higher waste tolerates less utility.
+        // waste > 0.85 → throttle if utility < 0.60 (aggressive override)
+        // waste > 0.50 → throttle if utility < 0.40 (soft override, no GUI only)
+        let waste_triggered = if waste >= self.config.waste_override_threshold {
+            adjusted_utility < 0.6
+        } else if waste > 0.5 && !snap.has_gui_window {
+            adjusted_utility < 0.40
+        } else {
+            false
+        };
+        if waste_triggered {
             return ProcessDecision {
                 pid: snap.pid,
                 name: snap.name.clone(),
@@ -374,21 +380,7 @@ impl AdaptiveGovernor {
                 utility_score: adjusted_utility,
                 waste_score: waste,
                 reason: format!(
-                    "Graduated waste override (waste={:.2}, utility={:.2})",
-                    waste, adjusted_utility
-                ),
-            };
-        }
-        if waste >= self.config.waste_override_threshold && adjusted_utility < 0.6 {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Throttle,
-                tier,
-                utility_score: adjusted_utility,
-                waste_score: waste,
-                reason: format!(
-                    "High waste ({:.2}) with low utility ({:.2})",
+                    "Waste override (waste={:.2}, utility={:.2})",
                     waste, adjusted_utility
                 ),
             };
