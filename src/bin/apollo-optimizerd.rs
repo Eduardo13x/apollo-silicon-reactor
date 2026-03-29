@@ -3346,6 +3346,13 @@ fn main() -> anyhow::Result<()> {
                                 pid,
                                 jetsam_control::priority::FOREGROUND,
                             );
+                            // Cable C: Proactive QoS — route predicted app to P-cores
+                            // BEFORE the user switches to it (predictive DVFS pattern).
+                            // Eliminates the ~50ms QoS transition lag on app switch.
+                            {
+                                let mut qos = state.mach_qos.lock_recover();
+                                qos.set_tier(pid, SchedulingTier::Foreground);
+                            }
                             // File cache warming: pre-read the app's executable into
                             // the buffer cache so code pages don't fault from SSD.
                             // Cao et al. 1994 — app-controlled prefetch cuts I/O wait 50%.
@@ -4437,6 +4444,20 @@ fn main() -> anyhow::Result<()> {
                         Some(f) => (f.throughput_mips, f.jitter_us, f.cache_latency_us),
                         None => (800.0, 50.0, 5000.0),
                     };
+                    // Cable B: OutcomeTracker → PredictiveAgent context.
+                    // low_value_ratio tells LinUCB how much of its effort is wasted.
+                    let lv_ratio = {
+                        let total = outcome_tracker.weights.len() as f64;
+                        if total > 0.0 {
+                            let threshold = outcome_tracker.calibrated_threshold();
+                            let low = outcome_tracker.weights.values()
+                                .filter(|w| w.is_low_value_vs_baseline(threshold))
+                                .count() as f64;
+                            low / total
+                        } else {
+                            0.0
+                        }
+                    };
                     let agent_ctx = AgentContext::build(
                         signal_digest.pressure_smooth, // Kalman-filtered instead of raw
                         swap_forecast.swap_trend,
@@ -4449,6 +4470,7 @@ fn main() -> anyhow::Result<()> {
                         *reactor_weight,
                         overflow_guard.history.threshold_offset,
                         outcome_tracker.overall_effectiveness(),
+                        lv_ratio,
                     );
                     let mut intervention = predictive_agent.select_action(&agent_ctx);
 
@@ -5509,6 +5531,18 @@ fn main() -> anyhow::Result<()> {
                         let mut policy = state.learned_policy.lock_recover();
                         for (name, weight) in &outcome_tracker.weights {
                             policy.pattern_weights.insert(name.clone(), weight.clone());
+                        }
+                    }
+                }
+
+                // Cable A: OutcomeTracker → RL reward signal.
+                // When throttling is wasteful (low-value patterns detected),
+                // penalize the RL agent so it learns to adjust thresholds.
+                {
+                    let penalty = outcome_tracker.rl_penalty();
+                    if penalty < 0.0 {
+                        if let Some(rl) = &mut overflow_guard.rl_agent {
+                            rl.inject_external_reward(penalty);
                         }
                     }
                 }

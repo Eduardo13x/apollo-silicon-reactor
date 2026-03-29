@@ -107,6 +107,14 @@ pub struct SignalIntelligence {
     /// Decay factor per tick to prevent integral windup (leaky integrator).
     /// 0.98 = loses ~2% per tick, preventing unbounded accumulation.
     pid_decay: f64,
+
+    // ── Budget cognitivo (per-subsystem utility EMA) ────────────────────
+    // Tracks how often each heavy subsystem produces actionable signals.
+    // EMA with α=0.05 — slow adaptation, stable scores.
+    utility_entropy: f64,
+    utility_hazard: f64,
+    utility_lotka: f64,
+    utility_mpc: f64,
 }
 
 impl Default for SignalIntelligence {
@@ -142,6 +150,13 @@ impl SignalIntelligence {
             pid_target: 0.65,
             // Leaky integrator: 0.98 decay per tick prevents windup.
             pid_decay: 0.98,
+
+            // Budget cognitivo: start optimistic (0.5) so all subsystems run
+            // initially, then adapt based on actual signal production.
+            utility_entropy: 0.5,
+            utility_hazard: 0.5,
+            utility_lotka: 0.5,
+            utility_mpc: 0.5,
         }
     }
 
@@ -199,32 +214,86 @@ impl SignalIntelligence {
             self.cusum_pressure.reset_target(memory_pressure);
         }
 
+        // ── Adaptive router (MoR-inspired + budget cognitivo) ────────────
+        // Three zones:
+        //   Low  (< 0.30): skip all heavy subsystems
+        //   Mid  (0.30–0.50): run only subsystems with utility > 0.15
+        //   High (≥ 0.50): run everything
+        // Kalman + CUSUM always run (O(1), needed for change detection).
+        const UTIL_ALPHA: f64 = 0.05;
+        const UTIL_THRESHOLD: f64 = 0.15;
+
+        let all_heavy = pressure_smooth >= 0.50;
+        let mid_zone = !all_heavy && pressure_smooth >= 0.30;
+        // In mid zone, per-subsystem gate; in high zone, always run.
+        let run_entropy = all_heavy || (mid_zone && self.utility_entropy > UTIL_THRESHOLD);
+        let run_hazard = all_heavy || (mid_zone && self.utility_hazard > UTIL_THRESHOLD);
+        let run_lotka = all_heavy || (mid_zone && self.utility_lotka > UTIL_THRESHOLD);
+        let run_mpc = all_heavy || (mid_zone && self.utility_mpc > UTIL_THRESHOLD);
+
         // ── 3. Entropía ──────────────────────────────────────────────────
-        self.entropy.update(cpu_values, mem_values);
-        let entropy_anomaly = self.entropy.anomaly_score();
+        let entropy_anomaly = if run_entropy {
+            self.entropy.update(cpu_values, mem_values);
+            self.entropy.anomaly_score()
+        } else {
+            0.0
+        };
 
         // ── 4. Hazard ────────────────────────────────────────────────────
-        let risk_features = HazardModel::risk_features(
-            memory_pressure,
-            pressure_velocity,
-            swap_ratio,
-            compressor_ratio,
-        );
-        let p_oom_30s = self.hazard.probability_oom(&risk_features, 30.0);
-        self.hazard.tick_no_event(dt_secs);
+        let p_oom_30s = if run_hazard {
+            let risk_features = HazardModel::risk_features(
+                memory_pressure,
+                pressure_velocity,
+                swap_ratio,
+                compressor_ratio,
+            );
+            let p = self.hazard.probability_oom(&risk_features, 30.0);
+            self.hazard.tick_no_event(dt_secs);
+            p
+        } else {
+            self.hazard.tick_no_event(dt_secs);
+            0.0
+        };
 
         // ── 5. Lotka-Volterra ────────────────────────────────────────────
-        self.competition.update(
-            dominant_name,
-            dominant_bytes,
-            total_used_bytes,
-            total_available_bytes,
-            dt_secs,
-        );
-        let monopoly_risk = self.competition.monopoly_risk();
+        let monopoly_risk = if run_lotka {
+            self.competition.update(
+                dominant_name,
+                dominant_bytes,
+                total_used_bytes,
+                total_available_bytes,
+                dt_secs,
+            );
+            self.competition.monopoly_risk()
+        } else {
+            0.0
+        };
 
         // ── 6. MPC ───────────────────────────────────────────────────────
-        let mpc_recommendation = self.mpc.solve(pressure_smooth, pressure_velocity);
+        let mpc_recommendation = if run_mpc {
+            self.mpc.solve(pressure_smooth, pressure_velocity)
+        } else {
+            0 // Observe
+        };
+
+        // ── Update utility EMAs ──────────────────────────────────────────
+        // "Actionable" = non-trivial signal that could influence decisions.
+        if run_entropy {
+            let useful = if entropy_anomaly.abs() > 0.5 { 1.0 } else { 0.0 };
+            self.utility_entropy += UTIL_ALPHA * (useful - self.utility_entropy);
+        }
+        if run_hazard {
+            let useful = if p_oom_30s > 0.01 { 1.0 } else { 0.0 };
+            self.utility_hazard += UTIL_ALPHA * (useful - self.utility_hazard);
+        }
+        if run_lotka {
+            let useful = if monopoly_risk > 0.05 { 1.0 } else { 0.0 };
+            self.utility_lotka += UTIL_ALPHA * (useful - self.utility_lotka);
+        }
+        if run_mpc {
+            let useful = if mpc_recommendation != 0 { 1.0 } else { 0.0 };
+            self.utility_mpc += UTIL_ALPHA * (useful - self.utility_mpc);
+        }
 
         // ── 7. Urgency score compuesto ───────────────────────────────────
         let urgency = compute_urgency(
@@ -289,6 +358,12 @@ impl SignalIntelligence {
     /// Pesos beta del hazard model (diagnóstico).
     pub fn hazard_beta(&self) -> [f64; 4] {
         self.hazard.beta_weights()
+    }
+
+    /// Per-subsystem utility scores (budget cognitivo).
+    /// Returns [entropy, hazard, lotka, mpc] — each in 0–1.
+    pub fn subsystem_utilities(&self) -> [f64; 4] {
+        [self.utility_entropy, self.utility_hazard, self.utility_lotka, self.utility_mpc]
     }
 
     /// Persist learned state to disk.
@@ -491,6 +566,40 @@ mod tests {
     }
 
     #[test]
+    fn test_router_skips_heavy_at_low_pressure() {
+        let mut si = SignalIntelligence::new();
+        // Low pressure: heavy modules should produce zeroed outputs.
+        let d = si.tick(
+            0.15, 10.0, 0.01, 0.05,
+            &[5.0, 3.0], &[100e6, 50e6],
+            "idle_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+        );
+        assert_eq!(d.entropy_anomaly, 0.0, "entropy should be skipped at low pressure");
+        assert_eq!(d.p_oom_30s, 0.0, "hazard should be skipped at low pressure");
+        assert_eq!(d.monopoly_risk, 0.0, "lotka-volterra should be skipped at low pressure");
+        assert_eq!(d.mpc_recommendation, 0, "MPC should be skipped at low pressure");
+        // But Kalman should still work.
+        assert!(d.pressure_smooth > 0.0, "Kalman must always run");
+    }
+
+    #[test]
+    fn test_router_engages_heavy_at_high_pressure() {
+        let mut si = SignalIntelligence::new();
+        // Warm up Kalman so pressure_smooth reaches ≥0.40.
+        for _ in 0..20 {
+            tick_stressed(&mut si, 0.80);
+        }
+        let d = tick_stressed(&mut si, 0.80);
+        // At high pressure, hazard and MPC should produce non-trivial values.
+        // p_oom_30s may be 0 if hazard hasn't seen events, but it should have run.
+        // MPC should produce a recommendation (possibly Observe=0, but the path executed).
+        assert!(d.pressure_smooth > 0.40, "pressure should be high enough for deep mode");
+        // Entropy updates with real data — score may be 0 but the path ran.
+        // Key check: urgency should be non-trivial with all subsystems engaged.
+        assert!(d.urgency > 0.15, "urgency should be meaningful at 0.80 pressure");
+    }
+
+    #[test]
     fn test_mpc_recommends_action_under_stress() {
         let mut si = SignalIntelligence::new();
         for _ in 0..10 {
@@ -529,5 +638,55 @@ mod tests {
             d_after.p_oom_30s,
             p_before
         );
+    }
+
+    #[test]
+    fn test_budget_cognitivo_utility_decays_without_signal() {
+        // Hazard utility decays when p_oom stays near 0 (no overflow events).
+        let mut si = SignalIntelligence::new();
+        let initial_hazard = si.subsystem_utilities()[1];
+        assert!((initial_hazard - 0.5).abs() < 1e-9, "start at 0.5");
+
+        // 200 ticks in high zone (≥0.50) — all subsystems run.
+        // No record_overflow() calls → hazard base_rate stays 0 → p_oom ≈ 0.
+        for _ in 0..200 {
+            si.tick(
+                0.55, 10.0, 0.01, 0.05,
+                &[5.0, 3.0], &[100e6, 50e6],
+                "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+            );
+        }
+        let after_hazard = si.subsystem_utilities()[1];
+        assert!(
+            after_hazard < 0.10,
+            "hazard utility should decay without OOM events: {}",
+            after_hazard
+        );
+    }
+
+    #[test]
+    fn test_budget_cognitivo_mid_zone_skips_low_utility() {
+        let mut si = SignalIntelligence::new();
+        // Force utility to 0 (below threshold) for MPC.
+        si.utility_mpc = 0.0;
+        si.utility_entropy = 0.0;
+
+        // Warm up Kalman to mid-zone (~0.35).
+        for _ in 0..30 {
+            si.tick(
+                0.35, 10.0, 0.01, 0.05,
+                &[5.0, 3.0], &[100e6, 50e6],
+                "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+            );
+        }
+
+        let d = si.tick(
+            0.35, 10.0, 0.01, 0.05,
+            &[5.0, 3.0], &[100e6, 50e6],
+            "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+        );
+        // Low-utility subsystems should be skipped in mid zone.
+        assert_eq!(d.mpc_recommendation, 0, "MPC should be skipped (utility=0)");
+        assert_eq!(d.entropy_anomaly, 0.0, "Entropy should be skipped (utility=0)");
     }
 }

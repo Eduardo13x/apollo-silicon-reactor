@@ -82,6 +82,11 @@ impl AgentContext {
     /// Build the context vector from existing daemon state.
     ///
     /// All inputs are already collected each cycle — no new syscalls.
+    ///
+    /// `outcome_effectiveness`: overall [0,1] from OutcomeTracker.
+    /// `low_value_ratio`: fraction of tracked processes that are low-value [0,1].
+    ///   When high, interventions are wasting effort — LinUCB learns to prefer
+    ///   Observe or switch strategy.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         memory_pressure: f64,
@@ -95,6 +100,7 @@ impl AgentContext {
         reactor_weight: f64,
         overflow_threshold_offset: f64,
         outcome_effectiveness: f64,
+        low_value_ratio: f64,
     ) -> Self {
         let swap_ord = match swap_trend {
             SwapTrend::Decreasing => 0.0,
@@ -112,6 +118,13 @@ impl AgentContext {
         let hour_cos = (2.0 * std::f64::consts::PI * hour_f / 24.0).cos();
         let wl_ord = workload_ordinal(workload) as f64 / 7.0;
 
+        // Slot 11: combined feedback signal.
+        // effectiveness [0,1] penalized by low_value_ratio [0,1].
+        // When low_value_ratio is high, the effective signal drops,
+        // telling LinUCB that current interventions aren't working.
+        let feedback_signal =
+            (outcome_effectiveness * (1.0 - low_value_ratio)).clamp(0.0, 1.0);
+
         Self {
             features: [
                 memory_pressure.clamp(0.0, 1.0),              // 0
@@ -125,7 +138,7 @@ impl AgentContext {
                 hour_cos,                                     // 8
                 reactor_weight.clamp(0.0, 1.0),               // 9
                 overflow_threshold_offset.clamp(-0.20, 0.0),  // 10
-                outcome_effectiveness.clamp(0.0, 1.0),        // 11
+                feedback_signal,                              // 11
             ],
         }
     }
@@ -532,6 +545,7 @@ mod tests {
             0.0,
             0.0,
             0.5,
+            0.0, // low_value_ratio
         )
     }
 
@@ -683,6 +697,33 @@ mod tests {
     }
 
     #[test]
+    fn test_feedback_signal_combines_effectiveness_and_low_value() {
+        // High effectiveness + no low-value → high feedback signal.
+        let ctx_good = AgentContext::build(
+            0.5, SwapTrend::Stable, -1, 800.0, 50.0, 5000.0,
+            WorkloadType::General, 14, 0.0, 0.0,
+            0.80,  // outcome_effectiveness
+            0.0,   // low_value_ratio
+        );
+        assert!((ctx_good.features[11] - 0.80).abs() < 1e-6,
+            "no low-value: feedback should equal effectiveness");
+
+        // High effectiveness + high low-value → penalized feedback.
+        let ctx_bad = AgentContext::build(
+            0.5, SwapTrend::Stable, -1, 800.0, 50.0, 5000.0,
+            WorkloadType::General, 14, 0.0, 0.0,
+            0.80,  // outcome_effectiveness
+            0.50,  // 50% low-value
+        );
+        assert!((ctx_bad.features[11] - 0.40).abs() < 1e-6,
+            "50% low-value: feedback should be 0.80 * 0.50 = 0.40, got {}",
+            ctx_bad.features[11]);
+
+        // Darwinian: bad context should signal lower than good context.
+        assert!(ctx_bad.features[11] < ctx_good.features[11]);
+    }
+
+    #[test]
     fn test_context_build_ranges() {
         let ctx = AgentContext::build(
             1.5, // will be clamped to 1.0
@@ -696,6 +737,7 @@ mod tests {
             1.0,
             -0.15,
             0.8,
+            0.3, // low_value_ratio
         );
         // memory_pressure clamped
         assert!((ctx.features[0] - 1.0).abs() < 1e-10);

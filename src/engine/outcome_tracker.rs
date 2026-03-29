@@ -196,6 +196,29 @@ impl OutcomeTracker {
         (self.total_effective as f64 + 1.0) / (self.total_resolved as f64 + 2.0)
     }
 
+    /// Penalty signal for the RL agent: negative reward proportional to
+    /// how many low-value patterns exist.  Returns 0.0 when things are fine,
+    /// negative when throttling is wasting effort.
+    ///
+    /// Designed to be called after `tick()` and passed to
+    /// `RlThresholdAgent::inject_external_reward()`.
+    pub fn rl_penalty(&self) -> f64 {
+        let threshold = self.calibrated_threshold();
+        let low_count = self
+            .weights
+            .values()
+            .filter(|w| w.is_low_value_vs_baseline(threshold))
+            .count();
+        if low_count == 0 {
+            0.0
+        } else {
+            // -0.5 per low-value pattern, capped at -3.0.
+            // Mild enough not to override overflow penalty (-10),
+            // but persistent enough to steer learning over time.
+            (-0.5 * low_count as f64).max(-3.0)
+        }
+    }
+
     /// True si el heurístico tiene patrones confirmados como low-value
     /// y la efectividad global es baja — señal para llamar al LLM.
     pub fn heuristic_is_struggling(&self) -> bool {
@@ -421,6 +444,67 @@ mod tests {
         let tracker = OutcomeTracker::new();
         // < 5 resolved → returns neutral 0.5
         assert!((tracker.overall_effectiveness() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rl_penalty_zero_when_no_low_value() {
+        let tracker = OutcomeTracker::new();
+        assert_eq!(tracker.rl_penalty(), 0.0);
+    }
+
+    #[test]
+    fn rl_penalty_proportional_to_low_value_count() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.baseline_drop_ema = 0.25;
+        tracker.baseline_samples = 50;
+        // threshold = 0.225
+
+        // Add 2 low-value processes
+        tracker.weights.insert("proc_a".into(), PatternWeight { throttle_count: 25, effective_count: 0 });
+        tracker.weights.insert("proc_b".into(), PatternWeight { throttle_count: 25, effective_count: 0 });
+        // Add 1 high-value process (should not affect penalty)
+        tracker.weights.insert("proc_c".into(), PatternWeight { throttle_count: 25, effective_count: 20 });
+
+        let penalty = tracker.rl_penalty();
+        assert!((penalty - (-1.0)).abs() < 1e-6, "2 low-value = -1.0 penalty, got {}", penalty);
+    }
+
+    #[test]
+    fn rl_penalty_capped_at_minus_3() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.baseline_drop_ema = 0.25;
+        tracker.baseline_samples = 50;
+        for i in 0..10 {
+            tracker.weights.insert(format!("proc_{i}"), PatternWeight { throttle_count: 25, effective_count: 0 });
+        }
+        let penalty = tracker.rl_penalty();
+        assert!((penalty - (-3.0)).abs() < 1e-6, "10 low-value should cap at -3.0, got {}", penalty);
+    }
+
+    #[test]
+    fn integration_outcome_to_rl_feedback() {
+        // End-to-end: OutcomeTracker detects low-value → RL gets penalized.
+        use crate::engine::rl_threshold::{RlThresholdAgent, RlState};
+
+        let mut tracker = OutcomeTracker::new();
+        tracker.baseline_drop_ema = 0.25;
+        tracker.baseline_samples = 50;
+        tracker.weights.insert("wasteful".into(), PatternWeight { throttle_count: 30, effective_count: 0 });
+
+        let mut rl = RlThresholdAgent::load_or_default(std::path::Path::new("/dev/null"));
+        let state = RlState::from_metrics(0.60, 0.40, 0);
+        rl.tick(state, false);
+
+        let q_before = rl.last_q_value();
+
+        // Wire the feedback: outcome → RL
+        let penalty = tracker.rl_penalty();
+        assert!(penalty < 0.0);
+        rl.inject_external_reward(penalty);
+
+        let q_after = rl.last_q_value();
+        assert!(q_after < q_before,
+            "RL should be penalized by outcome feedback: {} < {}", q_after, q_before);
     }
 
     #[test]

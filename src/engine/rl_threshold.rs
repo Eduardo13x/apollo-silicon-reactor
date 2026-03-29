@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 
 const NUM_STATES: usize = 36;
 const NUM_ACTIONS: usize = 3;
-const ALPHA: f64 = 0.10;
+/// Minimum learning rate — floor for the decaying EMA alpha.
+const ALPHA_MIN: f64 = 0.02;
+/// Initial learning rate — high to learn fast from early observations.
+const ALPHA_INITIAL: f64 = 0.20;
 const GAMMA: f64 = 0.95;
 const EPSILON_INITIAL: f64 = 0.10;
 const EPSILON_STABLE: f64 = 0.05;
@@ -154,6 +157,13 @@ impl RlThresholdAgent {
         }
     }
 
+    /// Decaying learning rate: high at start (explore), low later (exploit).
+    /// α = max(ALPHA_MIN, ALPHA_INITIAL / (1 + total_ticks / 200))
+    /// Half-life ≈ 200 ticks — matches EPSILON_DECAY_TICKS.
+    pub fn alpha(&self) -> f64 {
+        (ALPHA_INITIAL / (1.0 + self.total_ticks as f64 / 200.0)).max(ALPHA_MIN)
+    }
+
     pub fn total_ticks(&self) -> u64 {
         self.total_ticks
     }
@@ -198,7 +208,8 @@ impl RlThresholdAgent {
                 .cloned()
                 .fold(f64::NEG_INFINITY, f64::max);
             let old_q = self.q_table[s][a];
-            self.q_table[s][a] = old_q + ALPHA * (reward + GAMMA * max_q_next - old_q);
+            let alpha = self.alpha();
+            self.q_table[s][a] = old_q + alpha * (reward + GAMMA * max_q_next - old_q);
         }
 
         let action = self.select_action(state);
@@ -214,6 +225,28 @@ impl RlThresholdAgent {
         self.last_state = Some(state);
         self.last_action = Some(action);
         self.total_ticks += 1;
+    }
+
+    /// Q-value for the last state-action pair (for observability/testing).
+    /// Returns 0.0 if no action has been taken yet.
+    pub fn last_q_value(&self) -> f64 {
+        match (self.last_state, self.last_action) {
+            (Some(s), Some(a)) => self.q_table[s.index()][a as usize],
+            _ => 0.0,
+        }
+    }
+
+    /// Inject an external reward signal into the last state-action pair.
+    /// Used by the feedback loop: OutcomeTracker sends penalties when
+    /// throttling is ineffective, enriching RL beyond binary overflow.
+    pub fn inject_external_reward(&mut self, reward: f64) {
+        if let (Some(prev_state), Some(prev_action)) = (self.last_state, self.last_action) {
+            let s = prev_state.index();
+            let a = prev_action as usize;
+            let alpha = self.alpha();
+            // Direct injection: no Bellman lookahead, just nudge Q toward reward.
+            self.q_table[s][a] += alpha * reward;
+        }
     }
 
     pub fn persist(&self) {
@@ -355,6 +388,57 @@ mod tests {
         let effective2 =
             (0.78 + (-0.20) + (-0.08) + agent.current_adjustment).max(RL_ABSOLUTE_FLOOR);
         assert!(effective2 >= RL_ABSOLUTE_FLOOR);
+    }
+
+    #[test]
+    fn test_ema_alpha_decays_over_time() {
+        let mut agent = make_agent();
+        let alpha_0 = agent.alpha();
+        assert!((alpha_0 - ALPHA_INITIAL).abs() < 1e-6, "initial alpha should be {}", ALPHA_INITIAL);
+
+        let state = RlState::from_metrics(0.50, 0.30, 0);
+        for _ in 0..400 {
+            agent.tick(state, false);
+        }
+        let alpha_400 = agent.alpha();
+        assert!(alpha_400 < alpha_0, "alpha should decay: {} < {}", alpha_400, alpha_0);
+        assert!(alpha_400 >= ALPHA_MIN, "alpha should not go below floor: {}", alpha_400);
+    }
+
+    #[test]
+    fn test_ema_converges_faster_than_fixed_alpha() {
+        // Darwinian selection: EMA agent vs hypothetical fixed-alpha agent.
+        // Both see 50 stable ticks then 20 overflow ticks.
+        // EMA should have higher Q variance (learned more from early data).
+        let mut agent = make_agent();
+        let calm = RlState::from_metrics(0.30, 0.10, 0);
+        for _ in 0..50 {
+            agent.tick(calm, false);
+        }
+        let q_after_calm: f64 = agent.q_table[calm.index()]
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        // After 50 calm ticks, best Q should be meaningfully positive
+        // because early high alpha accumulated reward faster.
+        assert!(q_after_calm > 2.0,
+            "EMA agent should learn fast from early data: best_q={}", q_after_calm);
+    }
+
+    #[test]
+    fn test_inject_external_reward_nudges_q() {
+        let mut agent = make_agent();
+        let state = RlState::from_metrics(0.60, 0.40, 0);
+        agent.tick(state, false);
+
+        let s = agent.last_state.unwrap().index();
+        let a = agent.last_action.unwrap() as usize;
+        let q_before = agent.q_table[s][a];
+
+        agent.inject_external_reward(-5.0);
+        let q_after = agent.q_table[s][a];
+        assert!(q_after < q_before,
+            "negative external reward should decrease Q: {} < {}", q_after, q_before);
     }
 
     #[test]

@@ -161,6 +161,28 @@ Key crates:
 - `toml` – Config file parsing
 - `ureq` – HTTP requests (for LLM integration)
 
+## Current Development: v0.6.0 "Self-Evolving"
+
+**Base:** v0.5.0 (tag `v0.5.0`, commit `a3f2216`). Backup binarios en `~/backups/apollo-v0.5.0/`.
+
+### Key Problem
+Three independent learning loops (RL, OutcomeTracker, PredictiveAgent) never cross-feed. `mach_qos.rs` is purely reactive — ignores Markov predictions.
+
+### Plan (Nivel 1 — ~70 lines, 0 new modules, 0 new deps)
+1. **Router adaptativo** in `signal_intelligence.rs` — skip heavy subsystems when pressure < 0.40
+2. **EMA Q-learning** in `rl_threshold.rs` — decaying alpha replaces fixed 0.10
+3. **Cable A**: OutcomeTracker → RL reward signal (in daemon main loop)
+4. **Cable B**: OutcomeTracker low_value → PredictiveAgent context
+5. **Cable C**: Markov prediction → `mach_qos.set_tier()` proactive QoS
+6. **Budget cognitivo**: Router uses per-predictor outcome scores
+
+### Dead Code (confirmed, safe to remove)
+- `optimizer.rs:optimize()` — never called in modern daemon
+- `TransformerPredictor` — disabled
+- `TelemetryLogger` — disabled
+
+Full plan: see memory file `project_v060_evolution.md`.
+
 ## Quick Reference
 
 | Task | Command |
