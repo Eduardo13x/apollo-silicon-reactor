@@ -73,8 +73,9 @@ pub struct SignalDigest {
     /// Score compuesto de urgencia (0–1). Combina todas las señales.
     pub urgency: f64,
 
-    // ── Transformer ────────────────────────────────────────────────────
-    /// Reserved for future Transformer integration. Always 0.0 (Transformer disabled).
+    // ── Darwin-Boltzmann Anomaly Detector ──────────────────────────────
+    /// Learned anomaly score from DBAD: Hopfield memory + evolving SAE population.
+    /// 0.0 = normal, >0.5 = significant deviation, >0.8 = severe.
     pub transformer_anomaly: f64,
 
     // ── Deep Scan (v0.7.0) ──────────────────────────────────────────────

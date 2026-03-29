@@ -40,6 +40,7 @@ use apollo_optimizer::engine::energy::EnergyTracker;
 use apollo_optimizer::engine::execute_actions::execute_actions;
 use apollo_optimizer::engine::focus_markov::FocusMarkov;
 use apollo_optimizer::engine::foreground::{ForegroundDetector, ForegroundState};
+use apollo_optimizer::engine::evolved_anomaly::EvolvedAnomalyDetector;
 use apollo_optimizer::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
 use apollo_optimizer::engine::holt_winters::HoltWinters;
 use apollo_optimizer::engine::hw_bayes::HwFeatures;
@@ -2901,6 +2902,9 @@ fn main() -> anyhow::Result<()> {
             let mut wake_storm = WakeStormDetector::new();
             // GPU thermal monitoring: integrates with thermal_manager for GPU-aware decisions.
             let gpu_mgr = GPUManager::new();
+            // Darwin-Boltzmann Anomaly Detector: replaces disabled TransformerPredictor
+            // with online Hopfield memory + evolving SAE population + free energy fusion.
+            let mut darwin_anomaly = EvolvedAnomalyDetector::new();
             // Network profile optimizer: complements sysctl_governor with profile-driven tuning.
             let net_optimizer = NetworkOptimizer::new();
             // Foreground detection: replaces get_foreground_app() with cached, richer detection.
@@ -4511,10 +4515,67 @@ fn main() -> anyhow::Result<()> {
 
                 // v0.7.0: Mark memory scan available when pressure is in mid/high zone.
                 // The actual scan runs lazily during freeze decision (cost-gated).
+                // DBAD: build telemetry vector from signal digest and score.
                 let signal_digest = {
                     let mut d = signal_digest;
                     if d.pressure_smooth >= 0.30 {
                         d.memory_scan_available = true;
+                    }
+                    // Darwin-Boltzmann anomaly scoring: feed signal digest into
+                    // Hopfield memory + evolving SAE population for learned anomaly detection.
+                    // Replaces hardcoded transformer_anomaly: 0.0.
+                    use apollo_optimizer::engine::telemetry_logger::TelemetryVector;
+                    let dom_share = {
+                        let max_mem = snapshot.top_processes.iter()
+                            .map(|p| p.memory_usage)
+                            .max()
+                            .unwrap_or(0) as f64;
+                        let total = snapshot.memory.total_ram as f64;
+                        if total > 0.0 { (max_mem / total) as f32 } else { 0.0 }
+                    };
+                    let thermal_score = match snapshot.pressure.thermal_level.as_str() {
+                        "nominal" => 0.0f32,
+                        "light" => 0.33,
+                        "serious" => 0.66,
+                        "critical" => 1.0,
+                        _ => 0.0,
+                    };
+                    let cpu_total = snapshot.top_processes.iter()
+                        .map(|p| p.cpu_usage)
+                        .sum::<f32>() / 100.0;
+                    let active_count = (snapshot.top_processes.len() as f32 / 200.0).min(1.0);
+                    let tv = TelemetryVector {
+                        pressure_smooth: d.pressure_smooth as f32,
+                        pressure_velocity: d.pressure_velocity as f32,
+                        pressure_predicted_5s: d.pressure_predicted_5s as f32,
+                        swap_velocity_smooth: (d.swap_velocity_smooth as f32).clamp(-5.0, 5.0),
+                        pressure_integral: d.pressure_integral as f32,
+                        cusum_score: d.cusum_score as f32,
+                        entropy_anomaly: d.entropy_anomaly as f32,
+                        p_oom_30s: d.p_oom_30s as f32,
+                        monopoly_risk: d.monopoly_risk as f32,
+                        urgency: d.urgency as f32,
+                        cpu_total: cpu_total.min(1.0),
+                        compressor_ratio: snapshot.pressure.memory_pressure as f32,
+                        dominant_share: dom_share,
+                        latency_score: 0.0, // no perceptual latency sensor yet
+                        active_proc_count: active_count,
+                        thermal_score,
+                    };
+                    d.transformer_anomaly = darwin_anomaly.score(
+                        tv.as_f32_slice(),
+                        d.pressure_smooth as f32,
+                    );
+                    // Audit DBAD score every ~60 cycles or when anomaly detected.
+                    if d.transformer_anomaly > 0.3 || cycle_count % 60 == 0 {
+                        audit_log(&serde_json::json!({
+                            "event": "dbad_score",
+                            "score": (d.transformer_anomaly * 1000.0).round() / 1000.0,
+                            "alpha": (darwin_anomaly.alpha() * 100.0).round() / 100.0,
+                            "samples": darwin_anomaly.sample_count(),
+                            "ready": darwin_anomaly.is_ready(),
+                            "pressure": (d.pressure_smooth * 1000.0).round() / 1000.0,
+                        }));
                     }
                     d
                 };
@@ -4531,6 +4592,12 @@ fn main() -> anyhow::Result<()> {
                 // Entropy anomaly: chaotic process distribution change.
                 if signal_digest.entropy_anomaly > 2.0 {
                     *reactor_weight = (*reactor_weight + 0.15).min(1.0);
+                }
+                // Darwin-Boltzmann anomaly: learned pattern deviation.
+                // Score > 0.5 means the system state deviates significantly from
+                // the Hopfield memory + SAE ensemble's learned "normal" manifold.
+                if signal_digest.transformer_anomaly > 0.5 {
+                    *reactor_weight = (*reactor_weight + 0.2).min(1.0);
                 }
 
                 // Predictive agent: build context from existing signals and select intervention.

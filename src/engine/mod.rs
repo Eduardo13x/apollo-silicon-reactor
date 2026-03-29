@@ -7,6 +7,7 @@ pub mod capabilities;
 pub mod coalition;
 pub mod compressor_aware;
 pub mod cusum;
+pub mod evolved_anomaly;
 pub mod decide_actions;
 pub mod display_turbo;
 pub mod energy;
