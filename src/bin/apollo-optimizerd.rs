@@ -2877,6 +2877,16 @@ fn main() -> anyhow::Result<()> {
             // Predictive agent: LinUCB contextual bandit for proactive interventions.
             let mut predictive_agent =
                 PredictiveAgent::load_or_default(std::path::Path::new(predictive_agent_path()));
+            // ZeroTune: seed with hardware meta-features on cold start.
+            // Reduces warmup from 200→50 cycles by injecting domain knowledge priors.
+            if !predictive_agent.is_active() && predictive_agent.total_cycles() == 0 {
+                let ram_gb = apollo_optimizer::engine::sysctl_direct::read_u64("hw.memsize")
+                    .unwrap_or(8 * 1024 * 1024 * 1024) as f64
+                    / (1024.0 * 1024.0 * 1024.0);
+                let cores = apollo_optimizer::engine::sysctl_direct::read_u64("hw.ncpu")
+                    .unwrap_or(4) as usize;
+                predictive_agent.meta_seed(ram_gb, cores);
+            }
             // Signal intelligence: Kalman + CUSUM + Entropy + Hazard + LV + MPC.
             // Restore persisted hazard model + MPC effects so the system doesn't cold-start
             // after a reboot (Cox hazard base_rate calibrates over days of observation).
@@ -5519,6 +5529,13 @@ fn main() -> anyhow::Result<()> {
                         outcome_tracker.record_throttle(name, mem_pressure_now, proc_watts);
                     }
                 }
+
+                // Counterfactual: observe pressure drift. If no throttles this cycle,
+                // the tracker learns the natural drift rate (what happens without action).
+                outcome_tracker.observe_cycle(
+                    snapshot.pressure.memory_pressure,
+                    !throttle_names_for_outcome.is_empty(),
+                );
 
                 // Outcome tracker tick: resuelve outcomes de hace 30s, actualiza pesos y energy savings.
                 {

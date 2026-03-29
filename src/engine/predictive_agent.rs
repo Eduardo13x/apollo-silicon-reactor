@@ -28,6 +28,7 @@ use crate::engine::user_profile::WorkloadType;
 const D: usize = 12; // feature dimensions
 const K: usize = 5; // number of arms
 const WARMUP_CYCLES: u32 = 200;
+const SEEDED_WARMUP_CYCLES: u32 = 50;
 const PERSIST_INTERVAL: u32 = 100;
 const TIGHTEN_OFFSET: f64 = -0.03; // 3pp tighter thresholds
 
@@ -515,6 +516,55 @@ impl PredictiveAgent {
         }
         thresholds
     }
+
+    /// ZeroTune: seed LinUCB arms with system-aware priors to reduce cold-start.
+    ///
+    /// Instead of 200 blind Observe cycles, inject synthetic observations based
+    /// on hardware meta-features. This encodes domain knowledge:
+    /// - Low RAM (≤8 GB): TightenThresholds and ProactivePurge are more valuable
+    /// - High RAM (>16 GB): Observe is often sufficient
+    /// - More cores: PreThrottleNoise is cheaper (more scheduling headroom)
+    ///
+    /// Call once at initialization when no persisted state exists.
+    /// Reduces warmup from 200 → 50 cycles.
+    pub fn meta_seed(&mut self, ram_gb: f64, cores: usize) {
+        if self.total_cycles > 0 {
+            return; // already trained, don't overwrite
+        }
+
+        // Synthetic context: moderate pressure scenario (the interesting regime).
+        let mut ctx = [0.0; D];
+        ctx[0] = 0.55; // memory_pressure (moderate-high)
+        ctx[1] = 0.3; // swap_trend (rising)
+        ctx[2] = 0.5; // time_to_critical (medium)
+
+        // Prior rewards by arm, scaled by hardware.
+        // Low RAM → proactive interventions are more valuable.
+        let ram_factor = (16.0 / ram_gb).clamp(0.5, 2.0); // 8GB→2.0, 16GB→1.0, 32GB→0.5
+        let core_factor = (cores as f64 / 8.0).clamp(0.5, 1.5); // 4→0.5, 8→1.0, 12→1.5
+
+        let priors = [
+            0.0,                          // Observe: neutral
+            0.3 * ram_factor,             // TightenThresholds: better with low RAM
+            0.1,                          // SuggestAggressive: mild prior
+            0.15 * core_factor,           // PreThrottleNoise: better with more cores
+            0.25 * ram_factor,            // ProactivePurge: better with low RAM
+        ];
+
+        // Inject N synthetic pulls per arm (like pseudo-observations).
+        const SEED_PULLS: usize = 5;
+        for (arm_idx, &reward) in priors.iter().enumerate() {
+            for _ in 0..SEED_PULLS {
+                self.arms[arm_idx].update(&ctx, reward);
+            }
+        }
+
+        self.warmup_remaining = SEEDED_WARMUP_CYCLES;
+        eprintln!(
+            "predictive-agent: ZeroTune seeded (ram={:.0}GB, cores={}) — warmup reduced to {}",
+            ram_gb, cores, SEEDED_WARMUP_CYCLES
+        );
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -745,5 +795,75 @@ mod tests {
         assert!((ctx.features[1] - 0.75).abs() < 1e-10);
         // swap_urgency = 1/(1+5) = 0.1667
         assert!((ctx.features[2] - 1.0 / 6.0).abs() < 1e-3);
+    }
+
+    // ── ZeroTune cold start tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_meta_seed_reduces_warmup() {
+        let path = test_path("zerotune_warmup");
+        let mut agent = PredictiveAgent::load_or_default(&path);
+        assert_eq!(agent.warmup_remaining, WARMUP_CYCLES);
+
+        agent.meta_seed(8.0, 8);
+        assert_eq!(agent.warmup_remaining, SEEDED_WARMUP_CYCLES);
+        assert!(SEEDED_WARMUP_CYCLES < WARMUP_CYCLES);
+    }
+
+    #[test]
+    fn test_meta_seed_injects_priors_into_arms() {
+        let path = test_path("zerotune_priors");
+        let mut agent = PredictiveAgent::load_or_default(&path);
+        agent.meta_seed(8.0, 8);
+
+        // After seeding, arms should have pull_count > 0.
+        let pulls = agent.arm_pulls();
+        assert!(pulls.iter().all(|&p| p > 0), "all arms should have pulls: {:?}", pulls);
+
+        // TightenThresholds (arm 1) should have higher avg reward than Observe (arm 0)
+        // on 8GB RAM (ram_factor=2.0 → 0.3*2.0=0.6 vs 0.0).
+        let avg = agent.arm_avg_rewards();
+        assert!(
+            avg[1] > avg[0],
+            "TightenThresholds should have higher prior than Observe on 8GB: {:?}",
+            avg
+        );
+    }
+
+    #[test]
+    fn test_meta_seed_noop_after_training() {
+        let path = test_path("zerotune_noop");
+        let mut agent = PredictiveAgent::load_or_default(&path);
+        // Simulate some training
+        agent.warmup_remaining = 0;
+        let ctx = dummy_context(0.5);
+        agent.select_action(&ctx);
+        agent.observe_outcome(0.5);
+        assert!(agent.total_cycles() > 0);
+
+        let pulls_before = agent.arm_pulls();
+        agent.meta_seed(8.0, 8); // should be no-op
+        let pulls_after = agent.arm_pulls();
+        assert_eq!(pulls_before, pulls_after, "meta_seed should be no-op after training");
+    }
+
+    #[test]
+    fn test_meta_seed_low_vs_high_ram() {
+        let path_low = test_path("zerotune_low_ram");
+        let path_high = test_path("zerotune_high_ram");
+        let mut agent_low = PredictiveAgent::load_or_default(&path_low);
+        let mut agent_high = PredictiveAgent::load_or_default(&path_high);
+
+        agent_low.meta_seed(8.0, 8);
+        agent_high.meta_seed(32.0, 8);
+
+        // On 8GB, TightenThresholds (arm 1) should have higher reward than on 32GB.
+        let avg_low = agent_low.arm_avg_rewards();
+        let avg_high = agent_high.arm_avg_rewards();
+        assert!(
+            avg_low[1] > avg_high[1],
+            "TightenThresholds should be more valued on 8GB ({}) than 32GB ({})",
+            avg_low[1], avg_high[1]
+        );
     }
 }

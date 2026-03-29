@@ -269,9 +269,22 @@ impl SignalIntelligence {
             0.0
         };
 
-        // ── 6. MPC ───────────────────────────────────────────────────────
+        // ── 6. MPC (constraint-aware) ─────────────────────────────────────
         let mpc_recommendation = if run_mpc {
-            self.mpc.solve(pressure_smooth, pressure_velocity)
+            let utils = [
+                self.utility_entropy,
+                self.utility_hazard,
+                self.utility_lotka,
+                self.utility_mpc,
+            ];
+            // Use pressure_smooth as urgency proxy (dominant component;
+            // full urgency includes MPC output — circular dependency).
+            self.mpc.solve_constrained(
+                pressure_smooth,
+                pressure_velocity,
+                pressure_smooth, // urgency proxy
+                &utils,
+            )
         } else {
             0 // Observe
         };

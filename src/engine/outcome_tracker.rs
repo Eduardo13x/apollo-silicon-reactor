@@ -69,7 +69,77 @@ pub struct OutcomeBatch {
     pub low_value_names: Vec<String>,
 }
 
-// ── OutcomeTracker ────────────────────────────────────────────────────────────
+// ── Experience Memory ───────────���─────────────────────────────��───────────────
+
+/// A resolved decision+outcome record for queryable experience memory.
+/// Ring buffer of the last N records enables "what worked before?" queries.
+#[derive(Debug, Clone)]
+pub struct ExperienceRecord {
+    /// Process that was throttled.
+    pub process_name: String,
+    /// Memory pressure at the time of throttle.
+    pub pressure_at_action: f64,
+    /// Pressure drop observed 30s later (positive = pressure went down).
+    pub pressure_drop: f64,
+    /// Whether the throttle was effective (drop ≥ 0.02).
+    pub effective: bool,
+}
+
+/// Ring buffer of experience records with similarity query.
+pub struct ExperienceMemory {
+    records: VecDeque<ExperienceRecord>,
+    capacity: usize,
+}
+
+impl ExperienceMemory {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            records: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Store a resolved outcome.
+    pub fn push(&mut self, record: ExperienceRecord) {
+        if self.records.len() >= self.capacity {
+            self.records.pop_front();
+        }
+        self.records.push_back(record);
+    }
+
+    /// Query: expected effectiveness for throttling `process` at `pressure`.
+    /// Returns (expected_drop, confidence) or None if no similar records.
+    /// Similarity: same process name AND pressure within ±0.10.
+    pub fn query_similar(&self, process: &str, pressure: f64) -> Option<(f64, f64)> {
+        let mut sum_drop = 0.0_f64;
+        let mut count = 0u32;
+        for r in &self.records {
+            if r.process_name == process && (r.pressure_at_action - pressure).abs() <= 0.10 {
+                sum_drop += r.pressure_drop;
+                count += 1;
+            }
+        }
+        if count < 3 {
+            return None;
+        }
+        let avg_drop = sum_drop / count as f64;
+        // Confidence: saturates at 1.0 after 20 records.
+        let confidence = (count as f64 / 20.0).min(1.0);
+        Some((avg_drop, confidence))
+    }
+
+    /// Number of stored records.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// True if empty.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+// ── OutcomeTracker ──��─────────────────��─────────────────────��─────────────────
 
 pub struct OutcomeTracker {
     pending: VecDeque<PendingOutcome>,
@@ -86,6 +156,18 @@ pub struct OutcomeTracker {
     baseline_drop_ema: f64,
     /// Número de outcomes resueltos que alimentan el baseline.
     baseline_samples: u32,
+    /// Queryable experience memory — ring buffer of resolved outcomes.
+    pub experience: ExperienceMemory,
+    /// Counterfactual: EMA of natural pressure drift when we DON'T act.
+    /// Positive = pressure tends to drop naturally over 30s.
+    /// Used to separate real causal effect from natural fluctuation.
+    natural_drift_ema: f64,
+    /// Pressure snapshot from previous cycle (for drift calculation).
+    prev_pressure: Option<f64>,
+    /// Accumulated pressure delta during non-action cycles (rolling 30s window).
+    drift_accumulator: f64,
+    /// Ticks since last action (for windowed drift measurement).
+    ticks_since_action: u32,
 }
 
 impl OutcomeTracker {
@@ -97,6 +179,11 @@ impl OutcomeTracker {
             total_resolved: 0,
             baseline_drop_ema: 0.0,
             baseline_samples: 0,
+            experience: ExperienceMemory::new(500),
+            natural_drift_ema: 0.0,
+            prev_pressure: None,
+            drift_accumulator: 0.0,
+            ticks_since_action: 0,
         }
     }
 
@@ -162,6 +249,14 @@ impl OutcomeTracker {
                 }
             }
 
+            // Store in experience memory for similarity queries.
+            self.experience.push(ExperienceRecord {
+                process_name: outcome.process_name.clone(),
+                pressure_at_action: outcome.pressure_before,
+                pressure_drop,
+                effective,
+            });
+
             self.total_resolved += 1;
             if effective {
                 self.total_effective += 1;
@@ -225,6 +320,46 @@ impl OutcomeTracker {
         self.total_resolved >= 10
             && self.overall_effectiveness() < 0.35
             && self.weights.values().any(|w| w.is_low_value())
+    }
+
+    // ── Counterfactual baseline ──────────────────────────────────────────
+
+    /// Call every daemon cycle with current pressure and whether an action was taken.
+    /// Builds a model of natural pressure drift to separate causal effects.
+    pub fn observe_cycle(&mut self, pressure: f64, acted: bool) {
+        const DRIFT_ALPHA: f64 = 0.02; // slow EMA, half-life ~35 observations
+        const DRIFT_WINDOW_TICKS: u32 = 60; // ~30s at 2Hz
+
+        if let Some(prev) = self.prev_pressure {
+            if !acted {
+                self.drift_accumulator += prev - pressure; // positive = pressure dropped
+                self.ticks_since_action += 1;
+
+                // After a full window of non-action, commit the drift observation.
+                if self.ticks_since_action >= DRIFT_WINDOW_TICKS {
+                    self.natural_drift_ema += DRIFT_ALPHA
+                        * (self.drift_accumulator - self.natural_drift_ema);
+                    self.drift_accumulator = 0.0;
+                    self.ticks_since_action = 0;
+                }
+            } else {
+                // Action taken — reset drift window.
+                self.drift_accumulator = 0.0;
+                self.ticks_since_action = 0;
+            }
+        }
+        self.prev_pressure = Some(pressure);
+    }
+
+    /// Causal effect of a throttle: observed pressure drop minus natural drift.
+    /// Positive = the action actually helped beyond what would have happened naturally.
+    pub fn causal_effect(&self, observed_drop: f64) -> f64 {
+        observed_drop - self.natural_drift_ema
+    }
+
+    /// Current estimate of natural pressure drift over 30s (no-action baseline).
+    pub fn natural_drift(&self) -> f64 {
+        self.natural_drift_ema
     }
 }
 
@@ -505,6 +640,157 @@ mod tests {
         let q_after = rl.last_q_value();
         assert!(q_after < q_before,
             "RL should be penalized by outcome feedback: {} < {}", q_after, q_before);
+    }
+
+    // ── Experience Memory tests ────────────────────────────────────────────────
+
+    #[test]
+    fn experience_memory_ring_buffer_evicts_oldest() {
+        let mut mem = ExperienceMemory::new(3);
+        for i in 0..5 {
+            mem.push(ExperienceRecord {
+                process_name: format!("proc_{i}"),
+                pressure_at_action: 0.60,
+                pressure_drop: 0.05,
+                effective: true,
+            });
+        }
+        assert_eq!(mem.len(), 3);
+        // Oldest (proc_0, proc_1) evicted; proc_2, proc_3, proc_4 remain.
+        assert!(mem.records.iter().all(|r| !r.process_name.starts_with("proc_0")));
+        assert!(mem.records.iter().all(|r| !r.process_name.starts_with("proc_1")));
+    }
+
+    #[test]
+    fn experience_query_similar_requires_min_3_records() {
+        let mut mem = ExperienceMemory::new(100);
+        // Only 2 records → None
+        for _ in 0..2 {
+            mem.push(ExperienceRecord {
+                process_name: "Dropbox".into(),
+                pressure_at_action: 0.70,
+                pressure_drop: 0.05,
+                effective: true,
+            });
+        }
+        assert!(mem.query_similar("Dropbox", 0.70).is_none());
+
+        // 3rd record → Some
+        mem.push(ExperienceRecord {
+            process_name: "Dropbox".into(),
+            pressure_at_action: 0.72,
+            pressure_drop: 0.03,
+            effective: true,
+        });
+        let (avg_drop, confidence) = mem.query_similar("Dropbox", 0.70).unwrap();
+        assert!((avg_drop - (0.05 + 0.05 + 0.03) / 3.0).abs() < 1e-6);
+        assert!((confidence - 3.0 / 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn experience_query_filters_by_pressure_window() {
+        let mut mem = ExperienceMemory::new(100);
+        // 3 records at pressure 0.70
+        for _ in 0..3 {
+            mem.push(ExperienceRecord {
+                process_name: "chrome".into(),
+                pressure_at_action: 0.70,
+                pressure_drop: 0.08,
+                effective: true,
+            });
+        }
+        // 3 records at pressure 0.30 (too far from 0.70)
+        for _ in 0..3 {
+            mem.push(ExperienceRecord {
+                process_name: "chrome".into(),
+                pressure_at_action: 0.30,
+                pressure_drop: -0.01,
+                effective: false,
+            });
+        }
+        // Query at 0.70 should only match first 3.
+        let (avg_drop, _) = mem.query_similar("chrome", 0.70).unwrap();
+        assert!((avg_drop - 0.08).abs() < 1e-6, "should only match p≈0.70 records");
+    }
+
+    // ── Counterfactual baseline tests ───────────────────────────────────────────
+
+    #[test]
+    fn counterfactual_natural_drift_builds_from_observe_cycles() {
+        let mut tracker = OutcomeTracker::new();
+        // Simulate 65 ticks of no-action with slight natural pressure drop.
+        // First tick sets prev_pressure; need ≥60 more for a full window commit.
+        for i in 0..65 {
+            let p = 0.60 - (i as f64) * (0.05 / 65.0);
+            tracker.observe_cycle(p, false);
+        }
+        // After 60 non-action ticks (one full window), drift EMA should be positive
+        // (pressure naturally dropped).
+        assert!(
+            tracker.natural_drift() > 0.0,
+            "natural drift should be positive when pressure drops: {}",
+            tracker.natural_drift()
+        );
+    }
+
+    #[test]
+    fn counterfactual_action_resets_drift_window() {
+        let mut tracker = OutcomeTracker::new();
+        // 30 no-action ticks
+        for i in 0..30 {
+            tracker.observe_cycle(0.60 - i as f64 * 0.001, false);
+        }
+        // Action resets accumulator
+        tracker.observe_cycle(0.55, true);
+        // Only 5 more non-action ticks — not enough for a window commit
+        for i in 0..5 {
+            tracker.observe_cycle(0.55 - i as f64 * 0.001, false);
+        }
+        // Drift should still be 0 (no full window completed after reset)
+        assert!(
+            tracker.natural_drift().abs() < 1e-9,
+            "drift should be 0 after action reset: {}",
+            tracker.natural_drift()
+        );
+    }
+
+    #[test]
+    fn counterfactual_causal_effect_subtracts_natural_drift() {
+        let mut tracker = OutcomeTracker::new();
+        // Build natural drift over a window.
+        // 65 ticks, pressure 0.60 → 0.55 linearly (first tick sets prev_pressure).
+        for i in 0..65 {
+            let p = 0.60 - (i as f64) * (0.05 / 65.0);
+            tracker.observe_cycle(p, false);
+        }
+        let drift = tracker.natural_drift();
+        // If we observed a throttle causing 0.08 drop, causal effect = 0.08 - drift.
+        let causal = tracker.causal_effect(0.08);
+        assert!(
+            causal < 0.08,
+            "causal effect should be less than raw drop: {} < 0.08",
+            causal
+        );
+        assert!(
+            (causal - (0.08 - drift)).abs() < 1e-9,
+            "causal = observed - drift"
+        );
+    }
+
+    #[test]
+    fn experience_fed_by_tick() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.pending.push_back(super::PendingOutcome {
+            process_name: "test_proc".into(),
+            throttled_at: Instant::now() - Duration::from_secs(31),
+            pressure_before: 0.75,
+            watts_before: 1.0,
+        });
+        tracker.weights.insert("test_proc".into(), PatternWeight { throttle_count: 1, effective_count: 0 });
+
+        assert!(tracker.experience.is_empty());
+        tracker.tick(0.70); // drop = 0.05
+        assert_eq!(tracker.experience.len(), 1);
     }
 
     #[test]
