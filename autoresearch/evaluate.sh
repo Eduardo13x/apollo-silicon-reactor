@@ -34,7 +34,7 @@
 # Baseline (frozen):
 BASELINE_TESTS=1370
 BASELINE_SIZE_KB=4055
-TOTAL_SCENARIOS=30
+TOTAL_SCENARIOS=40
 # ══════════════════════════════════════════════════════════════════════════════
 cd "$(dirname "$0")/.."
 

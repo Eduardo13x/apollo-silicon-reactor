@@ -667,4 +667,227 @@ mod scenarios {
             d
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CATEGORY 11: BOSS LEVEL 3 — ADVERSARIAL SCENARIOS
+    // Edge cases designed to break naive heuristics.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// BOSS 11: Fake telemetry name — a process named "analyticsd_worker" that
+    /// is NOT actually telemetry (it's a user analytics pipeline). High CPU,
+    /// high pageins, doing real work. Must not be blindly throttled by name.
+    #[test]
+    fn s31_fake_telemetry_not_blindly_throttled() {
+        let mut s = snap(3100, "analytics_worker", 40.0, 400, false, 300, 300);
+        s.pageins_total = 60000; // Real I/O work
+        s.wakeups_per_sec = 20.0;
+        s.has_network = true;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "analytics_worker");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "analytics_worker doing real I/O work must be ALLOWED despite name. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 12: Memory hoarder vs loaded model — two 2GB processes.
+    /// One is a leaked browser process (0% CPU, no ports, no network, zombie parent).
+    /// Other is a database (3% CPU, 90 ports, network). The governor should
+    /// treat them DIFFERENTLY despite same RSS.
+    #[test]
+    fn s32_same_rss_different_treatment() {
+        let leaked = snap(3200, "leaked_browser", 0.0, 2048, false, 14400, 14400);
+        let mut db = snap(3201, "mysql", 3.0, 2048, false, 9999, 9999);
+        db.has_network = true;
+        db.mach_port_count = 90;
+        db.wakeups_per_sec = 8.0;
+        let snaps = vec![leaked, db];
+        let results = decide(&snaps, None);
+        let d_leaked = find_decision(&results, "leaked_browser");
+        let d_db = find_decision(&results, "mysql");
+        assert!(
+            d_leaked != GovernorDecision::Allow,
+            "Leaked 2GB browser process should NOT be allowed. Got {:?}",
+            d_leaked
+        );
+        assert_eq!(
+            d_db,
+            GovernorDecision::Allow,
+            "Active 2GB database must be ALLOWED. Got {:?}",
+            d_db
+        );
+    }
+
+    /// BOSS 13: Freshly launched app — a process that just started (uptime=3s)
+    /// with high RSS (1GB) because it's loading. Despite looking like a hog,
+    /// it should be allowed because it's still initializing.
+    #[test]
+    fn s33_fresh_launch_not_punished() {
+        let mut s = snap(3300, "Xcode", 80.0, 1024, true, 3, 3);
+        s.process_uptime_secs = 3;
+        s.wakeups_per_sec = 200.0; // Loading plugins, indexing
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "Xcode");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Freshly launched Xcode (3s) must be ALLOWED during init. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 14: Translated LLM — worst case for memory.
+    /// An x86 translated ollama process with 6GB RSS, idle 4h.
+    /// Even though it's Rosetta AND idle AND huge RSS, it must be protected
+    /// because it's an LLM model. The LLM protection should override Rosetta tax.
+    #[test]
+    fn s34_translated_llm_still_protected() {
+        let mut s = snap(3400, "ollama", 0.0, 6144, false, 14400, 14400);
+        s.is_translated = true;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "ollama");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Translated LLM (6GB) must still be ALLOWED — model reload cost > Rosetta penalty. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 15: Docker daemon — high Mach ports, network, moderate CPU.
+    /// Docker Desktop runs as a daemon with many containers connecting.
+    /// Must not be throttled even though it has no GUI.
+    #[test]
+    fn s35_docker_daemon_protected() {
+        let mut s = snap(3500, "com.docker.backend", 8.0, 1500, false, 9999, 9999);
+        s.has_network = true;
+        s.mach_port_count = 200; // Container connections
+        s.wakeups_per_sec = 25.0;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "com.docker.backend");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Docker daemon (200 Mach ports) must be ALLOWED. Got {:?}",
+            d
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CATEGORY 12: BOSS LEVEL 3b — TRULY ADVERSARIAL
+    // These are designed to break current heuristics by hitting exact edge cases.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// BOSS 16: Swarm with IPC hub overlap.
+    /// In a 40-process swarm, a daemon with 50 Mach ports (just below IPC hub
+    /// threshold of 80) and waste=0.30 would be swarm-throttled. But it has
+    /// network + moderate ports = it's serving other apps. Must be ALLOWED.
+    #[test]
+    fn s36_near_hub_in_swarm_not_throttled() {
+        let mut snaps: Vec<ProcessSnapshot> = (0..40)
+            .map(|i| snap(3600 + i, &format!("bg_{}", i), 0.5, 30, false, 3600, 3600))
+            .collect();
+        let mut near_hub = snap(3699, "windowserver_helper", 2.0, 150, false, 3600, 3600);
+        near_hub.mach_port_count = 60; // Below 80 threshold but still significant
+        near_hub.has_network = true;
+        snaps.push(near_hub);
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "windowserver_helper");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Near-hub daemon (60 ports + network) in swarm must be ALLOWED. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 17: I/O worker just below pageins threshold.
+    /// A process with 45k pageins (below 50k threshold) doing real work.
+    /// Must still be protected because the pattern (CPU + network + pageins)
+    /// indicates legitimate work even below the hard threshold.
+    #[test]
+    fn s37_io_worker_below_threshold() {
+        let mut s = snap(3700, "rsync", 15.0, 300, false, 9999, 9999);
+        s.pageins_total = 45000; // Below 50k threshold
+        s.has_network = true;
+        s.wakeups_per_sec = 30.0;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "rsync");
+        assert!(
+            d == GovernorDecision::Allow || d == GovernorDecision::Throttle,
+            "I/O worker (rsync, 45k pageins + network + 15% CPU) must not be frozen. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 18: Memory pressure triage — when system has many heavy processes,
+    /// the LEAST useful one should be acted on first. Here: two idle daemons,
+    /// one with network (more useful) and one without. The one without network
+    /// should get MORE aggressive treatment.
+    #[test]
+    fn s38_triage_least_useful_first() {
+        let mut useful = snap(3800, "dns_cache", 0.0, 200, false, 7200, 7200);
+        useful.has_network = true;
+        useful.wakeups_per_sec = 1.0;
+        let mut useless = snap(3801, "old_updater", 0.0, 200, false, 7200, 7200);
+        useless.wakeups_per_sec = 1.0;
+        let snaps = vec![useful, useless];
+        let results = decide(&snaps, None);
+        let d_useful = find_decision(&results, "dns_cache");
+        let d_useless = find_decision(&results, "old_updater");
+        // Both are idle SilentDaemons. But dns_cache has network → higher utility.
+        // old_updater should be treated same or more aggressively.
+        assert!(
+            d_useless as u8 >= d_useful as u8,
+            "Process without network should be treated >= aggressively as one with network. \
+             Got dns_cache={:?}, old_updater={:?}",
+            d_useful, d_useless
+        );
+    }
+
+    /// BOSS 19: Electron app with no GUI but serving localhost.
+    /// VS Code's extension host: no window, high CPU, high RSS, but it's
+    /// the brain of the editor. 30 Mach ports (below hub threshold).
+    /// Has network (localhost IPC). Must be ALLOWED.
+    #[test]
+    fn s39_electron_extension_host_protected() {
+        let mut s = snap(3900, "Code Helper (Plugin)", 25.0, 800, false, 5, 5);
+        s.has_network = true;
+        s.mach_port_count = 30;
+        s.wakeups_per_sec = 45.0;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "Code Helper (Plugin)");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "VS Code extension host must be ALLOWED — it IS the editor. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 20: Zombie disguised as useful.
+    /// A process claiming 10% CPU and 500MB RSS but with dead parent.
+    /// The zombie hunter should catch it regardless of its "stats".
+    #[test]
+    fn s40_zombie_with_high_cpu_still_killed() {
+        let mut z = snap(4000, "zombie_hog", 10.0, 500, false, 9999, 9999);
+        z.is_zombie = true;
+        z.parent_alive = false;
+        let snaps = vec![z];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "zombie_hog");
+        assert!(
+            d == GovernorDecision::Kill || d == GovernorDecision::Freeze,
+            "Zombie with dead parent must be killed/frozen regardless of CPU. Got {:?}",
+            d
+        );
+    }
 }
