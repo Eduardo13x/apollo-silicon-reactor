@@ -34,7 +34,7 @@
 # Baseline (frozen):
 BASELINE_TESTS=1370
 BASELINE_SIZE_KB=4055
-TOTAL_SCENARIOS=95
+TOTAL_SCENARIOS=140
 # ══════════════════════════════════════════════════════════════════════════════
 cd "$(dirname "$0")/.."
 
@@ -67,7 +67,22 @@ ACTIONS_OUTPUT=$(cargo test --test prepare_actions 2>&1 || true)
 ACT_PASSED=$(echo "$ACTIONS_OUTPUT" | grep -cE 'test scenarios::a[0-9]+.*ok$' || echo 0)
 ACT_PASSED=${ACT_PASSED:-0}
 
-SCENARIOS_PASSED=$((GOV_PASSED + LAT_PASSED + MEM_PASSED + ACT_PASSED))
+# Classifier scenarios (c01-c15)
+CLASSIFIER_OUTPUT=$(cargo test --test prepare_classifier 2>&1 || true)
+CLS_PASSED=$(echo "$CLASSIFIER_OUTPUT" | grep -cE 'test scenarios::c[0-9]+.*ok$' || echo 0)
+CLS_PASSED=${CLS_PASSED:-0}
+
+# Signal intelligence scenarios (i01-i15)
+SIGNALS_OUTPUT=$(cargo test --test prepare_signals 2>&1 || true)
+SIG_PASSED=$(echo "$SIGNALS_OUTPUT" | grep -cE 'test scenarios::i[0-9]+.*ok$' || echo 0)
+SIG_PASSED=${SIG_PASSED:-0}
+
+# RL threshold scenarios (r01-r15)
+RL_OUTPUT=$(cargo test --test prepare_rl 2>&1 || true)
+RL_PASSED=$(echo "$RL_OUTPUT" | grep -cE 'test scenarios::r[0-9]+.*ok$' || echo 0)
+RL_PASSED=${RL_PASSED:-0}
+
+SCENARIOS_PASSED=$((GOV_PASSED + LAT_PASSED + MEM_PASSED + ACT_PASSED + CLS_PASSED + SIG_PASSED + RL_PASSED))
 SCENARIOS_FAILED=$((TOTAL_SCENARIOS - SCENARIOS_PASSED))
 
 # ── Step 3: Non-scenario tests (regression gate) ────────────────────────────
