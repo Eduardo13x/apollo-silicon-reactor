@@ -311,6 +311,23 @@ impl AdaptiveGovernor {
             };
         }
 
+        // IPC hub protection: daemons with many Mach ports are serving other
+        // processes via XPC/MIG. Throttling them cascades into beachballs.
+        if snap.mach_port_count > 80 {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Allow,
+                tier,
+                utility_score: utility,
+                waste_score: waste,
+                reason: format!(
+                    "IPC hub ({} Mach ports) — protected",
+                    snap.mach_port_count
+                ),
+            };
+        }
+
         // SilentDaemon idle override: if a daemon has near-zero CPU and has been
         // idle for over an hour with no GUI, it's effectively stale even if the
         // classifier didn't flag it (e.g. wakeups at threshold boundary).
