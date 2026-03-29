@@ -421,6 +421,30 @@ impl AdaptiveGovernor {
             adjusted_utility = (adjusted_utility - penalty).max(0.0);
         }
 
+        // Foreground app helper detection: if a process name contains part of
+        // the foreground app name (e.g., "com.apple.WebKit" when "Safari" is fg),
+        // or is a known helper pattern for the foreground app, protect it.
+        // Must be checked BEFORE waste/swarm overrides — otherwise a Safari
+        // WebKit helper in a crowded system gets swarm-throttled.
+        if let Some(fg) = foreground_app {
+            let is_fg_helper = snap.name.contains(fg)
+                || (fg == "Safari" && snap.name.contains("WebKit"))
+                || (fg == "Google Chrome" && snap.name.contains("Chrome"))
+                || (fg == "Brave Browser" && snap.name.contains("Brave"))
+                || (fg == "Firefox" && snap.name.contains("plugin-container"));
+            if is_fg_helper && !snap.has_gui_window {
+                return ProcessDecision {
+                    pid: snap.pid,
+                    name: snap.name.clone(),
+                    decision: GovernorDecision::Allow,
+                    tier,
+                    utility_score: utility,
+                    waste_score: waste,
+                    reason: format!("Helper of foreground app ({})", fg),
+                };
+            }
+        }
+
         // Stale — strong candidate for freeze
         if tier == ProcessTier::Stale && adjusted_utility < self.config.freeze_utility_threshold {
             return ProcessDecision {
@@ -457,28 +481,6 @@ impl AdaptiveGovernor {
                     waste, adjusted_utility
                 ),
             };
-        }
-
-        // Foreground app helper detection: if a process name contains part of
-        // the foreground app name (e.g., "com.apple.WebKit" when "Safari" is fg),
-        // or is a known helper pattern for the foreground app, protect it.
-        if let Some(fg) = foreground_app {
-            let is_fg_helper = snap.name.contains(fg)
-                || (fg == "Safari" && snap.name.contains("WebKit"))
-                || (fg == "Google Chrome" && snap.name.contains("Chrome"))
-                || (fg == "Brave Browser" && snap.name.contains("Brave"))
-                || (fg == "Firefox" && snap.name.contains("plugin-container"));
-            if is_fg_helper && !snap.has_gui_window {
-                return ProcessDecision {
-                    pid: snap.pid,
-                    name: snap.name.clone(),
-                    decision: GovernorDecision::Allow,
-                    tier,
-                    utility_score: utility,
-                    waste_score: waste,
-                    reason: format!("Helper of foreground app ({})", fg),
-                };
-            }
         }
 
         // Swarm pressure: when many processes are competing (>30), lower the
