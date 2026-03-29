@@ -268,11 +268,13 @@ pub fn behavioral_protection_score(
         wakeups_per_sec as f64
     };
 
-    // Network: active sockets. Boolean, strongest signal for servers.
-    let net_signal = if has_network { 1.0 } else { 0.0 };
+    // Network: active sockets. Weak hint — socket existence ≠ active I/O.
+    // Cumulative mach_msgs inflate has_network for long-lived daemons,
+    // so this is circumstantial evidence, not proof of activity.
+    let net_signal = if has_network { 0.3 } else { 0.0 };
 
-    // GUI: visible window. User can see it → protected.
-    let gui_signal = if has_gui_window { 1.0 } else { 0.0 };
+    // GUI: visible window. User can see it → strong protection.
+    let gui_signal = if has_gui_window { 0.8 } else { 0.0 };
 
     // Recency: exponential decay over 10 minutes (600s).
     // At 0s → 1.0, at 300s → 0.61, at 600s → 0.37, at 1200s → 0.14.
@@ -286,16 +288,21 @@ pub fn behavioral_protection_score(
         .max(gui_signal)
         .max(recency_signal);
 
-    // ── Memory cost (TMO model) ─────────────────────────────────────────
-    // A process consuming 80% of RAM needs much stronger activity signals
-    // than one consuming 1%. Square root gives sub-linear penalty (Borg model:
-    // 4× memory → 2× activity needed, not 4×).
-    let mem_fraction = (rss_bytes as f64 / total_ram_bytes.max(1) as f64).max(0.001);
-    let cost = mem_fraction.sqrt();
+    // ── Memory cost (Darwinian resource pressure) ──────────────────────
+    // Ecological fitness: foraging_success / resource_demand.
+    // Factor: 1 + k·√(rss/ram).  k=1.5 (Google Borg sub-linear cost model):
+    //   100MB/8GB → cost 1.17 (barely penalized)
+    //   500MB     → cost 1.38 (moderate; active servers survive)
+    //   4GB       → cost 2.06 (heavy; must be very active to survive)
+    // Denominator ≥ 1.0 so score is naturally bounded in [0, 1].
+    let mem_fraction = rss_bytes as f64 / total_ram_bytes.max(1) as f64;
+    let cost = 1.0 + 1.5 * mem_fraction.sqrt();
 
-    // ── Final score ─────────────────────────────────────────────────────
-    // Clamp to [0, 1]. Compare against system_pressure for the protection gate.
-    (activity / cost).min(1.0)
+    // ── Fitness score ───────────────────────────────────────────────────
+    // Compare against system_pressure for the protection gate:
+    //   score ≥ pressure → survives (Darwinian selection).
+    // No clamp needed — activity ∈ [0,1] and cost ≥ 1.0 guarantees [0,1].
+    activity / cost
 }
 
 pub fn enforce_limits(actions: Vec<RootAction>, policy: &SafetyPolicy) -> Vec<RootAction> {
@@ -503,33 +510,37 @@ mod tests {
 
     #[test]
     fn active_server_gets_high_score() {
-        // Python web server: network active, some CPU, recent interaction
+        // Python web server: CPU active, wakeups, network, recent interaction
+        // activity=1.0, cost=1+1.5*sqrt(200M/8G)=1.17 → score≈0.76
         let score = behavioral_protection_score(5.0, 10.0, true, false, 30, 200_000_000, RAM_8GB);
-        assert!(score > 0.8, "active server should have high score: {}", score);
+        assert!(score > 0.7, "active server should have high score: {}", score);
     }
 
     #[test]
     fn dormant_zombie_gets_low_score() {
         // Abandoned Python script: 0 CPU, 0 wakeups, no network, idle 4 hours, 6.8GB RSS
+        // activity≈e^(-24)≈0, cost=1+1.5*sqrt(0.85)=2.38 → score≈0
         let score = behavioral_protection_score(
             0.0, 0.0, false, false, 14400, 6_800_000_000, RAM_8GB,
         );
-        assert!(score < 0.1, "6.8GB dormant zombie should have near-zero score: {}", score);
+        assert!(score < 0.01, "6.8GB dormant zombie should have near-zero score: {}", score);
     }
 
     #[test]
     fn small_idle_process_gets_moderate_score() {
-        // Small background Python (50MB): idle but cheap to protect
+        // Small background Python (50MB): idle 10min but cheap to protect
+        // recency=e^(-1)=0.37, cost=1+1.5*sqrt(50M/8G)=1.12 → score≈0.33
         let score = behavioral_protection_score(0.0, 0.0, false, false, 600, 50_000_000, RAM_8GB);
-        // Small cost → even dormant process has moderate score because cost is tiny
-        assert!(score > 0.3, "small idle process should have moderate score: {}", score);
+        assert!(score > 0.2, "small idle process should have moderate score: {}", score);
     }
 
     #[test]
     fn pressure_gate_protects_active_drops_dormant() {
+        // Active 500MB server: activity=1.0, cost=1+1.5*sqrt(0.0625)=1.375 → score≈0.73
         let active_score = behavioral_protection_score(
             3.0, 5.0, true, false, 60, 500_000_000, RAM_8GB,
         );
+        // Dormant 6.8GB zombie: activity≈0, score≈0
         let dormant_score = behavioral_protection_score(
             0.0, 0.0, false, false, 7200, 6_800_000_000, RAM_8GB,
         );
@@ -560,9 +571,38 @@ mod tests {
     }
 
     #[test]
-    fn gui_process_always_protected() {
-        // Process with a visible window — always active regardless of other signals
+    fn gui_process_well_protected() {
+        // Process with a visible window — user can see it → strong protection
+        // gui_signal=0.8, cost=1+1.5*sqrt(1G/8G)=1.53 → score≈0.52
         let score = behavioral_protection_score(0.0, 0.0, false, true, 3600, 1_000_000_000, RAM_8GB);
-        assert!(score > 0.7, "GUI process should be well-protected: {}", score);
+        assert!(score > 0.4, "GUI process should be well-protected: {}", score);
+    }
+
+    #[test]
+    fn network_only_not_enough_at_medium_pressure() {
+        // Idle daemon with network sockets but no other activity — should NOT be
+        // immune at medium pressure. This is the CategoriesService / idle Python fix.
+        // net_signal=0.3, idle=3600, cost≈1.0 → score≈0.3
+        let score = behavioral_protection_score(
+            0.0, 0.0, true, false, 3600, 50_000_000, RAM_8GB,
+        );
+        let pressure = 0.5; // medium pressure
+        assert!(
+            score < pressure,
+            "idle daemon with only network should lose protection at pressure {}: score={}",
+            pressure, score
+        );
+    }
+
+    #[test]
+    fn zero_rss_does_not_inflate_score() {
+        // Process with rss=0 (tiny process or measurement gap) — score should NOT
+        // be inflated to 1.0. With new formula: cost=1+0=1 → score=activity.
+        let score = behavioral_protection_score(0.0, 0.0, true, false, 3600, 0, RAM_8GB);
+        assert!(
+            score < 0.4,
+            "zero-RSS process with only network should not be over-protected: {}",
+            score,
+        );
     }
 }

@@ -1007,25 +1007,47 @@ fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonResponse {
             let now = Utc::now();
             let profile = *state.profile.lock_recover();
             let latency_target = *state.latency_target.lock_recover();
-            let metrics = state.metrics.lock_recover().clone();
+            // Non-blocking metrics: try_lock avoids stalling when the main loop
+            // holds the metrics lock during its end-of-cycle update (~100 lines).
+            // Fall back to default metrics if busy — dashboard shows stale data
+            // briefly, but never hangs.
+            let metrics = match state.metrics.try_lock() {
+                Ok(m) => m.clone(),
+                Err(_) => {
+                    // Lock held by main loop — read last-written snapshot from disk.
+                    // This is always ≤1 cycle old (written at end of each cycle).
+                    match std::fs::read_to_string(metrics_path()) {
+                        Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+                        Err(_) => RuntimeMetrics::default(),
+                    }
+                }
+            };
             let blockers = state.last_blockers.lock_recover().clone();
             let thermal_state = state.thermal_state.lock_recover().clone();
             let throttle_level = state.throttle_level.lock_recover().clone();
-            let governor = state.governor.lock_recover();
-            let wake_state = state.wake_state.lock_recover();
-            let grace_active = wake_state
-                .post_wake_grace_until
-                .map(|t| t > now)
-                .unwrap_or(false);
-            let grace_remaining = wake_state
-                .post_wake_grace_until
-                .and_then(|t| (t - now).to_std().ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            // Snapshot governor + wake_state, then DROP locks before build_llm_status.
+            let (auto_profile_enabled, base_profile, override_active, override_expires_at,
+                 transition_reason) = {
+                let gov = state.governor.lock_recover();
+                (gov.auto_profile_enabled, gov.base_profile,
+                 gov.manual_override.is_some(),
+                 gov.manual_override.as_ref().map(|o| o.expires_at),
+                 gov.transition_reason.clone())
+            };
+            let (grace_active, grace_remaining, last_wake_at, post_wake_policy) = {
+                let ws = state.wake_state.lock_recover();
+                let ga = ws.post_wake_grace_until.map(|t| t > now).unwrap_or(false);
+                let gr = ws.post_wake_grace_until
+                    .and_then(|t| (t - now).to_std().ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                (ga, gr, ws.last_wake_at, ws.post_wake_policy.clone())
+            };
             let (reactor_mode, reactor_health) = {
                 let rs = state.reactor_status.lock_recover();
                 (rs.mode.clone(), rs.health.clone())
             };
+            let llm = build_llm_status(state);
             let status = DaemonStatus {
                 running: !state.stop.load(Ordering::Acquire),
                 profile,
@@ -1035,19 +1057,19 @@ fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonResponse {
                 throttle_level,
                 thermal_state,
                 last_blockers: blockers,
-                auto_profile_enabled: governor.auto_profile_enabled,
-                base_profile: governor.base_profile,
-                override_active: governor.manual_override.is_some(),
-                override_expires_at: governor.manual_override.as_ref().map(|o| o.expires_at),
-                transition_reason: governor.transition_reason.clone(),
+                auto_profile_enabled,
+                base_profile,
+                override_active,
+                override_expires_at,
+                transition_reason,
                 post_wake_grace_active: grace_active,
                 post_wake_grace_remaining_secs: grace_remaining,
-                last_wake_at: wake_state.last_wake_at,
-                post_wake_policy: wake_state.post_wake_policy.clone(),
+                last_wake_at,
+                post_wake_policy,
                 reactor_mode,
                 reactor_health,
                 metrics,
-                llm: Some(build_llm_status(state)),
+                llm: Some(llm),
             };
             DaemonResponse::Status(status)
         }
@@ -2413,8 +2435,15 @@ fn build_enriched_process_data_with_tree(
                     } else {
                         0.0
                     };
-                    // Mach messages indicate IPC activity (XPC, network, etc.)
-                    let has_net = mach_msgs > 100;
+                    // Rate-based network detection: cumulative mach_msgs / uptime.
+                    // Avoids false positives on long-lived daemons with high cumulative
+                    // counts but near-zero actual IPC rate.
+                    let msg_rate = if process_uptime_secs > 0 {
+                        mach_msgs as f64 / process_uptime_secs as f64
+                    } else {
+                        0.0
+                    };
+                    let has_net = msg_rate > 0.1; // >0.1 msg/sec = active IPC
                     (wps, has_net, faults, pageins)
                 }
                 None => (0.0, false, 0, 0),
@@ -4945,8 +4974,16 @@ fn main() -> anyhow::Result<()> {
 
                 // Survival Mode: active when memory pressure is critical or swap is thrashing.
                 // swap_delta_bps > 1MB/s means we're actively writing to swap (thrashing).
+                // Survival Mode: critical memory pressure or swap thrashing.
+                // p_oom_30s amplifies: if SI predicts OOM with high confidence AND
+                // pressure is already elevated (≥0.70), escalate to survival.
+                // Requires warmup (≥5 cycles) to avoid stale persisted p_oom values.
+                let p_oom_escalation = cycle_count > 5
+                    && signal_digest.p_oom_30s > 0.80
+                    && snapshot.pressure.memory_pressure >= 0.70;
                 let survival_mode = snapshot.pressure.memory_pressure > 0.85
-                    || snapshot.pressure.swap_delta_bytes_per_sec > 1_000_000.0;
+                    || snapshot.pressure.swap_delta_bytes_per_sec > 1_000_000.0
+                    || p_oom_escalation;
 
                 // Overflow guard: only record as overflow when there is real memory
                 // pressure (≥ 0.60).  Swap storms at low pressure (36-42%) were
@@ -5002,6 +5039,7 @@ fn main() -> anyhow::Result<()> {
                     if survival_mode
                         && target.rss_bytes > 200 * 1024 * 1024
                         && target.recovery_attempts >= 2
+                        && target.pid > 1 // never signal init/kernel/self
                     {
                         if unsafe { libc::kill(target.pid as i32, 0) } == 0 {
                             unsafe {
@@ -6028,7 +6066,11 @@ fn main() -> anyhow::Result<()> {
                         metrics.rl_total_overflows = rl.total_overflows();
                     }
 
-                    write_metrics(&metrics_path, &metrics);
+                    // Clone before releasing lock — write_metrics does file I/O
+                    // and holding the lock during I/O blocks GetStatus requests.
+                    let metrics_snapshot = metrics.clone();
+                    drop(metrics);
+                    write_metrics(&metrics_path, &metrics_snapshot);
                 }
 
                 // Push estado a suscriptores activos (menubar, etc.)

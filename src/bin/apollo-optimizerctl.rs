@@ -143,6 +143,8 @@ fn send_request(req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
         }
     }
     let mut stream = stream.context("cannot connect to daemon socket")?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
     let payload = serde_json::to_string(&req)?;
     writeln!(stream, "{}", payload)?;
 
