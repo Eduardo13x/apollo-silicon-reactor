@@ -1194,8 +1194,20 @@ fn estimate_vnode_usage(maxvnodes: u64) -> f64 {
         return 0.5; // Conservative: assume moderate usage when max is unknown.
     }
 
+    // kern.num_vnodes and kern.openfiles can block indefinitely as root
+    // under kernel lock contention on macOS.  Use a timeout thread to
+    // avoid hanging the daemon's main loop.
+    fn read_sysctl_with_timeout(key: &str) -> Option<String> {
+        let key = key.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(sysctl_direct::read_str(&key));
+        });
+        rx.recv_timeout(std::time::Duration::from_millis(500)).ok().flatten()
+    }
+
     // Try kern.num_vnodes first (available on macOS 12+).
-    if let Some(val) = read_sysctl("kern.num_vnodes") {
+    if let Some(val) = read_sysctl_with_timeout("kern.num_vnodes") {
         if let Ok(current) = val.parse::<u64>() {
             return (current as f64 / maxvnodes as f64).clamp(0.0, 1.0);
         }
@@ -1203,7 +1215,7 @@ fn estimate_vnode_usage(maxvnodes: u64) -> f64 {
 
     // Fallback: use kern.openfiles as a rough proxy (vnodes >= open files).
     // NOTE: This undercounts real vnode usage; see doc comment above.
-    if let Some(val) = read_sysctl("kern.openfiles") {
+    if let Some(val) = read_sysctl_with_timeout("kern.openfiles") {
         if let Ok(open_files) = val.parse::<u64>() {
             // Open files undercount vnodes; apply a 1.5x multiplier heuristic.
             let estimated = (open_files as f64 * 1.5) as u64;
@@ -1211,8 +1223,8 @@ fn estimate_vnode_usage(maxvnodes: u64) -> f64 {
         }
     }
 
-    // Both sysctls failed — return a conservative 50% estimate so the
-    // governor does not assume zero usage and skip scaling entirely.
+    // Both sysctls failed or timed out — return a conservative 50% estimate
+    // so the governor does not assume zero usage and skip scaling entirely.
     0.5
 }
 

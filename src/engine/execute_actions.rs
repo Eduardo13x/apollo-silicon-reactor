@@ -61,21 +61,63 @@ fn killall_by_name(daemon: &str, signal: i32) -> anyhow::Result<()> {
 /// Toggle Spotlight indexing via `mdutil -a -i on/off`.
 ///
 /// mdutil communicates with the Spotlight server via XPC (com.apple.spotlightserver).
-/// There is no public or private framework function equivalent — MDSetIndexingEnabled
-/// does not exist in the dyld shared cache on Apple Silicon macOS 15.
+/// Fire-and-forget: `.spawn()` instead of `.status()` to avoid blocking the daemon
+/// loop indefinitely if the Spotlight server is unresponsive.
 fn spotlight_set_indexing(enabled: bool) {
     let flag = if enabled { "on" } else { "off" };
     let _ = std::process::Command::new("/usr/bin/mdutil")
         .args(["-a", "-i", flag])
-        .status();
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn(); // non-blocking — child reaps automatically
 }
 
 fn run_sysctl_write(key: &str, value: &str) -> anyhow::Result<()> {
-    if sysctl_direct::write_str_value(key, value) {
+    if sysctl_write_with_timeout(key, value) {
         Ok(())
     } else {
         anyhow::bail!("sysctl write failed: {}={}", key, value)
     }
+}
+
+// ── Timeout wrappers for kernel syscalls that can block as root ──────────
+
+/// Read a sysctl with 500ms timeout. Prevents `sysctlbyname` from blocking
+/// the daemon loop indefinitely under kernel lock contention.
+fn sysctl_read_with_timeout(key: &str) -> Option<String> {
+    let key = key.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(sysctl_direct::read_str(&key));
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(500))
+        .ok()
+        .flatten()
+}
+
+/// Write a sysctl with 500ms timeout.
+fn sysctl_write_with_timeout(key: &str, value: &str) -> bool {
+    let key = key.to_string();
+    let value = value.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(sysctl_direct::write_str_value(&key, &value));
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(500))
+        .ok()
+        .unwrap_or(false)
+}
+
+/// Write an i32 sysctl with 500ms timeout.
+fn sysctl_write_i32_with_timeout(key: &str, value: i32) -> bool {
+    let key = key.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(sysctl_direct::write_i32(&key, value));
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(500))
+        .ok()
+        .unwrap_or(false)
 }
 
 /// Verify PID identity using kernel start-time.
@@ -153,6 +195,8 @@ pub fn execute_actions(
     // they've already lost their behavioral gate.
     let critical_bg = infrastructure_processes();
     let allowlist = allowlisted_sysctls();
+    // Self-protection: never freeze/throttle/kill the daemon itself.
+    let my_pid = std::process::id();
     // ML/AMX workloads: final safety net — never throttle or freeze inference processes.
     let ml_pids = amx_detector::ml_protected_pids();
     // Lazy: computed only if we actually have a FreezeProcess action.
@@ -189,7 +233,7 @@ pub fn execute_actions(
         let result: anyhow::Result<()> = (|| {
             match &action {
                 RootAction::BoostProcess { pid, name, .. } => {
-                    if protected.iter().any(|p| name.contains(p)) {
+                    if *pid == my_pid || protected.iter().any(|p| name.contains(p)) {
                         return Ok(());
                     }
                     // Validate PID identity (name-only for boost — no start-time available).
@@ -220,6 +264,9 @@ pub fn execute_actions(
                     start_usec,
                     ..
                 } => {
+                    if *pid == my_pid {
+                        return Ok(());
+                    }
                     if protected.iter().any(|p| name.contains(p)) {
                         out.push_skip(format!("protected:{}", name));
                         return Ok(());
@@ -295,6 +342,9 @@ pub fn execute_actions(
                     start_usec,
                     ..
                 } => {
+                    if *pid == my_pid {
+                        return Ok(());
+                    }
                     if protected.iter().any(|p| name.contains(p)) {
                         return Ok(());
                     }
@@ -393,7 +443,8 @@ pub fn execute_actions(
                         }
                     }
                     // Read current value — doubles as existence check.
-                    let read_result = sysctl_direct::read_str(key);
+                    // Uses timeout wrapper: sysctlbyname can block as root.
+                    let read_result = sysctl_read_with_timeout(key);
                     match read_result {
                         Some(val) => {
                             before = Some(val);
@@ -405,7 +456,7 @@ pub fn execute_actions(
                         }
                     }
                     run_sysctl_write(key, value)?;
-                    after = sysctl_direct::read_str(key);
+                    after = sysctl_read_with_timeout(key);
                     out.sysctl_applied += 1;
                 }
                 RootAction::SetMemorystatus { pid, .. } => {
@@ -425,7 +476,7 @@ pub fn execute_actions(
                         if is_protected {
                             // Skip — do not pressure protected processes.
                         } else {
-                            let _ = sysctl_direct::write_i32(
+                            let _ = sysctl_write_i32_with_timeout(
                                 "kern.memorystatus_vm_pressure_send",
                                 *pid as i32,
                             );

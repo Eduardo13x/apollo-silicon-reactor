@@ -14,11 +14,26 @@ use std::collections::{HashMap, HashSet};
 /// important — freezing them would break it.
 ///
 /// Cost: ~0.1ms (direct IOKit call, no subprocess). Cache the result per freeze cycle.
+/// Note: IOPMCopyAssertionsByProcess can block indefinitely as root under kernel
+/// contention. We run it in a thread with a 500ms timeout to avoid hanging the daemon.
 pub fn pids_with_assertions() -> HashSet<u32> {
     #[cfg(not(target_os = "macos"))]
     { return HashSet::new(); }
 
     #[cfg(target_os = "macos")]
+    {
+        // Run IOKit call in a thread with timeout to prevent indefinite blocking.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(pids_with_assertions_inner());
+        });
+        return rx.recv_timeout(std::time::Duration::from_millis(500))
+            .unwrap_or_default();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pids_with_assertions_inner() -> HashSet<u32> {
     {
         extern "C" {
             fn IOPMCopyAssertionsByProcess(

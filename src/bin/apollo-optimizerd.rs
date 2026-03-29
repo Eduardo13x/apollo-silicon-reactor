@@ -113,7 +113,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use sysinfo::ProcessStatus;
 
-const FREEZE_TTL_SECS: i64 = 10 * 60;
+const FREEZE_TTL_SECS: i64 = 3 * 60;
 const REACTOR_FAST_TICK_SECS: u64 = 30;
 
 /// Battery-aware pressure boost: on battery, effective pressure is raised so
@@ -585,10 +585,23 @@ fn should_unfreeze(
     current_pressure: f64,
 ) -> bool {
     let ttl_expired = elapsed_secs > FREEZE_TTL_SECS;
+    // Pressure recovery: two paths — relative drop OR absolute improvement.
+    // On 8GB M1, pressure rarely drops much, so use 5pp threshold (was 10pp).
     let pressure_recovered = elapsed_secs >= 30
-        && current_pressure <= pressure_at_freeze * 0.6
-        && pressure_at_freeze > 0.0;
-    ttl_expired || pressure_recovered
+        && pressure_at_freeze > 0.0
+        && (current_pressure <= pressure_at_freeze * 0.6
+            || (pressure_at_freeze - current_pressure) >= 0.05);
+    // Stale safety: after 2 min, unfreeze if pressure is at least mildly lower.
+    let stale_with_improvement = elapsed_secs >= 120
+        && current_pressure < pressure_at_freeze;
+    ttl_expired || pressure_recovered || stale_with_improvement
+}
+
+/// On memory-constrained hardware (8GB), rotate frozen processes: if ≥3 are
+/// frozen and the oldest has been frozen ≥90s, unfreeze it to prevent resource
+/// hoarding even when pressure stays high.
+fn should_rotate_oldest(elapsed_secs: i64, total_frozen: usize) -> bool {
+    total_frozen >= 2 && elapsed_secs >= 60
 }
 
 #[cfg(test)]
@@ -606,8 +619,10 @@ mod tests {
     fn test_should_unfreeze_pressure_recovery() {
         // Pressure at freeze was 0.80, now 0.45 (< 0.80 * 0.6 = 0.48) → unfreeze.
         assert!(should_unfreeze(60, 0.80, 0.45));
-        // Pressure at freeze was 0.80, now 0.50 (> 0.80 * 0.6 = 0.48) → keep frozen.
-        assert!(!should_unfreeze(60, 0.80, 0.50));
+        // 5pp drop: 0.80 → 0.75 → unfreeze (relaxed for 8GB).
+        assert!(should_unfreeze(60, 0.80, 0.75));
+        // Only 3pp drop: not enough.
+        assert!(!should_unfreeze(60, 0.80, 0.77));
     }
 
     #[test]
@@ -633,6 +648,26 @@ mod tests {
         // pressure_at_freeze == 0.0: guard against always-true result.
         assert!(!should_unfreeze(60, 0.0, 0.0));
         assert!(!should_unfreeze(60, 0.0, 0.10));
+    }
+
+    #[test]
+    fn test_should_unfreeze_stale_at_2min() {
+        // After 2 min (was 5 min), any pressure improvement → unfreeze.
+        assert!(should_unfreeze(120, 0.75, 0.74));
+        assert!(!should_unfreeze(119, 0.75, 0.74));
+        // No improvement → no unfreeze.
+        assert!(!should_unfreeze(120, 0.75, 0.75));
+    }
+
+    #[test]
+    fn test_should_rotate_oldest() {
+        // ≥2 frozen and oldest ≥60s → rotate.
+        assert!(should_rotate_oldest(60, 2));
+        assert!(should_rotate_oldest(200, 5));
+        // Not enough frozen.
+        assert!(!should_rotate_oldest(60, 1));
+        // Too fresh.
+        assert!(!should_rotate_oldest(59, 2));
     }
 }
 
@@ -4579,7 +4614,7 @@ fn main() -> anyhow::Result<()> {
                         power_mgr.battery_status.is_charging,
                         thermal_emergency,
                     );
-                    signal_intel.tick(
+                    let _si_result = signal_intel.tick(
                         snapshot.pressure.memory_pressure,
                         snapshot.pressure.swap_delta_bytes_per_sec,
                         swap_ratio,
@@ -4591,7 +4626,8 @@ fn main() -> anyhow::Result<()> {
                         total_used,
                         snapshot.memory.total_ram,
                         cycle_dt_secs,
-                    )
+                    );
+                    _si_result
                 };
 
                 // v0.7.0: Mark memory scan available when pressure is in mid/high zone.
@@ -5079,6 +5115,52 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     _ => {} // Observe, TightenThresholds, SuggestAggressive handled above
+                }
+
+                // Direct paging hints: when pressure > 0.60, hint top 3 background
+                // memory consumers. Safe (voluntary cache release, no freeze/kill).
+                // Rate-limited by safety module's max_paging_hints_per_cycle.
+                let already_has_hints = actions.iter().any(|a| matches!(a, RootAction::SetMemorystatus { .. }));
+                if signal_digest.pressure_smooth >= 0.60
+                    && !already_has_hints
+                {
+                    let interactive_pats = decide_interactive.clone();
+                    let protected_pats = state
+                        .learned_policy
+                        .lock_recover()
+                        .protected_patterns
+                        .clone();
+                    // Use proc_snaps (full process list) not top_processes (top 10 by CPU).
+                    // Only skip core interactive apps — paging hints are gentle (voluntary
+                    // cache release), so we use a tighter filter than freeze/throttle.
+                    let hard_protected = apollo_optimizer::engine::safety::protected_processes();
+                    let mut bg_procs: Vec<_> = proc_snaps
+                        .iter()
+                        .filter(|p| {
+                            // Skip system-critical processes and self.
+                            !hard_protected.iter().any(|hp| p.name.contains(hp))
+                                && p.rss_bytes > 80 * 1024 * 1024 // >80 MB RSS
+                                && p.pid != std::process::id()
+                                && !p.has_gui_window
+                                // Skip foreground app
+                                && foreground_app.as_ref().map(|fg| p.name != *fg).unwrap_or(true)
+                                // Skip processes with recent interaction (<60s)
+                                && p.secs_since_user_interaction > 60
+                        })
+                        .collect();
+                    bg_procs.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
+                    for proc in bg_procs.iter().take(3) {
+                        actions.push(RootAction::SetMemorystatus {
+                            pid: proc.pid,
+                            priority: -1,
+                            reason: format!(
+                                "pressure-driven hint (p={:.0}%): {} ({}MB)",
+                                signal_digest.pressure_smooth * 100.0,
+                                proc.name,
+                                proc.rss_bytes / 1024 / 1024,
+                            ),
+                        });
+                    }
                 }
 
                 // Heuristic pass: AdaptiveGovernor
@@ -5711,7 +5793,8 @@ fn main() -> anyhow::Result<()> {
                             .unwrap_or_default();
                         let current_pressure = snapshot.pressure.memory_pressure;
                         let mut frozen_state = state.frozen_state.lock_recover();
-                        let expired: Vec<u32> = frozen_state
+                        let total_frozen = frozen_state.len();
+                        let mut expired: Vec<u32> = frozen_state
                             .iter()
                             .filter(|(pid, entry)| {
                                 let elapsed =
@@ -5724,6 +5807,20 @@ fn main() -> anyhow::Result<()> {
                             })
                             .map(|(pid, _)| *pid)
                             .collect();
+                        // FIFO rotation: on 8GB hardware, rotate oldest frozen
+                        // process to prevent resource hoarding under sustained pressure.
+                        if let Some((&oldest_pid, oldest_entry)) = frozen_state
+                            .iter()
+                            .filter(|(pid, _)| !interrupt_pids.contains(pid) && !expired.contains(pid))
+                            .min_by_key(|(_, e)| e.frozen_at)
+                        {
+                            let elapsed = now
+                                .signed_duration_since(oldest_entry.frozen_at)
+                                .num_seconds();
+                            if should_rotate_oldest(elapsed, total_frozen) {
+                                expired.push(oldest_pid);
+                            }
+                        }
                         if !expired.is_empty() {
                             let count = unfreeze_pids(expired.iter().copied());
                             for pid in &expired {
@@ -5790,6 +5887,8 @@ fn main() -> anyhow::Result<()> {
                     let mut ds_hint = 0u64;
                     let confirmed_actions: Vec<RootAction> = confirmed_actions.into_iter().filter_map(|a| {
                         if let RootAction::FreezeProcess { pid, name: ref freeze_name, ref reason, .. } = a {
+                            // query_memory_profile falls back to proc_pid_rusage (~3µs)
+                            // when task_for_pid fails (ad-hoc signing). No timeout needed.
                             if let Some(profile) = query_memory_profile(pid) {
                                 ds_scans += 1;
                                 let fault_rate = mem_analyzer.major_fault_rate(pid);
@@ -5914,14 +6013,11 @@ fn main() -> anyhow::Result<()> {
                             Some(a)
                         }
                     }).collect();
-                    {
-                        let mut m = state.metrics.lock_recover();
-                        m.deep_scan_count += ds_scans;
-                        m.deep_scan_temp_probes += ds_probes;
-                        m.deep_scan_freeze += ds_freeze;
-                        m.deep_scan_skip += ds_skip;
-                        m.deep_scan_hint += ds_hint;
-                    }
+                    metrics.deep_scan_count += ds_scans;
+                    metrics.deep_scan_temp_probes += ds_probes;
+                    metrics.deep_scan_freeze += ds_freeze;
+                    metrics.deep_scan_skip += ds_skip;
+                    metrics.deep_scan_hint += ds_hint;
 
                     // Rosetta AOT: skip freezing oahd/oahd-helper during AOT compilation.
                     let confirmed_actions: Vec<RootAction> = if rosetta_monitor.is_compiling() {

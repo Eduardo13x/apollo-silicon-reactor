@@ -412,8 +412,32 @@ pub enum MemoryAction {
 ///
 /// Cost: ~50 μs (task_for_pid + task_info).
 /// Only call for freeze candidates, not on the hot path.
+///
+/// Falls back to proc_pid_rusage when task_for_pid fails (ad-hoc signing
+/// on Apple Silicon lacks com.apple.system-task-ports entitlement).
 #[cfg(target_os = "macos")]
 pub fn query_memory_profile(pid: u32) -> Option<ProcessMemoryProfile> {
+    query_memory_profile_mach(pid)
+        .or_else(|| query_memory_profile_rusage(pid))
+}
+
+/// Fallback: build a partial profile from proc_pid_rusage (always works as root).
+#[cfg(target_os = "macos")]
+fn query_memory_profile_rusage(pid: u32) -> Option<ProcessMemoryProfile> {
+    let rusage = crate::engine::proc_taskinfo::get_rusage_info(pid)?;
+    Some(ProcessMemoryProfile {
+        pid,
+        phys_footprint: rusage.phys_footprint,
+        compressed_bytes: 0, // unavailable via rusage
+        purgeable_bytes: 0,
+        compression_ratio: 1.0, // assume uncompressed (conservative)
+        working_set_bytes: rusage.resident_size,
+        resident_bytes: rusage.resident_size,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn query_memory_profile_mach(pid: u32) -> Option<ProcessMemoryProfile> {
     unsafe {
         let mut task_port: u32 = 0;
         let kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);

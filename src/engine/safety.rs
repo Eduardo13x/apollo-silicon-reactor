@@ -23,6 +23,9 @@ pub fn protected_processes() -> HashSet<&'static str> {
         "syspolicyd",
         "tccd",
         "CoreServicesUIAgent",
+        // Apollo itself — self-SIGSTOP is instant deadlock.
+        "apollo-optimizerd",
+        "apollo-optimizerctl",
         // XPC infrastructure — xpcproxy is the XPC service launcher; freezing it
         // is a no-op (kernel re-spawns immediately) that spams the journal.
         "xpcproxy",
