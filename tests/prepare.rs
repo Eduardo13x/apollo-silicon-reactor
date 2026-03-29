@@ -546,4 +546,125 @@ mod scenarios {
             d
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CATEGORY 10: BOSS LEVEL 2 — SYSTEM-WIDE INTELLIGENCE
+    // Scenarios requiring awareness of the WHOLE system, not just one process.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// BOSS 6: Rosetta tax — translated x86 processes cost 2x memory on ARM.
+    /// A translated daemon with 500MB RSS, 0% CPU, idle 4h. Should be throttled
+    /// or frozen MORE aggressively than a native daemon with same stats, because
+    /// freeing it reclaims 2x the effective memory (JIT page tables).
+    #[test]
+    fn s26_translated_process_penalized() {
+        let mut native = snap(2600, "native_daemon", 0.0, 500, false, 14400, 14400);
+        native.wakeups_per_sec = 1.0;
+        let mut rosetta = snap(2601, "rosetta_daemon", 0.0, 500, false, 14400, 14400);
+        rosetta.is_translated = true;
+        rosetta.wakeups_per_sec = 1.0;
+        let snaps = vec![native.clone(), rosetta.clone()];
+        let results = decide(&snaps, None);
+        let d_native = find_decision(&results, "native_daemon");
+        let d_rosetta = find_decision(&results, "rosetta_daemon");
+        // Both are idle SilentDaemons and will be throttled.
+        // But Rosetta process should be frozen (more aggressive) while native just throttled.
+        assert!(
+            d_rosetta as u8 > d_native as u8
+                || (d_rosetta == GovernorDecision::Freeze && d_native == GovernorDecision::Throttle),
+            "Translated (Rosetta) process should be treated MORE aggressively than native. \
+             Got native={:?}, rosetta={:?}",
+            d_native, d_rosetta
+        );
+    }
+
+    /// BOSS 7: Process swarm — when 50+ background processes are running,
+    /// the governor should be MORE aggressive (freeze instead of throttle)
+    /// to protect foreground responsiveness. Tests crowd-awareness.
+    #[test]
+    fn s27_swarm_increases_aggression() {
+        // Create a swarm of 50 idle background daemons
+        let mut snaps: Vec<ProcessSnapshot> = (0..50)
+            .map(|i| {
+                let mut s = snap(2700 + i, &format!("bgd_{}", i), 0.5, 30, false, 3600, 3600);
+                s.wakeups_per_sec = 2.0;
+                s
+            })
+            .collect();
+        // Add a target: mildly wasteful daemon
+        let mut target = snap(2799, "target_daemon", 3.0, 200, false, 3600, 3600);
+        target.wakeups_per_sec = 15.0;
+        snaps.push(target);
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "target_daemon");
+        assert!(
+            d == GovernorDecision::Throttle || d == GovernorDecision::Freeze,
+            "With 50+ bg processes competing, mildly wasteful daemon should be acted on. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 8: Night owl — at 3am (hour=3), the user is likely asleep.
+    /// Background maintenance processes should be left alone (they're doing
+    /// useful work: backups, indexing, updates). Only pure waste should be acted on.
+    #[test]
+    fn s28_nighttime_allows_maintenance() {
+        // Spotlight indexer: moderate CPU, background, doing real work at night
+        let mut mds = snap(2800, "mds_stores", 25.0, 300, false, 9999, 9999);
+        mds.wakeups_per_sec = 30.0;
+        mds.pageins_total = 40000;
+        let snaps = vec![mds];
+        // Pass hour=3 (3am) — night time
+        let mut gov = AdaptiveGovernor::new();
+        let hunts: Vec<HuntSnapshot> = Vec::new();
+        let names: Vec<&str> = snaps.iter().map(|s| s.name.as_str()).collect();
+        let decisions = gov.decide_all(&snaps, &hunts, None, &names, 3); // 3am
+        let d = decisions.iter().find(|d| d.name == "mds_stores").unwrap();
+        assert!(
+            d.decision == GovernorDecision::Allow || d.decision == GovernorDecision::Throttle,
+            "At 3am, indexer doing real I/O work should be allowed to work. Got {:?}",
+            d.decision
+        );
+    }
+
+    /// BOSS 9: Helper process with active parent.
+    /// A Chrome Helper using 5% CPU and 200MB with its parent (Chrome) in
+    /// foreground. The helper must be ALLOWED because it's serving the
+    /// active foreground app. Throttling it = tab freeze.
+    #[test]
+    fn s29_helper_with_foreground_parent_protected() {
+        let chrome = snap(2900, "Google Chrome", 10.0, 500, true, 5, 5);
+        let mut helper = snap(2901, "Google Chrome Helper", 5.0, 200, false, 9999, 9999);
+        helper.wakeups_per_sec = 40.0;
+        let snaps = vec![chrome, helper];
+        let results = decide(&snaps, Some("Google Chrome"));
+        let d = find_decision(&results, "Google Chrome Helper");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Helper of foreground app must be ALLOWED — throttle = tab freeze. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 10: Database engine protection.
+    /// postgres: 3% CPU, 2GB RSS (shared buffers), lots of Mach ports,
+    /// network active, idle forever. Looks like a memory hog but it's a
+    /// database serving other apps. Must be allowed.
+    #[test]
+    fn s30_database_engine_protected() {
+        let mut pg = snap(3000, "postgres", 3.0, 2048, false, 9999, 9999);
+        pg.has_network = true;
+        pg.mach_port_count = 90; // Many client connections
+        pg.wakeups_per_sec = 10.0;
+        let snaps = vec![pg];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "postgres");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Database engine with active connections must be ALLOWED. Got {:?}",
+            d
+        );
+    }
 }
