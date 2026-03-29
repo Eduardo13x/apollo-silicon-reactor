@@ -335,7 +335,18 @@ impl AdaptiveGovernor {
 
         // Relevance bonus from user profile
         let relevance = self.user_profile.process_relevance(&snap.name);
-        let adjusted_utility = (utility + relevance * 0.2).min(1.0);
+        let mut adjusted_utility = (utility + relevance * 0.2).min(1.0);
+
+        // RSS-weighted utility penalty: large background processes (>500MB)
+        // with no GUI are penalized proportionally. A 1GB daemon without GUI
+        // gets -0.10 utility. Ensures bloated silent processes are acted on
+        // sooner without touching the classifier.
+        if !snap.has_gui_window && snap.rss_bytes > 500 * 1024 * 1024 {
+            let excess_gb =
+                (snap.rss_bytes as f64 - 500.0 * 1024.0 * 1024.0) / (1024.0 * 1024.0 * 1024.0);
+            let penalty = (excess_gb * 0.10).min(0.20) as f32;
+            adjusted_utility = (adjusted_utility - penalty).max(0.0);
+        }
 
         // Stale — strong candidate for freeze
         if tier == ProcessTier::Stale && adjusted_utility < self.config.freeze_utility_threshold {
