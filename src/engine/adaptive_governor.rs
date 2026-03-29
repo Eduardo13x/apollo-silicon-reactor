@@ -446,9 +446,7 @@ impl AdaptiveGovernor {
         }
 
         // Normal utility-based decision.
-        let (decision, reason) = if adjusted_utility < self.config.freeze_utility_threshold
-            && self.is_heavy_workload(workload)
-        {
+        let (decision, reason) = if adjusted_utility < self.config.freeze_utility_threshold {
             (
                 GovernorDecision::Freeze,
                 format!("utility={:.2} waste={:.2} workload={:?}", adjusted_utility, waste, workload),
