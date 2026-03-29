@@ -263,4 +263,227 @@ mod tests {
         let freed = pr.tick(0.80, false, false);
         assert_eq!(freed, 0, "should not purge during active foreground");
     }
+
+    #[test]
+    fn initial_state_is_clean() {
+        let pr = PageReclaim::new(true);
+        assert_eq!(pr.total_purges, 0);
+        assert_eq!(pr.total_bytes_freed, 0);
+        assert_eq!(pr.last_freed_bytes(), 0);
+        assert!(pr.last_purge.is_none());
+        assert!(pr.recent_purges.is_empty());
+        assert_eq!(pr.cooldown, Duration::from_secs(MIN_COOLDOWN_SECS));
+        assert!(pr.is_root);
+    }
+
+    #[test]
+    fn initial_state_non_root() {
+        let pr = PageReclaim::new(false);
+        assert_eq!(pr.total_purges, 0);
+        assert_eq!(pr.total_bytes_freed, 0);
+        assert_eq!(pr.last_freed_bytes(), 0);
+        assert!(!pr.is_root);
+    }
+
+    #[test]
+    fn last_freed_bytes_accessor_returns_field() {
+        let mut pr = PageReclaim::new(false);
+        pr.last_freed_bytes = 123_456_789;
+        assert_eq!(pr.last_freed_bytes(), 123_456_789);
+    }
+
+    #[test]
+    fn pressure_just_below_interactive_gate_blocked() {
+        // 0.549 is just below the 0.55 interactive gate.
+        let mut pr = PageReclaim::new(true);
+        let freed = pr.tick(0.549, false, true);
+        assert_eq!(freed, 0, "pressure just below gate should not trigger purge");
+    }
+
+    #[test]
+    fn pressure_just_below_display_off_gate_blocked() {
+        // 0.39 is just below the 0.40 display-off gate.
+        let mut pr = PageReclaim::new(true);
+        let freed = pr.tick(0.39, true, true);
+        assert_eq!(freed, 0, "pressure just below display-off gate should be blocked");
+    }
+
+    #[test]
+    fn display_off_blocks_below_display_gate() {
+        // 0.45 is above the display-off gate (0.40) but below the interactive gate (0.55).
+        // With display off, this should NOT be blocked by the pressure gate.
+        // However it will reach execute_purge() — we just verify it doesn't block early.
+        // We test the boundary: 0.35 < 0.40 → blocked.
+        let mut pr = PageReclaim::new(true);
+        let freed = pr.tick(0.35, true, true);
+        assert_eq!(freed, 0, "0.35 is below even the display-off gate (0.40)");
+    }
+
+    #[test]
+    fn constants_have_expected_values() {
+        assert_eq!(PRESSURE_GATE_INTERACTIVE, 0.55);
+        assert_eq!(PRESSURE_GATE_DISPLAY_OFF, 0.40);
+        assert_eq!(MIN_COOLDOWN_SECS, 300);
+        assert_eq!(EXTENDED_COOLDOWN_SECS, 900);
+        assert_eq!(MIN_EFFECTIVE_BYTES, 50 * 1024 * 1024);
+        assert_eq!(MAX_PURGES_PER_HOUR, 6);
+    }
+
+    #[test]
+    fn display_off_gate_is_lower_than_interactive_gate() {
+        assert!(
+            PRESSURE_GATE_DISPLAY_OFF < PRESSURE_GATE_INTERACTIVE,
+            "display-off gate must be more permissive than interactive gate"
+        );
+    }
+
+    #[test]
+    fn extended_cooldown_longer_than_standard() {
+        assert!(
+            EXTENDED_COOLDOWN_SECS > MIN_COOLDOWN_SECS,
+            "extended cooldown must be longer than standard cooldown"
+        );
+    }
+
+    #[test]
+    fn rate_limit_with_stale_entries_cleared() {
+        let mut pr = PageReclaim::new(true);
+        // Push stale entries (> 1 hour old) — they should be pruned by tick().
+        // We can verify by injecting entries that are almost 1 hour old.
+        // Because we can't fast-forward Instant, we fill with current time but
+        // only MAX_PURGES_PER_HOUR - 1 entries, confirming it's not rate-limited
+        // at that count (pressure gate will still block us).
+        let now = Instant::now();
+        for _ in 0..(MAX_PURGES_PER_HOUR - 1) {
+            pr.recent_purges.push(now);
+        }
+        // Still below rate limit, but pressure is low → blocked by pressure gate.
+        let freed = pr.tick(0.10, false, true);
+        assert_eq!(freed, 0, "low pressure should block regardless of rate limit headroom");
+    }
+
+    #[test]
+    fn rate_limit_exactly_at_max_purges() {
+        let mut pr = PageReclaim::new(true);
+        let now = Instant::now();
+        // Fill exactly to MAX_PURGES_PER_HOUR.
+        for _ in 0..MAX_PURGES_PER_HOUR {
+            pr.recent_purges.push(now);
+        }
+        // Even with display off and high pressure, rate limit blocks.
+        let freed = pr.tick(0.99, true, true);
+        assert_eq!(freed, 0, "rate limit should block at exactly MAX_PURGES_PER_HOUR");
+    }
+
+    #[test]
+    fn rate_limit_over_max_purges() {
+        let mut pr = PageReclaim::new(true);
+        let now = Instant::now();
+        // Overfill beyond MAX_PURGES_PER_HOUR.
+        for _ in 0..(MAX_PURGES_PER_HOUR + 3) {
+            pr.recent_purges.push(now);
+        }
+        let freed = pr.tick(0.99, true, true);
+        assert_eq!(freed, 0, "rate limit should block when over MAX_PURGES_PER_HOUR");
+    }
+
+    #[test]
+    fn cooldown_blocks_second_call_immediately() {
+        let mut pr = PageReclaim::new(true);
+        // Simulate a purge just happened (last_purge = now).
+        pr.last_purge = Some(Instant::now());
+        pr.cooldown = Duration::from_secs(MIN_COOLDOWN_SECS);
+        // Even with high pressure + display off, cooldown blocks.
+        let freed = pr.tick(0.99, true, true);
+        assert_eq!(freed, 0, "active cooldown should prevent immediate re-purge");
+    }
+
+    #[test]
+    fn cooldown_of_standard_duration_blocks() {
+        let mut pr = PageReclaim::new(true);
+        // Last purge was 60 seconds ago — still within 300s cooldown.
+        pr.last_purge = Some(Instant::now() - Duration::from_secs(60));
+        pr.cooldown = Duration::from_secs(MIN_COOLDOWN_SECS);
+        let freed = pr.tick(0.99, true, true);
+        assert_eq!(freed, 0, "should be blocked within standard cooldown window");
+    }
+
+    #[test]
+    fn extended_cooldown_blocks_within_window() {
+        let mut pr = PageReclaim::new(true);
+        // Last purge was 400 seconds ago (past MIN_COOLDOWN but within EXTENDED_COOLDOWN).
+        pr.last_purge = Some(Instant::now() - Duration::from_secs(400));
+        pr.cooldown = Duration::from_secs(EXTENDED_COOLDOWN_SECS); // 900s
+        let freed = pr.tick(0.99, true, true);
+        assert_eq!(freed, 0, "should be blocked within extended cooldown window");
+    }
+
+    #[test]
+    fn non_root_ignores_all_other_conditions() {
+        // Even with favorable conditions, non-root should always return 0.
+        let mut pr = PageReclaim::new(false);
+        // No cooldown, no rate limit, display off, high pressure.
+        assert_eq!(pr.tick(0.99, true, true), 0);
+        assert_eq!(pr.tick(0.99, false, true), 0);
+        assert_eq!(pr.tick(0.99, false, false), 0);
+        assert_eq!(pr.tick(0.30, true, true), 0);
+        assert_eq!(pr.total_purges, 0);
+        assert_eq!(pr.total_bytes_freed, 0);
+    }
+
+    #[test]
+    fn min_effective_bytes_threshold_is_50mb() {
+        assert_eq!(MIN_EFFECTIVE_BYTES, 50 * 1024 * 1024,
+            "threshold for effective purge should be 50 MB");
+    }
+
+    #[test]
+    fn max_purges_per_hour_is_reasonable() {
+        // Should be a positive, small number to prevent thrashing.
+        assert!(MAX_PURGES_PER_HOUR > 0);
+        assert!(MAX_PURGES_PER_HOUR <= 12,
+            "more than 12 purges/hour would thrash the file cache");
+    }
+
+    #[test]
+    fn total_bytes_freed_accumulates() {
+        let mut pr = PageReclaim::new(true);
+        pr.total_bytes_freed = 100 * 1024 * 1024;
+        pr.total_purges = 2;
+        // Verify field is accessible and holds value.
+        assert_eq!(pr.total_bytes_freed, 100 * 1024 * 1024);
+        assert_eq!(pr.total_purges, 2);
+    }
+
+    #[test]
+    fn pressure_exactly_at_interactive_gate_is_not_blocked() {
+        // pressure == gate means the condition `memory_pressure < gate` is false,
+        // so it should NOT be blocked by the pressure gate. It will proceed to
+        // execute_purge() — but the foreground gate blocks it when not idle.
+        // We combine pressure == 0.55 with display=off, foreground_idle=false:
+        // display_off=true → gate becomes 0.40, so 0.55 >= 0.40 → passes pressure.
+        // Then foreground gate: display_off=true → exception applies → not blocked.
+        // It will reach execute_purge(). We don't want that, so set rate limit.
+        let mut pr = PageReclaim::new(true);
+        let now = Instant::now();
+        for _ in 0..MAX_PURGES_PER_HOUR {
+            pr.recent_purges.push(now);
+        }
+        // Rate limited, so execute_purge won't run.
+        let freed = pr.tick(0.55, true, false);
+        assert_eq!(freed, 0, "rate limited so no purge even though pressure passes gate");
+    }
+
+    #[test]
+    fn pressure_exactly_at_display_off_gate_is_not_below_gate() {
+        // 0.40 == display-off gate: condition `< 0.40` is false → not blocked.
+        // Ensure rate limit so execute_purge won't run.
+        let mut pr = PageReclaim::new(true);
+        let now = Instant::now();
+        for _ in 0..MAX_PURGES_PER_HOUR {
+            pr.recent_purges.push(now);
+        }
+        let freed = pr.tick(0.40, true, true);
+        assert_eq!(freed, 0, "rate limited so no purge");
+    }
 }

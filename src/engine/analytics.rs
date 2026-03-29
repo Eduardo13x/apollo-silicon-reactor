@@ -178,3 +178,148 @@ impl Default for AnalyticsEngine {
         Self::new()
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_engine_returns_zero_analytics() {
+        let engine = AnalyticsEngine::new();
+        let analytics = engine.calculate_analytics();
+        assert_eq!(analytics.total_optimizations, 0);
+        assert_eq!(analytics.avg_cpu_improvement_percent, 0.0);
+        assert_eq!(analytics.avg_memory_freed_mb, 0);
+        assert_eq!(analytics.avg_thermal_reduction_celsius, 0.0);
+    }
+
+    #[test]
+    fn single_optimization_recorded_correctly() {
+        let mut engine = AnalyticsEngine::new();
+        // 10% CPU improvement, 100 MB memory freed, 2°C thermal reduction
+        engine.record_optimization(40.0, 30.0, 200 * 1024 * 1024, 100 * 1024 * 1024, 60.0, 58.0, 1);
+
+        let analytics = engine.calculate_analytics();
+        assert_eq!(analytics.total_optimizations, 1);
+        assert!((analytics.avg_cpu_improvement_percent - 10.0).abs() < 0.01,
+            "expected ~10.0, got {}", analytics.avg_cpu_improvement_percent);
+        assert_eq!(analytics.avg_memory_freed_mb, 100);
+        assert!((analytics.avg_thermal_reduction_celsius - 2.0).abs() < 0.01,
+            "expected ~2.0, got {}", analytics.avg_thermal_reduction_celsius);
+    }
+
+    #[test]
+    fn multiple_optimizations_average_correctly() {
+        let mut engine = AnalyticsEngine::new();
+        // Cycle 1: 20% CPU, 200 MB freed, 4°C
+        engine.record_optimization(50.0, 30.0, 300 * 1024 * 1024, 100 * 1024 * 1024, 70.0, 66.0, 2);
+        // Cycle 2: 0% CPU improvement (after >= before), 0 MB freed, 0°C
+        engine.record_optimization(30.0, 30.0, 100 * 1024 * 1024, 100 * 1024 * 1024, 66.0, 66.0, 0);
+
+        let analytics = engine.calculate_analytics();
+        assert_eq!(analytics.total_optimizations, 2);
+        // avg CPU improvement = (20.0 + 0.0) / 2 = 10.0
+        assert!((analytics.avg_cpu_improvement_percent - 10.0).abs() < 0.01,
+            "expected ~10.0, got {}", analytics.avg_cpu_improvement_percent);
+        // avg memory freed = (200 + 0) / 2 = 100 MB
+        assert_eq!(analytics.avg_memory_freed_mb, 100);
+    }
+
+    #[test]
+    fn negative_cpu_improvement_clamped_to_zero() {
+        let mut engine = AnalyticsEngine::new();
+        // CPU went UP (after > before) — should contribute 0 to average
+        engine.record_optimization(20.0, 30.0, 0, 0, 60.0, 60.0, 0);
+
+        let analytics = engine.calculate_analytics();
+        assert_eq!(analytics.avg_cpu_improvement_percent, 0.0,
+            "negative improvement should be clamped to 0");
+    }
+
+    #[test]
+    fn memory_freed_saturates_instead_of_wrapping() {
+        let mut engine = AnalyticsEngine::new();
+        // memory_after > memory_before — saturating_sub yields 0
+        engine.record_optimization(0.0, 0.0, 100 * 1024 * 1024, 200 * 1024 * 1024, 0.0, 0.0, 0);
+
+        let analytics = engine.calculate_analytics();
+        assert_eq!(analytics.avg_memory_freed_mb, 0,
+            "memory_after > memory_before should not underflow");
+    }
+
+    #[test]
+    fn generate_report_has_correct_title_and_structure() {
+        let engine = AnalyticsEngine::new();
+        let report = engine.generate_report();
+
+        assert_eq!(report.title, "Apollo Optimizer Performance Report");
+        // Should have exactly 3 top-optimization strings for an empty engine
+        assert_eq!(report.top_optimizations.len(), 3);
+        assert!(report.top_optimizations[0].contains("CPU"));
+        assert!(report.top_optimizations[1].contains("MB"));
+        assert!(report.top_optimizations[2].contains("temperature"));
+    }
+
+    #[test]
+    fn generate_report_adds_high_frequency_message_when_over_1000() {
+        let mut engine = AnalyticsEngine::new();
+        // Record enough metrics to trigger the >1000 branch.
+        // max_history is 1440, so we need metrics.len() to report total_optimizations > 1000.
+        for _ in 0..1001 {
+            engine.record_optimization(50.0, 40.0, 200 * 1024 * 1024, 100 * 1024 * 1024, 65.0, 63.0, 1);
+        }
+        let report = engine.generate_report();
+        let has_high_freq = report.top_optimizations.iter()
+            .any(|s| s.contains("High-frequency"));
+        assert!(has_high_freq, "expected high-frequency message, got: {:?}", report.top_optimizations);
+    }
+
+    #[test]
+    fn get_trend_returns_correct_count_and_values() {
+        let mut engine = AnalyticsEngine::new();
+        engine.record_optimization(40.0, 30.0, 200 * 1024 * 1024, 100 * 1024 * 1024, 65.0, 63.0, 1);
+        engine.record_optimization(50.0, 40.0, 300 * 1024 * 1024, 200 * 1024 * 1024, 70.0, 68.0, 1);
+
+        let trend = engine.get_trend(5);
+        assert_eq!(trend.len(), 2);
+
+        // First entry: CPU delta=10, mem=100MB, thermal=2
+        assert!((trend[0].0 - 10.0).abs() < 0.01, "cpu delta: {}", trend[0].0);
+        assert!((trend[0].1 - 100.0).abs() < 0.01, "mem freed MB: {}", trend[0].1);
+        assert!((trend[0].2 - 2.0).abs() < 0.01, "thermal delta: {}", trend[0].2);
+    }
+
+    #[test]
+    fn get_trend_returns_empty_when_no_metrics() {
+        let engine = AnalyticsEngine::new();
+        assert!(engine.get_trend(10).is_empty());
+    }
+
+    #[test]
+    fn history_is_capped_at_max_history() {
+        let mut engine = AnalyticsEngine::new();
+        // Push more entries than max_history (1440)
+        for i in 0..1500u32 {
+            engine.record_optimization(
+                50.0, 40.0,
+                200 * 1024 * 1024, 100 * 1024 * 1024,
+                65.0, 63.0,
+                i,
+            );
+        }
+        let analytics = engine.calculate_analytics();
+        // Should be capped at 1440, not 1500
+        assert_eq!(analytics.total_optimizations, 1440);
+    }
+
+    #[test]
+    fn energy_and_co2_are_non_negative() {
+        let mut engine = AnalyticsEngine::new();
+        engine.record_optimization(50.0, 30.0, 0, 0, 65.0, 63.0, 1);
+        let report = engine.generate_report();
+        assert!(report.energy_saved_wh >= 0.0);
+        assert!(report.co2_avoided_grams >= 0.0);
+    }
+}

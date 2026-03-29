@@ -2,3 +2,5 @@ experiment	branch	score_before	score_after	delta	tests	clippy	size_kb	status	des
 0	master	0	1236.00	+1236.00	1236	0	4056	baseline	Initial baseline: v0.7.0 + evolved anomaly detector
 1	master	1236.00	1371.00	+135.00	1326	0	4056	kept	Add unit tests for wait_graph.rs (ProcessWaitState, is_freeze_safe, find_stuck_frozen, query_wait_state)
 2	master	1236.00	1371.00	+135.00	1326	0	4056	kept	Add 30 unit tests for gpu_manager.rs (needs_cooling, recommend_power_state, optimize_for_workload, thermal_recommendations)
+3	master	1371.00	1467.0	+96.0	1390	0	4056	kept	Add 22 unit tests for page_reclaim.rs (initial state, pressure gates, cooldowns, rate limiting, boundary conditions)
+4	master	1371.00	1467.0	+96.0	1390	0	4056	kept	Add unit tests for analytics.rs (calculate_analytics, generate_report, get_trend, history cap)
