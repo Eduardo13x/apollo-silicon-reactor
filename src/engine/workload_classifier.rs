@@ -19,6 +19,56 @@ use crate::engine::{
     user_profile::{workload_signatures, AppStats, HourProfile, WorkloadType},
 };
 
+use crate::engine::compressor_aware::RegionSummary;
+
+/// Memory layout classification based on vm_region scan.
+///
+/// Each workload type has a distinctive memory region fingerprint:
+/// - LLM inference: few huge anonymous regions (model weights + KV cache)
+/// - Browser: many regions with significant shared memory (web content, JIT)
+/// - Build system: many small file-backed regions (object files, headers)
+/// - Database: large shared buffers, few total regions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryLayoutHint {
+    LlmInference,
+    BrowserCache,
+    BuildSystem,
+    DatabaseEngine,
+    General,
+}
+
+/// Classify workload by memory region layout.
+///
+/// Returns `(hint, confidence)` if the layout matches a known pattern,
+/// `None` if the layout is ambiguous.
+pub fn classify_by_memory(summary: &RegionSummary) -> Option<(MemoryLayoutHint, f32)> {
+    const MB: u64 = 1024 * 1024;
+
+    // LLM: few regions, one huge anonymous private region (model weights).
+    // llama.cpp / MLX typically mmap the full model as one region.
+    if summary.largest_anon_bytes > 512 * MB && summary.n_regions < 100 {
+        return Some((MemoryLayoutHint::LlmInference, 0.85));
+    }
+
+    // Browser: many regions (per-tab isolates, JIT segments) + large shared.
+    if summary.n_regions > 300 && summary.shared_bytes > 50 * MB {
+        return Some((MemoryLayoutHint::BrowserCache, 0.75));
+    }
+
+    // Build system: many small regions (object files, headers, temp allocs).
+    if summary.n_regions > 200 && summary.mean_region_size < MB {
+        return Some((MemoryLayoutHint::BuildSystem, 0.70));
+    }
+
+    // Database: large shared buffers (buffer pool), relatively few regions.
+    if summary.shared_bytes > 200 * MB && summary.n_regions < 80 {
+        return Some((MemoryLayoutHint::DatabaseEngine, 0.65));
+    }
+
+    None // ambiguous — return None, caller uses other classifiers
+}
+
 /// How a particular piece of evidence contributed to the classification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClassifierSource {
@@ -27,6 +77,7 @@ pub enum ClassifierSource {
     AppRecency(String),
     ProcessMix(u32), // # of matching process names
     LlmLearned,
+    MemoryLayout(MemoryLayoutHint),
 }
 
 /// Result of one classify() call.
@@ -48,6 +99,7 @@ impl WorkloadClassification {
                 ClassifierSource::AppRecency(app) => format!("recency:{}", app),
                 ClassifierSource::ProcessMix(n) => format!("process-mix:{}", n),
                 ClassifierSource::LlmLearned => "llm-learned".to_string(),
+                ClassifierSource::MemoryLayout(hint) => format!("memory-layout:{:?}", hint),
             })
             .collect()
     }
@@ -372,6 +424,64 @@ pub fn classify_workload_mode(features: &WorkloadFeatures) -> (WorkloadMode, f64
     };
 
     (distances[0].0, confidence.clamp(0.0, 1.0))
+}
+
+#[cfg(test)]
+mod memory_layout_tests {
+    use super::*;
+
+    fn make_summary(n: u32, private: u64, shared: u64, largest: u64, total: u64) -> RegionSummary {
+        RegionSummary {
+            n_regions: n,
+            private_bytes: private,
+            shared_bytes: shared,
+            largest_anon_bytes: largest,
+            mean_region_size: if n > 0 { total / n as u64 } else { 0 },
+            total_virtual: total,
+        }
+    }
+
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * MB;
+
+    #[test]
+    fn classify_llm_layout() {
+        // Few regions, one huge anonymous (model weights).
+        let s = make_summary(40, 4 * GB, 100 * MB, 3 * GB, 5 * GB);
+        let result = classify_by_memory(&s);
+        assert!(result.is_some());
+        let (hint, conf) = result.unwrap();
+        assert_eq!(hint, MemoryLayoutHint::LlmInference);
+        assert!(conf > 0.7);
+    }
+
+    #[test]
+    fn classify_browser_layout() {
+        // Many regions + large shared.
+        let s = make_summary(500, 200 * MB, 300 * MB, 100 * MB, 2 * GB);
+        let result = classify_by_memory(&s);
+        assert!(result.is_some());
+        let (hint, _) = result.unwrap();
+        assert_eq!(hint, MemoryLayoutHint::BrowserCache);
+    }
+
+    #[test]
+    fn classify_build_layout() {
+        // Many small regions (object files).
+        let s = make_summary(400, 300 * MB, 50 * MB, 50 * MB, 350 * MB);
+        let result = classify_by_memory(&s);
+        assert!(result.is_some());
+        let (hint, _) = result.unwrap();
+        assert_eq!(hint, MemoryLayoutHint::BuildSystem);
+    }
+
+    #[test]
+    fn classify_general_layout() {
+        // Average process — doesn't match any pattern.
+        let s = make_summary(50, 100 * MB, 20 * MB, 30 * MB, 2 * GB);
+        let result = classify_by_memory(&s);
+        assert!(result.is_none(), "should be ambiguous");
+    }
 }
 
 #[cfg(test)]

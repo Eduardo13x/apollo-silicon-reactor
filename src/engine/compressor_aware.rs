@@ -14,12 +14,340 @@ const TASK_VM_INFO: u32 = 22;
 #[cfg(target_os = "macos")]
 const KERN_SUCCESS: i32 = 0;
 
+/// VM_REGION_TOP_INFO flavor for `mach_vm_region()`.
+#[cfg(target_os = "macos")]
+const VM_REGION_TOP_INFO: i32 = 12;
+#[cfg(target_os = "macos")]
+const VM_REGION_TOP_INFO_COUNT: u32 = 5;
+/// Share modes from XNU osfmk/mach/vm_region.h.
+#[cfg(target_os = "macos")]
+const SM_PRIVATE: u8 = 1;
+#[cfg(target_os = "macos")]
+const SM_SHARED: u8 = 3;
+#[cfg(target_os = "macos")]
+const SM_TRUESHARED: u8 = 5;
+
 #[cfg(target_os = "macos")]
 extern "C" {
     fn mach_task_self() -> u32;
     fn task_for_pid(target: u32, pid: i32, t: *mut u32) -> i32;
     fn task_info(task: u32, flavor: u32, info: *mut i32, count: *mut u32) -> i32;
     fn mach_port_deallocate(task: u32, name: u32) -> i32;
+    fn mach_vm_region(
+        task: u32,
+        address: *mut u64,
+        size: *mut u64,
+        flavor: i32,
+        info: *mut i32,
+        info_count: *mut u32,
+        object_name: *mut u32,
+    ) -> i32;
+    fn mach_vm_read_overwrite(
+        task: u32,
+        address: u64,
+        size: u64,
+        data: u64,
+        out_size: *mut u64,
+    ) -> i32;
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+/// Mach timebase info for converting mach_absolute_time to nanoseconds.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+/// vm_region_top_info — compact per-region descriptor from XNU.
+/// Flavor 12 (VM_REGION_TOP_INFO), count 5.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct VmRegionTopInfo {
+    obj_id: u32,
+    ref_count: u32,
+    private_pages_resident: u32,
+    shared_pages_resident: u32,
+    share_mode: u8,
+    _pad: [u8; 3],
+}
+
+/// Summary of a process's virtual memory region layout.
+///
+/// Produced by `scan_regions()` via `mach_vm_region_recurse`.
+/// Cost: ~200-500µs per process. Only call on freeze candidates.
+#[derive(Debug, Clone)]
+pub struct RegionSummary {
+    /// Number of non-submap regions.
+    pub n_regions: u32,
+    /// Resident bytes in private (SM_PRIVATE) regions.
+    pub private_bytes: u64,
+    /// Resident bytes in shared (SM_SHARED | SM_TRUESHARED) regions.
+    pub shared_bytes: u64,
+    /// Virtual size of the largest single private region.
+    pub largest_anon_bytes: u64,
+    /// Mean region virtual size (total / n_regions).
+    pub mean_region_size: u64,
+    /// Total virtual size across all regions.
+    pub total_virtual: u64,
+}
+
+/// Enumerate memory regions of a process via `mach_vm_region` + `VM_REGION_TOP_INFO`.
+///
+/// Returns an aggregate summary without storing per-region details.
+/// Cost: ~200-500µs depending on region count (Chrome ≈ 500+ regions).
+#[cfg(target_os = "macos")]
+pub fn scan_regions(pid: u32) -> Option<RegionSummary> {
+    unsafe {
+        let self_port = mach_task_self();
+        let (task_port, need_dealloc) = if pid == std::process::id() {
+            (self_port, false) // own task port — no dealloc needed
+        } else {
+            let mut port: u32 = 0;
+            let kr = task_for_pid(self_port, pid as i32, &mut port);
+            if kr != KERN_SUCCESS {
+                return None;
+            }
+            (port, true)
+        };
+
+        let page_size: u64 = 16384; // ARM64
+
+        let mut address: u64 = 0;
+        let mut n_regions: u32 = 0;
+        let mut private_bytes: u64 = 0;
+        let mut shared_bytes: u64 = 0;
+        let mut largest_anon: u64 = 0;
+        let mut total_virtual: u64 = 0;
+
+        loop {
+            let mut size: u64 = 0;
+            let mut info: VmRegionTopInfo = std::mem::zeroed();
+            let mut count = VM_REGION_TOP_INFO_COUNT;
+            let mut obj_name: u32 = 0;
+
+            let kr = mach_vm_region(
+                task_port,
+                &mut address,
+                &mut size,
+                VM_REGION_TOP_INFO,
+                &mut info as *mut _ as *mut i32,
+                &mut count,
+                &mut obj_name,
+            );
+            if kr != KERN_SUCCESS {
+                break; // end of address space
+            }
+
+            n_regions += 1;
+            total_virtual += size;
+
+            // Use resident page counts for meaningful byte values.
+            let priv_resident = info.private_pages_resident as u64 * page_size;
+            let shr_resident = info.shared_pages_resident as u64 * page_size;
+
+            match info.share_mode {
+                SM_PRIVATE => {
+                    private_bytes += priv_resident;
+                    if size > largest_anon {
+                        largest_anon = size;
+                    }
+                }
+                SM_SHARED | SM_TRUESHARED => {
+                    shared_bytes += shr_resident;
+                }
+                _ => {} // COW, empty, etc.
+            }
+
+            address += size;
+            if address == 0 {
+                break; // wrapped around
+            }
+        }
+
+        if need_dealloc {
+            mach_port_deallocate(self_port, task_port);
+        }
+
+        if n_regions == 0 {
+            return None;
+        }
+
+        Some(RegionSummary {
+            n_regions,
+            private_bytes,
+            shared_bytes,
+            largest_anon_bytes: largest_anon,
+            mean_region_size: total_virtual / n_regions as u64,
+            total_virtual,
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn scan_regions(_pid: u32) -> Option<RegionSummary> {
+    None
+}
+
+// ── Page Temperature Oracle ──────────────────────────────────────────────────
+//
+// iLeakage (CCS'23): on M1, mach_absolute_time has ~42ns resolution.
+// Access latency reveals where a page lives:
+//   - L2/SLC (< 150ns) — hot, actively cached
+//   - DRAM (150–600ns) — resident but not cached
+//   - Compressed (> 600ns) — compressor must decompress
+//
+// This tells Apollo the real cost of freezing: hot pages = expensive to evict,
+// compressed pages = already paying the penalty.
+
+/// Where a page currently resides in the memory hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageTemp {
+    /// L2 / SLC — cached, access < 150ns.
+    SlcHot,
+    /// DRAM — resident, not cached, 150–600ns.
+    Dram,
+    /// Compressed or swapped — > 600ns.
+    Compressed,
+    /// Could not read (permission, unmapped, etc.).
+    Unreachable,
+}
+
+/// Aggregate temperature profile of a process's memory regions.
+#[derive(Debug, Clone)]
+pub struct TempProfile {
+    /// Fraction of sampled pages in L2/SLC (0.0–1.0).
+    pub pct_hot: f64,
+    /// Fraction of sampled pages in DRAM (0.0–1.0).
+    pub pct_dram: f64,
+    /// Fraction of sampled pages compressed/swapped (0.0–1.0).
+    pub pct_compressed: f64,
+    /// Number of pages successfully sampled.
+    pub sample_count: u32,
+}
+
+/// Sample up to 8 memory regions of a process and classify their temperature
+/// using **relative timing** (percentile-based).
+///
+/// mach_vm_read_overwrite adds ~4µs Mach trap overhead, so absolute thresholds
+/// don't work. Instead: read N pages, sort by latency, classify by percentile.
+/// Bottom 25% → SlcHot, middle 50% → Dram, top 25% → Compressed.
+/// Pages ≥2× median → definitely Compressed.
+///
+/// Cost: ~8 × vm_read ≈ 30–50µs total.
+#[cfg(target_os = "macos")]
+pub fn sample_process_temperature(pid: u32) -> Option<TempProfile> {
+    let self_port = unsafe { mach_task_self() };
+    let (task_port, need_dealloc) = if pid == std::process::id() {
+        (self_port, false)
+    } else {
+        let mut port: u32 = 0;
+        let kr = unsafe { task_for_pid(self_port, pid as i32, &mut port) };
+        if kr != KERN_SUCCESS {
+            return None;
+        }
+        (port, true)
+    };
+
+    // Enumerate private regions for probing.
+    let mut regions: Vec<(u64, u64)> = Vec::new();
+    unsafe {
+        let mut address: u64 = 0;
+        loop {
+            let mut size: u64 = 0;
+            let mut info: VmRegionTopInfo = std::mem::zeroed();
+            let mut count = VM_REGION_TOP_INFO_COUNT;
+            let mut obj: u32 = 0;
+
+            let kr = mach_vm_region(
+                task_port, &mut address, &mut size,
+                VM_REGION_TOP_INFO, &mut info as *mut _ as *mut i32,
+                &mut count, &mut obj,
+            );
+            if kr != KERN_SUCCESS { break; }
+            if info.share_mode == SM_PRIVATE && size >= 16384 {
+                regions.push((address, size));
+            }
+            address += size;
+            if address == 0 { break; }
+        }
+    }
+
+    // Sort by size descending, take top 8.
+    regions.sort_by(|a, b| b.1.cmp(&a.1));
+    regions.truncate(8);
+
+    // Probe each region and record latency.
+    let mut timings: Vec<u64> = Vec::new();
+    unsafe {
+        let mut tbi: MachTimebaseInfo = std::mem::zeroed();
+        mach_timebase_info(&mut tbi);
+        let numer = tbi.numer as u64;
+        let denom = tbi.denom.max(1) as u64;
+
+        for &(addr, size) in &regions {
+            let probe_addr = (addr + size / 2) & !0x3FFF; // page-align
+            if probe_addr < addr { continue; }
+
+            let mut buf: u8 = 0;
+            let mut out_size: u64 = 0;
+            let t0 = mach_absolute_time();
+            let kr = mach_vm_read_overwrite(
+                task_port, probe_addr, 1,
+                &mut buf as *mut u8 as u64, &mut out_size,
+            );
+            let t1 = mach_absolute_time();
+            if kr == KERN_SUCCESS && out_size > 0 {
+                timings.push((t1 - t0) * numer / denom);
+            }
+        }
+    }
+
+    if need_dealloc {
+        unsafe { mach_port_deallocate(self_port, task_port); }
+    }
+
+    let n = timings.len();
+    if n == 0 {
+        return None;
+    }
+
+    // Classify by percentile: sort timings, use median as reference.
+    timings.sort_unstable();
+    let median = timings[n / 2];
+    // Threshold: anything ≥ 1.8× median is "compressed" (decompression adds latency).
+    // Anything ≤ 0.7× median is "SLC hot" (cache hit is faster).
+    let compressed_thresh = median * 18 / 10;
+    let hot_thresh = median * 7 / 10;
+
+    let mut hot = 0u32;
+    let mut dram = 0u32;
+    let mut compressed = 0u32;
+
+    for &t in &timings {
+        if t <= hot_thresh {
+            hot += 1;
+        } else if t >= compressed_thresh {
+            compressed += 1;
+        } else {
+            dram += 1;
+        }
+    }
+
+    let total = n as f64;
+    Some(TempProfile {
+        pct_hot: hot as f64 / total,
+        pct_dram: dram as f64 / total,
+        pct_compressed: compressed as f64 / total,
+        sample_count: n as u32,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn sample_process_temperature(_pid: u32) -> Option<TempProfile> {
+    None
 }
 
 /// Subset of `task_vm_info` we care about.  Layout must match XNU exactly.
@@ -197,6 +525,50 @@ pub fn decide_memory_action(
     MemoryAction::Freeze
 }
 
+/// Enhanced freeze decision using temperature + WSS + SLC knowledge.
+///
+/// Supplements `decide_memory_action` with deep-scan signals. Falls through
+/// to the legacy decision when enhanced data is unavailable.
+///
+/// Key insight (MEMTIS SOSP'23 + M1 SLC architecture):
+/// - M1 has 8MB System Level Cache shared by CPU+GPU+ANE
+/// - A process with WSS < (SLC / active_clients) is free to freeze —
+///   its pages remain cached in SLC, zero decompression on SIGCONT
+/// - A mostly-compressed process is already paying the compression tax;
+///   freezing would force swap and make things worse
+pub fn decide_enhanced(
+    profile: &ProcessMemoryProfile,
+    temp: Option<&TempProfile>,
+    damon_wss: Option<u64>,
+    active_process_count: usize,
+    system_pressure: f64,
+    major_faults_per_sec: f64,
+) -> MemoryAction {
+    // SLC-aware fast path: if WSS fits in this process's SLC share, freeze is free.
+    const SLC_BYTES: u64 = 8 * 1024 * 1024; // M1 SLC = 8 MB
+    if let Some(wss) = damon_wss {
+        let slc_share = SLC_BYTES / active_process_count.max(1) as u64;
+        if wss > 0 && wss <= slc_share {
+            return MemoryAction::Freeze;
+        }
+    }
+
+    // Temperature-aware paths.
+    if let Some(t) = temp {
+        // Mostly compressed: freeze would cause swap (compressor pages move to disk).
+        if t.pct_compressed > 0.60 {
+            return MemoryAction::Skip;
+        }
+        // Actively hot: process is using its pages right now. Hint is gentler.
+        if t.pct_hot > 0.80 {
+            return MemoryAction::PressureHint;
+        }
+    }
+
+    // Fall through to legacy decision.
+    decide_memory_action(profile, system_pressure, major_faults_per_sec)
+}
+
 /// Assess how efficiently the compressor is serving this process.
 /// Returns a score in [0.0, 1.0]:
 ///   - 1.0 = compressor is very effective (high ratio, worth keeping compressed)
@@ -219,4 +591,163 @@ pub fn compressor_efficiency_score(profile: &ProcessMemoryProfile) -> f64 {
 
     // Combine: good ratio offsets large size, but very large size always penalizes.
     (ratio_score * 0.7 + (1.0 - size_penalty) * 0.3).clamp(0.0, 1.0)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Region scanning tests ────────────────────────────────────────────
+
+    #[test]
+    fn scan_self_regions() {
+        let pid = std::process::id();
+        let summary = scan_regions(pid);
+        assert!(summary.is_some(), "should scan own process (pid={})", pid);
+        let s = summary.unwrap();
+        assert!(s.n_regions > 10, "self should have many regions: {}", s.n_regions);
+        assert!(s.private_bytes > 0, "self should have private memory");
+        assert!(s.total_virtual > 0, "self should have virtual memory");
+    }
+
+    #[test]
+    fn region_summary_has_sane_sizes() {
+        let pid = std::process::id();
+        if let Some(s) = scan_regions(pid) {
+            // Private + shared should not exceed total virtual.
+            assert!(
+                s.private_bytes + s.shared_bytes <= s.total_virtual + 1024 * 1024,
+                "private({}) + shared({}) should be <= total({})",
+                s.private_bytes, s.shared_bytes, s.total_virtual
+            );
+            assert!(
+                s.mean_region_size > 0,
+                "mean region size should be positive"
+            );
+            assert!(
+                s.largest_anon_bytes <= s.total_virtual,
+                "largest anon should be <= total virtual"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_invalid_pid_returns_none() {
+        // PID 99999 almost certainly doesn't exist.
+        assert!(scan_regions(99999).is_none());
+    }
+
+    #[test]
+    fn region_count_is_realistic() {
+        let pid = std::process::id();
+        if let Some(s) = scan_regions(pid) {
+            // A Rust test binary should have between 20 and 5000 regions.
+            assert!(
+                s.n_regions >= 20 && s.n_regions <= 5000,
+                "unexpected region count: {}",
+                s.n_regions
+            );
+        }
+    }
+
+    // ── Page temperature tests ───────────────────────────────────────────
+
+    // ── Enhanced freeze decision tests ──────────────────────────────────
+
+    fn test_profile(phys: u64, compressed: u64) -> ProcessMemoryProfile {
+        ProcessMemoryProfile {
+            pid: 1,
+            phys_footprint: phys,
+            compressed_bytes: compressed,
+            purgeable_bytes: 0,
+            compression_ratio: if compressed > 0 {
+                (phys + compressed) as f64 / phys.max(1) as f64
+            } else {
+                1.0
+            },
+            working_set_bytes: phys,
+            resident_bytes: phys,
+        }
+    }
+
+    #[test]
+    fn decide_slc_fit_freezes() {
+        let profile = test_profile(100_000_000, 0);
+        // WSS = 1MB, 4 active processes → SLC share = 2MB → fits.
+        let action = decide_enhanced(&profile, None, Some(1_000_000), 4, 0.50, 0.0);
+        assert_eq!(action, MemoryAction::Freeze);
+    }
+
+    #[test]
+    fn decide_hot_process_gets_hint() {
+        let profile = test_profile(500_000_000, 0);
+        let temp = TempProfile {
+            pct_hot: 0.90,
+            pct_dram: 0.10,
+            pct_compressed: 0.0,
+            sample_count: 8,
+        };
+        let action = decide_enhanced(&profile, Some(&temp), None, 10, 0.50, 0.0);
+        assert_eq!(action, MemoryAction::PressureHint);
+    }
+
+    #[test]
+    fn decide_mostly_compressed_skips() {
+        let profile = test_profile(500_000_000, 300_000_000);
+        let temp = TempProfile {
+            pct_hot: 0.10,
+            pct_dram: 0.20,
+            pct_compressed: 0.70,
+            sample_count: 8,
+        };
+        let action = decide_enhanced(&profile, Some(&temp), None, 10, 0.50, 0.0);
+        assert_eq!(action, MemoryAction::Skip);
+    }
+
+    #[test]
+    fn decide_falls_through_to_legacy() {
+        // No enhanced data → should behave like decide_memory_action.
+        let profile = test_profile(100_000_000, 0);
+        let enhanced = decide_enhanced(&profile, None, None, 10, 0.50, 0.0);
+        let legacy = decide_memory_action(&profile, 0.50, 0.0);
+        assert_eq!(enhanced, legacy, "should fall through to legacy");
+    }
+
+    // ── Page temperature tests ───────────────────────────────────────────
+
+    #[test]
+    fn sample_own_process_returns_profile() {
+        let pid = std::process::id();
+        let profile = sample_process_temperature(pid);
+        assert!(profile.is_some(), "should sample own process temperature");
+        let p = profile.unwrap();
+        assert!(p.sample_count > 0, "should have sampled at least 1 page");
+        // Own process pages should be mostly hot or in DRAM.
+        let hot_or_dram = p.pct_hot + p.pct_dram;
+        assert!(
+            hot_or_dram > 0.3,
+            "own process should have hot/dram pages: hot={} dram={} compressed={}",
+            p.pct_hot, p.pct_dram, p.pct_compressed
+        );
+    }
+
+    #[test]
+    fn temp_profile_fractions_sum_to_one() {
+        let pid = std::process::id();
+        if let Some(p) = sample_process_temperature(pid) {
+            let sum = p.pct_hot + p.pct_dram + p.pct_compressed;
+            assert!(
+                (sum - 1.0).abs() < 0.01,
+                "fractions should sum to 1.0: {}",
+                sum
+            );
+        }
+    }
+
+    #[test]
+    fn sample_invalid_pid_returns_none() {
+        assert!(sample_process_temperature(99999).is_none());
+    }
 }

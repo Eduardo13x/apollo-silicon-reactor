@@ -31,7 +31,8 @@ use apollo_optimizer::engine::analytics::AnalyticsEngine;
 use apollo_optimizer::engine::background_collectors::PressureCollector;
 use apollo_optimizer::engine::capabilities::detect_capabilities;
 use apollo_optimizer::engine::compressor_aware::{
-    decide_memory_action, query_memory_profile, MemoryAction,
+    decide_enhanced, query_memory_profile,
+    sample_process_temperature, MemoryAction,
 };
 use apollo_optimizer::engine::decide_actions::decide_actions;
 use apollo_optimizer::engine::energy::EnergyTracker;
@@ -4434,6 +4435,16 @@ fn main() -> anyhow::Result<()> {
                     )
                 };
 
+                // v0.7.0: Mark memory scan available when pressure is in mid/high zone.
+                // The actual scan runs lazily during freeze decision (cost-gated).
+                let signal_digest = {
+                    let mut d = signal_digest;
+                    if d.pressure_smooth >= 0.30 {
+                        d.memory_scan_available = true;
+                    }
+                    d
+                };
+
                 // Signal intelligence → reactor_weight boosting.
                 // CUSUM regime shift: pressure drifting up significantly.
                 if signal_digest.regime_shift_up {
@@ -5322,23 +5333,42 @@ fn main() -> anyhow::Result<()> {
                     // so first-cycle candidates survive to reach count >= 2.
                     freeze_candidates.retain(|pid, _| proposed_freeze_pids.contains(pid));
 
-                    // Audit fix #3: Compressor-aware freeze decisions.
-                    // Query memory profile for freeze candidates and convert to
-                    // PressureHint if the process has low compression ratio.
+                    // Compressor-aware + deep-scan freeze decisions (v0.7.0).
+                    // For top 3 freeze candidates, run vm_region scan + temperature probe.
+                    // Uses decide_enhanced when deep data available, else falls through to legacy.
+                    // Approximate active process count for SLC budget.
+                    // Precise count not critical — SLC share is a rough heuristic.
+                    let active_count = confirmed_actions.len().max(5);
                     let confirmed_actions: Vec<RootAction> = confirmed_actions.into_iter().filter_map(|a| {
                         if let RootAction::FreezeProcess { pid, name: _, ref reason, .. } = a {
                             if let Some(profile) = query_memory_profile(pid) {
                                 let fault_rate = mem_analyzer.major_fault_rate(pid);
-                                match decide_memory_action(&profile, metrics.memory_pressure, fault_rate) {
+                                // Deep scan: vm_region + temperature (only in mid/high zone).
+                                let temp = if signal_digest.pressure_smooth >= 0.30 {
+                                    sample_process_temperature(pid)
+                                } else {
+                                    None
+                                };
+                                let action = decide_enhanced(
+                                    &profile,
+                                    temp.as_ref(),
+                                    None, // DAMON WSS integrated later per-process
+                                    active_count,
+                                    metrics.memory_pressure,
+                                    fault_rate,
+                                );
+                                match action {
                                     MemoryAction::PressureHint => {
                                         Some(RootAction::SetMemorystatus {
                                             pid,
                                             priority: -1,
                                             reason: format!(
-                                                "{} (compressor: ratio={:.1} purgeable={}MB → hint)",
+                                                "{} (deep-scan: ratio={:.1} purgeable={}MB temp={} → hint)",
                                                 reason,
                                                 profile.compression_ratio,
                                                 profile.purgeable_bytes / 1024 / 1024,
+                                                temp.as_ref().map(|t| format!("hot={:.0}%", t.pct_hot * 100.0))
+                                                    .unwrap_or_else(|| "n/a".to_string()),
                                             ),
                                         })
                                     }

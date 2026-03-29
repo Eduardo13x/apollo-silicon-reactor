@@ -76,6 +76,10 @@ pub struct SignalDigest {
     // ── Transformer ────────────────────────────────────────────────────
     /// Reserved for future Transformer integration. Always 0.0 (Transformer disabled).
     pub transformer_anomaly: f64,
+
+    // ── Deep Scan (v0.7.0) ──────────────────────────────────────────────
+    /// true if vm_region deep scan ran this cycle (pressure was high enough).
+    pub memory_scan_available: bool,
 }
 
 /// Orquestador de señales. Inicializar una vez en el daemon, llamar tick() cada ciclo.
@@ -354,6 +358,7 @@ impl SignalIntelligence {
             mpc_recommendation,
             urgency,
             transformer_anomaly: 0.0,
+            memory_scan_available: false,
         }
     }
 
@@ -586,6 +591,7 @@ mod tests {
             mpc_recommendation: 0,
             urgency: 0.0,
             transformer_anomaly: 0.0,
+            memory_scan_available: false,
         };
         for _ in 0..20 {
             digest = tick_nominal(&mut si);
