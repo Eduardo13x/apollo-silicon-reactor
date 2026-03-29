@@ -31,7 +31,7 @@ use apollo_optimizer::engine::analytics::AnalyticsEngine;
 use apollo_optimizer::engine::background_collectors::PressureCollector;
 use apollo_optimizer::engine::capabilities::detect_capabilities;
 use apollo_optimizer::engine::compressor_aware::{
-    decide_enhanced, query_memory_profile, scan_regions,
+    decide_enhanced, purge_purgeable_regions, query_memory_profile, scan_regions,
     sample_process_temperature, MemoryAction,
 };
 use apollo_optimizer::engine::workload_classifier::classify_by_memory;
@@ -4599,10 +4599,11 @@ fn main() -> anyhow::Result<()> {
                     let vote_result = tally_votes(&votes);
                     let intervention = vote_result.intervention;
 
-                    // Cable: had_disagreement → audit when specialists disagree.
-                    // Disagreement means different specialists see different signals,
-                    // which indicates an ambiguous state worth logging for analysis.
-                    if vote_result.had_disagreement {
+                    // Cable: had_disagreement → conservative safety route.
+                    // When specialists disagree AND the winning score is weak (<0.4),
+                    // the signal is ambiguous. Fall back to Observe instead of risking
+                    // a wrong aggressive action. Only override if not in survival mode.
+                    let intervention = if vote_result.had_disagreement {
                         audit_log(&serde_json::json!({
                             "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                             "event": "specialist_disagreement",
@@ -4611,7 +4612,15 @@ fn main() -> anyhow::Result<()> {
                             "n_votes": votes.len(),
                             "pressure": (signal_digest.pressure_smooth * 1000.0).round() / 1000.0,
                         }));
-                    }
+                        if vote_result.winning_score < 0.4 && signal_digest.pressure_smooth < 0.80 {
+                            // Low confidence + not critical pressure → play it safe.
+                            Intervention::Observe
+                        } else {
+                            intervention
+                        }
+                    } else {
+                        intervention
+                    };
 
                     // Apply threshold tightening if selected.
                     overflow_thresholds = predictive_agent.adjust_thresholds(overflow_thresholds);
@@ -5015,6 +5024,44 @@ fn main() -> anyhow::Result<()> {
                     true
                 }).collect();
                 actions.extend(heuristic_actions);
+
+                // Cable: stale_apps() → nominate stale background apps as freeze candidates.
+                // When pressure is elevated, apps the user hasn't interacted with for >30min
+                // are prime freeze targets — they're consuming RAM without doing useful work.
+                // Only nominate non-foreground, non-critical, non-already-acting processes.
+                if signal_digest.pressure_smooth >= 0.50 {
+                    let existing_pids: HashSet<u32> = actions.iter().filter_map(|a| match a {
+                        RootAction::FreezeProcess { pid, .. }
+                        | RootAction::ThrottleProcess { pid, .. }
+                        | RootAction::BoostProcess { pid, .. } => Some(*pid),
+                        _ => None,
+                    }).collect();
+                    let stale_names = {
+                        let gov = state.adaptive_governor.lock_recover();
+                        let running: Vec<&str> = all_proc_names.iter().copied().collect();
+                        gov.user_profile.stale_apps(&running, 1800) // 30 min threshold
+                    };
+                    let sys = collector.system();
+                    for (pid, process) in sys.processes() {
+                        let pid_u32 = pid.as_u32();
+                        let name = process.name().to_string();
+                        if !stale_names.contains(&name) { continue; }
+                        if Some(pid_u32) == foreground_pid { continue; }
+                        if heuristic_critical_pids.contains(&pid_u32) { continue; }
+                        if existing_pids.contains(&pid_u32) { continue; }
+                        // Only freeze if using meaningful memory (>50MB RSS).
+                        if process.memory() < 50 * 1024 * 1024 { continue; }
+                        let (ss, su) = pid_start_time(pid_u32);
+                        actions.push(RootAction::FreezeProcess {
+                            pid: pid_u32,
+                            name: name.clone(),
+                            reason: format!("stale-app: no user interaction for >30min, rss={}MB",
+                                process.memory() / 1024 / 1024),
+                            start_sec: ss,
+                            start_usec: su,
+                        });
+                    }
+                }
 
                 // Survival Mode: active when memory pressure is critical or swap is thrashing.
                 // swap_delta_bps > 1MB/s means we're actively writing to swap (thrashing).
@@ -5587,11 +5634,28 @@ fn main() -> anyhow::Result<()> {
                                 match action {
                                     MemoryAction::PressureHint => {
                                         ds_hint += 1;
+                                        // Cable: purge_purgeable_regions() → reclaim RAM without freeze.
+                                        // When we'd only send a hint, also actively purge purgeable
+                                        // regions. This is the "secret weapon": free RAM from a live
+                                        // process without SIGSTOP, by marking purgeable pages volatile.
+                                        if profile.purgeable_bytes > 10 * 1024 * 1024 {
+                                            let purged = purge_purgeable_regions(pid).unwrap_or(0);
+                                            if purged > 0 {
+                                                audit_log(&serde_json::json!({
+                                                    "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                                    "event": "purge_purgeable",
+                                                    "pid": pid,
+                                                    "name": freeze_name,
+                                                    "regions_purged": purged,
+                                                    "purgeable_mb": profile.purgeable_bytes / 1024 / 1024,
+                                                }));
+                                            }
+                                        }
                                         Some(RootAction::SetMemorystatus {
                                             pid,
                                             priority: -1,
                                             reason: format!(
-                                                "{} (deep-scan: ratio={:.1} purgeable={}MB temp={} → hint)",
+                                                "{} (deep-scan: ratio={:.1} purgeable={}MB temp={} → hint+purge)",
                                                 reason,
                                                 profile.compression_ratio,
                                                 profile.purgeable_bytes / 1024 / 1024,
@@ -5600,7 +5664,26 @@ fn main() -> anyhow::Result<()> {
                                             ),
                                         })
                                     }
-                                    MemoryAction::Skip => { ds_skip += 1; None }
+                                    MemoryAction::Skip => {
+                                        ds_skip += 1;
+                                        // Cable: check_resident equivalent — if we're skipping because
+                                        // pct_compressed > 0.60, the process is already mostly swapped.
+                                        // No action needed: the process isn't consuming physical RAM.
+                                        // Log this so we can verify the skip was correct.
+                                        if let Some(ref t) = temp {
+                                            if t.pct_compressed > 0.60 {
+                                                audit_log(&serde_json::json!({
+                                                    "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                                    "event": "skip_already_cold",
+                                                    "pid": pid,
+                                                    "name": freeze_name,
+                                                    "pct_compressed": (t.pct_compressed * 100.0).round(),
+                                                    "reason": "process already swapped/compressed, freeze pointless",
+                                                }));
+                                            }
+                                        }
+                                        None
+                                    }
                                     MemoryAction::Freeze => { ds_freeze += 1; Some(a) }
                                 }
                             } else {

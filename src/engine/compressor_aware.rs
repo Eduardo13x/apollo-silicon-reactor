@@ -593,6 +593,97 @@ pub fn compressor_efficiency_score(profile: &ProcessMemoryProfile) -> f64 {
     (ratio_score * 0.7 + (1.0 - size_penalty) * 0.3).clamp(0.0, 1.0)
 }
 
+// ── Cross-process memory reclaim ─────────────────────────────────────────────
+
+/// Purgeable state constants from XNU <mach/vm_purgable.h>.
+#[cfg(target_os = "macos")]
+const VM_PURGABLE_SET_STATE: i32 = 0;
+#[cfg(target_os = "macos")]
+const VM_PURGABLE_VOLATILE: i32 = 1;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn mach_vm_purgable_control(
+        task: u32,
+        address: u64,
+        control: i32,
+        state: *mut i32,
+    ) -> i32;
+}
+
+/// Reclaim purgeable memory from another process without killing it.
+///
+/// Walks the process's VM regions, finds purgeable private regions, and marks
+/// them volatile via `mach_vm_purgable_control`. The kernel can then reclaim
+/// those pages on demand — the owning process gets zero-filled pages on next access.
+///
+/// This is the cross-process equivalent of `hint_free()` / `hint_dontneed()`:
+/// reclaim RAM from a live process without SIGSTOP.
+///
+/// Returns the number of regions successfully marked volatile, or None on failure.
+/// Cost: ~200-500µs (region enumeration + purgable_control per region).
+#[cfg(target_os = "macos")]
+pub fn purge_purgeable_regions(pid: u32) -> Option<u32> {
+    unsafe {
+        let self_port = mach_task_self();
+        let (task_port, need_dealloc) = if pid == std::process::id() {
+            (self_port, false)
+        } else {
+            let mut port: u32 = 0;
+            let kr = task_for_pid(self_port, pid as i32, &mut port);
+            if kr != KERN_SUCCESS {
+                return None;
+            }
+            (port, true)
+        };
+
+        let mut purged = 0u32;
+        let mut address: u64 = 0;
+
+        loop {
+            let mut size: u64 = 0;
+            let mut info: VmRegionTopInfo = std::mem::zeroed();
+            let mut count = VM_REGION_TOP_INFO_COUNT;
+            let mut obj: u32 = 0;
+
+            let kr = mach_vm_region(
+                task_port, &mut address, &mut size,
+                VM_REGION_TOP_INFO, &mut info as *mut _ as *mut i32,
+                &mut count, &mut obj,
+            );
+            if kr != KERN_SUCCESS { break; }
+
+            // Only target private regions with resident pages.
+            // Purgeable memory is identified by attempting the purgable_control call —
+            // non-purgeable regions return KERN_INVALID_ARGUMENT (harmlessly).
+            if info.share_mode == SM_PRIVATE && info.private_pages_resident > 0 {
+                let mut state = VM_PURGABLE_VOLATILE;
+                let kr = mach_vm_purgable_control(
+                    task_port, address, VM_PURGABLE_SET_STATE, &mut state,
+                );
+                if kr == KERN_SUCCESS {
+                    purged += 1;
+                }
+                // KERN_INVALID_ARGUMENT = not purgeable → harmless, skip.
+            }
+
+            address += size;
+            if address == 0 { break; }
+        }
+
+        if need_dealloc {
+            mach_port_deallocate(self_port, task_port);
+        }
+
+        Some(purged)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn purge_purgeable_regions(_pid: u32) -> Option<u32> {
+    None
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
