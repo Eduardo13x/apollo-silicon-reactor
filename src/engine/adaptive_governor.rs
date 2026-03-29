@@ -371,17 +371,23 @@ impl AdaptiveGovernor {
         }
 
         // SilentDaemon idle override: if a daemon has near-zero CPU and has been
-        // idle for over an hour with no GUI, it's effectively stale even if the
-        // classifier didn't flag it (e.g. wakeups at threshold boundary).
+        // idle for over an hour with no GUI, it's effectively stale.
+        // Rosetta (translated) processes get frozen instead of throttled because
+        // they use ~2x memory (JIT page tables) — freeing them is more valuable.
         if tier == ProcessTier::SilentDaemon
             && snap.cpu_percent < 0.5
             && snap.secs_since_foreground > 3600
             && !snap.has_gui_window
         {
+            let decision = if snap.is_translated {
+                GovernorDecision::Freeze
+            } else {
+                GovernorDecision::Throttle
+            };
             return ProcessDecision {
                 pid: snap.pid,
                 name: snap.name.clone(),
-                decision: GovernorDecision::Throttle,
+                decision,
                 tier,
                 utility_score: utility,
                 waste_score: waste,
