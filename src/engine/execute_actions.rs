@@ -287,9 +287,9 @@ pub fn execute_actions(
                 RootAction::FreezeProcess {
                     pid,
                     name,
-                    reason,
                     start_sec,
                     start_usec,
+                    ..
                 } => {
                     if protected.iter().any(|p| name.contains(p)) {
                         return Ok(());
@@ -317,14 +317,9 @@ pub fn execute_actions(
                         }
                     }
                     if critical_bg.iter().any(|p| name.contains(p)) {
-                        // Memory-hog overrides bypass critical-bg protection:
-                        // a >1GB, 0% CPU zombie has lost its dev-workload exemption.
-                        let is_hog_override = reason.starts_with("memory-hog override");
-                        if !is_hog_override {
-                            out.critical_background_skips += 1;
-                            out.push_skip(format!("critical-bg:{}", name));
-                            return Ok(());
-                        }
+                        out.critical_background_skips += 1;
+                        out.push_skip(format!("critical-bg:{}", name));
+                        return Ok(());
                     }
                     // Validate PID identity with start-time (prevents A-B-A recycling).
                     if !verify_pid_identity(*pid, name, *start_sec, *start_usec) {

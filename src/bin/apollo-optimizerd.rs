@@ -4938,63 +4938,6 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // ── Memory hog override ──────────────────────────────────────
-                // Critical-background processes (python, node, java, etc.) are normally
-                // immune to freeze/kill. But a process with >1GB RSS, <1% CPU, and
-                // >5min idle is a zombie hog — it lost its protection.
-                // This catches scenarios like a 6.8GB Python services.py sitting in swap.
-                if snapshot.pressure.memory_pressure > 0.50 {
-                    let protected_pats = protected_processes();
-                    for snap in proc_snaps.iter() {
-                        // Never touch hard-protected (WindowServer, Finder, launchd, etc.)
-                        if protected_pats.iter().any(|p| snap.name.contains(p)) {
-                            continue;
-                        }
-                        // Skip foreground
-                        if Some(snap.pid) == foreground_pid {
-                            continue;
-                        }
-                        let is_hog = snap.rss_bytes > 1024 * 1024 * 1024
-                            && snap.cpu_percent < 1.0
-                            && snap.secs_since_user_interaction > 300
-                            && !snap.has_gui_window;
-                        if !is_hog {
-                            continue;
-                        }
-                        // In survival mode with 2+ recovery attempts → kill.
-                        if survival_mode
-                            && proc_recovery
-                                .get_recovery_targets()
-                                .iter()
-                                .any(|t| t.pid == snap.pid && t.recovery_attempts >= 2)
-                        {
-                            if unsafe { libc::kill(snap.pid as i32, 0) } == 0 {
-                                unsafe {
-                                    libc::kill(snap.pid as i32, libc::SIGKILL);
-                                }
-                                let mut m = state.metrics.lock_recover();
-                                m.kills_applied += 1;
-                                m.survival_mode_activations += 1;
-                            }
-                        } else {
-                            // Freeze the hog — override critical_background protection.
-                            let (ss, su) = pid_start_time(snap.pid);
-                            actions.push(RootAction::FreezeProcess {
-                                pid: snap.pid,
-                                name: snap.name.clone(),
-                                reason: format!(
-                                    "memory-hog override: rss={}MB cpu={:.1}% idle={}s",
-                                    snap.rss_bytes / 1024 / 1024,
-                                    snap.cpu_percent,
-                                    snap.secs_since_user_interaction,
-                                ),
-                                start_sec: ss,
-                                start_usec: su,
-                            });
-                        }
-                    }
-                }
-
                 // ── Feature 5: Wakeup Budget Enforcer ───────────────────────
                 // Upgrade from ThrottleProcess to App Nap for wakeup offenders.
                 // App Nap suppresses CPU + timers + I/O without SIGSTOP artifacts.
