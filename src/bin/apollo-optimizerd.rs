@@ -5035,6 +5035,7 @@ fn main() -> anyhow::Result<()> {
                         outcome_baseline,
                         &behavior_interactive_pids,
                         &ipc_hints,
+                        &outcome_tracker.hop_groups,
                     )
                 };
                 *state.last_blockers.lock_recover() = decision.blockers.clone();
@@ -6306,6 +6307,24 @@ fn main() -> anyhow::Result<()> {
                     if penalty < 0.0 {
                         if let Some(rl) = &mut overflow_guard.rl_agent {
                             rl.inject_external_reward(penalty);
+                        }
+                    }
+                }
+
+                // Dr. Zero feedback loop: read external score from watcher's
+                // autoresearch and use it to reinforce/penalize the RL agent.
+                // File written by watch-deploy.sh after each autoresearch run.
+                if cycle_count % 60 == 30 {
+                    if let Ok(data) = std::fs::read_to_string("/tmp/apollo-dr-zero-feedback.json") {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                            if let Some(score) = v.get("score").and_then(|s| s.as_f64()) {
+                                // Normalize: score 90+ is good (reward), <70 is bad (penalty).
+                                // Range maps to [-0.3, +0.3] RL reward.
+                                let reward = ((score - 80.0) / 33.3).clamp(-0.3, 0.3);
+                                if let Some(rl) = &mut overflow_guard.rl_agent {
+                                    rl.inject_external_reward(reward);
+                                }
+                            }
                         }
                     }
                 }

@@ -255,7 +255,7 @@ pub struct OutcomeTracker {
     /// Ticks since last action (for windowed drift measurement).
     ticks_since_action: u32,
     /// HRPO: per-group effectiveness tracking (Dr. Zero solver).
-    hop_groups: HashMap<WorkloadHop, HopGroupWeight>,
+    pub hop_groups: HashMap<WorkloadHop, HopGroupWeight>,
 }
 
 impl OutcomeTracker {

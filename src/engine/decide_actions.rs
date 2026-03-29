@@ -4,7 +4,7 @@ use sysinfo::System;
 
 use crate::collector::SystemSnapshot;
 use crate::engine::amx_detector;
-use crate::engine::outcome_tracker::PatternWeight;
+use crate::engine::outcome_tracker::{PatternWeight, WorkloadHop, HopGroupWeight};
 use crate::engine::overflow_guard::OverflowThresholds;
 use crate::engine::safety::critical_background_processes;
 use crate::engine::thread_selfcounts::IpcClass;
@@ -190,6 +190,9 @@ pub fn decide_actions(
     // Used for IPC-aware throttling: low IPC = memory-bound (safe to throttle),
     // high IPC = compute-bound (throttling hurts throughput).
     ipc_hints: &HashMap<u32, f64>,
+    // HRPO group effectiveness from Dr. Zero — skip throttling groups with
+    // consistently low effectiveness (< 15%) after sufficient observations.
+    hop_groups: &HashMap<WorkloadHop, HopGroupWeight>,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -303,6 +306,25 @@ pub fn decide_actions(
             {
                 low_value_skipped.push(name);
                 continue;
+            }
+
+            // HRPO group-level intelligence (Dr. Zero):
+            // 1. Skip: groups throttled ≥20x with effectiveness <15%
+            // 2. Explore: groups with high prediction error get tested regardless
+            {
+                let hop = WorkloadHop::from_process_name(&name);
+                if let Some(group) = hop_groups.get(&hop) {
+                    // Groups needing exploration bypass the skip — the solver
+                    // is uncertain about their effectiveness and needs more data.
+                    if !group.needs_exploration() {
+                        if group.throttle_count >= 20 && group.effectiveness() < 0.15
+                            && !matches!(context, InteractiveContext::ThermalConstrained)
+                        {
+                            low_value_skipped.push(format!("hrpo-skip:{}", name));
+                            continue;
+                        }
+                    }
+                }
             }
 
             // IPC-aware throttling: use per-process IPC to modulate aggressiveness.
