@@ -20,3 +20,4 @@ dc0400a	3889.0	53/55	1239	keep	Exp31: Graduated idle 6h/12h (fixes s51, s54, s55
 6059231	3989.0	55/55	1239	keep	Exp32: Swarm exempt faults>500K + ports>40 (fixes s52, s53)
 4eba4e4	4239.0	60/60	1239	baseline	Boss L7 (s56-s60): UI fluidity & render pipeline, 0 fail
 5539ade	4239.0	60/60	1239	keep	Exp33: Render pipeline exemption for waste+wakeup hog (fixes s57, s58)
+04bab54	5989.0	95/95	1239	keep	Exp34: AutoResearch x3 — latency_monitor + compressor_aware + decide_actions (+35 scenarios)
