@@ -90,6 +90,9 @@ pub struct OverflowGuard {
     last_event_at: Option<Instant>,
     /// Q-learning RL agent for adaptive threshold tuning (Phase 4).
     pub rl_agent: Option<RlThresholdAgent>,
+    /// Device-level offset: shifts base thresholds down on memory-constrained devices.
+    /// -0.05 for ≤8 GB, 0.0 for ≤16 GB, +0.05 for >16 GB.
+    device_offset: f64,
 }
 
 /// Herramientas de compilación que causan picos de RAM.
@@ -98,6 +101,33 @@ pub struct OverflowGuard {
 pub const BUILD_TOOLS: &[&str] = &[
     "rustc", "cargo", "swift", "clang", "make", "gcc", "ld", "link", "stable",
 ];
+
+/// Query total physical RAM in GB using `sysctl -n hw.memsize`.
+/// Falls back to 8.0 GB if the query fails (conservative default for M1 Air).
+fn query_ram_gb() -> f64 {
+    std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|b| b as f64 / 1e9)
+        .unwrap_or(8.0)
+}
+
+/// Compute a device-level threshold offset based on total RAM.
+/// Memory-constrained devices (≤8 GB) get -0.05 (act sooner).
+/// Mid-range (≤16 GB) get 0.0 (no change).
+/// Large-memory devices (>16 GB) get +0.05 (more headroom).
+pub fn device_threshold_offset(ram_gb: f64) -> f64 {
+    if ram_gb <= 8.0 {
+        -0.05
+    } else if ram_gb <= 16.0 {
+        0.0
+    } else {
+        0.05
+    }
+}
 
 impl OverflowGuard {
     /// Carga el historial desde disco, o crea uno vacío si no existe.
@@ -108,12 +138,14 @@ impl OverflowGuard {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let rl_agent = rl_path.map(RlThresholdAgent::load_or_default);
+        let device_offset = device_threshold_offset(query_ram_gb());
         Self {
             history,
             path: path.to_path_buf(),
             last_decay_check: Instant::now(),
             last_event_at: None,
             rl_agent,
+            device_offset,
         }
     }
 
@@ -265,7 +297,8 @@ impl OverflowGuard {
             .as_ref()
             .map(|r| r.current_adjustment)
             .unwrap_or(0.0);
-        let total_offset = off + workload_bonus + rl_adj;
+        // device_offset: -0.05 on ≤8 GB (act sooner), +0.05 on >16 GB (more headroom).
+        let total_offset = off + workload_bonus + rl_adj + self.device_offset;
 
         OverflowThresholds {
             bg_pressure: (0.78 + total_offset).max(RL_ABSOLUTE_FLOOR),
@@ -362,6 +395,18 @@ mod tests {
             last_decay_check: Instant::now(),
             last_event_at: None,
             rl_agent: None,
+            device_offset: 0.0,
+        }
+    }
+
+    fn make_guard_with_device_offset(offset: f64) -> OverflowGuard {
+        OverflowGuard {
+            history: OverflowHistory::default(),
+            path: PathBuf::from("/tmp/test_overflow_device.json"),
+            last_decay_check: Instant::now(),
+            last_event_at: None,
+            rl_agent: None,
+            device_offset: offset,
         }
     }
 
@@ -433,6 +478,71 @@ mod tests {
             t.bg_pressure <= 0.81,
             "no puede superar el default + idle bonus: {}",
             t.bg_pressure
+        );
+    }
+
+    #[test]
+    fn device_offset_8gb_lowers_thresholds() {
+        let guard_8gb = make_guard_with_device_offset(-0.05);
+        let guard_base = make_guard_with_device_offset(0.0);
+        let t_8gb = guard_8gb.thresholds(WorkloadMode::Idle);
+        let t_base = guard_base.thresholds(WorkloadMode::Idle);
+        assert!(
+            t_8gb.bg_pressure < t_base.bg_pressure,
+            "8 GB device should have lower bg_pressure threshold: {} vs {}",
+            t_8gb.bg_pressure,
+            t_base.bg_pressure
+        );
+        assert!(
+            (t_base.bg_pressure - t_8gb.bg_pressure - 0.05).abs() < 1e-9,
+            "offset should be exactly -0.05pp: diff={}",
+            t_base.bg_pressure - t_8gb.bg_pressure
+        );
+    }
+
+    #[test]
+    fn device_offset_32gb_raises_thresholds() {
+        let guard_32gb = make_guard_with_device_offset(0.05);
+        let guard_base = make_guard_with_device_offset(0.0);
+        let t_32gb = guard_32gb.thresholds(WorkloadMode::Idle);
+        let t_base = guard_base.thresholds(WorkloadMode::Idle);
+        assert!(
+            t_32gb.bg_pressure > t_base.bg_pressure,
+            "32 GB device should have higher bg_pressure threshold: {} vs {}",
+            t_32gb.bg_pressure,
+            t_base.bg_pressure
+        );
+        assert!(
+            (t_32gb.bg_pressure - t_base.bg_pressure - 0.05).abs() < 1e-9,
+            "offset should be exactly +0.05pp"
+        );
+    }
+
+    #[test]
+    fn device_threshold_offset_buckets() {
+        assert!(
+            (device_threshold_offset(8.0) - (-0.05)).abs() < 1e-9,
+            "8 GB exactly -> -0.05"
+        );
+        assert!(
+            (device_threshold_offset(7.9) - (-0.05)).abs() < 1e-9,
+            "< 8 GB -> -0.05"
+        );
+        assert!(
+            (device_threshold_offset(16.0) - 0.0).abs() < 1e-9,
+            "16 GB exactly -> 0.0"
+        );
+        assert!(
+            (device_threshold_offset(12.0) - 0.0).abs() < 1e-9,
+            "12 GB -> 0.0"
+        );
+        assert!(
+            (device_threshold_offset(32.0) - 0.05).abs() < 1e-9,
+            "32 GB -> +0.05"
+        );
+        assert!(
+            (device_threshold_offset(16.1) - 0.05).abs() < 1e-9,
+            "> 16 GB -> +0.05"
         );
     }
 }
