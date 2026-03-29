@@ -1002,4 +1002,103 @@ mod scenarios {
             d_small, d_big
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CATEGORY 14: BOSS LEVEL 5 — RESOURCE AWARENESS
+    // These require understanding RSS cost, time-of-day, energy, and Rosetta
+    // impact at a deeper level than simple thresholds.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// BOSS 26: RSS hog idle daemon should FREEZE, not just throttle.
+    /// On 8GB M1, a native daemon hogging 1.5GB with 0% CPU for 2h is a
+    /// massive waste of physical memory. Throttle only reduces CPU priority
+    /// — it doesn't free the 1.5GB. Must freeze to reclaim.
+    #[test]
+    fn s46_rss_hog_idle_must_freeze() {
+        let snaps = vec![snap(4600, "big_daemon", 0.1, 1500, false, 7200, 7200)];
+        let results = decide(&snaps, None);
+        assert_eq!(
+            find_decision(&results, "big_daemon"),
+            GovernorDecision::Freeze,
+            "1.5GB idle native daemon on 8GB machine must be FROZEN to reclaim memory"
+        );
+    }
+
+    /// BOSS 27: Night mode — at 3AM nobody is using the machine.
+    /// A background daemon with low activity that would normally be Allow
+    /// should be Throttled to save energy. hour_of_day must influence decisions.
+    #[test]
+    fn s47_night_mode_more_aggressive_throttle() {
+        let snaps = vec![snap(4700, "night_service", 2.0, 100, false, 1800, 1800)];
+        let mut gov = AdaptiveGovernor::new();
+        let hunts: Vec<HuntSnapshot> = Vec::new();
+        let names: Vec<&str> = vec!["night_service"];
+        let decisions = gov.decide_all(&snaps, &hunts, None, &names, 3); // 3 AM
+        let d = decisions.iter().find(|d| d.name == "night_service").unwrap();
+        assert!(
+            d.decision == GovernorDecision::Throttle || d.decision == GovernorDecision::Freeze,
+            "At 3AM, idle background service should be throttled to save energy. Got {:?}",
+            d.decision
+        );
+    }
+
+    /// BOSS 28: Wakeup energy hog — 200 wakeups/sec is an energy catastrophe.
+    /// Each wakeup forces the CPU out of deep idle (P→E transition on M1).
+    /// Even with only 3% CPU, this daemon destroys battery life. Must throttle.
+    #[test]
+    fn s48_wakeup_energy_hog_throttled() {
+        let mut s = snap(4800, "chatty_daemon", 3.0, 80, false, 600, 600);
+        s.wakeups_per_sec = 200.0;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "chatty_daemon");
+        assert!(
+            d == GovernorDecision::Throttle || d == GovernorDecision::Freeze,
+            "200 wakeups/sec daemon must be throttled for energy. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 29: Translated process in swarm should FREEZE, not just throttle.
+    /// Rosetta processes use ~2x memory (JIT page tables). In a swarm scenario
+    /// where resources are scarce, freezing reclaims both CPU scheduling AND
+    /// the extra Rosetta memory overhead. Throttle is not enough.
+    #[test]
+    fn s49_translated_in_swarm_should_freeze() {
+        let mut snaps: Vec<ProcessSnapshot> = (0..35)
+            .map(|i| snap(4900 + i, &format!("bg_{}", i), 0.5, 30, false, 3600, 3600))
+            .collect();
+        let mut rosetta = snap(4950, "rosetta_daemon", 2.0, 200, false, 1800, 1800);
+        rosetta.is_translated = true;
+        snaps.push(rosetta);
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "rosetta_daemon");
+        assert_eq!(
+            d,
+            GovernorDecision::Freeze,
+            "Translated process in swarm must be FROZEN (2x memory overhead). Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 30: FG helper stress test — validates that foreground app helpers
+    /// are immune to swarm pressure even with moderate waste stats.
+    /// 40 background processes, Safari foreground, WebKit helper with low
+    /// wakeups (no audio/video active). Must still be ALLOWED.
+    #[test]
+    fn s50_fg_helper_survives_swarm_pressure() {
+        let mut snaps: Vec<ProcessSnapshot> = (0..38)
+            .map(|i| snap(5000 + i, &format!("daemon_{}", i), 0.5, 30, false, 3600, 3600))
+            .collect();
+        let mut webkit = snap(5050, "com.apple.WebKit.WebContent", 5.0, 200, false, 100, 100);
+        webkit.wakeups_per_sec = 2.0;
+        snaps.push(webkit);
+        snaps.push(snap(5051, "Safari", 15.0, 400, true, 5, 0));
+        let results = decide(&snaps, Some("Safari"));
+        assert_eq!(
+            find_decision(&results, "com.apple.WebKit.WebContent"),
+            GovernorDecision::Allow,
+            "FG helper must be immune to swarm pressure"
+        );
+    }
 }
