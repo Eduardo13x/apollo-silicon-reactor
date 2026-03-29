@@ -118,6 +118,9 @@ pub struct RlThresholdAgent {
     total_ticks: u64,
     total_overflows: u64,
     path: PathBuf,
+    /// Previous memory pressure for potential-based reward shaping.
+    /// Φ(s) = -pressure² — so shaped reward = Φ(s') - Φ(s) = prev² - cur².
+    prev_pressure: f64,
 }
 
 impl RlThresholdAgent {
@@ -146,6 +149,7 @@ impl RlThresholdAgent {
             total_ticks,
             total_overflows,
             path: path.to_path_buf(),
+            prev_pressure: 0.5,
         }
     }
 
@@ -191,13 +195,29 @@ impl RlThresholdAgent {
         }
     }
 
+    /// Map a pressure_band to a representative pressure float for shaping.
+    fn band_to_pressure(band: u8) -> f64 {
+        match band {
+            0 => 0.35,
+            1 => 0.65,
+            _ => 0.90,
+        }
+    }
+
     pub fn tick(&mut self, state: RlState, overflow_occurred: bool) {
-        let reward = if overflow_occurred {
+        // Potential-based reward shaping: Φ(s) = -pressure²
+        // R_shaped = Φ(s') - Φ(s) = prev_pressure² - current_pressure²
+        let current_pressure = Self::band_to_pressure(state.pressure_band);
+        let shaped = self.prev_pressure * self.prev_pressure
+            - current_pressure * current_pressure;
+
+        let base_reward = if overflow_occurred {
             self.total_overflows += 1;
             REWARD_OVERFLOW
         } else {
             REWARD_STABLE
         };
+        let reward = base_reward + shaped * 2.0;
 
         if let (Some(prev_state), Some(prev_action)) = (self.last_state, self.last_action) {
             let s = prev_state.index();
@@ -224,6 +244,7 @@ impl RlThresholdAgent {
 
         self.last_state = Some(state);
         self.last_action = Some(action);
+        self.prev_pressure = current_pressure;
         self.total_ticks += 1;
     }
 
@@ -280,6 +301,7 @@ mod tests {
             total_ticks: 0,
             total_overflows: 0,
             path: PathBuf::from("/dev/null"),
+            prev_pressure: 0.5,
         }
     }
 
@@ -453,6 +475,73 @@ mod tests {
         assert_eq!(RlState::from_metrics(0.00, 0.60, 0).compressor_band, 1);
         assert_eq!(RlState::from_metrics(0.00, 0.61, 0).compressor_band, 2);
         assert_eq!(RlState::from_metrics(0.00, 0.00, 5).overflow_last_hour, 3);
+    }
+
+    #[test]
+    fn test_shaped_reward_pressure_drop_beats_no_change() {
+        // Agent starting at high pressure (band 2 → 0.90) dropping to low (band 0 → 0.35)
+        // should accumulate higher Q than agent that stays at same pressure.
+        let mut agent_drop = make_agent();
+        agent_drop.prev_pressure = 0.90; // start high
+        let high_state = RlState::from_metrics(0.85, 0.40, 0); // band 2
+        let low_state = RlState::from_metrics(0.30, 0.10, 0);  // band 0
+        agent_drop.tick(high_state, false); // prev=0.90, cur=0.90, shaped≈0
+        agent_drop.tick(low_state, false);  // prev=0.90, cur=0.35, shaped= 0.81-0.1225=+0.6875
+
+        let mut agent_flat = make_agent();
+        agent_flat.prev_pressure = 0.90;
+        agent_flat.tick(high_state, false);
+        agent_flat.tick(high_state, false); // stays at 0.90, shaped=0
+
+        // The drop agent's Q for the first state should be higher (better reward received)
+        let q_drop: f64 = agent_drop.q_table[high_state.index()].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let q_flat: f64 = agent_flat.q_table[high_state.index()].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            q_drop > q_flat,
+            "pressure drop should yield higher Q than staying high: drop={} flat={}",
+            q_drop, q_flat
+        );
+    }
+
+    #[test]
+    fn test_shaped_overflow_still_dominates() {
+        // Even with positive shaping, repeated overflow ticks must push Q strongly negative.
+        let mut agent = make_agent();
+        let high = RlState::from_metrics(0.85, 0.70, 2);
+        // Run enough overflow ticks to accumulate penalty (first tick has no prev_state update)
+        for _ in 0..5 {
+            agent.tick(high, true);
+        }
+        // The best Q value across all actions for this state should be negative
+        let best_q = agent.q_table[high.index()]
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            best_q < 0.0,
+            "repeated overflow must push best Q negative: best_q={}",
+            best_q
+        );
+    }
+
+    #[test]
+    fn test_prev_pressure_updates_after_tick() {
+        let mut agent = make_agent();
+        assert!((agent.prev_pressure - 0.5).abs() < 1e-9, "initial prev_pressure=0.5");
+        let low_state = RlState::from_metrics(0.30, 0.10, 0); // band 0 → 0.35
+        agent.tick(low_state, false);
+        assert!(
+            (agent.prev_pressure - 0.35).abs() < 1e-9,
+            "prev_pressure should update to band 0 midpoint: {}",
+            agent.prev_pressure
+        );
+        let high_state = RlState::from_metrics(0.90, 0.70, 0); // band 2 → 0.90
+        agent.tick(high_state, false);
+        assert!(
+            (agent.prev_pressure - 0.90).abs() < 1e-9,
+            "prev_pressure should update to band 2 midpoint: {}",
+            agent.prev_pressure
+        );
     }
 
     #[test]
