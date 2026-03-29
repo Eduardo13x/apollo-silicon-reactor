@@ -2,8 +2,11 @@ commit	score	scenarios	tests	status	description
 82da8eb	2139.0	18/20	1239	baseline	Original 20-scenario baseline
 7d5189a	2239.0	20/20	1239	keep	Exp1-3: idle override + waste curve + RSS penalty
 633b6fe	2239.0	20/20	1239	keep	Exp8+11+14: simplify waste/calibration, -23 lines
-5d0f52f	2339.0	22/25	1239	baseline	Boss scenarios added (s21-s25), 3 fail
+5d0f52f	2339.0	22/25	1239	baseline	Boss L1 (s21-s25), 3 fail
 7614269	2489.0	25/25	1239	keep	Exp16: IPC hub + LLM model + active I/O protection
 742893f	2489.0	25/25	1239	keep	Exp20: Remove gray-zone entropy, -45 lines
-8c1fee1	2489.0	25/25	1239	keep	Exp21: Remove heavy-workload gate on freeze, -2 lines
-0e66e1e	1866.0	25/25	616	discard	Exp22: Remove aggressive flags — PASS=0 ext refs
+35b209f	2639.0	28/30	1239	baseline	Boss L2 (s26-s30), 2 fail
+216602f	2683.0	29/30	1233	keep	Exp23: Rosetta tax
+ea59834	2739.0	30/30	1239	keep	Exp24: Swarm awareness
+f6b9ab5	3183.0	39/40	1233	baseline	Boss L3 (s31-s40), 1 fails
+ccb0936	3239.0	40/40	1239	keep	Exp25: Kill zombies in decide_one
