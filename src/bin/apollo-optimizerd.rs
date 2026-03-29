@@ -3824,6 +3824,8 @@ fn main() -> anyhow::Result<()> {
                 last_hw_pressure = hw_pressure;
 
                 // ThermalManager + GPUManager: tick every cycle with latest IOKit temperatures.
+                // gpu_thermal_throttled escapes this block to feed into governor input.
+                let mut gpu_thermal_throttled = false;
                 {
                     if let Some(hw) = &cycle_hw_snap {
                         let cpu_t = hw.temps.p_cluster_celsius.unwrap_or(0.0);
@@ -3853,8 +3855,23 @@ fn main() -> anyhow::Result<()> {
                         };
                         // If GPU is thermally throttled, engage fast-tick for quicker response.
                         if gpu_metrics.power_state == GPUPowerState::Throttled {
+                            gpu_thermal_throttled = true;
                             *state.fast_tick_until.lock_recover() =
                                 Some(Instant::now() + Duration::from_secs(15));
+                        }
+                        // Cable: GPU thermal audit — log thermal_recommendations on throttle
+                        // transitions and workload-specific hints for observability.
+                        if gpu_metrics.throttle_active || gpu_metrics.power_state == GPUPowerState::Throttled {
+                            let recs = gpu_mgr.thermal_recommendations(&gpu_metrics);
+                            if !recs.is_empty() {
+                                audit_log(&serde_json::json!({
+                                    "event": "gpu_thermal",
+                                    "gpu_temp": gpu_t,
+                                    "gpu_util": gpu_util,
+                                    "power_state": format!("{:?}", gpu_metrics.power_state),
+                                    "recommendations": recs,
+                                }));
+                            }
                         }
                         // Store GPU power state in metrics for status reporting.
                         state.metrics.lock_recover().energy_gpu_watts =
@@ -4429,7 +4446,7 @@ fn main() -> anyhow::Result<()> {
                     thermal_constrained: matches!(
                         snapshot.pressure.thermal_level.as_str(),
                         "serious" | "critical"
-                    ),
+                    ) || gpu_thermal_throttled,
                     dev_session_active,
                     interactive_heavy,
                     context_switch_burst,
@@ -5360,6 +5377,20 @@ fn main() -> anyhow::Result<()> {
                     m.ml_confidence = ml_class.confidence;
                     m.current_workload = format!("{:?}", ml_class.workload).to_lowercase();
                     m.ml_sources = ml_class.sources_summary();
+                }
+                // Cable: GPU optimize_for_workload → log GPU-specific hints when
+                // workload changes AND GPU is drawing power (gpu_active in features).
+                // This feeds observability: what GPU strategy Apollo recommends per workload.
+                if cycle_hw_snap.as_ref().and_then(|h| h.power.gpu_watts).unwrap_or(0.0) > 2.0 {
+                    let wl_str = format!("{:?}", ml_class.workload).to_lowercase();
+                    let gpu_hints = gpu_mgr.optimize_for_workload(&wl_str);
+                    if !gpu_hints.is_empty() && cycle_count % 30 == 0 {
+                        audit_log(&serde_json::json!({
+                            "event": "gpu_workload_hint",
+                            "workload": wl_str,
+                            "hints": gpu_hints,
+                        }));
+                    }
                 }
 
                 // Sysctl Governor: reactive tuning based on TCP health, memory pressure, and workload.
