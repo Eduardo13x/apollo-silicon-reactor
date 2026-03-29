@@ -547,21 +547,7 @@ pub struct GovernorSummary {
 /// Evita hardcodear valores que asuman M1 cuando corre en M3 Max.
 fn calibrate_config_for_hardware(hw: &SiliconInfo) -> GovernorConfig {
     let mut cfg = GovernorConfig::default();
-    let cores = hw.physical_cores;
     let ram_gb = hw.memory_bytes / 1024 / 1024 / 1024;
-
-    // Más cores = más margen para congelar procesos background agresivamente,
-    // porque el workload activo tiene más cores propios disponibles.
-    if cores >= 12 {
-        // M3 Pro/Max, M4 Pro/Max — más cores, algo más agresivo pero sin pasarse
-        cfg.freeze_utility_threshold = 0.08;
-        cfg.throttle_utility_threshold = 0.25;
-    } else if cores >= 10 {
-        // M2 Pro, M3 — tier intermedio
-        cfg.freeze_utility_threshold = 0.06;
-        cfg.throttle_utility_threshold = 0.22;
-    }
-    // M1/M2 base (8 cores) — usa defaults (0.20/0.05)
 
     // Con poca RAM (8GB), lower waste threshold to act sooner on bloat.
     if ram_gb <= 8 {
