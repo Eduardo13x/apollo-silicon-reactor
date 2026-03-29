@@ -532,7 +532,10 @@ impl AdaptiveGovernor {
         // Swarm pressure: when many processes are competing (>30), lower the
         // bar for waste-based throttling. With 50+ daemons, even mildly wasteful
         // ones degrade foreground responsiveness.
-        if process_count > 30 && waste >= 0.30 && adjusted_utility < 0.55 && !snap.has_gui_window {
+        // Swarm exemptions: high faults = active memory work (GPU, mmap I/O),
+        // significant Mach ports (40+) = serving other processes via XPC.
+        let swarm_exempt = snap.faults_total > 500000 || snap.mach_port_count > 40;
+        if process_count > 30 && waste >= 0.30 && adjusted_utility < 0.55 && !snap.has_gui_window && !swarm_exempt {
             // Translated (Rosetta) processes in swarm get frozen: they use ~2x
             // memory from JIT page tables, so reclaiming is more valuable.
             let swarm_decision = if snap.is_translated {
