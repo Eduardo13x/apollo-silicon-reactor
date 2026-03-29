@@ -4835,6 +4835,11 @@ fn main() -> anyhow::Result<()> {
                     let total_ram = apollo_optimizer::engine::sysctl_direct::read_u64("hw.memsize")
                         .unwrap_or(8 * 1024 * 1024 * 1024);
                     let mut cpids: HashSet<u32> = HashSet::new();
+                    let mut bps_eval = 0u64;
+                    let mut bps_prot = 0u64;
+                    let mut bps_dem = 0u64;
+                    let mut bps_min = f64::MAX;
+                    let mut bps_min_name = String::new();
                     for (pid, process) in sys.processes() {
                         let name = process.name().to_string();
                         // Always-protected: system essentials + infrastructure + learned
@@ -4847,7 +4852,6 @@ fn main() -> anyhow::Result<()> {
                         }
                         // Dev runtimes: behavioral gate — protection earned, not given.
                         if runtime_pats.iter().any(|p| name.contains(p)) {
-                            // Find this process in proc_snaps for behavioral signals.
                             let pid_u32 = pid.as_u32();
                             if let Some(snap) = proc_snaps.iter().find(|s| s.pid == pid_u32) {
                                 let score = behavioral_protection_score(
@@ -4859,14 +4863,30 @@ fn main() -> anyhow::Result<()> {
                                     snap.rss_bytes,
                                     total_ram,
                                 );
-                                if score >= pressure as f64 {
-                                    cpids.insert(pid_u32);
+                                bps_eval += 1;
+                                if score < bps_min {
+                                    bps_min = score;
+                                    bps_min_name = format!("{}({})", name, pid_u32);
                                 }
-                                // else: dormant runtime loses protection, governor decides
+                                if score >= pressure as f64 {
+                                    bps_prot += 1;
+                                    cpids.insert(pid_u32);
+                                } else {
+                                    bps_dem += 1;
+                                }
                             } else {
-                                // Not in proc_snaps (ephemeral?) → protect conservatively
                                 cpids.insert(pid.as_u32());
                             }
+                        }
+                    }
+                    {
+                        let mut m = state.metrics.lock_recover();
+                        m.bps_evaluated += bps_eval;
+                        m.bps_protected += bps_prot;
+                        m.bps_demoted += bps_dem;
+                        if bps_min < f64::MAX {
+                            m.bps_min_score = bps_min;
+                            m.bps_min_score_name = bps_min_name;
                         }
                     }
                     // AMX/ML workloads: never throttle/freeze ML inference processes.
@@ -5372,12 +5392,19 @@ fn main() -> anyhow::Result<()> {
                     // Approximate active process count for SLC budget.
                     // Precise count not critical — SLC share is a rough heuristic.
                     let active_count = confirmed_actions.len().max(5);
+                    let mut ds_scans = 0u64;
+                    let mut ds_probes = 0u64;
+                    let mut ds_freeze = 0u64;
+                    let mut ds_skip = 0u64;
+                    let mut ds_hint = 0u64;
                     let confirmed_actions: Vec<RootAction> = confirmed_actions.into_iter().filter_map(|a| {
                         if let RootAction::FreezeProcess { pid, name: _, ref reason, .. } = a {
                             if let Some(profile) = query_memory_profile(pid) {
+                                ds_scans += 1;
                                 let fault_rate = mem_analyzer.major_fault_rate(pid);
                                 // Deep scan: vm_region + temperature (only in mid/high zone).
                                 let temp = if signal_digest.pressure_smooth >= 0.30 {
+                                    ds_probes += 1;
                                     sample_process_temperature(pid)
                                 } else {
                                     None
@@ -5392,6 +5419,7 @@ fn main() -> anyhow::Result<()> {
                                 );
                                 match action {
                                     MemoryAction::PressureHint => {
+                                        ds_hint += 1;
                                         Some(RootAction::SetMemorystatus {
                                             pid,
                                             priority: -1,
@@ -5405,8 +5433,8 @@ fn main() -> anyhow::Result<()> {
                                             ),
                                         })
                                     }
-                                    MemoryAction::Skip => None,
-                                    MemoryAction::Freeze => Some(a),
+                                    MemoryAction::Skip => { ds_skip += 1; None }
+                                    MemoryAction::Freeze => { ds_freeze += 1; Some(a) }
                                 }
                             } else {
                                 Some(a)
@@ -5415,6 +5443,14 @@ fn main() -> anyhow::Result<()> {
                             Some(a)
                         }
                     }).collect();
+                    {
+                        let mut m = state.metrics.lock_recover();
+                        m.deep_scan_count += ds_scans;
+                        m.deep_scan_temp_probes += ds_probes;
+                        m.deep_scan_freeze += ds_freeze;
+                        m.deep_scan_skip += ds_skip;
+                        m.deep_scan_hint += ds_hint;
+                    }
 
                     // Rosetta AOT: skip freezing oahd/oahd-helper during AOT compilation.
                     let confirmed_actions: Vec<RootAction> = if rosetta_monitor.is_compiling() {

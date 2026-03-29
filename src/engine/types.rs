@@ -584,6 +584,38 @@ pub struct RuntimeMetrics {
     // Daemon self-IPC (thread_selfcounts syscall 186)
     #[serde(default)]
     pub daemon_cycle_ipc: f64,
+
+    // ── v0.7.0 Deep Scan metrics ────────────────────────────────────────
+    /// Number of vm_region scans performed this session.
+    #[serde(default)]
+    pub deep_scan_count: u64,
+    /// Number of page temperature probes performed this session.
+    #[serde(default)]
+    pub deep_scan_temp_probes: u64,
+    /// decide_enhanced outcomes: freeze / skip / hint.
+    #[serde(default)]
+    pub deep_scan_freeze: u64,
+    #[serde(default)]
+    pub deep_scan_skip: u64,
+    #[serde(default)]
+    pub deep_scan_hint: u64,
+
+    // ── Behavioral protection metrics ───────────────────────────────────
+    /// Dev runtimes evaluated by behavioral_protection_score this session.
+    #[serde(default)]
+    pub bps_evaluated: u64,
+    /// Dev runtimes that kept protection (score >= pressure).
+    #[serde(default)]
+    pub bps_protected: u64,
+    /// Dev runtimes that lost protection (score < pressure).
+    #[serde(default)]
+    pub bps_demoted: u64,
+    /// Lowest behavioral score seen this cycle (0.0 = fully dormant hog).
+    #[serde(default)]
+    pub bps_min_score: f64,
+    /// Name of the process with the lowest behavioral score.
+    #[serde(default)]
+    pub bps_min_score_name: String,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.
