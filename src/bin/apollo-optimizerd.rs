@@ -208,6 +208,32 @@ fn journal_path() -> &'static str {
     }
 }
 
+fn audit_log_path() -> &'static str {
+    if unsafe { libc::geteuid() } == 0 {
+        "/var/lib/apollo/deep_scan_audit.jsonl"
+    } else {
+        "/tmp/apollo-deep_scan_audit.jsonl"
+    }
+}
+
+/// Append a JSON line to the audit log (best-effort, never fails the caller).
+fn audit_log(entry: &serde_json::Value) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    let path = audit_log_path();
+    // Rotate at 5MB to avoid unbounded growth.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > 5 * 1024 * 1024 {
+            let rotated = format!("{}.1", path);
+            let _ = std::fs::remove_file(&rotated);
+            let _ = std::fs::rename(path, &rotated);
+        }
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", entry);
+    }
+}
+
 fn metrics_path() -> &'static str {
     if unsafe { libc::geteuid() } == 0 {
         "/var/lib/apollo/runtime_metrics.json"
@@ -4864,11 +4890,28 @@ fn main() -> anyhow::Result<()> {
                                     total_ram,
                                 );
                                 bps_eval += 1;
+                                let protected = score >= pressure as f64;
                                 if score < bps_min {
                                     bps_min = score;
                                     bps_min_name = format!("{}({})", name, pid_u32);
                                 }
-                                if score >= pressure as f64 {
+                                // Audit log: every dev runtime evaluation with full context.
+                                audit_log(&serde_json::json!({
+                                    "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                    "event": "bps_eval",
+                                    "pid": pid_u32,
+                                    "name": name,
+                                    "score": (score * 10000.0).round() / 10000.0,
+                                    "pressure": (pressure * 1000.0).round() / 1000.0,
+                                    "protected": protected,
+                                    "cpu": snap.cpu_percent,
+                                    "wakeups": snap.wakeups_per_sec,
+                                    "net": snap.has_network,
+                                    "gui": snap.has_gui_window,
+                                    "idle_s": snap.secs_since_user_interaction,
+                                    "rss_mb": snap.rss_bytes / 1024 / 1024,
+                                }));
+                                if protected {
                                     bps_prot += 1;
                                     cpids.insert(pid_u32);
                                 } else {
@@ -5417,6 +5460,29 @@ fn main() -> anyhow::Result<()> {
                                     metrics.memory_pressure,
                                     fault_rate,
                                 );
+                                let decision_str = match action {
+                                    MemoryAction::Freeze => "freeze",
+                                    MemoryAction::Skip => "skip",
+                                    MemoryAction::PressureHint => "hint",
+                                };
+                                audit_log(&serde_json::json!({
+                                    "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                    "event": "deep_scan",
+                                    "pid": pid,
+                                    "decision": decision_str,
+                                    "ratio": (profile.compression_ratio * 100.0).round() / 100.0,
+                                    "phys_mb": profile.phys_footprint / 1024 / 1024,
+                                    "compressed_mb": profile.compressed_bytes / 1024 / 1024,
+                                    "purgeable_mb": profile.purgeable_bytes / 1024 / 1024,
+                                    "temp": temp.as_ref().map(|t| serde_json::json!({
+                                        "hot": (t.pct_hot * 100.0).round(),
+                                        "dram": (t.pct_dram * 100.0).round(),
+                                        "compressed": (t.pct_compressed * 100.0).round(),
+                                        "samples": t.sample_count,
+                                    })),
+                                    "fault_rate": (fault_rate * 10.0).round() / 10.0,
+                                    "pressure": (metrics.memory_pressure * 1000.0).round() / 1000.0,
+                                }));
                                 match action {
                                     MemoryAction::PressureHint => {
                                         ds_hint += 1;
