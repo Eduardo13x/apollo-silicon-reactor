@@ -328,6 +328,48 @@ impl AdaptiveGovernor {
             };
         }
 
+        // IPC hub protection: daemons with many Mach ports serve other apps.
+        if snap.mach_port_count > 80 {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Allow,
+                tier,
+                utility_score: utility,
+                waste_score: waste,
+                reason: format!("IPC hub ({} Mach ports) — protected", snap.mach_port_count),
+            };
+        }
+
+        // LLM model protection: large-RSS processes matching known AI runtimes
+        // have huge reload cost (30s+). Never freeze/throttle a loaded model.
+        const LLM_NAMES: &[&str] = &["ollama", "llama", "llamafile", "mlc-chat", "whisper"];
+        if snap.rss_bytes > 1024 * 1024 * 1024 && LLM_NAMES.iter().any(|n| snap.name.contains(n)) {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Allow,
+                tier,
+                utility_score: utility,
+                waste_score: waste,
+                reason: format!("LLM model loaded ({}MB RSS) — reload cost too high", snap.rss_bytes / 1024 / 1024),
+            };
+        }
+
+        // Active I/O work protection: high pageins = real disk work in progress.
+        // Freezing corrupts backups/encodes. Throttle is acceptable.
+        if snap.pageins_total > 50000 && snap.cpu_percent > 5.0 {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Allow,
+                tier,
+                utility_score: utility,
+                waste_score: waste,
+                reason: format!("Active I/O work ({} pageins, {:.0}% CPU) — protected", snap.pageins_total, snap.cpu_percent),
+            };
+        }
+
         // SilentDaemon idle override: if a daemon has near-zero CPU and has been
         // idle for over an hour with no GUI, it's effectively stale even if the
         // classifier didn't flag it (e.g. wakeups at threshold boundary).
