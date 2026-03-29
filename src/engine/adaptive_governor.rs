@@ -387,7 +387,9 @@ impl AdaptiveGovernor {
             && snap.secs_since_foreground > 3600
             && !snap.has_gui_window
         {
-            let decision = if snap.is_translated {
+            let decision = if snap.is_translated || snap.rss_bytes > 1024 * 1024 * 1024 {
+                // Translated (2x memory) or RSS hog (>1GB): freeze to reclaim memory.
+                // On 8GB M1, 1GB idle is 12.5% of total — throttle doesn't free it.
                 GovernorDecision::Freeze
             } else {
                 GovernorDecision::Throttle
