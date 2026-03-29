@@ -12,7 +12,7 @@ use crate::engine::mach_qos::{LatencyTier, MachQoSManager, ThreadTier, Throughpu
 use crate::engine::proc_taskinfo;
 use crate::engine::process_identity::{self, ProcessIdentity};
 use crate::engine::safety::{
-    allowlisted_sysctls, allowlisted_sysctls_with_ranges, critical_background_processes,
+    allowlisted_sysctls, allowlisted_sysctls_with_ranges, infrastructure_processes,
     protected_processes,
 };
 use crate::engine::types::{CapabilityReport, JournalEntry, RootAction};
@@ -147,7 +147,11 @@ pub fn execute_actions(
     mut qos_mgr: Option<&mut MachQoSManager>,
 ) -> ExecuteOutcomes {
     let protected = protected_processes();
-    let critical_bg = critical_background_processes();
+    // Only infrastructure (docker, postgres, redis, etc.) gets unconditional protection
+    // at execution time. Dev runtimes (python, node, etc.) are filtered upstream by
+    // behavioral_protection_score in the daemon — if they reach execute_actions,
+    // they've already lost their behavioral gate.
+    let critical_bg = infrastructure_processes();
     let allowlist = allowlisted_sysctls();
     // ML/AMX workloads: final safety net — never throttle or freeze inference processes.
     let ml_pids = amx_detector::ml_protected_pids();

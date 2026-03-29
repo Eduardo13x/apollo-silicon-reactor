@@ -138,11 +138,12 @@ pub fn allowlisted_sysctls() -> HashSet<&'static str> {
         .collect()
 }
 
-pub fn critical_background_processes() -> HashSet<&'static str> {
-    // Dev workloads that should not be slowed down by an "interactive-first" optimizer.
-    // Match by substring, same style as `protected_processes()`.
+/// Infrastructure processes: stateful services whose freeze/kill would cascade
+/// to dependent processes (data loss, broken connections, orphaned containers).
+/// Unconditionally protected — same as `protected_processes()` but for dev infra.
+pub fn infrastructure_processes() -> HashSet<&'static str> {
     [
-        // Containers / VMs
+        // Containers / VMs — freezing kills all containers inside
         "podman",
         "qemu-system",
         "colima",
@@ -151,25 +152,111 @@ pub fn critical_background_processes() -> HashSet<&'static str> {
         "com.docker",
         "vpnkit",
         "hyperkit",
-        // Databases / caches
+        // Databases / caches — freezing causes data corruption or client timeouts
         "postgres",
         "mysqld",
         "mariadbd",
         "redis-server",
         "mongod",
-        // Queues / streaming
+        // Queues / streaming — freezing loses in-flight messages
         "kafka",
         "zookeeper",
         "rabbitmq",
-        // Common dev runtimes / servers
-        "node",
-        "python",
-        "java",
-        "go",
-        "nginx",
     ]
     .into_iter()
     .collect()
+}
+
+/// Dev runtime patterns: processes that MAY be doing useful work (web server,
+/// build tool, etc.) or MAY be abandoned zombies (forgotten script leaking 6GB).
+///
+/// Unlike infrastructure, these earn protection dynamically through behavioral
+/// signals — not by name alone. See `behavioral_protection_score()`.
+pub fn dev_runtime_patterns() -> HashSet<&'static str> {
+    ["node", "python", "java", "go", "nginx"]
+        .into_iter()
+        .collect()
+}
+
+/// Backward-compatible: returns infrastructure ∪ dev_runtime patterns.
+/// Callers that need the behavioral gate should use the split functions instead.
+pub fn critical_background_processes() -> HashSet<&'static str> {
+    let mut all = infrastructure_processes();
+    all.extend(dev_runtime_patterns());
+    all
+}
+
+/// Behavioral protection score: measures a process's demonstrated resource
+/// demand relative to its memory cost.
+///
+/// Based on three principles:
+/// - **Android LMK**: protection earned by activity, not name. A dormant process
+///   loses its dev-workload exemption regardless of binary name.
+/// - **TMO (Facebook, ASPLOS'22)**: reclaim aggressiveness proportional to memory
+///   pressure. The returned score is compared against system pressure — as pressure
+///   rises, the activity bar for maintaining protection rises with it.
+/// - **DAMOS (SeongJae Park, arXiv:2303.05919)**: actions decided by access pattern,
+///   not identity. CPU, IPC, network, and recency are all access-pattern signals.
+///
+/// Returns [0.0, 1.0]. Compare against `system_pressure` to decide protection:
+///   score >= pressure → protected (process justifies its memory usage)
+///   score <  pressure → unprotected (memory cost exceeds demonstrated demand)
+///
+/// At pressure 0.3 (calm): almost everything stays protected.
+/// At pressure 0.7 (stressed): only active processes survive.
+pub fn behavioral_protection_score(
+    cpu_pct: f32,
+    wakeups_per_sec: f32,
+    has_network: bool,
+    has_gui_window: bool,
+    secs_idle: u64,
+    rss_bytes: u64,
+    total_ram_bytes: u64,
+) -> f64 {
+    // ── Activity signals ────────────────────────────────────────────────
+    // Each measures a different dimension of "this process is alive."
+    // Binary max() aggregation: ANY sign of life = active (Android LMK model).
+    // No weights — a web server with 0 CPU but active network is just as alive
+    // as a compute job with high CPU but no network.
+
+    // CPU: kernel-measured user+system time. Nonzero = executing code.
+    let cpu_signal = if cpu_pct > 0.5 { 1.0 } else { cpu_pct as f64 / 0.5 };
+
+    // IPC: Mach message wakeups. Nonzero = receiving requests / responding.
+    let ipc_signal = if wakeups_per_sec > 1.0 {
+        1.0
+    } else {
+        wakeups_per_sec as f64
+    };
+
+    // Network: active sockets. Boolean, strongest signal for servers.
+    let net_signal = if has_network { 1.0 } else { 0.0 };
+
+    // GUI: visible window. User can see it → protected.
+    let gui_signal = if has_gui_window { 1.0 } else { 0.0 };
+
+    // Recency: exponential decay over 10 minutes (600s).
+    // At 0s → 1.0, at 300s → 0.61, at 600s → 0.37, at 1200s → 0.14.
+    // e^(-t/600) is the natural decay — no threshold, just diminishing relevance.
+    let recency_signal = (-1.0 * secs_idle as f64 / 600.0).exp();
+
+    // Aggregate: max of all (any sign of life suffices).
+    let activity = cpu_signal
+        .max(ipc_signal)
+        .max(net_signal)
+        .max(gui_signal)
+        .max(recency_signal);
+
+    // ── Memory cost (TMO model) ─────────────────────────────────────────
+    // A process consuming 80% of RAM needs much stronger activity signals
+    // than one consuming 1%. Square root gives sub-linear penalty (Borg model:
+    // 4× memory → 2× activity needed, not 4×).
+    let mem_fraction = (rss_bytes as f64 / total_ram_bytes.max(1) as f64).max(0.001);
+    let cost = mem_fraction.sqrt();
+
+    // ── Final score ─────────────────────────────────────────────────────
+    // Clamp to [0, 1]. Compare against system_pressure for the protection gate.
+    (activity / cost).min(1.0)
 }
 
 pub fn enforce_limits(actions: Vec<RootAction>, policy: &SafetyPolicy) -> Vec<RootAction> {
@@ -294,4 +381,114 @@ pub fn pattern_conflicts_with_protected(pattern: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RAM_8GB: u64 = 8 * 1024 * 1024 * 1024;
+
+    // ── List split tests ────────────────────────────────────────────────
+
+    #[test]
+    fn infrastructure_has_stateful_services() {
+        let infra = infrastructure_processes();
+        for name in &["docker", "postgres", "redis-server", "kafka", "qemu-system"] {
+            assert!(infra.contains(name), "'{}' must be in infrastructure", name);
+        }
+    }
+
+    #[test]
+    fn dev_runtimes_not_in_infrastructure() {
+        let infra = infrastructure_processes();
+        for name in &["python", "node", "java", "go", "nginx"] {
+            assert!(!infra.contains(name), "'{}' must NOT be in infrastructure", name);
+        }
+    }
+
+    #[test]
+    fn dev_runtimes_in_own_set() {
+        let runtimes = dev_runtime_patterns();
+        for name in &["python", "node", "java", "go", "nginx"] {
+            assert!(runtimes.contains(name), "'{}' must be in dev_runtime_patterns", name);
+        }
+    }
+
+    #[test]
+    fn backward_compat_union_has_all() {
+        let all = critical_background_processes();
+        let infra = infrastructure_processes();
+        let runtimes = dev_runtime_patterns();
+        for p in infra.iter().chain(runtimes.iter()) {
+            assert!(all.contains(p), "'{}' must be in backward-compat union", p);
+        }
+    }
+
+    // ── Behavioral protection score tests ───────────────────────────────
+
+    #[test]
+    fn active_server_gets_high_score() {
+        // Python web server: network active, some CPU, recent interaction
+        let score = behavioral_protection_score(5.0, 10.0, true, false, 30, 200_000_000, RAM_8GB);
+        assert!(score > 0.8, "active server should have high score: {}", score);
+    }
+
+    #[test]
+    fn dormant_zombie_gets_low_score() {
+        // Abandoned Python script: 0 CPU, 0 wakeups, no network, idle 4 hours, 6.8GB RSS
+        let score = behavioral_protection_score(
+            0.0, 0.0, false, false, 14400, 6_800_000_000, RAM_8GB,
+        );
+        assert!(score < 0.1, "6.8GB dormant zombie should have near-zero score: {}", score);
+    }
+
+    #[test]
+    fn small_idle_process_gets_moderate_score() {
+        // Small background Python (50MB): idle but cheap to protect
+        let score = behavioral_protection_score(0.0, 0.0, false, false, 600, 50_000_000, RAM_8GB);
+        // Small cost → even dormant process has moderate score because cost is tiny
+        assert!(score > 0.3, "small idle process should have moderate score: {}", score);
+    }
+
+    #[test]
+    fn pressure_gate_protects_active_drops_dormant() {
+        let active_score = behavioral_protection_score(
+            3.0, 5.0, true, false, 60, 500_000_000, RAM_8GB,
+        );
+        let dormant_score = behavioral_protection_score(
+            0.0, 0.0, false, false, 7200, 6_800_000_000, RAM_8GB,
+        );
+        let pressure = 0.67; // typical stressed system
+
+        assert!(
+            active_score >= pressure,
+            "active process should survive at pressure {}: score={}",
+            pressure, active_score
+        );
+        assert!(
+            dormant_score < pressure,
+            "dormant hog should lose protection at pressure {}: score={}",
+            pressure, dormant_score
+        );
+    }
+
+    #[test]
+    fn score_scales_with_memory_cost() {
+        // Same activity, different RSS — bigger process needs more activity
+        let small = behavioral_protection_score(0.0, 0.5, false, false, 300, 100_000_000, RAM_8GB);
+        let big = behavioral_protection_score(0.0, 0.5, false, false, 300, 4_000_000_000, RAM_8GB);
+        assert!(
+            small > big,
+            "smaller process should have higher score at same activity: small={} big={}",
+            small, big
+        );
+    }
+
+    #[test]
+    fn gui_process_always_protected() {
+        // Process with a visible window — always active regardless of other signals
+        let score = behavioral_protection_score(0.0, 0.0, false, true, 3600, 1_000_000_000, RAM_8GB);
+        assert!(score > 0.7, "GUI process should be well-protected: {}", score);
+    }
 }

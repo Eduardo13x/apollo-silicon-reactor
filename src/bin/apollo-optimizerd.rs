@@ -75,7 +75,8 @@ use apollo_optimizer::engine::profile_governor::{
 };
 use apollo_optimizer::engine::protocol::{DaemonRequest, DaemonResponse};
 use apollo_optimizer::engine::safety::{
-    critical_background_processes, enforce_limits_with_budget, pattern_conflicts_with_protected,
+    behavioral_protection_score, critical_background_processes, dev_runtime_patterns,
+    enforce_limits_with_budget, infrastructure_processes, pattern_conflicts_with_protected,
     protected_processes,
 };
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
@@ -4813,27 +4814,59 @@ fn main() -> anyhow::Result<()> {
                     )
                 };
 
-                // Build critical_pids set for heuristic merge (same logic as decide_actions)
+                // Build critical_pids set for heuristic merge.
+                //
+                // Infrastructure (docker, postgres, redis) → always protected.
+                // Dev runtimes (python, node, java, go, nginx) → protected only
+                // when behaviorally active (Android LMK + TMO ASPLOS'22 model).
+                // Score compared against system pressure: as memory stress rises,
+                // only truly active dev runtimes keep their exemption.
                 let heuristic_critical_pids: HashSet<u32> = {
                     let sys = collector.system();
-                    let critical_pats = critical_background_processes();
+                    let infra_pats = infrastructure_processes();
+                    let runtime_pats = dev_runtime_patterns();
                     let protected_pats = protected_processes();
-                    // Incluir los protected_patterns de la policy aprendida —
-                    // sin esto, procesos como com.apple.DriverKit-AppleBCMWLAN
-                    // son throttleados por WakeStormDetector aunque estén protegidos.
                     let policy_protected = state
                         .learned_policy
                         .lock_recover()
                         .protected_patterns
                         .clone();
+                    let pressure = signal_digest.pressure_smooth;
+                    let total_ram = apollo_optimizer::engine::sysctl_direct::read_u64("hw.memsize")
+                        .unwrap_or(8 * 1024 * 1024 * 1024);
                     let mut cpids: HashSet<u32> = HashSet::new();
                     for (pid, process) in sys.processes() {
                         let name = process.name().to_string();
-                        if critical_pats.iter().any(|p| name.contains(p))
-                            || protected_pats.iter().any(|p| name.contains(p))
+                        // Always-protected: system essentials + infrastructure + learned
+                        if protected_pats.iter().any(|p| name.contains(p))
+                            || infra_pats.iter().any(|p| name.contains(p))
                             || policy_protected.iter().any(|p| name.contains(p.as_str()))
                         {
                             cpids.insert(pid.as_u32());
+                            continue;
+                        }
+                        // Dev runtimes: behavioral gate — protection earned, not given.
+                        if runtime_pats.iter().any(|p| name.contains(p)) {
+                            // Find this process in proc_snaps for behavioral signals.
+                            let pid_u32 = pid.as_u32();
+                            if let Some(snap) = proc_snaps.iter().find(|s| s.pid == pid_u32) {
+                                let score = behavioral_protection_score(
+                                    snap.cpu_percent,
+                                    snap.wakeups_per_sec,
+                                    snap.has_network,
+                                    snap.has_gui_window,
+                                    snap.secs_since_user_interaction,
+                                    snap.rss_bytes,
+                                    total_ram,
+                                );
+                                if score >= pressure as f64 {
+                                    cpids.insert(pid_u32);
+                                }
+                                // else: dormant runtime loses protection, governor decides
+                            } else {
+                                // Not in proc_snaps (ephemeral?) → protect conservatively
+                                cpids.insert(pid.as_u32());
+                            }
                         }
                     }
                     // AMX/ML workloads: never throttle/freeze ML inference processes.
