@@ -563,10 +563,9 @@ fn calibrate_config_for_hardware(hw: &SiliconInfo) -> GovernorConfig {
     }
     // M1/M2 base (8 cores) — usa defaults (0.20/0.05)
 
-    // Con poca RAM (8GB), congelar un poco más agresivo para evitar swap.
+    // Con poca RAM (8GB), lower waste threshold to act sooner on bloat.
     if ram_gb <= 8 {
-        cfg.freeze_utility_threshold = cfg.freeze_utility_threshold.max(0.07);
-        cfg.waste_override_threshold = 0.85;
+        cfg.waste_override_threshold = 0.80;
     }
 
     cfg
