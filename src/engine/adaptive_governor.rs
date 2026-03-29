@@ -11,7 +11,7 @@ use crate::engine::{
     hw_bayes::HwFeatures,
     llm::LearnedPolicy,
     process_classifier::{score_utility, ProcessClassifier, ProcessSnapshot, ProcessTier},
-    silicon_probe::{fast_entropy, SiliconInfo},
+    silicon_probe::SiliconInfo,
     user_profile::{UserProfile, WorkloadType},
     workload_classifier::{WorkloadClassification, WorkloadClassifier},
     zombie_hunter::{HuntSnapshot, ZombieAction, ZombieHunter},
@@ -445,69 +445,24 @@ impl AdaptiveGovernor {
             };
         }
 
-        // Normal utility-based decision with stochastic tie-breaking.
-        //
-        // Cuando varios procesos caen exactamente en la zona gris alrededor de un
-        // threshold (utility ≈ threshold ± GRAY_ZONE), Apollo sin entropía los actuaría
-        // a TODOS en el mismo ciclo → stutter visible o thundering herd de wakeups.
-        //
-        // fast_entropy(pid) usa cntvct_el0 + xorshift64 (~3 ns, sin syscall) para
-        // distribuir esas decisiones en ciclos sucesivos sin introducir ningún estado.
-        const GRAY_ZONE: f32 = 0.02;
-
-        let near_freeze =
-            (adjusted_utility - self.config.freeze_utility_threshold).abs() < GRAY_ZONE;
-        let near_throttle =
-            (adjusted_utility - self.config.throttle_utility_threshold).abs() < GRAY_ZONE;
-
+        // Normal utility-based decision.
         let (decision, reason) = if adjusted_utility < self.config.freeze_utility_threshold
             && self.is_heavy_workload(workload)
         {
-            if near_freeze {
-                // Gray zone: stagger freeze/throttle con entropía para evitar herd
-                let d = if fast_entropy(snap.pid as u64) % 2 == 0 {
-                    GovernorDecision::Freeze
-                } else {
-                    GovernorDecision::Throttle
-                };
-                let r = format!(
-                    "utility={:.2} waste={:.2} workload={:?} (gray-zone entropy)",
-                    adjusted_utility, waste, workload
-                );
-                (d, r)
-            } else {
-                let r = format!(
-                    "utility={:.2} waste={:.2} workload={:?}",
-                    adjusted_utility, waste, workload
-                );
-                (GovernorDecision::Freeze, r)
-            }
+            (
+                GovernorDecision::Freeze,
+                format!("utility={:.2} waste={:.2} workload={:?}", adjusted_utility, waste, workload),
+            )
         } else if adjusted_utility < self.config.throttle_utility_threshold {
-            if near_throttle {
-                // Gray zone: stagger throttle/allow
-                let d = if fast_entropy(snap.pid as u64) % 2 == 0 {
-                    GovernorDecision::Throttle
-                } else {
-                    GovernorDecision::Allow
-                };
-                let r = format!(
-                    "utility={:.2} waste={:.2} workload={:?} (gray-zone entropy)",
-                    adjusted_utility, waste, workload
-                );
-                (d, r)
-            } else {
-                let r = format!(
-                    "utility={:.2} waste={:.2} workload={:?}",
-                    adjusted_utility, waste, workload
-                );
-                (GovernorDecision::Throttle, r)
-            }
+            (
+                GovernorDecision::Throttle,
+                format!("utility={:.2} waste={:.2} workload={:?}", adjusted_utility, waste, workload),
+            )
         } else {
-            let r = format!(
-                "utility={:.2} waste={:.2} workload={:?}",
-                adjusted_utility, waste, workload
-            );
-            (GovernorDecision::Allow, r)
+            (
+                GovernorDecision::Allow,
+                format!("utility={:.2} waste={:.2} workload={:?}", adjusted_utility, waste, workload),
+            )
         };
 
         ProcessDecision {
