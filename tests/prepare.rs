@@ -438,4 +438,112 @@ mod scenarios {
             "Network daemon should have higher utility than silent idle"
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CATEGORY 9: BOSS SCENARIOS — EXPERT-LEVEL DECISIONS
+    // These test intelligence that goes beyond basic classification.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// BOSS 1: LLM on-device awareness.
+    /// ollama: 4GB RSS, ZERO CPU, no GUI, idle 2h. The SilentDaemon idle
+    /// override will throttle it. But throttling a loaded LLM model is wrong —
+    /// model reload from disk takes 30+ seconds. Must be ALLOWED.
+    /// Requires: name-based LLM recognition or RSS-cost-aware protection.
+    #[test]
+    fn s21_llm_process_protected_despite_high_rss() {
+        let s = snap(2100, "ollama", 0.0, 4096, false, 7200, 7200);
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "ollama");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "LLM process (4GB loaded model) must be ALLOWED — reload cost is 30s+. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 2: Active I/O work protection.
+    /// backupd: 12% CPU, 600MB RSS, 60 wakeups/s, no GUI, idle forever.
+    /// The graduated waste override catches it (waste>0.5, utility<0.40).
+    /// But 80k pageins = real disk I/O work, not waste. Must be ALLOWED.
+    /// Requires: pageins as a "legitimate work" signal.
+    #[test]
+    fn s22_backup_process_protected_during_active_io() {
+        let mut s = snap(2200, "backupd", 12.0, 600, false, 9999, 9999);
+        s.pageins_total = 80000;
+        s.wakeups_per_sec = 60.0;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "backupd");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Active backup (80k pageins) must be ALLOWED — freezing corrupts data. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 3: IPC-serving daemon (WaitGraph).
+    /// trustd: 0% CPU, no GUI, idle 2h, 1 wakeup/s. Hits the SilentDaemon
+    /// idle override → Throttle. But 120 Mach ports = critical IPC hub.
+    /// Throttling it beachballs Chrome, Safari, Mail (all need TLS).
+    /// Requires: mach_port_count as a protection signal.
+    #[test]
+    fn s23_ipc_serving_daemon_not_frozen() {
+        let mut s = snap(2300, "trustd", 0.0, 40, false, 7200, 7200);
+        s.mach_port_count = 120;
+        s.wakeups_per_sec = 1.0; // Just enough to NOT be Stale
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "trustd");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "IPC hub (120 Mach ports) must be ALLOWED — throttle causes system beachballs. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 4: Compiler without build context.
+    /// rustc: 95% CPU, 1.5GB RSS, 55 wakeups, no GUI, idle forever.
+    /// No cargo in the process list = no workload hint from classifier.
+    /// Pure waste case. But the NAME "rustc" means it's a compiler.
+    /// Requires: compiler name recognition independent of workload context.
+    #[test]
+    fn s24_compiler_protected_during_build() {
+        let mut rustc = snap(2400, "rustc", 95.0, 1500, false, 9999, 9999);
+        rustc.wakeups_per_sec = 55.0;
+        // No cargo in the list — workload classifier won't detect Coding mode
+        let snaps = vec![rustc];
+        let results = decide(&snaps, None);
+        let d_rustc = find_decision(&results, "rustc");
+        assert_eq!(
+            d_rustc,
+            GovernorDecision::Allow,
+            "Compiler (rustc) must NEVER be throttled even without build context. Got {:?}",
+            d_rustc
+        );
+    }
+
+    /// BOSS 5: Long-running encode protection.
+    /// ffmpeg: 85% CPU, 1GB RSS, 55 wakeups, no GUI, idle 2h.
+    /// RSS penalty + waste override → Throttle. But 200k pageins + known
+    /// encoder name = user-initiated long task. Must be ALLOWED.
+    /// Requires: encoder recognition or pageins-as-work signal.
+    #[test]
+    fn s25_render_process_not_frozen() {
+        let mut s = snap(2500, "ffmpeg", 85.0, 1024, false, 7200, 7200);
+        s.wakeups_per_sec = 55.0;
+        s.pageins_total = 200000;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "ffmpeg");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Encoder (ffmpeg, 200k pageins) must be ALLOWED — user-initiated task. Got {:?}",
+            d
+        );
+    }
 }
