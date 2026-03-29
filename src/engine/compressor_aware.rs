@@ -556,7 +556,12 @@ pub fn decide_enhanced(
     // Temperature-aware paths.
     if let Some(t) = temp {
         // Mostly compressed: freeze would cause swap (compressor pages move to disk).
-        if t.pct_compressed > 0.60 {
+        // Exception: if the process has a huge footprint (>1GB) and system pressure
+        // is high, freeze anyway — the memory it hogs causes more swap than the
+        // freeze itself. This catches zombie processes like a 6.8GB Python sitting
+        // in swap doing nothing.
+        let is_memory_hog = profile.phys_footprint > 1024 * 1024 * 1024 && system_pressure > 0.50;
+        if t.pct_compressed > 0.60 && !is_memory_hog {
             return MemoryAction::Skip;
         }
         // Actively hot: process is using its pages right now. Hint is gentler.
@@ -703,6 +708,36 @@ mod tests {
             sample_count: 8,
         };
         let action = decide_enhanced(&profile, Some(&temp), None, 10, 0.50, 0.0);
+        assert_eq!(action, MemoryAction::Skip);
+    }
+
+    #[test]
+    fn decide_compressed_hog_overrides_skip() {
+        // >1GB footprint + high pressure → should NOT skip even if mostly compressed.
+        // This catches zombie processes like a 6.8GB Python sitting in swap.
+        let profile = test_profile(2_000_000_000, 1_500_000_000);
+        let temp = TempProfile {
+            pct_hot: 0.05,
+            pct_dram: 0.15,
+            pct_compressed: 0.80,
+            sample_count: 8,
+        };
+        let action = decide_enhanced(&profile, Some(&temp), None, 10, 0.60, 0.0);
+        // Should fall through to legacy instead of Skip.
+        assert_ne!(action, MemoryAction::Skip, "memory hog should not be skipped");
+    }
+
+    #[test]
+    fn decide_compressed_small_process_still_skips() {
+        // <1GB footprint with high compression → normal Skip behavior preserved.
+        let profile = test_profile(500_000_000, 300_000_000);
+        let temp = TempProfile {
+            pct_hot: 0.10,
+            pct_dram: 0.20,
+            pct_compressed: 0.70,
+            sample_count: 8,
+        };
+        let action = decide_enhanced(&profile, Some(&temp), None, 10, 0.60, 0.0);
         assert_eq!(action, MemoryAction::Skip);
     }
 
