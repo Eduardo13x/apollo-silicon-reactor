@@ -890,4 +890,116 @@ mod scenarios {
             d
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CATEGORY 13: BOSS LEVEL 4 — CONTEXTUAL INTELLIGENCE
+    // These require understanding process relationships and system context.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// BOSS 21: Foreground app's invisible helper swarm.
+    /// Safari is foreground. It has 8 "com.apple.WebKit" helpers with no GUI.
+    /// Each helper has moderate CPU and RSS. They look like SilentDaemons but
+    /// they ARE Safari. In a 50-process swarm, swarm throttle must NOT catch them.
+    #[test]
+    fn s41_fg_app_helpers_immune_to_swarm() {
+        let mut snaps: Vec<ProcessSnapshot> = (0..40)
+            .map(|i| snap(4100 + i, &format!("bg_{}", i), 0.5, 30, false, 3600, 3600))
+            .collect();
+        // Safari foreground
+        let safari = snap(4150, "Safari", 5.0, 600, true, 2, 2);
+        snaps.push(safari);
+        // 8 WebKit helpers — no GUI, moderate stats
+        for i in 0..8 {
+            let mut helper = snap(4160 + i, "com.apple.WebKit.WebContent", 8.0, 200, false, 9999, 9999);
+            helper.wakeups_per_sec = 30.0;
+            snaps.push(helper);
+        }
+        let results = decide(&snaps, Some("Safari"));
+        // ALL WebKit helpers should be allowed (they're serving the foreground app)
+        let helper_decisions: Vec<_> = results.iter()
+            .filter(|(name, _)| name == "com.apple.WebKit.WebContent")
+            .map(|(_, d)| *d)
+            .collect();
+        assert!(
+            helper_decisions.iter().all(|d| *d == GovernorDecision::Allow),
+            "WebKit helpers of foreground Safari must ALL be allowed in swarm. Got {:?}",
+            helper_decisions
+        );
+    }
+
+    /// BOSS 22: Stale LLM — an ollama process with 0% CPU, idle 24h.
+    /// Even though it's an LLM, 24 hours idle means the user has forgotten
+    /// about it. At some point, the reload cost is worth paying. Throttle it.
+    #[test]
+    fn s42_very_stale_llm_eventually_throttled() {
+        let s = snap(4200, "ollama", 0.0, 4096, false, 86400, 86400);
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "ollama");
+        assert!(
+            d == GovernorDecision::Throttle || d == GovernorDecision::Freeze,
+            "LLM idle 24h should eventually be throttled — user forgot about it. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 23: GPU compute process (Metal shader compilation).
+    /// A process doing GPU work appears as low CPU (GPU work doesn't show in
+    /// CPU%) but high RSS and many faults. Must not be frozen.
+    #[test]
+    fn s43_gpu_compute_not_frozen() {
+        let mut s = snap(4300, "MTLCompilerService", 2.0, 800, false, 60, 60);
+        s.faults_total = 500000; // Many page faults from GPU buffer mapping
+        s.mach_port_count = 40;
+        s.wakeups_per_sec = 50.0;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "MTLCompilerService");
+        assert!(
+            d == GovernorDecision::Allow || d == GovernorDecision::Throttle,
+            "GPU compute (Metal shader) must not be frozen — GPU stall. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 24: Cascading dependency — Spotlight depends on trustd depends on mDNSResponder.
+    /// If mDNSResponder is throttled, DNS breaks → trustd stalls → Spotlight hangs.
+    /// mDNSResponder has few Mach ports (30) and low CPU. Must be ALLOWED.
+    #[test]
+    fn s44_mdns_responder_always_allowed() {
+        let mut s = snap(4400, "mDNSResponder", 0.5, 20, false, 9999, 9999);
+        s.has_network = true;
+        s.mach_port_count = 30;
+        s.wakeups_per_sec = 5.0;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "mDNSResponder");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "mDNSResponder must ALWAYS be allowed — DNS is critical infrastructure. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 25: Diminishing returns — two idle daemons with different RSS.
+    /// small_daemon: 50MB idle. big_daemon: 2GB idle. Both SilentDaemons.
+    /// The big one should be acted on MORE aggressively (more memory to reclaim).
+    #[test]
+    fn s45_bigger_daemon_more_aggressive() {
+        let mut small = snap(4500, "small_daemon", 0.0, 50, false, 7200, 7200);
+        small.wakeups_per_sec = 1.0;
+        let mut big = snap(4501, "big_daemon", 0.0, 2048, false, 7200, 7200);
+        big.wakeups_per_sec = 1.0;
+        let snaps = vec![small, big];
+        let results = decide(&snaps, None);
+        let d_small = find_decision(&results, "small_daemon");
+        let d_big = find_decision(&results, "big_daemon");
+        assert!(
+            d_big as u8 >= d_small as u8,
+            "Bigger idle daemon should get >= aggressive treatment. \
+             Got small={:?}, big={:?}",
+            d_small, d_big
+        );
+    }
 }
