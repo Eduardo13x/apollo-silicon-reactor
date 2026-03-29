@@ -189,7 +189,7 @@ impl AdaptiveGovernor {
             }
 
             let utility = score_utility(snap);
-            let decision = self.decide_one(snap, *tier, utility, *waste, workload);
+            let decision = self.decide_one(snap, *tier, utility, *waste, workload, classified.len());
             decisions.push(decision);
         }
 
@@ -223,6 +223,7 @@ impl AdaptiveGovernor {
         utility: f32,
         waste: f32,
         workload: WorkloadType,
+        process_count: usize,
     ) -> ProcessDecision {
         // Essential — never touch
         if tier == ProcessTier::SystemEssential || tier == ProcessTier::ActiveForeground {
@@ -451,13 +452,33 @@ impl AdaptiveGovernor {
             };
         }
 
+        // Swarm pressure: when many processes are competing (>30), lower the
+        // bar for waste-based throttling. With 50+ daemons, even mildly wasteful
+        // ones degrade foreground responsiveness.
+        if process_count > 30 && waste >= 0.30 && adjusted_utility < 0.55 && !snap.has_gui_window {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Throttle,
+                tier,
+                utility_score: adjusted_utility,
+                waste_score: waste,
+                reason: format!(
+                    "Swarm throttle ({} procs, waste={:.2}, util={:.2})",
+                    process_count, waste, adjusted_utility
+                ),
+            };
+        }
+
+        let throttle_thresh = self.config.throttle_utility_threshold;
+
         // Normal utility-based decision.
         let (decision, reason) = if adjusted_utility < self.config.freeze_utility_threshold {
             (
                 GovernorDecision::Freeze,
                 format!("utility={:.2} waste={:.2} workload={:?}", adjusted_utility, waste, workload),
             )
-        } else if adjusted_utility < self.config.throttle_utility_threshold {
+        } else if adjusted_utility < throttle_thresh {
             (
                 GovernorDecision::Throttle,
                 format!("utility={:.2} waste={:.2} workload={:?}", adjusted_utility, waste, workload),
