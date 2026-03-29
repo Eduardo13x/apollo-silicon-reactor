@@ -1207,4 +1207,132 @@ mod scenarios {
             d
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CATEGORY 16: BOSS LEVEL 7 — UI FLUIDITY & RENDER PIPELINE
+    // Target: 90-120 FPS consistency. The governor must protect the entire
+    // render pipeline — not just the foreground app, but visible background
+    // apps, compositor helpers, and GPU-bound processes that feed frames to
+    // WindowServer. Throttling ANY of these causes dropped frames / jank.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// BOSS 36: Visible background app must NOT be throttled during swarm.
+    /// Stage Manager shows multiple windows. A visible music player (GUI,
+    /// last interaction 120s ago) with moderate waste in a 40-process swarm
+    /// should NEVER be throttled — the user can see frame drops.
+    #[test]
+    fn s56_visible_bg_app_immune_to_swarm() {
+        let mut snaps: Vec<ProcessSnapshot> = (0..38)
+            .map(|i| snap(5600 + i, &format!("bg_{}", i), 0.5, 30, false, 3600, 3600))
+            .collect();
+        // Visible music player: has GUI, last interaction 120s ago (not ActiveForeground)
+        snaps.push(snap(5650, "Spotify", 8.0, 400, true, 120, 120));
+        let results = decide(&snaps, Some("Safari"));
+        let d = find_decision(&results, "Spotify");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Visible GUI app must be immune to swarm throttle — dropped frames are visible. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 37: Render-pipeline daemon with high wakeups must be protected
+    /// when foreground app is active. coreaudiod/VDCAssistant/coreservicesd
+    /// feed the compositor. A wakeup-heavy render daemon (150/s, has_gui=false)
+    /// would be caught by the "wakeup energy hog" rule (>100/s). But if a
+    /// foreground app is active, this daemon is part of the render pipeline
+    /// and must be ALLOWED to maintain 120fps compositing.
+    #[test]
+    fn s57_render_daemon_protected_when_fg_active() {
+        let mut render_daemon = snap(5700, "VDCAssistant", 5.0, 80, false, 600, 600);
+        render_daemon.wakeups_per_sec = 150.0;
+        render_daemon.mach_port_count = 25; // IPC with WindowServer but below hub threshold
+        let fg_app = snap(5701, "Final Cut Pro", 30.0, 1200, true, 0, 0);
+        let snaps = vec![render_daemon, fg_app];
+        let results = decide(&snaps, Some("Final Cut Pro"));
+        let d = find_decision(&results, "VDCAssistant");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Render pipeline daemon must be protected when foreground needs frames. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 38: GPU worker with high faults and wakeups in a non-swarm context.
+    /// A Metal/OpenGL compositor helper doing 200 wakeups/s, 300K faults,
+    /// low CPU (GPU does the work), no GUI. The wakeup hog rule would throttle it.
+    /// But faults + wakeups together = active GPU render — must be ALLOWED.
+    #[test]
+    fn s58_gpu_compositor_high_wakeups_allowed() {
+        let mut gpu = snap(5800, "com.apple.gpu-helper", 2.0, 250, false, 300, 300);
+        gpu.wakeups_per_sec = 200.0;
+        gpu.faults_total = 300000;
+        let snaps = vec![gpu];
+        let results = decide(&snaps, Some("Safari"));
+        let d = find_decision(&results, "com.apple.gpu-helper");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "GPU compositor with high faults = active render work — wakeup hog rule must yield. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 39: Multiple visible apps during video call. User is on a Zoom
+    /// call with Keynote visible in Stage Manager. Both have GUI windows.
+    /// Under 35-process swarm pressure, Keynote (gui=true, idle 90s, 5% CPU)
+    /// must remain ALLOWED — the user is presenting and sees both windows.
+    #[test]
+    fn s59_presenting_visible_apps_protected() {
+        let mut snaps: Vec<ProcessSnapshot> = (0..33)
+            .map(|i| snap(5900 + i, &format!("bg_{}", i), 0.5, 30, false, 3600, 3600))
+            .collect();
+        snaps.push(snap(5950, "zoom.us", 15.0, 600, true, 0, 0));
+        snaps.push(snap(5951, "Keynote", 5.0, 350, true, 90, 90));
+        let results = decide(&snaps, Some("zoom.us"));
+        let d = find_decision(&results, "Keynote");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Visible Keynote during Zoom call must be ALLOWED — user sees both. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 40: Night mode must NOT throttle visible GUI apps. At 3AM, a
+    /// visible video player (VLC, gui=true, idle 600s, low utility) would be
+    /// caught by the night mode rule. But it has a GUI window — user may be
+    /// watching. Night mode must only throttle non-GUI background processes.
+    #[test]
+    fn s60_night_mode_spares_visible_gui() {
+        let vlc = snap(6000, "VLC", 4.0, 300, true, 600, 600);
+        let snaps = vec![vlc];
+        let results = decide_at_hour(&snaps, None, 3);
+        let d = find_decision(&results, "VLC");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "GUI app at 3AM must NOT be throttled by night mode — user may be watching. Got {:?}",
+            d
+        );
+    }
+
+    // ── Helper for night-mode tests ──────────────────────────────────────────
+
+    fn decide_at_hour(
+        snaps: &[ProcessSnapshot],
+        fg: Option<&str>,
+        hour: u8,
+    ) -> Vec<(String, GovernorDecision)> {
+        let mut gov = AdaptiveGovernor::new();
+        let hunts: Vec<HuntSnapshot> = Vec::new();
+        let names: Vec<&str> = snaps.iter().map(|s| s.name.as_str()).collect();
+        let decisions = gov.decide_all(snaps, &hunts, fg, &names, hour);
+        decisions
+            .into_iter()
+            .map(|d| (d.name, d.decision))
+            .collect()
+    }
 }

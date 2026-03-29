@@ -504,10 +504,19 @@ impl AdaptiveGovernor {
             };
         }
 
+        // Render pipeline exemption: processes with high faults (GPU buffer work)
+        // or known compositor daemons with an active foreground app are part of
+        // the frame delivery path. Throttling them causes visible jank / dropped frames.
+        let render_pipeline_exempt = snap.faults_total > 100000
+            || (foreground_app.is_some() && is_render_pipeline(&snap.name));
+
         // Waste override — graduated curve: higher waste tolerates less utility.
         // waste >= threshold (0.80 on 8GB, 0.90 default) → throttle if utility < 0.60
         // waste > 0.50 → throttle if utility < 0.40 (soft override, no GUI only)
-        let waste_triggered = if waste >= self.config.waste_override_threshold {
+        // Render pipeline processes are exempt — their "waste" is actually frame work.
+        let waste_triggered = if render_pipeline_exempt {
+            false
+        } else if waste >= self.config.waste_override_threshold {
             adjusted_utility < 0.6
         } else if waste > 0.5 && !snap.has_gui_window {
             adjusted_utility < 0.40
@@ -560,7 +569,8 @@ impl AdaptiveGovernor {
         // Wakeup energy hog: >100 wakeups/sec with no GUI forces the CPU out
         // of deep idle on every wakeup (P→E transition on M1). Even at low CPU%,
         // this destroys battery life. Throttle to reduce wakeup frequency.
-        if snap.wakeups_per_sec > 100.0 && !snap.has_gui_window && adjusted_utility < 0.50 {
+        // Render pipeline processes are exempt (computed above waste override).
+        if snap.wakeups_per_sec > 100.0 && !snap.has_gui_window && adjusted_utility < 0.50 && !render_pipeline_exempt {
             return ProcessDecision {
                 pid: snap.pid,
                 name: snap.name.clone(),
@@ -683,6 +693,19 @@ pub struct GovernorSummary {
     pub throttled: usize,
     pub frozen: usize,
     pub killed: usize,
+}
+
+/// Render-pipeline process names: these feed frames to WindowServer.
+/// Throttling them causes dropped frames even though they have no GUI window.
+fn is_render_pipeline(name: &str) -> bool {
+    const RENDER_NAMES: &[&str] = &[
+        "VDCAssistant",        // Video decode compositor
+        "coreservicesd",       // System UI compositing
+        "com.apple.gpu",       // GPU helper processes
+        "MTLCompilerService",  // Metal shader compilation
+        "mediaserverd",        // AV render pipeline
+    ];
+    RENDER_NAMES.iter().any(|r| name.contains(r))
 }
 
 /// Calibra los thresholds del governor según el hardware real del chip.
