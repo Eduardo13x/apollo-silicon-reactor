@@ -1,117 +1,38 @@
-//! Process Classifier — heuristic-based process categorization
+//! Process Classifier — heuristic-based process tier classification.
 //!
 //! Classifies every process into a tier without any LLM.
-//! Decision logic is a scored rule set:
-//!   score = utility_score / (resource_cost + 1)
-//! Low-score processes are throttle / kill candidates.
+//! Decision logic uses behavioral signals: CPU, RSS, wakeups, GUI presence, etc.
+//!
+//!   tier = classify(name, cpu, rss, wakeups, gui, network, uptime, ...)
+//!
+//! score_utility() maps a snapshot to a [0,1] utility score used by AdaptiveGovernor.
 
 use std::collections::HashSet;
 
-// ── Category ─────────────────────────────────────────────────────────────────
+// ── Tier ──────────────────────────────────────────────────────────────────────
 
-/// How a process relates to the user right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Priority tier for a process. Higher = more important = never throttle/freeze.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ProcessTier {
-    /// User is actively interacting (frontmost window, keyboard input).
-    ActiveForeground,
-    /// Opened by the user, not focused but recently used.
-    BackgroundVisible,
-    /// Helper / extension process for an app the user runs.
-    AppHelper,
-    /// System daemon that the user genuinely needs (launchd, coreaudio…).
+    /// System-critical (launchd, WindowServer, kernel helpers). Never touch.
     SystemEssential,
-    /// Background service with no visible user benefit.
+    /// The foreground app the user is actively using.
+    ActiveForeground,
+    /// Visible background app (e.g. music player, notification app).
+    BackgroundVisible,
+    /// Helper/renderer spawned by a foreground app (Chrome Helper, etc.).
+    AppHelper,
+    /// Background daemon with no GUI and low wakeup rate.
     SilentDaemon,
-    /// Process that has not been interacted with in >24 h.
+    /// Process that has been idle for a long time — freeze candidate.
     Stale,
-    /// Zombie (Z) or parent-dead orphan.
-    ZombieOrphan,
-    /// Apple / 3rd-party telemetry / analytics.
+    /// Telemetry / analytics process — always throttle.
     Telemetry,
+    /// Zombie or orphan — kill candidate.
+    ZombieOrphan,
 }
 
-// ── Known-process knowledge base ─────────────────────────────────────────────
-
-/// Processes that must never be touched.
-pub fn essential_process_names() -> HashSet<&'static str> {
-    [
-        // macOS kernel & core
-        "kernel_task",
-        "launchd",
-        "kextd",
-        "watchdogd",
-        "securityd",
-        "configd",
-        "notifyd",
-        "opendirectoryd",
-        "syslogd",
-        "diskarbitrationd",
-        "powerd",
-        "WindowServer",
-        // Audio / video pipeline
-        "coreaudiod",
-        "audioclocksyncd",
-        "avconferenced",
-        // Input
-        "hidd",
-        "bluetoothd",
-        // Network
-        "mDNSResponder",
-        "networkd",
-        "trustd",
-        "neagent",
-        // Our own daemon
-        "apollo-optimizerd",
-    ]
-    .iter()
-    .copied()
-    .collect()
-}
-
-/// Processes known to be telemetry / analytics — safe to throttle hard.
-pub fn telemetry_process_names() -> HashSet<&'static str> {
-    [
-        // Apple telemetry
-        "DiagnosticReportsTrigger",
-        "ReportPanic",
-        "spindump",
-        "SubmitDiagInfo",
-        "osanalyticshelper",
-        "CrashReporter",
-        "analyticsd",
-        "WirelessRadioManagerd",
-        // Common 3rd-party
-        "GoogleCrashHandler",
-        "GoogleUpdate",
-        "firefox-crash-reporter",
-        "SentinelStatsd",
-        "MacFUSEHelper",
-        "adobe_crash_reporter",
-        // Electron / CEF helpers that report telemetry
-        "Electron Helper (GPU)",
-        "Electron Helper (Renderer)",
-    ]
-    .iter()
-    .copied()
-    .collect()
-}
-
-/// Well-known "helper" suffixes / substrings — child processes of user apps.
-pub fn helper_name_patterns() -> &'static [&'static str] {
-    &[
-        " Helper",
-        " Helper (GPU)",
-        " Helper (Renderer)",
-        " Helper (Plugin)",
-        " Agent",
-        "Extension",
-        "Service",
-        "XPCService",
-        "BrokerExtension",
-    ]
-}
-
-// ── Scoring ───────────────────────────────────────────────────────────────────
+// ── ProcessSnapshot ───────────────────────────────────────────────────────────
 
 /// Lightweight snapshot of a process for classification.
 #[derive(Debug, Clone)]
@@ -121,80 +42,53 @@ pub struct ProcessSnapshot {
     pub cpu_percent: f32,
     pub rss_bytes: u64,
     pub is_zombie: bool,
-    /// Seconds since the process had a foreground window.
     pub secs_since_foreground: u64,
-    /// Seconds since user last interacted with any window of this app.
     pub secs_since_user_interaction: u64,
-    /// True if the process has any active network connections.
     pub has_network: bool,
-    /// True if there is any open GUI window.
     pub has_gui_window: bool,
-    /// Number of voluntary wakeups per second (Mach port messages received).
     pub wakeups_per_sec: f32,
-    /// Parent process is still alive.
     pub parent_alive: bool,
-    /// Seconds the process has been running. Used to skip ephemeral XPC
-    /// on-demand services that will exit on their own before any action
-    /// can be applied.
     pub process_uptime_secs: u64,
-    /// Total VM faults (major + minor) — cumulative counter from Mach task info.
     pub faults_total: u32,
-    /// Page-ins (major faults) — pages fetched from disk/swap/compressor.
-    /// This is the expensive signal: high rate = process is thrashing.
     pub pageins_total: u32,
-    /// True if running under Rosetta 2 binary translation (x86_64→ARM64).
-    /// Rosetta processes incur ~10-30% JIT overhead — freezing them first
-    /// under pressure recovers more real throughput than native ARM64 processes.
-    #[allow(dead_code)]
     pub is_translated: bool,
-    /// Number of Mach port rights held by this process.
-    /// >5000 indicates IPC flooding or port leak; 0 = not measured.
-    #[allow(dead_code)]
     pub mach_port_count: u32,
 }
 
-/// Score a process's "user utility" on a 0.0–1.0 scale.
-/// Higher = more useful / should not be throttled.
-pub fn score_utility(snap: &ProcessSnapshot) -> f32 {
-    if snap.is_zombie || !snap.parent_alive {
-        return 0.0;
-    }
+// ── Name lists ────────────────────────────────────────────────────────────────
 
-    let mut score: f32 = 0.0;
-
-    // Active interaction is the strongest signal
-    score += match snap.secs_since_user_interaction {
-        0..=30 => 1.0,
-        31..=300 => 0.7,
-        301..=3600 => 0.4,
-        3601..=86400 => 0.1,
-        _ => 0.0,
-    };
-
-    // GUI window visible
-    if snap.has_gui_window {
-        score += 0.3;
-    }
-
-    // Active network connections → el proceso está sirviendo trabajo real
-    // (daemons de red, sync, audio, etc. nunca tienen interacción de usuario)
-    if snap.has_network {
-        score += 0.25;
-    }
-
-    // Normalise to 0..1 (max raw = 1.0 + 0.3 + 0.25 = 1.55)
-    (score / 1.55).min(1.0)
+pub fn essential_process_names() -> HashSet<&'static str> {
+    [
+        "launchd", "kernel_task", "WindowServer", "loginwindow", "cfprefsd",
+        "UserEventAgent", "diskarbitrationd", "powerd", "configd", "notifyd",
+        "syslogd", "opendirectoryd", "coreaudiod", "bluetoothd", "airportd",
+        "mDNSResponder", "systemstats", "logd", "nsurlsessiond", "symptomsd",
+    ]
+    .iter()
+    .copied()
+    .collect()
 }
 
-/// Score a process's resource waste on a 0.0–1.0 scale.
-/// Higher = more wasteful.
-pub fn score_waste(snap: &ProcessSnapshot) -> f32 {
-    let cpu_waste = (snap.cpu_percent / 10.0).min(1.0); // 10 % CPU → max
-    let wakeup_waste = (snap.wakeups_per_sec / 50.0).min(1.0); // 50/s → max
-    ((cpu_waste + wakeup_waste) / 2.0).min(1.0)
+pub fn telemetry_process_names() -> HashSet<&'static str> {
+    [
+        "DiagnosticReporter", "CrashReporter", "ReportCrash", "SubmitDiagInfo",
+        "Siri", "SiriNCService", "parsec-fbf", "OSLogHelper",
+        "com.apple.telemetry", "EscrowSecurityAlert", "analyticsd",
+        "symptomsd", "rapportd",
+    ]
+    .iter()
+    .copied()
+    .collect()
 }
 
-// ── Classifier ────────────────────────────────────────────────────────────────
+pub fn helper_name_patterns() -> &'static [&'static str] {
+    &[
+        "Helper", "Renderer", "GPU Process", "Crashpad", "BraveSoftware Helper",
+        "Google Chrome Helper", "Electron Helper", "plugin-container",
+    ]
+}
+
+// ── ProcessClassifier ─────────────────────────────────────────────────────────
 
 pub struct ProcessClassifier {
     essential: HashSet<&'static str>,
@@ -209,62 +103,68 @@ impl ProcessClassifier {
         }
     }
 
-    /// Classify a single process snapshot deterministically.
-    pub fn classify(&self, snap: &ProcessSnapshot) -> ProcessTier {
-        // Hard rules first — order matters
-        if snap.is_zombie || !snap.parent_alive {
-            return ProcessTier::ZombieOrphan;
-        }
-        if self.essential.contains(snap.name.as_str()) {
-            return ProcessTier::SystemEssential;
-        }
-        if self.telemetry.contains(snap.name.as_str()) {
-            return ProcessTier::Telemetry;
-        }
-        if snap.secs_since_user_interaction == 0 {
-            return ProcessTier::ActiveForeground;
-        }
-        if snap.secs_since_user_interaction <= 300 && snap.has_gui_window {
-            return ProcessTier::BackgroundVisible;
-        }
-
-        // Heuristic rules
-        let is_helper = helper_name_patterns().iter().any(|p| snap.name.contains(p));
-
-        if snap.secs_since_user_interaction > 86400 {
-            return ProcessTier::Stale;
-        }
-        if is_helper {
-            return ProcessTier::AppHelper;
-        }
-        if !snap.has_gui_window && !snap.has_network && snap.wakeups_per_sec > 5.0 {
-            return ProcessTier::SilentDaemon;
-        }
-
-        // Default
-        ProcessTier::SilentDaemon
-    }
-
-    /// Classify many processes and return sorted by descending waste score.
-    pub fn classify_all(
+    /// Classify all snapshots. Returns (snap, tier, waste_score) triples.
+    pub fn classify_all<'a>(
         &self,
-        snaps: &[ProcessSnapshot],
-    ) -> Vec<(ProcessSnapshot, ProcessTier, f32)> {
-        let mut results: Vec<(ProcessSnapshot, ProcessTier, f32)> = snaps
+        snaps: &'a [ProcessSnapshot],
+    ) -> Vec<(&'a ProcessSnapshot, ProcessTier, f32)> {
+        snaps
             .iter()
             .map(|s| {
                 let tier = self.classify(s);
-                let waste = score_waste(s);
-                (s.clone(), tier, waste)
+                let waste = waste_score(s, tier);
+                (s, tier, waste)
             })
-            .collect();
-
-        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-
-        results
+            .collect()
     }
 
-    /// Return only processes that are safe throttle/kill candidates.
+    pub fn classify(&self, snap: &ProcessSnapshot) -> ProcessTier {
+        // Zombie / orphan
+        if snap.is_zombie || (!snap.parent_alive && snap.pid > 1) {
+            return ProcessTier::ZombieOrphan;
+        }
+
+        // System essential
+        if self.essential.contains(snap.name.as_str()) {
+            return ProcessTier::SystemEssential;
+        }
+
+        // Telemetry
+        if self.telemetry.contains(snap.name.as_str()) {
+            return ProcessTier::Telemetry;
+        }
+        for pat in helper_name_patterns() {
+            if snap.name.contains(pat) {
+                return if snap.has_gui_window {
+                    ProcessTier::AppHelper
+                } else {
+                    ProcessTier::SilentDaemon
+                };
+            }
+        }
+
+        // Foreground
+        if snap.has_gui_window && snap.secs_since_user_interaction < 30 {
+            return ProcessTier::ActiveForeground;
+        }
+
+        // Background visible
+        if snap.has_gui_window {
+            return ProcessTier::BackgroundVisible;
+        }
+
+        // Stale: no GUI, low CPU, long idle
+        if snap.cpu_percent < 0.5
+            && snap.wakeups_per_sec < 1.0
+            && snap.secs_since_foreground > 300
+        {
+            return ProcessTier::Stale;
+        }
+
+        ProcessTier::SilentDaemon
+    }
+
+    /// Return processes that are candidates for throttling (non-essential, non-foreground).
     pub fn throttle_candidates<'a>(
         &self,
         snaps: &'a [ProcessSnapshot],
@@ -275,9 +175,9 @@ impl ProcessClassifier {
                 let tier = self.classify(s);
                 matches!(
                     tier,
-                    ProcessTier::Stale
+                    ProcessTier::Telemetry
+                        | ProcessTier::Stale
                         | ProcessTier::SilentDaemon
-                        | ProcessTier::Telemetry
                         | ProcessTier::ZombieOrphan
                 )
             })
@@ -288,5 +188,198 @@ impl ProcessClassifier {
 impl Default for ProcessClassifier {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Scoring ───────────────────────────────────────────────────────────────────
+
+/// Waste score [0,1] for a process standalone — high CPU + wakeups = wasteful.
+/// Used by external callers that don't have the tier yet.
+pub fn score_waste(snap: &ProcessSnapshot) -> f32 {
+    let mut w = 0.0_f32;
+    // High CPU with no GUI = likely wasteful
+    if snap.cpu_percent > 5.0 && !snap.has_gui_window {
+        w += 0.40;
+    }
+    // High wakeups
+    if snap.wakeups_per_sec > 20.0 {
+        w += 0.25;
+    }
+    // Large RSS in background
+    if snap.rss_bytes > 200 * 1024 * 1024 && !snap.has_gui_window {
+        w += 0.15;
+    }
+    // Long stale
+    if snap.secs_since_foreground > 3600 && snap.cpu_percent < 1.0 {
+        w += 0.10;
+    }
+    // Penalty reduction for active GUI
+    if snap.has_gui_window {
+        w -= 0.30;
+    }
+    w.clamp(0.0, 1.0)
+}
+
+/// Utility score [0,1]: how valuable is this process to the user right now?
+/// Higher = keep alive. Lower = freeze/throttle candidate.
+pub fn score_utility(snap: &ProcessSnapshot) -> f32 {
+    let mut score: f32 = 0.5;
+
+    // GUI presence is the strongest signal
+    if snap.has_gui_window {
+        score += 0.25;
+    }
+    if snap.secs_since_user_interaction < 10 {
+        score += 0.20;
+    }
+
+    // Active network = doing something useful
+    if snap.has_network {
+        score += 0.05;
+    }
+
+    // High CPU = doing real work (or being a nuisance — context-dependent)
+    if snap.cpu_percent > 10.0 {
+        score += 0.05;
+    }
+
+    // Penalty: high wakeups with no GUI = chatty daemon
+    if snap.wakeups_per_sec > 50.0 && !snap.has_gui_window {
+        score -= 0.15;
+    }
+
+    // Penalty: translated binary (Rosetta) = legacy, lower priority
+    if snap.is_translated {
+        score -= 0.05;
+    }
+
+    score.clamp(0.0, 1.0)
+}
+
+/// Waste score [0,1]: how wasteful is this process?
+/// Higher = stronger candidate for throttle/freeze.
+pub fn waste_score(snap: &ProcessSnapshot, tier: ProcessTier) -> f32 {
+    match tier {
+        ProcessTier::SystemEssential | ProcessTier::ActiveForeground => 0.0,
+        ProcessTier::ZombieOrphan => 1.0,
+        ProcessTier::Telemetry => 0.85,
+        ProcessTier::Stale => 0.70,
+        ProcessTier::SilentDaemon => {
+            let mut w = 0.30_f32;
+            if snap.wakeups_per_sec > 20.0 {
+                w += 0.20;
+            }
+            if snap.rss_bytes > 200 * 1024 * 1024 {
+                w += 0.15;
+            }
+            w.min(0.80)
+        }
+        ProcessTier::AppHelper => 0.20,
+        ProcessTier::BackgroundVisible => 0.10,
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(name: &str) -> ProcessSnapshot {
+        ProcessSnapshot {
+            pid: 100,
+            name: name.to_string(),
+            cpu_percent: 0.0,
+            rss_bytes: 10 * 1024 * 1024,
+            is_zombie: false,
+            secs_since_foreground: 3600,
+            secs_since_user_interaction: 3600,
+            has_network: false,
+            has_gui_window: false,
+            wakeups_per_sec: 0.0,
+            parent_alive: true,
+            process_uptime_secs: 3600,
+            faults_total: 0,
+            pageins_total: 0,
+            is_translated: false,
+            mach_port_count: 0,
+        }
+    }
+
+    #[test]
+    fn essential_process_classified_correctly() {
+        let c = ProcessClassifier::new();
+        let s = snap("WindowServer");
+        assert_eq!(c.classify(&s), ProcessTier::SystemEssential);
+    }
+
+    #[test]
+    fn zombie_classified_correctly() {
+        let c = ProcessClassifier::new();
+        let mut s = snap("some_app");
+        s.is_zombie = true;
+        assert_eq!(c.classify(&s), ProcessTier::ZombieOrphan);
+    }
+
+    #[test]
+    fn foreground_gui_recent_interaction() {
+        let c = ProcessClassifier::new();
+        let mut s = snap("MyApp");
+        s.has_gui_window = true;
+        s.secs_since_user_interaction = 5;
+        assert_eq!(c.classify(&s), ProcessTier::ActiveForeground);
+    }
+
+    #[test]
+    fn background_gui_no_recent_interaction() {
+        let c = ProcessClassifier::new();
+        let mut s = snap("MusicApp");
+        s.has_gui_window = true;
+        s.secs_since_user_interaction = 300;
+        assert_eq!(c.classify(&s), ProcessTier::BackgroundVisible);
+    }
+
+    #[test]
+    fn stale_process_no_gui_idle() {
+        let c = ProcessClassifier::new();
+        let mut s = snap("idled");
+        s.secs_since_foreground = 600;
+        s.cpu_percent = 0.1;
+        s.wakeups_per_sec = 0.5;
+        assert_eq!(c.classify(&s), ProcessTier::Stale);
+    }
+
+    #[test]
+    fn telemetry_process_classified() {
+        let c = ProcessClassifier::new();
+        let s = snap("DiagnosticReporter");
+        assert_eq!(c.classify(&s), ProcessTier::Telemetry);
+    }
+
+    #[test]
+    fn score_utility_gui_process_high() {
+        let mut s = snap("App");
+        s.has_gui_window = true;
+        s.secs_since_user_interaction = 5;
+        assert!(score_utility(&s) > 0.7);
+    }
+
+    #[test]
+    fn score_utility_chatty_daemon_penalized() {
+        let mut s = snap("daemon");
+        s.wakeups_per_sec = 100.0;
+        assert!(score_utility(&s) < 0.5);
+    }
+
+    #[test]
+    fn waste_score_zombie_is_one() {
+        let s = snap("zombie");
+        assert_eq!(waste_score(&s, ProcessTier::ZombieOrphan), 1.0);
+    }
+
+    #[test]
+    fn waste_score_essential_is_zero() {
+        let s = snap("WindowServer");
+        assert_eq!(waste_score(&s, ProcessTier::SystemEssential), 0.0);
     }
 }

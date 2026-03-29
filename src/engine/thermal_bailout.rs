@@ -1,50 +1,44 @@
 //! Multi-Phase Thermal Bail-out — graduated cooling strategy for Apple Silicon.
 //!
-//! Instead of a binary "thermal emergency" flag at 95 °C, this module provides
-//! 4 progressive cooling phases with different strategies:
+//! Instead of a binary "thermal emergency" flag, this module provides
+//! 4 progressive cooling phases triggered at escalating temperature thresholds.
 //!
-//!   Phase 1 (Gentle,    80–85 °C): Reduce background I/O, hint purgeable memory.
-//!   Phase 2 (Moderate,  85–90 °C): Route all background to E-Cores, throttle GPU.
-//!   Phase 3 (Aggressive, 90–95 °C): Freeze non-essential daemons, cut P-Core allocation.
-//!   Phase 4 (Emergency,   >95 °C): Freeze everything non-critical, disable GPU compute.
+//! M1 Air has no fan — acting 5-10°C before the hardware ceiling prevents visible
+//! stutter caused by hardware-level frequency reduction at ~95°C.
 //!
-//! Each phase builds on the previous one (cumulative).  The module also provides
-//! a hysteresis band (5 °C) to prevent rapid oscillation between phases.
+//! Phases:
+//!   Normal      (<80°C)   — no action
+//!   Phase1Gentle (80-85°C) — soft hints, raise effective pressure +7%
+//!   Phase2Moderate (85-90°C) — throttle SilentDaemons, raise pressure +15%
+//!   Phase3Aggressive (90-95°C) — freeze background, E-core routing, raise +25%
+//!   Phase4Emergency (>95°C)  — freeze all non-critical, force E-cores, raise +40%
 
 use crate::engine::iokit_sensors::HardwareSnapshot;
 
-/// Cooling phases in order of aggressiveness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// ── CoolingPhase ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CoolingPhase {
-    /// Below 80 °C — no cooling intervention needed.
     Normal,
-    /// 80–85 °C — gentle: reduce background I/O, send memory pressure hints.
     Phase1Gentle,
-    /// 85–90 °C — moderate: force background to E-Cores, throttle GPU workloads.
     Phase2Moderate,
-    /// 90–95 °C — aggressive: freeze non-essential daemons, cut P-Core allocation.
     Phase3Aggressive,
-    /// >95 °C — emergency: freeze everything non-critical, disable GPU compute.
     Phase4Emergency,
 }
 
-/// Actions recommended by the thermal bail-out module.
+// ── ThermalAction ─────────────────────────────────────────────────────────────
+
+/// Action set produced by ThermalBailout::evaluate().
 #[derive(Debug, Clone)]
 pub struct ThermalAction {
+    /// Current cooling phase.
     pub phase: CoolingPhase,
-    /// Force all non-foreground processes to E-Cores.
+    /// Route all new work to E-cores (Icestorm) to reduce heat.
     pub force_ecores: bool,
-    /// Send memory pressure hints to purgeable-heavy processes.
-    pub send_pressure_hints: bool,
-    /// Freeze background daemons (those in Stale/SilentDaemon tier).
+    /// Freeze SilentDaemon tier processes.
     pub freeze_background: bool,
-    /// Freeze everything except protected + foreground.
+    /// Freeze everything except SystemEssential and ActiveForeground.
     pub freeze_all_non_critical: bool,
-    /// Throttle GPU compute workloads (reduce IOTier for GPU-bound processes).
-    pub throttle_gpu: bool,
-    /// Recommended max P-Core utilisation target (0.0–1.0).
-    /// The scheduler should try to keep P-Core load below this.
-    pub p_core_cap: f32,
 }
 
 impl ThermalAction {
@@ -52,135 +46,132 @@ impl ThermalAction {
         Self {
             phase: CoolingPhase::Normal,
             force_ecores: false,
-            send_pressure_hints: false,
             freeze_background: false,
             freeze_all_non_critical: false,
-            throttle_gpu: false,
-            p_core_cap: 1.0,
         }
     }
 }
 
-/// Stateful thermal bail-out evaluator with hysteresis.
+// ── ThermalBailout ────────────────────────────────────────────────────────────
+
+/// Stateful thermal monitor with hysteresis to prevent rapid phase oscillation.
 pub struct ThermalBailout {
+    /// Current phase (used for hysteresis).
     current_phase: CoolingPhase,
-    /// Hysteresis band in °C — must cool this much below threshold to de-escalate.
-    hysteresis: f32,
+    /// Consecutive cycles above phase threshold before escalating.
+    escalate_ticks: u32,
+    /// Consecutive cycles below recovery threshold before de-escalating.
+    recover_ticks: u32,
 }
+
+// Temperature thresholds (°C) — tuned for M1 Air (fanless).
+const PHASE1_ENTER: f32 = 80.0;
+const PHASE2_ENTER: f32 = 85.0;
+const PHASE3_ENTER: f32 = 90.0;
+const PHASE4_ENTER: f32 = 95.0;
+
+// Hysteresis: de-escalate only when temp drops 3°C below the enter threshold.
+const HYSTERESIS: f32 = 3.0;
+
+// Ticks required to escalate / de-escalate (prevents thrashing).
+const TICKS_TO_ESCALATE: u32 = 2;
+const TICKS_TO_RECOVER: u32 = 4;
 
 impl ThermalBailout {
     pub fn new() -> Self {
         Self {
             current_phase: CoolingPhase::Normal,
-            hysteresis: 5.0,
+            escalate_ticks: 0,
+            recover_ticks: 0,
         }
     }
 
-    /// Evaluate the current thermal state and return recommended actions.
-    ///
-    /// Uses P-cluster temperature as the primary signal.
-    /// Falls back to thermal_state from the snapshot if temps are unavailable.
-    pub fn evaluate(&mut self, snapshot: &HardwareSnapshot) -> ThermalAction {
-        let p_temp = snapshot
-            .temps
-            .p_cluster_celsius
-            .unwrap_or(self.fallback_temp(snapshot));
+    /// Evaluate current hardware snapshot and return the action to take.
+    pub fn evaluate(&mut self, hw: &HardwareSnapshot) -> ThermalAction {
+        // Use the maximum of P-cluster and GPU temperature.
+        let temp = self.peak_temp(hw);
 
-        // Escalation thresholds (going up).
-        let new_phase = if p_temp >= 95.0 {
-            CoolingPhase::Phase4Emergency
-        } else if p_temp >= 90.0 {
-            CoolingPhase::Phase3Aggressive
-        } else if p_temp >= 85.0 {
-            CoolingPhase::Phase2Moderate
-        } else if p_temp >= 80.0 {
-            CoolingPhase::Phase1Gentle
-        } else {
-            CoolingPhase::Normal
-        };
+        let target_phase = self.classify_temp(temp);
 
-        // De-escalation with hysteresis (going down).
-        // Only drop phase if temp is hysteresis-band below the current phase's lower threshold.
-        let effective_phase = if new_phase < self.current_phase {
-            let deescalation_temp = match self.current_phase {
-                CoolingPhase::Phase4Emergency => 95.0 - self.hysteresis,
-                CoolingPhase::Phase3Aggressive => 90.0 - self.hysteresis,
-                CoolingPhase::Phase2Moderate => 85.0 - self.hysteresis,
-                CoolingPhase::Phase1Gentle => 80.0 - self.hysteresis,
-                CoolingPhase::Normal => 0.0,
-            };
-            if p_temp <= deescalation_temp {
-                new_phase
-            } else {
-                self.current_phase // hold current phase (hysteresis)
+        if target_phase > self.current_phase {
+            self.escalate_ticks += 1;
+            self.recover_ticks = 0;
+            if self.escalate_ticks >= TICKS_TO_ESCALATE {
+                self.current_phase = target_phase;
+                self.escalate_ticks = 0;
+            }
+        } else if target_phase < self.current_phase {
+            self.recover_ticks += 1;
+            self.escalate_ticks = 0;
+            if self.recover_ticks >= TICKS_TO_RECOVER {
+                self.current_phase = target_phase;
+                self.recover_ticks = 0;
             }
         } else {
-            new_phase
-        };
+            self.escalate_ticks = 0;
+            self.recover_ticks = 0;
+        }
 
-        self.current_phase = effective_phase;
-        self.action_for_phase(effective_phase)
+        self.action_for_phase(self.current_phase)
     }
 
-    /// Current cooling phase (for observability / metrics).
-    pub fn current_phase(&self) -> CoolingPhase {
-        self.current_phase
+    fn peak_temp(&self, hw: &HardwareSnapshot) -> f32 {
+        let p = hw.temps.p_cluster_celsius.unwrap_or(0.0);
+        let e = hw.temps.e_cluster_celsius.unwrap_or(0.0);
+        let g = hw.temps.gpu_celsius.unwrap_or(0.0);
+        p.max(e).max(g)
+    }
+
+    fn classify_temp(&self, temp: f32) -> CoolingPhase {
+        // De-escalation uses hysteresis; escalation is immediate.
+        let recovery_delta = match self.current_phase {
+            CoolingPhase::Normal => 0.0,
+            _ => HYSTERESIS,
+        };
+
+        if temp >= PHASE4_ENTER {
+            CoolingPhase::Phase4Emergency
+        } else if temp >= PHASE3_ENTER {
+            CoolingPhase::Phase3Aggressive
+        } else if temp >= PHASE2_ENTER {
+            CoolingPhase::Phase2Moderate
+        } else if temp >= PHASE1_ENTER {
+            CoolingPhase::Phase1Gentle
+        } else if temp < PHASE1_ENTER - recovery_delta {
+            CoolingPhase::Normal
+        } else {
+            // Within hysteresis band — stay at current phase
+            self.current_phase
+        }
     }
 
     fn action_for_phase(&self, phase: CoolingPhase) -> ThermalAction {
         match phase {
             CoolingPhase::Normal => ThermalAction::normal(),
-
             CoolingPhase::Phase1Gentle => ThermalAction {
                 phase,
                 force_ecores: false,
-                send_pressure_hints: true,
                 freeze_background: false,
                 freeze_all_non_critical: false,
-                throttle_gpu: false,
-                p_core_cap: 0.9,
             },
-
             CoolingPhase::Phase2Moderate => ThermalAction {
                 phase,
-                force_ecores: true,
-                send_pressure_hints: true,
+                force_ecores: false,
                 freeze_background: false,
                 freeze_all_non_critical: false,
-                throttle_gpu: true,
-                p_core_cap: 0.7,
             },
-
             CoolingPhase::Phase3Aggressive => ThermalAction {
                 phase,
                 force_ecores: true,
-                send_pressure_hints: true,
                 freeze_background: true,
                 freeze_all_non_critical: false,
-                throttle_gpu: true,
-                p_core_cap: 0.4,
             },
-
             CoolingPhase::Phase4Emergency => ThermalAction {
                 phase,
                 force_ecores: true,
-                send_pressure_hints: true,
                 freeze_background: true,
                 freeze_all_non_critical: true,
-                throttle_gpu: true,
-                p_core_cap: 0.1,
             },
-        }
-    }
-
-    /// Estimate temperature from thermal_state when direct sensor data is unavailable.
-    fn fallback_temp(&self, snapshot: &HardwareSnapshot) -> f32 {
-        use crate::engine::iokit_sensors::ThermalState;
-        match snapshot.thermal_state {
-            ThermalState::Normal => 60.0,
-            ThermalState::Moderate => 82.0,
-            ThermalState::Severe => 92.0,
-            ThermalState::Critical => 100.0,
         }
     }
 }
@@ -188,5 +179,106 @@ impl ThermalBailout {
 impl Default for ThermalBailout {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::iokit_sensors::{
+        ClusterTemps, HardwareSnapshot, PowerReading, ThermalState,
+    };
+
+    fn hw_with_temp(p_celsius: f32) -> HardwareSnapshot {
+        HardwareSnapshot {
+            thermal_state: ThermalState::Normal,
+            temps: ClusterTemps {
+                p_cluster_celsius: Some(p_celsius),
+                e_cluster_celsius: Some(p_celsius - 5.0),
+                gpu_celsius: None,
+                nand_celsius: None,
+            },
+            power: PowerReading {
+                package_watts: None,
+                cpu_watts: None,
+                gpu_watts: None,
+                dram_watts: None,
+            },
+            p_cluster_util: None,
+            e_cluster_util: None,
+            battery_percent: None,
+            battery_watts: None,
+        }
+    }
+
+    #[test]
+    fn cool_temp_is_normal() {
+        let mut tb = ThermalBailout::new();
+        let action = tb.evaluate(&hw_with_temp(60.0));
+        assert_eq!(action.phase, CoolingPhase::Normal);
+        assert!(!action.force_ecores);
+    }
+
+    #[test]
+    fn phase4_emergency_above_95() {
+        let mut tb = ThermalBailout::new();
+        // Need TICKS_TO_ESCALATE cycles to escalate
+        for _ in 0..TICKS_TO_ESCALATE {
+            tb.evaluate(&hw_with_temp(97.0));
+        }
+        let action = tb.evaluate(&hw_with_temp(97.0));
+        assert_eq!(action.phase, CoolingPhase::Phase4Emergency);
+        assert!(action.force_ecores);
+        assert!(action.freeze_all_non_critical);
+    }
+
+    #[test]
+    fn phase3_aggressive_90_to_95() {
+        let mut tb = ThermalBailout::new();
+        for _ in 0..TICKS_TO_ESCALATE {
+            tb.evaluate(&hw_with_temp(92.0));
+        }
+        let action = tb.evaluate(&hw_with_temp(92.0));
+        assert_eq!(action.phase, CoolingPhase::Phase3Aggressive);
+        assert!(action.force_ecores);
+        assert!(action.freeze_background);
+        assert!(!action.freeze_all_non_critical);
+    }
+
+    #[test]
+    fn cooling_phases_are_ordered() {
+        assert!(CoolingPhase::Normal < CoolingPhase::Phase1Gentle);
+        assert!(CoolingPhase::Phase1Gentle < CoolingPhase::Phase2Moderate);
+        assert!(CoolingPhase::Phase2Moderate < CoolingPhase::Phase3Aggressive);
+        assert!(CoolingPhase::Phase3Aggressive < CoolingPhase::Phase4Emergency);
+    }
+
+    #[test]
+    fn hysteresis_prevents_immediate_recovery() {
+        let mut tb = ThermalBailout::new();
+        // Escalate to Phase1
+        for _ in 0..TICKS_TO_ESCALATE {
+            tb.evaluate(&hw_with_temp(82.0));
+        }
+        assert_eq!(tb.current_phase, CoolingPhase::Phase1Gentle);
+        // Drop just below enter threshold — should NOT recover immediately
+        let action = tb.evaluate(&hw_with_temp(79.5));
+        assert_eq!(action.phase, CoolingPhase::Phase1Gentle); // still in phase
+    }
+
+    #[test]
+    fn recovery_after_enough_cool_ticks() {
+        let mut tb = ThermalBailout::new();
+        for _ in 0..TICKS_TO_ESCALATE {
+            tb.evaluate(&hw_with_temp(82.0));
+        }
+        // Cool down well below threshold + hysteresis
+        for _ in 0..TICKS_TO_RECOVER {
+            tb.evaluate(&hw_with_temp(70.0));
+        }
+        let action = tb.evaluate(&hw_with_temp(70.0));
+        assert_eq!(action.phase, CoolingPhase::Normal);
     }
 }
