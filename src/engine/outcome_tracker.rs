@@ -141,6 +141,88 @@ impl ExperienceMemory {
 
 // ── OutcomeTracker ──��─────────────────��─────────────────────��─────────────────
 
+// ── HRPO: Hop-Grouped Relative Policy Optimization (Dr. Zero) ────────────────
+//
+// Groups structurally similar processes into "hops" (workload categories) and
+// learns effectiveness per group. Transfers knowledge between processes of the
+// same kind so new processes benefit from existing experience (zero-shot).
+
+/// Workload hop — a category that groups structurally similar processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkloadHop {
+    Browser,
+    Build,
+    SystemDaemon,
+    CloudSync,
+    Media,
+    General,
+}
+
+impl WorkloadHop {
+    pub fn from_process_name(name: &str) -> Self {
+        let lower = name.to_lowercase();
+        if lower.contains("brave") || lower.contains("chrome") || lower.contains("safari")
+            || lower.contains("firefox") || lower.contains("webkit") || lower.contains("renderer")
+        {
+            WorkloadHop::Browser
+        } else if lower.contains("rustc") || lower.contains("cargo") || lower.contains("clang")
+            || lower.contains("swift") || lower == "cc" || lower.contains("make")
+            || lower.contains("ninja")
+        {
+            WorkloadHop::Build
+        } else if lower.contains("cloud") || lower.contains("dropbox") || lower.contains("drive")
+            || lower.contains("sync") || lower.contains("bird")
+        {
+            WorkloadHop::CloudSync
+        } else if lower.contains("audio") || lower.contains("video")
+            || lower.contains("avconf") || lower.contains("camera")
+        {
+            WorkloadHop::Media
+        } else if lower.ends_with('d') && lower.len() > 3 && !lower.contains(' ') {
+            WorkloadHop::SystemDaemon
+        } else {
+            WorkloadHop::General
+        }
+    }
+}
+
+/// Per-group effectiveness tracker (HRPO weights — Dr. Zero solver).
+#[derive(Debug, Clone, Default)]
+pub struct HopGroupWeight {
+    pub throttle_count: u32,
+    pub effective_count: u32,
+    /// EMA of observed pressure drop for this group.
+    pub avg_drop_ema: f64,
+    /// Self-challenge: predicted effectiveness based on group history.
+    pub predicted_effectiveness: f64,
+    /// Prediction error EMA — drives curriculum difficulty.
+    pub prediction_error_ema: f64,
+}
+
+impl HopGroupWeight {
+    pub fn effectiveness(&self) -> f64 {
+        (self.effective_count as f64 + 1.0) / (self.throttle_count as f64 + 2.0)
+    }
+
+    /// Record outcome and update self-challenge prediction (solver learns).
+    pub fn record(&mut self, effective: bool, pressure_drop: f64) {
+        self.throttle_count += 1;
+        if effective {
+            self.effective_count += 1;
+        }
+        self.avg_drop_ema += 0.05 * (pressure_drop - self.avg_drop_ema);
+        let actual = if effective { 1.0 } else { 0.0 };
+        let error = (actual - self.predicted_effectiveness).abs();
+        self.prediction_error_ema += 0.1 * (error - self.prediction_error_ema);
+        self.predicted_effectiveness += 0.1 * (actual - self.predicted_effectiveness);
+    }
+
+    /// High prediction error = group needs more exploration (curriculum signal).
+    pub fn needs_exploration(&self) -> bool {
+        self.throttle_count >= 5 && self.prediction_error_ema > 0.3
+    }
+}
+
 pub struct OutcomeTracker {
     pending: VecDeque<PendingOutcome>,
     /// Pesos Bayesianos por nombre de proceso.
@@ -172,6 +254,8 @@ pub struct OutcomeTracker {
     drift_accumulator: f64,
     /// Ticks since last action (for windowed drift measurement).
     ticks_since_action: u32,
+    /// HRPO: per-group effectiveness tracking (Dr. Zero solver).
+    hop_groups: HashMap<WorkloadHop, HopGroupWeight>,
 }
 
 impl OutcomeTracker {
@@ -189,6 +273,7 @@ impl OutcomeTracker {
             prev_pressure: None,
             drift_accumulator: 0.0,
             ticks_since_action: 0,
+            hop_groups: HashMap::new(),
         }
     }
 
@@ -253,6 +338,10 @@ impl OutcomeTracker {
                     w.effective_count += 1;
                 }
             }
+
+            // HRPO: update group-level effectiveness (Dr. Zero solver feedback).
+            let hop = WorkloadHop::from_process_name(&outcome.process_name);
+            self.hop_groups.entry(hop).or_default().record(effective, pressure_drop);
 
             // Store in experience memory for similarity queries.
             self.experience.push(ExperienceRecord {
@@ -417,6 +506,48 @@ impl OutcomeTracker {
     /// Current estimate of natural pressure drift over 30s (no-action baseline).
     pub fn natural_drift(&self) -> f64 {
         self.natural_drift_ema
+    }
+
+    // ── HRPO: Dr. Zero group-level intelligence ──────────────────────────
+
+    /// Query group effectiveness for a process (zero-shot via hop grouping).
+    /// Returns (group_effectiveness, group_predicted, confidence) or None.
+    pub fn hop_effectiveness(&self, process_name: &str) -> Option<(f64, f64, f64)> {
+        let hop = WorkloadHop::from_process_name(process_name);
+        self.hop_groups.get(&hop).map(|g| {
+            let confidence = (g.throttle_count as f64 / 20.0).min(1.0);
+            (g.effectiveness(), g.predicted_effectiveness, confidence)
+        })
+    }
+
+    /// Dr. Zero proposer signal: which groups need more exploration?
+    /// Returns hops where prediction error is high (solver is uncertain).
+    pub fn exploration_needed(&self) -> Vec<(WorkloadHop, f64)> {
+        self.hop_groups
+            .iter()
+            .filter(|(_, g)| g.needs_exploration())
+            .map(|(&hop, g)| (hop, g.prediction_error_ema))
+            .collect()
+    }
+
+    /// Summary of HRPO groups for status/metrics reporting.
+    pub fn hop_group_summary(&self) -> Vec<(WorkloadHop, f64, u32, f64)> {
+        let mut groups: Vec<_> = self.hop_groups
+            .iter()
+            .map(|(&hop, g)| (hop, g.effectiveness(), g.throttle_count, g.prediction_error_ema))
+            .collect();
+        groups.sort_by(|a, b| b.2.cmp(&a.2)); // by throttle count descending
+        groups
+    }
+
+    /// Dr. Zero self-challenge reward: average prediction error across all groups.
+    /// Low = solver is calibrated. High = solver needs more training.
+    pub fn self_challenge_score(&self) -> f64 {
+        if self.hop_groups.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = self.hop_groups.values().map(|g| g.prediction_error_ema).sum();
+        sum / self.hop_groups.len() as f64
     }
 }
 
@@ -925,5 +1056,49 @@ mod tests {
             },
         );
         assert!(!tracker.heuristic_is_struggling());
+    }
+
+    // ── HRPO / Dr. Zero tests ────────────────────────────────────────────
+
+    #[test]
+    fn workload_hop_classification() {
+        assert_eq!(WorkloadHop::from_process_name("Brave Browser Helper (Renderer)"), WorkloadHop::Browser);
+        assert_eq!(WorkloadHop::from_process_name("rustc"), WorkloadHop::Build);
+        assert_eq!(WorkloadHop::from_process_name("cloudd"), WorkloadHop::CloudSync);
+        assert_eq!(WorkloadHop::from_process_name("coreaudiod"), WorkloadHop::Media);
+        assert_eq!(WorkloadHop::from_process_name("launchd"), WorkloadHop::SystemDaemon);
+        assert_eq!(WorkloadHop::from_process_name("Warp"), WorkloadHop::General);
+    }
+
+    #[test]
+    fn hop_group_weight_learning() {
+        let mut g = HopGroupWeight::default();
+        assert!((g.effectiveness() - 0.5).abs() < 0.01);
+        // Record 10 outcomes: 7 effective
+        for i in 0..10 {
+            g.record(i < 7, 0.03);
+        }
+        // Bayesian: (7+1)/(10+2) ≈ 0.667
+        assert!(g.effectiveness() > 0.60);
+        // Prediction moving toward effectiveness (α=0.1, 10 samples → partial convergence)
+        assert!(g.predicted_effectiveness > 0.2);
+    }
+
+    #[test]
+    fn hop_group_exploration_signal() {
+        let mut g = HopGroupWeight::default();
+        // Alternate effective/not to create high prediction error
+        for i in 0..10 {
+            g.record(i % 2 == 0, 0.02);
+        }
+        // With alternating outcomes, prediction error should be elevated
+        assert!(g.prediction_error_ema > 0.1);
+    }
+
+    #[test]
+    fn tracker_hop_effectiveness_zero_shot() {
+        let tracker = OutcomeTracker::new();
+        // No data yet → None
+        assert!(tracker.hop_effectiveness("Brave Browser Helper").is_none());
     }
 }

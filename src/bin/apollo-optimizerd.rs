@@ -6365,6 +6365,18 @@ fn main() -> anyhow::Result<()> {
                         };
                         outcome_tracker.causal_effect(avg_drop)
                     };
+                    // HRPO / Dr. Zero metrics
+                    m.dr_zero_self_challenge = outcome_tracker.self_challenge_score();
+                    m.dr_zero_groups = outcome_tracker.hop_group_summary()
+                        .iter()
+                        .map(|(hop, eff, count, pred_err)| {
+                            format!("{:?}(eff={:.0}% n={} err={:.2})", hop, eff * 100.0, count, pred_err)
+                        })
+                        .collect();
+                    m.dr_zero_exploration = outcome_tracker.exploration_needed()
+                        .iter()
+                        .map(|(hop, err)| format!("{:?}(err={:.2})", hop, err))
+                        .collect();
                 }
 
                 // I/O Traffic Shaping: foreground-aware disk bandwidth allocation.

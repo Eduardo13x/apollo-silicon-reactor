@@ -640,6 +640,16 @@ pub struct RuntimeMetrics {
     /// Experience memory size (resolved outcome records).
     #[serde(default)]
     pub experience_memory_size: usize,
+    /// Dr. Zero self-challenge score: average prediction error across hop groups.
+    /// Low = solver is well-calibrated. High = needs more training.
+    #[serde(default)]
+    pub dr_zero_self_challenge: f64,
+    /// Dr. Zero HRPO group summaries: "Browser(eff=70% n=50 err=0.15)"
+    #[serde(default)]
+    pub dr_zero_groups: Vec<String>,
+    /// Dr. Zero exploration signal: groups needing more data.
+    #[serde(default)]
+    pub dr_zero_exploration: Vec<String>,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.
