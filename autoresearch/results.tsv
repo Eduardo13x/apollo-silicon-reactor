@@ -1,8 +1,9 @@
 commit	score	scenarios	tests	status	description
-82da8eb	2139.0	18/20	1239	baseline	Karpathy AutoResearch framework baseline
-3e7f0d6	2189.0	19/20	1239	keep	Exp1: SilentDaemon idle override — throttle zero-CPU daemons idle >1h
-438abee	2233.0	20/20	1233	keep	Exp2: Graduated waste-utility check — throttle medium-waste low-utility daemons
-7d5189a	2239.0	20/20	1239	keep	Exp3: RSS-weighted utility penalty for bloated silent daemons (>500MB)
-050b446	1616.0	20/20	616	discard	Exp4: Build-mode compiler protection — PASS=0 test count drop
-c498ff1	2239.0	20/20	1239	discard	Exp5: Build-mode compiler protection v2 — no score improvement (+code)
-dda00bb	2239.0	20/20	1239	discard	Exp6: Pageins as utility signal — no score improvement (+code)
+82da8eb	2139.0	18/20	1239	baseline	Original 20-scenario baseline
+7d5189a	2239.0	20/20	1239	keep	Exp1-3: idle override + waste curve + RSS penalty
+633b6fe	2239.0	20/20	1239	keep	Exp8+11+14: simplify waste/calibration, -23 lines
+5d0f52f	2339.0	22/25	1239	baseline	Boss scenarios added (s21-s25), 3 fail
+7614269	2489.0	25/25	1239	keep	Exp16: IPC hub + LLM model + active I/O protection
+742893f	2489.0	25/25	1239	keep	Exp20: Remove gray-zone entropy, -45 lines
+8c1fee1	2489.0	25/25	1239	keep	Exp21: Remove heavy-workload gate on freeze, -2 lines
+0e66e1e	1866.0	25/25	616	discard	Exp22: Remove aggressive flags — PASS=0 ext refs
