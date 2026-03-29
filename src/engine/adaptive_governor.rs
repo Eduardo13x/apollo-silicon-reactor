@@ -424,6 +424,30 @@ impl AdaptiveGovernor {
             adjusted_utility = (adjusted_utility - penalty).max(0.0);
         }
 
+        // Graduated idle: the idle override (above) only catches cpu < 0.5%.
+        // But a daemon idle for 6h+ is effectively abandoned even at moderate CPU.
+        // Graduated: >6h → Throttle, >12h → Freeze. No GUI required.
+        if !snap.has_gui_window && snap.secs_since_foreground > 21600 {
+            let decision = if snap.secs_since_foreground > 43200 {
+                GovernorDecision::Freeze
+            } else {
+                GovernorDecision::Throttle
+            };
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision,
+                tier,
+                utility_score: adjusted_utility,
+                waste_score: waste,
+                reason: format!(
+                    "Graduated idle ({}h, no GUI) — {}",
+                    snap.secs_since_foreground / 3600,
+                    if snap.secs_since_foreground > 43200 { "freeze" } else { "throttle" }
+                ),
+            };
+        }
+
         // Foreground app helper detection: if a process name contains part of
         // the foreground app name (e.g., "com.apple.WebKit" when "Safari" is fg),
         // or is a known helper pattern for the foreground app, protect it.
