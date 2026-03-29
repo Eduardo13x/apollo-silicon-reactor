@@ -225,6 +225,21 @@ impl AdaptiveGovernor {
         workload: WorkloadType,
         process_count: usize,
     ) -> ProcessDecision {
+        // Zombie/orphan — always kill regardless of other signals.
+        // A process with dead parent or zombie flag is leaked; its CPU/RSS
+        // stats are unreliable and it can't serve any user purpose.
+        if tier == ProcessTier::ZombieOrphan {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Kill,
+                tier,
+                utility_score: 0.0,
+                waste_score: 1.0,
+                reason: "Zombie/orphan process — kill".into(),
+            };
+        }
+
         // Essential — never touch
         if tier == ProcessTier::SystemEssential || tier == ProcessTier::ActiveForeground {
             return ProcessDecision {
