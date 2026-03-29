@@ -503,6 +503,24 @@ impl AdaptiveGovernor {
             };
         }
 
+        // Wakeup energy hog: >100 wakeups/sec with no GUI forces the CPU out
+        // of deep idle on every wakeup (P→E transition on M1). Even at low CPU%,
+        // this destroys battery life. Throttle to reduce wakeup frequency.
+        if snap.wakeups_per_sec > 100.0 && !snap.has_gui_window && adjusted_utility < 0.50 {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Throttle,
+                tier,
+                utility_score: adjusted_utility,
+                waste_score: waste,
+                reason: format!(
+                    "Wakeup energy hog ({:.0} wakeups/s) — throttle for battery",
+                    snap.wakeups_per_sec
+                ),
+            };
+        }
+
         let throttle_thresh = self.config.throttle_utility_threshold;
 
         // Normal utility-based decision.
