@@ -214,4 +214,173 @@ mod tests {
         let id = tracker.get_coalition_id(999_999);
         assert_eq!(id, 0);
     }
+
+    // ── Additional tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_empty_returns_empty_map() {
+        let tracker = CoalitionTracker::new();
+        let map = tracker.snapshot(std::iter::empty());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn snapshot_single_process_has_correct_stats() {
+        let tracker = CoalitionTracker::new();
+        let own_pid = std::process::id();
+        let procs = vec![(own_pid, "myapp", 12.5f32, 1024u64)];
+        let map = tracker.snapshot(procs.iter().map(|(p, n, c, r)| (*p, *n, *c, *r)));
+        assert_eq!(map.len(), 1);
+        let stats = map.values().next().unwrap();
+        assert_eq!(stats.process_count, 1);
+        assert_eq!(stats.pids.len(), 1);
+        assert_eq!(stats.pids[0], own_pid);
+        assert!((stats.total_cpu - 12.5).abs() < 0.01);
+        assert_eq!(stats.total_rss, 1024);
+        assert_eq!(stats.lead_name, "myapp");
+    }
+
+    #[test]
+    fn snapshot_rss_accumulates_correctly() {
+        let tracker = CoalitionTracker::new();
+        let own_pid = std::process::id();
+        // Three processes, same coalition (same PID), different RSS values.
+        let procs = vec![
+            (own_pid, "proc_a", 0.0f32, 1_000_000u64),
+            (own_pid, "proc_b", 0.0, 2_000_000),
+            (own_pid, "proc_c", 0.0, 500_000),
+        ];
+        let map = tracker.snapshot(procs.iter().map(|(p, n, c, r)| (*p, *n, *c, *r)));
+        let stats = map.values().next().unwrap();
+        assert_eq!(stats.total_rss, 3_500_000);
+        assert_eq!(stats.process_count, 3);
+    }
+
+    #[test]
+    fn snapshot_dead_pid_gets_zero_coalition() {
+        let tracker = CoalitionTracker::new();
+        // Dead PID → coalition 0.  Two dead PIDs → both end up in coalition 0 group.
+        let procs = vec![
+            (999_991u32, "ghost_a", 1.0f32, 100u64),
+            (999_992u32, "ghost_b", 2.0, 200),
+        ];
+        let map = tracker.snapshot(procs.iter().map(|(p, n, c, r)| (*p, *n, *c, *r)));
+        // Both go to coalition 0.
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&0));
+        let stats = &map[&0];
+        assert_eq!(stats.process_count, 2);
+        assert!((stats.total_cpu - 3.0).abs() < 0.01);
+        assert_eq!(stats.total_rss, 300);
+    }
+
+    #[test]
+    fn snapshot_coalition_id_matches_key() {
+        let tracker = CoalitionTracker::new();
+        let own_pid = std::process::id();
+        let procs = vec![(own_pid, "app", 5.0f32, 512u64)];
+        let map = tracker.snapshot(procs.iter().map(|(p, n, c, r)| (*p, *n, *c, *r)));
+        for (key, stats) in &map {
+            assert_eq!(*key, stats.coalition_id);
+        }
+    }
+
+    #[test]
+    fn snapshot_pids_list_contains_all_members() {
+        let tracker = CoalitionTracker::new();
+        let own_pid = std::process::id();
+        let procs = vec![
+            (own_pid, "worker_1", 1.0f32, 100u64),
+            (own_pid, "worker_2", 1.0, 200),
+            (own_pid, "worker_3", 1.0, 300),
+        ];
+        let map = tracker.snapshot(procs.iter().map(|(p, n, c, r)| (*p, *n, *c, *r)));
+        let stats = map.values().next().unwrap();
+        assert_eq!(stats.pids.len(), 3);
+        // All entries should be own_pid (same coalition).
+        assert!(stats.pids.iter().all(|&p| p == own_pid));
+    }
+
+    #[test]
+    fn snapshot_zero_cpu_processes_accumulate() {
+        let tracker = CoalitionTracker::new();
+        let own_pid = std::process::id();
+        let procs = vec![
+            (own_pid, "idle_a", 0.0f32, 4096u64),
+            (own_pid, "idle_b", 0.0, 8192),
+        ];
+        let map = tracker.snapshot(procs.iter().map(|(p, n, c, r)| (*p, *n, *c, *r)));
+        let stats = map.values().next().unwrap();
+        assert!((stats.total_cpu - 0.0).abs() < 0.001);
+        assert_eq!(stats.total_rss, 4096 + 8192);
+        assert_eq!(stats.process_count, 2);
+    }
+
+    #[test]
+    fn family_of_dead_pid_returns_single_pid() {
+        let tracker = CoalitionTracker::new();
+        // Dead PID → coalition 0 → family_of returns just the pid itself.
+        let family = tracker.family_of(999_993, &[999_993, 999_994, 999_995]);
+        // coalition 0 means no reliable family; returns vec![pid].
+        assert_eq!(family, vec![999_993]);
+    }
+
+    #[test]
+    fn coalition_tracker_default_same_as_new() {
+        // Default and new() should produce identical behaviour.
+        let _t1 = CoalitionTracker::new();
+        let _t2 = CoalitionTracker::default();
+        // Both should handle own PID without panicking.
+        let id1 = _t1.get_coalition_id(std::process::id());
+        let id2 = _t2.get_coalition_id(std::process::id());
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn proc_pid_coalition_info_size_is_sixteen_bytes() {
+        // XNU ABI: struct contains two u64 fields → 16 bytes.
+        assert_eq!(std::mem::size_of::<ProcPidCoalitionInfo>(), 16);
+    }
+
+    #[test]
+    fn proc_pid_coalition_info_default_zeroed() {
+        let info = ProcPidCoalitionInfo::default();
+        assert_eq!(info.coalition_id[0], 0);
+        assert_eq!(info.coalition_id[1], 0);
+    }
+
+    #[test]
+    fn coalition_type_resource_is_zero() {
+        assert_eq!(COALITION_TYPE_RESOURCE, 0);
+    }
+
+    #[test]
+    fn coalition_type_jetsam_is_one() {
+        assert_eq!(COALITION_TYPE_JETSAM, 1);
+    }
+
+    #[test]
+    fn snapshot_large_rss_values_no_overflow() {
+        let tracker = CoalitionTracker::new();
+        let own_pid = std::process::id();
+        // Near u64::MAX / 2 to check accumulation doesn't overflow.
+        let big: u64 = 8 * 1024 * 1024 * 1024; // 8 GB
+        let procs = vec![
+            (own_pid, "big_a", 0.0f32, big),
+            (own_pid, "big_b", 0.0, big),
+        ];
+        let map = tracker.snapshot(procs.iter().map(|(p, n, c, r)| (*p, *n, *c, *r)));
+        let stats = map.values().next().unwrap();
+        assert_eq!(stats.total_rss, big * 2);
+    }
+
+    #[test]
+    fn get_coalition_id_called_multiple_times_stable() {
+        let tracker = CoalitionTracker::new();
+        let pid = std::process::id();
+        let id_a = tracker.get_coalition_id(pid);
+        let id_b = tracker.get_coalition_id(pid);
+        // Same PID → same coalition every time.
+        assert_eq!(id_a, id_b);
+    }
 }

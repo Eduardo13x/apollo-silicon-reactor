@@ -4,3 +4,4 @@ experiment	branch	score_before	score_after	delta	tests	clippy	size_kb	status	des
 2	master	1236.00	1371.00	+135.00	1326	0	4056	kept	Add 30 unit tests for gpu_manager.rs (needs_cooling, recommend_power_state, optimize_for_workload, thermal_recommendations)
 3	master	1371.00	1467.0	+96.0	1390	0	4056	kept	Add 22 unit tests for page_reclaim.rs (initial state, pressure gates, cooldowns, rate limiting, boundary conditions)
 4	master	1371.00	1467.0	+96.0	1390	0	4056	kept	Add unit tests for analytics.rs (calculate_analytics, generate_report, get_trend, history cap)
+5	master	1467.0	1512.0	+45.0	1420	0	4056	kept	Add 14 unit tests for coalition.rs (snapshot edge cases, rss accumulation, ProcPidCoalitionInfo layout, family_of, stability)
