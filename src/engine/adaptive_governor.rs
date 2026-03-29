@@ -424,30 +424,11 @@ impl AdaptiveGovernor {
             adjusted_utility = (adjusted_utility - penalty).max(0.0);
         }
 
-        // Night mode: between midnight and 6AM, nobody is watching the screen.
-        // Non-GUI background processes with idle > 15min should be throttled to
-        // save energy. Raises the effective throttle bar for nighttime.
-        let is_night = hour_of_day < 6;
-        if is_night && !snap.has_gui_window && snap.secs_since_foreground > 900 && adjusted_utility < 0.55 {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Throttle,
-                tier,
-                utility_score: adjusted_utility,
-                waste_score: waste,
-                reason: format!(
-                    "Night mode (hour={}, idle={}s) — throttle to save energy",
-                    hour_of_day, snap.secs_since_foreground
-                ),
-            };
-        }
-
         // Foreground app helper detection: if a process name contains part of
         // the foreground app name (e.g., "com.apple.WebKit" when "Safari" is fg),
         // or is a known helper pattern for the foreground app, protect it.
-        // Must be checked BEFORE waste/swarm overrides — otherwise a Safari
-        // WebKit helper in a crowded system gets swarm-throttled.
+        // Must be checked BEFORE night mode/waste/swarm overrides — otherwise a
+        // Safari WebKit helper gets throttled by those checks first.
         if let Some(fg) = foreground_app {
             let is_fg_helper = snap.name.contains(fg)
                 || (fg == "Safari" && snap.name.contains("WebKit"))
@@ -467,6 +448,25 @@ impl AdaptiveGovernor {
             }
         }
 
+        // Night mode: between midnight and 6AM, nobody is watching the screen.
+        // Non-GUI background processes with idle > 15min should be throttled to
+        // save energy. Placed AFTER FG helper check so Safari tabs survive at 3AM.
+        let is_night = hour_of_day < 6;
+        if is_night && !snap.has_gui_window && snap.secs_since_foreground > 900 && adjusted_utility < 0.55 {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Throttle,
+                tier,
+                utility_score: adjusted_utility,
+                waste_score: waste,
+                reason: format!(
+                    "Night mode (hour={}, idle={}s) — throttle to save energy",
+                    hour_of_day, snap.secs_since_foreground
+                ),
+            };
+        }
+
         // Stale — strong candidate for freeze
         if tier == ProcessTier::Stale && adjusted_utility < self.config.freeze_utility_threshold {
             return ProcessDecision {
@@ -481,7 +481,7 @@ impl AdaptiveGovernor {
         }
 
         // Waste override — graduated curve: higher waste tolerates less utility.
-        // waste > 0.85 → throttle if utility < 0.60 (aggressive override)
+        // waste >= threshold (0.80 on 8GB, 0.90 default) → throttle if utility < 0.60
         // waste > 0.50 → throttle if utility < 0.40 (soft override, no GUI only)
         let waste_triggered = if waste >= self.config.waste_override_threshold {
             adjusted_utility < 0.6
