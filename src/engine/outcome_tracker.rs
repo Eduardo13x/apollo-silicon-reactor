@@ -158,6 +158,10 @@ pub struct OutcomeTracker {
     baseline_samples: u32,
     /// Queryable experience memory — ring buffer of resolved outcomes.
     pub experience: ExperienceMemory,
+    /// Process co-occurrence graph: tracks which processes appear together
+    /// during high-pressure events. Key = sorted pair (A, B), value = count.
+    /// Used to identify causal clusters (A+B always cause pressure together).
+    co_occurrence: HashMap<(String, String), u32>,
     /// Counterfactual: EMA of natural pressure drift when we DON'T act.
     /// Positive = pressure tends to drop naturally over 30s.
     /// Used to separate real causal effect from natural fluctuation.
@@ -180,6 +184,7 @@ impl OutcomeTracker {
             baseline_drop_ema: 0.0,
             baseline_samples: 0,
             experience: ExperienceMemory::new(500),
+            co_occurrence: HashMap::new(),
             natural_drift_ema: 0.0,
             prev_pressure: None,
             drift_accumulator: 0.0,
@@ -320,6 +325,58 @@ impl OutcomeTracker {
         self.total_resolved >= 10
             && self.overall_effectiveness() < 0.35
             && self.weights.values().any(|w| w.is_low_value())
+    }
+
+    // ── Process causal graph ────────────────────────────────────────────
+
+    /// Record which processes were active during a high-pressure event.
+    /// Builds a co-occurrence graph to identify causal clusters.
+    /// Call with the names of top-N processes during pressure spikes.
+    pub fn record_co_occurrence(&mut self, active_processes: &[String]) {
+        // Generate all unique pairs (sorted for consistency).
+        for i in 0..active_processes.len() {
+            for j in (i + 1)..active_processes.len() {
+                let (a, b) = if active_processes[i] <= active_processes[j] {
+                    (active_processes[i].clone(), active_processes[j].clone())
+                } else {
+                    (active_processes[j].clone(), active_processes[i].clone())
+                };
+                *self.co_occurrence.entry((a, b)).or_insert(0) += 1;
+            }
+        }
+
+        // GC: keep only top 100 pairs by count.
+        if self.co_occurrence.len() > 150 {
+            let mut counts: Vec<_> = self.co_occurrence.values().copied().collect();
+            counts.sort_unstable();
+            let cutoff = counts[counts.len().saturating_sub(100)];
+            // Use > to ensure we actually evict entries at the cutoff boundary.
+            self.co_occurrence.retain(|_, &mut v| v > cutoff);
+        }
+    }
+
+    /// Query the causal graph: top N co-occurring process pairs.
+    /// Returns pairs sorted by co-occurrence count (most frequent first).
+    pub fn top_causal_pairs(&self, n: usize) -> Vec<(&str, &str, u32)> {
+        let mut pairs: Vec<_> = self
+            .co_occurrence
+            .iter()
+            .map(|((a, b), &count)| (a.as_str(), b.as_str(), count))
+            .collect();
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.2));
+        pairs.truncate(n);
+        pairs
+    }
+
+    /// Check if two processes form a known causal cluster.
+    /// Returns the co-occurrence count if they've been seen together ≥ threshold times.
+    pub fn is_causal_pair(&self, proc_a: &str, proc_b: &str, min_count: u32) -> Option<u32> {
+        let (a, b) = if proc_a <= proc_b {
+            (proc_a.to_string(), proc_b.to_string())
+        } else {
+            (proc_b.to_string(), proc_a.to_string())
+        };
+        self.co_occurrence.get(&(a, b)).copied().filter(|&c| c >= min_count)
     }
 
     // ── Counterfactual baseline ──────────────────────────────────────────
@@ -791,6 +848,67 @@ mod tests {
         assert!(tracker.experience.is_empty());
         tracker.tick(0.70); // drop = 0.05
         assert_eq!(tracker.experience.len(), 1);
+    }
+
+    // ── Process causal graph tests ──────────────────────────────────────────────
+
+    #[test]
+    fn co_occurrence_builds_from_active_processes() {
+        let mut tracker = OutcomeTracker::new();
+        let procs = vec!["Chrome".into(), "Xcode".into(), "node".into()];
+        tracker.record_co_occurrence(&procs);
+
+        // Should have 3 pairs: (Chrome,Xcode), (Chrome,node), (Xcode,node)
+        assert_eq!(tracker.co_occurrence.len(), 3);
+        assert!(tracker.is_causal_pair("Chrome", "Xcode", 1).is_some());
+        assert!(tracker.is_causal_pair("Xcode", "Chrome", 1).is_some()); // order invariant
+    }
+
+    #[test]
+    fn co_occurrence_counts_accumulate() {
+        let mut tracker = OutcomeTracker::new();
+        let procs = vec!["Chrome".into(), "Xcode".into()];
+        for _ in 0..5 {
+            tracker.record_co_occurrence(&procs);
+        }
+        assert_eq!(tracker.is_causal_pair("Chrome", "Xcode", 5), Some(5));
+        assert!(tracker.is_causal_pair("Chrome", "Xcode", 6).is_none());
+    }
+
+    #[test]
+    fn top_causal_pairs_sorted_by_count() {
+        let mut tracker = OutcomeTracker::new();
+        // Pair A+B: 10 times
+        for _ in 0..10 {
+            tracker.record_co_occurrence(&vec!["A".into(), "B".into()]);
+        }
+        // Pair C+D: 3 times
+        for _ in 0..3 {
+            tracker.record_co_occurrence(&vec!["C".into(), "D".into()]);
+        }
+
+        let top = tracker.top_causal_pairs(2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0, "A");
+        assert_eq!(top[0].1, "B");
+        assert_eq!(top[0].2, 10);
+    }
+
+    #[test]
+    fn co_occurrence_gc_bounds_size() {
+        let mut tracker = OutcomeTracker::new();
+        // Generate 200 distinct pairs via 200 calls with 2 procs each.
+        for i in 0..200 {
+            let procs = vec![format!("p{i}"), format!("q{i}")];
+            tracker.record_co_occurrence(&procs);
+        }
+        // After GC at 151 entries, all count=1 entries are evicted.
+        // Subsequent inserts re-grow but won't hit 150 again.
+        assert!(
+            tracker.co_occurrence.len() < 200,
+            "GC should have pruned: {}",
+            tracker.co_occurrence.len()
+        );
     }
 
     #[test]

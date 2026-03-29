@@ -4413,6 +4413,12 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         0.0
                     };
+                    // Energy-aware routing: shift subsystem thresholds by battery/thermal.
+                    signal_intel.set_energy_bias(
+                        power_mgr.battery_status.percentage,
+                        power_mgr.battery_status.is_charging,
+                        thermal_emergency,
+                    );
                     signal_intel.tick(
                         snapshot.pressure.memory_pressure,
                         snapshot.pressure.swap_delta_bytes_per_sec,
@@ -4482,25 +4488,48 @@ fn main() -> anyhow::Result<()> {
                         outcome_tracker.overall_effectiveness(),
                         lv_ratio,
                     );
-                    let mut intervention = predictive_agent.select_action(&agent_ctx);
+                    let linucb_choice = predictive_agent.select_action(&agent_ctx);
 
-                    // ── Hazard override: if P(OOM) > 30%, don't just Observe. ────
-                    if intervention == Intervention::Observe && signal_digest.p_oom_30s > 0.30 {
-                        // Use MPC recommendation as the override action.
-                        intervention = Intervention::from_index(signal_digest.mpc_recommendation);
+                    // ── Specialist voting: weighted ensemble replaces override chain ──
+                    use apollo_optimizer::engine::predictive_agent::{SpecialistVote, tally_votes};
+                    let mut votes = vec![
+                        // LinUCB: primary agent, moderate confidence.
+                        SpecialistVote {
+                            name: "linucb",
+                            intervention: linucb_choice,
+                            confidence: 0.5,
+                        },
+                    ];
+
+                    // Hazard specialist: high P(OOM) → use MPC recommendation.
+                    if signal_digest.p_oom_30s > 0.30 {
+                        votes.push(SpecialistVote {
+                            name: "hazard",
+                            intervention: Intervention::from_index(signal_digest.mpc_recommendation),
+                            confidence: signal_digest.p_oom_30s.min(1.0),
+                        });
                     }
 
-                    // ── Monopoly risk: if a single process is hogging RAM, prefer throttle. ──
-                    if intervention == Intervention::Observe && signal_digest.monopoly_risk > 0.5 {
-                        intervention = Intervention::PreThrottleNoise;
+                    // Monopoly specialist: one process hogging RAM → throttle noise.
+                    if signal_digest.monopoly_risk > 0.5 {
+                        votes.push(SpecialistVote {
+                            name: "monopoly",
+                            intervention: Intervention::PreThrottleNoise,
+                            confidence: signal_digest.monopoly_risk.min(1.0) * 0.7,
+                        });
                     }
 
-                    // ── Kalman predicted pressure: if 5s prediction > 0.85, tighten. ────
-                    if intervention == Intervention::Observe
-                        && signal_digest.pressure_predicted_5s > 0.85
-                    {
-                        intervention = Intervention::TightenThresholds;
+                    // Kalman specialist: predicted pressure spike → tighten.
+                    if signal_digest.pressure_predicted_5s > 0.85 {
+                        votes.push(SpecialistVote {
+                            name: "kalman",
+                            intervention: Intervention::TightenThresholds,
+                            confidence: (signal_digest.pressure_predicted_5s - 0.85).min(0.15) / 0.15 * 0.8,
+                        });
                     }
+
+                    let vote_result = tally_votes(&votes);
+                    let intervention = vote_result.intervention;
 
                     // Apply threshold tightening if selected.
                     overflow_thresholds = predictive_agent.adjust_thresholds(overflow_thresholds);
@@ -5530,6 +5559,16 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // Causal graph: record process co-occurrence during high-pressure events.
+                if snapshot.pressure.memory_pressure >= 0.60 {
+                    let active: Vec<String> = snapshot.top_processes
+                        .iter()
+                        .take(10)
+                        .map(|p| p.name.clone())
+                        .collect();
+                    outcome_tracker.record_co_occurrence(&active);
+                }
+
                 // Counterfactual: observe pressure drift. If no throttles this cycle,
                 // the tracker learns the natural drift rate (what happens without action).
                 outcome_tracker.observe_cycle(
@@ -5549,6 +5588,17 @@ fn main() -> anyhow::Result<()> {
                         for (name, weight) in &outcome_tracker.weights {
                             policy.pattern_weights.insert(name.clone(), weight.clone());
                         }
+                    }
+                }
+
+                // Lifelong zone learning: feed outcome effectiveness to router zones.
+                // Effective actions → lower zone thresholds (engage earlier).
+                // Ineffective actions → raise thresholds (be more conservative).
+                {
+                    let effectiveness = outcome_tracker.overall_effectiveness();
+                    let pressure = signal_digest.pressure_smooth;
+                    if outcome_tracker.total_resolved > 10 {
+                        signal_intel.zone_feedback(pressure, effectiveness > 0.50);
                     }
                 }
 

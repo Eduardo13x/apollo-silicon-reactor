@@ -71,6 +71,66 @@ impl Intervention {
     }
 }
 
+// ── Specialist voting ────────────────────────────────────────────────────────
+
+/// A specialist's vote: proposed intervention + confidence (0–1).
+#[derive(Debug, Clone)]
+pub struct SpecialistVote {
+    /// Who is voting.
+    pub name: &'static str,
+    /// Proposed intervention.
+    pub intervention: Intervention,
+    /// Confidence in this proposal (0–1). Higher = more weight.
+    pub confidence: f64,
+}
+
+/// Result of tallying specialist votes.
+#[derive(Debug)]
+pub struct VotingResult {
+    /// The winning intervention.
+    pub intervention: Intervention,
+    /// Whether specialists disagreed (at least 2 different non-Observe proposals).
+    pub had_disagreement: bool,
+    /// Total weighted score for the winner.
+    pub winning_score: f64,
+}
+
+/// Tally specialist votes using weighted scoring.
+/// Each intervention accumulates confidence from its voters.
+/// Highest total confidence wins. Ties go to the safer option (lower index).
+pub fn tally_votes(votes: &[SpecialistVote]) -> VotingResult {
+    let mut scores = [0.0_f64; K];
+    for v in votes {
+        scores[v.intervention.index()] += v.confidence;
+    }
+
+    // Find winner (highest score; ties favor lower index = safer).
+    let mut best_idx = 0;
+    let mut best_score = scores[0];
+    for (i, &s) in scores.iter().enumerate().skip(1) {
+        if s > best_score {
+            best_score = s;
+            best_idx = i;
+        }
+    }
+
+    // Detect disagreement: ≥2 different non-Observe proposals.
+    let non_observe_proposals: Vec<usize> = votes
+        .iter()
+        .filter(|v| v.intervention != Intervention::Observe)
+        .map(|v| v.intervention.index())
+        .collect();
+    let unique_proposals: std::collections::HashSet<usize> =
+        non_observe_proposals.iter().copied().collect();
+    let had_disagreement = unique_proposals.len() >= 2;
+
+    VotingResult {
+        intervention: Intervention::from_index(best_idx),
+        had_disagreement,
+        winning_score: best_score,
+    }
+}
+
 // ── Context vector ───────────────────────────────────────────────────────────
 
 /// 12-dimensional context built from already-collected signals.
@@ -865,5 +925,99 @@ mod tests {
             "TightenThresholds should be more valued on 8GB ({}) than 32GB ({})",
             avg_low[1], avg_high[1]
         );
+    }
+
+    // ── Specialist voting tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_voting_single_specialist_wins() {
+        let votes = vec![SpecialistVote {
+            name: "linucb",
+            intervention: Intervention::TightenThresholds,
+            confidence: 0.8,
+        }];
+        let result = tally_votes(&votes);
+        assert_eq!(result.intervention, Intervention::TightenThresholds);
+        assert!(!result.had_disagreement);
+    }
+
+    #[test]
+    fn test_voting_highest_confidence_wins() {
+        let votes = vec![
+            SpecialistVote {
+                name: "linucb",
+                intervention: Intervention::Observe,
+                confidence: 0.3,
+            },
+            SpecialistVote {
+                name: "hazard",
+                intervention: Intervention::SuggestAggressive,
+                confidence: 0.9,
+            },
+        ];
+        let result = tally_votes(&votes);
+        assert_eq!(result.intervention, Intervention::SuggestAggressive);
+    }
+
+    #[test]
+    fn test_voting_detects_disagreement() {
+        let votes = vec![
+            SpecialistVote {
+                name: "hazard",
+                intervention: Intervention::SuggestAggressive,
+                confidence: 0.5,
+            },
+            SpecialistVote {
+                name: "monopoly",
+                intervention: Intervention::PreThrottleNoise,
+                confidence: 0.5,
+            },
+        ];
+        let result = tally_votes(&votes);
+        assert!(result.had_disagreement, "two different non-Observe proposals = disagreement");
+    }
+
+    #[test]
+    fn test_voting_same_intervention_accumulates() {
+        let votes = vec![
+            SpecialistVote {
+                name: "hazard",
+                intervention: Intervention::TightenThresholds,
+                confidence: 0.4,
+            },
+            SpecialistVote {
+                name: "kalman",
+                intervention: Intervention::TightenThresholds,
+                confidence: 0.5,
+            },
+            SpecialistVote {
+                name: "linucb",
+                intervention: Intervention::Observe,
+                confidence: 0.6,
+            },
+        ];
+        let result = tally_votes(&votes);
+        // TightenThresholds: 0.4+0.5 = 0.9 > Observe: 0.6
+        assert_eq!(result.intervention, Intervention::TightenThresholds);
+        assert!((result.winning_score - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_voting_tie_favors_safer_option() {
+        let votes = vec![
+            SpecialistVote {
+                name: "a",
+                intervention: Intervention::Observe,
+                confidence: 0.5,
+            },
+            SpecialistVote {
+                name: "b",
+                intervention: Intervention::SuggestAggressive,
+                confidence: 0.5,
+            },
+        ];
+        let result = tally_votes(&votes);
+        // Equal scores → lower index (Observe=0) wins.
+        assert_eq!(result.intervention, Intervention::Observe);
     }
 }

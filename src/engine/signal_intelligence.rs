@@ -115,6 +115,19 @@ pub struct SignalIntelligence {
     utility_hazard: f64,
     utility_lotka: f64,
     utility_mpc: f64,
+
+    // ── Energy-aware routing bias ───────────────────────────────────────
+    // Shifts router zone thresholds based on battery/thermal state.
+    // Positive = conserve energy (raise thresholds, skip more).
+    // Negative = thermal emergency (lower thresholds, act faster).
+    // Range: -0.15 to +0.15.
+    energy_bias: f64,
+
+    // ── Lifelong zone learning ──────────────────────────────────────────
+    // Adaptive mid/high zone entry points that evolve from outcome data.
+    // Start at defaults (0.30/0.50) and shift ±0.10 based on feedback.
+    learned_mid_entry: f64,
+    learned_high_entry: f64,
 }
 
 impl Default for SignalIntelligence {
@@ -157,6 +170,11 @@ impl SignalIntelligence {
             utility_hazard: 0.5,
             utility_lotka: 0.5,
             utility_mpc: 0.5,
+
+            energy_bias: 0.0,
+
+            learned_mid_entry: 0.30,
+            learned_high_entry: 0.50,
         }
     }
 
@@ -214,17 +232,20 @@ impl SignalIntelligence {
             self.cusum_pressure.reset_target(memory_pressure);
         }
 
-        // ── Adaptive router (MoR-inspired + budget cognitivo) ────────────
-        // Three zones:
-        //   Low  (< 0.30): skip all heavy subsystems
-        //   Mid  (0.30–0.50): run only subsystems with utility > 0.15
-        //   High (≥ 0.50): run everything
+        // ── Adaptive router (MoR-inspired + budget cognitivo + energy) ────
+        // Three zones with energy-adaptive thresholds:
+        //   Low  (< mid_entry): skip all heavy subsystems
+        //   Mid  (mid_entry..high_entry): run only subsystems with utility > 0.15
+        //   High (≥ high_entry): run everything
+        // Energy bias: positive = conserve (raise thresholds), negative = emergency (lower).
         // Kalman + CUSUM always run (O(1), needed for change detection).
         const UTIL_ALPHA: f64 = 0.05;
         const UTIL_THRESHOLD: f64 = 0.15;
 
-        let all_heavy = pressure_smooth >= 0.50;
-        let mid_zone = !all_heavy && pressure_smooth >= 0.30;
+        let mid_entry = (self.learned_mid_entry + self.energy_bias).clamp(0.15, 0.45);
+        let high_entry = (self.learned_high_entry + self.energy_bias).clamp(0.30, 0.65);
+        let all_heavy = pressure_smooth >= high_entry;
+        let mid_zone = !all_heavy && pressure_smooth >= mid_entry;
         // In mid zone, per-subsystem gate; in high zone, always run.
         let run_entropy = all_heavy || (mid_zone && self.utility_entropy > UTIL_THRESHOLD);
         let run_hazard = all_heavy || (mid_zone && self.utility_hazard > UTIL_THRESHOLD);
@@ -377,6 +398,56 @@ impl SignalIntelligence {
     /// Returns [entropy, hazard, lotka, mpc] — each in 0–1.
     pub fn subsystem_utilities(&self) -> [f64; 4] {
         [self.utility_entropy, self.utility_hazard, self.utility_lotka, self.utility_mpc]
+    }
+
+    /// Lifelong learning: adjust zone thresholds based on outcome feedback.
+    ///
+    /// - `pressure_at_action`: pressure when the system decided to act.
+    /// - `was_effective`: true if the action reduced pressure meaningfully.
+    ///
+    /// If actions at low pressure are wasteful, raise mid_entry (skip more).
+    /// If actions at moderate pressure are effective, lower thresholds (engage earlier).
+    pub fn zone_feedback(&mut self, pressure_at_action: f64, was_effective: bool) {
+        const ZONE_ALPHA: f64 = 0.005; // very slow adaptation
+
+        if was_effective && pressure_at_action < self.learned_mid_entry + 0.05 {
+            // Effective action near the mid_entry boundary → lower it (engage earlier).
+            self.learned_mid_entry =
+                (self.learned_mid_entry - ZONE_ALPHA).clamp(0.20, 0.40);
+            self.learned_high_entry =
+                (self.learned_high_entry - ZONE_ALPHA).clamp(0.35, 0.60);
+        } else if !was_effective && pressure_at_action < self.learned_high_entry {
+            // Ineffective action below high_entry → raise thresholds (be more conservative).
+            self.learned_mid_entry =
+                (self.learned_mid_entry + ZONE_ALPHA).clamp(0.20, 0.40);
+            self.learned_high_entry =
+                (self.learned_high_entry + ZONE_ALPHA).clamp(0.35, 0.60);
+        }
+    }
+
+    /// Current learned zone boundaries (for observability).
+    pub fn learned_zones(&self) -> (f64, f64) {
+        (self.learned_mid_entry, self.learned_high_entry)
+    }
+
+    /// Set energy-aware routing bias.
+    ///
+    /// - `battery_pct`: 0–100 battery percentage (ignored if charging).
+    /// - `is_charging`: true if on AC power.
+    /// - `thermal_emergency`: true if in thermal emergency phase.
+    ///
+    /// Effect: shifts router zone thresholds to save CPU when battery is low,
+    /// or to engage everything when thermal management needs fast decisions.
+    pub fn set_energy_bias(&mut self, battery_pct: u32, is_charging: bool, thermal_emergency: bool) {
+        self.energy_bias = if thermal_emergency {
+            -0.15 // lower thresholds → run everything → act fast
+        } else if !is_charging && battery_pct < 20 {
+            0.15 // critical battery → raise thresholds → conserve CPU
+        } else if !is_charging && battery_pct < 50 {
+            0.08 // low battery → moderate conservation
+        } else {
+            0.0 // plugged in or plenty of battery
+        };
     }
 
     /// Persist learned state to disk.
@@ -701,5 +772,103 @@ mod tests {
         // Low-utility subsystems should be skipped in mid zone.
         assert_eq!(d.mpc_recommendation, 0, "MPC should be skipped (utility=0)");
         assert_eq!(d.entropy_anomaly, 0.0, "Entropy should be skipped (utility=0)");
+    }
+
+    // ── Energy-aware routing tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_energy_bias_low_battery_skips_more() {
+        let mut si = SignalIntelligence::new();
+        // Critical battery: bias = +0.15, so mid_entry = 0.45, high_entry = 0.65.
+        si.set_energy_bias(15, false, false);
+
+        // Warm up Kalman to 0.40 — normally mid-zone, but with bias it's LOW zone.
+        for _ in 0..30 {
+            si.tick(
+                0.40, 10.0, 0.01, 0.05,
+                &[5.0, 3.0], &[100e6, 50e6],
+                "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+            );
+        }
+        let d = si.tick(
+            0.40, 10.0, 0.01, 0.05,
+            &[5.0, 3.0], &[100e6, 50e6],
+            "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+        );
+        // At 0.40 with bias +0.15, we're below mid_entry (0.45) → skip all heavy.
+        assert_eq!(d.entropy_anomaly, 0.0, "entropy skipped on low battery at 0.40");
+        assert_eq!(d.mpc_recommendation, 0, "MPC skipped on low battery at 0.40");
+    }
+
+    #[test]
+    fn test_energy_bias_thermal_emergency_engages_more() {
+        let mut si = SignalIntelligence::new();
+        // Thermal emergency: bias = -0.15, so mid_entry = 0.15, high_entry = 0.35.
+        si.set_energy_bias(100, true, true);
+
+        // Warm up Kalman to 0.35 — normally low zone, but with thermal bias it's HIGH zone.
+        for _ in 0..30 {
+            si.tick(
+                0.38, 10.0, 0.01, 0.05,
+                &[5.0, 3.0], &[100e6, 50e6],
+                "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+            );
+        }
+        let d = si.tick(
+            0.38, 10.0, 0.01, 0.05,
+            &[5.0, 3.0], &[100e6, 50e6],
+            "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+        );
+        // At 0.38 with bias -0.15, high_entry=0.35, so we're in ALL_HEAVY zone.
+        // Kalman smoothed pressure should be ~0.38 > 0.35.
+        assert!(d.pressure_smooth > 0.34, "pressure should be near 0.38: {}", d.pressure_smooth);
+    }
+
+    #[test]
+    fn test_energy_bias_plugged_in_no_effect() {
+        let mut si = SignalIntelligence::new();
+        si.set_energy_bias(50, true, false); // charging, no thermal
+        assert!((si.energy_bias).abs() < 1e-9, "plugged in = no bias");
+    }
+
+    // ── Lifelong zone learning tests ────────────────────────────────────────
+
+    #[test]
+    fn test_zone_feedback_effective_action_lowers_entry() {
+        let mut si = SignalIntelligence::new();
+        let (mid_before, high_before) = si.learned_zones();
+
+        // Effective action near mid_entry → lower thresholds.
+        for _ in 0..100 {
+            si.zone_feedback(0.32, true); // near 0.30 mid_entry
+        }
+        let (mid_after, high_after) = si.learned_zones();
+        assert!(mid_after < mid_before, "mid_entry should decrease: {} < {}", mid_after, mid_before);
+        assert!(high_after < high_before, "high_entry should decrease: {} < {}", high_after, high_before);
+    }
+
+    #[test]
+    fn test_zone_feedback_ineffective_action_raises_entry() {
+        let mut si = SignalIntelligence::new();
+        let (mid_before, _) = si.learned_zones();
+
+        // Ineffective action below high_entry → raise thresholds.
+        for _ in 0..100 {
+            si.zone_feedback(0.40, false); // below 0.50 high_entry
+        }
+        let (mid_after, _) = si.learned_zones();
+        assert!(mid_after > mid_before, "mid_entry should increase: {} > {}", mid_after, mid_before);
+    }
+
+    #[test]
+    fn test_zone_learning_bounded() {
+        let mut si = SignalIntelligence::new();
+        // Push zones to extremes.
+        for _ in 0..10000 {
+            si.zone_feedback(0.25, true);
+        }
+        let (mid, high) = si.learned_zones();
+        assert!(mid >= 0.20, "mid_entry clamped at 0.20: {}", mid);
+        assert!(high >= 0.35, "high_entry clamped at 0.35: {}", high);
     }
 }

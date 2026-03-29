@@ -17,6 +17,37 @@
 //! if detector.anomaly_score() > 0.5 { /* workload changed significantly */ }
 //! ```
 
+use std::collections::HashMap;
+
+/// Compact fingerprint of a workload distribution.
+/// Buckets entropy into 0.25-bit bands and counts processes.
+/// Two distributions with the same fingerprint produce similar anomaly scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorkloadFingerprint {
+    /// Entropy bucketed to 0.25 bits (e.g., 2.75 → 11).
+    entropy_bucket: u16,
+    /// Number of active processes (capped at 255).
+    process_count: u8,
+}
+
+impl WorkloadFingerprint {
+    fn from_entropy_and_count(entropy: f64, count: usize) -> Self {
+        Self {
+            entropy_bucket: (entropy / 0.25).round() as u16,
+            process_count: count.min(255) as u8,
+        }
+    }
+}
+
+/// Cached knowledge about a fingerprint.
+#[derive(Debug, Clone)]
+struct FingerprintEntry {
+    /// Running average anomaly score for this fingerprint.
+    avg_anomaly: f64,
+    /// How many times we've seen this fingerprint.
+    hits: u32,
+}
+
 /// Detector de anomalía basado en entropía de Shannon.
 #[derive(Debug)]
 pub struct EntropyDetector {
@@ -30,6 +61,10 @@ pub struct EntropyDetector {
     alpha: f64,
     /// true una vez que tengamos suficientes observaciones.
     initialized: bool,
+    /// Fingerprint cache: recognized workload patterns → expected anomaly score.
+    fingerprints: HashMap<WorkloadFingerprint, FingerprintEntry>,
+    /// Last fingerprint (for external query).
+    last_fingerprint: Option<WorkloadFingerprint>,
 }
 
 impl EntropyDetector {
@@ -40,6 +75,8 @@ impl EntropyDetector {
             max_history: 60, // ~30s de historia a 0.5s/ciclo
             alpha: 0.1,
             initialized: false,
+            fingerprints: HashMap::new(),
+            last_fingerprint: None,
         }
     }
 }
@@ -76,6 +113,7 @@ impl EntropyDetector {
     /// - `mem_values`: memory_usage de cada proceso (top N).
     ///
     /// Usa la media de ambas entropías como señal combinada.
+    /// Also updates the fingerprint cache for pattern recognition.
     pub fn update(&mut self, cpu_values: &[f64], mem_values: &[f64]) {
         let h_cpu = Self::shannon_entropy(cpu_values);
         let h_mem = Self::shannon_entropy(mem_values);
@@ -93,6 +131,11 @@ impl EntropyDetector {
         if self.history.len() > self.max_history {
             self.history.remove(0);
         }
+
+        // Generate fingerprint for this workload state.
+        let process_count = cpu_values.len().max(mem_values.len());
+        self.last_fingerprint =
+            Some(WorkloadFingerprint::from_entropy_and_count(h_combined, process_count));
     }
 
     /// Score de anomalía: cuántas desviaciones estándar está la entropía actual
@@ -101,19 +144,41 @@ impl EntropyDetector {
     /// - > 0: entropía por encima de lo normal (más procesos compitiendo)
     /// - < 0: entropía por debajo de lo normal (proceso dominante)
     /// - |score| > 2.0: anomalía significativa
-    pub fn anomaly_score(&self) -> f64 {
-        if self.history.len() < 5 {
-            return 0.0;
+    ///
+    /// Also updates the fingerprint cache with the computed score.
+    pub fn anomaly_score(&mut self) -> f64 {
+        let score = if self.history.len() < 5 {
+            0.0
+        } else {
+            let mean: f64 = self.history.iter().sum::<f64>() / self.history.len() as f64;
+            let variance: f64 = self.history.iter().map(|h| (h - mean).powi(2)).sum::<f64>()
+                / self.history.len() as f64;
+            let std_dev = variance.sqrt();
+            if std_dev < 1e-6 {
+                0.0
+            } else {
+                let current = *self.history.last().unwrap_or(&mean);
+                (current - mean) / std_dev
+            }
+        };
+
+        // Update fingerprint cache with this observation (even if score is 0).
+        if let Some(fp) = self.last_fingerprint {
+            let entry = self.fingerprints.entry(fp).or_insert(FingerprintEntry {
+                avg_anomaly: score,
+                hits: 0,
+            });
+            entry.hits += 1;
+            entry.avg_anomaly += 0.1 * (score - entry.avg_anomaly);
+
+            // GC: if cache grows too large, evict least-seen entries.
+            if self.fingerprints.len() > 200 {
+                let min_hits = self.fingerprints.values().map(|e| e.hits).min().unwrap_or(0);
+                self.fingerprints.retain(|_, e| e.hits > min_hits);
+            }
         }
-        let mean: f64 = self.history.iter().sum::<f64>() / self.history.len() as f64;
-        let variance: f64 = self.history.iter().map(|h| (h - mean).powi(2)).sum::<f64>()
-            / self.history.len() as f64;
-        let std_dev = variance.sqrt();
-        if std_dev < 1e-6 {
-            return 0.0;
-        }
-        let current = *self.history.last().unwrap_or(&mean);
-        (current - mean) / std_dev
+
+        score
     }
 
     /// Entropía suavizada actual.
@@ -124,6 +189,24 @@ impl EntropyDetector {
     /// Entropía actual (última observación sin suavizar).
     pub fn current(&self) -> f64 {
         *self.history.last().unwrap_or(&0.0)
+    }
+
+    /// Check if the current workload fingerprint has been seen before.
+    /// Returns (expected_anomaly, confidence) if recognized, None if new pattern.
+    /// Confidence saturates at 1.0 after 50 observations.
+    pub fn recognized_pattern(&self) -> Option<(f64, f64)> {
+        let fp = self.last_fingerprint?;
+        let entry = self.fingerprints.get(&fp)?;
+        if entry.hits < 3 {
+            return None; // not enough data
+        }
+        let confidence = (entry.hits as f64 / 50.0).min(1.0);
+        Some((entry.avg_anomaly, confidence))
+    }
+
+    /// Number of unique fingerprints in the cache.
+    pub fn fingerprint_count(&self) -> usize {
+        self.fingerprints.len()
     }
 }
 
@@ -177,7 +260,7 @@ mod tests {
             );
         }
         // Cambio súbito: 20 procesos iguales (build paralelo).
-        det.update(&vec![5.0; 20], &vec![100.0; 20]);
+        det.update(&[5.0; 20], &[100.0; 20]);
         assert!(
             det.anomaly_score() > 1.0,
             "sudden change → anomaly_score > 1.0, got {}",
@@ -189,5 +272,79 @@ mod tests {
     fn test_empty_values_zero_entropy() {
         assert_eq!(EntropyDetector::shannon_entropy(&[]), 0.0);
         assert_eq!(EntropyDetector::shannon_entropy(&[0.0, 0.0]), 0.0);
+    }
+
+    // ── Fingerprinting tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_fingerprint_built_on_update() {
+        let mut det = EntropyDetector::new();
+        assert!(det.last_fingerprint.is_none());
+        det.update(&[30.0, 20.0, 10.0], &[500.0, 300.0, 100.0]);
+        assert!(det.last_fingerprint.is_some());
+    }
+
+    #[test]
+    fn test_fingerprint_recognized_after_repeated_pattern() {
+        let mut det = EntropyDetector::new();
+        let cpu = [30.0, 20.0, 15.0, 10.0, 5.0];
+        let mem = [500.0, 300.0, 200.0, 100.0, 50.0];
+
+        // 10 cycles to build history for z-score calculation.
+        for _ in 0..10 {
+            det.update(&cpu, &mem);
+            det.anomaly_score();
+        }
+
+        // Same distribution → same fingerprint, should be recognized.
+        assert!(det.fingerprint_count() > 0);
+        // After enough hits, recognized_pattern should return Some.
+        let result = det.recognized_pattern();
+        assert!(result.is_some(), "pattern should be recognized after 10 hits");
+        let (avg_anomaly, confidence) = result.unwrap();
+        // Stable pattern → anomaly near 0.
+        assert!(avg_anomaly.abs() < 1.5, "stable pattern anomaly should be low: {}", avg_anomaly);
+        assert!(confidence > 0.0, "should have some confidence");
+    }
+
+    #[test]
+    fn test_fingerprint_different_workloads_different_fingerprints() {
+        let mut det = EntropyDetector::new();
+        // Workload A: 5 processes.
+        for _ in 0..5 {
+            det.update(&[30.0, 20.0, 15.0, 10.0, 5.0], &[500.0, 300.0, 200.0, 100.0, 50.0]);
+            det.anomaly_score();
+        }
+        let count_after_a = det.fingerprint_count();
+
+        // Workload B: 20 uniform processes (very different entropy).
+        for _ in 0..5 {
+            det.update(&[5.0; 20], &[100.0; 20]);
+            det.anomaly_score();
+        }
+        let count_after_b = det.fingerprint_count();
+
+        assert!(
+            count_after_b > count_after_a,
+            "different workloads should produce different fingerprints: {} > {}",
+            count_after_b, count_after_a
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_cache_gc_limits_size() {
+        let mut det = EntropyDetector::new();
+        // Generate 250 distinct fingerprints (vary process count).
+        for i in 1..=250 {
+            let cpu: Vec<f64> = (0..i).map(|j| (j as f64 + 1.0) * 0.1).collect();
+            let mem: Vec<f64> = (0..i).map(|j| (j as f64 + 1.0) * 100.0).collect();
+            det.update(&cpu, &mem);
+            det.anomaly_score(); // triggers GC when >200
+        }
+        assert!(
+            det.fingerprint_count() <= 200,
+            "cache should be bounded: {}",
+            det.fingerprint_count()
+        );
     }
 }
