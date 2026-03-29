@@ -189,7 +189,7 @@ impl AdaptiveGovernor {
             }
 
             let utility = score_utility(snap);
-            let decision = self.decide_one(snap, *tier, utility, *waste, workload, classified.len(), foreground_app);
+            let decision = self.decide_one(snap, *tier, utility, *waste, workload, classified.len(), foreground_app, hour_of_day);
             decisions.push(decision);
         }
 
@@ -225,6 +225,7 @@ impl AdaptiveGovernor {
         workload: WorkloadType,
         process_count: usize,
         foreground_app: Option<&str>,
+        hour_of_day: u8,
     ) -> ProcessDecision {
         // Zombie/orphan — always kill regardless of other signals.
         // A process with dead parent or zombie flag is leaked; its CPU/RSS
@@ -421,6 +422,25 @@ impl AdaptiveGovernor {
                 (snap.rss_bytes as f64 - 500.0 * 1024.0 * 1024.0) / (1024.0 * 1024.0 * 1024.0);
             let penalty = (excess_gb * 0.10).min(0.20) as f32;
             adjusted_utility = (adjusted_utility - penalty).max(0.0);
+        }
+
+        // Night mode: between midnight and 6AM, nobody is watching the screen.
+        // Non-GUI background processes with idle > 15min should be throttled to
+        // save energy. Raises the effective throttle bar for nighttime.
+        let is_night = hour_of_day < 6;
+        if is_night && !snap.has_gui_window && snap.secs_since_foreground > 900 && adjusted_utility < 0.55 {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Throttle,
+                tier,
+                utility_score: adjusted_utility,
+                waste_score: waste,
+                reason: format!(
+                    "Night mode (hour={}, idle={}s) — throttle to save energy",
+                    hour_of_day, snap.secs_since_foreground
+                ),
+            };
         }
 
         // Foreground app helper detection: if a process name contains part of
