@@ -259,7 +259,26 @@ impl SignalIntelligence {
         // ── 3. Entropía ──────────────────────────────────────────────────
         let entropy_anomaly = if run_entropy {
             self.entropy.update(cpu_values, mem_values);
-            self.entropy.anomaly_score()
+            let raw_score = self.entropy.anomaly_score();
+            // Cable: recognized_pattern() suppresses false alarms.
+            // If this workload fingerprint has been seen before and its historical
+            // anomaly is close to the current score, it's not a real anomaly —
+            // it's a known regime that just looks unusual to the sliding window.
+            if let Some((expected, confidence)) = self.entropy.recognized_pattern() {
+                if confidence > 0.5 {
+                    // Attenuate: the more confident we are this is a known pattern,
+                    // the more we trust the expected anomaly over the raw score.
+                    // residual = how far the raw score deviates from what we expect
+                    // for this fingerprint. Only the residual is a real anomaly.
+                    let residual = raw_score - expected;
+                    // Blend: at confidence=1.0, use 100% residual; at 0.5, use 50/50.
+                    raw_score * (1.0 - confidence) + residual * confidence
+                } else {
+                    raw_score
+                }
+            } else {
+                raw_score
+            }
         } else {
             0.0
         };

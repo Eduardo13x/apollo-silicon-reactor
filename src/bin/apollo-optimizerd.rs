@@ -31,9 +31,10 @@ use apollo_optimizer::engine::analytics::AnalyticsEngine;
 use apollo_optimizer::engine::background_collectors::PressureCollector;
 use apollo_optimizer::engine::capabilities::detect_capabilities;
 use apollo_optimizer::engine::compressor_aware::{
-    decide_enhanced, query_memory_profile,
+    decide_enhanced, query_memory_profile, scan_regions,
     sample_process_temperature, MemoryAction,
 };
+use apollo_optimizer::engine::workload_classifier::classify_by_memory;
 use apollo_optimizer::engine::decide_actions::decide_actions;
 use apollo_optimizer::engine::energy::EnergyTracker;
 use apollo_optimizer::engine::execute_actions::execute_actions;
@@ -4598,6 +4599,20 @@ fn main() -> anyhow::Result<()> {
                     let vote_result = tally_votes(&votes);
                     let intervention = vote_result.intervention;
 
+                    // Cable: had_disagreement → audit when specialists disagree.
+                    // Disagreement means different specialists see different signals,
+                    // which indicates an ambiguous state worth logging for analysis.
+                    if vote_result.had_disagreement {
+                        audit_log(&serde_json::json!({
+                            "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            "event": "specialist_disagreement",
+                            "winner": format!("{:?}", intervention),
+                            "score": (vote_result.winning_score * 100.0).round() / 100.0,
+                            "n_votes": votes.len(),
+                            "pressure": (signal_digest.pressure_smooth * 1000.0).round() / 1000.0,
+                        }));
+                    }
+
                     // Apply threshold tightening if selected.
                     overflow_thresholds = predictive_agent.adjust_thresholds(overflow_thresholds);
 
@@ -4917,9 +4932,20 @@ fn main() -> anyhow::Result<()> {
                                     // Fallback: sysinfo process — limited signals but real RSS.
                                     (process.cpu_usage(), 0.0, false, false, 3600, process.memory())
                                 };
-                            let score = behavioral_protection_score(
+                            let raw_score = behavioral_protection_score(
                                 cpu, wakeups, net, gui, idle_s, rss, total_ram,
                             );
+                            // Cable 5: process_relevance() → modulate BPS with user profile.
+                            // If the user actively uses this process (relevance > 0), boost
+                            // its behavioral score. If irrelevant (0.0), no change.
+                            // This means a dev runtime the user has interacted with recently
+                            // gets a relevance bonus, while one that's been stale loses it.
+                            let relevance = {
+                                let gov = state.adaptive_governor.lock_recover();
+                                gov.user_profile.process_relevance(&name)
+                            };
+                            // Boost: relevance 1.0 adds up to +0.15 to score, relevance 0.0 adds 0.
+                            let score = raw_score + (relevance as f64 * 0.15);
                             bps_eval += 1;
                             let protected = score >= pressure as f64;
                             if score < bps_min {
@@ -4932,6 +4958,8 @@ fn main() -> anyhow::Result<()> {
                                 "pid": pid_u32,
                                 "name": name,
                                 "score": (score * 10000.0).round() / 10000.0,
+                                "raw_score": (raw_score * 10000.0).round() / 10000.0,
+                                "relevance": (relevance * 100.0).round() / 100.0,
                                 "pressure": (pressure * 1000.0).round() / 1000.0,
                                 "protected": protected,
                                 "cpu": cpu,
@@ -4970,6 +4998,22 @@ fn main() -> anyhow::Result<()> {
                     &actions,
                     &heuristic_critical_pids,
                 );
+                // Cable 2: query_similar() → skip throttles that experience says won't work.
+                // If we have ≥3 records of throttling process X at similar pressure and it
+                // never helped (avg_drop ≤ 0), skip wasting the action budget on it.
+                let current_pressure = snapshot.pressure.memory_pressure;
+                let heuristic_actions: Vec<RootAction> = heuristic_actions.into_iter().filter(|a| {
+                    if let RootAction::ThrottleProcess { ref name, .. } = a {
+                        if let Some((avg_drop, confidence)) = outcome_tracker.experience.query_similar(name, current_pressure) {
+                            if confidence >= 0.5 && avg_drop <= 0.0 {
+                                // Experience says throttling this process at this pressure
+                                // has never reduced pressure. Skip it.
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                }).collect();
                 actions.extend(heuristic_actions);
 
                 // Survival Mode: active when memory pressure is critical or swap is thrashing.
@@ -5477,7 +5521,7 @@ fn main() -> anyhow::Result<()> {
                     let mut ds_skip = 0u64;
                     let mut ds_hint = 0u64;
                     let confirmed_actions: Vec<RootAction> = confirmed_actions.into_iter().filter_map(|a| {
-                        if let RootAction::FreezeProcess { pid, name: _, ref reason, .. } = a {
+                        if let RootAction::FreezeProcess { pid, name: ref freeze_name, ref reason, .. } = a {
                             if let Some(profile) = query_memory_profile(pid) {
                                 ds_scans += 1;
                                 let fault_rate = mem_analyzer.major_fault_rate(pid);
@@ -5488,6 +5532,26 @@ fn main() -> anyhow::Result<()> {
                                 } else {
                                     None
                                 };
+                                // Cable: classify_by_memory() → skip freezing LLM/Database processes.
+                                // If vm_region scan reveals an LLM inference or database layout,
+                                // freezing would be destructive (model eviction, buffer pool loss).
+                                let memory_hint = scan_regions(pid)
+                                    .and_then(|regions| classify_by_memory(&regions));
+                                if let Some((hint, conf)) = &memory_hint {
+                                    use apollo_optimizer::engine::workload_classifier::MemoryLayoutHint;
+                                    if conf > &0.7 && matches!(hint, MemoryLayoutHint::LlmInference | MemoryLayoutHint::DatabaseEngine) {
+                                        ds_skip += 1;
+                                        audit_log(&serde_json::json!({
+                                            "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                            "event": "deep_scan_layout_skip",
+                                            "pid": pid,
+                                            "name": freeze_name,
+                                            "hint": format!("{:?}", hint),
+                                            "confidence": conf,
+                                        }));
+                                        return None;
+                                    }
+                                }
                                 let action = decide_enhanced(
                                     &profile,
                                     temp.as_ref(),
@@ -5518,6 +5582,7 @@ fn main() -> anyhow::Result<()> {
                                     })),
                                     "fault_rate": (fault_rate * 10.0).round() / 10.0,
                                     "pressure": (metrics.memory_pressure * 1000.0).round() / 1000.0,
+                                    "memory_layout": memory_hint.as_ref().map(|(h, c)| format!("{:?}({:.0}%)", h, c * 100.0)),
                                 }));
                                 match action {
                                     MemoryAction::PressureHint => {
@@ -5783,6 +5848,32 @@ fn main() -> anyhow::Result<()> {
                     if batch.savings_watts > 0.0 {
                         energy_tracker.record_savings(batch.savings_watts, 30.0);
                     }
+                    // Cable 1: causal_effect() → correct PatternWeight using real causal signal.
+                    // For each effective throttle, check if the drop was truly caused by the
+                    // action (causal_effect > 0) or just natural drift. Demote weights that
+                    // only appear effective due to natural pressure fluctuation.
+                    if !batch.effective_names.is_empty() {
+                        let drift = outcome_tracker.natural_drift();
+                        if drift > 0.01 {
+                            // Pre-compute causal effects per process before mutating weights.
+                            let demotions: Vec<String> = batch.effective_names.iter().filter_map(|name| {
+                                let avg_drop = outcome_tracker.experience
+                                    .query_similar(name, snapshot.pressure.memory_pressure)
+                                    .map(|(drop, _)| drop)
+                                    .unwrap_or(0.05);
+                                let causal = outcome_tracker.causal_effect(avg_drop);
+                                if causal < 0.01 { Some(name.clone()) } else { None }
+                            }).collect();
+                            // Now mutate: roll back effective_count for drift-only "successes".
+                            for name in &demotions {
+                                if let Some(w) = outcome_tracker.weights.get_mut(name) {
+                                    if w.effective_count > 0 {
+                                        w.effective_count -= 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Sincroniza pesos Bayesianos a la LearnedPolicy persistida.
                     if !batch.effective_names.is_empty() || !batch.low_value_names.is_empty() {
                         let mut policy = state.learned_policy.lock_recover();
@@ -5853,6 +5944,23 @@ fn main() -> anyhow::Result<()> {
                     }
                     m.si_monopoly_risk = signal_digest.monopoly_risk;
                     m.si_entropy_anomaly = signal_digest.entropy_anomaly;
+                    // Cable 4: top_causal_pairs() → expose in metrics for observability.
+                    m.causal_pairs = outcome_tracker.top_causal_pairs(5)
+                        .iter()
+                        .map(|(a, b, c)| format!("{} + {} ({})", a, b, c))
+                        .collect();
+                    m.natural_drift = outcome_tracker.natural_drift();
+                    m.experience_memory_size = outcome_tracker.experience.len();
+                    // Causal effect average: mean effect across last resolved outcomes.
+                    m.causal_effect_avg = {
+                        let effectiveness = outcome_tracker.overall_effectiveness();
+                        let avg_drop = if outcome_tracker.total_resolved > 0 {
+                            effectiveness * 0.05
+                        } else {
+                            0.0
+                        };
+                        outcome_tracker.causal_effect(avg_drop)
+                    };
                 }
 
                 // I/O Traffic Shaping: foreground-aware disk bandwidth allocation.

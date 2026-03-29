@@ -616,6 +616,20 @@ pub struct RuntimeMetrics {
     /// Name of the process with the lowest behavioral score.
     #[serde(default)]
     pub bps_min_score_name: String,
+    /// Top causal process pairs (co-occur during pressure spikes).
+    /// Format: "A + B (count)" for up to 5 pairs.
+    #[serde(default)]
+    pub causal_pairs: Vec<String>,
+    /// Causal effect of throttling: observed drop minus natural drift.
+    /// Positive = throttling actually helped beyond natural fluctuation.
+    #[serde(default)]
+    pub causal_effect_avg: f64,
+    /// Natural pressure drift EMA (what happens without action).
+    #[serde(default)]
+    pub natural_drift: f64,
+    /// Experience memory size (resolved outcome records).
+    #[serde(default)]
+    pub experience_memory_size: usize,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.
