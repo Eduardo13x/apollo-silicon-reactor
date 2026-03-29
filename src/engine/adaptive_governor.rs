@@ -489,10 +489,17 @@ impl AdaptiveGovernor {
         // bar for waste-based throttling. With 50+ daemons, even mildly wasteful
         // ones degrade foreground responsiveness.
         if process_count > 30 && waste >= 0.30 && adjusted_utility < 0.55 && !snap.has_gui_window {
+            // Translated (Rosetta) processes in swarm get frozen: they use ~2x
+            // memory from JIT page tables, so reclaiming is more valuable.
+            let swarm_decision = if snap.is_translated {
+                GovernorDecision::Freeze
+            } else {
+                GovernorDecision::Throttle
+            };
             return ProcessDecision {
                 pid: snap.pid,
                 name: snap.name.clone(),
-                decision: GovernorDecision::Throttle,
+                decision: swarm_decision,
                 tier,
                 utility_score: adjusted_utility,
                 waste_score: waste,
