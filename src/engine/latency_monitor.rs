@@ -86,21 +86,42 @@ pub fn compute_latency(signals: &LatencySignals) -> LatencyScore {
         ((signals.foreground_csw_per_sec - CSW_NOMINAL) / (CSW_BAD - CSW_NOMINAL)).clamp(0.0, 1.0);
 
     // Foreground CPU: both extremes are bad.
-    // Too low (<2%) = starved by other processes.
-    // Too high (>90%) = app itself is overloaded (less actionable by Apollo).
-    let fg_starved = if signals.foreground_cpu < 2.0 {
-        (2.0 - signals.foreground_cpu) / 2.0 // 0% → 1.0, 2% → 0.0
+    // Too low (<5%) = starved by other processes (not getting scheduled).
+    // 0% → 1.0 (completely frozen), 5% → 0.0 (getting enough CPU).
+    // Wider range than original 2% catches partial starvation (1-4% CPU)
+    // which on M1 means the app misses multiple frame deadlines.
+    let fg_starved = if signals.foreground_cpu < 5.0 {
+        (5.0 - signals.foreground_cpu) / 5.0
     } else {
         0.0
     };
 
     // Weighted composite:
-    //   jitter: 35% — most direct signal of scheduler contention
+    //   jitter: 32% — most direct signal of scheduler contention
+    //   foreground starvation: 30% — most user-visible (app frozen/unresponsive)
     //   WindowServer: 25% — frame compositing backlog
-    //   context switches: 20% — scheduler thrashing
-    //   foreground starvation: 20% — app not getting CPU
-    let score = jitter_norm * 0.35 + ws_norm * 0.25 + csw_norm * 0.20 + fg_starved * 0.20;
-    let score = score.clamp(0.0, 1.0);
+    //   context switches: 13% — scheduler thrashing (least directly visible)
+    let linear = jitter_norm * 0.32 + ws_norm * 0.25 + fg_starved * 0.30 + csw_norm * 0.13;
+
+    // Starvation severity: when fg_starved > 0.8 (cpu < 1%), the app is
+    // effectively frozen — this alone should trigger boost regardless of
+    // other signals. Add an extra 0.25 for severe starvation.
+    let starvation_severity = if fg_starved > 0.8 { 0.25 } else { 0.0 };
+
+    // Synergy bonus: multiple elevated signals compound perceptual impact.
+    // Two moderate problems feel worse than one bad problem (Card et al. 1983).
+    // Count signals above 0.3 and add a bonus that scales with count.
+    let elevated_count = [jitter_norm, ws_norm, fg_starved, csw_norm]
+        .iter()
+        .filter(|&&v| v > 0.3)
+        .count();
+    let synergy = if elevated_count >= 2 {
+        0.12 * (elevated_count - 1) as f64
+    } else {
+        0.0
+    };
+
+    let score = (linear + starvation_severity + synergy).clamp(0.0, 1.0);
 
     let category = if score < 0.3 {
         LatencyCategory::Responsive
@@ -114,7 +135,10 @@ pub fn compute_latency(signals: &LatencySignals) -> LatencyScore {
 
     LatencyScore {
         score,
-        needs_boost: score > 0.5,
+        // Boost threshold at 0.45: for 90-120fps consistency, we need to act
+        // earlier than the Noticeable/Sluggish boundary. At 0.45 we catch
+        // compound degradations (jitter + WS backlog) before they become visible.
+        needs_boost: score > 0.45,
         category,
     }
 }

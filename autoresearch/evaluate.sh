@@ -34,7 +34,7 @@
 # Baseline (frozen):
 BASELINE_TESTS=1370
 BASELINE_SIZE_KB=4055
-TOTAL_SCENARIOS=60
+TOTAL_SCENARIOS=95
 # ══════════════════════════════════════════════════════════════════════════════
 cd "$(dirname "$0")/.."
 
@@ -46,15 +46,29 @@ if ! cargo build --release 2>/dev/null; then
     exit 0
 fi
 
-# ── Step 2: Scenario tests (prepare.rs) ──────────────────────────────────────
-# Run ONLY the scenario tests from prepare.rs
+# ── Step 2: Scenario tests (all prepare_*.rs files) ─────────────────────────
+# Governor scenarios (s01-s60)
 SCENARIO_OUTPUT=$(cargo test --test prepare 2>&1 || true)
+GOV_PASSED=$(echo "$SCENARIO_OUTPUT" | grep -cE 'test scenarios::s[0-9]+.*ok$' || echo 0)
+GOV_PASSED=${GOV_PASSED:-0}
 
-# Count passed scenarios (each test is named s01_, s02_, etc.)
-SCENARIOS_PASSED=$(echo "$SCENARIO_OUTPUT" | grep -cE 'test scenarios::s[0-9]+.*ok$' || echo 0)
-SCENARIOS_PASSED=${SCENARIOS_PASSED:-0}
-SCENARIOS_FAILED=$(echo "$SCENARIO_OUTPUT" | grep -cE 'test scenarios::s[0-9]+.*FAILED' || echo 0)
-SCENARIOS_FAILED=${SCENARIOS_FAILED:-0}
+# Latency scenarios (l01-l10)
+LATENCY_OUTPUT=$(cargo test --test prepare_latency 2>&1 || true)
+LAT_PASSED=$(echo "$LATENCY_OUTPUT" | grep -cE 'test scenarios::l[0-9]+.*ok$' || echo 0)
+LAT_PASSED=${LAT_PASSED:-0}
+
+# Memory scenarios (m01-m15)
+MEMORY_OUTPUT=$(cargo test --test prepare_memory 2>&1 || true)
+MEM_PASSED=$(echo "$MEMORY_OUTPUT" | grep -cE 'test scenarios::m[0-9]+.*ok$' || echo 0)
+MEM_PASSED=${MEM_PASSED:-0}
+
+# Actions scenarios (a01-a10)
+ACTIONS_OUTPUT=$(cargo test --test prepare_actions 2>&1 || true)
+ACT_PASSED=$(echo "$ACTIONS_OUTPUT" | grep -cE 'test scenarios::a[0-9]+.*ok$' || echo 0)
+ACT_PASSED=${ACT_PASSED:-0}
+
+SCENARIOS_PASSED=$((GOV_PASSED + LAT_PASSED + MEM_PASSED + ACT_PASSED))
+SCENARIOS_FAILED=$((TOTAL_SCENARIOS - SCENARIOS_PASSED))
 
 # ── Step 3: Non-scenario tests (regression gate) ────────────────────────────
 # Exclude prepare.rs scenarios — those are the optimization target, not a gate.

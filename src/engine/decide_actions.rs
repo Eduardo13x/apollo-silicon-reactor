@@ -66,7 +66,9 @@ fn is_known_blocker(name: &str) -> bool {
     BLOCKER_APPS.iter().any(|n| name.contains(n))
 }
 
-fn context_from_pressure(
+/// Classify system pressure into an interactive context.
+/// Used by `decide_actions` and exposed for benchmarking.
+pub fn context_from_pressure(
     snapshot: &SystemSnapshot,
     thresholds: &OverflowThresholds,
 ) -> InteractiveContext {
@@ -80,6 +82,22 @@ fn context_from_pressure(
     } else {
         InteractiveContext::InteractiveFocus
     }
+}
+
+/// Pure blocker score formula — exposed for benchmarking.
+///
+/// Combines interactive wait ratio, CPU spike, recent sighting, and reactor weight
+/// into a single blocker importance score.
+pub fn blocker_score_formula(
+    interactive_wait_ratio: f64,
+    blocker_cpu_spike: f64,
+    blocker_seen_recently: bool,
+    reactor_event_weight: f64,
+) -> f64 {
+    (interactive_wait_ratio * 0.45)
+        + (blocker_cpu_spike * 0.35)
+        + (if blocker_seen_recently { 0.1 } else { 0.0 })
+        + (reactor_event_weight * 0.1)
 }
 
 fn top_blockers(
@@ -118,10 +136,12 @@ fn top_blockers(
         let cpu = process.cpu_usage();
         let blocker_cpu_spike = (cpu / 100.0).clamp(0.0, 1.0);
         let blocker_seen_recently = cpu > 8.0;
-        let score = (interactive_wait_ratio * 0.45)
-            + (blocker_cpu_spike as f64 * 0.35)
-            + (if blocker_seen_recently { 0.1 } else { 0.0 })
-            + (reactor_event_weight * 0.1);
+        let score = blocker_score_formula(
+            interactive_wait_ratio,
+            blocker_cpu_spike as f64,
+            blocker_seen_recently,
+            reactor_event_weight,
+        );
 
         if score > 0.30 {
             blockers.push(BlockerScore {
