@@ -1101,4 +1101,110 @@ mod scenarios {
             "FG helper must be immune to swarm pressure"
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CATEGORY 15: BOSS LEVEL 6 — UNUSED SIGNALS & TEMPORAL GRADUATION
+    // The governor collects faults_total and process_uptime_secs but ignores
+    // them. Idle duration is binary (1h = magic number). These scenarios
+    // require using ALL available signals and graduating decisions over time.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// BOSS 31: Graduated idle — a daemon idle for 12 HOURS with 1.5% CPU
+    /// (above the 0.5% idle override threshold). The idle override misses it,
+    /// and utility (0.50) keeps it alive. But 12h idle is extreme — throttle it.
+    #[test]
+    fn s51_graduated_idle_12h_throttled() {
+        let snaps = vec![snap(5100, "old_service", 1.5, 300, false, 43200, 43200)];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "old_service");
+        assert!(
+            d == GovernorDecision::Throttle || d == GovernorDecision::Freeze,
+            "Daemon idle 12h should be throttled regardless of CPU. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 32: High faults = active memory work. A process doing GPU buffer
+    /// mapping or mmap'd I/O has 800K page faults but low CPU (GPU does the
+    /// real work). In a swarm, swarm-throttle would catch it. Must be ALLOWED
+    /// because faults prove it's doing real memory work.
+    #[test]
+    fn s52_high_faults_protected_in_swarm() {
+        let mut snaps: Vec<ProcessSnapshot> = (0..35)
+            .map(|i| snap(5200 + i, &format!("bg_{}", i), 0.5, 30, false, 3600, 3600))
+            .collect();
+        let mut gpu = snap(5250, "gpu_worker", 0.8, 200, false, 7200, 7200);
+        gpu.faults_total = 800000;
+        gpu.wakeups_per_sec = 5.0;
+        snaps.push(gpu);
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "gpu_worker");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "800K faults = active memory work — must be ALLOWED despite swarm. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 33: Partial Mach port protection. A daemon with 60 Mach ports
+    /// (below 80 IPC hub threshold) is still serving other processes via XPC.
+    /// In a swarm, swarm-throttle catches it. Must be ALLOWED because 60 ports
+    /// is significant IPC activity.
+    #[test]
+    fn s53_partial_port_protection_in_swarm() {
+        let mut snaps: Vec<ProcessSnapshot> = (0..35)
+            .map(|i| snap(5300 + i, &format!("bg_{}", i), 0.5, 30, false, 3600, 3600))
+            .collect();
+        let mut broker = snap(5350, "xpc_broker", 1.0, 100, false, 3600, 3600);
+        broker.mach_port_count = 60;
+        broker.wakeups_per_sec = 5.0;
+        snaps.push(broker);
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "xpc_broker");
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "60 Mach ports = significant IPC — must be ALLOWED despite swarm. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 34: Network bonus expires. A Stale process (cpu=0.1%, wakeups=0.5)
+    /// has been idle for 8 HOURS but still has an open network socket. The
+    /// network +0.05 utility bonus keeps it alive forever. But 8h idle means
+    /// the connection is a zombie keepalive, not real work. Must throttle.
+    #[test]
+    fn s54_stale_network_expires_after_8h() {
+        let mut s = snap(5400, "keepalive_daemon", 0.1, 100, false, 28800, 28800);
+        s.has_network = true;
+        s.wakeups_per_sec = 0.5;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "keepalive_daemon");
+        assert!(
+            d == GovernorDecision::Throttle || d == GovernorDecision::Freeze,
+            "Stale daemon with network idle 8h = zombie connection — must act. Got {:?}",
+            d
+        );
+    }
+
+    /// BOSS 35: Graduated Stale freeze. A Stale process idle for 24 HOURS
+    /// has utility ~0.50 (base score). The freeze threshold (0.05) never
+    /// catches it because base utility is too high. But 24h idle is extreme
+    /// — this process should be FROZEN to reclaim memory.
+    #[test]
+    fn s55_very_stale_24h_frozen() {
+        let mut s = snap(5500, "abandoned_service", 0.1, 150, false, 86400, 86400);
+        s.wakeups_per_sec = 0.3;
+        let snaps = vec![s];
+        let results = decide(&snaps, None);
+        let d = find_decision(&results, "abandoned_service");
+        assert_eq!(
+            d,
+            GovernorDecision::Freeze,
+            "Stale process idle 24h must be FROZEN — memory is wasted. Got {:?}",
+            d
+        );
+    }
 }
