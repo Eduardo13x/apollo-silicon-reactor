@@ -589,6 +589,20 @@ pub fn decide_enhanced(
         }
     }
 
+    // Rusage-only paths: when temp and WSS are unavailable (task_for_pid fails
+    // on ad-hoc signed binaries), use footprint heuristics for skip/hint decisions
+    // instead of defaulting everything to Freeze.
+    if temp.is_none() && damon_wss.is_none() {
+        // Actively thrashing without compression data: skip (freeze is risky).
+        if major_faults_per_sec > 50.0 {
+            return MemoryAction::Skip;
+        }
+        // Large resident process under moderate pressure: hint is safer than freeze.
+        if profile.phys_footprint > 200 * 1024 * 1024 && system_pressure < 0.80 {
+            return MemoryAction::PressureHint;
+        }
+    }
+
     // Fall through to legacy decision.
     decide_memory_action(profile, system_pressure, major_faults_per_sec)
 }

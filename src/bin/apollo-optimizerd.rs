@@ -4418,11 +4418,13 @@ fn main() -> anyhow::Result<()> {
                     metrics.energy_package_wh = Some(energy_summary.total_package_wh);
                     metrics.energy_session_wh =
                         Some(energy_summary.total_cpu_wh + energy_summary.total_gpu_wh);
-                    // Use cycle-level hardware snapshot for per-process power.
+                    // Use cycle-level hardware snapshot for per-process power,
+                    // falling back to smc_direct when IOKit returns None.
                     metrics.energy_cpu_watts = cycle_hw_snap
                         .as_ref()
                         .and_then(|h| h.power.cpu_watts)
-                        .map(|w| w as f64);
+                        .map(|w| w as f64)
+                        .or(last_smc.as_ref().and_then(|s| s.p_cluster_watts));
                     metrics.energy_gpu_watts = cycle_hw_snap
                         .as_ref()
                         .and_then(|h| h.power.gpu_watts)
@@ -4430,7 +4432,8 @@ fn main() -> anyhow::Result<()> {
                     metrics.energy_package_watts = cycle_hw_snap
                         .as_ref()
                         .and_then(|h| h.power.package_watts)
-                        .map(|w| w as f64);
+                        .map(|w| w as f64)
+                        .or(last_smc.as_ref().and_then(|s| s.system_power_watts));
                     metrics.energy_top_consumers = energy_tracker
                         .top_consumers(5)
                         .into_iter()
