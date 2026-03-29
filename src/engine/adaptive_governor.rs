@@ -345,19 +345,6 @@ impl AdaptiveGovernor {
             };
         }
 
-        // IPC hub protection: daemons with many Mach ports serve other apps.
-        if snap.mach_port_count > 80 {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Allow,
-                tier,
-                utility_score: utility,
-                waste_score: waste,
-                reason: format!("IPC hub ({} Mach ports) — protected", snap.mach_port_count),
-            };
-        }
-
         // LLM model protection: large-RSS processes matching known AI runtimes
         // have huge reload cost (30s+). Protect if idle < 12h. Beyond that,
         // the user has likely moved on and the memory is worth reclaiming.
