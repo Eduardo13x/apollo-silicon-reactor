@@ -311,6 +311,28 @@ impl AdaptiveGovernor {
             };
         }
 
+        // SilentDaemon idle override: if a daemon has near-zero CPU and has been
+        // idle for over an hour with no GUI, it's effectively stale even if the
+        // classifier didn't flag it (e.g. wakeups at threshold boundary).
+        if tier == ProcessTier::SilentDaemon
+            && snap.cpu_percent < 0.5
+            && snap.secs_since_foreground > 3600
+            && !snap.has_gui_window
+        {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Throttle,
+                tier,
+                utility_score: utility,
+                waste_score: waste,
+                reason: format!(
+                    "SilentDaemon idle override (cpu={:.1}%, idle={}s)",
+                    snap.cpu_percent, snap.secs_since_foreground
+                ),
+            };
+        }
+
         // Relevance bonus from user profile
         let relevance = self.user_profile.process_relevance(&snap.name);
         let adjusted_utility = (utility + relevance * 0.2).min(1.0);
