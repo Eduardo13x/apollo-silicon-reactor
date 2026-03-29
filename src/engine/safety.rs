@@ -172,17 +172,56 @@ pub fn infrastructure_processes() -> HashSet<&'static str> {
 ///
 /// Unlike infrastructure, these earn protection dynamically through behavioral
 /// signals — not by name alone. See `behavioral_protection_score()`.
-pub fn dev_runtime_patterns() -> HashSet<&'static str> {
-    ["node", "python", "java", "go", "nginx"]
-        .into_iter()
-        .collect()
+///
+/// Note: short patterns like "go" would false-positive on CategoriesService,
+/// mongod, etc. via substring match. We use a dedicated `matches_dev_runtime()`
+/// function with word-boundary awareness instead of raw `.contains()`.
+pub fn dev_runtime_patterns() -> &'static [&'static str] {
+    &["node", "python", "java", "go", "nginx"]
+}
+
+/// Check if a process name matches a dev runtime pattern, with word-boundary
+/// awareness for short patterns (≤3 chars). "go" must appear at a word boundary
+/// (start/end of string or preceded/followed by non-alphanumeric), preventing
+/// false matches like CategoriesService, mongod, Cargo, etc.
+///
+/// Case-insensitive: macOS shows "Python" (capital P) in process names.
+pub fn matches_dev_runtime(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    for &pat in dev_runtime_patterns() {
+        if pat.len() <= 3 {
+            // Short pattern: require word boundaries.
+            let mut start = 0;
+            while let Some(pos) = lower[start..].find(pat) {
+                let abs_pos = start + pos;
+                let end_pos = abs_pos + pat.len();
+                let left_ok = abs_pos == 0
+                    || !lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+                let right_ok = end_pos == lower.len()
+                    || !lower.as_bytes()[end_pos].is_ascii_alphanumeric();
+                if left_ok && right_ok {
+                    return true;
+                }
+                start = abs_pos + 1;
+                if start >= lower.len() {
+                    break;
+                }
+            }
+        } else {
+            // Long pattern (≥4 chars): substring match is safe.
+            if lower.contains(pat) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Backward-compatible: returns infrastructure ∪ dev_runtime patterns.
 /// Callers that need the behavioral gate should use the split functions instead.
 pub fn critical_background_processes() -> HashSet<&'static str> {
     let mut all = infrastructure_processes();
-    all.extend(dev_runtime_patterns());
+    all.extend(dev_runtime_patterns().iter().copied());
     all
 }
 
@@ -397,6 +436,41 @@ mod tests {
         for name in &["docker", "postgres", "redis-server", "kafka", "qemu-system"] {
             assert!(infra.contains(name), "'{}' must be in infrastructure", name);
         }
+    }
+
+    // ── Word-boundary matching tests ──────────────────────────────────
+
+    #[test]
+    fn go_matches_go_binary() {
+        assert!(matches_dev_runtime("go"));
+        assert!(matches_dev_runtime("go-build"));
+        assert!(matches_dev_runtime("/usr/local/bin/go"));
+    }
+
+    #[test]
+    fn go_does_not_match_substrings() {
+        assert!(!matches_dev_runtime("CategoriesService"));
+        assert!(!matches_dev_runtime("mongod"));
+        assert!(!matches_dev_runtime("Cargo"));
+        assert!(!matches_dev_runtime("google-chrome"));
+        assert!(!matches_dev_runtime("Diego"));
+    }
+
+    #[test]
+    fn python_matches_long_pattern() {
+        assert!(matches_dev_runtime("python"));
+        assert!(matches_dev_runtime("python3.13"));
+        assert!(matches_dev_runtime("/opt/homebrew/bin/python3"));
+        // Case insensitive: macOS shows "Python" with capital P.
+        assert!(matches_dev_runtime("Python"));
+    }
+
+    #[test]
+    fn node_matches_correctly() {
+        assert!(matches_dev_runtime("node"));
+        assert!(matches_dev_runtime("/usr/local/bin/node"));
+        // "node" is 4 chars → uses substring match (≥4), so this matches:
+        assert!(matches_dev_runtime("nodejs"));
     }
 
     #[test]

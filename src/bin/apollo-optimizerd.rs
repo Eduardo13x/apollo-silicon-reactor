@@ -75,8 +75,8 @@ use apollo_optimizer::engine::profile_governor::{
 };
 use apollo_optimizer::engine::protocol::{DaemonRequest, DaemonResponse};
 use apollo_optimizer::engine::safety::{
-    behavioral_protection_score, critical_background_processes, dev_runtime_patterns,
-    enforce_limits_with_budget, infrastructure_processes, pattern_conflicts_with_protected,
+    behavioral_protection_score, critical_background_processes, enforce_limits_with_budget,
+    infrastructure_processes, matches_dev_runtime, pattern_conflicts_with_protected,
     protected_processes,
 };
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
@@ -4850,7 +4850,6 @@ fn main() -> anyhow::Result<()> {
                 let heuristic_critical_pids: HashSet<u32> = {
                     let sys = collector.system();
                     let infra_pats = infrastructure_processes();
-                    let runtime_pats = dev_runtime_patterns();
                     let protected_pats = protected_processes();
                     let policy_protected = state
                         .learned_policy
@@ -4877,48 +4876,47 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         }
                         // Dev runtimes: behavioral gate — protection earned, not given.
-                        if runtime_pats.iter().any(|p| name.contains(p)) {
+                        if matches_dev_runtime(&name) {
                             let pid_u32 = pid.as_u32();
-                            if let Some(snap) = proc_snaps.iter().find(|s| s.pid == pid_u32) {
-                                let score = behavioral_protection_score(
-                                    snap.cpu_percent,
-                                    snap.wakeups_per_sec,
-                                    snap.has_network,
-                                    snap.has_gui_window,
-                                    snap.secs_since_user_interaction,
-                                    snap.rss_bytes,
-                                    total_ram,
-                                );
-                                bps_eval += 1;
-                                let protected = score >= pressure as f64;
-                                if score < bps_min {
-                                    bps_min = score;
-                                    bps_min_name = format!("{}({})", name, pid_u32);
-                                }
-                                // Audit log: every dev runtime evaluation with full context.
-                                audit_log(&serde_json::json!({
-                                    "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                                    "event": "bps_eval",
-                                    "pid": pid_u32,
-                                    "name": name,
-                                    "score": (score * 10000.0).round() / 10000.0,
-                                    "pressure": (pressure * 1000.0).round() / 1000.0,
-                                    "protected": protected,
-                                    "cpu": snap.cpu_percent,
-                                    "wakeups": snap.wakeups_per_sec,
-                                    "net": snap.has_network,
-                                    "gui": snap.has_gui_window,
-                                    "idle_s": snap.secs_since_user_interaction,
-                                    "rss_mb": snap.rss_bytes / 1024 / 1024,
-                                }));
-                                if protected {
-                                    bps_prot += 1;
-                                    cpids.insert(pid_u32);
+                            // Prefer enriched ProcessSnapshot if available;
+                            // fall back to raw sysinfo data for processes not in top-N.
+                            let (cpu, wakeups, net, gui, idle_s, rss) =
+                                if let Some(snap) = proc_snaps.iter().find(|s| s.pid == pid_u32) {
+                                    (snap.cpu_percent, snap.wakeups_per_sec, snap.has_network,
+                                     snap.has_gui_window, snap.secs_since_user_interaction, snap.rss_bytes)
                                 } else {
-                                    bps_dem += 1;
-                                }
+                                    // Fallback: sysinfo process — limited signals but real RSS.
+                                    (process.cpu_usage(), 0.0, false, false, 3600, process.memory())
+                                };
+                            let score = behavioral_protection_score(
+                                cpu, wakeups, net, gui, idle_s, rss, total_ram,
+                            );
+                            bps_eval += 1;
+                            let protected = score >= pressure as f64;
+                            if score < bps_min {
+                                bps_min = score;
+                                bps_min_name = format!("{}({})", name, pid_u32);
+                            }
+                            audit_log(&serde_json::json!({
+                                "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                "event": "bps_eval",
+                                "pid": pid_u32,
+                                "name": name,
+                                "score": (score * 10000.0).round() / 10000.0,
+                                "pressure": (pressure * 1000.0).round() / 1000.0,
+                                "protected": protected,
+                                "cpu": cpu,
+                                "wakeups": wakeups,
+                                "net": net,
+                                "gui": gui,
+                                "idle_s": idle_s,
+                                "rss_mb": rss / 1024 / 1024,
+                            }));
+                            if protected {
+                                bps_prot += 1;
+                                cpids.insert(pid_u32);
                             } else {
-                                cpids.insert(pid.as_u32());
+                                bps_dem += 1;
                             }
                         }
                     }
