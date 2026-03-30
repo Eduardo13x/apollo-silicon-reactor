@@ -137,6 +137,42 @@ impl ExperienceMemory {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+
+    /// State compression (Hermes pattern): merge old records by process name.
+    /// Keeps last 100 records intact (recent detail) and compresses older ones
+    /// into per-process averages, freeing ~80% of memory.
+    pub fn compress_old(&mut self) {
+        if self.records.len() < 200 {
+            return; // not enough to compress
+        }
+        // Keep last 100 intact.
+        let keep_recent = 100;
+        let old_count = self.records.len() - keep_recent;
+        let old_records: Vec<ExperienceRecord> = self.records.drain(..old_count).collect();
+
+        // Compress: average by process name.
+        let mut groups: std::collections::HashMap<String, (f64, f64, u32, u32)> =
+            std::collections::HashMap::new();
+        for r in &old_records {
+            let e = groups.entry(r.process_name.clone()).or_insert((0.0, 0.0, 0, 0));
+            e.0 += r.pressure_at_action;
+            e.1 += r.pressure_drop;
+            e.2 += 1;
+            if r.effective {
+                e.3 += 1;
+            }
+        }
+
+        // Re-insert compressed summaries at front.
+        for (name, (sum_pressure, sum_drop, count, eff_count)) in groups {
+            self.records.push_front(ExperienceRecord {
+                process_name: name,
+                pressure_at_action: sum_pressure / count as f64,
+                pressure_drop: sum_drop / count as f64,
+                effective: eff_count * 2 >= count, // majority vote
+            });
+        }
+    }
 }
 
 // ── OutcomeTracker ──��─────────────────��─────────────────────��─────────────────

@@ -65,6 +65,7 @@ use apollo_optimizer::engine::network_monitor::NetworkMonitor;
 use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfile};
 use apollo_optimizer::engine::causal_graph::CausalGraph;
 use apollo_optimizer::engine::neuromodulator::{ApolloNeuromodulator, NeuroSignals};
+use apollo_optimizer::engine::optimization_skills::SkillRegistry;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
 use apollo_optimizer::engine::overflow_guard::{OverflowGuard, BUILD_TOOLS};
 use apollo_optimizer::engine::power_management::{detect_battery_status, PowerManager};
@@ -3046,6 +3047,15 @@ fn main() -> anyhow::Result<()> {
             // Bio-inspired parameter modulation — DA/NA/SE/ACh drive RL alpha,
             // Dyna-Q steps, router zones, and exploration rate.
             let mut neuromod = ApolloNeuromodulator::new();
+
+            // Optimization skills (Hermes self-improving skills pattern).
+            let mut skill_registry = SkillRegistry::new();
+            let skills_path = if is_root {
+                "/var/lib/apollo/optimization_skills.json"
+            } else {
+                "/tmp/apollo-optimization_skills.json"
+            };
+            skill_registry.load(std::path::Path::new(skills_path));
             // Track cycle-to-cycle wall time for energy dt calculation.
             let mut last_cycle_instant = Instant::now();
             // Audit fix #5: Background powermetrics polling (replaces 5-cycle IOKit tick).
@@ -5497,11 +5507,12 @@ fn main() -> anyhow::Result<()> {
                     };
                     neuromod.tick(&neuro_signals);
 
-                    // Push derived params to subsystems.
+                    // Push derived params to subsystems + enforce constraints.
                     if let Some(rl) = &mut overflow_guard.rl_agent {
                         rl.neuro_alpha_mult = neuromod.alpha_multiplier;
                         rl.neuro_epsilon_bonus = neuromod.epsilon_bonus;
                         rl.dyna_steps = neuromod.dyna_steps;
+                        rl.enforce_constraints(); // Infrastructure-locked (Hermes)
                     }
                     signal_intel.neuro_serotonin_shift = neuromod.serotonin_shift;
                 }
@@ -6479,6 +6490,26 @@ fn main() -> anyhow::Result<()> {
                         println!("causal_graph: {}/{} edges solid, {} pending",
                             solid, total, causal_graph.solid_edges().len());
                     }
+                    // Persist optimization skills (Hermes pattern).
+                    skill_registry.persist(std::path::Path::new(skills_path));
+                    // Learn skills from causal graph solid edges.
+                    for edge in causal_graph.solid_edges() {
+                        if edge.cause.starts_with("throttle:") {
+                            let target = edge.cause.trim_start_matches("throttle:");
+                            skill_registry.learn(
+                                &edge.cause,
+                                0.65, // learn at moderate pressure
+                                "any",
+                                vec![target.to_string()],
+                            );
+                            skill_registry.record_result(&edge.cause, edge.confidence > 0.5);
+                        }
+                    }
+                }
+                // State compression (Hermes pattern): compress old experience records.
+                if cycle_count % 500 == 0 {
+                    outcome_tracker.experience.compress_old();
+                    skill_registry.gc(); // retire ineffective skills
                 }
                 // Hourly housekeeping (7200 cycles × 500ms ≈ 1 hour).
                 if cycle_count % 7200 == 1 {

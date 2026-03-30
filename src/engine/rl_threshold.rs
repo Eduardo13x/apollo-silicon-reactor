@@ -18,6 +18,7 @@
 //! decay (compute_dynamic_offset), which provides the baseline behavior.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,31 @@ pub const RL_ABSOLUTE_FLOOR: f64 = 0.45;
 
 const ADJUSTMENT_FLOOR: f64 = -0.20;
 const ADJUSTMENT_CEIL: f64 = 0.05;
+
+/// Infrastructure-locked constraints (Hermes/Tinker-Atropos pattern).
+/// These are hard walls the RL agent can NEVER cross, regardless of reward.
+/// Prevents learning to sacrifice system stability for marginal improvements.
+pub struct RlConstraints {
+    /// Maximum Dyna-Q planning steps (prevents CPU burn under stress).
+    pub max_dyna_steps: usize,
+    /// Minimum alpha multiplier (prevents learning stall).
+    pub min_alpha_mult: f64,
+    /// Maximum epsilon (prevents pure random exploration).
+    pub max_epsilon: f64,
+    /// Maximum consecutive Lower5pp actions (prevents threshold collapse).
+    pub max_consecutive_lower: u32,
+}
+
+impl Default for RlConstraints {
+    fn default() -> Self {
+        Self {
+            max_dyna_steps: 20,
+            min_alpha_mult: 0.3,
+            max_epsilon: 0.15,
+            max_consecutive_lower: 5,
+        }
+    }
+}
 
 /// Discretized system state for the Q-table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -152,6 +178,10 @@ pub struct RlThresholdAgent {
     pub neuro_epsilon_bonus: f64,
     /// NA → Dyna-Q planning steps [4, 20]. Default=10.
     pub dyna_steps: usize,
+    /// Infrastructure-locked safety constraints (Hermes pattern).
+    constraints: RlConstraints,
+    /// Consecutive Lower5pp actions (for constraint enforcement).
+    consecutive_lower: u32,
 }
 
 impl RlThresholdAgent {
@@ -188,6 +218,8 @@ impl RlThresholdAgent {
             neuro_alpha_mult: 1.0,
             neuro_epsilon_bonus: 0.0,
             dyna_steps: DYNA_PLANNING_STEPS,
+            constraints: RlConstraints::default(),
+            consecutive_lower: 0,
         }
     }
 
@@ -278,9 +310,25 @@ impl RlThresholdAgent {
             // Inspired by memoria-core dyna_q.rs (Sutton 1991).
             self.dyna_record(s, a, reward, s_prime);
             self.dyna_plan();
+
+            // Trajectory recording (Hermes pattern): persist transitions for offline learning.
+            // Append to JSONL every 10 ticks to amortize I/O cost.
+            if self.total_ticks % 10 == 0 {
+                self.record_trajectory(s, a, reward, s_prime);
+            }
         }
 
-        let action = self.select_action(state);
+        let mut action = self.select_action(state);
+        // Infrastructure-locked constraint (Hermes/Tinker-Atropos):
+        // Prevent threshold collapse from too many consecutive Lower5pp.
+        if matches!(action, RlAction::Lower5pp) {
+            self.consecutive_lower += 1;
+            if self.consecutive_lower > self.constraints.max_consecutive_lower {
+                action = RlAction::Hold; // force hold
+            }
+        } else {
+            self.consecutive_lower = 0;
+        }
         match action {
             RlAction::Lower5pp => self.current_adjustment -= 0.05,
             RlAction::Hold => {}
@@ -370,6 +418,35 @@ impl RlThresholdAgent {
         self.dyna_model.len()
     }
 
+    /// Record a transition to trajectory JSONL file (Hermes pattern).
+    /// Enables offline RL training from historical data.
+    fn record_trajectory(&self, s: usize, a: usize, reward: f64, s_prime: usize) {
+        let traj_path = self.path.with_extension("trajectories.jsonl");
+        // Cap file at ~1MB to prevent disk bloat.
+        if let Ok(meta) = std::fs::metadata(&traj_path) {
+            if meta.len() > 1_000_000 {
+                return; // silently skip when full
+            }
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&traj_path)
+        {
+            let _ = writeln!(f, "{{\"s\":{},\"a\":{},\"r\":{:.4},\"s_prime\":{},\"tick\":{}}}",
+                s, a, reward, s_prime, self.total_ticks);
+        }
+    }
+
+    /// Enforce infrastructure-locked constraints on neuro-driven params.
+    /// Called after neuromodulator pushes new values.
+    pub fn enforce_constraints(&mut self) {
+        self.dyna_steps = self.dyna_steps.min(self.constraints.max_dyna_steps);
+        self.neuro_alpha_mult = self.neuro_alpha_mult.max(self.constraints.min_alpha_mult);
+        let max_eps = self.constraints.max_epsilon - self.epsilon();
+        self.neuro_epsilon_bonus = self.neuro_epsilon_bonus.min(max_eps.max(0.0));
+    }
+
     pub fn persist(&self) {
         let flattened: Vec<f64> = self
             .q_table
@@ -409,6 +486,8 @@ mod tests {
             neuro_alpha_mult: 1.0,
             neuro_epsilon_bonus: 0.0,
             dyna_steps: DYNA_PLANNING_STEPS,
+            constraints: RlConstraints::default(),
+            consecutive_lower: 0,
         }
     }
 
