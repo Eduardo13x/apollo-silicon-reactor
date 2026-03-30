@@ -73,8 +73,10 @@ pub struct AisInput {
     pub rl_convergence_ticks: u64,
     /// Max possible ticks for normalization.
     pub rl_max_ticks: u64,
-    /// Causal graph edges with confidence > 0.50.
+    /// Causal graph edges with confidence > 0.50 (effective actions).
     pub causal_solid_edges: u32,
+    /// Causal graph edges with confidence < 0.25 (confirmed ineffective).
+    pub causal_weak_edges: u32,
     /// Causal graph total edges.
     pub causal_total_edges: u32,
     /// Skills that passed reliability threshold (≥5 applications, ≥60% success).
@@ -259,8 +261,14 @@ fn learning_velocity(input: &AisInput) -> f64 {
     // Sigmoid: score = 1 / (1 + variance)
     let rl_stability = 1.0 / (1.0 + input.rl_q_variance);
 
-    // Causal graph: fraction of solid edges.
-    let causal_depth = safe_ratio_u32(input.causal_solid_edges, input.causal_total_edges);
+    // Causal graph: fraction of *resolved* edges (solid OR definitively weak).
+    // Both represent useful knowledge — knowing what doesn't work is valuable.
+    let causal_depth = if input.causal_total_edges > 0 {
+        let resolved = input.causal_solid_edges + input.causal_weak_edges;
+        (resolved as f64 / input.causal_total_edges as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
 
     // Skills: reliable / total, with bonus for having any.
     let skill_score = if input.total_skills > 0 {
@@ -457,11 +465,12 @@ mod tests {
             rl_convergence_ticks: learning.1,
             rl_max_ticks: learning.2,
             causal_solid_edges: learning.3,
-            causal_total_edges: learning.4,
-            reliable_skills: learning.5,
-            total_skills: learning.6,
-            experience_records: learning.7,
-            dyna_transitions: learning.8,
+            causal_weak_edges: learning.4,
+            causal_total_edges: learning.5,
+            reliable_skills: learning.6,
+            total_skills: learning.7,
+            experience_records: learning.8,
+            dyna_transitions: learning.9,
 
             // Resource: LIVE from measured computation time
             p95_cycle_ms: resource.0,
@@ -611,9 +620,9 @@ mod tests {
     }
 
     // ── Learning Velocity Simulation ─────────────────────────────────────
-    // Returns: (rl_q_var, rl_conv_ticks, rl_max_ticks, causal_solid, causal_total,
+    // Returns: (rl_q_var, rl_conv_ticks, rl_max_ticks, causal_solid, causal_weak, causal_total,
     //           reliable_skills, total_skills, exp_records, dyna_transitions)
-    fn sim_learning_velocity() -> (f64, u64, u64, u32, u32, u32, u32, u32, u64) {
+    fn sim_learning_velocity() -> (f64, u64, u64, u32, u32, u32, u32, u32, u32, u64) {
         // RL: run agent for 500 ticks across different states
         let tmp = std::path::Path::new("/tmp/ais_rl_test.json");
         let mut rl = RlThresholdAgent::load_or_default(tmp);
@@ -683,6 +692,7 @@ mod tests {
         let conf_map = cg.confidence_map();
         let causal_total = conf_map.len() as u32;
         let causal_solid = conf_map.values().filter(|&&c| c > 0.50).count() as u32;
+        let causal_weak = conf_map.values().filter(|&&c| c < 0.25).count() as u32;
 
         // Skills: simulate learning across 4 skill types (mirrors real daemon diversity)
         let mut skills = SkillRegistry::new();
@@ -732,6 +742,7 @@ mod tests {
             converged_at,
             max_ticks,
             causal_solid,
+            causal_weak,
             causal_total,
             reliable,
             total,
@@ -852,6 +863,7 @@ mod tests {
             rl_convergence_ticks: 50,
             rl_max_ticks: 500,
             causal_solid_edges: 5,
+            causal_weak_edges: 0,
             causal_total_edges: 5,
             reliable_skills: 3,
             total_skills: 3,
