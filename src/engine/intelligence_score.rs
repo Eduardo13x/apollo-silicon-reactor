@@ -629,9 +629,9 @@ mod tests {
             let state = RlState::from_metrics(pressure, compressor, if overflowed { 1 } else { 0 });
             rl.tick(state, overflowed);
 
-            // Check convergence: adjustment stabilizes
+            // Check convergence: adjustment stabilizes (warmup=50, EMA alpha starts 0.20)
             let adj = rl.current_adjustment;
-            if tick > 100 && (adj - last_adj).abs() < 0.001 && converged_at == max_ticks {
+            if tick > 50 && (adj - last_adj).abs() < 0.001 && converged_at == max_ticks {
                 converged_at = tick;
             }
             last_adj = adj;
