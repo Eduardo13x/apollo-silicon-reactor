@@ -157,7 +157,7 @@ pub fn apply_io_tier_direct(
 
 /// Minimum interval between re-applying I/O policy to the same PID.
 /// Avoids syscall spam when nothing changed.
-const MIN_REAPPLY_SECS: u64 = 10;
+const MIN_REAPPLY_SECS: u64 = 60;
 
 /// Maximum tracked PIDs (prevent unbounded growth).
 const MAX_TRACKED_PIDS: usize = 200;
