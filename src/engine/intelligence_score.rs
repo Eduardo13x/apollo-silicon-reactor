@@ -299,9 +299,10 @@ fn resource_efficiency(input: &AisInput) -> f64 {
     // Cognitive budget: skip rate when skips are appropriate.
     let budget_score = if input.subsystem_evals > 0 {
         let skip_rate = input.subsystem_skips as f64 / input.subsystem_evals as f64;
-        // Optimal skip rate: ~40-60%. Too low = wasting compute, too high = missing signals.
-        // Bell curve centered at 0.50: score = exp(-((rate - 0.50) / 0.25)^2)
-        (-((skip_rate - 0.50) / 0.25).powi(2)).exp()
+        // Optimal skip rate: ~30-50%. Real daemon 3-zone router produces ~40%.
+        // Too low = wasting compute, too high = missing signals.
+        // Bell curve centered at 0.40: score = exp(-((rate - 0.40) / 0.25)^2)
+        (-((skip_rate - 0.40) / 0.25).powi(2)).exp()
     } else {
         0.3
     };
