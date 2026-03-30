@@ -3028,6 +3028,12 @@ fn main() -> anyhow::Result<()> {
             let mut energy_tracker = EnergyTracker::new();
             let mut outcome_tracker = OutcomeTracker::new();
             outcome_tracker.load_hop_groups(std::path::Path::new(hop_groups_path()));
+
+            // Habituation filter (Thompson & Spencer 1966, inspired by memoria-core).
+            // Tracks per-process (cpu_bucket, rss_bucket, cycles_unchanged).
+            // Processes unchanged for ≥5 cycles are skipped in decide_actions.
+            const HABITUATION_THRESHOLD: u32 = 5;
+            let mut habituation_map: HashMap<u32, (u8, u8, u32)> = HashMap::new();
             // Track cycle-to-cycle wall time for energy dt calculation.
             let mut last_cycle_instant = Instant::now();
             // Audit fix #5: Background powermetrics polling (replaces 5-cycle IOKit tick).
@@ -5030,6 +5036,43 @@ fn main() -> anyhow::Result<()> {
                 // already covers anomaly detection and prediction.
                 // Code preserved in telemetry_logger.rs / transformer_predictor.rs.
 
+                // ── Habituation: update per-process state tracking ─────────
+                // Inspired by Thompson & Spencer 1966 / memoria-core habituation.rs.
+                // Processes whose CPU and RSS bucket are unchanged for ≥5 cycles
+                // are skipped in decide_actions (their last action is maintained).
+                // Dishabituation: any bucket change resets the counter.
+                let habituated_pids: HashSet<u32> = {
+                    let mut hab_set = HashSet::new();
+                    for (pid, process) in collector.system().processes() {
+                        let pid_u32 = pid.as_u32();
+                        let cpu_bucket = (process.cpu_usage() / 5.0) as u8;
+                        let rss_bucket = (process.memory() / (50 * 1024 * 1024)) as u8;
+                        match habituation_map.get_mut(&pid_u32) {
+                            Some(entry) => {
+                                if entry.0 == cpu_bucket && entry.1 == rss_bucket {
+                                    entry.2 += 1; // unchanged
+                                    if entry.2 >= HABITUATION_THRESHOLD {
+                                        hab_set.insert(pid_u32);
+                                    }
+                                } else {
+                                    // Dishabituation: state changed.
+                                    *entry = (cpu_bucket, rss_bucket, 0);
+                                }
+                            }
+                            None => {
+                                habituation_map.insert(pid_u32, (cpu_bucket, rss_bucket, 0));
+                            }
+                        }
+                    }
+                    // GC dead PIDs every 100 cycles.
+                    if cycle_count % 100 == 0 {
+                        let live: HashSet<u32> = collector.system().processes()
+                            .keys().map(|p| p.as_u32()).collect();
+                        habituation_map.retain(|pid, _| live.contains(pid));
+                    }
+                    hab_set
+                };
+
                 let decision = {
                     let mut qos = state.mach_qos.lock_recover();
                     decide_actions(
@@ -5047,6 +5090,7 @@ fn main() -> anyhow::Result<()> {
                         &behavior_interactive_pids,
                         &ipc_hints,
                         &outcome_tracker.hop_groups,
+                        &habituated_pids,
                     )
                 };
                 *state.last_blockers.lock_recover() = decision.blockers.clone();

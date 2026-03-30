@@ -193,6 +193,10 @@ pub fn decide_actions(
     // HRPO group effectiveness from Dr. Zero — skip throttling groups with
     // consistently low effectiveness (< 15%) after sufficient observations.
     hop_groups: &HashMap<WorkloadHop, HopGroupWeight>,
+    // Habituation filter (Thompson & Spencer 1966, inspired by memoria-core):
+    // PIDs whose (cpu_bucket, rss_bucket) haven't changed in N cycles.
+    // Skipped in the main loop — their last decision is maintained.
+    habituated_pids: &HashSet<u32>,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -282,6 +286,13 @@ pub fn decide_actions(
         let pid = pid.as_u32();
 
         if critical_pids.contains(&pid) {
+            continue;
+        }
+
+        // Habituation: skip processes whose state hasn't changed in N cycles.
+        // Their previous throttle/boost action is maintained by the executor.
+        // Dishabituation occurs when CPU or RSS bucket changes (daemon side).
+        if habituated_pids.contains(&pid) {
             continue;
         }
 

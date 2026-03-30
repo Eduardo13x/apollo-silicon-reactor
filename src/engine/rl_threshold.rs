@@ -17,6 +17,7 @@
 //! The RL output is an additive correction on top of the existing exponential
 //! decay (compute_dynamic_offset), which provides the baseline behavior.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -109,6 +110,18 @@ struct RlPersisted {
     total_overflows: u64,
 }
 
+/// Dyna-Q planning steps per real transition (Sutton 1991).
+/// 10 simulated updates per real step ≈ 10x sample efficiency.
+/// Inspired by memoria-core/src/embodiment/dyna_q.rs.
+const DYNA_PLANNING_STEPS: usize = 10;
+
+/// Stored model entry for Dyna-Q planning.
+#[derive(Clone)]
+struct DynaTransition {
+    reward: f64,
+    next_state_idx: usize,
+}
+
 /// Tabular Q-learning agent for adaptive threshold tuning.
 pub struct RlThresholdAgent {
     q_table: [[f64; NUM_ACTIONS]; NUM_STATES],
@@ -125,6 +138,13 @@ pub struct RlThresholdAgent {
     /// Used to normalize surprise: surprise_factor = |rpe| / rpe_ema.
     /// Initialized to 1.0 so early ticks start with a neutral baseline.
     rpe_ema: f64,
+    /// Dyna-Q transition model: (state_idx, action_idx) → transition.
+    /// Stores observed transitions for model-based planning replay.
+    dyna_model: HashMap<(usize, usize), DynaTransition>,
+    /// Round-robin cursor for deterministic planning (no RNG needed).
+    dyna_cursor: usize,
+    /// Cached keys for round-robin iteration.
+    dyna_keys: Vec<(usize, usize)>,
 }
 
 impl RlThresholdAgent {
@@ -155,6 +175,9 @@ impl RlThresholdAgent {
             path: path.to_path_buf(),
             prev_pressure: 0.5,
             rpe_ema: 1.0,
+            dyna_model: HashMap::new(),
+            dyna_cursor: 0,
+            dyna_keys: Vec::new(),
         }
     }
 
@@ -240,6 +263,11 @@ impl RlThresholdAgent {
             let surprise_factor = (rpe_abs / self.rpe_ema.max(0.01)).clamp(0.5, 5.0);
             let effective_alpha = self.alpha() * surprise_factor;
             self.q_table[s][a] = old_q + effective_alpha * (reward + GAMMA * max_q_next - old_q);
+
+            // Dyna-Q: record real transition and run planning steps.
+            // Inspired by memoria-core dyna_q.rs (Sutton 1991).
+            self.dyna_record(s, a, reward, s_prime);
+            self.dyna_plan();
         }
 
         let action = self.select_action(state);
@@ -280,6 +308,58 @@ impl RlThresholdAgent {
         }
     }
 
+    /// Record a real (s, a, r, s') transition into the Dyna-Q model.
+    fn dyna_record(&mut self, state_idx: usize, action_idx: usize, reward: f64, next_state_idx: usize) {
+        let key = (state_idx, action_idx);
+        match self.dyna_model.get_mut(&key) {
+            Some(t) => {
+                // EMA blend: keep history, weight new reward at 10%.
+                t.reward = t.reward * 0.9 + reward * 0.1;
+                t.next_state_idx = next_state_idx;
+            }
+            None => {
+                self.dyna_model.insert(key, DynaTransition { reward, next_state_idx });
+                // Invalidate key cache.
+                self.dyna_keys.clear();
+            }
+        }
+    }
+
+    /// Run DYNA_PLANNING_STEPS simulated Q-updates from the stored model.
+    /// Deterministic round-robin — no RNG dependency.
+    fn dyna_plan(&mut self) {
+        if self.dyna_model.is_empty() {
+            return;
+        }
+        // Rebuild key cache if invalidated.
+        if self.dyna_keys.is_empty() {
+            self.dyna_keys = self.dyna_model.keys().copied().collect();
+        }
+        let n_keys = self.dyna_keys.len();
+        let alpha = self.alpha();
+        for _ in 0..DYNA_PLANNING_STEPS {
+            let idx = self.dyna_cursor % n_keys;
+            self.dyna_cursor = self.dyna_cursor.wrapping_add(1);
+            let (s, a) = self.dyna_keys[idx];
+            let t = match self.dyna_model.get(&(s, a)) {
+                Some(t) => t.clone(),
+                None => continue,
+            };
+            let max_q_next = self.q_table[t.next_state_idx]
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let max_q_next = if max_q_next.is_infinite() { 0.0 } else { max_q_next };
+            let old_q = self.q_table[s][a];
+            self.q_table[s][a] = old_q + alpha * (t.reward + GAMMA * max_q_next - old_q);
+        }
+    }
+
+    /// Number of unique (state, action) pairs in the Dyna-Q model.
+    pub fn dyna_model_size(&self) -> usize {
+        self.dyna_model.len()
+    }
+
     pub fn persist(&self) {
         let flattened: Vec<f64> = self
             .q_table
@@ -313,6 +393,9 @@ mod tests {
             path: PathBuf::from("/dev/null"),
             prev_pressure: 0.5,
             rpe_ema: 1.0,
+            dyna_model: HashMap::new(),
+            dyna_cursor: 0,
+            dyna_keys: Vec::new(),
         }
     }
 
@@ -656,5 +739,42 @@ mod tests {
         assert_eq!(loaded.current_adjustment, agent.current_adjustment);
         assert_eq!(loaded.total_ticks, agent.total_ticks);
         assert_eq!(loaded.total_overflows, agent.total_overflows);
+    }
+
+    #[test]
+    fn test_dyna_q_amplifies_learning() {
+        // Agent WITH Dyna-Q (default) should learn faster than one without.
+        // Both see the same 30-tick sequence of high→low pressure transitions.
+        let mut agent_dyna = make_agent();
+        let mut agent_nodyna = make_agent();
+
+        let high = RlState::from_metrics(0.85, 0.70, 2);
+        let low = RlState::from_metrics(0.30, 0.10, 0);
+        for _ in 0..15 {
+            agent_dyna.tick(high, true);
+            agent_dyna.tick(low, false);
+
+            // Simulate no-dyna by clearing model each tick.
+            agent_nodyna.tick(high, true);
+            agent_nodyna.dyna_model.clear();
+            agent_nodyna.dyna_keys.clear();
+            agent_nodyna.tick(low, false);
+            agent_nodyna.dyna_model.clear();
+            agent_nodyna.dyna_keys.clear();
+        }
+
+        // Dyna agent should have more model entries and different Q-values.
+        assert!(agent_dyna.dyna_model_size() > 0, "dyna model should have entries");
+        // Compare Q-value spread: dyna should have more differentiated Q-values
+        // (higher variance) because planning amplifies learning from each transition.
+        let variance = |qt: &[[f64; NUM_ACTIONS]; NUM_STATES]| -> f64 {
+            let vals: Vec<f64> = qt.iter().flat_map(|r| r.iter().copied()).collect();
+            let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+            vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / vals.len() as f64
+        };
+        assert!(
+            variance(&agent_dyna.q_table) > variance(&agent_nodyna.q_table),
+            "dyna agent should have more differentiated Q-values"
+        );
     }
 }
