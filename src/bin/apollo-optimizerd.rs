@@ -4510,9 +4510,10 @@ fn main() -> anyhow::Result<()> {
                         metrics.smc_p_cluster_watts = smc.p_cluster_watts;
                     }
 
-                    // KPC IPC metric
+                    // KPC IPC metric + signal intelligence modulation
                     if let Some(ref kpc) = kpc_snap {
                         metrics.kpc_ipc = kpc.ipc;
+                        signal_intel.set_kpc_ipc(kpc.ipc);
                     }
 
                     // Rosetta AOT state

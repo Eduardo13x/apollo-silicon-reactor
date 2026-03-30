@@ -137,6 +137,11 @@ pub struct SignalIntelligence {
     // Neuromodulator serotonin shift: positive = conserve (raise thresholds),
     // negative = engage more. Set by daemon from ApolloNeuromodulator.
     pub neuro_serotonin_shift: f64,
+
+    /// Last KPC IPC value (0 = unavailable). Set by daemon each cycle.
+    kpc_ipc: f64,
+    /// Kalman base R for pressure (stored so we can modulate dynamically).
+    kf_pressure_base_r: f64,
 }
 
 impl Default for SignalIntelligence {
@@ -186,6 +191,24 @@ impl SignalIntelligence {
             learned_high_entry: 0.50,
 
             neuro_serotonin_shift: 0.0,
+
+            kpc_ipc: 0.0,
+            kf_pressure_base_r: 0.02,
+        }
+    }
+
+    /// Feed KPC IPC value. Called by daemon each cycle before tick().
+    /// Modulates Kalman measurement noise:
+    ///   IPC < 0.5 → memory-bound → pressure signal more reliable → lower R
+    ///   IPC > 1.5 → compute-bound → pressure signal noisier → higher R
+    pub fn set_kpc_ipc(&mut self, ipc: f64) {
+        self.kpc_ipc = ipc;
+        if ipc > 0.0 {
+            // Scale R: base_r × [0.5, 2.0] based on IPC.
+            // Low IPC (memory-bound): 0.5× base_r → trust pressure more.
+            // High IPC (compute-bound): 2.0× base_r → trust prediction more.
+            let scale = (ipc / 1.0).clamp(0.5, 2.0);
+            self.kf_pressure.set_measurement_noise(self.kf_pressure_base_r * scale);
         }
     }
 

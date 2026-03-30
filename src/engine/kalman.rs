@@ -146,6 +146,13 @@ impl Kalman1D {
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
+
+    /// Dynamically adjust measurement noise R.
+    /// Lower R = trust measurements more. Higher R = trust predictions more.
+    /// Used by KPC IPC modulation: low IPC (memory-bound) → lower R.
+    pub fn set_measurement_noise(&mut self, r: f64) {
+        self.r = r.max(1e-6); // safety floor
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
