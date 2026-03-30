@@ -203,10 +203,10 @@ run_autoresearch() {
 
     # Bonus (0-10)
     local AR_P95 AR_CAUSAL AR_BONUS=0
-    AR_P95=$(echo "$AR_FINAL" | grep -oE '"p95_cycle_ms": [0-9.]+' | grep -oE '[0-9.]+' || echo 999)
-    AR_CAUSAL=$(echo "$AR_FINAL" | grep -oE '"causal_effect_avg": [0-9.]+' | grep -oE '[0-9.]+' || echo 0)
+    AR_P95=$(echo "$AR_FINAL" | grep -oE '"p95_cycle_ms": [0-9.]+' | tail -1 | grep -oE '[0-9.]+' || echo 999)
+    AR_CAUSAL=$(echo "$AR_FINAL" | grep -oE '"causal_effect_avg": [0-9.]+' | tail -1 | grep -oE '[0-9.]+' || echo 0)
     local AR_P95_INT
-    AR_P95_INT=$(echo "$AR_P95" | cut -d. -f1)
+    AR_P95_INT=$(echo "$AR_P95" | cut -d. -f1 | tr -d '[:space:]')
     [ "${AR_P95_INT:-999}" -le 120 ] && AR_BONUS=$((AR_BONUS + 5))
     [ "$AR_CAUSAL" != "0" ] && AR_BONUS=$((AR_BONUS + 5))
 
