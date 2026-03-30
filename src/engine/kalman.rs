@@ -44,10 +44,6 @@ pub struct Kalman1D {
     /// el filtro confía más en el modelo.
     r: f64,
 
-    /// Exponential moving average of innovation² for adaptive Q-boost.
-    /// When innovation >> ema, temporarily boost Q to react faster (Sage & Husa, 1969).
-    innovation_ema: f64,
-
     /// true una vez que recibimos al menos una observación.
     initialized: bool,
 }
@@ -68,7 +64,6 @@ impl Kalman1D {
             p11: 1.0,
             q: process_noise,
             r: measurement_noise,
-            innovation_ema: 0.0,
             initialized: false,
         }
     }
@@ -91,21 +86,6 @@ impl Kalman1D {
 
         let dt = dt.max(0.001); // floor para evitar dt=0
 
-        // ── Adaptive Q-boost (Sage & Husa, 1969) ─────────────────────────
-        // When the innovation (measurement - prediction) is much larger than
-        // recent history, the signal has shifted and the filter should adapt faster.
-        // We temporarily boost Q so the Kalman gain increases.
-        let innovation_raw = measurement - (self.x + self.v * dt);
-        let innovation_sq = innovation_raw * innovation_raw;
-        self.innovation_ema = 0.95 * self.innovation_ema + 0.05 * innovation_sq;
-        // Boost factor: 1.0 normally, up to 4.0 when innovation >> EMA.
-        let q_boost = if self.innovation_ema > 1e-10 {
-            (innovation_sq / self.innovation_ema).clamp(1.0, 4.0)
-        } else {
-            1.0
-        };
-        let q_effective = self.q * q_boost;
-
         // ── Predict ──────────────────────────────────────────────────────
         // x_pred = F * x = [x + v*dt, v]
         let x_pred = self.x + self.v * dt;
@@ -113,9 +93,9 @@ impl Kalman1D {
 
         // P_pred = F * P * F' + Q
         // Q se escala con dt: bloques proporcionales a [dt³/3, dt²/2; dt²/2, dt]
-        let q_dt3 = q_effective * dt * dt * dt / 3.0;
-        let q_dt2 = q_effective * dt * dt / 2.0;
-        let q_dt1 = q_effective * dt;
+        let q_dt3 = self.q * dt * dt * dt / 3.0;
+        let q_dt2 = self.q * dt * dt / 2.0;
+        let q_dt1 = self.q * dt;
 
         let p00_pred = self.p00 + dt * (self.p01 + self.p01 + dt * self.p11) + q_dt3;
         let p01_pred = self.p01 + dt * self.p11 + q_dt2;
