@@ -45,9 +45,12 @@ impl OptimizationSkill {
         self.apply_count >= 5 && self.success_rate >= 0.60
     }
 
-    /// Should this skill be retired? (≥10 applications, <20% success rate)
+    /// Should this skill be retired? (≥10 applications, <35% success rate)
+    /// 35% threshold: skills in the 20-35% range are barely above noise and
+    /// consume a slot that a better skill could occupy. The reliable threshold
+    /// is 60%, so anything below 35% is clearly not useful in practice.
     pub fn should_retire(&self) -> bool {
-        self.apply_count >= 10 && self.success_rate < 0.20
+        self.apply_count >= 10 && self.success_rate < 0.35
     }
 }
 
