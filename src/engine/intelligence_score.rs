@@ -210,22 +210,26 @@ fn signal_quality(input: &AisInput) -> f64 {
     // Sigmoid mapping: score = 1 / (1 + (rmse/0.03)^2)
     let kalman_score = 1.0 / (1.0 + (input.kalman_rmse / 0.03).powi(2));
 
-    // CUSUM: F1 score of detection.
+    // CUSUM: Fβ score with β=2 (recall-weighted).
+    // In a safety-critical system, missing a real regime shift (false negative)
+    // is worse than a false alarm (false positive). β=2 weights recall 4× more.
     let cusum_tp = input.cusum_true_positives as f64;
     let cusum_fp = input.cusum_false_positives as f64;
     let cusum_fn = (input.cusum_actual_shifts.saturating_sub(input.cusum_true_positives)) as f64;
     let cusum_precision = if cusum_tp + cusum_fp > 0.0 {
         cusum_tp / (cusum_tp + cusum_fp)
     } else {
-        0.5 // no data = neutral
+        0.5
     };
     let cusum_recall = if cusum_tp + cusum_fn > 0.0 {
         cusum_tp / (cusum_tp + cusum_fn)
     } else {
         0.5
     };
-    let cusum_f1 = if cusum_precision + cusum_recall > 0.0 {
-        2.0 * cusum_precision * cusum_recall / (cusum_precision + cusum_recall)
+    let beta_sq = 4.0; // β²=4 for β=2
+    let cusum_fbeta = if cusum_precision + cusum_recall > 0.0 {
+        (1.0 + beta_sq) * cusum_precision * cusum_recall
+            / (beta_sq * cusum_precision + cusum_recall)
     } else {
         0.0
     };
@@ -236,7 +240,7 @@ fn signal_quality(input: &AisInput) -> f64 {
     // Entropy TPR directly.
     let entropy_score = input.entropy_tpr.clamp(0.0, 1.0);
 
-    (0.30 * kalman_score + 0.30 * cusum_f1 + 0.25 * hazard_score + 0.15 * entropy_score)
+    (0.30 * kalman_score + 0.30 * cusum_fbeta + 0.25 * hazard_score + 0.15 * entropy_score)
         .clamp(0.0, 1.0)
 }
 
