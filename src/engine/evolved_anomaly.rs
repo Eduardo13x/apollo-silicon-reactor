@@ -35,6 +35,79 @@
 
 use crate::engine::telemetry_logger::N_FEATURES;
 
+// ── NEON-accelerated f32 operations ─────────────────────────────────────────
+// N_FEATURES=16 = exactly 4 × float32x4_t lanes. Zero remainder.
+
+/// NEON dot product for f32 slices of length 16 (encoder/decoder inner loops).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn neon_dot16_f32(a: &[f32], b: &[f32; N_FEATURES]) -> f32 {
+    debug_assert!(a.len() >= N_FEATURES);
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        // 16 elements / 4 lanes = 4 iterations, fully unrolled.
+        let a0 = vld1q_f32(a.as_ptr());
+        let b0 = vld1q_f32(b.as_ptr());
+        acc0 = vfmaq_f32(acc0, a0, b0);
+        let a1 = vld1q_f32(a.as_ptr().add(4));
+        let b1 = vld1q_f32(b.as_ptr().add(4));
+        acc1 = vfmaq_f32(acc1, a1, b1);
+        let a2 = vld1q_f32(a.as_ptr().add(8));
+        let b2 = vld1q_f32(b.as_ptr().add(8));
+        acc2 = vfmaq_f32(acc2, a2, b2);
+        let a3 = vld1q_f32(a.as_ptr().add(12));
+        let b3 = vld1q_f32(b.as_ptr().add(12));
+        acc3 = vfmaq_f32(acc3, a3, b3);
+        // Horizontal reduction: acc0+acc1+acc2+acc3
+        let sum01 = vaddq_f32(acc0, acc1);
+        let sum23 = vaddq_f32(acc2, acc3);
+        let sum = vaddq_f32(sum01, sum23);
+        vaddvq_f32(sum)
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn neon_dot16_f32(a: &[f32], b: &[f32; N_FEATURES]) -> f32 {
+    let mut s = 0.0f32;
+    for i in 0..N_FEATURES {
+        s += a[i] * b[i];
+    }
+    s
+}
+
+/// NEON dot product for f32 slices of length 24 (decoder inner loop: HIDDEN=24).
+/// 24 / 4 = 6 NEON iterations, zero remainder.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn neon_dot24_f32(a: &[f32], b: &[f32; HIDDEN]) -> f32 {
+    debug_assert!(a.len() >= HIDDEN);
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut acc0 = vmulq_f32(vld1q_f32(a.as_ptr()), vld1q_f32(b.as_ptr()));
+        let mut acc1 = vmulq_f32(vld1q_f32(a.as_ptr().add(4)), vld1q_f32(b.as_ptr().add(4)));
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a.as_ptr().add(8)), vld1q_f32(b.as_ptr().add(8)));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a.as_ptr().add(12)), vld1q_f32(b.as_ptr().add(12)));
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a.as_ptr().add(16)), vld1q_f32(b.as_ptr().add(16)));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a.as_ptr().add(20)), vld1q_f32(b.as_ptr().add(20)));
+        vaddvq_f32(vaddq_f32(acc0, acc1))
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn neon_dot24_f32(a: &[f32], b: &[f32; HIDDEN]) -> f32 {
+    let mut s = 0.0f32;
+    for i in 0..HIDDEN {
+        s += a[i] * b[i];
+    }
+    s
+}
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Hopfield memory: number of stored "normal" prototypes.
@@ -329,14 +402,10 @@ impl SaeGenome {
     fn forward(&self, x: &[f32; N_FEATURES]) -> ([f32; N_FEATURES], [f32; HIDDEN]) {
         let masked = self.mask_input(x);
 
-        // Encode: h = ReLU(W_e · x + b_e)
+        // Encode: h = ReLU(W_e · x + b_e) — NEON-accelerated inner product.
         let mut h = [0.0f32; HIDDEN];
         for j in 0..HIDDEN {
-            let mut sum = self.b_enc[j];
-            for i in 0..N_FEATURES {
-                sum += self.w_enc[j][i] * masked[i];
-            }
-            h[j] = sum.max(0.0); // ReLU
+            h[j] = (self.b_enc[j] + neon_dot16_f32(&self.w_enc[j], &masked)).max(0.0);
         }
 
         // TopK: keep only the top K activations, zero the rest.
@@ -363,14 +432,10 @@ impl SaeGenome {
             }
         }
 
-        // Decode: x̂ = W_d · h_sparse + b_d
+        // Decode: x̂ = W_d · h_sparse + b_d — NEON-accelerated inner product.
         let mut recon = [0.0f32; N_FEATURES];
         for i in 0..N_FEATURES {
-            let mut sum = self.b_dec[i];
-            for j in 0..HIDDEN {
-                sum += self.w_dec[i][j] * h_sparse[j];
-            }
-            recon[i] = sum;
+            recon[i] = self.b_dec[i] + neon_dot24_f32(&self.w_dec[i], &h_sparse);
         }
 
         (recon, h_sparse)
@@ -722,11 +787,7 @@ impl EvolvedAnomalyDetector {
 
 #[inline]
 fn dot(a: &[f32; N_FEATURES], b: &[f32; N_FEATURES]) -> f32 {
-    let mut s = 0.0f32;
-    for i in 0..N_FEATURES {
-        s += a[i] * b[i];
-    }
-    s
+    neon_dot16_f32(a, b)
 }
 
 #[inline]
