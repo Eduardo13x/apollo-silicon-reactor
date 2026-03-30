@@ -326,6 +326,14 @@ fn frozen_state_path() -> &'static str {
     }
 }
 
+fn hop_groups_path() -> &'static str {
+    if unsafe { libc::geteuid() } == 0 {
+        "/var/lib/apollo/hrpo_groups.json"
+    } else {
+        "/tmp/apollo-hrpo_groups.json"
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "apollo-optimizerd")]
 struct Cli {
@@ -3019,6 +3027,7 @@ fn main() -> anyhow::Result<()> {
             // Per-app energy estimation: accumulates energy attribution each cycle.
             let mut energy_tracker = EnergyTracker::new();
             let mut outcome_tracker = OutcomeTracker::new();
+            outcome_tracker.load_hop_groups(std::path::Path::new(hop_groups_path()));
             // Track cycle-to-cycle wall time for energy dt calculation.
             let mut last_cycle_instant = Instant::now();
             // Audit fix #5: Background powermetrics polling (replaces 5-cycle IOKit tick).
@@ -6342,6 +6351,7 @@ fn main() -> anyhow::Result<()> {
                 // effects survive crashes (not just clean shutdowns).
                 if cycle_count % 100 == 0 {
                     signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
+                    outcome_tracker.persist_hop_groups(std::path::Path::new(hop_groups_path()));
                 }
                 // Hourly housekeeping (7200 cycles × 500ms ≈ 1 hour).
                 if cycle_count % 7200 == 1 {

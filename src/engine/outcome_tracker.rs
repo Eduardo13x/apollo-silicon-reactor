@@ -148,7 +148,7 @@ impl ExperienceMemory {
 // same kind so new processes benefit from existing experience (zero-shot).
 
 /// Workload hop — a category that groups structurally similar processes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WorkloadHop {
     Browser,
     Build,
@@ -187,7 +187,7 @@ impl WorkloadHop {
 }
 
 /// Per-group effectiveness tracker (HRPO weights — Dr. Zero solver).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HopGroupWeight {
     pub throttle_count: u32,
     pub effective_count: u32,
@@ -548,6 +548,22 @@ impl OutcomeTracker {
         }
         let sum: f64 = self.hop_groups.values().map(|g| g.prediction_error_ema).sum();
         sum / self.hop_groups.len() as f64
+    }
+
+    /// Persist hop_groups to disk so HRPO learning survives restarts.
+    pub fn persist_hop_groups(&self, path: &std::path::Path) {
+        if let Ok(json) = serde_json::to_string(&self.hop_groups) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    /// Load hop_groups from disk (called on startup).
+    pub fn load_hop_groups(&mut self, path: &std::path::Path) {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(groups) = serde_json::from_str::<HashMap<WorkloadHop, HopGroupWeight>>(&data) {
+                self.hop_groups = groups;
+            }
+        }
     }
 }
 
