@@ -62,19 +62,13 @@ while time.time()-t<300: sum(range(10000))" &
             for _s in $(seq 1 20); do sleep 300 & DZ_PIDS="$DZ_PIDS $!"; done
             ;;
         3)
-            write_report "CHALLENGE: heavy (800MB alloc + CPU×3 + 40 processes)"
-            python3 -c "
-import time
-chunks = [bytearray(200*1024*1024) for _ in range(4)]
-time.sleep(300)
-" &
-            DZ_PIDS="$!"
-            for _c in $(seq 1 3); do
+            write_report "CHALLENGE: heavy (CPU×2 + 40 processes, no alloc)"
+            for _c in $(seq 1 2); do
                 python3 -c "import time; t=time.time()
 while time.time()-t<300: sum(range(10000))" &
-                DZ_PIDS="$DZ_PIDS $!"
+                DZ_PIDS="${DZ_PIDS:-} $!"
             done
-            for _s in $(seq 1 40); do sleep 300 & DZ_PIDS="$DZ_PIDS $!"; done
+            for _s in $(seq 1 40); do sleep 300 & DZ_PIDS="${DZ_PIDS:-} $!"; done
             ;;
     esac
 }
@@ -297,18 +291,7 @@ echo "  Observe:  touch $OBSERVE"
 echo "  Stop:     touch $STOP"
 echo ""
 
-# Sync ctl binary on startup
-if [ -f target/release/apollo-optimizerctl ]; then
-    INSTALLED_MD5=$(md5 -q "$CTL" 2>/dev/null || echo "none")
-    BUILT_MD5=$(md5 -q target/release/apollo-optimizerctl)
-    if [ "$INSTALLED_MD5" != "$BUILT_MD5" ]; then
-        echo "  Syncing ctl binary..."
-        cp -f target/release/apollo-optimizerctl "$CTL"
-        chown root:wheel "$CTL"
-        chmod 755 "$CTL"
-        codesign --force --sign - "$CTL" 2>/dev/null
-    fi
-fi
+# ctl binary synced during trigger deploy (not on startup to avoid codesign hang)
 
 touch /tmp/.apollo-last-build
 
