@@ -23,6 +23,7 @@ pub mod holt_winters;
 pub mod host_vm_info;
 pub mod hw_bayes;
 pub mod hw_predictor;
+pub mod intelligence_score;
 pub mod io_tiering;
 pub mod iokit_sensors;
 pub mod ioreport;
