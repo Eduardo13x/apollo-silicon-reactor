@@ -35,11 +35,6 @@ pub struct Cusum {
     s_neg: f64,
     /// Número de observaciones desde la última alarma o inicio.
     run_length: u32,
-    /// Refractory period: minimum observations between alarms (Basseville & Nikiforov, 1993).
-    /// Prevents spurious re-triggering after a genuine alarm + reset.
-    refractory: u32,
-    /// Countdown: observations remaining in refractory period.
-    refractory_countdown: u32,
 }
 
 impl Cusum {
@@ -56,8 +51,6 @@ impl Cusum {
             s_pos: 0.0,
             s_neg: 0.0,
             run_length: 0,
-            refractory: 5, // suppress alarms for 5 observations after trigger
-            refractory_countdown: 0,
         }
     }
 
@@ -68,20 +61,16 @@ impl Cusum {
         // S⁻ = max(0, S⁻ + (target - k - x))  [equivalente: detecta bajadas]
         self.s_neg = (self.s_neg + (self.target - self.k - value)).max(0.0);
         self.run_length += 1;
-        // Refractory countdown
-        if self.refractory_countdown > 0 {
-            self.refractory_countdown -= 1;
-        }
     }
 
     /// ¿Alarma de subida? La señal ha drifteado significativamente por encima del target.
     pub fn alarm_high(&self) -> bool {
-        self.s_pos > self.h && self.refractory_countdown == 0
+        self.s_pos > self.h
     }
 
     /// ¿Alarma de bajada? La señal ha drifteado significativamente por debajo del target.
     pub fn alarm_low(&self) -> bool {
-        self.s_neg > self.h && self.refractory_countdown == 0
+        self.s_neg > self.h
     }
 
     /// Resetea los acumuladores (llamar después de actuar sobre una alarma).
@@ -89,7 +78,6 @@ impl Cusum {
         self.s_pos = 0.0;
         self.s_neg = 0.0;
         self.run_length = 0;
-        self.refractory_countdown = self.refractory;
     }
 
     /// Resetea y actualiza el target (cuando aprendemos un nuevo régimen normal).
