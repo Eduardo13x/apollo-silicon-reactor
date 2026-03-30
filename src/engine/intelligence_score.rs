@@ -247,10 +247,11 @@ fn signal_quality(input: &AisInput) -> f64 {
 // ── Dimension 3: Learning Velocity ───────────────────────────────────────────
 // How fast and deep the system learns from experience.
 fn learning_velocity(input: &AisInput) -> f64 {
-    // RL convergence: normalize ticks to first good policy.
-    // Fewer ticks = faster learning. Score = 1 - (ticks/max_ticks).
+    // RL convergence: sigmoid — rewards converging in <30% of total ticks.
+    // 1/(1 + (ratio/0.30)²): 20% → 0.92, 30% → 0.50, 50% → 0.26.
     let rl_speed = if input.rl_max_ticks > 0 {
-        1.0 - (input.rl_convergence_ticks as f64 / input.rl_max_ticks as f64).clamp(0.0, 1.0)
+        let ratio = input.rl_convergence_ticks as f64 / input.rl_max_ticks as f64;
+        1.0 / (1.0 + (ratio / 0.30).powi(2))
     } else {
         0.5
     };
