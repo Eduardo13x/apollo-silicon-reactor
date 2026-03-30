@@ -25,6 +25,30 @@ use serde::{Deserialize, Serialize};
 /// Número de features de riesgo.
 const N_RISK: usize = 4;
 
+/// NEON-accelerated dot product for exactly 4 f64 values.
+/// Uses 2 × float64x2_t multiply + horizontal reduction.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn neon_dot4(a: &[f64; 4], b: &[f64; 4]) -> f64 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let a0 = vld1q_f64(a.as_ptr());
+        let a1 = vld1q_f64(a.as_ptr().add(2));
+        let b0 = vld1q_f64(b.as_ptr());
+        let b1 = vld1q_f64(b.as_ptr().add(2));
+        let prod0 = vmulq_f64(a0, b0);
+        let prod1 = vmulq_f64(a1, b1);
+        let sum01 = vaddq_f64(prod0, prod1);
+        vgetq_lane_f64(sum01, 0) + vgetq_lane_f64(sum01, 1)
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn neon_dot4(a: &[f64; 4], b: &[f64; 4]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+}
+
 /// Modelo de hazard proporcional para estimar P(OOM).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HazardModel {
@@ -82,13 +106,9 @@ impl HazardModel {
     }
 
     /// Calcula h(x) = h₀ · exp(β · x).
+    /// NEON-accelerated: 4 f64 = 2 × float64x2_t → 2 FMA + horizontal add.
     fn hazard_rate(&self, features: &[f64; N_RISK]) -> f64 {
-        let dot: f64 = self
-            .beta
-            .iter()
-            .zip(features.iter())
-            .map(|(b, x)| b * x)
-            .sum();
+        let dot = neon_dot4(&self.beta, features);
         // Clamp el exponente para evitar overflow.
         let exp_val = dot.clamp(-10.0, 10.0);
         self.base_rate * exp_val.exp()
