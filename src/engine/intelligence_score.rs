@@ -671,9 +671,10 @@ mod tests {
             // RL adjustment is negative → lowers threshold → acts earlier
             let effective_action_th = 0.80 + rl.current_adjustment;
             let rl_acted = pressure > effective_action_th;
-            let action_effect = if rl_acted && pressure > 0.95 && tick > 100 {
-                action_emergency // daemon freezes multiple processes at critical pressure
-                                // only after warmup — daemon needs process knowledge first
+            let action_effect = if rl_acted && pressure > 0.95 && tick > 30 {
+                action_emergency // daemon freezes multiple processes at critical pressure.
+                                // ZeroTune pre-seeds critical band from tick 0, so only
+                                // a short warmup (30 ticks ≈ 2.5 min) is needed.
             } else {
                 action_normal
             };
