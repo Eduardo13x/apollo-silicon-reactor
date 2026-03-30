@@ -197,6 +197,11 @@ pub fn decide_actions(
     // PIDs whose (cpu_bucket, rss_bucket) haven't changed in N cycles.
     // Skipped in the main loop — their last decision is maintained.
     habituated_pids: &HashSet<u32>,
+    // Causal confidence map (Pearl 2009, from memoria-core/causal_inference.rs):
+    // "throttle:ProcessName" → confidence [0,1] that throttling this process
+    // actually causes pressure to drop. Processes with confidence < 0.20
+    // after ≥5 observations are skipped (causally ineffective).
+    causal_confidence: &HashMap<String, f32>,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -334,6 +339,20 @@ pub fn decide_actions(
                             low_value_skipped.push(format!("hrpo-skip:{}", name));
                             continue;
                         }
+                    }
+                }
+            }
+
+            // Causal graph: skip processes proven causally ineffective.
+            // If "throttle:X → pressure_drop" confidence < 0.20 with ≥5 observations,
+            // throttling X doesn't actually reduce pressure — skip it.
+            // Thermal emergencies bypass this (safety first).
+            if !matches!(context, InteractiveContext::ThermalConstrained) {
+                let causal_key = format!("throttle:{}", name);
+                if let Some(&conf) = causal_confidence.get(&causal_key) {
+                    if conf < 0.20 {
+                        low_value_skipped.push(format!("causal-skip:{}", name));
+                        continue;
                     }
                 }
             }

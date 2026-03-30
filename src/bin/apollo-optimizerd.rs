@@ -63,6 +63,7 @@ use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
 use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
 use apollo_optimizer::engine::network_monitor::NetworkMonitor;
 use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfile};
+use apollo_optimizer::engine::causal_graph::CausalGraph;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
 use apollo_optimizer::engine::overflow_guard::{OverflowGuard, BUILD_TOOLS};
 use apollo_optimizer::engine::power_management::{detect_battery_status, PowerManager};
@@ -3034,6 +3035,11 @@ fn main() -> anyhow::Result<()> {
             // Processes unchanged for ≥5 cycles are skipped in decide_actions.
             const HABITUATION_THRESHOLD: u32 = 5;
             let mut habituation_map: HashMap<u32, (u8, u8, u32)> = HashMap::new();
+
+            // Causal graph (Pearl 2009, adapted from memoria-core/causal_inference.rs).
+            // Tracks action → outcome relationships with Bayesian confidence.
+            // "throttle:X → pressure_drop" edges inform future prioritization.
+            let mut causal_graph = CausalGraph::new();
             // Track cycle-to-cycle wall time for energy dt calculation.
             let mut last_cycle_instant = Instant::now();
             // Audit fix #5: Background powermetrics polling (replaces 5-cycle IOKit tick).
@@ -5091,6 +5097,7 @@ fn main() -> anyhow::Result<()> {
                         &ipc_hints,
                         &outcome_tracker.hop_groups,
                         &habituated_pids,
+                        &causal_graph.confidence_map(),
                     )
                 };
                 *state.last_blockers.lock_recover() = decision.blockers.clone();
@@ -6285,6 +6292,36 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // ── Causal graph (Pearl 2009, memoria-core/causal_inference.rs) ──
+                // Record throttle/freeze actions for causal evaluation.
+                // Each action becomes a pending observation; eval_delay cycles later
+                // we check if pressure actually dropped (cause → effect).
+                {
+                    let pressure_now = snapshot.pressure.memory_pressure as f32;
+                    for name in &throttle_names_for_outcome {
+                        causal_graph.record_action(
+                            &format!("throttle:{}", name),
+                            pressure_now,
+                            cycle_count,
+                        );
+                    }
+                    // Also record freeze actions.
+                    if exec_outcomes.freezes_applied > 0 {
+                        let frozen_state = state.frozen_state.lock_recover();
+                        for &pid in frozen_state.keys() {
+                            if let Some(process) = collector.system().process(sysinfo::Pid::from_u32(pid)) {
+                                causal_graph.record_action(
+                                    &format!("freeze:{}", process.name()),
+                                    pressure_now,
+                                    cycle_count,
+                                );
+                            }
+                        }
+                    }
+                    // Evaluate pending actions: did pressure actually drop?
+                    causal_graph.evaluate(pressure_now, cycle_count);
+                }
+
                 // Causal graph: record process co-occurrence during high-pressure events.
                 if snapshot.pressure.memory_pressure >= 0.60 {
                     let active: Vec<String> = snapshot.top_processes
@@ -6398,6 +6435,13 @@ fn main() -> anyhow::Result<()> {
                 if cycle_count % 100 == 0 {
                     signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
                     outcome_tracker.persist_hop_groups(std::path::Path::new(hop_groups_path()));
+                    // Causal graph observability: log solid/weak links discovered.
+                    let solid = causal_graph.solid_count();
+                    let total = causal_graph.edge_count();
+                    if total > 0 {
+                        println!("causal_graph: {}/{} edges solid, {} pending",
+                            solid, total, causal_graph.solid_edges().len());
+                    }
                 }
                 // Hourly housekeeping (7200 cycles × 500ms ≈ 1 hour).
                 if cycle_count % 7200 == 1 {

@@ -4,6 +4,7 @@ pub mod analytics;
 pub mod background_collectors;
 pub mod cache_warmer;
 pub mod capabilities;
+pub mod causal_graph;
 pub mod coalition;
 pub mod compressor_aware;
 pub mod cusum;
