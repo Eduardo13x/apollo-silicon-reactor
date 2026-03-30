@@ -19,6 +19,81 @@
 
 use std::collections::{HashMap, VecDeque};
 
+// ── NEON-accelerated f64 reductions ─────────────────────────────────────────
+// Processes 2×f64 per cycle via float64x2_t on Apple Silicon.
+// Falls back to scalar iterator on non-aarch64.
+
+/// Sum a contiguous f64 slice using NEON 2-wide accumulation.
+#[cfg(target_arch = "aarch64")]
+fn neon_sum(data: &[f64]) -> f64 {
+    use std::arch::aarch64::*;
+    if data.len() < 4 {
+        return data.iter().sum();
+    }
+    unsafe {
+        let mut acc = vdupq_n_f64(0.0);
+        let chunks = data.len() / 2;
+        let remainder = data.len() % 2;
+        for i in 0..chunks {
+            let v = vld1q_f64(data.as_ptr().add(i * 2));
+            acc = vaddq_f64(acc, v);
+        }
+        let mut total = vgetq_lane_f64(acc, 0) + vgetq_lane_f64(acc, 1);
+        for i in (chunks * 2)..(chunks * 2 + remainder) {
+            total += data[i];
+        }
+        total
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn neon_sum(data: &[f64]) -> f64 {
+    data.iter().sum()
+}
+
+/// Sum of squared deviations from mean: Σ(x - mean)² using NEON.
+#[cfg(target_arch = "aarch64")]
+fn neon_sum_sq_dev(data: &[f64], mean: f64) -> f64 {
+    use std::arch::aarch64::*;
+    if data.len() < 4 {
+        return data.iter().map(|x| (x - mean).powi(2)).sum();
+    }
+    unsafe {
+        let mean_v = vdupq_n_f64(mean);
+        let mut acc = vdupq_n_f64(0.0);
+        let chunks = data.len() / 2;
+        let remainder = data.len() % 2;
+        for i in 0..chunks {
+            let v = vld1q_f64(data.as_ptr().add(i * 2));
+            let diff = vsubq_f64(v, mean_v);
+            acc = vfmaq_f64(acc, diff, diff); // acc += diff * diff (FMA)
+        }
+        let mut total = vgetq_lane_f64(acc, 0) + vgetq_lane_f64(acc, 1);
+        for i in (chunks * 2)..(chunks * 2 + remainder) {
+            let d = data[i] - mean;
+            total += d * d;
+        }
+        total
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn neon_sum_sq_dev(data: &[f64], mean: f64) -> f64 {
+    data.iter().map(|x| (x - mean).powi(2)).sum()
+}
+
+/// Sum over a VecDeque using NEON (handles two-slice layout).
+fn vecdeque_neon_sum(dq: &VecDeque<f64>) -> f64 {
+    let (a, b) = dq.as_slices();
+    neon_sum(a) + neon_sum(b)
+}
+
+/// Sum of squared deviations over a VecDeque using NEON.
+fn vecdeque_neon_sq_dev(dq: &VecDeque<f64>, mean: f64) -> f64 {
+    let (a, b) = dq.as_slices();
+    neon_sum_sq_dev(a, mean) + neon_sum_sq_dev(b, mean)
+}
+
 /// Compact fingerprint of a workload distribution.
 /// Buckets entropy into 0.25-bit bands and counts processes.
 /// Two distributions with the same fingerprint produce similar anomaly scores.
@@ -99,7 +174,7 @@ impl EntropyDetector {
     /// Recibe un slice de valores positivos (cpu_usage o memory_usage por proceso).
     /// Retorna H en bits.
     pub fn shannon_entropy(values: &[f64]) -> f64 {
-        let total: f64 = values.iter().sum();
+        let total: f64 = neon_sum(values);
         if total <= 0.0 {
             return 0.0;
         }
@@ -175,9 +250,9 @@ impl EntropyDetector {
         let score = if self.history.len() < 5 {
             0.0
         } else {
-            let mean: f64 = self.history.iter().sum::<f64>() / self.history.len() as f64;
-            let variance: f64 = self.history.iter().map(|h| (h - mean).powi(2)).sum::<f64>()
-                / self.history.len() as f64;
+            let n = self.history.len() as f64;
+            let mean: f64 = vecdeque_neon_sum(&self.history) / n;
+            let variance: f64 = vecdeque_neon_sq_dev(&self.history, mean) / n;
             let std_dev = variance.sqrt();
             if std_dev < 1e-6 {
                 0.0
