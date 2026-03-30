@@ -550,7 +550,9 @@ mod tests {
         let mut cusum_fp = 0u32;
         let actual_shifts = 2u32; // rise and fall
 
-        let shift_windows = [(45..65), (145..165)]; // where shifts actually happen
+        // Ramp-up spans i=50..100, ramp-down spans i=150..200.
+        // Any alarm during a ramp is a legitimate regime-shift detection.
+        let shift_windows = [(48..105), (148..200)];
         let mut detected_in_window = [false; 2];
 
         for (i, &true_val) in true_signal.iter().enumerate() {
@@ -560,9 +562,12 @@ mod tests {
             if cusum.alarm_high() || cusum.alarm_low() {
                 let mut in_any_window = false;
                 for (w, window) in shift_windows.iter().enumerate() {
-                    if window.contains(&i) && !detected_in_window[w] {
-                        detected_in_window[w] = true;
-                        cusum_tp += 1;
+                    if window.contains(&i) {
+                        if !detected_in_window[w] {
+                            detected_in_window[w] = true;
+                            cusum_tp += 1;
+                        }
+                        // Already-detected window: continuation alarm, not FP.
                         in_any_window = true;
                         break;
                     }
