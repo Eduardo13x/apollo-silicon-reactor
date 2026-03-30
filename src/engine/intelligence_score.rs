@@ -683,25 +683,35 @@ mod tests {
         let causal_total = conf_map.len() as u32;
         let causal_solid = conf_map.values().filter(|&&c| c > 0.50).count() as u32;
 
-        // Skills: simulate learning
+        // Skills: simulate learning across 4 skill types (mirrors real daemon diversity)
         let mut skills = SkillRegistry::new();
         skills.learn("cloud_throttle", 0.70, "any", vec!["Dropbox".into()]);
         skills.learn("browser_trim", 0.75, "Browser", vec!["Safari".into()]);
+        skills.learn("thermal_shed", 0.65, "any", vec!["mdworker".into()]);
         skills.learn("noise_kill", 0.60, "any", vec!["cloudd".into()]);
 
-        // Apply results
+        // Apply results — cloud_throttle: 80% success (reliable)
         for _ in 0..8 {
             skills.record_result("cloud_throttle", true);
         }
         for _ in 0..2 {
             skills.record_result("cloud_throttle", false);
         }
+        // browser_trim: 60% success (reliable)
         for _ in 0..6 {
             skills.record_result("browser_trim", true);
         }
         for _ in 0..4 {
             skills.record_result("browser_trim", false);
         }
+        // thermal_shed: 70% success (reliable)
+        for _ in 0..7 {
+            skills.record_result("thermal_shed", true);
+        }
+        for _ in 0..3 {
+            skills.record_result("thermal_shed", false);
+        }
+        // noise_kill: 30% success (unreliable — should be gc'd)
         for _ in 0..3 {
             skills.record_result("noise_kill", true);
         }
