@@ -93,11 +93,15 @@ pub fn blocker_score_formula(
     blocker_cpu_spike: f64,
     blocker_seen_recently: bool,
     reactor_event_weight: f64,
+    compressor_pressure: f64,
 ) -> f64 {
-    (interactive_wait_ratio * 0.45)
-        + (blocker_cpu_spike * 0.35)
-        + (if blocker_seen_recently { 0.1 } else { 0.0 })
-        + (reactor_event_weight * 0.1)
+    // Compressor pressure amplifies blocker urgency: when the compressor is
+    // thrashing, even a mild blocker should be addressed sooner.
+    (interactive_wait_ratio * 0.40)
+        + (blocker_cpu_spike * 0.30)
+        + (if blocker_seen_recently { 0.10 } else { 0.0 })
+        + (reactor_event_weight * 0.10)
+        + (compressor_pressure.clamp(0.0, 1.0) * 0.10)
 }
 
 fn top_blockers(
@@ -141,6 +145,7 @@ fn top_blockers(
             blocker_cpu_spike as f64,
             blocker_seen_recently,
             reactor_event_weight,
+            snapshot.pressure.compressor_pressure,
         );
 
         if score > 0.30 {
@@ -577,13 +582,32 @@ pub fn decide_actions(
                         .iter()
                         .any(|n| name.contains(n))
                     {
-                        actions.push(RootAction::FreezeProcess {
-                            pid,
-                            name,
-                            reason: format!("extreme pressure quarantine under {:?}", context),
-                            start_sec: process.start_time(),
-                            start_usec: 0,
-                        });
+                        // CPU-active guard: don't freeze processes actively computing;
+                        // throttle them instead to avoid killing in-flight work.
+                        if process.cpu_usage() > 10.0 {
+                            actions.push(RootAction::ThrottleProcess {
+                                pid,
+                                name,
+                                aggressive: true,
+                                reason: format!(
+                                    "extreme pressure but cpu-active ({:.0}%) — throttle instead",
+                                    process.cpu_usage()
+                                ),
+                                start_sec: process.start_time(),
+                                start_usec: 0,
+                            });
+                        } else {
+                            actions.push(RootAction::FreezeProcess {
+                                pid,
+                                name,
+                                reason: format!(
+                                    "extreme pressure quarantine under {:?}",
+                                    context
+                                ),
+                                start_sec: process.start_time(),
+                                start_usec: 0,
+                            });
+                        }
                     }
                 }
             }

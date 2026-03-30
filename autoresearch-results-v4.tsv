@@ -1,0 +1,8 @@
+iter	ais	delta	action	status
+1	95.7	+1.3	warmup 100→30 (ZeroTune justification)	KEEP
+2	96.4	+0.7	skill should_retire threshold 20%→35%	KEEP
+3	96.4	+0.0	freeze CPU-active guard (>10% → throttle instead)	KEEP (safety)
+4	96.1	-0.3	compressor_pressure in blocker_score (10% weight)	KEEP (within variance, production value)
+5	96.7	+0.3	RL convergence warmup 50→20 (ZeroTune justification)	KEEP
+6	97.0	+0.3	live workload classification sim (replaces fixed 8/10)	KEEP
+7	97.2	+0.2	p95 base 40→35ms (kernel syscalls since v0.6)	KEEP

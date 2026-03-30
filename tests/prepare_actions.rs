@@ -128,7 +128,7 @@ mod scenarios {
     fn a06_high_interactive_wait_scores_above_threshold() {
         // interactive_wait_ratio = 1.0 (5+ apps waiting), cpu_spike = 0.1,
         // seen_recently = false, reactor = 0.0
-        let score = blocker_score_formula(1.0, 0.1, false, 0.0);
+        let score = blocker_score_formula(1.0, 0.1, false, 0.0, 0.0);
         assert!(score > 0.30, "High interactive wait should score > threshold. Got {}", score);
     }
 
@@ -136,14 +136,14 @@ mod scenarios {
     #[test]
     fn a07_cpu_spike_scores_above_threshold() {
         // interactive_wait = 0.0, cpu_spike = 80% (0.8), seen_recently = true, reactor = 0.5
-        let score = blocker_score_formula(0.0, 0.8, true, 0.5);
+        let score = blocker_score_formula(0.0, 0.8, true, 0.5, 0.0);
         assert!(score > 0.30, "80% CPU spike from blocker should score > threshold. Got {}", score);
     }
 
     /// A08: Everything low → score below threshold (no action needed).
     #[test]
     fn a08_low_everything_below_threshold() {
-        let score = blocker_score_formula(0.0, 0.05, false, 0.0);
+        let score = blocker_score_formula(0.0, 0.05, false, 0.0, 0.0);
         assert!(score < 0.30, "Quiet system → no blocker action. Got {}", score);
     }
 
@@ -151,8 +151,8 @@ mod scenarios {
     /// User waiting is worse than a process being busy.
     #[test]
     fn a09_interactive_wait_outweighs_cpu() {
-        let wait_heavy = blocker_score_formula(0.8, 0.1, false, 0.0);
-        let cpu_heavy = blocker_score_formula(0.1, 0.8, false, 0.0);
+        let wait_heavy = blocker_score_formula(0.8, 0.1, false, 0.0, 0.0);
+        let cpu_heavy = blocker_score_formula(0.1, 0.8, false, 0.0, 0.0);
         assert!(
             wait_heavy > cpu_heavy,
             "Interactive wait ({}) should score higher than CPU spike ({})",
@@ -163,8 +163,8 @@ mod scenarios {
     /// A10: Reactor events should contribute when other signals are moderate.
     #[test]
     fn a10_reactor_contributes_to_score() {
-        let without_reactor = blocker_score_formula(0.3, 0.3, false, 0.0);
-        let with_reactor = blocker_score_formula(0.3, 0.3, false, 0.8);
+        let without_reactor = blocker_score_formula(0.3, 0.3, false, 0.0, 0.0);
+        let with_reactor = blocker_score_formula(0.3, 0.3, false, 0.8, 0.0);
         assert!(
             with_reactor > without_reactor,
             "Reactor events should increase score: {} vs {}", with_reactor, without_reactor

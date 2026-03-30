@@ -275,15 +275,62 @@ impl WorkloadClassifier {
             *scores.entry(hw_wl).or_insert(0.0) += hw_weight * hw_prob as f32;
         }
 
-        // Winner + confidence
-        let total: f32 = scores.values().map(|v| v.max(0.0)).sum::<f32>().max(1.0);
-        let (best_wl, best_score) = scores
+        // Winner + AIS-style multi-dimensional confidence.
+        //
+        // Old formula: best_score / total — structurally weak because hour-prior
+        // spreads evidence across all workloads, diluting the winner even when
+        // strong signals (foreground app, recency) agree.
+        //
+        // New formula: weighted composite of 3 orthogonal dimensions, each with
+        // a sigmoid transfer function (same approach as intelligence_score.rs).
+        //
+        //   D1 (0.40) — Margin: how far ahead is the winner vs runner-up.
+        //               sigmoid: 1 / (1 + exp(-6 * (margin - 0.3)))
+        //   D2 (0.35) — Evidence depth: how many distinct source types contributed.
+        //               sigmoid: 1 / (1 + exp(-3 * (n_sources - 1.5)))
+        //   D3 (0.25) — Signal strength: absolute winner score (saturates at ~4).
+        //               sigmoid: 1 / (1 + exp(-2 * (score - 2.0)))
+
+        let mut sorted_scores: Vec<f32> = scores.values().copied().collect();
+        sorted_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+        let best_score = sorted_scores.first().copied().unwrap_or(0.0);
+        let runner_up = sorted_scores.get(1).copied().unwrap_or(0.0);
+        let best_wl = scores
             .iter()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(wl, s)| (*wl, *s))
-            .unwrap_or((WorkloadType::General, 0.0));
+            .map(|(wl, _)| *wl)
+            .unwrap_or(WorkloadType::General);
 
-        let confidence = (best_score.max(0.0) / total).clamp(0.0, 1.0);
+        // D1: Margin — separation between winner and runner-up.
+        let margin = if best_score > 0.0 {
+            (best_score - runner_up.max(0.0)) / best_score
+        } else {
+            0.0
+        };
+        let d1 = 1.0 / (1.0 + (-6.0_f32 * (margin - 0.3)).exp());
+
+        // D2: Evidence depth — count of distinct source types.
+        let n_source_types = {
+            let mut seen = [false; 6]; // ForegroundApp, HourPrior, AppRecency, ProcessMix, LlmLearned, MemoryLayout
+            for s in &sources {
+                match s {
+                    ClassifierSource::ForegroundApp => seen[0] = true,
+                    ClassifierSource::HourPrior => seen[1] = true,
+                    ClassifierSource::AppRecency(_) => seen[2] = true,
+                    ClassifierSource::ProcessMix(_) => seen[3] = true,
+                    ClassifierSource::LlmLearned => seen[4] = true,
+                    ClassifierSource::MemoryLayout(_) => seen[5] = true,
+                }
+            }
+            seen.iter().filter(|&&b| b).count() as f32
+        };
+        let d2 = 1.0 / (1.0 + (-3.0_f32 * (n_source_types - 1.5)).exp());
+
+        // D3: Signal strength — absolute winner score.
+        let d3 = 1.0 / (1.0 + (-2.0_f32 * (best_score - 2.0)).exp());
+
+        let confidence = (0.40 * d1 + 0.35 * d2 + 0.25 * d3).clamp(0.0, 1.0);
 
         // Emit Idle when no foreground app and evidence is very weak.
         let final_workload = if foreground_app.is_none() && confidence < 0.25 {

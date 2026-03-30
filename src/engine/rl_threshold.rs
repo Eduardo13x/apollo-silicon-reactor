@@ -2,11 +2,11 @@
 //!
 //! ## Scientific basis
 //! Tabular Q-learning (Watkins, 1989) with e-greedy exploration.
-//! State space is deliberately small (36 states x 3 actions = 108 Q-values)
+//! State space is deliberately small (48 states x 3 actions = 144 Q-values)
 //! to ensure convergence within ~200 episodes per state-action pair.
 //!
 //! ## State representation
-//! (pressure_band, compressor_band, overflow_last_hour) -- 3 x 3 x 4 = 36 states.
+//! (pressure_band, compressor_band, overflow_last_hour) -- 4 x 3 x 4 = 48 states.
 //!
 //! ## Reward function
 //! +1.0 per tick without overflow (stability reward).
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-const NUM_STATES: usize = 36;
+const NUM_STATES: usize = 48; // 4 pressure × 3 compressor × 4 overflow
 const NUM_ACTIONS: usize = 3;
 /// Minimum learning rate — floor for the decaying EMA alpha.
 const ALPHA_MIN: f64 = 0.02;
@@ -86,8 +86,10 @@ impl RlState {
             0
         } else if memory_pressure <= 0.80 {
             1
+        } else if memory_pressure <= 0.92 {
+            2 // high
         } else {
-            2
+            3 // critical — RL can learn distinct policy for extreme pressure
         };
         let compressor_band = if compressor_pressure < 0.30 {
             0
@@ -200,7 +202,20 @@ impl RlThresholdAgent {
                     }
                     Some((qt, p.current_adjustment, p.total_ticks, p.total_overflows))
                 })
-                .unwrap_or(([[0.0; NUM_ACTIONS]; NUM_STATES], 0.0, 0, 0));
+                .unwrap_or_else(|| {
+                    // ZeroTune: pre-seed critical pressure band (3) to favor Lower5pp.
+                    // Domain knowledge: at pressure > 0.92, acting early is always correct.
+                    let mut qt = [[0.0_f64; NUM_ACTIONS]; NUM_STATES];
+                    for cb in 0..3usize {
+                        for oh in 0..4usize {
+                            let idx = 3 * 12 + cb * 4 + oh; // pressure_band=3
+                            qt[idx][0] = 2.0;  // Lower5pp: positive prior
+                            qt[idx][1] = -1.0; // Hold: mild negative
+                            qt[idx][2] = -2.0; // Raise1pp: bad at critical pressure
+                        }
+                    }
+                    (qt, 0.0, 0, 0)
+                });
 
         Self {
             q_table,
@@ -399,17 +414,17 @@ impl RlThresholdAgent {
             let idx = self.dyna_cursor % n_keys;
             self.dyna_cursor = self.dyna_cursor.wrapping_add(1);
             let (s, a) = self.dyna_keys[idx];
-            let t = match self.dyna_model.get(&(s, a)) {
-                Some(t) => t.clone(),
+            let (reward, next_state_idx) = match self.dyna_model.get(&(s, a)) {
+                Some(t) => (t.reward, t.next_state_idx),
                 None => continue,
             };
-            let max_q_next = self.q_table[t.next_state_idx]
+            let max_q_next = self.q_table[next_state_idx]
                 .iter()
-                .cloned()
+                .copied()
                 .fold(f64::NEG_INFINITY, f64::max);
             let max_q_next = if max_q_next.is_infinite() { 0.0 } else { max_q_next };
             let old_q = self.q_table[s][a];
-            self.q_table[s][a] = old_q + alpha * (t.reward + GAMMA * max_q_next - old_q);
+            self.q_table[s][a] = old_q + alpha * (reward + GAMMA * max_q_next - old_q);
         }
     }
 
@@ -494,7 +509,7 @@ mod tests {
     #[test]
     fn test_state_index_range() {
         let mut seen = std::collections::HashSet::new();
-        for pb in 0..3u8 {
+        for pb in 0..4u8 {
             for cb in 0..3u8 {
                 for oh in 0..4u8 {
                     let state = RlState {
@@ -513,7 +528,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen.len(), NUM_STATES, "must cover all 36 states");
+        assert_eq!(seen.len(), NUM_STATES, "must cover all 48 states");
     }
 
     #[test]
