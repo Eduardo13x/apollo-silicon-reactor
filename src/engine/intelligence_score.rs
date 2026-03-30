@@ -420,6 +420,7 @@ mod tests {
     use super::*;
     use crate::engine::causal_graph::CausalGraph;
     use crate::engine::cusum::Cusum;
+    use crate::engine::hazard_model::HazardModel;
     use crate::engine::kalman::Kalman1D;
     use crate::engine::optimization_skills::SkillRegistry;
     use crate::engine::rl_threshold::{RlState, RlThresholdAgent};
@@ -589,20 +590,26 @@ mod tests {
             }
         }
 
-        // Hazard calibration: measure how well hazard model would track pressure
-        // We approximate with Kalman prediction error at 5s horizon
+        // Hazard calibration: exercise real HazardModel with production-like history.
+        // Production has ~1570 overflow events → β weights saturate → p_oom overestimates.
+        // We simulate this and measure |p_oom_predicted - pressure_actual|.
+        let mut hazard = HazardModel::new();
+        // Replay production history: ~20 overflow events per 7 days, ~1570 total over time.
+        // Simulate 200 events spread across ~7 months to build realistic β state.
+        let sim_overflows = 200u32;
+        for i in 0..sim_overflows {
+            let pressure = 0.65 + (i % 10) as f64 * 0.02; // 0.65..0.85
+            let features = HazardModel::risk_features(pressure, 0.02, 0.75, 0.60);
+            hazard.record_event(&features, 8.0); // ~8h between events on average
+        }
+        // Measure calibration: P(OOM|30s) should track actual pressure closely.
         let mut hazard_err_sum = 0.0;
         let mut hazard_n = 0u32;
-        let mut kf2 = Kalman1D::new(0.005, 0.02);
-        for (i, &true_val) in true_signal.iter().enumerate() {
-            let noisy = (true_val + noise[i % noise.len()]).clamp(0.0, 1.0);
-            kf2.update(noisy, 0.5);
-            if i > 20 && i + 10 < true_signal.len() {
-                let predicted = kf2.predict_ahead(5.0);
-                let actual_5s = true_signal[(i + 10).min(true_signal.len() - 1)];
-                hazard_err_sum += (predicted - actual_5s).abs();
-                hazard_n += 1;
-            }
+        for &true_val in true_signal.iter().skip(10) {
+            let features = HazardModel::risk_features(true_val, 0.003, 0.75, 0.60);
+            let p_oom = hazard.probability_oom(&features, 30.0);
+            hazard_err_sum += (p_oom - true_val).abs();
+            hazard_n += 1;
         }
         let hazard_err = hazard_err_sum / hazard_n.max(1) as f64;
 
