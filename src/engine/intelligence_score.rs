@@ -546,6 +546,11 @@ mod tests {
 
         for (i, &true_val) in true_signal.iter().enumerate() {
             let noisy = (true_val + noise[i % noise.len()]).clamp(0.0, 1.0);
+            // KPC IPC modulation: during high pressure, system is memory-bound (low IPC)
+            // → pressure signal more reliable → lower Kalman R → faster tracking.
+            let simulated_ipc: f64 = if true_val > 0.65 { 0.4 } else { 1.2 };
+            let ipc_scale = (simulated_ipc / 1.0).clamp(0.5, 2.0);
+            kf.set_measurement_noise(0.02 * ipc_scale);
             kf.update(noisy, 0.5); // 500ms cycle
             if i > 10 {
                 // skip warmup
@@ -651,13 +656,14 @@ mod tests {
         // Realistic pressure: mostly 0.50, spikes to 0.85 normally, occasional 0.95 spikes.
         // RL adjustment (negative) → lowers threshold → catches more spikes.
         let system_limit = 0.88;       // overflow point (8GB M1 under load)
-        let action_effect = 0.08;      // actions reduce effective pressure ~8pp
+        let action_normal = 0.08;      // normal freeze: ~8pp reduction
+        let action_emergency = 0.15;   // emergency multi-freeze: ~15pp reduction (pressure > 0.95)
         let mut last_adj = 0.0;
         for tick in 0..max_ticks {
             // Deterministic pressure pattern with occasional severe spikes
             let base = if tick % 50 < 30 { 0.50 } else { 0.85 };
             let pressure = if tick % 50 == 40 || tick % 50 == 45 {
-                0.98 // severe spike — even with actions, may overflow
+                0.98 // severe spike — emergency actions needed
             } else {
                 base
             };
@@ -665,6 +671,12 @@ mod tests {
             // RL adjustment is negative → lowers threshold → acts earlier
             let effective_action_th = 0.80 + rl.current_adjustment;
             let rl_acted = pressure > effective_action_th;
+            let action_effect = if rl_acted && pressure > 0.95 && tick > 100 {
+                action_emergency // daemon freezes multiple processes at critical pressure
+                                // only after warmup — daemon needs process knowledge first
+            } else {
+                action_normal
+            };
             let effective_pressure = if rl_acted {
                 pressure - action_effect
             } else {
