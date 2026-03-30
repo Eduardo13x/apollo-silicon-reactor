@@ -411,8 +411,8 @@ while true; do
             write_report "CRASH_LOOP: NO"
         fi
 
-        # Warmup 180s after deploy, then observe
-        run_autoresearch 180
+        # Warmup 60s after deploy: enough for sysinfo CPU% to stabilize (~120 cycles)
+        run_autoresearch 60
     fi
 
     sleep 3

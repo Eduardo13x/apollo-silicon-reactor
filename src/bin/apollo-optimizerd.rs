@@ -3479,13 +3479,14 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Adaptive snapshot: use lightweight path (no disk/net, direct sysctl)
-                // when hw pressure was Nominal last cycle AND memory is not stressed.
-                // Every 30 cycles force a full refresh to pick up disk/net changes.
+                // Adaptive snapshot: use lightweight path (no disk/net refresh) every cycle
+                // except a full-refresh heartbeat every 30 cycles (~15s).
+                // Disk/network data from sysinfo is not consumed on the hot path — the
+                // network monitor and sysctl governor read directly from sysctl/netstat.
+                // Dropping the pressure gate removes ~15-25ms of disk/net I/O at 0.70+ pressure
+                // where the old 0.40 threshold never fired anyway.
                 let cached_mem_pressure = pressure_collector.latest().memory_pressure;
-                let use_light = last_hw_pressure == HwPressure::Nominal
-                    && cached_mem_pressure < 0.40
-                    && cycle_count % 30 != 0;
+                let use_light = cycle_count % 30 != 0;
                 let mut snapshot = if use_light {
                     collector.collect_snapshot_light()
                 } else {
@@ -3924,9 +3925,10 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // HwPredictor: sample hardware signals every 5 cycles (~2.5s at normal rate).
-                // Runs in <50ms and gives advance warning before metrics APIs catch up.
-                let (hw_pressure, jitter_us, hw_features) = if cycle_count % 5 == 0 {
+                // HwPredictor: sample hardware signals every 10 cycles (~5s at normal rate).
+                // Runs in <50ms (16MB cache probe + 32MB BW probe) and gives advance warning
+                // before metrics APIs catch up. 5s is sufficient — thermal buildup takes ≥10s.
+                let (hw_pressure, jitter_us, hw_features) = if cycle_count % 10 == 0 {
                     let snap = sample_hw_pressure();
                     if snap.is_critical() {
                         *state.fast_tick_until.lock_recover() =
@@ -4202,8 +4204,8 @@ fn main() -> anyhow::Result<()> {
                     .map(|e| (e.pid, e.ipc))
                     .collect();
 
-                // ── IOPMrootDomain direct thermal (every 5 cycles) ──────────
-                let iopm_snap = if cycle_count % 5 == 0 {
+                // ── IOPMrootDomain direct thermal (every 10 cycles, aligned with HwPredictor) ──
+                let iopm_snap = if cycle_count % 10 == 0 {
                     apollo_optimizer::engine::thermal_iokit::read_iopm_state()
                 } else {
                     None
