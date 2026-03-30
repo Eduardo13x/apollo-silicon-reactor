@@ -39,6 +39,7 @@ pub mod memory_analyzer;
 pub mod memory_budget;
 pub mod mpc_horizon;
 pub mod network_monitor;
+pub mod neuromodulator;
 pub mod network_optimizer;
 pub mod outcome_tracker;
 pub mod overflow_guard;

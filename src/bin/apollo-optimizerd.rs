@@ -64,6 +64,7 @@ use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
 use apollo_optimizer::engine::network_monitor::NetworkMonitor;
 use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfile};
 use apollo_optimizer::engine::causal_graph::CausalGraph;
+use apollo_optimizer::engine::neuromodulator::{ApolloNeuromodulator, NeuroSignals};
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
 use apollo_optimizer::engine::overflow_guard::{OverflowGuard, BUILD_TOOLS};
 use apollo_optimizer::engine::power_management::{detect_battery_status, PowerManager};
@@ -3040,6 +3041,11 @@ fn main() -> anyhow::Result<()> {
             // Tracks action → outcome relationships with Bayesian confidence.
             // "throttle:X → pressure_drop" edges inform future prioritization.
             let mut causal_graph = CausalGraph::new();
+
+            // Neuromodulator (memoria-core/neuromodulator.rs):
+            // Bio-inspired parameter modulation — DA/NA/SE/ACh drive RL alpha,
+            // Dyna-Q steps, router zones, and exploration rate.
+            let mut neuromod = ApolloNeuromodulator::new();
             // Track cycle-to-cycle wall time for energy dt calculation.
             let mut last_cycle_instant = Instant::now();
             // Audit fix #5: Background powermetrics polling (replaces 5-cycle IOKit tick).
@@ -5468,6 +5474,37 @@ fn main() -> anyhow::Result<()> {
                     snapshot.pressure.memory_pressure,
                     snapshot.pressure.compressor_pressure,
                 );
+
+                // ── Neuromodulator: bio-inspired parameter modulation ────────
+                {
+                    let overflow_occurred = overflow_guard.history.total_overflows > 0;
+                    let neuro_signals = NeuroSignals {
+                        pressure_drop: signal_digest.pressure_smooth as f64 * -1.0
+                            * signal_digest.pressure_velocity,
+                        outcome_penalty: outcome_tracker.rl_penalty(),
+                        overflow_occurred,
+                        urgency: signal_digest.urgency,
+                        regime_shift_up: signal_digest.regime_shift_up,
+                        pressure_velocity: signal_digest.pressure_velocity,
+                        thermal_emergency: thermal_action.phase
+                            >= apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase2Moderate,
+                        pressure_smooth: signal_digest.pressure_smooth as f64,
+                        regime_shift_down: signal_digest.regime_shift_down,
+                        process_count: collector.system().processes().len(),
+                        entropy_anomaly: signal_digest.entropy_anomaly as f64,
+                        rl_exploring: overflow_guard.rl_agent.as_ref()
+                            .map_or(false, |rl| rl.total_ticks() < 200),
+                    };
+                    neuromod.tick(&neuro_signals);
+
+                    // Push derived params to subsystems.
+                    if let Some(rl) = &mut overflow_guard.rl_agent {
+                        rl.neuro_alpha_mult = neuromod.alpha_multiplier;
+                        rl.neuro_epsilon_bonus = neuromod.epsilon_bonus;
+                        rl.dyna_steps = neuromod.dyna_steps;
+                    }
+                    signal_intel.neuro_serotonin_shift = neuromod.serotonin_shift;
+                }
 
                 // ProcessRecoveryManager: freeze (or kill in survival mode) confirmed leakers.
                 let recovery_targets = proc_recovery.get_recovery_targets();

@@ -133,6 +133,10 @@ pub struct SignalIntelligence {
     // Start at defaults (0.30/0.50) and shift ±0.10 based on feedback.
     learned_mid_entry: f64,
     learned_high_entry: f64,
+
+    // Neuromodulator serotonin shift: positive = conserve (raise thresholds),
+    // negative = engage more. Set by daemon from ApolloNeuromodulator.
+    pub neuro_serotonin_shift: f64,
 }
 
 impl Default for SignalIntelligence {
@@ -180,6 +184,8 @@ impl SignalIntelligence {
 
             learned_mid_entry: 0.30,
             learned_high_entry: 0.50,
+
+            neuro_serotonin_shift: 0.0,
         }
     }
 
@@ -247,8 +253,8 @@ impl SignalIntelligence {
         const UTIL_ALPHA: f64 = 0.05;
         const UTIL_THRESHOLD: f64 = 0.15;
 
-        let mid_entry = (self.learned_mid_entry + self.energy_bias).clamp(0.15, 0.45);
-        let high_entry = (self.learned_high_entry + self.energy_bias).clamp(0.30, 0.65);
+        let mid_entry = (self.learned_mid_entry + self.energy_bias + self.neuro_serotonin_shift).clamp(0.15, 0.45);
+        let high_entry = (self.learned_high_entry + self.energy_bias + self.neuro_serotonin_shift).clamp(0.30, 0.65);
         let all_heavy = pressure_smooth >= high_entry;
         let mid_zone = !all_heavy && pressure_smooth >= mid_entry;
         // In mid zone, per-subsystem gate; in high zone, always run.

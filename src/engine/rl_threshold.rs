@@ -145,6 +145,13 @@ pub struct RlThresholdAgent {
     dyna_cursor: usize,
     /// Cached keys for round-robin iteration.
     dyna_keys: Vec<(usize, usize)>,
+    // ── Neuromodulator-driven parameters (set by daemon each cycle) ──
+    /// DA → RL alpha multiplier [0.5, 1.5]. Default=1.0 (no change).
+    pub neuro_alpha_mult: f64,
+    /// ACh → exploration epsilon bonus [0.0, 0.05]. Default=0.0.
+    pub neuro_epsilon_bonus: f64,
+    /// NA → Dyna-Q planning steps [4, 20]. Default=10.
+    pub dyna_steps: usize,
 }
 
 impl RlThresholdAgent {
@@ -178,6 +185,9 @@ impl RlThresholdAgent {
             dyna_model: HashMap::new(),
             dyna_cursor: 0,
             dyna_keys: Vec::new(),
+            neuro_alpha_mult: 1.0,
+            neuro_epsilon_bonus: 0.0,
+            dyna_steps: DYNA_PLANNING_STEPS,
         }
     }
 
@@ -204,7 +214,7 @@ impl RlThresholdAgent {
     }
 
     fn select_action(&self, state: RlState) -> RlAction {
-        let eps = self.epsilon();
+        let eps = self.epsilon() + self.neuro_epsilon_bonus;
         let explore = (self.total_ticks.wrapping_mul(2_654_435_761)) % 100 < (eps * 100.0) as u64;
         if explore {
             let action_idx = ((self.total_ticks.wrapping_mul(7_919)) % 3) as usize;
@@ -261,7 +271,7 @@ impl RlThresholdAgent {
             let rpe_abs = (reward + GAMMA * max_q_next - old_q).abs();
             self.rpe_ema = 0.99 * self.rpe_ema + 0.01 * rpe_abs;
             let surprise_factor = (rpe_abs / self.rpe_ema.max(0.01)).clamp(0.5, 5.0);
-            let effective_alpha = self.alpha() * surprise_factor;
+            let effective_alpha = self.alpha() * surprise_factor * self.neuro_alpha_mult;
             self.q_table[s][a] = old_q + effective_alpha * (reward + GAMMA * max_q_next - old_q);
 
             // Dyna-Q: record real transition and run planning steps.
@@ -336,8 +346,8 @@ impl RlThresholdAgent {
             self.dyna_keys = self.dyna_model.keys().copied().collect();
         }
         let n_keys = self.dyna_keys.len();
-        let alpha = self.alpha();
-        for _ in 0..DYNA_PLANNING_STEPS {
+        let alpha = self.alpha() * self.neuro_alpha_mult;
+        for _ in 0..self.dyna_steps {
             let idx = self.dyna_cursor % n_keys;
             self.dyna_cursor = self.dyna_cursor.wrapping_add(1);
             let (s, a) = self.dyna_keys[idx];
@@ -396,6 +406,9 @@ mod tests {
             dyna_model: HashMap::new(),
             dyna_cursor: 0,
             dyna_keys: Vec::new(),
+            neuro_alpha_mult: 1.0,
+            neuro_epsilon_bonus: 0.0,
+            dyna_steps: DYNA_PLANNING_STEPS,
         }
     }
 
