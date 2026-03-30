@@ -758,25 +758,37 @@ mod tests {
         // Map: <50µs = excellent (p95~40ms), >200µs = poor (p95~100ms)
         let simulated_p95 = 40.0 + (compute_per_cycle_us / 50.0) * 20.0;
 
-        // Cognitive budget: simulate skip decisions at different pressures
+        // Cognitive budget: simulate 3-zone router skip decisions
+        // Zone 1 (<0.30): skip all heavy subsystems (4/4 skipped)
+        // Zone 2 (0.30-0.50): skip low-utility subsystems (2/4 skipped)
+        // Zone 3 (>0.50): run everything (0/4 skipped)
         let mut skips = 0u64;
-        let evals = 100u64;
-        for i in 0..evals {
-            let pressure = (i as f64) / evals as f64; // 0.0 → 1.0
-            // Router: skip heavy subsystems when pressure < 0.30
+        let mut evals = 0u64;
+        for i in 0..100 {
+            let pressure = (i as f64) / 100.0;
+            let subsystems = 4u64; // entropy, hazard, lotka, mpc
+            evals += subsystems;
             if pressure < 0.30 {
-                skips += 1;
+                skips += subsystems; // skip all 4
+            } else if pressure < 0.50 {
+                skips += 2; // skip 2 low-utility
             }
+            // >0.50: run all, no skips
         }
 
         // Habituation: simulate process stability detection
+        // HABITUATION_THRESHOLD=5 cycles unchanged
         let mut hab_skips = 0u64;
-        let process_evals = 100u64;
-        // Simulate: 60% of processes are stable (same cpu_band for 5+ cycles)
-        for i in 0..process_evals {
-            if i % 10 < 6 {
-                // stable process
-                hab_skips += 1;
+        let mut process_evals = 0u64;
+        // Simulate 50 processes over 10 cycles
+        for proc in 0..50u64 {
+            for cycle in 0..10u64 {
+                process_evals += 1;
+                // 60% of processes are stable (unchanged cpu_band for 5+ cycles)
+                let stable = proc % 10 < 6;
+                if stable && cycle >= 5 {
+                    hab_skips += 1;
+                }
             }
         }
 
