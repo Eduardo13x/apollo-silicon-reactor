@@ -448,4 +448,41 @@ mod tests {
             det.fingerprint_count()
         );
     }
+
+    // ── NEON correctness tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_neon_sum_matches_scalar() {
+        let data: Vec<f64> = (0..60).map(|i| i as f64 * 0.1 + 0.5).collect();
+        let scalar_sum: f64 = data.iter().sum();
+        let neon_result = neon_sum(&data);
+        assert!(
+            (scalar_sum - neon_result).abs() < 1e-10,
+            "neon_sum({}) != scalar_sum({})",
+            neon_result,
+            scalar_sum
+        );
+    }
+
+    #[test]
+    fn test_neon_sum_sq_dev_matches_scalar() {
+        let data: Vec<f64> = (0..60).map(|i| i as f64 * 0.1 + 0.5).collect();
+        let mean = data.iter().sum::<f64>() / data.len() as f64;
+        let scalar: f64 = data.iter().map(|x| (x - mean).powi(2)).sum();
+        let neon_result = neon_sum_sq_dev(&data, mean);
+        assert!(
+            (scalar - neon_result).abs() < 1e-8,
+            "neon_sq_dev({}) != scalar({})",
+            neon_result,
+            scalar
+        );
+    }
+
+    #[test]
+    fn test_neon_sum_small_input() {
+        // Edge case: fewer than 4 elements (falls back to scalar).
+        assert!((neon_sum(&[1.0, 2.0]) - 3.0).abs() < 1e-15);
+        assert!((neon_sum(&[]) - 0.0).abs() < 1e-15);
+        assert!((neon_sum(&[42.0]) - 42.0).abs() < 1e-15);
+    }
 }
