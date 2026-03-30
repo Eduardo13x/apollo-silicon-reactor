@@ -35,6 +35,9 @@ pub struct KpcSnapshot {
     pub total_instructions: u64,
     /// Instructions per cycle (delta-based). 0.0 if no previous sample.
     pub ipc: f64,
+    /// IPC trend: EMA of IPC velocity (positive = improving, negative = degrading).
+    /// Falling IPC trend predicts memory pressure increase before it shows in Mach counters.
+    pub ipc_trend: f64,
 }
 
 /// Hardware performance counter reader via libkpc.dylib.
@@ -56,6 +59,12 @@ pub struct KpcReader {
     prev_counters: Option<Vec<u64>>,
     /// Whether KPC is operational.
     pub available: bool,
+    /// EMA of IPC for trend detection.
+    ipc_ema: f64,
+    /// Previous IPC for velocity computation.
+    prev_ipc: f64,
+    /// EMA of IPC velocity (trend).
+    ipc_velocity_ema: f64,
 }
 
 // KpcReader contains raw pointers but they are function pointers / dlopen handle
@@ -111,6 +120,9 @@ impl KpcReader {
                     counter_count: 0,
                     prev_counters: None,
                     available: false,
+                    ipc_ema: 0.0,
+                    prev_ipc: 0.0,
+                    ipc_velocity_ema: 0.0,
                 };
             }
 
@@ -126,6 +138,9 @@ impl KpcReader {
                     counter_count: 0,
                     prev_counters: None,
                     available: false,
+                    ipc_ema: 0.0,
+                    prev_ipc: 0.0,
+                    ipc_velocity_ema: 0.0,
                 };
             }
 
@@ -140,6 +155,9 @@ impl KpcReader {
                     counter_count: 0,
                     prev_counters: None,
                     available: false,
+                    ipc_ema: 0.0,
+                    prev_ipc: 0.0,
+                    ipc_velocity_ema: 0.0,
                 };
             }
 
@@ -152,6 +170,9 @@ impl KpcReader {
                 counter_count,
                 prev_counters: None,
                 available: true,
+                ipc_ema: 0.0,
+                prev_ipc: 0.0,
+                ipc_velocity_ema: 0.0,
             }
         }
 
@@ -227,10 +248,25 @@ impl KpcReader {
 
             self.prev_counters = Some(buf);
 
+            // IPC trend: EMA of IPC velocity.
+            // Falling IPC → system becoming memory-bound → pressure increase likely.
+            let ipc_velocity = if self.prev_ipc > 0.0 {
+                ipc - self.prev_ipc
+            } else {
+                0.0
+            };
+            const TREND_ALPHA: f64 = 0.15;
+            self.ipc_ema = if self.ipc_ema == 0.0 { ipc } else {
+                TREND_ALPHA * ipc + (1.0 - TREND_ALPHA) * self.ipc_ema
+            };
+            self.ipc_velocity_ema = TREND_ALPHA * ipc_velocity + (1.0 - TREND_ALPHA) * self.ipc_velocity_ema;
+            self.prev_ipc = ipc;
+
             Some(KpcSnapshot {
                 total_cycles: delta_cycles,
                 total_instructions: delta_instructions,
                 ipc,
+                ipc_trend: self.ipc_velocity_ema,
             })
         }
 
@@ -248,6 +284,9 @@ impl KpcReader {
             counter_count: 0,
             prev_counters: None,
             available: false,
+            ipc_ema: 0.0,
+            prev_ipc: 0.0,
+            ipc_velocity_ema: 0.0,
         }
     }
 
