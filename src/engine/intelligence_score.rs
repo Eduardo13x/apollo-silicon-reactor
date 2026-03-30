@@ -472,6 +472,7 @@ mod tests {
             total_skills: learning.7,
             experience_records: learning.8,
             dyna_transitions: learning.9,
+            // overflow_count from RL sim available as learning.10
 
             // Resource: LIVE from measured computation time
             p95_cycle_ms: resource.0,
@@ -481,10 +482,10 @@ mod tests {
             habituation_skips: resource.3,
             process_evals: resource.4,
 
-            // Safety: fixed (perfect in simulation, no kills/crashes)
+            // Safety: LIVE overflow count from RL simulation
             kills_applied: 0,
             survival_activations: 0,
-            overflow_events_7d: 0,
+            overflow_events_7d: learning.10, // from RL sim overflow tracking
             failures: 0,
             frozen_critical: 0,
 
@@ -638,12 +639,13 @@ mod tests {
     // ── Learning Velocity Simulation ─────────────────────────────────────
     // Returns: (rl_q_var, rl_conv_ticks, rl_max_ticks, causal_solid, causal_weak, causal_total,
     //           reliable_skills, total_skills, exp_records, dyna_transitions)
-    fn sim_learning_velocity() -> (f64, u64, u64, u32, u32, u32, u32, u32, u32, u64) {
+    fn sim_learning_velocity() -> (f64, u64, u64, u32, u32, u32, u32, u32, u32, u64, u32) {
         // RL: run agent for 500 ticks across different states
         let tmp = std::path::Path::new("/tmp/ais_rl_test.json");
         let mut rl = RlThresholdAgent::load_or_default(tmp);
         let max_ticks = 500u64;
         let mut converged_at = max_ticks;
+        let mut overflow_count = 0u32;
 
         // Simulate: low pressure = stable (+1), high pressure with overflow = penalty (-10)
         let mut last_adj = 0.0;
@@ -651,6 +653,9 @@ mod tests {
             let pressure = if tick % 50 < 30 { 0.50 } else { 0.85 };
             let compressor = if pressure > 0.70 { 0.6 } else { 0.2 };
             let overflowed = pressure > 0.80 && tick % 5 == 0;
+            if overflowed {
+                overflow_count += 1;
+            }
 
             let state = RlState::from_metrics(pressure, compressor, if overflowed { 1 } else { 0 });
             rl.tick(state, overflowed);
@@ -764,6 +769,7 @@ mod tests {
             total,
             100, // experience records
             dyna_transitions,
+            overflow_count,
         )
     }
 
