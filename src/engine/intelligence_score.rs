@@ -647,12 +647,18 @@ mod tests {
         let mut converged_at = max_ticks;
         let mut overflow_count = 0u32;
 
-        // Simulate: low pressure = stable (+1), high pressure with overflow = penalty (-10)
+        // Simulate: low pressure = stable, high pressure triggers overflow UNLESS the
+        // RL agent has lowered thresholds enough. This closes the feedback loop:
+        // RL learns → lowers threshold → fewer overflows → better Safety score.
+        let base_threshold = 0.80; // default overflow threshold
         let mut last_adj = 0.0;
         for tick in 0..max_ticks {
             let pressure = if tick % 50 < 30 { 0.50 } else { 0.85 };
             let compressor = if pressure > 0.70 { 0.6 } else { 0.2 };
-            let overflowed = pressure > 0.80 && tick % 5 == 0;
+            // Overflow occurs only if pressure exceeds the RL-adjusted threshold.
+            // rl.current_adjustment is negative (lowers threshold to catch overflows earlier).
+            let effective_threshold = base_threshold + rl.current_adjustment;
+            let overflowed = pressure > effective_threshold && tick % 5 == 0;
             if overflowed {
                 overflow_count += 1;
             }
