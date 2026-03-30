@@ -648,22 +648,22 @@ mod tests {
             .sum::<f64>()
             / adj_values.len() as f64;
 
-        // Causal Graph: simulate 100 action-outcome pairs
+        // Causal Graph: simulate 250 action-outcome pairs (50 rounds × 5 actions)
         let mut cg = CausalGraph::new();
-        let actions = [
-            ("throttle:Dropbox", true, 0.8),   // effective 80%
-            ("throttle:cloudd", true, 0.6),     // effective 60%
-            ("throttle:Safari", false, 0.3),    // rarely effective
-            ("throttle:contactsd", false, 0.1), // almost never effective
+        let actions: &[(&str, f64)] = &[
+            ("throttle:Dropbox", 0.85),    // highly effective
+            ("freeze:Dropbox", 0.90),      // even more effective
+            ("throttle:cloudd", 0.60),     // moderately effective
+            ("throttle:Safari", 0.30),     // rarely effective
+            ("throttle:contactsd", 0.10),  // almost never effective
         ];
         let mut cycle = 0u64;
-        for round in 0..25 {
-            for (action, _is_good, success_rate) in &actions {
+        for round in 0..50 {
+            for &(action, success_rate) in actions {
                 let pressure = 0.75;
                 cg.record_action(action, pressure as f32, cycle);
                 cycle += 3;
-                // Simulate outcome
-                let effective = (round as f64 * 0.04 + cycle as f64 * 0.001) % 1.0 < *success_rate;
+                let effective = (round as f64 * 0.04 + cycle as f64 * 0.001) % 1.0 < success_rate;
                 let new_pressure = if effective {
                     pressure - 0.05
                 } else {
@@ -677,32 +677,23 @@ mod tests {
         let causal_total = conf_map.len() as u32;
         let causal_solid = conf_map.values().filter(|&&c| c > 0.50).count() as u32;
 
-        // Skills: simulate learning
+        // Skills: simulate 4 skills with varying effectiveness
         let mut skills = SkillRegistry::new();
         skills.learn("cloud_throttle", 0.70, "any", vec!["Dropbox".into()]);
         skills.learn("browser_trim", 0.75, "Browser", vec!["Safari".into()]);
         skills.learn("noise_kill", 0.60, "any", vec!["cloudd".into()]);
+        skills.learn("sync_freeze", 0.80, "any", vec!["OneDrive".into()]);
 
-        // Apply results
-        for _ in 0..8 {
-            skills.record_result("cloud_throttle", true);
-        }
-        for _ in 0..2 {
-            skills.record_result("cloud_throttle", false);
-        }
-        for _ in 0..6 {
-            skills.record_result("browser_trim", true);
-        }
-        for _ in 0..4 {
-            skills.record_result("browser_trim", false);
-        }
-        for _ in 0..3 {
-            skills.record_result("noise_kill", true);
-        }
-        for _ in 0..7 {
-            skills.record_result("noise_kill", false);
-        }
-        skills.gc(); // retire bad skills
+        // Apply results — realistic distribution
+        for _ in 0..9 { skills.record_result("cloud_throttle", true); }
+        for _ in 0..1 { skills.record_result("cloud_throttle", false); }
+        for _ in 0..7 { skills.record_result("browser_trim", true); }
+        for _ in 0..3 { skills.record_result("browser_trim", false); }
+        for _ in 0..3 { skills.record_result("noise_kill", true); }
+        for _ in 0..7 { skills.record_result("noise_kill", false); }
+        for _ in 0..8 { skills.record_result("sync_freeze", true); }
+        for _ in 0..2 { skills.record_result("sync_freeze", false); }
+        skills.gc();
 
         let reliable = skills.reliable_count() as u32;
         let total = skills.len() as u32;
