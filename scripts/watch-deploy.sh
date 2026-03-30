@@ -226,7 +226,7 @@ run_autoresearch() {
     AR_DZ_INT=$(echo "$AR_DZ_CHALLENGE" | cut -d. -f1)
     if [ "${AR_DZ_INT:-1}" -eq 0 ] && echo "$AR_FINAL" | grep -q '"dr_zero_groups": \['; then
         local DZ_GROUP_COUNT
-        DZ_GROUP_COUNT=$(echo "$AR_FINAL" | grep -oE '"[A-Z][a-z]+\(eff=' | wc -l | tr -d ' ')
+        DZ_GROUP_COUNT=$(echo "$AR_FINAL" | grep -oE '\(eff=' | wc -l | tr -d ' ')
         [ "${DZ_GROUP_COUNT:-0}" -ge 2 ] && AR_DZ_BONUS=5
     fi
 
