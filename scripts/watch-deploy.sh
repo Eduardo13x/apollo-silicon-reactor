@@ -100,6 +100,7 @@ run_autoresearch() {
     if [ "$warmup_secs" -gt 0 ]; then
         write_report ""
         write_report "── WARMUP (${warmup_secs}s) ──"
+        echo "  [warmup] ${warmup_secs}s..."
         sleep "$warmup_secs"
         # Verify daemon survived warmup
         if ! pgrep -x apollo-optimizerd >/dev/null 2>&1; then
@@ -126,13 +127,17 @@ run_autoresearch() {
         AR_STATUS=$("$CTL" status 2>/dev/null || echo '{"error":"no response"}')
         if echo "$AR_STATUS" | grep -q '"error"'; then
             AR_CTL_FAIL=$((AR_CTL_FAIL + 1))
+            echo "  [poll $_poll/18] daemon: NO RESPONSE"
         else
             AR_CTL_OK=$((AR_CTL_OK + 1))
-            local AR_CUR
+            local AR_CUR AR_P95_LIVE AR_PRESS_LIVE
             AR_CUR=$(echo "$AR_STATUS" | grep -oE '"cycles": [0-9]+' | grep -oE '[0-9]+' || echo 0)
+            AR_P95_LIVE=$(echo "$AR_STATUS" | grep -oE '"p95_cycle_ms": [0-9.]+' | grep -oE '[0-9]+' | head -1 || echo "?")
+            AR_PRESS_LIVE=$(echo "$AR_STATUS" | grep -oE '"memory_pressure": [0-9.]+' | grep -oE '[0-9.]+' | head -1 || echo "?")
+            echo "  [poll $_poll/18] cycles=$AR_CUR p95=${AR_P95_LIVE}ms pressure=${AR_PRESS_LIVE}"
             if [ "$AR_CUR" = "$AR_PREV_CYCLES" ] && [ "$AR_PREV_CYCLES" != "0" ]; then
                 AR_STUCK=$((AR_STUCK + 1))
-                [ "$AR_STUCK" -ge 3 ] && AR_HANG=1
+                [ "$AR_STUCK" -ge 3 ] && AR_HANG=1 && echo "  [HANG DETECTED]"
             else
                 AR_STUCK=0
             fi
@@ -240,6 +245,8 @@ run_autoresearch() {
     write_report "DR.ZERO_BONUS: $AR_DZ_BONUS/5 (self_challenge=$AR_DZ_CHALLENGE, groups=$DZ_GROUP_COUNT)"
     write_report ""
     write_report "AUTORESEARCH_SCORE: $AR_SCORE/105 ($AR_VERDICT)"
+    echo ""
+    echo "══ SCORE: $AR_SCORE/105 ($AR_VERDICT) | p95=${AR_AVG}ms | pressure=${AR_PRESS_LIVE} | Dr.Zero L${DZ_LEVEL} ══"
 
     # Cleanup synthetic load
     dz_cleanup
@@ -359,7 +366,7 @@ while true; do
         cp -f target/release/apollo-optimizerd "$DAEMON"
         chown root:wheel "$DAEMON"
         chmod 755 "$DAEMON"
-        codesign --force --sign - "$DAEMON" 2>&1
+        timeout 8 codesign --force --sign - "$DAEMON" 2>&1 || true
         MD5=$(md5 -q "$DAEMON")
         write_report "BINARY: installed (md5=$MD5)"
 
@@ -367,7 +374,7 @@ while true; do
             cp -f target/release/apollo-optimizerctl "$CTL"
             chown root:wheel "$CTL"
             chmod 755 "$CTL"
-            codesign --force --sign - "$CTL" 2>&1
+            timeout 8 codesign --force --sign - "$CTL" 2>&1 || true
         fi
 
         truncate -s 0 /var/log/apollo-optimizer.out.log /var/log/apollo-optimizer.err.log 2>/dev/null || true
