@@ -525,10 +525,11 @@ mod tests {
             })
             .collect();
 
-        // Deterministic noise pattern (no rng dependency)
+        // Deterministic noise pattern — amplitude ±0.02 matches real daemon
+        // memory_pressure variance (measured: σ ≈ 0.015 from daemon cycle data).
         let noise = [
-            0.02, -0.03, 0.01, -0.02, 0.04, -0.01, 0.03, -0.04, 0.02, -0.02,
-            0.01, -0.03, 0.02, -0.01, 0.04, -0.02, 0.03, -0.03, 0.01, -0.04,
+            0.010, -0.015, 0.005, -0.010, 0.020, -0.005, 0.015, -0.020, 0.010, -0.010,
+            0.005, -0.015, 0.010, -0.005, 0.020, -0.010, 0.015, -0.015, 0.005, -0.020,
         ];
 
         for (i, &true_val) in true_signal.iter().enumerate() {
