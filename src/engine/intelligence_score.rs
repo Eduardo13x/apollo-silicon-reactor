@@ -481,6 +481,19 @@ mod tests {
             regime_shifts_total: 10,
         };
 
+        // Debug: print raw sim values
+        println!(
+            "  Signal: kalman_rmse={:.4} cusum_tp={} cusum_fp={} actual={} hazard_err={:.4} entropy={:.2}",
+            signal.0, signal.1, signal.2, signal.3, signal.4, signal.5
+        );
+        println!(
+            "  Learn:  rl_qvar={:.4} conv={}/{} causal={}/{} skills={}/{} dyna={}",
+            learning.0, learning.1, learning.2, learning.3, learning.4, learning.5, learning.6, learning.8
+        );
+        println!(
+            "  Resource: p95={:.1}ms skips={}/{} hab={}/{}",
+            resource.0, resource.1, resource.2, resource.3, resource.4
+        );
         let score = compute_ais(&input);
         println!(
             "AIS: {:.1} | D={:.0}% S={:.0}% L={:.0}% R={:.0}% Sf={:.0}% A={:.0}%",
