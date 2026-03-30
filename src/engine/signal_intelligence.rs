@@ -140,6 +140,8 @@ pub struct SignalIntelligence {
 
     /// Last KPC IPC value (0 = unavailable). Set by daemon each cycle.
     kpc_ipc: f64,
+    /// Last KPC IPC trend (velocity EMA). Negative = becoming memory-bound.
+    kpc_ipc_trend: f64,
     /// Kalman base R for pressure (stored so we can modulate dynamically).
     kf_pressure_base_r: f64,
 }
@@ -193,23 +195,25 @@ impl SignalIntelligence {
             neuro_serotonin_shift: 0.0,
 
             kpc_ipc: 0.0,
+            kpc_ipc_trend: 0.0,
             kf_pressure_base_r: 0.02,
         }
     }
 
-    /// Feed KPC IPC value. Called by daemon each cycle before tick().
-    /// Modulates Kalman measurement noise:
-    ///   IPC < 0.5 → memory-bound → pressure signal more reliable → lower R
-    ///   IPC > 1.5 → compute-bound → pressure signal noisier → higher R
+    /// Feed KPC IPC value and trend. Called by daemon each cycle before tick().
+    /// Modulates Kalman measurement noise based on IPC level,
+    /// and hazard horizon based on IPC trend.
     pub fn set_kpc_ipc(&mut self, ipc: f64) {
         self.kpc_ipc = ipc;
         if ipc > 0.0 {
-            // Scale R: base_r × [0.5, 2.0] based on IPC.
-            // Low IPC (memory-bound): 0.5× base_r → trust pressure more.
-            // High IPC (compute-bound): 2.0× base_r → trust prediction more.
             let scale = (ipc / 1.0).clamp(0.5, 2.0);
             self.kf_pressure.set_measurement_noise(self.kf_pressure_base_r * scale);
         }
+    }
+
+    /// Feed KPC IPC trend (velocity EMA). Negative = system becoming memory-bound.
+    pub fn set_kpc_trend(&mut self, trend: f64) {
+        self.kpc_ipc_trend = trend;
     }
 
     /// Procesa un ciclo completo de señales.
@@ -321,7 +325,13 @@ impl SignalIntelligence {
                 swap_ratio,
                 compressor_ratio,
             );
-            let p = self.hazard.probability_oom(&risk_features, 30.0);
+            // KPC IPC trend modulates hazard horizon:
+            // Falling IPC (negative trend) → look further ahead (more conservative).
+            // Rising IPC → shorter horizon (less conservative).
+            // Range: 20s (IPC rising) to 45s (IPC falling fast).
+            let ipc_horizon_adjust = (-self.kpc_ipc_trend * 150.0).clamp(-10.0, 15.0);
+            let horizon = 30.0 + ipc_horizon_adjust;
+            let p = self.hazard.probability_oom(&risk_features, horizon);
             self.hazard.tick_no_event(dt_secs);
             p
         } else {

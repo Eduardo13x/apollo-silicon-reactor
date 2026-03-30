@@ -4514,6 +4514,7 @@ fn main() -> anyhow::Result<()> {
                     if let Some(ref kpc) = kpc_snap {
                         metrics.kpc_ipc = kpc.ipc;
                         signal_intel.set_kpc_ipc(kpc.ipc);
+                        signal_intel.set_kpc_trend(kpc.ipc_trend);
                     }
 
                     // Rosetta AOT state
