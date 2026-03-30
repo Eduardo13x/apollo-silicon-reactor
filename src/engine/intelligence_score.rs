@@ -500,7 +500,7 @@ mod tests {
     // Returns: (kalman_rmse, cusum_tp, cusum_fp, cusum_actual, hazard_err, entropy_tpr)
     fn sim_signal_quality() -> (f64, u32, u32, u32, f64, f64) {
         // Kalman: feed realistic pressure signal with noise + regime shifts
-        let mut kf = Kalman1D::new(0.005, 0.02); // same params as SignalIntelligence
+        let mut kf = Kalman1D::new(0.008, 0.02); // same params as SignalIntelligence
         let mut rmse_sum = 0.0;
         let mut rmse_n = 0u32;
 
@@ -539,7 +539,7 @@ mod tests {
         let kalman_rmse = (rmse_sum / rmse_n.max(1) as f64).sqrt();
 
         // CUSUM: detect the 2 regime shifts (rise at t=50, fall at t=150)
-        let mut cusum = Cusum::new(0.50, 0.02, 0.12);
+        let mut cusum = Cusum::new(0.50, 0.02, 0.10);
         let mut cusum_tp = 0u32;
         let mut cusum_fp = 0u32;
         let actual_shifts = 2u32; // rise and fall
@@ -572,7 +572,7 @@ mod tests {
         // We approximate with Kalman prediction error at 5s horizon
         let mut hazard_err_sum = 0.0;
         let mut hazard_n = 0u32;
-        let mut kf2 = Kalman1D::new(0.005, 0.02);
+        let mut kf2 = Kalman1D::new(0.008, 0.02);
         for (i, &true_val) in true_signal.iter().enumerate() {
             let noisy = (true_val + noise[i % noise.len()]).clamp(0.0, 1.0);
             kf2.update(noisy, 0.5);
@@ -725,8 +725,8 @@ mod tests {
         let start = std::time::Instant::now();
 
         // Simulate 100 cycles of signal processing
-        let mut kf = Kalman1D::new(0.005, 0.02);
-        let mut cusum = Cusum::new(0.50, 0.02, 0.12);
+        let mut kf = Kalman1D::new(0.008, 0.02);
+        let mut cusum = Cusum::new(0.50, 0.02, 0.10);
         let noise = [0.02, -0.03, 0.01, -0.02, 0.04, -0.01, 0.03, -0.04, 0.02, -0.02];
 
         for i in 0..100 {
