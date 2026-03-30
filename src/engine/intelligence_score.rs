@@ -647,18 +647,30 @@ mod tests {
         let mut converged_at = max_ticks;
         let mut overflow_count = 0u32;
 
-        // Simulate: low pressure = stable, high pressure triggers overflow UNLESS the
-        // RL agent has lowered thresholds enough. This closes the feedback loop:
-        // RL learns → lowers threshold → fewer overflows → better Safety score.
-        let base_threshold = 0.80; // default overflow threshold
+        // Simulate: RL learns to lower action threshold → acts sooner → prevents overflow.
+        // Realistic pressure: mostly 0.50, spikes to 0.85 normally, occasional 0.95 spikes.
+        // RL adjustment (negative) → lowers threshold → catches more spikes.
+        let system_limit = 0.88;       // overflow point (8GB M1 under load)
+        let action_effect = 0.08;      // actions reduce effective pressure ~8pp
         let mut last_adj = 0.0;
         for tick in 0..max_ticks {
-            let pressure = if tick % 50 < 30 { 0.50 } else { 0.85 };
+            // Deterministic pressure pattern with occasional severe spikes
+            let base = if tick % 50 < 30 { 0.50 } else { 0.85 };
+            let pressure = if tick % 50 == 40 || tick % 50 == 45 {
+                0.98 // severe spike — even with actions, may overflow
+            } else {
+                base
+            };
             let compressor = if pressure > 0.70 { 0.6 } else { 0.2 };
-            // Overflow occurs only if pressure exceeds the RL-adjusted threshold.
-            // rl.current_adjustment is negative (lowers threshold to catch overflows earlier).
-            let effective_threshold = base_threshold + rl.current_adjustment;
-            let overflowed = pressure > effective_threshold && tick % 5 == 0;
+            // RL adjustment is negative → lowers threshold → acts earlier
+            let effective_action_th = 0.80 + rl.current_adjustment;
+            let rl_acted = pressure > effective_action_th;
+            let effective_pressure = if rl_acted {
+                pressure - action_effect
+            } else {
+                pressure
+            };
+            let overflowed = effective_pressure > system_limit;
             if overflowed {
                 overflow_count += 1;
             }
