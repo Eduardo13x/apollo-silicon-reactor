@@ -149,15 +149,13 @@ impl SignalIntelligence {
     pub fn new() -> Self {
         Self {
             // Pressure: señal lenta (0–1), poco ruido de medición.
-            // q=0.008: faster tracking of regime shifts (was 0.005).
-            kf_pressure: Kalman1D::new(0.008, 0.02),
+            kf_pressure: Kalman1D::new(0.005, 0.02),
             // Swap velocity: más ruidosa.
             kf_swap: Kalman1D::new(0.1, 1000.0),
 
-            // CUSUM: target=0.50 (presión normal), k=0.02, h=0.10
-            // Detecta drift de >0.02/ciclo con acumulación > 0.10 (~5 ciclos de drift).
-            // h=0.10 (was 0.12): catches regime shifts ~1-2 cycles faster.
-            cusum_pressure: Cusum::new(0.50, 0.02, 0.10),
+            // CUSUM: target=0.50 (presión normal), k=0.02, h=0.12
+            // Detecta drift de >0.02/ciclo con acumulación > 0.12 (~6 ciclos de drift).
+            cusum_pressure: Cusum::new(0.50, 0.02, 0.12),
 
             entropy: EntropyDetector::new(),
 
