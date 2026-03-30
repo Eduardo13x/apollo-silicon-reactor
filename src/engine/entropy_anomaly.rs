@@ -65,6 +65,10 @@ pub struct EntropyDetector {
     fingerprints: HashMap<WorkloadFingerprint, FingerprintEntry>,
     /// Last fingerprint (for external query).
     last_fingerprint: Option<WorkloadFingerprint>,
+    /// Cached anomaly score (reused when entropy is stable).
+    cached_anomaly: f64,
+    /// Last entropy value for which anomaly_score was computed.
+    last_entropy_computed: f64,
 }
 
 impl EntropyDetector {
@@ -77,6 +81,8 @@ impl EntropyDetector {
             initialized: false,
             fingerprints: HashMap::new(),
             last_fingerprint: None,
+            cached_anomaly: 0.0,
+            last_entropy_computed: f64::NAN,
         }
     }
 }
@@ -147,6 +153,25 @@ impl EntropyDetector {
     ///
     /// Also updates the fingerprint cache with the computed score.
     pub fn anomaly_score(&mut self) -> f64 {
+        // Short-circuit: if entropy hasn't changed meaningfully, reuse cached score.
+        // Saves O(N) mean+variance iteration over 60 samples when signal is stable.
+        let current_entropy = *self.history.back().unwrap_or(&0.0);
+        if (current_entropy - self.last_entropy_computed).abs() < 1e-4
+            && !self.last_entropy_computed.is_nan()
+        {
+            // Still update fingerprint cache so recognition keeps working.
+            if let Some(fp) = self.last_fingerprint {
+                let score = self.cached_anomaly;
+                let entry = self.fingerprints.entry(fp).or_insert(FingerprintEntry {
+                    avg_anomaly: score,
+                    hits: 0,
+                });
+                entry.hits += 1;
+                entry.avg_anomaly += 0.1 * (score - entry.avg_anomaly);
+            }
+            return self.cached_anomaly;
+        }
+
         let score = if self.history.len() < 5 {
             0.0
         } else {
@@ -157,10 +182,11 @@ impl EntropyDetector {
             if std_dev < 1e-6 {
                 0.0
             } else {
-                let current = *self.history.back().unwrap_or(&mean);
-                (current - mean) / std_dev
+                (current_entropy - mean) / std_dev
             }
         };
+        self.cached_anomaly = score;
+        self.last_entropy_computed = current_entropy;
 
         // Update fingerprint cache with this observation (even if score is 0).
         if let Some(fp) = self.last_fingerprint {
