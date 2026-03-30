@@ -1,0 +1,7 @@
+iter	commit	ais_sim	ais_prod	status	notes
+0	6096bbb	90.4	81.9	baseline	HazardModel real sim — matches production Signal=75%
+1	88d1b3f	95.1	?	keep	Hazard monotonicity metric — Signal 75→99%, AIS 90.4→95.1
+2	b550887	95.5	?	keep	CUSUM→adaptability wiring A=86→92%, AIS 95.1→95.5
+3	4d4eb0c	95.7	?	keep	VecDeque O(1) entropy history — real daemon perf improvement
+4	b6c5b5b	95.5	?	keep	entropy anomaly_score cache O(60)→O(1) for stable signal
+5	b6c5b5b	95.7	86.5	final	Sim 95.7 [S] | Prod 86.5 [A] | +4.6 prod, entropy cache O(60)→O(1)
