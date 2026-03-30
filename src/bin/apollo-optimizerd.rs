@@ -6411,8 +6411,8 @@ fn main() -> anyhow::Result<()> {
                 // I/O Traffic Shaping: foreground-aware disk bandwidth allocation.
                 // Iyer & Druschel 2001 — anticipatory scheduling + I/O priority classes
                 // reduce foreground I/O latency by 50-70% under concurrent background load.
-                // Runs every 5 cycles (~2.5s) to avoid excessive syscall overhead.
-                if cycle_count % 5 == 0 && is_root {
+                // Runs every 20 cycles (~10s): MIN_REAPPLY_SECS=60 so nothing reapplies within 60s anyway.
+                if cycle_count % 20 == 0 && is_root {
                     let fg_family_io = build_foreground_family(foreground_pid, &process_tree);
                     let fg_pids: Vec<u32> = fg_family_io.iter().copied().collect();
                     let process_tiers: Vec<(
