@@ -74,7 +74,6 @@ use apollo_optimizer::engine::predictive_agent::{
 };
 use apollo_optimizer::engine::proc_taskinfo;
 use apollo_optimizer::engine::process_classifier::{ProcessSnapshot, ProcessTier};
-use apollo_optimizer::engine::process_identity::ProcessIdentity;
 use apollo_optimizer::engine::process_recovery::ProcessRecoveryManager;
 use apollo_optimizer::engine::process_tree::{ProcessEntry, ProcessTree};
 use apollo_optimizer::engine::profile_governor::{
@@ -110,13 +109,24 @@ use apollo_optimizer::engine::wake_storm_detector::WakeStormDetector;
 use apollo_optimizer::engine::workload_classifier::{
     classify_workload_mode, WorkloadFeatures, WorkloadMode,
 };
+use apollo_optimizer::engine::daemon_helpers::{
+    self, audit_log, audit_log_path, battery_pressure_boost, compute_p95, frozen_state_path,
+    governor_state_path, holt_winters_path, hop_groups_path, journal_path, kill_switch_path,
+    load_frozen_state, load_governor_state, load_wake_state, markov_path, merge_seed_into,
+    metrics_path, overflow_history_path, parse_profile, pid_start_time, predictive_agent_path,
+    rl_threshold_path, rotate_timeline, signal_intelligence_path, socket_path,
+    should_rotate_oldest, should_unfreeze, spotlight_set_indexing, timeline_path, unfreeze_pids,
+    wake_state_path, write_frozen_state, append_timeline,
+    write_governor_state, write_metrics, write_wake_state, WakeRuntimeState, WakeStatePersisted,
+    FREEZE_TTL_SECS,
+};
 use apollo_optimizer::engine::zombie_hunter::HuntSnapshot;
 use chrono::{DateTime, Duration as ChronoDuration, Local, Timelike, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use sysinfo::ProcessStatus;
 
-const FREEZE_TTL_SECS: i64 = 3 * 60;
+// FREEZE_TTL_SECS → daemon_helpers
 const REACTOR_FAST_TICK_SECS: u64 = 30;
 
 /// Battery-aware pressure boost: on battery, effective pressure is raised so
@@ -128,214 +138,9 @@ const REACTOR_FAST_TICK_SECS: u64 = 30;
 ///   Battery >50% → +0.04  (slightly more aggressive)
 ///   Battery 20-50% → +0.10  (noticeably more aggressive)
 ///   Battery <20%  → +0.18  (maximum aggressiveness)
-fn battery_pressure_boost(power_mgr: &PowerManager) -> f64 {
-    use apollo_optimizer::engine::power_management::BatteryMode;
-    if !power_mgr.is_on_battery() {
-        return 0.0;
-    }
-    match power_mgr.battery_mode_current() {
-        BatteryMode::Normal => 0.04,
-        BatteryMode::LowPower => 0.10,
-        BatteryMode::Critical => 0.18,
-    }
-}
+// battery_pressure_boost, merge_seed_into, pid_start_time → daemon_helpers
 
-/// Seed policy embedded at compile time — guarantees Brave, Claude, Warp, etc.
-/// are always in interactive_patterns even on fresh installs or corrupt disk policy.
-static SEED_POLICY: &str = include_str!("../../policy_clean.json");
-
-/// Merge seed policy patterns into `policy` as a floor.
-/// Seed patterns are always present — they can be added to but never removed.
-/// Deduplicates across lists: a pattern in protected won't be added to interactive/noise.
-fn merge_seed_into(policy: &mut LearnedPolicy) {
-    let seed: LearnedPolicy =
-        serde_json::from_str(SEED_POLICY).expect("BUG: embedded policy_clean.json is invalid");
-    // Protected first (highest priority).
-    for pat in &seed.protected_patterns {
-        if !policy.protected_patterns.contains(pat) {
-            policy.protected_patterns.push(pat.clone());
-        }
-    }
-    // Interactive: skip if already in protected.
-    for pat in &seed.interactive_patterns {
-        if !policy.interactive_patterns.contains(pat)
-            && !policy.protected_patterns.contains(pat)
-        {
-            policy.interactive_patterns.push(pat.clone());
-        }
-    }
-    // Noise: skip if already in protected or interactive.
-    for pat in &seed.noise_patterns {
-        if !policy.noise_patterns.contains(pat)
-            && !policy.protected_patterns.contains(pat)
-            && !policy.interactive_patterns.contains(pat)
-        {
-            policy.noise_patterns.push(pat.clone());
-        }
-    }
-    // Clean up cross-list conflicts: protected wins over interactive/noise.
-    policy
-        .interactive_patterns
-        .retain(|p| !policy.protected_patterns.contains(p));
-    policy
-        .noise_patterns
-        .retain(|p| !policy.protected_patterns.contains(p) && !policy.interactive_patterns.contains(p));
-}
-
-/// Query kernel start-time for a PID. Returns `(start_sec, start_usec)`.
-/// Falls back to `(0, 0)` if the process is already dead — the action will
-/// be safely skipped by `execute_actions` identity check.
-fn pid_start_time(pid: u32) -> (u64, u64) {
-    ProcessIdentity::from_pid(pid)
-        .map(|id| (id.start_sec, id.start_usec))
-        .unwrap_or((0, 0))
-}
-
-fn socket_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/run/apollo-optimizer.sock"
-    } else {
-        "/tmp/apollo-optimizer.sock"
-    }
-}
-
-fn kill_switch_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/run/apollo.disable"
-    } else {
-        "/tmp/apollo.disable"
-    }
-}
-
-fn journal_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/journal.jsonl"
-    } else {
-        "/tmp/apollo-journal.jsonl"
-    }
-}
-
-fn audit_log_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/deep_scan_audit.jsonl"
-    } else {
-        "/tmp/apollo-deep_scan_audit.jsonl"
-    }
-}
-
-/// Append a JSON line to the audit log (best-effort, never fails the caller).
-fn audit_log(entry: &serde_json::Value) {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    let path = audit_log_path();
-    // Rotate at 5MB to avoid unbounded growth.
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > 5 * 1024 * 1024 {
-            let rotated = format!("{}.1", path);
-            let _ = std::fs::remove_file(&rotated);
-            let _ = std::fs::rename(path, &rotated);
-        }
-    }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{}", entry);
-    }
-}
-
-fn metrics_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/runtime_metrics.json"
-    } else {
-        "/tmp/apollo-runtime_metrics.json"
-    }
-}
-
-fn governor_state_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/governor_state.json"
-    } else {
-        "/tmp/apollo-governor_state.json"
-    }
-}
-
-fn overflow_history_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/overflow_history.json"
-    } else {
-        "/tmp/apollo-overflow_history.json"
-    }
-}
-
-fn rl_threshold_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/rl_threshold.json"
-    } else {
-        "/tmp/apollo-rl_threshold.json"
-    }
-}
-
-fn predictive_agent_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/predictive_agent.json"
-    } else {
-        "/tmp/apollo-predictive_agent.json"
-    }
-}
-
-fn markov_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/markov_transitions.json"
-    } else {
-        "/tmp/apollo-markov_transitions.json"
-    }
-}
-
-fn signal_intelligence_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/signal_intelligence.json"
-    } else {
-        "/tmp/apollo-signal_intelligence.json"
-    }
-}
-
-fn holt_winters_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/holt_winters.json"
-    } else {
-        "/tmp/apollo-holt_winters.json"
-    }
-}
-
-fn timeline_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/profile_timeline.jsonl"
-    } else {
-        "/tmp/apollo-profile_timeline.jsonl"
-    }
-}
-
-fn wake_state_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/wake_state.json"
-    } else {
-        "/tmp/apollo-wake_state.json"
-    }
-}
-
-fn frozen_state_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/frozen_state.json"
-    } else {
-        "/tmp/apollo-frozen_state.json"
-    }
-}
-
-fn hop_groups_path() -> &'static str {
-    if unsafe { libc::geteuid() } == 0 {
-        "/var/lib/apollo/hrpo_groups.json"
-    } else {
-        "/tmp/apollo-hrpo_groups.json"
-    }
-}
+// Path functions (socket_path, kill_switch_path, journal_path, etc.) → daemon_helpers
 
 #[derive(Parser)]
 #[command(name = "apollo-optimizerd")]
@@ -445,20 +250,7 @@ struct UsageTrackerState {
     promotions_today: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WakeStatePersisted {
-    last_wake_at: Option<DateTime<Utc>>,
-    post_wake_grace_until: Option<DateTime<Utc>>,
-    post_wake_policy: String,
-}
-
-#[derive(Debug, Clone)]
-struct WakeRuntimeState {
-    last_cycle_wallclock: DateTime<Utc>,
-    last_wake_at: Option<DateTime<Utc>>,
-    post_wake_grace_until: Option<DateTime<Utc>>,
-    post_wake_policy: String,
-}
+// WakeStatePersisted, WakeRuntimeState → daemon_helpers
 
 #[derive(Default)]
 struct ThrashState {
@@ -474,213 +266,11 @@ struct LlmReactiveCounters {
     prev_trigger_active: bool,
 }
 
-fn parse_profile(input: &str) -> OptimizationProfile {
-    match input {
-        "aggressive-root" => OptimizationProfile::AggressiveRoot,
-        "safe-root" => OptimizationProfile::SafeRoot,
-        _ => OptimizationProfile::BalancedRoot,
-    }
-}
+// parse_profile, write_metrics → daemon_helpers
 
-fn write_metrics(path: &Path, metrics: &RuntimeMetrics) {
-    write_json(path, metrics, Some(0o600));
-}
+// write_governor_state, load_governor_state, append_timeline → daemon_helpers
 
-fn write_governor_state(path: &Path, governor: &ProfileGovernor) {
-    write_json(path, &governor.to_persisted(), Some(0o600));
-}
-
-fn load_governor_state(path: &Path, fallback_profile: OptimizationProfile) -> ProfileGovernor {
-    if let Ok(data) = HardPath::read_to_string_limited(path, 1024 * 1024) {
-        if let Ok(state) = serde_json::from_str::<GovernorPersisted>(&data) {
-            return ProfileGovernor::from_persisted(state);
-        }
-    }
-    ProfileGovernor::new(fallback_profile)
-}
-
-fn append_timeline(path: &Path, transition: &ProfileTransition) {
-    append_jsonl(path, transition);
-    rotate_timeline(path);
-}
-
-fn write_wake_state(path: &Path, state: &WakeRuntimeState) {
-    let persisted = WakeStatePersisted {
-        last_wake_at: state.last_wake_at,
-        post_wake_grace_until: state.post_wake_grace_until,
-        post_wake_policy: state.post_wake_policy.clone(),
-    };
-    write_json(path, &persisted, Some(0o600));
-}
-
-fn load_wake_state(path: &Path) -> WakeRuntimeState {
-    let now = Utc::now();
-    if let Ok(data) = HardPath::read_to_string_limited(path, 1024 * 1024) {
-        if let Ok(state) = serde_json::from_str::<WakeStatePersisted>(&data) {
-            return WakeRuntimeState {
-                last_cycle_wallclock: now,
-                last_wake_at: state.last_wake_at,
-                post_wake_grace_until: state.post_wake_grace_until,
-                post_wake_policy: state.post_wake_policy,
-            };
-        }
-    }
-    WakeRuntimeState {
-        last_cycle_wallclock: now,
-        last_wake_at: None,
-        post_wake_grace_until: None,
-        post_wake_policy: "grace-60s".to_string(),
-    }
-}
-
-fn write_frozen_state(path: &Path, frozen_state: &HashMap<u32, FrozenEntry>) {
-    let persisted = FrozenStatePersisted {
-        frozen: frozen_state
-            .iter()
-            .map(|(pid, entry)| FrozenPidEntry {
-                pid: *pid,
-                since: entry.frozen_at,
-            })
-            .collect(),
-    };
-    write_json(path, &persisted, Some(0o600));
-}
-
-fn load_frozen_state(path: &Path) -> HashMap<u32, FrozenEntry> {
-    if let Ok(data) = HardPath::read_to_string_limited(path, 10 * 1024 * 1024) {
-        if let Ok(state) = serde_json::from_str::<FrozenStatePersisted>(&data) {
-            return state
-                .frozen
-                .into_iter()
-                .map(|e| {
-                    (
-                        e.pid,
-                        FrozenEntry {
-                            frozen_at: e.since,
-                            source: FreezeSource::MainLoop,
-                            // Unknown pressure when loaded from disk; use 1.0 so
-                            // only the TTL path can trigger unfreeze for these entries.
-                            pressure_at_freeze: 1.0,
-                        },
-                    )
-                })
-                .collect();
-        }
-    }
-    HashMap::new()
-}
-
-fn unfreeze_pids(pids: impl Iterator<Item = u32>) -> u64 {
-    let mut count = 0_u64;
-    for pid in pids {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGCONT);
-        }
-        count += 1;
-    }
-    count
-}
-
-/// Returns true when a frozen process should be thawed.
-///
-/// Two independent conditions can trigger an early unfreeze:
-/// - **TTL**: the process has been frozen longer than `FREEZE_TTL_SECS` (safety net).
-/// - **Pressure recovery**: current pressure has dropped to ≤60% of the pressure at
-///   freeze time AND at least 30 s have elapsed (prevents immediate re-thaw on transient
-///   pressure spikes and avoids thrash when frozen just moments ago).
-///
-/// This is a pure function so it can be tested without daemon state.
-fn should_unfreeze(
-    elapsed_secs: i64,
-    pressure_at_freeze: f64,
-    current_pressure: f64,
-) -> bool {
-    let ttl_expired = elapsed_secs > FREEZE_TTL_SECS;
-    // Pressure recovery: two paths — relative drop OR absolute improvement.
-    // On 8GB M1, pressure rarely drops much, so use 5pp threshold (was 10pp).
-    let pressure_recovered = elapsed_secs >= 30
-        && pressure_at_freeze > 0.0
-        && (current_pressure <= pressure_at_freeze * 0.6
-            || (pressure_at_freeze - current_pressure) >= 0.05);
-    // Stale safety: after 2 min, unfreeze if pressure is at least mildly lower.
-    let stale_with_improvement = elapsed_secs >= 120
-        && current_pressure < pressure_at_freeze;
-    ttl_expired || pressure_recovered || stale_with_improvement
-}
-
-/// On memory-constrained hardware (8GB), rotate frozen processes: if ≥3 are
-/// frozen and the oldest has been frozen ≥90s, unfreeze it to prevent resource
-/// hoarding even when pressure stays high.
-fn should_rotate_oldest(elapsed_secs: i64, total_frozen: usize) -> bool {
-    total_frozen >= 2 && elapsed_secs >= 60
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_should_unfreeze_ttl_path() {
-        // TTL expired → always unfreeze regardless of pressure.
-        assert!(should_unfreeze(FREEZE_TTL_SECS + 1, 0.80, 0.80));
-        assert!(should_unfreeze(FREEZE_TTL_SECS + 1, 0.80, 0.90));
-    }
-
-    #[test]
-    fn test_should_unfreeze_pressure_recovery() {
-        // Pressure at freeze was 0.80, now 0.45 (< 0.80 * 0.6 = 0.48) → unfreeze.
-        assert!(should_unfreeze(60, 0.80, 0.45));
-        // 5pp drop: 0.80 → 0.75 → unfreeze (relaxed for 8GB).
-        assert!(should_unfreeze(60, 0.80, 0.75));
-        // Only 3pp drop: not enough.
-        assert!(!should_unfreeze(60, 0.80, 0.77));
-    }
-
-    #[test]
-    fn test_should_unfreeze_min_30s_guard() {
-        // Even if pressure recovered, don't unfreeze before 30 s to avoid thrash.
-        assert!(!should_unfreeze(29, 0.80, 0.10));
-        assert!(should_unfreeze(30, 0.80, 0.10));
-    }
-
-    #[test]
-    fn test_should_unfreeze_high_pressure_at_freeze() {
-        // pressure_at_freeze == 1.0 (max): pressure_recovered threshold = 0.60.
-        // current = 0.10 < 0.60 → unfreeze after 30 s (pressure clearly recovered).
-        assert!(should_unfreeze(60, 1.0, 0.10));
-        // current = 0.65 > 0.60 → still above threshold, do NOT unfreeze early.
-        assert!(!should_unfreeze(60, 1.0, 0.65));
-        // TTL always triggers regardless.
-        assert!(should_unfreeze(FREEZE_TTL_SECS + 1, 1.0, 0.90));
-    }
-
-    #[test]
-    fn test_should_unfreeze_zero_pressure_at_freeze() {
-        // pressure_at_freeze == 0.0: guard against always-true result.
-        assert!(!should_unfreeze(60, 0.0, 0.0));
-        assert!(!should_unfreeze(60, 0.0, 0.10));
-    }
-
-    #[test]
-    fn test_should_unfreeze_stale_at_2min() {
-        // After 2 min (was 5 min), any pressure improvement → unfreeze.
-        assert!(should_unfreeze(120, 0.75, 0.74));
-        assert!(!should_unfreeze(119, 0.75, 0.74));
-        // No improvement → no unfreeze.
-        assert!(!should_unfreeze(120, 0.75, 0.75));
-    }
-
-    #[test]
-    fn test_should_rotate_oldest() {
-        // ≥2 frozen and oldest ≥60s → rotate.
-        assert!(should_rotate_oldest(60, 2));
-        assert!(should_rotate_oldest(200, 5));
-        // Not enough frozen.
-        assert!(!should_rotate_oldest(60, 1));
-        // Too fresh.
-        assert!(!should_rotate_oldest(59, 2));
-    }
-}
+// wake_state, frozen_state, unfreeze, should_unfreeze, should_rotate_oldest + tests → daemon_helpers
 
 fn run_reactor(state: SharedState) -> anyhow::Result<()> {
     unsafe {
@@ -912,22 +502,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn rotate_timeline(path: &Path) {
-    const MAX_BYTES: u64 = 10 * 1024 * 1024;
-    // Use symlink_metadata to avoid following symlinks
-    if fs::symlink_metadata(path)
-        .map(|m| !m.file_type().is_symlink() && m.len() > MAX_BYTES)
-        .unwrap_or(false)
-    {
-        let p1 = format!("{}.1", path.display());
-        let p2 = format!("{}.2", path.display());
-        let p3 = format!("{}.3", path.display());
-        let _ = fs::remove_file(&p3);
-        let _ = fs::rename(&p2, &p3);
-        let _ = fs::rename(&p1, &p2);
-        let _ = fs::rename(path, &p1);
-    }
-}
+// rotate_timeline → daemon_helpers
 
 #[link(name = "System")]
 extern "C" {
@@ -939,15 +514,7 @@ extern "C" {
     ) -> u32;
 }
 
-fn compute_p95(samples: &[u64]) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let mut sorted = samples.to_vec();
-    sorted.sort_unstable();
-    let idx = (((sorted.len() - 1) as f64) * 0.95).round() as usize;
-    sorted[idx] as f64
-}
+// compute_p95 → daemon_helpers
 
 fn filter_boost_cooldown(
     actions: Vec<RootAction>,
@@ -2708,16 +2275,6 @@ fn convert_and_merge_heuristic_decisions(
 
 /// Toggle Spotlight indexing via `mdutil -a -i on/off`.
 ///
-/// mdutil communicates with the Spotlight server via XPC (com.apple.spotlightserver).
-/// There is no public or private framework function equivalent — MDSetIndexingEnabled
-/// does not exist in the dyld shared cache on Apple Silicon macOS 15.
-fn spotlight_set_indexing(enabled: bool) {
-    let flag = if enabled { "on" } else { "off" };
-    let _ = std::process::Command::new("/usr/bin/mdutil")
-        .args(["-a", "-i", flag])
-        .status();
-}
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
