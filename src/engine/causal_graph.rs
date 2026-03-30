@@ -47,11 +47,9 @@ impl CausalEdge {
     /// Bayesian update: blend new evidence into confidence.
     fn update(&mut self, was_effective: bool) {
         self.evidence_count += 1;
-        // Adaptive alpha: start high (0.20) for fast convergence, decay to 0.08
-        // as evidence accumulates. Matches RL EMA-alpha pattern.
-        let alpha = (0.20 / (1.0 + self.evidence_count as f32 * 0.05)).max(0.08);
+        // EMA-style Bayesian update (alpha=0.1 matches memoria-core).
         let target = if was_effective { 1.0 } else { 0.0 };
-        self.confidence = self.confidence * (1.0 - alpha) + target * alpha;
+        self.confidence = self.confidence * 0.9 + target * 0.1;
     }
 
     /// Edge is solid: high confidence with sufficient evidence.
