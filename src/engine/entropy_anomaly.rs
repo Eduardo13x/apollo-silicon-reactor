@@ -17,7 +17,7 @@
 //! if detector.anomaly_score() > 0.5 { /* workload changed significantly */ }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Compact fingerprint of a workload distribution.
 /// Buckets entropy into 0.25-bit bands and counts processes.
@@ -53,8 +53,8 @@ struct FingerprintEntry {
 pub struct EntropyDetector {
     /// Entropía suavizada (EWMA).
     smoothed_entropy: f64,
-    /// Historial reciente de entropías para calcular desviación.
-    history: Vec<f64>,
+    /// Historial reciente de entropías para calcular desviación (ring buffer O(1) push/pop).
+    history: VecDeque<f64>,
     /// Máximo tamaño del historial.
     max_history: usize,
     /// Peso EWMA (0–1). Más alto = más peso a la observación reciente.
@@ -71,7 +71,7 @@ impl EntropyDetector {
     pub fn new() -> Self {
         Self {
             smoothed_entropy: 0.0,
-            history: Vec::with_capacity(60),
+            history: VecDeque::with_capacity(61),
             max_history: 60, // ~30s de historia a 0.5s/ciclo
             alpha: 0.1,
             initialized: false,
@@ -127,10 +127,10 @@ impl EntropyDetector {
                 self.alpha * h_combined + (1.0 - self.alpha) * self.smoothed_entropy;
         }
 
-        self.history.push(h_combined);
-        if self.history.len() > self.max_history {
-            self.history.remove(0);
+        if self.history.len() >= self.max_history {
+            self.history.pop_front(); // O(1) vs O(N) Vec::remove(0)
         }
+        self.history.push_back(h_combined);
 
         // Generate fingerprint for this workload state.
         let process_count = cpu_values.len().max(mem_values.len());
@@ -157,7 +157,7 @@ impl EntropyDetector {
             if std_dev < 1e-6 {
                 0.0
             } else {
-                let current = *self.history.last().unwrap_or(&mean);
+                let current = *self.history.back().unwrap_or(&mean);
                 (current - mean) / std_dev
             }
         };
@@ -188,7 +188,7 @@ impl EntropyDetector {
 
     /// Entropía actual (última observación sin suavizar).
     pub fn current(&self) -> f64 {
-        *self.history.last().unwrap_or(&0.0)
+        *self.history.back().unwrap_or(&0.0)
     }
 
     /// Check if the current workload fingerprint has been seen before.
