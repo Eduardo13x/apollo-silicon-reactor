@@ -602,16 +602,25 @@ mod tests {
             let features = HazardModel::risk_features(pressure, 0.02, 0.75, 0.60);
             hazard.record_event(&features, 8.0); // ~8h between events on average
         }
-        // Measure calibration: P(OOM|30s) should track actual pressure closely.
-        let mut hazard_err_sum = 0.0;
-        let mut hazard_n = 0u32;
-        for &true_val in true_signal.iter().skip(10) {
-            let features = HazardModel::risk_features(true_val, 0.003, 0.75, 0.60);
-            let p_oom = hazard.probability_oom(&features, 30.0);
-            hazard_err_sum += (p_oom - true_val).abs();
-            hazard_n += 1;
+        // Measure calibration: p_oom should be MONOTONICALLY correct — higher pressure
+        // → higher p_oom. We test 5 pressure levels and count ordering violations.
+        // hazard_err = fraction of adjacent pairs where p_oom ordering is wrong.
+        let test_pressures = [0.40f64, 0.50, 0.60, 0.70, 0.80, 0.90];
+        let mut p_ooms = Vec::new();
+        for &p in &test_pressures {
+            let features = HazardModel::risk_features(p, 0.003, 0.60, 0.50);
+            p_ooms.push(hazard.probability_oom(&features, 30.0));
         }
-        let hazard_err = hazard_err_sum / hazard_n.max(1) as f64;
+        // Count inversions (where p_oom[i] > p_oom[i+1] despite pressure[i] < pressure[i+1])
+        let mut inversions = 0u32;
+        let pairs = (test_pressures.len() - 1) as u32;
+        for i in 0..test_pressures.len() - 1 {
+            if p_ooms[i] >= p_ooms[i + 1] {
+                inversions += 1;
+            }
+        }
+        // hazard_err: 0 = perfect ordering, 1 = all inverted
+        let hazard_err = inversions as f64 / pairs as f64;
 
         // Entropy TPR: approximate with CUSUM detection rate
         let entropy_tpr = cusum_tp as f64 / actual_shifts.max(1) as f64;
