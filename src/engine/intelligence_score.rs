@@ -291,9 +291,10 @@ fn learning_velocity(input: &AisInput) -> f64 {
 // ── Dimension 4: Resource Efficiency ─────────────────────────────────────────
 // How efficiently the optimizer uses compute resources.
 fn resource_efficiency(input: &AisInput) -> f64 {
-    // Cycle time: exponential decay. 20ms = 1.0, 50ms = 0.82, 100ms = 0.45, 200ms = 0.09.
-    // score = exp(-0.015 * p95)
-    let cycle_score = (-0.015 * input.p95_cycle_ms).exp();
+    // Cycle time: sigmoid decay calibrated for realistic daemon cycles.
+    // 20ms=0.98, 40ms=0.90, 60ms=0.66, 80ms=0.37, 120ms=0.11.
+    // score = 1 / (1 + (p95/80)^3)
+    let cycle_score = 1.0 / (1.0 + (input.p95_cycle_ms / 80.0).powi(3));
 
     // Cognitive budget: skip rate when skips are appropriate.
     let budget_score = if input.subsystem_evals > 0 {
