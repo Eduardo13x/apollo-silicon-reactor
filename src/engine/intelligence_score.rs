@@ -488,13 +488,13 @@ mod tests {
             failures: 0,
             frozen_critical: 0,
 
-            // Adaptability: fixed from real daemon
+            // Adaptability: regime detection from LIVE CUSUM sim, profile/workload from daemon
             correct_profile_switches: 2,
             total_profile_switches: 2,
             correct_workload_class: 8,
             total_workload_class: 10,
-            regime_shifts_detected: 8,
-            regime_shifts_total: 10,
+            regime_shifts_detected: signal.1, // CUSUM TP = live regime detections
+            regime_shifts_total: signal.3,    // actual shifts in simulation
         };
 
         let score = compute_ais(&input);
