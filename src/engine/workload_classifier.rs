@@ -193,11 +193,24 @@ impl WorkloadClassifier {
         let mut sources: Vec<ClassifierSource> = Vec::new();
         let sigs = workload_signatures();
 
-        // 1. Foreground app — weight 2.0
+        // 1. Foreground app — weight 2.0 (0.8 for launcher workloads like CommandLine).
+        //
+        // A terminal emulator is a launcher: it tells us the user has a shell open,
+        // not what they're doing inside it.  CommandLine as a foreground signal has
+        // low information content compared to e.g. "zoom.us" (definitely a video call).
+        // We halve the foreground weight for CommandLine so background process signals
+        // can override it — no hardcoded app names needed, uses existing WorkloadType.
+        let mut fg_is_launcher = false;
         if let Some(fg) = foreground_app {
             for (wl, patterns) in &sigs {
                 if patterns.iter().any(|p| fg.contains(p)) {
-                    *scores.entry(*wl).or_insert(0.0) += 2.0;
+                    let fg_weight = if *wl == WorkloadType::CommandLine {
+                        fg_is_launcher = true;
+                        0.8 // launcher: low-info foreground, process mix can override
+                    } else {
+                        2.0
+                    };
+                    *scores.entry(*wl).or_insert(0.0) += fg_weight;
                     sources.push(ClassifierSource::ForegroundApp);
                     break;
                 }
@@ -237,12 +250,17 @@ impl WorkloadClassifier {
         }
 
         // 4. Process mix — 0.04 per match, capped at 50
+        // Process mix weight: higher when foreground is a launcher (CommandLine).
+        // A terminal running cargo/rustc has process signals as the PRIMARY evidence;
+        // standard 0.04 is calibrated for apps where foreground already has 2.0.
+        let proc_mix_weight = if fg_is_launcher { 0.30 } else { 0.04 };
+
         let mut mix_count = 0u32;
         for proc in all_proc_names.iter().take(50) {
             let proc_name = *proc;
             for (wl, patterns) in &sigs {
                 if patterns.iter().any(|p| proc_name.contains(*p)) {
-                    *scores.entry(*wl).or_insert(0.0) += 0.04;
+                    *scores.entry(*wl).or_insert(0.0) += proc_mix_weight;
                     mix_count += 1;
                     break;
                 }
@@ -256,32 +274,6 @@ impl WorkloadClassifier {
         }
         if mix_count > 0 {
             sources.push(ClassifierSource::ProcessMix(mix_count));
-        }
-
-        // 5. Terminal context upgrade: Terminal/iTerm/Warp + build tools → Coding.
-        //
-        // A terminal with rustc, cargo, nvim, clang etc. running is a coding session,
-        // not a generic command-line session.  The foreground-app signal scores Terminal
-        // at 2.0 for CommandLine; we add 1.6 for Coding when ≥1 toolchain process is
-        // detected, which tips the balance without hard-coding a special case.
-        const TERMINAL_APPS: &[&str] = &["Terminal", "iTerm", "Warp", "Alacritty", "kitty", "Hyper"];
-        const CODING_TOOLS: &[&str] = &[
-            "rustc", "cargo", "clang", "gcc", "make", "cmake",
-            "nvim", "vim", "emacs", "python3", "node", "go", "javac",
-        ];
-        if let Some(fg) = foreground_app {
-            let is_terminal = TERMINAL_APPS.iter().any(|t| fg.contains(t));
-            if is_terminal {
-                let tool_count = all_proc_names
-                    .iter()
-                    .filter(|p| CODING_TOOLS.iter().any(|t| p.contains(t)))
-                    .count();
-                if tool_count >= 1 {
-                    *scores.entry(WorkloadType::Coding).or_insert(0.0) +=
-                        1.6 + 0.10 * tool_count as f32;
-                    sources.push(ClassifierSource::ProcessMix(tool_count as u32));
-                }
-            }
         }
 
         // Fusión con Gaussian NB de hardware (si hay features disponibles).
