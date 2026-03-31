@@ -73,7 +73,7 @@ pub struct OutcomeBatch {
 
 /// A resolved decision+outcome record for queryable experience memory.
 /// Ring buffer of the last N records enables "what worked before?" queries.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperienceRecord {
     /// Process that was throttled.
     pub process_name: String,
@@ -136,6 +136,11 @@ impl ExperienceMemory {
     /// True if empty.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    /// Read-only access to all records (for persistence).
+    pub fn records(&self) -> &VecDeque<ExperienceRecord> {
+        &self.records
     }
 
     /// State compression (Hermes pattern): merge old records by process name.
@@ -601,6 +606,58 @@ impl OutcomeTracker {
             }
         }
     }
+
+    /// Build a persisted snapshot (for LearnedState).
+    pub fn to_persisted(&self) -> OutcomeTrackerPersisted {
+        let co_occurrence: Vec<(String, String, u32)> = self
+            .co_occurrence
+            .iter()
+            .map(|((a, b), &count)| (a.clone(), b.clone(), count))
+            .collect();
+        OutcomeTrackerPersisted {
+            weights: self.weights.clone(),
+            total_effective: self.total_effective,
+            total_resolved: self.total_resolved,
+            baseline_drop_ema: self.baseline_drop_ema,
+            baseline_samples: self.baseline_samples,
+            experience_records: self.experience.records().iter().cloned().collect(),
+            co_occurrence,
+            natural_drift_ema: self.natural_drift_ema,
+            hop_groups: self.hop_groups.clone(),
+        }
+    }
+
+    /// Restore from a persisted snapshot (for LearnedState).
+    pub fn restore(&mut self, p: OutcomeTrackerPersisted) {
+        self.weights = p.weights;
+        self.total_effective = p.total_effective;
+        self.total_resolved = p.total_resolved;
+        self.baseline_drop_ema = p.baseline_drop_ema;
+        self.baseline_samples = p.baseline_samples;
+        for record in p.experience_records {
+            self.experience.push(record);
+        }
+        self.co_occurrence.clear();
+        for (a, b, count) in p.co_occurrence {
+            self.co_occurrence.insert((a, b), count);
+        }
+        self.natural_drift_ema = p.natural_drift_ema;
+        self.hop_groups = p.hop_groups;
+    }
+}
+
+/// Serializable snapshot of OutcomeTracker state for persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeTrackerPersisted {
+    pub weights: HashMap<String, PatternWeight>,
+    pub total_effective: u32,
+    pub total_resolved: u32,
+    pub baseline_drop_ema: f64,
+    pub baseline_samples: u32,
+    pub experience_records: Vec<ExperienceRecord>,
+    pub co_occurrence: Vec<(String, String, u32)>,
+    pub natural_drift_ema: f64,
+    pub hop_groups: HashMap<WorkloadHop, HopGroupWeight>,
 }
 
 #[cfg(test)]

@@ -183,6 +183,21 @@ Three independent learning loops (RL, OutcomeTracker, PredictiveAgent) never cro
 
 Full plan: see memory file `project_v060_evolution.md`.
 
+## Unified Persistence Layer
+
+All learned state is persisted in a single file (`learned_state.json`) via `LearnedState` in `src/engine/learned_state.rs`. This replaces the pattern of each subsystem persisting independently.
+
+**What's persisted:**
+- Signal intelligence: hazard model, MPC, Kalman filters, learned zones, utility EMAs
+- Outcome tracker: Bayesian weights, experience memory, co-occurrence graph, HRPO groups
+- Specialist accuracy tracker: per-specialist EMA weights
+
+**Self-improvement:** Before each persist, `self_improve()` prunes stale co-occurrence entries, noisy weights, and caps experience memory at 300 records. After each restore, `validate()` clamps out-of-range values.
+
+**Restore quality monitoring:** `RestoreQualityMonitor` tracks effectiveness for 50 cycles post-restore. If restored state is stale (quality < 0.35), zones are reset to defaults.
+
+**Adding a new component:** Add a `#[serde(default)]` field to `LearnedState`, populate in `collect()`, restore in `apply()`.
+
 ## Quick Reference
 
 | Task | Command |

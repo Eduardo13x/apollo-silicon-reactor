@@ -162,7 +162,7 @@ pub mod specialist {
 ///
 /// The resulting accuracy value is used as the confidence multiplier when
 /// building [`SpecialistVote`]s instead of fixed constants.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecialistAccuracyTracker {
     /// EMA accuracy per specialist, range [0, 1]. Init: 0.70.
     accuracy: [f64; specialist::COUNT],
@@ -223,6 +223,11 @@ impl SpecialistAccuracyTracker {
     /// Return all accuracy weights as a slice.
     pub fn weights(&self) -> &[f64; specialist::COUNT] {
         &self.accuracy
+    }
+
+    /// Mutable access to all accuracy weights (for validation/clamping on restore).
+    pub fn weights_mut(&mut self) -> &mut [f64; specialist::COUNT] {
+        &mut self.accuracy
     }
 
     /// Total update calls (diagnostic).

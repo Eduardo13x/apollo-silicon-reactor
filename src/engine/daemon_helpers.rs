@@ -101,6 +101,10 @@ pub fn hop_groups_path() -> &'static str {
     if is_root() { "/var/lib/apollo/hrpo_groups.json" } else { "/tmp/apollo-hrpo_groups.json" }
 }
 
+pub fn learned_state_path() -> &'static str {
+    if is_root() { "/var/lib/apollo/learned_state.json" } else { "/tmp/apollo-learned_state.json" }
+}
+
 // ── Audit Log ───────────────────────────────────────────────────────────────
 
 /// Append a JSON line to the audit log (best-effort, never fails the caller).

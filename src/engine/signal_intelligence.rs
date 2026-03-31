@@ -521,11 +521,24 @@ impl SignalIntelligence {
     ///
     /// Not persisted: CUSUM target (must reflect current regime), Entropy history
     /// (adapts in <20 cycles), Lotka-Volterra (resets when dominant process changes).
-    pub fn persist(&self, path: &Path) {
-        let persisted = SignalIntelligencePersisted {
+    /// Build a persisted snapshot from live state (for LearnedState).
+    pub fn to_persisted(&self) -> SignalIntelligencePersisted {
+        SignalIntelligencePersisted {
             hazard: self.hazard.clone(),
             mpc: self.mpc.to_persisted(),
-        };
+            learned_mid_entry: self.learned_mid_entry,
+            learned_high_entry: self.learned_high_entry,
+            utility_entropy: self.utility_entropy,
+            utility_hazard: self.utility_hazard,
+            utility_lotka: self.utility_lotka,
+            utility_mpc: self.utility_mpc,
+            kf_pressure: Some(self.kf_pressure.clone()),
+            kf_swap: Some(self.kf_swap.clone()),
+        }
+    }
+
+    pub fn persist(&self, path: &Path) {
+        let persisted = self.to_persisted();
         if let Ok(json) = serde_json::to_string(&persisted) {
             let _ = std::fs::write(path, json);
         }
@@ -539,10 +552,29 @@ impl SignalIntelligence {
         serde_json::from_str(&data).ok()
     }
 
-    /// Apply a persisted snapshot, restoring the hazard model and MPC effects.
+    /// Apply a persisted snapshot, restoring the hazard model, MPC effects,
+    /// learned zones, utility EMAs, and Kalman filter state.
     pub fn restore(&mut self, p: SignalIntelligencePersisted) {
         self.hazard = p.hazard;
         self.mpc.restore_effects(&p.mpc);
+        self.learned_mid_entry = p.learned_mid_entry;
+        self.learned_high_entry = p.learned_high_entry;
+        self.utility_entropy = p.utility_entropy;
+        self.utility_hazard = p.utility_hazard;
+        self.utility_lotka = p.utility_lotka;
+        self.utility_mpc = p.utility_mpc;
+        if let Some(kf) = p.kf_pressure {
+            self.kf_pressure = kf;
+        }
+        if let Some(kf) = p.kf_swap {
+            self.kf_swap = kf;
+        }
+    }
+
+    /// Reset learned zones to defaults (called when restore quality is stale).
+    pub fn reset_zones(&mut self) {
+        self.learned_mid_entry = 0.30;
+        self.learned_high_entry = 0.50;
     }
 }
 
@@ -553,7 +585,35 @@ pub struct SignalIntelligencePersisted {
     pub hazard: HazardModel,
     /// MPC action effect estimates (learned from live pressure feedback).
     pub mpc: MpcPersisted,
+    /// Learned mid zone entry threshold (default 0.30).
+    #[serde(default = "default_mid_entry")]
+    pub learned_mid_entry: f64,
+    /// Learned high zone entry threshold (default 0.50).
+    #[serde(default = "default_high_entry")]
+    pub learned_high_entry: f64,
+    /// Utility EMA for entropy subsystem.
+    #[serde(default = "default_utility")]
+    pub utility_entropy: f64,
+    /// Utility EMA for hazard subsystem.
+    #[serde(default = "default_utility")]
+    pub utility_hazard: f64,
+    /// Utility EMA for Lotka-Volterra subsystem.
+    #[serde(default = "default_utility")]
+    pub utility_lotka: f64,
+    /// Utility EMA for MPC subsystem.
+    #[serde(default = "default_utility")]
+    pub utility_mpc: f64,
+    /// Kalman filter state for pressure (position + velocity + covariance).
+    #[serde(default)]
+    pub kf_pressure: Option<Kalman1D>,
+    /// Kalman filter state for swap velocity.
+    #[serde(default)]
+    pub kf_swap: Option<Kalman1D>,
 }
+
+fn default_mid_entry() -> f64 { 0.30 }
+fn default_high_entry() -> f64 { 0.50 }
+fn default_utility() -> f64 { 0.5 }
 
 /// Score compuesto de urgencia, combinación ponderada de todas las señales.
 fn compute_urgency(

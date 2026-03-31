@@ -32,6 +32,7 @@ pub mod ioreport;
 pub mod jetsam_control;
 pub mod journal;
 pub mod kalman;
+pub mod learned_state;
 pub mod latency_monitor;
 pub mod llm_inference_mode;
 pub mod llm;

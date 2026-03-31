@@ -366,6 +366,7 @@ while true; do
         cp -f target/release/apollo-optimizerd "$DAEMON"
         chown root:wheel "$DAEMON"
         chmod 755 "$DAEMON"
+        codesign -s - -f "$DAEMON" 2>/dev/null || true
         MD5=$(md5 -q "$DAEMON")
         write_report "BINARY: installed (md5=$MD5)"
 
@@ -373,6 +374,7 @@ while true; do
             cp -f target/release/apollo-optimizerctl "$CTL"
             chown root:wheel "$CTL"
             chmod 755 "$CTL"
+            codesign -s - -f "$CTL" 2>/dev/null || true
         fi
 
         truncate -s 0 /var/log/apollo-optimizer.out.log /var/log/apollo-optimizer.err.log 2>/dev/null || true

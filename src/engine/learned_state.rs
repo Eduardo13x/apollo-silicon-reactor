@@ -1,0 +1,498 @@
+//! Unified persistence layer for all learned state.
+//!
+//! Single file, single struct. To add a new persisted component:
+//! 1. Add a field to [`LearnedState`] with `#[serde(default)]`
+//! 2. Populate it in [`LearnedState::collect`]
+//! 3. Restore it in [`LearnedState::apply`]
+//! That's it. No daemon wiring changes needed.
+//!
+//! ## Self-improvement
+//! Before each persist, `self_improve()` prunes stale data and decays old signals.
+//! After each restore, `validate()` detects corrupt/out-of-range state and resets it.
+//! The `RestoreQualityMonitor` tracks whether restored state helps or hurts,
+//! and can trigger partial resets if the restored state is stale.
+
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
+use crate::engine::predictive_agent::SpecialistAccuracyTracker;
+use crate::engine::signal_intelligence::{SignalIntelligence, SignalIntelligencePersisted};
+
+/// Everything Apollo learns at runtime, in one serializable struct.
+///
+/// All fields use `#[serde(default)]` so old files missing new fields
+/// deserialize cleanly — components fall back to cold-start defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnedState {
+    /// Schema version for forward compatibility.
+    #[serde(default = "default_version")]
+    pub version: u32,
+
+    /// Signal intelligence: hazard model, MPC, Kalman, zones, utility EMAs.
+    #[serde(default)]
+    pub signal_intelligence: Option<SignalIntelligencePersisted>,
+
+    /// Outcome tracker: Bayesian weights, experience memory, causal graph, HRPO.
+    #[serde(default)]
+    pub outcome_tracker: Option<OutcomeTrackerPersisted>,
+
+    /// Specialist voting accuracy weights (4 floats).
+    #[serde(default)]
+    pub specialist_accuracy: Option<SpecialistAccuracyTracker>,
+
+    /// Metadata: how many persist cycles this state has survived.
+    #[serde(default)]
+    pub persist_generations: u32,
+
+    /// Restore quality: effectiveness in the first 50 cycles after last restore.
+    /// Persisted so we can compare across restarts.
+    #[serde(default)]
+    pub last_restore_quality: Option<f64>,
+}
+
+fn default_version() -> u32 { 1 }
+
+// ── Self-improvement constants ──────────────────────────────────────────────
+
+/// Co-occurrence decay factor per persist (×0.90 = 10% decay per save).
+const CO_OCC_DECAY: f64 = 0.90;
+/// Co-occurrence entries below this count after decay are pruned.
+const CO_OCC_PRUNE_THRESHOLD: u32 = 2;
+/// Bayesian weights with fewer than this many throttles AND effectiveness
+/// indistinguishable from prior (0.5) are pruned on persist.
+const WEIGHT_MIN_THROTTLES: u32 = 3;
+/// Experience records cap after compression.
+const EXPERIENCE_CAP: usize = 300;
+
+impl LearnedState {
+    /// Collect snapshots from all live components into a single struct.
+    pub fn collect(
+        signal_intel: &SignalIntelligence,
+        outcome_tracker: &OutcomeTracker,
+        specialist_accuracy: &SpecialistAccuracyTracker,
+    ) -> Self {
+        Self {
+            version: 1,
+            signal_intelligence: Some(signal_intel.to_persisted()),
+            outcome_tracker: Some(outcome_tracker.to_persisted()),
+            specialist_accuracy: Some(specialist_accuracy.clone()),
+            persist_generations: 0,
+            last_restore_quality: None,
+        }
+    }
+
+    /// Apply persisted state back to live components.
+    /// Runs `validate()` first to sanitize corrupt or out-of-range data.
+    /// Each component handles missing data gracefully (keeps defaults).
+    pub fn apply(
+        mut self,
+        signal_intel: &mut SignalIntelligence,
+        outcome_tracker: &mut OutcomeTracker,
+        specialist_accuracy: &mut SpecialistAccuracyTracker,
+    ) {
+        self.validate();
+        if let Some(si) = self.signal_intelligence {
+            signal_intel.restore(si);
+        }
+        if let Some(ot) = self.outcome_tracker {
+            outcome_tracker.restore(ot);
+        }
+        if let Some(sa) = self.specialist_accuracy {
+            *specialist_accuracy = sa;
+        }
+    }
+
+    // ── Self-improvement: called before persist ─────────────────────────
+
+    /// Prune stale data, decay old signals, compress bloated sections.
+    /// Called automatically by `persist_improved()`.
+    pub fn self_improve(&mut self) {
+        self.persist_generations = self.persist_generations.saturating_add(1);
+
+        if let Some(ot) = &mut self.outcome_tracker {
+            // 1. Decay co-occurrence counts — old pairs fade out.
+            for entry in &mut ot.co_occurrence {
+                entry.2 = ((entry.2 as f64) * CO_OCC_DECAY).round() as u32;
+            }
+            ot.co_occurrence.retain(|e| e.2 >= CO_OCC_PRUNE_THRESHOLD);
+
+            // 2. Prune Bayesian weights that carry no signal.
+            //    Processes with <3 throttles and effectiveness ~0.5 (prior)
+            //    are noise — discard them to keep the file lean.
+            ot.weights.retain(|_, w| {
+                w.throttle_count >= WEIGHT_MIN_THROTTLES || w.effective_count > 0
+            });
+
+            // 3. Compress experience memory: keep last EXPERIENCE_CAP records.
+            //    Older records are less relevant as workload patterns shift.
+            if ot.experience_records.len() > EXPERIENCE_CAP {
+                let drain = ot.experience_records.len() - EXPERIENCE_CAP;
+                ot.experience_records.drain(..drain);
+            }
+
+            // 4. Prune HRPO groups with <2 throttles — not enough signal.
+            ot.hop_groups.retain(|_, g| g.throttle_count >= 2);
+        }
+    }
+
+    // ── Validation: called before apply ─────────────────────────────────
+
+    /// Sanitize restored state: detect out-of-range values and reset them
+    /// to cold-start defaults rather than letting corrupt data propagate.
+    pub fn validate(&mut self) {
+        if let Some(si) = &mut self.signal_intelligence {
+            // Zone entries must be in their clamp ranges.
+            si.learned_mid_entry = si.learned_mid_entry.clamp(0.20, 0.40);
+            si.learned_high_entry = si.learned_high_entry.clamp(0.35, 0.60);
+            // Mid must be < high.
+            if si.learned_mid_entry >= si.learned_high_entry {
+                si.learned_mid_entry = 0.30;
+                si.learned_high_entry = 0.50;
+            }
+            // Utility EMAs must be in [0, 1].
+            si.utility_entropy = si.utility_entropy.clamp(0.0, 1.0);
+            si.utility_hazard = si.utility_hazard.clamp(0.0, 1.0);
+            si.utility_lotka = si.utility_lotka.clamp(0.0, 1.0);
+            si.utility_mpc = si.utility_mpc.clamp(0.0, 1.0);
+            // Kalman pressure position should be in [0, 1].
+            if let Some(kf) = &si.kf_pressure {
+                if kf.position() < -0.1 || kf.position() > 1.5 {
+                    si.kf_pressure = None; // let it re-initialize from live data
+                }
+            }
+        }
+
+        if let Some(ot) = &mut self.outcome_tracker {
+            // natural_drift_ema should be small (typical: -0.05 to +0.05).
+            ot.natural_drift_ema = ot.natural_drift_ema.clamp(-0.2, 0.2);
+            // baseline_drop_ema is a probability-like value in [0, 1].
+            ot.baseline_drop_ema = ot.baseline_drop_ema.clamp(0.0, 1.0);
+        }
+
+        if let Some(sa) = &mut self.specialist_accuracy {
+            // All accuracy weights must be in [0, 1].
+            for w in sa.weights_mut() {
+                *w = w.clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    // ── Persist with self-improvement ───────────────────────────────────
+
+    /// Collect + self-improve + persist in one call.
+    /// This is the recommended way to persist — replaces raw `collect().persist()`.
+    pub fn persist_improved(
+        signal_intel: &SignalIntelligence,
+        outcome_tracker: &OutcomeTracker,
+        specialist_accuracy: &SpecialistAccuracyTracker,
+        path: &Path,
+        prev_generations: u32,
+        last_quality: Option<f64>,
+    ) {
+        let mut state = Self::collect(signal_intel, outcome_tracker, specialist_accuracy);
+        state.persist_generations = prev_generations;
+        state.last_restore_quality = last_quality;
+        state.self_improve();
+        state.persist(path);
+    }
+
+    /// Persist to disk (best-effort, never panics).
+    pub fn persist(&self, path: &Path) {
+        if let Ok(json) = serde_json::to_string(self) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    /// Load from disk. Returns None on any error (cold start is safe).
+    pub fn load(path: &Path) -> Option<Self> {
+        let data = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+}
+
+// ── Restore Quality Monitor ─────────────────────────────────────────────────
+
+/// Tracks whether restored state is helping or hurting.
+///
+/// Usage: create after restore, call `observe()` each cycle for the first 50 cycles.
+/// After 50 cycles, `verdict()` returns the quality score.
+/// If quality < cold-start baseline (0.5), the restored state was stale — the daemon
+/// should partially reset (e.g., clear experience memory, reset zones to defaults).
+pub struct RestoreQualityMonitor {
+    /// Number of cycles observed since restore.
+    cycles: u32,
+    /// Number of effective throttles in the observation window.
+    effective: u32,
+    /// Total throttles resolved in the observation window.
+    resolved: u32,
+    /// Whether this monitor has already fired its verdict.
+    fired: bool,
+}
+
+/// Observation window: 50 cycles (~100s at 2s/cycle).
+const QUALITY_WINDOW: u32 = 50;
+/// If post-restore effectiveness is below this, restored state is hurting.
+const QUALITY_THRESHOLD: f64 = 0.35;
+
+impl RestoreQualityMonitor {
+    /// Create a new monitor. Call right after `LearnedState::apply()`.
+    pub fn new() -> Self {
+        Self {
+            cycles: 0,
+            effective: 0,
+            resolved: 0,
+            fired: false,
+        }
+    }
+
+    /// Feed an outcome observation. Call each cycle with the batch results.
+    pub fn observe(&mut self, batch_effective: u32, batch_resolved: u32) {
+        if self.fired {
+            return;
+        }
+        self.cycles += 1;
+        self.effective += batch_effective;
+        self.resolved += batch_resolved;
+    }
+
+    /// Check if the observation window is complete and return a verdict.
+    /// Returns `Some(quality)` once, where quality is the effectiveness ratio.
+    /// Returns `None` if still observing or already fired.
+    pub fn verdict(&mut self) -> Option<RestoreVerdict> {
+        if self.fired || self.cycles < QUALITY_WINDOW {
+            return None;
+        }
+        self.fired = true;
+        let quality = if self.resolved < 5 {
+            // Not enough data to judge — assume OK.
+            return Some(RestoreVerdict { quality: 0.5, stale: false });
+        } else {
+            (self.effective as f64 + 1.0) / (self.resolved as f64 + 2.0)
+        };
+        Some(RestoreVerdict {
+            quality,
+            stale: quality < QUALITY_THRESHOLD,
+        })
+    }
+
+    /// True if the monitor has already produced a verdict.
+    pub fn is_done(&self) -> bool {
+        self.fired
+    }
+}
+
+/// Result of the restore quality assessment.
+#[derive(Debug, Clone)]
+pub struct RestoreVerdict {
+    /// Effectiveness ratio [0, 1] in the first 50 cycles post-restore.
+    pub quality: f64,
+    /// True if restored state appears stale (quality < threshold).
+    /// Daemon should partially reset learned state.
+    pub stale: bool,
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::outcome_tracker::{ExperienceRecord, HopGroupWeight, PatternWeight, WorkloadHop};
+    use std::collections::HashMap;
+
+    fn make_ot_persisted() -> OutcomeTrackerPersisted {
+        let mut weights = HashMap::new();
+        // Process with signal: keep.
+        weights.insert("brave".to_string(), PatternWeight { throttle_count: 10, effective_count: 7 });
+        // Process without signal: prune (1 throttle, 0 effective).
+        weights.insert("noise".to_string(), PatternWeight { throttle_count: 1, effective_count: 0 });
+
+        let co_occurrence = vec![
+            ("a".into(), "b".into(), 20),  // will decay to 18, kept
+            ("c".into(), "d".into(), 2),   // will decay to ~2, borderline
+            ("e".into(), "f".into(), 1),   // will decay to ~1, pruned
+        ];
+
+        let mut experience_records = Vec::new();
+        for i in 0..400 {
+            experience_records.push(ExperienceRecord {
+                process_name: format!("proc_{}", i % 10),
+                pressure_at_action: 0.6,
+                pressure_drop: 0.03,
+                effective: i % 3 == 0,
+            });
+        }
+
+        OutcomeTrackerPersisted {
+            weights,
+            total_effective: 50,
+            total_resolved: 100,
+            baseline_drop_ema: 0.25,
+            baseline_samples: 100,
+            experience_records,
+            co_occurrence,
+            natural_drift_ema: 0.01,
+            hop_groups: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn self_improve_decays_co_occurrence() {
+        let mut state = LearnedState {
+            version: 1,
+            signal_intelligence: None,
+            outcome_tracker: Some(make_ot_persisted()),
+            specialist_accuracy: None,
+            persist_generations: 0,
+            last_restore_quality: None,
+        };
+        state.self_improve();
+        let ot = state.outcome_tracker.as_ref().unwrap();
+        // (a, b, 20) → 18 after decay, kept.
+        assert!(ot.co_occurrence.iter().any(|e| e.0 == "a" && e.2 == 18));
+        // (e, f, 1) → ~1 after decay, pruned.
+        assert!(!ot.co_occurrence.iter().any(|e| e.0 == "e"));
+    }
+
+    #[test]
+    fn self_improve_prunes_noisy_weights() {
+        let mut state = LearnedState {
+            version: 1,
+            signal_intelligence: None,
+            outcome_tracker: Some(make_ot_persisted()),
+            specialist_accuracy: None,
+            persist_generations: 0,
+            last_restore_quality: None,
+        };
+        state.self_improve();
+        let ot = state.outcome_tracker.as_ref().unwrap();
+        assert!(ot.weights.contains_key("brave"), "high-signal weight kept");
+        assert!(!ot.weights.contains_key("noise"), "no-signal weight pruned");
+    }
+
+    #[test]
+    fn self_improve_caps_experience() {
+        let mut state = LearnedState {
+            version: 1,
+            signal_intelligence: None,
+            outcome_tracker: Some(make_ot_persisted()),
+            specialist_accuracy: None,
+            persist_generations: 0,
+            last_restore_quality: None,
+        };
+        assert_eq!(state.outcome_tracker.as_ref().unwrap().experience_records.len(), 400);
+        state.self_improve();
+        assert_eq!(state.outcome_tracker.as_ref().unwrap().experience_records.len(), EXPERIENCE_CAP);
+    }
+
+    #[test]
+    fn self_improve_increments_generations() {
+        let mut state = LearnedState {
+            version: 1,
+            signal_intelligence: None,
+            outcome_tracker: None,
+            specialist_accuracy: None,
+            persist_generations: 5,
+            last_restore_quality: None,
+        };
+        state.self_improve();
+        assert_eq!(state.persist_generations, 6);
+    }
+
+    #[test]
+    fn validate_clamps_zones() {
+        let si = SignalIntelligencePersisted {
+            hazard: crate::engine::hazard_model::HazardModel::new(),
+            mpc: crate::engine::mpc_horizon::MpcController::new(3, 0.5).to_persisted(),
+            learned_mid_entry: 0.99,  // way out of range
+            learned_high_entry: 0.10, // below mid
+            utility_entropy: 5.0,     // out of [0,1]
+            utility_hazard: -1.0,
+            utility_lotka: 0.7,
+            utility_mpc: 0.3,
+            kf_pressure: None,
+            kf_swap: None,
+        };
+        let mut state = LearnedState {
+            version: 1,
+            signal_intelligence: Some(si),
+            outcome_tracker: None,
+            specialist_accuracy: None,
+            persist_generations: 0,
+            last_restore_quality: None,
+        };
+        state.validate();
+        let si = state.signal_intelligence.as_ref().unwrap();
+        // Zones reset to defaults because mid >= high after clamping.
+        assert_eq!(si.learned_mid_entry, 0.30);
+        assert_eq!(si.learned_high_entry, 0.50);
+        // Utilities clamped.
+        assert_eq!(si.utility_entropy, 1.0);
+        assert_eq!(si.utility_hazard, 0.0);
+    }
+
+    #[test]
+    fn validate_clamps_drift() {
+        let ot = OutcomeTrackerPersisted {
+            weights: HashMap::new(),
+            total_effective: 0,
+            total_resolved: 0,
+            baseline_drop_ema: 2.0,    // out of range
+            baseline_samples: 0,
+            experience_records: vec![],
+            co_occurrence: vec![],
+            natural_drift_ema: -0.5,   // out of range
+            hop_groups: HashMap::new(),
+        };
+        let mut state = LearnedState {
+            version: 1,
+            signal_intelligence: None,
+            outcome_tracker: Some(ot),
+            specialist_accuracy: None,
+            persist_generations: 0,
+            last_restore_quality: None,
+        };
+        state.validate();
+        let ot = state.outcome_tracker.as_ref().unwrap();
+        assert_eq!(ot.baseline_drop_ema, 1.0);
+        assert_eq!(ot.natural_drift_ema, -0.2);
+    }
+
+    #[test]
+    fn restore_quality_monitor_detects_stale() {
+        let mut monitor = RestoreQualityMonitor::new();
+        // Simulate 50 cycles of terrible effectiveness (2/50 effective).
+        for i in 0..QUALITY_WINDOW {
+            let eff = if i < 2 { 1 } else { 0 };
+            monitor.observe(eff, 1);
+        }
+        let verdict = monitor.verdict().expect("should have verdict");
+        assert!(verdict.stale, "low effectiveness should be flagged as stale");
+        assert!(verdict.quality < QUALITY_THRESHOLD);
+    }
+
+    #[test]
+    fn restore_quality_monitor_approves_good_state() {
+        let mut monitor = RestoreQualityMonitor::new();
+        // Simulate 50 cycles of good effectiveness (40/50 effective).
+        for i in 0..QUALITY_WINDOW {
+            let eff = if i < 40 { 1 } else { 0 };
+            monitor.observe(eff, 1);
+        }
+        let verdict = monitor.verdict().expect("should have verdict");
+        assert!(!verdict.stale, "good effectiveness should not be stale");
+        assert!(verdict.quality > 0.7);
+    }
+
+    #[test]
+    fn restore_quality_fires_only_once() {
+        let mut monitor = RestoreQualityMonitor::new();
+        for _ in 0..QUALITY_WINDOW {
+            monitor.observe(1, 1);
+        }
+        assert!(monitor.verdict().is_some());
+        assert!(monitor.verdict().is_none(), "second call should return None");
+        assert!(monitor.is_done());
+    }
+}
