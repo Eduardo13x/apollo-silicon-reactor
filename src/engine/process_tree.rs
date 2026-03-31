@@ -96,6 +96,9 @@ pub struct ProcessTree {
 
     /// root_pid -> AppGroup.  One entry per root application.
     groups: HashMap<u32, AppGroup>,
+
+    /// pid -> cpu_usage snapshot (from ProcessEntry input).
+    cpu_map: HashMap<u32, f32>,
 }
 
 struct EntryData {
@@ -159,10 +162,17 @@ impl ProcessTree {
             }
         }
 
+        // Build cpu_map for idle_children queries.
+        let cpu_map: HashMap<u32, f32> = entries
+            .iter()
+            .map(|e| (e.pid, e.cpu_usage))
+            .collect();
+
         Self {
             entries: entry_map,
             root_map,
             groups,
+            cpu_map,
         }
     }
 
@@ -262,6 +272,37 @@ impl ProcessTree {
     /// Check if a PID is the root of its app group (not a child).
     pub fn is_root(&self, pid: u32) -> bool {
         self.root_map.get(&pid) == Some(&pid)
+    }
+
+    /// Returns child PIDs of `parent_pid` that are idle:
+    /// - cpu_usage < `cpu_threshold` (not actively computing)
+    /// - not present in `active_set` (no power assertion, no open sockets, etc.)
+    ///
+    /// Used for subprocess-selective freeze: freeze idle renderer/worker children
+    /// while leaving active audio workers, download helpers, and visible renderers
+    /// untouched.
+    ///
+    /// Does NOT include the parent itself — only direct children.
+    pub fn idle_children(
+        &self,
+        parent_pid: u32,
+        cpu_threshold: f32,
+        active_set: &std::collections::HashSet<u32>,
+    ) -> Vec<u32> {
+        self.entries
+            .iter()
+            .filter(|(&child_pid, data)| {
+                data.ppid == parent_pid
+                    && child_pid != parent_pid
+                    && !active_set.contains(&child_pid)
+                    && self
+                        .cpu_map
+                        .get(&child_pid)
+                        .map(|&cpu| cpu < cpu_threshold)
+                        .unwrap_or(true) // unknown CPU = treat as idle
+            })
+            .map(|(&pid, _)| pid)
+            .collect()
     }
 }
 

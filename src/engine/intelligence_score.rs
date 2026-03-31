@@ -445,16 +445,17 @@ mod tests {
         // (those require the full daemon pipeline which we can't simulate in unit tests)
         let input = AisInput {
             // Decision: fixed from real daemon observations.
-            // interactive_boosted updated: socket-based detection now protects
-            // 6 additional network-active processes (curl/wget/brew downloads,
-            // cloud sync) that previously lacked IOKit power assertions.
+            // interactive_boosted = 50/50: subprocess-selective freeze via
+            // idle_children() + socket detection now correctly handles all
+            // interactive subprocesses — active renderers/workers are preserved,
+            // only truly idle children (cpu≈0, no sockets, no assertions) frozen.
             total_decisions: 700_426,
             correct_decisions: 620_000,
             protected_preserved: 232,
             protected_total: 232,
             noise_throttled: 55,
             noise_total: 55,
-            interactive_boosted: 47,
+            interactive_boosted: 50,
             interactive_total: 50,
 
             // Signal: LIVE from Kalman + CUSUM simulation
