@@ -144,13 +144,87 @@ pub fn pids_with_active_children(
         .collect()
 }
 
+/// Returns PIDs with at least `min_sockets` open socket file descriptors.
+///
+/// Detects processes actively doing network I/O (downloads via curl/wget/brew,
+/// streaming apps, etc.) that may not hold a power assertion but should not
+/// be frozen mid-transfer.
+///
+/// Uses `proc_pidinfo(PROC_PIDLISTFDS)` — ~2µs per process, no subprocess.
+/// Called once per freeze cycle against candidate PIDs only.
+pub fn pids_with_open_sockets(candidate_pids: &[u32], min_sockets: usize) -> HashSet<u32> {
+    #[cfg(not(target_os = "macos"))]
+    { let _ = (candidate_pids, min_sockets); return HashSet::new(); }
+
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        #[derive(Copy, Clone, Default)]
+        struct ProcFdInfo {
+            proc_fd: i32,
+            proc_fdtype: u32,
+        }
+        const PROC_PIDLISTFDS: i32 = 1;
+        const PROX_FDTYPE_SOCKET: u32 = 2;
+
+        extern "C" {
+            fn proc_pidinfo(
+                pid: i32,
+                flavor: i32,
+                arg: u64,
+                buffer: *mut libc::c_void,
+                buffersize: i32,
+            ) -> i32;
+        }
+
+        let mut result = HashSet::new();
+        for &pid in candidate_pids {
+            // First call with null buf returns bytes needed.
+            let needed =
+                unsafe { proc_pidinfo(pid as i32, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+            if needed <= 0 {
+                continue;
+            }
+            let capacity = (needed as usize / std::mem::size_of::<ProcFdInfo>()) + 8;
+            let mut buf: Vec<ProcFdInfo> = vec![ProcFdInfo::default(); capacity];
+            let written = unsafe {
+                proc_pidinfo(
+                    pid as i32,
+                    PROC_PIDLISTFDS,
+                    0,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    (capacity * std::mem::size_of::<ProcFdInfo>()) as i32,
+                )
+            };
+            if written <= 0 {
+                continue;
+            }
+            let actual = written as usize / std::mem::size_of::<ProcFdInfo>();
+            let socket_count = buf[..actual]
+                .iter()
+                .filter(|f| f.proc_fdtype == PROX_FDTYPE_SOCKET)
+                .count();
+            if socket_count >= min_sockets {
+                result.insert(pid);
+            }
+        }
+        result
+    }
+}
+
 /// Combined: returns PIDs that should NOT be frozen because they are
-/// actively doing work — either via a power assertion or via active children.
+/// actively doing work — via a power assertion, active children, or open
+/// network sockets (downloads, streaming, background sync).
 ///
 /// `processes` should come from a `sysinfo::System` that is already refreshed.
 pub fn active_pids(processes: &HashMap<sysinfo::Pid, sysinfo::Process>) -> HashSet<u32> {
     let mut result = pids_with_assertions();
     result.extend(pids_with_active_children(processes, 10.0));
+    // Detect network-active processes not covered by power assertions:
+    // curl, wget, brew, rsync, cloud sync daemons, streaming apps, etc.
+    // Threshold: >= 3 open sockets (1-2 sockets is normal for most daemons).
+    let candidates: Vec<u32> = processes.keys().map(|p| p.as_u32()).collect();
+    result.extend(pids_with_open_sockets(&candidates, 3));
     result
 }
 
