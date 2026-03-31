@@ -45,7 +45,7 @@ use apollo_optimizer::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerStat
 use apollo_optimizer::engine::holt_winters::HoltWinters;
 use apollo_optimizer::engine::hw_bayes::HwFeatures;
 use apollo_optimizer::engine::hw_predictor::{sample_hw_pressure, HwPressure};
-use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
+use apollo_optimizer::engine::iokit_sensors::{HardwareSnapshot, ThermalState};
 use apollo_optimizer::engine::coalition::CoalitionTracker;
 use apollo_optimizer::engine::ioreport::IOReportReader;
 use apollo_optimizer::engine::jetsam_control;
@@ -83,6 +83,7 @@ use apollo_optimizer::engine::safety::{
     behavioral_protection_score, critical_background_processes, enforce_limits_with_budget,
     infrastructure_processes, matches_dev_runtime, protected_processes,
 };
+use apollo_optimizer::engine::learned_state::{LearnedState, RestoreQualityMonitor};
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
 use apollo_optimizer::engine::smc_reader::SmcReader;
 use apollo_optimizer::engine::swap_predictor::SwapPredictor;
@@ -110,9 +111,9 @@ use apollo_optimizer::engine::workload_classifier::{
 use apollo_optimizer::engine::daemon_helpers::{
     audit_log, battery_pressure_boost, compute_p95, frozen_state_path,
     governor_state_path, holt_winters_path, hop_groups_path, journal_path, kill_switch_path,
-    load_frozen_state, load_governor_state, load_wake_state, markov_path, merge_seed_into,
-    metrics_path, overflow_history_path, parse_profile, pid_start_time, predictive_agent_path,
-    rl_threshold_path, signal_intelligence_path, socket_path,
+    learned_state_path, load_frozen_state, load_governor_state, load_wake_state, markov_path,
+    merge_seed_into, metrics_path, overflow_history_path, parse_profile, pid_start_time,
+    predictive_agent_path, rl_threshold_path, signal_intelligence_path, socket_path,
     should_rotate_oldest, should_unfreeze, spotlight_set_indexing, timeline_path, unfreeze_pids,
     wake_state_path, write_frozen_state, append_timeline,
     write_governor_state, write_metrics, write_wake_state, WakeRuntimeState,
@@ -896,6 +897,21 @@ fn main() -> anyhow::Result<()> {
             {
                 signal_intel.restore(si_persisted);
             }
+            // Unified persistence layer: restore all learned state from a single file.
+            let ls_path = std::path::Path::new(learned_state_path());
+            let mut persist_generations: u32 = 0;
+            let mut last_restore_quality: Option<f64> = None;
+            let mut restore_monitor = RestoreQualityMonitor::new();
+            if let Some(learned) = LearnedState::load(ls_path) {
+                persist_generations = learned.persist_generations;
+                last_restore_quality = learned.last_restore_quality;
+                learned.apply(
+                    &mut signal_intel,
+                    &mut outcome_tracker,
+                    &mut specialist_accuracy,
+                );
+                restore_monitor = RestoreQualityMonitor::new();
+            }
             // Telemetry logger: ring-buffer data collector for Transformer training.
             // Telemetry logger + Transformer disabled: classical stack is sufficient.
             // Code preserved for future evaluation.
@@ -1589,6 +1605,16 @@ fn main() -> anyhow::Result<()> {
                             m.iokit_e_cluster_temp = hw.temps.e_cluster_celsius;
                             m.iokit_package_watts = hw.power.package_watts;
                         }
+                        // Fix: wire SMC thermal_state → thermal_level_real every cycle.
+                        // Previously thermal_level_real only updated on rare OS thermal events
+                        // (reactor line ~427), leaving it "unknown" indefinitely on idle systems.
+                        let level_str = match hw.thermal_state {
+                            ThermalState::Normal => "nominal",
+                            ThermalState::Moderate => "moderate",
+                            ThermalState::Severe => "serious",
+                            ThermalState::Critical => "critical",
+                        };
+                        *state.thermal_level_real.lock_recover() = level_str.to_string();
                         *state.last_hw_snapshot.lock_recover() = Some(hw);
                     } else {
                         state.metrics.lock_recover().iokit_errors = smc_reader.error_count();
@@ -4217,6 +4243,18 @@ fn main() -> anyhow::Result<()> {
                             policy.pattern_weights.insert(name.clone(), weight.clone());
                         }
                     }
+                    // Restore quality monitor: track post-restore effectiveness.
+                    if !restore_monitor.is_done() {
+                        let batch_eff = batch.effective_names.len() as u32;
+                        let batch_res = (batch.effective_names.len() + batch.low_value_names.len()) as u32;
+                        restore_monitor.observe(batch_eff, batch_res);
+                        if let Some(verdict) = restore_monitor.verdict() {
+                            last_restore_quality = Some(verdict.quality);
+                            if verdict.stale {
+                                signal_intel.reset_zones();
+                            }
+                        }
+                    }
                 }
 
                 // Lifelong zone learning: feed outcome effectiveness to router zones.
@@ -4274,6 +4312,14 @@ fn main() -> anyhow::Result<()> {
                 if cycle_count % 100 == 0 {
                     signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
                     outcome_tracker.persist_hop_groups(std::path::Path::new(hop_groups_path()));
+                    LearnedState::persist_improved(
+                        &signal_intel,
+                        &outcome_tracker,
+                        &specialist_accuracy,
+                        ls_path,
+                        persist_generations,
+                        last_restore_quality,
+                    );
                     // Causal graph observability: log solid/weak links discovered.
                     let solid = causal_graph.solid_count();
                     let total = causal_graph.edge_count();
@@ -4645,6 +4691,14 @@ fn main() -> anyhow::Result<()> {
             focus_markov.persist();
             holt_winters.persist(&hw_path);
             signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
+            LearnedState::persist_improved(
+                &signal_intel,
+                &outcome_tracker,
+                &specialist_accuracy,
+                ls_path,
+                persist_generations,
+                last_restore_quality,
+            );
 
             // Revert sysctls to defaults on shutdown.
             {
