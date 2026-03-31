@@ -258,6 +258,32 @@ impl WorkloadClassifier {
             sources.push(ClassifierSource::ProcessMix(mix_count));
         }
 
+        // 5. Terminal context upgrade: Terminal/iTerm/Warp + build tools → Coding.
+        //
+        // A terminal with rustc, cargo, nvim, clang etc. running is a coding session,
+        // not a generic command-line session.  The foreground-app signal scores Terminal
+        // at 2.0 for CommandLine; we add 1.6 for Coding when ≥1 toolchain process is
+        // detected, which tips the balance without hard-coding a special case.
+        const TERMINAL_APPS: &[&str] = &["Terminal", "iTerm", "Warp", "Alacritty", "kitty", "Hyper"];
+        const CODING_TOOLS: &[&str] = &[
+            "rustc", "cargo", "clang", "gcc", "make", "cmake",
+            "nvim", "vim", "emacs", "python3", "node", "go", "javac",
+        ];
+        if let Some(fg) = foreground_app {
+            let is_terminal = TERMINAL_APPS.iter().any(|t| fg.contains(t));
+            if is_terminal {
+                let tool_count = all_proc_names
+                    .iter()
+                    .filter(|p| CODING_TOOLS.iter().any(|t| p.contains(t)))
+                    .count();
+                if tool_count >= 1 {
+                    *scores.entry(WorkloadType::Coding).or_insert(0.0) +=
+                        1.6 + 0.10 * tool_count as f32;
+                    sources.push(ClassifierSource::ProcessMix(tool_count as u32));
+                }
+            }
+        }
+
         // Fusión con Gaussian NB de hardware (si hay features disponibles).
         // Suma el log-posterior normalizado como boost adicional al score de texto.
         if let Some(hw_features) = hw {
