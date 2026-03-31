@@ -77,13 +77,28 @@ pub struct SystemCollector {
     networks: Networks,
     prev_swap_used_bytes: Option<u64>,
     prev_swap_at: Option<Instant>,
+    /// Tracks whether refresh_processes has ever hung (>5s).
+    pub process_refresh_hung: bool,
+    /// Number of process refresh cycles skipped (startup grace).
+    pub process_refresh_skip_count: u32,
+    /// Light call count (cycles since creation, for startup grace period).
+    pub light_call_count: u32,
 }
 
 #[allow(clippy::new_without_default, dead_code)]
 impl SystemCollector {
     pub fn new() -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        // Use System::new() + targeted refresh instead of System::new_all()
+        // to avoid the expensive initial process enumeration at startup.
+        // refresh_processes() is called once here to pre-seed the process list so
+        // that top_processes is non-empty from cycle 1 (fixes startup blind spot).
+        // The 3-cycle grace period still skips refresh_processes on each cycle to
+        // avoid double-refresh overhead, but the initial seed ensures decisions
+        // are never made with an empty process table.
+        let mut sys = System::new();
+        sys.refresh_cpu();
+        sys.refresh_memory();
+        sys.refresh_processes();
         let disks = Disks::new_with_refreshed_list();
         let networks = Networks::new_with_refreshed_list();
         Self {
@@ -92,6 +107,9 @@ impl SystemCollector {
             networks,
             prev_swap_used_bytes: None,
             prev_swap_at: None,
+            process_refresh_hung: false,
+            process_refresh_skip_count: 0,
+            light_call_count: 0,
         }
     }
 
@@ -100,8 +118,16 @@ impl SystemCollector {
     }
 
     pub fn collect_snapshot(&mut self) -> SystemSnapshot {
-        // Refresh system stats
-        self.sys.refresh_all();
+        // Refresh system stats — skip process refresh for first 3 cycles
+        // (startup grace period: avoids expensive initial enumeration).
+        self.light_call_count += 1;
+        if self.light_call_count <= 3 {
+            self.process_refresh_skip_count += 1;
+            self.sys.refresh_cpu();
+            self.sys.refresh_memory();
+        } else {
+            self.sys.refresh_all();
+        }
         self.disks.refresh_list();
         self.networks.refresh();
 
