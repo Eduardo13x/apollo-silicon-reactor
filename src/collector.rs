@@ -83,6 +83,10 @@ pub struct SystemCollector {
     pub process_refresh_skip_count: u32,
     /// Light call count (cycles since creation, for startup grace period).
     pub light_call_count: u32,
+    /// EMA state for compressor_pressure smoothing (α=0.25).
+    /// Applied before the MAX fusion with kernel_pressure to reduce noise
+    /// before it enters the Kalman filter in signal_intelligence.
+    compressor_ema: f64,
 }
 
 #[allow(clippy::new_without_default, dead_code)]
@@ -110,6 +114,7 @@ impl SystemCollector {
             process_refresh_hung: false,
             process_refresh_skip_count: 0,
             light_call_count: 0,
+            compressor_ema: 0.0,
         }
     }
 
@@ -143,8 +148,15 @@ impl SystemCollector {
         let used_swap = self.sys.used_swap();
 
         // Pressure (public commands, no private APIs)
-        let (mem_pressure, swap_used_bytes, swap_total_bytes, compressor_pressure) =
+        let (_, swap_used_bytes, swap_total_bytes, compressor_pressure_raw, kernel_pressure) =
             collect_pressure_facts();
+        // EMA smoothing on compressor_pressure (α=0.25) to remove single-sample noise
+        // before MAX fusion. Kalman in signal_intelligence still smooths the fused value,
+        // but pre-smoothing here reduces the noise it has to compensate for (less lag).
+        let alpha = 0.25f64;
+        let compressor_pressure = self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
+        self.compressor_ema = compressor_pressure;
+        let mem_pressure = kernel_pressure.max(compressor_pressure);
         let nowi = Instant::now();
         let swap_delta_bps = match (self.prev_swap_used_bytes, self.prev_swap_at) {
             (Some(prev_used), Some(prev_at)) => {
@@ -245,8 +257,12 @@ impl SystemCollector {
         let total_swap = self.sys.total_swap();
         let used_swap = self.sys.used_swap();
 
-        let (mem_pressure, swap_used_bytes, swap_total_bytes, compressor_pressure) =
+        let (_, swap_used_bytes, swap_total_bytes, compressor_pressure_raw, kernel_pressure) =
             collect_pressure_facts();
+        let alpha = 0.25f64;
+        let compressor_pressure = self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
+        self.compressor_ema = compressor_pressure;
+        let mem_pressure = kernel_pressure.max(compressor_pressure);
         let nowi = Instant::now();
         let swap_delta_bps = match (self.prev_swap_used_bytes, self.prev_swap_at) {
             (Some(prev_used), Some(prev_at)) => {
@@ -325,8 +341,10 @@ fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
     }
 }
 
-/// Returns (memory_pressure, swap_used_bytes, swap_total_bytes, compressor_pressure).
-fn collect_pressure_facts() -> (f64, u64, u64, f64) {
+/// Returns (memory_pressure_fused, swap_used_bytes, swap_total_bytes, compressor_pressure_raw, kernel_pressure).
+/// `memory_pressure_fused` = MAX(kernel_pressure, compressor_pressure_raw) — callers that want
+/// EMA-smoothed compressor should recompute the fusion with the smoothed value.
+fn collect_pressure_facts() -> (f64, u64, u64, f64, f64) {
     // kern.memorystatus_level: 0–100 (% memory available).
     // Faster than spawning /usr/bin/memory_pressure — direct kernel read.
     let kernel_pressure = sysctl_u64(c"kern.memorystatus_level")
@@ -444,5 +462,6 @@ fn collect_pressure_facts() -> (f64, u64, u64, f64) {
         swap_used_bytes,
         swap_total_bytes,
         compressor_pressure,
+        kernel_pressure,
     )
 }
