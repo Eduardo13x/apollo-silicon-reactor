@@ -151,14 +151,14 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
     match req {
         DaemonRequest::GetStatus => {
             let now = Utc::now();
-            let profile = state.policy_group.lock_recover().profile;
-            let latency_target = state.policy_group.lock_recover().latency_target;
+            let profile = *state.profile.lock_recover();
+            let latency_target = *state.latency_target.lock_recover();
             // Non-blocking metrics: try_lock avoids stalling when the main loop
             // holds the metrics lock during its end-of-cycle update (~100 lines).
             // Fall back to default metrics if busy — dashboard shows stale data
             // briefly, but never hangs.
-            let metrics = match state.metrics_group.try_lock() {
-                Ok(m) => m.metrics.clone(),
+            let metrics = match state.metrics.try_lock() {
+                Ok(m) => m.clone(),
                 Err(_) => {
                     // Lock held by main loop — read last-written snapshot from disk.
                     // This is always ≤1 cycle old (written at end of each cycle).
@@ -168,30 +168,30 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                     }
                 }
             };
-            let blockers = state.process_group.lock_recover().last_blockers.clone();
-            let thermal_state = state.metrics_group.lock_recover().thermal_state.clone();
-            let throttle_level = state.metrics_group.lock_recover().throttle_level.clone();
+            let blockers = state.last_blockers.lock_recover().clone();
+            let thermal_state = state.thermal_state.lock_recover().clone();
+            let throttle_level = state.throttle_level.lock_recover().clone();
             // Snapshot governor + wake_state, then DROP locks before build_llm_status.
             let (auto_profile_enabled, base_profile, override_active, override_expires_at,
                  transition_reason) = {
-                let gov = state.policy_group.lock_recover();
-                (gov.governor.auto_profile_enabled, gov.governor.base_profile,
-                 gov.governor.manual_override.is_some(),
-                 gov.governor.manual_override.as_ref().map(|o| o.expires_at),
-                 gov.governor.transition_reason.clone())
+                let gov = state.governor.lock_recover();
+                (gov.auto_profile_enabled, gov.base_profile,
+                 gov.manual_override.is_some(),
+                 gov.manual_override.as_ref().map(|o| o.expires_at),
+                 gov.transition_reason.clone())
             };
             let (grace_active, grace_remaining, last_wake_at, post_wake_policy) = {
-                let ws = state.process_group.lock_recover();
-                let ga = ws.wake_state.post_wake_grace_until.map(|t| t > now).unwrap_or(false);
-                let gr = ws.wake_state.post_wake_grace_until
+                let ws = state.wake_state.lock_recover();
+                let ga = ws.post_wake_grace_until.map(|t| t > now).unwrap_or(false);
+                let gr = ws.post_wake_grace_until
                     .and_then(|t| (t - now).to_std().ok())
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                (ga, gr, ws.wake_state.last_wake_at, ws.wake_state.post_wake_policy.clone())
+                (ga, gr, ws.last_wake_at, ws.post_wake_policy.clone())
             };
             let (reactor_mode, reactor_health) = {
-                let rs = state.metrics_group.lock_recover();
-                (rs.reactor_status.mode.clone(), rs.reactor_status.health.clone())
+                let rs = state.reactor_status.lock_recover();
+                (rs.mode.clone(), rs.health.clone())
             };
             let llm = build_llm_status(state);
             let status = DaemonStatus {
@@ -219,12 +219,12 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             };
             DaemonResponse::Status(status)
         }
-        DaemonRequest::GetMetrics => DaemonResponse::Metrics(state.metrics_group.lock_recover().metrics.clone()),
+        DaemonRequest::GetMetrics => DaemonResponse::Metrics(state.metrics.lock_recover().clone()),
         DaemonRequest::GetTopBlockers => {
-            DaemonResponse::TopBlockers(state.process_group.lock_recover().last_blockers.clone())
+            DaemonResponse::TopBlockers(state.last_blockers.lock_recover().clone())
         }
         DaemonRequest::GetProfileTimeline => {
-            DaemonResponse::ProfileTimeline(state.policy_group.lock_recover().timeline.iter().cloned().collect())
+            DaemonResponse::ProfileTimeline(state.timeline.lock_recover().iter().cloned().collect())
         }
         DaemonRequest::GetCapabilities => DaemonResponse::Capabilities(detect_capabilities()),
         DaemonRequest::SetProfile {
@@ -232,7 +232,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             ttl_minutes,
         } => {
             let ttl = ttl_minutes.unwrap_or(20).clamp(1, 1440);
-            state.policy_group.lock_recover().governor.set_manual_override(
+            state.governor.lock_recover().set_manual_override(
                 profile,
                 ttl,
                 "cli-set-profile".to_string(),
@@ -240,15 +240,15 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             DaemonResponse::Ok
         }
         DaemonRequest::SetLatencyTarget { target } => {
-            state.policy_group.lock_recover().latency_target = target;
+            *state.latency_target.lock_recover() = target;
             DaemonResponse::Ok
         }
         DaemonRequest::SetAutoProfile { enabled } => {
-            state.policy_group.lock_recover().governor.set_auto_profile(enabled);
+            state.governor.lock_recover().set_auto_profile(enabled);
             DaemonResponse::Ok
         }
         DaemonRequest::ClearProfileOverride => {
-            state.policy_group.lock_recover().governor.clear_manual_override();
+            state.governor.lock_recover().clear_manual_override();
             DaemonResponse::Ok
         }
         DaemonRequest::Restore => {
@@ -276,7 +276,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 }
             }
             let _ = File::create(ks);
-            state.policy_group.lock_recover().governor.set_auto_profile(false);
+            state.governor.lock_recover().set_auto_profile(false);
             let mut frozen_state = state.frozen_state.lock_recover();
             for pid in frozen_state.keys() {
                 unsafe {
@@ -297,12 +297,12 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 format!("socket_exists: {}", Path::new(socket_path()).exists()),
                 format!("kill_switch: {}", Path::new(kill_switch_path()).exists()),
                 {
-                    let rs = state.metrics_group.lock_recover();
-                    format!("reactor_mode: {}", rs.reactor_status.mode)
+                    let rs = state.reactor_status.lock_recover();
+                    format!("reactor_mode: {}", rs.mode)
                 },
                 {
-                    let rs = state.metrics_group.lock_recover();
-                    format!("reactor_health: {}", rs.reactor_status.health)
+                    let rs = state.reactor_status.lock_recover();
+                    format!("reactor_health: {}", rs.health)
                 },
                 format!(
                     "swapusage_readable: {}",
@@ -318,13 +318,13 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
         DaemonRequest::GetLlmStatus => DaemonResponse::LlmStatus(build_llm_status(state)),
         DaemonRequest::UsageTop { limit } => {
             let limit = limit.unwrap_or(10).clamp(3, 30);
-            let model = state.usage_group.lock_recover();
-            let report = model.usage_model.top_report(limit);
+            let model = state.usage_model.lock_recover();
+            let report = model.top_report(limit);
             DaemonResponse::Usage(UsageResponse::Top(report))
         }
         DaemonRequest::UsageExplain { name } => {
-            let model = state.usage_group.lock_recover();
-            match model.usage_model.entry_summary(&name) {
+            let model = state.usage_model.lock_recover();
+            match model.entry_summary(&name) {
                 Some(s) => DaemonResponse::Usage(UsageResponse::Explain(s)),
                 None => DaemonResponse::Error {
                     message: "usage entry not found".to_string(),
@@ -341,39 +341,39 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 };
             }
             {
-                let mut llm_state = state.llm_group.lock_recover();
-                llm_state.llm_state.enabled = true;
-                llm_state.llm_state.training_started_at = Some(now);
-                llm_state.llm_state.training_expires_at = Some(expires);
-                llm_state.llm_state.last_call_at = None;
-                llm_state.llm_state.last_attempt_at = None;
-                llm_state.llm_state.last_http_status = None;
-                llm_state.llm_state.last_error = None;
-                llm_state.llm_state.last_trigger_reason = None;
-                llm_state.llm_state.consecutive_failures = 0;
-                llm_state.llm_state.calls_in_window = 0;
-                llm_state.llm_state.hour_window_started_at = Some(now);
-                llm_state.llm_state.calls_today_day = None;
-                llm_state.llm_state.calls_today = 0;
-                llm_state.llm_state.mode = LlmRunMode::Sensitive;
-                llm_state.llm_state.last_trigger_at = None;
-                llm_state.llm_state.trigger_events.clear();
-                llm_state.llm_state.no_trigger_since = Some(now);
-                llm_state.llm_state.last_suggestion = None;
-                llm_state.llm_state.policy_updates_day = None;
-                llm_state.llm_state.policy_updates_today = 0;
-                write_json(&state.llm_state_path, &llm_state.llm_state, Some(0o600));
+                let mut llm_state = state.llm_state.lock_recover();
+                llm_state.enabled = true;
+                llm_state.training_started_at = Some(now);
+                llm_state.training_expires_at = Some(expires);
+                llm_state.last_call_at = None;
+                llm_state.last_attempt_at = None;
+                llm_state.last_http_status = None;
+                llm_state.last_error = None;
+                llm_state.last_trigger_reason = None;
+                llm_state.consecutive_failures = 0;
+                llm_state.calls_in_window = 0;
+                llm_state.hour_window_started_at = Some(now);
+                llm_state.calls_today_day = None;
+                llm_state.calls_today = 0;
+                llm_state.mode = LlmRunMode::Sensitive;
+                llm_state.last_trigger_at = None;
+                llm_state.trigger_events.clear();
+                llm_state.no_trigger_since = Some(now);
+                llm_state.last_suggestion = None;
+                llm_state.policy_updates_day = None;
+                llm_state.policy_updates_today = 0;
+                write_json(&state.llm_state_path, &*llm_state, Some(0o600));
             }
             DaemonResponse::Ok
         }
         DaemonRequest::LlmDisable => {
             delete_file_best_effort(&state.llm_key_path);
             {
-                let mut llm_state = state.llm_group.lock_recover();
-                llm_state.llm_state.enabled = false;
-                llm_state.llm_state.training_expires_at = None;
-                llm_state.llm_state.last_suggestion = None;
-                write_json(&state.llm_state_path, &llm_state.llm_state, Some(0o600));
+                let mut llm_state = state.llm_state.lock_recover();
+                llm_state.enabled = false;
+                llm_state.training_expires_at = None;
+                llm_state.last_suggestion = None;
+                write_json(&state.llm_state_path, &*llm_state, Some(0o600));
             }
             DaemonResponse::Ok
         }
@@ -399,8 +399,8 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 };
             }
             {
-                let llm_state = state.llm_group.lock_recover();
-                if !llm_state.llm_state.training_active() {
+                let llm_state = state.llm_state.lock_recover();
+                if !llm_state.training_active() {
                     return DaemonResponse::LlmTestResult {
                         ok: false,
                         http_status: None,
@@ -425,50 +425,50 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             // Collect a one-off snapshot for this test.
             let mut collector = SystemCollector::new();
             let mut snapshot = collector.collect_snapshot();
-            snapshot.pressure.thermal_level = state.metrics_group.lock_recover().thermal_level_real.clone();
+            snapshot.pressure.thermal_level = state.thermal_level_real.lock_recover().clone();
 
             // Record attempt immediately.
             {
-                let mut llm_state = state.llm_group.lock_recover();
-                if llm_state.llm_state.training_started_at.is_none() {
-                    llm_state.llm_state.training_started_at = Some(now);
+                let mut llm_state = state.llm_state.lock_recover();
+                if llm_state.training_started_at.is_none() {
+                    llm_state.training_started_at = Some(now);
                 }
-                llm_state.llm_state.last_attempt_at = Some(now);
-                llm_state.llm_state.last_trigger_reason = Some("manual-test".to_string());
-                llm_state.llm_state.last_error = None;
-                llm_state.llm_state.last_http_status = None;
+                llm_state.last_attempt_at = Some(now);
+                llm_state.last_trigger_reason = Some("manual-test".to_string());
+                llm_state.last_error = None;
+                llm_state.last_http_status = None;
 
                 // Count this as a call attempt for observability/budget.
                 let today = Local::now().date_naive().to_string();
-                if llm_state.llm_state.calls_today_day.as_deref() != Some(&today) {
-                    llm_state.llm_state.calls_today_day = Some(today);
-                    llm_state.llm_state.calls_today = 0;
+                if llm_state.calls_today_day.as_deref() != Some(&today) {
+                    llm_state.calls_today_day = Some(today);
+                    llm_state.calls_today = 0;
                 }
-                llm_state.llm_state.calls_today += 1;
+                llm_state.calls_today += 1;
                 if llm_state
-                    .llm_state.hour_window_started_at
+                    .hour_window_started_at
                     .map(|t| now - t > ChronoDuration::hours(1))
                     .unwrap_or(true)
                 {
-                    llm_state.llm_state.hour_window_started_at = Some(now);
-                    llm_state.llm_state.calls_in_window = 0;
+                    llm_state.hour_window_started_at = Some(now);
+                    llm_state.calls_in_window = 0;
                 }
-                llm_state.llm_state.calls_in_window += 1;
+                llm_state.calls_in_window += 1;
 
-                write_json(&state.llm_state_path, &llm_state.llm_state, Some(0o600));
+                write_json(&state.llm_state_path, &*llm_state, Some(0o600));
             }
 
             let mut advisor = LlmAdvisor::new(llm_cfg.clone());
-            let current_policy = state.policy_group.lock_recover().learned_policy.clone();
+            let current_policy = state.learned_policy.lock_recover().clone();
             match advisor.call_raw(&snapshot, &api_key, Some(&current_policy)) {
                 Ok(suggestion) => {
                     {
-                        let mut llm_state = state.llm_group.lock_recover();
-                        llm_state.llm_state.last_call_at = Some(now);
-                        llm_state.llm_state.last_http_status = Some(200);
-                        llm_state.llm_state.last_suggestion = Some(suggestion.clone());
-                        llm_state.llm_state.last_error = None;
-                        write_json(&state.llm_state_path, &llm_state.llm_state, Some(0o600));
+                        let mut llm_state = state.llm_state.lock_recover();
+                        llm_state.last_call_at = Some(now);
+                        llm_state.last_http_status = Some(200);
+                        llm_state.last_suggestion = Some(suggestion.clone());
+                        llm_state.last_error = None;
+                        write_json(&state.llm_state_path, &*llm_state, Some(0o600));
                     }
                     DaemonResponse::LlmTestResult {
                         ok: true,
@@ -500,10 +500,10 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                         }
                     };
                     {
-                        let mut llm_state = state.llm_group.lock_recover();
-                        llm_state.llm_state.last_http_status = http_status;
-                        llm_state.llm_state.last_error = Some(msg.clone());
-                        write_json(&state.llm_state_path, &llm_state.llm_state, Some(0o600));
+                        let mut llm_state = state.llm_state.lock_recover();
+                        llm_state.last_http_status = http_status;
+                        llm_state.last_error = Some(msg.clone());
+                        write_json(&state.llm_state_path, &*llm_state, Some(0o600));
                     }
                     DaemonResponse::LlmTestResult {
                         ok: false,
@@ -515,7 +515,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             }
         }
         DaemonRequest::GetLearnedPolicy => {
-            let policy = state.policy_group.lock_recover().learned_policy.clone();
+            let policy = state.learned_policy.lock_recover().clone();
             DaemonResponse::LearnedPolicy(policy)
         }
         DaemonRequest::SetLearnedPolicy { policy: new_policy } => {
@@ -582,16 +582,16 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 sanitized
                     .protected_patterns
                     .retain(|pat| !pattern_conflicts_with_protected(pat));
-                let mut policy = state.policy_group.lock_recover();
-                policy.learned_policy = sanitized;
+                let mut policy = state.learned_policy.lock_recover();
+                *policy = sanitized;
                 // Re-merge seed as floor — seed patterns can never be removed.
-                merge_seed_into(&mut policy.learned_policy);
-                policy.learned_policy.learned_at = Some(Utc::now());
-                write_json(&state.learned_policy_path, &policy.learned_policy, Some(0o600));
+                merge_seed_into(&mut policy);
+                policy.learned_at = Some(Utc::now());
+                write_json(&state.learned_policy_path, &*policy, Some(0o600));
                 // Propagate to ML classifier.
                 {
-                    let lp_clone = policy.learned_policy.clone();
-                    policy.adaptive_governor.update_learned_policy(&lp_clone);
+                    let mut gov = state.adaptive_governor.lock_recover();
+                    gov.update_learned_policy(&policy);
                 }
                 DaemonResponse::Ok
             }
@@ -618,7 +618,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             DaemonResponse::Ok
         }
         DaemonRequest::GetSysctlGovernor => {
-            let status = state.hardware_group.lock_recover().sysctl_governor_status.clone();
+            let status = state.sysctl_governor_status.lock_recover().clone();
             DaemonResponse::SysctlGovernor(status)
         }
         // Subscribe es manejado antes de llegar aqui (en handle_client)
@@ -633,8 +633,8 @@ pub fn build_llm_status(state: &SharedState) -> LlmStatus {
         .llm
         .unwrap_or_else(|| state.llm_cfg.as_ref().clone());
     let enabled_from_disk = llm_cfg.enabled();
-    let llm_state = state.llm_group.lock_recover().llm_state.clone();
-    let policy = state.policy_group.lock_recover().learned_policy.clone();
+    let llm_state = state.llm_state.lock_recover().clone();
+    let policy = state.learned_policy.lock_recover().clone();
 
     let has_key = state.llm_key_path.exists();
     let enabled = enabled_from_disk && llm_state.enabled;

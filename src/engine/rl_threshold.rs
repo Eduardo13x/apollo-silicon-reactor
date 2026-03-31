@@ -136,12 +136,7 @@ struct RlPersisted {
     current_adjustment: f64,
     total_ticks: u64,
     total_overflows: u64,
-    /// Neuromodulator DA alpha multiplier (EMA-decayed learning rate).
-    #[serde(default = "default_alpha_mult")]
-    neuro_alpha_mult: f64,
 }
-
-fn default_alpha_mult() -> f64 { 1.0 }
 
 /// Dyna-Q planning steps per real transition (Sutton 1991).
 /// 10 simulated updates per real step ≈ 10x sample efficiency.
@@ -193,7 +188,7 @@ pub struct RlThresholdAgent {
 
 impl RlThresholdAgent {
     pub fn load_or_default(path: &Path) -> Self {
-        let (q_table, current_adjustment, total_ticks, total_overflows, neuro_alpha_mult) =
+        let (q_table, current_adjustment, total_ticks, total_overflows) =
             std::fs::read_to_string(path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<RlPersisted>(&s).ok())
@@ -205,7 +200,7 @@ impl RlThresholdAgent {
                     for (i, &val) in p.q_table.iter().enumerate() {
                         qt[i / NUM_ACTIONS][i % NUM_ACTIONS] = val;
                     }
-                    Some((qt, p.current_adjustment, p.total_ticks, p.total_overflows, p.neuro_alpha_mult))
+                    Some((qt, p.current_adjustment, p.total_ticks, p.total_overflows))
                 })
                 .unwrap_or_else(|| {
                     // ZeroTune: pre-seed critical pressure band (3) to favor Lower5pp.
@@ -219,7 +214,7 @@ impl RlThresholdAgent {
                             qt[idx][2] = -2.0; // Raise1pp: bad at critical pressure
                         }
                     }
-                    (qt, 0.0, 0, 0, 1.0)
+                    (qt, 0.0, 0, 0)
                 });
 
         Self {
@@ -235,7 +230,7 @@ impl RlThresholdAgent {
             dyna_model: HashMap::new(),
             dyna_cursor: 0,
             dyna_keys: Vec::new(),
-            neuro_alpha_mult,
+            neuro_alpha_mult: 1.0,
             neuro_epsilon_bonus: 0.0,
             dyna_steps: DYNA_PLANNING_STEPS,
             constraints: RlConstraints::default(),
@@ -478,7 +473,6 @@ impl RlThresholdAgent {
             current_adjustment: self.current_adjustment,
             total_ticks: self.total_ticks,
             total_overflows: self.total_overflows,
-            neuro_alpha_mult: self.neuro_alpha_mult,
         };
         if let Ok(json) = serde_json::to_string_pretty(&persisted) {
             let _ = std::fs::write(&self.path, json);
@@ -845,7 +839,6 @@ mod tests {
             current_adjustment: agent.current_adjustment,
             total_ticks: agent.total_ticks,
             total_overflows: agent.total_overflows,
-            neuro_alpha_mult: agent.neuro_alpha_mult,
         };
         let json = serde_json::to_string(&persisted).unwrap();
         let loaded: RlPersisted = serde_json::from_str(&json).unwrap();
