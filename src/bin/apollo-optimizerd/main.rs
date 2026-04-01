@@ -1074,6 +1074,8 @@ fn main() -> anyhow::Result<()> {
             let mut last_fg_name: Option<String> = None;
             // Track last hw_pressure level to decide light vs full snapshot.
             let mut last_hw_pressure = HwPressure::Nominal;
+            // Track previous cycle's package_watts for RL power-reduction reward.
+            let mut prev_package_watts: Option<f64> = None;
             // EMA interactivity classifier: track per-PID rusage CPU deltas
             // to compute cpu_wall_ratio. Key = PID, value = (prev_user_ns,
             // prev_system_ns, proc_start_abstime) for delta computation.
@@ -2485,6 +2487,11 @@ fn main() -> anyhow::Result<()> {
                         power_mgr.battery_status.is_charging,
                         thermal_emergency,
                     );
+                    // Power-aware bias: when real watts are high, engage optimizer earlier.
+                    // M1 Air TDP ~15W; >8W = active load, >12W = stressed.
+                    if let Some(pkg_w) = cycle_hw_snap.as_ref().and_then(|h| h.power.package_watts) {
+                        signal_intel.adjust_bias_for_power(pkg_w);
+                    }
                     let _si_result = signal_intel.tick(
                         snapshot.pressure.memory_pressure,
                         snapshot.pressure.swap_delta_bytes_per_sec,
@@ -4290,6 +4297,27 @@ fn main() -> anyhow::Result<()> {
                             rl.inject_external_reward(penalty);
                         }
                     }
+                }
+
+                // Cable D: Power-reduction reward → RL.
+                // When package_watts drops cycle-over-cycle, the RL policy
+                // did something good — reinforce it. M1 Air idle ~1-3W, active
+                // ~5-15W. A 1W+ reduction is meaningful; cap at 5W (→ +0.3).
+                {
+                    let curr_w = cycle_hw_snap
+                        .as_ref()
+                        .and_then(|h| h.power.package_watts)
+                        .map(|w| w as f64);
+                    if let (Some(prev), Some(curr)) = (prev_package_watts, curr_w) {
+                        let delta = (prev - curr).max(0.0);
+                        if delta > 1.0 {
+                            let power_reward = (delta / 5.0 * 0.3).clamp(0.0, 0.3);
+                            if let Some(rl) = &mut overflow_guard.rl_agent {
+                                rl.inject_external_reward(power_reward);
+                            }
+                        }
+                    }
+                    prev_package_watts = curr_w;
                 }
 
                 // Dr. Zero feedback loop: read external score from watcher's

@@ -499,10 +499,18 @@ impl SignalIntelligence {
     /// - `battery_pct`: 0–100 battery percentage (ignored if charging).
     /// - `is_charging`: true if on AC power.
     /// - `thermal_emergency`: true if in thermal emergency phase.
+    /// - `package_watts`: real-time package power (from powermetrics/IOKit).
     ///
     /// Effect: shifts router zone thresholds to save CPU when battery is low,
     /// or to engage everything when thermal management needs fast decisions.
-    pub fn set_energy_bias(&mut self, battery_pct: u32, is_charging: bool, thermal_emergency: bool) {
+    /// When package_watts is high (M1 Air TDP ~15W), lowers thresholds to act
+    /// earlier — the optimizer should be more aggressive when power is being burned.
+    pub fn set_energy_bias(
+        &mut self,
+        battery_pct: u32,
+        is_charging: bool,
+        thermal_emergency: bool,
+    ) {
         self.energy_bias = if thermal_emergency {
             -0.15 // lower thresholds → run everything → act fast
         } else if !is_charging && battery_pct < 20 {
@@ -512,6 +520,24 @@ impl SignalIntelligence {
         } else {
             0.0 // plugged in or plenty of battery
         };
+    }
+
+    /// Nudge energy_bias downward when real package watts are high.
+    ///
+    /// Called after `set_energy_bias`. M1 Air TDP ~15W:
+    /// - >12W: stressed load → engage optimizer 5pp earlier
+    /// - >8W: active load  → engage optimizer 2pp earlier
+    ///
+    /// Clamps combined bias to -0.15 to prevent over-engagement.
+    pub fn adjust_bias_for_power(&mut self, package_watts: f32) {
+        let power_nudge = if package_watts > 12.0 {
+            -0.05
+        } else if package_watts > 8.0 {
+            -0.02
+        } else {
+            0.0
+        };
+        self.energy_bias = (self.energy_bias + power_nudge).max(-0.15);
     }
 
     /// Persist learned state to disk.
