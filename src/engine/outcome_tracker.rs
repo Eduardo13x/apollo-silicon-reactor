@@ -364,9 +364,13 @@ impl OutcomeTracker {
             }
             let outcome = self.pending.pop_front().unwrap();
             let pressure_drop = outcome.pressure_before - current_pressure;
-            let effective = pressure_drop >= 0.02;
+            // Lowered from 0.02 to 0.01: on an 8GB M1 with 2-3GB swap, 2% absolute
+            // is too strict a bar — many legitimate throttles produce 1-1.5% relief
+            // that compounds across multiple actions. 1% catches these while still
+            // filtering noise.
+            let effective = pressure_drop >= 0.01;
 
-            // Actualiza el baseline de fluctuación natural: ¿bajó la presión ≥2%
+            // Actualiza el baseline de fluctuación natural: ¿bajó la presión ≥1%
             // en esta ventana de 30s, independientemente de qué proceso causó qué?
             // Este EMA nos dice cuán frecuentemente la presión cae sola.
             let dropped = if effective { 1.0 } else { 0.0 };
@@ -840,8 +844,8 @@ mod tests {
             },
         );
 
-        // Pressure barely dropped (< 0.02) → ineffective.
-        let batch = tracker.tick(0.79);
+        // Pressure barely dropped (< 0.01) → ineffective.
+        let batch = tracker.tick(0.795);
         assert!(batch.effective_names.is_empty());
 
         let w = tracker.weights.get("Dropbox").unwrap();

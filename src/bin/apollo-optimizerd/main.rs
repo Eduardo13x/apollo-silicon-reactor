@@ -1020,7 +1020,13 @@ fn main() -> anyhow::Result<()> {
             let smc_direct = apollo_optimizer::engine::smc_direct::SmcDirectReader::new();
             let mut last_smc: Option<apollo_optimizer::engine::smc_direct::SmcSnapshot> = None;
             if smc_direct.available {
-                println!("[smc-direct] SMC direct reader active");
+                let keys = smc_direct.probe_available_keys();
+                if keys.is_empty() {
+                    println!("[smc-direct] SMC connection open but 0 keys readable");
+                } else {
+                    let summary: Vec<String> = keys.iter().map(|(k, v)| format!("{}={:.1}", k, v)).collect();
+                    println!("[smc-direct] {} keys found: {}", keys.len(), summary.join(", "));
+                }
             } else {
                 println!("[smc-direct] SMC direct reader unavailable");
             }
@@ -2282,7 +2288,8 @@ fn main() -> anyhow::Result<()> {
                     metrics.energy_gpu_watts = cycle_hw_snap
                         .as_ref()
                         .and_then(|h| h.power.gpu_watts)
-                        .map(|w| w as f64);
+                        .map(|w| w as f64)
+                        .or(last_smc.as_ref().and_then(|s| s.gpu_watts));
                     metrics.energy_package_watts = cycle_hw_snap
                         .as_ref()
                         .and_then(|h| h.power.package_watts)
@@ -4224,7 +4231,7 @@ fn main() -> anyhow::Result<()> {
                                     .map(|(drop, _)| drop)
                                     .unwrap_or(0.05);
                                 let causal = outcome_tracker.causal_effect(avg_drop);
-                                if causal < 0.01 { Some(name.clone()) } else { None }
+                                if causal < 0.005 { Some(name.clone()) } else { None }
                             }).collect();
                             // Now mutate: roll back effective_count for drift-only "successes".
                             for name in &demotions {

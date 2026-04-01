@@ -15,8 +15,57 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::engine::iokit_sensors::{HardwareSnapshot, IOKitSensorReader};
+use crate::engine::iokit_sensors::{HardwareSnapshot, IOKitSensorReader, PowerReading};
 use crate::engine::lock_ext::LockRecover;
+
+/// Lightweight powermetrics probe — runs as subprocess (~500ms), parses power watts.
+/// Only called from the SmcReader background thread when IOKit/SMC are blind to power
+/// (typical on Apple Silicon without developer entitlements).
+fn probe_powermetrics() -> Option<PowerReading> {
+    use std::process::Command;
+    let output = Command::new("/usr/bin/powermetrics")
+        .args(["--samplers", "cpu_power", "-i", "500", "-n", "1"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut cpu_mw: Option<f32> = None;
+    let mut gpu_mw: Option<f32> = None;
+    let mut combined_mw: Option<f32> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("CPU Power:") {
+            cpu_mw = parse_mw(line);
+        } else if line.starts_with("GPU Power:") && gpu_mw.is_none() {
+            gpu_mw = parse_mw(line);
+        } else if line.starts_with("Combined Power") {
+            combined_mw = parse_mw(line);
+        }
+    }
+    // Convert mW → W
+    Some(PowerReading {
+        cpu_watts: cpu_mw.map(|v| v / 1000.0),
+        gpu_watts: gpu_mw.map(|v| v / 1000.0),
+        package_watts: combined_mw.map(|v| v / 1000.0),
+        dram_watts: None,
+    })
+}
+
+/// Parse "CPU Power: 767 mW" → Some(767.0)
+fn parse_mw(line: &str) -> Option<f32> {
+    // Find the numeric portion before "mW" or "W"
+    let after_colon = line.split(':').nth(1)?.trim();
+    let num_str = after_colon.split_whitespace().next()?;
+    let val: f32 = num_str.parse().ok()?;
+    // If the line says "W" without "mW", convert to mW
+    if after_colon.contains("mW") {
+        Some(val)
+    } else {
+        Some(val * 1000.0) // Watts → mW
+    }
+}
 
 /// Cached sensor reader with background polling thread.
 pub struct SmcReader {
@@ -57,9 +106,49 @@ impl SmcReader {
             .name("smc-reader".into())
             .spawn(move || {
                 let reader = IOKitSensorReader::new();
+                // Track whether powermetrics fallback is needed.
+                // After first snapshot, if power is all-None, try powermetrics.
+                let mut needs_powermetrics = false;
+                let mut pm_cycle = 0u32;
+                let mut cached_pm: Option<PowerReading> = None;
                 loop {
                     match reader.snapshot() {
-                        Ok(hw) => {
+                        Ok(mut hw) => {
+                            // On first snapshot, check if IOKit provides power data.
+                            // If not (common on Apple Silicon without entitlements),
+                            // enable powermetrics fallback every 3rd cycle (~9s).
+                            if !needs_powermetrics && hw.power.package_watts.is_none()
+                                && hw.power.cpu_watts.is_none()
+                            {
+                                needs_powermetrics = true;
+                            }
+
+                            // Enrich with powermetrics data if direct sensors are blind.
+                            if needs_powermetrics {
+                                pm_cycle += 1;
+                                // Run powermetrics every 3rd cycle to limit subprocess overhead.
+                                if pm_cycle % 3 == 1 {
+                                    if let Some(pm) = probe_powermetrics() {
+                                        cached_pm = Some(pm);
+                                    } else {
+                                        eprintln!("[smc-reader] powermetrics probe failed");
+                                    }
+                                }
+                                // Apply cached reading every cycle so power fields
+                                // aren't overwritten with None on non-probe cycles.
+                                if let Some(ref pm) = cached_pm {
+                                    if hw.power.cpu_watts.is_none() {
+                                        hw.power.cpu_watts = pm.cpu_watts;
+                                    }
+                                    if hw.power.gpu_watts.is_none() {
+                                        hw.power.gpu_watts = pm.gpu_watts;
+                                    }
+                                    if hw.power.package_watts.is_none() {
+                                        hw.power.package_watts = pm.package_watts;
+                                    }
+                                }
+                            }
+
                             *c.lock_recover() = Some(hw);
                             *lr.lock_recover() = Some(Instant::now());
                             *sc.lock_recover() += 1;
