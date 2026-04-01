@@ -155,7 +155,10 @@ pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
     serde_json::from_str(&data).ok()
 }
 
-pub fn write_json(path: &Path, value: &impl Serialize, mode: Option<u32>) {
+/// Write JSON atomically (temp → rename). `fsync` controls whether to call
+/// `sync_all()` before rename. Use `true` only for crash-critical files
+/// (journal, learned_state) — it adds ~5-30ms per write via F_FULLFSYNC.
+pub fn write_json_fsync(path: &Path, value: &impl Serialize, mode: Option<u32>, fsync: bool) {
     let _ = HardPath::verify_no_symlink(path);
 
     if let Some(parent) = path.parent() {
@@ -184,7 +187,9 @@ pub fn write_json(path: &Path, value: &impl Serialize, mode: Option<u32>) {
                 .mode(m)
                 .open(&tmp_path)
             {
-                if f.write_all(json.as_bytes()).is_ok() && f.sync_all().is_ok() {
+                let wrote = f.write_all(json.as_bytes()).is_ok();
+                let synced = !fsync || f.sync_all().is_ok();
+                if wrote && synced {
                     if fs::rename(&tmp_path, path).is_ok() {
                         return;
                     }
@@ -196,6 +201,17 @@ pub fn write_json(path: &Path, value: &impl Serialize, mode: Option<u32>) {
         // Fallback for non-unix or if atomic write failed.
         let _ = fs::write(path, json);
     }
+}
+
+/// Atomic write without fsync — for non-critical state files (wake_state,
+/// governor_state, metrics, profile). Fast path: no F_FULLFSYNC syscall.
+pub fn write_json(path: &Path, value: &impl Serialize, mode: Option<u32>) {
+    write_json_fsync(path, value, mode, false);
+}
+
+/// Atomic write with fsync — for crash-critical files (learned_state, journal).
+pub fn write_json_critical(path: &Path, value: &impl Serialize, mode: Option<u32>) {
+    write_json_fsync(path, value, mode, true);
 }
 
 pub fn write_secret(path: &Path, value: &str) -> anyhow::Result<()> {

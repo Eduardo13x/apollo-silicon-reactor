@@ -816,7 +816,12 @@ fn main() -> anyhow::Result<()> {
             let net_optimizer = NetworkOptimizer::new();
             // Foreground detection: replaces get_foreground_app() with cached, richer detection.
             // Wrapped in Arc so it can be shared with the resource sentinel thread.
-            let fg_detector = Arc::new(ForegroundDetector::new());
+            // TTL raised from 200ms → 3s: daemon cycle is ~3s, lsappinfo subprocess
+            // was running every 3rd cycle (200ms TTL < 70ms median cycle). At 3s it
+            // runs at most once per cycle — same freshness, no subprocess stacking.
+            let fg_detector = Arc::new(
+                ForegroundDetector::new().with_cache_ttl(Duration::from_secs(3)),
+            );
             // Per-app energy estimation: accumulates energy attribution each cycle.
             let mut energy_tracker = EnergyTracker::new();
             let mut outcome_tracker = OutcomeTracker::new();
