@@ -1162,8 +1162,6 @@ fn main() -> anyhow::Result<()> {
             // Context-switch burst detector (TDA-aware).
             let mut ctx_switch_times: VecDeque<Instant> = VecDeque::new();
             let mut last_fg_name: Option<String> = None;
-            // Track last hw_pressure level to decide light vs full snapshot.
-            let mut last_hw_pressure = HwPressure::Nominal;
             // Track previous cycle's package_watts for RL power-reduction reward.
             let mut prev_package_watts: Option<f64> = None;
             // Track previous cycle's workload for onset detection (build-onset-proactive).
@@ -1428,7 +1426,6 @@ fn main() -> anyhow::Result<()> {
                 // network monitor and sysctl governor read directly from sysctl/netstat.
                 // Dropping the pressure gate removes ~15-25ms of disk/net I/O at 0.70+ pressure
                 // where the old 0.40 threshold never fired anyway.
-                let cached_mem_pressure = pressure_collector.latest().memory_pressure;
                 let use_light = cycle_count % 30 != 0;
                 let mut snapshot = if use_light {
                     collector.collect_snapshot_light()
@@ -1911,7 +1908,7 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     (HwPressure::Nominal, 0u64, None)
                 };
-                last_hw_pressure = hw_pressure;
+
 
                 // ThermalManager + GPUManager: tick every cycle with latest IOKit temperatures.
                 // gpu_thermal_throttled escapes this block to feed into governor input.
@@ -3420,7 +3417,6 @@ fn main() -> anyhow::Result<()> {
                 if signal_digest.pressure_smooth >= 0.60
                     && !already_has_hints
                 {
-                    let interactive_pats = decide_interactive.clone();
                     let protected_pats = state
                         .learned_policy
                         .lock_recover()

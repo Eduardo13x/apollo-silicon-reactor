@@ -51,6 +51,7 @@ impl CausalEdge {
 
     /// Bayesian update: blend new evidence into confidence.
     /// When effective, also track the magnitude of the pressure delta.
+    #[allow(dead_code)]
     fn update(&mut self, was_effective: bool) {
         self.update_with_delta(was_effective, 0.0);
     }
