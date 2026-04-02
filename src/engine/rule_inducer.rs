@@ -29,6 +29,7 @@
 //! - Caps total induced skills at MAX_INDUCED to prevent explosion.
 //! - Skills start with success_rate = 0.0; must prove themselves or get GC'd.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
 use crate::engine::optimization_skills::OptimizationSkill;
@@ -43,7 +44,15 @@ const MIN_OBS: usize = 8;
 const MIN_EFFECTIVE_RATE: f64 = 0.50;
 
 /// Minimum mean pressure drop to consider a throttle meaningful.
-const MIN_MEAN_DROP: f64 = 0.015;
+/// Set to 0.005 (0.5%) — just above the typical natural_drift_ema (~0.0045)
+/// observed on M1 hardware, so we capture real causal effects without noise.
+const MIN_MEAN_DROP: f64 = 0.005;
+
+/// Only use experience records above the median-pressure threshold.
+/// Low-pressure throttles add noise: throttling harmless background daemons
+/// when system is calm often shows negative drops (real culprit elsewhere).
+/// At pressure>=0.50 the events are in the meaningful optimization range.
+const MIN_PRESSURE_AT_ACTION: f64 = 0.50;
 
 /// Minimum co-occurrence count to induce a group skill.
 const MIN_COOCCUR: u32 = 10;
@@ -56,9 +65,23 @@ const HIGH_COOCCUR_BYPASS: u32 = 500;
 /// Maximum induced skills total (prevents explosion under noisy data).
 const MAX_INDUCED: usize = 60;
 
+/// Minimum pressure drop (absolute) to count an event as a "large drop".
+/// Events where pressure fell by at least 5% — meaningful batch signal.
+const BATCH_MIN_DROP: f64 = 0.05;
+
+/// Minimum number of large-drop batch events two processes must share
+/// before inducing a batch group skill.
+const BATCH_MIN_EVENTS: usize = 4;
+
+/// Maximum batch size to consider for attribution.
+/// Mass-throttle events (>5 processes at once) spread across too many
+/// pairs and dilute the causal signal — skip them.
+const BATCH_MAX_SIZE: usize = 5;
+
 /// Prefix for auto-induced skill names — distinguishes from causal-graph skills.
 const INDUCED_PREFIX: &str = "induced:";
 const GROUP_PREFIX: &str = "group:";
+const BATCH_PREFIX: &str = "batch:";
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -77,10 +100,16 @@ pub fn induce(
     // ── 1. Individual skills from experience memory ───────────────────────────
 
     // Aggregate records per process.
+    // Filter to high-pressure events only: low-pressure throttles add noise
+    // because the real culprit (browser, Spotlight) dominates and small
+    // background daemon throttles look causally negative.
     // Use pressure_drop > 0 (not rec.effective) to avoid double-penalizing
     // beneficial throttles that fell below the global counterfactual baseline.
     let mut by_process: HashMap<&str, ProcessStats> = HashMap::new();
     for rec in experience.records() {
+        if (rec.pressure_at_action as f64) < MIN_PRESSURE_AT_ACTION {
+            continue;
+        }
         let e = by_process.entry(rec.process_name.as_str()).or_default();
         e.total += 1;
         if rec.pressure_drop > 0.0 {
@@ -175,6 +204,103 @@ pub fn induce(
             min_pressure: trigger,
             workload_hint: "any".to_string(),
             throttle_targets: vec![first.to_string(), second.to_string()],
+            success_rate: 0.0,
+            apply_count: 0,
+            success_count: 0,
+        });
+    }
+
+    // ── 3. Batch event detection from experience memory ───────────────────────
+    //
+    // Multiple processes throttled in the same daemon cycle produce records
+    // with nearly identical pressure_drop and pressure_at_action values.
+    // Detecting these coincident records reveals pairs that consistently
+    // co-throttle during large drops — independent of the co-occurrence graph.
+    //
+    // Algorithm: bucket records by (quantized_drop, quantized_pressure).
+    // Buckets with ≥2 distinct processes during a large-drop event (≥0.05)
+    // are batch events. Count how many times each pair appears together.
+    // Pairs with BATCH_MIN_EVENTS shared large-drop batches get a "batch:" skill.
+
+    let mut batch_pair_counts: HashMap<(&str, &str), usize> = HashMap::new();
+    {
+        // Bucket key: (drop in thousandths, pressure in hundredths)
+        let mut buckets: HashMap<(i32, i32), Vec<&str>> = HashMap::new();
+        for rec in experience.records() {
+            if (rec.pressure_drop as f64) < BATCH_MIN_DROP {
+                continue;
+            }
+            if (rec.pressure_at_action as f64) < MIN_PRESSURE_AT_ACTION {
+                continue;
+            }
+            if is_protected(rec.process_name.as_str(), protected) {
+                continue;
+            }
+            let drop_k = (rec.pressure_drop * 1000.0) as i32;
+            let pres_k = (rec.pressure_at_action * 100.0) as i32;
+            buckets
+                .entry((drop_k, pres_k))
+                .or_default()
+                .push(rec.process_name.as_str());
+        }
+
+        for processes in buckets.values() {
+            // Skip mass-throttle events — too many processes dilutes attribution.
+            if processes.len() < 2 || processes.len() > BATCH_MAX_SIZE {
+                continue;
+            }
+            // Count unique pairs within this batch bucket.
+            for i in 0..processes.len() {
+                for j in (i + 1)..processes.len() {
+                    if processes[i] == processes[j] {
+                        continue;
+                    }
+                    let (a, b) = if processes[i] <= processes[j] {
+                        (processes[i], processes[j])
+                    } else {
+                        (processes[j], processes[i])
+                    };
+                    *batch_pair_counts.entry((a, b)).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // Emit batch group skills for pairs with sufficient evidence.
+    let mut batch_pairs: Vec<((&str, &str), usize)> = batch_pair_counts.into_iter().collect();
+    batch_pairs.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+
+    for ((a, b), count) in &batch_pairs {
+        if result.len() >= MAX_INDUCED {
+            break;
+        }
+        if *count < BATCH_MIN_EVENTS {
+            continue;
+        }
+        let skill_name = format!("{}{}+{}", BATCH_PREFIX, a, b);
+        if existing_names.contains(&skill_name) {
+            continue;
+        }
+        // Also skip if already covered by a group: skill for the same pair.
+        let group_name = format!("{}{}+{}", GROUP_PREFIX, a, b);
+        if existing_names.contains(&group_name)
+            || result.iter().any(|s| s.name == group_name)
+        {
+            continue;
+        }
+
+        // Trigger at the mean pressure observed across batch events minus a margin.
+        let mean_pressure = by_process
+            .get(a)
+            .map(|s| s.sum_pressure / s.total.max(1) as f64)
+            .unwrap_or(0.65);
+        let trigger = ((mean_pressure - 0.05) as f32).clamp(0.45, 0.80);
+
+        result.push(OptimizationSkill {
+            name: skill_name,
+            min_pressure: trigger,
+            workload_hint: "any".to_string(),
+            throttle_targets: vec![a.to_string(), b.to_string()],
             success_rate: 0.0,
             apply_count: 0,
             success_count: 0,
@@ -345,5 +471,50 @@ mod tests {
         assert!(!skills.is_empty());
         // trigger should be ~0.67 (0.72 - 0.05), clamped to [0.40, 0.85]
         assert!(skills[0].min_pressure < 0.72);
+    }
+
+    #[test]
+    fn batch_detector_induces_group_from_coincident_drops() {
+        // Two processes throttled in the same cycle share identical drop values.
+        // After BATCH_MIN_EVENTS (4) such events, a batch: group skill appears.
+        let mut mem = ExperienceMemory::new(300);
+        let drops = [0.15_f64, 0.18, 0.12, 0.20]; // 4 distinct large-drop events
+        let pressures = [0.70_f64, 0.72, 0.68, 0.75];
+        for (drop, pressure) in drops.iter().zip(pressures.iter()) {
+            for name in &["corespeechd", "suggestd"] {
+                mem.push(ExperienceRecord {
+                    process_name: name.to_string(),
+                    pressure_at_action: *pressure,
+                    pressure_drop: *drop, // same drop = same cycle
+                    effective: true,
+                });
+            }
+        }
+        // No co-occurrence pairs passed — batch detector must find this on its own.
+        let skills = induce(&mem, &[], &HashSet::new(), &[]);
+        let batch = skills.iter().find(|s| s.name.starts_with("batch:"));
+        assert!(batch.is_some(), "batch detector should find coincident pairs after {} events", BATCH_MIN_EVENTS);
+        let b = batch.unwrap();
+        assert!(b.throttle_targets.contains(&"corespeechd".to_string()));
+        assert!(b.throttle_targets.contains(&"suggestd".to_string()));
+    }
+
+    #[test]
+    fn batch_detector_requires_large_drop() {
+        // Pairs with small drops (< BATCH_MIN_DROP=0.05) must not be induced via batch path.
+        let mut mem = ExperienceMemory::new(300);
+        for _ in 0..3 {
+            for name in &["alpha", "beta"] {
+                mem.push(ExperienceRecord {
+                    process_name: name.to_string(),
+                    pressure_at_action: 0.65,
+                    pressure_drop: 0.02, // below BATCH_MIN_DROP
+                    effective: true,
+                });
+            }
+        }
+        let skills = induce(&mem, &[], &HashSet::new(), &[]);
+        let batch = skills.iter().find(|s| s.name.starts_with("batch:"));
+        assert!(batch.is_none(), "small drops must not trigger batch induction");
     }
 }
