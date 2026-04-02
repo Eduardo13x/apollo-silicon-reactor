@@ -1076,6 +1076,8 @@ fn main() -> anyhow::Result<()> {
             let mut last_hw_pressure = HwPressure::Nominal;
             // Track previous cycle's package_watts for RL power-reduction reward.
             let mut prev_package_watts: Option<f64> = None;
+            // Track previous cycle's workload for onset detection (build-onset-proactive).
+            let mut prev_workload_mode: WorkloadMode = WorkloadMode::Idle;
             // EMA interactivity classifier: track per-PID rusage CPU deltas
             // to compute cpu_wall_ratio. Key = PID, value = (prev_user_ns,
             // prev_system_ns, proc_start_abstime) for delta computation.
@@ -2441,6 +2443,12 @@ fn main() -> anyhow::Result<()> {
                     mode
                 };
 
+                // Workload-onset: fired once when transitioning INTO Build mode.
+                // Lets the governor proactively switch to AggressiveRoot before
+                // pressure builds, rather than waiting for the reactive threshold.
+                let workload_onset = workload_mode == WorkloadMode::Build
+                    && prev_workload_mode != WorkloadMode::Build;
+
                 let mut governor = state.governor.lock_recover();
                 let governor_decision = governor.evaluate(GovernorInput {
                     cpu_pressure: pressure_cpu,
@@ -2455,6 +2463,7 @@ fn main() -> anyhow::Result<()> {
                     interactive_heavy,
                     context_switch_burst,
                     workload_mode: Some(workload_mode),
+                    workload_onset,
                 });
                 if governor_decision.transition_reason.contains("floor") {
                     state.metrics.lock_recover().profile_floor_hits += 1;
@@ -2740,6 +2749,25 @@ fn main() -> anyhow::Result<()> {
                             confidence: (signal_digest.pressure_predicted_5s - 0.85).min(0.15)
                                 / 0.15
                                 * specialist_accuracy.weight(specialist::KALMAN),
+                        });
+                    }
+
+                    // Proactive-30s specialist: Kalman projects overflow in ~30s but we're
+                    // still below the action threshold — act NOW before RAM fills up.
+                    // This is the key advantage over purely reactive systems:
+                    // the OS can only react; Apollo can predict and pre-empt.
+                    let p30_trigger = overflow_thresholds.bg_pressure as f64 - 0.05;
+                    let p30_clear = overflow_thresholds.bg_pressure as f64 - 0.08;
+                    if signal_digest.pressure_predicted_30s > p30_trigger
+                        && signal_digest.pressure_smooth < p30_clear
+                    {
+                        let strength = ((signal_digest.pressure_predicted_30s - p30_trigger)
+                            / 0.10)
+                            .clamp(0.0, 1.0);
+                        votes.push(SpecialistVote {
+                            name: "proactive-30s",
+                            intervention: Intervention::TightenThresholds,
+                            confidence: strength * specialist_accuracy.weight(specialist::KALMAN),
                         });
                     }
 
@@ -3041,6 +3069,58 @@ fn main() -> anyhow::Result<()> {
                                     start_sec: 0,
                                     start_usec: 0,
                                 });
+                            }
+                        }
+                    }
+                }
+
+                // Coordinated multi-process freezing (Pearl 2009 causal clusters).
+                // If process A is already being actioned AND B co-occurs with A during
+                // pressure spikes (≥8 observed co-occurrences), include B in this cycle.
+                // This exploits the causal graph: "Safari + cloudd together cause 20%
+                // pressure drop; individually each is only 10%."
+                // Only triggers near the overflow threshold to avoid false over-throttling.
+                if snapshot.pressure.memory_pressure
+                    >= overflow_thresholds.bg_pressure as f64 - 0.05
+                {
+                    let causal_pairs = outcome_tracker.top_causal_pairs(5);
+                    let actioned: std::collections::HashSet<String> = actions
+                        .iter()
+                        .filter_map(|a| match a {
+                            RootAction::ThrottleProcess { name, .. }
+                            | RootAction::FreezeProcess { name, .. } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    for (pa, pb, count) in &causal_pairs {
+                        if *count < 8 {
+                            continue;
+                        }
+                        let a_acted = actioned.iter().any(|n| n.contains(pa));
+                        let b_acted = actioned.iter().any(|n| n.contains(pb));
+                        if a_acted == b_acted {
+                            continue; // both already actioned or neither
+                        }
+                        let missing = if a_acted { pb } else { pa };
+                        let partner = if a_acted { pa } else { pb };
+                        // Find the missing co-cluster partner and throttle it.
+                        for (pid, proc) in collector.system().processes() {
+                            let proc_name = proc.name().to_string();
+                            if proc_name.contains(missing)
+                                && !actioned.iter().any(|n| n.contains(missing))
+                            {
+                                actions.push(RootAction::ThrottleProcess {
+                                    pid: pid.as_u32(),
+                                    name: proc_name,
+                                    aggressive: false,
+                                    reason: format!(
+                                        "coordinated-cluster: co-occurs with {} (n={})",
+                                        partner, count
+                                    ),
+                                    start_sec: 0,
+                                    start_usec: 0,
+                                });
+                                break;
                             }
                         }
                     }
@@ -4391,6 +4471,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     prev_package_watts = curr_w;
                 }
+                prev_workload_mode = workload_mode;
 
                 // Dr. Zero feedback loop: read external score from watcher's
                 // autoresearch and use it to reinforce/penalize the RL agent.

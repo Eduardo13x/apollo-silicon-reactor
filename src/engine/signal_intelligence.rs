@@ -36,6 +36,9 @@ pub struct SignalDigest {
     pub pressure_velocity: f64,
     /// Presión predicha en 5 segundos.
     pub pressure_predicted_5s: f64,
+    /// Presión predicha en 30 segundos (proyección lineal Kalman).
+    /// Usado por el predictor proactivo para actuar antes de que la presión suba.
+    pub pressure_predicted_30s: f64,
     /// Swap delta suavizado (bytes/s).
     pub swap_velocity_smooth: f64,
     /// Integral of pressure error over target (accumulated pressure-seconds).
@@ -251,6 +254,7 @@ impl SignalIntelligence {
         let pressure_smooth = self.kf_pressure.position();
         let pressure_velocity = self.kf_pressure.velocity();
         let pressure_predicted_5s = self.kf_pressure.predict_ahead(5.0).clamp(0.0, 1.0);
+        let pressure_predicted_30s = self.kf_pressure.predict_ahead(30.0).clamp(0.0, 1.0);
         let swap_velocity_smooth = self.kf_swap.position();
 
         // PID integral: leaky accumulation of (pressure - target) × dt.
@@ -406,6 +410,7 @@ impl SignalIntelligence {
             pressure_smooth,
             pressure_velocity,
             pressure_predicted_5s,
+            pressure_predicted_30s,
             swap_velocity_smooth,
             pressure_integral,
             regime_shift_up,
@@ -738,6 +743,7 @@ mod tests {
             pressure_smooth: 0.0,
             pressure_velocity: 0.0,
             pressure_predicted_5s: 0.0,
+            pressure_predicted_30s: 0.0,
             swap_velocity_smooth: 0.0,
             pressure_integral: 0.0,
             regime_shift_up: false,

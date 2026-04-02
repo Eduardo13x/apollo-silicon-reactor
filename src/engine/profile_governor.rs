@@ -28,6 +28,10 @@ pub struct GovernorInput {
     pub context_switch_burst: bool,
     /// Workload mode from Phase 3 feature-based classifier (None for backward compat).
     pub workload_mode: Option<WorkloadMode>,
+    /// True when workload just transitioned INTO Build mode (cargo/rustc/swift detected).
+    /// Triggers proactive AggressiveRoot before RAM pressure builds —
+    /// faster than any reactive pressure-based trigger.
+    pub workload_onset: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +218,17 @@ impl ProfileGovernor {
         if input.thermal_constrained && target == OptimizationProfile::AggressiveRoot {
             target = OptimizationProfile::BalancedRoot;
             reason = "thermal-cap".to_string();
+        }
+
+        // Workload-onset proactive boost: jump to AggressiveRoot the moment a heavy build
+        // starts, before pressure climbs. Pre-freezes backgrounds BEFORE the compiler needs
+        // the RAM rather than reacting after swap starts. Skip if thermal is constrained.
+        if input.workload_onset
+            && !input.thermal_constrained
+            && target != OptimizationProfile::AggressiveRoot
+        {
+            target = OptimizationProfile::AggressiveRoot;
+            reason = "build-onset-proactive".to_string();
         }
 
         // Dev/interactive floor: don't drop to safe-root when the user is actively developing
