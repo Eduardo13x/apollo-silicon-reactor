@@ -36,6 +36,7 @@ use apollo_optimizer::engine::compressor_aware::{
 };
 use apollo_optimizer::engine::workload_classifier::classify_by_memory;
 use apollo_optimizer::engine::decide_actions::decide_actions;
+use apollo_optimizer::engine::effective_pressure;
 use apollo_optimizer::engine::energy::EnergyTracker;
 use apollo_optimizer::engine::execute_actions::execute_actions;
 use apollo_optimizer::engine::focus_markov::FocusMarkov;
@@ -2179,7 +2180,26 @@ fn main() -> anyhow::Result<()> {
                     .map(|_| 0.08)
                     .unwrap_or(0.0);
 
-                let pressure_ram = (snapshot.pressure.memory_pressure + hw_boost + batt_boost + thermal_pressure_boost + llm_boost + charging_stress_boost + battery_low_boost + mem_bw_boost + smc_thermal_boost + battery_overheat_boost).clamp(0.0, 1.0);
+                // ── Effective pressure: aggregate all boost factors ──────────
+                // Raw memory_pressure misses hardware stress (thermal, battery,
+                // bandwidth saturation). effective_pressure::compute() is the
+                // authoritative value. We write it back into snapshot so all
+                // downstream consumers (decide_actions, page_reclaim, io_shaper,
+                // skill_registry, signal_intel) see the fully-boosted value
+                // without requiring individual call-site changes.
+                let (pressure_ram, _pressure_components) = effective_pressure::compute(
+                    snapshot.pressure.memory_pressure,
+                    hw_boost,
+                    batt_boost,
+                    thermal_pressure_boost,
+                    llm_boost,
+                    charging_stress_boost,
+                    battery_low_boost,
+                    mem_bw_boost,
+                    smc_thermal_boost,
+                    battery_overheat_boost,
+                );
+                snapshot.pressure.memory_pressure = pressure_ram;
                 let pressure_wait = snapshot
                     .top_processes
                     .iter()
