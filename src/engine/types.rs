@@ -266,6 +266,13 @@ pub enum RootAction {
         tier: String,
         reason: String,
     },
+    /// Mark cold private heap regions as VM_BEHAVIOR_REUSABLE so the kernel
+    /// can compress/reclaim them without pausing the process.
+    TrimWorkingSet {
+        pid: u32,
+        name: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

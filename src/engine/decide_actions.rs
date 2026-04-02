@@ -6,6 +6,7 @@ use crate::collector::SystemSnapshot;
 use crate::engine::amx_detector;
 use crate::engine::outcome_tracker::{PatternWeight, WorkloadHop, HopGroupWeight};
 use crate::engine::overflow_guard::OverflowThresholds;
+use crate::engine::memory_trimmer;
 use crate::engine::safety::critical_background_processes;
 use crate::engine::thread_selfcounts::IpcClass;
 use crate::engine::types::{
@@ -573,7 +574,46 @@ pub fn decide_actions(
         }
     }
 
-    // 4b) Deferrable Apple intelligence/ML daemons: throttle immediately under
+    // 4b) Working-set trim: mark cold private heap regions as VM_BEHAVIOR_REUSABLE
+    // for browser/Electron processes that hold large anonymous heaps they're not
+    // actively using.  No freeze, no SIGSTOP — the process keeps running.
+    // Triggered when: memory pressure >= 0.65 OR swap >= 1.5 GB.
+    // Rate-limited to one TrimWorkingSet per PID per call (the daemon main loop
+    // should gate calls to at most once every 5 minutes per PID).
+    {
+        let swap_gb =
+            snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let trim_triggered = snapshot.pressure.memory_pressure >= 0.65 || swap_gb >= 1.5;
+        if trim_triggered {
+            for (pid, process) in sys.processes() {
+                let pid_u32 = pid.as_u32();
+                if critical_pids.contains(&pid_u32) {
+                    continue;
+                }
+                let name = process.name().to_string();
+                if !memory_trimmer::is_trimmable(&name) {
+                    continue;
+                }
+                // Only trim if the process is holding meaningful memory (≥ 150 MB RSS).
+                let rss = process.memory(); // bytes
+                if rss < 150 * 1024 * 1024 {
+                    continue;
+                }
+                actions.push(RootAction::TrimWorkingSet {
+                    pid: pid_u32,
+                    name,
+                    reason: format!(
+                        "working-set-trim: mem={:.2} swap={:.1}GB rss={}MB",
+                        snapshot.pressure.memory_pressure,
+                        swap_gb,
+                        rss / (1024 * 1024)
+                    ),
+                });
+            }
+        }
+    }
+
+    // 4c) Deferrable Apple intelligence/ML daemons: throttle immediately under
     // BackgroundPressure without waiting for HRPO learning cycles.  These processes
     // self-throttle on AC/idle normally; under RAM pressure we accelerate that.
     if matches!(
