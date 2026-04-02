@@ -188,8 +188,14 @@ impl ProfileGovernor {
         self.transition_times
             .retain(|t| *t >= now - Duration::minutes(10));
 
+        let swap_gb_input = input.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let mem_thrash_crisis = input.ram_pressure >= 0.60 && swap_gb_input >= 2.0;
+
         if let Some(lock_until) = self.balanced_lock_until {
-            if lock_until > now {
+            if lock_until > now && !mem_thrash_crisis {
+                // Anti-thrash lock active — hold balanced unless the machine is genuinely
+                // thrashing (high RAM + high swap).  In a real memory crisis the lock
+                // was protecting against oscillation, not against a sustained emergency.
                 target = OptimizationProfile::BalancedRoot;
                 reason = "anti-thrash-balanced-lock".to_string();
             } else {
@@ -392,7 +398,18 @@ fn pressure_score(input: &GovernorInput) -> f64 {
     // Cap at 0.12 (2 GB → full boost on 8 GB machines; higher RAM → less boost).
     let swap_gb = input.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let swap_boost = (swap_gb / 2.0).clamp(0.0, 1.0) * 0.12;
-    (0.35 * cpu + 0.35 * ram + 0.20 * wait + 0.10 * reactor + swap_boost).clamp(0.0, 1.0)
+    let base = (0.35 * cpu + 0.35 * ram + 0.20 * wait + 0.10 * reactor + swap_boost).clamp(0.0, 1.0);
+
+    // Memory-thrash crisis override: when both RAM and swap are simultaneously stressed,
+    // the CPU-idle formula chronically underscores the real system state.
+    // On 8 GB machines: ram >= 0.60 + swap >= 1.5 GB is an active thrash condition.
+    // Guarantee a minimum score that clears the 0.72 aggressive-root threshold.
+    // Scale 0.60→0.85 as swap rises from 1.5→3.0 GB to allow proportional response.
+    if ram >= 0.60 && swap_gb >= 1.5 {
+        let crisis_score = (0.60 + (swap_gb - 1.5).clamp(0.0, 1.5) / 1.5 * 0.25).clamp(0.0, 1.0);
+        return base.max(crisis_score);
+    }
+    base
 }
 
 fn throttle_level(pressure_score: f64) -> String {
@@ -482,5 +499,62 @@ mod tests {
         let mut gov = make_governor(OptimizationProfile::AggressiveRoot);
         let decision = gov.evaluate(low_pressure_input(true));
         assert_eq!(decision.effective_profile, OptimizationProfile::AggressiveRoot);
+    }
+
+    #[test]
+    fn memory_thrash_crisis_score_clears_aggressive_threshold() {
+        // ram=0.67, swap=2.5 GB (8 GB machine thrashing) — score must reach >= 0.72
+        let input = GovernorInput {
+            cpu_pressure: 0.05,
+            ram_pressure: 0.67,
+            interactive_wait_ratio: 0.0,
+            reactor_event_weight: 0.0,
+            thermal_constrained: false,
+            dev_session_active: false,
+            interactive_heavy: false,
+            context_switch_burst: false,
+            workload_mode: None,
+            workload_onset: false,
+            swap_used_bytes: (2.5 * 1024.0 * 1024.0 * 1024.0) as u64,
+        };
+        let score = pressure_score(&input);
+        assert!(
+            score >= 0.72,
+            "memory thrash crisis should yield score >= 0.72, got {:.3}",
+            score
+        );
+    }
+
+    #[test]
+    fn memory_thrash_bypasses_anti_thrash_lock() {
+        // Even if balanced_lock is active, a genuine memory crisis should be able
+        // to escalate to AggressiveRoot.
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        // Trigger anti-thrash lock by making 5 rapid transitions
+        for _ in 0..5 {
+            gov.evaluate(low_pressure_input(true));
+        }
+        // Now evaluate with memory crisis — should break the lock
+        let crisis_input = GovernorInput {
+            cpu_pressure: 0.05,
+            ram_pressure: 0.70,
+            interactive_wait_ratio: 0.0,
+            reactor_event_weight: 0.0,
+            thermal_constrained: false,
+            dev_session_active: false,
+            interactive_heavy: false,
+            context_switch_burst: false,
+            workload_mode: None,
+            workload_onset: false,
+            swap_used_bytes: (2.5 * 1024.0 * 1024.0 * 1024.0) as u64,
+        };
+        let decision = gov.evaluate(crisis_input);
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::AggressiveRoot,
+            "memory thrash crisis must bypass anti-thrash balanced_lock; got {:?} (reason: {})",
+            decision.effective_profile,
+            decision.transition_reason
+        );
     }
 }
