@@ -81,8 +81,9 @@ use apollo_optimizer::engine::profile_governor::{
     GovernorInput, ProfileGovernor,
 };
 use apollo_optimizer::engine::safety::{
-    behavioral_protection_score, critical_background_processes, enforce_limits_with_budget,
-    infrastructure_processes, is_user_interactive_app, matches_dev_runtime, protected_processes,
+    behavioral_protection_score, classify_protection, critical_background_processes,
+    enforce_limits_with_budget, infrastructure_processes, is_user_interactive_app,
+    matches_dev_runtime, protected_processes, ProtectionLevel,
 };
 use apollo_optimizer::engine::learned_state::{LearnedState, RestoreQualityMonitor};
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
@@ -1282,8 +1283,8 @@ fn main() -> anyhow::Result<()> {
                     match display_turbo.tick() {
                         TurboAction::ActivateTurbo => {
                             // Freeze non-essential background processes.
-                            let critical_pats = critical_background_processes();
-                            let protected_pats = protected_processes();
+                            let turbo_hard = protected_processes();
+                            let turbo_infra = infrastructure_processes();
                             let policy_protected = state
                                 .learned_policy
                                 .lock_recover()
@@ -1297,11 +1298,15 @@ fn main() -> anyhow::Result<()> {
                             for (pid, process) in collector.system().processes() {
                                 let pid_u32 = pid.as_u32();
                                 let name = process.name().to_string();
-                                // Never freeze: foreground, essential, protected, Apollo itself.
+                                // Never freeze: foreground, OS/infra/policy-protected,
+                                // dev runtimes (behavioral gate not available here),
+                                // or Apollo itself.
+                                let protection = classify_protection(
+                                    &name, &turbo_hard, &turbo_infra, &policy_protected, false,
+                                );
                                 if Some(pid_u32) == fg_pid
-                                    || critical_pats.iter().any(|p| name.contains(p))
-                                    || protected_pats.iter().any(|p| name.contains(p))
-                                    || policy_protected.iter().any(|p| name.contains(p.as_str()))
+                                    || protection != ProtectionLevel::Unprotected
+                                    || matches_dev_runtime(&name)
                                     || name == "apollo-optimizerd"
                                     || frozen_guard.contains_key(&pid_u32)
                                 {
@@ -1727,8 +1732,8 @@ fn main() -> anyhow::Result<()> {
                 // Unfreeze when temperature drops back to Phase2 or below (hysteresis built into
                 // ThermalBailout keeps us from thrashing).
                 if thermal_action.freeze_background || thermal_action.freeze_all_non_critical {
-                    let critical_pats = critical_background_processes();
-                    let protected_pats = protected_processes();
+                    let thermal_hard = protected_processes();
+                    let thermal_infra = infrastructure_processes();
                     let policy_protected = state
                         .learned_policy
                         .lock_recover()
@@ -1749,11 +1754,13 @@ fn main() -> anyhow::Result<()> {
                         let pid_u32 = pid.as_u32();
                         let name = process.name().to_string();
                         let cpu = process.cpu_usage();
+                        let protection = classify_protection(
+                            &name, &thermal_hard, &thermal_infra, &policy_protected, false,
+                        );
                         if cpu > cpu_threshold
                             || Some(pid_u32) == fg_pid
-                            || critical_pats.iter().any(|p| name.contains(p))
-                            || protected_pats.iter().any(|p| name.contains(p))
-                            || policy_protected.iter().any(|p| name.contains(p.as_str()))
+                            || protection != ProtectionLevel::Unprotected
+                            || matches_dev_runtime(&name)
                             || name == "apollo-optimizerd"
                             || frozen_guard.contains_key(&pid_u32)
                         {
@@ -3133,6 +3140,7 @@ fn main() -> anyhow::Result<()> {
                         let skill_name = skill.name.clone();
                         let pressure_before = snapshot.pressure.memory_pressure;
                         let hard_protected = apollo_optimizer::engine::safety::protected_processes();
+                        let infra_protected = infrastructure_processes();
                         let policy_prot = state.learned_policy.lock_recover().protected_patterns.clone();
                         let already_actioned: std::collections::HashSet<String> = actions
                             .iter()
@@ -3148,10 +3156,13 @@ fn main() -> anyhow::Result<()> {
                         // skill for respecting the foreground gate.
                         let mut targets_found_but_skipped = false;
                         for target in &skill.throttle_targets.clone() {
-                            // Skip targets that are hard-protected or policy-protected daemons.
-                            // (Foreground-aware user apps are handled by heuristic_critical_pids.)
-                            if hard_protected.iter().any(|p| target.contains(p))
-                                || policy_prot.iter().any(|p| target.contains(p.as_str()))
+                            // Skip targets that are hard-protected, infra-protected, or
+                            // policy-protected daemons.
+                            // ConditionalForeground (user apps) are NOT skipped here —
+                            // the foreground check happens per-pid in the inner loop below.
+                            // is_interactive=false: no behavioral data at target-name level.
+                            if classify_protection(target, &hard_protected, &infra_protected, &policy_prot, false)
+                                == ProtectionLevel::Unconditional
                             {
                                 continue;
                             }
@@ -3430,47 +3441,54 @@ fn main() -> anyhow::Result<()> {
                     for (pid, process) in sys.processes() {
                         let pid_u32 = pid.as_u32();
                         let name = process.name().to_string();
-                        // Hard-protected: OS/system essentials + infrastructure → always skip.
-                        if protected_pats.iter().any(|p| name.contains(p))
-                            || infra_pats.iter().any(|p| name.contains(p))
-                        {
-                            cpids.insert(pid_u32);
-                            continue;
-                        }
-                        // User-interactive apps: protect when foreground, eligible for
-                        // QoS hint / throttle when in background.
-                        // Detect via behavioral signals — no hardcoded names.
-                        {
-                            let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
-                            let has_gui = snap.map_or(false, |s| s.has_gui_window);
-                            let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
-                            let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
-                            if is_user_interactive_app(has_gui, idle_s, rss, &name) {
-                                if Some(pid_u32) == foreground_pid {
-                                    // Foreground user app: fully protected.
-                                    cpids.insert(pid_u32);
-                                }
-                                // Background user app: not inserted → eligible for throttle/QoS.
+                        // Evaluate interactive-app behavioral signals before calling
+                        // classify_protection so the result is available for Tier 4.
+                        let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
+                        let has_gui = snap.map_or(false, |s| s.has_gui_window);
+                        let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
+                        let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
+                        let is_interactive =
+                            is_user_interactive_app(has_gui, idle_s, rss, &name);
+                        match classify_protection(
+                            &name,
+                            &protected_pats,
+                            &infra_pats,
+                            &policy_protected,
+                            is_interactive,
+                        ) {
+                            ProtectionLevel::Unconditional => {
+                                // OS/system essentials, infrastructure, policy-learned
+                                // daemons → always skip.
+                                cpids.insert(pid_u32);
                                 continue;
                             }
-                        }
-                        // Policy-protected (learned daemons): always protect.
-                        if policy_protected.iter().any(|p| name.contains(p.as_str())) {
-                            cpids.insert(pid_u32);
-                            continue;
+                            ProtectionLevel::ConditionalForeground => {
+                                // User-interactive apps: protect when foreground, eligible
+                                // for QoS hint / throttle when in background.
+                                if Some(pid_u32) == foreground_pid {
+                                    cpids.insert(pid_u32);
+                                }
+                                // Background user app: not inserted → eligible for
+                                // throttle/QoS.
+                                continue;
+                            }
+                            ProtectionLevel::Unprotected => {
+                                // Fall through to dev-runtime behavioral gate below.
+                            }
                         }
                         // Dev runtimes: behavioral gate — protection earned, not given.
                         if matches_dev_runtime(&name) {
                             let pid_u32 = pid.as_u32();
-                            // Prefer enriched ProcessSnapshot if available;
-                            // fall back to raw sysinfo data for processes not in top-N.
-                            let (cpu, wakeups, net, gui, idle_s, rss) =
-                                if let Some(snap) = proc_snaps.iter().find(|s| s.pid == pid_u32) {
-                                    (snap.cpu_percent, snap.wakeups_per_sec, snap.has_network,
-                                     snap.has_gui_window, snap.secs_since_user_interaction, snap.rss_bytes)
+                            // Re-use the enriched ProcessSnapshot already looked up above
+                            // (snap/has_gui/idle_s/rss are in scope from classify_protection
+                            // evaluation), adding wakeups and network from the same snapshot.
+                            let (cpu, wakeups, net, gui) =
+                                if let Some(s) = snap {
+                                    (s.cpu_percent, s.wakeups_per_sec, s.has_network,
+                                     s.has_gui_window)
                                 } else {
                                     // Fallback: sysinfo process — limited signals but real RSS.
-                                    (process.cpu_usage(), 0.0, false, false, 3600, process.memory())
+                                    (process.cpu_usage(), 0.0, false, false)
                                 };
                             let raw_score = behavioral_protection_score(
                                 cpu, wakeups, net, gui, idle_s, rss, total_ram,

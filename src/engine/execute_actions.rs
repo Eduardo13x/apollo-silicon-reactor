@@ -267,6 +267,12 @@ pub fn execute_actions(
                     if *pid == my_pid {
                         return Ok(());
                     }
+                    // TODO(classify_protection): migrate to classify_protection() once the
+                    // API supports a 5th tier: learned_interactive → unconditional skip at
+                    // execute time (no foreground context available here).
+                    // Spec: classify_protection(name, hard, infra, learned_protected, false)
+                    //   == Unconditional → skip; also check learned_interactive separately.
+                    // Until then: three-step check below is intentionally kept explicit.
                     if protected.iter().any(|p| name.contains(p)) {
                         out.push_skip(format!("protected:{}", name));
                         return Ok(());
