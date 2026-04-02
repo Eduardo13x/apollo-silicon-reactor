@@ -4558,7 +4558,7 @@ fn main() -> anyhow::Result<()> {
                 // Apollo crystallizes its own observations into reusable rules.
                 if cycle_count % 100 == 0 {
                     let existing_names = skill_registry.name_set();
-                    let top_pairs = outcome_tracker.top_causal_pairs(20);
+                    let top_pairs = outcome_tracker.top_causal_pairs(100);
                     let protected_set = apollo_optimizer::engine::safety::protected_processes();
                     let protected_slice: Vec<&str> = protected_set.iter().copied().collect();
                     let new_skills = apollo_optimizer::engine::rule_inducer::induce(

@@ -35,16 +35,23 @@ use crate::engine::optimization_skills::OptimizationSkill;
 use crate::engine::outcome_tracker::ExperienceMemory;
 
 /// Minimum observations before crystallizing a skill.
-const MIN_OBS: usize = 12;
+const MIN_OBS: usize = 8;
 
-/// Minimum effectiveness rate to induce a skill (positive outcomes / total).
-const MIN_EFFECTIVE_RATE: f64 = 0.65;
+/// Minimum rate of throttles that produced a positive pressure drop.
+/// Uses raw pressure_drop > 0 (not the counterfactual-adjusted `effective` flag)
+/// so short-lived beneficial effects aren't double-penalized by the baseline filter.
+const MIN_EFFECTIVE_RATE: f64 = 0.50;
 
 /// Minimum mean pressure drop to consider a throttle meaningful.
-const MIN_MEAN_DROP: f64 = 0.025;
+const MIN_MEAN_DROP: f64 = 0.015;
 
 /// Minimum co-occurrence count to induce a group skill.
-const MIN_COOCCUR: u32 = 18;
+const MIN_COOCCUR: u32 = 10;
+
+/// Co-occurrence count above which a_ok/b_ok individual evidence is not required.
+/// Two processes that co-spike ≥500 times are worth trying to throttle together
+/// even without individual effectiveness records.
+const HIGH_COOCCUR_BYPASS: u32 = 500;
 
 /// Maximum induced skills total (prevents explosion under noisy data).
 const MAX_INDUCED: usize = 60;
@@ -70,15 +77,17 @@ pub fn induce(
     // ── 1. Individual skills from experience memory ───────────────────────────
 
     // Aggregate records per process.
+    // Use pressure_drop > 0 (not rec.effective) to avoid double-penalizing
+    // beneficial throttles that fell below the global counterfactual baseline.
     let mut by_process: HashMap<&str, ProcessStats> = HashMap::new();
     for rec in experience.records() {
         let e = by_process.entry(rec.process_name.as_str()).or_default();
         e.total += 1;
-        if rec.effective {
-            e.effective += 1;
+        if rec.pressure_drop > 0.0 {
+            e.positive_drops += 1;
         }
-        e.sum_drop += rec.pressure_drop;
-        e.sum_pressure += rec.pressure_at_action;
+        e.sum_drop += rec.pressure_drop as f64;
+        e.sum_pressure += rec.pressure_at_action as f64;
     }
 
     for (name, stats) in &by_process {
@@ -88,7 +97,7 @@ pub fn induce(
         if stats.total < MIN_OBS {
             continue;
         }
-        let rate = stats.effective as f64 / stats.total as f64;
+        let rate = stats.positive_drops as f64 / stats.total as f64;
         let mean_drop = stats.sum_drop / stats.total as f64;
         let mean_pressure = stats.sum_pressure / stats.total as f64;
 
@@ -132,18 +141,23 @@ pub fn induce(
             continue;
         }
 
-        // Only build a group skill if both processes individually have some
-        // evidence of effectiveness (avoids grouping two low-value processes).
-        let a_stats = by_process.get(a);
-        let b_stats = by_process.get(b);
-        let a_ok = a_stats.map_or(false, |s| {
-            s.total >= 3 && s.effective as f64 / s.total as f64 >= 0.40
-        });
-        let b_ok = b_stats.map_or(false, |s| {
-            s.total >= 3 && s.effective as f64 / s.total as f64 >= 0.40
-        });
-        if !a_ok && !b_ok {
-            continue;
+        // For very high co-occurrence counts, skip individual effectiveness
+        // check — the co-spike frequency alone is sufficient evidence.
+        // Otherwise require at least one process to have some individual
+        // effectiveness (relaxed from AND → OR to avoid blocking all pairs
+        // where one process lacks experience records).
+        if *count < HIGH_COOCCUR_BYPASS {
+            let a_stats = by_process.get(a);
+            let b_stats = by_process.get(b);
+            let a_ok = a_stats.map_or(false, |s| {
+                s.total >= 3 && s.positive_drops as f64 / s.total as f64 >= 0.40
+            });
+            let b_ok = b_stats.map_or(false, |s| {
+                s.total >= 3 && s.positive_drops as f64 / s.total as f64 >= 0.40
+            });
+            if !a_ok && !b_ok {
+                continue;
+            }
         }
 
         // Sort names so the skill name is deterministic regardless of pair order.
@@ -175,7 +189,8 @@ pub fn induce(
 #[derive(Default)]
 struct ProcessStats {
     total: usize,
-    effective: usize,
+    /// Records where pressure_drop > 0 (raw positive outcomes).
+    positive_drops: usize,
     sum_drop: f64,
     sum_pressure: f64,
 }
@@ -226,9 +241,56 @@ mod tests {
 
     #[test]
     fn does_not_induce_insufficient_obs() {
-        let mem = make_experience("mediaanalysisd", 8, 0.90, 0.70);
+        // MIN_OBS = 8; n=5 is genuinely insufficient.
+        let mem = make_experience("mediaanalysisd", 5, 0.90, 0.70);
         let skills = induce(&mem, &[], &HashSet::new(), &[]);
         assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn induces_from_positive_drops_bypassing_effective_flag() {
+        // Records where effective=false but pressure_drop > 0 (below counterfactual
+        // baseline) should still count toward induction — avoids double-penalizing.
+        let mut mem = ExperienceMemory::new(300);
+        for _ in 0..10 {
+            mem.push(ExperienceRecord {
+                process_name: "corespeechd".to_string(),
+                pressure_at_action: 0.65,
+                pressure_drop: 0.03, // positive but below natural_drift → effective=false in tracker
+                effective: false,    // counterfactual said "not good enough"
+            });
+        }
+        let skills = induce(&mem, &[], &HashSet::new(), &[]);
+        // Should induce: 10 records, 100% positive_drops, mean_drop=0.03 > 0.015
+        assert_eq!(skills.len(), 1, "should induce despite effective=false");
+        assert!(skills[0].name.starts_with("induced:"));
+    }
+
+    #[test]
+    fn does_not_induce_negative_mean_drop() {
+        // Processes where throttling makes things worse (negative drop) must not
+        // be induced even if n and rate would otherwise qualify.
+        let mut mem = ExperienceMemory::new(300);
+        for _ in 0..10 {
+            mem.push(ExperienceRecord {
+                process_name: "suggestd".to_string(),
+                pressure_at_action: 0.62,
+                pressure_drop: -0.011, // pressure went UP after throttle
+                effective: false,
+            });
+        }
+        let skills = induce(&mem, &[], &HashSet::new(), &[]);
+        assert!(skills.is_empty(), "must not induce skill for process that increases pressure");
+    }
+
+    #[test]
+    fn group_skill_from_high_cooccur_bypass() {
+        // Very high co-occurrence bypasses a_ok/b_ok individual evidence requirement.
+        let mem = ExperienceMemory::new(300); // empty — no individual evidence
+        let pairs = vec![("coreaudiod", "corespeechd", HIGH_COOCCUR_BYPASS + 10)];
+        let skills = induce(&mem, &pairs, &HashSet::new(), &[]);
+        let group = skills.iter().find(|s| s.name.starts_with("group:"));
+        assert!(group.is_some(), "high co-occurrence should bypass individual evidence check");
     }
 
     #[test]
