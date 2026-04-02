@@ -3106,6 +3106,11 @@ fn main() -> anyhow::Result<()> {
                             })
                             .collect();
                         let mut trialed = false;
+                        // Tracks whether at least one target exists in the process list
+                        // but was blocked solely because it is the current foreground app.
+                        // "Foreground-blocked" ≠ "ineffective" — we must not penalise the
+                        // skill for respecting the foreground gate.
+                        let mut targets_found_but_skipped = false;
                         for target in &skill.throttle_targets.clone() {
                             // Skip targets that are hard-protected or policy-protected daemons.
                             // (Foreground-aware user apps are handled by heuristic_critical_pids.)
@@ -3115,33 +3120,44 @@ fn main() -> anyhow::Result<()> {
                                 continue;
                             }
                             for (pid, process) in collector.system().processes() {
-                                if process.name() == target
-                                    && Some(pid.as_u32()) != foreground_pid
-                                {
-                                    // Add throttle only if not already actioned by individual skills.
-                                    // But mark trialed=true regardless — the pressure measurement
-                                    // captures the combined effect of all throttles in this cycle,
-                                    // including targets already covered by throttle:X skills.
-                                    if !already_actioned.contains(target) {
-                                        actions.push(RootAction::ThrottleProcess {
-                                            pid: pid.as_u32(),
-                                            name: target.clone(),
-                                            aggressive: false,
-                                            reason: format!("trial:{}", skill_name),
-                                            start_sec: 0,
-                                            start_usec: 0,
-                                        });
+                                if process.name() == target {
+                                    if Some(pid.as_u32()) == foreground_pid {
+                                        // Process exists but is the active foreground app —
+                                        // we intentionally skip it this cycle.
+                                        targets_found_but_skipped = true;
+                                    } else {
+                                        // Add throttle only if not already actioned by individual skills.
+                                        // But mark trialed=true regardless — the pressure measurement
+                                        // captures the combined effect of all throttles in this cycle,
+                                        // including targets already covered by throttle:X skills.
+                                        if !already_actioned.contains(target) {
+                                            actions.push(RootAction::ThrottleProcess {
+                                                pid: pid.as_u32(),
+                                                name: target.clone(),
+                                                aggressive: false,
+                                                reason: format!("trial:{}", skill_name),
+                                                start_sec: 0,
+                                                start_usec: 0,
+                                            });
+                                        }
+                                        trialed = true;
                                     }
-                                    trialed = true;
                                     break;
                                 }
                             }
                         }
                         if trialed {
                             pending_trial_skill = Some((skill_name, pressure_before));
+                        } else if targets_found_but_skipped {
+                            // At least one target exists but is foreground-protected this cycle.
+                            // This is NOT an ineffective outcome — the skill simply couldn't run.
+                            // Leave pending_trial_skill as None and wait for the next cycle when
+                            // the process may be in the background.
+                            // (apply_count is NOT incremented, so the skill is not GC'd.)
                         } else {
-                            // All targets are protected — skill can never execute.
-                            // Record as ineffective so it gets GC'd after 10 failed attempts.
+                            // No targets found in the process list at all — the skill's targets
+                            // are genuinely absent (crashed, jetsam'd, or never launched).
+                            // Mark as ineffective so the skill gets GC'd after enough failures.
                             skill_registry.record_result(&skill_name, false);
                         }
                     }
