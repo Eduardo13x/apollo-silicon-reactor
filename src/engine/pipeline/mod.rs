@@ -123,6 +123,7 @@
 //!
 //! See `periodic_stage.rs` for the full interface.
 
+pub mod learning_context;
 pub mod periodic_stage;
 
 /// Trait implemented by each pipeline stage.
