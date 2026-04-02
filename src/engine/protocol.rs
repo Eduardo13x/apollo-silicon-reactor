@@ -7,8 +7,8 @@ use crate::engine::llm::{LearnedPolicy, LlmSuggestion};
 /// this at runtime so a version mismatch can be reported cleanly.
 pub const PROTOCOL_VERSION: u32 = 1;
 use crate::engine::types::{
-    BlockerScore, CapabilityReport, DaemonStatus, LatencyTarget, LlmStatus, OptimizationProfile,
-    ProfileTransition, RuntimeMetrics, UsageResponse,
+    BlockerScore, CapabilityReport, DaemonStatus, HealthReport, LatencyTarget, LlmStatus,
+    OptimizationProfile, ProfileTransition, RuntimeMetrics, UsageResponse,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,6 +60,8 @@ pub enum DaemonRequest {
     Subscribe,
     /// Returns protocol version and build string for compatibility checks.
     GetVersion,
+    /// Returns circuit breaker and degradation health summary.
+    GetHealth,
 }
 
 impl DaemonRequest {
@@ -77,7 +79,8 @@ impl DaemonRequest {
             | Self::GetLearnedPolicy
             | Self::GetSysctlGovernor
             | Self::Subscribe
-            | Self::GetVersion => false,
+            | Self::GetVersion
+            | Self::GetHealth => false,
 
             Self::SetProfile { .. }
             | Self::SetLatencyTarget { .. }
@@ -150,6 +153,8 @@ pub enum DaemonResponse {
         protocol: u32,
         build: String,
     },
+    /// Response to GetHealth.
+    Health(HealthReport),
     Error {
         message: String,
     },

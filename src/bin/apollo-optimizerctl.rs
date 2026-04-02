@@ -81,6 +81,8 @@ enum Commands {
     SysctlGovernor,
     /// Show daemon protocol version and build info
     Version,
+    /// Show circuit breaker and degradation health summary
+    Health,
 }
 
 #[derive(Subcommand)]
@@ -440,6 +442,7 @@ fn main() -> anyhow::Result<()> {
         },
         Commands::SysctlGovernor => send_request(DaemonRequest::GetSysctlGovernor),
         Commands::Version => send_request(DaemonRequest::GetVersion),
+        Commands::Health => send_request(DaemonRequest::GetHealth),
     }?;
 
     match response {
@@ -486,6 +489,8 @@ fn main() -> anyhow::Result<()> {
             let _ = fs::metadata("/var/run/apollo-optimizer.sock");
             let _ = fs::metadata("/tmp/apollo-optimizer.sock");
         }
+        DaemonResponse::Health(h) => println!("{}", serde_json::to_string_pretty(&h)?),
+        DaemonResponse::Health(h) => println!("{}", serde_json::to_string_pretty(&h)?),
         DaemonResponse::Error { message } => {
             anyhow::bail!(message);
         }

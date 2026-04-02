@@ -65,6 +65,7 @@ use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
 use apollo_optimizer::engine::network_monitor::NetworkMonitor;
 use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfile};
 use apollo_optimizer::engine::causal_graph::CausalGraph;
+use apollo_optimizer::engine::action_queue::ActionQueue;
 use apollo_optimizer::engine::neuromodulator::{ApolloNeuromodulator, NeuroSignals};
 use apollo_optimizer::engine::optimization_skills::SkillRegistry;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
@@ -206,6 +207,10 @@ pub(crate) struct SharedState {
 
     /// Clientes suscritos a push de estado (menubar, etc.)
     pub(crate) subscribers: Arc<Mutex<Vec<UnixStream>>>,
+
+    // Resilience layer
+    pub(crate) circuit_breaker: Arc<Mutex<apollo_optimizer::engine::circuit_breaker::CircuitBreaker>>,
+    pub(crate) degradation: Arc<Mutex<apollo_optimizer::engine::degradation::DegradationController>>,
 }
 
 /// Reactor thread counters and status — 9 fields merged into 1 Mutex.
@@ -661,6 +666,13 @@ fn main() -> anyhow::Result<()> {
                 resource_interrupt: Arc::new(ResourceInterruptState::new()),
 
                 subscribers: Arc::new(Mutex::new(Vec::new())),
+
+                circuit_breaker: Arc::new(Mutex::new(
+                    apollo_optimizer::engine::circuit_breaker::CircuitBreaker::default(),
+                )),
+                degradation: Arc::new(Mutex::new(
+                    apollo_optimizer::engine::degradation::DegradationController::default(),
+                )),
             };
 
             // Load persisted UserProfile (learning survives daemon restarts).
@@ -1077,6 +1089,11 @@ fn main() -> anyhow::Result<()> {
 
             // ── Daemon self-IPC monitoring (thread_selfcounts syscall 186) ───
             let mut cycle_ipc_tracker = apollo_optimizer::engine::thread_selfcounts::CycleIpcTracker::new();
+
+            // Priority action queue: buffers decide_actions output and dispatches at most
+            // max_per_cycle actions per cycle. Unfreeze (urgent) is never capped.
+            // Capacity=100 defines the denominator for backpressure_ratio reporting.
+            let mut action_queue = ActionQueue::new(20, 100);
 
             // Freeze confirmation cache: pid → consecutive cycles flagged.
             // Only freeze processes that have been candidates for 2+ cycles,
@@ -4417,6 +4434,21 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 // Phase 2: Execute actions WITHOUT holding the metrics lock.
+                //
+                // Priority action queue: buffer this cycle's decided actions and
+                // dispatch at most max_per_cycle per cycle. Urgent (Unfreeze) actions
+                // bypass the cap. Any overflow stays in the queue for the next cycle.
+                action_queue.push_all(final_actions);
+                let final_actions = action_queue.drain_cycle();
+                // Update backpressure metrics (observable in runtime_metrics.json).
+                {
+                    let bp = action_queue.backpressure_ratio();
+                    let pending_depth = outcome_tracker.pending_depth();
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.action_queue_backpressure = bp;
+                    metrics.outcome_pending_depth = pending_depth;
+                }
+
                 // Captura los nombres de throttles antes de mover final_actions.
                 let throttle_names_for_outcome: Vec<String> = final_actions
                     .iter()
@@ -4429,6 +4461,64 @@ fn main() -> anyhow::Result<()> {
                     })
                     .collect();
                 let exec_outcomes = {
+                    use apollo_optimizer::engine::degradation::{DegradationInputs, OperationMode};
+
+                    // ── Circuit breaker + degradation pre-check ───────────────
+                    // Snapshot circuit breaker state before acquiring heavy locks.
+                    let (cb_is_open, cb_open_duration) = {
+                        let cb = state.circuit_breaker.lock_recover();
+                        let is_open = *cb.state() == apollo_optimizer::engine::circuit_breaker::CircuitState::Open;
+                        let dur = cb.open_duration();
+                        (is_open, dur)
+                    };
+
+                    // Evaluate degradation tier; update last-cycle inputs.
+                    let op_mode = {
+                        // kernel_task CPU from top_processes (already captured this cycle).
+                        let kernel_cpu = snapshot
+                            .top_processes
+                            .iter()
+                            .find(|p| p.name == "kernel_task")
+                            .map(|p| p.cpu_usage as f64)
+                            .unwrap_or(0.0);
+                        let mut deg = state.degradation.lock_recover();
+                        let inp = DegradationInputs {
+                            new_failures: 0, // incremental failures added after execution
+                            kernel_task_cpu_pct: kernel_cpu,
+                            circuit_open: cb_is_open,
+                            circuit_open_duration: cb_open_duration,
+                        };
+                        deg.update(&inp).clone()
+                    };
+
+                    // Filter actions based on degradation tier.
+                    let filtered_actions: Vec<RootAction> = if op_mode == OperationMode::Emergency {
+                        // Emergency: only unfreeze, no new actions.
+                        final_actions
+                            .into_iter()
+                            .filter(|a| matches!(a, RootAction::UnfreezeProcess { .. }))
+                            .collect()
+                    } else if op_mode == OperationMode::Observe {
+                        // Observe: no actions at all.
+                        Vec::new()
+                    } else if op_mode == OperationMode::Conservative {
+                        // Conservative: only unfreeze + QoS hints (no SIGSTOP, no throttle).
+                        final_actions
+                            .into_iter()
+                            .filter(|a| {
+                                matches!(
+                                    a,
+                                    RootAction::UnfreezeProcess { .. }
+                                        | RootAction::SetThreadQoS { .. }
+                                        | RootAction::BoostProcess { .. }
+                                )
+                            })
+                            .collect()
+                    } else {
+                        // Full: all actions pass through.
+                        final_actions
+                    };
+
                     // Extract a temporary HashSet for execute_actions (which requires &mut HashSet<u32>).
                     let mut frozen_set: HashSet<u32> =
                         state.frozen_state.lock_recover().keys().copied().collect();
@@ -4442,15 +4532,66 @@ fn main() -> anyhow::Result<()> {
                         )
                     };
                     let mut qos = state.mach_qos.lock_recover();
-                    let outcomes = execute_actions(
-                        final_actions,
-                        &caps,
-                        &journal_path,
-                        &mut frozen_set,
-                        &learned_protected,
-                        &learned_interactive,
-                        Some(&mut qos),
-                    );
+
+                    // ── Circuit breaker + execute_actions ────────────────────
+                    // We use the external record_success/record_failure API so the
+                    // Mutex is never held across blocking I/O.
+                    let outcomes = if cb_is_open {
+                        // Circuit Open: only dispatch unfreeze (always safe).
+                        tracing::warn!(
+                            op_mode = op_mode.as_str(),
+                            "circuit-breaker: open — skipping execute_actions, dispatching unfreeze only"
+                        );
+                        let safe_actions: Vec<RootAction> = filtered_actions
+                            .into_iter()
+                            .filter(|a| matches!(a, RootAction::UnfreezeProcess { .. }))
+                            .collect();
+                        execute_actions(
+                            safe_actions,
+                            &caps,
+                            &journal_path,
+                            &mut frozen_set,
+                            &learned_protected,
+                            &learned_interactive,
+                            Some(&mut qos),
+                        )
+                    } else {
+                        // Circuit Closed or HalfOpen: run normally, then report outcome.
+                        let out = execute_actions(
+                            filtered_actions,
+                            &caps,
+                            &journal_path,
+                            &mut frozen_set,
+                            &learned_protected,
+                            &learned_interactive,
+                            Some(&mut qos),
+                        );
+                        // Report outcome to circuit breaker (lock released before I/O above).
+                        {
+                            let mut cb = state.circuit_breaker.lock_recover();
+                            if out.failures == 0 {
+                                cb.record_success();
+                            } else {
+                                for _ in 0..out.failures {
+                                    cb.record_failure();
+                                }
+                            }
+                        }
+                        out
+                    };
+
+                    // Update degradation controller with new failure count from this cycle.
+                    if outcomes.failures > 0 {
+                        let mut deg = state.degradation.lock_recover();
+                        let inp = DegradationInputs {
+                            new_failures: outcomes.failures,
+                            kernel_task_cpu_pct: 0.0,
+                            circuit_open: false,
+                            circuit_open_duration: None,
+                        };
+                        deg.update(&inp);
+                    }
+
                     // Sync the temporary set back into the unified frozen_state map.
                     let now = Utc::now();
                     let mut frozen_state = state.frozen_state.lock_recover();

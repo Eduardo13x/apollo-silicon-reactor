@@ -652,6 +652,17 @@ pub struct RuntimeMetrics {
     /// Experience memory size (resolved outcome records).
     #[serde(default)]
     pub experience_memory_size: usize,
+    // ── Action queue backpressure ─────────────────────────────────────────
+    /// Current backpressure ratio of the action queue [0.0, 1.0].
+    /// 0.0 = queue empty. 1.0 = queue at capacity.
+    /// High values mean actions are accumulating faster than they are executed.
+    #[serde(default)]
+    pub action_queue_backpressure: f64,
+    /// Pending unresolved outcome observations in OutcomeTracker [0, 300].
+    /// High depth = throttles are being applied faster than outcomes resolve (30s window).
+    #[serde(default)]
+    pub outcome_pending_depth: usize,
+
     /// Dr. Zero self-challenge score: average prediction error across hop groups.
     /// Low = solver is well-calibrated. High = needs more training.
     #[serde(default)]
@@ -760,4 +771,25 @@ impl Default for LlmRunMode {
     fn default() -> Self {
         Self::Sensitive
     }
+}
+
+/// Summary of circuit breaker and degradation state, returned by `GetHealth`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthReport {
+    /// "healthy" | "degraded" | "emergency"
+    pub status: String,
+    /// Circuit breaker state: "closed" | "open" | "half_open"
+    pub circuit_breaker: String,
+    /// Operation mode: "full" | "conservative" | "observe" | "emergency"
+    pub operation_mode: String,
+    /// Failures in the last 60 seconds as a fraction of threshold (0.0–∞).
+    pub failure_rate_60s: f32,
+    /// Total optimization cycles completed.
+    pub uptime_cycles: u64,
+    /// Total execute_actions failures recorded (lifetime).
+    pub total_failures: u64,
+    /// Total circuit breaker trips (lifetime).
+    pub cb_trips_total: u64,
+    /// Total degradation mode transitions (lifetime).
+    pub degradation_transitions: u64,
 }

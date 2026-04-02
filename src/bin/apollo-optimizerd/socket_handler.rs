@@ -35,8 +35,8 @@ use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::protocol::{DaemonRequest, DaemonResponse};
 use apollo_optimizer::engine::safety::pattern_conflicts_with_protected;
 use apollo_optimizer::engine::types::{
-    DaemonStatus, HardPath, LearnedPolicyStatus, LlmRunMode, LlmStatus, RuntimeMetrics,
-    UsageResponse,
+    DaemonStatus, HardPath, HealthReport, LearnedPolicyStatus, LlmRunMode, LlmStatus,
+    RuntimeMetrics, UsageResponse,
 };
 
 use super::{SharedState, STOP_REQUESTED};
@@ -620,6 +620,46 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
         DaemonRequest::GetSysctlGovernor => {
             let status = state.sysctl_governor_status.lock_recover().clone();
             DaemonResponse::SysctlGovernor(status)
+        }
+        DaemonRequest::GetHealth => {
+            use apollo_optimizer::engine::circuit_breaker::CircuitState;
+            use apollo_optimizer::engine::degradation::OperationMode;
+
+            let (cb_state_str, cb_trips) = {
+                let cb = state.circuit_breaker.lock_recover();
+                (cb.state().as_str().to_string(), cb.trips_total)
+            };
+            let (op_mode_str, failure_rate, deg_transitions) = {
+                let deg = state.degradation.lock_recover();
+                (
+                    deg.mode.as_str().to_string(),
+                    deg.failure_rate_60s(),
+                    deg.transitions_total,
+                )
+            };
+            let (uptime_cycles, total_failures) = {
+                let m = state.metrics.lock_recover();
+                (m.cycles, m.failures)
+            };
+            let is_emergency = op_mode_str == OperationMode::Emergency.as_str();
+            let is_degraded = op_mode_str != OperationMode::Full.as_str();
+            let status = if is_emergency {
+                "emergency"
+            } else if is_degraded || cb_state_str != CircuitState::Closed.as_str() {
+                "degraded"
+            } else {
+                "healthy"
+            };
+            DaemonResponse::Health(HealthReport {
+                status: status.to_string(),
+                circuit_breaker: cb_state_str,
+                operation_mode: op_mode_str,
+                failure_rate_60s: failure_rate,
+                uptime_cycles,
+                total_failures,
+                cb_trips_total: cb_trips,
+                degradation_transitions: deg_transitions,
+            })
         }
         // Subscribe es manejado antes de llegar aqui (en handle_client)
         DaemonRequest::Subscribe => DaemonResponse::Ok,
