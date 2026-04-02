@@ -332,7 +332,7 @@ impl RlThresholdAgent {
 
             // Trajectory recording (Hermes pattern): persist transitions for offline learning.
             // Append to JSONL every 10 ticks to amortize I/O cost.
-            if self.total_ticks % 10 == 0 {
+            if self.total_ticks % 100 == 0 {
                 self.record_trajectory(s, a, reward, s_prime);
             }
         }
