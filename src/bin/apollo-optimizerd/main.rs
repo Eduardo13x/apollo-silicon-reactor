@@ -4696,6 +4696,7 @@ fn main() -> anyhow::Result<()> {
                 // State compression (Hermes pattern): compress old experience records.
                 if cycle_count % 500 == 0 {
                     outcome_tracker.experience.compress_old();
+                    outcome_tracker.gc_weights(); // BUG-04: prune low-signal weight entries
                     skill_registry.gc(); // retire ineffective skills
                     skill_registry.persist(std::path::Path::new(skills_path));
                 }
