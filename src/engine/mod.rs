@@ -1,3 +1,4 @@
+pub mod action_queue;
 pub mod activity_sensor;
 pub mod adaptive_governor;
 pub mod analytics;
@@ -5,7 +6,9 @@ pub mod background_collectors;
 pub mod cache_warmer;
 pub mod capabilities;
 pub mod causal_graph;
+pub mod circuit_breaker;
 pub mod coalition;
+pub mod degradation;
 pub mod compressor_aware;
 pub mod cusum;
 pub mod daemon_helpers;
@@ -83,6 +86,9 @@ pub mod wait_graph;
 pub mod wake_storm_detector;
 pub mod workload_classifier;
 pub mod zombie_hunter;
+
+// ── Pipeline stage abstraction ────────────────────────────────────────────────
+pub mod pipeline;
 
 // ── Subatomic layer (ARM64 EL0 floor) ────────────────────────────────────────
 pub mod amx_detector;
