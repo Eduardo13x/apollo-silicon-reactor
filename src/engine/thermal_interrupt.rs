@@ -735,6 +735,7 @@ fn freeze_non_critical(
                     // Pressure not available in interrupt context; use 1.0 so
                     // only the TTL path can trigger early unfreeze for these entries.
                     pressure_at_freeze: 1.0,
+                    process_name: None, // name not available in interrupt context
                 });
             }
         }

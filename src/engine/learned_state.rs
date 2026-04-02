@@ -50,6 +50,12 @@ pub struct LearnedState {
     /// Persisted so we can compare across restarts.
     #[serde(default)]
     pub last_restore_quality: Option<f64>,
+
+    /// Pending trial skill: (skill_name, pressure_before_trial).
+    /// If the daemon restarts mid-trial, this lets the next cycle record the
+    /// trial result instead of silently dropping it.
+    #[serde(default)]
+    pub pending_trial_skill: Option<(String, f64)>,
 }
 
 fn default_version() -> u32 { 1 }
@@ -80,6 +86,7 @@ impl LearnedState {
             specialist_accuracy: Some(specialist_accuracy.clone()),
             persist_generations: 0,
             last_restore_quality: None,
+            pending_trial_skill: None,
         }
     }
 
@@ -190,10 +197,12 @@ impl LearnedState {
         path: &Path,
         prev_generations: u32,
         last_quality: Option<f64>,
+        pending_trial_skill: Option<(String, f64)>,
     ) {
         let mut state = Self::collect(signal_intel, outcome_tracker, specialist_accuracy);
         state.persist_generations = prev_generations;
         state.last_restore_quality = last_quality;
+        state.pending_trial_skill = pending_trial_skill;
         state.self_improve();
         state.persist(path);
     }
@@ -346,6 +355,7 @@ mod tests {
             specialist_accuracy: None,
             persist_generations: 0,
             last_restore_quality: None,
+            pending_trial_skill: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -364,6 +374,7 @@ mod tests {
             specialist_accuracy: None,
             persist_generations: 0,
             last_restore_quality: None,
+            pending_trial_skill: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -380,6 +391,7 @@ mod tests {
             specialist_accuracy: None,
             persist_generations: 0,
             last_restore_quality: None,
+            pending_trial_skill: None,
         };
         assert_eq!(state.outcome_tracker.as_ref().unwrap().experience_records.len(), 400);
         state.self_improve();
@@ -395,6 +407,7 @@ mod tests {
             specialist_accuracy: None,
             persist_generations: 5,
             last_restore_quality: None,
+            pending_trial_skill: None,
         };
         state.self_improve();
         assert_eq!(state.persist_generations, 6);
@@ -421,6 +434,7 @@ mod tests {
             specialist_accuracy: None,
             persist_generations: 0,
             last_restore_quality: None,
+            pending_trial_skill: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -452,6 +466,7 @@ mod tests {
             specialist_accuracy: None,
             persist_generations: 0,
             last_restore_quality: None,
+            pending_trial_skill: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();

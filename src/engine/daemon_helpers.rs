@@ -219,6 +219,7 @@ pub fn write_frozen_state(path: &Path, frozen_state: &HashMap<u32, FrozenEntry>)
             .map(|(pid, entry)| FrozenPidEntry {
                 pid: *pid,
                 since: entry.frozen_at,
+                name: entry.process_name.clone(),
             })
             .collect(),
     };
@@ -238,6 +239,7 @@ pub fn load_frozen_state(path: &Path) -> HashMap<u32, FrozenEntry> {
                             frozen_at: e.since,
                             source: FreezeSource::MainLoop,
                             pressure_at_freeze: 1.0,
+                            process_name: e.name,
                         },
                     )
                 })
