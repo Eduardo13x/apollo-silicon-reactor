@@ -757,11 +757,41 @@ fn main() -> anyhow::Result<()> {
             });
 
             // Defensive: if a previous run froze processes and crashed/restarted, unfreeze them on startup.
+            // PID reuse guard: if a process_name was recorded at freeze time, verify the current
+            // process at that PID still has the same name before sending SIGCONT. If names differ,
+            // the PID was recycled — skip SIGCONT (the original process is gone; the new one is
+            // running normally and doesn't need SIGCONT).
             {
                 let mut frozen_state = state.frozen_state.lock_recover();
                 if !frozen_state.is_empty() {
-                    let count = unfreeze_pids(frozen_state.keys().copied());
-                    frozen_state.clear();
+                    // Build a lightweight set of live process names for PID-reuse detection.
+                    // We spin up sysinfo only if there are frozen entries to check.
+                    use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+                    let mut sys = System::new_with_specifics(
+                        RefreshKind::new().with_processes(ProcessRefreshKind::new()),
+                    );
+                    sys.refresh_processes_specifics(ProcessRefreshKind::new());
+
+                    let safe_pids: Vec<u32> = frozen_state
+                        .iter()
+                        .filter(|(pid, entry)| {
+                            if let Some(ref expected_name) = entry.process_name {
+                                // A name was recorded: verify the current process still matches.
+                                let pid_sysinfo = sysinfo::Pid::from_u32(**pid);
+                                match sys.process(pid_sysinfo) {
+                                    Some(proc) => proc.name() == expected_name.as_str(),
+                                    None => false, // process is gone — no SIGCONT needed
+                                }
+                            } else {
+                                // No name recorded (legacy entry): send SIGCONT unconditionally.
+                                // SIGCONT to a non-stopped process is a kernel no-op.
+                                true
+                            }
+                        })
+                        .map(|(pid, _)| *pid)
+                        .collect();
+
+                    let count = unfreeze_pids(safe_pids.into_iter());
                     frozen_state.clear();
                     write_frozen_state(&frozen_state_path, &frozen_state);
                     {
@@ -922,9 +952,12 @@ fn main() -> anyhow::Result<()> {
             let mut persist_generations: u32 = 0;
             let mut last_restore_quality: Option<f64> = None;
             let mut restore_monitor = RestoreQualityMonitor::new();
+            // Restored pending trial skill from the previous run (if daemon crashed mid-trial).
+            let mut restored_trial_skill: Option<(String, f64)> = None;
             if let Some(learned) = LearnedState::load(ls_path) {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
+                restored_trial_skill = learned.pending_trial_skill.clone();
                 learned.apply(
                     &mut signal_intel,
                     &mut outcome_tracker,
@@ -1050,7 +1083,8 @@ fn main() -> anyhow::Result<()> {
             let mut freeze_candidates: HashMap<u32, u8> = HashMap::new();
             let mut cycle_count: u64 = 0;
             // Pending trial skill: (name, pressure_before). Recorded next cycle.
-            let mut pending_trial_skill: Option<(String, f64)> = None;
+            // Restored from LearnedState so a trial started before a crash is still evaluated.
+            let mut pending_trial_skill: Option<(String, f64)> = restored_trial_skill;
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
             // Gate network_monitor.tick() to every ~10s since netstat is blocking.
@@ -1179,8 +1213,8 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    // Watchdog: check background collector health every 60 cycles (also cycle 1).
-                    if cycle_count % 60 == 0 || cycle_count == 1 {
+                    // Watchdog: check background collector health every 60 cycles (starting cycle 1).
+                    if cycle_count % 60 == 1 {
                         let pressure_alive = pressure_collector.is_alive(120);
                         let smc_alive = smc_reader.is_alive(120);
                         {
@@ -1287,6 +1321,7 @@ fn main() -> anyhow::Result<()> {
                                             pressure_at_freeze: pressure_collector
                                                 .latest()
                                                 .memory_pressure,
+                                            process_name: Some(name.clone()),
                                         },
                                     );
                                     turbo_frozen += 1;
@@ -1734,6 +1769,7 @@ fn main() -> anyhow::Result<()> {
                                     frozen_at: Utc::now(),
                                     source: FreezeSource::ThermalPreThrottle,
                                     pressure_at_freeze: snapshot.pressure.memory_pressure,
+                                    process_name: Some(name.clone()),
                                 },
                             );
                             thermal_frozen += 1;
@@ -4406,6 +4442,7 @@ fn main() -> anyhow::Result<()> {
                             frozen_at: now,
                             source: FreezeSource::MainLoop,
                             pressure_at_freeze: snapshot.pressure.memory_pressure,
+                            process_name: None, // name not available in this execute path
                         });
                     }
                     // Remove PIDs that are no longer frozen.
@@ -4662,6 +4699,7 @@ fn main() -> anyhow::Result<()> {
                         ls_path,
                         persist_generations,
                         last_restore_quality,
+                        pending_trial_skill.clone(),
                     );
                     // Causal graph observability: log solid/weak links discovered.
                     let solid = causal_graph.solid_count();
@@ -5079,6 +5117,8 @@ fn main() -> anyhow::Result<()> {
             focus_markov.persist();
             holt_winters.persist(&hw_path);
             signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
+            // On clean shutdown, clear the pending trial: the result can't be measured
+            // reliably after a restart since system pressure state will differ.
             LearnedState::persist_improved(
                 &signal_intel,
                 &outcome_tracker,
@@ -5086,6 +5126,7 @@ fn main() -> anyhow::Result<()> {
                 ls_path,
                 persist_generations,
                 last_restore_quality,
+                None,
             );
 
             // Revert sysctls to defaults on shutdown.

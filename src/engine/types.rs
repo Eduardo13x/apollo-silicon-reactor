@@ -287,6 +287,11 @@ pub struct FrozenEntry {
     /// ensuring only the TTL path triggers for pre-existing freezes.
     #[serde(default = "frozen_entry_pressure_default")]
     pub pressure_at_freeze: f64,
+    /// Process name at the time of freeze. Used on startup to detect PID reuse:
+    /// if the current process at this PID has a different name, the PID was
+    /// recycled and we skip SIGCONT (the original process is already gone).
+    #[serde(default)]
+    pub process_name: Option<String>,
 }
 
 fn frozen_entry_pressure_default() -> f64 {
@@ -297,6 +302,9 @@ fn frozen_entry_pressure_default() -> f64 {
 pub struct FrozenPidEntry {
     pub pid: u32,
     pub since: DateTime<Utc>,
+    /// Process name captured at freeze time. Used on restart to detect PID reuse.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
