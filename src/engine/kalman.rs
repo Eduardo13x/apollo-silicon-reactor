@@ -75,11 +75,13 @@ impl Kalman1D {
     pub fn update(&mut self, measurement: f64, dt: f64) {
         if !self.initialized {
             // Primera observación: inicializar estado directamente.
+            // p11 initialized to q (process noise) rather than 1.0 — more confident
+            // that velocity starts near 0, reducing noise in early stable-period estimates.
             self.x = measurement;
             self.v = 0.0;
             self.p00 = self.r;
             self.p01 = 0.0;
-            self.p11 = 1.0;
+            self.p11 = self.q;
             self.initialized = true;
             return;
         }
@@ -152,6 +154,14 @@ impl Kalman1D {
     /// Used by KPC IPC modulation: low IPC (memory-bound) → lower R.
     pub fn set_measurement_noise(&mut self, r: f64) {
         self.r = r.max(1e-6); // safety floor
+    }
+
+    /// Dynamically adjust process noise Q.
+    /// Higher Q = filter adapts faster to signal changes (less lag, more noise).
+    /// Lower Q = smoother but slower to track genuine regime shifts.
+    /// Mirrors set_measurement_noise for symmetric adaptive tuning.
+    pub fn set_process_noise(&mut self, q: f64) {
+        self.q = q.max(1e-8); // safety floor
     }
 }
 
