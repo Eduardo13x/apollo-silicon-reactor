@@ -972,10 +972,14 @@ fn main() -> anyhow::Result<()> {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
                 restored_trial_skill = learned.pending_trial_skill.clone();
+                // apply() restores skills from learned_state.json if present,
+                // overwriting the legacy optimization_skills.json load above.
+                // If skill_registry field is absent (old file), the legacy load is kept.
                 learned.apply(
                     &mut signal_intel,
                     &mut outcome_tracker,
                     &mut specialist_accuracy,
+                    &mut skill_registry,
                 );
                 restore_monitor = RestoreQualityMonitor::new();
             }
@@ -4879,6 +4883,7 @@ fn main() -> anyhow::Result<()> {
                         &signal_intel,
                         &outcome_tracker,
                         &specialist_accuracy,
+                        &skill_registry,
                         ls_path,
                         persist_generations,
                         last_restore_quality,
@@ -5306,6 +5311,7 @@ fn main() -> anyhow::Result<()> {
                 &signal_intel,
                 &outcome_tracker,
                 &specialist_accuracy,
+                &skill_registry,
                 ls_path,
                 persist_generations,
                 last_restore_quality,
