@@ -432,6 +432,22 @@ impl OutcomeTracker {
         (self.total_effective as f64 + 1.0) / (self.total_resolved as f64 + 2.0)
     }
 
+    /// Backpressure ratio of the pending outcome queue [0.0, 1.0].
+    ///
+    /// 0.0 = no pending observations.
+    /// 1.0 = queue at capacity (300 items).
+    /// Values > 0.5 suggest throttling is happening faster than outcomes resolve;
+    /// callers can use this to reduce aggressiveness.
+    pub fn pending_backpressure_ratio(&self) -> f64 {
+        const CAP: usize = 300;
+        (self.pending.len() as f64 / CAP as f64).min(1.0)
+    }
+
+    /// Number of currently pending (unresolved) outcome observations.
+    pub fn pending_depth(&self) -> usize {
+        self.pending.len()
+    }
+
     /// GC for the weights HashMap — prevents unbounded growth in long-running daemons.
     ///
     /// Prunes entries that carry insufficient signal: fewer than 5 throttles AND
