@@ -67,6 +67,10 @@ const ML_BINARY_NAMES: &[&str] = &[
     "whisper",
     "whisper-server",
     "tortoise-tts",
+    // Apple on-device ML/intelligence (iOS/macOS Sequoia+)
+    "mlhostd",
+    "intelligencecontextd",
+    "modelmanagerd",
 ];
 
 /// Path substrings that indicate Accelerate/AMX usage.

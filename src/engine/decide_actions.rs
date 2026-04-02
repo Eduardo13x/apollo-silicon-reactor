@@ -33,6 +33,20 @@ const NOISE_APPS: [&str; 6] = [
     "suggestd",
 ];
 
+/// Apple on-device intelligence / ML background daemons.
+/// These run opportunistically (idle + AC power) and are safe to throttle
+/// aggressively when memory pressure is high — they resume when pressure drops.
+const DEFERRABLE_DAEMONS: [&str; 8] = [
+    "duetexpertd",        // Siri predictions / Proactive engine
+    "suggestd",           // Spotlight/Siri suggestions ML
+    "photoanalysisd",     // Photos ML tagging / face recognition
+    "mediaanalysisd",     // Media content analysis
+    "intelligencecontextd", // Apple Intelligence context engine
+    "mlhostd",            // Metal/Core ML on-device inference host
+    "modelmanagerd",      // On-device model cache manager
+    "corespeechd",        // Siri speech recognition (background)
+];
+
 const BLOCKER_APPS: [&str; 7] = [
     "WindowServer",
     "accountsd",
@@ -338,7 +352,7 @@ pub fn decide_actions(
                     // Groups needing exploration bypass the skip — the solver
                     // is uncertain about their effectiveness and needs more data.
                     if !group.needs_exploration() {
-                        if group.throttle_count >= 20 && group.effectiveness() < 0.15
+                        if group.throttle_count >= 15 && group.effectiveness() < 0.12
                             && !matches!(context, InteractiveContext::ThermalConstrained)
                         {
                             low_value_skipped.push(format!("hrpo-skip:{}", name));
@@ -555,6 +569,30 @@ pub fn decide_actions(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // 4b) Deferrable Apple intelligence/ML daemons: throttle immediately under
+    // BackgroundPressure without waiting for HRPO learning cycles.  These processes
+    // self-throttle on AC/idle normally; under RAM pressure we accelerate that.
+    if matches!(
+        context,
+        InteractiveContext::BackgroundPressure | InteractiveContext::ThermalConstrained
+    ) {
+        for (pid, process) in sys.processes() {
+            let name = process.name().to_string();
+            if DEFERRABLE_DAEMONS.iter().any(|d| name.contains(d))
+                && !critical_pids.contains(&pid.as_u32())
+            {
+                actions.push(RootAction::ThrottleProcess {
+                    pid: pid.as_u32(),
+                    name,
+                    aggressive: false,
+                    reason: "deferrable-ml-daemon: throttled under memory pressure".to_string(),
+                    start_sec: 0,
+                    start_usec: 0,
+                });
             }
         }
     }

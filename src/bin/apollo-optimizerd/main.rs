@@ -1061,6 +1061,9 @@ fn main() -> anyhow::Result<()> {
             let mut prev_package_watts: Option<f64> = None;
             // Track previous cycle's workload for onset detection (build-onset-proactive).
             let mut prev_workload_mode: WorkloadMode = WorkloadMode::Idle;
+            // Spotlight pause state: true when Apollo has paused Spotlight indexing
+            // via mdutil to relieve memory pressure.  Re-enabled when pressure normalizes.
+            let mut spotlight_paused: bool = false;
             // EMA interactivity classifier: track per-PID rusage CPU deltas
             // to compute cpu_wall_ratio. Key = PID, value = (prev_user_ns,
             // prev_system_ns, proc_start_abstime) for delta computation.
@@ -3097,6 +3100,36 @@ fn main() -> anyhow::Result<()> {
                                 });
                                 break;
                             }
+                        }
+                    }
+                }
+
+                // Spotlight pressure gate: pause indexing when swap is heavy and
+                // re-enable when pressure normalizes.  Uses mdutil (clean handshake
+                // with Spotlight server) rather than SIGSTOP — no index corruption risk.
+                // Gate: memory_pressure ≥ 0.75 AND swap ≥ 1.5 GB → pause.
+                // Re-enable: memory_pressure < 0.55 AND spotlight was paused by us.
+                {
+                    let mem_p = snapshot.pressure.memory_pressure;
+                    let swap_gb = snapshot.pressure.swap_used_bytes as f64
+                        / (1024.0 * 1024.0 * 1024.0);
+                    let can_mdutil = std::path::Path::new("/usr/bin/mdutil").exists();
+                    if can_mdutil {
+                        if !spotlight_paused && mem_p >= 0.75 && swap_gb >= 1.5 {
+                            actions.push(apollo_optimizer::engine::types::RootAction::ToggleSpotlight {
+                                enabled: false,
+                                reason: format!(
+                                    "swap-pressure: mem={:.2} swap={:.1}GB",
+                                    mem_p, swap_gb
+                                ),
+                            });
+                            spotlight_paused = true;
+                        } else if spotlight_paused && mem_p < 0.55 {
+                            actions.push(apollo_optimizer::engine::types::RootAction::ToggleSpotlight {
+                                enabled: true,
+                                reason: "pressure-normalized: re-enabling spotlight".to_string(),
+                            });
+                            spotlight_paused = false;
                         }
                     }
                 }

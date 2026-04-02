@@ -274,7 +274,9 @@ pub fn behavioral_protection_score(
     // Network: active sockets. Weak hint — socket existence ≠ active I/O.
     // Cumulative mach_msgs inflate has_network for long-lived daemons,
     // so this is circumstantial evidence, not proof of activity.
-    let net_signal = if has_network { 0.3 } else { 0.0 };
+    // Reduced from 0.30 → 0.15: always-listening background daemons (suggestd,
+    // cloudd, imagent) have persistent sockets but are not meaningfully active.
+    let net_signal = if has_network { 0.15 } else { 0.0 };
 
     // GUI: visible window. User can see it → strong protection.
     let gui_signal = if has_gui_window { 0.8 } else { 0.0 };
