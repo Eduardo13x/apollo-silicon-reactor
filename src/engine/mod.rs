@@ -38,6 +38,7 @@ pub mod journal;
 pub mod kalman;
 pub mod learned_state;
 pub mod latency_monitor;
+pub mod learning_pipeline;
 pub mod llm_inference_mode;
 pub mod llm;
 pub mod lock_ext;
