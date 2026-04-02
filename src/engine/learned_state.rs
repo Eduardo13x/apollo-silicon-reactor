@@ -16,6 +16,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
+
+use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
 use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
 use crate::engine::predictive_agent::SpecialistAccuracyTracker;
 use crate::engine::signal_intelligence::{SignalIntelligence, SignalIntelligencePersisted};
@@ -56,9 +59,19 @@ pub struct LearnedState {
     /// trial result instead of silently dropping it.
     #[serde(default)]
     pub pending_trial_skill: Option<(String, f64)>,
+
+    /// Optimization skills — persisted here so a single file captures all learned state.
+    ///
+    /// When present, this field takes precedence over `optimization_skills.json`.
+    /// During the transition period, both files are written (dual-write).
+    /// `None` means no skills were persisted — cold start or old file format.
+    #[serde(default)]
+    pub skill_registry: Option<HashMap<String, OptimizationSkill>>,
 }
 
-fn default_version() -> u32 { 1 }
+fn default_version() -> u32 {
+    1
+}
 
 // ── Self-improvement constants ──────────────────────────────────────────────
 
@@ -78,6 +91,7 @@ impl LearnedState {
         signal_intel: &SignalIntelligence,
         outcome_tracker: &OutcomeTracker,
         specialist_accuracy: &SpecialistAccuracyTracker,
+        skill_registry: &SkillRegistry,
     ) -> Self {
         Self {
             version: 1,
@@ -87,6 +101,7 @@ impl LearnedState {
             persist_generations: 0,
             last_restore_quality: None,
             pending_trial_skill: None,
+            skill_registry: Some(skill_registry.snapshot()),
         }
     }
 
@@ -98,6 +113,7 @@ impl LearnedState {
         signal_intel: &mut SignalIntelligence,
         outcome_tracker: &mut OutcomeTracker,
         specialist_accuracy: &mut SpecialistAccuracyTracker,
+        skill_registry: &mut SkillRegistry,
     ) {
         self.validate();
         if let Some(si) = self.signal_intelligence {
@@ -108,6 +124,12 @@ impl LearnedState {
         }
         if let Some(sa) = self.specialist_accuracy {
             *specialist_accuracy = sa;
+        }
+        // Restore skills only if the field is present — backwards compat:
+        // old learned_state.json files (field absent) fall through to the
+        // legacy optimization_skills.json load that the caller performs after.
+        if let Some(skills) = self.skill_registry {
+            skill_registry.restore_from_map(skills);
         }
     }
 
@@ -128,9 +150,8 @@ impl LearnedState {
             // 2. Prune Bayesian weights that carry no signal.
             //    Processes with <3 throttles and effectiveness ~0.5 (prior)
             //    are noise — discard them to keep the file lean.
-            ot.weights.retain(|_, w| {
-                w.throttle_count >= WEIGHT_MIN_THROTTLES || w.effective_count > 0
-            });
+            ot.weights
+                .retain(|_, w| w.throttle_count >= WEIGHT_MIN_THROTTLES || w.effective_count > 0);
 
             // 3. Compress experience memory: keep last EXPERIENCE_CAP records.
             //    Older records are less relevant as workload patterns shift.
@@ -190,16 +211,23 @@ impl LearnedState {
 
     /// Collect + self-improve + persist in one call.
     /// This is the recommended way to persist — replaces raw `collect().persist()`.
+    #[allow(clippy::too_many_arguments)]
     pub fn persist_improved(
         signal_intel: &SignalIntelligence,
         outcome_tracker: &OutcomeTracker,
         specialist_accuracy: &SpecialistAccuracyTracker,
+        skill_registry: &SkillRegistry,
         path: &Path,
         prev_generations: u32,
         last_quality: Option<f64>,
         pending_trial_skill: Option<(String, f64)>,
     ) {
-        let mut state = Self::collect(signal_intel, outcome_tracker, specialist_accuracy);
+        let mut state = Self::collect(
+            signal_intel,
+            outcome_tracker,
+            specialist_accuracy,
+            skill_registry,
+        );
         state.persist_generations = prev_generations;
         state.last_restore_quality = last_quality;
         state.pending_trial_skill = pending_trial_skill;
@@ -276,7 +304,10 @@ impl RestoreQualityMonitor {
         self.fired = true;
         let quality = if self.resolved < 5 {
             // Not enough data to judge — assume OK.
-            return Some(RestoreVerdict { quality: 0.5, stale: false });
+            return Some(RestoreVerdict {
+                quality: 0.5,
+                stale: false,
+            });
         } else {
             (self.effective as f64 + 1.0) / (self.resolved as f64 + 2.0)
         };
@@ -307,20 +338,34 @@ pub struct RestoreVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::outcome_tracker::{ExperienceRecord, HopGroupWeight, PatternWeight, WorkloadHop};
+    use crate::engine::outcome_tracker::{
+        ExperienceRecord, HopGroupWeight, PatternWeight, WorkloadHop,
+    };
     use std::collections::HashMap;
 
     fn make_ot_persisted() -> OutcomeTrackerPersisted {
         let mut weights = HashMap::new();
         // Process with signal: keep.
-        weights.insert("brave".to_string(), PatternWeight { throttle_count: 10, effective_count: 7 });
+        weights.insert(
+            "brave".to_string(),
+            PatternWeight {
+                throttle_count: 10,
+                effective_count: 7,
+            },
+        );
         // Process without signal: prune (1 throttle, 0 effective).
-        weights.insert("noise".to_string(), PatternWeight { throttle_count: 1, effective_count: 0 });
+        weights.insert(
+            "noise".to_string(),
+            PatternWeight {
+                throttle_count: 1,
+                effective_count: 0,
+            },
+        );
 
         let co_occurrence = vec![
-            ("a".into(), "b".into(), 20),  // will decay to 18, kept
-            ("c".into(), "d".into(), 2),   // will decay to ~2, borderline
-            ("e".into(), "f".into(), 1),   // will decay to ~1, pruned
+            ("a".into(), "b".into(), 20), // will decay to 18, kept
+            ("c".into(), "d".into(), 2),  // will decay to ~2, borderline
+            ("e".into(), "f".into(), 1),  // will decay to ~1, pruned
         ];
 
         let mut experience_records = Vec::new();
@@ -356,6 +401,7 @@ mod tests {
             persist_generations: 0,
             last_restore_quality: None,
             pending_trial_skill: None,
+            skill_registry: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -375,6 +421,7 @@ mod tests {
             persist_generations: 0,
             last_restore_quality: None,
             pending_trial_skill: None,
+            skill_registry: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -392,10 +439,27 @@ mod tests {
             persist_generations: 0,
             last_restore_quality: None,
             pending_trial_skill: None,
+            skill_registry: None,
         };
-        assert_eq!(state.outcome_tracker.as_ref().unwrap().experience_records.len(), 400);
+        assert_eq!(
+            state
+                .outcome_tracker
+                .as_ref()
+                .unwrap()
+                .experience_records
+                .len(),
+            400
+        );
         state.self_improve();
-        assert_eq!(state.outcome_tracker.as_ref().unwrap().experience_records.len(), EXPERIENCE_CAP);
+        assert_eq!(
+            state
+                .outcome_tracker
+                .as_ref()
+                .unwrap()
+                .experience_records
+                .len(),
+            EXPERIENCE_CAP
+        );
     }
 
     #[test]
@@ -408,6 +472,7 @@ mod tests {
             persist_generations: 5,
             last_restore_quality: None,
             pending_trial_skill: None,
+            skill_registry: None,
         };
         state.self_improve();
         assert_eq!(state.persist_generations, 6);
@@ -435,6 +500,7 @@ mod tests {
             persist_generations: 0,
             last_restore_quality: None,
             pending_trial_skill: None,
+            skill_registry: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -452,11 +518,11 @@ mod tests {
             weights: HashMap::new(),
             total_effective: 0,
             total_resolved: 0,
-            baseline_drop_ema: 2.0,    // out of range
+            baseline_drop_ema: 2.0, // out of range
             baseline_samples: 0,
             experience_records: vec![],
             co_occurrence: vec![],
-            natural_drift_ema: -0.5,   // out of range
+            natural_drift_ema: -0.5, // out of range
             hop_groups: HashMap::new(),
         };
         let mut state = LearnedState {
@@ -467,6 +533,7 @@ mod tests {
             persist_generations: 0,
             last_restore_quality: None,
             pending_trial_skill: None,
+            skill_registry: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -483,7 +550,10 @@ mod tests {
             monitor.observe(eff, 1);
         }
         let verdict = monitor.verdict().expect("should have verdict");
-        assert!(verdict.stale, "low effectiveness should be flagged as stale");
+        assert!(
+            verdict.stale,
+            "low effectiveness should be flagged as stale"
+        );
         assert!(verdict.quality < QUALITY_THRESHOLD);
     }
 
@@ -507,7 +577,10 @@ mod tests {
             monitor.observe(1, 1);
         }
         assert!(monitor.verdict().is_some());
-        assert!(monitor.verdict().is_none(), "second call should return None");
+        assert!(
+            monitor.verdict().is_none(),
+            "second call should return None"
+        );
         assert!(monitor.is_done());
     }
 }

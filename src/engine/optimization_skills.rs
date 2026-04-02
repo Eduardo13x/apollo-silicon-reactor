@@ -107,8 +107,10 @@ impl SkillRegistry {
 
     /// Learn a new skill from observed effective throttle patterns.
     pub fn learn(&mut self, name: &str, pressure: f32, workload: &str, targets: Vec<String>) {
-        let skill = self.skills.entry(name.to_string()).or_insert_with(|| {
-            OptimizationSkill {
+        let skill = self
+            .skills
+            .entry(name.to_string())
+            .or_insert_with(|| OptimizationSkill {
                 name: name.to_string(),
                 min_pressure: pressure,
                 workload_hint: workload.to_string(),
@@ -116,8 +118,7 @@ impl SkillRegistry {
                 success_rate: 0.5,
                 apply_count: 0,
                 success_count: 0,
-            }
-        });
+            });
         // Update pressure threshold with EMA.
         skill.min_pressure = skill.min_pressure * 0.9 + pressure * 0.1;
     }
@@ -188,7 +189,9 @@ impl SkillRegistry {
             // Keep if at least one target is NOT protected.
             skill.throttle_targets.iter().any(|target| {
                 let tl = target.to_ascii_lowercase();
-                !protected.iter().any(|p| tl.contains(&p.to_ascii_lowercase()))
+                !protected
+                    .iter()
+                    .any(|p| tl.contains(&p.to_ascii_lowercase()))
             })
         });
     }
@@ -231,8 +234,7 @@ impl SkillRegistry {
             {
                 skill.success_count = skill.success_count.saturating_add(1);
                 skill.apply_count = skill.apply_count.saturating_add(1);
-                skill.success_rate =
-                    skill.success_count as f32 / skill.apply_count.max(1) as f32;
+                skill.success_rate = skill.success_count as f32 / skill.apply_count.max(1) as f32;
                 return true;
             }
         }
@@ -262,6 +264,17 @@ impl SkillRegistry {
     /// Number of reliable skills.
     pub fn reliable_count(&self) -> usize {
         self.skills.values().filter(|s| s.is_reliable()).count()
+    }
+
+    /// Snapshot all skills as a cloned map — used by LearnedState::collect().
+    pub fn snapshot(&self) -> HashMap<String, OptimizationSkill> {
+        self.skills.clone()
+    }
+
+    /// Restore skills from a persisted map — used by LearnedState::apply().
+    /// Replaces the entire registry; existing skills are discarded.
+    pub fn restore_from_map(&mut self, map: HashMap<String, OptimizationSkill>) {
+        self.skills = map;
     }
 
     /// Persist to disk.
@@ -363,7 +376,10 @@ mod tests {
         }
         assert!(s.apply_count >= 20);
         assert!(s.success_rate < 0.50);
-        assert!(s.should_retire(), "zombie skill at 40% after 20 obs should retire");
+        assert!(
+            s.should_retire(),
+            "zombie skill at 40% after 20 obs should retire"
+        );
     }
 
     #[test]
@@ -410,7 +426,10 @@ mod tests {
         reg.record_result_with_pressure("adapt_skill", true, 0.75);
         let after = reg.skills["adapt_skill"].min_pressure;
         // Should have shifted toward 0.75
-        assert!(after > before, "effective trial at higher pressure should shift threshold up");
+        assert!(
+            after > before,
+            "effective trial at higher pressure should shift threshold up"
+        );
         assert!((after - (before * 0.80 + 0.75 * 0.20)).abs() < 0.002);
     }
 
@@ -422,7 +441,10 @@ mod tests {
         reg.record_result_with_pressure("no_adapt", false, 0.90);
         let after = reg.skills["no_adapt"].min_pressure;
         // Failure should not shift threshold
-        assert_eq!(after, before, "failed trial should not adapt pressure threshold");
+        assert_eq!(
+            after, before,
+            "failed trial should not adapt pressure threshold"
+        );
     }
 
     // ── next_trial_skill() tests ──────────────────────────────────────────────
@@ -520,12 +542,21 @@ mod tests {
         registry2.register_induced(b1);
         // next_trial_skill returns one at a time; drain all eligible
         while registry2.next_trial_skill(0.70, "browsing").is_some() {
-            let name = registry2.next_trial_skill(0.70, "browsing").unwrap().name.clone();
+            let name = registry2
+                .next_trial_skill(0.70, "browsing")
+                .unwrap()
+                .name
+                .clone();
             registry2.record_result(&name, false);
             count += 1;
-            if count > 20 { break; }
+            if count > 20 {
+                break;
+            }
         }
-        assert!(count >= 1, "browsing skill should be trialed during browsing workload");
+        assert!(
+            count >= 1,
+            "browsing skill should be trialed during browsing workload"
+        );
     }
 
     // ── purge_unexecutable() tests ────────────────────────────────────────────

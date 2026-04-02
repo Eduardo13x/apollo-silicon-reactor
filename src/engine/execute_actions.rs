@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use crate::engine::sysctl_direct;
+use std::collections::HashSet;
 
 use chrono::Utc;
 
@@ -12,8 +12,8 @@ use crate::engine::mach_qos::{LatencyTier, MachQoSManager, ThreadTier, Throughpu
 use crate::engine::proc_taskinfo;
 use crate::engine::process_identity::{self, ProcessIdentity};
 use crate::engine::safety::{
-    allowlisted_sysctls, allowlisted_sysctls_with_ranges, infrastructure_processes,
-    protected_processes,
+    allowlisted_sysctls, allowlisted_sysctls_with_ranges, classify_protection,
+    infrastructure_processes, protected_processes, ProtectionLevel,
 };
 use crate::engine::types::{CapabilityReport, JournalEntry, RootAction};
 
@@ -202,15 +202,20 @@ pub fn execute_actions(
     // Lazy: computed only if we actually have a FreezeProcess action.
     let mut assertion_pids: Option<std::collections::HashSet<u32>> = None;
 
-    // Pre-lowercase learned patterns once per call (avoids ~2,400 allocations/cycle).
-    let learned_protected_lc: Vec<String> = learned_protected
+    // Unified policy list for classify_protection(): learned_protected + learned_interactive.
+    //
+    // At execute time there is no foreground context, so learned_interactive patterns are
+    // treated as unconditional skips (same as learned_protected).  Both are passed as
+    // `policy_protected` to classify_protection(), which maps them to ProtectionLevel::Unconditional.
+    // This is behaviorally identical to the previous three-step explicit check.
+    let policy_all: Vec<String> = learned_protected
         .iter()
-        .map(|s| s.to_ascii_lowercase())
+        .chain(learned_interactive.iter())
+        .cloned()
         .collect();
-    let learned_interactive_lc: Vec<String> = learned_interactive
-        .iter()
-        .map(|s| s.to_ascii_lowercase())
-        .collect();
+    // Empty infra set — infrastructure_processes() is handled separately below
+    // in ThrottleProcess (soft throttle path) and FreezeProcess (critical-bg skip path).
+    let empty_infra: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
 
     let mut out = ExecuteOutcomes::default();
 
@@ -267,38 +272,22 @@ pub fn execute_actions(
                     if *pid == my_pid {
                         return Ok(());
                     }
-                    // TODO(classify_protection): migrate to classify_protection() once the
-                    // API supports a 5th tier: learned_interactive → unconditional skip at
-                    // execute time (no foreground context available here).
-                    // Spec: classify_protection(name, hard, infra, learned_protected, false)
-                    //   == Unconditional → skip; also check learned_interactive separately.
-                    // Until then: three-step check below is intentionally kept explicit.
-                    if protected.iter().any(|p| name.contains(p)) {
-                        out.push_skip(format!("protected:{}", name));
-                        return Ok(());
+                    // Unified protection check: hard OS names + policy-learned + interactive.
+                    // learned_interactive is treated as Unconditional at execute time because
+                    // no foreground context is available here (see policy_all pre-computation).
+                    // infra (infrastructure_processes) is intentionally excluded: critical_bg
+                    // below handles infra with soft-throttle semantics, not a full skip.
+                    match classify_protection(name, &protected, &empty_infra, &policy_all, false) {
+                        ProtectionLevel::Unconditional => {
+                            out.push_skip(format!("protected:{}", name));
+                            return Ok(());
+                        }
+                        ProtectionLevel::ConditionalForeground | ProtectionLevel::Unprotected => {}
                     }
                     // ML/AMX protection: never throttle inference workloads.
                     if ml_pids.contains(pid) {
                         out.push_skip(format!("ml-protected:{}", name));
                         return Ok(());
-                    }
-                    {
-                        let name_lc = name.to_ascii_lowercase();
-                        if learned_protected_lc
-                            .iter()
-                            .any(|p| name_lc.contains(p.as_str()))
-                        {
-                            out.push_skip(format!("learned-protected:{}", name));
-                            return Ok(());
-                        }
-                        // Never throttle interactive apps (they deserve boosted priority).
-                        if learned_interactive_lc
-                            .iter()
-                            .any(|p| name_lc.contains(p.as_str()))
-                        {
-                            out.push_skip(format!("learned-interactive:{}", name));
-                            return Ok(());
-                        }
                     }
                     // Validate PID identity with start-time (prevents A-B-A recycling).
                     if !verify_pid_identity(*pid, name, *start_sec, *start_usec) {
@@ -351,34 +340,24 @@ pub fn execute_actions(
                     if *pid == my_pid {
                         return Ok(());
                     }
-                    if protected.iter().any(|p| name.contains(p)) {
-                        return Ok(());
+                    // Unified protection check: hard OS names + infra + policy-learned + interactive.
+                    // Unlike ThrottleProcess, infra (critical_bg) is included here because
+                    // FreezeProcess treats infra as a full skip (not a soft-throttle path).
+                    // learned_interactive is treated as Unconditional: no foreground context
+                    // at execute time (see policy_all pre-computation above).
+                    match classify_protection(name, &protected, &critical_bg, &policy_all, false) {
+                        ProtectionLevel::Unconditional => {
+                            if critical_bg.iter().any(|p| name.contains(p)) {
+                                out.critical_background_skips += 1;
+                            }
+                            out.push_skip(format!("protected:{}", name));
+                            return Ok(());
+                        }
+                        ProtectionLevel::ConditionalForeground | ProtectionLevel::Unprotected => {}
                     }
                     // ML/AMX protection: never freeze inference workloads.
                     if ml_pids.contains(pid) {
                         out.push_skip(format!("ml-protected:{}", name));
-                        return Ok(());
-                    }
-                    {
-                        let name_lc = name.to_ascii_lowercase();
-                        if learned_protected_lc
-                            .iter()
-                            .any(|p| name_lc.contains(p.as_str()))
-                        {
-                            out.push_skip(format!("learned-protected:{}", name));
-                            return Ok(());
-                        }
-                        if learned_interactive_lc
-                            .iter()
-                            .any(|p| name_lc.contains(p.as_str()))
-                        {
-                            out.push_skip(format!("learned-interactive:{}", name));
-                            return Ok(());
-                        }
-                    }
-                    if critical_bg.iter().any(|p| name.contains(p)) {
-                        out.critical_background_skips += 1;
-                        out.push_skip(format!("critical-bg:{}", name));
                         return Ok(());
                     }
                     // Validate PID identity with start-time (prevents A-B-A recycling).
@@ -515,7 +494,11 @@ pub fn execute_actions(
                     } else if !name_valid {
                         // Skip — daemon name contains invalid characters.
                     } else {
-                        let signal = if *active { libc::SIGSTOP } else { libc::SIGCONT };
+                        let signal = if *active {
+                            libc::SIGSTOP
+                        } else {
+                            libc::SIGCONT
+                        };
                         let _ = killall_by_name(daemon, signal);
                     }
                 }
@@ -543,7 +526,6 @@ pub fn execute_actions(
                         }
                     }
                 }
-
             }
             Ok(())
         })();
@@ -567,4 +549,139 @@ pub fn execute_actions(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn make_caps() -> CapabilityReport {
+        CapabilityReport {
+            can_taskpolicy: false,
+            can_sysctl: false,
+            can_memorystatus: false,
+            can_mdutil: false,
+            can_tmutil: false,
+            is_root: false,
+            unavailable: vec![],
+        }
+    }
+
+    /// Helper: run execute_actions with a temp journal and return outcomes.
+    fn run(
+        actions: Vec<RootAction>,
+        learned_protected: &[String],
+        learned_interactive: &[String],
+    ) -> ExecuteOutcomes {
+        let journal = std::env::temp_dir().join("apollo-test-execute-actions.jsonl");
+        let mut frozen = HashSet::new();
+        execute_actions(
+            actions,
+            &make_caps(),
+            &journal,
+            &mut frozen,
+            learned_protected,
+            learned_interactive,
+            None,
+        )
+    }
+
+    /// A PID unlikely to exist so SIGSTOP/setpriority don't land on a real process.
+    /// Using PID 9_999_999 (exceeds typical macOS max PID of ~99_999).
+    const GHOST_PID: u32 = 9_999_999;
+
+    // ── learned_interactive skips (BUG-07) ────────────────────────────────────
+
+    #[test]
+    fn throttle_skips_learned_interactive_process() {
+        let interactive = vec!["MyInteractiveApp".to_string()];
+        let outcomes = run(
+            vec![RootAction::ThrottleProcess {
+                pid: GHOST_PID,
+                name: "MyInteractiveApp".to_string(),
+                aggressive: false,
+                reason: "test".to_string(),
+                start_sec: 0,
+                start_usec: 0,
+            }],
+            &[],
+            &interactive,
+        );
+        assert_eq!(
+            outcomes.throttles_applied, 0,
+            "learned_interactive process must not be throttled"
+        );
+        assert!(
+            outcomes
+                .top_skipped
+                .iter()
+                .any(|s| s.contains("MyInteractiveApp")),
+            "skip reason must mention the process name"
+        );
+    }
+
+    #[test]
+    fn freeze_skips_learned_interactive_process() {
+        let interactive = vec!["MyInteractiveApp".to_string()];
+        let outcomes = run(
+            vec![RootAction::FreezeProcess {
+                pid: GHOST_PID,
+                name: "MyInteractiveApp".to_string(),
+                reason: "test".to_string(),
+                start_sec: 0,
+                start_usec: 0,
+            }],
+            &[],
+            &interactive,
+        );
+        assert_eq!(
+            outcomes.freezes_applied, 0,
+            "learned_interactive process must not be frozen"
+        );
+        assert!(
+            outcomes
+                .top_skipped
+                .iter()
+                .any(|s| s.contains("MyInteractiveApp")),
+            "skip reason must mention the process name"
+        );
+    }
+
+    #[test]
+    fn throttle_skips_learned_interactive_case_insensitive() {
+        // Pattern stored lowercase; process name has mixed case — must still skip.
+        let interactive = vec!["myinteractiveapp".to_string()];
+        let outcomes = run(
+            vec![RootAction::ThrottleProcess {
+                pid: GHOST_PID,
+                name: "MyInteractiveApp".to_string(),
+                aggressive: false,
+                reason: "test".to_string(),
+                start_sec: 0,
+                start_usec: 0,
+            }],
+            &[],
+            &interactive,
+        );
+        assert_eq!(outcomes.throttles_applied, 0);
+    }
+
+    #[test]
+    fn throttle_skips_learned_protected_process() {
+        let protected = vec!["MyProtectedDaemon".to_string()];
+        let outcomes = run(
+            vec![RootAction::ThrottleProcess {
+                pid: GHOST_PID,
+                name: "MyProtectedDaemon".to_string(),
+                aggressive: false,
+                reason: "test".to_string(),
+                start_sec: 0,
+                start_usec: 0,
+            }],
+            &protected,
+            &[],
+        );
+        assert_eq!(outcomes.throttles_applied, 0);
+    }
 }
