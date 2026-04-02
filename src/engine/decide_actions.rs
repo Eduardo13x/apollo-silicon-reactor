@@ -564,9 +564,15 @@ pub fn decide_actions(
         InteractiveContext::BackgroundPressure | InteractiveContext::ThermalConstrained => {
             // Dev-first: no-freeze by default. Only consider freeze under extreme memory pressure
             // AND swap growth, and never for protected/critical workloads.
-            let extreme_freeze_ok = snapshot.pressure.memory_pressure
+            // Secondary gate: on memory-constrained systems (≥1.5 GB swap in use) the classic
+            // swap_delta trigger fires too late — RAM is already thrashing before delta rises.
+            // Allow freezing once memory_pressure ≥ 0.75 with significant swap already committed.
+            let swap_committed_gb =
+                snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            let extreme_freeze_ok = (snapshot.pressure.memory_pressure
                 >= thresholds.extreme_pressure
-                && snapshot.pressure.swap_delta_bytes_per_sec > (5.0 * 1024.0 * 1024.0);
+                && snapshot.pressure.swap_delta_bytes_per_sec > (5.0 * 1024.0 * 1024.0))
+                || (snapshot.pressure.memory_pressure >= 0.75 && swap_committed_gb >= 1.5);
             if extreme_freeze_ok {
                 for (pid, process) in sys.processes() {
                     let pid = pid.as_u32();

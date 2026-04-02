@@ -32,6 +32,10 @@ pub struct GovernorInput {
     /// Triggers proactive AggressiveRoot before RAM pressure builds —
     /// faster than any reactive pressure-based trigger.
     pub workload_onset: bool,
+    /// Swap committed in bytes.  Used to boost pressure_score when the system
+    /// is RAM-constrained but CPU is idle — the classic formula underweights
+    /// memory-only pressure on low-RAM machines (≤8 GB).
+    pub swap_used_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -383,7 +387,12 @@ fn pressure_score(input: &GovernorInput) -> f64 {
     let ram = input.ram_pressure.clamp(0.0, 1.0);
     let wait = input.interactive_wait_ratio.clamp(0.0, 1.0);
     let reactor = input.reactor_event_weight.clamp(0.0, 1.0);
-    (0.35 * cpu + 0.35 * ram + 0.20 * wait + 0.10 * reactor).clamp(0.0, 1.0)
+    // Swap boost: on memory-constrained systems CPU can be idle while the machine
+    // is actively swapping.  The base formula underweights this case.
+    // Cap at 0.12 (2 GB → full boost on 8 GB machines; higher RAM → less boost).
+    let swap_gb = input.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let swap_boost = (swap_gb / 2.0).clamp(0.0, 1.0) * 0.12;
+    (0.35 * cpu + 0.35 * ram + 0.20 * wait + 0.10 * reactor + swap_boost).clamp(0.0, 1.0)
 }
 
 fn throttle_level(pressure_score: f64) -> String {
@@ -414,6 +423,7 @@ mod tests {
             context_switch_burst: false,
             workload_mode: None,
             workload_onset,
+            swap_used_bytes: 0,
         }
     }
 

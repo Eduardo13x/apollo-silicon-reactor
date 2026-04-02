@@ -2444,6 +2444,7 @@ fn main() -> anyhow::Result<()> {
                     context_switch_burst,
                     workload_mode: Some(workload_mode),
                     workload_onset,
+                    swap_used_bytes: snapshot.pressure.swap_used_bytes,
                 });
                 if governor_decision.transition_reason.contains("floor") {
                     state.metrics.lock_recover().profile_floor_hits += 1;
