@@ -102,6 +102,44 @@ impl SkillRegistry {
             .collect()
     }
 
+    /// Pick one unproven induced skill to trial this cycle.
+    ///
+    /// Induced skills (group:/batch:) start with apply_count=0 and can never
+    /// reach is_reliable() without being applied first. This method returns
+    /// the single highest-priority unproven skill at current pressure so it
+    /// gets one real observation per call. Caller records the result via
+    /// record_result() after measuring pressure delta.
+    ///
+    /// Criteria: apply_count < 5, pressure >= min_pressure, not retired.
+    /// Priority: fewest applications first (round-robin exploration).
+    pub fn next_trial_skill(&self, pressure: f32) -> Option<&OptimizationSkill> {
+        self.skills
+            .values()
+            .filter(|s| {
+                s.apply_count < 10
+                    && !s.should_retire()
+                    && pressure >= s.min_pressure
+                    && (s.name.starts_with("group:") || s.name.starts_with("batch:"))
+            })
+            .min_by_key(|s| s.apply_count)
+    }
+
+    /// Remove induced skills whose ALL throttle targets are protected.
+    /// These skills can never execute and would spin forever in the trial loop.
+    /// `protected` is the combined hard + policy protected set.
+    pub fn purge_unexecutable(&mut self, protected: &[&str]) {
+        self.skills.retain(|name, skill| {
+            if !name.starts_with("group:") && !name.starts_with("batch:") {
+                return true; // keep individual skills unconditionally
+            }
+            // Keep if at least one target is NOT protected.
+            skill.throttle_targets.iter().any(|target| {
+                let tl = target.to_ascii_lowercase();
+                !protected.iter().any(|p| tl.contains(&p.to_ascii_lowercase()))
+            })
+        });
+    }
+
     /// Register an autonomously induced skill (from rule_inducer).
     /// Skips if a skill with the same name already exists.
     /// Returns true if the skill was added.

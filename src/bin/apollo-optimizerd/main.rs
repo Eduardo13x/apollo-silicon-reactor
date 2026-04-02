@@ -1048,6 +1048,8 @@ fn main() -> anyhow::Result<()> {
             // filtering out short-lived transients that die before execute_actions.
             let mut freeze_candidates: HashMap<u32, u8> = HashMap::new();
             let mut cycle_count: u64 = 0;
+            // Pending trial skill: (name, pressure_before). Recorded next cycle.
+            let mut pending_trial_skill: Option<(String, f64)> = None;
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
             // Gate network_monitor.tick() to every ~10s since netstat is blocking.
@@ -3052,6 +3054,70 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // Trial induced skills: group:/batch: skills start at apply_count=0
+                // and can never reach is_reliable() without real observations.
+                // Each cycle at elevated pressure we try one unproven skill and record
+                // the result on the NEXT cycle by comparing pressure before vs after.
+
+                {
+                    // Record result from previous cycle's trial if pending.
+                    if let Some((ref pending_name, pressure_before)) = pending_trial_skill {
+                        let effective = snapshot.pressure.memory_pressure < pressure_before - 0.01;
+                        skill_registry.record_result(pending_name, effective);
+                        pending_trial_skill = None;
+                    }
+
+                    let trial = skill_registry
+                        .next_trial_skill(snapshot.pressure.memory_pressure as f32);
+                    if let Some(skill) = trial {
+                        let skill_name = skill.name.clone();
+                        let pressure_before = snapshot.pressure.memory_pressure;
+                        let hard_protected = apollo_optimizer::engine::safety::protected_processes();
+                        let policy_prot = state.learned_policy.lock_recover().protected_patterns.clone();
+                        let already_actioned: std::collections::HashSet<String> = actions
+                            .iter()
+                            .filter_map(|a| match a {
+                                RootAction::ThrottleProcess { name, .. } => Some(name.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let mut trialed = false;
+                        for target in &skill.throttle_targets.clone() {
+                            // Skip targets that are hard-protected or policy-protected daemons.
+                            // (Foreground-aware user apps are handled by heuristic_critical_pids.)
+                            if hard_protected.iter().any(|p| target.contains(p))
+                                || policy_prot.iter().any(|p| target.contains(p.as_str()))
+                            {
+                                continue;
+                            }
+                            for (pid, process) in collector.system().processes() {
+                                if process.name() == target
+                                    && !already_actioned.contains(target)
+                                    && Some(pid.as_u32()) != foreground_pid
+                                {
+                                    actions.push(RootAction::ThrottleProcess {
+                                        pid: pid.as_u32(),
+                                        name: target.clone(),
+                                        aggressive: false,
+                                        reason: format!("trial:{}", skill_name),
+                                        start_sec: 0,
+                                        start_usec: 0,
+                                    });
+                                    trialed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if trialed {
+                            pending_trial_skill = Some((skill_name, pressure_before));
+                        } else {
+                            // All targets are protected — skill can never execute.
+                            // Record as ineffective so it gets GC'd after 10 failed attempts.
+                            skill_registry.record_result(&skill_name, false);
+                        }
+                    }
+                }
+
                 // Coordinated multi-process freezing (Pearl 2009 causal clusters).
                 // If process A is already being actioned AND B co-occurs with A during
                 // pressure spikes (≥8 observed co-occurrences), include B in this cycle.
@@ -4591,17 +4657,26 @@ fn main() -> anyhow::Result<()> {
                     let existing_names = skill_registry.name_set();
                     let top_pairs = outcome_tracker.top_causal_pairs(100);
                     let protected_set = apollo_optimizer::engine::safety::protected_processes();
-                    let protected_slice: Vec<&str> = protected_set.iter().copied().collect();
+                    // Also exclude policy-protected processes (learned by LLM/user).
+                    // Without this, rule_inducer generates skills whose targets are
+                    // unthrottleable — they accumulate zero observations forever.
+                    let policy_prot = state.learned_policy.lock_recover().protected_patterns.clone();
+                    let policy_prot_refs: Vec<&str> = policy_prot.iter().map(|s| s.as_str()).collect();
+                    let mut all_protected: Vec<&str> = protected_set.iter().copied().collect();
+                    all_protected.extend_from_slice(&policy_prot_refs);
                     let new_skills = apollo_optimizer::engine::rule_inducer::induce(
                         &outcome_tracker.experience,
                         &top_pairs,
                         &existing_names,
-                        &protected_slice,
+                        &all_protected,
                     );
                     let induced_count = new_skills.len();
                     for skill in new_skills {
                         skill_registry.register_induced(skill);
                     }
+                    // Purge induced skills whose targets are all protected —
+                    // they can never execute and would spin in the trial loop forever.
+                    skill_registry.purge_unexecutable(&all_protected);
                     if induced_count > 0 {
                         println!("rule_inducer: {} new skills crystallized (total={})",
                             induced_count, skill_registry.len());
@@ -4612,6 +4687,7 @@ fn main() -> anyhow::Result<()> {
                 if cycle_count % 500 == 0 {
                     outcome_tracker.experience.compress_old();
                     skill_registry.gc(); // retire ineffective skills
+                    skill_registry.persist(std::path::Path::new(skills_path));
                 }
                 // Hourly housekeeping (7200 cycles × 500ms ≈ 1 hour).
                 if cycle_count % 7200 == 1 {
