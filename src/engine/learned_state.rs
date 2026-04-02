@@ -20,8 +20,10 @@ use std::collections::HashMap;
 
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
 use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
+use crate::engine::overflow_guard::OverflowHistory;
 use crate::engine::predictive_agent::SpecialistAccuracyTracker;
 use crate::engine::signal_intelligence::{SignalIntelligence, SignalIntelligencePersisted};
+use crate::engine::types::FrozenStatePersisted;
 
 /// Everything Apollo learns at runtime, in one serializable struct.
 ///
@@ -67,6 +69,21 @@ pub struct LearnedState {
     /// `None` means no skills were persisted — cold start or old file format.
     #[serde(default)]
     pub skill_registry: Option<HashMap<String, OptimizationSkill>>,
+
+    /// Overflow guard history — persisted here so overflow events and adaptive
+    /// thresholds survive crashes and reboots without depending solely on
+    /// `overflow_history.json`.  Dual-write: the guard still writes its own
+    /// file as a fallback.  `None` on first run or old file format.
+    #[serde(default)]
+    pub overflow_guard_history: Option<OverflowHistory>,
+
+    /// Frozen process state — persisted here so a daemon crash leaves the
+    /// system consistent: on restart, Apollo knows which PIDs were frozen and
+    /// can SIGCONT them before any new freeze decisions are made.  Stored as
+    /// the same `FrozenStatePersisted` format used by `frozen_state.json`
+    /// (dual-write preserved).  `None` on first run or old file format.
+    #[serde(default)]
+    pub frozen_pids: Option<FrozenStatePersisted>,
 }
 
 fn default_version() -> u32 {
@@ -92,6 +109,8 @@ impl LearnedState {
         outcome_tracker: &OutcomeTracker,
         specialist_accuracy: &SpecialistAccuracyTracker,
         skill_registry: &SkillRegistry,
+        overflow_history: Option<OverflowHistory>,
+        frozen_state: Option<FrozenStatePersisted>,
     ) -> Self {
         Self {
             version: 1,
@@ -102,19 +121,27 @@ impl LearnedState {
             last_restore_quality: None,
             pending_trial_skill: None,
             skill_registry: Some(skill_registry.snapshot()),
+            overflow_guard_history: overflow_history,
+            frozen_pids: frozen_state,
         }
     }
 
     /// Apply persisted state back to live components.
     /// Runs `validate()` first to sanitize corrupt or out-of-range data.
     /// Each component handles missing data gracefully (keeps defaults).
+    ///
+    /// Returns `(overflow_history, frozen_pids)` — the caller is responsible
+    /// for wiring these into `OverflowGuard::import_history()` and the frozen
+    /// state map respectively.  Returning `None` in either slot means the
+    /// field was absent in the file (old format or cold start); the caller
+    /// should fall back to the legacy single-purpose file.
     pub fn apply(
         mut self,
         signal_intel: &mut SignalIntelligence,
         outcome_tracker: &mut OutcomeTracker,
         specialist_accuracy: &mut SpecialistAccuracyTracker,
         skill_registry: &mut SkillRegistry,
-    ) {
+    ) -> (Option<OverflowHistory>, Option<FrozenStatePersisted>) {
         self.validate();
         if let Some(si) = self.signal_intelligence {
             signal_intel.restore(si);
@@ -131,6 +158,7 @@ impl LearnedState {
         if let Some(skills) = self.skill_registry {
             skill_registry.restore_from_map(skills);
         }
+        (self.overflow_guard_history, self.frozen_pids)
     }
 
     // ── Self-improvement: called before persist ─────────────────────────
@@ -217,6 +245,8 @@ impl LearnedState {
         outcome_tracker: &OutcomeTracker,
         specialist_accuracy: &SpecialistAccuracyTracker,
         skill_registry: &SkillRegistry,
+        overflow_history: Option<OverflowHistory>,
+        frozen_state: Option<FrozenStatePersisted>,
         path: &Path,
         prev_generations: u32,
         last_quality: Option<f64>,
@@ -227,6 +257,8 @@ impl LearnedState {
             outcome_tracker,
             specialist_accuracy,
             skill_registry,
+            overflow_history,
+            frozen_state,
         );
         state.persist_generations = prev_generations;
         state.last_restore_quality = last_quality;
@@ -402,6 +434,8 @@ mod tests {
             last_restore_quality: None,
             pending_trial_skill: None,
             skill_registry: None,
+            overflow_guard_history: None,
+            frozen_pids: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -422,6 +456,8 @@ mod tests {
             last_restore_quality: None,
             pending_trial_skill: None,
             skill_registry: None,
+            overflow_guard_history: None,
+            frozen_pids: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -440,6 +476,8 @@ mod tests {
             last_restore_quality: None,
             pending_trial_skill: None,
             skill_registry: None,
+            overflow_guard_history: None,
+            frozen_pids: None,
         };
         assert_eq!(
             state
@@ -473,6 +511,8 @@ mod tests {
             last_restore_quality: None,
             pending_trial_skill: None,
             skill_registry: None,
+            overflow_guard_history: None,
+            frozen_pids: None,
         };
         state.self_improve();
         assert_eq!(state.persist_generations, 6);
@@ -501,6 +541,8 @@ mod tests {
             last_restore_quality: None,
             pending_trial_skill: None,
             skill_registry: None,
+            overflow_guard_history: None,
+            frozen_pids: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -534,6 +576,8 @@ mod tests {
             last_restore_quality: None,
             pending_trial_skill: None,
             skill_registry: None,
+            overflow_guard_history: None,
+            frozen_pids: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();

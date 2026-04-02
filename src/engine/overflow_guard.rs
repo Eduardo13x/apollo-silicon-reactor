@@ -366,6 +366,19 @@ impl OverflowGuard {
             let _ = std::fs::write(&self.path, json);
         }
     }
+
+    /// Export the overflow history for unified persistence (LearnedState).
+    /// The returned value is a clone of the internal history struct.
+    pub fn export_history(&self) -> OverflowHistory {
+        self.history.clone()
+    }
+
+    /// Import overflow history from unified persistence (LearnedState).
+    /// Replaces the in-memory history; the path-based fallback file is not touched.
+    /// Called at startup before the guard begins observing new events.
+    pub fn import_history(&mut self, history: OverflowHistory) {
+        self.history = history;
+    }
 }
 
 #[cfg(test)]

@@ -268,6 +268,28 @@ pub enum RootAction {
     },
 }
 
+impl RootAction {
+    /// Construct a `ThrottleProcess` with zero start times.
+    ///
+    /// Use this when the action is queued before PID identity validation
+    /// (start times are filled in by `execute_actions` at dispatch time).
+    pub fn throttle(
+        pid: u32,
+        name: impl Into<String>,
+        aggressive: bool,
+        reason: impl Into<String>,
+    ) -> Self {
+        RootAction::ThrottleProcess {
+            pid,
+            name: name.into(),
+            aggressive,
+            reason: reason.into(),
+            start_sec: 0,
+            start_usec: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FreezeSource {
     MainLoop,

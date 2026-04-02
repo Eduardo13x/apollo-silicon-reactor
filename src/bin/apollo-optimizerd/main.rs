@@ -101,6 +101,7 @@ use apollo_optimizer::engine::thermal_interrupt::{
 use apollo_optimizer::engine::thermal_manager::ThermalManager;
 use apollo_optimizer::engine::types::{
     BlockerScore, EnergyConsumerInfo, ForegroundAppInfo, FreezeSource, FrozenEntry,
+    FrozenPidEntry, FrozenStatePersisted,
     LatencyTarget,
     OptimizationProfile, ProfileTransition, RootAction,
     RuntimeMetrics, SafetyPolicy,
@@ -975,12 +976,49 @@ fn main() -> anyhow::Result<()> {
                 // apply() restores skills from learned_state.json if present,
                 // overwriting the legacy optimization_skills.json load above.
                 // If skill_registry field is absent (old file), the legacy load is kept.
-                learned.apply(
+                // Returns (overflow_history, frozen_pids) for components that need
+                // caller-side wiring.
+                let (ls_overflow_history, ls_frozen_pids) = learned.apply(
                     &mut signal_intel,
                     &mut outcome_tracker,
                     &mut specialist_accuracy,
                     &mut skill_registry,
                 );
+                // Restore overflow guard history from unified persistence.
+                // Migration: if learned_state has history, it takes precedence over
+                // the legacy overflow_history.json already loaded above.
+                if let Some(history) = ls_overflow_history {
+                    overflow_guard.import_history(history);
+                }
+                // Restore frozen state from unified persistence.
+                // Migration: learned_state takes precedence on PID conflicts because it
+                // carries richer data (pressure_at_freeze, process_name).  PIDs that
+                // appear only in the legacy file (load_frozen_state above) are merged in
+                // so no freeze entry is silently dropped.
+                if let Some(ls_frozen) = ls_frozen_pids {
+                    let mut frozen_guard = state.frozen_state.lock_recover();
+                    // Rebuild from learned_state — it has the authoritative set.
+                    let mut merged: HashMap<u32, FrozenEntry> = ls_frozen
+                        .frozen
+                        .into_iter()
+                        .map(|e| {
+                            (
+                                e.pid,
+                                FrozenEntry {
+                                    frozen_at: e.since,
+                                    source: FreezeSource::MainLoop,
+                                    pressure_at_freeze: 1.0,
+                                    process_name: e.name,
+                                },
+                            )
+                        })
+                        .collect();
+                    // Merge legacy entries for PIDs not in learned_state.
+                    for (pid, entry) in frozen_guard.iter() {
+                        merged.entry(*pid).or_insert_with(|| entry.clone());
+                    }
+                    *frozen_guard = merged;
+                }
                 restore_monitor = RestoreQualityMonitor::new();
             }
             // File cache warmer: pre-read predicted app executables into buffer cache.
@@ -3131,12 +3169,14 @@ fn main() -> anyhow::Result<()> {
                                     .find(|s| s.throttle_targets.contains(&name))
                                     .map(|s| s.name.as_str())
                                     .unwrap_or("skill");
-                                actions.push(RootAction::throttle(
-                                    pid.as_u32(),
+                                actions.push(RootAction::ThrottleProcess {
+                                    pid: pid.as_u32(),
                                     name,
-                                    false,
-                                    format!("skill:{}", skill_name),
-                                ));
+                                    aggressive: false,
+                                    reason: format!("skill:{}", skill_name),
+                                    start_sec: 0,
+                                    start_usec: 0,
+                                });
                             }
                         }
                     }
@@ -3203,12 +3243,14 @@ fn main() -> anyhow::Result<()> {
                                         // captures the combined effect of all throttles in this cycle,
                                         // including targets already covered by throttle:X skills.
                                         if !already_actioned.contains(target) {
-                                            actions.push(RootAction::throttle(
-                                                pid.as_u32(),
-                                                target.clone(),
-                                                false,
-                                                format!("trial:{}", skill_name),
-                                            ));
+                                            actions.push(RootAction::ThrottleProcess {
+                                                pid: pid.as_u32(),
+                                                name: target.clone(),
+                                                aggressive: false,
+                                                reason: format!("trial:{}", skill_name),
+                                                start_sec: 0,
+                                                start_usec: 0,
+                                            });
                                         }
                                         trialed = true;
                                     }
@@ -3268,15 +3310,17 @@ fn main() -> anyhow::Result<()> {
                             if proc_name.contains(missing)
                                 && !actioned.iter().any(|n| n.contains(missing))
                             {
-                                actions.push(RootAction::throttle(
-                                    pid.as_u32(),
-                                    proc_name,
-                                    false,
-                                    format!(
+                                actions.push(RootAction::ThrottleProcess {
+                                    pid: pid.as_u32(),
+                                    name: proc_name,
+                                    aggressive: false,
+                                    reason: format!(
                                         "coordinated-cluster: co-occurs with {} (n={})",
                                         partner, count
                                     ),
-                                ));
+                                    start_sec: 0,
+                                    start_usec: 0,
+                                });
                                 break;
                             }
                         }
@@ -3329,12 +3373,14 @@ fn main() -> anyhow::Result<()> {
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         });
                         for proc in noise_procs.iter().take(3) {
-                            actions.push(RootAction::throttle(
-                                proc.pid as u32,
-                                proc.name.clone(),
-                                false,
-                                "predictive-agent: pre-throttle noise",
-                            ));
+                            actions.push(RootAction::ThrottleProcess {
+                                pid: proc.pid as u32,
+                                name: proc.name.clone(),
+                                aggressive: false,
+                                reason: "predictive-agent: pre-throttle noise".to_string(),
+                                start_sec: 0,
+                                start_usec: 0,
+                            });
                         }
                     }
                     Intervention::ProactivePurge => {
@@ -3388,22 +3434,12 @@ fn main() -> anyhow::Result<()> {
                     // Use proc_snaps (full process list) not top_processes (top 10 by CPU).
                     // Only skip core interactive apps — paging hints are gentle (voluntary
                     // cache release), so we use a tighter filter than freeze/throttle.
-                    let hard_protected = protected_processes();
-                    let infra_protected = infrastructure_processes();
+                    let hard_protected = apollo_optimizer::engine::safety::protected_processes();
                     let mut bg_procs: Vec<_> = proc_snaps
                         .iter()
                         .filter(|p| {
-                            // Skip system-critical, infra, and policy-protected processes.
-                            // Processes without a GUI window cannot be user-interactive, so
-                            // is_interactive=false is correct; the GUI check below enforces it.
-                            let level = classify_protection(
-                                &p.name,
-                                &hard_protected,
-                                &infra_protected,
-                                &protected_pats,
-                                false,
-                            );
-                            level == ProtectionLevel::Unprotected
+                            // Skip system-critical processes and self.
+                            !hard_protected.iter().any(|hp| p.name.contains(hp))
                                 && p.rss_bytes > 80 * 1024 * 1024 // >80 MB RSS
                                 && p.pid != std::process::id()
                                 && !p.has_gui_window
@@ -3809,9 +3845,8 @@ fn main() -> anyhow::Result<()> {
                 // During LLM inference: App-Nap all non-foreground non-essential.
                 // During wake suppression: same, to give foreground first crack.
                 if llm_active || in_wake_suppression {
-                    let llm_hard = protected_processes();
-                    let llm_infra = infrastructure_processes();
-                    let llm_policy = state
+                    let protected_pats = protected_processes();
+                    let policy_protected = state
                         .learned_policy
                         .lock_recover()
                         .protected_patterns
@@ -3820,27 +3855,21 @@ fn main() -> anyhow::Result<()> {
                     for (pid, process) in collector.system().processes() {
                         let pid_u32 = pid.as_u32();
                         let name = process.name();
-                        // Foreground: never App Nap.
+                        // Foreground or hard-critical: never App Nap.
                         let is_foreground = Some(pid_u32) == foreground_pid;
+                        let is_hard_protected = heuristic_critical_pids.contains(&pid_u32)
+                            || protected_pats.iter().any(|p| name.contains(p))
+                            || name == "apollo-optimizerd";
                         // User-interactive apps: App Nap only when in background.
                         let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
                         let has_gui = snap.map_or(false, |s| s.has_gui_window);
                         let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
                         let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
-                        let is_interactive = is_user_interactive_app(has_gui, idle_s, rss, name);
-                        // Unified protection classification (hard + infra + policy + behavioral).
-                        let protection = classify_protection(
-                            name,
-                            &llm_hard,
-                            &llm_infra,
-                            &llm_policy,
-                            is_interactive,
-                        );
-                        let skip = is_foreground
-                            || protection == ProtectionLevel::Unconditional
-                            || (protection == ProtectionLevel::ConditionalForeground
-                                && is_foreground);
-                        if skip {
+                        let is_user_app = is_user_interactive_app(has_gui, idle_s, rss, name);
+                        // Policy-protected daemons (non-user-app): always skip.
+                        let is_policy_daemon = !is_user_app
+                            && policy_protected.iter().any(|p| name.contains(p.as_str()));
+                        if is_foreground || is_hard_protected || is_policy_daemon {
                             // Protected: ensure NOT app-napped.
                             if qos.is_app_napped(pid_u32) {
                                 qos.set_app_nap(pid_u32, false);
@@ -4888,11 +4917,27 @@ fn main() -> anyhow::Result<()> {
                     learning_pipeline.flush_remaining(&mut outcome_tracker, &mut causal_graph, &mut skill_registry);
                     signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
                     outcome_tracker.persist_hop_groups(std::path::Path::new(hop_groups_path()));
+                    // Snapshot frozen state for unified persistence.
+                    let frozen_snap: FrozenStatePersisted = {
+                        let fg = state.frozen_state.lock_recover();
+                        FrozenStatePersisted {
+                            frozen: fg
+                                .iter()
+                                .map(|(pid, e)| FrozenPidEntry {
+                                    pid: *pid,
+                                    since: e.frozen_at,
+                                    name: e.process_name.clone(),
+                                })
+                                .collect(),
+                        }
+                    };
                     LearnedState::persist_improved(
                         &signal_intel,
                         &outcome_tracker,
                         &specialist_accuracy,
                         &skill_registry,
+                        Some(overflow_guard.export_history()),
+                        Some(frozen_snap),
                         ls_path,
                         persist_generations,
                         last_restore_quality,
@@ -5316,11 +5361,26 @@ fn main() -> anyhow::Result<()> {
             signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
             // On clean shutdown, clear the pending trial: the result can't be measured
             // reliably after a restart since system pressure state will differ.
+            let frozen_snap_shutdown: FrozenStatePersisted = {
+                let fg = state.frozen_state.lock_recover();
+                FrozenStatePersisted {
+                    frozen: fg
+                        .iter()
+                        .map(|(pid, e)| FrozenPidEntry {
+                            pid: *pid,
+                            since: e.frozen_at,
+                            name: e.process_name.clone(),
+                        })
+                        .collect(),
+                }
+            };
             LearnedState::persist_improved(
                 &signal_intel,
                 &outcome_tracker,
                 &specialist_accuracy,
                 &skill_registry,
+                Some(overflow_guard.export_history()),
+                Some(frozen_snap_shutdown),
                 ls_path,
                 persist_generations,
                 last_restore_quality,
