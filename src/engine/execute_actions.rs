@@ -15,7 +15,6 @@ use crate::engine::safety::{
     allowlisted_sysctls, allowlisted_sysctls_with_ranges, infrastructure_processes,
     protected_processes,
 };
-use crate::engine::memory_trimmer;
 use crate::engine::types::{CapabilityReport, JournalEntry, RootAction};
 
 /// Set the nice value for a process via `setpriority(2)`.
@@ -227,8 +226,7 @@ pub fn execute_actions(
             | RootAction::SetMemorystatus { reason, .. }
             | RootAction::ToggleSpotlight { reason, .. }
             | RootAction::QuarantineDaemon { reason, .. }
-            | RootAction::SetThreadQoS { reason, .. }
-            | RootAction::TrimWorkingSet { reason, .. } => reason.clone(),
+            | RootAction::SetThreadQoS { reason, .. } => reason.clone(),
             RootAction::UnfreezeProcess { .. } => "unfreeze".to_string(),
         };
 
@@ -539,32 +537,7 @@ pub fn execute_actions(
                         }
                     }
                 }
-                RootAction::TrimWorkingSet { pid, name, .. } => {
-                    // Safety gates mirror FreezeProcess: never trim protected processes
-                    // or ML/AMX workloads.  The allowlist in memory_trimmer::TRIMMABLE_NAMES
-                    // is a second layer — callers should already have filtered, but we
-                    // enforce it here for defense-in-depth.
-                    if *pid == my_pid {
-                        return Ok(());
-                    }
-                    if protected.iter().any(|p| name.contains(p)) {
-                        return Ok(());
-                    }
-                    if ml_pids.contains(pid) {
-                        return Ok(());
-                    }
-                    if !memory_trimmer::is_trimmable(name) {
-                        return Ok(());
-                    }
-                    if let Some(result) = memory_trimmer::trim_process(*pid, name) {
-                        let mb = result.bytes_marked / (1024 * 1024);
-                        after = Some(format!(
-                            "trimmed {} regions (~{} MB marked reusable)",
-                            result.regions_trimmed, mb
-                        ));
-                        out.paging_hints_applied += 1;
-                    }
-                }
+
             }
             Ok(())
         })();
