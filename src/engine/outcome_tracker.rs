@@ -1214,4 +1214,68 @@ mod tests {
         // No data yet → None
         assert!(tracker.hop_effectiveness("Brave Browser Helper").is_none());
     }
+
+    // ── Coordinated multi-process freezing (Feature 2) ────────────────────────
+
+    /// Simulate the real-world scenario: Safari + cloudd co-occur during pressure
+    /// spikes 10 times. Verify they're returned as a top pair with count ≥ 8
+    /// (the gate used by coordinated freezing in the daemon).
+    #[test]
+    fn coordinated_freeze_safari_cloudd_cluster() {
+        let mut tracker = OutcomeTracker::new();
+        // Simulate 10 pressure events where Safari and cloudd are both active.
+        for _ in 0..10 {
+            tracker.record_co_occurrence(&vec![
+                "Safari".into(),
+                "cloudd".into(),
+                "suggestd".into(),  // noise: also present but less relevant
+            ]);
+        }
+        // Simulate 2 events where Safari is alone (cloudd not present).
+        for _ in 0..2 {
+            tracker.record_co_occurrence(&vec!["Safari".into(), "WindowServer".into()]);
+        }
+
+        // Safari + cloudd should be the top pair with count = 10.
+        let top = tracker.top_causal_pairs(3);
+        let safari_cloudd = top.iter().find(|(a, b, _)| {
+            (a.contains("Safari") && b.contains("cloudd"))
+            || (a.contains("cloudd") && b.contains("Safari"))
+        });
+        assert!(safari_cloudd.is_some(), "Safari+cloudd should appear in top pairs");
+        let (_, _, count) = safari_cloudd.unwrap();
+        assert!(
+            *count >= 8,
+            "count {} must meet the ≥8 gate for coordinated freezing",
+            count
+        );
+
+        // is_causal_pair() query (order-invariant) should return the count.
+        assert_eq!(tracker.is_causal_pair("cloudd", "Safari", 8), Some(10));
+    }
+
+    /// When only one process of a co-cluster is being actioned, the daemon
+    /// pulls in the partner. Verify the co-occurrence data supports this:
+    /// after ≥8 observations, the pair is queryable with min_count=8.
+    #[test]
+    fn coordinated_freeze_threshold_gate() {
+        let mut tracker = OutcomeTracker::new();
+        let procs = vec!["Dropbox".into(), "cloudd".into()];
+
+        // Only 7 co-occurrences: below the gate → should NOT trigger.
+        for _ in 0..7 {
+            tracker.record_co_occurrence(&procs);
+        }
+        assert!(
+            tracker.is_causal_pair("Dropbox", "cloudd", 8).is_none(),
+            "7 co-occurrences should not meet the ≥8 gate"
+        );
+
+        // 8th co-occurrence: now it qualifies.
+        tracker.record_co_occurrence(&procs);
+        assert!(
+            tracker.is_causal_pair("Dropbox", "cloudd", 8).is_some(),
+            "8 co-occurrences should meet the ≥8 gate"
+        );
+    }
 }

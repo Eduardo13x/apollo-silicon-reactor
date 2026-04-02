@@ -395,3 +395,82 @@ fn throttle_level(pressure_score: f64) -> String {
         "low".to_string()
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::types::OptimizationProfile;
+
+    fn low_pressure_input(workload_onset: bool) -> GovernorInput {
+        GovernorInput {
+            cpu_pressure: 0.20,
+            ram_pressure: 0.30,
+            interactive_wait_ratio: 0.10,
+            reactor_event_weight: 0.0,
+            thermal_constrained: false,
+            dev_session_active: false,
+            interactive_heavy: false,
+            context_switch_burst: false,
+            workload_mode: None,
+            workload_onset,
+        }
+    }
+
+    fn make_governor(profile: OptimizationProfile) -> ProfileGovernor {
+        ProfileGovernor::new(profile)
+    }
+
+    #[test]
+    fn workload_onset_jumps_to_aggressive_at_low_pressure() {
+        // Feature 3: governor should proactively jump to AggressiveRoot
+        // when a build starts — without waiting for pressure to climb.
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        let decision = gov.evaluate(low_pressure_input(true));
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::AggressiveRoot,
+            "build-onset should jump to AggressiveRoot immediately; got {:?}",
+            decision.effective_profile
+        );
+        assert!(
+            decision.transition_reason.contains("build-onset"),
+            "reason should mention build-onset; got '{}'",
+            decision.transition_reason
+        );
+    }
+
+    #[test]
+    fn workload_onset_blocked_by_thermal() {
+        // Thermal cap must override onset — we can't heat up more during a thermal event.
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        let mut input = low_pressure_input(true);
+        input.thermal_constrained = true;
+        let decision = gov.evaluate(input);
+        assert_ne!(
+            decision.effective_profile,
+            OptimizationProfile::AggressiveRoot,
+            "thermal constraint must block onset boost"
+        );
+    }
+
+    #[test]
+    fn no_onset_flag_does_not_boost() {
+        // Without onset, low-pressure BalancedRoot should stay BalancedRoot.
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        let decision = gov.evaluate(low_pressure_input(false));
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::BalancedRoot,
+            "without onset flag, profile should not change at low pressure"
+        );
+    }
+
+    #[test]
+    fn onset_noop_when_already_aggressive() {
+        // If already in AggressiveRoot, onset should be a no-op.
+        let mut gov = make_governor(OptimizationProfile::AggressiveRoot);
+        let decision = gov.evaluate(low_pressure_input(true));
+        assert_eq!(decision.effective_profile, OptimizationProfile::AggressiveRoot);
+    }
+}

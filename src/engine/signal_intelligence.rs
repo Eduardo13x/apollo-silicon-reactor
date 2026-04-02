@@ -1041,4 +1041,67 @@ mod tests {
         assert!(mid >= 0.20, "mid_entry clamped at 0.20: {}", mid);
         assert!(high >= 0.35, "high_entry clamped at 0.35: {}", high);
     }
+
+    // ── Proactive 30s predictor (Feature 1) ───────────────────────────────────
+
+    /// Feed a steadily rising pressure signal and verify the 30s projection
+    /// crosses the overflow zone well before the 5s projection does.
+    /// This simulates the "I can see the cliff 30 seconds ahead" scenario.
+    #[test]
+    fn proactive_30s_predicts_ahead_of_5s() {
+        let mut si = SignalIntelligence::new();
+        // Warm up Kalman with a stable baseline.
+        for _ in 0..10 {
+            si.tick(0.55, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app", 500_000_000, 2_000_000_000, 8_000_000_000, 0.5);
+        }
+        // Now simulate pressure rising at ~0.010/s (0.005 per 0.5s tick).
+        // After 20 ticks (~10s), pressure is at 0.65. Velocity ≈ 0.010/s.
+        // 30s ahead: 0.65 + 0.010*30 = 0.95 (overflow territory).
+        // 5s ahead: 0.65 + 0.010*5 = 0.70 (still below common bg_pressure ~0.72).
+        let mut last = SignalDigest { pressure_smooth: 0.0, pressure_velocity: 0.0, pressure_predicted_5s: 0.0, pressure_predicted_30s: 0.0, swap_velocity_smooth: 0.0, pressure_integral: 0.0, regime_shift_up: false, regime_shift_down: false, cusum_score: 0.0, entropy_anomaly: 0.0, p_oom_30s: 0.0, monopoly_risk: 0.0, mpc_recommendation: 0, urgency: 0.0, transformer_anomaly: 0.0, memory_scan_available: false };
+        for i in 0..20 {
+            let pressure = 0.55 + i as f64 * 0.005;
+            last = si.tick(pressure, 0.0, 0.05, 0.1, &[15.0], &[500e6], "app", 500_000_000, 2_000_000_000, 8_000_000_000, 0.5);
+        }
+        assert!(
+            last.pressure_predicted_30s > last.pressure_predicted_5s,
+            "30s prediction ({:.3}) must exceed 5s prediction ({:.3})",
+            last.pressure_predicted_30s, last.pressure_predicted_5s
+        );
+        // The proactive predictor should fire: 30s projection above ~0.82 (bg_pressure - 0.05)
+        // while current smooth pressure is still below ~0.75 (bg_pressure - 0.08 ≈ 0.72).
+        assert!(
+            last.pressure_predicted_30s > 0.80,
+            "30s forecast {:.3} should exceed 0.80 for proactive trigger to fire",
+            last.pressure_predicted_30s
+        );
+        assert!(
+            last.pressure_smooth < 0.75,
+            "current pressure {:.3} should still be safe (< 0.75) when proactive fires",
+            last.pressure_smooth
+        );
+    }
+
+    /// Stable signal → 30s projection should stay close to current value.
+    #[test]
+    fn proactive_30s_stable_signal_no_false_alarm() {
+        let mut si = SignalIntelligence::new();
+        let mut last = SignalDigest { pressure_smooth: 0.0, pressure_velocity: 0.0, pressure_predicted_5s: 0.0, pressure_predicted_30s: 0.0, swap_velocity_smooth: 0.0, pressure_integral: 0.0, regime_shift_up: false, regime_shift_down: false, cusum_score: 0.0, entropy_anomaly: 0.0, p_oom_30s: 0.0, monopoly_risk: 0.0, mpc_recommendation: 0, urgency: 0.0, transformer_anomaly: 0.0, memory_scan_available: false };
+        for _ in 0..30 {
+            last = si.tick(0.50, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app", 500_000_000, 2_000_000_000, 8_000_000_000, 0.5);
+        }
+        // Stable signal: 30s projection should be near 0.50 — no false proactive trigger.
+        assert!(
+            last.pressure_predicted_30s < 0.65,
+            "stable signal 30s forecast {:.3} should not trigger proactive alarm",
+            last.pressure_predicted_30s
+        );
+        // And 5s / 30s should be close to each other when velocity ≈ 0.
+        let delta = (last.pressure_predicted_30s - last.pressure_predicted_5s).abs();
+        assert!(
+            delta < 0.05,
+            "5s vs 30s gap {:.3} should be small on stable signal",
+            delta
+        );
+    }
 }
