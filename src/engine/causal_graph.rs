@@ -31,6 +31,10 @@ pub struct CausalEdge {
     pub evidence_count: u32,
     /// Typical latency in cycles between cause and observed effect.
     pub latency_cycles: u8,
+    /// EMA of actual pressure delta when this edge fired (effective observations only).
+    /// Captures HOW MUCH pressure dropped, not just WHETHER it dropped.
+    /// Range: 0.0–1.0. Init: 0.0 (no observations yet).
+    pub avg_delta: f32,
 }
 
 impl CausalEdge {
@@ -41,15 +45,33 @@ impl CausalEdge {
             confidence: 0.5, // uninformed prior
             evidence_count: 0,
             latency_cycles: 3, // default: expect effect within 3 cycles
+            avg_delta: 0.0,
         }
     }
 
     /// Bayesian update: blend new evidence into confidence.
+    /// When effective, also track the magnitude of the pressure delta.
     fn update(&mut self, was_effective: bool) {
+        self.update_with_delta(was_effective, 0.0);
+    }
+
+    /// Bayesian update with observed pressure delta magnitude.
+    fn update_with_delta(&mut self, was_effective: bool, delta: f32) {
         self.evidence_count += 1;
-        // EMA-style Bayesian update (alpha=0.1 matches memoria-core).
         let target = if was_effective { 1.0 } else { 0.0 };
         self.confidence = self.confidence * 0.9 + target * 0.1;
+        // Track average delta only when effective (delta > 0).
+        if was_effective && delta > 0.0 {
+            // EMA alpha=0.15: adapts to changing workload patterns.
+            self.avg_delta = self.avg_delta * 0.85 + delta * 0.15;
+        }
+    }
+
+    /// Impact score: confidence × avg_delta. Ranks edges by real-world effect.
+    /// A solid edge with 0.80 confidence and 0.10 avg drop scores higher
+    /// than one with 0.90 confidence but only 0.02 avg drop.
+    pub fn impact_score(&self) -> f32 {
+        self.confidence * self.avg_delta
     }
 
     /// Edge is solid: high confidence with sufficient evidence.
@@ -134,7 +156,7 @@ impl CausalGraph {
                 self.edges
                     .entry(key)
                     .or_insert_with(|| CausalEdge::new(&pending.action_key, effect))
-                    .update(true);
+                    .update_with_delta(true, delta.max(0.0));
 
                 // Also record the complementary edge (non-event).
                 let anti_effect = if was_effective {
@@ -146,7 +168,7 @@ impl CausalGraph {
                 self.edges
                     .entry(anti_key)
                     .or_insert_with(|| CausalEdge::new(&pending.action_key, anti_effect))
-                    .update(false);
+                    .update_with_delta(false, 0.0);
 
                 to_remove.push(i);
             }
@@ -174,6 +196,15 @@ impl CausalGraph {
     /// Get all solid edges (high confidence, sufficient evidence).
     pub fn solid_edges(&self) -> Vec<&CausalEdge> {
         self.edges.values().filter(|e| e.is_solid()).collect()
+    }
+
+    /// Solid edges sorted by impact_score (confidence × avg_delta), highest first.
+    /// Use this when prioritizing which actions to try — prefers actions that
+    /// both reliably work AND produce large pressure reductions.
+    pub fn solid_edges_by_impact(&self) -> Vec<&CausalEdge> {
+        let mut edges: Vec<&CausalEdge> = self.edges.values().filter(|e| e.is_solid()).collect();
+        edges.sort_by(|a, b| b.impact_score().partial_cmp(&a.impact_score()).unwrap_or(std::cmp::Ordering::Equal));
+        edges
     }
 
     /// Get all weak edges (low confidence despite evidence).

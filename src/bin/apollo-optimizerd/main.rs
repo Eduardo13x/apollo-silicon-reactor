@@ -4385,13 +4385,22 @@ fn main() -> anyhow::Result<()> {
                     }
                     // Persist optimization skills (Hermes pattern).
                     skill_registry.persist(std::path::Path::new(skills_path));
-                    // Learn skills from causal graph solid edges.
-                    for edge in causal_graph.solid_edges() {
+                    // Learn skills from causal graph solid edges, ordered by impact.
+                    // solid_edges_by_impact() sorts by confidence×avg_delta so high-impact
+                    // actions (large pressure reduction) are learned with higher priority.
+                    for edge in causal_graph.solid_edges_by_impact() {
                         if edge.cause.starts_with("throttle:") {
                             let target = edge.cause.trim_start_matches("throttle:");
+                            // Scale trigger pressure by impact: high-impact actions activate
+                            // at lower pressure (proactive), low-impact ones wait for more pressure.
+                            let trigger_pressure = if edge.avg_delta > 0.08 {
+                                0.55 // proactive: high-impact action, use early
+                            } else {
+                                0.65 // conservative: low-impact action, wait
+                            };
                             skill_registry.learn(
                                 &edge.cause,
-                                0.65, // learn at moderate pressure
+                                trigger_pressure,
                                 "any",
                                 vec![target.to_string()],
                             );
