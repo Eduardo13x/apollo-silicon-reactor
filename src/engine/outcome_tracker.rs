@@ -67,6 +67,9 @@ pub struct OutcomeBatch {
     pub savings_watts: f64,
     /// Nombres de procesos marcados como low-value (heurístico fallando).
     pub low_value_names: Vec<String>,
+    /// All resolved outcomes this tick: (process_name, pre_pressure, post_pressure).
+    /// Includes both effective and ineffective resolutions — used by LearningPipeline.
+    pub resolved_outcomes: Vec<(String, f64, f64)>,
 }
 
 // ── Experience Memory ───────────���─────────────────────────────��───────────────
@@ -359,6 +362,7 @@ impl OutcomeTracker {
         let check_after = Duration::from_secs(30);
         let mut effective_names = Vec::new();
         let mut savings_watts = 0.0_f64;
+        let mut resolved_outcomes: Vec<(String, f64, f64)> = Vec::new();
 
         while let Some(front) = self.pending.front() {
             if front.throttled_at.elapsed() < check_after {
@@ -398,6 +402,13 @@ impl OutcomeTracker {
                 effective,
             });
 
+            // Collect resolved outcome for LearningPipeline (pre/post pressure).
+            resolved_outcomes.push((
+                outcome.process_name.clone(),
+                outcome.pressure_before,
+                current_pressure,
+            ));
+
             self.total_resolved += 1;
             if effective {
                 self.total_effective += 1;
@@ -420,6 +431,7 @@ impl OutcomeTracker {
             effective_names,
             savings_watts,
             low_value_names,
+            resolved_outcomes,
         }
     }
 

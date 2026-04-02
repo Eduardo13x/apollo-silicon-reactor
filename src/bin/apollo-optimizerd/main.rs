@@ -66,6 +66,7 @@ use apollo_optimizer::engine::network_monitor::NetworkMonitor;
 use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfile};
 use apollo_optimizer::engine::causal_graph::CausalGraph;
 use apollo_optimizer::engine::action_queue::ActionQueue;
+use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningPipeline};
 use apollo_optimizer::engine::neuromodulator::{ApolloNeuromodulator, NeuroSignals};
 use apollo_optimizer::engine::optimization_skills::SkillRegistry;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
@@ -1094,6 +1095,11 @@ fn main() -> anyhow::Result<()> {
             // max_per_cycle actions per cycle. Unfreeze (urgent) is never capped.
             // Capacity=100 defines the denominator for backpressure_ratio reporting.
             let mut action_queue = ActionQueue::new(20, 100);
+
+            // Unified learning pipeline: fans out resolved throttle outcomes to
+            // OutcomeTracker, CausalGraph, and SkillRegistry coherently (mini-batch=8).
+            // Cross-feeds: OutcomeTracker→Skill, Causal→Skill, Skill→Outcome.
+            let mut learning_pipeline = LearningPipeline::new();
 
             // Freeze confirmation cache: pid → consecutive cycles flagged.
             // Only freeze processes that have been candidates for 2+ cycles,
@@ -4772,6 +4778,22 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+
+                    // LearningPipeline: fan out resolved outcomes to all three learners.
+                    // Each resolved throttle becomes a LearningObservation with the
+                    // pre/post pressure captured by tick(). Cross-feeds are applied
+                    // at batch flush (every 8 observations or at persist time).
+                    for (name, pre_pressure, post_pressure) in batch.resolved_outcomes {
+                        let obs = LearningObservation {
+                            process_name: name,
+                            skill_name: None, // skill attribution tracked by pending_trial_skill path
+                            pre_pressure,
+                            post_pressure,
+                            workload: workload_mode.as_str().to_string(),
+                            cycle: cycle_count,
+                        };
+                        learning_pipeline.push(obs, &mut outcome_tracker, &mut causal_graph, &mut skill_registry);
+                    }
                 }
 
                 // Lifelong zone learning: feed outcome effectiveness to router zones.
@@ -4849,6 +4871,8 @@ fn main() -> anyhow::Result<()> {
                 // Persist signal intelligence state every 100 cycles so hazard model + MPC
                 // effects survive crashes (not just clean shutdowns).
                 if cycle_count % 100 == 0 {
+                    // Flush any buffered observations before persisting state.
+                    learning_pipeline.flush_remaining(&mut outcome_tracker, &mut causal_graph, &mut skill_registry);
                     signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
                     outcome_tracker.persist_hop_groups(std::path::Path::new(hop_groups_path()));
                     LearnedState::persist_improved(
