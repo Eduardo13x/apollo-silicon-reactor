@@ -344,7 +344,9 @@ impl OutcomeTracker {
         });
 
         // Cap: si la cola crece demasiado, descarta los más viejos sin resolver.
+        // BUG-10: emit a diagnostic when we silently drop pending outcomes.
         if self.pending.len() > 300 {
+            eprintln!("apollo: outcome_tracker: discarded 100 pending outcomes (cap)");
             self.pending.drain(..100);
         }
     }
@@ -430,6 +432,18 @@ impl OutcomeTracker {
         (self.total_effective as f64 + 1.0) / (self.total_resolved as f64 + 2.0)
     }
 
+    /// GC for the weights HashMap — prevents unbounded growth in long-running daemons.
+    ///
+    /// Prunes entries that carry insufficient signal: fewer than 5 throttles AND
+    /// fewer than 2 effective outcomes. These entries are essentially noise — they
+    /// contribute only Laplace-smoothed 0.5 priors and waste memory.
+    ///
+    /// Complements the persist-time GC in `LearnedState::self_improve()` by also
+    /// pruning in-process, typically called every 500 cycles (~4 minutes).
+    pub fn gc_weights(&mut self) {
+        self.weights.retain(|_, w| w.throttle_count >= 5 || w.effective_count >= 2);
+    }
+
     /// Penalty signal for the RL agent: negative reward proportional to
     /// how many low-value patterns exist.  Returns 0.0 when things are fine,
     /// negative when throttling is wasting effort.
@@ -484,7 +498,9 @@ impl OutcomeTracker {
             let mut counts: Vec<_> = self.co_occurrence.values().copied().collect();
             counts.sort_unstable();
             let cutoff = counts[counts.len().saturating_sub(100)];
-            // Use > to ensure we actually evict entries at the cutoff boundary.
+            // Use > to ensure entries at the cutoff boundary are evicted, keeping only
+            // entries strictly above the Nth-largest count. This guarantees the map
+            // shrinks to ≤100 entries even when many pairs share the same count.
             self.co_occurrence.retain(|_, &mut v| v > cutoff);
         }
     }
