@@ -2990,6 +2990,47 @@ fn main() -> anyhow::Result<()> {
                     actions = llm_daemon::apply_learned_policy_actions(&snapshot, &policy, actions);
                 }
 
+                // Apply learned skills: throttle processes with solid causal links to
+                // pressure reduction. Skills are earned from causal graph solid edges
+                // (confidence × avg_delta). matching_skills() already gates on
+                // pressure ≥ skill.min_pressure AND is_reliable() (≥5 obs, ≥60% success).
+                {
+                    let skill_matches = skill_registry
+                        .matching_skills(snapshot.pressure.memory_pressure as f32, "any");
+                    if !skill_matches.is_empty() {
+                        let already_actioned: std::collections::HashSet<String> = actions
+                            .iter()
+                            .filter_map(|a| match a {
+                                RootAction::ThrottleProcess { name, .. }
+                                | RootAction::FreezeProcess { name, .. } => Some(name.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let skill_targets: std::collections::HashSet<String> = skill_matches
+                            .iter()
+                            .flat_map(|s| s.throttle_targets.iter().cloned())
+                            .collect();
+                        for (pid, process) in collector.system().processes() {
+                            let name = process.name().to_string();
+                            if skill_targets.contains(&name) && !already_actioned.contains(&name) {
+                                let skill_name = skill_matches
+                                    .iter()
+                                    .find(|s| s.throttle_targets.contains(&name))
+                                    .map(|s| s.name.as_str())
+                                    .unwrap_or("skill");
+                                actions.push(RootAction::ThrottleProcess {
+                                    pid: pid.as_u32(),
+                                    name,
+                                    aggressive: false,
+                                    reason: format!("skill:{}", skill_name),
+                                    start_sec: 0,
+                                    start_usec: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 // Predictive agent: inject soft actions for PreThrottleNoise / ProactivePurge.
                 match agent_intervention {
                     Intervention::PreThrottleNoise => {
