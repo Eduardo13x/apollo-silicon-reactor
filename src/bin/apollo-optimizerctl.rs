@@ -79,6 +79,8 @@ enum Commands {
     },
     /// Show reactive sysctl governor status
     SysctlGovernor,
+    /// Show daemon protocol version and build info
+    Version,
 }
 
 #[derive(Subcommand)]
@@ -437,6 +439,7 @@ fn main() -> anyhow::Result<()> {
             TeachCommands::Apply { file } => return handle_teach_apply(&file),
         },
         Commands::SysctlGovernor => send_request(DaemonRequest::GetSysctlGovernor),
+        Commands::Version => send_request(DaemonRequest::GetVersion),
     }?;
 
     match response {
@@ -467,6 +470,15 @@ fn main() -> anyhow::Result<()> {
         DaemonResponse::LearnedPolicy(p) => println!("{}", serde_json::to_string_pretty(&p)?),
         DaemonResponse::Usage(u) => println!("{}", serde_json::to_string_pretty(&u)?),
         DaemonResponse::SysctlGovernor(s) => println!("{}", serde_json::to_string_pretty(&s)?),
+        DaemonResponse::VersionInfo { protocol, build } => {
+            println!("apollo-optimizer v{build}  (protocol v{protocol})");
+            let client_protocol = apollo_optimizer::engine::protocol::PROTOCOL_VERSION;
+            if protocol != client_protocol {
+                eprintln!(
+                    "warning: protocol mismatch — daemon uses v{protocol}, client uses v{client_protocol}"
+                );
+            }
+        }
         DaemonResponse::Doctor { checks } => {
             for c in checks {
                 println!("{}", c);

@@ -509,6 +509,15 @@ extern "C" {
 /// Toggle Spotlight indexing via `mdutil -a -i on/off`.
 ///
 fn main() -> anyhow::Result<()> {
+    // Structured JSON logging to stderr (captured by launchd → apollo-optimizer.err.log).
+    // Override level at runtime: APOLLO_LOG=debug apollo-optimizerd
+    {
+        use tracing_subscriber::{fmt, EnvFilter};
+        let filter = EnvFilter::try_from_env("APOLLO_LOG")
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+        fmt().json().with_env_filter(filter).with_current_span(false).init();
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -516,6 +525,12 @@ fn main() -> anyhow::Result<()> {
             let profile = parse_profile(&profile);
             let is_root = unsafe { libc::geteuid() } == 0;
 
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                profile = profile.as_str(),
+                root = is_root,
+                "apollo-optimizerd starting"
+            );
             let config_path = PathBuf::from("/etc/apollo-optimizer/config.toml");
             let repo_cfg = load_repo_config(&config_path);
             let llm_cfg = repo_cfg.llm.unwrap_or(LlmConfig {
@@ -547,10 +562,9 @@ fn main() -> anyhow::Result<()> {
             let learned_policy = {
                 let disk_policy = read_json::<LearnedPolicy>(&learned_policy_path);
                 if disk_policy.is_none() && learned_policy_path.exists() {
-                    eprintln!(
-                        "WARNING: learned policy at '{}' is missing or corrupt — \
-                         falling back to seed policy only",
-                        learned_policy_path.display()
+                    tracing::warn!(
+                        path = %learned_policy_path.display(),
+                        "learned policy missing or corrupt — falling back to seed policy"
                     );
                 }
                 let mut p = disk_policy.unwrap_or_default();
@@ -761,7 +775,7 @@ fn main() -> anyhow::Result<()> {
             let socket_state = state.clone();
             thread::spawn(move || {
                 if let Err(e) = socket_handler::run_socket_server(socket_state) {
-                    eprintln!("CRITICAL: Socket server failed: {:?}", e);
+                    tracing::error!(err = ?e, "CRITICAL: socket server failed");
                 }
             });
 
@@ -917,40 +931,9 @@ fn main() -> anyhow::Result<()> {
                 );
                 restore_monitor = RestoreQualityMonitor::new();
             }
-            // Telemetry logger: ring-buffer data collector for Transformer training.
-            // Telemetry logger + Transformer disabled: classical stack is sufficient.
-            // Code preserved for future evaluation.
-            // let telemetry_dir = if unsafe { libc::geteuid() } == 0 {
-            //     std::path::PathBuf::from("/var/lib/apollo/telemetry")
-            // } else {
-            //     std::path::PathBuf::from("/tmp/apollo-telemetry")
-            // };
-            // let mut telemetry_logger =
-            //     apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(
-            //         telemetry_dir.clone(),
-            //     );
             // File cache warmer: pre-read predicted app executables into buffer cache.
             // Cao et al. 1994 — app-controlled prefetch eliminates cold page faults.
             let mut cache_warmer = apollo_optimizer::engine::cache_warmer::CacheWarmer::new();
-            // Transformer predictor: ONNX inference for anomaly detection.
-            // Without `transformer` feature flag, this is a zero-cost no-op.
-            // With the flag + trained model, it runs real inference each cycle.
-            // let transformer_model_path = telemetry_dir
-            //     .parent()
-            //     .unwrap_or(std::path::Path::new("/var/lib/apollo"))
-            //     .join("apollo_transformer.onnx");
-            // let transformer_stats_path = telemetry_dir
-            //     .parent()
-            //     .unwrap_or(std::path::Path::new("/var/lib/apollo"))
-            //     .join("feature_stats.json");
-            // Transformer disabled: the classical stack (Kalman + CUSUM + Hazard +
-            // Holt-Winters + Markov + Temporal) already covers anomaly detection and
-            // prediction.  Code preserved for future evaluation.
-            // let mut transformer_predictor =
-            //     apollo_optimizer::engine::transformer_predictor::TransformerPredictor::new(
-            //         &transformer_model_path,
-            //         &transformer_stats_path,
-            //     );
             // Display-Off Turbo: Android Doze-like mode for macOS.
             // Project Volta (Google 2014) — freeze non-essential when display off,
             // instant restore on wake. Saves 15-25% battery (Chuang et al. 2013).
@@ -1092,10 +1075,7 @@ fn main() -> anyhow::Result<()> {
                 let ptr = &*lf_metrics as *const LockFreeMetrics as *const u8;
                 let len = std::mem::size_of::<LockFreeMetrics>();
                 if let Err(e) = vm_surgeon::pin_memory(ptr, len) {
-                    eprintln!(
-                        "warn: mlock on LockFreeMetrics failed ({}), continuing unpinned",
-                        e
-                    );
+                    tracing::warn!(err = %e, "mlock on LockFreeMetrics failed, continuing unpinned");
                 }
             }
             // kqueue reactor for frozen-PID death detection (push, not poll).
@@ -1105,7 +1085,7 @@ fn main() -> anyhow::Result<()> {
                 match kqueue_pressure::KqueuePressure::new() {
                     Ok(kq) => Some(kq),
                     Err(e) => {
-                        eprintln!("warn: kqueue_pressure init failed ({}), frozen-death detection degraded", e);
+                        tracing::warn!(err = %e, "kqueue_pressure init failed, frozen-death detection degraded");
                         None
                     }
                 };
@@ -1207,11 +1187,11 @@ fn main() -> anyhow::Result<()> {
                                 "collector-stalled".to_string();
                             // Respawn stalled collectors so the main loop gets fresh data.
                             if !smc_alive {
-                                eprintln!("watchdog: SmcReader stalled — respawning");
+                                tracing::warn!("watchdog: SmcReader stalled — respawning");
                                 smc_reader = SmcReader::spawn(Duration::from_secs(3));
                             }
                             if !pressure_alive {
-                                eprintln!("watchdog: PressureCollector stalled — respawning");
+                                tracing::warn!("watchdog: PressureCollector stalled — respawning");
                                 pressure_collector =
                                     PressureCollector::spawn(Duration::from_secs(3));
                             }
@@ -2547,7 +2527,6 @@ fn main() -> anyhow::Result<()> {
                     }
                     // Darwin-Boltzmann anomaly scoring: feed signal digest into
                     // Hopfield memory + evolving SAE population for learned anomaly detection.
-                    // Replaces hardcoded transformer_anomaly: 0.0.
                     use apollo_optimizer::engine::telemetry_logger::TelemetryVector;
                     let dom_share = {
                         let max_mem = snapshot.top_processes.iter()
@@ -2947,11 +2926,6 @@ fn main() -> anyhow::Result<()> {
                         state.metrics.lock_recover().paging_hints_applied += 1;
                     }
                 }
-
-                // Telemetry logger + Transformer scoring disabled.
-                // Classical signal stack (Kalman/CUSUM/Hazard/HW/Markov/Temporal)
-                // already covers anomaly detection and prediction.
-                // Code preserved in telemetry_logger.rs / transformer_predictor.rs.
 
                 // ── Habituation: update per-process state tracking ─────────
                 // Inspired by Thompson & Spencer 1966 / memoria-core habituation.rs.
@@ -3702,7 +3676,7 @@ fn main() -> anyhow::Result<()> {
                             if let Err(e) = jetsam_control::set_warn_limit(snap.pid, warn_mb) {
                                 // Non-fatal: log at debug level and continue.
                                 if cfg!(debug_assertions) {
-                                    eprintln!("[warn-limit] {}", e);
+                                    tracing::warn!(err = %e, "warn-limit");
                                 }
                             } else {
                                 warn_limit_pids.insert(snap.pid, 3); // clear after 3 cycles
@@ -4920,10 +4894,9 @@ fn main() -> anyhow::Result<()> {
                     if outcomes.failures == 0 {
                         sysctl_governor.mark_reverted();
                     } else {
-                        eprintln!(
-                            "sysctl-governor: WARNING: {} revert failures; \
-                             persisted defaults retained for next startup",
-                            outcomes.failures
+                        tracing::warn!(
+                            failures = outcomes.failures,
+                            "sysctl-governor: revert failures; persisted defaults retained for next startup"
                         );
                     }
                 } else {

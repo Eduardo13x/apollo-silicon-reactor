@@ -74,8 +74,6 @@ pub mod temporal_predictor;
 pub mod thermal_iokit;
 pub mod thermal_interrupt;
 pub mod thermal_manager;
-#[cfg(feature = "tract-onnx")]
-pub mod transformer_predictor;
 pub mod types;
 pub mod usage_model;
 pub mod user_profile;

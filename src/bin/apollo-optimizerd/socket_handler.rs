@@ -623,6 +623,10 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
         }
         // Subscribe es manejado antes de llegar aqui (en handle_client)
         DaemonRequest::Subscribe => DaemonResponse::Ok,
+        DaemonRequest::GetVersion => DaemonResponse::VersionInfo {
+            protocol: apollo_optimizer::engine::protocol::PROTOCOL_VERSION,
+            build: env!("CARGO_PKG_VERSION").to_string(),
+        },
     }
 }
 

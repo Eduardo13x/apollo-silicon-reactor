@@ -67,10 +67,41 @@ fi
 
 if ! sudo test -f /etc/apollo-optimizer/config.toml; then
   cat <<'CFG' | sudo tee /etc/apollo-optimizer/config.toml >/dev/null
+# Apollo Optimizer — daemon configuration
+# Location: /etc/apollo-optimizer/config.toml
+# Changes take effect on next daemon restart.
+
+# Optimization profile: "balanced-root" | "aggressive-root" | "safe-root"
+#   balanced-root  — default; adapts to pressure, conservative on foreground
+#                    apps and developer tools.
+#   aggressive-root — more aggressive background freezing; good for builds.
+#   safe-root      — minimal intervention; safest option.
 profile = "balanced-root"
+
+# Safety policy: "aggressive-controlled" | "conservative"
+#   aggressive-controlled — freeze background processes when pressure > 0.55.
+#   conservative          — only freeze processes idle > 10 min at > 0.75.
 policy = "aggressive-controlled"
 
-# Optional LLM teacher mode (requires `apollo-optimizerctl llm set-key`).
+# Additional processes to never freeze/throttle (substring match against name).
+# The default protected set (Claude, Brave, rustc, cargo, etc.) is always active.
+#protected_extra = ["my-app", "postgres"]
+
+# Foreground latency target.
+#   low    — 16 ms budget (real-time audio / gaming)
+#   normal — 50 ms budget (default)
+#   max    — 150 ms budget (batch workloads dominant)
+#latency_target = "normal"
+
+# Log level for structured daemon output to /var/log/apollo-optimizer.err.log
+# Override at runtime: APOLLO_LOG=debug apollo-optimizerd
+# Values: "error" | "warn" | "info" | "debug" | "trace"
+#log_level = "info"
+
+# ── LLM teacher mode ──────────────────────────────────────────────────────────
+# Requires: apollo-optimizerctl llm set-key <key>
+# The API key is stored encrypted in /var/lib/apollo/; this section only
+# controls model behaviour.
 #[llm]
 #enabled = false
 #model = "gpt-4.1-mini"

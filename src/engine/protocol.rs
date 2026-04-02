@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::engine::llm::{LearnedPolicy, LlmSuggestion};
+
+/// Wire protocol version.  Bump when adding variants that older clients/daemons
+/// cannot understand.  Both apollo-optimizerd and apollo-optimizerctl expose
+/// this at runtime so a version mismatch can be reported cleanly.
+pub const PROTOCOL_VERSION: u32 = 1;
 use crate::engine::types::{
     BlockerScore, CapabilityReport, DaemonStatus, LatencyTarget, LlmStatus, OptimizationProfile,
     ProfileTransition, RuntimeMetrics, UsageResponse,
@@ -53,6 +58,8 @@ pub enum DaemonRequest {
     /// Suscripcion push: el daemon enviara StatusPush en cada ciclo de optimizacion.
     /// La conexion se mantiene abierta indefinidamente.
     Subscribe,
+    /// Returns protocol version and build string for compatibility checks.
+    GetVersion,
 }
 
 impl DaemonRequest {
@@ -69,7 +76,8 @@ impl DaemonRequest {
             | Self::UsageExplain { .. }
             | Self::GetLearnedPolicy
             | Self::GetSysctlGovernor
-            | Self::Subscribe => false,
+            | Self::Subscribe
+            | Self::GetVersion => false,
 
             Self::SetProfile { .. }
             | Self::SetLatencyTarget { .. }
@@ -137,6 +145,11 @@ pub enum DaemonResponse {
     SysctlGovernor(crate::engine::sysctl_governor::SysctlGovernorStatus),
     /// Evento push enviado por el daemon a los suscriptores en cada ciclo.
     StatusPush(DaemonStatus),
+    /// Response to GetVersion.
+    VersionInfo {
+        protocol: u32,
+        build: String,
+    },
     Error {
         message: String,
     },
