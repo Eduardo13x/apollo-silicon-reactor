@@ -522,6 +522,19 @@ impl SignalIntelligence {
         };
     }
 
+    /// Nudge energy_bias based on expected workload at the current hour.
+    ///
+    /// Heavy workloads (Coding, VideoEdit) spike pressure fast — engage 2pp earlier.
+    /// Clamps combined bias to -0.15 to prevent over-engagement.
+    pub fn adjust_bias_for_workload(&mut self, workload: crate::engine::user_profile::WorkloadType) {
+        use crate::engine::user_profile::WorkloadType;
+        let workload_nudge = match workload {
+            WorkloadType::Coding | WorkloadType::VideoEdit => -0.02,
+            _ => 0.0,
+        };
+        self.energy_bias = (self.energy_bias + workload_nudge).max(-0.15);
+    }
+
     /// Nudge energy_bias downward when real package watts are high.
     ///
     /// Called after `set_energy_bias`. M1 Air TDP ~15W:

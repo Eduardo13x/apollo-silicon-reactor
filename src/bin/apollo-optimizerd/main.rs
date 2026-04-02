@@ -2492,6 +2492,15 @@ fn main() -> anyhow::Result<()> {
                     if let Some(pkg_w) = cycle_hw_snap.as_ref().and_then(|h| h.power.package_watts) {
                         signal_intel.adjust_bias_for_power(pkg_w);
                     }
+                    // Workload-aware bias: heavy workloads (Coding/VideoEdit) spike pressure
+                    // fast — engage optimizer 2pp earlier during those hours.
+                    {
+                        let wl = {
+                            let gov = state.adaptive_governor.lock_recover();
+                            gov.user_profile.likely_workload_at_hour(hour_of_day)
+                        };
+                        signal_intel.adjust_bias_for_workload(wl);
+                    }
                     let _si_result = signal_intel.tick(
                         snapshot.pressure.memory_pressure,
                         snapshot.pressure.swap_delta_bytes_per_sec,
@@ -2675,13 +2684,16 @@ fn main() -> anyhow::Result<()> {
                     prev_pressure_smooth = signal_digest.pressure_smooth;
 
                     // ── Specialist voting: weighted ensemble replaces override chain ──
-                    use apollo_optimizer::engine::predictive_agent::{SpecialistVote, tally_votes};
+                    // Confidences are modulated by learned accuracy weights (Super Learner).
+                    // SpecialistAccuracyTracker EMA-tracks per-specialist correctness;
+                    // a specialist consistently right gets weight→1.0, wrong gets→0.0.
+                    use apollo_optimizer::engine::predictive_agent::{SpecialistVote, tally_votes, specialist};
                     let mut votes = vec![
-                        // LinUCB: primary agent, moderate confidence.
+                        // LinUCB: primary agent — confidence scaled by learned accuracy.
                         SpecialistVote {
                             name: "linucb",
                             intervention: linucb_choice,
-                            confidence: 0.5,
+                            confidence: 0.5 * specialist_accuracy.weight(specialist::LINUCB),
                         },
                     ];
 
@@ -2690,7 +2702,8 @@ fn main() -> anyhow::Result<()> {
                         votes.push(SpecialistVote {
                             name: "hazard",
                             intervention: Intervention::from_index(signal_digest.mpc_recommendation),
-                            confidence: signal_digest.p_oom_30s.min(1.0),
+                            confidence: signal_digest.p_oom_30s.min(1.0)
+                                * specialist_accuracy.weight(specialist::HAZARD),
                         });
                     }
 
@@ -2699,7 +2712,8 @@ fn main() -> anyhow::Result<()> {
                         votes.push(SpecialistVote {
                             name: "monopoly",
                             intervention: Intervention::PreThrottleNoise,
-                            confidence: signal_digest.monopoly_risk.min(1.0) * 0.7,
+                            confidence: signal_digest.monopoly_risk.min(1.0)
+                                * specialist_accuracy.weight(specialist::MONOPOLY),
                         });
                     }
 
@@ -2708,7 +2722,9 @@ fn main() -> anyhow::Result<()> {
                         votes.push(SpecialistVote {
                             name: "kalman",
                             intervention: Intervention::TightenThresholds,
-                            confidence: (signal_digest.pressure_predicted_5s - 0.85).min(0.15) / 0.15 * 0.8,
+                            confidence: (signal_digest.pressure_predicted_5s - 0.85).min(0.15)
+                                / 0.15
+                                * specialist_accuracy.weight(specialist::KALMAN),
                         });
                     }
 
