@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
+use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
 use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
 use crate::engine::overflow_guard::OverflowHistory;
@@ -84,6 +85,10 @@ pub struct LearnedState {
     /// (dual-write preserved).  `None` on first run or old file format.
     #[serde(default)]
     pub frozen_pids: Option<FrozenStatePersisted>,
+
+    /// Unified effectiveness scores per process.
+    #[serde(default)]
+    pub effectiveness_tracker: Option<HashMap<String, ProcessEffectiveness>>,
 }
 
 fn default_version() -> u32 {
@@ -109,6 +114,7 @@ impl LearnedState {
         outcome_tracker: &OutcomeTracker,
         specialist_accuracy: &SpecialistAccuracyTracker,
         skill_registry: &SkillRegistry,
+        effectiveness_tracker: &EffectivenessTracker,
         overflow_history: Option<OverflowHistory>,
         frozen_state: Option<FrozenStatePersisted>,
     ) -> Self {
@@ -121,6 +127,7 @@ impl LearnedState {
             last_restore_quality: None,
             pending_trial_skill: None,
             skill_registry: Some(skill_registry.snapshot()),
+            effectiveness_tracker: Some(effectiveness_tracker.snapshot()),
             overflow_guard_history: overflow_history,
             frozen_pids: frozen_state,
         }
@@ -141,6 +148,7 @@ impl LearnedState {
         outcome_tracker: &mut OutcomeTracker,
         specialist_accuracy: &mut SpecialistAccuracyTracker,
         skill_registry: &mut SkillRegistry,
+        effectiveness_tracker: &mut EffectivenessTracker,
     ) -> (Option<OverflowHistory>, Option<FrozenStatePersisted>) {
         self.validate();
         if let Some(si) = self.signal_intelligence {
@@ -157,6 +165,9 @@ impl LearnedState {
         // legacy optimization_skills.json load that the caller performs after.
         if let Some(skills) = self.skill_registry {
             skill_registry.restore_from_map(skills);
+        }
+        if let Some(eff) = self.effectiveness_tracker {
+            effectiveness_tracker.restore_from_map(eff);
         }
         (self.overflow_guard_history, self.frozen_pids)
     }
@@ -245,6 +256,7 @@ impl LearnedState {
         outcome_tracker: &OutcomeTracker,
         specialist_accuracy: &SpecialistAccuracyTracker,
         skill_registry: &SkillRegistry,
+        effectiveness_tracker: &EffectivenessTracker,
         overflow_history: Option<OverflowHistory>,
         frozen_state: Option<FrozenStatePersisted>,
         path: &Path,
@@ -257,6 +269,7 @@ impl LearnedState {
             outcome_tracker,
             specialist_accuracy,
             skill_registry,
+            effectiveness_tracker,
             overflow_history,
             frozen_state,
         );
@@ -436,6 +449,7 @@ mod tests {
             skill_registry: None,
             overflow_guard_history: None,
             frozen_pids: None,
+            effectiveness_tracker: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -458,6 +472,7 @@ mod tests {
             skill_registry: None,
             overflow_guard_history: None,
             frozen_pids: None,
+            effectiveness_tracker: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -478,6 +493,7 @@ mod tests {
             skill_registry: None,
             overflow_guard_history: None,
             frozen_pids: None,
+            effectiveness_tracker: None,
         };
         assert_eq!(
             state
@@ -513,6 +529,7 @@ mod tests {
             skill_registry: None,
             overflow_guard_history: None,
             frozen_pids: None,
+            effectiveness_tracker: None,
         };
         state.self_improve();
         assert_eq!(state.persist_generations, 6);
@@ -543,6 +560,7 @@ mod tests {
             skill_registry: None,
             overflow_guard_history: None,
             frozen_pids: None,
+            effectiveness_tracker: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -578,6 +596,7 @@ mod tests {
             skill_registry: None,
             overflow_guard_history: None,
             frozen_pids: None,
+            effectiveness_tracker: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();

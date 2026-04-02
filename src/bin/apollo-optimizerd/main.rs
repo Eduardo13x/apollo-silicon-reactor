@@ -72,8 +72,10 @@ use apollo_optimizer::engine::optimization_skills::SkillRegistry;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
 use apollo_optimizer::engine::overflow_guard::{OverflowGuard, BUILD_TOOLS};
 use apollo_optimizer::engine::power_management::{detect_battery_status, PowerManager};
+use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_optimizer::engine::predictive_agent::{
     specialist, AgentContext, Intervention, PredictiveAgent, SpecialistAccuracyTracker,
+    SpecialistVote, tally_votes,
 };
 use apollo_optimizer::engine::proc_taskinfo;
 use apollo_optimizer::engine::process_classifier::{ProcessTier};
@@ -940,6 +942,7 @@ fn main() -> anyhow::Result<()> {
             // Specialist accuracy tracker: EMA per-specialist confidence weights.
             // Starts at 0.70 (matching legacy hardcoded multipliers) and adapts.
             let mut specialist_accuracy = SpecialistAccuracyTracker::new();
+            let mut effectiveness_tracker = EffectivenessTracker::new();
             // Track previous cycle pressure to detect spikes (for accuracy feedback).
             let mut prev_pressure_smooth: f64 = 0.0;
 
@@ -983,6 +986,7 @@ fn main() -> anyhow::Result<()> {
                     &mut outcome_tracker,
                     &mut specialist_accuracy,
                     &mut skill_registry,
+                    &mut effectiveness_tracker,
                 );
                 // Restore overflow guard history from unified persistence.
                 // Migration: if learned_state has history, it takes precedence over
@@ -2821,7 +2825,6 @@ fn main() -> anyhow::Result<()> {
                     // Confidences are modulated by learned accuracy weights (Super Learner).
                     // SpecialistAccuracyTracker EMA-tracks per-specialist correctness;
                     // a specialist consistently right gets weight→1.0, wrong gets→0.0.
-                    use apollo_optimizer::engine::predictive_agent::{SpecialistVote, tally_votes, specialist};
                     let mut votes = vec![
                         // LinUCB: primary agent — UCB confidence × learned accuracy weight.
                         // linucb_confidence is the normalized margin of the winning arm [0.5, 1.0]:
@@ -3447,16 +3450,16 @@ fn main() -> anyhow::Result<()> {
                         .collect();
                     bg_procs.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
                     for proc in bg_procs.iter().take(3) {
-                        actions.push(RootAction::SetMemorystatus {
-                            pid: proc.pid,
-                            priority: -1,
-                            reason: format!(
+                        actions.push(RootAction::set_memorystatus(
+                            proc.pid,
+                            -1,
+                            format!(
                                 "pressure-driven hint (p={:.0}%): {} ({}MB)",
                                 signal_digest.pressure_smooth * 100.0,
                                 proc.name,
                                 proc.rss_bytes / 1024 / 1024,
                             ),
-                        });
+                        ));
                     }
                 }
 
@@ -3662,14 +3665,14 @@ fn main() -> anyhow::Result<()> {
                         // Only freeze if using meaningful memory (>50MB RSS).
                         if process.memory() < 50 * 1024 * 1024 { continue; }
                         let (ss, su) = pid_start_time(pid_u32);
-                        actions.push(RootAction::FreezeProcess {
-                            pid: pid_u32,
-                            name: name.clone(),
-                            reason: format!("stale-app: no user interaction for >30min, rss={}MB",
+                        actions.push(RootAction::freeze_full(
+                            pid_u32,
+                            name.clone(),
+                            format!("stale-app: no user interaction for >30min, rss={}MB",
                                 process.memory() / 1024 / 1024),
-                            start_sec: ss,
-                            start_usec: su,
-                        });
+                            ss,
+                            su,
+                        ));
                     }
                 }
 
@@ -3787,18 +3790,18 @@ fn main() -> anyhow::Result<()> {
                         }
                     } else {
                         let (ss, su) = pid_start_time(target.pid);
-                        actions.push(RootAction::FreezeProcess {
-                            pid: target.pid,
-                            name: target.name.clone(),
-                            reason: format!(
+                        actions.push(RootAction::freeze_full(
+                            target.pid,
+                            target.name.clone(),
+                            format!(
                                 "memory-leak recovery: prob={:.2} rss={}MB attempts={}",
                                 target.leak_probability,
                                 target.rss_bytes / 1024 / 1024,
                                 target.recovery_attempts,
                             ),
-                            start_sec: ss,
-                            start_usec: su,
-                        });
+                            ss,
+                            su,
+                        ));
                         proc_recovery.record_kill_attempt(target.pid);
                     }
                 }
@@ -4060,11 +4063,11 @@ fn main() -> anyhow::Result<()> {
                         }
                     };
                     for (key, value) in net_optimizer.get_sysctl_recommendations(net_profile) {
-                        actions.push(RootAction::SetSysctl {
+                        actions.push(RootAction::set_sysctl(
                             key,
                             value,
-                            reason: format!("network-optimizer: {:?} profile", net_profile),
-                        });
+                            format!("network-optimizer: {:?} profile", net_profile),
+                        ));
                     }
                 }
 
@@ -4833,7 +4836,13 @@ fn main() -> anyhow::Result<()> {
                             workload: workload_mode.as_str().to_string(),
                             cycle: cycle_count,
                         };
-                        learning_pipeline.push(obs, &mut outcome_tracker, &mut causal_graph, &mut skill_registry);
+                        learning_pipeline.push(
+                            obs,
+                            &mut outcome_tracker,
+                            &mut causal_graph,
+                            &mut skill_registry,
+                            &mut effectiveness_tracker,
+                        );
                     }
                 }
 
@@ -4913,7 +4922,12 @@ fn main() -> anyhow::Result<()> {
                 // effects survive crashes (not just clean shutdowns).
                 if cycle_count % 100 == 0 {
                     // Flush any buffered observations before persisting state.
-                    learning_pipeline.flush_remaining(&mut outcome_tracker, &mut causal_graph, &mut skill_registry);
+                    learning_pipeline.flush_remaining(
+                        &mut outcome_tracker,
+                        &mut causal_graph,
+                        &mut skill_registry,
+                        &mut effectiveness_tracker,
+                    );
                     signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
                     outcome_tracker.persist_hop_groups(std::path::Path::new(hop_groups_path()));
                     // Snapshot frozen state for unified persistence.
@@ -4935,6 +4949,7 @@ fn main() -> anyhow::Result<()> {
                         &outcome_tracker,
                         &specialist_accuracy,
                         &skill_registry,
+                        &effectiveness_tracker,
                         Some(overflow_guard.export_history()),
                         Some(frozen_snap),
                         ls_path,
@@ -5378,6 +5393,7 @@ fn main() -> anyhow::Result<()> {
                 &outcome_tracker,
                 &specialist_accuracy,
                 &skill_registry,
+                &effectiveness_tracker,
                 Some(overflow_guard.export_history()),
                 Some(frozen_snap_shutdown),
                 ls_path,

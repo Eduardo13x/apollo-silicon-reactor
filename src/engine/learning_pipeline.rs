@@ -45,6 +45,7 @@
 //!   gives the same results, switch via `with_batch_size(1)`.
 
 use crate::engine::causal_graph::CausalGraph;
+use crate::engine::effectiveness_tracker::EffectivenessTracker;
 use crate::engine::optimization_skills::SkillRegistry;
 use crate::engine::outcome_tracker::OutcomeTracker;
 
@@ -167,13 +168,14 @@ impl LearningPipeline {
         outcome_tracker: &mut OutcomeTracker,
         causal_graph: &mut CausalGraph,
         skill_registry: &mut SkillRegistry,
+        effectiveness_tracker: &mut EffectivenessTracker,
     ) {
         if !self.enabled {
             return;
         }
         self.batch.push(obs);
         if self.batch.len() >= self.batch_size {
-            self.flush(outcome_tracker, causal_graph, skill_registry);
+            self.flush(outcome_tracker, causal_graph, skill_registry, effectiveness_tracker);
         }
     }
 
@@ -189,6 +191,7 @@ impl LearningPipeline {
         outcome_tracker: &mut OutcomeTracker,
         causal_graph: &mut CausalGraph,
         skill_registry: &mut SkillRegistry,
+        effectiveness_tracker: &mut EffectivenessTracker,
     ) {
         if self.batch.is_empty() {
             return;
@@ -301,7 +304,50 @@ impl LearningPipeline {
             }
         }
 
-        // ── Step 3: Clear batch ───────────────────────────────────────────────
+        // ── Step 3: Update EffectivenessTracker (F3 Blend) ───────────────────
+
+        // After all learners have updated, feed their new signals into the 
+        // EffectivenessTracker to recompute the blended scores for all 
+        // processes touched in this batch.
+        for obs in &self.batch {
+            let cycle = obs.cycle;
+
+            // 1. Bayesian signal
+            if let Some(w) = outcome_tracker.weights.get(&obs.process_name) {
+                effectiveness_tracker.update_from_outcome(
+                    &obs.process_name,
+                    w.effectiveness(),
+                    w.throttle_count,
+                    cycle,
+                );
+            }
+
+            // 2. Causal signal
+            let causal_key = obs.causal_action_key();
+            if let Some(edge) = causal_graph.get_edge(&causal_key, "pressure_drop") {
+                effectiveness_tracker.update_from_causal(
+                    &obs.process_name,
+                    edge.confidence as f64,
+                    edge.evidence_count,
+                    cycle,
+                );
+            }
+
+            // 3. Skill signal
+            let skill_key = obs.skill_name.as_ref().map(|s| s.clone())
+                .unwrap_or_else(|| format!("throttle:{}", obs.process_name));
+            if let Some(rate) = skill_registry.success_rate(&skill_key) {
+                let apps = skill_registry.apply_count(&skill_key).unwrap_or(0);
+                effectiveness_tracker.update_from_skill(
+                    &obs.process_name,
+                    rate as f64,
+                    apps,
+                    cycle,
+                );
+            }
+        }
+
+        // ── Step 4: Clear batch ───────────────────────────────────────────────
         self.batch.clear();
     }
 
@@ -316,8 +362,9 @@ impl LearningPipeline {
         outcome_tracker: &mut OutcomeTracker,
         causal_graph: &mut CausalGraph,
         skill_registry: &mut SkillRegistry,
+        effectiveness_tracker: &mut EffectivenessTracker,
     ) {
-        self.flush(outcome_tracker, causal_graph, skill_registry);
+        self.flush(outcome_tracker, causal_graph, skill_registry, effectiveness_tracker);
     }
 }
 
@@ -393,9 +440,10 @@ mod tests {
         let mut ot = OutcomeTracker::new();
         let mut cg = CausalGraph::new();
         let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
 
         let obs = make_obs("Dropbox", 0.75, 0.70, 1);
-        pipeline.push(obs, &mut ot, &mut cg, &mut sr);
+        pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
 
         assert_eq!(pipeline.pending_count(), 0);
         assert!(ot.weights.is_empty(), "disabled pipeline should not update OutcomeTracker");
@@ -407,11 +455,12 @@ mod tests {
         let mut ot = OutcomeTracker::new();
         let mut cg = CausalGraph::new();
         let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
 
         // Push 3 observations — should not flush yet.
         for i in 0..3u64 {
             let obs = make_obs("Dropbox", 0.75, 0.70, i * 4);
-            pipeline.push(obs, &mut ot, &mut cg, &mut sr);
+            pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
         }
         assert_eq!(pipeline.pending_count(), 3);
         // OutcomeTracker not yet updated.
@@ -419,7 +468,7 @@ mod tests {
 
         // Push 4th — triggers auto-flush.
         let obs = make_obs("Dropbox", 0.75, 0.70, 12);
-        pipeline.push(obs, &mut ot, &mut cg, &mut sr);
+        pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
 
         assert_eq!(pipeline.pending_count(), 0);
         let w = ot.weights.get("Dropbox").expect("weight should exist after flush");
@@ -433,9 +482,10 @@ mod tests {
         let mut ot = OutcomeTracker::new();
         let mut cg = CausalGraph::new();
         let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
 
         let obs = make_obs("Dropbox", 0.80, 0.74, 0); // delta=0.06, effective
-        pipeline.push(obs, &mut ot, &mut cg, &mut sr);
+        pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
 
         let w = ot.weights.get("Dropbox").unwrap();
         assert_eq!(w.throttle_count, 1);
@@ -448,9 +498,10 @@ mod tests {
         let mut ot = OutcomeTracker::new();
         let mut cg = CausalGraph::new();
         let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
 
         let obs = make_obs("contactsd", 0.70, 0.70, 0); // delta=0, not effective
-        pipeline.push(obs, &mut ot, &mut cg, &mut sr);
+        pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
 
         let w = ot.weights.get("contactsd").unwrap();
         assert_eq!(w.throttle_count, 1);
@@ -463,12 +514,13 @@ mod tests {
         let mut ot = OutcomeTracker::new();
         let mut cg = CausalGraph::new();
         let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
 
         // Register a skill first.
         sr.learn("cloud_throttle", 0.70, "any", vec!["Dropbox".into()]);
 
         let obs = make_obs_with_skill("Dropbox", "cloud_throttle", 0.75, 0.68, 0);
-        pipeline.push(obs, &mut ot, &mut cg, &mut sr);
+        pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
 
         assert_eq!(sr.apply_count("cloud_throttle"), Some(1));
         // delta=0.07 ≥ 0.01 → effective, so success_count should be 1.
@@ -486,6 +538,7 @@ mod tests {
         let mut ot = OutcomeTracker::new();
         let mut cg = CausalGraph::new();
         let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
 
         // Seed OutcomeTracker with 5 effective throttles (effectiveness ≈ 0.86).
         {
@@ -507,7 +560,7 @@ mod tests {
 
         // Push one observation for Safari — triggers cross-feed at flush.
         let obs = make_obs("Safari", 0.75, 0.70, 0);
-        pipeline.push(obs, &mut ot, &mut cg, &mut sr);
+        pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
 
         // The skill should have been boosted (success_rate increased).
         let rate_after = sr.success_rate("throttle:Safari").unwrap();
@@ -526,6 +579,7 @@ mod tests {
         let mut ot = OutcomeTracker::new();
         let mut cg = CausalGraph::new();
         let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
 
         // Create a skill with strong evidence via learn + record.
         sr.learn("throttle:Dropbox", 0.65, "any", vec!["Dropbox".to_string()]);
@@ -543,7 +597,7 @@ mod tests {
         assert!(ot.weights.get("Dropbox").is_none());
 
         let obs = make_obs("Dropbox", 0.75, 0.68, 0);
-        pipeline.push(obs, &mut ot, &mut cg, &mut sr);
+        pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
 
         // After flush, OutcomeTracker should have been seeded by the skill.
         let w = ot.weights.get("Dropbox").expect("weight should exist after prior seeding");
@@ -559,16 +613,17 @@ mod tests {
         let mut ot = OutcomeTracker::new();
         let mut cg = CausalGraph::new();
         let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
 
         // Push fewer than batch_size observations.
         for i in 0..3u64 {
             let obs = make_obs("Dropbox", 0.75, 0.70, i * 4);
-            pipeline.push(obs, &mut ot, &mut cg, &mut sr);
+            pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
         }
         assert_eq!(pipeline.pending_count(), 3);
 
         // Explicit flush_remaining should process them.
-        pipeline.flush_remaining(&mut ot, &mut cg, &mut sr);
+        pipeline.flush_remaining(&mut ot, &mut cg, &mut sr, &mut eff);
         assert_eq!(pipeline.pending_count(), 0);
 
         let w = ot.weights.get("Dropbox").expect("weight after flush_remaining");
@@ -581,18 +636,19 @@ mod tests {
         let mut ot = OutcomeTracker::new();
         let mut cg = CausalGraph::new();
         let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
 
         // Run enough observations to build causal evidence.
         for i in 0..10u64 {
             let obs = make_obs("Firefox", 0.80, 0.74, i * 4);
-            pipeline.push(obs, &mut ot, &mut cg, &mut sr);
+            pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
         }
 
         // CausalGraph should have evidence for throttle:Firefox.
-        let eff = cg.effectiveness("throttle:Firefox");
-        assert!(eff.is_some(), "causal graph should have evidence for Firefox");
+        let eff_score = cg.effectiveness("throttle:Firefox");
+        assert!(eff_score.is_some(), "causal graph should have evidence for Firefox");
         assert!(
-            eff.unwrap() > 0.5,
+            eff_score.unwrap() > 0.5,
             "effectiveness should be > 0.5 for consistently effective actions"
         );
     }
@@ -611,9 +667,10 @@ mod tests {
         {
             let mut cg = CausalGraph::new();
             let mut sr = SkillRegistry::new();
+            let mut eff = EffectivenessTracker::new();
             let mut pipeline = LearningPipeline::new().with_batch_size(1);
             for obs in &observations {
-                pipeline.push(obs.clone(), &mut ot1, &mut cg, &mut sr);
+                pipeline.push(obs.clone(), &mut ot1, &mut cg, &mut sr, &mut eff);
             }
         }
 
@@ -622,9 +679,10 @@ mod tests {
         {
             let mut cg = CausalGraph::new();
             let mut sr = SkillRegistry::new();
+            let mut eff = EffectivenessTracker::new();
             let mut pipeline = LearningPipeline::new().with_batch_size(8);
             for obs in &observations {
-                pipeline.push(obs.clone(), &mut ot8, &mut cg, &mut sr);
+                pipeline.push(obs.clone(), &mut ot8, &mut cg, &mut sr, &mut eff);
             }
         }
 

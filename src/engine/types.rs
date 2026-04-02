@@ -279,13 +279,86 @@ impl RootAction {
         aggressive: bool,
         reason: impl Into<String>,
     ) -> Self {
+        Self::throttle_full(pid, name, aggressive, reason, 0, 0)
+    }
+
+    pub fn throttle_full(
+        pid: u32,
+        name: impl Into<String>,
+        aggressive: bool,
+        reason: impl Into<String>,
+        start_sec: u64,
+        start_usec: u64,
+    ) -> Self {
         RootAction::ThrottleProcess {
             pid,
             name: name.into(),
             aggressive,
             reason: reason.into(),
-            start_sec: 0,
-            start_usec: 0,
+            start_sec,
+            start_usec,
+        }
+    }
+
+    pub fn freeze(
+        pid: u32,
+        name: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::freeze_full(pid, name, reason, 0, 0)
+    }
+
+    pub fn freeze_full(
+        pid: u32,
+        name: impl Into<String>,
+        reason: impl Into<String>,
+        start_sec: u64,
+        start_usec: u64,
+    ) -> Self {
+        RootAction::FreezeProcess {
+            pid,
+            name: name.into(),
+            reason: reason.into(),
+            start_sec,
+            start_usec,
+        }
+    }
+
+    pub fn set_sysctl(
+        key: impl Into<String>,
+        value: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        RootAction::SetSysctl {
+            key: key.into(),
+            value: value.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn set_memorystatus(
+        pid: u32,
+        priority: i32,
+        reason: impl Into<String>,
+    ) -> Self {
+        RootAction::SetMemorystatus {
+            pid,
+            priority,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn toggle_spotlight(enabled: bool, reason: impl Into<String>) -> Self {
+        RootAction::ToggleSpotlight {
+            enabled,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn unfreeze(pid: u32, name: impl Into<String>) -> Self {
+        RootAction::UnfreezeProcess {
+            pid,
+            name: name.into(),
         }
     }
 }

@@ -174,6 +174,12 @@ impl CausalGraph {
         }
     }
 
+    /// Get a specific causal edge if it exists.
+    pub fn get_edge(&self, cause: &str, effect: &str) -> Option<&CausalEdge> {
+        let key = (cause.to_string(), effect.to_string());
+        self.edges.get(&key)
+    }
+
     /// Get the causal effectiveness of an action (confidence in causing pressure_drop).
     /// Returns None if not enough evidence.
     pub fn effectiveness(&self, action_key: &str) -> Option<f32> {
