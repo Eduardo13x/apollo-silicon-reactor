@@ -138,20 +138,21 @@ impl CausalGraph {
     /// Called each cycle — checks actions that are old enough for evaluation.
     pub fn evaluate(&mut self, current_pressure: f32, current_cycle: u64) {
         let delay = self.eval_delay as u64;
-        let mut to_remove = Vec::new();
-
-        for (i, pending) in self.pending.iter().enumerate() {
-            if current_cycle.saturating_sub(pending.cycle) >= delay {
+        let mut i = 0;
+        while i < self.pending.len() {
+            if current_cycle.saturating_sub(self.pending[i].cycle) >= delay {
+                // Move the item out (swap_remove avoids shifting elements).
+                let pending = self.pending.swap_remove(i);
                 let delta = pending.pressure_at_action - current_pressure;
                 let was_effective = delta >= MIN_DELTA;
 
-                // Update causal edge for this action → pressure outcome.
-                let effect = if was_effective {
-                    EFFECT_PRESSURE_DROP
+                let (effect, anti_effect) = if was_effective {
+                    (EFFECT_PRESSURE_DROP, EFFECT_PRESSURE_UNCHANGED)
                 } else {
-                    EFFECT_PRESSURE_UNCHANGED
+                    (EFFECT_PRESSURE_UNCHANGED, EFFECT_PRESSURE_DROP)
                 };
 
+                // Update causal edge for this action → pressure outcome.
                 let key = (pending.action_key.clone(), effect.to_string());
                 self.edges
                     .entry(key)
@@ -159,24 +160,17 @@ impl CausalGraph {
                     .update_with_delta(true, delta.max(0.0));
 
                 // Also record the complementary edge (non-event).
-                let anti_effect = if was_effective {
-                    EFFECT_PRESSURE_UNCHANGED
-                } else {
-                    EFFECT_PRESSURE_DROP
-                };
-                let anti_key = (pending.action_key.clone(), anti_effect.to_string());
+                // Move pending.action_key into anti_key — no second clone.
+                // or_insert_with_key passes &key to the closure when a new edge is needed.
+                let anti_key = (pending.action_key, anti_effect.to_string());
                 self.edges
                     .entry(anti_key)
-                    .or_insert_with(|| CausalEdge::new(&pending.action_key, anti_effect))
+                    .or_insert_with_key(|k| CausalEdge::new(&k.0, anti_effect))
                     .update_with_delta(false, 0.0);
-
-                to_remove.push(i);
+                // Don't increment i: swap_remove placed a new element at position i.
+            } else {
+                i += 1;
             }
-        }
-
-        // Remove evaluated (reverse order to preserve indices).
-        for i in to_remove.into_iter().rev() {
-            self.pending.swap_remove(i);
         }
     }
 
