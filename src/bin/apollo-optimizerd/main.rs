@@ -4553,6 +4553,30 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                // Autonomous rule induction: mine experience memory + co-occurrence
+                // graph for new skills every 100 cycles (~50s).  No human needed —
+                // Apollo crystallizes its own observations into reusable rules.
+                if cycle_count % 100 == 0 {
+                    let existing_names = skill_registry.name_set();
+                    let top_pairs = outcome_tracker.top_causal_pairs(20);
+                    let protected_set = apollo_optimizer::engine::safety::protected_processes();
+                    let protected_slice: Vec<&str> = protected_set.iter().copied().collect();
+                    let new_skills = apollo_optimizer::engine::rule_inducer::induce(
+                        &outcome_tracker.experience,
+                        &top_pairs,
+                        &existing_names,
+                        &protected_slice,
+                    );
+                    let induced_count = new_skills.len();
+                    for skill in new_skills {
+                        skill_registry.register_induced(skill);
+                    }
+                    if induced_count > 0 {
+                        println!("rule_inducer: {} new skills crystallized (total={})",
+                            induced_count, skill_registry.len());
+                        skill_registry.persist(std::path::Path::new(skills_path));
+                    }
+                }
                 // State compression (Hermes pattern): compress old experience records.
                 if cycle_count % 500 == 0 {
                     outcome_tracker.experience.compress_old();

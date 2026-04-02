@@ -102,6 +102,22 @@ impl SkillRegistry {
             .collect()
     }
 
+    /// Register an autonomously induced skill (from rule_inducer).
+    /// Skips if a skill with the same name already exists.
+    /// Returns true if the skill was added.
+    pub fn register_induced(&mut self, skill: OptimizationSkill) -> bool {
+        if self.skills.contains_key(&skill.name) {
+            return false;
+        }
+        self.skills.insert(skill.name.clone(), skill);
+        true
+    }
+
+    /// Snapshot of all skill names (for duplicate checking in rule_inducer).
+    pub fn name_set(&self) -> std::collections::HashSet<String> {
+        self.skills.keys().cloned().collect()
+    }
+
     /// Retire ineffective skills.
     pub fn gc(&mut self) {
         self.skills.retain(|_, s| !s.should_retire());
