@@ -57,6 +57,11 @@ const MIN_EFFECTIVE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 /// Maximum purges per hour (safety cap).
 const MAX_PURGES_PER_HOUR: u32 = 6;
 
+/// At this pressure, bypass the foreground-idle gate entirely.
+/// A 200-500ms purge stall is preferable to swap thrashing at 0.80+
+/// when all culprits are protected (Claude, Brave, WindowServer).
+const PRESSURE_CRITICAL_OVERRIDE: f64 = 0.80;
+
 // ── Purge Executor ──────────────────────────────────────────────────────────
 
 /// Run `purge` to flush the file system disk cache.
@@ -160,8 +165,10 @@ impl PageReclaim {
 
         // Foreground gate: don't purge during active interaction
         // (the 200-500ms stall would be perceptible).
-        // Exception: display off = nobody watching.
-        if !display_off && !foreground_idle {
+        // Exception: display off = nobody watching, OR critical pressure where
+        // the stall is less harmful than continued swap thrashing.
+        let critical_override = memory_pressure >= PRESSURE_CRITICAL_OVERRIDE;
+        if !display_off && !foreground_idle && !critical_override {
             return 0;
         }
 
