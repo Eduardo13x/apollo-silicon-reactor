@@ -81,7 +81,7 @@ use apollo_optimizer::engine::profile_governor::{
 };
 use apollo_optimizer::engine::safety::{
     behavioral_protection_score, critical_background_processes, enforce_limits_with_budget,
-    infrastructure_processes, matches_dev_runtime, protected_processes,
+    infrastructure_processes, is_user_interactive_app, matches_dev_runtime, protected_processes,
 };
 use apollo_optimizer::engine::learned_state::{LearnedState, RestoreQualityMonitor};
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
@@ -3281,13 +3281,35 @@ fn main() -> anyhow::Result<()> {
                     let mut bps_min = f64::MAX;
                     let mut bps_min_name = String::new();
                     for (pid, process) in sys.processes() {
+                        let pid_u32 = pid.as_u32();
                         let name = process.name().to_string();
-                        // Always-protected: system essentials + infrastructure + learned
+                        // Hard-protected: OS/system essentials + infrastructure → always skip.
                         if protected_pats.iter().any(|p| name.contains(p))
                             || infra_pats.iter().any(|p| name.contains(p))
-                            || policy_protected.iter().any(|p| name.contains(p.as_str()))
                         {
-                            cpids.insert(pid.as_u32());
+                            cpids.insert(pid_u32);
+                            continue;
+                        }
+                        // User-interactive apps: protect when foreground, eligible for
+                        // QoS hint / throttle when in background.
+                        // Detect via behavioral signals — no hardcoded names.
+                        {
+                            let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
+                            let has_gui = snap.map_or(false, |s| s.has_gui_window);
+                            let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
+                            let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
+                            if is_user_interactive_app(has_gui, idle_s, rss, &name) {
+                                if Some(pid_u32) == foreground_pid {
+                                    // Foreground user app: fully protected.
+                                    cpids.insert(pid_u32);
+                                }
+                                // Background user app: not inserted → eligible for throttle/QoS.
+                                continue;
+                            }
+                        }
+                        // Policy-protected (learned daemons): always protect.
+                        if policy_protected.iter().any(|p| name.contains(p.as_str())) {
+                            cpids.insert(pid_u32);
                             continue;
                         }
                         // Dev runtimes: behavioral gate — protection earned, not given.
@@ -3603,13 +3625,22 @@ fn main() -> anyhow::Result<()> {
                     for (pid, process) in collector.system().processes() {
                         let pid_u32 = pid.as_u32();
                         let name = process.name();
-                        if Some(pid_u32) == foreground_pid
-                            || heuristic_critical_pids.contains(&pid_u32)
+                        // Foreground or hard-critical: never App Nap.
+                        let is_foreground = Some(pid_u32) == foreground_pid;
+                        let is_hard_protected = heuristic_critical_pids.contains(&pid_u32)
                             || protected_pats.iter().any(|p| name.contains(p))
-                            || policy_protected.iter().any(|p| name.contains(p.as_str()))
-                            || name == "apollo-optimizerd"
-                        {
-                            // Foreground and protected: ensure NOT app-napped.
+                            || name == "apollo-optimizerd";
+                        // User-interactive apps: App Nap only when in background.
+                        let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
+                        let has_gui = snap.map_or(false, |s| s.has_gui_window);
+                        let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
+                        let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
+                        let is_user_app = is_user_interactive_app(has_gui, idle_s, rss, name);
+                        // Policy-protected daemons (non-user-app): always skip.
+                        let is_policy_daemon = !is_user_app
+                            && policy_protected.iter().any(|p| name.contains(p.as_str()));
+                        if is_foreground || is_hard_protected || is_policy_daemon {
+                            // Protected: ensure NOT app-napped.
                             if qos.is_app_napped(pid_u32) {
                                 qos.set_app_nap(pid_u32, false);
                             }

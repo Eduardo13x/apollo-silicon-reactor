@@ -44,6 +44,34 @@ pub fn protected_processes() -> HashSet<&'static str> {
     .collect()
 }
 
+/// Returns true if a process should be treated as a user-interactive app
+/// — i.e. protection is foreground-conditional rather than unconditional.
+///
+/// Decision is purely behavioral (no hardcoded names):
+/// - Has a GUI window: user can see and interact with it
+/// - NOT a known system daemon (already in protected_processes)
+/// - Has recent user interaction OR significant RSS (it's actively used)
+///
+/// Background instances of such apps are eligible for QoS hints and
+/// CPU throttle but are NEVER frozen.
+pub fn is_user_interactive_app(
+    has_gui_window: bool,
+    secs_since_user_interaction: u64,
+    rss_bytes: u64,
+    name: &str,
+) -> bool {
+    // System daemons never qualify regardless of heuristics.
+    if protected_processes().contains(name) {
+        return false;
+    }
+    // Must have a GUI window — headless daemons are not user apps.
+    if !has_gui_window {
+        return false;
+    }
+    // Recent interaction OR large resident footprint (user launched and uses it).
+    secs_since_user_interaction < 300 || rss_bytes > 100 * 1024 * 1024
+}
+
 pub fn allowlisted_sysctls_with_ranges() -> Vec<SysctlRange> {
     vec![
         SysctlRange {
