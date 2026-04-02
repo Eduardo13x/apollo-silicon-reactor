@@ -1280,7 +1280,7 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     // Watchdog: check background collector health every 60 cycles (starting cycle 1).
-                    if cycle_count % 60 == 1 {
+                    if cycle_count % 60 == 0 {
                         let pressure_alive = pressure_collector.is_alive(120);
                         let smc_alive = smc_reader.is_alive(120);
                         {
@@ -1729,7 +1729,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Battery status: detect real battery state every 10 cycles (~30s)
                 // to avoid spawning pmset too frequently.
-                if cycle_count % 10 == 1 {
+                if cycle_count % 10 == 0 {
                     if let Some(batt) = detect_battery_status() {
                         power_mgr.update_battery_status(batt);
                     }
@@ -3169,14 +3169,12 @@ fn main() -> anyhow::Result<()> {
                                     .find(|s| s.throttle_targets.contains(&name))
                                     .map(|s| s.name.as_str())
                                     .unwrap_or("skill");
-                                actions.push(RootAction::ThrottleProcess {
-                                    pid: pid.as_u32(),
+                                actions.push(RootAction::throttle(
+                                    pid.as_u32(),
                                     name,
-                                    aggressive: false,
-                                    reason: format!("skill:{}", skill_name),
-                                    start_sec: 0,
-                                    start_usec: 0,
-                                });
+                                    false,
+                                    format!("skill:{}", skill_name),
+                                ));
                             }
                         }
                     }
@@ -3243,14 +3241,12 @@ fn main() -> anyhow::Result<()> {
                                         // captures the combined effect of all throttles in this cycle,
                                         // including targets already covered by throttle:X skills.
                                         if !already_actioned.contains(target) {
-                                            actions.push(RootAction::ThrottleProcess {
-                                                pid: pid.as_u32(),
-                                                name: target.clone(),
-                                                aggressive: false,
-                                                reason: format!("trial:{}", skill_name),
-                                                start_sec: 0,
-                                                start_usec: 0,
-                                            });
+                                            actions.push(RootAction::throttle(
+                                                pid.as_u32(),
+                                                target.clone(),
+                                                false,
+                                                format!("trial:{}", skill_name),
+                                            ));
                                         }
                                         trialed = true;
                                     }
@@ -3310,17 +3306,15 @@ fn main() -> anyhow::Result<()> {
                             if proc_name.contains(missing)
                                 && !actioned.iter().any(|n| n.contains(missing))
                             {
-                                actions.push(RootAction::ThrottleProcess {
-                                    pid: pid.as_u32(),
-                                    name: proc_name,
-                                    aggressive: false,
-                                    reason: format!(
+                                actions.push(RootAction::throttle(
+                                    pid.as_u32(),
+                                    proc_name,
+                                    false,
+                                    format!(
                                         "coordinated-cluster: co-occurs with {} (n={})",
                                         partner, count
                                     ),
-                                    start_sec: 0,
-                                    start_usec: 0,
-                                });
+                                ));
                                 break;
                             }
                         }
@@ -3373,14 +3367,12 @@ fn main() -> anyhow::Result<()> {
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         });
                         for proc in noise_procs.iter().take(3) {
-                            actions.push(RootAction::ThrottleProcess {
-                                pid: proc.pid as u32,
-                                name: proc.name.clone(),
-                                aggressive: false,
-                                reason: "predictive-agent: pre-throttle noise".to_string(),
-                                start_sec: 0,
-                                start_usec: 0,
-                            });
+                            actions.push(RootAction::throttle(
+                                proc.pid as u32,
+                                proc.name.clone(),
+                                false,
+                                "predictive-agent: pre-throttle noise",
+                            ));
                         }
                     }
                     Intervention::ProactivePurge => {
@@ -3434,12 +3426,16 @@ fn main() -> anyhow::Result<()> {
                     // Use proc_snaps (full process list) not top_processes (top 10 by CPU).
                     // Only skip core interactive apps — paging hints are gentle (voluntary
                     // cache release), so we use a tighter filter than freeze/throttle.
-                    let hard_protected = apollo_optimizer::engine::safety::protected_processes();
+                    let hard_protected = protected_processes();
+                    let infra_protected = infrastructure_processes();
                     let mut bg_procs: Vec<_> = proc_snaps
                         .iter()
                         .filter(|p| {
-                            // Skip system-critical processes and self.
-                            !hard_protected.iter().any(|hp| p.name.contains(hp))
+                            // Skip system-critical, infra, and policy-protected processes.
+                            let is_interactive =
+                                is_user_interactive_app(p.has_gui_window, p.secs_since_user_interaction, p.rss_bytes, &p.name);
+                            classify_protection(&p.name, &hard_protected, &infra_protected, &protected_pats, is_interactive)
+                                == ProtectionLevel::Unprotected
                                 && p.rss_bytes > 80 * 1024 * 1024 // >80 MB RSS
                                 && p.pid != std::process::id()
                                 && !p.has_gui_window
@@ -3845,8 +3841,9 @@ fn main() -> anyhow::Result<()> {
                 // During LLM inference: App-Nap all non-foreground non-essential.
                 // During wake suppression: same, to give foreground first crack.
                 if llm_active || in_wake_suppression {
-                    let protected_pats = protected_processes();
-                    let policy_protected = state
+                    let appnap_hard = protected_processes();
+                    let appnap_infra = infrastructure_processes();
+                    let appnap_policy = state
                         .learned_policy
                         .lock_recover()
                         .protected_patterns
@@ -3855,21 +3852,23 @@ fn main() -> anyhow::Result<()> {
                     for (pid, process) in collector.system().processes() {
                         let pid_u32 = pid.as_u32();
                         let name = process.name();
-                        // Foreground or hard-critical: never App Nap.
                         let is_foreground = Some(pid_u32) == foreground_pid;
-                        let is_hard_protected = heuristic_critical_pids.contains(&pid_u32)
-                            || protected_pats.iter().any(|p| name.contains(p))
-                            || name == "apollo-optimizerd";
-                        // User-interactive apps: App Nap only when in background.
+                        // Evaluate behavioral signals for Tier-4 interactive detection.
                         let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
                         let has_gui = snap.map_or(false, |s| s.has_gui_window);
                         let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
                         let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
-                        let is_user_app = is_user_interactive_app(has_gui, idle_s, rss, name);
-                        // Policy-protected daemons (non-user-app): always skip.
-                        let is_policy_daemon = !is_user_app
-                            && policy_protected.iter().any(|p| name.contains(p.as_str()));
-                        if is_foreground || is_hard_protected || is_policy_daemon {
+                        let is_interactive = is_user_interactive_app(has_gui, idle_s, rss, name);
+                        let protection = classify_protection(
+                            name, &appnap_hard, &appnap_infra, &appnap_policy, is_interactive,
+                        );
+                        // Apollo itself is never app-napped (self-protection).
+                        // Unconditional: OS/infra/policy — always skip.
+                        // ConditionalForeground: user-interactive apps — skip only when foreground.
+                        let should_protect = name == "apollo-optimizerd"
+                            || protection == ProtectionLevel::Unconditional
+                            || (protection == ProtectionLevel::ConditionalForeground && is_foreground);
+                        if should_protect {
                             // Protected: ensure NOT app-napped.
                             if qos.is_app_napped(pid_u32) {
                                 qos.set_app_nap(pid_u32, false);
@@ -4050,7 +4049,7 @@ fn main() -> anyhow::Result<()> {
                 // NetworkOptimizer: profile-driven TCP tuning complements sysctl_governor.
                 // Select network profile based on optimization profile + battery state.
                 // Emits SetSysctl actions for TCP buffers, delayed_ack, window scale.
-                if is_root && cycle_count % 30 == 1 {
+                if is_root && cycle_count % 30 == 0 {
                     let net_profile = if power_mgr.is_on_battery() {
                         NetworkProfile::Battery
                     } else {
@@ -5017,7 +5016,7 @@ fn main() -> anyhow::Result<()> {
                     skill_registry.persist(std::path::Path::new(skills_path));
                 }
                 // Hourly housekeeping (7200 cycles × 500ms ≈ 1 hour).
-                if cycle_count % 7200 == 1 {
+                if cycle_count % 7200 == 0 {
                     // GC stale entries from cache warmer + I/O shaper.
                     cache_warmer.gc();
                     io_shaper.gc();

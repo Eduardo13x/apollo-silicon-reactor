@@ -25,7 +25,7 @@
 //! |             | ls_path, hop_groups_path, skills_path                  |
 //! | % 100 == 0  | rule_inducer (outcome_tracker, top_pairs, skill_registry) |
 //! | % 500 == 0  | outcome_tracker, skill_registry (GC + compress)        |
-//! | % 7200 == 1 | cache_warmer, io_shaper, temporal_predictor            |
+//! | % 7200 == 0 | cache_warmer, io_shaper, temporal_predictor            |
 //!
 //! ### Pre-condition for full extraction
 //!
@@ -107,7 +107,7 @@ pub struct PeriodicResult {
     /// Whether GC/compression ran this cycle (% 500 gate).
     pub did_gc: bool,
 
-    /// Whether hourly housekeeping ran this cycle (% 7200 gate).
+    /// Whether hourly housekeeping ran this cycle (% 7200 == 0 gate).
     pub did_hourly: bool,
 }
 
@@ -132,7 +132,7 @@ pub fn run_periodic(ctx: &PeriodicContext) -> PeriodicResult {
         result.did_gc = true;
     }
 
-    if ctx.cycle_count % 7200 == 1 {
+    if ctx.cycle_count % 7200 == 0 {
         result.did_hourly = true;
     }
 
@@ -176,20 +176,22 @@ mod tests {
     }
 
     #[test]
-    fn hourly_fires_at_cycle_7201() {
-        let result = run_periodic(&make_ctx(7201));
-        assert!(result.did_hourly, "% 7200 == 1 gate should fire at cycle 7201");
+    fn hourly_fires_at_cycle_7200() {
+        let result = run_periodic(&make_ctx(7200));
+        assert!(result.did_hourly, "% 7200 == 0 gate should fire at cycle 7200");
+        // 7200 % 100 == 0, so persist also fires.
+        assert!(result.did_persist, "% 100 gate must co-fire at cycle 7200");
     }
 
     #[test]
     fn gates_at_cycle_1() {
-        // cycle 1: 1 % 100 != 0, 1 % 500 != 0, BUT 1 % 7200 == 1 (hourly fires on first cycle).
-        // This matches the main loop's % 7200 == 1 gate which intentionally fires at startup
-        // to run initial housekeeping (GC cache warmer, IO shaper, temporal predictor).
+        // cycle 1: 1 % 100 != 0, 1 % 500 != 0, 1 % 7200 != 0.
+        // No periodic tasks run on the very first cycle — housekeeping waits for
+        // the first full interval to elapse before executing.
         let result = run_periodic(&make_ctx(1));
         assert!(!result.did_persist, "% 100 gate must not fire at cycle 1");
         assert!(!result.did_gc, "% 500 gate must not fire at cycle 1");
-        assert!(result.did_hourly, "% 7200 == 1 gate DOES fire at cycle 1 (startup housekeeping)");
+        assert!(!result.did_hourly, "% 7200 == 0 gate must not fire at cycle 1");
     }
 
     #[test]
