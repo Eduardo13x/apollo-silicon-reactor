@@ -12,6 +12,7 @@ pub mod daemon_helpers;
 pub mod daemon_state;
 pub mod evolved_anomaly;
 pub mod decide_actions;
+pub mod effective_pressure;
 pub mod display_turbo;
 pub mod energy;
 pub mod energy_pid;
