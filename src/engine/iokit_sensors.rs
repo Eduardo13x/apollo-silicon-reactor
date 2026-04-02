@@ -58,6 +58,12 @@ pub struct PowerReading {
     pub gpu_watts: Option<f32>,
     /// DRAM subsystem.
     pub dram_watts: Option<f32>,
+    /// ANE (Neural Engine) power in watts.
+    pub ane_watts: Option<f32>,
+    /// ANE utilization 0.0–100.0 %.
+    pub ane_util_pct: Option<f32>,
+    /// ANE throughput in TFLOPS.
+    pub ane_tflops: Option<f32>,
 }
 
 /// Combined hardware snapshot.
@@ -127,6 +133,9 @@ impl IOKitSensorReader {
                 cpu_watts: None,
                 gpu_watts: None,
                 dram_watts: None,
+                ane_watts: None,
+                ane_util_pct: None,
+                ane_tflops: None,
             },
             p_cluster_util: None,
             e_cluster_util: None,
@@ -144,6 +153,9 @@ impl IOKitSensorReader {
         let mut pkg_watts: Option<f32> = None;
         let mut cpu_watts: Option<f32> = None;
         let mut gpu_watts: Option<f32> = None;
+        let mut ane_watts: Option<f32> = None;
+        let mut ane_util_pct: Option<f32> = None;
+        let mut ane_tflops: Option<f32> = None;
         let mut p_util: Option<f32> = None;
         let mut e_util: Option<f32> = None;
         let mut batt_pct: Option<u32> = None;
@@ -178,6 +190,12 @@ impl IOKitSensorReader {
                 cpu_watts = parse_power_watts(line);
             } else if line.starts_with("GPU Power:") || line.starts_with("GPU power:") {
                 gpu_watts = parse_power_watts(line);
+            } else if line.starts_with("ANE Power:") || line.starts_with("ANE power:") {
+                ane_watts = parse_power_watts(line);
+            } else if line.starts_with("ANE utilization:") {
+                ane_util_pct = parse_percent(line);
+            } else if line.starts_with("ANE TFLOPS:") {
+                ane_tflops = parse_float_after_colon(line);
             }
             // Utilisation: "P-Cluster HW active residency: 38.3%" (case varies by OS version)
             else if line.to_ascii_lowercase().contains("p-cluster")
@@ -261,6 +279,9 @@ impl IOKitSensorReader {
                 cpu_watts,
                 gpu_watts,
                 dram_watts: None,
+                ane_watts,
+                ane_util_pct,
+                ane_tflops,
             },
             p_cluster_util: p_util,
             e_cluster_util: e_util,

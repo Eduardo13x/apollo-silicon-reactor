@@ -1674,6 +1674,9 @@ fn main() -> anyhow::Result<()> {
                                 cpu_watts: None,
                                 gpu_watts: None,
                                 dram_watts: None,
+                                ane_watts: None,
+                                ane_util_pct: None,
+                                ane_tflops: None,
                             },
                             p_cluster_util: None,
                             e_cluster_util: None,
@@ -2297,6 +2300,14 @@ fn main() -> anyhow::Result<()> {
                         .and_then(|h| h.power.gpu_watts)
                         .map(|w| w as f64)
                         .or(last_smc.as_ref().and_then(|s| s.gpu_watts));
+                    metrics.energy_ane_watts = cycle_hw_snap
+                        .as_ref()
+                        .and_then(|h| h.power.ane_watts)
+                        .map(|w| w as f64);
+                    metrics.energy_ane_util_pct = cycle_hw_snap
+                        .as_ref()
+                        .and_then(|h| h.power.ane_util_pct)
+                        .map(|v| v as f64);
                     metrics.energy_package_watts = cycle_hw_snap
                         .as_ref()
                         .and_then(|h| h.power.package_watts)

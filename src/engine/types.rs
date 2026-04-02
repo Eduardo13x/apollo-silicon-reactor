@@ -431,6 +431,10 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub energy_gpu_watts: Option<f64>,
     #[serde(default)]
+    pub energy_ane_watts: Option<f64>,
+    #[serde(default)]
+    pub energy_ane_util_pct: Option<f64>,
+    #[serde(default)]
     pub energy_package_watts: Option<f64>,
     #[serde(default)]
     pub energy_session_wh: Option<f64>,

@@ -24,7 +24,7 @@ use crate::engine::lock_ext::LockRecover;
 fn probe_powermetrics() -> Option<PowerReading> {
     use std::process::Command;
     let output = Command::new("/usr/bin/powermetrics")
-        .args(["--samplers", "cpu_power", "-i", "500", "-n", "1"])
+        .args(["--samplers", "cpu_power,gpu_power,ane_power", "-i", "500", "-n", "1"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -34,6 +34,9 @@ fn probe_powermetrics() -> Option<PowerReading> {
     let mut cpu_mw: Option<f32> = None;
     let mut gpu_mw: Option<f32> = None;
     let mut combined_mw: Option<f32> = None;
+    let mut ane_mw: Option<f32> = None;
+    let mut ane_util: Option<f32> = None;
+    let mut ane_tflops: Option<f32> = None;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with("CPU Power:") {
@@ -42,6 +45,14 @@ fn probe_powermetrics() -> Option<PowerReading> {
             gpu_mw = parse_mw(line);
         } else if line.starts_with("Combined Power") {
             combined_mw = parse_mw(line);
+        } else if line.starts_with("ANE Power:") {
+            ane_mw = parse_mw(line);
+        } else if line.starts_with("ANE utilization:") {
+            ane_util = parse_percent_line(line);
+        } else if line.starts_with("ANE TFLOPS:") {
+            ane_tflops = line.split(':').nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse().ok());
         }
     }
     // Convert mW → W
@@ -50,6 +61,9 @@ fn probe_powermetrics() -> Option<PowerReading> {
         gpu_watts: gpu_mw.map(|v| v / 1000.0),
         package_watts: combined_mw.map(|v| v / 1000.0),
         dram_watts: None,
+        ane_watts: ane_mw.map(|v| v / 1000.0),
+        ane_util_pct: ane_util,
+        ane_tflops,
     })
 }
 
@@ -65,6 +79,13 @@ fn parse_mw(line: &str) -> Option<f32> {
     } else {
         Some(val * 1000.0) // Watts → mW
     }
+}
+
+/// Parse "ANE utilization: 12.5%" → Some(12.5)
+fn parse_percent_line(line: &str) -> Option<f32> {
+    let after_colon = line.split(':').nth(1)?.trim();
+    let num_str = after_colon.trim_end_matches('%').split_whitespace().next()?;
+    num_str.parse().ok()
 }
 
 /// Cached sensor reader with background polling thread.
@@ -123,30 +144,32 @@ impl SmcReader {
                                 needs_powermetrics = true;
                             }
 
-                            // Enrich with powermetrics data if direct sensors are blind.
-                            if needs_powermetrics {
-                                pm_cycle += 1;
-                                // Run powermetrics every 3rd cycle to limit subprocess overhead.
-                                if pm_cycle % 3 == 1 {
-                                    if let Some(pm) = probe_powermetrics() {
-                                        cached_pm = Some(pm);
-                                    } else {
-                                        eprintln!("[smc-reader] powermetrics probe failed");
-                                    }
+                            // Always poll powermetrics every 3rd cycle for ANE data
+                            // (IOKit never exposes ANE utilization/power — powermetrics only).
+                            // Also serves as CPU/GPU fallback when IOKit is blind.
+                            pm_cycle += 1;
+                            if pm_cycle % 3 == 1 {
+                                if let Some(pm) = probe_powermetrics() {
+                                    cached_pm = Some(pm);
+                                } else if needs_powermetrics {
+                                    eprintln!("[smc-reader] powermetrics probe failed");
                                 }
-                                // Apply cached reading every cycle so power fields
-                                // aren't overwritten with None on non-probe cycles.
-                                if let Some(ref pm) = cached_pm {
-                                    if hw.power.cpu_watts.is_none() {
-                                        hw.power.cpu_watts = pm.cpu_watts;
-                                    }
-                                    if hw.power.gpu_watts.is_none() {
-                                        hw.power.gpu_watts = pm.gpu_watts;
-                                    }
-                                    if hw.power.package_watts.is_none() {
-                                        hw.power.package_watts = pm.package_watts;
-                                    }
+                            }
+                            if let Some(ref pm) = cached_pm {
+                                // CPU/GPU: only fill when IOKit is blind.
+                                if hw.power.cpu_watts.is_none() {
+                                    hw.power.cpu_watts = pm.cpu_watts;
                                 }
+                                if hw.power.gpu_watts.is_none() {
+                                    hw.power.gpu_watts = pm.gpu_watts;
+                                }
+                                if hw.power.package_watts.is_none() {
+                                    hw.power.package_watts = pm.package_watts;
+                                }
+                                // ANE: always enrich (IOKit never provides these).
+                                hw.power.ane_watts = pm.ane_watts;
+                                hw.power.ane_util_pct = pm.ane_util_pct;
+                                hw.power.ane_tflops = pm.ane_tflops;
                             }
 
                             *c.lock_recover() = Some(hw);
