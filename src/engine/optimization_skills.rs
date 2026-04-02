@@ -209,6 +209,46 @@ impl SkillRegistry {
         self.skills.keys().cloned().collect()
     }
 
+    /// Cross-feed: boost a skill's success_count when external Bayesian evidence
+    /// (e.g., OutcomeTracker or CausalGraph) is stronger than trial data.
+    ///
+    /// Only applies if:
+    ///   - The skill exists.
+    ///   - `evidence_rate` exceeds the current `success_rate` by at least `min_gap`.
+    ///   - The skill has ≥ `min_apply_count` applications (enough to be meaningful).
+    ///
+    /// Returns `true` if a boost was applied.
+    pub fn cross_feed_boost(
+        &mut self,
+        name: &str,
+        evidence_rate: f64,
+        min_gap: f64,
+        min_apply_count: u32,
+    ) -> bool {
+        if let Some(skill) = self.skills.get_mut(name) {
+            if skill.apply_count >= min_apply_count
+                && (evidence_rate - skill.success_rate as f64) >= min_gap
+            {
+                skill.success_count = skill.success_count.saturating_add(1);
+                skill.apply_count = skill.apply_count.saturating_add(1);
+                skill.success_rate =
+                    skill.success_count as f32 / skill.apply_count.max(1) as f32;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Query the success_rate for a skill by name. Returns `None` if not found.
+    pub fn success_rate(&self, name: &str) -> Option<f32> {
+        self.skills.get(name).map(|s| s.success_rate)
+    }
+
+    /// Query apply_count for a skill by name. Returns `None` if not found.
+    pub fn apply_count(&self, name: &str) -> Option<u32> {
+        self.skills.get(name).map(|s| s.apply_count)
+    }
+
     /// Retire ineffective skills.
     pub fn gc(&mut self) {
         self.skills.retain(|_, s| !s.should_retire());
