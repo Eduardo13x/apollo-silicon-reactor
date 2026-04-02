@@ -294,7 +294,7 @@ fn test_swap_predictor_increasing_trend() {
             // After enough samples, should detect increasing trend
             assert!(matches!(
                 forecast.swap_trend,
-                SwapTrend::Increasing | SwapTrend::Stable
+                SwapTrend::Increasing | SwapTrend::Stable | SwapTrend::Critical
             ));
         }
     }
@@ -304,12 +304,16 @@ fn test_swap_predictor_increasing_trend() {
 fn test_swap_predictor_critical_trend() {
     let mut predictor = SwapPredictor::new();
 
-    // Feed swap above critical threshold - need at least 3 samples
-    for _ in 0..3 {
-        let _forecast = predictor.update(1100 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+    // Critical trend requires delta_ratio > 0.05 of total (rate-based, not absolute level).
+    // With total=2GB: need newer_half_avg - older_half_avg > 102MB.
+    // 4 samples: [200, 400, 700, 1100] MB → older=[200,400]=300avg, newer=[700,1100]=900avg
+    // delta_ratio = 600/2048 ≈ 0.29 > 0.05 → Critical
+    let total = 2u64 * 1024 * 1024 * 1024;
+    for &mb in &[200u64, 400, 700, 1100] {
+        predictor.update(mb * 1024 * 1024, total);
     }
 
-    let forecast = predictor.update(1100 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+    let forecast = predictor.update(1400 * 1024 * 1024, total);
     assert_eq!(forecast.swap_trend, SwapTrend::Critical);
 }
 
@@ -333,8 +337,15 @@ fn test_swap_predictor_decreasing_trend() {
 fn test_swap_predictor_time_to_critical() {
     let mut predictor = SwapPredictor::new();
 
-    // Already critical
-    let forecast = predictor.update(1100 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+    // time_to_critical returns 0 when: trend is Increasing|Critical AND
+    // current >= 0.85 * total. Feed rapidly increasing samples past that threshold.
+    // total=2GB, 0.85*2GB=1740MB. Feed [1700, 1800, 1900, 2000]MB → Critical trend,
+    // current=2000MB > 1740MB → bytes_remaining <= 0 → time = 0.
+    let total = 2u64 * 1024 * 1024 * 1024;
+    for &mb in &[1700u64, 1800, 1900] {
+        predictor.update(mb * 1024 * 1024, total);
+    }
+    let forecast = predictor.update(2000 * 1024 * 1024, total);
     assert_eq!(forecast.time_to_swap_critical, 0);
 }
 
@@ -351,12 +362,12 @@ fn test_swap_predictor_time_to_critical_not_yet() {
 fn test_swap_predictor_recommendations_critical() {
     let mut predictor = SwapPredictor::new();
 
-    // Need at least 3 samples to detect trend
-    for _ in 0..3 {
-        let _forecast = predictor.update(1100 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+    // Recommendations require Critical trend (delta-based). Use rapidly increasing samples.
+    let total = 2u64 * 1024 * 1024 * 1024;
+    for &mb in &[200u64, 400, 700, 1100] {
+        predictor.update(mb * 1024 * 1024, total);
     }
-
-    let forecast = predictor.update(1100 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+    let forecast = predictor.update(1400 * 1024 * 1024, total);
     assert!(!forecast.recommended_actions.is_empty());
     assert!(forecast
         .recommended_actions

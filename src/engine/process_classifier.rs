@@ -243,14 +243,23 @@ pub fn score_utility(snap: &ProcessSnapshot) -> f32 {
         score += 0.05;
     }
 
-    // Penalty: high wakeups with no GUI = chatty daemon
+    // Penalty: high wakeups with no GUI = chatty daemon (forces CPU out of deep idle)
     if snap.wakeups_per_sec > 50.0 && !snap.has_gui_window {
-        score -= 0.15;
+        score -= 0.20;
     }
 
     // Penalty: translated binary (Rosetta) = legacy, lower priority
     if snap.is_translated {
         score -= 0.05;
+    }
+
+    // Penalty: stale background process — no GUI, long idle, low activity
+    if !snap.has_gui_window
+        && snap.secs_since_user_interaction > 3600
+        && snap.wakeups_per_sec < 2.0
+        && snap.cpu_percent < 2.0
+    {
+        score -= 0.40;
     }
 
     score.clamp(0.0, 1.0)

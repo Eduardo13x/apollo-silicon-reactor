@@ -638,4 +638,63 @@ mod tests {
             score,
         );
     }
+
+    // ── is_user_interactive_app() tests ──────────────────────────────────────
+
+    const MB: u64 = 1024 * 1024;
+
+    #[test]
+    fn interactive_app_recent_interaction() {
+        // GUI + interaction 60s ago → true regardless of RSS
+        assert!(is_user_interactive_app(true, 60, 10 * MB, "MyApp"));
+    }
+
+    #[test]
+    fn interactive_app_large_rss_idle() {
+        // GUI + RSS > 100MB + idle 1h → still true (user launched, large footprint)
+        assert!(is_user_interactive_app(true, 3600, 200 * MB, "BigApp"));
+    }
+
+    #[test]
+    fn interactive_app_small_rss_long_idle_is_false() {
+        // GUI + RSS ≤ 100MB + idle > 300s → false (looks abandoned)
+        assert!(!is_user_interactive_app(true, 400, 50 * MB, "TinyApp"));
+    }
+
+    #[test]
+    fn headless_daemon_never_interactive() {
+        // No GUI → always false regardless of RSS or interaction
+        assert!(!is_user_interactive_app(false, 0, 500 * MB, "coreaudiod"));
+    }
+
+    #[test]
+    fn protected_process_never_interactive() {
+        // kernel_task is in protected_processes() → false even with GUI
+        assert!(!is_user_interactive_app(true, 0, 500 * MB, "kernel_task"));
+        assert!(!is_user_interactive_app(true, 0, 500 * MB, "WindowServer"));
+        assert!(!is_user_interactive_app(true, 0, 500 * MB, "launchd"));
+    }
+
+    #[test]
+    fn interactive_app_at_interaction_boundary() {
+        // secs == 299 (< 300) → true
+        assert!(is_user_interactive_app(true, 299, 10 * MB, "BrowserApp"));
+        // secs == 300 (= 300, not < 300) → false if RSS also small
+        assert!(!is_user_interactive_app(true, 300, 10 * MB, "BrowserApp"));
+    }
+
+    #[test]
+    fn interactive_app_at_rss_boundary() {
+        // RSS == 100MB + 1 byte (> 100MB) → true even if idle
+        assert!(is_user_interactive_app(true, 9999, 100 * MB + 1, "HeavyApp"));
+        // RSS == exactly 100MB (not >) → false if also idle
+        assert!(!is_user_interactive_app(true, 9999, 100 * MB, "HeavyApp"));
+    }
+
+    #[test]
+    fn unknown_app_name_follows_behavior() {
+        // Arbitrary unknown name — decision is purely behavioral
+        assert!(is_user_interactive_app(true, 10, 5 * MB, "com.example.MyRandomApp"));
+        assert!(!is_user_interactive_app(false, 10, 5 * MB, "com.example.MyRandomApp"));
+    }
 }

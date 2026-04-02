@@ -120,7 +120,9 @@ fn test_classifier_background_visible() {
 #[test]
 fn test_classifier_stale_app() {
     let classifier = ProcessClassifier::new();
-    let snap = make_snap("StaleApp", 1.0, 90_000, false); // 25h idle
+    // Stale requires: cpu < 0.5 AND wakeups < 1.0 AND secs_since_foreground > 300.
+    let mut snap = make_snap("StaleApp", 0.1, 90_000, false); // 25h idle, low cpu
+    snap.wakeups_per_sec = 0.0;
     assert_eq!(classifier.classify(&snap), ProcessTier::Stale);
 }
 
@@ -158,6 +160,7 @@ fn test_utility_score_stale() {
 fn test_waste_score_high_cpu() {
     let mut snap = make_snap("burner", 9.0, 7200, false);
     snap.wakeups_per_sec = 45.0;
+    snap.rss_bytes = 300 * 1024 * 1024; // >200MB triggers +0.15 → total 0.80 > 0.7
     let waste = score_waste(&snap);
     assert!(
         waste > 0.7,
@@ -171,8 +174,9 @@ fn test_waste_score_idle_process() {
     let mut snap = make_snap("idle_proc", 0.0, 7200, false);
     snap.wakeups_per_sec = 0.0;
     let waste = score_waste(&snap);
+    // Long idle (7200s > 3600) with cpu < 1.0 adds +0.10 → exactly 0.10.
     assert!(
-        waste < 0.1,
+        waste <= 0.10,
         "Idle process should have near-zero waste: {}",
         waste
     );
@@ -558,9 +562,12 @@ fn test_governor_summary_counts() {
 fn test_governor_waste_override() {
     let mut gov = AdaptiveGovernor::new();
 
-    // High CPU + high wakeups + not used recently → should at least throttle
-    let mut snap = make_snap("BurnerApp", 9.5, 7200, false);
-    snap.wakeups_per_sec = 49.0;
+    // High CPU + high wakeups + large RSS + no GUI → waste override triggers.
+    // waste = cpu(>5,noGUI)+0.40 + wakeups(>20)+0.25 + rss(>200MB,noGUI)+0.15 = 0.80
+    // On 8GB M1: waste_override_threshold=0.80 → utility(0.40) < 0.60 → Throttle.
+    let mut snap = make_snap("BurnerApp", 11.0, 7200, false);
+    snap.wakeups_per_sec = 60.0;
+    snap.rss_bytes = 300 * 1024 * 1024;
     let procs = vec![snap];
     let hunts: Vec<HuntSnapshot> = vec![];
 

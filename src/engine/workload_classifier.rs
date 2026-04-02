@@ -321,8 +321,10 @@ impl WorkloadClassifier {
             .unwrap_or(WorkloadType::General);
 
         // D1: Margin — separation between winner and runner-up.
-        let margin = if best_score > 0.0 {
-            (best_score - runner_up.max(0.0)) / best_score
+        // Only meaningful when there is actual competition (runner_up > 0).
+        // A single weak signal with no alternatives is NOT high-margin evidence.
+        let margin = if best_score > 0.0 && runner_up > 0.0 {
+            (best_score - runner_up) / best_score
         } else {
             0.0
         };

@@ -75,11 +75,19 @@ const BATCH_PREFIX: &str = "batch:";
 ///
 /// Returns skills not already present in `existing_names`.
 /// The caller is responsible for adding them to the registry and persisting.
+/// Induce new skills from observed experience.
+///
+/// `workload` is the current workload mode string (e.g., "build", "browsing").
+/// - **Group skills** (co-occurrence) use `"any"` — they represent structural
+///   pairs that co-spike across all workloads.
+/// - **Batch skills** (coincident events) use the provided `workload` — they
+///   represent session-specific bursts likely tied to the active context.
 pub fn induce(
     experience: &ExperienceMemory,
     top_pairs: &[(&str, &str, u32)],
     existing_names: &HashSet<String>,
     protected: &[&str],
+    workload: &str,
 ) -> Vec<OptimizationSkill> {
     let mut result = Vec::new();
 
@@ -108,6 +116,11 @@ pub fn induce(
             continue;
         }
         if is_protected(a, protected) || is_protected(b, protected) {
+            continue;
+        }
+        // Skip self-pairs (same process co-occurring with itself — e.g., multiple
+        // instances). A single-target "group" skill offers no synergy over throttle:X.
+        if a == b {
             continue;
         }
 
@@ -219,7 +232,9 @@ pub fn induce(
         result.push(OptimizationSkill {
             name: skill_name,
             min_pressure: trigger,
-            workload_hint: "any".to_string(),
+            // Batch skills tag the active workload — they come from coincident
+            // events in the current session, so they're context-specific.
+            workload_hint: workload.to_string(),
             throttle_targets: vec![a.to_string(), b.to_string()],
             success_rate: 0.0,
             apply_count: 0,
@@ -267,7 +282,7 @@ mod tests {
             }
         }
         let pairs = vec![("mediaanalysisd", "photoanalysisd", 25u32)];
-        let skills = induce(&mem, &pairs, &HashSet::new(), &[]);
+        let skills = induce(&mem, &pairs, &HashSet::new(), &[], "any");
         let group = skills.iter().find(|s| s.name.starts_with("group:"));
         assert!(group.is_some(), "should induce group skill");
         let g = group.unwrap();
@@ -280,7 +295,7 @@ mod tests {
         // Very high co-occurrence bypasses a_ok/b_ok individual evidence requirement.
         let mem = ExperienceMemory::new(300);
         let pairs = vec![("coreaudiod", "corespeechd", HIGH_COOCCUR_BYPASS + 10)];
-        let skills = induce(&mem, &pairs, &HashSet::new(), &[]);
+        let skills = induce(&mem, &pairs, &HashSet::new(), &[], "any");
         let group = skills.iter().find(|s| s.name.starts_with("group:"));
         assert!(group.is_some(), "high co-occurrence should bypass individual evidence check");
     }
@@ -289,7 +304,7 @@ mod tests {
     fn skips_protected_in_group() {
         let mem = ExperienceMemory::new(300);
         let pairs = vec![("mds_stores", "photoanalysisd", HIGH_COOCCUR_BYPASS + 10)];
-        let skills = induce(&mem, &pairs, &HashSet::new(), &["mds_stores"]);
+        let skills = induce(&mem, &pairs, &HashSet::new(), &["mds_stores"], "any");
         assert!(skills.is_empty(), "protected process must not appear in group skill");
     }
 
@@ -299,7 +314,7 @@ mod tests {
         let pairs = vec![("coreaudiod", "corespeechd", HIGH_COOCCUR_BYPASS + 10)];
         let mut existing = HashSet::new();
         existing.insert("group:coreaudiod+corespeechd".to_string());
-        let skills = induce(&mem, &pairs, &existing, &[]);
+        let skills = induce(&mem, &pairs, &existing, &[], "any");
         assert!(skills.is_empty(), "must not re-induce existing skill");
     }
 
@@ -319,7 +334,7 @@ mod tests {
                 });
             }
         }
-        let skills = induce(&mem, &[], &HashSet::new(), &[]);
+        let skills = induce(&mem, &[], &HashSet::new(), &[], "any");
         let batch = skills.iter().find(|s| s.name.starts_with("batch:"));
         assert!(
             batch.is_some(),
@@ -344,7 +359,7 @@ mod tests {
                 });
             }
         }
-        let skills = induce(&mem, &[], &HashSet::new(), &[]);
+        let skills = induce(&mem, &[], &HashSet::new(), &[], "any");
         let batch = skills.iter().find(|s| s.name.starts_with("batch:"));
         assert!(batch.is_none(), "small drops must not trigger batch induction");
     }
@@ -367,10 +382,60 @@ mod tests {
         }
         let mut existing = HashSet::new();
         existing.insert("group:corespeechd+suggestd".to_string());
-        let skills = induce(&mem, &[], &existing, &[]);
+        let skills = induce(&mem, &[], &existing, &[], "any");
         assert!(
             skills.iter().all(|s| s.name != "batch:corespeechd+suggestd"),
             "batch: must not duplicate an existing group: skill"
         );
+    }
+
+    #[test]
+    fn group_skills_always_tagged_any() {
+        // Group skills are structural (cross-workload) — always tagged "any".
+        let mem = ExperienceMemory::new(300);
+        let pairs = vec![("coreaudiod", "corespeechd", HIGH_COOCCUR_BYPASS + 10)];
+        let skills = induce(&mem, &pairs, &HashSet::new(), &[], "build");
+        let group = skills.iter().find(|s| s.name.starts_with("group:")).unwrap();
+        assert_eq!(group.workload_hint, "any", "group skills must be tagged 'any' regardless of workload");
+    }
+
+    #[test]
+    fn batch_skills_tagged_with_active_workload() {
+        // Batch skills come from session-specific bursts — tagged with current workload.
+        let mut mem = ExperienceMemory::new(300);
+        let drops = [0.15_f64, 0.18, 0.12, 0.20];
+        let pressures = [0.70_f64, 0.72, 0.68, 0.75];
+        for (drop, pressure) in drops.iter().zip(pressures.iter()) {
+            for name in &["corespeechd", "suggestd"] {
+                mem.push(ExperienceRecord {
+                    process_name: name.to_string(),
+                    pressure_at_action: *pressure,
+                    pressure_drop: *drop,
+                    effective: true,
+                });
+            }
+        }
+        let skills = induce(&mem, &[], &HashSet::new(), &[], "browsing");
+        let batch = skills.iter().find(|s| s.name.starts_with("batch:")).unwrap();
+        assert_eq!(batch.workload_hint, "browsing", "batch skills must be tagged with active workload");
+    }
+
+    #[test]
+    fn batch_skills_tagged_idle_when_workload_idle() {
+        let mut mem = ExperienceMemory::new(300);
+        for drop in &[0.15_f64, 0.18, 0.12, 0.20] {
+            for name in &["alpha", "beta"] {
+                mem.push(ExperienceRecord {
+                    process_name: name.to_string(),
+                    pressure_at_action: 0.70,
+                    pressure_drop: *drop,
+                    effective: true,
+                });
+            }
+        }
+        let skills = induce(&mem, &[], &HashSet::new(), &[], "idle");
+        if let Some(batch) = skills.iter().find(|s| s.name.starts_with("batch:")) {
+            assert_eq!(batch.workload_hint, "idle");
+        }
     }
 }

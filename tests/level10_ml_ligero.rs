@@ -15,8 +15,8 @@ use std::collections::HashMap;
 fn test_classifier_new_has_no_learned_weights() {
     let classifier = WorkloadClassifier::new();
     // With no foreground app and no learned weights, classification should be low confidence.
-    // Hour model with General: 1.0 → score = 0.30, total = max(0.30, 1.0) = 1.0
-    // confidence = 0.30 / 1.0 = 0.30
+    // Hour model with General: 1.0 → score = 0.30, runner_up = 0.0 → margin = 0.0
+    // D1≈0.14, D2≈0.18 (1 source), D3≈0.03 (score 0.30 << 2.0) → confidence ≈ 0.13
     let hour_model: [_; 24] = std::array::from_fn(|_| {
         let mut m = std::collections::HashMap::new();
         m.insert(WorkloadType::General, 1.0f32);

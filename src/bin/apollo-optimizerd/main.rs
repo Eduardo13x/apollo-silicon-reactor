@@ -3019,7 +3019,7 @@ fn main() -> anyhow::Result<()> {
                 // pressure ≥ skill.min_pressure AND is_reliable() (≥5 obs, ≥60% success).
                 {
                     let skill_matches = skill_registry
-                        .matching_skills(snapshot.pressure.memory_pressure as f32, "any");
+                        .matching_skills(snapshot.pressure.memory_pressure as f32, workload_mode.as_str());
                     if !skill_matches.is_empty() {
                         let already_actioned: std::collections::HashSet<String> = actions
                             .iter()
@@ -3063,12 +3063,16 @@ fn main() -> anyhow::Result<()> {
                     // Record result from previous cycle's trial if pending.
                     if let Some((ref pending_name, pressure_before)) = pending_trial_skill {
                         let effective = snapshot.pressure.memory_pressure < pressure_before - 0.01;
-                        skill_registry.record_result(pending_name, effective);
+                        skill_registry.record_result_with_pressure(
+                            pending_name,
+                            effective,
+                            pressure_before as f32,
+                        );
                         pending_trial_skill = None;
                     }
 
                     let trial = skill_registry
-                        .next_trial_skill(snapshot.pressure.memory_pressure as f32);
+                        .next_trial_skill(snapshot.pressure.memory_pressure as f32, workload_mode.as_str());
                     if let Some(skill) = trial {
                         let skill_name = skill.name.clone();
                         let pressure_before = snapshot.pressure.memory_pressure;
@@ -3092,17 +3096,22 @@ fn main() -> anyhow::Result<()> {
                             }
                             for (pid, process) in collector.system().processes() {
                                 if process.name() == target
-                                    && !already_actioned.contains(target)
                                     && Some(pid.as_u32()) != foreground_pid
                                 {
-                                    actions.push(RootAction::ThrottleProcess {
-                                        pid: pid.as_u32(),
-                                        name: target.clone(),
-                                        aggressive: false,
-                                        reason: format!("trial:{}", skill_name),
-                                        start_sec: 0,
-                                        start_usec: 0,
-                                    });
+                                    // Add throttle only if not already actioned by individual skills.
+                                    // But mark trialed=true regardless — the pressure measurement
+                                    // captures the combined effect of all throttles in this cycle,
+                                    // including targets already covered by throttle:X skills.
+                                    if !already_actioned.contains(target) {
+                                        actions.push(RootAction::ThrottleProcess {
+                                            pid: pid.as_u32(),
+                                            name: target.clone(),
+                                            aggressive: false,
+                                            reason: format!("trial:{}", skill_name),
+                                            start_sec: 0,
+                                            start_usec: 0,
+                                        });
+                                    }
                                     trialed = true;
                                     break;
                                 }
@@ -4669,6 +4678,7 @@ fn main() -> anyhow::Result<()> {
                         &top_pairs,
                         &existing_names,
                         &all_protected,
+                        workload_mode.as_str(),
                     );
                     let induced_count = new_skills.len();
                     for skill in new_skills {

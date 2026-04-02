@@ -45,12 +45,22 @@ impl OptimizationSkill {
         self.apply_count >= 5 && self.success_rate >= 0.60
     }
 
-    /// Should this skill be retired? (≥10 applications, <35% success rate)
-    /// 35% threshold: skills in the 20-35% range are barely above noise and
-    /// consume a slot that a better skill could occupy. The reliable threshold
-    /// is 60%, so anything below 35% is clearly not useful in practice.
+    /// Should this skill be retired?
+    ///
+    /// Two conditions:
+    /// - **Primary** (≥10 obs, <35%): clearly ineffective — below noise floor.
+    /// - **Zombie** (≥20 obs, <50%): consistently mediocre — never crosses the
+    ///   reliable threshold (60%) and occupies a trial slot indefinitely.
     pub fn should_retire(&self) -> bool {
-        self.apply_count >= 10 && self.success_rate < 0.35
+        (self.apply_count >= 10 && self.success_rate < 0.35)
+            || (self.apply_count >= 20 && self.success_rate < 0.50)
+    }
+
+    /// EMA-update min_pressure toward the pressure where this skill
+    /// was actually applied (α = 0.20).  Called after effective trials
+    /// so the skill self-calibrates to its real operating range.
+    pub fn adapt_pressure(&mut self, pressure: f32) {
+        self.min_pressure = self.min_pressure * 0.80 + pressure * 0.20;
     }
 }
 
@@ -90,6 +100,18 @@ impl SkillRegistry {
         }
     }
 
+    /// Record result and, on success, EMA-adapt the skill's pressure threshold
+    /// toward the pressure at which it was applied.  Use this in the trial loop
+    /// so skills converge to their real operating range over time.
+    pub fn record_result_with_pressure(&mut self, name: &str, was_effective: bool, pressure: f32) {
+        if let Some(skill) = self.skills.get_mut(name) {
+            skill.record(was_effective);
+            if was_effective {
+                skill.adapt_pressure(pressure);
+            }
+        }
+    }
+
     /// Get reliable skills matching current conditions.
     pub fn matching_skills(&self, pressure: f32, workload: &str) -> Vec<&OptimizationSkill> {
         self.skills
@@ -110,9 +132,10 @@ impl SkillRegistry {
     /// gets one real observation per call. Caller records the result via
     /// record_result() after measuring pressure delta.
     ///
-    /// Criteria: apply_count < 5, pressure >= min_pressure, not retired.
+    /// Criteria: apply_count < 10, pressure >= min_pressure, not retired,
+    /// workload matches (skill.workload_hint == "any" OR == current workload).
     /// Priority: fewest applications first (round-robin exploration).
-    pub fn next_trial_skill(&self, pressure: f32) -> Option<&OptimizationSkill> {
+    pub fn next_trial_skill(&self, pressure: f32, workload: &str) -> Option<&OptimizationSkill> {
         self.skills
             .values()
             .filter(|s| {
@@ -120,6 +143,7 @@ impl SkillRegistry {
                     && !s.should_retire()
                     && pressure >= s.min_pressure
                     && (s.name.starts_with("group:") || s.name.starts_with("batch:"))
+                    && (s.workload_hint == "any" || s.workload_hint == workload)
             })
             .min_by_key(|s| s.apply_count)
     }
@@ -251,5 +275,245 @@ mod tests {
         }
         reg.gc();
         assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn test_zombie_retirement_secondary_condition() {
+        // Zombie: 20 obs but only 40% success (0.35–0.49 band, never reliable).
+        let mut s = OptimizationSkill {
+            name: "zombie".into(),
+            min_pressure: 0.50,
+            workload_hint: "any".into(),
+            throttle_targets: vec![],
+            success_rate: 0.0,
+            apply_count: 0,
+            success_count: 0,
+        };
+        for i in 0..20 {
+            s.record(i % 5 < 2); // 2/5 = 40% success
+        }
+        assert!(s.apply_count >= 20);
+        assert!(s.success_rate < 0.50);
+        assert!(s.should_retire(), "zombie skill at 40% after 20 obs should retire");
+    }
+
+    #[test]
+    fn test_zombie_retirement_does_not_over_retire() {
+        // 18 obs at 48% — below 50% but not yet at 20 obs threshold → keep alive.
+        let mut s = OptimizationSkill {
+            name: "marginal".into(),
+            min_pressure: 0.50,
+            workload_hint: "any".into(),
+            throttle_targets: vec![],
+            success_rate: 0.0,
+            apply_count: 0,
+            success_count: 0,
+        };
+        for i in 0..18 {
+            s.record(i % 2 == 0); // alternating 50% — stays near 0.50
+        }
+        // 9 successes / 18 = 0.50 exactly — should NOT retire on secondary
+        // (secondary: < 0.50, not <= 0.50)
+        assert!(!s.should_retire(), "50% at 18 obs should not retire yet");
+    }
+
+    #[test]
+    fn test_adapt_pressure_ema() {
+        let mut s = OptimizationSkill {
+            name: "adapt".into(),
+            min_pressure: 0.60,
+            workload_hint: "any".into(),
+            throttle_targets: vec![],
+            success_rate: 0.0,
+            apply_count: 0,
+            success_count: 0,
+        };
+        // EMA toward 0.75: 0.60 * 0.80 + 0.75 * 0.20 = 0.48 + 0.15 = 0.63
+        s.adapt_pressure(0.75);
+        assert!((s.min_pressure - 0.63).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_record_result_with_pressure_adapts_on_success() {
+        let mut reg = SkillRegistry::new();
+        reg.learn("adapt_skill", 0.60, "any", vec!["App".into()]);
+        let before = reg.skills["adapt_skill"].min_pressure;
+        reg.record_result_with_pressure("adapt_skill", true, 0.75);
+        let after = reg.skills["adapt_skill"].min_pressure;
+        // Should have shifted toward 0.75
+        assert!(after > before, "effective trial at higher pressure should shift threshold up");
+        assert!((after - (before * 0.80 + 0.75 * 0.20)).abs() < 0.002);
+    }
+
+    #[test]
+    fn test_record_result_with_pressure_no_adapt_on_failure() {
+        let mut reg = SkillRegistry::new();
+        reg.learn("no_adapt", 0.60, "any", vec!["App".into()]);
+        let before = reg.skills["no_adapt"].min_pressure;
+        reg.record_result_with_pressure("no_adapt", false, 0.90);
+        let after = reg.skills["no_adapt"].min_pressure;
+        // Failure should not shift threshold
+        assert_eq!(after, before, "failed trial should not adapt pressure threshold");
+    }
+
+    // ── next_trial_skill() tests ──────────────────────────────────────────────
+
+    fn induced_skill(name: &str, min_pressure: f32, apply_count: u32) -> OptimizationSkill {
+        OptimizationSkill {
+            name: name.to_string(),
+            min_pressure,
+            workload_hint: "any".to_string(),
+            throttle_targets: vec!["SomeApp".to_string()],
+            success_rate: 0.5,
+            apply_count,
+            success_count: apply_count / 2,
+        }
+    }
+
+    #[test]
+    fn test_next_trial_skill_empty_registry() {
+        let reg = SkillRegistry::new();
+        assert!(reg.next_trial_skill(0.80, "any").is_none());
+    }
+
+    #[test]
+    fn test_next_trial_skill_returns_unproven_induced() {
+        let mut reg = SkillRegistry::new();
+        reg.register_induced(induced_skill("group:safari+dropbox", 0.60, 0));
+        let trial = reg.next_trial_skill(0.70, "any");
+        assert!(trial.is_some());
+        assert_eq!(trial.unwrap().name, "group:safari+dropbox");
+    }
+
+    #[test]
+    fn test_next_trial_skill_skips_non_induced() {
+        let mut reg = SkillRegistry::new();
+        reg.learn("cloud_throttle", 0.60, "any", vec!["Dropbox".into()]);
+        assert!(reg.next_trial_skill(0.80, "any").is_none());
+    }
+
+    #[test]
+    fn test_next_trial_skill_pressure_gate() {
+        let mut reg = SkillRegistry::new();
+        reg.register_induced(induced_skill("group:heavy", 0.65, 0));
+        assert!(reg.next_trial_skill(0.64, "any").is_none());
+        assert!(reg.next_trial_skill(0.65, "any").is_some());
+    }
+
+    #[test]
+    fn test_next_trial_skill_cap_at_ten() {
+        let mut reg = SkillRegistry::new();
+        reg.register_induced(induced_skill("group:worn", 0.50, 10));
+        assert!(reg.next_trial_skill(0.80, "any").is_none());
+        reg.register_induced(induced_skill("group:fresh", 0.50, 9));
+        assert!(reg.next_trial_skill(0.80, "any").is_some());
+    }
+
+    #[test]
+    fn test_next_trial_skill_prefers_fewest_applications() {
+        let mut reg = SkillRegistry::new();
+        reg.register_induced(induced_skill("group:more_used", 0.50, 5));
+        reg.register_induced(induced_skill("batch:less_used", 0.50, 2));
+        let trial = reg.next_trial_skill(0.80, "any");
+        assert_eq!(trial.unwrap().name, "batch:less_used");
+    }
+
+    #[test]
+    fn test_next_trial_skill_skips_retiring() {
+        let mut reg = SkillRegistry::new();
+        let mut s = induced_skill("group:bad", 0.50, 10);
+        s.success_rate = 0.0;
+        s.success_count = 0;
+        reg.register_induced(s);
+        assert!(reg.next_trial_skill(0.80, "any").is_none());
+    }
+
+    #[test]
+    fn test_next_trial_skill_workload_filter() {
+        let mut reg = SkillRegistry::new();
+        // batch skill tagged "browsing" — should appear when workload matches
+        let mut browser_skill = induced_skill("batch:tab+sync", 0.50, 0);
+        browser_skill.workload_hint = "browsing".to_string();
+        reg.register_induced(browser_skill);
+        // group skill "any" — always available
+        reg.register_induced(induced_skill("group:daemon+helper", 0.50, 0));
+
+        // "build" workload: only "any" skill visible
+        let build_trial = reg.next_trial_skill(0.70, "build");
+        assert!(build_trial.is_some());
+        assert_eq!(build_trial.unwrap().name, "group:daemon+helper");
+
+        // "browsing" workload: both visible, "any" and "browsing" skill eligible
+        let mut count = 0;
+        let mut registry2 = SkillRegistry::new();
+        let mut b1 = induced_skill("batch:tab+sync", 0.50, 0);
+        b1.workload_hint = "browsing".to_string();
+        registry2.register_induced(b1);
+        // next_trial_skill returns one at a time; drain all eligible
+        while registry2.next_trial_skill(0.70, "browsing").is_some() {
+            let name = registry2.next_trial_skill(0.70, "browsing").unwrap().name.clone();
+            registry2.record_result(&name, false);
+            count += 1;
+            if count > 20 { break; }
+        }
+        assert!(count >= 1, "browsing skill should be trialed during browsing workload");
+    }
+
+    // ── purge_unexecutable() tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_purge_unexecutable_empty_registry() {
+        let mut reg = SkillRegistry::new();
+        reg.purge_unexecutable(&["kernel_task"]);
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn test_purge_unexecutable_removes_all_protected_targets() {
+        let mut reg = SkillRegistry::new();
+        let mut skill = induced_skill("group:protected_only", 0.50, 0);
+        skill.throttle_targets = vec!["kernel_task".into(), "WindowServer".into()];
+        reg.register_induced(skill);
+        reg.purge_unexecutable(&["kernel_task", "windowserver"]);
+        assert_eq!(reg.len(), 0, "all targets protected → skill removed");
+    }
+
+    #[test]
+    fn test_purge_unexecutable_keeps_skill_with_free_target() {
+        let mut reg = SkillRegistry::new();
+        let mut skill = induced_skill("group:mixed", 0.50, 0);
+        skill.throttle_targets = vec!["kernel_task".into(), "Brave Browser".into()];
+        reg.register_induced(skill);
+        // "brave browser" is not in protected list → skill kept
+        reg.purge_unexecutable(&["kernel_task"]);
+        assert_eq!(reg.len(), 1, "skill with at least one free target kept");
+    }
+
+    #[test]
+    fn test_purge_unexecutable_case_insensitive() {
+        let mut reg = SkillRegistry::new();
+        let mut skill = induced_skill("group:case_test", 0.50, 0);
+        skill.throttle_targets = vec!["CoreAudiod".into()];
+        reg.register_induced(skill);
+        // lowercase in protected list should still match "CoreAudiod"
+        reg.purge_unexecutable(&["coreaudiod"]);
+        assert_eq!(reg.len(), 0, "case-insensitive substring match should work");
+    }
+
+    #[test]
+    fn test_purge_unexecutable_preserves_individual_skills() {
+        let mut reg = SkillRegistry::new();
+        // Individual (non-induced) skills are never removed
+        reg.learn("cloud_throttle", 0.50, "any", vec!["kernel_task".into()]);
+        reg.purge_unexecutable(&["kernel_task"]);
+        assert_eq!(reg.len(), 1, "individual skills always kept");
+    }
+
+    #[test]
+    fn test_purge_unexecutable_empty_protected_list() {
+        let mut reg = SkillRegistry::new();
+        reg.register_induced(induced_skill("group:any_target", 0.50, 0));
+        reg.purge_unexecutable(&[]);
+        assert_eq!(reg.len(), 1, "empty protected list → all skills kept");
     }
 }

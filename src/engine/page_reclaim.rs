@@ -266,9 +266,37 @@ mod tests {
     #[test]
     fn foreground_blocks_purge() {
         let mut pr = PageReclaim::new(true);
-        // High pressure but foreground active and display on → don't purge.
-        let freed = pr.tick(0.80, false, false);
-        assert_eq!(freed, 0, "should not purge during active foreground");
+        // Below critical threshold: foreground gate blocks even at 0.79.
+        let freed = pr.tick(0.79, false, false);
+        assert_eq!(freed, 0, "should not purge during active foreground below critical threshold");
+        assert_eq!(pr.total_purges, 0, "no purge attempt when foreground gate blocks");
+    }
+
+    #[test]
+    fn critical_override_bypasses_foreground_gate() {
+        let mut pr = PageReclaim::new(true);
+        // At critical pressure (>= 0.80), the foreground gate is bypassed.
+        // Even with display=on and foreground=active, purge runs.
+        // execute_purge() may return 0 bytes in test env, but total_purges increments.
+        pr.tick(0.85, false, false);
+        assert_eq!(pr.total_purges, 1, "critical pressure should bypass foreground gate and attempt purge");
+    }
+
+    #[test]
+    fn exactly_at_critical_threshold_bypasses() {
+        let mut pr = PageReclaim::new(true);
+        // pressure == PRESSURE_CRITICAL_OVERRIDE (0.80) should trigger override.
+        pr.tick(0.80, false, false);
+        assert_eq!(pr.total_purges, 1, "exactly at 0.80 should bypass foreground gate");
+    }
+
+    #[test]
+    fn just_below_critical_threshold_respects_gate() {
+        let mut pr = PageReclaim::new(true);
+        // 0.799 is just below the 0.80 critical threshold.
+        let freed = pr.tick(0.799, false, false);
+        assert_eq!(freed, 0);
+        assert_eq!(pr.total_purges, 0, "just below 0.80 should still respect foreground gate");
     }
 
     #[test]
