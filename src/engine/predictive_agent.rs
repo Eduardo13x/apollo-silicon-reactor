@@ -553,26 +553,44 @@ impl PredictiveAgent {
 
     /// Select the best intervention for the current context.
     pub fn select_action(&mut self, ctx: &AgentContext) -> Intervention {
-        // During warmup, always observe (learn passively).
+        self.select_action_with_confidence(ctx).0
+    }
+
+    /// Like `select_action` but also returns the normalized UCB confidence [0, 1].
+    ///
+    /// The UCB score (exploit + explore term) is normalized by dividing by the
+    /// score of the second-best arm so that margin of victory maps to confidence.
+    /// When all arms are tied the confidence is 0.5; a dominant winner → near 1.0.
+    /// During warmup returns (Observe, 0.0) — agent has no opinion yet.
+    pub fn select_action_with_confidence(&mut self, ctx: &AgentContext) -> (Intervention, f64) {
         if self.warmup_remaining > 0 {
             self.warmup_remaining -= 1;
             self.last_action = Some((Intervention::Observe, ctx.features, ctx.features[0]));
-            return Intervention::Observe;
+            return (Intervention::Observe, 0.0);
         }
 
-        let mut best_arm = 0;
-        let mut best_score = f64::NEG_INFINITY;
+        let mut scores = [(0usize, f64::NEG_INFINITY); K];
         for i in 0..K {
-            let s = self.arms[i].score(&ctx.features, self.alpha);
-            if s > best_score {
-                best_score = s;
-                best_arm = i;
-            }
+            scores[i] = (i, self.arms[i].score(&ctx.features, self.alpha));
         }
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let best_arm = scores[0].0;
+        let best_score = scores[0].1;
+        let second_score = scores[1].1;
+
+        // Confidence: how far ahead is the winner vs runner-up?
+        // Normalize to [0.5, 1.0]: tie → 0.5, large margin → 1.0.
+        let confidence = if best_score <= 0.0 || best_score == second_score {
+            0.5
+        } else {
+            let margin = (best_score - second_score) / best_score.abs().max(1e-9);
+            (0.5 + margin * 0.5).clamp(0.5, 1.0)
+        };
 
         let intervention = Intervention::from_index(best_arm);
         self.last_action = Some((intervention, ctx.features, ctx.features[0]));
-        intervention
+        (intervention, confidence)
     }
 
     /// Observe the outcome: current pressure after the intervention had time to act.

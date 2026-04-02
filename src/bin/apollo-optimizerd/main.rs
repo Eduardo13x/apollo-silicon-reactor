@@ -2655,7 +2655,8 @@ fn main() -> anyhow::Result<()> {
                         outcome_tracker.overall_effectiveness(),
                         lv_ratio,
                     );
-                    let linucb_choice = predictive_agent.select_action(&agent_ctx);
+                    let (linucb_choice, linucb_confidence) =
+                        predictive_agent.select_action_with_confidence(&agent_ctx);
 
                     // ── Specialist accuracy feedback (Super Learner) ─────────────────
                     // Compare prev cycle's specialist predictions against observed outcome.
@@ -2700,11 +2701,14 @@ fn main() -> anyhow::Result<()> {
                     // a specialist consistently right gets weight→1.0, wrong gets→0.0.
                     use apollo_optimizer::engine::predictive_agent::{SpecialistVote, tally_votes, specialist};
                     let mut votes = vec![
-                        // LinUCB: primary agent — confidence scaled by learned accuracy.
+                        // LinUCB: primary agent — UCB confidence × learned accuracy weight.
+                        // linucb_confidence is the normalized margin of the winning arm [0.5, 1.0]:
+                        // dominant winner → near 1.0, all arms tied → 0.5.
                         SpecialistVote {
                             name: "linucb",
                             intervention: linucb_choice,
-                            confidence: 0.5 * specialist_accuracy.weight(specialist::LINUCB),
+                            confidence: linucb_confidence
+                                * specialist_accuracy.weight(specialist::LINUCB),
                         },
                     ];
 
