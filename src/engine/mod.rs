@@ -58,6 +58,7 @@ pub mod overflow_guard;
 pub mod page_reclaim;
 pub mod process_classifier;
 pub mod swap_predictor;
+pub mod syscall_classifier;
 pub mod thermal_bailout;
 pub mod power_management;
 pub mod predictive_agent;

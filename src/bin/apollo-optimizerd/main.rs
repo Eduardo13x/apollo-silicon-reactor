@@ -93,6 +93,7 @@ use apollo_optimizer::engine::learned_state::{LearnedState, RestoreQualityMonito
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
 use apollo_optimizer::engine::smc_reader::SmcReader;
 use apollo_optimizer::engine::swap_predictor::SwapPredictor;
+use apollo_optimizer::engine::syscall_classifier::SyscallClassifier;
 use apollo_optimizer::engine::sysctl_governor::{
     SysctlGovernor, SysctlGovernorInput, SysctlGovernorStatus,
 };
@@ -865,6 +866,7 @@ fn main() -> anyhow::Result<()> {
             let mut power_mgr = PowerManager::new();
             let mut proc_recovery = ProcessRecoveryManager::new();
             let mut swap_predictor = SwapPredictor::new();
+            let mut syscall_classifier = SyscallClassifier::new();
             let mut network_monitor = NetworkMonitor::new();
             let mut sysctl_governor = SysctlGovernor::new(is_root);
             let mut thermal_mgr = ThermalManager::new();
@@ -2160,6 +2162,29 @@ fn main() -> anyhow::Result<()> {
                     .map(|e| (e.pid, e.ipc))
                     .collect();
 
+                // ── Syscall-aware profiling: identify JIT-compiling processes ──
+                // Sample top processes through the syscall classifier and collect
+                // PIDs currently in JitCompiling state.  These are merged into
+                // behavior_interactive_pids below so decide_actions protects them
+                // from throttling (same path as I/O-bound interactive processes).
+                // Evict stale entries every 60 cycles to keep the HashMap bounded.
+                let jit_protected_pids: HashSet<u32> = {
+                    let pids: Vec<u32> = snapshot.top_processes.iter().map(|p| p.pid).collect();
+                    if cycle_count % 60 == 0 {
+                        syscall_classifier.evict_stale(&pids);
+                    }
+                    pids.iter()
+                        .filter_map(|&pid| {
+                            syscall_classifier
+                                .sample(pid)
+                                .filter(|p| {
+                                    *p == apollo_optimizer::engine::syscall_classifier::SyscallProfile::JitCompiling
+                                })
+                                .map(|_| pid)
+                        })
+                        .collect()
+                };
+
                 // ── IOPMrootDomain direct thermal (every 10 cycles, aligned with HwPredictor) ──
                 let iopm_snap = if cycle_count % 10 == 0 {
                     apollo_optimizer::engine::thermal_iokit::read_iopm_state()
@@ -2930,6 +2955,8 @@ fn main() -> anyhow::Result<()> {
 
                 // Build behavior-interactive PID set from usage model EMA data.
                 // Processes with sustained low cpu_wall_ratio are I/O-bound (interactive).
+                // JIT-compiling PIDs (from syscall_classifier) are merged in so that
+                // decide_actions treats them as interactive and skips throttling.
                 let behavior_interactive_pids: HashSet<u32> = {
                     let model = state.usage_model.lock_recover();
                     let interactive_names: HashSet<&str> = model
@@ -2940,13 +2967,15 @@ fn main() -> anyhow::Result<()> {
                         })
                         .map(|(name, _)| name.as_str())
                         .collect();
-                    // Map interactive names back to running PIDs.
-                    snapshot
+                    // Map interactive names back to running PIDs, then union JIT PIDs.
+                    let mut pids: HashSet<u32> = snapshot
                         .top_processes
                         .iter()
                         .filter(|p| interactive_names.contains(p.name.as_str()))
                         .map(|p| p.pid)
-                        .collect()
+                        .collect();
+                    pids.extend(jit_protected_pids.iter().copied());
+                    pids
                 };
 
                 // PID integral adjustment: if pressure has been chronically above target,
