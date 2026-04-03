@@ -4,54 +4,32 @@
 //! In the current daemon main loop these are scattered as `if cycle_count % N == 0`
 //! blocks throughout the ~5000-line `run_daemon` function.
 //!
-//! ## Current extraction status
+//! ## Extraction status
 //!
-//! The `PeriodicContext` and `run_periodic()` interface are defined here and
-//! compile cleanly, but the function body is intentionally a no-op stub:
-//! the actual periodic logic remains inline in the main loop because wiring it
-//! through this interface would require a `PeriodicContext` with 15+ `&mut`
-//! fields — exactly the parameter explosion the extraction rules warn against.
+//! `run_periodic()` is now wired to a [`LearningContext`] and performs real work:
 //!
-//! ### Why 15+ parameters?
+//! | Cycle gate    | What it does                                           |
+//! |---------------|--------------------------------------------------------|
+//! | % 500 == 0    | Compress experience memory, prune weights, GC skills   |
+//! | % 100 == 0    | Compute causal solid-edge count for observability      |
 //!
-//! The periodic stage touches learning subsystems spread across independent
-//! struct instances that are *also* mutably borrowed by the decision and
-//! observation stages:
+//! Remaining inline periodic work in the daemon loop:
 //!
-//! | Cycle gate  | What it touches                                        |
-//! |-------------|--------------------------------------------------------|
-//! | % 100 == 0  | signal_intel, outcome_tracker, specialist_accuracy     |
-//! |             | skill_registry, causal_graph, overflow_guard::rl_agent |
-//! |             | ls_path, hop_groups_path, skills_path                  |
-//! | % 100 == 0  | rule_inducer (outcome_tracker, top_pairs, skill_registry) |
-//! | % 500 == 0  | outcome_tracker, skill_registry (GC + compress)        |
-//! | % 7200 == 0 | cache_warmer, io_shaper, temporal_predictor            |
-//!
-//! ### Pre-condition for full extraction
-//!
-//! Group the learning subsystems into a `LearningContext` struct:
-//!
-//! ```rust,ignore
-//! struct LearningContext {
-//!     signal_intel: SignalIntelligence,
-//!     outcome_tracker: OutcomeTracker,
-//!     specialist_accuracy: SpecialistAccuracyTracker,
-//!     skill_registry: SkillRegistry,
-//!     causal_graph: CausalGraph,
-//!     overflow_guard: OverflowGuard,
-//!     predictive_agent: PredictiveAgent,
-//! }
-//! ```
-//!
-//! With that grouping, `PeriodicContext` drops to 5 parameters and full
-//! extraction becomes straightforward. `LearningContext` is the recommended
-//! next refactoring step (tracked in architecture notes).
+//! | Cycle gate    | Why it stays inline                                    |
+//! |---------------|--------------------------------------------------------|
+//! | % 100 == 0    | Signal/state persist: needs `learning_pipeline`,       |
+//! |               | `effectiveness_tracker`, `frozen_state` (SharedState)  |
+//! | % 100 == 0    | Rule induction: needs `learned_policy` (SharedState)   |
+//! | % 7200 == 0   | Hourly GC: needs `cache_warmer`, `io_shaper`,          |
+//! |               | `temporal_predictor` (binary-local types)              |
+
+use crate::engine::pipeline::learning_context::LearningContext;
 
 /// Everything the periodic stage needs to do its work.
 ///
-/// This struct is the *target* interface — not all fields are wired to the
-/// main loop yet. See module-level documentation for details.
-pub struct PeriodicContext<'a> {
+/// `'a` is the lifetime of the data borrowed inside [`LearningContext`].
+/// `'lctx` is the lifetime of the borrow of the context itself.
+pub struct PeriodicContext<'a, 'lctx> {
     /// Current daemon cycle counter (starts at 1, monotonically increasing).
     pub cycle_count: u64,
 
@@ -83,11 +61,12 @@ pub struct PeriodicContext<'a> {
     /// Pending trial skill from the current decision cycle, if any.
     /// Passed through to LearnedState so a crash mid-trial can be recovered.
     pub pending_trial_skill: Option<(String, f64)>,
-    // TODO: learning_ctx: &mut LearningContext  — blocked until LearningContext exists.
-    // Until then: signal_intel, outcome_tracker, specialist_accuracy, skill_registry,
-    // causal_graph, overflow_guard, predictive_agent, cache_warmer, io_shaper,
-    // temporal_predictor, holt_winters, focus_markov are passed separately in the
-    // main loop.
+
+    /// All 9 learning subsystems needed for GC and observability.
+    ///
+    /// Must be constructed from the same locals that [`LearningContext`] was
+    /// built from, inside the same loop iteration.
+    pub lctx: &'lctx mut LearningContext<'a>,
 }
 
 /// Which periodic housekeeping tasks ran this cycle.
@@ -95,7 +74,7 @@ pub struct PeriodicContext<'a> {
 /// Returned by `run_periodic` so the caller can log what happened.
 #[derive(Debug, Default)]
 pub struct PeriodicResult {
-    /// Causal graph solid-edge count logged this cycle (0 if gate didn't fire).
+    /// Causal graph solid-edge count logged this cycle (None if gate didn't fire).
     pub causal_solid_edges: Option<usize>,
 
     /// Number of new skills crystallised from rule induction (0 if gate didn't fire).
@@ -111,27 +90,39 @@ pub struct PeriodicResult {
     pub did_hourly: bool,
 }
 
-/// Decide which periodic tasks to run for this cycle.
+/// Run all periodic housekeeping tasks for this cycle.
 ///
-/// In its current stub form this function only computes the `PeriodicResult`
-/// flags — it does not actually mutate any state.  The real mutations remain
-/// inline in the main loop pending the `LearningContext` grouping.
-///
-/// Once `LearningContext` exists this function will accept it as a parameter
-/// and contain the full implementation.
-pub fn run_periodic(ctx: &PeriodicContext) -> PeriodicResult {
+/// Executes only the gates whose modulus fires for the given `ctx.cycle_count`.
+/// Callers are responsible for the remaining periodic work that requires
+/// binary-local state (signal persist, rule induction, hourly GC).
+pub fn run_periodic(ctx: &mut PeriodicContext<'_, '_>) -> PeriodicResult {
     let mut result = PeriodicResult::default();
 
+    // ── Every 100 cycles: observability snapshot ─────────────────────────────
+    // Full persist (signal_intel, LearnedState, skills) remains inline because
+    // it requires learning_pipeline and effectiveness_tracker from the binary.
     if ctx.cycle_count % 100 == 0 {
         result.did_persist = true;
-        result.causal_solid_edges = Some(0); // placeholder; real value from causal_graph
-        result.induced_skills = Some(0); // placeholder; real value from skill_registry
+        result.causal_solid_edges = Some(ctx.lctx.causal_graph.solid_count());
+        result.induced_skills = Some(0); // rule induction stays inline (needs SharedState)
     }
 
+    // ── Every 500 cycles: GC and compression ─────────────────────────────────
     if ctx.cycle_count % 500 == 0 {
+        // Compress old experience records to save memory (Hermes pattern).
+        ctx.lctx.outcome_tracker.experience.compress_old();
+        // Prune low-signal Bayesian weight entries (BUG-04).
+        ctx.lctx.outcome_tracker.gc_weights();
+        // Retire ineffective skills.
+        ctx.lctx.skill_registry.gc();
+        // Persist updated skill registry after GC.
+        ctx.lctx.skill_registry.persist(ctx.skills_path);
         result.did_gc = true;
     }
 
+    // ── Every 7200 cycles (~2 hours): hourly housekeeping ────────────────────
+    // cache_warmer.gc(), io_shaper.gc(), temporal_predictor.persist() remain
+    // inline: they are binary-local types that cannot be imported here.
     if ctx.cycle_count % 7200 == 0 {
         result.did_hourly = true;
     }
@@ -142,8 +133,68 @@ pub fn run_periodic(ctx: &PeriodicContext) -> PeriodicResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::causal_graph::CausalGraph;
+    use crate::engine::energy::EnergyTracker;
+    use crate::engine::neuromodulator::ApolloNeuromodulator;
+    use crate::engine::optimization_skills::SkillRegistry;
+    use crate::engine::outcome_tracker::OutcomeTracker;
+    use crate::engine::overflow_guard::OverflowGuard;
+    use crate::engine::pipeline::learning_context::LearningContext;
+    use crate::engine::predictive_agent::{PredictiveAgent, SpecialistAccuracyTracker};
+    use crate::engine::signal_intelligence::SignalIntelligence;
 
-    fn make_ctx(cycle: u64) -> PeriodicContext<'static> {
+    /// Owns the 9 learning subsystems needed to construct a LearningContext.
+    struct LctxOwner {
+        outcome_tracker: OutcomeTracker,
+        signal_intel: SignalIntelligence,
+        predictive_agent: PredictiveAgent,
+        specialist_accuracy: SpecialistAccuracyTracker,
+        overflow_guard: OverflowGuard,
+        causal_graph: CausalGraph,
+        skill_registry: SkillRegistry,
+        neuromod: ApolloNeuromodulator,
+        energy_tracker: EnergyTracker,
+    }
+
+    impl LctxOwner {
+        fn new() -> Self {
+            Self {
+                outcome_tracker: OutcomeTracker::new(),
+                signal_intel: SignalIntelligence::new(),
+                predictive_agent: PredictiveAgent::load_or_default(
+                    std::path::Path::new("/dev/null"),
+                ),
+                specialist_accuracy: SpecialistAccuracyTracker::new(),
+                overflow_guard: OverflowGuard::load_or_default(
+                    std::path::Path::new("/dev/null"),
+                    None,
+                ),
+                causal_graph: CausalGraph::new(),
+                skill_registry: SkillRegistry::new(),
+                neuromod: ApolloNeuromodulator::new(),
+                energy_tracker: EnergyTracker::new(),
+            }
+        }
+
+        fn make_lctx(&mut self) -> LearningContext<'_> {
+            LearningContext::new(
+                &mut self.outcome_tracker,
+                &mut self.signal_intel,
+                &mut self.predictive_agent,
+                &mut self.specialist_accuracy,
+                &mut self.overflow_guard,
+                &mut self.causal_graph,
+                &mut self.skill_registry,
+                &mut self.neuromod,
+                &mut self.energy_tracker,
+            )
+        }
+    }
+
+    fn make_pctx<'a, 'lctx>(
+        cycle: u64,
+        lctx: &'lctx mut LearningContext<'a>,
+    ) -> PeriodicContext<'a, 'lctx> {
         PeriodicContext {
             cycle_count: cycle,
             current_pressure: 0.30,
@@ -155,45 +206,62 @@ mod tests {
             persist_generations: 0,
             last_restore_quality: None,
             pending_trial_skill: None,
+            lctx,
         }
     }
 
+    /// % 100 gate fires: did_persist set, causal_solid_edges populated.
     #[test]
     fn persist_fires_at_cycle_100() {
-        let result = run_periodic(&make_ctx(100));
+        let mut owner = LctxOwner::new();
+        let mut lctx = owner.make_lctx();
+        let mut ctx = make_pctx(100, &mut lctx);
+        let result = run_periodic(&mut ctx);
         assert!(result.did_persist, "% 100 gate should fire at cycle 100");
         assert!(!result.did_gc, "% 500 gate must not fire at cycle 100");
         assert!(!result.did_hourly, "% 7200 gate must not fire at cycle 100");
+        assert!(
+            result.causal_solid_edges.is_some(),
+            "causal solid count should be populated at % 100"
+        );
     }
 
+    /// % 500 gate: GC runs; experience, weights, and skills are mutated.
     #[test]
     fn gc_fires_at_cycle_500() {
-        let result = run_periodic(&make_ctx(500));
-        // 500 % 100 == 0, so persist fires too
+        let mut owner = LctxOwner::new();
+        let mut lctx = owner.make_lctx();
+        let mut ctx = make_pctx(500, &mut lctx);
+        let result = run_periodic(&mut ctx);
         assert!(result.did_persist, "% 100 gate must co-fire at cycle 500");
         assert!(result.did_gc, "% 500 gate should fire at cycle 500");
         assert!(!result.did_hourly, "% 7200 gate must not fire at cycle 500");
     }
 
+    /// % 7200 gate: did_hourly set (binary-local work remains inline).
     #[test]
     fn hourly_fires_at_cycle_7200() {
-        let result = run_periodic(&make_ctx(7200));
+        let mut owner = LctxOwner::new();
+        let mut lctx = owner.make_lctx();
+        let mut ctx = make_pctx(7200, &mut lctx);
+        let result = run_periodic(&mut ctx);
         assert!(result.did_hourly, "% 7200 == 0 gate should fire at cycle 7200");
-        // 7200 % 100 == 0, so persist also fires.
         assert!(result.did_persist, "% 100 gate must co-fire at cycle 7200");
     }
 
+    /// No gates fire on cycle 1.
     #[test]
     fn gates_at_cycle_1() {
-        // cycle 1: 1 % 100 != 0, 1 % 500 != 0, 1 % 7200 != 0.
-        // No periodic tasks run on the very first cycle — housekeeping waits for
-        // the first full interval to elapse before executing.
-        let result = run_periodic(&make_ctx(1));
+        let mut owner = LctxOwner::new();
+        let mut lctx = owner.make_lctx();
+        let mut ctx = make_pctx(1, &mut lctx);
+        let result = run_periodic(&mut ctx);
         assert!(!result.did_persist, "% 100 gate must not fire at cycle 1");
         assert!(!result.did_gc, "% 500 gate must not fire at cycle 1");
-        assert!(!result.did_hourly, "% 7200 == 0 gate must not fire at cycle 1");
+        assert!(!result.did_hourly, "% 7200 gate must not fire at cycle 1");
     }
 
+    /// PeriodicResult::default() is all-false/None.
     #[test]
     fn periodic_result_default_is_all_false() {
         let r = PeriodicResult::default();
