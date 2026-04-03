@@ -159,3 +159,185 @@ pub enum DaemonResponse {
         message: String,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Serde roundtrip helpers ───────────────────────────────────────────────
+
+    fn roundtrip(req: &DaemonRequest) -> DaemonRequest {
+        let json = serde_json::to_string(req).expect("serialize DaemonRequest");
+        serde_json::from_str(&json).expect("deserialize DaemonRequest")
+    }
+
+    // ── Roundtrip tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn roundtrip_get_status() {
+        let rt = roundtrip(&DaemonRequest::GetStatus);
+        assert!(matches!(rt, DaemonRequest::GetStatus));
+    }
+
+    #[test]
+    fn roundtrip_get_metrics() {
+        let rt = roundtrip(&DaemonRequest::GetMetrics);
+        assert!(matches!(rt, DaemonRequest::GetMetrics));
+    }
+
+    #[test]
+    fn roundtrip_subscribe() {
+        let rt = roundtrip(&DaemonRequest::Subscribe);
+        assert!(matches!(rt, DaemonRequest::Subscribe));
+    }
+
+    #[test]
+    fn roundtrip_get_version() {
+        let rt = roundtrip(&DaemonRequest::GetVersion);
+        assert!(matches!(rt, DaemonRequest::GetVersion));
+    }
+
+    #[test]
+    fn roundtrip_set_profile_fields() {
+        let req = DaemonRequest::SetProfile {
+            profile: OptimizationProfile::BalancedRoot,
+            ttl_minutes: None,
+        };
+        let rt = roundtrip(&req);
+        match rt {
+            DaemonRequest::SetProfile {
+                profile,
+                ttl_minutes,
+            } => {
+                assert_eq!(profile, OptimizationProfile::BalancedRoot);
+                assert_eq!(ttl_minutes, None);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn roundtrip_llm_set_key_fields() {
+        let req = DaemonRequest::LlmSetKey {
+            api_key: "sk-test".to_string(),
+            ttl_days: 7,
+        };
+        let rt = roundtrip(&req);
+        match rt {
+            DaemonRequest::LlmSetKey { api_key, ttl_days } => {
+                assert_eq!(api_key, "sk-test");
+                assert_eq!(ttl_days, 7);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn roundtrip_usage_explain_fields() {
+        let req = DaemonRequest::UsageExplain {
+            name: "Brave".to_string(),
+        };
+        let rt = roundtrip(&req);
+        match rt {
+            DaemonRequest::UsageExplain { name } => assert_eq!(name, "Brave"),
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn roundtrip_feedback_fields() {
+        let req = DaemonRequest::Feedback {
+            rating: "good".to_string(),
+            note: None,
+        };
+        let rt = roundtrip(&req);
+        match rt {
+            DaemonRequest::Feedback { rating, note } => {
+                assert_eq!(rating, "good");
+                assert_eq!(note, None);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    // ── is_privileged tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn not_privileged_get_status() {
+        assert!(!DaemonRequest::GetStatus.is_privileged());
+    }
+
+    #[test]
+    fn not_privileged_get_metrics() {
+        assert!(!DaemonRequest::GetMetrics.is_privileged());
+    }
+
+    #[test]
+    fn not_privileged_get_version() {
+        assert!(!DaemonRequest::GetVersion.is_privileged());
+    }
+
+    #[test]
+    fn privileged_restore() {
+        assert!(DaemonRequest::Restore.is_privileged());
+    }
+
+    #[test]
+    fn privileged_llm_disable() {
+        assert!(DaemonRequest::LlmDisable.is_privileged());
+    }
+
+    #[test]
+    fn privileged_panic_restore() {
+        assert!(DaemonRequest::PanicRestore.is_privileged());
+    }
+
+    #[test]
+    fn privileged_set_profile() {
+        let req = DaemonRequest::SetProfile {
+            profile: OptimizationProfile::BalancedRoot,
+            ttl_minutes: None,
+        };
+        assert!(req.is_privileged());
+    }
+
+    // ── sanitize tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_llm_set_key_does_not_panic() {
+        let mut req = DaemonRequest::LlmSetKey {
+            api_key: "sk-test".to_string(),
+            ttl_days: 7,
+        };
+        req.sanitize();
+        match req {
+            DaemonRequest::LlmSetKey { api_key, .. } => {
+                assert!(!api_key.is_empty());
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sanitize_truncates_overlong_api_key() {
+        let long_key = "x".repeat(2000);
+        let mut req = DaemonRequest::LlmSetKey {
+            api_key: long_key,
+            ttl_days: 1,
+        };
+        req.sanitize();
+        match req {
+            DaemonRequest::LlmSetKey { api_key, .. } => {
+                assert!(api_key.len() <= 1024);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    // ── PROTOCOL_VERSION test ─────────────────────────────────────────────────
+
+    #[test]
+    fn protocol_version_is_positive() {
+        assert!(PROTOCOL_VERSION > 0);
+    }
+}
