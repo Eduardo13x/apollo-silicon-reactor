@@ -35,7 +35,6 @@ use apollo_optimizer::engine::compressor_aware::{
     sample_process_temperature, MemoryAction,
 };
 use apollo_optimizer::engine::workload_classifier::classify_by_memory;
-use apollo_optimizer::engine::decide_actions::decide_actions;
 use apollo_optimizer::engine::effective_pressure;
 use apollo_optimizer::engine::energy::EnergyTracker;
 use apollo_optimizer::engine::execute_actions::execute_actions;
@@ -68,6 +67,7 @@ use apollo_optimizer::engine::causal_graph::CausalGraph;
 use apollo_optimizer::engine::action_queue::ActionQueue;
 use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningPipeline};
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
+use apollo_optimizer::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
 use apollo_optimizer::engine::neuromodulator::{ApolloNeuromodulator, NeuroSignals};
 use apollo_optimizer::engine::optimization_skills::SkillRegistry;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
@@ -1200,6 +1200,8 @@ fn main() -> anyhow::Result<()> {
                         None
                     }
                 };
+
+            let mut decision_stage = DecisionStage::new();
 
             loop {
                 // Check both: Arc flag (set by ctrlc) and static flag (set by SIGTERM handler).
@@ -3142,26 +3144,30 @@ fn main() -> anyhow::Result<()> {
                     hab_set
                 };
 
+                let causal_confidence = lctx.causal_graph.confidence_map();
                 let decision = {
                     let mut qos = state.mach_qos.lock_recover();
-                    decide_actions(
+                    let policy = PolicyContext {
+                        decide_interactive:        &decide_interactive,
+                        decide_noise:              &decide_noise,
+                        decide_weights:            &decide_weights,
+                        outcome_baseline,
+                        behavior_interactive_pids: &behavior_interactive_pids,
+                        ipc_hints:                 &ipc_hints,
+                        hop_groups:                &lctx.outcome_tracker.hop_groups,
+                        habituated_pids:           &habituated_pids,
+                        causal_confidence:         &causal_confidence,
+                    };
+                    decision_stage.run(
                         &snapshot,
                         collector.system(),
                         current_profile,
                         latency_target,
                         *reactor_weight,
-                        &decide_interactive,
-                        &decide_noise,
                         overflow_thresholds,
                         Some(&mut qos),
-                        &decide_weights,
-                        outcome_baseline,
-                        &behavior_interactive_pids,
-                        &ipc_hints,
-                        &lctx.outcome_tracker.hop_groups,
-                        &habituated_pids,
-                        &lctx.causal_graph.confidence_map(),
-                    )
+                        &policy,
+                    ).decision
                 };
                 *state.last_blockers.lock_recover() = decision.blockers.clone();
                 *state.thermal_state.lock_recover() = process_enrichment::context_to_thermal(decision.context);
