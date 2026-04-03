@@ -39,3 +39,53 @@ pub fn detect_capabilities() -> CapabilityReport {
         unavailable,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_capabilities_does_not_panic() {
+        let _cap = detect_capabilities();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn can_taskpolicy_is_true_on_macos() {
+        let cap = detect_capabilities();
+        assert!(
+            cap.can_taskpolicy,
+            "can_taskpolicy should be true on macOS"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn can_sysctl_is_true_on_macos() {
+        let cap = detect_capabilities();
+        assert!(cap.can_sysctl, "can_sysctl should be true on macOS");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unavailable_does_not_contain_taskpolicy_on_macos() {
+        let cap = detect_capabilities();
+        assert!(
+            !cap.unavailable.contains(&"taskpolicy".to_string()),
+            "unavailable should not contain 'taskpolicy' on macOS, got: {:?}",
+            cap.unavailable
+        );
+    }
+
+    #[test]
+    fn capability_report_fields_are_bool() {
+        let cap = detect_capabilities();
+        // Implicit type check: these are all bool fields used in assertions
+        let _ = cap.can_taskpolicy as u8;
+        let _ = cap.can_sysctl as u8;
+        let _ = cap.can_memorystatus as u8;
+        let _ = cap.can_mdutil as u8;
+        let _ = cap.can_tmutil as u8;
+        let _ = cap.is_root as u8;
+    }
+}
