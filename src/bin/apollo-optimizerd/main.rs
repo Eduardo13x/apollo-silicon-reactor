@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 /// Global stop flag for signal handlers (SIGTERM/SIGINT).
 /// Signal handlers cannot capture Arc/closures, so we use a static AtomicBool
 /// that the main loop checks alongside `state.stop`.
+mod daemon_init;
+mod learning_tick;
 mod llm_daemon;
 mod process_enrichment;
 mod socket_handler;
@@ -123,8 +125,9 @@ use apollo_optimizer::engine::daemon_helpers::{
     governor_state_path, holt_winters_path, hop_groups_path, journal_path, kill_switch_path,
     learned_state_path, load_frozen_state, load_governor_state, load_wake_state, markov_path,
     merge_seed_into, metrics_path, overflow_history_path, parse_profile, pid_start_time,
-    predictive_agent_path, rl_threshold_path, signal_intelligence_path, socket_path,
-    should_rotate_oldest, should_unfreeze, spotlight_set_indexing, timeline_path, unfreeze_pids,
+    predictive_agent_path, rl_threshold_path, signal_intelligence_path, skills_path,
+    socket_path, should_rotate_oldest, should_unfreeze, spotlight_set_indexing,
+    temporal_histograms_path, timeline_path, unfreeze_pids,
     wake_state_path, write_frozen_state, append_timeline,
     write_governor_state, write_metrics, write_wake_state,
 };
@@ -796,41 +799,50 @@ fn main() -> anyhow::Result<()> {
             let mut llm_advisor = LlmAdvisor::new(state.llm.lock_recover().llm_cfg.clone());
 
             // Secondary optimization modules — all run each cycle without locks.
-            let mut analytics = AnalyticsEngine::new();
-            let mut mem_analyzer = MemoryAnalyzer::new();
+            // Constructed via daemon_init::DaemonSubsystems::new() to keep this
+            // init block concise; immediately destructured into mut locals.
+            let daemon_init::DaemonSubsystems {
+                mut analytics,
+                mut mem_analyzer,
+                mut power_mgr,
+                mut proc_recovery,
+                mut swap_predictor,
+                mut syscall_classifier,
+                mut network_monitor,
+                mut thermal_mgr,
+                mut wake_storm,
+                mut darwin_anomaly,
+                net_optimizer,
+                mut energy_tracker,
+                mut outcome_tracker,
+                mut causal_graph,
+                mut neuromod,
+                mut skill_registry,
+                mut specialist_accuracy,
+                mut effectiveness_tracker,
+                mut cache_warmer,
+                mut display_turbo,
+                mut io_shaper,
+                mut thermal_bailout,
+                coalition_tracker,
+                mut action_queue,
+                mut learning_pipeline,
+                mut ioreport,
+                mut energy_pid_tracker,
+                mut cycle_ipc_tracker,
+            } = daemon_init::DaemonSubsystems::new();
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
             let hw_path = PathBuf::from(holt_winters_path());
             let mut holt_winters = HoltWinters::load(&hw_path).unwrap_or_default();
             let mut hw_last_hour: Option<u8> = None;
             let mut hw_pressure_accum: f64 = 0.0;
             let mut hw_pressure_count: u32 = 0;
-            let mut power_mgr = PowerManager::new();
-            let mut proc_recovery = ProcessRecoveryManager::new();
-            let mut swap_predictor = SwapPredictor::new();
-            let mut syscall_classifier = SyscallClassifier::new();
-            let mut network_monitor = NetworkMonitor::new();
             let mut sysctl_governor = SysctlGovernor::new(is_root);
             // Hardware capability scaling for SafetyPolicy::for_capabilities().
-            // Detected once at startup; cost is ~1ms for the sysinfo query.
-            let hw_cores: u32 = {
-                let mut s = sysinfo::System::new();
-                s.refresh_cpu();
-                s.cpus().len().max(1) as u32
-            };
-            let hw_ram_gb: f64 = {
-                let mut s = sysinfo::System::new();
-                s.refresh_memory();
-                s.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0)
-            };
-            let mut thermal_mgr = ThermalManager::new();
-            let mut wake_storm = WakeStormDetector::new();
+            // Detected once at startup via detect_hw_caps() (~1ms sysinfo query).
+            let (hw_cores, hw_ram_gb) = daemon_init::detect_hw_caps();
             // GPU thermal monitoring: integrates with thermal_manager for GPU-aware decisions.
             let gpu_mgr = GPUManager::new();
-            // Darwin-Boltzmann Anomaly Detector: replaces disabled TransformerPredictor
-            // with online Hopfield memory + evolving SAE population + free energy fusion.
-            let mut darwin_anomaly = EvolvedAnomalyDetector::new();
-            // Network profile optimizer: complements sysctl_governor with profile-driven tuning.
-            let net_optimizer = NetworkOptimizer::new();
             // Foreground detection: replaces get_foreground_app() with cached, richer detection.
             // Wrapped in Arc so it can be shared with the resource sentinel thread.
             // TTL raised from 200ms → 3s: daemon cycle is ~3s, lsappinfo subprocess
@@ -839,35 +851,12 @@ fn main() -> anyhow::Result<()> {
             let fg_detector = Arc::new(
                 ForegroundDetector::new().with_cache_ttl(Duration::from_secs(3)),
             );
-            // Per-app energy estimation: accumulates energy attribution each cycle.
-            let mut energy_tracker = EnergyTracker::new();
-            let mut outcome_tracker = OutcomeTracker::new();
-            outcome_tracker.load_hop_groups(std::path::Path::new(hop_groups_path()));
 
             // Habituation filter (Thompson & Spencer 1966, inspired by memoria-core).
             // Tracks per-process (cpu_bucket, rss_bucket, cycles_unchanged).
             // Processes unchanged for ≥5 cycles are skipped in decide_actions.
             const HABITUATION_THRESHOLD: u32 = 5;
             let mut habituation_map: HashMap<u32, (u8, u8, u32)> = HashMap::new();
-
-            // Causal graph (Pearl 2009, adapted from memoria-core/causal_inference.rs).
-            // Tracks action → outcome relationships with Bayesian confidence.
-            // "throttle:X → pressure_drop" edges inform future prioritization.
-            let mut causal_graph = CausalGraph::new();
-
-            // Neuromodulator (memoria-core/neuromodulator.rs):
-            // Bio-inspired parameter modulation — DA/NA/SE/ACh drive RL alpha,
-            // Dyna-Q steps, router zones, and exploration rate.
-            let mut neuromod = ApolloNeuromodulator::new();
-
-            // Optimization skills (Hermes self-improving skills pattern).
-            let mut skill_registry = SkillRegistry::new();
-            let skills_path = if is_root {
-                "/var/lib/apollo/optimization_skills.json"
-            } else {
-                "/tmp/apollo-optimization_skills.json"
-            };
-            skill_registry.load(std::path::Path::new(skills_path));
             // Track cycle-to-cycle wall time for energy dt calculation.
             let mut last_cycle_instant = Instant::now();
             // Audit fix #5: Background powermetrics polling (replaces 5-cycle IOKit tick).
@@ -894,10 +883,6 @@ fn main() -> anyhow::Result<()> {
             // Predictive agent: LinUCB contextual bandit for proactive interventions.
             let mut predictive_agent =
                 PredictiveAgent::load_or_default(std::path::Path::new(predictive_agent_path()));
-            // Specialist accuracy tracker: EMA per-specialist confidence weights.
-            // Starts at 0.70 (matching legacy hardcoded multipliers) and adapts.
-            let mut specialist_accuracy = SpecialistAccuracyTracker::new();
-            let mut effectiveness_tracker = EffectivenessTracker::new();
             // Track previous cycle pressure to detect spikes (for accuracy feedback).
             let mut prev_pressure_smooth: f64 = 0.0;
             // Track previous cycle's actual specialist firing signals for accurate
@@ -986,44 +971,22 @@ fn main() -> anyhow::Result<()> {
                 }
                 restore_monitor = RestoreQualityMonitor::new();
             }
-            // File cache warmer: pre-read predicted app executables into buffer cache.
-            // Cao et al. 1994 — app-controlled prefetch eliminates cold page faults.
-            let mut cache_warmer = apollo_optimizer::engine::cache_warmer::CacheWarmer::new();
-            // Display-Off Turbo: Android Doze-like mode for macOS.
-            // Project Volta (Google 2014) — freeze non-essential when display off,
-            // instant restore on wake. Saves 15-25% battery (Chuang et al. 2013).
-            let mut display_turbo = apollo_optimizer::engine::display_turbo::DisplayTurbo::new();
             // Temporal app predictor: time-of-day aware app launch prediction.
             // Shin et al. 2012 — temporal patterns predict app launches with ~80% accuracy.
             // Combined with Markov chain for 85% top-3 accuracy (Baeza-Yates et al. 2015).
-            let temporal_path = if unsafe { libc::geteuid() } == 0 {
-                std::path::PathBuf::from("/var/lib/apollo/temporal_histograms.json")
-            } else {
-                std::path::PathBuf::from("/tmp/apollo-temporal_histograms.json")
-            };
             let mut temporal_predictor =
-                apollo_optimizer::engine::temporal_predictor::TemporalPredictor::new(temporal_path);
-            // I/O Traffic Shaper: foreground-aware disk bandwidth allocation.
-            // Iyer & Druschel 2001 — anticipatory scheduling reduces foreground I/O
-            // latency by 50-70% under concurrent background load.
-            let mut io_shaper = apollo_optimizer::engine::io_tiering::IoShaper::new();
+                apollo_optimizer::engine::temporal_predictor::TemporalPredictor::new(
+                    std::path::PathBuf::from(temporal_histograms_path()),
+                );
             // Adaptive Page Reclaim: pressure-driven file cache purging.
             // Jiang & Zhang 2005 — proactive reclaim of low-IRR pages outperforms
             // reactive LRU eviction by 20-40% in cache hit ratio.
             let mut page_reclaim =
                 apollo_optimizer::engine::page_reclaim::PageReclaim::new(is_root);
-            // Audit fix #6: Multi-phase thermal bail-out with hysteresis.
-            let mut thermal_bailout = ThermalBailout::new();
-
-            // ── Coalition tracker (kernel-authoritative process families) ─────
-            // Groups app + all XPC/GPU/framework helpers by kernel coalition ID.
-            // Used to augment foreground family detection beyond heuristic name-matching.
-            let coalition_tracker = CoalitionTracker::new();
 
             // ── IOReport reader (hardware telemetry without subprocess overhead) ─
             // Provides P/E cluster utilization, GPU%, ANE activity, per-component mW.
             // Samples the first baseline here; delta is computed each cycle.
-            let mut ioreport = IOReportReader::new();
             if ioreport.available {
                 #[cfg(target_os = "macos")]
                 ioreport.begin_sample();
@@ -1091,22 +1054,6 @@ fn main() -> anyhow::Result<()> {
             } else {
                 println!("[rosetta] Rosetta not installed or /var/db/oah inaccessible");
             }
-
-            // ── Per-Process Energy Ranking (ri_billed_energy) ────────────────
-            let mut energy_pid_tracker = apollo_optimizer::engine::energy_pid::EnergyPidTracker::new();
-
-            // ── Daemon self-IPC monitoring (thread_selfcounts syscall 186) ───
-            let mut cycle_ipc_tracker = apollo_optimizer::engine::thread_selfcounts::CycleIpcTracker::new();
-
-            // Priority action queue: buffers decide_actions output and dispatches at most
-            // max_per_cycle actions per cycle. Unfreeze (urgent) is never capped.
-            // Capacity=100 defines the denominator for backpressure_ratio reporting.
-            let mut action_queue = ActionQueue::new(20, 100);
-
-            // Unified learning pipeline: fans out resolved throttle outcomes to
-            // OutcomeTracker, CausalGraph, and SkillRegistry coherently (mini-batch=8).
-            // Cross-feeds: OutcomeTracker→Skill, Causal→Skill, Skill→Outcome.
-            let mut learning_pipeline = LearningPipeline::new();
 
             // Freeze confirmation cache: pid → consecutive cycles flagged.
             // Only freeze processes that have been candidates for 2+ cycles,
@@ -4721,295 +4668,31 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Outcome tracking: registra los throttles ejecutados esta ronda.
-                // Necesitamos el proceso + watts actuales + presión antes.
-                if exec_outcomes.throttles_applied > 0 {
-                    let cpu_watts = cycle_hw_snap
-                        .as_ref()
-                        .and_then(|h| h.power.cpu_watts)
-                        .unwrap_or(0.0) as f64;
-                    let total_cpu_pct: f64 = snapshot
-                        .top_processes
-                        .iter()
-                        .map(|p| p.cpu_usage as f64)
-                        .sum::<f64>()
-                        .max(0.01);
-                    let mem_pressure_now = snapshot.pressure.memory_pressure;
-                    for name in &throttle_names_for_outcome {
-                        let proc_watts = snapshot
-                            .top_processes
-                            .iter()
-                            .find(|p| &p.name == name)
-                            .map(|p| (p.cpu_usage as f64 / total_cpu_pct) * cpu_watts)
-                            .unwrap_or(0.0);
-                        lctx.outcome_tracker.record_throttle(name, mem_pressure_now, proc_watts);
-                    }
-                }
-
-                // ── Causal graph (Pearl 2009, memoria-core/causal_inference.rs) ──
-                // Record throttle/freeze actions for causal evaluation.
-                // Each action becomes a pending observation; eval_delay cycles later
-                // we check if pressure actually dropped (cause → effect).
-                {
-                    let pressure_now = snapshot.pressure.memory_pressure as f32;
-                    for name in &throttle_names_for_outcome {
-                        lctx.causal_graph.record_action(
-                            &format!("throttle:{}", name),
-                            pressure_now,
-                            cycle_count,
-                        );
-                    }
-                    // Also record freeze actions — only PIDs frozen THIS cycle, not all active ones.
-                    // Using exec_outcomes.newly_frozen_pids avoids double-counting PIDs that have
-                    // been frozen across multiple previous cycles (would inflate causal scores).
-                    for &pid in &exec_outcomes.newly_frozen_pids {
-                        if let Some(process) = collector.system().process(sysinfo::Pid::from_u32(pid)) {
-                            lctx.causal_graph.record_action(
-                                &format!("freeze:{}", process.name()),
-                                pressure_now,
-                                cycle_count,
-                            );
-                        }
-                    }
-                    // Evaluate pending actions: did pressure actually drop?
-                    lctx.causal_graph.evaluate(pressure_now, cycle_count);
-                }
-
-                // Causal graph: record process co-occurrence during high-pressure events.
-                if snapshot.pressure.memory_pressure >= 0.60 {
-                    let active: Vec<String> = snapshot.top_processes
-                        .iter()
-                        .take(10)
-                        .map(|p| p.name.clone())
-                        .collect();
-                    lctx.outcome_tracker.record_co_occurrence(&active);
-                }
-
-                // Counterfactual: observe pressure drift. If no throttles this cycle,
-                // the tracker learns the natural drift rate (what happens without action).
-                lctx.outcome_tracker.observe_cycle(
-                    snapshot.pressure.memory_pressure,
-                    !throttle_names_for_outcome.is_empty(),
+                // Learning tick: outcome tracking, causal graph, RL cables, predictive
+                // agent, and periodic persist (every 100 cycles). Extracted to
+                // learning_tick.rs for readability; behaviour is unchanged.
+                learning_tick::run_learning_tick(
+                    &snapshot,
+                    &cycle_hw_snap,
+                    &exec_outcomes,
+                    &throttle_names_for_outcome,
+                    &signal_digest,
+                    workload_mode,
+                    cycle_count,
+                    &state,
+                    &collector,
+                    &mut lctx,
+                    &mut learning_pipeline,
+                    &mut effectiveness_tracker,
+                    &mut restore_monitor,
+                    &mut last_restore_quality,
+                    &mut prev_package_watts,
+                    &mut prev_workload_mode,
+                    pending_trial_skill.clone(),
+                    ls_path,
+                    persist_generations,
+                    skills_path,
                 );
-
-                // Outcome tracker tick: resuelve outcomes de hace 30s, actualiza pesos y energy savings.
-                {
-                    let batch = lctx.outcome_tracker.tick(snapshot.pressure.memory_pressure);
-                    if batch.savings_watts > 0.0 {
-                        lctx.energy_tracker.record_savings(batch.savings_watts, 30.0);
-                    }
-                    // Cable 1: causal_effect() → correct PatternWeight using real causal signal.
-                    // For each effective throttle, check if the drop was truly caused by the
-                    // action (causal_effect > 0) or just natural drift. Demote weights that
-                    // only appear effective due to natural pressure fluctuation.
-                    if !batch.effective_names.is_empty() {
-                        let drift = lctx.outcome_tracker.natural_drift();
-                        if drift > 0.01 {
-                            // Pre-compute causal effects per process before mutating weights.
-                            let demotions: Vec<String> = batch.effective_names.iter().filter_map(|name| {
-                                let avg_drop = lctx.outcome_tracker.experience
-                                    .query_similar(name, snapshot.pressure.memory_pressure)
-                                    .map(|(drop, _)| drop)
-                                    .unwrap_or(0.05);
-                                let causal = lctx.outcome_tracker.causal_effect(avg_drop);
-                                if causal < 0.005 { Some(name.clone()) } else { None }
-                            }).collect();
-                            // Now mutate: roll back effective_count for drift-only "successes".
-                            for name in &demotions {
-                                if let Some(w) = lctx.outcome_tracker.weights.get_mut(name) {
-                                    if w.effective_count > 0 {
-                                        w.effective_count -= 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Sincroniza pesos Bayesianos a la LearnedPolicy persistida.
-                    if !batch.effective_names.is_empty() || !batch.low_value_names.is_empty() {
-                        let mut pg = state.policy.lock_recover();
-                        for (name, weight) in &lctx.outcome_tracker.weights {
-                            pg.learned_policy.pattern_weights.insert(name.clone(), weight.clone());
-                        }
-                    }
-                    // Restore quality monitor: track post-restore effectiveness.
-                    if !restore_monitor.is_done() {
-                        let batch_eff = batch.effective_names.len() as u32;
-                        let batch_res = (batch.effective_names.len() + batch.low_value_names.len()) as u32;
-                        restore_monitor.observe(batch_eff, batch_res);
-                        if let Some(verdict) = restore_monitor.verdict() {
-                            last_restore_quality = Some(verdict.quality);
-                            if verdict.stale {
-                                lctx.signal_intel.reset_zones();
-                            }
-                        }
-                    }
-
-                    // LearningPipeline: fan out resolved outcomes to all three learners.
-                    // Each resolved throttle becomes a LearningObservation with the
-                    // pre/post pressure captured by tick(). Cross-feeds are applied
-                    // at batch flush (every 8 observations or at persist time).
-                    for (name, pre_pressure, post_pressure) in batch.resolved_outcomes {
-                        let obs = LearningObservation {
-                            process_name: name,
-                            skill_name: None, // skill attribution tracked by pending_trial_skill path
-                            pre_pressure,
-                            post_pressure,
-                            workload: workload_mode.as_str().to_string(),
-                            cycle: cycle_count,
-                        };
-                        learning_pipeline.push(
-                            obs,
-                            lctx.outcome_tracker,
-                            lctx.causal_graph,
-                            lctx.skill_registry,
-                            &mut effectiveness_tracker,
-                        );
-                    }
-                }
-
-                // Lifelong zone learning: feed outcome effectiveness to router zones.
-                // Effective actions → lower zone thresholds (engage earlier).
-                // Ineffective actions → raise thresholds (be more conservative).
-                {
-                    let effectiveness = lctx.outcome_tracker.overall_effectiveness();
-                    let pressure = signal_digest.pressure_smooth;
-                    if lctx.outcome_tracker.total_resolved > 10 {
-                        lctx.signal_intel.zone_feedback(pressure, effectiveness > 0.50);
-                    }
-                }
-
-                // Cable A: OutcomeTracker → RL reward signal.
-                // When throttling is wasteful (low-value patterns detected),
-                // penalize the RL agent so it learns to adjust thresholds.
-                {
-                    let penalty = lctx.outcome_tracker.rl_penalty();
-                    if penalty < 0.0 {
-                        if let Some(rl) = &mut lctx.overflow_guard.rl_agent {
-                            rl.inject_external_reward(penalty);
-                        }
-                    }
-                }
-
-                // Cable D: Power-reduction reward → RL.
-                // When package_watts drops cycle-over-cycle, the RL policy
-                // did something good — reinforce it. M1 Air idle ~1-3W, active
-                // ~5-15W. A 1W+ reduction is meaningful; cap at 5W (→ +0.3).
-                {
-                    let curr_w = cycle_hw_snap
-                        .as_ref()
-                        .and_then(|h| h.power.package_watts)
-                        .map(|w| w as f64);
-                    if let (Some(prev), Some(curr)) = (prev_package_watts, curr_w) {
-                        let delta = (prev - curr).max(0.0);
-                        if delta > 1.0 {
-                            let power_reward = (delta / 5.0 * 0.3).clamp(0.0, 0.3);
-                            if let Some(rl) = &mut lctx.overflow_guard.rl_agent {
-                                rl.inject_external_reward(power_reward);
-                            }
-                        }
-                    }
-                    prev_package_watts = curr_w;
-                }
-                prev_workload_mode = workload_mode;
-
-                // Dr. Zero feedback loop: read external score from watcher's
-                // autoresearch and use it to reinforce/penalize the RL agent.
-                // File written by watch-deploy.sh after each autoresearch run.
-                if cycle_count % 60 == 30 {
-                    if let Ok(data) = std::fs::read_to_string("/tmp/apollo-dr-zero-feedback.json") {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                            if let Some(score) = v.get("score").and_then(|s| s.as_f64()) {
-                                // Normalize: score 90+ is good (reward), <70 is bad (penalty).
-                                // Range maps to [-0.3, +0.3] RL reward.
-                                let reward = ((score - 80.0) / 33.3).clamp(-0.3, 0.3);
-                                if let Some(rl) = &mut lctx.overflow_guard.rl_agent {
-                                    rl.inject_external_reward(reward);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Predictive agent: observe outcome and update model.
-                lctx.predictive_agent.observe_outcome(snapshot.pressure.memory_pressure);
-                lctx.predictive_agent.maybe_persist();
-                // MPC feedback: tell MPC what happened after its recommendation.
-                lctx.signal_intel.mpc_feedback(
-                    signal_digest.mpc_recommendation,
-                    signal_digest.pressure_smooth,
-                    snapshot.pressure.memory_pressure,
-                );
-                // Persist signal intelligence state every 100 cycles so hazard model + MPC
-                // effects survive crashes (not just clean shutdowns).
-                if cycle_count % 100 == 0 {
-                    // Flush any buffered observations before persisting state.
-                    learning_pipeline.flush_remaining(
-                        lctx.outcome_tracker,
-                        lctx.causal_graph,
-                        lctx.skill_registry,
-                        &mut effectiveness_tracker,
-                    );
-                    lctx.signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
-                    lctx.outcome_tracker.persist_hop_groups(std::path::Path::new(hop_groups_path()));
-                    // Snapshot frozen state for unified persistence.
-                    let frozen_snap: FrozenStatePersisted = {
-                        let fg = state.frozen_state.lock_recover();
-                        FrozenStatePersisted {
-                            frozen: fg
-                                .iter()
-                                .map(|(pid, e)| FrozenPidEntry {
-                                    pid: *pid,
-                                    since: e.frozen_at,
-                                    name: e.process_name.clone(),
-                                })
-                                .collect(),
-                        }
-                    };
-                    LearnedState::persist_improved(
-                        lctx.signal_intel,
-                        lctx.outcome_tracker,
-                        lctx.specialist_accuracy,
-                        lctx.skill_registry,
-                        &effectiveness_tracker,
-                        Some(lctx.overflow_guard.export_history()),
-                        Some(frozen_snap),
-                        ls_path,
-                        persist_generations,
-                        last_restore_quality,
-                        pending_trial_skill.clone(),
-                    );
-                    // Causal graph observability: log solid/weak links discovered.
-                    let solid = lctx.causal_graph.solid_count();
-                    let total = lctx.causal_graph.edge_count();
-                    if total > 0 {
-                        println!("lctx.causal_graph: {}/{} edges solid, {} pending",
-                            solid, total, lctx.causal_graph.solid_edges().len());
-                    }
-                    // Persist optimization skills (Hermes pattern).
-                    lctx.skill_registry.persist(std::path::Path::new(skills_path));
-                    // Learn skills from causal graph solid edges, ordered by impact.
-                    // solid_edges_by_impact() sorts by confidence×avg_delta so high-impact
-                    // actions (large pressure reduction) are learned with higher priority.
-                    for edge in lctx.causal_graph.solid_edges_by_impact() {
-                        if edge.cause.starts_with("throttle:") {
-                            let target = edge.cause.trim_start_matches("throttle:");
-                            // Scale trigger pressure by impact: high-impact actions activate
-                            // at lower pressure (proactive), low-impact ones wait for more pressure.
-                            let trigger_pressure = if edge.avg_delta > 0.08 {
-                                0.55 // proactive: high-impact action, use early
-                            } else {
-                                0.65 // conservative: low-impact action, wait
-                            };
-                            lctx.skill_registry.learn(
-                                &edge.cause,
-                                trigger_pressure,
-                                "any",
-                                vec![target.to_string()],
-                            );
-                            lctx.skill_registry.record_result(&edge.cause, edge.confidence > 0.5);
-                        }
-                    }
-                }
                 // Autonomous rule induction: mine experience memory + co-occurrence
                 // graph for new skills every 100 cycles (~50s).  No human needed —
                 // Apollo crystallizes its own observations into reusable rules.
