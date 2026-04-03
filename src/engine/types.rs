@@ -888,3 +888,128 @@ pub struct HealthReport {
     /// Total degradation mode transitions (lifetime).
     pub degradation_transitions: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── OptimizationProfile roundtrip ─────────────────────────────────────────
+
+    #[test]
+    fn optimization_profile_roundtrip() {
+        for profile in [
+            OptimizationProfile::BalancedRoot,
+            OptimizationProfile::AggressiveRoot,
+            OptimizationProfile::SafeRoot,
+        ] {
+            let json = serde_json::to_string(&profile).expect("serialize OptimizationProfile");
+            let rt: OptimizationProfile =
+                serde_json::from_str(&json).expect("deserialize OptimizationProfile");
+            assert_eq!(rt, profile);
+        }
+    }
+
+    #[test]
+    fn optimization_profile_kebab_case_in_json() {
+        let json = serde_json::to_string(&OptimizationProfile::BalancedRoot)
+            .expect("serialize OptimizationProfile");
+        assert!(
+            json.contains('-'),
+            "expected kebab-case dash in JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn optimization_profile_as_str_matches_json() {
+        assert_eq!(OptimizationProfile::BalancedRoot.as_str(), "balanced-root");
+        assert_eq!(
+            OptimizationProfile::AggressiveRoot.as_str(),
+            "aggressive-root"
+        );
+        assert_eq!(OptimizationProfile::SafeRoot.as_str(), "safe-root");
+    }
+
+    // ── LatencyTarget roundtrip ───────────────────────────────────────────────
+
+    #[test]
+    fn latency_target_roundtrip() {
+        for target in [LatencyTarget::Low, LatencyTarget::Normal, LatencyTarget::Max] {
+            let json = serde_json::to_string(&target).expect("serialize LatencyTarget");
+            let rt: LatencyTarget =
+                serde_json::from_str(&json).expect("deserialize LatencyTarget");
+            assert_eq!(rt, target);
+        }
+    }
+
+    #[test]
+    fn latency_target_default_is_normal() {
+        assert_eq!(LatencyTarget::default(), LatencyTarget::Normal);
+    }
+
+    // ── FrozenEntry roundtrip ─────────────────────────────────────────────────
+
+    #[test]
+    fn frozen_entry_roundtrip() {
+        let entry = FrozenEntry {
+            frozen_at: chrono::Utc::now(),
+            source: FreezeSource::MainLoop,
+            pressure_at_freeze: 0.75,
+            process_name: Some("TestProcess".to_string()),
+        };
+        let json = serde_json::to_string(&entry).expect("serialize FrozenEntry");
+        let rt: FrozenEntry = serde_json::from_str(&json).expect("deserialize FrozenEntry");
+        assert_eq!(rt.pressure_at_freeze, entry.pressure_at_freeze);
+        assert_eq!(rt.process_name, entry.process_name);
+    }
+
+    // ── BlockerScore roundtrip ────────────────────────────────────────────────
+
+    #[test]
+    fn blocker_score_roundtrip() {
+        let score = BlockerScore {
+            name: "com.example.app".to_string(),
+            pid: 1234,
+            score: 0.85,
+            blocker_cpu_spike: 0.5,
+            interactive_wait_ratio: 0.3,
+            blocker_seen_recently: true,
+            reactor_event_weight: 1.0,
+        };
+        let json = serde_json::to_string(&score).expect("serialize BlockerScore");
+        let rt: BlockerScore = serde_json::from_str(&json).expect("deserialize BlockerScore");
+        assert_eq!(rt.name, score.name);
+        assert_eq!(rt.pid, score.pid);
+        assert!((rt.score - score.score).abs() < f64::EPSILON);
+    }
+
+    // ── RuntimeMetrics no NaN ─────────────────────────────────────────────────
+
+    #[test]
+    fn runtime_metrics_default_no_nan_f64() {
+        let m = RuntimeMetrics::default();
+        assert!(
+            !m.p95_cycle_ms.is_nan(),
+            "p95_cycle_ms should not be NaN"
+        );
+        assert!(
+            !m.last_pressure_score.is_nan(),
+            "last_pressure_score should not be NaN"
+        );
+        assert!(
+            !m.swap_delta_bps.is_nan(),
+            "swap_delta_bps should not be NaN"
+        );
+        assert!(
+            !m.memory_pressure.is_nan(),
+            "memory_pressure should not be NaN"
+        );
+    }
+
+    #[test]
+    fn runtime_metrics_default_cycles_zero() {
+        let m = RuntimeMetrics::default();
+        assert_eq!(m.cycles, 0);
+        assert_eq!(m.boosts_applied, 0);
+        assert_eq!(m.failures, 0);
+    }
+}
