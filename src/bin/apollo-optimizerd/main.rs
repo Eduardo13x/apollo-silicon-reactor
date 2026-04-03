@@ -133,7 +133,9 @@ use clap::{Parser, Subcommand};
 
 // v0.9.0: ACL alias — DomainSharedState is the grouped version being migrated to
 #[allow(unused_imports)]
-use apollo_optimizer::engine::daemon_state::{ProcessState, SharedState as DomainSharedState};
+use apollo_optimizer::engine::daemon_state::{
+    ProcessState, SharedState as DomainSharedState, UsageDomainState, UsageTrackerState,
+};
 
 // FREEZE_TTL_SECS → daemon_helpers
 const REACTOR_FAST_TICK_SECS: u64 = 30;
@@ -193,10 +195,7 @@ pub(crate) struct SharedState {
 
     pub(crate) config_path: PathBuf,
 
-    pub(crate) usage_model: Arc<Mutex<UsageModel>>,
-    pub(crate) usage_model_path: PathBuf,
-    pub(crate) usage_events_path: PathBuf,
-    pub(crate) usage_tracker: Arc<Mutex<UsageTrackerState>>,
+    pub(crate) usage: Arc<Mutex<UsageDomainState>>,
 
     // Heuristic modules
     pub(crate) adaptive_governor: Arc<Mutex<AdaptiveGovernor>>,
@@ -254,13 +253,7 @@ impl Default for ReactorStatus {
     }
 }
 
-/// Usage model lifecycle counters — 3 fields merged into 1 Mutex.
-#[derive(Default)]
-struct UsageTrackerState {
-    last_persist_at: Option<DateTime<Utc>>,
-    promotions_day: Option<String>,
-    promotions_today: u32,
-}
+// UsageTrackerState → daemon_state (PR#13: unified single definition)
 
 // WakeStatePersisted, WakeRuntimeState → daemon_helpers
 
@@ -635,10 +628,12 @@ fn main() -> anyhow::Result<()> {
 
                 config_path,
 
-                usage_model: Arc::new(Mutex::new(usage_model)),
-                usage_model_path,
-                usage_events_path,
-                usage_tracker: Arc::new(Mutex::new(UsageTrackerState::default())),
+                usage: Arc::new(Mutex::new(UsageDomainState {
+                    usage_model,
+                    usage_model_path,
+                    usage_events_path,
+                    usage_tracker: UsageTrackerState::default(),
+                })),
 
                 adaptive_governor: Arc::new(Mutex::new(AdaptiveGovernor::new())),
                 mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
@@ -1657,13 +1652,13 @@ fn main() -> anyhow::Result<()> {
                 // Memory budgets: compute and enforce jetsam limits when pressure ≥ 0.60.
                 // Only recompute under pressure to avoid unnecessary syscalls in idle.
                 if snapshot.pressure.memory_pressure >= 0.60 {
-                    let usage_model = state.usage_model.lock_recover();
+                    let usage_guard = state.usage.lock_recover();
                     let budget_inputs: Vec<ProcessBudgetInput> = proc_snaps
                         .iter()
                         .take(30) // Top 30 processes
                         .filter(|s| s.rss_bytes > 50 * 1024 * 1024) // Only >50MB
                         .map(|s| {
-                            let (presence, interactive) = usage_model
+                            let (presence, interactive) = usage_guard.usage_model
                                 .entries()
                                 .get(&s.name.to_ascii_lowercase())
                                 .map(|e| (e.presence_ema, e.interactive_ema))
@@ -1692,7 +1687,7 @@ fn main() -> anyhow::Result<()> {
                             }
                         })
                         .collect();
-                    drop(usage_model);
+                    drop(usage_guard);
 
                     if !budget_inputs.is_empty() {
                         let budgets = memory_budget::compute_budgets(
@@ -2981,8 +2976,8 @@ fn main() -> anyhow::Result<()> {
                 // JIT-compiling PIDs (from syscall_classifier) are merged in so that
                 // decide_actions treats them as interactive and skips throttling.
                 let behavior_interactive_pids: HashSet<u32> = {
-                    let model = state.usage_model.lock_recover();
-                    let interactive_names: HashSet<&str> = model
+                    let model = state.usage.lock_recover();
+                    let interactive_names: HashSet<&str> = model.usage_model
                         .entries()
                         .iter()
                         .filter(|(_, entry)| {

@@ -542,8 +542,8 @@ pub fn usage_learning_tick(
         );
 
     {
-        let mut model = state.usage_model.lock_recover();
-        model.update_from_snapshot(
+        let mut usage = state.usage.lock_recover();
+        usage.usage_model.update_from_snapshot(
             snapshot,
             now,
             interactive_proxy,
@@ -555,35 +555,32 @@ pub fn usage_learning_tick(
 
     // Persist usage model periodically (every ~2 minutes).
     {
-        let tracker = state.usage_tracker.lock_recover();
-        let due = tracker
+        let mut usage = state.usage.lock_recover();
+        let due = usage.usage_tracker
             .last_persist_at
             .map(|t| now - t > ChronoDuration::minutes(2))
             .unwrap_or(true);
         if due {
-            drop(tracker); // release before locking usage_model
-            {
-                let model = state.usage_model.lock_recover();
-                model.persist(&state.usage_model_path);
-            }
-            state.usage_tracker.lock_recover().last_persist_at = Some(now);
+            let path = usage.usage_model_path.clone();
+            usage.usage_model.persist(&path);
+            usage.usage_tracker.last_persist_at = Some(now);
         }
     }
 
     // Daily promotion counters (conservative).
     let today = Local::now().date_naive().to_string();
     let promotions_used = {
-        let mut tracker = state.usage_tracker.lock_recover();
-        if tracker.promotions_day.as_deref() != Some(&today) {
-            tracker.promotions_day = Some(today.clone());
-            tracker.promotions_today = 0;
+        let mut usage = state.usage.lock_recover();
+        if usage.usage_tracker.promotions_day.as_deref() != Some(&today) {
+            usage.usage_tracker.promotions_day = Some(today.clone());
+            usage.usage_tracker.promotions_today = 0;
         }
-        tracker.promotions_today
+        usage.usage_tracker.promotions_today
     };
     // Propose promotions without holding locks across scoring.
     let (started_at, existing_interactive, existing_noise, existing_protected) = {
-        let model = state.usage_model.lock_recover();
-        let started_at = model.top_report(1).model_started_at;
+        let model = state.usage.lock_recover();
+        let started_at = model.usage_model.top_report(1).model_started_at;
         drop(model);
         let policy = state.learned_policy.lock_recover().clone();
         (
@@ -594,8 +591,8 @@ pub fn usage_learning_tick(
         )
     };
     let promotions = {
-        let model = state.usage_model.lock_recover();
-        model.maybe_promote_patterns(
+        let model = state.usage.lock_recover();
+        model.usage_model.maybe_promote_patterns(
             now,
             &existing_interactive,
             &existing_noise,
@@ -659,9 +656,13 @@ pub fn usage_learning_tick(
     }
 
     if applied > 0 {
-        state.usage_tracker.lock_recover().promotions_today += applied;
+        let events_path = {
+            let mut usage = state.usage.lock_recover();
+            usage.usage_tracker.promotions_today += applied;
+            usage.usage_events_path.clone()
+        };
         append_jsonl(
-            &state.usage_events_path,
+            &events_path,
             &serde_json::json!({"at": now, "promotions": promotions}),
         );
     }

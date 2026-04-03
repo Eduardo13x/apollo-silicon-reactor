@@ -319,13 +319,13 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
         DaemonRequest::GetLlmStatus => DaemonResponse::LlmStatus(build_llm_status(state)),
         DaemonRequest::UsageTop { limit } => {
             let limit = limit.unwrap_or(10).clamp(3, 30);
-            let model = state.usage_model.lock_recover();
-            let report = model.top_report(limit);
+            let model = state.usage.lock_recover();
+            let report = model.usage_model.top_report(limit);
             DaemonResponse::Usage(UsageResponse::Top(report))
         }
         DaemonRequest::UsageExplain { name } => {
-            let model = state.usage_model.lock_recover();
-            match model.entry_summary(&name) {
+            let model = state.usage.lock_recover();
+            match model.usage_model.entry_summary(&name) {
                 Some(s) => DaemonResponse::Usage(UsageResponse::Explain(s)),
                 None => DaemonResponse::Error {
                     message: "usage entry not found".to_string(),
