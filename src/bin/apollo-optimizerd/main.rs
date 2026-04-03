@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 /// that the main loop checks alongside `state.stop`.
 mod daemon_init;
 mod learning_tick;
+mod metrics_reporter;
 mod llm_daemon;
 mod process_enrichment;
 mod socket_handler;
@@ -4736,275 +4737,52 @@ fn main() -> anyhow::Result<()> {
                     // Persist temporal predictor state.
                     temporal_predictor.persist();
                 }
-                // Update predictive agent + signal intelligence metrics for status reporting.
-                {
-                    let mut m = state.metrics.lock_recover();
-                    m.metrics.predictive_agent_active = lctx.predictive_agent.is_active();
-                    m.metrics.predictive_agent_cycles = lctx.predictive_agent.total_cycles();
-                    m.metrics.predictive_agent_arm_pulls = lctx.predictive_agent.arm_pulls();
-                    m.metrics.predictive_agent_last_intervention = format!("{:?}", agent_intervention);
-                    m.metrics.si_pressure_smooth = signal_digest.pressure_smooth;
-                    m.metrics.si_pressure_velocity = signal_digest.pressure_velocity;
-                    m.metrics.si_p_oom_30s = signal_digest.p_oom_30s;
-                    m.metrics.si_urgency = signal_digest.urgency;
-                    if signal_digest.regime_shift_up {
-                        m.metrics.si_regime_shifts += 1;
-                    }
-                    m.metrics.si_monopoly_risk = signal_digest.monopoly_risk;
-                    m.metrics.si_entropy_anomaly = signal_digest.entropy_anomaly;
-                    // Cable 4: top_causal_pairs() → expose in metrics for observability.
-                    m.metrics.causal_pairs = lctx.outcome_tracker.top_causal_pairs(5)
-                        .iter()
-                        .map(|(a, b, c)| format!("{} + {} ({})", a, b, c))
-                        .collect();
-                    m.metrics.natural_drift = lctx.outcome_tracker.natural_drift();
-                    m.metrics.experience_memory_size = lctx.outcome_tracker.experience.len();
-                    // Causal effect average: mean effect across last resolved outcomes.
-                    m.metrics.causal_effect_avg = {
-                        let effectiveness = lctx.outcome_tracker.overall_effectiveness();
-                        let avg_drop = if lctx.outcome_tracker.total_resolved > 0 {
-                            effectiveness * 0.05
-                        } else {
-                            0.0
-                        };
-                        lctx.outcome_tracker.causal_effect(avg_drop)
-                    };
-                    // HRPO / Dr. Zero metrics
-                    m.metrics.dr_zero_self_challenge = lctx.outcome_tracker.self_challenge_score();
-                    m.metrics.dr_zero_groups = lctx.outcome_tracker.hop_group_summary()
-                        .iter()
-                        .map(|(hop, eff, count, pred_err)| {
-                            format!("{:?}(eff={:.0}% n={} err={:.2})", hop, eff * 100.0, count, pred_err)
-                        })
-                        .collect();
-                    m.metrics.dr_zero_exploration = lctx.outcome_tracker.exploration_needed()
-                        .iter()
-                        .map(|(hop, err)| format!("{:?}(err={:.2})", hop, err))
-                        .collect();
-                }
-
-                // I/O Traffic Shaping: foreground-aware disk bandwidth allocation.
-                // Iyer & Druschel 2001 — anticipatory scheduling + I/O priority classes
-                // reduce foreground I/O latency by 50-70% under concurrent background load.
-                // Runs every 20 cycles (~10s): MIN_REAPPLY_SECS=60 so nothing reapplies within 60s anyway.
-                if cycle_count % 20 == 0 && is_root {
-                    let fg_family_io = process_enrichment::build_foreground_family(foreground_pid, &process_tree);
-                    let fg_pids: Vec<u32> = fg_family_io.iter().copied().collect();
-                    let process_tiers: Vec<(
-                        u32,
-                        apollo_optimizer::engine::process_classifier::ProcessTier,
-                    )> = heuristic_decisions
-                        .iter()
-                        .map(|d| (d.pid, d.tier))
-                        .collect();
-                    let under_pressure = snapshot.pressure.memory_pressure + battery_pressure_boost(&power_mgr) + thermal_pressure_boost > 0.60;
-                    let mut qos = state.mach_qos.lock_recover();
-                    let io_changes =
-                        io_shaper.shape(&fg_pids, &process_tiers, under_pressure, Some(&mut qos));
-                    drop(qos);
-                    if io_changes > 0 {
-                        state.metrics.lock_recover().metrics.sysctl_reactive_writes += io_changes as u64;
-                    }
-                }
-
-                // F5 — MachQoS: route processes to P-Cores / E-Cores based on heuristic decisions.
-                // Skip SIGSTOP'd processes; force E-Cores for all during thermal emergency.
-                // Uses process tree to cascade Foreground tier to all children of the
-                // foreground app (e.g., Chrome Helper processes get P-core routing too).
-                {
-                    let frozen_pids: HashSet<u32> =
-                        state.frozen_state.lock_recover().keys().copied().collect();
-
-                    // Build the foreground family set from the process tree.
-                    let fg_family = process_enrichment::build_foreground_family(foreground_pid, &process_tree);
-
-                    let interrupt_frozen = state
-                        .resource_interrupt
-                        .interrupt_frozen_pids
-                        .try_lock()
-                        .ok()
-                        .map(|g| g.clone())
-                        .unwrap_or_default();
-                    let mut qos_changes: Vec<(u32, SchedulingTier)> = heuristic_decisions
-                        .iter()
-                        .filter(|d| {
-                            !frozen_pids.contains(&d.pid)
-                                && !heuristic_critical_pids.contains(&d.pid)
-                                && !interrupt_frozen.contains(&d.pid)
-                        })
-                        .filter_map(|decision| {
-                            let tier = if thermal_action.force_ecores && !fg_family.contains(&decision.pid) {
-                                // Thermal pre-throttle: route backgrounds to E-Cores at Phase2+ (85°C).
-                                // Foreground app stays on P-Cores for responsiveness.
-                                SchedulingTier::Background
-                            } else if fg_family.contains(&decision.pid) {
-                                // Process tree cascade: children of the foreground app
-                                // get Foreground tier even if the heuristic didn't
-                                // classify them as ActiveForeground by name alone.
-                                SchedulingTier::Foreground
-                            } else {
-                                match decision.decision {
-                                    GovernorDecision::Allow => {
-                                        if decision.tier == ProcessTier::ActiveForeground {
-                                            SchedulingTier::Foreground
-                                        } else {
-                                            // Normal/TASK_UNSPECIFIED is a no-op — skip the
-                                            // syscall to avoid wasting task_for_pid on ~400
-                                            // processes that either don't need changes or are
-                                            // SIP-protected and always fail.
-                                            return None;
-                                        }
-                                    }
-                                    GovernorDecision::Throttle => return None,
-                                    GovernorDecision::Freeze | GovernorDecision::Kill => {
-                                        SchedulingTier::Background
-                                    }
-                                }
-                            };
-                            Some((decision.pid, tier))
-                        })
-                        .collect();
-
-                    // Deduplicate: if a PID appeared in both heuristic decisions and
-                    // fg_family cascade, the last entry wins (which is fine since both
-                    // would map to Foreground). The MachQoSManager handles dupes internally.
-                    let _ = &mut qos_changes; // suppress unused_mut if no further manipulation
-
-                    let mut qos = state.mach_qos.lock_recover();
-                    // GC dead PIDs every 30 cycles to prevent unbounded growth
-                    // and handle PID recycling (recycled PID must be re-evaluated).
-                    if cycle_count % 30 == 0 {
-                        qos.gc_dead_pids();
-                    }
-                    let outcomes = qos.apply_batch(&qos_changes);
-                    {
-                        let mut m = state.metrics.lock_recover();
-                        m.metrics.qos_foreground_count += outcomes
-                            .iter()
-                            .filter(|o| o.tier == SchedulingTier::Foreground && o.success)
-                            .count() as u64;
-                        m.metrics.qos_background_count += outcomes
-                            .iter()
-                            .filter(|o| o.tier == SchedulingTier::Background && o.success)
-                            .count() as u64;
-                        m.metrics.qos_errors += outcomes.iter().filter(|o| !o.success).count() as u64;
-                    }
-                }
-
-                // Phase 3: Merge outcomes into metrics (reacquire lock after I/O).
-                {
-                    let mut metrics = state.metrics.lock_recover();
-                    metrics.metrics.boosts_applied += exec_outcomes.boosts_applied;
-                    metrics.metrics.throttles_applied += exec_outcomes.throttles_applied;
-                    metrics.metrics.freezes_applied += exec_outcomes.freezes_applied;
-                    metrics.metrics.unfreezes_applied += exec_outcomes.unfreezes_applied;
-                    metrics.metrics.paging_hints_applied += exec_outcomes.paging_hints_applied;
-                    metrics.metrics.sysctl_applied += exec_outcomes.sysctl_applied;
-                    metrics.metrics.failures += exec_outcomes.failures;
-                    if let Some(e) = exec_outcomes.last_error {
-                        metrics.metrics.last_error = Some(e);
-                    }
-                    metrics.metrics.critical_background_skips += exec_outcomes.critical_background_skips;
-                    metrics.metrics.invalid_sysctl_denied += exec_outcomes.invalid_sysctl_denied;
-                    for skip in exec_outcomes.top_skipped {
-                        if metrics.metrics.top_skipped_processes.len() < 12
-                            && !metrics.metrics.top_skipped_processes.contains(&skip)
-                        {
-                            metrics.metrics.top_skipped_processes.push(skip);
-                        }
-                    }
-                    metrics.metrics.top_skipped_processes.truncate(12);
-                    metrics.metrics.throttle_reverted += exec_outcomes.throttle_reverted;
-                    metrics.metrics.thread_qos_applied += exec_outcomes.thread_qos_applied;
-
-                    // SysctlGovernor + NetworkMonitor metrics.
-                    metrics.metrics.sysctl_reactive_writes += exec_outcomes.sysctl_applied;
-                    {
-                        let hw = state.hardware.lock_recover();
-                        metrics.metrics.sysctl_governor_active_tunings = hw.sysctl_governor_status.active_tunings;
-                        metrics.metrics.sysctl_governor_total_writes = hw.sysctl_governor_status.total_writes;
-                    }
-                    metrics.metrics.network_retransmit_ratio = network_monitor.retransmission_rate();
-                    metrics.metrics.network_listen_drop_rate = network_monitor.listen_drop_rate();
-
-                    let had_new_failures = exec_outcomes.failures > 0;
-
-                    metrics.metrics.cycles += 1;
-                    metrics.metrics.reactor_pulses += if decision.reactor_event_weight > 0.2 {
-                        1
-                    } else {
-                        0
-                    };
-                    metrics.metrics.last_cycle_at = Some(Utc::now());
-                    metrics.metrics.last_blockers = decision.blockers;
-                    metrics.metrics.effective_profile = current_profile;
-                    metrics.throttle_level = governor_decision.throttle_level.clone();
-                    metrics.metrics.throttle_level = governor_decision.throttle_level.clone();
-                    // Use MetricsState.thermal_state (set by reactor) — no re-lock needed
-                    metrics.metrics.thermal_state = metrics.thermal_state.clone();
-                    metrics.metrics.last_pressure_score = governor_decision.pressure_score;
-                    if governor_decision.override_expired {
-                        metrics.metrics.override_expirations += 1;
-                    }
-                    if governor_decision.override_active && !override_was_active {
-                        metrics.metrics.override_activations += 1;
-                    }
-                    if let Some(transition) = governor_decision.transition.clone() {
-                        metrics.metrics.profile_switches += 1;
-                        {
-                            let mut pg = state.policy.lock_recover();
-                            pg.timeline.push_back(transition.clone());
-                            if pg.timeline.len() > 200 {
-                                pg.timeline.pop_front();
-                            }
-                        }
-                        append_timeline(&timeline_path, &transition);
-                    }
-                    override_was_active = governor_decision.override_active;
-
-                    let elapsed = cycle_start.elapsed().as_millis() as u64;
-                    metrics.metrics.cycle_durations_ms.push_back(elapsed);
-                    if metrics.metrics.cycle_durations_ms.len() > 120 {
-                        metrics.metrics.cycle_durations_ms.pop_front();
-                    }
-                    metrics.metrics.p95_cycle_ms =
-                        compute_p95(metrics.metrics.cycle_durations_ms.make_contiguous());
-
-                    // reactor_weight: write back local accumulated value to MetricsState
-                    metrics.reactor_event_weight = reactor_weight;
-
-                    let nowi = Instant::now();
-                    critical_failure_timestamps
-                        .retain(|t| nowi.duration_since(*t) <= Duration::from_secs(180));
-                    if had_new_failures {
-                        critical_failure_timestamps.push(nowi);
-                    }
-                    if critical_failure_timestamps.len() > 5 {
-                        state.policy.lock_recover().governor.force_safe_on_errors();
-                        critical_failure_timestamps.clear();
-                    }
-
-                    // Actualizar métricas del overflow guard antes de escribir.
-                    metrics.metrics.overflow_events_total = lctx.overflow_guard.history.total_overflows;
-                    metrics.metrics.overflow_events_7d = lctx.overflow_guard.recent_overflow_count(7);
-                    metrics.metrics.overflow_threshold_offset_pp =
-                        (lctx.overflow_guard.compute_dynamic_offset() * 100.0).round() as i32;
-                    metrics.metrics.overflow_workload_mode =
-                        overflow_thresholds.workload_mode.as_str().to_string();
-
-                    // RL threshold agent metrics (Phase 4).
-                    if let Some(rl) = &lctx.overflow_guard.rl_agent {
-                        metrics.metrics.rl_adjustment_pp = (rl.current_adjustment * 100.0).round() as i32;
-                        metrics.metrics.rl_total_ticks = rl.total_ticks();
-                        metrics.metrics.rl_total_overflows = rl.total_overflows();
-                    }
-
-                    // Clone before releasing lock — write_metrics does file I/O
-                    // and holding the lock during I/O blocks GetStatus requests.
-                    let metrics_snapshot = metrics.metrics.clone();
-                    drop(metrics);
-                    write_metrics(&metrics_path, &metrics_snapshot);
-                }
+                // Metrics reporting: update learning metrics, apply I/O shaping,
+                // route processes to P/E cores, and merge execution outcomes.
+                // Extracted to metrics_reporter.rs; behaviour is unchanged.
+                metrics_reporter::update_learning_metrics(
+                    &state,
+                    &lctx,
+                    &signal_digest,
+                    &agent_intervention,
+                );
+                metrics_reporter::apply_io_shaping(
+                    cycle_count,
+                    is_root,
+                    &snapshot,
+                    foreground_pid,
+                    &process_tree,
+                    &heuristic_decisions,
+                    &power_mgr,
+                    thermal_pressure_boost,
+                    &mut io_shaper,
+                    &state,
+                );
+                metrics_reporter::apply_qos_routing(
+                    cycle_count,
+                    &state,
+                    foreground_pid,
+                    &process_tree,
+                    &heuristic_decisions,
+                    &heuristic_critical_pids,
+                    &thermal_action,
+                );
+                metrics_reporter::merge_cycle_metrics(
+                    &state,
+                    exec_outcomes,
+                    &network_monitor,
+                    &decision,
+                    current_profile,
+                    &governor_decision,
+                    &lctx,
+                    &overflow_thresholds,
+                    &cycle_start,
+                    reactor_weight,
+                    &mut override_was_active,
+                    &mut critical_failure_timestamps,
+                    Path::new(&timeline_path),
+                    Path::new(&metrics_path),
+                );
 
                 // ── Periodic stage: GC and observability (% 100 / % 500 / % 7200 gates) ──
                 // % 500 GC (experience compress, weight prune, skill GC) runs here.
