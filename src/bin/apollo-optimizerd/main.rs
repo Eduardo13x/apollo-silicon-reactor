@@ -744,12 +744,29 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Spawn socket server and wait for bind confirmation before entering main loop.
+            // If bind fails (e.g., another instance already running), exit(1) immediately.
+            // Without this guard, a second daemon instance would silently run headless —
+            // no socket, no control, but actively mutating frozen_state and frozen_state.json
+            // concurrently with the first instance.
             let socket_state = state.clone();
+            let (bind_tx, bind_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
             thread::spawn(move || {
-                if let Err(e) = socket_handler::run_socket_server(socket_state) {
-                    tracing::error!(err = ?e, "CRITICAL: socket server failed");
-                }
+                socket_handler::run_socket_server_with_notify(socket_state, bind_tx);
             });
+            match bind_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Ok(())) => { /* bind succeeded, continue */ }
+                Ok(Err(e)) => {
+                    tracing::error!(err = ?e, "FATAL: socket bind failed — another instance may be running");
+                    eprintln!("apollo-optimizerd: socket bind failed: {e}");
+                    eprintln!("  Is another instance already running?");
+                    eprintln!("  Check: pgrep apollo-optimizerd");
+                    std::process::exit(1);
+                }
+                Err(_timeout) => {
+                    tracing::warn!("socket bind confirmation timed out — continuing anyway");
+                }
+            }
 
             let stop = state.stop.clone();
             ctrlc::set_handler(move || {

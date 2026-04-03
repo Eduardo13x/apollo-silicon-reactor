@@ -753,6 +753,46 @@ pub fn build_llm_status(state: &SharedState) -> LlmStatus {
 
 // ── Socket Server ──────────────────────────────────────────────────────────
 
+/// Wrapper that signals bind success/failure via `tx` before entering the accept loop.
+/// The main thread waits on `tx` to confirm binding before entering its hot loop,
+/// so a bind failure causes an immediate exit(1) rather than a headless second instance.
+///
+/// Background: if socket bind fails (e.g., another instance is running), the previous
+/// code logged an error and returned from the thread — but the daemon continued into its
+/// main optimization loop with no socket, no control plane, and in conflict with the
+/// other instance over frozen_state.json writes.
+pub fn run_socket_server_with_notify(
+    state: SharedState,
+    tx: std::sync::mpsc::Sender<anyhow::Result<()>>,
+) {
+    let sp = socket_path();
+    let socket_path = Path::new(sp);
+
+    // Probe: can we set up and bind the socket?
+    let bind_result = (|| -> anyhow::Result<()> {
+        if let Some(parent) = socket_path.parent() {
+            HardPath::secure_create_dir_all(parent)?;
+        }
+        HardPath::verify_no_symlink(socket_path)?;
+        if socket_path.exists() {
+            fs::remove_file(socket_path)?;
+        }
+        // A successful bind (and immediate close) confirms we can own the socket.
+        // run_socket_server will rebind immediately after — the window is <1ms.
+        let probe = UnixListener::bind(socket_path).context("bind socket")?;
+        drop(probe);
+        fs::remove_file(socket_path).ok();
+        Ok(())
+    })();
+
+    let _ = tx.send(bind_result);
+    // If bind_result was Err, main thread will exit(1) — this thread can return.
+    // If bind_result was Ok, run the full server (which re-binds immediately).
+    if let Err(e) = run_socket_server(state) {
+        tracing::error!(err = ?e, "socket server exited with error");
+    }
+}
+
 pub fn run_socket_server(state: SharedState) -> anyhow::Result<()> {
     let socket_path = Path::new(socket_path());
     println!("Socket server starting for path: {:?}", socket_path);
