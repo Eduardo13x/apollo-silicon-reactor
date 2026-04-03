@@ -270,7 +270,10 @@ impl LearningPipeline {
             if !edge.cause.starts_with("throttle:") {
                 continue;
             }
-            let current_rate = skill_registry.success_rate(&edge.cause).unwrap_or(1.0);
+            let current_rate = skill_registry.success_rate(&edge.cause).unwrap_or_else(|| {
+                eprintln!("[learning_pipeline] cross-feed B: no skill rate for {:?}, defaulting to 1.0", edge.cause);
+                1.0
+            });
             if current_rate < 0.5 {
                 // Boost: lift rate toward causal evidence. min_apply_count=3, min_gap=0.
                 skill_registry.cross_feed_boost(
@@ -289,8 +292,14 @@ impl LearningPipeline {
         // benefit from crystallised skill knowledge without waiting 20+ throttle cycles.
         for obs in &self.batch {
             let skill_key = format!("throttle:{}", obs.process_name);
-            let skill_apply_count = skill_registry.apply_count(&skill_key).unwrap_or(0);
-            let skill_rate = skill_registry.success_rate(&skill_key).unwrap_or(0.0);
+            let skill_apply_count = skill_registry.apply_count(&skill_key).unwrap_or_else(|| {
+                eprintln!("[learning_pipeline] cross-feed C: no apply_count for {:?}, defaulting to 0", skill_key);
+                0
+            });
+            let skill_rate = skill_registry.success_rate(&skill_key).unwrap_or_else(|| {
+                eprintln!("[learning_pipeline] cross-feed C: no success_rate for {:?}, defaulting to 0.0", skill_key);
+                0.0
+            });
             if skill_apply_count >= 20 && skill_rate > 0.8 {
                 let w = outcome_tracker.weights
                     .entry(obs.process_name.clone())
@@ -337,7 +346,10 @@ impl LearningPipeline {
             let skill_key = obs.skill_name.as_ref().map(|s| s.clone())
                 .unwrap_or_else(|| format!("throttle:{}", obs.process_name));
             if let Some(rate) = skill_registry.success_rate(&skill_key) {
-                let apps = skill_registry.apply_count(&skill_key).unwrap_or(0);
+                let apps = skill_registry.apply_count(&skill_key).unwrap_or_else(|| {
+                    eprintln!("[learning_pipeline] F3 blend: no apply_count for {:?}, defaulting to 0", skill_key);
+                    0
+                });
                 effectiveness_tracker.update_from_skill(
                     &obs.process_name,
                     rate as f64,
