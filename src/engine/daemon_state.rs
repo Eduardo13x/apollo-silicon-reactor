@@ -25,7 +25,6 @@ use crate::engine::circuit_breaker::CircuitBreaker;
 use crate::engine::degradation::DegradationController;
 use crate::engine::iokit_sensors::HardwareSnapshot;
 use crate::engine::llm::{LearnedPolicy, LlmConfig, LlmState};
-use crate::engine::mach_qos::MachQoSManager;
 use crate::engine::profile_governor::ProfileGovernor;
 use crate::engine::sysctl_governor::SysctlGovernorStatus;
 use crate::engine::thermal_interrupt::ResourceInterruptState;
@@ -108,10 +107,10 @@ pub struct ProcessState {
 
 // ── Hardware Domain ─────────────────────────────────────────────────────────
 
-/// Hardware snapshots, QoS scheduling, sysctl governor — the "hardware" layer.
+/// Hardware snapshots, sysctl governor — the "hardware" layer.
+/// Note: mach_qos lives as a flat SharedState field (sentinel coupling; see feedback_lock_migration.md).
 pub struct HardwareState {
     pub last_hw_snapshot: Option<HardwareSnapshot>,
-    pub mach_qos: MachQoSManager,
     pub sysctl_governor_status: SysctlGovernorStatus,
 }
 

@@ -134,7 +134,8 @@ use clap::{Parser, Subcommand};
 // v0.9.0: ACL alias — DomainSharedState is the grouped version being migrated to
 #[allow(unused_imports)]
 use apollo_optimizer::engine::daemon_state::{
-    ProcessState, SharedState as DomainSharedState, UsageDomainState, UsageTrackerState,
+    HardwareState, ProcessState, SharedState as DomainSharedState, UsageDomainState,
+    UsageTrackerState,
 };
 
 // FREEZE_TTL_SECS → daemon_helpers
@@ -200,14 +201,11 @@ pub(crate) struct SharedState {
     // Heuristic modules
     pub(crate) adaptive_governor: Arc<Mutex<AdaptiveGovernor>>,
     pub(crate) mach_qos: Arc<Mutex<MachQoSManager>>,
-    pub(crate) last_hw_snapshot: Arc<Mutex<Option<HardwareSnapshot>>>,
+    pub(crate) hardware: Arc<Mutex<HardwareState>>,
 
     // ML Ligero
     pub(crate) discrepancy_log_path: PathBuf,
     pub(crate) user_profile_path: PathBuf,
-
-    // Sysctl Governor status (shared with socket handler threads)
-    pub(crate) sysctl_governor_status: Arc<Mutex<SysctlGovernorStatus>>,
 
     // Reactive daemon: condvar to wake the main loop on reactor events
     pub(crate) cycle_condvar: Arc<(Mutex<bool>, Condvar)>,
@@ -637,7 +635,27 @@ fn main() -> anyhow::Result<()> {
 
                 adaptive_governor: Arc::new(Mutex::new(AdaptiveGovernor::new())),
                 mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
-                last_hw_snapshot: Arc::new(Mutex::new(None)),
+                hardware: Arc::new(Mutex::new(HardwareState {
+                    last_hw_snapshot: None,
+                    sysctl_governor_status: SysctlGovernorStatus {
+                        active: false,
+                        current_values: HashMap::new(),
+                        defaults: HashMap::new(),
+                        total_writes: 0,
+                        active_tunings: 0,
+                        retransmission_rate: 0.0,
+                        listen_drop_rate: 0.0,
+                        last_tune_secs_ago: HashMap::new(),
+                        tcp_consecutive_high: 0,
+                        tcp_consecutive_low: 0,
+                        ipc_consecutive_drops: 0,
+                        ipc_consecutive_clean: 0,
+                        vm_consecutive_high: 0,
+                        vm_consecutive_low: 0,
+                        fs_consecutive_high: 0,
+                        fs_consecutive_low: 0,
+                    },
+                })),
 
                 discrepancy_log_path: if is_root {
                     PathBuf::from("/var/lib/apollo/discrepancy.jsonl")
@@ -649,25 +667,6 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     PathBuf::from("/tmp/apollo-user_profile.json")
                 },
-
-                sysctl_governor_status: Arc::new(Mutex::new(SysctlGovernorStatus {
-                    active: false,
-                    current_values: HashMap::new(),
-                    defaults: HashMap::new(),
-                    total_writes: 0,
-                    active_tunings: 0,
-                    retransmission_rate: 0.0,
-                    listen_drop_rate: 0.0,
-                    last_tune_secs_ago: HashMap::new(),
-                    tcp_consecutive_high: 0,
-                    tcp_consecutive_low: 0,
-                    ipc_consecutive_drops: 0,
-                    ipc_consecutive_clean: 0,
-                    vm_consecutive_high: 0,
-                    vm_consecutive_low: 0,
-                    fs_consecutive_high: 0,
-                    fs_consecutive_low: 0,
-                })),
 
                 cycle_condvar: Arc::new((Mutex::new(false), Condvar::new())),
                 resource_interrupt: Arc::new(ResourceInterruptState::new()),
@@ -1728,7 +1727,7 @@ fn main() -> anyhow::Result<()> {
                             ThermalState::Critical => "critical",
                         };
                         *state.thermal_level_real.lock_recover() = level_str.to_string();
-                        *state.last_hw_snapshot.lock_recover() = Some(hw);
+                        state.hardware.lock_recover().last_hw_snapshot = Some(hw);
                     } else {
                         state.metrics.lock_recover().iokit_errors = smc_reader.error_count();
                     }
@@ -1744,7 +1743,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Snapshot hardware data once per cycle (avoids 6 redundant mutex+clone operations).
                 let cycle_hw_snap: Option<HardwareSnapshot> =
-                    state.last_hw_snapshot.lock_recover().clone();
+                    state.hardware.lock_recover().last_hw_snapshot.clone();
 
 
                 // ── LearningContext: group the 9 learning subsystems for this cycle ──
@@ -4121,7 +4120,7 @@ fn main() -> anyhow::Result<()> {
                 // Update SharedState with latest sysctl governor status for ctl queries.
                 {
                     let status = sysctl_governor.status(&network_monitor);
-                    *state.sysctl_governor_status.lock_recover() = status;
+                    state.hardware.lock_recover().sysctl_governor_status = status;
                 }
 
                 // F3 — Safety Precedence: foreground app is NEVER throttled or frozen.
@@ -5263,9 +5262,9 @@ fn main() -> anyhow::Result<()> {
                     // SysctlGovernor + NetworkMonitor metrics.
                     metrics.sysctl_reactive_writes += exec_outcomes.sysctl_applied;
                     {
-                        let gov_status = state.sysctl_governor_status.lock_recover();
-                        metrics.sysctl_governor_active_tunings = gov_status.active_tunings;
-                        metrics.sysctl_governor_total_writes = gov_status.total_writes;
+                        let hw = state.hardware.lock_recover();
+                        metrics.sysctl_governor_active_tunings = hw.sysctl_governor_status.active_tunings;
+                        metrics.sysctl_governor_total_writes = hw.sysctl_governor_status.total_writes;
                     }
                     metrics.network_retransmit_ratio = network_monitor.retransmission_rate();
                     metrics.network_listen_drop_rate = network_monitor.listen_drop_rate();
@@ -5371,8 +5370,9 @@ fn main() -> anyhow::Result<()> {
                 // Analytics: record this cycle's metrics for trend tracking.
                 {
                     let thermal_now = state
-                        .last_hw_snapshot
+                        .hardware
                         .lock_recover()
+                        .last_hw_snapshot
                         .as_ref()
                         .and_then(|h| h.temps.p_cluster_celsius)
                         .unwrap_or(0.0);

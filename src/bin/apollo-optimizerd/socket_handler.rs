@@ -619,7 +619,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             DaemonResponse::Ok
         }
         DaemonRequest::GetSysctlGovernor => {
-            let status = state.sysctl_governor_status.lock_recover().clone();
+            let status = state.hardware.lock_recover().sysctl_governor_status.clone();
             DaemonResponse::SysctlGovernor(status)
         }
         DaemonRequest::GetHealth => {
