@@ -21,6 +21,8 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 
 use crate::engine::adaptive_governor::AdaptiveGovernor;
+use crate::engine::circuit_breaker::CircuitBreaker;
+use crate::engine::degradation::DegradationController;
 use crate::engine::iokit_sensors::HardwareSnapshot;
 use crate::engine::llm::{LearnedPolicy, LlmConfig, LlmState};
 use crate::engine::mach_qos::MachQoSManager;
@@ -89,6 +91,10 @@ pub struct PolicyState {
     pub adaptive_governor: AdaptiveGovernor,
     pub latency_target: LatencyTarget,
     pub timeline: VecDeque<ProfileTransition>,
+    /// Resilience: circuit breaker for external calls (LLM, sysctl, etc.).
+    pub circuit_breaker: CircuitBreaker,
+    /// Resilience: graceful degradation controller for policy quality tiers.
+    pub degradation: DegradationController,
 }
 
 // ── Process Domain ──────────────────────────────────────────────────────────

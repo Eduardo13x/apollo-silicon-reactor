@@ -131,6 +131,10 @@ use apollo_optimizer::engine::daemon_helpers::{
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use clap::{Parser, Subcommand};
 
+// v0.9.0: ACL alias — DomainSharedState is the grouped version being migrated to
+#[allow(unused_imports)]
+use apollo_optimizer::engine::daemon_state::SharedState as DomainSharedState;
+
 // FREEZE_TTL_SECS → daemon_helpers
 const REACTOR_FAST_TICK_SECS: u64 = 30;
 
