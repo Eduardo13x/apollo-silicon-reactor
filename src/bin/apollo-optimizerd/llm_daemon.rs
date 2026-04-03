@@ -363,7 +363,7 @@ pub fn llm_reactive_tick(
     }
 
     // Network call (no locks held).
-    let current_policy = state.learned_policy.lock_recover().clone();
+    let current_policy = state.policy.lock_recover().learned_policy.clone();
     let suggestion_res = advisor.call_raw(snapshot, &api_key, Some(&current_policy));
 
     // Apply suggestion and persist state.
@@ -399,14 +399,14 @@ pub fn llm_reactive_tick(
 
             // 1) Profile: apply as a short-lived override.
             if let Some(p) = suggestion.suggested_profile {
-                let mut gov = state.governor.lock_recover();
-                if gov.manual_override.is_none() {
-                    gov.set_manual_override(p, 20, "llm-reactive".to_string());
+                let mut pg = state.policy.lock_recover();
+                if pg.governor.manual_override.is_none() {
+                    pg.governor.set_manual_override(p, 20, "llm-reactive".to_string());
                 }
             }
             // 2) Latency target.
             if let Some(t) = suggestion.suggested_latency_target {
-                *state.latency_target.lock_recover() = t;
+                state.policy.lock_recover().latency_target = t;
             }
 
             // 3) Learned patterns: merge with daily cap.
@@ -433,66 +433,67 @@ pub fn llm_reactive_tick(
             }
 
             let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
-            let mut policy = state.learned_policy.lock_recover();
-
             let mut added = 0u32;
-            for p in suggestion
-                .add_interactive_patterns
-                .iter()
-                .take(remaining as usize)
-            {
-                if !policy.interactive_patterns.contains(p)
-                    && !pattern_conflicts_with_protected(p)
+            let lp_snap = {
+                let mut pg = state.policy.lock_recover();
+                for p in suggestion
+                    .add_interactive_patterns
+                    .iter()
+                    .take(remaining as usize)
                 {
-                    // Remove from noise if promoted to interactive.
-                    policy.noise_patterns.retain(|n| n != p);
-                    policy.interactive_patterns.push(p.clone());
-                    added += 1;
+                    if !pg.learned_policy.interactive_patterns.contains(p)
+                        && !pattern_conflicts_with_protected(p)
+                    {
+                        // Remove from noise if promoted to interactive.
+                        pg.learned_policy.noise_patterns.retain(|n| n != p);
+                        pg.learned_policy.interactive_patterns.push(p.clone());
+                        added += 1;
+                    }
                 }
-            }
-            for p in suggestion
-                .add_noise_patterns
-                .iter()
-                .take(remaining.saturating_sub(added) as usize)
-            {
-                // Skip if already protected or interactive — cannot downgrade.
-                if !policy.noise_patterns.contains(p)
-                    && !pattern_conflicts_with_protected(p)
-                    && !policy.protected_patterns.contains(p)
-                    && !policy.interactive_patterns.contains(p)
+                for p in suggestion
+                    .add_noise_patterns
+                    .iter()
+                    .take(remaining.saturating_sub(added) as usize)
                 {
-                    policy.noise_patterns.push(p.clone());
-                    added += 1;
+                    // Skip if already protected or interactive — cannot downgrade.
+                    if !pg.learned_policy.noise_patterns.contains(p)
+                        && !pattern_conflicts_with_protected(p)
+                        && !pg.learned_policy.protected_patterns.contains(p)
+                        && !pg.learned_policy.interactive_patterns.contains(p)
+                    {
+                        pg.learned_policy.noise_patterns.push(p.clone());
+                        added += 1;
+                    }
                 }
-            }
-            for p in suggestion
-                .add_protected_patterns
-                .iter()
-                .take(remaining.saturating_sub(added) as usize)
-            {
-                if !policy.protected_patterns.contains(p)
-                    && !pattern_conflicts_with_protected(p)
+                for p in suggestion
+                    .add_protected_patterns
+                    .iter()
+                    .take(remaining.saturating_sub(added) as usize)
                 {
-                    // Remove from noise when promoted to protected.
-                    policy.noise_patterns.retain(|n| n != p);
-                    policy.protected_patterns.push(p.clone());
-                    added += 1;
+                    if !pg.learned_policy.protected_patterns.contains(p)
+                        && !pattern_conflicts_with_protected(p)
+                    {
+                        // Remove from noise when promoted to protected.
+                        pg.learned_policy.noise_patterns.retain(|n| n != p);
+                        pg.learned_policy.protected_patterns.push(p.clone());
+                        added += 1;
+                    }
                 }
-            }
-
+                if added > 0 {
+                    pg.learned_policy.interactive_patterns.sort();
+                    pg.learned_policy.noise_patterns.sort();
+                    pg.learned_policy.protected_patterns.sort();
+                    pg.learned_policy.learned_at = Some(now);
+                }
+                let snap = pg.learned_policy.clone();
+                if added > 0 {
+                    pg.adaptive_governor.update_learned_policy(&snap);
+                }
+                snap
+            };
             if added > 0 {
-                policy.interactive_patterns.sort();
-                policy.noise_patterns.sort();
-                policy.protected_patterns.sort();
-                policy.learned_at = Some(now);
-                write_json(&learned_policy_path, &*policy, Some(0o600));
-                drop(policy);
-                // Propagate updated patterns to the ML Ligero classifier.
-                {
-                    let policy_snap = state.learned_policy.lock_recover().clone();
-                    let mut gov = state.adaptive_governor.lock_recover();
-                    gov.update_learned_policy(&policy_snap);
-                }
+                // Persist after releasing the policy lock.
+                write_json(&learned_policy_path, &lp_snap, Some(0o600));
                 {
                     let mut guard = state.llm.lock_recover();
                     guard.llm_state.policy_updates_today += added;
@@ -601,7 +602,7 @@ pub fn usage_learning_tick(
         let model = state.usage.lock_recover();
         let started_at = model.usage_model.top_report(1).model_started_at;
         drop(model);
-        let policy = state.learned_policy.lock_recover().clone();
+        let policy = state.policy.lock_recover().learned_policy.clone();
         (
             started_at,
             policy.interactive_patterns,
@@ -627,33 +628,34 @@ pub fn usage_learning_tick(
 
     // Apply promotions to learned policy.
     let mut applied = 0u32;
-    {
-        let mut policy = state.learned_policy.lock_recover();
+    let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
+    let lp_snap = {
+        let mut pg = state.policy.lock_recover();
         for (kind, pattern) in &promotions {
             match kind.as_str() {
                 "interactive" => {
-                    if !policy.interactive_patterns.contains(pattern)
+                    if !pg.learned_policy.interactive_patterns.contains(pattern)
                         && !pattern_conflicts_with_protected(pattern)
                     {
-                        policy.interactive_patterns.push(pattern.clone());
+                        pg.learned_policy.interactive_patterns.push(pattern.clone());
                         applied += 1;
                     }
                 }
                 "noise" => {
-                    if !policy.noise_patterns.contains(pattern)
+                    if !pg.learned_policy.noise_patterns.contains(pattern)
                         && !pattern_conflicts_with_protected(pattern)
                     {
-                        policy.noise_patterns.push(pattern.clone());
+                        pg.learned_policy.noise_patterns.push(pattern.clone());
                         applied += 1;
                     }
                 }
                 "protected" => {
                     // Protected patterns are safety labels — they bypass the daily
                     // cap and only require that the pattern isn't already present.
-                    if !policy.protected_patterns.contains(pattern)
+                    if !pg.learned_policy.protected_patterns.contains(pattern)
                         && !pattern_conflicts_with_protected(pattern)
                     {
-                        policy.protected_patterns.push(pattern.clone());
+                        pg.learned_policy.protected_patterns.push(pattern.clone());
                         applied += 1;
                     }
                 }
@@ -661,18 +663,20 @@ pub fn usage_learning_tick(
             }
         }
         if applied > 0 {
-            policy.interactive_patterns.sort();
-            policy.noise_patterns.sort();
-            policy.protected_patterns.sort();
-            policy.learned_at = Some(now);
-            let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
-            write_json(&learned_policy_path, &*policy, Some(0o600));
-            // Propagate updated patterns to the ML Ligero classifier.
-            {
-                let mut gov = state.adaptive_governor.lock_recover();
-                gov.update_learned_policy(&policy);
-            }
+            pg.learned_policy.interactive_patterns.sort();
+            pg.learned_policy.noise_patterns.sort();
+            pg.learned_policy.protected_patterns.sort();
+            pg.learned_policy.learned_at = Some(now);
         }
+        let snap = pg.learned_policy.clone();
+        if applied > 0 {
+            pg.adaptive_governor.update_learned_policy(&snap);
+        }
+        snap
+    };
+    if applied > 0 {
+        // Persist after releasing the policy lock.
+        write_json(&learned_policy_path, &lp_snap, Some(0o600));
     }
 
     if applied > 0 {

@@ -151,8 +151,8 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
     match req {
         DaemonRequest::GetStatus => {
             let now = Utc::now();
-            let profile = *state.profile.lock_recover();
-            let latency_target = *state.latency_target.lock_recover();
+            let profile = state.policy.lock_recover().profile;
+            let latency_target = state.policy.lock_recover().latency_target;
             // Non-blocking metrics: try_lock avoids stalling when the main loop
             // holds the metrics lock during its end-of-cycle update (~100 lines).
             // Fall back to default metrics if busy — dashboard shows stale data
@@ -174,11 +174,11 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             // Snapshot governor + wake_state, then DROP locks before build_llm_status.
             let (auto_profile_enabled, base_profile, override_active, override_expires_at,
                  transition_reason) = {
-                let gov = state.governor.lock_recover();
-                (gov.auto_profile_enabled, gov.base_profile,
-                 gov.manual_override.is_some(),
-                 gov.manual_override.as_ref().map(|o| o.expires_at),
-                 gov.transition_reason.clone())
+                let pg = state.policy.lock_recover();
+                (pg.governor.auto_profile_enabled, pg.governor.base_profile,
+                 pg.governor.manual_override.is_some(),
+                 pg.governor.manual_override.as_ref().map(|o| o.expires_at),
+                 pg.governor.transition_reason.clone())
             };
             let (grace_active, grace_remaining, last_wake_at, post_wake_policy) = {
                 let proc = state.process.lock_recover();
@@ -225,7 +225,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             DaemonResponse::TopBlockers(state.process.lock_recover().last_blockers.clone())
         }
         DaemonRequest::GetProfileTimeline => {
-            DaemonResponse::ProfileTimeline(state.timeline.lock_recover().iter().cloned().collect())
+            DaemonResponse::ProfileTimeline(state.policy.lock_recover().timeline.iter().cloned().collect())
         }
         DaemonRequest::GetCapabilities => DaemonResponse::Capabilities(detect_capabilities()),
         DaemonRequest::SetProfile {
@@ -233,7 +233,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             ttl_minutes,
         } => {
             let ttl = ttl_minutes.unwrap_or(20).clamp(1, 1440);
-            state.governor.lock_recover().set_manual_override(
+            state.policy.lock_recover().governor.set_manual_override(
                 profile,
                 ttl,
                 "cli-set-profile".to_string(),
@@ -241,15 +241,15 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             DaemonResponse::Ok
         }
         DaemonRequest::SetLatencyTarget { target } => {
-            *state.latency_target.lock_recover() = target;
+            state.policy.lock_recover().latency_target = target;
             DaemonResponse::Ok
         }
         DaemonRequest::SetAutoProfile { enabled } => {
-            state.governor.lock_recover().set_auto_profile(enabled);
+            state.policy.lock_recover().governor.set_auto_profile(enabled);
             DaemonResponse::Ok
         }
         DaemonRequest::ClearProfileOverride => {
-            state.governor.lock_recover().clear_manual_override();
+            state.policy.lock_recover().governor.clear_manual_override();
             DaemonResponse::Ok
         }
         DaemonRequest::Restore => {
@@ -277,7 +277,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 }
             }
             let _ = File::create(ks);
-            state.governor.lock_recover().set_auto_profile(false);
+            state.policy.lock_recover().governor.set_auto_profile(false);
             let mut frozen_state = state.frozen_state.lock_recover();
             for pid in frozen_state.keys() {
                 unsafe {
@@ -472,7 +472,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             }
 
             let mut advisor = LlmAdvisor::new(llm_cfg.clone());
-            let current_policy = state.learned_policy.lock_recover().clone();
+            let current_policy = state.policy.lock_recover().learned_policy.clone();
             match advisor.call_raw(&snapshot, &api_key, Some(&current_policy)) {
                 Ok(suggestion) => {
                     {
@@ -528,7 +528,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             }
         }
         DaemonRequest::GetLearnedPolicy => {
-            let policy = state.learned_policy.lock_recover().clone();
+            let policy = state.policy.lock_recover().learned_policy.clone();
             DaemonResponse::LearnedPolicy(policy)
         }
         DaemonRequest::SetLearnedPolicy { policy: new_policy } => {
@@ -596,17 +596,17 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                     .protected_patterns
                     .retain(|pat| !pattern_conflicts_with_protected(pat));
                 let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
-                let mut policy = state.learned_policy.lock_recover();
-                *policy = sanitized;
-                // Re-merge seed as floor — seed patterns can never be removed.
-                merge_seed_into(&mut policy);
-                policy.learned_at = Some(Utc::now());
-                write_json(&learned_policy_path, &*policy, Some(0o600));
-                // Propagate to ML classifier.
-                {
-                    let mut gov = state.adaptive_governor.lock_recover();
-                    gov.update_learned_policy(&policy);
-                }
+                let lp_snap = {
+                    let mut pg = state.policy.lock_recover();
+                    pg.learned_policy = sanitized;
+                    // Re-merge seed as floor — seed patterns can never be removed.
+                    merge_seed_into(&mut pg.learned_policy);
+                    pg.learned_policy.learned_at = Some(Utc::now());
+                    let snap = pg.learned_policy.clone();
+                    pg.adaptive_governor.update_learned_policy(&snap);
+                    snap
+                };
+                write_json(&learned_policy_path, &lp_snap, Some(0o600));
                 DaemonResponse::Ok
             }
         }
@@ -640,15 +640,15 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             use apollo_optimizer::engine::degradation::OperationMode;
 
             let (cb_state_str, cb_trips) = {
-                let cb = state.circuit_breaker.lock_recover();
-                (cb.state().as_str().to_string(), cb.trips_total)
+                let pg = state.policy.lock_recover();
+                (pg.circuit_breaker.state().as_str().to_string(), pg.circuit_breaker.trips_total)
             };
             let (op_mode_str, failure_rate, deg_transitions) = {
-                let deg = state.degradation.lock_recover();
+                let pg = state.policy.lock_recover();
                 (
-                    deg.mode.as_str().to_string(),
-                    deg.failure_rate_60s(),
-                    deg.transitions_total,
+                    pg.degradation.mode.as_str().to_string(),
+                    pg.degradation.failure_rate_60s(),
+                    pg.degradation.transitions_total,
                 )
             };
             let (uptime_cycles, total_failures) = {
@@ -695,7 +695,7 @@ pub fn build_llm_status(state: &SharedState) -> LlmStatus {
         .llm
         .unwrap_or(llm_cfg_default);
     let enabled_from_disk = llm_cfg.enabled();
-    let policy = state.learned_policy.lock_recover().clone();
+    let policy = state.policy.lock_recover().learned_policy.clone();
 
     let has_key = llm_key_path.exists();
     let enabled = enabled_from_disk && llm_state.enabled;

@@ -134,8 +134,9 @@ use clap::{Parser, Subcommand};
 // v0.9.0: ACL alias — DomainSharedState is the grouped version being migrated to
 #[allow(unused_imports)]
 use apollo_optimizer::engine::daemon_state::{
-    HardwareState, LlmDomainState, MetricsState, ProcessState, ReactorStatus as DomainReactorStatus,
-    SharedState as DomainSharedState, UsageDomainState, UsageTrackerState,
+    HardwareState, LlmDomainState, MetricsState, PolicyState, ProcessState,
+    ReactorStatus as DomainReactorStatus, SharedState as DomainSharedState,
+    UsageDomainState, UsageTrackerState,
 };
 
 // FREEZE_TTL_SECS → daemon_helpers
@@ -170,42 +171,26 @@ enum Commands {
 }
 #[derive(Clone)]
 pub(crate) struct SharedState {
-    pub(crate) profile: Arc<Mutex<OptimizationProfile>>,
-    pub(crate) latency_target: Arc<Mutex<LatencyTarget>>,
+    // v0.9.0: domain groups (Strangler Fig migration)
     pub(crate) metrics: Arc<Mutex<MetricsState>>,
-    pub(crate) frozen_state: Arc<Mutex<HashMap<u32, FrozenEntry>>>,
     pub(crate) process: Arc<Mutex<ProcessState>>,
-    pub(crate) governor: Arc<Mutex<ProfileGovernor>>,
-    pub(crate) timeline: Arc<Mutex<VecDeque<ProfileTransition>>>,
-    pub(crate) stop: Arc<AtomicBool>,
-
+    pub(crate) policy: Arc<Mutex<PolicyState>>,  // PR#14
+    pub(crate) hardware: Arc<Mutex<HardwareState>>,
     pub(crate) llm: Arc<Mutex<LlmDomainState>>,
-    pub(crate) learned_policy: Arc<Mutex<LearnedPolicy>>,
-
-    pub(crate) config_path: PathBuf,
-
     pub(crate) usage: Arc<Mutex<UsageDomainState>>,
 
-    // Heuristic modules
-    pub(crate) adaptive_governor: Arc<Mutex<AdaptiveGovernor>>,
+    // Infrastructure (lock-free or low-frequency)
+    pub(crate) frozen_state: Arc<Mutex<HashMap<u32, FrozenEntry>>>,
     pub(crate) mach_qos: Arc<Mutex<MachQoSManager>>,
-    pub(crate) hardware: Arc<Mutex<HardwareState>>,
-
-    // ML Ligero
-    pub(crate) discrepancy_log_path: PathBuf,
-    pub(crate) user_profile_path: PathBuf,
-
-    // Reactive daemon: condvar to wake the main loop on reactor events
+    pub(crate) stop: Arc<AtomicBool>,
     pub(crate) cycle_condvar: Arc<(Mutex<bool>, Condvar)>,
-    // Resource interrupt handler state (lock-free atomics)
     pub(crate) resource_interrupt: Arc<ResourceInterruptState>,
-
-    /// Clientes suscritos a push de estado (menubar, etc.)
     pub(crate) subscribers: Arc<Mutex<Vec<UnixStream>>>,
 
-    // Resilience layer
-    pub(crate) circuit_breaker: Arc<Mutex<apollo_optimizer::engine::circuit_breaker::CircuitBreaker>>,
-    pub(crate) degradation: Arc<Mutex<apollo_optimizer::engine::degradation::DegradationController>>,
+    // Read-only paths (set once at init)
+    pub(crate) config_path: PathBuf,
+    pub(crate) discrepancy_log_path: PathBuf,
+    pub(crate) user_profile_path: PathBuf,
 }
 
 // ReactorStatus → daemon_state (PR#10: unified with MetricsState)
@@ -546,8 +531,16 @@ fn main() -> anyhow::Result<()> {
             let wake_state = load_wake_state(&wake_state_path);
             let frozen_since_boot = load_frozen_state(&frozen_state_path);
             let state = SharedState {
-                profile: Arc::new(Mutex::new(profile)),
-                latency_target: Arc::new(Mutex::new(LatencyTarget::Normal)),
+                policy: Arc::new(Mutex::new(PolicyState {
+                    profile,
+                    latency_target: LatencyTarget::Normal,
+                    governor,
+                    learned_policy,
+                    adaptive_governor: AdaptiveGovernor::new(),
+                    timeline: VecDeque::new(),
+                    circuit_breaker: apollo_optimizer::engine::circuit_breaker::CircuitBreaker::default(),
+                    degradation: apollo_optimizer::engine::degradation::DegradationController::default(),
+                })),
                 metrics: Arc::new(Mutex::new(MetricsState {
                     metrics: RuntimeMetrics {
                         effective_profile: profile,
@@ -571,8 +564,6 @@ fn main() -> anyhow::Result<()> {
                     last_blockers: Vec::new(),
                     wake_state,
                 })),
-                governor: Arc::new(Mutex::new(governor)),
-                timeline: Arc::new(Mutex::new(VecDeque::new())),
                 stop: Arc::new(AtomicBool::new(false)),
 
                 llm: Arc::new(Mutex::new(LlmDomainState {
@@ -584,7 +575,6 @@ fn main() -> anyhow::Result<()> {
                     feedback_path,
                     suggestions_path,
                 })),
-                learned_policy: Arc::new(Mutex::new(learned_policy)),
 
                 config_path,
 
@@ -595,7 +585,6 @@ fn main() -> anyhow::Result<()> {
                     usage_tracker: UsageTrackerState::default(),
                 })),
 
-                adaptive_governor: Arc::new(Mutex::new(AdaptiveGovernor::new())),
                 mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
                 hardware: Arc::new(Mutex::new(HardwareState {
                     last_hw_snapshot: None,
@@ -634,26 +623,19 @@ fn main() -> anyhow::Result<()> {
                 resource_interrupt: Arc::new(ResourceInterruptState::new()),
 
                 subscribers: Arc::new(Mutex::new(Vec::new())),
-
-                circuit_breaker: Arc::new(Mutex::new(
-                    apollo_optimizer::engine::circuit_breaker::CircuitBreaker::default(),
-                )),
-                degradation: Arc::new(Mutex::new(
-                    apollo_optimizer::engine::degradation::DegradationController::default(),
-                )),
             };
 
             // Load persisted UserProfile (learning survives daemon restarts).
             if let Some(persisted) = read_json::<UserProfilePersisted>(&state.user_profile_path) {
-                let mut gov = state.adaptive_governor.lock_recover();
-                gov.user_profile = UserProfile::from_persisted(persisted);
+                state.policy.lock_recover().adaptive_governor.user_profile =
+                    UserProfile::from_persisted(persisted);
             }
 
             // Scrub learned policy: remove patterns that should never be interactive.
             // This list is curated by LLM Teacher analysis of usage_model data.
             let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
             {
-                let mut policy = state.learned_policy.lock_recover();
+                let mut policy = state.policy.lock_recover().learned_policy.clone();
                 let bad_interactive: Vec<&str> = vec![
                     // Self-reference
                     "apollo-optimizerd",
@@ -722,15 +704,16 @@ fn main() -> anyhow::Result<()> {
                 }
                 let removed = before - policy.interactive_patterns.len();
                 if removed > 0 || policy.noise_patterns.len() == 1 {
-                    write_json(&learned_policy_path, &*policy, Some(0o600));
+                    // Write back to shared state, then persist.
+                    state.policy.lock_recover().learned_policy = policy.clone();
+                    write_json(&learned_policy_path, &policy, Some(0o600));
                 }
             }
 
             // Initialize ML Ligero classifier with the already-loaded LearnedPolicy.
             {
-                let policy = state.learned_policy.lock_recover().clone();
-                let mut gov = state.adaptive_governor.lock_recover();
-                gov.update_learned_policy(&policy);
+                let policy = state.policy.lock_recover().learned_policy.clone();
+                state.policy.lock_recover().adaptive_governor.update_learned_policy(&policy);
             }
 
             let reactor_state = state.clone();
@@ -1320,9 +1303,7 @@ fn main() -> anyhow::Result<()> {
                             // Freeze non-essential background processes.
                             let turbo_hard = protected_processes();
                             let turbo_infra = infrastructure_processes();
-                            let policy_protected = state
-                                .learned_policy
-                                .lock_recover()
+                            let policy_protected = state.policy.lock_recover().learned_policy
                                 .protected_patterns
                                 .clone();
                             let fg_pid = fg_detector.detect().pid();
@@ -1412,7 +1393,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 snapshot.pressure.thermal_level = state.metrics.lock_recover().thermal_level_real.clone();
-                let latency_target = *state.latency_target.lock_recover();
+                let latency_target = state.policy.lock_recover().latency_target;
 
                 // Foreground detection: use ForegroundDetector instead of get_foreground_app().
                 let fg_state = fg_detector.detect();
@@ -1782,9 +1763,7 @@ fn main() -> anyhow::Result<()> {
                 if thermal_action.freeze_background || thermal_action.freeze_all_non_critical {
                     let thermal_hard = protected_processes();
                     let thermal_infra = infrastructure_processes();
-                    let policy_protected = state
-                        .learned_policy
-                        .lock_recover()
+                    let policy_protected = state.policy.lock_recover().learned_policy
                         .protected_patterns
                         .clone();
                     let fg_pid = foreground_pid;
@@ -2512,11 +2491,11 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 let (decide_interactive, decide_noise, decide_weights, outcome_baseline) = {
-                    let policy = state.learned_policy.lock_recover();
+                    let pg = state.policy.lock_recover();
                     (
-                        policy.interactive_patterns.clone(),
-                        policy.noise_patterns.clone(),
-                        policy.pattern_weights.clone(),
+                        pg.learned_policy.interactive_patterns.clone(),
+                        pg.learned_policy.noise_patterns.clone(),
+                        pg.learned_policy.pattern_weights.clone(),
                         lctx.outcome_tracker.calibrated_threshold(),
                     )
                 };
@@ -2576,29 +2555,33 @@ fn main() -> anyhow::Result<()> {
                 let workload_onset = workload_mode == WorkloadMode::Build
                     && prev_workload_mode != WorkloadMode::Build;
 
-                let mut governor = state.governor.lock_recover();
-                let governor_decision = governor.evaluate(GovernorInput {
-                    cpu_pressure: pressure_cpu,
-                    ram_pressure: pressure_ram,
-                    interactive_wait_ratio: pressure_wait,
-                    reactor_event_weight: reactor_weight,
-                    thermal_constrained: matches!(
-                        snapshot.pressure.thermal_level.as_str(),
-                        "serious" | "critical"
-                    ) || gpu_thermal_throttled,
-                    dev_session_active,
-                    interactive_heavy,
-                    context_switch_burst,
-                    workload_mode: Some(workload_mode),
-                    workload_onset,
-                    swap_used_bytes: snapshot.pressure.swap_used_bytes,
-                });
+                let governor_decision = {
+                    let mut pg = state.policy.lock_recover();
+                    pg.governor.evaluate(GovernorInput {
+                        cpu_pressure: pressure_cpu,
+                        ram_pressure: pressure_ram,
+                        interactive_wait_ratio: pressure_wait,
+                        reactor_event_weight: reactor_weight,
+                        thermal_constrained: matches!(
+                            snapshot.pressure.thermal_level.as_str(),
+                            "serious" | "critical"
+                        ) || gpu_thermal_throttled,
+                        dev_session_active,
+                        interactive_heavy,
+                        context_switch_burst,
+                        workload_mode: Some(workload_mode),
+                        workload_onset,
+                        swap_used_bytes: snapshot.pressure.swap_used_bytes,
+                    })
+                };
                 if governor_decision.transition_reason.contains("floor") {
                     state.metrics.lock_recover().metrics.profile_floor_hits += 1;
                 }
                 let current_profile = governor_decision.effective_profile;
-                write_governor_state(&governor_state_path, &governor);
-                drop(governor);
+                {
+                    let pg = state.policy.lock_recover();
+                    write_governor_state(&governor_state_path, &pg.governor);
+                }
 
                 // Thresholds adaptativos: workload-aware via Phase 3 classifier.
                 let mut overflow_thresholds = lctx.overflow_guard.thresholds(workload_mode);
@@ -2643,10 +2626,7 @@ fn main() -> anyhow::Result<()> {
                     // Workload-aware bias: heavy workloads (Coding/VideoEdit) spike pressure
                     // fast — engage optimizer 2pp earlier during those hours.
                     {
-                        let wl = {
-                            let gov = state.adaptive_governor.lock_recover();
-                            gov.user_profile.likely_workload_at_hour(hour_of_day)
-                        };
+                        let wl = state.policy.lock_recover().adaptive_governor.user_profile.likely_workload_at_hour(hour_of_day);
                         lctx.signal_intel.adjust_bias_for_workload(wl);
                     }
                     let _si_result = lctx.signal_intel.tick(
@@ -2754,9 +2734,7 @@ fn main() -> anyhow::Result<()> {
                 // Predictive agent: build context from existing signals and select intervention.
                 // Feed Kalman-smoothed pressure instead of raw — cleaner signal for LinUCB.
                 let agent_intervention = {
-                    let prev_workload = state
-                        .adaptive_governor
-                        .lock_recover()
+                    let prev_workload = state.policy.lock_recover().adaptive_governor
                         .last_ml_classification()
                         .workload;
                     let (hw_tp, hw_jt, hw_cl) = match &hw_features {
@@ -2928,9 +2906,9 @@ fn main() -> anyhow::Result<()> {
 
                     // SuggestAggressive: set a 5-minute manual override to aggressive profile.
                     if intervention == Intervention::SuggestAggressive {
-                        let mut gov = state.governor.lock_recover();
-                        if gov.manual_override.is_none() {
-                            gov.set_manual_override(
+                        let mut pg = state.policy.lock_recover();
+                        if pg.governor.manual_override.is_none() {
+                            pg.governor.set_manual_override(
                                 OptimizationProfile::AggressiveRoot,
                                 5,
                                 "predictive-agent: proactive pressure mitigation".to_string(),
@@ -3008,10 +2986,7 @@ fn main() -> anyhow::Result<()> {
                         // Cross-reference with UserProfile: if the next hour is typically
                         // a build session, apply extra tightening (builds spike fast).
                         let next_hour = (hour_of_day + 1) % 24;
-                        let next_workload = {
-                            let gov = state.adaptive_governor.lock_recover();
-                            gov.user_profile.likely_workload_at_hour(next_hour)
-                        };
+                        let next_workload = state.policy.lock_recover().adaptive_governor.user_profile.likely_workload_at_hour(next_hour);
                         let workload_multiplier = match next_workload {
                             apollo_optimizer::engine::user_profile::WorkloadType::Coding => 1.5,
                             apollo_optimizer::engine::user_profile::WorkloadType::VideoEdit => 1.3,
@@ -3158,7 +3133,7 @@ fn main() -> anyhow::Result<()> {
                 // Apply any locally learned policy patterns (and keep them even after LLM is disabled).
                 let mut actions = decision.actions;
                 {
-                    let policy = state.learned_policy.lock_recover().clone();
+                    let policy = state.policy.lock_recover().learned_policy.clone();
                     actions = llm_daemon::apply_learned_policy_actions(&snapshot, &policy, actions);
                 }
 
@@ -3225,7 +3200,7 @@ fn main() -> anyhow::Result<()> {
                         let pressure_before = snapshot.pressure.memory_pressure;
                         let hard_protected = apollo_optimizer::engine::safety::protected_processes();
                         let infra_protected = infrastructure_processes();
-                        let policy_prot = state.learned_policy.lock_recover().protected_patterns.clone();
+                        let policy_prot = state.policy.lock_recover().learned_policy.protected_patterns.clone();
                         let already_actioned: std::collections::HashSet<String> = actions
                             .iter()
                             .filter_map(|a| match a {
@@ -3376,7 +3351,7 @@ fn main() -> anyhow::Result<()> {
                 match agent_intervention {
                     Intervention::PreThrottleNoise => {
                         // Renice top 3 noise processes (soft throttle, no SIGSTOP).
-                        let noise_pats = state.learned_policy.lock_recover().noise_patterns.clone();
+                        let noise_pats = state.policy.lock_recover().learned_policy.noise_patterns.clone();
                         let mut noise_procs: Vec<_> = snapshot
                             .top_processes
                             .iter()
@@ -3401,9 +3376,7 @@ fn main() -> anyhow::Result<()> {
                         // SetMemorystatus with priority -1 asks the process to release caches
                         // voluntarily — no freeze, no kill. Passes through safety in execute_actions.
                         let interactive_pats = decide_interactive.clone();
-                        let protected_pats = state
-                            .learned_policy
-                            .lock_recover()
+                        let protected_pats = state.policy.lock_recover().learned_policy
                             .protected_patterns
                             .clone();
                         let mut bg_procs: Vec<_> = snapshot
@@ -3438,9 +3411,7 @@ fn main() -> anyhow::Result<()> {
                 if signal_digest.pressure_smooth >= 0.60
                     && !already_has_hints
                 {
-                    let protected_pats = state
-                        .learned_policy
-                        .lock_recover()
+                    let protected_pats = state.policy.lock_recover().learned_policy
                         .protected_patterns
                         .clone();
                     // Use proc_snaps (full process list) not top_processes (top 10 by CPU).
@@ -3483,8 +3454,8 @@ fn main() -> anyhow::Result<()> {
                 // Heuristic pass: AdaptiveGovernor
                 // Pass hw_features (sampled every 5 cycles) for Bayesian fusion + online learning.
                 let heuristic_decisions = {
-                    let mut gov = state.adaptive_governor.lock_recover();
-                    gov.decide_all_with_hw(
+                    let mut pg = state.policy.lock_recover();
+                    pg.adaptive_governor.decide_all_with_hw(
                         &proc_snaps,
                         &hunt_snaps,
                         foreground_app.as_deref(),
@@ -3505,9 +3476,7 @@ fn main() -> anyhow::Result<()> {
                     let sys = collector.system();
                     let infra_pats = infrastructure_processes();
                     let protected_pats = protected_processes();
-                    let policy_protected = state
-                        .learned_policy
-                        .lock_recover()
+                    let policy_protected = state.policy.lock_recover().learned_policy
                         .protected_patterns
                         .clone();
                     let pressure = signal_digest.pressure_smooth;
@@ -3579,10 +3548,7 @@ fn main() -> anyhow::Result<()> {
                             // its behavioral score. If irrelevant (0.0), no change.
                             // This means a dev runtime the user has interacted with recently
                             // gets a relevance bonus, while one that's been stale loses it.
-                            let relevance = {
-                                let gov = state.adaptive_governor.lock_recover();
-                                gov.user_profile.process_relevance(&name)
-                            };
+                            let relevance = state.policy.lock_recover().adaptive_governor.user_profile.process_relevance(&name);
                             // Boost: relevance 1.0 adds up to +0.15 to score, relevance 0.0 adds 0.
                             let score = raw_score + (relevance as f64 * 0.15);
                             bps_eval += 1;
@@ -3667,9 +3633,9 @@ fn main() -> anyhow::Result<()> {
                         _ => None,
                     }).collect();
                     let stale_names = {
-                        let gov = state.adaptive_governor.lock_recover();
                         let running: Vec<&str> = all_proc_names.iter().copied().collect();
-                        gov.user_profile.stale_apps(&running, 1800) // 30 min threshold
+                        let pg = state.policy.lock_recover();
+                        pg.adaptive_governor.user_profile.stale_apps(&running, 1800) // 30 min threshold
                     };
                     let sys = collector.system();
                     for (pid, process) in sys.processes() {
@@ -3863,9 +3829,7 @@ fn main() -> anyhow::Result<()> {
                 if llm_active || in_wake_suppression {
                     let appnap_hard = protected_processes();
                     let appnap_infra = infrastructure_processes();
-                    let appnap_policy = state
-                        .learned_policy
-                        .lock_recover()
+                    let appnap_policy = state.policy.lock_recover().learned_policy
                         .protected_patterns
                         .clone();
                     let mut qos = state.mach_qos.lock_recover();
@@ -3936,9 +3900,7 @@ fn main() -> anyhow::Result<()> {
                             fg_pids.insert(coalition_pid);
                         }
                     }
-                    let interactive_pats: Vec<String> = state
-                        .learned_policy
-                        .lock_recover()
+                    let interactive_pats: Vec<String> = state.policy.lock_recover().learned_policy
                         .interactive_patterns
                         .clone();
                     for snap in proc_snaps.iter().take(100) {
@@ -4010,6 +3972,15 @@ fn main() -> anyhow::Result<()> {
                     }
                 });
 
+                // Snapshot workload + ml_class from policy BEFORE acquiring metrics lock
+                // (avoids holding two domain locks simultaneously).
+                let current_workload_str = format!(
+                    "{:?}",
+                    state.policy.lock_recover().adaptive_governor.user_profile.current_workload()
+                );
+                // F2 — ML Ligero: read classification result (computed inside decide_all this cycle).
+                // GovernorConfig aggressiveness was already updated inside decide_all().
+                let ml_class = state.policy.lock_recover().adaptive_governor.last_ml_classification().clone();
                 // Update heuristic metrics
                 {
                     let mut m = state.metrics.lock_recover();
@@ -4018,17 +3989,8 @@ fn main() -> anyhow::Result<()> {
                     m.metrics.heuristic_freezes += heuristic_stats.freezes;
                     m.metrics.heuristic_kills_downgraded += heuristic_stats.kills_downgraded;
                     m.metrics.zombies_detected += heuristic_stats.zombies_detected;
-                    // Update current workload from adaptive governor's user profile
-                    let gov = state.adaptive_governor.lock_recover();
-                    m.metrics.current_workload = format!("{:?}", gov.user_profile.current_workload());
+                    m.metrics.current_workload = current_workload_str;
                 }
-
-                // F2 — ML Ligero: read classification result (computed inside decide_all this cycle).
-                // GovernorConfig aggressiveness was already updated inside decide_all().
-                let ml_class = {
-                    let gov = state.adaptive_governor.lock_recover();
-                    gov.last_ml_classification().clone()
-                };
                 {
                     let mut m = state.metrics.lock_recover();
                     m.metrics.ml_confidence = ml_class.confidence;
@@ -4533,9 +4495,9 @@ fn main() -> anyhow::Result<()> {
                     // ── Circuit breaker + degradation pre-check ───────────────
                     // Snapshot circuit breaker state before acquiring heavy locks.
                     let (cb_is_open, cb_open_duration) = {
-                        let cb = state.circuit_breaker.lock_recover();
-                        let is_open = *cb.state() == apollo_optimizer::engine::circuit_breaker::CircuitState::Open;
-                        let dur = cb.open_duration();
+                        let pg = state.policy.lock_recover();
+                        let is_open = *pg.circuit_breaker.state() == apollo_optimizer::engine::circuit_breaker::CircuitState::Open;
+                        let dur = pg.circuit_breaker.open_duration();
                         (is_open, dur)
                     };
 
@@ -4548,14 +4510,14 @@ fn main() -> anyhow::Result<()> {
                             .find(|p| p.name == "kernel_task")
                             .map(|p| p.cpu_usage as f64)
                             .unwrap_or(0.0);
-                        let mut deg = state.degradation.lock_recover();
+                        let mut pg = state.policy.lock_recover();
                         let inp = DegradationInputs {
                             new_failures: 0, // incremental failures added after execution
                             kernel_task_cpu_pct: kernel_cpu,
                             circuit_open: cb_is_open,
                             circuit_open_duration: cb_open_duration,
                         };
-                        deg.update(&inp).clone()
+                        pg.degradation.update(&inp).clone()
                     };
 
                     // Filter actions based on degradation tier.
@@ -4592,10 +4554,10 @@ fn main() -> anyhow::Result<()> {
                     // Snapshot before execution — used to detect changes and skip redundant disk writes.
                     let frozen_before: HashSet<u32> = frozen_set.clone();
                     let (learned_protected, learned_interactive) = {
-                        let policy = state.learned_policy.lock_recover();
+                        let pg = state.policy.lock_recover();
                         (
-                            policy.protected_patterns.clone(),
-                            policy.interactive_patterns.clone(),
+                            pg.learned_policy.protected_patterns.clone(),
+                            pg.learned_policy.interactive_patterns.clone(),
                         )
                     };
                     let mut qos = state.mach_qos.lock_recover();
@@ -4635,12 +4597,12 @@ fn main() -> anyhow::Result<()> {
                         );
                         // Report outcome to circuit breaker (lock released before I/O above).
                         {
-                            let mut cb = state.circuit_breaker.lock_recover();
+                            let mut pg = state.policy.lock_recover();
                             if out.failures == 0 {
-                                cb.record_success();
+                                pg.circuit_breaker.record_success();
                             } else {
                                 for _ in 0..out.failures {
-                                    cb.record_failure();
+                                    pg.circuit_breaker.record_failure();
                                 }
                             }
                         }
@@ -4649,14 +4611,14 @@ fn main() -> anyhow::Result<()> {
 
                     // Update degradation controller with new failure count from this cycle.
                     if outcomes.failures > 0 {
-                        let mut deg = state.degradation.lock_recover();
+                        let mut pg = state.policy.lock_recover();
                         let inp = DegradationInputs {
                             new_failures: outcomes.failures,
                             kernel_task_cpu_pct: 0.0,
                             circuit_open: false,
                             circuit_open_duration: None,
                         };
-                        deg.update(&inp);
+                        pg.degradation.update(&inp);
                     }
 
                     // Sync the temporary set back into the unified frozen_state map.
@@ -4822,9 +4784,9 @@ fn main() -> anyhow::Result<()> {
                     }
                     // Sincroniza pesos Bayesianos a la LearnedPolicy persistida.
                     if !batch.effective_names.is_empty() || !batch.low_value_names.is_empty() {
-                        let mut policy = state.learned_policy.lock_recover();
+                        let mut pg = state.policy.lock_recover();
                         for (name, weight) in &lctx.outcome_tracker.weights {
-                            policy.pattern_weights.insert(name.clone(), weight.clone());
+                            pg.learned_policy.pattern_weights.insert(name.clone(), weight.clone());
                         }
                     }
                     // Restore quality monitor: track post-restore effectiveness.
@@ -5016,7 +4978,7 @@ fn main() -> anyhow::Result<()> {
                     // Also exclude policy-protected processes (learned by LLM/user).
                     // Without this, rule_inducer generates skills whose targets are
                     // unthrottleable — they accumulate zero observations forever.
-                    let policy_prot = state.learned_policy.lock_recover().protected_patterns.clone();
+                    let policy_prot = state.policy.lock_recover().learned_policy.protected_patterns.clone();
                     let policy_prot_refs: Vec<&str> = policy_prot.iter().map(|s| s.as_str()).collect();
                     let mut all_protected: Vec<&str> = protected_set.iter().copied().collect();
                     all_protected.extend_from_slice(&policy_prot_refs);
@@ -5264,10 +5226,12 @@ fn main() -> anyhow::Result<()> {
                     }
                     if let Some(transition) = governor_decision.transition.clone() {
                         metrics.metrics.profile_switches += 1;
-                        let mut timeline = state.timeline.lock_recover();
-                        timeline.push_back(transition.clone());
-                        if timeline.len() > 200 {
-                            timeline.pop_front();
+                        {
+                            let mut pg = state.policy.lock_recover();
+                            pg.timeline.push_back(transition.clone());
+                            if pg.timeline.len() > 200 {
+                                pg.timeline.pop_front();
+                            }
                         }
                         append_timeline(&timeline_path, &transition);
                     }
@@ -5291,7 +5255,7 @@ fn main() -> anyhow::Result<()> {
                         critical_failure_timestamps.push(nowi);
                     }
                     if critical_failure_timestamps.len() > 5 {
-                        state.governor.lock_recover().force_safe_on_errors();
+                        state.policy.lock_recover().governor.force_safe_on_errors();
                         critical_failure_timestamps.clear();
                     }
 
@@ -5368,10 +5332,7 @@ fn main() -> anyhow::Result<()> {
                 {
                     let cycles = state.metrics.lock_recover().metrics.cycles;
                     if cycles % 10 == 0 {
-                        let persisted = {
-                            let gov = state.adaptive_governor.lock_recover();
-                            gov.user_profile.to_persisted()
-                        };
+                        let persisted = state.policy.lock_recover().adaptive_governor.user_profile.to_persisted();
                         write_json(&state.user_profile_path, &persisted, Some(0o600));
                     }
                 }
