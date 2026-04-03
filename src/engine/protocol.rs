@@ -55,6 +55,8 @@ pub enum DaemonRequest {
         policy: LearnedPolicy,
     },
     GetSysctlGovernor,
+    /// Revert all sysctl changes made by the daemon to their startup defaults.
+    RevertSysctls,
     /// Suscripcion push: el daemon enviara StatusPush en cada ciclo de optimizacion.
     /// La conexion se mantiene abierta indefinidamente.
     Subscribe,
@@ -92,7 +94,8 @@ impl DaemonRequest {
             | Self::LlmDisable
             | Self::LlmTest
             | Self::Feedback { .. }
-            | Self::SetLearnedPolicy { .. } => true,
+            | Self::SetLearnedPolicy { .. }
+            | Self::RevertSysctls => true,
         }
     }
 

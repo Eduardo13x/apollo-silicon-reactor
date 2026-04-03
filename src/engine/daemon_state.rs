@@ -224,6 +224,9 @@ pub struct SharedState {
 
     // Infrastructure (lock-free or low-frequency)
     pub stop: Arc<AtomicBool>,
+    /// Set by socket handler when a `RevertSysctls` RPC is received.
+    /// Main loop checks this flag each cycle, executes the revert, then clears it.
+    pub revert_sysctls_requested: Arc<AtomicBool>,
     pub cycle_condvar: Arc<(Mutex<bool>, Condvar)>,
     pub resource_interrupt: Arc<ResourceInterruptState>,
     pub subscribers: Arc<Mutex<Vec<UnixStream>>>,

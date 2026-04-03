@@ -130,6 +130,31 @@ fn default_thread_qos() -> usize {
 }
 
 impl SafetyPolicy {
+    /// Returns a `SafetyPolicy` scaled to the available hardware.
+    ///
+    /// On M1 8 GB (cores=8, ram=8): `core_scale=1.0`, `ram_scale=1.0` — identical
+    /// to the per-profile defaults.  On a 16-core 32 GB machine: `core_scale=2.0`,
+    /// `ram_scale=4.0`, so budgets scale up proportionally.
+    ///
+    /// Call after `for_profile()` to apply hardware-aware scaling:
+    /// ```ignore
+    /// let base = SafetyPolicy::for_profile(profile);
+    /// let scaled = SafetyPolicy::for_capabilities(base, cores, ram_gb);
+    /// ```
+    pub fn for_capabilities(base: Self, cores: u32, ram_gb: f64) -> Self {
+        let core_scale = (cores as f64 / 8.0).clamp(0.5, 2.0);
+        let ram_scale = (ram_gb / 8.0).clamp(0.5, 4.0);
+        Self {
+            max_boosts_per_cycle: ((base.max_boosts_per_cycle as f64 * core_scale).round() as usize).max(1),
+            max_throttles_per_cycle: ((base.max_throttles_per_cycle as f64 * core_scale).round() as usize).max(1),
+            max_paging_hints_per_cycle: ((base.max_paging_hints_per_cycle as f64 * ram_scale).round() as usize).max(1),
+            max_freezes_per_cycle: ((base.max_freezes_per_cycle as f64 * core_scale).round() as usize).max(1),
+            max_sysctl_writes_per_cycle: ((base.max_sysctl_writes_per_cycle as f64 * core_scale).round() as usize).max(1),
+            cooldown_seconds: base.cooldown_seconds,
+            max_thread_qos_per_cycle: ((base.max_thread_qos_per_cycle as f64 * core_scale).round() as usize).max(1),
+        }
+    }
+
     pub fn for_profile(profile: OptimizationProfile) -> Self {
         match profile {
             OptimizationProfile::AggressiveRoot => Self {

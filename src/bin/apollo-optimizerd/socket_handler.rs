@@ -635,6 +635,13 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             let status = state.hardware.lock_recover().sysctl_governor_status.clone();
             DaemonResponse::SysctlGovernor(status)
         }
+        DaemonRequest::RevertSysctls => {
+            tracing::info!("RevertSysctls requested via RPC — flagging main loop");
+            state
+                .revert_sysctls_requested
+                .store(true, std::sync::atomic::Ordering::Release);
+            DaemonResponse::Ok
+        }
         DaemonRequest::GetHealth => {
             use apollo_optimizer::engine::circuit_breaker::CircuitState;
             use apollo_optimizer::engine::degradation::OperationMode;

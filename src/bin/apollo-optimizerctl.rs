@@ -79,6 +79,8 @@ enum Commands {
     },
     /// Show reactive sysctl governor status
     SysctlGovernor,
+    /// Revert all sysctl changes made by the daemon to their startup defaults
+    RevertSysctls,
     /// Show daemon protocol version and build info
     Version,
     /// Show circuit breaker and degradation health summary
@@ -441,6 +443,7 @@ fn main() -> anyhow::Result<()> {
             TeachCommands::Apply { file } => return handle_teach_apply(&file),
         },
         Commands::SysctlGovernor => send_request(DaemonRequest::GetSysctlGovernor),
+        Commands::RevertSysctls => send_request(DaemonRequest::RevertSysctls),
         Commands::Version => send_request(DaemonRequest::GetVersion),
         Commands::Health => send_request(DaemonRequest::GetHealth),
     }?;

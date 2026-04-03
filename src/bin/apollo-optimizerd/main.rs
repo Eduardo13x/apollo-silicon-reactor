@@ -597,6 +597,7 @@ fn main() -> anyhow::Result<()> {
 
                 cycle_condvar: Arc::new((Mutex::new(false), Condvar::new())),
                 resource_interrupt: Arc::new(ResourceInterruptState::new()),
+                revert_sysctls_requested: Arc::new(AtomicBool::new(false)),
 
                 subscribers: Arc::new(Mutex::new(Vec::new())),
             };
@@ -809,6 +810,18 @@ fn main() -> anyhow::Result<()> {
             let mut syscall_classifier = SyscallClassifier::new();
             let mut network_monitor = NetworkMonitor::new();
             let mut sysctl_governor = SysctlGovernor::new(is_root);
+            // Hardware capability scaling for SafetyPolicy::for_capabilities().
+            // Detected once at startup; cost is ~1ms for the sysinfo query.
+            let hw_cores: u32 = {
+                let mut s = sysinfo::System::new();
+                s.refresh_cpu();
+                s.cpus().len().max(1) as u32
+            };
+            let hw_ram_gb: f64 = {
+                let mut s = sysinfo::System::new();
+                s.refresh_memory();
+                s.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0)
+            };
             let mut thermal_mgr = ThermalManager::new();
             let mut wake_storm = WakeStormDetector::new();
             // GPU thermal monitoring: integrates with thermal_manager for GPU-aware decisions.
@@ -4053,6 +4066,35 @@ fn main() -> anyhow::Result<()> {
                     state.hardware.lock_recover().sysctl_governor_status = status;
                 }
 
+                // RevertSysctls RPC: if requested via socket, revert all sysctl changes now.
+                if state.revert_sysctls_requested.swap(false, Ordering::AcqRel) {
+                    tracing::info!("RevertSysctls RPC: reverting sysctl changes to defaults");
+                    let revert_actions = sysctl_governor.revert_to_defaults();
+                    if !revert_actions.is_empty() {
+                        let caps = detect_capabilities();
+                        let mut frozen_dummy = std::collections::HashSet::new();
+                        let outcomes = execute_actions(
+                            revert_actions,
+                            &caps,
+                            &journal_path,
+                            &mut frozen_dummy,
+                            &[],
+                            &[],
+                            None,
+                        );
+                        if outcomes.failures == 0 {
+                            sysctl_governor.mark_reverted();
+                        } else {
+                            tracing::warn!(
+                                failures = outcomes.failures,
+                                "RevertSysctls RPC: revert had failures"
+                            );
+                        }
+                    } else {
+                        sysctl_governor.mark_reverted();
+                    }
+                }
+
                 // F3 — Safety Precedence: foreground app is NEVER throttled or frozen.
                 // Also protects recently active apps (minimized but used in the last 5 min).
                 // Only logs to discrepancy when the reason is ambiguous (not covered by
@@ -4110,7 +4152,11 @@ fn main() -> anyhow::Result<()> {
                     actions.retain(|a| !matches!(a, RootAction::BoostProcess { .. }));
                 }
 
-                let policy = SafetyPolicy::for_profile(current_profile);
+                let policy = SafetyPolicy::for_capabilities(
+                    SafetyPolicy::for_profile(current_profile),
+                    hw_cores,
+                    hw_ram_gb,
+                );
 
                 let now = Instant::now();
                 if thrash
