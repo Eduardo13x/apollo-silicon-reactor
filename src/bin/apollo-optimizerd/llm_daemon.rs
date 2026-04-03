@@ -52,31 +52,41 @@ pub fn llm_reactive_tick(
     heuristic_struggling: bool,
 ) {
     let now = Utc::now();
-    let has_key = state.llm_key_path.exists();
+    let (llm_key_path, llm_state_path, suggestions_path, llm_cfg_default) = {
+        let llm = state.llm.lock_recover();
+        (
+            llm.llm_key_path.clone(),
+            llm.llm_state_path.clone(),
+            llm.suggestions_path.clone(),
+            llm.llm_cfg.clone(),
+        )
+    };
+    let has_key = llm_key_path.exists();
 
     // TTL housekeeping: if training expired, disable and delete key.
     {
-        let mut llm_state = state.llm_state.lock_recover();
-        if llm_state.enabled
-            && llm_state
+        let mut guard = state.llm.lock_recover();
+        if guard.llm_state.enabled
+            && guard.llm_state
                 .training_expires_at
                 .map(|t| t <= now)
                 .unwrap_or(true)
         {
-            llm_state.enabled = false;
-            llm_state.training_expires_at = None;
-            llm_state.last_suggestion = None;
-            llm_state.mode = LlmRunMode::Off;
-            llm_state.last_error = Some("training-expired".to_string());
-            write_json(&state.llm_state_path, &*llm_state, Some(0o600));
-            delete_file_best_effort(&state.llm_key_path);
+            guard.llm_state.enabled = false;
+            guard.llm_state.training_expires_at = None;
+            guard.llm_state.last_suggestion = None;
+            guard.llm_state.mode = LlmRunMode::Off;
+            guard.llm_state.last_error = Some("training-expired".to_string());
+            write_json(&llm_state_path, &guard.llm_state, Some(0o600));
+            drop(guard);
+            delete_file_best_effort(&llm_key_path);
             return;
         }
     }
 
     let llm_cfg = load_repo_config(&state.config_path)
         .llm
-        .unwrap_or_else(|| state.llm_cfg.as_ref().clone());
+        .unwrap_or(llm_cfg_default);
     if !llm_cfg.enabled() {
         return;
     }
@@ -87,7 +97,7 @@ pub fn llm_reactive_tick(
         return;
     }
 
-    let api_key = match HardPath::read_to_string_limited(&state.llm_key_path, 4096) {
+    let api_key = match HardPath::read_to_string_limited(&llm_key_path, 4096) {
         Ok(v) => v,
         Err(_) => return,
     };
@@ -107,49 +117,49 @@ pub fn llm_reactive_tick(
     };
 
     let (mode, daily_budget, min_interval_secs, max_calls_per_hour, pattern_budget_per_day) = {
-        let mut llm_state = state.llm_state.lock_recover();
-        if !llm_state.training_active() {
-            write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+        let mut guard = state.llm.lock_recover();
+        if !guard.llm_state.training_active() {
+            write_json(&llm_state_path, &guard.llm_state, Some(0o600));
             return;
         }
 
         // Reset daily budget window.
-        if llm_state.calls_today_day.as_deref() != Some(&today) {
-            llm_state.calls_today_day = Some(today.clone());
-            llm_state.calls_today = 0;
+        if guard.llm_state.calls_today_day.as_deref() != Some(&today) {
+            guard.llm_state.calls_today_day = Some(today.clone());
+            guard.llm_state.calls_today = 0;
         }
 
         // Keep trigger events only for a short horizon.
-        llm_state
+        guard.llm_state
             .trigger_events
             .retain(|t| now - *t < ChronoDuration::minutes(30));
-        let trigger_len = llm_state.trigger_events.len();
+        let trigger_len = guard.llm_state.trigger_events.len();
         if trigger_len > 100 {
-            llm_state.trigger_events.drain(..trigger_len - 100);
+            guard.llm_state.trigger_events.drain(..trigger_len - 100);
         }
-        let triggers_recent = llm_state.trigger_events.len() as u32;
+        let triggers_recent = guard.llm_state.trigger_events.len() as u32;
 
-        let bootcamp = llm_state
+        let bootcamp = guard.llm_state
             .training_started_at
             .map(|t| now - t < ChronoDuration::days(5))
             .unwrap_or(false);
         let daily_budget = if bootcamp { 24 } else { 8 };
 
         // If we've been stable for a while, bias to strict.
-        let stable_for = llm_state
+        let stable_for = guard.llm_state
             .no_trigger_since
             .map(|t| now - t)
             .unwrap_or_else(|| ChronoDuration::seconds(0));
         let stable_long = stable_for > ChronoDuration::hours(3);
 
-        let consumed = llm_state.calls_today;
+        let consumed = guard.llm_state.calls_today;
         let consumed_ratio = if daily_budget == 0 {
             1.0
         } else {
             (consumed as f64) / (daily_budget as f64)
         };
 
-        let mut mode = llm_state.mode;
+        let mut mode = guard.llm_state.mode;
         if quiet_hours {
             mode = LlmRunMode::Strict;
         } else if consumed >= daily_budget {
@@ -166,7 +176,7 @@ pub fn llm_reactive_tick(
             // Recover from off when the budget permits.
             mode = LlmRunMode::Strict;
         }
-        llm_state.mode = mode;
+        guard.llm_state.mode = mode;
 
         let (base_min_interval, base_max_calls, pattern_budget) = match mode {
             LlmRunMode::Sensitive => (600_u64, 4_u32, if bootcamp { 5_u32 } else { 3_u32 }),
@@ -178,7 +188,7 @@ pub fn llm_reactive_tick(
         let effective_min_interval = base_min_interval.max(llm_cfg.min_interval_secs());
         let effective_max_calls = base_max_calls.min(llm_cfg.max_calls_per_hour().max(1));
 
-        write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+        write_json(&llm_state_path, &guard.llm_state, Some(0o600));
         (
             mode,
             daily_budget,
@@ -228,9 +238,9 @@ pub fn llm_reactive_tick(
     // One-time baseline call after enabling training so it doesn't look "stuck"
     // when the system is stable and no triggers fire.
     let baseline_call = {
-        let llm_state = state.llm_state.lock_recover();
-        llm_state.last_attempt_at.is_none()
-            && llm_state
+        let guard = state.llm.lock_recover();
+        guard.llm_state.last_attempt_at.is_none()
+            && guard.llm_state
                 .training_started_at
                 .map(|t| now - t > ChronoDuration::minutes(2))
                 .unwrap_or(false)
@@ -251,14 +261,14 @@ pub fn llm_reactive_tick(
         // Bootcamp sampling: even when the system is "fine", take an occasional sample call
         // so the teacher can learn normal workload patterns.
         let sampling_due = {
-            let llm_state = state.llm_state.lock_recover();
-            let since_last = llm_state
+            let guard = state.llm.lock_recover();
+            let since_last = guard.llm_state
                 .last_attempt_at
                 .map(|t| now - t)
                 .unwrap_or_else(|| ChronoDuration::hours(24));
             let user_active_proxy = ws_cpu >= 10.0 || snapshot.cpu.global_usage >= 15.0;
             mode == LlmRunMode::Sensitive
-                && llm_state
+                && guard.llm_state
                     .training_started_at
                     .map(|t| now - t < ChronoDuration::days(5))
                     .unwrap_or(false)
@@ -266,22 +276,22 @@ pub fn llm_reactive_tick(
                 && since_last > ChronoDuration::minutes(45)
         };
 
-        let mut llm_state = state.llm_state.lock_recover();
-        if llm_state.no_trigger_since.is_none() {
-            llm_state.no_trigger_since = Some(now);
+        let mut guard = state.llm.lock_recover();
+        if guard.llm_state.no_trigger_since.is_none() {
+            guard.llm_state.no_trigger_since = Some(now);
         }
 
         if sampling_due {
-            llm_state.last_trigger_at = Some(now);
-            llm_state.last_trigger_reason = Some("sampling".to_string());
-            llm_state.trigger_events.push(now);
-            llm_state.no_trigger_since = None;
-            write_json(&state.llm_state_path, &*llm_state, Some(0o600));
-            drop(llm_state);
+            guard.llm_state.last_trigger_at = Some(now);
+            guard.llm_state.last_trigger_reason = Some("sampling".to_string());
+            guard.llm_state.trigger_events.push(now);
+            guard.llm_state.no_trigger_since = None;
+            write_json(&llm_state_path, &guard.llm_state, Some(0o600));
+            drop(guard);
             // Turn sampling into a synthetic rising-edge trigger.
             rising_edge = true;
         } else {
-            write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+            write_json(&llm_state_path, &guard.llm_state, Some(0o600));
             return;
         }
     }
@@ -300,12 +310,12 @@ pub fn llm_reactive_tick(
     };
 
     if rising_edge {
-        let mut llm_state = state.llm_state.lock_recover();
-        llm_state.last_trigger_at = Some(now);
-        llm_state.last_trigger_reason = Some(trigger_reason.clone());
-        llm_state.trigger_events.push(now);
-        llm_state.no_trigger_since = None;
-        write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+        let mut guard = state.llm.lock_recover();
+        guard.llm_state.last_trigger_at = Some(now);
+        guard.llm_state.last_trigger_reason = Some(trigger_reason.clone());
+        guard.llm_state.trigger_events.push(now);
+        guard.llm_state.no_trigger_since = None;
+        write_json(&llm_state_path, &guard.llm_state, Some(0o600));
     }
 
     // Call gating: only call on rising edge.
@@ -315,41 +325,41 @@ pub fn llm_reactive_tick(
 
     // Budget + cadence.
     {
-        let mut llm_state = state.llm_state.lock_recover();
+        let mut guard = state.llm.lock_recover();
 
-        if llm_state.calls_today >= daily_budget {
-            llm_state.mode = LlmRunMode::Off;
-            llm_state.last_error = Some("daily-budget-exhausted".to_string());
-            write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+        if guard.llm_state.calls_today >= daily_budget {
+            guard.llm_state.mode = LlmRunMode::Off;
+            guard.llm_state.last_error = Some("daily-budget-exhausted".to_string());
+            write_json(&llm_state_path, &guard.llm_state, Some(0o600));
             return;
         }
 
-        if let Some(last) = llm_state.last_attempt_at {
+        if let Some(last) = guard.llm_state.last_attempt_at {
             if now - last < ChronoDuration::seconds(min_interval_secs as i64) {
                 return;
             }
         }
 
         // Per-hour window.
-        if llm_state
+        if guard.llm_state
             .hour_window_started_at
             .map(|t| now - t > ChronoDuration::hours(1))
             .unwrap_or(true)
         {
-            llm_state.hour_window_started_at = Some(now);
-            llm_state.calls_in_window = 0;
+            guard.llm_state.hour_window_started_at = Some(now);
+            guard.llm_state.calls_in_window = 0;
         }
-        if llm_state.calls_in_window >= max_calls_per_hour {
+        if guard.llm_state.calls_in_window >= max_calls_per_hour {
             return;
         }
 
         // Record attempt before the network call so status updates immediately.
-        llm_state.last_attempt_at = Some(now);
-        llm_state.last_http_status = None;
-        llm_state.last_error = None;
-        llm_state.calls_in_window += 1;
-        llm_state.calls_today += 1;
-        write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+        guard.llm_state.last_attempt_at = Some(now);
+        guard.llm_state.last_http_status = None;
+        guard.llm_state.last_error = None;
+        guard.llm_state.calls_in_window += 1;
+        guard.llm_state.calls_today += 1;
+        write_json(&llm_state_path, &guard.llm_state, Some(0o600));
     }
 
     // Network call (no locks held).
@@ -361,19 +371,19 @@ pub fn llm_reactive_tick(
         Ok(suggestion) => {
             let accepted = suggestion.confidence >= llm_cfg.min_confidence();
             {
-                let mut llm_state = state.llm_state.lock_recover();
-                llm_state.last_http_status = Some(200);
-                llm_state.last_call_at = Some(now);
-                llm_state.last_suggestion = Some(suggestion.clone());
-                llm_state.consecutive_failures = 0;
+                let mut guard = state.llm.lock_recover();
+                guard.llm_state.last_http_status = Some(200);
+                guard.llm_state.last_call_at = Some(now);
+                guard.llm_state.last_suggestion = Some(suggestion.clone());
+                guard.llm_state.consecutive_failures = 0;
                 if !accepted {
-                    llm_state.last_error = Some("below-min-confidence".to_string());
+                    guard.llm_state.last_error = Some("below-min-confidence".to_string());
                 }
-                write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+                write_json(&llm_state_path, &guard.llm_state, Some(0o600));
             }
 
             append_jsonl(
-                &state.suggestions_path,
+                &suggestions_path,
                 &serde_json::json!({
                     "at": now,
                     "trigger": trigger_reason,
@@ -400,118 +410,127 @@ pub fn llm_reactive_tick(
             }
 
             // 3) Learned patterns: merge with daily cap.
-            {
-                let mut llm_state = state.llm_state.lock_recover();
+            let remaining = {
+                let mut guard = state.llm.lock_recover();
                 let day = now.date_naive();
-                let reset_day = llm_state
+                let reset_day = guard.llm_state
                     .policy_updates_day
                     .map(|d| d.date_naive() != day)
                     .unwrap_or(true);
                 if reset_day {
-                    llm_state.policy_updates_day = Some(now);
-                    llm_state.policy_updates_today = 0;
+                    guard.llm_state.policy_updates_day = Some(now);
+                    guard.llm_state.policy_updates_today = 0;
                 }
                 let remaining =
-                    pattern_budget_per_day.saturating_sub(llm_state.policy_updates_today);
+                    pattern_budget_per_day.saturating_sub(guard.llm_state.policy_updates_today);
                 if remaining == 0 {
-                    write_json(&state.llm_state_path, &*llm_state, Some(0o600));
-                    return;
+                    write_json(&llm_state_path, &guard.llm_state, Some(0o600));
                 }
+                remaining
+            };
+            if remaining == 0 {
+                return;
+            }
 
-                let mut policy = state.learned_policy.lock_recover();
+            let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
+            let mut policy = state.learned_policy.lock_recover();
 
-                let mut added = 0u32;
-                for p in suggestion
-                    .add_interactive_patterns
-                    .iter()
-                    .take(remaining as usize)
+            let mut added = 0u32;
+            for p in suggestion
+                .add_interactive_patterns
+                .iter()
+                .take(remaining as usize)
+            {
+                if !policy.interactive_patterns.contains(p)
+                    && !pattern_conflicts_with_protected(p)
                 {
-                    if !policy.interactive_patterns.contains(p)
-                        && !pattern_conflicts_with_protected(p)
-                    {
-                        // Remove from noise if promoted to interactive.
-                        policy.noise_patterns.retain(|n| n != p);
-                        policy.interactive_patterns.push(p.clone());
-                        added += 1;
-                    }
+                    // Remove from noise if promoted to interactive.
+                    policy.noise_patterns.retain(|n| n != p);
+                    policy.interactive_patterns.push(p.clone());
+                    added += 1;
                 }
-                for p in suggestion
-                    .add_noise_patterns
-                    .iter()
-                    .take(remaining.saturating_sub(added) as usize)
+            }
+            for p in suggestion
+                .add_noise_patterns
+                .iter()
+                .take(remaining.saturating_sub(added) as usize)
+            {
+                // Skip if already protected or interactive — cannot downgrade.
+                if !policy.noise_patterns.contains(p)
+                    && !pattern_conflicts_with_protected(p)
+                    && !policy.protected_patterns.contains(p)
+                    && !policy.interactive_patterns.contains(p)
                 {
-                    // Skip if already protected or interactive — cannot downgrade.
-                    if !policy.noise_patterns.contains(p)
-                        && !pattern_conflicts_with_protected(p)
-                        && !policy.protected_patterns.contains(p)
-                        && !policy.interactive_patterns.contains(p)
-                    {
-                        policy.noise_patterns.push(p.clone());
-                        added += 1;
-                    }
+                    policy.noise_patterns.push(p.clone());
+                    added += 1;
                 }
-                for p in suggestion
-                    .add_protected_patterns
-                    .iter()
-                    .take(remaining.saturating_sub(added) as usize)
+            }
+            for p in suggestion
+                .add_protected_patterns
+                .iter()
+                .take(remaining.saturating_sub(added) as usize)
+            {
+                if !policy.protected_patterns.contains(p)
+                    && !pattern_conflicts_with_protected(p)
                 {
-                    if !policy.protected_patterns.contains(p)
-                        && !pattern_conflicts_with_protected(p)
-                    {
-                        // Remove from noise when promoted to protected.
-                        policy.noise_patterns.retain(|n| n != p);
-                        policy.protected_patterns.push(p.clone());
-                        added += 1;
-                    }
+                    // Remove from noise when promoted to protected.
+                    policy.noise_patterns.retain(|n| n != p);
+                    policy.protected_patterns.push(p.clone());
+                    added += 1;
                 }
+            }
 
-                if added > 0 {
-                    policy.interactive_patterns.sort();
-                    policy.noise_patterns.sort();
-                    policy.protected_patterns.sort();
-                    policy.learned_at = Some(now);
-                    write_json(&state.learned_policy_path, &*policy, Some(0o600));
-                    llm_state.policy_updates_today += added;
-                    // Propagate updated patterns to the ML Ligero classifier.
-                    {
-                        let mut gov = state.adaptive_governor.lock_recover();
-                        gov.update_learned_policy(&policy);
-                    }
+            if added > 0 {
+                policy.interactive_patterns.sort();
+                policy.noise_patterns.sort();
+                policy.protected_patterns.sort();
+                policy.learned_at = Some(now);
+                write_json(&learned_policy_path, &*policy, Some(0o600));
+                drop(policy);
+                // Propagate updated patterns to the ML Ligero classifier.
+                {
+                    let policy_snap = state.learned_policy.lock_recover().clone();
+                    let mut gov = state.adaptive_governor.lock_recover();
+                    gov.update_learned_policy(&policy_snap);
                 }
-                write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+                {
+                    let mut guard = state.llm.lock_recover();
+                    guard.llm_state.policy_updates_today += added;
+                    write_json(&llm_state_path, &guard.llm_state, Some(0o600));
+                }
             }
         }
         Err(err) => {
-            let mut llm_state = state.llm_state.lock_recover();
-            llm_state.consecutive_failures += 1;
+            let mut guard = state.llm.lock_recover();
+            guard.llm_state.consecutive_failures += 1;
             match err {
                 apollo_optimizer::engine::llm::LlmCallError::Cooldown => {
-                    llm_state.last_error = Some("cooldown".to_string());
+                    guard.llm_state.last_error = Some("cooldown".to_string());
                 }
                 apollo_optimizer::engine::llm::LlmCallError::HttpStatus { code, body_excerpt } => {
-                    llm_state.last_http_status = Some(code);
-                    llm_state.last_error = Some(format!(
+                    guard.llm_state.last_http_status = Some(code);
+                    guard.llm_state.last_error = Some(format!(
                         "http-status {} {}",
                         code,
                         body_excerpt.unwrap_or_default()
                     ));
                 }
                 apollo_optimizer::engine::llm::LlmCallError::Transport(e) => {
-                    llm_state.last_error = Some(format!("transport {}", e));
+                    guard.llm_state.last_error = Some(format!("transport {}", e));
                 }
                 apollo_optimizer::engine::llm::LlmCallError::Parse(e) => {
-                    llm_state.last_error = Some(format!("parse {}", e));
+                    guard.llm_state.last_error = Some(format!("parse {}", e));
                 }
                 apollo_optimizer::engine::llm::LlmCallError::Rejected(e) => {
-                    llm_state.last_error = Some(format!("rejected {}", e));
+                    guard.llm_state.last_error = Some(format!("rejected {}", e));
                 }
             }
 
             // Fail-safe: if it's repeatedly failing, go strict to save cost.
-            if llm_state.consecutive_failures >= 3 {
-                llm_state.mode = LlmRunMode::Strict;
+            if guard.llm_state.consecutive_failures >= 3 {
+                guard.llm_state.mode = LlmRunMode::Strict;
             }
-            write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+            write_json(&llm_state_path, &guard.llm_state, Some(0o600));
         }
     }
 }
@@ -646,7 +665,8 @@ pub fn usage_learning_tick(
             policy.noise_patterns.sort();
             policy.protected_patterns.sort();
             policy.learned_at = Some(now);
-            write_json(&state.learned_policy_path, &*policy, Some(0o600));
+            let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
+            write_json(&learned_policy_path, &*policy, Some(0o600));
             // Propagate updated patterns to the ML Ligero classifier.
             {
                 let mut gov = state.adaptive_governor.lock_recover();

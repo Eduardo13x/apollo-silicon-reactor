@@ -134,7 +134,7 @@ use clap::{Parser, Subcommand};
 // v0.9.0: ACL alias — DomainSharedState is the grouped version being migrated to
 #[allow(unused_imports)]
 use apollo_optimizer::engine::daemon_state::{
-    HardwareState, ProcessState, SharedState as DomainSharedState, UsageDomainState,
+    HardwareState, LlmDomainState, ProcessState, SharedState as DomainSharedState, UsageDomainState,
     UsageTrackerState,
 };
 
@@ -185,14 +185,8 @@ pub(crate) struct SharedState {
     pub(crate) timeline: Arc<Mutex<VecDeque<ProfileTransition>>>,
     pub(crate) stop: Arc<AtomicBool>,
 
-    pub(crate) llm_cfg: Arc<LlmConfig>,
-    pub(crate) llm_state: Arc<Mutex<LlmState>>,
+    pub(crate) llm: Arc<Mutex<LlmDomainState>>,
     pub(crate) learned_policy: Arc<Mutex<LearnedPolicy>>,
-    pub(crate) llm_state_path: PathBuf,
-    pub(crate) llm_key_path: PathBuf,
-    pub(crate) learned_policy_path: PathBuf,
-    pub(crate) feedback_path: PathBuf,
-    pub(crate) suggestions_path: PathBuf,
 
     pub(crate) config_path: PathBuf,
 
@@ -615,14 +609,16 @@ fn main() -> anyhow::Result<()> {
                 timeline: Arc::new(Mutex::new(VecDeque::new())),
                 stop: Arc::new(AtomicBool::new(false)),
 
-                llm_cfg: Arc::new(llm_cfg),
-                llm_state: Arc::new(Mutex::new(llm_state)),
+                llm: Arc::new(Mutex::new(LlmDomainState {
+                    llm_cfg,
+                    llm_state,
+                    llm_state_path,
+                    llm_key_path,
+                    learned_policy_path,
+                    feedback_path,
+                    suggestions_path,
+                })),
                 learned_policy: Arc::new(Mutex::new(learned_policy)),
-                llm_state_path,
-                llm_key_path,
-                learned_policy_path,
-                feedback_path,
-                suggestions_path,
 
                 config_path,
 
@@ -689,6 +685,7 @@ fn main() -> anyhow::Result<()> {
 
             // Scrub learned policy: remove patterns that should never be interactive.
             // This list is curated by LLM Teacher analysis of usage_model data.
+            let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
             {
                 let mut policy = state.learned_policy.lock_recover();
                 let bad_interactive: Vec<&str> = vec![
@@ -759,7 +756,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 let removed = before - policy.interactive_patterns.len();
                 if removed > 0 || policy.noise_patterns.len() == 1 {
-                    write_json(&state.learned_policy_path, &*policy, Some(0o600));
+                    write_json(&learned_policy_path, &*policy, Some(0o600));
                 }
             }
 
@@ -853,7 +850,7 @@ fn main() -> anyhow::Result<()> {
             let mut critical_failure_timestamps: Vec<Instant> = Vec::new();
             let mut override_was_active = false;
             let daemon_start = Instant::now();
-            let mut llm_advisor = LlmAdvisor::new(state.llm_cfg.as_ref().clone());
+            let mut llm_advisor = LlmAdvisor::new(state.llm.lock_recover().llm_cfg.clone());
 
             // Secondary optimization modules — all run each cycle without locks.
             let mut analytics = AnalyticsEngine::new();

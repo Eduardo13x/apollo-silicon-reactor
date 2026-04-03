@@ -336,53 +336,65 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             let now = Utc::now();
             let ttl_clamped = ttl_days.clamp(1, 365);
             let expires = now + ChronoDuration::days(ttl_clamped as i64);
-            if write_secret(&state.llm_key_path, api_key.trim()).is_err() {
+            let (llm_key_path, llm_state_path) = {
+                let llm = state.llm.lock_recover();
+                (llm.llm_key_path.clone(), llm.llm_state_path.clone())
+            };
+            if write_secret(&llm_key_path, api_key.trim()).is_err() {
                 return DaemonResponse::Error {
                     message: "failed to write llm key".to_string(),
                 };
             }
             {
-                let mut llm_state = state.llm_state.lock_recover();
-                llm_state.enabled = true;
-                llm_state.training_started_at = Some(now);
-                llm_state.training_expires_at = Some(expires);
-                llm_state.last_call_at = None;
-                llm_state.last_attempt_at = None;
-                llm_state.last_http_status = None;
-                llm_state.last_error = None;
-                llm_state.last_trigger_reason = None;
-                llm_state.consecutive_failures = 0;
-                llm_state.calls_in_window = 0;
-                llm_state.hour_window_started_at = Some(now);
-                llm_state.calls_today_day = None;
-                llm_state.calls_today = 0;
-                llm_state.mode = LlmRunMode::Sensitive;
-                llm_state.last_trigger_at = None;
-                llm_state.trigger_events.clear();
-                llm_state.no_trigger_since = Some(now);
-                llm_state.last_suggestion = None;
-                llm_state.policy_updates_day = None;
-                llm_state.policy_updates_today = 0;
-                write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+                let mut guard = state.llm.lock_recover();
+                guard.llm_state.enabled = true;
+                guard.llm_state.training_started_at = Some(now);
+                guard.llm_state.training_expires_at = Some(expires);
+                guard.llm_state.last_call_at = None;
+                guard.llm_state.last_attempt_at = None;
+                guard.llm_state.last_http_status = None;
+                guard.llm_state.last_error = None;
+                guard.llm_state.last_trigger_reason = None;
+                guard.llm_state.consecutive_failures = 0;
+                guard.llm_state.calls_in_window = 0;
+                guard.llm_state.hour_window_started_at = Some(now);
+                guard.llm_state.calls_today_day = None;
+                guard.llm_state.calls_today = 0;
+                guard.llm_state.mode = LlmRunMode::Sensitive;
+                guard.llm_state.last_trigger_at = None;
+                guard.llm_state.trigger_events.clear();
+                guard.llm_state.no_trigger_since = Some(now);
+                guard.llm_state.last_suggestion = None;
+                guard.llm_state.policy_updates_day = None;
+                guard.llm_state.policy_updates_today = 0;
+                write_json(&llm_state_path, &guard.llm_state, Some(0o600));
             }
             DaemonResponse::Ok
         }
         DaemonRequest::LlmDisable => {
-            delete_file_best_effort(&state.llm_key_path);
+            let (llm_key_path, llm_state_path) = {
+                let llm = state.llm.lock_recover();
+                (llm.llm_key_path.clone(), llm.llm_state_path.clone())
+            };
+            delete_file_best_effort(&llm_key_path);
             {
-                let mut llm_state = state.llm_state.lock_recover();
-                llm_state.enabled = false;
-                llm_state.training_expires_at = None;
-                llm_state.last_suggestion = None;
-                write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+                let mut guard = state.llm.lock_recover();
+                guard.llm_state.enabled = false;
+                guard.llm_state.training_expires_at = None;
+                guard.llm_state.last_suggestion = None;
+                write_json(&llm_state_path, &guard.llm_state, Some(0o600));
             }
             DaemonResponse::Ok
         }
         DaemonRequest::LlmTest => {
             let now = Utc::now();
+            let (llm_key_path, llm_state_path, llm_cfg_default) = {
+                let llm = state.llm.lock_recover();
+                (llm.llm_key_path.clone(), llm.llm_state_path.clone(), llm.llm_cfg.clone())
+            };
             let llm_cfg = load_repo_config(&state.config_path)
                 .llm
-                .unwrap_or_else(|| state.llm_cfg.as_ref().clone());
+                .unwrap_or(llm_cfg_default);
             if !llm_cfg.enabled() {
                 return DaemonResponse::LlmTestResult {
                     ok: false,
@@ -391,7 +403,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                     suggestion: None,
                 };
             }
-            if !state.llm_key_path.exists() {
+            if !llm_key_path.exists() {
                 return DaemonResponse::LlmTestResult {
                     ok: false,
                     http_status: None,
@@ -400,8 +412,8 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 };
             }
             {
-                let llm_state = state.llm_state.lock_recover();
-                if !llm_state.training_active() {
+                let guard = state.llm.lock_recover();
+                if !guard.llm_state.training_active() {
                     return DaemonResponse::LlmTestResult {
                         ok: false,
                         http_status: None,
@@ -411,7 +423,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 }
             }
 
-            let api_key = match HardPath::read_to_string_limited(&state.llm_key_path, 4096) {
+            let api_key = match HardPath::read_to_string_limited(&llm_key_path, 4096) {
                 Ok(v) => v,
                 Err(_) => {
                     return DaemonResponse::LlmTestResult {
@@ -430,33 +442,33 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
 
             // Record attempt immediately.
             {
-                let mut llm_state = state.llm_state.lock_recover();
-                if llm_state.training_started_at.is_none() {
-                    llm_state.training_started_at = Some(now);
+                let mut guard = state.llm.lock_recover();
+                if guard.llm_state.training_started_at.is_none() {
+                    guard.llm_state.training_started_at = Some(now);
                 }
-                llm_state.last_attempt_at = Some(now);
-                llm_state.last_trigger_reason = Some("manual-test".to_string());
-                llm_state.last_error = None;
-                llm_state.last_http_status = None;
+                guard.llm_state.last_attempt_at = Some(now);
+                guard.llm_state.last_trigger_reason = Some("manual-test".to_string());
+                guard.llm_state.last_error = None;
+                guard.llm_state.last_http_status = None;
 
                 // Count this as a call attempt for observability/budget.
                 let today = Local::now().date_naive().to_string();
-                if llm_state.calls_today_day.as_deref() != Some(&today) {
-                    llm_state.calls_today_day = Some(today);
-                    llm_state.calls_today = 0;
+                if guard.llm_state.calls_today_day.as_deref() != Some(&today) {
+                    guard.llm_state.calls_today_day = Some(today);
+                    guard.llm_state.calls_today = 0;
                 }
-                llm_state.calls_today += 1;
-                if llm_state
+                guard.llm_state.calls_today += 1;
+                if guard.llm_state
                     .hour_window_started_at
                     .map(|t| now - t > ChronoDuration::hours(1))
                     .unwrap_or(true)
                 {
-                    llm_state.hour_window_started_at = Some(now);
-                    llm_state.calls_in_window = 0;
+                    guard.llm_state.hour_window_started_at = Some(now);
+                    guard.llm_state.calls_in_window = 0;
                 }
-                llm_state.calls_in_window += 1;
+                guard.llm_state.calls_in_window += 1;
 
-                write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+                write_json(&llm_state_path, &guard.llm_state, Some(0o600));
             }
 
             let mut advisor = LlmAdvisor::new(llm_cfg.clone());
@@ -464,12 +476,12 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             match advisor.call_raw(&snapshot, &api_key, Some(&current_policy)) {
                 Ok(suggestion) => {
                     {
-                        let mut llm_state = state.llm_state.lock_recover();
-                        llm_state.last_call_at = Some(now);
-                        llm_state.last_http_status = Some(200);
-                        llm_state.last_suggestion = Some(suggestion.clone());
-                        llm_state.last_error = None;
-                        write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+                        let mut guard = state.llm.lock_recover();
+                        guard.llm_state.last_call_at = Some(now);
+                        guard.llm_state.last_http_status = Some(200);
+                        guard.llm_state.last_suggestion = Some(suggestion.clone());
+                        guard.llm_state.last_error = None;
+                        write_json(&llm_state_path, &guard.llm_state, Some(0o600));
                     }
                     DaemonResponse::LlmTestResult {
                         ok: true,
@@ -501,10 +513,10 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                         }
                     };
                     {
-                        let mut llm_state = state.llm_state.lock_recover();
-                        llm_state.last_http_status = http_status;
-                        llm_state.last_error = Some(msg.clone());
-                        write_json(&state.llm_state_path, &*llm_state, Some(0o600));
+                        let mut guard = state.llm.lock_recover();
+                        guard.llm_state.last_http_status = http_status;
+                        guard.llm_state.last_error = Some(msg.clone());
+                        write_json(&llm_state_path, &guard.llm_state, Some(0o600));
                     }
                     DaemonResponse::LlmTestResult {
                         ok: false,
@@ -583,12 +595,13 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 sanitized
                     .protected_patterns
                     .retain(|pat| !pattern_conflicts_with_protected(pat));
+                let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
                 let mut policy = state.learned_policy.lock_recover();
                 *policy = sanitized;
                 // Re-merge seed as floor — seed patterns can never be removed.
                 merge_seed_into(&mut policy);
                 policy.learned_at = Some(Utc::now());
-                write_json(&state.learned_policy_path, &*policy, Some(0o600));
+                write_json(&learned_policy_path, &*policy, Some(0o600));
                 // Propagate to ML classifier.
                 {
                     let mut gov = state.adaptive_governor.lock_recover();
@@ -615,7 +628,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 rating,
                 note,
             };
-            append_jsonl(&state.feedback_path, &entry);
+            append_jsonl(&state.llm.lock_recover().feedback_path, &entry);
             DaemonResponse::Ok
         }
         DaemonRequest::GetSysctlGovernor => {
@@ -674,14 +687,17 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
 // ── LLM Status Builder ─────────────────────────────────────────────────────
 
 pub fn build_llm_status(state: &SharedState) -> LlmStatus {
+    let (llm_cfg_default, llm_state, llm_key_path) = {
+        let llm = state.llm.lock_recover();
+        (llm.llm_cfg.clone(), llm.llm_state.clone(), llm.llm_key_path.clone())
+    };
     let llm_cfg = load_repo_config(&state.config_path)
         .llm
-        .unwrap_or_else(|| state.llm_cfg.as_ref().clone());
+        .unwrap_or(llm_cfg_default);
     let enabled_from_disk = llm_cfg.enabled();
-    let llm_state = state.llm_state.lock_recover().clone();
     let policy = state.learned_policy.lock_recover().clone();
 
-    let has_key = state.llm_key_path.exists();
+    let has_key = llm_key_path.exists();
     let enabled = enabled_from_disk && llm_state.enabled;
     let training_active = enabled && llm_state.training_active() && has_key;
 
