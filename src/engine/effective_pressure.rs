@@ -6,9 +6,10 @@
 /// that makes the system *behaviorally* more constrained even at the same raw number.
 ///
 /// # Solution
-/// `compute()` aggregates all boost factors that were previously computed inline in
-/// `apollo-optimizerd/main.rs` and scattered across separate decision sites. The
-/// resulting `effective` value is the one all decision-makers should use.
+/// `compute()` aggregates all boost factors via additive sum with clamp(0.0, 1.0)
+/// that were previously computed inline in `apollo-optimizerd/main.rs` and scattered
+/// across separate decision sites. The resulting `effective` value is the one all
+/// decision-makers should use.
 ///
 /// # Threshold impact example
 /// Default `bg_pressure` threshold = 0.78, `critical_pressure` = 0.88.
@@ -91,6 +92,7 @@ pub fn compute(
     smc_thermal: f64,
     battery_overheat: f64,
 ) -> (f64, PressureComponents) {
+    debug_assert!((0.0..=1.0).contains(&base), "base pressure out of range: {base}");
     let effective = (base
         + hardware
         + battery

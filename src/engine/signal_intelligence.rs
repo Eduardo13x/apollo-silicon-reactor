@@ -247,6 +247,10 @@ impl SignalIntelligence {
         total_available_bytes: u64,
         dt_secs: f64,
     ) -> SignalDigest {
+        debug_assert!(
+            (0.0..=1.0).contains(&memory_pressure),
+            "memory_pressure out of range: {memory_pressure}"
+        );
         // ── 1. Kalman ────────────────────────────────────────────────────
         self.kf_pressure.update(memory_pressure, dt_secs);
         self.kf_swap.update(swap_delta_bps, dt_secs);
