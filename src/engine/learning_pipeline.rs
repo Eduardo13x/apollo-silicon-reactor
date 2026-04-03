@@ -704,4 +704,105 @@ mod tests {
         assert_eq!(w1.throttle_count, w8.throttle_count, "throttle_count should match");
         assert_eq!(w1.effective_count, w8.effective_count, "effective_count should match");
     }
+
+    #[test]
+    fn test_pending_count_starts_at_zero() {
+        let pipeline = LearningPipeline::new();
+        assert_eq!(pipeline.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_flush_empty_batch_is_noop() {
+        let mut pipeline = LearningPipeline::new();
+        let mut ot = OutcomeTracker::new();
+        let mut cg = CausalGraph::new();
+        let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
+
+        // flush with nothing buffered should not panic or mutate state
+        pipeline.flush(&mut ot, &mut cg, &mut sr, &mut eff);
+        assert!(ot.weights.is_empty());
+        assert_eq!(pipeline.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_with_batch_size_zero_clamped_to_one() {
+        // with_batch_size(0) must clamp to 1 so push() always flushes immediately.
+        let mut pipeline = LearningPipeline::new().with_batch_size(0);
+        let mut ot = OutcomeTracker::new();
+        let mut cg = CausalGraph::new();
+        let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
+
+        let obs = make_obs("Dropbox", 0.75, 0.70, 0);
+        pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
+
+        // Batch flushed immediately (batch_size clamped to 1).
+        assert_eq!(pipeline.pending_count(), 0);
+        assert!(ot.weights.contains_key("Dropbox"));
+    }
+
+    #[test]
+    fn test_default_pipeline_is_enabled() {
+        let pipeline = LearningPipeline::default();
+        assert!(pipeline.enabled, "default pipeline should be enabled");
+    }
+
+    #[test]
+    fn test_delta_negative_not_effective() {
+        // Pressure went UP — bad action, delta < 0.
+        let obs = make_obs("Slack", 0.60, 0.65, 0);
+        assert!(obs.delta() < 0.0);
+        assert!(!obs.effective());
+    }
+
+    #[test]
+    fn test_effective_threshold_exact_boundary() {
+        // delta = exactly 0.01 → effective (≥ 0.01 is true).
+        let obs_at = make_obs("Arc", 0.70, 0.69, 0);
+        assert!((obs_at.delta() - 0.01).abs() < 1e-9);
+        assert!(obs_at.effective());
+
+        // delta = 0.009 → not effective.
+        let obs_below = make_obs("Arc", 0.70, 0.691, 0);
+        assert!(!obs_below.effective());
+    }
+
+    #[test]
+    fn test_multiple_processes_tracked_independently() {
+        let mut pipeline = LearningPipeline::new().with_batch_size(2);
+        let mut ot = OutcomeTracker::new();
+        let mut cg = CausalGraph::new();
+        let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
+
+        // One effective, one not.
+        let obs_a = make_obs("Dropbox", 0.75, 0.70, 0); // effective
+        let obs_b = make_obs("Slack", 0.60, 0.61, 1);   // not effective (delta=-0.01)
+
+        pipeline.push(obs_a, &mut ot, &mut cg, &mut sr, &mut eff);
+        pipeline.push(obs_b, &mut ot, &mut cg, &mut sr, &mut eff);
+
+        let w_dropbox = ot.weights.get("Dropbox").unwrap();
+        assert_eq!(w_dropbox.throttle_count, 1);
+        assert_eq!(w_dropbox.effective_count, 1);
+
+        let w_slack = ot.weights.get("Slack").unwrap();
+        assert_eq!(w_slack.throttle_count, 1);
+        assert_eq!(w_slack.effective_count, 0);
+    }
+
+    #[test]
+    fn test_flush_remaining_on_empty_is_noop() {
+        let mut pipeline = LearningPipeline::new().with_batch_size(10);
+        let mut ot = OutcomeTracker::new();
+        let mut cg = CausalGraph::new();
+        let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
+
+        // Nothing pushed — flush_remaining should be silent.
+        pipeline.flush_remaining(&mut ot, &mut cg, &mut sr, &mut eff);
+        assert_eq!(pipeline.pending_count(), 0);
+        assert!(ot.weights.is_empty());
+    }
 }

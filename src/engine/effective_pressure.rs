@@ -183,4 +183,83 @@ mod tests {
             comp.total_boost()
         );
     }
+
+    #[test]
+    fn hardware_boost_only() {
+        let (eff, comp) = compute(0.50, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert!((eff - 0.65).abs() < 1e-9);
+        assert_eq!(comp.hardware, 0.15);
+    }
+
+    #[test]
+    fn thermal_boost_only() {
+        let (eff, comp) = compute(0.40, 0.0, 0.0, 0.40, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert!((eff - 0.80).abs() < 1e-9);
+        assert_eq!(comp.thermal, 0.40);
+    }
+
+    #[test]
+    fn llm_boost_only() {
+        let (eff, comp) = compute(0.55, 0.0, 0.0, 0.0, 0.20, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert!((eff - 0.75).abs() < 1e-9);
+        assert_eq!(comp.llm_workload, 0.20);
+    }
+
+    #[test]
+    fn battery_low_boost_only() {
+        let (eff, comp) = compute(0.60, 0.0, 0.0, 0.0, 0.0, 0.0, 0.08, 0.0, 0.0, 0.0);
+        assert!((eff - 0.68).abs() < 1e-9);
+        assert_eq!(comp.battery_low, 0.08);
+    }
+
+    #[test]
+    fn smc_thermal_boost_only() {
+        let (eff, comp) = compute(0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.30, 0.0);
+        assert!((eff - 0.80).abs() < 1e-9);
+        assert_eq!(comp.smc_thermal, 0.30);
+    }
+
+    #[test]
+    fn memory_bandwidth_boost_only() {
+        let (eff, comp) = compute(0.55, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.10, 0.0, 0.0);
+        assert!((eff - 0.65).abs() < 1e-9);
+        assert_eq!(comp.memory_bandwidth, 0.10);
+    }
+
+    #[test]
+    fn base_already_at_max_stays_one() {
+        let (eff, comp) = compute(1.0, 0.30, 0.18, 0.40, 0.20, 0.06, 0.08, 0.10, 0.30, 0.12);
+        assert_eq!(eff, 1.0);
+        assert_eq!(comp.base, 1.0);
+        // effective is clamped but base is preserved
+        assert!(comp.total_boost() > 0.0);
+    }
+
+    #[test]
+    fn additive_semantics_not_max() {
+        // If compute used max(base, boost) this would return 0.30.
+        // Additive semantics: 0.20 + 0.30 = 0.50
+        let (eff, _) = compute(0.20, 0.30, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert!((eff - 0.50).abs() < 1e-9, "must be additive: got {eff}");
+    }
+
+    #[test]
+    fn base_preserved_in_components_when_clamped() {
+        let base = 0.70;
+        let (eff, comp) = compute(base, 0.30, 0.18, 0.40, 0.20, 0.06, 0.08, 0.10, 0.30, 0.12);
+        assert_eq!(eff, 1.0, "should be clamped");
+        assert_eq!(comp.base, base, "base must be preserved in components");
+    }
+
+    #[test]
+    fn total_boost_zero_when_no_boosts() {
+        let (_, comp) = compute(0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(comp.total_boost(), 0.0);
+    }
+
+    #[test]
+    fn effective_matches_component_field() {
+        let (eff, comp) = compute(0.45, 0.15, 0.04, 0.07, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(eff, comp.effective, "returned value must match component field");
+    }
 }
