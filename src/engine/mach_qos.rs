@@ -1485,4 +1485,27 @@ mod tests {
             let _ = count;
         }
     }
+
+    /// Verify ThreadBasicInfo is exactly 40 bytes to match kernel ABI.
+    ///
+    /// The kernel's THREAD_BASIC_INFO_COUNT = 10 (in units of natural_t = i32 = 4 bytes),
+    /// so the struct must be 10 × 4 = 40 bytes.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn thread_basic_info_is_40_bytes() {
+        assert_eq!(
+            std::mem::size_of::<ffi::ThreadBasicInfo>(),
+            40,
+            "ThreadBasicInfo must be 40 bytes to match kernel THREAD_BASIC_INFO_COUNT=10"
+        );
+    }
+
+    /// Verify THREAD_BASIC_INFO_COUNT is exactly 10 (natural_t units).
+    #[test]
+    fn thread_basic_info_count_is_10() {
+        assert_eq!(
+            mach_sys::THREAD_BASIC_INFO_COUNT, 10,
+            "THREAD_BASIC_INFO_COUNT must equal 10 to match the kernel ABI"
+        );
+    }
 }
