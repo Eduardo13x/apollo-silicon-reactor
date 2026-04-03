@@ -795,6 +795,11 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub outcome_pending_depth: usize,
 
+    /// Habituation skips: processes unchanged for ≥5 CPU/RSS cycles, skipped in decide_actions.
+    /// Incremented once per cycle by habituated_pids.len().
+    #[serde(default)]
+    pub habituation_skips: u64,
+
     /// Dr. Zero self-challenge score: average prediction error across hop groups.
     /// Low = solver is well-calibrated. High = needs more training.
     #[serde(default)]

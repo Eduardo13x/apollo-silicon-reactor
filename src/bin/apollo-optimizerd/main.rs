@@ -3047,6 +3047,11 @@ fn main() -> anyhow::Result<()> {
                     }
                     hab_set
                 };
+                // Emit habituation count so AIS runtime benchmark can read it.
+                {
+                    let mut m = state.metrics.lock_recover();
+                    m.metrics.habituation_skips += habituated_pids.len() as u64;
+                }
 
                 let causal_confidence = lctx.causal_graph.confidence_map();
                 let decision = {
