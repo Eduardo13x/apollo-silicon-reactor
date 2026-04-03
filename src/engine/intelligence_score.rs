@@ -32,7 +32,7 @@ const W_SAFETY: f64 = 0.12;
 const W_ADAPT: f64 = 0.08;
 
 /// Input data for AIS computation. Can come from live daemon or simulation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AisInput {
     // ── Decision metrics ─────────────────────────────────────────────────
     /// Total decisions made (throttle/freeze/boost/skip).
@@ -127,6 +127,32 @@ pub struct AisInput {
     pub regime_shifts_detected: u32,
     /// Total actual regime shifts.
     pub regime_shifts_total: u32,
+
+    // ── Hardware context (for normalization portability) ──────────────────
+    /// Number of CPU cores on this machine. 0 = unknown (defaults to 8).
+    /// Used to normalize thresholds that depend on parallelism capacity.
+    #[serde(default)]
+    pub hardware_cores: u32,
+    /// RAM in GB on this machine. 0 = unknown (defaults to 8).
+    /// Used to normalize rl_max_ticks and pressure thresholds.
+    #[serde(default)]
+    pub hardware_memory_gb: u32,
+}
+
+impl AisInput {
+    /// Effective RAM for normalization: falls back to 8 GB (M1 baseline) when not set.
+    pub fn effective_ram_gb(&self) -> u32 {
+        if self.hardware_memory_gb == 0 { 8 } else { self.hardware_memory_gb }
+    }
+
+    /// Recommended `rl_max_ticks` for this hardware.
+    ///
+    /// On machines with more RAM, the RL agent takes longer to converge because
+    /// pressure events are rarer. Scale linearly from the M1 8GB baseline (500 ticks).
+    pub fn recommended_rl_max_ticks(&self) -> u64 {
+        let ram = self.effective_ram_gb();
+        500_u64.saturating_mul(ram as u64) / 8
+    }
 }
 
 /// AIS result with per-dimension breakdown.
@@ -501,6 +527,8 @@ mod tests {
             total_workload_class: workload.1,
             regime_shifts_detected: signal.1, // CUSUM TP = live regime detections
             regime_shifts_total: signal.3,    // actual shifts in simulation
+            hardware_cores: 8,
+            hardware_memory_gb: 8,
         };
 
         let score = compute_ais(&input);
@@ -940,6 +968,22 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════════
 
     #[test]
+    fn test_hardware_normalization_helpers() {
+        let m1_8gb = AisInput { hardware_memory_gb: 8, ..Default::default() };
+        assert_eq!(m1_8gb.recommended_rl_max_ticks(), 500, "M1 8GB baseline = 500 ticks");
+
+        let mac_16gb = AisInput { hardware_memory_gb: 16, ..Default::default() };
+        assert_eq!(mac_16gb.recommended_rl_max_ticks(), 1000, "16GB → 1000 ticks (2× baseline)");
+
+        let mac_32gb = AisInput { hardware_memory_gb: 32, ..Default::default() };
+        assert_eq!(mac_32gb.recommended_rl_max_ticks(), 2000, "32GB → 2000 ticks (4× baseline)");
+
+        let unknown = AisInput { hardware_memory_gb: 0, ..Default::default() };
+        assert_eq!(unknown.effective_ram_gb(), 8, "0 = unknown falls back to 8GB baseline");
+        assert_eq!(unknown.recommended_rl_max_ticks(), 500, "unknown hardware → M1 baseline ticks");
+    }
+
+    #[test]
     fn test_weights_sum_to_one() {
         let sum = W_DECISION + W_SIGNAL + W_LEARNING + W_RESOURCE + W_SAFETY + W_ADAPT;
         assert!(
@@ -993,6 +1037,8 @@ mod tests {
             total_workload_class: 10,
             regime_shifts_detected: 3,
             regime_shifts_total: 3,
+            hardware_cores: 8,
+            hardware_memory_gb: 8,
         };
         let score = compute_ais(&input);
         assert_eq!(score.safety_compliance, 0.0);
