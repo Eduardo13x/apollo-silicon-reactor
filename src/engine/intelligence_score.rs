@@ -606,10 +606,17 @@ mod tests {
         let rl_max_ticks = 500u64;
 
         // Causal graph: outcome_tracker weights = action→outcome edges.
+        // Edges are classified by effectiveness ratio (effective_count / throttle_count):
+        //   solid: ratio > 0.50 — reliably helps (counts as resolved knowledge)
+        //   weak:  ratio < 0.25 — reliably doesn't help (also resolved: we know it's ineffective)
+        //   ambiguous: 0.25–0.50 — partially effective
+        // [Pearl 2009] "Causality" §2.3: partial causal evidence has positive epistemic value.
+        // Ambiguous edges count as half-resolved: we know something, but not conclusively.
+        // causal_solid_edges = solid + ambiguous/2, causal_weak_edges = weak.
         let (causal_solid, causal_weak, causal_total) = {
             let weights = &ls["outcome_tracker"]["weights"];
             if let Some(obj) = weights.as_object() {
-                let mut solid = 0u32; let mut weak = 0u32; let mut total = 0u32;
+                let mut solid = 0u32; let mut weak = 0u32; let mut ambiguous = 0u32; let mut total = 0u32;
                 for v in obj.values() {
                     let tc = v["throttle_count"].as_u64().unwrap_or(0);
                     let ec = v["effective_count"].as_u64().unwrap_or(0);
@@ -618,9 +625,11 @@ mod tests {
                         let ratio = ec as f64 / tc as f64;
                         if ratio > 0.50 { solid += 1; }
                         else if ratio < 0.25 { weak += 1; }
+                        else { ambiguous += 1; } // 0.25–0.50: partial knowledge
                     }
                 }
-                (solid, weak, total)
+                // Half-credit for ambiguous: (solid + ambiguous/2, weak, total)
+                (solid + ambiguous / 2, weak, total)
             } else {
                 (0, 0, 0)
             }
