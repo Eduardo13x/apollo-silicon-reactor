@@ -105,7 +105,7 @@ use apollo_optimizer::engine::thermal_interrupt::{
 };
 use apollo_optimizer::engine::thermal_manager::ThermalManager;
 use apollo_optimizer::engine::types::{
-    BlockerScore, EnergyConsumerInfo, ForegroundAppInfo, FreezeSource, FrozenEntry,
+    EnergyConsumerInfo, ForegroundAppInfo, FreezeSource, FrozenEntry,
     FrozenPidEntry, FrozenStatePersisted,
     LatencyTarget,
     OptimizationProfile, ProfileTransition, RootAction,
@@ -126,14 +126,14 @@ use apollo_optimizer::engine::daemon_helpers::{
     predictive_agent_path, rl_threshold_path, signal_intelligence_path, socket_path,
     should_rotate_oldest, should_unfreeze, spotlight_set_indexing, timeline_path, unfreeze_pids,
     wake_state_path, write_frozen_state, append_timeline,
-    write_governor_state, write_metrics, write_wake_state, WakeRuntimeState,
+    write_governor_state, write_metrics, write_wake_state,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use clap::{Parser, Subcommand};
 
 // v0.9.0: ACL alias — DomainSharedState is the grouped version being migrated to
 #[allow(unused_imports)]
-use apollo_optimizer::engine::daemon_state::SharedState as DomainSharedState;
+use apollo_optimizer::engine::daemon_state::{ProcessState, SharedState as DomainSharedState};
 
 // FREEZE_TTL_SECS → daemon_helpers
 const REACTOR_FAST_TICK_SECS: u64 = 30;
@@ -171,7 +171,7 @@ pub(crate) struct SharedState {
     pub(crate) latency_target: Arc<Mutex<LatencyTarget>>,
     pub(crate) metrics: Arc<Mutex<RuntimeMetrics>>,
     pub(crate) frozen_state: Arc<Mutex<HashMap<u32, FrozenEntry>>>,
-    pub(crate) last_blockers: Arc<Mutex<Vec<BlockerScore>>>,
+    pub(crate) process: Arc<Mutex<ProcessState>>,
     pub(crate) thermal_state: Arc<Mutex<String>>,
     pub(crate) throttle_level: Arc<Mutex<String>>,
     pub(crate) reactor_event_weight: Arc<Mutex<f64>>,
@@ -180,7 +180,6 @@ pub(crate) struct SharedState {
     pub(crate) reactor_status: Arc<Mutex<ReactorStatus>>,
     pub(crate) governor: Arc<Mutex<ProfileGovernor>>,
     pub(crate) timeline: Arc<Mutex<VecDeque<ProfileTransition>>>,
-    pub(crate) wake_state: Arc<Mutex<WakeRuntimeState>>,
     pub(crate) stop: Arc<AtomicBool>,
 
     pub(crate) llm_cfg: Arc<LlmConfig>,
@@ -611,7 +610,10 @@ fn main() -> anyhow::Result<()> {
                     ..RuntimeMetrics::default()
                 })),
                 frozen_state: Arc::new(Mutex::new(frozen_since_boot.clone())),
-                last_blockers: Arc::new(Mutex::new(Vec::new())),
+                process: Arc::new(Mutex::new(ProcessState {
+                    last_blockers: Vec::new(),
+                    wake_state,
+                })),
                 thermal_state: Arc::new(Mutex::new("nominal".to_string())),
                 throttle_level: Arc::new(Mutex::new("balanced".to_string())),
                 reactor_event_weight: Arc::new(Mutex::new(0.0)),
@@ -620,7 +622,6 @@ fn main() -> anyhow::Result<()> {
                 reactor_status: Arc::new(Mutex::new(ReactorStatus::default())),
                 governor: Arc::new(Mutex::new(governor)),
                 timeline: Arc::new(Mutex::new(VecDeque::new())),
-                wake_state: Arc::new(Mutex::new(wake_state)),
                 stop: Arc::new(AtomicBool::new(false)),
 
                 llm_cfg: Arc::new(llm_cfg),
@@ -1317,16 +1318,16 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 let now_wall = Utc::now();
-                let mut wake_state_guard = state.wake_state.lock_recover();
-                let wake_jump = now_wall - wake_state_guard.last_cycle_wallclock;
-                let mut grace_active = wake_state_guard
+                let mut process_guard = state.process.lock_recover();
+                let wake_jump = now_wall - process_guard.wake_state.last_cycle_wallclock;
+                let mut grace_active = process_guard.wake_state
                     .post_wake_grace_until
                     .map(|t| t > now_wall)
                     .unwrap_or(false);
                 if wake_jump > ChronoDuration::seconds(90) {
                     // Treat as wake: engage grace window and unfreeze anything Apollo froze.
-                    wake_state_guard.last_wake_at = Some(now_wall);
-                    wake_state_guard.post_wake_grace_until =
+                    process_guard.wake_state.last_wake_at = Some(now_wall);
+                    process_guard.wake_state.post_wake_grace_until =
                         Some(now_wall + ChronoDuration::seconds(60));
                     grace_active = true;
 
@@ -1344,9 +1345,9 @@ fn main() -> anyhow::Result<()> {
                         metrics.throttle_reverted += unfreeze_count;
                     }
                 }
-                wake_state_guard.last_cycle_wallclock = now_wall;
-                write_wake_state(&wake_state_path, &wake_state_guard);
-                drop(wake_state_guard);
+                process_guard.wake_state.last_cycle_wallclock = now_wall;
+                write_wake_state(&wake_state_path, &process_guard.wake_state);
+                drop(process_guard);
 
                 // Display-Off Turbo: Android Doze-like power management.
                 // Battery-aware dwell: on battery shorten dwell to 2s so turbo activates
@@ -3174,7 +3175,7 @@ fn main() -> anyhow::Result<()> {
                         &policy,
                     ).decision
                 };
-                *state.last_blockers.lock_recover() = decision.blockers.clone();
+                state.process.lock_recover().last_blockers = decision.blockers.clone();
                 *state.thermal_state.lock_recover() = process_enrichment::context_to_thermal(decision.context);
 
                 // Propagar skips de OutcomeTracker a top_skipped_processes para observabilidad.

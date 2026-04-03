@@ -11,7 +11,7 @@
 //! - LlmDomainState: LLM config/state and associated paths
 //! - UsageDomainState: usage model and tracker
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -29,9 +29,9 @@ use crate::engine::mach_qos::MachQoSManager;
 use crate::engine::profile_governor::ProfileGovernor;
 use crate::engine::sysctl_governor::SysctlGovernorStatus;
 use crate::engine::thermal_interrupt::ResourceInterruptState;
+use crate::engine::daemon_helpers::WakeRuntimeState;
 use crate::engine::types::{
-    BlockerScore, FrozenEntry, LatencyTarget, OptimizationProfile, ProfileTransition,
-    RuntimeMetrics,
+    BlockerScore, LatencyTarget, OptimizationProfile, ProfileTransition, RuntimeMetrics,
 };
 use crate::engine::usage_model::UsageModel;
 
@@ -99,20 +99,11 @@ pub struct PolicyState {
 
 // ── Process Domain ──────────────────────────────────────────────────────────
 
-/// Frozen processes, blockers, wake state — the "process management" data.
+/// Blockers + wake state — the "process management" data.
+/// Note: frozen_state lives as a flat SharedState field (sentinel coupling; see feedback_lock_migration.md).
 pub struct ProcessState {
-    pub frozen_state: HashMap<u32, FrozenEntry>,
     pub last_blockers: Vec<BlockerScore>,
     pub wake_state: WakeRuntimeState,
-}
-
-/// Wake/sleep tracking state.
-#[derive(Debug, Clone)]
-pub struct WakeRuntimeState {
-    pub last_cycle_wallclock: DateTime<Utc>,
-    pub last_wake_at: Option<DateTime<Utc>>,
-    pub post_wake_grace_until: Option<DateTime<Utc>>,
-    pub post_wake_policy: String,
 }
 
 // ── Hardware Domain ─────────────────────────────────────────────────────────

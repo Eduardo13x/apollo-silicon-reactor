@@ -168,7 +168,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                     }
                 }
             };
-            let blockers = state.last_blockers.lock_recover().clone();
+            let blockers = state.process.lock_recover().last_blockers.clone();
             let thermal_state = state.thermal_state.lock_recover().clone();
             let throttle_level = state.throttle_level.lock_recover().clone();
             // Snapshot governor + wake_state, then DROP locks before build_llm_status.
@@ -181,7 +181,8 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                  gov.transition_reason.clone())
             };
             let (grace_active, grace_remaining, last_wake_at, post_wake_policy) = {
-                let ws = state.wake_state.lock_recover();
+                let proc = state.process.lock_recover();
+                let ws = &proc.wake_state;
                 let ga = ws.post_wake_grace_until.map(|t| t > now).unwrap_or(false);
                 let gr = ws.post_wake_grace_until
                     .and_then(|t| (t - now).to_std().ok())
@@ -221,7 +222,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
         }
         DaemonRequest::GetMetrics => DaemonResponse::Metrics(state.metrics.lock_recover().clone()),
         DaemonRequest::GetTopBlockers => {
-            DaemonResponse::TopBlockers(state.last_blockers.lock_recover().clone())
+            DaemonResponse::TopBlockers(state.process.lock_recover().last_blockers.clone())
         }
         DaemonRequest::GetProfileTimeline => {
             DaemonResponse::ProfileTimeline(state.timeline.lock_recover().iter().cloned().collect())
