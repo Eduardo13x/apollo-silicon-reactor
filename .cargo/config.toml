@@ -2,7 +2,32 @@
 # M1 MacBook Air 8GB: limitar a 4 jobs para no reventar la RAM compilando.
 # Rust+LTO puede usar 1-2GB por job; con 4 quedamos en ~5-6GB máximo.
 jobs = 4
+# NOTE: target-cpu=native applies to ALL profiles (dev, test, release).
+# It gives ~5-10% perf on release but costs ~2-3min extra on every test build.
+# Tradeoff accepted: we compensate with codegen-units=256 + debug=false below.
+# To truly isolate it to release only, a per-profile rustflags override would
+# require a workspace split (see .plan/WORKSPACE_SPLIT.md). For now, keep here.
 rustflags = ["-C", "target-cpu=native"]
+
+[profile.dev]
+# Faster iteration: no optimisation, max parallel codegen units, incremental on.
+# split-debuginfo=unpacked avoids running dsymutil on macOS — big link-time win.
+opt-level = 0
+codegen-units = 256
+incremental = true
+split-debuginfo = "unpacked"
+
+[profile.test]
+# `cargo test` builds use this profile. Key wins:
+#   debug=false   — skip DWARF generation (~20-30% faster link on large crates)
+#   codegen-units=256 — saturate all 8 M1 cores during compilation
+#   incremental=true  — reuse .d artefacts across runs
+#   split-debuginfo=unpacked — skip dsymutil post-link step on macOS
+opt-level = 0
+debug = false
+codegen-units = 256
+incremental = true
+split-debuginfo = "unpacked"
 
 [profile.release]
 lto = true
