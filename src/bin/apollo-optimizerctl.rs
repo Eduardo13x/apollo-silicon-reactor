@@ -2,13 +2,16 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use apollo_optimizer::dashboard;
 use apollo_optimizer::engine::llm::LearnedPolicy;
-use apollo_optimizer::engine::protocol::{DaemonRequest, DaemonResponse};
+use apollo_optimizer::engine::protocol::{DaemonRequest, DaemonResponse, PROTOCOL_VERSION};
 use apollo_optimizer::engine::types::{LatencyTarget, OptimizationProfile, UsageResponse};
 use clap::{Parser, Subcommand};
+
+static VERSION_CHECKED: AtomicBool = AtomicBool::new(false);
 
 fn socket_candidates() -> [&'static str; 2] {
     [
@@ -140,7 +143,9 @@ fn to_latency_target(s: &str) -> LatencyTarget {
     }
 }
 
-fn send_request(req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
+/// Low-level send: connects, sends request, reads one response line.
+/// Does NOT trigger version checking — used by `check_version_once()` to avoid recursion.
+fn send_raw(req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
     let mut stream = None;
     for path in socket_candidates() {
         if let Ok(s) = UnixStream::connect(path) {
@@ -164,6 +169,37 @@ fn send_request(req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
         .read_line(&mut line)?;
     let response = serde_json::from_str::<DaemonResponse>(&line)?;
     Ok(response)
+}
+
+/// Run a one-time protocol version check before the first RPC in a process lifetime.
+/// Warns on mismatch but never exits — preserves backward compatibility.
+fn check_version_once() {
+    // Swap returns the previous value; if it was already true we've checked before.
+    if VERSION_CHECKED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Use send_raw to avoid recursive call through send_request.
+    let resp = match send_raw(DaemonRequest::GetVersion) {
+        Ok(r) => r,
+        Err(_) => return, // Daemon unreachable — the real command will surface a better error.
+    };
+    if let DaemonResponse::VersionInfo { protocol, .. } = resp {
+        if protocol != PROTOCOL_VERSION {
+            eprintln!(
+                "Warning: protocol version mismatch — daemon={protocol}, ctl={PROTOCOL_VERSION}"
+            );
+            if protocol > PROTOCOL_VERSION {
+                eprintln!(
+                    "  The daemon is newer. Some commands may fail. Consider updating apollo-optimizerctl."
+                );
+            }
+        }
+    }
+}
+
+fn send_request(req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
+    check_version_once();
+    send_raw(req)
 }
 
 fn handle_dashboard() -> anyhow::Result<()> {
@@ -478,10 +514,9 @@ fn main() -> anyhow::Result<()> {
         DaemonResponse::SysctlGovernor(s) => println!("{}", serde_json::to_string_pretty(&s)?),
         DaemonResponse::VersionInfo { protocol, build } => {
             println!("apollo-optimizer v{build}  (protocol v{protocol})");
-            let client_protocol = apollo_optimizer::engine::protocol::PROTOCOL_VERSION;
-            if protocol != client_protocol {
+            if protocol != PROTOCOL_VERSION {
                 eprintln!(
-                    "warning: protocol mismatch — daemon uses v{protocol}, client uses v{client_protocol}"
+                    "warning: protocol mismatch — daemon uses v{protocol}, client uses v{PROTOCOL_VERSION}"
                 );
             }
         }
@@ -492,7 +527,6 @@ fn main() -> anyhow::Result<()> {
             let _ = fs::metadata("/var/run/apollo-optimizer.sock");
             let _ = fs::metadata("/tmp/apollo-optimizer.sock");
         }
-        DaemonResponse::Health(h) => println!("{}", serde_json::to_string_pretty(&h)?),
         DaemonResponse::Health(h) => println!("{}", serde_json::to_string_pretty(&h)?),
         DaemonResponse::Error { message } => {
             anyhow::bail!(message);
