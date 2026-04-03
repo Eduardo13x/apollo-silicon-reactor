@@ -166,6 +166,9 @@ pub struct ExecuteOutcomes {
     pub top_skipped: Vec<String>,
     pub throttle_reverted: u64,
     pub thread_qos_applied: u64,
+    /// PIDs that were successfully frozen (SIGSTOP sent) this cycle.
+    /// Used by causal graph to record only new freeze actions, not all active frozen PIDs.
+    pub newly_frozen_pids: Vec<u32>,
 }
 
 impl ExecuteOutcomes {
@@ -386,6 +389,7 @@ pub fn execute_actions(
                     if rc == 0 {
                         frozen.insert(*pid);
                         out.freezes_applied += 1;
+                        out.newly_frozen_pids.push(*pid);
                     }
                 }
                 RootAction::UnfreezeProcess { pid, .. } => {

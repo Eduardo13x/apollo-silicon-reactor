@@ -273,7 +273,7 @@ impl LearnedState {
             overflow_history,
             frozen_state,
         );
-        state.persist_generations = prev_generations;
+        state.persist_generations = prev_generations.saturating_add(1);
         state.last_restore_quality = last_quality;
         state.pending_trial_skill = pending_trial_skill;
         state.self_improve();

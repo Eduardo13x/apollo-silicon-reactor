@@ -4692,17 +4692,16 @@ fn main() -> anyhow::Result<()> {
                             cycle_count,
                         );
                     }
-                    // Also record freeze actions.
-                    if exec_outcomes.freezes_applied > 0 {
-                        let frozen_state = state.frozen_state.lock_recover();
-                        for &pid in frozen_state.keys() {
-                            if let Some(process) = collector.system().process(sysinfo::Pid::from_u32(pid)) {
-                                lctx.causal_graph.record_action(
-                                    &format!("freeze:{}", process.name()),
-                                    pressure_now,
-                                    cycle_count,
-                                );
-                            }
+                    // Also record freeze actions — only PIDs frozen THIS cycle, not all active ones.
+                    // Using exec_outcomes.newly_frozen_pids avoids double-counting PIDs that have
+                    // been frozen across multiple previous cycles (would inflate causal scores).
+                    for &pid in &exec_outcomes.newly_frozen_pids {
+                        if let Some(process) = collector.system().process(sysinfo::Pid::from_u32(pid)) {
+                            lctx.causal_graph.record_action(
+                                &format!("freeze:{}", process.name()),
+                                pressure_now,
+                                cycle_count,
+                            );
                         }
                     }
                     // Evaluate pending actions: did pressure actually drop?
