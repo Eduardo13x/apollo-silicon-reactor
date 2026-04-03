@@ -67,6 +67,7 @@ use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfi
 use apollo_optimizer::engine::causal_graph::CausalGraph;
 use apollo_optimizer::engine::action_queue::ActionQueue;
 use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningPipeline};
+use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
 use apollo_optimizer::engine::neuromodulator::{ApolloNeuromodulator, NeuroSignals};
 use apollo_optimizer::engine::optimization_skills::SkillRegistry;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
@@ -1742,12 +1743,26 @@ fn main() -> anyhow::Result<()> {
                 let cycle_hw_snap: Option<HardwareSnapshot> =
                     state.last_hw_snapshot.lock_recover().clone();
 
+
+                // ── LearningContext: group the 9 learning subsystems for this cycle ──
+                let lctx = LearningContext::new(
+                    &mut outcome_tracker,
+                    &mut signal_intel,
+                    &mut predictive_agent,
+                    &mut specialist_accuracy,
+                    &mut overflow_guard,
+                    &mut causal_graph,
+                    &mut skill_registry,
+                    &mut neuromod,
+                    &mut energy_tracker,
+                );
+
                 // EnergyTracker: update per-app energy estimates with this cycle's data.
                 let cycle_dt_secs = last_cycle_instant.elapsed().as_secs_f64();
                 last_cycle_instant = Instant::now();
                 {
                     if let Some(ref hw) = cycle_hw_snap {
-                        energy_tracker.update(&snapshot.top_processes, hw, cycle_dt_secs);
+                        lctx.energy_tracker.update(&snapshot.top_processes, hw, cycle_dt_secs);
                     }
                 }
 
@@ -2030,7 +2045,7 @@ fn main() -> anyhow::Result<()> {
                     &mut llm_advisor,
                     &snapshot,
                     &mut llm_counters,
-                    outcome_tracker.heuristic_is_struggling(),
+                    lctx.outcome_tracker.heuristic_is_struggling(),
                 );
 
                 let mut reactor_weight = state.reactor_event_weight.lock_recover();
@@ -2065,7 +2080,7 @@ fn main() -> anyhow::Result<()> {
                                             .take(8)
                                             .map(|p| p.name.clone())
                                             .collect();
-                                        overflow_guard.record_event(
+                                        lctx.overflow_guard.record_event(
                                             snapshot.pressure.memory_pressure,
                                             snapshot.pressure.swap_delta_bytes_per_sec,
                                             &heavy,
@@ -2079,7 +2094,7 @@ fn main() -> anyhow::Result<()> {
                                         } else {
                                             0.0
                                         };
-                                        signal_intel.record_overflow(
+                                        lctx.signal_intel.record_overflow(
                                             snapshot.pressure.memory_pressure,
                                             sr,
                                             snapshot.pressure.memory_pressure,
@@ -2423,7 +2438,7 @@ fn main() -> anyhow::Result<()> {
                     metrics.foreground_idle = foreground_idle;
 
                     // Energy tracking metrics.
-                    let energy_summary = energy_tracker.session_summary();
+                    let energy_summary = lctx.energy_tracker.session_summary();
                     metrics.energy_savings_wh = Some(energy_summary.estimated_savings_wh);
                     metrics.energy_co2_avoided_g = Some(energy_summary.estimated_co2_kg * 1000.0);
                     metrics.energy_package_wh = Some(energy_summary.total_package_wh);
@@ -2454,7 +2469,7 @@ fn main() -> anyhow::Result<()> {
                         .and_then(|h| h.power.package_watts)
                         .map(|w| w as f64)
                         .or(last_smc.as_ref().and_then(|s| s.system_power_watts));
-                    metrics.energy_top_consumers = energy_tracker
+                    metrics.energy_top_consumers = lctx.energy_tracker
                         .top_consumers(5)
                         .into_iter()
                         .map(|e| EnergyConsumerInfo {
@@ -2494,8 +2509,8 @@ fn main() -> anyhow::Result<()> {
                     // KPC IPC metric + signal intelligence modulation
                     if let Some(ref kpc) = kpc_snap {
                         metrics.kpc_ipc = kpc.ipc;
-                        signal_intel.set_kpc_ipc(kpc.ipc);
-                        signal_intel.set_kpc_trend(kpc.ipc_trend);
+                        lctx.signal_intel.set_kpc_ipc(kpc.ipc);
+                        lctx.signal_intel.set_kpc_trend(kpc.ipc_trend);
                     }
 
                     // Rosetta AOT state
@@ -2529,7 +2544,7 @@ fn main() -> anyhow::Result<()> {
                         policy.interactive_patterns.clone(),
                         policy.noise_patterns.clone(),
                         policy.pattern_weights.clone(),
-                        outcome_tracker.calibrated_threshold(),
+                        lctx.outcome_tracker.calibrated_threshold(),
                     )
                 };
 
@@ -2613,7 +2628,7 @@ fn main() -> anyhow::Result<()> {
                 drop(governor);
 
                 // Thresholds adaptativos: workload-aware via Phase 3 classifier.
-                let mut overflow_thresholds = overflow_guard.thresholds(workload_mode);
+                let mut overflow_thresholds = lctx.overflow_guard.thresholds(workload_mode);
 
                 // Signal intelligence: Kalman + CUSUM + Entropy + Hazard + LV + MPC.
                 let signal_digest = {
@@ -2642,7 +2657,7 @@ fn main() -> anyhow::Result<()> {
                         0.0
                     };
                     // Energy-aware routing: shift subsystem thresholds by battery/thermal.
-                    signal_intel.set_energy_bias(
+                    lctx.signal_intel.set_energy_bias(
                         power_mgr.battery_status.percentage,
                         power_mgr.battery_status.is_charging,
                         thermal_emergency,
@@ -2650,7 +2665,7 @@ fn main() -> anyhow::Result<()> {
                     // Power-aware bias: when real watts are high, engage optimizer earlier.
                     // M1 Air TDP ~15W; >8W = active load, >12W = stressed.
                     if let Some(pkg_w) = cycle_hw_snap.as_ref().and_then(|h| h.power.package_watts) {
-                        signal_intel.adjust_bias_for_power(pkg_w);
+                        lctx.signal_intel.adjust_bias_for_power(pkg_w);
                     }
                     // Workload-aware bias: heavy workloads (Coding/VideoEdit) spike pressure
                     // fast — engage optimizer 2pp earlier during those hours.
@@ -2659,9 +2674,9 @@ fn main() -> anyhow::Result<()> {
                             let gov = state.adaptive_governor.lock_recover();
                             gov.user_profile.likely_workload_at_hour(hour_of_day)
                         };
-                        signal_intel.adjust_bias_for_workload(wl);
+                        lctx.signal_intel.adjust_bias_for_workload(wl);
                     }
-                    let _si_result = signal_intel.tick(
+                    let _si_result = lctx.signal_intel.tick(
                         snapshot.pressure.memory_pressure,
                         snapshot.pressure.swap_delta_bytes_per_sec,
                         swap_ratio,
@@ -2778,10 +2793,10 @@ fn main() -> anyhow::Result<()> {
                     // Cable B: OutcomeTracker → PredictiveAgent context.
                     // low_value_ratio tells LinUCB how much of its effort is wasted.
                     let lv_ratio = {
-                        let total = outcome_tracker.weights.len() as f64;
+                        let total = lctx.outcome_tracker.weights.len() as f64;
                         if total > 0.0 {
-                            let threshold = outcome_tracker.calibrated_threshold();
-                            let low = outcome_tracker.weights.values()
+                            let threshold = lctx.outcome_tracker.calibrated_threshold();
+                            let low = lctx.outcome_tracker.weights.values()
                                 .filter(|w| w.is_low_value_vs_baseline(threshold))
                                 .count() as f64;
                             low / total
@@ -2799,12 +2814,12 @@ fn main() -> anyhow::Result<()> {
                         prev_workload,
                         hour_of_day,
                         *reactor_weight,
-                        overflow_guard.history.threshold_offset,
-                        outcome_tracker.overall_effectiveness(),
+                        lctx.overflow_guard.history.threshold_offset,
+                        lctx.outcome_tracker.overall_effectiveness(),
                         lv_ratio,
                     );
                     let (linucb_choice, linucb_confidence) =
-                        predictive_agent.select_action_with_confidence(&agent_ctx);
+                        lctx.predictive_agent.select_action_with_confidence(&agent_ctx);
 
                     // ── Specialist accuracy feedback (Super Learner) ─────────────────
                     // Compare prev cycle's specialist predictions against observed outcome.
@@ -2818,27 +2833,27 @@ fn main() -> anyhow::Result<()> {
                         let hazard_predicted_high = prev_pressure_smooth > 0.40;
                         let hazard_correct = (hazard_predicted_high && pressure_spiked)
                             || (!hazard_predicted_high && !pressure_spiked);
-                        specialist_accuracy.update(specialist::HAZARD, hazard_correct);
+                        lctx.specialist_accuracy.update(specialist::HAZARD, hazard_correct);
 
                         // Monopoly: predicted high when monopoly_risk > 0.5.
                         // Proxy: prev pressure was in monopoly range (>0.55).
                         let monopoly_predicted_high = prev_pressure_smooth > 0.55;
                         let monopoly_correct = (monopoly_predicted_high && pressure_spiked)
                             || (!monopoly_predicted_high && !pressure_spiked);
-                        specialist_accuracy.update(specialist::MONOPOLY, monopoly_correct);
+                        lctx.specialist_accuracy.update(specialist::MONOPOLY, monopoly_correct);
 
                         // Kalman: predicted spike when pressure_predicted_5s > 0.85.
                         // Proxy: prev pressure was high enough to trigger the specialist.
                         let kalman_predicted_high = prev_pressure_smooth > 0.70;
                         let kalman_correct = (kalman_predicted_high && pressure_spiked)
                             || (!kalman_predicted_high && !pressure_spiked);
-                        specialist_accuracy.update(specialist::KALMAN, kalman_correct);
+                        lctx.specialist_accuracy.update(specialist::KALMAN, kalman_correct);
 
                         // LinUCB: voted for action. Correct if pressure improved or stayed calm.
                         let linucb_predicted_intervention = linucb_choice != Intervention::Observe;
                         let linucb_correct = (linucb_predicted_intervention && pressure_spiked)
                             || (!linucb_predicted_intervention && !pressure_spiked);
-                        specialist_accuracy.update(specialist::LINUCB, linucb_correct);
+                        lctx.specialist_accuracy.update(specialist::LINUCB, linucb_correct);
                     }
                     // Save current pressure for next cycle's accuracy feedback.
                     prev_pressure_smooth = signal_digest.pressure_smooth;
@@ -2855,7 +2870,7 @@ fn main() -> anyhow::Result<()> {
                             name: "linucb",
                             intervention: linucb_choice,
                             confidence: linucb_confidence
-                                * specialist_accuracy.weight(specialist::LINUCB),
+                                * lctx.specialist_accuracy.weight(specialist::LINUCB),
                         },
                     ];
 
@@ -2865,7 +2880,7 @@ fn main() -> anyhow::Result<()> {
                             name: "hazard",
                             intervention: Intervention::from_index(signal_digest.mpc_recommendation),
                             confidence: signal_digest.p_oom_30s.min(1.0)
-                                * specialist_accuracy.weight(specialist::HAZARD),
+                                * lctx.specialist_accuracy.weight(specialist::HAZARD),
                         });
                     }
 
@@ -2875,7 +2890,7 @@ fn main() -> anyhow::Result<()> {
                             name: "monopoly",
                             intervention: Intervention::PreThrottleNoise,
                             confidence: signal_digest.monopoly_risk.min(1.0)
-                                * specialist_accuracy.weight(specialist::MONOPOLY),
+                                * lctx.specialist_accuracy.weight(specialist::MONOPOLY),
                         });
                     }
 
@@ -2886,7 +2901,7 @@ fn main() -> anyhow::Result<()> {
                             intervention: Intervention::TightenThresholds,
                             confidence: (signal_digest.pressure_predicted_5s - 0.85).min(0.15)
                                 / 0.15
-                                * specialist_accuracy.weight(specialist::KALMAN),
+                                * lctx.specialist_accuracy.weight(specialist::KALMAN),
                         });
                     }
 
@@ -2905,7 +2920,7 @@ fn main() -> anyhow::Result<()> {
                         votes.push(SpecialistVote {
                             name: "proactive-30s",
                             intervention: Intervention::TightenThresholds,
-                            confidence: strength * specialist_accuracy.weight(specialist::KALMAN),
+                            confidence: strength * lctx.specialist_accuracy.weight(specialist::KALMAN),
                         });
                     }
 
@@ -2936,7 +2951,7 @@ fn main() -> anyhow::Result<()> {
                     };
 
                     // Apply threshold tightening if selected.
-                    overflow_thresholds = predictive_agent.adjust_thresholds(overflow_thresholds);
+                    overflow_thresholds = lctx.predictive_agent.adjust_thresholds(overflow_thresholds);
 
                     // SuggestAggressive: set a 5-minute manual override to aggressive profile.
                     if intervention == Intervention::SuggestAggressive {
@@ -3143,9 +3158,9 @@ fn main() -> anyhow::Result<()> {
                         outcome_baseline,
                         &behavior_interactive_pids,
                         &ipc_hints,
-                        &outcome_tracker.hop_groups,
+                        &lctx.outcome_tracker.hop_groups,
                         &habituated_pids,
-                        &causal_graph.confidence_map(),
+                        &lctx.causal_graph.confidence_map(),
                     )
                 };
                 *state.last_blockers.lock_recover() = decision.blockers.clone();
@@ -3175,7 +3190,7 @@ fn main() -> anyhow::Result<()> {
                 // (confidence × avg_delta). matching_skills() already gates on
                 // pressure ≥ skill.min_pressure AND is_reliable() (≥5 obs, ≥60% success).
                 {
-                    let skill_matches = skill_registry
+                    let skill_matches = lctx.skill_registry
                         .matching_skills(snapshot.pressure.memory_pressure as f32, workload_mode.as_str());
                     if !skill_matches.is_empty() {
                         let already_actioned: std::collections::HashSet<String> = actions
@@ -3218,7 +3233,7 @@ fn main() -> anyhow::Result<()> {
                     // Record result from previous cycle's trial if pending.
                     if let Some((ref pending_name, pressure_before)) = pending_trial_skill {
                         let effective = snapshot.pressure.memory_pressure < pressure_before - 0.01;
-                        skill_registry.record_result_with_pressure(
+                        lctx.skill_registry.record_result_with_pressure(
                             pending_name,
                             effective,
                             pressure_before as f32,
@@ -3226,7 +3241,7 @@ fn main() -> anyhow::Result<()> {
                         pending_trial_skill = None;
                     }
 
-                    let trial = skill_registry
+                    let trial = lctx.skill_registry
                         .next_trial_skill(snapshot.pressure.memory_pressure as f32, workload_mode.as_str());
                     if let Some(skill) = trial {
                         let skill_name = skill.name.clone();
@@ -3295,7 +3310,7 @@ fn main() -> anyhow::Result<()> {
                             // No targets found in the process list at all — the skill's targets
                             // are genuinely absent (crashed, jetsam'd, or never launched).
                             // Mark as ineffective so the skill gets GC'd after enough failures.
-                            skill_registry.record_result(&skill_name, false);
+                            lctx.skill_registry.record_result(&skill_name, false);
                         }
                     }
                 }
@@ -3309,7 +3324,7 @@ fn main() -> anyhow::Result<()> {
                 if snapshot.pressure.memory_pressure
                     >= overflow_thresholds.bg_pressure as f64 - 0.05
                 {
-                    let causal_pairs = outcome_tracker.top_causal_pairs(5);
+                    let causal_pairs = lctx.outcome_tracker.top_causal_pairs(5);
                     let actioned: std::collections::HashSet<String> = actions
                         .iter()
                         .filter_map(|a| match a {
@@ -3651,7 +3666,7 @@ fn main() -> anyhow::Result<()> {
                 let current_pressure = snapshot.pressure.memory_pressure;
                 let heuristic_actions: Vec<RootAction> = heuristic_actions.into_iter().filter(|a| {
                     if let RootAction::ThrottleProcess { ref name, .. } = a {
-                        if let Some((avg_drop, confidence)) = outcome_tracker.experience.query_similar(name, current_pressure) {
+                        if let Some((avg_drop, confidence)) = lctx.outcome_tracker.experience.query_similar(name, current_pressure) {
                             if confidence >= 0.5 && avg_drop <= 0.0 {
                                 // Experience says throttling this process at this pressure
                                 // has never reduced pressure. Skip it.
@@ -3731,7 +3746,7 @@ fn main() -> anyhow::Result<()> {
                         .take(8)
                         .map(|p| p.name.clone())
                         .collect();
-                    overflow_guard.record_event(
+                    lctx.overflow_guard.record_event(
                         snapshot.pressure.memory_pressure,
                         snapshot.pressure.swap_delta_bytes_per_sec,
                         &heavy,
@@ -3744,7 +3759,7 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         0.0
                     };
-                    signal_intel.record_overflow(
+                    lctx.signal_intel.record_overflow(
                         snapshot.pressure.memory_pressure,
                         sr,
                         snapshot.pressure.memory_pressure,
@@ -3752,18 +3767,18 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
                 // Decaimiento gradual: si el sistema está en calma, relajar thresholds.
-                overflow_guard.tick_decay(
+                lctx.overflow_guard.tick_decay(
                     snapshot.pressure.memory_pressure,
                     snapshot.pressure.compressor_pressure,
                 );
 
                 // ── Neuromodulator: bio-inspired parameter modulation ────────
                 {
-                    let overflow_occurred = overflow_guard.history.total_overflows > 0;
+                    let overflow_occurred = lctx.overflow_guard.history.total_overflows > 0;
                     let neuro_signals = NeuroSignals {
                         pressure_drop: signal_digest.pressure_smooth as f64 * -1.0
                             * signal_digest.pressure_velocity,
-                        outcome_penalty: outcome_tracker.rl_penalty(),
+                        outcome_penalty: lctx.outcome_tracker.rl_penalty(),
                         overflow_occurred,
                         urgency: signal_digest.urgency,
                         regime_shift_up: signal_digest.regime_shift_up,
@@ -3774,19 +3789,19 @@ fn main() -> anyhow::Result<()> {
                         regime_shift_down: signal_digest.regime_shift_down,
                         process_count: collector.system().processes().len(),
                         entropy_anomaly: signal_digest.entropy_anomaly as f64,
-                        rl_exploring: overflow_guard.rl_agent.as_ref()
+                        rl_exploring: lctx.overflow_guard.rl_agent.as_ref()
                             .map_or(false, |rl| rl.total_ticks() < 200),
                     };
-                    neuromod.tick(&neuro_signals);
+                    lctx.neuromod.tick(&neuro_signals);
 
                     // Push derived params to subsystems + enforce constraints.
-                    if let Some(rl) = &mut overflow_guard.rl_agent {
-                        rl.neuro_alpha_mult = neuromod.alpha_multiplier;
-                        rl.neuro_epsilon_bonus = neuromod.epsilon_bonus;
-                        rl.dyna_steps = neuromod.dyna_steps;
+                    if let Some(rl) = &mut lctx.overflow_guard.rl_agent {
+                        rl.neuro_alpha_mult = lctx.neuromod.alpha_multiplier;
+                        rl.neuro_epsilon_bonus = lctx.neuromod.epsilon_bonus;
+                        rl.dyna_steps = lctx.neuromod.dyna_steps;
                         rl.enforce_constraints(); // Infrastructure-locked (Hermes)
                     }
-                    signal_intel.neuro_serotonin_shift = neuromod.serotonin_shift;
+                    lctx.signal_intel.neuro_serotonin_shift = lctx.neuromod.serotonin_shift;
                 }
 
                 // ProcessRecoveryManager: freeze (or kill in survival mode) confirmed leakers.
@@ -4518,7 +4533,7 @@ fn main() -> anyhow::Result<()> {
                 // Update backpressure metrics (observable in runtime_metrics.json).
                 {
                     let bp = action_queue.backpressure_ratio();
-                    let pending_depth = outcome_tracker.pending_depth();
+                    let pending_depth = lctx.outcome_tracker.pending_depth();
                     let mut metrics = state.metrics.lock_recover();
                     metrics.action_queue_backpressure = bp;
                     metrics.outcome_pending_depth = pending_depth;
@@ -4719,7 +4734,7 @@ fn main() -> anyhow::Result<()> {
                             let fraction = (p.cpu_usage as f64) / total_cpu_pct;
                             let saved_watts = fraction * cpu_watts;
                             // Record savings for 1 cycle duration (will accumulate over time).
-                            energy_tracker.record_savings(saved_watts, 30.0);
+                            lctx.energy_tracker.record_savings(saved_watts, 30.0);
                         }
                     }
                 }
@@ -4745,7 +4760,7 @@ fn main() -> anyhow::Result<()> {
                             .find(|p| &p.name == name)
                             .map(|p| (p.cpu_usage as f64 / total_cpu_pct) * cpu_watts)
                             .unwrap_or(0.0);
-                        outcome_tracker.record_throttle(name, mem_pressure_now, proc_watts);
+                        lctx.outcome_tracker.record_throttle(name, mem_pressure_now, proc_watts);
                     }
                 }
 
@@ -4756,7 +4771,7 @@ fn main() -> anyhow::Result<()> {
                 {
                     let pressure_now = snapshot.pressure.memory_pressure as f32;
                     for name in &throttle_names_for_outcome {
-                        causal_graph.record_action(
+                        lctx.causal_graph.record_action(
                             &format!("throttle:{}", name),
                             pressure_now,
                             cycle_count,
@@ -4767,7 +4782,7 @@ fn main() -> anyhow::Result<()> {
                         let frozen_state = state.frozen_state.lock_recover();
                         for &pid in frozen_state.keys() {
                             if let Some(process) = collector.system().process(sysinfo::Pid::from_u32(pid)) {
-                                causal_graph.record_action(
+                                lctx.causal_graph.record_action(
                                     &format!("freeze:{}", process.name()),
                                     pressure_now,
                                     cycle_count,
@@ -4776,7 +4791,7 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     // Evaluate pending actions: did pressure actually drop?
-                    causal_graph.evaluate(pressure_now, cycle_count);
+                    lctx.causal_graph.evaluate(pressure_now, cycle_count);
                 }
 
                 // Causal graph: record process co-occurrence during high-pressure events.
@@ -4786,41 +4801,41 @@ fn main() -> anyhow::Result<()> {
                         .take(10)
                         .map(|p| p.name.clone())
                         .collect();
-                    outcome_tracker.record_co_occurrence(&active);
+                    lctx.outcome_tracker.record_co_occurrence(&active);
                 }
 
                 // Counterfactual: observe pressure drift. If no throttles this cycle,
                 // the tracker learns the natural drift rate (what happens without action).
-                outcome_tracker.observe_cycle(
+                lctx.outcome_tracker.observe_cycle(
                     snapshot.pressure.memory_pressure,
                     !throttle_names_for_outcome.is_empty(),
                 );
 
                 // Outcome tracker tick: resuelve outcomes de hace 30s, actualiza pesos y energy savings.
                 {
-                    let batch = outcome_tracker.tick(snapshot.pressure.memory_pressure);
+                    let batch = lctx.outcome_tracker.tick(snapshot.pressure.memory_pressure);
                     if batch.savings_watts > 0.0 {
-                        energy_tracker.record_savings(batch.savings_watts, 30.0);
+                        lctx.energy_tracker.record_savings(batch.savings_watts, 30.0);
                     }
                     // Cable 1: causal_effect() → correct PatternWeight using real causal signal.
                     // For each effective throttle, check if the drop was truly caused by the
                     // action (causal_effect > 0) or just natural drift. Demote weights that
                     // only appear effective due to natural pressure fluctuation.
                     if !batch.effective_names.is_empty() {
-                        let drift = outcome_tracker.natural_drift();
+                        let drift = lctx.outcome_tracker.natural_drift();
                         if drift > 0.01 {
                             // Pre-compute causal effects per process before mutating weights.
                             let demotions: Vec<String> = batch.effective_names.iter().filter_map(|name| {
-                                let avg_drop = outcome_tracker.experience
+                                let avg_drop = lctx.outcome_tracker.experience
                                     .query_similar(name, snapshot.pressure.memory_pressure)
                                     .map(|(drop, _)| drop)
                                     .unwrap_or(0.05);
-                                let causal = outcome_tracker.causal_effect(avg_drop);
+                                let causal = lctx.outcome_tracker.causal_effect(avg_drop);
                                 if causal < 0.005 { Some(name.clone()) } else { None }
                             }).collect();
                             // Now mutate: roll back effective_count for drift-only "successes".
                             for name in &demotions {
-                                if let Some(w) = outcome_tracker.weights.get_mut(name) {
+                                if let Some(w) = lctx.outcome_tracker.weights.get_mut(name) {
                                     if w.effective_count > 0 {
                                         w.effective_count -= 1;
                                     }
@@ -4831,7 +4846,7 @@ fn main() -> anyhow::Result<()> {
                     // Sincroniza pesos Bayesianos a la LearnedPolicy persistida.
                     if !batch.effective_names.is_empty() || !batch.low_value_names.is_empty() {
                         let mut policy = state.learned_policy.lock_recover();
-                        for (name, weight) in &outcome_tracker.weights {
+                        for (name, weight) in &lctx.outcome_tracker.weights {
                             policy.pattern_weights.insert(name.clone(), weight.clone());
                         }
                     }
@@ -4843,7 +4858,7 @@ fn main() -> anyhow::Result<()> {
                         if let Some(verdict) = restore_monitor.verdict() {
                             last_restore_quality = Some(verdict.quality);
                             if verdict.stale {
-                                signal_intel.reset_zones();
+                                lctx.signal_intel.reset_zones();
                             }
                         }
                     }
@@ -4863,9 +4878,9 @@ fn main() -> anyhow::Result<()> {
                         };
                         learning_pipeline.push(
                             obs,
-                            &mut outcome_tracker,
-                            &mut causal_graph,
-                            &mut skill_registry,
+                            lctx.outcome_tracker,
+                            lctx.causal_graph,
+                            lctx.skill_registry,
                             &mut effectiveness_tracker,
                         );
                     }
@@ -4875,10 +4890,10 @@ fn main() -> anyhow::Result<()> {
                 // Effective actions → lower zone thresholds (engage earlier).
                 // Ineffective actions → raise thresholds (be more conservative).
                 {
-                    let effectiveness = outcome_tracker.overall_effectiveness();
+                    let effectiveness = lctx.outcome_tracker.overall_effectiveness();
                     let pressure = signal_digest.pressure_smooth;
-                    if outcome_tracker.total_resolved > 10 {
-                        signal_intel.zone_feedback(pressure, effectiveness > 0.50);
+                    if lctx.outcome_tracker.total_resolved > 10 {
+                        lctx.signal_intel.zone_feedback(pressure, effectiveness > 0.50);
                     }
                 }
 
@@ -4886,9 +4901,9 @@ fn main() -> anyhow::Result<()> {
                 // When throttling is wasteful (low-value patterns detected),
                 // penalize the RL agent so it learns to adjust thresholds.
                 {
-                    let penalty = outcome_tracker.rl_penalty();
+                    let penalty = lctx.outcome_tracker.rl_penalty();
                     if penalty < 0.0 {
-                        if let Some(rl) = &mut overflow_guard.rl_agent {
+                        if let Some(rl) = &mut lctx.overflow_guard.rl_agent {
                             rl.inject_external_reward(penalty);
                         }
                     }
@@ -4907,7 +4922,7 @@ fn main() -> anyhow::Result<()> {
                         let delta = (prev - curr).max(0.0);
                         if delta > 1.0 {
                             let power_reward = (delta / 5.0 * 0.3).clamp(0.0, 0.3);
-                            if let Some(rl) = &mut overflow_guard.rl_agent {
+                            if let Some(rl) = &mut lctx.overflow_guard.rl_agent {
                                 rl.inject_external_reward(power_reward);
                             }
                         }
@@ -4926,7 +4941,7 @@ fn main() -> anyhow::Result<()> {
                                 // Normalize: score 90+ is good (reward), <70 is bad (penalty).
                                 // Range maps to [-0.3, +0.3] RL reward.
                                 let reward = ((score - 80.0) / 33.3).clamp(-0.3, 0.3);
-                                if let Some(rl) = &mut overflow_guard.rl_agent {
+                                if let Some(rl) = &mut lctx.overflow_guard.rl_agent {
                                     rl.inject_external_reward(reward);
                                 }
                             }
@@ -4935,10 +4950,10 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // Predictive agent: observe outcome and update model.
-                predictive_agent.observe_outcome(snapshot.pressure.memory_pressure);
-                predictive_agent.maybe_persist();
+                lctx.predictive_agent.observe_outcome(snapshot.pressure.memory_pressure);
+                lctx.predictive_agent.maybe_persist();
                 // MPC feedback: tell MPC what happened after its recommendation.
-                signal_intel.mpc_feedback(
+                lctx.signal_intel.mpc_feedback(
                     signal_digest.mpc_recommendation,
                     signal_digest.pressure_smooth,
                     snapshot.pressure.memory_pressure,
@@ -4948,13 +4963,13 @@ fn main() -> anyhow::Result<()> {
                 if cycle_count % 100 == 0 {
                     // Flush any buffered observations before persisting state.
                     learning_pipeline.flush_remaining(
-                        &mut outcome_tracker,
-                        &mut causal_graph,
-                        &mut skill_registry,
+                        lctx.outcome_tracker,
+                        lctx.causal_graph,
+                        lctx.skill_registry,
                         &mut effectiveness_tracker,
                     );
-                    signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
-                    outcome_tracker.persist_hop_groups(std::path::Path::new(hop_groups_path()));
+                    lctx.signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
+                    lctx.outcome_tracker.persist_hop_groups(std::path::Path::new(hop_groups_path()));
                     // Snapshot frozen state for unified persistence.
                     let frozen_snap: FrozenStatePersisted = {
                         let fg = state.frozen_state.lock_recover();
@@ -4970,12 +4985,12 @@ fn main() -> anyhow::Result<()> {
                         }
                     };
                     LearnedState::persist_improved(
-                        &signal_intel,
-                        &outcome_tracker,
-                        &specialist_accuracy,
-                        &skill_registry,
+                        lctx.signal_intel,
+                        lctx.outcome_tracker,
+                        lctx.specialist_accuracy,
+                        lctx.skill_registry,
                         &effectiveness_tracker,
-                        Some(overflow_guard.export_history()),
+                        Some(lctx.overflow_guard.export_history()),
                         Some(frozen_snap),
                         ls_path,
                         persist_generations,
@@ -4983,18 +4998,18 @@ fn main() -> anyhow::Result<()> {
                         pending_trial_skill.clone(),
                     );
                     // Causal graph observability: log solid/weak links discovered.
-                    let solid = causal_graph.solid_count();
-                    let total = causal_graph.edge_count();
+                    let solid = lctx.causal_graph.solid_count();
+                    let total = lctx.causal_graph.edge_count();
                     if total > 0 {
-                        println!("causal_graph: {}/{} edges solid, {} pending",
-                            solid, total, causal_graph.solid_edges().len());
+                        println!("lctx.causal_graph: {}/{} edges solid, {} pending",
+                            solid, total, lctx.causal_graph.solid_edges().len());
                     }
                     // Persist optimization skills (Hermes pattern).
-                    skill_registry.persist(std::path::Path::new(skills_path));
+                    lctx.skill_registry.persist(std::path::Path::new(skills_path));
                     // Learn skills from causal graph solid edges, ordered by impact.
                     // solid_edges_by_impact() sorts by confidence×avg_delta so high-impact
                     // actions (large pressure reduction) are learned with higher priority.
-                    for edge in causal_graph.solid_edges_by_impact() {
+                    for edge in lctx.causal_graph.solid_edges_by_impact() {
                         if edge.cause.starts_with("throttle:") {
                             let target = edge.cause.trim_start_matches("throttle:");
                             // Scale trigger pressure by impact: high-impact actions activate
@@ -5004,13 +5019,13 @@ fn main() -> anyhow::Result<()> {
                             } else {
                                 0.65 // conservative: low-impact action, wait
                             };
-                            skill_registry.learn(
+                            lctx.skill_registry.learn(
                                 &edge.cause,
                                 trigger_pressure,
                                 "any",
                                 vec![target.to_string()],
                             );
-                            skill_registry.record_result(&edge.cause, edge.confidence > 0.5);
+                            lctx.skill_registry.record_result(&edge.cause, edge.confidence > 0.5);
                         }
                     }
                 }
@@ -5018,8 +5033,8 @@ fn main() -> anyhow::Result<()> {
                 // graph for new skills every 100 cycles (~50s).  No human needed —
                 // Apollo crystallizes its own observations into reusable rules.
                 if cycle_count % 100 == 0 {
-                    let existing_names = skill_registry.name_set();
-                    let top_pairs = outcome_tracker.top_causal_pairs(100);
+                    let existing_names = lctx.skill_registry.name_set();
+                    let top_pairs = lctx.outcome_tracker.top_causal_pairs(100);
                     let protected_set = apollo_optimizer::engine::safety::protected_processes();
                     // Also exclude policy-protected processes (learned by LLM/user).
                     // Without this, rule_inducer generates skills whose targets are
@@ -5029,7 +5044,7 @@ fn main() -> anyhow::Result<()> {
                     let mut all_protected: Vec<&str> = protected_set.iter().copied().collect();
                     all_protected.extend_from_slice(&policy_prot_refs);
                     let new_skills = apollo_optimizer::engine::rule_inducer::induce(
-                        &outcome_tracker.experience,
+                        &lctx.outcome_tracker.experience,
                         &top_pairs,
                         &existing_names,
                         &all_protected,
@@ -5037,23 +5052,23 @@ fn main() -> anyhow::Result<()> {
                     );
                     let induced_count = new_skills.len();
                     for skill in new_skills {
-                        skill_registry.register_induced(skill);
+                        lctx.skill_registry.register_induced(skill);
                     }
                     // Purge induced skills whose targets are all protected —
                     // they can never execute and would spin in the trial loop forever.
-                    skill_registry.purge_unexecutable(&all_protected);
+                    lctx.skill_registry.purge_unexecutable(&all_protected);
                     if induced_count > 0 {
                         println!("rule_inducer: {} new skills crystallized (total={})",
-                            induced_count, skill_registry.len());
-                        skill_registry.persist(std::path::Path::new(skills_path));
+                            induced_count, lctx.skill_registry.len());
+                        lctx.skill_registry.persist(std::path::Path::new(skills_path));
                     }
                 }
                 // State compression (Hermes pattern): compress old experience records.
                 if cycle_count % 500 == 0 {
-                    outcome_tracker.experience.compress_old();
-                    outcome_tracker.gc_weights(); // BUG-04: prune low-signal weight entries
-                    skill_registry.gc(); // retire ineffective skills
-                    skill_registry.persist(std::path::Path::new(skills_path));
+                    lctx.outcome_tracker.experience.compress_old();
+                    lctx.outcome_tracker.gc_weights(); // BUG-04: prune low-signal weight entries
+                    lctx.skill_registry.gc(); // retire ineffective skills
+                    lctx.skill_registry.persist(std::path::Path::new(skills_path));
                 }
                 // Hourly housekeeping (7200 cycles × 500ms ≈ 1 hour).
                 if cycle_count % 7200 == 0 {
@@ -5066,9 +5081,9 @@ fn main() -> anyhow::Result<()> {
                 // Update predictive agent + signal intelligence metrics for status reporting.
                 {
                     let mut m = state.metrics.lock_recover();
-                    m.predictive_agent_active = predictive_agent.is_active();
-                    m.predictive_agent_cycles = predictive_agent.total_cycles();
-                    m.predictive_agent_arm_pulls = predictive_agent.arm_pulls();
+                    m.predictive_agent_active = lctx.predictive_agent.is_active();
+                    m.predictive_agent_cycles = lctx.predictive_agent.total_cycles();
+                    m.predictive_agent_arm_pulls = lctx.predictive_agent.arm_pulls();
                     m.predictive_agent_last_intervention = format!("{:?}", agent_intervention);
                     m.si_pressure_smooth = signal_digest.pressure_smooth;
                     m.si_pressure_velocity = signal_digest.pressure_velocity;
@@ -5080,31 +5095,31 @@ fn main() -> anyhow::Result<()> {
                     m.si_monopoly_risk = signal_digest.monopoly_risk;
                     m.si_entropy_anomaly = signal_digest.entropy_anomaly;
                     // Cable 4: top_causal_pairs() → expose in metrics for observability.
-                    m.causal_pairs = outcome_tracker.top_causal_pairs(5)
+                    m.causal_pairs = lctx.outcome_tracker.top_causal_pairs(5)
                         .iter()
                         .map(|(a, b, c)| format!("{} + {} ({})", a, b, c))
                         .collect();
-                    m.natural_drift = outcome_tracker.natural_drift();
-                    m.experience_memory_size = outcome_tracker.experience.len();
+                    m.natural_drift = lctx.outcome_tracker.natural_drift();
+                    m.experience_memory_size = lctx.outcome_tracker.experience.len();
                     // Causal effect average: mean effect across last resolved outcomes.
                     m.causal_effect_avg = {
-                        let effectiveness = outcome_tracker.overall_effectiveness();
-                        let avg_drop = if outcome_tracker.total_resolved > 0 {
+                        let effectiveness = lctx.outcome_tracker.overall_effectiveness();
+                        let avg_drop = if lctx.outcome_tracker.total_resolved > 0 {
                             effectiveness * 0.05
                         } else {
                             0.0
                         };
-                        outcome_tracker.causal_effect(avg_drop)
+                        lctx.outcome_tracker.causal_effect(avg_drop)
                     };
                     // HRPO / Dr. Zero metrics
-                    m.dr_zero_self_challenge = outcome_tracker.self_challenge_score();
-                    m.dr_zero_groups = outcome_tracker.hop_group_summary()
+                    m.dr_zero_self_challenge = lctx.outcome_tracker.self_challenge_score();
+                    m.dr_zero_groups = lctx.outcome_tracker.hop_group_summary()
                         .iter()
                         .map(|(hop, eff, count, pred_err)| {
                             format!("{:?}(eff={:.0}% n={} err={:.2})", hop, eff * 100.0, count, pred_err)
                         })
                         .collect();
-                    m.dr_zero_exploration = outcome_tracker.exploration_needed()
+                    m.dr_zero_exploration = lctx.outcome_tracker.exploration_needed()
                         .iter()
                         .map(|(hop, err)| format!("{:?}(err={:.2})", hop, err))
                         .collect();
@@ -5307,15 +5322,15 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     // Actualizar métricas del overflow guard antes de escribir.
-                    metrics.overflow_events_total = overflow_guard.history.total_overflows;
-                    metrics.overflow_events_7d = overflow_guard.recent_overflow_count(7);
+                    metrics.overflow_events_total = lctx.overflow_guard.history.total_overflows;
+                    metrics.overflow_events_7d = lctx.overflow_guard.recent_overflow_count(7);
                     metrics.overflow_threshold_offset_pp =
-                        (overflow_guard.compute_dynamic_offset() * 100.0).round() as i32;
+                        (lctx.overflow_guard.compute_dynamic_offset() * 100.0).round() as i32;
                     metrics.overflow_workload_mode =
                         overflow_thresholds.workload_mode.as_str().to_string();
 
                     // RL threshold agent metrics (Phase 4).
-                    if let Some(rl) = &overflow_guard.rl_agent {
+                    if let Some(rl) = &lctx.overflow_guard.rl_agent {
                         metrics.rl_adjustment_pp = (rl.current_adjustment * 100.0).round() as i32;
                         metrics.rl_total_ticks = rl.total_ticks();
                         metrics.rl_total_overflows = rl.total_overflows();
