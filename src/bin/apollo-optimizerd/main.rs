@@ -4690,9 +4690,9 @@ fn main() -> anyhow::Result<()> {
                     &mut prev_package_watts,
                     &mut prev_workload_mode,
                     pending_trial_skill.clone(),
-                    ls_path,
+                    ls_path.to_str().unwrap_or(""),
                     persist_generations,
-                    skills_path,
+                    skills_path(),
                 );
                 // Autonomous rule induction: mine experience memory + co-occurrence
                 // graph for new skills every 100 cycles (~50s).  No human needed —
@@ -4725,7 +4725,7 @@ fn main() -> anyhow::Result<()> {
                     if induced_count > 0 {
                         println!("rule_inducer: {} new skills crystallized (total={})",
                             induced_count, lctx.skill_registry.len());
-                        lctx.skill_registry.persist(std::path::Path::new(skills_path));
+                        lctx.skill_registry.persist(std::path::Path::new(skills_path()));
                     }
                 }
                 // State compression (% 500) is handled by run_periodic() below.
@@ -4769,9 +4769,10 @@ fn main() -> anyhow::Result<()> {
                 );
                 metrics_reporter::merge_cycle_metrics(
                     &state,
-                    exec_outcomes,
+                    &exec_outcomes,
                     &network_monitor,
-                    &decision,
+                    decision.reactor_event_weight,
+                    &decision.blockers,
                     current_profile,
                     &governor_decision,
                     &lctx,
@@ -4793,10 +4794,10 @@ fn main() -> anyhow::Result<()> {
                         cycle_count,
                         current_pressure: snapshot.pressure.memory_pressure,
                         workload_mode: workload_mode.as_str(),
-                        skills_path: std::path::Path::new(skills_path),
+                        skills_path: std::path::Path::new(skills_path()),
                         hop_groups_path: std::path::Path::new(hop_groups_path()),
                         signal_intel_path: std::path::Path::new(signal_intelligence_path()),
-                        learned_state_path: std::path::Path::new(ls_path),
+                        learned_state_path: ls_path,
                         persist_generations,
                         last_restore_quality,
                         pending_trial_skill: pending_trial_skill.clone(),

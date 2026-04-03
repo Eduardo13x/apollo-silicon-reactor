@@ -29,8 +29,8 @@ use apollo_optimizer::collector::SystemSnapshot;
 use apollo_optimizer::engine::adaptive_governor::{GovernorDecision as AdaptiveGovernorDecision, ProcessDecision};
 use apollo_optimizer::engine::daemon_helpers::{append_timeline, battery_pressure_boost, compute_p95, write_metrics};
 use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::decide_actions::DecisionOutput;
 use apollo_optimizer::engine::execute_actions::ExecuteOutcomes;
+use apollo_optimizer::engine::types::BlockerScore;
 use apollo_optimizer::engine::io_tiering::IoShaper;
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::mach_qos::SchedulingTier;
@@ -195,7 +195,7 @@ pub fn apply_qos_routing(
                 // classify them as ActiveForeground by name alone.
                 SchedulingTier::Foreground
             } else {
-                use apollo_optimizer::engine::profile_governor::GovernorDecision as GovDecision;
+                use apollo_optimizer::engine::adaptive_governor::GovernorDecision as GovDecision;
                 match decision.decision {
                     GovDecision::Allow => {
                         if decision.tier == ProcessTier::ActiveForeground {
@@ -255,9 +255,10 @@ pub fn apply_qos_routing(
 #[allow(clippy::too_many_arguments)]
 pub fn merge_cycle_metrics<'a>(
     state: &SharedState,
-    exec_outcomes: ExecuteOutcomes,
+    exec_outcomes: &ExecuteOutcomes,
     network_monitor: &NetworkMonitor,
-    decision: &DecisionOutput,
+    decision_reactor_weight: f64,
+    decision_blockers: &[BlockerScore],
     current_profile: OptimizationProfile,
     governor_decision: &GovernorDecision,
     lctx: &LearningContext<'a>,
@@ -277,12 +278,13 @@ pub fn merge_cycle_metrics<'a>(
     metrics.metrics.paging_hints_applied += exec_outcomes.paging_hints_applied;
     metrics.metrics.sysctl_applied += exec_outcomes.sysctl_applied;
     metrics.metrics.failures += exec_outcomes.failures;
-    if let Some(e) = exec_outcomes.last_error {
+    if let Some(e) = exec_outcomes.last_error.clone() {
         metrics.metrics.last_error = Some(e);
     }
     metrics.metrics.critical_background_skips += exec_outcomes.critical_background_skips;
     metrics.metrics.invalid_sysctl_denied += exec_outcomes.invalid_sysctl_denied;
-    for skip in exec_outcomes.top_skipped {
+    for skip in exec_outcomes.top_skipped.iter() {
+        let skip = skip.clone();
         if metrics.metrics.top_skipped_processes.len() < 12
             && !metrics.metrics.top_skipped_processes.contains(&skip)
         {
@@ -306,13 +308,13 @@ pub fn merge_cycle_metrics<'a>(
     let had_new_failures = exec_outcomes.failures > 0;
 
     metrics.metrics.cycles += 1;
-    metrics.metrics.reactor_pulses += if decision.reactor_event_weight > 0.2 {
+    metrics.metrics.reactor_pulses += if decision_reactor_weight > 0.2 {
         1
     } else {
         0
     };
     metrics.metrics.last_cycle_at = Some(Utc::now());
-    metrics.metrics.last_blockers = decision.blockers.clone();
+    metrics.metrics.last_blockers = decision_blockers.to_vec();
     metrics.metrics.effective_profile = current_profile;
     metrics.throttle_level = governor_decision.throttle_level.clone();
     metrics.metrics.throttle_level = governor_decision.throttle_level.clone();

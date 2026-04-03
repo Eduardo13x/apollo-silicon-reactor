@@ -333,7 +333,7 @@ pub fn run_learning_tick<'a>(
             effectiveness_tracker,
             Some(lctx.overflow_guard.export_history()),
             Some(frozen_snap),
-            ls_path,
+            std::path::Path::new(ls_path),
             persist_generations,
             *last_restore_quality,
             pending_trial_skill,
