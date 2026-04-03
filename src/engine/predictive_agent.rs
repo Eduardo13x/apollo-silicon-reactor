@@ -1217,4 +1217,268 @@ mod tests {
         assert_eq!(before, after, "unknown specialist name should be a no-op");
         assert_eq!(tracker.total_updates(), 0);
     }
+
+    // ── Intervention from_index tests ────────────────────────────────────────
+
+    #[test]
+    fn test_from_index_all_valid_variants() {
+        assert_eq!(Intervention::from_index(0), Intervention::Observe);
+        assert_eq!(Intervention::from_index(1), Intervention::TightenThresholds);
+        assert_eq!(Intervention::from_index(2), Intervention::SuggestAggressive);
+        assert_eq!(Intervention::from_index(3), Intervention::PreThrottleNoise);
+        assert_eq!(Intervention::from_index(4), Intervention::ProactivePurge);
+    }
+
+    #[test]
+    fn test_from_index_out_of_range_falls_back_to_observe() {
+        assert_eq!(Intervention::from_index(5), Intervention::Observe);
+        assert_eq!(Intervention::from_index(99), Intervention::Observe);
+        assert_eq!(Intervention::from_index(usize::MAX), Intervention::Observe);
+    }
+
+    #[test]
+    fn test_intervention_index_roundtrip() {
+        let variants = [
+            Intervention::Observe,
+            Intervention::TightenThresholds,
+            Intervention::SuggestAggressive,
+            Intervention::PreThrottleNoise,
+            Intervention::ProactivePurge,
+        ];
+        for v in variants {
+            assert_eq!(Intervention::from_index(v.index()), v,
+                "from_index(index()) should be identity for {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_intervention_serde_roundtrip() {
+        let variants = [
+            Intervention::Observe,
+            Intervention::TightenThresholds,
+            Intervention::SuggestAggressive,
+            Intervention::PreThrottleNoise,
+            Intervention::ProactivePurge,
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).expect("serialize");
+            let back: Intervention = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, v, "serde roundtrip failed for {:?}", v);
+        }
+    }
+
+    // ── SpecialistAccuracyTracker — weight convergence & clamping ────────────
+
+    #[test]
+    fn test_specialist_accuracy_weight_never_exceeds_one() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        for _ in 0..1000 {
+            tracker.update(specialist::LINUCB, true);
+        }
+        let w = tracker.weight(specialist::LINUCB);
+        assert!(w <= 1.0, "weight must not exceed 1.0 after 1000 correct: {w}");
+    }
+
+    #[test]
+    fn test_specialist_accuracy_weight_never_below_zero() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        for _ in 0..1000 {
+            tracker.update(specialist::LINUCB, false);
+        }
+        let w = tracker.weight(specialist::LINUCB);
+        assert!(w >= 0.0, "weight must not go below 0.0 after 1000 incorrect: {w}");
+    }
+
+    #[test]
+    fn test_specialist_accuracy_convergence_to_one_after_many_correct() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        // EMA with alpha=0.03 converges to 1.0 from 0.70: after ~300 steps it should be > 0.97.
+        for _ in 0..300 {
+            tracker.update(specialist::KALMAN, true);
+        }
+        let w = tracker.weight(specialist::KALMAN);
+        assert!(w > 0.97, "after 300 correct, weight should approach 1.0, got {w}");
+    }
+
+    #[test]
+    fn test_specialist_accuracy_convergence_to_zero_after_many_incorrect() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        // EMA with alpha=0.03 converges to 0.0 from 0.70: after ~300 steps it should be < 0.03.
+        for _ in 0..300 {
+            tracker.update(specialist::HAZARD, false);
+        }
+        let w = tracker.weight(specialist::HAZARD);
+        assert!(w < 0.03, "after 300 incorrect, weight should approach 0.0, got {w}");
+    }
+
+    #[test]
+    fn test_specialist_accuracy_out_of_range_index_returns_default() {
+        let tracker = SpecialistAccuracyTracker::new();
+        // Out-of-range index should return the default INIT_ACCURACY (0.70).
+        let w = tracker.weight(specialist::COUNT + 10);
+        assert!((w - 0.70).abs() < 1e-12,
+            "out-of-range index should return default 0.70, got {w}");
+    }
+
+    #[test]
+    fn test_specialist_accuracy_update_out_of_range_is_noop() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        let before = tracker.total_updates();
+        tracker.update(specialist::COUNT + 5, true);
+        assert_eq!(tracker.total_updates(), before, "out-of-range update should be no-op");
+    }
+
+    #[test]
+    fn test_specialist_accuracy_tracker_serde_roundtrip() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        for _ in 0..20 {
+            tracker.update(specialist::LINUCB, true);
+            tracker.update(specialist::HAZARD, false);
+        }
+        let json = serde_json::to_string(&tracker).expect("serialize");
+        let back: SpecialistAccuracyTracker = serde_json::from_str(&json).expect("deserialize");
+        for i in 0..specialist::COUNT {
+            assert!((back.weight(i) - tracker.weight(i)).abs() < 1e-12,
+                "weight[{i}] mismatch after serde roundtrip");
+        }
+        assert_eq!(back.total_updates(), tracker.total_updates());
+    }
+
+    // ── AgentContext edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn test_context_extreme_zero_pressure_no_panic() {
+        let ctx = AgentContext::build(
+            0.0, SwapTrend::Decreasing, -1, 0.0, 0.0, 0.0,
+            WorkloadType::Idle, 0, 0.0, 0.0, 0.0, 0.0,
+        );
+        assert!((ctx.features[0] - 0.0).abs() < 1e-10);
+        assert!(ctx.features.iter().all(|f| f.is_finite()), "all features must be finite");
+    }
+
+    #[test]
+    fn test_context_extreme_max_pressure_no_panic() {
+        let ctx = AgentContext::build(
+            1.0, SwapTrend::Critical, 0, 9999.0, 99999.0, 999999.0,
+            WorkloadType::VideoEdit, 23, 1.0, -0.20, 1.0, 1.0,
+        );
+        assert!((ctx.features[0] - 1.0).abs() < 1e-10);
+        assert!(ctx.features.iter().all(|f| f.is_finite()), "all features must be finite");
+    }
+
+    // ── LinUCB post-warmup behavior & edge cases ─────────────────────────────
+
+    #[test]
+    fn test_linucb_post_warmup_returns_valid_intervention() {
+        let path = test_path("post_warmup_valid");
+        let mut agent = PredictiveAgent::load_or_default(&path);
+        agent.warmup_remaining = 0;
+
+        let ctx = dummy_context(0.6);
+        let action = agent.select_action(&ctx);
+        // Result must be one of the 5 valid variants (from_index ensures this).
+        let valid = [
+            Intervention::Observe,
+            Intervention::TightenThresholds,
+            Intervention::SuggestAggressive,
+            Intervention::PreThrottleNoise,
+            Intervention::ProactivePurge,
+        ];
+        assert!(valid.contains(&action), "select_action must return a valid Intervention");
+    }
+
+    #[test]
+    fn test_linucb_observe_outcome_without_prior_select_is_noop() {
+        // observe_outcome with no last_action set should not panic.
+        let path = test_path("outcome_no_action");
+        let mut agent = PredictiveAgent::load_or_default(&path);
+        agent.observe_outcome(0.5); // no last_action — should be silent no-op
+        assert_eq!(agent.total_cycles(), 1); // total_cycles still increments
+        let pulls = agent.arm_pulls();
+        assert!(pulls.iter().all(|&p| p == 0), "no arms should have pulls: {:?}", pulls);
+    }
+
+    #[test]
+    fn test_linucb_select_with_confidence_warmup_returns_zero_confidence() {
+        let path = test_path("confidence_warmup");
+        let mut agent = PredictiveAgent::load_or_default(&path);
+        assert!(agent.warmup_remaining > 0);
+
+        let ctx = dummy_context(0.5);
+        let (action, confidence) = agent.select_action_with_confidence(&ctx);
+        assert_eq!(action, Intervention::Observe);
+        assert!((confidence - 0.0).abs() < 1e-10,
+            "during warmup confidence should be 0.0, got {confidence}");
+    }
+
+    #[test]
+    fn test_linucb_select_with_confidence_post_warmup_in_range() {
+        let path = test_path("confidence_post");
+        let mut agent = PredictiveAgent::load_or_default(&path);
+        agent.warmup_remaining = 0;
+
+        let ctx = dummy_context(0.5);
+        let (_, confidence) = agent.select_action_with_confidence(&ctx);
+        assert!(confidence >= 0.0 && confidence <= 1.0,
+            "confidence must be in [0, 1], got {confidence}");
+    }
+
+    #[test]
+    fn test_linucb_is_active_only_after_warmup() {
+        let path = test_path("is_active");
+        let mut agent = PredictiveAgent::load_or_default(&path);
+        assert!(!agent.is_active(), "should not be active during warmup");
+        agent.warmup_remaining = 0;
+        assert!(agent.is_active(), "should be active after warmup");
+    }
+
+    #[test]
+    fn test_linucb_observe_negative_reward_on_pressure_spike() {
+        // Observe intervention + pressure increased → negative reward for Observe arm.
+        let path = test_path("negative_reward");
+        let mut agent = PredictiveAgent::load_or_default(&path);
+        agent.warmup_remaining = 0;
+
+        let ctx = dummy_context(0.5);
+        agent.last_action = Some((Intervention::Observe, ctx.features, 0.5));
+        // pressure rose from 0.5 to 0.6: delta = 0.5 - 0.6 = -0.1 < -0.05 → penalty -0.3
+        agent.observe_outcome(0.6);
+
+        let pulls = agent.arm_pulls();
+        assert_eq!(pulls[0], 1, "Observe arm should have 1 pull");
+        let avg = agent.arm_avg_rewards();
+        assert!(avg[0] < 0.0, "Observe should receive negative reward when pressure spikes: {}", avg[0]);
+    }
+
+    #[test]
+    fn test_voting_empty_votes_returns_observe() {
+        // Empty vote list: all scores = 0.0, lower index (Observe) wins.
+        let result = tally_votes(&[]);
+        assert_eq!(result.intervention, Intervention::Observe);
+        assert!(!result.had_disagreement);
+        assert!((result.winning_score - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_voting_dominant_specialist_wins() {
+        // One specialist has weight 0.99, all others 0.01.
+        let votes = vec![
+            SpecialistVote { name: "linucb", intervention: Intervention::ProactivePurge, confidence: 0.99 },
+            SpecialistVote { name: "hazard", intervention: Intervention::Observe, confidence: 0.01 },
+            SpecialistVote { name: "monopoly", intervention: Intervention::Observe, confidence: 0.01 },
+            SpecialistVote { name: "kalman", intervention: Intervention::Observe, confidence: 0.01 },
+        ];
+        let result = tally_votes(&votes);
+        assert_eq!(result.intervention, Intervention::ProactivePurge,
+            "dominant specialist (0.99 vs 0.03) should win");
+    }
+
+    #[test]
+    fn test_specialist_index_of_all_known_names() {
+        assert_eq!(specialist::index_of("linucb"), Some(specialist::LINUCB));
+        assert_eq!(specialist::index_of("hazard"), Some(specialist::HAZARD));
+        assert_eq!(specialist::index_of("monopoly"), Some(specialist::MONOPOLY));
+        assert_eq!(specialist::index_of("kalman"), Some(specialist::KALMAN));
+        assert_eq!(specialist::index_of("unknown"), None);
+    }
 }
