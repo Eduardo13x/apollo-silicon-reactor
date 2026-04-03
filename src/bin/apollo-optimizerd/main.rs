@@ -887,6 +887,12 @@ fn main() -> anyhow::Result<()> {
             let mut effectiveness_tracker = EffectivenessTracker::new();
             // Track previous cycle pressure to detect spikes (for accuracy feedback).
             let mut prev_pressure_smooth: f64 = 0.0;
+            // Track previous cycle's actual specialist firing signals for accurate
+            // accuracy feedback (avoids pressure-proxy approximations).
+            let mut prev_hazard_fired: bool = false;
+            let mut prev_monopoly_fired: bool = false;
+            let mut prev_kalman_fired: bool = false;
+            let mut prev_linucb_intervened: bool = false;
 
             // ZeroTune: seed with hardware meta-features on cold start.
             // Reduces warmup from 200→50 cycles by injecting domain knowledge priors.
@@ -2766,41 +2772,39 @@ fn main() -> anyhow::Result<()> {
                         lctx.predictive_agent.select_action_with_confidence(&agent_ctx);
 
                     // ── Specialist accuracy feedback (Super Learner) ─────────────────
-                    // Compare prev cycle's specialist predictions against observed outcome.
+                    // Compare prev cycle's ACTUAL specialist signals against observed outcome.
+                    // Using real firing conditions (not pressure proxies) ensures the tracker
+                    // measures what the specialist actually predicted, not a heuristic stand-in.
                     // A spike is a pressure rise of ≥0.08 over the previous cycle.
                     {
                         let pressure_spiked = signal_digest.pressure_smooth
                             >= prev_pressure_smooth + 0.08;
-                        // Hazard: predicted high risk when p_oom_30s > 0.30 last cycle.
-                        // We can't replay last cycle's p_oom value, so we approximate:
-                        // hazard fired (voted) iff prev_pressure was already elevated.
-                        let hazard_predicted_high = prev_pressure_smooth > 0.40;
-                        let hazard_correct = (hazard_predicted_high && pressure_spiked)
-                            || (!hazard_predicted_high && !pressure_spiked);
+                        // Hazard: did prev cycle's hazard specialist fire (p_oom_30s > 0.30)?
+                        let hazard_correct = (prev_hazard_fired && pressure_spiked)
+                            || (!prev_hazard_fired && !pressure_spiked);
                         lctx.specialist_accuracy.update(specialist::HAZARD, hazard_correct);
 
-                        // Monopoly: predicted high when monopoly_risk > 0.5.
-                        // Proxy: prev pressure was in monopoly range (>0.55).
-                        let monopoly_predicted_high = prev_pressure_smooth > 0.55;
-                        let monopoly_correct = (monopoly_predicted_high && pressure_spiked)
-                            || (!monopoly_predicted_high && !pressure_spiked);
+                        // Monopoly: did prev cycle's monopoly specialist fire (monopoly_risk > 0.5)?
+                        let monopoly_correct = (prev_monopoly_fired && pressure_spiked)
+                            || (!prev_monopoly_fired && !pressure_spiked);
                         lctx.specialist_accuracy.update(specialist::MONOPOLY, monopoly_correct);
 
-                        // Kalman: predicted spike when pressure_predicted_5s > 0.85.
-                        // Proxy: prev pressure was high enough to trigger the specialist.
-                        let kalman_predicted_high = prev_pressure_smooth > 0.70;
-                        let kalman_correct = (kalman_predicted_high && pressure_spiked)
-                            || (!kalman_predicted_high && !pressure_spiked);
+                        // Kalman: did prev cycle's Kalman predict spike (pressure_predicted_5s > 0.85)?
+                        let kalman_correct = (prev_kalman_fired && pressure_spiked)
+                            || (!prev_kalman_fired && !pressure_spiked);
                         lctx.specialist_accuracy.update(specialist::KALMAN, kalman_correct);
 
-                        // LinUCB: voted for action. Correct if pressure improved or stayed calm.
-                        let linucb_predicted_intervention = linucb_choice != Intervention::Observe;
-                        let linucb_correct = (linucb_predicted_intervention && pressure_spiked)
-                            || (!linucb_predicted_intervention && !pressure_spiked);
+                        // LinUCB: voted for non-Observe intervention. Correct if pressure spiked.
+                        let linucb_correct = (prev_linucb_intervened && pressure_spiked)
+                            || (!prev_linucb_intervened && !pressure_spiked);
                         lctx.specialist_accuracy.update(specialist::LINUCB, linucb_correct);
                     }
-                    // Save current pressure for next cycle's accuracy feedback.
+                    // Save current cycle's actual specialist firing signals for next cycle's feedback.
                     prev_pressure_smooth = signal_digest.pressure_smooth;
+                    prev_hazard_fired = signal_digest.p_oom_30s > 0.30;
+                    prev_monopoly_fired = signal_digest.monopoly_risk > 0.5;
+                    prev_kalman_fired = signal_digest.pressure_predicted_5s > 0.85;
+                    prev_linucb_intervened = linucb_choice != Intervention::Observe;
 
                     // ── Specialist voting: weighted ensemble replaces override chain ──
                     // Confidences are modulated by learned accuracy weights (Super Learner).
