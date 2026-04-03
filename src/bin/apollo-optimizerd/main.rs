@@ -68,6 +68,7 @@ use apollo_optimizer::engine::action_queue::ActionQueue;
 use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningPipeline};
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
 use apollo_optimizer::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
+use apollo_optimizer::engine::pipeline::periodic_stage::{PeriodicContext, run_periodic};
 use apollo_optimizer::engine::neuromodulator::{ApolloNeuromodulator, NeuroSignals};
 use apollo_optimizer::engine::optimization_skills::SkillRegistry;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
@@ -1747,7 +1748,7 @@ fn main() -> anyhow::Result<()> {
 
 
                 // ── LearningContext: group the 9 learning subsystems for this cycle ──
-                let lctx = LearningContext::new(
+                let mut lctx = LearningContext::new(
                     &mut outcome_tracker,
                     &mut signal_intel,
                     &mut predictive_agent,
@@ -5069,13 +5070,7 @@ fn main() -> anyhow::Result<()> {
                         lctx.skill_registry.persist(std::path::Path::new(skills_path));
                     }
                 }
-                // State compression (Hermes pattern): compress old experience records.
-                if cycle_count % 500 == 0 {
-                    lctx.outcome_tracker.experience.compress_old();
-                    lctx.outcome_tracker.gc_weights(); // BUG-04: prune low-signal weight entries
-                    lctx.skill_registry.gc(); // retire ineffective skills
-                    lctx.skill_registry.persist(std::path::Path::new(skills_path));
-                }
+                // State compression (% 500) is handled by run_periodic() below.
                 // Hourly housekeeping (7200 cycles × 500ms ≈ 1 hour).
                 if cycle_count % 7200 == 0 {
                     // GC stale entries from cache warmer + I/O shaper.
@@ -5347,6 +5342,27 @@ fn main() -> anyhow::Result<()> {
                     let metrics_snapshot = metrics.clone();
                     drop(metrics);
                     write_metrics(&metrics_path, &metrics_snapshot);
+                }
+
+                // ── Periodic stage: GC and observability (% 100 / % 500 / % 7200 gates) ──
+                // % 500 GC (experience compress, weight prune, skill GC) runs here.
+                // % 100 persist and rule-induction remain inline above (need SharedState).
+                // % 7200 hourly GC remains inline above (binary-local types).
+                {
+                    let mut pctx = PeriodicContext {
+                        cycle_count,
+                        current_pressure: snapshot.pressure.memory_pressure,
+                        workload_mode: workload_mode.as_str(),
+                        skills_path: std::path::Path::new(skills_path),
+                        hop_groups_path: std::path::Path::new(hop_groups_path()),
+                        signal_intel_path: std::path::Path::new(signal_intelligence_path()),
+                        learned_state_path: std::path::Path::new(ls_path),
+                        persist_generations,
+                        last_restore_quality,
+                        pending_trial_skill: pending_trial_skill.clone(),
+                        lctx: &mut lctx,
+                    };
+                    let _periodic_result = run_periodic(&mut pctx);
                 }
 
                 // Push estado a suscriptores activos (menubar, etc.)
