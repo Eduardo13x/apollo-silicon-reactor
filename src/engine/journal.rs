@@ -72,3 +72,149 @@ pub fn read_journal(path: &Path) -> anyhow::Result<Vec<JournalEntry>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::types::{FreezeSource, FrozenEntry, RootAction};
+    use std::io::Write;
+
+    fn make_entry() -> JournalEntry {
+        JournalEntry {
+            timestamp: chrono::Utc::now(),
+            action: RootAction::BoostProcess {
+                pid: 42,
+                name: "test-proc".to_string(),
+                reason: "test".to_string(),
+            },
+            before: None,
+            after: None,
+            success: true,
+            reason: "unit-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn roundtrip_single_entry() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("journal.jsonl");
+
+        let entry = make_entry();
+        append_journal(&path, &entry).expect("append_journal");
+
+        let entries = read_journal(&path).expect("read_journal");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].reason, "unit-test");
+    }
+
+    #[test]
+    fn roundtrip_multiple_entries() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("journal.jsonl");
+
+        for _ in 0..3 {
+            append_journal(&path, &make_entry()).expect("append_journal");
+        }
+
+        let entries = read_journal(&path).expect("read_journal");
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn missing_file_returns_empty() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("nonexistent.jsonl");
+
+        let entries = read_journal(&path).expect("read_journal on missing file");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn rotation_when_file_exceeds_10mb() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("journal.jsonl");
+
+        // Write >10 MB of dummy content
+        {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&path)
+                .expect("open file");
+            let big_chunk = vec![b'x'; 11 * 1024 * 1024];
+            f.write_all(&big_chunk).expect("write chunk");
+        }
+
+        // Appending should trigger rotation
+        append_journal(&path, &make_entry()).expect("append after large file");
+
+        let rotated = path.with_extension("jsonl.1");
+        assert!(
+            rotated.exists(),
+            "rotated file .jsonl.1 should exist after size limit exceeded"
+        );
+    }
+
+    #[test]
+    fn symlink_rejection() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let real = dir.path().join("real.jsonl");
+        let link = dir.path().join("link.jsonl");
+
+        // Create the real file first so the symlink target exists
+        std::fs::write(&real, b"").expect("create real file");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+        let result = append_journal(&link, &make_entry());
+        assert!(result.is_err(), "should reject symlink path");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("symlink"),
+            "error should mention 'symlink', got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("journal.jsonl");
+
+        // Write one valid entry manually
+        let valid_entry = make_entry();
+        let valid_line =
+            serde_json::to_string(&valid_entry).expect("serialize") + "\n";
+
+        let bad_line = "this is not json\n";
+
+        {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&path)
+                .expect("open file");
+            f.write_all(valid_line.as_bytes()).expect("write valid line");
+            f.write_all(bad_line.as_bytes()).expect("write bad line");
+            f.write_all(valid_line.as_bytes()).expect("write valid line 2");
+        }
+
+        let entries = read_journal(&path).expect("read_journal");
+        assert_eq!(
+            entries.len(),
+            2,
+            "malformed line should be silently ignored, got {} entries",
+            entries.len()
+        );
+    }
+
+    // Ensure FrozenEntry is importable for completeness (used by other journal callers)
+    #[test]
+    fn frozen_entry_fields_accessible() {
+        let entry = FrozenEntry {
+            frozen_at: chrono::Utc::now(),
+            source: FreezeSource::MainLoop,
+            pressure_at_freeze: 0.5,
+            process_name: None,
+        };
+        assert!(!entry.pressure_at_freeze.is_nan());
+    }
+}
