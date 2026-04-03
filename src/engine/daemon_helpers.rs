@@ -105,6 +105,14 @@ pub fn learned_state_path() -> &'static str {
     if is_root() { "/var/lib/apollo/learned_state.json" } else { "/tmp/apollo-learned_state.json" }
 }
 
+pub fn skills_path() -> &'static str {
+    if is_root() { "/var/lib/apollo/optimization_skills.json" } else { "/tmp/apollo-optimization_skills.json" }
+}
+
+pub fn temporal_histograms_path() -> &'static str {
+    if is_root() { "/var/lib/apollo/temporal_histograms.json" } else { "/tmp/apollo-temporal_histograms.json" }
+}
+
 // ── Audit Log ───────────────────────────────────────────────────────────────
 
 /// Append a JSON line to the audit log (best-effort, never fails the caller).
