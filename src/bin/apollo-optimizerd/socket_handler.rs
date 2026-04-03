@@ -35,8 +35,8 @@ use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::protocol::{DaemonRequest, DaemonResponse};
 use apollo_optimizer::engine::safety::pattern_conflicts_with_protected;
 use apollo_optimizer::engine::types::{
-    DaemonStatus, HardPath, HealthReport, LearnedPolicyStatus, LlmRunMode, LlmStatus,
-    RuntimeMetrics, UsageResponse,
+    DaemonStatus, FrozenProcessInfo, HardPath, HealthReport, LearnedPolicyStatus, LlmRunMode,
+    LlmStatus, RuntimeMetrics, UsageResponse,
 };
 
 use super::{SharedState, STOP_REQUESTED};
@@ -195,6 +195,21 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 (m.reactor_status.mode.clone(), m.reactor_status.health.clone())
             };
             let llm = build_llm_status(state);
+            let frozen_processes: Vec<FrozenProcessInfo> = {
+                let fs = state.frozen_state.lock_recover();
+                fs.iter()
+                    .map(|(&pid, entry)| FrozenProcessInfo {
+                        pid,
+                        name: entry.process_name.clone().unwrap_or_else(|| pid.to_string()),
+                        frozen_seconds: now
+                            .signed_duration_since(entry.frozen_at)
+                            .num_seconds()
+                            .max(0) as u64,
+                        source: entry.source,
+                        pressure_at_freeze: entry.pressure_at_freeze,
+                    })
+                    .collect()
+            };
             let status = DaemonStatus {
                 running: !state.stop.load(Ordering::Acquire),
                 profile,
@@ -217,6 +232,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 reactor_health,
                 metrics,
                 llm: Some(llm),
+                frozen_processes,
             };
             DaemonResponse::Status(status)
         }

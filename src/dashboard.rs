@@ -4,7 +4,7 @@
 //! ANSI colors, and emoji indicators.
 
 use crate::engine::types::{
-    BlockerScore, DaemonStatus, EnergyConsumerInfo, OptimizationProfile, SafetyPolicy,
+    BlockerScore, DaemonStatus, EnergyConsumerInfo, FreezeSource, OptimizationProfile, SafetyPolicy,
 };
 use chrono::Utc;
 
@@ -514,6 +514,46 @@ fn render_blockers(blockers: &[BlockerScore]) -> Vec<String> {
     lines
 }
 
+fn render_frozen(status: &DaemonStatus) -> Vec<String> {
+    let mut lines = vec![bold("🧊 PROCESOS CONGELADOS")];
+    if status.frozen_processes.is_empty() {
+        lines.push(green("Ninguno congelado actualmente"));
+        return lines;
+    }
+    lines.push(format!(
+        "{:<6} {:<22} {:>8} {:>6} {:<14}",
+        "PID", "NOMBRE", "TIEMPO", "P@FRZ", "FUENTE"
+    ));
+    lines.push("─".repeat(CW.min(60)));
+    let mut sorted = status.frozen_processes.clone();
+    sorted.sort_by_key(|p| p.frozen_seconds);
+    sorted.reverse();
+    for p in sorted.iter().take(10) {
+        let source = match p.source {
+            FreezeSource::MainLoop => "MainLoop",
+            FreezeSource::Sentinel => "Sentinel",
+            FreezeSource::Manual => "Manual",
+            FreezeSource::ThermalPreThrottle => "ThermalPre",
+        };
+        let time = if p.frozen_seconds >= 3600 {
+            format!("{}h {:02}m", p.frozen_seconds / 3600, (p.frozen_seconds % 3600) / 60)
+        } else if p.frozen_seconds >= 60 {
+            format!("{}m {:02}s", p.frozen_seconds / 60, p.frozen_seconds % 60)
+        } else {
+            format!("{}s", p.frozen_seconds)
+        };
+        let name = if p.name.len() > 22 { &p.name[..22] } else { &p.name };
+        lines.push(format!(
+            "{:<6} {:<22} {:>8} {:>5.2} {:<14}",
+            p.pid, name, time, p.pressure_at_freeze, source
+        ));
+    }
+    if status.frozen_processes.len() > 10 {
+        lines.push(format!("  ... y {} más", status.frozen_processes.len() - 10));
+    }
+    lines
+}
+
 fn render_reactor(status: &DaemonStatus) -> Vec<String> {
     let m = &status.metrics;
     let mut lines = vec![bold("⚡ REACTOR")];
@@ -737,6 +777,7 @@ pub fn render_dashboard(status: &DaemonStatus) -> String {
         render_intelligence(status),
         render_foreground(status),
         render_actions(status),
+        render_frozen(status),
         render_blockers(&status.last_blockers),
         render_reactor(status),
         render_energy(status),

@@ -418,6 +418,18 @@ fn frozen_entry_pressure_default() -> f64 {
     1.0
 }
 
+/// Summary of a currently frozen process, included in `DaemonStatus` for observability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrozenProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub frozen_seconds: u64,
+    /// Which subsystem triggered the freeze.
+    pub source: FreezeSource,
+    /// Memory pressure when the freeze was applied.
+    pub pressure_at_freeze: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrozenPidEntry {
     pub pid: u32,
@@ -835,6 +847,9 @@ pub struct DaemonStatus {
     pub metrics: RuntimeMetrics,
     #[serde(default)]
     pub llm: Option<LlmStatus>,
+    /// Currently frozen processes. Empty if none.
+    #[serde(default)]
+    pub frozen_processes: Vec<FrozenProcessInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
