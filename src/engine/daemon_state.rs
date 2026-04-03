@@ -11,7 +11,7 @@
 //! - LlmDomainState: LLM config/state and associated paths
 //! - UsageDomainState: usage model and tracker
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -29,8 +29,9 @@ use crate::engine::profile_governor::ProfileGovernor;
 use crate::engine::sysctl_governor::SysctlGovernorStatus;
 use crate::engine::thermal_interrupt::ResourceInterruptState;
 use crate::engine::daemon_helpers::WakeRuntimeState;
+use crate::engine::mach_qos::MachQoSManager;
 use crate::engine::types::{
-    BlockerScore, LatencyTarget, OptimizationProfile, ProfileTransition, RuntimeMetrics,
+    BlockerScore, FrozenEntry, LatencyTarget, OptimizationProfile, ProfileTransition, RuntimeMetrics,
 };
 use crate::engine::usage_model::UsageModel;
 
@@ -199,6 +200,15 @@ mod tests {
 
 /// The daemon's shared state, grouped into 6 domain-specific Mutex groups.
 /// Reduces ~20 individual Mutex fields to 6 coarser-grained locks.
+///
+/// # Lock ordering (to prevent deadlocks)
+/// Never hold two domain locks simultaneously. Acquire one, complete the
+/// operation, drop, then acquire the next.
+///
+/// `frozen_state` and `mach_qos` are intentionally kept as flat Arc<Mutex<>>
+/// fields: `frozen_state` is shared with `spawn_resource_sentinel` (16 internal
+/// sites in thermal_interrupt.rs use an independent Arc reference), and `mach_qos`
+/// is used as a sentinel parameter. Grouping them would cascade to those call sites.
 #[derive(Clone)]
 pub struct SharedState {
     pub metrics: Arc<Mutex<MetricsState>>,
@@ -208,7 +218,11 @@ pub struct SharedState {
     pub llm: Arc<Mutex<LlmDomainState>>,
     pub usage: Arc<Mutex<UsageDomainState>>,
 
-    // Infrastructure (unchanged — low frequency or lock-free)
+    // Sentinel-coupled fields (kept flat — see doc comment above)
+    pub frozen_state: Arc<Mutex<HashMap<u32, FrozenEntry>>>,
+    pub mach_qos: Arc<Mutex<MachQoSManager>>,
+
+    // Infrastructure (lock-free or low-frequency)
     pub stop: Arc<AtomicBool>,
     pub cycle_condvar: Arc<(Mutex<bool>, Condvar)>,
     pub resource_interrupt: Arc<ResourceInterruptState>,

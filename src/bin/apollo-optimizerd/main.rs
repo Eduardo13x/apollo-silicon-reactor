@@ -131,11 +131,10 @@ use apollo_optimizer::engine::daemon_helpers::{
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use clap::{Parser, Subcommand};
 
-// v0.9.0: ACL alias — DomainSharedState is the grouped version being migrated to
-#[allow(unused_imports)]
+// v0.9.0: canonical SharedState — all domain groups live in daemon_state.rs
 use apollo_optimizer::engine::daemon_state::{
     HardwareState, LlmDomainState, MetricsState, PolicyState, ProcessState,
-    ReactorStatus as DomainReactorStatus, SharedState as DomainSharedState,
+    ReactorStatus as DomainReactorStatus, SharedState,
     UsageDomainState, UsageTrackerState,
 };
 
@@ -169,30 +168,7 @@ enum Commands {
         profile: String,
     },
 }
-#[derive(Clone)]
-pub(crate) struct SharedState {
-    // v0.9.0: domain groups (Strangler Fig migration)
-    pub(crate) metrics: Arc<Mutex<MetricsState>>,
-    pub(crate) process: Arc<Mutex<ProcessState>>,
-    pub(crate) policy: Arc<Mutex<PolicyState>>,  // PR#14
-    pub(crate) hardware: Arc<Mutex<HardwareState>>,
-    pub(crate) llm: Arc<Mutex<LlmDomainState>>,
-    pub(crate) usage: Arc<Mutex<UsageDomainState>>,
-
-    // Infrastructure (lock-free or low-frequency)
-    pub(crate) frozen_state: Arc<Mutex<HashMap<u32, FrozenEntry>>>,
-    pub(crate) mach_qos: Arc<Mutex<MachQoSManager>>,
-    pub(crate) stop: Arc<AtomicBool>,
-    pub(crate) cycle_condvar: Arc<(Mutex<bool>, Condvar)>,
-    pub(crate) resource_interrupt: Arc<ResourceInterruptState>,
-    pub(crate) subscribers: Arc<Mutex<Vec<UnixStream>>>,
-
-    // Read-only paths (set once at init)
-    pub(crate) config_path: PathBuf,
-    pub(crate) discrepancy_log_path: PathBuf,
-    pub(crate) user_profile_path: PathBuf,
-}
-
+// SharedState → daemon_state (PR#15: canonical definition in daemon_state.rs)
 // ReactorStatus → daemon_state (PR#10: unified with MetricsState)
 // UsageTrackerState → daemon_state (PR#13: unified single definition)
 
