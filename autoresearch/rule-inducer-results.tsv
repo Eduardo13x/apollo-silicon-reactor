@@ -1,0 +1,5 @@
+iter	action	tests	induced_skills	verdict	notes
+0	baseline	14	0	baseline	0 skills from 335 records; all n>=12 processes have negative drops; group skills blocked by a_ok/b_ok check
+1	3 fixes: criterion/thresholds/group bypass + top_pairs 20→100	20	22	KEEP	17 individual + 5 group from live data; drops of 0.21 real batch events; added HIGH_COOCCUR_BYPASS=500
+2	batch event detector: BATCH_MIN_DROP=0.05, BATCH_MIN_EVENTS=4, BATCH_MAX_SIZE=5	24	3	KEEP	batch fires during high-pressure episodes; 171→0 after size cap (mass throttles excluded)
+3	pressure filter MIN_PRESSURE_AT_ACTION=0.50	24	3	KEEP	eliminates noisy low-pressure records; all bg daemons correctly show negative drops = not real culprits
