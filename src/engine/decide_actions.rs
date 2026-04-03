@@ -671,3 +671,495 @@ pub fn decide_actions(
         low_value_skipped,
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collector::{CpuStats, MemoryStats, PressureStats, SystemSnapshot};
+    use crate::engine::overflow_guard::OverflowThresholds;
+    use crate::engine::types::{LatencyTarget, OptimizationProfile};
+
+    /// Build a minimal SystemSnapshot with configurable pressure values.
+    fn make_snapshot(cpu_usage: f32, mem_pressure: f64, compressor: f64) -> SystemSnapshot {
+        SystemSnapshot {
+            timestamp: chrono::Utc::now(),
+            cpu: CpuStats {
+                global_usage: cpu_usage,
+                core_count: 4,
+            },
+            memory: MemoryStats {
+                total_ram: 8 * 1024 * 1024 * 1024,
+                used_ram: 0,
+                free_ram: 8 * 1024 * 1024 * 1024,
+                total_swap: 0,
+                used_swap: 0,
+            },
+            pressure: PressureStats {
+                memory_pressure: mem_pressure,
+                swap_used_bytes: 0,
+                swap_total_bytes: 0,
+                swap_delta_bytes_per_sec: 0.0,
+                thermal_level: "nominal".to_string(),
+                compressor_pressure: compressor,
+            },
+            disks: vec![],
+            networks: vec![],
+            top_processes: vec![],
+        }
+    }
+
+    /// Build default empty collections for `decide_actions` parameters.
+    fn empty_params() -> (
+        Vec<String>,
+        Vec<String>,
+        HashMap<String, PatternWeight>,
+        HashSet<u32>,
+        HashMap<u32, f64>,
+        HashMap<WorkloadHop, HopGroupWeight>,
+        HashSet<u32>,
+        HashMap<String, f32>,
+    ) {
+        (
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashSet::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashSet::new(),
+            HashMap::new(),
+        )
+    }
+
+    // ── context_from_pressure tests ──────────────────────────────────────
+
+    #[test]
+    fn context_interactive_focus_when_low_pressure() {
+        let snap = make_snapshot(10.0, 0.10, 0.0);
+        let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
+        assert!(
+            matches!(ctx, InteractiveContext::InteractiveFocus),
+            "low CPU + low memory should yield InteractiveFocus, got {:?}",
+            ctx
+        );
+    }
+
+    #[test]
+    fn context_background_pressure_from_memory() {
+        // memory_pressure 0.80 > default bg_pressure 0.78
+        let snap = make_snapshot(30.0, 0.80, 0.0);
+        let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
+        assert!(
+            matches!(ctx, InteractiveContext::BackgroundPressure),
+            "high memory pressure should yield BackgroundPressure, got {:?}",
+            ctx
+        );
+    }
+
+    #[test]
+    fn context_background_pressure_from_cpu() {
+        // CPU 75% > 72.0 threshold
+        let snap = make_snapshot(75.0, 0.10, 0.0);
+        let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
+        assert!(
+            matches!(ctx, InteractiveContext::BackgroundPressure),
+            "CPU > 72% should yield BackgroundPressure, got {:?}",
+            ctx
+        );
+    }
+
+    #[test]
+    fn context_thermal_constrained_from_cpu() {
+        // CPU 92% > 88.0 threshold
+        let snap = make_snapshot(92.0, 0.10, 0.0);
+        let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
+        assert!(
+            matches!(ctx, InteractiveContext::ThermalConstrained),
+            "CPU > 88% should yield ThermalConstrained, got {:?}",
+            ctx
+        );
+    }
+
+    #[test]
+    fn context_thermal_constrained_from_memory() {
+        // memory_pressure 0.95 > default critical_pressure 0.88
+        let snap = make_snapshot(20.0, 0.95, 0.0);
+        let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
+        assert!(
+            matches!(ctx, InteractiveContext::ThermalConstrained),
+            "memory_pressure > critical should yield ThermalConstrained, got {:?}",
+            ctx
+        );
+    }
+
+    #[test]
+    fn context_respects_custom_thresholds() {
+        // Lower bg_pressure threshold: 0.30 should make 0.35 trigger BackgroundPressure.
+        let snap = make_snapshot(10.0, 0.35, 0.0);
+        let thresholds = OverflowThresholds {
+            bg_pressure: 0.30,
+            ..OverflowThresholds::default()
+        };
+        let ctx = context_from_pressure(&snap, &thresholds);
+        assert!(
+            matches!(ctx, InteractiveContext::BackgroundPressure),
+            "custom threshold should lower the bar, got {:?}",
+            ctx
+        );
+    }
+
+    // ── blocker_score_formula tests ──────────────────────────────────────
+
+    #[test]
+    fn blocker_score_all_zero() {
+        let score = blocker_score_formula(0.0, 0.0, false, 0.0, 0.0);
+        assert!(
+            (score - 0.0).abs() < 1e-9,
+            "all-zero inputs should produce 0.0, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn blocker_score_max_all_components() {
+        let score = blocker_score_formula(1.0, 1.0, true, 1.0, 1.0);
+        // 0.40 + 0.30 + 0.10 + 0.10 + 0.10 = 1.0
+        assert!(
+            (score - 1.0).abs() < 1e-9,
+            "max inputs should produce 1.0, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn blocker_score_seen_recently_adds_010() {
+        let without = blocker_score_formula(0.5, 0.0, false, 0.0, 0.0);
+        let with = blocker_score_formula(0.5, 0.0, true, 0.0, 0.0);
+        assert!(
+            (with - without - 0.10).abs() < 1e-9,
+            "seen_recently should add exactly 0.10, delta={}",
+            with - without
+        );
+    }
+
+    #[test]
+    fn blocker_score_compressor_clamped() {
+        // compressor_pressure > 1.0 should be clamped to 1.0
+        let score_clamped = blocker_score_formula(0.0, 0.0, false, 0.0, 5.0);
+        let score_max = blocker_score_formula(0.0, 0.0, false, 0.0, 1.0);
+        assert!(
+            (score_clamped - score_max).abs() < 1e-9,
+            "compressor > 1.0 should be clamped: {} vs {}",
+            score_clamped,
+            score_max
+        );
+    }
+
+    #[test]
+    fn blocker_score_negative_compressor_clamped_to_zero() {
+        let score = blocker_score_formula(0.0, 0.0, false, 0.0, -1.0);
+        assert!(
+            (score - 0.0).abs() < 1e-9,
+            "negative compressor should clamp to 0.0, got {}",
+            score
+        );
+    }
+
+    // ── Helper classification tests ──────────────────────────────────────
+
+    #[test]
+    fn interactive_apps_detected() {
+        assert!(is_interactive_base("Code"));
+        assert!(is_interactive_base("Google Chrome"));
+        assert!(is_interactive_base("Antigravity"));
+        assert!(is_interactive_base("LM Studio"));
+        assert!(!is_interactive_base("Dropbox"));
+        assert!(!is_interactive_base("randomd"));
+    }
+
+    #[test]
+    fn noise_apps_detected() {
+        assert!(is_background_noise_base("Dropbox"));
+        assert!(is_background_noise_base("Google Drive"));
+        assert!(is_background_noise_base("corespeechd"));
+        assert!(!is_background_noise_base("Code"));
+        assert!(!is_background_noise_base("WindowServer"));
+    }
+
+    #[test]
+    fn blocker_apps_detected() {
+        assert!(is_known_blocker("WindowServer"));
+        assert!(is_known_blocker("accountsd"));
+        assert!(is_known_blocker("runningboardd"));
+        assert!(!is_known_blocker("Code"));
+        assert!(!is_known_blocker("Dropbox"));
+    }
+
+    #[test]
+    fn classification_uses_contains_not_exact_match() {
+        // "contains" semantics — substrings match.
+        assert!(is_interactive_base("com.apple.Terminal"));
+        assert!(is_background_noise_base("com.apple.suggestd"));
+        assert!(is_known_blocker("com.apple.WindowServer"));
+    }
+
+    // ── decide_actions integration tests (empty process table) ───────────
+
+    #[test]
+    fn decide_actions_empty_system_returns_no_actions() {
+        let snap = make_snapshot(10.0, 0.10, 0.0);
+        let sys = System::new();
+        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
+
+        let output = decide_actions(
+            &snap,
+            &sys,
+            OptimizationProfile::BalancedRoot,
+            LatencyTarget::Normal,
+            0.0,
+            &interactive,
+            &noise,
+            OverflowThresholds::default(),
+            None,
+            &weights,
+            0.0,
+            &pids,
+            &ipc,
+            &hops,
+            &hab,
+            &causal,
+        );
+
+        assert!(
+            output.actions.is_empty(),
+            "empty system should yield no actions"
+        );
+        assert!(
+            output.blockers.is_empty(),
+            "empty system should yield no blockers"
+        );
+        assert!(output.low_value_skipped.is_empty());
+        assert!(
+            matches!(output.context, InteractiveContext::InteractiveFocus),
+            "low pressure should yield InteractiveFocus"
+        );
+    }
+
+    #[test]
+    fn decide_actions_preserves_reactor_event_weight() {
+        let snap = make_snapshot(10.0, 0.10, 0.0);
+        let sys = System::new();
+        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
+
+        let output = decide_actions(
+            &snap,
+            &sys,
+            OptimizationProfile::BalancedRoot,
+            LatencyTarget::Normal,
+            0.42,
+            &interactive,
+            &noise,
+            OverflowThresholds::default(),
+            None,
+            &weights,
+            0.0,
+            &pids,
+            &ipc,
+            &hops,
+            &hab,
+            &causal,
+        );
+
+        assert!(
+            (output.reactor_event_weight - 0.42).abs() < 1e-9,
+            "reactor_event_weight should be passed through"
+        );
+    }
+
+    #[test]
+    fn decide_actions_context_escalates_with_pressure() {
+        let sys = System::new();
+        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
+        let thresholds = OverflowThresholds::default();
+
+        // Low pressure
+        let snap_low = make_snapshot(10.0, 0.10, 0.0);
+        let out_low = decide_actions(
+            &snap_low,
+            &sys,
+            OptimizationProfile::BalancedRoot,
+            LatencyTarget::Normal,
+            0.0,
+            &interactive,
+            &noise,
+            thresholds.clone(),
+            None,
+            &weights,
+            0.0,
+            &pids,
+            &ipc,
+            &hops,
+            &hab,
+            &causal,
+        );
+        assert!(matches!(
+            out_low.context,
+            InteractiveContext::InteractiveFocus
+        ));
+
+        // Medium pressure (CPU > 72)
+        let snap_mid = make_snapshot(75.0, 0.10, 0.0);
+        let out_mid = decide_actions(
+            &snap_mid,
+            &sys,
+            OptimizationProfile::BalancedRoot,
+            LatencyTarget::Normal,
+            0.0,
+            &interactive,
+            &noise,
+            thresholds.clone(),
+            None,
+            &weights,
+            0.0,
+            &pids,
+            &ipc,
+            &hops,
+            &hab,
+            &causal,
+        );
+        assert!(matches!(
+            out_mid.context,
+            InteractiveContext::BackgroundPressure
+        ));
+
+        // High pressure (CPU > 88)
+        let snap_high = make_snapshot(92.0, 0.10, 0.0);
+        let out_high = decide_actions(
+            &snap_high,
+            &sys,
+            OptimizationProfile::BalancedRoot,
+            LatencyTarget::Normal,
+            0.0,
+            &interactive,
+            &noise,
+            thresholds.clone(),
+            None,
+            &weights,
+            0.0,
+            &pids,
+            &ipc,
+            &hops,
+            &hab,
+            &causal,
+        );
+        assert!(matches!(
+            out_high.context,
+            InteractiveContext::ThermalConstrained
+        ));
+    }
+
+    #[test]
+    fn decide_actions_all_profiles_work() {
+        let snap = make_snapshot(10.0, 0.10, 0.0);
+        let sys = System::new();
+        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
+
+        for profile in [
+            OptimizationProfile::BalancedRoot,
+            OptimizationProfile::AggressiveRoot,
+            OptimizationProfile::SafeRoot,
+        ] {
+            let output = decide_actions(
+                &snap,
+                &sys,
+                profile,
+                LatencyTarget::Normal,
+                0.0,
+                &interactive,
+                &noise,
+                OverflowThresholds::default(),
+                None,
+                &weights,
+                0.0,
+                &pids,
+                &ipc,
+                &hops,
+                &hab,
+                &causal,
+            );
+            // Should not panic, and with no processes should produce no actions.
+            assert!(
+                output.actions.is_empty(),
+                "profile {:?} with empty sys should be empty",
+                profile
+            );
+        }
+    }
+
+    #[test]
+    fn decide_actions_all_latency_targets_work() {
+        let snap = make_snapshot(10.0, 0.10, 0.0);
+        let sys = System::new();
+        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
+
+        for target in [
+            LatencyTarget::Low,
+            LatencyTarget::Normal,
+            LatencyTarget::Max,
+        ] {
+            let output = decide_actions(
+                &snap,
+                &sys,
+                OptimizationProfile::BalancedRoot,
+                target,
+                0.0,
+                &interactive,
+                &noise,
+                OverflowThresholds::default(),
+                None,
+                &weights,
+                0.0,
+                &pids,
+                &ipc,
+                &hops,
+                &hab,
+                &causal,
+            );
+            assert!(output.actions.is_empty());
+        }
+    }
+
+    // ── DecisionOutput struct tests ──────────────────────────────────────
+
+    #[test]
+    fn decision_output_debug_derives() {
+        let output = DecisionOutput {
+            context: InteractiveContext::InteractiveFocus,
+            reactor_event_weight: 0.0,
+            blockers: vec![],
+            actions: vec![],
+            low_value_skipped: vec![],
+        };
+        // Debug should not panic.
+        let dbg = format!("{:?}", output);
+        assert!(dbg.contains("InteractiveFocus"));
+    }
+
+    #[test]
+    fn decision_output_clone() {
+        let output = DecisionOutput {
+            context: InteractiveContext::ThermalConstrained,
+            reactor_event_weight: 0.75,
+            blockers: vec![],
+            actions: vec![RootAction::BoostProcess {
+                pid: 42,
+                name: "test".to_string(),
+                reason: "testing".to_string(),
+            }],
+            low_value_skipped: vec!["skipped".to_string()],
+        };
+        let cloned = output.clone();
+        assert_eq!(cloned.actions.len(), 1);
+        assert_eq!(cloned.low_value_skipped.len(), 1);
+        assert!((cloned.reactor_event_weight - 0.75).abs() < 1e-9);
+    }
+}
