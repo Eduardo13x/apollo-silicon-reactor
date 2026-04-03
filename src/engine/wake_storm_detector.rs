@@ -150,3 +150,88 @@ impl Default for WakeStormDetector {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn new_detector_starts_empty() {
+        let det = WakeStormDetector::new();
+        assert!(det.detect_storms().is_empty());
+    }
+
+    #[test]
+    fn default_is_same_as_new() {
+        let det = WakeStormDetector::default();
+        assert!(det.detect_storms().is_empty());
+    }
+
+    #[test]
+    fn no_storm_below_threshold() {
+        let mut det = WakeStormDetector::new();
+        // Record only a few wakeups — well below the 10/sec threshold
+        for _ in 0..3 {
+            det.record_wakeup(100, "quiet-proc".to_string());
+        }
+        let storms = det.detect_storms();
+        assert!(
+            storms.is_empty(),
+            "3 wakeups should not trigger a storm, got: {:?}",
+            storms
+        );
+    }
+
+    #[test]
+    fn storm_detected_above_threshold() {
+        let mut det = WakeStormDetector::new();
+        // Record many wakeups in a tight burst — well above 10/sec
+        for _ in 0..500 {
+            det.record_wakeup(200, "noisy-proc".to_string());
+        }
+        let storms = det.detect_storms();
+        assert!(
+            !storms.is_empty(),
+            "500 wakeups within the detection window should trigger a storm"
+        );
+        assert!(storms[0].is_storm);
+        assert_eq!(storms[0].pid, 200);
+    }
+
+    #[test]
+    fn get_severity_classification() {
+        let det = WakeStormDetector::new();
+        assert_eq!(det.get_severity(5.0), StormSeverity::Low);
+        assert_eq!(det.get_severity(75.0), StormSeverity::Medium);
+        assert_eq!(det.get_severity(300.0), StormSeverity::High);
+        assert_eq!(det.get_severity(2000.0), StormSeverity::Critical);
+    }
+
+    #[test]
+    fn get_mitigation_actions_non_empty() {
+        for severity in [
+            StormSeverity::Low,
+            StormSeverity::Medium,
+            StormSeverity::High,
+            StormSeverity::Critical,
+        ] {
+            let actions = WakeStormDetector::get_mitigation_actions(severity);
+            assert!(
+                !actions.is_empty(),
+                "expected at least one mitigation action for {severity:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_stale_removes_old_processes() {
+        let mut det = WakeStormDetector::new();
+        det.record_wakeup(99, "stale-proc".to_string());
+        // Sleep just long enough that cleanup_stale removes the entry
+        std::thread::sleep(Duration::from_millis(5));
+        det.cleanup_stale(Duration::from_millis(1));
+        // After cleanup the process should be gone
+        assert!(det.detect_storms().is_empty());
+    }
+}

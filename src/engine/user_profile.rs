@@ -480,3 +480,99 @@ impl Default for UserProfile {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workload_type_roundtrip_serde() {
+        for wt in [
+            WorkloadType::Coding,
+            WorkloadType::VideoCall,
+            WorkloadType::MediaPlayback,
+            WorkloadType::VideoEdit,
+            WorkloadType::OfficeWork,
+            WorkloadType::CommandLine,
+            WorkloadType::Idle,
+            WorkloadType::General,
+        ] {
+            let json = serde_json::to_string(&wt).expect("serialize WorkloadType");
+            let rt: WorkloadType =
+                serde_json::from_str(&json).expect("deserialize WorkloadType");
+            assert_eq!(rt, wt);
+        }
+    }
+
+    #[test]
+    fn workload_type_uses_kebab_case() {
+        let json = serde_json::to_string(&WorkloadType::VideoCall)
+            .expect("serialize WorkloadType::VideoCall");
+        assert!(
+            json.contains('-'),
+            "expected kebab-case in JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn app_stats_default_zero() {
+        let stats = AppStats::default();
+        assert_eq!(stats.total_foreground_secs, 0);
+        assert_eq!(stats.launch_count, 0);
+        assert!(stats.dominant_workload.is_none());
+    }
+
+    #[test]
+    fn user_profile_new_starts_idle() {
+        let up = UserProfile::new();
+        assert_eq!(up.current_workload(), WorkloadType::Idle);
+    }
+
+    #[test]
+    fn user_profile_observe_detects_coding_workload() {
+        let mut up = UserProfile::new();
+        up.observe(Some("Xcode"), &["rustc", "cargo"], 10);
+        assert_eq!(up.current_workload(), WorkloadType::Coding);
+    }
+
+    #[test]
+    fn user_profile_persisted_roundtrip() {
+        let mut up = UserProfile::new();
+        up.observe(Some("cargo"), &["rustc"], 9);
+        up.observe(Some("Xcode"), &[], 14);
+
+        let persisted = up.to_persisted();
+        let json = serde_json::to_string(&persisted).expect("serialize UserProfilePersisted");
+        let rt: UserProfilePersisted =
+            serde_json::from_str(&json).expect("deserialize UserProfilePersisted");
+
+        // hour_model always has 24 entries after to_persisted
+        assert_eq!(rt.hour_model.len(), 24);
+    }
+
+    #[test]
+    fn likely_workload_at_hour_returns_general_with_no_data() {
+        let up = UserProfile::new();
+        // With only the default "General: 1.0" seed, should return General
+        assert_eq!(up.likely_workload_at_hour(0), WorkloadType::General);
+    }
+
+    #[test]
+    fn process_relevance_unknown_returns_zero() {
+        let up = UserProfile::new();
+        assert!((up.process_relevance("unknown-process-xyz") - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn process_relevance_coding_process_returns_one_when_coding() {
+        let mut up = UserProfile::new();
+        // Put the profile in Coding workload
+        up.observe(Some("cargo"), &["rustc", "cargo"], 10);
+        // "cargo" should be fully relevant
+        let rel = up.process_relevance("cargo");
+        assert!(
+            rel > 0.9,
+            "expected relevance ~1.0 for coding process during coding workload, got {rel}"
+        );
+    }
+}

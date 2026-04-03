@@ -152,6 +152,55 @@ pub struct UsageTrackerState {
 
 // ── Consolidated SharedState ────────────────────────────────────────────────
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reactor_status_default_counters_zero() {
+        let rs = ReactorStatus::default();
+        assert_eq!(rs.events_total, 0);
+        assert_eq!(rs.events_mem, 0);
+        assert_eq!(rs.events_thermal, 0);
+        assert_eq!(rs.events_spawn, 0);
+        assert_eq!(rs.events_power, 0);
+        assert!(rs.last_event_at.is_none());
+        assert!(rs.last_error.is_none());
+    }
+
+    #[test]
+    fn reactor_status_default_mode_normal() {
+        let rs = ReactorStatus::default();
+        assert_eq!(rs.mode, "normal");
+    }
+
+    #[test]
+    fn reactor_status_default_health_ok() {
+        let rs = ReactorStatus::default();
+        assert_eq!(rs.health, "ok");
+    }
+
+    #[test]
+    fn usage_tracker_state_default_promotions_zero() {
+        let ut = UsageTrackerState::default();
+        assert_eq!(ut.promotions_today, 0);
+        assert!(ut.last_persist_at.is_none());
+        assert!(ut.promotions_day.is_none());
+    }
+
+    #[test]
+    fn wake_runtime_state_can_be_constructed() {
+        let ws = WakeRuntimeState {
+            last_cycle_wallclock: chrono::Utc::now(),
+            last_wake_at: None,
+            post_wake_grace_until: None,
+            post_wake_policy: "normal".to_string(),
+        };
+        assert_eq!(ws.post_wake_policy, "normal");
+        assert!(ws.last_wake_at.is_none());
+    }
+}
+
 /// The daemon's shared state, grouped into 6 domain-specific Mutex groups.
 /// Reduces ~20 individual Mutex fields to 6 coarser-grained locks.
 #[derive(Clone)]
