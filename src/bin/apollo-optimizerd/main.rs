@@ -134,8 +134,8 @@ use clap::{Parser, Subcommand};
 // v0.9.0: ACL alias — DomainSharedState is the grouped version being migrated to
 #[allow(unused_imports)]
 use apollo_optimizer::engine::daemon_state::{
-    HardwareState, LlmDomainState, ProcessState, SharedState as DomainSharedState, UsageDomainState,
-    UsageTrackerState,
+    HardwareState, LlmDomainState, MetricsState, ProcessState, ReactorStatus as DomainReactorStatus,
+    SharedState as DomainSharedState, UsageDomainState, UsageTrackerState,
 };
 
 // FREEZE_TTL_SECS → daemon_helpers
@@ -172,15 +172,9 @@ enum Commands {
 pub(crate) struct SharedState {
     pub(crate) profile: Arc<Mutex<OptimizationProfile>>,
     pub(crate) latency_target: Arc<Mutex<LatencyTarget>>,
-    pub(crate) metrics: Arc<Mutex<RuntimeMetrics>>,
+    pub(crate) metrics: Arc<Mutex<MetricsState>>,
     pub(crate) frozen_state: Arc<Mutex<HashMap<u32, FrozenEntry>>>,
     pub(crate) process: Arc<Mutex<ProcessState>>,
-    pub(crate) thermal_state: Arc<Mutex<String>>,
-    pub(crate) throttle_level: Arc<Mutex<String>>,
-    pub(crate) reactor_event_weight: Arc<Mutex<f64>>,
-    pub(crate) fast_tick_until: Arc<Mutex<Option<Instant>>>,
-    pub(crate) thermal_level_real: Arc<Mutex<String>>,
-    pub(crate) reactor_status: Arc<Mutex<ReactorStatus>>,
     pub(crate) governor: Arc<Mutex<ProfileGovernor>>,
     pub(crate) timeline: Arc<Mutex<VecDeque<ProfileTransition>>>,
     pub(crate) stop: Arc<AtomicBool>,
@@ -214,37 +208,7 @@ pub(crate) struct SharedState {
     pub(crate) degradation: Arc<Mutex<apollo_optimizer::engine::degradation::DegradationController>>,
 }
 
-/// Reactor thread counters and status — 9 fields merged into 1 Mutex.
-pub(crate) struct ReactorStatus {
-    pub(crate) events_total: u64,
-    pub(crate) events_mem: u64,
-    pub(crate) events_thermal: u64,
-    pub(crate) events_spawn: u64,
-    pub(crate) events_power: u64,
-    pub(crate) last_event_at: Option<DateTime<Utc>>,
-    pub(crate) last_error: Option<String>,
-    /// "normal" | "degraded"
-    pub(crate) mode: String,
-    /// "ok" | "stalled" | "collector-stalled"
-    pub(crate) health: String,
-}
-
-impl Default for ReactorStatus {
-    fn default() -> Self {
-        Self {
-            events_total: 0,
-            events_mem: 0,
-            events_thermal: 0,
-            events_spawn: 0,
-            events_power: 0,
-            last_event_at: None,
-            last_error: None,
-            mode: "normal".to_string(),
-            health: "ok".to_string(),
-        }
-    }
-}
-
+// ReactorStatus → daemon_state (PR#10: unified with MetricsState)
 // UsageTrackerState → daemon_state (PR#13: unified single definition)
 
 // WakeStatePersisted, WakeRuntimeState → daemon_helpers
@@ -262,7 +226,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
     unsafe {
         let kq = libc::kqueue();
         if kq == -1 {
-            state.reactor_status.lock_recover().last_error = Some("kqueue failed".to_string());
+            state.metrics.lock_recover().reactor_status.last_error = Some("kqueue failed".to_string());
             return Ok(());
         }
 
@@ -282,7 +246,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             &mut thermal_token,
         );
         if thermal_reg != 0 {
-            state.reactor_status.lock_recover().last_error = Some(format!(
+            state.metrics.lock_recover().reactor_status.last_error = Some(format!(
                 "thermal notify_register_file_descriptor failed: {}",
                 thermal_reg
             ));
@@ -324,7 +288,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
         );
         if fork_rc < 0 {
             let errno = *libc::__error();
-            state.reactor_status.lock_recover().last_error = Some(format!(
+            state.metrics.lock_recover().reactor_status.last_error = Some(format!(
                 "EVFILT_PROC NOTE_FORK on launchd failed errno={}",
                 errno
             ));
@@ -342,7 +306,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             &mut power_token,
         );
         if power_reg != 0 {
-            state.reactor_status.lock_recover().last_error = Some(format!(
+            state.metrics.lock_recover().reactor_status.last_error = Some(format!(
                 "power notify_register_file_descriptor failed: {}",
                 power_reg
             ));
@@ -370,7 +334,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             // distinguish a live-but-quiet reactor from a dead one.
             {
                 let mut m = state.metrics.lock_recover();
-                m.reactor_pulses += 1;
+                m.metrics.reactor_pulses += 1;
             }
             // Poll kernel pressure level on every iteration (~1µs sysctl read).
             // Fires memory signal on level transitions (Normal↔Warning↔Critical).
@@ -382,7 +346,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
                         .memory_signal
                         .store(true, Ordering::Release);
                 }
-                state.reactor_status.lock_recover().events_mem += 1;
+                state.metrics.lock_recover().reactor_status.events_mem += 1;
                 // Wake main loop for pressure transition.
                 {
                     let (lock, cvar) = &*state.cycle_condvar;
@@ -400,7 +364,7 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
                 // kevent error (e.g. EINTR).  Record the error and retry.
                 let errno = *libc::__error();
                 if errno != libc::EINTR {
-                    state.reactor_status.lock_recover().last_error =
+                    state.metrics.lock_recover().reactor_status.last_error =
                         Some(format!("kevent error errno={}", errno));
                 }
                 continue;
@@ -409,24 +373,24 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             let id = out_ev.udata as usize;
             // Update shared counters + status in one lock acquisition.
             let reactor_mode = {
-                let mut rs = state.reactor_status.lock_recover();
-                rs.events_total += 1;
-                rs.last_event_at = Some(Utc::now());
-                rs.health = "ok".to_string();
-                rs.mode.clone()
+                let mut m = state.metrics.lock_recover();
+                m.reactor_status.events_total += 1;
+                m.reactor_status.last_event_at = Some(Utc::now());
+                m.reactor_status.health = "ok".to_string();
+                m.reactor_status.mode.clone()
             };
             if id == 2 {
                 // Drain thermal pipe
                 let mut dummy: i32 = 0;
                 let _ = libc::read(thermal_fd, &mut dummy as *mut _ as *mut libc::c_void, 4);
-                state.reactor_status.lock_recover().events_thermal += 1;
+                state.metrics.lock_recover().reactor_status.events_thermal += 1;
                 let level = match dummy {
                     0 => "nominal",
                     1 => "moderate",
                     2 => "serious",
                     _ => "critical",
                 };
-                *state.thermal_level_real.lock_recover() = level.to_string();
+                state.metrics.lock_recover().thermal_level_real = level.to_string();
                 // Signal resource sentinel for thermal ≥ serious.
                 if dummy >= 2 {
                     state
@@ -437,27 +401,27 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
             } else if id == 3 {
                 let mut dummy: i32 = 0;
                 let _ = libc::read(launch_fd, &mut dummy as *mut _ as *mut libc::c_void, 4);
-                state.reactor_status.lock_recover().events_spawn += 1;
+                state.metrics.lock_recover().reactor_status.events_spawn += 1;
             } else if id == 4 {
                 let mut dummy: i32 = 0;
                 let _ = libc::read(power_fd, &mut dummy as *mut _ as *mut libc::c_void, 4);
-                state.reactor_status.lock_recover().events_power += 1;
+                state.metrics.lock_recover().reactor_status.events_power += 1;
                 // Signal resource sentinel for power source changes.
                 state
                     .resource_interrupt
                     .power_signal
                     .store(true, Ordering::Release);
             } else if id == 1 {
-                state.reactor_status.lock_recover().events_mem += 1;
+                state.metrics.lock_recover().reactor_status.events_mem += 1;
                 state
                     .resource_interrupt
                     .memory_signal
                     .store(true, Ordering::Release);
             }
 
-            *state.reactor_event_weight.lock_recover() = 1.0;
+            state.metrics.lock_recover().reactor_event_weight = 1.0;
             if reactor_mode.as_str() == "normal" {
-                *state.fast_tick_until.lock_recover() =
+                state.metrics.lock_recover().fast_tick_until =
                     Some(Instant::now() + Duration::from_secs(REACTOR_FAST_TICK_SECS));
             }
 
@@ -584,27 +548,29 @@ fn main() -> anyhow::Result<()> {
             let state = SharedState {
                 profile: Arc::new(Mutex::new(profile)),
                 latency_target: Arc::new(Mutex::new(LatencyTarget::Normal)),
-                metrics: Arc::new(Mutex::new(RuntimeMetrics {
-                    effective_profile: profile,
+                metrics: Arc::new(Mutex::new(MetricsState {
+                    metrics: RuntimeMetrics {
+                        effective_profile: profile,
+                        throttle_level: "balanced".to_string(),
+                        thermal_state: "nominal".to_string(),
+                        thermal_level: "unknown".to_string(),
+                        current_workload: "idle".to_string(),
+                        collector_pressure_alive: true,
+                        collector_smc_alive: true,
+                        ..RuntimeMetrics::default()
+                    },
                     throttle_level: "balanced".to_string(),
                     thermal_state: "nominal".to_string(),
-                    thermal_level: "unknown".to_string(),
-                    current_workload: "idle".to_string(),
-                    collector_pressure_alive: true,
-                    collector_smc_alive: true,
-                    ..RuntimeMetrics::default()
+                    thermal_level_real: "unknown".to_string(),
+                    fast_tick_until: None,
+                    reactor_event_weight: 0.0,
+                    reactor_status: DomainReactorStatus::default(),
                 })),
                 frozen_state: Arc::new(Mutex::new(frozen_since_boot.clone())),
                 process: Arc::new(Mutex::new(ProcessState {
                     last_blockers: Vec::new(),
                     wake_state,
                 })),
-                thermal_state: Arc::new(Mutex::new("nominal".to_string())),
-                throttle_level: Arc::new(Mutex::new("balanced".to_string())),
-                reactor_event_weight: Arc::new(Mutex::new(0.0)),
-                fast_tick_until: Arc::new(Mutex::new(None)),
-                thermal_level_real: Arc::new(Mutex::new("unknown".to_string())),
-                reactor_status: Arc::new(Mutex::new(ReactorStatus::default())),
                 governor: Arc::new(Mutex::new(governor)),
                 timeline: Arc::new(Mutex::new(VecDeque::new())),
                 stop: Arc::new(AtomicBool::new(false)),
@@ -812,9 +778,9 @@ fn main() -> anyhow::Result<()> {
                     write_frozen_state(&frozen_state_path, &frozen_state);
                     {
                         let mut metrics = state.metrics.lock_recover();
-                        metrics.post_wake_defensive_unfreezes += count;
-                        metrics.unfreezes_applied += count;
-                        metrics.throttle_reverted += count;
+                        metrics.metrics.post_wake_defensive_unfreezes += count;
+                        metrics.metrics.unfreezes_applied += count;
+                        metrics.metrics.throttle_reverted += count;
                     }
                 }
             }
@@ -1245,16 +1211,16 @@ fn main() -> anyhow::Result<()> {
                         let cached = pressure_collector.latest();
                         let mut metrics = state.metrics.lock_recover();
                         if pressure_collector.data_age() < Duration::from_secs(10) {
-                            metrics.memory_pressure = cached.memory_pressure;
-                            metrics.swap_used_bytes = cached.swap_used_bytes;
-                            metrics.swap_delta_bps = cached.swap_delta_bps;
+                            metrics.metrics.memory_pressure = cached.memory_pressure;
+                            metrics.metrics.swap_used_bytes = cached.swap_used_bytes;
+                            metrics.metrics.swap_delta_bps = cached.swap_delta_bps;
                         }
                         if let Some(hw) = smc_reader.latest() {
-                            metrics.iokit_p_cluster_temp = hw.temps.p_cluster_celsius;
-                            metrics.iokit_e_cluster_temp = hw.temps.e_cluster_celsius;
-                            metrics.iokit_package_watts = hw.power.package_watts;
+                            metrics.metrics.iokit_p_cluster_temp = hw.temps.p_cluster_celsius;
+                            metrics.metrics.iokit_e_cluster_temp = hw.temps.e_cluster_celsius;
+                            metrics.metrics.iokit_package_watts = hw.power.package_watts;
                         }
-                        metrics.thermal_state = state.thermal_state.lock_recover().clone();
+                        metrics.metrics.thermal_state = metrics.thermal_state.clone();
                     }
                     last_cycle_end = Instant::now();
                     thread::sleep(Duration::from_secs(5));
@@ -1266,20 +1232,20 @@ fn main() -> anyhow::Result<()> {
                 // zero pulses after 60 s — that means the thread itself died,
                 // not just that the system has been quiet.
                 if daemon_start.elapsed() > Duration::from_secs(60) {
-                    let pulses = state.metrics.lock_recover().reactor_pulses;
+                    let pulses = state.metrics.lock_recover().metrics.reactor_pulses;
                     if pulses == 0 {
                         {
-                            let mut rs = state.reactor_status.lock_recover();
-                            rs.mode = "degraded".to_string();
-                            rs.health = "stalled".to_string();
+                            let mut m = state.metrics.lock_recover();
+                            m.reactor_status.mode = "degraded".to_string();
+                            m.reactor_status.health = "stalled".to_string();
+                            m.fast_tick_until = None;
                         }
-                        *state.fast_tick_until.lock_recover() = None;
                     } else {
                         // Reactor thread is alive; health tracks actual events.
-                        let mut rs = state.reactor_status.lock_recover();
-                        if rs.mode == "degraded" {
-                            rs.mode = "normal".to_string();
-                            rs.health = "ok".to_string();
+                        let mut m = state.metrics.lock_recover();
+                        if m.reactor_status.mode == "degraded" {
+                            m.reactor_status.mode = "normal".to_string();
+                            m.reactor_status.health = "ok".to_string();
                         }
                     }
 
@@ -1289,11 +1255,11 @@ fn main() -> anyhow::Result<()> {
                         let smc_alive = smc_reader.is_alive(120);
                         {
                             let mut m = state.metrics.lock_recover();
-                            m.collector_pressure_alive = pressure_alive;
-                            m.collector_smc_alive = smc_alive;
+                            m.metrics.collector_pressure_alive = pressure_alive;
+                            m.metrics.collector_smc_alive = smc_alive;
                         }
                         if !pressure_alive || !smc_alive {
-                            state.reactor_status.lock_recover().health =
+                            state.metrics.lock_recover().reactor_status.health =
                                 "collector-stalled".to_string();
                             // Respawn stalled collectors so the main loop gets fresh data.
                             if !smc_alive {
@@ -1329,11 +1295,11 @@ fn main() -> anyhow::Result<()> {
 
                     {
                         let mut metrics = state.metrics.lock_recover();
-                        metrics.wake_events += 1;
-                        metrics.post_wake_grace_entries += 1;
-                        metrics.post_wake_defensive_unfreezes += unfreeze_count;
-                        metrics.unfreezes_applied += unfreeze_count;
-                        metrics.throttle_reverted += unfreeze_count;
+                        metrics.metrics.wake_events += 1;
+                        metrics.metrics.post_wake_grace_entries += 1;
+                        metrics.metrics.post_wake_defensive_unfreezes += unfreeze_count;
+                        metrics.metrics.unfreezes_applied += unfreeze_count;
+                        metrics.metrics.throttle_reverted += unfreeze_count;
                     }
                 }
                 process_guard.wake_state.last_cycle_wallclock = now_wall;
@@ -1403,7 +1369,7 @@ fn main() -> anyhow::Result<()> {
                             }
                             write_frozen_state(&frozen_state_path, &frozen_guard);
                             drop(frozen_guard);
-                            state.metrics.lock_recover().freezes_applied += turbo_frozen as u64;
+                            state.metrics.lock_recover().metrics.freezes_applied += turbo_frozen as u64;
                         }
                         TurboAction::DeactivateTurbo {
                             unfreeze_pids: pids,
@@ -1416,7 +1382,7 @@ fn main() -> anyhow::Result<()> {
                             }
                             write_frozen_state(&frozen_state_path, &frozen_guard);
                             drop(frozen_guard);
-                            state.metrics.lock_recover().unfreezes_applied += unfreeze_count;
+                            state.metrics.lock_recover().metrics.unfreezes_applied += unfreeze_count;
                         }
                         TurboAction::None => {}
                     }
@@ -1445,7 +1411,7 @@ fn main() -> anyhow::Result<()> {
                         snapshot.pressure.swap_delta_bytes_per_sec = cached_pressure.swap_delta_bps;
                     }
                 }
-                snapshot.pressure.thermal_level = state.thermal_level_real.lock_recover().clone();
+                snapshot.pressure.thermal_level = state.metrics.lock_recover().thermal_level_real.clone();
                 let latency_target = *state.latency_target.lock_recover();
 
                 // Foreground detection: use ForegroundDetector instead of get_foreground_app().
@@ -1474,7 +1440,7 @@ fn main() -> anyhow::Result<()> {
                         if frozen_guard.remove(&pid).is_some() {
                             unfreeze_pids(std::iter::once(pid));
                             write_frozen_state(&frozen_state_path, &frozen_guard);
-                            state.metrics.lock_recover().unfreezes_applied += 1;
+                            state.metrics.lock_recover().metrics.unfreezes_applied += 1;
                         }
                         drop(frozen_guard);
 
@@ -1571,7 +1537,7 @@ fn main() -> anyhow::Result<()> {
                             unfreeze_pids(std::iter::once(fg_pid));
                             write_frozen_state(&frozen_state_path, &frozen_guard);
                             drop(frozen_guard);
-                            state.metrics.lock_recover().unfreezes_applied += 1;
+                            state.metrics.lock_recover().metrics.unfreezes_applied += 1;
                         }
                     }
 
@@ -1708,11 +1674,11 @@ fn main() -> anyhow::Result<()> {
                     if let Some(hw) = smc_reader.latest() {
                         {
                             let mut m = state.metrics.lock_recover();
-                            m.iokit_snapshots = smc_reader.success_count();
-                            m.iokit_errors = smc_reader.error_count();
-                            m.iokit_p_cluster_temp = hw.temps.p_cluster_celsius;
-                            m.iokit_e_cluster_temp = hw.temps.e_cluster_celsius;
-                            m.iokit_package_watts = hw.power.package_watts;
+                            m.metrics.iokit_snapshots = smc_reader.success_count();
+                            m.metrics.iokit_errors = smc_reader.error_count();
+                            m.metrics.iokit_p_cluster_temp = hw.temps.p_cluster_celsius;
+                            m.metrics.iokit_e_cluster_temp = hw.temps.e_cluster_celsius;
+                            m.metrics.iokit_package_watts = hw.power.package_watts;
                         }
                         // Fix: wire SMC thermal_state → thermal_level_real every cycle.
                         // Previously thermal_level_real only updated on rare OS thermal events
@@ -1723,10 +1689,10 @@ fn main() -> anyhow::Result<()> {
                             ThermalState::Severe => "serious",
                             ThermalState::Critical => "critical",
                         };
-                        *state.thermal_level_real.lock_recover() = level_str.to_string();
+                        state.metrics.lock_recover().thermal_level_real = level_str.to_string();
                         state.hardware.lock_recover().last_hw_snapshot = Some(hw);
                     } else {
-                        state.metrics.lock_recover().iokit_errors = smc_reader.error_count();
+                        state.metrics.lock_recover().metrics.iokit_errors = smc_reader.error_count();
                     }
                 }
 
@@ -1866,7 +1832,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     if thermal_frozen > 0 {
                         write_frozen_state(&frozen_state_path, &frozen_guard);
-                        state.metrics.lock_recover().freezes_applied += thermal_frozen as u64;
+                        state.metrics.lock_recover().metrics.freezes_applied += thermal_frozen as u64;
                         println!(
                             "[thermal] Phase {:?}: froze {} background processes (pre-throttle)",
                             thermal_action.phase, thermal_frozen
@@ -1892,7 +1858,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         write_frozen_state(&frozen_state_path, &frozen_guard);
                         drop(frozen_guard);
-                        state.metrics.lock_recover().unfreezes_applied += n;
+                        state.metrics.lock_recover().metrics.unfreezes_applied += n;
                         println!("[thermal] Cooled: unfroze {} pre-throttled processes", n);
                     }
                 }
@@ -1903,7 +1869,7 @@ fn main() -> anyhow::Result<()> {
                 let (hw_pressure, jitter_us, hw_features) = if cycle_count % 10 == 0 {
                     let snap = sample_hw_pressure();
                     if snap.is_critical() {
-                        *state.fast_tick_until.lock_recover() =
+                        state.metrics.lock_recover().fast_tick_until =
                             Some(Instant::now() + Duration::from_secs(15));
                         println!(
                             "hw_predictor: CRITICAL — jitter={}µs throughput={}Mips cache={}µs → fast-tick engaged",
@@ -1959,7 +1925,7 @@ fn main() -> anyhow::Result<()> {
                         // If GPU is thermally throttled, engage fast-tick for quicker response.
                         if gpu_metrics.power_state == GPUPowerState::Throttled {
                             gpu_thermal_throttled = true;
-                            *state.fast_tick_until.lock_recover() =
+                            state.metrics.lock_recover().fast_tick_until =
                                 Some(Instant::now() + Duration::from_secs(15));
                         }
                         // Cable: GPU thermal audit — log thermal_recommendations on throttle
@@ -1977,7 +1943,7 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         // Store GPU power state in metrics for status reporting.
-                        state.metrics.lock_recover().energy_gpu_watts =
+                        state.metrics.lock_recover().metrics.energy_gpu_watts =
                             Some(hw.power.gpu_watts.unwrap_or(0.0) as f64);
                     }
                 }
@@ -2047,8 +2013,8 @@ fn main() -> anyhow::Result<()> {
                     lctx.outcome_tracker.heuristic_is_struggling(),
                 );
 
-                let mut reactor_weight = state.reactor_event_weight.lock_recover();
-                *reactor_weight = (*reactor_weight * 0.75).clamp(0.0, 1.0);
+                let mut reactor_weight = state.metrics.lock_recover().reactor_event_weight;
+                reactor_weight = (reactor_weight * 0.75).clamp(0.0, 1.0);
 
                 // kqueue: consume VM pressure events from kernel push notifications.
                 // Critical/SuddenTerminate → boost reactor_weight + engage fast-tick.
@@ -2061,8 +2027,8 @@ fn main() -> anyhow::Result<()> {
                                 match level {
                                     VmPressureLevel::Critical
                                     | VmPressureLevel::SuddenTerminate => {
-                                        *reactor_weight = 1.0;
-                                        *state.fast_tick_until.lock_recover() =
+                                        reactor_weight = 1.0;
+                                        state.metrics.lock_recover().fast_tick_until =
                                             Some(Instant::now() + Duration::from_secs(30));
                                         println!(
                                             "kqueue: VM pressure {:?} — fast-tick engaged",
@@ -2101,7 +2067,7 @@ fn main() -> anyhow::Result<()> {
                                         );
                                     }
                                     VmPressureLevel::Warning => {
-                                        *reactor_weight = (*reactor_weight + 0.5).min(1.0);
+                                        reactor_weight = (reactor_weight + 0.5).min(1.0);
                                     }
                                     VmPressureLevel::Normal => {}
                                 }
@@ -2111,7 +2077,7 @@ fn main() -> anyhow::Result<()> {
                                 let mut frozen_state = state.frozen_state.lock_recover();
                                 if frozen_state.remove(&pid).is_some() {
                                     write_frozen_state(&frozen_state_path, &frozen_state);
-                                    state.metrics.lock_recover().unfreezes_applied += 1;
+                                    state.metrics.lock_recover().metrics.unfreezes_applied += 1;
                                 }
                                 // Also clean up display turbo's set — prevents unbounded
                                 // growth if many processes die while frozen during turbo.
@@ -2380,53 +2346,61 @@ fn main() -> anyhow::Result<()> {
                 // Populate real pressure metrics for observability.
                 {
                     let mut metrics = state.metrics.lock_recover();
-                    metrics.swap_used_bytes = snapshot.pressure.swap_used_bytes;
-                    metrics.swap_delta_bps = snapshot.pressure.swap_delta_bytes_per_sec;
-                    metrics.memory_pressure = snapshot.pressure.memory_pressure;
-                    metrics.thermal_level = snapshot.pressure.thermal_level.clone();
+                    metrics.metrics.swap_used_bytes = snapshot.pressure.swap_used_bytes;
+                    metrics.metrics.swap_delta_bps = snapshot.pressure.swap_delta_bytes_per_sec;
+                    metrics.metrics.memory_pressure = snapshot.pressure.memory_pressure;
+                    metrics.metrics.thermal_level = snapshot.pressure.thermal_level.clone();
                     {
-                        let rs = state.reactor_status.lock_recover();
-                        metrics.reactor_events_total = rs.events_total;
-                        metrics.reactor_events_mem = rs.events_mem;
-                        metrics.reactor_events_thermal = rs.events_thermal;
-                        metrics.reactor_events_spawn = rs.events_spawn;
-                        metrics.reactor_events_power = rs.events_power;
-                        metrics.reactor_last_event_at = rs.last_event_at;
-                        metrics.reactor_last_error = rs.last_error.clone();
-                        metrics.reactor_mode = rs.mode.clone();
-                        metrics.reactor_health = rs.health.clone();
+                        let rs_total = metrics.reactor_status.events_total;
+                        let rs_mem = metrics.reactor_status.events_mem;
+                        let rs_thermal = metrics.reactor_status.events_thermal;
+                        let rs_spawn = metrics.reactor_status.events_spawn;
+                        let rs_power = metrics.reactor_status.events_power;
+                        let rs_last_at = metrics.reactor_status.last_event_at;
+                        let rs_last_err = metrics.reactor_status.last_error.clone();
+                        let rs_mode = metrics.reactor_status.mode.clone();
+                        let rs_health = metrics.reactor_status.health.clone();
+                        metrics.metrics.reactor_events_total = rs_total;
+                        metrics.metrics.reactor_events_mem = rs_mem;
+                        metrics.metrics.reactor_events_thermal = rs_thermal;
+                        metrics.metrics.reactor_events_spawn = rs_spawn;
+                        metrics.metrics.reactor_events_power = rs_power;
+                        metrics.metrics.reactor_last_event_at = rs_last_at;
+                        metrics.metrics.reactor_last_error = rs_last_err;
+                        metrics.metrics.reactor_mode = rs_mode;
+                        metrics.metrics.reactor_health = rs_health;
                     }
-                    metrics.dev_session_active = dev_session_active;
-                    metrics.interactive_heavy = interactive_heavy;
-                    metrics.context_switches_5min = context_switches_5min;
-                    metrics.context_switch_burst = context_switch_burst;
+                    metrics.metrics.dev_session_active = dev_session_active;
+                    metrics.metrics.interactive_heavy = interactive_heavy;
+                    metrics.metrics.context_switches_5min = context_switches_5min;
+                    metrics.metrics.context_switch_burst = context_switch_burst;
 
                     // Resource interrupt (sentinel) metrics.
-                    metrics.resource_interrupts_total =
+                    metrics.metrics.resource_interrupts_total =
                         state.resource_interrupt.total_fires.load(Ordering::Relaxed);
-                    metrics.resource_interrupt_last_phase =
+                    metrics.metrics.resource_interrupt_last_phase =
                         state.resource_interrupt.phase.load(Ordering::Relaxed);
-                    metrics.resource_interrupt_active =
+                    metrics.metrics.resource_interrupt_active =
                         state.resource_interrupt.active.load(Ordering::Relaxed);
-                    metrics.resource_interrupt_latency_us = state
+                    metrics.metrics.resource_interrupt_latency_us = state
                         .resource_interrupt
                         .last_latency_us
                         .load(Ordering::Relaxed);
-                    metrics.resource_interrupt_processes_frozen = state
+                    metrics.metrics.resource_interrupt_processes_frozen = state
                         .resource_interrupt
                         .total_frozen
                         .load(Ordering::Relaxed);
-                    metrics.resource_interrupt_processes_migrated = state
+                    metrics.metrics.resource_interrupt_processes_migrated = state
                         .resource_interrupt
                         .total_migrated
                         .load(Ordering::Relaxed);
-                    metrics.resource_interrupt_recovery_count = state
+                    metrics.metrics.resource_interrupt_recovery_count = state
                         .resource_interrupt
                         .total_recoveries
                         .load(Ordering::Relaxed);
 
                     // Foreground detection metrics.
-                    metrics.foreground_app = match &fg_state {
+                    metrics.metrics.foreground_app = match &fg_state {
                         ForegroundState::App(app) => Some(ForegroundAppInfo {
                             pid: app.pid,
                             name: app.name.clone(),
@@ -2434,41 +2408,41 @@ fn main() -> anyhow::Result<()> {
                         }),
                         _ => None,
                     };
-                    metrics.foreground_idle = foreground_idle;
+                    metrics.metrics.foreground_idle = foreground_idle;
 
                     // Energy tracking metrics.
                     let energy_summary = lctx.energy_tracker.session_summary();
-                    metrics.energy_savings_wh = Some(energy_summary.estimated_savings_wh);
-                    metrics.energy_co2_avoided_g = Some(energy_summary.estimated_co2_kg * 1000.0);
-                    metrics.energy_package_wh = Some(energy_summary.total_package_wh);
-                    metrics.energy_session_wh =
+                    metrics.metrics.energy_savings_wh = Some(energy_summary.estimated_savings_wh);
+                    metrics.metrics.energy_co2_avoided_g = Some(energy_summary.estimated_co2_kg * 1000.0);
+                    metrics.metrics.energy_package_wh = Some(energy_summary.total_package_wh);
+                    metrics.metrics.energy_session_wh =
                         Some(energy_summary.total_cpu_wh + energy_summary.total_gpu_wh);
                     // Use cycle-level hardware snapshot for per-process power,
                     // falling back to smc_direct when IOKit returns None.
-                    metrics.energy_cpu_watts = cycle_hw_snap
+                    metrics.metrics.energy_cpu_watts = cycle_hw_snap
                         .as_ref()
                         .and_then(|h| h.power.cpu_watts)
                         .map(|w| w as f64)
                         .or(last_smc.as_ref().and_then(|s| s.p_cluster_watts));
-                    metrics.energy_gpu_watts = cycle_hw_snap
+                    metrics.metrics.energy_gpu_watts = cycle_hw_snap
                         .as_ref()
                         .and_then(|h| h.power.gpu_watts)
                         .map(|w| w as f64)
                         .or(last_smc.as_ref().and_then(|s| s.gpu_watts));
-                    metrics.energy_ane_watts = cycle_hw_snap
+                    metrics.metrics.energy_ane_watts = cycle_hw_snap
                         .as_ref()
                         .and_then(|h| h.power.ane_watts)
                         .map(|w| w as f64);
-                    metrics.energy_ane_util_pct = cycle_hw_snap
+                    metrics.metrics.energy_ane_util_pct = cycle_hw_snap
                         .as_ref()
                         .and_then(|h| h.power.ane_util_pct)
                         .map(|v| v as f64);
-                    metrics.energy_package_watts = cycle_hw_snap
+                    metrics.metrics.energy_package_watts = cycle_hw_snap
                         .as_ref()
                         .and_then(|h| h.power.package_watts)
                         .map(|w| w as f64)
                         .or(last_smc.as_ref().and_then(|s| s.system_power_watts));
-                    metrics.energy_top_consumers = lctx.energy_tracker
+                    metrics.metrics.energy_top_consumers = lctx.energy_tracker
                         .top_consumers(5)
                         .into_iter()
                         .map(|e| EnergyConsumerInfo {
@@ -2479,62 +2453,62 @@ fn main() -> anyhow::Result<()> {
                         .collect();
 
                     // Process tree metrics (informational).
-                    metrics.process_tree_groups = process_tree.group_count();
-                    metrics.process_tree_total = process_tree.len();
+                    metrics.metrics.process_tree_groups = process_tree.group_count();
+                    metrics.metrics.process_tree_total = process_tree.len();
 
                     // IOReport hardware telemetry.
                     if let Some(ref ir) = last_ioreport {
-                        metrics.ioreport_p_cluster_pct = ir.p_cluster_pct;
-                        metrics.ioreport_e_cluster_pct = ir.e_cluster_pct;
-                        metrics.ioreport_gpu_pct = ir.gpu_pct;
-                        metrics.ioreport_ane_busy = ir.ane_busy;
-                        metrics.ioreport_cpu_mw = ir.cpu_mw;
-                        metrics.ioreport_total_watts = ir.total_watts();
+                        metrics.metrics.ioreport_p_cluster_pct = ir.p_cluster_pct;
+                        metrics.metrics.ioreport_e_cluster_pct = ir.e_cluster_pct;
+                        metrics.metrics.ioreport_gpu_pct = ir.gpu_pct;
+                        metrics.metrics.ioreport_ane_busy = ir.ane_busy;
+                        metrics.metrics.ioreport_cpu_mw = ir.cpu_mw;
+                        metrics.metrics.ioreport_total_watts = ir.total_watts();
                     }
 
                     // SMC direct metrics
                     if let Some(ref smc) = last_smc {
-                        metrics.smc_system_power_watts = smc.system_power_watts;
-                        metrics.smc_lid_closed = smc.lid_closed;
-                        metrics.smc_charger_watts = smc.charger_watts;
-                        metrics.smc_battery_tte_min = smc.battery_time_to_empty_min;
-                        metrics.smc_cpu_temp_celsius = smc.cpu_temp_celsius;
-                        metrics.smc_gpu_temp_celsius = smc.gpu_temp_celsius;
-                        metrics.smc_battery_temp_celsius = smc.battery_temp_celsius;
-                        metrics.smc_cpu_voltage = smc.cpu_voltage;
-                        metrics.smc_p_cluster_watts = smc.p_cluster_watts;
+                        metrics.metrics.smc_system_power_watts = smc.system_power_watts;
+                        metrics.metrics.smc_lid_closed = smc.lid_closed;
+                        metrics.metrics.smc_charger_watts = smc.charger_watts;
+                        metrics.metrics.smc_battery_tte_min = smc.battery_time_to_empty_min;
+                        metrics.metrics.smc_cpu_temp_celsius = smc.cpu_temp_celsius;
+                        metrics.metrics.smc_gpu_temp_celsius = smc.gpu_temp_celsius;
+                        metrics.metrics.smc_battery_temp_celsius = smc.battery_temp_celsius;
+                        metrics.metrics.smc_cpu_voltage = smc.cpu_voltage;
+                        metrics.metrics.smc_p_cluster_watts = smc.p_cluster_watts;
                     }
 
                     // KPC IPC metric + signal intelligence modulation
                     if let Some(ref kpc) = kpc_snap {
-                        metrics.kpc_ipc = kpc.ipc;
+                        metrics.metrics.kpc_ipc = kpc.ipc;
                         lctx.signal_intel.set_kpc_ipc(kpc.ipc);
                         lctx.signal_intel.set_kpc_trend(kpc.ipc_trend);
                     }
 
                     // Rosetta AOT state
-                    metrics.rosetta_aot_active = rosetta_monitor.is_compiling();
+                    metrics.metrics.rosetta_aot_active = rosetta_monitor.is_compiling();
 
                     // IOReport AMC bandwidth
                     if let Some(ref ir) = last_ioreport {
-                        metrics.ioreport_amc_bandwidth_pct = ir.amc_bandwidth_pct;
+                        metrics.metrics.ioreport_amc_bandwidth_pct = ir.amc_bandwidth_pct;
                     }
 
                     // IOPMrootDomain thermal
                     if let Some(ref iopm) = iopm_snap {
-                        metrics.iopm_thermal_warning = format!("{:?}", iopm.thermal_warning);
-                        metrics.iopm_power_source = format!("{:?}", iopm.power_source);
+                        metrics.metrics.iopm_thermal_warning = format!("{:?}", iopm.thermal_warning);
+                        metrics.metrics.iopm_power_source = format!("{:?}", iopm.power_source);
                     }
 
                     // Per-process energy top consumer
                     if let Some(top) = energy_pid_results.first() {
-                        metrics.energy_top_pid_name = top.name.clone();
-                        metrics.energy_top_pid_mw = top.power_mw;
+                        metrics.metrics.energy_top_pid_name = top.name.clone();
+                        metrics.metrics.energy_top_pid_mw = top.power_mw;
                     }
 
                     // Daemon self-IPC (thread_selfcounts syscall 186)
                     let _cycle_ipc = cycle_ipc_tracker.tick();
-                    metrics.daemon_cycle_ipc = cycle_ipc_tracker.ema_ipc();
+                    metrics.metrics.daemon_cycle_ipc = cycle_ipc_tracker.ema_ipc();
                 }
 
                 let (decide_interactive, decide_noise, decide_weights, outcome_baseline) = {
@@ -2607,7 +2581,7 @@ fn main() -> anyhow::Result<()> {
                     cpu_pressure: pressure_cpu,
                     ram_pressure: pressure_ram,
                     interactive_wait_ratio: pressure_wait,
-                    reactor_event_weight: *reactor_weight,
+                    reactor_event_weight: reactor_weight,
                     thermal_constrained: matches!(
                         snapshot.pressure.thermal_level.as_str(),
                         "serious" | "critical"
@@ -2620,7 +2594,7 @@ fn main() -> anyhow::Result<()> {
                     swap_used_bytes: snapshot.pressure.swap_used_bytes,
                 });
                 if governor_decision.transition_reason.contains("floor") {
-                    state.metrics.lock_recover().profile_floor_hits += 1;
+                    state.metrics.lock_recover().metrics.profile_floor_hits += 1;
                 }
                 let current_profile = governor_decision.effective_profile;
                 write_governor_state(&governor_state_path, &governor);
@@ -2760,21 +2734,21 @@ fn main() -> anyhow::Result<()> {
                 // Signal intelligence → reactor_weight boosting.
                 // CUSUM regime shift: pressure drifting up significantly.
                 if signal_digest.regime_shift_up {
-                    *reactor_weight = (*reactor_weight + 0.3).min(1.0);
+                    reactor_weight = (reactor_weight + 0.3).min(1.0);
                 }
                 // High composite urgency: multiple signals converging on danger.
                 if signal_digest.urgency > 0.7 {
-                    *reactor_weight = (*reactor_weight + 0.2).min(1.0);
+                    reactor_weight = (reactor_weight + 0.2).min(1.0);
                 }
                 // Entropy anomaly: chaotic process distribution change.
                 if signal_digest.entropy_anomaly > 2.0 {
-                    *reactor_weight = (*reactor_weight + 0.15).min(1.0);
+                    reactor_weight = (reactor_weight + 0.15).min(1.0);
                 }
                 // Darwin-Boltzmann anomaly: learned pattern deviation.
                 // Score > 0.5 means the system state deviates significantly from
                 // the Hopfield memory + SAE ensemble's learned "normal" manifold.
                 if signal_digest.transformer_anomaly > 0.5 {
-                    *reactor_weight = (*reactor_weight + 0.2).min(1.0);
+                    reactor_weight = (reactor_weight + 0.2).min(1.0);
                 }
 
                 // Predictive agent: build context from existing signals and select intervention.
@@ -2812,7 +2786,7 @@ fn main() -> anyhow::Result<()> {
                         hw_cl,
                         prev_workload,
                         hour_of_day,
-                        *reactor_weight,
+                        reactor_weight,
                         lctx.overflow_guard.history.threshold_offset,
                         lctx.outcome_tracker.overall_effectiveness(),
                         lv_ratio,
@@ -3084,7 +3058,7 @@ fn main() -> anyhow::Result<()> {
                     });
                     if latency.needs_boost {
                         // Elevate reactor weight → faster tick + more aggressive decisions.
-                        *reactor_weight = (*reactor_weight + 0.25).min(1.0);
+                        reactor_weight = (reactor_weight + 0.25).min(1.0);
                     }
                     latency.score
                 };
@@ -3100,7 +3074,7 @@ fn main() -> anyhow::Result<()> {
                         foreground_idle,
                     );
                     if freed > 0 {
-                        state.metrics.lock_recover().paging_hints_applied += 1;
+                        state.metrics.lock_recover().metrics.paging_hints_applied += 1;
                     }
                 }
 
@@ -3160,23 +3134,23 @@ fn main() -> anyhow::Result<()> {
                         collector.system(),
                         current_profile,
                         latency_target,
-                        *reactor_weight,
+                        reactor_weight,
                         overflow_thresholds,
                         Some(&mut qos),
                         &policy,
                     ).decision
                 };
                 state.process.lock_recover().last_blockers = decision.blockers.clone();
-                *state.thermal_state.lock_recover() = process_enrichment::context_to_thermal(decision.context);
+                state.metrics.lock_recover().thermal_state = process_enrichment::context_to_thermal(decision.context);
 
                 // Propagar skips de OutcomeTracker a top_skipped_processes para observabilidad.
                 {
                     let mut metrics = state.metrics.lock_recover();
                     for name in &decision.low_value_skipped {
-                        if metrics.top_skipped_processes.len() < 12
-                            && !metrics.top_skipped_processes.contains(name)
+                        if metrics.metrics.top_skipped_processes.len() < 12
+                            && !metrics.metrics.top_skipped_processes.contains(name)
                         {
-                            metrics.top_skipped_processes.push(name.clone());
+                            metrics.metrics.top_skipped_processes.push(name.clone());
                         }
                     }
                 }
@@ -3644,12 +3618,12 @@ fn main() -> anyhow::Result<()> {
                     }
                     {
                         let mut m = state.metrics.lock_recover();
-                        m.bps_evaluated += bps_eval;
-                        m.bps_protected += bps_prot;
-                        m.bps_demoted += bps_dem;
+                        m.metrics.bps_evaluated += bps_eval;
+                        m.metrics.bps_protected += bps_prot;
+                        m.metrics.bps_demoted += bps_dem;
                         if bps_min < f64::MAX {
-                            m.bps_min_score = bps_min;
-                            m.bps_min_score_name = bps_min_name;
+                            m.metrics.bps_min_score = bps_min;
+                            m.metrics.bps_min_score_name = bps_min_name;
                         }
                     }
                     // AMX/ML workloads: never throttle/freeze ML inference processes.
@@ -3827,8 +3801,8 @@ fn main() -> anyhow::Result<()> {
                             proc_recovery.record_kill_attempt(target.pid);
                             {
                                 let mut m = state.metrics.lock_recover();
-                                m.kills_applied += 1;
-                                m.survival_mode_activations += 1;
+                                m.metrics.kills_applied += 1;
+                                m.metrics.survival_mode_activations += 1;
                             }
                         }
                     } else {
@@ -4039,14 +4013,14 @@ fn main() -> anyhow::Result<()> {
                 // Update heuristic metrics
                 {
                     let mut m = state.metrics.lock_recover();
-                    m.heuristic_decisions += heuristic_stats.decisions_total;
-                    m.heuristic_throttles += heuristic_stats.throttles;
-                    m.heuristic_freezes += heuristic_stats.freezes;
-                    m.heuristic_kills_downgraded += heuristic_stats.kills_downgraded;
-                    m.zombies_detected += heuristic_stats.zombies_detected;
+                    m.metrics.heuristic_decisions += heuristic_stats.decisions_total;
+                    m.metrics.heuristic_throttles += heuristic_stats.throttles;
+                    m.metrics.heuristic_freezes += heuristic_stats.freezes;
+                    m.metrics.heuristic_kills_downgraded += heuristic_stats.kills_downgraded;
+                    m.metrics.zombies_detected += heuristic_stats.zombies_detected;
                     // Update current workload from adaptive governor's user profile
                     let gov = state.adaptive_governor.lock_recover();
-                    m.current_workload = format!("{:?}", gov.user_profile.current_workload());
+                    m.metrics.current_workload = format!("{:?}", gov.user_profile.current_workload());
                 }
 
                 // F2 — ML Ligero: read classification result (computed inside decide_all this cycle).
@@ -4057,9 +4031,9 @@ fn main() -> anyhow::Result<()> {
                 };
                 {
                     let mut m = state.metrics.lock_recover();
-                    m.ml_confidence = ml_class.confidence;
-                    m.current_workload = format!("{:?}", ml_class.workload).to_lowercase();
-                    m.ml_sources = ml_class.sources_summary();
+                    m.metrics.ml_confidence = ml_class.confidence;
+                    m.metrics.current_workload = format!("{:?}", ml_class.workload).to_lowercase();
+                    m.metrics.ml_sources = ml_class.sources_summary();
                 }
                 // Cable: GPU optimize_for_workload → log GPU-specific hints when
                 // workload changes AND GPU is drawing power (gpu_active in features).
@@ -4186,7 +4160,7 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or(true)
                 {
                     thrash.minute_started = Some(now);
-                    state.metrics.lock_recover().budgets.minute_actions = 0;
+                    state.metrics.lock_recover().metrics.budgets.minute_actions = 0;
                 }
 
                 let caps = detect_capabilities();
@@ -4243,22 +4217,22 @@ fn main() -> anyhow::Result<()> {
                                 frozen_state.remove(pid);
                             }
                             write_frozen_state(&frozen_state_path, &frozen_state);
-                            metrics.post_wake_defensive_unfreezes += count;
-                            metrics.unfreezes_applied += count;
-                            metrics.throttle_reverted += count;
+                            metrics.metrics.post_wake_defensive_unfreezes += count;
+                            metrics.metrics.unfreezes_applied += count;
+                            metrics.metrics.throttle_reverted += count;
                         }
                     }
-                    metrics.budgets.cycle_boosts = 0;
-                    metrics.budgets.cycle_throttles = 0;
-                    metrics.budgets.cycle_hints = 0;
-                    metrics.budgets.cycle_freezes = 0;
-                    metrics.budgets.cycle_sysctl_writes = 0;
-                    metrics.budgets.boost_denied_cooldown = 0;
+                    metrics.metrics.budgets.cycle_boosts = 0;
+                    metrics.metrics.budgets.cycle_throttles = 0;
+                    metrics.metrics.budgets.cycle_hints = 0;
+                    metrics.metrics.budgets.cycle_freezes = 0;
+                    metrics.metrics.budgets.cycle_sysctl_writes = 0;
+                    metrics.metrics.budgets.boost_denied_cooldown = 0;
 
                     let (graced_actions, throttle_suppressed, freeze_suppressed) =
                         process_enrichment::apply_post_wake_grace_policy(actions, grace_active);
-                    metrics.post_wake_throttle_suppressed += throttle_suppressed;
-                    metrics.post_wake_freeze_suppressed += freeze_suppressed;
+                    metrics.metrics.post_wake_throttle_suppressed += throttle_suppressed;
+                    metrics.metrics.post_wake_freeze_suppressed += freeze_suppressed;
 
                     // Freeze confirmation: only freeze PIDs flagged for 2+ consecutive cycles.
                     // This filters out short-lived transients that die before execute_actions.
@@ -4340,7 +4314,7 @@ fn main() -> anyhow::Result<()> {
                                     temp.as_ref(),
                                     None, // DAMON WSS integrated later per-process
                                     active_count,
-                                    metrics.memory_pressure,
+                                    metrics.metrics.memory_pressure,
                                     fault_rate,
                                 );
                                 let decision_str = match action {
@@ -4364,7 +4338,7 @@ fn main() -> anyhow::Result<()> {
                                         "samples": t.sample_count,
                                     })),
                                     "fault_rate": (fault_rate * 10.0).round() / 10.0,
-                                    "pressure": (metrics.memory_pressure * 1000.0).round() / 1000.0,
+                                    "pressure": (metrics.metrics.memory_pressure * 1000.0).round() / 1000.0,
                                     "memory_layout": memory_hint.as_ref().map(|(h, c)| format!("{:?}({:.0}%)", h, c * 100.0)),
                                 }));
                                 match action {
@@ -4429,11 +4403,11 @@ fn main() -> anyhow::Result<()> {
                             Some(a)
                         }
                     }).collect();
-                    metrics.deep_scan_count += ds_scans;
-                    metrics.deep_scan_temp_probes += ds_probes;
-                    metrics.deep_scan_freeze += ds_freeze;
-                    metrics.deep_scan_skip += ds_skip;
-                    metrics.deep_scan_hint += ds_hint;
+                    metrics.metrics.deep_scan_count += ds_scans;
+                    metrics.metrics.deep_scan_temp_probes += ds_probes;
+                    metrics.metrics.deep_scan_freeze += ds_freeze;
+                    metrics.metrics.deep_scan_skip += ds_skip;
+                    metrics.metrics.deep_scan_hint += ds_hint;
 
                     // Rosetta AOT: skip freezing oahd/oahd-helper during AOT compilation.
                     let confirmed_actions: Vec<RootAction> = if rosetta_monitor.is_compiling() {
@@ -4498,7 +4472,7 @@ fn main() -> anyhow::Result<()> {
                         for pid in &stuck_pids {
                             frozen_map.remove(pid);
                         }
-                        metrics.unfreezes_applied += stuck_pids.len() as u64;
+                        metrics.metrics.unfreezes_applied += stuck_pids.len() as u64;
                     }
 
                     let filtered = process_enrichment::filter_boost_cooldown(confirmed_actions, &policy, &mut thrash);
@@ -4510,17 +4484,17 @@ fn main() -> anyhow::Result<()> {
                     let fa = enforce_limits_with_budget(
                         filtered,
                         &policy,
-                        &mut metrics.budgets,
+                        &mut metrics.metrics.budgets,
                         minute_cap,
                     );
-                    metrics.last_actions_summary = format!(
+                    metrics.metrics.last_actions_summary = format!(
                         "actions={} boosts={} throttles={} freezes={} sysctl={} invalid_sysctl_denied={}",
                         fa.len(),
                         fa.iter().filter(|a| matches!(a, RootAction::BoostProcess { .. })).count(),
                         fa.iter().filter(|a| matches!(a, RootAction::ThrottleProcess { .. })).count(),
                         fa.iter().filter(|a| matches!(a, RootAction::FreezeProcess { .. })).count(),
                         fa.iter().filter(|a| matches!(a, RootAction::SetSysctl { .. })).count(),
-                        metrics.invalid_sysctl_denied
+                        metrics.metrics.invalid_sysctl_denied
                     );
                     fa
                     // metrics lock released here
@@ -4538,8 +4512,8 @@ fn main() -> anyhow::Result<()> {
                     let bp = action_queue.backpressure_ratio();
                     let pending_depth = lctx.outcome_tracker.pending_depth();
                     let mut metrics = state.metrics.lock_recover();
-                    metrics.action_queue_backpressure = bp;
-                    metrics.outcome_pending_depth = pending_depth;
+                    metrics.metrics.action_queue_backpressure = bp;
+                    metrics.metrics.outcome_pending_depth = pending_depth;
                 }
 
                 // Captura los nombres de throttles antes de mover final_actions.
@@ -5078,28 +5052,28 @@ fn main() -> anyhow::Result<()> {
                 // Update predictive agent + signal intelligence metrics for status reporting.
                 {
                     let mut m = state.metrics.lock_recover();
-                    m.predictive_agent_active = lctx.predictive_agent.is_active();
-                    m.predictive_agent_cycles = lctx.predictive_agent.total_cycles();
-                    m.predictive_agent_arm_pulls = lctx.predictive_agent.arm_pulls();
-                    m.predictive_agent_last_intervention = format!("{:?}", agent_intervention);
-                    m.si_pressure_smooth = signal_digest.pressure_smooth;
-                    m.si_pressure_velocity = signal_digest.pressure_velocity;
-                    m.si_p_oom_30s = signal_digest.p_oom_30s;
-                    m.si_urgency = signal_digest.urgency;
+                    m.metrics.predictive_agent_active = lctx.predictive_agent.is_active();
+                    m.metrics.predictive_agent_cycles = lctx.predictive_agent.total_cycles();
+                    m.metrics.predictive_agent_arm_pulls = lctx.predictive_agent.arm_pulls();
+                    m.metrics.predictive_agent_last_intervention = format!("{:?}", agent_intervention);
+                    m.metrics.si_pressure_smooth = signal_digest.pressure_smooth;
+                    m.metrics.si_pressure_velocity = signal_digest.pressure_velocity;
+                    m.metrics.si_p_oom_30s = signal_digest.p_oom_30s;
+                    m.metrics.si_urgency = signal_digest.urgency;
                     if signal_digest.regime_shift_up {
-                        m.si_regime_shifts += 1;
+                        m.metrics.si_regime_shifts += 1;
                     }
-                    m.si_monopoly_risk = signal_digest.monopoly_risk;
-                    m.si_entropy_anomaly = signal_digest.entropy_anomaly;
+                    m.metrics.si_monopoly_risk = signal_digest.monopoly_risk;
+                    m.metrics.si_entropy_anomaly = signal_digest.entropy_anomaly;
                     // Cable 4: top_causal_pairs() → expose in metrics for observability.
-                    m.causal_pairs = lctx.outcome_tracker.top_causal_pairs(5)
+                    m.metrics.causal_pairs = lctx.outcome_tracker.top_causal_pairs(5)
                         .iter()
                         .map(|(a, b, c)| format!("{} + {} ({})", a, b, c))
                         .collect();
-                    m.natural_drift = lctx.outcome_tracker.natural_drift();
-                    m.experience_memory_size = lctx.outcome_tracker.experience.len();
+                    m.metrics.natural_drift = lctx.outcome_tracker.natural_drift();
+                    m.metrics.experience_memory_size = lctx.outcome_tracker.experience.len();
                     // Causal effect average: mean effect across last resolved outcomes.
-                    m.causal_effect_avg = {
+                    m.metrics.causal_effect_avg = {
                         let effectiveness = lctx.outcome_tracker.overall_effectiveness();
                         let avg_drop = if lctx.outcome_tracker.total_resolved > 0 {
                             effectiveness * 0.05
@@ -5109,14 +5083,14 @@ fn main() -> anyhow::Result<()> {
                         lctx.outcome_tracker.causal_effect(avg_drop)
                     };
                     // HRPO / Dr. Zero metrics
-                    m.dr_zero_self_challenge = lctx.outcome_tracker.self_challenge_score();
-                    m.dr_zero_groups = lctx.outcome_tracker.hop_group_summary()
+                    m.metrics.dr_zero_self_challenge = lctx.outcome_tracker.self_challenge_score();
+                    m.metrics.dr_zero_groups = lctx.outcome_tracker.hop_group_summary()
                         .iter()
                         .map(|(hop, eff, count, pred_err)| {
                             format!("{:?}(eff={:.0}% n={} err={:.2})", hop, eff * 100.0, count, pred_err)
                         })
                         .collect();
-                    m.dr_zero_exploration = lctx.outcome_tracker.exploration_needed()
+                    m.metrics.dr_zero_exploration = lctx.outcome_tracker.exploration_needed()
                         .iter()
                         .map(|(hop, err)| format!("{:?}(err={:.2})", hop, err))
                         .collect();
@@ -5142,7 +5116,7 @@ fn main() -> anyhow::Result<()> {
                         io_shaper.shape(&fg_pids, &process_tiers, under_pressure, Some(&mut qos));
                     drop(qos);
                     if io_changes > 0 {
-                        state.metrics.lock_recover().sysctl_reactive_writes += io_changes as u64;
+                        state.metrics.lock_recover().metrics.sysctl_reactive_writes += io_changes as u64;
                     }
                 }
 
@@ -5218,76 +5192,78 @@ fn main() -> anyhow::Result<()> {
                     let outcomes = qos.apply_batch(&qos_changes);
                     {
                         let mut m = state.metrics.lock_recover();
-                        m.qos_foreground_count += outcomes
+                        m.metrics.qos_foreground_count += outcomes
                             .iter()
                             .filter(|o| o.tier == SchedulingTier::Foreground && o.success)
                             .count() as u64;
-                        m.qos_background_count += outcomes
+                        m.metrics.qos_background_count += outcomes
                             .iter()
                             .filter(|o| o.tier == SchedulingTier::Background && o.success)
                             .count() as u64;
-                        m.qos_errors += outcomes.iter().filter(|o| !o.success).count() as u64;
+                        m.metrics.qos_errors += outcomes.iter().filter(|o| !o.success).count() as u64;
                     }
                 }
 
                 // Phase 3: Merge outcomes into metrics (reacquire lock after I/O).
                 {
                     let mut metrics = state.metrics.lock_recover();
-                    metrics.boosts_applied += exec_outcomes.boosts_applied;
-                    metrics.throttles_applied += exec_outcomes.throttles_applied;
-                    metrics.freezes_applied += exec_outcomes.freezes_applied;
-                    metrics.unfreezes_applied += exec_outcomes.unfreezes_applied;
-                    metrics.paging_hints_applied += exec_outcomes.paging_hints_applied;
-                    metrics.sysctl_applied += exec_outcomes.sysctl_applied;
-                    metrics.failures += exec_outcomes.failures;
+                    metrics.metrics.boosts_applied += exec_outcomes.boosts_applied;
+                    metrics.metrics.throttles_applied += exec_outcomes.throttles_applied;
+                    metrics.metrics.freezes_applied += exec_outcomes.freezes_applied;
+                    metrics.metrics.unfreezes_applied += exec_outcomes.unfreezes_applied;
+                    metrics.metrics.paging_hints_applied += exec_outcomes.paging_hints_applied;
+                    metrics.metrics.sysctl_applied += exec_outcomes.sysctl_applied;
+                    metrics.metrics.failures += exec_outcomes.failures;
                     if let Some(e) = exec_outcomes.last_error {
-                        metrics.last_error = Some(e);
+                        metrics.metrics.last_error = Some(e);
                     }
-                    metrics.critical_background_skips += exec_outcomes.critical_background_skips;
-                    metrics.invalid_sysctl_denied += exec_outcomes.invalid_sysctl_denied;
+                    metrics.metrics.critical_background_skips += exec_outcomes.critical_background_skips;
+                    metrics.metrics.invalid_sysctl_denied += exec_outcomes.invalid_sysctl_denied;
                     for skip in exec_outcomes.top_skipped {
-                        if metrics.top_skipped_processes.len() < 12
-                            && !metrics.top_skipped_processes.contains(&skip)
+                        if metrics.metrics.top_skipped_processes.len() < 12
+                            && !metrics.metrics.top_skipped_processes.contains(&skip)
                         {
-                            metrics.top_skipped_processes.push(skip);
+                            metrics.metrics.top_skipped_processes.push(skip);
                         }
                     }
-                    metrics.top_skipped_processes.truncate(12);
-                    metrics.throttle_reverted += exec_outcomes.throttle_reverted;
-                    metrics.thread_qos_applied += exec_outcomes.thread_qos_applied;
+                    metrics.metrics.top_skipped_processes.truncate(12);
+                    metrics.metrics.throttle_reverted += exec_outcomes.throttle_reverted;
+                    metrics.metrics.thread_qos_applied += exec_outcomes.thread_qos_applied;
 
                     // SysctlGovernor + NetworkMonitor metrics.
-                    metrics.sysctl_reactive_writes += exec_outcomes.sysctl_applied;
+                    metrics.metrics.sysctl_reactive_writes += exec_outcomes.sysctl_applied;
                     {
                         let hw = state.hardware.lock_recover();
-                        metrics.sysctl_governor_active_tunings = hw.sysctl_governor_status.active_tunings;
-                        metrics.sysctl_governor_total_writes = hw.sysctl_governor_status.total_writes;
+                        metrics.metrics.sysctl_governor_active_tunings = hw.sysctl_governor_status.active_tunings;
+                        metrics.metrics.sysctl_governor_total_writes = hw.sysctl_governor_status.total_writes;
                     }
-                    metrics.network_retransmit_ratio = network_monitor.retransmission_rate();
-                    metrics.network_listen_drop_rate = network_monitor.listen_drop_rate();
+                    metrics.metrics.network_retransmit_ratio = network_monitor.retransmission_rate();
+                    metrics.metrics.network_listen_drop_rate = network_monitor.listen_drop_rate();
 
                     let had_new_failures = exec_outcomes.failures > 0;
 
-                    metrics.cycles += 1;
-                    metrics.reactor_pulses += if decision.reactor_event_weight > 0.2 {
+                    metrics.metrics.cycles += 1;
+                    metrics.metrics.reactor_pulses += if decision.reactor_event_weight > 0.2 {
                         1
                     } else {
                         0
                     };
-                    metrics.last_cycle_at = Some(Utc::now());
-                    metrics.last_blockers = decision.blockers;
-                    metrics.effective_profile = current_profile;
+                    metrics.metrics.last_cycle_at = Some(Utc::now());
+                    metrics.metrics.last_blockers = decision.blockers;
+                    metrics.metrics.effective_profile = current_profile;
                     metrics.throttle_level = governor_decision.throttle_level.clone();
-                    metrics.thermal_state = state.thermal_state.lock_recover().clone();
-                    metrics.last_pressure_score = governor_decision.pressure_score;
+                    metrics.metrics.throttle_level = governor_decision.throttle_level.clone();
+                    // Use MetricsState.thermal_state (set by reactor) — no re-lock needed
+                    metrics.metrics.thermal_state = metrics.thermal_state.clone();
+                    metrics.metrics.last_pressure_score = governor_decision.pressure_score;
                     if governor_decision.override_expired {
-                        metrics.override_expirations += 1;
+                        metrics.metrics.override_expirations += 1;
                     }
                     if governor_decision.override_active && !override_was_active {
-                        metrics.override_activations += 1;
+                        metrics.metrics.override_activations += 1;
                     }
                     if let Some(transition) = governor_decision.transition.clone() {
-                        metrics.profile_switches += 1;
+                        metrics.metrics.profile_switches += 1;
                         let mut timeline = state.timeline.lock_recover();
                         timeline.push_back(transition.clone());
                         if timeline.len() > 200 {
@@ -5298,14 +5274,15 @@ fn main() -> anyhow::Result<()> {
                     override_was_active = governor_decision.override_active;
 
                     let elapsed = cycle_start.elapsed().as_millis() as u64;
-                    metrics.cycle_durations_ms.push_back(elapsed);
-                    if metrics.cycle_durations_ms.len() > 120 {
-                        metrics.cycle_durations_ms.pop_front();
+                    metrics.metrics.cycle_durations_ms.push_back(elapsed);
+                    if metrics.metrics.cycle_durations_ms.len() > 120 {
+                        metrics.metrics.cycle_durations_ms.pop_front();
                     }
-                    metrics.p95_cycle_ms =
-                        compute_p95(metrics.cycle_durations_ms.make_contiguous());
+                    metrics.metrics.p95_cycle_ms =
+                        compute_p95(metrics.metrics.cycle_durations_ms.make_contiguous());
 
-                    *state.throttle_level.lock_recover() = metrics.throttle_level.clone();
+                    // reactor_weight: write back local accumulated value to MetricsState
+                    metrics.reactor_event_weight = reactor_weight;
 
                     let nowi = Instant::now();
                     critical_failure_timestamps
@@ -5319,23 +5296,23 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     // Actualizar métricas del overflow guard antes de escribir.
-                    metrics.overflow_events_total = lctx.overflow_guard.history.total_overflows;
-                    metrics.overflow_events_7d = lctx.overflow_guard.recent_overflow_count(7);
-                    metrics.overflow_threshold_offset_pp =
+                    metrics.metrics.overflow_events_total = lctx.overflow_guard.history.total_overflows;
+                    metrics.metrics.overflow_events_7d = lctx.overflow_guard.recent_overflow_count(7);
+                    metrics.metrics.overflow_threshold_offset_pp =
                         (lctx.overflow_guard.compute_dynamic_offset() * 100.0).round() as i32;
-                    metrics.overflow_workload_mode =
+                    metrics.metrics.overflow_workload_mode =
                         overflow_thresholds.workload_mode.as_str().to_string();
 
                     // RL threshold agent metrics (Phase 4).
                     if let Some(rl) = &lctx.overflow_guard.rl_agent {
-                        metrics.rl_adjustment_pp = (rl.current_adjustment * 100.0).round() as i32;
-                        metrics.rl_total_ticks = rl.total_ticks();
-                        metrics.rl_total_overflows = rl.total_overflows();
+                        metrics.metrics.rl_adjustment_pp = (rl.current_adjustment * 100.0).round() as i32;
+                        metrics.metrics.rl_total_ticks = rl.total_ticks();
+                        metrics.metrics.rl_total_overflows = rl.total_overflows();
                     }
 
                     // Clone before releasing lock — write_metrics does file I/O
                     // and holding the lock during I/O blocks GetStatus requests.
-                    let metrics_snapshot = metrics.clone();
+                    let metrics_snapshot = metrics.metrics.clone();
                     drop(metrics);
                     write_metrics(&metrics_path, &metrics_snapshot);
                 }
@@ -5389,7 +5366,7 @@ fn main() -> anyhow::Result<()> {
                 // Persist UserProfile every 10 cycles (~5 min at 30 s/cycle) so learning
                 // survives daemon restarts.
                 {
-                    let cycles = state.metrics.lock_recover().cycles;
+                    let cycles = state.metrics.lock_recover().metrics.cycles;
                     if cycles % 10 == 0 {
                         let persisted = {
                             let gov = state.adaptive_governor.lock_recover();
@@ -5399,9 +5376,8 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                let fast = state
+                let fast = state.metrics.lock_recover()
                     .fast_tick_until
-                    .lock_recover()
                     .map(|t| Instant::now() < t)
                     .unwrap_or(false);
                 last_cycle_end = Instant::now();

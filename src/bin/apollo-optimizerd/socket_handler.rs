@@ -158,7 +158,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             // Fall back to default metrics if busy — dashboard shows stale data
             // briefly, but never hangs.
             let metrics = match state.metrics.try_lock() {
-                Ok(m) => m.clone(),
+                Ok(m) => m.metrics.clone(),
                 Err(_) => {
                     // Lock held by main loop — read last-written snapshot from disk.
                     // This is always ≤1 cycle old (written at end of each cycle).
@@ -169,8 +169,8 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 }
             };
             let blockers = state.process.lock_recover().last_blockers.clone();
-            let thermal_state = state.thermal_state.lock_recover().clone();
-            let throttle_level = state.throttle_level.lock_recover().clone();
+            let thermal_state = state.metrics.lock_recover().thermal_state.clone();
+            let throttle_level = state.metrics.lock_recover().throttle_level.clone();
             // Snapshot governor + wake_state, then DROP locks before build_llm_status.
             let (auto_profile_enabled, base_profile, override_active, override_expires_at,
                  transition_reason) = {
@@ -191,8 +191,8 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 (ga, gr, ws.last_wake_at, ws.post_wake_policy.clone())
             };
             let (reactor_mode, reactor_health) = {
-                let rs = state.reactor_status.lock_recover();
-                (rs.mode.clone(), rs.health.clone())
+                let m = state.metrics.lock_recover();
+                (m.reactor_status.mode.clone(), m.reactor_status.health.clone())
             };
             let llm = build_llm_status(state);
             let status = DaemonStatus {
@@ -220,7 +220,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             };
             DaemonResponse::Status(status)
         }
-        DaemonRequest::GetMetrics => DaemonResponse::Metrics(state.metrics.lock_recover().clone()),
+        DaemonRequest::GetMetrics => DaemonResponse::Metrics(state.metrics.lock_recover().metrics.clone()),
         DaemonRequest::GetTopBlockers => {
             DaemonResponse::TopBlockers(state.process.lock_recover().last_blockers.clone())
         }
@@ -298,12 +298,12 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 format!("socket_exists: {}", Path::new(socket_path()).exists()),
                 format!("kill_switch: {}", Path::new(kill_switch_path()).exists()),
                 {
-                    let rs = state.reactor_status.lock_recover();
-                    format!("reactor_mode: {}", rs.mode)
+                    let m = state.metrics.lock_recover();
+                    format!("reactor_mode: {}", m.reactor_status.mode)
                 },
                 {
-                    let rs = state.reactor_status.lock_recover();
-                    format!("reactor_health: {}", rs.health)
+                    let m = state.metrics.lock_recover();
+                    format!("reactor_health: {}", m.reactor_status.health)
                 },
                 format!(
                     "swapusage_readable: {}",
@@ -438,7 +438,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             // Collect a one-off snapshot for this test.
             let mut collector = SystemCollector::new();
             let mut snapshot = collector.collect_snapshot();
-            snapshot.pressure.thermal_level = state.thermal_level_real.lock_recover().clone();
+            snapshot.pressure.thermal_level = state.metrics.lock_recover().thermal_level_real.clone();
 
             // Record attempt immediately.
             {
@@ -653,7 +653,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             };
             let (uptime_cycles, total_failures) = {
                 let m = state.metrics.lock_recover();
-                (m.cycles, m.failures)
+                (m.metrics.cycles, m.metrics.failures)
             };
             let is_emergency = op_mode_str == OperationMode::Emergency.as_str();
             let is_degraded = op_mode_str != OperationMode::Full.as_str();
