@@ -404,6 +404,14 @@ pub fn execute_actions(
                             // Restore I/O tier to Standard on unfreeze.
                             if caps.can_taskpolicy {
                                 apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Standard);
+                                // Warmup boost: temporary Foreground QoS burst accelerates
+                                // working-set reload from the compressor on resume.
+                                // Next cycle re-evaluates and may demote back.
+                                // [Ousterhout 2013 "Scheduling for Reduced Tail Latency" OSDI;
+                                //  iOS app resume — foreground pulse for fast working-set reload]
+                                if let Some(ref mut mgr) = qos_mgr {
+                                    mgr.set_tier(*pid, crate::engine::mach_qos::SchedulingTier::Foreground);
+                                }
                             }
                             // Restaurar prioridad jetsam a FOREGROUND al descongelar.
                             if caps.can_memorystatus {
