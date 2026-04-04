@@ -88,6 +88,7 @@ pub mod usage_model;
 pub mod user_profile;
 pub mod wait_graph;
 pub mod wake_storm_detector;
+pub mod window_sensor;
 pub mod workload_classifier;
 pub mod zombie_hunter;
 
