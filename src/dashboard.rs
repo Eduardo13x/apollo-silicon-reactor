@@ -83,7 +83,13 @@ fn box_empty() -> String {
 fn box_line(content: &str) -> String {
     let dw = display_width(content);
     let pad = CW.saturating_sub(dw);
-    format!("║ {}{} ║", content, " ".repeat(pad))
+    // Pre-size: "║ " (2B) + content + spaces + " ║" (2B). Single alloc.
+    let mut s = String::with_capacity(4 + content.len() + pad);
+    s.push_str("║ ");
+    s.push_str(content);
+    for _ in 0..pad { s.push(' '); }
+    s.push_str(" ║");
+    s
 }
 
 // ── Formatters ──
