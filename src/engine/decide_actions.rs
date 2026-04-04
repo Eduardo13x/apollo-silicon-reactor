@@ -644,46 +644,64 @@ pub fn decide_actions(
                 && snapshot.pressure.swap_delta_bytes_per_sec > (5.0 * 1024.0 * 1024.0))
                 || (snapshot.pressure.memory_pressure >= 0.75 && swap_committed_gb >= 1.5);
             if extreme_freeze_ok {
-                for (pid, process) in sys.processes() {
-                    let pid = pid.as_u32();
-                    if critical_pids.contains(&pid) {
-                        continue;
-                    }
-                    let name = process.name().to_string();
-                    // Never freeze interactive apps even under extreme pressure.
-                    if is_interactive(&name, pid) {
-                        continue;
-                    }
-                    if ["Slack", "Discord", "Spotify", "Teams"]
+                // RSS-rank selection: freeze/throttle the largest-RSS background
+                // processes first — maximum pressure relief per action.
+                // [Android LMK: terminate by OOM-adj score (RSS proxy);
+                //  Facebook HHVM: "evict by cost, not name"]
+                //
+                // Replaced hardcoded ["Slack","Discord","Spotify","Teams"]: any
+                // memory-heavy background app (zoom.us, Figma, Electron apps)
+                // now qualifies. Protection stack in execute_actions still applies.
+                let mut freeze_candidates: Vec<(u32, String, u64, f32, u64)> =
+                    sys.processes()
                         .iter()
-                        .any(|n| name.contains(n))
-                    {
-                        // CPU-active guard: don't freeze processes actively computing;
-                        // throttle them instead to avoid killing in-flight work.
-                        if process.cpu_usage() > 10.0 {
-                            actions.push(RootAction::ThrottleProcess {
-                                pid,
+                        .filter_map(|(pid, process)| {
+                            let pid_u32 = pid.as_u32();
+                            if critical_pids.contains(&pid_u32) {
+                                return None;
+                            }
+                            let name = process.name().to_string();
+                            if is_interactive(&name, pid_u32) {
+                                return None;
+                            }
+                            Some((
+                                pid_u32,
                                 name,
-                                aggressive: true,
-                                reason: format!(
-                                    "extreme pressure but cpu-active ({:.0}%) — throttle instead",
-                                    process.cpu_usage()
-                                ),
-                                start_sec: process.start_time(),
-                                start_usec: 0,
-                            });
-                        } else {
-                            actions.push(RootAction::FreezeProcess {
-                                pid,
-                                name,
-                                reason: format!(
-                                    "extreme pressure quarantine under {:?}",
-                                    context
-                                ),
-                                start_sec: process.start_time(),
-                                start_usec: 0,
-                            });
-                        }
+                                process.memory(), // RSS bytes
+                                process.cpu_usage(),
+                                process.start_time(),
+                            ))
+                        })
+                        .collect();
+                // Descending RSS: biggest consumers first.
+                freeze_candidates.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+                // Cap at 3 per cycle — avoid SIGSTOP burst overhead on display pipeline.
+                for (pid, name, _rss, cpu, start_sec) in freeze_candidates.into_iter().take(3) {
+                    // CPU-active guard: throttle instead of freeze to avoid dropping
+                    // in-flight work (compile, network IO, active render).
+                    if cpu > 10.0 {
+                        actions.push(RootAction::ThrottleProcess {
+                            pid,
+                            name,
+                            aggressive: true,
+                            reason: format!(
+                                "extreme pressure RSS-rank cpu-active ({:.0}%) — throttle",
+                                cpu
+                            ),
+                            start_sec,
+                            start_usec: 0,
+                        });
+                    } else {
+                        actions.push(RootAction::FreezeProcess {
+                            pid,
+                            name,
+                            reason: format!(
+                                "extreme pressure RSS-rank under {:?}",
+                                context
+                            ),
+                            start_sec,
+                            start_usec: 0,
+                        });
                     }
                 }
             }
