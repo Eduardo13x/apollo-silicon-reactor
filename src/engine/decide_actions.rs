@@ -11,6 +11,7 @@ use crate::engine::thread_selfcounts::IpcClass;
 use crate::engine::types::{
     BlockerScore, InteractiveContext, LatencyTarget, OptimizationProfile, RootAction,
 };
+use crate::engine::user_context::UserContext;
 
 const INTERACTIVE_APPS: [&str; 14] = [
     "Code",
@@ -234,6 +235,10 @@ pub fn decide_actions(
     // actually causes pressure to drop. Processes with confidence < 0.20
     // after ≥5 observations are skipped (causally ineffective).
     causal_confidence: &HashMap<String, f32>,
+    // User context: what is the user doing right now?
+    // idle_secs, sleep assertions, call detection, audio state.
+    // [Riva & Mantovani 2014] idle time + media state = highest-signal contextual cues.
+    user_ctx: &UserContext,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -307,6 +312,13 @@ pub fn decide_actions(
     let context = context_from_pressure(snapshot, &thresholds);
     let blockers = top_blockers(sys, snapshot, reactor_event_weight, learned_interactive);
 
+    // User context: when the user is actively present and system is only at BackgroundPressure,
+    // skip background throttling entirely — fluidity > marginal pressure relief.
+    // At ThermalConstrained we always act regardless of user activity (safety first).
+    // [Riva & Mantovani 2014] active user context → preserve responsiveness over efficiency.
+    let skip_bg_throttle_user_active = user_ctx.is_recently_active()
+        && matches!(context, InteractiveContext::InteractiveFocus);
+
     // 1) Wait-graph practical: temporary boost for top blockers.
     let blocker_boost_count = match latency_target {
         LatencyTarget::Max => 3,
@@ -347,6 +359,11 @@ pub fn decide_actions(
         }
 
         if is_background_noise(&name) {
+            // User active at low pressure: defer background throttling — jank isn't worth it.
+            if skip_bg_throttle_user_active {
+                low_value_skipped.push(format!("user-active-skip:{}", name));
+                continue;
+            }
             // Outcome-tracker feedback: skip processes whose effectiveness is
             // not meaningfully above the natural baseline fluctuation rate.
             // Uses calibrated threshold (90% of baseline) to avoid false positives
@@ -661,6 +678,18 @@ pub fn decide_actions(
     }
 
     // 5) Pressure actions with hysteresis-ish behavior by context.
+    //
+    // User context gates (applied before freeze logic):
+    // - call_in_progress or has_sleep_assertion → skip freeze entirely (user is in a call
+    //   or watching media; SIGSTOP would cause visible jank / dropped frames / audio glitch)
+    // - idle_long (>120s) → relax gate thresholds (-10pp pressure, -30% swap commit)
+    //   User is away; aggressive optimization causes zero jank.
+    // - recently_active (<15s) → tighten gate thresholds (+5pp pressure, +30% swap commit)
+    //   User is actively present; conserve fluidity headroom.
+    // [Riva & Mantovani 2014] "User context awareness for mobile computing"
+    let freeze_skip_by_user = user_ctx.freeze_protected();
+    let gate_offset = user_ctx.pressure_gate_offset();
+
     match context {
         InteractiveContext::BackgroundPressure | InteractiveContext::ThermalConstrained => {
             // Dev-first: no-freeze by default. Only consider freeze under extreme memory pressure
@@ -676,10 +705,21 @@ pub fn decide_actions(
             // On 8 GB M1, 1.0 GB swap = compressor already stressed; 1.5 GB = already stuttering.
             // [Dulloor 2016 "Data tiering in heterogeneous memory" EuroSys;
             //  macOS UCS compressor — compression triggers ~62% of physical RAM used]
+            //
+            // User context offsets applied to gate thresholds (gate_offset from UserContext):
+            //   idle long  → gate_offset = -0.10 → lower gate = earlier, more aggressive freeze
+            //   active     → gate_offset = +0.05 → raise gate = freeze only at higher pressure
+            let gate_b_pressure = 0.75 + gate_offset;
+            let gate_b_swap_gb = if gate_offset < 0.0 { 0.7 } else if gate_offset > 0.0 { 1.3 } else { 1.0 };
             let gate_a = snapshot.pressure.memory_pressure >= thresholds.extreme_pressure
                 && snapshot.pressure.swap_delta_bytes_per_sec > (2.0 * 1024.0 * 1024.0);
-            let gate_b = snapshot.pressure.memory_pressure >= 0.75 && swap_committed_gb >= 1.0;
-            let extreme_freeze_ok = gate_a || gate_b;
+            let gate_b = snapshot.pressure.memory_pressure >= gate_b_pressure && swap_committed_gb >= gate_b_swap_gb;
+
+            // User in call / media playing: skip freeze — jank is worse than memory pressure.
+            if freeze_skip_by_user {
+                freeze_gate = "user-protected".to_string();
+            }
+            let extreme_freeze_ok = (gate_a || gate_b) && !freeze_skip_by_user;
             if extreme_freeze_ok {
                 freeze_gate = if gate_a { "delta".to_string() } else { "committed".to_string() };
                 // RSS-rank selection: freeze/throttle the largest-RSS background
@@ -1018,6 +1058,7 @@ mod tests {
             &hops,
             &hab,
             &causal,
+            &UserContext::default(),
         );
 
         assert!(
@@ -1058,6 +1099,7 @@ mod tests {
             &hops,
             &hab,
             &causal,
+            &UserContext::default(),
         );
 
         assert!(
@@ -1091,6 +1133,7 @@ mod tests {
             &hops,
             &hab,
             &causal,
+            &UserContext::default(),
         );
         assert!(matches!(
             out_low.context,
@@ -1116,6 +1159,7 @@ mod tests {
             &hops,
             &hab,
             &causal,
+            &UserContext::default(),
         );
         assert!(matches!(
             out_mid.context,
@@ -1141,6 +1185,7 @@ mod tests {
             &hops,
             &hab,
             &causal,
+            &UserContext::default(),
         );
         assert!(matches!(
             out_high.context,
@@ -1176,6 +1221,7 @@ mod tests {
                 &hops,
                 &hab,
                 &causal,
+                &UserContext::default(),
             );
             // Should not panic, and with no processes should produce no actions.
             assert!(
@@ -1214,6 +1260,7 @@ mod tests {
                 &hops,
                 &hab,
                 &causal,
+                &UserContext::default(),
             );
             assert!(output.actions.is_empty());
         }

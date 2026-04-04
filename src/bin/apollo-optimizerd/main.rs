@@ -3304,6 +3304,30 @@ fn main() -> anyhow::Result<()> {
 
                 let causal_confidence = lctx.causal_graph.confidence_map();
 
+                // ── User context: "telepathy" — what is the user doing right now? ──
+                // idle_secs from IOHIDSystem HIDIdleTime — fast ioreg call, safe every cycle.
+                // Sleep assertions + call detection from pmset — amortised: every 5 cycles.
+                // cpu_temp comes from hw_snapshot (already collected by SMC reader above).
+                // [Riva & Mantovani 2014] idle time + media state = highest-signal context cues.
+                let user_context = {
+                    use apollo_optimizer::engine::user_context::UserContext;
+                    let collect_assertions = cycle_count % 5 == 0;
+                    let mut ctx = UserContext::collect(collect_assertions);
+                    // Merge cpu_temp from hw_snapshot (already in RuntimeMetrics).
+                    // If P-cluster temp > 75°C, treat as if more active (raise pressure gate)
+                    // so Apollo conserves thermal headroom for the user's workload.
+                    if let Some(ref hw) = cycle_hw_snap {
+                        if let Some(p_temp) = hw.temps.p_cluster_celsius {
+                            if p_temp > 75.0 && !ctx.is_idle_long() {
+                                // Simulate "recently active" to raise freeze gates and
+                                // protect thermal headroom — overrides any idle signal.
+                                ctx.idle_secs = ctx.idle_secs.min(10.0);
+                            }
+                        }
+                    }
+                    ctx
+                };
+
                 // Bypass habituation under critical conditions.
                 // Habituation assumes "stable RSS = no problem", but under heavy swap
                 // processes have stable RSS (swapped out) and stable CPU (not running) —
@@ -3330,6 +3354,7 @@ fn main() -> anyhow::Result<()> {
                         hop_groups:                &lctx.outcome_tracker.hop_groups,
                         habituated_pids:           effective_habituated,
                         causal_confidence:         &causal_confidence,
+                        user_ctx:                  &user_context,
                     };
                     decision_stage.run(
                         &snapshot,

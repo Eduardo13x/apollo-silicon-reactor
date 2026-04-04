@@ -87,6 +87,7 @@ pub mod thermal_interrupt;
 pub mod thermal_manager;
 pub mod types;
 pub mod usage_model;
+pub mod user_context;
 pub mod user_profile;
 pub mod wait_graph;
 pub mod wake_storm_detector;

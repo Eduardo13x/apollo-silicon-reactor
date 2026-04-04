@@ -50,6 +50,7 @@ use crate::engine::mach_qos::MachQoSManager;
 use crate::engine::outcome_tracker::{HopGroupWeight, PatternWeight, WorkloadHop};
 use crate::engine::overflow_guard::OverflowThresholds;
 use crate::engine::types::{LatencyTarget, OptimizationProfile, RootAction};
+use crate::engine::user_context::UserContext;
 
 /// Policy-level inputs that control *which* processes are targeted and with
 /// what learned weights.
@@ -88,6 +89,10 @@ pub struct PolicyContext<'a> {
     /// Pearl-style causal confidence map: `"throttle:ProcessName"` → [0,1].
     /// Processes with confidence <0.20 after ≥5 observations are skipped.
     pub causal_confidence: &'a HashMap<String, f32>,
+
+    /// Current user context: idle time, sleep assertions, call detection, audio.
+    /// Drives freeze gating and throttle conservatism based on user activity.
+    pub user_ctx: &'a UserContext,
 }
 
 /// The output returned by [`DecisionStage::run`].
@@ -171,6 +176,7 @@ impl DecisionStage {
             policy.hop_groups,
             policy.habituated_pids,
             policy.causal_confidence,
+            policy.user_ctx,
         );
 
         DecisionStageOutput { decision }
@@ -226,6 +232,7 @@ mod tests {
         ipc: &'a HashMap<u32, f64>,
         hops: &'a HashMap<WorkloadHop, HopGroupWeight>,
         causal: &'a HashMap<String, f32>,
+        user_ctx: &'a UserContext,
     ) -> PolicyContext<'a> {
         PolicyContext {
             decide_interactive: interactive,
@@ -237,6 +244,7 @@ mod tests {
             hop_groups: hops,
             habituated_pids: pids,
             causal_confidence: causal,
+            user_ctx,
         }
     }
 
@@ -255,6 +263,7 @@ mod tests {
         let empty_ipc: HashMap<u32, f64> = HashMap::new();
         let empty_hops: HashMap<WorkloadHop, HopGroupWeight> = HashMap::new();
         let empty_causal: HashMap<String, f32> = HashMap::new();
+        let user_ctx = UserContext::default();
         let policy = make_policy(
             &empty_interactive,
             &empty_noise,
@@ -263,6 +272,7 @@ mod tests {
             &empty_ipc,
             &empty_hops,
             &empty_causal,
+            &user_ctx,
         );
 
         let output = stage.run(
@@ -297,6 +307,7 @@ mod tests {
         let empty_ipc: HashMap<u32, f64> = HashMap::new();
         let empty_hops: HashMap<WorkloadHop, HopGroupWeight> = HashMap::new();
         let empty_causal: HashMap<String, f32> = HashMap::new();
+        let user_ctx = UserContext::default();
         let policy = make_policy(
             &empty_interactive,
             &empty_noise,
@@ -305,6 +316,7 @@ mod tests {
             &empty_ipc,
             &empty_hops,
             &empty_causal,
+            &user_ctx,
         );
 
         let output = stage.run(
