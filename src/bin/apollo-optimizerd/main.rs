@@ -2838,6 +2838,40 @@ fn main() -> anyhow::Result<()> {
                     reactor_weight = (reactor_weight - win_pressure_floor * 0.5).max(0.0);
                 }
 
+                // Workload intent adjustments [Yang et al. 2013 PowerAPI].
+                // Apollo applies workload-specific resource policy based on what the
+                // user is actually doing — inferred from process signatures.
+                match win_workload_intent {
+                    WorkloadIntent::AISession => {
+                        // Ollama/Python inference: high memory IS expected and intentional.
+                        // Don't be aggressive while AI inference is running.
+                        // Conservative: only back off if pressure is not critical.
+                        if raw_pressure < 0.85 {
+                            reactor_weight = (reactor_weight - 0.20).max(0.0);
+                        }
+                    }
+                    WorkloadIntent::ResearchSession => {
+                        // Many tabs open: renderer memory is load-bearing for the user's
+                        // research context. Back off moderately — don't freeze their tabs.
+                        if raw_pressure < 0.80 {
+                            reactor_weight = (reactor_weight - 0.10).max(0.0);
+                        }
+                    }
+                    WorkloadIntent::BuildSession => {
+                        // Build session: cargo/rustc need RAM and CPU priority.
+                        // Boost slightly so Apollo acts faster to clear non-build memory.
+                        reactor_weight = (reactor_weight + 0.10).min(1.0);
+                    }
+                    WorkloadIntent::MediaSession => {
+                        // Media playing: avoid heavy I/O actions (sysctl writes, spotlight)
+                        // that could cause audio glitches. Slight back-off.
+                        if raw_pressure < 0.75 {
+                            reactor_weight = (reactor_weight - 0.08).max(0.0);
+                        }
+                    }
+                    WorkloadIntent::General => {}
+                }
+
                 // Predictive agent: build context from existing signals and select intervention.
                 // Feed Kalman-smoothed pressure instead of raw — cleaner signal for LinUCB.
                 let agent_intervention = {
