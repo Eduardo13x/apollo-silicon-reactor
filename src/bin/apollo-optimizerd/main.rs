@@ -1074,6 +1074,10 @@ fn main() -> anyhow::Result<()> {
             // filtering out short-lived transients that die before execute_actions.
             let mut freeze_candidates: HashMap<u32, u8> = HashMap::new();
             let mut cycle_count: u64 = 0;
+            // Feed-forward pressure relief counter [Hellerstein 2004].
+            // Set to N when tabs close / heavy app terminates; decrements each cycle.
+            // While > 0, reactor_weight is reduced (anticipate pressure drop).
+            let mut window_relief_cycles: u32 = 0;
             // Pending trial skill: (name, pressure_before). Recorded next cycle.
             // Restored from LearnedState so a trial started before a crash is still evaluated.
             let mut pending_trial_skill: Option<(String, f64)> = restored_trial_skill;
@@ -2498,8 +2502,10 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    // Window/app lifecycle sensor — process diff for tab/app events
-                    {
+                    // Window/app lifecycle sensor — process diff for tab/app events.
+                    // [Hellerstein 2004] Feed-forward: act on disturbance (tab close),
+                    // don't wait for pressure to fall (feedback lag).
+                    let (win_tab_delta, win_freed_heavy) = {
                         let fg_name = match fg_detector.detect() {
                             ForegroundState::App(ref a) => a.name.clone(),
                             _ => String::new(),
@@ -2515,6 +2521,13 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.window_tab_delta = win.tab_delta;
                         metrics.metrics.window_renderer_count = win.renderer_count;
                         metrics.metrics.window_freed_heavy_app = win.freed_heavy_app;
+                        (win.tab_delta, win.freed_heavy_app)
+                    };
+                    // Feed-forward relief: tabs closed or heavy app quit → RAM freed soon.
+                    if win_tab_delta < -1 || win_freed_heavy {
+                        window_relief_cycles = window_relief_cycles.max(3);
+                    } else if win_tab_delta < 0 {
+                        window_relief_cycles = window_relief_cycles.max(2);
                     }
 
                     // Rosetta AOT state
@@ -2781,6 +2794,13 @@ fn main() -> anyhow::Result<()> {
                 // the Hopfield memory + SAE ensemble's learned "normal" manifold.
                 if signal_digest.transformer_anomaly > 0.5 {
                     reactor_weight = (reactor_weight + 0.2).min(1.0);
+                }
+                // Feed-forward pressure relief [Hellerstein 2004]: tabs closed or heavy
+                // app terminated → RAM will be freed. Back off reactor_weight for N cycles
+                // instead of waiting for Kalman filter to catch the pressure drop.
+                if window_relief_cycles > 0 {
+                    reactor_weight = (reactor_weight - 0.25).max(0.0);
+                    window_relief_cycles -= 1;
                 }
 
                 // Predictive agent: build context from existing signals and select intervention.
