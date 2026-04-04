@@ -514,6 +514,29 @@ pub fn decide_actions(
         }
     }
 
+    // 3c) WindowServer high-CPU boost: when the display compositor is using >20% CPU,
+    // explicitly boost it to P-cores to prevent jank from scheduler preemption.
+    // WindowServer is already in protected_processes() so it won't be frozen/throttled,
+    // but a proactive BoostProcess ensures the scheduler keeps it on a P-core.
+    // [WWDC 2021] "Tune CPU job scheduling with QoS" — compositor must stay on P-cores
+    // under load; explicit QoS boost guarantees scheduling priority.
+    {
+        const WS_CPU_BOOST_THRESHOLD: f32 = 20.0;
+        for (pid, process) in sys.processes() {
+            if process.name() == "WindowServer" && process.cpu_usage() > WS_CPU_BOOST_THRESHOLD {
+                actions.push(RootAction::BoostProcess {
+                    pid: pid.as_u32(),
+                    name: "WindowServer".to_string(),
+                    reason: format!(
+                        "display compositor high CPU ({:.0}%) — P-core priority",
+                        process.cpu_usage()
+                    ),
+                });
+                break; // Only one WindowServer process
+            }
+        }
+    }
+
     // 4) Phase 1: Thread-level scheduling for multi-threaded processes.
     // For non-interactive, non-critical processes using >15% CPU with multiple threads,
     // route hot threads to P-cores and cold threads to E-cores.
