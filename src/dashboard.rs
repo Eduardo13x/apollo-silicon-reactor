@@ -110,6 +110,24 @@ fn render_bar(ratio: f64, width: usize) -> String {
     format!("[{}{}]", colored_fill, empty_str)
 }
 
+/// Classify swap status for display. Pure function — testable in isolation.
+///
+/// Priority: rate signal (growing/falling) > absolute amount.
+/// A swap growing rapidly is more urgent than static large swap.
+fn swap_status_label(swap_gb: f64, delta_bps: f64) -> &'static str {
+    if delta_bps > 100.0 {
+        "📈 Creciendo"
+    } else if delta_bps < -100.0 {
+        "📉 Bajando"
+    } else if swap_gb >= 8.0 {
+        "🔴 Crítico"
+    } else if swap_gb >= 4.0 {
+        "🟠 Alto"
+    } else {
+        "🟢 Estable"
+    }
+}
+
 fn score_emoji(score: f64) -> &'static str {
     if score >= 0.7 {
         "🔴"
@@ -253,17 +271,7 @@ fn render_system(status: &DaemonStatus) -> Vec<String> {
     let swap_ratio = (m.swap_used_bytes as f64 / (8.0 * 1_073_741_824.0)).min(1.0);
     let swap_bar = render_bar(swap_ratio, 20);
     let swap_gb = m.swap_used_bytes as f64 / 1_073_741_824.0;
-    let swap_label = if m.swap_delta_bps > 100.0 {
-        "📈 Creciendo"
-    } else if m.swap_delta_bps < -100.0 {
-        "📉 Bajando"
-    } else if swap_gb >= 8.0 {
-        "🔴 Crítico"
-    } else if swap_gb >= 4.0 {
-        "🟠 Alto"
-    } else {
-        "🟢 Estable"
-    };
+    let swap_label = swap_status_label(swap_gb, m.swap_delta_bps);
     lines.push(format!(
         "Swap   {}  {:>7}  {}",
         swap_bar, swap_str, swap_label
@@ -820,4 +828,47 @@ pub fn render_dashboard(status: &DaemonStatus) -> String {
     out.push('\n');
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swap_label_stable_when_low_and_no_delta() {
+        assert_eq!(swap_status_label(0.5, 0.0), "🟢 Estable");
+        assert_eq!(swap_status_label(3.9, 0.0), "🟢 Estable");
+    }
+
+    #[test]
+    fn swap_label_alto_when_between_4_and_8gb() {
+        assert_eq!(swap_status_label(4.0, 0.0), "🟠 Alto");
+        assert_eq!(swap_status_label(7.9, 0.0), "🟠 Alto");
+    }
+
+    #[test]
+    fn swap_label_critico_when_8gb_or_more() {
+        assert_eq!(swap_status_label(8.0, 0.0), "🔴 Crítico");
+        assert_eq!(swap_status_label(13.5, 0.0), "🔴 Crítico");
+    }
+
+    #[test]
+    fn swap_label_growing_overrides_amount() {
+        // Even at 12 GB, if actively growing, show the dynamic rate label
+        assert_eq!(swap_status_label(12.0, 500.0), "📈 Creciendo");
+    }
+
+    #[test]
+    fn swap_label_falling_overrides_amount() {
+        assert_eq!(swap_status_label(12.0, -500.0), "📉 Bajando");
+    }
+
+    #[test]
+    fn swap_label_stable_bug_is_fixed() {
+        // This is the exact bug that was reported: 12.7 GB showing 🟢 Estable
+        // because only delta_bps was checked, not the absolute amount.
+        let label = swap_status_label(12.7, 0.0); // delta=0 (not growing)
+        assert_ne!(label, "🟢 Estable", "12.7 GB swap must NOT show Estable");
+        assert_eq!(label, "🔴 Crítico");
+    }
 }
