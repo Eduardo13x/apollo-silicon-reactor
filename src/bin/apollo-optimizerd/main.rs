@@ -2574,6 +2574,8 @@ fn main() -> anyhow::Result<()> {
                         let proc_pairs: Vec<(u32, &str)> = proc_snaps.iter()
                             .map(|p| (p.pid, p.name.as_str())).collect();
                         build_tracker.tick(&proc_pairs);
+                        metrics.metrics.build_phase = format!("{:?}", build_tracker.phase);
+                        metrics.metrics.build_progress = build_tracker.build_progress;
                     }
 
                     // Rosetta AOT state

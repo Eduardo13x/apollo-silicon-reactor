@@ -729,6 +729,11 @@ pub struct RuntimeMetrics {
     pub window_session_phase: String,
     #[serde(default)]
     pub window_workload_intent: String,
+    // Build progress tracker
+    #[serde(default)]
+    pub build_phase: String,
+    #[serde(default)]
+    pub build_progress: f32,
     // Rosetta AOT compilation
     #[serde(default)]
     pub rosetta_aot_active: bool,
