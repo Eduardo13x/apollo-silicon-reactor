@@ -19,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::engine::nars_belief::DriftDetector;
 use crate::engine::overflow_guard::OverflowThresholds;
 use crate::engine::swap_predictor::SwapTrend;
 use crate::engine::user_profile::WorkloadType;
@@ -168,6 +169,12 @@ pub struct SpecialistAccuracyTracker {
     accuracy: [f64; specialist::COUNT],
     /// Total updates applied (for diagnostics / test assertions).
     updates: u64,
+    /// NARS drift detector for specialist effectiveness beliefs.
+    /// When a specialist's prediction accuracy shifts by >=20pp (sustained),
+    /// drift is detected and weights are reset toward 0.70 (neutral prior).
+    /// [Kuncheva 2004] "Changing Classifiers in Non-Stationary Environments"
+    #[serde(default)]
+    pub drift_detector: DriftDetector,
 }
 
 impl Default for SpecialistAccuracyTracker {
@@ -185,6 +192,7 @@ impl SpecialistAccuracyTracker {
         Self {
             accuracy: [Self::INIT_ACCURACY; specialist::COUNT],
             updates: 0,
+            drift_detector: DriftDetector::new(),
         }
     }
 
@@ -200,6 +208,25 @@ impl SpecialistAccuracyTracker {
                 (1.0 - Self::EMA_ALPHA) * self.accuracy[specialist_idx]
                     + Self::EMA_ALPHA * signal;
             self.updates += 1;
+            // NARS: track specialist drift belief.
+            // When a specialist's accuracy regime changes (was accurate, now not),
+            // the belief frequency will shift and trigger recalibration.
+            let name = specialist::NAMES.get(specialist_idx).copied().unwrap_or("unknown");
+            self.drift_detector.observe(name, correct);
+            // Auto-recalibrate: if drift detected, reset drifted specialists toward neutral.
+            if self.drift_detector.needs_recalibration() {
+                for i in 0..specialist::COUNT {
+                    let n = specialist::NAMES[i];
+                    if let Some(tv) = self.drift_detector.belief(n) {
+                        // If the NARS belief for this specialist has low confidence
+                        // or has drifted, pull its EMA weight toward the neutral prior.
+                        if tv.confidence < 0.3 || (tv.frequency as f64 - self.accuracy[i]).abs() > 0.20 {
+                            self.accuracy[i] = 0.9 * self.accuracy[i] + 0.1 * Self::INIT_ACCURACY;
+                        }
+                    }
+                }
+                self.drift_detector.acknowledge_recalibration();
+            }
         }
     }
 
