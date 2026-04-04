@@ -639,10 +639,16 @@ pub fn decide_actions(
             // Allow freezing once memory_pressure ≥ 0.75 with significant swap already committed.
             let swap_committed_gb =
                 snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            // Two-gate early-warning: act before compressor becomes bottleneck.
+            // Gate A: extreme_pressure + swap growing ≥ 2 MB/s (lowered from 5 MB/s)
+            // Gate B: moderate pressure (≥0.75) + swap committed ≥ 1.0 GB (lowered from 1.5)
+            // On 8 GB M1, 1.0 GB swap = compressor already stressed; 1.5 GB = already stuttering.
+            // [Dulloor 2016 "Data tiering in heterogeneous memory" EuroSys;
+            //  macOS UCS compressor — compression triggers ~62% of physical RAM used]
             let extreme_freeze_ok = (snapshot.pressure.memory_pressure
                 >= thresholds.extreme_pressure
-                && snapshot.pressure.swap_delta_bytes_per_sec > (5.0 * 1024.0 * 1024.0))
-                || (snapshot.pressure.memory_pressure >= 0.75 && swap_committed_gb >= 1.5);
+                && snapshot.pressure.swap_delta_bytes_per_sec > (2.0 * 1024.0 * 1024.0))
+                || (snapshot.pressure.memory_pressure >= 0.75 && swap_committed_gb >= 1.0);
             if extreme_freeze_ok {
                 // RSS-rank selection: freeze/throttle the largest-RSS background
                 // processes first — maximum pressure relief per action.
