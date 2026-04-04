@@ -203,21 +203,31 @@ fn send_request(req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
 }
 
 fn handle_dashboard() -> anyhow::Result<()> {
-    // Live TUI watch loop: re-renders in-place at ~4 Hz (250 ms cadence).
-    // Uses cursor-home overwrite (no clear) + differential line rendering to
-    // eliminate all visible flicker. [btop++ 2022] in-place terminal redraw;
-    // [Marcotte 2010] "Repainting Only What Changed" — TUI diff patterns.
+    // Live TUI watch loop: re-renders in-place at ~4–10 Hz (100–250 ms cadence).
+    // Uses alternate screen buffer + cursor-home overwrite + differential line
+    // rendering to eliminate ALL visible flicker.
+    //
+    // [DEC VT220, xterm] \x1b[?1049h/l — alternate screen buffer (saves/restores
+    //   main screen including scrollback). Used by vim, less, btop, htop.
+    // [btop++ 2022] in-place cursor-home overwrite eliminates clear-screen flash.
+    // [Marcotte 2010] "Repainting Only What Changed" — differential TUI pattern.
     use std::io::Write;
     let stdout = std::io::stdout();
 
-    // Hide cursor for the duration of the watch session.
-    print!("\x1b[?25l");
-    stdout.lock().flush().ok();
+    // Enter alternate screen + hide cursor. Together these produce the same
+    // "clean room" effect as every major TUI app: user's terminal is preserved
+    // and restored exactly on exit.
+    {
+        let mut lock = stdout.lock();
+        lock.write_all(b"\x1b[?1049h\x1b[?25l").ok(); // alt screen + hide cursor
+        lock.flush().ok();
+    }
 
-    // Restore cursor + clear on Ctrl-C.
+    // Restore on Ctrl-C: exit alt screen, show cursor, then quit.
     ctrlc::set_handler(|| {
-        print!("\x1b[?25h");
-        let _ = std::io::stdout().flush();
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[?25h\x1b[?1049l"); // show cursor + leave alt screen
+        let _ = out.flush();
         std::process::exit(0);
     })
     .ok();
@@ -296,10 +306,8 @@ fn handle_dashboard() -> anyhow::Result<()> {
         *prev = new_lines;
     };
 
-    // Render first frame.
+    // Render first frame. Alternate screen is already blank — just go to home.
     if let DaemonResponse::Status(s) = first {
-        // Clear screen once at startup to establish a clean canvas.
-        print!("\x1b[2J");
         render_one(&s, &mut prev_frame, &mut prev_hash);
     }
 
