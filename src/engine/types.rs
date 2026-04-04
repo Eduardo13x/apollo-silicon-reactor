@@ -894,6 +894,22 @@ pub struct RuntimeMetrics {
     /// What triggered the last ML daemon throttle: "swap-early" | "pressure" | "none".
     #[serde(default)]
     pub ml_throttle_source: String,
+
+    // ── User context telemetry ────────────────────────────────────────────────
+    /// Seconds since last keyboard/mouse event (from IOHIDSystem HIDIdleTime).
+    /// 0 = recently active or unknown.
+    #[serde(default)]
+    pub user_idle_secs: f64,
+    /// True when any non-Apollo sleep-prevention assertion is active.
+    /// Indicates active media playback, presentation, or call.
+    #[serde(default)]
+    pub user_has_sleep_assertion: bool,
+    /// True when a video/audio call is likely in progress.
+    #[serde(default)]
+    pub user_call_in_progress: bool,
+    /// True when audio is actively being output (coreaudiod assertion).
+    #[serde(default)]
+    pub user_audio_active: bool,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.

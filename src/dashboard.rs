@@ -360,6 +360,31 @@ fn render_system(status: &DaemonStatus) -> Vec<String> {
         }
     }
 
+    // User context block — "what is the user doing right now?"
+    {
+        // Call in progress: highest priority — affects all throttle/freeze decisions
+        if m.user_call_in_progress {
+            lines.push(red("📞 CALL IN PROGRESS — freeze protection active"));
+        } else if m.user_has_sleep_assertion {
+            lines.push(yellow("⚠ Sleep assertion active — media/presentation mode"));
+        }
+
+        // Idle time
+        let idle_str = if m.user_idle_secs >= 120.0 {
+            green(&format!("idle {:.0}s (aggressive mode)", m.user_idle_secs))
+        } else if m.user_idle_secs >= 15.0 {
+            format!("idle {:.0}s", m.user_idle_secs)
+        } else if m.user_idle_secs > 0.0 {
+            yellow(&format!("active ({:.0}s ago)", m.user_idle_secs))
+        } else {
+            String::new()
+        };
+        if !idle_str.is_empty() {
+            let audio_tag = if m.user_audio_active { "  🔊 audio" } else { "" };
+            lines.push(format!("User: {}{}", idle_str, audio_tag));
+        }
+    }
+
     // Pressure score
     let ps = m.last_pressure_score;
     let ps_bar = render_bar(ps, 20);

@@ -3392,6 +3392,11 @@ fn main() -> anyhow::Result<()> {
                     if decision.ml_throttle_source != "none" {
                         metrics.metrics.ml_throttle_source = decision.ml_throttle_source.clone();
                     }
+                    // User context telemetry: wire idle/call/audio/assertion signals.
+                    metrics.metrics.user_idle_secs = user_context.idle_secs;
+                    metrics.metrics.user_has_sleep_assertion = user_context.has_sleep_assertion;
+                    metrics.metrics.user_call_in_progress = user_context.call_in_progress;
+                    metrics.metrics.user_audio_active = user_context.audio_active;
                 }
 
                 // Apply any locally learned policy patterns (and keep them even after LLM is disabled).
