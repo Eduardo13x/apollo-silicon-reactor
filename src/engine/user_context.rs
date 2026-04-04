@@ -123,10 +123,14 @@ impl UserContext {
 
 /// Read HIDIdleTime from IOHIDSystem via `ioreg`.
 ///
-/// The value is reported in nanoseconds. Returns 0.0 on any error.
+/// The value is reported in nanoseconds. Returns 30.0 on any error — neutral
+/// zone (15 ≤ idle < 120), so a collection failure doesn't falsely trigger
+/// "recently active" conservatism (which would raise freeze gates).
+/// [Gray & Reuter 1993] "Transaction Processing: Concepts and Techniques" —
+/// safe-default under partial failure: use neutral, not worst-case assumption.
 #[cfg(target_os = "macos")]
 fn collect_idle_secs() -> f64 {
-    collect_idle_secs_inner().unwrap_or(0.0)
+    collect_idle_secs_inner().unwrap_or(30.0)
 }
 
 #[cfg(target_os = "macos")]
