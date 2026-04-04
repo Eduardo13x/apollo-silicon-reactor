@@ -42,6 +42,34 @@ use std::path::{Path, PathBuf};
 /// Minimum observations for an app-hour before we trust it.
 const MIN_OBSERVATIONS: u32 = 3;
 
+// ── Memory-aware heavy-app patterns ──────────────────────────────────────────
+
+/// Apps known to consume substantial RAM; headroom weight is the fraction of
+/// working-set budget to pre-carve when temporal prediction says one is coming.
+///
+/// [Denning 1968] Working Set Model — expand the working-set budget *before*
+/// the predicted app arrives rather than reacting after compressor spikes.
+const HEAVY_APP_HEADROOM: &[(&str, f64)] = &[
+    // Build tools — cargo can spike 2-3 GB on M1 8 GB
+    ("cargo", 0.20),
+    ("rustc", 0.18),
+    ("java", 0.15),
+    // LLM inference — model weights stay resident
+    ("ollama", 0.18),
+    // Browsers — each Chromium renderer tab adds ~80-120 MB
+    ("brave", 0.12),
+    ("chrome", 0.12),
+    ("zen browser", 0.10),
+    // Electron / collaboration apps
+    ("slack", 0.08),
+    ("discord", 0.07),
+    ("notion", 0.07),
+    ("electron", 0.07),
+];
+
+/// Maximum headroom advice returned (caps the weighted sum).
+const HEADROOM_CAP: f64 = 0.20;
+
 /// Maximum apps to track (evict least-used on overflow).
 const MAX_TRACKED_APPS: usize = 80;
 
@@ -277,6 +305,41 @@ impl TemporalPredictor {
         self.observations_since_persist = 0;
     }
 
+    /// How much pressure headroom to pre-carve for apps predicted to launch soon.
+    ///
+    /// Returns a value in `[0.0, HEADROOM_CAP]` (max 0.20): positive means
+    /// "tighten freeze thresholds now so RAM is available when the heavy app
+    /// arrives."
+    ///
+    /// Weights each top-N temporal prediction by its probability × the known
+    /// memory footprint of the predicted app.  Only predictions above 0.05
+    /// probability contribute (noise floor).
+    ///
+    /// Paper: [Denning 1968] "The Working Set Model for Program Behavior",
+    /// CACM 11(5) — proactively maintain the working-set budget before demand
+    /// arrives.
+    pub fn pressure_headroom_for_incoming(&self, hour: u8, weekday: u8) -> f64 {
+        let predictions = self.predict(hour, weekday, &HashMap::new());
+        if predictions.is_empty() {
+            return 0.0;
+        }
+
+        let mut headroom: f64 = 0.0;
+        for pred in &predictions {
+            if pred.probability < 0.05 {
+                continue; // below noise floor
+            }
+            let name_lower = pred.app_name.to_ascii_lowercase();
+            for &(pattern, weight) in HEAVY_APP_HEADROOM {
+                if name_lower.contains(pattern) {
+                    headroom = (headroom + pred.probability * weight).min(HEADROOM_CAP);
+                    break;
+                }
+            }
+        }
+        headroom
+    }
+
     fn load_state(path: &Path) -> Option<TemporalState> {
         let data = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&data).ok()
@@ -402,6 +465,49 @@ mod tests {
 
         let preds = tp.predict(15, 0, &HashMap::new());
         assert!(preds.is_empty(), "should not predict with < 3 observations");
+    }
+
+    #[test]
+    fn headroom_zero_for_light_apps() {
+        let mut tp = test_predictor();
+        for _ in 0..5 {
+            tp.observe("Finder", 10, 1);
+        }
+        let h = tp.pressure_headroom_for_incoming(10, 1);
+        // Finder is not a heavy app → headroom should be 0
+        assert_eq!(h, 0.0);
+    }
+
+    #[test]
+    fn headroom_nonzero_for_heavy_apps() {
+        let mut tp = test_predictor();
+        // Simulate: user opens cargo at 9 AM most days
+        for _ in 0..10 {
+            tp.observe("cargo", 9, 0);
+        }
+        let h = tp.pressure_headroom_for_incoming(9, 0);
+        assert!(h > 0.0, "cargo prediction should yield positive headroom");
+        assert!(h <= HEADROOM_CAP, "headroom must not exceed cap");
+    }
+
+    #[test]
+    fn headroom_capped_at_max() {
+        let mut tp = test_predictor();
+        // Multiple heavy apps at same hour — headroom should not exceed cap
+        for _ in 0..10 {
+            tp.observe("cargo", 11, 2);
+            tp.observe("ollama", 11, 2);
+            tp.observe("rustc", 11, 2);
+        }
+        let h = tp.pressure_headroom_for_incoming(11, 2);
+        assert!(h <= HEADROOM_CAP, "headroom must not exceed {}", HEADROOM_CAP);
+    }
+
+    #[test]
+    fn headroom_returns_zero_without_observations() {
+        let tp = test_predictor();
+        let h = tp.pressure_headroom_for_incoming(9, 1);
+        assert_eq!(h, 0.0);
     }
 
     #[test]
