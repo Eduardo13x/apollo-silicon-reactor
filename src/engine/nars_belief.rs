@@ -205,6 +205,30 @@ impl DriftDetector {
         self.drifted_count = 0;
     }
 
+    /// Decay confidence of all beliefs by `factor` (0 < factor < 1).
+    ///
+    /// Simulates Bayesian forgetting: old evidence becomes less certain over time.
+    /// With factor=0.95, confidence halves every ~14 persist cycles.
+    /// After decay, new observations will have proportionally more influence.
+    ///
+    /// Beliefs with confidence < 0.05 after decay are pruned (noise floor).
+    /// [Bayesian forgetting: Pfau et al. 2010, Streaming Bayesian Updates]
+    pub fn decay_confidence(&mut self, factor: f32) {
+        let factor = factor.clamp(0.0, 1.0);
+        let mut to_remove = Vec::new();
+        for (key, entry) in &mut self.beliefs {
+            entry.tv.confidence *= factor;
+            if entry.tv.confidence < 0.05 {
+                to_remove.push(key.clone());
+            }
+        }
+        for key in to_remove {
+            self.beliefs.remove(&key);
+        }
+        // Recount drifted beliefs after pruning
+        self.drifted_count = self.beliefs.values().filter(|e| e.is_drifted()).count();
+    }
+
     /// Number of tracked beliefs.
     pub fn len(&self) -> usize {
         self.beliefs.len()
@@ -355,6 +379,37 @@ mod tests {
         let delta = dd.observe("new_process", true);
         assert_eq!(delta, 0.0, "first observation produces no drift delta");
         assert!(!dd.needs_recalibration());
+    }
+
+    #[test]
+    fn drift_detector_decay_prunes_low_confidence_beliefs() {
+        let mut dd = DriftDetector::new();
+        for _ in 0..5 {
+            dd.observe("proc_A", true);
+        }
+        assert_eq!(dd.len(), 1);
+        // Decay 20 times at 0.5 factor: 0.5^20 → effectively 0
+        for _ in 0..20 {
+            dd.decay_confidence(0.5);
+        }
+        // proc_A should be pruned (confidence < 0.05)
+        assert_eq!(dd.len(), 0, "fully decayed belief should be pruned");
+    }
+
+    #[test]
+    fn drift_detector_decay_reduces_confidence_not_frequency() {
+        let mut dd = DriftDetector::new();
+        for _ in 0..10 {
+            dd.observe("proc_B", true);
+        }
+        let tv_before = dd.belief("proc_B").unwrap();
+        dd.decay_confidence(0.95);
+        let tv_after = dd.belief("proc_B").unwrap();
+        // Confidence decays
+        assert!(tv_after.confidence < tv_before.confidence, "confidence must decay");
+        // Frequency is preserved (decay only affects evidence weight, not outcome)
+        assert!((tv_after.frequency - tv_before.frequency).abs() < 1e-4,
+            "frequency must not change after decay");
     }
 
     #[test]

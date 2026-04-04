@@ -201,6 +201,14 @@ impl LearnedState {
 
             // 4. Prune HRPO groups with <2 throttles — not enough signal.
             ot.hop_groups.retain(|_, g| g.throttle_count >= 2);
+
+            // 5. NARS belief confidence decay: old evidence becomes less certain.
+            //    Processes not observed recently lose confidence → new observations
+            //    have more influence, preventing stale beliefs from dominating.
+            //    [Bayesian forgetting] factor=0.95 → half-life ≈ 14 persist cycles.
+            if let Some(dd) = &mut ot.drift_detector {
+                dd.decay_confidence(0.95);
+            }
         }
     }
 
