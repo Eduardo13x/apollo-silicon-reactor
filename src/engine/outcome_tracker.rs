@@ -1468,4 +1468,101 @@ mod tests {
         let slow = tracker.causal_effect_fast(0.01);
         assert!(slow < fast, "small drop should yield smaller causal effect than large drop");
     }
+
+    // ── NARS drift detector integration tests ────────────────────────────────
+
+    /// Simulates a process that was effective for 30 cycles, then becomes
+    /// useless. Verifies that the NARS drift detector signals recalibration.
+    #[test]
+    fn nars_detects_regime_change_in_batch_resolve() {
+        let mut tracker = OutcomeTracker::new();
+        let now = std::time::Instant::now();
+
+        // Phase 1: proc_X is consistently effective (30 resolved outcomes)
+        for i in 0..30u32 {
+            tracker.weights.entry("proc_X".to_string()).or_default().throttle_count += 1;
+            tracker.pending.push_back(crate::engine::outcome_tracker::PendingOutcome {
+                process_name: "proc_X".to_string(),
+                throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
+                pressure_before: 0.75,
+                watts_before: 5.0,
+            });
+        }
+        // Use high current pressure so outcomes resolve as effective
+        tracker.tick(0.70); // pressure_before=0.75, current=0.70 → drop=0.05 → effective
+        // tick resolves all pending outcomes with 0.75-0.70=0.05 drop (≥0.01 → effective)
+
+        let score_phase1 = tracker.nars_drift_score();
+
+        // Phase 2: proc_X suddenly useless (pressure never drops)
+        for i in 0..30u32 {
+            tracker.weights.entry("proc_X".to_string()).or_default().throttle_count += 1;
+            tracker.pending.push_back(crate::engine::outcome_tracker::PendingOutcome {
+                process_name: "proc_X".to_string(),
+                throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
+                pressure_before: 0.70,
+                watts_before: 5.0,
+            });
+        }
+        tracker.tick(0.70); // pressure stayed same → drop=0 → NOT effective
+
+        let score_phase2 = tracker.nars_drift_score();
+        let drifted = tracker.drift_detector.drifted_count;
+
+        // Drift score must increase after regime change
+        assert!(
+            score_phase2 > score_phase1 || drifted >= 1,
+            "regime change (effective→ineffective) must increase drift score. phase1={:.4} phase2={:.4} drifted={}",
+            score_phase1, score_phase2, drifted
+        );
+    }
+
+    /// Verifies that nars_acknowledge_recalibration resets the drift signal.
+    #[test]
+    fn nars_acknowledge_resets_drift_after_recalibration() {
+        let mut tracker = OutcomeTracker::new();
+        // Build up some drift
+        for _ in 0..20 {
+            tracker.drift_detector.observe("proc_A", true);
+        }
+        for _ in 0..20 {
+            tracker.drift_detector.observe("proc_A", false);
+        }
+        let drift_before = tracker.nars_drift_score();
+        tracker.nars_acknowledge_recalibration();
+        let drift_after = tracker.nars_drift_score();
+        assert!(drift_after < drift_before, "acknowledge must reduce drift score");
+        assert_eq!(tracker.drift_detector.drifted_count, 0, "drifted_count must clear after acknowledge");
+    }
+
+    /// Verifies roundtrip: to_persisted + restore preserves drift_detector state.
+    #[test]
+    fn nars_drift_survives_persist_restore_roundtrip() {
+        let mut tracker = OutcomeTracker::new();
+        // Build a non-trivial drift state
+        for _ in 0..20 {
+            tracker.drift_detector.observe("proc_B", true);
+        }
+        for _ in 0..10 {
+            tracker.drift_detector.observe("proc_B", false);
+        }
+        let score_before = tracker.nars_drift_score();
+
+        // Persist then restore
+        let persisted = tracker.to_persisted();
+        let mut restored = OutcomeTracker::new();
+        restored.restore(persisted);
+
+        let score_after = restored.nars_drift_score();
+        assert!(
+            (score_after - score_before).abs() < 1e-9,
+            "drift score must be identical after roundtrip: before={} after={}",
+            score_before, score_after
+        );
+        // Belief for proc_B should be present in restored tracker
+        assert!(
+            restored.drift_detector.belief("proc_B").is_some(),
+            "proc_B belief must survive roundtrip"
+        );
+    }
 }
