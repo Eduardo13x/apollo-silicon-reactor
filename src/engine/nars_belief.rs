@@ -1,17 +1,28 @@
-//! NARS-inspired belief revision for concept drift detection.
+//! NARS-inspired belief revision with affective salience weighting.
 //!
-//! Implements the core TruthValue and Revision Rule from Pei Wang's
-//! Non-Axiomatic Reasoning System (NARS, 2013), stripped to what Apollo needs:
-//! detecting when learned effectiveness beliefs have drifted from reality.
+//! Implements TruthValue + Revision Rule from Pei Wang's NARS (2013), extended
+//! with arousal-based salience weighting from cognitive neuroscience:
 //!
-//! # Concept Drift Signal
-//! A belief tracks: "action X → good outcome" with (frequency, confidence).
-//! - frequency ∈ [0,1]: how often X actually produced a good outcome
-//! - confidence ∈ [0,1): evidence weight — grows as more observations arrive
+//! # Salience & Emotional Memory
+//! High-arousal events (swap=12GB, p_oom=1.0, massive pressure spike) are
+//! remembered more strongly than low-arousal routine observations. This mirrors
+//! the amygdala's role in memory consolidation: stress hormones (norepinephrine,
+//! cortisol) strengthen synaptic encoding proportional to arousal intensity.
 //!
-//! When we re-observe X with new evidence, Revision updates the belief.
-//! If `|f_after - f_before| > DRIFT_THRESHOLD`, the model has drifted —
-//! the old learned pattern no longer matches current system behavior.
+//! [McGaugh 2004] "The amygdala modulates the consolidation of memories of
+//! emotionally arousing experiences" — Annual Review of Neuroscience.
+//! [Yerkes & Dodson 1908] "The relation of strength of stimulus to rapidity of
+//! habit-formation" — arousal modulates learning rate.
+//! [OCC model, Ortony-Clore-Collins 1988] — arousal + valence as independent
+//! dimensions; valence = positive/negative outcome, arousal = intensity.
+//!
+//! # Implementation
+//! - `Salience { arousal, valence }` — computed from pressure metrics
+//! - High arousal → higher evidence weight in NARS Revision
+//!   (acts like N observations instead of 1, where N ∝ arousal)
+//! - `BeliefEntry.lti` (Long-Term Importance, OpenCog-inspired):
+//!   high-arousal beliefs decay slower — emotionally significant memories persist
+//! - Low-arousal routine observations use the standard single-observation weight
 //!
 //! # Revision Rule (Pei Wang 2013, §3.3.3)
 //! w = c / (1 - c)
@@ -33,6 +44,22 @@ const MIN_CONFIDENCE_FOR_DRIFT: f32 = 0.30;
 
 /// EMA alpha for aggregate drift score (slow-decaying: half-life ≈ 69 ticks).
 const DRIFT_SCORE_ALPHA: f64 = 0.01;
+
+/// Max equivalent observations for a maximum-arousal event.
+/// arousal=1.0 → evidence weight = confidence_from_count(MAX_SALIENT_OBS).
+/// This means a crisis event (swap=12GB, p_oom=1.0) counts as strongly as
+/// 4 normal observations — 4× faster belief update under maximum stress.
+/// [McGaugh 2004] amygdala modulation: arousal boosts memory consolidation.
+const MAX_SALIENT_OBS: u32 = 4;
+
+/// LTI decay protection: high-arousal beliefs decay at this slower rate.
+/// Standard decay = 0.95; LTI-protected decay = 0.985 (3× slower fading).
+/// Equivalent to long-term potentiation (LTP) in neuroscience: strong stimuli
+/// produce lasting synaptic changes. [Bliss & Lømo 1973] LTP paper.
+const LTI_DECAY_FACTOR: f32 = 0.985;
+
+/// Arousal threshold above which LTI protection is granted.
+const LTI_AROUSAL_THRESHOLD: f32 = 0.60;
 
 // ── TruthValue ───────────────────────────────────────────────────────────────
 
@@ -98,6 +125,92 @@ impl TruthValue {
     }
 }
 
+// ── Salience ─────────────────────────────────────────────────────────────────
+
+/// Affective salience of an observation event.
+///
+/// Captures the emotional intensity (arousal) and outcome quality (valence)
+/// of a system event, inspired by the VAD model (Valence-Arousal-Dominance).
+///
+/// [Russell 1980] "A circumplex model of affect" — Journal of Personality and
+/// Social Psychology. Arousal and valence are orthogonal dimensions.
+/// [OCC model, Ortony-Clore-Collins 1988] — appraisal theory of emotion.
+///
+/// In Apollo's context:
+/// - arousal = how intense/critical the event was (pressure level, OOM risk, swap size)
+/// - valence = was the outcome good (+1) or bad (-1)?
+///   Positive valence = action reduced pressure. Negative = did nothing or worse.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Salience {
+    /// Event intensity ∈ [0,1]. 0 = routine, 1 = maximum crisis.
+    /// Computed from: pressure_before, pressure_drop, p_oom, swap_gb.
+    pub arousal: f32,
+    /// Outcome quality ∈ [-1,1]. +1 = highly effective, -1 = counterproductive.
+    pub valence: f32,
+}
+
+impl Salience {
+    /// Neutral observation: no special emotional weight.
+    pub fn neutral() -> Self {
+        Self { arousal: 0.0, valence: 0.0 }
+    }
+
+    /// Compute salience from system metrics.
+    ///
+    /// Arousal formula:
+    ///   arousal = clamp(0.4·pressure_before + 0.4·p_oom + 0.2·swap_factor, 0, 1)
+    ///   swap_factor = min(swap_gb / 8.0, 1.0)  (8GB = full saturation)
+    ///
+    /// Valence formula:
+    ///   +1.0 if pressure_drop >= 0.10 (large effective drop)
+    ///   +0.5 if pressure_drop >= 0.01 (small but effective)
+    ///    0.0 if pressure_drop == 0    (no effect)
+    ///   -0.5 if pressure_drop <  0   (pressure increased)
+    pub fn compute(
+        pressure_before: f64,
+        pressure_drop: f64,
+        p_oom: f64,
+        swap_gb: f64,
+    ) -> Self {
+        let swap_factor = (swap_gb / 8.0).min(1.0) as f32;
+        let arousal = (0.4 * pressure_before as f32
+            + 0.4 * p_oom as f32
+            + 0.2 * swap_factor)
+            .clamp(0.0, 1.0);
+
+        let valence = if pressure_drop >= 0.10 {
+            1.0_f32
+        } else if pressure_drop >= 0.01 {
+            0.5
+        } else if pressure_drop < 0.0 {
+            -0.5
+        } else {
+            0.0
+        };
+
+        Self { arousal, valence }
+    }
+
+    /// Evidence count equivalent for NARS Revision.
+    /// Maps arousal [0,1] → [1, MAX_SALIENT_OBS] observations.
+    /// A maximum-crisis event counts as MAX_SALIENT_OBS independent observations.
+    pub fn evidence_count(&self) -> u32 {
+        1 + (self.arousal * (MAX_SALIENT_OBS - 1) as f32).round() as u32
+    }
+
+    /// True if this event warrants Long-Term Importance protection.
+    /// High-arousal events form durable memories. [Bliss & Lømo 1973] LTP.
+    pub fn grants_lti(&self) -> bool {
+        self.arousal >= LTI_AROUSAL_THRESHOLD
+    }
+}
+
+impl Default for Salience {
+    fn default() -> Self {
+        Self::neutral()
+    }
+}
+
 // ── BeliefEntry ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +220,11 @@ struct BeliefEntry {
     freq_before_last_revision: f32,
     /// Total observations that fed this belief.
     observations: u32,
+    /// Long-Term Importance ∈ [0,1]. Accumulates when high-arousal events
+    /// grant LTI protection. High LTI → slower confidence decay (durable memory).
+    /// [OpenCog STI/LTI, Goertzel 2010] + [Bliss & Lømo 1973] LTP.
+    #[serde(default)]
+    lti: f32,
 }
 
 impl BeliefEntry {
@@ -115,18 +233,48 @@ impl BeliefEntry {
             tv: TruthValue::new(initial_freq, TruthValue::confidence_from_count(1)),
             freq_before_last_revision: initial_freq,
             observations: 1,
+            lti: 0.0,
         }
     }
 
-    /// Incorporate a new observation (true/false) and return the frequency delta.
+    /// Incorporate a new observation with neutral salience (standard weight).
     fn observe(&mut self, success: bool) -> f32 {
+        self.observe_salient(success, Salience::neutral())
+    }
+
+    /// Incorporate a new observation with explicit salience weighting.
+    ///
+    /// High arousal → higher evidence weight → faster belief update.
+    /// High arousal + LTI threshold → LTI credit accumulated.
+    ///
+    /// [McGaugh 2004] amygdala modulation of memory consolidation.
+    fn observe_salient(&mut self, success: bool, salience: Salience) -> f32 {
         self.observations += 1;
         let new_freq = if success { 1.0_f32 } else { 0.0_f32 };
-        let new_conf = TruthValue::confidence_from_count(1); // single observation
+        // Evidence weight scaled by arousal: high-arousal events count as
+        // multiple observations (up to MAX_SALIENT_OBS).
+        let evidence_n = salience.evidence_count();
+        let new_conf = TruthValue::confidence_from_count(evidence_n);
         let new_evidence = TruthValue::new(new_freq, new_conf);
         self.freq_before_last_revision = self.tv.frequency;
         self.tv = self.tv.revise(new_evidence);
+        // Accumulate LTI for high-arousal events (long-term potentiation).
+        if salience.grants_lti() {
+            self.lti = (self.lti + 0.05).min(1.0);
+        }
         (self.tv.frequency - self.freq_before_last_revision).abs()
+    }
+
+    /// Effective decay factor for this belief.
+    /// High-LTI beliefs use LTI_DECAY_FACTOR instead of the caller's factor.
+    /// Models the durability of emotionally significant memories.
+    fn effective_decay(&self, base_factor: f32) -> f32 {
+        if self.lti > 0.3 {
+            // LTI protection: decay slower. Blend based on LTI strength.
+            base_factor + (LTI_DECAY_FACTOR - base_factor) * self.lti
+        } else {
+            base_factor
+        }
     }
 
     /// True if this belief has shifted significantly since last calibration.
@@ -157,20 +305,39 @@ impl DriftDetector {
         Self::default()
     }
 
-    /// Record an observation for a named action/specialist.
-    /// `success` = did it produce a good outcome?
+    /// Record an observation with neutral salience (standard weight).
+    /// `success` = did the action produce a good outcome?
     /// Returns the local frequency delta from revision.
     pub fn observe(&mut self, key: &str, success: bool) -> f32 {
+        self.observe_salient(key, success, Salience::neutral())
+    }
+
+    /// Record an observation with explicit affective salience.
+    ///
+    /// High-arousal events (memory crisis, OOM risk) update beliefs faster
+    /// and may earn LTI protection (slower decay). This is the primary
+    /// mechanism for emotionally-weighted memory in Apollo.
+    ///
+    /// [McGaugh 2004] amygdala modulates memory consolidation proportional
+    /// to arousal intensity — high stress → stronger, more durable memories.
+    pub fn observe_salient(&mut self, key: &str, success: bool, salience: Salience) -> f32 {
         let delta = if let Some(entry) = self.beliefs.get_mut(key) {
-            entry.observe(success)
+            entry.observe_salient(success, salience)
         } else {
             let initial_freq = if success { 1.0 } else { 0.0 };
-            self.beliefs.insert(key.to_string(), BeliefEntry::new(initial_freq));
+            let mut entry = BeliefEntry::new(initial_freq);
+            // Apply salience to the first observation too (not just subsequent ones).
+            if salience.grants_lti() {
+                entry.lti = 0.05;
+            }
+            self.beliefs.insert(key.to_string(), entry);
             0.0 // first observation: no drift yet
         };
 
-        // Update aggregate drift score via EMA
-        self.drift_score = DRIFT_SCORE_ALPHA * delta as f64
+        // Arousal amplifies the drift EMA signal too — a crisis-level regime
+        // change is more alarming than a routine one.
+        let arousal_amp = 1.0 + salience.arousal as f64;
+        self.drift_score = DRIFT_SCORE_ALPHA * delta as f64 * arousal_amp
             + (1.0 - DRIFT_SCORE_ALPHA) * self.drift_score;
 
         // Recount drifted beliefs
@@ -179,7 +346,8 @@ impl DriftDetector {
         delta
     }
 
-    /// Overall drift score ∈ [0,1]. Threshold: > 0.05 = notable drift.
+    /// Current arousal-weighted drift score [0,1].
+    /// EMA of per-belief drift deltas, amplified by event arousal.
     pub fn score(&self) -> f64 {
         self.drift_score
     }
@@ -213,11 +381,23 @@ impl DriftDetector {
     ///
     /// Beliefs with confidence < 0.05 after decay are pruned (noise floor).
     /// [Bayesian forgetting: Pfau et al. 2010, Streaming Bayesian Updates]
+    /// Decay confidence of all beliefs by `factor` (0 < factor < 1).
+    ///
+    /// High-LTI beliefs (formed during crisis events) decay slower —
+    /// they use `effective_decay()` which blends toward LTI_DECAY_FACTOR.
+    /// This models long-term potentiation: emotionally significant memories
+    /// persist longer than routine ones. [Bliss & Lømo 1973] LTP.
+    ///
+    /// Standard: 0.95/cycle → half-life ≈ 14 cycles.
+    /// LTI-protected: 0.985/cycle → half-life ≈ 46 cycles (3× more durable).
     pub fn decay_confidence(&mut self, factor: f32) {
         let factor = factor.clamp(0.0, 1.0);
         let mut to_remove = Vec::new();
         for (key, entry) in &mut self.beliefs {
-            entry.tv.confidence *= factor;
+            let eff = entry.effective_decay(factor);
+            entry.tv.confidence *= eff;
+            // LTI itself also decays slowly (1% per persist cycle).
+            entry.lti = (entry.lti * 0.99).max(0.0);
             if entry.tv.confidence < 0.05 {
                 to_remove.push(key.clone());
             }
@@ -414,15 +594,134 @@ mod tests {
 
     #[test]
     fn revision_rule_math_from_paper() {
-        // [Pei Wang 2013] §3.3.3 example: two beliefs with same frequency
-        // f1=0.8, c1=0.6; f2=0.8, c2=0.6
-        // w1 = 0.6/0.4 = 1.5; w2 = 1.5; w = 3.0
-        // f_new = (1.5*0.8 + 1.5*0.8) / 3.0 = 0.8
-        // c_new = 3.0 / (3.0 + 1.0) = 0.75
         let tv1 = TruthValue::new(0.8, 0.6);
         let tv2 = TruthValue::new(0.8, 0.6);
         let result = tv1.revise(tv2);
         assert!((result.frequency - 0.8).abs() < 0.001, "same freq → no change: {}", result.frequency);
         assert!((result.confidence - 0.75).abs() < 0.001, "c_new=0.75: {}", result.confidence);
+    }
+
+    // ── Salience tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn salience_neutral_has_arousal_zero() {
+        let s = Salience::neutral();
+        assert_eq!(s.arousal, 0.0);
+        assert_eq!(s.valence, 0.0);
+        assert_eq!(s.evidence_count(), 1, "neutral → 1 observation equivalent");
+        assert!(!s.grants_lti(), "neutral → no LTI protection");
+    }
+
+    #[test]
+    fn salience_max_crisis_grants_lti_and_max_evidence() {
+        // Maximum crisis: full pressure, full OOM risk, 8+ GB swap
+        let s = Salience::compute(1.0, 0.15, 1.0, 8.0);
+        assert!(s.arousal > 0.9, "full crisis → near-max arousal: {}", s.arousal);
+        assert!(s.grants_lti(), "high arousal → LTI protection");
+        assert_eq!(s.evidence_count(), MAX_SALIENT_OBS,
+            "max arousal → MAX_SALIENT_OBS evidence equivalent");
+        assert_eq!(s.valence, 1.0, "large drop → positive valence");
+    }
+
+    #[test]
+    fn salience_routine_low_pressure_no_lti() {
+        // Routine: low pressure, effective small drop, no swap
+        let s = Salience::compute(0.20, 0.02, 0.05, 0.1);
+        assert!(s.arousal < 0.3, "low pressure → low arousal: {}", s.arousal);
+        assert!(!s.grants_lti(), "low arousal → no LTI");
+        assert_eq!(s.evidence_count(), 1, "low arousal → single observation weight");
+        assert_eq!(s.valence, 0.5, "small drop → moderate positive valence");
+    }
+
+    #[test]
+    fn salience_negative_valence_when_pressure_increased() {
+        let s = Salience::compute(0.80, -0.05, 0.70, 2.0);
+        assert_eq!(s.valence, -0.5, "pressure increase → negative valence");
+    }
+
+    #[test]
+    fn high_arousal_observation_updates_belief_faster() {
+        let mut dd_normal = DriftDetector::new();
+        let mut dd_crisis = DriftDetector::new();
+
+        // Both see the same false outcome, but crisis has high arousal
+        let crisis = Salience::compute(0.95, 0.0, 0.98, 10.0);
+
+        // Start both with 10 true observations (high confidence)
+        for _ in 0..10 {
+            dd_normal.observe("proc", true);
+            dd_crisis.observe_salient("proc", true, crisis);
+        }
+
+        // Now one failure arrives
+        dd_normal.observe("proc", false);
+        dd_crisis.observe_salient("proc", false, crisis);
+
+        let tv_normal = dd_normal.belief("proc").unwrap();
+        let tv_crisis = dd_crisis.belief("proc").unwrap();
+
+        // Crisis belief should have moved further from 1.0 (faster update)
+        let normal_drop = 1.0 - tv_normal.frequency;
+        let crisis_drop = 1.0 - tv_crisis.frequency;
+        assert!(
+            crisis_drop > normal_drop,
+            "high-arousal failure should update belief faster: normal_drop={:.3} crisis_drop={:.3}",
+            normal_drop, crisis_drop
+        );
+    }
+
+    #[test]
+    fn lti_protection_slows_decay() {
+        let mut dd_normal = DriftDetector::new();
+        let mut dd_crisis = DriftDetector::new();
+
+        let crisis = Salience::compute(0.95, 0.12, 0.95, 9.0);
+
+        // Crisis tracker gets LTI via high-arousal observations
+        for _ in 0..10 {
+            dd_normal.observe("proc", true);
+            dd_crisis.observe_salient("proc", true, crisis);
+        }
+
+        // Apply 20 decay cycles
+        for _ in 0..20 {
+            dd_normal.decay_confidence(0.95);
+            dd_crisis.decay_confidence(0.95);
+        }
+
+        let tv_normal = dd_normal.belief("proc");
+        let tv_crisis = dd_crisis.belief("proc").unwrap();
+
+        // Crisis belief should survive with higher confidence (LTI protection)
+        let crisis_conf = tv_crisis.confidence;
+        let normal_conf = tv_normal.map(|tv| tv.confidence).unwrap_or(0.0);
+        assert!(
+            crisis_conf > normal_conf,
+            "LTI-protected belief should decay slower: crisis={:.3} normal={:.3}",
+            crisis_conf, normal_conf
+        );
+    }
+
+    #[test]
+    fn arousal_amplifies_drift_score_ema() {
+        let mut dd_neutral = DriftDetector::new();
+        let mut dd_crisis = DriftDetector::new();
+
+        // Build up beliefs
+        for _ in 0..10 {
+            dd_neutral.observe("proc", true);
+            dd_crisis.observe_salient("proc", true, Salience::compute(0.9, 0.1, 0.9, 8.0));
+        }
+
+        // Regime change
+        dd_neutral.observe("proc", false);
+        dd_crisis.observe_salient("proc", false, Salience::compute(0.9, -0.05, 0.9, 8.0));
+
+        // Crisis drift score should be higher due to arousal amplification
+        assert!(
+            dd_crisis.drift_score >= dd_neutral.drift_score,
+            "arousal should amplify drift score EMA: crisis={:.4} neutral={:.4}",
+            dd_crisis.drift_score, dd_neutral.drift_score
+        );
     }
 }
