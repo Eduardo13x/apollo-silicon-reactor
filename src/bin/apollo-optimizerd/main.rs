@@ -2431,7 +2431,21 @@ fn main() -> anyhow::Result<()> {
                         lctx.signal_intel.set_kpc_trend(kpc.ipc_trend);
                     }
 
-                    // Cache contention detection (observation phase)
+                    // Cache contention detection + cluster separation (Phase 3)
+                    //
+                    // On Apple Silicon P-cluster and E-cluster have separate L2 caches.
+                    // Routing competing processes to different clusters eliminates L2
+                    // thrashing. We use QoS tiers as cluster hints (not strict binding):
+                    //   heavy_pid → Foreground (P-cores, low latency)
+                    //   light_pid → Background (E-cores, energy efficient)
+                    //
+                    // Safety gates:
+                    //   1. Only if confidence ≥ 0.25 (≥3 consecutive co-exec cycles)
+                    //   2. Only if contention score > 0.45
+                    //   3. Neither pid in heuristic_critical_pids
+                    //   4. Pressure > 0.30 (only under real load)
+                    //
+                    // [Apple WWDC21 "Optimize for Apple Silicon" — P/E cluster semantics]
                     {
                         let system_ipc = kpc_snap.as_ref().map(|k| k.ipc).unwrap_or(0.0);
                         let proc_list: Vec<(u32, String, f32)> = proc_snaps
@@ -2443,6 +2457,32 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.contention_score = contention.score;
                         metrics.metrics.contention_heavy_count = contention.heavy_count;
                         metrics.metrics.contention_pairs_active = contention.pairs.len() as u32;
+
+                        // Apply cluster separation for confirmed pairs.
+                        if contention.score > 0.45 && pressure > 0.30 && !contention.pairs.is_empty() {
+                            let sep_hard = apollo_optimizer::engine::safety::protected_processes();
+                            let sep_infra = infrastructure_processes();
+                            let policy_prot = state.policy.lock_recover()
+                                .learned_policy.protected_patterns.clone();
+                            let mut qos = state.mach_qos.lock_recover();
+                            for pair in &contention.pairs {
+                                if pair.confidence() < 0.25 { continue; }
+                                // Skip if either process matches any protection list.
+                                let protected = |name: &str| {
+                                    sep_hard.iter().any(|p| name.contains(p))
+                                        || sep_infra.iter().any(|p| name.contains(p))
+                                        || policy_prot.iter().any(|p| name.to_ascii_lowercase().contains(&p.to_ascii_lowercase()))
+                                };
+                                if protected(&pair.heavy_name) || protected(&pair.light_name) {
+                                    continue;
+                                }
+                                // heavy → P-cores (Foreground tier)
+                                qos.set_tier(pair.heavy_pid, SchedulingTier::Foreground);
+                                // light → E-cores (Background tier)
+                                qos.set_tier(pair.light_pid, SchedulingTier::Background);
+                            }
+                        }
+
                         // GC dead PIDs every 100 cycles
                         if cycle_count % 100 == 0 {
                             let alive: std::collections::HashSet<u32> =
