@@ -93,7 +93,10 @@ impl BuildTracker {
             }
         }
 
-        let build_signal = self.cargo_count > 0 || self.rustc_count > 0;
+        // Require at least one rustc to confirm active compilation.
+        // cargo alone (cargo run, cargo watch, cargo test with cached binary)
+        // does NOT mean compilation is happening — avoid false Starting boosts.
+        let build_signal = self.rustc_count > 0;
 
         if build_signal {
             if !self.build_active {
@@ -169,6 +172,16 @@ mod tests {
 
     fn procs<'a>(names: &[&'a str]) -> Vec<(u32, &'a str)> {
         names.iter().enumerate().map(|(i, &n)| (i as u32, n)).collect()
+    }
+
+    #[test]
+    fn cargo_alone_does_not_trigger_build() {
+        // cargo run / cargo watch / cargo test (cached) should NOT trigger Starting.
+        // Only rustc confirms active compilation.
+        let mut bt = BuildTracker::new();
+        bt.tick(&procs(&["cargo"]));
+        assert!(!bt.build_active, "cargo without rustc should not activate build tracker");
+        assert_eq!(bt.phase, BuildPhase::Idle);
     }
 
     #[test]
