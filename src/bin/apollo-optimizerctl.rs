@@ -232,22 +232,38 @@ fn handle_dashboard() -> anyhow::Result<()> {
         let frame = dashboard::render_dashboard(status);
         let new_lines: Vec<String> = frame.lines().map(|l| l.to_string()).collect();
 
+        // Build the entire output as a single string, then flush once.
+        // Single write = no tearing from partial flushes mid-render.
+        // [Unix write(2)] write() on a pipe/tty is atomic up to PIPE_BUF (4KB on Linux,
+        // unlimited on macOS for local sockets). Our box is ~70×60 = ~4200 bytes with
+        // ANSI codes — fits in one syscall on macOS. [POSIX.1-2017] §2.9.7.
+        let mut buf = String::with_capacity(8192);
+
         // First frame or line count changed: full redraw from home.
         if prev.is_empty() || prev.len() != new_lines.len() {
-            print!("\x1b[H");
+            buf.push_str("\x1b[H");
             for line in &new_lines {
-                // \x1b[K erases from cursor to end-of-line (handles shrinking content).
-                print!("{}\x1b[K\r\n", line);
+                buf.push_str(line);
+                buf.push_str("\x1b[K\r\n");
             }
         } else {
             // Differential: only rewrite lines that changed.
             // \x1b[K after content ensures stale chars from longer old lines are cleared.
+            let mut changed = 0usize;
             for (row, (new, old)) in new_lines.iter().zip(prev.iter()).enumerate() {
                 if new != old {
-                    print!("\x1b[{};1H{}\x1b[K", row + 1, new);
+                    buf.push_str(&format!("\x1b[{};1H{}\x1b[K", row + 1, new));
+                    changed += 1;
                 }
             }
+            if changed == 0 {
+                // Nothing changed — skip the write entirely (zero CPU, zero flicker).
+                *prev = new_lines;
+                return;
+            }
         }
+        use std::io::Write;
+        stdout.lock().write_all(buf.as_bytes()).ok();
         stdout.lock().flush().ok();
         *prev = new_lines;
     };
