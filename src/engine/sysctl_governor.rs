@@ -753,6 +753,27 @@ impl SysctlGovernor {
             SwapTrend::Increasing | SwapTrend::Critical
         );
 
+        // Emergency fast-path: Critical swap trend bypasses 3-cycle hysteresis.
+        // SwapTrend::Critical means swap grew >5% of total in the sample window —
+        // waiting 6+ seconds would guarantee jank frames before reacting.
+        // [Gu 2018 "Throttling on Bandwidth-Constrained Platforms" IISWC;
+        //  macOS UCS: faster compressor eval reduces swap I/O at display-frame boundaries]
+        if inputs.swap_trend == SwapTrend::Critical {
+            #[cfg(target_os = "macos")]
+            if self.vm.poll_interval != 100
+                && self.cooldown_ok("vm.compressor_eval_period_in_msecs", now)
+            {
+                self.emit_sysctl(
+                    "vm.compressor_eval_period_in_msecs",
+                    "100",
+                    "sysctl-governor: critical swap — emergency aggressive compressor",
+                    actions,
+                    now,
+                );
+                self.vm.poll_interval = 100;
+            }
+        }
+
         // High pressure + swap growing for 3 cycles: aggressive compressor.
         if self.vm.consecutive_high >= 3 && swap_growing {
             #[cfg(target_os = "macos")]
