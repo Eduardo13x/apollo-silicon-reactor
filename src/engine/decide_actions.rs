@@ -319,6 +319,19 @@ pub fn decide_actions(
     let skip_bg_throttle_user_active = user_ctx.is_recently_active()
         && matches!(context, InteractiveContext::InteractiveFocus);
 
+    // Call in progress → elevate effective context to BackgroundPressure regardless of measured
+    // pressure. Real-time audio/video codecs need CPU + memory bandwidth; throttling background
+    // daemons frees both. Freeze is still blocked by freeze_protected() in step 5.
+    // [Ellis & Gibbs 1989] "Concurrency control in groupware systems" — real-time collaboration
+    // requires dedicated, low-latency CPU + memory bandwidth, not shared with background tasks.
+    let effective_context = if user_ctx.call_in_progress
+        && matches!(context, InteractiveContext::InteractiveFocus)
+    {
+        InteractiveContext::BackgroundPressure
+    } else {
+        context
+    };
+
     // 1) Wait-graph practical: temporary boost for top blockers.
     let blocker_boost_count = match latency_target {
         LatencyTarget::Max => 3,
@@ -421,13 +434,13 @@ pub fn decide_actions(
             // Skip throttling for highly optimized compute-bound processes
             // unless we're in thermal emergency.
             if !ipc_class.safe_to_throttle()
-                && !matches!(context, InteractiveContext::ThermalConstrained)
+                && !matches!(effective_context, InteractiveContext::ThermalConstrained)
             {
                 low_value_skipped.push(format!("ipc-protected:{}", name));
                 continue;
             }
 
-            let aggressive = match context {
+            let aggressive = match effective_context {
                 InteractiveContext::ThermalConstrained => true,
                 InteractiveContext::BackgroundPressure => {
                     // Memory-bound processes: always throttle aggressively
@@ -650,8 +663,10 @@ pub fn decide_actions(
     // [WWDC 2017 "Modernizing GCD Usage"; iOS background task throttling]
     let deferrable_swap_trigger =
         snapshot.pressure.swap_delta_bytes_per_sec / (1024.0 * 1024.0) >= 0.5;
+    // Use effective_context: call_in_progress elevates to BackgroundPressure
+    // so deferrable ML daemons get throttled even at low measured pressure.
     let deferrable_pressure_trigger = matches!(
-        context,
+        effective_context,
         InteractiveContext::BackgroundPressure | InteractiveContext::ThermalConstrained
     );
     if deferrable_pressure_trigger || deferrable_swap_trigger {
