@@ -707,6 +707,13 @@ pub struct RuntimeMetrics {
     // KPC hardware performance counters
     #[serde(default)]
     pub kpc_ipc: f64,
+    // Cache contention detection (ContentionDetector)
+    #[serde(default)]
+    pub contention_score: f64,
+    #[serde(default)]
+    pub contention_heavy_count: usize,
+    #[serde(default)]
+    pub contention_pairs_active: u32,
     // Rosetta AOT compilation
     #[serde(default)]
     pub rosetta_aot_active: bool,

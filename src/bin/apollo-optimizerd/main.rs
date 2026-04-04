@@ -1047,6 +1047,12 @@ fn main() -> anyhow::Result<()> {
                 println!("[kpc] KPC counters unavailable (SIP or not root)");
             }
 
+            // ── Cache Contention Detector ───────────────────────────────────
+            // Detects L2 cache competition between co-executing high-CPU processes
+            // using system-wide IPC as proxy. Observation-only until Phase 3.
+            let mut contention_detector =
+                apollo_optimizer::engine::contention_detector::ContentionDetector::new();
+
             // ── Rosetta AOT Monitor ─────────────────────────────────────────
             // Watches /var/db/oah/ for write events → suppress freezing oahd.
             let mut rosetta_monitor = apollo_optimizer::engine::rosetta_monitor::RosettaMonitor::new();
@@ -2423,6 +2429,26 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.kpc_ipc = kpc.ipc;
                         lctx.signal_intel.set_kpc_ipc(kpc.ipc);
                         lctx.signal_intel.set_kpc_trend(kpc.ipc_trend);
+                    }
+
+                    // Cache contention detection (observation phase)
+                    {
+                        let system_ipc = kpc_snap.as_ref().map(|k| k.ipc).unwrap_or(0.0);
+                        let proc_list: Vec<(u32, String, f32)> = proc_snaps
+                            .iter()
+                            .map(|p| (p.pid, p.name.clone(), p.cpu_percent))
+                            .collect();
+                        let pressure = metrics.metrics.memory_pressure;
+                        let contention = contention_detector.tick(system_ipc, &proc_list, pressure, 15.0);
+                        metrics.metrics.contention_score = contention.score;
+                        metrics.metrics.contention_heavy_count = contention.heavy_count;
+                        metrics.metrics.contention_pairs_active = contention.pairs.len() as u32;
+                        // GC dead PIDs every 100 cycles
+                        if cycle_count % 100 == 0 {
+                            let alive: std::collections::HashSet<u32> =
+                                proc_snaps.iter().map(|p| p.pid).collect();
+                            contention_detector.gc(&alive);
+                        }
                     }
 
                     // Rosetta AOT state
