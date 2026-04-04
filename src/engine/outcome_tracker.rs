@@ -747,6 +747,7 @@ impl OutcomeTracker {
             co_occurrence,
             natural_drift_ema: self.natural_drift_ema,
             hop_groups: self.hop_groups.clone(),
+            drift_detector: Some(self.drift_detector.clone()),
         }
     }
 
@@ -766,6 +767,9 @@ impl OutcomeTracker {
         }
         self.natural_drift_ema = p.natural_drift_ema;
         self.hop_groups = p.hop_groups;
+        if let Some(dd) = p.drift_detector {
+            self.drift_detector = dd;
+        }
     }
 }
 
@@ -781,6 +785,10 @@ pub struct OutcomeTrackerPersisted {
     pub co_occurrence: Vec<(String, String, u32)>,
     pub natural_drift_ema: f64,
     pub hop_groups: HashMap<WorkloadHop, HopGroupWeight>,
+    /// NARS drift detector state — persisted so beliefs survive daemon restarts.
+    /// Confidence values are meaningless if beliefs reset every restart.
+    #[serde(default)]
+    pub drift_detector: Option<DriftDetector>,
 }
 
 #[cfg(test)]

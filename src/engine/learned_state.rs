@@ -433,6 +433,7 @@ mod tests {
             co_occurrence,
             natural_drift_ema: 0.01,
             hop_groups: HashMap::new(),
+            drift_detector: None,
         }
     }
 
@@ -584,6 +585,7 @@ mod tests {
             co_occurrence: vec![],
             natural_drift_ema: -0.5, // out of range
             hop_groups: HashMap::new(),
+            drift_detector: None,
         };
         let mut state = LearnedState {
             version: 1,
