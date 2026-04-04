@@ -615,10 +615,17 @@ pub fn decide_actions(
     // 4b) Deferrable Apple intelligence/ML daemons: throttle immediately under
     // BackgroundPressure without waiting for HRPO learning cycles.  These processes
     // self-throttle on AC/idle normally; under RAM pressure we accelerate that.
+    //
+    // Also trigger when swap_delta > 0.5 MB/s (early pressure) even if context is
+    // still InteractiveFocus — synchronized with the display boost in step 3b so
+    // RAM is freed before pressure reaches the BackgroundPressure threshold.
+    // [WWDC 2017 "Modernizing GCD Usage"; iOS background task throttling]
+    let deferrable_swap_trigger =
+        snapshot.pressure.swap_delta_bytes_per_sec / (1024.0 * 1024.0) >= 0.5;
     if matches!(
         context,
         InteractiveContext::BackgroundPressure | InteractiveContext::ThermalConstrained
-    ) {
+    ) || deferrable_swap_trigger {
         for (pid, process) in sys.processes() {
             let name = process.name().to_string();
             if DEFERRABLE_DAEMONS.iter().any(|d| name.contains(d))
