@@ -165,15 +165,20 @@ pub fn run_learning_tick<'a>(
         // only appear effective due to natural pressure fluctuation.
         if !batch.effective_names.is_empty() {
             let drift = lctx.outcome_tracker.natural_drift();
-            if drift > 0.01 {
+            let short_velocity = lctx.outcome_tracker.pressure_velocity_short();
+            // Demote if long-term drift is present OR short-window velocity
+            // already explains the drop (faster 3-cycle attribution).
+            if drift > 0.01 || short_velocity > 0.01 {
                 // Pre-compute causal effects per process before mutating weights.
                 let demotions: Vec<String> = batch.effective_names.iter().filter_map(|name| {
                     let avg_drop = lctx.outcome_tracker.experience
                         .query_similar(name, snapshot.pressure.memory_pressure)
                         .map(|(drop, _)| drop)
                         .unwrap_or(0.05);
-                    let causal = lctx.outcome_tracker.causal_effect(avg_drop);
-                    if causal < 0.005 { Some(name.clone()) } else { None }
+                    let causal_long = lctx.outcome_tracker.causal_effect(avg_drop);
+                    let causal_fast = lctx.outcome_tracker.causal_effect_fast(avg_drop);
+                    // Demote if EITHER signal says natural drift explains the drop.
+                    if causal_long < 0.005 || causal_fast < 0.005 { Some(name.clone()) } else { None }
                 }).collect();
                 // Roll back effective_count for drift-only "successes".
                 for name in &demotions {

@@ -78,6 +78,7 @@ pub fn update_learning_metrics<'a>(
         .map(|(a, b, c)| format!("{} + {} ({})", a, b, c))
         .collect();
     m.metrics.natural_drift = lctx.outcome_tracker.natural_drift();
+    m.metrics.short_drift_velocity = lctx.outcome_tracker.pressure_velocity_short();
     m.metrics.experience_memory_size = lctx.outcome_tracker.experience.len();
     // Causal effect average: mean effect across last resolved outcomes.
     m.metrics.causal_effect_avg = {

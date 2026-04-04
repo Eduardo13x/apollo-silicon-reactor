@@ -803,6 +803,10 @@ pub struct RuntimeMetrics {
     /// Natural pressure drift EMA (what happens without action).
     #[serde(default)]
     pub natural_drift: f64,
+    /// Short-window (3-cycle) pressure velocity: mean delta over last 3 no-action cycles.
+    /// Positive = pressure dropping naturally. Fast causal attribution signal.
+    #[serde(default)]
+    pub short_drift_velocity: f64,
     /// Experience memory size (resolved outcome records).
     #[serde(default)]
     pub experience_memory_size: usize,
