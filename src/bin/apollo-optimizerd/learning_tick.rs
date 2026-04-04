@@ -95,6 +95,7 @@ pub fn run_learning_tick<'a>(
             .sum::<f64>()
             .max(0.01);
         let mem_pressure_now = snapshot.pressure.memory_pressure;
+        let swap_gb_now = snapshot.pressure.swap_used_bytes as f64 / 1_073_741_824.0;
         for name in throttle_names_for_outcome {
             let proc_watts = snapshot
                 .top_processes
@@ -102,7 +103,11 @@ pub fn run_learning_tick<'a>(
                 .find(|p| &p.name == name)
                 .map(|p| (p.cpu_usage as f64 / total_cpu_pct) * cpu_watts)
                 .unwrap_or(0.0);
-            lctx.outcome_tracker.record_throttle(name, mem_pressure_now, proc_watts);
+            // Capture swap context for affective salience weighting.
+            // High swap at throttle time → high arousal → stronger NARS belief.
+            lctx.outcome_tracker.record_throttle_with_swap(
+                name, mem_pressure_now, proc_watts, swap_gb_now,
+            );
         }
     }
 
