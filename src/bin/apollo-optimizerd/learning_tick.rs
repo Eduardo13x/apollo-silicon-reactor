@@ -190,6 +190,20 @@ pub fn run_learning_tick<'a>(
                 }
             }
         }
+        // NARS drift recalibration: detect regime changes in per-process effectiveness.
+        // When ≥2 beliefs have drifted ≥20pp (or EMA score > 0.08), the Bayesian
+        // weights no longer reflect current system behavior. Apply soft decay:
+        // halve accumulated counts toward the Laplace prior (effectiveness→0.5).
+        // This is distribution-shift recovery per [Murphy 2012] §3.3 "reset toward prior".
+        if lctx.outcome_tracker.nars_needs_recalibration() {
+            for w in lctx.outcome_tracker.weights.values_mut() {
+                // Soft decay: halve counts. Minimum 1 each to keep Laplace structure.
+                w.effective_count = (w.effective_count / 2).max(1);
+                w.throttle_count  = (w.throttle_count  / 2).max(2);
+            }
+            lctx.outcome_tracker.nars_acknowledge_recalibration();
+        }
+
         // Sync Bayesian weights to the persisted LearnedPolicy.
         if !batch.effective_names.is_empty() || !batch.low_value_names.is_empty() {
             let mut pg = state.policy.lock_recover();
