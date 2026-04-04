@@ -48,6 +48,7 @@ pub mod lock_ext;
 pub mod lotka_volterra;
 pub mod mach_qos;
 pub mod memory_analyzer;
+pub mod nars_belief;
 pub mod memory_budget;
 pub mod rule_inducer;
 pub mod mpc_horizon;
