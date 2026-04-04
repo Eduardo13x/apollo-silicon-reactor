@@ -349,6 +349,21 @@ fn render_intelligence(status: &DaemonStatus) -> Vec<String> {
         lines.push(format!("Fuentes: {}", dim(&sources)));
     }
 
+    // NARS concept drift indicator
+    if m.nars_drift_score > 0.0 || m.nars_drifted_beliefs > 0 {
+        let drift_label = if m.nars_drift_score > 0.08 || m.nars_drifted_beliefs >= 2 {
+            red("🔴 Recalibrando")
+        } else if m.nars_drift_score > 0.05 {
+            yellow("🟡 Leve")
+        } else {
+            green("🟢 Estable")
+        };
+        lines.push(format!(
+            "Concept Drift: {} (score={:.3}, beliefs={})",
+            drift_label, m.nars_drift_score, m.nars_drifted_beliefs
+        ));
+    }
+
     lines
 }
 
