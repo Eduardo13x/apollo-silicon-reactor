@@ -695,6 +695,9 @@ pub fn decide_actions(
     if deferrable_pressure_trigger || deferrable_swap_trigger {
         ml_throttle_source = if deferrable_swap_trigger && !deferrable_pressure_trigger {
             "swap-early".to_string()
+        } else if user_ctx.call_in_progress && matches!(context, InteractiveContext::InteractiveFocus) {
+            // Triggered by call elevation, not real measured pressure.
+            "call-mode".to_string()
         } else {
             "pressure".to_string()
         };

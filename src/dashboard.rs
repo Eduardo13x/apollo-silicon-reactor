@@ -354,7 +354,11 @@ fn render_system(status: &DaemonStatus) -> Vec<String> {
         if ml_src != "none" || gate != "none" {
             lines.push(format!(
                 "ML throttle: {}  Freeze gate: {}",
-                if ml_src == "swap-early" { yellow(ml_src) } else { ml_src.to_string() },
+                match ml_src {
+                    "swap-early" => yellow(ml_src),
+                    "call-mode" => yellow("call-mode (bandwidth reserved)"),
+                    _ => ml_src.to_string(),
+                },
                 if gate != "none" { yellow(gate) } else { gate.to_string() }
             ));
         }
