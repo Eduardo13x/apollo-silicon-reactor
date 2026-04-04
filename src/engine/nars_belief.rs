@@ -419,6 +419,75 @@ impl DriftDetector {
     }
 }
 
+// ── ArousalState ─────────────────────────────────────────────────────────────
+
+/// EMA-based global arousal tracker for the daemon.
+///
+/// Tracks the daemon's current system-wide stress level as a continuous signal
+/// ∈ [0,1]. High arousal = system under crisis (swap full, p_oom elevated).
+/// Low arousal = system idle / healthy.
+///
+/// Yerkes-Dodson (1908): arousal modulates learning efficiency — too low =
+/// inattentive, too high = overwhelmed, optimal band (0.3–0.7) = peak learning.
+///
+/// Used in learning_tick.rs to:
+/// - Tighten recalibration threshold under high arousal (faster drift response)
+/// - Expand recalibration threshold under low arousal (avoid false positives)
+/// - Gate expensive subsystems when arousal is trivially low
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArousalState {
+    /// Current EMA arousal level ∈ [0,1].
+    pub level: f32,
+    /// EMA decay factor. α=0.15 → half-life ≈ 4 samples (fast-reacting).
+    alpha: f32,
+    /// Count of observations fed into this EMA.
+    pub samples: u64,
+}
+
+impl Default for ArousalState {
+    fn default() -> Self {
+        Self { level: 0.0, alpha: 0.15, samples: 0 }
+    }
+}
+
+impl ArousalState {
+    /// Update arousal EMA with a new salience observation.
+    ///
+    /// The EMA reacts quickly to spikes (α=0.15) but decays slowly when inputs
+    /// are low — mimicking the lingering effect of stress hormones (cortisol
+    /// half-life ≈ 60–90 min, modeled here as persistent EMA memory).
+    pub fn update(&mut self, salience: Salience) {
+        self.level = self.alpha * salience.arousal + (1.0 - self.alpha) * self.level;
+        self.samples += 1;
+    }
+
+    /// Drift recalibration threshold adjusted by Yerkes-Dodson inverted-U.
+    ///
+    /// At low arousal: raise threshold (don't recalibrate on noise).
+    /// At high arousal: lower threshold (fast response to real crises).
+    /// At optimal arousal (0.5): return the base threshold unchanged.
+    ///
+    /// Formula: threshold × (1.0 + 0.5 × (0.5 - arousal))
+    ///   arousal=0.0 → threshold × 1.25 (sluggish, conservative)
+    ///   arousal=0.5 → threshold × 1.00 (baseline)
+    ///   arousal=1.0 → threshold × 0.75 (hair-trigger, aggressive)
+    pub fn adjusted_drift_threshold(&self, base: f64) -> f64 {
+        let arousal = self.level as f64;
+        base * (1.0 + 0.5 * (0.5 - arousal))
+    }
+
+    /// Yerkes-Dodson zone label for dashboard display.
+    pub fn zone(&self) -> &'static str {
+        match self.level {
+            a if a < 0.25 => "Idle",
+            a if a < 0.45 => "Calm",
+            a if a < 0.65 => "Optimal",
+            a if a < 0.80 => "Stressed",
+            _ => "Crisis",
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -723,5 +792,78 @@ mod tests {
             "arousal should amplify drift score EMA: crisis={:.4} neutral={:.4}",
             dd_crisis.drift_score, dd_neutral.drift_score
         );
+    }
+
+    // ── ArousalState ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn arousal_state_starts_at_zero() {
+        let a = ArousalState::default();
+        assert_eq!(a.level, 0.0);
+        assert_eq!(a.samples, 0);
+        assert_eq!(a.zone(), "Idle");
+    }
+
+    #[test]
+    fn arousal_state_ema_rises_under_crisis() {
+        let mut a = ArousalState::default();
+        let crisis = Salience::compute(0.9, -0.05, 0.9, 8.0); // high swap, high p_oom
+        for _ in 0..30 {
+            a.update(crisis);
+        }
+        // After 30 updates with high-arousal input, EMA should converge near crisis.arousal
+        assert!(a.level > 0.60, "EMA should approach crisis arousal: got {:.3}", a.level);
+        assert!(matches!(a.zone(), "Stressed" | "Crisis"));
+    }
+
+    #[test]
+    fn arousal_state_decays_back_to_idle() {
+        let mut a = ArousalState::default();
+        let crisis = Salience::compute(0.9, -0.05, 0.9, 8.0);
+        // Build up arousal
+        for _ in 0..30 { a.update(crisis); }
+        assert!(a.level > 0.50);
+        // Feed zero-arousal inputs — EMA decays
+        let calm = Salience::compute(0.1, 0.01, 0.0, 0.0);
+        for _ in 0..60 { a.update(calm); }
+        assert!(a.level < 0.20, "EMA should decay toward calm: got {:.3}", a.level);
+    }
+
+    #[test]
+    fn arousal_adjusted_threshold_follows_yerkes_dodson() {
+        let base = 0.08_f64;
+        let mut a = ArousalState::default();
+
+        // Low arousal → threshold raised (conservative)
+        let low = Salience::compute(0.0, 0.0, 0.0, 0.0);
+        for _ in 0..50 { a.update(low); }
+        let t_low = a.adjusted_drift_threshold(base);
+        assert!(t_low > base, "low arousal should raise threshold: {:.4}", t_low);
+
+        // High arousal → threshold lowered (aggressive)
+        let mut b = ArousalState::default();
+        let crisis = Salience::compute(0.9, -0.05, 0.9, 8.0);
+        for _ in 0..50 { b.update(crisis); }
+        let t_high = b.adjusted_drift_threshold(base);
+        assert!(t_high < base, "high arousal should lower threshold: {:.4}", t_high);
+
+        // High arousal is more aggressive than low arousal
+        assert!(t_high < t_low);
+    }
+
+    #[test]
+    fn arousal_zone_labels_are_correct() {
+        let cases = [
+            (0.0_f32, "Idle"),
+            (0.20, "Idle"),
+            (0.30, "Calm"),
+            (0.50, "Optimal"),
+            (0.70, "Stressed"),
+            (0.85, "Crisis"),
+        ];
+        for (level, expected) in cases {
+            let a = ArousalState { level, alpha: 0.15, samples: 1 };
+            assert_eq!(a.zone(), expected, "level={level} → expected {expected}");
+        }
     }
 }
