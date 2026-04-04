@@ -355,7 +355,17 @@ impl DriftDetector {
     /// True if model drift is significant enough to warrant recalibration.
     /// Threshold: ≥2 beliefs drifted OR aggregate EMA score > 0.08.
     pub fn needs_recalibration(&self) -> bool {
-        self.drifted_count >= 2 || self.drift_score > 0.08
+        self.needs_recalibration_at(0.08)
+    }
+
+    /// Like `needs_recalibration()` but with a caller-supplied EMA threshold.
+    ///
+    /// Used by `ArousalState::adjusted_drift_threshold()` to dynamically tighten
+    /// or loosen the recalibration trigger per Yerkes-Dodson:
+    /// - High arousal → lower threshold → faster recalibration response
+    /// - Low arousal  → higher threshold → conservative (avoids false alarms)
+    pub fn needs_recalibration_at(&self, score_threshold: f64) -> bool {
+        self.drifted_count >= 2 || self.drift_score > score_threshold
     }
 
     /// Get current TruthValue for a key (for diagnostics).

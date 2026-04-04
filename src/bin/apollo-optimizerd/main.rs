@@ -1107,6 +1107,9 @@ fn main() -> anyhow::Result<()> {
             let mut prev_package_watts: Option<f64> = None;
             // Track previous cycle's workload for onset detection (build-onset-proactive).
             let mut prev_workload_mode: WorkloadMode = WorkloadMode::Idle;
+            // Affective arousal EMA: global system-wide stress level ∈ [0,1].
+            // Drives Yerkes-Dodson adaptive recalibration threshold in learning_tick.
+            let mut arousal_state = apollo_optimizer::engine::nars_belief::ArousalState::default();
             // Spotlight pause state: true when Apollo has paused Spotlight indexing
             // via mdutil to relieve memory pressure.  Re-enabled when pressure normalizes.
             let mut spotlight_paused: bool = false;
@@ -4949,6 +4952,7 @@ fn main() -> anyhow::Result<()> {
                     &mut last_restore_quality,
                     &mut prev_package_watts,
                     &mut prev_workload_mode,
+                    &mut arousal_state,
                     pending_trial_skill.clone(),
                     ls_path.to_str().unwrap_or(""),
                     persist_generations,

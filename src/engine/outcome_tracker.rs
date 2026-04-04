@@ -350,6 +350,12 @@ impl OutcomeTracker {
         self.drift_detector.needs_recalibration()
     }
 
+    /// Like `nars_needs_recalibration()` but with an arousal-adjusted threshold.
+    /// Caller passes `ArousalState::adjusted_drift_threshold(0.08)`.
+    pub fn nars_needs_recalibration_at(&self, score_threshold: f64) -> bool {
+        self.drift_detector.needs_recalibration_at(score_threshold)
+    }
+
     /// Call after recalibration has been applied to reset drift signals.
     pub fn nars_acknowledge_recalibration(&mut self) {
         self.drift_detector.acknowledge_recalibration();

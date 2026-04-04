@@ -25,6 +25,7 @@ use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
 use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningPipeline};
 use apollo_optimizer::engine::learned_state::{LearnedState, RestoreQualityMonitor};
 use apollo_optimizer::engine::lock_ext::LockRecover;
+use apollo_optimizer::engine::nars_belief::{ArousalState, Salience};
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
 use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_optimizer::engine::signal_intelligence::SignalDigest;
@@ -56,6 +57,7 @@ use apollo_optimizer::engine::daemon_state::SharedState;
 /// - `prev_package_watts` — previous cycle's package watts (Cable D, updated by this call)
 /// - `pending_trial_skill` — current trial skill (passed to persist, not modified here)
 /// - `prev_workload_mode` — previous cycle's workload mode (updated by this call for next cycle)
+/// - `arousal_state` — global EMA arousal tracker; updated here, used to adjust recalibration threshold
 /// - `ls_path` — filesystem path for unified learned state
 /// - `persist_generations` — generation counter passed to `LearnedState::persist_improved`
 /// - `skills_path` — filesystem path for optimization skills
@@ -77,11 +79,23 @@ pub fn run_learning_tick<'a>(
     last_restore_quality: &mut Option<f64>,
     prev_package_watts: &mut Option<f64>,
     prev_workload_mode: &mut WorkloadMode,
+    arousal_state: &mut ArousalState,
     pending_trial_skill: Option<(String, f64)>,
     ls_path: &str,
     persist_generations: u32,
     skills_path: &str,
 ) {
+    // ── Arousal EMA: update every cycle from current pressure + swap ─────────
+    // p_oom_est ∈ [0,1]: proxy for OOM risk derived from pressure above 0.70.
+    // [Yerkes & Dodson 1908] arousal modulates learning rate.
+    {
+        let mem_pressure = snapshot.pressure.memory_pressure;
+        let swap_gb = snapshot.pressure.swap_used_bytes as f64 / 1_073_741_824.0;
+        let p_oom_est = ((mem_pressure - 0.70) / 0.30).clamp(0.0, 1.0);
+        let cycle_salience = Salience::compute(mem_pressure, 0.0, p_oom_est, swap_gb);
+        arousal_state.update(cycle_salience);
+    }
+
     // ── Outcome tracking: record throttled processes ─────────────────────────
     if exec_outcomes.throttles_applied > 0 {
         let cpu_watts = cycle_hw_snap
@@ -196,11 +210,13 @@ pub fn run_learning_tick<'a>(
             }
         }
         // NARS drift recalibration: detect regime changes in per-process effectiveness.
-        // When ≥2 beliefs have drifted ≥20pp (or EMA score > 0.08), the Bayesian
-        // weights no longer reflect current system behavior. Apply soft decay:
+        // When ≥2 beliefs have drifted ≥20pp (or EMA score > arousal-adjusted threshold),
+        // the Bayesian weights no longer reflect current system behavior. Apply soft decay:
         // halve accumulated counts toward the Laplace prior (effectiveness→0.5).
-        // This is distribution-shift recovery per [Murphy 2012] §3.3 "reset toward prior".
-        if lctx.outcome_tracker.nars_needs_recalibration() {
+        // Threshold is Yerkes-Dodson adaptive: high arousal → 0.06 (hair-trigger),
+        // low arousal → 0.10 (conservative). [Murphy 2012] §3.3 "reset toward prior".
+        let recalib_threshold = arousal_state.adjusted_drift_threshold(0.08);
+        if lctx.outcome_tracker.nars_needs_recalibration_at(recalib_threshold) {
             for w in lctx.outcome_tracker.weights.values_mut() {
                 // Soft decay: halve counts. Minimum 1 each to keep Laplace structure.
                 w.effective_count = (w.effective_count / 2).max(1);
