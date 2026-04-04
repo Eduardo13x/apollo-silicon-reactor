@@ -1445,6 +1445,15 @@ fn main() -> anyhow::Result<()> {
                 // proactive pre-warming of apps the user habitually opens at this hour.
                 // Observe only on app transition (not every cycle) to avoid count inflation
                 // and excess disk writes. last_fg_name is updated at end of ctx-switch block.
+                // Update temporal hour/weekday unconditionally every cycle so that
+                // pressure_headroom_for_incoming() always uses the real current time,
+                // even when no foreground app is detected (lock screen, screensaver).
+                {
+                    let now_chrono = Utc::now();
+                    temporal_hour = now_chrono.hour() as u8;
+                    temporal_weekday =
+                        chrono::Datelike::weekday(&now_chrono).num_days_from_monday() as u8;
+                }
                 if let Some(ref fg_name) = foreground_app {
                     let now_chrono = Utc::now();
                     let hour = now_chrono.hour() as u8;
