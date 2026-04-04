@@ -203,15 +203,77 @@ fn send_request(req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
 }
 
 fn handle_dashboard() -> anyhow::Result<()> {
-    let response = send_request(DaemonRequest::GetStatus)
+    // Live TUI watch loop: re-renders in-place at ~4 Hz (250 ms cadence).
+    // Uses cursor-home overwrite (no clear) + differential line rendering to
+    // eliminate all visible flicker. [btop++ 2022] in-place terminal redraw;
+    // [Marcotte 2010] "Repainting Only What Changed" — TUI diff patterns.
+    use std::io::Write;
+    let stdout = std::io::stdout();
+
+    // Hide cursor for the duration of the watch session.
+    print!("\x1b[?25l");
+    stdout.lock().flush().ok();
+
+    // Restore cursor + clear on Ctrl-C.
+    ctrlc::set_handler(|| {
+        print!("\x1b[?25h");
+        let _ = std::io::stdout().flush();
+        std::process::exit(0);
+    })
+    .ok();
+
+    // Probe first frame: check daemon is reachable before entering loop.
+    let first = send_raw(DaemonRequest::GetStatus)
         .context("No se pudo conectar al daemon. ¿Está corriendo apollo-optimizerd?")?;
-    match response {
-        DaemonResponse::Status(s) => {
-            print!("{}", dashboard::render_dashboard(&s));
-            Ok(())
+    let mut prev_frame: Vec<String> = Vec::new();
+
+    let render_one = |status: &apollo_optimizer::engine::types::DaemonStatus,
+                      prev: &mut Vec<String>| {
+        let frame = dashboard::render_dashboard(status);
+        let new_lines: Vec<String> = frame.lines().map(|l| l.to_string()).collect();
+
+        // First frame or line count changed: full redraw from home.
+        if prev.is_empty() || prev.len() != new_lines.len() {
+            print!("\x1b[H");
+            for line in &new_lines {
+                println!("{}", line);
+            }
+        } else {
+            // Differential: only rewrite lines that changed.
+            for (row, (new, old)) in new_lines.iter().zip(prev.iter()).enumerate() {
+                if new != old {
+                    // \x1b[{row};1H — move to row (1-indexed), column 1.
+                    print!("\x1b[{};1H{}", row + 1, new);
+                }
+            }
         }
-        DaemonResponse::Error { message } => anyhow::bail!(message),
-        _ => anyhow::bail!("respuesta inesperada del daemon"),
+        stdout.lock().flush().ok();
+        *prev = new_lines;
+    };
+
+    // Render first frame.
+    if let DaemonResponse::Status(s) = first {
+        // Clear screen once at startup to establish a clean canvas.
+        print!("\x1b[2J");
+        render_one(&s, &mut prev_frame);
+    }
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        match send_raw(DaemonRequest::GetStatus) {
+            Ok(DaemonResponse::Status(s)) => render_one(&s, &mut prev_frame),
+            Ok(DaemonResponse::Error { message }) => {
+                // Daemon error: show inline, keep looping.
+                print!("\x1b[H\x1b[31mDaemon error: {}\x1b[0m", message);
+                stdout.lock().flush().ok();
+            }
+            Err(_) => {
+                // Transient disconnect: show status, keep looping.
+                print!("\x1b[H\x1b[33mWaiting for daemon...\x1b[0m");
+                stdout.lock().flush().ok();
+            }
+            _ => {}
+        }
     }
 }
 
