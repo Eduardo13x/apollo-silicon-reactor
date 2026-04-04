@@ -319,6 +319,10 @@ impl TemporalPredictor {
     /// CACM 11(5) — proactively maintain the working-set budget before demand
     /// arrives.
     pub fn pressure_headroom_for_incoming(&self, hour: u8, weekday: u8) -> f64 {
+        // Fast-exit: no profiles yet (cold start) — avoid predict() allocation.
+        if self.state.profiles.is_empty() {
+            return 0.0;
+        }
         let predictions = self.predict(hour, weekday, &HashMap::new());
         if predictions.is_empty() {
             return 0.0;
