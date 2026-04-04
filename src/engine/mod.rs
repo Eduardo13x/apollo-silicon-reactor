@@ -7,6 +7,7 @@ pub mod cache_warmer;
 pub mod capabilities;
 pub mod causal_graph;
 pub mod circuit_breaker;
+pub mod contention_detector;
 pub mod coalition;
 pub mod degradation;
 pub mod compressor_aware;
