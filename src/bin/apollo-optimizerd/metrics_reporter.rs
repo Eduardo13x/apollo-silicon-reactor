@@ -43,6 +43,7 @@ use apollo_optimizer::engine::profile_governor::GovernorDecision;
 use apollo_optimizer::engine::signal_intelligence::SignalDigest;
 use apollo_optimizer::engine::thermal_bailout::ThermalAction;
 use apollo_optimizer::engine::types::{OptimizationProfile, ProfileTransition};
+use apollo_optimizer::engine::nars_belief::ArousalState;
 use apollo_optimizer::engine::predictive_agent::Intervention;
 use apollo_optimizer::engine::process_tree::ProcessTree;
 
@@ -57,6 +58,7 @@ pub fn update_learning_metrics<'a>(
     lctx: &LearningContext<'a>,
     signal_digest: &SignalDigest,
     agent_intervention: &Intervention,
+    arousal_state: &ArousalState,
 ) {
     let mut m = state.metrics.lock_recover();
     m.metrics.predictive_agent_active = lctx.predictive_agent.is_active();
@@ -81,6 +83,8 @@ pub fn update_learning_metrics<'a>(
     m.metrics.short_drift_velocity = lctx.outcome_tracker.pressure_velocity_short();
     m.metrics.nars_drift_score = lctx.outcome_tracker.nars_drift_score();
     m.metrics.nars_drifted_beliefs = lctx.outcome_tracker.drift_detector.drifted_count;
+    m.metrics.arousal_level = arousal_state.level;
+    m.metrics.arousal_zone = arousal_state.zone().to_string();
     m.metrics.experience_memory_size = lctx.outcome_tracker.experience.len();
     // Causal effect average: mean effect across last resolved outcomes.
     m.metrics.causal_effect_avg = {

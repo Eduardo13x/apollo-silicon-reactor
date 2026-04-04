@@ -850,6 +850,13 @@ pub struct RuntimeMetrics {
     /// Number of process beliefs currently in drifted state (freq shift >= 20pp).
     #[serde(default)]
     pub nars_drifted_beliefs: usize,
+    /// Global arousal EMA level ∈ [0,1]. Computed from memory pressure + swap.
+    /// [Yerkes & Dodson 1908] arousal modulates learning rate.
+    #[serde(default)]
+    pub arousal_level: f32,
+    /// Yerkes-Dodson zone label: Idle/Calm/Optimal/Stressed/Crisis.
+    #[serde(default)]
+    pub arousal_zone: String,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.

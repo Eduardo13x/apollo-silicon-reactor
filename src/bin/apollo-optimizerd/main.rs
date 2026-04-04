@@ -5009,6 +5009,7 @@ fn main() -> anyhow::Result<()> {
                     &lctx,
                     &signal_digest,
                     &agent_intervention,
+                    &arousal_state,
                 );
                 metrics_reporter::apply_io_shaping(
                     cycle_count,

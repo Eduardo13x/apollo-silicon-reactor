@@ -349,6 +349,22 @@ fn render_intelligence(status: &DaemonStatus) -> Vec<String> {
         lines.push(format!("Fuentes: {}", dim(&sources)));
     }
 
+    // Affective arousal indicator (Yerkes-Dodson zone)
+    if m.arousal_level > 0.01 || !m.arousal_zone.is_empty() {
+        let zone = if m.arousal_zone.is_empty() { "Idle" } else { &m.arousal_zone };
+        let zone_colored = match zone {
+            "Crisis"   => red(zone),
+            "Stressed" => yellow(zone),
+            "Optimal"  => green(zone),
+            _          => dim(zone),
+        };
+        lines.push(format!(
+            "Arousal: {} ({:.0}%) — Yerkes-Dodson",
+            zone_colored,
+            m.arousal_level * 100.0,
+        ));
+    }
+
     // NARS concept drift indicator
     if m.nars_drift_score > 0.0 || m.nars_drifted_beliefs > 0 {
         let drift_label = if m.nars_drift_score > 0.08 || m.nars_drifted_beliefs >= 2 {
