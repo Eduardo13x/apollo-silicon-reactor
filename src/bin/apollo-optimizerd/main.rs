@@ -1053,6 +1053,13 @@ fn main() -> anyhow::Result<()> {
             let mut contention_detector =
                 apollo_optimizer::engine::contention_detector::ContentionDetector::new();
 
+            // ── Window/App Lifecycle Sensor ─────────────────────────────────
+            // Diff-based: tracks app terminated/launched, browser tab delta,
+            // foreground changes. Works as root daemon (no GUI session needed).
+            // [GoF Observer Pattern via cycle-to-cycle process diff]
+            let mut window_sensor =
+                apollo_optimizer::engine::window_sensor::WindowSensor::new();
+
             // ── Rosetta AOT Monitor ─────────────────────────────────────────
             // Watches /var/db/oah/ for write events → suppress freezing oahd.
             let mut rosetta_monitor = apollo_optimizer::engine::rosetta_monitor::RosettaMonitor::new();
@@ -2489,6 +2496,25 @@ fn main() -> anyhow::Result<()> {
                                 proc_snaps.iter().map(|p| p.pid).collect();
                             contention_detector.gc(&alive);
                         }
+                    }
+
+                    // Window/app lifecycle sensor — process diff for tab/app events
+                    {
+                        let fg_name = match fg_detector.detect() {
+                            ForegroundState::App(ref a) => a.name.clone(),
+                            _ => String::new(),
+                        };
+                        let proc_pairs: Vec<(u32, &str)> = proc_snaps
+                            .iter()
+                            .map(|p| (p.pid, p.name.as_str()))
+                            .collect();
+                        let win = window_sensor.tick(
+                            &proc_pairs,
+                            if fg_name.is_empty() { None } else { Some(fg_name.as_str()) },
+                        );
+                        metrics.metrics.window_tab_delta = win.tab_delta;
+                        metrics.metrics.window_renderer_count = win.renderer_count;
+                        metrics.metrics.window_freed_heavy_app = win.freed_heavy_app;
                     }
 
                     // Rosetta AOT state

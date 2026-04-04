@@ -714,6 +714,13 @@ pub struct RuntimeMetrics {
     pub contention_heavy_count: usize,
     #[serde(default)]
     pub contention_pairs_active: u32,
+    // Window/app lifecycle sensor (WindowSensor)
+    #[serde(default)]
+    pub window_tab_delta: i32,
+    #[serde(default)]
+    pub window_renderer_count: u32,
+    #[serde(default)]
+    pub window_freed_heavy_app: bool,
     // Rosetta AOT compilation
     #[serde(default)]
     pub rosetta_aot_active: bool,
