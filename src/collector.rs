@@ -125,16 +125,28 @@ impl SystemCollector {
     pub fn collect_snapshot(&mut self) -> SystemSnapshot {
         // Refresh system stats — skip process refresh for first 3 cycles
         // (startup grace period: avoids expensive initial enumeration).
+        // Lightweight refresh every cycle: CPU + memory + processes only.
+        // Full refresh (disk/network) every 30 cycles (~9s at 300ms interval).
+        // refresh_all() includes refresh_components() (temps) and disk/net I/O stats —
+        // expensive (~30-50ms on macOS with 200 processes) and unneeded each cycle
+        // for scheduling decisions. SMC reader handles temps independently.
+        // [Bhatt 2009 "Reducing overhead of application tracing"; sysinfo docs]
         self.light_call_count += 1;
         if self.light_call_count <= 3 {
             self.process_refresh_skip_count += 1;
             self.sys.refresh_cpu();
             self.sys.refresh_memory();
-        } else {
+        } else if self.light_call_count % 30 == 0 {
+            // Full refresh for disk/network stats (for journal and metrics).
             self.sys.refresh_all();
+            self.disks.refresh_list();
+            self.networks.refresh();
+        } else {
+            // Light path: enough for all scheduling decisions.
+            self.sys.refresh_cpu();
+            self.sys.refresh_memory();
+            self.sys.refresh_processes();
         }
-        self.disks.refresh_list();
-        self.networks.refresh();
 
         // CPU
         let global_cpu = self.sys.global_cpu_info().cpu_usage();
