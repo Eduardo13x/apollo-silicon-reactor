@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::nars_belief::DriftDetector;
+
 // ── Tipos públicos ────────────────────────────────────────────────────────────
 
 /// Peso Bayesiano de un patrón de proceso.
@@ -306,6 +308,11 @@ pub struct OutcomeTracker {
     short_drift_velocity: f64,
     /// HRPO: per-group effectiveness tracking (Dr. Zero solver).
     pub hop_groups: HashMap<WorkloadHop, HopGroupWeight>,
+    /// NARS-based concept drift detector.
+    /// Tracks per-process effectiveness beliefs using Revision rule.
+    /// Signals when the Bayesian model has drifted from current reality.
+    /// [Pei Wang 2013] Non-Axiomatic Reasoning System, §3.3.3
+    pub drift_detector: DriftDetector,
 }
 
 impl OutcomeTracker {
@@ -326,7 +333,23 @@ impl OutcomeTracker {
             short_window_deltas: VecDeque::with_capacity(3),
             short_drift_velocity: 0.0,
             hop_groups: HashMap::new(),
+            drift_detector: DriftDetector::new(),
         }
+    }
+
+    /// Current NARS drift score [0,1]. High = model has drifted from reality.
+    pub fn nars_drift_score(&self) -> f64 {
+        self.drift_detector.score()
+    }
+
+    /// True if NARS drift detector signals that Bayesian weights need recalibration.
+    pub fn nars_needs_recalibration(&self) -> bool {
+        self.drift_detector.needs_recalibration()
+    }
+
+    /// Call after recalibration has been applied to reset drift signals.
+    pub fn nars_acknowledge_recalibration(&mut self) {
+        self.drift_detector.acknowledge_recalibration();
     }
 
     /// Umbral calibrado para is_low_value_vs_baseline.
@@ -397,6 +420,10 @@ impl OutcomeTracker {
                     w.effective_count += 1;
                 }
             }
+
+            // NARS Revision: update drift belief for this process.
+            // Detects when a process's effectiveness profile has changed regime.
+            self.drift_detector.observe(&outcome.process_name, effective);
 
             // HRPO: update group-level effectiveness (Dr. Zero solver feedback).
             let hop = WorkloadHop::from_process_name(&outcome.process_name);
