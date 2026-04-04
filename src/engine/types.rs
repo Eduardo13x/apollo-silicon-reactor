@@ -841,6 +841,15 @@ pub struct RuntimeMetrics {
     /// Dr. Zero exploration signal: groups needing more data.
     #[serde(default)]
     pub dr_zero_exploration: Vec<String>,
+    /// NARS concept drift score [0.0, 1.0].
+    /// EMA of per-process belief frequency shifts after Revision rule.
+    /// > 0.05: notable drift. > 0.08: recalibration triggered.
+    /// [Pei Wang 2013] Non-Axiomatic Reasoning System, §3.3.3
+    #[serde(default)]
+    pub nars_drift_score: f64,
+    /// Number of process beliefs currently in drifted state (freq shift >= 20pp).
+    #[serde(default)]
+    pub nars_drifted_beliefs: usize,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.
