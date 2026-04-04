@@ -1089,6 +1089,10 @@ fn main() -> anyhow::Result<()> {
             // inside the foreground block and reused in reactor_weight section.
             let mut temporal_hour: u8 = 0;
             let mut temporal_weekday: u8 = 0;
+            // Build progress tracker: estimates cargo build completion from
+            // rustc process-count dynamics. Informs reactor_weight policy.
+            use apollo_optimizer::engine::build_tracker::{BuildTracker, BuildPhase};
+            let mut build_tracker = BuildTracker::new();
             // Pending trial skill: (name, pressure_before). Recorded next cycle.
             // Restored from LearnedState so a trial started before a crash is still evaluated.
             let mut pending_trial_skill: Option<(String, f64)> = restored_trial_skill;
@@ -2555,6 +2559,14 @@ fn main() -> anyhow::Result<()> {
                         window_relief_cycles = window_relief_cycles.max(2);
                     }
 
+                    // Build progress tick — updates build_tracker.phase and
+                    // build_progress each cycle from rustc/cargo process counts.
+                    {
+                        let proc_pairs: Vec<(u32, &str)> = proc_snaps.iter()
+                            .map(|p| (p.pid, p.name.as_str())).collect();
+                        build_tracker.tick(&proc_pairs);
+                    }
+
                     // Rosetta AOT state
                     metrics.metrics.rosetta_aot_active = rosetta_monitor.is_compiling();
 
@@ -2886,6 +2898,26 @@ fn main() -> anyhow::Result<()> {
                     temporal_predictor.pressure_headroom_for_incoming(temporal_hour, temporal_weekday);
                 if temporal_headroom > 0.02 {
                     reactor_weight = (reactor_weight + temporal_headroom).min(1.0);
+                }
+
+                // Build progress [McKenney 2004]: rustc-count dynamics proxy.
+                // Starting phase: cargo just spawned — pre-clear non-build memory so
+                // compilation gets all available RAM.
+                // Finishing phase: rustc count declining — build about to complete,
+                // relax to avoid disruptive actions during linker phase.
+                match build_tracker.phase {
+                    BuildPhase::Starting => {
+                        // Boost aggressiveness: help cargo get RAM now.
+                        reactor_weight = (reactor_weight + 0.15).min(1.0);
+                    }
+                    BuildPhase::Finishing => {
+                        // Back off: linker/metadata writes are latency-sensitive.
+                        let raw_pressure = snapshot.pressure.memory_pressure;
+                        if raw_pressure < 0.80 {
+                            reactor_weight = (reactor_weight - 0.12).max(0.0);
+                        }
+                    }
+                    _ => {}
                 }
 
                 // Predictive agent: build context from existing signals and select intervention.
