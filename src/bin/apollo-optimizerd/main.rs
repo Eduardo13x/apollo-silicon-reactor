@@ -3283,6 +3283,21 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 let causal_confidence = lctx.causal_graph.confidence_map();
+
+                // Bypass habituation under critical conditions.
+                // Habituation assumes "stable RSS = no problem", but under heavy swap
+                // processes have stable RSS (swapped out) and stable CPU (not running) —
+                // they LOOK calm but are the source of thrashing.  Force a fresh look
+                // when p_oom ≥ 0.95 or swap ≥ 8 GB.
+                let swap_critical = snapshot.pressure.swap_used_bytes >= 8 * 1_073_741_824;
+                let oom_critical  = signal_digest.p_oom_30s >= 0.95;
+                let empty_hab: HashSet<u32> = HashSet::new();
+                let effective_habituated: &HashSet<u32> = if swap_critical || oom_critical {
+                    &empty_hab  // bypass: re-evaluate all processes
+                } else {
+                    &habituated_pids
+                };
+
                 let decision = {
                     let mut qos = state.mach_qos.lock_recover();
                     let policy = PolicyContext {
@@ -3293,7 +3308,7 @@ fn main() -> anyhow::Result<()> {
                         behavior_interactive_pids: &behavior_interactive_pids,
                         ipc_hints:                 &ipc_hints,
                         hop_groups:                &lctx.outcome_tracker.hop_groups,
-                        habituated_pids:           &habituated_pids,
+                        habituated_pids:           effective_habituated,
                         causal_confidence:         &causal_confidence,
                     };
                     decision_stage.run(

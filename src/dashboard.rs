@@ -252,10 +252,15 @@ fn render_system(status: &DaemonStatus) -> Vec<String> {
     let swap_str = format_bytes(m.swap_used_bytes);
     let swap_ratio = (m.swap_used_bytes as f64 / (8.0 * 1_073_741_824.0)).min(1.0);
     let swap_bar = render_bar(swap_ratio, 20);
+    let swap_gb = m.swap_used_bytes as f64 / 1_073_741_824.0;
     let swap_label = if m.swap_delta_bps > 100.0 {
         "📈 Creciendo"
     } else if m.swap_delta_bps < -100.0 {
         "📉 Bajando"
+    } else if swap_gb >= 8.0 {
+        "🔴 Crítico"
+    } else if swap_gb >= 4.0 {
+        "🟠 Alto"
     } else {
         "🟢 Estable"
     };
