@@ -721,6 +721,14 @@ pub struct RuntimeMetrics {
     pub window_renderer_count: u32,
     #[serde(default)]
     pub window_freed_heavy_app: bool,
+    #[serde(default)]
+    pub window_tab_velocity_ema: f64,
+    #[serde(default)]
+    pub window_pressure_floor: f64,
+    #[serde(default)]
+    pub window_session_phase: String,
+    #[serde(default)]
+    pub window_workload_intent: String,
     // Rosetta AOT compilation
     #[serde(default)]
     pub rosetta_aot_active: bool,

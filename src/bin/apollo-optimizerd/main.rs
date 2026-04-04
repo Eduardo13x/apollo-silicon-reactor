@@ -1078,6 +1078,13 @@ fn main() -> anyhow::Result<()> {
             // Set to N when tabs close / heavy app terminates; decrements each cycle.
             // While > 0, reactor_weight is reduced (anticipate pressure drop).
             let mut window_relief_cycles: u32 = 0;
+            // Window session intelligence — updated each cycle by window_sensor.tick().
+            // Declared here so they're accessible in both the proc_snaps block and
+            // the reactor_weight section which runs after signal_digest computation.
+            use apollo_optimizer::engine::window_sensor::{SessionPhase, WorkloadIntent};
+            let mut win_session_phase = SessionPhase::ColdStart;
+            let mut win_workload_intent = WorkloadIntent::General;
+            let mut win_pressure_floor: f64 = 0.0;
             // Pending trial skill: (name, pressure_before). Recorded next cycle.
             // Restored from LearnedState so a trial started before a crash is still evaluated.
             let mut pending_trial_skill: Option<(String, f64)> = restored_trial_skill;
@@ -2505,6 +2512,10 @@ fn main() -> anyhow::Result<()> {
                     // Window/app lifecycle sensor — process diff for tab/app events.
                     // [Hellerstein 2004] Feed-forward: act on disturbance (tab close),
                     // don't wait for pressure to fall (feedback lag).
+                    // Window sensor: full delta with session intelligence.
+                    // [Pirolli & Card 1999] session phase | [Denning 1968] pressure floor
+                    // Window sensor: full delta with session intelligence.
+                    // [Pirolli & Card 1999] session phase | [Denning 1968] pressure floor
                     let (win_tab_delta, win_freed_heavy) = {
                         let fg_name = match fg_detector.detect() {
                             ForegroundState::App(ref a) => a.name.clone(),
@@ -2521,6 +2532,14 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.window_tab_delta = win.tab_delta;
                         metrics.metrics.window_renderer_count = win.renderer_count;
                         metrics.metrics.window_freed_heavy_app = win.freed_heavy_app;
+                        metrics.metrics.window_tab_velocity_ema = win.tab_velocity_ema;
+                        metrics.metrics.window_pressure_floor = win.pressure_floor_correction;
+                        metrics.metrics.window_session_phase = format!("{:?}", win.session_phase);
+                        metrics.metrics.window_workload_intent = format!("{:?}", win.workload_intent);
+                        // Lift to outer scope for reactor_weight section.
+                        win_session_phase = win.session_phase;
+                        win_workload_intent = win.workload_intent;
+                        win_pressure_floor = win.pressure_floor_correction;
                         (win.tab_delta, win.freed_heavy_app)
                     };
                     // Feed-forward relief: tabs closed or heavy app quit → RAM freed soon.
@@ -2801,6 +2820,22 @@ fn main() -> anyhow::Result<()> {
                 if window_relief_cycles > 0 {
                     reactor_weight = (reactor_weight - 0.25).max(0.0);
                     window_relief_cycles -= 1;
+                }
+
+                // Session phase feed-forward [Pirolli & Card 1999].
+                // Ramping = user is expanding session → expect pressure rise → pre-position.
+                // WindingDown = already handled by window_relief_cycles above.
+                if win_session_phase == SessionPhase::Ramping {
+                    reactor_weight = (reactor_weight + 0.15).min(1.0);
+                }
+
+                // Pressure floor correction [Denning 1968].
+                // If current pressure is largely "explained" by the browser's working set,
+                // dial back reactor aggressiveness. 13 tabs → floor=0.156: pressure of
+                // 0.65 is not an emergency — it's the expected baseline for this session.
+                let raw_pressure = snapshot.pressure.memory_pressure;
+                if win_pressure_floor > 0.08 && raw_pressure < win_pressure_floor + 0.15 {
+                    reactor_weight = (reactor_weight - win_pressure_floor * 0.5).max(0.0);
                 }
 
                 // Predictive agent: build context from existing signals and select intervention.
