@@ -630,9 +630,19 @@ impl OutcomeTracker {
     /// Use for immediate post-action evaluation; use `causal_effect()` for
     /// long-term validated assessment.
     ///
+    /// Falls back to `natural_drift_ema` when the short window is empty (i.e.,
+    /// during consecutive action cycles where the 3-cycle deque was cleared).
+    /// Without a fallback, `causal_effect_fast` would return `drop - 0 = drop`
+    /// (always positive), defeating its purpose of detecting drift-only successes.
+    ///
     /// Positive = action caused a drop beyond natural short-term drift.
     pub fn causal_effect_fast(&self, observed_drop: f64) -> f64 {
-        observed_drop - self.short_drift_velocity
+        let baseline = if self.short_window_deltas.is_empty() {
+            self.natural_drift_ema // fallback: use slow EMA when no fast data
+        } else {
+            self.short_drift_velocity
+        };
+        observed_drop - baseline
     }
 
     // ── HRPO: Dr. Zero group-level intelligence ──────────────────────────
@@ -1383,6 +1393,29 @@ mod tests {
         // Action taken — short window should reset
         tracker.observe_cycle(0.50, true);
         assert_eq!(tracker.pressure_velocity_short(), 0.0, "short drift should reset on action");
+    }
+
+    #[test]
+    fn causal_effect_fast_fallback_to_ema_when_window_empty() {
+        let mut tracker = OutcomeTracker::new();
+        // Build up natural_drift_ema: pressure drops 0.001 per cycle across 70 cycles.
+        // After DRIFT_WINDOW_TICKS=60 no-action cycles, EMA commits with positive drift.
+        let mut p = 0.90f64;
+        for _ in 0..70 {
+            tracker.observe_cycle(p, false);
+            p = (p - 0.001).max(0.0);
+        }
+        let drift = tracker.natural_drift();
+        assert!(drift > 0.0, "should have positive natural drift after 70 declining cycles (got {})", drift);
+        // Now act many times — short window clears each time
+        for _ in 0..5 {
+            tracker.observe_cycle(0.60, true);
+        }
+        assert!(tracker.short_window_deltas.is_empty(), "short window should be empty after actions");
+        // causal_effect_fast should use natural_drift_ema as fallback, not 0
+        let fast = tracker.causal_effect_fast(0.005);
+        let slow = tracker.causal_effect(0.005);
+        assert_eq!(fast, slow, "fast should fall back to slow EMA when window is empty");
     }
 
     #[test]
