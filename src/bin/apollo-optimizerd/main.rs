@@ -1085,6 +1085,10 @@ fn main() -> anyhow::Result<()> {
             let mut win_session_phase = SessionPhase::ColdStart;
             let mut win_workload_intent = WorkloadIntent::General;
             let mut win_pressure_floor: f64 = 0.0;
+            // Current hour/weekday for temporal headroom; updated each cycle
+            // inside the foreground block and reused in reactor_weight section.
+            let mut temporal_hour: u8 = 0;
+            let mut temporal_weekday: u8 = 0;
             // Pending trial skill: (name, pressure_before). Recorded next cycle.
             // Restored from LearnedState so a trial started before a crash is still evaluated.
             let mut pending_trial_skill: Option<(String, f64)> = restored_trial_skill;
@@ -1442,6 +1446,8 @@ fn main() -> anyhow::Result<()> {
                     let hour = now_chrono.hour() as u8;
                     let weekday =
                         chrono::Datelike::weekday(&now_chrono).num_days_from_monday() as u8;
+                    temporal_hour = hour;
+                    temporal_weekday = weekday;
                     let fg_changed = last_fg_name.as_deref() != Some(fg_name.as_str());
                     if fg_changed {
                         temporal_predictor.observe(fg_name, hour, weekday);
@@ -2870,6 +2876,16 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     WorkloadIntent::General => {}
+                }
+
+                // Temporal pre-positioning [Denning 1968 Working Set Model].
+                // If the user habitually launches a heavy-memory app (cargo, ollama,
+                // browser) around this time, pre-carve headroom now so the compressor
+                // doesn't spike when the app arrives.  headroom ∈ [0.0, 0.20].
+                let temporal_headroom =
+                    temporal_predictor.pressure_headroom_for_incoming(temporal_hour, temporal_weekday);
+                if temporal_headroom > 0.02 {
+                    reactor_weight = (reactor_weight + temporal_headroom).min(1.0);
                 }
 
                 // Predictive agent: build context from existing signals and select intervention.
