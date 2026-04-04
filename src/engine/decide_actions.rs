@@ -12,7 +12,7 @@ use crate::engine::types::{
     BlockerScore, InteractiveContext, LatencyTarget, OptimizationProfile, RootAction,
 };
 
-const INTERACTIVE_APPS: [&str; 9] = [
+const INTERACTIVE_APPS: [&str; 14] = [
     "Code",
     "Arc",
     "Google Chrome",
@@ -22,6 +22,13 @@ const INTERACTIVE_APPS: [&str; 9] = [
     "Antigravity",
     "Cursor",
     "LM Studio",
+    // Additional interactive apps — missing from original list, can get throttled
+    // to E-cores during active use before behavioral data populates behavior_interactive_pids.
+    "Safari",       // macOS default browser — most common interactive app
+    "Brave",        // CLAUDE.md invariant: never throttle during LLM/browsing use
+    "zoom.us",      // Video calls — frame timing as critical as display rendering
+    "Xcode",        // IDE — active compilation + UI interactions
+    "Claude",       // Claude desktop app (Electron) — user's primary workload
 ];
 
 const NOISE_APPS: [&str; 6] = [
