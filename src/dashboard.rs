@@ -83,13 +83,7 @@ fn box_empty() -> String {
 fn box_line(content: &str) -> String {
     let dw = display_width(content);
     let pad = CW.saturating_sub(dw);
-    // Pre-size: "║ " (2B) + content + spaces + " ║" (2B). Single alloc.
-    let mut s = String::with_capacity(4 + content.len() + pad);
-    s.push_str("║ ");
-    s.push_str(content);
-    for _ in 0..pad { s.push(' '); }
-    s.push_str(" ║");
-    s
+    format!("║ {}{} ║", content, " ".repeat(pad))
 }
 
 // ── Formatters ──
@@ -104,17 +98,16 @@ fn render_bar(ratio: f64, width: usize) -> String {
     let ratio = ratio.clamp(0.0, 1.0);
     let filled = (ratio * width as f64).round() as usize;
     let empty = width.saturating_sub(filled);
-    // Build directly into one String: [COLOR + fills + RESET + DIM + empties + RESET]
-    // 5 allocs → 1 alloc. [Rust API Guidelines C-COLLECT] prefer pre-alloc single pass.
-    let color = if ratio >= 0.85 { "\x1b[31m" } else if ratio >= 0.60 { "\x1b[33m" } else { "\x1b[32m" };
-    let mut bar = String::with_capacity(2 + 20 + 30); // brackets + fills + empties + codes
-    bar.push('[');
-    bar.push_str(color);
-    for _ in 0..filled { bar.push('█'); }
-    bar.push_str("\x1b[0m\x1b[2m");
-    for _ in 0..empty { bar.push('░'); }
-    bar.push_str("\x1b[0m]");
-    bar
+    let fill_str = "█".repeat(filled);
+    let empty_str = dim(&"░".repeat(empty));
+    let colored_fill = if ratio >= 0.85 {
+        red(&fill_str)
+    } else if ratio >= 0.60 {
+        yellow(&fill_str)
+    } else {
+        green(&fill_str)
+    };
+    format!("[{}{}]", colored_fill, empty_str)
 }
 
 /// Classify swap status for display. Pure function — testable in isolation.

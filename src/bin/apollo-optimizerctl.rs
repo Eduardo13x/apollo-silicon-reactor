@@ -203,148 +203,15 @@ fn send_request(req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
 }
 
 fn handle_dashboard() -> anyhow::Result<()> {
-    // Live TUI watch loop: re-renders in-place at ~4–10 Hz (100–250 ms cadence).
-    // Uses alternate screen buffer + cursor-home overwrite + differential line
-    // rendering to eliminate ALL visible flicker.
-    //
-    // [DEC VT220, xterm] \x1b[?1049h/l — alternate screen buffer (saves/restores
-    //   main screen including scrollback). Used by vim, less, btop, htop.
-    // [btop++ 2022] in-place cursor-home overwrite eliminates clear-screen flash.
-    // [Marcotte 2010] "Repainting Only What Changed" — differential TUI pattern.
-    use std::io::Write;
-    let stdout = std::io::stdout();
-
-    // Enter alternate screen + hide cursor. Together these produce the same
-    // "clean room" effect as every major TUI app: user's terminal is preserved
-    // and restored exactly on exit.
-    {
-        let mut lock = stdout.lock();
-        lock.write_all(b"\x1b[?1049h\x1b[?25l").ok(); // alt screen + hide cursor
-        lock.flush().ok();
-    }
-
-    // Restore on Ctrl-C: exit alt screen, show cursor, then quit.
-    ctrlc::set_handler(|| {
-        let mut out = std::io::stdout();
-        let _ = out.write_all(b"\x1b[?25h\x1b[?1049l"); // show cursor + leave alt screen
-        let _ = out.flush();
-        std::process::exit(0);
-    })
-    .ok();
-
-    // Probe first frame: check daemon is reachable before entering loop.
-    let first = send_raw(DaemonRequest::GetStatus)
+    let response = send_request(DaemonRequest::GetStatus)
         .context("No se pudo conectar al daemon. ¿Está corriendo apollo-optimizerd?")?;
-    let mut prev_frame: Vec<String> = Vec::new();
-    // Status hash: skip render entirely when daemon reports identical state.
-    // Uses a cheap XOR fold over the JSON bytes — not cryptographic, just change-detection.
-    // [Knuth 1997] "The Art of Computer Programming" §3.3 — hash for equality probe.
-    let mut prev_hash: u64 = 0;
-
-    let hash_status = |status: &apollo_optimizer::engine::types::DaemonStatus| -> u64 {
-        // Serialize to JSON and fold bytes with a Fowler-Noll-Vo-inspired XOR hash.
-        // Fast (< 10µs for ~2KB JSON), deterministic, zero-alloc on repeat calls.
-        let json = serde_json::to_string(status).unwrap_or_default();
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
-        for b in json.bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    match response {
+        DaemonResponse::Status(s) => {
+            print!("{}", dashboard::render_dashboard(&s));
+            Ok(())
         }
-        h
-    };
-
-    let render_one = |status: &apollo_optimizer::engine::types::DaemonStatus,
-                      prev: &mut Vec<String>,
-                      prev_h: &mut u64| {
-        let h = hash_status(status);
-        if h == *prev_h && !prev.is_empty() {
-            return; // Identical state — skip rendering entirely.
-        }
-        *prev_h = h;
-        let frame = dashboard::render_dashboard(status);
-        let new_lines: Vec<String> = frame.lines().map(|l| l.to_string()).collect();
-
-        // Build the entire output as a single string, then flush once.
-        // Single write = no tearing from partial flushes mid-render.
-        // [Unix write(2)] write() on a pipe/tty is atomic up to PIPE_BUF (4KB on Linux,
-        // unlimited on macOS for local sockets). Our box is ~70×60 = ~4200 bytes with
-        // ANSI codes — fits in one syscall on macOS. [POSIX.1-2017] §2.9.7.
-        let mut buf = String::with_capacity(8192);
-
-        // First frame or line count changed: full redraw from home.
-        if prev.is_empty() || prev.len() != new_lines.len() {
-            buf.push_str("\x1b[H");
-            for line in &new_lines {
-                buf.push_str(line);
-                buf.push_str("\x1b[K\r\n");
-            }
-            // If new frame is shorter than previous, erase the stale trailing rows.
-            // Without this, e.g. when a blocker disappears the old last line stays.
-            // \x1b[J erases from cursor to end-of-screen (ED sequence, VT100).
-            if prev.len() > new_lines.len() {
-                buf.push_str("\x1b[J");
-            }
-        } else {
-            // Differential: only rewrite lines that changed.
-            // \x1b[K after content ensures stale chars from longer old lines are cleared.
-            let mut changed = 0usize;
-            for (row, (new, old)) in new_lines.iter().zip(prev.iter()).enumerate() {
-                if new != old {
-                    buf.push_str(&format!("\x1b[{};1H{}\x1b[K", row + 1, new));
-                    changed += 1;
-                }
-            }
-            if changed == 0 {
-                // Nothing changed — skip the write entirely (zero CPU, zero flicker).
-                *prev = new_lines;
-                return;
-            }
-        }
-        use std::io::Write;
-        stdout.lock().write_all(buf.as_bytes()).ok();
-        stdout.lock().flush().ok();
-        *prev = new_lines;
-    };
-
-    // Render first frame. Alternate screen is already blank — just go to home.
-    if let DaemonResponse::Status(s) = first {
-        render_one(&s, &mut prev_frame, &mut prev_hash);
-    }
-
-    // Adaptive poll rate: accelerate when data is changing, relax when stable.
-    // [btop++ adaptive refresh] 100ms during active change, 250ms at steady state.
-    // Idle MacBook Air M1: daemon cycle ~30ms; typical data change rate ~1Hz.
-    let mut idle_ticks: u32 = 0;
-    loop {
-        // 100ms when recently active (idle_ticks < 4), 250ms when stable.
-        let poll_ms = if idle_ticks < 4 { 100 } else { 250 };
-        std::thread::sleep(std::time::Duration::from_millis(poll_ms));
-        match send_raw(DaemonRequest::GetStatus) {
-            Ok(DaemonResponse::Status(s)) => {
-                let old_hash = prev_hash;
-                render_one(&s, &mut prev_frame, &mut prev_hash);
-                if prev_hash != old_hash {
-                    idle_ticks = 0; // data changed — stay in fast mode
-                } else {
-                    idle_ticks = idle_ticks.saturating_add(1);
-                }
-            }
-            Ok(DaemonResponse::Error { message }) => {
-                use std::io::Write;
-                let msg = format!("\x1b[H\x1b[31mDaemon error: {}\x1b[0m\x1b[K", message);
-                stdout.lock().write_all(msg.as_bytes()).ok();
-                stdout.lock().flush().ok();
-                idle_ticks = idle_ticks.saturating_add(1);
-            }
-            Err(_) => {
-                use std::io::Write;
-                let msg = b"\x1b[H\x1b[33mWaiting for daemon...\x1b[0m\x1b[K";
-                stdout.lock().write_all(msg).ok();
-                stdout.lock().flush().ok();
-                idle_ticks = idle_ticks.saturating_add(1);
-            }
-            _ => {}
-        }
+        DaemonResponse::Error { message } => anyhow::bail!(message),
+        _ => anyhow::bail!("respuesta inesperada del daemon"),
     }
 }
 
