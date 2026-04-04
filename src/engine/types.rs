@@ -857,6 +857,43 @@ pub struct RuntimeMetrics {
     /// Yerkes-Dodson zone label: Idle/Calm/Optimal/Stressed/Crisis.
     #[serde(default)]
     pub arousal_zone: String,
+
+    // ── Telemetría enriched (2026-04-04) ────────────────────────────────────
+    /// SwapTrend from swap_predictor: "Decreasing" | "Stable" | "Increasing" | "Critical"
+    /// Previously computed but never exposed. Key leading indicator for display jank.
+    #[serde(default)]
+    pub swap_trend: String,
+    /// WindowServer CPU usage % — display compositor load. Rising = rendering pressure.
+    #[serde(default)]
+    pub windowserver_cpu_pct: f32,
+    /// Compression ratio: compressed_bytes / total_memory ∈ [0.0, 1.0].
+    /// Approaches 1.0 = compressor fully loaded, swap I/O imminent.
+    #[serde(default)]
+    pub compressed_memory_ratio: f64,
+    /// Sum of RSS (MB) of all currently frozen processes — RAM Apollo has reclaimed.
+    #[serde(default)]
+    pub frozen_ram_mb: f64,
+    /// Times the display pipeline boost fired this session (swap_delta >= 0.5 MB/s).
+    #[serde(default)]
+    pub display_boost_count: u64,
+    /// Consecutive cycles where memory_pressure > bg_pressure threshold.
+    /// 0 = currently below threshold. High = sustained pressure.
+    #[serde(default)]
+    pub cycles_high_pressure: u32,
+    /// Number of PIDs behaviorally classified as interactive (cpu_wall_ratio EMA < 0.05).
+    /// Shows how many processes were learned dynamically vs hardcoded list.
+    #[serde(default)]
+    pub behavior_interactive_pid_count: usize,
+    /// Current RL threshold as absolute value (bg_pressure + rl_adjustment).
+    /// More actionable than rl_adjustment_pp alone.
+    #[serde(default)]
+    pub rl_threshold_current: f64,
+    /// Which gate triggered the last freeze decision: "delta" | "committed" | "none".
+    #[serde(default)]
+    pub freeze_gate_last: String,
+    /// What triggered the last ML daemon throttle: "swap-early" | "pressure" | "none".
+    #[serde(default)]
+    pub ml_throttle_source: String,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.

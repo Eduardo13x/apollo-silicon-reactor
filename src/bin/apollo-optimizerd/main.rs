@@ -3346,6 +3346,7 @@ fn main() -> anyhow::Result<()> {
                 state.metrics.lock_recover().thermal_state = process_enrichment::context_to_thermal(decision.context);
 
                 // Propagar skips de OutcomeTracker a top_skipped_processes para observabilidad.
+                // También propagar los nuevos campos de observabilidad de DecisionOutput.
                 {
                     let mut metrics = state.metrics.lock_recover();
                     for name in &decision.low_value_skipped {
@@ -3354,6 +3355,17 @@ fn main() -> anyhow::Result<()> {
                         {
                             metrics.metrics.top_skipped_processes.push(name.clone());
                         }
+                    }
+                    // Enrich telemetría: display boost count + freeze gate + ml source.
+                    if decision.display_boosts_emitted > 0 {
+                        metrics.metrics.display_boost_count = metrics.metrics.display_boost_count
+                            .saturating_add(decision.display_boosts_emitted as u64);
+                    }
+                    if decision.freeze_gate != "none" {
+                        metrics.metrics.freeze_gate_last = decision.freeze_gate.clone();
+                    }
+                    if decision.ml_throttle_source != "none" {
+                        metrics.metrics.ml_throttle_source = decision.ml_throttle_source.clone();
                     }
                 }
 
@@ -5055,6 +5067,49 @@ fn main() -> anyhow::Result<()> {
                     Path::new(&timeline_path),
                     Path::new(&metrics_path),
                 );
+
+                // ── Enriched telemetry wiring (2026-04-04) ──────────────────────────────
+                // Fields added to RuntimeMetrics that can only be computed here in the
+                // main loop where swap_forecast, sys, and cycle state are in scope.
+                {
+                    let mut m = state.metrics.lock_recover();
+                    // SwapTrend — previously computed but never exposed.
+                    m.metrics.swap_trend = format!("{:?}", swap_forecast.swap_trend);
+                    // WindowServer CPU — display compositor load indicator.
+                    m.metrics.windowserver_cpu_pct = collector.system()
+                        .processes()
+                        .values()
+                        .find(|p| p.name() == "WindowServer")
+                        .map(|p| p.cpu_usage())
+                        .unwrap_or(0.0);
+                    // Compression ratio: compressed / total RAM ∈ [0, 1].
+                    let total_ram = collector.system().total_memory().max(1);
+                    let used_ram = collector.system().used_memory();
+                    let free_ram = collector.system().free_memory();
+                    let compressed = used_ram.saturating_sub(total_ram.saturating_sub(free_ram));
+                    m.metrics.compressed_memory_ratio =
+                        (compressed as f64 / total_ram as f64).clamp(0.0, 1.0);
+                    // Frozen RAM: sum of RSS of currently frozen PIDs.
+                    let sys = collector.system();
+                    let frozen_pids = state.frozen_state.lock_recover().clone();
+                    m.metrics.frozen_ram_mb = frozen_pids.iter()
+                        .filter_map(|(pid, _)| sys.process(sysinfo::Pid::from_u32(*pid)))
+                        .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
+                        .sum();
+                    // cycles_high_pressure — consecutive cycles above bg_pressure.
+                    let bg_threshold = overflow_thresholds.bg_pressure;
+                    if snapshot.pressure.memory_pressure > bg_threshold {
+                        m.metrics.cycles_high_pressure =
+                            m.metrics.cycles_high_pressure.saturating_add(1);
+                    } else {
+                        m.metrics.cycles_high_pressure = 0;
+                    }
+                    // behavior_interactive_pid_count — how many PIDs learned dynamically.
+                    m.metrics.behavior_interactive_pid_count = behavior_interactive_pids.len();
+                    // rl_threshold_current — absolute threshold (bg_pressure + rl_adj).
+                    m.metrics.rl_threshold_current =
+                        bg_threshold + m.metrics.rl_adjustment_pp as f64 / 100.0;
+                }
 
                 // ── Periodic stage: GC and observability (% 100 / % 500 / % 7200 gates) ──
                 // % 500 GC (experience compress, weight prune, skill GC) runs here.

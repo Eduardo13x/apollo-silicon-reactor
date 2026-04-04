@@ -266,15 +266,26 @@ fn render_system(status: &DaemonStatus) -> Vec<String> {
         pressure_label(mp)
     ));
 
-    // Swap
+    // Swap + SwapTrend
     let swap_str = format_bytes(m.swap_used_bytes);
     let swap_ratio = (m.swap_used_bytes as f64 / (8.0 * 1_073_741_824.0)).min(1.0);
     let swap_bar = render_bar(swap_ratio, 20);
     let swap_gb = m.swap_used_bytes as f64 / 1_073_741_824.0;
     let swap_label = swap_status_label(swap_gb, m.swap_delta_bps);
+    let trend_suffix = if !m.swap_trend.is_empty() && m.swap_trend != "Stable" {
+        let colored = match m.swap_trend.as_str() {
+            "Critical"   => red(&m.swap_trend),
+            "Increasing" => yellow(&m.swap_trend),
+            "Decreasing" => green(&m.swap_trend),
+            other        => dim(other),
+        };
+        format!(" [{}]", colored)
+    } else {
+        String::new()
+    };
     lines.push(format!(
-        "Swap   {}  {:>7}  {}",
-        swap_bar, swap_str, swap_label
+        "Swap   {}  {:>7}  {}{}",
+        swap_bar, swap_str, swap_label, trend_suffix
     ));
 
     // Temperature
@@ -295,6 +306,58 @@ fn render_system(status: &DaemonStatus) -> Vec<String> {
             thermal_emoji(&m.thermal_state),
             thermal_label(&m.thermal_state)
         ));
+    }
+
+    // Fluidity telemetry block — enriched display pipeline + memory observability
+    {
+        // WindowServer CPU — compositor load
+        if m.windowserver_cpu_pct > 0.5 {
+            let ws_color = if m.windowserver_cpu_pct > 30.0 {
+                yellow(&format!("{:.0}%", m.windowserver_cpu_pct))
+            } else {
+                format!("{:.0}%", m.windowserver_cpu_pct)
+            };
+            lines.push(format!("WindowServer CPU: {}", ws_color));
+        }
+        // Frozen RAM
+        if m.frozen_ram_mb > 0.0 {
+            lines.push(format!(
+                "Frozen RAM: {:.0} MB recovered ({} procs)",
+                m.frozen_ram_mb,
+                m.freezes_applied.saturating_sub(m.unfreezes_applied)
+            ));
+        }
+        // Display boost counter
+        if m.display_boost_count > 0 {
+            lines.push(format!(
+                "Display boost: {}× fired — behavior_interactive: {} PIDs",
+                m.display_boost_count, m.behavior_interactive_pid_count
+            ));
+        }
+        // Cycles at high pressure
+        if m.cycles_high_pressure > 0 {
+            let cyc_colored = if m.cycles_high_pressure >= 5 {
+                red(&format!("{}", m.cycles_high_pressure))
+            } else if m.cycles_high_pressure >= 2 {
+                yellow(&format!("{}", m.cycles_high_pressure))
+            } else {
+                format!("{}", m.cycles_high_pressure)
+            };
+            lines.push(format!(
+                "High-pressure streak: {} cycles  RL threshold: {:.2}",
+                cyc_colored, m.rl_threshold_current
+            ));
+        }
+        // ML throttle source + freeze gate
+        let ml_src = if m.ml_throttle_source.is_empty() { "none" } else { &m.ml_throttle_source };
+        let gate = if m.freeze_gate_last.is_empty() { "none" } else { &m.freeze_gate_last };
+        if ml_src != "none" || gate != "none" {
+            lines.push(format!(
+                "ML throttle: {}  Freeze gate: {}",
+                if ml_src == "swap-early" { yellow(ml_src) } else { ml_src.to_string() },
+                if gate != "none" { yellow(gate) } else { gate.to_string() }
+            ));
+        }
     }
 
     // Pressure score

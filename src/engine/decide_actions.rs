@@ -73,6 +73,12 @@ pub struct DecisionOutput {
     /// Procesos skipeados en esta decisión por ser low_value según OutcomeTracker.
     /// Aparecen en `metrics.top_skipped_processes` para observabilidad.
     pub low_value_skipped: Vec<String>,
+    /// Number of display pipeline BoostProcess actions emitted this cycle (iter 3b).
+    pub display_boosts_emitted: usize,
+    /// Which freeze gate fired this cycle: "delta" | "committed" | "none".
+    pub freeze_gate: String,
+    /// What triggered ML daemon throttle: "swap-early" | "pressure" | "none".
+    pub ml_throttle_source: String,
 }
 
 fn is_interactive_base(name: &str) -> bool {
@@ -254,6 +260,10 @@ pub fn decide_actions(
 
     let mut actions = Vec::new();
     let mut low_value_skipped: Vec<String> = Vec::new();
+    // Observability counters for enriched telemetry.
+    let mut display_boosts_emitted: usize = 0;
+    let mut freeze_gate = "none".to_string();
+    let mut ml_throttle_source = "none".to_string();
 
     // Dev-first: protect critical background workloads and their children.
     let critical_patterns = critical_background_processes();
@@ -468,6 +478,7 @@ pub fn decide_actions(
                 }
             }
             // Prepend so display boosts run before any throttle/freeze actions.
+            display_boosts_emitted = display_boosts.len();
             display_boosts.extend(actions.drain(..));
             actions = display_boosts;
         }
@@ -622,10 +633,16 @@ pub fn decide_actions(
     // [WWDC 2017 "Modernizing GCD Usage"; iOS background task throttling]
     let deferrable_swap_trigger =
         snapshot.pressure.swap_delta_bytes_per_sec / (1024.0 * 1024.0) >= 0.5;
-    if matches!(
+    let deferrable_pressure_trigger = matches!(
         context,
         InteractiveContext::BackgroundPressure | InteractiveContext::ThermalConstrained
-    ) || deferrable_swap_trigger {
+    );
+    if deferrable_pressure_trigger || deferrable_swap_trigger {
+        ml_throttle_source = if deferrable_swap_trigger && !deferrable_pressure_trigger {
+            "swap-early".to_string()
+        } else {
+            "pressure".to_string()
+        };
         for (pid, process) in sys.processes() {
             let name = process.name().to_string();
             if DEFERRABLE_DAEMONS.iter().any(|d| name.contains(d))
@@ -659,11 +676,12 @@ pub fn decide_actions(
             // On 8 GB M1, 1.0 GB swap = compressor already stressed; 1.5 GB = already stuttering.
             // [Dulloor 2016 "Data tiering in heterogeneous memory" EuroSys;
             //  macOS UCS compressor — compression triggers ~62% of physical RAM used]
-            let extreme_freeze_ok = (snapshot.pressure.memory_pressure
-                >= thresholds.extreme_pressure
-                && snapshot.pressure.swap_delta_bytes_per_sec > (2.0 * 1024.0 * 1024.0))
-                || (snapshot.pressure.memory_pressure >= 0.75 && swap_committed_gb >= 1.0);
+            let gate_a = snapshot.pressure.memory_pressure >= thresholds.extreme_pressure
+                && snapshot.pressure.swap_delta_bytes_per_sec > (2.0 * 1024.0 * 1024.0);
+            let gate_b = snapshot.pressure.memory_pressure >= 0.75 && swap_committed_gb >= 1.0;
+            let extreme_freeze_ok = gate_a || gate_b;
             if extreme_freeze_ok {
+                freeze_gate = if gate_a { "delta".to_string() } else { "committed".to_string() };
                 // RSS-rank selection: freeze/throttle the largest-RSS background
                 // processes first — maximum pressure relief per action.
                 // [Android LMK: terminate by OOM-adj score (RSS proxy);
@@ -739,6 +757,9 @@ pub fn decide_actions(
         blockers,
         actions,
         low_value_skipped,
+        display_boosts_emitted,
+        freeze_gate,
+        ml_throttle_source,
     }
 }
 #[cfg(test)]
@@ -1208,6 +1229,9 @@ mod tests {
             blockers: vec![],
             actions: vec![],
             low_value_skipped: vec![],
+            display_boosts_emitted: 0,
+            freeze_gate: "none".to_string(),
+            ml_throttle_source: "none".to_string(),
         };
         // Debug should not panic.
         let dbg = format!("{:?}", output);
@@ -1276,6 +1300,9 @@ mod tests {
                 reason: "testing".to_string(),
             }],
             low_value_skipped: vec!["skipped".to_string()],
+            display_boosts_emitted: 0,
+            freeze_gate: "none".to_string(),
+            ml_throttle_source: "none".to_string(),
         };
         let cloned = output.clone();
         assert_eq!(cloned.actions.len(), 1);
