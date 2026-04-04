@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
+use crate::engine::nars_belief::ArousalState;
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
 use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
 use crate::engine::overflow_guard::OverflowHistory;
@@ -89,6 +90,12 @@ pub struct LearnedState {
     /// Unified effectiveness scores per process.
     #[serde(default)]
     pub effectiveness_tracker: Option<HashMap<String, ProcessEffectiveness>>,
+
+    /// Global arousal EMA state — persisted so crisis context survives restarts.
+    /// Without this, the daemon starts cold (arousal=0.0) after a restart even
+    /// if the system was under heavy load. [Yerkes & Dodson 1908]
+    #[serde(default)]
+    pub arousal_state: Option<ArousalState>,
 }
 
 fn default_version() -> u32 {
@@ -117,6 +124,7 @@ impl LearnedState {
         effectiveness_tracker: &EffectivenessTracker,
         overflow_history: Option<OverflowHistory>,
         frozen_state: Option<FrozenStatePersisted>,
+        arousal_state: Option<ArousalState>,
     ) -> Self {
         Self {
             version: 1,
@@ -130,6 +138,7 @@ impl LearnedState {
             effectiveness_tracker: Some(effectiveness_tracker.snapshot()),
             overflow_guard_history: overflow_history,
             frozen_pids: frozen_state,
+            arousal_state,
         }
     }
 
@@ -149,7 +158,7 @@ impl LearnedState {
         specialist_accuracy: &mut SpecialistAccuracyTracker,
         skill_registry: &mut SkillRegistry,
         effectiveness_tracker: &mut EffectivenessTracker,
-    ) -> (Option<OverflowHistory>, Option<FrozenStatePersisted>) {
+    ) -> (Option<OverflowHistory>, Option<FrozenStatePersisted>, Option<ArousalState>) {
         self.validate();
         if let Some(si) = self.signal_intelligence {
             signal_intel.restore(si);
@@ -169,7 +178,7 @@ impl LearnedState {
         if let Some(eff) = self.effectiveness_tracker {
             effectiveness_tracker.restore_from_map(eff);
         }
-        (self.overflow_guard_history, self.frozen_pids)
+        (self.overflow_guard_history, self.frozen_pids, self.arousal_state)
     }
 
     // ── Self-improvement: called before persist ─────────────────────────
@@ -271,6 +280,7 @@ impl LearnedState {
         prev_generations: u32,
         last_quality: Option<f64>,
         pending_trial_skill: Option<(String, f64)>,
+        arousal_state: Option<ArousalState>,
     ) {
         let mut state = Self::collect(
             signal_intel,
@@ -280,6 +290,7 @@ impl LearnedState {
             effectiveness_tracker,
             overflow_history,
             frozen_state,
+            arousal_state,
         );
         state.persist_generations = prev_generations.saturating_add(1);
         state.last_restore_quality = last_quality;
@@ -459,6 +470,7 @@ mod tests {
             overflow_guard_history: None,
             frozen_pids: None,
             effectiveness_tracker: None,
+            arousal_state: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -482,6 +494,7 @@ mod tests {
             overflow_guard_history: None,
             frozen_pids: None,
             effectiveness_tracker: None,
+            arousal_state: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -503,6 +516,7 @@ mod tests {
             overflow_guard_history: None,
             frozen_pids: None,
             effectiveness_tracker: None,
+            arousal_state: None,
         };
         assert_eq!(
             state
@@ -539,6 +553,7 @@ mod tests {
             overflow_guard_history: None,
             frozen_pids: None,
             effectiveness_tracker: None,
+            arousal_state: None,
         };
         state.self_improve();
         assert_eq!(state.persist_generations, 6);
@@ -570,6 +585,7 @@ mod tests {
             overflow_guard_history: None,
             frozen_pids: None,
             effectiveness_tracker: None,
+            arousal_state: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -607,6 +623,7 @@ mod tests {
             overflow_guard_history: None,
             frozen_pids: None,
             effectiveness_tracker: None,
+            arousal_state: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();

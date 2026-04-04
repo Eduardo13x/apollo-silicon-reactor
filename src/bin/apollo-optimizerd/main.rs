@@ -919,6 +919,8 @@ fn main() -> anyhow::Result<()> {
             let mut restore_monitor = RestoreQualityMonitor::new();
             // Restored pending trial skill from the previous run (if daemon crashed mid-trial).
             let mut restored_trial_skill: Option<(String, f64)> = None;
+            // Restored arousal state — applied after arousal_state is declared below.
+            let mut restored_arousal: Option<apollo_optimizer::engine::nars_belief::ArousalState> = None;
             if let Some(learned) = LearnedState::load(ls_path) {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
@@ -926,15 +928,16 @@ fn main() -> anyhow::Result<()> {
                 // apply() restores skills from learned_state.json if present,
                 // overwriting the legacy optimization_skills.json load above.
                 // If skill_registry field is absent (old file), the legacy load is kept.
-                // Returns (overflow_history, frozen_pids) for components that need
-                // caller-side wiring.
-                let (ls_overflow_history, ls_frozen_pids) = learned.apply(
+                // Returns (overflow_history, frozen_pids, arousal_state) for
+                // components that need caller-side wiring.
+                let (ls_overflow_history, ls_frozen_pids, ls_arousal) = learned.apply(
                     &mut signal_intel,
                     &mut outcome_tracker,
                     &mut specialist_accuracy,
                     &mut skill_registry,
                     &mut effectiveness_tracker,
                 );
+                restored_arousal = ls_arousal;
                 // Restore overflow guard history from unified persistence.
                 // Migration: if learned_state has history, it takes precedence over
                 // the legacy overflow_history.json already loaded above.
@@ -1109,7 +1112,10 @@ fn main() -> anyhow::Result<()> {
             let mut prev_workload_mode: WorkloadMode = WorkloadMode::Idle;
             // Affective arousal EMA: global system-wide stress level ∈ [0,1].
             // Drives Yerkes-Dodson adaptive recalibration threshold in learning_tick.
-            let mut arousal_state = apollo_optimizer::engine::nars_belief::ArousalState::default();
+            // Restored from learned_state.json if available — preserves crisis context
+            // across restarts. [Yerkes & Dodson 1908]
+            let mut arousal_state = restored_arousal
+                .unwrap_or_else(apollo_optimizer::engine::nars_belief::ArousalState::default);
             // Spotlight pause state: true when Apollo has paused Spotlight indexing
             // via mdutil to relieve memory pressure.  Re-enabled when pressure normalizes.
             let mut spotlight_paused: bool = false;
@@ -5165,6 +5171,7 @@ fn main() -> anyhow::Result<()> {
                 persist_generations,
                 last_restore_quality,
                 None,
+                Some(arousal_state.clone()),
             );
 
             // Revert sysctls to defaults on shutdown.

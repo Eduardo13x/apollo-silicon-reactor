@@ -377,6 +377,7 @@ pub fn run_learning_tick<'a>(
             persist_generations,
             *last_restore_quality,
             pending_trial_skill,
+            Some(arousal_state.clone()),
         );
         // Causal graph observability: log solid/weak links discovered.
         let solid = lctx.causal_graph.solid_count();
