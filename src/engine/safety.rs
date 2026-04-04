@@ -39,6 +39,16 @@ pub fn protected_processes() -> HashSet<&'static str> {
         "mdworker_shared",
         "corespotlightd",
         "spotlightknowledged",
+        // Display & audio rendering pipeline — freezing any of these causes frame drops,
+        // animation jank, or audio glitches visible to the user. [WWDC 2021 "Tune CPU job
+        // scheduling with QoS"; Apple TN2169 SIP/process policy]
+        "Dock",            // Dock, Exposé, Mission Control animations
+        "coreaudiod",      // Real-time audio I/O loop — latency-critical
+        "mediaserverd",    // AVFoundation / CoreMedia pipeline
+        "displaypolicyd",  // Display power-state transitions — freeze → flicker
+        "runningboardd",   // Process lifecycle manager — freeze → broken app launches
+        "SystemUIServer",  // Menu bar / status bar rendering
+        "ControlCenter",   // Control center overlay rendering
     ]
     .into_iter()
     .collect()
