@@ -1106,6 +1106,11 @@ fn main() -> anyhow::Result<()> {
             // Context-switch burst detector (TDA-aware).
             let mut ctx_switch_times: VecDeque<Instant> = VecDeque::new();
             let mut last_fg_name: Option<String> = None;
+            // Cached user context assertion state — assertion signals are collected
+            // every N cycles (amortised); between polls, last-known values are carried
+            // forward to prevent the freeze gate from flickering on/off every cycle.
+            // [Cook et al. 2019] "Caching volatile state in reactive systems"
+            let mut last_user_assertions: (bool, bool, bool) = (false, false, false); // (sleep_assert, call, audio)
             // Track previous cycle's package_watts for RL power-reduction reward.
             let mut prev_package_watts: Option<f64> = None;
             // Track previous cycle's workload for onset detection (build-onset-proactive).
@@ -3311,8 +3316,20 @@ fn main() -> anyhow::Result<()> {
                 // [Riva & Mantovani 2014] idle time + media state = highest-signal context cues.
                 let user_context = {
                     use apollo_optimizer::engine::user_context::UserContext;
-                    let collect_assertions = cycle_count % 5 == 0;
+                    // Poll pmset every 3 cycles (~9s) — balances subprocess cost vs
+                    // responsiveness (call starts → detected within 9s, not 15s).
+                    let collect_assertions = cycle_count % 3 == 0;
                     let mut ctx = UserContext::collect(collect_assertions);
+                    // Merge: on non-assertion cycles, carry forward last known state.
+                    // Prevents freeze_gate from flickering between "user-protected" and
+                    // "delta/committed" every cycle. [Cook et al. 2019]
+                    if collect_assertions {
+                        last_user_assertions = (ctx.has_sleep_assertion, ctx.call_in_progress, ctx.audio_active);
+                    } else {
+                        ctx.has_sleep_assertion = last_user_assertions.0;
+                        ctx.call_in_progress = last_user_assertions.1;
+                        ctx.audio_active = last_user_assertions.2;
+                    }
                     // Merge cpu_temp from hw_snapshot (already in RuntimeMetrics).
                     // If P-cluster temp > 75°C, treat as if more active (raise pressure gate)
                     // so Apollo conserves thermal headroom for the user's workload.
