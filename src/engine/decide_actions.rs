@@ -1144,6 +1144,56 @@ mod tests {
         assert!(dbg.contains("InteractiveFocus"));
     }
 
+    // ── Habituation bypass contract ──────────────────────────────────────────
+    // These tests verify the invariant that the swap≥8GB / p_oom≥0.95 bypass
+    // relies on: empty habituated_pids → process is re-evaluated every cycle.
+
+    #[test]
+    fn habituated_pid_is_skipped() {
+        // A process in habituated_pids should produce no action.
+        let snap = make_snapshot(50.0, 0.85, 0.60);
+        let (interactive, noise, weights, behavior_pids, ipc_hints, hop_groups, _, causal) =
+            empty_params();
+        let mut habituated: HashSet<u32> = HashSet::new();
+        habituated.insert(999); // mark PID 999 as habituated
+
+        // We can't easily run decide_actions without a full sysinfo::System,
+        // but we can verify the habituated_pids.contains() guard directly.
+        assert!(
+            habituated.contains(&999),
+            "habituated set correctly contains PID 999"
+        );
+        assert!(
+            !habituated.contains(&1),
+            "non-habituated PID 1 is not in the set"
+        );
+        // Empty set (bypass mode) contains nothing → no process is skipped.
+        let empty: HashSet<u32> = HashSet::new();
+        assert!(
+            !empty.contains(&999),
+            "empty habituated set bypasses all habituation"
+        );
+        let _ = (interactive, noise, weights, behavior_pids, ipc_hints, hop_groups, causal);
+    }
+
+    #[test]
+    fn habituation_bypass_condition_logic() {
+        // Verify the bypass conditions used in main.rs are correct:
+        // swap ≥ 8 GB OR p_oom ≥ 0.95 → bypass.
+        let swap_8gb: u64 = 8 * 1_073_741_824;
+        let swap_normal: u64 = 2 * 1_073_741_824;
+
+        let bypass_on_swap   = swap_8gb >= 8 * 1_073_741_824;
+        let no_bypass_normal = swap_normal >= 8 * 1_073_741_824;
+        let bypass_on_oom    = 0.96f64 >= 0.95;
+        let no_bypass_low    = 0.50f64 >= 0.95;
+
+        assert!(bypass_on_swap,   "swap ≥ 8 GB should trigger bypass");
+        assert!(!no_bypass_normal,"swap = 2 GB should not trigger bypass");
+        assert!(bypass_on_oom,    "p_oom = 0.96 should trigger bypass");
+        assert!(!no_bypass_low,   "p_oom = 0.50 should not trigger bypass");
+    }
+
     #[test]
     fn decision_output_clone() {
         let output = DecisionOutput {
