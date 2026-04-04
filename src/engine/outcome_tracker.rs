@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::nars_belief::DriftDetector;
+use crate::engine::nars_belief::{DriftDetector, Salience};
 
 // ── Tipos públicos ────────────────────────────────────────────────────────────
 
@@ -59,6 +59,9 @@ struct PendingOutcome {
     pressure_before: f64,
     /// Watts estimados del proceso en el momento del throttle (para record_savings).
     watts_before: f64,
+    /// Swap usado en GB en el momento del throttle — para salience weighting.
+    /// 0.0 si no fue capturado (backward compatible).
+    swap_gb_at_throttle: f64,
 }
 
 /// Resumen de la resolución de un batch de outcomes.
@@ -366,6 +369,18 @@ impl OutcomeTracker {
 
     /// Registra un throttle aplicado. Llamar justo después de ejecutar la acción.
     pub fn record_throttle(&mut self, process_name: &str, pressure_before: f64, watts_before: f64) {
+        self.record_throttle_with_swap(process_name, pressure_before, watts_before, 0.0);
+    }
+
+    /// Registra un throttle con swap context para salience weighting.
+    /// `swap_gb` = swap usado en GB en el momento del throttle.
+    pub fn record_throttle_with_swap(
+        &mut self,
+        process_name: &str,
+        pressure_before: f64,
+        watts_before: f64,
+        swap_gb: f64,
+    ) {
         // Actualiza contador de throttles para el peso Bayesiano.
         let w = self.weights.entry(process_name.to_string()).or_default();
         w.throttle_count += 1;
@@ -375,6 +390,7 @@ impl OutcomeTracker {
             throttled_at: Instant::now(),
             pressure_before,
             watts_before,
+            swap_gb_at_throttle: swap_gb,
         });
 
         // Cap: si la cola crece demasiado, descarta los más viejos sin resolver.
@@ -421,9 +437,17 @@ impl OutcomeTracker {
                 }
             }
 
-            // NARS Revision: update drift belief for this process.
-            // Detects when a process's effectiveness profile has changed regime.
-            self.drift_detector.observe(&outcome.process_name, effective);
+            // NARS Revision with affective salience weighting.
+            // High-pressure / high-OOM events earn stronger belief updates and LTI.
+            // p_oom estimated from pressure_before (>0.70 → rising OOM risk).
+            let p_oom_est = ((outcome.pressure_before - 0.70) / 0.30).clamp(0.0, 1.0);
+            let salience = Salience::compute(
+                outcome.pressure_before,
+                pressure_drop,
+                p_oom_est,
+                outcome.swap_gb_at_throttle,
+            );
+            self.drift_detector.observe_salient(&outcome.process_name, effective, salience);
 
             // HRPO: update group-level effectiveness (Dr. Zero solver feedback).
             let hop = WorkloadHop::from_process_name(&outcome.process_name);
@@ -935,6 +959,7 @@ mod tests {
             throttled_at: Instant::now() - Duration::from_secs(31),
             pressure_before: 0.80,
             watts_before: 2.0,
+            swap_gb_at_throttle: 0.0,
         });
         // Also add throttle_count so weights exist.
         tracker.weights.insert(
@@ -962,6 +987,7 @@ mod tests {
             throttled_at: Instant::now() - Duration::from_secs(31),
             pressure_before: 0.80,
             watts_before: 2.0,
+            swap_gb_at_throttle: 0.0,
         });
         tracker.weights.insert(
             "Dropbox".to_string(),
@@ -1213,6 +1239,7 @@ mod tests {
             throttled_at: Instant::now() - Duration::from_secs(31),
             pressure_before: 0.75,
             watts_before: 1.0,
+            swap_gb_at_throttle: 0.0,
         });
         tracker.weights.insert("test_proc".into(), PatternWeight { throttle_count: 1, effective_count: 0 });
 
@@ -1486,6 +1513,7 @@ mod tests {
                 throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
                 pressure_before: 0.75,
                 watts_before: 5.0,
+                swap_gb_at_throttle: 0.0,
             });
         }
         // Use high current pressure so outcomes resolve as effective
@@ -1502,6 +1530,7 @@ mod tests {
                 throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
                 pressure_before: 0.70,
                 watts_before: 5.0,
+                swap_gb_at_throttle: 0.0,
             });
         }
         tracker.tick(0.70); // pressure stayed same → drop=0 → NOT effective
