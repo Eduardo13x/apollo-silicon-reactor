@@ -2902,12 +2902,12 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // Temporal pre-positioning [Denning 1968 Working Set Model].
-                // If the user habitually launches a heavy-memory app (cargo, ollama,
-                // browser) around this time, pre-carve headroom now so the compressor
-                // doesn't spike when the app arrives.  headroom ∈ [0.0, 0.20].
+                // Pre-carve headroom before predicted heavy app arrives.
+                // Skip when build is already active: BuildTracker handles the boost
+                // and adding temporal headroom on top would double-count the signal.
                 let temporal_headroom =
                     temporal_predictor.pressure_headroom_for_incoming(temporal_hour, temporal_weekday);
-                if temporal_headroom > 0.02 {
+                if temporal_headroom > 0.02 && !build_tracker.build_active {
                     reactor_weight = (reactor_weight + temporal_headroom).min(1.0);
                 }
 
