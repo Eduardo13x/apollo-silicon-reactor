@@ -298,6 +298,12 @@ pub struct OutcomeTracker {
     drift_accumulator: f64,
     /// Ticks since last action (for windowed drift measurement).
     ticks_since_action: u32,
+    /// Short-window (3-cycle) pressure deltas for fast causal attribution.
+    /// [Rubin 1974] Potential Outcomes framework: faster D-in-D for
+    /// detecting action effect vs. natural drift within ~1.5s at 2 Hz.
+    short_window_deltas: VecDeque<f64>,
+    /// Mean of the last 3 no-action pressure deltas (positive = dropping).
+    short_drift_velocity: f64,
     /// HRPO: per-group effectiveness tracking (Dr. Zero solver).
     pub hop_groups: HashMap<WorkloadHop, HopGroupWeight>,
 }
@@ -317,6 +323,8 @@ impl OutcomeTracker {
             prev_pressure: None,
             drift_accumulator: 0.0,
             ticks_since_action: 0,
+            short_window_deltas: VecDeque::with_capacity(3),
+            short_drift_velocity: 0.0,
             hop_groups: HashMap::new(),
         }
     }
@@ -567,6 +575,7 @@ impl OutcomeTracker {
 
         if let Some(prev) = self.prev_pressure {
             if !acted {
+                // Long-window drift: 60-tick EMA (~30s).
                 self.drift_accumulator += prev - pressure; // positive = pressure dropped
                 self.ticks_since_action += 1;
 
@@ -577,10 +586,21 @@ impl OutcomeTracker {
                     self.drift_accumulator = 0.0;
                     self.ticks_since_action = 0;
                 }
+
+                // Short-window velocity: 3-cycle mean delta (~1.5s at 2 Hz).
+                // Provides fast causal signal before the 60-tick EMA converges.
+                self.short_window_deltas.push_back(prev - pressure);
+                if self.short_window_deltas.len() > 3 {
+                    self.short_window_deltas.pop_front();
+                }
+                self.short_drift_velocity = self.short_window_deltas.iter().sum::<f64>()
+                    / self.short_window_deltas.len() as f64;
             } else {
-                // Action taken — reset drift window.
+                // Action taken — reset both drift windows.
                 self.drift_accumulator = 0.0;
                 self.ticks_since_action = 0;
+                self.short_window_deltas.clear();
+                self.short_drift_velocity = 0.0;
             }
         }
         self.prev_pressure = Some(pressure);
@@ -595,6 +615,24 @@ impl OutcomeTracker {
     /// Current estimate of natural pressure drift over 30s (no-action baseline).
     pub fn natural_drift(&self) -> f64 {
         self.natural_drift_ema
+    }
+
+    /// Short-window pressure velocity: mean of last 3 no-action deltas (~1.5s).
+    /// Positive = pressure dropping naturally; negative = rising.
+    ///
+    /// Paper: [Rubin 1974] Potential Outcomes framework — difference-in-differences
+    /// over a tight 3-cycle window for rapid causal isolation.
+    pub fn pressure_velocity_short(&self) -> f64 {
+        self.short_drift_velocity
+    }
+
+    /// Fast causal attribution using 3-cycle velocity instead of 60-tick EMA.
+    /// Use for immediate post-action evaluation; use `causal_effect()` for
+    /// long-term validated assessment.
+    ///
+    /// Positive = action caused a drop beyond natural short-term drift.
+    pub fn causal_effect_fast(&self, observed_drop: f64) -> f64 {
+        observed_drop - self.short_drift_velocity
     }
 
     // ── HRPO: Dr. Zero group-level intelligence ──────────────────────────
@@ -1321,5 +1359,45 @@ mod tests {
             tracker.is_causal_pair("Dropbox", "cloudd", 8).is_some(),
             "8 co-occurrences should meet the ≥8 gate"
         );
+    }
+
+    #[test]
+    fn short_window_velocity_tracks_natural_drop() {
+        let mut tracker = OutcomeTracker::new();
+        // Feed 4 non-action cycles with pressure dropping 0.10 each
+        tracker.observe_cycle(0.80, false);
+        tracker.observe_cycle(0.70, false);
+        tracker.observe_cycle(0.60, false);
+        tracker.observe_cycle(0.50, false);
+        // Short-window velocity should be ~0.10 (pressure dropping 0.10/cycle)
+        let v = tracker.pressure_velocity_short();
+        assert!(v > 0.05 && v < 0.15, "expected ~0.10 short-window velocity, got {}", v);
+    }
+
+    #[test]
+    fn short_window_resets_on_action() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.observe_cycle(0.80, false);
+        tracker.observe_cycle(0.70, false);
+        tracker.observe_cycle(0.60, false);
+        // Action taken — short window should reset
+        tracker.observe_cycle(0.50, true);
+        assert_eq!(tracker.pressure_velocity_short(), 0.0, "short drift should reset on action");
+    }
+
+    #[test]
+    fn causal_effect_fast_separates_action_from_drift() {
+        let mut tracker = OutcomeTracker::new();
+        // Establish a slow natural drift of ~0.02/cycle
+        tracker.observe_cycle(0.80, false);
+        tracker.observe_cycle(0.78, false);
+        tracker.observe_cycle(0.76, false);
+        tracker.observe_cycle(0.74, false);
+        // Now: if observed_drop = 0.15 but drift = 0.02, causal effect ≈ 0.13
+        let fast = tracker.causal_effect_fast(0.15);
+        assert!(fast > 0.0, "causal_effect_fast should be positive when action > drift");
+        // If observed_drop = 0.01 (less than drift), effect should be near zero or negative
+        let slow = tracker.causal_effect_fast(0.01);
+        assert!(slow < fast, "small drop should yield smaller causal effect than large drop");
     }
 }
