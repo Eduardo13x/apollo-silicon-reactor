@@ -236,14 +236,15 @@ fn handle_dashboard() -> anyhow::Result<()> {
         if prev.is_empty() || prev.len() != new_lines.len() {
             print!("\x1b[H");
             for line in &new_lines {
-                println!("{}", line);
+                // \x1b[K erases from cursor to end-of-line (handles shrinking content).
+                print!("{}\x1b[K\r\n", line);
             }
         } else {
             // Differential: only rewrite lines that changed.
+            // \x1b[K after content ensures stale chars from longer old lines are cleared.
             for (row, (new, old)) in new_lines.iter().zip(prev.iter()).enumerate() {
                 if new != old {
-                    // \x1b[{row};1H — move to row (1-indexed), column 1.
-                    print!("\x1b[{};1H{}", row + 1, new);
+                    print!("\x1b[{};1H{}\x1b[K", row + 1, new);
                 }
             }
         }
