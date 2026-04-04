@@ -3,6 +3,7 @@ pub mod activity_sensor;
 pub mod adaptive_governor;
 pub mod analytics;
 pub mod background_collectors;
+pub mod build_tracker;
 pub mod cache_warmer;
 pub mod capabilities;
 pub mod causal_graph;
