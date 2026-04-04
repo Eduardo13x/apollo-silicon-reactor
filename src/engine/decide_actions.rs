@@ -434,6 +434,38 @@ pub fn decide_actions(
         }
     }
 
+    // 3b) Display pipeline proactive boost — when swap starts growing, promote
+    // display-critical daemons to P-cores BEFORE throttling background processes.
+    // This prevents the display pipeline from losing P-core access during the
+    // scheduler rebalance that follows background E-core routing.
+    // [WWDC 2021 "Tune CPU job scheduling with QoS"; Anderson & Dahlin 2014 "OS Fundamentals"]
+    {
+        const DISPLAY_PIPELINE: &[&str] =
+            &["Dock", "coreaudiod", "mediaserverd", "SystemUIServer", "ControlCenter"];
+        let swap_delta_mb =
+            snapshot.pressure.swap_delta_bytes_per_sec / (1024.0 * 1024.0);
+        // Trigger when swap grows ≥ 0.5 MB/s — early pressure signal, not crisis.
+        if swap_delta_mb >= 0.5 {
+            let mut display_boosts: Vec<RootAction> = Vec::new();
+            for (pid, process) in sys.processes() {
+                let name = process.name().to_string();
+                if DISPLAY_PIPELINE.iter().any(|d| name.contains(d)) {
+                    display_boosts.push(RootAction::BoostProcess {
+                        pid: pid.as_u32(),
+                        name,
+                        reason: format!(
+                            "display pipeline — swap +{:.1} MB/s",
+                            swap_delta_mb
+                        ),
+                    });
+                }
+            }
+            // Prepend so display boosts run before any throttle/freeze actions.
+            display_boosts.extend(actions.drain(..));
+            actions = display_boosts;
+        }
+    }
+
     // 4) Phase 1: Thread-level scheduling for multi-threaded processes.
     // For non-interactive, non-critical processes using >15% CPU with multiple threads,
     // route hot threads to P-cores and cold threads to E-cores.

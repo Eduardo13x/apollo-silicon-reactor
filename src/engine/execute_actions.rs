@@ -241,7 +241,11 @@ pub fn execute_actions(
         let result: anyhow::Result<()> = (|| {
             match &action {
                 RootAction::BoostProcess { pid, name, .. } => {
-                    if *pid == my_pid || protected.iter().any(|p| name.contains(p)) {
+                    // Self-protection only — display-critical daemons (coreaudiod, Dock,
+                    // mediaserverd) are in protected_processes for freeze/throttle safety, but
+                    // must be BOOSTABLE. True OS-kernel processes (WindowServer, kernel_task)
+                    // fail gracefully via is_sip_protected() in set_tier().
+                    if *pid == my_pid || name.contains("apollo-optimizer") {
                         return Ok(());
                     }
                     // Validate PID identity (name-only for boost — no start-time available).
