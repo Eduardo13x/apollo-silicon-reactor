@@ -366,4 +366,53 @@ mod tests {
         map.prune_stale();
         assert_eq!(map.entries.len(), 1, "active entry should survive prune");
     }
+
+    #[test]
+    fn full_pipeline_warm_then_anomaly() {
+        // Simulate the full path:
+        // 1. Warm up process baseline (20 stable cycles)
+        // 2. Observe an anomalous cycle (disk burst)
+        // 3. Verify anomaly_score ≥ ANOMALY_THRESHOLD
+        // 4. Verify build_anomaly_hints would include this pid
+        use crate::engine::energy_pid::ProcessEnergyDelta;
+
+        let mut map = ProcessBaselineMap::new();
+
+        // Step 1: warm baseline on stable values
+        for _ in 0..20 {
+            map.observe("Spotlight", 1.5, 20.0, 0.1);
+        }
+        assert_eq!(map.warm_count(), 1, "Spotlight baseline should be warm");
+
+        // Step 2: normal reading — no anomaly
+        let normal_score = map.anomaly_score("Spotlight", 1.5, 20.0, 0.1);
+        assert!(normal_score < ANOMALY_THRESHOLD, "normal reading should not trigger anomaly");
+
+        // Step 3: disk burst — Spotlight suddenly indexing heavy content
+        let burst_score = map.anomaly_score("Spotlight", 1.5, 20.0, 80.0);
+        assert!(burst_score >= ANOMALY_THRESHOLD,
+            "disk burst should trigger anomaly, got {}", burst_score);
+
+        // Step 4: build_anomaly_hints filters correctly
+        let results = vec![
+            ProcessEnergyDelta {
+                pid: 42,
+                name: "Spotlight".into(),
+                delta_nj: 0,
+                power_mw: 0.0,
+                ipc: 1.5,
+                wakeup_rate: 20.0,
+                phys_footprint_mb: 100.0,
+                disk_write_mbps: 80.0,
+                anomaly_score: burst_score,
+            },
+        ];
+        // Simulated anomaly_hints build (same logic as main.rs)
+        let hints: std::collections::HashMap<u32, f64> = results.iter()
+            .filter(|r| r.anomaly_score >= ANOMALY_THRESHOLD)
+            .map(|r| (r.pid, r.anomaly_score))
+            .collect();
+        assert!(hints.contains_key(&42), "Spotlight should appear in anomaly_hints");
+        assert!(hints[&42] >= ANOMALY_THRESHOLD);
+    }
 }
