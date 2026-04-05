@@ -16,10 +16,11 @@
 //! - Pearl (2009) "Causality: Models, Reasoning and Inference"
 //! - memoria-core causal_inference.rs (constraint-based inference)
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// A causal edge: action X caused outcome Y with measured confidence.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CausalEdge {
     /// Cause (e.g., "throttle:Safari", "freeze:Dropbox").
     pub cause: String,
@@ -51,7 +52,7 @@ pub struct CausalEdge {
 /// Tracks WHICH resource changed when an action was effective.
 /// Answers "WHY did throttling X reduce pressure?" — was it RSS release,
 /// CPU reduction, or swap avoidance?
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MechanismAttribution {
     /// EMA of RSS delta (MB) when action was effective. Positive = RSS freed.
     pub rss_delta_mb: f32,
@@ -422,6 +423,27 @@ impl CausalGraph {
             .values()
             .filter(|e| (e.slow_confidence - 0.5).abs() > 0.01)
             .count()
+    }
+
+    /// Snapshot edges for persistence. Only persists edges with ≥ 3 evidence
+    /// (skip noise from very early observations).
+    pub fn to_persisted(&self) -> Vec<((String, String), CausalEdge)> {
+        self.edges
+            .iter()
+            .filter(|(_, e)| e.evidence_count >= 3)
+            .map(|(k, e)| (k.clone(), e.clone()))
+            .collect()
+    }
+
+    /// Restore edges from persisted snapshot. Merges with any existing edges.
+    pub fn restore(&mut self, persisted: Vec<((String, String), CausalEdge)>) {
+        for (key, edge) in persisted {
+            // Only restore if we don't already have fresher data.
+            let entry = self.edges.entry(key).or_insert_with(|| edge.clone());
+            if entry.evidence_count < edge.evidence_count {
+                *entry = edge;
+            }
+        }
     }
 
     /// Count of edges with mechanism attribution data.

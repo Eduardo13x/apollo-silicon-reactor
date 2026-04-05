@@ -936,6 +936,7 @@ fn main() -> anyhow::Result<()> {
                     &mut specialist_accuracy,
                     &mut skill_registry,
                     &mut effectiveness_tracker,
+                    Some(&mut causal_graph),
                 );
                 restored_arousal = ls_arousal;
                 // Restore overflow guard history from unified persistence.
@@ -5295,6 +5296,7 @@ fn main() -> anyhow::Result<()> {
                 last_restore_quality,
                 None,
                 Some(arousal_state.clone()),
+                Some(&causal_graph),
             );
 
             // Revert sysctls to defaults on shutdown.

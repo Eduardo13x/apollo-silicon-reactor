@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
+use crate::engine::causal_graph::{CausalEdge, CausalGraph};
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
 use crate::engine::nars_belief::ArousalState;
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
@@ -96,6 +97,13 @@ pub struct LearnedState {
     /// if the system was under heavy load. [Yerkes & Dodson 1908]
     #[serde(default)]
     pub arousal_state: Option<ArousalState>,
+
+    /// Causal graph edges — persisted so learned causal relationships (confidence,
+    /// mechanism attribution, slow-horizon data) survive daemon restarts.
+    /// Without this, Apollo restarts with no causal knowledge and wastes cycles
+    /// re-learning which throttles are effective. [Pearl 2009]
+    #[serde(default)]
+    pub causal_graph_edges: Option<Vec<((String, String), CausalEdge)>>,
 }
 
 fn default_version() -> u32 {
@@ -125,6 +133,7 @@ impl LearnedState {
         overflow_history: Option<OverflowHistory>,
         frozen_state: Option<FrozenStatePersisted>,
         arousal_state: Option<ArousalState>,
+        causal_graph: Option<&CausalGraph>,
     ) -> Self {
         Self {
             version: 1,
@@ -139,6 +148,7 @@ impl LearnedState {
             overflow_guard_history: overflow_history,
             frozen_pids: frozen_state,
             arousal_state,
+            causal_graph_edges: causal_graph.map(|cg| cg.to_persisted()),
         }
     }
 
@@ -158,6 +168,7 @@ impl LearnedState {
         specialist_accuracy: &mut SpecialistAccuracyTracker,
         skill_registry: &mut SkillRegistry,
         effectiveness_tracker: &mut EffectivenessTracker,
+        causal_graph: Option<&mut CausalGraph>,
     ) -> (Option<OverflowHistory>, Option<FrozenStatePersisted>, Option<ArousalState>) {
         self.validate();
         if let Some(si) = self.signal_intelligence {
@@ -177,6 +188,11 @@ impl LearnedState {
         }
         if let Some(eff) = self.effectiveness_tracker {
             effectiveness_tracker.restore_from_map(eff);
+        }
+        if let Some(edges) = self.causal_graph_edges {
+            if let Some(cg) = causal_graph {
+                cg.restore(edges);
+            }
         }
         (self.overflow_guard_history, self.frozen_pids, self.arousal_state)
     }
@@ -281,6 +297,7 @@ impl LearnedState {
         last_quality: Option<f64>,
         pending_trial_skill: Option<(String, f64)>,
         arousal_state: Option<ArousalState>,
+        causal_graph: Option<&CausalGraph>,
     ) {
         let mut state = Self::collect(
             signal_intel,
@@ -291,6 +308,7 @@ impl LearnedState {
             overflow_history,
             frozen_state,
             arousal_state,
+            causal_graph,
         );
         state.persist_generations = prev_generations.saturating_add(1);
         state.last_restore_quality = last_quality;
@@ -471,6 +489,7 @@ mod tests {
             frozen_pids: None,
             effectiveness_tracker: None,
             arousal_state: None,
+            causal_graph_edges: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -495,6 +514,7 @@ mod tests {
             frozen_pids: None,
             effectiveness_tracker: None,
             arousal_state: None,
+            causal_graph_edges: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -517,6 +537,7 @@ mod tests {
             frozen_pids: None,
             effectiveness_tracker: None,
             arousal_state: None,
+            causal_graph_edges: None,
         };
         assert_eq!(
             state
@@ -554,6 +575,7 @@ mod tests {
             frozen_pids: None,
             effectiveness_tracker: None,
             arousal_state: None,
+            causal_graph_edges: None,
         };
         state.self_improve();
         assert_eq!(state.persist_generations, 6);
@@ -586,6 +608,7 @@ mod tests {
             frozen_pids: None,
             effectiveness_tracker: None,
             arousal_state: None,
+            causal_graph_edges: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -624,6 +647,7 @@ mod tests {
             frozen_pids: None,
             effectiveness_tracker: None,
             arousal_state: None,
+            causal_graph_edges: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
