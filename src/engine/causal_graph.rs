@@ -432,6 +432,62 @@ impl CausalGraph {
             .count()
     }
 
+    /// Co-occurrence cluster boosting: if process B co-occurs with solid process A
+    /// (confidence > 0.70) ≥ 5 times, and B's own confidence is below skip threshold,
+    /// boost B's confidence to the cluster average. [Pearl 2009] Ch.2: confounding —
+    /// processes that always appear together share causal structure.
+    pub fn apply_cluster_boost(
+        &self,
+        map: &mut HashMap<String, f32>,
+        co_occurrence: &[(String, String, u32)],
+    ) {
+        // Build a set of solid action keys for fast lookup.
+        let solid_keys: std::collections::HashSet<&str> = map
+            .iter()
+            .filter(|(_, &conf)| conf > 0.70)
+            .map(|(k, _)| k.as_str())
+            .collect();
+
+        let mut boosts: Vec<(String, f32)> = Vec::new();
+
+        for (a, b, count) in co_occurrence {
+            if *count < 5 {
+                continue;
+            }
+            let key_a = format!("throttle:{}", a);
+            let key_b = format!("throttle:{}", b);
+
+            let a_is_solid = solid_keys.contains(key_a.as_str());
+            let b_is_solid = solid_keys.contains(key_b.as_str());
+
+            // If A is solid and B is cold/weak, boost B.
+            if a_is_solid {
+                let b_conf = map.get(&key_b).copied().unwrap_or(0.5);
+                if b_conf < 0.30 {
+                    let a_conf = map[&key_a];
+                    let boost = ((a_conf + b_conf) / 2.0).min(0.50);
+                    boosts.push((key_b.clone(), boost));
+                }
+            }
+            // Symmetric: if B is solid and A is cold/weak, boost A.
+            if b_is_solid {
+                let a_conf = map.get(&key_a).copied().unwrap_or(0.5);
+                if a_conf < 0.30 {
+                    let b_conf = map.get(&key_b).copied().unwrap_or(0.5);
+                    let boost = ((b_conf + a_conf) / 2.0).min(0.50);
+                    boosts.push((key_a.clone(), boost));
+                }
+            }
+        }
+
+        for (key, boosted_conf) in boosts {
+            let entry = map.entry(key).or_insert(0.5);
+            if *entry < boosted_conf {
+                *entry = boosted_conf;
+            }
+        }
+    }
+
     /// Experience-informed confidence: for processes with insufficient causal data
     /// (< 5 observations), fall back to experience memory as a Bayesian prior.
     /// [Kahneman & Tversky 1973] Availability heuristic: similar past episodes

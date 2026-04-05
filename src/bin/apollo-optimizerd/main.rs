@@ -3311,10 +3311,18 @@ fn main() -> anyhow::Result<()> {
                 // Cold processes (< 5 observations) get warm-start priors from
                 // similar past episodes, preventing the causal skip filter from
                 // requiring 5 wasteful throttles before it can make a judgment.
-                let causal_confidence = lctx.causal_graph.confidence_map_with_experience(
+                let mut causal_confidence = lctx.causal_graph.confidence_map_with_experience(
                     &lctx.outcome_tracker.experience,
                     snapshot.pressure.memory_pressure,
                 );
+                // [Pearl 2009 Ch.2] Co-occurrence cluster boost: if B always appears
+                // with solid A during pressure events, B gets a confidence boost.
+                let co_pairs: Vec<(String, String, u32)> = lctx.outcome_tracker
+                    .top_causal_pairs(20)
+                    .into_iter()
+                    .map(|(a, b, c)| (a.to_string(), b.to_string(), c))
+                    .collect();
+                lctx.causal_graph.apply_cluster_boost(&mut causal_confidence, &co_pairs);
 
                 // ── User context: "telepathy" — what is the user doing right now? ──
                 // idle_secs from IOHIDSystem HIDIdleTime — fast ioreg call, safe every cycle.
