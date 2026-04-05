@@ -707,6 +707,11 @@ pub struct RuntimeMetrics {
     // KPC hardware performance counters
     #[serde(default)]
     pub kpc_ipc: f64,
+    /// Fraction of CPU cycles stalled on memory (0.0=compute-bound, 1.0=memory-stalled).
+    /// Derived from KPC IPC vs Apple M1 P-core peak IPC (~5.0).
+    /// >0.7 = system >70% memory-bound → freeze decisions are lower risk.
+    #[serde(default)]
+    pub kpc_memory_bound_score: f64,
     // Cache contention detection (ContentionDetector)
     #[serde(default)]
     pub contention_score: f64,

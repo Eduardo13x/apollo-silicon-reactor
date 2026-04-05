@@ -2490,6 +2490,9 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.kpc_ipc = kpc.ipc;
                         lctx.signal_intel.set_kpc_ipc(kpc.ipc);
                         lctx.signal_intel.set_kpc_trend(kpc.ipc_trend);
+                        // memory_bound_score: fraction of CPU cycles stalled on memory.
+                        // >0.7 = system >70% memory-bound → aggressive freeze safe.
+                        metrics.metrics.kpc_memory_bound_score = kpc.memory_bound_score;
                     }
 
                     // Cache contention detection + cluster separation (Phase 3)
