@@ -254,4 +254,72 @@ mod tests {
         let p = model.probability_oom(&features, 300.0);
         assert!(p >= 0.0 && p <= 1.0, "P should be in [0,1], got {}", p);
     }
+
+    /// Hazard must be monotonically increasing with pressure (all else equal).
+    /// [Cox 1972] proportional hazards: higher risk features → higher hazard.
+    #[test]
+    fn test_monotonic_with_pressure() {
+        let mut model = HazardModel::new();
+        let pressures = [0.1, 0.3, 0.5, 0.7, 0.9];
+        let mut prev_p = 0.0;
+        for &pr in &pressures {
+            let feat = HazardModel::risk_features(pr, 0.02, pr * 0.5, pr * 0.5);
+            let p = model.probability_oom(&feat, 30.0);
+            assert!(p >= prev_p, "P(OOM) not monotonic: p={}, pr={}, prev={}", p, pr, prev_p);
+            prev_p = p;
+        }
+    }
+
+    /// Zero-horizon must give zero probability (no time to fail).
+    #[test]
+    fn test_zero_horizon_zero_probability() {
+        let mut model = HazardModel::new();
+        let feat = HazardModel::risk_features(0.9, 0.1, 0.8, 0.8);
+        let p = model.probability_oom(&feat, 0.0);
+        assert!(p.abs() < 1e-10, "zero horizon should give ~zero P(OOM), got {}", p);
+    }
+
+    /// Beta weights must stay bounded [0, 5] even after many events.
+    #[test]
+    fn test_beta_bounded_after_many_events() {
+        let mut model = HazardModel::new();
+        // Record 100 events with extreme features.
+        for _ in 0..100 {
+            let feat = HazardModel::risk_features(1.0, 0.1, 1.0, 1.0);
+            model.record_event(&feat, 0.1);
+        }
+        for &b in &model.beta_weights() {
+            assert!(b >= 0.0 && b <= 5.0, "beta {} out of bounds [0,5]", b);
+        }
+    }
+
+    /// risk_features must clamp inputs to [0, 1] for normalized features.
+    #[test]
+    fn test_risk_features_clamps_out_of_range() {
+        let feat = HazardModel::risk_features(-0.5, -1.0, 2.0, 1.5);
+        assert_eq!(feat[0], 0.0, "negative pressure should clamp to 0");
+        assert_eq!(feat[1], 0.0, "negative velocity should clamp to 0");
+        assert_eq!(feat[2], 1.0, "swap > 1.0 should clamp to 1.0");
+        assert_eq!(feat[3], 1.0, "compressor > 1.0 should clamp to 1.0");
+    }
+
+    /// Serde roundtrip must preserve all model state (for persistence).
+    #[test]
+    fn test_serde_roundtrip() {
+        let mut model = HazardModel::new();
+        let feat = HazardModel::risk_features(0.8, 0.05, 0.5, 0.6);
+        model.record_event(&feat, 3.0);
+        model.tick_no_event(7200.0);
+
+        let json = serde_json::to_string(&model).unwrap();
+        let restored: HazardModel = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(model.total_events, restored.total_events);
+        assert!((model.total_hours - restored.total_hours).abs() < 1e-10);
+        assert!((model.base_rate - restored.base_rate).abs() < 1e-15);
+        for i in 0..N_RISK {
+            assert!((model.beta[i] - restored.beta[i]).abs() < 1e-15,
+                "beta[{}] diverged: {} vs {}", i, model.beta[i], restored.beta[i]);
+        }
+    }
 }

@@ -266,4 +266,68 @@ mod tests {
         );
         assert!((c48 - 1.0).abs() < 0.01, "48h should reach full confidence");
     }
+
+    /// Trend must be bounded to ±0.1 even with extreme inputs.
+    /// [Holt 1957] damped trend prevents extrapolation explosion.
+    #[test]
+    fn trend_bounded_under_extreme_jumps() {
+        let mut hw = HoltWinters::new();
+        hw.observe(0, 0.10);
+        hw.observe(1, 0.99);
+        hw.observe(2, 0.10);
+        hw.observe(3, 0.99);
+        assert!(
+            hw.trend().abs() <= 0.10,
+            "trend {} must be bounded to ±0.10",
+            hw.trend()
+        );
+    }
+
+    /// Seasonal factors must stay in [0.5, 2.0] to prevent multiplicative explosion.
+    #[test]
+    fn seasonal_factors_bounded() {
+        let mut hw = HoltWinters::new();
+        // Extreme: one hour is always 0.01, another always 0.99.
+        for _ in 0..10 {
+            hw.observe(8, 0.01);
+            hw.observe(20, 0.99);
+        }
+        for h in 0..24u8 {
+            let s = hw.seasonal_factor(h);
+            assert!(s >= 0.5 && s <= 2.0,
+                "seasonal[{}]={} must be in [0.5, 2.0]", h, s);
+        }
+    }
+
+    /// Forecast must be clamped to [0, 1] regardless of model state.
+    #[test]
+    fn forecast_clamped_to_valid_range() {
+        let mut hw = HoltWinters::new();
+        // Feed high-trending data.
+        for h in 0..24u8 {
+            hw.observe(h, 0.95);
+        }
+        // Forecast far ahead — trend + seasonal could push above 1.0.
+        for hours_ahead in 0..24u8 {
+            let (f, _) = hw.forecast(12, hours_ahead);
+            assert!(f >= 0.0 && f <= 1.0,
+                "forecast({})={} out of [0,1]", hours_ahead, f);
+        }
+    }
+
+    /// Serde roundtrip must preserve model state for persistence.
+    #[test]
+    fn serde_roundtrip() {
+        let mut hw = HoltWinters::new();
+        for h in 0..48u8 {
+            hw.observe(h % 24, 0.50 + (h as f64 % 5.0) * 0.02);
+        }
+        let json = serde_json::to_string(hw.state()).unwrap();
+        let restored: HoltWintersState = serde_json::from_str(&json).unwrap();
+        let hw2 = HoltWinters::from_persisted(restored);
+
+        assert!((hw.level() - hw2.level()).abs() < 1e-10);
+        assert!((hw.trend() - hw2.trend()).abs() < 1e-10);
+        assert_eq!(hw.observations(), hw2.observations());
+    }
 }
