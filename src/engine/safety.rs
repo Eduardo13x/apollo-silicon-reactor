@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use crate::engine::types::{ActionBudgetState, RootAction, SafetyPolicy};
 
@@ -54,6 +55,16 @@ pub fn protected_processes() -> HashSet<&'static str> {
     .collect()
 }
 
+/// Fast membership test against the hard-protected set (hot-path safe).
+/// Uses `OnceLock` to initialise once and share across all subsequent calls,
+/// avoiding the ~300 HashSet allocations per cycle that `protected_processes()`
+/// would otherwise produce when called inside process-enumeration loops.
+/// [GoF 1994] Flyweight pattern — share expensive read-only objects.
+fn is_hard_protected(name: &str) -> bool {
+    static CACHE: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    CACHE.get_or_init(protected_processes).contains(name)
+}
+
 /// Returns true if a process should be treated as a user-interactive app
 /// — i.e. protection is foreground-conditional rather than unconditional.
 ///
@@ -71,7 +82,7 @@ pub fn is_user_interactive_app(
     name: &str,
 ) -> bool {
     // System daemons never qualify regardless of heuristics.
-    if protected_processes().contains(name) {
+    if is_hard_protected(name) {
         return false;
     }
     // Must have a GUI window — headless daemons are not user apps.
