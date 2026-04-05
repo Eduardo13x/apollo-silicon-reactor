@@ -3323,6 +3323,12 @@ fn main() -> anyhow::Result<()> {
                     .map(|(a, b, c)| (a.to_string(), b.to_string(), c))
                     .collect();
                 lctx.causal_graph.apply_cluster_boost(&mut causal_confidence, &co_pairs);
+                // [Pei Wang 2013] NARS × Causal: discount confidence for drifted beliefs.
+                // Unstable NARS beliefs (low confidence) → causal relationship may be stale.
+                CausalGraph::apply_nars_discount(
+                    &mut causal_confidence,
+                    &lctx.outcome_tracker.drift_detector,
+                );
 
                 // ── User context: "telepathy" — what is the user doing right now? ──
                 // idle_secs from IOHIDSystem HIDIdleTime — fast ioreg call, safe every cycle.

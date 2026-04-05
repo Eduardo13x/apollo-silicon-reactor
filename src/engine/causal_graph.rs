@@ -488,6 +488,30 @@ impl CausalGraph {
         }
     }
 
+    /// NARS × Causal fusion: discount causal confidence by NARS belief stability.
+    /// When concept drift is detected for a process (NARS confidence < 0.30 or
+    /// frequency changed > 20pp), the learned causal relationship may no longer hold.
+    /// Discount the causal confidence proportionally.
+    /// [Pei Wang 2013] NARS §3.3.3 — stale beliefs should reduce decision weight.
+    pub fn apply_nars_discount(
+        map: &mut HashMap<String, f32>,
+        drift_detector: &crate::engine::nars_belief::DriftDetector,
+    ) {
+        for (key, conf) in map.iter_mut() {
+            // Extract process name from "throttle:ProcessName".
+            let process_name = key.strip_prefix("throttle:").unwrap_or(key);
+            if let Some(tv) = drift_detector.belief(process_name) {
+                // Low NARS confidence = belief has been revised many times recently
+                // (unstable). Discount causal confidence proportionally.
+                // NARS conf 0.50+ → no discount. NARS conf < 0.30 → 40% discount.
+                if tv.confidence < 0.50 {
+                    let discount = 0.6 + 0.8 * tv.confidence; // 0.6..1.0
+                    *conf *= discount;
+                }
+            }
+        }
+    }
+
     /// Experience-informed confidence: for processes with insufficient causal data
     /// (< 5 observations), fall back to experience memory as a Bayesian prior.
     /// [Kahneman & Tversky 1973] Availability heuristic: similar past episodes
