@@ -1262,4 +1262,65 @@ mod tests {
             delta
         );
     }
+
+    // ── PID integral tests ──────────────────────────────────────────────────
+
+    /// PID integral should accumulate when pressure is above target (0.65)
+    /// and should be bounded to prevent integral windup.
+    /// [Hellerstein 2004] "Feedback Control" §9: leaky integrator prevents windup.
+    #[test]
+    fn test_pid_integral_accumulates_above_target() {
+        let mut si = SignalIntelligence::new();
+        // Feed high pressure (above PID target of 0.65).
+        for _ in 0..50 {
+            tick_stressed(&mut si, 0.85);
+        }
+        // Integral should be positive (pressure above target).
+        let d = tick_stressed(&mut si, 0.85);
+        assert!(
+            d.pressure_integral > 0.0,
+            "integral={} should be positive when pressure > target",
+            d.pressure_integral
+        );
+    }
+
+    /// PID integral must be bounded to [-5, 5] pressure-seconds.
+    #[test]
+    fn test_pid_integral_bounded() {
+        let mut si = SignalIntelligence::new();
+        // Feed extreme pressure for many cycles — integral should not exceed 5.0.
+        for _ in 0..1000 {
+            tick_stressed(&mut si, 0.99);
+        }
+        let d = tick_stressed(&mut si, 0.99);
+        assert!(d.pressure_integral <= 5.0,
+            "integral {} should be bounded at 5.0", d.pressure_integral);
+        assert!(d.pressure_integral >= -5.0,
+            "integral {} should be bounded at -5.0", d.pressure_integral);
+    }
+
+    /// Urgency at boundary pressure values must be monotonically increasing.
+    #[test]
+    fn test_urgency_monotonic_with_pressure() {
+        let pressures = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
+        let mut prev_urgency = -1.0;
+        for &p in &pressures {
+            let u = compute_urgency(p, 0.0, false, 0.0, 0.0, 0.0);
+            assert!(
+                u >= prev_urgency,
+                "urgency not monotonic: p={}, urgency={}, prev={}",
+                p, u, prev_urgency
+            );
+            prev_urgency = u;
+        }
+    }
+
+    /// compute_urgency must be bounded [0, 1] even with extreme inputs.
+    #[test]
+    fn test_urgency_bounded_extreme_inputs() {
+        let u = compute_urgency(1.0, 1.0, true, 1.0, 1.0, 5.0);
+        assert!(u >= 0.0 && u <= 1.0, "urgency {} out of bounds", u);
+        let u_zero = compute_urgency(0.0, 0.0, false, 0.0, 0.0, 0.0);
+        assert!(u_zero >= 0.0 && u_zero <= 1.0);
+    }
 }

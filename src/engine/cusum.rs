@@ -56,6 +56,11 @@ impl Cusum {
 
     /// Alimenta una nueva observación.
     pub fn update(&mut self, value: f64) {
+        // Guard: reject NaN/Infinity to prevent accumulator corruption.
+        // A single NaN poisons s_pos/s_neg permanently (NaN + x = NaN).
+        if !value.is_finite() {
+            return;
+        }
         // S⁺ = max(0, S⁺ + (x - target - k))
         self.s_pos = (self.s_pos + (value - self.target - self.k)).max(0.0);
         // S⁻ = max(0, S⁻ + (target - k - x))  [equivalente: detecta bajadas]
@@ -174,5 +179,57 @@ mod tests {
         }
         assert!(!cs.alarm_high());
         assert!(!cs.alarm_low());
+    }
+
+    /// NaN input must not corrupt CUSUM accumulators.
+    /// A single NaN poisons s_pos/s_neg permanently (NaN + x = NaN),
+    /// causing all subsequent alarm_high()/alarm_low() to return false forever.
+    #[test]
+    fn test_nan_input_rejected() {
+        let mut cs = Cusum::new(0.50, 0.02, 0.15);
+        // Build up some accumulation.
+        for _ in 0..5 {
+            cs.update(0.60);
+        }
+        let s_pos_before = cs.score_high();
+        assert!(s_pos_before > 0.0, "should have accumulated");
+
+        // NaN should be silently rejected.
+        cs.update(f64::NAN);
+        assert!(
+            cs.score_high().is_finite(),
+            "NaN corrupted s_pos: {}",
+            cs.score_high()
+        );
+        assert_eq!(cs.score_high(), s_pos_before, "s_pos should not change on NaN");
+        assert_eq!(cs.run_length(), 5, "run_length should not increment on NaN");
+    }
+
+    /// Infinity input must not corrupt CUSUM accumulators.
+    #[test]
+    fn test_infinity_input_rejected() {
+        let mut cs = Cusum::new(0.50, 0.02, 0.15);
+        cs.update(0.55);
+        let s_pos_before = cs.score_high();
+        cs.update(f64::INFINITY);
+        assert!(cs.score_high().is_finite());
+        assert_eq!(cs.score_high(), s_pos_before);
+    }
+
+    /// reset_target should update the target and clear accumulators.
+    #[test]
+    fn test_reset_target_changes_baseline() {
+        let mut cs = Cusum::new(0.50, 0.02, 0.15);
+        for _ in 0..10 {
+            cs.update(0.70);
+        }
+        assert!(cs.alarm_high());
+        cs.reset_target(0.70);
+        assert!(!cs.alarm_high());
+        // Now feeding 0.70 should NOT trigger alarm (it's the new target).
+        for _ in 0..20 {
+            cs.update(0.70);
+        }
+        assert!(!cs.alarm_high(), "new target should prevent alarm");
     }
 }

@@ -50,6 +50,18 @@ pub fn protected_processes() -> HashSet<&'static str> {
         "runningboardd",   // Process lifecycle manager — freeze → broken app launches
         "SystemUIServer",  // Menu bar / status bar rendering
         "ControlCenter",   // Control center overlay rendering
+        // Core services — freeze → Finder hangs, app associations break, no icon updates.
+        // [Apple TN3113] coreservicesd manages Launch Services database, UTI resolution,
+        // and app registration. SIGSTOP leaves the system unable to resolve file types.
+        "coreservicesd",
+        // Audio daemon — freeze → audio routing drops, Bluetooth headphones disconnect.
+        // [CoreAudio documentation] audiod manages audio device policy and routing
+        // decisions above coreaudiod's real-time mixing layer.
+        "audiod",
+        // Power management — freeze → sleep/wake state machine stalls, fans uncontrolled.
+        // [IOKit Power Management] powerd manages assertion tracking, thermal policy,
+        // and display sleep. SIGSTOP causes indefinite wake-lock or uncontrolled fan spin.
+        "powerd",
     ]
     .into_iter()
     .collect()
@@ -926,5 +938,43 @@ mod tests {
             ProtectionLevel::Unconditional,
             "hard protection must take precedence over is_interactive"
         );
+    }
+
+    /// Verify critical macOS system daemons added for audio/power/services safety.
+    /// [Apple TN3113] coreservicesd, [CoreAudio] audiod, [IOKit PM] powerd.
+    #[test]
+    fn protected_includes_coreservicesd_audiod_powerd() {
+        let protected = protected_processes();
+        assert!(protected.contains("coreservicesd"),
+            "coreservicesd must be protected — freeze breaks Finder, app associations, UTI resolution");
+        assert!(protected.contains("audiod"),
+            "audiod must be protected — freeze drops audio routing, disconnects Bluetooth headphones");
+        assert!(protected.contains("powerd"),
+            "powerd must be protected — freeze stalls sleep/wake state machine, uncontrolled fans");
+    }
+
+    /// Protected processes must include ALL rendering pipeline components.
+    /// Freezing any of these causes visible user-facing degradation.
+    #[test]
+    fn protected_covers_rendering_pipeline() {
+        let protected = protected_processes();
+        let pipeline = ["WindowServer", "Dock", "SystemUIServer", "ControlCenter",
+                        "coreaudiod", "mediaserverd", "displaypolicyd"];
+        for name in &pipeline {
+            assert!(protected.contains(name),
+                "'{}' must be in rendering pipeline protection", name);
+        }
+    }
+
+    /// The hard-protected fast path (OnceLock) must agree with the full set.
+    #[test]
+    fn is_hard_protected_matches_full_set() {
+        let full = protected_processes();
+        for &name in full.iter() {
+            assert!(is_hard_protected(name),
+                "is_hard_protected('{}') must return true", name);
+        }
+        // Negative check.
+        assert!(!is_hard_protected("random_process_xyz"));
     }
 }

@@ -73,6 +73,14 @@ impl Kalman1D {
     /// - `measurement`: valor observado crudo.
     /// - `dt`: tiempo desde la última observación (segundos). Usar el dt real del ciclo.
     pub fn update(&mut self, measurement: f64, dt: f64) {
+        // Guard: reject NaN/Infinity inputs to prevent permanent filter corruption.
+        // [Crassidis & Junkins 2012] "Optimal Estimation" §3.6: a single NaN observation
+        // propagates through Riccati recursion and corrupts all subsequent estimates.
+        // Silently skip the update — last valid state is always better than NaN state.
+        if !measurement.is_finite() || !dt.is_finite() {
+            return;
+        }
+
         if !self.initialized {
             // Primera observación: inicializar estado directamente.
             // p11 initialized to q (process noise) rather than 1.0 — more confident
@@ -244,5 +252,58 @@ mod tests {
             filt_devs,
             raw_devs
         );
+    }
+
+    /// NaN measurement must not corrupt filter state.
+    /// [Crassidis & Junkins 2012] §3.6: a single NaN propagates through Riccati
+    /// recursion and permanently corrupts all subsequent estimates.
+    #[test]
+    fn test_nan_measurement_rejected() {
+        let mut kf = Kalman1D::new(0.01, 0.1);
+        kf.update(0.50, 0.5);
+        assert!(kf.is_initialized());
+
+        // Feed NaN — should be silently rejected.
+        kf.update(f64::NAN, 0.5);
+        assert!(kf.position().is_finite(), "NaN corrupted position");
+        assert!(kf.velocity().is_finite(), "NaN corrupted velocity");
+        assert!((kf.position() - 0.50).abs() < 1e-10, "position changed after NaN");
+    }
+
+    /// Infinity measurement must not corrupt filter state.
+    #[test]
+    fn test_infinity_measurement_rejected() {
+        let mut kf = Kalman1D::new(0.01, 0.1);
+        kf.update(0.50, 0.5);
+        kf.update(0.52, 0.5);
+        let pos_before = kf.position();
+
+        kf.update(f64::INFINITY, 0.5);
+        assert!(kf.position().is_finite(), "Inf corrupted position");
+        assert!((kf.position() - pos_before).abs() < 1e-10);
+    }
+
+    /// NaN dt must not corrupt filter state.
+    #[test]
+    fn test_nan_dt_rejected() {
+        let mut kf = Kalman1D::new(0.01, 0.1);
+        kf.update(0.50, 0.5);
+        let pos_before = kf.position();
+
+        kf.update(0.55, f64::NAN);
+        assert!(kf.position().is_finite());
+        assert!((kf.position() - pos_before).abs() < 1e-10);
+    }
+
+    /// NaN on first observation must not initialize the filter.
+    #[test]
+    fn test_nan_first_observation_not_initialized() {
+        let mut kf = Kalman1D::new(0.01, 0.1);
+        kf.update(f64::NAN, 0.5);
+        assert!(!kf.is_initialized(), "NaN should not initialize filter");
+        // Subsequent valid observation should initialize correctly.
+        kf.update(0.60, 0.5);
+        assert!(kf.is_initialized());
+        assert!((kf.position() - 0.60).abs() < 1e-10);
     }
 }

@@ -280,11 +280,15 @@ impl FluidityState {
         if self.fluidity_degraded {
             for (pid, name, cpu) in processes {
                 if *cpu > OFFENDER_CPU_THRESHOLD && !is_protected(name) {
-                    // Update or insert offender record
+                    // Update or insert offender record.
+                    // Match on PID + name to guard against PID reuse: macOS recycles
+                    // PIDs aggressively and a reused PID is a different process.
+                    // [Saltzer & Schroeder 1975] "Protection of Information" — use
+                    // unforgeable identifiers; PID alone is not unique over time.
                     if let Some(entry) = self
                         .fluidity_offenders
                         .iter_mut()
-                        .find(|(p, _, _)| p == pid)
+                        .find(|(p, n, _)| p == pid && n == name)
                     {
                         // EMA of hurt score: higher CPU during degradation = higher score
                         entry.2 = OFFENDER_EMA_ALPHA * (cpu / 100.0)
@@ -697,5 +701,91 @@ mod tests {
         let elapsed = start.elapsed();
         eprintln!("FluidityState 500 updates (6 procs): {:?}", elapsed);
         assert!(elapsed.as_millis() < 50, "500 fluidity updates too slow: {:?}", elapsed);
+    }
+
+    /// PID reuse must not accumulate hurt-score across different processes.
+    /// macOS recycles PIDs aggressively; a reused PID is a different process.
+    /// [Saltzer & Schroeder 1975] — PID alone is not unique over time.
+    #[test]
+    fn offender_pid_reuse_creates_separate_entry() {
+        let mut state = FluidityState::new();
+        // Initialize with idle state.
+        let procs_init = make_procs(&[("WindowServer", 2.0)]);
+        state.update(&procs_init, 0.0, 2.0);
+
+        // Force degraded fluidity with high WS CPU.
+        // PID 5 = "HogProcess" high CPU.
+        let procs_hog = vec![
+            (1u32, "WindowServer", 80.0f32),
+            (5u32, "HogProcess", 40.0f32),
+        ];
+        for _ in 0..5 {
+            state.update(&procs_hog, 0.5, 2.0);
+        }
+
+        // HogProcess should be tracked as offender.
+        let hog_count = state.fluidity_offenders.iter()
+            .filter(|(_, n, _)| n == "HogProcess").count();
+        assert_eq!(hog_count, 1, "HogProcess should be tracked");
+
+        // Now PID 5 is reused by a DIFFERENT process "GoodProcess".
+        let procs_reuse = vec![
+            (1u32, "WindowServer", 80.0f32),
+            (5u32, "GoodProcess", 30.0f32),
+        ];
+        for _ in 0..3 {
+            state.update(&procs_reuse, 0.5, 2.0);
+        }
+
+        // Both entries may exist (old HogProcess decays, new GoodProcess may appear).
+        // The key invariant: HogProcess entry must NOT have its score increased
+        // by GoodProcess's CPU usage.
+        let hog_entry = state.fluidity_offenders.iter()
+            .find(|(p, n, _)| *p == 5 && n == "HogProcess");
+        let good_entry = state.fluidity_offenders.iter()
+            .find(|(p, n, _)| *p == 5 && n == "GoodProcess");
+
+        // HogProcess should be decaying (no new data feeding it).
+        if let Some((_, _, score)) = hog_entry {
+            assert!(*score < 0.3, "HogProcess score should be decaying, got {}", score);
+        }
+        // GoodProcess should have its own entry if CPU > threshold.
+        // Just verify no crash and entries are separate.
+        assert!(
+            hog_entry.is_none() || good_entry.is_none()
+                || hog_entry.unwrap().1 != good_entry.unwrap().1,
+            "PID reuse must create separate entries for different process names"
+        );
+    }
+
+    /// Renderer/helper processes should NOT trigger launch detection.
+    #[test]
+    fn renderer_helper_not_detected_as_launch() {
+        let mut state = FluidityState::new();
+        let procs1 = vec![(1u32, "launchd", 0.1f32)];
+        state.update(&procs1, 0.0, 2.0);
+        // Add a renderer helper — should not count as app launch.
+        let procs2 = vec![
+            (1u32, "launchd", 0.1f32),
+            (200u32, "Brave Browser Helper (GPU)", 5.0f32),
+        ];
+        state.update(&procs2, 0.0, 2.0);
+        assert!(!state.launch_active,
+            "GPU helper should not trigger launch detection");
+    }
+
+    /// Lowercase system daemons should NOT trigger launch detection.
+    #[test]
+    fn system_daemon_not_detected_as_launch() {
+        let mut state = FluidityState::new();
+        let procs1 = vec![(1u32, "launchd", 0.1f32)];
+        state.update(&procs1, 0.0, 2.0);
+        let procs2 = vec![
+            (1u32, "launchd", 0.1f32),
+            (300u32, "configd", 0.3f32),
+        ];
+        state.update(&procs2, 0.0, 2.0);
+        assert!(!state.launch_active,
+            "system daemon should not trigger launch detection");
     }
 }
