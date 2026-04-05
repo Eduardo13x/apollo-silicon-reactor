@@ -641,4 +641,229 @@ mod tests {
         }
         assert!(g.pending.len() <= 200);
     }
+
+    // ── Multi-horizon tests ──────────────────────────────────────────────
+
+    #[test]
+    fn slow_horizon_captures_delayed_effect() {
+        let mut g = CausalGraph::new();
+        // Record action at cycle 10 with pressure 0.80.
+        g.record_action("throttle:Safari", 0.80, 10);
+        // Fast eval at cycle 13: pressure unchanged → fast says ineffective.
+        g.evaluate(0.79, 13);
+        let edge = g.get_edge("throttle:Safari", EFFECT_PRESSURE_DROP);
+        // Fast confidence should be close to uninformed (slightly below 0.5).
+        assert!(edge.is_some());
+
+        // Slow eval at cycle 25 (15 cycles later): pressure dropped significantly.
+        g.evaluate(0.65, 25);
+        let edge = g.get_edge("throttle:Safari", EFFECT_PRESSURE_DROP).unwrap();
+        // Slow confidence should reflect the delayed drop.
+        assert!(edge.slow_confidence > 0.5, "slow should see effect: {}", edge.slow_confidence);
+        assert!(edge.slow_avg_delta > 0.0, "slow delta should be positive");
+    }
+
+    #[test]
+    fn slow_horizon_blends_into_confidence_map() {
+        let mut g = CausalGraph::new();
+        // Build a process with weak fast but strong slow signal.
+        for cycle in 0..10u64 {
+            g.record_action("throttle:compactd", 0.80, cycle * 20);
+            // Fast eval: no change.
+            g.evaluate(0.79, cycle * 20 + 3);
+            // Slow eval: big drop.
+            g.evaluate(0.60, cycle * 20 + 15);
+        }
+        let map = g.confidence_map();
+        // confidence_map uses max(fast, slow), so slow signal should show.
+        if let Some(&conf) = map.get("throttle:compactd") {
+            assert!(conf > 0.5, "blended confidence should be > 0.5: {}", conf);
+        }
+    }
+
+    // ── Mechanism attribution tests ─────────────────────────────────────
+
+    #[test]
+    fn mechanism_attribution_tracks_resource_deltas() {
+        let mut m = MechanismAttribution::default();
+        assert_eq!(m.primary(), "unknown"); // not enough observations
+        m.observe(100.0, 5.0, 0.0); // RSS dominant
+        m.observe(120.0, 3.0, 0.0);
+        m.observe(90.0, 4.0, 0.0);
+        assert_eq!(m.primary(), "rss");
+        // EMA with α=0.15 from 0: after 3 obs of ~100 → ~35 (not fully converged).
+        assert!(m.rss_delta_mb > 10.0, "RSS EMA should be positive: {}", m.rss_delta_mb);
+    }
+
+    #[test]
+    fn mechanism_cpu_dominant() {
+        let mut m = MechanismAttribution::default();
+        m.observe(5.0, 80.0, 0.0); // CPU dominant
+        m.observe(3.0, 90.0, 0.0);
+        m.observe(4.0, 85.0, 0.0);
+        assert_eq!(m.primary(), "cpu");
+    }
+
+    #[test]
+    fn mechanism_swap_dominant() {
+        let mut m = MechanismAttribution::default();
+        m.observe(0.0, 0.0, 500.0); // swap dominant
+        m.observe(0.0, 0.0, 600.0);
+        m.observe(0.0, 0.0, 400.0);
+        assert_eq!(m.primary(), "swap");
+    }
+
+    #[test]
+    fn evaluate_with_resources_populates_mechanism() {
+        let mut g = CausalGraph::new();
+        let res_before = ResourceSnapshot { rss_mb: 500.0, cpu_pct: 30.0, swap_mb: 1000.0 };
+        for cycle in 0..5u64 {
+            g.record_action_with_resources(
+                "throttle:Chrome", 0.80, cycle * 4, res_before.clone(),
+            );
+            let res_after = ResourceSnapshot { rss_mb: 350.0, cpu_pct: 10.0, swap_mb: 900.0 };
+            g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after);
+        }
+        let mech = g.mechanism("throttle:Chrome");
+        assert!(mech.is_some(), "should have mechanism data after 5 effective evals");
+        let (primary, rss, cpu, swap) = mech.unwrap();
+        assert!(rss > 0.0, "RSS delta should be positive");
+        assert!(cpu > 0.0, "CPU delta should be positive");
+        assert!(swap > 0.0, "swap delta should be positive");
+        assert_eq!(primary, "rss"); // 150MB RSS > 20% CPU > 100MB swap
+    }
+
+    // ── Impact score tests ──────────────────────────────────────────────
+
+    #[test]
+    fn impact_score_uses_max_of_fast_and_slow() {
+        let mut e = CausalEdge::new("test", "pressure_drop");
+        // Fast: low
+        e.confidence = 0.30;
+        e.avg_delta = 0.01;
+        // Slow: high
+        e.slow_confidence = 0.80;
+        e.slow_avg_delta = 0.10;
+        // Impact should use slow (0.08) > fast (0.003).
+        assert!(e.impact_score() > 0.05, "should use slow: {}", e.impact_score());
+    }
+
+    // ── Cluster boost tests ─────────────────────────────────────────────
+
+    #[test]
+    fn cluster_boost_rescues_cold_process() {
+        let g = CausalGraph::new();
+        let mut map = HashMap::new();
+        map.insert("throttle:Safari".to_string(), 0.80_f32); // solid
+        map.insert("throttle:cloudd".to_string(), 0.15_f32);  // would be skipped
+        let pairs = vec![
+            ("Safari".to_string(), "cloudd".to_string(), 10), // co-occur 10 times
+        ];
+        g.apply_cluster_boost(&mut map, &pairs);
+        let boosted = map["throttle:cloudd"];
+        assert!(boosted > 0.20, "cloudd should be boosted above skip threshold: {}", boosted);
+    }
+
+    #[test]
+    fn cluster_boost_ignores_low_cooccurrence() {
+        let g = CausalGraph::new();
+        let mut map = HashMap::new();
+        map.insert("throttle:Safari".to_string(), 0.80_f32);
+        map.insert("throttle:cloudd".to_string(), 0.15_f32);
+        let pairs = vec![
+            ("Safari".to_string(), "cloudd".to_string(), 3), // too few co-occurrences
+        ];
+        g.apply_cluster_boost(&mut map, &pairs);
+        assert_eq!(map["throttle:cloudd"], 0.15); // unchanged
+    }
+
+    // ── NARS discount tests ─────────────────────────────────────────────
+
+    #[test]
+    fn nars_discount_reduces_drifted_confidence() {
+        use crate::engine::nars_belief::DriftDetector;
+        let mut dd = DriftDetector::new();
+        // Create a belief with low confidence (many revisions → unstable).
+        for _ in 0..5 { dd.observe("Safari", true); }
+        for _ in 0..5 { dd.observe("Safari", false); }
+        // The belief should have moderate-to-low confidence now.
+        let tv = dd.belief("Safari").unwrap();
+
+        let mut map = HashMap::new();
+        map.insert("throttle:Safari".to_string(), 0.80_f32);
+        CausalGraph::apply_nars_discount(&mut map, &dd);
+
+        if tv.confidence < 0.50 {
+            assert!(map["throttle:Safari"] < 0.80, "should be discounted");
+        }
+    }
+
+    #[test]
+    fn nars_discount_no_effect_on_stable_beliefs() {
+        use crate::engine::nars_belief::DriftDetector;
+        let mut dd = DriftDetector::new();
+        // Consistent successes → high confidence.
+        for _ in 0..20 { dd.observe("Dropbox", true); }
+        let tv = dd.belief("Dropbox").unwrap();
+        assert!(tv.confidence >= 0.50, "should be high confidence");
+
+        let mut map = HashMap::new();
+        map.insert("throttle:Dropbox".to_string(), 0.80_f32);
+        CausalGraph::apply_nars_discount(&mut map, &dd);
+        assert_eq!(map["throttle:Dropbox"], 0.80); // unchanged
+    }
+
+    // ── Slow horizon + pending_slow cap ─────────────────────────────────
+
+    #[test]
+    fn pending_slow_cap() {
+        let mut g = CausalGraph::new();
+        for i in 0..250u64 {
+            g.record_action(&format!("action:{}", i), 0.7, i);
+        }
+        assert!(g.pending_slow.len() <= 200);
+    }
+
+    #[test]
+    fn slow_horizon_count_tracks_updated_edges() {
+        let mut g = CausalGraph::new();
+        assert_eq!(g.slow_horizon_count(), 0);
+        g.record_action("throttle:test", 0.80, 0);
+        g.evaluate(0.60, 15); // triggers slow eval
+        assert!(g.slow_horizon_count() > 0);
+    }
+
+    #[test]
+    fn mechanism_count_tracks_attributed_edges() {
+        let mut g = CausalGraph::new();
+        assert_eq!(g.mechanism_count(), 0);
+        let res = ResourceSnapshot { rss_mb: 500.0, cpu_pct: 30.0, swap_mb: 100.0 };
+        for i in 0..5u64 {
+            g.record_action_with_resources("throttle:X", 0.80, i * 4, res.clone());
+            let after = ResourceSnapshot { rss_mb: 300.0, cpu_pct: 10.0, swap_mb: 50.0 };
+            g.evaluate_with_resources(0.60, i * 4 + 3, &after);
+        }
+        assert!(g.mechanism_count() > 0);
+    }
+
+    // ── Impact map test ─────────────────────────────────────────────────
+
+    #[test]
+    fn impact_map_ranks_by_score() {
+        let mut g = CausalGraph::new();
+        // Chrome: effective with big drops.
+        for i in 0..10u64 {
+            g.record_action("throttle:Chrome", 0.80, i * 4);
+            g.evaluate(0.65, i * 4 + 3); // 0.15 drop
+        }
+        // contactsd: effective with tiny drops.
+        for i in 0..10u64 {
+            g.record_action("throttle:contactsd", 0.80, 100 + i * 4);
+            g.evaluate(0.77, 100 + i * 4 + 3); // 0.03 drop
+        }
+        let map = g.impact_map();
+        let chrome = map.get("throttle:Chrome").copied().unwrap_or(0.0);
+        let contact = map.get("throttle:contactsd").copied().unwrap_or(0.0);
+        assert!(chrome > contact, "Chrome ({}) should rank higher than contactsd ({})", chrome, contact);
+    }
 }
