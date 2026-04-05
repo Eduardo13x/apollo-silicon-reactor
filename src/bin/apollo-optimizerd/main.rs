@@ -2158,6 +2158,11 @@ fn main() -> anyhow::Result<()> {
                 let footprint_hints = apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_footprint_hints(
                     &energy_pid_results,
                 );
+                // I/O burst hints: background processes writing >5 MB/s compete for
+                // disk bandwidth with LLM model weight loading — throttle during inference.
+                let io_burst_hints = apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_io_burst_hints(
+                    &energy_pid_results, 5.0,
+                );
 
                 // ── Syscall-aware profiling: identify JIT-compiling processes ──
                 // Sample top processes through the syscall classifier and collect
@@ -3443,6 +3448,7 @@ fn main() -> anyhow::Result<()> {
                         wakeup_hints:              &wakeup_hints,
                         footprint_hints:           &footprint_hints,
                         dram_bandwidth_pct,
+                        io_burst_hints:            &io_burst_hints,
                     };
                     decision_stage.run(
                         &snapshot,

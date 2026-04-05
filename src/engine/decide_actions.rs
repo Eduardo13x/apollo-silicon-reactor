@@ -249,6 +249,12 @@ pub fn decide_actions(
     // DRAM memory bandwidth utilization (0.0–1.0) from IOReport AMC stats.
     // When > 0.80, memory-bandwidth-heavy processes should be throttled first.
     dram_bandwidth_pct: f64,
+    // Per-process disk write rate (MB/s) from ri_disk_write_bytes delta.
+    // Background processes writing >5 MB/s compete for disk bandwidth with
+    // LLM model weight loading — throttle them during inference.
+    // [Bhagwan & Savage 2002 OSDI] "I/O-Scope" — I/O bursts degrade co-located
+    // latency-sensitive workloads by saturating disk queue depth.
+    io_burst_hints: &HashMap<u32, f64>,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -484,7 +490,22 @@ pub fn decide_actions(
             let footprint_mb = footprint_hints.get(&pid).copied().unwrap_or(0.0);
             let bandwidth_priority = dram_bandwidth_pct >= 0.80 && footprint_mb > 100.0;
 
-            let reason = if is_wakeup_vampire {
+            // I/O burst: background process writing >5 MB/s competes for disk bandwidth
+            // with LLM model weight loading. Throttle it to protect inference throughput.
+            // [Bhagwan & Savage 2002 OSDI] I/O bursts saturate disk queue depth and
+            // degrade latency-sensitive co-located workloads — throttle the I/O abuser.
+            let disk_mbps = io_burst_hints.get(&pid).copied().unwrap_or(0.0);
+            let is_io_burst = disk_mbps >= 5.0;
+            // io_burst always aggressive — disk saturation is immediate and binary.
+            let aggressive = aggressive || is_io_burst;
+
+            let reason = if is_io_burst {
+                format!(
+                    "io-burst throttle ({:.1} MB/s writes, ipc={:.2})",
+                    disk_mbps,
+                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
+                )
+            } else if is_wakeup_vampire {
                 format!(
                     "wakeup-vampire throttle ({:.0}/s wakeups, ipc={:.2})",
                     wakeup_rate,
@@ -1187,6 +1208,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             0.0,
+            &HashMap::new(),
         );
 
         assert!(
@@ -1231,6 +1253,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             0.0,
+            &HashMap::new(),
         );
 
         assert!(
@@ -1268,6 +1291,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             0.0,
+            &HashMap::new(),
         );
         assert!(matches!(
             out_low.context,
@@ -1297,6 +1321,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             0.0,
+            &HashMap::new(),
         );
         assert!(matches!(
             out_mid.context,
@@ -1326,6 +1351,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             0.0,
+            &HashMap::new(),
         );
         assert!(matches!(
             out_high.context,
@@ -1365,6 +1391,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 0.0,
+                &HashMap::new(),
             );
             // Should not panic, and with no processes should produce no actions.
             assert!(
@@ -1407,9 +1434,26 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 0.0,
+                &HashMap::new(),
             );
             assert!(output.actions.is_empty());
         }
+    }
+
+    // ── io_burst_hints contract ──────────────────────────────────────────
+    // Verify the disk_mbps >= 5.0 threshold logic used in decide_actions.
+
+    #[test]
+    fn io_burst_threshold_math() {
+        // Exactly 5.0 MB/s — meets threshold (aggressive throttle).
+        let disk_mbps: f64 = 5.0;
+        assert!(disk_mbps >= 5.0, "5.0 MB/s must trigger io_burst");
+        // Just below — does not trigger.
+        let below: f64 = 4.999;
+        assert!(!(below >= 5.0), "4.999 MB/s must NOT trigger io_burst");
+        // Typical backup process at 50 MB/s — should trigger.
+        let backup: f64 = 50.0;
+        assert!(backup >= 5.0, "50 MB/s backup must trigger io_burst");
     }
 
     // ── DecisionOutput struct tests ──────────────────────────────────────

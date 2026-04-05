@@ -104,6 +104,10 @@ pub struct PolicyContext<'a> {
 
     /// DRAM bandwidth utilization 0.0–1.0 from IOReport AMC stats.
     pub dram_bandwidth_pct: f64,
+
+    /// Per-process disk write rate (MB/s) from ri_disk_write_bytes delta.
+    /// Throttle background I/O abusers (>5 MB/s) to protect LLM inference bandwidth.
+    pub io_burst_hints: &'a HashMap<u32, f64>,
 }
 
 /// The output returned by [`DecisionStage::run`].
@@ -191,6 +195,7 @@ impl DecisionStage {
             policy.wakeup_hints,
             policy.footprint_hints,
             policy.dram_bandwidth_pct,
+            policy.io_burst_hints,
         );
 
         DecisionStageOutput { decision }
@@ -262,6 +267,7 @@ mod tests {
             wakeup_hints: ipc, // reuse empty map (same type)
             footprint_hints: ipc,
             dram_bandwidth_pct: 0.0,
+            io_burst_hints: ipc,
         }
     }
 
