@@ -442,9 +442,14 @@ pub fn decide_actions(
                 .unwrap_or(IpcClass::Mixed);
 
             // Skip throttling for highly optimized compute-bound processes
-            // unless we're in thermal emergency.
+            // unless we're in thermal emergency OR the system is highly memory-stalled.
+            // [Hennessy & Patterson 2017] when system-wide DRAM bandwidth is saturated
+            // (>80%), even "compute-bound" processes are sharing a memory bottleneck —
+            // IPC protection is less meaningful in that regime.
+            let system_memory_stressed = dram_bandwidth_pct >= 0.80;
             if !ipc_class.safe_to_throttle()
                 && !matches!(effective_context, InteractiveContext::ThermalConstrained)
+                && !system_memory_stressed
             {
                 low_value_skipped.push(format!("ipc-protected:{}", name));
                 continue;
