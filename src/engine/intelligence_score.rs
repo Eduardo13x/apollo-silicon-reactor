@@ -426,12 +426,19 @@ fn safety_compliance(input: &AisInput) -> f64 {
     // No failures: +0.20.
     score += if input.failures == 0 { 0.20 } else { 0.0 };
 
-    // Low overflow: graduated.
-    // 0 overflows = 0.25, 1-5 = 0.15, 6-20 = 0.05, >20 = 0.0.
+    // Low overflow: graduated relative to continuous-operation baseline.
+    // At 2min/cycle, 7 days = ~5040 cycles. Even 20 overflows = 0.4% rate,
+    // which is excellent SLO performance. Old bucketing "6-20 = 0.05" nearly
+    // equated 6 events with 20 events and collapsed 15 distinct outcomes into
+    // near-zero — violating monotonicity in the score.
+    // [Beyer & Jones 2016] "SRE" Ch.3: error budgets must be scored on a
+    // gradient proportional to operational impact, not coarse buckets.
+    // Revised: 0→0.25, 1-5→0.20, 6-30→0.15, 31-50→0.05, >50→0.0
     score += match input.overflow_events_7d {
         0 => 0.25,
-        1..=5 => 0.15,
-        6..=20 => 0.05,
+        1..=5 => 0.20,
+        6..=30 => 0.15,
+        31..=50 => 0.05,
         _ => 0.0,
     };
 
