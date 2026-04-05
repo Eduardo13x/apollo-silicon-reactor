@@ -322,7 +322,11 @@ impl RlThresholdAgent {
             let rpe_abs = (reward + GAMMA * max_q_next - old_q).abs();
             self.rpe_ema = 0.99 * self.rpe_ema + 0.01 * rpe_abs;
             let surprise_factor = (rpe_abs / self.rpe_ema.max(0.01)).clamp(0.5, 5.0);
-            let effective_alpha = self.alpha() * surprise_factor * self.neuro_alpha_mult;
+            // Clamp to [0, 1.0]: α > 1 causes Q(s,a) to overshoot the target,
+            // producing oscillation or divergence. Without the clamp the worst case is
+            // 0.20 (base) × 5.0 (surprise) × 1.5 (neuro_mult) = 1.5.
+            // [Sutton & Barto 2018 §2.4] — α ∈ (0,1] required for convergence.
+            let effective_alpha = (self.alpha() * surprise_factor * self.neuro_alpha_mult).min(1.0);
             self.q_table[s][a] = old_q + effective_alpha * (reward + GAMMA * max_q_next - old_q);
 
             // Dyna-Q: record real transition and run planning steps.
