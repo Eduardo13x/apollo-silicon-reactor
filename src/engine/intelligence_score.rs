@@ -1503,4 +1503,121 @@ mod tests {
         let score = compute_ais(&input);
         assert_eq!(score.safety_compliance, 0.0);
     }
+
+    /// D5 throttle precision: zero reverts = maximum precision bonus.
+    #[test]
+    fn test_d5_throttle_precision_zero_reverts() {
+        let base = AisInput {
+            kills_applied: 0,
+            survival_activations: 0,
+            failures: 0,
+            overflow_events_7d: 0,
+            frozen_critical: 0,
+            noise_throttled: 100, // 100 throttles
+            noise_total: 100,     // 100 throttles, 0 reverts
+            ..Default::default()
+        };
+        let score = compute_ais(&base);
+        // No kills + no survival + no failures + 0 overflow + perfect precision
+        // = 0.30 + 0.25 + 0.20 + 0.25 + 0.10 = 1.10 → clamped to 1.0
+        assert_eq!(score.safety_compliance, 1.0,
+            "zero reverts + zero overflows should max out D5: {:.3}", score.safety_compliance);
+    }
+
+    /// D5 throttle precision: 20% revert rate = 0 precision bonus.
+    #[test]
+    fn test_d5_throttle_precision_high_revert_rate() {
+        let base = AisInput {
+            kills_applied: 0,
+            survival_activations: 0,
+            failures: 0,
+            overflow_events_7d: 0,
+            frozen_critical: 0,
+            noise_throttled: 80,  // 80 kept out of 100
+            noise_total: 100,     // revert_rate = (100-80)/100 = 0.20
+            ..Default::default()
+        };
+        let score = compute_ais(&base);
+        // 0.30 + 0.25 + 0.20 + 0.25 + 0.0 = 1.0 (still perfect w/ zero overflow)
+        assert!(score.safety_compliance >= 0.99,
+            "D5 with 20% revert still saturates at 1.0 due to other components: {:.3}",
+            score.safety_compliance);
+    }
+
+    /// D5 throttle precision: 20% revert + some overflows shows the delta.
+    #[test]
+    fn test_d5_throttle_precision_delta_with_overflows() {
+        let perfect = AisInput {
+            kills_applied: 0, survival_activations: 0, failures: 0,
+            overflow_events_7d: 20, frozen_critical: 0,
+            noise_throttled: 100, noise_total: 100, // 0 reverts
+            ..Default::default()
+        };
+        let imprecise = AisInput {
+            kills_applied: 0, survival_activations: 0, failures: 0,
+            overflow_events_7d: 20, frozen_critical: 0,
+            noise_throttled: 80, noise_total: 100,  // 20% reverts
+            ..Default::default()
+        };
+        let score_perfect = compute_ais(&perfect);
+        let score_imprecise = compute_ais(&imprecise);
+        assert!(score_perfect.safety_compliance > score_imprecise.safety_compliance,
+            "zero reverts ({:.3}) should outscore 20% reverts ({:.3}) with same overflow count",
+            score_perfect.safety_compliance, score_imprecise.safety_compliance);
+    }
+
+    /// Kalman Riccati threshold: RMSE at or below floor → kalman sub-score = 1.0.
+    /// We verify by comparing two inputs that differ ONLY in kalman_rmse and riccati_rmse.
+    #[test]
+    fn test_kalman_riccati_optimal_score() {
+        // Base input with good CUSUM, hazard, entropy so D2 is meaningful.
+        let base = AisInput {
+            cusum_true_positives: 10,
+            cusum_false_positives: 0,
+            cusum_actual_shifts: 10,
+            hazard_calibration_error: 0.0,
+            entropy_tpr: 1.0,
+            ..Default::default()
+        };
+        // At Riccati floor: RMSE < riccati_rmse → kalman sub-score = 1.0
+        let at_floor = AisInput { kalman_rmse: 0.100, kalman_riccati_rmse: 0.109, ..base.clone() };
+        // Above Riccati floor: RMSE > riccati_rmse → kalman sub-score < 1.0
+        let above_floor = AisInput { kalman_rmse: 0.150, kalman_riccati_rmse: 0.109, ..base };
+        let s_at = compute_ais(&at_floor).signal_quality;
+        let s_above = compute_ais(&above_floor).signal_quality;
+        assert!(s_at > s_above,
+            "RMSE ≤ Riccati floor ({:.3}) should outscore RMSE above floor ({:.3})",
+            s_at, s_above);
+        // The at-floor score should be exactly the max for these CUSUM/hazard/entropy
+        // (kalman=1.0 is the maximum kalman sub-score).
+        let perfect_kalman = AisInput { kalman_rmse: 0.0, kalman_riccati_rmse: 0.109,
+            cusum_true_positives: 10, cusum_false_positives: 0, cusum_actual_shifts: 10,
+            hazard_calibration_error: 0.0, entropy_tpr: 1.0, ..Default::default() };
+        let s_perfect = compute_ais(&perfect_kalman).signal_quality;
+        assert!((s_at - s_perfect).abs() < 1e-9,
+            "RMSE at floor ({:.3}) should equal perfect kalman ({:.3})", s_at, s_perfect);
+    }
+
+    /// D2 signal_quality: Riccati dynamic threshold takes precedence over fixed threshold.
+    #[test]
+    fn test_kalman_riccati_overrides_fixed_threshold() {
+        // With high pressure and RMSE=0.11 (just above nominal 0.0884 threshold):
+        // Without Riccati: current_pressure>=0.70 → threshold=0.12 → score=1/(1+(0.11/0.12)^2)=0.54
+        // With Riccati=0.12: RMSE=0.11 < 0.12 → score=1.0 (at or below floor)
+        let base = AisInput {
+            cusum_true_positives: 5,
+            cusum_false_positives: 0,
+            cusum_actual_shifts: 5,
+            hazard_calibration_error: 0.0,
+            entropy_tpr: 0.8,
+            ..Default::default()
+        };
+        let with_riccati = AisInput { kalman_rmse: 0.11, kalman_riccati_rmse: 0.12, current_pressure: 0.80, ..base.clone() };
+        let without_riccati = AisInput { kalman_rmse: 0.11, kalman_riccati_rmse: 0.0, current_pressure: 0.80, ..base };
+        let s_with = compute_ais(&with_riccati).signal_quality;
+        let s_without = compute_ais(&without_riccati).signal_quality;
+        assert!(s_with > s_without,
+            "Riccati-guided ({:.3}) should exceed fixed-threshold ({:.3}) when RMSE at floor",
+            s_with, s_without);
+    }
 }

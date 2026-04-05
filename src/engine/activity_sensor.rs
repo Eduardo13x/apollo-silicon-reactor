@@ -236,8 +236,8 @@ mod tests {
     fn assertions_returns_hashset() {
         // Just check it doesn't panic and returns something reasonable.
         let pids = pids_with_assertions();
-        // pmset should always be available on macOS; result may be empty if
-        // no assertions are active, but the call must succeed.
+        // IOPMCopyAssertionsByProcess may be empty when no assertions active.
+        // The call must succeed without panicking.
         let _ = pids;
     }
 
@@ -246,5 +246,54 @@ mod tests {
         let processes = HashMap::new();
         let result = pids_with_active_children(&processes, 10.0);
         assert!(result.is_empty());
+    }
+
+    /// pids_with_open_sockets with empty candidates returns empty set.
+    #[test]
+    fn open_sockets_empty_candidates() {
+        let result = pids_with_open_sockets(&[], 3);
+        assert!(result.is_empty(), "no candidates → no results");
+    }
+
+    /// pids_with_open_sockets with a non-existent PID returns empty set.
+    #[test]
+    fn open_sockets_nonexistent_pid() {
+        // PID 999999 almost certainly doesn't exist.
+        let result = pids_with_open_sockets(&[999_999], 1);
+        // Either returns empty (proc_pidinfo fails) or a valid set — must not panic.
+        let _ = result;
+    }
+
+    /// pids_with_active_children: only parent PIDs with enough child CPU are returned.
+    #[test]
+    fn active_children_threshold_filtering() {
+        // We can't easily create real sysinfo::Process objects, but we can
+        // verify the contract: empty input → empty output at any threshold.
+        let processes = HashMap::new();
+        // Various thresholds — all return empty for empty input.
+        for threshold in [0.0f32, 5.0, 10.0, 50.0, 100.0] {
+            let result = pids_with_active_children(&processes, threshold);
+            assert!(result.is_empty(), "threshold={}: empty system → empty result", threshold);
+        }
+    }
+
+    /// active_pids with empty process map returns a set (possibly from IOKit assertions).
+    #[test]
+    fn active_pids_no_crash_empty_system() {
+        let processes = HashMap::new();
+        // Must not panic even with empty process map.
+        let result = active_pids(&processes);
+        // Result may be non-empty if the test runner holds power assertions (rare).
+        let _ = result;
+    }
+
+    /// pids_with_open_sockets: min_sockets=usize::MAX returns empty (no process has that many).
+    #[test]
+    fn open_sockets_unreachable_threshold() {
+        // Get current process PID — it definitely has some FDs open.
+        let my_pid = std::process::id();
+        // But requiring usize::MAX sockets should always return empty.
+        let result = pids_with_open_sockets(&[my_pid], usize::MAX);
+        assert!(result.is_empty(), "no process has usize::MAX sockets");
     }
 }
