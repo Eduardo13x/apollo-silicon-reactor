@@ -747,8 +747,18 @@ fn freeze_non_critical(
 }
 
 /// Send memory pressure hint via sysctl to trigger kernel-level page reclaim.
+///
+/// DISABLED: `kern.memorystatus_vm_pressure_send` takes a *target PID* as its
+/// value — writing `1` means "send pressure to PID 1" = launchd, which causes
+/// jetsam to kill arbitrary child processes (including Brave, Chrome, etc.).
+/// The only safe use of this sysctl is with a specific non-critical daemon PID,
+/// which the main loop already handles per-process. The sentinel must NOT trigger
+/// a system-wide jetsam cascade by targeting the root of the process tree.
+/// [Apple TN2416 / XNU memorystatus_kern_extended_info]
 fn send_memory_pressure_hint() {
-    sysctl_direct::write_i32("kern.memorystatus_vm_pressure_send", 1);
+    // Intentionally a no-op. See doc comment above.
+    // The kernel's own jetsam daemon manages system-wide pressure responses.
+    // Per-process hints are emitted by execute_actions.rs with explicit target PIDs.
 }
 
 /// Enable I/O throttle sysctl during SuperEmergency.
