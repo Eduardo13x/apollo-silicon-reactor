@@ -680,12 +680,28 @@ fn migrate_to_ecores(
     // Try to use direct Mach QoS manager (Phase 2: ~50µs vs ~5ms per call).
     let mut qos_guard = qos_mgr.as_ref().and_then(|m| m.try_lock().ok());
 
+    // Snapshot foreground state once before the loop (cached, <1µs).
+    let fg_state = bufs.fg_detector.detect();
+    let fg_pid = fg_state.pid();
+    let recently_active_window = std::time::Duration::from_secs(300);
+
     for (pid, proc_info) in sys.processes() {
         let pid_u32 = pid.as_u32();
         if pid_u32 <= 1 || main_frozen_pids.contains(&pid_u32) {
             continue;
         }
+        // Skip foreground app and recently active apps.
+        // Without this check any GUI app inactive > 5 min (Brave, VS Code, Slack)
+        // gets demoted to E-cores, and the OS takes seconds to re-promote them
+        // when the user switches back — perceived as system slowness.
+        // [Apple QoS doc] — Background tier stays until explicitly promoted.
+        if fg_pid == Some(pid_u32) {
+            continue;
+        }
         let name = proc_info.name();
+        if bufs.fg_detector.is_recently_active(name, recently_active_window) {
+            continue;
+        }
         if bufs.is_essential(name) || bufs.is_protected(name) {
             continue;
         }
