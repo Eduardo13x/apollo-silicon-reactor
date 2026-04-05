@@ -958,7 +958,13 @@ pub fn decide_actions(
         actions.extend(others);
 
         DecisionOutput {
-            context,
+            // Report effective_context (the context actually used for decisions),
+            // not the raw measured context. When call_in_progress elevates
+            // InteractiveFocus → BackgroundPressure, the raw context is misleading:
+            // observability logs would show "InteractiveFocus" while decisions were
+            // made under BackgroundPressure semantics.
+            // [Kleppmann 2017 DDIA §11] — observability records must reflect actual execution.
+            context: effective_context,
             reactor_event_weight,
             blockers,
             actions,
