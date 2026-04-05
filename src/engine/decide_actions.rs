@@ -800,7 +800,11 @@ pub fn decide_actions(
                     name,
                     aggressive: false,
                     reason: "deferrable-ml-daemon: throttled under memory pressure".to_string(),
-                    start_sec: 0,
+                    // Pass start_sec so verify_pid_identity can guard against PID
+                    // recycling between snapshot and execution. The old start_sec=0
+                    // caused this path to fall back to name-only matching, which is
+                    // weaker (6-char prefix/suffix comparison only).
+                    start_sec: process.start_time(),
                     start_usec: 0,
                 });
             }
