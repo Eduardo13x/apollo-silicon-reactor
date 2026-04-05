@@ -5243,13 +5243,13 @@ fn main() -> anyhow::Result<()> {
                         .find(|p| p.name() == "WindowServer")
                         .map(|p| p.cpu_usage())
                         .unwrap_or(0.0);
-                    // Compression ratio: compressed / total RAM ∈ [0, 1].
-                    let total_ram = collector.system().total_memory().max(1);
-                    let used_ram = collector.system().used_memory();
-                    let free_ram = collector.system().free_memory();
-                    let compressed = used_ram.saturating_sub(total_ram.saturating_sub(free_ram));
+                    // Compression signal from the EMA-smoothed compressor_pressure already
+                    // computed by the collector (ratio of compressor pages to total physical
+                    // pages × 0.85). The old formula used_ram - (total - free) was wrong:
+                    // on macOS total ≠ used + free (inactive/wired/speculative pages exist),
+                    // producing saturating_sub underflow → always 0 or nonsense.
                     m.metrics.compressed_memory_ratio =
-                        (compressed as f64 / total_ram as f64).clamp(0.0, 1.0);
+                        snapshot.pressure.compressor_pressure.clamp(0.0, 1.0);
                     // Frozen RAM: sum of RSS of currently frozen PIDs.
                     let sys = collector.system();
                     let frozen_pids = state.frozen_state.lock_recover().clone();
