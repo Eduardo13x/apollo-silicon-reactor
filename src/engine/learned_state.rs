@@ -213,7 +213,11 @@ impl LearnedState {
     /// Prune stale data, decay old signals, compress bloated sections.
     /// Called automatically by `persist_improved()`.
     pub fn self_improve(&mut self) {
-        self.persist_generations = self.persist_generations.saturating_add(1);
+        // NOTE: persist_generations is incremented by persist_improved() before
+        // calling self_improve(), so we must NOT increment here too.
+        // Double-incrementing causes all half-life / decay calculations to run
+        // at 2× the intended speed (beliefs forgotten prematurely).
+        // [Hamilton 2007] — version counters must increment exactly once per operation.
 
         if let Some(ot) = &mut self.outcome_tracker {
             // 1. Decay co-occurrence counts — old pairs fade out.
