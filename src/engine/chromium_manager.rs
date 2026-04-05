@@ -55,6 +55,10 @@ const FD_CHECK_EVERY_N_CYCLES: u8 = 5;
 /// Renderers always have Unix-domain IPC sockets; we only block on TCP/UDP.
 const MIN_INET_SOCKETS_TO_BLOCK: usize = 1;
 
+/// Max cycles a renderer stays frozen before forced thaw (~5 min at 2s/cycle).
+/// Prevents renderers stuck frozen if fg-change detection misses a tab switch.
+const MAX_FROZEN_CYCLES: u8 = 150;
+
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 /// A detected Chromium/Electron renderer process.
@@ -75,6 +79,8 @@ pub struct RendererInfo {
     pub has_assertion: bool,
     /// CPU history over last 3 cycles (newest first).
     cpu_history: [f32; 3],
+    /// Cycles elapsed since this renderer was frozen (for max-freeze-duration guard).
+    frozen_cycles: u8,
 }
 
 impl RendererInfo {
@@ -90,6 +96,7 @@ impl RendererInfo {
             has_inet_sockets: false,
             has_assertion: false,
             cpu_history: [cpu_pct, 0.0, 0.0],
+            frozen_cycles: 0,
         }
     }
 
@@ -166,6 +173,11 @@ pub struct ChromiumManager {
     pub recoveries_applied: u32,
     /// E-core renderers this cycle.
     ecore_count: u32,
+    /// Previous foreground browser — detect fg change to trigger immediate thaw.
+    /// [Bug fix]: frozen renderers show 0% CPU always; thaw must be event-driven.
+    prev_fg_browser: Option<String>,
+    /// PIDs already sent to E-core demotion — avoid repeat calls each cycle.
+    ecore_demoted: HashSet<u32>,
 }
 
 impl Default for ChromiumManager {
@@ -189,6 +201,8 @@ impl ChromiumManager {
             freezes_applied: 0,
             recoveries_applied: 0,
             ecore_count: 0,
+            prev_fg_browser: None,
+            ecore_demoted: HashSet::new(),
         }
     }
 
@@ -339,6 +353,13 @@ impl ChromiumManager {
                 entry.consecutive_idle_cycles = 0;
             }
 
+            // Update frozen duration counter — used for max-freeze-duration guard
+            if entry.frozen {
+                entry.frozen_cycles = entry.frozen_cycles.saturating_add(1);
+            } else {
+                entry.frozen_cycles = 0;
+            }
+
             // Periodic network FD check (expensive — rate limited)
             if do_fd_check || !entry.has_inet_sockets {
                 entry.has_inet_sockets = Self::has_inet_sockets(pid);
@@ -369,7 +390,33 @@ impl ChromiumManager {
         });
 
         // Collect freeze/thaw decisions per browser (respect MAX_FREEZE_RATIO)
-        // First pass: thaws and E-core demotions (always safe)
+
+        // ── Foreground-browser-change thaw (Bug fix #1) ───────────────────────
+        // A SIGSTOP'd process always reports 0% CPU — the previous CPU-spike
+        // thaw condition (cpu_pct > threshold) would NEVER fire for frozen
+        // renderers. Thaw must be event-driven: when the user switches to a
+        // Chromium browser, immediately SIGCONT all its frozen renderers so
+        // they are ready when the browser activates a tab via IPC.
+        // [Denning 1968] Working set must be in memory when process resumes.
+        let fg_changed = fg_browser.as_ref() != self.prev_fg_browser.as_ref();
+        if fg_changed {
+            if let Some(new_fg) = &fg_browser {
+                for (&pid, info) in &self.renderers {
+                    if &info.browser == new_fg && info.frozen && !main_frozen.contains(&pid) {
+                        actions.push(ChromiumAction::ThawRenderer {
+                            pid,
+                            name: info.name.clone(),
+                        });
+                    }
+                }
+            }
+            self.prev_fg_browser = fg_browser.clone();
+        }
+
+        // Prune dead PIDs from ecore_demoted set (Bug fix #4)
+        self.ecore_demoted.retain(|pid| self.renderers.contains_key(pid));
+
+        // First pass: per-renderer thaws (non-frozen CPU spike) and E-core demotions
         let pids: Vec<u32> = self.renderers.keys().copied().collect();
 
         for pid in &pids {
@@ -383,7 +430,13 @@ impl ChromiumManager {
                 continue;
             }
 
-            // Thaw check: if frozen but now CPU-active, send SIGCONT
+            // Skip if already queued for thaw by the fg-change pass above
+            if actions.iter().any(|a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == *pid)) {
+                continue;
+            }
+
+            // Thaw check 1: frozen renderer with CPU spike
+            // (rare — would mean SIGSTOP failed or OS resumed it externally)
             if info.frozen && info.cpu_pct > THAW_CPU_THRESHOLD {
                 actions.push(ChromiumAction::ThawRenderer {
                     pid: *pid,
@@ -392,13 +445,24 @@ impl ChromiumManager {
                 continue;
             }
 
-            // E-core demotion for non-foreground renderers
-            // (skip if this renderer belongs to the foreground browser)
+            // Thaw check 2: max-freeze-duration guard — force thaw after ~5 min.
+            // Prevents renderers stuck frozen if a foreground change was missed.
+            // [Denning 1968] A process suspended too long must be reintegrated.
+            if info.frozen && info.frozen_cycles >= MAX_FROZEN_CYCLES {
+                actions.push(ChromiumAction::ThawRenderer {
+                    pid: *pid,
+                    name: info.name.clone(),
+                });
+                continue;
+            }
+
+            // E-core demotion for non-foreground renderers — deduplicated (Bug fix #4)
+            // Only emit once per renderer, not every cycle (mach_qos.set_tier is sticky)
             let is_fg_browser = fg_browser
                 .as_ref()
                 .map(|fb| fb == &info.browser)
                 .unwrap_or(false);
-            if !is_fg_browser && !info.frozen {
+            if !is_fg_browser && !info.frozen && !self.ecore_demoted.contains(pid) {
                 actions.push(ChromiumAction::DemoteToEcores {
                     pid: *pid,
                     name: info.name.clone(),
@@ -525,10 +589,12 @@ impl ChromiumManager {
                     if let Some(info) = self.renderers.get_mut(pid) {
                         info.frozen = false;
                         info.consecutive_idle_cycles = 0;
+                        info.frozen_cycles = 0;
                     }
                 }
-                ChromiumAction::DemoteToEcores { .. } => {
+                ChromiumAction::DemoteToEcores { pid, .. } => {
                     self.ecore_demotions += 1;
+                    self.ecore_demoted.insert(*pid);
                 }
             }
         }
@@ -1233,5 +1299,115 @@ mod tests {
             "ChromiumManager.update() too slow: {:?}/call",
             elapsed / 1000
         );
+    }
+
+    // ── Thaw behaviour fixes ───────────────────────────────────────────────────
+
+    /// Bug fix #1: SIGSTOP'd renderers always report 0% CPU — the old thaw
+    /// condition (cpu_pct > threshold) would never fire. Thaw must happen when
+    /// the foreground browser changes, not on CPU spike detection.
+    #[test]
+    fn thaw_on_foreground_browser_change() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+
+        // Cycle 1-3: Brave renderers idle, no foreground
+        let brave_procs: Vec<(u32, &str, f32, u64)> = vec![
+            (200, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
+            (201, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
+        ];
+        mgr.set_pressure_context(0.80); // aggressive: 1 cycle to freeze
+        for _ in 0..4 {
+            mgr.update(&brave_procs, None, &none_set, &none_set);
+        }
+
+        // Mark renderers as frozen (simulate daemon executing FreezeRenderer actions)
+        if let Some(r) = mgr.renderers.get_mut(&200) {
+            r.frozen = true;
+            r.frozen_cycles = 1;
+        }
+        if let Some(r) = mgr.renderers.get_mut(&201) {
+            r.frozen = true;
+            r.frozen_cycles = 1;
+        }
+        mgr.frozen_pids.insert(200);
+        mgr.frozen_pids.insert(201);
+
+        // Simulate: 0% CPU (as would happen for SIGSTOP'd process)
+        let frozen_procs: Vec<(u32, &str, f32, u64)> = vec![
+            (200, "Brave Browser Helper (Renderer)", 0.0, 50_000_000),
+            (201, "Brave Browser Helper (Renderer)", 0.0, 50_000_000),
+        ];
+
+        // No foreground — no thaw yet
+        let actions = mgr.update(&frozen_procs, None, &none_set, &none_set);
+        let thaws: Vec<_> = actions.iter().filter(|a| matches!(a, ChromiumAction::ThawRenderer { .. })).collect();
+        assert!(thaws.is_empty(), "No thaw when no foreground browser");
+
+        // User switches to Brave (pid 200 is now foreground)
+        let actions = mgr.update(&frozen_procs, Some(200), &none_set, &none_set);
+        let thaws: Vec<u32> = actions.iter().filter_map(|a| match a {
+            ChromiumAction::ThawRenderer { pid, .. } => Some(*pid),
+            _ => None,
+        }).collect();
+        assert_eq!(thaws.len(), 2, "Both frozen Brave renderers must thaw on fg change, got {:?}", thaws);
+        assert!(thaws.contains(&200), "pid 200 must be thawed");
+        assert!(thaws.contains(&201), "pid 201 must be thawed");
+    }
+
+    /// Bug fix #2: Max-freeze-duration guard — renderer frozen too long gets
+    /// thawed even if foreground detection missed the switch.
+    #[test]
+    fn thaw_after_max_frozen_cycles() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        let procs: Vec<(u32, &str, f32, u64)> = vec![
+            (300, "Brave Browser Helper (Renderer)", 0.0, 50_000_000),
+        ];
+
+        mgr.update(&procs, None, &none_set, &none_set);
+        // Simulate frozen state
+        if let Some(r) = mgr.renderers.get_mut(&300) {
+            r.frozen = true;
+            r.frozen_cycles = MAX_FROZEN_CYCLES; // at the limit
+        }
+        mgr.frozen_pids.insert(300);
+
+        // One more cycle pushes frozen_cycles to MAX_FROZEN_CYCLES+1 via saturating_add
+        // But since we set it to MAX_FROZEN_CYCLES directly, update() sees >= MAX and thaws
+        let actions = mgr.update(&procs, None, &none_set, &none_set);
+        let thaws: Vec<_> = actions.iter().filter(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 300)).collect();
+        assert!(!thaws.is_empty(), "Renderer must be thawed after MAX_FROZEN_CYCLES");
+    }
+
+    /// Bug fix #4: E-core demotion must not be re-emitted every cycle for the
+    /// same renderer (mach_qos.set_tier is sticky — repeat calls are waste).
+    #[test]
+    fn ecore_demotion_deduplicated_across_cycles() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        let procs: Vec<(u32, &str, f32, u64)> = vec![
+            (400, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
+        ];
+
+        // Cycle 1: first time — should emit DemoteToEcores
+        let actions1 = mgr.update(&procs, None, &none_set, &none_set);
+        let demotions1 = actions1.iter().filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. })).count();
+        assert_eq!(demotions1, 1, "First cycle must emit exactly 1 demotion");
+
+        // Cycle 2: same renderer — must NOT re-emit (already demoted)
+        let actions2 = mgr.update(&procs, None, &none_set, &none_set);
+        let demotions2 = actions2.iter().filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. })).count();
+        assert_eq!(demotions2, 0, "Subsequent cycles must NOT re-emit demotion for same PID");
+    }
+
+    /// Bug fix #3: FreezeSource::ChromiumManager must exist as distinct variant.
+    /// (Compilation test — if the enum doesn't have this variant this won't build.)
+    #[test]
+    fn freeze_source_chromium_manager_variant_exists() {
+        use crate::engine::types::FreezeSource;
+        let src = FreezeSource::ChromiumManager;
+        // Just needs to compile and be non-panicking
+        let _ = format!("{:?}", src);
     }
 }

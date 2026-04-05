@@ -395,6 +395,8 @@ pub enum FreezeSource {
     Manual,
     /// Frozen by thermal pre-throttle (Phase3Aggressive ≥90°C).
     ThermalPreThrottle,
+    /// Frozen by ChromiumManager (idle tab renderer — safe to SIGCONT on fg change).
+    ChromiumManager,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

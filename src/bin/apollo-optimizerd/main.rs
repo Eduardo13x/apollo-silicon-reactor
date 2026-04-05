@@ -4663,7 +4663,7 @@ fn main() -> anyhow::Result<()> {
                                     fs.entry(*pid).or_insert(
                                         apollo_optimizer::engine::types::FrozenEntry {
                                             frozen_at: chrono::Utc::now(),
-                                            source: apollo_optimizer::engine::types::FreezeSource::MainLoop,
+                                            source: apollo_optimizer::engine::types::FreezeSource::ChromiumManager,
                                             pressure_at_freeze: snapshot.pressure.memory_pressure,
                                             process_name: Some(name.clone()),
                                         },
