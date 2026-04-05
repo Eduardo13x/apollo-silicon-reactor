@@ -334,6 +334,7 @@ mod tests {
                 wakeup_rate: 50.0,
                 phys_footprint_mb: 300.0,
                 disk_write_mbps: 0.1,
+                anomaly_score: 0.0,
             },
             ProcessEnergyDelta {
                 pid: 2,
@@ -344,6 +345,7 @@ mod tests {
                 wakeup_rate: 10.0,
                 phys_footprint_mb: 50.0,
                 disk_write_mbps: 0.0,
+                anomaly_score: 0.0,
             },
         ];
 
