@@ -1051,6 +1051,17 @@ fn main() -> anyhow::Result<()> {
                 println!("[kpc] KPC counters unavailable (SIP or not root)");
             }
 
+            // ── AMX Coprocessor Probe (one-time, at startup) ─────────────────
+            // AMX (Apple Matrix coprocessor) probe via raw ASM: `.word 0x00201220`.
+            // This is the undocumented instruction reverse-engineered by the Asahi Linux
+            // team and @corsix. Done once at startup in a forked child (safe — if AMX
+            // is absent, SIGILL fires in child and we see non-zero exit status).
+            let amx_available = amx_detector::probe_amx_available();
+            let amx_cs_overhead_ns = amx_detector::amx_context_switch_overhead_ns();
+            if amx_available {
+                tracing::info!("[amx] Apple Matrix coprocessor available (~{}ns ctx-switch overhead)", amx_cs_overhead_ns);
+            }
+
             // ── Cache Contention Detector ───────────────────────────────────
             // Detects L2 cache competition between co-executing high-CPU processes
             // using system-wide IPC as proxy. Observation-only until Phase 3.
@@ -2624,6 +2635,10 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.energy_top_pid_name = top.name.clone();
                         metrics.metrics.energy_top_pid_mw = top.power_mw;
                     }
+
+                    // AMX availability (static — probed once at startup).
+                    metrics.metrics.amx_available = amx_available;
+                    metrics.metrics.amx_cs_overhead_ns = amx_cs_overhead_ns;
 
                     // Wakeup vampire report: top 3 processes by wakeup rate.
                     // [Apple Activity Monitor] wakeup rate = primary "Energy Impact" signal.

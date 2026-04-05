@@ -716,6 +716,15 @@ pub struct RuntimeMetrics {
     /// Processes with >50 idle+interrupt wakeups/sec drain battery even when idle.
     #[serde(default)]
     pub wakeup_vampires: Vec<String>,
+    /// Whether Apple AMX coprocessor is available on this chip.
+    /// Detected via raw ASM probe: `.word 0x00201220` (AMX_SET instruction) in forked child.
+    /// AMX is the undocumented matrix coprocessor used by Accelerate.framework for BLAS/ML.
+    #[serde(default)]
+    pub amx_available: bool,
+    /// AMX context-switch overhead estimate (nanoseconds).
+    /// When AMX state is dirty, context switches incur ~50ns overhead (5120B save/restore).
+    #[serde(default)]
+    pub amx_cs_overhead_ns: u64,
     // Cache contention detection (ContentionDetector)
     #[serde(default)]
     pub contention_score: f64,

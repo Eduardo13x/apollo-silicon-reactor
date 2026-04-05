@@ -518,6 +518,15 @@ fn render_intelligence(status: &DaemonStatus) -> Vec<String> {
         ));
     }
 
+    // AMX coprocessor (undocumented — probed via raw ASM .word 0x00201220)
+    if m.amx_available {
+        lines.push(format!(
+            "AMX: {} (ctx-switch ~{}ns)",
+            green("active"),
+            m.amx_cs_overhead_ns
+        ));
+    }
+
     lines
 }
 
