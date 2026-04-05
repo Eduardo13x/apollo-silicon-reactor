@@ -4615,6 +4615,21 @@ fn main() -> anyhow::Result<()> {
                 {
                     use apollo_optimizer::engine::chromium_manager::ChromiumAction;
 
+                    // FocusMarkov context: top-5 predictions + elapsed dwell time.
+                    // [Altmann & Trafton 2002] Pre-thaw browsers predicted as next switch.
+                    {
+                        let preds: Vec<(String, f64, f64)> = focus_markov
+                            .predict_top_n(
+                                foreground_app.as_deref().unwrap_or(""),
+                                5,
+                            )
+                            .into_iter()
+                            .map(|p| (p.app_name, p.probability, p.avg_dwell_secs))
+                            .collect();
+                        let elapsed = focus_markov.elapsed_dwell_secs();
+                        chromium_mgr.set_markov_context(&preds, elapsed);
+                    }
+
                     // Pressure-adaptive aggressiveness
                     chromium_mgr.set_pressure_context(
                         snapshot.pressure.memory_pressure as f32,
@@ -4683,6 +4698,16 @@ fn main() -> anyhow::Result<()> {
                                 );
                                 apollo_optimizer::engine::chromium_manager::ChromiumManager::thaw_renderer(*pid);
                                 state.frozen_state.lock_recover().remove(pid);
+                                // NARS belief update: observe whether renderer survived freeze.
+                                // Alive after thaw = success (0.3 salience). Dead = failure (0.8).
+                                // [Pei Wang 2013] Revision rule accumulates evidence over time.
+                                let browser = apollo_optimizer::engine::chromium_manager::ChromiumManager::browser_name(name.as_str()).to_string();
+                                let alive = proc_snaps.iter().any(|p| p.pid == *pid);
+                                chromium_mgr.observe_freeze_outcome(
+                                    &browser,
+                                    alive,
+                                    if alive { 0.3 } else { 0.8 },
+                                );
                             }
                             ChromiumAction::DemoteToEcores { pid, name } => {
                                 tracing::debug!(
