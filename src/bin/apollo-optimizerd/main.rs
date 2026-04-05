@@ -4682,10 +4682,28 @@ fn main() -> anyhow::Result<()> {
                             }
                         })
                         .collect();
+                    // Fluidity launch guard: defer ALL new freezes while an app launch
+                    // is in progress. App startup is a latency-sensitive critical path —
+                    // background interference causes visible jank and slow launch times.
+                    // [Selkowitz 1984] "Graphical Simulation" — launch is the user's
+                    // primary interaction moment; background must yield completely.
+                    let fluidity_launch_active = fluidity_state.launch_active;
+                    if fluidity_launch_active {
+                        tracing::debug!(
+                            launch = %fluidity_state.launch_name,
+                            cycles_remaining = fluidity_state.launch_cycles_remaining,
+                            "fluidity: launch active — deferring new freezes"
+                        );
+                    }
+
                     let confirmed_actions: Vec<RootAction> = graced_actions
                         .into_iter()
                         .filter(|a| {
                             if let RootAction::FreezeProcess { pid, .. } = a {
+                                // Skip new freezes during app launch (launch acceleration)
+                                if fluidity_launch_active {
+                                    return false;
+                                }
                                 let count = freeze_candidates.entry(*pid).or_insert(0);
                                 *count += 1;
                                 *count >= 2
