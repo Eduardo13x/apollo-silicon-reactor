@@ -4619,6 +4619,11 @@ fn main() -> anyhow::Result<()> {
                     chromium_mgr.set_pressure_context(
                         snapshot.pressure.memory_pressure as f32,
                     );
+                    // Arousal-adaptive aggressiveness [Yerkes-Dodson 1908]
+                    // Override pressure thresholds with arousal-based ones when
+                    // arousal signal is available — crisis arousal freezes faster,
+                    // idle arousal thaws everything.
+                    chromium_mgr.set_arousal_context(arousal_state.level);
                     // Pause freeze decisions during window ops / app launches
                     chromium_mgr.set_fluidity_context(
                         fluidity_state.window_op_active(),
