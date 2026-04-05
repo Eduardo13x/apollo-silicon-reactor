@@ -1202,7 +1202,9 @@ fn main() -> anyhow::Result<()> {
                     let mut qos = state.mach_qos.lock_recover();
                     qos.release_all_app_nap();
                 }
-                last_cycle_instant = Instant::now();
+                // NOTE: do NOT reset last_cycle_instant here — it must span the full
+                // inter-cycle interval so that cycle_dt_secs (computed later) reflects
+                // the real wall-clock gap between cycles, not just intra-cycle work time.
                 let in_wake_suppression = wake_suppression_until
                     .map(|t| Instant::now() < t)
                     .unwrap_or(false);
