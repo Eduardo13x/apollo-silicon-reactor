@@ -468,6 +468,22 @@ fn safety_compliance(input: &AisInput) -> f64 {
         _ => 0.0,
     };
 
+    // Throttle precision: when the daemon intervenes, it should not need to revert.
+    // [Beyer & Jones 2016] SRE Ch.3: precision of intervention = low revert rate.
+    // Revert rate = throttle_reverted / noise_total (noise_total = throttles_applied).
+    // 0 reverts = all throttles were correct → +0.10 safety bonus.
+    // This component rewards the daemon's self-calibration (RL-adjusted threshold
+    // learning), which reduces false-positive throttles over time.
+    let throttle_precision = if input.noise_total > 0 {
+        let reverts = input.noise_total.saturating_sub(input.noise_throttled);
+        let revert_rate = reverts as f64 / input.noise_total as f64;
+        // Score: 0 reverts → 0.10, 10% reverts → 0.05, 20%+ reverts → 0.0
+        (0.10 * (1.0 - (revert_rate / 0.20).min(1.0))).max(0.0)
+    } else {
+        0.05 // no data → neutral half-credit
+    };
+    score += throttle_precision;
+
     score.clamp(0.0, 1.0)
 }
 
