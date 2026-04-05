@@ -236,7 +236,17 @@ pub fn compute_ais(input: &AisInput) -> AisScore {
 // - 30% noise throttling (precision)
 // - 30% interactive boosting (recall)
 fn decision_precision(input: &AisInput) -> f64 {
-    let protected_rate = safe_ratio(input.protected_preserved, input.protected_total);
+    // When no process was elevated to "protected" by BPS, the system correctly
+    // determined that zero processes needed priority preservation — recall is
+    // vacuously perfect (universal quantification over the empty set is true).
+    // [Laplace 1812] "Théorie analytique des probabilités" — empty-set events
+    // satisfy all preservation constraints; safe_ratio(0,0)=0.5 is wrong here
+    // because 0 eligible = 0 wrongly discarded = perfect recall.
+    let protected_rate = if input.protected_total == 0 {
+        1.0
+    } else {
+        safe_ratio(input.protected_preserved, input.protected_total)
+    };
     let noise_rate = safe_ratio(input.noise_throttled, input.noise_total);
     let interactive_rate = safe_ratio(input.interactive_boosted, input.interactive_total);
 
