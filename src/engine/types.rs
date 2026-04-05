@@ -712,6 +712,10 @@ pub struct RuntimeMetrics {
     /// >0.7 = system >70% memory-bound → freeze decisions are lower risk.
     #[serde(default)]
     pub kpc_memory_bound_score: f64,
+    /// Top 3 wakeup vampire processes: "name(rate/s)" strings.
+    /// Processes with >50 idle+interrupt wakeups/sec drain battery even when idle.
+    #[serde(default)]
+    pub wakeup_vampires: Vec<String>,
     // Cache contention detection (ContentionDetector)
     #[serde(default)]
     pub contention_score: f64,

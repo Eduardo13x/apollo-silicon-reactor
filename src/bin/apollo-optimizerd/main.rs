@@ -2625,6 +2625,21 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.energy_top_pid_mw = top.power_mw;
                     }
 
+                    // Wakeup vampire report: top 3 processes by wakeup rate.
+                    // [Apple Activity Monitor] wakeup rate = primary "Energy Impact" signal.
+                    let mut wakeup_sorted: Vec<_> = energy_pid_results.iter()
+                        .filter(|e| e.wakeup_rate >= 50.0)
+                        .collect();
+                    wakeup_sorted.sort_by(|a, b| b.wakeup_rate.partial_cmp(&a.wakeup_rate)
+                        .unwrap_or(std::cmp::Ordering::Equal));
+                    metrics.metrics.wakeup_vampires = wakeup_sorted.iter().take(3)
+                        .map(|e| format!("{}({:.0}/s)", e.name, e.wakeup_rate))
+                        .collect();
+                    metrics.metrics.kpc_memory_bound_score =
+                        kpc_snap.as_ref().map(|k| k.memory_bound_score).unwrap_or(
+                            metrics.metrics.kpc_memory_bound_score
+                        );
+
                     // Daemon self-IPC (thread_selfcounts syscall 186)
                     let _cycle_ipc = cycle_ipc_tracker.tick();
                     metrics.metrics.daemon_cycle_ipc = cycle_ipc_tracker.ema_ipc();

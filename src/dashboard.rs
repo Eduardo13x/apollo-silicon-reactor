@@ -498,6 +498,26 @@ fn render_intelligence(status: &DaemonStatus) -> Vec<String> {
         lines.push(format!("  {}", dim(mech)));
     }
 
+    // KPC memory-bound score
+    if m.kpc_memory_bound_score > 0.0 {
+        let score_label = if m.kpc_memory_bound_score > 0.7 {
+            green(&format!("{:.0}% memory-stalled", m.kpc_memory_bound_score * 100.0))
+        } else if m.kpc_memory_bound_score > 0.4 {
+            yellow(&format!("{:.0}% memory-stalled", m.kpc_memory_bound_score * 100.0))
+        } else {
+            dim(&format!("{:.0}% memory-stalled", m.kpc_memory_bound_score * 100.0))
+        };
+        lines.push(format!("KPC: {}", score_label));
+    }
+
+    // Wakeup vampires: battery drain daemons
+    if !m.wakeup_vampires.is_empty() {
+        lines.push(format!(
+            "Wakeup Vampires: {}",
+            yellow(&m.wakeup_vampires.join(", "))
+        ));
+    }
+
     lines
 }
 
