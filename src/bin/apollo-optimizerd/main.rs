@@ -921,6 +921,7 @@ fn main() -> anyhow::Result<()> {
             let mut restored_trial_skill: Option<(String, f64)> = None;
             // Restored arousal state — applied after arousal_state is declared below.
             let mut restored_arousal: Option<apollo_optimizer::engine::nars_belief::ArousalState> = None;
+            let mut restored_process_baselines: Option<apollo_optimizer::engine::process_baseline::ProcessBaselineMap> = None;
             if let Some(learned) = LearnedState::load(ls_path) {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
@@ -930,7 +931,7 @@ fn main() -> anyhow::Result<()> {
                 // If skill_registry field is absent (old file), the legacy load is kept.
                 // Returns (overflow_history, frozen_pids, arousal_state) for
                 // components that need caller-side wiring.
-                let (ls_overflow_history, ls_frozen_pids, ls_arousal) = learned.apply(
+                let (ls_overflow_history, ls_frozen_pids, ls_arousal, ls_baselines) = learned.apply(
                     &mut signal_intel,
                     &mut outcome_tracker,
                     &mut specialist_accuracy,
@@ -939,6 +940,8 @@ fn main() -> anyhow::Result<()> {
                     Some(&mut causal_graph),
                 );
                 restored_arousal = ls_arousal;
+                // Restore process baselines — wired into energy_pid_tracker after DaemonSubsystems::new().
+                restored_process_baselines = ls_baselines;
                 // Restore overflow guard history from unified persistence.
                 // Migration: if learned_state has history, it takes precedence over
                 // the legacy overflow_history.json already loaded above.
@@ -1133,6 +1136,11 @@ fn main() -> anyhow::Result<()> {
             // across restarts. [Yerkes & Dodson 1908]
             let mut arousal_state = restored_arousal
                 .unwrap_or_else(apollo_optimizer::engine::nars_belief::ArousalState::default);
+            // Restore process baselines: warm EMA-MAD history survives daemon restarts.
+            // Called after DaemonSubsystems::new() so energy_pid_tracker is available.
+            if let Some(baselines) = restored_process_baselines {
+                energy_pid_tracker.restore_baseline(baselines);
+            }
             // Spotlight pause state: true when Apollo has paused Spotlight indexing
             // via mdutil to relieve memory pressure.  Re-enabled when pressure normalizes.
             let mut spotlight_paused: bool = false;
@@ -5360,6 +5368,7 @@ fn main() -> anyhow::Result<()> {
                 None,
                 Some(arousal_state.clone()),
                 Some(&causal_graph),
+                Some(energy_pid_tracker.baseline.clone()),
             );
 
             // Revert sysctls to defaults on shutdown.

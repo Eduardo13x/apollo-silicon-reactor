@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::engine::causal_graph::{CausalEdge, CausalGraph};
+use crate::engine::process_baseline::ProcessBaselineMap;
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
 use crate::engine::nars_belief::ArousalState;
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
@@ -104,6 +105,14 @@ pub struct LearnedState {
     /// re-learning which throttles are effective. [Pearl 2009]
     #[serde(default)]
     pub causal_graph_edges: Option<Vec<((String, String), CausalEdge)>>,
+
+    /// Per-process hardware counter baselines for behavioral anomaly detection.
+    /// EMA + EMA-MAD per {ipc, wakeup_rate, disk_mbps} per process name.
+    /// Persisted so warm baselines (≥ 5 obs) survive daemon restarts — without this,
+    /// every restart discards learned behavioral norms and cold-starts anomaly detection.
+    /// [Holt 1957] exponential smoothing; [Chandola 2009] EMA-MAD anomaly detection.
+    #[serde(default)]
+    pub process_baselines: Option<ProcessBaselineMap>,
 }
 
 fn default_version() -> u32 {
@@ -134,6 +143,7 @@ impl LearnedState {
         frozen_state: Option<FrozenStatePersisted>,
         arousal_state: Option<ArousalState>,
         causal_graph: Option<&CausalGraph>,
+        process_baselines: Option<ProcessBaselineMap>,
     ) -> Self {
         Self {
             version: 1,
@@ -149,6 +159,7 @@ impl LearnedState {
             frozen_pids: frozen_state,
             arousal_state,
             causal_graph_edges: causal_graph.map(|cg| cg.to_persisted()),
+            process_baselines,
         }
     }
 
@@ -169,7 +180,7 @@ impl LearnedState {
         skill_registry: &mut SkillRegistry,
         effectiveness_tracker: &mut EffectivenessTracker,
         causal_graph: Option<&mut CausalGraph>,
-    ) -> (Option<OverflowHistory>, Option<FrozenStatePersisted>, Option<ArousalState>) {
+    ) -> (Option<OverflowHistory>, Option<FrozenStatePersisted>, Option<ArousalState>, Option<ProcessBaselineMap>) {
         self.validate();
         if let Some(si) = self.signal_intelligence {
             signal_intel.restore(si);
@@ -194,7 +205,7 @@ impl LearnedState {
                 cg.restore(edges);
             }
         }
-        (self.overflow_guard_history, self.frozen_pids, self.arousal_state)
+        (self.overflow_guard_history, self.frozen_pids, self.arousal_state, self.process_baselines)
     }
 
     // ── Self-improvement: called before persist ─────────────────────────
@@ -236,7 +247,12 @@ impl LearnedState {
             }
         }
 
-        // 6. Causal graph decay: stale edges lose confidence over time.
+        // 6. Process baseline prune: remove entries with 0 observations (defensive).
+        if let Some(pb) = &mut self.process_baselines {
+            pb.prune_stale();
+        }
+
+        // 7. Causal graph decay: stale edges lose confidence over time.
         //    [Bayesian forgetting] factor=0.97 → half-life ≈ 23 persist cycles.
         //    Prune edges with near-zero impact AND low evidence.
         if let Some(edges) = &mut self.causal_graph_edges {
@@ -329,6 +345,7 @@ impl LearnedState {
         pending_trial_skill: Option<(String, f64)>,
         arousal_state: Option<ArousalState>,
         causal_graph: Option<&CausalGraph>,
+        process_baselines: Option<ProcessBaselineMap>,
     ) {
         let mut state = Self::collect(
             signal_intel,
@@ -340,10 +357,16 @@ impl LearnedState {
             frozen_state,
             arousal_state,
             causal_graph,
+            process_baselines,
         );
         state.persist_generations = prev_generations.saturating_add(1);
         state.last_restore_quality = last_quality;
         state.pending_trial_skill = pending_trial_skill;
+        // If no baselines were passed (periodic persist), preserve the previously
+        // persisted baselines so we don't erase them on every cycle persist.
+        if state.process_baselines.is_none() {
+            state.process_baselines = Self::load(path).and_then(|old| old.process_baselines);
+        }
         state.self_improve();
         state.persist(path);
     }
@@ -353,6 +376,15 @@ impl LearnedState {
         if let Ok(json) = serde_json::to_string(self) {
             let _ = std::fs::write(path, json);
         }
+    }
+
+    /// Patch only the `process_baselines` field of an existing persisted file.
+    /// Reads the file, updates the field, writes back. No-op if file is missing.
+    /// Used by periodic persist which doesn't have access to the baseline map.
+    pub fn patch_process_baselines(path: &Path, baselines: ProcessBaselineMap) {
+        let Some(mut state) = Self::load(path) else { return };
+        state.process_baselines = Some(baselines);
+        state.persist(path);
     }
 
     /// Load from disk. Returns None on any error (cold start is safe).
@@ -521,6 +553,7 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            process_baselines: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -546,6 +579,7 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            process_baselines: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -569,6 +603,7 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            process_baselines: None,
         };
         assert_eq!(
             state
@@ -607,6 +642,7 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            process_baselines: None,
         };
         state.self_improve();
         assert_eq!(state.persist_generations, 6);
@@ -640,6 +676,7 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            process_baselines: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -679,6 +716,7 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            process_baselines: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
