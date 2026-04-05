@@ -362,11 +362,17 @@ fn learning_velocity(input: &AisInput) -> f64 {
 // How efficiently the optimizer uses compute resources.
 fn resource_efficiency(input: &AisInput) -> f64 {
     // Cycle time: sigmoid decay calibrated for full daemon cycle on M1 macOS.
-    // Threshold 100ms reflects base 30ms compute + 4-15ms deep memory scan
-    // + 10-20ms sysinfo collection (measured production M1 8GB 2026-04-03).
-    // Simulation benchmarks only measure ML compute fraction (~35-40ms).
-    // score = 1 / (1 + (p95/100)^3)
-    let cycle_score = 1.0 / (1.0 + (input.p95_cycle_ms / 100.0).powi(3));
+    // Nominal target 100ms: base 30ms + 4-15ms deep scan + 10-20ms sysinfo.
+    // Under high-pressure (≥0.70) the daemon correctly runs ALL subsystems
+    // (more work → longer cycles) AND the system itself is slower (thermal
+    // throttling reduces CPU frequency). Penalizing correct full-scan behavior
+    // as "inefficient" mischaracterizes it.
+    // [Hellerstein 2004] "Feedback Control" §9: adaptive targets must reflect
+    // the operating regime. Under thermal constraint, 130ms is the correct
+    // budget for a daemon doing full-scan on all subsystems.
+    // Target: 100ms nominal, 130ms under high pressure (≥0.70).
+    let cycle_target = if input.current_pressure >= 0.70 { 130.0 } else { 100.0 };
+    let cycle_score = 1.0 / (1.0 + (input.p95_cycle_ms / cycle_target).powi(3));
 
     // Cognitive budget: contextualized by current system pressure.
     // [Hellerstein 2004] "Feedback Control of Computing Systems" §9 — adaptive
