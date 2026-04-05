@@ -45,6 +45,31 @@ const ALPHA: f64 = 0.10;
 /// score >= ANOMALY_THRESHOLD → process is anomalous for that signal.
 pub const ANOMALY_THRESHOLD: f64 = 3.0;
 
+/// Cold-start warm baseline count target.
+/// Below this, effective threshold is raised to suppress false positives.
+/// [Chandola 2009 §4.1] detectors with few training samples have high FP rate.
+const WARM_TARGET: usize = 10;
+
+/// Compute effective anomaly threshold given how many warm baselines exist.
+///
+/// With few warm baselines (cold start), raises threshold to avoid throttling
+/// on statistical noise from poorly-trained detectors.
+///
+/// Formula: `ANOMALY_THRESHOLD × (1 + cold_factor)` where
+/// `cold_factor = max(0, (WARM_TARGET - warm_count) / WARM_TARGET) × 0.5`
+///
+/// At warm_count=0  → threshold × 1.5 (50% higher, very conservative)
+/// At warm_count=5  → threshold × 1.25
+/// At warm_count=10 → threshold × 1.0 (nominal, fully warmed)
+pub fn effective_threshold(warm_count: usize) -> f64 {
+    let cold_factor = if warm_count >= WARM_TARGET {
+        0.0
+    } else {
+        (WARM_TARGET - warm_count) as f64 / WARM_TARGET as f64 * 0.5
+    };
+    ANOMALY_THRESHOLD * (1.0 + cold_factor)
+}
+
 /// Single-signal streaming baseline: EMA value + EMA of absolute deviation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalBaseline {
@@ -351,5 +376,24 @@ mod tests {
             .collect();
         assert!(hints.contains_key(&42), "Spotlight should appear in anomaly_hints");
         assert!(hints[&42] >= ANOMALY_THRESHOLD);
+    }
+
+    #[test]
+    fn effective_threshold_cold_start_raises_threshold() {
+        // At warm_count=0 → threshold × 1.5 (maximum conservatism during cold start).
+        let t = effective_threshold(0);
+        assert!((t - ANOMALY_THRESHOLD * 1.5).abs() < 1e-9,
+            "cold start should raise threshold 50%, got {}", t);
+    }
+
+    #[test]
+    fn effective_threshold_warm_returns_nominal() {
+        // At warm_count >= WARM_TARGET → exactly ANOMALY_THRESHOLD (no penalty).
+        let t = effective_threshold(WARM_TARGET);
+        assert_eq!(t, ANOMALY_THRESHOLD, "fully warm should return nominal threshold");
+
+        // Strictly above WARM_TARGET — still nominal.
+        let t2 = effective_threshold(WARM_TARGET + 5);
+        assert_eq!(t2, ANOMALY_THRESHOLD);
     }
 }

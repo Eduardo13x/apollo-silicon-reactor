@@ -2171,11 +2171,16 @@ fn main() -> anyhow::Result<()> {
                 let io_burst_hints = apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_io_burst_hints(
                     &energy_pid_results, 5.0,
                 );
-                // Behavioral anomaly hints: processes deviating ≥ 3 MADs from their
-                // learned {ipc, wakeup_rate, disk_mbps} baseline get priority throttle.
+                // Behavioral anomaly hints: processes deviating ≥ threshold MADs from
+                // their learned {ipc, wakeup_rate, disk_mbps} baseline get priority throttle.
+                // Threshold is raised during cold start (< 10 warm baselines) to suppress
+                // false positives from poorly-trained detectors. [Chandola 2009 §4.1]
+                let anomaly_thresh = apollo_optimizer::engine::process_baseline::effective_threshold(
+                    energy_pid_tracker.baseline.warm_count()
+                );
                 let anomaly_hints: std::collections::HashMap<u32, f64> = energy_pid_results
                     .iter()
-                    .filter(|r| r.anomaly_score >= apollo_optimizer::engine::process_baseline::ANOMALY_THRESHOLD)
+                    .filter(|r| r.anomaly_score >= anomaly_thresh)
                     .map(|r| (r.pid, r.anomaly_score))
                     .collect();
 
@@ -2678,7 +2683,7 @@ fn main() -> anyhow::Result<()> {
                     // Behavioral anomaly telemetry: top 3 anomalous processes.
                     // "name(score×)" e.g. "backupd(8.2×)" = 8.2 MADs above baseline.
                     let mut anomaly_sorted: Vec<_> = energy_pid_results.iter()
-                        .filter(|e| e.anomaly_score >= apollo_optimizer::engine::process_baseline::ANOMALY_THRESHOLD)
+                        .filter(|e| e.anomaly_score >= anomaly_thresh)
                         .collect();
                     anomaly_sorted.sort_by(|a, b| b.anomaly_score.partial_cmp(&a.anomaly_score)
                         .unwrap_or(std::cmp::Ordering::Equal));
