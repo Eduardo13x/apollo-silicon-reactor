@@ -631,7 +631,11 @@ mod tests {
     }
 
     #[test]
-    fn self_improve_increments_generations() {
+    fn self_improve_does_not_increment_generations() {
+        // persist_generations is incremented exactly once per persist cycle by
+        // persist_improved() BEFORE calling self_improve(). self_improve() must
+        // NOT increment it again — doing so would advance the counter by 2 per
+        // cycle, making all decay / half-life calculations run at 2× intended rate.
         let mut state = LearnedState {
             version: 1,
             signal_intelligence: None,
@@ -649,7 +653,7 @@ mod tests {
             process_baselines: None,
         };
         state.self_improve();
-        assert_eq!(state.persist_generations, 6);
+        assert_eq!(state.persist_generations, 5, "self_improve must not touch persist_generations");
     }
 
     #[test]
