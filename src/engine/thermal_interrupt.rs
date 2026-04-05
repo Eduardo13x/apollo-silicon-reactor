@@ -231,16 +231,77 @@ impl SentinelBuffers {
             essential.insert(name);
         }
 
-        // Protected: dev background workloads and build tools that have no foreground
-        // and should never be frozen regardless of idle state.
-        // User-visible apps (browsers, terminals, etc.) are handled by reactive unfreeze.
+        // Protected: dev background workloads + ALL user-facing GUI apps.
+        //
+        // Critical insight: the sentinel has no access to CGWindowServer to know if a
+        // process has a visible window. Instead we enumerate all known user-facing
+        // apps explicitly. Any GUI app NOT in this list risks SIGSTOP when it has been
+        // inactive > 5 min (the is_recently_active window), even while visible/minimized.
+        //
+        // [WWDC 2017 "Modernizing GCD Usage"] — user-interactive processes need
+        // dedicated CPU; freezing them produces visible hangs and broken IPC.
         for name in [
+            // Apollo itself
+            "apollo-optimizerd",
+            // Build tools — background but never safe to freeze mid-compile
             "node",
             "cargo",
             "rustc",
             "swift",
             "clang",
-            "apollo-optimizerd",
+            "python3",
+            "python",
+            // Web browsers — all have multi-process architectures; freezing the main
+            // process or a renderer hangs IPC and the OS may force-quit the app.
+            "Brave Browser",
+            "Brave Browser H",       // Brave Helper (Renderer/GPU/Plugin)
+            "Google Chrome",
+            "Google Chrome H",
+            "Safari",
+            "SafariForWebKitDevel",
+            "Firefox",
+            "firefox",
+            "Arc",
+            "Microsoft Edge",
+            // IDEs and editors
+            "Xcode",
+            "Code",            // VS Code
+            "Cursor",
+            "Nova",
+            "Zed",
+            "RubyMine",
+            "IntelliJ IDEA",
+            // Terminals
+            "Terminal",
+            "iTerm2",
+            "Warp",
+            "Ghostty",
+            "alacritty",
+            "kitty",
+            // Communication / collaboration
+            "zoom.us",
+            "Slack",
+            "Teams",
+            "Discord",
+            "Telegram",
+            "Signal",
+            "FaceTime",
+            // Media — active playback pipelines; SIGSTOP causes audio/video stutter
+            "Spotify",
+            "Music",
+            "Podcasts",
+            "QuickTime Player",
+            // AI / LLM apps
+            "Claude",
+            "LM Studio",
+            "Ollama",
+            // Other common GUI apps
+            "Finder",
+            "Mail",
+            "Calendar",
+            "Notes",
+            "Messages",
+            "Antigravity",
         ] {
             protected.insert(name);
         }
