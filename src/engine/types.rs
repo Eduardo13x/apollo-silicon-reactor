@@ -934,6 +934,24 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub ml_throttle_source: String,
 
+    // ── Fluidity Intelligence ────────────────────────────────────────────────
+    /// Composite fluidity score 0–1 (1 = perfectly fluid, Kalman-smoothed).
+    /// Combines WindowServer CPU, GPU load, and app launch pressure.
+    #[serde(default)]
+    pub fluidity_score: f32,
+    /// True when WindowServer CPU spike detected (window resize/move active).
+    #[serde(default)]
+    pub window_op_active: bool,
+    /// True when a new app launch is in progress (protection window active).
+    #[serde(default)]
+    pub app_launching: bool,
+    /// Name of the app currently being launched (empty if none).
+    #[serde(default)]
+    pub app_launch_name: String,
+    /// True when sustained fluidity degradation detected (EMA < 0.65).
+    #[serde(default)]
+    pub fluidity_degraded: bool,
+
     // ── User context telemetry ────────────────────────────────────────────────
     /// Seconds since last keyboard/mouse event (from IOHIDSystem HIDIdleTime).
     /// 0 = recently active or unknown.
