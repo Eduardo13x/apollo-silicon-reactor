@@ -815,7 +815,16 @@ pub struct RuntimeMetrics {
     /// Experience memory size (resolved outcome records).
     #[serde(default)]
     pub experience_memory_size: usize,
-    // ── Action queue backpressure ─────────────────────────────────────────
+    /// Causal edges with slow-horizon (15-cycle) data. Captures delayed effects.
+    #[serde(default)]
+    pub causal_slow_horizon_count: usize,
+    /// Causal edges with mechanism attribution (RSS/CPU/swap channel identified).
+    #[serde(default)]
+    pub causal_mechanism_count: usize,
+    /// Top causal mechanism summaries: "throttle:X via rss (−42MB)" format.
+    #[serde(default)]
+    pub causal_mechanisms: Vec<String>,
+    // ── Action queue backpressure ───��───────────────────────────────���─────
     /// Current backpressure ratio of the action queue [0.0, 1.0].
     /// 0.0 = queue empty. 1.0 = queue at capacity.
     /// High values mean actions are accumulating faster than they are executed.

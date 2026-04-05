@@ -472,6 +472,32 @@ fn render_intelligence(status: &DaemonStatus) -> Vec<String> {
         ));
     }
 
+    // Causal reasoning depth: show multi-horizon and mechanism attribution status.
+    if m.causal_slow_horizon_count > 0 || m.causal_mechanism_count > 0 {
+        let horizon_label = if m.causal_slow_horizon_count > 5 {
+            green(&format!("{} edges", m.causal_slow_horizon_count))
+        } else if m.causal_slow_horizon_count > 0 {
+            yellow(&format!("{} edges", m.causal_slow_horizon_count))
+        } else {
+            dim("cold")
+        };
+        let mech_label = if m.causal_mechanism_count > 3 {
+            green(&format!("{} edges", m.causal_mechanism_count))
+        } else if m.causal_mechanism_count > 0 {
+            yellow(&format!("{} edges", m.causal_mechanism_count))
+        } else {
+            dim("cold")
+        };
+        lines.push(format!(
+            "Causal Depth: slow-horizon={} | mechanisms={}",
+            horizon_label, mech_label
+        ));
+    }
+    // Top mechanism attributions: show WHY throttles work.
+    for mech in m.causal_mechanisms.iter().take(3) {
+        lines.push(format!("  {}", dim(mech)));
+    }
+
     lines
 }
 

@@ -86,6 +86,27 @@ pub fn update_learning_metrics<'a>(
     m.metrics.arousal_level = arousal_state.level;
     m.metrics.arousal_zone = arousal_state.zone().to_string();
     m.metrics.experience_memory_size = lctx.outcome_tracker.experience.len();
+    m.metrics.causal_slow_horizon_count = lctx.causal_graph.slow_horizon_count();
+    m.metrics.causal_mechanism_count = lctx.causal_graph.mechanism_count();
+    // Top mechanism summaries for observability.
+    m.metrics.causal_mechanisms = lctx.causal_graph.solid_edges_by_impact()
+        .iter()
+        .take(5)
+        .filter_map(|e| {
+            if e.mechanism.observations >= 3 {
+                let m_type = e.mechanism.primary();
+                let detail = match m_type {
+                    "rss" => format!("−{:.0}MB", e.mechanism.rss_delta_mb),
+                    "cpu" => format!("−{:.0}%", e.mechanism.cpu_delta_pct),
+                    "swap" => format!("−{:.0}MB", e.mechanism.swap_delta_mb),
+                    _ => "?".to_string(),
+                };
+                Some(format!("{} via {} ({})", e.cause, m_type, detail))
+            } else {
+                None
+            }
+        })
+        .collect();
     // Causal effect average: mean effect across last resolved outcomes.
     m.metrics.causal_effect_avg = {
         let effectiveness = lctx.outcome_tracker.overall_effectiveness();
