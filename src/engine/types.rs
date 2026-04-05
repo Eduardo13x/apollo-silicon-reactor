@@ -733,6 +733,10 @@ pub struct RuntimeMetrics {
     /// e.g. "backupd(8.2×)" = backupd is 8.2 MADs above its baseline behavior.
     #[serde(default)]
     pub anomaly_processes: Vec<String>,
+    /// Number of process baselines with ≥ 5 observations (warm, actively detecting anomalies).
+    /// 0 = cold start (no anomaly detection yet); grows as processes are observed.
+    #[serde(default)]
+    pub process_baseline_warm: usize,
     // Cache contention detection (ContentionDetector)
     #[serde(default)]
     pub contention_score: f64,

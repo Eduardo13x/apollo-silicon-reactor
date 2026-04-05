@@ -2686,6 +2686,7 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.anomaly_processes = anomaly_sorted.iter().take(3)
                         .map(|e| format!("{}({:.1}×)", e.name, e.anomaly_score))
                         .collect();
+                    metrics.metrics.process_baseline_warm = energy_pid_tracker.baseline.warm_count();
 
                     // Daemon self-IPC (thread_selfcounts syscall 186)
                     let _cycle_ipc = cycle_ipc_tracker.tick();
