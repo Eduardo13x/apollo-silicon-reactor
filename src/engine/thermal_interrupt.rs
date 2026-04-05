@@ -743,8 +743,9 @@ fn freeze_non_critical(
     // Snapshot once: PIDs doing active work (audio, downloads, active children).
     let busy_pids = active_pids(sys.processes());
 
-    let mut frozen_count = 0_u64;
-    let mut newly_frozen = Vec::new();
+    // Candidates collected in the filter loop; SIGSTOP sent only after identity
+    // verification (one batch re-snapshot post-loop).
+    let mut newly_frozen: Vec<(u32, String)> = Vec::new();
 
     // Snapshot foreground state once before the loop (cached, <1µs).
     let fg_state = bufs.fg_detector.detect();
@@ -785,34 +786,54 @@ fn freeze_non_critical(
         if newly_frozen.len() >= 4 {
             break;
         }
-        unsafe {
-            libc::kill(pid_u32 as i32, libc::SIGSTOP);
-        }
-        newly_frozen.push(pid_u32);
-        frozen_count += 1;
+        // Collect candidates; identity verification and SIGSTOP happen after the loop
+        // (one batch re-snapshot instead of one System per process → O(N) not O(N²)).
+        newly_frozen.push((pid_u32, name.to_string()));
     }
 
+    // Identity verification: one batch re-snapshot for all candidates.
+    // Avoids PID recycling between the filter snapshot and the actual SIGSTOP.
+    // One System refresh is O(N) shared; doing it per-process would be O(N²).
+    // [Chen et al. 2002] — TOCTTOU: verify identity before acting on a PID.
+    let mut confirmed_frozen: Vec<u32> = Vec::new();
     if !newly_frozen.is_empty() {
+        let verify_sys = sysinfo::System::new_with_specifics(
+            sysinfo::RefreshKind::new()
+                .with_processes(sysinfo::ProcessRefreshKind::new()),
+        );
+        for (pid_u32, expected_name) in &newly_frozen {
+            let pid_key = sysinfo::Pid::from_u32(*pid_u32);
+            let name_matches = verify_sys
+                .process(pid_key)
+                .map(|p| p.name() == expected_name.as_str())
+                .unwrap_or(false); // process no longer exists → do not signal
+            if !name_matches {
+                // PID recycled or process exited between snapshot and now.
+                continue;
+            }
+            unsafe {
+                libc::kill(*pid_u32 as i32, libc::SIGSTOP);
+            }
+            confirmed_frozen.push(*pid_u32);
+        }
+    }
+
+    if !confirmed_frozen.is_empty() {
         if let Ok(mut guard) = state.interrupt_frozen_pids.lock() {
-            for &pid in &newly_frozen {
+            for &pid in &confirmed_frozen {
                 guard.insert(pid);
             }
         }
         // Sync into main_frozen so frozen_state.json captures sentinel freezes.
-        // Usar lock_recover() (bloqueante) para garantizar consistencia de estado.
-        // Este lock se mantiene brevemente (<1µs por entry), no hay riesgo de deadlock
-        // porque el main loop no llama freeze_non_critical con el lock tomado.
         {
             let mut mf = main_frozen.lock_recover();
             let now = Utc::now();
-            for pid in newly_frozen {
-                mf.entry(pid).or_insert_with(|| FrozenEntry {
+            for pid in &confirmed_frozen {
+                mf.entry(*pid).or_insert_with(|| FrozenEntry {
                     frozen_at: now,
                     source: FreezeSource::Sentinel,
-                    // Pressure not available in interrupt context; use 1.0 so
-                    // only the TTL path can trigger early unfreeze for these entries.
                     pressure_at_freeze: 1.0,
-                    process_name: None, // name not available in interrupt context
+                    process_name: None,
                 });
             }
         }
@@ -820,7 +841,7 @@ fn freeze_non_critical(
 
     state
         .total_frozen
-        .fetch_add(frozen_count, Ordering::Relaxed);
+        .fetch_add(confirmed_frozen.len() as u64, Ordering::Relaxed);
 }
 
 /// Send memory pressure hint via sysctl to trigger kernel-level page reclaim.
