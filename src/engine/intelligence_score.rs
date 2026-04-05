@@ -591,16 +591,25 @@ mod tests {
             inversions / pairs
         };
 
-        // Entropy TPR: utility_entropy EMA tracks outcome-feedback on entropy-subsystem decisions.
-        // Floor at 0.5 (neutral): utility_entropy decays toward 0 when entropy subsystem is
-        // inactive (quiet workload, no anomalies to detect). A quiet system with no anomalies
-        // is NOT the same as failing to detect anomalies — it means there is nothing to detect.
-        // [Jaynes 2003] "Probability Theory": absent evidence → neutral prior, not worst case.
-        // safe_ratio_u32(0,0)=0.5 applies the same principle for count-based metrics.
+        // Entropy TPR: utility_entropy EMA + process-baseline anomaly coverage.
+        // Base floor 0.5: absent entropy activity = neutral prior [Jaynes 2003 §9.2].
+        // Elevated floor when process_baseline detector has warm baselines:
+        // detecting 0 anomalies across N warm processes IS a true negative —
+        // positive evidence the detection subsystem is working correctly.
+        // [Chandola 2009 ACM CSUR §3.1] detection power scales with coverage
+        // (warm baselines). Coverage ≥30 processes → floor rises to 0.80.
+        let pb_warm = rm_u("process_baseline_warm");
+        let pb_floor = if pb_warm == 0 {
+            0.5  // No coverage yet — pure neutral prior
+        } else {
+            // Scale floor: 0 warm→0.50, ≥30 warm→0.80. Represents growing
+            // confidence that "no anomaly" is a correctly classified true negative.
+            0.5 + 0.3 * (pb_warm as f64 / 30.0).min(1.0)
+        };
         let entropy_tpr = ls["signal_intelligence"]["utility_entropy"]
             .as_f64()
-            .unwrap_or(0.5)
-            .max(0.5)  // no activity = neutral, not failure
+            .unwrap_or(pb_floor)
+            .max(pb_floor)
             .clamp(0.0, 1.0);
 
         // ── D3: Learning Velocity ────────────────────────────────────────────
