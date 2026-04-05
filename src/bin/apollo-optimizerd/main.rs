@@ -2675,6 +2675,18 @@ fn main() -> anyhow::Result<()> {
                             metrics.metrics.kpc_memory_bound_score
                         );
 
+                    // Behavioral anomaly telemetry: top 3 anomalous processes.
+                    // "name(score×)" e.g. "backupd(8.2×)" = 8.2 MADs above baseline.
+                    let mut anomaly_sorted: Vec<_> = energy_pid_results.iter()
+                        .filter(|e| e.anomaly_score >= apollo_optimizer::engine::process_baseline::ANOMALY_THRESHOLD)
+                        .collect();
+                    anomaly_sorted.sort_by(|a, b| b.anomaly_score.partial_cmp(&a.anomaly_score)
+                        .unwrap_or(std::cmp::Ordering::Equal));
+                    metrics.metrics.anomaly_process_count = anomaly_sorted.len();
+                    metrics.metrics.anomaly_processes = anomaly_sorted.iter().take(3)
+                        .map(|e| format!("{}({:.1}×)", e.name, e.anomaly_score))
+                        .collect();
+
                     // Daemon self-IPC (thread_selfcounts syscall 186)
                     let _cycle_ipc = cycle_ipc_tracker.tick();
                     metrics.metrics.daemon_cycle_ipc = cycle_ipc_tracker.ema_ipc();

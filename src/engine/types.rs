@@ -725,6 +725,14 @@ pub struct RuntimeMetrics {
     /// When AMX state is dirty, context switches incur ~50ns overhead (5120B save/restore).
     #[serde(default)]
     pub amx_cs_overhead_ns: u64,
+    /// Number of processes with anomaly_score ≥ 3.0 this cycle.
+    /// Processes deviating ≥ 3 MADs from their learned hardware counter baseline.
+    #[serde(default)]
+    pub anomaly_process_count: usize,
+    /// Top anomalous processes: "name(score×)" strings, sorted by score descending.
+    /// e.g. "backupd(8.2×)" = backupd is 8.2 MADs above its baseline behavior.
+    #[serde(default)]
+    pub anomaly_processes: Vec<String>,
     // Cache contention detection (ContentionDetector)
     #[serde(default)]
     pub contention_score: f64,

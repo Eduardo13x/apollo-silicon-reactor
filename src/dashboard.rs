@@ -518,6 +518,16 @@ fn render_intelligence(status: &DaemonStatus) -> Vec<String> {
         ));
     }
 
+    // Behavioral anomalies: processes deviating from learned baseline
+    if !m.anomaly_processes.is_empty() {
+        let label = if m.anomaly_process_count >= 3 {
+            red(&m.anomaly_processes.join(", "))
+        } else {
+            yellow(&m.anomaly_processes.join(", "))
+        };
+        lines.push(format!("Anomalies: {}", label));
+    }
+
     // AMX coprocessor (undocumented — probed via raw ASM .word 0x00201220)
     if m.amx_available {
         lines.push(format!(
