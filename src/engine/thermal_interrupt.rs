@@ -1171,16 +1171,23 @@ mod tests {
     #[test]
     fn sentinel_buffers_protected_detection() {
         let bufs = SentinelBuffers::new(Arc::new(ForegroundDetector::new()));
-        // Build tools are statically protected (no foreground window).
+        // Build tools are statically protected.
         assert!(bufs.is_protected("apollo-optimizerd"));
         assert!(bufs.is_protected("cargo"));
         assert!(bufs.is_protected("rustc"));
         assert!(bufs.is_protected("node"));
-        // User-visible apps are handled by ForegroundDetector, not the static set.
-        assert!(!bufs.is_protected("Google Chrome"));
-        assert!(!bufs.is_protected("iTerm2"));
-        // Analytics daemons are not protected.
+        // User-facing GUI apps are now ALSO in the static protected set.
+        // The sentinel cannot query CGWindowServer, so explicit enumeration
+        // of known GUI apps is the only safe approach. Without this, any GUI
+        // app inactive > 300s would receive SIGSTOP during thermal Emergency.
+        assert!(bufs.is_protected("Google Chrome"), "browsers must be statically protected");
+        assert!(bufs.is_protected("Brave Browser"), "browsers must be statically protected");
+        assert!(bufs.is_protected("Safari"), "browsers must be statically protected");
+        assert!(bufs.is_protected("Slack"), "communication apps must be protected");
+        assert!(bufs.is_protected("Claude"), "AI apps must be protected");
+        // Analytics/background daemons are still not protected.
         assert!(!bufs.is_protected("com.apple.photoanalysisd"));
+        assert!(!bufs.is_protected("mlhostd"));
     }
 
     #[test]
