@@ -441,6 +441,38 @@ fn render_intelligence(status: &DaemonStatus) -> Vec<String> {
         lines.push(format!("Fuentes: {}", dim(&sources)));
     }
 
+    // ── Fluidity Intelligence ────────────────────────────────────────────────
+    // Always show: score drives key freeze/QoS decisions every cycle.
+    {
+        let score = m.fluidity_score;
+        let score_colored = if score > 0.8 {
+            green(&format!("{:.2}", score))
+        } else if score > 0.6 {
+            yellow(&format!("{:.2}", score))
+        } else {
+            red(&format!("{:.2}", score))
+        };
+        let ws_str = if m.windowserver_cpu_pct > 25.0 {
+            yellow(&format!("WS={:.0}%", m.windowserver_cpu_pct))
+        } else {
+            dim(&format!("WS={:.0}%", m.windowserver_cpu_pct))
+        };
+        let launch_str = if m.app_launching {
+            yellow(&format!(" launching={}", m.app_launch_name))
+        } else {
+            dim(" launching=false")
+        };
+        let window_str = if m.window_op_active {
+            yellow(" win_op=true")
+        } else {
+            dim(" win_op=false")
+        };
+        lines.push(format!(
+            "FLUIDITY  score={} {} {}{}",
+            score_colored, ws_str, window_str, launch_str
+        ));
+    }
+
     // Affective arousal indicator (Yerkes-Dodson zone)
     if m.arousal_level > 0.01 || !m.arousal_zone.is_empty() {
         let zone = if m.arousal_zone.is_empty() { "Idle" } else { &m.arousal_zone };
