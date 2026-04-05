@@ -5269,6 +5269,32 @@ fn main() -> anyhow::Result<()> {
                     &heuristic_critical_pids,
                     &thermal_action,
                 );
+
+                // ── Fluidity QoS elevation ───────────────────────────────────
+                // When a window operation or app launch is active, elevate the
+                // foreground app to Foreground (P-Core) tier immediately.
+                // [Apple QoS Programming Guide 2014] user-interactive QoS =
+                // render-frame priority on P-Cores (Firestorm).
+                if (fluidity_state.window_op_active() || fluidity_state.app_launching())
+                    && !thermal_action.force_ecores
+                {
+                    if let Some(fg_pid) = foreground_pid {
+                        let mut qos = state.mach_qos.lock_recover();
+                        let outcome = qos.set_tier(
+                            fg_pid,
+                            apollo_optimizer::engine::mach_qos::SchedulingTier::Foreground,
+                        );
+                        if outcome.success {
+                            tracing::debug!(
+                                pid = fg_pid,
+                                window_op = fluidity_state.window_op_active(),
+                                launching = fluidity_state.launch_active,
+                                "fluidity: elevated foreground to P-Core (Foreground QoS)"
+                            );
+                        }
+                    }
+                }
+
                 metrics_reporter::merge_cycle_metrics(
                     &state,
                     &exec_outcomes,
