@@ -431,6 +431,54 @@ impl CausalGraph {
             .filter(|e| e.mechanism.observations >= 3)
             .count()
     }
+
+    /// Experience-informed confidence: for processes with insufficient causal data
+    /// (< 5 observations), fall back to experience memory as a Bayesian prior.
+    /// [Kahneman & Tversky 1973] Availability heuristic: similar past episodes
+    /// inform current prediction. [Pearl 2009] §3.6 priors from observational data.
+    ///
+    /// Returns a blended confidence map where cold processes get priors from
+    /// experience memory, and warm processes use their causal graph confidence.
+    pub fn confidence_map_with_experience(
+        &self,
+        experience: &crate::engine::outcome_tracker::ExperienceMemory,
+        current_pressure: f64,
+    ) -> HashMap<String, f32> {
+        let mut map = self.confidence_map();
+
+        // For each process in experience that isn't in the causal map yet,
+        // compute a prior from similar episodes.
+        let mut seen: std::collections::HashSet<String> = map.keys().cloned().collect();
+
+        for record in experience.records() {
+            let key = format!("throttle:{}", record.process_name);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key.clone());
+
+            // Query experience for this process at current pressure.
+            if let Some((avg_drop, confidence)) =
+                experience.query_similar(&record.process_name, current_pressure)
+            {
+                // Convert experience effectiveness to causal prior.
+                // avg_drop > 0.02 and confidence > 0.15 → warm prior.
+                // Scale: a 0.05 average drop at 0.5 confidence → 0.65 prior.
+                if confidence >= 0.15 {
+                    let prior = if avg_drop >= 0.02 {
+                        // Effective in similar conditions: prior 0.5 + scaled by drop magnitude.
+                        (0.5 + (avg_drop * 3.0).min(0.4) as f32).min(0.85)
+                    } else {
+                        // Ineffective: low prior.
+                        0.25
+                    };
+                    map.insert(key, prior);
+                }
+            }
+        }
+
+        map
+    }
 }
 
 #[cfg(test)]

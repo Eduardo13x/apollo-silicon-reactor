@@ -3307,7 +3307,14 @@ fn main() -> anyhow::Result<()> {
                     m.metrics.habituation_skips += habituated_pids.len() as u64;
                 }
 
-                let causal_confidence = lctx.causal_graph.confidence_map();
+                // [Pearl 2009 + Kahneman 1973] Blend causal graph with experience priors.
+                // Cold processes (< 5 observations) get warm-start priors from
+                // similar past episodes, preventing the causal skip filter from
+                // requiring 5 wasteful throttles before it can make a judgment.
+                let causal_confidence = lctx.causal_graph.confidence_map_with_experience(
+                    &lctx.outcome_tracker.experience,
+                    snapshot.pressure.memory_pressure,
+                );
 
                 // ── User context: "telepathy" — what is the user doing right now? ──
                 // idle_secs from IOHIDSystem HIDIdleTime — fast ioreg call, safe every cycle.
