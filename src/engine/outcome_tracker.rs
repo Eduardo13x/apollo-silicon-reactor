@@ -591,10 +591,15 @@ impl OutcomeTracker {
             let mut counts: Vec<_> = self.co_occurrence.values().copied().collect();
             counts.sort_unstable();
             let cutoff = counts[counts.len().saturating_sub(100)];
-            // Use > to ensure entries at the cutoff boundary are evicted, keeping only
-            // entries strictly above the Nth-largest count. This guarantees the map
-            // shrinks to ≤100 entries even when many pairs share the same count.
-            self.co_occurrence.retain(|_, &mut v| v > cutoff);
+            // Safety floor: if all entries share the same count (e.g., every pair
+            // has count=1 after a cold start), `v > cutoff` retains nothing — a
+            // total wipe of the causal graph. Only prune when at least 50 entries
+            // would survive, preserving graph connectivity.
+            // [Boldi & Vigna 2014] — graph pruning must respect a minimum floor.
+            let would_retain = self.co_occurrence.values().filter(|&&v| v > cutoff).count();
+            if would_retain >= 50 {
+                self.co_occurrence.retain(|_, &mut v| v > cutoff);
+            }
         }
     }
 
