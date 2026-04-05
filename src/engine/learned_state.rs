@@ -235,6 +235,27 @@ impl LearnedState {
                 dd.decay_confidence(0.95);
             }
         }
+
+        // 6. Causal graph decay: stale edges lose confidence over time.
+        //    [Bayesian forgetting] factor=0.97 → half-life ≈ 23 persist cycles.
+        //    Prune edges with near-zero impact AND low evidence.
+        if let Some(edges) = &mut self.causal_graph_edges {
+            for (_, edge) in edges.iter_mut() {
+                // Decay both fast and slow confidence toward uninformed prior (0.5).
+                edge.confidence = 0.5 + (edge.confidence - 0.5) * 0.97;
+                edge.slow_confidence = 0.5 + (edge.slow_confidence - 0.5) * 0.97;
+                // Decay mechanism attribution EMAs.
+                edge.mechanism.rss_delta_mb *= 0.95;
+                edge.mechanism.cpu_delta_pct *= 0.95;
+                edge.mechanism.swap_delta_mb *= 0.95;
+            }
+            // Prune edges near uninformed prior with low evidence — no signal.
+            edges.retain(|(_, e)| {
+                let near_prior = (e.confidence - 0.5).abs() < 0.05
+                    && (e.slow_confidence - 0.5).abs() < 0.05;
+                !(near_prior && e.evidence_count < 10)
+            });
+        }
     }
 
     // ── Validation: called before apply ─────────────────────────────────
@@ -275,6 +296,16 @@ impl LearnedState {
             // All accuracy weights must be in [0, 1].
             for w in sa.weights_mut() {
                 *w = w.clamp(0.0, 1.0);
+            }
+        }
+
+        // Causal graph: clamp confidence values to [0, 1].
+        if let Some(edges) = &mut self.causal_graph_edges {
+            for (_, edge) in edges.iter_mut() {
+                edge.confidence = edge.confidence.clamp(0.0, 1.0);
+                edge.slow_confidence = edge.slow_confidence.clamp(0.0, 1.0);
+                edge.avg_delta = edge.avg_delta.clamp(0.0, 1.0);
+                edge.slow_avg_delta = edge.slow_avg_delta.clamp(0.0, 1.0);
             }
         }
     }
