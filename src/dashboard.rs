@@ -473,6 +473,35 @@ fn render_intelligence(status: &DaemonStatus) -> Vec<String> {
         ));
     }
 
+    // ── Chromium Renderer Manager ────────────────────────────────────────────
+    // Only show when there are tracked renderers (not present on all systems).
+    if m.chromium_renderers_total > 0 {
+        let frozen_str = if m.chromium_renderers_frozen > 0 {
+            yellow(&format!("frozen={}", m.chromium_renderers_frozen))
+        } else {
+            dim(&format!("frozen={}", m.chromium_renderers_frozen))
+        };
+        let freed_str = if m.chromium_freed_mb > 0.0 {
+            green(&format!("freed={:.0}MB", m.chromium_freed_mb))
+        } else {
+            dim("freed=0MB")
+        };
+        let browsers_str = if !m.chromium_browsers_managed.is_empty() {
+            let joined = m.chromium_browsers_managed.join(", ");
+            format!("  [{}]", joined)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "CHROMIUM  renderers={} {} e-core={} {}{}",
+            m.chromium_renderers_total,
+            frozen_str,
+            m.chromium_renderers_ecore,
+            freed_str,
+            browsers_str,
+        ));
+    }
+
     // Affective arousal indicator (Yerkes-Dodson zone)
     if m.arousal_level > 0.01 || !m.arousal_zone.is_empty() {
         let zone = if m.arousal_zone.is_empty() { "Idle" } else { &m.arousal_zone };

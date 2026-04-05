@@ -1086,6 +1086,14 @@ fn main() -> anyhow::Result<()> {
             let mut fluidity_state =
                 apollo_optimizer::engine::fluidity::FluidityState::new();
 
+            // ── Chromium Renderer Manager ────────────────────────────────────
+            // Manages RAM/CPU for ALL Chromium/Electron renderer subprocesses:
+            // Brave, Chrome, Edge, Arc, Vivaldi, Slack, Discord, Code, Cursor, etc.
+            // Tier 1: E-core demotion (safe). Tier 2: SIGSTOP idle renderers (guarded).
+            // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
+            let mut chromium_mgr =
+                apollo_optimizer::engine::chromium_manager::ChromiumManager::new();
+
             // ── Rosetta AOT Monitor ─────────────────────────────────────────
             // Watches /var/db/oah/ for write events → suppress freezing oahd.
             let mut rosetta_monitor = apollo_optimizer::engine::rosetta_monitor::RosettaMonitor::new();
@@ -4599,6 +4607,105 @@ fn main() -> anyhow::Result<()> {
                     actions.retain(|a| !matches!(a, RootAction::BoostProcess { .. }));
                 }
 
+                // ── Chromium Renderer Manager ────────────────────────────────────
+                // Update renderer inventory, apply E-core demotions and SIGSTOP/SIGCONT
+                // for idle tab renderers across ALL Chromium/Electron apps.
+                // Runs after all main-loop freeze decisions so we can exclude those PIDs.
+                // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
+                {
+                    use apollo_optimizer::engine::chromium_manager::ChromiumAction;
+
+                    // Pressure-adaptive aggressiveness
+                    chromium_mgr.set_pressure_context(
+                        snapshot.pressure.memory_pressure as f32,
+                    );
+                    // Pause freeze decisions during window ops / app launches
+                    chromium_mgr.set_fluidity_context(
+                        fluidity_state.window_op_active(),
+                        fluidity_state.launch_active,
+                    );
+
+                    // Build assertion PID set from existing frozen/active tracking
+                    let chromium_assertion_pids =
+                        apollo_optimizer::engine::activity_sensor::pids_with_assertions();
+
+                    // Current main-daemon frozen set (don't interfere)
+                    let main_frozen_set: HashSet<u32> =
+                        state.frozen_state.lock_recover().keys().copied().collect();
+
+                    let proc_list: Vec<(u32, &str, f32, u64)> = proc_snaps
+                        .iter()
+                        .map(|p| (p.pid, p.name.as_str(), p.cpu_percent, p.rss_bytes))
+                        .collect();
+
+                    let chromium_actions = chromium_mgr.update(
+                        &proc_list,
+                        foreground_pid,
+                        &chromium_assertion_pids,
+                        &main_frozen_set,
+                    );
+
+                    // Execute chromium actions
+                    for action in &chromium_actions {
+                        match action {
+                            ChromiumAction::FreezeRenderer { pid, name, estimated_mb } => {
+                                tracing::info!(
+                                    pid = pid,
+                                    name = name.as_str(),
+                                    estimated_mb = estimated_mb,
+                                    "chromium: freezing idle renderer"
+                                );
+                                let ok = apollo_optimizer::engine::chromium_manager::ChromiumManager::freeze_renderer(*pid);
+                                if ok {
+                                    // Register in the main frozen_state for crash-recovery
+                                    // and unified observability.
+                                    let mut fs = state.frozen_state.lock_recover();
+                                    fs.entry(*pid).or_insert(
+                                        apollo_optimizer::engine::types::FrozenEntry {
+                                            frozen_at: chrono::Utc::now(),
+                                            source: apollo_optimizer::engine::types::FreezeSource::MainLoop,
+                                            pressure_at_freeze: snapshot.pressure.memory_pressure,
+                                            process_name: Some(name.clone()),
+                                        },
+                                    );
+                                }
+                            }
+                            ChromiumAction::ThawRenderer { pid, name } => {
+                                tracing::info!(
+                                    pid = pid,
+                                    name = name.as_str(),
+                                    "chromium: thawing renderer (became active)"
+                                );
+                                apollo_optimizer::engine::chromium_manager::ChromiumManager::thaw_renderer(*pid);
+                                state.frozen_state.lock_recover().remove(pid);
+                            }
+                            ChromiumAction::DemoteToEcores { pid, name } => {
+                                tracing::debug!(
+                                    pid = pid,
+                                    name = name.as_str(),
+                                    "chromium: E-core demotion for background renderer"
+                                );
+                                let mut qos = state.mach_qos.lock_recover();
+                                let _ = qos.set_tier(
+                                    *pid,
+                                    apollo_optimizer::engine::mach_qos::SchedulingTier::Background,
+                                );
+                            }
+                        }
+                    }
+
+                    // Update chromium metrics in RuntimeMetrics
+                    {
+                        let cm = chromium_mgr.metrics();
+                        let mut m = state.metrics.lock_recover();
+                        m.metrics.chromium_renderers_total = cm.total_renderers;
+                        m.metrics.chromium_renderers_frozen = cm.frozen_renderers;
+                        m.metrics.chromium_renderers_ecore = cm.ecore_renderers;
+                        m.metrics.chromium_freed_mb = cm.estimated_freed_mb;
+                        m.metrics.chromium_browsers_managed = cm.browsers_managed;
+                    }
+                }
+
                 let policy = SafetyPolicy::for_capabilities(
                     SafetyPolicy::for_profile(current_profile),
                     hw_cores,
@@ -5535,6 +5642,15 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     // No actions to revert — clean up persisted defaults anyway.
                     sysctl_governor.mark_reverted();
+                }
+            }
+
+            // Chromium renderer cleanup: SIGCONT all renderers frozen by ChromiumManager.
+            // These are separate from the main frozen_state (different source tracking).
+            {
+                let thawed = chromium_mgr.shutdown_cleanup();
+                if !thawed.is_empty() {
+                    tracing::info!(count = thawed.len(), "chromium: shutdown cleanup — thawed all frozen renderers");
                 }
             }
 

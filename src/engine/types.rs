@@ -974,6 +974,23 @@ pub struct RuntimeMetrics {
     /// True when audio is actively being output (coreaudiod assertion).
     #[serde(default)]
     pub user_audio_active: bool,
+
+    // ── Chromium Renderer Manager ────────────────────────────────────────────
+    /// Total renderer processes tracked (across all Chromium/Electron apps).
+    #[serde(default)]
+    pub chromium_renderers_total: u32,
+    /// Renderer processes currently frozen (SIGSTOP) by ChromiumManager.
+    #[serde(default)]
+    pub chromium_renderers_frozen: u32,
+    /// Renderer processes demoted to E-cores this cycle.
+    #[serde(default)]
+    pub chromium_renderers_ecore: u32,
+    /// Estimated RAM freed (MB) by frozen renderers.
+    #[serde(default)]
+    pub chromium_freed_mb: f64,
+    /// Names of browsers/apps with managed renderers.
+    #[serde(default)]
+    pub chromium_browsers_managed: Vec<String>,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.

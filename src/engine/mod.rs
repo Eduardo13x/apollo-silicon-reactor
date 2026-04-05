@@ -1,5 +1,6 @@
 pub mod action_queue;
 pub mod activity_sensor;
+pub mod chromium_manager;
 pub mod adaptive_governor;
 pub mod analytics;
 pub mod background_collectors;
