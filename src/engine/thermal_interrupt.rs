@@ -859,18 +859,26 @@ fn recover(
 
     let pids_to_resume: Vec<u32> = state.interrupt_frozen_pids.lock_recover().drain().collect();
 
-    // Remove sentinel-owned entries from main_frozen to keep state in sync.
-    // Usar lock_recover() (bloqueante) en lugar de try_lock() para garantizar que
-    // los entries de FreezeSource::Sentinel siempre se limpien en recovery.
-    main_frozen
-        .lock_recover()
-        .retain(|_, entry| entry.source != FreezeSource::Sentinel);
-
     if pids_to_resume.is_empty() {
+        // Still clean up sentinel entries in main_frozen even if nothing to resume.
+        main_frozen
+            .lock_recover()
+            .retain(|_, entry| entry.source != FreezeSource::Sentinel);
         return;
     }
 
-    let main_frozen_pids: HashSet<u32> = main_frozen.lock_recover().keys().copied().collect();
+    // Consolidate retain + snapshot into ONE lock acquisition to eliminate TOCTOU.
+    // The original code acquired main_frozen twice: once for retain(), once for the
+    // keys snapshot. Between the two releases the main loop could insert a new
+    // FreezeSource::Apollo entry for a PID we just cleaned, causing the snapshot
+    // to show that PID as "main-loop frozen" and skip SIGCONT — leaving the process
+    // permanently stuck in SIGSTOP with no SIGCONT planned.
+    // [Herlihy & Shavit 2012] — check-then-act on shared state must be atomic.
+    let main_frozen_pids: HashSet<u32> = {
+        let mut mf = main_frozen.lock_recover();
+        mf.retain(|_, entry| entry.source != FreezeSource::Sentinel);
+        mf.keys().copied().collect()
+    };
 
     let mut recovered = 0_u64;
     for pid in pids_to_resume {
