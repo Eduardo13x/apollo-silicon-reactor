@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::engine::nars_belief::DriftDetector;
+use crate::engine::neon_ema;
 use crate::engine::overflow_guard::OverflowThresholds;
 use crate::engine::swap_predictor::SwapTrend;
 use crate::engine::user_profile::WorkloadType;
@@ -215,14 +216,47 @@ impl SpecialistAccuracyTracker {
             self.drift_detector.observe(name, correct);
             // Auto-recalibrate: if drift detected, reset drifted specialists toward neutral.
             if self.drift_detector.needs_recalibration() {
+                // Build mask: 1.0 if this specialist needs recalibration, 0.0 if stable.
+                // Drifted specialists get pulled toward INIT_ACCURACY (0.70); stable ones unchanged.
+                // NEON version: process all 4 specialists in one vfmaq_f32 instruction.
+                // [ARM NEON Guide §4] batch EMA: alpha * prior + (1-alpha) * current.
+                // Mask encodes selective update: alpha[i] = 0.1 if drifted, 0.0 if stable.
+                let mut ema_f32 = [0.0f32; 4];
+                let mut alphas  = [0.0f32; 4];
+                let prior_f32   = Self::INIT_ACCURACY as f32;
+
                 for i in 0..specialist::COUNT {
+                    ema_f32[i] = self.accuracy[i] as f32;
                     let n = specialist::NAMES[i];
-                    if let Some(tv) = self.drift_detector.belief(n) {
-                        // If the NARS belief for this specialist has low confidence
-                        // or has drifted, pull its EMA weight toward the neutral prior.
+                    alphas[i] = if let Some(tv) = self.drift_detector.belief(n) {
                         if tv.confidence < 0.3 || (tv.frequency as f64 - self.accuracy[i]).abs() > 0.20 {
-                            self.accuracy[i] = 0.9 * self.accuracy[i] + 0.1 * Self::INIT_ACCURACY;
+                            0.1_f32 // drifted: pull 10% toward prior
+                        } else {
+                            0.0_f32 // stable: no change
                         }
+                    } else {
+                        0.0_f32
+                    };
+                }
+
+                // NEON batch recalibration: pull ALL 4 specialists toward prior simultaneously.
+                // Specialists with alphas[i]=0.0 are unchanged by the EMA (0*prior + 1*ema = ema).
+                // Specialists with alphas[i]=0.1 move 10% toward prior.
+                // We process in two steps: for simplicity use uniform alpha=0.1 on all 4 then
+                // restore the stable ones from saved ema_f32.
+                // [ARM NEON Guide] ema_update_4 = 1 vfmaq_f32 instruction for all 4 specialists.
+                let saved = ema_f32; // save for restore of stable specialists
+                let prior4 = [prior_f32; 4];
+                neon_ema::ema_update_4(
+                    &mut ema_f32,
+                    &prior4,
+                    0.1_f32, // pull-toward-prior alpha
+                );
+                for i in 0..specialist::COUNT {
+                    if alphas[i] > 0.0 {
+                        self.accuracy[i] = ema_f32[i] as f64; // NEON result for drifted specialist
+                    } else {
+                        let _ = saved[i]; // stable: keep original (no-op, written for clarity)
                     }
                 }
                 self.drift_detector.acknowledge_recalibration();
