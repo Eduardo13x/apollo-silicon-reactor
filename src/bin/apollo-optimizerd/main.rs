@@ -364,8 +364,9 @@ fn run_reactor(state: SharedState) -> anyhow::Result<()> {
                         .store(true, Ordering::Release);
                 }
             } else if id == 3 {
-                let mut dummy: i32 = 0;
-                let _ = libc::read(launch_fd, &mut dummy as *mut _ as *mut libc::c_void, 4);
+                // EVFILT_PROC NOTE_FORK on launchd (pid 1) — no pipe to drain.
+                // launch_fd == -1 (sentinel); reading from it is always EBADF.
+                // Just increment the counter; the kernel event itself is the notification.
                 state.metrics.lock_recover().reactor_status.events_spawn += 1;
             } else if id == 4 {
                 let mut dummy: i32 = 0;
