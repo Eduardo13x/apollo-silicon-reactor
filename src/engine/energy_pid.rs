@@ -41,12 +41,16 @@ pub struct ProcessEnergyDelta {
     /// True physical memory footprint (MB). More accurate than RSS for freeze ranking
     /// because it excludes shared pages and includes compressed memory contribution.
     pub phys_footprint_mb: f64,
+    /// Disk writes this cycle (MB/s). High disk I/O during LLM inference = contention.
+    /// [Bhagwan & Savage 2002 OSDI] I/O-heavy background processes compete for disk
+    /// bandwidth with model weight loading — throttle during inference.
+    pub disk_write_mbps: f64,
 }
 
 /// Tracks ri_billed_energy deltas across cycles.
 pub struct EnergyPidTracker {
-    /// Previous readings: pid → (billed_energy_nj, instructions, cycles, proc_start_abstime, idle_wakeups, pkg_idle_wakeups).
-    prev: HashMap<u32, (u64, u64, u64, u64, u64, u64)>,
+    /// Previous readings: pid → (energy_nj, instructions, cycles, proc_start_abstime, idle_wakeups, interrupt_wakeups, disk_write_bytes).
+    prev: HashMap<u32, (u64, u64, u64, u64, u64, u64, u64)>,
 }
 
 impl EnergyPidTracker {
@@ -85,11 +89,12 @@ impl EnergyPidTracker {
                 rusage.proc_start_abstime,
                 rusage.idle_wakeups,
                 rusage.interrupt_wakeups,
+                rusage.disk_write_bytes,
             );
 
             let phys_footprint_mb = rusage.phys_footprint as f64 / (1024.0 * 1024.0);
 
-            if let Some(&(prev_energy, prev_instr, prev_cycles, prev_start, prev_idle_wk, prev_intr_wk)) =
+            if let Some(&(prev_energy, prev_instr, prev_cycles, prev_start, prev_idle_wk, prev_intr_wk, prev_disk_w)) =
                 self.prev.get(&pid)
             {
                 // PID recycling check: if proc_start_abstime changed, skip delta.
@@ -99,6 +104,7 @@ impl EnergyPidTracker {
                     let delta_cycles = current.2.saturating_sub(prev_cycles);
                     let delta_idle_wk = current.4.saturating_sub(prev_idle_wk);
                     let delta_intr_wk = current.5.saturating_sub(prev_intr_wk);
+                    let delta_disk_w = current.6.saturating_sub(prev_disk_w);
 
                     // Convert nJ to mW: mW = nJ / (dt_s * 1_000_000)
                     let power_mw = delta_nj as f64 / (dt_secs * 1_000_000.0);
@@ -112,7 +118,10 @@ impl EnergyPidTracker {
                     // Wakeup rate = (idle + interrupt wakeups) per second.
                     let wakeup_rate = (delta_idle_wk + delta_intr_wk) as f64 / dt_secs;
 
-                    if delta_nj > 0 || wakeup_rate > 10.0 {
+                    // Disk write rate in MB/s.
+                    let disk_write_mbps = delta_disk_w as f64 / (dt_secs * 1_048_576.0);
+
+                    if delta_nj > 0 || wakeup_rate > 10.0 || disk_write_mbps > 1.0 {
                         results.push(ProcessEnergyDelta {
                             pid,
                             name: name.to_string(),
@@ -121,6 +130,7 @@ impl EnergyPidTracker {
                             ipc,
                             wakeup_rate,
                             phys_footprint_mb,
+                            disk_write_mbps,
                         });
                     }
                 }
@@ -161,6 +171,20 @@ impl EnergyPidTracker {
             .iter()
             .filter(|r| r.phys_footprint_mb > 0.0)
             .map(|r| (r.pid, r.phys_footprint_mb))
+            .collect()
+    }
+
+    /// Build a pid → disk_write_mbps map for I/O burst detection.
+    /// Only includes processes with disk_write_mbps > threshold.
+    /// [Bhagwan & Savage 2002 OSDI] I/O burst = process writing >5 MB/s in background.
+    pub fn build_io_burst_hints(
+        results: &[ProcessEnergyDelta],
+        min_mbps: f64,
+    ) -> HashMap<u32, f64> {
+        results
+            .iter()
+            .filter(|r| r.disk_write_mbps >= min_mbps)
+            .map(|r| (r.pid, r.disk_write_mbps))
             .collect()
     }
 
@@ -210,6 +234,7 @@ mod tests {
                 ipc: 1.0,
                 wakeup_rate: 0.0,
                 phys_footprint_mb: 0.0,
+                disk_write_mbps: 0.0,
             },
             ProcessEnergyDelta {
                 pid: 2,
@@ -219,6 +244,7 @@ mod tests {
                 ipc: 0.5,
                 wakeup_rate: 0.0,
                 phys_footprint_mb: 0.0,
+                disk_write_mbps: 0.0,
             },
         ];
         assert_eq!(EnergyPidTracker::top_consumers(&data, 1).len(), 1);
@@ -236,6 +262,7 @@ mod tests {
                 ipc: 1.0,
                 wakeup_rate: 0.0,
                 phys_footprint_mb: 0.0,
+                disk_write_mbps: 0.0,
             },
             ProcessEnergyDelta {
                 pid: 2,
@@ -245,6 +272,7 @@ mod tests {
                 ipc: 0.5,
                 wakeup_rate: 0.0,
                 phys_footprint_mb: 0.0,
+                disk_write_mbps: 0.0,
             },
         ];
         assert_eq!(EnergyPidTracker::total_energy_nj(&data), 300);
@@ -254,9 +282,9 @@ mod tests {
     #[test]
     fn wakeup_hints_filters_threshold() {
         let data = vec![
-            ProcessEnergyDelta { pid: 1, name: "a".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 200.0, phys_footprint_mb: 100.0 },
-            ProcessEnergyDelta { pid: 2, name: "b".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 30.0, phys_footprint_mb: 50.0 },
-            ProcessEnergyDelta { pid: 3, name: "c".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 500.0, phys_footprint_mb: 200.0 },
+            ProcessEnergyDelta { pid: 1, name: "a".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 200.0, phys_footprint_mb: 100.0, disk_write_mbps: 0.0 },
+            ProcessEnergyDelta { pid: 2, name: "b".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 30.0, phys_footprint_mb: 50.0, disk_write_mbps: 0.0 },
+            ProcessEnergyDelta { pid: 3, name: "c".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 500.0, phys_footprint_mb: 200.0, disk_write_mbps: 0.0 },
         ];
         let hints = EnergyPidTracker::build_wakeup_hints(&data, 50.0);
         assert_eq!(hints.len(), 2);
@@ -268,8 +296,8 @@ mod tests {
     #[test]
     fn footprint_hints_built_correctly() {
         let data = vec![
-            ProcessEnergyDelta { pid: 10, name: "x".into(), delta_nj: 100, power_mw: 5.0, ipc: 1.0, wakeup_rate: 0.0, phys_footprint_mb: 256.0 },
-            ProcessEnergyDelta { pid: 11, name: "y".into(), delta_nj: 50, power_mw: 2.0, ipc: 0.5, wakeup_rate: 0.0, phys_footprint_mb: 0.0 },
+            ProcessEnergyDelta { pid: 10, name: "x".into(), delta_nj: 100, power_mw: 5.0, ipc: 1.0, wakeup_rate: 0.0, phys_footprint_mb: 256.0, disk_write_mbps: 0.0 },
+            ProcessEnergyDelta { pid: 11, name: "y".into(), delta_nj: 50, power_mw: 2.0, ipc: 0.5, wakeup_rate: 0.0, phys_footprint_mb: 0.0, disk_write_mbps: 0.0 },
         ];
         let footprints = EnergyPidTracker::build_footprint_hints(&data);
         assert_eq!(footprints.len(), 1);
@@ -281,5 +309,27 @@ mod tests {
         // 300 wakeups over 0.5s = 600/s
         let rate = 300u64 as f64 / 0.5;
         assert!((rate - 600.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn disk_write_mbps_math() {
+        // 10 MB in 1 second = 10 MB/s
+        let bytes = 10u64 * 1_048_576;
+        let mbps = bytes as f64 / (1.0 * 1_048_576.0);
+        assert!((mbps - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn io_burst_hints_filters_threshold() {
+        let data = vec![
+            ProcessEnergyDelta { pid: 1, name: "backup".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 0.0, phys_footprint_mb: 0.0, disk_write_mbps: 50.0 },
+            ProcessEnergyDelta { pid: 2, name: "idle".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 0.0, phys_footprint_mb: 0.0, disk_write_mbps: 0.5 },
+            ProcessEnergyDelta { pid: 3, name: "spotlight".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 0.0, phys_footprint_mb: 0.0, disk_write_mbps: 8.0 },
+        ];
+        let hints = EnergyPidTracker::build_io_burst_hints(&data, 5.0);
+        assert_eq!(hints.len(), 2);
+        assert!(hints.contains_key(&1));
+        assert!(hints.contains_key(&3));
+        assert!(!hints.contains_key(&2));
     }
 }
