@@ -951,6 +951,13 @@ pub struct RuntimeMetrics {
     /// True when sustained fluidity degradation detected (EMA < 0.65).
     #[serde(default)]
     pub fluidity_degraded: bool,
+    /// Kalman-predicted fluidity in 3 cycles (~6s ahead).
+    /// [Welch & Bishop 2006] 1D Kalman for noise-rejected prediction.
+    #[serde(default)]
+    pub fluidity_predicted_3s: f32,
+    /// Rate of fluidity change per second (positive = improving, negative = degrading).
+    #[serde(default)]
+    pub fluidity_velocity: f32,
 
     // ── User context telemetry ────────────────────────────────────────────────
     /// Seconds since last keyboard/mouse event (from IOHIDSystem HIDIdleTime).

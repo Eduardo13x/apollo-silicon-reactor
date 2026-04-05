@@ -2669,6 +2669,9 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.app_launching = fl_sig.app_launching;
                         metrics.metrics.app_launch_name = fl_sig.launch_name.clone();
                         metrics.metrics.fluidity_degraded = fl_sig.fluidity_degraded;
+                        // Kalman prediction for pre-emptive response
+                        metrics.metrics.fluidity_predicted_3s = fl_sig.fluidity_predicted_3s;
+                        metrics.metrics.fluidity_velocity = fl_sig.fluidity_velocity;
                         // Also update windowserver_cpu_pct (existing field)
                         metrics.metrics.windowserver_cpu_pct =
                             fluidity_state.windowserver_cpu_ema;
