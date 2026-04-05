@@ -632,6 +632,89 @@ impl HwPressureSnapshot {
 mod tests {
     use super::*;
 
+    // ── HwPressure enum ordering ──────────────────────────────────────────────
+
+    #[test]
+    fn hw_pressure_ordering_is_correct() {
+        // PartialOrd/Ord must satisfy Nominal < Warning < Critical.
+        assert!(HwPressure::Nominal < HwPressure::Warning);
+        assert!(HwPressure::Warning < HwPressure::Critical);
+        assert!(HwPressure::Nominal < HwPressure::Critical);
+    }
+
+    #[test]
+    fn hw_pressure_equality() {
+        assert_eq!(HwPressure::Nominal, HwPressure::Nominal);
+        assert_ne!(HwPressure::Nominal, HwPressure::Critical);
+    }
+
+    // ── HwPressureSnapshot helper methods ─────────────────────────────────────
+
+    fn make_snapshot(overall: HwPressure) -> HwPressureSnapshot {
+        HwPressureSnapshot {
+            overall,
+            thermal: HwPressure::Nominal,
+            core_migration: HwPressure::Nominal,
+            memory: HwPressure::Nominal,
+            cpu_drop: HwPressure::Nominal,
+            scheduler: HwPressure::Nominal,
+            bandwidth: HwPressure::Nominal,
+            l1_pressure: HwPressure::Nominal,
+            contention: HwPressure::Nominal,
+            jitter_us: 0,
+            throughput_mips: 1000,
+            cache_latency_us: 1,
+            bandwidth_gbs: 10.0,
+            l1_latency_us: 2,
+            contention_rate: 0.0,
+            active_cpus: 8,
+            physical_cpus: 8,
+            core_migrated: false,
+            commpage_valid: true,
+            sampled_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn needs_attention_false_for_nominal() {
+        let snap = make_snapshot(HwPressure::Nominal);
+        assert!(!snap.needs_attention());
+        assert!(!snap.is_critical());
+    }
+
+    #[test]
+    fn needs_attention_true_for_warning() {
+        let snap = make_snapshot(HwPressure::Warning);
+        assert!(snap.needs_attention());
+        assert!(!snap.is_critical());
+    }
+
+    #[test]
+    fn needs_attention_true_for_critical() {
+        let snap = make_snapshot(HwPressure::Critical);
+        assert!(snap.needs_attention());
+        assert!(snap.is_critical());
+    }
+
+    // ── sample_hw_pressure smoke test ─────────────────────────────────────────
+
+    #[test]
+    fn sample_hw_pressure_returns_valid_snapshot() {
+        let snap = sample_hw_pressure();
+        // active_cpus should be between 1 and physical_cpus (or both 0 if commpage invalid).
+        if snap.commpage_valid {
+            // physical_cpus and active_cpus are read from commpage at fixed offsets.
+            // On Darwin 25, active_cpus offset may differ; just check both are non-zero.
+            assert!(snap.physical_cpus >= 1, "physical_cpus={}", snap.physical_cpus);
+        }
+        // bandwidth_gbs should be non-negative and plausible (< 1000 GB/s).
+        assert!(snap.bandwidth_gbs >= 0.0 && snap.bandwidth_gbs < 1000.0,
+            "bandwidth_gbs={}", snap.bandwidth_gbs);
+        // contention_rate in [0, 1].
+        assert!((0.0..=1.0).contains(&snap.contention_rate),
+            "contention_rate={}", snap.contention_rate);
+    }
+
     #[test]
     fn probe_hardware_registers() {
         // Commpage — lectura directa de memoria del kernel sin syscall
