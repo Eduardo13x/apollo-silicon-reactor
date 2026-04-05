@@ -1576,4 +1576,216 @@ mod tests {
         // Just needs to compile and be non-panicking
         let _ = format!("{:?}", src);
     }
+
+    // ── Enhancement A: Predictive pre-thaw (FocusMarkov) ──────────────────────
+
+    /// Helper: create a manager with one frozen Brave renderer.
+    fn brave_mgr_with_frozen_renderer(pid: u32) -> (ChromiumManager, HashSet<u32>) {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(pid, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
+        mgr.set_pressure_context(0.80);
+        mgr.update(&procs, None, &none_set, &none_set);
+        // Manually mark as frozen (simulate daemon having executed FreezeRenderer)
+        if let Some(r) = mgr.renderers.get_mut(&pid) {
+            r.frozen = true;
+        }
+        mgr.frozen_pids.insert(pid);
+        (mgr, none_set)
+    }
+
+    /// A: pre-thaw fires when predicted switch is imminent (< 10s window).
+    #[test]
+    fn predictive_pre_thaw_fires_when_switch_imminent() {
+        let (mut mgr, none_set) = brave_mgr_with_frozen_renderer(500);
+        // "Brave Browser" predicted at P=0.80, avg_dwell=50s; elapsed=42s → 8s remaining
+        let preds = vec![("Brave Browser".to_string(), 0.80_f64, 50.0_f64)];
+        mgr.set_markov_context(&preds, 42.0);
+
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(500, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
+        let actions = mgr.update(&procs, None, &none_set, &none_set);
+
+        let thawed = actions
+            .iter()
+            .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 500));
+        assert!(
+            thawed,
+            "predictive pre-thaw must fire when switch is 8s away (< 10s window)"
+        );
+    }
+
+    /// A: pre-thaw does NOT fire when switch is far away (> 10s).
+    #[test]
+    fn predictive_pre_thaw_no_fire_when_switch_distant() {
+        let (mut mgr, none_set) = brave_mgr_with_frozen_renderer(501);
+        // avg_dwell=50s, elapsed=10s → 40s remaining
+        let preds = vec![("Brave Browser".to_string(), 0.80_f64, 50.0_f64)];
+        mgr.set_markov_context(&preds, 10.0);
+
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(501, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
+        let actions = mgr.update(&procs, None, &none_set, &none_set);
+
+        let thawed = actions
+            .iter()
+            .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 501));
+        assert!(
+            !thawed,
+            "pre-thaw must NOT fire when 40s remain before predicted switch"
+        );
+    }
+
+    /// A: low-probability prediction (P < 0.35) is ignored.
+    #[test]
+    fn predictive_pre_thaw_low_probability_ignored() {
+        let (mut mgr, none_set) = brave_mgr_with_frozen_renderer(502);
+        // P=0.20 — below the 0.35 threshold
+        let preds = vec![("Brave Browser".to_string(), 0.20_f64, 50.0_f64)];
+        mgr.set_markov_context(&preds, 45.0); // would be within 10s window if prob were high
+
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(502, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
+        let actions = mgr.update(&procs, None, &none_set, &none_set);
+
+        let thawed = actions
+            .iter()
+            .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 502));
+        assert!(!thawed, "prediction with P=0.20 must be ignored (threshold = 0.35)");
+    }
+
+    // ── Enhancement B: ArousalState adaptive aggressiveness ───────────────────
+
+    /// B: crisis arousal (≥ 0.75) sets idle_cycles_required = 1.
+    #[test]
+    fn arousal_crisis_sets_idle_cycles_1() {
+        let mut mgr = ChromiumManager::new();
+        mgr.set_arousal_context(0.80);
+        assert_eq!(
+            mgr.idle_cycles_required, 1,
+            "crisis arousal must set idle_cycles_required = 1"
+        );
+    }
+
+    /// B: idle arousal (< 0.20) sets arousal_thaw_all = true.
+    #[test]
+    fn arousal_idle_sets_thaw_all() {
+        let mut mgr = ChromiumManager::new();
+        mgr.set_arousal_context(0.15);
+        assert!(
+            mgr.arousal_thaw_all,
+            "arousal < 0.20 must set arousal_thaw_all = true"
+        );
+    }
+
+    /// B: arousal_thaw_all triggers thaw of frozen renderers in update().
+    #[test]
+    fn arousal_thaw_all_unfreezes_renderers() {
+        let (mut mgr, none_set) = brave_mgr_with_frozen_renderer(503);
+        // Set idle arousal — should thaw everything
+        mgr.set_arousal_context(0.10);
+
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(503, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
+        let actions = mgr.update(&procs, None, &none_set, &none_set);
+
+        let thawed = actions
+            .iter()
+            .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 503));
+        assert!(
+            thawed,
+            "arousal_thaw_all must cause update() to emit ThawRenderer for frozen renderer"
+        );
+    }
+
+    // ── Enhancement C: NARS belief-based freeze confidence ────────────────────
+
+    /// C: fresh manager returns default 0.70 confidence for any browser.
+    #[test]
+    fn nars_confidence_default_allows_freeze() {
+        let mgr = ChromiumManager::new();
+        let confidence = mgr.freeze_confidence("Brave Browser");
+        assert!(
+            (confidence - 0.70).abs() < 1e-5,
+            "default freeze confidence must be 0.70, got {}",
+            confidence
+        );
+    }
+
+    /// C: multiple failure observations lower confidence below 0.50.
+    #[test]
+    fn nars_confidence_drops_on_failure() {
+        let mut mgr = ChromiumManager::new();
+        for _ in 0..5 {
+            mgr.observe_freeze_outcome("Brave Browser", false, 0.8);
+        }
+        let confidence = mgr.freeze_confidence("Brave Browser");
+        assert!(
+            confidence < 0.50,
+            "5 failure observations must pull confidence below 0.50, got {}",
+            confidence
+        );
+    }
+
+    /// C: NARS confidence gate blocks freeze when confidence is low.
+    #[test]
+    fn nars_confidence_gate_blocks_freeze() {
+        let mut mgr = ChromiumManager::new();
+        mgr.set_pressure_context(0.80); // aggressive — would freeze immediately
+
+        // Force low confidence via many failure observations
+        for _ in 0..10 {
+            mgr.observe_freeze_outcome("Brave Browser", false, 0.9);
+        }
+
+        let none_set: HashSet<u32> = HashSet::new();
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(600, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
+
+        // Run enough cycles that renderer would otherwise be frozen
+        let mut any_freeze = false;
+        for _ in 0..5 {
+            let actions = mgr.update(&procs, None, &none_set, &none_set);
+            if actions
+                .iter()
+                .any(|a| matches!(a, ChromiumAction::FreezeRenderer { pid, .. } if *pid == 600))
+            {
+                any_freeze = true;
+            }
+        }
+        assert!(
+            !any_freeze,
+            "NARS confidence gate must block freeze when confidence < 0.35"
+        );
+    }
+
+    // ── chromium_app_to_browser helper ────────────────────────────────────────
+
+    /// D: chromium_app_to_browser maps known apps correctly.
+    #[test]
+    fn chromium_app_to_browser_maps_known_apps() {
+        assert_eq!(
+            ChromiumManager::chromium_app_to_browser("Brave Browser"),
+            Some("Brave Browser".to_string())
+        );
+        assert_eq!(
+            ChromiumManager::chromium_app_to_browser("Slack"),
+            Some("Slack".to_string())
+        );
+        assert_eq!(
+            ChromiumManager::chromium_app_to_browser("Code"),
+            Some("Code".to_string())
+        );
+        assert_eq!(
+            ChromiumManager::chromium_app_to_browser("Terminal"),
+            None,
+            "Terminal is not a Chromium browser"
+        );
+        assert_eq!(
+            ChromiumManager::chromium_app_to_browser("Finder"),
+            None,
+            "Finder is not a Chromium browser"
+        );
+    }
 }
