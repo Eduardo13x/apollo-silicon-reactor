@@ -813,11 +813,11 @@ mod tests {
             score.safety_compliance * 100.0,
             score.adaptability * 100.0,
         );
-        // Floor = 87.0 (locks in 6-iteration Darwinian evolution gains, ±3pt noise tolerance).
-        // Score range: 89.9–90.0 on stable M1 daemon; allows for fresh-restart warmup lag.
-        // To exceed 90 sustainably: profile_switches accumulate (D6 0.5→1.0), entropy warms up.
-        assert!(score.total >= 87.0,
-            "AIS runtime {:.1} < 87.0 — regression detected (S-tier floor after evolution). \
+        // Floor = 90.0 (locks in 7-iteration Darwinian evolution gains post-process_baseline).
+        // Calibration: adaptive D1/D2/D4/D5 formulas; 90+ S-tier under nominal+thermal load.
+        // ±3pt noise tolerance for Kalman RMSE variance and fresh-restart warmup lag.
+        assert!(score.total >= 90.0,
+            "AIS runtime {:.1} < 90.0 — regression detected (S-tier floor after evolution). \
              Dims: D={:.0}% S={:.0}% L={:.0}% R={:.0}% Sf={:.0}% A={:.0}%",
             score.total,
             score.decision_precision * 100.0,
