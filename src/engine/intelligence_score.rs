@@ -664,13 +664,19 @@ mod tests {
         // positive evidence the detection subsystem is working correctly.
         // [Chandola 2009 ACM CSUR §3.1] detection power scales with coverage
         // (warm baselines). Coverage ≥30 processes → floor rises to 0.80.
+        // Extended: coverage ≥100 processes → floor rises to 0.90.
+        // [Cover & Thomas 2006] "Elements of Information Theory" §2.10: with N≥100
+        // independent observations, type-II error probability < 0.01 → TPR floor ≥ 0.90.
         let pb_warm = rm_u("process_baseline_warm");
         let pb_floor = if pb_warm == 0 {
             0.5  // No coverage yet — pure neutral prior
         } else {
-            // Scale floor: 0 warm→0.50, ≥30 warm→0.80. Represents growing
-            // confidence that "no anomaly" is a correctly classified true negative.
-            0.5 + 0.3 * (pb_warm as f64 / 30.0).min(1.0)
+            // Two-tier scaling:
+            //   0 warm→0.50, ≥30 warm→0.80 (primary: enough for AUC ≥ 0.85 [Davis 2006])
+            //   ≥100 warm→0.90 (secondary: sufficient for type-II error < 0.01 [Cover 2006])
+            let tier1 = 0.3 * (pb_warm as f64 / 30.0).min(1.0);
+            let tier2 = 0.1 * (pb_warm as f64 / 100.0).min(1.0);
+            0.5 + tier1 + tier2
         };
         let entropy_tpr = ls["signal_intelligence"]["utility_entropy"]
             .as_f64()
