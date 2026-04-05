@@ -453,15 +453,17 @@ mod tests {
 
     #[test]
     fn memory_bound_score_at_zero_ipc() {
-        // IPC=0 with cycles>0 = 100% memory stalled.
-        let raw = if 0.001 > 0.001 {
-            (1.0 - (0.001 / pmu_events::M1_PEAK_IPC)).clamp(0.0, 1.0)
-        } else if 1000u64 > 0 {
+        // IPC=0.0 with cycles>0 = 100% memory stalled (the else if branch).
+        let ipc = 0.0f64;
+        let delta_cycles = 1000u64;
+        let raw = if ipc > 0.001 {
+            (1.0 - (ipc / pmu_events::M1_PEAK_IPC)).clamp(0.0, 1.0)
+        } else if delta_cycles > 0 {
             1.0
         } else {
             0.0
         };
-        assert!((raw - 1.0).abs() < 0.001);
+        assert!((raw - 1.0).abs() < 0.001, "zero IPC should give score=1.0, got {}", raw);
     }
 
     #[test]

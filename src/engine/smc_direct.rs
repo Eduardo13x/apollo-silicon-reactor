@@ -484,6 +484,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is a test byte value, not π
     fn float_parse_be() {
         // 3.14 as big-endian f32: 0x4048F5C3
         let bytes: [u8; 4] = [0x40, 0x48, 0xF5, 0xC3];
