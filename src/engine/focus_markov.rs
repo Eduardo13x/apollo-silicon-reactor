@@ -272,6 +272,14 @@ impl FocusMarkov {
         self.state.transitions.len()
     }
 
+    /// How long the current foreground app has been in focus (seconds).
+    /// Returns 0.0 if no foreground app has been observed yet.
+    pub fn elapsed_dwell_secs(&self) -> f64 {
+        self.last_switch_at
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
     /// Persist state to disk (if dirty).
     pub fn persist(&mut self) {
         if !self.dirty {

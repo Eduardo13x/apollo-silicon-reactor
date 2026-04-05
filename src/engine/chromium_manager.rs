@@ -33,6 +33,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::engine::nars_belief::{DriftDetector, Salience};
+
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 /// CPU% below which a renderer is considered "idle".
@@ -178,6 +180,19 @@ pub struct ChromiumManager {
     prev_fg_browser: Option<String>,
     /// PIDs already sent to E-core demotion — avoid repeat calls each cycle.
     ecore_demoted: HashSet<u32>,
+
+    // ── Cognitive context (Enhancement A/B/C) ─────────────────────────────────
+    /// FocusMarkov top-N predictions: (app_name, probability, avg_dwell_secs).
+    /// Updated each cycle via `set_markov_context()`.
+    markov_predictions: Vec<(String, f64, f64)>,
+    /// How long the current foreground app has been focused (seconds).
+    elapsed_dwell_secs: f64,
+    /// When arousal is very low (< 0.20) thaw all frozen renderers.
+    /// [Yerkes-Dodson 1908] System idle = no need to keep anything frozen.
+    arousal_thaw_all: bool,
+    /// NARS DriftDetector tracking per-browser freeze-safety beliefs.
+    /// [Pei Wang 2013] Truth values updated by revision rule on each freeze outcome.
+    nars_beliefs: DriftDetector,
 }
 
 impl Default for ChromiumManager {
@@ -203,6 +218,10 @@ impl ChromiumManager {
             ecore_count: 0,
             prev_fg_browser: None,
             ecore_demoted: HashSet::new(),
+            markov_predictions: Vec::new(),
+            elapsed_dwell_secs: 0.0,
+            arousal_thaw_all: false,
+            nars_beliefs: DriftDetector::new(),
         }
     }
 
@@ -271,6 +290,99 @@ impl ChromiumManager {
     /// E-core demotions continue regardless (they are safe at any time).
     pub fn set_fluidity_context(&mut self, window_op_active: bool, app_launching: bool) {
         self.freeze_paused = window_op_active || app_launching;
+    }
+
+    /// Set FocusMarkov top-N predictions for predictive pre-thaw.
+    ///
+    /// [Altmann & Trafton 2002] User task switches are predictable — pre-activate
+    /// resources before predicted context switch to eliminate perceived latency.
+    ///
+    /// `predictions`: Vec<(app_name, probability, avg_dwell_secs)>
+    /// `elapsed_dwell_secs`: how long the current foreground app has been active
+    pub fn set_markov_context(
+        &mut self,
+        predictions: &[(String, f64, f64)],
+        elapsed_dwell_secs: f64,
+    ) {
+        self.markov_predictions = predictions.to_vec();
+        self.elapsed_dwell_secs = elapsed_dwell_secs;
+    }
+
+    /// Set arousal level for Yerkes-Dodson adaptive freeze aggressiveness.
+    ///
+    /// [Yerkes & Dodson 1908] Performance is optimised at moderate arousal.
+    /// High arousal (crisis) → freeze faster; low arousal (idle) → thaw everything.
+    pub fn set_arousal_context(&mut self, arousal_level: f32) {
+        self.idle_cycles_required = match arousal_level {
+            a if a >= 0.75 => 1, // Crisis: freeze after 1 idle cycle
+            a if a >= 0.50 => 2, // Stressed: freeze after 2 cycles
+            a if a >= 0.25 => 3, // Optimal: normal (default 3 cycles)
+            _ => 5,              // Idle: very conservative (effectively never)
+        };
+        self.arousal_thaw_all = arousal_level < 0.20;
+    }
+
+    /// Observe a freeze/thaw outcome for NARS belief update.
+    ///
+    /// Call with `success=true` after a clean renderer thaw (renderer alive).
+    /// Call with `success=false` if a renderer died while frozen.
+    /// [Pei Wang 2013] NARS Revision rule updates frequency proportional to evidence weight.
+    pub fn observe_freeze_outcome(&mut self, browser: &str, success: bool, salience: f32) {
+        let concept = format!(
+            "chromium:freeze:{}",
+            browser.replace(' ', "-").to_ascii_lowercase()
+        );
+        self.nars_beliefs.observe_salient(
+            &concept,
+            success,
+            Salience {
+                arousal: salience,
+                valence: if success { 0.5 } else { -0.5 },
+            },
+        );
+    }
+
+    /// Returns freeze confidence for a browser based on NARS belief frequency.
+    ///
+    /// Below 0.35: skip freezing (too many bad outcomes observed).
+    /// Default: 0.70 (conservative prior — assume freezing is safe until proven otherwise).
+    pub fn freeze_confidence(&self, browser: &str) -> f32 {
+        let concept = format!(
+            "chromium:freeze:{}",
+            browser.replace(' ', "-").to_ascii_lowercase()
+        );
+        self.nars_beliefs
+            .belief(&concept)
+            .map(|tv| tv.frequency)
+            .unwrap_or(0.70)
+    }
+
+    /// Map a macOS app name to the Chromium browser name we track.
+    /// Returns `Some(browser_name)` if the app is a Chromium/Electron browser,
+    /// `None` if it is not (e.g. Terminal, Finder).
+    fn chromium_app_to_browser(app_name: &str) -> Option<String> {
+        const BROWSERS: &[&str] = &[
+            "Brave Browser",
+            "Google Chrome",
+            "Microsoft Edge",
+            "Arc",
+            "Vivaldi",
+            "Opera",
+            "Chromium",
+            "Slack",
+            "Code",
+            "Cursor",
+            "Discord",
+            "Notion",
+            "Linear",
+            "Figma",
+        ];
+        for &b in BROWSERS {
+            if app_name == b || app_name.starts_with(b) {
+                return Some(b.to_string());
+            }
+        }
+        None
     }
 
     /// Update renderer inventory and compute actions for this cycle.
@@ -413,6 +525,43 @@ impl ChromiumManager {
             self.prev_fg_browser = fg_browser.clone();
         }
 
+        // ── Predictive pre-thaw from FocusMarkov ─────────────────────────────────
+        // [Altmann & Trafton 2002] Pre-activate resources before predicted task switch.
+        // If the user is predicted to switch to a Chromium browser within 10 seconds,
+        // thaw all its frozen renderers now so they are warm when the switch happens.
+        for (app_name, prob, avg_dwell) in &self.markov_predictions {
+            if *prob < 0.35 {
+                continue;
+            }
+            let predicted_browser = match Self::chromium_app_to_browser(app_name) {
+                Some(b) => b,
+                None => continue,
+            };
+            let time_to_switch = avg_dwell - self.elapsed_dwell_secs;
+            if time_to_switch < 10.0 {
+                for (&pid, info) in &self.renderers {
+                    if info.browser == predicted_browser
+                        && info.frozen
+                        && !main_frozen.contains(&pid)
+                        && !actions.iter().any(
+                            |a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == pid),
+                        )
+                    {
+                        actions.push(ChromiumAction::ThawRenderer {
+                            pid,
+                            name: info.name.clone(),
+                        });
+                        tracing::info!(
+                            browser = predicted_browser.as_str(),
+                            prob = prob,
+                            time_to_switch = time_to_switch,
+                            "chromium: predictive pre-thaw — switch imminent"
+                        );
+                    }
+                }
+            }
+        }
+
         // Prune dead PIDs from ecore_demoted set (Bug fix #4)
         self.ecore_demoted.retain(|pid| self.renderers.contains_key(pid));
 
@@ -510,6 +659,18 @@ impl ChromiumManager {
                     continue;
                 }
 
+                // NARS confidence gate: skip browsers where freeze safety is unproven.
+                // [Pei Wang 2013] Truth frequency < 0.35 = evidence favours unsafety.
+                let confidence = self.freeze_confidence(&info.browser);
+                if confidence < 0.35 {
+                    tracing::debug!(
+                        browser = info.browser.as_str(),
+                        confidence = confidence,
+                        "chromium: skipping freeze — NARS confidence too low"
+                    );
+                    continue;
+                }
+
                 candidates_by_browser
                     .entry(info.browser.clone())
                     .or_default()
@@ -554,20 +715,25 @@ impl ChromiumManager {
             }
         }
 
-        // ── Step 7: Apply low-pressure thaw-all (system has headroom) ─────────
-        if self.idle_cycles_required >= 5 {
-            // Pressure < 0.40: thaw all chromium-frozen renderers
+        // ── Step 7: Apply low-pressure / arousal-idle thaw-all ────────────────
+        // Two conditions trigger a full thaw:
+        // 1. Pressure < 0.40 (idle_cycles_required ≥ 5) — memory headroom exists
+        // 2. Arousal < 0.20 (arousal_thaw_all) — system truly idle, no need to save RAM
+        // [Yerkes-Dodson 1908] At very low arousal there is no cost to thawing everything.
+        if self.idle_cycles_required >= 5 || self.arousal_thaw_all {
             for pid in self.frozen_pids.iter().copied().collect::<Vec<_>>() {
                 if main_frozen.contains(&pid) {
                     continue;
                 }
                 if let Some(info) = self.renderers.get(&pid) {
-                    actions.push(ChromiumAction::ThawRenderer {
-                        pid,
-                        name: info.name.clone(),
-                    });
-                } else {
-                    // Process died — just remove tracking
+                    if !actions.iter().any(
+                        |a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == pid),
+                    ) {
+                        actions.push(ChromiumAction::ThawRenderer {
+                            pid,
+                            name: info.name.clone(),
+                        });
+                    }
                 }
             }
         }
