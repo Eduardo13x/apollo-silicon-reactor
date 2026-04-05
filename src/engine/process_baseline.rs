@@ -180,25 +180,6 @@ impl ProcessBaselineMap {
         self.entries.get(name).map(|e| e.dominant_signal(ipc, wakeup_rate, disk_mbps))
     }
 
-    /// Build a pid → anomaly_score map for all processes in `results`.
-    ///
-    /// Also updates the baselines as a side effect (observe + score in one pass).
-    /// Returns only entries with score > 0 (warm baselines, actual anomalies).
-    pub fn update_and_score(
-        &mut self,
-        results: &[crate::engine::energy_pid::ProcessEnergyDelta],
-    ) -> HashMap<u32, f64> {
-        let mut scores = HashMap::new();
-        for r in results {
-            self.observe(&r.name, r.ipc, r.wakeup_rate, r.disk_write_mbps);
-            let score = self.anomaly_score(&r.name, r.ipc, r.wakeup_rate, r.disk_write_mbps);
-            if score > 0.0 {
-                scores.insert(r.pid, score);
-            }
-        }
-        scores
-    }
-
     /// Prune entries for processes not seen in the last `max_unseen_cycles` persist cycles.
     /// Called from `LearnedState::self_improve()` to bound map size.
     /// For now: prune entries with 0 observations (should not exist but defensive).
@@ -312,50 +293,6 @@ mod tests {
         // Wakeup explosion, others normal.
         let dom = map.dominant_signal("some_daemon", 1.5, 1000.0, 0.1);
         assert_eq!(dom, Some("wakeup"));
-    }
-
-    #[test]
-    fn update_and_score_returns_warm_only() {
-        use crate::engine::energy_pid::ProcessEnergyDelta;
-        let mut map = ProcessBaselineMap::new();
-
-        // Pre-warm "Safari" manually.
-        for _ in 0..20 {
-            map.observe("Safari", 2.0, 50.0, 0.1);
-        }
-
-        let results = vec![
-            ProcessEnergyDelta {
-                pid: 1,
-                name: "Safari".into(),
-                delta_nj: 1000,
-                power_mw: 5.0,
-                ipc: 2.0,
-                wakeup_rate: 50.0,
-                phys_footprint_mb: 300.0,
-                disk_write_mbps: 0.1,
-                anomaly_score: 0.0,
-            },
-            ProcessEnergyDelta {
-                pid: 2,
-                name: "new_proc".into(),
-                delta_nj: 500,
-                power_mw: 2.0,
-                ipc: 1.0,
-                wakeup_rate: 10.0,
-                phys_footprint_mb: 50.0,
-                disk_write_mbps: 0.0,
-                anomaly_score: 0.0,
-            },
-        ];
-
-        let scores = map.update_and_score(&results);
-        // Safari reading is exactly on-baseline → score = 0.0 → NOT in map (not anomalous).
-        assert!(!scores.contains_key(&1), "Safari at baseline should not be in scores");
-        // "new_proc" has only 1 obs — cold start, also not in scores.
-        assert!(!scores.contains_key(&2), "new_proc cold start should not be in scores");
-        // Warm baseline for Safari is recorded.
-        assert!(map.warm_count() >= 1, "Safari baseline should be warm after 20+ obs");
     }
 
     #[test]
