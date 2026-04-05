@@ -773,6 +773,9 @@ mod tests {
             urgency: 0.0,
             transformer_anomaly: 0.0,
             memory_scan_available: false,
+            fluidity_score: 1.0,
+            window_op_active: false,
+            app_launching: false,
         };
         for _ in 0..20 {
             digest = tick_nominal(&mut si);
@@ -1075,7 +1078,7 @@ mod tests {
         // After 20 ticks (~10s), pressure is at 0.65. Velocity ≈ 0.010/s.
         // 30s ahead: 0.65 + 0.010*30 = 0.95 (overflow territory).
         // 5s ahead: 0.65 + 0.010*5 = 0.70 (still below common bg_pressure ~0.72).
-        let mut last = SignalDigest { pressure_smooth: 0.0, pressure_velocity: 0.0, pressure_predicted_5s: 0.0, pressure_predicted_30s: 0.0, swap_velocity_smooth: 0.0, pressure_integral: 0.0, regime_shift_up: false, regime_shift_down: false, cusum_score: 0.0, entropy_anomaly: 0.0, p_oom_30s: 0.0, monopoly_risk: 0.0, mpc_recommendation: 0, urgency: 0.0, transformer_anomaly: 0.0, memory_scan_available: false };
+        let mut last = SignalDigest { pressure_smooth: 0.0, pressure_velocity: 0.0, pressure_predicted_5s: 0.0, pressure_predicted_30s: 0.0, swap_velocity_smooth: 0.0, pressure_integral: 0.0, regime_shift_up: false, regime_shift_down: false, cusum_score: 0.0, entropy_anomaly: 0.0, p_oom_30s: 0.0, monopoly_risk: 0.0, mpc_recommendation: 0, urgency: 0.0, transformer_anomaly: 0.0, memory_scan_available: false, fluidity_score: 1.0, window_op_active: false, app_launching: false };
         for i in 0..20 {
             let pressure = 0.55 + i as f64 * 0.005;
             last = si.tick(pressure, 0.0, 0.05, 0.1, &[15.0], &[500e6], "app", 500_000_000, 2_000_000_000, 8_000_000_000, 0.5);
@@ -1103,7 +1106,7 @@ mod tests {
     #[test]
     fn proactive_30s_stable_signal_no_false_alarm() {
         let mut si = SignalIntelligence::new();
-        let mut last = SignalDigest { pressure_smooth: 0.0, pressure_velocity: 0.0, pressure_predicted_5s: 0.0, pressure_predicted_30s: 0.0, swap_velocity_smooth: 0.0, pressure_integral: 0.0, regime_shift_up: false, regime_shift_down: false, cusum_score: 0.0, entropy_anomaly: 0.0, p_oom_30s: 0.0, monopoly_risk: 0.0, mpc_recommendation: 0, urgency: 0.0, transformer_anomaly: 0.0, memory_scan_available: false };
+        let mut last = SignalDigest { pressure_smooth: 0.0, pressure_velocity: 0.0, pressure_predicted_5s: 0.0, pressure_predicted_30s: 0.0, swap_velocity_smooth: 0.0, pressure_integral: 0.0, regime_shift_up: false, regime_shift_down: false, cusum_score: 0.0, entropy_anomaly: 0.0, p_oom_30s: 0.0, monopoly_risk: 0.0, mpc_recommendation: 0, urgency: 0.0, transformer_anomaly: 0.0, memory_scan_available: false, fluidity_score: 1.0, window_op_active: false, app_launching: false };
         for _ in 0..30 {
             last = si.tick(0.50, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app", 500_000_000, 2_000_000_000, 8_000_000_000, 0.5);
         }
