@@ -4713,6 +4713,24 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
 
+                    // Pre-emptive fluidity response: when Kalman predicts fluidity will drop
+                    // below 0.60 within 3 cycles AND velocity is negative, lower the freeze
+                    // confirmation threshold from 2 to 1 cycle. This allows Apollo to act
+                    // before the degradation is perceptible to the user.
+                    // [Welch & Bishop 2006] Kalman prediction enables anticipatory control.
+                    // [Shavit & Lotan 2000] pre-emptive action on predicted queue saturation.
+                    let fluidity_preemptive = !fluidity_launch_active
+                        && fluidity_state.fluidity_predicted_3s < 0.60
+                        && fluidity_state.fluidity_velocity < -0.05;
+                    if fluidity_preemptive {
+                        tracing::info!(
+                            predicted = fluidity_state.fluidity_predicted_3s,
+                            velocity = fluidity_state.fluidity_velocity,
+                            "fluidity: predicted drop to {:.2} — pre-emptive freeze threshold lowered",
+                            fluidity_state.fluidity_predicted_3s
+                        );
+                    }
+
                     let confirmed_actions: Vec<RootAction> = graced_actions
                         .into_iter()
                         .filter(|a| {
@@ -4723,7 +4741,9 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 let count = freeze_candidates.entry(*pid).or_insert(0);
                                 *count += 1;
-                                *count >= 2
+                                // Pre-emptive mode: act after 1 cycle instead of 2
+                                let required = if fluidity_preemptive { 1 } else { 2 };
+                                *count >= required
                             } else {
                                 true
                             }
