@@ -173,7 +173,9 @@ impl SystemCollector {
         let swap_delta_bps = match (self.prev_swap_used_bytes, self.prev_swap_at) {
             (Some(prev_used), Some(prev_at)) => {
                 let dt = nowi.duration_since(prev_at).as_secs_f64().max(0.001);
-                (swap_used_bytes.saturating_sub(prev_used) as f64) / dt
+                // Signed delta: negative when swap shrinks (pressure resolving).
+                // [Arlitt & Williamson 1997] — rate metrics must be signed.
+                (swap_used_bytes as i64 - prev_used as i64) as f64 / dt
             }
             _ => 0.0,
         };
@@ -279,7 +281,9 @@ impl SystemCollector {
         let swap_delta_bps = match (self.prev_swap_used_bytes, self.prev_swap_at) {
             (Some(prev_used), Some(prev_at)) => {
                 let dt = nowi.duration_since(prev_at).as_secs_f64().max(0.001);
-                (swap_used_bytes.saturating_sub(prev_used) as f64) / dt
+                // Signed delta: negative when swap shrinks (pressure resolving).
+                // [Arlitt & Williamson 1997] — rate metrics must be signed.
+                (swap_used_bytes as i64 - prev_used as i64) as f64 / dt
             }
             _ => 0.0,
         };
