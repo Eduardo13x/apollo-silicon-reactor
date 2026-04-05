@@ -34,12 +34,19 @@ pub struct ProcessEnergyDelta {
     pub power_mw: f64,
     /// Per-process IPC from ri_instructions/ri_cycles delta.
     pub ipc: f64,
+    /// CPU wakeups per second (idle + pkg_idle combined).
+    /// Apple Activity Monitor uses this as the primary "Energy Impact" signal.
+    /// >100/s = battery vampire; >500/s = severe drain.
+    pub wakeup_rate: f64,
+    /// True physical memory footprint (MB). More accurate than RSS for freeze ranking
+    /// because it excludes shared pages and includes compressed memory contribution.
+    pub phys_footprint_mb: f64,
 }
 
 /// Tracks ri_billed_energy deltas across cycles.
 pub struct EnergyPidTracker {
-    /// Previous readings: pid → (billed_energy_nj, instructions, cycles, proc_start_abstime).
-    prev: HashMap<u32, (u64, u64, u64, u64)>,
+    /// Previous readings: pid → (billed_energy_nj, instructions, cycles, proc_start_abstime, idle_wakeups, pkg_idle_wakeups).
+    prev: HashMap<u32, (u64, u64, u64, u64, u64, u64)>,
 }
 
 impl EnergyPidTracker {
@@ -76,15 +83,22 @@ impl EnergyPidTracker {
                 rusage.instructions,
                 rusage.cycles,
                 rusage.proc_start_abstime,
+                rusage.idle_wakeups,
+                rusage.interrupt_wakeups,
             );
 
-            if let Some(&(prev_energy, prev_instr, prev_cycles, prev_start)) = self.prev.get(&pid)
+            let phys_footprint_mb = rusage.phys_footprint as f64 / (1024.0 * 1024.0);
+
+            if let Some(&(prev_energy, prev_instr, prev_cycles, prev_start, prev_idle_wk, prev_intr_wk)) =
+                self.prev.get(&pid)
             {
                 // PID recycling check: if proc_start_abstime changed, skip delta.
                 if prev_start == current.3 {
                     let delta_nj = current.0.saturating_sub(prev_energy);
                     let delta_instr = current.1.saturating_sub(prev_instr);
                     let delta_cycles = current.2.saturating_sub(prev_cycles);
+                    let delta_idle_wk = current.4.saturating_sub(prev_idle_wk);
+                    let delta_intr_wk = current.5.saturating_sub(prev_intr_wk);
 
                     // Convert nJ to mW: mW = nJ / (dt_s * 1_000_000)
                     let power_mw = delta_nj as f64 / (dt_secs * 1_000_000.0);
@@ -95,13 +109,18 @@ impl EnergyPidTracker {
                         0.0
                     };
 
-                    if delta_nj > 0 {
+                    // Wakeup rate = (idle + interrupt wakeups) per second.
+                    let wakeup_rate = (delta_idle_wk + delta_intr_wk) as f64 / dt_secs;
+
+                    if delta_nj > 0 || wakeup_rate > 10.0 {
                         results.push(ProcessEnergyDelta {
                             pid,
                             name: name.to_string(),
                             delta_nj,
                             power_mw,
                             ipc,
+                            wakeup_rate,
+                            phys_footprint_mb,
                         });
                     }
                 }
@@ -121,6 +140,28 @@ impl EnergyPidTracker {
     pub fn top_consumers(results: &[ProcessEnergyDelta], n: usize) -> &[ProcessEnergyDelta] {
         let end = n.min(results.len());
         &results[..end]
+    }
+
+    /// Build a pid → wakeup_rate map for use in decide_actions.
+    /// Only includes processes with wakeup_rate > threshold (default 50/s).
+    pub fn build_wakeup_hints(
+        results: &[ProcessEnergyDelta],
+        min_rate: f64,
+    ) -> HashMap<u32, f64> {
+        results
+            .iter()
+            .filter(|r| r.wakeup_rate >= min_rate)
+            .map(|r| (r.pid, r.wakeup_rate))
+            .collect()
+    }
+
+    /// Build a pid → phys_footprint_mb map for freeze priority ranking.
+    pub fn build_footprint_hints(results: &[ProcessEnergyDelta]) -> HashMap<u32, f64> {
+        results
+            .iter()
+            .filter(|r| r.phys_footprint_mb > 0.0)
+            .map(|r| (r.pid, r.phys_footprint_mb))
+            .collect()
     }
 
     /// Total system energy this cycle (nanojoules, sum of all sampled processes).
@@ -167,6 +208,8 @@ mod tests {
                 delta_nj: 100,
                 power_mw: 10.0,
                 ipc: 1.0,
+                wakeup_rate: 0.0,
+                phys_footprint_mb: 0.0,
             },
             ProcessEnergyDelta {
                 pid: 2,
@@ -174,6 +217,8 @@ mod tests {
                 delta_nj: 50,
                 power_mw: 5.0,
                 ipc: 0.5,
+                wakeup_rate: 0.0,
+                phys_footprint_mb: 0.0,
             },
         ];
         assert_eq!(EnergyPidTracker::top_consumers(&data, 1).len(), 1);
@@ -189,6 +234,8 @@ mod tests {
                 delta_nj: 100,
                 power_mw: 10.0,
                 ipc: 1.0,
+                wakeup_rate: 0.0,
+                phys_footprint_mb: 0.0,
             },
             ProcessEnergyDelta {
                 pid: 2,
@@ -196,9 +243,43 @@ mod tests {
                 delta_nj: 200,
                 power_mw: 20.0,
                 ipc: 0.5,
+                wakeup_rate: 0.0,
+                phys_footprint_mb: 0.0,
             },
         ];
         assert_eq!(EnergyPidTracker::total_energy_nj(&data), 300);
         assert!((EnergyPidTracker::total_power_mw(&data) - 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn wakeup_hints_filters_threshold() {
+        let data = vec![
+            ProcessEnergyDelta { pid: 1, name: "a".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 200.0, phys_footprint_mb: 100.0 },
+            ProcessEnergyDelta { pid: 2, name: "b".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 30.0, phys_footprint_mb: 50.0 },
+            ProcessEnergyDelta { pid: 3, name: "c".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 500.0, phys_footprint_mb: 200.0 },
+        ];
+        let hints = EnergyPidTracker::build_wakeup_hints(&data, 50.0);
+        assert_eq!(hints.len(), 2);
+        assert!(hints.contains_key(&1));
+        assert!(hints.contains_key(&3));
+        assert!(!hints.contains_key(&2));
+    }
+
+    #[test]
+    fn footprint_hints_built_correctly() {
+        let data = vec![
+            ProcessEnergyDelta { pid: 10, name: "x".into(), delta_nj: 100, power_mw: 5.0, ipc: 1.0, wakeup_rate: 0.0, phys_footprint_mb: 256.0 },
+            ProcessEnergyDelta { pid: 11, name: "y".into(), delta_nj: 50, power_mw: 2.0, ipc: 0.5, wakeup_rate: 0.0, phys_footprint_mb: 0.0 },
+        ];
+        let footprints = EnergyPidTracker::build_footprint_hints(&data);
+        assert_eq!(footprints.len(), 1);
+        assert!((footprints[&10] - 256.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn wakeup_rate_math() {
+        // 300 wakeups over 0.5s = 600/s
+        let rate = 300u64 as f64 / 0.5;
+        assert!((rate - 600.0).abs() < 0.001);
     }
 }
