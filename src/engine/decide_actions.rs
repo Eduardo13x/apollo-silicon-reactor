@@ -832,15 +832,45 @@ pub fn decide_actions(
         }
     }
 
-    DecisionOutput {
-        context,
-        reactor_event_weight,
-        blockers,
-        actions,
-        low_value_skipped,
-        display_boosts_emitted,
-        freeze_gate,
-        ml_throttle_source,
+    // [Pearl 2009] Impact-prioritized ordering: sort ThrottleProcess actions by
+    // causal impact score (highest first). When the action queue has capacity limits,
+    // high-impact throttles execute first, maximizing pressure reduction per cycle.
+    // Boosts and freezes keep their original order (boosts first, freezes last).
+    {
+        // Partition: boosts first, then throttles (sorted), then freezes/others.
+        let mut boosts = Vec::new();
+        let mut throttles = Vec::new();
+        let mut others = Vec::new();
+        for action in actions {
+            match &action {
+                RootAction::BoostProcess { .. } => boosts.push(action),
+                RootAction::ThrottleProcess { name, .. } => {
+                    let causal_key = format!("throttle:{}", name);
+                    let impact = causal_confidence
+                        .get(&causal_key)
+                        .copied()
+                        .unwrap_or(0.5); // unknown → neutral priority
+                    throttles.push((impact, action));
+                }
+                _ => others.push(action),
+            }
+        }
+        // Sort throttles by impact descending (highest impact first).
+        throttles.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut actions = boosts;
+        actions.extend(throttles.into_iter().map(|(_, a)| a));
+        actions.extend(others);
+
+        DecisionOutput {
+            context,
+            reactor_event_weight,
+            blockers,
+            actions,
+            low_value_skipped,
+            display_boosts_emitted,
+            freeze_gate,
+            ml_throttle_source,
+        }
     }
 }
 #[cfg(test)]
