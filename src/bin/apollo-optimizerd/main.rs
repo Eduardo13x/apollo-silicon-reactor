@@ -1079,6 +1079,13 @@ fn main() -> anyhow::Result<()> {
             let mut window_sensor =
                 apollo_optimizer::engine::window_sensor::WindowSensor::new();
 
+            // ── Fluidity Intelligence ────────────────────────────────────────
+            // Tracks WindowServer CPU spike (window resize/move), app launches,
+            // GPU render load → composite fluidity score 0–1.
+            // [Jain 1991] EMA composite scoring, [Welch & Bishop 2006] Kalman prediction
+            let mut fluidity_state =
+                apollo_optimizer::engine::fluidity::FluidityState::new();
+
             // ── Rosetta AOT Monitor ─────────────────────────────────────────
             // Watches /var/db/oah/ for write events → suppress freezing oahd.
             let mut rosetta_monitor = apollo_optimizer::engine::rosetta_monitor::RosettaMonitor::new();
@@ -2632,6 +2639,39 @@ fn main() -> anyhow::Result<()> {
                         window_relief_cycles = window_relief_cycles.max(3);
                     } else if win_tab_delta < 0 {
                         window_relief_cycles = window_relief_cycles.max(2);
+                    }
+
+                    // ── Fluidity Intelligence ────────────────────────────────
+                    // Update FluidityState from process snapshot + GPU load.
+                    // WindowServer CPU → spike detection (window resize/move).
+                    // New PIDs → app launch detection + protection window.
+                    // [Jain 1991] composite score, [Welch & Bishop 2006] Kalman prediction
+                    {
+                        let fl_procs: Vec<(u32, &str, f32)> = proc_snaps
+                            .iter()
+                            .map(|p| (p.pid, p.name.as_str(), p.cpu_percent))
+                            .collect();
+                        // GPU load from IOKit hw_snap (normalized 0–1).
+                        let fl_gpu_load = cycle_hw_snap.as_ref()
+                            .and_then(|hw| hw.power.gpu_watts)
+                            .map(|w| (w / 15.0).clamp(0.0, 1.0) as f32)
+                            .unwrap_or(0.0);
+                        fluidity_state.update(&fl_procs, fl_gpu_load, cycle_dt_secs as f32);
+
+                        // Snapshot signal for use later in the cycle
+                        let fl_sig = apollo_optimizer::engine::fluidity::FluiditySignal::from(
+                            &fluidity_state
+                        );
+
+                        // Wire into RuntimeMetrics for status/dashboard reporting
+                        metrics.metrics.fluidity_score = fl_sig.fluidity_score;
+                        metrics.metrics.window_op_active = fl_sig.window_op_active;
+                        metrics.metrics.app_launching = fl_sig.app_launching;
+                        metrics.metrics.app_launch_name = fl_sig.launch_name.clone();
+                        metrics.metrics.fluidity_degraded = fl_sig.fluidity_degraded;
+                        // Also update windowserver_cpu_pct (existing field)
+                        metrics.metrics.windowserver_cpu_pct =
+                            fluidity_state.windowserver_cpu_ema;
                     }
 
                     // Build progress tick — updates build_tracker.phase and
