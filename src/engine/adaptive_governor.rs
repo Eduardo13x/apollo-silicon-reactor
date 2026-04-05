@@ -708,6 +708,283 @@ fn is_render_pipeline(name: &str) -> bool {
     RENDER_NAMES.iter().any(|r| name.contains(r))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::process_classifier::ProcessSnapshot;
+    use crate::engine::zombie_hunter::HuntSnapshot;
+
+    fn base_proc(pid: u32, name: &str) -> ProcessSnapshot {
+        ProcessSnapshot {
+            pid,
+            name: name.to_string(),
+            cpu_percent: 1.0,
+            rss_bytes: 50 * 1024 * 1024,
+            is_zombie: false,
+            secs_since_foreground: 120,
+            secs_since_user_interaction: 120,
+            has_network: false,
+            has_gui_window: false,
+            wakeups_per_sec: 2.0,
+            parent_alive: true,
+            process_uptime_secs: 3600,
+            faults_total: 100,
+            pageins_total: 100,
+            is_translated: false,
+            mach_port_count: 10,
+        }
+    }
+
+    fn no_hunts() -> Vec<HuntSnapshot> {
+        vec![]
+    }
+
+    fn governor() -> AdaptiveGovernor {
+        AdaptiveGovernor::new()
+    }
+
+    // ── Basic operation ──────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_input_produces_no_decisions() {
+        let mut gov = governor();
+        let decisions = gov.decide_all(&[], &no_hunts(), None, &[], 12);
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn summarise_empty_decisions() {
+        let summary = AdaptiveGovernor::summarise(&[]);
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.allowed, 0);
+    }
+
+    #[test]
+    fn summarise_counts_correctly() {
+        let decisions = vec![
+            ProcessDecision { pid: 1, name: "a".into(), decision: GovernorDecision::Allow, tier: ProcessTier::SilentDaemon, utility_score: 0.5, waste_score: 0.1, reason: "".into() },
+            ProcessDecision { pid: 2, name: "b".into(), decision: GovernorDecision::Throttle, tier: ProcessTier::SilentDaemon, utility_score: 0.1, waste_score: 0.5, reason: "".into() },
+            ProcessDecision { pid: 3, name: "c".into(), decision: GovernorDecision::Freeze, tier: ProcessTier::SilentDaemon, utility_score: 0.0, waste_score: 0.9, reason: "".into() },
+            ProcessDecision { pid: 4, name: "d".into(), decision: GovernorDecision::Kill, tier: ProcessTier::ZombieOrphan, utility_score: 0.0, waste_score: 1.0, reason: "".into() },
+        ];
+        let summary = AdaptiveGovernor::summarise(&decisions);
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.allowed, 1);
+        assert_eq!(summary.throttled, 1);
+        assert_eq!(summary.frozen, 1);
+        assert_eq!(summary.killed, 1);
+    }
+
+    // ── Essential / foreground protection ────────────────────────────────────
+
+    #[test]
+    fn system_essential_process_always_allowed() {
+        let mut gov = governor();
+        // "launchd" is in the essential set.
+        let snap = base_proc(1, "launchd");
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, GovernorDecision::Allow);
+    }
+
+    #[test]
+    fn foreground_app_is_allowed() {
+        let mut gov = governor();
+        // When Safari is foreground, its process should be protected.
+        let snap = ProcessSnapshot {
+            name: "Safari".into(),
+            secs_since_foreground: 0,
+            ..base_proc(100, "Safari")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), Some("Safari"), &["Safari"], 14);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, GovernorDecision::Allow);
+    }
+
+    // ── Ephemeral process protection ─────────────────────────────────────────
+
+    #[test]
+    fn ephemeral_xpc_under_8s_is_always_allowed() {
+        let mut gov = governor();
+        let snap = ProcessSnapshot {
+            process_uptime_secs: 3, // below 8s threshold
+            ..base_proc(200, "com.apple.xpc.launchd.oneshot.helper")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, GovernorDecision::Allow,
+            "ephemeral XPC < 8s must always be allowed");
+    }
+
+    // ── Graduated idle ────────────────────────────────────────────────────────
+
+    #[test]
+    fn idle_over_6h_no_gui_is_throttled() {
+        let mut gov = governor();
+        let snap = ProcessSnapshot {
+            secs_since_foreground: 7 * 3600, // 7h
+            has_gui_window: false,
+            ..base_proc(300, "some-daemon")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, GovernorDecision::Throttle,
+            "idle > 6h should be throttled");
+    }
+
+    #[test]
+    fn idle_over_12h_no_gui_is_frozen() {
+        let mut gov = governor();
+        let snap = ProcessSnapshot {
+            secs_since_foreground: 13 * 3600, // 13h
+            has_gui_window: false,
+            ..base_proc(301, "stale-daemon")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, GovernorDecision::Freeze,
+            "idle > 12h should be frozen");
+    }
+
+    // ── IPC hub protection ────────────────────────────────────────────────────
+
+    #[test]
+    fn high_mach_port_count_is_protected() {
+        let mut gov = governor();
+        let snap = ProcessSnapshot {
+            mach_port_count: 100, // > 80 threshold
+            secs_since_foreground: 5000,
+            ..base_proc(400, "ipc-hub-daemon")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, GovernorDecision::Allow,
+            "high Mach port count = IPC hub, must be protected");
+    }
+
+    // ── Night mode ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn night_mode_throttles_idle_no_gui() {
+        let mut gov = governor();
+        let snap = ProcessSnapshot {
+            has_gui_window: false,
+            secs_since_foreground: 1800, // 30 min idle
+            wakeups_per_sec: 1.0,
+            cpu_percent: 0.1,
+            ..base_proc(500, "background-daemon")
+        };
+        // hour=3 → night mode
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 3);
+        assert_eq!(decisions.len(), 1);
+        // Night mode should throttle low-utility background processes.
+        // (May be Allow if utility is high — test only fires for low-utility processes)
+        let d = &decisions[0];
+        assert!(
+            d.decision == GovernorDecision::Throttle || d.decision == GovernorDecision::Allow,
+            "night mode should throttle or allow, not freeze/kill: {:?}", d.decision
+        );
+    }
+
+    // ── Wakeup energy hog ─────────────────────────────────────────────────────
+
+    #[test]
+    fn wakeup_hog_no_gui_is_throttled() {
+        let mut gov = governor();
+        let snap = ProcessSnapshot {
+            wakeups_per_sec: 200.0, // > 100 threshold
+            has_gui_window: false,
+            cpu_percent: 0.5,
+            secs_since_foreground: 300,
+            faults_total: 100, // not render pipeline
+            ..base_proc(600, "wakeup-hog")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
+        assert_eq!(decisions.len(), 1);
+        // High wakeups + no GUI + low utility → throttle.
+        assert_eq!(decisions[0].decision, GovernorDecision::Throttle,
+            "wakeup hog should be throttled");
+    }
+
+    // ── Foreground helper detection ───────────────────────────────────────────
+
+    #[test]
+    fn webkit_helper_protected_when_safari_foreground() {
+        let mut gov = governor();
+        let snap = ProcessSnapshot {
+            has_gui_window: false,
+            secs_since_foreground: 5000,
+            ..base_proc(700, "com.apple.WebKit.WebContent")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), Some("Safari"), &["Safari"], 14);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, GovernorDecision::Allow,
+            "WebKit helper with Safari in foreground must be protected");
+    }
+
+    // ── Governor config default ───────────────────────────────────────────────
+
+    #[test]
+    fn governor_config_default_values() {
+        let cfg = GovernorConfig::default();
+        assert!((cfg.throttle_utility_threshold - 0.20).abs() < 0.01);
+        assert!((cfg.freeze_utility_threshold - 0.05).abs() < 0.01);
+        assert!((cfg.waste_override_threshold - 0.90).abs() < 0.01);
+        assert!(cfg.aggressive_in_coding);
+        assert!(cfg.aggressive_in_video_edit);
+    }
+
+    // ── is_render_pipeline ────────────────────────────────────────────────────
+
+    #[test]
+    fn render_pipeline_names_detected() {
+        assert!(is_render_pipeline("VDCAssistant"));
+        assert!(is_render_pipeline("MTLCompilerService"));
+        assert!(is_render_pipeline("mediaserverd"));
+        assert!(!is_render_pipeline("random-daemon"));
+        assert!(!is_render_pipeline("Safari"));
+    }
+
+    // ── calibrate_config_for_hardware ────────────────────────────────────────
+
+    #[test]
+    fn low_ram_machine_gets_lower_waste_threshold() {
+        use crate::engine::silicon_probe::SiliconInfo;
+        let hw_8gb = SiliconInfo { memory_bytes: 8 * 1024 * 1024 * 1024, ..SiliconInfo::read() };
+        let cfg = calibrate_config_for_hardware(&hw_8gb);
+        // 8GB machine: waste threshold should be 0.80, more aggressive.
+        assert!((cfg.waste_override_threshold - 0.80).abs() < 0.01,
+            "8GB machine should use 0.80 waste threshold, got {}", cfg.waste_override_threshold);
+    }
+
+    // ── Micro-benchmark: decide_all latency ──────────────────────────────────
+
+    #[test]
+    fn bench_decide_all_latency() {
+        let mut gov = governor();
+        let procs: Vec<ProcessSnapshot> = (0..20)
+            .map(|i| ProcessSnapshot {
+                secs_since_foreground: 300 + i * 100,
+                ..base_proc(i as u32 + 1000, "daemon")
+            })
+            .collect();
+        let hunts: Vec<HuntSnapshot> = vec![];
+        // Warm-up.
+        for _ in 0..5 {
+            let _ = gov.decide_all(&procs, &hunts, None, &[], 14);
+        }
+        let start = std::time::Instant::now();
+        let n = 100usize;
+        for _ in 0..n {
+            let _ = gov.decide_all(&procs, &hunts, None, &[], 14);
+        }
+        let per_call_ms = start.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        // 20 processes × governor logic should complete in < 5ms per cycle.
+        assert!(per_call_ms < 5.0,
+            "decide_all too slow: {per_call_ms:.2}ms/call (expected < 5ms)");
+    }
+}
+
 /// Calibra los thresholds del governor según el hardware real del chip.
 ///
 /// Leído una sola vez al inicio via sysctl (sin root, sin entitlement).

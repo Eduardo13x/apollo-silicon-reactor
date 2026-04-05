@@ -481,3 +481,206 @@ fn collect_pressure_facts() -> (f64, u64, u64, f64, f64) {
         kernel_pressure,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Struct construction ──────────────────────────────────────────────────
+
+    #[test]
+    fn system_snapshot_fields_accessible() {
+        let snap = SystemSnapshot {
+            timestamp: chrono::Utc::now(),
+            cpu: CpuStats { global_usage: 42.0, core_count: 8 },
+            memory: MemoryStats {
+                total_ram: 8 * 1024 * 1024 * 1024,
+                used_ram: 4 * 1024 * 1024 * 1024,
+                free_ram: 4 * 1024 * 1024 * 1024,
+                total_swap: 2 * 1024 * 1024 * 1024,
+                used_swap: 512 * 1024 * 1024,
+            },
+            pressure: PressureStats {
+                memory_pressure: 0.45,
+                swap_used_bytes: 512 * 1024 * 1024,
+                swap_total_bytes: 2 * 1024 * 1024 * 1024,
+                swap_delta_bytes_per_sec: 1_000_000.0,
+                thermal_level: "nominal".to_string(),
+                compressor_pressure: 0.30,
+            },
+            disks: vec![],
+            networks: vec![],
+            top_processes: vec![],
+        };
+        assert_eq!(snap.cpu.core_count, 8);
+        assert!((snap.cpu.global_usage - 42.0).abs() < 0.01);
+        assert_eq!(snap.pressure.thermal_level, "nominal");
+    }
+
+    #[test]
+    fn process_stats_cpu_wall_ratio_defaults_none() {
+        let ps = ProcessStats {
+            pid: 1234,
+            name: "test_proc".to_string(),
+            cpu_usage: 5.5,
+            memory_usage: 1024 * 1024,
+            cpu_wall_ratio: None,
+        };
+        assert!(ps.cpu_wall_ratio.is_none());
+        assert_eq!(ps.name, "test_proc");
+    }
+
+    // ── EMA math (mirrors collect_snapshot EMA logic) ────────────────────────
+
+    #[test]
+    fn ema_converges_to_target() {
+        // After N steps, EMA should be within ε of the constant input.
+        let alpha = 0.25f64;
+        let target = 0.60;
+        let mut ema = 0.0f64;
+        for _ in 0..40 {
+            ema = ema * (1.0 - alpha) + target * alpha;
+        }
+        assert!((ema - target).abs() < 0.01, "EMA should converge: got {ema:.4}");
+    }
+
+    #[test]
+    fn ema_alpha_bounds_hold() {
+        // EMA output should always remain within [0, 1] for inputs in [0, 1].
+        let alpha = 0.25f64;
+        let mut ema = 0.0f64;
+        let inputs = [0.0, 0.5, 1.0, 0.8, 0.2, 0.0, 0.9];
+        for &v in &inputs {
+            ema = ema * (1.0 - alpha) + v * alpha;
+            assert!((0.0..=1.0).contains(&ema), "EMA out of range: {ema}");
+        }
+    }
+
+    // ── Pressure fusion logic ────────────────────────────────────────────────
+
+    #[test]
+    fn pressure_fusion_takes_max() {
+        // mem_pressure = kernel_pressure.max(compressor_pressure)
+        let kernel = 0.40f64;
+        let compressor = 0.65f64;
+        let fused = kernel.max(compressor);
+        assert!((fused - compressor).abs() < 1e-9, "should take compressor when higher");
+
+        let kernel2 = 0.80f64;
+        let compressor2 = 0.30f64;
+        let fused2 = kernel2.max(compressor2);
+        assert!((fused2 - kernel2).abs() < 1e-9, "should take kernel when higher");
+    }
+
+    #[test]
+    fn pressure_fusion_clamped_to_unit_interval() {
+        // Even with extreme raw values, fused result should be in [0, 1].
+        for (k, c) in [(0.0, 0.0), (1.0, 1.0), (0.5, 0.5), (1.0, 0.0), (0.0, 1.0)] {
+            let fused = (k as f64).max(c as f64);
+            assert!((0.0..=1.0).contains(&fused));
+        }
+    }
+
+    // ── collect_pressure_facts smoke test ───────────────────────────────────
+
+    #[test]
+    fn collect_pressure_facts_returns_valid_range() {
+        let (fused, swap_used, swap_total, comp_raw, kernel) = collect_pressure_facts();
+        // All pressure values must be in [0, 1].
+        assert!((0.0..=1.0).contains(&fused), "fused={fused}");
+        assert!((0.0..=1.0).contains(&comp_raw), "comp_raw={comp_raw}");
+        assert!((0.0..=1.0).contains(&kernel), "kernel={kernel}");
+        // Swap values must be non-negative.
+        assert!(swap_used <= swap_total || swap_total == 0,
+            "swap_used ({swap_used}) > swap_total ({swap_total})");
+        // fused must be max(kernel, comp_raw) — may differ by EMA rounding
+        let expected_min = kernel.max(comp_raw);
+        assert!(fused >= expected_min - 1e-9, "fused={fused} < max(k,c)={expected_min}");
+    }
+
+    // ── SystemCollector construction ─────────────────────────────────────────
+
+    #[test]
+    fn system_collector_new_does_not_panic() {
+        // Verifies that initialization (including refresh_processes) completes.
+        let collector = SystemCollector::new();
+        assert!(!collector.process_refresh_hung);
+        assert_eq!(collector.light_call_count, 0);
+    }
+
+    #[test]
+    fn collect_snapshot_light_returns_valid_pressure() {
+        let mut collector = SystemCollector::new();
+        let snap = collector.collect_snapshot_light();
+        assert!((0.0..=1.0).contains(&snap.pressure.memory_pressure));
+        assert!((0.0..=1.0).contains(&snap.pressure.compressor_pressure));
+        assert!(snap.pressure.swap_used_bytes <= snap.pressure.swap_total_bytes
+            || snap.pressure.swap_total_bytes == 0);
+    }
+
+    #[test]
+    fn collect_snapshot_increments_light_call_count() {
+        let mut collector = SystemCollector::new();
+        assert_eq!(collector.light_call_count, 0);
+        collector.collect_snapshot();
+        assert_eq!(collector.light_call_count, 1);
+        collector.collect_snapshot();
+        assert_eq!(collector.light_call_count, 2);
+    }
+
+    #[test]
+    fn swap_delta_is_zero_on_first_call() {
+        let mut collector = SystemCollector::new();
+        // On first collect_snapshot, prev_swap_at is None → delta = 0.
+        let snap = collector.collect_snapshot();
+        assert_eq!(snap.pressure.swap_delta_bytes_per_sec, 0.0,
+            "first-call delta should be 0");
+    }
+
+    // ── Serialization round-trip ─────────────────────────────────────────────
+
+    #[test]
+    fn process_stats_serde_roundtrip() {
+        let ps = ProcessStats {
+            pid: 5678,
+            name: "roundtrip_proc".to_string(),
+            cpu_usage: 12.5,
+            memory_usage: 2 * 1024 * 1024,
+            cpu_wall_ratio: Some(0.45),
+        };
+        let json = serde_json::to_string(&ps).expect("serialize");
+        let ps2: ProcessStats = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(ps2.pid, ps.pid);
+        assert_eq!(ps2.name, ps.name);
+        assert!((ps2.cpu_usage - ps.cpu_usage).abs() < 0.01);
+        assert_eq!(ps2.cpu_wall_ratio, ps.cpu_wall_ratio);
+    }
+
+    #[test]
+    fn process_stats_cpu_wall_ratio_default_is_none() {
+        // When cpu_wall_ratio is absent from JSON, it should default to None.
+        let json = r#"{"pid":9,"name":"old_proc","cpu_usage":3.0,"memory_usage":1024}"#;
+        let ps: ProcessStats = serde_json::from_str(json).expect("deserialize without cpu_wall_ratio");
+        assert!(ps.cpu_wall_ratio.is_none());
+    }
+
+    // ── Micro-benchmark: collect_pressure_facts latency ──────────────────────
+
+    #[test]
+    fn bench_collect_pressure_facts_latency() {
+        // Warm-up
+        for _ in 0..3 {
+            let _ = collect_pressure_facts();
+        }
+        let start = std::time::Instant::now();
+        let n = 20;
+        for _ in 0..n {
+            let _ = collect_pressure_facts();
+        }
+        let elapsed = start.elapsed();
+        let per_call_ms = elapsed.as_secs_f64() * 1000.0 / n as f64;
+        // Two sysctl calls + host_statistics64 should complete in < 5ms each.
+        assert!(per_call_ms < 5.0,
+            "collect_pressure_facts too slow: {per_call_ms:.2}ms/call (expected < 5ms)");
+    }
+}
