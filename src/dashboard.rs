@@ -797,6 +797,7 @@ fn render_frozen(status: &DaemonStatus) -> Vec<String> {
             FreezeSource::Manual => "Manual",
             FreezeSource::ThermalPreThrottle => "ThermalPre",
             FreezeSource::ChromiumManager => "Chromium",
+            FreezeSource::Unknown => "Unknown",
         };
         let time = if p.frozen_seconds >= 3600 {
             format!("{}h {:02}m", p.frozen_seconds / 3600, (p.frozen_seconds % 3600) / 60)

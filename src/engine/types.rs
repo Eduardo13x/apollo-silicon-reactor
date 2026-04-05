@@ -389,6 +389,7 @@ impl RootAction {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
 pub enum FreezeSource {
     MainLoop,
     Sentinel,
@@ -397,6 +398,9 @@ pub enum FreezeSource {
     ThermalPreThrottle,
     /// Frozen by ChromiumManager (idle tab renderer — safe to SIGCONT on fg change).
     ChromiumManager,
+    /// Unknown variant from future binary — treat as MainLoop for safe recovery.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
