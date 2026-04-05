@@ -2139,6 +2139,15 @@ fn main() -> anyhow::Result<()> {
                     .map(|e| (e.pid, e.ipc))
                     .collect();
 
+                // Battery vampire detection: processes with >50 wakeups/s get priority throttle.
+                let wakeup_hints = apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_wakeup_hints(
+                    &energy_pid_results, 50.0,
+                );
+                // Physical footprint hints for accurate freeze ranking.
+                let footprint_hints = apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_footprint_hints(
+                    &energy_pid_results,
+                );
+
                 // ── Syscall-aware profiling: identify JIT-compiling processes ──
                 // Sample top processes through the syscall classifier and collect
                 // PIDs currently in JitCompiling state.  These are merged into
@@ -3383,6 +3392,10 @@ fn main() -> anyhow::Result<()> {
 
                 let decision = {
                     let mut qos = state.mach_qos.lock_recover();
+                    let dram_bandwidth_pct = last_ioreport
+                        .as_ref()
+                        .map(|ir| ir.amc_bandwidth_pct)
+                        .unwrap_or(0.0);
                     let policy = PolicyContext {
                         decide_interactive:        &decide_interactive,
                         decide_noise:              &decide_noise,
@@ -3394,6 +3407,9 @@ fn main() -> anyhow::Result<()> {
                         habituated_pids:           effective_habituated,
                         causal_confidence:         &causal_confidence,
                         user_ctx:                  &user_context,
+                        wakeup_hints:              &wakeup_hints,
+                        footprint_hints:           &footprint_hints,
+                        dram_bandwidth_pct,
                     };
                     decision_stage.run(
                         &snapshot,

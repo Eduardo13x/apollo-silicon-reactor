@@ -239,6 +239,16 @@ pub fn decide_actions(
     // idle_secs, sleep assertions, call detection, audio state.
     // [Riva & Mantovani 2014] idle time + media state = highest-signal contextual cues.
     user_ctx: &UserContext,
+    // Per-process wakeup rate (idle + interrupt wakeups/sec) from proc_pid_rusage.
+    // [Apple Energy Diagnostics / Activity Monitor] wakeup rate is the primary
+    // battery drain signal for idle daemons. >100/s = vampire; >500/s = severe.
+    wakeup_hints: &HashMap<u32, f64>,
+    // Per-process physical footprint (MB) from ri_phys_footprint.
+    // More accurate than RSS for freeze ranking: excludes shared pages.
+    footprint_hints: &HashMap<u32, f64>,
+    // DRAM memory bandwidth utilization (0.0–1.0) from IOReport AMC stats.
+    // When > 0.80, memory-bandwidth-heavy processes should be throttled first.
+    dram_bandwidth_pct: f64,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -454,15 +464,47 @@ pub fn decide_actions(
                         && matches!(profile, OptimizationProfile::AggressiveRoot)
                 }
             };
+            // Wakeup vampire boost: if process has high wakeup rate (>100/s),
+            // it is a battery drain even when idle. Mark as aggressive regardless
+            // of profile — wakeup vampires waste power doing nothing useful.
+            // [Apple Energy Diagnostics] >100 wakeups/s = measurable battery impact.
+            let wakeup_rate = wakeup_hints.get(&pid).copied().unwrap_or(0.0);
+            let is_wakeup_vampire = wakeup_rate >= 100.0;
+            let aggressive = aggressive || is_wakeup_vampire;
+
+            // DRAM bandwidth saturation: when memory bandwidth > 80%, prefer
+            // throttling the process with highest physical footprint (most BW usage).
+            // [Intel Memory Bandwidth Allocation / IOReport AMC] bandwidth saturation
+            // causes system-wide latency spikes worse than CPU contention.
+            let footprint_mb = footprint_hints.get(&pid).copied().unwrap_or(0.0);
+            let bandwidth_priority = dram_bandwidth_pct >= 0.80 && footprint_mb > 100.0;
+
+            let reason = if is_wakeup_vampire {
+                format!(
+                    "wakeup-vampire throttle ({:.0}/s wakeups, ipc={:.2})",
+                    wakeup_rate,
+                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
+                )
+            } else if bandwidth_priority {
+                format!(
+                    "dram-bw throttle (bw={:.0}%, footprint={:.0}MB, ipc={:.2})",
+                    dram_bandwidth_pct * 100.0,
+                    footprint_mb,
+                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
+                )
+            } else {
+                format!(
+                    "ipc-aware throttle ({:?}, ipc={:.2})",
+                    context,
+                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
+                )
+            };
+
             actions.push(RootAction::ThrottleProcess {
                 pid,
                 name,
                 aggressive,
-                reason: format!(
-                    "ipc-aware throttle ({:?}, ipc={:.2})",
-                    context,
-                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
-                ),
+                reason,
                 start_sec: process.start_time(),
                 start_usec: 0,
             });
@@ -792,8 +834,15 @@ pub fn decide_actions(
                             ))
                         })
                         .collect();
-                // Descending RSS: biggest consumers first.
-                freeze_candidates.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+                // Rank by physical footprint when available (more accurate than RSS),
+                // else fall back to RSS. phys_footprint excludes shared pages so it
+                // better reflects actual memory pressure contribution per process.
+                // [XNU proc_pid_rusage ri_phys_footprint] = true owned pages.
+                freeze_candidates.sort_unstable_by(|a, b| {
+                    let fa = footprint_hints.get(&a.0).copied().unwrap_or(a.2 as f64 / (1024.0 * 1024.0));
+                    let fb = footprint_hints.get(&b.0).copied().unwrap_or(b.2 as f64 / (1024.0 * 1024.0));
+                    fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+                });
                 // Cap at 3 per cycle — avoid SIGSTOP burst overhead on display pipeline.
                 for (pid, name, _rss, cpu, start_sec) in freeze_candidates.into_iter().take(3) {
                     // CPU-active guard: throttle instead of freeze to avoid dropping
@@ -1130,6 +1179,9 @@ mod tests {
             &hab,
             &causal,
             &UserContext::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            0.0,
         );
 
         assert!(
@@ -1171,6 +1223,9 @@ mod tests {
             &hab,
             &causal,
             &UserContext::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            0.0,
         );
 
         assert!(
@@ -1205,6 +1260,9 @@ mod tests {
             &hab,
             &causal,
             &UserContext::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            0.0,
         );
         assert!(matches!(
             out_low.context,
@@ -1231,6 +1289,9 @@ mod tests {
             &hab,
             &causal,
             &UserContext::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            0.0,
         );
         assert!(matches!(
             out_mid.context,
@@ -1257,6 +1318,9 @@ mod tests {
             &hab,
             &causal,
             &UserContext::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            0.0,
         );
         assert!(matches!(
             out_high.context,
@@ -1293,6 +1357,9 @@ mod tests {
                 &hab,
                 &causal,
                 &UserContext::default(),
+                &HashMap::new(),
+                &HashMap::new(),
+                0.0,
             );
             // Should not panic, and with no processes should produce no actions.
             assert!(
@@ -1332,6 +1399,9 @@ mod tests {
                 &hab,
                 &causal,
                 &UserContext::default(),
+                &HashMap::new(),
+                &HashMap::new(),
+                0.0,
             );
             assert!(output.actions.is_empty());
         }

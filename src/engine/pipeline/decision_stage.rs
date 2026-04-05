@@ -93,6 +93,17 @@ pub struct PolicyContext<'a> {
     /// Current user context: idle time, sleep assertions, call detection, audio.
     /// Drives freeze gating and throttle conservatism based on user activity.
     pub user_ctx: &'a UserContext,
+
+    /// Per-process wakeup rate (idle + interrupt wakeups/sec) from proc_pid_rusage.
+    /// Battery vampire detection: >100/s = priority throttle target.
+    pub wakeup_hints: &'a HashMap<u32, f64>,
+
+    /// Per-process physical footprint (MB) from ri_phys_footprint.
+    /// Used for freeze ranking instead of RSS (more accurate).
+    pub footprint_hints: &'a HashMap<u32, f64>,
+
+    /// DRAM bandwidth utilization 0.0–1.0 from IOReport AMC stats.
+    pub dram_bandwidth_pct: f64,
 }
 
 /// The output returned by [`DecisionStage::run`].
@@ -177,6 +188,9 @@ impl DecisionStage {
             policy.habituated_pids,
             policy.causal_confidence,
             policy.user_ctx,
+            policy.wakeup_hints,
+            policy.footprint_hints,
+            policy.dram_bandwidth_pct,
         );
 
         DecisionStageOutput { decision }
@@ -245,6 +259,9 @@ mod tests {
             habituated_pids: pids,
             causal_confidence: causal,
             user_ctx,
+            wakeup_hints: ipc, // reuse empty map (same type)
+            footprint_hints: ipc,
+            dram_bandwidth_pct: 0.0,
         }
     }
 
