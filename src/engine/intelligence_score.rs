@@ -256,19 +256,14 @@ fn decision_precision(input: &AisInput) -> f64 {
 // ── Dimension 2: Signal Quality ──────────────────────────────────────────────
 // Combines: Kalman accuracy, CUSUM detection rate, Hazard calibration, Entropy TPR.
 fn signal_quality(input: &AisInput) -> f64 {
-    // Kalman: score = 1 / (1 + (rmse / threshold)³), threshold = Riccati steady-state RMSE.
+    // Kalman: score = 1 / (1 + (rmse / threshold)²), threshold = Riccati steady-state RMSE.
     // [Welch & Bishop 2006] §VII: filter performance judged relative to optimal linear estimate.
-    // For Kalman(Q=0.005, R=0.02): Riccati P* = 0.00781 → RMSE_theory = 0.0884.
-    // The adaptive IPC-aware filter (variable R) achieves sub-Riccati RMSE in production
-    // (empirically ~0.051), because adaptive R reduces effective measurement noise below
-    // the fixed-R Kalman's theoretical floor.
-    // Exponent 3 (was 2): for Kalman RMSE vs Cramér-Rao bound the appropriate metric is
-    // how many "bound multiples" the filter is below theory — a multiplicative, not additive,
-    // scale. Cubic exponent creates steep improvement for sub-bound performance (correct
-    // behavior: a filter 1.7× below theory should score >90%, not 75%) while maintaining
-    // strong penalties above the bound (RMSE=2×bound → score=0.11 vs 0.20 with ^2).
-    // At RMSE=bound: score=0.50 (unchanged). At RMSE=bound/2: score=0.89 (was 0.80).
-    let kalman_score = 1.0 / (1.0 + (input.kalman_rmse / 0.088_4).powi(3));
+    // For Kalman(Q=0.005, R=0.02): Riccati P* = (-Q + √(Q²+4QR))/2 = 0.00781
+    // → RMSE_theory = √P* = 0.0884. This is the theoretical floor — a filter below this
+    // threshold is performing better than theory via adaptive noise (IPC-aware R tuning).
+    // threshold=0.0884: filter at P*=RMSE_theory → score=0.50; at RMSE=0.044 → score=0.80.
+    // Previous threshold 0.06 was set as "observed steady state" — circular/self-referential.
+    let kalman_score = 1.0 / (1.0 + (input.kalman_rmse / 0.088_4).powi(2));
 
     // CUSUM: Fβ score with β=2 (recall-weighted).
     // In a safety-critical system, missing a real regime shift (false negative)
