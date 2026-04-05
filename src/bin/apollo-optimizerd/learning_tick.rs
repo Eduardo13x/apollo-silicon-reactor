@@ -125,33 +125,58 @@ pub fn run_learning_tick<'a>(
         }
     }
 
-    // ── Causal graph (Pearl 2009) ────────────────────────────────────────────
-    // Record throttle/freeze actions for causal evaluation.
-    // Each action becomes a pending observation; eval_delay cycles later
-    // we check if pressure actually dropped (cause → effect).
+    // ── Causal graph (Pearl 2009 + Granger 1969) ──────────────────────────────
+    // Record throttle/freeze actions for causal evaluation with resource snapshots
+    // for mechanism attribution. Multi-horizon eval: 3 cycles (fast) + 15 cycles (slow).
     {
+        use apollo_optimizer::engine::causal_graph::ResourceSnapshot;
         let pressure_now = snapshot.pressure.memory_pressure as f32;
+        let swap_mb_now = snapshot.pressure.swap_used_bytes as f32 / 1_048_576.0;
         for name in throttle_names_for_outcome {
-            lctx.causal_graph.record_action(
+            // Build per-process resource snapshot for mechanism attribution.
+            let res = snapshot.top_processes.iter()
+                .find(|p| &p.name == name)
+                .map(|p| ResourceSnapshot {
+                    rss_mb: p.memory_usage as f32 / 1_048_576.0,
+                    cpu_pct: p.cpu_usage,
+                    swap_mb: swap_mb_now, // system-level (no per-process swap on macOS)
+                })
+                .unwrap_or_default();
+            lctx.causal_graph.record_action_with_resources(
                 &format!("throttle:{}", name),
                 pressure_now,
                 cycle_count,
+                res,
             );
         }
         // Record freeze actions — only PIDs frozen THIS cycle, not all active ones.
-        // Using exec_outcomes.newly_frozen_pids avoids double-counting PIDs that have
-        // been frozen across multiple previous cycles (would inflate causal scores).
         for &pid in &exec_outcomes.newly_frozen_pids {
             if let Some(process) = collector.system().process(sysinfo::Pid::from_u32(pid)) {
-                lctx.causal_graph.record_action(
+                let res = ResourceSnapshot {
+                    rss_mb: process.memory() as f32 / 1_048_576.0,
+                    cpu_pct: process.cpu_usage(),
+                    swap_mb: swap_mb_now,
+                };
+                lctx.causal_graph.record_action_with_resources(
                     &format!("freeze:{}", process.name()),
                     pressure_now,
                     cycle_count,
+                    res,
                 );
             }
         }
-        // Evaluate pending actions: did pressure actually drop?
-        lctx.causal_graph.evaluate(pressure_now, cycle_count);
+        // Evaluate pending actions with current resource snapshot.
+        // Both fast (3-cycle) and slow (15-cycle) horizons are evaluated.
+        let current_res = ResourceSnapshot {
+            rss_mb: snapshot.top_processes.iter()
+                .map(|p| p.memory_usage as f32 / 1_048_576.0)
+                .sum(),
+            cpu_pct: snapshot.top_processes.iter()
+                .map(|p| p.cpu_usage)
+                .sum(),
+            swap_mb: swap_mb_now,
+        };
+        lctx.causal_graph.evaluate_with_resources(pressure_now, cycle_count, &current_res);
     }
 
     // ── Causal graph: process co-occurrence at high pressure ─────────────────
