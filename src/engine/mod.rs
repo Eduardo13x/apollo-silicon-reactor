@@ -24,6 +24,7 @@ pub mod energy;
 pub mod energy_pid;
 pub mod entropy_anomaly;
 pub mod execute_actions;
+pub mod fluidity;
 pub mod focus_markov;
 pub mod foreground;
 pub mod gpu_manager;
