@@ -255,6 +255,12 @@ pub fn decide_actions(
     // [Bhagwan & Savage 2002 OSDI] "I/O-Scope" — I/O bursts degrade co-located
     // latency-sensitive workloads by saturating disk queue depth.
     io_burst_hints: &HashMap<u32, f64>,
+    // Per-process behavioral anomaly score vs learned baseline.
+    // Score = max(|x-ema|/(mad+ε)) across {ipc, wakeup_rate, disk_mbps}.
+    // ≥ 3.0 MADs from baseline → process deviating from learned normal behavior.
+    // A normally-idle process suddenly active is more suspicious than a
+    // consistently high-load process. [Chandola 2009 ACM CSUR §3.1]
+    anomaly_hints: &HashMap<u32, f64>,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -499,7 +505,22 @@ pub fn decide_actions(
             // io_burst always aggressive — disk saturation is immediate and binary.
             let aggressive = aggressive || is_io_burst;
 
-            let reason = if is_io_burst {
+            // Behavioral anomaly: process deviating ≥ 3 MADs from its learned baseline.
+            // A process that is normally idle but suddenly active is a higher priority
+            // target than a consistently high-load process that we already know about.
+            // [Chandola 2009 ACM CSUR §3.1] deviation-from-baseline as anomaly signal.
+            let anomaly_score = anomaly_hints.get(&pid).copied().unwrap_or(0.0);
+            let is_anomalous = anomaly_score >= crate::engine::process_baseline::ANOMALY_THRESHOLD;
+            // Anomalous behavior = aggressive throttle — the process broke its contract.
+            let aggressive = aggressive || is_anomalous;
+
+            let reason = if is_anomalous {
+                format!(
+                    "anomaly throttle (score={:.1}x baseline, ipc={:.2})",
+                    anomaly_score,
+                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
+                )
+            } else if is_io_burst {
                 format!(
                     "io-burst throttle ({:.1} MB/s writes, ipc={:.2})",
                     disk_mbps,
@@ -1209,6 +1230,7 @@ mod tests {
             &HashMap::new(),
             0.0,
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert!(
@@ -1254,6 +1276,7 @@ mod tests {
             &HashMap::new(),
             0.0,
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert!(
@@ -1292,6 +1315,7 @@ mod tests {
             &HashMap::new(),
             0.0,
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(matches!(
             out_low.context,
@@ -1322,6 +1346,7 @@ mod tests {
             &HashMap::new(),
             0.0,
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(matches!(
             out_mid.context,
@@ -1351,6 +1376,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             0.0,
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert!(matches!(
@@ -1391,6 +1417,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 0.0,
+                &HashMap::new(),
                 &HashMap::new(),
             );
             // Should not panic, and with no processes should produce no actions.
@@ -1434,6 +1461,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 0.0,
+                &HashMap::new(),
                 &HashMap::new(),
             );
             assert!(output.actions.is_empty());

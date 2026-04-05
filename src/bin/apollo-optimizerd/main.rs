@@ -2163,6 +2163,13 @@ fn main() -> anyhow::Result<()> {
                 let io_burst_hints = apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_io_burst_hints(
                     &energy_pid_results, 5.0,
                 );
+                // Behavioral anomaly hints: processes deviating ≥ 3 MADs from their
+                // learned {ipc, wakeup_rate, disk_mbps} baseline get priority throttle.
+                let anomaly_hints: std::collections::HashMap<u32, f64> = energy_pid_results
+                    .iter()
+                    .filter(|r| r.anomaly_score >= apollo_optimizer::engine::process_baseline::ANOMALY_THRESHOLD)
+                    .map(|r| (r.pid, r.anomaly_score))
+                    .collect();
 
                 // ── Syscall-aware profiling: identify JIT-compiling processes ──
                 // Sample top processes through the syscall classifier and collect
@@ -3449,6 +3456,7 @@ fn main() -> anyhow::Result<()> {
                         footprint_hints:           &footprint_hints,
                         dram_bandwidth_pct,
                         io_burst_hints:            &io_burst_hints,
+                        anomaly_hints:             &anomaly_hints,
                     };
                     decision_stage.run(
                         &snapshot,

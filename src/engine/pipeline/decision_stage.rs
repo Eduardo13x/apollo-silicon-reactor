@@ -108,6 +108,10 @@ pub struct PolicyContext<'a> {
     /// Per-process disk write rate (MB/s) from ri_disk_write_bytes delta.
     /// Throttle background I/O abusers (>5 MB/s) to protect LLM inference bandwidth.
     pub io_burst_hints: &'a HashMap<u32, f64>,
+
+    /// Per-process behavioral anomaly score vs learned hardware counter baseline.
+    /// ≥ 3.0 MADs from {ipc, wakeup_rate, disk_mbps} baseline = priority throttle.
+    pub anomaly_hints: &'a HashMap<u32, f64>,
 }
 
 /// The output returned by [`DecisionStage::run`].
@@ -196,6 +200,7 @@ impl DecisionStage {
             policy.footprint_hints,
             policy.dram_bandwidth_pct,
             policy.io_burst_hints,
+            policy.anomaly_hints,
         );
 
         DecisionStageOutput { decision }
@@ -268,6 +273,7 @@ mod tests {
             footprint_hints: ipc,
             dram_bandwidth_pct: 0.0,
             io_burst_hints: ipc,
+            anomaly_hints: ipc,
         }
     }
 
