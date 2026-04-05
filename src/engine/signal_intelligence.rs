@@ -84,6 +84,15 @@ pub struct SignalDigest {
     // ── Deep Scan (v0.7.0) ──────────────────────────────────────────────
     /// true if vm_region deep scan ran this cycle (pressure was high enough).
     pub memory_scan_available: bool,
+
+    // ── Fluidity Intelligence ───────────────────────────────────────────
+    /// Composite system fluidity score 0–1 (1 = perfectly fluid).
+    /// [Jain 1991] composite EMA from WindowServer CPU + GPU + launch pressure.
+    pub fluidity_score: f32,
+    /// True when WindowServer CPU spike detected (window resize/move active).
+    pub window_op_active: bool,
+    /// True when a new app launch is in progress.
+    pub app_launching: bool,
 }
 
 /// Orquestador de señales. Inicializar una vez en el daemon, llamar tick() cada ciclo.
@@ -427,6 +436,10 @@ impl SignalIntelligence {
             urgency,
             transformer_anomaly: 0.0,
             memory_scan_available: false,
+            // Fluidity fields: wired from daemon after tick() via mut SignalDigest.
+            fluidity_score: 1.0,
+            window_op_active: false,
+            app_launching: false,
         }
     }
 

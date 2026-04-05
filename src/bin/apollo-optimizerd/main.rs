@@ -2959,6 +2959,20 @@ fn main() -> anyhow::Result<()> {
                             "pressure": (d.pressure_smooth * 1000.0).round() / 1000.0,
                         }));
                     }
+
+                    // Fluidity signals → SignalDigest.
+                    // [Jain 1991] Composite urgency includes fluidity degradation:
+                    // sustained low fluidity (< 0.65) adds up to 0.30 to urgency,
+                    // allowing the predictive agent to account for rendering pressure.
+                    d.fluidity_score = fluidity_state.fluidity_ema;
+                    d.window_op_active = fluidity_state.window_op_active();
+                    d.app_launching = fluidity_state.launch_active;
+                    if fluidity_state.fluidity_degraded {
+                        let fluidity_urgency =
+                            ((0.65 - fluidity_state.fluidity_ema as f64) * 0.4).max(0.0);
+                        d.urgency = (d.urgency + fluidity_urgency).min(1.0);
+                    }
+
                     d
                 };
 
