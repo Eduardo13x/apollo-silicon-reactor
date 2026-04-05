@@ -286,10 +286,16 @@ impl RlThresholdAgent {
 
     /// Map a pressure_band to a representative pressure float for shaping.
     fn band_to_pressure(band: u8) -> f64 {
+        // All 4 bands must map to distinct values for reward shaping to
+        // distinguish 'high' (0.81-0.92) from 'critical' (>0.92) pressure.
+        // The original wildcard merged bands 2 and 3 into 0.90, eliminating
+        // the critical-state gradient.
+        // [Hellerstein 2004] — discrete state spaces must be fully specified.
         match band {
             0 => 0.35,
             1 => 0.65,
-            _ => 0.90,
+            2 => 0.90,
+            _ => 0.95,
         }
     }
 
