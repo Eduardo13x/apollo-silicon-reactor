@@ -5334,13 +5334,9 @@ fn main() -> anyhow::Result<()> {
                     let mut m = state.metrics.lock_recover();
                     // SwapTrend — previously computed but never exposed.
                     m.metrics.swap_trend = format!("{:?}", swap_forecast.swap_trend);
-                    // WindowServer CPU — display compositor load indicator.
-                    m.metrics.windowserver_cpu_pct = collector.system()
-                        .processes()
-                        .values()
-                        .find(|p| p.name() == "WindowServer")
-                        .map(|p| p.cpu_usage())
-                        .unwrap_or(0.0);
+                    // WindowServer CPU — use EMA from FluidityState (already computed
+                    // each cycle in the proc_snaps block). More stable than raw sample.
+                    m.metrics.windowserver_cpu_pct = fluidity_state.windowserver_cpu_ema;
                     // Compression signal from the EMA-smoothed compressor_pressure already
                     // computed by the collector (ratio of compressor pages to total physical
                     // pages × 0.85). The old formula used_ram - (total - free) was wrong:
