@@ -107,15 +107,17 @@ pub fn update_learning_metrics<'a>(
             }
         })
         .collect();
-    // Causal effect average: mean effect across last resolved outcomes.
+    // Causal effect average: mean impact_score across solid causal edges.
+    // This is a real signal (confidence × avg_delta from observed pressure drops)
+    // instead of the previous synthetic (effectiveness × 0.05) heuristic.
     m.metrics.causal_effect_avg = {
-        let effectiveness = lctx.outcome_tracker.overall_effectiveness();
-        let avg_drop = if lctx.outcome_tracker.total_resolved > 0 {
-            effectiveness * 0.05
-        } else {
+        let solid = lctx.causal_graph.solid_edges();
+        if solid.is_empty() {
             0.0
-        };
-        lctx.outcome_tracker.causal_effect(avg_drop)
+        } else {
+            let sum: f64 = solid.iter().map(|e| e.impact_score() as f64).sum();
+            sum / solid.len() as f64
+        }
     };
     // HRPO / Dr. Zero metrics
     m.metrics.dr_zero_self_challenge = lctx.outcome_tracker.self_challenge_score();
