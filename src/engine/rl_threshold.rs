@@ -207,6 +207,14 @@ pub struct RlThresholdAgent {
     constraints: RlConstraints,
     /// Consecutive Lower5pp actions (for constraint enforcement).
     consecutive_lower: u32,
+
+    // ── Pressure histogram for band auto-tuning (Phase 2) ────────────
+    /// Ring buffer of recent pressure observations for quantile estimation.
+    pressure_histogram: Vec<f64>,
+    /// Ring buffer of recent compressor observations.
+    compressor_histogram: Vec<f64>,
+    /// Write cursor for histogram ring buffer.
+    histogram_cursor: usize,
 }
 
 impl RlThresholdAgent {
@@ -264,6 +272,9 @@ impl RlThresholdAgent {
             dyna_steps: DYNA_PLANNING_STEPS,
             constraints: RlConstraints::default(),
             consecutive_lower: 0,
+            pressure_histogram: Vec::with_capacity(200),
+            compressor_histogram: Vec::with_capacity(200),
+            histogram_cursor: 0,
         }
     }
 
@@ -519,6 +530,55 @@ impl RlThresholdAgent {
         self.neuro_epsilon_bonus = self.neuro_epsilon_bonus.min(max_eps.max(0.0));
     }
 
+    // ── Auto-tuning (Phase 2) ─────────────────────────────────────────
+
+    /// Record a pressure/compressor observation for histogram-based band auto-tuning.
+    /// Call every cycle with the raw memory_pressure and compressor_pressure.
+    pub fn record_pressure_sample(&mut self, pressure: f64, compressor: f64) {
+        const HISTOGRAM_CAP: usize = 200;
+        if self.pressure_histogram.len() < HISTOGRAM_CAP {
+            self.pressure_histogram.push(pressure);
+            self.compressor_histogram.push(compressor);
+        } else {
+            let idx = self.histogram_cursor % HISTOGRAM_CAP;
+            self.pressure_histogram[idx] = pressure;
+            self.compressor_histogram[idx] = compressor;
+        }
+        self.histogram_cursor += 1;
+    }
+
+    /// Auto-tune pressure and compressor bands from the histogram.
+    ///
+    /// Computes quantiles (33rd/66th/90th for pressure, 33rd/66th for compressor)
+    /// and returns them clamped to safe ranges. Returns None if < 100 samples.
+    pub fn auto_tune_bands(&self) -> Option<([f64; 3], [f64; 2])> {
+        if self.pressure_histogram.len() < 100 {
+            return None;
+        }
+        let p_bands = {
+            let mut sorted = self.pressure_histogram.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = sorted.len();
+            let p33 = sorted[n * 33 / 100].clamp(0.30, 0.60);
+            let p66 = sorted[n * 66 / 100].clamp(0.55, 0.85);
+            let p90 = sorted[n * 90 / 100].clamp(0.80, 0.97);
+            // Enforce monotonicity with minimum 0.05 gap.
+            let p66 = p66.max(p33 + 0.05);
+            let p90 = p90.max(p66 + 0.05);
+            [p33, p66, p90]
+        };
+        let c_bands = {
+            let mut sorted = self.compressor_histogram.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = sorted.len();
+            let c33 = sorted[n * 33 / 100].clamp(0.10, 0.50);
+            let c66 = sorted[n * 66 / 100].clamp(0.40, 0.80);
+            let c66 = c66.max(c33 + 0.05);
+            [c33, c66]
+        };
+        Some((p_bands, c_bands))
+    }
+
     pub fn persist(&self) {
         let flattened: Vec<f64> = self
             .q_table
@@ -561,6 +621,9 @@ mod tests {
             dyna_steps: DYNA_PLANNING_STEPS,
             constraints: RlConstraints::default(),
             consecutive_lower: 0,
+            pressure_histogram: Vec::new(),
+            compressor_histogram: Vec::new(),
+            histogram_cursor: 0,
         }
     }
 
@@ -1007,5 +1070,55 @@ mod tests {
             variance(&agent_dyna.q_table) > variance(&agent_nodyna.q_table),
             "dyna agent should have more differentiated Q-values"
         );
+    }
+
+    #[test]
+    fn test_auto_tune_bands_needs_100_samples() {
+        let mut agent = make_agent();
+        for i in 0..50 {
+            agent.record_pressure_sample(0.3 + i as f64 * 0.01, 0.2);
+        }
+        assert!(agent.auto_tune_bands().is_none(), "need ≥100 samples");
+    }
+
+    #[test]
+    fn test_auto_tune_bands_produces_monotonic() {
+        let mut agent = make_agent();
+        // Feed pressure heavily in [0.5, 0.8] range.
+        for i in 0..200 {
+            let p = 0.40 + (i as f64 / 200.0) * 0.50;
+            agent.record_pressure_sample(p, 0.3 + (i as f64 / 200.0) * 0.40);
+        }
+        let (p_bands, c_bands) = agent.auto_tune_bands().unwrap();
+        assert!(p_bands[0] < p_bands[1], "p bands must be monotonic");
+        assert!(p_bands[1] < p_bands[2], "p bands must be monotonic");
+        assert!(c_bands[0] < c_bands[1], "c bands must be monotonic");
+        // Bands should be in valid ranges.
+        assert!(p_bands[0] >= 0.30 && p_bands[0] <= 0.60);
+        assert!(p_bands[2] >= 0.80 && p_bands[2] <= 0.97);
+    }
+
+    #[test]
+    fn test_from_metrics_with_bands() {
+        let bands_p = [0.40, 0.70, 0.90];
+        let bands_c = [0.25, 0.55];
+        let s1 = RlState::from_metrics_with_bands(0.35, 0.20, 0, &bands_p, &bands_c);
+        assert_eq!(s1.pressure_band, 0); // below 0.40
+        let s2 = RlState::from_metrics_with_bands(0.50, 0.30, 1, &bands_p, &bands_c);
+        assert_eq!(s2.pressure_band, 1); // between 0.40 and 0.70
+        let s3 = RlState::from_metrics_with_bands(0.95, 0.60, 2, &bands_p, &bands_c);
+        assert_eq!(s3.pressure_band, 3); // above 0.90
+        assert_eq!(s3.compressor_band, 2); // above 0.55
+    }
+
+    #[test]
+    fn test_histogram_ring_buffer_wraps() {
+        let mut agent = make_agent();
+        for i in 0..300 {
+            agent.record_pressure_sample(i as f64 * 0.003, 0.5);
+        }
+        // Should cap at 200.
+        assert_eq!(agent.pressure_histogram.len(), 200);
+        assert_eq!(agent.compressor_histogram.len(), 200);
     }
 }

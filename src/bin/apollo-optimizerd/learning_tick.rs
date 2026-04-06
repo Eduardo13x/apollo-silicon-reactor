@@ -328,6 +328,32 @@ pub fn run_learning_tick<'a>(
         }
     }
 
+    // ── RL pressure histogram sample ──────────────────────────────────────────
+    // Record every cycle for quantile-based band auto-tuning.
+    if let Some(rl) = &mut lctx.overflow_guard.rl_agent {
+        rl.record_pressure_sample(
+            snapshot.pressure.memory_pressure,
+            signal_digest.pressure_smooth, // compressor proxy: smooth pressure
+        );
+    }
+
+    // ── Auto-tune (Phase 2): Kalman R, RL bands, zone alpha ─────────────────
+    // Every 50 cycles: Kalman R auto-tune from innovation variance.
+    // Every 200 cycles: RL bands from pressure histogram quantiles.
+    // Every 100 cycles: zone alpha from oscillation/stall detection.
+    if cycle_count % 50 == 25 {
+        if let Some(new_r) = lctx.signal_intel.auto_tune_kalman_r() {
+            let _ = new_r; // applied internally; value available for diagnostics
+        }
+    }
+    if cycle_count % 200 == 100 {
+        if let Some(rl) = &lctx.overflow_guard.rl_agent {
+            if let Some((p_bands, c_bands)) = rl.auto_tune_bands() {
+                let _ = (p_bands, c_bands); // bands available for future wiring to LearnableParams
+            }
+        }
+    }
+
     // ── Cable A: OutcomeTracker → RL reward signal ───────────────────────────
     // When throttling is wasteful (low-value patterns detected),
     // penalize the RL agent so it learns to adjust thresholds.

@@ -156,6 +156,14 @@ pub struct SignalIntelligence {
     kpc_ipc_trend: f64,
     /// Kalman base R for pressure (stored so we can modulate dynamically).
     kf_pressure_base_r: f64,
+
+    // ── Auto-tuning state (Phase 2) ──────────────────────────────────
+    /// Zone oscillation detector: last N zone_feedback directions (+1/-1).
+    /// If sign alternates, zones are oscillating → halve alpha.
+    zone_feedback_history: [i8; 8],
+    zone_feedback_idx: usize,
+    /// Cycles since last zone movement (for stall detection).
+    zone_stall_cycles: u64,
 }
 
 impl Default for SignalIntelligence {
@@ -209,6 +217,9 @@ impl SignalIntelligence {
             kpc_ipc: 0.0,
             kpc_ipc_trend: 0.0,
             kf_pressure_base_r: 0.02,
+            zone_feedback_history: [0i8; 8],
+            zone_feedback_idx: 0,
+            zone_stall_cycles: 0,
         }
     }
 
@@ -520,10 +531,19 @@ impl SignalIntelligence {
             // Effective action near the mid_entry boundary → lower it (engage earlier).
             self.learned_mid_entry = (self.learned_mid_entry - zone_alpha).clamp(0.20, 0.40);
             self.learned_high_entry = (self.learned_high_entry - zone_alpha).clamp(0.35, 0.60);
+            // Track direction for oscillation detection.
+            self.zone_feedback_history[self.zone_feedback_idx % 8] = -1;
+            self.zone_feedback_idx += 1;
+            self.zone_stall_cycles = 0;
         } else if !was_effective && pressure_at_action < self.learned_high_entry {
             // Ineffective action below high_entry → raise thresholds (be more conservative).
             self.learned_mid_entry = (self.learned_mid_entry + zone_alpha).clamp(0.20, 0.40);
             self.learned_high_entry = (self.learned_high_entry + zone_alpha).clamp(0.35, 0.60);
+            self.zone_feedback_history[self.zone_feedback_idx % 8] = 1;
+            self.zone_feedback_idx += 1;
+            self.zone_stall_cycles = 0;
+        } else {
+            self.zone_stall_cycles += 1;
         }
     }
 
@@ -592,6 +612,54 @@ impl SignalIntelligence {
             0.0
         };
         self.energy_bias = (self.energy_bias + power_nudge).max(-0.15);
+    }
+
+    // ── Auto-tuning methods (Phase 2) ──────────────────────────────────
+
+    /// Auto-tune Kalman pressure R from innovation variance.
+    ///
+    /// Standard Kalman auto-tuning: R_optimal = Var(innovation) - P[0,0].
+    /// Called every ~50 cycles. Returns true if R was updated.
+    pub fn auto_tune_kalman_r(&mut self) -> Option<f64> {
+        let suggested = self.kf_pressure.auto_tune_r()?;
+        let new_r = suggested.clamp(0.001, 0.5);
+        self.kf_pressure.set_measurement_noise(new_r);
+        self.kf_pressure_base_r = new_r;
+        Some(new_r)
+    }
+
+    /// Auto-tune zone alpha based on oscillation / stall detection.
+    ///
+    /// - If zones oscillate (alternating up/down), halve alpha (damp).
+    /// - If zones haven't moved in 500 cycles, double alpha (explore).
+    /// Returns the new alpha value.
+    pub fn auto_tune_zone_alpha(&mut self, current_alpha: f64) -> f64 {
+        // Check oscillation: count sign alternations in last 8 feedbacks.
+        let filled = self.zone_feedback_idx.min(8);
+        if filled >= 4 {
+            let mut alternations = 0u32;
+            let start = if self.zone_feedback_idx > 8 { 0 } else { 0 };
+            for i in 1..filled {
+                let prev =
+                    self.zone_feedback_history[(self.zone_feedback_idx - filled + i - 1) % 8];
+                let curr = self.zone_feedback_history[(self.zone_feedback_idx - filled + i) % 8];
+                if prev != 0 && curr != 0 && prev != curr {
+                    alternations += 1;
+                }
+            }
+            // If >60% of transitions are alternations → oscillating.
+            if alternations as f64 / (filled - 1) as f64 > 0.60 {
+                return (current_alpha * 0.5).clamp(0.001, 0.05);
+            }
+        }
+
+        // Stall detection: no zone movement in 500+ cycles.
+        if self.zone_stall_cycles > 500 {
+            self.zone_stall_cycles = 0; // reset after adjustment
+            return (current_alpha * 2.0).clamp(0.001, 0.05);
+        }
+
+        current_alpha
     }
 
     /// Persist learned state to disk.

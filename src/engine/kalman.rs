@@ -46,6 +46,15 @@ pub struct Kalman1D {
 
     /// true una vez que recibimos al menos una observación.
     initialized: bool,
+
+    // ── Innovation tracking (for auto-tuning R) ───────────────────────
+    /// EMA of squared innovation y² (for R auto-tune: R_opt ≈ Var(y) - P[0,0]).
+    /// Not serialized — rebuilds from live data after restart.
+    #[serde(default)]
+    residual_var_ema: f64,
+    /// Number of innovation samples observed (for warm-up gating).
+    #[serde(default)]
+    residual_samples: u64,
 }
 
 impl Kalman1D {
@@ -65,6 +74,8 @@ impl Kalman1D {
             q: process_noise,
             r: measurement_noise,
             initialized: false,
+            residual_var_ema: 0.0,
+            residual_samples: 0,
         }
     }
 
@@ -114,6 +125,17 @@ impl Kalman1D {
         // ── Update ───────────────────────────────────────────────────────
         // Innovation: y = z - H * x_pred = measurement - x_pred
         let y = measurement - x_pred;
+
+        // Track innovation variance for R auto-tuning.
+        // EMA α=0.05 → half-life ≈14 samples (~28s at 2s/cycle).
+        let y_sq = y * y;
+        if self.residual_samples < 5 {
+            // Cold start: seed with first observations.
+            self.residual_var_ema = y_sq;
+        } else {
+            self.residual_var_ema = 0.95 * self.residual_var_ema + 0.05 * y_sq;
+        }
+        self.residual_samples += 1;
 
         // S = H * P_pred * H' + R = p00_pred + R
         let s = p00_pred + self.r;
@@ -170,6 +192,30 @@ impl Kalman1D {
     /// Mirrors set_measurement_noise for symmetric adaptive tuning.
     pub fn set_process_noise(&mut self, q: f64) {
         self.q = q.max(1e-8); // safety floor
+    }
+
+    /// Auto-tune R from innovation variance.
+    ///
+    /// In a well-tuned Kalman filter, the innovation variance S = P[0,0] + R.
+    /// If the empirical innovation variance (EMA of y²) exceeds S, the filter
+    /// underestimates measurement noise → increase R. If it's below S, we can
+    /// trust measurements more → decrease R.
+    ///
+    /// Returns the suggested R value, or None if not enough samples (< 20).
+    /// The caller is responsible for clamping to a safe range.
+    pub fn auto_tune_r(&self) -> Option<f64> {
+        if self.residual_samples < 20 {
+            return None;
+        }
+        // R_suggested = Var(innovation) - P[0,0]
+        // Var(innovation) ≈ residual_var_ema (EMA of y²)
+        let r_suggested = (self.residual_var_ema - self.p00).max(1e-6);
+        Some(r_suggested)
+    }
+
+    /// Number of innovation samples collected (for warm-up gating).
+    pub fn residual_samples(&self) -> u64 {
+        self.residual_samples
     }
 }
 
@@ -267,7 +313,10 @@ mod tests {
         kf.update(f64::NAN, 0.5);
         assert!(kf.position().is_finite(), "NaN corrupted position");
         assert!(kf.velocity().is_finite(), "NaN corrupted velocity");
-        assert!((kf.position() - 0.50).abs() < 1e-10, "position changed after NaN");
+        assert!(
+            (kf.position() - 0.50).abs() < 1e-10,
+            "position changed after NaN"
+        );
     }
 
     /// Infinity measurement must not corrupt filter state.
@@ -305,5 +354,40 @@ mod tests {
         kf.update(0.60, 0.5);
         assert!(kf.is_initialized());
         assert!((kf.position() - 0.60).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_auto_tune_r_not_ready_before_warmup() {
+        let mut kf = Kalman1D::new(0.005, 0.02);
+        for i in 0..15 {
+            kf.update(0.50 + (i as f64 * 0.001), 0.5);
+        }
+        assert!(kf.auto_tune_r().is_none(), "should need ≥20 samples");
+    }
+
+    #[test]
+    fn test_auto_tune_r_produces_reasonable_value() {
+        let mut kf = Kalman1D::new(0.005, 0.02);
+        // Feed constant signal — innovation should be small.
+        for _ in 0..50 {
+            kf.update(0.50, 0.5);
+        }
+        let r = kf.auto_tune_r().unwrap();
+        // R should be positive and reasonably small for a constant signal.
+        assert!(r > 0.0, "R must be positive");
+        assert!(r < 0.5, "R should be small for constant signal");
+    }
+
+    #[test]
+    fn test_residual_samples_increment() {
+        let mut kf = Kalman1D::new(0.01, 0.1);
+        assert_eq!(kf.residual_samples(), 0);
+        kf.update(0.50, 0.5);
+        // First update initializes — no residual computed.
+        assert_eq!(kf.residual_samples(), 0);
+        kf.update(0.52, 0.5);
+        assert_eq!(kf.residual_samples(), 1);
+        kf.update(0.51, 0.5);
+        assert_eq!(kf.residual_samples(), 2);
     }
 }
