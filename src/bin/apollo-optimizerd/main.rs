@@ -4334,6 +4334,7 @@ fn main() -> anyhow::Result<()> {
                 // If we have ≥3 records of throttling process X at similar pressure and it
                 // never helped (avg_drop ≤ 0), skip wasting the action budget on it.
                 let current_pressure = snapshot.pressure.memory_pressure;
+                let exp_band = learnable_params.experience_pressure_band;
                 let heuristic_actions: Vec<RootAction> = heuristic_actions
                     .into_iter()
                     .filter(|a| {
@@ -4341,7 +4342,7 @@ fn main() -> anyhow::Result<()> {
                             if let Some((avg_drop, confidence)) = lctx
                                 .outcome_tracker
                                 .experience
-                                .query_similar(name, current_pressure)
+                                .query_similar_with_band(name, current_pressure, exp_band)
                             {
                                 if confidence >= 0.5 && avg_drop <= 0.0 {
                                     // Experience says throttling this process at this pressure

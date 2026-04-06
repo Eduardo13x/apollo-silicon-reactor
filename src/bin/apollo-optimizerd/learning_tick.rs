@@ -254,7 +254,11 @@ pub fn run_learning_tick<'a>(
                         let avg_drop = lctx
                             .outcome_tracker
                             .experience
-                            .query_similar(name, snapshot.pressure.memory_pressure)
+                            .query_similar_with_band(
+                                name,
+                                snapshot.pressure.memory_pressure,
+                                learnable_params.experience_pressure_band,
+                            )
                             .map(|(drop, _)| drop)
                             .unwrap_or(0.05);
                         let causal_long = lctx.outcome_tracker.causal_effect(avg_drop);
