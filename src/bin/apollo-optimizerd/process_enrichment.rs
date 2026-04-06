@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use apollo_optimizer::engine::adaptive_governor::{GovernorDecision, ProcessDecision};
+use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
 use apollo_optimizer::engine::daemon_helpers::pid_start_time;
 use apollo_optimizer::engine::llm::append_jsonl;
 use apollo_optimizer::engine::daemon_helpers::rotate_timeline;
@@ -346,6 +347,21 @@ pub fn convert_and_merge_heuristic_decisions(
 
         // Skip critical processes
         if critical_pids.contains(&decision.pid) {
+            continue;
+        }
+
+        // Complete Mediation guard: apply the same interactive-app name check that
+        // decide_actions uses, so Freeze/Kill decisions from the AdaptiveGovernor
+        // never bypass it. Production data (2026-04-06): "Antigravity Helper (Renderer)"
+        // frozen 1x, "Notion"/"Notion Helper (Renderer)" frozen 7x — both contain a
+        // known interactive app name but their PIDs were absent from critical_pids
+        // because classify_protection yields ConditionalForeground for helper subprocesses
+        // (only the exact foreground PID is inserted, not the parent's helpers).
+        // [Saltzer & Kaashoek 2009] "Principles of Computer System Design" §3.3
+        // Complete Mediation — every access path must go through the same gate.
+        if matches!(decision.decision, GovernorDecision::Freeze | GovernorDecision::Kill)
+            && is_interactive_app_name(&decision.name)
+        {
             continue;
         }
 

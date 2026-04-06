@@ -13,7 +13,7 @@ use crate::engine::types::{
 };
 use crate::engine::user_context::UserContext;
 
-const INTERACTIVE_APPS: [&str; 14] = [
+const INTERACTIVE_APPS: [&str; 15] = [
     "Code",
     "Arc",
     "Google Chrome",
@@ -30,6 +30,7 @@ const INTERACTIVE_APPS: [&str; 14] = [
     "zoom.us",      // Video calls — frame timing as critical as display rendering
     "Xcode",        // IDE — active compilation + UI interactions
     "Claude",       // Claude desktop app (Electron) — user's primary workload
+    "Notion",       // Production data: Notion + Notion Helper (Renderer) frozen 7x
 ];
 
 const NOISE_APPS: [&str; 6] = [
@@ -82,8 +83,17 @@ pub struct DecisionOutput {
     pub ml_throttle_source: String,
 }
 
-fn is_interactive_base(name: &str) -> bool {
+/// Returns true if the process name contains a known interactive app pattern.
+///
+/// Exported so `process_enrichment::convert_and_merge_heuristic_decisions` can apply
+/// the same guard — [Saltzer & Kaashoek 2009] Complete Mediation: every path to a
+/// privileged action must pass through the same access control point.
+pub fn is_interactive_app_name(name: &str) -> bool {
     INTERACTIVE_APPS.iter().any(|n| name.contains(n))
+}
+
+fn is_interactive_base(name: &str) -> bool {
+    is_interactive_app_name(name)
 }
 
 fn is_background_noise_base(name: &str) -> bool {

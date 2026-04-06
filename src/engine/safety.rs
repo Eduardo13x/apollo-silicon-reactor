@@ -317,7 +317,10 @@ pub fn infrastructure_processes() -> HashSet<&'static str> {
 /// mongod, etc. via substring match. We use a dedicated `matches_dev_runtime()`
 /// function with word-boundary awareness instead of raw `.contains()`.
 pub fn dev_runtime_patterns() -> &'static [&'static str] {
-    &["node", "python", "java", "go", "nginx"]
+    // Production data (2026-04-06): clippy-driver frozen 7x — compiler toolchain
+    // processes are dev-runtime critical; freeze during compilation → broken build.
+    // [Saltzer & Kaashoek 2009] Fail-safe defaults: protect by default, not by exception.
+    &["node", "python", "java", "go", "nginx", "rustc", "clippy-driver"]
 }
 
 /// Check if a process name matches a dev runtime pattern, with word-boundary
