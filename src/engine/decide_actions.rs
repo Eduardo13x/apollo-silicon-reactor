@@ -33,13 +33,15 @@ const INTERACTIVE_APPS: [&str; 15] = [
     "Notion",       // Production data: Notion + Notion Helper (Renderer) frozen 7x
 ];
 
-const NOISE_APPS: [&str; 6] = [
+// suggestd and corespeechd removed — both live in DEFERRABLE_DAEMONS with
+// memory-pressure gate (correct semantics). Having them here caused conflicting
+// immediate-throttle (NOISE) vs gated-throttle (DEFERRABLE) in the same cycle.
+// [Saltzer & Schroeder 1975] Economy of Mechanism — one policy per resource.
+const NOISE_APPS: [&str; 4] = [
     "Dropbox",
     "Google Drive",
     "OneDrive",
-    "corespeechd",
     "logioptionsplus",
-    "suggestd",
 ];
 
 /// Apple on-device intelligence / ML background daemons.
@@ -804,6 +806,7 @@ pub fn decide_actions(
             let name = process.name().to_string();
             if DEFERRABLE_DAEMONS.iter().any(|d| name.contains(d))
                 && !critical_pids.contains(&pid.as_u32())
+                && !behavior_interactive_pids.contains(&pid.as_u32())
             {
                 actions.push(RootAction::ThrottleProcess {
                     pid: pid.as_u32(),
@@ -1198,7 +1201,9 @@ mod tests {
     fn noise_apps_detected() {
         assert!(is_background_noise_base("Dropbox"));
         assert!(is_background_noise_base("Google Drive"));
-        assert!(is_background_noise_base("corespeechd"));
+        // corespeechd and suggestd moved to DEFERRABLE_DAEMONS (pressure-gated)
+        assert!(!is_background_noise_base("corespeechd"));
+        assert!(!is_background_noise_base("suggestd"));
         assert!(!is_background_noise_base("Code"));
         assert!(!is_background_noise_base("WindowServer"));
     }
@@ -1216,7 +1221,8 @@ mod tests {
     fn classification_uses_contains_not_exact_match() {
         // "contains" semantics — substrings match.
         assert!(is_interactive_base("com.apple.Terminal"));
-        assert!(is_background_noise_base("com.apple.suggestd"));
+        // suggestd moved to DEFERRABLE_DAEMONS, verify it's no longer noise
+        assert!(!is_background_noise_base("com.apple.suggestd"));
         assert!(is_known_blocker("com.apple.WindowServer"));
     }
 

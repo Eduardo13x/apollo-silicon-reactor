@@ -359,9 +359,12 @@ pub fn convert_and_merge_heuristic_decisions(
         // (only the exact foreground PID is inserted, not the parent's helpers).
         // [Saltzer & Kaashoek 2009] "Principles of Computer System Design" §3.3
         // Complete Mediation — every access path must go through the same gate.
-        if matches!(decision.decision, GovernorDecision::Freeze | GovernorDecision::Kill)
-            && is_interactive_app_name(&decision.name)
-        {
+        // Extend to ALL action types (Freeze, Kill, AND Throttle) for interactive
+        // app names. Production data: "Brave Helper (Renderer)" with AppHelper tier
+        // can receive GovernorDecision::Throttle — throttling a renderer subprocess
+        // degrades the parent browser's frame rate just as much as freezing it.
+        // [Saltzer & Kaashoek 2009] Complete Mediation — same gate for all paths.
+        if is_interactive_app_name(&decision.name) {
             continue;
         }
 
