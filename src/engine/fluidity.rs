@@ -138,6 +138,12 @@ pub struct FluidityState {
     /// Processes correlated with fluidity degradation: (pid, name, hurt_score).
     /// hurt_score EMA: higher = more correlated with degradation.
     pub fluidity_offenders: Vec<(u32, String, f32)>,
+    /// Learned WS CPU% spike threshold. Default = WS_SPIKE_THRESHOLD (25.0).
+    /// Wired from LearnableParams::ws_spike_threshold.
+    ws_spike_threshold: f32,
+    /// Learned fluidity-degraded threshold. Default = FLUIDITY_DEGRADED_THRESHOLD (0.65).
+    /// Wired from LearnableParams::fluidity_degraded_threshold.
+    fluidity_degraded_threshold: f32,
 
     /// Previous process set (PID) for launch detection.
     prev_pids: std::collections::HashSet<u32>,
@@ -174,9 +180,17 @@ impl FluidityState {
             fluidity_predicted_3s: 1.0,
 
             fluidity_offenders: Vec::new(),
+            ws_spike_threshold: WS_SPIKE_THRESHOLD,
+            fluidity_degraded_threshold: FLUIDITY_DEGRADED_THRESHOLD,
             prev_pids: std::collections::HashSet::new(),
             initialized: false,
         }
+    }
+
+    /// Apply learned thresholds from LearnableParams (called every N cycles).
+    pub fn apply_thresholds(&mut self, ws_spike: f32, degraded: f32) {
+        self.ws_spike_threshold = ws_spike.clamp(10.0, 50.0);
+        self.fluidity_degraded_threshold = degraded.clamp(0.30, 0.90);
     }
 
     /// Update fluidity state from a new daemon cycle snapshot.
@@ -205,8 +219,8 @@ impl FluidityState {
         self.windowserver_cpu_history.push_back(ws_cpu);
 
         // Spike: either current sample or EMA exceeds threshold
-        self.windowserver_cpu_spike =
-            ws_cpu > WS_SPIKE_THRESHOLD || self.windowserver_cpu_ema > WS_SPIKE_THRESHOLD * 0.75;
+        self.windowserver_cpu_spike = ws_cpu > self.ws_spike_threshold
+            || self.windowserver_cpu_ema > self.ws_spike_threshold * 0.75;
 
         // ── 2. GPU render load ─────────────────────────────────────────────
         self.gpu_render_load = gpu_load.clamp(0.0, 1.0);
@@ -256,7 +270,11 @@ impl FluidityState {
         let ws_penalty = (self.windowserver_cpu_ema / 100.0 * 0.4).min(0.4);
 
         // Spike adds immediate penalty (window op is latency-sensitive critical path)
-        let spike_penalty = if self.windowserver_cpu_spike { 0.2 } else { 0.0 };
+        let spike_penalty = if self.windowserver_cpu_spike {
+            0.2
+        } else {
+            0.0
+        };
 
         // GPU load contribution: high GPU = rendering contention
         let gpu_penalty = self.gpu_render_load * 0.2;
@@ -264,8 +282,8 @@ impl FluidityState {
         // Launch penalty: launching = background work must yield
         let launch_penalty = if self.launch_active { 0.1 } else { 0.0 };
 
-        let raw_score = (1.0 - ws_penalty - spike_penalty - gpu_penalty - launch_penalty)
-            .clamp(0.0, 1.0);
+        let raw_score =
+            (1.0 - ws_penalty - spike_penalty - gpu_penalty - launch_penalty).clamp(0.0, 1.0);
         self.fluidity_score = raw_score;
 
         // ── 5. EMA smoothing ───────────────────────────────────────────────
@@ -273,7 +291,8 @@ impl FluidityState {
             FLUIDITY_EMA_ALPHA * raw_score + (1.0 - FLUIDITY_EMA_ALPHA) * self.fluidity_ema;
 
         // ── 6. Kalman filter + prediction [Welch & Bishop 2006] ───────────
-        self.fluidity_kalman.update(raw_score as f64, dt_secs as f64);
+        self.fluidity_kalman
+            .update(raw_score as f64, dt_secs as f64);
         let kalman_pos = self.fluidity_kalman.position() as f32;
         let kalman_vel = self.fluidity_kalman.velocity() as f32;
         self.fluidity_velocity = kalman_vel;
@@ -288,7 +307,7 @@ impl FluidityState {
         }
 
         // ── 7. Degradation state ───────────────────────────────────────────
-        self.fluidity_degraded = self.fluidity_ema < FLUIDITY_DEGRADED_THRESHOLD;
+        self.fluidity_degraded = self.fluidity_ema < self.fluidity_degraded_threshold;
 
         // ── 8. Offender tracking [Pearl 2009] Causation ───────────────────
         // When fluidity is degraded, correlate high-CPU processes as offenders.
@@ -309,7 +328,8 @@ impl FluidityState {
                         entry.2 = OFFENDER_EMA_ALPHA * (cpu / 100.0)
                             + (1.0 - OFFENDER_EMA_ALPHA) * entry.2;
                     } else if self.fluidity_offenders.len() < MAX_OFFENDERS {
-                        self.fluidity_offenders.push((*pid, name.to_string(), cpu / 100.0));
+                        self.fluidity_offenders
+                            .push((*pid, name.to_string(), cpu / 100.0));
                     }
                 }
             }
@@ -320,7 +340,8 @@ impl FluidityState {
             }
 
             // Prune offenders with negligible scores
-            self.fluidity_offenders.retain(|(_, _, score)| *score > 0.01);
+            self.fluidity_offenders
+                .retain(|(_, _, score)| *score > 0.01);
         }
     }
 
@@ -455,7 +476,11 @@ mod tests {
         let procs = make_procs(&[("WindowServer", 2.0), ("launchd", 0.1)]);
         state.update(&procs, 0.0, 2.0);
         // Low WS CPU, no GPU, no launch → score should be high
-        assert!(state.fluidity_score > 0.85, "score={}", state.fluidity_score);
+        assert!(
+            state.fluidity_score > 0.85,
+            "score={}",
+            state.fluidity_score
+        );
         assert!(!state.windowserver_cpu_spike);
     }
 
@@ -465,7 +490,10 @@ mod tests {
         // High WindowServer CPU = window operation
         let procs = make_procs(&[("WindowServer", 60.0), ("launchd", 0.1)]);
         state.update(&procs, 0.0, 2.0);
-        assert!(state.windowserver_cpu_spike, "spike should be detected at 60%");
+        assert!(
+            state.windowserver_cpu_spike,
+            "spike should be detected at 60%"
+        );
         assert!(
             state.fluidity_score < 0.75,
             "score should drop during spike, got {}",
@@ -573,7 +601,7 @@ mod tests {
         // Force degraded state by using high WS CPU across many cycles
         let procs = make_procs(&[
             ("WindowServer", 80.0),
-            ("Brave Browser", 50.0), // protected
+            ("Brave Browser", 50.0),     // protected
             ("SomeBackgroundApp", 40.0), // not protected
         ]);
         // Run multiple cycles to trigger degradation
@@ -625,9 +653,19 @@ mod tests {
         state.update(&spike, 0.0, 2.0);
         let elapsed = start.elapsed();
 
-        eprintln!("WS spike detection: {:?}, detected={}", elapsed, state.windowserver_cpu_spike);
-        assert!(state.windowserver_cpu_spike, "WS spike not detected in 1 cycle at 45% CPU");
-        assert!(elapsed.as_micros() < 100, "WS detection too slow: {:?}", elapsed);
+        eprintln!(
+            "WS spike detection: {:?}, detected={}",
+            elapsed, state.windowserver_cpu_spike
+        );
+        assert!(
+            state.windowserver_cpu_spike,
+            "WS spike not detected in 1 cycle at 45% CPU"
+        );
+        assert!(
+            elapsed.as_micros() < 100,
+            "WS detection too slow: {:?}",
+            elapsed
+        );
     }
 
     /// App launch detection must be immediate (first cycle after new PID appears).
@@ -637,12 +675,12 @@ mod tests {
         let mut state = FluidityState::new();
         // Use explicit PIDs to avoid collision with make_procs auto-assignment.
         // Initialize with known process set (PIDs 2001, 2002).
-        let initial: Vec<(u32, &str, f32)> = vec![
-            (2001, "Safari", 5.0),
-            (2002, "Finder", 2.0),
-        ];
+        let initial: Vec<(u32, &str, f32)> = vec![(2001, "Safari", 5.0), (2002, "Finder", 2.0)];
         state.update(&initial, 0.0, 2.0);
-        assert!(!state.launch_active, "no launch on init (first tick initializes prev_pids)");
+        assert!(
+            !state.launch_active,
+            "no launch on init (first tick initializes prev_pids)"
+        );
 
         // Second tick with same PIDs: no launch
         state.update(&initial, 0.0, 2.0);
@@ -658,13 +696,23 @@ mod tests {
         state.update(&with_new, 0.0, 2.0);
         let elapsed = start.elapsed();
 
-        eprintln!("Launch detection: {:?}, active={}, name={}", elapsed, state.launch_active, state.launch_name);
-        assert!(elapsed.as_micros() < 200, "Launch detection too slow: {:?}", elapsed);
+        eprintln!(
+            "Launch detection: {:?}, active={}, name={}",
+            elapsed, state.launch_active, state.launch_name
+        );
+        assert!(
+            elapsed.as_micros() < 200,
+            "Launch detection too slow: {:?}",
+            elapsed
+        );
         // Verify protection persists for LAUNCH_PROTECTION_CYCLES if detected
         if state.launch_active {
             // Bear is launchable if is_launchable_app("Bear") returns true
             assert!(state.launch_cycles_remaining > 0);
-            eprintln!("  Launch detected: name={}, cycles_remaining={}", state.launch_name, state.launch_cycles_remaining);
+            eprintln!(
+                "  Launch detected: name={}, cycles_remaining={}",
+                state.launch_name, state.launch_cycles_remaining
+            );
         } else {
             eprintln!("  'Bear' is not classified as launchable app — timing still verified");
         }
@@ -690,14 +738,26 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..8 {
             state.update(&stressed, 0.5, 2.0);
-            eprintln!("  cycle {}: fluidity_ema={:.3}", i+1, state.fluidity_ema);
+            eprintln!("  cycle {}: fluidity_ema={:.3}", i + 1, state.fluidity_ema);
         }
         let elapsed = start.elapsed();
         let low_ema = state.fluidity_ema;
-        eprintln!("Low fluidity EMA after 8 stressed cycles: {:.3} ({:?})", low_ema, elapsed);
+        eprintln!(
+            "Low fluidity EMA after 8 stressed cycles: {:.3} ({:?})",
+            low_ema, elapsed
+        );
         // Should have moved significantly from high_ema toward stressed value
-        assert!(low_ema < high_ema - 0.20, "EMA should have converged: {:.3} vs {:.3}", low_ema, high_ema);
-        assert!(elapsed.as_millis() < 5, "8 fluidity updates too slow: {:?}", elapsed);
+        assert!(
+            low_ema < high_ema - 0.20,
+            "EMA should have converged: {:.3} vs {:.3}",
+            low_ema,
+            high_ema
+        );
+        assert!(
+            elapsed.as_millis() < 5,
+            "8 fluidity updates too slow: {:?}",
+            elapsed
+        );
     }
 
     /// Update throughput: 500 fluidity updates with 20 processes < 50ms.
@@ -705,8 +765,12 @@ mod tests {
     fn bench_fluidity_throughput() {
         let mut state = FluidityState::new();
         let procs = make_procs(&[
-            ("WindowServer", 8.0), ("Safari", 5.0), ("Chrome", 3.0),
-            ("Finder", 1.0), ("Dock", 0.5), ("SystemUIServer", 0.3),
+            ("WindowServer", 8.0),
+            ("Safari", 5.0),
+            ("Chrome", 3.0),
+            ("Finder", 1.0),
+            ("Dock", 0.5),
+            ("SystemUIServer", 0.3),
         ]);
         let start = std::time::Instant::now();
         for i in 0..500 {
@@ -715,7 +779,11 @@ mod tests {
         }
         let elapsed = start.elapsed();
         eprintln!("FluidityState 500 updates (6 procs): {:?}", elapsed);
-        assert!(elapsed.as_millis() < 50, "500 fluidity updates too slow: {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 50,
+            "500 fluidity updates too slow: {:?}",
+            elapsed
+        );
     }
 
     /// PID reuse must not accumulate hurt-score across different processes.
@@ -739,8 +807,11 @@ mod tests {
         }
 
         // HogProcess should be tracked as offender.
-        let hog_count = state.fluidity_offenders.iter()
-            .filter(|(_, n, _)| n == "HogProcess").count();
+        let hog_count = state
+            .fluidity_offenders
+            .iter()
+            .filter(|(_, n, _)| n == "HogProcess")
+            .count();
         assert_eq!(hog_count, 1, "HogProcess should be tracked");
 
         // Now PID 5 is reused by a DIFFERENT process "GoodProcess".
@@ -755,19 +826,28 @@ mod tests {
         // Both entries may exist (old HogProcess decays, new GoodProcess may appear).
         // The key invariant: HogProcess entry must NOT have its score increased
         // by GoodProcess's CPU usage.
-        let hog_entry = state.fluidity_offenders.iter()
+        let hog_entry = state
+            .fluidity_offenders
+            .iter()
             .find(|(p, n, _)| *p == 5 && n == "HogProcess");
-        let good_entry = state.fluidity_offenders.iter()
+        let good_entry = state
+            .fluidity_offenders
+            .iter()
             .find(|(p, n, _)| *p == 5 && n == "GoodProcess");
 
         // HogProcess should be decaying (no new data feeding it).
         if let Some((_, _, score)) = hog_entry {
-            assert!(*score < 0.3, "HogProcess score should be decaying, got {}", score);
+            assert!(
+                *score < 0.3,
+                "HogProcess score should be decaying, got {}",
+                score
+            );
         }
         // GoodProcess should have its own entry if CPU > threshold.
         // Just verify no crash and entries are separate.
         assert!(
-            hog_entry.is_none() || good_entry.is_none()
+            hog_entry.is_none()
+                || good_entry.is_none()
                 || hog_entry.unwrap().1 != good_entry.unwrap().1,
             "PID reuse must create separate entries for different process names"
         );
@@ -785,8 +865,10 @@ mod tests {
             (200u32, "Brave Browser Helper (GPU)", 5.0f32),
         ];
         state.update(&procs2, 0.0, 2.0);
-        assert!(!state.launch_active,
-            "GPU helper should not trigger launch detection");
+        assert!(
+            !state.launch_active,
+            "GPU helper should not trigger launch detection"
+        );
     }
 
     /// Lowercase system daemons should NOT trigger launch detection.
@@ -795,12 +877,11 @@ mod tests {
         let mut state = FluidityState::new();
         let procs1 = vec![(1u32, "launchd", 0.1f32)];
         state.update(&procs1, 0.0, 2.0);
-        let procs2 = vec![
-            (1u32, "launchd", 0.1f32),
-            (300u32, "configd", 0.3f32),
-        ];
+        let procs2 = vec![(1u32, "launchd", 0.1f32), (300u32, "configd", 0.3f32)];
         state.update(&procs2, 0.0, 2.0);
-        assert!(!state.launch_active,
-            "system daemon should not trigger launch detection");
+        assert!(
+            !state.launch_active,
+            "system daemon should not trigger launch detection"
+        );
     }
 }

@@ -5731,6 +5731,14 @@ fn main() -> anyhow::Result<()> {
                         persist_generations,
                         skills_path(),
                     );
+                    // Apply ws_spike_threshold / fluidity_degraded_threshold from LearnableParams.
+                    // Keeps fluidity detection calibrated with learned values.
+                    if persist_generations % 100 == 50 {
+                        fluidity_state.apply_thresholds(
+                            learnable_params.ws_spike_threshold,
+                            learnable_params.fluidity_degraded_threshold,
+                        );
+                    }
                 } // end if !cognitive_pause
                   // ── Neurocognitive tick ──────────────────────────────────────────────
                   // Runs after learning_tick so all signals (drift, causal, arousal) are
