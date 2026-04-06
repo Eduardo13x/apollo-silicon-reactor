@@ -52,6 +52,7 @@ pub mod lock_ext;
 pub mod lotka_volterra;
 pub mod mach_qos;
 pub mod memory_analyzer;
+pub mod meta_cognition;
 pub mod nars_belief;
 pub mod neon_ema;
 pub mod process_baseline;
