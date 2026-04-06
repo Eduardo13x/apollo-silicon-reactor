@@ -91,6 +91,11 @@ pub struct ExperienceRecord {
     pub pressure_drop: f64,
     /// Whether the throttle was effective (drop ≥ 0.02).
     pub effective: bool,
+    /// Workload at time of action (WorkloadMode encoded as u8).
+    /// Used for workload-aware queries: records from the same workload
+    /// are weighted 2× since workload context strongly affects outcomes.
+    #[serde(default)]
+    pub workload: u8,
 }
 
 /// Ring buffer of experience records with similarity query.
@@ -146,6 +151,39 @@ impl ExperienceMemory {
         Some((avg_drop, confidence))
     }
 
+    /// Workload-aware query: same as `query_similar_with_band` but records
+    /// from the same workload are weighted 2× (context-dependent memory).
+    /// `current_workload` is the WorkloadMode encoded as u8.
+    pub fn query_similar_contextual(
+        &self,
+        process: &str,
+        pressure: f64,
+        band: f64,
+        current_workload: u8,
+    ) -> Option<(f64, f64)> {
+        let mut weighted_drop = 0.0_f64;
+        let mut total_weight = 0.0_f64;
+        let mut count = 0u32;
+        for r in &self.records {
+            if r.process_name == process && (r.pressure_at_action - pressure).abs() <= band {
+                let w = if r.workload == current_workload {
+                    2.0
+                } else {
+                    1.0
+                };
+                weighted_drop += r.pressure_drop * w;
+                total_weight += w;
+                count += 1;
+            }
+        }
+        if count < 3 {
+            return None;
+        }
+        let avg_drop = weighted_drop / total_weight;
+        let confidence = (count as f64 / 20.0).min(1.0);
+        Some((avg_drop, confidence))
+    }
+
     /// Number of stored records.
     pub fn len(&self) -> usize {
         self.records.len()
@@ -195,6 +233,7 @@ impl ExperienceMemory {
                 pressure_at_action: sum_pressure / count as f64,
                 pressure_drop: sum_drop / count as f64,
                 effective: eff_count * 2 >= count, // majority vote
+                workload: 0, // compressed summaries lose workload specificity
             });
         }
     }
@@ -436,15 +475,16 @@ impl OutcomeTracker {
     /// Retorna un batch con los resultados para que el llamador actualice
     /// el EnergyTracker y la LearnedPolicy.
     pub fn tick(&mut self, current_pressure: f64) -> OutcomeBatch {
-        self.tick_with_params(current_pressure, 30, 0.01)
+        self.tick_with_params(current_pressure, 30, 0.01, 0)
     }
 
-    /// Tick with adaptive wait time and effectiveness threshold (from LearnableParams).
+    /// Tick with adaptive wait time, effectiveness threshold, and workload context.
     pub fn tick_with_params(
         &mut self,
         current_pressure: f64,
         wait_secs: u64,
         effective_threshold: f64,
+        workload: u8,
     ) -> OutcomeBatch {
         const BASELINE_ALPHA: f64 = 0.01; // half-life ≈ 69 observaciones
         let check_after = Duration::from_secs(wait_secs);
@@ -504,6 +544,7 @@ impl OutcomeTracker {
                 pressure_at_action: outcome.pressure_before,
                 pressure_drop,
                 effective,
+                workload,
             });
 
             // Collect resolved outcome for LearningPipeline (pre/post pressure).
@@ -1216,6 +1257,7 @@ mod tests {
                 pressure_at_action: 0.60,
                 pressure_drop: 0.05,
                 effective: true,
+                workload: 0,
             });
         }
         assert_eq!(mem.len(), 3);
@@ -1240,6 +1282,7 @@ mod tests {
                 pressure_at_action: 0.70,
                 pressure_drop: 0.05,
                 effective: true,
+                workload: 0,
             });
         }
         assert!(mem.query_similar("Dropbox", 0.70).is_none());
@@ -1250,6 +1293,7 @@ mod tests {
             pressure_at_action: 0.72,
             pressure_drop: 0.03,
             effective: true,
+            workload: 0,
         });
         let (avg_drop, confidence) = mem.query_similar("Dropbox", 0.70).unwrap();
         assert!((avg_drop - (0.05 + 0.05 + 0.03) / 3.0).abs() < 1e-6);
@@ -1266,6 +1310,7 @@ mod tests {
                 pressure_at_action: 0.70,
                 pressure_drop: 0.08,
                 effective: true,
+                workload: 0,
             });
         }
         // 3 records at pressure 0.30 (too far from 0.70)
@@ -1275,6 +1320,7 @@ mod tests {
                 pressure_at_action: 0.30,
                 pressure_drop: -0.01,
                 effective: false,
+                workload: 0,
             });
         }
         // Query at 0.70 should only match first 3.
@@ -1283,6 +1329,59 @@ mod tests {
             (avg_drop - 0.08).abs() < 1e-6,
             "should only match p≈0.70 records"
         );
+    }
+
+    // ── Workload-aware experience tests (Phase 4) ─────────────────────────────
+
+    #[test]
+    fn experience_workload_weighting_boosts_same_workload() {
+        let mut mem = ExperienceMemory::new(100);
+        // 3 records at workload=1 (build), drop=0.10
+        for _ in 0..3 {
+            mem.push(ExperienceRecord {
+                process_name: "rustc".into(),
+                pressure_at_action: 0.70,
+                pressure_drop: 0.10,
+                effective: true,
+                workload: 1,
+            });
+        }
+        // 3 records at workload=0 (idle), drop=0.02
+        for _ in 0..3 {
+            mem.push(ExperienceRecord {
+                process_name: "rustc".into(),
+                pressure_at_action: 0.70,
+                pressure_drop: 0.02,
+                effective: true,
+                workload: 0,
+            });
+        }
+        // Standard query: all 6 records equally weighted
+        let (avg_all, _) = mem.query_similar("rustc", 0.70).unwrap();
+        // Contextual query with workload=1: build records weighted 2×
+        let (avg_build, _) = mem
+            .query_similar_contextual("rustc", 0.70, 0.10, 1)
+            .unwrap();
+        // Build-weighted average should be closer to 0.10 than the uniform average
+        assert!(
+            (avg_build - 0.10).abs() < (avg_all - 0.10).abs(),
+            "workload-weighted avg ({avg_build}) should be closer to 0.10 than uniform ({avg_all})"
+        );
+    }
+
+    #[test]
+    fn experience_workload_contextual_needs_3_records() {
+        let mut mem = ExperienceMemory::new(100);
+        for _ in 0..2 {
+            mem.push(ExperienceRecord {
+                process_name: "Safari".into(),
+                pressure_at_action: 0.65,
+                pressure_drop: 0.05,
+                effective: true,
+                workload: 3,
+            });
+        }
+        assert!(mem.query_similar_contextual("Safari", 0.65, 0.10, 3).is_none());
     }
 
     // ── Counterfactual baseline tests ───────────────────────────────────────────

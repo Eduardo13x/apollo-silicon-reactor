@@ -61,6 +61,35 @@ const LTI_DECAY_FACTOR: f32 = 0.985;
 /// Arousal threshold above which LTI protection is granted.
 const LTI_AROUSAL_THRESHOLD: f32 = 0.60;
 
+// ── ContextBucket ────────────────────────────────────────────────────────────
+
+/// Pressure regime for contextual belief tracking.
+/// Beliefs learned under high pressure may not apply at low pressure and vice versa.
+/// [Godden & Baddeley 1975] context-dependent memory: recall is better when
+/// retrieval context matches encoding context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ContextBucket {
+    /// Low pressure: < 0.40 — system is comfortable
+    Low,
+    /// Mid pressure: 0.40–0.70 — moderate load
+    Mid,
+    /// High pressure: >= 0.70 — stressed
+    High,
+}
+
+impl ContextBucket {
+    /// Classify a pressure value into a context bucket.
+    pub fn from_pressure(pressure: f64) -> Self {
+        if pressure < 0.40 {
+            ContextBucket::Low
+        } else if pressure < 0.70 {
+            ContextBucket::Mid
+        } else {
+            ContextBucket::High
+        }
+    }
+}
+
 // ── TruthValue ───────────────────────────────────────────────────────────────
 
 /// NARS TruthValue: (frequency, confidence).
@@ -80,7 +109,10 @@ pub struct TruthValue {
 impl Default for TruthValue {
     /// Ignorance prior: no evidence either way.
     fn default() -> Self {
-        Self { frequency: 0.5, confidence: 0.0 }
+        Self {
+            frequency: 0.5,
+            confidence: 0.0,
+        }
     }
 }
 
@@ -152,7 +184,10 @@ pub struct Salience {
 impl Salience {
     /// Neutral observation: no special emotional weight.
     pub fn neutral() -> Self {
-        Self { arousal: 0.0, valence: 0.0 }
+        Self {
+            arousal: 0.0,
+            valence: 0.0,
+        }
     }
 
     /// Compute salience from system metrics.
@@ -166,17 +201,10 @@ impl Salience {
     ///   +0.5 if pressure_drop >= 0.01 (small but effective)
     ///    0.0 if pressure_drop == 0    (no effect)
     ///   -0.5 if pressure_drop <  0   (pressure increased)
-    pub fn compute(
-        pressure_before: f64,
-        pressure_drop: f64,
-        p_oom: f64,
-        swap_gb: f64,
-    ) -> Self {
+    pub fn compute(pressure_before: f64, pressure_drop: f64, p_oom: f64, swap_gb: f64) -> Self {
         let swap_factor = (swap_gb / 8.0).min(1.0) as f32;
-        let arousal = (0.4 * pressure_before as f32
-            + 0.4 * p_oom as f32
-            + 0.2 * swap_factor)
-            .clamp(0.0, 1.0);
+        let arousal =
+            (0.4 * pressure_before as f32 + 0.4 * p_oom as f32 + 0.2 * swap_factor).clamp(0.0, 1.0);
 
         let valence = if pressure_drop >= 0.10 {
             1.0_f32
@@ -289,6 +317,12 @@ impl BeliefEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriftDetector {
     beliefs: HashMap<String, BeliefEntry>,
+    /// Contextual beliefs: keyed by (action_name, pressure_bucket).
+    /// Captures that "Dropbox throttle is effective at high pressure but not at low".
+    /// Falls back to global belief if no contextual data exists.
+    /// [Godden & Baddeley 1975] context-dependent memory.
+    #[serde(default)]
+    contextual_beliefs: HashMap<String, BeliefEntry>,
     /// EMA of per-belief drift deltas. High = model is drifting.
     pub drift_score: f64,
     /// Number of beliefs currently in a drifted state.
@@ -361,6 +395,70 @@ impl DriftDetector {
         self.drifted_count = self.beliefs.values().filter(|e| e.is_drifted()).count();
 
         delta
+    }
+
+    /// Observe with pressure context: updates BOTH global and contextual beliefs.
+    /// The contextual belief captures behavior specific to the pressure regime,
+    /// while the global belief maintains the overall average.
+    pub fn observe_contextual(
+        &mut self,
+        key: &str,
+        success: bool,
+        salience: Salience,
+        pressure: f64,
+    ) -> f32 {
+        // Update global belief as usual
+        let delta = self.observe_salient(key, success, salience);
+
+        // Update contextual belief (keyed by "action@bucket")
+        let bucket = ContextBucket::from_pressure(pressure);
+        let ctx_key = format!("{}@{:?}", key, bucket);
+        if let Some(entry) = self.contextual_beliefs.get_mut(&ctx_key) {
+            entry.observe_salient(success, salience);
+        } else {
+            let initial_freq = if success { 1.0 } else { 0.0 };
+            let mut entry = BeliefEntry::new(initial_freq);
+            if salience.grants_lti() {
+                entry.lti = 0.05;
+            }
+            self.contextual_beliefs.insert(ctx_key, entry);
+        }
+
+        // Cap contextual beliefs at 200 to prevent unbounded growth
+        if self.contextual_beliefs.len() > 200 {
+            // Remove lowest-confidence entries
+            let mut entries: Vec<(String, f32)> = self
+                .contextual_beliefs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.tv.confidence))
+                .collect();
+            entries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (key, _) in entries.iter().take(20) {
+                self.contextual_beliefs.remove(key);
+            }
+        }
+
+        delta
+    }
+
+    /// Query contextual belief for an action at a given pressure.
+    /// Returns contextual belief if available, otherwise falls back to global.
+    pub fn contextual_belief(&self, key: &str, pressure: f64) -> Option<TruthValue> {
+        let bucket = ContextBucket::from_pressure(pressure);
+        let ctx_key = format!("{}@{:?}", key, bucket);
+        // Try contextual first
+        if let Some(entry) = self.contextual_beliefs.get(&ctx_key) {
+            if entry.tv.confidence >= 0.10 {
+                return Some(entry.tv);
+            }
+        }
+        // Fall back to global
+        self.belief(key)
+    }
+
+    /// Number of contextual beliefs tracked.
+    pub fn contextual_belief_count(&self) -> usize {
+        self.contextual_beliefs.len()
     }
 
     /// Current arousal-weighted drift score [0,1].
@@ -480,9 +578,8 @@ impl DriftDetector {
         self.changepoint_posterior = 1.0 - 1.0 / (1.0 + (rl / 5.0).powi(2));
 
         // Composite early warning
-        self.early_warning_score = (0.6 * self.gradient_ema.abs()
-            + 0.4 * self.changepoint_posterior)
-            .clamp(0.0, 1.0);
+        self.early_warning_score =
+            (0.6 * self.gradient_ema.abs() + 0.4 * self.changepoint_posterior).clamp(0.0, 1.0);
     }
 
     /// True if early warning detects drift is starting (before threshold breach).
@@ -544,7 +641,11 @@ pub struct ArousalState {
 
 impl Default for ArousalState {
     fn default() -> Self {
-        Self { level: 0.0, alpha: 0.15, samples: 0 }
+        Self {
+            level: 0.0,
+            alpha: 0.15,
+            samples: 0,
+        }
     }
 }
 
@@ -611,10 +712,16 @@ mod tests {
         let r1 = tv1.revise(tv2);
         let r2 = tv2.revise(tv1);
         // Symmetric
-        assert!((r1.frequency - r2.frequency).abs() < 1e-5, "revision should be symmetric");
+        assert!(
+            (r1.frequency - r2.frequency).abs() < 1e-5,
+            "revision should be symmetric"
+        );
         assert!((r1.confidence - r2.confidence).abs() < 1e-5);
         // Midpoint
-        assert!((r1.frequency - 0.5).abs() < 0.01, "equal evidence → midpoint");
+        assert!(
+            (r1.frequency - 0.5).abs() < 0.01,
+            "equal evidence → midpoint"
+        );
     }
 
     #[test]
@@ -623,8 +730,15 @@ mod tests {
         let strong = TruthValue::new(0.9, 0.9);
         let weak = TruthValue::new(0.1, 0.1);
         let result = strong.revise(weak);
-        assert!(result.frequency > 0.7, "strong belief should dominate: got {}", result.frequency);
-        assert!(result.confidence > strong.confidence, "confidence should grow after revision");
+        assert!(
+            result.frequency > 0.7,
+            "strong belief should dominate: got {}",
+            result.frequency
+        );
+        assert!(
+            result.confidence > strong.confidence,
+            "confidence should grow after revision"
+        );
     }
 
     #[test]
@@ -633,7 +747,10 @@ mod tests {
         for _ in 0..10 {
             let prev_conf = tv.confidence;
             tv = tv.revise(TruthValue::new(0.5, 0.1));
-            assert!(tv.confidence > prev_conf, "confidence must grow with each observation");
+            assert!(
+                tv.confidence > prev_conf,
+                "confidence must grow with each observation"
+            );
         }
     }
 
@@ -695,7 +812,10 @@ mod tests {
         }
         let drift_before = dd.drift_score;
         dd.acknowledge_recalibration();
-        assert!(dd.drift_score < drift_before * 0.5, "acknowledge should reduce drift score");
+        assert!(
+            dd.drift_score < drift_before * 0.5,
+            "acknowledge should reduce drift score"
+        );
         assert_eq!(dd.drifted_count, 0);
     }
 
@@ -717,7 +837,10 @@ mod tests {
         let tv_a = dd.belief("proc_A").unwrap();
         let tv_b = dd.belief("proc_B").unwrap();
         assert!(tv_a.frequency > 0.7, "proc_A should have high frequency");
-        assert!(tv_b.frequency < 0.5, "proc_B should have lower frequency after failures");
+        assert!(
+            tv_b.frequency < 0.5,
+            "proc_B should have lower frequency after failures"
+        );
     }
 
     #[test]
@@ -753,10 +876,15 @@ mod tests {
         dd.decay_confidence(0.95);
         let tv_after = dd.belief("proc_B").unwrap();
         // Confidence decays
-        assert!(tv_after.confidence < tv_before.confidence, "confidence must decay");
+        assert!(
+            tv_after.confidence < tv_before.confidence,
+            "confidence must decay"
+        );
         // Frequency is preserved (decay only affects evidence weight, not outcome)
-        assert!((tv_after.frequency - tv_before.frequency).abs() < 1e-4,
-            "frequency must not change after decay");
+        assert!(
+            (tv_after.frequency - tv_before.frequency).abs() < 1e-4,
+            "frequency must not change after decay"
+        );
     }
 
     #[test]
@@ -764,8 +892,16 @@ mod tests {
         let tv1 = TruthValue::new(0.8, 0.6);
         let tv2 = TruthValue::new(0.8, 0.6);
         let result = tv1.revise(tv2);
-        assert!((result.frequency - 0.8).abs() < 0.001, "same freq → no change: {}", result.frequency);
-        assert!((result.confidence - 0.75).abs() < 0.001, "c_new=0.75: {}", result.confidence);
+        assert!(
+            (result.frequency - 0.8).abs() < 0.001,
+            "same freq → no change: {}",
+            result.frequency
+        );
+        assert!(
+            (result.confidence - 0.75).abs() < 0.001,
+            "c_new=0.75: {}",
+            result.confidence
+        );
     }
 
     // ── Salience tests ────────────────────────────────────────────────────────
@@ -783,10 +919,17 @@ mod tests {
     fn salience_max_crisis_grants_lti_and_max_evidence() {
         // Maximum crisis: full pressure, full OOM risk, 8+ GB swap
         let s = Salience::compute(1.0, 0.15, 1.0, 8.0);
-        assert!(s.arousal > 0.9, "full crisis → near-max arousal: {}", s.arousal);
+        assert!(
+            s.arousal > 0.9,
+            "full crisis → near-max arousal: {}",
+            s.arousal
+        );
         assert!(s.grants_lti(), "high arousal → LTI protection");
-        assert_eq!(s.evidence_count(), MAX_SALIENT_OBS,
-            "max arousal → MAX_SALIENT_OBS evidence equivalent");
+        assert_eq!(
+            s.evidence_count(),
+            MAX_SALIENT_OBS,
+            "max arousal → MAX_SALIENT_OBS evidence equivalent"
+        );
         assert_eq!(s.valence, 1.0, "large drop → positive valence");
     }
 
@@ -796,7 +939,11 @@ mod tests {
         let s = Salience::compute(0.20, 0.02, 0.05, 0.1);
         assert!(s.arousal < 0.3, "low pressure → low arousal: {}", s.arousal);
         assert!(!s.grants_lti(), "low arousal → no LTI");
-        assert_eq!(s.evidence_count(), 1, "low arousal → single observation weight");
+        assert_eq!(
+            s.evidence_count(),
+            1,
+            "low arousal → single observation weight"
+        );
         assert_eq!(s.valence, 0.5, "small drop → moderate positive valence");
     }
 
@@ -833,7 +980,8 @@ mod tests {
         assert!(
             crisis_drop > normal_drop,
             "high-arousal failure should update belief faster: normal_drop={:.3} crisis_drop={:.3}",
-            normal_drop, crisis_drop
+            normal_drop,
+            crisis_drop
         );
     }
 
@@ -865,7 +1013,8 @@ mod tests {
         assert!(
             crisis_conf > normal_conf,
             "LTI-protected belief should decay slower: crisis={:.3} normal={:.3}",
-            crisis_conf, normal_conf
+            crisis_conf,
+            normal_conf
         );
     }
 
@@ -888,7 +1037,8 @@ mod tests {
         assert!(
             dd_crisis.drift_score >= dd_neutral.drift_score,
             "arousal should amplify drift score EMA: crisis={:.4} neutral={:.4}",
-            dd_crisis.drift_score, dd_neutral.drift_score
+            dd_crisis.drift_score,
+            dd_neutral.drift_score
         );
     }
 
@@ -910,7 +1060,11 @@ mod tests {
             a.update(crisis);
         }
         // After 30 updates with high-arousal input, EMA should converge near crisis.arousal
-        assert!(a.level > 0.60, "EMA should approach crisis arousal: got {:.3}", a.level);
+        assert!(
+            a.level > 0.60,
+            "EMA should approach crisis arousal: got {:.3}",
+            a.level
+        );
         assert!(matches!(a.zone(), "Stressed" | "Crisis"));
     }
 
@@ -919,12 +1073,20 @@ mod tests {
         let mut a = ArousalState::default();
         let crisis = Salience::compute(0.9, -0.05, 0.9, 8.0);
         // Build up arousal
-        for _ in 0..30 { a.update(crisis); }
+        for _ in 0..30 {
+            a.update(crisis);
+        }
         assert!(a.level > 0.50);
         // Feed zero-arousal inputs — EMA decays
         let calm = Salience::compute(0.1, 0.01, 0.0, 0.0);
-        for _ in 0..60 { a.update(calm); }
-        assert!(a.level < 0.20, "EMA should decay toward calm: got {:.3}", a.level);
+        for _ in 0..60 {
+            a.update(calm);
+        }
+        assert!(
+            a.level < 0.20,
+            "EMA should decay toward calm: got {:.3}",
+            a.level
+        );
     }
 
     #[test]
@@ -934,16 +1096,28 @@ mod tests {
 
         // Low arousal → threshold raised (conservative)
         let low = Salience::compute(0.0, 0.0, 0.0, 0.0);
-        for _ in 0..50 { a.update(low); }
+        for _ in 0..50 {
+            a.update(low);
+        }
         let t_low = a.adjusted_drift_threshold(base);
-        assert!(t_low > base, "low arousal should raise threshold: {:.4}", t_low);
+        assert!(
+            t_low > base,
+            "low arousal should raise threshold: {:.4}",
+            t_low
+        );
 
         // High arousal → threshold lowered (aggressive)
         let mut b = ArousalState::default();
         let crisis = Salience::compute(0.9, -0.05, 0.9, 8.0);
-        for _ in 0..50 { b.update(crisis); }
+        for _ in 0..50 {
+            b.update(crisis);
+        }
         let t_high = b.adjusted_drift_threshold(base);
-        assert!(t_high < base, "high arousal should lower threshold: {:.4}", t_high);
+        assert!(
+            t_high < base,
+            "high arousal should lower threshold: {:.4}",
+            t_high
+        );
 
         // High arousal is more aggressive than low arousal
         assert!(t_high < t_low);
@@ -960,7 +1134,11 @@ mod tests {
             (0.85, "Crisis"),
         ];
         for (level, expected) in cases {
-            let a = ArousalState { level, alpha: 0.15, samples: 1 };
+            let a = ArousalState {
+                level,
+                alpha: 0.15,
+                samples: 1,
+            };
             assert_eq!(a.zone(), expected, "level={level} → expected {expected}");
         }
     }
@@ -997,7 +1175,11 @@ mod tests {
             d.observe("stable_process", true);
             d.update_early_warning();
         }
-        assert!(d.early_warning() < 0.05, "Stable → no warning: {}", d.early_warning());
+        assert!(
+            d.early_warning() < 0.05,
+            "Stable → no warning: {}",
+            d.early_warning()
+        );
     }
 
     #[test]
@@ -1068,8 +1250,14 @@ mod tests {
     #[test]
     fn early_warning_at_custom_threshold() {
         let d = DriftDetector::new();
-        assert!(!d.early_warning_at(0.01), "Zero early warning < any threshold");
-        assert!(!d.early_warning_at(0.0), "Zero early warning == 0.0 threshold? No, > not >=");
+        assert!(
+            !d.early_warning_at(0.01),
+            "Zero early warning < any threshold"
+        );
+        assert!(
+            !d.early_warning_at(0.0),
+            "Zero early warning == 0.0 threshold? No, > not >="
+        );
     }
 
     #[test]
@@ -1105,6 +1293,68 @@ mod tests {
         assert!(
             (d.gradient_acceleration - accel_after_steady).abs() >= 0.0,
             "Acceleration should change with drift intensity"
+        );
+    }
+
+    // ── ContextBucket tests (Phase 4) ───────────────────────────────────────
+
+    #[test]
+    fn test_context_bucket_classification() {
+        assert_eq!(ContextBucket::from_pressure(0.10), ContextBucket::Low);
+        assert_eq!(ContextBucket::from_pressure(0.39), ContextBucket::Low);
+        assert_eq!(ContextBucket::from_pressure(0.40), ContextBucket::Mid);
+        assert_eq!(ContextBucket::from_pressure(0.69), ContextBucket::Mid);
+        assert_eq!(ContextBucket::from_pressure(0.70), ContextBucket::High);
+        assert_eq!(ContextBucket::from_pressure(0.95), ContextBucket::High);
+    }
+
+    #[test]
+    fn test_contextual_beliefs_differ_by_bucket() {
+        let mut dd = DriftDetector::new();
+        // At low pressure, throttle is ineffective
+        for _ in 0..10 {
+            dd.observe_contextual("throttle:Dropbox", false, Salience::neutral(), 0.30);
+        }
+        // At high pressure, throttle is effective
+        for _ in 0..10 {
+            dd.observe_contextual("throttle:Dropbox", true, Salience::neutral(), 0.80);
+        }
+        // Contextual query at low pressure → low frequency
+        let low_tv = dd.contextual_belief("throttle:Dropbox", 0.30).unwrap();
+        // Contextual query at high pressure → high frequency
+        let high_tv = dd.contextual_belief("throttle:Dropbox", 0.80).unwrap();
+        assert!(
+            high_tv.frequency > low_tv.frequency,
+            "high-pressure belief should have higher frequency: {} vs {}",
+            high_tv.frequency,
+            low_tv.frequency
+        );
+    }
+
+    #[test]
+    fn test_contextual_belief_falls_back_to_global() {
+        let mut dd = DriftDetector::new();
+        // Only observe at high pressure
+        for _ in 0..5 {
+            dd.observe_contextual("throttle:Safari", true, Salience::neutral(), 0.80);
+        }
+        // Query at mid pressure (no contextual data) → falls back to global
+        let tv = dd.contextual_belief("throttle:Safari", 0.50);
+        assert!(tv.is_some(), "should fall back to global belief");
+    }
+
+    #[test]
+    fn test_contextual_beliefs_cap_at_200() {
+        let mut dd = DriftDetector::new();
+        // Create 210 unique contextual entries
+        for i in 0..210 {
+            let key = format!("proc_{}", i);
+            dd.observe_contextual(&key, true, Salience::neutral(), 0.80);
+        }
+        assert!(
+            dd.contextual_belief_count() <= 200,
+            "contextual beliefs should be capped at 200, got {}",
+            dd.contextual_belief_count()
         );
     }
 }

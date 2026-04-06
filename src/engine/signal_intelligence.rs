@@ -15,6 +15,7 @@
 //! La salida es `SignalDigest`: un resumen compacto que el PredictiveAgent
 //! puede consumir como features adicionales o como override de su decisión.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,13 @@ pub struct SignalIntelligence {
     /// Cycles since last zone movement (for stall detection).
     zone_stall_cycles: u64,
 
+    // ── Workload-specific zone offsets (Phase 4) ──────────────────────
+    /// Per-workload adjustments to zone thresholds.
+    /// Key: workload mode as u8, Value: (mid_offset, high_offset).
+    /// Capped at 8 entries. Learned from effectiveness feedback per workload.
+    /// E.g., during "build" workload, zones may need to be more conservative.
+    workload_zone_offsets: HashMap<u8, (f64, f64)>,
+
     // ── Hazard online retrain buffer (Phase 3) ──────────────────────
     /// Ring buffer of OOM/overflow event features for mini-batch gradient retrain.
     /// Each entry: (features [f64; 4], hours_since_last).
@@ -227,6 +235,7 @@ impl SignalIntelligence {
             zone_feedback_history: [0i8; 8],
             zone_feedback_idx: 0,
             zone_stall_cycles: 0,
+            workload_zone_offsets: HashMap::new(),
             oom_event_buffer: Vec::new(),
         }
     }
@@ -770,6 +779,71 @@ impl SignalIntelligence {
     pub fn reset_zones(&mut self) {
         self.learned_mid_entry = 0.30;
         self.learned_high_entry = 0.50;
+    }
+
+    /// Zone feedback with workload context: learns per-workload zone offsets.
+    /// If a workload consistently needs different zone thresholds, the offset
+    /// accumulates so zones auto-adapt per workload type.
+    pub fn zone_feedback_workload(
+        &mut self,
+        pressure: f64,
+        was_effective: bool,
+        workload: u8,
+    ) {
+        // Regular zone feedback (global)
+        self.zone_feedback(pressure, was_effective);
+
+        // Per-workload offset learning (α = 0.002, very slow)
+        let alpha = 0.002;
+        let entry = self.workload_zone_offsets.entry(workload).or_insert((0.0, 0.0));
+        if was_effective {
+            // Effective → lower zones for this workload (engage earlier)
+            entry.0 -= alpha;
+            entry.1 -= alpha;
+        } else {
+            // Ineffective → raise zones for this workload (be more conservative)
+            entry.0 += alpha;
+            entry.1 += alpha;
+        }
+        // Clamp offsets to ±0.05
+        entry.0 = entry.0.clamp(-0.05, 0.05);
+        entry.1 = entry.1.clamp(-0.05, 0.05);
+
+        // Cap at 8 workload entries
+        if self.workload_zone_offsets.len() > 8 {
+            // Remove the entry with smallest absolute offset sum
+            if let Some(key) = self
+                .workload_zone_offsets
+                .iter()
+                .min_by(|a, b| {
+                    let sa = a.1 .0.abs() + a.1 .1.abs();
+                    let sb = b.1 .0.abs() + b.1 .1.abs();
+                    sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(&k, _)| k)
+            {
+                self.workload_zone_offsets.remove(&key);
+            }
+        }
+    }
+
+    /// Get effective zone thresholds adjusted for the current workload.
+    /// Returns (mid_entry, high_entry) with workload-specific offsets applied.
+    pub fn effective_zones(&self, workload: u8) -> (f64, f64) {
+        let (mid_off, high_off) = self
+            .workload_zone_offsets
+            .get(&workload)
+            .copied()
+            .unwrap_or((0.0, 0.0));
+        (
+            (self.learned_mid_entry + mid_off).clamp(0.15, 0.45),
+            (self.learned_high_entry + high_off).clamp(0.35, 0.65),
+        )
+    }
+
+    /// Number of workload zone offsets tracked (diagnostic).
+    pub fn workload_zone_count(&self) -> usize {
+        self.workload_zone_offsets.len()
     }
 }
 
@@ -1762,6 +1836,83 @@ mod tests {
         assert!(
             beta_after_batch[0] >= beta_after_online[0] || beta_after_batch[0] >= beta_before[0],
             "batch retrain should maintain or increase beta[0] for high-pressure events"
+        );
+    }
+
+    // ── Workload zone offsets (Phase 4) ─────────────────────────────────
+
+    #[test]
+    fn test_workload_zone_feedback_creates_offset() {
+        let mut si = SignalIntelligence::new();
+        let (mid_before, high_before) = si.effective_zones(1);
+        // Effective feedback for workload=1 → offsets shift down
+        for _ in 0..20 {
+            si.zone_feedback_workload(0.50, true, 1);
+        }
+        let (mid_after, high_after) = si.effective_zones(1);
+        assert!(
+            mid_after < mid_before,
+            "effective feedback should lower mid zone: {mid_after} vs {mid_before}"
+        );
+        assert!(
+            high_after < high_before,
+            "effective feedback should lower high zone: {high_after} vs {high_before}"
+        );
+    }
+
+    #[test]
+    fn test_workload_zones_differ_by_workload() {
+        let mut si = SignalIntelligence::new();
+        // Build workload: effective → zones go down
+        for _ in 0..20 {
+            si.zone_feedback_workload(0.50, true, 1);
+        }
+        // Browser workload: ineffective → zones go up
+        for _ in 0..20 {
+            si.zone_feedback_workload(0.50, false, 3);
+        }
+        let (mid_build, _) = si.effective_zones(1);
+        let (mid_browser, _) = si.effective_zones(3);
+        assert!(
+            mid_build < mid_browser,
+            "build zones should be lower than browser zones: {} vs {}",
+            mid_build,
+            mid_browser
+        );
+    }
+
+    #[test]
+    fn test_workload_zone_offsets_clamped() {
+        let mut si = SignalIntelligence::new();
+        // Many effective feedbacks → offset should clamp at -0.05
+        for _ in 0..1000 {
+            si.zone_feedback_workload(0.50, true, 1);
+        }
+        let (mid, high) = si.effective_zones(1);
+        // With base 0.30 and max offset -0.05, mid should be >= 0.25
+        assert!(mid >= 0.15, "mid zone should respect clamp: {mid}");
+        assert!(high >= 0.35, "high zone should respect clamp: {high}");
+    }
+
+    #[test]
+    fn test_effective_zones_default_no_workload() {
+        let si = SignalIntelligence::new();
+        // Unknown workload → no offset
+        let (mid, high) = si.effective_zones(99);
+        assert!((mid - 0.30).abs() < 0.01);
+        assert!((high - 0.50).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_workload_zone_offsets_cap_at_8() {
+        let mut si = SignalIntelligence::new();
+        for wl in 0..12_u8 {
+            si.zone_feedback_workload(0.50, true, wl);
+        }
+        assert!(
+            si.workload_zone_count() <= 8,
+            "should cap at 8 entries, got {}",
+            si.workload_zone_count()
         );
     }
 }

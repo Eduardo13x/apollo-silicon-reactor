@@ -278,6 +278,7 @@ mod tests {
                     pressure_at_action: 0.70,
                     pressure_drop: if i % 2 == 0 { 0.04 } else { 0.0 },
                     effective: i % 2 == 0,
+                    workload: 0,
                 });
             }
         }
@@ -297,7 +298,10 @@ mod tests {
         let pairs = vec![("coreaudiod", "corespeechd", HIGH_COOCCUR_BYPASS + 10)];
         let skills = induce(&mem, &pairs, &HashSet::new(), &[], "any");
         let group = skills.iter().find(|s| s.name.starts_with("group:"));
-        assert!(group.is_some(), "high co-occurrence should bypass individual evidence check");
+        assert!(
+            group.is_some(),
+            "high co-occurrence should bypass individual evidence check"
+        );
     }
 
     #[test]
@@ -305,7 +309,10 @@ mod tests {
         let mem = ExperienceMemory::new(300);
         let pairs = vec![("mds_stores", "photoanalysisd", HIGH_COOCCUR_BYPASS + 10)];
         let skills = induce(&mem, &pairs, &HashSet::new(), &["mds_stores"], "any");
-        assert!(skills.is_empty(), "protected process must not appear in group skill");
+        assert!(
+            skills.is_empty(),
+            "protected process must not appear in group skill"
+        );
     }
 
     #[test]
@@ -331,6 +338,7 @@ mod tests {
                     pressure_at_action: *pressure,
                     pressure_drop: *drop,
                     effective: true,
+                    workload: 0,
                 });
             }
         }
@@ -356,12 +364,16 @@ mod tests {
                     pressure_at_action: 0.65,
                     pressure_drop: 0.02, // below BATCH_MIN_DROP=0.05
                     effective: true,
+                    workload: 0,
                 });
             }
         }
         let skills = induce(&mem, &[], &HashSet::new(), &[], "any");
         let batch = skills.iter().find(|s| s.name.starts_with("batch:"));
-        assert!(batch.is_none(), "small drops must not trigger batch induction");
+        assert!(
+            batch.is_none(),
+            "small drops must not trigger batch induction"
+        );
     }
 
     #[test]
@@ -377,6 +389,7 @@ mod tests {
                     pressure_at_action: *pressure,
                     pressure_drop: *drop,
                     effective: true,
+                    workload: 0,
                 });
             }
         }
@@ -384,7 +397,9 @@ mod tests {
         existing.insert("group:corespeechd+suggestd".to_string());
         let skills = induce(&mem, &[], &existing, &[], "any");
         assert!(
-            skills.iter().all(|s| s.name != "batch:corespeechd+suggestd"),
+            skills
+                .iter()
+                .all(|s| s.name != "batch:corespeechd+suggestd"),
             "batch: must not duplicate an existing group: skill"
         );
     }
@@ -395,8 +410,14 @@ mod tests {
         let mem = ExperienceMemory::new(300);
         let pairs = vec![("coreaudiod", "corespeechd", HIGH_COOCCUR_BYPASS + 10)];
         let skills = induce(&mem, &pairs, &HashSet::new(), &[], "build");
-        let group = skills.iter().find(|s| s.name.starts_with("group:")).unwrap();
-        assert_eq!(group.workload_hint, "any", "group skills must be tagged 'any' regardless of workload");
+        let group = skills
+            .iter()
+            .find(|s| s.name.starts_with("group:"))
+            .unwrap();
+        assert_eq!(
+            group.workload_hint, "any",
+            "group skills must be tagged 'any' regardless of workload"
+        );
     }
 
     #[test]
@@ -412,12 +433,19 @@ mod tests {
                     pressure_at_action: *pressure,
                     pressure_drop: *drop,
                     effective: true,
+                    workload: 0,
                 });
             }
         }
         let skills = induce(&mem, &[], &HashSet::new(), &[], "browsing");
-        let batch = skills.iter().find(|s| s.name.starts_with("batch:")).unwrap();
-        assert_eq!(batch.workload_hint, "browsing", "batch skills must be tagged with active workload");
+        let batch = skills
+            .iter()
+            .find(|s| s.name.starts_with("batch:"))
+            .unwrap();
+        assert_eq!(
+            batch.workload_hint, "browsing",
+            "batch skills must be tagged with active workload"
+        );
     }
 
     #[test]
@@ -430,6 +458,7 @@ mod tests {
                     pressure_at_action: 0.70,
                     pressure_drop: *drop,
                     effective: true,
+                    workload: 0,
                 });
             }
         }

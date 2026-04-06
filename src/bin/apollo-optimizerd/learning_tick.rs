@@ -338,15 +338,25 @@ pub fn run_learning_tick<'a>(
         }
     }
 
-    // ── Lifelong zone learning ───────────────────────────────────────────────
+    // ── Lifelong zone learning (workload-aware, Phase 4) ────────────────────
     // Effective actions → lower zone thresholds (engage earlier).
     // Ineffective actions → raise thresholds (be more conservative).
+    // Per-workload offsets accumulate so zones auto-adapt to workload type.
     {
         let effectiveness = lctx.outcome_tracker.overall_effectiveness();
         let pressure = signal_digest.pressure_smooth;
         if lctx.outcome_tracker.total_resolved > 10 {
-            lctx.signal_intel
-                .zone_feedback(pressure, effectiveness > 0.50);
+            let wl_id = match workload_mode {
+                WorkloadMode::Build => 1,
+                WorkloadMode::LlmInference => 2,
+                WorkloadMode::Browsing => 3,
+                WorkloadMode::Idle => 0,
+            };
+            lctx.signal_intel.zone_feedback_workload(
+                pressure,
+                effectiveness > 0.50,
+                wl_id,
+            );
         }
     }
 

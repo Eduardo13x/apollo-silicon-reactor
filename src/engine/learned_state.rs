@@ -804,6 +804,7 @@ mod tests {
                 pressure_at_action: 0.6,
                 pressure_drop: 0.03,
                 effective: i % 3 == 0,
+                workload: 0,
             });
         }
 
