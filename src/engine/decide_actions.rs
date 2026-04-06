@@ -1218,8 +1218,52 @@ mod tests {
         assert!(is_interactive_base("Google Chrome"));
         assert!(is_interactive_base("Antigravity"));
         assert!(is_interactive_base("LM Studio"));
+        // ITER 3 additions — synced from thermal_interrupt.rs protected list
+        assert!(is_interactive_base("Firefox"));
+        assert!(is_interactive_base("Slack"));
+        assert!(is_interactive_base("Discord"));
+        assert!(is_interactive_base("Spotify"));
+        assert!(is_interactive_base("Notion"));
+        assert!(is_interactive_base("Zed"));
+        assert!(is_interactive_base("Ghostty"));
+        assert!(is_interactive_base("Ollama"));
+        // Electron helpers — substring match catches child processes
+        assert!(is_interactive_base("Notion Helper (Renderer)"));
+        assert!(is_interactive_base("Antigravity Helper (GPU)"));
+        assert!(is_interactive_base("Slack Helper (Renderer)"));
+        assert!(is_interactive_base("Discord Helper"));
+        // Negatives — daemons must NOT match
         assert!(!is_interactive_base("Dropbox"));
         assert!(!is_interactive_base("randomd"));
+        assert!(!is_interactive_base("searchpartyd"));
+        assert!(!is_interactive_base("corespeechd"));
+    }
+
+    #[test]
+    fn no_process_in_both_noise_and_deferrable() {
+        // [Saltzer & Schroeder 1975] Economy of Mechanism — one policy per resource.
+        // A process in both lists gets conflicting treatment in the same cycle.
+        for noise in &NOISE_APPS {
+            assert!(
+                !DEFERRABLE_DAEMONS.iter().any(|d| d == noise),
+                "{noise} is in both NOISE_APPS and DEFERRABLE_DAEMONS"
+            );
+        }
+    }
+
+    #[test]
+    fn no_interactive_app_in_noise_or_deferrable() {
+        // Interactive apps must never be throttled by name-based gates.
+        for interactive in &INTERACTIVE_APPS {
+            assert!(
+                !NOISE_APPS.iter().any(|n| n == interactive),
+                "{interactive} is in both INTERACTIVE_APPS and NOISE_APPS"
+            );
+            assert!(
+                !DEFERRABLE_DAEMONS.iter().any(|d| d == interactive),
+                "{interactive} is in both INTERACTIVE_APPS and DEFERRABLE_DAEMONS"
+            );
+        }
     }
 
     #[test]
