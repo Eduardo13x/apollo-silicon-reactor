@@ -13,24 +13,48 @@ use crate::engine::types::{
 };
 use crate::engine::user_context::UserContext;
 
-const INTERACTIVE_APPS: [&str; 15] = [
-    "Code",
-    "Arc",
-    "Google Chrome",
+/// User-facing interactive applications that must NEVER be frozen or throttled
+/// by heuristic or adaptive governor decisions. Substring match — catches helpers
+/// (e.g., "Brave" matches "Brave Browser Helper (Renderer)").
+///
+/// Synchronized with thermal_interrupt.rs protected list to prevent divergence
+/// where an app is protected from thermal freeze but not from memory freeze.
+/// [Lampson 1974] "Information is lost by having multiple, inconsistent copies."
+const INTERACTIVE_APPS: [&str; 28] = [
+    // IDEs and editors
+    "Code",           // VS Code
+    "Cursor",
+    "Xcode",
+    "Zed",
+    "Nova",
+    "RubyMine",
+    "IntelliJ",
+    // Terminals
     "Terminal",
     "iTerm",
     "Warp",
-    "Antigravity",
-    "Cursor",
+    "Ghostty",
+    "alacritty",
+    "kitty",
+    // Browsers
+    "Arc",
+    "Google Chrome",
+    "Safari",
+    "Brave",          // CLAUDE.md invariant: never throttle
+    "Firefox",
+    "Microsoft Edge",
+    // Communication
+    "zoom.us",
+    "Slack",
+    "Discord",
+    // AI / LLM
+    "Claude",
     "LM Studio",
-    // Additional interactive apps — missing from original list, can get throttled
-    // to E-cores during active use before behavioral data populates behavior_interactive_pids.
-    "Safari",       // macOS default browser — most common interactive app
-    "Brave",        // CLAUDE.md invariant: never throttle during LLM/browsing use
-    "zoom.us",      // Video calls — frame timing as critical as display rendering
-    "Xcode",        // IDE — active compilation + UI interactions
-    "Claude",       // Claude desktop app (Electron) — user's primary workload
-    "Notion",       // Production data: Notion + Notion Helper (Renderer) frozen 7x
+    "Antigravity",
+    "Ollama",
+    // Other user apps (production data: frozen incorrectly)
+    "Notion",
+    "Spotify",
 ];
 
 // suggestd and corespeechd removed — both live in DEFERRABLE_DAEMONS with

@@ -57,7 +57,10 @@ const OFFENDER_EMA_ALPHA: f32 = 0.3;
 const MAX_OFFENDERS: usize = 20;
 
 /// Process names that are always protected and never flagged as offenders.
+/// Includes system essentials + interactive apps from decide_actions::INTERACTIVE_APPS.
+/// [Lampson 1974] One policy per resource — keep in sync with thermal_interrupt.
 const PROTECTED_NAMES: &[&str] = &[
+    // System essentials
     "WindowServer",
     "launchd",
     "kernel_task",
@@ -67,11 +70,23 @@ const PROTECTED_NAMES: &[&str] = &[
     "Finder",
     "coreaudiod",
     "apollo-optimizerd",
+    // Build tools
     "cargo",
     "rustc",
+    "clippy-driver",
+    // User interactive (synced from INTERACTIVE_APPS)
     "Claude",
     "Antigravity",
-    "Brave Browser",
+    "Brave",
+    "Google Chrome",
+    "Safari",
+    "Firefox",
+    "Arc",
+    "Code",
+    "Cursor",
+    "zoom.us",
+    "Notion",
+    "Spotify",
 ];
 
 // ── Core State ────────────────────────────────────────────────────────────────
