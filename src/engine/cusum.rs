@@ -91,6 +91,12 @@ impl Cusum {
         self.reset();
     }
 
+    /// Update sensitivity parameters from learned state (does not reset accumulators).
+    pub fn set_kh(&mut self, k: f64, h: f64) {
+        self.k = k;
+        self.h = h;
+    }
+
     /// Acumulador positivo actual (diagnóstico).
     pub fn score_high(&self) -> f64 {
         self.s_pos
@@ -201,7 +207,11 @@ mod tests {
             "NaN corrupted s_pos: {}",
             cs.score_high()
         );
-        assert_eq!(cs.score_high(), s_pos_before, "s_pos should not change on NaN");
+        assert_eq!(
+            cs.score_high(),
+            s_pos_before,
+            "s_pos should not change on NaN"
+        );
         assert_eq!(cs.run_length(), 5, "run_length should not increment on NaN");
     }
 

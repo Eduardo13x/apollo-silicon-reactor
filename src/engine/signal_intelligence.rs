@@ -24,6 +24,7 @@ use crate::engine::cusum::Cusum;
 use crate::engine::entropy_anomaly::EntropyDetector;
 use crate::engine::hazard_model::HazardModel;
 use crate::engine::kalman::Kalman1D;
+use crate::engine::learned_state::LearnableParams;
 use crate::engine::lotka_volterra::CompetitionState;
 use crate::engine::mpc_horizon::{MpcController, MpcPersisted};
 
@@ -682,6 +683,22 @@ impl SignalIntelligence {
         self.kf_pressure.set_measurement_noise(new_r);
         self.kf_pressure_base_r = new_r;
         Some(new_r)
+    }
+
+    /// Apply learned parameters to live subsystems.
+    ///
+    /// Called by learning_tick every N cycles after params are updated by auto-tuning
+    /// or meta-learning. Closes the wiring gap: params are persisted AND consumed.
+    pub fn apply_learnable_params(&mut self, lp: &LearnableParams) {
+        // Kalman R and Q
+        self.kf_pressure_base_r = lp.kalman_pressure_r;
+        self.kf_pressure.set_measurement_noise(lp.kalman_pressure_r);
+        self.kf_pressure.set_process_noise(lp.kalman_pressure_q);
+        // CUSUM sensitivity
+        self.cusum_pressure.set_kh(lp.cusum_k, lp.cusum_h);
+        // PID
+        self.pid_target = lp.pid_target;
+        self.pid_decay = lp.pid_decay;
     }
 
     /// Auto-tune zone alpha based on oscillation / stall detection.

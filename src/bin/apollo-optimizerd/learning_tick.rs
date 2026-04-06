@@ -385,7 +385,7 @@ pub fn run_learning_tick<'a>(
     // Every 100 cycles: zone alpha from oscillation/stall detection.
     if cycle_count % 50 == 25 {
         if let Some(new_r) = lctx.signal_intel.auto_tune_kalman_r() {
-            let _ = new_r; // applied internally; value available for diagnostics
+            learnable_params.kalman_pressure_r = new_r; // persist the auto-tuned value
         }
     }
     if cycle_count % 200 == 100 {
@@ -395,6 +395,11 @@ pub fn run_learning_tick<'a>(
                 learnable_params.rl_compressor_bands = c_bands;
             }
         }
+    }
+    // Apply all learned params to live subsystems every 100 cycles.
+    // Closes the wiring gap: cusum_k/h, kalman Q, pid_target/decay now consumed.
+    if cycle_count % 100 == 50 {
+        lctx.signal_intel.apply_learnable_params(learnable_params);
     }
 
     // ── Loop 2 fix: hazard model batch retrain ──────────────────────────────
