@@ -10,6 +10,7 @@ pub mod cache_warmer;
 pub mod capabilities;
 pub mod causal_graph;
 pub mod cognitive_bus;
+pub mod cognitive_health;
 pub mod circuit_breaker;
 pub mod contention_detector;
 pub mod coalition;
