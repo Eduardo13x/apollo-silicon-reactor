@@ -212,13 +212,25 @@ pub fn run_learning_tick<'a>(
 
     // ── Outcome tracker tick (urgency-aware, Phase 7) ────────────────────────
     // Urgency flush: when pressure > 0.80, resolve all pending immediately.
-    // Normal: use standard tick with 30s wait.
+    // Normal: use adaptive params from LearnableParams (outcome_wait_secs,
+    // outcome_effective_threshold) instead of hardcoded 30s / 0.01.
     {
+        let wl_id = match workload_mode {
+            WorkloadMode::Build => 1,
+            WorkloadMode::LlmInference => 2,
+            WorkloadMode::Browsing => 3,
+            WorkloadMode::Idle => 0,
+        };
         let batch = if snapshot.pressure.memory_pressure > 0.80 {
             lctx.outcome_tracker
                 .urgency_flush(snapshot.pressure.memory_pressure)
         } else {
-            lctx.outcome_tracker.tick(snapshot.pressure.memory_pressure)
+            lctx.outcome_tracker.tick_with_params(
+                snapshot.pressure.memory_pressure,
+                learnable_params.outcome_wait_secs,
+                learnable_params.outcome_effective_threshold,
+                wl_id,
+            )
         };
         if batch.savings_watts > 0.0 {
             lctx.energy_tracker
