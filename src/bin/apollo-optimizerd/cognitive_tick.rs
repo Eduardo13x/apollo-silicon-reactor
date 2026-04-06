@@ -77,9 +77,6 @@ pub struct CognitiveTickInputs {
     /// LinUCB arm index and delta (for ReptileMeta learning).
     pub linucb_arm_idx: usize,
     pub linucb_delta: f64,
-    /// Pointer to the DriftDetector (for early warning update).
-    /// None if not accessible this cycle.
-    pub drift_detector_available: bool,
 }
 
 impl Default for CognitiveTickInputs {
@@ -100,7 +97,6 @@ impl Default for CognitiveTickInputs {
             rl_q_delta: 0.0,
             linucb_arm_idx: 0,
             linucb_delta: 0.0,
-            drift_detector_available: false,
         }
     }
 }
@@ -279,6 +275,7 @@ pub fn run_cognitive_tick(
 }
 
 /// Output of the cognitive tick — informs the daemon what to do.
+#[derive(Clone, Copy)]
 pub struct CognitiveDecision {
     /// UCHS < 0.40 → pause all learning for recovery.
     pub pause_learning: bool,

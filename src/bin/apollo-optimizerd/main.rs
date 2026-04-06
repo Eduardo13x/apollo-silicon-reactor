@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -27,11 +26,8 @@ extern "C" fn handle_sigterm(_sig: libc::c_int) {
 }
 
 use apollo_optimizer::collector::SystemCollector;
-use apollo_optimizer::engine::adaptive_governor::{
-    AdaptiveGovernor, GovernorDecision,
-};
+use apollo_optimizer::engine::adaptive_governor::AdaptiveGovernor;
 use apollo_optimizer::engine::amx_detector;
-use apollo_optimizer::engine::analytics::AnalyticsEngine;
 use apollo_optimizer::engine::background_collectors::PressureCollector;
 use apollo_optimizer::engine::capabilities::detect_capabilities;
 use apollo_optimizer::engine::compressor_aware::{
@@ -40,18 +36,14 @@ use apollo_optimizer::engine::compressor_aware::{
 };
 use apollo_optimizer::engine::workload_classifier::classify_by_memory;
 use apollo_optimizer::engine::effective_pressure;
-use apollo_optimizer::engine::energy::EnergyTracker;
 use apollo_optimizer::engine::execute_actions::execute_actions;
 use apollo_optimizer::engine::focus_markov::FocusMarkov;
 use apollo_optimizer::engine::foreground::{ForegroundDetector, ForegroundState};
-use apollo_optimizer::engine::evolved_anomaly::EvolvedAnomalyDetector;
 use apollo_optimizer::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
 use apollo_optimizer::engine::holt_winters::HoltWinters;
 use apollo_optimizer::engine::hw_bayes::HwFeatures;
 use apollo_optimizer::engine::hw_predictor::{sample_hw_pressure, HwPressure};
 use apollo_optimizer::engine::iokit_sensors::{HardwareSnapshot, ThermalState};
-use apollo_optimizer::engine::coalition::CoalitionTracker;
-use apollo_optimizer::engine::ioreport::IOReportReader;
 use apollo_optimizer::engine::jetsam_control;
 use apollo_optimizer::engine::kqueue_pressure;
 use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
@@ -65,31 +57,21 @@ use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
 use apollo_optimizer::engine::mach_qos::{MachQoSManager, SchedulingTier};
 use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
 use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
-use apollo_optimizer::engine::network_monitor::NetworkMonitor;
-use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfile};
+use apollo_optimizer::engine::network_optimizer::NetworkProfile;
 use apollo_optimizer::engine::causal_graph::CausalGraph;
-use apollo_optimizer::engine::action_queue::ActionQueue;
-use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningPipeline};
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
 use apollo_optimizer::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
 use apollo_optimizer::engine::pipeline::periodic_stage::{PeriodicContext, run_periodic};
-use apollo_optimizer::engine::neuromodulator::{ApolloNeuromodulator, NeuroSignals};
-use apollo_optimizer::engine::optimization_skills::SkillRegistry;
-use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
+use apollo_optimizer::engine::neuromodulator::NeuroSignals;
 use apollo_optimizer::engine::overflow_guard::{OverflowGuard, BUILD_TOOLS};
-use apollo_optimizer::engine::power_management::{detect_battery_status, PowerManager};
-use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
+use apollo_optimizer::engine::power_management::detect_battery_status;
 use apollo_optimizer::engine::predictive_agent::{
-    specialist, AgentContext, Intervention, PredictiveAgent, SpecialistAccuracyTracker,
+    specialist, AgentContext, Intervention, PredictiveAgent,
     SpecialistVote, tally_votes,
 };
 use apollo_optimizer::engine::proc_taskinfo;
-use apollo_optimizer::engine::process_classifier::{ProcessTier};
-use apollo_optimizer::engine::process_recovery::ProcessRecoveryManager;
 use apollo_optimizer::engine::process_tree::{ProcessEntry, ProcessTree};
-use apollo_optimizer::engine::profile_governor::{
-    GovernorInput, ProfileGovernor,
-};
+use apollo_optimizer::engine::profile_governor::GovernorInput;
 use apollo_optimizer::engine::safety::{
     behavioral_protection_score, classify_protection, critical_background_processes,
     enforce_limits_with_budget, infrastructure_processes, is_user_interactive_app,
@@ -98,42 +80,37 @@ use apollo_optimizer::engine::safety::{
 use apollo_optimizer::engine::learned_state::{LearnedState, RestoreQualityMonitor};
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
 use apollo_optimizer::engine::smc_reader::SmcReader;
-use apollo_optimizer::engine::swap_predictor::SwapPredictor;
-use apollo_optimizer::engine::syscall_classifier::SyscallClassifier;
 use apollo_optimizer::engine::sysctl_governor::{
     SysctlGovernor, SysctlGovernorInput, SysctlGovernorStatus,
 };
-use apollo_optimizer::engine::thermal_bailout::ThermalBailout;
 use apollo_optimizer::engine::thermal_interrupt::{
     spawn_resource_sentinel, ResourceInterruptState, SentinelConfig,
 };
-use apollo_optimizer::engine::thermal_manager::ThermalManager;
 use apollo_optimizer::engine::types::{
     EnergyConsumerInfo, ForegroundAppInfo, FreezeSource, FrozenEntry,
     FrozenPidEntry, FrozenStatePersisted,
     LatencyTarget,
-    OptimizationProfile, ProfileTransition, RootAction,
+    OptimizationProfile, RootAction,
     RuntimeMetrics, SafetyPolicy,
 };
 use apollo_optimizer::engine::usage_model::{usage_model_path_root, UsageModel};
 use apollo_optimizer::engine::user_profile::{UserProfile, UserProfilePersisted};
 use apollo_optimizer::engine::wait_graph;
-use apollo_optimizer::engine::wake_storm_detector::WakeStormDetector;
 use apollo_optimizer::engine::workload_classifier::{
     classify_workload_mode, WorkloadFeatures, WorkloadMode,
 };
 use apollo_optimizer::engine::daemon_helpers::{
-    audit_log, battery_pressure_boost, compute_p95, frozen_state_path,
+    audit_log, battery_pressure_boost, frozen_state_path,
     governor_state_path, holt_winters_path, hop_groups_path, journal_path, kill_switch_path,
     learned_state_path, load_frozen_state, load_governor_state, load_wake_state, markov_path,
     merge_seed_into, metrics_path, overflow_history_path, parse_profile, pid_start_time,
     predictive_agent_path, rl_threshold_path, signal_intelligence_path, skills_path,
     socket_path, should_rotate_oldest, should_unfreeze, spotlight_set_indexing,
     temporal_histograms_path, timeline_path, unfreeze_pids,
-    wake_state_path, write_frozen_state, append_timeline,
-    write_governor_state, write_metrics, write_wake_state,
+    wake_state_path, write_frozen_state,
+    write_governor_state, write_wake_state,
 };
-use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
+use chrono::{Duration as ChronoDuration, Timelike, Utc};
 use clap::{Parser, Subcommand};
 
 // v0.9.0: canonical SharedState — all domain groups live in daemon_state.rs
@@ -1117,13 +1094,13 @@ fn main() -> anyhow::Result<()> {
             // Declared here so they're accessible in both the proc_snaps block and
             // the reactor_weight section which runs after signal_digest computation.
             use apollo_optimizer::engine::window_sensor::{SessionPhase, WorkloadIntent};
-            let mut win_session_phase = SessionPhase::ColdStart;
-            let mut win_workload_intent = WorkloadIntent::General;
-            let mut win_pressure_floor: f64 = 0.0;
-            // Current hour/weekday for temporal headroom; updated each cycle
-            // inside the foreground block and reused in reactor_weight section.
-            let mut temporal_hour: u8 = 0;
-            let mut temporal_weekday: u8 = 0;
+            let mut win_session_phase;
+            let mut win_workload_intent;
+            let mut win_pressure_floor: f64;
+            // Current hour/weekday for temporal headroom; unconditionally set each cycle
+            // inside the Utc::now() block at line ~1547, then optionally refined.
+            let mut temporal_hour: u8;
+            let mut temporal_weekday: u8;
             // Build progress tracker: estimates cargo build completion from
             // rustc process-count dynamics. Informs reactor_weight policy.
             use apollo_optimizer::engine::build_tracker::{BuildTracker, BuildPhase};
@@ -1153,6 +1130,13 @@ fn main() -> anyhow::Result<()> {
             // across restarts. [Yerkes & Dodson 1908]
             let mut arousal_state = restored_arousal
                 .unwrap_or_else(apollo_optimizer::engine::nars_belief::ArousalState::default);
+            // Neurocognitive state: 8-module cognitive pipeline wired into hot loop.
+            // [CognitiveRewardBus, MetaCognition, SelfRewardingEvaluator, EpistemicUncertainty,
+            //  ReptileMeta, AdversarialProbe, ProactiveDrift, CognitiveHealthScore]
+            let mut cognitive_state = cognitive_tick::CognitiveState::new();
+            // CognitiveDecision from the PREVIOUS cycle — gates current cycle's
+            // aggressive actions. None on first cycle (no restriction). [Sutton 2018]
+            let mut prev_cog_decision: Option<cognitive_tick::CognitiveDecision> = None;
             // Restore process baselines: warm EMA-MAD history survives daemon restarts.
             // Called after DaemonSubsystems::new() so energy_pid_tracker is available.
             if let Some(baselines) = restored_process_baselines {
@@ -5423,6 +5407,44 @@ fn main() -> anyhow::Result<()> {
                     persist_generations,
                     skills_path(),
                 );
+                // ── Neurocognitive tick ──────────────────────────────────────────────
+                // Runs after learning_tick so all signals (drift, causal, arousal) are
+                // fresh. Feeds 8 cognitive modules. Result stored in prev_cog_decision
+                // for gating next-cycle learning and current-cycle metrics.
+                let cog_decision = {
+                    let cog_inputs = cognitive_tick::CognitiveTickInputs {
+                        cycle: cycle_count as u64,
+                        pressure: signal_digest.pressure_smooth,
+                        drift_score: lctx.outcome_tracker.nars_drift_score(),
+                        rl_q_variance: 0.0,
+                        linucb_exploration: 0.0,
+                        nars_min_confidence: (1.0 - lctx.outcome_tracker.nars_drift_score() as f32)
+                            .clamp(0.0, 1.0),
+                        outcome_effectiveness: lctx.outcome_tracker.overall_effectiveness(),
+                        causal_confidence: lctx
+                            .causal_graph
+                            .solid_edges_by_impact()
+                            .first()
+                            .map(|e| e.confidence)
+                            .unwrap_or(0.0),
+                        latest_action: throttle_names_for_outcome.first().cloned(),
+                        predicted_score: 0.5,
+                        workload_fingerprint: workload_mode
+                            .as_str()
+                            .bytes()
+                            .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64)),
+                        rl_state_idx: 0,
+                        rl_q_delta: 0.0,
+                        linucb_arm_idx: 0,
+                        linucb_delta: 0.0,
+                    };
+                    cognitive_tick::run_cognitive_tick(
+                        &mut cognitive_state,
+                        &cog_inputs,
+                        Some(&mut lctx.outcome_tracker.drift_detector),
+                    )
+                };
+                prev_cog_decision = Some(cog_decision);
                 // Autonomous rule induction: mine experience memory + co-occurrence
                 // graph for new skills every 100 cycles (~50s).  No human needed —
                 // Apollo crystallizes its own observations into reusable rules.
@@ -5578,6 +5600,25 @@ fn main() -> anyhow::Result<()> {
                     // rl_threshold_current — absolute threshold (bg_pressure + rl_adj).
                     m.metrics.rl_threshold_current =
                         bg_threshold + m.metrics.rl_adjustment_pp as f64 / 100.0;
+                    // ── UCHS / Neurocognitive metrics (8 cognitive modules) ──────────
+                    m.metrics.uchs_composite = cog_decision.uchs_composite;
+                    m.metrics.uchs_grade = cognitive_state.health.grade.clone();
+                    m.metrics.uchs_recovery_mode = cognitive_state.health.recovery_mode;
+                    m.metrics.epistemic_uncertainty = cognitive_state.epistemic.composite;
+                    m.metrics.epistemic_level =
+                        cognitive_state.epistemic.level_label().to_string();
+                    m.metrics.meta_confidence = cognitive_state.meta_cognition.meta_confidence;
+                    m.metrics.humble_mode = cog_decision.humble_mode;
+                    m.metrics.adversarial_pass_rate =
+                        cognitive_state.adversarial.lifetime_pass_rate() as f32;
+                    m.metrics.adversarial_safety_alert = cog_decision.safety_alert;
+                    m.metrics.cognitive_snr = cognitive_state.reward_bus.signal_to_noise();
+                    m.metrics.self_eval_quality =
+                        cognitive_state.self_evaluator.evaluator_trust();
+                    m.metrics.reptile_cached_workloads =
+                        cognitive_state.reptile.cached_workloads();
+                    m.metrics.drift_early_warning =
+                        lctx.outcome_tracker.drift_detector.early_warning();
                 }
 
                 // ── Periodic stage: GC and observability (% 100 / % 500 / % 7200 gates) ──

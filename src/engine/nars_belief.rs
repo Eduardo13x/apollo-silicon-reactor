@@ -237,11 +237,6 @@ impl BeliefEntry {
         }
     }
 
-    /// Incorporate a new observation with neutral salience (standard weight).
-    fn observe(&mut self, success: bool) -> f32 {
-        self.observe_salient(success, Salience::neutral())
-    }
-
     /// Incorporate a new observation with explicit salience weighting.
     ///
     /// High arousal → higher evidence weight → faster belief update.

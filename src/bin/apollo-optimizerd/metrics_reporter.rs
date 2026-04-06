@@ -26,7 +26,7 @@ use std::time::Instant;
 use chrono::Utc;
 
 use apollo_optimizer::collector::SystemSnapshot;
-use apollo_optimizer::engine::adaptive_governor::{GovernorDecision as AdaptiveGovernorDecision, ProcessDecision};
+use apollo_optimizer::engine::adaptive_governor::ProcessDecision;
 use apollo_optimizer::engine::daemon_helpers::{append_timeline, battery_pressure_boost, compute_p95, write_metrics};
 use apollo_optimizer::engine::daemon_state::SharedState;
 use apollo_optimizer::engine::execute_actions::ExecuteOutcomes;
@@ -42,7 +42,7 @@ use apollo_optimizer::engine::process_classifier::ProcessTier;
 use apollo_optimizer::engine::profile_governor::GovernorDecision;
 use apollo_optimizer::engine::signal_intelligence::SignalDigest;
 use apollo_optimizer::engine::thermal_bailout::ThermalAction;
-use apollo_optimizer::engine::types::{OptimizationProfile, ProfileTransition};
+use apollo_optimizer::engine::types::OptimizationProfile;
 use apollo_optimizer::engine::nars_belief::ArousalState;
 use apollo_optimizer::engine::predictive_agent::Intervention;
 use apollo_optimizer::engine::process_tree::ProcessTree;
