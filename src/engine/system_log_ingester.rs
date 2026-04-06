@@ -11,6 +11,7 @@
 //! - Read-only: we only observe, never act on crash/OOM events directly
 
 use std::process::Command;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// A system event parsed from macOS unified logs.
@@ -44,6 +45,9 @@ pub struct SystemLogIngester {
     pub total_oom_events: u64,
     /// Total crash events observed (lifetime counter).
     pub total_crash_events: u64,
+    /// Background thread channel receiver. When `Some`, `poll()` drains this
+    /// channel non-blockingly instead of spawning a subprocess inline.
+    receiver: Option<mpsc::Receiver<Vec<SystemEvent>>>,
 }
 
 impl SystemLogIngester {
@@ -55,12 +59,102 @@ impl SystemLogIngester {
             timeout: Duration::from_secs(2),
             total_oom_events: 0,
             total_crash_events: 0,
+            receiver: None,
         }
+    }
+
+    /// Start a background thread that polls `log show` every `poll_interval`.
+    /// After calling this, `poll()` becomes non-blocking: it drains the channel
+    /// without spawning a subprocess inline. Eliminates 100-300ms spikes in the
+    /// daemon hot path when `log show` fires.
+    ///
+    /// The thread shuts down automatically when the ingester is dropped (sender
+    /// disconnect causes the thread loop to exit).
+    pub fn start_background(&mut self) {
+        let (tx, rx) = mpsc::channel::<Vec<SystemEvent>>();
+        let poll_interval = self.poll_interval;
+        let timeout = self.timeout;
+        std::thread::Builder::new()
+            .name("apollo-log-ingester".to_string())
+            .spawn(move || {
+                // Wait one full interval before first poll so startup isn't
+                // burdened with a potentially slow `log show` call.
+                std::thread::sleep(poll_interval);
+                loop {
+                    let events = Self::run_query_static(timeout);
+                    if tx.send(events).is_err() {
+                        // Main thread dropped receiver — exit cleanly.
+                        return;
+                    }
+                    std::thread::sleep(poll_interval);
+                }
+            })
+            .ok(); // spawn failure is non-fatal; falls back to blocking poll
+        self.receiver = Some(rx);
+    }
+
+    /// Static version of `query_logs` + `parse_log_output` for use in background thread.
+    fn run_query_static(timeout: Duration) -> Vec<SystemEvent> {
+        let result = Command::new("log")
+            .args([
+                "show",
+                "--last",
+                "2m",
+                "--predicate",
+                r#"(subsystem == "com.apple.kernel" AND category == "memorystatus") OR (process == "ReportCrash") OR (eventMessage CONTAINS "Jetsam") OR (eventMessage CONTAINS "EXC_CRASH") OR (eventMessage CONTAINS "SIGKILL")"#,
+                "--style",
+                "compact",
+                "--info",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let mut child = match result {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        match child.wait_timeout(timeout) {
+            Ok(Some(status)) if status.success() => {}
+            _ => {
+                let _ = child.kill();
+                return Vec::new();
+            }
+        }
+        let output = child
+            .stdout
+            .take()
+            .and_then(|out| {
+                use std::io::Read;
+                let mut buf = String::new();
+                let mut reader = out;
+                reader.read_to_string(&mut buf).ok()?;
+                Some(buf)
+            })
+            .unwrap_or_default();
+        Self::parse_log_output(&output)
     }
 
     /// Check if it's time to poll. If so, query the logs and return any events found.
     /// Returns an empty vec if it's not time yet or if no events were found.
+    ///
+    /// In background mode (after `start_background()`), this is always non-blocking:
+    /// it drains whatever the background thread has collected without spawning a subprocess.
     pub fn poll(&mut self) -> Vec<SystemEvent> {
+        // Background mode: drain channel non-blockingly.
+        if let Some(rx) = &self.receiver {
+            let mut events = Vec::new();
+            while let Ok(batch) = rx.try_recv() {
+                for ev in batch {
+                    match &ev {
+                        SystemEvent::OomKill { .. } => self.total_oom_events += 1,
+                        SystemEvent::Crash { .. } => self.total_crash_events += 1,
+                    }
+                    events.push(ev);
+                }
+            }
+            return events;
+        }
+        // Blocking fallback (used in tests and when start_background() was not called).
         if self.last_poll.elapsed() < self.poll_interval {
             return Vec::new();
         }

@@ -1130,7 +1130,10 @@ fn main() -> anyhow::Result<()> {
             // Stored when had_disagreement is true; consumed by learning_tick next cycle.
             let mut last_specialist_votes: Option<(Vec<SpecialistVote>, Intervention)> = None;
             // System log ingester: polls macOS unified logs for OOM/crash events (Phase 5).
+            // Runs in background thread to avoid blocking the daemon hot path with
+            // `log show` subprocess latency (100-300ms when it fires).
             let mut log_ingester = apollo_optimizer::engine::system_log_ingester::SystemLogIngester::new();
+            log_ingester.start_background();
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
             // Gate network_monitor.tick() to every ~10s since netstat is blocking.
