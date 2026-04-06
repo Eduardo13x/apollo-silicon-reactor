@@ -80,6 +80,7 @@ pub mod protocol;
 pub mod rl_threshold;
 pub mod rosetta_monitor;
 pub mod safety;
+pub mod self_reward;
 pub mod signal_intelligence;
 pub mod sleep_notifier;
 pub mod silicon_probe;
