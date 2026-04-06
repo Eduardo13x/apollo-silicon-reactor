@@ -116,8 +116,12 @@ pub fn run_cognitive_tick(
     let cycle = inputs.cycle;
 
     // ── 1. CognitiveRewardBus: publish signals ────────────────────────────
-    // Outcome effectiveness as reward signal
-    if inputs.outcome_effectiveness > 0.0 {
+    // Outcome effectiveness as reward signal — only publish above noise floor.
+    // Under high pressure (>0.80), 21% effectiveness is expected (single throttles
+    // can't overcome system-wide pressure). Publishing -0.58 every cycle floods
+    // the bus with noise that drowns directional signal (SNR ~0.18).
+    // Threshold 0.30 filters cycles where signal > noise.
+    if inputs.outcome_effectiveness > 0.30 {
         cog.reward_bus.publish(RewardSignal {
             source: RewardSource::Outcome,
             value: inputs.outcome_effectiveness * 2.0 - 1.0, // map [0,1] → [-1,1]
@@ -131,6 +135,16 @@ pub fn run_cognitive_tick(
             source: RewardSource::CausalGraph,
             value: inputs.causal_confidence as f64 * 2.0 - 1.0,
             confidence: inputs.causal_confidence.min(1.0),
+            cycle,
+        });
+    }
+    // Stability reward every 100 cycles: daemon alive, no drift, nars beliefs stable.
+    // [Silver 2021] "Reward is Enough" — survival is a valid reward signal.
+    if cycle % 100 == 50 && inputs.drift_score < 0.05 && inputs.nars_min_confidence > 0.5 {
+        cog.reward_bus.publish(RewardSignal {
+            source: RewardSource::Outcome,
+            value: 0.20,
+            confidence: 0.5,
             cycle,
         });
     }
@@ -163,13 +177,13 @@ pub fn run_cognitive_tick(
             inputs.pressure,
         );
     }
-    let eval_results = cog.self_evaluator.evaluate_past(
-        cycle,
-        inputs.pressure,
-        |action_name| {
+    let eval_results = cog
+        .self_evaluator
+        .evaluate_past(cycle, inputs.pressure, |action_name| {
             // Full CausalGraph map lookup — evaluate any past action, not just current.
             // [Yuan 2024 §3 DR-ZERO]: use causal graph as internal oracle for JuicyScore.
-            inputs.causal_confidence_map
+            inputs
+                .causal_confidence_map
                 .iter()
                 .find(|(a, _)| a == action_name)
                 .map(|(_, c)| *c)
@@ -181,8 +195,7 @@ pub fn run_cognitive_tick(
                         0.0
                     }
                 })
-        },
-    );
+        });
     // Publish self-eval scores to reward bus
     for eval in &eval_results {
         if eval.informative {
@@ -204,7 +217,8 @@ pub fn run_cognitive_tick(
     );
 
     // ── 5. ReptileMeta: detect fingerprint changes + apply deltas ────────
-    cog.reptile.on_fingerprint_change(inputs.workload_fingerprint, cycle);
+    cog.reptile
+        .on_fingerprint_change(inputs.workload_fingerprint, cycle);
     if inputs.rl_q_delta.abs() > 0.001 || inputs.linucb_delta.abs() > 0.001 {
         cog.reptile.apply_learning_delta(
             inputs.rl_state_idx,
@@ -401,7 +415,10 @@ mod tests {
             ..Default::default()
         };
         let decision = run_cognitive_tick(&mut cog, &inputs, None);
-        assert!(cog.adversarial.total_probes >= 4, "Should run 4 probes at cycle 500");
+        assert!(
+            cog.adversarial.total_probes >= 4,
+            "Should run 4 probes at cycle 500"
+        );
         assert!(!decision.safety_alert);
     }
 

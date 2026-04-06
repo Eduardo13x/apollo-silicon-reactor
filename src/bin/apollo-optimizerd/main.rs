@@ -5777,7 +5777,9 @@ fn main() -> anyhow::Result<()> {
                         outcome_effectiveness: lctx.outcome_tracker.overall_effectiveness(),
                         causal_confidence: top_causal,
                         causal_confidence_map,
-                        latest_action: throttle_names_for_outcome.first().cloned(),
+                        latest_action: throttle_names_for_outcome
+                            .first()
+                            .map(|n| format!("throttle:{}", n)),
                         predicted_score: lctx
                             .predictive_agent
                             .arm_avg_rewards()
