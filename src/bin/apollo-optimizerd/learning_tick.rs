@@ -209,9 +209,16 @@ pub fn run_learning_tick<'a>(
         !throttle_names_for_outcome.is_empty(),
     );
 
-    // ── Outcome tracker tick ─────────────────────────────────────────────────
+    // ── Outcome tracker tick (urgency-aware, Phase 7) ────────────────────────
+    // Urgency flush: when pressure > 0.80, resolve all pending immediately.
+    // Normal: use standard tick with 30s wait.
     {
-        let batch = lctx.outcome_tracker.tick(snapshot.pressure.memory_pressure);
+        let batch = if snapshot.pressure.memory_pressure > 0.80 {
+            lctx.outcome_tracker
+                .urgency_flush(snapshot.pressure.memory_pressure)
+        } else {
+            lctx.outcome_tracker.tick(snapshot.pressure.memory_pressure)
+        };
         if batch.savings_watts > 0.0 {
             lctx.energy_tracker
                 .record_savings(batch.savings_watts, 30.0);

@@ -380,6 +380,12 @@ pub struct OutcomeTracker {
     /// Signals when the Bayesian model has drifted from current reality.
     /// [Pei Wang 2013] Non-Axiomatic Reasoning System, §3.3.3
     pub drift_detector: DriftDetector,
+
+    // ── Outcome acceleration (Phase 7) ──────────────────────────────────
+    /// Per-process EMA of time-to-effect in seconds.
+    /// Processes that respond quickly (effect visible in 10s) get shorter wait times.
+    /// Processes that respond slowly keep the default 30s.
+    process_effect_time: HashMap<String, f64>,
 }
 
 impl OutcomeTracker {
@@ -401,6 +407,7 @@ impl OutcomeTracker {
             short_drift_velocity: 0.0,
             hop_groups: HashMap::new(),
             drift_detector: DriftDetector::new(),
+            process_effect_time: HashMap::new(),
         }
     }
 
@@ -554,6 +561,14 @@ impl OutcomeTracker {
                 current_pressure,
             ));
 
+            // Track per-process time-to-effect for adaptive wait (Phase 7).
+            let elapsed_secs = outcome.throttled_at.elapsed().as_secs_f64();
+            let effect_entry = self
+                .process_effect_time
+                .entry(outcome.process_name.clone())
+                .or_insert(30.0);
+            *effect_entry = *effect_entry * 0.8 + elapsed_secs * 0.2;
+
             self.total_resolved += 1;
             if effective {
                 self.total_effective += 1;
@@ -603,6 +618,82 @@ impl OutcomeTracker {
     /// Number of currently pending (unresolved) outcome observations.
     pub fn pending_depth(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Adaptive wait time for a process based on its historical time-to-effect.
+    /// Processes that show effect quickly (EMA < 15s) get a shorter wait (15s).
+    /// Unknown processes use the default (30s).
+    pub fn adaptive_wait_secs(&self, process: &str) -> u64 {
+        self.process_effect_time
+            .get(process)
+            .map(|&ema| {
+                if ema < 15.0 {
+                    15 // fast responder
+                } else if ema < 25.0 {
+                    20 // moderate
+                } else {
+                    30 // slow or default
+                }
+            })
+            .unwrap_or(30)
+    }
+
+    /// Urgency flush: resolve ALL pending outcomes immediately (no wait).
+    /// Used when pressure > 0.80 — we need the feedback loop NOW.
+    /// Returns an OutcomeBatch with all resolutions.
+    pub fn urgency_flush(&mut self, current_pressure: f64) -> OutcomeBatch {
+        let mut effective_names = Vec::new();
+        let mut savings_watts = 0.0_f64;
+        let mut low_value_names = Vec::new();
+        let mut resolved_outcomes = Vec::new();
+
+        while let Some(outcome) = self.pending.pop_front() {
+            let pressure_drop = outcome.pressure_before - current_pressure;
+            let effective = pressure_drop > 0.01;
+            let elapsed_secs = outcome.throttled_at.elapsed().as_secs_f64();
+
+            self.total_resolved += 1;
+            if effective {
+                self.total_effective += 1;
+                effective_names.push(outcome.process_name.clone());
+                savings_watts += outcome.watts_before;
+            } else {
+                low_value_names.push(outcome.process_name.clone());
+            }
+
+            // Update per-process effect time EMA
+            let entry = self
+                .process_effect_time
+                .entry(outcome.process_name.clone())
+                .or_insert(30.0);
+            *entry = *entry * 0.8 + elapsed_secs * 0.2;
+
+            // Update weights
+            let weight = self
+                .weights
+                .entry(outcome.process_name.clone())
+                .or_insert(PatternWeight {
+                    throttle_count: 0,
+                    effective_count: 0,
+                });
+            weight.throttle_count += 1;
+            if effective {
+                weight.effective_count += 1;
+            }
+
+            resolved_outcomes.push((
+                outcome.process_name,
+                outcome.pressure_before,
+                current_pressure,
+            ));
+        }
+
+        OutcomeBatch {
+            effective_names,
+            savings_watts,
+            low_value_names,
+            resolved_outcomes,
+        }
     }
 
     /// GC for the weights HashMap — prevents unbounded growth in long-running daemons.
@@ -1382,6 +1473,84 @@ mod tests {
             });
         }
         assert!(mem.query_similar_contextual("Safari", 0.65, 0.10, 3).is_none());
+    }
+
+    // ── Outcome acceleration tests (Phase 7) ──────────────────────────────────
+
+    #[test]
+    fn adaptive_wait_unknown_process_returns_default() {
+        let tracker = OutcomeTracker::new();
+        assert_eq!(tracker.adaptive_wait_secs("unknown_process"), 30);
+    }
+
+    #[test]
+    fn adaptive_wait_tracks_fast_process() {
+        let mut tracker = OutcomeTracker::new();
+        // Simulate a process with fast effect time (EMA converges toward 10s)
+        for _ in 0..20 {
+            let entry = tracker
+                .process_effect_time
+                .entry("fast_app".into())
+                .or_insert(30.0);
+            *entry = *entry * 0.8 + 10.0 * 0.2; // EMA toward 10s
+        }
+        assert_eq!(
+            tracker.adaptive_wait_secs("fast_app"),
+            15,
+            "fast process should get 15s wait"
+        );
+    }
+
+    #[test]
+    fn urgency_flush_resolves_all_pending() {
+        let mut tracker = OutcomeTracker::new();
+        // Add some pending outcomes
+        tracker.pending.push_back(super::PendingOutcome {
+            process_name: "App1".into(),
+            throttled_at: std::time::Instant::now() - std::time::Duration::from_secs(5),
+            pressure_before: 0.85,
+            watts_before: 2.0,
+            swap_gb_at_throttle: 1.0,
+        });
+        tracker.pending.push_back(super::PendingOutcome {
+            process_name: "App2".into(),
+            throttled_at: std::time::Instant::now() - std::time::Duration::from_secs(3),
+            pressure_before: 0.82,
+            watts_before: 1.5,
+            swap_gb_at_throttle: 0.5,
+        });
+        assert_eq!(tracker.pending.len(), 2);
+        let batch = tracker.urgency_flush(0.70); // pressure dropped to 0.70
+        assert_eq!(tracker.pending.len(), 0, "urgency flush should drain all pending");
+        assert_eq!(batch.resolved_outcomes.len(), 2);
+        // Both should be effective (0.85-0.70=0.15 > 0.01 and 0.82-0.70=0.12 > 0.01)
+        assert_eq!(batch.effective_names.len(), 2);
+    }
+
+    #[test]
+    fn urgency_flush_updates_effect_time() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.pending.push_back(super::PendingOutcome {
+            process_name: "SlowApp".into(),
+            throttled_at: std::time::Instant::now() - std::time::Duration::from_secs(5),
+            pressure_before: 0.80,
+            watts_before: 1.0,
+            swap_gb_at_throttle: 0.0,
+        });
+        tracker.urgency_flush(0.70);
+        // Should have tracked effect time for SlowApp
+        assert!(
+            tracker.process_effect_time.contains_key("SlowApp"),
+            "urgency flush should track effect time"
+        );
+    }
+
+    #[test]
+    fn urgency_flush_empty_pending_returns_empty_batch() {
+        let mut tracker = OutcomeTracker::new();
+        let batch = tracker.urgency_flush(0.90);
+        assert!(batch.resolved_outcomes.is_empty());
+        assert!(batch.effective_names.is_empty());
     }
 
     // ── Counterfactual baseline tests ───────────────────────────────────────────
