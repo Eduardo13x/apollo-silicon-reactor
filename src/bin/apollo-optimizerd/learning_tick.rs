@@ -416,6 +416,10 @@ pub fn run_learning_tick<'a>(
     // Closes the wiring gap: cusum_k/h, kalman Q, pid_target/decay now consumed.
     if cycle_count % 100 == 50 {
         lctx.signal_intel.apply_learnable_params(learnable_params);
+        // Wire nars_drift_threshold → DriftDetector sensitivity.
+        lctx.outcome_tracker
+            .drift_detector
+            .set_drift_threshold(learnable_params.nars_drift_threshold as f32);
     }
 
     // ── Loop 2 fix: hazard model batch retrain ──────────────────────────────

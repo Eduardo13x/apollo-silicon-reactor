@@ -37,7 +37,12 @@ use std::collections::HashMap;
 /// Frequency shift that triggers a drift alert for a single belief.
 /// A 20pp shift means the action's effectiveness profile has materially changed.
 /// Inspired by Population Stability Index threshold (PSI ≥ 0.20 = major shift).
+/// Default value — overridden by LearnableParams::nars_drift_threshold at runtime.
 const DRIFT_THRESHOLD: f32 = 0.20;
+
+fn default_drift_threshold() -> f32 {
+    DRIFT_THRESHOLD
+}
 
 /// Minimum confidence before drift can be declared (need enough evidence).
 const MIN_CONFIDENCE_FOR_DRIFT: f32 = 0.30;
@@ -301,9 +306,10 @@ impl BeliefEntry {
     }
 
     /// True if this belief has shifted significantly since last calibration.
-    fn is_drifted(&self) -> bool {
+    /// Uses the DriftDetector's learned drift_threshold (default DRIFT_THRESHOLD).
+    fn is_drifted(&self, threshold: f32) -> bool {
         let delta = (self.tv.frequency - self.freq_before_last_revision).abs();
-        self.tv.confidence >= MIN_CONFIDENCE_FOR_DRIFT && delta >= DRIFT_THRESHOLD
+        self.tv.confidence >= MIN_CONFIDENCE_FOR_DRIFT && delta >= threshold
     }
 }
 
@@ -323,6 +329,11 @@ pub struct DriftDetector {
     /// [Godden & Baddeley 1975] context-dependent memory.
     #[serde(default)]
     contextual_beliefs: HashMap<String, BeliefEntry>,
+    /// Frequency-shift threshold to declare drift. Default 0.20 (PSI major shift criterion).
+    /// Wired from LearnableParams::nars_drift_threshold — can converge to a tighter or
+    /// looser threshold based on the system's observed noise floor.
+    #[serde(default = "default_drift_threshold")]
+    drift_threshold: f32,
     /// EMA of per-belief drift deltas. High = model is drifting.
     pub drift_score: f64,
     /// Number of beliefs currently in a drifted state.
@@ -392,7 +403,7 @@ impl DriftDetector {
             + (1.0 - DRIFT_SCORE_ALPHA) * self.drift_score;
 
         // Recount drifted beliefs
-        self.drifted_count = self.beliefs.values().filter(|e| e.is_drifted()).count();
+        self.drifted_count = self.beliefs.values().filter(|e| e.is_drifted(self.drift_threshold)).count();
 
         delta
     }
@@ -531,7 +542,7 @@ impl DriftDetector {
             self.beliefs.remove(&key);
         }
         // Recount drifted beliefs after pruning
-        self.drifted_count = self.beliefs.values().filter(|e| e.is_drifted()).count();
+        self.drifted_count = self.beliefs.values().filter(|e| e.is_drifted(self.drift_threshold)).count();
     }
 
     /// Number of tracked beliefs.
@@ -541,6 +552,12 @@ impl DriftDetector {
 
     pub fn is_empty(&self) -> bool {
         self.beliefs.is_empty()
+    }
+
+    /// Update the drift sensitivity threshold from LearnableParams.
+    /// Clamped to [0.05, 0.40] — prevents both hair-trigger and deafness.
+    pub fn set_drift_threshold(&mut self, threshold: f32) {
+        self.drift_threshold = threshold.clamp(0.05, 0.40);
     }
 
     // ── Proactive Early Warning [Adams & MacKay 2007] ───────────────────────
