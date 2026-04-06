@@ -320,7 +320,7 @@ impl BeliefEntry {
 /// with sufficient confidence, the learned model no longer matches reality.
 ///
 /// Drift score ∈ [0,1]: 0 = stable, 1 = total model invalidation.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriftDetector {
     beliefs: HashMap<String, BeliefEntry>,
     /// Contextual beliefs: keyed by (action_name, pressure_bucket).
@@ -360,6 +360,24 @@ pub struct DriftDetector {
     /// Run length counter for Bayesian changepoint detection.
     #[serde(default)]
     run_length: u32,
+}
+
+impl Default for DriftDetector {
+    fn default() -> Self {
+        Self {
+            beliefs: HashMap::new(),
+            contextual_beliefs: HashMap::new(),
+            drift_threshold: DRIFT_THRESHOLD,
+            drift_score: 0.0,
+            drifted_count: 0,
+            prev_drift_score: 0.0,
+            gradient_ema: 0.0,
+            gradient_acceleration: 0.0,
+            changepoint_posterior: 0.0,
+            early_warning_score: 0.0,
+            run_length: 0,
+        }
+    }
 }
 
 impl DriftDetector {
