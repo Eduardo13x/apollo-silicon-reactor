@@ -5448,23 +5448,57 @@ fn main() -> anyhow::Result<()> {
                 // fresh. Feeds 8 cognitive modules. Result stored in prev_cog_decision
                 // for gating next-cycle learning and current-cycle metrics.
                 let cog_decision = {
+                    // ── Derive real epistemic signals from subsystems ─────────────────
+                    // [Lakshminarayanan 2017] predictive uncertainty from ensemble variance.
+                    // RL Q-value variance: std-dev across arm avg-rewards → spread = uncertainty.
+                    let rl_q_variance = {
+                        let avg = lctx.predictive_agent.arm_avg_rewards();
+                        let n = avg.len() as f64;
+                        let mean = avg.iter().sum::<f64>() / n;
+                        let var = avg.iter().map(|&r| (r - mean).powi(2)).sum::<f64>() / n;
+                        (var.sqrt() as f32).clamp(0.0, 1.0)
+                    };
+                    // LinUCB exploration: UCB for the most-pulled arm (lower = more exploited).
+                    let linucb_exploration = {
+                        let pulls = lctx.predictive_agent.arm_pulls();
+                        let total = lctx.predictive_agent.total_cycles();
+                        if total > 1 {
+                            let best = pulls.iter().copied().max().unwrap_or(1).max(1);
+                            ((2.0 * (total as f64).ln() / best as f64).sqrt().min(1.0) as f32)
+                                .clamp(0.0, 1.0)
+                        } else {
+                            1.0 // maximum uncertainty on cold start
+                        }
+                    };
+                    // Full causal confidence map — lets SelfRewardingEvaluator look up
+                    // any past action's confidence, not just the current one.
+                    // [Yuan 2024 §3 DR-ZERO]: CausalGraph as internal oracle for JuicyScore.
+                    let causal_confidence_map: Vec<(String, f32)> = lctx
+                        .causal_graph
+                        .confidence_map()
+                        .into_iter()
+                        .collect();
+                    let top_causal = lctx
+                        .causal_graph
+                        .solid_edges_by_impact()
+                        .first()
+                        .map(|e| e.confidence)
+                        .unwrap_or(0.0);
                     let cog_inputs = cognitive_tick::CognitiveTickInputs {
                         cycle: cycle_count as u64,
                         pressure: signal_digest.pressure_smooth,
                         drift_score: lctx.outcome_tracker.nars_drift_score(),
-                        rl_q_variance: 0.0,
-                        linucb_exploration: 0.0,
+                        rl_q_variance,
+                        linucb_exploration,
                         nars_min_confidence: (1.0 - lctx.outcome_tracker.nars_drift_score() as f32)
                             .clamp(0.0, 1.0),
                         outcome_effectiveness: lctx.outcome_tracker.overall_effectiveness(),
-                        causal_confidence: lctx
-                            .causal_graph
-                            .solid_edges_by_impact()
-                            .first()
-                            .map(|e| e.confidence)
-                            .unwrap_or(0.0),
+                        causal_confidence: top_causal,
+                        causal_confidence_map,
                         latest_action: throttle_names_for_outcome.first().cloned(),
-                        predicted_score: 0.5,
+                        predicted_score: lctx.predictive_agent.arm_avg_rewards()
+                            .iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                            .clamp(0.0, 1.0) as f32,
                         workload_fingerprint: workload_mode
                             .as_str()
                             .bytes()

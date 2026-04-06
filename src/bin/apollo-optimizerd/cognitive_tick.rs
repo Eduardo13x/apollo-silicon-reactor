@@ -65,6 +65,9 @@ pub struct CognitiveTickInputs {
     pub outcome_effectiveness: f64,
     /// Causal confidence for strongest recent action [0,1].
     pub causal_confidence: f32,
+    /// Full action→confidence map from CausalGraph (for SelfRewardingEvaluator retroactive eval).
+    /// Allows evaluating past decisions by their actual causal confidence, not just the current action.
+    pub causal_confidence_map: Vec<(String, f32)>,
     /// Name of latest action taken (for SelfRewardingEvaluator log).
     pub latest_action: Option<String>,
     /// Predicted score for latest action [0,1].
@@ -90,6 +93,7 @@ impl Default for CognitiveTickInputs {
             nars_min_confidence: 0.70,
             outcome_effectiveness: 0.5,
             causal_confidence: 0.0,
+            causal_confidence_map: Vec::new(),
             latest_action: None,
             predicted_score: 0.5,
             workload_fingerprint: 0,
@@ -163,12 +167,20 @@ pub fn run_cognitive_tick(
         cycle,
         inputs.pressure,
         |action_name| {
-            // Use causal_confidence as proxy for CausalGraph lookup
-            if inputs.latest_action.as_deref() == Some(action_name) {
-                inputs.causal_confidence
-            } else {
-                0.0
-            }
+            // Full CausalGraph map lookup — evaluate any past action, not just current.
+            // [Yuan 2024 §3 DR-ZERO]: use causal graph as internal oracle for JuicyScore.
+            inputs.causal_confidence_map
+                .iter()
+                .find(|(a, _)| a == action_name)
+                .map(|(_, c)| *c)
+                .unwrap_or_else(|| {
+                    // Fallback to current causal_confidence if action matches current
+                    if inputs.latest_action.as_deref() == Some(action_name) {
+                        inputs.causal_confidence
+                    } else {
+                        0.0
+                    }
+                })
         },
     );
     // Publish self-eval scores to reward bus
