@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 /// Global stop flag for signal handlers (SIGTERM/SIGINT).
 /// Signal handlers cannot capture Arc/closures, so we use a static AtomicBool
 /// that the main loop checks alongside `state.stop`.
+mod cognitive_tick;
 mod daemon_init;
 mod learning_tick;
 mod metrics_reporter;
@@ -1487,6 +1488,57 @@ fn main() -> anyhow::Result<()> {
                             // the buffer cache so code pages don't fault from SSD.
                             // Cao et al. 1994 — app-controlled prefetch cuts I/O wait 50%.
                             cache_warmer.warm_pid(pid);
+                        }
+                    }
+                }
+
+                // Universal pre-thaw: FocusMarkov prediction → pre-thaw ALL frozen processes
+                // whose category matches the hint for the predicted next app.
+                // App-agnostic: covers Chromium renderers, IDE LSP helpers, media helpers,
+                // generic app helpers — not just Chromium browsers.
+                // [Altmann & Trafton 2002] Pre-activate resources before predicted task switch.
+                if let Some(ref pred) = markov_prediction {
+                    if pred.probability >= 0.35 {
+                        let elapsed = focus_markov.elapsed_dwell_secs();
+                        let time_to_switch = pred.avg_dwell_secs - elapsed;
+                        if time_to_switch < 10.0 {
+                            use apollo_optimizer::engine::freeze_intelligence::FreezeIntelligence;
+                            let hint_categories =
+                                FreezeIntelligence::pre_thaw_hint(&pred.app_name);
+                            // Collect pids + names from frozen_state that match hint categories.
+                            let candidates: Vec<(u32, String)> = {
+                                let frozen_guard = state.frozen_state.lock_recover();
+                                frozen_guard
+                                    .iter()
+                                    .filter_map(|(&pid, entry)| {
+                                        let pname = entry.process_name.as_deref().unwrap_or("");
+                                        if !pname.is_empty() {
+                                            let cat = FreezeIntelligence::classify(pname);
+                                            if hint_categories.contains(&cat) {
+                                                return Some((pid, pname.to_string()));
+                                            }
+                                        }
+                                        None
+                                    })
+                                    .collect()
+                            };
+                            if !candidates.is_empty() {
+                                let mut frozen_guard = state.frozen_state.lock_recover();
+                                for (pid, pname) in &candidates {
+                                    if frozen_guard.remove(pid).is_some() {
+                                        unfreeze_pids(std::iter::once(*pid));
+                                        tracing::info!(
+                                            pid = pid,
+                                            process = pname.as_str(),
+                                            predicted_app = pred.app_name.as_str(),
+                                            prob = pred.probability,
+                                            time_to_switch = time_to_switch,
+                                            "freeze_intelligence: universal pre-thaw — switch imminent"
+                                        );
+                                    }
+                                }
+                                write_frozen_state(&frozen_state_path, &frozen_guard);
+                            }
                         }
                     }
                 }
@@ -4699,12 +4751,14 @@ fn main() -> anyhow::Result<()> {
                                 apollo_optimizer::engine::chromium_manager::ChromiumManager::thaw_renderer(*pid);
                                 state.frozen_state.lock_recover().remove(pid);
                                 // NARS belief update: observe whether renderer survived freeze.
+                                // Pass the full process name — FreezeIntelligence.classify()
+                                // maps it to the correct category ("chromium-renderer" etc.)
+                                // so evidence accumulates across all renderers of the same type.
                                 // Alive after thaw = success (0.3 salience). Dead = failure (0.8).
                                 // [Pei Wang 2013] Revision rule accumulates evidence over time.
-                                let browser = apollo_optimizer::engine::chromium_manager::ChromiumManager::browser_name(name.as_str()).to_string();
                                 let alive = proc_snaps.iter().any(|p| p.pid == *pid);
                                 chromium_mgr.observe_freeze_outcome(
-                                    &browser,
+                                    name.as_str(),
                                     alive,
                                     if alive { 0.3 } else { 0.8 },
                                 );

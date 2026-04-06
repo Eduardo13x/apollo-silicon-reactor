@@ -571,6 +571,59 @@ fn render_intelligence(status: &DaemonStatus) -> Vec<String> {
         lines.push(format!("KPC: {}", score_label));
     }
 
+    // ── Neurocognitive Health (UCHS) ──────────────────────────────────────
+    if m.uchs_composite > 0.0 {
+        let grade_color = match m.uchs_grade.as_str() {
+            "S+" | "S" => green(&m.uchs_grade),
+            "A" => green(&m.uchs_grade),
+            "B" => yellow(&m.uchs_grade),
+            _ => red(&m.uchs_grade),
+        };
+        let recovery = if m.uchs_recovery_mode {
+            red(" RECOVERY")
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "UCHS: {:.1}% {} {}{}",
+            m.uchs_composite * 100.0,
+            grade_color,
+            dim(&format!(
+                "meta={:.0}% snr={:.1} eval={:.0}% adv={:.0}%",
+                m.meta_confidence * 100.0,
+                m.cognitive_snr,
+                m.self_eval_quality * 100.0,
+                m.adversarial_pass_rate * 100.0,
+            )),
+            recovery,
+        ));
+        if m.epistemic_uncertainty > 0.40 {
+            let ep_label = match m.epistemic_level.as_str() {
+                "OBSERVE-ONLY" => red(&m.epistemic_level),
+                "HIGH" => yellow(&m.epistemic_level),
+                _ => dim(&m.epistemic_level),
+            };
+            lines.push(format!(
+                "Epistemic: {} ({:.0}%)",
+                ep_label,
+                m.epistemic_uncertainty * 100.0,
+            ));
+        }
+        if m.humble_mode {
+            lines.push(yellow("MetaCognition: HUMBLE MODE (2× exploration)").to_string());
+        }
+        if m.drift_early_warning > 0.05 {
+            lines.push(format!(
+                "Drift Early Warning: {} ({:.3})",
+                yellow("ACTIVE"),
+                m.drift_early_warning,
+            ));
+        }
+        if m.adversarial_safety_alert {
+            lines.push(red("⚠ COGNITIVE SAFETY ALERT — adversarial pass rate < 75%").to_string());
+        }
+    }
+
     // Wakeup vampires: battery drain daemons
     if !m.wakeup_vampires.is_empty() {
         lines.push(format!(

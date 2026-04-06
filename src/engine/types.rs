@@ -997,6 +997,47 @@ pub struct RuntimeMetrics {
     /// Names of browsers/apps with managed renderers.
     #[serde(default)]
     pub chromium_browsers_managed: Vec<String>,
+
+    // ── Neurocognitive v2.0 (UCHS) ─────────────────────────────────────────
+    /// Unified Cognitive Health Score [0,1]. 6 dimensions.
+    #[serde(default)]
+    pub uchs_composite: f32,
+    /// UCHS grade label (S+, S, A, B, C, D, F).
+    #[serde(default)]
+    pub uchs_grade: String,
+    /// Whether cognitive recovery mode is active.
+    #[serde(default)]
+    pub uchs_recovery_mode: bool,
+    /// Epistemic uncertainty composite [0,1].
+    #[serde(default)]
+    pub epistemic_uncertainty: f32,
+    /// Epistemic uncertainty level label.
+    #[serde(default)]
+    pub epistemic_level: String,
+    /// MetaCognition meta_confidence [0,1].
+    #[serde(default)]
+    pub meta_confidence: f32,
+    /// MetaCognition humble mode active.
+    #[serde(default)]
+    pub humble_mode: bool,
+    /// AdversarialProbe pass rate [0,1].
+    #[serde(default)]
+    pub adversarial_pass_rate: f32,
+    /// AdversarialProbe safety alert active.
+    #[serde(default)]
+    pub adversarial_safety_alert: bool,
+    /// CognitiveRewardBus signal-to-noise.
+    #[serde(default)]
+    pub cognitive_snr: f64,
+    /// SelfRewardingEvaluator mean quality [0,1].
+    #[serde(default)]
+    pub self_eval_quality: f32,
+    /// ReptileMeta cached workload count.
+    #[serde(default)]
+    pub reptile_cached_workloads: usize,
+    /// DriftDetector early warning score [0,1].
+    #[serde(default)]
+    pub drift_early_warning: f64,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.
