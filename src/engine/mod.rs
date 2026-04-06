@@ -78,6 +78,7 @@ pub mod process_recovery;
 pub mod process_tree;
 pub mod profile_governor;
 pub mod protocol;
+pub mod reptile_meta;
 pub mod rl_threshold;
 pub mod rosetta_monitor;
 pub mod safety;
