@@ -219,7 +219,8 @@ impl SignalIntelligence {
         self.kpc_ipc = ipc;
         if ipc > 0.0 {
             let scale = (ipc / 1.0).clamp(0.5, 2.0);
-            self.kf_pressure.set_measurement_noise(self.kf_pressure_base_r * scale);
+            self.kf_pressure
+                .set_measurement_noise(self.kf_pressure_base_r * scale);
         }
     }
 
@@ -297,8 +298,10 @@ impl SignalIntelligence {
         const UTIL_ALPHA: f64 = 0.05;
         const UTIL_THRESHOLD: f64 = 0.15;
 
-        let mid_entry = (self.learned_mid_entry + self.energy_bias + self.neuro_serotonin_shift).clamp(0.15, 0.45);
-        let high_entry = (self.learned_high_entry + self.energy_bias + self.neuro_serotonin_shift).clamp(0.30, 0.65);
+        let mid_entry = (self.learned_mid_entry + self.energy_bias + self.neuro_serotonin_shift)
+            .clamp(0.15, 0.45);
+        let high_entry = (self.learned_high_entry + self.energy_bias + self.neuro_serotonin_shift)
+            .clamp(0.30, 0.65);
         let all_heavy = pressure_smooth >= high_entry;
         let mid_zone = !all_heavy && pressure_smooth >= mid_entry;
         // In mid zone, per-subsystem gate; in high zone, always run.
@@ -393,7 +396,11 @@ impl SignalIntelligence {
         // ── Update utility EMAs ──────────────────────────────────────────
         // "Actionable" = non-trivial signal that could influence decisions.
         if run_entropy {
-            let useful = if entropy_anomaly.abs() > 0.5 { 1.0 } else { 0.0 };
+            let useful = if entropy_anomaly.abs() > 0.5 {
+                1.0
+            } else {
+                0.0
+            };
             self.utility_entropy += UTIL_ALPHA * (useful - self.utility_entropy);
         }
         if run_hazard {
@@ -483,7 +490,12 @@ impl SignalIntelligence {
     /// Per-subsystem utility scores (budget cognitivo).
     /// Returns [entropy, hazard, lotka, mpc] — each in 0–1.
     pub fn subsystem_utilities(&self) -> [f64; 4] {
-        [self.utility_entropy, self.utility_hazard, self.utility_lotka, self.utility_mpc]
+        [
+            self.utility_entropy,
+            self.utility_hazard,
+            self.utility_lotka,
+            self.utility_mpc,
+        ]
     }
 
     /// Lifelong learning: adjust zone thresholds based on outcome feedback.
@@ -494,20 +506,24 @@ impl SignalIntelligence {
     /// If actions at low pressure are wasteful, raise mid_entry (skip more).
     /// If actions at moderate pressure are effective, lower thresholds (engage earlier).
     pub fn zone_feedback(&mut self, pressure_at_action: f64, was_effective: bool) {
-        const ZONE_ALPHA: f64 = 0.005; // very slow adaptation
+        self.zone_feedback_with_alpha(pressure_at_action, was_effective, 0.005);
+    }
 
+    /// Zone feedback with explicit alpha (used by LearnableParams auto-tuning).
+    pub fn zone_feedback_with_alpha(
+        &mut self,
+        pressure_at_action: f64,
+        was_effective: bool,
+        zone_alpha: f64,
+    ) {
         if was_effective && pressure_at_action < self.learned_mid_entry + 0.05 {
             // Effective action near the mid_entry boundary → lower it (engage earlier).
-            self.learned_mid_entry =
-                (self.learned_mid_entry - ZONE_ALPHA).clamp(0.20, 0.40);
-            self.learned_high_entry =
-                (self.learned_high_entry - ZONE_ALPHA).clamp(0.35, 0.60);
+            self.learned_mid_entry = (self.learned_mid_entry - zone_alpha).clamp(0.20, 0.40);
+            self.learned_high_entry = (self.learned_high_entry - zone_alpha).clamp(0.35, 0.60);
         } else if !was_effective && pressure_at_action < self.learned_high_entry {
             // Ineffective action below high_entry → raise thresholds (be more conservative).
-            self.learned_mid_entry =
-                (self.learned_mid_entry + ZONE_ALPHA).clamp(0.20, 0.40);
-            self.learned_high_entry =
-                (self.learned_high_entry + ZONE_ALPHA).clamp(0.35, 0.60);
+            self.learned_mid_entry = (self.learned_mid_entry + zone_alpha).clamp(0.20, 0.40);
+            self.learned_high_entry = (self.learned_high_entry + zone_alpha).clamp(0.35, 0.60);
         }
     }
 
@@ -548,7 +564,10 @@ impl SignalIntelligence {
     ///
     /// Heavy workloads (Coding, VideoEdit) spike pressure fast — engage 2pp earlier.
     /// Clamps combined bias to -0.15 to prevent over-engagement.
-    pub fn adjust_bias_for_workload(&mut self, workload: crate::engine::user_profile::WorkloadType) {
+    pub fn adjust_bias_for_workload(
+        &mut self,
+        workload: crate::engine::user_profile::WorkloadType,
+    ) {
         use crate::engine::user_profile::WorkloadType;
         let workload_nudge = match workload {
             WorkloadType::Coding | WorkloadType::VideoEdit => -0.02,
@@ -672,9 +691,15 @@ pub struct SignalIntelligencePersisted {
     pub kf_swap: Option<Kalman1D>,
 }
 
-fn default_mid_entry() -> f64 { 0.30 }
-fn default_high_entry() -> f64 { 0.50 }
-fn default_utility() -> f64 { 0.5 }
+fn default_mid_entry() -> f64 {
+    0.30
+}
+fn default_high_entry() -> f64 {
+    0.50
+}
+fn default_utility() -> f64 {
+    0.5
+}
 
 /// Score compuesto de urgencia, combinación ponderada de todas las señales.
 fn compute_urgency(
@@ -844,14 +869,31 @@ mod tests {
         let mut si = SignalIntelligence::new();
         // Low pressure: heavy modules should produce zeroed outputs.
         let d = si.tick(
-            0.15, 10.0, 0.01, 0.05,
-            &[5.0, 3.0], &[100e6, 50e6],
-            "idle_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+            0.15,
+            10.0,
+            0.01,
+            0.05,
+            &[5.0, 3.0],
+            &[100e6, 50e6],
+            "idle_app",
+            100_000_000,
+            500_000_000,
+            8_000_000_000,
+            0.5,
         );
-        assert_eq!(d.entropy_anomaly, 0.0, "entropy should be skipped at low pressure");
+        assert_eq!(
+            d.entropy_anomaly, 0.0,
+            "entropy should be skipped at low pressure"
+        );
         assert_eq!(d.p_oom_30s, 0.0, "hazard should be skipped at low pressure");
-        assert_eq!(d.monopoly_risk, 0.0, "lotka-volterra should be skipped at low pressure");
-        assert_eq!(d.mpc_recommendation, 0, "MPC should be skipped at low pressure");
+        assert_eq!(
+            d.monopoly_risk, 0.0,
+            "lotka-volterra should be skipped at low pressure"
+        );
+        assert_eq!(
+            d.mpc_recommendation, 0,
+            "MPC should be skipped at low pressure"
+        );
         // But Kalman should still work.
         assert!(d.pressure_smooth > 0.0, "Kalman must always run");
     }
@@ -867,10 +909,16 @@ mod tests {
         // At high pressure, hazard and MPC should produce non-trivial values.
         // p_oom_30s may be 0 if hazard hasn't seen events, but it should have run.
         // MPC should produce a recommendation (possibly Observe=0, but the path executed).
-        assert!(d.pressure_smooth > 0.40, "pressure should be high enough for deep mode");
+        assert!(
+            d.pressure_smooth > 0.40,
+            "pressure should be high enough for deep mode"
+        );
         // Entropy updates with real data — score may be 0 but the path ran.
         // Key check: urgency should be non-trivial with all subsystems engaged.
-        assert!(d.urgency > 0.15, "urgency should be meaningful at 0.80 pressure");
+        assert!(
+            d.urgency > 0.15,
+            "urgency should be meaningful at 0.80 pressure"
+        );
     }
 
     #[test]
@@ -925,9 +973,17 @@ mod tests {
         // No record_overflow() calls → hazard base_rate stays 0 → p_oom ≈ 0.
         for _ in 0..200 {
             si.tick(
-                0.55, 10.0, 0.01, 0.05,
-                &[5.0, 3.0], &[100e6, 50e6],
-                "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+                0.55,
+                10.0,
+                0.01,
+                0.05,
+                &[5.0, 3.0],
+                &[100e6, 50e6],
+                "calm_app",
+                100_000_000,
+                500_000_000,
+                8_000_000_000,
+                0.5,
             );
         }
         let after_hazard = si.subsystem_utilities()[1];
@@ -948,20 +1004,39 @@ mod tests {
         // Warm up Kalman to mid-zone (~0.35).
         for _ in 0..30 {
             si.tick(
-                0.35, 10.0, 0.01, 0.05,
-                &[5.0, 3.0], &[100e6, 50e6],
-                "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+                0.35,
+                10.0,
+                0.01,
+                0.05,
+                &[5.0, 3.0],
+                &[100e6, 50e6],
+                "calm_app",
+                100_000_000,
+                500_000_000,
+                8_000_000_000,
+                0.5,
             );
         }
 
         let d = si.tick(
-            0.35, 10.0, 0.01, 0.05,
-            &[5.0, 3.0], &[100e6, 50e6],
-            "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+            0.35,
+            10.0,
+            0.01,
+            0.05,
+            &[5.0, 3.0],
+            &[100e6, 50e6],
+            "calm_app",
+            100_000_000,
+            500_000_000,
+            8_000_000_000,
+            0.5,
         );
         // Low-utility subsystems should be skipped in mid zone.
         assert_eq!(d.mpc_recommendation, 0, "MPC should be skipped (utility=0)");
-        assert_eq!(d.entropy_anomaly, 0.0, "Entropy should be skipped (utility=0)");
+        assert_eq!(
+            d.entropy_anomaly, 0.0,
+            "Entropy should be skipped (utility=0)"
+        );
     }
 
     // ── Energy-aware routing tests ──────────────────────────────────────────
@@ -975,19 +1050,41 @@ mod tests {
         // Warm up Kalman to 0.40 — normally mid-zone, but with bias it's LOW zone.
         for _ in 0..30 {
             si.tick(
-                0.40, 10.0, 0.01, 0.05,
-                &[5.0, 3.0], &[100e6, 50e6],
-                "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+                0.40,
+                10.0,
+                0.01,
+                0.05,
+                &[5.0, 3.0],
+                &[100e6, 50e6],
+                "calm_app",
+                100_000_000,
+                500_000_000,
+                8_000_000_000,
+                0.5,
             );
         }
         let d = si.tick(
-            0.40, 10.0, 0.01, 0.05,
-            &[5.0, 3.0], &[100e6, 50e6],
-            "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+            0.40,
+            10.0,
+            0.01,
+            0.05,
+            &[5.0, 3.0],
+            &[100e6, 50e6],
+            "calm_app",
+            100_000_000,
+            500_000_000,
+            8_000_000_000,
+            0.5,
         );
         // At 0.40 with bias +0.15, we're below mid_entry (0.45) → skip all heavy.
-        assert_eq!(d.entropy_anomaly, 0.0, "entropy skipped on low battery at 0.40");
-        assert_eq!(d.mpc_recommendation, 0, "MPC skipped on low battery at 0.40");
+        assert_eq!(
+            d.entropy_anomaly, 0.0,
+            "entropy skipped on low battery at 0.40"
+        );
+        assert_eq!(
+            d.mpc_recommendation, 0,
+            "MPC skipped on low battery at 0.40"
+        );
     }
 
     #[test]
@@ -999,19 +1096,39 @@ mod tests {
         // Warm up Kalman to 0.35 — normally low zone, but with thermal bias it's HIGH zone.
         for _ in 0..30 {
             si.tick(
-                0.38, 10.0, 0.01, 0.05,
-                &[5.0, 3.0], &[100e6, 50e6],
-                "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+                0.38,
+                10.0,
+                0.01,
+                0.05,
+                &[5.0, 3.0],
+                &[100e6, 50e6],
+                "calm_app",
+                100_000_000,
+                500_000_000,
+                8_000_000_000,
+                0.5,
             );
         }
         let d = si.tick(
-            0.38, 10.0, 0.01, 0.05,
-            &[5.0, 3.0], &[100e6, 50e6],
-            "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+            0.38,
+            10.0,
+            0.01,
+            0.05,
+            &[5.0, 3.0],
+            &[100e6, 50e6],
+            "calm_app",
+            100_000_000,
+            500_000_000,
+            8_000_000_000,
+            0.5,
         );
         // At 0.38 with bias -0.15, high_entry=0.35, so we're in ALL_HEAVY zone.
         // Kalman smoothed pressure should be ~0.38 > 0.35.
-        assert!(d.pressure_smooth > 0.34, "pressure should be near 0.38: {}", d.pressure_smooth);
+        assert!(
+            d.pressure_smooth > 0.34,
+            "pressure should be near 0.38: {}",
+            d.pressure_smooth
+        );
     }
 
     #[test]
@@ -1033,8 +1150,18 @@ mod tests {
             si.zone_feedback(0.32, true); // near 0.30 mid_entry
         }
         let (mid_after, high_after) = si.learned_zones();
-        assert!(mid_after < mid_before, "mid_entry should decrease: {} < {}", mid_after, mid_before);
-        assert!(high_after < high_before, "high_entry should decrease: {} < {}", high_after, high_before);
+        assert!(
+            mid_after < mid_before,
+            "mid_entry should decrease: {} < {}",
+            mid_after,
+            mid_before
+        );
+        assert!(
+            high_after < high_before,
+            "high_entry should decrease: {} < {}",
+            high_after,
+            high_before
+        );
     }
 
     #[test]
@@ -1047,7 +1174,12 @@ mod tests {
             si.zone_feedback(0.40, false); // below 0.50 high_entry
         }
         let (mid_after, _) = si.learned_zones();
-        assert!(mid_after > mid_before, "mid_entry should increase: {} > {}", mid_after, mid_before);
+        assert!(
+            mid_after > mid_before,
+            "mid_entry should increase: {} > {}",
+            mid_after,
+            mid_before
+        );
     }
 
     #[test]
@@ -1072,21 +1204,66 @@ mod tests {
         let mut si = SignalIntelligence::new();
         // Warm up Kalman with a stable baseline.
         for _ in 0..10 {
-            si.tick(0.55, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app", 500_000_000, 2_000_000_000, 8_000_000_000, 0.5);
+            si.tick(
+                0.55,
+                0.0,
+                0.05,
+                0.1,
+                &[10.0],
+                &[500e6],
+                "app",
+                500_000_000,
+                2_000_000_000,
+                8_000_000_000,
+                0.5,
+            );
         }
         // Now simulate pressure rising at ~0.010/s (0.005 per 0.5s tick).
         // After 20 ticks (~10s), pressure is at 0.65. Velocity ≈ 0.010/s.
         // 30s ahead: 0.65 + 0.010*30 = 0.95 (overflow territory).
         // 5s ahead: 0.65 + 0.010*5 = 0.70 (still below common bg_pressure ~0.72).
-        let mut last = SignalDigest { pressure_smooth: 0.0, pressure_velocity: 0.0, pressure_predicted_5s: 0.0, pressure_predicted_30s: 0.0, swap_velocity_smooth: 0.0, pressure_integral: 0.0, regime_shift_up: false, regime_shift_down: false, cusum_score: 0.0, entropy_anomaly: 0.0, p_oom_30s: 0.0, monopoly_risk: 0.0, mpc_recommendation: 0, urgency: 0.0, transformer_anomaly: 0.0, memory_scan_available: false, fluidity_score: 1.0, window_op_active: false, app_launching: false };
+        let mut last = SignalDigest {
+            pressure_smooth: 0.0,
+            pressure_velocity: 0.0,
+            pressure_predicted_5s: 0.0,
+            pressure_predicted_30s: 0.0,
+            swap_velocity_smooth: 0.0,
+            pressure_integral: 0.0,
+            regime_shift_up: false,
+            regime_shift_down: false,
+            cusum_score: 0.0,
+            entropy_anomaly: 0.0,
+            p_oom_30s: 0.0,
+            monopoly_risk: 0.0,
+            mpc_recommendation: 0,
+            urgency: 0.0,
+            transformer_anomaly: 0.0,
+            memory_scan_available: false,
+            fluidity_score: 1.0,
+            window_op_active: false,
+            app_launching: false,
+        };
         for i in 0..20 {
             let pressure = 0.55 + i as f64 * 0.005;
-            last = si.tick(pressure, 0.0, 0.05, 0.1, &[15.0], &[500e6], "app", 500_000_000, 2_000_000_000, 8_000_000_000, 0.5);
+            last = si.tick(
+                pressure,
+                0.0,
+                0.05,
+                0.1,
+                &[15.0],
+                &[500e6],
+                "app",
+                500_000_000,
+                2_000_000_000,
+                8_000_000_000,
+                0.5,
+            );
         }
         assert!(
             last.pressure_predicted_30s > last.pressure_predicted_5s,
             "30s prediction ({:.3}) must exceed 5s prediction ({:.3})",
-            last.pressure_predicted_30s, last.pressure_predicted_5s
+            last.pressure_predicted_30s,
+            last.pressure_predicted_5s
         );
         // The proactive predictor should fire: 30s projection above ~0.82 (bg_pressure - 0.05)
         // while current smooth pressure is still below ~0.75 (bg_pressure - 0.08 ≈ 0.72).
@@ -1120,7 +1297,11 @@ mod tests {
         let start = std::time::Instant::now();
         let mut rmse_history = Vec::with_capacity(200);
         for i in 0..200usize {
-            let true_val = if i < 100 { 0.50 + i as f64 * 0.003 } else { 0.80 - (i - 100) as f64 * 0.003 };
+            let true_val = if i < 100 {
+                0.50 + i as f64 * 0.003
+            } else {
+                0.80 - (i - 100) as f64 * 0.003
+            };
             let noisy = (true_val + noise[i % noise.len()]).clamp(0.0, 1.0);
             kf.update(noisy, 0.5);
             if i > 10 {
@@ -1131,13 +1312,24 @@ mod tests {
         let rmse = (rmse_history.iter().sum::<f64>() / rmse_history.len() as f64).sqrt();
 
         eprintln!("Kalman 200 updates: {:?}, RMSE: {:.4}", elapsed, rmse);
-        assert!(elapsed.as_micros() < 500, "Kalman 200 updates too slow: {:?}", elapsed);
+        assert!(
+            elapsed.as_micros() < 500,
+            "Kalman 200 updates too slow: {:?}",
+            elapsed
+        );
         // Riccati floor for Q=0.005, R=0.02: P* ≈ 0.0078 → RMSE ≈ 0.088
-        assert!(rmse < 0.12, "Kalman RMSE {:.4} exceeds threshold — filter not converging", rmse);
+        assert!(
+            rmse < 0.12,
+            "Kalman RMSE {:.4} exceeds threshold — filter not converging",
+            rmse
+        );
         // Convergence: RMSE after warmup should reflect steady-state, not transient
         let early_rmse = rmse_history[..5].iter().sum::<f64>().sqrt();
-        let late_rmse = (rmse_history[rmse_history.len()-5..].iter().sum::<f64>() / 5.0).sqrt();
-        eprintln!("  Early RMSE: {:.4}, Late RMSE: {:.4}", early_rmse, late_rmse);
+        let late_rmse = (rmse_history[rmse_history.len() - 5..].iter().sum::<f64>() / 5.0).sqrt();
+        eprintln!(
+            "  Early RMSE: {:.4}, Late RMSE: {:.4}",
+            early_rmse, late_rmse
+        );
     }
 
     /// CUSUM detection latency: verify regime shifts are detected within 4 cycles.
@@ -1164,10 +1356,24 @@ mod tests {
             }
         }
         let elapsed = start.elapsed();
-        eprintln!("CUSUM detection at cycle {:?}, time {:?}", detected_at, elapsed);
-        assert!(detected_at.is_some(), "CUSUM failed to detect +0.20 regime shift");
-        assert!(detected_at.unwrap() <= 4, "CUSUM took {} cycles (expected ≤4)", detected_at.unwrap());
-        assert!(elapsed.as_micros() < 50, "CUSUM 10 updates too slow: {:?}", elapsed);
+        eprintln!(
+            "CUSUM detection at cycle {:?}, time {:?}",
+            detected_at, elapsed
+        );
+        assert!(
+            detected_at.is_some(),
+            "CUSUM failed to detect +0.20 regime shift"
+        );
+        assert!(
+            detected_at.unwrap() <= 4,
+            "CUSUM took {} cycles (expected ≤4)",
+            detected_at.unwrap()
+        );
+        assert!(
+            elapsed.as_micros() < 50,
+            "CUSUM 10 updates too slow: {:?}",
+            elapsed
+        );
     }
 
     /// Full SignalIntelligence tick throughput: 100 ticks must complete < 10ms.
@@ -1181,14 +1387,26 @@ mod tests {
         for i in 0..100 {
             let pressure = 0.50 + (i as f64 * 0.003).sin() * 0.15;
             let _ = si.tick(
-                pressure, 1024.0, 0.3, 0.4,
-                &cpu_vals, &mem_vals,
-                "app", 500_000_000, 2_000_000_000, 8_000_000_000, 0.5,
+                pressure,
+                1024.0,
+                0.3,
+                0.4,
+                &cpu_vals,
+                &mem_vals,
+                "app",
+                500_000_000,
+                2_000_000_000,
+                8_000_000_000,
+                0.5,
             );
         }
         let elapsed = start.elapsed();
         eprintln!("SignalIntelligence 100 ticks: {:?}", elapsed);
-        assert!(elapsed.as_millis() < 10, "100 signal ticks too slow: {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 10,
+            "100 signal ticks too slow: {:?}",
+            elapsed
+        );
     }
 
     /// Hazard model calibration speed: 200 event records + 6 predictions < 1ms.
@@ -1205,18 +1423,30 @@ mod tests {
         }
         // 6 predictions at different pressure levels
         let pressures = [0.30f64, 0.45, 0.55, 0.65, 0.75, 0.85];
-        let p_ooms: Vec<f64> = pressures.iter().map(|&p| {
-            let f = HazardModel::risk_features(p, 0.003, p * 0.7, p * 0.6);
-            hazard.probability_oom(&f, 30.0)
-        }).collect();
+        let p_ooms: Vec<f64> = pressures
+            .iter()
+            .map(|&p| {
+                let f = HazardModel::risk_features(p, 0.003, p * 0.7, p * 0.6);
+                hazard.probability_oom(&f, 30.0)
+            })
+            .collect();
         let elapsed = start.elapsed();
         eprintln!("Hazard 200 records + 6 predictions: {:?}", elapsed);
         // 5ms budget: 200 Cox-regression updates + 6 predictions. Debug builds are ~5×
         // slower than release; give generous headroom for CI and debug runs.
-        assert!(elapsed.as_millis() < 5, "Hazard calibration too slow: {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 5,
+            "Hazard calibration too slow: {:?}",
+            elapsed
+        );
         // Monotonicity: higher pressure → higher p_oom
         for w in p_ooms.windows(2) {
-            assert!(w[0] <= w[1], "Hazard non-monotonic: p_oom[i]={:.4} > p_oom[i+1]={:.4}", w[0], w[1]);
+            assert!(
+                w[0] <= w[1],
+                "Hazard non-monotonic: p_oom[i]={:.4} > p_oom[i+1]={:.4}",
+                w[0],
+                w[1]
+            );
         }
     }
 
@@ -1237,16 +1467,52 @@ mod tests {
         }
         let elapsed = start.elapsed();
         eprintln!("Entropy 500 updates: {:?}", elapsed);
-        assert!(elapsed.as_millis() < 5, "Entropy 500 updates too slow: {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 5,
+            "Entropy 500 updates too slow: {:?}",
+            elapsed
+        );
     }
 
     /// Stable signal → 30s projection should stay close to current value.
     #[test]
     fn proactive_30s_stable_signal_no_false_alarm() {
         let mut si = SignalIntelligence::new();
-        let mut last = SignalDigest { pressure_smooth: 0.0, pressure_velocity: 0.0, pressure_predicted_5s: 0.0, pressure_predicted_30s: 0.0, swap_velocity_smooth: 0.0, pressure_integral: 0.0, regime_shift_up: false, regime_shift_down: false, cusum_score: 0.0, entropy_anomaly: 0.0, p_oom_30s: 0.0, monopoly_risk: 0.0, mpc_recommendation: 0, urgency: 0.0, transformer_anomaly: 0.0, memory_scan_available: false, fluidity_score: 1.0, window_op_active: false, app_launching: false };
+        let mut last = SignalDigest {
+            pressure_smooth: 0.0,
+            pressure_velocity: 0.0,
+            pressure_predicted_5s: 0.0,
+            pressure_predicted_30s: 0.0,
+            swap_velocity_smooth: 0.0,
+            pressure_integral: 0.0,
+            regime_shift_up: false,
+            regime_shift_down: false,
+            cusum_score: 0.0,
+            entropy_anomaly: 0.0,
+            p_oom_30s: 0.0,
+            monopoly_risk: 0.0,
+            mpc_recommendation: 0,
+            urgency: 0.0,
+            transformer_anomaly: 0.0,
+            memory_scan_available: false,
+            fluidity_score: 1.0,
+            window_op_active: false,
+            app_launching: false,
+        };
         for _ in 0..30 {
-            last = si.tick(0.50, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app", 500_000_000, 2_000_000_000, 8_000_000_000, 0.5);
+            last = si.tick(
+                0.50,
+                0.0,
+                0.05,
+                0.1,
+                &[10.0],
+                &[500e6],
+                "app",
+                500_000_000,
+                2_000_000_000,
+                8_000_000_000,
+                0.5,
+            );
         }
         // Stable signal: 30s projection should be near 0.50 — no false proactive trigger.
         assert!(
@@ -1293,10 +1559,16 @@ mod tests {
             tick_stressed(&mut si, 0.99);
         }
         let d = tick_stressed(&mut si, 0.99);
-        assert!(d.pressure_integral <= 5.0,
-            "integral {} should be bounded at 5.0", d.pressure_integral);
-        assert!(d.pressure_integral >= -5.0,
-            "integral {} should be bounded at -5.0", d.pressure_integral);
+        assert!(
+            d.pressure_integral <= 5.0,
+            "integral {} should be bounded at 5.0",
+            d.pressure_integral
+        );
+        assert!(
+            d.pressure_integral >= -5.0,
+            "integral {} should be bounded at -5.0",
+            d.pressure_integral
+        );
     }
 
     /// Urgency at boundary pressure values must be monotonically increasing.
@@ -1309,7 +1581,9 @@ mod tests {
             assert!(
                 u >= prev_urgency,
                 "urgency not monotonic: p={}, urgency={}, prev={}",
-                p, u, prev_urgency
+                p,
+                u,
+                prev_urgency
             );
             prev_urgency = u;
         }

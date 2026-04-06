@@ -18,21 +18,21 @@
 //! 9. **Predictive agent** — observe pressure outcome, MPC feedback
 //! 10. **Periodic persist (% 100)** — flush pipeline, persist signal/state/skills, causal edge learning
 
-use apollo_optimizer::collector::SystemSnapshot;
 use apollo_optimizer::collector::SystemCollector;
+use apollo_optimizer::collector::SystemSnapshot;
+use apollo_optimizer::engine::daemon_helpers::{hop_groups_path, signal_intelligence_path};
+use apollo_optimizer::engine::daemon_state::SharedState;
+use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_optimizer::engine::execute_actions::ExecuteOutcomes;
 use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
-use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningPipeline};
 use apollo_optimizer::engine::learned_state::{LearnedState, RestoreQualityMonitor};
+use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningPipeline};
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::nars_belief::{ArousalState, Salience};
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
-use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_optimizer::engine::signal_intelligence::SignalDigest;
 use apollo_optimizer::engine::types::{FrozenPidEntry, FrozenStatePersisted};
 use apollo_optimizer::engine::workload_classifier::WorkloadMode;
-use apollo_optimizer::engine::daemon_helpers::{hop_groups_path, signal_intelligence_path};
-use apollo_optimizer::engine::daemon_state::SharedState;
 
 /// Run all per-cycle learning pipeline work.
 ///
@@ -120,7 +120,10 @@ pub fn run_learning_tick<'a>(
             // Capture swap context for affective salience weighting.
             // High swap at throttle time → high arousal → stronger NARS belief.
             lctx.outcome_tracker.record_throttle_with_swap(
-                name, mem_pressure_now, proc_watts, swap_gb_now,
+                name,
+                mem_pressure_now,
+                proc_watts,
+                swap_gb_now,
             );
         }
     }
@@ -134,7 +137,9 @@ pub fn run_learning_tick<'a>(
         let swap_mb_now = snapshot.pressure.swap_used_bytes as f32 / 1_048_576.0;
         for name in throttle_names_for_outcome {
             // Build per-process resource snapshot for mechanism attribution.
-            let res = snapshot.top_processes.iter()
+            let res = snapshot
+                .top_processes
+                .iter()
                 .find(|p| &p.name == name)
                 .map(|p| ResourceSnapshot {
                     rss_mb: p.memory_usage as f32 / 1_048_576.0,
@@ -168,20 +173,22 @@ pub fn run_learning_tick<'a>(
         // Evaluate pending actions with current resource snapshot.
         // Both fast (3-cycle) and slow (15-cycle) horizons are evaluated.
         let current_res = ResourceSnapshot {
-            rss_mb: snapshot.top_processes.iter()
+            rss_mb: snapshot
+                .top_processes
+                .iter()
                 .map(|p| p.memory_usage as f32 / 1_048_576.0)
                 .sum(),
-            cpu_pct: snapshot.top_processes.iter()
-                .map(|p| p.cpu_usage)
-                .sum(),
+            cpu_pct: snapshot.top_processes.iter().map(|p| p.cpu_usage).sum(),
             swap_mb: swap_mb_now,
         };
-        lctx.causal_graph.evaluate_with_resources(pressure_now, cycle_count, &current_res);
+        lctx.causal_graph
+            .evaluate_with_resources(pressure_now, cycle_count, &current_res);
     }
 
     // ── Causal graph: process co-occurrence at high pressure ─────────────────
     if snapshot.pressure.memory_pressure >= 0.60 {
-        let active: Vec<String> = snapshot.top_processes
+        let active: Vec<String> = snapshot
+            .top_processes
             .iter()
             .take(10)
             .map(|p| p.name.clone())
@@ -201,7 +208,8 @@ pub fn run_learning_tick<'a>(
     {
         let batch = lctx.outcome_tracker.tick(snapshot.pressure.memory_pressure);
         if batch.savings_watts > 0.0 {
-            lctx.energy_tracker.record_savings(batch.savings_watts, 30.0);
+            lctx.energy_tracker
+                .record_savings(batch.savings_watts, 30.0);
         }
         // Cable 1: causal_effect() → correct PatternWeight using real causal signal.
         // For each effective throttle, check if the drop was truly caused by the
@@ -214,16 +222,26 @@ pub fn run_learning_tick<'a>(
             // already explains the drop (faster 3-cycle attribution).
             if drift > 0.01 || short_velocity > 0.01 {
                 // Pre-compute causal effects per process before mutating weights.
-                let demotions: Vec<String> = batch.effective_names.iter().filter_map(|name| {
-                    let avg_drop = lctx.outcome_tracker.experience
-                        .query_similar(name, snapshot.pressure.memory_pressure)
-                        .map(|(drop, _)| drop)
-                        .unwrap_or(0.05);
-                    let causal_long = lctx.outcome_tracker.causal_effect(avg_drop);
-                    let causal_fast = lctx.outcome_tracker.causal_effect_fast(avg_drop);
-                    // Demote if EITHER signal says natural drift explains the drop.
-                    if causal_long < 0.005 || causal_fast < 0.005 { Some(name.clone()) } else { None }
-                }).collect();
+                let demotions: Vec<String> = batch
+                    .effective_names
+                    .iter()
+                    .filter_map(|name| {
+                        let avg_drop = lctx
+                            .outcome_tracker
+                            .experience
+                            .query_similar(name, snapshot.pressure.memory_pressure)
+                            .map(|(drop, _)| drop)
+                            .unwrap_or(0.05);
+                        let causal_long = lctx.outcome_tracker.causal_effect(avg_drop);
+                        let causal_fast = lctx.outcome_tracker.causal_effect_fast(avg_drop);
+                        // Demote if EITHER signal says natural drift explains the drop.
+                        if causal_long < 0.005 || causal_fast < 0.005 {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 // Roll back effective_count for drift-only "successes".
                 for name in &demotions {
                     if let Some(w) = lctx.outcome_tracker.weights.get_mut(name) {
@@ -241,11 +259,14 @@ pub fn run_learning_tick<'a>(
         // Threshold is Yerkes-Dodson adaptive: high arousal → 0.06 (hair-trigger),
         // low arousal → 0.10 (conservative). [Murphy 2012] §3.3 "reset toward prior".
         let recalib_threshold = arousal_state.adjusted_drift_threshold(0.08);
-        if lctx.outcome_tracker.nars_needs_recalibration_at(recalib_threshold) {
+        if lctx
+            .outcome_tracker
+            .nars_needs_recalibration_at(recalib_threshold)
+        {
             for w in lctx.outcome_tracker.weights.values_mut() {
                 // Soft decay: halve counts. Minimum 1 each to keep Laplace structure.
                 w.effective_count = (w.effective_count / 2).max(1);
-                w.throttle_count  = (w.throttle_count  / 2).max(2);
+                w.throttle_count = (w.throttle_count / 2).max(2);
             }
             lctx.outcome_tracker.nars_acknowledge_recalibration();
         }
@@ -254,7 +275,9 @@ pub fn run_learning_tick<'a>(
         if !batch.effective_names.is_empty() || !batch.low_value_names.is_empty() {
             let mut pg = state.policy.lock_recover();
             for (name, weight) in &lctx.outcome_tracker.weights {
-                pg.learned_policy.pattern_weights.insert(name.clone(), weight.clone());
+                pg.learned_policy
+                    .pattern_weights
+                    .insert(name.clone(), weight.clone());
             }
         }
         // Restore quality monitor: track post-restore effectiveness.
@@ -300,7 +323,8 @@ pub fn run_learning_tick<'a>(
         let effectiveness = lctx.outcome_tracker.overall_effectiveness();
         let pressure = signal_digest.pressure_smooth;
         if lctx.outcome_tracker.total_resolved > 10 {
-            lctx.signal_intel.zone_feedback(pressure, effectiveness > 0.50);
+            lctx.signal_intel
+                .zone_feedback(pressure, effectiveness > 0.50);
         }
     }
 
@@ -356,7 +380,8 @@ pub fn run_learning_tick<'a>(
     }
 
     // ── Predictive agent: observe outcome + MPC feedback ────────────────────
-    lctx.predictive_agent.observe_outcome(snapshot.pressure.memory_pressure);
+    lctx.predictive_agent
+        .observe_outcome(snapshot.pressure.memory_pressure);
     lctx.predictive_agent.maybe_persist();
     // MPC feedback: tell MPC what happened after its recommendation.
     lctx.signal_intel.mpc_feedback(
@@ -374,8 +399,10 @@ pub fn run_learning_tick<'a>(
             lctx.skill_registry,
             effectiveness_tracker,
         );
-        lctx.signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
-        lctx.outcome_tracker.persist_hop_groups(std::path::Path::new(hop_groups_path()));
+        lctx.signal_intel
+            .persist(std::path::Path::new(signal_intelligence_path()));
+        lctx.outcome_tracker
+            .persist_hop_groups(std::path::Path::new(hop_groups_path()));
         // Snapshot frozen state for unified persistence.
         let frozen_snap: FrozenStatePersisted = {
             let fg = state.frozen_state.lock_recover();
@@ -405,16 +432,22 @@ pub fn run_learning_tick<'a>(
             Some(arousal_state.clone()),
             Some(lctx.causal_graph),
             None, // process_baselines: persisted at shutdown via main.rs
+            None, // learnable_params: wired in Phase 2
         );
         // Causal graph observability: log solid/weak links discovered.
         let solid = lctx.causal_graph.solid_count();
         let total = lctx.causal_graph.edge_count();
         if total > 0 {
-            println!("lctx.causal_graph: {}/{} edges solid, {} pending",
-                solid, total, lctx.causal_graph.solid_edges().len());
+            println!(
+                "lctx.causal_graph: {}/{} edges solid, {} pending",
+                solid,
+                total,
+                lctx.causal_graph.solid_edges().len()
+            );
         }
         // Persist optimization skills (Hermes pattern).
-        lctx.skill_registry.persist(std::path::Path::new(skills_path));
+        lctx.skill_registry
+            .persist(std::path::Path::new(skills_path));
         // Learn skills from causal graph solid edges, ordered by impact.
         // solid_edges_by_impact() sorts by confidence×avg_delta so high-impact
         // actions (large pressure reduction) are learned with higher priority.
@@ -434,7 +467,8 @@ pub fn run_learning_tick<'a>(
                     "any",
                     vec![target.to_string()],
                 );
-                lctx.skill_registry.record_result(&edge.cause, edge.confidence > 0.5);
+                lctx.skill_registry
+                    .record_result(&edge.cause, edge.confidence > 0.5);
             }
         }
     }

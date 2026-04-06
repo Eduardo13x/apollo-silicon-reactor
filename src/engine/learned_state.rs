@@ -19,15 +19,262 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::engine::causal_graph::{CausalEdge, CausalGraph};
-use crate::engine::process_baseline::ProcessBaselineMap;
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
 use crate::engine::nars_belief::ArousalState;
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
 use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
 use crate::engine::overflow_guard::OverflowHistory;
 use crate::engine::predictive_agent::SpecialistAccuracyTracker;
+use crate::engine::process_baseline::ProcessBaselineMap;
 use crate::engine::signal_intelligence::{SignalIntelligence, SignalIntelligencePersisted};
 use crate::engine::types::FrozenStatePersisted;
+
+/// Adaptive parameters that replace hardcoded thresholds.
+///
+/// Every field has a safe default matching the original hardcoded value,
+/// a valid range enforced by `validate()`, and a learning pathway that
+/// adjusts it from outcome data.  Persisted via `LearnedState` so learned
+/// values survive daemon restarts.
+///
+/// ## Adding a new parameter
+/// 1. Add a `#[serde(default = "default_X")]` field here
+/// 2. Add a clamp rule in `LearnableParams::validate()`
+/// 3. Wire the consumer to read `learnable.X` instead of its hardcoded constant
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnableParams {
+    // ── Kalman filter tuning ──────────────────────────────────────────
+    /// Kalman measurement noise for pressure filter.
+    /// Lower = trusts measurements more. Auto-tuned from innovation variance.
+    #[serde(default = "lp_kalman_pressure_r")]
+    pub kalman_pressure_r: f64,
+
+    /// Kalman process noise for pressure filter.
+    #[serde(default = "lp_kalman_pressure_q")]
+    pub kalman_pressure_q: f64,
+
+    // ── RL state discretization ───────────────────────────────────────
+    /// Pressure band boundaries for Q-table state discretization.
+    /// Auto-tuned from pressure histogram quantiles (33rd/66th/90th).
+    #[serde(default = "lp_rl_pressure_bands")]
+    pub rl_pressure_bands: [f64; 3],
+
+    /// Compressor band boundaries for Q-table state discretization.
+    #[serde(default = "lp_rl_compressor_bands")]
+    pub rl_compressor_bands: [f64; 2],
+
+    // ── Zone learning ─────────────────────────────────────────────────
+    /// Zone feedback learning rate. Auto-tuned: halved on oscillation, doubled on stall.
+    #[serde(default = "lp_zone_alpha")]
+    pub zone_alpha: f64,
+
+    // ── Outcome tracker ───────────────────────────────────────────────
+    /// Seconds to wait before checking outcome (per-process adaptive in Phase 7).
+    #[serde(default = "lp_outcome_wait_secs")]
+    pub outcome_wait_secs: u64,
+
+    /// Minimum pressure drop to count as effective.
+    #[serde(default = "lp_outcome_effective_threshold")]
+    pub outcome_effective_threshold: f64,
+
+    /// Pressure similarity band for experience memory queries.
+    #[serde(default = "lp_experience_pressure_band")]
+    pub experience_pressure_band: f64,
+
+    // ── NARS belief system ────────────────────────────────────────────
+    /// Frequency shift threshold for drift detection.
+    #[serde(default = "lp_nars_drift_threshold")]
+    pub nars_drift_threshold: f64,
+
+    /// Per-persist confidence decay factor (Bayesian forgetting).
+    #[serde(default = "lp_nars_decay_factor")]
+    pub nars_decay_factor: f32,
+
+    // ── Signal intelligence ───────────────────────────────────────────
+    /// CUSUM drift magnitude parameter.
+    #[serde(default = "lp_cusum_k")]
+    pub cusum_k: f64,
+
+    /// CUSUM threshold parameter.
+    #[serde(default = "lp_cusum_h")]
+    pub cusum_h: f64,
+
+    /// PID target pressure (below = fine, above = error accumulates).
+    #[serde(default = "lp_pid_target")]
+    pub pid_target: f64,
+
+    /// PID leaky integrator decay (prevents windup).
+    #[serde(default = "lp_pid_decay")]
+    pub pid_decay: f64,
+
+    // ── Fluidity ──────────────────────────────────────────────────────
+    /// WindowServer CPU spike threshold (%).
+    #[serde(default = "lp_ws_spike_threshold")]
+    pub ws_spike_threshold: f32,
+
+    /// Fluidity degraded threshold (0–1).
+    #[serde(default = "lp_fluidity_degraded_threshold")]
+    pub fluidity_degraded_threshold: f32,
+
+    // ── Hazard model ──────────────────────────────────────────────────
+    /// Online hazard retrain learning rate.
+    #[serde(default = "lp_hazard_lr")]
+    pub hazard_lr: f64,
+
+    // ── Memory budget ─────────────────────────────────────────────────
+    /// Max fraction of allocatable RAM for foreground processes.
+    #[serde(default = "lp_max_foreground_share")]
+    pub max_foreground_share: f64,
+
+    /// Max fraction of allocatable RAM for background processes.
+    #[serde(default = "lp_max_background_share")]
+    pub max_background_share: f64,
+
+    // ── Meta-learning (Phase 6) ───────────────────────────────────────
+    /// EMA of global effectiveness (for meta-learning velocity detection).
+    #[serde(default)]
+    pub meta_effectiveness_ema: f64,
+
+    /// EMA of |param_delta|/cycle (learning velocity).
+    #[serde(default)]
+    pub meta_learning_velocity: f64,
+
+    // ── Provenance ────────────────────────────────────────────────────
+    /// Total tuning cycles that have contributed to these parameters.
+    #[serde(default)]
+    pub tuning_cycles: u64,
+}
+
+// ── LearnableParams defaults (match original hardcoded values) ─────────
+fn lp_kalman_pressure_r() -> f64 {
+    0.02
+}
+fn lp_kalman_pressure_q() -> f64 {
+    0.005
+}
+fn lp_rl_pressure_bands() -> [f64; 3] {
+    [0.50, 0.80, 0.92]
+}
+fn lp_rl_compressor_bands() -> [f64; 2] {
+    [0.30, 0.60]
+}
+fn lp_zone_alpha() -> f64 {
+    0.005
+}
+fn lp_outcome_wait_secs() -> u64 {
+    30
+}
+fn lp_outcome_effective_threshold() -> f64 {
+    0.01
+}
+fn lp_experience_pressure_band() -> f64 {
+    0.10
+}
+fn lp_nars_drift_threshold() -> f64 {
+    0.20
+}
+fn lp_nars_decay_factor() -> f32 {
+    0.95
+}
+fn lp_cusum_k() -> f64 {
+    0.02
+}
+fn lp_cusum_h() -> f64 {
+    0.12
+}
+fn lp_pid_target() -> f64 {
+    0.65
+}
+fn lp_pid_decay() -> f64 {
+    0.98
+}
+fn lp_ws_spike_threshold() -> f32 {
+    25.0
+}
+fn lp_fluidity_degraded_threshold() -> f32 {
+    0.65
+}
+fn lp_hazard_lr() -> f64 {
+    0.01
+}
+fn lp_max_foreground_share() -> f64 {
+    0.40
+}
+fn lp_max_background_share() -> f64 {
+    0.15
+}
+
+impl Default for LearnableParams {
+    fn default() -> Self {
+        Self {
+            kalman_pressure_r: lp_kalman_pressure_r(),
+            kalman_pressure_q: lp_kalman_pressure_q(),
+            rl_pressure_bands: lp_rl_pressure_bands(),
+            rl_compressor_bands: lp_rl_compressor_bands(),
+            zone_alpha: lp_zone_alpha(),
+            outcome_wait_secs: lp_outcome_wait_secs(),
+            outcome_effective_threshold: lp_outcome_effective_threshold(),
+            experience_pressure_band: lp_experience_pressure_band(),
+            nars_drift_threshold: lp_nars_drift_threshold(),
+            nars_decay_factor: lp_nars_decay_factor(),
+            cusum_k: lp_cusum_k(),
+            cusum_h: lp_cusum_h(),
+            pid_target: lp_pid_target(),
+            pid_decay: lp_pid_decay(),
+            ws_spike_threshold: lp_ws_spike_threshold(),
+            fluidity_degraded_threshold: lp_fluidity_degraded_threshold(),
+            hazard_lr: lp_hazard_lr(),
+            max_foreground_share: lp_max_foreground_share(),
+            max_background_share: lp_max_background_share(),
+            meta_effectiveness_ema: 0.0,
+            meta_learning_velocity: 0.0,
+            tuning_cycles: 0,
+        }
+    }
+}
+
+impl LearnableParams {
+    /// Clamp all values to their safe ranges.
+    pub fn validate(&mut self) {
+        self.kalman_pressure_r = self.kalman_pressure_r.clamp(0.001, 0.5);
+        self.kalman_pressure_q = self.kalman_pressure_q.clamp(0.001, 0.1);
+
+        // RL pressure bands must be monotonically increasing in safe ranges.
+        self.rl_pressure_bands[0] = self.rl_pressure_bands[0].clamp(0.30, 0.60);
+        self.rl_pressure_bands[1] = self.rl_pressure_bands[1].clamp(0.55, 0.85);
+        self.rl_pressure_bands[2] = self.rl_pressure_bands[2].clamp(0.80, 0.97);
+        // Enforce monotonicity.
+        if self.rl_pressure_bands[1] <= self.rl_pressure_bands[0] + 0.05 {
+            self.rl_pressure_bands[1] = self.rl_pressure_bands[0] + 0.05;
+        }
+        if self.rl_pressure_bands[2] <= self.rl_pressure_bands[1] + 0.05 {
+            self.rl_pressure_bands[2] = self.rl_pressure_bands[1] + 0.05;
+        }
+
+        self.rl_compressor_bands[0] = self.rl_compressor_bands[0].clamp(0.10, 0.50);
+        self.rl_compressor_bands[1] = self.rl_compressor_bands[1].clamp(0.40, 0.80);
+        if self.rl_compressor_bands[1] <= self.rl_compressor_bands[0] + 0.05 {
+            self.rl_compressor_bands[1] = self.rl_compressor_bands[0] + 0.05;
+        }
+
+        self.zone_alpha = self.zone_alpha.clamp(0.001, 0.05);
+        self.outcome_wait_secs = self.outcome_wait_secs.clamp(10, 60);
+        self.outcome_effective_threshold = self.outcome_effective_threshold.clamp(0.005, 0.05);
+        self.experience_pressure_band = self.experience_pressure_band.clamp(0.02, 0.25);
+        self.nars_drift_threshold = self.nars_drift_threshold.clamp(0.05, 0.40);
+        self.nars_decay_factor = self.nars_decay_factor.clamp(0.80, 0.99);
+        self.cusum_k = self.cusum_k.clamp(0.005, 0.10);
+        self.cusum_h = self.cusum_h.clamp(0.05, 0.30);
+        self.pid_target = self.pid_target.clamp(0.40, 0.85);
+        self.pid_decay = self.pid_decay.clamp(0.90, 0.999);
+        self.ws_spike_threshold = self.ws_spike_threshold.clamp(10.0, 50.0);
+        self.fluidity_degraded_threshold = self.fluidity_degraded_threshold.clamp(0.30, 0.90);
+        self.hazard_lr = self.hazard_lr.clamp(0.001, 0.1);
+        self.max_foreground_share = self.max_foreground_share.clamp(0.20, 0.60);
+        self.max_background_share = self.max_background_share.clamp(0.05, 0.30);
+        self.meta_effectiveness_ema = self.meta_effectiveness_ema.clamp(0.0, 1.0);
+        self.meta_learning_velocity = self.meta_learning_velocity.clamp(0.0, 1.0);
+    }
+}
 
 /// Everything Apollo learns at runtime, in one serializable struct.
 ///
@@ -113,6 +360,12 @@ pub struct LearnedState {
     /// [Holt 1957] exponential smoothing; [Chandola 2009] EMA-MAD anomaly detection.
     #[serde(default)]
     pub process_baselines: Option<ProcessBaselineMap>,
+
+    /// Adaptive parameters replacing hardcoded thresholds.
+    /// Auto-tuned from outcome data, persisted across restarts.
+    /// `None` on old file format → falls back to `LearnableParams::default()`.
+    #[serde(default)]
+    pub learnable_params: Option<LearnableParams>,
 }
 
 fn default_version() -> u32 {
@@ -133,6 +386,7 @@ const EXPERIENCE_CAP: usize = 300;
 
 impl LearnedState {
     /// Collect snapshots from all live components into a single struct.
+    #[allow(clippy::too_many_arguments)]
     pub fn collect(
         signal_intel: &SignalIntelligence,
         outcome_tracker: &OutcomeTracker,
@@ -144,6 +398,7 @@ impl LearnedState {
         arousal_state: Option<ArousalState>,
         causal_graph: Option<&CausalGraph>,
         process_baselines: Option<ProcessBaselineMap>,
+        learnable_params: Option<LearnableParams>,
     ) -> Self {
         Self {
             version: 1,
@@ -160,6 +415,7 @@ impl LearnedState {
             arousal_state,
             causal_graph_edges: causal_graph.map(|cg| cg.to_persisted()),
             process_baselines,
+            learnable_params,
         }
     }
 
@@ -180,7 +436,13 @@ impl LearnedState {
         skill_registry: &mut SkillRegistry,
         effectiveness_tracker: &mut EffectivenessTracker,
         causal_graph: Option<&mut CausalGraph>,
-    ) -> (Option<OverflowHistory>, Option<FrozenStatePersisted>, Option<ArousalState>, Option<ProcessBaselineMap>) {
+    ) -> (
+        Option<OverflowHistory>,
+        Option<FrozenStatePersisted>,
+        Option<ArousalState>,
+        Option<ProcessBaselineMap>,
+        LearnableParams,
+    ) {
         self.validate();
         if let Some(si) = self.signal_intelligence {
             signal_intel.restore(si);
@@ -205,7 +467,16 @@ impl LearnedState {
                 cg.restore(edges);
             }
         }
-        (self.overflow_guard_history, self.frozen_pids, self.arousal_state, self.process_baselines)
+        // Restore learnable params — validated + default-fallback.
+        let mut lp = self.learnable_params.unwrap_or_default();
+        lp.validate();
+        (
+            self.overflow_guard_history,
+            self.frozen_pids,
+            self.arousal_state,
+            self.process_baselines,
+            lp,
+        )
     }
 
     // ── Self-improvement: called before persist ─────────────────────────
@@ -271,8 +542,8 @@ impl LearnedState {
             }
             // Prune edges near uninformed prior with low evidence — no signal.
             edges.retain(|(_, e)| {
-                let near_prior = (e.confidence - 0.5).abs() < 0.05
-                    && (e.slow_confidence - 0.5).abs() < 0.05;
+                let near_prior =
+                    (e.confidence - 0.5).abs() < 0.05 && (e.slow_confidence - 0.5).abs() < 0.05;
                 !(near_prior && e.evidence_count < 10)
             });
         }
@@ -328,6 +599,11 @@ impl LearnedState {
                 edge.slow_avg_delta = edge.slow_avg_delta.clamp(0.0, 1.0);
             }
         }
+
+        // LearnableParams: clamp all adaptive thresholds to safe ranges.
+        if let Some(lp) = &mut self.learnable_params {
+            lp.validate();
+        }
     }
 
     // ── Persist with self-improvement ───────────────────────────────────
@@ -350,6 +626,7 @@ impl LearnedState {
         arousal_state: Option<ArousalState>,
         causal_graph: Option<&CausalGraph>,
         process_baselines: Option<ProcessBaselineMap>,
+        learnable_params: Option<LearnableParams>,
     ) {
         let mut state = Self::collect(
             signal_intel,
@@ -362,6 +639,7 @@ impl LearnedState {
             arousal_state,
             causal_graph,
             process_baselines,
+            learnable_params,
         );
         state.persist_generations = prev_generations.saturating_add(1);
         state.last_restore_quality = last_quality;
@@ -386,7 +664,9 @@ impl LearnedState {
     /// Reads the file, updates the field, writes back. No-op if file is missing.
     /// Used by periodic persist which doesn't have access to the baseline map.
     pub fn patch_process_baselines(path: &Path, baselines: ProcessBaselineMap) {
-        let Some(mut state) = Self::load(path) else { return };
+        let Some(mut state) = Self::load(path) else {
+            return;
+        };
         state.process_baselines = Some(baselines);
         state.persist(path);
     }
@@ -558,6 +838,7 @@ mod tests {
             arousal_state: None,
             causal_graph_edges: None,
             process_baselines: None,
+            learnable_params: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -584,6 +865,7 @@ mod tests {
             arousal_state: None,
             causal_graph_edges: None,
             process_baselines: None,
+            learnable_params: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -608,6 +890,7 @@ mod tests {
             arousal_state: None,
             causal_graph_edges: None,
             process_baselines: None,
+            learnable_params: None,
         };
         assert_eq!(
             state
@@ -651,9 +934,13 @@ mod tests {
             arousal_state: None,
             causal_graph_edges: None,
             process_baselines: None,
+            learnable_params: None,
         };
         state.self_improve();
-        assert_eq!(state.persist_generations, 5, "self_improve must not touch persist_generations");
+        assert_eq!(
+            state.persist_generations, 5,
+            "self_improve must not touch persist_generations"
+        );
     }
 
     #[test]
@@ -685,6 +972,7 @@ mod tests {
             arousal_state: None,
             causal_graph_edges: None,
             process_baselines: None,
+            learnable_params: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -725,6 +1013,7 @@ mod tests {
             arousal_state: None,
             causal_graph_edges: None,
             process_baselines: None,
+            learnable_params: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -773,5 +1062,100 @@ mod tests {
             "second call should return None"
         );
         assert!(monitor.is_done());
+    }
+
+    // ── LearnableParams tests ───────────────────────────────────────────
+
+    #[test]
+    fn learnable_params_defaults_match_hardcoded() {
+        let lp = LearnableParams::default();
+        assert_eq!(lp.kalman_pressure_r, 0.02);
+        assert_eq!(lp.kalman_pressure_q, 0.005);
+        assert_eq!(lp.rl_pressure_bands, [0.50, 0.80, 0.92]);
+        assert_eq!(lp.rl_compressor_bands, [0.30, 0.60]);
+        assert_eq!(lp.zone_alpha, 0.005);
+        assert_eq!(lp.outcome_wait_secs, 30);
+        assert_eq!(lp.outcome_effective_threshold, 0.01);
+        assert_eq!(lp.experience_pressure_band, 0.10);
+        assert_eq!(lp.nars_drift_threshold, 0.20);
+        assert_eq!(lp.nars_decay_factor, 0.95);
+        assert_eq!(lp.cusum_k, 0.02);
+        assert_eq!(lp.cusum_h, 0.12);
+        assert_eq!(lp.pid_target, 0.65);
+        assert_eq!(lp.pid_decay, 0.98);
+        assert_eq!(lp.ws_spike_threshold, 25.0);
+        assert_eq!(lp.fluidity_degraded_threshold, 0.65);
+        assert_eq!(lp.hazard_lr, 0.01);
+        assert_eq!(lp.max_foreground_share, 0.40);
+        assert_eq!(lp.max_background_share, 0.15);
+        assert_eq!(lp.tuning_cycles, 0);
+    }
+
+    #[test]
+    fn learnable_params_serde_roundtrip() {
+        let lp = LearnableParams {
+            kalman_pressure_r: 0.03,
+            rl_pressure_bands: [0.45, 0.75, 0.90],
+            zone_alpha: 0.01,
+            tuning_cycles: 42,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&lp).unwrap();
+        let restored: LearnableParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.kalman_pressure_r, 0.03);
+        assert_eq!(restored.rl_pressure_bands, [0.45, 0.75, 0.90]);
+        assert_eq!(restored.zone_alpha, 0.01);
+        assert_eq!(restored.tuning_cycles, 42);
+    }
+
+    #[test]
+    fn learnable_params_validate_clamps_out_of_range() {
+        let mut lp = LearnableParams {
+            kalman_pressure_r: 999.0,
+            kalman_pressure_q: -1.0,
+            rl_pressure_bands: [0.01, 0.02, 0.03], // way below range
+            rl_compressor_bands: [0.99, 0.01],     // inverted
+            zone_alpha: 0.0,
+            outcome_wait_secs: 0,
+            nars_decay_factor: 0.0,
+            pid_target: 0.0,
+            meta_effectiveness_ema: 5.0,
+            ..Default::default()
+        };
+        lp.validate();
+        assert_eq!(lp.kalman_pressure_r, 0.5);
+        assert_eq!(lp.kalman_pressure_q, 0.001);
+        assert!(lp.rl_pressure_bands[0] >= 0.30);
+        assert!(lp.rl_pressure_bands[1] > lp.rl_pressure_bands[0]);
+        assert!(lp.rl_pressure_bands[2] > lp.rl_pressure_bands[1]);
+        assert!(lp.rl_compressor_bands[1] > lp.rl_compressor_bands[0]);
+        assert_eq!(lp.zone_alpha, 0.001);
+        assert_eq!(lp.outcome_wait_secs, 10);
+        assert_eq!(lp.nars_decay_factor, 0.80);
+        assert_eq!(lp.pid_target, 0.40);
+        assert_eq!(lp.meta_effectiveness_ema, 1.0);
+    }
+
+    #[test]
+    fn learnable_params_backward_compat_missing_field() {
+        // Simulate old learned_state.json without learnable_params field.
+        let json = r#"{"version":1}"#;
+        let state: LearnedState = serde_json::from_str(json).unwrap();
+        assert!(state.learnable_params.is_none());
+        // Default fallback works.
+        let lp = state.learnable_params.unwrap_or_default();
+        assert_eq!(lp.pid_target, 0.65);
+    }
+
+    #[test]
+    fn learnable_params_monotonicity_enforcement() {
+        let mut lp = LearnableParams {
+            rl_pressure_bands: [0.55, 0.55, 0.55], // all same
+            ..Default::default()
+        };
+        lp.validate();
+        // After validation, must be strictly increasing with ≥0.05 gap.
+        assert!(lp.rl_pressure_bands[1] > lp.rl_pressure_bands[0]);
+        assert!(lp.rl_pressure_bands[2] > lp.rl_pressure_bands[1]);
     }
 }

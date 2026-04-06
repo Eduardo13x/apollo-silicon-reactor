@@ -82,18 +82,35 @@ impl RlState {
         compressor_pressure: f64,
         overflows_last_hour: usize,
     ) -> Self {
-        let pressure_band = if memory_pressure < 0.50 {
+        Self::from_metrics_with_bands(
+            memory_pressure,
+            compressor_pressure,
+            overflows_last_hour,
+            &[0.50, 0.80, 0.92],
+            &[0.30, 0.60],
+        )
+    }
+
+    /// State discretization with adaptive band boundaries (from LearnableParams).
+    pub fn from_metrics_with_bands(
+        memory_pressure: f64,
+        compressor_pressure: f64,
+        overflows_last_hour: usize,
+        pressure_bands: &[f64; 3],
+        compressor_bands: &[f64; 2],
+    ) -> Self {
+        let pressure_band = if memory_pressure < pressure_bands[0] {
             0
-        } else if memory_pressure <= 0.80 {
+        } else if memory_pressure <= pressure_bands[1] {
             1
-        } else if memory_pressure <= 0.92 {
-            2 // high
+        } else if memory_pressure <= pressure_bands[2] {
+            2
         } else {
-            3 // critical — RL can learn distinct policy for extreme pressure
+            3
         };
-        let compressor_band = if compressor_pressure < 0.30 {
+        let compressor_band = if compressor_pressure < compressor_bands[0] {
             0
-        } else if compressor_pressure <= 0.60 {
+        } else if compressor_pressure <= compressor_bands[1] {
             1
         } else {
             2
@@ -140,7 +157,9 @@ struct RlPersisted {
     neuro_alpha_mult: f64,
 }
 
-fn default_neuro_alpha() -> f64 { 1.0 }
+fn default_neuro_alpha() -> f64 {
+    1.0
+}
 
 /// Dyna-Q planning steps per real transition (Sutton 1991).
 /// 10 simulated updates per real step ≈ 10x sample efficiency.
@@ -204,7 +223,13 @@ impl RlThresholdAgent {
                     for (i, &val) in p.q_table.iter().enumerate() {
                         qt[i / NUM_ACTIONS][i % NUM_ACTIONS] = val;
                     }
-                    Some((qt, p.current_adjustment, p.total_ticks, p.total_overflows, p.neuro_alpha_mult))
+                    Some((
+                        qt,
+                        p.current_adjustment,
+                        p.total_ticks,
+                        p.total_overflows,
+                        p.neuro_alpha_mult,
+                    ))
                 })
                 .unwrap_or_else(|| {
                     // ZeroTune: pre-seed critical pressure band (3) to favor Lower5pp.
@@ -213,7 +238,7 @@ impl RlThresholdAgent {
                     for cb in 0..3usize {
                         for oh in 0..4usize {
                             let idx = 3 * 12 + cb * 4 + oh; // pressure_band=3
-                            qt[idx][0] = 2.0;  // Lower5pp: positive prior
+                            qt[idx][0] = 2.0; // Lower5pp: positive prior
                             qt[idx][1] = -1.0; // Hold: mild negative
                             qt[idx][2] = -2.0; // Raise1pp: bad at critical pressure
                         }
@@ -303,8 +328,7 @@ impl RlThresholdAgent {
         // Potential-based reward shaping: Φ(s) = -pressure²
         // R_shaped = Φ(s') - Φ(s) = prev_pressure² - current_pressure²
         let current_pressure = Self::band_to_pressure(state.pressure_band);
-        let shaped = self.prev_pressure * self.prev_pressure
-            - current_pressure * current_pressure;
+        let shaped = self.prev_pressure * self.prev_pressure - current_pressure * current_pressure;
 
         let base_reward = if overflow_occurred {
             self.total_overflows += 1;
@@ -396,7 +420,13 @@ impl RlThresholdAgent {
     }
 
     /// Record a real (s, a, r, s') transition into the Dyna-Q model.
-    fn dyna_record(&mut self, state_idx: usize, action_idx: usize, reward: f64, next_state_idx: usize) {
+    fn dyna_record(
+        &mut self,
+        state_idx: usize,
+        action_idx: usize,
+        reward: f64,
+        next_state_idx: usize,
+    ) {
         let key = (state_idx, action_idx);
         match self.dyna_model.get_mut(&key) {
             Some(t) => {
@@ -405,7 +435,13 @@ impl RlThresholdAgent {
                 t.next_state_idx = next_state_idx;
             }
             None => {
-                self.dyna_model.insert(key, DynaTransition { reward, next_state_idx });
+                self.dyna_model.insert(
+                    key,
+                    DynaTransition {
+                        reward,
+                        next_state_idx,
+                    },
+                );
                 // Invalidate key cache.
                 self.dyna_keys.clear();
             }
@@ -436,7 +472,11 @@ impl RlThresholdAgent {
                 .iter()
                 .copied()
                 .fold(f64::NEG_INFINITY, f64::max);
-            let max_q_next = if max_q_next.is_infinite() { 0.0 } else { max_q_next };
+            let max_q_next = if max_q_next.is_infinite() {
+                0.0
+            } else {
+                max_q_next
+            };
             let old_q = self.q_table[s][a];
             self.q_table[s][a] = old_q + alpha * (reward + GAMMA * max_q_next - old_q);
         }
@@ -462,8 +502,11 @@ impl RlThresholdAgent {
             .append(true)
             .open(&traj_path)
         {
-            let _ = writeln!(f, "{{\"s\":{},\"a\":{},\"r\":{:.4},\"s_prime\":{},\"tick\":{}}}",
-                s, a, reward, s_prime, self.total_ticks);
+            let _ = writeln!(
+                f,
+                "{{\"s\":{},\"a\":{},\"r\":{:.4},\"s_prime\":{},\"tick\":{}}}",
+                s, a, reward, s_prime, self.total_ticks
+            );
         }
     }
 
@@ -632,15 +675,28 @@ mod tests {
     fn test_ema_alpha_decays_over_time() {
         let mut agent = make_agent();
         let alpha_0 = agent.alpha();
-        assert!((alpha_0 - ALPHA_INITIAL).abs() < 1e-6, "initial alpha should be {}", ALPHA_INITIAL);
+        assert!(
+            (alpha_0 - ALPHA_INITIAL).abs() < 1e-6,
+            "initial alpha should be {}",
+            ALPHA_INITIAL
+        );
 
         let state = RlState::from_metrics(0.50, 0.30, 0);
         for _ in 0..400 {
             agent.tick(state, false);
         }
         let alpha_400 = agent.alpha();
-        assert!(alpha_400 < alpha_0, "alpha should decay: {} < {}", alpha_400, alpha_0);
-        assert!(alpha_400 >= ALPHA_MIN, "alpha should not go below floor: {}", alpha_400);
+        assert!(
+            alpha_400 < alpha_0,
+            "alpha should decay: {} < {}",
+            alpha_400,
+            alpha_0
+        );
+        assert!(
+            alpha_400 >= ALPHA_MIN,
+            "alpha should not go below floor: {}",
+            alpha_400
+        );
     }
 
     #[test]
@@ -659,8 +715,11 @@ mod tests {
             .fold(f64::NEG_INFINITY, f64::max);
         // After 50 calm ticks, best Q should be meaningfully positive
         // because early high alpha accumulated reward faster.
-        assert!(q_after_calm > 2.0,
-            "EMA agent should learn fast from early data: best_q={}", q_after_calm);
+        assert!(
+            q_after_calm > 2.0,
+            "EMA agent should learn fast from early data: best_q={}",
+            q_after_calm
+        );
     }
 
     #[test]
@@ -675,8 +734,12 @@ mod tests {
 
         agent.inject_external_reward(-5.0);
         let q_after = agent.q_table[s][a];
-        assert!(q_after < q_before,
-            "negative external reward should decrease Q: {} < {}", q_after, q_before);
+        assert!(
+            q_after < q_before,
+            "negative external reward should decrease Q: {} < {}",
+            q_after,
+            q_before
+        );
     }
 
     #[test]
@@ -700,9 +763,9 @@ mod tests {
         let mut agent_drop = make_agent();
         agent_drop.prev_pressure = 0.90; // start high
         let high_state = RlState::from_metrics(0.85, 0.40, 0); // band 2
-        let low_state = RlState::from_metrics(0.30, 0.10, 0);  // band 0
+        let low_state = RlState::from_metrics(0.30, 0.10, 0); // band 0
         agent_drop.tick(high_state, false); // prev=0.90, cur=0.90, shaped≈0
-        agent_drop.tick(low_state, false);  // prev=0.90, cur=0.35, shaped= 0.81-0.1225=+0.6875
+        agent_drop.tick(low_state, false); // prev=0.90, cur=0.35, shaped= 0.81-0.1225=+0.6875
 
         let mut agent_flat = make_agent();
         agent_flat.prev_pressure = 0.90;
@@ -710,12 +773,19 @@ mod tests {
         agent_flat.tick(high_state, false); // stays at 0.90, shaped=0
 
         // The drop agent's Q for the first state should be higher (better reward received)
-        let q_drop: f64 = agent_drop.q_table[high_state.index()].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let q_flat: f64 = agent_flat.q_table[high_state.index()].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let q_drop: f64 = agent_drop.q_table[high_state.index()]
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let q_flat: f64 = agent_flat.q_table[high_state.index()]
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         assert!(
             q_drop > q_flat,
             "pressure drop should yield higher Q than staying high: drop={} flat={}",
-            q_drop, q_flat
+            q_drop,
+            q_flat
         );
     }
 
@@ -743,7 +813,10 @@ mod tests {
     #[test]
     fn test_prev_pressure_updates_after_tick() {
         let mut agent = make_agent();
-        assert!((agent.prev_pressure - 0.5).abs() < 1e-9, "initial prev_pressure=0.5");
+        assert!(
+            (agent.prev_pressure - 0.5).abs() < 1e-9,
+            "initial prev_pressure=0.5"
+        );
         let low_state = RlState::from_metrics(0.30, 0.10, 0); // band 0 → 0.35
         agent.tick(low_state, false);
         assert!(
@@ -771,12 +844,23 @@ mod tests {
         }
         // After convergence the rpe_ema should roughly equal the current |rpe|.
         // We can verify indirectly: rpe_ema should be a reasonable positive value (not 1.0 or 0.0).
-        assert!(agent.rpe_ema > 0.0, "rpe_ema must remain positive: {}", agent.rpe_ema);
-        assert!(agent.rpe_ema < 50.0, "rpe_ema should not explode: {}", agent.rpe_ema);
+        assert!(
+            agent.rpe_ema > 0.0,
+            "rpe_ema must remain positive: {}",
+            agent.rpe_ema
+        );
+        assert!(
+            agent.rpe_ema < 50.0,
+            "rpe_ema should not explode: {}",
+            agent.rpe_ema
+        );
         // In steady state the effective alpha should stay near base alpha (factor ≈ 1).
         // We can't directly measure surprise_factor here, but we verify rpe_ema is bounded.
         let ratio = agent.rpe_ema / agent.rpe_ema.max(0.01);
-        assert!((ratio - 1.0).abs() < 1e-9, "rpe_ema / max(rpe_ema, 0.01) == 1.0 in steady state");
+        assert!(
+            (ratio - 1.0).abs() < 1e-9,
+            "rpe_ema / max(rpe_ema, 0.01) == 1.0 in steady state"
+        );
     }
 
     #[test]
@@ -804,8 +888,16 @@ mod tests {
         );
         // The Q update on tick(high, true) applied to the PREVIOUS state (calm).
         // Verify that some Q entry for the calm state was updated (non-zero).
-        let calm_q_sum: f64 = agent.q_table[calm.index()].iter().copied().map(f64::abs).sum();
-        assert!(calm_q_sum > 0.0, "Q for calm state must be updated after overflow spike: sum={}", calm_q_sum);
+        let calm_q_sum: f64 = agent.q_table[calm.index()]
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .sum();
+        assert!(
+            calm_q_sum > 0.0,
+            "Q for calm state must be updated after overflow spike: sum={}",
+            calm_q_sum
+        );
     }
 
     #[test]
@@ -826,14 +918,26 @@ mod tests {
         // We verify indirectly: no NaN or infinite values in Q table.
         for row in &agent.q_table {
             for &q in row {
-                assert!(q.is_finite(), "Q values must remain finite after large RPE spike: {}", q);
+                assert!(
+                    q.is_finite(),
+                    "Q values must remain finite after large RPE spike: {}",
+                    q
+                );
             }
         }
         // And rpe_ema has grown (0.99 * 0.001 + 0.01 * big_rpe > 0.001).
-        assert!(agent.rpe_ema > 0.001, "rpe_ema must grow after spike: {}", agent.rpe_ema);
+        assert!(
+            agent.rpe_ema > 0.001,
+            "rpe_ema must grow after spike: {}",
+            agent.rpe_ema
+        );
         // Max effective_alpha seen can be reconstructed: base_alpha * 5 (max clamp).
         let max_effective = base_alpha * 5.0;
-        assert!(max_effective < 1.0 + 1e-9, "clamped effective_alpha must stay < 1.0: {}", max_effective);
+        assert!(
+            max_effective < 1.0 + 1e-9,
+            "clamped effective_alpha must stay < 1.0: {}",
+            max_effective
+        );
     }
 
     #[test]
@@ -888,7 +992,10 @@ mod tests {
         }
 
         // Dyna agent should have more model entries and different Q-values.
-        assert!(agent_dyna.dyna_model_size() > 0, "dyna model should have entries");
+        assert!(
+            agent_dyna.dyna_model_size() > 0,
+            "dyna model should have entries"
+        );
         // Compare Q-value spread: dyna should have more differentiated Q-values
         // (higher variance) because planning amplifies learning from each transition.
         let variance = |qt: &[[f64; NUM_ACTIONS]; NUM_STATES]| -> f64 {

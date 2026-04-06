@@ -119,10 +119,20 @@ impl ExperienceMemory {
     /// Returns (expected_drop, confidence) or None if no similar records.
     /// Similarity: same process name AND pressure within ±0.10.
     pub fn query_similar(&self, process: &str, pressure: f64) -> Option<(f64, f64)> {
+        self.query_similar_with_band(process, pressure, 0.10)
+    }
+
+    /// Query with adaptive pressure similarity band (from LearnableParams).
+    pub fn query_similar_with_band(
+        &self,
+        process: &str,
+        pressure: f64,
+        band: f64,
+    ) -> Option<(f64, f64)> {
         let mut sum_drop = 0.0_f64;
         let mut count = 0u32;
         for r in &self.records {
-            if r.process_name == process && (r.pressure_at_action - pressure).abs() <= 0.10 {
+            if r.process_name == process && (r.pressure_at_action - pressure).abs() <= band {
                 sum_drop += r.pressure_drop;
                 count += 1;
             }
@@ -167,7 +177,9 @@ impl ExperienceMemory {
         let mut groups: std::collections::HashMap<String, (f64, f64, u32, u32)> =
             std::collections::HashMap::new();
         for r in &old_records {
-            let e = groups.entry(r.process_name.clone()).or_insert((0.0, 0.0, 0, 0));
+            let e = groups
+                .entry(r.process_name.clone())
+                .or_insert((0.0, 0.0, 0, 0));
             e.0 += r.pressure_at_action;
             e.1 += r.pressure_drop;
             e.2 += 1;
@@ -210,21 +222,34 @@ pub enum WorkloadHop {
 impl WorkloadHop {
     pub fn from_process_name(name: &str) -> Self {
         let lower = name.to_lowercase();
-        if lower.contains("brave") || lower.contains("chrome") || lower.contains("safari")
-            || lower.contains("firefox") || lower.contains("webkit") || lower.contains("renderer")
+        if lower.contains("brave")
+            || lower.contains("chrome")
+            || lower.contains("safari")
+            || lower.contains("firefox")
+            || lower.contains("webkit")
+            || lower.contains("renderer")
         {
             WorkloadHop::Browser
-        } else if lower.contains("rustc") || lower.contains("cargo") || lower.contains("clang")
-            || lower.contains("swift") || lower == "cc" || lower.contains("make")
+        } else if lower.contains("rustc")
+            || lower.contains("cargo")
+            || lower.contains("clang")
+            || lower.contains("swift")
+            || lower == "cc"
+            || lower.contains("make")
             || lower.contains("ninja")
         {
             WorkloadHop::Build
-        } else if lower.contains("cloud") || lower.contains("dropbox") || lower.contains("drive")
-            || lower.contains("sync") || lower.contains("bird")
+        } else if lower.contains("cloud")
+            || lower.contains("dropbox")
+            || lower.contains("drive")
+            || lower.contains("sync")
+            || lower.contains("bird")
         {
             WorkloadHop::CloudSync
-        } else if lower.contains("audio") || lower.contains("video")
-            || lower.contains("avconf") || lower.contains("camera")
+        } else if lower.contains("audio")
+            || lower.contains("video")
+            || lower.contains("avconf")
+            || lower.contains("camera")
         {
             WorkloadHop::Media
         } else if lower.ends_with('d') && lower.len() > 3 && !lower.contains(' ') {
@@ -411,8 +436,18 @@ impl OutcomeTracker {
     /// Retorna un batch con los resultados para que el llamador actualice
     /// el EnergyTracker y la LearnedPolicy.
     pub fn tick(&mut self, current_pressure: f64) -> OutcomeBatch {
+        self.tick_with_params(current_pressure, 30, 0.01)
+    }
+
+    /// Tick with adaptive wait time and effectiveness threshold (from LearnableParams).
+    pub fn tick_with_params(
+        &mut self,
+        current_pressure: f64,
+        wait_secs: u64,
+        effective_threshold: f64,
+    ) -> OutcomeBatch {
         const BASELINE_ALPHA: f64 = 0.01; // half-life ≈ 69 observaciones
-        let check_after = Duration::from_secs(30);
+        let check_after = Duration::from_secs(wait_secs);
         let mut effective_names = Vec::new();
         let mut savings_watts = 0.0_f64;
         let mut resolved_outcomes: Vec<(String, f64, f64)> = Vec::new();
@@ -426,8 +461,8 @@ impl OutcomeTracker {
             // Lowered from 0.02 to 0.01: on an 8GB M1 with 2-3GB swap, 2% absolute
             // is too strict a bar — many legitimate throttles produce 1-1.5% relief
             // that compounds across multiple actions. 1% catches these while still
-            // filtering noise.
-            let effective = pressure_drop >= 0.01;
+            // filtering noise. Now adaptive via LearnableParams.
+            let effective = pressure_drop >= effective_threshold;
 
             // Actualiza el baseline de fluctuación natural: ¿bajó la presión ≥1%
             // en esta ventana de 30s, independientemente de qué proceso causó qué?
@@ -453,11 +488,15 @@ impl OutcomeTracker {
                 p_oom_est,
                 outcome.swap_gb_at_throttle,
             );
-            self.drift_detector.observe_salient(&outcome.process_name, effective, salience);
+            self.drift_detector
+                .observe_salient(&outcome.process_name, effective, salience);
 
             // HRPO: update group-level effectiveness (Dr. Zero solver feedback).
             let hop = WorkloadHop::from_process_name(&outcome.process_name);
-            self.hop_groups.entry(hop).or_default().record(effective, pressure_drop);
+            self.hop_groups
+                .entry(hop)
+                .or_default()
+                .record(effective, pressure_drop);
 
             // Store in experience memory for similarity queries.
             self.experience.push(ExperienceRecord {
@@ -534,7 +573,8 @@ impl OutcomeTracker {
     /// Complements the persist-time GC in `LearnedState::self_improve()` by also
     /// pruning in-process, typically called every 500 cycles (~4 minutes).
     pub fn gc_weights(&mut self) {
-        self.weights.retain(|_, w| w.throttle_count >= 5 || w.effective_count >= 2);
+        self.weights
+            .retain(|_, w| w.throttle_count >= 5 || w.effective_count >= 2);
     }
 
     /// Penalty signal for the RL agent: negative reward proportional to
@@ -624,7 +664,10 @@ impl OutcomeTracker {
         } else {
             (proc_b.to_string(), proc_a.to_string())
         };
-        self.co_occurrence.get(&(a, b)).copied().filter(|&c| c >= min_count)
+        self.co_occurrence
+            .get(&(a, b))
+            .copied()
+            .filter(|&c| c >= min_count)
     }
 
     // ── Counterfactual baseline ──────────────────────────────────────────
@@ -643,8 +686,8 @@ impl OutcomeTracker {
 
                 // After a full window of non-action, commit the drift observation.
                 if self.ticks_since_action >= DRIFT_WINDOW_TICKS {
-                    self.natural_drift_ema += DRIFT_ALPHA
-                        * (self.drift_accumulator - self.natural_drift_ema);
+                    self.natural_drift_ema +=
+                        DRIFT_ALPHA * (self.drift_accumulator - self.natural_drift_ema);
                     self.drift_accumulator = 0.0;
                     self.ticks_since_action = 0;
                 }
@@ -731,9 +774,17 @@ impl OutcomeTracker {
 
     /// Summary of HRPO groups for status/metrics reporting.
     pub fn hop_group_summary(&self) -> Vec<(WorkloadHop, f64, u32, f64)> {
-        let mut groups: Vec<_> = self.hop_groups
+        let mut groups: Vec<_> = self
+            .hop_groups
             .iter()
-            .map(|(&hop, g)| (hop, g.effectiveness(), g.throttle_count, g.prediction_error_ema))
+            .map(|(&hop, g)| {
+                (
+                    hop,
+                    g.effectiveness(),
+                    g.throttle_count,
+                    g.prediction_error_ema,
+                )
+            })
             .collect();
         groups.sort_by(|a, b| b.2.cmp(&a.2)); // by throttle count descending
         groups
@@ -745,7 +796,11 @@ impl OutcomeTracker {
         if self.hop_groups.is_empty() {
             return 0.0;
         }
-        let sum: f64 = self.hop_groups.values().map(|g| g.prediction_error_ema).sum();
+        let sum: f64 = self
+            .hop_groups
+            .values()
+            .map(|g| g.prediction_error_ema)
+            .sum();
         sum / self.hop_groups.len() as f64
     }
 
@@ -759,7 +814,8 @@ impl OutcomeTracker {
     /// Load hop_groups from disk (called on startup).
     pub fn load_hop_groups(&mut self, path: &std::path::Path) {
         if let Ok(data) = std::fs::read_to_string(path) {
-            if let Ok(groups) = serde_json::from_str::<HashMap<WorkloadHop, HopGroupWeight>>(&data) {
+            if let Ok(groups) = serde_json::from_str::<HashMap<WorkloadHop, HopGroupWeight>>(&data)
+            {
                 self.hop_groups = groups;
             }
         }
@@ -1060,13 +1116,35 @@ mod tests {
         // threshold = 0.225
 
         // Add 2 low-value processes
-        tracker.weights.insert("proc_a".into(), PatternWeight { throttle_count: 25, effective_count: 0 });
-        tracker.weights.insert("proc_b".into(), PatternWeight { throttle_count: 25, effective_count: 0 });
+        tracker.weights.insert(
+            "proc_a".into(),
+            PatternWeight {
+                throttle_count: 25,
+                effective_count: 0,
+            },
+        );
+        tracker.weights.insert(
+            "proc_b".into(),
+            PatternWeight {
+                throttle_count: 25,
+                effective_count: 0,
+            },
+        );
         // Add 1 high-value process (should not affect penalty)
-        tracker.weights.insert("proc_c".into(), PatternWeight { throttle_count: 25, effective_count: 20 });
+        tracker.weights.insert(
+            "proc_c".into(),
+            PatternWeight {
+                throttle_count: 25,
+                effective_count: 20,
+            },
+        );
 
         let penalty = tracker.rl_penalty();
-        assert!((penalty - (-1.0)).abs() < 1e-6, "2 low-value = -1.0 penalty, got {}", penalty);
+        assert!(
+            (penalty - (-1.0)).abs() < 1e-6,
+            "2 low-value = -1.0 penalty, got {}",
+            penalty
+        );
     }
 
     #[test]
@@ -1075,21 +1153,37 @@ mod tests {
         tracker.baseline_drop_ema = 0.25;
         tracker.baseline_samples = 50;
         for i in 0..10 {
-            tracker.weights.insert(format!("proc_{i}"), PatternWeight { throttle_count: 25, effective_count: 0 });
+            tracker.weights.insert(
+                format!("proc_{i}"),
+                PatternWeight {
+                    throttle_count: 25,
+                    effective_count: 0,
+                },
+            );
         }
         let penalty = tracker.rl_penalty();
-        assert!((penalty - (-3.0)).abs() < 1e-6, "10 low-value should cap at -3.0, got {}", penalty);
+        assert!(
+            (penalty - (-3.0)).abs() < 1e-6,
+            "10 low-value should cap at -3.0, got {}",
+            penalty
+        );
     }
 
     #[test]
     fn integration_outcome_to_rl_feedback() {
         // End-to-end: OutcomeTracker detects low-value → RL gets penalized.
-        use crate::engine::rl_threshold::{RlThresholdAgent, RlState};
+        use crate::engine::rl_threshold::{RlState, RlThresholdAgent};
 
         let mut tracker = OutcomeTracker::new();
         tracker.baseline_drop_ema = 0.25;
         tracker.baseline_samples = 50;
-        tracker.weights.insert("wasteful".into(), PatternWeight { throttle_count: 30, effective_count: 0 });
+        tracker.weights.insert(
+            "wasteful".into(),
+            PatternWeight {
+                throttle_count: 30,
+                effective_count: 0,
+            },
+        );
 
         let mut rl = RlThresholdAgent::load_or_default(std::path::Path::new("/dev/null"));
         let state = RlState::from_metrics(0.60, 0.40, 0);
@@ -1103,8 +1197,12 @@ mod tests {
         rl.inject_external_reward(penalty);
 
         let q_after = rl.last_q_value();
-        assert!(q_after < q_before,
-            "RL should be penalized by outcome feedback: {} < {}", q_after, q_before);
+        assert!(
+            q_after < q_before,
+            "RL should be penalized by outcome feedback: {} < {}",
+            q_after,
+            q_before
+        );
     }
 
     // ── Experience Memory tests ────────────────────────────────────────────────
@@ -1122,8 +1220,14 @@ mod tests {
         }
         assert_eq!(mem.len(), 3);
         // Oldest (proc_0, proc_1) evicted; proc_2, proc_3, proc_4 remain.
-        assert!(mem.records.iter().all(|r| !r.process_name.starts_with("proc_0")));
-        assert!(mem.records.iter().all(|r| !r.process_name.starts_with("proc_1")));
+        assert!(mem
+            .records
+            .iter()
+            .all(|r| !r.process_name.starts_with("proc_0")));
+        assert!(mem
+            .records
+            .iter()
+            .all(|r| !r.process_name.starts_with("proc_1")));
     }
 
     #[test]
@@ -1175,7 +1279,10 @@ mod tests {
         }
         // Query at 0.70 should only match first 3.
         let (avg_drop, _) = mem.query_similar("chrome", 0.70).unwrap();
-        assert!((avg_drop - 0.08).abs() < 1e-6, "should only match p≈0.70 records");
+        assert!(
+            (avg_drop - 0.08).abs() < 1e-6,
+            "should only match p≈0.70 records"
+        );
     }
 
     // ── Counterfactual baseline tests ───────────────────────────────────────────
@@ -1252,7 +1359,13 @@ mod tests {
             watts_before: 1.0,
             swap_gb_at_throttle: 0.0,
         });
-        tracker.weights.insert("test_proc".into(), PatternWeight { throttle_count: 1, effective_count: 0 });
+        tracker.weights.insert(
+            "test_proc".into(),
+            PatternWeight {
+                throttle_count: 1,
+                effective_count: 0,
+            },
+        );
 
         assert!(tracker.experience.is_empty());
         tracker.tick(0.70); // drop = 0.05
@@ -1359,11 +1472,23 @@ mod tests {
 
     #[test]
     fn workload_hop_classification() {
-        assert_eq!(WorkloadHop::from_process_name("Brave Browser Helper (Renderer)"), WorkloadHop::Browser);
+        assert_eq!(
+            WorkloadHop::from_process_name("Brave Browser Helper (Renderer)"),
+            WorkloadHop::Browser
+        );
         assert_eq!(WorkloadHop::from_process_name("rustc"), WorkloadHop::Build);
-        assert_eq!(WorkloadHop::from_process_name("cloudd"), WorkloadHop::CloudSync);
-        assert_eq!(WorkloadHop::from_process_name("coreaudiod"), WorkloadHop::Media);
-        assert_eq!(WorkloadHop::from_process_name("launchd"), WorkloadHop::SystemDaemon);
+        assert_eq!(
+            WorkloadHop::from_process_name("cloudd"),
+            WorkloadHop::CloudSync
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("coreaudiod"),
+            WorkloadHop::Media
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("launchd"),
+            WorkloadHop::SystemDaemon
+        );
         assert_eq!(WorkloadHop::from_process_name("Warp"), WorkloadHop::General);
     }
 
@@ -1412,7 +1537,7 @@ mod tests {
             tracker.record_co_occurrence(&vec![
                 "Safari".into(),
                 "cloudd".into(),
-                "suggestd".into(),  // noise: also present but less relevant
+                "suggestd".into(), // noise: also present but less relevant
             ]);
         }
         // Simulate 2 events where Safari is alone (cloudd not present).
@@ -1424,9 +1549,12 @@ mod tests {
         let top = tracker.top_causal_pairs(3);
         let safari_cloudd = top.iter().find(|(a, b, _)| {
             (a.contains("Safari") && b.contains("cloudd"))
-            || (a.contains("cloudd") && b.contains("Safari"))
+                || (a.contains("cloudd") && b.contains("Safari"))
         });
-        assert!(safari_cloudd.is_some(), "Safari+cloudd should appear in top pairs");
+        assert!(
+            safari_cloudd.is_some(),
+            "Safari+cloudd should appear in top pairs"
+        );
         let (_, _, count) = safari_cloudd.unwrap();
         assert!(
             *count >= 8,
@@ -1473,7 +1601,11 @@ mod tests {
         tracker.observe_cycle(0.50, false);
         // Short-window velocity should be ~0.10 (pressure dropping 0.10/cycle)
         let v = tracker.pressure_velocity_short();
-        assert!(v > 0.05 && v < 0.15, "expected ~0.10 short-window velocity, got {}", v);
+        assert!(
+            v > 0.05 && v < 0.15,
+            "expected ~0.10 short-window velocity, got {}",
+            v
+        );
     }
 
     #[test]
@@ -1484,7 +1616,11 @@ mod tests {
         tracker.observe_cycle(0.60, false);
         // Action taken — short window should reset
         tracker.observe_cycle(0.50, true);
-        assert_eq!(tracker.pressure_velocity_short(), 0.0, "short drift should reset on action");
+        assert_eq!(
+            tracker.pressure_velocity_short(),
+            0.0,
+            "short drift should reset on action"
+        );
     }
 
     #[test]
@@ -1498,16 +1634,26 @@ mod tests {
             p = (p - 0.001).max(0.0);
         }
         let drift = tracker.natural_drift();
-        assert!(drift > 0.0, "should have positive natural drift after 70 declining cycles (got {})", drift);
+        assert!(
+            drift > 0.0,
+            "should have positive natural drift after 70 declining cycles (got {})",
+            drift
+        );
         // Now act many times — short window clears each time
         for _ in 0..5 {
             tracker.observe_cycle(0.60, true);
         }
-        assert!(tracker.short_window_deltas.is_empty(), "short window should be empty after actions");
+        assert!(
+            tracker.short_window_deltas.is_empty(),
+            "short window should be empty after actions"
+        );
         // causal_effect_fast should use natural_drift_ema as fallback, not 0
         let fast = tracker.causal_effect_fast(0.005);
         let slow = tracker.causal_effect(0.005);
-        assert_eq!(fast, slow, "fast should fall back to slow EMA when window is empty");
+        assert_eq!(
+            fast, slow,
+            "fast should fall back to slow EMA when window is empty"
+        );
     }
 
     #[test]
@@ -1520,10 +1666,16 @@ mod tests {
         tracker.observe_cycle(0.74, false);
         // Now: if observed_drop = 0.15 but drift = 0.02, causal effect ≈ 0.13
         let fast = tracker.causal_effect_fast(0.15);
-        assert!(fast > 0.0, "causal_effect_fast should be positive when action > drift");
+        assert!(
+            fast > 0.0,
+            "causal_effect_fast should be positive when action > drift"
+        );
         // If observed_drop = 0.01 (less than drift), effect should be near zero or negative
         let slow = tracker.causal_effect_fast(0.01);
-        assert!(slow < fast, "small drop should yield smaller causal effect than large drop");
+        assert!(
+            slow < fast,
+            "small drop should yield smaller causal effect than large drop"
+        );
     }
 
     // ── NARS drift detector integration tests ────────────────────────────────
@@ -1537,31 +1689,43 @@ mod tests {
 
         // Phase 1: proc_X is consistently effective (30 resolved outcomes)
         for i in 0..30u32 {
-            tracker.weights.entry("proc_X".to_string()).or_default().throttle_count += 1;
-            tracker.pending.push_back(crate::engine::outcome_tracker::PendingOutcome {
-                process_name: "proc_X".to_string(),
-                throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
-                pressure_before: 0.75,
-                watts_before: 5.0,
-                swap_gb_at_throttle: 0.0,
-            });
+            tracker
+                .weights
+                .entry("proc_X".to_string())
+                .or_default()
+                .throttle_count += 1;
+            tracker
+                .pending
+                .push_back(crate::engine::outcome_tracker::PendingOutcome {
+                    process_name: "proc_X".to_string(),
+                    throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
+                    pressure_before: 0.75,
+                    watts_before: 5.0,
+                    swap_gb_at_throttle: 0.0,
+                });
         }
         // Use high current pressure so outcomes resolve as effective
         tracker.tick(0.70); // pressure_before=0.75, current=0.70 → drop=0.05 → effective
-        // tick resolves all pending outcomes with 0.75-0.70=0.05 drop (≥0.01 → effective)
+                            // tick resolves all pending outcomes with 0.75-0.70=0.05 drop (≥0.01 → effective)
 
         let score_phase1 = tracker.nars_drift_score();
 
         // Phase 2: proc_X suddenly useless (pressure never drops)
         for i in 0..30u32 {
-            tracker.weights.entry("proc_X".to_string()).or_default().throttle_count += 1;
-            tracker.pending.push_back(crate::engine::outcome_tracker::PendingOutcome {
-                process_name: "proc_X".to_string(),
-                throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
-                pressure_before: 0.70,
-                watts_before: 5.0,
-                swap_gb_at_throttle: 0.0,
-            });
+            tracker
+                .weights
+                .entry("proc_X".to_string())
+                .or_default()
+                .throttle_count += 1;
+            tracker
+                .pending
+                .push_back(crate::engine::outcome_tracker::PendingOutcome {
+                    process_name: "proc_X".to_string(),
+                    throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
+                    pressure_before: 0.70,
+                    watts_before: 5.0,
+                    swap_gb_at_throttle: 0.0,
+                });
         }
         tracker.tick(0.70); // pressure stayed same → drop=0 → NOT effective
 
@@ -1590,8 +1754,14 @@ mod tests {
         let drift_before = tracker.nars_drift_score();
         tracker.nars_acknowledge_recalibration();
         let drift_after = tracker.nars_drift_score();
-        assert!(drift_after < drift_before, "acknowledge must reduce drift score");
-        assert_eq!(tracker.drift_detector.drifted_count, 0, "drifted_count must clear after acknowledge");
+        assert!(
+            drift_after < drift_before,
+            "acknowledge must reduce drift score"
+        );
+        assert_eq!(
+            tracker.drift_detector.drifted_count, 0,
+            "drifted_count must clear after acknowledge"
+        );
     }
 
     /// Validates that NARS recalibration actually helps convergence:
@@ -1605,7 +1775,10 @@ mod tests {
 
         // Both trackers see 20 effective throttles
         for t in [&mut tracker_with_nars, &mut tracker_without_nars] {
-            t.weights.entry("proc_X".to_string()).or_default().throttle_count = 20;
+            t.weights
+                .entry("proc_X".to_string())
+                .or_default()
+                .throttle_count = 20;
             t.weights.get_mut("proc_X").unwrap().effective_count = 18; // 90% effective
         }
         // NARS tracker also has built-up beliefs
@@ -1635,7 +1808,7 @@ mod tests {
             // Apply recalibration
             for w in tracker_with_nars.weights.values_mut() {
                 w.effective_count = (w.effective_count / 2).max(1);
-                w.throttle_count  = (w.throttle_count  / 2).max(2);
+                w.throttle_count = (w.throttle_count / 2).max(2);
             }
             tracker_with_nars.nars_acknowledge_recalibration();
 
@@ -1649,7 +1822,8 @@ mod tests {
             assert!(
                 dist_with <= dist_without,
                 "recalibrated weights should be closer to neutral prior: with={:.3} without={:.3}",
-                eff_after, eff_before
+                eff_after,
+                eff_before
             );
         }
         // Even if recalibration wasn't triggered, verify scores moved
@@ -1678,7 +1852,8 @@ mod tests {
         assert!(
             (score_after - score_before).abs() < 1e-9,
             "drift score must be identical after roundtrip: before={} after={}",
-            score_before, score_after
+            score_before,
+            score_after
         );
         // Belief for proc_B should be present in restored tracker
         assert!(
@@ -1703,28 +1878,40 @@ mod tests {
         // Routine tracker: low-pressure events
         let mut routine = OutcomeTracker::new();
         for i in 0..10u32 {
-            routine.weights.entry("proc_Z".to_string()).or_default().throttle_count += 1;
-            routine.pending.push_back(crate::engine::outcome_tracker::PendingOutcome {
-                process_name: "proc_Z".to_string(),
-                throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
-                pressure_before: 0.40, // low pressure → low arousal
-                watts_before: 2.0,
-                swap_gb_at_throttle: 0.1, // minimal swap
-            });
+            routine
+                .weights
+                .entry("proc_Z".to_string())
+                .or_default()
+                .throttle_count += 1;
+            routine
+                .pending
+                .push_back(crate::engine::outcome_tracker::PendingOutcome {
+                    process_name: "proc_Z".to_string(),
+                    throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
+                    pressure_before: 0.40, // low pressure → low arousal
+                    watts_before: 2.0,
+                    swap_gb_at_throttle: 0.1, // minimal swap
+                });
         }
         routine.tick(0.40); // no drop → ineffective
 
         // Crisis tracker: same outcome pattern but high swap + high pressure
         let mut crisis = OutcomeTracker::new();
         for i in 0..10u32 {
-            crisis.weights.entry("proc_Z".to_string()).or_default().throttle_count += 1;
-            crisis.pending.push_back(crate::engine::outcome_tracker::PendingOutcome {
-                process_name: "proc_Z".to_string(),
-                throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
-                pressure_before: 0.90, // high pressure → high arousal
-                watts_before: 2.0,
-                swap_gb_at_throttle: 7.5, // near-full swap → max arousal
-            });
+            crisis
+                .weights
+                .entry("proc_Z".to_string())
+                .or_default()
+                .throttle_count += 1;
+            crisis
+                .pending
+                .push_back(crate::engine::outcome_tracker::PendingOutcome {
+                    process_name: "proc_Z".to_string(),
+                    throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
+                    pressure_before: 0.90, // high pressure → high arousal
+                    watts_before: 2.0,
+                    swap_gb_at_throttle: 7.5, // near-full swap → max arousal
+                });
         }
         crisis.tick(0.90); // no drop → ineffective
 
@@ -1732,7 +1919,8 @@ mod tests {
         assert!(
             crisis.nars_drift_score() >= routine.nars_drift_score(),
             "crisis drift score {:.5} should be >= routine {:.5}",
-            crisis.nars_drift_score(), routine.nars_drift_score()
+            crisis.nars_drift_score(),
+            routine.nars_drift_score()
         );
     }
 
@@ -1752,26 +1940,38 @@ mod tests {
         // Build up a moderate drift signal (not enough to trigger at default 0.08)
         // We'll do a small regime change: 5 effective then 5 ineffective
         for i in 0..5u32 {
-            tracker.weights.entry("proc_W".to_string()).or_default().throttle_count += 1;
-            tracker.pending.push_back(crate::engine::outcome_tracker::PendingOutcome {
-                process_name: "proc_W".to_string(),
-                throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
-                pressure_before: 0.75,
-                watts_before: 3.0,
-                swap_gb_at_throttle: 2.0,
-            });
+            tracker
+                .weights
+                .entry("proc_W".to_string())
+                .or_default()
+                .throttle_count += 1;
+            tracker
+                .pending
+                .push_back(crate::engine::outcome_tracker::PendingOutcome {
+                    process_name: "proc_W".to_string(),
+                    throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
+                    pressure_before: 0.75,
+                    watts_before: 3.0,
+                    swap_gb_at_throttle: 2.0,
+                });
         }
         tracker.tick(0.70); // 0.75→0.70 drop = effective
 
         for i in 0..5u32 {
-            tracker.weights.entry("proc_W".to_string()).or_default().throttle_count += 1;
-            tracker.pending.push_back(crate::engine::outcome_tracker::PendingOutcome {
-                process_name: "proc_W".to_string(),
-                throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
-                pressure_before: 0.70,
-                watts_before: 3.0,
-                swap_gb_at_throttle: 5.0,
-            });
+            tracker
+                .weights
+                .entry("proc_W".to_string())
+                .or_default()
+                .throttle_count += 1;
+            tracker
+                .pending
+                .push_back(crate::engine::outcome_tracker::PendingOutcome {
+                    process_name: "proc_W".to_string(),
+                    throttled_at: now - std::time::Duration::from_secs(31 + i as u64),
+                    pressure_before: 0.70,
+                    watts_before: 3.0,
+                    swap_gb_at_throttle: 5.0,
+                });
         }
         tracker.tick(0.70); // no drop = ineffective
 
@@ -1780,27 +1980,40 @@ mod tests {
         // Idle arousal state: threshold ~0.10 (raised above base 0.08)
         let mut idle_arousal = ArousalState::default();
         let calm = Salience::compute(0.1, 0.0, 0.0, 0.0);
-        for _ in 0..50 { idle_arousal.update(calm); }
+        for _ in 0..50 {
+            idle_arousal.update(calm);
+        }
         let idle_threshold = idle_arousal.adjusted_drift_threshold(0.08);
 
         // Crisis arousal state: threshold ~0.06 (lowered below base 0.08)
         let mut crisis_arousal = ArousalState::default();
         let crisis = Salience::compute(0.9, -0.05, 0.9, 7.0);
-        for _ in 0..50 { crisis_arousal.update(crisis); }
+        for _ in 0..50 {
+            crisis_arousal.update(crisis);
+        }
         let crisis_threshold = crisis_arousal.adjusted_drift_threshold(0.08);
 
         // Crisis threshold must be strictly lower (more sensitive)
         assert!(
             crisis_threshold < idle_threshold,
             "crisis threshold {:.4} should be < idle threshold {:.4}",
-            crisis_threshold, idle_threshold
+            crisis_threshold,
+            idle_threshold
         );
 
         // Verify the threshold arithmetic: with the same drift score,
         // one state recalibrates and the other doesn't (if drift is in the gap).
         // The key property: crisis_threshold < 0.08 < idle_threshold.
-        assert!(crisis_threshold < 0.08, "crisis should lower threshold below base: {:.4}", crisis_threshold);
-        assert!(idle_threshold > 0.08, "idle should raise threshold above base: {:.4}", idle_threshold);
+        assert!(
+            crisis_threshold < 0.08,
+            "crisis should lower threshold below base: {:.4}",
+            crisis_threshold
+        );
+        assert!(
+            idle_threshold > 0.08,
+            "idle should raise threshold above base: {:.4}",
+            idle_threshold
+        );
 
         // Suppress unused variable warning
         let _ = drift_score;
@@ -1832,7 +2045,10 @@ mod tests {
         let b2 = t2.tick(0.70);
 
         // Both should see 1 effective outcome (pressure dropped 0.05)
-        assert_eq!(b1.effective_names.len(), b2.effective_names.len(),
-            "record_throttle_with_swap must resolve same as record_throttle");
+        assert_eq!(
+            b1.effective_names.len(),
+            b2.effective_names.len(),
+            "record_throttle_with_swap must resolve same as record_throttle"
+        );
     }
 }
