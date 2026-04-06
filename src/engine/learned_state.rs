@@ -274,6 +274,54 @@ impl LearnableParams {
         self.meta_effectiveness_ema = self.meta_effectiveness_ema.clamp(0.0, 1.0);
         self.meta_learning_velocity = self.meta_learning_velocity.clamp(0.0, 1.0);
     }
+
+    /// Second-order meta-learning: adjust learning rates based on system behavior.
+    ///
+    /// Called every 500 cycles. Tracks two signals:
+    /// - `meta_effectiveness_ema`: EMA of overall optimization effectiveness
+    /// - `meta_learning_velocity`: EMA of |param_delta| per tuning cycle
+    ///
+    /// Decision matrix:
+    /// - Velocity low + effectiveness falling → stuck: multiply rates ×1.5 (explore more)
+    /// - Velocity low + effectiveness stable  → converged: multiply rates ×0.8 (slow down)
+    /// - Velocity high → actively adapting: no change
+    ///
+    /// Safety: only adjusts learning *rates*, never safety thresholds. All clamped.
+    pub fn meta_learn(&mut self, current_effectiveness: f64, param_delta: f64) {
+        // Update meta EMA trackers
+        let alpha = 0.01; // very slow: half-life ≈ 69 cycles at 500-cycle intervals
+        self.meta_effectiveness_ema =
+            (1.0 - alpha) * self.meta_effectiveness_ema + alpha * current_effectiveness;
+        self.meta_learning_velocity =
+            (1.0 - alpha) * self.meta_learning_velocity + alpha * param_delta.abs();
+        self.tuning_cycles += 1;
+
+        // Need at least 3 meta-learning cycles before acting
+        if self.tuning_cycles < 3 {
+            return;
+        }
+
+        let velocity_low = self.meta_learning_velocity < 0.005;
+        let effectiveness_falling = current_effectiveness < self.meta_effectiveness_ema - 0.02;
+        let effectiveness_stable =
+            (current_effectiveness - self.meta_effectiveness_ema).abs() < 0.02;
+
+        if velocity_low && effectiveness_falling {
+            // Stuck: increase exploration — multiply learning rates ×1.5
+            self.zone_alpha *= 1.5;
+            self.hazard_lr *= 1.5;
+            self.nars_decay_factor = (self.nars_decay_factor * 0.98).max(0.80); // faster forgetting
+        } else if velocity_low && effectiveness_stable {
+            // Converged: slow down — multiply learning rates ×0.8
+            self.zone_alpha *= 0.8;
+            self.hazard_lr *= 0.8;
+            self.nars_decay_factor = (self.nars_decay_factor * 1.005).min(0.99); // slower forgetting
+        }
+        // High velocity → actively adapting, no change needed
+
+        // Re-validate after adjustment
+        self.validate();
+    }
 }
 
 /// Everything Apollo learns at runtime, in one serializable struct.
@@ -1158,5 +1206,86 @@ mod tests {
         // After validation, must be strictly increasing with ≥0.05 gap.
         assert!(lp.rl_pressure_bands[1] > lp.rl_pressure_bands[0]);
         assert!(lp.rl_pressure_bands[2] > lp.rl_pressure_bands[1]);
+    }
+
+    // ── Meta-learning tests (Phase 6) ───────────────────────────────────────
+
+    #[test]
+    fn meta_learn_stuck_increases_learning_rates() {
+        let mut lp = LearnableParams::default();
+        // Build up a solid meta_effectiveness_ema by running many cycles
+        // α=0.01 → need ~100 cycles to converge
+        for _ in 0..200 {
+            lp.meta_learn(0.60, 0.001);
+        }
+        let alpha_before = lp.zone_alpha;
+        let lr_before = lp.hazard_lr;
+        // Now effectiveness drops below the EMA - 0.02 → stuck
+        lp.meta_learn(0.30, 0.001);
+        assert!(
+            lp.zone_alpha > alpha_before || lp.hazard_lr > lr_before,
+            "stuck system should increase learning rates: zone_alpha {} vs {}, hazard_lr {} vs {}",
+            lp.zone_alpha, alpha_before, lp.hazard_lr, lr_before
+        );
+    }
+
+    #[test]
+    fn meta_learn_converged_decreases_learning_rates() {
+        let mut lp = LearnableParams::default();
+        // Build up stable effectiveness EMA
+        for _ in 0..200 {
+            lp.meta_learn(0.50, 0.001);
+        }
+        let alpha_before = lp.zone_alpha;
+        let lr_before = lp.hazard_lr;
+        // Simulate converged: low velocity, stable effectiveness (within ±0.02)
+        lp.meta_learn(0.50, 0.001);
+        assert!(
+            lp.zone_alpha <= alpha_before && lp.hazard_lr <= lr_before,
+            "converged system should decrease learning rates: zone_alpha {} vs {}, hazard_lr {} vs {}",
+            lp.zone_alpha, alpha_before, lp.hazard_lr, lr_before
+        );
+    }
+
+    #[test]
+    fn meta_learn_respects_clamps_after_many_stuck_cycles() {
+        let mut lp = LearnableParams::default();
+        // Many stuck cycles → rates should be clamped
+        for i in 0..100 {
+            lp.meta_learn(0.50 - (i as f64) * 0.005, 0.001);
+        }
+        assert!(
+            lp.zone_alpha <= 0.05,
+            "zone_alpha should be clamped: {}",
+            lp.zone_alpha
+        );
+        assert!(
+            lp.hazard_lr <= 0.1,
+            "hazard_lr should be clamped: {}",
+            lp.hazard_lr
+        );
+    }
+
+    #[test]
+    fn meta_learn_no_action_before_warmup() {
+        let mut lp = LearnableParams::default();
+        let alpha_before = lp.zone_alpha;
+        // Only 2 cycles → no adjustment yet
+        lp.meta_learn(0.30, 0.001);
+        lp.meta_learn(0.30, 0.001);
+        assert_eq!(
+            lp.zone_alpha, alpha_before,
+            "should not adjust before warmup"
+        );
+    }
+
+    #[test]
+    fn meta_learn_tuning_cycles_increment() {
+        let mut lp = LearnableParams::default();
+        assert_eq!(lp.tuning_cycles, 0);
+        lp.meta_learn(0.50, 0.01);
+        assert_eq!(lp.tuning_cycles, 1);
+        lp.meta_learn(0.50, 0.01);
+        assert_eq!(lp.tuning_cycles, 2);
     }
 }
