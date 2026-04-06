@@ -5223,6 +5223,25 @@ fn main() -> anyhow::Result<()> {
                         pg.degradation.update(&inp).clone()
                     };
 
+                    // ── Cognitive gate: block_aggressive / observe_only ──────────────
+                    // Epistemic uncertainty > 0.70 → Conservative (no SIGSTOP, no throttle).
+                    // Epistemic uncertainty > 0.85 → Observe (no actions at all).
+                    // [Sutton 2018 §13: reduce action scope under high policy uncertainty]
+                    // [Lakshminarayanan 2017: predictive uncertainty → action inhibition]
+                    let op_mode = if prev_cog_decision.as_ref().map_or(false, |d| d.observe_only)
+                        && op_mode == OperationMode::Full
+                    {
+                        tracing::debug!("cognitive gate: observe_only → OperationMode::Observe");
+                        OperationMode::Observe
+                    } else if prev_cog_decision.as_ref().map_or(false, |d| d.block_aggressive)
+                        && op_mode == OperationMode::Full
+                    {
+                        tracing::debug!("cognitive gate: block_aggressive → OperationMode::Conservative");
+                        OperationMode::Conservative
+                    } else {
+                        op_mode
+                    };
+
                     // Filter actions based on degradation tier.
                     let filtered_actions: Vec<RootAction> = if op_mode == OperationMode::Emergency {
                         // Emergency: only unfreeze, no new actions.
@@ -5381,9 +5400,25 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // ── Cognitive gate: pause_learning ───────────────────────────────────
+                // UCHS < 0.40 (recovery mode) → skip weight updates this cycle.
+                // Arousal EMA and causal graph still update (safe, no Bayesian corruption).
+                // [Goodfellow 2016 §7: regularization via confidence-adaptive learning rate]
+                let cognitive_pause = prev_cog_decision
+                    .as_ref()
+                    .map_or(false, |d| d.pause_learning);
+                if cognitive_pause {
+                    tracing::debug!(
+                        uchs = prev_cog_decision.as_ref().map_or(0.0, |d| d.uchs_composite),
+                        "cognitive gate: learning paused (UCHS recovery mode)"
+                    );
+                }
+
                 // Learning tick: outcome tracking, causal graph, RL cables, predictive
                 // agent, and periodic persist (every 100 cycles). Extracted to
                 // learning_tick.rs for readability; behaviour is unchanged.
+                // Skipped when UCHS recovery mode active (cognitive_pause).
+                if !cognitive_pause {
                 learning_tick::run_learning_tick(
                     &snapshot,
                     &cycle_hw_snap,
@@ -5407,6 +5442,7 @@ fn main() -> anyhow::Result<()> {
                     persist_generations,
                     skills_path(),
                 );
+                } // end if !cognitive_pause
                 // ── Neurocognitive tick ──────────────────────────────────────────────
                 // Runs after learning_tick so all signals (drift, causal, arousal) are
                 // fresh. Feeds 8 cognitive modules. Result stored in prev_cog_decision
