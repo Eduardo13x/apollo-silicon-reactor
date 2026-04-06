@@ -25,7 +25,7 @@ use apollo_optimizer::engine::daemon_state::SharedState;
 use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_optimizer::engine::execute_actions::ExecuteOutcomes;
 use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
-use apollo_optimizer::engine::learned_state::{LearnedState, RestoreQualityMonitor};
+use apollo_optimizer::engine::learned_state::{LearnableParams, LearnedState, RestoreQualityMonitor};
 use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningPipeline};
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::nars_belief::{ArousalState, Salience};
@@ -86,6 +86,7 @@ pub fn run_learning_tick<'a>(
     pending_trial_skill: Option<(String, f64)>,
     last_specialist_votes: Option<(&[SpecialistVote], Intervention)>,
     log_ingester: &mut SystemLogIngester,
+    learnable_params: &mut LearnableParams,
     ls_path: &str,
     persist_generations: u32,
     skills_path: &str,
@@ -390,7 +391,8 @@ pub fn run_learning_tick<'a>(
     if cycle_count % 200 == 100 {
         if let Some(rl) = &lctx.overflow_guard.rl_agent {
             if let Some((p_bands, c_bands)) = rl.auto_tune_bands() {
-                let _ = (p_bands, c_bands); // bands available for future wiring to LearnableParams
+                learnable_params.rl_pressure_bands = p_bands;
+                learnable_params.rl_compressor_bands = c_bands;
             }
         }
     }
@@ -468,17 +470,12 @@ pub fn run_learning_tick<'a>(
     // (velocity low + effectiveness stable → slow down).
     // Safety: only adjusts rates, never safety thresholds. All clamped.
     if cycle_count % 500 == 250 {
-        use apollo_optimizer::engine::learned_state::LearnableParams;
         let effectiveness = lctx.outcome_tracker.overall_effectiveness();
         // Compute param delta as proxy for velocity: zone alpha change rate
         let zone_delta = (signal_digest.pressure_smooth
             - lctx.signal_intel.effective_zones(0).0)
             .abs();
-        // Thread-safe: create/update learnable params locally, will be persisted at next persist
-        // For now, we log the meta-learning decision. Full wiring through LearnableParams
-        // happens when the persist path carries learnable_params.
-        let mut lp = LearnableParams::default();
-        lp.meta_learn(effectiveness, zone_delta);
+        learnable_params.meta_learn(effectiveness, zone_delta);
     }
 
     // ── Cable A: OutcomeTracker → RL reward signal ───────────────────────────
@@ -585,7 +582,7 @@ pub fn run_learning_tick<'a>(
             Some(arousal_state.clone()),
             Some(lctx.causal_graph),
             None, // process_baselines: persisted at shutdown via main.rs
-            None, // learnable_params: wired in Phase 2
+            Some(learnable_params.clone()),
         );
         // Causal graph observability: log solid/weak links discovered.
         let solid = lctx.causal_graph.solid_count();

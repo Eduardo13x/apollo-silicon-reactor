@@ -56,7 +56,7 @@ use apollo_optimizer::engine::iokit_sensors::{HardwareSnapshot, ThermalState};
 use apollo_optimizer::engine::jetsam_control;
 use apollo_optimizer::engine::kqueue_pressure;
 use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
-use apollo_optimizer::engine::learned_state::{LearnedState, RestoreQualityMonitor};
+use apollo_optimizer::engine::learned_state::{LearnableParams, LearnedState, RestoreQualityMonitor};
 use apollo_optimizer::engine::llm::{
     feedback_path_root, load_repo_config, policy_path_root, read_json, state_paths_root,
     suggestions_path_root, write_json, LearnedPolicy, LlmAdvisor, LlmConfig, LlmState,
@@ -906,6 +906,7 @@ fn main() -> anyhow::Result<()> {
             let mut restored_process_baselines: Option<
                 apollo_optimizer::engine::process_baseline::ProcessBaselineMap,
             > = None;
+            let mut learnable_params = LearnableParams::default();
             if let Some(learned) = LearnedState::load(ls_path) {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
@@ -915,7 +916,7 @@ fn main() -> anyhow::Result<()> {
                 // If skill_registry field is absent (old file), the legacy load is kept.
                 // Returns (overflow_history, frozen_pids, arousal_state) for
                 // components that need caller-side wiring.
-                let (ls_overflow_history, ls_frozen_pids, ls_arousal, ls_baselines, _ls_learnable) =
+                let (ls_overflow_history, ls_frozen_pids, ls_arousal, ls_baselines, restored_lp) =
                     learned.apply(
                         &mut signal_intel,
                         &mut outcome_tracker,
@@ -924,6 +925,7 @@ fn main() -> anyhow::Result<()> {
                         &mut effectiveness_tracker,
                         Some(&mut causal_graph),
                     );
+                learnable_params = restored_lp;
                 restored_arousal = ls_arousal;
                 // Restore process baselines — wired into energy_pid_tracker after DaemonSubsystems::new().
                 restored_process_baselines = ls_baselines;
@@ -5720,6 +5722,7 @@ fn main() -> anyhow::Result<()> {
                         pending_trial_skill.clone(),
                         last_specialist_votes.as_ref().map(|(v, i)| (v.as_slice(), *i)),
                         &mut log_ingester,
+                        &mut learnable_params,
                         ls_path.to_str().unwrap_or(""),
                         persist_generations,
                         skills_path(),
@@ -6107,7 +6110,7 @@ fn main() -> anyhow::Result<()> {
                 Some(arousal_state.clone()),
                 Some(&causal_graph),
                 Some(energy_pid_tracker.baseline.clone()),
-                None, // learnable_params: wired in Phase 2
+                Some(learnable_params.clone()),
             );
 
             // Revert sysctls to defaults on shutdown.
