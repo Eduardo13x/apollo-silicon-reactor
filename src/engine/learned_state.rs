@@ -564,9 +564,15 @@ impl LearnedState {
             // 5. NARS belief confidence decay: old evidence becomes less certain.
             //    Processes not observed recently lose confidence → new observations
             //    have more influence, preventing stale beliefs from dominating.
-            //    [Bayesian forgetting] factor=0.95 → half-life ≈ 14 persist cycles.
+            //    Factor from LearnableParams (default 0.95 → half-life ≈ 14 persist cycles).
+            //    Meta-learning adjusts it: stuck→faster forgetting, converged→slower.
             if let Some(dd) = &mut ot.drift_detector {
-                dd.decay_confidence(0.95);
+                let decay = self
+                    .learnable_params
+                    .as_ref()
+                    .map(|lp| lp.nars_decay_factor)
+                    .unwrap_or(0.95);
+                dd.decay_confidence(decay);
             }
         }
 
