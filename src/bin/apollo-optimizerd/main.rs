@@ -3321,12 +3321,31 @@ fn main() -> anyhow::Result<()> {
                 // JIT-compiling PIDs (from syscall_classifier) are merged in so that
                 // decide_actions treats them as interactive and skips throttling.
                 let behavior_interactive_pids: HashSet<u32> = {
+                    // Apple background daemons that are I/O-bound (low cpu_wall_ratio)
+                    // but must NEVER be classified as interactive or boosted.
+                    // The bad_interactive scrubber only covers learned_interactive;
+                    // this denylist covers the behavioral (cpu_wall_ratio) path.
+                    // [Android LMK] Protection earned by user interaction, not I/O.
+                    // Production data: searchpartyd got 17 incorrect boosts via this path.
+                    const BEHAVIOR_DENYLIST: &[&str] = &[
+                        "searchpartyd",           // Find My / Handoff BLE scanning
+                        "corespeechd",            // Siri speech (background)
+                        "suggestd",               // Spotlight/Siri suggestions ML
+                        "duetexpertd",            // Siri predictions / Proactive
+                        "photoanalysisd",         // Photos ML tagging
+                        "mediaanalysisd",         // Media content analysis
+                        "intelligencecontextd",   // Apple Intelligence
+                        "mlhostd",                // Core ML inference host
+                        "modelmanagerd",          // On-device model cache
+                        "rtcreportingd",          // RealTimeComm diagnostics
+                    ];
                     let model = state.usage.lock_recover();
                     let interactive_names: HashSet<&str> = model.usage_model
                         .entries()
                         .iter()
-                        .filter(|(_, entry)| {
+                        .filter(|(name, entry)| {
                             apollo_optimizer::engine::usage_model::is_behavior_interactive(entry)
+                                && !BEHAVIOR_DENYLIST.iter().any(|d| name.contains(d))
                         })
                         .map(|(name, _)| name.as_str())
                         .collect();

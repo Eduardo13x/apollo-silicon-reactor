@@ -47,7 +47,7 @@ const NOISE_APPS: [&str; 4] = [
 /// Apple on-device intelligence / ML background daemons.
 /// These run opportunistically (idle + AC power) and are safe to throttle
 /// aggressively when memory pressure is high — they resume when pressure drops.
-const DEFERRABLE_DAEMONS: [&str; 8] = [
+const DEFERRABLE_DAEMONS: [&str; 9] = [
     "duetexpertd",        // Siri predictions / Proactive engine
     "suggestd",           // Spotlight/Siri suggestions ML
     "photoanalysisd",     // Photos ML tagging / face recognition
@@ -56,6 +56,7 @@ const DEFERRABLE_DAEMONS: [&str; 8] = [
     "mlhostd",            // Metal/Core ML on-device inference host
     "modelmanagerd",      // On-device model cache manager
     "corespeechd",        // Siri speech recognition (background)
+    "searchpartyd",       // Find My / Handoff BLE — 17 incorrect boosts in prod
 ];
 
 const BLOCKER_APPS: [&str; 7] = [
