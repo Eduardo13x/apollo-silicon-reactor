@@ -1124,6 +1124,9 @@ fn main() -> anyhow::Result<()> {
             // Pending trial skill: (name, pressure_before). Recorded next cycle.
             // Restored from LearnedState so a trial started before a crash is still evaluated.
             let mut pending_trial_skill: Option<(String, f64)> = restored_trial_skill;
+            // Last specialist votes + chosen intervention for disagreement feedback.
+            // Stored when had_disagreement is true; consumed by learning_tick next cycle.
+            let mut last_specialist_votes: Option<(Vec<SpecialistVote>, Intervention)> = None;
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
             // Gate network_monitor.tick() to every ~10s since netstat is blocking.
@@ -3400,6 +3403,13 @@ fn main() -> anyhow::Result<()> {
 
                     let vote_result = tally_votes(&votes);
                     let intervention = vote_result.intervention;
+
+                    // Loop 3: store votes for disagreement outcome feedback next cycle.
+                    if vote_result.had_disagreement {
+                        last_specialist_votes = Some((votes.clone(), intervention));
+                    } else {
+                        last_specialist_votes = None;
+                    }
 
                     // Cable: had_disagreement → conservative safety route.
                     // When specialists disagree AND the winning score is weak (<0.4),
@@ -5706,6 +5716,7 @@ fn main() -> anyhow::Result<()> {
                         &mut prev_workload_mode,
                         &mut arousal_state,
                         pending_trial_skill.clone(),
+                        last_specialist_votes.as_ref().map(|(v, i)| (v.as_slice(), *i)),
                         ls_path.to_str().unwrap_or(""),
                         persist_generations,
                         skills_path(),

@@ -206,13 +206,15 @@ impl SpecialistAccuracyTracker {
         if specialist_idx < specialist::COUNT {
             let signal = if correct { 1.0 } else { 0.0 };
             self.accuracy[specialist_idx] =
-                (1.0 - Self::EMA_ALPHA) * self.accuracy[specialist_idx]
-                    + Self::EMA_ALPHA * signal;
+                (1.0 - Self::EMA_ALPHA) * self.accuracy[specialist_idx] + Self::EMA_ALPHA * signal;
             self.updates += 1;
             // NARS: track specialist drift belief.
             // When a specialist's accuracy regime changes (was accurate, now not),
             // the belief frequency will shift and trigger recalibration.
-            let name = specialist::NAMES.get(specialist_idx).copied().unwrap_or("unknown");
+            let name = specialist::NAMES
+                .get(specialist_idx)
+                .copied()
+                .unwrap_or("unknown");
             self.drift_detector.observe(name, correct);
             // Auto-recalibrate: if drift detected, reset drifted specialists toward neutral.
             if self.drift_detector.needs_recalibration() {
@@ -222,14 +224,16 @@ impl SpecialistAccuracyTracker {
                 // [ARM NEON Guide §4] batch EMA: alpha * prior + (1-alpha) * current.
                 // Mask encodes selective update: alpha[i] = 0.1 if drifted, 0.0 if stable.
                 let mut ema_f32 = [0.0f32; 4];
-                let mut alphas  = [0.0f32; 4];
-                let prior_f32   = Self::INIT_ACCURACY as f32;
+                let mut alphas = [0.0f32; 4];
+                let prior_f32 = Self::INIT_ACCURACY as f32;
 
                 for i in 0..specialist::COUNT {
                     ema_f32[i] = self.accuracy[i] as f32;
                     let n = specialist::NAMES[i];
                     alphas[i] = if let Some(tv) = self.drift_detector.belief(n) {
-                        if tv.confidence < 0.3 || (tv.frequency as f64 - self.accuracy[i]).abs() > 0.20 {
+                        if tv.confidence < 0.3
+                            || (tv.frequency as f64 - self.accuracy[i]).abs() > 0.20
+                        {
                             0.1_f32 // drifted: pull 10% toward prior
                         } else {
                             0.0_f32 // stable: no change
@@ -295,6 +299,38 @@ impl SpecialistAccuracyTracker {
     pub fn total_updates(&self) -> u64 {
         self.updates
     }
+
+    /// Record disagreement outcome: given the votes and whether the chosen
+    /// intervention was effective, boost correct specialists and penalize wrong ones.
+    ///
+    /// When specialists disagree, one faction was right and the other wrong.
+    /// After observing the outcome (pressure dropped = effective), we can
+    /// attribute correctness:
+    /// - Specialists who voted for the winning intervention: correct = effective
+    /// - Specialists who voted differently: correct = !effective
+    ///
+    /// This closes the feedback loop where `had_disagreement` was logged but
+    /// never used to improve specialist weights.
+    pub fn record_disagreement_outcome(
+        &mut self,
+        votes: &[SpecialistVote],
+        chosen: Intervention,
+        was_effective: bool,
+    ) {
+        for vote in votes {
+            let voted_for_winner = vote.intervention == chosen;
+            // If the chosen action was effective, those who voted for it were right.
+            // If it was ineffective, those who voted against it were right.
+            let correct = if voted_for_winner {
+                was_effective
+            } else {
+                !was_effective
+            };
+            if let Some(idx) = specialist::index_of(vote.name) {
+                self.update(idx, correct);
+            }
+        }
+    }
 }
 
 // ── Context vector ───────────────────────────────────────────────────────────
@@ -349,8 +385,7 @@ impl AgentContext {
         // effectiveness [0,1] penalized by low_value_ratio [0,1].
         // When low_value_ratio is high, the effective signal drops,
         // telling LinUCB that current interventions aren't working.
-        let feedback_signal =
-            (outcome_effectiveness * (1.0 - low_value_ratio)).clamp(0.0, 1.0);
+        let feedback_signal = (outcome_effectiveness * (1.0 - low_value_ratio)).clamp(0.0, 1.0);
 
         Self {
             features: [
@@ -788,11 +823,11 @@ impl PredictiveAgent {
         let core_factor = (cores as f64 / 8.0).clamp(0.5, 1.5); // 4→0.5, 8→1.0, 12→1.5
 
         let priors = [
-            0.0,                          // Observe: neutral
-            0.3 * ram_factor,             // TightenThresholds: better with low RAM
-            0.1,                          // SuggestAggressive: mild prior
-            0.15 * core_factor,           // PreThrottleNoise: better with more cores
-            0.25 * ram_factor,            // ProactivePurge: better with low RAM
+            0.0,                // Observe: neutral
+            0.3 * ram_factor,   // TightenThresholds: better with low RAM
+            0.1,                // SuggestAggressive: mild prior
+            0.15 * core_factor, // PreThrottleNoise: better with more cores
+            0.25 * ram_factor,  // ProactivePurge: better with low RAM
         ];
 
         // Inject N synthetic pulls per arm (like pseudo-observations).
@@ -994,24 +1029,44 @@ mod tests {
     fn test_feedback_signal_combines_effectiveness_and_low_value() {
         // High effectiveness + no low-value → high feedback signal.
         let ctx_good = AgentContext::build(
-            0.5, SwapTrend::Stable, -1, 800.0, 50.0, 5000.0,
-            WorkloadType::General, 14, 0.0, 0.0,
-            0.80,  // outcome_effectiveness
-            0.0,   // low_value_ratio
+            0.5,
+            SwapTrend::Stable,
+            -1,
+            800.0,
+            50.0,
+            5000.0,
+            WorkloadType::General,
+            14,
+            0.0,
+            0.0,
+            0.80, // outcome_effectiveness
+            0.0,  // low_value_ratio
         );
-        assert!((ctx_good.features[11] - 0.80).abs() < 1e-6,
-            "no low-value: feedback should equal effectiveness");
+        assert!(
+            (ctx_good.features[11] - 0.80).abs() < 1e-6,
+            "no low-value: feedback should equal effectiveness"
+        );
 
         // High effectiveness + high low-value → penalized feedback.
         let ctx_bad = AgentContext::build(
-            0.5, SwapTrend::Stable, -1, 800.0, 50.0, 5000.0,
-            WorkloadType::General, 14, 0.0, 0.0,
-            0.80,  // outcome_effectiveness
-            0.50,  // 50% low-value
+            0.5,
+            SwapTrend::Stable,
+            -1,
+            800.0,
+            50.0,
+            5000.0,
+            WorkloadType::General,
+            14,
+            0.0,
+            0.0,
+            0.80, // outcome_effectiveness
+            0.50, // 50% low-value
         );
-        assert!((ctx_bad.features[11] - 0.40).abs() < 1e-6,
+        assert!(
+            (ctx_bad.features[11] - 0.40).abs() < 1e-6,
             "50% low-value: feedback should be 0.80 * 0.50 = 0.40, got {}",
-            ctx_bad.features[11]);
+            ctx_bad.features[11]
+        );
 
         // Darwinian: bad context should signal lower than good context.
         assert!(ctx_bad.features[11] < ctx_good.features[11]);
@@ -1062,7 +1117,11 @@ mod tests {
 
         // After seeding, arms should have pull_count > 0.
         let pulls = agent.arm_pulls();
-        assert!(pulls.iter().all(|&p| p > 0), "all arms should have pulls: {:?}", pulls);
+        assert!(
+            pulls.iter().all(|&p| p > 0),
+            "all arms should have pulls: {:?}",
+            pulls
+        );
 
         // TightenThresholds (arm 1) should have higher avg reward than Observe (arm 0)
         // on 8GB RAM (ram_factor=2.0 → 0.3*2.0=0.6 vs 0.0).
@@ -1088,7 +1147,10 @@ mod tests {
         let pulls_before = agent.arm_pulls();
         agent.meta_seed(8.0, 8); // should be no-op
         let pulls_after = agent.arm_pulls();
-        assert_eq!(pulls_before, pulls_after, "meta_seed should be no-op after training");
+        assert_eq!(
+            pulls_before, pulls_after,
+            "meta_seed should be no-op after training"
+        );
     }
 
     #[test]
@@ -1107,7 +1169,8 @@ mod tests {
         assert!(
             avg_low[1] > avg_high[1],
             "TightenThresholds should be more valued on 8GB ({}) than 32GB ({})",
-            avg_low[1], avg_high[1]
+            avg_low[1],
+            avg_high[1]
         );
     }
 
@@ -1158,7 +1221,10 @@ mod tests {
             },
         ];
         let result = tally_votes(&votes);
-        assert!(result.had_disagreement, "two different non-Observe proposals = disagreement");
+        assert!(
+            result.had_disagreement,
+            "two different non-Observe proposals = disagreement"
+        );
     }
 
     #[test]
@@ -1307,8 +1373,12 @@ mod tests {
             Intervention::ProactivePurge,
         ];
         for v in variants {
-            assert_eq!(Intervention::from_index(v.index()), v,
-                "from_index(index()) should be identity for {:?}", v);
+            assert_eq!(
+                Intervention::from_index(v.index()),
+                v,
+                "from_index(index()) should be identity for {:?}",
+                v
+            );
         }
     }
 
@@ -1337,7 +1407,10 @@ mod tests {
             tracker.update(specialist::LINUCB, true);
         }
         let w = tracker.weight(specialist::LINUCB);
-        assert!(w <= 1.0, "weight must not exceed 1.0 after 1000 correct: {w}");
+        assert!(
+            w <= 1.0,
+            "weight must not exceed 1.0 after 1000 correct: {w}"
+        );
     }
 
     #[test]
@@ -1347,7 +1420,10 @@ mod tests {
             tracker.update(specialist::LINUCB, false);
         }
         let w = tracker.weight(specialist::LINUCB);
-        assert!(w >= 0.0, "weight must not go below 0.0 after 1000 incorrect: {w}");
+        assert!(
+            w >= 0.0,
+            "weight must not go below 0.0 after 1000 incorrect: {w}"
+        );
     }
 
     #[test]
@@ -1358,7 +1434,10 @@ mod tests {
             tracker.update(specialist::KALMAN, true);
         }
         let w = tracker.weight(specialist::KALMAN);
-        assert!(w > 0.97, "after 300 correct, weight should approach 1.0, got {w}");
+        assert!(
+            w > 0.97,
+            "after 300 correct, weight should approach 1.0, got {w}"
+        );
     }
 
     #[test]
@@ -1369,7 +1448,10 @@ mod tests {
             tracker.update(specialist::HAZARD, false);
         }
         let w = tracker.weight(specialist::HAZARD);
-        assert!(w < 0.03, "after 300 incorrect, weight should approach 0.0, got {w}");
+        assert!(
+            w < 0.03,
+            "after 300 incorrect, weight should approach 0.0, got {w}"
+        );
     }
 
     #[test]
@@ -1377,8 +1459,10 @@ mod tests {
         let tracker = SpecialistAccuracyTracker::new();
         // Out-of-range index should return the default INIT_ACCURACY (0.70).
         let w = tracker.weight(specialist::COUNT + 10);
-        assert!((w - 0.70).abs() < 1e-12,
-            "out-of-range index should return default 0.70, got {w}");
+        assert!(
+            (w - 0.70).abs() < 1e-12,
+            "out-of-range index should return default 0.70, got {w}"
+        );
     }
 
     #[test]
@@ -1386,7 +1470,11 @@ mod tests {
         let mut tracker = SpecialistAccuracyTracker::new();
         let before = tracker.total_updates();
         tracker.update(specialist::COUNT + 5, true);
-        assert_eq!(tracker.total_updates(), before, "out-of-range update should be no-op");
+        assert_eq!(
+            tracker.total_updates(),
+            before,
+            "out-of-range update should be no-op"
+        );
     }
 
     #[test]
@@ -1399,10 +1487,86 @@ mod tests {
         let json = serde_json::to_string(&tracker).expect("serialize");
         let back: SpecialistAccuracyTracker = serde_json::from_str(&json).expect("deserialize");
         for i in 0..specialist::COUNT {
-            assert!((back.weight(i) - tracker.weight(i)).abs() < 1e-12,
-                "weight[{i}] mismatch after serde roundtrip");
+            assert!(
+                (back.weight(i) - tracker.weight(i)).abs() < 1e-12,
+                "weight[{i}] mismatch after serde roundtrip"
+            );
         }
         assert_eq!(back.total_updates(), tracker.total_updates());
+    }
+
+    // ── record_disagreement_outcome tests ─────────────────────────────────
+
+    #[test]
+    fn test_disagreement_outcome_boosts_correct_specialist() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        let votes = vec![
+            SpecialistVote {
+                name: "linucb",
+                intervention: Intervention::TightenThresholds,
+                confidence: 0.8,
+            },
+            SpecialistVote {
+                name: "hazard",
+                intervention: Intervention::ProactivePurge,
+                confidence: 0.6,
+            },
+        ];
+        let before_linucb = tracker.weight(specialist::LINUCB);
+        let before_hazard = tracker.weight(specialist::HAZARD);
+        // TightenThresholds won and was effective → linucb was right, hazard wrong
+        tracker.record_disagreement_outcome(&votes, Intervention::TightenThresholds, true);
+        assert!(
+            tracker.weight(specialist::LINUCB) > before_linucb,
+            "correct specialist should be boosted"
+        );
+        assert!(
+            tracker.weight(specialist::HAZARD) < before_hazard,
+            "wrong specialist should be penalized"
+        );
+    }
+
+    #[test]
+    fn test_disagreement_outcome_ineffective_penalizes_winner() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        let votes = vec![
+            SpecialistVote {
+                name: "linucb",
+                intervention: Intervention::TightenThresholds,
+                confidence: 0.8,
+            },
+            SpecialistVote {
+                name: "hazard",
+                intervention: Intervention::ProactivePurge,
+                confidence: 0.6,
+            },
+        ];
+        let before_linucb = tracker.weight(specialist::LINUCB);
+        let before_hazard = tracker.weight(specialist::HAZARD);
+        // TightenThresholds won but was NOT effective → linucb wrong, hazard right
+        tracker.record_disagreement_outcome(&votes, Intervention::TightenThresholds, false);
+        assert!(
+            tracker.weight(specialist::LINUCB) < before_linucb,
+            "winner of ineffective intervention should be penalized"
+        );
+        assert!(
+            tracker.weight(specialist::HAZARD) > before_hazard,
+            "dissenter should be boosted when winner was wrong"
+        );
+    }
+
+    #[test]
+    fn test_disagreement_outcome_unknown_specialist_is_noop() {
+        let mut tracker = SpecialistAccuracyTracker::new();
+        let votes = vec![SpecialistVote {
+            name: "nonexistent",
+            intervention: Intervention::Observe,
+            confidence: 0.5,
+        }];
+        let updates_before = tracker.total_updates();
+        tracker.record_disagreement_outcome(&votes, Intervention::Observe, true);
+        // Unknown specialist name → no update
+        assert_eq!(tracker.total_updates(), updates_before);
     }
 
     // ── AgentContext edge cases ──────────────────────────────────────────────
@@ -1410,21 +1574,47 @@ mod tests {
     #[test]
     fn test_context_extreme_zero_pressure_no_panic() {
         let ctx = AgentContext::build(
-            0.0, SwapTrend::Decreasing, -1, 0.0, 0.0, 0.0,
-            WorkloadType::Idle, 0, 0.0, 0.0, 0.0, 0.0,
+            0.0,
+            SwapTrend::Decreasing,
+            -1,
+            0.0,
+            0.0,
+            0.0,
+            WorkloadType::Idle,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
         );
         assert!((ctx.features[0] - 0.0).abs() < 1e-10);
-        assert!(ctx.features.iter().all(|f| f.is_finite()), "all features must be finite");
+        assert!(
+            ctx.features.iter().all(|f| f.is_finite()),
+            "all features must be finite"
+        );
     }
 
     #[test]
     fn test_context_extreme_max_pressure_no_panic() {
         let ctx = AgentContext::build(
-            1.0, SwapTrend::Critical, 0, 9999.0, 99999.0, 999999.0,
-            WorkloadType::VideoEdit, 23, 1.0, -0.20, 1.0, 1.0,
+            1.0,
+            SwapTrend::Critical,
+            0,
+            9999.0,
+            99999.0,
+            999999.0,
+            WorkloadType::VideoEdit,
+            23,
+            1.0,
+            -0.20,
+            1.0,
+            1.0,
         );
         assert!((ctx.features[0] - 1.0).abs() < 1e-10);
-        assert!(ctx.features.iter().all(|f| f.is_finite()), "all features must be finite");
+        assert!(
+            ctx.features.iter().all(|f| f.is_finite()),
+            "all features must be finite"
+        );
     }
 
     // ── LinUCB post-warmup behavior & edge cases ─────────────────────────────
@@ -1445,7 +1635,10 @@ mod tests {
             Intervention::PreThrottleNoise,
             Intervention::ProactivePurge,
         ];
-        assert!(valid.contains(&action), "select_action must return a valid Intervention");
+        assert!(
+            valid.contains(&action),
+            "select_action must return a valid Intervention"
+        );
     }
 
     #[test]
@@ -1456,7 +1649,11 @@ mod tests {
         agent.observe_outcome(0.5); // no last_action — should be silent no-op
         assert_eq!(agent.total_cycles(), 1); // total_cycles still increments
         let pulls = agent.arm_pulls();
-        assert!(pulls.iter().all(|&p| p == 0), "no arms should have pulls: {:?}", pulls);
+        assert!(
+            pulls.iter().all(|&p| p == 0),
+            "no arms should have pulls: {:?}",
+            pulls
+        );
     }
 
     #[test]
@@ -1468,8 +1665,10 @@ mod tests {
         let ctx = dummy_context(0.5);
         let (action, confidence) = agent.select_action_with_confidence(&ctx);
         assert_eq!(action, Intervention::Observe);
-        assert!((confidence - 0.0).abs() < 1e-10,
-            "during warmup confidence should be 0.0, got {confidence}");
+        assert!(
+            (confidence - 0.0).abs() < 1e-10,
+            "during warmup confidence should be 0.0, got {confidence}"
+        );
     }
 
     #[test]
@@ -1480,8 +1679,10 @@ mod tests {
 
         let ctx = dummy_context(0.5);
         let (_, confidence) = agent.select_action_with_confidence(&ctx);
-        assert!(confidence >= 0.0 && confidence <= 1.0,
-            "confidence must be in [0, 1], got {confidence}");
+        assert!(
+            confidence >= 0.0 && confidence <= 1.0,
+            "confidence must be in [0, 1], got {confidence}"
+        );
     }
 
     #[test]
@@ -1508,7 +1709,11 @@ mod tests {
         let pulls = agent.arm_pulls();
         assert_eq!(pulls[0], 1, "Observe arm should have 1 pull");
         let avg = agent.arm_avg_rewards();
-        assert!(avg[0] < 0.0, "Observe should receive negative reward when pressure spikes: {}", avg[0]);
+        assert!(
+            avg[0] < 0.0,
+            "Observe should receive negative reward when pressure spikes: {}",
+            avg[0]
+        );
     }
 
     #[test]
@@ -1524,14 +1729,33 @@ mod tests {
     fn test_voting_dominant_specialist_wins() {
         // One specialist has weight 0.99, all others 0.01.
         let votes = vec![
-            SpecialistVote { name: "linucb", intervention: Intervention::ProactivePurge, confidence: 0.99 },
-            SpecialistVote { name: "hazard", intervention: Intervention::Observe, confidence: 0.01 },
-            SpecialistVote { name: "monopoly", intervention: Intervention::Observe, confidence: 0.01 },
-            SpecialistVote { name: "kalman", intervention: Intervention::Observe, confidence: 0.01 },
+            SpecialistVote {
+                name: "linucb",
+                intervention: Intervention::ProactivePurge,
+                confidence: 0.99,
+            },
+            SpecialistVote {
+                name: "hazard",
+                intervention: Intervention::Observe,
+                confidence: 0.01,
+            },
+            SpecialistVote {
+                name: "monopoly",
+                intervention: Intervention::Observe,
+                confidence: 0.01,
+            },
+            SpecialistVote {
+                name: "kalman",
+                intervention: Intervention::Observe,
+                confidence: 0.01,
+            },
         ];
         let result = tally_votes(&votes);
-        assert_eq!(result.intervention, Intervention::ProactivePurge,
-            "dominant specialist (0.99 vs 0.03) should win");
+        assert_eq!(
+            result.intervention,
+            Intervention::ProactivePurge,
+            "dominant specialist (0.99 vs 0.03) should win"
+        );
     }
 
     #[test]

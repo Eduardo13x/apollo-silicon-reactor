@@ -616,4 +616,44 @@ mod tests {
         reg.purge_unexecutable(&[]);
         assert_eq!(reg.len(), 1, "empty protected list → all skills kept");
     }
+
+    // ── Loop 1: skill outcome observation tests ─────────────────────────────
+
+    #[test]
+    fn test_skill_observes_outcome_via_throttle_prefix() {
+        let mut reg = SkillRegistry::new();
+        reg.learn("throttle:Dropbox", 0.70, "any", vec!["Dropbox".into()]);
+        assert_eq!(reg.skills["throttle:Dropbox"].apply_count, 0);
+        // Simulate resolved outcome feeding back to skill
+        reg.record_result_with_pressure("throttle:Dropbox", true, 0.72);
+        assert_eq!(reg.skills["throttle:Dropbox"].apply_count, 1);
+        assert_eq!(reg.skills["throttle:Dropbox"].success_count, 1);
+    }
+
+    #[test]
+    fn test_skill_adapts_pressure_from_outcome() {
+        let mut reg = SkillRegistry::new();
+        reg.learn("throttle:Safari", 0.65, "any", vec!["Safari".into()]);
+        let before = reg.skills["throttle:Safari"].min_pressure;
+        // Effective outcome at higher pressure → skill adapts upward
+        reg.record_result_with_pressure("throttle:Safari", true, 0.80);
+        let after = reg.skills["throttle:Safari"].min_pressure;
+        assert!(
+            after > before,
+            "effective outcome at higher pressure should shift threshold up"
+        );
+    }
+
+    #[test]
+    fn test_induced_skill_gets_outcome_feedback() {
+        let mut reg = SkillRegistry::new();
+        reg.register_induced(induced_skill("group:safari+dropbox", 0.60, 0));
+        // Simulate trial outcome feedback
+        reg.record_result_with_pressure("group:safari+dropbox", true, 0.70);
+        assert_eq!(reg.skills["group:safari+dropbox"].apply_count, 1);
+        assert_eq!(reg.skills["group:safari+dropbox"].success_count, 1);
+        // Pressure should have adapted
+        let p = reg.skills["group:safari+dropbox"].min_pressure;
+        assert!(p > 0.60, "pressure should adapt toward 0.70, got {p}");
+    }
 }

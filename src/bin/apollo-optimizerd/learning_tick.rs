@@ -30,6 +30,7 @@ use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningP
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::nars_belief::{ArousalState, Salience};
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
+use apollo_optimizer::engine::predictive_agent::{Intervention, SpecialistVote};
 use apollo_optimizer::engine::signal_intelligence::SignalDigest;
 use apollo_optimizer::engine::types::{FrozenPidEntry, FrozenStatePersisted};
 use apollo_optimizer::engine::workload_classifier::WorkloadMode;
@@ -56,6 +57,7 @@ use apollo_optimizer::engine::workload_classifier::WorkloadMode;
 /// - `last_restore_quality` — updated when restore monitor produces a verdict
 /// - `prev_package_watts` — previous cycle's package watts (Cable D, updated by this call)
 /// - `pending_trial_skill` — current trial skill (passed to persist, not modified here)
+/// - `last_specialist_votes` — if specialists disagreed last cycle: (votes, chosen intervention)
 /// - `prev_workload_mode` — previous cycle's workload mode (updated by this call for next cycle)
 /// - `arousal_state` — global EMA arousal tracker; updated here, used to adjust recalibration threshold
 /// - `ls_path` — filesystem path for unified learned state
@@ -81,6 +83,7 @@ pub fn run_learning_tick<'a>(
     prev_workload_mode: &mut WorkloadMode,
     arousal_state: &mut ArousalState,
     pending_trial_skill: Option<(String, f64)>,
+    last_specialist_votes: Option<(&[SpecialistVote], Intervention)>,
     ls_path: &str,
     persist_generations: u32,
     skills_path: &str,
@@ -298,6 +301,25 @@ pub fn run_learning_tick<'a>(
         // pre/post pressure captured by tick(). Cross-feeds are applied
         // at batch flush (every 8 observations or at persist time).
         for (name, pre_pressure, post_pressure) in batch.resolved_outcomes {
+            // ── Loop 1 fix: skills observe their outcomes ───────────────
+            // When a resolved outcome matches a known skill target, feed
+            // the result back so the skill adapts its min_pressure and
+            // success_rate from real data instead of only causal graph edges.
+            let effective = post_pressure < pre_pressure - 0.01;
+            {
+                let skill_name = format!("throttle:{}", name);
+                lctx.skill_registry
+                    .record_result_with_pressure(&skill_name, effective, pre_pressure as f32);
+            }
+            // Also match pending_trial_skill: induced skills (group:/batch:)
+            // that were trialed get outcome feedback through their skill name.
+            if let Some((ref trial_name, _)) = pending_trial_skill {
+                // Check if this process is a target of the trialed skill.
+                // The trial skill targets may include this process name.
+                lctx.skill_registry
+                    .record_result_with_pressure(trial_name, effective, pre_pressure as f32);
+            }
+
             let obs = LearningObservation {
                 process_name: name,
                 skill_name: None, // skill attribution tracked by pending_trial_skill path
@@ -352,6 +374,24 @@ pub fn run_learning_tick<'a>(
                 let _ = (p_bands, c_bands); // bands available for future wiring to LearnableParams
             }
         }
+    }
+
+    // ── Loop 2 fix: hazard model batch retrain ──────────────────────────────
+    // Every 50 cycles, replay buffered OOM events through the hazard model
+    // for mini-batch gradient refinement. This makes the hazard model learn
+    // from ALL observed overflows (not just the latest one).
+    if cycle_count % 50 == 15 {
+        let _steps = lctx.signal_intel.retrain_hazard_batch();
+    }
+
+    // ── Loop 3 fix: specialist disagreement outcome feedback ──────────────
+    // When specialists disagreed last cycle, observe whether the chosen
+    // intervention was effective and feed back to boost/penalize specialists.
+    if let Some((votes, chosen)) = last_specialist_votes {
+        // Simple heuristic: pressure dropped since last cycle → intervention was effective.
+        let was_effective = snapshot.pressure.memory_pressure < signal_digest.pressure_smooth;
+        lctx.specialist_accuracy
+            .record_disagreement_outcome(votes, chosen, was_effective);
     }
 
     // ── Cable A: OutcomeTracker → RL reward signal ───────────────────────────
