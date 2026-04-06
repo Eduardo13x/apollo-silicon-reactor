@@ -22,3 +22,5 @@ dc0400a	3889.0	53/55	1239	keep	Exp31: Graduated idle 6h/12h (fixes s51, s54, s55
 5539ade	4239.0	60/60	1239	keep	Exp33: Render pipeline exemption for waste+wakeup hog (fixes s57, s58)
 04bab54	5989.0	95/95	1239	keep	Exp34: AutoResearch x3 — latency_monitor + compressor_aware + decide_actions (+35 scenarios)
 6c01bc9	8239.0	140/140	1239	keep	Exp35: AutoResearch x3 — process_classifier + signal_intelligence + rl_threshold (+45 scenarios)
+8fef77d	9797.69	140/140	2810	keep	Neuro God Mode v2.0 — 8 cognitive modules + 0 clippy warnings (+1571 tests)
+a906d38	9908.97	140/140	2922	keep	Neuro Black Box — LearnableParams + auto-tune + 3 feedback loops + contextual NARS + log ingestion + meta-learning + outcome accel (+98 tests)
