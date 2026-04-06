@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::engine::nars_belief::{DriftDetector, Salience};
+use crate::engine::freeze_intelligence::FreezeIntelligence;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -190,9 +190,10 @@ pub struct ChromiumManager {
     /// When arousal is very low (< 0.20) thaw all frozen renderers.
     /// [Yerkes-Dodson 1908] System idle = no need to keep anything frozen.
     arousal_thaw_all: bool,
-    /// NARS DriftDetector tracking per-browser freeze-safety beliefs.
+    /// Universal freeze-safety intelligence (NARS beliefs per process category).
     /// [Pei Wang 2013] Truth values updated by revision rule on each freeze outcome.
-    nars_beliefs: DriftDetector,
+    /// App-agnostic: chromium-renderer, ide-lsp, app-helper, etc.
+    intelligence: FreezeIntelligence,
 }
 
 impl Default for ChromiumManager {
@@ -221,7 +222,7 @@ impl ChromiumManager {
             markov_predictions: Vec::new(),
             elapsed_dwell_secs: 0.0,
             arousal_thaw_all: false,
-            nars_beliefs: DriftDetector::new(),
+            intelligence: FreezeIntelligence::new(),
         }
     }
 
@@ -326,35 +327,33 @@ impl ChromiumManager {
     ///
     /// Call with `success=true` after a clean renderer thaw (renderer alive).
     /// Call with `success=false` if a renderer died while frozen.
+    /// Routes through `FreezeIntelligence.observe()` — uses `classify()` to map the
+    /// renderer name to a stable category ("chromium-renderer", "ide-lsp", etc.)
+    /// so evidence accumulates across all processes of the same type.
     /// [Pei Wang 2013] NARS Revision rule updates frequency proportional to evidence weight.
-    pub fn observe_freeze_outcome(&mut self, browser: &str, success: bool, salience: f32) {
-        let concept = format!(
-            "chromium:freeze:{}",
-            browser.replace(' ', "-").to_ascii_lowercase()
-        );
-        self.nars_beliefs.observe_salient(
-            &concept,
-            success,
-            Salience {
-                arousal: salience,
-                valence: if success { 0.5 } else { -0.5 },
-            },
-        );
+    pub fn observe_freeze_outcome(&mut self, process_name: &str, success: bool, salience: f32) {
+        self.intelligence.observe(process_name, success, salience);
     }
 
-    /// Returns freeze confidence for a browser based on NARS belief frequency.
+    /// Returns freeze confidence for a process name based on NARS belief frequency.
     ///
+    /// Delegates to `FreezeIntelligence.confidence()` which looks up the
+    /// process category via `classify()`.
     /// Below 0.35: skip freezing (too many bad outcomes observed).
     /// Default: 0.70 (conservative prior — assume freezing is safe until proven otherwise).
-    pub fn freeze_confidence(&self, browser: &str) -> f32 {
-        let concept = format!(
-            "chromium:freeze:{}",
-            browser.replace(' ', "-").to_ascii_lowercase()
-        );
-        self.nars_beliefs
-            .belief(&concept)
-            .map(|tv| tv.frequency)
-            .unwrap_or(0.70)
+    pub fn freeze_confidence(&self, process_name: &str) -> f32 {
+        self.intelligence.confidence(process_name)
+    }
+
+    /// Access the universal FreezeIntelligence for use by other daemon subsystems.
+    /// Allows the daemon to query freeze safety for ANY process, not just renderers.
+    pub fn intelligence(&self) -> &FreezeIntelligence {
+        &self.intelligence
+    }
+
+    /// Mutable access to FreezeIntelligence (for belief updates from outside ChromiumManager).
+    pub fn intelligence_mut(&mut self) -> &mut FreezeIntelligence {
+        &mut self.intelligence
     }
 
     /// Map a macOS app name to the Chromium browser name we track.
@@ -659,12 +658,16 @@ impl ChromiumManager {
                     continue;
                 }
 
-                // NARS confidence gate: skip browsers where freeze safety is unproven.
+                // NARS confidence gate: skip processes where freeze safety is unproven.
+                // FreezeIntelligence.classify() maps the full name to a category
+                // (e.g. "Brave Browser Helper (Renderer)" → "chromium-renderer"),
+                // so evidence accumulates across all renderers of the same type.
                 // [Pei Wang 2013] Truth frequency < 0.35 = evidence favours unsafety.
-                let confidence = self.freeze_confidence(&info.browser);
+                let confidence = self.freeze_confidence(&info.name);
                 if confidence < 0.35 {
                     tracing::debug!(
                         browser = info.browser.as_str(),
+                        process = info.name.as_str(),
                         confidence = confidence,
                         "chromium: skipping freeze — NARS confidence too low"
                     );
