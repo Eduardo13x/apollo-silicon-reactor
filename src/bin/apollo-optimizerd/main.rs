@@ -1127,6 +1127,8 @@ fn main() -> anyhow::Result<()> {
             // Last specialist votes + chosen intervention for disagreement feedback.
             // Stored when had_disagreement is true; consumed by learning_tick next cycle.
             let mut last_specialist_votes: Option<(Vec<SpecialistVote>, Intervention)> = None;
+            // System log ingester: polls macOS unified logs for OOM/crash events (Phase 5).
+            let mut log_ingester = apollo_optimizer::engine::system_log_ingester::SystemLogIngester::new();
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
             // Gate network_monitor.tick() to every ~10s since netstat is blocking.
@@ -5717,6 +5719,7 @@ fn main() -> anyhow::Result<()> {
                         &mut arousal_state,
                         pending_trial_skill.clone(),
                         last_specialist_votes.as_ref().map(|(v, i)| (v.as_slice(), *i)),
+                        &mut log_ingester,
                         ls_path.to_str().unwrap_or(""),
                         persist_generations,
                         skills_path(),

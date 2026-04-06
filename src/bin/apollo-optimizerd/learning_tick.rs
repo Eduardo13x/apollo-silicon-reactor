@@ -32,6 +32,7 @@ use apollo_optimizer::engine::nars_belief::{ArousalState, Salience};
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
 use apollo_optimizer::engine::predictive_agent::{Intervention, SpecialistVote};
 use apollo_optimizer::engine::signal_intelligence::SignalDigest;
+use apollo_optimizer::engine::system_log_ingester::{SystemEvent, SystemLogIngester};
 use apollo_optimizer::engine::types::{FrozenPidEntry, FrozenStatePersisted};
 use apollo_optimizer::engine::workload_classifier::WorkloadMode;
 
@@ -84,6 +85,7 @@ pub fn run_learning_tick<'a>(
     arousal_state: &mut ArousalState,
     pending_trial_skill: Option<(String, f64)>,
     last_specialist_votes: Option<(&[SpecialistVote], Intervention)>,
+    log_ingester: &mut SystemLogIngester,
     ls_path: &str,
     persist_generations: u32,
     skills_path: &str,
@@ -392,6 +394,55 @@ pub fn run_learning_tick<'a>(
     // from ALL observed overflows (not just the latest one).
     if cycle_count % 50 == 15 {
         let _steps = lctx.signal_intel.retrain_hazard_batch();
+    }
+
+    // ── System log ingestion (Phase 5) ──────────────────────────────────────
+    // Poll macOS unified logs for Jetsam/OOM kills and process crashes.
+    // OOM events → feed hazard model + NARS (arousal=1.0, valence=-1.0).
+    // Crash events → NARS belief update (arousal=0.9, valence=-1.0).
+    // Protected processes are observed but never targeted.
+    {
+        let log_events = log_ingester.poll();
+        for event in &log_events {
+            match event {
+                SystemEvent::OomKill { process_name, .. } => {
+                    // Feed hazard model: OOM is a real overflow event
+                    let mem_pressure = snapshot.pressure.memory_pressure;
+                    let swap_ratio = snapshot.pressure.swap_used_bytes as f64
+                        / (snapshot.pressure.swap_total_bytes.max(1) as f64);
+                    lctx.signal_intel.record_overflow(
+                        mem_pressure,
+                        swap_ratio,
+                        signal_digest.pressure_smooth, // compressor proxy
+                        1.0, // ~1 hour since last (conservative)
+                    );
+                    // NARS: crisis-level salience for OOM kill
+                    let salience = Salience {
+                        arousal: 1.0,
+                        valence: -1.0,
+                    };
+                    lctx.outcome_tracker.drift_detector.observe_contextual(
+                        &format!("oom:{}", process_name),
+                        false, // OOM = negative outcome
+                        salience,
+                        mem_pressure,
+                    );
+                }
+                SystemEvent::Crash { process_name, .. } => {
+                    // NARS: high salience for crashes (slightly less than OOM)
+                    let salience = Salience {
+                        arousal: 0.9,
+                        valence: -1.0,
+                    };
+                    lctx.outcome_tracker.drift_detector.observe_contextual(
+                        &format!("crash:{}", process_name),
+                        false,
+                        salience,
+                        snapshot.pressure.memory_pressure,
+                    );
+                }
+            }
+        }
     }
 
     // ── Loop 3 fix: specialist disagreement outcome feedback ──────────────
