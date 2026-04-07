@@ -41,17 +41,17 @@ pub fn ema_update_4(ema: &mut [f32; 4], samples: &[f32; 4], alpha: f32) {
         use std::arch::aarch64::*;
         unsafe {
             // Load current EMA values and new samples into NEON registers.
-            let ema_v    = vld1q_f32(ema.as_ptr());
+            let ema_v = vld1q_f32(ema.as_ptr());
             let sample_v = vld1q_f32(samples.as_ptr());
 
             // beta = 1.0 - alpha
-            let beta_v   = vdupq_n_f32(1.0 - alpha);
-            let alpha_v  = vdupq_n_f32(alpha);
+            let beta_v = vdupq_n_f32(1.0 - alpha);
+            let alpha_v = vdupq_n_f32(alpha);
 
             // ema = beta * ema + alpha * sample  (two FMAs)
             // vfmaq_f32(a, b, c) = a + b * c
-            let scaled_ema    = vmulq_f32(beta_v, ema_v);    // beta * ema
-            let result        = vfmaq_f32(scaled_ema, alpha_v, sample_v); // + alpha * sample
+            let scaled_ema = vmulq_f32(beta_v, ema_v); // beta * ema
+            let result = vfmaq_f32(scaled_ema, alpha_v, sample_v); // + alpha * sample
 
             vst1q_f32(ema.as_mut_ptr(), result);
         }
@@ -74,8 +74,16 @@ pub fn ema_update_8(ema: &mut [f32; 8], samples: &[f32; 8], alpha: f32) {
     let (ema_lo, ema_hi) = ema.split_at_mut(4);
     let (smp_lo, smp_hi) = samples.split_at(4);
 
-    ema_update_4(ema_lo.try_into().unwrap(), smp_lo.try_into().unwrap(), alpha);
-    ema_update_4(ema_hi.try_into().unwrap(), smp_hi.try_into().unwrap(), alpha);
+    ema_update_4(
+        ema_lo.try_into().unwrap(),
+        smp_lo.try_into().unwrap(),
+        alpha,
+    );
+    ema_update_4(
+        ema_hi.try_into().unwrap(),
+        smp_hi.try_into().unwrap(),
+        alpha,
+    );
 }
 
 /// Verify scalar and NEON results match (for testing).
@@ -102,8 +110,13 @@ mod tests {
         let scalar_result = ema_scalar_reference(&ema, &samples, 0.0);
         ema_update_4(&mut ema, &samples, 0.0);
         for i in 0..4 {
-            assert!((ema[i] - scalar_result[i]).abs() < EPS,
-                "alpha=0: ema[{}]={} vs scalar={}", i, ema[i], scalar_result[i]);
+            assert!(
+                (ema[i] - scalar_result[i]).abs() < EPS,
+                "alpha=0: ema[{}]={} vs scalar={}",
+                i,
+                ema[i],
+                scalar_result[i]
+            );
         }
     }
 
@@ -114,21 +127,31 @@ mod tests {
         let scalar_result = ema_scalar_reference(&ema, &samples, 1.0);
         ema_update_4(&mut ema, &samples, 1.0);
         for i in 0..4 {
-            assert!((ema[i] - scalar_result[i]).abs() < EPS,
-                "alpha=1: ema[{}]={} vs scalar={}", i, ema[i], scalar_result[i]);
+            assert!(
+                (ema[i] - scalar_result[i]).abs() < EPS,
+                "alpha=1: ema[{}]={} vs scalar={}",
+                i,
+                ema[i],
+                scalar_result[i]
+            );
         }
     }
 
     #[test]
     fn neon_matches_scalar_typical_alpha() {
-        let mut ema  = [0.5f32, 0.6, 0.7, 0.8];
-        let samples  = [1.0f32, 0.8, 0.6, 0.4];
-        let alpha    = 0.15_f32;
-        let scalar   = ema_scalar_reference(&ema, &samples, alpha);
+        let mut ema = [0.5f32, 0.6, 0.7, 0.8];
+        let samples = [1.0f32, 0.8, 0.6, 0.4];
+        let alpha = 0.15_f32;
+        let scalar = ema_scalar_reference(&ema, &samples, alpha);
         ema_update_4(&mut ema, &samples, alpha);
         for i in 0..4 {
-            assert!((ema[i] - scalar[i]).abs() < EPS,
-                "alpha=0.15: ema[{}]={} vs scalar={}", i, ema[i], scalar[i]);
+            assert!(
+                (ema[i] - scalar[i]).abs() < EPS,
+                "alpha=0.15: ema[{}]={} vs scalar={}",
+                i,
+                ema[i],
+                scalar[i]
+            );
         }
     }
 
@@ -138,14 +161,22 @@ mod tests {
         let samples8 = [1.0f32, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3];
         let alpha = 0.20_f32;
 
-        let ref_lo = ema_scalar_reference(ema8[..4].try_into().unwrap(), samples8[..4].try_into().unwrap(), alpha);
-        let ref_hi = ema_scalar_reference(ema8[4..].try_into().unwrap(), samples8[4..].try_into().unwrap(), alpha);
+        let ref_lo = ema_scalar_reference(
+            ema8[..4].try_into().unwrap(),
+            samples8[..4].try_into().unwrap(),
+            alpha,
+        );
+        let ref_hi = ema_scalar_reference(
+            ema8[4..].try_into().unwrap(),
+            samples8[4..].try_into().unwrap(),
+            alpha,
+        );
 
         ema_update_8(&mut ema8, &samples8, alpha);
 
         for i in 0..4 {
-            assert!((ema8[i]   - ref_lo[i]).abs() < EPS, "lo[{}]", i);
-            assert!((ema8[i+4] - ref_hi[i]).abs() < EPS, "hi[{}]", i);
+            assert!((ema8[i] - ref_lo[i]).abs() < EPS, "lo[{}]", i);
+            assert!((ema8[i + 4] - ref_hi[i]).abs() < EPS, "hi[{}]", i);
         }
     }
 
@@ -153,15 +184,17 @@ mod tests {
     fn ema_converges_to_constant_input() {
         // After N iterations with constant input, EMA should approach that input.
         let mut ema = [0.0f32; 4];
-        let target  = [1.0f32; 4];
-        let alpha   = 0.15_f32;
+        let target = [1.0f32; 4];
+        let alpha = 0.15_f32;
         for _ in 0..200 {
             ema_update_4(&mut ema, &target, alpha);
         }
         for i in 0..4 {
             assert!(
                 (ema[i] - 1.0).abs() < 0.01,
-                "EMA did not converge: ema[{}]={}", i, ema[i]
+                "EMA did not converge: ema[{}]={}",
+                i,
+                ema[i]
             );
         }
     }

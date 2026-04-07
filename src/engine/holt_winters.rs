@@ -294,8 +294,12 @@ mod tests {
         }
         for h in 0..24u8 {
             let s = hw.seasonal_factor(h);
-            assert!(s >= 0.5 && s <= 2.0,
-                "seasonal[{}]={} must be in [0.5, 2.0]", h, s);
+            assert!(
+                s >= 0.5 && s <= 2.0,
+                "seasonal[{}]={} must be in [0.5, 2.0]",
+                h,
+                s
+            );
         }
     }
 
@@ -310,8 +314,12 @@ mod tests {
         // Forecast far ahead — trend + seasonal could push above 1.0.
         for hours_ahead in 0..24u8 {
             let (f, _) = hw.forecast(12, hours_ahead);
-            assert!(f >= 0.0 && f <= 1.0,
-                "forecast({})={} out of [0,1]", hours_ahead, f);
+            assert!(
+                f >= 0.0 && f <= 1.0,
+                "forecast({})={} out of [0,1]",
+                hours_ahead,
+                f
+            );
         }
     }
 

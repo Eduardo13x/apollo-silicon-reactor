@@ -15,9 +15,7 @@
 mod scenarios {
     use std::path::PathBuf;
 
-    use apollo_optimizer::engine::rl_threshold::{
-        RlState, RlThresholdAgent, RL_ABSOLUTE_FLOOR,
-    };
+    use apollo_optimizer::engine::rl_threshold::{RlState, RlThresholdAgent, RL_ABSOLUTE_FLOOR};
 
     fn make_agent() -> RlThresholdAgent {
         RlThresholdAgent::load_or_default(&PathBuf::from("/dev/null"))
@@ -36,8 +34,11 @@ mod scenarios {
         for _ in 0..100 {
             agent.tick(crisis, true);
         }
-        assert!(agent.current_adjustment >= -0.20,
-            "adjustment must stay >= -0.20: {}", agent.current_adjustment);
+        assert!(
+            agent.current_adjustment >= -0.20,
+            "adjustment must stay >= -0.20: {}",
+            agent.current_adjustment
+        );
     }
 
     /// R02: After 200 calm ticks, adjustment must stay <= ceiling (+0.05).
@@ -48,8 +49,11 @@ mod scenarios {
         for _ in 0..200 {
             agent.tick(calm, false);
         }
-        assert!(agent.current_adjustment <= 0.05,
-            "adjustment must stay <= 0.05: {}", agent.current_adjustment);
+        assert!(
+            agent.current_adjustment <= 0.05,
+            "adjustment must stay <= 0.05: {}",
+            agent.current_adjustment
+        );
     }
 
     /// R03: The absolute floor (0.45) must hold even with worst-case stacking
@@ -62,8 +66,12 @@ mod scenarios {
         }
         // Simulate worst-case: base 0.78 + adjustment + hypothetical -0.08 dynamic offset.
         let effective = (0.78 + agent.current_adjustment - 0.08).max(RL_ABSOLUTE_FLOOR);
-        assert!(effective >= RL_ABSOLUTE_FLOOR,
-            "effective threshold must be >= {}: {}", RL_ABSOLUTE_FLOOR, effective);
+        assert!(
+            effective >= RL_ABSOLUTE_FLOOR,
+            "effective threshold must be >= {}: {}",
+            RL_ABSOLUTE_FLOOR,
+            effective
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -80,7 +88,11 @@ mod scenarios {
             agent.tick(calm, false);
         }
         let last_q = agent.last_q_value();
-        assert!(last_q > 0.0, "after 50 stable ticks, last Q must be positive: {}", last_q);
+        assert!(
+            last_q > 0.0,
+            "after 50 stable ticks, last Q must be positive: {}",
+            last_q
+        );
     }
 
     /// R05: After 10 overflow ticks, overflow counter must increase correctly.
@@ -91,7 +103,11 @@ mod scenarios {
         for _ in 0..10 {
             agent.tick(crisis, true);
         }
-        assert_eq!(agent.total_overflows(), 10, "must count all overflow events");
+        assert_eq!(
+            agent.total_overflows(),
+            10,
+            "must count all overflow events"
+        );
     }
 
     /// R06: Overflow must penalize: Q-value decreases after an overflow tick.
@@ -122,7 +138,11 @@ mod scenarios {
         for pb in 0..3u8 {
             for cb in 0..3u8 {
                 for oh in 0..4u8 {
-                    let s = RlState { pressure_band: pb, compressor_band: cb, overflow_last_hour: oh };
+                    let s = RlState {
+                        pressure_band: pb,
+                        compressor_band: cb,
+                        overflow_last_hour: oh,
+                    };
                     let idx = s.index();
                     assert!(idx < 36, "index {} out of range for {:?}", idx, s);
                     seen.insert(idx);
@@ -170,8 +190,11 @@ mod scenarios {
         for _ in 0..50 {
             agent.tick(calm, false);
         }
-        assert!(agent.current_adjustment >= -0.20 && agent.current_adjustment <= 0.05,
-            "adjustment must be in [-0.20, 0.05] after mixed conditions: {}", agent.current_adjustment);
+        assert!(
+            agent.current_adjustment >= -0.20 && agent.current_adjustment <= 0.05,
+            "adjustment must be in [-0.20, 0.05] after mixed conditions: {}",
+            agent.current_adjustment
+        );
     }
 
     /// R10: EMA alpha decays from 0.20 toward 0.02 over 400 ticks.
@@ -179,27 +202,46 @@ mod scenarios {
     fn r10_alpha_decays_over_time() {
         let mut agent = make_agent();
         let alpha_0 = agent.alpha();
-        assert!((alpha_0 - 0.20).abs() < 1e-6, "initial alpha must be 0.20: {}", alpha_0);
+        assert!(
+            (alpha_0 - 0.20).abs() < 1e-6,
+            "initial alpha must be 0.20: {}",
+            alpha_0
+        );
 
         let state = RlState::from_metrics(0.50, 0.30, 0);
         for _ in 0..400 {
             agent.tick(state, false);
         }
         let alpha_400 = agent.alpha();
-        assert!(alpha_400 < alpha_0, "alpha must decay: {} < {}", alpha_400, alpha_0);
-        assert!(alpha_400 >= 0.02, "alpha must not go below floor: {}", alpha_400);
+        assert!(
+            alpha_400 < alpha_0,
+            "alpha must decay: {} < {}",
+            alpha_400,
+            alpha_0
+        );
+        assert!(
+            alpha_400 >= 0.02,
+            "alpha must not go below floor: {}",
+            alpha_400
+        );
     }
 
     /// R11: Epsilon decays from 0.10 to 0.05 after 200 ticks.
     #[test]
     fn r11_epsilon_decay() {
         let mut agent = make_agent();
-        assert!((agent.epsilon() - 0.10).abs() < 1e-6, "initial epsilon must be 0.10");
+        assert!(
+            (agent.epsilon() - 0.10).abs() < 1e-6,
+            "initial epsilon must be 0.10"
+        );
         let state = RlState::from_metrics(0.50, 0.30, 0);
         for _ in 0..200 {
             agent.tick(state, false);
         }
-        assert!((agent.epsilon() - 0.05).abs() < 1e-6, "epsilon after 200 ticks must be 0.05");
+        assert!(
+            (agent.epsilon() - 0.05).abs() < 1e-6,
+            "epsilon after 200 ticks must be 0.05"
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -215,8 +257,12 @@ mod scenarios {
         let q_before = agent.last_q_value();
         agent.inject_external_reward(-5.0);
         let q_after = agent.last_q_value();
-        assert!(q_after < q_before,
-            "negative external reward must decrease Q: {} < {}", q_after, q_before);
+        assert!(
+            q_after < q_before,
+            "negative external reward must decrease Q: {} < {}",
+            q_after,
+            q_before
+        );
     }
 
     /// R13: External positive reward must increase Q for the last state-action pair.
@@ -228,8 +274,12 @@ mod scenarios {
         let q_before = agent.last_q_value();
         agent.inject_external_reward(5.0);
         let q_after = agent.last_q_value();
-        assert!(q_after > q_before,
-            "positive external reward must increase Q: {} > {}", q_after, q_before);
+        assert!(
+            q_after > q_before,
+            "positive external reward must increase Q: {} > {}",
+            q_after,
+            q_before
+        );
     }
 
     /// R14: After 50 stable ticks with high initial alpha, learning must be
@@ -242,8 +292,11 @@ mod scenarios {
             agent.tick(calm, false);
         }
         let last_q = agent.last_q_value();
-        assert!(last_q > 2.0,
-            "EMA agent must learn fast from early data: last_q={}", last_q);
+        assert!(
+            last_q > 2.0,
+            "EMA agent must learn fast from early data: last_q={}",
+            last_q
+        );
     }
 
     /// R15: Total ticks counter must increment correctly.
@@ -255,6 +308,10 @@ mod scenarios {
         for _ in 0..25 {
             agent.tick(state, false);
         }
-        assert_eq!(agent.total_ticks(), 25, "total_ticks must equal 25 after 25 ticks");
+        assert_eq!(
+            agent.total_ticks(),
+            25,
+            "total_ticks must equal 25 after 25 ticks"
+        );
     }
 }

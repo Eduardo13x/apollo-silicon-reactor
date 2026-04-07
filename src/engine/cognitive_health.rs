@@ -229,7 +229,11 @@ mod tests {
     fn test_good_inputs_high_score() {
         let mut chs = CognitiveHealthScore::new();
         chs.update(&good_inputs());
-        assert!(chs.composite > 0.70, "Good inputs → high score: {}", chs.composite);
+        assert!(
+            chs.composite > 0.70,
+            "Good inputs → high score: {}",
+            chs.composite
+        );
         assert!(!chs.recovery_mode);
     }
 
@@ -237,7 +241,11 @@ mod tests {
     fn test_bad_inputs_low_score() {
         let mut chs = CognitiveHealthScore::new();
         chs.update(&bad_inputs());
-        assert!(chs.composite < 0.40, "Bad inputs → low score: {}", chs.composite);
+        assert!(
+            chs.composite < 0.40,
+            "Bad inputs → low score: {}",
+            chs.composite
+        );
     }
 
     #[test]
@@ -327,7 +335,10 @@ mod tests {
             ..Default::default()
         };
         chs.update(&inputs);
-        assert!((chs.d3_belief_stability - 0.20).abs() < 0.01, "High drift → low stability");
+        assert!(
+            (chs.d3_belief_stability - 0.20).abs() < 0.01,
+            "High drift → low stability"
+        );
     }
 
     #[test]
@@ -339,7 +350,11 @@ mod tests {
             ..Default::default()
         };
         chs.update(&inputs);
-        assert!(chs.d2_reward_quality > 0.8, "High SNR → high D2: {}", chs.d2_reward_quality);
+        assert!(
+            chs.d2_reward_quality > 0.8,
+            "High SNR → high D2: {}",
+            chs.d2_reward_quality
+        );
 
         // Zero SNR → low reward quality
         let inputs_low = CognitiveInputs {
@@ -347,7 +362,11 @@ mod tests {
             ..Default::default()
         };
         chs.update(&inputs_low);
-        assert!(chs.d2_reward_quality < 0.1, "Zero SNR → low D2: {}", chs.d2_reward_quality);
+        assert!(
+            chs.d2_reward_quality < 0.1,
+            "Zero SNR → low D2: {}",
+            chs.d2_reward_quality
+        );
     }
 
     #[test]

@@ -92,7 +92,10 @@ pub fn compute(
     smc_thermal: f64,
     battery_overheat: f64,
 ) -> (f64, PressureComponents) {
-    debug_assert!((0.0..=1.0).contains(&base), "base pressure out of range: {base}");
+    debug_assert!(
+        (0.0..=1.0).contains(&base),
+        "base pressure out of range: {base}"
+    );
     let effective = (base
         + hardware
         + battery
@@ -140,13 +143,15 @@ mod tests {
         // hw=0.30, batt=0.18, thermal=0.40, llm=0.20, charging=0.06,
         // batt_low=0.08, mem_bw=0.10, smc_thermal=0.30, overheat=0.12
         // sum = 0.60 + 1.74 = 2.34 → clamped to 1.0
-        let (eff, comp) =
-            compute(0.60, 0.30, 0.18, 0.40, 0.20, 0.06, 0.08, 0.10, 0.30, 0.12);
+        let (eff, comp) = compute(0.60, 0.30, 0.18, 0.40, 0.20, 0.06, 0.08, 0.10, 0.30, 0.12);
         assert_eq!(eff, 1.0);
         assert_eq!(comp.effective, 1.0);
         // base is preserved even though effective is clamped
         assert_eq!(comp.base, 0.60);
-        assert!(comp.total_boost() > 1.0, "boosts sum should exceed 1.0 in worst case");
+        assert!(
+            comp.total_boost() > 1.0,
+            "boosts sum should exceed 1.0 in worst case"
+        );
     }
 
     #[test]
@@ -262,6 +267,9 @@ mod tests {
     #[test]
     fn effective_matches_component_field() {
         let (eff, comp) = compute(0.45, 0.15, 0.04, 0.07, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(eff, comp.effective, "returned value must match component field");
+        assert_eq!(
+            eff, comp.effective,
+            "returned value must match component field"
+        );
     }
 }

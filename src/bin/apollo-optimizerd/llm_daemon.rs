@@ -67,7 +67,8 @@ pub fn llm_reactive_tick(
     {
         let mut guard = state.llm.lock_recover();
         if guard.llm_state.enabled
-            && guard.llm_state
+            && guard
+                .llm_state
                 .training_expires_at
                 .map(|t| t <= now)
                 .unwrap_or(true)
@@ -130,7 +131,8 @@ pub fn llm_reactive_tick(
         }
 
         // Keep trigger events only for a short horizon.
-        guard.llm_state
+        guard
+            .llm_state
             .trigger_events
             .retain(|t| now - *t < ChronoDuration::minutes(30));
         let trigger_len = guard.llm_state.trigger_events.len();
@@ -139,14 +141,16 @@ pub fn llm_reactive_tick(
         }
         let triggers_recent = guard.llm_state.trigger_events.len() as u32;
 
-        let bootcamp = guard.llm_state
+        let bootcamp = guard
+            .llm_state
             .training_started_at
             .map(|t| now - t < ChronoDuration::days(5))
             .unwrap_or(false);
         let daily_budget = if bootcamp { 24 } else { 8 };
 
         // If we've been stable for a while, bias to strict.
-        let stable_for = guard.llm_state
+        let stable_for = guard
+            .llm_state
             .no_trigger_since
             .map(|t| now - t)
             .unwrap_or_else(|| ChronoDuration::seconds(0));
@@ -240,7 +244,8 @@ pub fn llm_reactive_tick(
     let baseline_call = {
         let guard = state.llm.lock_recover();
         guard.llm_state.last_attempt_at.is_none()
-            && guard.llm_state
+            && guard
+                .llm_state
                 .training_started_at
                 .map(|t| now - t > ChronoDuration::minutes(2))
                 .unwrap_or(false)
@@ -262,13 +267,15 @@ pub fn llm_reactive_tick(
         // so the teacher can learn normal workload patterns.
         let sampling_due = {
             let guard = state.llm.lock_recover();
-            let since_last = guard.llm_state
+            let since_last = guard
+                .llm_state
                 .last_attempt_at
                 .map(|t| now - t)
                 .unwrap_or_else(|| ChronoDuration::hours(24));
             let user_active_proxy = ws_cpu >= 10.0 || snapshot.cpu.global_usage >= 15.0;
             mode == LlmRunMode::Sensitive
-                && guard.llm_state
+                && guard
+                    .llm_state
                     .training_started_at
                     .map(|t| now - t < ChronoDuration::days(5))
                     .unwrap_or(false)
@@ -341,7 +348,8 @@ pub fn llm_reactive_tick(
         }
 
         // Per-hour window.
-        if guard.llm_state
+        if guard
+            .llm_state
             .hour_window_started_at
             .map(|t| now - t > ChronoDuration::hours(1))
             .unwrap_or(true)
@@ -401,7 +409,8 @@ pub fn llm_reactive_tick(
             if let Some(p) = suggestion.suggested_profile {
                 let mut pg = state.policy.lock_recover();
                 if pg.governor.manual_override.is_none() {
-                    pg.governor.set_manual_override(p, 20, "llm-reactive".to_string());
+                    pg.governor
+                        .set_manual_override(p, 20, "llm-reactive".to_string());
                 }
             }
             // 2) Latency target.
@@ -413,7 +422,8 @@ pub fn llm_reactive_tick(
             let remaining = {
                 let mut guard = state.llm.lock_recover();
                 let day = now.date_naive();
-                let reset_day = guard.llm_state
+                let reset_day = guard
+                    .llm_state
                     .policy_updates_day
                     .map(|d| d.date_naive() != day)
                     .unwrap_or(true);
@@ -576,7 +586,8 @@ pub fn usage_learning_tick(
     // Persist usage model periodically (every ~2 minutes).
     {
         let mut usage = state.usage.lock_recover();
-        let due = usage.usage_tracker
+        let due = usage
+            .usage_tracker
             .last_persist_at
             .map(|t| now - t > ChronoDuration::minutes(2))
             .unwrap_or(true);

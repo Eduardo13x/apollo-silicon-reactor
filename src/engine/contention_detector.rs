@@ -148,22 +148,56 @@ impl ContentionDetector {
         let mut pairs = Vec::new();
         if score > 0.40 && pressure > 0.25 {
             for &(pid_a, pid_b) in &active_pairs {
-                let cycles = self.co_exec_cycles.get(&(pid_a, pid_b)).copied().unwrap_or(0);
+                let cycles = self
+                    .co_exec_cycles
+                    .get(&(pid_a, pid_b))
+                    .copied()
+                    .unwrap_or(0);
                 if cycles >= 3 {
                     // heavy_pid = whichever has higher CPU (keep on P-cores).
-                    let cpu_a = heavy.iter().find(|(p, _, _)| *p == pid_a).map(|(_, _, c)| *c).unwrap_or(0.0);
-                    let cpu_b = heavy.iter().find(|(p, _, _)| *p == pid_b).map(|(_, _, c)| *c).unwrap_or(0.0);
-                    let (heavy_pid, light_pid) = if cpu_a >= cpu_b { (pid_a, pid_b) } else { (pid_b, pid_a) };
-                    let heavy_name = heavy.iter().find(|(p, _, _)| *p == heavy_pid).map(|(_, n, _)| n.clone()).unwrap_or_default();
-                    let light_name = heavy.iter().find(|(p, _, _)| *p == light_pid).map(|(_, n, _)| n.clone()).unwrap_or_default();
-                    pairs.push(ContentionPair { heavy_pid, heavy_name, light_pid, light_name, consecutive_cycles: cycles });
+                    let cpu_a = heavy
+                        .iter()
+                        .find(|(p, _, _)| *p == pid_a)
+                        .map(|(_, _, c)| *c)
+                        .unwrap_or(0.0);
+                    let cpu_b = heavy
+                        .iter()
+                        .find(|(p, _, _)| *p == pid_b)
+                        .map(|(_, _, c)| *c)
+                        .unwrap_or(0.0);
+                    let (heavy_pid, light_pid) = if cpu_a >= cpu_b {
+                        (pid_a, pid_b)
+                    } else {
+                        (pid_b, pid_a)
+                    };
+                    let heavy_name = heavy
+                        .iter()
+                        .find(|(p, _, _)| *p == heavy_pid)
+                        .map(|(_, n, _)| n.clone())
+                        .unwrap_or_default();
+                    let light_name = heavy
+                        .iter()
+                        .find(|(p, _, _)| *p == light_pid)
+                        .map(|(_, n, _)| n.clone())
+                        .unwrap_or_default();
+                    pairs.push(ContentionPair {
+                        heavy_pid,
+                        heavy_name,
+                        light_pid,
+                        light_name,
+                        consecutive_cycles: cycles,
+                    });
                 }
             }
         }
 
         self.prev_heavy_pids = heavy.iter().map(|(pid, _, _)| *pid).collect();
         let heavy_count = heavy.len();
-        ContentionState { score, pairs, heavy_count }
+        ContentionState {
+            score,
+            pairs,
+            heavy_count,
+        }
     }
 
     /// Remove dead PIDs from tracking state.
@@ -192,7 +226,9 @@ mod tests {
     use super::*;
 
     fn procs(list: &[(u32, &str, f32)]) -> Vec<(u32, String, f32)> {
-        list.iter().map(|(p, n, c)| (*p, n.to_string(), *c)).collect()
+        list.iter()
+            .map(|(p, n, c)| (*p, n.to_string(), *c))
+            .collect()
     }
 
     #[test]
@@ -200,7 +236,10 @@ mod tests {
         let mut det = ContentionDetector::new();
         let p = procs(&[(1, "rustc", 80.0), (2, "launchd", 0.1)]);
         let state = det.tick(0.4, &p, 0.6, 15.0);
-        assert!(state.pairs.is_empty(), "single heavy process cannot form a pair");
+        assert!(
+            state.pairs.is_empty(),
+            "single heavy process cannot form a pair"
+        );
     }
 
     #[test]
@@ -209,7 +248,10 @@ mod tests {
         let p = procs(&[(1, "rustc", 60.0), (2, "ollama", 40.0)]);
         for i in 0..2 {
             let state = det.tick(0.3, &p, 0.7, 15.0);
-            assert!(state.pairs.is_empty(), "cycle {i}: pair should not fire before 3 cycles");
+            assert!(
+                state.pairs.is_empty(),
+                "cycle {i}: pair should not fire before 3 cycles"
+            );
         }
     }
 
@@ -221,8 +263,14 @@ mod tests {
         for _ in 0..4 {
             last_state = det.tick(0.3, &p, 0.7, 15.0);
         }
-        assert!(!last_state.pairs.is_empty(), "pair should fire after 3+ cycles");
-        assert_eq!(last_state.pairs[0].heavy_pid, 1, "rustc has higher CPU → heavy");
+        assert!(
+            !last_state.pairs.is_empty(),
+            "pair should fire after 3+ cycles"
+        );
+        assert_eq!(
+            last_state.pairs[0].heavy_pid, 1,
+            "rustc has higher CPU → heavy"
+        );
         assert_eq!(last_state.pairs[0].light_pid, 2);
     }
 
@@ -232,7 +280,10 @@ mod tests {
         let p = procs(&[(1, "rustc", 60.0), (2, "ollama", 40.0)]);
         // IPC = 3.0 (above saturation) → ipc_factor = 0, score should be low
         let state = det.tick(3.0, &p, 0.7, 15.0);
-        assert!(state.score < 0.40, "high IPC means compute-bound, not cache-bound");
+        assert!(
+            state.score < 0.40,
+            "high IPC means compute-bound, not cache-bound"
+        );
     }
 
     #[test]
@@ -240,18 +291,27 @@ mod tests {
         let mut det = ContentionDetector::new();
         let p2 = procs(&[(1, "rustc", 60.0), (2, "ollama", 40.0)]);
         let p1 = procs(&[(1, "rustc", 60.0)]); // ollama gone
-        for _ in 0..4 { det.tick(0.3, &p2, 0.7, 15.0); }
+        for _ in 0..4 {
+            det.tick(0.3, &p2, 0.7, 15.0);
+        }
         // Now ollama gone — pair should not fire
-        for _ in 0..3 { det.tick(0.3, &p1, 0.7, 15.0); }
+        for _ in 0..3 {
+            det.tick(0.3, &p1, 0.7, 15.0);
+        }
         let state = det.tick(0.3, &p1, 0.7, 15.0);
-        assert!(state.pairs.is_empty(), "pair should decay when one process disappears");
+        assert!(
+            state.pairs.is_empty(),
+            "pair should decay when one process disappears"
+        );
     }
 
     #[test]
     fn confidence_saturates_at_10_cycles() {
         let pair = ContentionPair {
-            heavy_pid: 1, heavy_name: "a".into(),
-            light_pid: 2, light_name: "b".into(),
+            heavy_pid: 1,
+            heavy_name: "a".into(),
+            light_pid: 2,
+            light_name: "b".into(),
             consecutive_cycles: 10,
         };
         assert!((pair.confidence() - 1.0).abs() < 0.01);
@@ -261,9 +321,14 @@ mod tests {
     fn gc_removes_dead_pids() {
         let mut det = ContentionDetector::new();
         let p = procs(&[(1, "rustc", 60.0), (2, "ollama", 40.0)]);
-        for _ in 0..4 { det.tick(0.3, &p, 0.7, 15.0); }
+        for _ in 0..4 {
+            det.tick(0.3, &p, 0.7, 15.0);
+        }
         let alive: std::collections::HashSet<u32> = [1].into_iter().collect();
         det.gc(&alive);
-        assert!(det.co_exec_cycles.is_empty(), "dead pair should be removed by gc");
+        assert!(
+            det.co_exec_cycles.is_empty(),
+            "dead pair should be removed by gc"
+        );
     }
 }

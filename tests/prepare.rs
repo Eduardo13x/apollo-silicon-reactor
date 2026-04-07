@@ -104,7 +104,7 @@ mod scenarios {
     #[test]
     fn s01_foreground_app_always_allowed() {
         let snaps = vec![
-            snap(100, "Code", 45.0, 800, true, 2, 0),  // VS Code, active
+            snap(100, "Code", 45.0, 800, true, 2, 0), // VS Code, active
             snap(200, "Slack", 3.0, 400, true, 600, 600), // Slack, background
         ];
         let results = decide(&snaps, Some("Code"));
@@ -128,7 +128,10 @@ mod scenarios {
             snap(2, "launchd", 1.0, 100, false, 0, 0),
         ];
         let results = decide(&snaps, None);
-        assert_eq!(find_decision(&results, "WindowServer"), GovernorDecision::Allow);
+        assert_eq!(
+            find_decision(&results, "WindowServer"),
+            GovernorDecision::Allow
+        );
         assert_eq!(find_decision(&results, "launchd"), GovernorDecision::Allow);
     }
 
@@ -323,9 +326,9 @@ mod scenarios {
     #[test]
     fn s15_realistic_desktop_session() {
         let snaps = vec![
-            snap(100, "Code", 25.0, 600, true, 5, 0),      // Active editor
-            snap(200, "Brave", 15.0, 800, true, 120, 120),  // Background browser
-            snap(300, "Slack", 2.0, 400, true, 600, 600),   // Background chat
+            snap(100, "Code", 25.0, 600, true, 5, 0), // Active editor
+            snap(200, "Brave", 15.0, 800, true, 120, 120), // Background browser
+            snap(300, "Slack", 2.0, 400, true, 600, 600), // Background chat
             snap(400, "Dropbox", 3.0, 200, false, 9999, 9999), // Background sync
             snap(500, "WindowServer", 10.0, 150, false, 0, 0), // System
             snap(600, "analyticsd", 1.0, 30, false, 9999, 9999), // Telemetry
@@ -335,7 +338,10 @@ mod scenarios {
         // Active editor: always allowed
         assert_eq!(find_decision(&results, "Code"), GovernorDecision::Allow);
         // WindowServer: system essential
-        assert_eq!(find_decision(&results, "WindowServer"), GovernorDecision::Allow);
+        assert_eq!(
+            find_decision(&results, "WindowServer"),
+            GovernorDecision::Allow
+        );
         // Telemetry: must be throttled or frozen
         let analytics_d = find_decision(&results, "analyticsd");
         assert!(
@@ -571,10 +577,12 @@ mod scenarios {
         // But Rosetta process should be frozen (more aggressive) while native just throttled.
         assert!(
             d_rosetta as u8 > d_native as u8
-                || (d_rosetta == GovernorDecision::Freeze && d_native == GovernorDecision::Throttle),
+                || (d_rosetta == GovernorDecision::Freeze
+                    && d_native == GovernorDecision::Throttle),
             "Translated (Rosetta) process should be treated MORE aggressively than native. \
              Got native={:?}, rosetta={:?}",
-            d_native, d_rosetta
+            d_native,
+            d_rosetta
         );
     }
 
@@ -848,7 +856,8 @@ mod scenarios {
             d_useless as u8 >= d_useful as u8,
             "Process without network should be treated >= aggressively as one with network. \
              Got dns_cache={:?}, old_updater={:?}",
-            d_useful, d_useless
+            d_useful,
+            d_useless
         );
     }
 
@@ -910,18 +919,29 @@ mod scenarios {
         snaps.push(safari);
         // 8 WebKit helpers — no GUI, moderate stats
         for i in 0..8 {
-            let mut helper = snap(4160 + i, "com.apple.WebKit.WebContent", 8.0, 200, false, 9999, 9999);
+            let mut helper = snap(
+                4160 + i,
+                "com.apple.WebKit.WebContent",
+                8.0,
+                200,
+                false,
+                9999,
+                9999,
+            );
             helper.wakeups_per_sec = 30.0;
             snaps.push(helper);
         }
         let results = decide(&snaps, Some("Safari"));
         // ALL WebKit helpers should be allowed (they're serving the foreground app)
-        let helper_decisions: Vec<_> = results.iter()
+        let helper_decisions: Vec<_> = results
+            .iter()
             .filter(|(name, _)| name == "com.apple.WebKit.WebContent")
             .map(|(_, d)| *d)
             .collect();
         assert!(
-            helper_decisions.iter().all(|d| *d == GovernorDecision::Allow),
+            helper_decisions
+                .iter()
+                .all(|d| *d == GovernorDecision::Allow),
             "WebKit helpers of foreground Safari must ALL be allowed in swarm. Got {:?}",
             helper_decisions
         );
@@ -999,7 +1019,8 @@ mod scenarios {
             d_big as u8 >= d_small as u8,
             "Bigger idle daemon should get >= aggressive treatment. \
              Got small={:?}, big={:?}",
-            d_small, d_big
+            d_small,
+            d_big
         );
     }
 
@@ -1034,7 +1055,10 @@ mod scenarios {
         let hunts: Vec<HuntSnapshot> = Vec::new();
         let names: Vec<&str> = vec!["night_service"];
         let decisions = gov.decide_all(&snaps, &hunts, None, &names, 3); // 3 AM
-        let d = decisions.iter().find(|d| d.name == "night_service").unwrap();
+        let d = decisions
+            .iter()
+            .find(|d| d.name == "night_service")
+            .unwrap();
         assert!(
             d.decision == GovernorDecision::Throttle || d.decision == GovernorDecision::Freeze,
             "At 3AM, idle background service should be throttled to save energy. Got {:?}",
@@ -1088,9 +1112,27 @@ mod scenarios {
     #[test]
     fn s50_fg_helper_survives_swarm_pressure() {
         let mut snaps: Vec<ProcessSnapshot> = (0..38)
-            .map(|i| snap(5000 + i, &format!("daemon_{}", i), 0.5, 30, false, 3600, 3600))
+            .map(|i| {
+                snap(
+                    5000 + i,
+                    &format!("daemon_{}", i),
+                    0.5,
+                    30,
+                    false,
+                    3600,
+                    3600,
+                )
+            })
             .collect();
-        let mut webkit = snap(5050, "com.apple.WebKit.WebContent", 5.0, 200, false, 100, 100);
+        let mut webkit = snap(
+            5050,
+            "com.apple.WebKit.WebContent",
+            5.0,
+            200,
+            false,
+            100,
+            100,
+        );
         webkit.wakeups_per_sec = 2.0;
         snaps.push(webkit);
         snaps.push(snap(5051, "Safari", 15.0, 400, true, 5, 0));

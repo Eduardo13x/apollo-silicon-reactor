@@ -181,8 +181,7 @@ mod tests {
 
         // Write one valid entry manually
         let valid_entry = make_entry();
-        let valid_line =
-            serde_json::to_string(&valid_entry).expect("serialize") + "\n";
+        let valid_line = serde_json::to_string(&valid_entry).expect("serialize") + "\n";
 
         let bad_line = "this is not json\n";
 
@@ -192,9 +191,11 @@ mod tests {
                 .write(true)
                 .open(&path)
                 .expect("open file");
-            f.write_all(valid_line.as_bytes()).expect("write valid line");
+            f.write_all(valid_line.as_bytes())
+                .expect("write valid line");
             f.write_all(bad_line.as_bytes()).expect("write bad line");
-            f.write_all(valid_line.as_bytes()).expect("write valid line 2");
+            f.write_all(valid_line.as_bytes())
+                .expect("write valid line 2");
         }
 
         let entries = read_journal(&path).expect("read_journal");

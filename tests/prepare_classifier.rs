@@ -14,7 +14,7 @@
 #[cfg(test)]
 mod scenarios {
     use apollo_optimizer::engine::process_classifier::{
-        ProcessClassifier, ProcessSnapshot, ProcessTier, score_utility, waste_score,
+        score_utility, waste_score, ProcessClassifier, ProcessSnapshot, ProcessTier,
     };
 
     fn snap(name: &str) -> ProcessSnapshot {
@@ -49,7 +49,8 @@ mod scenarios {
         let c = ProcessClassifier::new();
         let s = snap("coreaudiod");
         assert_eq!(
-            c.classify(&s), ProcessTier::SystemEssential,
+            c.classify(&s),
+            ProcessTier::SystemEssential,
             "coreaudiod must be SystemEssential — freezing it kills all audio"
         );
     }
@@ -71,7 +72,8 @@ mod scenarios {
         // should protect it via utility scoring, not the classifier.
         assert!(
             tier == ProcessTier::Stale || tier == ProcessTier::SilentDaemon,
-            "Low-activity daemon should be Stale or SilentDaemon, got {:?}", tier
+            "Low-activity daemon should be Stale or SilentDaemon, got {:?}",
+            tier
         );
     }
 
@@ -84,7 +86,8 @@ mod scenarios {
         s.has_gui_window = true;
         s.secs_since_user_interaction = 25;
         assert_eq!(
-            c.classify(&s), ProcessTier::ActiveForeground,
+            c.classify(&s),
+            ProcessTier::ActiveForeground,
             "App with GUI + 25s since interaction should be ActiveForeground"
         );
     }
@@ -98,7 +101,8 @@ mod scenarios {
         s.has_gui_window = true;
         s.secs_since_user_interaction = 35;
         assert_eq!(
-            c.classify(&s), ProcessTier::BackgroundVisible,
+            c.classify(&s),
+            ProcessTier::BackgroundVisible,
             "App with GUI + 35s since interaction = BackgroundVisible"
         );
     }
@@ -110,7 +114,8 @@ mod scenarios {
         let mut s = snap("Google Chrome Helper");
         s.has_gui_window = true;
         assert_eq!(
-            c.classify(&s), ProcessTier::AppHelper,
+            c.classify(&s),
+            ProcessTier::AppHelper,
             "Chrome Helper with GUI should be AppHelper"
         );
     }
@@ -121,7 +126,8 @@ mod scenarios {
         let c = ProcessClassifier::new();
         let s = snap("Google Chrome Helper");
         assert_eq!(
-            c.classify(&s), ProcessTier::SilentDaemon,
+            c.classify(&s),
+            ProcessTier::SilentDaemon,
             "Chrome Helper without GUI should be SilentDaemon"
         );
     }
@@ -134,7 +140,8 @@ mod scenarios {
         s.parent_alive = false;
         s.pid = 500;
         assert_eq!(
-            c.classify(&s), ProcessTier::ZombieOrphan,
+            c.classify(&s),
+            ProcessTier::ZombieOrphan,
             "Process with dead parent should be ZombieOrphan"
         );
     }
@@ -148,7 +155,8 @@ mod scenarios {
         s.pid = 1;
         // launchd is essential, and pid=1 is exempt from orphan check
         assert_eq!(
-            c.classify(&s), ProcessTier::SystemEssential,
+            c.classify(&s),
+            ProcessTier::SystemEssential,
             "PID 1 (launchd) should never be ZombieOrphan"
         );
     }
@@ -164,7 +172,11 @@ mod scenarios {
         s.has_gui_window = true;
         s.secs_since_user_interaction = 5;
         let u = score_utility(&s);
-        assert!(u > 0.90, "Active GUI app should have utility > 0.90, got {}", u);
+        assert!(
+            u > 0.90,
+            "Active GUI app should have utility > 0.90, got {}",
+            u
+        );
     }
 
     /// C10: Silent daemon with network should have utility > base (0.5).
@@ -173,7 +185,11 @@ mod scenarios {
         let mut s = snap("sync_daemon");
         s.has_network = true;
         let u = score_utility(&s);
-        assert!(u > 0.50, "Network daemon should have utility > 0.50, got {}", u);
+        assert!(
+            u > 0.50,
+            "Network daemon should have utility > 0.50, got {}",
+            u
+        );
     }
 
     /// C11: Chatty no-GUI daemon (100 wakeups/s) should be penalized.
@@ -182,7 +198,11 @@ mod scenarios {
         let mut s = snap("chatty_service");
         s.wakeups_per_sec = 100.0;
         let u = score_utility(&s);
-        assert!(u < 0.40, "Chatty daemon (100 wakeups/s) should have low utility, got {}", u);
+        assert!(
+            u < 0.40,
+            "Chatty daemon (100 wakeups/s) should have low utility, got {}",
+            u
+        );
     }
 
     /// C12: Rosetta process gets small penalty but stays near base.
@@ -197,11 +217,14 @@ mod scenarios {
         let u_rosetta = score_utility(&rosetta);
         assert!(
             u_native > u_rosetta,
-            "Native ({}) should have higher utility than Rosetta ({})", u_native, u_rosetta
+            "Native ({}) should have higher utility than Rosetta ({})",
+            u_native,
+            u_rosetta
         );
         assert!(
             u_rosetta > 0.40,
-            "Rosetta penalty should be small — still usable. Got {}", u_rosetta
+            "Rosetta penalty should be small — still usable. Got {}",
+            u_rosetta
         );
     }
 
@@ -226,7 +249,11 @@ mod scenarios {
         let mut s = snap("Spotify");
         s.has_gui_window = true;
         let w = waste_score(&s, ProcessTier::BackgroundVisible);
-        assert!(w <= 0.15, "BackgroundVisible waste should be <= 0.15, got {}", w);
+        assert!(
+            w <= 0.15,
+            "BackgroundVisible waste should be <= 0.15, got {}",
+            w
+        );
     }
 
     /// C15: SilentDaemon with high wakeups AND large RSS should have high waste.
@@ -236,6 +263,10 @@ mod scenarios {
         s.wakeups_per_sec = 50.0;
         s.rss_bytes = 500 * 1024 * 1024; // 500MB
         let w = waste_score(&s, ProcessTier::SilentDaemon);
-        assert!(w > 0.55, "Bloated chatty daemon waste should be > 0.55, got {}", w);
+        assert!(
+            w > 0.55,
+            "Bloated chatty daemon waste should be > 0.55, got {}",
+            w
+        );
     }
 }

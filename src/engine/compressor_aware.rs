@@ -262,16 +262,24 @@ pub fn sample_process_temperature(pid: u32) -> Option<TempProfile> {
             let mut obj: u32 = 0;
 
             let kr = mach_vm_region(
-                task_port, &mut address, &mut size,
-                VM_REGION_TOP_INFO, &mut info as *mut _ as *mut i32,
-                &mut count, &mut obj,
+                task_port,
+                &mut address,
+                &mut size,
+                VM_REGION_TOP_INFO,
+                &mut info as *mut _ as *mut i32,
+                &mut count,
+                &mut obj,
             );
-            if kr != KERN_SUCCESS { break; }
+            if kr != KERN_SUCCESS {
+                break;
+            }
             if info.share_mode == SM_PRIVATE && size >= 16384 {
                 regions.push((address, size));
             }
             address += size;
-            if address == 0 { break; }
+            if address == 0 {
+                break;
+            }
         }
     }
 
@@ -289,14 +297,19 @@ pub fn sample_process_temperature(pid: u32) -> Option<TempProfile> {
 
         for &(addr, size) in &regions {
             let probe_addr = (addr + size / 2) & !0x3FFF; // page-align
-            if probe_addr < addr { continue; }
+            if probe_addr < addr {
+                continue;
+            }
 
             let mut buf: u8 = 0;
             let mut out_size: u64 = 0;
             let t0 = mach_absolute_time();
             let kr = mach_vm_read_overwrite(
-                task_port, probe_addr, 1,
-                &mut buf as *mut u8 as u64, &mut out_size,
+                task_port,
+                probe_addr,
+                1,
+                &mut buf as *mut u8 as u64,
+                &mut out_size,
             );
             let t1 = mach_absolute_time();
             if kr == KERN_SUCCESS && out_size > 0 {
@@ -306,7 +319,9 @@ pub fn sample_process_temperature(pid: u32) -> Option<TempProfile> {
     }
 
     if need_dealloc {
-        unsafe { mach_port_deallocate(self_port, task_port); }
+        unsafe {
+            mach_port_deallocate(self_port, task_port);
+        }
     }
 
     let n = timings.len();
@@ -417,8 +432,7 @@ pub enum MemoryAction {
 /// on Apple Silicon lacks com.apple.system-task-ports entitlement).
 #[cfg(target_os = "macos")]
 pub fn query_memory_profile(pid: u32) -> Option<ProcessMemoryProfile> {
-    query_memory_profile_mach(pid)
-        .or_else(|| query_memory_profile_rusage(pid))
+    query_memory_profile_mach(pid).or_else(|| query_memory_profile_rusage(pid))
 }
 
 /// Fallback: build a partial profile from proc_pid_rusage (always works as root).
@@ -641,12 +655,7 @@ const VM_PURGABLE_VOLATILE: i32 = 1;
 
 #[cfg(target_os = "macos")]
 extern "C" {
-    fn mach_vm_purgable_control(
-        task: u32,
-        address: u64,
-        control: i32,
-        state: *mut i32,
-    ) -> i32;
+    fn mach_vm_purgable_control(task: u32, address: u64, control: i32, state: *mut i32) -> i32;
 }
 
 /// Reclaim purgeable memory from another process without killing it.
@@ -685,20 +694,25 @@ pub fn purge_purgeable_regions(pid: u32) -> Option<u32> {
             let mut obj: u32 = 0;
 
             let kr = mach_vm_region(
-                task_port, &mut address, &mut size,
-                VM_REGION_TOP_INFO, &mut info as *mut _ as *mut i32,
-                &mut count, &mut obj,
+                task_port,
+                &mut address,
+                &mut size,
+                VM_REGION_TOP_INFO,
+                &mut info as *mut _ as *mut i32,
+                &mut count,
+                &mut obj,
             );
-            if kr != KERN_SUCCESS { break; }
+            if kr != KERN_SUCCESS {
+                break;
+            }
 
             // Only target private regions with resident pages.
             // Purgeable memory is identified by attempting the purgable_control call —
             // non-purgeable regions return KERN_INVALID_ARGUMENT (harmlessly).
             if info.share_mode == SM_PRIVATE && info.private_pages_resident > 0 {
                 let mut state = VM_PURGABLE_VOLATILE;
-                let kr = mach_vm_purgable_control(
-                    task_port, address, VM_PURGABLE_SET_STATE, &mut state,
-                );
+                let kr =
+                    mach_vm_purgable_control(task_port, address, VM_PURGABLE_SET_STATE, &mut state);
                 if kr == KERN_SUCCESS {
                     purged += 1;
                 }
@@ -706,7 +720,9 @@ pub fn purge_purgeable_regions(pid: u32) -> Option<u32> {
             }
 
             address += size;
-            if address == 0 { break; }
+            if address == 0 {
+                break;
+            }
         }
 
         if need_dealloc {
@@ -736,7 +752,11 @@ mod tests {
         let summary = scan_regions(pid);
         assert!(summary.is_some(), "should scan own process (pid={})", pid);
         let s = summary.unwrap();
-        assert!(s.n_regions > 10, "self should have many regions: {}", s.n_regions);
+        assert!(
+            s.n_regions > 10,
+            "self should have many regions: {}",
+            s.n_regions
+        );
         assert!(s.private_bytes > 0, "self should have private memory");
         assert!(s.total_virtual > 0, "self should have virtual memory");
     }
@@ -749,7 +769,9 @@ mod tests {
             assert!(
                 s.private_bytes + s.shared_bytes <= s.total_virtual + 1024 * 1024,
                 "private({}) + shared({}) should be <= total({})",
-                s.private_bytes, s.shared_bytes, s.total_virtual
+                s.private_bytes,
+                s.shared_bytes,
+                s.total_virtual
             );
             assert!(
                 s.mean_region_size > 0,
@@ -858,7 +880,9 @@ mod tests {
         assert!(
             hot_or_dram > 0.3,
             "own process should have hot/dram pages: hot={} dram={} compressed={}",
-            p.pct_hot, p.pct_dram, p.pct_compressed
+            p.pct_hot,
+            p.pct_dram,
+            p.pct_compressed
         );
     }
 

@@ -294,11 +294,7 @@ mod tests {
             "linucb_reward={}",
             bus.linucb_reward()
         );
-        assert!(
-            bus.nars_reward() > 0.0,
-            "nars_reward={}",
-            bus.nars_reward()
-        );
+        assert!(bus.nars_reward() > 0.0, "nars_reward={}", bus.nars_reward());
     }
 
     #[test]
@@ -320,7 +316,10 @@ mod tests {
         bus.publish(sig(RewardSource::CausalGraph, -0.3, 0.1, 1));
         bus.flush_cycle();
 
-        assert!(bus.rl_reward() > 0.0, "High-confidence positive should dominate");
+        assert!(
+            bus.rl_reward() > 0.0,
+            "High-confidence positive should dominate"
+        );
     }
 
     #[test]
@@ -456,6 +455,10 @@ mod tests {
         for i in 0..30 {
             bus_neg.publish(sig(RewardSource::RlAgent, -0.6, 1.0, i));
         }
-        assert!(bus_neg.mean_reward() < -0.3, "mean={}", bus_neg.mean_reward());
+        assert!(
+            bus_neg.mean_reward() < -0.3,
+            "mean={}",
+            bus_neg.mean_reward()
+        );
     }
 }

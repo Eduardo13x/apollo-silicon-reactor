@@ -195,16 +195,11 @@ impl DegradationController {
         }
 
         // ── Conservative: failure rate ────────────────────────────────────────
-        if self.mode == OperationMode::Full
-            && failures_60s >= self.failure_threshold_conservative
-        {
+        if self.mode == OperationMode::Full && failures_60s >= self.failure_threshold_conservative {
             self.transition(OperationMode::Conservative, "failure-rate-high");
         }
         // Recover from Conservative when failures clear.
-        if self.mode == OperationMode::Conservative
-            && failures_60s == 0
-            && !inputs.circuit_open
-        {
+        if self.mode == OperationMode::Conservative && failures_60s == 0 && !inputs.circuit_open {
             self.transition(OperationMode::Full, "failure-rate-clear");
         }
 

@@ -292,7 +292,10 @@ mod tests {
             assert!(result.is_some(), "should be able to query own process");
             let state = result.unwrap();
             assert_eq!(state.pid, my_pid);
-            assert!(state.total_threads >= 1, "test process has at least 1 thread");
+            assert!(
+                state.total_threads >= 1,
+                "test process has at least 1 thread"
+            );
         }
         #[cfg(not(target_os = "macos"))]
         {

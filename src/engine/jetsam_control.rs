@@ -168,9 +168,9 @@ pub fn set_warn_limit(pid: u32, warn_mb: i32) -> Result<(), String> {
     // Preserve the current active limit to avoid unintentionally changing it.
     let current = get_memlimit(pid).unwrap_or_default();
     let mut props = MemorystatusMemlimitProperties {
-        memlimit_active:      current.memlimit_active,
+        memlimit_active: current.memlimit_active,
         memlimit_active_attr: current.memlimit_active_attr,
-        memlimit_inactive:    warn_mb,
+        memlimit_inactive: warn_mb,
         memlimit_inactive_attr: 0, // 0 = non-fatal (no MEMORYSTATUS_MEMLIMIT_ATTR_FATAL=0x1)
     };
     let ret = unsafe {

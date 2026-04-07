@@ -215,8 +215,10 @@ impl EntropyDetector {
 
         // Generate fingerprint for this workload state.
         let process_count = cpu_values.len().max(mem_values.len());
-        self.last_fingerprint =
-            Some(WorkloadFingerprint::from_entropy_and_count(h_combined, process_count));
+        self.last_fingerprint = Some(WorkloadFingerprint::from_entropy_and_count(
+            h_combined,
+            process_count,
+        ));
     }
 
     /// Score de anomalía: cuántas desviaciones estándar está la entropía actual
@@ -274,7 +276,12 @@ impl EntropyDetector {
 
             // GC: if cache grows too large, evict least-seen entries.
             if self.fingerprints.len() > 200 {
-                let min_hits = self.fingerprints.values().map(|e| e.hits).min().unwrap_or(0);
+                let min_hits = self
+                    .fingerprints
+                    .values()
+                    .map(|e| e.hits)
+                    .min()
+                    .unwrap_or(0);
                 self.fingerprints.retain(|_, e| e.hits > min_hits);
             }
         }
@@ -401,10 +408,17 @@ mod tests {
         assert!(det.fingerprint_count() > 0);
         // After enough hits, recognized_pattern should return Some.
         let result = det.recognized_pattern();
-        assert!(result.is_some(), "pattern should be recognized after 10 hits");
+        assert!(
+            result.is_some(),
+            "pattern should be recognized after 10 hits"
+        );
         let (avg_anomaly, confidence) = result.unwrap();
         // Stable pattern → anomaly near 0.
-        assert!(avg_anomaly.abs() < 1.5, "stable pattern anomaly should be low: {}", avg_anomaly);
+        assert!(
+            avg_anomaly.abs() < 1.5,
+            "stable pattern anomaly should be low: {}",
+            avg_anomaly
+        );
         assert!(confidence > 0.0, "should have some confidence");
     }
 
@@ -413,7 +427,10 @@ mod tests {
         let mut det = EntropyDetector::new();
         // Workload A: 5 processes.
         for _ in 0..5 {
-            det.update(&[30.0, 20.0, 15.0, 10.0, 5.0], &[500.0, 300.0, 200.0, 100.0, 50.0]);
+            det.update(
+                &[30.0, 20.0, 15.0, 10.0, 5.0],
+                &[500.0, 300.0, 200.0, 100.0, 50.0],
+            );
             det.anomaly_score();
         }
         let count_after_a = det.fingerprint_count();
@@ -428,7 +445,8 @@ mod tests {
         assert!(
             count_after_b > count_after_a,
             "different workloads should produce different fingerprints: {} > {}",
-            count_after_b, count_after_a
+            count_after_b,
+            count_after_a
         );
     }
 

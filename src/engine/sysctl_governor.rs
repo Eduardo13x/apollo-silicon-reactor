@@ -14,9 +14,9 @@
 //! All emitted actions use keys from the safety module's allowlist.  The
 //! governor only emits actions when running as root.
 
+use crate::engine::sysctl_direct;
 use std::collections::HashMap;
 use std::path::Path;
-use crate::engine::sysctl_direct;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -1224,7 +1224,9 @@ fn estimate_vnode_usage(maxvnodes: u64) -> f64 {
         std::thread::spawn(move || {
             let _ = tx.send(sysctl_direct::read_str(&key));
         });
-        rx.recv_timeout(std::time::Duration::from_millis(500)).ok().flatten()
+        rx.recv_timeout(std::time::Duration::from_millis(500))
+            .ok()
+            .flatten()
     }
 
     // Try kern.num_vnodes first (available on macOS 12+).

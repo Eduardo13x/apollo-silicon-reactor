@@ -145,13 +145,25 @@ impl SafetyPolicy {
         let core_scale = (cores as f64 / 8.0).clamp(0.5, 2.0);
         let ram_scale = (ram_gb / 8.0).clamp(0.5, 4.0);
         Self {
-            max_boosts_per_cycle: ((base.max_boosts_per_cycle as f64 * core_scale).round() as usize).max(1),
-            max_throttles_per_cycle: ((base.max_throttles_per_cycle as f64 * core_scale).round() as usize).max(1),
-            max_paging_hints_per_cycle: ((base.max_paging_hints_per_cycle as f64 * ram_scale).round() as usize).max(1),
-            max_freezes_per_cycle: ((base.max_freezes_per_cycle as f64 * core_scale).round() as usize).max(1),
-            max_sysctl_writes_per_cycle: ((base.max_sysctl_writes_per_cycle as f64 * core_scale).round() as usize).max(1),
+            max_boosts_per_cycle: ((base.max_boosts_per_cycle as f64 * core_scale).round()
+                as usize)
+                .max(1),
+            max_throttles_per_cycle: ((base.max_throttles_per_cycle as f64 * core_scale).round()
+                as usize)
+                .max(1),
+            max_paging_hints_per_cycle: ((base.max_paging_hints_per_cycle as f64 * ram_scale)
+                .round() as usize)
+                .max(1),
+            max_freezes_per_cycle: ((base.max_freezes_per_cycle as f64 * core_scale).round()
+                as usize)
+                .max(1),
+            max_sysctl_writes_per_cycle: ((base.max_sysctl_writes_per_cycle as f64 * core_scale)
+                .round() as usize)
+                .max(1),
             cooldown_seconds: base.cooldown_seconds,
-            max_thread_qos_per_cycle: ((base.max_thread_qos_per_cycle as f64 * core_scale).round() as usize).max(1),
+            max_thread_qos_per_cycle: ((base.max_thread_qos_per_cycle as f64 * core_scale).round()
+                as usize)
+                .max(1),
         }
     }
 
@@ -325,11 +337,7 @@ impl RootAction {
         }
     }
 
-    pub fn freeze(
-        pid: u32,
-        name: impl Into<String>,
-        reason: impl Into<String>,
-    ) -> Self {
+    pub fn freeze(pid: u32, name: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::freeze_full(pid, name, reason, 0, 0)
     }
 
@@ -361,11 +369,7 @@ impl RootAction {
         }
     }
 
-    pub fn set_memorystatus(
-        pid: u32,
-        priority: i32,
-        reason: impl Into<String>,
-    ) -> Self {
+    pub fn set_memorystatus(pid: u32, priority: i32, reason: impl Into<String>) -> Self {
         RootAction::SetMemorystatus {
             pid,
             priority,
@@ -1206,10 +1210,13 @@ mod tests {
 
     #[test]
     fn latency_target_roundtrip() {
-        for target in [LatencyTarget::Low, LatencyTarget::Normal, LatencyTarget::Max] {
+        for target in [
+            LatencyTarget::Low,
+            LatencyTarget::Normal,
+            LatencyTarget::Max,
+        ] {
             let json = serde_json::to_string(&target).expect("serialize LatencyTarget");
-            let rt: LatencyTarget =
-                serde_json::from_str(&json).expect("deserialize LatencyTarget");
+            let rt: LatencyTarget = serde_json::from_str(&json).expect("deserialize LatencyTarget");
             assert_eq!(rt, target);
         }
     }
@@ -1260,10 +1267,7 @@ mod tests {
     #[test]
     fn runtime_metrics_default_no_nan_f64() {
         let m = RuntimeMetrics::default();
-        assert!(
-            !m.p95_cycle_ms.is_nan(),
-            "p95_cycle_ms should not be NaN"
-        );
+        assert!(!m.p95_cycle_ms.is_nan(), "p95_cycle_ms should not be NaN");
         assert!(
             !m.last_pressure_score.is_nan(),
             "last_pressure_score should not be NaN"

@@ -90,10 +90,26 @@ fn neon_dot24_f32(a: &[f32], b: &[f32; HIDDEN]) -> f32 {
     unsafe {
         let mut acc0 = vmulq_f32(vld1q_f32(a.as_ptr()), vld1q_f32(b.as_ptr()));
         let mut acc1 = vmulq_f32(vld1q_f32(a.as_ptr().add(4)), vld1q_f32(b.as_ptr().add(4)));
-        acc0 = vfmaq_f32(acc0, vld1q_f32(a.as_ptr().add(8)), vld1q_f32(b.as_ptr().add(8)));
-        acc1 = vfmaq_f32(acc1, vld1q_f32(a.as_ptr().add(12)), vld1q_f32(b.as_ptr().add(12)));
-        acc0 = vfmaq_f32(acc0, vld1q_f32(a.as_ptr().add(16)), vld1q_f32(b.as_ptr().add(16)));
-        acc1 = vfmaq_f32(acc1, vld1q_f32(a.as_ptr().add(20)), vld1q_f32(b.as_ptr().add(20)));
+        acc0 = vfmaq_f32(
+            acc0,
+            vld1q_f32(a.as_ptr().add(8)),
+            vld1q_f32(b.as_ptr().add(8)),
+        );
+        acc1 = vfmaq_f32(
+            acc1,
+            vld1q_f32(a.as_ptr().add(12)),
+            vld1q_f32(b.as_ptr().add(12)),
+        );
+        acc0 = vfmaq_f32(
+            acc0,
+            vld1q_f32(a.as_ptr().add(16)),
+            vld1q_f32(b.as_ptr().add(16)),
+        );
+        acc1 = vfmaq_f32(
+            acc1,
+            vld1q_f32(a.as_ptr().add(20)),
+            vld1q_f32(b.as_ptr().add(20)),
+        );
         vaddvq_f32(vaddq_f32(acc0, acc1))
     }
 }
@@ -192,7 +208,11 @@ struct WelfordF32 {
 
 impl WelfordF32 {
     fn new() -> Self {
-        Self { mean: 0.0, m2: 0.0, count: 0 }
+        Self {
+            mean: 0.0,
+            m2: 0.0,
+            count: 0,
+        }
     }
     fn update(&mut self, x: f32) {
         self.count += 1;
@@ -202,7 +222,11 @@ impl WelfordF32 {
         self.m2 += delta * delta2;
     }
     fn variance(&self) -> f32 {
-        if self.count < 2 { 1.0 } else { self.m2 / (self.count - 1) as f32 }
+        if self.count < 2 {
+            1.0
+        } else {
+            self.m2 / (self.count - 1) as f32
+        }
     }
     fn std(&self) -> f32 {
         self.variance().sqrt().max(1e-8)
@@ -225,7 +249,12 @@ struct EmaWelford {
 
 impl EmaWelford {
     fn new(alpha: f32) -> Self {
-        Self { mean: 0.0, var: 1.0, count: 0, alpha }
+        Self {
+            mean: 0.0,
+            var: 1.0,
+            count: 0,
+            alpha,
+        }
     }
     fn update(&mut self, x: f32) {
         self.count += 1;
@@ -239,7 +268,11 @@ impl EmaWelford {
         self.var = (1.0 - self.alpha) * (self.var + self.alpha * delta * delta);
     }
     fn std(&self) -> f32 {
-        if self.count < 2 { 1.0 } else { self.var.sqrt().max(1e-8) }
+        if self.count < 2 {
+            1.0
+        } else {
+            self.var.sqrt().max(1e-8)
+        }
     }
 }
 
@@ -251,7 +284,9 @@ struct OnlineNormaliser {
 
 impl OnlineNormaliser {
     fn new() -> Self {
-        Self { stats: std::array::from_fn(|_| WelfordF32::new()) }
+        Self {
+            stats: std::array::from_fn(|_| WelfordF32::new()),
+        }
     }
     fn update_and_normalise(&mut self, raw: &[f32; N_FEATURES]) -> [f32; N_FEATURES] {
         let mut out = [0.0f32; N_FEATURES];
@@ -336,9 +371,9 @@ struct SaeGenome {
     lr: f32,
 
     // Weights (row-major).
-    w_enc: [[f32; N_FEATURES]; HIDDEN],   // encoder: HIDDEN rows × N_FEATURES cols
+    w_enc: [[f32; N_FEATURES]; HIDDEN], // encoder: HIDDEN rows × N_FEATURES cols
     b_enc: [f32; HIDDEN],
-    w_dec: [[f32; HIDDEN]; N_FEATURES],   // decoder: N_FEATURES rows × HIDDEN cols
+    w_dec: [[f32; HIDDEN]; N_FEATURES], // decoder: N_FEATURES rows × HIDDEN cols
     b_dec: [f32; N_FEATURES],
 
     // RMSProp accumulators (per-parameter EMA of squared gradients).
@@ -475,14 +510,13 @@ impl SaeGenome {
         for i in 0..N_FEATURES {
             for j in 0..HIDDEN {
                 let g = d_recon[i] * h_sparse[j];
-                self.rms_w_dec[i][j] = RMSPROP_DECAY * self.rms_w_dec[i][j]
-                    + (1.0 - RMSPROP_DECAY) * g * g;
+                self.rms_w_dec[i][j] =
+                    RMSPROP_DECAY * self.rms_w_dec[i][j] + (1.0 - RMSPROP_DECAY) * g * g;
                 let step = self.lr * g / (self.rms_w_dec[i][j].sqrt() + 1e-8);
                 self.w_dec[i][j] -= step;
             }
             let g = d_recon[i];
-            self.rms_b_dec[i] = RMSPROP_DECAY * self.rms_b_dec[i]
-                + (1.0 - RMSPROP_DECAY) * g * g;
+            self.rms_b_dec[i] = RMSPROP_DECAY * self.rms_b_dec[i] + (1.0 - RMSPROP_DECAY) * g * g;
             self.b_dec[i] -= self.lr * g / (self.rms_b_dec[i].sqrt() + 1e-8);
         }
 
@@ -503,14 +537,13 @@ impl SaeGenome {
             }
             for i in 0..N_FEATURES {
                 let g = d_h[j] * masked[i];
-                self.rms_w_enc[j][i] = RMSPROP_DECAY * self.rms_w_enc[j][i]
-                    + (1.0 - RMSPROP_DECAY) * g * g;
+                self.rms_w_enc[j][i] =
+                    RMSPROP_DECAY * self.rms_w_enc[j][i] + (1.0 - RMSPROP_DECAY) * g * g;
                 let step = self.lr * g / (self.rms_w_enc[j][i].sqrt() + 1e-8);
                 self.w_enc[j][i] -= step;
             }
             let g = d_h[j];
-            self.rms_b_enc[j] = RMSPROP_DECAY * self.rms_b_enc[j]
-                + (1.0 - RMSPROP_DECAY) * g * g;
+            self.rms_b_enc[j] = RMSPROP_DECAY * self.rms_b_enc[j] + (1.0 - RMSPROP_DECAY) * g * g;
             self.b_enc[j] -= self.lr * g / (self.rms_b_enc[j].sqrt() + 1e-8);
         }
     }
@@ -537,9 +570,17 @@ fn niche_of(pressure_zone: u8, feature_focus: u8) -> usize {
 }
 
 fn classify_pressure_zone(pressure: f32) -> u8 {
-    if pressure < 0.30 { 0 }      // idle
-    else if pressure < 0.65 { 1 }  // moderate
-    else { 2 }                      // heavy
+    if pressure < 0.30 {
+        0
+    }
+    // idle
+    else if pressure < 0.65 {
+        1
+    }
+    // moderate
+    else {
+        2
+    } // heavy
 }
 
 fn classify_feature_focus(mask: u16) -> u8 {
@@ -549,7 +590,11 @@ fn classify_feature_focus(mask: u16) -> u8 {
     // Normalise by group size so the niche isn't always "memory-heavy".
     let mem_frac = (mask & 0x001F).count_ones() as f32 / 5.0;
     let sys_frac = (mask >> 5).count_ones() as f32 / 11.0;
-    if mem_frac >= sys_frac { 0 } else { 1 }
+    if mem_frac >= sys_frac {
+        0
+    } else {
+        1
+    }
 }
 
 // ── Darwin-Boltzmann Anomaly Detector ────────────────────────────────────────
@@ -675,7 +720,9 @@ impl EvolvedAnomalyDetector {
         let pressure_zone = classify_pressure_zone(self.recent_pressure);
 
         // Assign niches.
-        let niches: Vec<usize> = self.population.iter()
+        let niches: Vec<usize> = self
+            .population
+            .iter()
             .map(|ind| niche_of(pressure_zone, classify_feature_focus(ind.feature_mask)))
             .collect();
 
@@ -693,14 +740,13 @@ impl EvolvedAnomalyDetector {
                 _ => {}
             }
         }
-        let elite_set: Vec<usize> = niche_best.iter()
+        let elite_set: Vec<usize> = niche_best
+            .iter()
             .filter_map(|e| e.map(|(idx, _)| idx))
             .collect();
 
         // Tournament selection: pick 2 random non-elite, replace loser with mutant of winner.
-        let non_elite: Vec<usize> = (0..POP_SIZE)
-            .filter(|i| !elite_set.contains(i))
-            .collect();
+        let non_elite: Vec<usize> = (0..POP_SIZE).filter(|i| !elite_set.contains(i)).collect();
 
         if non_elite.len() >= 2 {
             let a = non_elite[self.rng.usize(non_elite.len())];
@@ -744,8 +790,8 @@ impl EvolvedAnomalyDetector {
 
         for h in 0..HIDDEN {
             for f in 0..N_FEATURES {
-                self.population[dst].w_enc[h][f] = self.population[src].w_enc[h][f]
-                    + 0.02 * self.rng.gaussian();
+                self.population[dst].w_enc[h][f] =
+                    self.population[src].w_enc[h][f] + 0.02 * self.rng.gaussian();
                 self.population[dst].rms_w_enc[h][f] = 1.0; // reset optimizer state
             }
             self.population[dst].b_enc[h] = self.population[src].b_enc[h];
@@ -753,8 +799,8 @@ impl EvolvedAnomalyDetector {
         }
         for f in 0..N_FEATURES {
             for h in 0..HIDDEN {
-                self.population[dst].w_dec[f][h] = self.population[src].w_dec[f][h]
-                    + 0.02 * self.rng.gaussian();
+                self.population[dst].w_dec[f][h] =
+                    self.population[src].w_dec[f][h] + 0.02 * self.rng.gaussian();
                 self.population[dst].rms_w_dec[f][h] = 1.0;
             }
             self.population[dst].b_dec[f] = self.population[src].b_dec[f];
@@ -779,7 +825,10 @@ impl EvolvedAnomalyDetector {
 
     /// Best fitness across the population.
     pub fn best_fitness(&self) -> f32 {
-        self.population.iter().map(|p| p.fitness).fold(0.0f32, f32::max)
+        self.population
+            .iter()
+            .map(|p| p.fitness)
+            .fold(0.0f32, f32::max)
     }
 }
 
@@ -972,7 +1021,11 @@ mod tests {
         let mean_vec = [5.0f32; N_FEATURES];
         let normed = norm.update_and_normalise(&mean_vec);
         for i in 0..N_FEATURES {
-            assert!(normed[i].abs() < 1.0, "feature {i} normalised mean should be near 0, got {}", normed[i]);
+            assert!(
+                normed[i].abs() < 1.0,
+                "feature {i} normalised mean should be near 0, got {}",
+                normed[i]
+            );
         }
     }
 }

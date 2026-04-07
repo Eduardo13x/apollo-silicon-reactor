@@ -37,11 +37,17 @@ impl SleepNotifier {
         {
             let flag = will_sleep.clone();
             let available = spawn_iokit_listener(flag);
-            Self { will_sleep, available }
+            Self {
+                will_sleep,
+                available,
+            }
         }
 
         #[cfg(not(target_os = "macos"))]
-        Self { will_sleep, available: false }
+        Self {
+            will_sleep,
+            available: false,
+        }
     }
 
     /// Check if a sleep event is pending. Non-blocking.
@@ -177,7 +183,8 @@ fn spawn_iokit_listener(flag: Arc<AtomicBool>) -> bool {
         .ok();
 
     // Wait for registration result (timeout 2s).
-    rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or(false)
+    rx.recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

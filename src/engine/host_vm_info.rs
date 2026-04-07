@@ -36,8 +36,8 @@ impl VmPageStats {
         if total == 0 {
             return 0.0;
         }
-        let free_pct = (self.free_pages + self.inactive_pages + self.speculative_pages) as f64
-            / total as f64;
+        let free_pct =
+            (self.free_pages + self.inactive_pages + self.speculative_pages) as f64 / total as f64;
         (1.0 - free_pct).clamp(0.0, 1.0)
     }
 }
@@ -101,8 +101,7 @@ const KERN_SUCCESS: i32 = 0;
 pub fn read_vm_stats() -> Option<VmPageStats> {
     let mut info = VmStatistics64::default();
     // Count is in units of `integer_t` (i32), not bytes.
-    let mut count =
-        (std::mem::size_of::<VmStatistics64>() / std::mem::size_of::<i32>()) as u32;
+    let mut count = (std::mem::size_of::<VmStatistics64>() / std::mem::size_of::<i32>()) as u32;
 
     let kr = unsafe { host_statistics64(mach_host_self(), HOST_VM_INFO64, &mut info, &mut count) };
 

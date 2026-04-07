@@ -175,7 +175,12 @@ impl LearningPipeline {
         }
         self.batch.push(obs);
         if self.batch.len() >= self.batch_size {
-            self.flush(outcome_tracker, causal_graph, skill_registry, effectiveness_tracker);
+            self.flush(
+                outcome_tracker,
+                causal_graph,
+                skill_registry,
+                effectiveness_tracker,
+            );
         }
     }
 
@@ -198,7 +203,8 @@ impl LearningPipeline {
         }
 
         // Sort by process_name for cache locality when updating HashMaps.
-        self.batch.sort_unstable_by(|a, b| a.process_name.cmp(&b.process_name));
+        self.batch
+            .sort_unstable_by(|a, b| a.process_name.cmp(&b.process_name));
 
         // ── Step 1: Fan-out to each subsystem ────────────────────────────────
 
@@ -207,7 +213,8 @@ impl LearningPipeline {
             // Note: record_throttle() + tick() is the live path; here we update the
             // Bayesian weight directly for observations that already have post_pressure.
             {
-                let w = outcome_tracker.weights
+                let w = outcome_tracker
+                    .weights
                     .entry(obs.process_name.clone())
                     .or_default();
                 w.throttle_count += 1;
@@ -219,12 +226,19 @@ impl LearningPipeline {
             // CausalGraph: record + evaluate in the same cycle using pre/post pressure.
             // We use a synthetic cycle so evaluate() triggers immediately.
             let synthetic_cycle = obs.cycle;
-            causal_graph.record_action(&obs.causal_action_key(), obs.pre_pressure as f32, synthetic_cycle);
+            causal_graph.record_action(
+                &obs.causal_action_key(),
+                obs.pre_pressure as f32,
+                synthetic_cycle,
+            );
             // Evaluate 0 cycles later with post_pressure (we already have the outcome).
             // This bypasses the normal eval_delay but is correct since we supply the
             // resolved outcome directly. We call evaluate() with a cycle offset of
             // eval_delay so the pending entry is eligible.
-            causal_graph.evaluate(obs.post_pressure as f32, synthetic_cycle + causal_graph_eval_delay());
+            causal_graph.evaluate(
+                obs.post_pressure as f32,
+                synthetic_cycle + causal_graph_eval_delay(),
+            );
 
             // SkillRegistry: record result for the named skill, if any.
             if let Some(skill_name) = &obs.skill_name {
@@ -271,7 +285,10 @@ impl LearningPipeline {
                 continue;
             }
             let current_rate = skill_registry.success_rate(&edge.cause).unwrap_or_else(|| {
-                eprintln!("[learning_pipeline] cross-feed B: no skill rate for {:?}, defaulting to 1.0", edge.cause);
+                eprintln!(
+                    "[learning_pipeline] cross-feed B: no skill rate for {:?}, defaulting to 1.0",
+                    edge.cause
+                );
                 1.0
             });
             if current_rate < 0.5 {
@@ -293,15 +310,22 @@ impl LearningPipeline {
         for obs in &self.batch {
             let skill_key = format!("throttle:{}", obs.process_name);
             let skill_apply_count = skill_registry.apply_count(&skill_key).unwrap_or_else(|| {
-                eprintln!("[learning_pipeline] cross-feed C: no apply_count for {:?}, defaulting to 0", skill_key);
+                eprintln!(
+                    "[learning_pipeline] cross-feed C: no apply_count for {:?}, defaulting to 0",
+                    skill_key
+                );
                 0
             });
             let skill_rate = skill_registry.success_rate(&skill_key).unwrap_or_else(|| {
-                eprintln!("[learning_pipeline] cross-feed C: no success_rate for {:?}, defaulting to 0.0", skill_key);
+                eprintln!(
+                    "[learning_pipeline] cross-feed C: no success_rate for {:?}, defaulting to 0.0",
+                    skill_key
+                );
                 0.0
             });
             if skill_apply_count >= 20 && skill_rate > 0.8 {
-                let w = outcome_tracker.weights
+                let w = outcome_tracker
+                    .weights
                     .entry(obs.process_name.clone())
                     .or_default();
                 // Only seed if OutcomeTracker has less evidence than the skill.
@@ -315,8 +339,8 @@ impl LearningPipeline {
 
         // ── Step 3: Update EffectivenessTracker (F3 Blend) ───────────────────
 
-        // After all learners have updated, feed their new signals into the 
-        // EffectivenessTracker to recompute the blended scores for all 
+        // After all learners have updated, feed their new signals into the
+        // EffectivenessTracker to recompute the blended scores for all
         // processes touched in this batch.
         for obs in &self.batch {
             let cycle = obs.cycle;
@@ -343,11 +367,17 @@ impl LearningPipeline {
             }
 
             // 3. Skill signal
-            let skill_key = obs.skill_name.as_ref().map(|s| s.clone())
+            let skill_key = obs
+                .skill_name
+                .as_ref()
+                .map(|s| s.clone())
                 .unwrap_or_else(|| format!("throttle:{}", obs.process_name));
             if let Some(rate) = skill_registry.success_rate(&skill_key) {
                 let apps = skill_registry.apply_count(&skill_key).unwrap_or_else(|| {
-                    eprintln!("[learning_pipeline] F3 blend: no apply_count for {:?}, defaulting to 0", skill_key);
+                    eprintln!(
+                        "[learning_pipeline] F3 blend: no apply_count for {:?}, defaulting to 0",
+                        skill_key
+                    );
                     0
                 });
                 effectiveness_tracker.update_from_skill(
@@ -376,7 +406,12 @@ impl LearningPipeline {
         skill_registry: &mut SkillRegistry,
         effectiveness_tracker: &mut EffectivenessTracker,
     ) {
-        self.flush(outcome_tracker, causal_graph, skill_registry, effectiveness_tracker);
+        self.flush(
+            outcome_tracker,
+            causal_graph,
+            skill_registry,
+            effectiveness_tracker,
+        );
     }
 }
 
@@ -458,7 +493,10 @@ mod tests {
         pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
 
         assert_eq!(pipeline.pending_count(), 0);
-        assert!(ot.weights.is_empty(), "disabled pipeline should not update OutcomeTracker");
+        assert!(
+            ot.weights.is_empty(),
+            "disabled pipeline should not update OutcomeTracker"
+        );
     }
 
     #[test]
@@ -483,7 +521,10 @@ mod tests {
         pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
 
         assert_eq!(pipeline.pending_count(), 0);
-        let w = ot.weights.get("Dropbox").expect("weight should exist after flush");
+        let w = ot
+            .weights
+            .get("Dropbox")
+            .expect("weight should exist after flush");
         assert_eq!(w.throttle_count, 4);
         assert_eq!(w.effective_count, 4); // all effective (delta=0.05 ≥ 0.01)
     }
@@ -568,7 +609,11 @@ mod tests {
         sr.record_result("throttle:Safari", true);
         // Verify setup: success_rate ≈ 0.2 (1/5).
         let rate_before = sr.success_rate("throttle:Safari").unwrap();
-        assert!(rate_before < 0.3, "setup: initial rate should be low (got {})", rate_before);
+        assert!(
+            rate_before < 0.3,
+            "setup: initial rate should be low (got {})",
+            rate_before
+        );
 
         // Push one observation for Safari — triggers cross-feed at flush.
         let obs = make_obs("Safari", 0.75, 0.70, 0);
@@ -579,7 +624,8 @@ mod tests {
         assert!(
             rate_after > rate_before,
             "cross-feed should boost skill success_rate (was {}, now {})",
-            rate_before, rate_after
+            rate_before,
+            rate_after
         );
     }
 
@@ -603,7 +649,11 @@ mod tests {
         }
         // 17 successes / 20 = 0.85 success_rate.
         let rate = sr.success_rate("throttle:Dropbox").unwrap();
-        assert!(rate > 0.8, "setup: skill should have >0.8 rate (got {})", rate);
+        assert!(
+            rate > 0.8,
+            "setup: skill should have >0.8 rate (got {})",
+            rate
+        );
 
         // OutcomeTracker has no data for Dropbox yet.
         assert!(ot.weights.get("Dropbox").is_none());
@@ -612,7 +662,10 @@ mod tests {
         pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
 
         // After flush, OutcomeTracker should have been seeded by the skill.
-        let w = ot.weights.get("Dropbox").expect("weight should exist after prior seeding");
+        let w = ot
+            .weights
+            .get("Dropbox")
+            .expect("weight should exist after prior seeding");
         // throttle_count comes from the fan-out (1) + possibly a seed (1 more).
         // effective_count should be ≥1 (effective obs) + seed boost.
         assert!(w.throttle_count >= 1);
@@ -638,7 +691,10 @@ mod tests {
         pipeline.flush_remaining(&mut ot, &mut cg, &mut sr, &mut eff);
         assert_eq!(pipeline.pending_count(), 0);
 
-        let w = ot.weights.get("Dropbox").expect("weight after flush_remaining");
+        let w = ot
+            .weights
+            .get("Dropbox")
+            .expect("weight after flush_remaining");
         assert_eq!(w.throttle_count, 3);
     }
 
@@ -658,7 +714,10 @@ mod tests {
 
         // CausalGraph should have evidence for throttle:Firefox.
         let eff_score = cg.effectiveness("throttle:Firefox");
-        assert!(eff_score.is_some(), "causal graph should have evidence for Firefox");
+        assert!(
+            eff_score.is_some(),
+            "causal graph should have evidence for Firefox"
+        );
         assert!(
             eff_score.unwrap() > 0.5,
             "effectiveness should be > 0.5 for consistently effective actions"
@@ -701,8 +760,14 @@ mod tests {
         // Core weights should match.
         let w1 = ot1.weights.get("Dropbox").unwrap();
         let w8 = ot8.weights.get("Dropbox").unwrap();
-        assert_eq!(w1.throttle_count, w8.throttle_count, "throttle_count should match");
-        assert_eq!(w1.effective_count, w8.effective_count, "effective_count should match");
+        assert_eq!(
+            w1.throttle_count, w8.throttle_count,
+            "throttle_count should match"
+        );
+        assert_eq!(
+            w1.effective_count, w8.effective_count,
+            "effective_count should match"
+        );
     }
 
     #[test]
@@ -778,7 +843,7 @@ mod tests {
 
         // One effective, one not.
         let obs_a = make_obs("Dropbox", 0.75, 0.70, 0); // effective
-        let obs_b = make_obs("Slack", 0.60, 0.61, 1);   // not effective (delta=-0.01)
+        let obs_b = make_obs("Slack", 0.60, 0.61, 1); // not effective (delta=-0.01)
 
         pipeline.push(obs_a, &mut ot, &mut cg, &mut sr, &mut eff);
         pipeline.push(obs_b, &mut ot, &mut cg, &mut sr, &mut eff);

@@ -85,11 +85,7 @@ impl EnergyPidTracker {
     ///
     /// `dt_secs`: elapsed time since last call (for mW conversion).
     /// Returns sorted by power_mw descending (top consumers first).
-    pub fn sample(
-        &mut self,
-        processes: &[(u32, &str)],
-        dt_secs: f64,
-    ) -> Vec<ProcessEnergyDelta> {
+    pub fn sample(&mut self, processes: &[(u32, &str)], dt_secs: f64) -> Vec<ProcessEnergyDelta> {
         if dt_secs <= 0.001 {
             return Vec::new();
         }
@@ -115,8 +111,15 @@ impl EnergyPidTracker {
 
             let phys_footprint_mb = rusage.phys_footprint as f64 / (1024.0 * 1024.0);
 
-            if let Some(&(prev_energy, prev_instr, prev_cycles, prev_start, prev_idle_wk, prev_intr_wk, prev_disk_w)) =
-                self.prev.get(&pid)
+            if let Some(&(
+                prev_energy,
+                prev_instr,
+                prev_cycles,
+                prev_start,
+                prev_idle_wk,
+                prev_intr_wk,
+                prev_disk_w,
+            )) = self.prev.get(&pid)
             {
                 // PID recycling check: if proc_start_abstime changed, skip delta.
                 if prev_start == current.3 {
@@ -145,11 +148,12 @@ impl EnergyPidTracker {
                     if delta_nj > 0 || wakeup_rate > 10.0 || disk_write_mbps > 1.0 {
                         // Score BEFORE updating baseline so the current sample is
                         // evaluated against the historical baseline, not itself.
-                        let anomaly_score = self.baseline.anomaly_score(
-                            name, ipc, wakeup_rate, disk_write_mbps,
-                        );
+                        let anomaly_score =
+                            self.baseline
+                                .anomaly_score(name, ipc, wakeup_rate, disk_write_mbps);
                         // Update baseline with this observation (after scoring).
-                        self.baseline.observe(name, ipc, wakeup_rate, disk_write_mbps);
+                        self.baseline
+                            .observe(name, ipc, wakeup_rate, disk_write_mbps);
                         results.push(ProcessEnergyDelta {
                             pid,
                             name: name.to_string(),
@@ -171,7 +175,11 @@ impl EnergyPidTracker {
         self.prev = new_prev;
 
         // Sort by power descending.
-        results.sort_by(|a, b| b.power_mw.partial_cmp(&a.power_mw).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.power_mw
+                .partial_cmp(&a.power_mw)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results
     }
 
@@ -183,10 +191,7 @@ impl EnergyPidTracker {
 
     /// Build a pid → wakeup_rate map for use in decide_actions.
     /// Only includes processes with wakeup_rate > threshold (default 50/s).
-    pub fn build_wakeup_hints(
-        results: &[ProcessEnergyDelta],
-        min_rate: f64,
-    ) -> HashMap<u32, f64> {
+    pub fn build_wakeup_hints(results: &[ProcessEnergyDelta], min_rate: f64) -> HashMap<u32, f64> {
         results
             .iter()
             .filter(|r| r.wakeup_rate >= min_rate)
@@ -315,9 +320,39 @@ mod tests {
     #[test]
     fn wakeup_hints_filters_threshold() {
         let data = vec![
-            ProcessEnergyDelta { pid: 1, name: "a".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 200.0, phys_footprint_mb: 100.0, disk_write_mbps: 0.0, anomaly_score: 0.0 },
-            ProcessEnergyDelta { pid: 2, name: "b".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 30.0, phys_footprint_mb: 50.0, disk_write_mbps: 0.0, anomaly_score: 0.0 },
-            ProcessEnergyDelta { pid: 3, name: "c".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 500.0, phys_footprint_mb: 200.0, disk_write_mbps: 0.0, anomaly_score: 0.0 },
+            ProcessEnergyDelta {
+                pid: 1,
+                name: "a".into(),
+                delta_nj: 0,
+                power_mw: 0.0,
+                ipc: 0.0,
+                wakeup_rate: 200.0,
+                phys_footprint_mb: 100.0,
+                disk_write_mbps: 0.0,
+                anomaly_score: 0.0,
+            },
+            ProcessEnergyDelta {
+                pid: 2,
+                name: "b".into(),
+                delta_nj: 0,
+                power_mw: 0.0,
+                ipc: 0.0,
+                wakeup_rate: 30.0,
+                phys_footprint_mb: 50.0,
+                disk_write_mbps: 0.0,
+                anomaly_score: 0.0,
+            },
+            ProcessEnergyDelta {
+                pid: 3,
+                name: "c".into(),
+                delta_nj: 0,
+                power_mw: 0.0,
+                ipc: 0.0,
+                wakeup_rate: 500.0,
+                phys_footprint_mb: 200.0,
+                disk_write_mbps: 0.0,
+                anomaly_score: 0.0,
+            },
         ];
         let hints = EnergyPidTracker::build_wakeup_hints(&data, 50.0);
         assert_eq!(hints.len(), 2);
@@ -329,8 +364,28 @@ mod tests {
     #[test]
     fn footprint_hints_built_correctly() {
         let data = vec![
-            ProcessEnergyDelta { pid: 10, name: "x".into(), delta_nj: 100, power_mw: 5.0, ipc: 1.0, wakeup_rate: 0.0, phys_footprint_mb: 256.0, disk_write_mbps: 0.0, anomaly_score: 0.0 },
-            ProcessEnergyDelta { pid: 11, name: "y".into(), delta_nj: 50, power_mw: 2.0, ipc: 0.5, wakeup_rate: 0.0, phys_footprint_mb: 0.0, disk_write_mbps: 0.0, anomaly_score: 0.0 },
+            ProcessEnergyDelta {
+                pid: 10,
+                name: "x".into(),
+                delta_nj: 100,
+                power_mw: 5.0,
+                ipc: 1.0,
+                wakeup_rate: 0.0,
+                phys_footprint_mb: 256.0,
+                disk_write_mbps: 0.0,
+                anomaly_score: 0.0,
+            },
+            ProcessEnergyDelta {
+                pid: 11,
+                name: "y".into(),
+                delta_nj: 50,
+                power_mw: 2.0,
+                ipc: 0.5,
+                wakeup_rate: 0.0,
+                phys_footprint_mb: 0.0,
+                disk_write_mbps: 0.0,
+                anomaly_score: 0.0,
+            },
         ];
         let footprints = EnergyPidTracker::build_footprint_hints(&data);
         assert_eq!(footprints.len(), 1);
@@ -355,9 +410,39 @@ mod tests {
     #[test]
     fn io_burst_hints_filters_threshold() {
         let data = vec![
-            ProcessEnergyDelta { pid: 1, name: "backup".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 0.0, phys_footprint_mb: 0.0, disk_write_mbps: 50.0, anomaly_score: 0.0 },
-            ProcessEnergyDelta { pid: 2, name: "idle".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 0.0, phys_footprint_mb: 0.0, disk_write_mbps: 0.5, anomaly_score: 0.0 },
-            ProcessEnergyDelta { pid: 3, name: "spotlight".into(), delta_nj: 0, power_mw: 0.0, ipc: 0.0, wakeup_rate: 0.0, phys_footprint_mb: 0.0, disk_write_mbps: 8.0, anomaly_score: 0.0 },
+            ProcessEnergyDelta {
+                pid: 1,
+                name: "backup".into(),
+                delta_nj: 0,
+                power_mw: 0.0,
+                ipc: 0.0,
+                wakeup_rate: 0.0,
+                phys_footprint_mb: 0.0,
+                disk_write_mbps: 50.0,
+                anomaly_score: 0.0,
+            },
+            ProcessEnergyDelta {
+                pid: 2,
+                name: "idle".into(),
+                delta_nj: 0,
+                power_mw: 0.0,
+                ipc: 0.0,
+                wakeup_rate: 0.0,
+                phys_footprint_mb: 0.0,
+                disk_write_mbps: 0.5,
+                anomaly_score: 0.0,
+            },
+            ProcessEnergyDelta {
+                pid: 3,
+                name: "spotlight".into(),
+                delta_nj: 0,
+                power_mw: 0.0,
+                ipc: 0.0,
+                wakeup_rate: 0.0,
+                phys_footprint_mb: 0.0,
+                disk_write_mbps: 8.0,
+                anomaly_score: 0.0,
+            },
         ];
         let hints = EnergyPidTracker::build_io_burst_hints(&data, 5.0);
         assert_eq!(hints.len(), 2);

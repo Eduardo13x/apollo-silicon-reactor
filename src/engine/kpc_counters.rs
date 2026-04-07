@@ -221,11 +221,23 @@ impl KpcReader {
                 };
             }
 
-            let fn_set_config = if fn_set_cfg.is_null() { None } else {
-                Some(unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut u64) -> i32>(fn_set_cfg) })
+            let fn_set_config = if fn_set_cfg.is_null() {
+                None
+            } else {
+                Some(unsafe {
+                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut u64) -> i32>(
+                        fn_set_cfg,
+                    )
+                })
             };
-            let fn_get_config = if fn_get_cfg.is_null() { None } else {
-                Some(unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut u64) -> i32>(fn_get_cfg) })
+            let fn_get_config = if fn_get_cfg.is_null() {
+                None
+            } else {
+                Some(unsafe {
+                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut u64) -> i32>(
+                        fn_get_cfg,
+                    )
+                })
             };
 
             Self {
@@ -287,34 +299,30 @@ impl KpcReader {
             let cycles = buf.first().copied().unwrap_or(0);
             let instructions = buf.get(1).copied().unwrap_or(0);
 
-            let (delta_cycles, delta_instructions, ipc) =
-                if let Some(ref prev) = self.prev_counters {
-                    let prev_cycles = prev.first().copied().unwrap_or(0);
-                    let prev_instr = prev.get(1).copied().unwrap_or(0);
+            let (delta_cycles, delta_instructions, ipc) = if let Some(ref prev) = self.prev_counters
+            {
+                let prev_cycles = prev.first().copied().unwrap_or(0);
+                let prev_instr = prev.get(1).copied().unwrap_or(0);
 
-                    // Handle 48-bit counter overflow.
-                    let mask_48 = (1u64 << 48) - 1;
-                    let dc = if cycles >= prev_cycles {
-                        cycles - prev_cycles
-                    } else {
-                        (cycles + mask_48) - prev_cycles
-                    };
-                    let di = if instructions >= prev_instr {
-                        instructions - prev_instr
-                    } else {
-                        (instructions + mask_48) - prev_instr
-                    };
-
-                    let ipc = if dc > 0 {
-                        di as f64 / dc as f64
-                    } else {
-                        0.0
-                    };
-
-                    (dc, di, ipc)
+                // Handle 48-bit counter overflow.
+                let mask_48 = (1u64 << 48) - 1;
+                let dc = if cycles >= prev_cycles {
+                    cycles - prev_cycles
                 } else {
-                    (0, 0, 0.0)
+                    (cycles + mask_48) - prev_cycles
                 };
+                let di = if instructions >= prev_instr {
+                    instructions - prev_instr
+                } else {
+                    (instructions + mask_48) - prev_instr
+                };
+
+                let ipc = if dc > 0 { di as f64 / dc as f64 } else { 0.0 };
+
+                (dc, di, ipc)
+            } else {
+                (0, 0, 0.0)
+            };
 
             self.prev_counters = Some(buf);
 
@@ -326,10 +334,13 @@ impl KpcReader {
                 0.0
             };
             const TREND_ALPHA: f64 = 0.15;
-            self.ipc_ema = if self.ipc_ema == 0.0 { ipc } else {
+            self.ipc_ema = if self.ipc_ema == 0.0 {
+                ipc
+            } else {
                 TREND_ALPHA * ipc + (1.0 - TREND_ALPHA) * self.ipc_ema
             };
-            self.ipc_velocity_ema = TREND_ALPHA * ipc_velocity + (1.0 - TREND_ALPHA) * self.ipc_velocity_ema;
+            self.ipc_velocity_ema =
+                TREND_ALPHA * ipc_velocity + (1.0 - TREND_ALPHA) * self.ipc_velocity_ema;
             self.prev_ipc = ipc;
 
             // Memory-bound score: fraction of cycles NOT executing instructions.
@@ -463,7 +474,11 @@ mod tests {
         } else {
             0.0
         };
-        assert!((raw - 1.0).abs() < 0.001, "zero IPC should give score=1.0, got {}", raw);
+        assert!(
+            (raw - 1.0).abs() < 0.001,
+            "zero IPC should give score=1.0, got {}",
+            raw
+        );
     }
 
     #[test]
@@ -471,7 +486,10 @@ mod tests {
         // IPC = peak → memory_bound_score = 0 (fully compute-bound).
         let ipc = pmu_events::M1_PEAK_IPC;
         let score = (1.0 - (ipc / pmu_events::M1_PEAK_IPC)).clamp(0.0, 1.0);
-        assert!(score < 0.001, "peak IPC should give near-zero memory_bound_score");
+        assert!(
+            score < 0.001,
+            "peak IPC should give near-zero memory_bound_score"
+        );
     }
 
     #[test]

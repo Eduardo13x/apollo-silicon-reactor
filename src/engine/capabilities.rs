@@ -53,10 +53,7 @@ mod tests {
     #[test]
     fn can_taskpolicy_is_true_on_macos() {
         let cap = detect_capabilities();
-        assert!(
-            cap.can_taskpolicy,
-            "can_taskpolicy should be true on macOS"
-        );
+        assert!(cap.can_taskpolicy, "can_taskpolicy should be true on macOS");
     }
 
     #[cfg(target_os = "macos")]

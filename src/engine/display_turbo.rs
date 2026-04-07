@@ -67,12 +67,15 @@ const MAX_TURBO_FREEZE: usize = 60;
 /// On error, assumes display is on (conservative default).
 fn is_display_on() -> bool {
     #[cfg(not(target_os = "macos"))]
-    { return true; }
+    {
+        return true;
+    }
 
     #[cfg(target_os = "macos")]
     {
         extern "C" {
-            fn IOServiceGetMatchingService(mainPort: u32, matching: *const std::ffi::c_void) -> u32;
+            fn IOServiceGetMatchingService(mainPort: u32, matching: *const std::ffi::c_void)
+                -> u32;
             fn IOServiceMatching(name: *const i8) -> *mut std::ffi::c_void;
             fn IORegistryEntryCreateCFProperty(
                 entry: u32,
@@ -224,8 +227,7 @@ impl DisplayTurbo {
                     self.display_off_since = None;
                     TurboAction::None
                 } else if let Some(off_since) = self.display_off_since {
-                    if now.duration_since(off_since) >= Duration::from_secs(self.dwell_secs)
-                    {
+                    if now.duration_since(off_since) >= Duration::from_secs(self.dwell_secs) {
                         // Dwell timer expired — activate turbo.
                         self.state = TurboState::TurboActive;
                         self.activation_count += 1;

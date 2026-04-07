@@ -19,19 +19,34 @@ mod scenarios {
     /// Helper: tick with given pressure, all else nominal.
     fn tick_at(si: &mut SignalIntelligence, pressure: f64) {
         si.tick(
-            pressure, 10.0, 0.01, 0.05,
-            &[5.0, 3.0], &[100e6, 50e6],
-            "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+            pressure,
+            10.0,
+            0.01,
+            0.05,
+            &[5.0, 3.0],
+            &[100e6, 50e6],
+            "calm_app",
+            100_000_000,
+            500_000_000,
+            8_000_000_000,
+            0.5,
         );
     }
 
     /// Helper: tick with stressed parameters.
     fn tick_stressed(si: &mut SignalIntelligence, pressure: f64) {
         si.tick(
-            pressure, 50_000.0, 0.7, 0.8,
+            pressure,
+            50_000.0,
+            0.7,
+            0.8,
             &[50.0, 40.0, 30.0, 20.0, 10.0],
             &[2e9, 1.5e9, 1e9, 500e6, 200e6],
-            "hog_process", 2_000_000_000, 6_000_000_000, 8_000_000_000, 0.5,
+            "hog_process",
+            2_000_000_000,
+            6_000_000_000,
+            8_000_000_000,
+            0.5,
         );
     }
 
@@ -68,8 +83,16 @@ mod scenarios {
             tick_stressed(&mut si, 0.80);
         }
         let d = tick_stressed_returning(&mut si, 0.80);
-        assert!(d.urgency > 0.15, "urgency must be meaningful at 0.80: {}", d.urgency);
-        assert!(d.pressure_smooth > 0.50, "smoothed pressure should track 0.80: {}", d.pressure_smooth);
+        assert!(
+            d.urgency > 0.15,
+            "urgency must be meaningful at 0.80: {}",
+            d.urgency
+        );
+        assert!(
+            d.pressure_smooth > 0.50,
+            "smoothed pressure should track 0.80: {}",
+            d.pressure_smooth
+        );
     }
 
     /// I03: Kalman always runs, even at lowest pressure. The smoothed pressure
@@ -79,7 +102,11 @@ mod scenarios {
         let mut si = SignalIntelligence::new();
         warmup(&mut si, 0.15, 30);
         let d = tick_at_returning(&mut si, 0.15);
-        assert!(d.pressure_smooth > 0.10, "Kalman must track input at low pressure: {}", d.pressure_smooth);
+        assert!(
+            d.pressure_smooth > 0.10,
+            "Kalman must track input at low pressure: {}",
+            d.pressure_smooth
+        );
     }
 
     /// I04: CUSUM detects regime shift from stable 0.40 to sudden 0.80.
@@ -96,7 +123,10 @@ mod scenarios {
                 break;
             }
         }
-        assert!(found, "CUSUM must detect regime shift from 0.40→0.80 within 10 ticks");
+        assert!(
+            found,
+            "CUSUM must detect regime shift from 0.40→0.80 within 10 ticks"
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -115,8 +145,16 @@ mod scenarios {
             tick_stressed(&mut si, pressure);
         }
         let d = tick_stressed_returning(&mut si, 0.90);
-        assert!(d.pressure_velocity > 0.0, "velocity must be positive during ramp: {}", d.pressure_velocity);
-        assert!(d.urgency > 0.30, "urgency must be high during rapid rise: {}", d.urgency);
+        assert!(
+            d.pressure_velocity > 0.0,
+            "velocity must be positive during ramp: {}",
+            d.pressure_velocity
+        );
+        assert!(
+            d.urgency > 0.30,
+            "urgency must be high during rapid rise: {}",
+            d.urgency
+        );
     }
 
     /// I06: Flat low pressure (0.30) for 50 ticks should produce urgency < 0.15.
@@ -126,7 +164,11 @@ mod scenarios {
         let mut si = SignalIntelligence::new();
         warmup(&mut si, 0.30, 50);
         let d = tick_at_returning(&mut si, 0.30);
-        assert!(d.urgency < 0.15, "urgency should be low at flat 0.30: {}", d.urgency);
+        assert!(
+            d.urgency < 0.15,
+            "urgency should be low at flat 0.30: {}",
+            d.urgency
+        );
     }
 
     /// I07: After recording 3 overflow events, P(OOM) must increase compared to
@@ -144,8 +186,12 @@ mod scenarios {
             si.record_overflow(0.95, 0.8, 0.9, 2.0);
         }
         let d_after = tick_stressed_returning(&mut si, 0.85);
-        assert!(d_after.p_oom_30s > p_before,
-            "P(OOM) must increase after overflows: {} > {}", d_after.p_oom_30s, p_before);
+        assert!(
+            d_after.p_oom_30s > p_before,
+            "P(OOM) must increase after overflows: {} > {}",
+            d_after.p_oom_30s,
+            p_before
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -161,7 +207,10 @@ mod scenarios {
         warmup(&mut si, 0.40, 30);
         let d = tick_at_returning(&mut si, 0.40);
         // With bias +0.15, mid_entry = 0.45, so 0.40 is LOW zone.
-        assert_eq!(d.entropy_anomaly, 0.0, "entropy must be skipped on critical battery at 0.40");
+        assert_eq!(
+            d.entropy_anomaly, 0.0,
+            "entropy must be skipped on critical battery at 0.40"
+        );
     }
 
     /// I09: Thermal emergency should shift zones down, engaging all heavy
@@ -175,7 +224,11 @@ mod scenarios {
             tick_at(&mut si, 0.38);
         }
         let d = tick_at_returning(&mut si, 0.38);
-        assert!(d.pressure_smooth > 0.34, "pressure must be above shifted high_entry: {}", d.pressure_smooth);
+        assert!(
+            d.pressure_smooth > 0.34,
+            "pressure must be above shifted high_entry: {}",
+            d.pressure_smooth
+        );
     }
 
     /// I10: Plugged in with no thermal issue → zero energy bias.
@@ -185,8 +238,16 @@ mod scenarios {
         si.set_energy_bias(50, true, false);
         let (mid, high) = si.learned_zones();
         // Default zones unaffected.
-        assert!((mid - 0.30).abs() < 0.01, "mid_entry should be default: {}", mid);
-        assert!((high - 0.50).abs() < 0.01, "high_entry should be default: {}", high);
+        assert!(
+            (mid - 0.30).abs() < 0.01,
+            "mid_entry should be default: {}",
+            mid
+        );
+        assert!(
+            (high - 0.50).abs() < 0.01,
+            "high_entry should be default: {}",
+            high
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -203,8 +264,18 @@ mod scenarios {
             si.zone_feedback(0.32, true);
         }
         let (mid_after, high_after) = si.learned_zones();
-        assert!(mid_after < mid_before, "mid_entry must decrease: {} < {}", mid_after, mid_before);
-        assert!(high_after < high_before, "high_entry must decrease: {} < {}", high_after, high_before);
+        assert!(
+            mid_after < mid_before,
+            "mid_entry must decrease: {} < {}",
+            mid_after,
+            mid_before
+        );
+        assert!(
+            high_after < high_before,
+            "high_entry must decrease: {} < {}",
+            high_after,
+            high_before
+        );
     }
 
     /// I12: Repeated ineffective actions should raise the entry threshold
@@ -217,7 +288,12 @@ mod scenarios {
             si.zone_feedback(0.40, false);
         }
         let (mid_after, _) = si.learned_zones();
-        assert!(mid_after > mid_before, "mid_entry must increase: {} > {}", mid_after, mid_before);
+        assert!(
+            mid_after > mid_before,
+            "mid_entry must increase: {} > {}",
+            mid_after,
+            mid_before
+        );
     }
 
     /// I13: Zone boundaries must be clamped — even extreme feedback cannot push
@@ -244,13 +320,25 @@ mod scenarios {
         // 200 ticks in high zone, no overflow events.
         for _ in 0..200 {
             si.tick(
-                0.55, 10.0, 0.01, 0.05,
-                &[5.0, 3.0], &[100e6, 50e6],
-                "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+                0.55,
+                10.0,
+                0.01,
+                0.05,
+                &[5.0, 3.0],
+                &[100e6, 50e6],
+                "calm_app",
+                100_000_000,
+                500_000_000,
+                8_000_000_000,
+                0.5,
             );
         }
         let after = si.subsystem_utilities()[1];
-        assert!(after < 0.10, "hazard utility must decay without OOM events: {}", after);
+        assert!(
+            after < 0.10,
+            "hazard utility must decay without OOM events: {}",
+            after
+        );
     }
 
     /// I15: PID integral accumulates positive error when pressure stays above target.
@@ -260,8 +348,11 @@ mod scenarios {
         let mut si = SignalIntelligence::new();
         warmup(&mut si, 0.80, 30);
         let d = tick_at_returning(&mut si, 0.80);
-        assert!(d.pressure_integral > 0.0,
-            "PID integral must be positive when pressure > target: {}", d.pressure_integral);
+        assert!(
+            d.pressure_integral > 0.0,
+            "PID integral must be positive when pressure > target: {}",
+            d.pressure_integral
+        );
     }
 
     // ── Helpers that return SignalDigest ─────────────────────────────────────
@@ -271,9 +362,17 @@ mod scenarios {
         pressure: f64,
     ) -> apollo_optimizer::engine::signal_intelligence::SignalDigest {
         si.tick(
-            pressure, 10.0, 0.01, 0.05,
-            &[5.0, 3.0], &[100e6, 50e6],
-            "calm_app", 100_000_000, 500_000_000, 8_000_000_000, 0.5,
+            pressure,
+            10.0,
+            0.01,
+            0.05,
+            &[5.0, 3.0],
+            &[100e6, 50e6],
+            "calm_app",
+            100_000_000,
+            500_000_000,
+            8_000_000_000,
+            0.5,
         )
     }
 
@@ -282,10 +381,17 @@ mod scenarios {
         pressure: f64,
     ) -> apollo_optimizer::engine::signal_intelligence::SignalDigest {
         si.tick(
-            pressure, 50_000.0, 0.7, 0.8,
+            pressure,
+            50_000.0,
+            0.7,
+            0.8,
             &[50.0, 40.0, 30.0, 20.0, 10.0],
             &[2e9, 1.5e9, 1e9, 500e6, 200e6],
-            "hog_process", 2_000_000_000, 6_000_000_000, 8_000_000_000, 0.5,
+            "hog_process",
+            2_000_000_000,
+            6_000_000_000,
+            8_000_000_000,
+            0.5,
         )
     }
 }

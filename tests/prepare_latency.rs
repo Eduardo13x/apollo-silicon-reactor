@@ -40,7 +40,11 @@ mod scenarios {
         let s = compute_latency(&nominal());
         assert_eq!(s.category, LatencyCategory::Responsive);
         assert!(!s.needs_boost, "nominal system should not need boost");
-        assert!(s.score < 0.15, "nominal score should be near zero, got {}", s.score);
+        assert!(
+            s.score < 0.15,
+            "nominal score should be near zero, got {}",
+            s.score
+        );
     }
 
     /// L02: Mild jitter (300µs) alone — common during context switches.
@@ -50,7 +54,11 @@ mod scenarios {
         let mut sig = nominal();
         sig.jitter_us = 300.0;
         let s = compute_latency(&sig);
-        assert!(!s.needs_boost, "300µs jitter is normal M1 variance — no boost. Score: {}", s.score);
+        assert!(
+            !s.needs_boost,
+            "300µs jitter is normal M1 variance — no boost. Score: {}",
+            s.score
+        );
     }
 
     /// L03: WindowServer at 25% is normal during window resize/animation.
@@ -60,7 +68,11 @@ mod scenarios {
         let mut sig = nominal();
         sig.windowserver_cpu = 25.0;
         let s = compute_latency(&sig);
-        assert!(!s.needs_boost, "WS at 25% is normal compositing — no boost. Score: {}", s.score);
+        assert!(
+            !s.needs_boost,
+            "WS at 25% is normal compositing — no boost. Score: {}",
+            s.score
+        );
     }
 
     /// L04: High context switches (3000/s) alone with everything else nominal.
@@ -71,8 +83,11 @@ mod scenarios {
         let mut sig = nominal();
         sig.foreground_csw_per_sec = 3000.0;
         let s = compute_latency(&sig);
-        assert!(!s.needs_boost,
-            "High CSW alone shouldn't trigger boost — foreground may be fine. Score: {}", s.score);
+        assert!(
+            !s.needs_boost,
+            "High CSW alone shouldn't trigger boost — foreground may be fine. Score: {}",
+            s.score
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -88,7 +103,11 @@ mod scenarios {
         sig.jitter_us = 1500.0;
         sig.windowserver_cpu = 40.0;
         let s = compute_latency(&sig);
-        assert!(s.needs_boost, "Jitter 1500µs + WS 40% = real jank — must boost. Score: {}", s.score);
+        assert!(
+            s.needs_boost,
+            "Jitter 1500µs + WS 40% = real jank — must boost. Score: {}",
+            s.score
+        );
     }
 
     /// L06: Foreground completely starved (0% CPU) — app frozen to user.
@@ -99,7 +118,11 @@ mod scenarios {
         sig.foreground_cpu = 0.0;
         sig.jitter_us = 400.0; // slight jitter from whatever stole the CPU
         let s = compute_latency(&sig);
-        assert!(s.needs_boost, "FG at 0% CPU = completely starved — must boost. Score: {}", s.score);
+        assert!(
+            s.needs_boost,
+            "FG at 0% CPU = completely starved — must boost. Score: {}",
+            s.score
+        );
     }
 
     /// L07: Full system stress — everything bad. Must be Sluggish or Broken.
@@ -115,7 +138,9 @@ mod scenarios {
         let s = compute_latency(&sig);
         assert!(
             s.category == LatencyCategory::Sluggish || s.category == LatencyCategory::Broken,
-            "Full stress must be Sluggish or Broken, got {:?} ({})", s.category, s.score
+            "Full stress must be Sluggish or Broken, got {:?} ({})",
+            s.category,
+            s.score
         );
         assert!(s.needs_boost);
     }
@@ -142,7 +167,8 @@ mod scenarios {
         assert!(
             s_two.score >= s_one.score,
             "Two moderate degradations ({:.3}) should score >= one bad ({:.3})",
-            s_two.score, s_one.score
+            s_two.score,
+            s_one.score
         );
     }
 
@@ -171,7 +197,9 @@ mod scenarios {
         let s = compute_latency(&sig);
         assert!(
             s.category == LatencyCategory::Noticeable || s.category == LatencyCategory::Responsive,
-            "Single bad signal should be at most Noticeable, got {:?} ({})", s.category, s.score
+            "Single bad signal should be at most Noticeable, got {:?} ({})",
+            s.category,
+            s.score
         );
     }
 }

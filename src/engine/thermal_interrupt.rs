@@ -9,8 +9,8 @@
 //! `interrupt_frozen_pids` which uses a Mutex accessed with `try_lock` from the
 //! main loop.
 
-use std::collections::{HashMap, HashSet};
 use crate::engine::sysctl_direct;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -254,7 +254,7 @@ impl SentinelBuffers {
             // Web browsers — all have multi-process architectures; freezing the main
             // process or a renderer hangs IPC and the OS may force-quit the app.
             "Brave Browser",
-            "Brave Browser H",       // Brave Helper (Renderer/GPU/Plugin)
+            "Brave Browser H", // Brave Helper (Renderer/GPU/Plugin)
             "Google Chrome",
             "Google Chrome H",
             "Safari",
@@ -265,7 +265,7 @@ impl SentinelBuffers {
             "Microsoft Edge",
             // IDEs and editors
             "Xcode",
-            "Code",            // VS Code
+            "Code", // VS Code
             "Cursor",
             "Nova",
             "Zed",
@@ -699,7 +699,10 @@ fn migrate_to_ecores(
             continue;
         }
         let name = proc_info.name();
-        if bufs.fg_detector.is_recently_active(name, recently_active_window) {
+        if bufs
+            .fg_detector
+            .is_recently_active(name, recently_active_window)
+        {
             continue;
         }
         if bufs.is_essential(name) || bufs.is_protected(name) {
@@ -798,8 +801,7 @@ fn freeze_non_critical(
     let mut confirmed_frozen: Vec<u32> = Vec::new();
     if !newly_frozen.is_empty() {
         let verify_sys = sysinfo::System::new_with_specifics(
-            sysinfo::RefreshKind::new()
-                .with_processes(sysinfo::ProcessRefreshKind::new()),
+            sysinfo::RefreshKind::new().with_processes(sysinfo::ProcessRefreshKind::new()),
         );
         for (pid_u32, expected_name) in &newly_frozen {
             let pid_key = sysinfo::Pid::from_u32(*pid_u32);
@@ -1180,10 +1182,22 @@ mod tests {
         // The sentinel cannot query CGWindowServer, so explicit enumeration
         // of known GUI apps is the only safe approach. Without this, any GUI
         // app inactive > 300s would receive SIGSTOP during thermal Emergency.
-        assert!(bufs.is_protected("Google Chrome"), "browsers must be statically protected");
-        assert!(bufs.is_protected("Brave Browser"), "browsers must be statically protected");
-        assert!(bufs.is_protected("Safari"), "browsers must be statically protected");
-        assert!(bufs.is_protected("Slack"), "communication apps must be protected");
+        assert!(
+            bufs.is_protected("Google Chrome"),
+            "browsers must be statically protected"
+        );
+        assert!(
+            bufs.is_protected("Brave Browser"),
+            "browsers must be statically protected"
+        );
+        assert!(
+            bufs.is_protected("Safari"),
+            "browsers must be statically protected"
+        );
+        assert!(
+            bufs.is_protected("Slack"),
+            "communication apps must be protected"
+        );
         assert!(bufs.is_protected("Claude"), "AI apps must be protected");
         // Analytics/background daemons are still not protected.
         assert!(!bufs.is_protected("com.apple.photoanalysisd"));

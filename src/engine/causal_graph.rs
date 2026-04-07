@@ -248,7 +248,11 @@ impl CausalGraph {
     /// Called each cycle — checks actions that are old enough for evaluation.
     /// Now also accepts current resource snapshot for mechanism attribution.
     pub fn evaluate(&mut self, current_pressure: f32, current_cycle: u64) {
-        self.evaluate_with_resources(current_pressure, current_cycle, &ResourceSnapshot::default());
+        self.evaluate_with_resources(
+            current_pressure,
+            current_cycle,
+            &ResourceSnapshot::default(),
+        );
     }
 
     /// Evaluate with resource snapshots for mechanism attribution.
@@ -275,7 +279,8 @@ impl CausalGraph {
                 };
 
                 let key = (pending.action_key.clone(), effect.to_string());
-                let edge = self.edges
+                let edge = self
+                    .edges
                     .entry(key)
                     .or_insert_with(|| CausalEdge::new(&pending.action_key, effect));
                 edge.update_with_delta(true, delta.max(0.0));
@@ -285,7 +290,8 @@ impl CausalGraph {
                     let rss_d = pending.resources.rss_mb - current_resources.rss_mb;
                     let cpu_d = pending.resources.cpu_pct - current_resources.cpu_pct;
                     let swap_d = pending.resources.swap_mb - current_resources.swap_mb;
-                    edge.mechanism.observe(rss_d.max(0.0), cpu_d.max(0.0), swap_d.max(0.0));
+                    edge.mechanism
+                        .observe(rss_d.max(0.0), cpu_d.max(0.0), swap_d.max(0.0));
                 }
 
                 let anti_key = (pending.action_key, anti_effect.to_string());
@@ -312,7 +318,8 @@ impl CausalGraph {
 
                 // Update slow-horizon confidence on the pressure_drop edge.
                 let drop_key = (pending.action_key.clone(), EFFECT_PRESSURE_DROP.to_string());
-                let edge = self.edges
+                let edge = self
+                    .edges
                     .entry(drop_key)
                     .or_insert_with(|| CausalEdge::new(&pending.action_key, EFFECT_PRESSURE_DROP));
                 edge.update_slow(was_effective, delta.max(0.0));
@@ -351,7 +358,11 @@ impl CausalGraph {
     /// both reliably work AND produce large pressure reductions.
     pub fn solid_edges_by_impact(&self) -> Vec<&CausalEdge> {
         let mut edges: Vec<&CausalEdge> = self.edges.values().filter(|e| e.is_solid()).collect();
-        edges.sort_by(|a, b| b.impact_score().partial_cmp(&a.impact_score()).unwrap_or(std::cmp::Ordering::Equal));
+        edges.sort_by(|a, b| {
+            b.impact_score()
+                .partial_cmp(&a.impact_score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         edges
     }
 
@@ -623,7 +634,7 @@ mod tests {
         g.evaluate(0.70, 13);
         let eff = g.effectiveness("throttle:Safari");
         assert!(eff.is_none()); // only 1 observation, need ≥3
-        // Add more observations.
+                                // Add more observations.
         g.record_action("throttle:Safari", 0.75, 14);
         g.evaluate(0.70, 17);
         g.record_action("throttle:Safari", 0.75, 18);
@@ -681,7 +692,11 @@ mod tests {
         g.evaluate(0.65, 25);
         let edge = g.get_edge("throttle:Safari", EFFECT_PRESSURE_DROP).unwrap();
         // Slow confidence should reflect the delayed drop.
-        assert!(edge.slow_confidence > 0.5, "slow should see effect: {}", edge.slow_confidence);
+        assert!(
+            edge.slow_confidence > 0.5,
+            "slow should see effect: {}",
+            edge.slow_confidence
+        );
         assert!(edge.slow_avg_delta > 0.0, "slow delta should be positive");
     }
 
@@ -714,7 +729,11 @@ mod tests {
         m.observe(90.0, 4.0, 0.0);
         assert_eq!(m.primary(), "rss");
         // EMA with α=0.15 from 0: after 3 obs of ~100 → ~35 (not fully converged).
-        assert!(m.rss_delta_mb > 10.0, "RSS EMA should be positive: {}", m.rss_delta_mb);
+        assert!(
+            m.rss_delta_mb > 10.0,
+            "RSS EMA should be positive: {}",
+            m.rss_delta_mb
+        );
     }
 
     #[test]
@@ -738,16 +757,25 @@ mod tests {
     #[test]
     fn evaluate_with_resources_populates_mechanism() {
         let mut g = CausalGraph::new();
-        let res_before = ResourceSnapshot { rss_mb: 500.0, cpu_pct: 30.0, swap_mb: 1000.0 };
+        let res_before = ResourceSnapshot {
+            rss_mb: 500.0,
+            cpu_pct: 30.0,
+            swap_mb: 1000.0,
+        };
         for cycle in 0..5u64 {
-            g.record_action_with_resources(
-                "throttle:Chrome", 0.80, cycle * 4, res_before.clone(),
-            );
-            let res_after = ResourceSnapshot { rss_mb: 350.0, cpu_pct: 10.0, swap_mb: 900.0 };
+            g.record_action_with_resources("throttle:Chrome", 0.80, cycle * 4, res_before.clone());
+            let res_after = ResourceSnapshot {
+                rss_mb: 350.0,
+                cpu_pct: 10.0,
+                swap_mb: 900.0,
+            };
             g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after);
         }
         let mech = g.mechanism("throttle:Chrome");
-        assert!(mech.is_some(), "should have mechanism data after 5 effective evals");
+        assert!(
+            mech.is_some(),
+            "should have mechanism data after 5 effective evals"
+        );
         let (primary, rss, cpu, swap) = mech.unwrap();
         assert!(rss > 0.0, "RSS delta should be positive");
         assert!(cpu > 0.0, "CPU delta should be positive");
@@ -767,7 +795,11 @@ mod tests {
         e.slow_confidence = 0.80;
         e.slow_avg_delta = 0.10;
         // Impact should use slow (0.08) > fast (0.003).
-        assert!(e.impact_score() > 0.05, "should use slow: {}", e.impact_score());
+        assert!(
+            e.impact_score() > 0.05,
+            "should use slow: {}",
+            e.impact_score()
+        );
     }
 
     // ── Cluster boost tests ─────────────────────────────────────────────
@@ -777,13 +809,17 @@ mod tests {
         let g = CausalGraph::new();
         let mut map = HashMap::new();
         map.insert("throttle:Safari".to_string(), 0.80_f32); // solid
-        map.insert("throttle:cloudd".to_string(), 0.15_f32);  // would be skipped
+        map.insert("throttle:cloudd".to_string(), 0.15_f32); // would be skipped
         let pairs = vec![
             ("Safari".to_string(), "cloudd".to_string(), 10), // co-occur 10 times
         ];
         g.apply_cluster_boost(&mut map, &pairs);
         let boosted = map["throttle:cloudd"];
-        assert!(boosted > 0.20, "cloudd should be boosted above skip threshold: {}", boosted);
+        assert!(
+            boosted > 0.20,
+            "cloudd should be boosted above skip threshold: {}",
+            boosted
+        );
     }
 
     #[test]
@@ -806,8 +842,12 @@ mod tests {
         use crate::engine::nars_belief::DriftDetector;
         let mut dd = DriftDetector::new();
         // Create a belief with low confidence (many revisions → unstable).
-        for _ in 0..5 { dd.observe("Safari", true); }
-        for _ in 0..5 { dd.observe("Safari", false); }
+        for _ in 0..5 {
+            dd.observe("Safari", true);
+        }
+        for _ in 0..5 {
+            dd.observe("Safari", false);
+        }
         // The belief should have moderate-to-low confidence now.
         let tv = dd.belief("Safari").unwrap();
 
@@ -825,7 +865,9 @@ mod tests {
         use crate::engine::nars_belief::DriftDetector;
         let mut dd = DriftDetector::new();
         // Consistent successes → high confidence.
-        for _ in 0..20 { dd.observe("Dropbox", true); }
+        for _ in 0..20 {
+            dd.observe("Dropbox", true);
+        }
         let tv = dd.belief("Dropbox").unwrap();
         assert!(tv.confidence >= 0.50, "should be high confidence");
 
@@ -859,10 +901,18 @@ mod tests {
     fn mechanism_count_tracks_attributed_edges() {
         let mut g = CausalGraph::new();
         assert_eq!(g.mechanism_count(), 0);
-        let res = ResourceSnapshot { rss_mb: 500.0, cpu_pct: 30.0, swap_mb: 100.0 };
+        let res = ResourceSnapshot {
+            rss_mb: 500.0,
+            cpu_pct: 30.0,
+            swap_mb: 100.0,
+        };
         for i in 0..5u64 {
             g.record_action_with_resources("throttle:X", 0.80, i * 4, res.clone());
-            let after = ResourceSnapshot { rss_mb: 300.0, cpu_pct: 10.0, swap_mb: 50.0 };
+            let after = ResourceSnapshot {
+                rss_mb: 300.0,
+                cpu_pct: 10.0,
+                swap_mb: 50.0,
+            };
             g.evaluate_with_resources(0.60, i * 4 + 3, &after);
         }
         assert!(g.mechanism_count() > 0);
@@ -886,6 +936,11 @@ mod tests {
         let map = g.impact_map();
         let chrome = map.get("throttle:Chrome").copied().unwrap_or(0.0);
         let contact = map.get("throttle:contactsd").copied().unwrap_or(0.0);
-        assert!(chrome > contact, "Chrome ({}) should rank higher than contactsd ({})", chrome, contact);
+        assert!(
+            chrome > contact,
+            "Chrome ({}) should rank higher than contactsd ({})",
+            chrome,
+            contact
+        );
     }
 }

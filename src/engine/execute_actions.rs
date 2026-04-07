@@ -410,7 +410,10 @@ pub fn execute_actions(
                                 // [Ousterhout 2013 "Scheduling for Reduced Tail Latency" OSDI;
                                 //  iOS app resume — foreground pulse for fast working-set reload]
                                 if let Some(ref mut mgr) = qos_mgr {
-                                    mgr.set_tier(*pid, crate::engine::mach_qos::SchedulingTier::Foreground);
+                                    mgr.set_tier(
+                                        *pid,
+                                        crate::engine::mach_qos::SchedulingTier::Foreground,
+                                    );
                                 }
                             }
                             // Restaurar prioridad jetsam a FOREGROUND al descongelar.

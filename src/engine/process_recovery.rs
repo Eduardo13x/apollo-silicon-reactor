@@ -126,7 +126,10 @@ mod tests {
     fn register_leak_rejects_low_confidence() {
         let mut mgr = ProcessRecoveryManager::new();
         mgr.register_leak(200, "borderline".into(), 0.74, 100 * 1024 * 1024);
-        assert!(!mgr.leaking_processes.contains_key(&200), "below threshold should be ignored");
+        assert!(
+            !mgr.leaking_processes.contains_key(&200),
+            "below threshold should be ignored"
+        );
     }
 
     #[test]
@@ -195,8 +198,10 @@ mod tests {
             mgr.record_kill_attempt(700);
         }
         mgr.cleanup_resolved();
-        assert!(!mgr.leaking_processes.contains_key(&700),
-            "exhausted process should be removed");
+        assert!(
+            !mgr.leaking_processes.contains_key(&700),
+            "exhausted process should be removed"
+        );
     }
 
     #[test]
@@ -204,8 +209,10 @@ mod tests {
         let mut mgr = ProcessRecoveryManager::new();
         mgr.register_leak(800, "fresh_leak".into(), 0.80, 256 * 1024 * 1024);
         mgr.cleanup_resolved();
-        assert!(mgr.leaking_processes.contains_key(&800),
-            "fresh leak with remaining attempts should be retained");
+        assert!(
+            mgr.leaking_processes.contains_key(&800),
+            "fresh leak with remaining attempts should be retained"
+        );
     }
 
     // ── get_recovery_targets ──────────────────────────────────────────────────
@@ -229,13 +236,17 @@ mod tests {
     #[test]
     fn estimate_recovery_cost_increases_with_attempts() {
         let base = LeakingProcess {
-            pid: 1, name: "test".into(),
+            pid: 1,
+            name: "test".into(),
             leak_probability: 0.90,
             rss_bytes: 1024 * 1024 * 1024, // 1 GB
             first_detected_at: std::time::Instant::now(),
             recovery_attempts: 0,
         };
-        let with_attempts = LeakingProcess { recovery_attempts: 2, ..base.clone() };
+        let with_attempts = LeakingProcess {
+            recovery_attempts: 2,
+            ..base.clone()
+        };
         let cost0 = ProcessRecoveryManager::estimate_recovery_cost(&base);
         let cost2 = ProcessRecoveryManager::estimate_recovery_cost(&with_attempts);
         assert!(cost2 > cost0, "more attempts → higher recovery cost");
@@ -244,13 +255,17 @@ mod tests {
     #[test]
     fn estimate_recovery_cost_increases_with_rss() {
         let small = LeakingProcess {
-            pid: 2, name: "small".into(),
+            pid: 2,
+            name: "small".into(),
             leak_probability: 0.90,
             rss_bytes: 128 * 1024 * 1024, // 128 MB
             first_detected_at: std::time::Instant::now(),
             recovery_attempts: 0,
         };
-        let large = LeakingProcess { rss_bytes: 4 * 1024 * 1024 * 1024, ..small.clone() };
+        let large = LeakingProcess {
+            rss_bytes: 4 * 1024 * 1024 * 1024,
+            ..small.clone()
+        };
         let cost_small = ProcessRecoveryManager::estimate_recovery_cost(&small);
         let cost_large = ProcessRecoveryManager::estimate_recovery_cost(&large);
         assert!(cost_large > cost_small, "higher RSS → higher recovery cost");
@@ -260,7 +275,8 @@ mod tests {
     fn estimate_recovery_cost_formula_is_correct() {
         // cost = prob × (1 + attempts×0.5) × rss_in_gb
         let proc = LeakingProcess {
-            pid: 3, name: "exact".into(),
+            pid: 3,
+            name: "exact".into(),
             leak_probability: 0.80,
             rss_bytes: 2 * 1024 * 1024 * 1024, // 2 GB
             first_detected_at: std::time::Instant::now(),
@@ -268,7 +284,10 @@ mod tests {
         };
         let cost = ProcessRecoveryManager::estimate_recovery_cost(&proc);
         let expected = 0.80 * 1.5 * 2.0; // 2.40
-        assert!((cost - expected).abs() < 0.01, "cost={cost:.4} expected={expected:.4}");
+        assert!(
+            (cost - expected).abs() < 0.01,
+            "cost={cost:.4} expected={expected:.4}"
+        );
     }
 
     // ── Default impl ─────────────────────────────────────────────────────────

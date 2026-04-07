@@ -228,7 +228,10 @@ mod tests {
         let opt = NetworkOptimizer::new();
         let cfg = opt.get_optimization(NetworkProfile::LowLatency);
         assert_eq!(cfg.tcp_send_buffer, 65_536);
-        assert_eq!(cfg.tcp_delayed_ack, 0, "LowLatency must disable delayed ACK");
+        assert_eq!(
+            cfg.tcp_delayed_ack, 0,
+            "LowLatency must disable delayed ACK"
+        );
     }
 
     #[test]
@@ -245,8 +248,14 @@ mod tests {
     fn battery_profile_has_combined_ack() {
         let opt = NetworkOptimizer::new();
         let cfg = opt.get_optimization(NetworkProfile::Battery);
-        assert_eq!(cfg.tcp_delayed_ack, 3, "Battery combines ACKs to reduce CPU wakeups");
-        assert!(cfg.tcp_send_buffer < 1_048_576, "Battery uses smaller buffers");
+        assert_eq!(
+            cfg.tcp_delayed_ack, 3,
+            "Battery combines ACKs to reduce CPU wakeups"
+        );
+        assert!(
+            cfg.tcp_send_buffer < 1_048_576,
+            "Battery uses smaller buffers"
+        );
     }
 
     // ── recommend_profile ────────────────────────────────────────────────────
@@ -333,7 +342,9 @@ mod tests {
     fn sysctl_values_match_profile_settings() {
         let opt = NetworkOptimizer::new();
         let recs = opt.get_sysctl_recommendations(NetworkProfile::HighThroughput);
-        let sendspace = recs.iter().find(|(k, _)| k == "net.inet.tcp.sendspace")
+        let sendspace = recs
+            .iter()
+            .find(|(k, _)| k == "net.inet.tcp.sendspace")
             .map(|(_, v)| v.parse::<u32>().unwrap());
         assert_eq!(sendspace, Some(4_194_304));
     }

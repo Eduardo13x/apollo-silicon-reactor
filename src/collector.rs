@@ -166,7 +166,8 @@ impl SystemCollector {
         // before MAX fusion. Kalman in signal_intelligence still smooths the fused value,
         // but pre-smoothing here reduces the noise it has to compensate for (less lag).
         let alpha = 0.25f64;
-        let compressor_pressure = self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
+        let compressor_pressure =
+            self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
         self.compressor_ema = compressor_pressure;
         let mem_pressure = kernel_pressure.max(compressor_pressure);
         let nowi = Instant::now();
@@ -274,7 +275,8 @@ impl SystemCollector {
         let (_, swap_used_bytes, swap_total_bytes, compressor_pressure_raw, kernel_pressure) =
             collect_pressure_facts();
         let alpha = 0.25f64;
-        let compressor_pressure = self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
+        let compressor_pressure =
+            self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
         self.compressor_ema = compressor_pressure;
         let mem_pressure = kernel_pressure.max(compressor_pressure);
         let nowi = Instant::now();
@@ -492,7 +494,10 @@ mod tests {
     fn system_snapshot_fields_accessible() {
         let snap = SystemSnapshot {
             timestamp: chrono::Utc::now(),
-            cpu: CpuStats { global_usage: 42.0, core_count: 8 },
+            cpu: CpuStats {
+                global_usage: 42.0,
+                core_count: 8,
+            },
             memory: MemoryStats {
                 total_ram: 8 * 1024 * 1024 * 1024,
                 used_ram: 4 * 1024 * 1024 * 1024,
@@ -541,7 +546,10 @@ mod tests {
         for _ in 0..40 {
             ema = ema * (1.0 - alpha) + target * alpha;
         }
-        assert!((ema - target).abs() < 0.01, "EMA should converge: got {ema:.4}");
+        assert!(
+            (ema - target).abs() < 0.01,
+            "EMA should converge: got {ema:.4}"
+        );
     }
 
     #[test]
@@ -564,12 +572,18 @@ mod tests {
         let kernel = 0.40f64;
         let compressor = 0.65f64;
         let fused = kernel.max(compressor);
-        assert!((fused - compressor).abs() < 1e-9, "should take compressor when higher");
+        assert!(
+            (fused - compressor).abs() < 1e-9,
+            "should take compressor when higher"
+        );
 
         let kernel2 = 0.80f64;
         let compressor2 = 0.30f64;
         let fused2 = kernel2.max(compressor2);
-        assert!((fused2 - kernel2).abs() < 1e-9, "should take kernel when higher");
+        assert!(
+            (fused2 - kernel2).abs() < 1e-9,
+            "should take kernel when higher"
+        );
     }
 
     #[test]
@@ -591,11 +605,16 @@ mod tests {
         assert!((0.0..=1.0).contains(&comp_raw), "comp_raw={comp_raw}");
         assert!((0.0..=1.0).contains(&kernel), "kernel={kernel}");
         // Swap values must be non-negative.
-        assert!(swap_used <= swap_total || swap_total == 0,
-            "swap_used ({swap_used}) > swap_total ({swap_total})");
+        assert!(
+            swap_used <= swap_total || swap_total == 0,
+            "swap_used ({swap_used}) > swap_total ({swap_total})"
+        );
         // fused must be max(kernel, comp_raw) — may differ by EMA rounding
         let expected_min = kernel.max(comp_raw);
-        assert!(fused >= expected_min - 1e-9, "fused={fused} < max(k,c)={expected_min}");
+        assert!(
+            fused >= expected_min - 1e-9,
+            "fused={fused} < max(k,c)={expected_min}"
+        );
     }
 
     // ── SystemCollector construction ─────────────────────────────────────────
@@ -614,8 +633,10 @@ mod tests {
         let snap = collector.collect_snapshot_light();
         assert!((0.0..=1.0).contains(&snap.pressure.memory_pressure));
         assert!((0.0..=1.0).contains(&snap.pressure.compressor_pressure));
-        assert!(snap.pressure.swap_used_bytes <= snap.pressure.swap_total_bytes
-            || snap.pressure.swap_total_bytes == 0);
+        assert!(
+            snap.pressure.swap_used_bytes <= snap.pressure.swap_total_bytes
+                || snap.pressure.swap_total_bytes == 0
+        );
     }
 
     #[test]
@@ -633,8 +654,10 @@ mod tests {
         let mut collector = SystemCollector::new();
         // On first collect_snapshot, prev_swap_at is None → delta = 0.
         let snap = collector.collect_snapshot();
-        assert_eq!(snap.pressure.swap_delta_bytes_per_sec, 0.0,
-            "first-call delta should be 0");
+        assert_eq!(
+            snap.pressure.swap_delta_bytes_per_sec, 0.0,
+            "first-call delta should be 0"
+        );
     }
 
     // ── Serialization round-trip ─────────────────────────────────────────────
@@ -660,7 +683,8 @@ mod tests {
     fn process_stats_cpu_wall_ratio_default_is_none() {
         // When cpu_wall_ratio is absent from JSON, it should default to None.
         let json = r#"{"pid":9,"name":"old_proc","cpu_usage":3.0,"memory_usage":1024}"#;
-        let ps: ProcessStats = serde_json::from_str(json).expect("deserialize without cpu_wall_ratio");
+        let ps: ProcessStats =
+            serde_json::from_str(json).expect("deserialize without cpu_wall_ratio");
         assert!(ps.cpu_wall_ratio.is_none());
     }
 
@@ -680,7 +704,9 @@ mod tests {
         let elapsed = start.elapsed();
         let per_call_ms = elapsed.as_secs_f64() * 1000.0 / n as f64;
         // Two sysctl calls + host_statistics64 should complete in < 5ms each.
-        assert!(per_call_ms < 5.0,
-            "collect_pressure_facts too slow: {per_call_ms:.2}ms/call (expected < 5ms)");
+        assert!(
+            per_call_ms < 5.0,
+            "collect_pressure_facts too slow: {per_call_ms:.2}ms/call (expected < 5ms)"
+        );
     }
 }

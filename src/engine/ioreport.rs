@@ -50,9 +50,9 @@ use std::time::Instant;
 #[repr(C)]
 #[derive(Clone)]
 pub struct RawChannel {
-    pub driver:      [c_char; 128],
-    pub channel:     [c_char; 256],
-    pub value:       i64,
+    pub driver: [c_char; 128],
+    pub channel: [c_char; 256],
+    pub value: i64,
     pub state_count: i32,
     pub duty_cycles: [f64; 32],
     pub state_names: [[c_char; 64]; 32],
@@ -65,21 +65,18 @@ pub struct RawChannel {
 extern "C" {
     fn apollo_ioreport_create_subscription(
         out_channels: *mut *mut c_void,
-        group_names:  *const *const c_char,
-        group_count:  libc::c_int,
+        group_names: *const *const c_char,
+        group_count: libc::c_int,
     ) -> *mut c_void;
 
-    fn apollo_ioreport_sample(
-        sub:      *mut c_void,
-        channels: *mut c_void,
-    ) -> *mut c_void;
+    fn apollo_ioreport_sample(sub: *mut c_void, channels: *mut c_void) -> *mut c_void;
 
     fn apollo_ioreport_delta(s1: *mut c_void, s2: *mut c_void) -> *mut c_void;
 
     fn apollo_ioreport_iterate(
         samples: *mut c_void,
-        cb:      extern "C" fn(*const RawChannel, *mut c_void),
-        ctx:     *mut c_void,
+        cb: extern "C" fn(*const RawChannel, *mut c_void),
+        ctx: *mut c_void,
     );
 
     fn apollo_ioreport_release(ptr: *mut c_void);
@@ -138,9 +135,7 @@ impl IOReportSnapshot {
 
     /// Whether the system is mostly idle (all clusters low).
     pub fn is_system_idle(&self) -> bool {
-        self.p_cluster_pct < 0.05
-            && self.e_cluster_pct < 0.10
-            && self.gpu_pct < 0.05
+        self.p_cluster_pct < 0.05 && self.e_cluster_pct < 0.10 && self.gpu_pct < 0.05
     }
 
     /// Whether memory bandwidth is saturated (>80% utilization).
@@ -161,11 +156,11 @@ impl IOReportSnapshot {
 /// all methods return `None` gracefully.
 pub struct IOReportReader {
     #[cfg(target_os = "macos")]
-    sub:      *mut c_void,
+    sub: *mut c_void,
     #[cfg(target_os = "macos")]
     channels: *mut c_void,
     #[cfg(target_os = "macos")]
-    prev:     Option<(*mut c_void, Instant)>,
+    prev: Option<(*mut c_void, Instant)>,
     /// False if IOReport failed to initialize.
     pub available: bool,
 }
@@ -189,21 +184,16 @@ impl IOReportReader {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Self {
-                available: false,
-            }
+            Self { available: false }
         }
     }
 
     #[cfg(target_os = "macos")]
     fn new_macos() -> Self {
         use std::ffi::CString;
-        let group_cstrings: Vec<CString> = GROUPS
-            .iter()
-            .map(|s| CString::new(*s).unwrap())
-            .collect();
-        let group_ptrs: Vec<*const c_char> =
-            group_cstrings.iter().map(|cs| cs.as_ptr()).collect();
+        let group_cstrings: Vec<CString> =
+            GROUPS.iter().map(|s| CString::new(*s).unwrap()).collect();
+        let group_ptrs: Vec<*const c_char> = group_cstrings.iter().map(|cs| cs.as_ptr()).collect();
 
         let mut channels: *mut c_void = std::ptr::null_mut();
         let sub = unsafe {
@@ -294,8 +284,7 @@ impl IOReportReader {
                     acc.snap.p_cluster_pct = active_pct;
                 } else {
                     // Fallback: treat as P-core if only one cluster reported.
-                    acc.snap.p_cluster_pct =
-                        acc.snap.p_cluster_pct.max(active_pct);
+                    acc.snap.p_cluster_pct = acc.snap.p_cluster_pct.max(active_pct);
                 }
             }
 
@@ -320,9 +309,7 @@ impl IOReportReader {
             // ── AMC (memory controller bandwidth) ────────────────────────────
             // AMC Stats channels have performance state duty cycles.
             // Active fraction = memory bandwidth utilization.
-            if (channel.contains("AMC") || driver.contains("AMC"))
-                && ch.state_count > 0
-            {
+            if (channel.contains("AMC") || driver.contains("AMC")) && ch.state_count > 0 {
                 let active_pct = active_fraction(&ch.duty_cycles, &ch.state_names, ch.state_count);
                 // Take max across multiple AMC channels (one per memory port).
                 acc.snap.amc_bandwidth_pct = acc.snap.amc_bandwidth_pct.max(active_pct);
@@ -353,19 +340,13 @@ impl IOReportReader {
         let mut acc = Acc {
             snap: IOReportSnapshot::default(),
         };
-        unsafe {
-            apollo_ioreport_iterate(
-                delta,
-                callback,
-                &mut acc as *mut Acc as *mut c_void,
-            )
-        };
+        unsafe { apollo_ioreport_iterate(delta, callback, &mut acc as *mut Acc as *mut c_void) };
 
         // Clamp fractions to [0,1].
         let s = &mut acc.snap;
         s.p_cluster_pct = s.p_cluster_pct.clamp(0.0, 1.0);
         s.e_cluster_pct = s.e_cluster_pct.clamp(0.0, 1.0);
-        s.gpu_pct       = s.gpu_pct.clamp(0.0, 1.0);
+        s.gpu_pct = s.gpu_pct.clamp(0.0, 1.0);
 
         acc.snap
     }

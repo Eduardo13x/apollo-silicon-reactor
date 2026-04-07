@@ -20,8 +20,8 @@ use std::process::Command;
 /// App names that indicate an active video/audio call.
 #[cfg(target_os = "macos")]
 const CALL_APP_NAMES: &[&str] = &[
-    "zoom.us", "facetime", "teams", "webex", "skype", "discord",
-    "meet", "slack", "whereby", "around", "loom",
+    "zoom.us", "facetime", "teams", "webex", "skype", "discord", "meet", "slack", "whereby",
+    "around", "loom",
 ];
 
 /// User context snapshot — what is the user actually doing right now?
@@ -72,7 +72,12 @@ impl UserContext {
         } else {
             (false, false, false)
         };
-        Self { idle_secs, has_sleep_assertion, call_in_progress, audio_active }
+        Self {
+            idle_secs,
+            has_sleep_assertion,
+            call_in_progress,
+            audio_active,
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -232,30 +237,48 @@ mod tests {
 
     #[test]
     fn is_recently_active_when_idle_zero() {
-        let ctx = UserContext { idle_secs: 0.0, ..Default::default() };
+        let ctx = UserContext {
+            idle_secs: 0.0,
+            ..Default::default()
+        };
         assert!(ctx.is_recently_active());
         assert!(!ctx.is_idle_long());
     }
 
     #[test]
     fn is_idle_long_at_threshold() {
-        let ctx = UserContext { idle_secs: 120.0, ..Default::default() };
+        let ctx = UserContext {
+            idle_secs: 120.0,
+            ..Default::default()
+        };
         assert!(ctx.is_idle_long());
         assert!(!ctx.is_recently_active());
     }
 
     #[test]
     fn recently_active_boundary() {
-        let active = UserContext { idle_secs: 14.9, ..Default::default() };
-        let not_active = UserContext { idle_secs: 15.0, ..Default::default() };
+        let active = UserContext {
+            idle_secs: 14.9,
+            ..Default::default()
+        };
+        let not_active = UserContext {
+            idle_secs: 15.0,
+            ..Default::default()
+        };
         assert!(active.is_recently_active());
         assert!(!not_active.is_recently_active());
     }
 
     #[test]
     fn freeze_protected_from_call_or_assertion() {
-        let call = UserContext { call_in_progress: true, ..Default::default() };
-        let assertion = UserContext { has_sleep_assertion: true, ..Default::default() };
+        let call = UserContext {
+            call_in_progress: true,
+            ..Default::default()
+        };
+        let assertion = UserContext {
+            has_sleep_assertion: true,
+            ..Default::default()
+        };
         let normal = UserContext::default();
         assert!(call.freeze_protected());
         assert!(assertion.freeze_protected());
@@ -264,19 +287,28 @@ mod tests {
 
     #[test]
     fn pressure_gate_offset_idle() {
-        let idle = UserContext { idle_secs: 300.0, ..Default::default() };
+        let idle = UserContext {
+            idle_secs: 300.0,
+            ..Default::default()
+        };
         assert!((idle.pressure_gate_offset() - (-0.10)).abs() < f64::EPSILON);
     }
 
     #[test]
     fn pressure_gate_offset_active() {
-        let active = UserContext { idle_secs: 5.0, ..Default::default() };
+        let active = UserContext {
+            idle_secs: 5.0,
+            ..Default::default()
+        };
         assert!((active.pressure_gate_offset() - 0.05).abs() < f64::EPSILON);
     }
 
     #[test]
     fn pressure_gate_offset_neutral() {
-        let neutral = UserContext { idle_secs: 60.0, ..Default::default() };
+        let neutral = UserContext {
+            idle_secs: 60.0,
+            ..Default::default()
+        };
         assert!((neutral.pressure_gate_offset() - 0.0).abs() < f64::EPSILON);
     }
 }

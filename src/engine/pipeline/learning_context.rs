@@ -152,10 +152,8 @@ mod tests {
         let mut predictive_agent =
             PredictiveAgent::load_or_default(std::path::Path::new("/dev/null"));
         let mut specialist_accuracy = SpecialistAccuracyTracker::new();
-        let mut overflow_guard = OverflowGuard::load_or_default(
-            std::path::Path::new("/dev/null"),
-            None,
-        );
+        let mut overflow_guard =
+            OverflowGuard::load_or_default(std::path::Path::new("/dev/null"), None);
         let mut causal_graph = CausalGraph::new();
         let mut skill_registry = SkillRegistry::new();
         let mut neuromod = ApolloNeuromodulator::new();
@@ -188,10 +186,8 @@ mod tests {
         let mut predictive_agent =
             PredictiveAgent::load_or_default(std::path::Path::new("/dev/null"));
         let mut specialist_accuracy = SpecialistAccuracyTracker::new();
-        let mut overflow_guard = OverflowGuard::load_or_default(
-            std::path::Path::new("/dev/null"),
-            None,
-        );
+        let mut overflow_guard =
+            OverflowGuard::load_or_default(std::path::Path::new("/dev/null"), None);
         let mut causal_graph = CausalGraph::new();
         let mut skill_registry = SkillRegistry::new();
         let mut neuromod = ApolloNeuromodulator::new();
@@ -210,7 +206,11 @@ mod tests {
         );
 
         // Split-borrow: destructure to get two independent `&mut` references.
-        let LearningContext { outcome_tracker: ot, causal_graph: cg, .. } = &mut ctx;
+        let LearningContext {
+            outcome_tracker: ot,
+            causal_graph: cg,
+            ..
+        } = &mut ctx;
         // Both can be used independently (no aliasing).
         let _ = ot.total_resolved;
         let _ = cg.edge_count();

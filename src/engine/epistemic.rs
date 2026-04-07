@@ -246,13 +246,20 @@ mod tests {
         eu.update(0.6, 0.4, 0.3, 0.2);
         let bd = eu.breakdown();
         let sum: f32 = bd.iter().map(|(_, _, w)| w).sum();
-        assert!((sum - eu.composite).abs() < 0.001, "sum={sum} composite={}", eu.composite);
+        assert!(
+            (sum - eu.composite).abs() < 0.001,
+            "sum={sum} composite={}",
+            eu.composite
+        );
     }
 
     #[test]
     fn test_weights_sum_to_one() {
         let sum = W_RL + W_LINUCB + W_NARS + W_DRIFT;
-        assert!((sum - 1.0).abs() < 0.001, "Weights should sum to 1.0: {sum}");
+        assert!(
+            (sum - 1.0).abs() < 0.001,
+            "Weights should sum to 1.0: {sum}"
+        );
     }
 
     #[test]

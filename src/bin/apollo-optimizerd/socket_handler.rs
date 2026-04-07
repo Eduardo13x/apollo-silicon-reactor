@@ -28,8 +28,8 @@ use apollo_optimizer::engine::daemon_helpers::{
     kill_switch_path, merge_seed_into, metrics_path, socket_path,
 };
 use apollo_optimizer::engine::llm::{
-    append_jsonl, delete_file_best_effort, load_repo_config, write_json, write_secret, FeedbackEntry,
-    LlmAdvisor,
+    append_jsonl, delete_file_best_effort, load_repo_config, write_json, write_secret,
+    FeedbackEntry, LlmAdvisor,
 };
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::protocol::{DaemonRequest, DaemonResponse};
@@ -172,19 +172,28 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             let thermal_state = state.metrics.lock_recover().thermal_state.clone();
             let throttle_level = state.metrics.lock_recover().throttle_level.clone();
             // Snapshot governor + wake_state, then DROP locks before build_llm_status.
-            let (auto_profile_enabled, base_profile, override_active, override_expires_at,
-                 transition_reason) = {
+            let (
+                auto_profile_enabled,
+                base_profile,
+                override_active,
+                override_expires_at,
+                transition_reason,
+            ) = {
                 let pg = state.policy.lock_recover();
-                (pg.governor.auto_profile_enabled, pg.governor.base_profile,
-                 pg.governor.manual_override.is_some(),
-                 pg.governor.manual_override.as_ref().map(|o| o.expires_at),
-                 pg.governor.transition_reason.clone())
+                (
+                    pg.governor.auto_profile_enabled,
+                    pg.governor.base_profile,
+                    pg.governor.manual_override.is_some(),
+                    pg.governor.manual_override.as_ref().map(|o| o.expires_at),
+                    pg.governor.transition_reason.clone(),
+                )
             };
             let (grace_active, grace_remaining, last_wake_at, post_wake_policy) = {
                 let proc = state.process.lock_recover();
                 let ws = &proc.wake_state;
                 let ga = ws.post_wake_grace_until.map(|t| t > now).unwrap_or(false);
-                let gr = ws.post_wake_grace_until
+                let gr = ws
+                    .post_wake_grace_until
                     .and_then(|t| (t - now).to_std().ok())
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
@@ -192,7 +201,10 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             };
             let (reactor_mode, reactor_health) = {
                 let m = state.metrics.lock_recover();
-                (m.reactor_status.mode.clone(), m.reactor_status.health.clone())
+                (
+                    m.reactor_status.mode.clone(),
+                    m.reactor_status.health.clone(),
+                )
             };
             let llm = build_llm_status(state);
             let frozen_processes: Vec<FrozenProcessInfo> = {
@@ -200,7 +212,10 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 fs.iter()
                     .map(|(&pid, entry)| FrozenProcessInfo {
                         pid,
-                        name: entry.process_name.clone().unwrap_or_else(|| pid.to_string()),
+                        name: entry
+                            .process_name
+                            .clone()
+                            .unwrap_or_else(|| pid.to_string()),
                         frozen_seconds: now
                             .signed_duration_since(entry.frozen_at)
                             .num_seconds()
@@ -236,13 +251,21 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             };
             DaemonResponse::Status(status)
         }
-        DaemonRequest::GetMetrics => DaemonResponse::Metrics(state.metrics.lock_recover().metrics.clone()),
+        DaemonRequest::GetMetrics => {
+            DaemonResponse::Metrics(state.metrics.lock_recover().metrics.clone())
+        }
         DaemonRequest::GetTopBlockers => {
             DaemonResponse::TopBlockers(state.process.lock_recover().last_blockers.clone())
         }
-        DaemonRequest::GetProfileTimeline => {
-            DaemonResponse::ProfileTimeline(state.policy.lock_recover().timeline.iter().cloned().collect())
-        }
+        DaemonRequest::GetProfileTimeline => DaemonResponse::ProfileTimeline(
+            state
+                .policy
+                .lock_recover()
+                .timeline
+                .iter()
+                .cloned()
+                .collect(),
+        ),
         DaemonRequest::GetCapabilities => DaemonResponse::Capabilities(detect_capabilities()),
         DaemonRequest::SetProfile {
             profile,
@@ -261,7 +284,11 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             DaemonResponse::Ok
         }
         DaemonRequest::SetAutoProfile { enabled } => {
-            state.policy.lock_recover().governor.set_auto_profile(enabled);
+            state
+                .policy
+                .lock_recover()
+                .governor
+                .set_auto_profile(enabled);
             DaemonResponse::Ok
         }
         DaemonRequest::ClearProfileOverride => {
@@ -406,7 +433,11 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             let now = Utc::now();
             let (llm_key_path, llm_state_path, llm_cfg_default) = {
                 let llm = state.llm.lock_recover();
-                (llm.llm_key_path.clone(), llm.llm_state_path.clone(), llm.llm_cfg.clone())
+                (
+                    llm.llm_key_path.clone(),
+                    llm.llm_state_path.clone(),
+                    llm.llm_cfg.clone(),
+                )
             };
             let llm_cfg = load_repo_config(&state.config_path)
                 .llm
@@ -454,7 +485,8 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             // Collect a one-off snapshot for this test.
             let mut collector = SystemCollector::new();
             let mut snapshot = collector.collect_snapshot();
-            snapshot.pressure.thermal_level = state.metrics.lock_recover().thermal_level_real.clone();
+            snapshot.pressure.thermal_level =
+                state.metrics.lock_recover().thermal_level_real.clone();
 
             // Record attempt immediately.
             {
@@ -474,7 +506,8 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                     guard.llm_state.calls_today = 0;
                 }
                 guard.llm_state.calls_today += 1;
-                if guard.llm_state
+                if guard
+                    .llm_state
                     .hour_window_started_at
                     .map(|t| now - t > ChronoDuration::hours(1))
                     .unwrap_or(true)
@@ -664,7 +697,10 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
 
             let (cb_state_str, cb_trips) = {
                 let pg = state.policy.lock_recover();
-                (pg.circuit_breaker.state().as_str().to_string(), pg.circuit_breaker.trips_total)
+                (
+                    pg.circuit_breaker.state().as_str().to_string(),
+                    pg.circuit_breaker.trips_total,
+                )
             };
             let (op_mode_str, failure_rate, deg_transitions) = {
                 let pg = state.policy.lock_recover();
@@ -712,7 +748,11 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
 pub fn build_llm_status(state: &SharedState) -> LlmStatus {
     let (llm_cfg_default, llm_state, llm_key_path) = {
         let llm = state.llm.lock_recover();
-        (llm.llm_cfg.clone(), llm.llm_state.clone(), llm.llm_key_path.clone())
+        (
+            llm.llm_cfg.clone(),
+            llm.llm_state.clone(),
+            llm.llm_key_path.clone(),
+        )
     };
     let llm_cfg = load_repo_config(&state.config_path)
         .llm

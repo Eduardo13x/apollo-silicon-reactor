@@ -504,7 +504,11 @@ mod tests {
             tp.observe("rustc", 11, 2);
         }
         let h = tp.pressure_headroom_for_incoming(11, 2);
-        assert!(h <= HEADROOM_CAP, "headroom must not exceed {}", HEADROOM_CAP);
+        assert!(
+            h <= HEADROOM_CAP,
+            "headroom must not exceed {}",
+            HEADROOM_CAP
+        );
     }
 
     #[test]

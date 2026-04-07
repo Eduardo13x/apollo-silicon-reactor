@@ -234,10 +234,13 @@ mod tests {
 
         let cycle = q.drain_cycle();
         // Unfreeze must be first.
-        assert!(matches!(cycle[0], RootAction::UnfreezeProcess { pid: 99, .. }));
+        assert!(matches!(
+            cycle[0],
+            RootAction::UnfreezeProcess { pid: 99, .. }
+        ));
         // Then up to max_per_cycle (2) normals.
         assert_eq!(cycle.len(), 3); // 1 urgent + 2 normal
-        // Background (sysctl) stays in queue because budget=0.
+                                    // Background (sysctl) stays in queue because budget=0.
         assert_eq!(q.background_len(), 1);
     }
 

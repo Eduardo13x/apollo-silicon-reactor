@@ -128,16 +128,13 @@ impl BuildTracker {
 
     fn estimate_progress(&self) -> f32 {
         // If we have a solid peak and rustc count is declining, use it.
-        if self.max_rustc_seen >= MIN_PEAK_FOR_ESTIMATE
-            && self.rustc_count < self.max_rustc_seen
-        {
+        if self.max_rustc_seen >= MIN_PEAK_FOR_ESTIMATE && self.rustc_count < self.max_rustc_seen {
             let completed = (self.max_rustc_seen - self.rustc_count) as f32;
             return (completed / self.max_rustc_seen as f32).min(0.95);
         }
 
         // Fallback: time-based estimate normalized to EXPECTED_BUILD_CYCLES.
-        let time_estimate =
-            (self.build_cycles as f32 / EXPECTED_BUILD_CYCLES as f32).min(0.90);
+        let time_estimate = (self.build_cycles as f32 / EXPECTED_BUILD_CYCLES as f32).min(0.90);
         time_estimate
     }
 
@@ -171,7 +168,11 @@ mod tests {
     use super::*;
 
     fn procs<'a>(names: &[&'a str]) -> Vec<(u32, &'a str)> {
-        names.iter().enumerate().map(|(i, &n)| (i as u32, n)).collect()
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (i as u32, n))
+            .collect()
     }
 
     #[test]
@@ -180,7 +181,10 @@ mod tests {
         // Only rustc confirms active compilation.
         let mut bt = BuildTracker::new();
         bt.tick(&procs(&["cargo"]));
-        assert!(!bt.build_active, "cargo without rustc should not activate build tracker");
+        assert!(
+            !bt.build_active,
+            "cargo without rustc should not activate build tracker"
+        );
         assert_eq!(bt.phase, BuildPhase::Idle);
     }
 
@@ -205,13 +209,19 @@ mod tests {
     fn progress_increases_as_rustc_declines() {
         let mut bt = BuildTracker::new();
         // Peak: 8 rustc processes
-        bt.tick(&procs(&["cargo", "rustc", "rustc", "rustc", "rustc", "rustc", "rustc", "rustc", "rustc"]));
+        bt.tick(&procs(&[
+            "cargo", "rustc", "rustc", "rustc", "rustc", "rustc", "rustc", "rustc", "rustc",
+        ]));
         assert_eq!(bt.max_rustc_seen, 8);
         assert_eq!(bt.build_progress, 0.0); // none done yet (still at peak)
 
         // 4 rustc done → 50% progress
         bt.tick(&procs(&["cargo", "rustc", "rustc", "rustc", "rustc"]));
-        assert!((bt.build_progress - 0.5).abs() < 0.01, "expected ~50% got {}", bt.build_progress);
+        assert!(
+            (bt.build_progress - 0.5).abs() < 0.01,
+            "expected ~50% got {}",
+            bt.build_progress
+        );
         assert_eq!(bt.phase, BuildPhase::Active);
     }
 
@@ -226,7 +236,11 @@ mod tests {
         // 1 rustc remaining → 90% → Finishing
         bt.tick(&procs(&["cargo", "rustc"]));
         assert_eq!(bt.phase, BuildPhase::Finishing);
-        assert!(bt.build_progress >= 0.80, "expected ≥0.80 got {}", bt.build_progress);
+        assert!(
+            bt.build_progress >= 0.80,
+            "expected ≥0.80 got {}",
+            bt.build_progress
+        );
     }
 
     #[test]
@@ -249,6 +263,9 @@ mod tests {
         for _ in 0..50 {
             bt.tick(&procs(&["cargo", "rustc"]));
         }
-        assert!(bt.build_progress > 0.0, "time-based estimate should be positive");
+        assert!(
+            bt.build_progress > 0.0,
+            "time-based estimate should be positive"
+        );
     }
 }

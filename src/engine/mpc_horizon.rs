@@ -366,12 +366,16 @@ mod tests {
         let mut mpc = MpcController::new(3, 0.5);
         // Low utility → high λ → actions are expensive → favor Observe.
         let action_cautious = mpc.solve_constrained(
-            0.60, 0.02, 0.40,
+            0.60,
+            0.02,
+            0.40,
             &[0.05, 0.05, 0.05, 0.05], // very low utility
         );
         // Same scenario but with high utility.
         let action_confident = mpc.solve_constrained(
-            0.60, 0.02, 0.40,
+            0.60,
+            0.02,
+            0.40,
             &[0.90, 0.90, 0.90, 0.90], // high utility
         );
         // With low utility, MPC should be more cautious (higher cost for actions).

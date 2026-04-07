@@ -83,7 +83,11 @@ pub struct SignalBaseline {
 
 impl SignalBaseline {
     fn new() -> Self {
-        Self { ema: 0.0, mad: 0.0, obs: 0 }
+        Self {
+            ema: 0.0,
+            mad: 0.0,
+            obs: 0,
+        }
     }
 
     /// Update baseline with a new observation.
@@ -166,7 +170,10 @@ impl ProcessSignals {
 
     /// Total observations (minimum across signals — weakest link).
     pub fn min_obs(&self) -> u32 {
-        self.ipc.obs.min(self.wakeup_rate.obs).min(self.disk_mbps.obs)
+        self.ipc
+            .obs
+            .min(self.wakeup_rate.obs)
+            .min(self.disk_mbps.obs)
     }
 }
 
@@ -181,7 +188,9 @@ pub struct ProcessBaselineMap {
 
 impl ProcessBaselineMap {
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
     /// Update the baseline for `name` with a new observation.
@@ -201,8 +210,16 @@ impl ProcessBaselineMap {
     }
 
     /// Dominant anomaly signal for `name`.
-    pub fn dominant_signal(&self, name: &str, ipc: f64, wakeup_rate: f64, disk_mbps: f64) -> Option<&'static str> {
-        self.entries.get(name).map(|e| e.dominant_signal(ipc, wakeup_rate, disk_mbps))
+    pub fn dominant_signal(
+        &self,
+        name: &str,
+        ipc: f64,
+        wakeup_rate: f64,
+        disk_mbps: f64,
+    ) -> Option<&'static str> {
+        self.entries
+            .get(name)
+            .map(|e| e.dominant_signal(ipc, wakeup_rate, disk_mbps))
     }
 
     /// Prune entries for processes not seen in the last `max_unseen_cycles` persist cycles.
@@ -214,7 +231,10 @@ impl ProcessBaselineMap {
 
     /// Number of entries with warm baselines (>= MIN_OBS).
     pub fn warm_count(&self) -> usize {
-        self.entries.values().filter(|v| v.min_obs() >= MIN_OBS).count()
+        self.entries
+            .values()
+            .filter(|v| v.min_obs() >= MIN_OBS)
+            .count()
     }
 }
 
@@ -237,7 +257,11 @@ mod tests {
         }
         // After MIN_OBS observations all at 1.0, a current value of 1.0 = no anomaly.
         let score = b.score(1.0);
-        assert!(score < 0.5, "stable signal should score near 0, got {}", score);
+        assert!(
+            score < 0.5,
+            "stable signal should score near 0, got {}",
+            score
+        );
     }
 
     #[test]
@@ -249,7 +273,12 @@ mod tests {
         }
         // A spike of 100× should score very high.
         let score = b.score(100.0);
-        assert!(score > ANOMALY_THRESHOLD, "spike should score >{}, got {}", ANOMALY_THRESHOLD, score);
+        assert!(
+            score > ANOMALY_THRESHOLD,
+            "spike should score >{}, got {}",
+            ANOMALY_THRESHOLD,
+            score
+        );
     }
 
     #[test]
@@ -258,7 +287,11 @@ mod tests {
         for _ in 0..50 {
             b.update(5.0);
         }
-        assert!((b.ema - 5.0).abs() < 0.5, "EMA should converge to 5.0, got {}", b.ema);
+        assert!(
+            (b.ema - 5.0).abs() < 0.5,
+            "EMA should converge to 5.0, got {}",
+            b.ema
+        );
     }
 
     #[test]
@@ -270,11 +303,18 @@ mod tests {
         }
         // Normal reading = low anomaly.
         let normal = map.anomaly_score("Safari", 2.0, 50.0, 0.1);
-        assert!(normal < ANOMALY_THRESHOLD, "normal reading should not be anomalous");
+        assert!(
+            normal < ANOMALY_THRESHOLD,
+            "normal reading should not be anomalous"
+        );
 
         // Disk burst anomaly.
         let anomalous = map.anomaly_score("Safari", 2.0, 50.0, 200.0);
-        assert!(anomalous >= ANOMALY_THRESHOLD, "disk burst should be anomalous, got {}", anomalous);
+        assert!(
+            anomalous >= ANOMALY_THRESHOLD,
+            "disk burst should be anomalous, got {}",
+            anomalous
+        );
     }
 
     #[test]
@@ -348,33 +388,41 @@ mod tests {
 
         // Step 2: normal reading — no anomaly
         let normal_score = map.anomaly_score("Spotlight", 1.5, 20.0, 0.1);
-        assert!(normal_score < ANOMALY_THRESHOLD, "normal reading should not trigger anomaly");
+        assert!(
+            normal_score < ANOMALY_THRESHOLD,
+            "normal reading should not trigger anomaly"
+        );
 
         // Step 3: disk burst — Spotlight suddenly indexing heavy content
         let burst_score = map.anomaly_score("Spotlight", 1.5, 20.0, 80.0);
-        assert!(burst_score >= ANOMALY_THRESHOLD,
-            "disk burst should trigger anomaly, got {}", burst_score);
+        assert!(
+            burst_score >= ANOMALY_THRESHOLD,
+            "disk burst should trigger anomaly, got {}",
+            burst_score
+        );
 
         // Step 4: build_anomaly_hints filters correctly
-        let results = vec![
-            ProcessEnergyDelta {
-                pid: 42,
-                name: "Spotlight".into(),
-                delta_nj: 0,
-                power_mw: 0.0,
-                ipc: 1.5,
-                wakeup_rate: 20.0,
-                phys_footprint_mb: 100.0,
-                disk_write_mbps: 80.0,
-                anomaly_score: burst_score,
-            },
-        ];
+        let results = vec![ProcessEnergyDelta {
+            pid: 42,
+            name: "Spotlight".into(),
+            delta_nj: 0,
+            power_mw: 0.0,
+            ipc: 1.5,
+            wakeup_rate: 20.0,
+            phys_footprint_mb: 100.0,
+            disk_write_mbps: 80.0,
+            anomaly_score: burst_score,
+        }];
         // Simulated anomaly_hints build (same logic as main.rs)
-        let hints: std::collections::HashMap<u32, f64> = results.iter()
+        let hints: std::collections::HashMap<u32, f64> = results
+            .iter()
             .filter(|r| r.anomaly_score >= ANOMALY_THRESHOLD)
             .map(|r| (r.pid, r.anomaly_score))
             .collect();
-        assert!(hints.contains_key(&42), "Spotlight should appear in anomaly_hints");
+        assert!(
+            hints.contains_key(&42),
+            "Spotlight should appear in anomaly_hints"
+        );
         assert!(hints[&42] >= ANOMALY_THRESHOLD);
     }
 
@@ -382,15 +430,21 @@ mod tests {
     fn effective_threshold_cold_start_raises_threshold() {
         // At warm_count=0 → threshold × 1.5 (maximum conservatism during cold start).
         let t = effective_threshold(0);
-        assert!((t - ANOMALY_THRESHOLD * 1.5).abs() < 1e-9,
-            "cold start should raise threshold 50%, got {}", t);
+        assert!(
+            (t - ANOMALY_THRESHOLD * 1.5).abs() < 1e-9,
+            "cold start should raise threshold 50%, got {}",
+            t
+        );
     }
 
     #[test]
     fn effective_threshold_warm_returns_nominal() {
         // At warm_count >= WARM_TARGET → exactly ANOMALY_THRESHOLD (no penalty).
         let t = effective_threshold(WARM_TARGET);
-        assert_eq!(t, ANOMALY_THRESHOLD, "fully warm should return nominal threshold");
+        assert_eq!(
+            t, ANOMALY_THRESHOLD,
+            "fully warm should return nominal threshold"
+        );
 
         // Strictly above WARM_TARGET — still nominal.
         let t2 = effective_threshold(WARM_TARGET + 5);

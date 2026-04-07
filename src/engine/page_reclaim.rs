@@ -268,8 +268,14 @@ mod tests {
         let mut pr = PageReclaim::new(true);
         // Below critical threshold: foreground gate blocks even at 0.79.
         let freed = pr.tick(0.79, false, false);
-        assert_eq!(freed, 0, "should not purge during active foreground below critical threshold");
-        assert_eq!(pr.total_purges, 0, "no purge attempt when foreground gate blocks");
+        assert_eq!(
+            freed, 0,
+            "should not purge during active foreground below critical threshold"
+        );
+        assert_eq!(
+            pr.total_purges, 0,
+            "no purge attempt when foreground gate blocks"
+        );
     }
 
     #[test]
@@ -279,7 +285,10 @@ mod tests {
         // Even with display=on and foreground=active, purge runs.
         // execute_purge() may return 0 bytes in test env, but total_purges increments.
         pr.tick(0.85, false, false);
-        assert_eq!(pr.total_purges, 1, "critical pressure should bypass foreground gate and attempt purge");
+        assert_eq!(
+            pr.total_purges, 1,
+            "critical pressure should bypass foreground gate and attempt purge"
+        );
     }
 
     #[test]
@@ -287,7 +296,10 @@ mod tests {
         let mut pr = PageReclaim::new(true);
         // pressure == PRESSURE_CRITICAL_OVERRIDE (0.80) should trigger override.
         pr.tick(0.80, false, false);
-        assert_eq!(pr.total_purges, 1, "exactly at 0.80 should bypass foreground gate");
+        assert_eq!(
+            pr.total_purges, 1,
+            "exactly at 0.80 should bypass foreground gate"
+        );
     }
 
     #[test]
@@ -296,7 +308,10 @@ mod tests {
         // 0.799 is just below the 0.80 critical threshold.
         let freed = pr.tick(0.799, false, false);
         assert_eq!(freed, 0);
-        assert_eq!(pr.total_purges, 0, "just below 0.80 should still respect foreground gate");
+        assert_eq!(
+            pr.total_purges, 0,
+            "just below 0.80 should still respect foreground gate"
+        );
     }
 
     #[test]
@@ -332,7 +347,10 @@ mod tests {
         // 0.549 is just below the 0.55 interactive gate.
         let mut pr = PageReclaim::new(true);
         let freed = pr.tick(0.549, false, true);
-        assert_eq!(freed, 0, "pressure just below gate should not trigger purge");
+        assert_eq!(
+            freed, 0,
+            "pressure just below gate should not trigger purge"
+        );
     }
 
     #[test]
@@ -340,7 +358,10 @@ mod tests {
         // 0.39 is just below the 0.40 display-off gate.
         let mut pr = PageReclaim::new(true);
         let freed = pr.tick(0.39, true, true);
-        assert_eq!(freed, 0, "pressure just below display-off gate should be blocked");
+        assert_eq!(
+            freed, 0,
+            "pressure just below display-off gate should be blocked"
+        );
     }
 
     #[test]
@@ -394,7 +415,10 @@ mod tests {
         }
         // Still below rate limit, but pressure is low → blocked by pressure gate.
         let freed = pr.tick(0.10, false, true);
-        assert_eq!(freed, 0, "low pressure should block regardless of rate limit headroom");
+        assert_eq!(
+            freed, 0,
+            "low pressure should block regardless of rate limit headroom"
+        );
     }
 
     #[test]
@@ -407,7 +431,10 @@ mod tests {
         }
         // Even with display off and high pressure, rate limit blocks.
         let freed = pr.tick(0.99, true, true);
-        assert_eq!(freed, 0, "rate limit should block at exactly MAX_PURGES_PER_HOUR");
+        assert_eq!(
+            freed, 0,
+            "rate limit should block at exactly MAX_PURGES_PER_HOUR"
+        );
     }
 
     #[test]
@@ -419,7 +446,10 @@ mod tests {
             pr.recent_purges.push(now);
         }
         let freed = pr.tick(0.99, true, true);
-        assert_eq!(freed, 0, "rate limit should block when over MAX_PURGES_PER_HOUR");
+        assert_eq!(
+            freed, 0,
+            "rate limit should block when over MAX_PURGES_PER_HOUR"
+        );
     }
 
     #[test]
@@ -430,7 +460,10 @@ mod tests {
         pr.cooldown = Duration::from_secs(MIN_COOLDOWN_SECS);
         // Even with high pressure + display off, cooldown blocks.
         let freed = pr.tick(0.99, true, true);
-        assert_eq!(freed, 0, "active cooldown should prevent immediate re-purge");
+        assert_eq!(
+            freed, 0,
+            "active cooldown should prevent immediate re-purge"
+        );
     }
 
     #[test]
@@ -440,7 +473,10 @@ mod tests {
         pr.last_purge = Some(Instant::now() - Duration::from_secs(60));
         pr.cooldown = Duration::from_secs(MIN_COOLDOWN_SECS);
         let freed = pr.tick(0.99, true, true);
-        assert_eq!(freed, 0, "should be blocked within standard cooldown window");
+        assert_eq!(
+            freed, 0,
+            "should be blocked within standard cooldown window"
+        );
     }
 
     #[test]
@@ -450,7 +486,10 @@ mod tests {
         pr.last_purge = Some(Instant::now() - Duration::from_secs(400));
         pr.cooldown = Duration::from_secs(EXTENDED_COOLDOWN_SECS); // 900s
         let freed = pr.tick(0.99, true, true);
-        assert_eq!(freed, 0, "should be blocked within extended cooldown window");
+        assert_eq!(
+            freed, 0,
+            "should be blocked within extended cooldown window"
+        );
     }
 
     #[test]
@@ -468,16 +507,21 @@ mod tests {
 
     #[test]
     fn min_effective_bytes_threshold_is_50mb() {
-        assert_eq!(MIN_EFFECTIVE_BYTES, 50 * 1024 * 1024,
-            "threshold for effective purge should be 50 MB");
+        assert_eq!(
+            MIN_EFFECTIVE_BYTES,
+            50 * 1024 * 1024,
+            "threshold for effective purge should be 50 MB"
+        );
     }
 
     #[test]
     fn max_purges_per_hour_is_reasonable() {
         // Should be a positive, small number to prevent thrashing.
         assert!(MAX_PURGES_PER_HOUR > 0);
-        assert!(MAX_PURGES_PER_HOUR <= 12,
-            "more than 12 purges/hour would thrash the file cache");
+        assert!(
+            MAX_PURGES_PER_HOUR <= 12,
+            "more than 12 purges/hour would thrash the file cache"
+        );
     }
 
     #[test]
@@ -506,7 +550,10 @@ mod tests {
         }
         // Rate limited, so execute_purge won't run.
         let freed = pr.tick(0.55, true, false);
-        assert_eq!(freed, 0, "rate limited so no purge even though pressure passes gate");
+        assert_eq!(
+            freed, 0,
+            "rate limited so no purge even though pressure passes gate"
+        );
     }
 
     #[test]

@@ -705,14 +705,24 @@ mod tests {
         if snap.commpage_valid {
             // physical_cpus and active_cpus are read from commpage at fixed offsets.
             // On Darwin 25, active_cpus offset may differ; just check both are non-zero.
-            assert!(snap.physical_cpus >= 1, "physical_cpus={}", snap.physical_cpus);
+            assert!(
+                snap.physical_cpus >= 1,
+                "physical_cpus={}",
+                snap.physical_cpus
+            );
         }
         // bandwidth_gbs should be non-negative and plausible (< 1000 GB/s).
-        assert!(snap.bandwidth_gbs >= 0.0 && snap.bandwidth_gbs < 1000.0,
-            "bandwidth_gbs={}", snap.bandwidth_gbs);
+        assert!(
+            snap.bandwidth_gbs >= 0.0 && snap.bandwidth_gbs < 1000.0,
+            "bandwidth_gbs={}",
+            snap.bandwidth_gbs
+        );
         // contention_rate in [0, 1].
-        assert!((0.0..=1.0).contains(&snap.contention_rate),
-            "contention_rate={}", snap.contention_rate);
+        assert!(
+            (0.0..=1.0).contains(&snap.contention_rate),
+            "contention_rate={}",
+            snap.contention_rate
+        );
     }
 
     #[test]

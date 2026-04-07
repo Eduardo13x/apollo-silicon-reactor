@@ -40,11 +40,7 @@ use std::collections::HashMap;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const RENDERER_PATTERNS: &[&str] = &[
-    "Helper (Renderer)",
-    "Helper (GPU)",
-    "Helper (Plugin)",
-];
+const RENDERER_PATTERNS: &[&str] = &["Helper (Renderer)", "Helper (GPU)", "Helper (Plugin)"];
 
 const HEAVY_APP_PATTERNS: &[&str] = &[
     "Brave Browser",
@@ -63,20 +59,29 @@ const HEAVY_APP_PATTERNS: &[&str] = &[
 
 /// Substrings identifying active compilation / build processes.
 const BUILD_PATTERNS: &[&str] = &[
-    "cargo", "rustc", "stable", "clang", "clang++", "cc", "c++",
-    "make", "ninja", "gradle", "swift", "javac",
+    "cargo", "rustc", "stable", "clang", "clang++", "cc", "c++", "make", "ninja", "gradle",
+    "swift", "javac",
 ];
 
 /// Substrings identifying ML inference / AI workloads.
 const AI_PATTERNS: &[&str] = &[
-    "ollama", "ollama_llama_server", "python", "python3",
+    "ollama",
+    "ollama_llama_server",
+    "python",
+    "python3",
     "TGOnDeviceInferenceProviderService",
 ];
 
 /// Substrings identifying media playback processes.
 const MEDIA_PATTERNS: &[&str] = &[
-    "Spotify", "VLC", "mpv", "Stremio", "QuickTime", "IINA",
-    "Music", "Podcasts",
+    "Spotify",
+    "VLC",
+    "mpv",
+    "Stremio",
+    "QuickTime",
+    "IINA",
+    "Music",
+    "Podcasts",
 ];
 
 /// EMA alpha for tab_velocity smoothing. α=0.3 → ~3-cycle memory.
@@ -258,8 +263,7 @@ impl WindowSensor {
 
         // Foreground switch EMA: α=0.2 (5-cycle memory [Altmann & Trafton 2002])
         let fg_signal = if delta.foreground_changed { 1.0 } else { 0.0 };
-        self.foreground_switch_ema =
-            0.2 * fg_signal + 0.8 * self.foreground_switch_ema;
+        self.foreground_switch_ema = 0.2 * fg_signal + 0.8 * self.foreground_switch_ema;
         delta.foreground_switch_ema = self.foreground_switch_ema;
 
         self.prev_foreground = fg_name.clone();
@@ -329,8 +333,7 @@ impl WindowSensor {
         delta.tab_delta = renderer_count as i32 - self.prev_renderer_count as i32;
         // EMA smooths burst open/close into a trend signal.
         // α=0.3: new observation weighted 30%, history 70%.
-        self.tab_velocity_ema =
-            TAB_VELOCITY_ALPHA * delta.tab_delta as f64
+        self.tab_velocity_ema = TAB_VELOCITY_ALPHA * delta.tab_delta as f64
             + (1.0 - TAB_VELOCITY_ALPHA) * self.tab_velocity_ema;
         delta.tab_velocity_ema = self.tab_velocity_ema;
 
@@ -456,7 +459,11 @@ mod tests {
         let mut s = WindowSensor::new();
         s.tick(&make_procs(&[(1, "launchd"), (200, "Slack")]), None);
         let d = s.tick(&make_procs(&[(1, "launchd")]), None);
-        let term: Vec<_> = d.events.iter().filter(|e| e.kind == AppEventKind::Terminated).collect();
+        let term: Vec<_> = d
+            .events
+            .iter()
+            .filter(|e| e.kind == AppEventKind::Terminated)
+            .collect();
         assert_eq!(term.len(), 1);
         assert_eq!(term[0].name, "Slack");
     }
@@ -473,17 +480,23 @@ mod tests {
     #[test]
     fn tab_delta_negative_on_tab_close() {
         let mut s = WindowSensor::new();
-        s.tick(&make_procs(&[
-            (1, "Brave Browser"),
-            (101, "Brave Browser Helper (Renderer)"),
-            (102, "Brave Browser Helper (Renderer)"),
-            (103, "Brave Browser Helper (Renderer)"),
-        ]), None);
-        let d = s.tick(&make_procs(&[
-            (1, "Brave Browser"),
-            (101, "Brave Browser Helper (Renderer)"),
-            (102, "Brave Browser Helper (Renderer)"),
-        ]), None);
+        s.tick(
+            &make_procs(&[
+                (1, "Brave Browser"),
+                (101, "Brave Browser Helper (Renderer)"),
+                (102, "Brave Browser Helper (Renderer)"),
+                (103, "Brave Browser Helper (Renderer)"),
+            ]),
+            None,
+        );
+        let d = s.tick(
+            &make_procs(&[
+                (1, "Brave Browser"),
+                (101, "Brave Browser Helper (Renderer)"),
+                (102, "Brave Browser Helper (Renderer)"),
+            ]),
+            None,
+        );
         assert_eq!(d.tab_delta, -1);
         assert_eq!(d.renderer_count, 2);
     }
@@ -491,27 +504,41 @@ mod tests {
     #[test]
     fn tab_delta_positive_on_tab_open() {
         let mut s = WindowSensor::new();
-        s.tick(&make_procs(&[(1, "Brave Browser"), (101, "Brave Browser Helper (Renderer)")]), None);
-        let d = s.tick(&make_procs(&[
-            (1, "Brave Browser"),
-            (101, "Brave Browser Helper (Renderer)"),
-            (102, "Brave Browser Helper (Renderer)"),
-            (103, "Brave Browser Helper (Renderer)"),
-        ]), None);
+        s.tick(
+            &make_procs(&[
+                (1, "Brave Browser"),
+                (101, "Brave Browser Helper (Renderer)"),
+            ]),
+            None,
+        );
+        let d = s.tick(
+            &make_procs(&[
+                (1, "Brave Browser"),
+                (101, "Brave Browser Helper (Renderer)"),
+                (102, "Brave Browser Helper (Renderer)"),
+                (103, "Brave Browser Helper (Renderer)"),
+            ]),
+            None,
+        );
         assert_eq!(d.tab_delta, 2);
     }
 
     #[test]
     fn renderer_terminations_not_emitted_as_events() {
         let mut s = WindowSensor::new();
-        s.tick(&make_procs(&[
-            (1, "Brave Browser"),
-            (200, "Brave Browser Helper (Renderer)"),
-            (201, "Brave Browser Helper (Renderer)"),
-        ]), None);
+        s.tick(
+            &make_procs(&[
+                (1, "Brave Browser"),
+                (200, "Brave Browser Helper (Renderer)"),
+                (201, "Brave Browser Helper (Renderer)"),
+            ]),
+            None,
+        );
         let d = s.tick(&make_procs(&[(1, "Brave Browser")]), None);
         assert_eq!(d.tab_delta, -2);
-        let r: Vec<_> = d.events.iter()
+        let r: Vec<_> = d
+            .events
+            .iter()
             .filter(|e| e.kind == AppEventKind::Terminated && e.name.contains("Renderer"))
             .collect();
         assert!(r.is_empty());
@@ -541,7 +568,11 @@ mod tests {
         let mut s = WindowSensor::new();
         s.tick(&make_procs(&[(1, "launchd")]), None);
         let d = s.tick(&make_procs(&[(1, "launchd"), (500, "Notion")]), None);
-        let launched: Vec<_> = d.events.iter().filter(|e| e.kind == AppEventKind::Launched).collect();
+        let launched: Vec<_> = d
+            .events
+            .iter()
+            .filter(|e| e.kind == AppEventKind::Launched)
+            .collect();
         assert_eq!(launched.len(), 1);
         assert_eq!(launched[0].name, "Notion");
     }
@@ -549,7 +580,10 @@ mod tests {
     #[test]
     fn gpu_helper_counted_as_renderer() {
         let mut s = WindowSensor::new();
-        s.tick(&make_procs(&[(1, "Brave Browser"), (10, "Brave Browser Helper (GPU)")]), None);
+        s.tick(
+            &make_procs(&[(1, "Brave Browser"), (10, "Brave Browser Helper (GPU)")]),
+            None,
+        );
         let d = s.tick(&make_procs(&[(1, "Brave Browser")]), None);
         assert_eq!(d.tab_delta, -1);
     }
@@ -606,7 +640,10 @@ mod tests {
     fn workload_research_session_detected() {
         let procs = make_procs(&[(1, "Brave Browser"), (2, "launchd")]);
         // 10 renderers, no build/ai/media
-        assert_eq!(classify_workload(&procs, 10), WorkloadIntent::ResearchSession);
+        assert_eq!(
+            classify_workload(&procs, 10),
+            WorkloadIntent::ResearchSession
+        );
     }
 
     #[test]
@@ -645,7 +682,10 @@ mod tests {
     #[test]
     fn session_phase_cold_start_initially() {
         let mut s = WindowSensor::new();
-        let procs = make_procs(&[(1, "Brave Browser"), (10, "Brave Browser Helper (Renderer)")]);
+        let procs = make_procs(&[
+            (1, "Brave Browser"),
+            (10, "Brave Browser Helper (Renderer)"),
+        ]);
         s.tick(&procs, None); // init
         let d = s.tick(&procs, None); // cycle 1
         assert_eq!(d.session_phase, SessionPhase::ColdStart);
@@ -697,14 +737,21 @@ mod tests {
     #[test]
     fn tab_velocity_ema_decays_to_zero() {
         let mut s = WindowSensor::new();
-        let procs = make_procs(&[(1, "Brave Browser"), (10, "Brave Browser Helper (Renderer)")]);
+        let procs = make_procs(&[
+            (1, "Brave Browser"),
+            (10, "Brave Browser Helper (Renderer)"),
+        ]);
         s.tick(&procs, None);
         // Stable — no delta — velocity should decay toward 0
         for _ in 0..20 {
             s.tick(&procs, None);
         }
         let d = s.tick(&procs, None);
-        assert!(d.tab_velocity_ema.abs() < 0.01, "velocity should decay near 0, got {}", d.tab_velocity_ema);
+        assert!(
+            d.tab_velocity_ema.abs() < 0.01,
+            "velocity should decay near 0, got {}",
+            d.tab_velocity_ema
+        );
     }
 
     #[test]
@@ -718,6 +765,10 @@ mod tests {
             let d = s.tick(&procs, Some(app));
             last_ema = d.foreground_switch_ema;
         }
-        assert!(last_ema > 0.3, "switch EMA should be elevated, got {}", last_ema);
+        assert!(
+            last_ema > 0.3,
+            "switch EMA should be elevated, got {}",
+            last_ema
+        );
     }
 }

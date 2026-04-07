@@ -198,19 +198,35 @@ impl FreezeIntelligence {
             "Linear",
             "Figma",
         ];
-        if CHROMIUM_APPS.iter().any(|&a| predicted_app == a || predicted_app.starts_with(a)) {
+        if CHROMIUM_APPS
+            .iter()
+            .any(|&a| predicted_app == a || predicted_app.starts_with(a))
+        {
             return vec!["chromium-renderer", "chromium-gpu"];
         }
 
         // IDE / code editors that spawn LSP helpers
         const IDE_APPS: &[&str] = &["Xcode", "Nova", "Zed", "CLion", "PyCharm", "GoLand"];
-        if IDE_APPS.iter().any(|&a| predicted_app == a || predicted_app.starts_with(a)) {
+        if IDE_APPS
+            .iter()
+            .any(|&a| predicted_app == a || predicted_app.starts_with(a))
+        {
             return vec!["ide-lsp", "app-helper"];
         }
 
         // Media players
-        const MEDIA_APPS: &[&str] = &["Spotify", "Music", "Podcasts", "QuickTime Player", "IINA", "VLC"];
-        if MEDIA_APPS.iter().any(|&a| predicted_app == a || predicted_app.starts_with(a)) {
+        const MEDIA_APPS: &[&str] = &[
+            "Spotify",
+            "Music",
+            "Podcasts",
+            "QuickTime Player",
+            "IINA",
+            "VLC",
+        ];
+        if MEDIA_APPS
+            .iter()
+            .any(|&a| predicted_app == a || predicted_app.starts_with(a))
+        {
             return vec!["media-helper", "app-helper"];
         }
 
@@ -296,10 +312,7 @@ mod tests {
             // Wait — "Spotify Helper" contains "Spotify Helper" → media-helper
             "media-helper"
         );
-        assert_eq!(
-            FreezeIntelligence::classify("SomeApp Helper"),
-            "app-helper"
-        );
+        assert_eq!(FreezeIntelligence::classify("SomeApp Helper"), "app-helper");
     }
 
     #[test]
@@ -383,7 +396,10 @@ mod tests {
     #[test]
     fn pre_thaw_hint_chromium_returns_renderer_and_gpu() {
         let hint = FreezeIntelligence::pre_thaw_hint("Brave Browser");
-        assert!(hint.contains(&"chromium-renderer"), "missing chromium-renderer");
+        assert!(
+            hint.contains(&"chromium-renderer"),
+            "missing chromium-renderer"
+        );
         assert!(hint.contains(&"chromium-gpu"), "missing chromium-gpu");
     }
 
@@ -397,7 +413,10 @@ mod tests {
     #[test]
     fn pre_thaw_hint_media_returns_media_helper() {
         let hint = FreezeIntelligence::pre_thaw_hint("Spotify");
-        assert!(hint.contains(&"media-helper"), "Spotify should hint media-helper");
+        assert!(
+            hint.contains(&"media-helper"),
+            "Spotify should hint media-helper"
+        );
     }
 
     #[test]

@@ -161,9 +161,9 @@ mod tests {
             Self {
                 outcome_tracker: OutcomeTracker::new(),
                 signal_intel: SignalIntelligence::new(),
-                predictive_agent: PredictiveAgent::load_or_default(
-                    std::path::Path::new("/dev/null"),
-                ),
+                predictive_agent: PredictiveAgent::load_or_default(std::path::Path::new(
+                    "/dev/null",
+                )),
                 specialist_accuracy: SpecialistAccuracyTracker::new(),
                 overflow_guard: OverflowGuard::load_or_default(
                     std::path::Path::new("/dev/null"),
@@ -245,7 +245,10 @@ mod tests {
         let mut lctx = owner.make_lctx();
         let mut ctx = make_pctx(7200, &mut lctx);
         let result = run_periodic(&mut ctx);
-        assert!(result.did_hourly, "% 7200 == 0 gate should fire at cycle 7200");
+        assert!(
+            result.did_hourly,
+            "% 7200 == 0 gate should fire at cycle 7200"
+        );
         assert!(result.did_persist, "% 100 gate must co-fire at cycle 7200");
     }
 

@@ -122,10 +122,25 @@ mod tests {
 
     #[test]
     fn from_raw_values() {
-        assert_eq!(KernelPressureLevel::from_raw(0), KernelPressureLevel::Normal);
-        assert_eq!(KernelPressureLevel::from_raw(1), KernelPressureLevel::Warning);
-        assert_eq!(KernelPressureLevel::from_raw(2), KernelPressureLevel::Critical);
-        assert_eq!(KernelPressureLevel::from_raw(4), KernelPressureLevel::Critical);
-        assert_eq!(KernelPressureLevel::from_raw(-1), KernelPressureLevel::Normal);
+        assert_eq!(
+            KernelPressureLevel::from_raw(0),
+            KernelPressureLevel::Normal
+        );
+        assert_eq!(
+            KernelPressureLevel::from_raw(1),
+            KernelPressureLevel::Warning
+        );
+        assert_eq!(
+            KernelPressureLevel::from_raw(2),
+            KernelPressureLevel::Critical
+        );
+        assert_eq!(
+            KernelPressureLevel::from_raw(4),
+            KernelPressureLevel::Critical
+        );
+        assert_eq!(
+            KernelPressureLevel::from_raw(-1),
+            KernelPressureLevel::Normal
+        );
     }
 }

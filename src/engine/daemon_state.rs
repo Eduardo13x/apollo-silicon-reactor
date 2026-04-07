@@ -22,16 +22,17 @@ use chrono::{DateTime, Utc};
 
 use crate::engine::adaptive_governor::AdaptiveGovernor;
 use crate::engine::circuit_breaker::CircuitBreaker;
+use crate::engine::daemon_helpers::WakeRuntimeState;
 use crate::engine::degradation::DegradationController;
 use crate::engine::iokit_sensors::HardwareSnapshot;
 use crate::engine::llm::{LearnedPolicy, LlmConfig, LlmState};
+use crate::engine::mach_qos::MachQoSManager;
 use crate::engine::profile_governor::ProfileGovernor;
 use crate::engine::sysctl_governor::SysctlGovernorStatus;
 use crate::engine::thermal_interrupt::ResourceInterruptState;
-use crate::engine::daemon_helpers::WakeRuntimeState;
-use crate::engine::mach_qos::MachQoSManager;
 use crate::engine::types::{
-    BlockerScore, FrozenEntry, LatencyTarget, OptimizationProfile, ProfileTransition, RuntimeMetrics,
+    BlockerScore, FrozenEntry, LatencyTarget, OptimizationProfile, ProfileTransition,
+    RuntimeMetrics,
 };
 use crate::engine::usage_model::UsageModel;
 

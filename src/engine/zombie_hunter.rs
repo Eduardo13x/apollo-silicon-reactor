@@ -296,7 +296,10 @@ mod tests {
     #[test]
     fn true_zombie_detected_immediately() {
         let mut hunter = ZombieHunter::new();
-        let snap = HuntSnapshot { is_kernel_zombie: true, ..base_snap() };
+        let snap = HuntSnapshot {
+            is_kernel_zombie: true,
+            ..base_snap()
+        };
         let result = hunter.evaluate(&snap);
         assert!(result.is_some());
         let dw = result.unwrap();
@@ -307,7 +310,10 @@ mod tests {
     #[test]
     fn true_zombie_fires_on_first_cycle_no_confirmation_needed() {
         let mut hunter = ZombieHunter::new();
-        let snap = HuntSnapshot { is_kernel_zombie: true, ..base_snap() };
+        let snap = HuntSnapshot {
+            is_kernel_zombie: true,
+            ..base_snap()
+        };
         // Should fire immediately — no need for 3 confirmation cycles.
         assert!(hunter.evaluate(&snap).is_some());
     }
@@ -317,7 +323,11 @@ mod tests {
     #[test]
     fn orphan_with_dead_parent_non_launchd_is_killed() {
         let mut hunter = ZombieHunter::new();
-        let snap = HuntSnapshot { parent_alive: false, ppid: 500, ..base_snap() };
+        let snap = HuntSnapshot {
+            parent_alive: false,
+            ppid: 500,
+            ..base_snap()
+        };
         let result = hunter.evaluate(&snap);
         assert!(result.is_some());
         let dw = result.unwrap();
@@ -329,12 +339,19 @@ mod tests {
     fn launchd_reparented_process_is_not_orphan() {
         // ppid == 1 means launchd adopted it — legitimate, must not be killed.
         let mut hunter = ZombieHunter::new();
-        let snap = HuntSnapshot { parent_alive: false, ppid: 1, ..base_snap() };
+        let snap = HuntSnapshot {
+            parent_alive: false,
+            ppid: 1,
+            ..base_snap()
+        };
         // Even after 3 cycles, no hard rules fire.
         for _ in 0..5 {
             let result = hunter.evaluate(&snap);
             // Soft rules also don't fire (low wakeups, small RSS, not a ghost helper).
-            assert!(result.is_none(), "launchd-adopted process should not be flagged");
+            assert!(
+                result.is_none(),
+                "launchd-adopted process should not be flagged"
+            );
         }
     }
 
@@ -401,7 +418,7 @@ mod tests {
         };
         assert!(hunter.evaluate(&snap).is_none()); // cycle 1
         assert!(hunter.evaluate(&snap).is_none()); // cycle 2
-        let result = hunter.evaluate(&snap);        // cycle 3
+        let result = hunter.evaluate(&snap); // cycle 3
         assert!(result.is_some());
         let dw = result.unwrap();
         assert_eq!(dw.zombie_class, ZombieClass::WakeupBurner);
@@ -485,12 +502,15 @@ mod tests {
         hunter.evaluate(&suspicious);
         hunter.evaluate(&suspicious);
         // Now process becomes legitimate.
-        let legitimate = HuntSnapshot { wakeups_per_sec: 1.0, ..base_snap() };
+        let legitimate = HuntSnapshot {
+            wakeups_per_sec: 1.0,
+            ..base_snap()
+        };
         assert!(hunter.evaluate(&legitimate).is_none());
         // Counter should be reset — suspicious again needs 3 more cycles to confirm.
         assert!(hunter.evaluate(&suspicious).is_none()); // cycle 1 after reset
         assert!(hunter.evaluate(&suspicious).is_none()); // cycle 2
-        let result = hunter.evaluate(&suspicious);       // cycle 3 — now confirmed
+        let result = hunter.evaluate(&suspicious); // cycle 3 — now confirmed
         assert!(result.is_some());
     }
 
@@ -500,13 +520,26 @@ mod tests {
     fn evaluate_all_returns_sorted_by_rss_descending() {
         let mut hunter = ZombieHunter::new();
         let snaps = vec![
-            HuntSnapshot { pid: 1, is_kernel_zombie: true, rss_bytes: 100 * 1024 * 1024, ..base_snap() },
-            HuntSnapshot { pid: 2, is_kernel_zombie: true, rss_bytes: 500 * 1024 * 1024, name: "bigger".to_string(), ..base_snap() },
+            HuntSnapshot {
+                pid: 1,
+                is_kernel_zombie: true,
+                rss_bytes: 100 * 1024 * 1024,
+                ..base_snap()
+            },
+            HuntSnapshot {
+                pid: 2,
+                is_kernel_zombie: true,
+                rss_bytes: 500 * 1024 * 1024,
+                name: "bigger".to_string(),
+                ..base_snap()
+            },
         ];
         let dead_weight = hunter.evaluate_all(&snaps);
         assert_eq!(dead_weight.len(), 2);
-        assert!(dead_weight[0].wasted_rss_bytes >= dead_weight[1].wasted_rss_bytes,
-            "should be sorted by RSS descending");
+        assert!(
+            dead_weight[0].wasted_rss_bytes >= dead_weight[1].wasted_rss_bytes,
+            "should be sorted by RSS descending"
+        );
     }
 
     #[test]
@@ -522,14 +555,22 @@ mod tests {
     fn total_reclaimable_bytes_sums_correctly() {
         let dead = vec![
             DeadWeightProcess {
-                pid: 1, name: "a".into(), zombie_class: ZombieClass::TrueZombie,
-                wasted_rss_bytes: 100 * 1024 * 1024, wakeups_per_sec: 0.0,
-                recommended_action: ZombieAction::Kill, reason: "".into(),
+                pid: 1,
+                name: "a".into(),
+                zombie_class: ZombieClass::TrueZombie,
+                wasted_rss_bytes: 100 * 1024 * 1024,
+                wakeups_per_sec: 0.0,
+                recommended_action: ZombieAction::Kill,
+                reason: "".into(),
             },
             DeadWeightProcess {
-                pid: 2, name: "b".into(), zombie_class: ZombieClass::MemoryHoarder,
-                wasted_rss_bytes: 200 * 1024 * 1024, wakeups_per_sec: 0.0,
-                recommended_action: ZombieAction::Suspend, reason: "".into(),
+                pid: 2,
+                name: "b".into(),
+                zombie_class: ZombieClass::MemoryHoarder,
+                wasted_rss_bytes: 200 * 1024 * 1024,
+                wakeups_per_sec: 0.0,
+                recommended_action: ZombieAction::Suspend,
+                reason: "".into(),
             },
         ];
         let total = ZombieHunter::total_reclaimable_bytes(&dead);
@@ -559,7 +600,10 @@ mod tests {
         assert!(hunter.suspicious_history.contains_key(&42));
         // Cleanup without 42 in live_pids.
         hunter.cleanup(&[1, 2, 3]);
-        assert!(!hunter.suspicious_history.contains_key(&42), "stale PID should be purged");
+        assert!(
+            !hunter.suspicious_history.contains_key(&42),
+            "stale PID should be purged"
+        );
     }
 
     #[test]
@@ -574,7 +618,10 @@ mod tests {
         };
         hunter.evaluate(&snap);
         hunter.cleanup(&[99, 100]);
-        assert!(hunter.suspicious_history.contains_key(&99), "live PID should be retained");
+        assert!(
+            hunter.suspicious_history.contains_key(&99),
+            "live PID should be retained"
+        );
     }
 
     // ── Default impl ─────────────────────────────────────────────────────────
@@ -593,18 +640,27 @@ mod tests {
     fn bench_evaluate_latency() {
         let mut hunter = ZombieHunter::new();
         let snaps: Vec<HuntSnapshot> = (0..100)
-            .map(|i| HuntSnapshot { pid: i, ..base_snap() })
+            .map(|i| HuntSnapshot {
+                pid: i,
+                ..base_snap()
+            })
             .collect();
         // Warm-up.
-        for s in &snaps { let _ = hunter.evaluate(s); }
+        for s in &snaps {
+            let _ = hunter.evaluate(s);
+        }
         let start = std::time::Instant::now();
         let n = 1000usize;
         for _ in 0..n {
-            for s in &snaps { let _ = hunter.evaluate(s); }
+            for s in &snaps {
+                let _ = hunter.evaluate(s);
+            }
         }
         let per_call_us = start.elapsed().as_secs_f64() * 1_000_000.0 / (n * snaps.len()) as f64;
         // evaluate() is pure HashMap + comparisons — should be < 10µs each.
-        assert!(per_call_us < 10.0,
-            "evaluate() too slow: {per_call_us:.2}µs/call (expected < 10µs)");
+        assert!(
+            per_call_us < 10.0,
+            "evaluate() too slow: {per_call_us:.2}µs/call (expected < 10µs)"
+        );
     }
 }

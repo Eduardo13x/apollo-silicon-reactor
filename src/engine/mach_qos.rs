@@ -162,9 +162,9 @@ mod ffi {
     /// COUNT = 4 (4 × uint32_t).
     #[repr(C)]
     pub struct ThreadTimeConstraintPolicy {
-        pub period: u32,       // nanoseconds between periods
-        pub computation: u32,  // nanoseconds of CPU per period
-        pub constraint: u32,   // maximum scheduling delay (ns)
+        pub period: u32,              // nanoseconds between periods
+        pub computation: u32,         // nanoseconds of CPU per period
+        pub constraint: u32,          // maximum scheduling delay (ns)
         pub preemptible: libc::c_int, // 0=non-preemptible, 1=preemptible
     }
 
@@ -233,10 +233,10 @@ mod ffi {
         // Used for Mach port accounting: excessive port count = IPC leak.
         pub fn mach_port_names(
             target_task: MachPortT,
-            names:       *mut *mut MachPortT,
-            names_cnt:   *mut MachMsgTypeNumberT,
-            types:       *mut *mut MachMsgTypeNumberT,
-            types_cnt:   *mut MachMsgTypeNumberT,
+            names: *mut *mut MachPortT,
+            names_cnt: *mut MachMsgTypeNumberT,
+            types: *mut *mut MachMsgTypeNumberT,
+            types_cnt: *mut MachMsgTypeNumberT,
         ) -> KernReturnT;
     }
 }
@@ -1013,10 +1013,10 @@ impl MachQoSManager {
             // Apply RT constraint to thread 0 (main/UI thread).
             let main_thread = *thread_list;
             let policy = ThreadTimeConstraintPolicy {
-                period: 10_000_000,      // 10 ms
-                computation: 2_000_000,  // 2 ms guaranteed per period
-                constraint: 5_000_000,   // must be scheduled within 5 ms
-                preemptible: 1,          // allow preemption (safe)
+                period: 10_000_000,     // 10 ms
+                computation: 2_000_000, // 2 ms guaranteed per period
+                constraint: 5_000_000,  // must be scheduled within 5 ms
+                preemptible: 1,         // allow preemption (safe)
             };
             let kr3 = thread_policy_set(
                 main_thread,
@@ -1407,8 +1407,9 @@ pub fn batch_mach_port_counts() -> Vec<(i32, u32)> {
         let mut types: *mut MachMsgTypeNumberT = std::ptr::null_mut();
         let mut types_cnt: MachMsgTypeNumberT = 0;
 
-        let kr =
-            unsafe { mach_port_names(task, &mut names, &mut names_cnt, &mut types, &mut types_cnt) };
+        let kr = unsafe {
+            mach_port_names(task, &mut names, &mut names_cnt, &mut types, &mut types_cnt)
+        };
 
         if kr == KERN_SUCCESS {
             // Free the kernel-allocated arrays.
@@ -1504,7 +1505,8 @@ mod tests {
     #[test]
     fn thread_basic_info_count_is_10() {
         assert_eq!(
-            mach_sys::THREAD_BASIC_INFO_COUNT, 10,
+            mach_sys::THREAD_BASIC_INFO_COUNT,
+            10,
             "THREAD_BASIC_INFO_COUNT must equal 10 to match the kernel ABI"
         );
     }

@@ -188,7 +188,10 @@ impl AdversarialProbe {
     ///
     /// `would_freeze_fn`: closure that returns true if the system would freeze
     /// a process with the given name at the given pressure/p_oom.
-    pub fn probe_no_freeze_protected<F>(scenario: &SyntheticScenario, would_freeze_fn: F) -> ProbeResult
+    pub fn probe_no_freeze_protected<F>(
+        scenario: &SyntheticScenario,
+        would_freeze_fn: F,
+    ) -> ProbeResult
     where
         F: Fn(&str, f32, f32) -> bool,
     {
@@ -253,7 +256,10 @@ impl AdversarialProbe {
         }
         // Phase 2: inject sudden regime change with HIGH arousal (crisis salience)
         // High arousal = 4× evidence weight → larger frequency shifts per observation
-        let crisis = Salience { arousal: 0.95, valence: -0.8 };
+        let crisis = Salience {
+            arousal: 0.95,
+            valence: -0.8,
+        };
         for _ in 0..15 {
             detector.observe_salient("proc_a", false, crisis);
             detector.observe_salient("proc_b", false, crisis);
@@ -364,10 +370,22 @@ mod tests {
     fn test_generate_scenarios() {
         let scenarios = AdversarialProbe::generate_scenarios();
         assert_eq!(scenarios.len(), 4);
-        assert_eq!(scenarios[0].expectation, ProbeExpectation::NoFreezeProtected);
-        assert_eq!(scenarios[1].expectation, ProbeExpectation::SafetyFloorRespected);
-        assert_eq!(scenarios[2].expectation, ProbeExpectation::NarsDriftRecovery);
-        assert_eq!(scenarios[3].expectation, ProbeExpectation::EpistemicBlocksAggressive);
+        assert_eq!(
+            scenarios[0].expectation,
+            ProbeExpectation::NoFreezeProtected
+        );
+        assert_eq!(
+            scenarios[1].expectation,
+            ProbeExpectation::SafetyFloorRespected
+        );
+        assert_eq!(
+            scenarios[2].expectation,
+            ProbeExpectation::NarsDriftRecovery
+        );
+        assert_eq!(
+            scenarios[3].expectation,
+            ProbeExpectation::EpistemicBlocksAggressive
+        );
     }
 
     #[test]
@@ -414,7 +432,11 @@ mod tests {
     #[test]
     fn test_nars_drift_recovery() {
         let result = AdversarialProbe::probe_nars_recovery(20);
-        assert!(result.passed, "Should detect and recover: {}", result.description);
+        assert!(
+            result.passed,
+            "Should detect and recover: {}",
+            result.description
+        );
     }
 
     #[test]
@@ -437,9 +459,24 @@ mod tests {
     fn test_record_results_updates_pass_rate() {
         let mut ap = AdversarialProbe::new();
         let results = vec![
-            ProbeResult { expectation: ProbeExpectation::NoFreezeProtected, passed: true, description: String::new(), cycle: 500 },
-            ProbeResult { expectation: ProbeExpectation::SafetyFloorRespected, passed: true, description: String::new(), cycle: 500 },
-            ProbeResult { expectation: ProbeExpectation::NarsDriftRecovery, passed: false, description: "drift".into(), cycle: 500 },
+            ProbeResult {
+                expectation: ProbeExpectation::NoFreezeProtected,
+                passed: true,
+                description: String::new(),
+                cycle: 500,
+            },
+            ProbeResult {
+                expectation: ProbeExpectation::SafetyFloorRespected,
+                passed: true,
+                description: String::new(),
+                cycle: 500,
+            },
+            ProbeResult {
+                expectation: ProbeExpectation::NarsDriftRecovery,
+                passed: false,
+                description: "drift".into(),
+                cycle: 500,
+            },
         ];
         ap.record_results(results, 500);
         assert_eq!(ap.total_probes, 3);
@@ -453,9 +490,12 @@ mod tests {
         let mut ap = AdversarialProbe::new();
         // Many failures → low pass rate → alert
         for batch in 0..20 {
-            let results = vec![
-                ProbeResult { expectation: ProbeExpectation::NoFreezeProtected, passed: false, description: "fail".into(), cycle: batch * 500 },
-            ];
+            let results = vec![ProbeResult {
+                expectation: ProbeExpectation::NoFreezeProtected,
+                passed: false,
+                description: "fail".into(),
+                cycle: batch * 500,
+            }];
             ap.record_results(results, batch * 500);
         }
         assert!(ap.safety_alert, "Many failures → safety alert");
@@ -481,8 +521,18 @@ mod tests {
         let mut ap = AdversarialProbe::new();
         assert_eq!(ap.lifetime_pass_rate(), 1.0);
         let results = vec![
-            ProbeResult { expectation: ProbeExpectation::NoFreezeProtected, passed: true, description: String::new(), cycle: 1 },
-            ProbeResult { expectation: ProbeExpectation::SafetyFloorRespected, passed: false, description: String::new(), cycle: 1 },
+            ProbeResult {
+                expectation: ProbeExpectation::NoFreezeProtected,
+                passed: true,
+                description: String::new(),
+                cycle: 1,
+            },
+            ProbeResult {
+                expectation: ProbeExpectation::SafetyFloorRespected,
+                passed: false,
+                description: String::new(),
+                cycle: 1,
+            },
         ];
         ap.record_results(results, 1);
         assert!((ap.lifetime_pass_rate() - 0.5).abs() < 0.001);

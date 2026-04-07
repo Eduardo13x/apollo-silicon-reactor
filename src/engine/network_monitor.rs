@@ -5,8 +5,8 @@
 //! per-tick deltas and exposes EMA-smoothed rates for use by the sysctl
 //! governor.
 
-use std::collections::VecDeque;
 use crate::engine::sysctl_direct;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 // ── Public types ─────────────────────────────────────────────────────────────

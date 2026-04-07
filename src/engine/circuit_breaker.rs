@@ -116,18 +116,16 @@ impl CircuitBreaker {
                 self.rejected_total += 1;
                 return Err(CircuitError::Open);
             }
-            CircuitState::Closed | CircuitState::HalfOpen => {
-                match f() {
-                    Ok(v) => {
-                        self.record_success();
-                        Ok(v)
-                    }
-                    Err(e) => {
-                        self.record_failure();
-                        Err(CircuitError::Inner(e))
-                    }
+            CircuitState::Closed | CircuitState::HalfOpen => match f() {
+                Ok(v) => {
+                    self.record_success();
+                    Ok(v)
                 }
-            }
+                Err(e) => {
+                    self.record_failure();
+                    Err(CircuitError::Inner(e))
+                }
+            },
         }
     }
 
@@ -194,10 +192,7 @@ impl CircuitBreaker {
         self.opened_at = Some(at);
         self.half_open_successes = 0;
         self.trips_total += 1;
-        tracing::warn!(
-            trips = self.trips_total,
-            "circuit-breaker: tripped → Open"
-        );
+        tracing::warn!(trips = self.trips_total, "circuit-breaker: tripped → Open");
     }
 
     fn close(&mut self) {
@@ -215,7 +210,9 @@ impl CircuitBreaker {
                 if opened_at.elapsed() >= self.timeout {
                     self.state = CircuitState::HalfOpen;
                     self.half_open_successes = 0;
-                    tracing::info!("circuit-breaker: timeout elapsed → HalfOpen (testing recovery)");
+                    tracing::info!(
+                        "circuit-breaker: timeout elapsed → HalfOpen (testing recovery)"
+                    );
                 }
             }
         }

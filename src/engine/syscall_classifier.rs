@@ -173,13 +173,7 @@ impl SyscallClassifier {
 mod tests {
     use super::*;
 
-    fn make_delta(
-        unix: u64,
-        mach: u64,
-        csw: u64,
-        faults: u64,
-        pageins: u64,
-    ) -> SyscallSnapshot {
+    fn make_delta(unix: u64, mach: u64, csw: u64, faults: u64, pageins: u64) -> SyscallSnapshot {
         SyscallSnapshot {
             unix_calls: unix,
             mach_calls: mach,
@@ -206,14 +200,20 @@ mod tests {
     fn classify_jit_high_faults_and_csw() {
         // fault_rate = 500 / (100 + 50 + 1) ≈ 3.3 > 0.1, csw=200 > 50
         let d = make_delta(100, 50, 200, 500, 10);
-        assert_eq!(SyscallClassifier::classify(&d), SyscallProfile::JitCompiling);
+        assert_eq!(
+            SyscallClassifier::classify(&d),
+            SyscallProfile::JitCompiling
+        );
     }
 
     #[test]
     fn classify_jit_boundary_exact() {
         // fault_rate = 12 / (100 + 1 + 1) ≈ 0.117 > 0.1, csw=51 > 50
         let d = make_delta(100, 1, 51, 12, 0);
-        assert_eq!(SyscallClassifier::classify(&d), SyscallProfile::JitCompiling);
+        assert_eq!(
+            SyscallClassifier::classify(&d),
+            SyscallProfile::JitCompiling
+        );
     }
 
     #[test]
@@ -253,7 +253,10 @@ mod tests {
         let first = cls.sample(pid);
         // Either None (first observation) or None (no permission) — not a profile.
         // We can't assert Some here because on first call it's always None.
-        assert!(first.is_none(), "first sample must return None (no baseline yet)");
+        assert!(
+            first.is_none(),
+            "first sample must return None (no baseline yet)"
+        );
     }
 
     #[test]
@@ -291,7 +294,10 @@ mod tests {
         cls.evict_stale(&[1001, 1003]);
 
         assert!(cls.prev.contains_key(&1001));
-        assert!(!cls.prev.contains_key(&1002), "1002 should have been evicted");
+        assert!(
+            !cls.prev.contains_key(&1002),
+            "1002 should have been evicted"
+        );
         assert!(cls.prev.contains_key(&1003));
     }
 }

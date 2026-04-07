@@ -161,7 +161,11 @@ pub struct AisInput {
 impl AisInput {
     /// Effective RAM for normalization: falls back to 8 GB (M1 baseline) when not set.
     pub fn effective_ram_gb(&self) -> u32 {
-        if self.hardware_memory_gb == 0 { 8 } else { self.hardware_memory_gb }
+        if self.hardware_memory_gb == 0 {
+            8
+        } else {
+            self.hardware_memory_gb
+        }
     }
 
     /// Recommended `rl_max_ticks` for this hardware.
@@ -287,7 +291,11 @@ fn signal_quality(input: &AisInput) -> f64 {
     } else {
         // Fixed-threshold fallback for simulation mode.
         // Nominal: Riccati ≈ 0.0884. High-pressure (≥0.70): Riccati ≈ 0.12 (10% margin).
-        let kalman_threshold = if input.current_pressure >= 0.70 { 0.12 } else { 0.088_4 };
+        let kalman_threshold = if input.current_pressure >= 0.70 {
+            0.12
+        } else {
+            0.088_4
+        };
         1.0 / (1.0 + (input.kalman_rmse / kalman_threshold).powi(2))
     };
 
@@ -296,7 +304,9 @@ fn signal_quality(input: &AisInput) -> f64 {
     // is worse than a false alarm (false positive). β=2 weights recall 4× more.
     let cusum_tp = input.cusum_true_positives as f64;
     let cusum_fp = input.cusum_false_positives as f64;
-    let cusum_fn = (input.cusum_actual_shifts.saturating_sub(input.cusum_true_positives)) as f64;
+    let cusum_fn = (input
+        .cusum_actual_shifts
+        .saturating_sub(input.cusum_true_positives)) as f64;
     let cusum_precision = if cusum_tp + cusum_fp > 0.0 {
         cusum_tp / (cusum_tp + cusum_fp)
     } else {
@@ -397,7 +407,11 @@ fn resource_efficiency(input: &AisInput) -> f64 {
     // the operating regime. Under thermal constraint, 130ms is the correct
     // budget for a daemon doing full-scan on all subsystems.
     // Target: 100ms nominal, 130ms under high pressure (≥0.70).
-    let cycle_target = if input.current_pressure >= 0.70 { 130.0 } else { 100.0 };
+    let cycle_target = if input.current_pressure >= 0.70 {
+        130.0
+    } else {
+        100.0
+    };
     let cycle_score = 1.0 / (1.0 + (input.p95_cycle_ms / cycle_target).powi(3));
 
     // Cognitive budget: contextualized by current system pressure.
@@ -494,8 +508,7 @@ fn adaptability(input: &AisInput) -> f64 {
         safe_ratio_u32(input.correct_profile_switches, input.total_profile_switches);
     let workload_accuracy =
         safe_ratio_u32(input.correct_workload_class, input.total_workload_class);
-    let regime_detection =
-        safe_ratio_u32(input.regime_shifts_detected, input.regime_shifts_total);
+    let regime_detection = safe_ratio_u32(input.regime_shifts_detected, input.regime_shifts_total);
 
     (0.30 * profile_accuracy + 0.40 * workload_accuracy + 0.30 * regime_detection).clamp(0.0, 1.0)
 }
@@ -572,17 +585,26 @@ mod tests {
         };
         let rm: serde_json::Value = match serde_json::from_str(&rm_raw) {
             Ok(v) => v,
-            Err(e) => { println!("AIS runtime: parse error: {e}"); return; }
+            Err(e) => {
+                println!("AIS runtime: parse error: {e}");
+                return;
+            }
         };
 
-        let ls_raw = std::fs::read_to_string("/var/lib/apollo/learned_state.json").unwrap_or_default();
-        let ls: serde_json::Value = serde_json::from_str(&ls_raw).unwrap_or(serde_json::Value::Null);
+        let ls_raw =
+            std::fs::read_to_string("/var/lib/apollo/learned_state.json").unwrap_or_default();
+        let ls: serde_json::Value =
+            serde_json::from_str(&ls_raw).unwrap_or(serde_json::Value::Null);
 
-        let rl_raw = std::fs::read_to_string("/var/lib/apollo/rl_threshold.json").unwrap_or_default();
-        let rl: serde_json::Value = serde_json::from_str(&rl_raw).unwrap_or(serde_json::Value::Null);
+        let rl_raw =
+            std::fs::read_to_string("/var/lib/apollo/rl_threshold.json").unwrap_or_default();
+        let rl: serde_json::Value =
+            serde_json::from_str(&rl_raw).unwrap_or(serde_json::Value::Null);
 
-        let sk_raw = std::fs::read_to_string("/var/lib/apollo/optimization_skills.json").unwrap_or_default();
-        let sk: serde_json::Value = serde_json::from_str(&sk_raw).unwrap_or(serde_json::Value::Object(Default::default()));
+        let sk_raw =
+            std::fs::read_to_string("/var/lib/apollo/optimization_skills.json").unwrap_or_default();
+        let sk: serde_json::Value =
+            serde_json::from_str(&sk_raw).unwrap_or(serde_json::Value::Object(Default::default()));
 
         // ── Helpers ─────────────────────────────────────────────────────────
         let rm_u = |key: &str| rm[key].as_u64().unwrap_or(0);
@@ -592,23 +614,33 @@ mod tests {
         // bps_protected = processes that scored above BPS threshold (all preserved).
         // protected_preserved / protected_total = 1.0 (every protected process was kept).
         let bps_protected = rm_u("bps_protected");
-        let throttles     = rm_u("throttles_applied");
-        let reverted      = rm_u("throttle_reverted");
-        let boosts        = rm_u("boosts_applied");
+        let throttles = rm_u("throttles_applied");
+        let reverted = rm_u("throttle_reverted");
+        let boosts = rm_u("boosts_applied");
 
         // ── D2: Signal Quality ───────────────────────────────────────────────
         // Kalman RMSE: sqrt(posterior covariance p00) ≈ steady-state tracking uncertainty.
-        let kf_p00 = ls["signal_intelligence"]["kf_pressure"]["p00"].as_f64().unwrap_or(0.05_f64.powi(2));
+        let kf_p00 = ls["signal_intelligence"]["kf_pressure"]["p00"]
+            .as_f64()
+            .unwrap_or(0.05_f64.powi(2));
         let kalman_rmse = kf_p00.sqrt();
 
         // Riccati steady-state RMSE: theoretical minimum for the IPC-modulated noise level.
         // [Kalman 1960]: P* = (-Q + √(Q²+4QR)) / 2. When actual RMSE ≤ P*, filter is optimal.
         // Q=0.005 (stored in learned_state). R_eff = R_base × clamp(IPC/1.0, 0.5, 2.0).
         // R_base = 0.02 (stored in kf_pressure as "r", or default). IPC from runtime_metrics.
-        let kalman_q = ls["signal_intelligence"]["kf_pressure"]["q"].as_f64().unwrap_or(0.005);
-        let kalman_r_base = ls["signal_intelligence"]["kf_pressure"]["r"].as_f64().unwrap_or(0.02);
+        let kalman_q = ls["signal_intelligence"]["kf_pressure"]["q"]
+            .as_f64()
+            .unwrap_or(0.005);
+        let kalman_r_base = ls["signal_intelligence"]["kf_pressure"]["r"]
+            .as_f64()
+            .unwrap_or(0.02);
         let kpc_ipc = rm_f("daemon_cycle_ipc");
-        let ipc_scale = if kpc_ipc > 0.0 { (kpc_ipc / 1.0_f64).clamp(0.5, 2.0) } else { 1.0 };
+        let ipc_scale = if kpc_ipc > 0.0 {
+            (kpc_ipc / 1.0_f64).clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
         let kalman_r_eff = kalman_r_base * ipc_scale;
         // Riccati: P* = (-Q + √(Q²+4QR)) / 2
         let kalman_riccati_floor = {
@@ -626,7 +658,9 @@ mod tests {
         // Beta from learned_state: [memory_pressure, pressure_velocity, swap_ratio, compressor].
         let hazard_err = {
             let beta_arr = &ls["signal_intelligence"]["hazard"]["beta"];
-            let base_rate = ls["signal_intelligence"]["hazard"]["base_rate"].as_f64().unwrap_or(0.0003);
+            let base_rate = ls["signal_intelligence"]["hazard"]["base_rate"]
+                .as_f64()
+                .unwrap_or(0.0003);
             let b = [
                 beta_arr[0].as_f64().unwrap_or(5.0),
                 beta_arr[1].as_f64().unwrap_or(0.0),
@@ -644,12 +678,19 @@ mod tests {
             // Features: [memory_pressure, velocity, swap_ratio, compressor].
             // Correlation: swap ≈ 0.70*pressure, compressor ≈ 0.70*pressure (empirical).
             let test_pressures = [0.10f64, 0.25, 0.40, 0.55, 0.70, 0.85];
-            let p_ooms: Vec<f64> = test_pressures.iter().map(|&p| {
-                let features = [p, p * 0.008, p * 0.70, p * 0.70];
-                let dot = b.iter().zip(features.iter()).map(|(bi, xi)| bi * xi).sum::<f64>();
-                let h = base_rate * dot.clamp(-10.0, 10.0).exp();
-                1.0 - (-h * 30.0).exp()
-            }).collect();
+            let p_ooms: Vec<f64> = test_pressures
+                .iter()
+                .map(|&p| {
+                    let features = [p, p * 0.008, p * 0.70, p * 0.70];
+                    let dot = b
+                        .iter()
+                        .zip(features.iter())
+                        .map(|(bi, xi)| bi * xi)
+                        .sum::<f64>();
+                    let h = base_rate * dot.clamp(-10.0, 10.0).exp();
+                    1.0 - (-h * 30.0).exp()
+                })
+                .collect();
             let pairs = (test_pressures.len() - 1) as f64;
             // Strict inversion: ties (p_oom[i] == p_oom[i+1]) at saturation are correct
             // ordering (both "will die") — not a calibration error. Use `>` not `>=`.
@@ -669,7 +710,7 @@ mod tests {
         // independent observations, type-II error probability < 0.01 → TPR floor ≥ 0.90.
         let pb_warm = rm_u("process_baseline_warm");
         let pb_floor = if pb_warm == 0 {
-            0.5  // No coverage yet — pure neutral prior
+            0.5 // No coverage yet — pure neutral prior
         } else {
             // Two-tier scaling:
             //   0 warm→0.50, ≥30 warm→0.80 (primary: enough for AUC ≥ 0.85 [Davis 2006])
@@ -688,7 +729,11 @@ mod tests {
         // RL: Q-variance from real Q-table (non-zero entries).
         let rl_q_variance = {
             if let Some(arr) = rl["q_table"].as_array() {
-                let nz: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).filter(|&x| x != 0.0).collect();
+                let nz: Vec<f64> = arr
+                    .iter()
+                    .filter_map(|v| v.as_f64())
+                    .filter(|&x| x != 0.0)
+                    .collect();
                 if nz.is_empty() {
                     0.0
                 } else {
@@ -713,16 +758,23 @@ mod tests {
         let (causal_solid, causal_weak, causal_total) = {
             let weights = &ls["outcome_tracker"]["weights"];
             if let Some(obj) = weights.as_object() {
-                let mut solid = 0u32; let mut weak = 0u32; let mut ambiguous = 0u32; let mut total = 0u32;
+                let mut solid = 0u32;
+                let mut weak = 0u32;
+                let mut ambiguous = 0u32;
+                let mut total = 0u32;
                 for v in obj.values() {
                     let tc = v["throttle_count"].as_u64().unwrap_or(0);
                     let ec = v["effective_count"].as_u64().unwrap_or(0);
                     if tc > 0 {
                         total += 1;
                         let ratio = ec as f64 / tc as f64;
-                        if ratio > 0.50 { solid += 1; }
-                        else if ratio < 0.25 { weak += 1; }
-                        else { ambiguous += 1; } // 0.25–0.50: partial knowledge
+                        if ratio > 0.50 {
+                            solid += 1;
+                        } else if ratio < 0.25 {
+                            weak += 1;
+                        } else {
+                            ambiguous += 1;
+                        } // 0.25–0.50: partial knowledge
                     }
                 }
                 // 3/4 credit for ambiguous edges: classifying effectiveness in [0.25, 0.50]
@@ -742,17 +794,22 @@ mod tests {
         let (reliable_skills, total_skills) = {
             if let Some(obj) = sk.as_object() {
                 let total = obj.len() as u32;
-                let reliable = obj.values().filter(|v| {
-                    v["apply_count"].as_u64().unwrap_or(0) >= 5
-                        && v["success_rate"].as_f64().unwrap_or(0.0) >= 0.60
-                }).count() as u32;
+                let reliable = obj
+                    .values()
+                    .filter(|v| {
+                        v["apply_count"].as_u64().unwrap_or(0) >= 5
+                            && v["success_rate"].as_f64().unwrap_or(0.0) >= 0.60
+                    })
+                    .count() as u32;
                 (reliable, total)
             } else {
                 (0, 0)
             }
         };
         let experience_records = ls["outcome_tracker"]["experience_records"]
-            .as_array().map(|a| a.len()).unwrap_or(0) as u32;
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0) as u32;
         let dyna_transitions = rm_f("predictive_agent_cycles") as u64;
 
         // ── D4: Resource Efficiency ──────────────────────────────────────────
@@ -787,31 +844,35 @@ mod tests {
         // Habituation: no runtime counter yet — bps_protected ≠ habituation.
         // habituation_skips will be wired in a future commit after types.rs is extended.
         let habituation_skips = rm_u("habituation_skips");
-        let process_evals     = rm_u("bps_evaluated");
-        let current_pressure  = rm_f("si_pressure_smooth");
+        let process_evals = rm_u("bps_evaluated");
+        let current_pressure = rm_f("si_pressure_smooth");
 
         // ── D5: Safety ───────────────────────────────────────────────────────
-        let kills_applied      = rm_u("kills_applied") as u32;
+        let kills_applied = rm_u("kills_applied") as u32;
         let survival_activations = rm_u("survival_mode_activations") as u32;
-        let failures           = rm_u("failures") as u32;
+        let failures = rm_u("failures") as u32;
         let overflow_events_7d = rm_u("overflow_events_7d") as u32;
 
         // ── D6: Adaptability ─────────────────────────────────────────────────
         let profile_switches = rm_u("profile_switches") as u32;
-        let workload_correct = if rm["current_workload"].is_string() { 1u32 } else { 0u32 };
+        let workload_correct = if rm["current_workload"].is_string() {
+            1u32
+        } else {
+            0u32
+        };
 
         // ── Build AisInput ───────────────────────────────────────────────────
         let input = AisInput {
             // D1: protected_preserved = bps_protected (all scored-protected processes
             // were correctly kept). noise/interactive treated as fully correct.
-            total_decisions:     throttles + boosts + bps_protected,
-            correct_decisions:   throttles - reverted + boosts + bps_protected,
+            total_decisions: throttles + boosts + bps_protected,
+            correct_decisions: throttles - reverted + boosts + bps_protected,
             protected_preserved: bps_protected,
-            protected_total:     bps_protected,
-            noise_throttled:     throttles.saturating_sub(reverted),
-            noise_total:         throttles,
+            protected_total: bps_protected,
+            noise_throttled: throttles.saturating_sub(reverted),
+            noise_total: throttles,
             interactive_boosted: boosts,
-            interactive_total:   boosts,
+            interactive_total: boosts,
 
             // D2
             kalman_rmse,
@@ -838,7 +899,7 @@ mod tests {
             rl_max_ticks,
             rl_total_ticks,
             causal_solid_edges: causal_solid,
-            causal_weak_edges:  causal_weak,
+            causal_weak_edges: causal_weak,
             causal_total_edges: causal_total,
             reliable_skills,
             total_skills,
@@ -863,13 +924,13 @@ mod tests {
 
             // D6
             correct_profile_switches: profile_switches,
-            total_profile_switches:   profile_switches,
-            correct_workload_class:   workload_correct,
-            total_workload_class:     1,
-            regime_shifts_detected:   regime_shifts,
+            total_profile_switches: profile_switches,
+            correct_workload_class: workload_correct,
+            total_workload_class: 1,
+            regime_shifts_detected: regime_shifts,
             // 5% miss buffer: consistent with CUSUM buffer (recalibrated, see D2 comment).
             // [Kenett & Thyregod 2006] SPC §7.3 — buffer = 95th pct detection lag boundary.
-            regime_shifts_total:      (regime_shifts.saturating_add(regime_shifts / 20)).max(1),
+            regime_shifts_total: (regime_shifts.saturating_add(regime_shifts / 20)).max(1),
 
             hardware_cores: 8,
             hardware_memory_gb: 8,
@@ -892,7 +953,8 @@ mod tests {
         // Floor = 90.0 (locks in 7-iteration Darwinian evolution gains post-process_baseline).
         // Calibration: adaptive D1/D2/D4/D5 formulas; 90+ S-tier under nominal+thermal load.
         // ±3pt noise tolerance for Kalman RMSE variance and fresh-restart warmup lag.
-        assert!(score.total >= 90.0,
+        assert!(
+            score.total >= 90.0,
             "AIS runtime {:.1} < 90.0 — regression detected (S-tier floor after evolution). \
              Dims: D={:.0}% S={:.0}% L={:.0}% R={:.0}% Sf={:.0}% A={:.0}%",
             score.total,
@@ -983,9 +1045,9 @@ mod tests {
             regime_shifts_total: signal.3,    // actual shifts in simulation
             hardware_cores: 8,
             hardware_memory_gb: 8,
-            rl_total_ticks: 0,          // simulation mode: use convergence_ticks
-            current_pressure: 0.0,      // simulation mode: use skip-rate formula
-            kalman_riccati_rmse: 0.0,   // simulation mode: use fixed pressure-based thresholds
+            rl_total_ticks: 0,        // simulation mode: use convergence_ticks
+            current_pressure: 0.0,    // simulation mode: use skip-rate formula
+            kalman_riccati_rmse: 0.0, // simulation mode: use fixed pressure-based thresholds
         };
 
         let score = compute_ais(&input);
@@ -1030,8 +1092,8 @@ mod tests {
         // Deterministic noise pattern — amplitude ±0.02 matches real daemon
         // memory_pressure variance (measured: σ ≈ 0.015 from daemon cycle data).
         let noise = [
-            0.010, -0.015, 0.005, -0.010, 0.020, -0.005, 0.015, -0.020, 0.010, -0.010,
-            0.005, -0.015, 0.010, -0.005, 0.020, -0.010, 0.015, -0.015, 0.005, -0.020,
+            0.010, -0.015, 0.005, -0.010, 0.020, -0.005, 0.015, -0.020, 0.010, -0.010, 0.005,
+            -0.015, 0.010, -0.005, 0.020, -0.010, 0.015, -0.015, 0.005, -0.020,
         ];
 
         for (i, &true_val) in true_signal.iter().enumerate() {
@@ -1145,9 +1207,9 @@ mod tests {
         // Simulate: RL learns to lower action threshold → acts sooner → prevents overflow.
         // Realistic pressure: mostly 0.50, spikes to 0.85 normally, occasional 0.95 spikes.
         // RL adjustment (negative) → lowers threshold → catches more spikes.
-        let system_limit = 0.88;       // overflow point (8GB M1 under load)
-        let action_normal = 0.08;      // normal freeze: ~8pp reduction
-        let action_emergency = 0.15;   // emergency multi-freeze: ~15pp reduction (pressure > 0.95)
+        let system_limit = 0.88; // overflow point (8GB M1 under load)
+        let action_normal = 0.08; // normal freeze: ~8pp reduction
+        let action_emergency = 0.15; // emergency multi-freeze: ~15pp reduction (pressure > 0.95)
         let mut last_adj = 0.0;
         for tick in 0..max_ticks {
             // Deterministic pressure pattern with occasional severe spikes
@@ -1163,8 +1225,8 @@ mod tests {
             let rl_acted = pressure > effective_action_th;
             let action_effect = if rl_acted && pressure > 0.95 && tick > 30 {
                 action_emergency // daemon freezes multiple processes at critical pressure.
-                                // ZeroTune pre-seeds critical band from tick 0, so only
-                                // a short warmup (30 ticks ≈ 2.5 min) is needed.
+                                 // ZeroTune pre-seeds critical band from tick 0, so only
+                                 // a short warmup (30 ticks ≈ 2.5 min) is needed.
             } else {
                 action_normal
             };
@@ -1210,7 +1272,7 @@ mod tests {
         // Causal Graph: simulate 100 action-outcome pairs
         let mut cg = CausalGraph::new();
         let actions = [
-            ("throttle:Dropbox", true, 0.8),   // effective 80%
+            ("throttle:Dropbox", true, 0.8),    // effective 80%
             ("throttle:cloudd", true, 0.6),     // effective 60%
             ("throttle:Safari", false, 0.3),    // rarely effective
             ("throttle:contactsd", false, 0.1), // almost never effective
@@ -1304,7 +1366,9 @@ mod tests {
         // Simulate 100 cycles of signal processing
         let mut kf = Kalman1D::new(0.005, 0.02);
         let mut cusum = Cusum::new(0.50, 0.02, 0.12);
-        let noise = [0.02, -0.03, 0.01, -0.02, 0.04, -0.01, 0.03, -0.04, 0.02, -0.02];
+        let noise = [
+            0.02, -0.03, 0.01, -0.02, 0.04, -0.01, 0.03, -0.04, 0.02, -0.02,
+        ];
 
         for i in 0..100 {
             let pressure = 0.60 + noise[i % noise.len()];
@@ -1313,7 +1377,8 @@ mod tests {
         }
 
         // Simulate RL ticks
-        let mut rl = RlThresholdAgent::load_or_default(std::path::Path::new("/tmp/ais_sim_res.json"));
+        let mut rl =
+            RlThresholdAgent::load_or_default(std::path::Path::new("/tmp/ais_sim_res.json"));
         for _ in 0..100 {
             let state = RlState::from_metrics(0.60, 0.3, 0);
             rl.tick(state, false);
@@ -1377,9 +1442,9 @@ mod tests {
     // ── Workload Classification Simulation ──────────────────────────────
     // Returns: (correct, total)
     fn sim_workload_classification() -> (u32, u32) {
-        use std::collections::HashMap;
         use crate::engine::user_profile::{AppStats, HourProfile, WorkloadType};
         use crate::engine::workload_classifier::WorkloadClassifier;
+        use std::collections::HashMap;
 
         let classifier = WorkloadClassifier::default();
         let empty_hours: [HourProfile; 24] = std::array::from_fn(|_| HashMap::new());
@@ -1388,25 +1453,65 @@ mod tests {
         // Test vectors: (foreground_app, process_names, expected_workload)
         let cases: Vec<(Option<&str>, Vec<&str>, WorkloadType)> = vec![
             // Clear coding
-            (Some("Cursor"), vec!["Cursor", "cargo", "rustc", "git"], WorkloadType::Coding),
+            (
+                Some("Cursor"),
+                vec!["Cursor", "cargo", "rustc", "git"],
+                WorkloadType::Coding,
+            ),
             // Clear video call
-            (Some("zoom.us"), vec!["zoom.us", "coreaudiod"], WorkloadType::VideoCall),
+            (
+                Some("zoom.us"),
+                vec!["zoom.us", "coreaudiod"],
+                WorkloadType::VideoCall,
+            ),
             // Clear media
-            (Some("Spotify"), vec!["Spotify", "coreaudiod"], WorkloadType::MediaPlayback),
+            (
+                Some("Spotify"),
+                vec!["Spotify", "coreaudiod"],
+                WorkloadType::MediaPlayback,
+            ),
             // Clear video edit
-            (Some("Final Cut Pro"), vec!["Final Cut", "compressor"], WorkloadType::VideoEdit),
+            (
+                Some("Final Cut Pro"),
+                vec!["Final Cut", "compressor"],
+                WorkloadType::VideoEdit,
+            ),
             // Clear office
-            (Some("Mail"), vec!["Mail", "Calendar", "Notes"], WorkloadType::OfficeWork),
+            (
+                Some("Mail"),
+                vec!["Mail", "Calendar", "Notes"],
+                WorkloadType::OfficeWork,
+            ),
             // Build-heavy coding
-            (Some("VSCode"), vec!["VSCode", "cargo", "rustc", "clang", "make"], WorkloadType::Coding),
+            (
+                Some("VSCode"),
+                vec!["VSCode", "cargo", "rustc", "clang", "make"],
+                WorkloadType::Coding,
+            ),
             // Browser in office context
-            (Some("Safari"), vec!["Safari", "Mail", "Calendar"], WorkloadType::OfficeWork),
+            (
+                Some("Safari"),
+                vec!["Safari", "Mail", "Calendar"],
+                WorkloadType::OfficeWork,
+            ),
             // Terminal coding
-            (Some("Terminal"), vec!["cargo", "rustc", "git", "nvim"], WorkloadType::Coding),
+            (
+                Some("Terminal"),
+                vec!["cargo", "rustc", "git", "nvim"],
+                WorkloadType::Coding,
+            ),
             // Media via VLC
-            (Some("VLC"), vec!["VLC", "coreaudiod"], WorkloadType::MediaPlayback),
+            (
+                Some("VLC"),
+                vec!["VLC", "coreaudiod"],
+                WorkloadType::MediaPlayback,
+            ),
             // Teams call
-            (Some("Teams"), vec!["Teams", "coreaudiod", "Slack"], WorkloadType::VideoCall),
+            (
+                Some("Teams"),
+                vec!["Teams", "coreaudiod", "Slack"],
+                WorkloadType::VideoCall,
+            ),
         ];
 
         let total = cases.len() as u32;
@@ -1426,18 +1531,50 @@ mod tests {
 
     #[test]
     fn test_hardware_normalization_helpers() {
-        let m1_8gb = AisInput { hardware_memory_gb: 8, ..Default::default() };
-        assert_eq!(m1_8gb.recommended_rl_max_ticks(), 500, "M1 8GB baseline = 500 ticks");
+        let m1_8gb = AisInput {
+            hardware_memory_gb: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            m1_8gb.recommended_rl_max_ticks(),
+            500,
+            "M1 8GB baseline = 500 ticks"
+        );
 
-        let mac_16gb = AisInput { hardware_memory_gb: 16, ..Default::default() };
-        assert_eq!(mac_16gb.recommended_rl_max_ticks(), 1000, "16GB → 1000 ticks (2× baseline)");
+        let mac_16gb = AisInput {
+            hardware_memory_gb: 16,
+            ..Default::default()
+        };
+        assert_eq!(
+            mac_16gb.recommended_rl_max_ticks(),
+            1000,
+            "16GB → 1000 ticks (2× baseline)"
+        );
 
-        let mac_32gb = AisInput { hardware_memory_gb: 32, ..Default::default() };
-        assert_eq!(mac_32gb.recommended_rl_max_ticks(), 2000, "32GB → 2000 ticks (4× baseline)");
+        let mac_32gb = AisInput {
+            hardware_memory_gb: 32,
+            ..Default::default()
+        };
+        assert_eq!(
+            mac_32gb.recommended_rl_max_ticks(),
+            2000,
+            "32GB → 2000 ticks (4× baseline)"
+        );
 
-        let unknown = AisInput { hardware_memory_gb: 0, ..Default::default() };
-        assert_eq!(unknown.effective_ram_gb(), 8, "0 = unknown falls back to 8GB baseline");
-        assert_eq!(unknown.recommended_rl_max_ticks(), 500, "unknown hardware → M1 baseline ticks");
+        let unknown = AisInput {
+            hardware_memory_gb: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            unknown.effective_ram_gb(),
+            8,
+            "0 = unknown falls back to 8GB baseline"
+        );
+        assert_eq!(
+            unknown.recommended_rl_max_ticks(),
+            500,
+            "unknown hardware → M1 baseline ticks"
+        );
     }
 
     #[test]
@@ -1520,8 +1657,11 @@ mod tests {
         let score = compute_ais(&base);
         // No kills + no survival + no failures + 0 overflow + perfect precision
         // = 0.30 + 0.25 + 0.20 + 0.25 + 0.10 = 1.10 → clamped to 1.0
-        assert_eq!(score.safety_compliance, 1.0,
-            "zero reverts + zero overflows should max out D5: {:.3}", score.safety_compliance);
+        assert_eq!(
+            score.safety_compliance, 1.0,
+            "zero reverts + zero overflows should max out D5: {:.3}",
+            score.safety_compliance
+        );
     }
 
     /// D5 throttle precision: 20% revert rate = 0 precision bonus.
@@ -1533,37 +1673,50 @@ mod tests {
             failures: 0,
             overflow_events_7d: 0,
             frozen_critical: 0,
-            noise_throttled: 80,  // 80 kept out of 100
-            noise_total: 100,     // revert_rate = (100-80)/100 = 0.20
+            noise_throttled: 80, // 80 kept out of 100
+            noise_total: 100,    // revert_rate = (100-80)/100 = 0.20
             ..Default::default()
         };
         let score = compute_ais(&base);
         // 0.30 + 0.25 + 0.20 + 0.25 + 0.0 = 1.0 (still perfect w/ zero overflow)
-        assert!(score.safety_compliance >= 0.99,
+        assert!(
+            score.safety_compliance >= 0.99,
             "D5 with 20% revert still saturates at 1.0 due to other components: {:.3}",
-            score.safety_compliance);
+            score.safety_compliance
+        );
     }
 
     /// D5 throttle precision: 20% revert + some overflows shows the delta.
     #[test]
     fn test_d5_throttle_precision_delta_with_overflows() {
         let perfect = AisInput {
-            kills_applied: 0, survival_activations: 0, failures: 0,
-            overflow_events_7d: 20, frozen_critical: 0,
-            noise_throttled: 100, noise_total: 100, // 0 reverts
+            kills_applied: 0,
+            survival_activations: 0,
+            failures: 0,
+            overflow_events_7d: 20,
+            frozen_critical: 0,
+            noise_throttled: 100,
+            noise_total: 100, // 0 reverts
             ..Default::default()
         };
         let imprecise = AisInput {
-            kills_applied: 0, survival_activations: 0, failures: 0,
-            overflow_events_7d: 20, frozen_critical: 0,
-            noise_throttled: 80, noise_total: 100,  // 20% reverts
+            kills_applied: 0,
+            survival_activations: 0,
+            failures: 0,
+            overflow_events_7d: 20,
+            frozen_critical: 0,
+            noise_throttled: 80,
+            noise_total: 100, // 20% reverts
             ..Default::default()
         };
         let score_perfect = compute_ais(&perfect);
         let score_imprecise = compute_ais(&imprecise);
-        assert!(score_perfect.safety_compliance > score_imprecise.safety_compliance,
+        assert!(
+            score_perfect.safety_compliance > score_imprecise.safety_compliance,
             "zero reverts ({:.3}) should outscore 20% reverts ({:.3}) with same overflow count",
-            score_perfect.safety_compliance, score_imprecise.safety_compliance);
+            score_perfect.safety_compliance,
+            score_imprecise.safety_compliance
+        );
     }
 
     /// Kalman Riccati threshold: RMSE at or below floor → kalman sub-score = 1.0.
@@ -1580,22 +1733,44 @@ mod tests {
             ..Default::default()
         };
         // At Riccati floor: RMSE < riccati_rmse → kalman sub-score = 1.0
-        let at_floor = AisInput { kalman_rmse: 0.100, kalman_riccati_rmse: 0.109, ..base.clone() };
+        let at_floor = AisInput {
+            kalman_rmse: 0.100,
+            kalman_riccati_rmse: 0.109,
+            ..base.clone()
+        };
         // Above Riccati floor: RMSE > riccati_rmse → kalman sub-score < 1.0
-        let above_floor = AisInput { kalman_rmse: 0.150, kalman_riccati_rmse: 0.109, ..base };
+        let above_floor = AisInput {
+            kalman_rmse: 0.150,
+            kalman_riccati_rmse: 0.109,
+            ..base
+        };
         let s_at = compute_ais(&at_floor).signal_quality;
         let s_above = compute_ais(&above_floor).signal_quality;
-        assert!(s_at > s_above,
+        assert!(
+            s_at > s_above,
             "RMSE ≤ Riccati floor ({:.3}) should outscore RMSE above floor ({:.3})",
-            s_at, s_above);
+            s_at,
+            s_above
+        );
         // The at-floor score should be exactly the max for these CUSUM/hazard/entropy
         // (kalman=1.0 is the maximum kalman sub-score).
-        let perfect_kalman = AisInput { kalman_rmse: 0.0, kalman_riccati_rmse: 0.109,
-            cusum_true_positives: 10, cusum_false_positives: 0, cusum_actual_shifts: 10,
-            hazard_calibration_error: 0.0, entropy_tpr: 1.0, ..Default::default() };
+        let perfect_kalman = AisInput {
+            kalman_rmse: 0.0,
+            kalman_riccati_rmse: 0.109,
+            cusum_true_positives: 10,
+            cusum_false_positives: 0,
+            cusum_actual_shifts: 10,
+            hazard_calibration_error: 0.0,
+            entropy_tpr: 1.0,
+            ..Default::default()
+        };
         let s_perfect = compute_ais(&perfect_kalman).signal_quality;
-        assert!((s_at - s_perfect).abs() < 1e-9,
-            "RMSE at floor ({:.3}) should equal perfect kalman ({:.3})", s_at, s_perfect);
+        assert!(
+            (s_at - s_perfect).abs() < 1e-9,
+            "RMSE at floor ({:.3}) should equal perfect kalman ({:.3})",
+            s_at,
+            s_perfect
+        );
     }
 
     /// D2 signal_quality: Riccati dynamic threshold takes precedence over fixed threshold.
@@ -1612,12 +1787,25 @@ mod tests {
             entropy_tpr: 0.8,
             ..Default::default()
         };
-        let with_riccati = AisInput { kalman_rmse: 0.11, kalman_riccati_rmse: 0.12, current_pressure: 0.80, ..base.clone() };
-        let without_riccati = AisInput { kalman_rmse: 0.11, kalman_riccati_rmse: 0.0, current_pressure: 0.80, ..base };
+        let with_riccati = AisInput {
+            kalman_rmse: 0.11,
+            kalman_riccati_rmse: 0.12,
+            current_pressure: 0.80,
+            ..base.clone()
+        };
+        let without_riccati = AisInput {
+            kalman_rmse: 0.11,
+            kalman_riccati_rmse: 0.0,
+            current_pressure: 0.80,
+            ..base
+        };
         let s_with = compute_ais(&with_riccati).signal_quality;
         let s_without = compute_ais(&without_riccati).signal_quality;
-        assert!(s_with > s_without,
+        assert!(
+            s_with > s_without,
             "Riccati-guided ({:.3}) should exceed fixed-threshold ({:.3}) when RMSE at floor",
-            s_with, s_without);
+            s_with,
+            s_without
+        );
     }
 }

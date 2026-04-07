@@ -158,8 +158,8 @@ impl SelfRewardingEvaluator {
 
             // JuicyScore = causal_confidence × pressure_improvement / cycles_to_effect
             // Bounded to [0, 1]
-            let juicy = (causal_conf * pressure_improvement / (cycles_elapsed * 0.1 + 1.0))
-                .clamp(0.0, 1.0);
+            let juicy =
+                (causal_conf * pressure_improvement / (cycles_elapsed * 0.1 + 1.0)).clamp(0.0, 1.0);
 
             let informative = causal_conf >= MIN_CAUSAL_CONFIDENCE;
             let prediction_error = juicy - record.predicted_score;
@@ -172,8 +172,11 @@ impl SelfRewardingEvaluator {
                 self.informative_count += 1;
                 // Update EMAs only with informative evaluations
                 self.reward_ema = ema_f32(self.reward_ema, juicy, SELF_EVAL_ALPHA);
-                self.self_eval_accuracy =
-                    ema_f32(self.self_eval_accuracy, prediction_error.abs(), SELF_EVAL_ALPHA);
+                self.self_eval_accuracy = ema_f32(
+                    self.self_eval_accuracy,
+                    prediction_error.abs(),
+                    SELF_EVAL_ALPHA,
+                );
             }
 
             results.push(EvalResult {
@@ -310,7 +313,10 @@ mod tests {
         // Good pressure drop but no causal evidence
         let results = se.evaluate_past(15, 0.50, |_| 0.05);
         assert_eq!(results.len(), 1);
-        assert!(!results[0].informative, "No causal evidence → not informative");
+        assert!(
+            !results[0].informative,
+            "No causal evidence → not informative"
+        );
     }
 
     #[test]
@@ -319,7 +325,10 @@ mod tests {
         se.log_decision(1, "throttle:X".into(), 0.90, 0.70);
         // Reality: not much happened → low juicy
         let results = se.evaluate_past(15, 0.68, |_| 0.50);
-        assert!(results[0].prediction_error < 0.0, "Predicted high, got low = overconfident");
+        assert!(
+            results[0].prediction_error < 0.0,
+            "Predicted high, got low = overconfident"
+        );
     }
 
     #[test]
@@ -328,7 +337,10 @@ mod tests {
         se.log_decision(1, "throttle:Y".into(), 0.10, 0.90);
         // Reality: great improvement
         let results = se.evaluate_past(15, 0.50, |_| 0.90);
-        assert!(results[0].prediction_error > 0.0, "Predicted low, got good = underconfident");
+        assert!(
+            results[0].prediction_error > 0.0,
+            "Predicted low, got good = underconfident"
+        );
     }
 
     #[test]

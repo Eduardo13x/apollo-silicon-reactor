@@ -498,8 +498,7 @@ mod tests {
             WorkloadType::General,
         ] {
             let json = serde_json::to_string(&wt).expect("serialize WorkloadType");
-            let rt: WorkloadType =
-                serde_json::from_str(&json).expect("deserialize WorkloadType");
+            let rt: WorkloadType = serde_json::from_str(&json).expect("deserialize WorkloadType");
             assert_eq!(rt, wt);
         }
     }

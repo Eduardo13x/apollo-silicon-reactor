@@ -556,7 +556,8 @@ mod tests {
         assert!(
             cooled_wss < warm_wss,
             "WSS should decrease: {} < {}",
-            cooled_wss, warm_wss
+            cooled_wss,
+            warm_wss
         );
     }
 }

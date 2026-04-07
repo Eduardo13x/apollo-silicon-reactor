@@ -15,11 +15,9 @@
 
 #[cfg(test)]
 mod scenarios {
-    use apollo_optimizer::collector::{
-        CpuStats, MemoryStats, PressureStats, SystemSnapshot,
-    };
-    use apollo_optimizer::engine::decide_actions::context_from_pressure;
+    use apollo_optimizer::collector::{CpuStats, MemoryStats, PressureStats, SystemSnapshot};
     use apollo_optimizer::engine::decide_actions::blocker_score_formula;
+    use apollo_optimizer::engine::decide_actions::context_from_pressure;
     use apollo_optimizer::engine::overflow_guard::OverflowThresholds;
     use apollo_optimizer::engine::types::InteractiveContext;
     use chrono::Utc;
@@ -65,7 +63,8 @@ mod scenarios {
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
         assert!(
             matches!(ctx, InteractiveContext::InteractiveFocus),
-            "CPU 30% + mem 0.40 = normal → InteractiveFocus. Got {:?}", ctx
+            "CPU 30% + mem 0.40 = normal → InteractiveFocus. Got {:?}",
+            ctx
         );
     }
 
@@ -77,7 +76,8 @@ mod scenarios {
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
         assert!(
             matches!(ctx, InteractiveContext::BackgroundPressure),
-            "CPU 75% > 72% → BackgroundPressure. Got {:?}", ctx
+            "CPU 75% > 72% → BackgroundPressure. Got {:?}",
+            ctx
         );
     }
 
@@ -88,7 +88,8 @@ mod scenarios {
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
         assert!(
             matches!(ctx, InteractiveContext::ThermalConstrained),
-            "CPU 90% > 88% → ThermalConstrained. Got {:?}", ctx
+            "CPU 90% > 88% → ThermalConstrained. Got {:?}",
+            ctx
         );
     }
 
@@ -100,7 +101,8 @@ mod scenarios {
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
         assert!(
             matches!(ctx, InteractiveContext::ThermalConstrained),
-            "Mem pressure 0.92 > critical → ThermalConstrained. Got {:?}", ctx
+            "Mem pressure 0.92 > critical → ThermalConstrained. Got {:?}",
+            ctx
         );
     }
 
@@ -113,7 +115,8 @@ mod scenarios {
         // 72.0 is NOT > 72.0, so should remain InteractiveFocus
         assert!(
             matches!(ctx, InteractiveContext::InteractiveFocus),
-            "CPU at exactly 72% should be InteractiveFocus (> not >=). Got {:?}", ctx
+            "CPU at exactly 72% should be InteractiveFocus (> not >=). Got {:?}",
+            ctx
         );
     }
 
@@ -129,7 +132,11 @@ mod scenarios {
         // interactive_wait_ratio = 1.0 (5+ apps waiting), cpu_spike = 0.1,
         // seen_recently = false, reactor = 0.0
         let score = blocker_score_formula(1.0, 0.1, false, 0.0, 0.0);
-        assert!(score > 0.30, "High interactive wait should score > threshold. Got {}", score);
+        assert!(
+            score > 0.30,
+            "High interactive wait should score > threshold. Got {}",
+            score
+        );
     }
 
     /// A07: High CPU spike from blocker should score above threshold.
@@ -137,14 +144,22 @@ mod scenarios {
     fn a07_cpu_spike_scores_above_threshold() {
         // interactive_wait = 0.0, cpu_spike = 80% (0.8), seen_recently = true, reactor = 0.5
         let score = blocker_score_formula(0.0, 0.8, true, 0.5, 0.0);
-        assert!(score > 0.30, "80% CPU spike from blocker should score > threshold. Got {}", score);
+        assert!(
+            score > 0.30,
+            "80% CPU spike from blocker should score > threshold. Got {}",
+            score
+        );
     }
 
     /// A08: Everything low → score below threshold (no action needed).
     #[test]
     fn a08_low_everything_below_threshold() {
         let score = blocker_score_formula(0.0, 0.05, false, 0.0, 0.0);
-        assert!(score < 0.30, "Quiet system → no blocker action. Got {}", score);
+        assert!(
+            score < 0.30,
+            "Quiet system → no blocker action. Got {}",
+            score
+        );
     }
 
     /// A09: Interactive wait should outweigh CPU spike in scoring.
@@ -156,7 +171,8 @@ mod scenarios {
         assert!(
             wait_heavy > cpu_heavy,
             "Interactive wait ({}) should score higher than CPU spike ({})",
-            wait_heavy, cpu_heavy
+            wait_heavy,
+            cpu_heavy
         );
     }
 
@@ -167,7 +183,9 @@ mod scenarios {
         let with_reactor = blocker_score_formula(0.3, 0.3, false, 0.8, 0.0);
         assert!(
             with_reactor > without_reactor,
-            "Reactor events should increase score: {} vs {}", with_reactor, without_reactor
+            "Reactor events should increase score: {} vs {}",
+            with_reactor,
+            without_reactor
         );
     }
 }

@@ -176,7 +176,13 @@ impl EffectivenessTracker {
     /// `bayesian_eff` is `(effective_count + 1.0) / (throttle_count + 2.0)` —
     /// the Laplace-smoothed posterior from `PatternWeight::effectiveness()`.
     /// `obs_count` is `throttle_count` (number of times process was throttled).
-    pub fn update_from_outcome(&mut self, name: &str, bayesian_eff: f64, obs_count: u32, cycle: u64) {
+    pub fn update_from_outcome(
+        &mut self,
+        name: &str,
+        bayesian_eff: f64,
+        obs_count: u32,
+        cycle: u64,
+    ) {
         let entry = self.scores.entry(name.to_string()).or_default();
         entry.bayesian_eff = bayesian_eff.clamp(0.0, 1.0);
         entry.bayesian_obs = obs_count;
@@ -198,7 +204,13 @@ impl EffectivenessTracker {
     /// Only call this when `evidence_count >= 3` (the CausalGraph's own gate);
     /// it is safe to call regardless — credibility naturally stays near 0 with
     /// fewer observations (cred = obs / 5.0 ≈ 0 for obs ≤ 1).
-    pub fn update_from_causal(&mut self, name: &str, confidence: f64, evidence_count: u32, cycle: u64) {
+    pub fn update_from_causal(
+        &mut self,
+        name: &str,
+        confidence: f64,
+        evidence_count: u32,
+        cycle: u64,
+    ) {
         let entry = self.scores.entry(name.to_string()).or_default();
         entry.causal_confidence = confidence.clamp(0.0, 1.0);
         entry.causal_obs = evidence_count;
@@ -434,11 +446,7 @@ mod tests {
         tracker.update_from_skill("ProcA", 0.5, 1000, 1);
 
         let score = tracker.blended_score("ProcA");
-        assert!(
-            score.is_finite(),
-            "score must be finite, got {}",
-            score
-        );
+        assert!(score.is_finite(), "score must be finite, got {}", score);
         assert!(
             (0.0..=1.0).contains(&score),
             "score must be in [0,1], got {}",
@@ -451,7 +459,7 @@ mod tests {
     fn test_restore_clamping() {
         let mut tracker = EffectivenessTracker::new();
         let mut corrupt = ProcessEffectiveness::default();
-        corrupt.bayesian_eff = 2.5;   // out of range
+        corrupt.bayesian_eff = 2.5; // out of range
         corrupt.causal_confidence = -0.3; // out of range
         corrupt.bayesian_obs = 20;
         corrupt.causal_obs = 5;
@@ -497,11 +505,7 @@ mod tests {
         // GC at cycle 2000 with stale window = 500, but min_obs = 5.
         // Entry: age = 1999 > 500 (stale), BUT obs = 25 >= 5 → keep.
         tracker.gc(5, 500, 2000);
-        assert_eq!(
-            tracker.len(),
-            1,
-            "well-observed entry kept even when stale"
-        );
+        assert_eq!(tracker.len(), 1, "well-observed entry kept even when stale");
     }
 
     /// GC should keep recently-updated entries regardless of observation count.

@@ -265,7 +265,13 @@ mod tests {
         for &pr in &pressures {
             let feat = HazardModel::risk_features(pr, 0.02, pr * 0.5, pr * 0.5);
             let p = model.probability_oom(&feat, 30.0);
-            assert!(p >= prev_p, "P(OOM) not monotonic: p={}, pr={}, prev={}", p, pr, prev_p);
+            assert!(
+                p >= prev_p,
+                "P(OOM) not monotonic: p={}, pr={}, prev={}",
+                p,
+                pr,
+                prev_p
+            );
             prev_p = p;
         }
     }
@@ -276,7 +282,11 @@ mod tests {
         let mut model = HazardModel::new();
         let feat = HazardModel::risk_features(0.9, 0.1, 0.8, 0.8);
         let p = model.probability_oom(&feat, 0.0);
-        assert!(p.abs() < 1e-10, "zero horizon should give ~zero P(OOM), got {}", p);
+        assert!(
+            p.abs() < 1e-10,
+            "zero horizon should give ~zero P(OOM), got {}",
+            p
+        );
     }
 
     /// Beta weights must stay bounded [0, 5] even after many events.
@@ -318,8 +328,13 @@ mod tests {
         assert!((model.total_hours - restored.total_hours).abs() < 1e-10);
         assert!((model.base_rate - restored.base_rate).abs() < 1e-15);
         for i in 0..N_RISK {
-            assert!((model.beta[i] - restored.beta[i]).abs() < 1e-15,
-                "beta[{}] diverged: {} vs {}", i, model.beta[i], restored.beta[i]);
+            assert!(
+                (model.beta[i] - restored.beta[i]).abs() < 1e-15,
+                "beta[{}] diverged: {} vs {}",
+                i,
+                model.beta[i],
+                restored.beta[i]
+            );
         }
     }
 }

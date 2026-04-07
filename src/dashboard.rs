@@ -274,10 +274,10 @@ fn render_system(status: &DaemonStatus) -> Vec<String> {
     let swap_label = swap_status_label(swap_gb, m.swap_delta_bps);
     let trend_suffix = if !m.swap_trend.is_empty() && m.swap_trend != "Stable" {
         let colored = match m.swap_trend.as_str() {
-            "Critical"   => red(&m.swap_trend),
+            "Critical" => red(&m.swap_trend),
             "Increasing" => yellow(&m.swap_trend),
             "Decreasing" => green(&m.swap_trend),
-            other        => dim(other),
+            other => dim(other),
         };
         format!(" [{}]", colored)
     } else {
@@ -349,8 +349,16 @@ fn render_system(status: &DaemonStatus) -> Vec<String> {
             ));
         }
         // ML throttle source + freeze gate
-        let ml_src = if m.ml_throttle_source.is_empty() { "none" } else { &m.ml_throttle_source };
-        let gate = if m.freeze_gate_last.is_empty() { "none" } else { &m.freeze_gate_last };
+        let ml_src = if m.ml_throttle_source.is_empty() {
+            "none"
+        } else {
+            &m.ml_throttle_source
+        };
+        let gate = if m.freeze_gate_last.is_empty() {
+            "none"
+        } else {
+            &m.freeze_gate_last
+        };
         if ml_src != "none" || gate != "none" {
             lines.push(format!(
                 "ML throttle: {}  Freeze gate: {}",
@@ -359,7 +367,11 @@ fn render_system(status: &DaemonStatus) -> Vec<String> {
                     "call-mode" => yellow("call-mode (bandwidth reserved)"),
                     _ => ml_src.to_string(),
                 },
-                if gate != "none" { yellow(gate) } else { gate.to_string() }
+                if gate != "none" {
+                    yellow(gate)
+                } else {
+                    gate.to_string()
+                }
             ));
         }
     }
@@ -384,7 +396,11 @@ fn render_system(status: &DaemonStatus) -> Vec<String> {
             String::new()
         };
         if !idle_str.is_empty() {
-            let audio_tag = if m.user_audio_active { "  🔊 audio" } else { "" };
+            let audio_tag = if m.user_audio_active {
+                "  🔊 audio"
+            } else {
+                ""
+            };
             lines.push(format!("User: {}{}", idle_str, audio_tag));
         }
     }
@@ -504,12 +520,16 @@ fn render_intelligence(status: &DaemonStatus) -> Vec<String> {
 
     // Affective arousal indicator (Yerkes-Dodson zone)
     if m.arousal_level > 0.01 || !m.arousal_zone.is_empty() {
-        let zone = if m.arousal_zone.is_empty() { "Idle" } else { &m.arousal_zone };
+        let zone = if m.arousal_zone.is_empty() {
+            "Idle"
+        } else {
+            &m.arousal_zone
+        };
         let zone_colored = match zone {
-            "Crisis"   => red(zone),
+            "Crisis" => red(zone),
             "Stressed" => yellow(zone),
-            "Optimal"  => green(zone),
-            _          => dim(zone),
+            "Optimal" => green(zone),
+            _ => dim(zone),
         };
         lines.push(format!(
             "Arousal: {} ({:.0}%) — Yerkes-Dodson",
@@ -562,11 +582,20 @@ fn render_intelligence(status: &DaemonStatus) -> Vec<String> {
     // KPC memory-bound score
     if m.kpc_memory_bound_score > 0.0 {
         let score_label = if m.kpc_memory_bound_score > 0.7 {
-            green(&format!("{:.0}% memory-stalled", m.kpc_memory_bound_score * 100.0))
+            green(&format!(
+                "{:.0}% memory-stalled",
+                m.kpc_memory_bound_score * 100.0
+            ))
         } else if m.kpc_memory_bound_score > 0.4 {
-            yellow(&format!("{:.0}% memory-stalled", m.kpc_memory_bound_score * 100.0))
+            yellow(&format!(
+                "{:.0}% memory-stalled",
+                m.kpc_memory_bound_score * 100.0
+            ))
         } else {
-            dim(&format!("{:.0}% memory-stalled", m.kpc_memory_bound_score * 100.0))
+            dim(&format!(
+                "{:.0}% memory-stalled",
+                m.kpc_memory_bound_score * 100.0
+            ))
         };
         lines.push(format!("KPC: {}", score_label));
     }
@@ -853,20 +882,31 @@ fn render_frozen(status: &DaemonStatus) -> Vec<String> {
             FreezeSource::Unknown => "Unknown",
         };
         let time = if p.frozen_seconds >= 3600 {
-            format!("{}h {:02}m", p.frozen_seconds / 3600, (p.frozen_seconds % 3600) / 60)
+            format!(
+                "{}h {:02}m",
+                p.frozen_seconds / 3600,
+                (p.frozen_seconds % 3600) / 60
+            )
         } else if p.frozen_seconds >= 60 {
             format!("{}m {:02}s", p.frozen_seconds / 60, p.frozen_seconds % 60)
         } else {
             format!("{}s", p.frozen_seconds)
         };
-        let name = if p.name.len() > 22 { &p.name[..22] } else { &p.name };
+        let name = if p.name.len() > 22 {
+            &p.name[..22]
+        } else {
+            &p.name
+        };
         lines.push(format!(
             "{:<6} {:<22} {:>8} {:>5.2} {:<14}",
             p.pid, name, time, p.pressure_at_freeze, source
         ));
     }
     if status.frozen_processes.len() > 10 {
-        lines.push(format!("  ... y {} más", status.frozen_processes.len() - 10));
+        lines.push(format!(
+            "  ... y {} más",
+            status.frozen_processes.len() - 10
+        ));
     }
     lines
 }

@@ -59,10 +59,26 @@ pub struct ProcessSnapshot {
 
 pub fn essential_process_names() -> HashSet<&'static str> {
     [
-        "launchd", "kernel_task", "WindowServer", "loginwindow", "cfprefsd",
-        "UserEventAgent", "diskarbitrationd", "powerd", "configd", "notifyd",
-        "syslogd", "opendirectoryd", "coreaudiod", "bluetoothd", "airportd",
-        "mDNSResponder", "systemstats", "logd", "nsurlsessiond", "symptomsd",
+        "launchd",
+        "kernel_task",
+        "WindowServer",
+        "loginwindow",
+        "cfprefsd",
+        "UserEventAgent",
+        "diskarbitrationd",
+        "powerd",
+        "configd",
+        "notifyd",
+        "syslogd",
+        "opendirectoryd",
+        "coreaudiod",
+        "bluetoothd",
+        "airportd",
+        "mDNSResponder",
+        "systemstats",
+        "logd",
+        "nsurlsessiond",
+        "symptomsd",
     ]
     .iter()
     .copied()
@@ -71,10 +87,19 @@ pub fn essential_process_names() -> HashSet<&'static str> {
 
 pub fn telemetry_process_names() -> HashSet<&'static str> {
     [
-        "DiagnosticReporter", "CrashReporter", "ReportCrash", "SubmitDiagInfo",
-        "Siri", "SiriNCService", "parsec-fbf", "OSLogHelper",
-        "com.apple.telemetry", "EscrowSecurityAlert", "analyticsd",
-        "symptomsd", "rapportd",
+        "DiagnosticReporter",
+        "CrashReporter",
+        "ReportCrash",
+        "SubmitDiagInfo",
+        "Siri",
+        "SiriNCService",
+        "parsec-fbf",
+        "OSLogHelper",
+        "com.apple.telemetry",
+        "EscrowSecurityAlert",
+        "analyticsd",
+        "symptomsd",
+        "rapportd",
     ]
     .iter()
     .copied()
@@ -83,8 +108,14 @@ pub fn telemetry_process_names() -> HashSet<&'static str> {
 
 pub fn helper_name_patterns() -> &'static [&'static str] {
     &[
-        "Helper", "Renderer", "GPU Process", "Crashpad", "BraveSoftware Helper",
-        "Google Chrome Helper", "Electron Helper", "plugin-container",
+        "Helper",
+        "Renderer",
+        "GPU Process",
+        "Crashpad",
+        "BraveSoftware Helper",
+        "Google Chrome Helper",
+        "Electron Helper",
+        "plugin-container",
     ]
 }
 
@@ -154,9 +185,7 @@ impl ProcessClassifier {
         }
 
         // Stale: no GUI, low CPU, long idle
-        if snap.cpu_percent < 0.5
-            && snap.wakeups_per_sec < 1.0
-            && snap.secs_since_foreground > 300
+        if snap.cpu_percent < 0.5 && snap.wakeups_per_sec < 1.0 && snap.secs_since_foreground > 300
         {
             return ProcessTier::Stale;
         }

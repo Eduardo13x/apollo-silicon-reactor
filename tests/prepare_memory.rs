@@ -15,8 +15,8 @@
 #[cfg(test)]
 mod scenarios {
     use apollo_optimizer::engine::compressor_aware::{
-        decide_enhanced, decide_memory_action, compressor_efficiency_score,
-        MemoryAction, ProcessMemoryProfile, TempProfile,
+        compressor_efficiency_score, decide_enhanced, decide_memory_action, MemoryAction,
+        ProcessMemoryProfile, TempProfile,
     };
 
     fn profile(phys_mb: u64, compressed_mb: u64, purgeable_mb: u64) -> ProcessMemoryProfile {
@@ -111,9 +111,13 @@ mod scenarios {
     #[test]
     fn m06_slc_fit_overrides_bad_ratio() {
         let p = profile(400, 20, 0); // bad ratio 1.05
-        // WSS = 500KB, 2 active processes → SLC share = 4MB → fits
+                                     // WSS = 500KB, 2 active processes → SLC share = 4MB → fits
         let action = decide_enhanced(&p, None, Some(500_000), 2, 0.50, 0.0);
-        assert_eq!(action, MemoryAction::Freeze, "WSS fits in SLC → free freeze regardless of ratio");
+        assert_eq!(
+            action,
+            MemoryAction::Freeze,
+            "WSS fits in SLC → free freeze regardless of ratio"
+        );
     }
 
     /// M07: Mostly compressed process (70% pages compressed) → Skip.
@@ -158,7 +162,10 @@ mod scenarios {
         let p = profile(100, 200, 0); // 3:1 ratio
         let enhanced = decide_enhanced(&p, None, None, 10, 0.50, 0.0);
         let legacy = decide_memory_action(&p, 0.50, 0.0);
-        assert_eq!(enhanced, legacy, "No enhanced data → must match legacy decision");
+        assert_eq!(
+            enhanced, legacy,
+            "No enhanced data → must match legacy decision"
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -171,7 +178,11 @@ mod scenarios {
     fn m10_high_ratio_high_efficiency() {
         let p = profile(100, 300, 0); // ratio = 4.0
         let eff = compressor_efficiency_score(&p);
-        assert!(eff > 0.7, "4:1 ratio should have efficiency > 0.7, got {}", eff);
+        assert!(
+            eff > 0.7,
+            "4:1 ratio should have efficiency > 0.7, got {}",
+            eff
+        );
     }
 
     /// M11: Zero compression → efficiency = 1.0 (not burdening compressor).
@@ -219,9 +230,13 @@ mod scenarios {
     #[test]
     fn m14_damon_wss_overrides_footprint() {
         let p = profile(400, 0, 0); // 400MB phys
-        // WSS = 1MB, 4 processes → SLC share = 2MB → fits
+                                    // WSS = 1MB, 4 processes → SLC share = 2MB → fits
         let action = decide_enhanced(&p, None, Some(1_000_000), 4, 0.50, 0.0);
-        assert_eq!(action, MemoryAction::Freeze, "DAMON WSS 1MB fits SLC despite 400MB phys");
+        assert_eq!(
+            action,
+            MemoryAction::Freeze,
+            "DAMON WSS 1MB fits SLC despite 400MB phys"
+        );
     }
 
     /// M15: Borderline compression ratio (1.5) + moderate footprint (200MB).
@@ -229,8 +244,8 @@ mod scenarios {
     #[test]
     fn m15_borderline_ratio_freezes() {
         let p = profile(200, 100, 0); // ratio = 1.5
-        // The legacy path: not purgeable, not thrashing, ratio < 2.0,
-        // but ratio >= 1.5 and footprint is moderate (200MB fits the fallthrough case)
+                                      // The legacy path: not purgeable, not thrashing, ratio < 2.0,
+                                      // but ratio >= 1.5 and footprint is moderate (200MB fits the fallthrough case)
         let action = decide_memory_action(&p, 0.50, 0.0);
         assert_eq!(
             action,

@@ -142,8 +142,7 @@ fn collect_pressure_facts() -> (f64, u64, u64) {
         .unwrap_or(0.0);
 
     // Swap usage via direct sysctl struct read (~1µs vs 10ms for subprocess).
-    let (swap_total_bytes, swap_used_bytes) =
-        sysctl_direct::read_swap_usage().unwrap_or((0, 0));
+    let (swap_total_bytes, swap_used_bytes) = sysctl_direct::read_swap_usage().unwrap_or((0, 0));
 
     (memory_pressure, swap_used_bytes, swap_total_bytes)
 }

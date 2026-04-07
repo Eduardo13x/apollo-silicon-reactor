@@ -24,7 +24,14 @@ use crate::engine::lock_ext::LockRecover;
 fn probe_powermetrics() -> Option<PowerReading> {
     use std::process::Command;
     let output = Command::new("/usr/bin/powermetrics")
-        .args(["--samplers", "cpu_power,gpu_power,ane_power", "-i", "500", "-n", "1"])
+        .args([
+            "--samplers",
+            "cpu_power,gpu_power,ane_power",
+            "-i",
+            "500",
+            "-n",
+            "1",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -50,7 +57,9 @@ fn probe_powermetrics() -> Option<PowerReading> {
         } else if line.starts_with("ANE utilization:") {
             ane_util = parse_percent_line(line);
         } else if line.starts_with("ANE TFLOPS:") {
-            ane_tflops = line.split(':').nth(1)
+            ane_tflops = line
+                .split(':')
+                .nth(1)
                 .and_then(|s| s.split_whitespace().next())
                 .and_then(|s| s.parse().ok());
         }
@@ -84,7 +93,10 @@ fn parse_mw(line: &str) -> Option<f32> {
 /// Parse "ANE utilization: 12.5%" → Some(12.5)
 fn parse_percent_line(line: &str) -> Option<f32> {
     let after_colon = line.split(':').nth(1)?.trim();
-    let num_str = after_colon.trim_end_matches('%').split_whitespace().next()?;
+    let num_str = after_colon
+        .trim_end_matches('%')
+        .split_whitespace()
+        .next()?;
     num_str.parse().ok()
 }
 
@@ -138,7 +150,8 @@ impl SmcReader {
                             // On first snapshot, check if IOKit provides power data.
                             // If not (common on Apple Silicon without entitlements),
                             // enable powermetrics fallback every 3rd cycle (~9s).
-                            if !needs_powermetrics && hw.power.package_watts.is_none()
+                            if !needs_powermetrics
+                                && hw.power.package_watts.is_none()
                                 && hw.power.cpu_watts.is_none()
                             {
                                 needs_powermetrics = true;

@@ -153,7 +153,9 @@ impl MetaCognition {
             if self.humble_cycles_remaining == 0 && self.calibration_error < HUMBLE_THRESHOLD {
                 self.humble_mode = false;
             }
-        } else if self.calibration_error > HUMBLE_THRESHOLD && self.total_observations >= MIN_OBS_FOR_ECE as u64 {
+        } else if self.calibration_error > HUMBLE_THRESHOLD
+            && self.total_observations >= MIN_OBS_FOR_ECE as u64
+        {
             // Enter humble mode
             self.humble_mode = true;
             self.humble_cycles_remaining = HUMBLE_DURATION;
@@ -366,7 +368,10 @@ mod tests {
             m.tick();
         }
         // Should eventually exit
-        assert!(!m.humble_mode, "Should exit humble after duration + good calibration");
+        assert!(
+            !m.humble_mode,
+            "Should exit humble after duration + good calibration"
+        );
     }
 
     #[test]
@@ -385,7 +390,10 @@ mod tests {
             m.tick();
         }
         // Should stay in humble mode
-        assert!(m.humble_mode, "Should stay humble while still miscalibrated");
+        assert!(
+            m.humble_mode,
+            "Should stay humble while still miscalibrated"
+        );
     }
 
     #[test]
@@ -395,14 +403,22 @@ mod tests {
             m.observe(SubsystemId::RlAgent, 0.50, 0.50);
         }
         m.tick();
-        assert!(m.meta_confidence > 0.9, "Well calibrated → high meta: {}", m.meta_confidence);
+        assert!(
+            m.meta_confidence > 0.9,
+            "Well calibrated → high meta: {}",
+            m.meta_confidence
+        );
 
         let mut m2 = MetaCognition::new();
         for _ in 0..20 {
             m2.observe(SubsystemId::RlAgent, 0.95, 0.10);
         }
         m2.tick();
-        assert!(m2.meta_confidence < 0.7, "Poorly calibrated → low meta: {}", m2.meta_confidence);
+        assert!(
+            m2.meta_confidence < 0.7,
+            "Poorly calibrated → low meta: {}",
+            m2.meta_confidence
+        );
     }
 
     #[test]
@@ -410,8 +426,8 @@ mod tests {
         let mut m = MetaCognition::new();
         // One well-calibrated, one poorly calibrated
         for _ in 0..20 {
-            m.observe(SubsystemId::RlAgent, 0.50, 0.50);       // good
-            m.observe(SubsystemId::CausalGraph, 0.90, 0.10);   // bad
+            m.observe(SubsystemId::RlAgent, 0.50, 0.50); // good
+            m.observe(SubsystemId::CausalGraph, 0.90, 0.10); // bad
         }
         m.tick();
         // Aggregate should be somewhere in between
@@ -436,7 +452,9 @@ mod tests {
         for _ in 0..20 {
             m.observe(SubsystemId::SignalKalman, 0.90, 0.30);
         }
-        let dir = m.subsystem_miscalibration(SubsystemId::SignalKalman).unwrap();
+        let dir = m
+            .subsystem_miscalibration(SubsystemId::SignalKalman)
+            .unwrap();
         assert!(dir > 0.0, "Predicted > actual = overconfident: {dir}");
     }
 
@@ -446,7 +464,9 @@ mod tests {
         for _ in 0..20 {
             m.observe(SubsystemId::SignalKalman, 0.20, 0.80);
         }
-        let dir = m.subsystem_miscalibration(SubsystemId::SignalKalman).unwrap();
+        let dir = m
+            .subsystem_miscalibration(SubsystemId::SignalKalman)
+            .unwrap();
         assert!(dir < 0.0, "Predicted < actual = underconfident: {dir}");
     }
 

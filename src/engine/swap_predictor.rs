@@ -94,9 +94,19 @@ impl SwapPredictor {
 
         // Compare recent half vs older half
         let mid = n / 2;
-        let older_avg = self.samples.iter().take(mid).map(|(u, _)| *u as f64).sum::<f64>()
+        let older_avg = self
+            .samples
+            .iter()
+            .take(mid)
+            .map(|(u, _)| *u as f64)
+            .sum::<f64>()
             / mid as f64;
-        let newer_avg = self.samples.iter().skip(mid).map(|(u, _)| *u as f64).sum::<f64>()
+        let newer_avg = self
+            .samples
+            .iter()
+            .skip(mid)
+            .map(|(u, _)| *u as f64)
+            .sum::<f64>()
             / (n - mid) as f64;
 
         let delta_ratio = (newer_avg - older_avg) / total as f64;
@@ -121,7 +131,11 @@ impl SwapPredictor {
         if n < 2 {
             return current;
         }
-        let first = self.samples.front().map(|(u, _)| *u as f64).unwrap_or(current as f64);
+        let first = self
+            .samples
+            .front()
+            .map(|(u, _)| *u as f64)
+            .unwrap_or(current as f64);
         let rate = (current as f64 - first) / n as f64;
         // Predict 6 samples ahead (~30s)
         let predicted = current as f64 + rate * 6.0;

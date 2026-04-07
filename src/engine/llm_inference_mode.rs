@@ -53,9 +53,9 @@ const LLM_EXACT_NAMES: &[&str] = &[
 
 /// Prefix matches — process names starting with these strings.
 const LLM_PREFIX_NAMES: &[&str] = &[
-    "ollama_",  // ollama sub-processes
-    "llama",    // llama.cpp variants
-    "mlx_",     // Apple MLX variants
+    "ollama_", // ollama sub-processes
+    "llama",   // llama.cpp variants
+    "mlx_",    // Apple MLX variants
 ];
 
 /// Minimum sustained CPU% for python/python3 to count as LLM inference.
@@ -222,9 +222,7 @@ impl LlmInferenceDetector {
         LLM_EXACT_NAMES
             .iter()
             .any(|&n| n.to_ascii_lowercase() == name_lc)
-            || LLM_PREFIX_NAMES
-                .iter()
-                .any(|&p| name_lc.starts_with(p))
+            || LLM_PREFIX_NAMES.iter().any(|&p| name_lc.starts_with(p))
     }
 }
 

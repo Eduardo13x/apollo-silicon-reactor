@@ -102,8 +102,8 @@ impl MetaParams {
             .zip(other.linucb_arm_biases.iter())
             .map(|(a, b)| a + factor * (b - a))
             .collect();
-        let nars_confidence_adj =
-            self.nars_confidence_adj + (factor as f32) * (other.nars_confidence_adj - self.nars_confidence_adj);
+        let nars_confidence_adj = self.nars_confidence_adj
+            + (factor as f32) * (other.nars_confidence_adj - self.nars_confidence_adj);
         MetaParams {
             rl_q_bias,
             linucb_arm_biases,
@@ -160,8 +160,7 @@ impl ReptileMeta {
         // Save current params for old workload
         let mut saved = self.current_params.clone();
         saved.last_updated = current_cycle;
-        self.workload_params
-            .insert(self.current_fingerprint, saved);
+        self.workload_params.insert(self.current_fingerprint, saved);
 
         // Reptile outer-loop: θ_slow ← θ_slow + ε×(θ_current - θ_slow)
         // [Nichol 2018] Algorithm 1
@@ -174,9 +173,7 @@ impl ReptileMeta {
         self.current_params = if let Some(cached) = self.workload_params.get(&new_fingerprint) {
             // Known workload: interpolate between θ_slow and θ_fast[new]
             let distance_before = self.global_params.distance(cached);
-            let result = self
-                .global_params
-                .interpolate(cached, INTERPOLATION_FACTOR);
+            let result = self.global_params.interpolate(cached, INTERPOLATION_FACTOR);
             self.adaptation_quality = ema_f32(
                 self.adaptation_quality,
                 (1.0 - (distance_before as f32 / 5.0).min(1.0)).max(0.0),
@@ -306,7 +303,10 @@ mod tests {
         rm.on_fingerprint_change(42, 100);
         let steps_before = rm.adaptation_steps;
         rm.on_fingerprint_change(42, 200);
-        assert_eq!(rm.adaptation_steps, steps_before, "Same fingerprint = no update");
+        assert_eq!(
+            rm.adaptation_steps, steps_before,
+            "Same fingerprint = no update"
+        );
     }
 
     #[test]
@@ -321,7 +321,10 @@ mod tests {
 
         // Switch back to A — should interpolate with cached params
         rm.on_fingerprint_change(1, 50);
-        assert!(rm.rl_bias(0).abs() > 0.0, "Should have nonzero bias from cache");
+        assert!(
+            rm.rl_bias(0).abs() > 0.0,
+            "Should have nonzero bias from cache"
+        );
     }
 
     #[test]
@@ -363,7 +366,10 @@ mod tests {
         let mut rm = ReptileMeta::new();
         rm.apply_learning_delta(10, 2.0, 3, 1.5, 50);
         assert!((rm.rl_bias(10) - 0.2).abs() < 0.001, "delta * 0.1 = 0.2");
-        assert!((rm.linucb_bias(3) - 0.15).abs() < 0.001, "delta * 0.1 = 0.15");
+        assert!(
+            (rm.linucb_bias(3) - 0.15).abs() < 0.001,
+            "delta * 0.1 = 0.15"
+        );
     }
 
     #[test]

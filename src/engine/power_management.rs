@@ -338,7 +338,9 @@ impl PowerManager {
 /// Returns `None` if battery info cannot be determined (e.g., desktop Mac).
 pub fn detect_battery_status() -> Option<BatteryStatus> {
     #[cfg(not(target_os = "macos"))]
-    { return None; }
+    {
+        return None;
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -493,7 +495,11 @@ pub fn detect_battery_status() -> Option<BatteryStatus> {
             let on_ac = power_source_state.contains("AC") || is_charging;
 
             let time_remaining_minutes = if is_charging {
-                if time_to_full > 0 { time_to_full as u32 } else { 0 }
+                if time_to_full > 0 {
+                    time_to_full as u32
+                } else {
+                    0
+                }
             } else if time_to_empty > 0 {
                 time_to_empty as u32
             } else {

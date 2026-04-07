@@ -18,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 /// contention. We run it in a thread with a 500ms timeout to avoid hanging the daemon.
 pub fn pids_with_assertions() -> HashSet<u32> {
     #[cfg(not(target_os = "macos"))]
-    { return HashSet::new(); }
+    {
+        return HashSet::new();
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -27,7 +29,8 @@ pub fn pids_with_assertions() -> HashSet<u32> {
         std::thread::spawn(move || {
             let _ = tx.send(pids_with_assertions_inner());
         });
-        return rx.recv_timeout(std::time::Duration::from_millis(500))
+        return rx
+            .recv_timeout(std::time::Duration::from_millis(500))
             .unwrap_or_default();
     }
 }
@@ -36,9 +39,7 @@ pub fn pids_with_assertions() -> HashSet<u32> {
 fn pids_with_assertions_inner() -> HashSet<u32> {
     {
         extern "C" {
-            fn IOPMCopyAssertionsByProcess(
-                assertions_by_pid: *mut *const std::ffi::c_void,
-            ) -> i32;
+            fn IOPMCopyAssertionsByProcess(assertions_by_pid: *mut *const std::ffi::c_void) -> i32;
             fn CFArrayGetCount(array: *const std::ffi::c_void) -> i64;
             #[allow(dead_code)]
             fn CFArrayGetValueAtIndex(
@@ -154,7 +155,10 @@ pub fn pids_with_active_children(
 /// Called once per freeze cycle against candidate PIDs only.
 pub fn pids_with_open_sockets(candidate_pids: &[u32], min_sockets: usize) -> HashSet<u32> {
     #[cfg(not(target_os = "macos"))]
-    { let _ = (candidate_pids, min_sockets); return HashSet::new(); }
+    {
+        let _ = (candidate_pids, min_sockets);
+        return HashSet::new();
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -273,7 +277,11 @@ mod tests {
         // Various thresholds — all return empty for empty input.
         for threshold in [0.0f32, 5.0, 10.0, 50.0, 100.0] {
             let result = pids_with_active_children(&processes, threshold);
-            assert!(result.is_empty(), "threshold={}: empty system → empty result", threshold);
+            assert!(
+                result.is_empty(),
+                "threshold={}: empty system → empty result",
+                threshold
+            );
         }
     }
 

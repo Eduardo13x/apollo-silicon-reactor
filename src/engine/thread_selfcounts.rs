@@ -13,7 +13,6 @@
 //!   IPC > 1.5 → daemon is compute-efficient.
 //! - **Per-cycle cost tracking**: Instructions per cycle for regression detection.
 
-
 /// Raw counters from `thread_selfcounts(1, ...)`.
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -234,11 +233,23 @@ mod tests {
         let delta_insn = after.instructions - before.instructions;
         let delta_cyc = after.cycles - before.cycles;
 
-        assert!(delta_insn > 1_000_000, "should have retired >1M instructions, got {}", delta_insn);
-        assert!(delta_cyc > 100_000, "should have used >100K cycles, got {}", delta_cyc);
+        assert!(
+            delta_insn > 1_000_000,
+            "should have retired >1M instructions, got {}",
+            delta_insn
+        );
+        assert!(
+            delta_cyc > 100_000,
+            "should have used >100K cycles, got {}",
+            delta_cyc
+        );
 
         let ipc = delta_insn as f64 / delta_cyc as f64;
-        assert!(ipc > 0.1 && ipc < 10.0, "IPC should be reasonable: {:.2}", ipc);
+        assert!(
+            ipc > 0.1 && ipc < 10.0,
+            "IPC should be reasonable: {:.2}",
+            ipc
+        );
     }
 
     #[cfg(target_os = "macos")]

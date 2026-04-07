@@ -43,13 +43,13 @@ pub fn protected_processes() -> HashSet<&'static str> {
         // Display & audio rendering pipeline — freezing any of these causes frame drops,
         // animation jank, or audio glitches visible to the user. [WWDC 2021 "Tune CPU job
         // scheduling with QoS"; Apple TN2169 SIP/process policy]
-        "Dock",            // Dock, Exposé, Mission Control animations
-        "coreaudiod",      // Real-time audio I/O loop — latency-critical
-        "mediaserverd",    // AVFoundation / CoreMedia pipeline
-        "displaypolicyd",  // Display power-state transitions — freeze → flicker
-        "runningboardd",   // Process lifecycle manager — freeze → broken app launches
-        "SystemUIServer",  // Menu bar / status bar rendering
-        "ControlCenter",   // Control center overlay rendering
+        "Dock",           // Dock, Exposé, Mission Control animations
+        "coreaudiod",     // Real-time audio I/O loop — latency-critical
+        "mediaserverd",   // AVFoundation / CoreMedia pipeline
+        "displaypolicyd", // Display power-state transitions — freeze → flicker
+        "runningboardd",  // Process lifecycle manager — freeze → broken app launches
+        "SystemUIServer", // Menu bar / status bar rendering
+        "ControlCenter",  // Control center overlay rendering
         // Core services — freeze → Finder hangs, app associations break, no icon updates.
         // [Apple TN3113] coreservicesd manages Launch Services database, UTI resolution,
         // and app registration. SIGSTOP leaves the system unable to resolve file types.
@@ -320,7 +320,15 @@ pub fn dev_runtime_patterns() -> &'static [&'static str] {
     // Production data (2026-04-06): clippy-driver frozen 7x — compiler toolchain
     // processes are dev-runtime critical; freeze during compilation → broken build.
     // [Saltzer & Kaashoek 2009] Fail-safe defaults: protect by default, not by exception.
-    &["node", "python", "java", "go", "nginx", "rustc", "clippy-driver"]
+    &[
+        "node",
+        "python",
+        "java",
+        "go",
+        "nginx",
+        "rustc",
+        "clippy-driver",
+    ]
 }
 
 /// Check if a process name matches a dev runtime pattern, with word-boundary
@@ -338,10 +346,10 @@ pub fn matches_dev_runtime(name: &str) -> bool {
             while let Some(pos) = lower[start..].find(pat) {
                 let abs_pos = start + pos;
                 let end_pos = abs_pos + pat.len();
-                let left_ok = abs_pos == 0
-                    || !lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
-                let right_ok = end_pos == lower.len()
-                    || !lower.as_bytes()[end_pos].is_ascii_alphanumeric();
+                let left_ok =
+                    abs_pos == 0 || !lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+                let right_ok =
+                    end_pos == lower.len() || !lower.as_bytes()[end_pos].is_ascii_alphanumeric();
                 if left_ok && right_ok {
                     return true;
                 }
@@ -402,7 +410,11 @@ pub fn behavioral_protection_score(
     // as a compute job with high CPU but no network.
 
     // CPU: kernel-measured user+system time. Nonzero = executing code.
-    let cpu_signal = if cpu_pct > 0.5 { 1.0 } else { cpu_pct as f64 / 0.5 };
+    let cpu_signal = if cpu_pct > 0.5 {
+        1.0
+    } else {
+        cpu_pct as f64 / 0.5
+    };
 
     // IPC: Mach message wakeups. Nonzero = receiving requests / responding.
     let ipc_signal = if wakeups_per_sec > 1.0 {
@@ -629,7 +641,11 @@ mod tests {
     fn dev_runtimes_not_in_infrastructure() {
         let infra = infrastructure_processes();
         for name in &["python", "node", "java", "go", "nginx"] {
-            assert!(!infra.contains(name), "'{}' must NOT be in infrastructure", name);
+            assert!(
+                !infra.contains(name),
+                "'{}' must NOT be in infrastructure",
+                name
+            );
         }
     }
 
@@ -637,7 +653,11 @@ mod tests {
     fn dev_runtimes_in_own_set() {
         let runtimes = dev_runtime_patterns();
         for name in &["python", "node", "java", "go", "nginx"] {
-            assert!(runtimes.contains(name), "'{}' must be in dev_runtime_patterns", name);
+            assert!(
+                runtimes.contains(name),
+                "'{}' must be in dev_runtime_patterns",
+                name
+            );
         }
     }
 
@@ -658,17 +678,24 @@ mod tests {
         // Python web server: CPU active, wakeups, network, recent interaction
         // activity=1.0, cost=1+1.5*sqrt(200M/8G)=1.17 → score≈0.76
         let score = behavioral_protection_score(5.0, 10.0, true, false, 30, 200_000_000, RAM_8GB);
-        assert!(score > 0.7, "active server should have high score: {}", score);
+        assert!(
+            score > 0.7,
+            "active server should have high score: {}",
+            score
+        );
     }
 
     #[test]
     fn dormant_zombie_gets_low_score() {
         // Abandoned Python script: 0 CPU, 0 wakeups, no network, idle 4 hours, 6.8GB RSS
         // activity≈e^(-24)≈0, cost=1+1.5*sqrt(0.85)=2.38 → score≈0
-        let score = behavioral_protection_score(
-            0.0, 0.0, false, false, 14400, 6_800_000_000, RAM_8GB,
+        let score =
+            behavioral_protection_score(0.0, 0.0, false, false, 14400, 6_800_000_000, RAM_8GB);
+        assert!(
+            score < 0.01,
+            "6.8GB dormant zombie should have near-zero score: {}",
+            score
         );
-        assert!(score < 0.01, "6.8GB dormant zombie should have near-zero score: {}", score);
     }
 
     #[test]
@@ -676,30 +703,34 @@ mod tests {
         // Small background Python (50MB): idle 10min but cheap to protect
         // recency=e^(-1)=0.37, cost=1+1.5*sqrt(50M/8G)=1.12 → score≈0.33
         let score = behavioral_protection_score(0.0, 0.0, false, false, 600, 50_000_000, RAM_8GB);
-        assert!(score > 0.2, "small idle process should have moderate score: {}", score);
+        assert!(
+            score > 0.2,
+            "small idle process should have moderate score: {}",
+            score
+        );
     }
 
     #[test]
     fn pressure_gate_protects_active_drops_dormant() {
         // Active 500MB server: activity=1.0, cost=1+1.5*sqrt(0.0625)=1.375 → score≈0.73
-        let active_score = behavioral_protection_score(
-            3.0, 5.0, true, false, 60, 500_000_000, RAM_8GB,
-        );
+        let active_score =
+            behavioral_protection_score(3.0, 5.0, true, false, 60, 500_000_000, RAM_8GB);
         // Dormant 6.8GB zombie: activity≈0, score≈0
-        let dormant_score = behavioral_protection_score(
-            0.0, 0.0, false, false, 7200, 6_800_000_000, RAM_8GB,
-        );
+        let dormant_score =
+            behavioral_protection_score(0.0, 0.0, false, false, 7200, 6_800_000_000, RAM_8GB);
         let pressure = 0.67; // typical stressed system
 
         assert!(
             active_score >= pressure,
             "active process should survive at pressure {}: score={}",
-            pressure, active_score
+            pressure,
+            active_score
         );
         assert!(
             dormant_score < pressure,
             "dormant hog should lose protection at pressure {}: score={}",
-            pressure, dormant_score
+            pressure,
+            dormant_score
         );
     }
 
@@ -711,7 +742,8 @@ mod tests {
         assert!(
             small > big,
             "smaller process should have higher score at same activity: small={} big={}",
-            small, big
+            small,
+            big
         );
     }
 
@@ -719,8 +751,13 @@ mod tests {
     fn gui_process_well_protected() {
         // Process with a visible window — user can see it → strong protection
         // gui_signal=0.8, cost=1+1.5*sqrt(1G/8G)=1.53 → score≈0.52
-        let score = behavioral_protection_score(0.0, 0.0, false, true, 3600, 1_000_000_000, RAM_8GB);
-        assert!(score > 0.4, "GUI process should be well-protected: {}", score);
+        let score =
+            behavioral_protection_score(0.0, 0.0, false, true, 3600, 1_000_000_000, RAM_8GB);
+        assert!(
+            score > 0.4,
+            "GUI process should be well-protected: {}",
+            score
+        );
     }
 
     #[test]
@@ -728,14 +765,13 @@ mod tests {
         // Idle daemon with network sockets but no other activity — should NOT be
         // immune at medium pressure. This is the CategoriesService / idle Python fix.
         // net_signal=0.3, idle=3600, cost≈1.0 → score≈0.3
-        let score = behavioral_protection_score(
-            0.0, 0.0, true, false, 3600, 50_000_000, RAM_8GB,
-        );
+        let score = behavioral_protection_score(0.0, 0.0, true, false, 3600, 50_000_000, RAM_8GB);
         let pressure = 0.5; // medium pressure
         assert!(
             score < pressure,
             "idle daemon with only network should lose protection at pressure {}: score={}",
-            pressure, score
+            pressure,
+            score
         );
     }
 
@@ -798,7 +834,12 @@ mod tests {
     #[test]
     fn interactive_app_at_rss_boundary() {
         // RSS == 100MB + 1 byte (> 100MB) → true even if idle
-        assert!(is_user_interactive_app(true, 9999, 100 * MB + 1, "HeavyApp"));
+        assert!(is_user_interactive_app(
+            true,
+            9999,
+            100 * MB + 1,
+            "HeavyApp"
+        ));
         // RSS == exactly 100MB (not >) → false if also idle
         assert!(!is_user_interactive_app(true, 9999, 100 * MB, "HeavyApp"));
     }
@@ -806,8 +847,18 @@ mod tests {
     #[test]
     fn unknown_app_name_follows_behavior() {
         // Arbitrary unknown name — decision is purely behavioral
-        assert!(is_user_interactive_app(true, 10, 5 * MB, "com.example.MyRandomApp"));
-        assert!(!is_user_interactive_app(false, 10, 5 * MB, "com.example.MyRandomApp"));
+        assert!(is_user_interactive_app(
+            true,
+            10,
+            5 * MB,
+            "com.example.MyRandomApp"
+        ));
+        assert!(!is_user_interactive_app(
+            false,
+            10,
+            5 * MB,
+            "com.example.MyRandomApp"
+        ));
     }
 
     // ── classify_protection() tests ────────────────────────────────────────
@@ -952,8 +1003,10 @@ mod tests {
             "coreservicesd must be protected — freeze breaks Finder, app associations, UTI resolution");
         assert!(protected.contains("audiod"),
             "audiod must be protected — freeze drops audio routing, disconnects Bluetooth headphones");
-        assert!(protected.contains("powerd"),
-            "powerd must be protected — freeze stalls sleep/wake state machine, uncontrolled fans");
+        assert!(
+            protected.contains("powerd"),
+            "powerd must be protected — freeze stalls sleep/wake state machine, uncontrolled fans"
+        );
     }
 
     /// Protected processes must include ALL rendering pipeline components.
@@ -961,11 +1014,21 @@ mod tests {
     #[test]
     fn protected_covers_rendering_pipeline() {
         let protected = protected_processes();
-        let pipeline = ["WindowServer", "Dock", "SystemUIServer", "ControlCenter",
-                        "coreaudiod", "mediaserverd", "displaypolicyd"];
+        let pipeline = [
+            "WindowServer",
+            "Dock",
+            "SystemUIServer",
+            "ControlCenter",
+            "coreaudiod",
+            "mediaserverd",
+            "displaypolicyd",
+        ];
         for name in &pipeline {
-            assert!(protected.contains(name),
-                "'{}' must be in rendering pipeline protection", name);
+            assert!(
+                protected.contains(name),
+                "'{}' must be in rendering pipeline protection",
+                name
+            );
         }
     }
 
@@ -974,8 +1037,11 @@ mod tests {
     fn is_hard_protected_matches_full_set() {
         let full = protected_processes();
         for &name in full.iter() {
-            assert!(is_hard_protected(name),
-                "is_hard_protected('{}') must return true", name);
+            assert!(
+                is_hard_protected(name),
+                "is_hard_protected('{}') must return true",
+                name
+            );
         }
         // Negative check.
         assert!(!is_hard_protected("random_process_xyz"));

@@ -126,9 +126,7 @@ pub fn apply_io_tier(pid: u32, tier: IOTier) -> bool {
             // Remove background status.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 0) == 0 }
         }
-        IOTier::Standard => {
-            unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 0) == 0 }
-        }
+        IOTier::Standard => unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 0) == 0 },
         IOTier::Utility | IOTier::Throttle | IOTier::Passive => {
             // Set to background priority (includes IO throttle).
             unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 20) == 0 }

@@ -163,10 +163,7 @@ impl ProcessTree {
         }
 
         // Build cpu_map for idle_children queries.
-        let cpu_map: HashMap<u32, f32> = entries
-            .iter()
-            .map(|e| (e.pid, e.cpu_usage))
-            .collect();
+        let cpu_map: HashMap<u32, f32> = entries.iter().map(|e| (e.pid, e.cpu_usage)).collect();
 
         Self {
             entries: entry_map,

@@ -18,18 +18,18 @@ const DECAY: f64 = 0.10;
 /// Input signals from Apollo's subsystems, collected each cycle.
 pub struct NeuroSignals {
     // Dopamine inputs
-    pub pressure_drop: f64,       // prev_pressure - current (positive = good)
-    pub outcome_penalty: f64,     // from OutcomeTracker (negative = bad)
+    pub pressure_drop: f64,   // prev_pressure - current (positive = good)
+    pub outcome_penalty: f64, // from OutcomeTracker (negative = bad)
     pub overflow_occurred: bool,
 
     // Noradrenaline inputs
-    pub urgency: f64,             // signal_digest.urgency
+    pub urgency: f64, // signal_digest.urgency
     pub regime_shift_up: bool,
-    pub pressure_velocity: f64,   // positive = rising pressure
+    pub pressure_velocity: f64, // positive = rising pressure
     pub thermal_emergency: bool,
 
     // Serotonin inputs
-    pub pressure_smooth: f64,     // for streak tracking
+    pub pressure_smooth: f64, // for streak tracking
     pub regime_shift_down: bool,
 
     // Acetylcholine inputs
@@ -91,7 +91,8 @@ impl ApolloNeuromodulator {
         let na_velocity = (s.pressure_velocity * 2.0).clamp(0.0, 0.3);
         let na_thermal = if s.thermal_emergency { 0.2 } else { 0.0 };
         let na_signal = (na_urgency + na_regime + na_velocity + na_thermal).clamp(0.0, 1.0);
-        self.noradrenaline = (self.noradrenaline * (1.0 - DECAY) + na_signal * DECAY).clamp(0.0, 1.0);
+        self.noradrenaline =
+            (self.noradrenaline * (1.0 - DECAY) + na_signal * DECAY).clamp(0.0, 1.0);
 
         // ── Serotonin: stability ─────────────────────────────────────
         if s.pressure_smooth < 0.30 {
@@ -113,18 +114,24 @@ impl ApolloNeuromodulator {
         let ach_entropy = (s.entropy_anomaly.abs() / 3.0).clamp(0.0, 0.3);
         let ach_explore = if s.rl_exploring { 0.2 } else { 0.05 };
         let ach_signal = (ach_churn + ach_entropy + ach_explore).clamp(0.0, 1.0);
-        self.acetylcholine = (self.acetylcholine * (1.0 - DECAY) + ach_signal * DECAY).clamp(0.0, 1.0);
+        self.acetylcholine =
+            (self.acetylcholine * (1.0 - DECAY) + ach_signal * DECAY).clamp(0.0, 1.0);
 
         // ── Derive parameters ────────────────────────────────────────
-        self.alpha_multiplier = 0.5 + self.dopamine;              // [0.5, 1.5]
+        self.alpha_multiplier = 0.5 + self.dopamine; // [0.5, 1.5]
         self.dyna_steps = (4.0 + self.noradrenaline * 16.0).round() as usize; // [4, 20]
-        self.serotonin_shift = (self.serotonin - 0.5) * 0.10;    // [-0.05, +0.05]
-        self.epsilon_bonus = self.acetylcholine * 0.05;           // [0.0, 0.05]
+        self.serotonin_shift = (self.serotonin - 0.5) * 0.10; // [-0.05, +0.05]
+        self.epsilon_bonus = self.acetylcholine * 0.05; // [0.0, 0.05]
     }
 
     /// Current levels for observability.
     pub fn levels(&self) -> (f64, f64, f64, f64) {
-        (self.dopamine, self.noradrenaline, self.serotonin, self.acetylcholine)
+        (
+            self.dopamine,
+            self.noradrenaline,
+            self.serotonin,
+            self.acetylcholine,
+        )
     }
 }
 
@@ -167,7 +174,11 @@ mod tests {
             nm.tick(&s);
         }
         assert!(nm.dopamine > 0.5, "DA should rise: {}", nm.dopamine);
-        assert!(nm.alpha_multiplier > 1.0, "alpha mult should increase: {}", nm.alpha_multiplier);
+        assert!(
+            nm.alpha_multiplier > 1.0,
+            "alpha mult should increase: {}",
+            nm.alpha_multiplier
+        );
     }
 
     #[test]
@@ -179,8 +190,16 @@ mod tests {
         for _ in 0..20 {
             nm.tick(&s);
         }
-        assert!(nm.noradrenaline > 0.5, "NA should rise: {}", nm.noradrenaline);
-        assert!(nm.dyna_steps > 10, "dyna steps should increase: {}", nm.dyna_steps);
+        assert!(
+            nm.noradrenaline > 0.5,
+            "NA should rise: {}",
+            nm.noradrenaline
+        );
+        assert!(
+            nm.dyna_steps > 10,
+            "dyna steps should increase: {}",
+            nm.dyna_steps
+        );
     }
 
     #[test]
@@ -194,7 +213,11 @@ mod tests {
             nm.tick(&s);
         }
         assert!(nm.serotonin > 0.5, "SE should rise: {}", nm.serotonin);
-        assert!(nm.serotonin_shift > 0.0, "shift should be positive: {}", nm.serotonin_shift);
+        assert!(
+            nm.serotonin_shift > 0.0,
+            "shift should be positive: {}",
+            nm.serotonin_shift
+        );
     }
 
     #[test]
@@ -207,8 +230,16 @@ mod tests {
         for _ in 0..20 {
             nm.tick(&s);
         }
-        assert!(nm.acetylcholine > 0.5, "ACh should rise: {}", nm.acetylcholine);
-        assert!(nm.epsilon_bonus > 0.025, "epsilon bonus should increase: {}", nm.epsilon_bonus);
+        assert!(
+            nm.acetylcholine > 0.5,
+            "ACh should rise: {}",
+            nm.acetylcholine
+        );
+        assert!(
+            nm.epsilon_bonus > 0.025,
+            "epsilon bonus should increase: {}",
+            nm.epsilon_bonus
+        );
     }
 
     #[test]
@@ -250,6 +281,11 @@ mod tests {
         for _ in 0..50 {
             nm.tick(&s);
         }
-        assert!(nm.noradrenaline < na_high, "NA should decay: {} < {}", nm.noradrenaline, na_high);
+        assert!(
+            nm.noradrenaline < na_high,
+            "NA should decay: {} < {}",
+            nm.noradrenaline,
+            na_high
+        );
     }
 }

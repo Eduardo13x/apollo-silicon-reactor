@@ -6,20 +6,20 @@
 //! which subsystems exist.
 
 use apollo_optimizer::engine::action_queue::ActionQueue;
-use apollo_optimizer::engine::energy_pid::EnergyPidTracker;
-use apollo_optimizer::engine::ioreport::IOReportReader;
-use apollo_optimizer::engine::thread_selfcounts::CycleIpcTracker;
 use apollo_optimizer::engine::analytics::AnalyticsEngine;
 use apollo_optimizer::engine::causal_graph::CausalGraph;
 use apollo_optimizer::engine::coalition::CoalitionTracker;
+use apollo_optimizer::engine::daemon_helpers::{hop_groups_path, skills_path};
 use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_optimizer::engine::energy::EnergyTracker;
+use apollo_optimizer::engine::energy_pid::EnergyPidTracker;
 use apollo_optimizer::engine::evolved_anomaly::EvolvedAnomalyDetector;
+use apollo_optimizer::engine::ioreport::IOReportReader;
 use apollo_optimizer::engine::learning_pipeline::LearningPipeline;
 use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
-use apollo_optimizer::engine::neuromodulator::ApolloNeuromodulator;
 use apollo_optimizer::engine::network_monitor::NetworkMonitor;
 use apollo_optimizer::engine::network_optimizer::NetworkOptimizer;
+use apollo_optimizer::engine::neuromodulator::ApolloNeuromodulator;
 use apollo_optimizer::engine::optimization_skills::SkillRegistry;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
 use apollo_optimizer::engine::power_management::PowerManager;
@@ -29,8 +29,8 @@ use apollo_optimizer::engine::swap_predictor::SwapPredictor;
 use apollo_optimizer::engine::syscall_classifier::SyscallClassifier;
 use apollo_optimizer::engine::thermal_bailout::ThermalBailout;
 use apollo_optimizer::engine::thermal_manager::ThermalManager;
+use apollo_optimizer::engine::thread_selfcounts::CycleIpcTracker;
 use apollo_optimizer::engine::wake_storm_detector::WakeStormDetector;
-use apollo_optimizer::engine::daemon_helpers::{hop_groups_path, skills_path};
 
 /// Subsystems constructed once at daemon startup with no shared-state dependencies.
 ///

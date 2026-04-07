@@ -4,7 +4,7 @@ use sysinfo::System;
 
 use crate::collector::SystemSnapshot;
 use crate::engine::amx_detector;
-use crate::engine::outcome_tracker::{PatternWeight, WorkloadHop, HopGroupWeight};
+use crate::engine::outcome_tracker::{HopGroupWeight, PatternWeight, WorkloadHop};
 use crate::engine::overflow_guard::OverflowThresholds;
 use crate::engine::safety::critical_background_processes;
 use crate::engine::thread_selfcounts::IpcClass;
@@ -22,7 +22,7 @@ use crate::engine::user_context::UserContext;
 /// [Lampson 1974] "Information is lost by having multiple, inconsistent copies."
 const INTERACTIVE_APPS: [&str; 28] = [
     // IDEs and editors
-    "Code",           // VS Code
+    "Code", // VS Code
     "Cursor",
     "Xcode",
     "Zed",
@@ -40,7 +40,7 @@ const INTERACTIVE_APPS: [&str; 28] = [
     "Arc",
     "Google Chrome",
     "Safari",
-    "Brave",          // CLAUDE.md invariant: never throttle
+    "Brave", // CLAUDE.md invariant: never throttle
     "Firefox",
     "Microsoft Edge",
     // Communication
@@ -61,26 +61,21 @@ const INTERACTIVE_APPS: [&str; 28] = [
 // memory-pressure gate (correct semantics). Having them here caused conflicting
 // immediate-throttle (NOISE) vs gated-throttle (DEFERRABLE) in the same cycle.
 // [Saltzer & Schroeder 1975] Economy of Mechanism — one policy per resource.
-const NOISE_APPS: [&str; 4] = [
-    "Dropbox",
-    "Google Drive",
-    "OneDrive",
-    "logioptionsplus",
-];
+const NOISE_APPS: [&str; 4] = ["Dropbox", "Google Drive", "OneDrive", "logioptionsplus"];
 
 /// Apple on-device intelligence / ML background daemons.
 /// These run opportunistically (idle + AC power) and are safe to throttle
 /// aggressively when memory pressure is high — they resume when pressure drops.
 const DEFERRABLE_DAEMONS: [&str; 9] = [
-    "duetexpertd",        // Siri predictions / Proactive engine
-    "suggestd",           // Spotlight/Siri suggestions ML
-    "photoanalysisd",     // Photos ML tagging / face recognition
-    "mediaanalysisd",     // Media content analysis
+    "duetexpertd",          // Siri predictions / Proactive engine
+    "suggestd",             // Spotlight/Siri suggestions ML
+    "photoanalysisd",       // Photos ML tagging / face recognition
+    "mediaanalysisd",       // Media content analysis
     "intelligencecontextd", // Apple Intelligence context engine
-    "mlhostd",            // Metal/Core ML on-device inference host
-    "modelmanagerd",      // On-device model cache manager
-    "corespeechd",        // Siri speech recognition (background)
-    "searchpartyd",       // Find My / Handoff BLE — 17 incorrect boosts in prod
+    "mlhostd",              // Metal/Core ML on-device inference host
+    "modelmanagerd",        // On-device model cache manager
+    "corespeechd",          // Siri speech recognition (background)
+    "searchpartyd",         // Find My / Handoff BLE — 17 incorrect boosts in prod
 ];
 
 const BLOCKER_APPS: [&str; 7] = [
@@ -375,21 +370,20 @@ pub fn decide_actions(
     // skip background throttling entirely — fluidity > marginal pressure relief.
     // At ThermalConstrained we always act regardless of user activity (safety first).
     // [Riva & Mantovani 2014] active user context → preserve responsiveness over efficiency.
-    let skip_bg_throttle_user_active = user_ctx.is_recently_active()
-        && matches!(context, InteractiveContext::InteractiveFocus);
+    let skip_bg_throttle_user_active =
+        user_ctx.is_recently_active() && matches!(context, InteractiveContext::InteractiveFocus);
 
     // Call in progress → elevate effective context to BackgroundPressure regardless of measured
     // pressure. Real-time audio/video codecs need CPU + memory bandwidth; throttling background
     // daemons frees both. Freeze is still blocked by freeze_protected() in step 5.
     // [Ellis & Gibbs 1989] "Concurrency control in groupware systems" — real-time collaboration
     // requires dedicated, low-latency CPU + memory bandwidth, not shared with background tasks.
-    let effective_context = if user_ctx.call_in_progress
-        && matches!(context, InteractiveContext::InteractiveFocus)
-    {
-        InteractiveContext::BackgroundPressure
-    } else {
-        context
-    };
+    let effective_context =
+        if user_ctx.call_in_progress && matches!(context, InteractiveContext::InteractiveFocus) {
+            InteractiveContext::BackgroundPressure
+        } else {
+            context
+        };
 
     // 1) Wait-graph practical: temporary boost for top blockers.
     let blocker_boost_count = match latency_target {
@@ -458,7 +452,8 @@ pub fn decide_actions(
                     // Groups needing exploration bypass the skip — the solver
                     // is uncertain about their effectiveness and needs more data.
                     if !group.needs_exploration() {
-                        if group.throttle_count >= 15 && group.effectiveness() < 0.12
+                        if group.throttle_count >= 15
+                            && group.effectiveness() < 0.12
                             && !matches!(context, InteractiveContext::ThermalConstrained)
                         {
                             low_value_skipped.push(format!("hrpo-skip:{}", name));
@@ -613,10 +608,14 @@ pub fn decide_actions(
     // scheduler rebalance that follows background E-core routing.
     // [WWDC 2021 "Tune CPU job scheduling with QoS"; Anderson & Dahlin 2014 "OS Fundamentals"]
     {
-        const DISPLAY_PIPELINE: &[&str] =
-            &["Dock", "coreaudiod", "mediaserverd", "SystemUIServer", "ControlCenter"];
-        let swap_delta_mb =
-            snapshot.pressure.swap_delta_bytes_per_sec / (1024.0 * 1024.0);
+        const DISPLAY_PIPELINE: &[&str] = &[
+            "Dock",
+            "coreaudiod",
+            "mediaserverd",
+            "SystemUIServer",
+            "ControlCenter",
+        ];
+        let swap_delta_mb = snapshot.pressure.swap_delta_bytes_per_sec / (1024.0 * 1024.0);
         // Trigger when swap grows ≥ 0.5 MB/s — early pressure signal, not crisis.
         if swap_delta_mb >= 0.5 {
             let mut display_boosts: Vec<RootAction> = Vec::new();
@@ -626,10 +625,7 @@ pub fn decide_actions(
                     display_boosts.push(RootAction::BoostProcess {
                         pid: pid.as_u32(),
                         name,
-                        reason: format!(
-                            "display pipeline — swap +{:.1} MB/s",
-                            swap_delta_mb
-                        ),
+                        reason: format!("display pipeline — swap +{:.1} MB/s", swap_delta_mb),
                     });
                 }
             }
@@ -821,7 +817,9 @@ pub fn decide_actions(
     if deferrable_pressure_trigger || deferrable_swap_trigger {
         ml_throttle_source = if deferrable_swap_trigger && !deferrable_pressure_trigger {
             "swap-early".to_string()
-        } else if user_ctx.call_in_progress && matches!(context, InteractiveContext::InteractiveFocus) {
+        } else if user_ctx.call_in_progress
+            && matches!(context, InteractiveContext::InteractiveFocus)
+        {
             // Triggered by call elevation, not real measured pressure.
             "call-mode".to_string()
         } else {
@@ -882,10 +880,17 @@ pub fn decide_actions(
             //   idle long  → gate_offset = -0.10 → lower gate = earlier, more aggressive freeze
             //   active     → gate_offset = +0.05 → raise gate = freeze only at higher pressure
             let gate_b_pressure = 0.75 + gate_offset;
-            let gate_b_swap_gb = if gate_offset < 0.0 { 0.7 } else if gate_offset > 0.0 { 1.3 } else { 1.0 };
+            let gate_b_swap_gb = if gate_offset < 0.0 {
+                0.7
+            } else if gate_offset > 0.0 {
+                1.3
+            } else {
+                1.0
+            };
             let gate_a = snapshot.pressure.memory_pressure >= thresholds.extreme_pressure
                 && snapshot.pressure.swap_delta_bytes_per_sec > (2.0 * 1024.0 * 1024.0);
-            let gate_b = snapshot.pressure.memory_pressure >= gate_b_pressure && swap_committed_gb >= gate_b_swap_gb;
+            let gate_b = snapshot.pressure.memory_pressure >= gate_b_pressure
+                && swap_committed_gb >= gate_b_swap_gb;
 
             // User in call / media playing: skip freeze — jank is worse than memory pressure.
             if freeze_skip_by_user {
@@ -893,7 +898,11 @@ pub fn decide_actions(
             }
             let extreme_freeze_ok = (gate_a || gate_b) && !freeze_skip_by_user;
             if extreme_freeze_ok {
-                freeze_gate = if gate_a { "delta".to_string() } else { "committed".to_string() };
+                freeze_gate = if gate_a {
+                    "delta".to_string()
+                } else {
+                    "committed".to_string()
+                };
                 // RSS-rank selection: freeze/throttle the largest-RSS background
                 // processes first — maximum pressure relief per action.
                 // [Android LMK: terminate by OOM-adj score (RSS proxy);
@@ -902,34 +911,40 @@ pub fn decide_actions(
                 // Replaced hardcoded ["Slack","Discord","Spotify","Teams"]: any
                 // memory-heavy background app (zoom.us, Figma, Electron apps)
                 // now qualifies. Protection stack in execute_actions still applies.
-                let mut freeze_candidates: Vec<(u32, String, u64, f32, u64)> =
-                    sys.processes()
-                        .iter()
-                        .filter_map(|(pid, process)| {
-                            let pid_u32 = pid.as_u32();
-                            if critical_pids.contains(&pid_u32) {
-                                return None;
-                            }
-                            let name = process.name().to_string();
-                            if is_interactive(&name, pid_u32) {
-                                return None;
-                            }
-                            Some((
-                                pid_u32,
-                                name,
-                                process.memory(), // RSS bytes
-                                process.cpu_usage(),
-                                process.start_time(),
-                            ))
-                        })
-                        .collect();
+                let mut freeze_candidates: Vec<(u32, String, u64, f32, u64)> = sys
+                    .processes()
+                    .iter()
+                    .filter_map(|(pid, process)| {
+                        let pid_u32 = pid.as_u32();
+                        if critical_pids.contains(&pid_u32) {
+                            return None;
+                        }
+                        let name = process.name().to_string();
+                        if is_interactive(&name, pid_u32) {
+                            return None;
+                        }
+                        Some((
+                            pid_u32,
+                            name,
+                            process.memory(), // RSS bytes
+                            process.cpu_usage(),
+                            process.start_time(),
+                        ))
+                    })
+                    .collect();
                 // Rank by physical footprint when available (more accurate than RSS),
                 // else fall back to RSS. phys_footprint excludes shared pages so it
                 // better reflects actual memory pressure contribution per process.
                 // [XNU proc_pid_rusage ri_phys_footprint] = true owned pages.
                 freeze_candidates.sort_unstable_by(|a, b| {
-                    let fa = footprint_hints.get(&a.0).copied().unwrap_or(a.2 as f64 / (1024.0 * 1024.0));
-                    let fb = footprint_hints.get(&b.0).copied().unwrap_or(b.2 as f64 / (1024.0 * 1024.0));
+                    let fa = footprint_hints
+                        .get(&a.0)
+                        .copied()
+                        .unwrap_or(a.2 as f64 / (1024.0 * 1024.0));
+                    let fb = footprint_hints
+                        .get(&b.0)
+                        .copied()
+                        .unwrap_or(b.2 as f64 / (1024.0 * 1024.0));
                     fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 // Cap at 3 per cycle — avoid SIGSTOP burst overhead on display pipeline.
@@ -952,10 +967,7 @@ pub fn decide_actions(
                         actions.push(RootAction::FreezeProcess {
                             pid,
                             name,
-                            reason: format!(
-                                "extreme pressure RSS-rank under {:?}",
-                                context
-                            ),
+                            reason: format!("extreme pressure RSS-rank under {:?}", context),
                             start_sec,
                             start_usec: 0,
                         });
@@ -984,10 +996,7 @@ pub fn decide_actions(
                 RootAction::BoostProcess { .. } => boosts.push(action),
                 RootAction::ThrottleProcess { name, .. } => {
                     let causal_key = format!("throttle:{}", name);
-                    let impact = causal_confidence
-                        .get(&causal_key)
-                        .copied()
-                        .unwrap_or(0.5); // unknown → neutral priority
+                    let impact = causal_confidence.get(&causal_key).copied().unwrap_or(0.5); // unknown → neutral priority
                     throttles.push((impact, action));
                 }
                 _ => others.push(action),
@@ -1627,7 +1636,15 @@ mod tests {
             !empty.contains(&999),
             "empty habituated set bypasses all habituation"
         );
-        let _ = (interactive, noise, weights, behavior_pids, ipc_hints, hop_groups, causal);
+        let _ = (
+            interactive,
+            noise,
+            weights,
+            behavior_pids,
+            ipc_hints,
+            hop_groups,
+            causal,
+        );
     }
 
     #[test]
@@ -1637,15 +1654,15 @@ mod tests {
         let swap_8gb: u64 = 8 * 1_073_741_824;
         let swap_normal: u64 = 2 * 1_073_741_824;
 
-        let bypass_on_swap   = swap_8gb >= 8 * 1_073_741_824;
+        let bypass_on_swap = swap_8gb >= 8 * 1_073_741_824;
         let no_bypass_normal = swap_normal >= 8 * 1_073_741_824;
-        let bypass_on_oom    = 0.96f64 >= 0.95;
-        let no_bypass_low    = 0.50f64 >= 0.95;
+        let bypass_on_oom = 0.96f64 >= 0.95;
+        let no_bypass_low = 0.50f64 >= 0.95;
 
-        assert!(bypass_on_swap,   "swap ≥ 8 GB should trigger bypass");
-        assert!(!no_bypass_normal,"swap = 2 GB should not trigger bypass");
-        assert!(bypass_on_oom,    "p_oom = 0.96 should trigger bypass");
-        assert!(!no_bypass_low,   "p_oom = 0.50 should not trigger bypass");
+        assert!(bypass_on_swap, "swap ≥ 8 GB should trigger bypass");
+        assert!(!no_bypass_normal, "swap = 2 GB should not trigger bypass");
+        assert!(bypass_on_oom, "p_oom = 0.96 should trigger bypass");
+        assert!(!no_bypass_low, "p_oom = 0.50 should not trigger bypass");
     }
 
     // ── anomaly_hints protection invariants ──────────────────────────────
@@ -1659,9 +1676,22 @@ mod tests {
         // All names in INTERACTIVE_APPS must be recognised by is_interactive_base.
         // If this test fails, a new INTERACTIVE_APPS entry was added but the
         // contains() check no longer matches — they would be anomaly-throttleable.
-        let protected = ["Code", "Arc", "Brave", "Claude", "LM Studio", "Safari",
-                         "zoom.us", "Xcode", "Terminal", "iTerm", "Warp",
-                         "Cursor", "Antigravity", "Google Chrome"];
+        let protected = [
+            "Code",
+            "Arc",
+            "Brave",
+            "Claude",
+            "LM Studio",
+            "Safari",
+            "zoom.us",
+            "Xcode",
+            "Terminal",
+            "iTerm",
+            "Warp",
+            "Cursor",
+            "Antigravity",
+            "Google Chrome",
+        ];
         for name in protected {
             assert!(
                 is_interactive_base(name),
@@ -1683,7 +1713,7 @@ mod tests {
         //
         // This test ensures the score pipeline itself computes correctly and that
         // the threshold gate matches expected values.
-        use crate::engine::process_baseline::{ANOMALY_THRESHOLD, effective_threshold};
+        use crate::engine::process_baseline::{effective_threshold, ANOMALY_THRESHOLD};
 
         // Simulate an anomalous reading for a process with warm baseline.
         let mut map = crate::engine::process_baseline::ProcessBaselineMap::new();
@@ -1692,12 +1722,21 @@ mod tests {
         }
         // Disk burst — Claude is anomalous by the detector.
         let score = map.anomaly_score("Claude", 1.5, 20.0, 500.0);
-        assert!(score >= ANOMALY_THRESHOLD, "score {} should be anomalous", score);
+        assert!(
+            score >= ANOMALY_THRESHOLD,
+            "score {} should be anomalous",
+            score
+        );
 
         // With 1 warm baseline, effective_threshold is raised slightly above nominal.
         let thresh = effective_threshold(map.warm_count());
         // Score still exceeds even the raised threshold (burst is extreme).
-        assert!(score >= thresh, "score {} should exceed raised threshold {}", score, thresh);
+        assert!(
+            score >= thresh,
+            "score {} should exceed raised threshold {}",
+            score,
+            thresh
+        );
 
         // The anomaly_hints map that would be built from this score:
         let mut hints: HashMap<u32, f64> = HashMap::new();
@@ -1706,8 +1745,10 @@ mod tests {
 
         // Verify: is_interactive_base("Claude") fires FIRST and returns true.
         // This is the compile-time proof that the guard order is correct.
-        assert!(is_interactive_base("Claude"),
-            "Claude must be caught by is_interactive_base before anomaly path runs");
+        assert!(
+            is_interactive_base("Claude"),
+            "Claude must be caught by is_interactive_base before anomaly path runs"
+        );
     }
 
     #[test]

@@ -133,7 +133,11 @@ pub fn read_iopm_state() -> Option<IoPmSnapshot> {
             let prop = read_property(b"Thermal Warning Level\0");
             if !prop.is_null() && CFGetTypeID(prop) == CFNumberGetTypeID() {
                 let mut level: i32 = 0;
-                CFNumberGetValue(prop, K_CF_NUMBER_SINT32_TYPE, &mut level as *mut _ as *mut _);
+                CFNumberGetValue(
+                    prop,
+                    K_CF_NUMBER_SINT32_TYPE,
+                    &mut level as *mut _ as *mut _,
+                );
                 CFRelease(prop);
                 match level {
                     0..=4 => ThermalWarning::None,

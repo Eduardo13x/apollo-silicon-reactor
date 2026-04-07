@@ -442,10 +442,9 @@ impl ChromiumManager {
 
         for (&pid, &(name, cpu, mem)) in &current_renderers {
             let browser = Self::browser_name(name).to_string();
-            let entry = self
-                .renderers
-                .entry(pid)
-                .or_insert_with(|| RendererInfo::new(pid, name.to_string(), browser.clone(), cpu, mem));
+            let entry = self.renderers.entry(pid).or_insert_with(|| {
+                RendererInfo::new(pid, name.to_string(), browser.clone(), cpu, mem)
+            });
 
             // Shift CPU history (newest first)
             entry.cpu_history[2] = entry.cpu_history[1];
@@ -458,8 +457,7 @@ impl ChromiumManager {
 
             // Update idle counter
             if cpu < IDLE_CPU_THRESHOLD {
-                entry.consecutive_idle_cycles =
-                    entry.consecutive_idle_cycles.saturating_add(1);
+                entry.consecutive_idle_cycles = entry.consecutive_idle_cycles.saturating_add(1);
             } else {
                 entry.consecutive_idle_cycles = 0;
             }
@@ -562,7 +560,8 @@ impl ChromiumManager {
         }
 
         // Prune dead PIDs from ecore_demoted set (Bug fix #4)
-        self.ecore_demoted.retain(|pid| self.renderers.contains_key(pid));
+        self.ecore_demoted
+            .retain(|pid| self.renderers.contains_key(pid));
 
         // First pass: per-renderer thaws (non-frozen CPU spike) and E-core demotions
         let pids: Vec<u32> = self.renderers.keys().copied().collect();
@@ -579,7 +578,10 @@ impl ChromiumManager {
             }
 
             // Skip if already queued for thaw by the fg-change pass above
-            if actions.iter().any(|a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == *pid)) {
+            if actions
+                .iter()
+                .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == *pid))
+            {
                 continue;
             }
 
@@ -685,8 +687,7 @@ impl ChromiumManager {
                 let browser_state = self.browsers.get(browser).cloned().unwrap_or_default();
                 let total = browser_state.total_renderers.max(1) as f32;
                 let already_frozen = browser_state.frozen_renderers as f32;
-                let max_additional =
-                    ((total * MAX_FREEZE_RATIO) - already_frozen).floor() as usize;
+                let max_additional = ((total * MAX_FREEZE_RATIO) - already_frozen).floor() as usize;
                 let max_additional = max_additional.min(candidates.len());
 
                 // Sort by idle cycles descending (freeze the most-idle first)
@@ -744,7 +745,9 @@ impl ChromiumManager {
         // ── Step 8: Apply state changes from actions ───────────────────────────
         for action in &actions {
             match action {
-                ChromiumAction::FreezeRenderer { pid, estimated_mb, .. } => {
+                ChromiumAction::FreezeRenderer {
+                    pid, estimated_mb, ..
+                } => {
                     self.frozen_pids.insert(*pid);
                     self.total_freed_mb += estimated_mb;
                     self.freezes_applied += 1;
@@ -869,7 +872,7 @@ impl ChromiumManager {
             #[repr(C)]
             #[derive(Default)]
             struct SocketInfo {
-                soi_stat_pad: [u64; 7],  // struct stat64
+                soi_stat_pad: [u64; 7], // struct stat64
                 soi_so_linger: i16,
                 soi_so_state: i16,
                 soi_so_options: i16,
@@ -911,15 +914,8 @@ impl ChromiumManager {
             }
 
             // Step 1: get all FD infos
-            let needed = unsafe {
-                proc_pidinfo(
-                    pid as i32,
-                    PROC_PIDLISTFDS,
-                    0,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
+            let needed =
+                unsafe { proc_pidinfo(pid as i32, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
             if needed <= 0 {
                 return false;
             }
@@ -1004,17 +1000,23 @@ mod tests {
 
     #[test]
     fn is_renderer_brave() {
-        assert!(ChromiumManager::is_renderer("Brave Browser Helper (Renderer)"));
+        assert!(ChromiumManager::is_renderer(
+            "Brave Browser Helper (Renderer)"
+        ));
     }
 
     #[test]
     fn is_renderer_chrome() {
-        assert!(ChromiumManager::is_renderer("Google Chrome Helper (Renderer)"));
+        assert!(ChromiumManager::is_renderer(
+            "Google Chrome Helper (Renderer)"
+        ));
     }
 
     #[test]
     fn is_renderer_edge() {
-        assert!(ChromiumManager::is_renderer("Microsoft Edge Helper (Renderer)"));
+        assert!(ChromiumManager::is_renderer(
+            "Microsoft Edge Helper (Renderer)"
+        ));
     }
 
     #[test]
@@ -1086,7 +1088,9 @@ mod tests {
         assert!(ChromiumManager::is_gpu_helper("Brave Browser Helper (GPU)"));
         assert!(ChromiumManager::is_gpu_helper("Google Chrome Helper (GPU)"));
         assert!(ChromiumManager::is_gpu_helper("Slack Helper (GPU)"));
-        assert!(!ChromiumManager::is_gpu_helper("Brave Browser Helper (Renderer)"));
+        assert!(!ChromiumManager::is_gpu_helper(
+            "Brave Browser Helper (Renderer)"
+        ));
         assert!(!ChromiumManager::is_gpu_helper("Brave Browser"));
     }
 
@@ -1153,9 +1157,8 @@ mod tests {
     #[test]
     fn idle_counter_increments_when_cpu_below_threshold() {
         let mut mgr = ChromiumManager::new();
-        let procs: Vec<(u32, &str, f32, u64)> = vec![
-            (100, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
-        ];
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(100, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
         let none_set = HashSet::new();
 
         mgr.update(&procs, None, &none_set, &none_set);
@@ -1216,11 +1219,7 @@ mod tests {
             mgr.update(&procs, None, &none_set, &none_set);
         }
 
-        let freeze_count = mgr
-            .renderers
-            .values()
-            .filter(|r| r.frozen)
-            .count();
+        let freeze_count = mgr.renderers.values().filter(|r| r.frozen).count();
 
         // 50% of 4 = 2, so at most 2 should be frozen
         assert!(
@@ -1250,7 +1249,10 @@ mod tests {
         }
 
         let info = mgr.renderers.get(&pid).unwrap();
-        assert!(!info.frozen, "renderer with power assertion must never be frozen");
+        assert!(
+            !info.frozen,
+            "renderer with power assertion must never be frozen"
+        );
     }
 
     // ── main_frozen PIDs must not be touched ───────────────────────────────────
@@ -1293,12 +1295,18 @@ mod tests {
         let procs1: Vec<(u32, &str, f32, u64)> =
             vec![(500, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
         mgr.update(&procs1, None, &none_set, &none_set);
-        assert!(mgr.renderers.contains_key(&500), "PID 500 should be tracked");
+        assert!(
+            mgr.renderers.contains_key(&500),
+            "PID 500 should be tracked"
+        );
 
         // Next cycle: PID 500 is gone
         let procs2: Vec<(u32, &str, f32, u64)> = vec![];
         mgr.update(&procs2, None, &none_set, &none_set);
-        assert!(!mgr.renderers.contains_key(&500), "PID 500 should be pruned");
+        assert!(
+            !mgr.renderers.contains_key(&500),
+            "PID 500 should be pruned"
+        );
     }
 
     #[test]
@@ -1310,10 +1318,7 @@ mod tests {
             vec![(600, "Code Helper (Renderer)", 0.5, 30_000_000)];
         mgr.update(&procs, None, &none_set, &none_set);
         assert!(mgr.renderers.contains_key(&600), "new PID should be added");
-        assert_eq!(
-            mgr.renderers.get(&600).unwrap().browser,
-            "Code"
-        );
+        assert_eq!(mgr.renderers.get(&600).unwrap().browser, "Code");
     }
 
     // ── Pressure-adaptive thresholds ───────────────────────────────────────────
@@ -1322,21 +1327,30 @@ mod tests {
     fn pressure_high_reduces_idle_cycles_required() {
         let mut mgr = ChromiumManager::new();
         mgr.set_pressure_context(0.85);
-        assert_eq!(mgr.idle_cycles_required, 1, "high pressure → 1 cycle required");
+        assert_eq!(
+            mgr.idle_cycles_required, 1,
+            "high pressure → 1 cycle required"
+        );
     }
 
     #[test]
     fn pressure_low_increases_idle_cycles_required() {
         let mut mgr = ChromiumManager::new();
         mgr.set_pressure_context(0.30);
-        assert_eq!(mgr.idle_cycles_required, 5, "low pressure → 5 cycles (never freeze)");
+        assert_eq!(
+            mgr.idle_cycles_required, 5,
+            "low pressure → 5 cycles (never freeze)"
+        );
     }
 
     #[test]
     fn pressure_normal_uses_default() {
         let mut mgr = ChromiumManager::new();
         mgr.set_pressure_context(0.55);
-        assert_eq!(mgr.idle_cycles_required, 3, "normal pressure → default 3 cycles");
+        assert_eq!(
+            mgr.idle_cycles_required, 3,
+            "normal pressure → default 3 cycles"
+        );
     }
 
     // ── Fluidity pause ─────────────────────────────────────────────────────────
@@ -1377,7 +1391,10 @@ mod tests {
             .filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. }))
             .count();
         // E-core demotions must still happen even with freeze_paused=true
-        assert!(ecore > 0, "E-core demotions must continue during window ops");
+        assert!(
+            ecore > 0,
+            "E-core demotions must continue during window ops"
+        );
     }
 
     // ── Shutdown cleanup ───────────────────────────────────────────────────────
@@ -1389,8 +1406,15 @@ mod tests {
         mgr.frozen_pids.insert(900);
         mgr.frozen_pids.insert(901);
         let thawed = mgr.shutdown_cleanup();
-        assert_eq!(thawed.len(), 2, "shutdown_cleanup must return all frozen PIDs");
-        assert!(mgr.frozen_pids.is_empty(), "frozen_pids must be empty after cleanup");
+        assert_eq!(
+            thawed.len(),
+            2,
+            "shutdown_cleanup must return all frozen PIDs"
+        );
+        assert!(
+            mgr.frozen_pids.is_empty(),
+            "frozen_pids must be empty after cleanup"
+        );
     }
 
     // ── ChromiumMetrics ────────────────────────────────────────────────────────
@@ -1439,12 +1463,7 @@ mod tests {
         // 15 renderers + 185 other processes
         let mut procs: Vec<(u32, &'static str, f32, u64)> = Vec::with_capacity(200);
         for i in 0..15u32 {
-            procs.push((
-                100 + i,
-                "Brave Browser Helper (Renderer)",
-                0.1,
-                50_000_000,
-            ));
+            procs.push((100 + i, "Brave Browser Helper (Renderer)", 0.1, 50_000_000));
         }
         for i in 0..185u32 {
             procs.push((1000 + i, "some-daemon", 0.5, 10_000_000));
@@ -1510,16 +1529,27 @@ mod tests {
 
         // No foreground — no thaw yet
         let actions = mgr.update(&frozen_procs, None, &none_set, &none_set);
-        let thaws: Vec<_> = actions.iter().filter(|a| matches!(a, ChromiumAction::ThawRenderer { .. })).collect();
+        let thaws: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, ChromiumAction::ThawRenderer { .. }))
+            .collect();
         assert!(thaws.is_empty(), "No thaw when no foreground browser");
 
         // User switches to Brave (pid 200 is now foreground)
         let actions = mgr.update(&frozen_procs, Some(200), &none_set, &none_set);
-        let thaws: Vec<u32> = actions.iter().filter_map(|a| match a {
-            ChromiumAction::ThawRenderer { pid, .. } => Some(*pid),
-            _ => None,
-        }).collect();
-        assert_eq!(thaws.len(), 2, "Both frozen Brave renderers must thaw on fg change, got {:?}", thaws);
+        let thaws: Vec<u32> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ChromiumAction::ThawRenderer { pid, .. } => Some(*pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thaws.len(),
+            2,
+            "Both frozen Brave renderers must thaw on fg change, got {:?}",
+            thaws
+        );
         assert!(thaws.contains(&200), "pid 200 must be thawed");
         assert!(thaws.contains(&201), "pid 201 must be thawed");
     }
@@ -1530,9 +1560,8 @@ mod tests {
     fn thaw_after_max_frozen_cycles() {
         let mut mgr = ChromiumManager::new();
         let none_set: HashSet<u32> = HashSet::new();
-        let procs: Vec<(u32, &str, f32, u64)> = vec![
-            (300, "Brave Browser Helper (Renderer)", 0.0, 50_000_000),
-        ];
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(300, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
 
         mgr.update(&procs, None, &none_set, &none_set);
         // Simulate frozen state
@@ -1545,8 +1574,14 @@ mod tests {
         // One more cycle pushes frozen_cycles to MAX_FROZEN_CYCLES+1 via saturating_add
         // But since we set it to MAX_FROZEN_CYCLES directly, update() sees >= MAX and thaws
         let actions = mgr.update(&procs, None, &none_set, &none_set);
-        let thaws: Vec<_> = actions.iter().filter(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 300)).collect();
-        assert!(!thaws.is_empty(), "Renderer must be thawed after MAX_FROZEN_CYCLES");
+        let thaws: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 300))
+            .collect();
+        assert!(
+            !thaws.is_empty(),
+            "Renderer must be thawed after MAX_FROZEN_CYCLES"
+        );
     }
 
     /// Bug fix #4: E-core demotion must not be re-emitted every cycle for the
@@ -1555,19 +1590,27 @@ mod tests {
     fn ecore_demotion_deduplicated_across_cycles() {
         let mut mgr = ChromiumManager::new();
         let none_set: HashSet<u32> = HashSet::new();
-        let procs: Vec<(u32, &str, f32, u64)> = vec![
-            (400, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
-        ];
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(400, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
 
         // Cycle 1: first time — should emit DemoteToEcores
         let actions1 = mgr.update(&procs, None, &none_set, &none_set);
-        let demotions1 = actions1.iter().filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. })).count();
+        let demotions1 = actions1
+            .iter()
+            .filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. }))
+            .count();
         assert_eq!(demotions1, 1, "First cycle must emit exactly 1 demotion");
 
         // Cycle 2: same renderer — must NOT re-emit (already demoted)
         let actions2 = mgr.update(&procs, None, &none_set, &none_set);
-        let demotions2 = actions2.iter().filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. })).count();
-        assert_eq!(demotions2, 0, "Subsequent cycles must NOT re-emit demotion for same PID");
+        let demotions2 = actions2
+            .iter()
+            .filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. }))
+            .count();
+        assert_eq!(
+            demotions2, 0,
+            "Subsequent cycles must NOT re-emit demotion for same PID"
+        );
     }
 
     /// Bug fix #3: FreezeSource::ChromiumManager must exist as distinct variant.
@@ -1655,7 +1698,10 @@ mod tests {
         let thawed = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 502));
-        assert!(!thawed, "prediction with P=0.20 must be ignored (threshold = 0.35)");
+        assert!(
+            !thawed,
+            "prediction with P=0.20 must be ignored (threshold = 0.35)"
+        );
     }
 
     // ── Enhancement B: ArousalState adaptive aggressiveness ───────────────────

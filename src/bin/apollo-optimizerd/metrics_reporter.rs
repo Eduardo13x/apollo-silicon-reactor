@@ -27,25 +27,27 @@ use chrono::Utc;
 
 use apollo_optimizer::collector::SystemSnapshot;
 use apollo_optimizer::engine::adaptive_governor::ProcessDecision;
-use apollo_optimizer::engine::daemon_helpers::{append_timeline, battery_pressure_boost, compute_p95, write_metrics};
+use apollo_optimizer::engine::daemon_helpers::{
+    append_timeline, battery_pressure_boost, compute_p95, write_metrics,
+};
 use apollo_optimizer::engine::daemon_state::SharedState;
 use apollo_optimizer::engine::execute_actions::ExecuteOutcomes;
-use apollo_optimizer::engine::types::BlockerScore;
 use apollo_optimizer::engine::io_tiering::IoShaper;
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::mach_qos::SchedulingTier;
+use apollo_optimizer::engine::nars_belief::ArousalState;
 use apollo_optimizer::engine::network_monitor::NetworkMonitor;
 use apollo_optimizer::engine::overflow_guard::OverflowThresholds;
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
 use apollo_optimizer::engine::power_management::PowerManager;
+use apollo_optimizer::engine::predictive_agent::Intervention;
 use apollo_optimizer::engine::process_classifier::ProcessTier;
+use apollo_optimizer::engine::process_tree::ProcessTree;
 use apollo_optimizer::engine::profile_governor::GovernorDecision;
 use apollo_optimizer::engine::signal_intelligence::SignalDigest;
 use apollo_optimizer::engine::thermal_bailout::ThermalAction;
+use apollo_optimizer::engine::types::BlockerScore;
 use apollo_optimizer::engine::types::OptimizationProfile;
-use apollo_optimizer::engine::nars_belief::ArousalState;
-use apollo_optimizer::engine::predictive_agent::Intervention;
-use apollo_optimizer::engine::process_tree::ProcessTree;
 
 use crate::process_enrichment;
 
@@ -75,7 +77,9 @@ pub fn update_learning_metrics<'a>(
     m.metrics.si_monopoly_risk = signal_digest.monopoly_risk;
     m.metrics.si_entropy_anomaly = signal_digest.entropy_anomaly;
     // Cable 4: top_causal_pairs() → expose in metrics for observability.
-    m.metrics.causal_pairs = lctx.outcome_tracker.top_causal_pairs(5)
+    m.metrics.causal_pairs = lctx
+        .outcome_tracker
+        .top_causal_pairs(5)
         .iter()
         .map(|(a, b, c)| format!("{} + {} ({})", a, b, c))
         .collect();
@@ -89,7 +93,9 @@ pub fn update_learning_metrics<'a>(
     m.metrics.causal_slow_horizon_count = lctx.causal_graph.slow_horizon_count();
     m.metrics.causal_mechanism_count = lctx.causal_graph.mechanism_count();
     // Top mechanism summaries for observability.
-    m.metrics.causal_mechanisms = lctx.causal_graph.solid_edges_by_impact()
+    m.metrics.causal_mechanisms = lctx
+        .causal_graph
+        .solid_edges_by_impact()
         .iter()
         .take(5)
         .filter_map(|e| {
@@ -121,13 +127,23 @@ pub fn update_learning_metrics<'a>(
     };
     // HRPO / Dr. Zero metrics
     m.metrics.dr_zero_self_challenge = lctx.outcome_tracker.self_challenge_score();
-    m.metrics.dr_zero_groups = lctx.outcome_tracker.hop_group_summary()
+    m.metrics.dr_zero_groups = lctx
+        .outcome_tracker
+        .hop_group_summary()
         .iter()
         .map(|(hop, eff, count, pred_err)| {
-            format!("{:?}(eff={:.0}% n={} err={:.2})", hop, eff * 100.0, count, pred_err)
+            format!(
+                "{:?}(eff={:.0}% n={} err={:.2})",
+                hop,
+                eff * 100.0,
+                count,
+                pred_err
+            )
         })
         .collect();
-    m.metrics.dr_zero_exploration = lctx.outcome_tracker.exploration_needed()
+    m.metrics.dr_zero_exploration = lctx
+        .outcome_tracker
+        .exploration_needed()
         .iter()
         .map(|(hop, err)| format!("{:?}(err={:.2})", hop, err))
         .collect();
@@ -239,9 +255,7 @@ pub fn apply_qos_routing(
                         }
                     }
                     GovDecision::Throttle => return None,
-                    GovDecision::Freeze | GovDecision::Kill => {
-                        SchedulingTier::Background
-                    }
+                    GovDecision::Freeze | GovDecision::Kill => SchedulingTier::Background,
                 }
             };
             Some((decision.pid, tier))
@@ -338,11 +352,7 @@ pub fn merge_cycle_metrics<'a>(
     let had_new_failures = exec_outcomes.failures > 0;
 
     metrics.metrics.cycles += 1;
-    metrics.metrics.reactor_pulses += if decision_reactor_weight > 0.2 {
-        1
-    } else {
-        0
-    };
+    metrics.metrics.reactor_pulses += if decision_reactor_weight > 0.2 { 1 } else { 0 };
     metrics.metrics.last_cycle_at = Some(Utc::now());
     metrics.metrics.last_blockers = decision_blockers.to_vec();
     metrics.metrics.effective_profile = current_profile;
@@ -397,8 +407,7 @@ pub fn merge_cycle_metrics<'a>(
     metrics.metrics.overflow_events_7d = lctx.overflow_guard.recent_overflow_count(7);
     metrics.metrics.overflow_threshold_offset_pp =
         (lctx.overflow_guard.compute_dynamic_offset() * 100.0).round() as i32;
-    metrics.metrics.overflow_workload_mode =
-        overflow_thresholds.workload_mode.as_str().to_string();
+    metrics.metrics.overflow_workload_mode = overflow_thresholds.workload_mode.as_str().to_string();
 
     // RL threshold agent metrics (Phase 4).
     if let Some(rl) = &lctx.overflow_guard.rl_agent {

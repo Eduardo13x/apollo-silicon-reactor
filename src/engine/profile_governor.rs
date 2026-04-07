@@ -398,7 +398,8 @@ fn pressure_score(input: &GovernorInput) -> f64 {
     // Cap at 0.12 (2 GB → full boost on 8 GB machines; higher RAM → less boost).
     let swap_gb = input.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let swap_boost = (swap_gb / 2.0).clamp(0.0, 1.0) * 0.12;
-    let base = (0.35 * cpu + 0.35 * ram + 0.20 * wait + 0.10 * reactor + swap_boost).clamp(0.0, 1.0);
+    let base =
+        (0.35 * cpu + 0.35 * ram + 0.20 * wait + 0.10 * reactor + swap_boost).clamp(0.0, 1.0);
 
     // Memory-thrash crisis override: when both RAM and swap are simultaneously stressed,
     // the CPU-idle formula chronically underscores the real system state.
@@ -498,7 +499,10 @@ mod tests {
         // If already in AggressiveRoot, onset should be a no-op.
         let mut gov = make_governor(OptimizationProfile::AggressiveRoot);
         let decision = gov.evaluate(low_pressure_input(true));
-        assert_eq!(decision.effective_profile, OptimizationProfile::AggressiveRoot);
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::AggressiveRoot
+        );
     }
 
     #[test]

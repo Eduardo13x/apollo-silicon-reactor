@@ -5,9 +5,7 @@ fn main() {
             .args(["--show-sdk-path"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| {
-                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk".into()
-            });
+            .unwrap_or_else(|_| "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk".into());
 
         // ── IOReport bridge ──────────────────────────────────────────────
         cc::Build::new()

@@ -158,7 +158,10 @@ mod tests {
     fn needs_cooling_at_threshold_exact() {
         let mgr = GPUManager::new();
         let m = make_metrics(90.0, 50.0, false, GPUPowerState::Dynamic);
-        assert!(!mgr.needs_cooling(&m), "exactly at threshold should not need cooling");
+        assert!(
+            !mgr.needs_cooling(&m),
+            "exactly at threshold should not need cooling"
+        );
     }
 
     #[test]
@@ -180,26 +183,38 @@ mod tests {
     #[test]
     fn recommend_throttled_above_max_safe() {
         let mgr = GPUManager::new();
-        assert_eq!(mgr.recommend_power_state(50.0, 101.0), GPUPowerState::Throttled);
+        assert_eq!(
+            mgr.recommend_power_state(50.0, 101.0),
+            GPUPowerState::Throttled
+        );
     }
 
     #[test]
     fn recommend_dynamic_when_hot_but_below_max() {
         let mgr = GPUManager::new();
         // temp > throttle_threshold (90) but <= max_safe (100)
-        assert_eq!(mgr.recommend_power_state(99.0, 95.0), GPUPowerState::Dynamic);
+        assert_eq!(
+            mgr.recommend_power_state(99.0, 95.0),
+            GPUPowerState::Dynamic
+        );
     }
 
     #[test]
     fn recommend_maximum_high_utilization_cool() {
         let mgr = GPUManager::new();
-        assert_eq!(mgr.recommend_power_state(85.0, 70.0), GPUPowerState::Maximum);
+        assert_eq!(
+            mgr.recommend_power_state(85.0, 70.0),
+            GPUPowerState::Maximum
+        );
     }
 
     #[test]
     fn recommend_dynamic_moderate_utilization() {
         let mgr = GPUManager::new();
-        assert_eq!(mgr.recommend_power_state(50.0, 70.0), GPUPowerState::Dynamic);
+        assert_eq!(
+            mgr.recommend_power_state(50.0, 70.0),
+            GPUPowerState::Dynamic
+        );
     }
 
     #[test]
@@ -212,7 +227,10 @@ mod tests {
     fn recommend_boundary_utilization_80() {
         let mgr = GPUManager::new();
         // utilization == 80 is NOT > 80, falls to Dynamic
-        assert_eq!(mgr.recommend_power_state(80.0, 70.0), GPUPowerState::Dynamic);
+        assert_eq!(
+            mgr.recommend_power_state(80.0, 70.0),
+            GPUPowerState::Dynamic
+        );
     }
 
     #[test]
@@ -226,7 +244,10 @@ mod tests {
     fn recommend_temp_takes_priority_over_utilization() {
         let mgr = GPUManager::new();
         // Even at 100% utilization, if temp > max_safe → Throttled
-        assert_eq!(mgr.recommend_power_state(100.0, 105.0), GPUPowerState::Throttled);
+        assert_eq!(
+            mgr.recommend_power_state(100.0, 105.0),
+            GPUPowerState::Throttled
+        );
     }
 
     // --- optimize_for_workload ---

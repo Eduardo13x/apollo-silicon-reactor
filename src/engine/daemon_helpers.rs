@@ -16,8 +16,8 @@ use crate::engine::power_management::PowerManager;
 use crate::engine::process_identity::ProcessIdentity;
 use crate::engine::profile_governor::{GovernorPersisted, ProfileGovernor};
 use crate::engine::types::{
-    FreezeSource, FrozenEntry, FrozenPidEntry, FrozenStatePersisted, HardPath,
-    OptimizationProfile, ProfileTransition, RuntimeMetrics,
+    FreezeSource, FrozenEntry, FrozenPidEntry, FrozenStatePersisted, HardPath, OptimizationProfile,
+    ProfileTransition, RuntimeMetrics,
 };
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -38,79 +38,155 @@ fn is_root() -> bool {
 }
 
 pub fn socket_path() -> &'static str {
-    if is_root() { "/var/run/apollo-optimizer.sock" } else { "/tmp/apollo-optimizer.sock" }
+    if is_root() {
+        "/var/run/apollo-optimizer.sock"
+    } else {
+        "/tmp/apollo-optimizer.sock"
+    }
 }
 
 pub fn kill_switch_path() -> &'static str {
-    if is_root() { "/var/run/apollo.disable" } else { "/tmp/apollo.disable" }
+    if is_root() {
+        "/var/run/apollo.disable"
+    } else {
+        "/tmp/apollo.disable"
+    }
 }
 
 pub fn journal_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/journal.jsonl" } else { "/tmp/apollo-journal.jsonl" }
+    if is_root() {
+        "/var/lib/apollo/journal.jsonl"
+    } else {
+        "/tmp/apollo-journal.jsonl"
+    }
 }
 
 pub fn audit_log_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/deep_scan_audit.jsonl" } else { "/tmp/apollo-deep_scan_audit.jsonl" }
+    if is_root() {
+        "/var/lib/apollo/deep_scan_audit.jsonl"
+    } else {
+        "/tmp/apollo-deep_scan_audit.jsonl"
+    }
 }
 
 pub fn metrics_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/runtime_metrics.json" } else { "/tmp/apollo-runtime_metrics.json" }
+    if is_root() {
+        "/var/lib/apollo/runtime_metrics.json"
+    } else {
+        "/tmp/apollo-runtime_metrics.json"
+    }
 }
 
 pub fn governor_state_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/governor_state.json" } else { "/tmp/apollo-governor_state.json" }
+    if is_root() {
+        "/var/lib/apollo/governor_state.json"
+    } else {
+        "/tmp/apollo-governor_state.json"
+    }
 }
 
 pub fn overflow_history_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/overflow_history.json" } else { "/tmp/apollo-overflow_history.json" }
+    if is_root() {
+        "/var/lib/apollo/overflow_history.json"
+    } else {
+        "/tmp/apollo-overflow_history.json"
+    }
 }
 
 pub fn rl_threshold_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/rl_threshold.json" } else { "/tmp/apollo-rl_threshold.json" }
+    if is_root() {
+        "/var/lib/apollo/rl_threshold.json"
+    } else {
+        "/tmp/apollo-rl_threshold.json"
+    }
 }
 
 pub fn predictive_agent_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/predictive_agent.json" } else { "/tmp/apollo-predictive_agent.json" }
+    if is_root() {
+        "/var/lib/apollo/predictive_agent.json"
+    } else {
+        "/tmp/apollo-predictive_agent.json"
+    }
 }
 
 pub fn markov_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/markov_transitions.json" } else { "/tmp/apollo-markov_transitions.json" }
+    if is_root() {
+        "/var/lib/apollo/markov_transitions.json"
+    } else {
+        "/tmp/apollo-markov_transitions.json"
+    }
 }
 
 pub fn signal_intelligence_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/signal_intelligence.json" } else { "/tmp/apollo-signal_intelligence.json" }
+    if is_root() {
+        "/var/lib/apollo/signal_intelligence.json"
+    } else {
+        "/tmp/apollo-signal_intelligence.json"
+    }
 }
 
 pub fn holt_winters_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/holt_winters.json" } else { "/tmp/apollo-holt_winters.json" }
+    if is_root() {
+        "/var/lib/apollo/holt_winters.json"
+    } else {
+        "/tmp/apollo-holt_winters.json"
+    }
 }
 
 pub fn timeline_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/profile_timeline.jsonl" } else { "/tmp/apollo-profile_timeline.jsonl" }
+    if is_root() {
+        "/var/lib/apollo/profile_timeline.jsonl"
+    } else {
+        "/tmp/apollo-profile_timeline.jsonl"
+    }
 }
 
 pub fn wake_state_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/wake_state.json" } else { "/tmp/apollo-wake_state.json" }
+    if is_root() {
+        "/var/lib/apollo/wake_state.json"
+    } else {
+        "/tmp/apollo-wake_state.json"
+    }
 }
 
 pub fn frozen_state_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/frozen_state.json" } else { "/tmp/apollo-frozen_state.json" }
+    if is_root() {
+        "/var/lib/apollo/frozen_state.json"
+    } else {
+        "/tmp/apollo-frozen_state.json"
+    }
 }
 
 pub fn hop_groups_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/hrpo_groups.json" } else { "/tmp/apollo-hrpo_groups.json" }
+    if is_root() {
+        "/var/lib/apollo/hrpo_groups.json"
+    } else {
+        "/tmp/apollo-hrpo_groups.json"
+    }
 }
 
 pub fn learned_state_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/learned_state.json" } else { "/tmp/apollo-learned_state.json" }
+    if is_root() {
+        "/var/lib/apollo/learned_state.json"
+    } else {
+        "/tmp/apollo-learned_state.json"
+    }
 }
 
 pub fn skills_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/optimization_skills.json" } else { "/tmp/apollo-optimization_skills.json" }
+    if is_root() {
+        "/var/lib/apollo/optimization_skills.json"
+    } else {
+        "/tmp/apollo-optimization_skills.json"
+    }
 }
 
 pub fn temporal_histograms_path() -> &'static str {
-    if is_root() { "/var/lib/apollo/temporal_histograms.json" } else { "/tmp/apollo-temporal_histograms.json" }
+    if is_root() {
+        "/var/lib/apollo/temporal_histograms.json"
+    } else {
+        "/tmp/apollo-temporal_histograms.json"
+    }
 }
 
 // ── Audit Log ───────────────────────────────────────────────────────────────
@@ -271,18 +347,13 @@ pub fn unfreeze_pids(pids: impl Iterator<Item = u32>) -> u64 {
 }
 
 /// Returns true when a frozen process should be thawed.
-pub fn should_unfreeze(
-    elapsed_secs: i64,
-    pressure_at_freeze: f64,
-    current_pressure: f64,
-) -> bool {
+pub fn should_unfreeze(elapsed_secs: i64, pressure_at_freeze: f64, current_pressure: f64) -> bool {
     let ttl_expired = elapsed_secs > FREEZE_TTL_SECS;
     let pressure_recovered = elapsed_secs >= 30
         && pressure_at_freeze > 0.0
         && (current_pressure <= pressure_at_freeze * 0.6
             || (pressure_at_freeze - current_pressure) >= 0.05);
-    let stale_with_improvement =
-        elapsed_secs >= 120 && current_pressure < pressure_at_freeze;
+    let stale_with_improvement = elapsed_secs >= 120 && current_pressure < pressure_at_freeze;
     ttl_expired || pressure_recovered || stale_with_improvement
 }
 
@@ -315,9 +386,7 @@ pub fn merge_seed_into(policy: &mut LearnedPolicy) {
         }
     }
     for pat in &seed.interactive_patterns {
-        if !policy.interactive_patterns.contains(pat)
-            && !policy.protected_patterns.contains(pat)
-        {
+        if !policy.interactive_patterns.contains(pat) && !policy.protected_patterns.contains(pat) {
             policy.interactive_patterns.push(pat.clone());
         }
     }
@@ -332,9 +401,9 @@ pub fn merge_seed_into(policy: &mut LearnedPolicy) {
     policy
         .interactive_patterns
         .retain(|p| !policy.protected_patterns.contains(p));
-    policy
-        .noise_patterns
-        .retain(|p| !policy.protected_patterns.contains(p) && !policy.interactive_patterns.contains(p));
+    policy.noise_patterns.retain(|p| {
+        !policy.protected_patterns.contains(p) && !policy.interactive_patterns.contains(p)
+    });
 }
 
 pub fn pid_start_time(pid: u32) -> (u64, u64) {
