@@ -189,7 +189,16 @@ impl AdaptiveGovernor {
             }
 
             let utility = score_utility(snap);
-            let decision = self.decide_one(snap, *tier, utility, *waste, workload, classified.len(), foreground_app, hour_of_day);
+            let decision = self.decide_one(
+                snap,
+                *tier,
+                utility,
+                *waste,
+                workload,
+                classified.len(),
+                foreground_app,
+                hour_of_day,
+            );
             decisions.push(decision);
         }
 
@@ -227,18 +236,32 @@ impl AdaptiveGovernor {
         foreground_app: Option<&str>,
         hour_of_day: u8,
     ) -> ProcessDecision {
-        // Zombie/orphan — always kill regardless of other signals.
-        // A process with dead parent or zombie flag is leaked; its CPU/RSS
-        // stats are unreliable and it can't serve any user purpose.
+        // Zombie/orphan handling: true zombies (is_zombie=true) need SIGKILL to
+        // reap their kernel entry. Mere orphans (parent died, but process is still
+        // running and may be in the middle of I/O) should be frozen, not killed —
+        // killing mid-write can corrupt data. A frozen orphan drains naturally once
+        // it tries to communicate with its dead parent.
         if tier == ProcessTier::ZombieOrphan {
+            if snap.is_zombie {
+                return ProcessDecision {
+                    pid: snap.pid,
+                    name: snap.name.clone(),
+                    decision: GovernorDecision::Kill,
+                    tier,
+                    utility_score: 0.0,
+                    waste_score: 1.0,
+                    reason: "Zombie process — reap with SIGKILL".into(),
+                };
+            }
+            // Non-zombie orphan: freeze to reclaim resources safely.
             return ProcessDecision {
                 pid: snap.pid,
                 name: snap.name.clone(),
-                decision: GovernorDecision::Kill,
+                decision: GovernorDecision::Freeze,
                 tier,
                 utility_score: 0.0,
                 waste_score: 1.0,
-                reason: "Zombie/orphan process — kill".into(),
+                reason: "Orphaned process (parent dead) — freeze to reclaim".into(),
             };
         }
 
@@ -339,10 +362,7 @@ impl AdaptiveGovernor {
                 tier,
                 utility_score: utility,
                 waste_score: waste,
-                reason: format!(
-                    "IPC hub ({} Mach ports) — protected",
-                    snap.mach_port_count
-                ),
+                reason: format!("IPC hub ({} Mach ports) — protected", snap.mach_port_count),
             };
         }
 
@@ -361,7 +381,10 @@ impl AdaptiveGovernor {
                 tier,
                 utility_score: utility,
                 waste_score: waste,
-                reason: format!("LLM model loaded ({}MB RSS) — reload cost too high", snap.rss_bytes / 1024 / 1024),
+                reason: format!(
+                    "LLM model loaded ({}MB RSS) — reload cost too high",
+                    snap.rss_bytes / 1024 / 1024
+                ),
             };
         }
 
@@ -375,7 +398,10 @@ impl AdaptiveGovernor {
                 tier,
                 utility_score: utility,
                 waste_score: waste,
-                reason: format!("Active I/O work ({} pageins, {:.0}% CPU) — protected", snap.pageins_total, snap.cpu_percent),
+                reason: format!(
+                    "Active I/O work ({} pageins, {:.0}% CPU) — protected",
+                    snap.pageins_total, snap.cpu_percent
+                ),
             };
         }
 
@@ -424,10 +450,38 @@ impl AdaptiveGovernor {
             adjusted_utility = (adjusted_utility - penalty).max(0.0);
         }
 
+        // Extreme GUI abandonment: a window untouched for >24h is not an active
+        // session — it is abandoned memory. The normal graduated-idle rule skips
+        // GUI windows, but 24h is long enough that freezing is safe even with a
+        // visible window. Translated (Rosetta) apps consume 2x memory, so any
+        // extreme-idle Rosetta window is also worth reclaiming.
+        if snap.has_gui_window
+            && snap.secs_since_foreground > 86400
+            && snap.cpu_percent < 2.0
+        {
+            return ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision: GovernorDecision::Freeze,
+                tier,
+                utility_score: adjusted_utility,
+                waste_score: waste,
+                reason: format!(
+                    "GUI app abandoned >24h (idle={}h) — freeze to reclaim memory",
+                    snap.secs_since_foreground / 3600
+                ),
+            };
+        }
+
         // Graduated idle: the idle override (above) only catches cpu < 0.5%.
         // But a daemon idle for 6h+ is effectively abandoned even at moderate CPU.
         // Graduated: >6h → Throttle, >12h → Freeze. No GUI required.
-        if !snap.has_gui_window && snap.secs_since_foreground > 21600 {
+        // Processes with high faults (>500K) are doing active GPU/memory work —
+        // their idle time is deceptive (e.g. Metal shader caches between frames).
+        if !snap.has_gui_window
+            && snap.secs_since_foreground > 21600
+            && snap.faults_total < 500_000
+        {
             let decision = if snap.secs_since_foreground > 43200 {
                 GovernorDecision::Freeze
             } else {
@@ -443,7 +497,11 @@ impl AdaptiveGovernor {
                 reason: format!(
                     "Graduated idle ({}h, no GUI) — {}",
                     snap.secs_since_foreground / 3600,
-                    if snap.secs_since_foreground > 43200 { "freeze" } else { "throttle" }
+                    if snap.secs_since_foreground > 43200 {
+                        "freeze"
+                    } else {
+                        "throttle"
+                    }
                 ),
             };
         }
@@ -476,7 +534,11 @@ impl AdaptiveGovernor {
         // Non-GUI background processes with idle > 15min should be throttled to
         // save energy. Placed AFTER FG helper check so Safari tabs survive at 3AM.
         let is_night = hour_of_day < 6;
-        if is_night && !snap.has_gui_window && snap.secs_since_foreground > 900 && adjusted_utility < 0.55 {
+        if is_night
+            && !snap.has_gui_window
+            && snap.secs_since_foreground > 900
+            && adjusted_utility < 0.55
+        {
             return ProcessDecision {
                 pid: snap.pid,
                 name: snap.name.clone(),
@@ -544,7 +606,12 @@ impl AdaptiveGovernor {
         // Swarm exemptions: high faults = active memory work (GPU, mmap I/O),
         // significant Mach ports (40+) = serving other processes via XPC.
         let swarm_exempt = snap.faults_total > 500000 || snap.mach_port_count > 40;
-        if process_count > 30 && waste >= 0.30 && adjusted_utility < 0.55 && !snap.has_gui_window && !swarm_exempt {
+        if process_count > 30
+            && waste >= 0.30
+            && adjusted_utility < 0.55
+            && !snap.has_gui_window
+            && !swarm_exempt
+        {
             // Translated (Rosetta) processes in swarm get frozen: they use ~2x
             // memory from JIT page tables, so reclaiming is more valuable.
             let swarm_decision = if snap.is_translated {
@@ -570,7 +637,11 @@ impl AdaptiveGovernor {
         // of deep idle on every wakeup (P→E transition on M1). Even at low CPU%,
         // this destroys battery life. Throttle to reduce wakeup frequency.
         // Render pipeline processes are exempt (computed above waste override).
-        if snap.wakeups_per_sec > 100.0 && !snap.has_gui_window && adjusted_utility < 0.50 && !render_pipeline_exempt {
+        if snap.wakeups_per_sec > 100.0
+            && !snap.has_gui_window
+            && adjusted_utility < 0.50
+            && !render_pipeline_exempt
+        {
             return ProcessDecision {
                 pid: snap.pid,
                 name: snap.name.clone(),
@@ -591,17 +662,26 @@ impl AdaptiveGovernor {
         let (decision, reason) = if adjusted_utility < self.config.freeze_utility_threshold {
             (
                 GovernorDecision::Freeze,
-                format!("utility={:.2} waste={:.2} workload={:?}", adjusted_utility, waste, workload),
+                format!(
+                    "utility={:.2} waste={:.2} workload={:?}",
+                    adjusted_utility, waste, workload
+                ),
             )
         } else if adjusted_utility < throttle_thresh {
             (
                 GovernorDecision::Throttle,
-                format!("utility={:.2} waste={:.2} workload={:?}", adjusted_utility, waste, workload),
+                format!(
+                    "utility={:.2} waste={:.2} workload={:?}",
+                    adjusted_utility, waste, workload
+                ),
             )
         } else {
             (
                 GovernorDecision::Allow,
-                format!("utility={:.2} waste={:.2} workload={:?}", adjusted_utility, waste, workload),
+                format!(
+                    "utility={:.2} waste={:.2} workload={:?}",
+                    adjusted_utility, waste, workload
+                ),
             )
         };
 
@@ -699,11 +779,11 @@ pub struct GovernorSummary {
 /// Throttling them causes dropped frames even though they have no GUI window.
 fn is_render_pipeline(name: &str) -> bool {
     const RENDER_NAMES: &[&str] = &[
-        "VDCAssistant",        // Video decode compositor
-        "coreservicesd",       // System UI compositing
-        "com.apple.gpu",       // GPU helper processes
-        "MTLCompilerService",  // Metal shader compilation
-        "mediaserverd",        // AV render pipeline
+        "VDCAssistant",       // Video decode compositor
+        "coreservicesd",      // System UI compositing
+        "com.apple.gpu",      // GPU helper processes
+        "MTLCompilerService", // Metal shader compilation
+        "mediaserverd",       // AV render pipeline
     ];
     RENDER_NAMES.iter().any(|r| name.contains(r))
 }
@@ -762,10 +842,42 @@ mod tests {
     #[test]
     fn summarise_counts_correctly() {
         let decisions = vec![
-            ProcessDecision { pid: 1, name: "a".into(), decision: GovernorDecision::Allow, tier: ProcessTier::SilentDaemon, utility_score: 0.5, waste_score: 0.1, reason: "".into() },
-            ProcessDecision { pid: 2, name: "b".into(), decision: GovernorDecision::Throttle, tier: ProcessTier::SilentDaemon, utility_score: 0.1, waste_score: 0.5, reason: "".into() },
-            ProcessDecision { pid: 3, name: "c".into(), decision: GovernorDecision::Freeze, tier: ProcessTier::SilentDaemon, utility_score: 0.0, waste_score: 0.9, reason: "".into() },
-            ProcessDecision { pid: 4, name: "d".into(), decision: GovernorDecision::Kill, tier: ProcessTier::ZombieOrphan, utility_score: 0.0, waste_score: 1.0, reason: "".into() },
+            ProcessDecision {
+                pid: 1,
+                name: "a".into(),
+                decision: GovernorDecision::Allow,
+                tier: ProcessTier::SilentDaemon,
+                utility_score: 0.5,
+                waste_score: 0.1,
+                reason: "".into(),
+            },
+            ProcessDecision {
+                pid: 2,
+                name: "b".into(),
+                decision: GovernorDecision::Throttle,
+                tier: ProcessTier::SilentDaemon,
+                utility_score: 0.1,
+                waste_score: 0.5,
+                reason: "".into(),
+            },
+            ProcessDecision {
+                pid: 3,
+                name: "c".into(),
+                decision: GovernorDecision::Freeze,
+                tier: ProcessTier::SilentDaemon,
+                utility_score: 0.0,
+                waste_score: 0.9,
+                reason: "".into(),
+            },
+            ProcessDecision {
+                pid: 4,
+                name: "d".into(),
+                decision: GovernorDecision::Kill,
+                tier: ProcessTier::ZombieOrphan,
+                utility_score: 0.0,
+                waste_score: 1.0,
+                reason: "".into(),
+            },
         ];
         let summary = AdaptiveGovernor::summarise(&decisions);
         assert_eq!(summary.total, 4);
@@ -812,8 +924,11 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].decision, GovernorDecision::Allow,
-            "ephemeral XPC < 8s must always be allowed");
+        assert_eq!(
+            decisions[0].decision,
+            GovernorDecision::Allow,
+            "ephemeral XPC < 8s must always be allowed"
+        );
     }
 
     // ── Graduated idle ────────────────────────────────────────────────────────
@@ -828,8 +943,11 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].decision, GovernorDecision::Throttle,
-            "idle > 6h should be throttled");
+        assert_eq!(
+            decisions[0].decision,
+            GovernorDecision::Throttle,
+            "idle > 6h should be throttled"
+        );
     }
 
     #[test]
@@ -842,8 +960,11 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].decision, GovernorDecision::Freeze,
-            "idle > 12h should be frozen");
+        assert_eq!(
+            decisions[0].decision,
+            GovernorDecision::Freeze,
+            "idle > 12h should be frozen"
+        );
     }
 
     // ── IPC hub protection ────────────────────────────────────────────────────
@@ -858,8 +979,11 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].decision, GovernorDecision::Allow,
-            "high Mach port count = IPC hub, must be protected");
+        assert_eq!(
+            decisions[0].decision,
+            GovernorDecision::Allow,
+            "high Mach port count = IPC hub, must be protected"
+        );
     }
 
     // ── Night mode ────────────────────────────────────────────────────────────
@@ -882,7 +1006,8 @@ mod tests {
         let d = &decisions[0];
         assert!(
             d.decision == GovernorDecision::Throttle || d.decision == GovernorDecision::Allow,
-            "night mode should throttle or allow, not freeze/kill: {:?}", d.decision
+            "night mode should throttle or allow, not freeze/kill: {:?}",
+            d.decision
         );
     }
 
@@ -902,8 +1027,11 @@ mod tests {
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
         assert_eq!(decisions.len(), 1);
         // High wakeups + no GUI + low utility → throttle.
-        assert_eq!(decisions[0].decision, GovernorDecision::Throttle,
-            "wakeup hog should be throttled");
+        assert_eq!(
+            decisions[0].decision,
+            GovernorDecision::Throttle,
+            "wakeup hog should be throttled"
+        );
     }
 
     // ── Foreground helper detection ───────────────────────────────────────────
@@ -918,8 +1046,11 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), Some("Safari"), &["Safari"], 14);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].decision, GovernorDecision::Allow,
-            "WebKit helper with Safari in foreground must be protected");
+        assert_eq!(
+            decisions[0].decision,
+            GovernorDecision::Allow,
+            "WebKit helper with Safari in foreground must be protected"
+        );
     }
 
     // ── Governor config default ───────────────────────────────────────────────
@@ -950,11 +1081,17 @@ mod tests {
     #[test]
     fn low_ram_machine_gets_lower_waste_threshold() {
         use crate::engine::silicon_probe::SiliconInfo;
-        let hw_8gb = SiliconInfo { memory_bytes: 8 * 1024 * 1024 * 1024, ..SiliconInfo::read() };
+        let hw_8gb = SiliconInfo {
+            memory_bytes: 8 * 1024 * 1024 * 1024,
+            ..SiliconInfo::read()
+        };
         let cfg = calibrate_config_for_hardware(&hw_8gb);
         // 8GB machine: waste threshold should be 0.80, more aggressive.
-        assert!((cfg.waste_override_threshold - 0.80).abs() < 0.01,
-            "8GB machine should use 0.80 waste threshold, got {}", cfg.waste_override_threshold);
+        assert!(
+            (cfg.waste_override_threshold - 0.80).abs() < 0.01,
+            "8GB machine should use 0.80 waste threshold, got {}",
+            cfg.waste_override_threshold
+        );
     }
 
     // ── Micro-benchmark: decide_all latency ──────────────────────────────────
@@ -980,8 +1117,10 @@ mod tests {
         }
         let per_call_ms = start.elapsed().as_secs_f64() * 1000.0 / n as f64;
         // 20 processes × governor logic should complete in < 5ms per cycle.
-        assert!(per_call_ms < 5.0,
-            "decide_all too slow: {per_call_ms:.2}ms/call (expected < 5ms)");
+        assert!(
+            per_call_ms < 5.0,
+            "decide_all too slow: {per_call_ms:.2}ms/call (expected < 5ms)"
+        );
     }
 }
 

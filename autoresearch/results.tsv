@@ -26,3 +26,4 @@ dc0400a	3889.0	53/55	1239	keep	Exp31: Graduated idle 6h/12h (fixes s51, s54, s55
 a906d38	9908.97	140/140	2922	keep	Neuro Black Box — LearnableParams + auto-tune + 3 feedback loops + contextual NARS + log ingestion + meta-learning + outcome accel (+98 tests)
 a5523e8	9908.78	140/140	2922	keep	Evolve 10-iter — all 22 LearnableParams wired: CUSUM k/h, Kalman Q/R, PID, nars_drift, ws_spike, fluidity; 3 runtime fixes (persist, SNR, hot-path log); background log ingester
 b7854c1	10458.78	151/155	2922	baseline	Boss L8 (s61-s75): orphan detection, GUI idle, IO rate, faults+idle, translated GUI — 4 fail
+HEAD	10658.78	155/155	2922	keep	Exp36: Orphan→Freeze (not Kill) + GUI abandoned >24h + faults>500K skip graduated-idle (fixes s67,s69,s71,s75)
