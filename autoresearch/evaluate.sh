@@ -34,7 +34,7 @@
 # Baseline (frozen):
 BASELINE_TESTS=1370
 BASELINE_SIZE_KB=4055
-TOTAL_SCENARIOS=140
+TOTAL_SCENARIOS=155
 # ══════════════════════════════════════════════════════════════════════════════
 cd "$(dirname "$0")/.."
 
@@ -82,7 +82,12 @@ RL_OUTPUT=$(cargo test --test prepare_rl 2>&1 || true)
 RL_PASSED=$(echo "$RL_OUTPUT" | grep -cE 'test scenarios::r[0-9]+.*ok$' || echo 0)
 RL_PASSED=${RL_PASSED:-0}
 
-SCENARIOS_PASSED=$((GOV_PASSED + LAT_PASSED + MEM_PASSED + ACT_PASSED + CLS_PASSED + SIG_PASSED + RL_PASSED))
+# Boss Level 8 scenarios (s61-s75)
+BOSS8_OUTPUT=$(cargo test --test prepare_boss8 2>&1 || true)
+BOSS8_PASSED=$(echo "$BOSS8_OUTPUT" | grep -cE 'test scenarios::s[0-9]+.*ok$' || echo 0)
+BOSS8_PASSED=${BOSS8_PASSED:-0}
+
+SCENARIOS_PASSED=$((GOV_PASSED + LAT_PASSED + MEM_PASSED + ACT_PASSED + CLS_PASSED + SIG_PASSED + RL_PASSED + BOSS8_PASSED))
 SCENARIOS_FAILED=$((TOTAL_SCENARIOS - SCENARIOS_PASSED))
 
 # ── Step 3: Non-scenario tests (regression gate) ────────────────────────────
