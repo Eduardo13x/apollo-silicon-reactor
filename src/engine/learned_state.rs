@@ -755,20 +755,14 @@ pub struct RestoreQualityMonitor {
     fired: bool,
 }
 
-/// Warmup cycles to skip after restore (~120s at 2s/cycle).
+/// Warmup cycles to skip after restore (~60s at 2s/cycle).
 ///
-/// Why 60 and not fewer: each observation at cycle N reflects a throttle that
-/// was STARTED at cycle N - (outcome_wait_secs/cycle_interval) ≈ N - 15. So an
-/// observation at cycle 20 is judging a throttle from cycle 5 — deep in the
-/// post-restart chaos (process scan, log ingester backlog, pending outcomes
-/// resolving with stale pre-pressure). To observe outcomes from throttles that
-/// were STARTED in steady state, warmup must cover:
-///   - Startup duration (~60s = 30 cycles): daemon init, baseline warm-up
-///   - Outcome wait window (~30s = 15 cycles): resolve latency after action
-///   - Safety margin (~30s = 15 cycles): pressure stabilization
-/// Total: 60 cycles. Production measured 0% effective in a 20-cycle warmup
-/// window because it was still observing pre-stabilization outcomes.
-const WARMUP_CYCLES: u32 = 60;
+/// Observation at cycle N judges a throttle started at cycle N - (outcome_wait
+/// /cycle_interval) ≈ N - 15. So a 30-cycle warmup ensures we observe only
+/// throttles that were started after cycle 15 — past the initial daemon scan
+/// and log ingester burst. Combined with the 50-cycle observation window, the
+/// full (warmup + observation) window is 80 cycles ≈ 160 seconds post-restart.
+const WARMUP_CYCLES: u32 = 30;
 /// Observation window: 50 cycles of *clean* data after warmup (~100s).
 const QUALITY_WINDOW: u32 = 50;
 /// Minimum resolved outcomes required for a statistically meaningful verdict.

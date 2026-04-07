@@ -310,12 +310,25 @@ pub fn run_learning_tick<'a>(
             }
         }
         // Restore quality monitor: track post-restore effectiveness.
+        //
+        // The correct "resolved this tick" count is `resolved_outcomes.len()`,
+        // NOT `effective_names.len() + low_value_names.len()`. The previous
+        // code conflated two unrelated lists:
+        //   - effective_names: outcomes that resolved effectively in THIS tick
+        //   - low_value_names: ALL patterns historically marked low-value,
+        //                      recomputed every tick from self.weights
+        // Summing them inflated `resolved` with the entire lifetime low-value
+        // list, producing quality ≈ 0 even in a healthy system (observed in
+        // production: 0/3000 over 120s). `resolved_outcomes` is the authoritative
+        // per-tick resolution list documented as "includes both effective and
+        // ineffective resolutions" in OutcomeBatch.
+        //
         // The verdict is compared against the long-term steady-state effective
         // rate (not a hardcoded constant) so it only flags real regressions
         // rather than healthy-but-unspectacular behavior.
         if !restore_monitor.is_done() {
+            let batch_res = batch.resolved_outcomes.len() as u32;
             let batch_eff = batch.effective_names.len() as u32;
-            let batch_res = (batch.effective_names.len() + batch.low_value_names.len()) as u32;
             restore_monitor.observe(batch_eff, batch_res);
             let steady_state = lctx.outcome_tracker.overall_effectiveness();
             if let Some(verdict) = restore_monitor.verdict(steady_state) {
