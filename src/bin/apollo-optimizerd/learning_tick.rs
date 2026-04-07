@@ -310,11 +310,15 @@ pub fn run_learning_tick<'a>(
             }
         }
         // Restore quality monitor: track post-restore effectiveness.
+        // The verdict is compared against the long-term steady-state effective
+        // rate (not a hardcoded constant) so it only flags real regressions
+        // rather than healthy-but-unspectacular behavior.
         if !restore_monitor.is_done() {
             let batch_eff = batch.effective_names.len() as u32;
             let batch_res = (batch.effective_names.len() + batch.low_value_names.len()) as u32;
             restore_monitor.observe(batch_eff, batch_res);
-            if let Some(verdict) = restore_monitor.verdict() {
+            let steady_state = lctx.outcome_tracker.overall_effectiveness();
+            if let Some(verdict) = restore_monitor.verdict(steady_state) {
                 *last_restore_quality = Some(verdict.quality);
                 if verdict.stale {
                     lctx.signal_intel.reset_zones();

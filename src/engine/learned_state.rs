@@ -736,10 +736,14 @@ impl LearnedState {
 
 /// Tracks whether restored state is helping or hurting.
 ///
-/// Usage: create after restore, call `observe()` each cycle for the first 50 cycles.
-/// After 50 cycles, `verdict()` returns the quality score.
-/// If quality < cold-start baseline (0.5), the restored state was stale — the daemon
-/// should partially reset (e.g., clear experience memory, reset zones to defaults).
+/// Two-phase measurement:
+///   1. Warmup (20 cycles, ~40s): observations are discarded because post-restart
+///      data is contaminated by stale pending outcomes and startup scan noise.
+///   2. Observation (50 cycles, ~100s): clean measurement of effectiveness.
+///
+/// The verdict compares the measured quality against the long-term steady-state
+/// effective rate (supplied by the caller via `overall_effectiveness()`), not
+/// against a hardcoded threshold. Stale = quality dropped to <50% of baseline.
 pub struct RestoreQualityMonitor {
     /// Number of cycles observed since restore.
     cycles: u32,
@@ -751,10 +755,26 @@ pub struct RestoreQualityMonitor {
     fired: bool,
 }
 
-/// Observation window: 50 cycles (~100s at 2s/cycle).
+/// Warmup cycles to skip after restore (~40s at 2s/cycle).
+/// The first ~20 cycles post-restart are contaminated:
+///   - Stale pre-pressure in pending outcomes resolving from the previous run
+///   - Initial process scan + log ingester backlog creating noise
+///   - Cold caches inflating resolve latency
+/// We skip these cycles entirely rather than polluting the measurement.
+const WARMUP_CYCLES: u32 = 20;
+/// Observation window: 50 cycles of *clean* data after warmup (~100s).
 const QUALITY_WINDOW: u32 = 50;
-/// If post-restore effectiveness is below this, restored state is hurting.
-const QUALITY_THRESHOLD: f64 = 0.35;
+/// Minimum resolved outcomes required for a statistically meaningful verdict.
+/// Below this, we assume OK (can't judge with too few samples).
+const MIN_RESOLVED: u32 = 30;
+/// Stale detection: quality must drop below this fraction of the long-term
+/// steady-state effectiveness rate. A 50% drop from baseline is clearly broken;
+/// smaller fluctuations are normal variance.
+///
+/// Why relative, not absolute: the previous code used an absolute threshold
+/// of 0.35, but real steady-state effective rate is ~0.20 (19.67% in production).
+/// An absolute threshold of 0.35 would flag *any* healthy system as stale.
+const STALE_RATIO: f64 = 0.5;
 
 impl RestoreQualityMonitor {
     /// Create a new monitor. Call right after `LearnedState::apply()`.
@@ -768,35 +788,48 @@ impl RestoreQualityMonitor {
     }
 
     /// Feed an outcome observation. Call each cycle with the batch results.
+    /// During the warmup period the call is counted toward cycle progress but
+    /// the effective/resolved accumulators are NOT touched — post-restart noise
+    /// must not pollute the quality measurement.
     pub fn observe(&mut self, batch_effective: u32, batch_resolved: u32) {
         if self.fired {
             return;
         }
         self.cycles += 1;
+        if self.cycles <= WARMUP_CYCLES {
+            return;
+        }
         self.effective += batch_effective;
         self.resolved += batch_resolved;
     }
 
     /// Check if the observation window is complete and return a verdict.
-    /// Returns `Some(quality)` once, where quality is the effectiveness ratio.
-    /// Returns `None` if still observing or already fired.
-    pub fn verdict(&mut self) -> Option<RestoreVerdict> {
-        if self.fired || self.cycles < QUALITY_WINDOW {
+    ///
+    /// The verdict compares the measured quality against the caller's long-term
+    /// steady-state effective rate, NOT against a hardcoded constant. Stale is
+    /// defined as a drop to less than `STALE_RATIO` of steady-state.
+    ///
+    /// Returns `Some(verdict)` once the full (warmup + observation) window has
+    /// elapsed; `None` while still observing or after the monitor has fired.
+    pub fn verdict(&mut self, long_term_rate: f64) -> Option<RestoreVerdict> {
+        if self.fired || self.cycles < WARMUP_CYCLES + QUALITY_WINDOW {
             return None;
         }
         self.fired = true;
-        let quality = if self.resolved < 5 {
-            // Not enough data to judge — assume OK.
+        if self.resolved < MIN_RESOLVED {
+            // Not enough clean samples to judge — assume OK.
             return Some(RestoreVerdict {
                 quality: 0.5,
                 stale: false,
             });
-        } else {
-            (self.effective as f64 + 1.0) / (self.resolved as f64 + 2.0)
-        };
+        }
+        let quality = (self.effective as f64 + 1.0) / (self.resolved as f64 + 2.0);
+        // Stale threshold: half of steady-state. Floored at 0.02 so a cold-start
+        // system (long_term_rate ≈ 0) still has a sane comparison point.
+        let stale_threshold = (long_term_rate * STALE_RATIO).max(0.02);
         Some(RestoreVerdict {
             quality,
-            stale: quality < QUALITY_THRESHOLD,
+            stale: quality < stale_threshold,
         })
     }
 
@@ -1079,28 +1112,42 @@ mod tests {
     #[test]
     fn restore_quality_monitor_detects_stale() {
         let mut monitor = RestoreQualityMonitor::new();
-        // Simulate 50 cycles of terrible effectiveness (2/50 effective).
-        for i in 0..QUALITY_WINDOW {
-            let eff = if i < 2 { 1 } else { 0 };
+        // Feed WARMUP_CYCLES + QUALITY_WINDOW total. Within the observation
+        // window (post-warmup), only 2 of 50 outcomes are effective — that is
+        // well below half of a 20% steady-state.
+        for i in 0..(WARMUP_CYCLES + QUALITY_WINDOW) {
+            let in_observation = i >= WARMUP_CYCLES;
+            let eff = if in_observation && i < WARMUP_CYCLES + 2 {
+                1
+            } else {
+                0
+            };
             monitor.observe(eff, 1);
         }
-        let verdict = monitor.verdict().expect("should have verdict");
+        // Simulate a healthy steady-state of 20% (matches real production).
+        let verdict = monitor.verdict(0.20).expect("should have verdict");
         assert!(
             verdict.stale,
-            "low effectiveness should be flagged as stale"
+            "effectiveness < 50% of steady-state must be flagged stale"
         );
-        assert!(verdict.quality < QUALITY_THRESHOLD);
+        // quality ≈ 3/52 ≈ 0.058; stale_threshold = 0.20 * 0.5 = 0.10.
+        assert!(verdict.quality < 0.10);
     }
 
     #[test]
     fn restore_quality_monitor_approves_good_state() {
         let mut monitor = RestoreQualityMonitor::new();
-        // Simulate 50 cycles of good effectiveness (40/50 effective).
-        for i in 0..QUALITY_WINDOW {
-            let eff = if i < 40 { 1 } else { 0 };
+        // 40/50 effective in the observation window — clearly above baseline.
+        for i in 0..(WARMUP_CYCLES + QUALITY_WINDOW) {
+            let in_observation = i >= WARMUP_CYCLES;
+            let eff = if in_observation && i < WARMUP_CYCLES + 40 {
+                1
+            } else {
+                0
+            };
             monitor.observe(eff, 1);
         }
-        let verdict = monitor.verdict().expect("should have verdict");
+        let verdict = monitor.verdict(0.20).expect("should have verdict");
         assert!(!verdict.stale, "good effectiveness should not be stale");
         assert!(verdict.quality > 0.7);
     }
@@ -1108,15 +1155,64 @@ mod tests {
     #[test]
     fn restore_quality_fires_only_once() {
         let mut monitor = RestoreQualityMonitor::new();
-        for _ in 0..QUALITY_WINDOW {
+        for _ in 0..(WARMUP_CYCLES + QUALITY_WINDOW) {
             monitor.observe(1, 1);
         }
-        assert!(monitor.verdict().is_some());
+        assert!(monitor.verdict(0.20).is_some());
         assert!(
-            monitor.verdict().is_none(),
+            monitor.verdict(0.20).is_none(),
             "second call should return None"
         );
         assert!(monitor.is_done());
+    }
+
+    #[test]
+    fn restore_quality_monitor_ignores_warmup_noise() {
+        // This test reproduces the production bug: the first cycles post-restart
+        // have 0 effective outcomes (pending actions resolving with stale data).
+        // Before the fix, this contaminated the measurement; after the fix, the
+        // warmup is skipped and the clean observation window sees good data.
+        let mut monitor = RestoreQualityMonitor::new();
+
+        // Warmup: 20 cycles of pure noise (0 effective, 1 resolved each).
+        for _ in 0..WARMUP_CYCLES {
+            monitor.observe(0, 1);
+        }
+        // Observation: 50 cycles at healthy 20% effectiveness.
+        for i in 0..QUALITY_WINDOW {
+            let eff = if i < 10 { 1 } else { 0 };
+            monitor.observe(eff, 1);
+        }
+
+        let verdict = monitor.verdict(0.20).expect("should have verdict");
+        // Measured quality should reflect ONLY the observation window.
+        // 10/50 effective → (10+1)/(50+2) = 11/52 ≈ 0.212 (healthy).
+        assert!(
+            !verdict.stale,
+            "warmup noise must NOT contaminate verdict (quality={})",
+            verdict.quality
+        );
+        assert!(verdict.quality > 0.18 && verdict.quality < 0.25);
+    }
+
+    #[test]
+    fn restore_quality_monitor_waits_for_minimum_samples() {
+        // Even after the full window, if too few outcomes resolved (sparse
+        // traffic), the monitor returns neutral 0.5 instead of a noisy verdict.
+        let mut monitor = RestoreQualityMonitor::new();
+        for i in 0..(WARMUP_CYCLES + QUALITY_WINDOW) {
+            // Only 10 resolved outcomes total in the observation window —
+            // below MIN_RESOLVED = 30.
+            let resolved = if i >= WARMUP_CYCLES && i < WARMUP_CYCLES + 10 {
+                1
+            } else {
+                0
+            };
+            monitor.observe(0, resolved);
+        }
+        let verdict = monitor.verdict(0.20).expect("should have verdict");
+        assert!(!verdict.stale, "too-few-samples verdict must not be stale");
+        assert_eq!(verdict.quality, 0.5);
     }
 
     // ── LearnableParams tests ───────────────────────────────────────────
