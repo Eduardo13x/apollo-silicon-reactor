@@ -4949,6 +4949,14 @@ fn main() -> anyhow::Result<()> {
                     // arousal signal is available — crisis arousal freezes faster,
                     // idle arousal thaws everything.
                     chromium_mgr.set_arousal_context(arousal_state.level);
+                    // Build preemption: when the user is in a build session,
+                    // force maximum freeze aggressiveness on background
+                    // renderers BEFORE rustc/cargo/clang demand RAM. This is
+                    // what prevents OOM-driven reboots on 8GB systems: bulkhead
+                    // renderer memory from build memory.
+                    chromium_mgr.set_build_preemption(
+                        win_workload_intent == WorkloadIntent::BuildSession,
+                    );
                     // Pause freeze decisions during window ops / app launches
                     chromium_mgr.set_fluidity_context(
                         fluidity_state.window_op_active(),

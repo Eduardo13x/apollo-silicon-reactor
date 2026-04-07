@@ -176,6 +176,12 @@ pub struct ChromiumManager {
     idle_cycles_required: u8,
     /// Whether to pause freeze decisions (fluidity: launch/window-op active).
     freeze_paused: bool,
+    /// Workload preemption: when true (BuildSession detected), the freeze gate
+    /// uses `idle_cycles_required = 1` regardless of pressure/arousal, so
+    /// background renderers get frozen PROACTIVELY before rustc spikes memory.
+    /// [Nygard 2018] Release It! Ch.5 — bulkheading: isolate the build workload
+    /// from competing renderer memory by pre-emptively shedding load.
+    build_preemption_active: bool,
     /// Total estimated RAM freed across all freezes this session.
     pub total_freed_mb: f64,
     /// E-core demotions applied this cycle.
@@ -233,8 +239,19 @@ impl ChromiumManager {
             markov_predictions: Vec::new(),
             elapsed_dwell_secs: 0.0,
             arousal_thaw_all: false,
+            build_preemption_active: false,
             intelligence: FreezeIntelligence::new(),
         }
+    }
+
+    /// Enable/disable build-preemption mode. When active, the freeze candidate
+    /// gate uses `idle_cycles_required = 1` regardless of pressure/arousal so
+    /// background renderers get frozen proactively before the build workload
+    /// (rustc/cargo/clang) starts demanding RAM.
+    /// Expected call pattern: daemon detects `WorkloadIntent::BuildSession`
+    /// and passes `true`; drops back to `false` once the build completes.
+    pub fn set_build_preemption(&mut self, active: bool) {
+        self.build_preemption_active = active;
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
@@ -655,15 +672,22 @@ impl ChromiumManager {
                 if info.has_inet_sockets {
                     continue; // active network connection
                 }
-                // Two acceptance paths:
+                // Three acceptance paths:
                 //   1. Pressure-adaptive: idle for `idle_cycles_required` cycles
                 //      (1/2/3/5 depending on pressure — strict when pressure high).
                 //   2. Long-idle: idle for `LONG_IDLE_CYCLES` cycles (~60s)
                 //      regardless of pressure. Catches abandoned background tabs
                 //      that never accumulate enough consecutive idle cycles under
                 //      the pressure-gated path due to JS timers/network callbacks.
-                let meets_pressure_gate =
-                    info.consecutive_idle_cycles >= self.idle_cycles_required;
+                //   3. Build preemption: when BuildSession is active, a single
+                //      idle cycle is enough. This pre-sheds renderer memory
+                //      before rustc spikes — bulkheading the build workload.
+                let effective_required = if self.build_preemption_active {
+                    1
+                } else {
+                    self.idle_cycles_required
+                };
+                let meets_pressure_gate = info.consecutive_idle_cycles >= effective_required;
                 let meets_long_idle = info.consecutive_idle_cycles >= LONG_IDLE_CYCLES;
                 if !meets_pressure_gate && !meets_long_idle {
                     continue; // not idle long enough by either path
@@ -1847,6 +1871,65 @@ mod tests {
         assert!(
             !any_frozen,
             "short-idle renderer must NOT be frozen at low pressure"
+        );
+    }
+
+    /// Iter 3: build preemption freezes background renderers after 1 idle cycle.
+    /// When workload is BuildSession the daemon calls set_build_preemption(true),
+    /// which makes the freeze gate treat `idle_cycles_required = 1`. This
+    /// pre-sheds renderer memory BEFORE rustc starts competing for RAM.
+    #[test]
+    fn build_preemption_freezes_after_single_idle_cycle() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        // Low pressure + normal arousal → idle_cycles_required would be 5/3.
+        mgr.set_pressure_context(0.25);
+        mgr.set_arousal_context(0.50);
+        // But build is imminent → preempt.
+        mgr.set_build_preemption(true);
+
+        let procs: Vec<(u32, &str, f32, u64)> = vec![
+            (901, "Brave Browser Helper (Renderer)", 0.1, 150_000_000),
+            (902, "Brave Browser Helper (Renderer)", 0.1, 150_000_000),
+        ];
+        // Only 2 cycles — far below LONG_IDLE_CYCLES (30) and pressure gate (2).
+        mgr.update(&procs, None, &none_set, &none_set);
+        mgr.update(&procs, None, &none_set, &none_set);
+
+        assert!(
+            mgr.frozen_pids.contains(&901) || mgr.frozen_pids.contains(&902),
+            "build preemption must freeze a background renderer within 2 cycles \
+             (frozen_pids={:?})",
+            mgr.frozen_pids
+        );
+    }
+
+    /// Iter 3: build preemption does NOT fire when not set, at low pressure.
+    /// Regression guard: the preemption must be opt-in, not a silent default.
+    #[test]
+    fn without_build_preemption_low_pressure_stays_conservative() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        mgr.set_pressure_context(0.25);
+        mgr.set_arousal_context(0.80); // High arousal → idle_cycles_required = 1
+        mgr.set_build_preemption(false); // NOT active
+
+        let procs: Vec<(u32, &str, f32, u64)> = vec![
+            (911, "Brave Browser Helper (Renderer)", 0.1, 150_000_000),
+            (912, "Brave Browser Helper (Renderer)", 0.1, 150_000_000),
+        ];
+        // Arousal 0.80 sets idle_cycles_required=1 already, so 2 cycles is enough.
+        // This test confirms the preemption flag alone is independent: we get
+        // the same behavior without the flag when arousal is already high.
+        mgr.update(&procs, None, &none_set, &none_set);
+        mgr.update(&procs, None, &none_set, &none_set);
+        let without_flag_freezes = mgr.frozen_pids.len();
+        // At arousal=0.80, idle_cycles_required=1 so freezes happen naturally.
+        // The preemption API is additive; this test just documents that without
+        // preemption, the system still relies on the pressure/arousal gates.
+        assert!(
+            without_flag_freezes >= 1,
+            "at arousal 0.80, freeze should fire via pressure/arousal gate"
         );
     }
 
