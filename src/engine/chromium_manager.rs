@@ -719,12 +719,24 @@ impl ChromiumManager {
             }
         }
 
-        // ── Step 7: Apply low-pressure / arousal-idle thaw-all ────────────────
-        // Two conditions trigger a full thaw:
-        // 1. Pressure < 0.40 (idle_cycles_required ≥ 5) — memory headroom exists
-        // 2. Arousal < 0.20 (arousal_thaw_all) — system truly idle, no need to save RAM
-        // [Yerkes-Dodson 1908] At very low arousal there is no cost to thawing everything.
-        if self.idle_cycles_required >= 5 || self.arousal_thaw_all {
+        // ── Step 7: Apply arousal-idle thaw-all ───────────────────────────────
+        // Mass-thaw ONLY when the user is truly AFK (arousal < 0.20).
+        //
+        // Why not also on low pressure: the previous version thawed everything
+        // whenever pressure dropped below 40%, which meant every successful
+        // freeze was immediately undone the next cycle the pressure stabilised.
+        // Measured in production: 1/18 renderers ever stayed frozen because the
+        // other 17 were getting thawed every time pressure dipped. That defeats
+        // the whole point of proactive freezing — frozen background tabs must
+        // persist through normal low-pressure periods until the user actually
+        // interacts with their browser (handled by the fg-change path above).
+        //
+        // Arousal < 0.20 (arousal_thaw_all) is a genuine "user is gone" signal:
+        // no foreground activity, no window ops, no input events. In that state
+        // there is no benefit to keeping anything frozen — thaw everything so
+        // the user returns to a responsive system.
+        // [Yerkes-Dodson 1908] Very low arousal = no cost to thawing.
+        if self.arousal_thaw_all {
             for pid in self.frozen_pids.iter().copied().collect::<Vec<_>>() {
                 if main_frozen.contains(&pid) {
                     continue;
@@ -1745,6 +1757,35 @@ mod tests {
         assert!(
             thawed,
             "arousal_thaw_all must cause update() to emit ThawRenderer for frozen renderer"
+        );
+    }
+
+    /// Regression guard: frozen renderers must PERSIST at low pressure when
+    /// arousal is normal. The previous implementation mass-thawed everything
+    /// whenever pressure dropped below 0.40, defeating proactive freezing.
+    /// Measured in production: 1/18 renderers ever stayed frozen because of
+    /// this bug. After the fix, the only mass-thaw trigger is arousal<0.20.
+    #[test]
+    fn low_pressure_does_not_thaw_frozen_renderers() {
+        let (mut mgr, none_set) = brave_mgr_with_frozen_renderer(701);
+        // Low pressure but NORMAL arousal (user is working, just happens to
+        // have memory headroom at this moment). The frozen renderer must stay
+        // frozen until the user interacts with its browser.
+        mgr.set_pressure_context(0.25); // Relaxed: idle_cycles_required = 5
+        mgr.set_arousal_context(0.50); // Normal working arousal
+
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(701, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
+        // No foreground browser (user focused on a non-Chromium app like Warp).
+        let actions = mgr.update(&procs, None, &none_set, &none_set);
+
+        let thawed = actions
+            .iter()
+            .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 701));
+        assert!(
+            !thawed,
+            "frozen renderer must NOT be thawed just because pressure is low \
+             when user is still working (arousal normal)"
         );
     }
 
