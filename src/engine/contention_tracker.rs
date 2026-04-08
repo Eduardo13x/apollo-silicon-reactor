@@ -238,17 +238,45 @@ mod tests {
         for pid in 1..=12u32 {
             t.observe(pid, mk(0, 0, 0));
         }
-        // pids 1-6: balanced (ratio 0.5).
+        // pids 1-6: heavily starved (ratio ≈ 0.95 — 50 ms runnable, 2.5 ms on-cpu).
         for pid in 1..=6u32 {
-            t.observe(pid, mk(12_500_000, 12_500_000, 25_000_000));
+            t.observe(pid, mk(1_250_000, 1_250_000, 50_000_000));
         }
-        // pids 7-12: fast-running (ratio ≈ 0 — 50 ms on-cpu, 1 ms runnable).
+        // pids 7-12: fast-running (ratio ≈ 0.02 — 50 ms on-cpu, 1 ms runnable).
         for pid in 7..=12u32 {
             t.observe(pid, mk(25_000_000, 25_000_000, 1_000_000));
         }
-        // 6 of 12 have ratio ≥ 0.5 → fraction = 0.5.
+        // At threshold 0.85: 6 of 12 cross the bar (the starved ones) → 0.5.
+        let f = t.stall_fraction(0.85);
+        assert!((f - 0.5).abs() < 1e-9, "expected 0.5, got {f}");
+        // At threshold 0.5: same 6 still cross (0.95 > 0.5), still 0.5.
         let f = t.stall_fraction(0.5);
         assert!((f - 0.5).abs() < 1e-9, "expected 0.5, got {f}");
+    }
+
+    #[test]
+    fn stall_fraction_threshold_excludes_normal_load_baseline() {
+        // Regression for the production observation: under cpu_mean_busy=0.41
+        // every active process has Darwin runnable_time ratio ≈ 0.7-0.85
+        // (run-queue baseline). The new 0.85 threshold must NOT count those
+        // as stalled, while still flagging genuinely-starved pids at >=0.95.
+        let mut t = ContentionTracker::new();
+        // Prime 15 pids (above MIN_STALL_SAMPLES).
+        for pid in 1..=15u32 {
+            t.observe(pid, mk(0, 0, 0));
+        }
+        // All 15: Darwin baseline contention ≈ 0.75 (15 ms on-cpu, 45 ms runnable).
+        for pid in 1..=15u32 {
+            t.observe(pid, mk(7_500_000, 7_500_000, 45_000_000));
+        }
+        // None should cross 0.85 — they're all at the normal-load baseline.
+        assert_eq!(
+            t.stall_fraction(0.85),
+            0.0,
+            "Darwin run-queue baseline must NOT be flagged as starved at 0.85"
+        );
+        // Sanity: at 0.5 (the OLD threshold) all 15 do cross — that was the bug.
+        assert_eq!(t.stall_fraction(0.5), 1.0);
     }
 
     #[test]

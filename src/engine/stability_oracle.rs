@@ -115,10 +115,15 @@ impl StabilityOracle {
     }
 
     /// Record the system-wide CPU stall fraction from
-    /// `ContentionTracker::stall_fraction(0.5)`. This is the fraction of
-    /// tracked processes whose PSI "some" contention ratio crossed 50% in
-    /// the last cycle — i.e. how many processes wanted CPU but couldn't
-    /// get at least half of what they asked for.
+    /// `ContentionTracker::stall_fraction(0.85)`. This is the fraction of
+    /// tracked processes whose PSI "some" contention ratio crossed 0.85 in
+    /// the last cycle — i.e. how many processes spent ≥85% of their CPU-
+    /// wanting time in the run queue rather than executing. The 0.85
+    /// threshold is calibrated to Darwin's `ri_runnable_time` semantics:
+    /// the counter accumulates run-queue wait on every quantum, so the
+    /// baseline ratio under any normal multitasking load is already ~0.7.
+    /// Anything below 0.85 represents normal contention; only ratios at
+    /// or above it indicate true starvation.
     ///
     /// Feeds the same EMA smoothing as the other signals so a brief
     /// contention spike doesn't dominate steady-state decisions. Call

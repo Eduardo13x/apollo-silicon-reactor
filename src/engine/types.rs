@@ -526,8 +526,11 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub thrashing_score: f64,
     /// System-wide CPU stall fraction from
-    /// `ContentionTracker::stall_fraction(0.5)` — fraction of tracked pids
-    /// whose PSI "some" contention ratio crossed 50% in the last cycle.
+    /// `ContentionTracker::stall_fraction(0.85)` — fraction of tracked pids
+    /// whose PSI "some" contention ratio crossed 85% in the last cycle.
+    /// Threshold chosen because Darwin's `ri_runnable_time` accumulates
+    /// run-queue wait on every quantum and the baseline ratio is already
+    /// ~0.7 under normal multitasking load.
     #[serde(default)]
     pub stall_fraction: f64,
     /// Mean per-core busy ratio across all online processors.

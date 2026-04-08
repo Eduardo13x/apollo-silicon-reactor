@@ -2626,7 +2626,12 @@ fn main() -> anyhow::Result<()> {
                     if let Ok(tracker) =
                         apollo_optimizer::engine::contention_tracker::global().lock()
                     {
-                        metrics.metrics.stall_fraction = tracker.stall_fraction(0.5);
+                        // Threshold 0.85: Darwin's ri_runnable_time accumulates
+                        // run-queue wait time on EVERY scheduling quantum, so the
+                        // baseline ratio for any moderately active process is
+                        // already ~0.7 under cpu_mean_busy ~0.4. 0.85 means
+                        // "actually starved", not "compitiendo bajo carga normal".
+                        metrics.metrics.stall_fraction = tracker.stall_fraction(0.85);
                     }
                     {
                         let rs_total = metrics.reactor_status.events_total;
@@ -4918,7 +4923,11 @@ fn main() -> anyhow::Result<()> {
                 if let Ok(tracker) =
                     apollo_optimizer::engine::contention_tracker::global().lock()
                 {
-                    stability_oracle.record_stall_fraction(tracker.stall_fraction(0.5));
+                    // 0.85: see metrics-population site for the rationale —
+                    // Darwin's runnable counter saturates above 0.5 under any
+                    // normal load, so a lower threshold misclassifies normal
+                    // multitasking as a stability problem.
+                    stability_oracle.record_stall_fraction(tracker.stall_fraction(0.85));
                 }
                 {
                     let mut m = state.metrics.lock_recover();
