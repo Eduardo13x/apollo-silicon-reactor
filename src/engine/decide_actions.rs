@@ -965,9 +965,18 @@ pub fn decide_actions(
                 });
                 // Cap at 3 per cycle — avoid SIGSTOP burst overhead on display pipeline.
                 for (pid, name, _rss, cpu, start_sec) in freeze_candidates.into_iter().take(3) {
-                    // CPU-active guard: throttle instead of freeze to avoid dropping
-                    // in-flight work (compile, network IO, active render).
-                    if cpu > 10.0 {
+                    // CPU-active guard: under gate_a / gate_b (pressure-based) the
+                    // pressure is often transient and we'd rather throttle than
+                    // drop in-flight work. Under gate_c (flow-based, sustained
+                    // compressor thrashing) the in-flight work is what's CAUSING
+                    // the thrashing — pausing it briefly is exactly the remedy.
+                    // Throttling alone leaves memory unreclaimed and the
+                    // thrashing_score keeps climbing cycle after cycle (observed
+                    // in production: 720 throttles, 0 freezes, thrashing_score
+                    // = 19_890 with the gate firing every cycle but never
+                    // emitting a freeze action).
+                    let force_freeze_under_thrashing = gate_c;
+                    if cpu > 10.0 && !force_freeze_under_thrashing {
                         actions.push(RootAction::ThrottleProcess {
                             pid,
                             name,
@@ -980,10 +989,18 @@ pub fn decide_actions(
                             start_usec: 0,
                         });
                     } else {
+                        let reason = if gate_c && cpu > 10.0 {
+                            format!(
+                                "thrashing-flow freeze (cpu-active {:.0}%) under {:?}",
+                                cpu, context
+                            )
+                        } else {
+                            format!("extreme pressure RSS-rank under {:?}", context)
+                        };
                         actions.push(RootAction::FreezeProcess {
                             pid,
                             name,
-                            reason: format!("extreme pressure RSS-rank under {:?}", context),
+                            reason,
                             start_sec,
                             start_usec: 0,
                         });
