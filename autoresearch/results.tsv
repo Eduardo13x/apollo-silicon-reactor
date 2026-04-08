@@ -36,3 +36,4 @@ f214188	10668.78	155/155	2932	keep	Evolve Iter 2: ChromiumManager — long-idle 
 81599eb	10672.78	155/155	1466	keep	Cable 1: TelemetryLogger wired into daemon loop — ring buffer now collects training data [Welch 1967, Tuli 2022]
 f034a83	10672.78	155/155	1466	keep	Cable 2: WakeStorm graduated severity — Medium→Background tier, High/Critical→App Nap [Nygard 2018]
 51a13c9	10672.78	155/155	1466	keep	Cable 3: FocusMarkov prediction miss/hit tracking → accuracy audit every 50 evaluations [Sutton & Barto 1998]
+b50b179	11268.43	165/155	3032	keep	Evolve: +10 scenarios (s76-s85) + 524 unit tests — TelemetryLogger/WakeStorm/FocusMarkov cables + new test coverage
