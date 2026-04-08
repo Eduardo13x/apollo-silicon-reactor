@@ -4,6 +4,9 @@
 //! out of the main daemon loop into a dedicated background thread that polls
 //! at a configurable interval.  The main loop reads cached data in <1 μs.
 
+use crate::engine::cpu_saturation::{
+    self as cpu_sat, CpuSaturation, PerCoreTicks,
+};
 use crate::engine::host_vm_info::{self, VmPageStats, VmRate};
 use crate::engine::sysctl_direct;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +41,16 @@ pub struct PressureData {
     /// 0 ≈ quiet, 1_000+ ≈ mild churn, 10_000+ ≈ active thrashing.
     /// Cached here so consumers never have to re-derive it.
     pub thrashing_score: f64,
+    /// Per-core CPU busy ratios derived from host_processor_info tick deltas
+    /// between two successive samples. On the first cycle this is
+    /// `CpuSaturation::default()` (empty per_core_busy, all-zero scalars);
+    /// subsequent cycles have real data.
+    ///
+    /// Apollo used to have no per-core load signal at all — only per-process
+    /// CPU% and the aggregate runnable_time_ns counters. Surfacing it here
+    /// keeps the "read PressureData, get every resource pressure axis" API
+    /// uniform so consumers don't have to juggle collectors.
+    pub cpu_saturation: CpuSaturation,
 }
 
 impl Default for PressureData {
@@ -50,6 +63,7 @@ impl Default for PressureData {
             updated_at: Instant::now(),
             vm_rate: VmRate::default(),
             thrashing_score: 0.0,
+            cpu_saturation: CpuSaturation::default(),
         }
     }
 }
@@ -82,10 +96,15 @@ impl PressureCollector {
                 // the rate to be computed from the exact dt between the
                 // two host_statistics64 reads, not from the loop period.
                 let mut prev_vm: Option<(VmPageStats, Instant)> = None;
+                // Previous per-core tick sample for CpuSaturation derivation.
+                // The compute() helper handles empty / mismatched-length
+                // samples on the first cycle, so no special-casing here.
+                let mut prev_cpu_ticks: Vec<PerCoreTicks> = Vec::new();
 
                 loop {
                     let (mem_pressure, vm_sample, swap_used, swap_total) =
                         collect_pressure_facts();
+                    let curr_cpu_ticks = cpu_sat::read_per_core_ticks();
                     let now = Instant::now();
                     let swap_delta = match (prev_swap_used, prev_swap_at) {
                         (Some(prev), Some(at)) => {
@@ -112,6 +131,15 @@ impl PressureCollector {
                         prev_vm = Some((s, now));
                     }
 
+                    // CPU saturation: compute vs prev sample, then update prev.
+                    // The compute() helper returns Default on empty/mismatched
+                    // samples, so the first cycle naturally yields no signal.
+                    let cpu_saturation = CpuSaturation::compute(
+                        &prev_cpu_ticks,
+                        &curr_cpu_ticks,
+                    );
+                    prev_cpu_ticks = curr_cpu_ticks;
+
                     *c.lock_recover() = PressureData {
                         memory_pressure: mem_pressure,
                         swap_used_bytes: swap_used,
@@ -120,6 +148,7 @@ impl PressureCollector {
                         updated_at: now,
                         vm_rate,
                         thrashing_score,
+                        cpu_saturation,
                     };
 
                     // Update heartbeat after successful collection.
