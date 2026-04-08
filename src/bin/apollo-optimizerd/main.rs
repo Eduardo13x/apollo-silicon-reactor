@@ -1464,9 +1464,11 @@ fn main() -> anyhow::Result<()> {
                             drop(frozen_guard);
                             state.metrics.lock_recover().metrics.unfreezes_applied +=
                                 unfreeze_count;
-                            // Display returning from turbo = potential jank event (user came back,
-                            // system was frozen). Record for StabilityOracle.
-                            stability_oracle.record_display_jank(true);
+                            // Jank is recorded only when we ACTUALLY froze processes during turbo
+                            // (unfreeze_count > 0). Pure display on/off cycles with zero freezes
+                            // are normal user behavior, not jank events.
+                            // [Nielsen 1993] usability heuristics — count only user-perceptible impact.
+                            stability_oracle.record_display_jank(unfreeze_count > 0);
                         }
                         TurboAction::None => {
                             stability_oracle.record_display_jank(false);
@@ -4565,9 +4567,13 @@ fn main() -> anyhow::Result<()> {
                         pressure_drop: signal_digest.pressure_smooth as f64 * -1.0
                             * signal_digest.pressure_velocity,
                         // Combine outcome-tracker RL penalty with stability oracle signal.
-                        // [Schulman 2017] — additive reward shaping preserves policy gradient.
+                        // rl_penalty ∈ [-3, 0]; instability_penalty ∈ [0, 1] scaled by 0.5
+                        // → max additional penalty = -0.5, keeping the existing penalty
+                        // dominant while letting stability shape policy at the margin.
+                        // [Sutton & Barto 2018] §17.4 — reward shaping must preserve scale
+                        // hierarchy or it inverts the optimal policy.
                         outcome_penalty: lctx.outcome_tracker.rl_penalty()
-                            - stability_oracle.instability_penalty(),
+                            - 0.5 * stability_oracle.instability_penalty(),
                         overflow_occurred,
                         urgency: signal_digest.urgency,
                         regime_shift_up: signal_digest.regime_shift_up,
