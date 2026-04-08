@@ -891,17 +891,33 @@ pub fn decide_actions(
                 && snapshot.pressure.swap_delta_bytes_per_sec > (2.0 * 1024.0 * 1024.0);
             let gate_b = snapshot.pressure.memory_pressure >= gate_b_pressure
                 && swap_committed_gb >= gate_b_swap_gb;
+            // Gate C: VM flow gate. Activates when the compressor is churning
+            // hard (thrashing_score > 5_000 events/s weighted) even if the
+            // absolute pressure percentage hasn't crossed the extreme gate.
+            // Rationale: a system at 0.68 pressure with 10k compressions/s is
+            // thrashing; a system at 0.80 pressure with 0 compressions/s is
+            // resting. The flow signal catches the first case earlier than
+            // the level-based gates A and B.
+            //
+            // Requires the gate_a pressure floor so we don't freeze under
+            // transient compressor spikes at truly healthy pressure (<55%).
+            // [Denning 1968 "Working Set Model"] — fault rate, not residency,
+            // defines working-set quality.
+            let gate_c = snapshot.pressure.thrashing_score > 5_000.0
+                && snapshot.pressure.memory_pressure >= 0.55;
 
             // User in call / media playing: skip freeze — jank is worse than memory pressure.
             if freeze_skip_by_user {
                 freeze_gate = "user-protected".to_string();
             }
-            let extreme_freeze_ok = (gate_a || gate_b) && !freeze_skip_by_user;
+            let extreme_freeze_ok = (gate_a || gate_b || gate_c) && !freeze_skip_by_user;
             if extreme_freeze_ok {
                 freeze_gate = if gate_a {
                     "delta".to_string()
-                } else {
+                } else if gate_b {
                     "committed".to_string()
+                } else {
+                    "thrashing".to_string()
                 };
                 // RSS-rank selection: freeze/throttle the largest-RSS background
                 // processes first — maximum pressure relief per action.
@@ -1055,6 +1071,7 @@ mod tests {
                 swap_delta_bytes_per_sec: 0.0,
                 thermal_level: "nominal".to_string(),
                 compressor_pressure: compressor,
+                thrashing_score: 0.0,
             },
             disks: vec![],
             networks: vec![],

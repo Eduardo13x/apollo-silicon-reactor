@@ -41,6 +41,11 @@ pub struct PressureStats {
     /// to total physical pages, scaled by 0.85. Used by the RL threshold agent.
     #[serde(default)]
     pub compressor_pressure: f64,
+    /// Composite VM flow score from `VmRate::thrashing_score()`. 0 = quiet,
+    /// 5_000+ = actively thrashing the compressor. Distinguishes a sleepy
+    /// 70% pressure system from a thrashing 70% pressure system.
+    #[serde(default)]
+    pub thrashing_score: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -248,6 +253,7 @@ impl SystemCollector {
                 swap_delta_bytes_per_sec: swap_delta_bps,
                 thermal_level: "unknown".to_string(),
                 compressor_pressure,
+                thrashing_score: 0.0, // populated by daemon from pressure collector
             },
             disks,
             networks,
@@ -331,6 +337,7 @@ impl SystemCollector {
                 swap_delta_bytes_per_sec: swap_delta_bps,
                 thermal_level: "unknown".to_string(),
                 compressor_pressure,
+                thrashing_score: 0.0, // populated by daemon from pressure collector
             },
             disks: vec![],    // skipped in light mode
             networks: vec![], // skipped in light mode
@@ -512,6 +519,7 @@ mod tests {
                 swap_delta_bytes_per_sec: 1_000_000.0,
                 thermal_level: "nominal".to_string(),
                 compressor_pressure: 0.30,
+                thrashing_score: 0.0,
             },
             disks: vec![],
             networks: vec![],

@@ -241,6 +241,7 @@ mod tests {
                 swap_delta_bytes_per_sec: 0.0,
                 thermal_level: "nominal".to_string(),
                 compressor_pressure: 0.0,
+                thrashing_score: 0.0,
             },
             disks: vec![],
             networks: vec![],

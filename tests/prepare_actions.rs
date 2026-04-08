@@ -43,6 +43,7 @@ mod scenarios {
                 swap_delta_bytes_per_sec: swap_delta,
                 thermal_level: "nominal".to_string(),
                 compressor_pressure: 0.0,
+                thrashing_score: 0.0,
             },
             disks: vec![],
             networks: vec![],

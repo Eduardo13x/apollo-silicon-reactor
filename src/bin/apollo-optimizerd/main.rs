@@ -1497,6 +1497,11 @@ fn main() -> anyhow::Result<()> {
                         snapshot.pressure.swap_used_bytes = cached_pressure.swap_used_bytes;
                         snapshot.pressure.swap_total_bytes = cached_pressure.swap_total_bytes;
                         snapshot.pressure.swap_delta_bytes_per_sec = cached_pressure.swap_delta_bps;
+                        // Flow signal: composite VM thrashing score used by
+                        // the extreme-freeze gate in decide_actions to catch
+                        // active compressor churn even when absolute pressure
+                        // hasn't hit the extreme threshold yet.
+                        snapshot.pressure.thrashing_score = cached_pressure.thrashing_score;
                     }
                 }
                 snapshot.pressure.thermal_level =
