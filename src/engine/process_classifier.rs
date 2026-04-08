@@ -420,4 +420,189 @@ mod tests {
         let s = snap("WindowServer");
         assert_eq!(waste_score(&s, ProcessTier::SystemEssential), 0.0);
     }
+
+    // ── Untested paths in classify() ──────────────────────────────────────────
+
+    #[test]
+    fn orphan_parent_dead_classified_as_zombie_orphan() {
+        let c = ProcessClassifier::new();
+        let mut s = snap("helper");
+        s.pid = 500;
+        s.parent_alive = false;
+        assert_eq!(c.classify(&s), ProcessTier::ZombieOrphan);
+    }
+
+    #[test]
+    fn helper_name_pattern_no_gui_is_silent_daemon() {
+        let c = ProcessClassifier::new();
+        let mut s = snap("com.apple.WebKit.WebContent.Helper");
+        s.has_gui_window = false;
+        // "Helper" pattern → no GUI → SilentDaemon
+        assert_eq!(c.classify(&s), ProcessTier::SilentDaemon);
+    }
+
+    #[test]
+    fn helper_name_pattern_with_gui_is_app_helper() {
+        let c = ProcessClassifier::new();
+        let mut s = snap("Chrome Renderer");
+        s.has_gui_window = true;
+        s.secs_since_user_interaction = 600; // not recently active
+        // "Renderer" pattern + GUI → AppHelper
+        assert_eq!(c.classify(&s), ProcessTier::AppHelper);
+    }
+
+    #[test]
+    fn pid1_with_dead_parent_is_not_zombie_orphan() {
+        let c = ProcessClassifier::new();
+        // pid=1 (launchd) is exempt from orphan check
+        let mut s = snap("launchd");
+        s.pid = 1;
+        s.parent_alive = false;
+        // launchd is in essential set — hits that branch first
+        assert_eq!(c.classify(&s), ProcessTier::SystemEssential);
+    }
+
+    // ── Untested paths in score_utility() ────────────────────────────────────
+
+    #[test]
+    fn score_utility_active_network_adds_bonus() {
+        let mut s1 = snap("daemon");
+        s1.secs_since_user_interaction = 7200;
+        s1.wakeups_per_sec = 1.0;
+        let mut s2 = s1.clone();
+        s2.has_network = true;
+        let u1 = score_utility(&s1);
+        let u2 = score_utility(&s2);
+        assert!(
+            u2 > u1,
+            "network bonus should increase utility: {} vs {}",
+            u2,
+            u1
+        );
+    }
+
+    #[test]
+    fn score_utility_translated_binary_penalized() {
+        let mut s = snap("legacy-app");
+        let mut s_translated = snap("legacy-app");
+        s_translated.is_translated = true;
+        let u = score_utility(&s);
+        let u_t = score_utility(&s_translated);
+        assert!(
+            u > u_t,
+            "translated binary must have lower utility: {} vs {}",
+            u,
+            u_t
+        );
+    }
+
+    #[test]
+    fn score_utility_high_cpu_adds_bonus() {
+        let mut s = snap("cpu-worker");
+        let mut s_high = snap("cpu-worker");
+        s_high.cpu_percent = 15.0; // > 10% threshold
+        let u_low = score_utility(&s);
+        let u_high = score_utility(&s_high);
+        assert!(
+            u_high > u_low,
+            "high CPU should increase utility: {} vs {}",
+            u_high,
+            u_low
+        );
+    }
+
+    // ── Untested paths in waste_score() ──────────────────────────────────────
+
+    #[test]
+    fn waste_score_silent_daemon_high_wakeups_is_higher() {
+        let mut s_low = snap("quiet-daemon");
+        s_low.wakeups_per_sec = 5.0;
+        let mut s_high = snap("noisy-daemon");
+        s_high.wakeups_per_sec = 30.0; // > 20 threshold
+        let w_low = waste_score(&s_low, ProcessTier::SilentDaemon);
+        let w_high = waste_score(&s_high, ProcessTier::SilentDaemon);
+        assert!(
+            w_high > w_low,
+            "high wakeups should increase waste: {} vs {}",
+            w_high,
+            w_low
+        );
+    }
+
+    #[test]
+    fn waste_score_silent_daemon_large_rss_is_higher() {
+        let mut s_small = snap("small-daemon");
+        s_small.rss_bytes = 50 * 1024 * 1024; // 50MB
+        let mut s_large = snap("bloated-daemon");
+        s_large.rss_bytes = 300 * 1024 * 1024; // 300MB > 200MB threshold
+        let w_small = waste_score(&s_small, ProcessTier::SilentDaemon);
+        let w_large = waste_score(&s_large, ProcessTier::SilentDaemon);
+        assert!(
+            w_large > w_small,
+            "large RSS daemon should have higher waste: {} vs {}",
+            w_large,
+            w_small
+        );
+    }
+
+    #[test]
+    fn waste_score_telemetry_is_high() {
+        let s = snap("DiagnosticReporter");
+        let w = waste_score(&s, ProcessTier::Telemetry);
+        assert!(
+            w >= 0.80,
+            "telemetry waste must be >= 0.80, got {}",
+            w
+        );
+    }
+
+    #[test]
+    fn waste_score_app_helper_is_low() {
+        let s = snap("Chrome Helper");
+        let w = waste_score(&s, ProcessTier::AppHelper);
+        assert!(
+            w <= 0.25,
+            "AppHelper waste must be <= 0.25, got {}",
+            w
+        );
+    }
+
+    // ── score_waste() standalone ──────────────────────────────────────────────
+
+    #[test]
+    fn score_waste_gui_process_gets_reduction() {
+        let mut s = snap("App");
+        s.has_gui_window = true;
+        s.cpu_percent = 10.0; // would normally add waste
+        let w = score_waste(&s);
+        // GUI reduces waste by 0.30 — result should be lower than without GUI
+        let mut s_no_gui = snap("App");
+        s_no_gui.cpu_percent = 10.0;
+        let w_no_gui = score_waste(&s_no_gui);
+        assert!(
+            w < w_no_gui,
+            "GUI presence should reduce waste score: {} vs {}",
+            w,
+            w_no_gui
+        );
+    }
+
+    // ── throttle_candidates() ────────────────────────────────────────────────
+
+    #[test]
+    fn throttle_candidates_excludes_essential_and_foreground() {
+        let c = ProcessClassifier::new();
+        let mut essential = snap("WindowServer");
+        let mut active = snap("MyApp");
+        active.has_gui_window = true;
+        active.secs_since_user_interaction = 5;
+        let mut stale = snap("background-idle");
+        stale.secs_since_foreground = 600;
+        stale.wakeups_per_sec = 0.5;
+        let snaps = vec![essential, active, stale];
+        let candidates = c.throttle_candidates(&snaps);
+        // Only the stale daemon is a throttle candidate
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "background-idle");
+    }
 }

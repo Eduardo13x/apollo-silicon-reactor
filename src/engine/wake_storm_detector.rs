@@ -234,4 +234,96 @@ mod tests {
         // After cleanup the process should be gone
         assert!(det.detect_storms().is_empty());
     }
+
+    // ── Additional untested paths ─────────────────────────────────────────────
+
+    #[test]
+    fn severity_boundary_low_is_exactly_below_50() {
+        let det = WakeStormDetector::new();
+        assert_eq!(det.get_severity(49.9), StormSeverity::Low);
+        assert_eq!(det.get_severity(50.0), StormSeverity::Medium);
+    }
+
+    #[test]
+    fn severity_boundary_medium_to_high() {
+        let det = WakeStormDetector::new();
+        assert_eq!(det.get_severity(199.9), StormSeverity::Medium);
+        assert_eq!(det.get_severity(200.0), StormSeverity::High);
+    }
+
+    #[test]
+    fn severity_boundary_high_to_critical() {
+        let det = WakeStormDetector::new();
+        assert_eq!(det.get_severity(999.9), StormSeverity::High);
+        assert_eq!(det.get_severity(1000.0), StormSeverity::Critical);
+    }
+
+    #[test]
+    fn critical_mitigation_has_two_actions() {
+        let actions = WakeStormDetector::get_mitigation_actions(StormSeverity::Critical);
+        assert_eq!(
+            actions.len(),
+            2,
+            "Critical severity should produce exactly 2 actions, got {}",
+            actions.len()
+        );
+    }
+
+    #[test]
+    fn high_mitigation_has_two_actions() {
+        let actions = WakeStormDetector::get_mitigation_actions(StormSeverity::High);
+        assert_eq!(
+            actions.len(),
+            2,
+            "High severity should produce exactly 2 actions, got {}",
+            actions.len()
+        );
+    }
+
+    #[test]
+    fn low_mitigation_has_one_action() {
+        let actions = WakeStormDetector::get_mitigation_actions(StormSeverity::Low);
+        assert_eq!(
+            actions.len(),
+            1,
+            "Low severity should produce exactly 1 action, got {}",
+            actions.len()
+        );
+    }
+
+    #[test]
+    fn multiple_processes_storms_sorted_by_rate() {
+        let mut det = WakeStormDetector::new();
+        // Process A: 200 wakeups (higher rate)
+        for _ in 0..200 {
+            det.record_wakeup(1, "high-rate-proc".to_string());
+        }
+        // Process B: 50 wakeups (lower rate)
+        for _ in 0..50 {
+            det.record_wakeup(2, "low-rate-proc".to_string());
+        }
+        let storms = det.detect_storms();
+        assert!(!storms.is_empty());
+        // First storm should have the higher wakeup rate
+        assert_eq!(storms[0].pid, 1, "highest rate process should be first");
+        assert!(
+            storms[0].wakeups_per_second > storms[1].wakeups_per_second,
+            "storms should be sorted descending by rate"
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_recent_processes() {
+        let mut det = WakeStormDetector::new();
+        // Record many wakeups for a process (creating a storm)
+        for _ in 0..200 {
+            det.record_wakeup(77, "recent-proc".to_string());
+        }
+        // Cleanup with a 1-hour max age — recent process should survive
+        det.cleanup_stale(Duration::from_secs(3600));
+        // Process should still be tracked
+        let storms = det.detect_storms();
+        assert!(!storms.is_empty(), "recent process should survive cleanup");
+        assert_eq!(storms[0].pid, 77);
+    }
 }

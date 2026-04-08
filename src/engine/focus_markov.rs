@@ -432,4 +432,94 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    // ── Additional untested paths ─────────────────────────────────────────────
+
+    #[test]
+    fn elapsed_dwell_secs_zero_before_first_observation() {
+        let m = test_markov();
+        // No observation yet — elapsed should be 0.0
+        assert_eq!(m.elapsed_dwell_secs(), 0.0);
+    }
+
+    #[test]
+    fn elapsed_dwell_secs_positive_after_observation() {
+        let mut m = test_markov();
+        m.observe(Some("Claude"));
+        // After observing, dwell time should be non-negative
+        assert!(m.elapsed_dwell_secs() >= 0.0);
+    }
+
+    #[test]
+    fn tracked_apps_zero_initially() {
+        let m = test_markov();
+        assert_eq!(m.tracked_apps(), 0);
+    }
+
+    #[test]
+    fn tracked_apps_increases_after_transitions() {
+        let mut m = test_markov();
+        // Claude → Brave transition
+        m.observe(Some("Claude"));
+        m.observe(Some("Brave"));
+        // At least one source app should now be tracked
+        assert!(m.tracked_apps() >= 1, "should track at least 1 source app");
+    }
+
+    #[test]
+    fn total_transitions_zero_on_first_observation() {
+        let mut m = test_markov();
+        m.observe(Some("Claude")); // first observation → no transition yet
+        assert_eq!(m.total_transitions(), 0);
+    }
+
+    #[test]
+    fn total_transitions_increments_on_each_switch() {
+        let mut m = test_markov();
+        m.observe(Some("A"));
+        m.observe(Some("B"));
+        m.observe(Some("A"));
+        m.observe(Some("B"));
+        assert_eq!(m.total_transitions(), 3);
+    }
+
+    #[test]
+    fn predict_top_n_empty_when_no_data() {
+        let m = test_markov();
+        let top = m.predict_top_n("Claude", 5);
+        assert!(top.is_empty(), "should return empty when no transitions");
+    }
+
+    #[test]
+    fn predict_top_n_truncates_to_n() {
+        let mut m = test_markov();
+        // Build many transitions from X to A,B,C,D,E,F
+        for &target in &["A", "B", "C", "D", "E", "F"] {
+            for _ in 0..2 {
+                m.observe(Some("X"));
+                m.observe(Some(target));
+            }
+        }
+        // 12 transitions from X, 6 distinct targets — top 3 requested
+        let top = m.predict_top_n("X", 3);
+        assert!(top.len() <= 3, "predict_top_n should truncate to n");
+    }
+
+    #[test]
+    fn transition_stats_avg_dwell_secs() {
+        let stats = TransitionStats {
+            count: 4,
+            total_dwell_secs: 100.0,
+        };
+        assert!((stats.avg_dwell_secs() - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transition_stats_avg_dwell_zero_count() {
+        let stats = TransitionStats {
+            count: 0,
+            total_dwell_secs: 0.0,
+        };
+        assert_eq!(stats.avg_dwell_secs(), 0.0);
+    }
 }

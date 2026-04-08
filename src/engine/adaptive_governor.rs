@@ -1094,6 +1094,189 @@ mod tests {
         );
     }
 
+    // ── LLM model protection ──────────────────────────────────────────────────
+
+    #[test]
+    fn llm_model_large_rss_within_12h_is_protected() {
+        let mut gov = governor();
+        let snap = ProcessSnapshot {
+            name: "ollama".into(),
+            rss_bytes: 4 * 1024 * 1024 * 1024, // 4GB
+            secs_since_user_interaction: 3600,  // 1h idle
+            ..base_proc(800, "ollama")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].decision,
+            GovernorDecision::Allow,
+            "LLM model (ollama) with 4GB RSS within 12h must be protected"
+        );
+    }
+
+    #[test]
+    fn llm_model_expired_beyond_12h_not_protected() {
+        let mut gov = governor();
+        // Beyond 12h idle (43201s) — LLM protection does not apply (condition: < 43200).
+        // Also set secs_since_foreground > 21600 so graduated idle fires.
+        let snap = ProcessSnapshot {
+            name: "ollama".into(),
+            rss_bytes: 4 * 1024 * 1024 * 1024, // 4GB
+            secs_since_user_interaction: 43201,  // beyond 12h — LLM protection gone
+            secs_since_foreground: 43201,         // triggers graduated idle > 12h → Freeze
+            cpu_percent: 1.0,                     // > 0.5 → SilentDaemon idle override skips
+            ..base_proc(801, "ollama")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
+        assert_eq!(decisions.len(), 1);
+        // Without LLM protection and with 12h+ idle, must be Frozen by graduated idle.
+        assert_eq!(
+            decisions[0].decision,
+            GovernorDecision::Freeze,
+            "LLM model beyond 12h boundary should be Frozen by graduated idle rule"
+        );
+    }
+
+    // ── GUI abandonment ───────────────────────────────────────────────────────
+
+    #[test]
+    fn gui_app_abandoned_24h_is_frozen() {
+        let mut gov = governor();
+        let snap = ProcessSnapshot {
+            has_gui_window: true,
+            secs_since_foreground: 86401, // just over 24h
+            cpu_percent: 0.3,
+            ..base_proc(900, "AbandonedApp")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].decision,
+            GovernorDecision::Freeze,
+            "GUI app abandoned for 24h+ must be frozen to reclaim memory"
+        );
+    }
+
+    #[test]
+    fn gui_app_under_24h_not_frozen_by_abandonment_rule() {
+        let mut gov = governor();
+        let snap = ProcessSnapshot {
+            has_gui_window: true,
+            secs_since_foreground: 86399, // just under 24h
+            cpu_percent: 0.3,
+            ..base_proc(901, "ActiveApp")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
+        assert_eq!(decisions.len(), 1);
+        assert_ne!(
+            decisions[0].decision,
+            GovernorDecision::Freeze,
+            "GUI app < 24h idle must NOT be frozen by abandonment rule"
+        );
+    }
+
+    // ── Orphan (parent dead, non-zombie) ─────────────────────────────────────
+
+    #[test]
+    fn orphan_non_zombie_is_frozen_not_killed() {
+        let mut gov = governor();
+        let snap = ProcessSnapshot {
+            is_zombie: false,
+            parent_alive: false,
+            pid: 999,
+            ..base_proc(999, "orphaned-helper")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].decision,
+            GovernorDecision::Freeze,
+            "Non-zombie orphan (parent dead) must be Frozen, not Killed"
+        );
+    }
+
+    // ── Translated process in swarm ───────────────────────────────────────────
+
+    #[test]
+    fn translated_process_in_swarm_is_frozen() {
+        let mut gov = governor();
+        // 31 processes → swarm condition (> 30)
+        let mut procs: Vec<ProcessSnapshot> = (0..30)
+            .map(|i| ProcessSnapshot {
+                cpu_percent: 0.2,
+                secs_since_foreground: 3600,
+                ..base_proc(1000 + i as u32, &format!("bg_{}", i))
+            })
+            .collect();
+        // Add a translated daemon — in swarm + is_translated → Freeze
+        let translated = ProcessSnapshot {
+            is_translated: true,
+            secs_since_foreground: 3600,
+            cpu_percent: 0.2,
+            has_gui_window: false,
+            faults_total: 100,      // not swarm_exempt
+            mach_port_count: 5,     // not swarm_exempt
+            ..base_proc(2000, "rosetta-daemon")
+        };
+        procs.push(translated);
+        let decisions = gov.decide_all(&procs, &no_hunts(), None, &[], 14);
+        let d = decisions
+            .iter()
+            .find(|d| d.name == "rosetta-daemon")
+            .map(|d| d.decision);
+        assert_eq!(
+            d,
+            Some(GovernorDecision::Freeze),
+            "Translated process in swarm must be Frozen (2x memory overhead)"
+        );
+    }
+
+    // ── Render pipeline exemption ─────────────────────────────────────────────
+
+    #[test]
+    fn render_pipeline_process_exempt_from_wakeup_throttle() {
+        let mut gov = governor();
+        // VDCAssistant is in the render pipeline — even with 200 wakeups/s + low utility
+        // it should be protected when there's a foreground app.
+        let snap = ProcessSnapshot {
+            wakeups_per_sec: 200.0,
+            has_gui_window: false,
+            cpu_percent: 0.5,
+            secs_since_foreground: 300,
+            faults_total: 0, // explicitly low to NOT trigger faults exemption
+            ..base_proc(700, "VDCAssistant")
+        };
+        let decisions = gov.decide_all(&[snap], &no_hunts(), Some("Zoom"), &["Zoom"], 14);
+        assert_eq!(decisions.len(), 1);
+        // Render pipeline processes are exempt from wakeup throttle rule.
+        // With foreground app present and being a render pipeline process → exempt.
+        assert_ne!(
+            decisions[0].decision,
+            GovernorDecision::Kill,
+            "Render pipeline VDCAssistant must not be killed"
+        );
+    }
+
+    // ── Classify workload ─────────────────────────────────────────────────────
+
+    #[test]
+    fn classify_workload_returns_classification() {
+        let mut gov = governor();
+        let classification = gov.classify_workload(Some("Xcode"), &["rustc", "cargo"], 14);
+        // Should return a valid classification — workload type matters less than structure.
+        assert!(classification.confidence >= 0.0 && classification.confidence <= 1.0);
+    }
+
+    #[test]
+    fn last_ml_classification_matches_recent_decide() {
+        let mut gov = governor();
+        let snap = base_proc(100, "some-daemon");
+        let _ = gov.decide_all(&[snap], &no_hunts(), Some("Xcode"), &["Xcode", "rustc"], 14);
+        let last = gov.last_ml_classification();
+        // After a decide_all, classification must have been updated.
+        assert!(last.confidence >= 0.0);
+    }
+
     // ── Micro-benchmark: decide_all latency ──────────────────────────────────
 
     #[test]

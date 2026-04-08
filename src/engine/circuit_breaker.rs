@@ -330,4 +330,72 @@ mod tests {
         assert_eq!(CircuitState::Open.as_str(), "open");
         assert_eq!(CircuitState::HalfOpen.as_str(), "half_open");
     }
+
+    #[test]
+    fn is_closed_returns_true_when_closed() {
+        let cb = CircuitBreaker::default();
+        assert!(cb.is_closed());
+    }
+
+    #[test]
+    fn is_closed_returns_false_when_open() {
+        let mut cb = CircuitBreaker::new(1, 60, 1, Duration::from_secs(60));
+        err_call(&mut cb);
+        assert!(!cb.is_closed());
+    }
+
+    #[test]
+    fn is_closed_returns_true_when_half_open() {
+        let mut cb = CircuitBreaker::new(1, 60, 2, Duration::from_millis(1));
+        err_call(&mut cb);
+        std::thread::sleep(Duration::from_millis(2));
+        // Next call triggers maybe_recover → HalfOpen, but then executes ok
+        ok_call(&mut cb);
+        // After 1 success with threshold=2, should be HalfOpen
+        assert_eq!(*cb.state(), CircuitState::HalfOpen);
+        assert!(cb.is_closed(), "HalfOpen should return is_closed() = true");
+    }
+
+    #[test]
+    fn open_duration_none_when_closed() {
+        let cb = CircuitBreaker::default();
+        assert!(cb.open_duration().is_none());
+    }
+
+    #[test]
+    fn open_duration_some_when_open() {
+        let mut cb = CircuitBreaker::new(1, 60, 1, Duration::from_secs(60));
+        err_call(&mut cb);
+        let dur = cb.open_duration();
+        assert!(dur.is_some(), "open_duration should be Some when Open");
+        assert!(dur.unwrap() < Duration::from_millis(100), "just opened");
+    }
+
+    #[test]
+    fn default_config_has_expected_values() {
+        let cb = CircuitBreaker::default();
+        assert_eq!(cb.failure_threshold, 5);
+        assert_eq!(cb.window_secs, 60);
+        assert_eq!(cb.success_threshold, 2);
+        assert_eq!(cb.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn rejected_total_increments_on_open_rejection() {
+        let mut cb = CircuitBreaker::new(1, 60, 1, Duration::from_secs(60));
+        err_call(&mut cb); // trip
+        cb.call(|| -> Result<(), &str> { Ok(()) }).ok(); // rejected
+        cb.call(|| -> Result<(), &str> { Ok(()) }).ok(); // rejected again
+        assert_eq!(cb.rejected_total, 2);
+    }
+
+    #[test]
+    fn record_success_from_open_closes_immediately() {
+        let mut cb = CircuitBreaker::new(1, 60, 1, Duration::from_secs(60));
+        err_call(&mut cb);
+        assert_eq!(*cb.state(), CircuitState::Open);
+        // Calling record_success() directly from Open closes it
+        cb.record_success();
+        assert_eq!(*cb.state(), CircuitState::Closed);
+    }
 }
