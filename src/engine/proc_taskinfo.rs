@@ -173,6 +173,60 @@ pub struct QoSBreakdown {
     pub user_interactive_ns: u64,
 }
 
+impl RusageInfo {
+    /// Total on-CPU time for this process (user + system), in nanoseconds.
+    pub fn on_cpu_ns(&self) -> u64 {
+        self.user_time_ns.saturating_add(self.system_time_ns)
+    }
+}
+
+/// Per-process CPU contention ratio between two successive `RusageInfo`
+/// samples of the same pid.
+///
+/// Definition:
+/// ```text
+/// runnable_delta = curr.runnable_time_ns - prev.runnable_time_ns
+/// on_cpu_delta   = curr.on_cpu_ns()      - prev.on_cpu_ns()
+/// contention     = runnable_delta / (runnable_delta + on_cpu_delta)
+/// ```
+///
+/// Semantics: on Darwin, `ri_runnable_time` counts time the process was
+/// `TH_RUN` and ready but NOT actually running on a core. On-CPU time is
+/// the actual execution. So contention ∈ [0, 1] is the fraction of the
+/// process's "wanted CPU" that it did not get:
+///
+/// - `0.0` → process got every nanosecond of CPU it asked for.
+/// - `1.0` → process was starved for the entire interval (wanted CPU
+///   the whole time but the scheduler couldn't place it).
+/// - Somewhere between → system is contended and this pid is paying
+///   some of the cost.
+///
+/// This is the macOS equivalent of Linux PSI's per-task `some` stall
+/// accounting — the single most important signal for deciding whether
+/// a process is being starved by its neighbours.
+///
+/// Returns `None` when the process did not want any CPU in the window
+/// (runnable_delta + on_cpu_delta == 0) — there is no contention
+/// signal to report in that case.
+///
+/// References:
+/// - [Brown 2019] "Pressure Stall Information" Linux kernel docs —
+///   PSI defines "some" tasks are stalled as the ratio of
+///   runnable-but-not-running time to total runnable time.
+/// - [Apple XNU `osfmk/kern/thread.h`] — `ri_runnable_time` is the
+///   accumulator for TH_RUN time excluding actual on-CPU execution.
+pub fn cpu_contention_ratio(prev: &RusageInfo, curr: &RusageInfo) -> Option<f64> {
+    let runnable_delta = curr
+        .runnable_time_ns
+        .saturating_sub(prev.runnable_time_ns);
+    let on_cpu_delta = curr.on_cpu_ns().saturating_sub(prev.on_cpu_ns());
+    let total = runnable_delta.saturating_add(on_cpu_delta);
+    if total == 0 {
+        return None;
+    }
+    Some(runnable_delta as f64 / total as f64)
+}
+
 // ── Core functions ───────────────────────────────────────────────────────────
 
 /// Read Mach task info for a process. ~2µs per call.
@@ -308,6 +362,77 @@ pub fn bulk_process_scan() -> Vec<(TaskInfo, Option<RusageInfo>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mk_rusage(user: u64, system: u64, runnable: u64) -> RusageInfo {
+        RusageInfo {
+            pid: 1,
+            user_time_ns: user,
+            system_time_ns: system,
+            idle_wakeups: 0,
+            interrupt_wakeups: 0,
+            pageins: 0,
+            wired_size: 0,
+            resident_size: 0,
+            phys_footprint: 0,
+            disk_read_bytes: 0,
+            disk_write_bytes: 0,
+            logical_writes: 0,
+            instructions: 0,
+            cycles: 0,
+            billed_energy: 0,
+            runnable_time_ns: runnable,
+            proc_start_abstime: 0,
+            qos_time: QoSBreakdown::default(),
+        }
+    }
+
+    #[test]
+    fn contention_ratio_zero_when_no_wait() {
+        // Process ran 1 ms, never waited.
+        let prev = mk_rusage(0, 0, 0);
+        let curr = mk_rusage(500_000, 500_000, 0); // 1 ms on-CPU
+        assert_eq!(cpu_contention_ratio(&prev, &curr), Some(0.0));
+    }
+
+    #[test]
+    fn contention_ratio_one_when_fully_starved() {
+        // Process wanted CPU for 1 ms, got none.
+        let prev = mk_rusage(0, 0, 0);
+        let curr = mk_rusage(0, 0, 1_000_000);
+        assert_eq!(cpu_contention_ratio(&prev, &curr), Some(1.0));
+    }
+
+    #[test]
+    fn contention_ratio_half_when_balanced() {
+        // Process ran 500 μs on-CPU, waited 500 μs runnable.
+        let prev = mk_rusage(0, 0, 0);
+        let curr = mk_rusage(250_000, 250_000, 500_000);
+        let c = cpu_contention_ratio(&prev, &curr).unwrap();
+        assert!((c - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn contention_ratio_none_when_idle() {
+        // Process did nothing — no contention to report.
+        let prev = mk_rusage(100, 100, 100);
+        let curr = mk_rusage(100, 100, 100);
+        assert_eq!(cpu_contention_ratio(&prev, &curr), None);
+    }
+
+    #[test]
+    fn contention_ratio_clamps_backwards_samples() {
+        // Non-monotonic samples (should never happen from kernel, but guard).
+        let prev = mk_rusage(1000, 1000, 1000);
+        let curr = mk_rusage(500, 500, 500);
+        // All saturating_sub → 0, total → 0, returns None.
+        assert_eq!(cpu_contention_ratio(&prev, &curr), None);
+    }
+
+    #[test]
+    fn on_cpu_ns_sums_user_and_system() {
+        let ri = mk_rusage(1_000, 500, 9_999);
+        assert_eq!(ri.on_cpu_ns(), 1_500);
+    }
 
     #[test]
     fn read_self_task_info() {
