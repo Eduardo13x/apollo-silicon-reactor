@@ -210,18 +210,45 @@ impl RusageInfo {
 /// signal to report in that case.
 ///
 /// References:
+/// ## Idle-process noise floor
+///
+/// Mostly-idle processes routinely accumulate sub-microsecond blips of
+/// `runnable_time_ns` during wake transitions or scheduler accounting with
+/// effectively zero on-cpu time. Naively computing `runnable / (runnable +
+/// on_cpu)` on those samples returns ≈1.0 — a fully-starved verdict — even
+/// though the process was only "trying to run" for a few nanoseconds before
+/// going back to sleep. Observed in production: `stall_fraction` saturated
+/// to 0.996 while `cpu_mean_busy` was 0.146, which is physically impossible
+/// and broke the stall-fraction feeds into StabilityOracle + RuntimeMetrics.
+///
+/// Fix: require at least 1 ms (1_000_000 ns) of combined runnable + on-cpu
+/// time in the window before reporting a ratio. Below the floor the process
+/// was effectively idle — return None so the tracker doesn't pollute its
+/// aggregates with noise samples. 1 ms is ~0.05% of a 2-s daemon cycle,
+/// which is well above the scheduler-accounting quantum but well below any
+/// workload that would legitimately generate contention pressure.
+///
+/// ## References
+///
 /// - [Brown 2019] "Pressure Stall Information" Linux kernel docs —
 ///   PSI defines "some" tasks are stalled as the ratio of
 ///   runnable-but-not-running time to total runnable time.
 /// - [Apple XNU `osfmk/kern/thread.h`] — `ri_runnable_time` is the
 ///   accumulator for TH_RUN time excluding actual on-CPU execution.
+/// - [Jain 1991] "The Art of Computer Systems Performance Analysis" §12
+///   — noise-floor filtering is mandatory when measuring rare events in
+///   a continuously-sampled counter to avoid false positives at the quantum.
 pub fn cpu_contention_ratio(prev: &RusageInfo, curr: &RusageInfo) -> Option<f64> {
+    /// Minimum combined runnable + on-cpu delta required before we trust
+    /// the ratio. Below this floor the process is effectively idle.
+    const IDLE_NOISE_FLOOR_NS: u64 = 1_000_000; // 1 ms
+
     let runnable_delta = curr
         .runnable_time_ns
         .saturating_sub(prev.runnable_time_ns);
     let on_cpu_delta = curr.on_cpu_ns().saturating_sub(prev.on_cpu_ns());
     let total = runnable_delta.saturating_add(on_cpu_delta);
-    if total == 0 {
+    if total < IDLE_NOISE_FLOOR_NS {
         return None;
     }
     Some(runnable_delta as f64 / total as f64)
@@ -417,6 +444,47 @@ mod tests {
         let prev = mk_rusage(100, 100, 100);
         let curr = mk_rusage(100, 100, 100);
         assert_eq!(cpu_contention_ratio(&prev, &curr), None);
+    }
+
+    #[test]
+    fn contention_ratio_rejects_idle_noise_blips() {
+        // Regression test for the production stall_fraction=0.996 anomaly.
+        //
+        // A mostly-idle process accumulated a few-microsecond runnable_time
+        // blip with zero on-cpu time between two samples. The naive ratio
+        // `runnable / (runnable + on_cpu)` returns ≈1.0 — "fully starved" —
+        // but the process was not trying to do any real work, it was just
+        // scheduler-accounting noise from a wake transition.
+        //
+        // After the idle-noise-floor (1 ms), all sub-1-ms total-delta
+        // samples return None instead of polluting the stall aggregates.
+
+        // 500 ns runnable, 0 on-cpu → total 500 ns → below floor → None.
+        let prev = mk_rusage(1000, 1000, 1000);
+        let curr = mk_rusage(1000, 1000, 1500);
+        assert_eq!(
+            cpu_contention_ratio(&prev, &curr),
+            None,
+            "500ns runnable blip on idle process must not count as contention"
+        );
+
+        // 100 μs runnable, 200 μs on-cpu → total 300 μs → below floor → None.
+        let prev = mk_rusage(0, 0, 0);
+        let curr = mk_rusage(100_000, 100_000, 100_000);
+        assert_eq!(
+            cpu_contention_ratio(&prev, &curr),
+            None,
+            "sub-millisecond total activity must not emit a ratio"
+        );
+
+        // 2 ms total → ABOVE floor → real signal reported.
+        let prev = mk_rusage(0, 0, 0);
+        let curr = mk_rusage(500_000, 500_000, 1_000_000);
+        let c = cpu_contention_ratio(&prev, &curr).unwrap();
+        assert!(
+            (c - 0.5).abs() < 1e-9,
+            "2ms total with 1ms runnable must report ratio 0.5, got {c}"
+        );
     }
 
     #[test]
