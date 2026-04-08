@@ -4895,6 +4895,13 @@ fn main() -> anyhow::Result<()> {
                 stability_oracle.record_swap_bytes(snapshot.pressure.swap_used_bytes);
                 stability_oracle
                     .record_thrashing_score(pressure_collector.latest().thrashing_score);
+                // System-wide CPU stall fraction from the global contention
+                // tracker — fraction of tracked pids with PSI ratio ≥ 0.5.
+                if let Ok(tracker) =
+                    apollo_optimizer::engine::contention_tracker::global().lock()
+                {
+                    stability_oracle.record_stall_fraction(tracker.stall_fraction(0.5));
+                }
                 {
                     let mut m = state.metrics.lock_recover();
                     m.metrics.ml_confidence = ml_class.confidence;

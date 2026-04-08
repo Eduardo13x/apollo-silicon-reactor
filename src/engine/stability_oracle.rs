@@ -60,6 +60,10 @@ pub struct StabilityOracle {
     /// high-residency system from an actively thrashing one, which
     /// pressure-percentage alone cannot do.
     thrashing_ema: f64,
+    /// EMA of the system-wide CPU stall fraction from ContentionTracker.
+    /// Fraction of tracked pids whose PSI contention ratio ≥ 0.5, smoothed
+    /// to dampen single-cycle spikes.
+    stall_ema: f64,
     /// Previous cycle's swap usage (bytes) for spike detection.
     prev_swap_bytes: Option<u64>,
 }
@@ -71,6 +75,7 @@ impl StabilityOracle {
             zombie_rate_ema: 0.0,
             swap_spike_ema: 0.0,
             thrashing_ema: 0.0,
+            stall_ema: 0.0,
             prev_swap_bytes: None,
         }
     }
@@ -109,6 +114,25 @@ impl StabilityOracle {
         self.swap_spike_ema = ALPHA * signal + (1.0 - ALPHA) * self.swap_spike_ema;
     }
 
+    /// Record the system-wide CPU stall fraction from
+    /// `ContentionTracker::stall_fraction(0.5)`. This is the fraction of
+    /// tracked processes whose PSI "some" contention ratio crossed 50% in
+    /// the last cycle — i.e. how many processes wanted CPU but couldn't
+    /// get at least half of what they asked for.
+    ///
+    /// Feeds the same EMA smoothing as the other signals so a brief
+    /// contention spike doesn't dominate steady-state decisions. Call
+    /// once per cycle with a value in [0, 1].
+    pub fn record_stall_fraction(&mut self, fraction: f64) {
+        let signal = fraction.clamp(0.0, 1.0);
+        self.stall_ema = ALPHA * signal + (1.0 - ALPHA) * self.stall_ema;
+    }
+
+    /// Current stall-fraction EMA (for diagnostics/metrics).
+    pub fn stall_ema(&self) -> f64 {
+        self.stall_ema
+    }
+
     /// Record the VM thrashing score from `VmRate::thrashing_score()`.
     ///
     /// Normalised as `score / 5_000`, capped at 1. A score of 0 is quiet;
@@ -124,18 +148,20 @@ impl StabilityOracle {
 
     /// Composite stability score ∈ [0, 1].  Higher = more stable.
     ///
-    /// Equal-weight average of four inverted-EMA signals: display jank,
-    /// zombie rate, swap spike, and VM thrashing score. All four are
-    /// orthogonal — jank catches the user-perceived glitches, zombies
-    /// catch leaking daemons, swap spikes catch abrupt memory growth,
-    /// and thrashing_ema catches steady-state compressor churn that
-    /// none of the other three see.
+    /// Equal-weight average of five inverted-EMA signals: display jank,
+    /// zombie rate, swap spike, VM thrashing score, and CPU stall
+    /// fraction. All five are orthogonal — jank catches user-perceived
+    /// glitches, zombies catch leaking daemons, swap spikes catch abrupt
+    /// memory growth, thrashing_ema catches steady-state compressor
+    /// churn, and stall_ema catches CPU-contention starvation that
+    /// none of the memory-side signals can see.
     pub fn stability_score(&self) -> f64 {
         let instability = (self.jank_ema
             + self.zombie_rate_ema
             + self.swap_spike_ema
-            + self.thrashing_ema)
-            / 4.0;
+            + self.thrashing_ema
+            + self.stall_ema)
+            / 5.0;
         (1.0 - instability).clamp(0.0, 1.0)
     }
 
@@ -262,18 +288,21 @@ mod tests {
     #[test]
     fn persistent_instability_degrades_score() {
         let mut oracle = StabilityOracle::new();
-        // Simulate 40 consecutive events on ALL three signals simultaneously.
-        // With alpha=0.05, each EMA after 40 events ≈ 1 - 0.95^40 ≈ 0.87.
-        // instability = (0.87 + 0.87 + 0.87) / 3 ≈ 0.87 → score ≈ 0.13 < 0.4.
+        // Drive ALL FIVE signals to saturation so the composite score
+        // reflects the worst-case with every sensor agreeing.
+        // With alpha=0.05, each EMA after 80 events ≈ 1 - 0.95^80 ≈ 0.98.
+        // instability ≈ 5 * 0.98 / 5 = 0.98 → score ≈ 0.02 < 0.15.
         let mut swap = 0u64;
-        for _ in 0..40 {
+        for _ in 0..80 {
             oracle.record_display_jank(true);
             oracle.record_zombie_count(5);
             swap += 600 * 1024 * 1024; // spike every cycle
             oracle.record_swap_bytes(swap);
+            oracle.record_thrashing_score(10_000.0);
+            oracle.record_stall_fraction(1.0);
         }
         assert!(oracle.jank_ema() > 0.8);
-        assert!(oracle.stability_score() < 0.4);
+        assert!(oracle.stability_score() < 0.15);
     }
 
     #[test]
