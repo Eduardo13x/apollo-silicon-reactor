@@ -72,6 +72,19 @@ const MIN_INET_SOCKETS_TO_BLOCK: usize = 1;
 /// Prevents renderers stuck frozen if fg-change detection misses a tab switch.
 const MAX_FROZEN_CYCLES: u8 = 150;
 
+/// Aggressive TTL for renderers of the **currently foreground** Chromium
+/// browser. Bounds the user-visible "stuck tab" hang when the foreground-
+/// change detector misses a tab switch (which is the common case: switching
+/// tabs WITHIN the same browser does not change the foreground browser
+/// name, so the fg_changed thaw path never fires).
+///
+/// 15 cycles ≈ 30 s at the standard 2-s daemon period. Background browsers
+/// keep the long `MAX_FROZEN_CYCLES` TTL because their renderers are not
+/// user-visible and the long TTL maximises memory reclaim. The asymmetry
+/// matches user expectation: the browser you're looking at recovers
+/// quickly; the ones you switched away from stay paused.
+const MAX_FOREGROUND_FROZEN_CYCLES: u8 = 15;
+
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 /// A detected Chromium/Electron renderer process.
@@ -623,8 +636,32 @@ impl ChromiumManager {
                 continue;
             }
 
-            // Thaw check 2: max-freeze-duration guard — force thaw after ~5 min.
-            // Prevents renderers stuck frozen if a foreground change was missed.
+            // Thaw check 2a: foreground-browser renderers get an aggressive
+            // TTL (~30 s) so a missed tab-switch detection cannot leave the
+            // tab the user is looking at stuck for minutes. The user
+            // observed exactly this ("a veces algunos tabs no se me
+            // descongelan"): switching tabs within the same browser does
+            // not fire the fg_changed thaw because the foreground browser
+            // *name* did not change. The aggressive TTL bounds the worst
+            // case to ~30 s.
+            let is_fg_browser = fg_browser
+                .as_ref()
+                .map(|fb| fb == &info.browser)
+                .unwrap_or(false);
+            if info.frozen
+                && is_fg_browser
+                && info.frozen_cycles >= MAX_FOREGROUND_FROZEN_CYCLES
+            {
+                actions.push(ChromiumAction::ThawRenderer {
+                    pid: *pid,
+                    name: info.name.clone(),
+                });
+                continue;
+            }
+
+            // Thaw check 2b: max-freeze-duration guard — force thaw after
+            // ~5 min for background browsers. Prevents renderers stuck
+            // frozen if a foreground change was missed.
             // [Denning 1968] A process suspended too long must be reintegrated.
             if info.frozen && info.frozen_cycles >= MAX_FROZEN_CYCLES {
                 actions.push(ChromiumAction::ThawRenderer {
@@ -636,10 +673,7 @@ impl ChromiumManager {
 
             // E-core demotion for non-foreground renderers — deduplicated (Bug fix #4)
             // Only emit once per renderer, not every cycle (mach_qos.set_tier is sticky)
-            let is_fg_browser = fg_browser
-                .as_ref()
-                .map(|fb| fb == &info.browser)
-                .unwrap_or(false);
+            // (`is_fg_browser` was already computed above for the foreground TTL check.)
             if !is_fg_browser && !info.frozen && !self.ecore_demoted.contains(pid) {
                 actions.push(ChromiumAction::DemoteToEcores {
                     pid: *pid,
@@ -1609,6 +1643,43 @@ mod tests {
         );
         assert!(thaws.contains(&200), "pid 200 must be thawed");
         assert!(thaws.contains(&201), "pid 201 must be thawed");
+    }
+
+    /// Regression: foreground-browser renderers get the aggressive 30-s TTL
+    /// so a missed tab-switch detection can't leave the user looking at a
+    /// stuck tab for the long 5-min background TTL. User reported "a veces
+    /// algunos tabs no se me descongelan" — switching tabs within the same
+    /// browser does not change the foreground browser name and therefore
+    /// never fires the fg_changed thaw path.
+    #[test]
+    fn foreground_browser_renderers_thaw_on_short_ttl() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        // pid 500 belongs to Brave, which is the user's current foreground
+        // browser. The renderer was frozen earlier (e.g. when the tab was
+        // backgrounded inside the browser).
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(500, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
+        mgr.update(&procs, Some(500), &none_set, &none_set);
+        if let Some(r) = mgr.renderers.get_mut(&500) {
+            r.frozen = true;
+            r.frozen_cycles = MAX_FOREGROUND_FROZEN_CYCLES;
+            // browser field is auto-derived by update() from the helper name.
+        }
+        mgr.frozen_pids.insert(500);
+
+        // Update with Brave still in foreground — pid 500 must be thawed
+        // because it crossed MAX_FOREGROUND_FROZEN_CYCLES (~30 s) even
+        // though it's far below the background MAX_FROZEN_CYCLES (~5 min).
+        let actions = mgr.update(&procs, Some(500), &none_set, &none_set);
+        let thaws: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 500))
+            .collect();
+        assert!(
+            !thaws.is_empty(),
+            "Foreground-browser renderer must thaw at MAX_FOREGROUND_FROZEN_CYCLES"
+        );
     }
 
     /// Bug fix #2: Max-freeze-duration guard — renderer frozen too long gets
