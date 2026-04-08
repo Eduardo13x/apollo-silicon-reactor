@@ -251,27 +251,33 @@ impl TelemetryLogger {
     ///
     /// Loads up to `max_files` most-recently-modified files and pushes their
     /// vectors into the ring (oldest first so the ring ends up in time order).
-    /// This lets the anomaly detector skip its cold-start period after a daemon
-    /// restart or crash recovery.
+    /// Files older than `max_age` are skipped — stale data would mislead the
+    /// anomaly detector more than starting cold.
     ///
-    /// [Gray & Reuter 1992] §11.3 — restart protocols should restore as much
-    /// in-flight state as possible to avoid cold-start latency.
+    /// [Gray & Reuter 1992] §11.3 — restart protocols restore in-flight state.
+    /// §11.5 — checkpoint freshness must be bounded; stale state ≠ live state.
     pub fn warm_start_from_dir(&mut self, max_files: usize) {
-        if !self.output_dir.exists() {
-            return;
-        }
-        // Collect .bin files sorted by modification time (oldest first).
-        let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(&self.output_dir)
-            .unwrap_or_else(|_| return std::fs::read_dir("/dev/null").unwrap())
+        const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(3600); // 1 hour
+        let read_dir = match std::fs::read_dir(&self.output_dir) {
+            Ok(rd) => rd,
+            Err(_) => return,
+        };
+        let now = std::time::SystemTime::now();
+        let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = read_dir
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("bin"))
             .filter_map(|e| {
                 let mtime = e.metadata().ok()?.modified().ok()?;
+                // Freshness gate: skip files older than MAX_AGE.
+                if now.duration_since(mtime).ok()? > MAX_AGE {
+                    return None;
+                }
                 Some((mtime, e.path()))
             })
             .collect();
 
-        // Sort newest first, take max_files, then reverse to oldest-first order.
+        // Sort newest first, take max_files, then reverse to oldest-first order
+        // so the ring ends up in chronological order.
         files.sort_by(|a, b| b.0.cmp(&a.0));
         files.truncate(max_files);
         files.reverse();
@@ -283,7 +289,10 @@ impl TelemetryLogger {
             }
         }
         if loaded > 0 {
-            eprintln!("[telemetry] warm-start: loaded {loaded} vectors from {} file(s)", files.len());
+            eprintln!(
+                "[telemetry] warm-start: loaded {loaded} vectors from {} file(s)",
+                files.len()
+            );
         }
     }
 
@@ -548,6 +557,53 @@ mod tests {
         let result = prune_old_files(&dir, 30);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn warm_start_loads_recent_dump() {
+        let dir = std::env::temp_dir().join("apollo_test_warm_start");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // First logger: produce one dump.
+        {
+            let mut logger = TelemetryLogger::new(dir.clone());
+            for _ in 0..120 {
+                logger.record(make_vec(0.3, 0.2, 0.0, 0.1));
+            }
+            // Trigger an OOM-risk dump.
+            logger.record(make_vec(0.9, 0.9, 0.65, 0.3));
+        }
+
+        // Second logger: warm-start from disk should reload the vectors.
+        let mut fresh = TelemetryLogger::new(dir.clone());
+        assert_eq!(fresh.len(), 0);
+        fresh.warm_start_from_dir(3);
+        assert!(fresh.len() > 100, "expected warm-start to load >100 vectors, got {}", fresh.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_start_handles_missing_dir() {
+        let dir = std::env::temp_dir().join("apollo_test_warm_start_missing_xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut logger = TelemetryLogger::new(dir);
+        // Must not panic when directory doesn't exist.
+        logger.warm_start_from_dir(3);
+        assert_eq!(logger.len(), 0);
+    }
+
+    #[test]
+    fn warm_start_rejects_bad_magic() {
+        let dir = std::env::temp_dir().join("apollo_test_warm_start_badmagic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write a file with wrong magic bytes.
+        std::fs::write(dir.join("bad.bin"), vec![0u8; 1024]).unwrap();
+        let mut logger = TelemetryLogger::new(dir.clone());
+        logger.warm_start_from_dir(3);
+        assert_eq!(logger.len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
