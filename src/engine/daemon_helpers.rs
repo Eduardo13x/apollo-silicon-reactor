@@ -197,6 +197,16 @@ pub fn telemetry_output_dir() -> &'static str {
     }
 }
 
+/// Path where novel effective process patterns are logged for scenario generation.
+/// Append-only JSONL; read by autoresearch loop to generate targeted tests.
+pub fn novel_patterns_path() -> &'static str {
+    if is_root() {
+        "/var/lib/apollo/novel_patterns.jsonl"
+    } else {
+        "/tmp/apollo-novel-patterns.jsonl"
+    }
+}
+
 fn crash_sentinel_path() -> &'static str {
     if is_root() {
         "/var/lib/apollo/session.running"

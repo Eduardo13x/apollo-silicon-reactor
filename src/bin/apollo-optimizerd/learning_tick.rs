@@ -309,6 +309,36 @@ pub fn run_learning_tick<'a>(
                     .insert(name.clone(), weight.clone());
             }
         }
+        // Phase 4 — Novel pattern logger: when OutcomeTracker sees a high-value
+        // pattern for the first time (throttle_count == 3 exactly, just crossed
+        // the `is_high_value()` threshold), append it to `novel_patterns.jsonl`.
+        //
+        // This staging file lets the autoresearch loop generate targeted scenarios
+        // for newly-discovered effective process/workload combinations without
+        // modifying test files directly.
+        //
+        // [Simon 1955] satisficing: we don't need optimal detection of novelty,
+        // just a reliable signal that a pattern has just become "confirmed".
+        // throttle_count == 3 is the exact threshold used by `is_high_value()`.
+        for name in &batch.effective_names {
+            if let Some(w) = lctx.outcome_tracker.weights.get(name) {
+                if w.throttle_count == 3 && w.is_high_value() {
+                    let pressure = snapshot.pressure.memory_pressure;
+                    let workload = format!("{:?}", workload_mode).to_lowercase();
+                    let entry = format!(
+                        "{{\"process\":{:?},\"effectiveness\":{:.3},\"pressure\":{:.3},\"workload\":{:?},\"cycle\":{}}}\n",
+                        name, w.effectiveness(), pressure, workload, cycle_count
+                    );
+                    let novel_path = apollo_optimizer::engine::daemon_helpers::novel_patterns_path();
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(novel_path)
+                        .and_then(|mut f| { use std::io::Write; f.write_all(entry.as_bytes()) });
+                }
+            }
+        }
+
         // Restore quality monitor: track post-restore effectiveness.
         //
         // The correct "resolved this tick" count is `resolved_outcomes.len()`,

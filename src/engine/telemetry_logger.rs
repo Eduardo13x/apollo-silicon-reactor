@@ -247,6 +247,87 @@ impl TelemetryLogger {
         Ok(())
     }
 
+    /// Warm-start the ring buffer from recent `.bin` files in `output_dir`.
+    ///
+    /// Loads up to `max_files` most-recently-modified files and pushes their
+    /// vectors into the ring (oldest first so the ring ends up in time order).
+    /// This lets the anomaly detector skip its cold-start period after a daemon
+    /// restart or crash recovery.
+    ///
+    /// [Gray & Reuter 1992] §11.3 — restart protocols should restore as much
+    /// in-flight state as possible to avoid cold-start latency.
+    pub fn warm_start_from_dir(&mut self, max_files: usize) {
+        if !self.output_dir.exists() {
+            return;
+        }
+        // Collect .bin files sorted by modification time (oldest first).
+        let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(&self.output_dir)
+            .unwrap_or_else(|_| return std::fs::read_dir("/dev/null").unwrap())
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("bin"))
+            .filter_map(|e| {
+                let mtime = e.metadata().ok()?.modified().ok()?;
+                Some((mtime, e.path()))
+            })
+            .collect();
+
+        // Sort newest first, take max_files, then reverse to oldest-first order.
+        files.sort_by(|a, b| b.0.cmp(&a.0));
+        files.truncate(max_files);
+        files.reverse();
+
+        let mut loaded = 0usize;
+        for (_mtime, path) in &files {
+            if let Ok(data) = std::fs::read(path) {
+                loaded += self.load_bin_file(&data);
+            }
+        }
+        if loaded > 0 {
+            eprintln!("[telemetry] warm-start: loaded {loaded} vectors from {} file(s)", files.len());
+        }
+    }
+
+    /// Parse a binary telemetry file and push its vectors into the ring.
+    /// Returns the number of vectors loaded.
+    fn load_bin_file(&mut self, data: &[u8]) -> usize {
+        if data.len() < HEADER_SIZE {
+            return 0;
+        }
+        // Validate magic.
+        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if magic != MAGIC {
+            return 0;
+        }
+        let n_vecs = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        let n_feat = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        if n_feat != N_FEATURES {
+            return 0; // incompatible version
+        }
+        let expected_len = HEADER_SIZE + n_vecs * N_FEATURES * 4;
+        if data.len() < expected_len {
+            return 0;
+        }
+        let mut offset = HEADER_SIZE;
+        let mut count = 0;
+        for _ in 0..n_vecs {
+            let mut arr = [0f32; N_FEATURES];
+            for f in arr.iter_mut() {
+                let bytes = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+                *f = f32::from_le_bytes(bytes);
+                offset += 4;
+            }
+            // Reconstruct TelemetryVector from f32 array.
+            // SAFETY: TelemetryVector is #[repr(C)] with exactly N_FEATURES f32 fields.
+            let tv: TelemetryVector = unsafe { std::mem::transmute(arr) };
+            if self.ring.len() >= RING_CAPACITY {
+                self.ring.pop_front();
+            }
+            self.ring.push_back(tv);
+            count += 1;
+        }
+        count
+    }
+
     /// Toggle logging on/off.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;

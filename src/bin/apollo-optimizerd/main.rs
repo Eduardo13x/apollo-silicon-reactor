@@ -837,6 +837,12 @@ fn main() -> anyhow::Result<()> {
             let mut telemetry_logger = apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(
                 PathBuf::from(telemetry_output_dir()),
             );
+            // Warm-start: reload recent history so anomaly detector skips cold-start.
+            // [Gray & Reuter 1992] §11.3 — restart protocols restore in-flight state.
+            telemetry_logger.warm_start_from_dir(3);
+            // StabilityOracle: aggregate jank + zombie + swap-spike into RL reward.
+            // [Schulman et al. 2017] PPO per-cycle reward; [Nygard 2018] cascading instability.
+            let mut stability_oracle = apollo_optimizer::engine::stability_oracle::StabilityOracle::new();
             let hw_path = PathBuf::from(holt_winters_path());
             let mut holt_winters = HoltWinters::load(&hw_path).unwrap_or_default();
             let mut hw_last_hour: Option<u8> = None;
@@ -1458,8 +1464,13 @@ fn main() -> anyhow::Result<()> {
                             drop(frozen_guard);
                             state.metrics.lock_recover().metrics.unfreezes_applied +=
                                 unfreeze_count;
+                            // Display returning from turbo = potential jank event (user came back,
+                            // system was frozen). Record for StabilityOracle.
+                            stability_oracle.record_display_jank(true);
                         }
-                        TurboAction::None => {}
+                        TurboAction::None => {
+                            stability_oracle.record_display_jank(false);
+                        }
                     }
                 }
 
@@ -4553,7 +4564,10 @@ fn main() -> anyhow::Result<()> {
                     let neuro_signals = NeuroSignals {
                         pressure_drop: signal_digest.pressure_smooth as f64 * -1.0
                             * signal_digest.pressure_velocity,
-                        outcome_penalty: lctx.outcome_tracker.rl_penalty(),
+                        // Combine outcome-tracker RL penalty with stability oracle signal.
+                        // [Schulman 2017] — additive reward shaping preserves policy gradient.
+                        outcome_penalty: lctx.outcome_tracker.rl_penalty()
+                            - stability_oracle.instability_penalty(),
                         overflow_occurred,
                         urgency: signal_digest.urgency,
                         regime_shift_up: signal_digest.regime_shift_up,
@@ -4862,6 +4876,9 @@ fn main() -> anyhow::Result<()> {
                     m.metrics.zombies_detected += heuristic_stats.zombies_detected;
                     m.metrics.current_workload = current_workload_str;
                 }
+                // StabilityOracle: record zombie count + swap bytes each cycle.
+                stability_oracle.record_zombie_count(heuristic_stats.zombies_detected as usize);
+                stability_oracle.record_swap_bytes(snapshot.pressure.swap_used_bytes);
                 {
                     let mut m = state.metrics.lock_recover();
                     m.metrics.ml_confidence = ml_class.confidence;

@@ -87,6 +87,7 @@ pub mod silicon_probe;
 pub mod sleep_notifier;
 pub mod smc_direct;
 pub mod smc_reader;
+pub mod stability_oracle;
 pub mod swap_predictor;
 pub mod syscall_classifier;
 pub mod system_log_ingester;
