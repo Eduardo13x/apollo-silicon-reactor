@@ -31,6 +31,15 @@ const ALPHA: f64 = 0.05;
 /// Swap spike threshold: 512 MB jump in a single cycle.
 const SWAP_SPIKE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Normalisation divisor for the VM thrashing score. `VmRate::thrashing_score()`
+/// is in "events per second" with weights 3/2/1/1 for swap/compression/
+/// decompression/reactivation. A score of 5_000 corresponds roughly to
+/// "actively thrashing the compressor" in practice on an M1 8 GB machine;
+/// 10_000+ is a system in serious trouble. We normalise by 5_000 so that
+/// "actively thrashing" maps to 1.0 (fully unstable signal) and the EMA
+/// treats quieter churn proportionally.
+const THRASHING_NORM: f64 = 5_000.0;
+
 /// Cold-boot window: within this many seconds after kernel boot, Spotlight
 /// reindexing, cfprefsd warm-up and launchd job startup cause transient
 /// jank/swap/load that is NOT indicative of apollo's behaviour. The
@@ -38,7 +47,7 @@ const SWAP_SPIKE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 /// [Jain 1991] §12.2 — exclude warm-up period from steady-state measurements.
 pub const COLD_BOOT_WINDOW_SECS: u64 = 300;
 
-/// StabilityOracle aggregates three perceptual stability signals.
+/// StabilityOracle aggregates four perceptual stability signals.
 pub struct StabilityOracle {
     /// EMA of display-jank events (0=no jank, 1=jank).
     jank_ema: f64,
@@ -46,6 +55,11 @@ pub struct StabilityOracle {
     zombie_rate_ema: f64,
     /// EMA of swap spike events (0=no spike, 1=spike).
     swap_spike_ema: f64,
+    /// EMA of the VM thrashing score (normalised: score / 5_000, capped at 1).
+    /// This is the "flow" view of memory pressure — distinguishes a quiet
+    /// high-residency system from an actively thrashing one, which
+    /// pressure-percentage alone cannot do.
+    thrashing_ema: f64,
     /// Previous cycle's swap usage (bytes) for spike detection.
     prev_swap_bytes: Option<u64>,
 }
@@ -56,6 +70,7 @@ impl StabilityOracle {
             jank_ema: 0.0,
             zombie_rate_ema: 0.0,
             swap_spike_ema: 0.0,
+            thrashing_ema: 0.0,
             prev_swap_bytes: None,
         }
     }
@@ -94,12 +109,39 @@ impl StabilityOracle {
         self.swap_spike_ema = ALPHA * signal + (1.0 - ALPHA) * self.swap_spike_ema;
     }
 
+    /// Record the VM thrashing score from `VmRate::thrashing_score()`.
+    ///
+    /// Normalised as `score / 5_000`, capped at 1. A score of 0 is quiet;
+    /// 5_000+ corresponds to a system actively thrashing the compressor.
+    /// Uses the same EMA smoothing (α = 0.05) as the other signals so all
+    /// four contribute on comparable timescales to the composite score.
+    ///
+    /// Call once per cycle with `pressure_data.thrashing_score`.
+    pub fn record_thrashing_score(&mut self, score: f64) {
+        let signal = (score / THRASHING_NORM).clamp(0.0, 1.0);
+        self.thrashing_ema = ALPHA * signal + (1.0 - ALPHA) * self.thrashing_ema;
+    }
+
     /// Composite stability score ∈ [0, 1].  Higher = more stable.
     ///
-    /// Equal-weight average of three inverted-EMA signals.
+    /// Equal-weight average of four inverted-EMA signals: display jank,
+    /// zombie rate, swap spike, and VM thrashing score. All four are
+    /// orthogonal — jank catches the user-perceived glitches, zombies
+    /// catch leaking daemons, swap spikes catch abrupt memory growth,
+    /// and thrashing_ema catches steady-state compressor churn that
+    /// none of the other three see.
     pub fn stability_score(&self) -> f64 {
-        let instability = (self.jank_ema + self.zombie_rate_ema + self.swap_spike_ema) / 3.0;
+        let instability = (self.jank_ema
+            + self.zombie_rate_ema
+            + self.swap_spike_ema
+            + self.thrashing_ema)
+            / 4.0;
         (1.0 - instability).clamp(0.0, 1.0)
+    }
+
+    /// Current thrashing EMA (for diagnostics/metrics).
+    pub fn thrashing_ema(&self) -> f64 {
+        self.thrashing_ema
     }
 
     /// Instability penalty ∈ [0, 1].  0 = stable, 1 = maximally unstable.
@@ -232,6 +274,46 @@ mod tests {
         }
         assert!(oracle.jank_ema() > 0.8);
         assert!(oracle.stability_score() < 0.4);
+    }
+
+    #[test]
+    fn thrashing_score_feeds_into_instability() {
+        let mut oracle = StabilityOracle::new();
+        // Quiet baseline — thrashing EMA stays 0, stability stays high.
+        for _ in 0..20 {
+            oracle.record_thrashing_score(0.0);
+            oracle.record_display_jank(false);
+            oracle.record_zombie_count(0);
+            oracle.record_swap_bytes(0);
+        }
+        let quiet_score = oracle.stability_score();
+        assert!(quiet_score > 0.99);
+        // Drive thrashing EMA toward 1.0 — score must drop.
+        for _ in 0..80 {
+            oracle.record_thrashing_score(10_000.0); // above norm → clamps to 1.0
+            oracle.record_display_jank(false);
+            oracle.record_zombie_count(0);
+            oracle.record_swap_bytes(0);
+        }
+        let thrashing_score = oracle.stability_score();
+        assert!(
+            thrashing_score < quiet_score - 0.15,
+            "expected meaningful drop, got quiet={quiet_score} thrashing={thrashing_score}"
+        );
+        assert!(oracle.thrashing_ema() > 0.8);
+    }
+
+    #[test]
+    fn thrashing_score_clamps_at_norm() {
+        let mut oracle = StabilityOracle::new();
+        // Even with an insanely high raw score, the normalised signal
+        // can't exceed 1.0, so one cycle should move the EMA by exactly
+        // ALPHA (0.05) regardless of the raw magnitude.
+        oracle.record_thrashing_score(1_000_000.0);
+        assert!((oracle.thrashing_ema() - ALPHA).abs() < 1e-9);
+        let mut oracle2 = StabilityOracle::new();
+        oracle2.record_thrashing_score(5_000.0); // exactly norm
+        assert!((oracle2.thrashing_ema() - ALPHA).abs() < 1e-9);
     }
 
     #[test]

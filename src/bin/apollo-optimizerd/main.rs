@@ -4885,9 +4885,16 @@ fn main() -> anyhow::Result<()> {
                     m.metrics.zombies_detected += heuristic_stats.zombies_detected;
                     m.metrics.current_workload = current_workload_str;
                 }
-                // StabilityOracle: record zombie count + swap bytes each cycle.
+                // StabilityOracle: record zombie count + swap bytes + VM
+                // thrashing score each cycle. The thrashing score comes from
+                // the background pressure collector's VmRate derivation, which
+                // captures per-second compression/decompression/swap churn —
+                // the flow view of memory pressure that absolute percentages
+                // can't see.
                 stability_oracle.record_zombie_count(heuristic_stats.zombies_detected as usize);
                 stability_oracle.record_swap_bytes(snapshot.pressure.swap_used_bytes);
+                stability_oracle
+                    .record_thrashing_score(pressure_collector.latest().thrashing_score);
                 {
                     let mut m = state.metrics.lock_recover();
                     m.metrics.ml_confidence = ml_class.confidence;

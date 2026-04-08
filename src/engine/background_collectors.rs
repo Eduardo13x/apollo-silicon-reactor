@@ -4,7 +4,7 @@
 //! out of the main daemon loop into a dedicated background thread that polls
 //! at a configurable interval.  The main loop reads cached data in <1 μs.
 
-use crate::engine::host_vm_info;
+use crate::engine::host_vm_info::{self, VmPageStats, VmRate};
 use crate::engine::sysctl_direct;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,6 +26,18 @@ pub struct PressureData {
     pub swap_delta_bps: f64,
     /// When this data was last refreshed.
     pub updated_at: Instant,
+    /// Per-second VM flow rates derived from host_statistics64 cumulative
+    /// counters. Populated by `PressureCollector` using the previous sample
+    /// as baseline. Zero-filled on the very first collection (no prev).
+    ///
+    /// This is the "flow" view of memory pressure: pressure_percentage tells
+    /// you the water level, vm_rate tells you whether water is pouring in
+    /// or draining out.
+    pub vm_rate: VmRate,
+    /// Composite thrashing score from `VmRate::thrashing_score()`.
+    /// 0 ≈ quiet, 1_000+ ≈ mild churn, 10_000+ ≈ active thrashing.
+    /// Cached here so consumers never have to re-derive it.
+    pub thrashing_score: f64,
 }
 
 impl Default for PressureData {
@@ -36,6 +48,8 @@ impl Default for PressureData {
             swap_total_bytes: 0,
             swap_delta_bps: 0.0,
             updated_at: Instant::now(),
+            vm_rate: VmRate::default(),
+            thrashing_score: 0.0,
         }
     }
 }
@@ -62,9 +76,16 @@ impl PressureCollector {
             .spawn(move || {
                 let mut prev_swap_used: Option<u64> = None;
                 let mut prev_swap_at: Option<Instant> = None;
+                // Previous VM sample + its wall-clock timestamp for rate
+                // derivation. Separate from swap bookkeeping because the
+                // VM stats come from a different kernel call and we want
+                // the rate to be computed from the exact dt between the
+                // two host_statistics64 reads, not from the loop period.
+                let mut prev_vm: Option<(VmPageStats, Instant)> = None;
 
                 loop {
-                    let (mem_pressure, swap_used, swap_total) = collect_pressure_facts();
+                    let (mem_pressure, vm_sample, swap_used, swap_total) =
+                        collect_pressure_facts();
                     let now = Instant::now();
                     let swap_delta = match (prev_swap_used, prev_swap_at) {
                         (Some(prev), Some(at)) => {
@@ -76,12 +97,29 @@ impl PressureCollector {
                     prev_swap_used = Some(swap_used);
                     prev_swap_at = Some(now);
 
+                    // VM flow rates: derive from prev sample if we have one,
+                    // zero-filled on first iteration.
+                    let (vm_rate, thrashing_score) = match (&vm_sample, &prev_vm) {
+                        (Some(curr), Some((prev, prev_at))) => {
+                            let dt = now.duration_since(*prev_at).as_secs_f64();
+                            let rate = VmRate::compute(prev, curr, dt);
+                            let score = rate.thrashing_score();
+                            (rate, score)
+                        }
+                        _ => (VmRate::default(), 0.0),
+                    };
+                    if let Some(s) = vm_sample {
+                        prev_vm = Some((s, now));
+                    }
+
                     *c.lock_recover() = PressureData {
                         memory_pressure: mem_pressure,
                         swap_used_bytes: swap_used,
                         swap_total_bytes: swap_total,
                         swap_delta_bps: swap_delta,
                         updated_at: now,
+                        vm_rate,
+                        thrashing_score,
                     };
 
                     // Update heartbeat after successful collection.
@@ -135,16 +173,22 @@ impl PressureCollector {
     }
 }
 
-fn collect_pressure_facts() -> (f64, u64, u64) {
+/// Collect a raw sample of kernel memory+swap facts for the collector thread.
+///
+/// Returns the pressure percentage, the full VmPageStats sample (so the
+/// caller can also compute flow rates from it), and swap used/total. The
+/// VmPageStats is returned as `Option` because host_statistics64 can
+/// theoretically fail; the caller's rate computation already handles
+/// the None case by zero-filling.
+fn collect_pressure_facts() -> (f64, Option<VmPageStats>, u64, u64) {
     // Memory pressure via Mach host_statistics64 (~1µs vs 50ms for subprocess).
-    let memory_pressure = host_vm_info::read_vm_stats()
-        .map(|s| s.pressure())
-        .unwrap_or(0.0);
+    let vm_stats = host_vm_info::read_vm_stats();
+    let memory_pressure = vm_stats.as_ref().map(|s| s.pressure()).unwrap_or(0.0);
 
     // Swap usage via direct sysctl struct read (~1µs vs 10ms for subprocess).
     let (swap_total_bytes, swap_used_bytes) = sysctl_direct::read_swap_usage().unwrap_or((0, 0));
 
-    (memory_pressure, swap_used_bytes, swap_total_bytes)
+    (memory_pressure, vm_stats, swap_used_bytes, swap_total_bytes)
 }
 
 #[cfg(test)]
