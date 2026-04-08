@@ -217,15 +217,40 @@ fn crash_sentinel_path() -> &'static str {
 
 /// Call at daemon startup to detect if the previous session ended abnormally.
 ///
-/// Returns `true` if the previous session crashed (sentinel file left behind
-/// without a clean-shutdown write).  Side effect: creates a new sentinel for
-/// the current session so the next startup can detect *this* crash too.
+/// Returns `true` only if the previous session both (a) left a sentinel
+/// behind (no clean-shutdown write) AND (b) had been running long enough
+/// (≥60 seconds) for the crash to plausibly reflect a real runtime issue
+/// rather than a startup-time failure or operator kill.
+///
+/// Side effect: writes a new sentinel for the current session so the next
+/// startup can detect *this* crash too.
 ///
 /// [Gray & Reuter 1992 "Transaction Processing" §3 — crash recovery via
 /// write-ahead sentinel; presence = in-progress, absence = clean.]
+/// The 60-second minimum-uptime gate avoids treating crash-loops or operator
+/// kill cycles as genuine instability — those should be diagnosed, not masked
+/// by cautious mode.
 pub fn detect_prior_crash() -> bool {
     let path = crash_sentinel_path();
-    let crashed = std::path::Path::new(path).exists();
+    let crashed = if let Ok(prev) = fs::read_to_string(path) {
+        // Parse `started` timestamp from previous sentinel and require ≥60s
+        // uptime before treating absence-of-clean-shutdown as a real crash.
+        let prev_started = prev
+            .split("\"started\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+        match prev_started {
+            Some(started) => {
+                let lived = chrono::Utc::now()
+                    .signed_duration_since(started.with_timezone(&chrono::Utc));
+                lived.num_seconds() >= 60
+            }
+            None => true, // unparseable old format → be conservative, treat as crash
+        }
+    } else {
+        false
+    };
     // Overwrite (or create) sentinel with current PID + timestamp.
     let _ = fs::write(
         path,
@@ -574,10 +599,33 @@ mod tests {
         let _guard = sentinel_test_lock();
         let path = crash_sentinel_path();
         let _ = fs::remove_file(path); // clean state
-        let _ = detect_prior_crash(); // creates sentinel (first start)
-        // Simulate crash: don't call remove_crash_sentinel
-        let crashed = detect_prior_crash(); // second start finds sentinel
-        assert!(crashed, "sentinel present should mean crash detected");
+        // Inject an aged sentinel: previous session "started" 120s ago.
+        let aged = chrono::Utc::now() - chrono::Duration::seconds(120);
+        let _ = fs::write(
+            path,
+            format!("{{\"pid\":1,\"started\":\"{}\"}}", aged.to_rfc3339()),
+        );
+        let crashed = detect_prior_crash(); // sees aged sentinel → real crash
+        assert!(crashed, "aged sentinel (≥60s uptime) should be detected as crash");
+        remove_crash_sentinel();
+    }
+
+    #[test]
+    fn fresh_sentinel_below_uptime_floor_not_a_crash() {
+        let _guard = sentinel_test_lock();
+        let path = crash_sentinel_path();
+        let _ = fs::remove_file(path);
+        // Inject a very fresh sentinel (just now) — uptime < 60s.
+        let now = chrono::Utc::now();
+        let _ = fs::write(
+            path,
+            format!("{{\"pid\":1,\"started\":\"{}\"}}", now.to_rfc3339()),
+        );
+        let crashed = detect_prior_crash();
+        assert!(
+            !crashed,
+            "sentinel with <60s uptime should not be treated as a crash (likely startup failure or operator kill)"
+        );
         remove_crash_sentinel();
     }
 
