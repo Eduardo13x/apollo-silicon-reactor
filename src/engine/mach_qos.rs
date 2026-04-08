@@ -379,19 +379,48 @@ impl MachQoSManager {
             };
         }
 
+        // Check cache FIRST: any pid already in current_tier has been
+        // successfully task_for_pid'd before, so by construction it is not
+        // SIP-protected. Short-circuiting here skips the proc_pidpath()
+        // syscall that is_sip_protected() would otherwise cost on every
+        // single set_tier call — which matters on the unfreeze hot path
+        // where we promote every pid to Foreground. Steady state drops
+        // from 2 syscalls per set_tier (proc_pidpath + task_policy) to 1.
+        //
+        // [Hennessy & Patterson 2017] §2.1 — "make the common case fast";
+        // the common case during unfreeze is a pid already classified.
+        if let Some(&cached) = self.current_tier.get(&pid) {
+            if cached == tier {
+                return QoSOutcome {
+                    pid,
+                    tier,
+                    success: true,
+                    error: None,
+                };
+            }
+            // Cached with a different tier — skip is_sip_protected (already
+            // proven non-SIP) and go straight to apply_task_policy below.
+            let result = self.apply_task_policy(pid, tier);
+            if result.success {
+                self.current_tier.insert(pid, tier);
+            } else {
+                self.permanently_blocked.insert(pid);
+                self.current_tier.remove(&pid);
+                return QoSOutcome {
+                    pid,
+                    tier,
+                    success: true,
+                    error: None,
+                };
+            }
+            return result;
+        }
+
+        // First encounter with this pid — pay the SIP classification cost.
         // Pre-filter: if the executable is in a SIP-protected path or
         // proc_pidpath fails, block permanently without attempting task_for_pid.
         if Self::is_sip_protected(pid) {
             self.permanently_blocked.insert(pid);
-            return QoSOutcome {
-                pid,
-                tier,
-                success: true,
-                error: None,
-            };
-        }
-
-        if self.current_tier.get(&pid) == Some(&tier) {
             return QoSOutcome {
                 pid,
                 tier,
