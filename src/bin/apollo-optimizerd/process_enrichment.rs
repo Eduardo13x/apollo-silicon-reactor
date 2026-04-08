@@ -182,15 +182,34 @@ pub fn build_enriched_process_data_with_tree(
     // This replaces the hardcoded wakeups_per_sec: 0.0 with REAL kernel data.
     // pid → (idle_wakeups, mach_msgs, faults, pageins)
     let mut rusage_map: HashMap<u32, (u64, u32, u32, u32)> = HashMap::new();
+    // CPU contention map: pid → ratio ∈ [0, 1] between the prev rusage
+    // sample cached in the global ContentionTracker and the one we read
+    // this cycle. None on the first cycle for a pid, or when the process
+    // was fully idle. Feeds ProcessSnapshot.cpu_contention below.
+    let mut contention_map: HashMap<u32, f64> = HashMap::new();
     for &pid in &fg_family {
         // Only enrich non-foreground in the loop below
         let _ = pid;
     }
     // Build rusage map for all PIDs — O(n) syscalls, ~3µs each
+    let mut live_pids: HashSet<u32> = HashSet::new();
     for (pid, _process) in sys.processes() {
         let pid_u32 = pid.as_u32();
+        live_pids.insert(pid_u32);
         if let Some(ri) = proc_taskinfo::get_rusage_info(pid_u32) {
             let idle_wk = ri.idle_wakeups;
+            // Observe into the global contention tracker. This returns the
+            // ratio vs the previous cached sample (None on the first cycle
+            // or when the process was idle) and stores the new sample as
+            // the next baseline. The mutex is held only for the observe
+            // call itself; no other I/O happens under it.
+            if let Ok(mut tracker) =
+                apollo_optimizer::engine::contention_tracker::global().lock()
+            {
+                if let Some(ratio) = tracker.observe(pid_u32, ri.clone()) {
+                    contention_map.insert(pid_u32, ratio);
+                }
+            }
             if let Some(ti) = proc_taskinfo::get_task_info(pid_u32) {
                 rusage_map.insert(
                     pid_u32,
@@ -205,6 +224,11 @@ pub fn build_enriched_process_data_with_tree(
                 rusage_map.insert(pid_u32, (idle_wk, 0, 0, 0));
             }
         }
+    }
+    // GC any tracker entries for pids that disappeared this cycle so the
+    // map can't grow beyond the live pid set over a long-running session.
+    if let Ok(mut tracker) = apollo_optimizer::engine::contention_tracker::global().lock() {
+        tracker.gc(&live_pids);
     }
 
     let mut proc_snaps = Vec::new();
@@ -279,6 +303,7 @@ pub fn build_enriched_process_data_with_tree(
             pageins_total,
             is_translated: apollo_optimizer::engine::process_identity::is_translated(pid_u32),
             mach_port_count: 0, // populated lazily for hoarder candidates only
+            cpu_contention: contention_map.get(&pid_u32).copied(),
         });
 
         hunt_snaps.push(HuntSnapshot {

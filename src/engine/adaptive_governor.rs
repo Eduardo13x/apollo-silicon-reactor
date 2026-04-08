@@ -812,6 +812,7 @@ mod tests {
             pageins_total: 100,
             is_translated: false,
             mach_port_count: 10,
+            cpu_contention: None,
         }
     }
 

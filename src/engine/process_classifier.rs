@@ -53,6 +53,18 @@ pub struct ProcessSnapshot {
     pub pageins_total: u32,
     pub is_translated: bool,
     pub mach_port_count: u32,
+    /// CPU contention ratio ∈ [0, 1] derived from successive
+    /// `ri_runnable_time` samples. `None` on the first cycle for this pid,
+    /// or when the process was fully idle in the observation window.
+    ///
+    /// - `Some(0.0)` → process got every ns of CPU it asked for.
+    /// - `Some(1.0)` → process was fully starved (wanted CPU entire window,
+    ///   got none) — neighbouring processes blocked it.
+    /// - `None`     → no signal (first sample / idle).
+    ///
+    /// See `contention_tracker::ContentionTracker` and
+    /// `proc_taskinfo::cpu_contention_ratio`.
+    pub cpu_contention: Option<f64>,
 }
 
 // ── Name lists ────────────────────────────────────────────────────────────────
@@ -341,6 +353,7 @@ mod tests {
             pageins_total: 0,
             is_translated: false,
             mach_port_count: 0,
+            cpu_contention: None,
         }
     }
 
