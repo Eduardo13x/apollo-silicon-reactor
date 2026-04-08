@@ -7,7 +7,7 @@ use crate::engine::activity_sensor::pids_with_assertions;
 use crate::engine::amx_detector;
 use crate::engine::io_tiering::{apply_io_tier, io_tier_for_throttle};
 use crate::engine::jetsam_control::{apply_apollo_policy, JetsamClass};
-use crate::engine::journal::append_journal;
+use crate::engine::journal::append_journal_batch;
 use crate::engine::mach_qos::{LatencyTier, MachQoSManager, ThreadTier, ThroughputTier};
 use crate::engine::proc_taskinfo;
 use crate::engine::process_identity::{self, ProcessIdentity};
@@ -221,6 +221,10 @@ pub fn execute_actions(
     let empty_infra: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
 
     let mut out = ExecuteOutcomes::default();
+    // Batched journal buffer: entries are flushed in a single open/write/close
+    // AFTER the main loop exits, so journaling never queues between actions
+    // on the user-visible latency path.
+    let mut pending_journal: Vec<JournalEntry> = Vec::with_capacity(16);
 
     // ── Fast-path unfreeze pre-pass ─────────────────────────────────────────
     //
@@ -593,15 +597,23 @@ pub fn execute_actions(
             success = true;
         }
 
-        let entry = JournalEntry {
+        pending_journal.push(JournalEntry {
             timestamp: Utc::now(),
             action,
             before,
             after,
             success,
             reason,
-        };
-        let _ = append_journal(journal_path, &entry);
+        });
+    }
+
+    // Flush the entire cycle's journal in a single batched append. Failures
+    // here are logged via eprintln! (diagnostic-only) and never affect the
+    // outcomes counters — the kernel already owns the authoritative state.
+    if !pending_journal.is_empty() {
+        if let Err(e) = append_journal_batch(journal_path, &pending_journal) {
+            eprintln!("[execute_actions] batched journal append failed: {e}");
+        }
     }
 
     out
