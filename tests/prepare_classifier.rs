@@ -35,6 +35,7 @@ mod scenarios {
             pageins_total: 0,
             is_translated: false,
             mach_port_count: 0,
+            cpu_contention: None,
         }
     }
 

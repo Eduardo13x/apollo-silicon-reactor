@@ -2609,6 +2609,20 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.swap_delta_bps = snapshot.pressure.swap_delta_bytes_per_sec;
                     metrics.metrics.memory_pressure = snapshot.pressure.memory_pressure;
                     metrics.metrics.thermal_level = snapshot.pressure.thermal_level.clone();
+                    // Expose the new sensor surface (thrashing flow + per-core
+                    // saturation + PSI stall fraction) so the dashboard,
+                    // socket status and runtime_metrics.json all see the same
+                    // signals the RL reward path already reacts to.
+                    let pd = pressure_collector.latest();
+                    metrics.metrics.thrashing_score = pd.thrashing_score;
+                    metrics.metrics.cpu_mean_busy = pd.cpu_saturation.mean_busy;
+                    metrics.metrics.cpu_max_busy = pd.cpu_saturation.max_busy;
+                    metrics.metrics.cpu_pegged_fraction = pd.cpu_saturation.pegged_fraction;
+                    if let Ok(tracker) =
+                        apollo_optimizer::engine::contention_tracker::global().lock()
+                    {
+                        metrics.metrics.stall_fraction = tracker.stall_fraction(0.5);
+                    }
                     {
                         let rs_total = metrics.reactor_status.events_total;
                         let rs_mem = metrics.reactor_status.events_mem;

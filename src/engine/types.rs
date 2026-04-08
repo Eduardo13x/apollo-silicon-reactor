@@ -521,6 +521,24 @@ pub struct RuntimeMetrics {
     pub swap_used_bytes: u64,
     pub swap_delta_bps: f64,
     pub memory_pressure: f64,
+    /// Composite VM thrashing score from `VmRate::thrashing_score()`.
+    /// 0 ≈ quiet, 5_000+ ≈ actively thrashing the compressor.
+    #[serde(default)]
+    pub thrashing_score: f64,
+    /// System-wide CPU stall fraction from
+    /// `ContentionTracker::stall_fraction(0.5)` — fraction of tracked pids
+    /// whose PSI "some" contention ratio crossed 50% in the last cycle.
+    #[serde(default)]
+    pub stall_fraction: f64,
+    /// Mean per-core busy ratio across all online processors.
+    #[serde(default)]
+    pub cpu_mean_busy: f64,
+    /// Hottest per-core busy ratio — "single saturated core" signal.
+    #[serde(default)]
+    pub cpu_max_busy: f64,
+    /// Fraction of cores with busy ≥ 0.80 — pegged-core count / total.
+    #[serde(default)]
+    pub cpu_pegged_fraction: f64,
     pub thermal_level: String,
     pub invalid_sysctl_denied: u64,
     pub critical_background_skips: u64,
