@@ -5,8 +5,26 @@
 //! ~1µs vs 5-10ms for subprocess.
 
 /// VM page statistics from the kernel.
-#[derive(Debug, Clone)]
+///
+/// Contains BOTH the instantaneous page counts (state — "how much memory is
+/// where") AND the cumulative event counters (flow — "how fast is memory
+/// moving"). The event counters are monotonic since boot; callers compute
+/// per-second rates by taking deltas between successive samples.
+///
+/// The flow metrics are the single biggest gap between "apollo knows the
+/// water level" and "apollo senses the current". A system at 70% pressure
+/// with zero compressions/s is stable; a system at 70% pressure with 50k
+/// compressions/s is actively thrashing. Without these counters apollo
+/// cannot tell the difference.
+///
+/// References:
+/// - Apple XNU `vm_stat.c` — reads exactly these fields; Apple treats them
+///   as the authoritative flow metrics for memory pressure.
+/// - [Denning 1968] "The Working Set Model" — page fault rate, not
+///   residency, defines working-set quality.
+#[derive(Debug, Clone, Default)]
 pub struct VmPageStats {
+    // ── State (instantaneous) ────────────────────────────────────────────
     pub free_pages: u64,
     pub active_pages: u64,
     pub inactive_pages: u64,
@@ -14,6 +32,102 @@ pub struct VmPageStats {
     pub wired_pages: u64,
     pub compressor_pages: u64,
     pub page_size: u64,
+    // ── Flow (cumulative since boot) ─────────────────────────────────────
+    /// Total page faults (minor + major) since boot.
+    pub faults: u64,
+    /// Copy-on-write page faults since boot (fork/mmap sharing breakage).
+    pub cow_faults: u64,
+    /// Pages paged IN from the compressor/swap since boot.
+    pub pageins: u64,
+    /// Pages paged OUT to the compressor/swap since boot.
+    pub pageouts: u64,
+    /// Pages compressed into the WKdm compressor since boot.
+    /// [THIS IS THE primary macOS memory-pressure flow signal.]
+    pub compressions: u64,
+    /// Pages decompressed back out of the compressor since boot.
+    pub decompressions: u64,
+    /// Pages swapped IN from physical disk since boot.
+    pub swapins: u64,
+    /// Pages swapped OUT to physical disk since boot.
+    pub swapouts: u64,
+    /// Pages moved from inactive→active list since boot
+    /// (working-set reactivation — stale page touched again).
+    pub reactivations: u64,
+    /// Pages freed from the purgeable/volatile list since boot.
+    pub purges: u64,
+}
+
+/// Per-second rates derived from two successive `VmPageStats` samples.
+///
+/// All fields are f64 "events per second" so callers can feed them directly
+/// into EMAs / thresholds / predictors without additional conversion.
+///
+/// The primary consumer is the memory-pressure decision path: rates
+/// distinguish a quiet high-residency system from an actively thrashing one,
+/// which pressure-percentage alone cannot do.
+#[derive(Debug, Clone, Default)]
+pub struct VmRate {
+    pub faults_per_sec: f64,
+    pub cow_faults_per_sec: f64,
+    pub pageins_per_sec: f64,
+    pub pageouts_per_sec: f64,
+    pub compressions_per_sec: f64,
+    pub decompressions_per_sec: f64,
+    pub swapins_per_sec: f64,
+    pub swapouts_per_sec: f64,
+    pub reactivations_per_sec: f64,
+    pub purges_per_sec: f64,
+}
+
+impl VmRate {
+    /// Compute per-second rates between two samples separated by `dt_secs`
+    /// seconds of wall-clock time.
+    ///
+    /// Uses `saturating_sub` so non-monotonic reads (should not happen from
+    /// the kernel but may occur in tests) clamp to zero instead of wrapping
+    /// into astronomical rates. A `dt_secs <= 0.0` returns a default
+    /// zero-filled struct.
+    pub fn compute(prev: &VmPageStats, curr: &VmPageStats, dt_secs: f64) -> Self {
+        if dt_secs <= 0.0 {
+            return Self::default();
+        }
+        let div = dt_secs;
+        Self {
+            faults_per_sec: curr.faults.saturating_sub(prev.faults) as f64 / div,
+            cow_faults_per_sec: curr.cow_faults.saturating_sub(prev.cow_faults) as f64 / div,
+            pageins_per_sec: curr.pageins.saturating_sub(prev.pageins) as f64 / div,
+            pageouts_per_sec: curr.pageouts.saturating_sub(prev.pageouts) as f64 / div,
+            compressions_per_sec: curr
+                .compressions
+                .saturating_sub(prev.compressions) as f64
+                / div,
+            decompressions_per_sec: curr
+                .decompressions
+                .saturating_sub(prev.decompressions) as f64
+                / div,
+            swapins_per_sec: curr.swapins.saturating_sub(prev.swapins) as f64 / div,
+            swapouts_per_sec: curr.swapouts.saturating_sub(prev.swapouts) as f64 / div,
+            reactivations_per_sec: curr
+                .reactivations
+                .saturating_sub(prev.reactivations) as f64
+                / div,
+            purges_per_sec: curr.purges.saturating_sub(prev.purges) as f64 / div,
+        }
+    }
+
+    /// Composite "thrashing score" ∈ [0, ∞) combining the high-signal flow
+    /// metrics. Heuristic weights: swap I/O counts triple because hitting
+    /// the SSD is strictly worse than compressor churn; compressions count
+    /// double because they indicate working-set overflow; decompressions
+    /// and reactivations count single because they're lagging indicators.
+    ///
+    /// 0 = quiet. 10_000+ = actively thrashing.
+    pub fn thrashing_score(&self) -> f64 {
+        3.0 * (self.swapins_per_sec + self.swapouts_per_sec)
+            + 2.0 * self.compressions_per_sec
+            + self.decompressions_per_sec
+            + self.reactivations_per_sec
+    }
 }
 
 impl VmPageStats {
@@ -120,6 +234,16 @@ pub fn read_vm_stats() -> Option<VmPageStats> {
         wired_pages: info.wire_count as u64,
         compressor_pages: info.compressor_page_count as u64,
         page_size,
+        faults: info.faults,
+        cow_faults: info.cow_faults,
+        pageins: info.pageins,
+        pageouts: info.pageouts,
+        compressions: info.compressions,
+        decompressions: info.decompressions,
+        swapins: info.swapins,
+        swapouts: info.swapouts,
+        reactivations: info.reactivations,
+        purges: info.purges,
     })
 }
 
@@ -176,13 +300,8 @@ mod tests {
     #[test]
     fn empty_stats_pressure_is_zero() {
         let stats = VmPageStats {
-            free_pages: 0,
-            active_pages: 0,
-            inactive_pages: 0,
-            speculative_pages: 0,
-            wired_pages: 0,
-            compressor_pages: 0,
             page_size: 16384,
+            ..Default::default()
         };
         assert_eq!(stats.pressure(), 0.0);
     }
@@ -190,14 +309,88 @@ mod tests {
     #[test]
     fn full_pressure_when_all_wired() {
         let stats = VmPageStats {
-            free_pages: 0,
-            active_pages: 0,
-            inactive_pages: 0,
-            speculative_pages: 0,
             wired_pages: 1000,
-            compressor_pages: 0,
             page_size: 16384,
+            ..Default::default()
         };
         assert!((stats.pressure() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn vm_rate_zero_when_samples_identical() {
+        let s = VmPageStats {
+            compressions: 1000,
+            decompressions: 500,
+            swapins: 0,
+            swapouts: 0,
+            ..Default::default()
+        };
+        let rate = VmRate::compute(&s, &s, 1.0);
+        assert_eq!(rate.compressions_per_sec, 0.0);
+        assert_eq!(rate.swapins_per_sec, 0.0);
+        assert_eq!(rate.thrashing_score(), 0.0);
+    }
+
+    #[test]
+    fn vm_rate_computes_forward_delta() {
+        let prev = VmPageStats::default();
+        let curr = VmPageStats {
+            compressions: 2_000,
+            decompressions: 500,
+            swapins: 100,
+            swapouts: 50,
+            reactivations: 400,
+            ..Default::default()
+        };
+        // 2-second window.
+        let rate = VmRate::compute(&prev, &curr, 2.0);
+        assert_eq!(rate.compressions_per_sec, 1000.0);
+        assert_eq!(rate.decompressions_per_sec, 250.0);
+        assert_eq!(rate.swapins_per_sec, 50.0);
+        assert_eq!(rate.swapouts_per_sec, 25.0);
+        assert_eq!(rate.reactivations_per_sec, 200.0);
+        // Thrashing score = 3*(50+25) + 2*1000 + 250 + 200 = 225 + 2000 + 450 = 2675.
+        assert!((rate.thrashing_score() - 2675.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn vm_rate_clamps_backwards_samples_to_zero() {
+        // Non-monotonic read (should never happen from kernel, but guard it).
+        let prev = VmPageStats {
+            compressions: 100,
+            ..Default::default()
+        };
+        let curr = VmPageStats {
+            compressions: 50, // went backwards
+            ..Default::default()
+        };
+        let rate = VmRate::compute(&prev, &curr, 1.0);
+        assert_eq!(rate.compressions_per_sec, 0.0);
+    }
+
+    #[test]
+    fn vm_rate_rejects_non_positive_dt() {
+        let s = VmPageStats {
+            compressions: 1000,
+            ..Default::default()
+        };
+        let rate = VmRate::compute(&s, &s, 0.0);
+        assert_eq!(rate.compressions_per_sec, 0.0);
+        let rate_neg = VmRate::compute(&s, &s, -1.0);
+        assert_eq!(rate_neg.compressions_per_sec, 0.0);
+    }
+
+    #[test]
+    fn thrashing_score_weights_swap_triple() {
+        // 1 swap/s should score equal to 1.5 compressions/s (3 vs 2 weights).
+        let swap_rate = VmRate {
+            swapouts_per_sec: 1.0,
+            ..Default::default()
+        };
+        let comp_rate = VmRate {
+            compressions_per_sec: 1.5,
+            ..Default::default()
+        };
+        assert_eq!(swap_rate.thrashing_score(), comp_rate.thrashing_score());
     }
 }
