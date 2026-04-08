@@ -15,6 +15,7 @@ pub mod cognitive_bus;
 pub mod cognitive_health;
 pub mod compressor_aware;
 pub mod contention_detector;
+pub mod cpu_saturation;
 pub mod cusum;
 pub mod daemon_helpers;
 pub mod daemon_state;
