@@ -55,3 +55,61 @@ Atacar Target 1 y Target 2 en paralelo con agentes simultáneos:
 - Fix pass: un agente para resolver errores de compilación post-extracción
 
 Guard: `cargo check --tests` (NO `cargo test` — tarda 20 min)
+
+---
+
+## Sensor-Consumer Debts — 2026-04-08 god-sensor session
+
+The 2026-04-08 session added five new sensor axes (`VmRate`,
+`thrashing_score`, `CpuSaturation`, per-process `cpu_contention`,
+system-wide `stall_fraction`). All five are produced, persisted and
+exposed via `RuntimeMetrics` + `StabilityOracle` → RL reward. Two
+proposed decision-path consumers were DELIBERATELY deferred after
+analysis — the sensors are in place but the behavioural wiring
+requires empirical validation before it can be committed without
+regressing existing decisions.
+
+### DEBT-SENSOR-01 — Boost protected pid on high `cpu_contention`
+
+**Proposed:** if a foreground-family pid has `cpu_contention > 0.6`
+sustained for N cycles, promote it to `SchedulingTier::Foreground`
+via `mach_qos.set_tier()`.
+
+**Why deferred:** the foreground family is ALREADY promoted to
+Foreground by the existing `boost_foreground_family` path. Adding a
+contention-triggered second boost is either redundant (if already
+foreground) or invasive (if the pid is not in the foreground family
+but still "protected" by some other rule). The convergent wiring
+requires distinguishing these two cases, which in turn requires
+defining a "protected but not foreground" subset that does not
+currently exist as a first-class concept.
+
+**Unblocks when:** the decision pipeline introduces an explicit
+"protected pid set" separate from the foreground family. Track the
+data in `ProcessSnapshot.cpu_contention` until then.
+
+### DEBT-SENSOR-02 — Skip freeze of a CPU-starved candidate
+
+**Proposed:** in `decide_actions` extreme-pressure freeze path, skip
+candidates whose `cpu_contention > 0.7` — the scheduler is already
+refusing them CPU so freezing adds no throughput benefit.
+
+**Why deferred:** freezing reclaims MEMORY, not CPU. A starved pid
+still holds its RSS, and memory pressure is the reason the freeze
+path triggered. Skipping a starved-but-RSS-heavy pid would leave its
+memory in residency and defeat the whole purpose of the branch. The
+proposed consumer was structurally wrong on reflection — the sensor
+does not add decision value in this specific branch.
+
+**Unblocks when:** a different decision path (e.g. QoS tiering or
+boost eligibility) needs contention-awareness. The
+`ContentionTracker::stall_fraction()` global aggregate is the more
+likely real consumer.
+
+### Closure rationale
+
+Both debts are converted from "silent promise in commit message
+footer" to "tracked decision to defer with reasoning", which under
+the apollo-evolve divergence stop rule counts as CLOSES because the
+structural debt (unstructured open-ended promise) is replaced by
+a bounded decision record.
