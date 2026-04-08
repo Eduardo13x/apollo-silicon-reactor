@@ -41,8 +41,8 @@ use apollo_optimizer::engine::daemon_helpers::{
     load_governor_state, load_wake_state, markov_path, merge_seed_into, metrics_path,
     overflow_history_path, parse_profile, pid_start_time, predictive_agent_path, rl_threshold_path,
     should_rotate_oldest, should_unfreeze, signal_intelligence_path, skills_path, socket_path,
-    spotlight_set_indexing, temporal_histograms_path, timeline_path, unfreeze_pids,
-    wake_state_path, write_frozen_state, write_governor_state, write_wake_state,
+    spotlight_set_indexing, telemetry_output_dir, temporal_histograms_path, timeline_path,
+    unfreeze_pids, wake_state_path, write_frozen_state, write_governor_state, write_wake_state,
 };
 use apollo_optimizer::engine::effective_pressure;
 use apollo_optimizer::engine::execute_actions::execute_actions;
@@ -815,6 +815,11 @@ fn main() -> anyhow::Result<()> {
                 mut cycle_ipc_tracker,
             } = daemon_init::DaemonSubsystems::new();
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
+            // TelemetryLogger: ring-buffer collection for time-series training data.
+            // [Welch 1967, Tuli et al. 2022] — event-triggered dumps capture pre-anomaly context.
+            let mut telemetry_logger = apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(
+                PathBuf::from(telemetry_output_dir()),
+            );
             let hw_path = PathBuf::from(holt_winters_path());
             let mut holt_winters = HoltWinters::load(&hw_path).unwrap_or_default();
             let mut hw_last_hour: Option<u8> = None;
@@ -3117,6 +3122,10 @@ fn main() -> anyhow::Result<()> {
                     };
                     d.transformer_anomaly =
                         darwin_anomaly.score(tv.as_f32_slice(), d.pressure_smooth as f32);
+                    // Record to TelemetryLogger ring buffer.  record() self-triggers
+                    // disk dumps (event-triggered at OOM/urgency/latency thresholds,
+                    // periodic every ~10 min). [Welch 1967, Tuli et al. 2022]
+                    telemetry_logger.record(tv);
                     // Audit DBAD score every ~60 cycles or when anomaly detected.
                     if d.transformer_anomaly > 0.3 || cycle_count % 60 == 0 {
                         audit_log(&serde_json::json!({

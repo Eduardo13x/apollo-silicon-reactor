@@ -189,6 +189,14 @@ pub fn temporal_histograms_path() -> &'static str {
     }
 }
 
+pub fn telemetry_output_dir() -> &'static str {
+    if is_root() {
+        "/var/lib/apollo/telemetry"
+    } else {
+        "/tmp/apollo-telemetry"
+    }
+}
+
 // ── Audit Log ───────────────────────────────────────────────────────────────
 
 /// Append a JSON line to the audit log (best-effort, never fails the caller).
