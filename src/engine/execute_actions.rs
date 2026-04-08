@@ -222,6 +222,43 @@ pub fn execute_actions(
 
     let mut out = ExecuteOutcomes::default();
 
+    // ── Fast-path unfreeze pre-pass ─────────────────────────────────────────
+    //
+    // The main loop below does ~5 syscalls (SIGCONT + taskpolicy I/O tier +
+    // mach_qos + memorystatus + journal fsync) per action, serially. With N
+    // frozen Chromium renderers that's ~N × 10–30 ms, dominated by the
+    // synchronous journal append. During that window the user perceives the
+    // LATER pids in the list as "still frozen" — the browser grey-tabs a
+    // renderer long after SIGCONT would have resumed it.
+    //
+    // Fix: deliver SIGCONT to every UnfreezeProcess action in a tight loop
+    // BEFORE entering the main loop. SIGCONT is idempotent (~5 µs per
+    // syscall) so re-sending it later in the main loop is harmless; we
+    // simply pay O(N × 5 µs) extra for O(N × 10 ms) less user-visible
+    // latency. The taskpolicy / mach_qos / memorystatus / journal
+    // bookkeeping still runs afterwards at its normal pace — but the
+    // kernel has already resumed the processes.
+    //
+    // Dead pids: `kill(pid, SIGCONT)` on a dead pid returns ESRCH and is a
+    // no-op, so we don't bother with a per-pid alive check here. The main
+    // loop's `kill(pid, 0)` alive check still gates the slower cleanup work.
+    //
+    // References:
+    // - [Dean & Barroso 2013] "The Tail at Scale" CACM §3 — keep
+    //   latency-critical work off the serialized path where slow
+    //   operations queue ahead of it.
+    // - [POSA2] "Half-Sync/Half-Async" — fast synchronous dispatch
+    //   decoupled from slower async bookkeeping.
+    // - [Gray & Reuter 1992] §10 — journaling must not gate user-visible
+    //   state transitions; log-after-apply is correct here because the
+    //   kernel already owns the authoritative frozen state.
+    for action in &actions {
+        if let RootAction::UnfreezeProcess { pid, .. } = action {
+            // SAFETY: single syscall, no shared state, no dereference.
+            unsafe { libc::kill(*pid as i32, libc::SIGCONT) };
+        }
+    }
+
     for action in actions {
         let mut success = false;
         let mut before = None;
@@ -609,6 +646,32 @@ mod tests {
     /// A PID unlikely to exist so SIGSTOP/setpriority don't land on a real process.
     /// Using PID 9_999_999 (exceeds typical macOS max PID of ~99_999).
     const GHOST_PID: u32 = 9_999_999;
+
+    #[test]
+    fn batched_unfreeze_removes_dead_pids_from_frozen_set() {
+        // Regression test for the fast-path unfreeze pre-pass: even with the
+        // pre-pass sending SIGCONT first, the main loop must still run and
+        // the frozen-set bookkeeping must still be correct for dead pids.
+        // Dead pids should be removed from the frozen set; counters must match.
+        let journal = std::env::temp_dir().join("apollo-test-batched-unfreeze.jsonl");
+        let mut frozen: HashSet<u32> = (GHOST_PID..GHOST_PID + 5).collect();
+        let actions: Vec<RootAction> = (GHOST_PID..GHOST_PID + 5)
+            .map(|pid| RootAction::UnfreezeProcess {
+                pid,
+                name: format!("ghost-{pid}"),
+            })
+            .collect();
+        let outcomes = execute_actions(
+            actions, &make_caps(), &journal, &mut frozen, &[], &[], None,
+        );
+        // All 5 ghost pids are dead → should be removed from frozen set.
+        // unfreezes_applied stays 0 because the live-branch (which increments
+        // the counter) never runs for dead pids — but the frozen set MUST be
+        // cleaned up so the daemon doesn't get stuck thinking they're still
+        // frozen forever.
+        assert!(frozen.is_empty(), "dead pids must be removed from frozen set, still holds: {frozen:?}");
+        assert_eq!(outcomes.failures, 0);
+    }
 
     // ── learned_interactive skips (BUG-07) ────────────────────────────────────
 
