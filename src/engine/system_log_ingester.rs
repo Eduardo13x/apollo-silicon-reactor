@@ -33,6 +33,17 @@ pub enum SystemEvent {
     },
 }
 
+/// Number of consecutive `log show` query failures before we classify the
+/// platform's log subsystem (logd) as unhealthy.
+///
+/// At the default 60-s poll interval, 3 failures ≈ 3 minutes of silence —
+/// long enough to rule out a single transient failure but short enough to
+/// catch logd crashes within one human-noticeable timeframe.
+///
+/// [Nygard 2018] "Release It!" Ch.5 — adjacent subsystems going silent are
+/// as informative as error responses; detect them as first-class signals.
+pub const PLATFORM_UNHEALTHY_FAIL_THRESHOLD: u32 = 3;
+
 /// Ingester that periodically queries macOS system logs.
 pub struct SystemLogIngester {
     /// When we last polled the logs.
@@ -46,8 +57,19 @@ pub struct SystemLogIngester {
     /// Total crash events observed (lifetime counter).
     pub total_crash_events: u64,
     /// Background thread channel receiver. When `Some`, `poll()` drains this
-    /// channel non-blockingly instead of spawning a subprocess inline.
-    receiver: Option<mpsc::Receiver<Vec<SystemEvent>>>,
+    /// channel non-blockingly. Each message is `Some(events)` on success or
+    /// `None` when the underlying `log show` invocation failed, so the main
+    /// thread can track query-failure streaks without re-running the query.
+    receiver: Option<mpsc::Receiver<Option<Vec<SystemEvent>>>>,
+    /// Consecutive `log show` query failures. Reset on any success.
+    consecutive_query_failures: u32,
+    /// Sticky "platform unhealthy" flag. Set when consecutive failures cross
+    /// `PLATFORM_UNHEALTHY_FAIL_THRESHOLD`; cleared on the first success after
+    /// the flag was raised (and a single-line stderr transition is logged on
+    /// both edges). Exists so the daemon can subtly back off optimisation
+    /// aggression when the host OS log pipeline is degraded — a common
+    /// precursor to full system freezes.
+    platform_unhealthy: bool,
 }
 
 impl SystemLogIngester {
@@ -60,6 +82,46 @@ impl SystemLogIngester {
             total_oom_events: 0,
             total_crash_events: 0,
             receiver: None,
+            consecutive_query_failures: 0,
+            platform_unhealthy: false,
+        }
+    }
+
+    /// Returns `true` when the platform's log subsystem has been failing long
+    /// enough that we should treat it as degraded. Currently driven by
+    /// consecutive failed `log show` invocations.
+    pub fn is_platform_unhealthy(&self) -> bool {
+        self.platform_unhealthy
+    }
+
+    /// Consecutive failed query count (for diagnostics/metrics).
+    pub fn consecutive_query_failures(&self) -> u32 {
+        self.consecutive_query_failures
+    }
+
+    /// Record a successful query (empty or not). Clears the failure streak
+    /// and emits a "recovered" log line if we were previously unhealthy.
+    fn record_query_success(&mut self) {
+        self.consecutive_query_failures = 0;
+        if self.platform_unhealthy {
+            eprintln!("[log_ingester] platform log subsystem recovered (`log show` succeeded)");
+            self.platform_unhealthy = false;
+        }
+    }
+
+    /// Record a failed query. Increments the streak and raises the unhealthy
+    /// flag (with a single-line edge-triggered log message) once the streak
+    /// crosses `PLATFORM_UNHEALTHY_FAIL_THRESHOLD`.
+    fn record_query_failure(&mut self) {
+        self.consecutive_query_failures = self.consecutive_query_failures.saturating_add(1);
+        if !self.platform_unhealthy
+            && self.consecutive_query_failures >= PLATFORM_UNHEALTHY_FAIL_THRESHOLD
+        {
+            eprintln!(
+                "[log_ingester] platform log subsystem degraded: {} consecutive `log show` failures (logd may be unhealthy)",
+                self.consecutive_query_failures
+            );
+            self.platform_unhealthy = true;
         }
     }
 
@@ -71,7 +133,7 @@ impl SystemLogIngester {
     /// The thread shuts down automatically when the ingester is dropped (sender
     /// disconnect causes the thread loop to exit).
     pub fn start_background(&mut self) {
-        let (tx, rx) = mpsc::channel::<Vec<SystemEvent>>();
+        let (tx, rx) = mpsc::channel::<Option<Vec<SystemEvent>>>();
         let poll_interval = self.poll_interval;
         let timeout = self.timeout;
         std::thread::Builder::new()
@@ -81,8 +143,8 @@ impl SystemLogIngester {
                 // burdened with a potentially slow `log show` call.
                 std::thread::sleep(poll_interval);
                 loop {
-                    let events = Self::run_query_static(timeout);
-                    if tx.send(events).is_err() {
+                    let result = Self::run_query_static(timeout);
+                    if tx.send(result).is_err() {
                         // Main thread dropped receiver — exit cleanly.
                         return;
                     }
@@ -94,7 +156,12 @@ impl SystemLogIngester {
     }
 
     /// Static version of `query_logs` + `parse_log_output` for use in background thread.
-    fn run_query_static(timeout: Duration) -> Vec<SystemEvent> {
+    ///
+    /// Returns `None` when the `log show` invocation itself failed (spawn error,
+    /// non-zero exit, timeout). Returns `Some(vec)` (possibly empty) on success,
+    /// so the main thread can distinguish "no events" from "query broken" —
+    /// the latter is a platform-health signal.
+    fn run_query_static(timeout: Duration) -> Option<Vec<SystemEvent>> {
         let result = Command::new("log")
             .args([
                 "show",
@@ -111,27 +178,26 @@ impl SystemLogIngester {
             .spawn();
         let mut child = match result {
             Ok(c) => c,
-            Err(_) => return Vec::new(),
+            Err(_) => return None,
         };
         match child.wait_timeout(timeout) {
             Ok(Some(status)) if status.success() => {}
             _ => {
                 let _ = child.kill();
-                return Vec::new();
+                return None;
             }
         }
-        let output = child
-            .stdout
-            .take()
-            .and_then(|out| {
-                use std::io::Read;
-                let mut buf = String::new();
-                let mut reader = out;
-                reader.read_to_string(&mut buf).ok()?;
-                Some(buf)
-            })
-            .unwrap_or_default();
-        Self::parse_log_output(&output)
+        let output = match child.stdout.take().and_then(|out| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let mut reader = out;
+            reader.read_to_string(&mut buf).ok()?;
+            Some(buf)
+        }) {
+            Some(s) => s,
+            None => return None,
+        };
+        Some(Self::parse_log_output(&output))
     }
 
     /// Check if it's time to poll. If so, query the logs and return any events found.
@@ -140,16 +206,32 @@ impl SystemLogIngester {
     /// In background mode (after `start_background()`), this is always non-blocking:
     /// it drains whatever the background thread has collected without spawning a subprocess.
     pub fn poll(&mut self) -> Vec<SystemEvent> {
-        // Background mode: drain channel non-blockingly.
-        if let Some(rx) = &self.receiver {
+        // Background mode: drain channel non-blockingly. Each message is
+        // `Some(batch)` on success or `None` on query failure; the latter
+        // feeds the platform-health detector.
+        if self.receiver.is_some() {
             let mut events = Vec::new();
-            while let Ok(batch) = rx.try_recv() {
-                for ev in batch {
-                    match &ev {
-                        SystemEvent::OomKill { .. } => self.total_oom_events += 1,
-                        SystemEvent::Crash { .. } => self.total_crash_events += 1,
+            // Collect all messages first to avoid holding a borrow across
+            // the health-tracking calls below (which take &mut self).
+            let mut batches = Vec::new();
+            if let Some(rx) = &self.receiver {
+                while let Ok(msg) = rx.try_recv() {
+                    batches.push(msg);
+                }
+            }
+            for msg in batches {
+                match msg {
+                    Some(batch) => {
+                        self.record_query_success();
+                        for ev in batch {
+                            match &ev {
+                                SystemEvent::OomKill { .. } => self.total_oom_events += 1,
+                                SystemEvent::Crash { .. } => self.total_crash_events += 1,
+                            }
+                            events.push(ev);
+                        }
                     }
-                    events.push(ev);
+                    None => self.record_query_failure(),
                 }
             }
             return events;
@@ -162,8 +244,12 @@ impl SystemLogIngester {
 
         let output = match self.query_logs() {
             Some(text) => text,
-            None => return Vec::new(),
+            None => {
+                self.record_query_failure();
+                return Vec::new();
+            }
         };
+        self.record_query_success();
 
         let events = Self::parse_log_output(&output);
 
@@ -351,6 +437,45 @@ impl ChildExt for std::process::Child {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_unhealthy_flag_rises_after_threshold_failures() {
+        let mut ing = SystemLogIngester::new();
+        assert!(!ing.is_platform_unhealthy());
+        assert_eq!(ing.consecutive_query_failures(), 0);
+        for _ in 0..PLATFORM_UNHEALTHY_FAIL_THRESHOLD {
+            ing.record_query_failure();
+        }
+        assert!(ing.is_platform_unhealthy());
+        assert_eq!(
+            ing.consecutive_query_failures(),
+            PLATFORM_UNHEALTHY_FAIL_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn platform_unhealthy_clears_after_success() {
+        let mut ing = SystemLogIngester::new();
+        for _ in 0..5 {
+            ing.record_query_failure();
+        }
+        assert!(ing.is_platform_unhealthy());
+        ing.record_query_success();
+        assert!(!ing.is_platform_unhealthy());
+        assert_eq!(ing.consecutive_query_failures(), 0);
+    }
+
+    #[test]
+    fn isolated_failures_below_threshold_do_not_trip_flag() {
+        let mut ing = SystemLogIngester::new();
+        // Fail twice (below threshold=3), then succeed — never unhealthy.
+        ing.record_query_failure();
+        ing.record_query_failure();
+        assert!(!ing.is_platform_unhealthy());
+        ing.record_query_success();
+        ing.record_query_failure();
+        assert!(!ing.is_platform_unhealthy());
+    }
 
     #[test]
     fn test_parse_jetsam_bracketed_name() {
