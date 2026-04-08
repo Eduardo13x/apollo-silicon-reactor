@@ -240,8 +240,25 @@ impl RusageInfo {
 ///   a continuously-sampled counter to avoid false positives at the quantum.
 pub fn cpu_contention_ratio(prev: &RusageInfo, curr: &RusageInfo) -> Option<f64> {
     /// Minimum combined runnable + on-cpu delta required before we trust
-    /// the ratio. Below this floor the process is effectively idle.
-    const IDLE_NOISE_FLOOR_NS: u64 = 1_000_000; // 1 ms
+    /// the ratio. Below this floor the process is effectively idle or was
+    /// just handling a short event-loop wakeup.
+    ///
+    /// 1 ms was too low in practice — production daemons running 2-second
+    /// cycles naturally accumulate 1–5 ms of runnable blips from polling
+    /// threads with ~zero actual on-cpu time, which the ratio reports as
+    /// ≈1.0 and then pollutes stall_fraction. 10 ms is still only 0.5 % of
+    /// a 2-s cycle so any workload actually under contention burns
+    /// substantially more than this floor.
+    const IDLE_NOISE_FLOOR_NS: u64 = 10_000_000; // 10 ms
+
+    /// Separate minimum on-cpu delta: a process with non-zero runnable
+    /// but effectively zero on-cpu is usually a quantization artifact
+    /// (the rusage on-cpu accumulator has coarser resolution than
+    /// runnable on Darwin). Require at least 100 μs of real execution
+    /// before trusting the ratio — a truly starved process would still
+    /// have accumulated this much over any meaningful observation window
+    /// because the scheduler does give it SOME time eventually.
+    const MIN_ON_CPU_NS: u64 = 100_000; // 100 μs
 
     let runnable_delta = curr
         .runnable_time_ns
@@ -249,6 +266,9 @@ pub fn cpu_contention_ratio(prev: &RusageInfo, curr: &RusageInfo) -> Option<f64>
     let on_cpu_delta = curr.on_cpu_ns().saturating_sub(prev.on_cpu_ns());
     let total = runnable_delta.saturating_add(on_cpu_delta);
     if total < IDLE_NOISE_FLOOR_NS {
+        return None;
+    }
+    if on_cpu_delta < MIN_ON_CPU_NS {
         return None;
     }
     Some(runnable_delta as f64 / total as f64)
@@ -415,25 +435,28 @@ mod tests {
 
     #[test]
     fn contention_ratio_zero_when_no_wait() {
-        // Process ran 1 ms, never waited.
+        // Process ran 20 ms on-CPU, never waited. Above both floors.
         let prev = mk_rusage(0, 0, 0);
-        let curr = mk_rusage(500_000, 500_000, 0); // 1 ms on-CPU
+        let curr = mk_rusage(10_000_000, 10_000_000, 0); // 20 ms on-CPU
         assert_eq!(cpu_contention_ratio(&prev, &curr), Some(0.0));
     }
 
     #[test]
-    fn contention_ratio_one_when_fully_starved() {
-        // Process wanted CPU for 1 ms, got none.
+    fn contention_ratio_high_when_heavily_starved() {
+        // Process got 200 μs on-cpu and 50 ms runnable → ratio ≈ 0.996.
+        // Passes both IDLE_NOISE_FLOOR (50.2 ms > 10 ms) AND
+        // MIN_ON_CPU (200 μs > 100 μs).
         let prev = mk_rusage(0, 0, 0);
-        let curr = mk_rusage(0, 0, 1_000_000);
-        assert_eq!(cpu_contention_ratio(&prev, &curr), Some(1.0));
+        let curr = mk_rusage(100_000, 100_000, 50_000_000);
+        let c = cpu_contention_ratio(&prev, &curr).unwrap();
+        assert!(c > 0.99, "expected ≈1.0, got {c}");
     }
 
     #[test]
     fn contention_ratio_half_when_balanced() {
-        // Process ran 500 μs on-CPU, waited 500 μs runnable.
+        // Process ran 20 ms on-CPU, waited 20 ms runnable.
         let prev = mk_rusage(0, 0, 0);
-        let curr = mk_rusage(250_000, 250_000, 500_000);
+        let curr = mk_rusage(10_000_000, 10_000_000, 20_000_000);
         let c = cpu_contention_ratio(&prev, &curr).unwrap();
         assert!((c - 0.5).abs() < 1e-9);
     }
@@ -448,42 +471,52 @@ mod tests {
 
     #[test]
     fn contention_ratio_rejects_idle_noise_blips() {
-        // Regression test for the production stall_fraction=0.996 anomaly.
+        // Regression test for the production stall_fraction saturation bug.
         //
-        // A mostly-idle process accumulated a few-microsecond runnable_time
-        // blip with zero on-cpu time between two samples. The naive ratio
-        // `runnable / (runnable + on_cpu)` returns ≈1.0 — "fully starved" —
-        // but the process was not trying to do any real work, it was just
-        // scheduler-accounting noise from a wake transition.
+        // Mostly-idle processes and event-loop wakers routinely accumulate
+        // sub-10-ms blips of runnable_time with ~zero on-cpu time. The naive
+        // ratio on those samples returns ≈1.0 — "fully starved" — but the
+        // process wasn't doing real work. Two floors catch this:
         //
-        // After the idle-noise-floor (1 ms), all sub-1-ms total-delta
-        // samples return None instead of polluting the stall aggregates.
+        //   - IDLE_NOISE_FLOOR (10 ms combined) rejects short event loops.
+        //   - MIN_ON_CPU (100 μs) rejects quantization artifacts where
+        //     runnable is non-zero but on-cpu rounds to zero.
 
-        // 500 ns runnable, 0 on-cpu → total 500 ns → below floor → None.
+        // 500 ns runnable blip on idle process → below IDLE_NOISE_FLOOR.
         let prev = mk_rusage(1000, 1000, 1000);
         let curr = mk_rusage(1000, 1000, 1500);
         assert_eq!(
             cpu_contention_ratio(&prev, &curr),
             None,
-            "500ns runnable blip on idle process must not count as contention"
+            "500ns runnable blip must not count as contention"
         );
 
-        // 100 μs runnable, 200 μs on-cpu → total 300 μs → below floor → None.
+        // 2 ms total activity → still below IDLE_NOISE_FLOOR (10 ms).
         let prev = mk_rusage(0, 0, 0);
-        let curr = mk_rusage(100_000, 100_000, 100_000);
+        let curr = mk_rusage(500_000, 500_000, 1_000_000);
         assert_eq!(
             cpu_contention_ratio(&prev, &curr),
             None,
-            "sub-millisecond total activity must not emit a ratio"
+            "sub-10-ms total activity must not emit a ratio"
         );
 
-        // 2 ms total → ABOVE floor → real signal reported.
+        // 15 ms runnable + 0 on-cpu → passes IDLE_NOISE_FLOOR but FAILS
+        // MIN_ON_CPU (quantization artifact on Darwin rusage accounting).
         let prev = mk_rusage(0, 0, 0);
-        let curr = mk_rusage(500_000, 500_000, 1_000_000);
+        let curr = mk_rusage(0, 0, 15_000_000);
+        assert_eq!(
+            cpu_contention_ratio(&prev, &curr),
+            None,
+            "runnable-only burst with zero on-cpu must be treated as quantization noise"
+        );
+
+        // 50 ms total with 25 ms on-cpu → ABOVE both floors → real signal.
+        let prev = mk_rusage(0, 0, 0);
+        let curr = mk_rusage(12_500_000, 12_500_000, 25_000_000);
         let c = cpu_contention_ratio(&prev, &curr).unwrap();
         assert!(
             (c - 0.5).abs() < 1e-9,
-            "2ms total with 1ms runnable must report ratio 0.5, got {c}"
+            "50ms total with 25ms runnable must report ratio 0.5, got {c}"
         );
     }
 

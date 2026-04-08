@@ -127,9 +127,23 @@ impl ContentionTracker {
     /// in their most recent sample. This is the system-wide "how many
     /// processes are being starved right now" aggregate.
     ///
-    /// Returns 0.0 if no pids are tracked.
+    /// Returns 0.0 under any of the following conditions:
+    ///  - No pids currently tracked.
+    ///  - Sample size below `MIN_STALL_SAMPLES` — with too few active
+    ///    ratios the aggregate is statistically meaningless and tends
+    ///    to saturate at 1.0 whenever the handful of active processes
+    ///    happen to be event-loop wakers. Observed in production right
+    ///    after the god-sensor rollout (`stall_fraction = 1.0` with
+    ///    `cpu_mean_busy = 0.14` — physically impossible at the scale
+    ///    of a real system).
+    ///
+    /// `MIN_STALL_SAMPLES` of 10 was chosen because apollo typically
+    /// sees a few hundred tracked pids; if fewer than 10 of them pass
+    /// the `cpu_contention_ratio` noise floor, the system isn't under
+    /// enough real load for the stall signal to be meaningful.
     pub fn stall_fraction(&self, threshold: f64) -> f64 {
-        if self.last_ratio.is_empty() {
+        const MIN_STALL_SAMPLES: usize = 10;
+        if self.last_ratio.len() < MIN_STALL_SAMPLES {
             return 0.0;
         }
         let stalled = self
@@ -181,10 +195,10 @@ mod tests {
     fn subsequent_observe_returns_ratio() {
         let mut t = ContentionTracker::new();
         t.observe(42, mk(0, 0, 0));
-        // Wanted CPU for 1 ms, got 500 μs → 50% contention.
-        let ratio = t.observe(42, mk(250_000, 250_000, 500_000));
+        // Wanted 50 ms of CPU, got 25 ms → 50% contention.
+        // Above both floors (total 50 ms > 10 ms, on_cpu 25 ms > 100 μs).
+        let ratio = t.observe(42, mk(12_500_000, 12_500_000, 25_000_000));
         assert!((ratio.unwrap() - 0.5).abs() < 1e-9);
-        // latest() is now populated.
         assert!((t.latest(42).unwrap() - 0.5).abs() < 1e-9);
     }
 
@@ -202,19 +216,39 @@ mod tests {
     }
 
     #[test]
-    fn stall_fraction_aggregates() {
+    fn stall_fraction_returns_zero_below_min_sample_size() {
+        // Regression test for the production stall_fraction saturation bug.
+        // With fewer than MIN_STALL_SAMPLES (10) active ratios, the
+        // aggregate is statistically meaningless and must return 0.0
+        // regardless of how many of them are individually stalled.
         let mut t = ContentionTracker::new();
-        // Prime 3 pids with zero ratios.
-        t.observe(1, mk(0, 0, 0));
-        t.observe(2, mk(0, 0, 0));
-        t.observe(3, mk(0, 0, 0));
-        // pid 1: fully starved (runnable delta only).
-        t.observe(1, mk(0, 0, 1_000_000));
-        // pid 2: fully satisfied (on-cpu only).
-        t.observe(2, mk(500_000, 500_000, 0));
-        // pid 3: stays idle → no new ratio, falls out of last_ratio.
-        // stall_fraction threshold 0.5 → only pid 1 ≥ 0.5 ⇒ 0.5 of tracked.
-        assert_eq!(t.stall_fraction(0.5), 0.5);
+        // Prime 5 pids and drive all of them to ratio ≈0.5 (balanced).
+        for pid in 1..=5u32 {
+            t.observe(pid, mk(0, 0, 0));
+            t.observe(pid, mk(12_500_000, 12_500_000, 25_000_000));
+        }
+        // Only 5 active ratios — below MIN_STALL_SAMPLES=10 → returns 0.
+        assert_eq!(t.stall_fraction(0.5), 0.0);
+    }
+
+    #[test]
+    fn stall_fraction_aggregates_with_enough_samples() {
+        let mut t = ContentionTracker::new();
+        // Prime 12 pids so we're above MIN_STALL_SAMPLES=10.
+        for pid in 1..=12u32 {
+            t.observe(pid, mk(0, 0, 0));
+        }
+        // pids 1-6: balanced (ratio 0.5).
+        for pid in 1..=6u32 {
+            t.observe(pid, mk(12_500_000, 12_500_000, 25_000_000));
+        }
+        // pids 7-12: fast-running (ratio ≈ 0 — 50 ms on-cpu, 1 ms runnable).
+        for pid in 7..=12u32 {
+            t.observe(pid, mk(25_000_000, 25_000_000, 1_000_000));
+        }
+        // 6 of 12 have ratio ≥ 0.5 → fraction = 0.5.
+        let f = t.stall_fraction(0.5);
+        assert!((f - 0.5).abs() < 1e-9, "expected 0.5, got {f}");
     }
 
     #[test]
