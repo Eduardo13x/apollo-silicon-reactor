@@ -580,7 +580,7 @@ another normal line";
 
     #[test]
     fn test_lifetime_counters() {
-        let mut ingester = SystemLogIngester::new();
+        let ingester = SystemLogIngester::new();
         assert_eq!(ingester.total_oom_events, 0);
         assert_eq!(ingester.total_crash_events, 0);
     }

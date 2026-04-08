@@ -711,7 +711,6 @@ impl SignalIntelligence {
         let filled = self.zone_feedback_idx.min(8);
         if filled >= 4 {
             let mut alternations = 0u32;
-            let start = if self.zone_feedback_idx > 8 { 0 } else { 0 };
             for i in 1..filled {
                 let prev =
                     self.zone_feedback_history[(self.zone_feedback_idx - filled + i - 1) % 8];
