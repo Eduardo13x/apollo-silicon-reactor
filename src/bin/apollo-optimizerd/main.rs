@@ -4621,47 +4621,46 @@ fn main() -> anyhow::Result<()> {
                     lctx.signal_intel.neuro_serotonin_shift = lctx.neuromod.serotonin_shift;
                 }
 
-                // ProcessRecoveryManager: freeze (or kill in survival mode) confirmed leakers.
+                // ProcessRecoveryManager: freeze confirmed leakers. NEVER kill.
+                //
+                // Previous revisions of this block escalated to SIGKILL under
+                // survival_mode + rss > 200 MB + attempts >= 2. That was
+                // catastrophically wrong: the leak detector (see memory_analyzer
+                // `detect_memory_leak`) fires on ANY process whose RSS grew in
+                // 7/10 recent snapshots, which is literally normal behaviour
+                // for every active user app (Chrome tab, Cursor buffer, Slack
+                // message, Figma canvas). The kill branch had no foreground /
+                // interactive / protected-pattern guard, so a Chrome tab
+                // holding 500 MB would trivially satisfy rss > 200 MB and
+                // attempts >= 2 and get SIGKILLed — the user observed exactly
+                // this ("me cierra las apps").
+                //
+                // The recovery path is now freeze-only: SIGSTOP is reversible,
+                // the user can SIGCONT anything apollo got wrong, and the
+                // existing unfreeze fast-path recovers transparently when
+                // pressure drops. The leak detector itself is also being
+                // tightened in memory_analyzer.rs in the same commit so
+                // normal interactive apps stop being flagged in the first
+                // place; this block is the safety net.
                 let recovery_targets = proc_recovery.get_recovery_targets();
                 for target in &recovery_targets {
                     if heuristic_critical_pids.contains(&target.pid) {
                         continue;
                     }
-                    // Jetsam Kill: under critical pressure, kill confirmed long-running leakers
-                    // instead of freezing. Requires: survival_mode + rss > 200MB + 2+ attempts.
-                    if survival_mode
-                        && target.rss_bytes > 200 * 1024 * 1024
-                        && target.recovery_attempts >= 2
-                        && target.pid > 1
-                    // never signal init/kernel/self
-                    {
-                        if unsafe { libc::kill(target.pid as i32, 0) } == 0 {
-                            unsafe {
-                                libc::kill(target.pid as i32, libc::SIGKILL);
-                            }
-                            proc_recovery.record_kill_attempt(target.pid);
-                            {
-                                let mut m = state.metrics.lock_recover();
-                                m.metrics.kills_applied += 1;
-                                m.metrics.survival_mode_activations += 1;
-                            }
-                        }
-                    } else {
-                        let (ss, su) = pid_start_time(target.pid);
-                        actions.push(RootAction::freeze_full(
-                            target.pid,
-                            target.name.clone(),
-                            format!(
-                                "memory-leak recovery: prob={:.2} rss={}MB attempts={}",
-                                target.leak_probability,
-                                target.rss_bytes / 1024 / 1024,
-                                target.recovery_attempts,
-                            ),
-                            ss,
-                            su,
-                        ));
-                        proc_recovery.record_kill_attempt(target.pid);
-                    }
+                    let (ss, su) = pid_start_time(target.pid);
+                    actions.push(RootAction::freeze_full(
+                        target.pid,
+                        target.name.clone(),
+                        format!(
+                            "memory-leak recovery: prob={:.2} rss={}MB attempts={}",
+                            target.leak_probability,
+                            target.rss_bytes / 1024 / 1024,
+                            target.recovery_attempts,
+                        ),
+                        ss,
+                        su,
+                    ));
+                    proc_recovery.record_kill_attempt(target.pid);
                 }
 
                 // ── Feature 5: Wakeup Budget Enforcer ───────────────────────

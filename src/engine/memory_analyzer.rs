@@ -140,27 +140,79 @@ impl MemoryAnalyzer {
         delta as f64 / dt
     }
 
+    /// Detect a true memory leak — NOT normal interactive-app growth.
+    ///
+    /// The previous version flagged any process whose RSS grew in 7+/10 of
+    /// the last samples, which is catastrophically wrong because that is
+    /// **literally normal behaviour** for every active user app (Chrome
+    /// tab loading content, Cursor opening a file, Slack receiving messages,
+    /// Figma loading an image). Under survival-mode the downstream recovery
+    /// path was SIGKILL — so normal apps were being closed. The user
+    /// observed exactly this ("me cierra las apps"); see the daemon
+    /// recovery block for the downstream safety net.
+    ///
+    /// A real leak has three properties the previous heuristic ignored:
+    ///
+    /// 1. **Long observation window.** A leak manifests over hours, not
+    ///    seconds. We require at least 30 samples (~60 s at a 2-s cycle).
+    ///    Interactive apps settle into a plateau within this window once
+    ///    the user's current task is loaded; leakers do not.
+    /// 2. **Near-monotonic growth.** Real leaks grow without dropping:
+    ///    allocate, never free. Interactive apps drop RSS when tabs close,
+    ///    buffers flush, or the collector runs. We require fewer than 10%
+    ///    of transitions to be drops.
+    /// 3. **Significant absolute delta.** A leak that only added 10 MB
+    ///    over an hour isn't worth killing. We require end-RSS ≥ 1.25×
+    ///    start-RSS AND ≥ 50 MB growth in absolute terms.
+    ///
+    /// All three must hold. The probability value returned is the growth
+    /// fraction from condition 1, capped into the [0.75, 1.0] band that
+    /// the downstream ProcessRecoveryManager::register_leak accepts.
     fn detect_memory_leak(&self, history: &VecDeque<MemorySnapshot>) -> f64 {
-        if history.len() < 5 {
+        const MIN_SAMPLES: usize = 30;
+        const MAX_DROP_FRACTION: f64 = 0.10;
+        const MIN_GROWTH_RATIO: f64 = 1.25;
+        const MIN_ABSOLUTE_GROWTH_BYTES: u64 = 50 * 1024 * 1024;
+
+        if history.len() < MIN_SAMPLES {
             return 0.0;
         }
 
-        let start = history.len().saturating_sub(10);
-        let recent_len = history.len() - start;
-        let mut growth_count = 0;
+        let start_rss = history[0].rss;
+        let end_rss = history[history.len() - 1].rss;
 
-        for i in 1..recent_len {
-            if history[start + i].rss > history[start + i - 1].rss {
+        // Condition 3: significant absolute delta.
+        if end_rss < start_rss {
+            return 0.0;
+        }
+        let growth_bytes = end_rss - start_rss;
+        if growth_bytes < MIN_ABSOLUTE_GROWTH_BYTES {
+            return 0.0;
+        }
+        let growth_ratio = end_rss as f64 / start_rss.max(1) as f64;
+        if growth_ratio < MIN_GROWTH_RATIO {
+            return 0.0;
+        }
+
+        // Condition 2: near-monotonic — count drops across the window.
+        let mut drop_count = 0usize;
+        let mut growth_count = 0usize;
+        for i in 1..history.len() {
+            if history[i].rss < history[i - 1].rss {
+                drop_count += 1;
+            } else if history[i].rss > history[i - 1].rss {
                 growth_count += 1;
             }
         }
-
-        let growth_rate = growth_count as f64 / (recent_len - 1).max(1) as f64;
-        if growth_rate > 0.7 {
-            growth_rate
-        } else {
-            0.0
+        let transitions = (history.len() - 1).max(1);
+        let drop_fraction = drop_count as f64 / transitions as f64;
+        if drop_fraction > MAX_DROP_FRACTION {
+            return 0.0;
         }
+
+        // Growth fraction, clamped into the ProcessRecoveryManager accept band.
+        let growth_fraction = growth_count as f64 / transitions as f64;
+        growth_fraction.clamp(0.75, 1.0)
     }
 
     pub fn find_inefficient_processes(&self, threshold: f64) -> Vec<(u32, f64)> {
@@ -446,6 +498,95 @@ mod tests {
         assert_eq!(profile.pid, 100);
         assert_eq!(profile.rss_bytes, 100_000_000);
         assert!(!profile.is_thrashing);
+    }
+
+    // ── Leak detector regression tests ───────────────────────────────────
+    //
+    // Tests covering the user-visible incident where normal interactive
+    // app growth was flagged as a leak and the downstream recovery path
+    // SIGKILLed Chrome tabs / Cursor / Slack. The detector must now
+    // require long-window + near-monotonic + significant absolute delta
+    // before returning any non-zero probability.
+
+    #[test]
+    fn detect_leak_short_history_returns_zero() {
+        // Even with aggressive growth, fewer than MIN_SAMPLES samples
+        // must never trigger a leak verdict.
+        let mut analyzer = MemoryAnalyzer::new();
+        let mut last = 0.0;
+        for i in 0..10u64 {
+            let profile =
+                analyzer.analyze_process(42, "short", 100_000_000 + i * 50_000_000, 0, 0);
+            last = profile.memory_leak_probability;
+        }
+        assert_eq!(last, 0.0, "short history must not flag as leak");
+    }
+
+    #[test]
+    fn detect_leak_interactive_growth_not_flagged() {
+        // Simulate a normal interactive app: grows some, drops some,
+        // grows some more. Mimics Chrome opening/closing tabs,
+        // Cursor loading/discarding buffers. The pattern has many
+        // drops (>10%), so must NOT be flagged as a leak.
+        let mut analyzer = MemoryAnalyzer::new();
+        let rss_sequence: Vec<u64> = (0..50u64)
+            .map(|i| {
+                // Oscillating growth: grows 50 MB, drops 20 MB,
+                // grows 50 MB, drops 20 MB, ...
+                let base = 200_000_000u64;
+                let phase = i % 4;
+                let offset = (i / 4) * 60_000_000;
+                match phase {
+                    0 => base + offset,
+                    1 => base + offset + 50_000_000,
+                    2 => base + offset + 50_000_000,
+                    _ => base + offset + 30_000_000, // drop
+                }
+            })
+            .collect();
+        let mut last = 0.0;
+        for &rss in &rss_sequence {
+            let profile = analyzer.analyze_process(42, "chrome", rss, 0, 0);
+            last = profile.memory_leak_probability;
+        }
+        assert_eq!(
+            last, 0.0,
+            "interactive app with drops must NOT be flagged as leak"
+        );
+    }
+
+    #[test]
+    fn detect_leak_true_monotonic_growth_flagged() {
+        // A genuine leak: strictly monotonic growth, significant delta,
+        // long window. MUST be flagged.
+        let mut analyzer = MemoryAnalyzer::new();
+        let mut last = 0.0;
+        for i in 0..50u64 {
+            let rss = 100_000_000 + i * 10_000_000; // +10 MB per sample, +500 MB total
+            let profile = analyzer.analyze_process(42, "leaker", rss, 0, 0);
+            last = profile.memory_leak_probability;
+        }
+        assert!(
+            last >= 0.75,
+            "monotonic growth over long window must flag as leak, got {last}"
+        );
+    }
+
+    #[test]
+    fn detect_leak_small_absolute_delta_not_flagged() {
+        // Monotonic but tiny total growth (< 50 MB absolute).
+        // A 10 MB growth over an hour isn't worth killing anything over.
+        let mut analyzer = MemoryAnalyzer::new();
+        let mut last = 0.0;
+        for i in 0..50u64 {
+            let rss = 200_000_000 + i * 200_000; // +200 KB per sample, +10 MB total
+            let profile = analyzer.analyze_process(42, "tiny_grow", rss, 0, 0);
+            last = profile.memory_leak_probability;
+        }
+        assert_eq!(
+            last, 0.0,
+            "sub-50-MB absolute growth must NOT be flagged as leak"
+        );
     }
 
     // ── DAMON estimator tests ────────────────────────────────────────────
