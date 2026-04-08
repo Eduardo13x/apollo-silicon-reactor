@@ -903,6 +903,13 @@ fn main() -> anyhow::Result<()> {
             let mut persist_generations: u32 = 0;
             let mut last_restore_quality: Option<f64> = None;
             let mut restore_monitor = RestoreQualityMonitor::new();
+            // FocusMarkov prediction miss tracking: (predicted_app, cycle_when_predicted).
+            // On the next cycle, if foreground != predicted, count as a miss.
+            // [Sutton & Barto 1998 §6 — temporal difference: credit assignment requires
+            // knowing when a prediction was wrong, not just when it was right.]
+            let mut last_markov_prethaw: Option<(String, u64)> = None;
+            let mut markov_hit_count: u32 = 0;
+            let mut markov_miss_count: u32 = 0;
             // Restored pending trial skill from the previous run (if daemon crashed mid-trial).
             let mut restored_trial_skill: Option<(String, f64)> = None;
             // Restored arousal state — applied after arousal_state is declared below.
@@ -1472,6 +1479,35 @@ fn main() -> anyhow::Result<()> {
                 let foreground_pid = fg_state.pid();
                 let foreground_idle = fg_state.is_idle();
 
+                // FocusMarkov miss check: did last high-confidence prediction materialize?
+                // [Sutton & Barto 1998 §6 — temporal difference credit assignment]
+                if let Some((ref predicted, pred_cycle)) = last_markov_prethaw {
+                    let cycles_elapsed = cycle_count.saturating_sub(pred_cycle);
+                    if cycles_elapsed >= 1 {
+                        let hit = foreground_app
+                            .as_deref()
+                            .map(|fa| fa.to_ascii_lowercase().contains(&predicted.to_ascii_lowercase()))
+                            .unwrap_or(false);
+                        if hit {
+                            markov_hit_count += 1;
+                        } else {
+                            markov_miss_count += 1;
+                        }
+                        last_markov_prethaw = None;
+                        // Log accuracy every 50 evaluations to audit trail.
+                        let total = markov_hit_count + markov_miss_count;
+                        if total > 0 && total % 50 == 0 {
+                            let accuracy = markov_hit_count as f64 / total as f64;
+                            audit_log(&serde_json::json!({
+                                "event": "markov_prediction_accuracy",
+                                "hits": markov_hit_count,
+                                "misses": markov_miss_count,
+                                "accuracy": (accuracy * 1000.0).round() / 1000.0,
+                            }));
+                        }
+                    }
+                }
+
                 // Markov chain: observe foreground transition, predict next app.
                 // Pre-warm the predicted app by unfreezing + boosting QoS before
                 // the user switches to it — eliminates perceived switch latency.
@@ -1514,6 +1550,8 @@ fn main() -> anyhow::Result<()> {
                             // the buffer cache so code pages don't fault from SSD.
                             // Cao et al. 1994 — app-controlled prefetch cuts I/O wait 50%.
                             cache_warmer.warm_pid(pid);
+                            // Record prediction for miss tracking on next cycle.
+                            last_markov_prethaw = Some((pred.app_name.clone(), cycle_count));
                         }
                     }
                 }
