@@ -40,9 +40,10 @@ use apollo_optimizer::engine::daemon_helpers::{
     hop_groups_path, journal_path, kill_switch_path, learned_state_path, load_frozen_state,
     load_governor_state, load_wake_state, markov_path, merge_seed_into, metrics_path,
     overflow_history_path, parse_profile, pid_start_time, predictive_agent_path, rl_threshold_path,
-    should_rotate_oldest, should_unfreeze, signal_intelligence_path, skills_path, socket_path,
-    spotlight_set_indexing, telemetry_output_dir, temporal_histograms_path, timeline_path,
-    unfreeze_pids, wake_state_path, write_frozen_state, write_governor_state, write_wake_state,
+    detect_prior_crash, remove_crash_sentinel, should_rotate_oldest, should_unfreeze,
+    signal_intelligence_path, skills_path, socket_path, spotlight_set_indexing,
+    telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_pids,
+    wake_state_path, write_frozen_state, write_governor_state, write_wake_state,
 };
 use apollo_optimizer::engine::effective_pressure;
 use apollo_optimizer::engine::execute_actions::execute_actions;
@@ -730,6 +731,22 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+
+            // Crash detection: if the sentinel file from the previous session still exists,
+            // the daemon did not shut down cleanly (SIGKILL, kernel panic, OOM).
+            // Enter cautious mode: raise freeze/throttle thresholds for the first 50 cycles
+            // to avoid repeating whatever triggered the instability.
+            // [Gray & Reuter 1992 §3 — write-ahead sentinel for crash recovery]
+            let prior_crash = detect_prior_crash();
+            if prior_crash {
+                audit_log(&serde_json::json!({
+                    "event": "startup_after_crash",
+                    "cautious_cycles": 50,
+                    "action": "freeze+throttle thresholds raised +0.10 for first 50 cycles",
+                }));
+                tracing::warn!("apollo: prior session ended abnormally — cautious mode active for 50 cycles");
+            }
+            let mut cautious_cycles_remaining: u32 = if prior_crash { 50 } else { 0 };
 
             // Spawn socket server and wait for bind confirmation before entering main loop.
             // If bind fails (e.g., another instance already running), exit(1) immediately.
@@ -2526,6 +2543,23 @@ fn main() -> anyhow::Result<()> {
                     battery_overheat_boost,
                 );
                 snapshot.pressure.memory_pressure = pressure_ram;
+
+                // Cautious mode: if previous session crashed, raise effective pressure
+                // by +0.10 for the first 50 cycles so freeze/throttle gates trigger
+                // at a higher threshold — reducing risk of repeating the instability.
+                // [Gray & Reuter 1992 §3 — conservative restart after abnormal termination]
+                if cautious_cycles_remaining > 0 {
+                    snapshot.pressure.memory_pressure =
+                        (snapshot.pressure.memory_pressure - 0.10).max(0.0);
+                    cautious_cycles_remaining -= 1;
+                    if cautious_cycles_remaining == 0 {
+                        audit_log(&serde_json::json!({
+                            "event": "cautious_mode_ended",
+                            "message": "returning to normal thresholds after post-crash caution period",
+                        }));
+                    }
+                }
+
                 let pressure_wait = snapshot
                     .top_processes
                     .iter()
@@ -6262,6 +6296,8 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Clean shutdown: remove crash sentinel so next startup knows this was graceful.
+            remove_crash_sentinel();
             let _ = fs::remove_file(socket_path());
         }
     }

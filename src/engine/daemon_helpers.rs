@@ -197,6 +197,44 @@ pub fn telemetry_output_dir() -> &'static str {
     }
 }
 
+fn crash_sentinel_path() -> &'static str {
+    if is_root() {
+        "/var/lib/apollo/session.running"
+    } else {
+        "/tmp/apollo-session.running"
+    }
+}
+
+/// Call at daemon startup to detect if the previous session ended abnormally.
+///
+/// Returns `true` if the previous session crashed (sentinel file left behind
+/// without a clean-shutdown write).  Side effect: creates a new sentinel for
+/// the current session so the next startup can detect *this* crash too.
+///
+/// [Gray & Reuter 1992 "Transaction Processing" §3 — crash recovery via
+/// write-ahead sentinel; presence = in-progress, absence = clean.]
+pub fn detect_prior_crash() -> bool {
+    let path = crash_sentinel_path();
+    let crashed = std::path::Path::new(path).exists();
+    // Overwrite (or create) sentinel with current PID + timestamp.
+    let _ = fs::write(
+        path,
+        format!(
+            "{{\"pid\":{},\"started\":\"{}\"}}",
+            std::process::id(),
+            chrono::Utc::now().to_rfc3339()
+        ),
+    );
+    crashed
+}
+
+/// Call at the END of a clean shutdown to remove the sentinel.
+/// If the daemon is killed (SIGKILL, OOM, kernel panic) this never runs —
+/// the sentinel persists, and the next `detect_prior_crash()` returns true.
+pub fn remove_crash_sentinel() {
+    let _ = fs::remove_file(crash_sentinel_path());
+}
+
 // ── Audit Log ───────────────────────────────────────────────────────────────
 
 /// Append a JSON line to the audit log (best-effort, never fails the caller).
@@ -502,5 +540,41 @@ mod tests {
         assert!(should_rotate_oldest(200, 5));
         assert!(!should_rotate_oldest(60, 1));
         assert!(!should_rotate_oldest(59, 2));
+    }
+
+    /// Serialize sentinel tests — they share a global file path.
+    fn sentinel_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn clean_shutdown_no_crash_detected() {
+        let _guard = sentinel_test_lock();
+        let path = crash_sentinel_path();
+        let _ = fs::remove_file(path); // ensure clean state
+        let crashed = detect_prior_crash();
+        assert!(!crashed, "fresh start should not appear as crash");
+        remove_crash_sentinel();
+        assert!(!std::path::Path::new(path).exists(), "sentinel should be removed after clean shutdown");
+    }
+
+    #[test]
+    fn crash_leaves_sentinel_detected_on_next_start() {
+        let _guard = sentinel_test_lock();
+        let path = crash_sentinel_path();
+        let _ = fs::remove_file(path); // clean state
+        let _ = detect_prior_crash(); // creates sentinel (first start)
+        // Simulate crash: don't call remove_crash_sentinel
+        let crashed = detect_prior_crash(); // second start finds sentinel
+        assert!(crashed, "sentinel present should mean crash detected");
+        remove_crash_sentinel();
+    }
+
+    #[test]
+    fn remove_crash_sentinel_idempotent() {
+        let _guard = sentinel_test_lock();
+        remove_crash_sentinel();
+        remove_crash_sentinel(); // must not panic
     }
 }
