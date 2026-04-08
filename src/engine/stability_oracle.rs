@@ -31,6 +31,13 @@ const ALPHA: f64 = 0.05;
 /// Swap spike threshold: 512 MB jump in a single cycle.
 const SWAP_SPIKE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Cold-boot window: within this many seconds after kernel boot, Spotlight
+/// reindexing, cfprefsd warm-up and launchd job startup cause transient
+/// jank/swap/load that is NOT indicative of apollo's behaviour. The
+/// instability penalty is linearly ramped from 0 → full across this window.
+/// [Jain 1991] §12.2 — exclude warm-up period from steady-state measurements.
+pub const COLD_BOOT_WINDOW_SECS: u64 = 300;
+
 /// StabilityOracle aggregates three perceptual stability signals.
 pub struct StabilityOracle {
     /// EMA of display-jank events (0=no jank, 1=jank).
@@ -103,6 +110,34 @@ impl StabilityOracle {
     /// enough to steer over time.
     pub fn instability_penalty(&self) -> f64 {
         1.0 - self.stability_score()
+    }
+
+    /// Instability penalty with a cold-boot dampener applied.
+    ///
+    /// During the first `COLD_BOOT_WINDOW_SECS` seconds of system uptime, the
+    /// penalty is linearly attenuated from 0 (at uptime 0) to full (at the
+    /// window edge). After the window, behaviour is identical to
+    /// `instability_penalty()`.
+    ///
+    /// Why: Spotlight reindexing, cfprefsd warm-up and launchd job startup
+    /// produce transient jank/zombie/swap-spike events that are NOT caused
+    /// by apollo's decisions. Feeding them into the RL reward signal would
+    /// punish apollo for the kernel's own warm-up costs, corrupting the
+    /// learned policy.
+    ///
+    /// Pass `system_uptime_secs` from `daemon_helpers::system_uptime_secs()`.
+    /// Pass `0` to disable the dampener (e.g. in unit tests).
+    pub fn instability_penalty_attenuated(&self, system_uptime_secs: u64) -> f64 {
+        let raw = self.instability_penalty();
+        if system_uptime_secs == 0 {
+            // 0 means "no boot-time info available" — conservative: don't attenuate.
+            return raw;
+        }
+        if system_uptime_secs >= COLD_BOOT_WINDOW_SECS {
+            return raw;
+        }
+        let factor = system_uptime_secs as f64 / COLD_BOOT_WINDOW_SECS as f64;
+        raw * factor
     }
 
     /// Current jank EMA (for diagnostics/metrics).
@@ -197,6 +232,32 @@ mod tests {
         }
         assert!(oracle.jank_ema() > 0.8);
         assert!(oracle.stability_score() < 0.4);
+    }
+
+    #[test]
+    fn cold_boot_attenuates_penalty_linearly() {
+        let mut oracle = StabilityOracle::new();
+        // Drive instability high.
+        for _ in 0..40 {
+            oracle.record_display_jank(true);
+            oracle.record_zombie_count(5);
+            oracle.record_swap_bytes(0); // no spikes
+        }
+        let raw = oracle.instability_penalty();
+        assert!(raw > 0.3, "expected meaningful instability, got {raw}");
+        // At uptime 0 → treated as "no info", full penalty (conservative).
+        assert_eq!(oracle.instability_penalty_attenuated(0), raw);
+        // At uptime 1 (just booted) → ~raw * (1/300) — heavily dampened.
+        let fresh = oracle.instability_penalty_attenuated(1);
+        assert!(fresh < raw / 100.0, "expected heavy dampening, got {fresh}");
+        // At half the window → ~50% of raw.
+        let mid = oracle.instability_penalty_attenuated(COLD_BOOT_WINDOW_SECS / 2);
+        assert!((mid - raw * 0.5).abs() < 0.01);
+        // Past the window → full penalty.
+        let post = oracle.instability_penalty_attenuated(COLD_BOOT_WINDOW_SECS);
+        assert_eq!(post, raw);
+        let post2 = oracle.instability_penalty_attenuated(COLD_BOOT_WINDOW_SECS + 1000);
+        assert_eq!(post2, raw);
     }
 
     #[test]

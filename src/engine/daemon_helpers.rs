@@ -197,6 +197,48 @@ pub fn telemetry_output_dir() -> &'static str {
     }
 }
 
+/// Seconds since the macOS kernel booted.
+///
+/// Reads `kern.boottime` via `sysctlbyname` and subtracts from wall clock.
+/// Used by apollo's cold-boot dampener: during the first few minutes after
+/// boot, load averages and memory pressure are transiently elevated by
+/// Spotlight, cfprefsd, triald, etc., and apollo's stability signals would
+/// otherwise compound this noise into false instability penalties.
+///
+/// Returns `0` if the sysctl fails (conservative — callers then treat the
+/// system as "not in cold-boot", i.e. no attenuation).
+///
+/// References:
+/// - [Jain 1991] "The Art of Computer Systems Performance Analysis" §12.2
+///   — warm-up period must be excluded from steady-state measurements.
+/// - [Denning 1968] "The Working Set Model for Program Behavior" — no
+///   stable working set exists during startup; the same applies to system boot.
+pub fn system_uptime_secs() -> u64 {
+    use std::mem;
+    let mut tv: libc::timeval = unsafe { mem::zeroed() };
+    let mut size = mem::size_of::<libc::timeval>();
+    let name = b"kern.boottime\0";
+    // SAFETY: name is NUL-terminated; tv is a valid timeval; size matches.
+    let ret = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr() as *const libc::c_char,
+            &mut tv as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 || tv.tv_sec == 0 {
+        return 0;
+    }
+    let boot = tv.tv_sec as u64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(boot)
+}
+
 /// Path where novel effective process patterns are logged for scenario generation.
 /// Append-only JSONL; read by autoresearch loop to generate targeted tests.
 pub fn novel_patterns_path() -> &'static str {

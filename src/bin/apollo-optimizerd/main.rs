@@ -4573,7 +4573,10 @@ fn main() -> anyhow::Result<()> {
                         // [Sutton & Barto 2018] §17.4 — reward shaping must preserve scale
                         // hierarchy or it inverts the optimal policy.
                         outcome_penalty: lctx.outcome_tracker.rl_penalty()
-                            - 0.5 * stability_oracle.instability_penalty(),
+                            - 0.5
+                                * stability_oracle.instability_penalty_attenuated(
+                                    apollo_optimizer::engine::daemon_helpers::system_uptime_secs(),
+                                ),
                         overflow_occurred,
                         urgency: signal_digest.urgency,
                         regime_shift_up: signal_digest.regime_shift_up,
