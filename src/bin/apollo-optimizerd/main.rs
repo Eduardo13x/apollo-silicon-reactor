@@ -4551,21 +4551,37 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // ── Feature 5: Wakeup Budget Enforcer ───────────────────────
-                // Upgrade from ThrottleProcess to App Nap for wakeup offenders.
-                // App Nap suppresses CPU + timers + I/O without SIGSTOP artifacts.
-                // Processes that calm down (storm cleared) are released automatically.
+                // Graduated severity response: Critical/High → App Nap,
+                // Medium → Background tier (E-cores), Low → skip.
+                // [Nygard 2018 "Release It!" Ch.5 — graduated response avoids
+                // over-reaction to transient wakeup bursts.]
                 let storms = wake_storm.detect_storms();
                 {
+                    use apollo_optimizer::engine::mach_qos::SchedulingTier;
+                    use apollo_optimizer::engine::wake_storm_detector::StormSeverity;
                     let storm_pids: std::collections::HashSet<u32> =
                         storms.iter().map(|s| s.pid).collect();
                     let mut qos = state.mach_qos.lock_recover();
 
-                    // App-Nap new offenders.
+                    // Apply severity-graduated mitigation.
                     for storm in &storms {
-                        if !heuristic_critical_pids.contains(&storm.pid)
-                            && Some(storm.pid) != foreground_pid
+                        if heuristic_critical_pids.contains(&storm.pid)
+                            || Some(storm.pid) == foreground_pid
                         {
-                            qos.set_app_nap(storm.pid, true);
+                            continue;
+                        }
+                        let severity = wake_storm.get_severity(storm.wakeups_per_second);
+                        match severity {
+                            StormSeverity::Critical | StormSeverity::High => {
+                                qos.set_app_nap(storm.pid, true);
+                            }
+                            StormSeverity::Medium => {
+                                // E-core routing without full App Nap suppression.
+                                qos.set_tier(storm.pid, SchedulingTier::Background);
+                            }
+                            StormSeverity::Low => {
+                                // Below threshold: monitor only, no intervention.
+                            }
                         }
                     }
 
