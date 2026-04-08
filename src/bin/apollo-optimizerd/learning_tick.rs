@@ -310,19 +310,19 @@ pub fn run_learning_tick<'a>(
             }
         }
         // Phase 4 — Novel pattern logger: when OutcomeTracker sees a high-value
-        // pattern for the first time (throttle_count == 3 exactly, just crossed
-        // the `is_high_value()` threshold), append it to `novel_patterns.jsonl`.
+        // pattern crossing the `is_high_value()` threshold for the first time,
+        // append it to `novel_patterns.jsonl`.
         //
-        // This staging file lets the autoresearch loop generate targeted scenarios
-        // for newly-discovered effective process/workload combinations without
-        // modifying test files directly.
+        // Robust against off-by-one races: condition is `throttle_count ∈ [3, 4]`
+        // (catches both 2→3 and 2→4 jumps when multiple outcomes resolve in the
+        // same tick). File is rotated every 100 cycles when it exceeds 64 KiB
+        // (≈1000 entries) to bound disk usage.
         //
-        // [Simon 1955] satisficing: we don't need optimal detection of novelty,
-        // just a reliable signal that a pattern has just become "confirmed".
-        // throttle_count == 3 is the exact threshold used by `is_high_value()`.
+        // [Simon 1955] satisficing — reliable "just confirmed" signal.
+        // [Kleppmann 2017] DDIA Ch.3 — log compaction via size-triggered rotation.
         for name in &batch.effective_names {
             if let Some(w) = lctx.outcome_tracker.weights.get(name) {
-                if w.throttle_count == 3 && w.is_high_value() {
+                if (w.throttle_count == 3 || w.throttle_count == 4) && w.is_high_value() {
                     let pressure = snapshot.pressure.memory_pressure;
                     let workload = format!("{:?}", workload_mode).to_lowercase();
                     let entry = format!(
@@ -334,7 +334,20 @@ pub fn run_learning_tick<'a>(
                         .create(true)
                         .append(true)
                         .open(novel_path)
-                        .and_then(|mut f| { use std::io::Write; f.write_all(entry.as_bytes()) });
+                        .and_then(|mut f| {
+                            use std::io::Write;
+                            f.write_all(entry.as_bytes())
+                        });
+                }
+            }
+        }
+        // Opportunistic rotation: every 100 cycles, check size and rotate if > 64 KiB.
+        if cycle_count % 100 == 0 {
+            let novel_path = apollo_optimizer::engine::daemon_helpers::novel_patterns_path();
+            if let Ok(meta) = std::fs::metadata(novel_path) {
+                if meta.len() > 64 * 1024 {
+                    let old_path = format!("{}.old", novel_path);
+                    let _ = std::fs::rename(novel_path, &old_path);
                 }
             }
         }
