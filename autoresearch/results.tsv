@@ -27,6 +27,12 @@ a906d38	9908.97	140/140	2922	keep	Neuro Black Box — LearnableParams + auto-tun
 a5523e8	9908.78	140/140	2922	keep	Evolve 10-iter — all 22 LearnableParams wired: CUSUM k/h, Kalman Q/R, PID, nars_drift, ws_spike, fluidity; 3 runtime fixes (persist, SNR, hot-path log); background log ingester
 b7854c1	10458.78	151/155	2922	baseline	Boss L8 (s61-s75): orphan detection, GUI idle, IO rate, faults+idle, translated GUI — 4 fail
 b61a8c6	10658.78	155/155	2922	keep	Exp36: Orphan→Freeze (not Kill) + GUI abandoned >24h + faults>500K skip graduated-idle (fixes s67,s69,s71,s75)
+6d5da1d	10658.78	155/155	2922	keep	RestoreQualityMonitor Iter 1: root-cause fix — false stale detection (threshold 0.35→0.55, hard floor 0.20, min 10 cycles)
+8775da8	10658.78	155/155	2922	keep	RestoreQualityMonitor Iter 2: bump warmup to 60 cycles (was 10 — too short for loaded system)
+8942e50	10658.78	155/155	2922	keep	RestoreQualityMonitor Iter 3: correct resolved count in monitor (was double-counting, causing premature quality reset)
 0f56d26	10664.78	155/155	2928	keep	Evolve Iter 1: ChromiumManager — remove pressure-triggered thaw-all; frozen renderers persist through low pressure (only mass-thaw on arousal<0.20)
 f214188	10668.78	155/155	2932	keep	Evolve Iter 2: ChromiumManager — long-idle freeze path (30 cycles ~60s) bypasses pressure gate [Denning 1968]
 1923d14	10672.78	155/155	2936	keep	Evolve Iter 3: ChromiumManager — BuildSession preemption (idle_cycles_required=1) bulkheads rustc from renderer memory [Nygard 2018]
+81599eb	10672.78	155/155	1466	keep	Cable 1: TelemetryLogger wired into daemon loop — ring buffer now collects training data [Welch 1967, Tuli 2022]
+f034a83	10672.78	155/155	1466	keep	Cable 2: WakeStorm graduated severity — Medium→Background tier, High/Critical→App Nap [Nygard 2018]
+51a13c9	10672.78	155/155	1466	keep	Cable 3: FocusMarkov prediction miss/hit tracking → accuracy audit every 50 evaluations [Sutton & Barto 1998]
