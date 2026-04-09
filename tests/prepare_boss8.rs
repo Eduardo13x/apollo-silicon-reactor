@@ -50,6 +50,7 @@ mod scenarios {
             is_translated: false,
             mach_port_count: 0,
             cpu_contention: None,
+            is_app_bundle: false,
         }
     }
 

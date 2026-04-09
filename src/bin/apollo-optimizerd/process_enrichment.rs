@@ -286,6 +286,13 @@ pub fn build_enriched_process_data_with_tree(
                 None => (0.0, false, 0, 0),
             };
 
+        // Behavioural app-bundle detection: one extra proc_pidpath syscall
+        // (~3 µs on M1) per pid, only here in enrichment. The result is
+        // cached on ProcessSnapshot so downstream consumers don't repeat
+        // the syscall.
+        let is_app_bundle = apollo_optimizer::engine::proc_taskinfo::is_user_app_bundle(pid_u32)
+            .unwrap_or(false);
+
         proc_snaps.push(ProcessSnapshot {
             pid: pid_u32,
             name: name.clone(),
@@ -304,6 +311,7 @@ pub fn build_enriched_process_data_with_tree(
             is_translated: apollo_optimizer::engine::process_identity::is_translated(pid_u32),
             mach_port_count: 0, // populated lazily for hoarder candidates only
             cpu_contention: contention_map.get(&pid_u32).copied(),
+            is_app_bundle,
         });
 
         hunt_snaps.push(HuntSnapshot {

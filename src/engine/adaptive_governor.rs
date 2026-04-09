@@ -813,6 +813,7 @@ mod tests {
             is_translated: false,
             mach_port_count: 10,
             cpu_contention: None,
+            is_app_bundle: false,
         }
     }
 

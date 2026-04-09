@@ -65,6 +65,20 @@ pub struct ProcessSnapshot {
     /// See `contention_tracker::ContentionTracker` and
     /// `proc_taskinfo::cpu_contention_ratio`.
     pub cpu_contention: Option<f64>,
+    /// `true` when the process binary lives inside a macOS `.app` bundle
+    /// (i.e. its path matches `.app/Contents/MacOS/` or
+    /// `.app/Contents/Frameworks/`). This is the cheap behavioural test
+    /// for "is this a user-facing application" — daemons, CLI tools and
+    /// system services NEVER live in `.app` bundles by Apple's Bundle
+    /// Programming Guide.
+    ///
+    /// Populated by `process_enrichment` via
+    /// `proc_taskinfo::is_user_app_bundle`. Defaults to `false` so test
+    /// snapshots without explicit population act as non-bundle daemons.
+    ///
+    /// See `proc_taskinfo::is_app_bundle_path` for the exact pattern
+    /// and rationale.
+    pub is_app_bundle: bool,
 }
 
 // ── Name lists ────────────────────────────────────────────────────────────────
@@ -354,6 +368,7 @@ mod tests {
             is_translated: false,
             mach_port_count: 0,
             cpu_contention: None,
+            is_app_bundle: false,
         }
     }
 

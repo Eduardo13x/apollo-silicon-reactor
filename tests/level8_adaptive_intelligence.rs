@@ -34,6 +34,7 @@ fn make_snap(name: &str, cpu: f32, secs_idle: u64, has_gui: bool) -> ProcessSnap
         is_translated: false,
         mach_port_count: 0,
         cpu_contention: None,
+        is_app_bundle: false,
     }
 }
 
