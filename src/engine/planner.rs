@@ -459,9 +459,23 @@ impl Planner {
     /// would block log rotation. One row is ~500 bytes; at 30-s cadence
     /// the file grows ~1.5 KB/min ≈ 2 MB/day. A weekly rotation handler
     /// would be a follow-up if it ever becomes a concern.
+    /// Maximum calibration file size before rotation (10 MB ≈ 5 days at
+    /// 2 MB/day). Matches journal.jsonl rotation policy.
+    const MAX_CALIBRATION_BYTES: u64 = 10 * 1024 * 1024;
+
     fn append_calibration(path: &Path, row: &CalibrationRow) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        // Rotate when file exceeds MAX_CALIBRATION_BYTES — same policy as
+        // journal.jsonl. Keep one .old backup so the most recent ~5 days
+        // of history are always available for calibration analysis.
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > Self::MAX_CALIBRATION_BYTES {
+                let old = path.with_extension("jsonl.old");
+                let _ = std::fs::remove_file(&old);
+                let _ = std::fs::rename(path, &old);
+            }
         }
         let line = serde_json::to_string(row).map_err(std::io::Error::other)?;
         use std::io::Write;

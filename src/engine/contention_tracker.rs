@@ -90,12 +90,27 @@ impl ContentionTracker {
             }
         }
 
-        let ratio = self
-            .prev
-            .get(&pid)
-            .and_then(|prev_sample| cpu_contention_ratio(prev_sample, &curr));
+        let ratio = self.prev.get(&pid).and_then(|prev_sample| {
+            // PID recycling guard: if the kernel start-time changed between
+            // samples, this is a DIFFERENT process reusing the same PID.
+            // The rusage deltas would be garbage (new process counters minus
+            // old process counters). Flush the stale entry and treat this
+            // as a first observation.
+            if prev_sample.proc_start_abstime != 0
+                && curr.proc_start_abstime != 0
+                && prev_sample.proc_start_abstime != curr.proc_start_abstime
+            {
+                return None; // recycled — drop prev, treat as fresh
+            }
+            cpu_contention_ratio(prev_sample, &curr)
+        });
         if let Some(r) = ratio {
             self.last_ratio.insert(pid, r);
+        } else {
+            // No valid ratio (first observation, idle, or recycled PID):
+            // clear any stale last_ratio so stall_fraction doesn't count
+            // a ghost entry from a dead process.
+            self.last_ratio.remove(&pid);
         }
         self.prev.insert(pid, curr);
         ratio
@@ -277,6 +292,32 @@ mod tests {
         );
         // Sanity: at 0.5 (the OLD threshold) all 15 do cross — that was the bug.
         assert_eq!(t.stall_fraction(0.5), 1.0);
+    }
+
+    #[test]
+    fn pid_recycling_flushes_stale_entry() {
+        let mut t = ContentionTracker::new();
+        let mut r1 = mk(0, 0, 0);
+        r1.proc_start_abstime = 1000;
+        t.observe(42, r1);
+        // Second observation from the SAME process (same abstime).
+        let mut r2 = mk(12_500_000, 12_500_000, 25_000_000);
+        r2.proc_start_abstime = 1000;
+        let ratio = t.observe(42, r2);
+        assert!(ratio.is_some(), "same process should produce a ratio");
+        // Third observation: PID recycled (different abstime).
+        let mut r3 = mk(5_000_000, 5_000_000, 10_000_000);
+        r3.proc_start_abstime = 9999; // different process
+        let ratio = t.observe(42, r3);
+        assert!(
+            ratio.is_none(),
+            "recycled PID must return None (first obs of new process)"
+        );
+        // Stale ratio must also be cleared.
+        assert!(
+            t.latest(42).is_none(),
+            "stale ratio from old process must be flushed on recycle"
+        );
     }
 
     #[test]

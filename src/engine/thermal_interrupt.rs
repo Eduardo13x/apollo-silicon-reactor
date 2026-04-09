@@ -773,6 +773,14 @@ fn freeze_non_critical(
         if bufs.is_essential(name) || bufs.is_protected(name) {
             continue;
         }
+        // Behavioural app-bundle detection: any binary inside a .app bundle
+        // is a user-facing application (or its helper). Skip it from thermal
+        // freeze — the user's apps must not be paused by a temperature spike.
+        // This closes the gap where apps like Raycast, Bartender, 1Password
+        // were not in the hardcoded protected list but ARE user-facing.
+        if crate::engine::proc_taskinfo::is_user_app_bundle(pid_u32).unwrap_or(false) {
+            continue;
+        }
         // Never freeze processes with active power assertions or busy children:
         // música reproduciéndose, terminal con build corriendo, descarga activa, etc.
         if busy_pids.contains(&pid_u32) {
