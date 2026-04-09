@@ -121,6 +121,36 @@ boost eligibility) needs contention-awareness. The
 `ContentionTracker::stall_fraction()` global aggregate is the more
 likely real consumer.
 
+### First calibration analysis — 2026-04-09 (11h, 331 rows)
+
+Data from `/var/lib/apollo/calibration.jsonl` after 11 hours of
+production on MacBook Air M1 8 GB (browser + IDE + compiler workloads):
+
+```
+gate_c_would_fire:      80/331 (24.2%)  → well-calibrated
+stall_above_threshold:   0/331 (0.0%)   → never fires on this hardware
+pressure:    min=0.71  max=0.99  mean=0.86
+thrashing:   min=2     max=97400 mean=4863
+stall:       min=0.00  max=0.57  mean=0.27
+kills_applied: always 0
+```
+
+**Conclusions:**
+
+- **gate_c threshold (5000):** Fires 24% of the time under real load.
+  Not too sensitive (90%+), not too numb (<5%). No change needed.
+- **stall threshold (0.85):** Never fires. The M1 8 GB bottlenecks on
+  MEMORY, not CPU. Max observed stall_fraction was 0.57 — the system
+  simply never reaches the point where 50%+ of tracked pids have
+  85%+ queue-wait ratio. This is correct for memory-bound hardware.
+  The Phase 4 wiring (`system_cpu_stalled → aggressive throttle`) is
+  a valid gate for CPU-bound machines (parallel build servers,
+  16-core workstations) but effectively dormant on a laptop.
+- **kills_applied:** Zero across all 331 rows (11 hours). The SIGKILL
+  removal from commit 3e12890 is empirically validated.
+- **No threshold change recommended** based on this data. Collect
+  another 1-2 weeks before considering any adjustments.
+
 ### Closure rationale
 
 Both debts are converted from "silent promise in commit message
