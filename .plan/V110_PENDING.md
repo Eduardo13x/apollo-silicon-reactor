@@ -69,24 +69,39 @@ analysis — the sensors are in place but the behavioural wiring
 requires empirical validation before it can be committed without
 regressing existing decisions.
 
-### DEBT-SENSOR-01 — Boost protected pid on high `cpu_contention`
+### DEBT-SENSOR-01 — Boost protected pid on high `cpu_contention`  ✅ CLOSED 2026-04-09
 
-**Proposed:** if a foreground-family pid has `cpu_contention > 0.6`
-sustained for N cycles, promote it to `SchedulingTier::Foreground`
-via `mach_qos.set_tier()`.
+**Originally proposed:** if a foreground-family pid has
+`cpu_contention > 0.6` sustained for N cycles, promote it to
+`SchedulingTier::Foreground` via `mach_qos.set_tier()`.
 
-**Why deferred:** the foreground family is ALREADY promoted to
-Foreground by the existing `boost_foreground_family` path. Adding a
-contention-triggered second boost is either redundant (if already
-foreground) or invasive (if the pid is not in the foreground family
-but still "protected" by some other rule). The convergent wiring
-requires distinguishing these two cases, which in turn requires
-defining a "protected but not foreground" subset that does not
-currently exist as a first-class concept.
+**Why originally deferred:** the foreground family is ALREADY
+promoted to Foreground by the existing `boost_foreground_family`
+path. A second contention-triggered boost is a no-op for the
+foreground set, and there was no "protected but not foreground"
+concept to give it meaning.
 
-**Unblocks when:** the decision pipeline introduces an explicit
-"protected pid set" separate from the foreground family. Track the
-data in `ProcessSnapshot.cpu_contention` until then.
+**How actually closed (Phase 4 of the 2026-04-08 plan):** the
+deferral note mis-framed where the value of `stall_fraction`
+lives. The right consumer is NOT a boost on the protected pid
+(no-op) but an aggressive-throttle override on the
+NON-interactive pids. When the system is CPU-stalled at the
+system level, the only lever to free CPU for the protected set
+is to push the non-interactive tail to E-cores harder. Wired in
+`decide_actions::decide_actions`:
+
+```
+let system_cpu_stalled = contention_tracker::global()
+    .lock().stall_fraction(0.85) >= 0.5;
+...
+let aggressive = aggressive || system_cpu_stalled;
+```
+
+When the gate fires, every background-noise pid this cycle is
+treated as "aggressive throttle" (Background QoS / E-cores)
+regardless of context, freeing P-core headroom for the
+protected set on the next quantum. Behaviour-preserving when
+the tracker is empty (stall_fraction = 0 → no-op).
 
 ### DEBT-SENSOR-02 — Skip freeze of a CPU-starved candidate
 

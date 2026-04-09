@@ -328,6 +328,28 @@ pub fn decide_actions(
         })
         .collect();
 
+    // System-wide CPU stall signal: when more than half of the tracked
+    // pids are spending ≥85% of their CPU-wanting time in the run queue,
+    // the protected set is being starved by the non-interactive set.
+    // The fix is NOT to boost the protected pids further (they're
+    // already at Foreground QoS) — it's to throttle the non-interactive
+    // pids more aggressively so the scheduler has more headroom for
+    // the protected set on the next quantum.
+    //
+    // This is the closure of debt-sensor-01 from V110_PENDING.md, which
+    // proposed boosting protected pids on contention. Analysis showed
+    // that approach was structurally wrong (boosting an already-boosted
+    // pid is a no-op). The correct consumer for stall_fraction is here:
+    // raise the throttle aggressiveness floor when the system is
+    // CPU-starved at the system level.
+    //
+    // Threshold 0.5: half of tracked pids in starvation territory means
+    // the system is meaningfully contended, not transient noise.
+    let system_cpu_stalled = crate::engine::contention_tracker::global()
+        .lock()
+        .map(|t| t.stall_fraction(0.85) >= 0.5)
+        .unwrap_or(false);
+
     // Build closures that merge hardcoded lists with the learned policy.
     // Also checks behavior-interactive PIDs (cpu_wall_ratio EMA < 0.05)
     // AND the behavioural app-bundle set built above. The .app-bundle
@@ -542,6 +564,14 @@ pub fn decide_actions(
                         && matches!(profile, OptimizationProfile::AggressiveRoot)
                 }
             };
+            // System-wide CPU stall override: when the protected set is
+            // being starved at the system level (Phase 4 wiring of the
+            // stall_fraction signal), force aggressive throttling of any
+            // non-interactive process regardless of context. The
+            // protected set already has Foreground QoS — the only lever
+            // left to free CPU for them is to push the non-interactive
+            // tail to E-cores harder.
+            let aggressive = aggressive || system_cpu_stalled;
             // Wakeup vampire boost: if process has high wakeup rate (>100/s),
             // it is a battery drain even when idle. Mark as aggressive regardless
             // of profile — wakeup vampires waste power doing nothing useful.
