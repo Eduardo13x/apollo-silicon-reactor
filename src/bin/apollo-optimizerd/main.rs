@@ -890,16 +890,23 @@ fn main() -> anyhow::Result<()> {
                 let metrics_pb = std::path::PathBuf::from(
                     apollo_optimizer::engine::daemon_helpers::metrics_path(),
                 );
-                let hints_pb = if unsafe { libc::geteuid() } == 0 {
+                let is_root_for_planner = unsafe { libc::geteuid() } == 0;
+                let hints_pb = if is_root_for_planner {
                     std::path::PathBuf::from("/var/lib/apollo/planner_hints.json")
                 } else {
                     std::path::PathBuf::from("/tmp/apollo-planner_hints.json")
+                };
+                let calibration_pb = if is_root_for_planner {
+                    std::path::PathBuf::from("/var/lib/apollo/calibration.jsonl")
+                } else {
+                    std::path::PathBuf::from("/tmp/apollo-calibration.jsonl")
                 };
                 let _planner_stop = apollo_optimizer::engine::planner::Planner::new(
                     Duration::from_secs(30),
                     metrics_pb,
                     hints_pb,
                 )
+                .with_calibration_log(calibration_pb)
                 .spawn();
             }
             // Resource sentinel: sub-100ms interrupt handler for thermal/memory/power emergencies.

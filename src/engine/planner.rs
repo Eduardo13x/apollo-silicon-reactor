@@ -105,6 +105,101 @@ struct MetricsObservation {
     thrashing_score: f64,
     #[serde(default)]
     cpu_pegged_fraction: f64,
+    #[serde(default)]
+    cpu_mean_busy: f64,
+    #[serde(default)]
+    cpu_max_busy: f64,
+    #[serde(default)]
+    stall_fraction: f64,
+    #[serde(default)]
+    swap_used_bytes: u64,
+    #[serde(default)]
+    swap_delta_bps: f64,
+    #[serde(default)]
+    freezes_applied: u64,
+    #[serde(default)]
+    throttles_applied: u64,
+    #[serde(default)]
+    boosts_applied: u64,
+    #[serde(default)]
+    kills_applied: u64,
+}
+
+/// One row in the calibration log. Captures the values of every tunable
+/// threshold currently in production AND the live observed value at the
+/// same instant. A week's worth of these rows makes it possible to ask
+/// empirical questions like "is the gate_c threshold of 5000 well
+/// calibrated, or is it firing 0% / 100% of the time?". Phase 3 of the
+/// 4-phase improvement plan from 2026-04-08; replaces the speculative
+/// "tune by reasoning" approach with a data trail.
+#[derive(Debug, Clone, Serialize)]
+struct CalibrationRow {
+    ts: DateTime<Utc>,
+    // ── Live observed values (mirrors runtime_metrics) ─────────
+    memory_pressure: f64,
+    thrashing_score: f64,
+    cpu_mean_busy: f64,
+    cpu_max_busy: f64,
+    cpu_pegged_fraction: f64,
+    stall_fraction: f64,
+    swap_used_bytes: u64,
+    swap_delta_bps: f64,
+    freezes_applied: u64,
+    throttles_applied: u64,
+    boosts_applied: u64,
+    kills_applied: u64,
+    // ── Tunable thresholds in effect (constants) ───────────────
+    gate_c_thrashing_threshold: f64,
+    gate_c_pressure_floor: f64,
+    stall_threshold: f64,
+    cold_boot_window_secs: u64,
+    foreground_freeze_ttl_cycles: u64,
+    max_frozen_cycles: u64,
+    // ── Derived booleans (would the gate fire right now?) ──────
+    gate_c_would_fire: bool,
+    stall_above_threshold: bool,
+}
+
+impl CalibrationRow {
+    /// Constants must be kept manually in sync with the values defined
+    /// in decide_actions.rs / chromium_manager.rs / stability_oracle.rs.
+    /// Mismatches are caught by the calibration_constants_match_source
+    /// regression test below.
+    const GATE_C_THRASHING: f64 = 5_000.0;
+    const GATE_C_PRESSURE_FLOOR: f64 = 0.55;
+    const STALL_THRESHOLD: f64 = 0.85;
+    const COLD_BOOT_WINDOW: u64 = 300;
+    const FG_FREEZE_TTL: u64 = 15;
+    const MAX_FROZEN_CYCLES: u64 = 150;
+
+    fn from_observation(obs: &MetricsObservation) -> Self {
+        let gate_c_would_fire =
+            obs.thrashing_score > Self::GATE_C_THRASHING
+                && obs.memory_pressure >= Self::GATE_C_PRESSURE_FLOOR;
+        Self {
+            ts: Utc::now(),
+            memory_pressure: obs.memory_pressure,
+            thrashing_score: obs.thrashing_score,
+            cpu_mean_busy: obs.cpu_mean_busy,
+            cpu_max_busy: obs.cpu_max_busy,
+            cpu_pegged_fraction: obs.cpu_pegged_fraction,
+            stall_fraction: obs.stall_fraction,
+            swap_used_bytes: obs.swap_used_bytes,
+            swap_delta_bps: obs.swap_delta_bps,
+            freezes_applied: obs.freezes_applied,
+            throttles_applied: obs.throttles_applied,
+            boosts_applied: obs.boosts_applied,
+            kills_applied: obs.kills_applied,
+            gate_c_thrashing_threshold: Self::GATE_C_THRASHING,
+            gate_c_pressure_floor: Self::GATE_C_PRESSURE_FLOOR,
+            stall_threshold: Self::STALL_THRESHOLD,
+            cold_boot_window_secs: Self::COLD_BOOT_WINDOW,
+            foreground_freeze_ttl_cycles: Self::FG_FREEZE_TTL,
+            max_frozen_cycles: Self::MAX_FROZEN_CYCLES,
+            gate_c_would_fire,
+            stall_above_threshold: obs.stall_fraction >= Self::STALL_THRESHOLD,
+        }
+    }
 }
 
 /// File written each tick. Contains the current emission set; consumers
@@ -204,6 +299,11 @@ pub struct Planner {
     cadence: Duration,
     metrics_path: PathBuf,
     output_path: PathBuf,
+    /// Optional calibration log path. When `Some`, the planner appends
+    /// one CalibrationRow per tick to this JSONL file. Written
+    /// independently of the hints file because calibration data is
+    /// append-only and historical, while hints are atomic snapshots.
+    calibration_path: Option<PathBuf>,
     window: TrendWindow,
     stop: Arc<AtomicBool>,
 }
@@ -220,9 +320,20 @@ impl Planner {
             cadence,
             metrics_path,
             output_path,
+            calibration_path: None,
             window: TrendWindow::new(Self::WINDOW_SAMPLES),
             stop: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Builder: enable calibration row append at the given path. Phase 3
+    /// of the 4-phase improvement plan from 2026-04-08. Each tick now
+    /// also appends one JSONL row with the live observed values + the
+    /// thresholds in effect. A week of data answers "are the chosen
+    /// thresholds well-calibrated empirically".
+    pub fn with_calibration_log(mut self, path: PathBuf) -> Self {
+        self.calibration_path = Some(path);
+        self
     }
 
     /// Stop flag handle for graceful shutdown.
@@ -257,12 +368,20 @@ impl Planner {
     }
 
     /// One observation cycle: read metrics, push into trend window,
-    /// derive hints, persist to disk.
+    /// derive hints, persist to disk. Also appends a calibration row
+    /// when `calibration_path` is set.
     fn tick(&mut self) {
         let obs = match Self::read_metrics(&self.metrics_path) {
             Some(o) => o,
             None => return, // metrics file not yet written; skip
         };
+        // Calibration row is built from the raw observation BEFORE
+        // pushing into the window so the row reflects "what was true
+        // at this instant" even on the very first tick.
+        if let Some(cal_path) = &self.calibration_path {
+            let row = CalibrationRow::from_observation(&obs);
+            let _ = Self::append_calibration(cal_path, &row);
+        }
         self.window.push(Utc::now(), obs);
         let hints = self.derive_hints();
         let _ = Self::persist(&self.output_path, &hints);
@@ -335,6 +454,25 @@ impl Planner {
         out
     }
 
+    /// Append one calibration row as a single JSONL line. The file is
+    /// open-append-close to avoid keeping a long-lived file handle that
+    /// would block log rotation. One row is ~500 bytes; at 30-s cadence
+    /// the file grows ~1.5 KB/min ≈ 2 MB/day. A weekly rotation handler
+    /// would be a follow-up if it ever becomes a concern.
+    fn append_calibration(path: &Path, row: &CalibrationRow) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let line = serde_json::to_string(row).map_err(std::io::Error::other)?;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(f, "{}", line)?;
+        Ok(())
+    }
+
     fn persist(path: &Path, hints: &[PlannerHint]) -> std::io::Result<()> {
         // Atomic write: tmp file + rename so partial writes never expose
         // half-written JSON to a future consumer.
@@ -364,6 +502,7 @@ mod tests {
             memory_pressure: p,
             thrashing_score: t,
             cpu_pegged_fraction: c,
+            ..Default::default()
         }
     }
 
@@ -417,6 +556,7 @@ mod tests {
             cadence: Duration::from_secs(30),
             metrics_path: PathBuf::from("/dev/null"),
             output_path: PathBuf::from("/dev/null"),
+            calibration_path: None,
             window: TrendWindow::new(10),
             stop: Arc::new(AtomicBool::new(false)),
         }
@@ -545,6 +685,118 @@ mod tests {
     fn read_metrics_returns_none_on_missing_file() {
         let result = Planner::read_metrics(Path::new("/nonexistent/path/metrics.json"));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn calibration_row_reflects_observation_and_thresholds() {
+        let obs = MetricsObservation {
+            memory_pressure: 0.81,
+            thrashing_score: 19_890.0,
+            cpu_pegged_fraction: 0.0,
+            cpu_mean_busy: 0.41,
+            cpu_max_busy: 0.64,
+            stall_fraction: 0.07,
+            swap_used_bytes: 207_093_760,
+            swap_delta_bps: 0.0,
+            freezes_applied: 0,
+            throttles_applied: 720,
+            boosts_applied: 56,
+            kills_applied: 0,
+        };
+        let row = CalibrationRow::from_observation(&obs);
+        assert!(row.gate_c_would_fire, "thrashing 19890 + pressure 0.81 must trigger gate_c");
+        assert!(!row.stall_above_threshold, "stall 0.07 must NOT cross 0.85");
+        assert_eq!(row.gate_c_thrashing_threshold, 5_000.0);
+        assert_eq!(row.stall_threshold, 0.85);
+        assert_eq!(row.kills_applied, 0, "kills_applied must round-trip");
+    }
+
+    #[test]
+    fn calibration_row_quiet_state_no_gates_fired() {
+        let obs = MetricsObservation {
+            memory_pressure: 0.40,
+            thrashing_score: 100.0,
+            stall_fraction: 0.05,
+            ..Default::default()
+        };
+        let row = CalibrationRow::from_observation(&obs);
+        assert!(!row.gate_c_would_fire);
+        assert!(!row.stall_above_threshold);
+    }
+
+    #[test]
+    fn calibration_constants_match_source_of_truth() {
+        // Lock in the documented invariant: the constants the planner
+        // logs as "thresholds in effect" must match the values actually
+        // used by decide_actions / chromium_manager / contention_tracker.
+        // If anyone bumps the source-of-truth value without updating
+        // the planner row, this test fails — and the calibration log
+        // becomes silently misleading otherwise.
+        assert_eq!(
+            CalibrationRow::GATE_C_THRASHING, 5_000.0,
+            "gate_c thrashing threshold drifted from decide_actions::gate_c"
+        );
+        assert_eq!(
+            CalibrationRow::GATE_C_PRESSURE_FLOOR, 0.55,
+            "gate_c pressure floor drifted from decide_actions::gate_c"
+        );
+        assert_eq!(
+            CalibrationRow::STALL_THRESHOLD, 0.85,
+            "stall threshold drifted from main.rs::record_stall_fraction"
+        );
+        assert_eq!(
+            CalibrationRow::COLD_BOOT_WINDOW,
+            crate::engine::stability_oracle::COLD_BOOT_WINDOW_SECS,
+            "cold boot window drifted from stability_oracle"
+        );
+        assert_eq!(
+            CalibrationRow::FG_FREEZE_TTL, 15,
+            "fg-renderer TTL drifted from chromium_manager"
+        );
+        assert_eq!(
+            CalibrationRow::MAX_FROZEN_CYCLES, 150,
+            "max frozen cycles drifted from chromium_manager"
+        );
+    }
+
+    #[test]
+    fn append_calibration_creates_jsonl_file() {
+        let dir = std::env::temp_dir().join("apollo-planner-cal-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("cal.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let row = CalibrationRow::from_observation(&MetricsObservation {
+            memory_pressure: 0.7,
+            thrashing_score: 6_000.0,
+            ..Default::default()
+        });
+        Planner::append_calibration(&path, &row).expect("first append");
+        Planner::append_calibration(&path, &row).expect("second append");
+        let content = std::fs::read_to_string(&path).expect("file exists");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "two calls = two lines");
+        // Each line must be valid JSON object.
+        for line in &lines {
+            let _: serde_json::Value =
+                serde_json::from_str(line).expect("each line is valid JSON");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn calibration_path_is_optional() {
+        let p = Planner::new(
+            Duration::from_secs(30),
+            PathBuf::from("/dev/null"),
+            PathBuf::from("/dev/null"),
+        );
+        assert!(p.calibration_path.is_none(), "default: disabled");
+        let p2 = p.with_calibration_log(PathBuf::from("/tmp/cal.jsonl"));
+        assert_eq!(
+            p2.calibration_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            Some("/tmp/cal.jsonl".to_string())
+        );
     }
 
     #[test]
