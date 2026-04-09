@@ -257,7 +257,26 @@ pub fn execute_actions(
     //   state transitions; log-after-apply is correct here because the
     //   kernel already owns the authoritative frozen state.
     for action in &actions {
-        if let RootAction::UnfreezeProcess { pid, .. } = action {
+        if let RootAction::UnfreezeProcess { pid, name, .. } = action {
+            // PID recycling guard: verify the process at this PID still has
+            // the expected name before sending SIGCONT. Without this check,
+            // a recycled PID could belong to a DIFFERENT process that is
+            // legitimately SIGSTOP'd (e.g. by a debugger like lldb). Sending
+            // SIGCONT to that process would break the debugger's control.
+            //
+            // Cost: one proc_name_for_pid (~2 µs) per unfreeze candidate.
+            // For typical batches of 1-30 unfreezes this is 2-60 µs — well
+            // within the pre-pass's latency budget.
+            let name_matches = process_identity::proc_name_for_pid(*pid)
+                .map(|current_name| {
+                    current_name == *name
+                        || (current_name.len() >= 6 && name.starts_with(&current_name))
+                        || (name.len() >= 6 && current_name.starts_with(name))
+                })
+                .unwrap_or(false);
+            if !name_matches {
+                continue; // PID recycled or process dead — skip
+            }
             // SAFETY: single syscall, no shared state, no dereference.
             unsafe { libc::kill(*pid as i32, libc::SIGCONT) };
         }
