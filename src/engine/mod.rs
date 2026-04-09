@@ -17,6 +17,7 @@ pub mod compressor_aware;
 pub mod contention_detector;
 pub mod contention_tracker;
 pub mod cpu_saturation;
+pub mod planner;
 pub mod cusum;
 pub mod daemon_helpers;
 pub mod daemon_state;

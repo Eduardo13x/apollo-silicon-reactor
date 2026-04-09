@@ -873,6 +873,35 @@ fn main() -> anyhow::Result<()> {
             let mut smc_reader = SmcReader::spawn(Duration::from_secs(3));
             // Background pressure collector: moves memory_pressure + sysctl out of main loop.
             let mut pressure_collector = PressureCollector::spawn(Duration::from_secs(3));
+            // Hierarchical planner — Strangler Fig Phase 0 (advisory only).
+            // Reads runtime_metrics.json at 30-s cadence, derives forward-
+            // looking hints from observed trends, writes them to
+            // planner_hints.json. Zero coupling to the daemon main loop:
+            // no shared state, no consumer reads the hints yet. The whole
+            // point of Phase 0 is to validate the planner's predictions
+            // empirically before any reactor decision touches them.
+            //
+            // [Fowler 2004] StranglerFigApplication — produce in parallel,
+            // wire consumers only after validation. See engine/planner.rs.
+            {
+                // The local `metrics_path` PathBuf is bound much later
+                // (line 795). Use the helper function directly here so
+                // we don't depend on that ordering.
+                let metrics_pb = std::path::PathBuf::from(
+                    apollo_optimizer::engine::daemon_helpers::metrics_path(),
+                );
+                let hints_pb = if unsafe { libc::geteuid() } == 0 {
+                    std::path::PathBuf::from("/var/lib/apollo/planner_hints.json")
+                } else {
+                    std::path::PathBuf::from("/tmp/apollo-planner_hints.json")
+                };
+                let _planner_stop = apollo_optimizer::engine::planner::Planner::new(
+                    Duration::from_secs(30),
+                    metrics_pb,
+                    hints_pb,
+                )
+                .spawn();
+            }
             // Resource sentinel: sub-100ms interrupt handler for thermal/memory/power emergencies.
             // Shares the fg_detector so the sentinel never freezes the active foreground app.
             spawn_resource_sentinel(
