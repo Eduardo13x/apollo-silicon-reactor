@@ -708,9 +708,24 @@ impl LearnedState {
     }
 
     /// Persist to disk (best-effort, never panics).
+    ///
+    /// Uses atomic write (tmp → rename) so a crash mid-write leaves the
+    /// PREVIOUS state intact rather than a truncated/empty file. Without
+    /// this, a kernel panic, OOM kill or power loss during the write
+    /// would corrupt learned_state.json and destroy ALL learned state
+    /// (RL thresholds, NARS beliefs, causal graph, experience memory,
+    /// learnable params, arousal state).
+    ///
+    /// [Gray & Reuter 1992] §10 — WAL/atomic-replace: the previous
+    /// committed state must survive any single-point failure.
     pub fn persist(&self, path: &Path) {
-        if let Ok(json) = serde_json::to_string(self) {
-            let _ = std::fs::write(path, json);
+        let json = match serde_json::to_string(self) {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
         }
     }
 
