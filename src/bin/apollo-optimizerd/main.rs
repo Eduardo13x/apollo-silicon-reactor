@@ -3625,6 +3625,11 @@ fn main() -> anyhow::Result<()> {
                     // this denylist covers the behavioral (cpu_wall_ratio) path.
                     // [Android LMK] Protection earned by user interaction, not I/O.
                     // Production data: searchpartyd got 17 incorrect boosts via this path.
+                    // Journal audit 2026-04-09: these daemons have low cpu_wall_ratio
+                    // (I/O-bound) which the behavioral detector mis-classifies as
+                    // "interactive". Each name was observed receiving 30-100+ incorrect
+                    // boosts per session. Without the denylist they'd get Foreground QoS
+                    // every cycle, wasting scheduler priority on system background work.
                     const BEHAVIOR_DENYLIST: &[&str] = &[
                         "searchpartyd",         // Find My / Handoff BLE scanning
                         "corespeechd",          // Siri speech (background)
@@ -3636,6 +3641,15 @@ fn main() -> anyhow::Result<()> {
                         "mlhostd",              // Core ML inference host
                         "modelmanagerd",        // On-device model cache
                         "rtcreportingd",        // RealTimeComm diagnostics
+                        // Added 2026-04-09 from journal boost audit:
+                        "cfprefsd",             // Preference caching daemon — I/O-bound, 33 false boosts
+                        "xpcproxy",             // XPC service launcher — ephemeral, 40 false boosts
+                        "log",                  // Unified log CLI — spawned by log_ingester, 30 false boosts
+                        "apollo-optimizerd",    // Self — execute_actions blocks but 45 wasted journal entries
+                        "apollo-optimizerctl",  // Our own CLI client
+                        "diagnostics_agent",    // System diagnostics — throttled 749x but also boosted
+                        "socketfilterfw",       // Application firewall — I/O-bound, not interactive
+                        "stable",              // /usr/libexec/stable — system process, 67 false boosts
                     ];
                     let model = state.usage.lock_recover();
                     let interactive_names: HashSet<&str> = model
