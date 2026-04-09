@@ -304,11 +304,40 @@ pub fn decide_actions(
         .map(|s| s.to_ascii_lowercase())
         .collect();
 
+    // Behavioural app-bundle detection: build a set of pids whose binary
+    // lives in a macOS .app bundle. ANY .app binary is by definition a
+    // user-facing app or its helper (Apple Bundle Programming Guide), so
+    // it must be protected from throttling regardless of whether its name
+    // appears in the hardcoded INTERACTIVE_APPS list. This is the
+    // behavioural detection that eliminates the drift hazard observed in
+    // the 2026-04-08 graph audit (INTERACTIVE_APPS had drifted from
+    // thermal_interrupt::protected by 10+ entries).
+    //
+    // Cost: one proc_pidpath syscall (~3 µs on M1) per pid, called once
+    // per cycle here. Cached in the local HashSet for O(1) lookup by the
+    // is_interactive closure below. The lookup is name+pid based so the
+    // closure does not need to be aware of the path itself.
+    let app_bundle_pids: std::collections::HashSet<u32> = sys
+        .processes()
+        .keys()
+        .filter_map(|pid| {
+            let pid_u32 = pid.as_u32();
+            crate::engine::proc_taskinfo::is_user_app_bundle(pid_u32)
+                .filter(|&is_bundle| is_bundle)
+                .map(|_| pid_u32)
+        })
+        .collect();
+
     // Build closures that merge hardcoded lists with the learned policy.
-    // Also checks behavior-interactive PIDs (cpu_wall_ratio EMA < 0.05).
+    // Also checks behavior-interactive PIDs (cpu_wall_ratio EMA < 0.05)
+    // AND the behavioural app-bundle set built above. The .app-bundle
+    // tier is the primary signal; the hardcoded list is a fallback for
+    // pids whose proc_pidpath read failed (denied, kernel-only, or
+    // already gone).
     let is_interactive = |name: &str, pid: u32| -> bool {
         let name_lc = name.to_ascii_lowercase();
-        is_interactive_base(name)
+        app_bundle_pids.contains(&pid)
+            || is_interactive_base(name)
             || interactive_lc.iter().any(|p| name_lc.contains(p.as_str()))
             || behavior_interactive_pids.contains(&pid)
     };
@@ -1290,6 +1319,53 @@ mod tests {
             assert!(
                 !DEFERRABLE_DAEMONS.iter().any(|d| d == noise),
                 "{noise} is in both NOISE_APPS and DEFERRABLE_DAEMONS"
+            );
+        }
+    }
+
+    /// Behavioural-detection regression: every binary inside a `.app`
+    /// bundle is recognised as user-facing, regardless of whether its
+    /// name appears in INTERACTIVE_APPS. This is the test that locks
+    /// in the drift fix from the 2026-04-08 graph audit.
+    #[test]
+    fn app_bundle_paths_classify_as_interactive_via_proc_taskinfo() {
+        use crate::engine::proc_taskinfo::is_app_bundle_path;
+        // These names are NOT in INTERACTIVE_APPS, but their canonical
+        // bundle paths must still classify as user-facing via the
+        // behavioural path:
+        let bundle_only_apps = [
+            ("/Applications/Bartender 4.app/Contents/MacOS/Bartender 4", "Bartender 4"),
+            ("/Applications/Setapp/CleanShot X.app/Contents/MacOS/CleanShot X", "CleanShot X"),
+            ("/Applications/Raycast.app/Contents/MacOS/Raycast", "Raycast"),
+            ("/Applications/1Password 7 - Password Manager.app/Contents/MacOS/1Password 7", "1Password 7"),
+            ("/Users/me/Applications/CustomApp.app/Contents/MacOS/CustomApp", "CustomApp"),
+        ];
+        for (path, name) in bundle_only_apps {
+            assert!(
+                is_app_bundle_path(path),
+                "{name}: path-pattern detection must recognise {path} as a .app bundle"
+            );
+            // The name itself is NOT in INTERACTIVE_APPS — confirm the
+            // hardcoded list alone would have missed it.
+            assert!(
+                !is_interactive_base(name),
+                "{name}: this app intentionally NOT in INTERACTIVE_APPS so the test \
+                 verifies the BEHAVIOURAL tier (path) catches it without name match"
+            );
+        }
+        // And conversely: daemons must NOT classify as bundle, even if
+        // they happen to have a name that contains substrings of an app.
+        let non_bundle_daemons = [
+            "/usr/sbin/cfprefsd",
+            "/sbin/launchd",
+            "/usr/libexec/trustd",
+            "/System/Library/PrivateFrameworks/MediaAnalysisServices.framework/mediaanalysisd",
+            "/opt/homebrew/bin/cargo",
+        ];
+        for path in non_bundle_daemons {
+            assert!(
+                !is_app_bundle_path(path),
+                "{path}: must NOT be classified as a .app bundle"
             );
         }
     }
