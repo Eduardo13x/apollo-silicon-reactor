@@ -986,6 +986,7 @@ pub fn decide_actions(
                 // Replaced hardcoded ["Slack","Discord","Spotify","Teams"]: any
                 // memory-heavy background app (zoom.us, Figma, Electron apps)
                 // now qualifies. Protection stack in execute_actions still applies.
+                let protected = crate::engine::safety::protected_processes();
                 let mut freeze_candidates: Vec<(u32, String, u64, f32, u64)> = sys
                     .processes()
                     .iter()
@@ -995,6 +996,17 @@ pub fn decide_actions(
                             return None;
                         }
                         let name = process.name().to_string();
+                        // System-critical processes must never be freeze candidates.
+                        // Bug found in production: gate_c was emitting FreezeProcess
+                        // for loginwindow (pid 466) and sharingd (pid 719) because
+                        // critical_pids only contains infrastructure (docker, postgres)
+                        // and ML workloads — NOT the OS-essential daemons from
+                        // safety::protected_processes(). execute_actions blocks
+                        // loginwindow downstream but sharingd was NOT protected and
+                        // got frozen in a 19-hour loop. AirDrop/Handoff broken.
+                        if protected.iter().any(|p| name.contains(p)) {
+                            return None;
+                        }
                         if is_interactive(&name, pid_u32) {
                             return None;
                         }

@@ -62,6 +62,11 @@ pub fn protected_processes() -> HashSet<&'static str> {
         // [IOKit Power Management] powerd manages assertion tracking, thermal policy,
         // and display sleep. SIGSTOP causes indefinite wake-lock or uncontrolled fan spin.
         "powerd",
+        // AirDrop / Handoff / AirPlay sharing daemon. Freezing breaks device-to-device
+        // sharing. Found in production data: gate_c freeze loop froze sharingd 173
+        // times over 19 hours (2026-04-09 journal audit). sharingd respawns and
+        // immediately gets re-frozen — infinite loop, AirDrop permanently broken.
+        "sharingd",
     ]
     .into_iter()
     .collect()
