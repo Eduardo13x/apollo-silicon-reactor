@@ -368,6 +368,40 @@ pub fn get_proc_path(pid: u32) -> Option<String> {
     Some(cstr.to_string_lossy().into_owned())
 }
 
+/// Returns true if the path corresponds to a binary inside a `.app` bundle.
+///
+/// On macOS every GUI application — and every helper / framework binary
+/// the application spawns — lives somewhere under `<bundle>.app/Contents/`.
+/// Daemons, CLI tools, and system services NEVER live in `.app` bundles
+/// (they live under `/usr/`, `/System/Library/`, `/Library/`, etc.). This
+/// gives us a cheap, accurate, FFI-free behavioural test for "is this
+/// process user-facing".
+///
+/// Examples:
+/// - `/Applications/Brave Browser.app/Contents/MacOS/Brave Browser` → `true`
+/// - `/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper` → `true`
+/// - `/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal` → `true`
+/// - `/Users/me/Applications/MyApp.app/Contents/MacOS/MyApp` → `true`
+/// - `/usr/sbin/cfprefsd` → `false` (system daemon)
+/// - `/System/Library/PrivateFrameworks/.../mediaanalysisd` → `false`
+/// - `/opt/homebrew/bin/cargo` → `false` (CLI tool)
+///
+/// The check is path-pattern based — no syscalls beyond the proc_pidpath
+/// already done by `get_proc_path`. Pattern catches both top-level
+/// `.app/Contents/MacOS/` binaries and nested helper binaries inside
+/// `.app/Contents/Frameworks/`. The two together are the canonical
+/// macOS app bundle layout per Apple's Bundle Programming Guide.
+pub fn is_app_bundle_path(path: &str) -> bool {
+    path.contains(".app/Contents/MacOS/") || path.contains(".app/Contents/Frameworks/")
+}
+
+/// Convenience: read the path for `pid` and return whether it's an
+/// app-bundle binary. `None` if proc_pidpath fails (process gone, denied,
+/// or kernel-only).
+pub fn is_user_app_bundle(pid: u32) -> Option<bool> {
+    get_proc_path(pid).map(|p| is_app_bundle_path(&p))
+}
+
 /// Get all PIDs on the system. Returns sorted list.
 pub fn list_all_pids() -> Vec<u32> {
     // First call with null to get count
@@ -533,6 +567,71 @@ mod tests {
     fn on_cpu_ns_sums_user_and_system() {
         let ri = mk_rusage(1_000, 500, 9_999);
         assert_eq!(ri.on_cpu_ns(), 1_500);
+    }
+
+    // ── App bundle path detection ───────────────────────────────────────
+
+    #[test]
+    fn app_bundle_paths_recognised() {
+        // Top-level app binary
+        assert!(is_app_bundle_path(
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+        ));
+        // Nested in subfolder
+        assert!(is_app_bundle_path(
+            "/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+        ));
+        // User-local
+        assert!(is_app_bundle_path(
+            "/Users/me/Applications/MyApp.app/Contents/MacOS/MyApp"
+        ));
+        // Helper inside app's Frameworks
+        assert!(is_app_bundle_path(
+            "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper"
+        ));
+        // Setapp / third-party install location
+        assert!(is_app_bundle_path(
+            "/Applications/Setapp/Bartender 4.app/Contents/MacOS/Bartender 4"
+        ));
+    }
+
+    #[test]
+    fn non_app_paths_rejected() {
+        // System daemons
+        assert!(!is_app_bundle_path("/usr/sbin/cfprefsd"));
+        assert!(!is_app_bundle_path("/sbin/launchd"));
+        assert!(!is_app_bundle_path("/usr/libexec/trustd"));
+        // System frameworks (no .app)
+        assert!(!is_app_bundle_path(
+            "/System/Library/PrivateFrameworks/MediaAnalysisServices.framework/Versions/A/mediaanalysisd"
+        ));
+        // CLI tools
+        assert!(!is_app_bundle_path("/opt/homebrew/bin/cargo"));
+        assert!(!is_app_bundle_path("/usr/local/bin/rustc"));
+        // apollo itself (it lives in libexec, not in an .app)
+        assert!(!is_app_bundle_path("/usr/local/libexec/apollo-optimizerd"));
+    }
+
+    #[test]
+    fn empty_or_garbage_paths_rejected() {
+        assert!(!is_app_bundle_path(""));
+        assert!(!is_app_bundle_path("/"));
+        // ".app" without /Contents/ is not a bundle (could be a stray dir)
+        assert!(!is_app_bundle_path("/tmp/foo.app/random"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn is_user_app_bundle_handles_self() {
+        // The test binary itself lives under target/, not /Applications/.
+        // is_user_app_bundle should return Some(false) for it.
+        let pid = std::process::id();
+        let result = is_user_app_bundle(pid);
+        assert_eq!(
+            result,
+            Some(false),
+            "test binary lives under target/, not in a .app"
+        );
     }
 
     #[test]
