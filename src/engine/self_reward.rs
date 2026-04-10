@@ -22,6 +22,8 @@
 
 use std::collections::VecDeque;
 
+use super::neon_ema::ema_f32;
+
 use serde::{Deserialize, Serialize};
 
 /// Number of cycles to wait before evaluating a past decision.
@@ -237,9 +239,6 @@ impl SelfRewardingEvaluator {
     }
 }
 
-fn ema_f32(prev: f32, new: f32, alpha: f32) -> f32 {
-    prev + alpha * (new - prev)
-}
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 

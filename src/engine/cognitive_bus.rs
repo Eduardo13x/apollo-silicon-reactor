@@ -20,6 +20,8 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
+use super::neon_ema::ema_f64;
+
 /// Maximum number of reward signals retained in the bus buffer.
 const BUS_CAPACITY: usize = 200;
 
@@ -177,9 +179,9 @@ impl CognitiveRewardBus {
         let integrated = self.current_cycle_sum / self.current_cycle_count as f64;
 
         // Update per-consumer EMAs
-        self.rl_reward_ema = ema(self.rl_reward_ema, integrated, REWARD_EMA_ALPHA);
-        self.linucb_reward_ema = ema(self.linucb_reward_ema, integrated, REWARD_EMA_ALPHA);
-        self.nars_reward_ema = ema(self.nars_reward_ema, integrated, REWARD_EMA_ALPHA);
+        self.rl_reward_ema = ema_f64(self.rl_reward_ema, integrated, REWARD_EMA_ALPHA);
+        self.linucb_reward_ema = ema_f64(self.linucb_reward_ema, integrated, REWARD_EMA_ALPHA);
+        self.nars_reward_ema = ema_f64(self.nars_reward_ema, integrated, REWARD_EMA_ALPHA);
 
         // Reset cycle accumulator
         self.current_cycle_sum = 0.0;
@@ -250,10 +252,6 @@ impl CognitiveRewardBus {
     }
 }
 
-/// Simple EMA helper.
-fn ema(prev: f64, new: f64, alpha: f64) -> f64 {
-    prev + alpha * (new - prev)
-}
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 

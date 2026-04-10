@@ -96,6 +96,23 @@ pub fn ema_scalar_reference(ema: &[f32; 4], samples: &[f32; 4], alpha: f32) -> [
     result
 }
 
+/// Scalar EMA for a single f32 value: `prev + alpha * (new - prev)`.
+///
+/// Shared across modules that maintain per-value EMA state (meta_cognition,
+/// reptile_meta, self_reward). Consolidating here prevents copy-paste drift
+/// between identical 1-line helpers. [McIlroy 1969] "Composability: prefer
+/// library functions over repeated inline formulas."
+#[inline]
+pub(crate) fn ema_f32(prev: f32, new: f32, alpha: f32) -> f32 {
+    prev + alpha * (new - prev)
+}
+
+/// Scalar EMA for a single f64 value. Same formula as `ema_f32`.
+#[inline]
+pub(crate) fn ema_f64(prev: f64, new: f64, alpha: f64) -> f64 {
+    prev + alpha * (new - prev)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
