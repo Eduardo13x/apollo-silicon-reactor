@@ -1212,8 +1212,6 @@ fn main() -> anyhow::Result<()> {
             log_ingester.start_background();
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
-            // Pre-allocated push buffer for dry_run fast-path (avoids per-cycle allocation).
-            let mut dry_run_push_buf = String::with_capacity(128);
             // Batch buffer: accumulate N push messages before a single write syscall.
             let mut dry_run_batch: Vec<u8> = Vec::with_capacity(1024);
             let mut dry_run_batch_count: u32 = 0;
@@ -1368,14 +1366,29 @@ fn main() -> anyhow::Result<()> {
                     let cycles = lf_metrics.cycles.load(std::sync::atomic::Ordering::Relaxed);
                     {
                         use std::io::Write as _;
-                        dry_run_push_buf.clear();
-                        std::fmt::write(
-                            &mut dry_run_push_buf,
-                            format_args!(r#"{{"type":"StatusPush","payload":{{"metrics":{{"cycles":{}}}}}}}"#, cycles),
-                        )
-                        .ok();
-                        dry_run_batch.extend_from_slice(dry_run_push_buf.as_bytes());
-                        dry_run_batch.push(b'\n');
+                        // Zero-allocation direct byte write — no String, no fmt overhead.
+                        // [Drepper 2007 "What Every Programmer Should Know About Memory"]
+                        // stack-allocate digit buffer, write directly into batch Vec.
+                        const PREFIX: &[u8] = b"{\"type\":\"StatusPush\",\"payload\":{\"metrics\":{\"cycles\":";
+                        const SUFFIX: &[u8] = b"}}}\n";
+                        dry_run_batch.extend_from_slice(PREFIX);
+                        {
+                            let mut num_buf = [0u8; 20];
+                            let mut n = cycles;
+                            let mut end = 20usize;
+                            if n == 0 {
+                                end -= 1;
+                                num_buf[end] = b'0';
+                            } else {
+                                while n > 0 {
+                                    end -= 1;
+                                    num_buf[end] = b'0' + (n % 10) as u8;
+                                    n /= 10;
+                                }
+                            }
+                            dry_run_batch.extend_from_slice(&num_buf[end..]);
+                        }
+                        dry_run_batch.extend_from_slice(SUFFIX);
                         dry_run_batch_count += 1;
                         if dry_run_batch_count >= DRY_RUN_BATCH_SIZE {
                             let batch = &dry_run_batch;
@@ -1385,6 +1398,9 @@ fn main() -> anyhow::Result<()> {
                                 .retain_mut(|stream| stream.write_all(batch).is_ok());
                             dry_run_batch.clear();
                             dry_run_batch_count = 0;
+                            // Sync atomic cycle count to state.metrics once per batch
+                            // so GetMetrics/GetHealth return non-stale data (16x amortized).
+                            state.metrics.lock_recover().metrics.cycles = cycles;
                         }
                     }
                     last_cycle_end = Instant::now();
