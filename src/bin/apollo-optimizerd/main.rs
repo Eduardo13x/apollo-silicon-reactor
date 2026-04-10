@@ -1312,10 +1312,14 @@ fn main() -> anyhow::Result<()> {
                     .map(|t| Instant::now() < t)
                     .unwrap_or(false);
 
-                // Enforce minimum 300ms between cycles to prevent event-storm CPU burn.
+                // Enforce minimum inter-cycle delay to prevent event-storm CPU burn.
+                // In dry-run the condvar wait is already 100ms; skip the additional floor.
+                let min_inter_cycle_ms = if dry_run { 0 } else { 300 };
                 let since_last = last_cycle_end.elapsed();
-                if since_last < Duration::from_millis(300) {
-                    thread::sleep(Duration::from_millis(300) - since_last);
+                if min_inter_cycle_ms > 0
+                    && since_last < Duration::from_millis(min_inter_cycle_ms)
+                {
+                    thread::sleep(Duration::from_millis(min_inter_cycle_ms) - since_last);
                 }
 
                 if Path::new(kill_switch_path()).exists() {
