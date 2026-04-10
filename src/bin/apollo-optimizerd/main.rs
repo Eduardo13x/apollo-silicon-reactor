@@ -1212,6 +1212,8 @@ fn main() -> anyhow::Result<()> {
             log_ingester.start_background();
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
+            // Pre-allocated push buffer for dry_run fast-path (avoids per-cycle allocation).
+            let mut dry_run_push_buf = String::with_capacity(128);
             // Gate network_monitor.tick() to every ~10s since netstat is blocking.
             let mut last_netstat_tick = Instant::now() - Duration::from_secs(10);
             // Context-switch burst detector (TDA-aware).
@@ -1362,14 +1364,18 @@ fn main() -> anyhow::Result<()> {
                         m.metrics.cycles += 1;
                         m.metrics.cycles
                     };
-                    let push_msg =
-                        format!(r#"{{"type":"StatusPush","payload":{{"metrics":{{"cycles":{}}}}}}}"#, cycles);
                     {
                         use std::io::Write as _;
+                        dry_run_push_buf.clear();
+                        std::fmt::write(
+                            &mut dry_run_push_buf,
+                            format_args!(r#"{{"type":"StatusPush","payload":{{"metrics":{{"cycles":{}}}}}}}"#, cycles),
+                        )
+                        .ok();
                         state
                             .subscribers
                             .lock_recover()
-                            .retain_mut(|stream| writeln!(stream, "{}", push_msg).is_ok());
+                            .retain_mut(|stream| writeln!(stream, "{}", dry_run_push_buf).is_ok());
                     }
                     last_cycle_end = Instant::now();
                     lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
