@@ -34,6 +34,7 @@ use apollo_optimizer::engine::predictive_agent::{Intervention, SpecialistVote};
 use apollo_optimizer::engine::signal_intelligence::SignalDigest;
 use apollo_optimizer::engine::system_log_ingester::{SystemEvent, SystemLogIngester};
 use apollo_optimizer::engine::types::{FrozenPidEntry, FrozenStatePersisted};
+use apollo_optimizer::engine::nested_learner::NestedLearner;
 use apollo_optimizer::engine::workload_classifier::WorkloadMode;
 
 /// Run all per-cycle learning pipeline work.
@@ -64,6 +65,7 @@ use apollo_optimizer::engine::workload_classifier::WorkloadMode;
 /// - `ls_path` — filesystem path for unified learned state
 /// - `persist_generations` — generation counter passed to `LearnedState::persist_improved`
 /// - `skills_path` — filesystem path for optimization skills
+/// - `nested_learner` — L0/L1/L2 hierarchy coordinator (context flow gating)
 #[allow(clippy::too_many_arguments)]
 pub fn run_learning_tick<'a>(
     snapshot: &SystemSnapshot,
@@ -90,6 +92,7 @@ pub fn run_learning_tick<'a>(
     ls_path: &str,
     persist_generations: u32,
     skills_path: &str,
+    nested_learner: &mut NestedLearner,
 ) {
     // ── Arousal EMA: update every cycle from current pressure + swap ─────────
     // p_oom_est ∈ [0,1]: proxy for OOM risk derived from pressure above 0.70.
@@ -100,6 +103,16 @@ pub fn run_learning_tick<'a>(
         let p_oom_est = ((mem_pressure - 0.70) / 0.30).clamp(0.0, 1.0);
         let cycle_salience = Salience::compute(mem_pressure, 0.0, p_oom_est, swap_gb);
         arousal_state.update(cycle_salience);
+    }
+
+    // ── NestedLearner L0: per-cycle signal quality tick ─────────────────────
+    // [Google Nested Learning 2025] L0 updates every cycle; gates L1 updates.
+    // Signal quality = fluidity_score × (1 - transformer_anomaly × 0.5).
+    // High fluidity + low anomaly → signal is trustworthy → L1 gate opens.
+    {
+        let signal_quality = (signal_digest.fluidity_score as f64)
+            * (1.0 - (signal_digest.transformer_anomaly * 0.5).clamp(0.0, 1.0));
+        nested_learner.tick_l0(signal_quality);
     }
 
     // ── Outcome tracking: record throttled processes ─────────────────────────
@@ -414,6 +427,18 @@ pub fn run_learning_tick<'a>(
                 workload: workload_mode.as_str().to_string(),
                 cycle: cycle_count,
             };
+            // NestedLearner L1: tick per resolved outcome.
+            // Effectiveness = normalized pressure drop (0.3 drop → 1.0 effective).
+            // Context flow: L0 quality weights how much this outcome shifts L1 aggregate.
+            {
+                let effectiveness =
+                    ((pre_pressure - post_pressure) / 0.30).clamp(0.0, 1.0);
+                if nested_learner.tick_l1(effectiveness) {
+                    let _l2_ctx = nested_learner.flush_l2();
+                    // L2 context wired to meta-learning in a follow-up iteration.
+                }
+            }
+
             learning_pipeline.push(
                 obs,
                 lctx.outcome_tracker,

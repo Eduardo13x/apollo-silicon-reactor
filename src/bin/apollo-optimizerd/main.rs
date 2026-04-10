@@ -836,6 +836,7 @@ fn main() -> anyhow::Result<()> {
                 mut energy_pid_tracker,
                 mut cycle_ipc_tracker,
             } = daemon_init::DaemonSubsystems::new();
+            let mut nested_learner = apollo_optimizer::engine::nested_learner::NestedLearner::new();
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
             // TelemetryLogger: ring-buffer collection for time-series training data.
             // [Welch 1967, Tuli et al. 2022] — event-triggered dumps capture pre-anomaly context.
@@ -6062,6 +6063,7 @@ fn main() -> anyhow::Result<()> {
                         ls_path.to_str().unwrap_or(""),
                         persist_generations,
                         skills_path(),
+                        &mut nested_learner,
                     );
                     // Apply ws_spike_threshold / fluidity_degraded_threshold from LearnableParams.
                     // Keeps fluidity detection calibrated with learned values.
