@@ -712,6 +712,19 @@ pub fn run_learning_tick<'a>(
                 lctx.causal_graph.solid_edges().len()
             );
         }
+        // NestedLearner observability: log L0/L1/L2 state every 100 cycles.
+        {
+            let nd = nested_learner.diagnostics();
+            println!(
+                "nested_learner: l0_quality={:.3} gate={} l1_agg={:.3} l2_ctx={:.3} l1_total={} l2_total={}",
+                nd.l0_quality,
+                if nd.l1_gate_open { "open" } else { "closed" },
+                nd.l1_aggregate,
+                nd.l2_context,
+                nd.l1_total,
+                nd.l2_total,
+            );
+        }
         // Persist optimization skills (Hermes pattern).
         lctx.skill_registry
             .persist(std::path::Path::new(skills_path));
