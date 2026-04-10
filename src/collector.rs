@@ -82,8 +82,6 @@ pub struct SystemCollector {
     networks: Networks,
     prev_swap_used_bytes: Option<u64>,
     prev_swap_at: Option<Instant>,
-    /// Tracks whether refresh_processes has ever hung (>5s).
-    pub process_refresh_hung: bool,
     /// Number of process refresh cycles skipped (startup grace).
     pub process_refresh_skip_count: u32,
     /// Light call count (cycles since creation, for startup grace period).
@@ -116,7 +114,6 @@ impl SystemCollector {
             networks,
             prev_swap_used_bytes: None,
             prev_swap_at: None,
-            process_refresh_hung: false,
             process_refresh_skip_count: 0,
             light_call_count: 0,
             compressor_ema: 0.0,
@@ -716,7 +713,6 @@ mod tests {
     fn system_collector_new_does_not_panic() {
         // Verifies that initialization (including refresh_processes) completes.
         let collector = SystemCollector::new();
-        assert!(!collector.process_refresh_hung);
         assert_eq!(collector.light_call_count, 0);
     }
 

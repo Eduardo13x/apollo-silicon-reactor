@@ -1428,6 +1428,45 @@ mod tests {
         }
     }
 
+    // ── cross-module protection invariants ──────────────────────────────────
+    // Graph audit (2026-04-10): graphify detected `protected_processes()` and
+    // `INTERACTIVE_APPS` as semantically similar. They are intentionally separate
+    // (OS daemons vs user apps) but must remain disjoint and both must cover
+    // the CLAUDE.md mandatory set. [Lampson 1974] "Use a single source of
+    // truth for protection policy. Multiple tables that should agree will
+    // eventually diverge." — this test is the drift-detection mechanism.
+    #[test]
+    fn interactive_apps_disjoint_from_os_protected_processes() {
+        use crate::engine::safety::protected_processes;
+        let hard = protected_processes();
+        // INTERACTIVE_APPS are user-facing app names matched via substring.
+        // None of the exact strings should also appear in the OS hard-protected
+        // set — that would signal a drift where an OS daemon crept into the
+        // user-app list (or vice versa).
+        for app in &INTERACTIVE_APPS {
+            assert!(
+                !hard.contains(app),
+                "'{}' appears in both INTERACTIVE_APPS and protected_processes() — \
+                 these lists must stay disjoint (OS daemons vs user apps)",
+                app
+            );
+        }
+    }
+
+    #[test]
+    fn claude_md_invariants_covered_by_interactive_apps() {
+        // CLAUDE.md: "Nunca throttlear/congelar: Antigravity, Claude, Brave, rustc/cargo"
+        // User-facing AI/browser apps must be in INTERACTIVE_APPS.
+        // (rustc/cargo are covered by build-mode detection, not INTERACTIVE_APPS.)
+        for name in &["Antigravity", "Claude", "Brave"] {
+            assert!(
+                is_interactive_base(name),
+                "CLAUDE.md invariant violated: '{}' must be in INTERACTIVE_APPS",
+                name
+            );
+        }
+    }
+
     #[test]
     fn noise_apps_detected() {
         assert!(is_background_noise_base("Dropbox"));
