@@ -2,7 +2,7 @@ use std::fs::{self, create_dir_all, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
-use crate::engine::types::JournalEntry;
+use crate::engine::types::{HardPath, JournalEntry};
 
 /// Maximum journal size before rotation (10 MB).
 const MAX_JOURNAL_BYTES: u64 = 10 * 1024 * 1024;
@@ -37,17 +37,10 @@ pub fn append_journal_batch(path: &Path, entries: &[JournalEntry]) -> anyhow::Re
         return Ok(());
     }
 
-    // Symlink protection: refuse to write through symlinks
-    if path.exists() {
-        if let Ok(meta) = fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() {
-                anyhow::bail!(
-                    "journal path {} is a symlink — refusing to write",
-                    path.display()
-                );
-            }
-        }
-    }
+    // Symlink protection: refuse to write through symlinks (TOCTOU guard).
+    // [Lampson 1974] "Use the centralized security utility rather than
+    // re-implementing symlink checks at each write site."
+    HardPath::verify_no_symlink(path)?;
 
     if let Some(parent) = path.parent() {
         // Verify parent is not a symlink
