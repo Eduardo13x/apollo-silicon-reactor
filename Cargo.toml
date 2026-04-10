@@ -31,6 +31,12 @@ winit = "0.29"
 cocoa = "0.25"
 objc = "0.2"
 
+# Test profile: optimize daemon binary so e2e throughput benchmarks reflect
+# production-like performance rather than debug-build overhead.
+# debug-assertions remain enabled (default for test profile).
+[profile.test]
+opt-level = 2
+
 # Perfil rapido para el menubar (sin LTO, compila en segundos)
 [profile.menubar]
 inherits = "release"
