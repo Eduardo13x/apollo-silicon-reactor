@@ -6327,7 +6327,10 @@ fn main() -> anyhow::Result<()> {
                 lf_metrics.commit();
                 // Reactive: condvar.wait_timeout instead of thread::sleep.
                 // Wakes immediately on reactor events; otherwise max 500ms (fast) or 2s (idle).
-                let wait_duration = if fast {
+                // In dry-run mode, use 100ms to maximize cycle throughput for benchmarks.
+                let wait_duration = if dry_run {
+                    Duration::from_millis(100)
+                } else if fast {
                     Duration::from_millis(500)
                 } else {
                     Duration::from_secs(2)
