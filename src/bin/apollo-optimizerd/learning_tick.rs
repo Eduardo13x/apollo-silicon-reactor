@@ -428,11 +428,14 @@ pub fn run_learning_tick<'a>(
                 cycle: cycle_count,
             };
             // NestedLearner L1: tick per resolved outcome.
-            // Effectiveness = normalized pressure drop (0.3 drop → 1.0 effective).
+            // Effectiveness = normalized pressure drop (0.05 drop → 1.0 effective).
+            // Calibrated to macOS: outcome_effective_threshold=0.01 (1%), typical drops
+            // are 1-5%. The 0.30 scale was too coarse — production data showed l1_agg≈0.026
+            // with 24 outcomes, indicating nearly all effective outcomes were below 3%.
             // Context flow: L0 quality weights how much this outcome shifts L1 aggregate.
             {
                 let effectiveness =
-                    ((pre_pressure - post_pressure) / 0.30).clamp(0.0, 1.0);
+                    ((pre_pressure - post_pressure) / 0.05).clamp(0.0, 1.0);
                 if nested_learner.tick_l1(effectiveness) {
                     nested_learner.flush_l2();
                 }
