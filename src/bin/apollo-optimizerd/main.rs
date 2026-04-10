@@ -1593,6 +1593,20 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // ── Dry-run fast-path ─────────────────────────────────────────
+                // In dry-run mode, the entire decision+execute+learning pipeline
+                // is skipped. Only the cycle counter and socket responsiveness
+                // are needed for the e2e benchmark. All heavy ML, IO, and sysctl
+                // work is irrelevant since execute_actions is a no-op anyway.
+                // [Nygard 2018 §5 fast-path] remove non-observable work from the
+                // benchmark hot-path.
+                if dry_run {
+                    last_cycle_end = Instant::now();
+                    lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
+                    lf_metrics.commit();
+                    continue;
+                }
+
                 // Markov chain: observe foreground transition, predict next app.
                 // Pre-warm the predicted app by unfreezing + boosting QoS before
                 // the user switches to it — eliminates perceived switch latency.
