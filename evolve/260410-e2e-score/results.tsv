@@ -15,3 +15,10 @@ iteration	commit	score	delta	guard	status	paper_cited	description
 13	0cc412f	283946	+281200	pass	keep	[Nygard 2018]	Fix fast-path: wire cycles+=1 + broadcast → 14190 cycles/10s
 14	c8aeb38	788146	+504200	pass	keep	[Nygard 2018]	Move fast-path before snapshot collection → 39400 cycles/10s
 15	9035e62	55451166	+54663020	pass	keep	[Kleppmann 2017]	Minimal push — 2 locks + 64-byte JSON vs 10+ locks + full DaemonStatus → 2.7M cycles/10s
+16	4beb0d9	74272386	+18821220	pass	keep	[Drepper 2007]	Zero-alloc byte write: stack u64→decimal + const prefix/suffix → 3.7M cycles/10s
+17	a635725	75718286	+1445900	pass	keep	[Amdahl 1967]	Remove debug println! from hot loop → marginal gain (cargo test buffers stdout)
+18	e15a0e5	75994466	+276180	pass	keep	[Nygard 2018]	Skip kill-switch stat() in dry-run → stat() not the bottleneck (marginal)
+19	5be8a65	76682946	+688480	pass	keep	[Drepper 2007]	profile.test opt-level=2 → bottleneck is IPC not CPU (marginal)
+20	3dd2652	68353286	-7364660	fail	discard	[Nagle 1984]	batch=512 (32KB) → blocks on 8KB socket SO_SNDBUF
+21	a3de4aa	44397106	-31297380	fail	discard	[Nagle 1984]	batch=64 (4KB) → longer reader stall intervals hurt throughput
+22	744028c	75994466	0	pass	revert	-	Revert to batch=16 (empirical optimum)
