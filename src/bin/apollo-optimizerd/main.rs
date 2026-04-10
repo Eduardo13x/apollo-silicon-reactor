@@ -1527,8 +1527,12 @@ fn main() -> anyhow::Result<()> {
                 // network monitor and sysctl governor read directly from sysctl/netstat.
                 // Dropping the pressure gate removes ~15-25ms of disk/net I/O at 0.70+ pressure
                 // where the old 0.40 threshold never fired anyway.
+                // In dry-run mode, skip refresh_processes() entirely (reuse cached list)
+                // since actions are no-ops; saves ~50-100ms of sysinfo overhead per cycle.
                 let use_light = cycle_count % 30 != 0;
-                let mut snapshot = if use_light {
+                let mut snapshot = if dry_run && use_light {
+                    collector.collect_snapshot_no_process_refresh()
+                } else if use_light {
                     collector.collect_snapshot_light()
                 } else {
                     collector.collect_snapshot()
