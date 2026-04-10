@@ -1362,11 +1362,10 @@ fn main() -> anyhow::Result<()> {
                     // Minimal push batched for fewer write() syscalls.
                     // [Kleppmann 2017 DDIA §9] minimal state + [Nagle-style batching]
                     // accumulate DRY_RUN_BATCH_SIZE messages then flush in one write.
-                    let cycles = {
-                        let mut m = state.metrics.lock_recover();
-                        m.metrics.cycles += 1;
-                        m.metrics.cycles
-                    };
+                    // lf_metrics.inc_cycles() was already called at top of loop — read
+                    // the atomic counter directly, no mutex needed.
+                    // [Mara Bos 2022 Rust Atomics] eliminate lock in hot-path.
+                    let cycles = lf_metrics.cycles.load(std::sync::atomic::Ordering::Relaxed);
                     {
                         use std::io::Write as _;
                         dry_run_push_buf.clear();
