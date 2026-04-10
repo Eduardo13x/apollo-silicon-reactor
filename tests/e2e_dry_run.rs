@@ -366,20 +366,28 @@ fn e2e_socket_flood_33_rejected_gracefully() {
     let guard = spawn_daemon_guard();
     let socket = guard.socket.clone();
 
-    // Open 33 connections — one over the MAX_CONCURRENT_CLIENTS limit.
-    let handles: Vec<_> = (0..33)
-        .map(|_| {
-            let s = socket.clone();
-            std::thread::spawn(move || try_send_request(&s, r#"{"type":"GetStatus"}"#))
-        })
+    // [Lamport 1978] happened-before: 32 connections must be HELD OPEN before
+    // the 33rd attempts. Concurrent racing allows fast connections to complete
+    // before the limit is reached, making the test unreliable.
+    //
+    // Strategy: connect 32 streams without sending anything. handle_client()
+    // blocks on read_line() with a 5s timeout — so these 32 slots stay occupied.
+    // After a short drain, the daemon has accepted all 32 (active_clients == 32).
+    // The 33rd connection then hits the limit and gets dropped.
+    let held: Vec<UnixStream> = (0..32)
+        .filter_map(|_| UnixStream::connect(&socket).ok())
         .collect();
 
-    let results: Vec<_> = handles.into_iter().map(|h| h.join().ok().flatten()).collect();
-    let ok_count = results.iter().filter(|r| r.is_some()).count();
-    let err_count = 33 - ok_count;
+    // Let daemon's accept() loop drain the OS backlog (32 → active_clients == 32).
+    std::thread::sleep(Duration::from_millis(200));
 
-    // At least one must be rejected, but daemon must survive.
-    assert!(err_count >= 1, "at least one request must be rejected when over the client limit");
+    // 33rd attempt — must be rejected (stream accepted then immediately dropped by daemon).
+    let rejected = try_send_request(&socket, r#"{"type":"GetStatus"}"#).is_none();
+
+    // Release held connections so daemon frees the slots.
+    drop(held);
+
+    assert!(rejected, "33rd connection must be rejected when 32 are held open");
 
     // After the flood: daemon must still serve requests normally.
     std::thread::sleep(Duration::from_millis(500));
