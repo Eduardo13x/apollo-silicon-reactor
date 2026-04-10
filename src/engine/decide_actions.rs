@@ -343,11 +343,12 @@ pub fn decide_actions(
     // raise the throttle aggressiveness floor when the system is
     // CPU-starved at the system level.
     //
-    // Threshold 0.5: half of tracked pids in starvation territory means
-    // the system is meaningfully contended, not transient noise.
+    // Threshold 0.85: vast majority must be starved. Original 0.5 was
+    // too permissive on 8GB M1 — normal multitasking triggers it,
+    // causing aggressive throttle every cycle → system freeze.
     let system_cpu_stalled = crate::engine::contention_tracker::global()
         .lock()
-        .map(|t| t.stall_fraction(0.85) >= 0.5)
+        .map(|t| t.stall_fraction(0.85) >= 0.85)
         .unwrap_or(false);
 
     // Build closures that merge hardcoded lists with the learned policy.

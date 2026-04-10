@@ -44,8 +44,13 @@ pub const N_FEATURES: usize = 16;
 /// recommend ≥30s of context; we store 120s for richer temporal patterns).
 const RING_CAPACITY: usize = 240;
 
-/// Periodic dump interval in cycles.  1200 × 500ms = 10 minutes.
-const PERIODIC_INTERVAL: u64 = 1200;
+/// Periodic dump interval in cycles.  3600 × 500ms = 30 minutes.
+/// Raised from 1200 after crash report showed 8.6 GB disk writes in 9h.
+const PERIODIC_INTERVAL: u64 = 3600;
+
+/// Minimum cycles between event-triggered dumps.  600 × 500ms = 5 minutes.
+/// Raised from 120 (60s) — sustained p_oom>0.6 on 8GB fires continuously.
+const EVENT_COOLDOWN_CYCLES: u64 = 600;
 
 /// File header magic: "APOL" in little-endian.
 const MAGIC: u32 = 0x41504F4C;
@@ -144,6 +149,8 @@ pub struct TelemetryLogger {
     ring: VecDeque<TelemetryVector>,
     output_dir: PathBuf,
     cycle_count: u64,
+    /// Cycle at which the last event-triggered dump occurred.
+    last_event_dump_cycle: u64,
     /// Whether logging is enabled (can be toggled at runtime).
     enabled: bool,
 }
@@ -155,6 +162,7 @@ impl TelemetryLogger {
             ring: VecDeque::with_capacity(RING_CAPACITY),
             output_dir,
             cycle_count: 0,
+            last_event_dump_cycle: 0,
             enabled: true,
         }
     }
@@ -179,13 +187,16 @@ impl TelemetryLogger {
             return None;
         }
 
-        // Check event triggers (Tuli et al. 2022 — event-triggered dumps
-        // capture pre-anomaly context for anomaly detection training).
-        let kind = if vec.p_oom_30s > 0.6 {
+        // Check event triggers with cooldown to prevent I/O saturation.
+        let event_cooldown_ok = self.last_event_dump_cycle == 0
+            || self.cycle_count.saturating_sub(self.last_event_dump_cycle)
+                >= EVENT_COOLDOWN_CYCLES;
+
+        let kind = if vec.p_oom_30s > 0.6 && event_cooldown_ok {
             DumpKind::OomRisk
-        } else if vec.urgency > 0.8 {
+        } else if vec.urgency > 0.8 && event_cooldown_ok {
             DumpKind::Urgency
-        } else if vec.latency_score > 0.7 {
+        } else if vec.latency_score > 0.7 && event_cooldown_ok {
             DumpKind::Latency
         } else if self.cycle_count % PERIODIC_INTERVAL == 0 {
             DumpKind::Periodic
@@ -196,6 +207,10 @@ impl TelemetryLogger {
         // Best-effort dump: if it fails, we don't crash the daemon.
         if let Err(e) = self.dump(kind) {
             eprintln!("[telemetry] dump failed: {e}");
+        }
+
+        if !matches!(kind, DumpKind::Periodic) {
+            self.last_event_dump_cycle = self.cycle_count;
         }
 
         Some(kind)
