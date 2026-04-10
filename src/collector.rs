@@ -344,6 +344,91 @@ impl SystemCollector {
             top_processes,
         }
     }
+
+    /// Like `collect_snapshot_light()` but skips `refresh_processes()`,
+    /// reusing the cached process list from the previous cycle.
+    ///
+    /// Safe in dry-run mode only: `execute_actions()` is a no-op so stale
+    /// process data never reaches OS-mutating calls. Eliminates the dominant
+    /// per-cycle cost (~50-100ms sysinfo process enumeration on macOS).
+    pub fn collect_snapshot_no_process_refresh(&mut self) -> SystemSnapshot {
+        self.sys.refresh_cpu();
+        self.sys.refresh_memory();
+        // Intentionally no refresh_processes() — reuse cached list.
+
+        let global_cpu = self.sys.global_cpu_info().cpu_usage();
+        let core_count = self.sys.cpus().len();
+
+        let total_ram = self.sys.total_memory();
+        let used_ram = self.sys.used_memory();
+        let free_ram = self.sys.free_memory();
+        let total_swap = self.sys.total_swap();
+        let used_swap = self.sys.used_swap();
+
+        let (_, swap_used_bytes, swap_total_bytes, compressor_pressure_raw, kernel_pressure) =
+            collect_pressure_facts();
+        let alpha = 0.25f64;
+        let compressor_pressure =
+            self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
+        self.compressor_ema = compressor_pressure;
+        let mem_pressure = kernel_pressure.max(compressor_pressure);
+        let nowi = Instant::now();
+        let swap_delta_bps = match (self.prev_swap_used_bytes, self.prev_swap_at) {
+            (Some(prev_used), Some(prev_at)) => {
+                let dt = nowi.duration_since(prev_at).as_secs_f64().max(0.001);
+                (swap_used_bytes as i64 - prev_used as i64) as f64 / dt
+            }
+            _ => 0.0,
+        };
+        self.prev_swap_used_bytes = Some(swap_used_bytes);
+        self.prev_swap_at = Some(nowi);
+
+        let mut processes: Vec<ProcessStats> = self
+            .sys
+            .processes()
+            .iter()
+            .map(|(pid, process)| ProcessStats {
+                pid: pid.as_u32(),
+                name: process.name().to_string(),
+                cpu_usage: process.cpu_usage(),
+                memory_usage: process.memory(),
+                cpu_wall_ratio: None,
+            })
+            .collect();
+        processes.sort_by(|a, b| {
+            b.cpu_usage
+                .partial_cmp(&a.cpu_usage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let top_processes = processes.into_iter().take(10).collect();
+
+        SystemSnapshot {
+            timestamp: chrono::Utc::now(),
+            cpu: CpuStats {
+                global_usage: global_cpu,
+                core_count,
+            },
+            memory: MemoryStats {
+                total_ram,
+                used_ram,
+                free_ram,
+                total_swap,
+                used_swap,
+            },
+            pressure: PressureStats {
+                memory_pressure: mem_pressure,
+                swap_used_bytes,
+                swap_total_bytes,
+                swap_delta_bytes_per_sec: swap_delta_bps,
+                thermal_level: "unknown".to_string(),
+                compressor_pressure,
+                thrashing_score: 0.0,
+            },
+            disks: vec![],
+            networks: vec![],
+            top_processes,
+        }
+    }
 }
 
 /// Read a u64 sysctl value directly via libc — no subprocess, ~200 ns.

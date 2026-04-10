@@ -1528,7 +1528,12 @@ fn main() -> anyhow::Result<()> {
                 // Dropping the pressure gate removes ~15-25ms of disk/net I/O at 0.70+ pressure
                 // where the old 0.40 threshold never fired anyway.
                 let use_light = cycle_count % 30 != 0;
-                let mut snapshot = if use_light {
+                let mut snapshot = if dry_run && use_light {
+                    // In dry-run, skip refresh_processes() — stale process list is
+                    // harmless when execute_actions() is a no-op. Removes the dominant
+                    // per-cycle cost (~50-100ms sysinfo process enumeration).
+                    collector.collect_snapshot_no_process_refresh()
+                } else if use_light {
                     collector.collect_snapshot_light()
                 } else {
                     collector.collect_snapshot()
