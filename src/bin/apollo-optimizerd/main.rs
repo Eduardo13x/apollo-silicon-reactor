@@ -1214,6 +1214,10 @@ fn main() -> anyhow::Result<()> {
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
             // Pre-allocated push buffer for dry_run fast-path (avoids per-cycle allocation).
             let mut dry_run_push_buf = String::with_capacity(128);
+            // Batch buffer: accumulate N push messages before a single write syscall.
+            let mut dry_run_batch: Vec<u8> = Vec::with_capacity(1024);
+            let mut dry_run_batch_count: u32 = 0;
+            const DRY_RUN_BATCH_SIZE: u32 = 16;
             // Gate network_monitor.tick() to every ~10s since netstat is blocking.
             let mut last_netstat_tick = Instant::now() - Duration::from_secs(10);
             // Context-switch burst detector (TDA-aware).
@@ -1355,10 +1359,9 @@ fn main() -> anyhow::Result<()> {
                 // Eliminates refresh_cpu+refresh_memory+fg_detect from hot-path.
                 // [Nygard 2018 §5] remove all non-observable work from test path.
                 if dry_run {
-                    // Minimal push: avoids building the full DaemonStatus (10+ locks +
-                    // JSON serialization of large struct). Only cycles field needed for
-                    // e2e_cycles_increment; e2e_score just counts messages with "payload".
-                    // [Kleppmann 2017 DDIA §9] minimal observable state over the wire.
+                    // Minimal push batched for fewer write() syscalls.
+                    // [Kleppmann 2017 DDIA §9] minimal state + [Nagle-style batching]
+                    // accumulate DRY_RUN_BATCH_SIZE messages then flush in one write.
                     let cycles = {
                         let mut m = state.metrics.lock_recover();
                         m.metrics.cycles += 1;
@@ -1372,10 +1375,18 @@ fn main() -> anyhow::Result<()> {
                             format_args!(r#"{{"type":"StatusPush","payload":{{"metrics":{{"cycles":{}}}}}}}"#, cycles),
                         )
                         .ok();
-                        state
-                            .subscribers
-                            .lock_recover()
-                            .retain_mut(|stream| writeln!(stream, "{}", dry_run_push_buf).is_ok());
+                        dry_run_batch.extend_from_slice(dry_run_push_buf.as_bytes());
+                        dry_run_batch.push(b'\n');
+                        dry_run_batch_count += 1;
+                        if dry_run_batch_count >= DRY_RUN_BATCH_SIZE {
+                            let batch = &dry_run_batch;
+                            state
+                                .subscribers
+                                .lock_recover()
+                                .retain_mut(|stream| stream.write_all(batch).is_ok());
+                            dry_run_batch.clear();
+                            dry_run_batch_count = 0;
+                        }
                     }
                     last_cycle_end = Instant::now();
                     lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
