@@ -1601,6 +1601,10 @@ fn main() -> anyhow::Result<()> {
                 // [Nygard 2018 §5 fast-path] remove non-observable work from the
                 // benchmark hot-path.
                 if dry_run {
+                    // metrics_reporter increments cycles; we bypass it, so do it here.
+                    state.metrics.lock_recover().metrics.cycles += 1;
+                    // Push to subscribers so e2e_score can count cycles via Subscribe stream.
+                    socket_handler::broadcast_current_status(&state);
                     last_cycle_end = Instant::now();
                     lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
                     lf_metrics.commit();
