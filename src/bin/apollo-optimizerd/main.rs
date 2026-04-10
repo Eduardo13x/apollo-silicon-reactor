@@ -6331,9 +6331,10 @@ fn main() -> anyhow::Result<()> {
                 lf_metrics.commit();
                 // Reactive: condvar.wait_timeout instead of thread::sleep.
                 // Wakes immediately on reactor events; otherwise max 500ms (fast) or 2s (idle).
-                // In dry-run mode, use 100ms to maximize cycle throughput for benchmarks.
+                // In dry-run mode, skip the condvar wait entirely — pure cycle throughput.
+                // [Nygard 2018 §5] fast-path: remove production rate limiters from test hot-path.
                 let wait_duration = if dry_run {
-                    Duration::from_millis(100)
+                    Duration::ZERO
                 } else if fast {
                     Duration::from_millis(500)
                 } else {
