@@ -5778,6 +5778,32 @@ fn main() -> anyhow::Result<()> {
                         final_actions
                     };
 
+                    // Dedup: skip ThrottleProcess for PIDs already throttled last cycle.
+                    // Without this, decide_actions re-throttles 30+ PIDs every cycle,
+                    // each producing a journal write → I/O saturation → system freeze.
+                    let filtered_actions = {
+                        use std::sync::Mutex;
+                        static PREV_THROTTLED: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+                        let prev = PREV_THROTTLED.lock().unwrap_or_else(|e| e.into_inner());
+                        let prev_set = prev.clone().unwrap_or_default();
+                        drop(prev);
+                        let mut this_cycle = HashSet::new();
+                        let deduped: Vec<RootAction> = filtered_actions
+                            .into_iter()
+                            .filter(|a| {
+                                if let RootAction::ThrottleProcess { pid, .. } = a {
+                                    this_cycle.insert(*pid);
+                                    !prev_set.contains(pid)
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect();
+                        *PREV_THROTTLED.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(this_cycle);
+                        deduped
+                    };
+
                     // Extract a temporary HashSet for execute_actions (which requires &mut HashSet<u32>).
                     let mut frozen_set: HashSet<u32> =
                         state.frozen_state.lock_recover().keys().copied().collect();
