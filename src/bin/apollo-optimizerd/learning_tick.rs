@@ -434,8 +434,7 @@ pub fn run_learning_tick<'a>(
                 let effectiveness =
                     ((pre_pressure - post_pressure) / 0.30).clamp(0.0, 1.0);
                 if nested_learner.tick_l1(effectiveness) {
-                    let _l2_ctx = nested_learner.flush_l2();
-                    // L2 context wired to meta-learning in a follow-up iteration.
+                    nested_learner.flush_l2();
                 }
             }
 
@@ -579,8 +578,15 @@ pub fn run_learning_tick<'a>(
     // stuck (velocity low + effectiveness falling → explore more) or converged
     // (velocity low + effectiveness stable → slow down).
     // Safety: only adjusts rates, never safety thresholds. All clamped.
+    //
+    // NestedLearner L2 context flow: [Google Nested Learning 2025]
+    // Blend raw effectiveness with L2 context (L0-quality-weighted outcome aggregate).
+    // High l2_context (clean signal + effective outcomes) → confidence in effectiveness.
+    // Low l2_context (noisy signal or poor outcomes) → meta_learn sees lower signal.
+    // This is the downward context flow: outer L2 informs inner L0/L1 learning rates.
     if cycle_count % 500 == 250 {
-        let effectiveness = lctx.outcome_tracker.overall_effectiveness();
+        let raw_effectiveness = lctx.outcome_tracker.overall_effectiveness();
+        let effectiveness = 0.70 * raw_effectiveness + 0.30 * nested_learner.l2_context;
         // Compute param delta as proxy for velocity: zone alpha change rate
         let zone_delta = (signal_digest.pressure_smooth
             - lctx.signal_intel.effective_zones(0).0)
