@@ -63,6 +63,7 @@ pub mod meta_cognition;
 pub mod mpc_horizon;
 pub mod nars_belief;
 pub mod neon_ema;
+pub mod nested_learner;
 pub mod network_monitor;
 pub mod network_optimizer;
 pub mod neuromodulator;
