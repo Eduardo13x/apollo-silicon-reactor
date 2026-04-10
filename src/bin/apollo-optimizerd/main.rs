@@ -1292,7 +1292,6 @@ fn main() -> anyhow::Result<()> {
 
                 cycle_count += 1;
                 lf_metrics.inc_cycles();
-                println!(">>> Daemon cycle: {}", cycle_count);
 
                 // ── Feature 4: Post-Wake Suppression ─────────────────────────
                 // If more than 30s passed since the last cycle, the system was
