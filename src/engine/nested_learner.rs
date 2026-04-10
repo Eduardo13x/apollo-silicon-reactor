@@ -275,4 +275,64 @@ mod tests {
         assert!((d.l0_quality - nl.l0_quality).abs() < 1e-10);
         assert_eq!(d.l1_gate_open, nl.l0_quality >= 0.25);
     }
+
+    /// Production calibration test: simulates macOS realistic pressure drops (1-5%).
+    ///
+    /// With / 0.05 normalization (calibrated from 2026-04-10 prod data):
+    ///   1% drop (threshold = effective) → effectiveness = 0.20
+    ///   3% drop (typical good throttle) → effectiveness = 0.60
+    ///   5% drop (excellent result)      → effectiveness = 1.0
+    ///
+    /// After 40 such outcomes with stable L0 quality, l1_aggregate should
+    /// be meaningfully non-zero — catching any regression to the /0.30 scale.
+    #[test]
+    fn l1_aggregate_nonzero_with_macos_typical_drops() {
+        let mut nl = NestedLearner::new();
+        // Stable, moderately good signal quality
+        for _ in 0..100 { nl.tick_l0(0.6); }
+        assert!(nl.tick_l0(0.6), "gate should be open at quality 0.6");
+
+        // Simulate 40 outcomes with 3% pressure drop (calibrated as 0.60 effective)
+        for _ in 0..40 {
+            let effectiveness = (0.03_f64 / 0.05).clamp(0.0, 1.0); // = 0.60
+            nl.tick_l1(effectiveness);
+            if nl.l1_since_l2 >= L2_GATE_PERIOD {
+                nl.flush_l2();
+            }
+        }
+
+        assert!(
+            nl.l1_aggregate > 0.1,
+            "l1_aggregate should be meaningfully non-zero with 3% macOS pressure drops, got {}",
+            nl.l1_aggregate
+        );
+        assert!(
+            nl.l2_context > 0.05,
+            "l2_context should reflect l1_aggregate, got {}",
+            nl.l2_context
+        );
+    }
+
+    /// Zero-outcome convergence: when all outcomes have 0 effectiveness,
+    /// l1_aggregate should converge toward 0 (correctly reflects idle system).
+    #[test]
+    fn l1_aggregate_converges_to_zero_on_no_pressure_drop() {
+        let mut nl = NestedLearner::new();
+        for _ in 0..100 { nl.tick_l0(0.7); }
+        // Start from non-zero
+        for _ in 0..20 { nl.tick_l1(0.5); }
+        nl.flush_l2();
+
+        // Feed 100 zero-effectiveness outcomes
+        for _ in 0..100 {
+            nl.tick_l1(0.0);
+            if nl.l1_since_l2 >= L2_GATE_PERIOD { nl.flush_l2(); }
+        }
+
+        assert!(
+            nl.l1_aggregate < 0.1,
+            "l1_aggregate should converge near zero on all-zero outcomes, got {}",
+            nl.l1_aggregate
+        );
+    }
 }

@@ -957,6 +957,7 @@ mod tests {
             causal_graph_edges: None,
             process_baselines: None,
             learnable_params: None,
+            nested_learner: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -984,6 +985,7 @@ mod tests {
             causal_graph_edges: None,
             process_baselines: None,
             learnable_params: None,
+            nested_learner: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1009,6 +1011,7 @@ mod tests {
             causal_graph_edges: None,
             process_baselines: None,
             learnable_params: None,
+            nested_learner: None,
         };
         assert_eq!(
             state
@@ -1053,6 +1056,7 @@ mod tests {
             causal_graph_edges: None,
             process_baselines: None,
             learnable_params: None,
+            nested_learner: None,
         };
         state.self_improve();
         assert_eq!(
@@ -1091,6 +1095,7 @@ mod tests {
             causal_graph_edges: None,
             process_baselines: None,
             learnable_params: None,
+            nested_learner: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -1132,6 +1137,7 @@ mod tests {
             causal_graph_edges: None,
             process_baselines: None,
             learnable_params: None,
+            nested_learner: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
