@@ -1213,11 +1213,12 @@ fn main() -> anyhow::Result<()> {
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
             // Batch buffer: accumulate N push messages before a single write syscall.
-            // 512 messages × ~64 bytes = ~32KB per flush → well under 128KB socket send
-            // buffer, so write_all never blocks. Amortizes mutex+write overhead 512x.
-            let mut dry_run_batch: Vec<u8> = Vec::with_capacity(512 * 80);
+            // macOS Unix socket SO_SNDBUF = 8192 bytes. Keep batch under 8KB (128 msgs)
+            // so write_all never blocks waiting for receiver drain.
+            // [Nagle 1984] batch to reduce syscall overhead without causing blocking.
+            let mut dry_run_batch: Vec<u8> = Vec::with_capacity(64 * 80);
             let mut dry_run_batch_count: u32 = 0;
-            const DRY_RUN_BATCH_SIZE: u32 = 512;
+            const DRY_RUN_BATCH_SIZE: u32 = 64;
             // Gate network_monitor.tick() to every ~10s since netstat is blocking.
             let mut last_netstat_tick = Instant::now() - Duration::from_secs(10);
             // Context-switch burst detector (TDA-aware).
