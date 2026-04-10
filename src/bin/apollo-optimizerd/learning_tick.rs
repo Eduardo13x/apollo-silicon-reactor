@@ -699,6 +699,7 @@ pub fn run_learning_tick<'a>(
             Some(lctx.causal_graph),
             None, // process_baselines: persisted at shutdown via main.rs
             Some(learnable_params.clone()),
+            Some(nested_learner.clone()),
         );
         // Causal graph observability: log solid/weak links discovered.
         let solid = lctx.causal_graph.solid_count();

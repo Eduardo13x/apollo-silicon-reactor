@@ -26,6 +26,7 @@ use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
 use crate::engine::overflow_guard::OverflowHistory;
 use crate::engine::predictive_agent::SpecialistAccuracyTracker;
 use crate::engine::process_baseline::ProcessBaselineMap;
+use crate::engine::nested_learner::NestedLearner;
 use crate::engine::signal_intelligence::{SignalIntelligence, SignalIntelligencePersisted};
 use crate::engine::types::FrozenStatePersisted;
 
@@ -414,6 +415,13 @@ pub struct LearnedState {
     /// `None` on old file format → falls back to `LearnableParams::default()`.
     #[serde(default)]
     pub learnable_params: Option<LearnableParams>,
+
+    /// NestedLearner L0/L1/L2 hierarchy state.
+    /// Persisted so EMA quality signals survive restarts — otherwise the daemon
+    /// cold-starts at 0.5 neutral and needs ~50 cycles to stabilize the L1 gate.
+    /// [Google Nested Learning 2025] — multi-level context flow state.
+    #[serde(default)]
+    pub nested_learner: Option<NestedLearner>,
 }
 
 fn default_version() -> u32 {
@@ -447,6 +455,7 @@ impl LearnedState {
         causal_graph: Option<&CausalGraph>,
         process_baselines: Option<ProcessBaselineMap>,
         learnable_params: Option<LearnableParams>,
+        nested_learner: Option<NestedLearner>,
     ) -> Self {
         Self {
             version: 1,
@@ -464,6 +473,7 @@ impl LearnedState {
             causal_graph_edges: causal_graph.map(|cg| cg.to_persisted()),
             process_baselines,
             learnable_params,
+            nested_learner,
         }
     }
 
@@ -490,6 +500,7 @@ impl LearnedState {
         Option<ArousalState>,
         Option<ProcessBaselineMap>,
         LearnableParams,
+        Option<NestedLearner>,
     ) {
         self.validate();
         if let Some(si) = self.signal_intelligence {
@@ -524,6 +535,7 @@ impl LearnedState {
             self.arousal_state,
             self.process_baselines,
             lp,
+            self.nested_learner,
         )
     }
 
@@ -681,6 +693,7 @@ impl LearnedState {
         causal_graph: Option<&CausalGraph>,
         process_baselines: Option<ProcessBaselineMap>,
         learnable_params: Option<LearnableParams>,
+        nested_learner: Option<NestedLearner>,
     ) {
         let mut state = Self::collect(
             signal_intel,
@@ -694,6 +707,7 @@ impl LearnedState {
             causal_graph,
             process_baselines,
             learnable_params,
+            nested_learner,
         );
         state.persist_generations = prev_generations.saturating_add(1);
         state.last_restore_quality = last_quality;

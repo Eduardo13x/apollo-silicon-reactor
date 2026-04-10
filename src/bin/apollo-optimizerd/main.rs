@@ -993,7 +993,7 @@ fn main() -> anyhow::Result<()> {
                 // If skill_registry field is absent (old file), the legacy load is kept.
                 // Returns (overflow_history, frozen_pids, arousal_state) for
                 // components that need caller-side wiring.
-                let (ls_overflow_history, ls_frozen_pids, ls_arousal, ls_baselines, restored_lp) =
+                let (ls_overflow_history, ls_frozen_pids, ls_arousal, ls_baselines, restored_lp, restored_nl) =
                     learned.apply(
                         &mut signal_intel,
                         &mut outcome_tracker,
@@ -1003,6 +1003,9 @@ fn main() -> anyhow::Result<()> {
                         Some(&mut causal_graph),
                     );
                 learnable_params = restored_lp;
+                if let Some(nl) = restored_nl {
+                    nested_learner = nl;
+                }
                 restored_arousal = ls_arousal;
                 // Restore process baselines — wired into energy_pid_tracker after DaemonSubsystems::new().
                 restored_process_baselines = ls_baselines;
@@ -6463,6 +6466,7 @@ fn main() -> anyhow::Result<()> {
                 Some(&causal_graph),
                 Some(energy_pid_tracker.baseline.clone()),
                 Some(learnable_params.clone()),
+                Some(nested_learner.clone()),
             );
 
             // Revert sysctls to defaults on shutdown.
