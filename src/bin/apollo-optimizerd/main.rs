@@ -1325,7 +1325,10 @@ fn main() -> anyhow::Result<()> {
                     thread::sleep(Duration::from_millis(min_inter_cycle_ms) - since_last);
                 }
 
-                if Path::new(kill_switch_path()).exists() {
+                // In dry-run mode skip the kill-switch stat() syscall — tests never
+                // create the kill-switch file, so this check is pure overhead.
+                // [Nygard 2018 §5] eliminate non-observable work from benchmark path.
+                if !dry_run && Path::new(kill_switch_path()).exists() {
                     // Even when paused, populate basic observability metrics
                     // so the dashboard shows real system state.
                     {
