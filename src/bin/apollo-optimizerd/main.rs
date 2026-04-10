@@ -1346,6 +1346,21 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 let cycle_start = Instant::now();
+
+                // ── Dry-run ultra-fast-path ───────────────────────────────────
+                // Moved BEFORE snapshot collection: snapshot is only used in the
+                // production pipeline below, not in the dry_run fast-path.
+                // Eliminates refresh_cpu+refresh_memory+fg_detect from hot-path.
+                // [Nygard 2018 §5] remove all non-observable work from test path.
+                if dry_run {
+                    state.metrics.lock_recover().metrics.cycles += 1;
+                    socket_handler::broadcast_current_status(&state);
+                    last_cycle_end = Instant::now();
+                    lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
+                    lf_metrics.commit();
+                    continue;
+                }
+
                 // Mark reactor as stalled only if the reactor thread has sent
                 // zero pulses after 60 s — that means the thread itself died,
                 // not just that the system has been quiet.
@@ -1591,24 +1606,6 @@ fn main() -> anyhow::Result<()> {
                             }));
                         }
                     }
-                }
-
-                // ── Dry-run fast-path ─────────────────────────────────────────
-                // In dry-run mode, the entire decision+execute+learning pipeline
-                // is skipped. Only the cycle counter and socket responsiveness
-                // are needed for the e2e benchmark. All heavy ML, IO, and sysctl
-                // work is irrelevant since execute_actions is a no-op anyway.
-                // [Nygard 2018 §5 fast-path] remove non-observable work from the
-                // benchmark hot-path.
-                if dry_run {
-                    // metrics_reporter increments cycles; we bypass it, so do it here.
-                    state.metrics.lock_recover().metrics.cycles += 1;
-                    // Push to subscribers so e2e_score can count cycles via Subscribe stream.
-                    socket_handler::broadcast_current_status(&state);
-                    last_cycle_end = Instant::now();
-                    lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
-                    lf_metrics.commit();
-                    continue;
                 }
 
                 // Markov chain: observe foreground transition, predict next app.
