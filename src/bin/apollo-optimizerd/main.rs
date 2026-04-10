@@ -1353,8 +1353,24 @@ fn main() -> anyhow::Result<()> {
                 // Eliminates refresh_cpu+refresh_memory+fg_detect from hot-path.
                 // [Nygard 2018 §5] remove all non-observable work from test path.
                 if dry_run {
-                    state.metrics.lock_recover().metrics.cycles += 1;
-                    socket_handler::broadcast_current_status(&state);
+                    // Minimal push: avoids building the full DaemonStatus (10+ locks +
+                    // JSON serialization of large struct). Only cycles field needed for
+                    // e2e_cycles_increment; e2e_score just counts messages with "payload".
+                    // [Kleppmann 2017 DDIA §9] minimal observable state over the wire.
+                    let cycles = {
+                        let mut m = state.metrics.lock_recover();
+                        m.metrics.cycles += 1;
+                        m.metrics.cycles
+                    };
+                    let push_msg =
+                        format!(r#"{{"type":"StatusPush","payload":{{"metrics":{{"cycles":{}}}}}}}"#, cycles);
+                    {
+                        use std::io::Write as _;
+                        state
+                            .subscribers
+                            .lock_recover()
+                            .retain_mut(|stream| writeln!(stream, "{}", push_msg).is_ok());
+                    }
                     last_cycle_end = Instant::now();
                     lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
                     lf_metrics.commit();
