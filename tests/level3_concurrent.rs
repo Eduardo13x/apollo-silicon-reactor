@@ -101,6 +101,7 @@ fn concurrent_budget_enforcement_no_overflow() {
                     &[],
                     &[],
                     None,
+                    false,
                 );
 
                 final_actions.len()
@@ -168,6 +169,7 @@ fn three_phase_cycles_all_complete_with_correct_totals() {
                         &[],
                         &[],
                         None,
+                        false,
                     )
                 };
 
@@ -383,7 +385,7 @@ fn concurrent_freeze_unfreeze_frozen_set_is_consistent() {
                 let mut f = frozen.lock().unwrap();
                 // Dead PIDs → PID validation skips them; frozen set should not grow.
                 let _outcomes =
-                    execute_actions(actions, &no_caps(), null_journal(), &mut f, &[], &[], None);
+                    execute_actions(actions, &no_caps(), null_journal(), &mut f, &[], &[], None, false);
             })
         })
         .collect();

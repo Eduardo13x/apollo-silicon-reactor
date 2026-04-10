@@ -38,19 +38,29 @@ fn is_root() -> bool {
 }
 
 pub fn socket_path() -> &'static str {
-    if is_root() {
-        "/var/run/apollo-optimizer.sock"
-    } else {
-        "/tmp/apollo-optimizer.sock"
-    }
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        std::env::var("APOLLO_SOCKET_PATH").unwrap_or_else(|_| {
+            if is_root() {
+                "/var/run/apollo-optimizer.sock".to_string()
+            } else {
+                "/tmp/apollo-optimizer.sock".to_string()
+            }
+        })
+    })
 }
 
 pub fn kill_switch_path() -> &'static str {
-    if is_root() {
-        "/var/run/apollo.disable"
-    } else {
-        "/tmp/apollo.disable"
-    }
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        std::env::var("APOLLO_KILL_SWITCH_PATH").unwrap_or_else(|_| {
+            if is_root() {
+                "/var/run/apollo.disable".to_string()
+            } else {
+                "/tmp/apollo.disable".to_string()
+            }
+        })
+    })
 }
 
 pub fn journal_path() -> &'static str {

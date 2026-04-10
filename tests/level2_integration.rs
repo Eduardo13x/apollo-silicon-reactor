@@ -59,6 +59,7 @@ fn execute_boost_dead_pid_is_skipped() {
         &[],
         &[],
         None,
+        false,
     );
     assert_eq!(
         outcomes.failures, 0,
@@ -89,6 +90,7 @@ fn execute_freeze_dead_pid_is_skipped() {
         &[],
         &[],
         None,
+        false,
     );
     assert_eq!(
         outcomes.freezes_applied, 0,
@@ -121,6 +123,7 @@ fn execute_throttle_dead_pid_is_skipped() {
         &[],
         &[],
         None,
+        false,
     );
     assert_eq!(outcomes.throttles_applied, 0);
     assert_eq!(outcomes.failures, 0);
@@ -143,6 +146,7 @@ fn execute_unfreeze_dead_pid_is_safe() {
         &[],
         &[],
         None,
+        false,
     );
     // Unfreeze always increments even on dead PID (SIGCONT to dead PID is a no-op).
     assert_eq!(
@@ -169,7 +173,7 @@ fn execute_non_allowlisted_sysctl_is_denied() {
     let mut caps = no_caps();
     caps.can_sysctl = true; // cap granted, but key is not in allowlist
 
-    let outcomes = execute_actions(actions, &caps, null_journal(), &mut frozen, &[], &[], None);
+    let outcomes = execute_actions(actions, &caps, null_journal(), &mut frozen, &[], &[], None, false);
     assert_eq!(
         outcomes.sysctl_applied, 0,
         "non-allowlisted sysctl must not be applied"
@@ -191,7 +195,7 @@ fn execute_sysctl_without_cap_is_skipped() {
     let mut frozen = HashSet::new();
     let caps = no_caps(); // can_sysctl = false
 
-    let outcomes = execute_actions(actions, &caps, null_journal(), &mut frozen, &[], &[], None);
+    let outcomes = execute_actions(actions, &caps, null_journal(), &mut frozen, &[], &[], None, false);
     assert_eq!(
         outcomes.sysctl_applied, 0,
         "sysctl without capability must be skipped"
@@ -247,6 +251,7 @@ fn execute_outcomes_all_zero_for_dead_pids() {
         &[],
         &[],
         None,
+        false,
     );
 
     assert_eq!(outcomes.boosts_applied, 0);
@@ -441,6 +446,7 @@ fn execute_actions_skips_protected_name_regardless_of_pid() {
         &[],
         &[],
         None,
+        false,
     );
     // Protected name → skipped. No failure, no boost counted.
     assert_eq!(outcomes.failures, 0);
