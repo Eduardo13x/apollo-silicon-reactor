@@ -190,6 +190,7 @@ pub fn execute_actions(
     learned_protected: &[String],
     learned_interactive: &[String],
     mut qos_mgr: Option<&mut MachQoSManager>,
+    dry_run: bool,
 ) -> ExecuteOutcomes {
     let protected = protected_processes();
     // Only infrastructure (docker, postgres, redis, etc.) gets unconditional protection
@@ -277,6 +278,9 @@ pub fn execute_actions(
             if !name_matches {
                 continue; // PID recycled or process dead — skip
             }
+            if dry_run {
+                continue;
+            }
             // SAFETY: single syscall, no shared state, no dereference.
             unsafe { libc::kill(*pid as i32, libc::SIGCONT) };
         }
@@ -312,20 +316,22 @@ pub fn execute_actions(
                     if !verify_pid_identity(*pid, name, 0, 0) {
                         return Ok(());
                     }
-                    if caps.can_taskpolicy {
-                        // Phase 2: direct Mach syscalls (~50µs vs ~5ms fork/exec).
-                        if let Some(ref mut mgr) = qos_mgr {
-                            mgr.set_tier(*pid, crate::engine::mach_qos::SchedulingTier::Foreground);
-                            mgr.set_latency_and_throughput(
-                                *pid,
-                                LatencyTier::Interactive,
-                                ThroughputTier::High,
-                            );
+                    if !dry_run {
+                        if caps.can_taskpolicy {
+                            // Phase 2: direct Mach syscalls (~50µs vs ~5ms fork/exec).
+                            if let Some(ref mut mgr) = qos_mgr {
+                                mgr.set_tier(*pid, crate::engine::mach_qos::SchedulingTier::Foreground);
+                                mgr.set_latency_and_throughput(
+                                    *pid,
+                                    LatencyTier::Interactive,
+                                    ThroughputTier::High,
+                                );
+                            }
+                            // Boost I/O tier to Interactive.
+                            apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Interactive);
                         }
-                        // Boost I/O tier to Interactive.
-                        apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Interactive);
+                        let _ = set_nice(*pid, -10);
                     }
-                    let _ = set_nice(*pid, -10);
                     out.boosts_applied += 1;
                 }
                 RootAction::ThrottleProcess {
@@ -367,34 +373,36 @@ pub fn execute_actions(
                         out.critical_background_skips += 1;
                         out.push_skip(format!("critical-bg:{}", name));
                     }
-                    if caps.can_taskpolicy {
-                        // Phase 2: direct Mach syscalls for CPU tier routing.
-                        if let Some(ref mut mgr) = qos_mgr {
-                            let sched_tier = if aggressive {
-                                crate::engine::mach_qos::SchedulingTier::Background
-                            // E-cores only
-                            } else {
-                                crate::engine::mach_qos::SchedulingTier::Normal // scheduler decides, less invasive than E-cores-only
-                            };
-                            mgr.set_tier(*pid, sched_tier);
-                            let lat = if aggressive {
-                                LatencyTier::Background
-                            } else {
-                                LatencyTier::Default
-                            };
-                            let thr = if aggressive {
-                                ThroughputTier::Low
-                            } else {
-                                ThroughputTier::Default
-                            };
-                            mgr.set_latency_and_throughput(*pid, lat, thr);
+                    if !dry_run {
+                        if caps.can_taskpolicy {
+                            // Phase 2: direct Mach syscalls for CPU tier routing.
+                            if let Some(ref mut mgr) = qos_mgr {
+                                let sched_tier = if aggressive {
+                                    crate::engine::mach_qos::SchedulingTier::Background
+                                // E-cores only
+                                } else {
+                                    crate::engine::mach_qos::SchedulingTier::Normal // scheduler decides, less invasive than E-cores-only
+                                };
+                                mgr.set_tier(*pid, sched_tier);
+                                let lat = if aggressive {
+                                    LatencyTier::Background
+                                } else {
+                                    LatencyTier::Default
+                                };
+                                let thr = if aggressive {
+                                    ThroughputTier::Low
+                                } else {
+                                    ThroughputTier::Default
+                                };
+                                mgr.set_latency_and_throughput(*pid, lat, thr);
+                            }
+                            // Granular I/O tiering based on aggressiveness.
+                            let io_tier = io_tier_for_throttle(aggressive);
+                            apply_io_tier(*pid, io_tier);
                         }
-                        // Granular I/O tiering based on aggressiveness.
-                        let io_tier = io_tier_for_throttle(aggressive);
-                        apply_io_tier(*pid, io_tier);
+                        let nice_val: i32 = if aggressive { 20 } else { 10 };
+                        let _ = set_nice(*pid, nice_val);
                     }
-                    let nice_val: i32 = if aggressive { 20 } else { 10 };
-                    let _ = set_nice(*pid, nice_val);
                     out.throttles_applied += 1;
                 }
                 RootAction::FreezeProcess {
@@ -438,57 +446,71 @@ pub fn execute_actions(
                         out.push_skip(format!("assertion-active:{}", name));
                         return Ok(());
                     }
-                    // Demote disk I/O to Passive before SIGSTOP.
-                    // This prevents the process from hoarding SSD bandwidth on resume.
-                    if caps.can_taskpolicy {
-                        apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Passive);
-                    }
-                    // Jetsam: marcar como BACKGROUND en el kernel antes de SIGSTOP.
-                    // Así si el sistema entra en OOM mientras el proceso está frozen,
-                    // el kernel lo mata primero en lugar de matar procesos interactivos.
-                    if caps.can_memorystatus {
-                        let _ = apply_apollo_policy(*pid, JetsamClass::Noise);
-                    }
-                    let rc = unsafe { libc::kill(*pid as i32, libc::SIGSTOP) };
-                    if rc == 0 {
+                    if dry_run {
+                        // Simulate success without touching the process.
                         frozen.insert(*pid);
                         out.freezes_applied += 1;
                         out.newly_frozen_pids.push(*pid);
+                    } else {
+                        // Demote disk I/O to Passive before SIGSTOP.
+                        // This prevents the process from hoarding SSD bandwidth on resume.
+                        if caps.can_taskpolicy {
+                            apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Passive);
+                        }
+                        // Jetsam: marcar como BACKGROUND en el kernel antes de SIGSTOP.
+                        // Así si el sistema entra en OOM mientras el proceso está frozen,
+                        // el kernel lo mata primero en lugar de matar procesos interactivos.
+                        if caps.can_memorystatus {
+                            let _ = apply_apollo_policy(*pid, JetsamClass::Noise);
+                        }
+                        let rc = unsafe { libc::kill(*pid as i32, libc::SIGSTOP) };
+                        if rc == 0 {
+                            frozen.insert(*pid);
+                            out.freezes_applied += 1;
+                            out.newly_frozen_pids.push(*pid);
+                        }
                     }
                 }
                 RootAction::UnfreezeProcess { pid, .. } => {
-                    let alive = unsafe { libc::kill(*pid as i32, 0) } == 0;
-                    if alive {
-                        let rc = unsafe { libc::kill(*pid as i32, libc::SIGCONT) };
-                        if rc == 0 {
-                            // Restore I/O tier to Standard on unfreeze.
-                            if caps.can_taskpolicy {
-                                apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Standard);
-                                // Warmup boost: temporary Foreground QoS burst accelerates
-                                // working-set reload from the compressor on resume.
-                                // Next cycle re-evaluates and may demote back.
-                                // [Ousterhout 2013 "Scheduling for Reduced Tail Latency" OSDI;
-                                //  iOS app resume — foreground pulse for fast working-set reload]
-                                if let Some(ref mut mgr) = qos_mgr {
-                                    mgr.set_tier(
-                                        *pid,
-                                        crate::engine::mach_qos::SchedulingTier::Foreground,
-                                    );
-                                }
-                            }
-                            // Restaurar prioridad jetsam a FOREGROUND al descongelar.
-                            if caps.can_memorystatus {
-                                let _ = apply_apollo_policy(*pid, JetsamClass::Interactive);
-                            }
-                            frozen.remove(pid);
-                            out.unfreezes_applied += 1;
-                            out.throttle_reverted += 1;
-                        }
-                        // If SIGCONT failed (e.g. permission denied), keep in frozen set
-                        // so the TTL or next cycle can retry.
-                    } else {
-                        // Process is dead — safe to remove from frozen set.
+                    if dry_run {
+                        // Simulate success without touching the process.
                         frozen.remove(pid);
+                        out.unfreezes_applied += 1;
+                        out.throttle_reverted += 1;
+                    } else {
+                        let alive = unsafe { libc::kill(*pid as i32, 0) } == 0;
+                        if alive {
+                            let rc = unsafe { libc::kill(*pid as i32, libc::SIGCONT) };
+                            if rc == 0 {
+                                // Restore I/O tier to Standard on unfreeze.
+                                if caps.can_taskpolicy {
+                                    apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Standard);
+                                    // Warmup boost: temporary Foreground QoS burst accelerates
+                                    // working-set reload from the compressor on resume.
+                                    // Next cycle re-evaluates and may demote back.
+                                    // [Ousterhout 2013 "Scheduling for Reduced Tail Latency" OSDI;
+                                    //  iOS app resume — foreground pulse for fast working-set reload]
+                                    if let Some(ref mut mgr) = qos_mgr {
+                                        mgr.set_tier(
+                                            *pid,
+                                            crate::engine::mach_qos::SchedulingTier::Foreground,
+                                        );
+                                    }
+                                }
+                                // Restaurar prioridad jetsam a FOREGROUND al descongelar.
+                                if caps.can_memorystatus {
+                                    let _ = apply_apollo_policy(*pid, JetsamClass::Interactive);
+                                }
+                                frozen.remove(pid);
+                                out.unfreezes_applied += 1;
+                                out.throttle_reverted += 1;
+                            }
+                            // If SIGCONT failed (e.g. permission denied), keep in frozen set
+                            // so the TTL or next cycle can retry.
+                        } else {
+                            // Process is dead — safe to remove from frozen set.
+                            frozen.remove(pid);
+                        }
                     }
                 }
                 RootAction::SetSysctl { key, value, .. } => {
@@ -519,12 +541,14 @@ pub fn execute_actions(
                             return Ok(());
                         }
                     }
-                    run_sysctl_write(key, value)?;
-                    after = sysctl_read_with_timeout(key);
+                    if !dry_run {
+                        run_sysctl_write(key, value)?;
+                        after = sysctl_read_with_timeout(key);
+                    }
                     out.sysctl_applied += 1;
                 }
                 RootAction::SetMemorystatus { pid, .. } => {
-                    if caps.can_memorystatus {
+                    if !dry_run && caps.can_memorystatus {
                         // Guard: never send memory pressure to protected/critical processes.
                         let is_protected = crate::engine::process_identity::proc_name_for_pid(*pid)
                             .map(|name| {
@@ -537,9 +561,7 @@ pub fn execute_actions(
                                         .any(|c| nl.contains(&c.to_ascii_lowercase()))
                             })
                             .unwrap_or(false);
-                        if is_protected {
-                            // Skip — do not pressure protected processes.
-                        } else {
+                        if !is_protected {
                             let _ = sysctl_write_i32_with_timeout(
                                 "kern.memorystatus_vm_pressure_send",
                                 *pid as i32,
@@ -549,7 +571,7 @@ pub fn execute_actions(
                     }
                 }
                 RootAction::ToggleSpotlight { enabled, .. } => {
-                    if caps.can_mdutil {
+                    if !dry_run && caps.can_mdutil {
                         spotlight_set_indexing(*enabled);
                     }
                 }
@@ -568,11 +590,7 @@ pub fn execute_actions(
                         && daemon
                             .chars()
                             .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_');
-                    if is_protected {
-                        // Skip — do not quarantine protected daemons.
-                    } else if !name_valid {
-                        // Skip — daemon name contains invalid characters.
-                    } else {
+                    if !dry_run && !is_protected && name_valid {
                         let signal = if *active {
                             libc::SIGSTOP
                         } else {
@@ -599,9 +617,11 @@ pub fn execute_actions(
                         "background" => ThreadTier::Background,
                         _ => ThreadTier::Utility,
                     };
-                    if let Some(ref mut mgr) = qos_mgr {
-                        if mgr.set_thread_qos(*pid, *thread_index, thread_tier) {
-                            out.thread_qos_applied += 1;
+                    if !dry_run {
+                        if let Some(ref mut mgr) = qos_mgr {
+                            if mgr.set_thread_qos(*pid, *thread_index, thread_tier) {
+                                out.thread_qos_applied += 1;
+                            }
                         }
                     }
                 }
@@ -671,6 +691,7 @@ mod tests {
             learned_protected,
             learned_interactive,
             None,
+            false,
         )
     }
 
@@ -693,7 +714,7 @@ mod tests {
             })
             .collect();
         let outcomes = execute_actions(
-            actions, &make_caps(), &journal, &mut frozen, &[], &[], None,
+            actions, &make_caps(), &journal, &mut frozen, &[], &[], None, false,
         );
         // All 5 ghost pids are dead → should be removed from frozen set.
         // unfreezes_applied stays 0 because the live-branch (which increments

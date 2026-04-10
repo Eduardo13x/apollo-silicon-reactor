@@ -142,6 +142,11 @@ enum Commands {
     Daemon {
         #[arg(long, default_value = "balanced-root")]
         profile: String,
+        /// Skip all OS-mutating calls (SIGSTOP/SIGCONT/taskpolicy/sysctl/mdutil).
+        /// The full pipeline runs but no real processes are frozen or throttled.
+        /// Intended for testing and benchmarking.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 // SharedState → daemon_state (PR#15: canonical definition in daemon_state.rs)
@@ -429,7 +434,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Daemon { profile } => {
+        Commands::Daemon { profile, dry_run } => {
             let profile = parse_profile(&profile);
             let is_root = unsafe { libc::geteuid() } == 0;
 
@@ -5064,6 +5069,7 @@ fn main() -> anyhow::Result<()> {
                             &[],
                             &[],
                             None,
+                            dry_run,
                         );
                         if outcomes.failures == 0 {
                             sysctl_governor.mark_reverted();
@@ -5839,6 +5845,7 @@ fn main() -> anyhow::Result<()> {
                             &learned_protected,
                             &learned_interactive,
                             Some(&mut qos),
+                            dry_run,
                         )
                     } else {
                         // Circuit Closed or HalfOpen: run normally, then report outcome.
@@ -5850,6 +5857,7 @@ fn main() -> anyhow::Result<()> {
                             &learned_protected,
                             &learned_interactive,
                             Some(&mut qos),
+                            dry_run,
                         );
                         // Report outcome to circuit breaker (lock released before I/O above).
                         {
@@ -6389,6 +6397,7 @@ fn main() -> anyhow::Result<()> {
                         &[],
                         &[],
                         None,
+                        dry_run,
                     );
                     if outcomes.failures == 0 {
                         sysctl_governor.mark_reverted();
