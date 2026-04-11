@@ -10,3 +10,5 @@ iter	commit	passing	delta	failed	loc_decide	loc_chromium	loc_governor	loc_total	
 8	c1eb2f2	3656	0	0	1736	2038	1121	4895	keep	refactor(chromium): inline multi-line assert macros in tests -28 LOC
 9	9ee1f7e	3656	0	0	1736	1975	1121	4832	keep	refactor(chromium): inline spread assert macros across test suite -63 LOC
 10	3181f37	3656	0	0	1736	1975	1059	4770	keep	refactor(governor): inline multi-line assert macros in tests -62 LOC
+11	e325158	3656	0	0	1736	1935	1059	4730	keep	refactor(chromium): inline 11 multi-line assert macros -40 LOC [Saltzer 1975]
+12	4f8832f	3656	0	0	1688	1935	1059	4682	keep	refactor(decide): inline 12 multi-line assert macros -48 LOC [Saltzer 1975]
