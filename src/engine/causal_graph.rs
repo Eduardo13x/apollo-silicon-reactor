@@ -119,20 +119,19 @@ impl CausalEdge {
         self.evidence_count += 1;
         let target = if was_effective { 1.0 } else { 0.0 };
         self.confidence = self.confidence * 0.9 + target * 0.1;
-        // Track average delta only when effective (delta > 0).
-        if was_effective && delta > 0.0 {
-            // EMA alpha=0.15: adapts to changing workload patterns.
-            self.avg_delta = self.avg_delta * 0.85 + delta * 0.15;
-        }
+        // Always apply EMA decay; target = observed delta when effective, else 0.
+        // Prevents avg_delta from freezing at historical highs when an edge stops
+        // being effective — repeated failures should decay it toward 0.
+        let delta_target = if was_effective && delta > 0.0 { delta } else { 0.0 };
+        self.avg_delta = self.avg_delta * 0.85 + delta_target * 0.15;
     }
 
     /// Update slow-horizon confidence (15-cycle eval window).
     fn update_slow(&mut self, was_effective: bool, delta: f32) {
         let target = if was_effective { 1.0 } else { 0.0 };
         self.slow_confidence = self.slow_confidence * 0.9 + target * 0.1;
-        if was_effective && delta > 0.0 {
-            self.slow_avg_delta = self.slow_avg_delta * 0.85 + delta * 0.15;
-        }
+        let delta_target = if was_effective && delta > 0.0 { delta } else { 0.0 };
+        self.slow_avg_delta = self.slow_avg_delta * 0.85 + delta_target * 0.15;
     }
 
     /// Impact score: confidence × avg_delta. Ranks edges by real-world effect.
