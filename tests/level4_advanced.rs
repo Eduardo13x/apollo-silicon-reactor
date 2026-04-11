@@ -23,8 +23,10 @@ fn memory_analyzer_tracks_process_history() {
 fn memory_analyzer_detects_memory_leaks() {
     let mut analyzer = MemoryAnalyzer::new();
 
-    let mut current_rss = 100 * 1024 * 1024;
-    for i in 0..10 {
+    // 30 monotonically-growing samples required by detect_memory_leak's MIN_SAMPLES=30.
+    // 5 MB/step × 30 steps = 150 MB growth (100→250 MB, ratio 2.5×), well above all thresholds.
+    let mut current_rss = 100u64 * 1024 * 1024;
+    for i in 0..30 {
         analyzer.analyze_process(2001, "leaky_app", current_rss, current_rss * 5, 100 + i);
         current_rss += 5 * 1024 * 1024;
     }
