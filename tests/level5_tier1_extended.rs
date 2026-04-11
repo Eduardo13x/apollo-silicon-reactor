@@ -346,7 +346,7 @@ fn test_swap_predictor_time_to_critical() {
         predictor.update(mb * 1024 * 1024, total);
     }
     let forecast = predictor.update(2000 * 1024 * 1024, total);
-    assert_eq!(forecast.time_to_swap_critical, 0);
+    assert_eq!(forecast.time_to_swap_critical, Some(0));
 }
 
 #[test]
@@ -355,7 +355,7 @@ fn test_swap_predictor_time_to_critical_not_yet() {
 
     // Not yet critical, and not increasing
     let forecast = predictor.update(500 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
-    assert_eq!(forecast.time_to_swap_critical, -1); // No time to critical
+    assert_eq!(forecast.time_to_swap_critical, None); // Not trending toward critical
 }
 
 #[test]

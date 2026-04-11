@@ -354,7 +354,7 @@ impl AgentContext {
     pub fn build(
         memory_pressure: f64,
         swap_trend: SwapTrend,
-        time_to_critical_secs: i32,
+        time_to_critical_secs: Option<i32>,
         throughput_mips: f64,
         jitter_us: f64,
         cache_latency_us: f64,
@@ -371,10 +371,9 @@ impl AgentContext {
             SwapTrend::Increasing => 0.50,
             SwapTrend::Critical => 0.75,
         };
-        let swap_urgency = if time_to_critical_secs < 0 {
-            0.0
-        } else {
-            1.0 / (1.0 + time_to_critical_secs as f64)
+        let swap_urgency = match time_to_critical_secs {
+            None => 0.0,
+            Some(secs) => 1.0 / (1.0 + secs as f64),
         };
         let hour_f = hour as f64;
         let hour_sin = (2.0 * std::f64::consts::PI * hour_f / 24.0).sin();
@@ -865,7 +864,7 @@ mod tests {
         AgentContext::build(
             pressure,
             SwapTrend::Stable,
-            -1,
+            None,
             800.0,
             50.0,
             5000.0,
@@ -1031,7 +1030,7 @@ mod tests {
         let ctx_good = AgentContext::build(
             0.5,
             SwapTrend::Stable,
-            -1,
+            None,
             800.0,
             50.0,
             5000.0,
@@ -1051,7 +1050,7 @@ mod tests {
         let ctx_bad = AgentContext::build(
             0.5,
             SwapTrend::Stable,
-            -1,
+            None,
             800.0,
             50.0,
             5000.0,
@@ -1077,7 +1076,7 @@ mod tests {
         let ctx = AgentContext::build(
             1.5, // will be clamped to 1.0
             SwapTrend::Critical,
-            5,
+            Some(5),
             2000.0,
             10000.0,
             60000.0,
@@ -1576,7 +1575,7 @@ mod tests {
         let ctx = AgentContext::build(
             0.0,
             SwapTrend::Decreasing,
-            -1,
+            None,
             0.0,
             0.0,
             0.0,
@@ -1599,7 +1598,7 @@ mod tests {
         let ctx = AgentContext::build(
             1.0,
             SwapTrend::Critical,
-            0,
+            Some(0),
             9999.0,
             99999.0,
             999999.0,

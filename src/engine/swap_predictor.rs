@@ -28,8 +28,8 @@ pub struct SwapForecast {
     /// Current trend classification.
     pub swap_trend: SwapTrend,
     /// Seconds until swap is predicted to reach critical threshold.
-    /// -1 if not trending toward critical.
-    pub time_to_swap_critical: i32,
+    /// None = not trending toward critical (stable or decreasing).
+    pub time_to_swap_critical: Option<i32>,
     /// Current swap utilization ratio [0,1].
     pub swap_ratio: f64,
     /// Predicted swap usage bytes (extrapolated forward).
@@ -159,27 +159,27 @@ impl SwapPredictor {
         actions
     }
 
-    fn time_to_critical(&self, current: u64, total: u64, trend: &SwapTrend) -> i32 {
+    fn time_to_critical(&self, current: u64, total: u64, trend: &SwapTrend) -> Option<i32> {
         match trend {
-            SwapTrend::Stable | SwapTrend::Decreasing => -1,
+            SwapTrend::Stable | SwapTrend::Decreasing => None,
             SwapTrend::Increasing | SwapTrend::Critical => {
                 let n = self.samples.len();
                 if n < 2 {
-                    return -1;
+                    return None;
                 }
                 // Rate of change: bytes per sample (5s cycle)
                 let first = self.samples.front().map(|(u, _)| *u).unwrap_or(current);
                 let rate_per_cycle = (current as f64 - first as f64) / n as f64;
                 if rate_per_cycle <= 0.0 {
-                    return -1;
+                    return None; // not actually growing
                 }
                 let critical_threshold = total as f64 * 0.85;
                 let bytes_remaining = critical_threshold - current as f64;
                 if bytes_remaining <= 0.0 {
-                    return 0;
+                    return Some(0); // already at critical
                 }
                 let cycles_remaining = bytes_remaining / rate_per_cycle;
-                (cycles_remaining * 5.0).round() as i32 // 5s per cycle
+                Some((cycles_remaining * 5.0).round() as i32) // 5s per cycle
             }
         }
     }
@@ -204,7 +204,7 @@ mod tests {
         let mut p = SwapPredictor::new();
         let f = p.update(0, 2 * GB);
         assert_eq!(f.swap_trend, SwapTrend::Stable);
-        assert_eq!(f.time_to_swap_critical, -1);
+        assert_eq!(f.time_to_swap_critical, None);
     }
 
     #[test]
@@ -261,6 +261,6 @@ mod tests {
             p.update(GB, 4 * GB);
         }
         let f = p.update(GB, 4 * GB);
-        assert_eq!(f.time_to_swap_critical, -1);
+        assert_eq!(f.time_to_swap_critical, None);
     }
 }
