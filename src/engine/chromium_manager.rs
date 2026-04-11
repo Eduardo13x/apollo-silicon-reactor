@@ -1327,18 +1327,12 @@ mod tests {
         let procs1: Vec<(u32, &str, f32, u64)> =
             vec![(500, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
         mgr.update(&procs1, None, &none_set, &none_set);
-        assert!(
-            mgr.renderers.contains_key(&500),
-            "PID 500 should be tracked"
-        );
+        assert!(mgr.renderers.contains_key(&500), "PID 500 should be tracked");
 
         // Next cycle: PID 500 is gone
         let procs2: Vec<(u32, &str, f32, u64)> = vec![];
         mgr.update(&procs2, None, &none_set, &none_set);
-        assert!(
-            !mgr.renderers.contains_key(&500),
-            "PID 500 should be pruned"
-        );
+        assert!(!mgr.renderers.contains_key(&500), "PID 500 should be pruned");
     }
 
     #[test]
@@ -1359,30 +1353,21 @@ mod tests {
     fn pressure_high_reduces_idle_cycles_required() {
         let mut mgr = ChromiumManager::new();
         mgr.set_pressure_context(0.85);
-        assert_eq!(
-            mgr.idle_cycles_required, 1,
-            "high pressure → 1 cycle required"
-        );
+        assert_eq!(mgr.idle_cycles_required, 1, "high pressure → 1 cycle required");
     }
 
     #[test]
     fn pressure_low_increases_idle_cycles_required() {
         let mut mgr = ChromiumManager::new();
         mgr.set_pressure_context(0.30);
-        assert_eq!(
-            mgr.idle_cycles_required, 5,
-            "low pressure → 5 cycles (never freeze)"
-        );
+        assert_eq!(mgr.idle_cycles_required, 5, "low pressure → 5 cycles (never freeze)");
     }
 
     #[test]
     fn pressure_normal_uses_default() {
         let mut mgr = ChromiumManager::new();
         mgr.set_pressure_context(0.55);
-        assert_eq!(
-            mgr.idle_cycles_required, 3,
-            "normal pressure → default 3 cycles"
-        );
+        assert_eq!(mgr.idle_cycles_required, 3, "normal pressure → default 3 cycles");
     }
 
     // ── Fluidity pause ─────────────────────────────────────────────────────────
@@ -1438,15 +1423,8 @@ mod tests {
         mgr.frozen_pids.insert(900);
         mgr.frozen_pids.insert(901);
         let thawed = mgr.shutdown_cleanup();
-        assert_eq!(
-            thawed.len(),
-            2,
-            "shutdown_cleanup must return all frozen PIDs"
-        );
-        assert!(
-            mgr.frozen_pids.is_empty(),
-            "frozen_pids must be empty after cleanup"
-        );
+        assert_eq!(thawed.len(), 2, "shutdown_cleanup must return all frozen PIDs");
+        assert!(mgr.frozen_pids.is_empty(), "frozen_pids must be empty after cleanup");
     }
 
     // ── ChromiumMetrics ────────────────────────────────────────────────────────
@@ -1475,14 +1453,8 @@ mod tests {
         let m = mgr.metrics();
         assert_eq!(m.total_renderers, 3);
         assert!(m.total_renderer_memory_mb > 0.0);
-        assert!(
-            m.browsers_managed.contains(&"Brave Browser".to_string()),
-            "Brave Browser must be tracked"
-        );
-        assert!(
-            m.browsers_managed.contains(&"Slack".to_string()),
-            "Slack must be tracked"
-        );
+        assert!(m.browsers_managed.contains(&"Brave Browser".to_string()), "Brave Browser must be tracked");
+        assert!(m.browsers_managed.contains(&"Slack".to_string()), "Slack must be tracked");
     }
 
     // ── Performance benchmark ──────────────────────────────────────────────────
