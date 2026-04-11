@@ -1,0 +1,7 @@
+iteration	commit	tests	delta_tests	clippy	status	paper_cited	description
+1	fb6e4c1	3656	+8	1	KEEP	Kuncheva2004+Nygard2018	Sensor watchdog: stuck detection + EMA reset
+2	3768cb0	3682	+26	1	KEEP	Fowler2019	Pin 15 critical thresholds — PANIC_BRAKE + page_reclaim + freeze + chromium
+3	19a4fe1	3686	+4	1	KEEP	Kuncheva2004+Murphy2012	Adaptive StabilityOracle weights — RAM/CPU hardware-aware
+4	4084695	3686	0	1	KEEP	Fowler2004+Hellerstein2004	Wire hardware profile + planner consumer (Phase 1)
+5	3ef5554	3686	0	1	KEEP	Lampson1974+Parnas1972	Consolidate BEHAVIOR_DENYLIST → ProcessClasses TOML
+6	646df6a	3686	0	1	KEEP	CrashReport2026-04-09	Fix TelemetryLogger I/O saturation — cooldown 60s→5min + periodic 10m→30m

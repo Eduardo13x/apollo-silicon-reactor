@@ -1,913 +1,642 @@
-# Apollo Optimizer — Arquitectura del Sistema
+# Apollo Optimizer — Arquitectura Interna Detallada
 
-> **Versión:** 0.2.0 · **Lenguaje:** Rust 2021 · **Plataforma:** macOS (Apple Silicon nativo)
-> **Commit de referencia:** `951bb98` · **Actualizado:** 2026-03-13
-> **Hardware objetivo:** MacBook Air M1 · 8 GB RAM (Unified Memory Architecture)
+> **Versión:** 1.0.0 · **Lenguaje:** Rust 2021 · **Plataforma:** macOS Apple Silicon (M1/M2/M3/M4)
+> **AIS:** Apollo Intelligence Score — métrica compuesta de 6 dimensiones con escala 0–100.
 
----
-
-## Índice
-
-1. [Filosofía de diseño](#1-filosofía-de-diseño)
-2. [Vista general del sistema](#2-vista-general-del-sistema)
-3. [Modelo de inteligencia de tres niveles](#3-modelo-de-inteligencia-de-tres-niveles)
-4. [Arquitectura de binarios](#4-arquitectura-de-binarios)
-5. [Módulos del motor (~60 módulos)](#5-módulos-del-motor)
-6. [Pipeline de decisión](#6-pipeline-de-decisión)
-7. [Sistema de seguridad y restricciones](#7-sistema-de-seguridad-y-restricciones)
-8. [Sistema reactivo (kqueue)](#8-sistema-reactivo-kqueue)
-9. [Máquina de estados del gobernador](#9-máquina-de-estados-del-gobernador)
-10. [Overflow Guard — Aprendizaje de desbordamientos](#10-overflow-guard)
-11. [Gestión avanzada de memoria](#11-gestión-avanzada-de-memoria)
-12. [Térmica y energía](#12-térmica-y-energía)
-13. [I/O Tiering granular](#13-io-tiering-granular)
-14. [Wait-Graph — Prevención de deadlocks](#14-wait-graph)
-15. [Integración LLM Teacher](#15-integración-llm-teacher)
-16. [Capa de telemetría hardware](#16-capa-de-telemetría-hardware)
-17. [Persistencia y estado](#17-persistencia-y-estado)
-18. [Protocolo IPC](#18-protocolo-ipc)
-19. [Suite de tests](#19-suite-de-tests)
-20. [Instalación y despliegue](#20-instalación-y-despliegue)
-21. [Issues de hardening pendientes](#21-issues-de-hardening-pendientes)
+Cada afirmación de este documento tiene correspondencia directa en un archivo `.rs` del proyecto. Validado contra el código fuente el 04 de Abril de 2026.
 
 ---
 
-## 1. Filosofía de diseño
+## 0. ¿Cómo funciona Apollo? (Explicación No Técnica)
 
-Apollo Optimizer es un **árbitro de recursos de nivel de sistema** para macOS Apple Silicon. Actúa donde el kernel XNU es generalista: prioriza energía pero no protege activamente las apps de primer plano contra el ruido de fondo (Electron, telemetría, indexadores).
+### Para alguien que no programa
 
-**Cuatro principios arquitectónicos:**
+Imagina que tu Mac es un restaurante con una cocina (el procesador) y mesas limitadas (la memoria RAM). Los clientes son las aplicaciones: Safari, Xcode, Spotify, etc.
 
-1. **Observar, no adivinar.** Cada decisión se basa en estado medido: presión CPU, tendencias de memoria, sensores térmicos, velocidad de swap, tasa de wakeups y patrones de interacción de usuario.
+**El problema:** A veces llegan tantos clientes que la cocina se satura y la comida sale lenta para todos — incluso para el cliente VIP que pagó más (la app que estás usando activamente). macOS intenta manejar esto por sí solo, pero es como un mesero que no distingue entre un cliente esperando su postre y uno que ya se fue hace 2 horas y dejó la taza de café en la mesa ocupando espacio.
 
-2. **Inteligencia por niveles con latencia acotada.** Tres niveles de decisión con contratos estrictos: heurísticas (<1ms), ML bayesiano ligero (<5ms) y LLM cloud opcional (async, rate-limited). El hot-path nunca espera ML ni red.
+**Lo que hace Apollo:** Es un gerente de restaurante inteligente que trabaja en segundo plano, las 24 horas:
 
-3. **Conservador por defecto, agresivo por evidencia.** El daemon arranca en `BalancedRoot`. Escala a `AggressiveRoot` solo tras 3 ciclos consecutivos con presión sostenida >0.72. Baja tras 6 ciclos <0.55. La lógica anti-thrash bloquea el perfil si detecta oscilación. El `OverflowGuard` baja los thresholds automáticamente si ocurren desbordamientos reales.
+1. **Observa constantemente** quién está en el restaurante, cuánto come (CPU) y cuánto espacio ocupa en la mesa (RAM). Lee sensores físicos reales del chip: temperatura, presión de memoria, voltaje de batería, velocidad del ventilador.
 
-4. **Reversibilidad como propiedad de primera clase.** Toda acción de optimización (SIGSTOP, renice, sysctl) se registra en un journal append-only con estado antes/después. El sistema puede restaurar el estado previo en cualquier momento. Si el daemon crashea, descongela todos los procesos al reiniciar.
+2. **Clasifica a cada cliente** en categorías:
+   - 🟢 **VIP (Intocable):** La app que estás usando ahora mismo — jamás se toca.
+   - 🟢 **Personal del restaurante:** Procesos del sistema (WindowServer, launchd) — sin ellos el restaurante cierra. Nunca se tocan.
+   - 🟡 **Cliente normal:** Apps abiertas en segundo plano — se les puede pedir que esperen un poco.
+   - 🟠 **Cliente dormido:** Apps que llevan horas sin usarse, ocupando una mesa entera. Candidatas a que se les pida que se levanten.
+   - 🔴 **Fantasma:** Procesos huérfanos o zombies que ya no sirven a nadie — se les retira la mesa.
 
----
+3. **Toma decisiones automáticas:**
+   - **Boost (subir prioridad):** "Pon al VIP más cerca de la cocina."
+   - **Throttle (bajar prioridad):** "Ese cliente que descarga torrents en segundo plano puede esperar."
+   - **Freeze (pausar):** "Dropbox lleva 3 horas sincronizando en la nube y estás compilando — que espere hasta que termines."
+   - **Kill (solo zombies):** "Ese proceso está muerto en la tabla del kernel — hay que limpiar."
 
-## 2. Vista general del sistema
+4. **Aprende de sus propias decisiones:**
+   - Si congeló a Firefox y la presión de memoria bajó → lo recuerda para la próxima vez.
+   - Si throttleó a un daemon y no cambió nada → lo anota como inefectivo.
+   - Combina tres fuentes de aprendizaje para tener un "score" único por proceso.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Apollo Optimizer System                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────┐  ┌───────┐  │
-│  │ apollo-      │  │ apollo-          │  │ apollo-        │  │apollo-│  │
-│  │ optimizer    │  │ optimizerd       │  │ optimizerctl   │  │menubar│  │
-│  │ (CLI)        │  │ (Daemon)         │  │ (Client)       │  │ (UI)  │  │
-│  │              │  │                  │  │                │  │       │  │
-│  │ Comandos     │  │ Optimización     │  │ IPC queries    │  │ macOS │  │
-│  │ puntuales    │  │ continua         │  │ & control      │  │ menu  │  │
-│  └──────┬───────┘  └────────┬─────────┘  └───────┬────────┘  └───────┘  │
-│         │                   │                     │                      │
-│         │                   │   Unix Socket IPC   │                      │
-│         │                   │◄───────────────────►│                      │
-│         ▼                   ▼                                            │
-│  ┌──────────────────────────────────────────────────────────────────┐   │
-│  │                    Core Engine (~60 módulos)                      │   │
-│  │                                                                   │   │
-│  │  ┌────────────┐  ┌────────────┐  ┌──────────────────────────┐   │   │
-│  │  │ Nivel 1    │  │ Nivel 2    │  │ Nivel 3                  │   │   │
-│  │  │ Heurísticas│  │ ML Ligero  │  │ LLM Teacher (opcional)   │   │   │
-│  │  │ <1ms       │  │ <5ms       │  │ async, rate-limited      │   │   │
-│  │  └────────────┘  └────────────┘  └──────────────────────────┘   │   │
-│  │                                                                   │   │
-│  │  ┌───────────────────────────────────────────────────────────┐   │   │
-│  │  │              Subsistemas especializados                    │   │   │
-│  │  │  Thermal · Memory · Swap · GPU · Power · Network          │   │   │
-│  │  │  WakeStorm · ProcessRecovery · Analytics · OverflowGuard  │   │   │
-│  │  │  WaitGraph · CompressorAware · ThermalBailout · IOTiering  │   │   │
-│  │  └───────────────────────────────────────────────────────────┘   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ┌──────────────────────────────────────────────────────────────────┐   │
-│  │                   Interfaz con el kernel macOS                    │   │
-│  │  kqueue · Mach task_policy_set · SIGSTOP/SIGCONT · sysctl        │   │
-│  │  IOKit sensors · powermetrics · mdutil · memorystatus_control    │   │
-│  │  proc_pidinfo · task_info(TASK_VM_INFO) · host_statistics64      │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+5. **Se protege contra errores:**
+   - Tiene una lista de procesos que **jamás** puede tocar (el kernel, la pantalla, el audio).
+   - Si una app visible en pantalla depende de un proceso en segundo plano (por ejemplo, Safari esperando WebKit), **nunca** pausa a WebKit — detecta esta dependencia automáticamente.
+   - Si oscila mucho entre perfiles (agresivo ↔ conservador) se auto-bloquea en modo "balanceado" por 5 minutos para no causar daño.
+
+### En una oración
+
+> Apollo es un piloto automático que silenciosamente identifica qué apps están desperdiciando los recursos de tu Mac y las pone a dormir o las ralentiza, sin que notes nada, para que la app que estás usando vaya más rápido.
+
+### ¿Cuándo actúa y cuándo no?
+
+| Tu Mac está... | Apollo hace... |
+|---|---|
+| Navegando y leyendo emails | Casi nada. Solo vigila. Tick cada 60 segundos. |
+| Compilando un proyecto Rust/Swift | Congela agresivamente apps de fondo. Tick cada 2 segundos. |
+| Con poca batería | Baja la tolerancia — actúa antes para ahorrar energía. |
+| Calentándose | Reduce inmediatamente al modo conservador — no quiere empeorar el calor. |
+| De noche (00:00–06:00) | Throttlea daemons de fondo inactivos para ahorrar batería. |
+| Acabando de despertar (tras abrir la tapa) | Espera 60 segundos de gracia antes de intervenir. |
 
 ---
 
-## 3. Modelo de inteligencia de tres niveles
-
-### Nivel 1 — Heurísticas (<1ms)
-
-| Módulo | Responsabilidad |
-|--------|----------------|
-| `adaptive_governor.rs` | Motor central de decisión por proceso (Allow / Throttle / Freeze / Kill) |
-| `process_classifier.rs` | Categoriza procesos en 8 tiers por comportamiento |
-| `zombie_hunter.rs` | Identifica 5 clases de procesos muertos o improductivos |
-
-**Tiers de procesos:**
-
-| Tier | Criterio |
-|------|----------|
-| `ActiveForeground` | Interacción de usuario en los últimos 30s |
-| `BackgroundVisible` | App abierta, no enfocada, usada en últimos 5 min |
-| `AppHelper` | Subproceso XPC/helper de una app activa |
-| `SystemEssential` | Kernel, audio, display server |
-| `SilentDaemon` | Servicio de fondo sin valor observable para el usuario |
-| `Stale` | Sin uso en >24 horas |
-| `ZombieOrphan` | Proceso muerto u huérfano |
-| `Telemetry` | Analytics, crash reporters, diagnósticos |
-
-**Fórmula de utilidad (0.0–1.0):**
-```
-utility = base_interaction_score      // 1.0 si <30s, 0.7 si <5min, 0.0 si >1h
-        + gui_window_bonus    (0.3)
-        + network_active      (0.2)
-        - high_wakeup_penalty (0.5)   // >50 wakeups/sec
-        + user_profile_boost  (var)   // de comportamiento aprendido
-```
-
-**Umbrales de decisión:**
-- `utility < 0.1` Y carga pesada → **Freeze** (SIGSTOP)
-- `utility < 0.4` → **Throttle** (renice +10)
-- `waste_score > 0.9` → **Throttle** (override)
-- Zombie/Huérfano → **Kill** (SIGKILL, tras 3 ciclos de confirmación)
-
-### Nivel 2 — ML Ligero (<5ms)
-
-| Módulo | Responsabilidad |
-|--------|----------------|
-| `workload_classifier.rs` | Clasificación bayesiana de carga de trabajo (5 fuentes de evidencia) |
-| `user_profile.rs` | Aprendizaje conductual: estadísticas por app, modelo por hora del día |
-| `hw_predictor.rs` | Predicción de tendencias de hardware |
-| `hw_bayes.rs` | Modelo bayesiano de hardware |
-
-**Fuentes de evidencia bayesiana:**
-
-| Fuente | Peso | Descripción |
-|--------|------|-------------|
-| ForegroundApp | 2.0 | Coincidencia directa contra categorías conocidas |
-| HourPrior | 0.3 | Distribución probabilística de 24h desde historial |
-| AppRecency | 0.1–0.8 | Qué tan reciente fue la última interacción con apps relevantes |
-| ProcessMix | variable | Conteo de procesos de fondo coincidentes |
-| LlmLearned | 1.5 / -0.5 | Patrones de `LearnedPolicy` (interactivos/ruido) |
-
-**Tipos de carga de trabajo:** Coding, VideoCall, MediaPlayback, VideoEdit, OfficeWork, CommandLine, Idle, General
-
-### Nivel 3 — LLM Teacher (Opcional, Async)
-
-| Módulo | Responsabilidad |
-|--------|----------------|
-| `llm.rs` | Refinamiento de políticas via API compatible OpenAI |
-
-El LLM Teacher opera en una escala de tiempo diferente — no toma decisiones en tiempo real. Observa patrones del sistema y actualiza la `LearnedPolicy` que consume el Nivel 2. Rate-limited: 2 llamadas/hora, intervalo mínimo 15 min.
-
----
-
-## 4. Arquitectura de binarios
-
-### `apollo-optimizer` (CLI) — `src/main.rs`
-
-| Comando | Acción |
-|---------|--------|
-| `snapshot` | Recoge métricas del sistema → guarda JSON |
-| `optimize` | Ejecuta el motor de optimización una vez |
-| `clean` | Limpieza de disco |
-| `turbo` | Modo máximo rendimiento (deshabilita animaciones, tuning extremo) |
-| `daemon` | Inicia el bucle de optimización continua |
-| `startup` | Configura arranque inteligente (previene reapertura de apps) |
-| `llm` | Optimización agresiva para cargas de trabajo IA/LLM |
-| `restore` | Revierte todas las optimizaciones, descongela todo |
-
-### `apollo-optimizerd` (Daemon) — `src/bin/apollo-optimizerd.rs`
-
-Servicio de fondo de larga duración (~3,500 líneas). Responsabilidades principales:
-
-- **Bucle de optimización principal** con tick rate adaptivo (2s–60s)
-- **Servidor Unix socket** para IPC con `apollo-optimizerctl`
-- **Hilo reactor** para respuesta basada en eventos (kqueue)
-- **Persistencia de estado** entre reinicios (10 archivos de estado)
-- **Gobernador de perfiles** con transiciones automáticas
-- **Período de gracia post-wake** (60s tras sueño/despertar)
-- **Kill switch** (`/var/run/apollo.disable`)
-
-**SharedState** (~44 campos, `Arc<Mutex<T>>`):
-```rust
-SharedState {
-    // Perfil y política
-    profile: OptimizationProfile,
-    latency_target: LatencyTarget,
-    governor: ProfileGovernor,
-    overflow_guard: OverflowGuard,      // NUEVO
-
-    // Seguimiento de procesos
-    frozen: HashSet<u32>,
-    frozen_since: HashMap<u32, DateTime>,
-    last_blockers: Vec<BlockerScore>,
-
-    // Estado del sistema
-    thermal_state: String,
-    throttle_level: String,
-    wake_state: WakeRuntimeState,
-
-    // Módulos de inteligencia
-    adaptive_governor: AdaptiveGovernor,
-    workload_classifier: WorkloadClassifier,
-    user_profile: UserProfile,
-    llm_state: LlmState,
-    learned_policy: LearnedPolicy,
-    usage_model: UsageModel,
-
-    // Interfaces de hardware
-    mach_qos: MachQoSManager,
-    iokit_reader: IOKitSensorReader,
-
-    // Métricas y reactor
-    metrics: RuntimeMetrics,            // 50+ contadores
-    reactor_event_weight: f64,
-    reactor_mode: String,
-    reactor_health: String,
-}
-```
-
-> **Deuda técnica conocida:** `SharedState` tiene ~44 campos `Arc<Mutex<T>>` — candidatos a agruparse en structs lógicos para reducir contención. La función `main()` tiene ~1,900 líneas — candidata a modularización.
-
-### `apollo-optimizerctl` (Cliente) — `src/bin/apollo-optimizerctl.rs`
-
-Cliente CLI ligero. Conecta al socket del daemon, envía peticiones JSON, muestra respuestas.
-
-### `apollo-menubar` (UI nativa) — `src/bin/apollo-menubar.rs`
-
-Interfaz de menú macOS nativa. Acceso rápido a estado y control desde la barra de menú.
-
----
-
-## 5. Módulos del motor
-
-Los módulos en `src/engine/` se organizan por función:
-
-### Tipos y protocolo
-
-| Módulo | Tipos clave |
-|--------|------------|
-| `types.rs` | `OptimizationProfile`, `RootAction`, `SafetyPolicy`, `RuntimeMetrics`, `BlockerScore`, `DaemonStatus` |
-| `protocol.rs` | `DaemonRequest` (23 variantes), `DaemonResponse` (12 variantes) |
-| `journal.rs` | `JournalEntry` — audit trail JSONL append-only |
-| `lock_ext.rs` | Trait `LockRecover` — acceso uniforme a mutex con recuperación de poison |
-
-### Seguridad y capacidades
-
-| Módulo | Funciones clave |
-|--------|----------------|
-| `safety.rs` | `protected_processes()`, `critical_background_processes()`, `allowlisted_sysctls()`, `enforce_limits()` |
-| `capabilities.rs` | `can_taskpolicy()`, `can_sysctl()`, `can_memorystatus()`, `can_mdutil()`, `is_root()` |
-| `process_identity.rs` | Verificación de identidad PID (previene A-B-A recycling con `start_sec`/`start_usec`) |
-
-### Decisión y ejecución
-
-| Módulo | Propósito |
-|--------|-----------|
-| `decide_actions.rs` | Clasificación de contexto → detección de bloqueadores → generación de acciones |
-| `execute_actions.rs` | Validación de existencia del proceso → ejecución de señales/renice/sysctl |
-| `profile_governor.rs` | Puntuación de presión → transiciones de perfil → anti-thrash → overrides |
-| `sysctl_governor.rs` | Gobernador de parámetros sysctl con allowlist estricta |
-
-### Inteligencia (Nivel 1 y 2)
-
-| Módulo | Latencia | Propósito |
-|--------|----------|-----------|
-| `adaptive_governor.rs` | <1ms | Motor heurístico central (Nivel 1) |
-| `process_classifier.rs` | <2ms | Categorización en 8 tiers + utility score |
-| `zombie_hunter.rs` | <5ms | Detección de dead-weight (3 ciclos de confirmación) |
-| `workload_classifier.rs` | <1ms | Clasificación bayesiana de carga de trabajo (Nivel 2) |
-| `user_profile.rs` | <1ms | Aprendizaje conductual: stats por app, modelo por hora |
-| `hw_predictor.rs` | <1ms | Predicción de tendencias de hardware |
-| `hw_bayes.rs` | <1ms | Modelo bayesiano de hardware |
-| `predictive_agent.rs` | <5ms | Agente predictivo de estado del sistema |
-| `signal_intelligence.rs` | <1ms | Inteligencia de señales del proceso |
-| `outcome_tracker.rs` | <1ms | Seguimiento de resultados de acciones |
-| `entropy_anomaly.rs` | <1ms | Detección de anomalías por entropía |
-| `cusum.rs` | <1ms | CUSUM: detección de cambios de tendencia |
-| `kalman.rs` | <1ms | Filtro de Kalman para señales sucias |
-| `lotka_volterra.rs` | <1ms | Modelo depredador-presa para procesos compitiendo |
-| `mpc_horizon.rs` | <5ms | Control predictivo de modelo (horizonte finito) |
-| `hazard_model.rs` | <1ms | Modelo de riesgo por proceso |
-| `activity_sensor.rs` | <1ms | Sensor de actividad de usuario |
-| `foreground.rs` | <1ms | Detección de app en primer plano |
-| `process_tree.rs` | <1ms | Árbol de procesos padre/hijo |
-
-### Hardware y sistema
-
-| Módulo | Propósito |
-|--------|-----------|
-| `iokit_sensors.rs` | Telemetría hardware via `powermetrics` (temps, potencia, utilización) |
-| `mach_qos.rs` | Clases QoS de Mach: enrutamiento P-Core vs E-Core |
-| `thermal_manager.rs` | Gestión térmica predictiva con historial de 60 muestras |
-| `thermal_interrupt.rs` | Interrupciones térmicas con atomic ordering correcto (Release) |
-| `thermal_bailout.rs` | Estrategia de enfriamiento graduada de 4 fases |
-| `power_management.rs` | Modos de batería, estimación de potencia, acciones críticas |
-| `energy.rs` | Cálculo de consumo energético en mW |
-| `silicon_probe.rs` | Sonda de características del Silicon (AMX, LSE, RNDR) |
-| `amx_detector.rs` | Detección del acelerador AMX (Apple Matrix coprocessor) |
-| `lse_counters.rs` | Contadores de instrucciones LSE (Large System Extensions ARM64) |
-| `smc_reader.rs` | Lectura de sensores SMC directamente |
-
-### Gestión de memoria
-
-| Módulo | Propósito |
-|--------|-----------|
-| `memory_analyzer.rs` | Profiling RSS/VMS/WSS, detección de leaks (>70% crecimiento → leak) |
-| `swap_predictor.rs` | Predicción lineal de swap (30s adelante), tiempo hasta crítico |
-| `compressor_aware.rs` | Gestión de memoria consciente del compresor (Freeze vs Hint) |
-| `vm_surgeon.rs` | Cirujano de memoria virtual: análisis de footprint |
-| `overflow_guard.rs` | Aprendizaje de desbordamientos — ajuste dinámico de thresholds |
-| `jetsam_control.rs` | Control directo de Jetsam (memoria emergencia) |
-| `kqueue_pressure.rs` | Presión de memoria via kqueue EVFILT_VM |
-
-### Subsistemas especializados
-
-| Módulo | Propósito |
-|--------|-----------|
-| `gpu_manager.rs` | Estados de potencia GPU, optimización por carga de trabajo |
-| `network_optimizer.rs` | Perfiles de tuning TCP (HighThroughput, LowLatency, Balanced, Battery) |
-| `network_monitor.rs` | Monitor de actividad de red por proceso |
-| `wake_storm_detector.rs` | Detección de anomalías en tasa de wakeups (>10/s = tormenta) |
-| `process_recovery.rs` | Kill automático + reinicio de procesos con memory leak |
-| `analytics.rs` | Métricas de impacto acumuladas, estimados de energía/CO₂ |
-| `usage_model.rs` | Seguimiento de uso por proceso para `usage top` / `usage explain` |
-| `wait_graph.rs` | Grafo de dependencias IPC — veto de freeze si hay deadlock |
-| `io_tiering.rs` | 5 niveles de prioridad I/O de Darwin via `taskpolicy -d` |
-| `background_collectors.rs` | Colectores de fondo con watchdog |
-| `proc_taskinfo.rs` | Información de tarea de proceso a nivel Mach |
-| `mach_qos.rs` | Control fino de scheduling QoS en el kernel Mach |
-
----
-
-## 6. Pipeline de decisión
+## 1. Diagrama General del Sistema (ASCII)
 
 ```
-                         ┌──────────────────────┐
-                         │   Snapshot del sistema│
-                         │   (sysinfo + IOKit +  │
-                         │    host_statistics64) │
-                         └──────────┬────────────┘
-                                    │
-                         ┌──────────▼────────────┐
-                         │  OverflowGuard         │
-                         │  Aplica thresholds     │
-                         │  dinámicos (bajados    │
-                         │  si hubo overflows)    │
-                         └──────────┬────────────┘
-                                    │
-                         ┌──────────▼────────────┐
-                         │  Clasificación contexto│
-                         │                        │
-                         │  CPU>88% O Mem>90%     │
-                         │  → ThermalConstrained  │
-                         │  CPU>72% O Mem>78%     │
-                         │  → BackgroundPressure  │
-                         │  Resto                 │
-                         │  → InteractiveFocus    │
-                         └──────────┬────────────┘
-                                    │
-           ┌────────────────────────┼──────────────────────┐
-           │                        │                      │
-┌──────────▼──────────┐             │          ┌───────────▼─────────┐
-│  Detección bloqueador│             │          │  Clasificador proc.  │
-│                      │             │          │                      │
-│  Wait-graph scoring: │             │          │  8 tiers × utility   │
-│  interactive_wait    │             │          │  score → decisión    │
-│  × 0.45 +            │             │          │  por proceso         │
-│  cpu_spike × 0.35 +  │             │          │                      │
-│  seen_recent × 0.10  │             │          │  Zombie Hunter en    │
-│  + reactor × 0.10    │             │          │  paralelo            │
-│                      │             │          │                      │
-│  score > 0.30        │             │          └───────────┬─────────┘
-│  → Boost             │             │                      │
-└──────────┬──────────┘             │                      │
-           │                        │                      │
-           └────────────────────────┼──────────────────────┘
-                                    │
-                         ┌──────────▼────────────┐
-                         │  Clasificador de carga │
-                         │  (Bayesiano, Nivel 2)  │
-                         │                        │
-                         │  Confirma/ajusta el    │
-                         │  nivel de agresión     │
-                         │  según tipo de trabajo │
-                         └──────────┬────────────┘
-                                    │
-                         ┌──────────▼────────────┐
-                         │  Seguridad             │
-                         │                        │
-                         │  • Procesos protegidos │
-                         │  • Budgets de acciones │
-                         │  • Allowlist sysctl    │
-                         │  • Procs críticos bg   │
-                         │  • Interactivos apren. │
-                         └──────────┬────────────┘
-                                    │
-                         ┌──────────▼────────────┐
-                         │  Ejecutar acciones     │
-                         │                        │
-                         │  Validar PID →         │
-                         │  verificar identidad → │
-                         │  taskpolicy / renice / │
-                         │  SIGSTOP / SIGCONT /   │
-                         │  sysctl / mdutil       │
-                         └──────────┬────────────┘
-                                    │
-                         ┌──────────▼────────────┐
-                         │  Journal + Métricas    │
-                         │                        │
-                         │  Append JSONL →        │
-                         │  contadores atómicos   │
-                         └───────────────────────┘
-```
-
-### Tipos de acción (`RootAction`)
-
-| Acción | Mecanismo | Reversible |
-|--------|-----------|------------|
-| `BoostProcess` | `taskpolicy -l 0 -t 0` + `renice -10` | Sí (renice 0) |
-| `ThrottleProcess` | `taskpolicy -l {2\|4} -d 4` + `renice {+10\|+20}` | Sí (renice 0) |
-| `FreezeProcess` | `taskpolicy -d 4` + `SIGSTOP` | Sí (SIGCONT) |
-| `UnfreezeProcess` | `SIGCONT` | N/A |
-| `SetSysctl` | `sysctl -w key=value` (solo allowlist) | Sí (guardado previo) |
-| `SetMemorystatus` | `sysctl kern.memorystatus_vm_pressure_send=PID` | Sí |
-| `ToggleSpotlight` | `mdutil -i {on\|off} /` | Sí |
-| `QuarantineDaemon` | Demote I/O + throttle CPU | Sí |
-
----
-
-## 7. Sistema de seguridad y restricciones
-
-### Procesos protegidos (nunca se tocan)
-
-```
-kernel_task   launchd       WindowServer   loginwindow
-configd       securityd     tccd           syspolicyd
-notifyd       hidd          UserEventAgent
-Spotlight     mds           mds_stores     mdworker     mdworker_shared
-```
-
-### Procesos críticos de fondo (throttle ligero, nunca freeze)
-
-```
-podman   docker   colima   qemu-system          // Contenedores
-postgres mysqld   redis-server   mongod          // Bases de datos
-node     python   java     nginx                 // Servidores dev
-go       ruby     php                            // Runtimes de lenguaje
-rustc    cargo                                   // Compilación
-```
-
-### Invariante de interactivos aprendidos
-
-Nunca se throttlea ni congela ningún proceso cuyo nombre coincida con `learned_interactive` (de `LearnedPolicy`) ni con la lista estática hardcoded. Esto aplica en **toda** condición de presión, incluyendo extrema. Los patrones confirmados incluyen: Antigravity, Claude, Brave, rustc/cargo.
-
-### Sysctl permitidos (16 parámetros)
-
-```
-net.inet.tcp.sendspace          net.inet.tcp.recvspace
-net.inet.tcp.delayed_ack        net.inet.tcp.win_scale_factor
-net.inet.tcp.autorcvbufmax      net.inet.tcp.autosndbufmax
-vm.compressor_poll_interval     vm.compressor_sample_min
-kern.maxvnodes                  kern.maxfiles
-kern.ipc.somaxconn              kern.ipc.maxsockbuf
-iogpu.wired_limit_mb            debug.iogpu.wired_limit
-debug.lowpri_throttle_enabled   kern.memorystatus_vm_pressure_send
-```
-
-### Budgets de acciones por ciclo
-
-| Perfil | Boosts | Throttles | Hints | Freezes | Cooldown |
-|--------|--------|-----------|-------|---------|----------|
-| AggressiveRoot | 10 | 20 | 12 | 8 | 10s |
-| BalancedRoot | 6 | 12 | 6 | 4 | 20s |
-| SafeRoot | 3 | 6 | 3 | 2 | 45s |
-
-### Invariantes de seguridad
-
-1. Nunca congelar procesos críticos del sistema (`protected_processes()`)
-2. Nunca congelar trabajo crítico de fondo (`critical_background_processes()`)
-3. Todos los comandos externos usan `std::process::Command` — sin inyección de shell
-4. Escrituras sysctl estrictamente en allowlist — solo 16 claves
-5. Cooldown de transiciones de perfil: 90 segundos
-6. Anti-thrash: >4 transiciones en 10 min → bloquear BalancedRoot por 5 min
-7. Developer floor: nunca bajar a SafeRoot en sesiones interactivas/dev activas
-8. Gracia post-wake: 60s de agresión suprimida tras despertar del sistema
-9. Patrones LLM saneados: máx 80 chars, sin saltos de línea, confianza ≥ 0.80
-10. PIDs congelados en `frozen_state.json` — descongelados al reiniciar daemon
-11. Verificación de identidad PID: `start_sec`/`start_usec` — previene A-B-A recycling
-
----
-
-## 8. Sistema reactivo (kqueue)
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                   Bucle de eventos kqueue                 │
-├─────────────────────────────────────────────────────────┤
-│                                                          │
-│  Nervio 1: EVFILT_VM (Presión de memoria)               │
-│    └─ NOTE_VM_PRESSURE → re-optimización inmediata      │
-│                                                          │
-│  Nervio 2: Darwin Notification (Térmica)                 │
-│    └─ com.apple.system.thermalpressurelevel              │
-│    └─ Cambio de temperatura → cascada térmica           │
-│                                                          │
-│  Nervio 3: Darwin Notification (Ciclo de vida)           │
-│    └─ com.apple.launchd.spawn                            │
-│    └─ Lanzamiento de nuevo proceso → clasificar y decidir│
-│                                                          │
-│  Nervio 4: Darwin Notification (Energía)                 │
-│    └─ com.apple.system.powersources.source               │
-│    └─ Conectar/desconectar AC → cambio de modo de energía│
-│                                                          │
-├─────────────────────────────────────────────────────────┤
-│  Ante cualquier evento:                                  │
-│    1. Incrementar contadores de evento                   │
-│    2. Establecer fast_tick_until (acelerar bucle a 2s)   │
-│    3. Recoger snapshot fresco                            │
-│    4. Ejecutar ciclo de optimización inmediatamente      │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Tick rate adaptivo:**
-- Normal: 60s entre ciclos
-- Carga de trabajo pro detectada: 15s
-- Evento reactor: 2s (durante `fast_tick_duration`)
-
----
-
-## 9. Máquina de estados del gobernador
-
-```
-                 ┌──────────────────────────┐
-                 │        SafeRoot           │
-                 │    (conservador: 3/6/2)   │
-                 └──────────┬───────────────┘
-                            │
-             presión ≥ 0.40 │ 3 consecutivos
-             ───────────────►│
-                            │◄──────────────
-             presión ≤ 0.28 │ 6 consecutivos
-                            │
-                 ┌──────────▼───────────────┐
-                 │       BalancedRoot        │
-                 │    (defecto: 6/12/4)      │
-                 └──────────┬───────────────┘
-                            │
-             presión ≥ 0.72 │ 3 consecutivos
-             ───────────────►│
-                            │◄──────────────
-             presión ≤ 0.55 │ 6 consecutivos
-                            │
-                 ┌──────────▼───────────────┐
-                 │      AggressiveRoot       │
-                 │    (máximo: 10/20/8)      │
-                 └──────────────────────────┘
-
-    Anti-thrash: >4 transiciones en 10 min → bloquear BalancedRoot 5 min
-    Developer floor: sesión dev activa → nunca bajar de BalancedRoot
-    Override manual: perfil fijado por usuario con TTL (expira automáticamente)
-    OverflowGuard: thresholds reales = base - overflow_penalty - build_penalty
-```
-
-**Fórmula de puntuación de presión:**
-```
-score = 0.35 × cpu_pressure
-      + 0.35 × ram_pressure
-      + 0.20 × interactive_wait_ratio
-      + 0.10 × reactor_event_weight
-```
-
-**Presión RAM real (M1 con compresor):**
-```
-ram_pressure = max(kern.memorystatus_level, compressor_ratio × 0.85)
-```
-donde `compressor_ratio = total_uncompressed_pages_in_compressor / total_ram_pages`, leído via `host_statistics64` con `VmStats64` (size=152, offset=144).
-
----
-
-## 10. Overflow Guard
-
-`src/engine/overflow_guard.rs` — aprende de desbordamientos anteriores para prevenir futuros.
-
-**Comportamiento:**
-- **Por evento de overflow:** baja thresholds 5pp (piso: -20pp acumulados)
-- **Recuperación:** +1pp por hora de sistema estable sin overflow
-- **Build mode:** si ≥2 compiladores activos (rustc, cargo, cc, clang) → -8pp adicionales sobre el threshold actual
-- **Persistencia:** `/var/lib/apollo/overflow_history.json`
-
-**Resultado práctico en M1 8GB:**
-- Threshold de presión para AggressiveRoot puede bajar de 0.72 a ~0.52 si el sistema ha tenido 4 overflows recientes
-- Durante compilación activa: threshold efectivo ~0.44
-
----
-
-## 11. Gestión avanzada de memoria
-
-### Compressor-Aware (`compressor_aware.rs`)
-
-Antes de congelar un proceso, Apollo analiza el ratio de compresión de su memoria via `task_info(TASK_VM_INFO)`:
-
-- **Ratio alto (texto/datos):** → **Freeze** via SIGSTOP. El kernel mantiene el proceso comprimido en RAM; la recuperación es casi instantánea.
-- **Ratio bajo (media/cifrado):** → **PressureHint** via `memorystatus_control`. Le pide a la app que libere sus cachés internas de forma segura, evitando Swap I/O costoso.
-
-### Predictor de Swap (`swap_predictor.rs`)
-
-Regresión lineal sobre el uso de swap para predecir colapsos de responsividad con 30 segundos de antelación. Calcula `time_to_critical`.
-
-### Memory Analyzer (`memory_analyzer.rs`)
-
-- Profiling RSS/VMS/WSS por proceso
-- Detección de leaks: crecimiento >70% sostenido → clasificado como leak
-- Reporta `leak_probability` (0.0–1.0)
-
-### Wait-Graph y Freeze Safety
-
-Antes de congelar cualquier proceso, `wait_graph.rs` verifica:
-- Que ningún proceso en primer plano esté esperando un mensaje Mach del candidato
-- Si hay dependencia IPC activa → **veto del freeze** o descongelamiento preventivo del waiter
-
----
-
-## 12. Térmica y energía
-
-### Gestión térmica predictiva (`thermal_manager.rs`)
-
-- Historial de 60 muestras de temperatura
-- Tendencia EMA para predicción
-- Coordinado con `thermal_interrupt.rs` (atómica Release ordering)
-
-### Estrategia de enfriamiento de 4 fases (`thermal_bailout.rs`)
-
-| Fase | Rango | Acción |
-|------|-------|--------|
-| 1 - Suave | 80–85°C | Reduce I/O de fondo, hints de memoria purgeable |
-| 2 - Moderado | 85–90°C | Fuerza tareas de fondo a E-Cores, throttle GPU |
-| 3 - Agresivo | 90–95°C | Congela todos los daemons no esenciales, limita P-Cores al 40% |
-| 4 - Emergencia | >95°C | Congela todo excepto servicios protegidos y app activa; P-Cores al 10% |
-
-### Mach QoS Manager (`mach_qos.rs`)
-
-Control directo del scheduler del kernel via `task_policy_set()`:
-
-| Clase QoS | Target | Efecto |
-|-----------|--------|--------|
-| USER_INTERACTIVE | P-Cores (Firestorm) | Máximo throughput, mínima latencia |
-| USER_INITIATED | P-Cores, menor prioridad | Alto throughput |
-| DEFAULT | Decisión del scheduler | Balanceado |
-| UTILITY | Cores mixtos | Menor impacto energético |
-| BACKGROUND | Solo E-Cores (Icestorm) | I/O throttled, energía mínima |
-
----
-
-## 13. I/O Tiering granular
-
-`io_tiering.rs` utiliza los 5 niveles de prioridad I/O de Darwin via `taskpolicy -d`:
-
-| Tier | Nivel | Para |
-|------|-------|------|
-| 0 - Interactive | Máxima prioridad | Swap paging, compilación activa |
-| 1 - Standard | Normal | Apps de fondo visibles |
-| 2 - Utility | Reducida | Spotlight, Time Machine |
-| 3 - Throttle | Baja | Daemons silenciosos |
-| 4 - Passive | Mínima | Telemetría diferible — solo ejecuta si el SSD está idle |
-
----
-
-## 14. Wait-Graph
-
-`wait_graph.rs` — prevención de deadlocks IPC:
-
-**Análisis de hilos Mach:**
-- Usa `proc_pidinfo` con `PROC_PIDLISTTHREADS` y `PROC_PIDTHREADINFO`
-- Inspecciona `pth_run_state` de cada hilo
-
-**Veto de freeze:**
-- Si el proceso candidato a congelar tiene hilos en `TH_STATE_WAITING` y es probable lock-holder → **veto**
-- Si el proceso en primer plano espera a un proceso de fondo → descongelamiento preventivo del waiter
-
-**Stuck-detection:**
-- Identifica periódicamente PIDs "stuck-frozen" atrapados en mitad de IPC y los recupera
-
----
-
-## 15. Integración LLM Teacher
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    Modo LLM Teacher                           │
-├──────────────────────────────────────────────────────────────┤
-│  Configuración:                                               │
-│    model: gpt-4.1-mini (compatible OpenAI)                   │
-│    min_confidence: 0.80                                       │
-│    max_calls_per_hour: 2                                      │
-│    min_interval: 15 minutos                                   │
-│    timeout: 5 segundos                                        │
-│    training_window: 2 semanas (configurable)                  │
-│                                                               │
-│  Entrada (resumen del sistema):                               │
-│    Presión CPU, estado memoria, nivel térmico,               │
-│    top 10 procesos, perfil actual, patrones actuales         │
-│                                                               │
-│  Salida (JSON estructurado):                                  │
-│    suggest_profile: OptimizationProfile                       │
-│    suggest_latency_target: LatencyTarget                      │
-│    add_interactive_patterns: Vec<String>  (máx 6)            │
-│    add_noise_patterns: Vec<String>  (máx 6)                  │
-│    add_protected_patterns: Vec<String>  (máx 6)              │
-│    confidence: f64  (debe ser ≥ 0.80)                        │
-│    rationale: String                                          │
-│                                                               │
-│  Salvaguardas:                                                │
-│    • Patrones de Spotlight NUNCA aceptados                    │
-│    • Patrones saneados: máx 80 chars, sin saltos de línea    │
-│    • Máx 6 patrones por categoría por llamada                 │
-│    • Gate de confianza: ≥ 0.80 requerido                     │
-│    • Rate limiting: 2 llamadas/hora, 15 min mínimo           │
-│    • Ventana de training expira → vuelve a solo heurísticas  │
-│                                                               │
-│  Almacenamiento:                                              │
-│    /var/lib/apollo/learned_policy.json  (600, root:root)     │
-│    /var/lib/apollo/suggestions.jsonl    (log de respuestas)  │
-│    /var/lib/apollo/feedback.jsonl       (log de ratings)     │
-│    /var/lib/apollo/llm_key_secret      (600, root:root)     │
-└──────────────────────────────────────────────────────────────┘
++================================================================================================+
+|                                   APOLLO OPTIMIZER SYSTEM                                      |
++================================================================================================+
+|                                                                                                |
+|  Binarios:                                                                                     |
+|  +------------------+    +------------------------+    +--------------------+                  |
+|  | apollo-optimizer |    | apollo-optimizerd      |    | apollo-optimizerctl |                 |
+|  | (CLI: snapshot,  |    | (Daemon long-running,  |    | (Client IPC:       |                  |
+|  |  optimize, etc.) |    |  launchd-managed)      |    |  status, profile,  |                  |
+|  +------------------+    +----------+-------------+    |  set-override)     |                  |
+|                                     |                  +--------+-----------+                  |
+|          Unix socket IPC  <---------+---------------------------+                              |
+|          root:     /var/run/apollo-optimizer.sock                                               |
+|          non-root: /tmp/apollo-optimizer.sock                                                  |
+|                                     |                                                          |
++=====================================|==========================================================+
+                                      |
+                                      v
++================================================================================================+
+|                           DAEMON INTERNAL ARCHITECTURE                                         |
++================================================================================================+
+|                                                                                                |
+|  [1] ========================= TELEMETRÍA Y SENSORES =====================================    |
+|  |                                                                                        |   |
+|  |  +-------------------+  +-------------------+  +--------------------+                  |   |
+|  |  | iokit_sensors.rs  |  | smc_direct.rs     |  | kqueue_pressure.rs |                  |   |
+|  |  | GPU%, core watts, |  | CPU temp (Tc0P),  |  | EVFILT_VM:         |                  |   |
+|  |  | temps, fan RPM,   |  | fan speed, board  |  |  NOTE_VM_PRESSURE  |                  |   |
+|  |  | battery mWh       |  | temp, battery     |  | Darwin Notifications:                |   |
+|  |  +-------------------+  +-------------------+  |  thermal, spawn,   |                  |   |
+|  |                                                 |  power source      |                  |   |
+|  |  +-------------------+  +-------------------+  +--------------------+                  |   |
+|  |  | silicon_probe.rs  |  | amx_detector.rs   |                                          |   |
+|  |  | SiliconInfo:      |  | Detecta si el     |  +--------------------+                  |   |
+|  |  |  chip gen (M1/2/3)|  | AMX coprocessor   |  | host_vm_info       |                  |   |
+|  |  |  core count,      |  | está activo (IA   |  | (Mach host_stat64: |                  |   |
+|  |  |  RAM total,       |  | workloads de      |  |  free, active,     |                  |   |
+|  |  |  LSE, RNDR caps   |  | CoreML/PyTorch)   |  |  compressor, swap) |                  |   |
+|  |  +-------------------+  +-------------------+  +--------------------+                  |   |
+|  |                                                                                        |   |
+|  |  +-------------------+  +-------------------+                                          |   |
+|  |  | lse_counters.rs   |  | kpc_counters.rs   |                                          |   |
+|  |  | ARM64 Large Sys.  |  | PMC performance   |                                          |   |
+|  |  | Extension atomics |  | counters (EL0)    |                                          |   |
+|  |  +-------------------+  +-------------------+                                          |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [2] ========================= EFFECTIVE PRESSURE ========================================    |
+|  |                                                                                        |   |
+|  |  effective_pressure.rs — "la presión autoritativa"                                     |   |
+|  |                                                                                        |   |
+|  |  effective = base_kernel_pressure                                                      |   |
+|  |            + hardware_boost     (Warning=+0.15, Critical=+0.30)                        |   |
+|  |            + battery_boost      (Normal=+0.04, LowPower=+0.10, Critical=+0.18)         |   |
+|  |            + thermal_boost      (Phase1=+0.07, Phase2=+0.15, Phase3=+0.25, Phase4=+0.40)|  |
+|  |            + llm_workload_boost (ollama/llama detected=+0.20)                          |   |
+|  |            + charging_stress    (>8W while charging=+0.06)                             |   |
+|  |            + battery_low        (TTE <20min=+0.08)                                     |   |
+|  |            + memory_bandwidth   (AMC >80% saturated=+0.10)                             |   |
+|  |            + smc_thermal        (≥80°C=+0.05, ≥90°C=+0.15, ≥100°C=+0.30)              |   |
+|  |            + battery_overheat   (flag=+0.12)                                           |   |
+|  |                                                                                        |   |
+|  |  Resultado: clamp(0.0, 1.0)                                                            |   |
+|  |  Ejemplo: base=0.60 + hw=0.15 + batt=0.04 + thermal=0.07 = 0.86 → BackgroundPressure  |   |
+|  |           (sin los boosts, 0.60 sería InteractiveFocus y no haría nada)                |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [3] ======================== DOMAIN-GROUPED SHARED STATE ================================    |
+|  |  (Patrón Strangler Fig — 44 campos planos → 6+ grupos de dominio)                     |   |
+|  |                                                                                        |   |
+|  |  +----------------+  +----------------+  +------------------+  +---------------+       |   |
+|  |  | HardwareState  |  | ProcessState   |  | UsageDomainState |  | MetricsState  |       |   |
+|  |  | last_hw_snap   |  | frozen: HashSet|  | UsageModel       |  | RuntimeMetrics|       |   |
+|  |  | hw_status      |  | frozen_since   |  | EffectTracker    |  | 50+ counters  |       |   |
+|  |  | sysctl_status  |  | wake_state     |  | OverflowGuard    |  | cycle_durations|      |   |
+|  |  +----------------+  | last_blockers  |  +------------------+  +---------------+       |   |
+|  |                       +----------------+                                                |   |
+|  |  +----------------+  +----------------+  +--------------------------------------+      |   |
+|  |  | PolicyState    |  | LlmDomainState |  | (otros campos: AdaptiveGovernor,     |      |   |
+|  |  | ProfileGov     |  | llm_cfg        |  |  WorkloadClassifier, UserProfile,    |      |   |
+|  |  | latency_target |  | llm_state      |  |  MachQoS, LearnedPolicy, LV state,  |      |   |
+|  |  | governor_state |  | 5 paths        |  |  RL agent, signal_intelligence)      |      |   |
+|  |  | overflow_guard |  +----------------+  +--------------------------------------+      |   |
+|  |  +----------------+                                                                    |   |
+|  |                                                                                        |   |
+|  |  Impacto: el hot-path (reactor) ya no bloquea las rutinas de reporte de métricas      |   |
+|  |  ni las peticiones API concurrentes. Cada domain se lockea independientemente.          |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [4] ==================== CLASIFICACIÓN DE PROCESOS ======================================    |
+|  |                                                                                        |   |
+|  |  process_classifier.rs — 8 tiers de clasificación heurística                           |   |
+|  |                                                                                        |   |
+|  |  +-- ProcessTier (mayor → menor importancia) ---------------------------------+        |   |
+|  |  |                                                                            |        |   |
+|  |  |  SystemEssential   (launchd, kernel_task, WindowServer, coreaudiod, ...)   |        |   |
+|  |  |  ActiveForeground  (GUI + interacción < 30s)                               |        |   |
+|  |  |  BackgroundVisible (GUI + sin interacción reciente)                        |        |   |
+|  |  |  AppHelper         (Chrome Helper, WebKit, Electron, plugin-container)     |        |   |
+|  |  |  SilentDaemon      (sin GUI, CPU > 0.5%, wakeups > 1/s)                   |        |   |
+|  |  |  Stale             (sin GUI, CPU < 0.5%, wakeups < 1/s, idle > 300s)      |        |   |
+|  |  |  Telemetry         (DiagnosticReporter, analyticsd, Siri, rapportd, ...)   |        |   |
+|  |  |  ZombieOrphan      (is_zombie || padre muerto && ppid != 1)               |        |   |
+|  |  |                                                                            |        |   |
+|  |  +------------------------------------------------------------------------ ---+        |   |
+|  |                                                                                        |   |
+|  |  Scores por proceso:                                                                   |   |
+|  |    utility_score [0,1] = f(GUI, interacción, red, CPU, wakeups, Rosetta, idle)         |   |
+|  |    waste_score   [0,1] = f(tier, wakeups, RSS >200MB, idle >1h)                        |   |
+|  |                                                                                        |   |
+|  |  Ejemplo de utility_score:                                                             |   |
+|  |    GUI + interacción<10s + red activa = 0.50+0.25+0.20+0.05 = 1.00                    |   |
+|  |    sin GUI + idle >1h + wakeups>50 — penalización = 0.50-0.40-0.20 = -0.10 → 0.0      |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [5] ================== ZOMBIE HUNTER ====================================================    |
+|  |                                                                                        |   |
+|  |  zombie_hunter.rs — 5 clases de "peso muerto"                                         |   |
+|  |                                                                                        |   |
+|  |  Clase 1: TrueZombie    (kernel SZOMB)            → Kill inmediato                     |   |
+|  |  Clase 2: Orphan        (padre muerto, ppid≠1)    → Kill inmediato                     |   |
+|  |  Clase 3: GhostHelper   (host ausente >24h)       → Suspend tras 3 ciclos confirm.     |   |
+|  |  Clase 4: WakeupBurner  (>20 wakeups/s, sin GUI)  → NiceToMax tras 3 ciclos confirm.   |   |
+|  |  Clase 5: MemoryHoarder (>256MB RSS, idle >30min) → Suspend tras 3 ciclos confirm.     |   |
+|  |                                                                                        |   |
+|  |  confirmation_cycles = 3: las reglas blandas (3-5) requieren 3 observaciones           |   |
+|  |  consecutivas antes de actuar. Previene falsos positivos por picos momentáneos.        |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [6] ============ ADAPTIVE GOVERNOR ("El Cerebro") =======================================    |
+|  |                                                                                        |   |
+|  |  adaptive_governor.rs — toma la decisión final por proceso                             |   |
+|  |                                                                                        |   |
+|  |  Inputs: ProcessSnapshot + HuntSnapshot + foreground_app + hour_of_day + HwFeatures    |   |
+|  |                                                                                        |   |
+|  |  Cascada de decisión (se evalúa en orden, la primera que matchea gana):                |   |
+|  |                                                                                        |   |
+|  |   1. ZombieOrphan?                        → Kill                                      |   |
+|  |   2. SystemEssential o ActiveForeground?  → Allow (protegido absoluto)                 |   |
+|  |   3. Uptime < 8 segundos?                 → Allow (efímero XPC, se va solo)            |   |
+|  |   4. AppHelper con audio/video/red?       → Allow (romperlo crashea el tab)            |   |
+|  |   5. AppHelper inactivo?                  → Throttle (nunca Freeze)                    |   |
+|  |   6. Telemetry?                           → Throttle (Freeze si workload pesado)       |   |
+|  |   7. Mach ports > 80?                     → Allow (IPC hub — throttle causa beachball) |   |
+|  |   8. LLM cargado (ollama >1GB RSS)?       → Allow si idle<12h (reload cuesta 30s+)    |   |
+|  |   9. I/O activo (pageins>50K, CPU>5%)?    → Allow (backup/encode en curso)             |   |
+|  |  10. SilentDaemon idle (CPU<0.5%, fg>1h)? → Freeze si Rosetta o RSS>1GB, Throttle si no|  |
+|  |  11. Idle graduado (sin GUI):                                                          |   |
+|  |      - > 6h sin foreground → Throttle                                                 |   |
+|  |      - > 12h sin foreground → Freeze                                                  |   |
+|  |  12. Helper del foreground activo?         → Allow (Safari→WebKit, Chrome→Chrome Helper)|  |
+|  |  13. Modo nocturno (00:00-06:00)?          → Throttle daemons idle>15min               |   |
+|  |  14. Stale + utility < 0.05?               → Freeze                                   |   |
+|  |  15. Render pipeline (GPU buffer/faults)?  → Allow (throttle causa frame drops)        |   |
+|  |  16. Waste override (waste ≥ 0.90)?        → Throttle si utility < 0.60                |   |
+|  |  17. Swarm (>30 procs, waste≥0.30)?        → Throttle (Freeze si Rosetta)              |   |
+|  |  18. Wakeup hog (>100 wakeups/s, sin GUI)? → Throttle                                 |   |
+|  |  19. utility < 0.05?                       → Freeze                                   |   |
+|  |  20. utility < 0.20?                       → Throttle                                  |   |
+|  |  21. else                                  → Allow                                     |   |
+|  |                                                                                        |   |
+|  |  Config calibrada por hardware al inicio:                                              |   |
+|  |    M1 8GB:  waste_override = 0.80  (más agresivo — RAM escasa)                         |   |
+|  |    M3 Max:  waste_override = 0.90  (más tolerante — RAM abundante)                     |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [7] ================= PROFILE GOVERNOR ==================================================    |
+|  |                                                                                        |   |
+|  |  profile_governor.rs — máquina de estados para el perfil global del daemon             |   |
+|  |                                                                                        |   |
+|  |  Tres perfiles: SafeRoot ↔ BalancedRoot ↔ AggressiveRoot                               |   |
+|  |                                                                                        |   |
+|  |  Fórmula de presión:                                                                   |   |
+|  |    score = 0.35×cpu + 0.35×ram + 0.20×interactive_wait + 0.10×reactor_events           |   |
+|  |          + swap_boost (min(swap_GB/2, 1.0) × 0.12)                                     |   |
+|  |                                                                                        |   |
+|  |  Crisis override: ram≥0.60 && swap≥1.5GB →                                             |   |
+|  |    crisis_score = 0.60 + clamp(swap-1.5, 0, 1.5)/1.5 × 0.25                           |   |
+|  |    score = max(base, crisis_score) — garantiza cruzar 0.72                             |   |
+|  |                                                                                        |   |
+|  |  Transiciones:                                                                         |   |
+|  |    BalancedRoot → AggressiveRoot:  score≥0.72 × 3 ciclos (2 en Build mode)             |   |
+|  |    BalancedRoot → SafeRoot:        score≤0.28 × 6 ciclos (4 en Idle mode)              |   |
+|  |    AggressiveRoot → BalancedRoot:  score≤0.55 × 6 ciclos                               |   |
+|  |    SafeRoot → BalancedRoot:        score≥0.40 × 3 ciclos                               |   |
+|  |                                                                                        |   |
+|  |  Overrides (prioridad descendente):                                                    |   |
+|  |    1. ManualOverride con TTL (vía apolloctl set-override)                              |   |
+|  |    2. thermal_constrained → cap en BalancedRoot                                        |   |
+|  |    3. anti-thrash lock (>4 transiciones/10min → Balanced 5min)                         |   |
+|  |       ↳ se rompe si ram≥0.60 && swap≥2GB (crisis real)                                 |   |
+|  |    4. workload_onset (cargo/rustc detecado) → AggressiveRoot proactivo                 |   |
+|  |    5. context_switch_burst (3+ cambios/5min, ram<0.70) → AggressiveRoot                |   |
+|  |    6. dev/interactive_floor → mínimo BalancedRoot                                      |   |
+|  |                                                                                        |   |
+|  |  Throttle levels (lectura):                                                            |   |
+|  |    score ≥ 0.72 → "high"  | 0.40..0.72 → "medium"  | < 0.40 → "low"                  |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [8] ================= OVERFLOW GUARD ====================================================    |
+|  |                                                                                        |   |
+|  |  overflow_guard.rs — aprendizaje adaptativo para prevenir OOM                          |   |
+|  |                                                                                        |   |
+|  |  Thresholds base:                                                                      |   |
+|  |    bg_pressure = 0.78, critical = 0.88, extreme = 0.90                                 |   |
+|  |                                                                                        |   |
+|  |  Ajustes aditivos:                                                                     |   |
+|  |    + overflow_offset   (cada overflow: -5pp, piso -20pp, half-life 8h)                 |   |
+|  |    + workload_bonus    (Idle: +3pp, Interactive: +1pp, Build: -3pp, HeavyBuild: -5pp)  |   |
+|  |    + rl_adjustment     (Q-learning Phase 4: corrección aprendida online)               |   |
+|  |    + device_offset     (≤8GB: -5pp, ≤16GB: 0pp, >16GB: +5pp)                          |   |
+|  |                                                                                        |   |
+|  |  Deduplicación: ventana 60s entre eventos del mismo overflow.                          |   |
+|  |  Persistencia: overflow_history.json sobrevive reboots (máx 20 eventos).               |   |
+|  |  Build mode: ≥2 herramientas de compilación activas (rustc, cargo, clang, swift, etc.) |   |
+|  |  Pattern matching: resembles_past_overflow() compara apps actuales con historial.      |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [9] =========== LOTKA-VOLTERRA (Modelo Ecológico de RAM) ================================    |
+|  |                                                                                        |   |
+|  |  lotka_volterra.rs — dinámica competitiva de procesos por RAM                          |   |
+|  |                                                                                        |   |
+|  |  Modelo de competencia interespecífica (Volterra, 1926):                                |   |
+|  |                                                                                        |   |
+|  |    dx/dt = r₁·x·(1 - (x + α₁₂·y)/K)    ← proceso dominante                           |   |
+|  |    dy/dt = r₂·y·(1 - (y + α₂₁·x)/K)    ← resto del sistema                           |   |
+|  |                                                                                        |   |
+|  |    x,y  = fracciones de RAM [0,1]                                                      |   |
+|  |    K    = 1.0 (normalizado)                                                            |   |
+|  |    rᵢ   = growth rate (EWMA α=0.2 del cambio de RSS/dt)                               |   |
+|  |    αᵢⱼ  = coef. competencia (aprendido: si x↑ y y↓ → α↑)                              |   |
+|  |                                                                                        |   |
+|  |  monopoly_risk() [0,1] = raíz cúbica(share × growth × competition)                    |   |
+|  |    Media geométrica: los tres factores deben ser altos para alarma.                    |   |
+|  |    growth_risk normalizado: 0.01/s=moderado, 0.05/s=rápido.                            |   |
+|  |                                                                                        |   |
+|  |  simulate_forward(horizon_secs): Euler explícito, paso 1s, máx 120 pasos.             |   |
+|  |    Predice la fracción de RAM del dominante en `horizon` segundos.                     |   |
+|  |                                                                                        |   |
+|  |  Simplificación clave: solo 2 "especies" (dominante vs resto), no N (O(N²)).           |   |
+|  |  Resetea growth tracking al cambiar de proceso dominante.                              |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [10] ================= EJECUCIÓN Y SEGURIDAD ============================================    |
+|  |                                                                                        |   |
+|  |  safety.rs + capabilities.rs + process_identity.rs + execute_actions.rs                |   |
+|  |                                                                                        |   |
+|  |  Procesos ABSOLUTAMENTE protegidos (nunca throttle/freeze/kill):                       |   |
+|  |    kernel_task  launchd  WindowServer  loginwindow  configd  securityd                 |   |
+|  |    tccd  syspolicyd  notifyd  hidd  UserEventAgent                                     |   |
+|  |    Spotlight  mds  mds_stores  mdworker  mdworker_shared                               |   |
+|  |                                                                                        |   |
+|  |  Background crítico (solo throttle ligero):                                            |   |
+|  |    Contenedores: podman, docker, colima, qemu-system                                   |   |
+|  |    Bases de datos: postgres, mysqld, redis-server, mongod                              |   |
+|  |    Runtimes: node, python, java, nginx, go, ruby, php                                  |   |
+|  |    Compilación: rustc, cargo                                                           |   |
+|  |                                                                                        |   |
+|  |  Render pipeline (nunca throttle — causa frame drops):                                 |   |
+|  |    VDCAssistant, coreservicesd, com.apple.gpu, MTLCompilerService, mediaserverd         |   |
+|  |                                                                                        |   |
+|  |  Budgets por ciclo por perfil:                                                         |   |
+|  |    +--------------------+--------+-----------+--------+----------+                     |   |
+|  |    | Perfil             | Boosts | Throttles | Freezes| Cooldown |                     |   |
+|  |    +--------------------+--------+-----------+--------+----------+                     |   |
+|  |    | AggressiveRoot     |     10 |        20 |      8 |      10s |                     |   |
+|  |    | BalancedRoot       |      6 |        12 |      4 |      20s |                     |   |
+|  |    | SafeRoot           |      3 |         6 |      2 |      45s |                     |   |
+|  |    +--------------------+--------+-----------+--------+----------+                     |   |
+|  |                                                                                        |   |
+|  |  13 invariantes de seguridad:                                                          |   |
+|  |                                                                                        |   |
+|  |    1. Nunca congelar protected_processes().                                            |   |
+|  |    2. Nunca congelar critical_background_processes().                                  |   |
+|  |    3. Comandos vía std::process::Command — sin shell injection.                        |   |
+|  |    4. Sysctl solo sobre allowlist de 16 claves exactas.                                |   |
+|  |    5. Cooldown 90s entre transiciones de perfil.                                       |   |
+|  |    6. Anti-thrash: >4 transiciones/10min → BalancedRoot lock 5min.                     |   |
+|  |    7. Dev floor: sesión activa → nunca bajar a SafeRoot.                               |   |
+|  |    8. Gracia post-wake: 60s de agresión suprimida.                                     |   |
+|  |    9. LLM patterns saneados: max 80 chars, sin newlines, confianza≥0.80.              |   |
+|  |   10. PIDs congelados en frozen_state.json → descongelados al reiniciar.               |   |
+|  |   11. PID identity check: start_sec/start_usec — previene A-B-A recycling.            |   |
+|  |   12. AppHelper = throttle-only (nunca freeze) — Chromium watchdog crashea tab.        |   |
+|  |   13. IPC hubs (>80 Mach ports) = Allow siempre — throttle causa beachballs.           |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [11] =================== LEARNING PIPELINE ==============================================    |
+|  |                                                                                        |   |
+|  |  learning_pipeline.rs — coordinador de mini-batch para 3 subsistemas                   |   |
+|  |                                                                                        |   |
+|  |  LearningObservation:                                                                  |   |
+|  |    { process_name, skill_name?, pre_pressure, post_pressure, workload, cycle }         |   |
+|  |    effective() = (pre - post) >= 0.01                                                  |   |
+|  |                                                                                        |   |
+|  |  batch_size = 8 (default) — acumula, ordena por process_name (cache locality),         |   |
+|  |  luego fan-out a los 3 subsistemas + cross-feed + sync al EffectivenessTracker.        |   |
+|  |                                                                                        |   |
+|  |  ┌──────────────────────────────────────────────────────────────────────┐               |   |
+|  |  │  SUBSISTEMA 1: OutcomeTracker (outcome_tracker.rs)                 │               |   |
+|  |  │  Bayesian per-process weights: (effective+1)/(throttle+2) Laplace  │               |   |
+|  |  │  → Mantiene co-occurrence matrix + experience memory buffer        │               |   |
+|  |  │  → effectiveness() por proceso                                     │               |   |
+|  |  ├──────────────────────────────────────────────────────────────────────┤               |   |
+|  |  │  SUBSISTEMA 2: CausalGraph (causal_graph.rs)                       │               |   |
+|  |  │  Edges: (cause, effect) → CausalEdge                               │               |   |
+|  |  │    confidence = EMA α=0.10 (Bayesian update)                       │               |   |
+|  |  │    avg_delta  = EMA α=0.15 (magnitud del pressure drop)            │               |   |
+|  |  │  eval_delay = 3 ciclos (espera antes de evaluar resultado)         │               |   |
+|  |  │  pending queue ≤ 200 entradas                                      │               |   |
+|  |  │  is_solid: confidence > 0.7 && evidence ≥ 5                        │               |   |
+|  |  │  is_weak:  confidence < 0.25 && evidence ≥ 5                       │               |   |
+|  |  │  impact_score = confidence × avg_delta (ranking real-world)         │               |   |
+|  |  ├──────────────────────────────────────────────────────────────────────┤               |   |
+|  |  │  SUBSISTEMA 3: SkillRegistry (optimization_skills.rs)              │               |   |
+|  |  │  OptimizationSkill = receta aprendida:                              │               |   |
+|  |  │    { name, min_pressure, workload_hint, throttle_targets,          │               |   |
+|  |  │      success_rate, apply_count, success_count }                    │               |   |
+|  |  │  Individual: aprendido de throttles directos                        │               |   |
+|  |  │  Induced (group:/batch:): generado por rule_inducer de co-ocurrencia│              |   |
+|  |  │  is_reliable: apply_count ≥ 5 && success_rate ≥ 0.60              │               |   |
+|  |  │  should_retire: (≥10 apps, <35%) || (≥20 apps, <50% "zombie")     │               |   |
+|  |  │  adapt_pressure: EMA α=0.20 (auto-calibra min_pressure)           │               |   |
+|  |  │  next_trial_skill: round-robin exploration de skills unproven      │               |   |
+|  |  │  purge_unexecutable: elimina si todos los targets son protegidos   │               |   |
+|  |  └──────────────────────────────────────────────────────────────────────┘               |   |
+|  |                                                                                        |   |
+|  |  Cross-feed rules (al flush del batch):                                                |   |
+|  |                                                                                        |   |
+|  |    A. OutcomeTracker → SkillRegistry:                                                  |   |
+|  |       Si effectiveness > 0.7 (≥3 throttles) → boost skill.success_count +1             |   |
+|  |       (acelera convergencia de skills nuevos con evidencia bayesiana fuerte)            |   |
+|  |                                                                                        |   |
+|  |    B. CausalGraph → SkillRegistry:                                                     |   |
+|  |       Si borde sólido (conf>0.7, ≥5 evidencia) && skill.success_rate < 0.5             |   |
+|  |       → +1 éxito artificial (corrige trials con failures anómalos)                     |   |
+|  |                                                                                        |   |
+|  |    C. SkillRegistry → OutcomeTracker:                                                  |   |
+|  |       Si skill.success_rate > 0.8 (≥20 apps) → siembra el prior bayesiano             |   |
+|  |       (sabiduría persistente sobrevive reinicios del daemon)                            |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [12] ============ EFFECTIVENESS TRACKER (F3 Blend) ======================================    |
+|  |                                                                                        |   |
+|  |  effectiveness_tracker.rs — número autoritativo único por proceso                      |   |
+|  |                                                                                        |   |
+|  |  Basado en Thompson Sampling con multi-source Beta posteriors (Russo 2018)             |   |
+|  |                                                                                        |   |
+|  |  Fórmula:                                                                              |   |
+|  |    cred_bayesian = min(bayesian_obs / 20, 1.0)    ← satura a 20 obs                   |   |
+|  |    cred_causal   = min(causal_obs / 5, 1.0)       ← satura a 5 (Pearl dominance)      |   |
+|  |    cred_skill    = min(skill_obs / 10, 1.0)       ← satura a 10                       |   |
+|  |                                                                                        |   |
+|  |    blended = (cred_b×bayes + cred_c×causal + cred_s×skill)                            |   |
+|  |            / (cred_b + cred_c + cred_s)                                                |   |
+|  |                                                                                        |   |
+|  |    Cold start (0 obs) → 0.5 (neutral). NaN guard + clamp [0,1].                       |   |
+|  |                                                                                        |   |
+|  |  Ejemplo de dominancia causal:                                                         |   |
+|  |    Causal: 5 obs → cred=1.0, conf=0.90                                                |   |
+|  |    Bayes:  2 obs → cred=0.10, eff=0.30                                                |   |
+|  |    Score = (0.10×0.30 + 1.0×0.90) / 1.10 = 0.845 ← causal gana                       |   |
+|  |                                                                                        |   |
+|  |  Interpretación:                                                                       |   |
+|  |    ≥ 0.6 → objetivo fiable de throttling                                              |   |
+|  |    0.4–0.6 → neutral / datos insuficientes                                            |   |
+|  |    < 0.4 → throttling históricamente inefectivo                                       |   |
+|  |                                                                                        |   |
+|  |  GC: cada ~500 ciclos elimina entradas con age > max_stale_cycles && obs < min_obs.   |   |
+|  |  Persistence: snapshot() / restore_from_map() para LearnedState.                       |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [13] =================== APOLLO INTELLIGENCE SCORE (AIS) ================================    |
+|  |                                                                                        |   |
+|  |  intelligence_score.rs — métrica compuesta [0, 100] con 6 dimensiones                  |   |
+|  |                                                                                        |   |
+|  |  AIS = Σ wᵢ × Dᵢ(x) × 100                                                            |   |
+|  |                                                                                        |   |
+|  |  +----------------------------+------+----------------------------------------------+  |   |
+|  |  | Dimensión                  | Peso | Qué mide                                    |  |   |
+|  |  +----------------------------+------+----------------------------------------------+  |   |
+|  |  | D1: Decision Precision     | 0.25 | F1 sobre: preserved=40%, noise=30%, int=30% |  |   |
+|  |  | D2: Signal Quality         | 0.20 | Kalman RMSE, CUSUM Fβ(β=2), Hazard calib.  |  |   |
+|  |  | D3: Learning Velocity      | 0.20 | RL speed, Q-var, causal depth, skill rate   |  |   |
+|  |  | D4: Resource Efficiency    | 0.15 | P75 cycle<100ms, skip-rate ~40%, habituation|  |   |
+|  |  | D5: Safety Compliance      | 0.12 | 0 frozen_critical (=0 o score=0), kills,    |  |   |
+|  |  |                            |      | survival acts, failures, overflows          |  |   |
+|  |  | D6: Adaptability           | 0.08 | Profile switch acc, workload class, regime  |  |   |
+|  |  +----------------------------+------+----------------------------------------------+  |   |
+|  |                                                                                        |   |
+|  |  Pareto balanced: todas las dimensiones ≥ 0.30 → ninguna puede mejorar               |   |
+|  |  sin degradar otra.                                                                    |   |
+|  |                                                                                        |   |
+|  |  Grades: S(≥90) A(≥80) B(≥70) C(≥60) D(≥50) F(<50)                                   |   |
+|  |  Regression floor: score ≥ 87.0 en runtime benchmark (daemon M1 estable)               |   |
+|  |                                                                                        |   |
+|  |  D5 Safety: frozen_critical > 0 → score = 0.0 (hard kill switch).                     |   |
+|  |  D2 Kalman: threshold = √P* = 0.0884 (Riccati steady-state, Welch & Bishop 2006).     |   |
+|  |  D2 CUSUM: Fβ con β=2 (recall 4× más importante que precision).                       |   |
+|  |  D3 RL: post-convergence (total_ticks ≥ max_ticks) → speed = 1.0 (stability reward).  |   |
+|  |  D4 Budget: pressure≥0.55 → budget_score=1.0 (running all subsystems is correct).     |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                      |                                                         |
+|  [14] ================= REACTOR KQUEUE =========================== ========================   |
+|  |                                                                                        |   |
+|  |  Hilo separado que escucha eventos del kernel en tiempo real:                          |   |
+|  |                                                                                        |   |
+|  |  Evento 1: EVFILT_VM / NOTE_VM_PRESSURE → re-optimización inmediata                   |   |
+|  |  Evento 2: Darwin Notif thermal (com.apple.system.thermalpressurelevel)                |   |
+|  |  Evento 3: Darwin Notif spawn (com.apple.launchd.spawn)                                |   |
+|  |  Evento 4: Darwin Notif power (com.apple.system.powersources.source)                   |   |
+|  |                                                                                        |   |
+|  |  Ante cualquier evento:                                                                |   |
+|  |    fast_tick_until = now + fast_tick_duration                                           |   |
+|  |    reactor_event_weight += 1 (alimenta pressure_score del gobernador)                  |   |
+|  |    → dispara ciclo de optimización inmediato                                           |   |
+|  |                                                                                        |   |
+|  |  Tick rate adaptivo:                                                                   |   |
+|  |    Idle normal:          60s                                                            |   |
+|  |    Workload pro:         15s                                                            |   |
+|  |    Post-evento kqueue:   2s (durante fast_tick_duration)                                |   |
+|  |                                                                                        |   |
+|  =========================================================================================    |
+|                                                                                                |
++================================================================================================+
 ```
 
 ---
 
-## 16. Capa de telemetría hardware
+## 2. El Ciclo de Vida del Reactor (Execution Flow Detallado)
 
-### IOKit Sensor Reader (`iokit_sensors.rs`)
+Cada "tick" del daemon ejecuta este pipeline completo:
 
-Datos via `powermetrics` (requiere root):
-
-| Sensor | Fuente |
-|--------|--------|
-| Temperatura P-Cluster | Núcleos Firestorm (rendimiento) |
-| Temperatura E-Cluster | Núcleos Icestorm (eficiencia) |
-| Temperatura GPU | Apple GPU |
-| Temperatura NAND | Controlador de almacenamiento |
-| Potencia del paquete (W) | Consumo total del SoC |
-| Potencia CPU (W) | Subsistema CPU |
-| Potencia GPU (W) | Subsistema GPU |
-| Potencia DRAM (W) | Subsistema de memoria |
-| Utilización P-Core (%) | Carga de núcleos de rendimiento |
-| Utilización E-Core (%) | Carga de núcleos de eficiencia |
-| Carga batería (%) | Nivel actual de batería |
-| Tasa de descarga (W) | Drenaje de batería |
-
----
-
-## 17. Persistencia y estado
-
-### Archivos de estado (root: `/var/lib/apollo/`, non-root: `/tmp/`)
-
-| Archivo | Formato | Propósito | Frecuencia |
-|---------|---------|-----------|------------|
-| `journal.jsonl` | JSONL (append) | Audit trail de cada acción (antes/después) | Cada acción |
-| `runtime_metrics.json` | JSON | 50+ contadores | Cada ciclo |
-| `governor_state.json` | JSON | Perfil activo, cooldowns, conteo de transiciones | En transición |
-| `profile_timeline.jsonl` | JSONL (append) | Historial de cambios de perfil | En transición |
-| `frozen_state.json` | JSON | PIDs actualmente congelados | Solo si cambia el set |
-| `wake_state.json` | JSON | Seguimiento de eventos sleep/wake | En sleep/wake |
-| `learned_policy.json` | JSON | Patrones aprendidos por ML | En actualización LLM |
-| `usage_model.json` | JSON | Estadísticas de uso por proceso | Periódico |
-| `overflow_history.json` | JSON | Historial de overflows y thresholds ajustados | En overflow |
-| `suggestions.jsonl` | JSONL (append) | Historial de sugerencias LLM | En llamada LLM |
-| `feedback.jsonl` | JSONL (append) | Ratings del usuario | En feedback |
-
-**Técnica de escritura:** Write-then-Rename — los archivos JSON nunca se corrompen durante apagón súbito.
-
-### Métricas rastreadas (RuntimeMetrics — 50+ campos)
-
-**Contadores de optimización:** cycles, boosts_applied, throttles_applied, freezes_applied, unfreezes_applied, paging_hints_applied, sysctl_applied
-
-**Contadores de seguridad:** failures, invalid_sysctl_denied, critical_background_skips, heuristic_kills_downgraded
-
-**Estado del sistema:** effective_profile, thermal_state, throttle_level, current_workload, ml_confidence
-
-**Térmico/energía:** iokit_p_cluster_temp, iokit_e_cluster_temp, iokit_package_watts
-
-**Reactor:** reactor_pulses, reactor_mode, reactor_health, reactor_events_total
-
-**Supervivencia:** survival_mode_activations, kills_applied, zombies_detected
-
----
-
-## 18. Protocolo IPC
-
-**Socket Unix:** `/var/run/apollo-optimizer.sock` (root) / `/tmp/apollo-optimizer.sock` (non-root)
-
-**Wire format (JSON con tags):**
-```json
-// Petición
-{"type": "SetProfile", "payload": {"profile": "aggressive-root", "ttl_minutes": 60}}
-
-// Respuesta
-{"type": "Ok"}
 ```
-
-**23 variantes de `DaemonRequest`** · **12 variantes de `DaemonResponse`**
-
-**Permisos del socket:**
-- Root: `0o660` (root:staff) — `SetLearnedPolicy` requiere root
-- Non-root: `0o600`
-
----
-
-## 19. Suite de tests
-
-**621 tests totales: 0 fallos, 1 ignored** (`silicon_probe::read_rndr` → SIGILL en EL0, limitación de hardware)
-
-| Nivel | Enfoque | Tests |
-|-------|---------|-------|
-| 1 - Unit | Seguridad, convergencia EMA, bounds | ~20 |
-| 2 - Integration | Módulo safety, enforcement de acciones | ~25 |
-| 3 - Concurrent | Acciones concurrentes, race conditions | ~20 |
-| 4 - Advanced | Restricciones avanzadas, edge cases | ~15 |
-| 5 - Tier1 Extended | Heurísticas extendidas | ~25 |
-| 6 - Tier2 Features | Clasificación ML de carga de trabajo | ~20 |
-| 7 - Tier3 Features | Modo LLM teacher | ~25 |
-| 8 - Adaptive Intelligence | Gobernador adaptivo, recuperación | ~30 |
-| 9 - M1 Native | Características nativas M1 (QoS, sensores) | ~20 |
-| 10 - ML Ligero | Clasificador bayesiano, políticas aprendidas | ~28 |
-| 11 - Subatomic | Tests de bajo nivel, primitivas | ~21 |
-
-```bash
-cargo test                  # Todos los tests
-cargo test level1           # Nivel específico
-cargo test test_nombre      # Test individual
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  TICK START                                                                  │
+│                                                                              │
+│  1. RECOLECCIÓN (~30ms)                                                      │
+│     ├── sysinfo → CPU%, memoria por proceso, PIDs                           │
+│     ├── host_stat64 → RAM kernel {free, active, inactive, compressor, swap} │
+│     ├── iokit_sensors → temperatura, watts, GPU%, ventilador                │
+│     ├── smc_direct → CPU temp (Tc0P), board temp, battery flag              │
+│     └── kqueue_pressure → último evento VM pressure                         │
+│                                                                              │
+│  2. PRESIÓN EFECTIVA (~1ms)                                                  │
+│     └── effective_pressure::compute() → presión autoritativa [0,1]          │
+│                                                                              │
+│  3. OVERFLOW GUARD (~1ms)                                                    │
+│     ├── tick_decay(pressure, compressor) → RL agent tick + offset decay     │
+│     └── thresholds(workload_mode) → bg/critical/extreme dinámicos           │
+│                                                                              │
+│  4. CLASIFICACIÓN Y DECISIÓN (~5ms)                                         │
+│     ├── ProcessClassifier::classify_all() → 8 tiers + utility + waste       │
+│     ├── ZombieHunter::evaluate_all() → dead weight detection                │
+│     ├── AdaptiveGovernor::decide_all_with_hw() → vecor de ProcessDecision   │
+│     ├── LotkaVolterra::update() + monopoly_risk()                           │
+│     └── ProfileGovernor::evaluate() → perfil efectivo + throttle_level      │
+│                                                                              │
+│  5. SEGURIDAD Y FILTRADO (~1ms)                                             │
+│     ├── Filtrar protected_processes()                                        │
+│     ├── Filtrar critical_background_processes()                              │
+│     ├── Wait-graph: si foreground espera al candidato → VETO               │
+│     ├── Budget check: no exceder max boosts/throttles/freezes por ciclo     │
+│     └── Process identity check: start_sec/start_usec match                  │
+│                                                                              │
+│  6. EJECUCIÓN (~10ms)                                                        │
+│     ├── Boost: taskpolicy LATENCY_QOS_TIER_0                                │
+│     ├── Throttle: renice +10 / taskpolicy THROUGHPUT                        │
+│     ├── Freeze: SIGSTOP + registro en frozen_state.json                     │
+│     ├── Kill: SIGKILL (solo zombies confirmados)                            │
+│     └── Journal append: journal.jsonl con estado before/after               │
+│                                                                              │
+│  7. APRENDIZAJE (~2ms)                                                       │
+│     ├── LearningPipeline::push(observation)                                 │
+│     │   └── Si batch.len() >= 8 → flush:                                    │
+│     │       ├── Fan-out a OutcomeTracker, CausalGraph, SkillRegistry        │
+│     │       ├── Cross-feed rules A, B, C                                    │
+│     │       └── Sync EffectivenessTracker (F3 blend)                        │
+│     ├── CausalGraph::evaluate(current_pressure, cycle) → pending resolved   │
+│     └── MetricsReporter::update() → runtime_metrics.json                    │
+│                                                                              │
+│  8. ESTADO Y PERSISTENCIA (~5ms, no cada tick)                              │
+│     ├── governor_state.json (solo en transición)                             │
+│     ├── frozen_state.json (solo si cambió set congelados)                    │
+│     ├── optimization_skills.json (en flush del pipeline)                     │
+│     ├── learned_state.json (periódico)                                       │
+│     └── runtime_metrics.json (cada tick)                                     │
+│                                                                              │
+│  TICK END — sleep hasta próximo tick (2s–60s según modo)                     │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 20. Instalación y despliegue
+## 3. Persistencia y Estado
 
-### Compilación
+| Archivo | Formato | Cuándo se escribe | Contenido |
+|---------|---------|-------------------|-----------|
+| `journal.jsonl` | JSONL append | Cada acción | Acción, PID, nombre, before/after |
+| `runtime_metrics.json` | JSON | Cada tick | 50+ contadores, cycle_durations ring |
+| `governor_state.json` | JSON | En transición de perfil | Perfil, cooldown, override |
+| `profile_timeline.jsonl` | JSONL append | En transición | from, to, reason, score |
+| `frozen_state.json` | JSON | Cambio en set congelados | PIDs + start times |
+| `wake_state.json` | JSON | Eventos sleep/wake | Estado y timestamps |
+| `learned_state.json` | JSON | Periódico | Kalman, CUSUM, Hazard, OutcomeTracker |
+| `overflow_history.json` | JSON | En overflow | Últimos 20 eventos + offset |
+| `optimization_skills.json` | JSON | Flush del pipeline | Map de skills con rates |
+| `rl_threshold.json` | JSON | Cada 50 ticks | Q-table + current_adjustment |
 
-```bash
-cargo build --release     # LTO + native CPU (M1) + panic=abort
-```
-
-Produce 4 binarios:
-- `target/release/apollo-optimizer` (CLI)
-- `target/release/apollo-optimizerd` (Daemon)
-- `target/release/apollo-optimizerctl` (Cliente)
-- `target/release/apollo-menubar` (UI menú nativo)
-
-### Instalación (launchd)
-
-```bash
-./scripts/install-root-daemon.sh
-```
-
-Instala:
-- `/usr/local/libexec/apollo-optimizerd` (binario daemon)
-- `/usr/local/bin/apollo-optimizerctl` (binario cliente)
-- `/Library/LaunchDaemons/com.eduardocortez.systemoptimizerd.plist` (servicio launchd)
-- `/var/lib/apollo/` (directorio de estado, modo 700)
-- `/etc/apollo-optimizer/config.toml` (configuración, modo 600)
-
-### Kill switch
-
-Crear `/var/run/apollo.disable` pausa toda optimización sin desinstalar.
+**Ubicación:** `/var/lib/apollo/` (root) | `/tmp/` (non-root)
+**Técnica:** Write-then-Rename — archivos JSON nunca quedan corruptos ante crash.
+**Startup recovery:** Si el daemon crasheó con PIDs congelados, los descongela al reiniciar.
 
 ---
 
-## 21. Issues de hardening pendientes
+## 4. Glosario Técnico Completo
 
-### Completados
-
-| # | Issue | Fix aplicado |
-|---|-------|-------------|
-| 1–6 | SIGTERM, permisos socket, seed policy, PID recycling, SIGCONT | Implementados en sesiones anteriores |
-| 7 | ~2,500 string allocations/ciclo por `.to_lowercase()` | Pre-lowercase listas + `to_ascii_lowercase()` |
-| 8 | `frozen_state.json` escrito incondicionalmente cada ciclo | Solo escribe si el frozen set cambió |
-| 9 | 19 `.lock()` inconsistentes | Migradas a `.lock_recover()` — 0 instancias sin trait |
-| 10 | `HardwareSnapshot` clonado 6 veces/ciclo | 1 clone al inicio, reutilizado |
-| 11–12 | Tests flaky (doctest SIGILL, timing) | Marcados `no_run` / rangos relajados |
-
-### Pendientes — Arquitectura (prioridad media)
-
-| # | Issue | Impacto |
-|---|-------|---------|
-| A | SharedState con ~44 campos `Arc<Mutex<T>>` — candidatos a agruparse | Menos locks, menos contención |
-| B | `main()` de ~1,900 líneas | Modularidad, testabilidad |
-
-### Pendientes — Limpieza
-
-| Item | Detalle |
-|------|---------|
-| `src/sysctl_tuner.rs` | Archivo huérfano en disco — ya no se compila. Borrar. |
-| `silicon_probe::read_rndr` | Test `#[ignore]` por SIGILL en EL0 — limitación de hardware M1, no es bug. |
+| Término | Significado | Archivo fuente |
+|---------|-------------|----------------|
+| **AIS** | Apollo Intelligence Score — 6 dimensiones × pesos → [0,100] | `intelligence_score.rs` |
+| **F3 Blend** | Mezcla ponderada por credibilidad de 3 fuentes (Bayes + Causal + Skill) | `effectiveness_tracker.rs` |
+| **Solid edge** | Borde causal con confidence > 0.7 && evidence ≥ 5 | `causal_graph.rs` |
+| **Impact score** | confidence × avg_delta — ranking por efecto real | `causal_graph.rs` |
+| **EMA** | Exponential Moving Average — promedio ponderado exponencial | Múltiples |
+| **OverflowGuard** | Módulo que baja thresholds tras overflows (half-life 8h) | `overflow_guard.rs` |
+| **Strangler Fig** | Patrón de refactorización incremental del monolito SharedState | `daemon_state.rs` |
+| **Cross-feed** | Reglas que transfieren conocimiento entre los 3 subsistemas | `learning_pipeline.rs` |
+| **workload_onset** | Build detectado → escala proactivamente a AggressiveRoot | `profile_governor.rs` |
+| **anti-thrash lock** | Bloqueo BalancedRoot por 5min ante >4 oscilaciones/10min | `profile_governor.rs` |
+| **P-Cores / E-Cores** | Firestorm (rendimiento) / Icestorm (eficiencia) del Apple Silicon | `silicon_probe.rs` |
+| **Lotka-Volterra** | Modelo ecológico de competencia por RAM entre procesos | `lotka_volterra.rs` |
+| **monopoly_risk** | Score [0,1] de riesgo de que un proceso acapare toda la RAM | `lotka_volterra.rs` |
+| **ZombieClass** | 5 tipos de procesos inútiles detectados por ZombieHunter | `zombie_hunter.rs` |
+| **ProcessTier** | 8 niveles de clasificación heurística de procesos | `process_classifier.rs` |
+| **utility_score** | [0,1] — qué tan valioso es el proceso para el usuario ahora | `process_classifier.rs` |
+| **waste_score** | [0,1] — qué tan despilfarrador es el proceso | `process_classifier.rs` |
+| **PressureComponents** | Desglose de los 9 boosts que componen la presión efectiva | `effective_pressure.rs` |
+| **RL threshold** | Q-learning agent que ajusta umbrales online (Phase 4) | `rl_threshold.rs` |
+| **device_offset** | Ajuste de thresholds por RAM del dispositivo (±5pp) | `overflow_guard.rs` |
+| **LearnedPolicy** | Patrones aprendidos via LLM teacher (max 80 chars, conf≥0.80) | `llm.rs` |
+| **CUSUM** | Cumulative Sum — detecta cambios de régimen (Page, 1954) | `cusum.rs` |
+| **Kalman** | Filtro 1D para suavizar ruido de presión de memoria | `kalman.rs` |
+| **Hazard model** | Cox proportional hazards — predice probabilidad de OOM | `hazard_model.rs` |
+| **Dyna-Q** | Model-based RL que usa transiciones simuladas (Sutton, 1991) | `rl_threshold.rs` |
 
 ---
 
-*Documento consolidado — reemplaza: `ARQUITECTURA_Y_MANUAL_COMPLETO.md`, `TECHNICAL_DEEP_DIVE.md`, `AGENT_CONTEXT.md`*
-*Refleja el estado real del sistema en commit `951bb98` (2026-03-13)*
+## 5. Referencias Académicas Citadas en el Código
+
+| Referencia | Dónde se usa |
+|---|---|
+| Pearl (2009) "Causality: Models, Reasoning and Inference" | `causal_graph.rs`, `effectiveness_tracker.rs` |
+| Thompson (1933) "On the likelihood that one unknown probability exceeds another" | `effectiveness_tracker.rs` |
+| Russo et al. (2018) "A Tutorial on Thompson Sampling" arXiv:1707.02038 | `effectiveness_tracker.rs` |
+| Auer et al. (2002) "Finite-time Analysis of the Multiarmed Bandit Problem" | `effectiveness_tracker.rs` |
+| Shannon (1948) Information Theory | `intelligence_score.rs` |
+| Bellman (1957) Optimality Principle | `intelligence_score.rs` |
+| Volterra (1926) Competitive species dynamics | `lotka_volterra.rs` |
+| Sutton & Barto (2018) "Reinforcement Learning" §6.3, §6.5 | `intelligence_score.rs` |
+| Welch & Bishop (2006) Kalman filter performance (Riccati P*) | `intelligence_score.rs` |
+| Page (1954) "CUSUM schemes" | `intelligence_score.rs` |
+| Cox (1972) "Regression Models and Life Tables" | `intelligence_score.rs` |
+| Hellerstein (2004) "Feedback Control of Computing Systems" | `intelligence_score.rs` |
+| Jain (1991) "Art of Computer Systems Performance Analysis" | `intelligence_score.rs` |
+| Jaynes (2003) "Probability Theory" (MaxEnt neutral prior) | `intelligence_score.rs` |

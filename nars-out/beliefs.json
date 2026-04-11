@@ -1,346 +1,111 @@
 {
   "beliefs": [
     {
-      "id": "B031",
-      "subject": "nested_learner.rs \u2014 L2\u2192L0 feedback path",
-      "predicate": "gate threshold is constant (0.25), L2 meta-velocity never adjusts it \u2014 paper \u00a76.2 claim unimplemented",
+      "id": "B001",
+      "subject": "HazardModel \u2014 record_overflow() trained on pressure not OOM",
+      "predicate": "confuses proxy signal (swap_ratio) with causal signal (swap velocity)",
       "evidence": [
-        "grep: L1_GATE_THRESHOLD is const not dynamic",
-        "grep: flush_l2() stores l2_context but no caller reads it to adjust gate",
-        "paper_gap: \u00a76.2 'L2 meta-velocity feeds back to L0 gate threshold'",
-        "nested_learner.rs:51 L1_GATE_THRESHOLD: f64 = 0.25",
-        "experiment_passed_iter_2026-04-10"
+        "signal_intelligence.rs: record_overflow() called unconditionally on VmPressureLevel::Critical",
+        "macOS dynamic swap: swap_ratio always ~1.0 when any swap is in use",
+        "hazard_model.rs: base_rate accumulates events on every kqueue Critical (fires at ~80% pressure normal)",
+        "graph: signal_intelligence.rs degree=325 (god node) \u2014 over-coupled, many paths through it",
+        "PENDING_HARDENING: no existing guard on false OOM training signals"
       ],
       "truth": {
-        "f": 0.9500000000000001,
-        "c": 0.99
+        "f": 0.91,
+        "c": 0.982
       },
-      "priority": 0.9405,
-      "category": "implementation_gap",
-      "sources": [
-        "code_grep",
-        "paper_\u00a76.2"
-      ]
+      "priority": 0.894,
+      "root_cause": "Proxy signal confusion: macOS-specific dynamic swap semantics not accounted for in hazard training"
     },
     {
-      "id": "B032",
-      "subject": "causal_graph.mechanism() \u2192 QoS/SIGSTOP routing",
-      "predicate": "MechanismAttribution tracked but never consulted at set_tier call sites \u2014 paper \u00a75.2 claim unimplemented",
+      "id": "B002",
+      "subject": "ThermalManager.seconds_to_throttle: i32 with -1 sentinel",
+      "predicate": "uses magic sentinel value instead of Option<T> \u2014 Rust anti-pattern",
       "evidence": [
-        "grep: causal_graph.rs exposes mechanism() API at line 415",
-        "grep: main.rs set_tier calls use hardcoded Foreground/Background tiers",
-        "grep: zero matches for 'mechanism.*set_tier' or 'set_tier.*mechanism'",
-        "paper_gap: \u00a75.2 'CPU reduction \u2192 QoS tiering rather than SIGSTOP'",
-        "experiment_passed_iter_2026-04-10"
+        "types.rs: RuntimeMetrics::thermal_seconds_to_throttle: i32 with /// -1 = no throttle predicted",
+        "thermal_manager.rs: time_to_throttle() returns -1 in 3 branches as sentinel for None",
+        "main.rs: let mut thermal_seconds_to_throttle: i32 = -1 propagates sentinel to metrics",
+        "Graph: types.rs 64 degree (god file) \u2014 high fan-out amplifies sentinel misuse risk"
       ],
       "truth": {
-        "f": 0.93,
-        "c": 0.98
+        "f": 0.905,
+        "c": 0.975
       },
-      "priority": 0.9114,
-      "category": "implementation_gap",
-      "sources": [
-        "code_grep",
-        "paper_\u00a75.2"
-      ]
+      "priority": 0.882,
+      "root_cause": "Type safety gap: nullable integers bypassing Rust type system, hiding absence semantics"
     },
     {
-      "id": "B033",
-      "subject": "benchmark suite \u2014 continuous workload coverage",
-      "predicate": "165 fixed deterministic scenarios do not cover adversarial/gradual/continuous workloads \u2014 L2 limitation in paper \u00a78.3",
+      "id": "B006",
+      "subject": "Critical bugs hyperedge: pending_trial_skill + cooccurrence_eviction + f32_precision",
+      "predicate": "three confirmed architectural bugs with known fixes (EXTRACTED hyperedge)",
       "evidence": [
-        "paper_gap: \u00a78.3 L2 'does not capture adversarial workloads, multi-hour gradual memory leaks'",
-        "paper_gap: \u00a78.3 'future work: continuous workload simulation benchmark'",
-        "hyperedge_6_nodes | confidence_1.0 | Prediction & Forecasting (B018 revision)",
-        "1602 tests but all deterministic",
-        "experiment_passed_iter_2026-04-10"
-      ],
-      "truth": {
-        "f": 0.9500000000000001,
-        "c": 0.98
-      },
-      "priority": 0.931,
-      "category": "benchmark_gap",
-      "sources": [
-        "paper_\u00a78.3",
-        "hyperedge_B018_revision"
-      ]
-    },
-    {
-      "id": "B021",
-      "subject": "Adams & MacKay 2007 \u2014 Bayesian Online Changepoint Detection \u2194 Uncertainty Quantification",
-      "predicate": "bridges Affective & Cognitive Neuroscience \u2192 Uncertainty Quantification & Ensembles \u2014 novel cross-domain insight",
-      "evidence": [
-        "cross_community_edge",
-        "relation_conceptually_related_to",
-        "confidence_1.0"
-      ],
-      "truth": {
-        "f": 0.8,
-        "c": 1.0
-      },
-      "priority": 0.8,
-      "category": "bridge",
-      "sources": [
-        "surprising_connections"
-      ]
-    },
-    {
-      "id": "B022",
-      "subject": "Yerkes & Dodson 1908 \u2014 Arousal and Performance Law \u2194 Affective & Cognitive Computing",
-      "predicate": "bridges Systems Reliability & Data Management \u2192 Affective & Cognitive Neuroscience \u2014 novel cross-domain insight",
-      "evidence": [
-        "cross_community_edge",
-        "relation_conceptually_related_to",
-        "confidence_1.0"
-      ],
-      "truth": {
-        "f": 0.8,
-        "c": 1.0
-      },
-      "priority": 0.8,
-      "category": "bridge",
-      "sources": [
-        "surprising_connections"
-      ]
-    },
-    {
-      "id": "B015",
-      "subject": "Memory Management & Working Set Papers",
-      "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": [
-        "hyperedge_6_nodes",
-        "confidence_1.0",
-        "EXTRACTED"
+        "Graphify hyperedge [EXTRACTED 1.00]: Critical Architecture Bugs",
+        "bug_pending_trial_skill: SkillTrial not transitioned out of Pending state",
+        "bug_cooccurrence_eviction: LRU eviction removes co-occurrence pairs needed for causal inference",
+        "bug_f32_precision: f32 accumulation in causal weight update causes precision loss vs f64",
+        "PENDING_HARDENING.md: not listed (pre-date this document)"
       ],
       "truth": {
         "f": 0.9,
-        "c": 0.857
-      },
-      "priority": 0.771,
-      "category": "subsystem",
-      "sources": [
-        "hyperedge analysis"
-      ]
-    },
-    {
-      "id": "B018",
-      "subject": "Prediction & Forecasting Papers",
-      "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": [
-        "hyperedge_6_nodes",
-        "confidence_1.0",
-        "EXTRACTED"
-      ],
-      "truth": {
-        "f": 0.9,
-        "c": 0.857
-      },
-      "priority": 0.771,
-      "category": "subsystem",
-      "sources": [
-        "hyperedge analysis"
-      ]
-    },
-    {
-      "id": "B019",
-      "subject": "Affective & Cognitive Science Papers",
-      "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": [
-        "hyperedge_6_nodes",
-        "confidence_1.0",
-        "EXTRACTED"
-      ],
-      "truth": {
-        "f": 0.9,
-        "c": 0.857
-      },
-      "priority": 0.771,
-      "category": "subsystem",
-      "sources": [
-        "hyperedge analysis"
-      ]
-    },
-    {
-      "id": "B020",
-      "subject": "Deep Learning & Neural Architecture Papers",
-      "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": [
-        "hyperedge_7_nodes",
-        "confidence_0.95",
-        "INFERRED"
-      ],
-      "truth": {
-        "f": 0.75,
         "c": 0.9
       },
-      "priority": 0.675,
-      "category": "subsystem",
-      "sources": [
-        "hyperedge analysis"
-      ]
-    },
-    {
-      "id": "B011",
-      "subject": "Causal Reasoning Papers",
-      "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": [
-        "hyperedge_4_nodes",
-        "confidence_1.0",
-        "EXTRACTED"
-      ],
-      "truth": {
-        "f": 0.9,
-        "c": 0.571
-      },
-      "priority": 0.514,
-      "category": "subsystem",
-      "sources": [
-        "hyperedge analysis"
-      ]
-    },
-    {
-      "id": "B016",
-      "subject": "Self-Improvement & Meta-Learning Papers",
-      "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": [
-        "hyperedge_4_nodes",
-        "confidence_1.0",
-        "EXTRACTED"
-      ],
-      "truth": {
-        "f": 0.9,
-        "c": 0.571
-      },
-      "priority": 0.514,
-      "category": "subsystem",
-      "sources": [
-        "hyperedge analysis"
-      ]
-    },
-    {
-      "id": "B001",
-      "subject": "Pearl 2009 \u2014 Causality: Models, Reasoning, and Inference",
-      "predicate": "is a core architectural pillar of Apollo AGI",
-      "evidence": [
-        "god_node_5_edges",
-        "cross_community_bridge"
-      ],
-      "truth": {
-        "f": 0.85,
-        "c": 0.5
-      },
-      "priority": 0.425,
-      "category": "pillar",
-      "sources": [
-        "god_nodes analysis"
-      ]
-    },
-    {
-      "id": "B034",
-      "subject": "causal_graph.prefer_qos_over_sigstop() \u2192 FreezeProcess execution path",
-      "predicate": "method existed in causal_graph.rs and was tested, but never called from main.rs or execute_actions.rs \u2014 CPU-dominant FreezeProcess decisions were always SIGSTOP",
-      "evidence": [
-        "grep: zero matches for 'prefer_qos_over_sigstop' in main.rs before this session",
-        "causal_graph.rs:447 method defined + 3 unit tests passing",
-        "fixed_2026-04-10_commit_94f9fd4"
-      ],
-      "truth": {
-        "f": 1.0,
-        "c": 0.99
-      },
-      "priority": 0.99,
-      "category": "implementation_gap_closed",
-      "sources": ["code_grep", "unwired_audit"]
-    },
-    {
-      "id": "B035",
-      "subject": "effective_pressure::compute() \u2192 _pressure_components discarded",
-      "predicate": "PressureComponents return value computed every cycle but discarded with _ prefix — pressure boost breakdown invisible in metrics and decisions",
-      "evidence": [
-        "grep: '_pressure_components' at main.rs:2672",
-        "PressureComponents has total_boost() and 9 named fields all silently dropped",
-        "fixed_2026-04-10_commit_94f9fd4: renamed + pressure_total_boost/pressure_dominant_factor in metrics"
-      ],
-      "truth": {
-        "f": 1.0,
-        "c": 0.99
-      },
-      "priority": 0.99,
-      "category": "implementation_gap_closed",
-      "sources": ["code_grep", "unwired_audit"]
-    },
-    {
-      "id": "B036",
-      "subject": "collector.rs VmStats64 \u2014 speculative_count never in relief",
-      "predicate": "speculative_count field present in VmStats64 struct (line 501) and read from kernel, but never included in soft_available relief formula — pressure systematically over-reported",
-      "evidence": [
-        "grep: speculative_count in struct, not in soft_available computation",
-        "inactive_count + purgeable_count existed but speculative pages (~3-8% of total) excluded",
-        "fixed_2026-04-10_commit_94f9fd4: soft_available += speculative_count"
-      ],
-      "truth": {
-        "f": 1.0,
-        "c": 0.99
-      },
-      "priority": 0.99,
-      "category": "implementation_gap_closed",
-      "sources": ["code_grep", "unwired_audit"]
-    },
-    {
-      "id": "B037",
-      "subject": "thermal_manager.rs \u2014 ThermalState return discarded",
-      "predicate": "thermal_mgr.update() computed predicted_throttle_level, seconds_to_throttle, thermal_trend every cycle but result was _thermal_state (discarded) — predictive thermal data invisible",
-      "evidence": [
-        "grep: '_thermal_state = thermal_mgr.update()' at main.rs:2221",
-        "ThermalState.seconds_to_throttle valuable for proactive intervention",
-        "fixed_2026-04-10_commit_6ed2ace: 3 new metrics fields wired"
-      ],
-      "truth": {
-        "f": 1.0,
-        "c": 0.99
-      },
-      "priority": 0.99,
-      "category": "implementation_gap_closed",
-      "sources": ["code_grep", "unwired_audit"]
+      "priority": 0.81,
+      "root_cause": "Identified in paper draft (apollo_agi_paper_draft.md) \u2014 implementation gaps from paper-to-code translation"
     },
     {
       "id": "B003",
-      "subject": "nars_belief.rs",
-      "predicate": "is a core architectural pillar of Apollo AGI",
+      "subject": "frozen_state \u2014 ghost PID accumulation after kqueue miss",
+      "predicate": "event-only cleanup without periodic reconciliation fallback",
       "evidence": [
-        "god_node_5_edges",
-        "cross_community_bridge"
+        "main.rs: no periodic reconciliation of frozen_state vs live process table before this fix",
+        "kqueue NOTE_EXIT not registered after daemon restart \u2014 gap window for ghost PIDs",
+        "frozen_ram_mb counts ghost PIDs as frozen memory \u2192 inflated pressure metrics",
+        "Graph: execute_actions.rs degree=84, safety.rs degree=59 \u2014 freeze/unfreeze paths diverge",
+        "Chromium manager: same pattern \u2014 display_turbo.turbo_frozen_pids also accumulates ghosts"
       ],
       "truth": {
-        "f": 0.85,
-        "c": 0.5
+        "f": 0.826,
+        "c": 0.944
       },
-      "priority": 0.425,
-      "category": "pillar",
-      "sources": [
-        "god_nodes analysis"
-      ]
+      "priority": 0.78,
+      "root_cause": "Event-only state management: kqueue is necessary but not sufficient; periodic reconciliation needed as defensive fallback"
+    },
+    {
+      "id": "B004",
+      "subject": "Freeze/thaw lifecycle \u2014 missing pre-sleep unfreeze hook",
+      "predicate": "SIGSTOP'd processes block Jetsam target set during macOS sleep",
+      "evidence": [
+        "main.rs: no sleep notification handling before this diff",
+        "IOKit kIOMessageSystemWillSleep fires ~30s before kernel suspend \u2014 window available",
+        "Frozen PIDs block Jetsam target set \u2192 more aggressive kills of widgets/extensions during sleep",
+        "display_turbo.rs: turbo_frozen_pids had no snapshot/clear API before this diff",
+        "Graph: sleep_notifier.rs in C109 (isolated community, 2 nodes) \u2014 minimal integration"
+      ],
+      "truth": {
+        "f": 0.823,
+        "c": 0.937
+      },
+      "priority": 0.771,
+      "root_cause": "Incomplete OS lifecycle integration: freeze logic covers run-time only, not sleep/wake transitions"
+    },
+    {
+      "id": "B005",
+      "subject": "outcome_tracker.rs + predictive_agent.rs \u2014 god files (500+ degree)",
+      "predicate": "over-coupled orchestrators \u2014 decompose or extract focused traits",
+      "evidence": [
+        "Graph: outcome_tracker.rs degree=515, predictive_agent.rs degree=505 \u2014 top 2 most connected files",
+        "Community C1 cohesion=0.04 \u2014 Outcome Tracker community is fragmented/dumping-ground",
+        "Community C2 cohesion=0.05 \u2014 Learning Context + PredictiveAgent mixed concerns",
+        "autoresearch/redundancy_audit.md: three independent effectiveness rings never cross-feed",
+        "Graph surprise: Effectiveness Tracking 3 rings \u2194 Causal Graph Mechanism Mediation \u2014 duplicate logic"
+      ],
+      "truth": {
+        "f": 0.749,
+        "c": 0.985
+      },
+      "priority": 0.737,
+      "root_cause": "Organic growth without bounded scope: multiple learning loops added to same files over time"
     }
-  ],
-  "meta": {
-    "generated": "2026-04-10",
-    "source": "papers/apollo_agi_paper_draft.md + code grep analysis + unwired-code audit",
-    "new_this_session": [
-      "B031",
-      "B032",
-      "B033",
-      "B034",
-      "B035",
-      "B036",
-      "B037"
-    ],
-    "nars_revisions": [
-      "B033 revised from B018 evidence (Prediction hyperedge + paper \u00a78.3)",
-      "B034-B037 from unwired-code audit session 2026-04-10"
-    ],
-    "baseline_tests": 1608,
-    "baseline_scenarios": "165/165",
-    "last_evolve": "2026-04-10"
-  }
+  ]
 }

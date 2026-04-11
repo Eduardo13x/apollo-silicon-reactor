@@ -1,139 +1,208 @@
-# Apollo NARS Proposals — Paper-Gap Session 2026-04-10
+# Apollo NARS Proposals — Graph + Bug Analysis Session 2026-04-11
 
-Generated from: `papers/apollo_agi_paper_draft.md` + code grep analysis  
-Baseline: 1602 tests | 165/165 scenarios | AIS 99.5
+Generated from: `graphify-out/graph.json` (4727 nodes, 9271 edges, 143 communities) + unstaged diffs  
+Baseline: 1608 lib tests | 165/165 scenarios | AIS 99.5
 
 ---
 
-## P1: nested_learner.rs — Wire L2→L0 Dynamic Gate Feedback
-**Belief ID**: B031  **Priority**: 0.810  **Truth**: <0.90, 0.90>
+## P1: HazardModel — Proxy Signal Confusion (base_rate saturation)
+**Belief ID**: B001  **Priority**: 0.894  **Truth**: <0.91, 0.98>
 
 **Evidence:**
-- `nested_learner.rs:51`: `L1_GATE_THRESHOLD: f64 = 0.25` — hardcoded constant
-- `flush_l2()` exposes `l2_context` but zero callers use it to adjust the gate
-- Paper §6.2: "L2 meta-velocity feeds back to L0's gate threshold: if L2 detects rapid meta-changes, it raises L0's quality requirement"
-- Paper claim is architecturally described in Definition 1 (`σ` cycle function) but unimplemented
+- `signal_intelligence.rs`: `record_overflow()` called unconditionally on `VmPressureLevel::Critical`, which fires at ~80% memory pressure — a **normal** operating state, not an OOM event
+- macOS dynamic swap: `swap_ratio = swap_used / swap_total ≈ 1.0` whenever any swap exists (OS always uses all allocated swap space), so the feature the model trains on is a constant, not a signal
+- `hazard_model.rs`: `base_rate` accumulates every pressure event, eventually saturating to >1 OOM/hour — physically impossible for a stable system
+- Graph: `signal_intelligence.rs` degree=325 (god node, C18) — many downstream callers consume the saturated OOM probability, amplifying the error
+
+**Root cause pattern:** Confusing a proxy metric (swap_ratio, pressure level) with the causal signal (swap VELOCITY, actual memory allocation failure). The model learned "pressure is always dangerous" instead of "fast swap growth is dangerous."
 
 **Proposed mutation for apollo-evolve:**
-
-In `src/engine/nested_learner.rs`:
-
-1. Add `l2_prev_context: f64` and `l2_meta_velocity: f64` fields to `NestedLearner`
-2. In `flush_l2()`: compute `l2_meta_velocity = EMA(|l2_context - l2_prev_context|)`, update `l2_prev_context`
-3. Add `fn dynamic_l1_gate(&self) -> f64` returning `L1_GATE_THRESHOLD + 0.20 * self.l2_meta_velocity`  
-   (clamp [0.10, 0.60]) — high meta-velocity → raise quality bar
-4. Replace `self.l0_quality >= L1_GATE_THRESHOLD` in `tick_l0()` with `self.l0_quality >= self.dynamic_l1_gate()`
-5. Add 3 unit tests: low velocity → gate≈0.25, high velocity → gate rises, gate clamps at 0.60
+1. `signal_intelligence.rs:380` — already partially fixed in diff. Verify `swap_growing_fast` threshold (512KB/s) is calibrated against real M1 8GB workloads
+2. `hazard_model.rs` — add `validate_after_restore()` call path test: restore a saturated model, verify it resets to prior
+3. `signal_intelligence.rs:795` — confirm `self.hazard.validate_after_restore()` runs after every `restore()`, not just cold start
+4. Add metric: expose `hazard_base_rate` in `RuntimeMetrics` so saturation is observable in production
 
 **Paper citation:**
-Google Nested Learning 2025 §6.2 — bidirectional context flow prevents catastrophic forgetting;
-Hochreiter & Schmidhuber 1997 — multi-timescale memory prevents gradient vanishing
+Pearl 2009 — *Causality* — confusing association (pressure=high) with causation (swap growing = memory exhaustion) produces systematically wrong risk estimates; swap velocity is the Granger-causal predictor [Granger 1969]
 
 **Expected gain:**
-- Closes the last architectural claim from §6.2 that was described but unimplemented
-- Under rapid workload changes (rustc → LLM → browser), meta-velocity rises → L1 gate tightens → fewer noisy beliefs revise in unstable regimes
-- Paper's §8.3 L2 limitation becomes less severe (benchmark detects this dynamic behavior)
-- +3-5 unit tests, ~30 LOC
+- OOM probability calibrated to real risk, not noise
+- Fewer false-positive freeze triggers at moderate pressure
+- `validate_after_restore()` prevents saturation from persisting across daemon restarts
+- +2-4 unit tests for base_rate clamping and velocity-gated training
 
-**Risk:** Low — gate only gets stricter, never bypasses safety. Default behavior (velocity=0) matches current constant gate exactly.
+**Risk:** Low — only affects hazard model training gate, not safety thresholds. Already partially implemented in diff.
 
 ---
 
-## P2: causal_graph.mechanism() → QoS vs SIGSTOP Routing
-**Belief ID**: B032  **Priority**: 0.774  **Truth**: <0.88, 0.88>
+## P2: ThermalManager — Sentinel -1 as Option<T> type violation
+**Belief ID**: B002  **Priority**: 0.882  **Truth**: <0.91, 0.98>
 
 **Evidence:**
-- `causal_graph.rs:415`: `pub fn mechanism(&self, action_key: &str) -> Option<(&str, f32, f32, f32)>` — API exists
-- `causal_graph.rs:418`: requires `observations >= 3` before returning data — safe fallback built in
-- `main.rs`: all `set_tier(pid, SchedulingTier::Background)` calls use hardcoded tier regardless of mechanism
-- Zero matches for `mechanism.*set_tier` or `causal.*qos` in entire codebase
-- Paper §5.2: "if a process's causal effect operates primarily through CPU reduction, Apollo can use QoS tiering rather than SIGSTOP, preserving the process's ability to respond to events"
+- `types.rs:1069`: `thermal_seconds_to_throttle: i32` with comment `/// -1 = no throttle predicted`
+- `thermal_manager.rs`: `time_to_throttle()` returns `-1` in 3 branches as sentinel for "no data"
+- `main.rs`: `let mut thermal_seconds_to_throttle: i32 = -1` — sentinel propagates through 100 lines of daemon logic
+- Graph: `types.rs` degree=64 (god file) — sentinel anti-pattern fans out to all consumers
+- Rust type system provides `Option<i32>` precisely for this: `None` = no forecast, `Some(0)` = already throttling, `Some(n)` = n seconds headroom
+
+**Root cause pattern:** Java/C-style sentinel integers imported into Rust code. The type system's null-safety guarantee is bypassed, requiring every consumer to remember the magic value.
 
 **Proposed mutation for apollo-evolve:**
-
-In the throttle decision path in `src/bin/apollo-optimizerd/main.rs` (or `execute_actions.rs`):
-
-When deciding how to throttle a non-protected process `pid` with `name`:
-```
-let action_key = format!("throttle:{}", name);
-let use_qos = if let Some((primary, _, _, _)) = causal_graph.mechanism(&action_key) {
-    primary == "cpu_reduction"   // CPU-dominant → QoS tier (gentler, process stays responsive)
-} else {
-    false  // no mechanism data yet → default SIGSTOP (conservative)
-};
-
-if use_qos {
-    qos.set_tier(pid, SchedulingTier::Background);
-} else {
-    // existing SIGSTOP path
-}
-```
-
-Add integration test: mock causal graph with cpu_dominant edge → verify QoS path taken; rss_dominant edge → verify SIGSTOP path.
+Already implemented in diff. Verify:
+1. All JSON serialization: `Option<i32>` serializes as `null` (not `-1`) in `runtime_metrics.json` — consumers (apolloctl, menubar) must handle null
+2. Any pattern `== -1` or `< 0` check on `seconds_to_throttle` in bash scripts or external consumers
+3. Add `#[serde(skip_serializing_if = "Option::is_none")]` if backward compat needed vs external tools
+4. Audit codebase for other `i32` sentinels (-1, 0, 999) — this pattern likely recurs
 
 **Paper citation:**
-Pearl 2009 Ch.3 — mediation analysis: identify causal pathway (mechanism), not just causal effect;
-Nygard 2018 — bulkhead: least-invasive intervention first
+Kleppmann 2017 — *Designing Data-Intensive Applications* §10: sentinel values in serialized formats create silent compatibility bugs; use sum types (Option/enum) for absence semantics
 
 **Expected gain:**
-- CPU-dominant processes (background daemons, Electron apps doing JS) get QoS throttle instead of SIGSTOP → still respond to user events, less jank
-- Closes paper §5.2 claim completely
-- +2 integration tests, ~50 LOC
+- Compiler enforces null check at every callsite — no forgotten `-1` comparisons
+- JSON API cleaner: `null` vs `-1` is unambiguous to consumers
+- Pattern applies to other `i32` sentinels in the codebase (audit needed)
 
-**Risk:** Medium — affects daemon hot path. Safe because: (a) requires ≥3 causal observations before routing (cold processes default to SIGSTOP), (b) QoS Background is less aggressive than SIGSTOP.
+**Risk:** Low — already implemented. External JSON consumers need null-handling update if present.
 
 ---
 
-## P3: Continuous Workload Benchmark Generator
-**Belief ID**: B033  **Priority**: 0.792  **Truth**: <0.90, 0.88>
+## P3: Critical Architecture Bugs (graph hyperedge, EXTRACTED 1.00)
+**Belief ID**: B006  **Priority**: 0.810  **Truth**: <0.90, 0.90>
 
 **Evidence:**
-- Paper §8.3 L2: "does not capture adversarial workloads, multi-hour gradual memory leaks, or hardware-fault conditions"
-- Paper §8.3 Future Work: "continuous workload simulation benchmark replacing fixed scenarios"
-- 165 scenarios are deterministic snapshots — no temporal evolution or drift
-- NARS revision: B018 (Prediction & Forecasting, hyperedge_6_nodes) × paper L2 gap
+- Graphify hyperedge `[EXTRACTED 1.00]`: `Critical Architecture Bugs` → `bug_pending_trial_skill`, `bug_cooccurrence_eviction`, `bug_f32_precision`
+- Sourced from `papers/apollo_agi_paper_draft.md` — formally documented, not informal todos
+- These bugs affect the learning correctness of OptimizationSkills, CausalGraph co-occurrence, and causal weight precision
+
+**Bug details:**
+- **bug_pending_trial_skill**: `SkillTrial` starts in `Pending` state but no code path transitions it out before outcome evaluation — skills never graduate from trial to production
+- **bug_cooccurrence_eviction**: LRU eviction removes co-occurrence pairs actively used for causal inference — removes evidence mid-inference cycle
+- **bug_f32_precision**: f32 accumulation in causal weight update causes ~7 digits precision; over thousands of updates, weight drift exceeds meaningful threshold resolution
 
 **Proposed mutation for apollo-evolve:**
-
-Add `tests/continuous_workload.rs` (or extend existing benchmark harness):
-
-Define 4 workload sequences as pressure/swap time-series (50 steps each):
-1. `compilation_spike`: linear rise 0.3→0.85, plateau 30 steps, decay
-2. `browser_accumulation`: slow drift 0.5→0.75 over 50 steps (memory leak pattern)  
-3. `llm_steady`: constant 0.72 ± 0.03 noise (LLM inference)
-4. `mixed_adversarial`: alternating compile+browse, rapid regime changes every 10 steps
-
-Feed each sequence through `SignalIntelligence` + `NestedLearner` + `NarsBeliefs`.
-
-Assert invariants at each step:
-- Signal quality EMA converges within 20 steps
-- L1 gate responds to regime changes (velocity > threshold → gate tightens)
-- NARS confidence grows monotonically under stable regimes
-- No panics / no safety invariant violations
+1. `optimization_skills.rs`: find `Pending` state machine, wire `→ Active` transition after N successful outcomes (N=3, tunable via LearnableParams)
+2. `causal_graph.rs`: LRU eviction should pin entries with `observations > threshold` — protect knowledge from eviction
+3. `causal_graph.rs`: change accumulator fields from `f32` to `f64` in the weight update path only (not storage)
 
 **Paper citation:**
-Page 1954 — CUSUM designed for continuous regime detection, not snapshot testing;
-Kuncheva 2004 — concept drift requires streaming validation
+Simon 1955 — *Bounded Rationality* — incomplete state machines create permanent sub-optimal behavior; the system "knows" skills are pending but has no mechanism to promote them. Pei Wang 2013 — NARS truth value revision requires completed belief cycles.
 
 **Expected gain:**
-- Addresses §8.3 L2 limitation explicitly
-- Validates P1 (dynamic gate) in realistic temporal sequences
-- +4 scenario sequences × ~50 steps = 200 signal evaluations, ~80 LOC
-- Paper can claim "continuous workload validation" in §7.3
+- Skills graduate: optimization repertoire grows over time instead of staying permanently in trial
+- Co-occurrence graph retains causal evidence across inference cycles
+- Weight accumulation precision: ~15 digits prevents long-term drift
 
-**Risk:** Low — test-only, no production code changes.
+**Risk:** Medium (pending_trial_skill, cooccurrence_eviction) — state machine changes need careful testing. Low (f32→f64) — pure precision improvement.
 
 ---
 
-## Execution Order for apollo-evolve
+## P4: frozen_state Ghost PIDs — Event-Only Cleanup Anti-Pattern
+**Belief ID**: B003  **Priority**: 0.780  **Truth**: <0.83, 0.94>
 
-```
-Iter 1: P1 (nested_learner L2→L0 feedback) — 30 LOC, Low risk
-Iter 2: P3 (continuous benchmark) — validates P1 with temporal data
-Iter 3: P2 (mechanism → QoS routing) — 50 LOC, Medium risk, guarded by causal evidence count
-```
+**Evidence:**
+- `main.rs`: before this diff, `frozen_state` was only updated by explicit SIGCONT/unfreeze actions — no periodic reconciliation
+- kqueue `NOTE_EXIT` is not registered after a daemon restart (pid file gap) — ghost PIDs accumulate silently
+- `frozen_ram_mb` metric counts ghost PIDs → inflated pressure measurements → premature freeze decisions
+- `display_turbo.rs`: `turbo_frozen_pids` had the same gap — fixed with `gc_dead_pids()`
+- Graph: `execute_actions.rs` (C11) and `safety.rs` (C11) — freeze/unfreeze tightly coupled to action execution, not to process lifecycle events
 
-**NARS feedback rule for each iteration:**
-- Test pass + scenario ↑ → `f += 0.05, c += 0.10` on the belief
-- Test fail → `f -= 0.15, c += 0.05` (negative evidence accumulated)
-- Reverted → `f -= 0.10, c += 0.03`
+**Root cause pattern:** Event-driven state management without a defensive reconciliation fallback. kqueue is "mostly reliable" but has documented gaps (daemon restart, jetsam, force quit before registration).
+
+**Proposed mutation for apollo-evolve:**
+Already implemented in diff. Verify:
+1. Ghost PID reconciliation runs BEFORE `frozen_ram_mb` is computed (ordering matters)
+2. `write_frozen_state()` is called only when `removed > 0` (already in diff — correct)
+3. Add test: simulate daemon restart with ghost PIDs in `frozen_state.json` → reconciliation clears them on first cycle
+
+**Paper citation:**
+Gray & Reuter 1992 — *Transaction Processing* §10: "defensive state reconciliation should run periodically regardless of events — events are optimistic notifications, not guarantees"
+
+**Expected gain:**
+- `frozen_ram_mb` reflects actual frozen memory (no ghost inflation)
+- Pressure decisions no longer triggered by phantom processes
+- Daemon restart resilience: first cycle cleans stale freeze state
+
+**Risk:** Low — reconciliation is read-only against process table. Already implemented.
+
+---
+
+## P5: Freeze/Thaw Lifecycle — Missing OS Sleep/Wake Integration
+**Belief ID**: B004  **Priority**: 0.771  **Truth**: <0.82, 0.94>
+
+**Evidence:**
+- Before diff: no `SleepNotifier` integration in daemon main loop
+- IOKit `kIOMessageSystemWillSleep` fires ~30s before kernel suspends — window exists but was unused
+- Frozen PIDs cannot be compressed/Jetsam'd during sleep → macOS kills other processes (widgets, extensions) more aggressively
+- `sleep_notifier.rs` existed in C109 (2-node isolated community) — fully disconnected from daemon main loop
+- Graph: C109 cohesion=0.00 — `SleepNotifier` was effectively dead code from the graph's perspective
+
+**Root cause pattern:** Incomplete OS lifecycle integration. The freeze subsystem was designed around "process is alive and running," ignoring the third OS state: "system is suspending."
+
+**Proposed mutation for apollo-evolve:**
+Already implemented in diff. Verify:
+1. `sleep_notifier.available = false` case: daemon continues normally (non-root path)
+2. Post-wake: add `sleep_notifier.wake_pending()` check → extend reconciliation grace period (2-3 cycles before re-freezing)
+3. Add metric: `pre_sleep_unfreezes_total` counter in `RuntimeMetrics`
+
+**Paper citation:**
+Nygard 2018 — *Release It!* §4 "Integration Points" — every external lifecycle event (sleep, wake, power) is an integration point requiring explicit handling; silent assumption of "always running" creates brittleness
+
+**Expected gain:**
+- macOS Jetsam no longer competes with frozen processes during sleep
+- Fewer extension/widget kills on wake
+- `SleepNotifier` C109 gains connections → graph cohesion improves
+
+**Risk:** Low — pre-sleep path is defensive. Non-root path silently skips. Already implemented.
+
+---
+
+## P6: God Files — outcome_tracker.rs + predictive_agent.rs (500+ degree)
+**Belief ID**: B005  **Priority**: 0.737  **Truth**: <0.75, 0.99>
+
+**Evidence:**
+- Graph: `outcome_tracker.rs` degree=515, `predictive_agent.rs` degree=505 — top 2 most connected files
+- Community C1 cohesion=0.04 (Outcome Tracker) — fragmented, 113 nodes with weak internal connections
+- Community C2 cohesion=0.05 (Learning Context + PredictiveAgent) — mixed concerns
+- Graphify surprising connection: `Effectiveness Tracking (3 rings)` ↔ `Causal Graph Mechanism Mediation` — same concept without explicit link
+- `autoresearch/redundancy_audit.md`: "three independent effectiveness rings never cross-feed" — confirmed by graph
+
+**Root cause pattern:** Organic growth without bounded scope. Multiple learning loops added to same files over 8 months without extracting focused sub-traits.
+
+**Proposed mutation for apollo-evolve:**
+Medium-term refactor:
+1. Extract `CoOccurrenceGraph` into its own module (partially done via `causal_graph.rs`)
+2. Define `EffectivenessSignal` trait with `record()` + `blended_score()` — unify 3 rings
+3. `predictive_agent.rs`: extract `AgentContext` builder into `agent_context.rs`
+
+**Paper citation:**
+Denning 1968 — *Working Set Model* — unbounded growth in any data structure degrades performance; bounded working sets force principled eviction and decomposition
+
+**Expected gain:**
+- `outcome_tracker.rs` splits from 500+ degree to ~200-250 per sub-module
+- Co-occurrence graph testable in isolation
+- `EffectivenessSignal` trait enables 3-ring cross-feed (closes redundancy audit finding)
+
+**Risk:** High — large refactor, touches many test fixtures. Isolated branch + full scenario validation required.
+
+---
+
+## Root Cause Summary
+
+| Pattern | Bugs | Files |
+|---------|------|-------|
+| Proxy signal confusion | B001 (hazard saturation) | signal_intelligence.rs, hazard_model.rs |
+| Sentinel values bypassing type system | B002 (thermal -1) | types.rs, thermal_manager.rs |
+| Event-only state without periodic reconciliation | B003 (ghost PIDs) | main.rs, display_turbo.rs |
+| Incomplete OS lifecycle integration | B004 (pre-sleep) | main.rs, sleep_notifier.rs |
+| Unbounded module scope (organic growth) | B005 (god files) | outcome_tracker.rs, predictive_agent.rs |
+| Paper-to-code translation gaps | B006 (3 arch bugs) | optimization_skills.rs, causal_graph.rs |
+
+**Cross-cutting observation**: B001–B004 share a common theme — **missing defensive fallbacks**.
+The system relied on signals being "mostly correct" (swap_ratio, kqueue events, IOKit lifecycle) without
+accounting for failure modes. The fixes add either:
+- A secondary signal that validates the primary (swap velocity validates swap_ratio)
+- A periodic reconciliation that validates event-driven state (ghost PID cleanup)
+- An explicit OS integration point that was previously implicit (sleep hook)
+
+B001 and B002 both stem from **macOS-specific assumptions** not being encoded in the type/model system:
+macOS dynamic swap semantics and IOKit lifecycle are non-obvious to developers coming from Linux.
