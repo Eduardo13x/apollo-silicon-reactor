@@ -1141,9 +1141,7 @@ mod tests {
         assert!(ChromiumManager::is_gpu_helper("Brave Browser Helper (GPU)"));
         assert!(ChromiumManager::is_gpu_helper("Google Chrome Helper (GPU)"));
         assert!(ChromiumManager::is_gpu_helper("Slack Helper (GPU)"));
-        assert!(!ChromiumManager::is_gpu_helper(
-            "Brave Browser Helper (Renderer)"
-        ));
+        assert!(!ChromiumManager::is_gpu_helper("Brave Browser Helper (Renderer)"));
         assert!(!ChromiumManager::is_gpu_helper("Brave Browser"));
     }
 
@@ -1198,11 +1196,7 @@ mod tests {
         mgr.update(&procs, None, &none_set, &none_set);
 
         let info = mgr.renderers.get(&100).expect("renderer must be tracked");
-        assert!(
-            info.consecutive_idle_cycles >= 2,
-            "idle counter should be ≥ 2 after 3 updates: got {}",
-            info.consecutive_idle_cycles
-        );
+        assert!(info.consecutive_idle_cycles >= 2, "idle counter should be ≥ 2 after 3 updates: got {}", info.consecutive_idle_cycles);
     }
 
     #[test]
@@ -1223,10 +1217,7 @@ mod tests {
         mgr.update(&active, None, &none_set, &none_set);
 
         let info = mgr.renderers.get(&100).unwrap();
-        assert_eq!(
-            info.consecutive_idle_cycles, 0,
-            "idle counter must reset to 0 after CPU spike"
-        );
+        assert_eq!(info.consecutive_idle_cycles, 0, "idle counter must reset to 0 after CPU spike");
     }
 
     // ── MAX_FREEZE_RATIO enforcement ───────────────────────────────────────────
@@ -1254,11 +1245,7 @@ mod tests {
         let freeze_count = mgr.renderers.values().filter(|r| r.frozen).count();
 
         // 50% of 4 = 2, so at most 2 should be frozen
-        assert!(
-            freeze_count <= 2,
-            "MAX_FREEZE_RATIO violated: {} frozen out of 4 (max=2)",
-            freeze_count
-        );
+        assert!(freeze_count <= 2, "MAX_FREEZE_RATIO violated: {} frozen out of 4 (max=2)", freeze_count);
     }
 
     // ── Renderer with assertion must not be frozen ─────────────────────────────
@@ -1281,10 +1268,7 @@ mod tests {
         }
 
         let info = mgr.renderers.get(&pid).unwrap();
-        assert!(
-            !info.frozen,
-            "renderer with power assertion must never be frozen"
-        );
+        assert!(!info.frozen, "renderer with power assertion must never be frozen");
     }
 
     // ── main_frozen PIDs must not be touched ───────────────────────────────────
@@ -1541,12 +1525,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            thaws.len(),
-            2,
-            "Both frozen Brave renderers must thaw on fg change, got {:?}",
-            thaws
-        );
+        assert_eq!(thaws.len(), 2, "Both frozen Brave renderers must thaw on fg change, got {:?}", thaws);
         assert!(thaws.contains(&200), "pid 200 must be thawed");
         assert!(thaws.contains(&201), "pid 201 must be thawed");
     }
@@ -1582,10 +1561,7 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 500))
             .collect();
-        assert!(
-            !thaws.is_empty(),
-            "Foreground-browser renderer must thaw at MAX_FOREGROUND_FROZEN_CYCLES"
-        );
+        assert!(!thaws.is_empty(), "Foreground-browser renderer must thaw at MAX_FOREGROUND_FROZEN_CYCLES");
     }
 
     /// Bug fix #2: Max-freeze-duration guard — renderer frozen too long gets
@@ -1612,10 +1588,7 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 300))
             .collect();
-        assert!(
-            !thaws.is_empty(),
-            "Renderer must be thawed after MAX_FROZEN_CYCLES"
-        );
+        assert!(!thaws.is_empty(), "Renderer must be thawed after MAX_FROZEN_CYCLES");
     }
 
     /// Bug fix #4: E-core demotion must not be re-emitted every cycle for the
@@ -1641,10 +1614,7 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. }))
             .count();
-        assert_eq!(
-            demotions2, 0,
-            "Subsequent cycles must NOT re-emit demotion for same PID"
-        );
+        assert_eq!(demotions2, 0, "Subsequent cycles must NOT re-emit demotion for same PID");
     }
 
     /// Bug fix #3: FreezeSource::ChromiumManager must exist as distinct variant.
@@ -1794,12 +1764,7 @@ mod tests {
 
         // After 31+ cycles, at least one of the renderers must be in frozen_pids.
         // MAX_FREEZE_RATIO caps at floor(2 * 0.5) = 1, so exactly 1 gets frozen.
-        assert!(
-            mgr.frozen_pids.contains(&811) || mgr.frozen_pids.contains(&812),
-            "at least one long-idle renderer must be frozen at low pressure \
-             (frozen_pids={:?})",
-            mgr.frozen_pids
-        );
+        assert!(mgr.frozen_pids.contains(&811) || mgr.frozen_pids.contains(&812), "at least one long-idle renderer must be frozen at low pressure (frozen_pids={:?})", mgr.frozen_pids);
     }
 
     /// Iter 2: short-idle renderer stays running at low pressure.
@@ -1852,12 +1817,7 @@ mod tests {
         mgr.update(&procs, None, &none_set, &none_set);
         mgr.update(&procs, None, &none_set, &none_set);
 
-        assert!(
-            mgr.frozen_pids.contains(&901) || mgr.frozen_pids.contains(&902),
-            "build preemption must freeze a background renderer within 2 cycles \
-             (frozen_pids={:?})",
-            mgr.frozen_pids
-        );
+        assert!(mgr.frozen_pids.contains(&901) || mgr.frozen_pids.contains(&902), "build preemption must freeze a background renderer within 2 cycles (frozen_pids={:?})", mgr.frozen_pids);
     }
 
     /// Iter 3: build preemption does NOT fire when not set, at low pressure.
