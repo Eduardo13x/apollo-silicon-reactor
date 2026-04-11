@@ -27,11 +27,16 @@ pub struct LlmConfig {
     pub timeout_ms: Option<u64>,
     /// If true (default), request JSON-only output where supported.
     pub force_json: Option<bool>,
+    /// If true, bypass the training-TTL gate and auto-enable for local endpoints (Gemma 4, Ollama).
+    pub always_on: Option<bool>,
 }
 
 impl LlmConfig {
     pub fn enabled(&self) -> bool {
         self.enabled.unwrap_or(false)
+    }
+    pub fn always_on(&self) -> bool {
+        self.always_on.unwrap_or(false)
     }
     pub fn endpoint(&self) -> String {
         self.endpoint
@@ -95,6 +100,20 @@ pub struct LlmState {
     pub last_suggestion: Option<LlmSuggestion>,
     pub policy_updates_day: Option<DateTime<Utc>>,
     pub policy_updates_today: u32,
+
+    // ── Feedback loop: rastreo del resultado de sugerencias de Gemma ──────
+    /// Presión en el momento en que se aplicó la última sugerencia (baseline).
+    #[serde(default)]
+    pub pending_outcome_pressure: Option<f64>,
+    /// Timestamp cuando se aplicó la sugerencia (medir delta 30s después).
+    #[serde(default)]
+    pub pending_outcome_at: Option<DateTime<Utc>>,
+    /// Snippet del rationale de la sugerencia pendiente.
+    #[serde(default)]
+    pub pending_outcome_rationale: Option<String>,
+    /// Resultado medido de la última sugerencia — cerrado el loop.
+    #[serde(default)]
+    pub last_suggestion_outcome: Option<SuggestionOutcome>,
 }
 
 impl LlmState {
@@ -135,6 +154,30 @@ impl Default for LlmSuggestion {
             rationale: String::new(),
         }
     }
+}
+
+/// Resultado medido de una sugerencia de Gemma — cierra el loop de feedback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestionOutcome {
+    pub applied_at: DateTime<Utc>,
+    pub pressure_before: f64,
+    pub pressure_after: f64,
+    /// Negativo = presión mejoró. Positivo = empeoró.
+    pub pressure_delta: f64,
+    /// Primeras 80 chars del rationale de Gemma para contexto.
+    pub rationale_snippet: String,
+}
+
+/// Contexto rico que Apollo pasa al LLM teacher en cada llamada.
+/// Contiene todo lo que Apollo ha aprendido sobre el sistema.
+pub struct TeacherContext<'a> {
+    /// Scores Bayesianos por proceso: (nombre, throttle_count, effectiveness 0–1).
+    /// Solo incluye patrones con ≥3 throttles (señal estadística suficiente).
+    pub pattern_scores: &'a [(String, u32, f64)],
+    /// Resultado medido de la sugerencia anterior de Gemma (si existe).
+    pub previous_outcome: Option<&'a SuggestionOutcome>,
+    /// El OutcomeTracker detectó que el heurístico está fallando.
+    pub heuristic_struggling: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -265,6 +308,17 @@ pub fn policy_path_root(is_root: bool) -> PathBuf {
         PathBuf::from("/var/lib/apollo/learned_policy.json")
     } else {
         PathBuf::from("/tmp/apollo-learned_policy.json")
+    }
+}
+
+/// Write-ahead log for pending_trial_skill — survives daemon crash (BUG-01).
+/// Written immediately when a skill trial is registered; deleted on resolution.
+/// [Gray & Reuter 1992 §11 — crash recovery via write-ahead]
+pub fn pending_trial_path(is_root: bool) -> PathBuf {
+    if is_root {
+        PathBuf::from("/var/lib/apollo/pending_trial.json")
+    } else {
+        PathBuf::from("/tmp/apollo-pending_trial.json")
     }
 }
 
@@ -428,6 +482,7 @@ impl LlmAdvisor {
         snapshot: &SystemSnapshot,
         api_key: &str,
         policy: Option<&LearnedPolicy>,
+        teacher: Option<&TeacherContext<'_>>,
     ) -> Result<LlmSuggestion, LlmCallError> {
         // Extra guard: don't try too frequently on repeated failures.
         if let Some(last) = self.last_attempt {
@@ -437,7 +492,7 @@ impl LlmAdvisor {
         }
         self.last_attempt = Some(Instant::now());
 
-        let summary = build_summary(snapshot);
+        let summary = build_summary(snapshot, teacher);
         let policy_context = policy.map(build_policy_context).unwrap_or_default();
         let system_prompt = r#"You are an optimization advisor for a macOS system optimizer daemon.
 
@@ -461,6 +516,9 @@ Constraints:
 - Do NOT add processes already in the current policy lists (they are already classified).
 - Do NOT put the same process in both noise and protected.
 - low-value processes have been throttled many times with no effect; consider adding them to protected instead of noise.
+- 'PatternEffectiveness' shows measured Bayesian throttle outcomes. If effectiveness < 0.30, the process is NOT causing pressure — suggest protected, not noise.
+- 'PreviousGemmaSuggestion outcome' shows what happened after your last advice. If WORSENED or NO_EFFECT, revise your strategy.
+- 'HEURISTIC_STRUGGLING' means Apollo's rule-based system cannot reduce pressure — be more decisive in your suggestions.
 "#;
 
         let user_prompt = format!(
@@ -687,7 +745,7 @@ fn build_policy_context(policy: &LearnedPolicy) -> String {
     out
 }
 
-fn build_summary(snapshot: &SystemSnapshot) -> String {
+fn build_summary(snapshot: &SystemSnapshot, teacher: Option<&TeacherContext<'_>>) -> String {
     #[derive(Serialize)]
     struct Summary<'a> {
         cpu_global: f32,
@@ -705,5 +763,57 @@ fn build_summary(snapshot: &SystemSnapshot) -> String {
         thermal_level: &snapshot.pressure.thermal_level,
         top_processes: &snapshot.top_processes,
     };
-    serde_json::to_string_pretty(&s).unwrap_or_default()
+    let mut out = serde_json::to_string_pretty(&s).unwrap_or_default();
+
+    if let Some(ctx) = teacher {
+        // Bayesian effectiveness scores por proceso
+        let scored: Vec<_> = ctx
+            .pattern_scores
+            .iter()
+            .filter(|(_, count, _)| *count >= 3)
+            .collect();
+        if !scored.is_empty() {
+            out.push_str("\n\nPatternEffectiveness (Bayesian, throttle_count ≥ 3):\n");
+            for (name, count, eff) in scored.iter().take(14) {
+                let tag = if *eff < 0.30 {
+                    "NOT_CAUSING_PRESSURE"
+                } else if *eff > 0.75 {
+                    "confirmed_noise"
+                } else {
+                    "uncertain"
+                };
+                out.push_str(&format!(
+                    "  {} count={} effectiveness={:.2} [{}]\n",
+                    name, count, eff, tag
+                ));
+            }
+        }
+
+        // Resultado de la sugerencia anterior de Gemma
+        if let Some(prev) = ctx.previous_outcome {
+            let verdict = if prev.pressure_delta < -0.05 {
+                "IMPROVED"
+            } else if prev.pressure_delta > 0.03 {
+                "WORSENED"
+            } else {
+                "NO_EFFECT"
+            };
+            out.push_str(&format!(
+                "\nPreviousGemmaSuggestion outcome: {} (pressure delta {:+.3}, before={:.3} after={:.3})\nYour rationale was: \"{}\"\n",
+                verdict,
+                prev.pressure_delta,
+                prev.pressure_before,
+                prev.pressure_after,
+                prev.rationale_snippet
+            ));
+        }
+
+        if ctx.heuristic_struggling {
+            out.push_str(
+                "\nHEURISTIC_STRUGGLING=true — Apollo's rule-based optimizer cannot reduce pressure with current patterns.\n",
+            );
+        }
+    }
+
+    out
 }

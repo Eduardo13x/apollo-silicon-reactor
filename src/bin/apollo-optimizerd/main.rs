@@ -59,8 +59,9 @@ use apollo_optimizer::engine::kqueue_pressure;
 use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
 use apollo_optimizer::engine::learned_state::{LearnableParams, LearnedState, RestoreQualityMonitor};
 use apollo_optimizer::engine::llm::{
-    feedback_path_root, load_repo_config, policy_path_root, read_json, state_paths_root,
-    suggestions_path_root, write_json, LearnedPolicy, LlmAdvisor, LlmConfig, LlmState,
+    delete_file_best_effort, feedback_path_root, load_repo_config, pending_trial_path,
+    policy_path_root, read_json, state_paths_root, suggestions_path_root, write_json,
+    write_json_critical, LearnedPolicy, LlmAdvisor, LlmConfig, LlmState,
 };
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
@@ -455,6 +456,7 @@ fn main() -> anyhow::Result<()> {
                 min_interval_secs: None,
                 timeout_ms: None,
                 force_json: None,
+                always_on: None,
             });
 
             let (llm_state_path, llm_key_path) = state_paths_root(is_root);
@@ -999,6 +1001,16 @@ fn main() -> anyhow::Result<()> {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
                 restored_trial_skill = learned.pending_trial_skill.clone();
+                // BUG-01: WAL fallback — if LearnedState didn't carry a pending trial
+                // (e.g., daemon crashed before periodic persist), recover from WAL file.
+                if restored_trial_skill.is_none() {
+                    if let Ok(data) = apollo_optimizer::engine::types::HardPath::read_to_string_limited(
+                        &pending_trial_path(is_root),
+                        512,
+                    ) {
+                        restored_trial_skill = serde_json::from_str::<Option<(String, f64)>>(&data).ok().flatten();
+                    }
+                }
                 // apply() restores skills from learned_state.json if present,
                 // overwriting the legacy optimization_skills.json load above.
                 // If skill_registry field is absent (old file), the legacy load is kept.
@@ -4225,6 +4237,8 @@ fn main() -> anyhow::Result<()> {
                             pressure_before as f32,
                         );
                         pending_trial_skill = None;
+                        // BUG-01: delete WAL file now that trial is resolved.
+                        delete_file_best_effort(&pending_trial_path(is_root));
                     }
 
                     let trial = lctx.skill_registry.next_trial_skill(
@@ -4298,7 +4312,14 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         if trialed {
-                            pending_trial_skill = Some((skill_name, pressure_before));
+                            pending_trial_skill = Some((skill_name.clone(), pressure_before));
+                            // BUG-01: write-ahead so trial survives daemon crash.
+                            // [Gray & Reuter 1992 §11 — write-ahead crash recovery]
+                            write_json_critical(
+                                &pending_trial_path(is_root),
+                                &pending_trial_skill,
+                                Some(0o600),
+                            );
                         } else if targets_found_but_skipped {
                             // At least one target exists but is foreground-protected this cycle.
                             // This is NOT an ineffective outcome — the skill simply couldn't run.
