@@ -237,6 +237,74 @@
       ]
     },
     {
+      "id": "B034",
+      "subject": "causal_graph.prefer_qos_over_sigstop() \u2192 FreezeProcess execution path",
+      "predicate": "method existed in causal_graph.rs and was tested, but never called from main.rs or execute_actions.rs \u2014 CPU-dominant FreezeProcess decisions were always SIGSTOP",
+      "evidence": [
+        "grep: zero matches for 'prefer_qos_over_sigstop' in main.rs before this session",
+        "causal_graph.rs:447 method defined + 3 unit tests passing",
+        "fixed_2026-04-10_commit_94f9fd4"
+      ],
+      "truth": {
+        "f": 1.0,
+        "c": 0.99
+      },
+      "priority": 0.99,
+      "category": "implementation_gap_closed",
+      "sources": ["code_grep", "unwired_audit"]
+    },
+    {
+      "id": "B035",
+      "subject": "effective_pressure::compute() \u2192 _pressure_components discarded",
+      "predicate": "PressureComponents return value computed every cycle but discarded with _ prefix — pressure boost breakdown invisible in metrics and decisions",
+      "evidence": [
+        "grep: '_pressure_components' at main.rs:2672",
+        "PressureComponents has total_boost() and 9 named fields all silently dropped",
+        "fixed_2026-04-10_commit_94f9fd4: renamed + pressure_total_boost/pressure_dominant_factor in metrics"
+      ],
+      "truth": {
+        "f": 1.0,
+        "c": 0.99
+      },
+      "priority": 0.99,
+      "category": "implementation_gap_closed",
+      "sources": ["code_grep", "unwired_audit"]
+    },
+    {
+      "id": "B036",
+      "subject": "collector.rs VmStats64 \u2014 speculative_count never in relief",
+      "predicate": "speculative_count field present in VmStats64 struct (line 501) and read from kernel, but never included in soft_available relief formula — pressure systematically over-reported",
+      "evidence": [
+        "grep: speculative_count in struct, not in soft_available computation",
+        "inactive_count + purgeable_count existed but speculative pages (~3-8% of total) excluded",
+        "fixed_2026-04-10_commit_94f9fd4: soft_available += speculative_count"
+      ],
+      "truth": {
+        "f": 1.0,
+        "c": 0.99
+      },
+      "priority": 0.99,
+      "category": "implementation_gap_closed",
+      "sources": ["code_grep", "unwired_audit"]
+    },
+    {
+      "id": "B037",
+      "subject": "thermal_manager.rs \u2014 ThermalState return discarded",
+      "predicate": "thermal_mgr.update() computed predicted_throttle_level, seconds_to_throttle, thermal_trend every cycle but result was _thermal_state (discarded) — predictive thermal data invisible",
+      "evidence": [
+        "grep: '_thermal_state = thermal_mgr.update()' at main.rs:2221",
+        "ThermalState.seconds_to_throttle valuable for proactive intervention",
+        "fixed_2026-04-10_commit_6ed2ace: 3 new metrics fields wired"
+      ],
+      "truth": {
+        "f": 1.0,
+        "c": 0.99
+      },
+      "priority": 0.99,
+      "category": "implementation_gap_closed",
+      "sources": ["code_grep", "unwired_audit"]
+    },
+    {
       "id": "B003",
       "subject": "nars_belief.rs",
       "predicate": "is a core architectural pillar of Apollo AGI",
@@ -257,16 +325,21 @@
   ],
   "meta": {
     "generated": "2026-04-10",
-    "source": "papers/apollo_agi_paper_draft.md + code grep analysis",
+    "source": "papers/apollo_agi_paper_draft.md + code grep analysis + unwired-code audit",
     "new_this_session": [
       "B031",
       "B032",
-      "B033"
+      "B033",
+      "B034",
+      "B035",
+      "B036",
+      "B037"
     ],
     "nars_revisions": [
-      "B033 revised from B018 evidence (Prediction hyperedge + paper \u00a78.3)"
+      "B033 revised from B018 evidence (Prediction hyperedge + paper \u00a78.3)",
+      "B034-B037 from unwired-code audit session 2026-04-10"
     ],
-    "baseline_tests": 3672,
+    "baseline_tests": 1608,
     "baseline_scenarios": "165/165",
     "last_evolve": "2026-04-10"
   }
