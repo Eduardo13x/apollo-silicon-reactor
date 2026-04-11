@@ -236,6 +236,17 @@ impl AdaptiveGovernor {
         foreground_app: Option<&str>,
         hour_of_day: u8,
     ) -> ProcessDecision {
+        // Helper closure: avoids repeating pid/name/tier/waste_score on every early return.
+        let pd = |decision: GovernorDecision, utility_score: f32, reason: String| ProcessDecision {
+            pid: snap.pid,
+            name: snap.name.clone(),
+            decision,
+            tier,
+            utility_score,
+            waste_score: waste,
+            reason,
+        };
+
         // Zombie/orphan handling: true zombies (is_zombie=true) need SIGKILL to
         // reap their kernel entry. Mere orphans (parent died, but process is still
         // running and may be in the middle of I/O) should be frozen, not killed —
@@ -244,38 +255,21 @@ impl AdaptiveGovernor {
         if tier == ProcessTier::ZombieOrphan {
             if snap.is_zombie {
                 return ProcessDecision {
-                    pid: snap.pid,
-                    name: snap.name.clone(),
-                    decision: GovernorDecision::Kill,
-                    tier,
-                    utility_score: 0.0,
-                    waste_score: 1.0,
+                    pid: snap.pid, name: snap.name.clone(), decision: GovernorDecision::Kill,
+                    tier, utility_score: 0.0, waste_score: 1.0,
                     reason: "Zombie process — reap with SIGKILL".into(),
                 };
             }
-            // Non-zombie orphan: freeze to reclaim resources safely.
             return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Freeze,
-                tier,
-                utility_score: 0.0,
-                waste_score: 1.0,
+                pid: snap.pid, name: snap.name.clone(), decision: GovernorDecision::Freeze,
+                tier, utility_score: 0.0, waste_score: 1.0,
                 reason: "Orphaned process (parent dead) — freeze to reclaim".into(),
             };
         }
 
         // Essential — never touch
         if tier == ProcessTier::SystemEssential || tier == ProcessTier::ActiveForeground {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Allow,
-                tier,
-                utility_score: utility,
-                waste_score: waste,
-                reason: "Essential or active-foreground — protected".into(),
-            };
+            return pd(GovernorDecision::Allow, utility, "Essential or active-foreground — protected".into());
         }
 
         // Ephemeral XPC on-demand services exit on their own within seconds.
@@ -284,18 +278,8 @@ impl AdaptiveGovernor {
         // enough margin for a full cycle without catching persistent daemons
         // (which typically stay alive for minutes or hours).
         if snap.process_uptime_secs < 8 {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Allow,
-                tier,
-                utility_score: utility,
-                waste_score: waste,
-                reason: format!(
-                    "ephemeral XPC (uptime={}s < 8s) — will exit on its own",
-                    snap.process_uptime_secs
-                ),
-            };
+            return pd(GovernorDecision::Allow, utility,
+                format!("ephemeral XPC (uptime={}s < 8s) — will exit on its own", snap.process_uptime_secs));
         }
 
         // AppHelper (browser renderers, Electron helpers…) — throttle only, nunca freeze.
@@ -303,16 +287,7 @@ impl AdaptiveGovernor {
         // deja de responder (SIGSTOP). Además, wakeups altos = audio/video en curso.
         if tier == ProcessTier::AppHelper {
             if snap.wakeups_per_sec > 5.0 || snap.has_network {
-                // Audio, video, o cargando contenido → no tocar
-                return ProcessDecision {
-                    pid: snap.pid,
-                    name: snap.name.clone(),
-                    decision: GovernorDecision::Allow,
-                    tier,
-                    utility_score: utility,
-                    waste_score: waste,
-                    reason: "AppHelper activo (audio/video/red) — protegido".into(),
-                };
+                return pd(GovernorDecision::Allow, utility, "AppHelper activo (audio/video/red) — protegido".into());
             }
             // Sin actividad → throttle suave, pero NUNCA freeze
             let decision = if utility < self.config.throttle_utility_threshold {
@@ -320,50 +295,19 @@ impl AdaptiveGovernor {
             } else {
                 GovernorDecision::Allow
             };
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision,
-                tier,
-                utility_score: utility,
-                waste_score: waste,
-                reason: format!(
-                    "AppHelper inactivo — throttle-only (utility={:.2})",
-                    utility
-                ),
-            };
+            return pd(decision, utility, format!("AppHelper inactivo — throttle-only (utility={:.2})", utility));
         }
 
         // Telemetry — always throttle (or freeze under heavy load)
         if tier == ProcessTier::Telemetry {
-            let d = if self.is_heavy_workload(workload) {
-                GovernorDecision::Freeze
-            } else {
-                GovernorDecision::Throttle
-            };
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: d,
-                tier,
-                utility_score: utility,
-                waste_score: waste,
-                reason: "Known telemetry/analytics process".into(),
-            };
+            let d = if self.is_heavy_workload(workload) { GovernorDecision::Freeze } else { GovernorDecision::Throttle };
+            return pd(d, utility, "Known telemetry/analytics process".into());
         }
 
         // IPC hub protection: daemons with many Mach ports are serving other
         // processes via XPC/MIG. Throttling them cascades into beachballs.
         if snap.mach_port_count > 80 {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Allow,
-                tier,
-                utility_score: utility,
-                waste_score: waste,
-                reason: format!("IPC hub ({} Mach ports) — protected", snap.mach_port_count),
-            };
+            return pd(GovernorDecision::Allow, utility, format!("IPC hub ({} Mach ports) — protected", snap.mach_port_count));
         }
 
         // LLM model protection: large-RSS processes matching known AI runtimes
@@ -374,35 +318,15 @@ impl AdaptiveGovernor {
             && LLM_NAMES.iter().any(|n| snap.name.contains(n))
             && snap.secs_since_user_interaction < 43200
         {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Allow,
-                tier,
-                utility_score: utility,
-                waste_score: waste,
-                reason: format!(
-                    "LLM model loaded ({}MB RSS) — reload cost too high",
-                    snap.rss_bytes / 1024 / 1024
-                ),
-            };
+            return pd(GovernorDecision::Allow, utility,
+                format!("LLM model loaded ({}MB RSS) — reload cost too high", snap.rss_bytes / 1024 / 1024));
         }
 
         // Active I/O work protection: high pageins = real disk work in progress.
         // Freezing corrupts backups/encodes. Throttle is acceptable.
         if snap.pageins_total > 50000 && snap.cpu_percent > 5.0 {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Allow,
-                tier,
-                utility_score: utility,
-                waste_score: waste,
-                reason: format!(
-                    "Active I/O work ({} pageins, {:.0}% CPU) — protected",
-                    snap.pageins_total, snap.cpu_percent
-                ),
-            };
+            return pd(GovernorDecision::Allow, utility,
+                format!("Active I/O work ({} pageins, {:.0}% CPU) — protected", snap.pageins_total, snap.cpu_percent));
         }
 
         // SilentDaemon idle override: if a daemon has near-zero CPU and has been
@@ -414,25 +338,14 @@ impl AdaptiveGovernor {
             && snap.secs_since_foreground > 3600
             && !snap.has_gui_window
         {
+            // Translated (2x memory) or RSS hog (>1GB): freeze to reclaim memory.
             let decision = if snap.is_translated || snap.rss_bytes > 1024 * 1024 * 1024 {
-                // Translated (2x memory) or RSS hog (>1GB): freeze to reclaim memory.
-                // On 8GB M1, 1GB idle is 12.5% of total — throttle doesn't free it.
                 GovernorDecision::Freeze
             } else {
                 GovernorDecision::Throttle
             };
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision,
-                tier,
-                utility_score: utility,
-                waste_score: waste,
-                reason: format!(
-                    "SilentDaemon idle override (cpu={:.1}%, idle={}s)",
-                    snap.cpu_percent, snap.secs_since_foreground
-                ),
-            };
+            return pd(decision, utility,
+                format!("SilentDaemon idle override (cpu={:.1}%, idle={}s)", snap.cpu_percent, snap.secs_since_foreground));
         }
 
         // Relevance bonus from user profile
@@ -459,18 +372,8 @@ impl AdaptiveGovernor {
             && snap.secs_since_foreground > 86400
             && snap.cpu_percent < 2.0
         {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Freeze,
-                tier,
-                utility_score: adjusted_utility,
-                waste_score: waste,
-                reason: format!(
-                    "GUI app abandoned >24h (idle={}h) — freeze to reclaim memory",
-                    snap.secs_since_foreground / 3600
-                ),
-            };
+            return pd(GovernorDecision::Freeze, adjusted_utility,
+                format!("GUI app abandoned >24h (idle={}h) — freeze to reclaim memory", snap.secs_since_foreground / 3600));
         }
 
         // Graduated idle: the idle override (above) only catches cpu < 0.5%.
@@ -482,28 +385,10 @@ impl AdaptiveGovernor {
             && snap.secs_since_foreground > 21600
             && snap.faults_total < 500_000
         {
-            let decision = if snap.secs_since_foreground > 43200 {
-                GovernorDecision::Freeze
-            } else {
-                GovernorDecision::Throttle
-            };
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision,
-                tier,
-                utility_score: adjusted_utility,
-                waste_score: waste,
-                reason: format!(
-                    "Graduated idle ({}h, no GUI) — {}",
-                    snap.secs_since_foreground / 3600,
-                    if snap.secs_since_foreground > 43200 {
-                        "freeze"
-                    } else {
-                        "throttle"
-                    }
-                ),
-            };
+            let decision = if snap.secs_since_foreground > 43200 { GovernorDecision::Freeze } else { GovernorDecision::Throttle };
+            return pd(decision, adjusted_utility,
+                format!("Graduated idle ({}h, no GUI) — {}", snap.secs_since_foreground / 3600,
+                    if snap.secs_since_foreground > 43200 { "freeze" } else { "throttle" }));
         }
 
         // Foreground app helper detection: if a process name contains part of
@@ -518,15 +403,7 @@ impl AdaptiveGovernor {
                 || (fg == "Brave Browser" && snap.name.contains("Brave"))
                 || (fg == "Firefox" && snap.name.contains("plugin-container"));
             if is_fg_helper && !snap.has_gui_window {
-                return ProcessDecision {
-                    pid: snap.pid,
-                    name: snap.name.clone(),
-                    decision: GovernorDecision::Allow,
-                    tier,
-                    utility_score: utility,
-                    waste_score: waste,
-                    reason: format!("Helper of foreground app ({})", fg),
-                };
+                return pd(GovernorDecision::Allow, utility, format!("Helper of foreground app ({})", fg));
             }
         }
 
@@ -534,36 +411,14 @@ impl AdaptiveGovernor {
         // Non-GUI background processes with idle > 15min should be throttled to
         // save energy. Placed AFTER FG helper check so Safari tabs survive at 3AM.
         let is_night = hour_of_day < 6;
-        if is_night
-            && !snap.has_gui_window
-            && snap.secs_since_foreground > 900
-            && adjusted_utility < 0.55
-        {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Throttle,
-                tier,
-                utility_score: adjusted_utility,
-                waste_score: waste,
-                reason: format!(
-                    "Night mode (hour={}, idle={}s) — throttle to save energy",
-                    hour_of_day, snap.secs_since_foreground
-                ),
-            };
+        if is_night && !snap.has_gui_window && snap.secs_since_foreground > 900 && adjusted_utility < 0.55 {
+            return pd(GovernorDecision::Throttle, adjusted_utility,
+                format!("Night mode (hour={}, idle={}s) — throttle to save energy", hour_of_day, snap.secs_since_foreground));
         }
 
         // Stale — strong candidate for freeze
         if tier == ProcessTier::Stale && adjusted_utility < self.config.freeze_utility_threshold {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Freeze,
-                tier,
-                utility_score: adjusted_utility,
-                waste_score: waste,
-                reason: format!("Stale process (utility={:.2}) — frozen", adjusted_utility),
-            };
+            return pd(GovernorDecision::Freeze, adjusted_utility, format!("Stale process (utility={:.2}) — frozen", adjusted_utility));
         }
 
         // Render pipeline exemption: processes with high faults (GPU buffer work)
@@ -586,18 +441,8 @@ impl AdaptiveGovernor {
             false
         };
         if waste_triggered {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Throttle,
-                tier,
-                utility_score: adjusted_utility,
-                waste_score: waste,
-                reason: format!(
-                    "Waste override (waste={:.2}, utility={:.2})",
-                    waste, adjusted_utility
-                ),
-            };
+            return pd(GovernorDecision::Throttle, adjusted_utility,
+                format!("Waste override (waste={:.2}, utility={:.2})", waste, adjusted_utility));
         }
 
         // Swarm pressure: when many processes are competing (>30), lower the
@@ -614,23 +459,9 @@ impl AdaptiveGovernor {
         {
             // Translated (Rosetta) processes in swarm get frozen: they use ~2x
             // memory from JIT page tables, so reclaiming is more valuable.
-            let swarm_decision = if snap.is_translated {
-                GovernorDecision::Freeze
-            } else {
-                GovernorDecision::Throttle
-            };
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: swarm_decision,
-                tier,
-                utility_score: adjusted_utility,
-                waste_score: waste,
-                reason: format!(
-                    "Swarm throttle ({} procs, waste={:.2}, util={:.2})",
-                    process_count, waste, adjusted_utility
-                ),
-            };
+            let swarm_decision = if snap.is_translated { GovernorDecision::Freeze } else { GovernorDecision::Throttle };
+            return pd(swarm_decision, adjusted_utility,
+                format!("Swarm throttle ({} procs, waste={:.2}, util={:.2})", process_count, waste, adjusted_utility));
         }
 
         // Wakeup energy hog: >100 wakeups/sec with no GUI forces the CPU out
@@ -642,58 +473,22 @@ impl AdaptiveGovernor {
             && adjusted_utility < 0.50
             && !render_pipeline_exempt
         {
-            return ProcessDecision {
-                pid: snap.pid,
-                name: snap.name.clone(),
-                decision: GovernorDecision::Throttle,
-                tier,
-                utility_score: adjusted_utility,
-                waste_score: waste,
-                reason: format!(
-                    "Wakeup energy hog ({:.0} wakeups/s) — throttle for battery",
-                    snap.wakeups_per_sec
-                ),
-            };
+            return pd(GovernorDecision::Throttle, adjusted_utility,
+                format!("Wakeup energy hog ({:.0} wakeups/s) — throttle for battery", snap.wakeups_per_sec));
         }
 
         let throttle_thresh = self.config.throttle_utility_threshold;
 
         // Normal utility-based decision.
-        let (decision, reason) = if adjusted_utility < self.config.freeze_utility_threshold {
-            (
-                GovernorDecision::Freeze,
-                format!(
-                    "utility={:.2} waste={:.2} workload={:?}",
-                    adjusted_utility, waste, workload
-                ),
-            )
+        let base_reason = format!("utility={:.2} waste={:.2} workload={:?}", adjusted_utility, waste, workload);
+        let decision = if adjusted_utility < self.config.freeze_utility_threshold {
+            GovernorDecision::Freeze
         } else if adjusted_utility < throttle_thresh {
-            (
-                GovernorDecision::Throttle,
-                format!(
-                    "utility={:.2} waste={:.2} workload={:?}",
-                    adjusted_utility, waste, workload
-                ),
-            )
+            GovernorDecision::Throttle
         } else {
-            (
-                GovernorDecision::Allow,
-                format!(
-                    "utility={:.2} waste={:.2} workload={:?}",
-                    adjusted_utility, waste, workload
-                ),
-            )
+            GovernorDecision::Allow
         };
-
-        ProcessDecision {
-            pid: snap.pid,
-            name: snap.name.clone(),
-            decision,
-            tier,
-            utility_score: adjusted_utility,
-            waste_score: waste,
-            reason,
-        }
+        pd(decision, adjusted_utility, base_reason)
     }
 
     // ── ML Ligero methods ─────────────────────────────────────────────────
