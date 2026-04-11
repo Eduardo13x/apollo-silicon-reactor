@@ -160,6 +160,53 @@ impl HazardModel {
         }
     }
 
+    /// Tick de "supervivencia bajo presión alta": el sistema estaba bajo presión
+    /// pero no ocurrió ningún OOM. Esto es evidencia negativa — el modelo sobreestimó
+    /// el riesgo. Decae base_rate y ajusta beta hacia abajo (contra-gradiente suave).
+    ///
+    /// Solo debe llamarse cuando swap_ratio == 0 y presión > 0.6, para no
+    /// interferir con situaciones donde el riesgo es real.
+    pub fn tick_survived_high_pressure(&mut self, features: &[f64; N_RISK], dt_secs: f64) {
+        self.total_hours += dt_secs / 3600.0;
+        if self.total_hours > 0.0 {
+            // Incrementar el denominador como si hubieran pasado horas adicionales
+            // de observación sin evento — equivale a añadir evidencia negativa.
+            // Factor 3× para que la supervivencia a presión alta cuente más.
+            let effective_hours = self.total_hours + (dt_secs / 3600.0) * 2.0;
+            self.base_rate =
+                (self.total_events as f64 + 1.0) / ((effective_hours + 24.0) * 3600.0);
+        }
+        // Contra-gradiente en β: si el sistema sobrevivió con estas features,
+        // reducir el peso de los features que estaban altos (falsa alarma).
+        // lr negativo × 0.05 — mucho más lento que el aprendizaje positivo.
+        let neg_lr = self.lr * 0.05;
+        for (b, x) in self.beta.iter_mut().zip(features.iter()) {
+            *b -= neg_lr * x;
+            *b = b.clamp(0.5, 5.0); // mantener un floor positivo mínimo
+        }
+    }
+
+    /// Valida y sana el modelo post-restore.
+    ///
+    /// Un `base_rate` > 1 OOM/hora indica saturación por entrenamiento en
+    /// eventos de presión (no OOMs reales). Si se detecta, resetea base_rate
+    /// Y total_events al prior — si no, tick_no_event recalcularía base_rate
+    /// desde total_events alto e inmediatamente re-saturaría el modelo.
+    /// Los β se clampean a su rango válido.
+    pub fn validate_after_restore(&mut self) {
+        // Máximo plausible: 1 OOM por hora = 1/3600 eventos/segundo.
+        const MAX_SANE_BASE_RATE: f64 = 1.0 / 3600.0;
+        if self.base_rate > MAX_SANE_BASE_RATE {
+            // Reset completo: base_rate, total_events. Mantener total_hours
+            // para que el denominador de futuras estimaciones sea razonable.
+            self.base_rate = 1.0 / (24.0 * 3600.0);
+            self.total_events = 0;
+        }
+        for b in self.beta.iter_mut() {
+            *b = b.clamp(0.0, 5.0);
+        }
+    }
+
     /// Último hazard rate calculado (para métricas/diagnóstico).
     pub fn last_hazard_rate(&self) -> f64 {
         self.last_hazard

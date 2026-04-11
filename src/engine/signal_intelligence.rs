@@ -380,9 +380,28 @@ impl SignalIntelligence {
             // Range: 20s (IPC rising) to 45s (IPC falling fast).
             let ipc_horizon_adjust = (-self.kpc_ipc_trend * 150.0).clamp(-10.0, 15.0);
             let horizon = 30.0 + ipc_horizon_adjust;
-            let p = self.hazard.probability_oom(&risk_features, horizon);
-            self.hazard.tick_no_event(dt_secs);
-            p
+            let raw_p = self.hazard.probability_oom(&risk_features, horizon);
+
+            // On macOS, swap_total ≈ swap_used (dynamically allocated), so swap_ratio
+            // is always ~1.0 whenever any swap is in use. The meaningful signal is
+            // swap VELOCITY — if swap is not growing fast, the system is stable even
+            // at high pressure. Use 512KB/s as the growth threshold.
+            let swap_growing_fast = swap_velocity_smooth > 524_288.0; // 512KB/s
+
+            // Survival feedback: high pressure + slow/no swap growth = model over-estimated.
+            if !swap_growing_fast && memory_pressure >= 0.60 {
+                self.hazard.tick_survived_high_pressure(&risk_features, dt_secs);
+            } else {
+                self.hazard.tick_no_event(dt_secs);
+            }
+
+            // Output correction: if swap is not growing, macOS compression is
+            // managing the load and a true OOM in 30s is physically unlikely.
+            if !swap_growing_fast {
+                raw_p.min(pressure_smooth * 0.6).max(0.0)
+            } else {
+                raw_p
+            }
         } else {
             self.hazard.tick_no_event(dt_secs);
             0.0
@@ -776,6 +795,9 @@ impl SignalIntelligence {
     /// learned zones, utility EMAs, and Kalman filter state.
     pub fn restore(&mut self, p: SignalIntelligencePersisted) {
         self.hazard = p.hazard;
+        // Sanitize restored hazard model: base_rate > 1/hour indicates saturation
+        // from training on pressure events (not real OOMs). Reset to prior.
+        self.hazard.validate_after_restore();
         self.mpc.restore_effects(&p.mpc);
         self.learned_mid_entry = p.learned_mid_entry;
         self.learned_high_entry = p.learned_high_entry;
