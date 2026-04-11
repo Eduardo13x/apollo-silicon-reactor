@@ -541,7 +541,6 @@ pub fn run_learning_tick<'a>(
                             mem_pressure,
                             swap_ratio,
                             signal_digest.pressure_smooth, // compressor proxy
-                            1.0, // ~1 hour since last (conservative)
                         );
                     }
                     // NARS: crisis-level salience for OOM kill

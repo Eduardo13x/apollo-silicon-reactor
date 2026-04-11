@@ -2473,7 +2473,6 @@ fn main() -> anyhow::Result<()> {
                                                 snapshot.pressure.memory_pressure,
                                                 sr,
                                                 snapshot.pressure.memory_pressure,
-                                                1.0,
                                             );
                                         }
                                     }
@@ -4809,7 +4808,6 @@ fn main() -> anyhow::Result<()> {
                             snapshot.pressure.memory_pressure,
                             sr,
                             snapshot.pressure.memory_pressure,
-                            1.0,
                         );
                     }
                 }

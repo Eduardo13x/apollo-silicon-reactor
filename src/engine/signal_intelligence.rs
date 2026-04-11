@@ -180,6 +180,10 @@ pub struct SignalIntelligence {
     /// Capped at 50 entries. When ≥10 events, `retrain_hazard_batch()` runs
     /// 10-step gradient descent to refine β weights beyond single-event updates.
     oom_event_buffer: Vec<([f64; 4], f64)>,
+
+    /// Timestamp of the last recorded OOM/overflow event.
+    /// Used to compute real inter-event intervals instead of hardcoded 1.0.
+    last_oom_instant: Option<std::time::Instant>,
 }
 
 impl Default for SignalIntelligence {
@@ -238,6 +242,7 @@ impl SignalIntelligence {
             zone_stall_cycles: 0,
             workload_zone_offsets: HashMap::new(),
             oom_event_buffer: Vec::new(),
+            last_oom_instant: None,
         }
     }
 
@@ -499,13 +504,25 @@ impl SignalIntelligence {
     }
 
     /// Notifica un overflow observado (para que el hazard model aprenda).
+    /// Computes real inter-event interval from last_oom_instant instead of
+    /// relying on callers to supply hours_since_last (B012: was hardcoded 1.0).
     pub fn record_overflow(
         &mut self,
         memory_pressure: f64,
         swap_ratio: f64,
         compressor_ratio: f64,
-        hours_since_last: f64,
     ) {
+        let now = std::time::Instant::now();
+        let hours_since_last = match self.last_oom_instant {
+            Some(prev) => {
+                let secs = now.duration_since(prev).as_secs_f64();
+                // Cap at 72 hours to avoid stale timestamps (e.g. after daemon restart).
+                (secs / 3600.0).min(72.0).max(0.001)
+            }
+            None => 1.0, // Conservative prior for first observed event.
+        };
+        self.last_oom_instant = Some(now);
+
         let features = HazardModel::risk_features(
             memory_pressure,
             self.kf_pressure.velocity(),
@@ -1177,7 +1194,7 @@ mod tests {
 
         // Record some overflow events.
         for _ in 0..3 {
-            si.record_overflow(0.95, 0.8, 0.9, 2.0);
+            si.record_overflow(0.95, 0.8, 0.9);
         }
 
         let d_after = tick_stressed(&mut si, 0.85);
@@ -1832,7 +1849,7 @@ mod tests {
         let mut si = SignalIntelligence::new();
         // Less than 10 events → no retrain
         for i in 0..9 {
-            si.record_overflow(0.8 + (i as f64) * 0.01, 0.3, 0.5, 2.0);
+            si.record_overflow(0.8 + (i as f64) * 0.01, 0.3, 0.5);
         }
         assert_eq!(si.retrain_hazard_batch(), 0);
         assert_eq!(si.oom_event_count(), 9);
@@ -1842,7 +1859,7 @@ mod tests {
     fn test_retrain_hazard_batch_runs_after_10_events() {
         let mut si = SignalIntelligence::new();
         for i in 0..12 {
-            si.record_overflow(0.7 + (i as f64) * 0.02, 0.2, 0.4, 1.0);
+            si.record_overflow(0.7 + (i as f64) * 0.02, 0.2, 0.4);
         }
         assert_eq!(si.oom_event_count(), 12);
         let steps = si.retrain_hazard_batch();
@@ -1854,7 +1871,7 @@ mod tests {
     fn test_oom_event_buffer_caps_at_50() {
         let mut si = SignalIntelligence::new();
         for i in 0..60 {
-            si.record_overflow(0.7 + (i as f64) * 0.005, 0.1, 0.3, 0.5);
+            si.record_overflow(0.7 + (i as f64) * 0.005, 0.1, 0.3);
         }
         assert_eq!(si.oom_event_count(), 50, "buffer should cap at 50");
     }
@@ -1865,7 +1882,7 @@ mod tests {
         let beta_before = si.hazard_beta();
         // Record 15 events with high pressure + high swap → beta[0] and beta[2] should increase
         for _ in 0..15 {
-            si.record_overflow(0.95, 0.08, 0.85, 0.70);
+            si.record_overflow(0.95, 0.08, 0.85);
         }
         let beta_after_online = si.hazard_beta();
         let _steps = si.retrain_hazard_batch();
