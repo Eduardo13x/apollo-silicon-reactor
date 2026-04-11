@@ -1,0 +1,12 @@
+iter	commit	passing	delta	failed	loc_decide	loc_chromium	loc_governor	loc_total	status	hypothesis
+0	baseline	3343	—	2	1967	2125	1326	5418	baseline	—
+1	74e6221	3656	+313	0	1967	2125	1326	5418	keep	fix(test): 30 samples for MIN_SAMPLES=30 in detect_memory_leak
+2	79ee64a	3656	0	0	1967	2125	1121	5213	keep	refactor(governor): pd() closure in decide_one -205 LOC [McIlroy 1969]
+3	0366a91	3656	0	0	1921	2125	1121	5167	keep	refactor(decide): collapse aggressive shadow + ipc var -46 LOC [Saltzer 1975]
+4	34f3816	3656	0	0	1921	2115	1121	5157	keep	refactor(chromium): already_thawing closure + dead loop removal -10 LOC [Lampson 1974]
+5	d25cb0a	3656	0	0	1736	2115	1121	4972	keep	refactor(decide): call_decide helper collapses 5 verbose test call sites -185 LOC
+6	07ebfb7	3656	0	0	1736	2093	1121	4950	keep	refactor(chromium): inline 7 single-field struct push literals -22 LOC
+7	fa8e4ef	3656	0	0	1736	2066	1121	4923	keep	refactor(chromium): inline assert macros in browser_name/is_renderer tests -27 LOC
+8	c1eb2f2	3656	0	0	1736	2038	1121	4895	keep	refactor(chromium): inline multi-line assert macros in tests -28 LOC
+9	9ee1f7e	3656	0	0	1736	1975	1121	4832	keep	refactor(chromium): inline spread assert macros across test suite -63 LOC
+10	3181f37	3656	0	0	1736	1975	1059	4770	keep	refactor(governor): inline multi-line assert macros in tests -62 LOC
