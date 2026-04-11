@@ -721,11 +721,7 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(
-            decisions[0].decision,
-            GovernorDecision::Allow,
-            "ephemeral XPC < 8s must always be allowed"
-        );
+        assert_eq!(decisions[0].decision, GovernorDecision::Allow, "ephemeral XPC < 8s must always be allowed");
     }
 
     // ── Graduated idle ────────────────────────────────────────────────────────
@@ -740,11 +736,7 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(
-            decisions[0].decision,
-            GovernorDecision::Throttle,
-            "idle > 6h should be throttled"
-        );
+        assert_eq!(decisions[0].decision, GovernorDecision::Throttle, "idle > 6h should be throttled");
     }
 
     #[test]
@@ -757,11 +749,7 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(
-            decisions[0].decision,
-            GovernorDecision::Freeze,
-            "idle > 12h should be frozen"
-        );
+        assert_eq!(decisions[0].decision, GovernorDecision::Freeze, "idle > 12h should be frozen");
     }
 
     // ── IPC hub protection ────────────────────────────────────────────────────
@@ -776,11 +764,7 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(
-            decisions[0].decision,
-            GovernorDecision::Allow,
-            "high Mach port count = IPC hub, must be protected"
-        );
+        assert_eq!(decisions[0].decision, GovernorDecision::Allow, "high Mach port count = IPC hub, must be protected");
     }
 
     // ── Night mode ────────────────────────────────────────────────────────────
@@ -801,11 +785,8 @@ mod tests {
         // Night mode should throttle low-utility background processes.
         // (May be Allow if utility is high — test only fires for low-utility processes)
         let d = &decisions[0];
-        assert!(
-            d.decision == GovernorDecision::Throttle || d.decision == GovernorDecision::Allow,
-            "night mode should throttle or allow, not freeze/kill: {:?}",
-            d.decision
-        );
+        assert!(d.decision == GovernorDecision::Throttle || d.decision == GovernorDecision::Allow,
+            "night mode should throttle or allow, not freeze/kill: {:?}", d.decision);
     }
 
     // ── Wakeup energy hog ─────────────────────────────────────────────────────
@@ -824,11 +805,7 @@ mod tests {
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
         assert_eq!(decisions.len(), 1);
         // High wakeups + no GUI + low utility → throttle.
-        assert_eq!(
-            decisions[0].decision,
-            GovernorDecision::Throttle,
-            "wakeup hog should be throttled"
-        );
+        assert_eq!(decisions[0].decision, GovernorDecision::Throttle, "wakeup hog should be throttled");
     }
 
     // ── Foreground helper detection ───────────────────────────────────────────
@@ -843,11 +820,7 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), Some("Safari"), &["Safari"], 14);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(
-            decisions[0].decision,
-            GovernorDecision::Allow,
-            "WebKit helper with Safari in foreground must be protected"
-        );
+        assert_eq!(decisions[0].decision, GovernorDecision::Allow, "WebKit helper with Safari in foreground must be protected");
     }
 
     // ── Governor config default ───────────────────────────────────────────────
@@ -884,11 +857,7 @@ mod tests {
         };
         let cfg = calibrate_config_for_hardware(&hw_8gb);
         // 8GB machine: waste threshold should be 0.80, more aggressive.
-        assert!(
-            (cfg.waste_override_threshold - 0.80).abs() < 0.01,
-            "8GB machine should use 0.80 waste threshold, got {}",
-            cfg.waste_override_threshold
-        );
+        assert!((cfg.waste_override_threshold - 0.80).abs() < 0.01, "8GB machine should use 0.80 waste threshold, got {}", cfg.waste_override_threshold);
     }
 
     // ── LLM model protection ──────────────────────────────────────────────────
@@ -904,11 +873,7 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(
-            decisions[0].decision,
-            GovernorDecision::Allow,
-            "LLM model (ollama) with 4GB RSS within 12h must be protected"
-        );
+        assert_eq!(decisions[0].decision, GovernorDecision::Allow, "LLM model (ollama) with 4GB RSS within 12h must be protected");
     }
 
     #[test]
@@ -927,11 +892,7 @@ mod tests {
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
         assert_eq!(decisions.len(), 1);
         // Without LLM protection and with 12h+ idle, must be Frozen by graduated idle.
-        assert_eq!(
-            decisions[0].decision,
-            GovernorDecision::Freeze,
-            "LLM model beyond 12h boundary should be Frozen by graduated idle rule"
-        );
+        assert_eq!(decisions[0].decision, GovernorDecision::Freeze, "LLM model beyond 12h boundary should be Frozen by graduated idle rule");
     }
 
     // ── GUI abandonment ───────────────────────────────────────────────────────
@@ -947,11 +908,7 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(
-            decisions[0].decision,
-            GovernorDecision::Freeze,
-            "GUI app abandoned for 24h+ must be frozen to reclaim memory"
-        );
+        assert_eq!(decisions[0].decision, GovernorDecision::Freeze, "GUI app abandoned for 24h+ must be frozen to reclaim memory");
     }
 
     #[test]
@@ -965,11 +922,7 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
         assert_eq!(decisions.len(), 1);
-        assert_ne!(
-            decisions[0].decision,
-            GovernorDecision::Freeze,
-            "GUI app < 24h idle must NOT be frozen by abandonment rule"
-        );
+        assert_ne!(decisions[0].decision, GovernorDecision::Freeze, "GUI app < 24h idle must NOT be frozen by abandonment rule");
     }
 
     // ── Orphan (parent dead, non-zombie) ─────────────────────────────────────
@@ -985,11 +938,7 @@ mod tests {
         };
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
         assert_eq!(decisions.len(), 1);
-        assert_eq!(
-            decisions[0].decision,
-            GovernorDecision::Freeze,
-            "Non-zombie orphan (parent dead) must be Frozen, not Killed"
-        );
+        assert_eq!(decisions[0].decision, GovernorDecision::Freeze, "Non-zombie orphan (parent dead) must be Frozen, not Killed");
     }
 
     // ── Translated process in swarm ───────────────────────────────────────────
@@ -1021,11 +970,7 @@ mod tests {
             .iter()
             .find(|d| d.name == "rosetta-daemon")
             .map(|d| d.decision);
-        assert_eq!(
-            d,
-            Some(GovernorDecision::Freeze),
-            "Translated process in swarm must be Frozen (2x memory overhead)"
-        );
+        assert_eq!(d, Some(GovernorDecision::Freeze), "Translated process in swarm must be Frozen (2x memory overhead)");
     }
 
     // ── Render pipeline exemption ─────────────────────────────────────────────
@@ -1047,11 +992,7 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         // Render pipeline processes are exempt from wakeup throttle rule.
         // With foreground app present and being a render pipeline process → exempt.
-        assert_ne!(
-            decisions[0].decision,
-            GovernorDecision::Kill,
-            "Render pipeline VDCAssistant must not be killed"
-        );
+        assert_ne!(decisions[0].decision, GovernorDecision::Kill, "Render pipeline VDCAssistant must not be killed");
     }
 
     // ── Classify workload ─────────────────────────────────────────────────────
@@ -1097,10 +1038,7 @@ mod tests {
         }
         let per_call_ms = start.elapsed().as_secs_f64() * 1000.0 / n as f64;
         // 20 processes × governor logic should complete in < 5ms per cycle.
-        assert!(
-            per_call_ms < 5.0,
-            "decide_all too slow: {per_call_ms:.2}ms/call (expected < 5ms)"
-        );
+        assert!(per_call_ms < 5.0, "decide_all too slow: {per_call_ms:.2}ms/call (expected < 5ms)");
     }
 }
 
