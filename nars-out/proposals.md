@@ -1,4 +1,4 @@
-# Apollo NARS Proposals — Graph + Bug Analysis Session 2026-04-11
+# Apollo NARS Proposals — Graph + Bug Analysis Session 2026-04-11 (Updated with Gemma4 Teacher)
 
 Generated from: `graphify-out/graph.json` (4727 nodes, 9271 edges, 143 communities) + unstaged diffs  
 Baseline: 1608 lib tests | 165/165 scenarios | AIS 99.5
@@ -206,3 +206,36 @@ accounting for failure modes. The fixes add either:
 
 B001 and B002 both stem from **macOS-specific assumptions** not being encoded in the type/model system:
 macOS dynamic swap semantics and IOKit lifecycle are non-obvious to developers coming from Linux.
+
+---
+---
+
+# New NARS Pass — Post Gemma4 Teacher Integration (2026-04-11 updated)
+Graph: 4727 nodes, 9271 links | New beliefs from god-node + hyperedge analysis
+
+## NEW-P1: BUG-01 + BUG-03 — Critical Bug Cluster (pending_trial_skill + f32 precision)
+**Belief ID**: B011  **Priority**: 0.855  **Truth**: <0.95, 0.90>
+
+**BUG-01 — pending_trial_skill lost on daemon crash mid-trial:**
+Location: `src/bin/apollo-optimizerd/main.rs:4302`
+When `pending_trial_skill = Some(skill_name, pressure_before)` is set, the value lives only in RAM until the next periodic persist (~every 2 min, L6201). A daemon crash in that window silently drops the trial result. The skill registry never learns from real executions.
+Fix: call `write_json_critical` on the `learned_state` snapshot immediately after L4302.
+
+**BUG-03 — f32 precision loss in skill record_result_with_pressure:**
+Location: `src/bin/apollo-optimizerd/main.rs:4226`
+`pressure_before as f32` converts a 64-bit float to 32-bit before writing into the skill registry Bayesian weights. Over thousands of records, small rounding errors accumulate and bias skill selection probabilities.
+Fix: change `record_result_with_pressure` signature to accept `f64`.
+
+## NEW-P2: daemon_helpers.rs — 68-edge god node (highest in codebase)
+**Belief ID**: B001  **Priority**: 0.889  **Truth**: <0.95, 0.936>
+Most-imported utility file. Every module that needs a helper imports it.
+Fix: categorize exports by domain → extract `process_utils.rs` + `time_utils.rs`. `daemon_helpers.rs` becomes a re-export facade.
+
+## NEW-P3: Gemma4 Teacher Loop — VALIDATED (new feature, no bugs found)
+The new `TeacherContext` struct + `SuggestionOutcome` feedback loop implements a closed teacher-student cycle:
+- Apollo collects Bayesian pattern scores → feeds to Gemma 4
+- Gemma 4 suggests process classifications → Apollo applies them
+- 30s later: Apollo measures pressure delta → stores as `last_suggestion_outcome`
+- Next Gemma call: includes `PreviousGemmaSuggestion outcome` → Gemma can revise strategy
+NARS belief: <f=0.90, c=0.85> — this architecture follows the NARS revision principle where beliefs are updated by evidence accumulation.
+

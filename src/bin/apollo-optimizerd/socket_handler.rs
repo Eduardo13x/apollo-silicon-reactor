@@ -522,7 +522,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
 
             let mut advisor = LlmAdvisor::new(llm_cfg.clone());
             let current_policy = state.policy.lock_recover().learned_policy.clone();
-            match advisor.call_raw(&snapshot, &api_key, Some(&current_policy)) {
+            match advisor.call_raw(&snapshot, &api_key, Some(&current_policy), None) {
                 Ok(suggestion) => {
                     {
                         let mut guard = state.llm.lock_recover();

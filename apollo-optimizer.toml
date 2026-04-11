@@ -1,0 +1,24 @@
+# Apollo Optimizer — Configuración local
+# Copia a /etc/apollo-optimizer/config.toml con:
+#   sudo mkdir -p /etc/apollo-optimizer
+#   sudo cp apollo-optimizer.toml /etc/apollo-optimizer/config.toml
+
+[llm]
+# ── Conexión a Gemma 4 local via llama-server ─────────────────────────────
+enabled    = true
+endpoint   = "http://127.0.0.1:8080/v1/chat/completions"
+model      = "gemma-4-E2B-it-Q4_K_M"
+
+# Sin gate de training TTL — Gemma 4 es local, sin costo por llamada.
+always_on  = true
+
+# Gemma 4 via llama.cpp no soporta response_format: json_object — usar extracción manual.
+force_json = false
+
+# Timeouts más holgados para inferencia local en M1 8GB.
+timeout_ms          = 25000
+min_interval_secs   = 600     # mínimo 10 min entre llamadas
+max_calls_per_hour  = 4
+
+# Umbral de confianza más bajo para modelo local (menor calibración que GPT).
+min_confidence = 0.60

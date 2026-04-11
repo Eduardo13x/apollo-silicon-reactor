@@ -14,6 +14,7 @@ use chrono::{Duration as ChronoDuration, Local, Timelike, Utc};
 use apollo_optimizer::engine::daemon_helpers::pid_start_time;
 use apollo_optimizer::engine::llm::{
     append_jsonl, delete_file_best_effort, load_repo_config, write_json, LearnedPolicy, LlmAdvisor,
+    SuggestionOutcome, TeacherContext,
 };
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::safety::pattern_conflicts_with_protected;
@@ -63,8 +64,27 @@ pub fn llm_reactive_tick(
     };
     let has_key = llm_key_path.exists();
 
-    // TTL housekeeping: if training expired, disable and delete key.
-    {
+    // Load config early — needed for always_on check.
+    let llm_cfg = load_repo_config(&state.config_path)
+        .llm
+        .unwrap_or(llm_cfg_default);
+    if !llm_cfg.enabled() {
+        return;
+    }
+
+    // Auto-enable for always_on (local models like Gemma 4) — no training TTL needed.
+    if llm_cfg.always_on() {
+        let mut guard = state.llm.lock_recover();
+        if !guard.llm_state.enabled {
+            guard.llm_state.enabled = true;
+            guard.llm_state.training_started_at = Some(now);
+            // 10-year TTL — effectively permanent for local models.
+            guard.llm_state.training_expires_at =
+                Some(now + ChronoDuration::days(365 * 10));
+            write_json(&llm_state_path, &guard.llm_state, Some(0o600));
+        }
+    } else {
+        // TTL housekeeping: if training expired, disable and delete key.
         let mut guard = state.llm.lock_recover();
         if guard.llm_state.enabled
             && guard
@@ -85,11 +105,34 @@ pub fn llm_reactive_tick(
         }
     }
 
-    let llm_cfg = load_repo_config(&state.config_path)
-        .llm
-        .unwrap_or(llm_cfg_default);
-    if !llm_cfg.enabled() {
-        return;
+    // ── Fase 3: resolver outcome pendiente si ya pasaron ≥30s ─────────────
+    {
+        let mut guard = state.llm.lock_recover();
+        if let (Some(pending_at), Some(pending_pressure)) = (
+            guard.llm_state.pending_outcome_at,
+            guard.llm_state.pending_outcome_pressure,
+        ) {
+            if now - pending_at >= ChronoDuration::seconds(30) {
+                let pressure_after = snapshot.pressure.memory_pressure;
+                let delta = pressure_after - pending_pressure;
+                let rationale = guard
+                    .llm_state
+                    .pending_outcome_rationale
+                    .clone()
+                    .unwrap_or_default();
+                guard.llm_state.last_suggestion_outcome = Some(SuggestionOutcome {
+                    applied_at: pending_at,
+                    pressure_before: pending_pressure,
+                    pressure_after,
+                    pressure_delta: delta,
+                    rationale_snippet: rationale.chars().take(80).collect(),
+                });
+                guard.llm_state.pending_outcome_at = None;
+                guard.llm_state.pending_outcome_pressure = None;
+                guard.llm_state.pending_outcome_rationale = None;
+                write_json(&llm_state_path, &guard.llm_state, Some(0o600));
+            }
+        }
     }
 
     // Keep advisor in sync with config edits.
@@ -119,7 +162,7 @@ pub fn llm_reactive_tick(
 
     let (mode, daily_budget, min_interval_secs, max_calls_per_hour, pattern_budget_per_day) = {
         let mut guard = state.llm.lock_recover();
-        if !guard.llm_state.training_active() {
+        if !llm_cfg.always_on() && !guard.llm_state.training_active() {
             write_json(&llm_state_path, &guard.llm_state, Some(0o600));
             return;
         }
@@ -372,7 +415,27 @@ pub fn llm_reactive_tick(
 
     // Network call (no locks held).
     let current_policy = state.policy.lock_recover().learned_policy.clone();
-    let suggestion_res = advisor.call_raw(snapshot, &api_key, Some(&current_policy));
+
+    // ── Fase 2: construir TeacherContext con datos ricos ───────────────────
+    let pattern_scores_owned: Vec<(String, u32, f64)> = current_policy
+        .pattern_weights
+        .iter()
+        .filter(|(_, w)| w.throttle_count >= 3)
+        .map(|(name, w)| (name.clone(), w.throttle_count, w.effectiveness()))
+        .collect();
+    let previous_outcome_owned = state
+        .llm
+        .lock_recover()
+        .llm_state
+        .last_suggestion_outcome
+        .clone();
+    let teacher = TeacherContext {
+        pattern_scores: &pattern_scores_owned,
+        previous_outcome: previous_outcome_owned.as_ref(),
+        heuristic_struggling,
+    };
+
+    let suggestion_res = advisor.call_raw(snapshot, &api_key, Some(&current_policy), Some(&teacher));
 
     // Apply suggestion and persist state.
     match suggestion_res {
@@ -507,6 +570,16 @@ pub fn llm_reactive_tick(
                 {
                     let mut guard = state.llm.lock_recover();
                     guard.llm_state.policy_updates_today += added;
+                    // ── Fase 3: registrar baseline para medir el outcome ──
+                    // Solo sobrescribir si no hay outcome pendiente (evitar drift).
+                    if guard.llm_state.pending_outcome_at.is_none() {
+                        guard.llm_state.pending_outcome_pressure =
+                            Some(snapshot.pressure.memory_pressure);
+                        guard.llm_state.pending_outcome_at = Some(now);
+                        let snippet: String =
+                            suggestion.rationale.chars().take(80).collect();
+                        guard.llm_state.pending_outcome_rationale = Some(snippet);
+                    }
                     write_json(&llm_state_path, &guard.llm_state, Some(0o600));
                 }
             }
