@@ -428,6 +428,34 @@ impl CausalGraph {
         })
     }
 
+    /// Returns `true` when causal evidence indicates that QoS tier demotion
+    /// (set_tier → Background) is preferable to SIGSTOP for the given process.
+    ///
+    /// The heuristic: if the primary causal mechanism for this process is CPU
+    /// reduction (not RSS release or swap avoidance), then a CPU scheduler hint
+    /// achieves the pressure benefit while letting the process stay responsive
+    /// to events — SIGSTOP would be unnecessarily invasive.
+    ///
+    /// Returns `false` when:
+    /// - Fewer than 3 causal observations exist (conservative default: use SIGSTOP)
+    /// - Primary mechanism is "rss" or "swap" (memory pages must actually stop being
+    ///   touched — QoS tier alone won't achieve this)
+    /// - Mechanism is "unknown" (insufficient data)
+    ///
+    /// [Pearl 2009 Ch.3] — mediation analysis: identify the causal pathway
+    /// [Nygard 2018] — bulkhead: least-invasive intervention first
+    pub fn prefer_qos_over_sigstop(&self, process_name: &str) -> bool {
+        let action_key = format!("throttle:{}", process_name);
+        match self.mechanism(&action_key) {
+            Some(("cpu", _, cpu_pct, _)) => {
+                // Only prefer QoS if CPU reduction is the dominant effect
+                // (not marginal: require at least 5% CPU delta on average).
+                cpu_pct.abs() >= 5.0
+            }
+            _ => false, // no data or non-CPU mechanism → default SIGSTOP
+        }
+    }
+
     /// Count of edges with slow-horizon data (slow_confidence != 0.5 prior).
     pub fn slow_horizon_count(&self) -> usize {
         self.edges
@@ -941,6 +969,62 @@ mod tests {
             "Chrome ({}) should rank higher than contactsd ({})",
             chrome,
             contact
+        );
+    }
+
+    // ── prefer_qos_over_sigstop tests ──────────────────────────────────────
+
+    /// CPU-dominant mechanism with ≥5% delta → prefer QoS over SIGSTOP.
+    /// [Pearl 2009 Ch.3] — CPU reduction is the causal pathway, QoS is sufficient.
+    #[test]
+    fn prefer_qos_cpu_dominant() {
+        let mut g = CausalGraph::new();
+        let res_before = ResourceSnapshot { rss_mb: 200.0, cpu_pct: 40.0, swap_mb: 500.0 };
+        // Simulate CPU-dominant effect: large CPU drop, small RSS/swap change
+        for cycle in 0..5u64 {
+            g.record_action_with_resources("throttle:electron_bg", 0.80, cycle * 4, res_before.clone());
+            let res_after = ResourceSnapshot {
+                rss_mb: 195.0,   // ~2.5% RSS change — minor
+                cpu_pct: 15.0,   // 25% CPU freed — dominant
+                swap_mb: 498.0,  // ~0.4% swap — negligible
+            };
+            g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after);
+        }
+        assert!(
+            g.prefer_qos_over_sigstop("electron_bg"),
+            "CPU-dominant mechanism should prefer QoS over SIGSTOP"
+        );
+    }
+
+    /// RSS-dominant mechanism → do NOT prefer QoS (SIGSTOP is required to stop page access).
+    /// Memory pages must stop being touched — CPU scheduler hint alone is insufficient.
+    #[test]
+    fn prefer_sigstop_rss_dominant() {
+        let mut g = CausalGraph::new();
+        let res_before = ResourceSnapshot { rss_mb: 800.0, cpu_pct: 15.0, swap_mb: 500.0 };
+        // RSS-dominant: large RSS freed, moderate CPU, small swap
+        for cycle in 0..5u64 {
+            g.record_action_with_resources("throttle:chrome_renderer", 0.80, cycle * 4, res_before.clone());
+            let res_after = ResourceSnapshot {
+                rss_mb: 400.0,   // 400MB RSS freed — dominant
+                cpu_pct: 12.0,   // 3% CPU — minor
+                swap_mb: 490.0,  // 10MB swap — minor
+            };
+            g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after);
+        }
+        assert!(
+            !g.prefer_qos_over_sigstop("chrome_renderer"),
+            "RSS-dominant mechanism should prefer SIGSTOP (must stop page access)"
+        );
+    }
+
+    /// No causal data → conservative default: prefer SIGSTOP (false).
+    #[test]
+    fn prefer_sigstop_when_no_causal_data() {
+        let g = CausalGraph::new();
+        assert!(
+            !g.prefer_qos_over_sigstop("unknown_process"),
+            "no causal data should default to SIGSTOP (conservative)"
         );
     }
 }
