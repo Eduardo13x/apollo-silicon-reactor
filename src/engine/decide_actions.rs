@@ -1145,6 +1145,28 @@ mod tests {
         )
     }
 
+    /// Thin test wrapper: calls `decide_actions` with all hint maps empty and default
+    /// thresholds. Only the interesting parameters (snapshot, profile, latency, reactor
+    /// weight) need to be varied per test.
+    fn call_decide(
+        snap: &crate::collector::SystemSnapshot,
+        sys: &System,
+        profile: OptimizationProfile,
+        latency: LatencyTarget,
+        reactor: f64,
+    ) -> DecisionOutput {
+        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
+        decide_actions(
+            snap, sys, profile, latency, reactor,
+            &interactive, &noise,
+            OverflowThresholds::default(), None,
+            &weights, 0.0, &pids, &ipc, &hops, &hab, &causal,
+            &UserContext::default(),
+            &HashMap::new(), &HashMap::new(), 0.0,
+            &HashMap::new(), &HashMap::new(),
+        )
+    }
+
     // ── context_from_pressure tests ──────────────────────────────────────
 
     #[test]
@@ -1456,226 +1478,47 @@ mod tests {
     fn decide_actions_empty_system_returns_no_actions() {
         let snap = make_snapshot(10.0, 0.10, 0.0);
         let sys = System::new();
-        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
-
-        let output = decide_actions(
-            &snap,
-            &sys,
-            OptimizationProfile::BalancedRoot,
-            LatencyTarget::Normal,
-            0.0,
-            &interactive,
-            &noise,
-            OverflowThresholds::default(),
-            None,
-            &weights,
-            0.0,
-            &pids,
-            &ipc,
-            &hops,
-            &hab,
-            &causal,
-            &UserContext::default(),
-            &HashMap::new(),
-            &HashMap::new(),
-            0.0,
-            &HashMap::new(),
-            &HashMap::new(),
-        );
-
-        assert!(
-            output.actions.is_empty(),
-            "empty system should yield no actions"
-        );
-        assert!(
-            output.blockers.is_empty(),
-            "empty system should yield no blockers"
-        );
+        let output = call_decide(&snap, &sys, OptimizationProfile::BalancedRoot, LatencyTarget::Normal, 0.0);
+        assert!(output.actions.is_empty(), "empty system should yield no actions");
+        assert!(output.blockers.is_empty(), "empty system should yield no blockers");
         assert!(output.low_value_skipped.is_empty());
-        assert!(
-            matches!(output.context, InteractiveContext::InteractiveFocus),
-            "low pressure should yield InteractiveFocus"
-        );
+        assert!(matches!(output.context, InteractiveContext::InteractiveFocus), "low pressure should yield InteractiveFocus");
     }
 
     #[test]
     fn decide_actions_preserves_reactor_event_weight() {
         let snap = make_snapshot(10.0, 0.10, 0.0);
         let sys = System::new();
-        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
-
-        let output = decide_actions(
-            &snap,
-            &sys,
-            OptimizationProfile::BalancedRoot,
-            LatencyTarget::Normal,
-            0.42,
-            &interactive,
-            &noise,
-            OverflowThresholds::default(),
-            None,
-            &weights,
-            0.0,
-            &pids,
-            &ipc,
-            &hops,
-            &hab,
-            &causal,
-            &UserContext::default(),
-            &HashMap::new(),
-            &HashMap::new(),
-            0.0,
-            &HashMap::new(),
-            &HashMap::new(),
-        );
-
-        assert!(
-            (output.reactor_event_weight - 0.42).abs() < 1e-9,
-            "reactor_event_weight should be passed through"
-        );
+        let output = call_decide(&snap, &sys, OptimizationProfile::BalancedRoot, LatencyTarget::Normal, 0.42);
+        assert!((output.reactor_event_weight - 0.42).abs() < 1e-9, "reactor_event_weight should be passed through");
     }
 
     #[test]
     fn decide_actions_context_escalates_with_pressure() {
         let sys = System::new();
-        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
-        let thresholds = OverflowThresholds::default();
 
         // Low pressure
-        let snap_low = make_snapshot(10.0, 0.10, 0.0);
-        let out_low = decide_actions(
-            &snap_low,
-            &sys,
-            OptimizationProfile::BalancedRoot,
-            LatencyTarget::Normal,
-            0.0,
-            &interactive,
-            &noise,
-            thresholds.clone(),
-            None,
-            &weights,
-            0.0,
-            &pids,
-            &ipc,
-            &hops,
-            &hab,
-            &causal,
-            &UserContext::default(),
-            &HashMap::new(),
-            &HashMap::new(),
-            0.0,
-            &HashMap::new(),
-            &HashMap::new(),
-        );
-        assert!(matches!(
-            out_low.context,
-            InteractiveContext::InteractiveFocus
-        ));
+        let out_low = call_decide(&make_snapshot(10.0, 0.10, 0.0), &sys, OptimizationProfile::BalancedRoot, LatencyTarget::Normal, 0.0);
+        assert!(matches!(out_low.context, InteractiveContext::InteractiveFocus));
 
         // Medium pressure (CPU > 72)
-        let snap_mid = make_snapshot(75.0, 0.10, 0.0);
-        let out_mid = decide_actions(
-            &snap_mid,
-            &sys,
-            OptimizationProfile::BalancedRoot,
-            LatencyTarget::Normal,
-            0.0,
-            &interactive,
-            &noise,
-            thresholds.clone(),
-            None,
-            &weights,
-            0.0,
-            &pids,
-            &ipc,
-            &hops,
-            &hab,
-            &causal,
-            &UserContext::default(),
-            &HashMap::new(),
-            &HashMap::new(),
-            0.0,
-            &HashMap::new(),
-            &HashMap::new(),
-        );
-        assert!(matches!(
-            out_mid.context,
-            InteractiveContext::BackgroundPressure
-        ));
+        let out_mid = call_decide(&make_snapshot(75.0, 0.10, 0.0), &sys, OptimizationProfile::BalancedRoot, LatencyTarget::Normal, 0.0);
+        assert!(matches!(out_mid.context, InteractiveContext::BackgroundPressure));
 
         // High pressure (CPU > 88)
-        let snap_high = make_snapshot(92.0, 0.10, 0.0);
-        let out_high = decide_actions(
-            &snap_high,
-            &sys,
-            OptimizationProfile::BalancedRoot,
-            LatencyTarget::Normal,
-            0.0,
-            &interactive,
-            &noise,
-            thresholds.clone(),
-            None,
-            &weights,
-            0.0,
-            &pids,
-            &ipc,
-            &hops,
-            &hab,
-            &causal,
-            &UserContext::default(),
-            &HashMap::new(),
-            &HashMap::new(),
-            0.0,
-            &HashMap::new(),
-            &HashMap::new(),
-        );
-        assert!(matches!(
-            out_high.context,
-            InteractiveContext::ThermalConstrained
-        ));
+        let out_high = call_decide(&make_snapshot(92.0, 0.10, 0.0), &sys, OptimizationProfile::BalancedRoot, LatencyTarget::Normal, 0.0);
+        assert!(matches!(out_high.context, InteractiveContext::ThermalConstrained));
     }
 
     #[test]
     fn decide_actions_all_profiles_work() {
         let snap = make_snapshot(10.0, 0.10, 0.0);
         let sys = System::new();
-        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
 
-        for profile in [
-            OptimizationProfile::BalancedRoot,
-            OptimizationProfile::AggressiveRoot,
-            OptimizationProfile::SafeRoot,
-        ] {
-            let output = decide_actions(
-                &snap,
-                &sys,
-                profile,
-                LatencyTarget::Normal,
-                0.0,
-                &interactive,
-                &noise,
-                OverflowThresholds::default(),
-                None,
-                &weights,
-                0.0,
-                &pids,
-                &ipc,
-                &hops,
-                &hab,
-                &causal,
-                &UserContext::default(),
-                &HashMap::new(),
-                &HashMap::new(),
-                0.0,
-                &HashMap::new(),
-                &HashMap::new(),
-            );
+        for profile in [OptimizationProfile::BalancedRoot, OptimizationProfile::AggressiveRoot, OptimizationProfile::SafeRoot] {
+            let output = call_decide(&snap, &sys, profile, LatencyTarget::Normal, 0.0);
             // Should not panic, and with no processes should produce no actions.
-            assert!(
-                output.actions.is_empty(),
-                "profile {:?} with empty sys should be empty",
-                profile
-            );
+            assert!(output.actions.is_empty(), "profile {:?} with empty sys should be empty", profile);
         }
     }
 
@@ -1683,37 +1526,9 @@ mod tests {
     fn decide_actions_all_latency_targets_work() {
         let snap = make_snapshot(10.0, 0.10, 0.0);
         let sys = System::new();
-        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
 
-        for target in [
-            LatencyTarget::Low,
-            LatencyTarget::Normal,
-            LatencyTarget::Max,
-        ] {
-            let output = decide_actions(
-                &snap,
-                &sys,
-                OptimizationProfile::BalancedRoot,
-                target,
-                0.0,
-                &interactive,
-                &noise,
-                OverflowThresholds::default(),
-                None,
-                &weights,
-                0.0,
-                &pids,
-                &ipc,
-                &hops,
-                &hab,
-                &causal,
-                &UserContext::default(),
-                &HashMap::new(),
-                &HashMap::new(),
-                0.0,
-                &HashMap::new(),
-                &HashMap::new(),
-            );
+        for target in [LatencyTarget::Low, LatencyTarget::Normal, LatencyTarget::Max] {
+            let output = call_decide(&snap, &sys, OptimizationProfile::BalancedRoot, target, 0.0);
             assert!(output.actions.is_empty());
         }
     }
