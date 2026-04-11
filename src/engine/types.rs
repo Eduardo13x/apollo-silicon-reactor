@@ -1064,6 +1064,18 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub drift_early_warning: f64,
 
+    /// Predicted thermal throttle level from ThermalManager (0–100).
+    /// Non-zero = ThermalManager forecasts throttling based on temperature trend.
+    #[serde(default)]
+    pub thermal_predicted_throttle: u8,
+    /// Seconds until thermal throttling predicted by ThermalManager.
+    /// -1 = no throttle predicted. 0–30 = imminent. >30 = headroom available.
+    #[serde(default)]
+    pub thermal_seconds_to_throttle: i32,
+    /// ThermalManager trend label: "Cooling" | "Stable" | "Warming" | "Critical".
+    #[serde(default)]
+    pub thermal_trend_predicted: String,
+
     /// FreezeProcess actions upgraded to ThrottleProcess (QoS Background) this cycle.
     /// Non-zero = causal attribution identified CPU-dominant processes.
     /// [Pearl 2009] causal mediation — QoS achieves CPU reduction without SIGSTOP.

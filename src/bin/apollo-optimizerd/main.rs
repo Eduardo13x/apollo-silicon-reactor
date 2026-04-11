@@ -2213,12 +2213,19 @@ fn main() -> anyhow::Result<()> {
 
                 // ThermalManager + GPUManager: tick every cycle with latest IOKit temperatures.
                 // gpu_thermal_throttled escapes this block to feed into governor input.
+                // thermal_predicted_* escape to metrics (predictive thermal observability).
                 let mut gpu_thermal_throttled = false;
+                let mut thermal_predicted_throttle: u8 = 0;
+                let mut thermal_seconds_to_throttle: i32 = -1;
+                let mut thermal_trend_predicted = String::new();
                 {
                     if let Some(hw) = &cycle_hw_snap {
                         let cpu_t = hw.temps.p_cluster_celsius.unwrap_or(0.0);
                         let gpu_t = hw.temps.gpu_celsius.unwrap_or(cpu_t);
-                        let _thermal_state = thermal_mgr.update(cpu_t, gpu_t, 0.0, 0, jitter_us);
+                        let thermal_state = thermal_mgr.update(cpu_t, gpu_t, 0.0, 0, jitter_us);
+                        thermal_predicted_throttle = thermal_state.predicted_throttle_level;
+                        thermal_seconds_to_throttle = thermal_state.seconds_to_throttle;
+                        thermal_trend_predicted = format!("{:?}", thermal_state.thermal_trend);
 
                         // GPU-aware thermal management: build GPU metrics from IOKit data
                         // and feed into gpu_manager for workload-specific recommendations.
@@ -6381,6 +6388,11 @@ fn main() -> anyhow::Result<()> {
                         lctx.outcome_tracker.drift_detector.early_warning();
                     // Causal QoS upgrades this cycle (FreezeProcess → ThrottleProcess).
                     m.metrics.causal_qos_upgrades_cycle = causal_qos_upgrades_cycle;
+                    // Predictive thermal state from ThermalManager (previously discarded).
+                    // seconds_to_throttle: -1 = no forecast, 0-30 = imminent risk.
+                    m.metrics.thermal_predicted_throttle = thermal_predicted_throttle;
+                    m.metrics.thermal_seconds_to_throttle = thermal_seconds_to_throttle;
+                    m.metrics.thermal_trend_predicted = thermal_trend_predicted.clone();
                 }
 
                 // ── Periodic stage: GC and observability (% 100 / % 500 / % 7200 gates) ──
