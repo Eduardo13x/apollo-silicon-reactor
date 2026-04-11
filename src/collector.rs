@@ -535,7 +535,19 @@ fn collect_pressure_facts() -> (f64, u64, u64, f64, f64) {
             // of data currently held in the compressor — what would be needed if
             // the compressor were flushed back to RAM.
             let uncompressed_pages = s.total_uncompressed_pages_in_compressor;
-            (uncompressed_pages as f64 / total_pages as f64).clamp(0.0, 1.0) * 0.85
+            let raw = (uncompressed_pages as f64 / total_pages as f64).clamp(0.0, 1.0) * 0.85;
+
+            // Inactive + purgeable pages are soft-available: the kernel can reclaim
+            // them on demand without any I/O (inactive) or immediately on request
+            // (purgeable). They act as a buffer — if they exist, the compressor
+            // is not truly the bottleneck that raw ratio suggests.
+            // Relief = (inactive + purgeable) / total * 0.45, capped at 0.18.
+            // (0.45 scale: pages convert to pressure relief at ~half rate since
+            //  kernel reclaim isn't instantaneous; 0.18 cap avoids under-reporting
+            //  in genuinely high-pressure situations.)
+            let soft_available = s.inactive_count as u64 + s.purgeable_count as u64;
+            let relief = ((soft_available as f64 / total_pages as f64) * 0.45).min(0.18);
+            (raw - relief).max(0.0)
         } else {
             0.0
         }
