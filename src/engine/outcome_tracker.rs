@@ -763,14 +763,21 @@ impl OutcomeTracker {
             let mut counts: Vec<_> = self.co_occurrence.values().copied().collect();
             counts.sort_unstable();
             let cutoff = counts[counts.len().saturating_sub(100)];
-            // Safety floor: if all entries share the same count (e.g., every pair
-            // has count=1 after a cold start), `v > cutoff` retains nothing — a
-            // total wipe of the causal graph. Only prune when at least 50 entries
-            // would survive, preserving graph connectivity.
-            // [Boldi & Vigna 2014] — graph pruning must respect a minimum floor.
             let would_retain = self.co_occurrence.values().filter(|&&v| v > cutoff).count();
             if would_retain >= 50 {
+                // Normal case: clear differentiation — keep strictly above cutoff.
                 self.co_occurrence.retain(|_, &mut v| v > cutoff);
+            } else {
+                // Homogeneous counts (e.g., all pairs at count=1 after cold start):
+                // count-based GC would skip entirely, letting the map grow without bound.
+                // Fall back to stable key-order truncation to hard-cap at 100 entries.
+                // [Boldi & Vigna 2014] — any bounded graph representation requires
+                // a hard eviction path when frequency discrimination is unavailable.
+                let mut keys: Vec<_> = self.co_occurrence.keys().cloned().collect();
+                keys.sort_unstable();
+                for key in keys.into_iter().skip(100) {
+                    self.co_occurrence.remove(&key);
+                }
             }
         }
     }

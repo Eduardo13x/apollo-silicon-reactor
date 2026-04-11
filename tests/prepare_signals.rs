@@ -183,7 +183,7 @@ mod scenarios {
         let p_before = d_before.p_oom_30s;
 
         for _ in 0..3 {
-            si.record_overflow(0.95, 0.8, 0.9, 2.0);
+            si.record_overflow(0.95, 0.8, 0.9);
         }
         let d_after = tick_stressed_returning(&mut si, 0.85);
         assert!(
