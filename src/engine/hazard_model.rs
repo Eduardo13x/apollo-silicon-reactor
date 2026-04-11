@@ -64,6 +64,13 @@ pub struct HazardModel {
     total_hours: f64,
     /// Último hazard calculado (para diagnóstico).
     last_hazard: f64,
+    /// Cycle counter for throttling beta counter-gradient updates.
+    /// Beta is only updated every SURVIVAL_BETA_STRIDE calls to prevent the
+    /// ~10,000:1 survival-to-OOM ratio from pinning betas at their floor.
+    /// base_rate update still runs every call.
+    /// Skipped during serialization — resets to 0 on daemon restart.
+    #[serde(skip)]
+    survival_tick_count: u32,
 }
 
 impl Default for HazardModel {
@@ -84,6 +91,7 @@ impl HazardModel {
             total_events: 0,
             total_hours: 0.0,
             last_hazard: 0.0,
+            survival_tick_count: 0,
         }
     }
 
@@ -176,13 +184,24 @@ impl HazardModel {
             self.base_rate =
                 (self.total_events as f64 + 1.0) / ((effective_hours + 24.0) * 3600.0);
         }
-        // Contra-gradiente en β: si el sistema sobrevivió con estas features,
-        // reducir el peso de los features que estaban altos (falsa alarma).
-        // lr negativo × 0.05 — mucho más lento que el aprendizaje positivo.
-        let neg_lr = self.lr * 0.05;
-        for (b, x) in self.beta.iter_mut().zip(features.iter()) {
-            *b -= neg_lr * x;
-            *b = b.clamp(0.5, 5.0); // mantener un floor positivo mínimo
+        // Contra-gradiente en β: apply every SURVIVAL_BETA_STRIDE ticks only.
+        // At ~5s cycles and frequent high-pressure periods, survival ticks outnumber
+        // OOM events ~10,000:1. Without throttling, betas get pinned at the floor
+        // regardless of update magnitude (H-2 calibration issue).
+        // base_rate update above runs every tick (correct — it's time-based).
+        const SURVIVAL_BETA_STRIDE: u32 = 10;
+        self.survival_tick_count = self.survival_tick_count.wrapping_add(1);
+        if self.survival_tick_count % SURVIVAL_BETA_STRIDE == 0 {
+            // neg_lr × 0.05 keeps OOM events (lr=0.01) 20× more impactful per event.
+            // Combined with stride=10, effective asymmetry is 200× — OOM events
+            // dominate on a per-event basis while survival ticks still converge over hours.
+            // Floor: 0.1 (not 0.5) — allows the model to learn that some features
+            // are genuinely less predictive of OOM without zeroing them out entirely.
+            let neg_lr = self.lr * 0.05;
+            for (b, x) in self.beta.iter_mut().zip(features.iter()) {
+                *b -= neg_lr * x;
+                *b = b.clamp(0.1, 5.0);
+            }
         }
     }
 
@@ -476,14 +495,16 @@ mod tests {
     fn test_survived_high_pressure_beta_stays_bounded() {
         let mut model = HazardModel::new();
         let feat = HazardModel::risk_features(0.9, 0.01, 0.95, 0.85);
-        // Apply many survival ticks — beta must never go below 0.5 floor
+        // Apply many survival ticks — beta must never go below 0.1 floor.
+        // Floor lowered from 0.5 to 0.1 (H-2 fix) to allow feature discrimination
+        // without zeroing out features entirely.
         for _ in 0..500 {
             model.tick_survived_high_pressure(&feat, 5.0);
         }
         for (i, b) in model.beta.iter().enumerate() {
             assert!(
-                *b >= 0.5,
-                "beta[{}] fell below floor of 0.5: got {}",
+                *b >= 0.1,
+                "beta[{}] fell below floor of 0.1: got {}",
                 i, b
             );
         }
