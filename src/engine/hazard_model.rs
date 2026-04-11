@@ -197,10 +197,19 @@ impl HazardModel {
         // Máximo plausible: 1 OOM por hora = 1/3600 eventos/segundo.
         const MAX_SANE_BASE_RATE: f64 = 1.0 / 3600.0;
         if self.base_rate > MAX_SANE_BASE_RATE {
-            // Reset completo: base_rate, total_events. Mantener total_hours
-            // para que el denominador de futuras estimaciones sea razonable.
+            // Reset completo: base_rate, total_events, AND total_hours.
+            //
+            // Previously only total_events was reset, preserving total_hours.
+            // BUG: with total_hours=2000 (months of uptime) and total_events=0,
+            // tick_no_event() computes base_rate ≈ 1/(2000*3600) ≈ 1.37e-7,
+            // which is 33x below the prior — model becomes blind to OOM risk.
+            //
+            // Fix: also reset total_hours to a 24h prior window. This anchors
+            // the model to "1 event in the first 24h" (the Laplace prior) rather
+            // than to a phantom history it never observed in the new session.
             self.base_rate = 1.0 / (24.0 * 3600.0);
             self.total_events = 0;
+            self.total_hours = 24.0; // 24h prior window — matches Laplace +24 in formula
         }
         for b in self.beta.iter_mut() {
             *b = b.clamp(0.0, 5.0);
@@ -412,8 +421,10 @@ mod tests {
         );
         // total_events should be reset to 0 (prevents re-saturation on next tick)
         assert_eq!(model.total_events, 0, "total_events must reset to prevent re-saturation");
-        // total_hours preserved (denominator for future estimates)
-        assert!(model.total_hours > 0.0, "total_hours should be preserved");
+        // total_hours reset to 24h prior window (NOT preserved — preserving months of
+        // uptime would make base_rate ≈ 0 after events=0 reset)
+        assert!((model.total_hours - 24.0).abs() < 1e-10,
+            "total_hours should be reset to 24h prior, got {}", model.total_hours);
         // beta values must all be in valid range
         for b in model.beta.iter() {
             assert!(*b >= 0.0 && *b <= 5.0, "beta must stay in valid range after validate");

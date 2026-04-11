@@ -179,7 +179,11 @@ impl SwapPredictor {
                     return Some(0); // already at critical
                 }
                 let cycles_remaining = bytes_remaining / rate_per_cycle;
-                Some((cycles_remaining * 5.0).round() as i32) // 5s per cycle
+                // Clamp before cast: very slow growth produces astronomically large
+                // cycle counts that would overflow i32 (max ~2.1e9 → ~12 years).
+                // Cap at 7 days (604800s) — beyond that, the forecast is meaningless.
+                let secs = (cycles_remaining * 5.0).round().min(604_800.0);
+                Some(secs as i32)
             }
         }
     }
