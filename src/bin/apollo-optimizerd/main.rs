@@ -1494,13 +1494,20 @@ fn main() -> anyhow::Result<()> {
                     frozen_state.clear();
                     write_frozen_state(&frozen_state_path, &frozen_state);
 
+                    // Also thaw display_turbo frozen PIDs — separate registry, would stay
+                    // SIGSTOP'd until next DeactivateTurbo or ghost GC cycle otherwise.
+                    let turbo_pids = display_turbo.turbo_frozen_pids_snapshot();
+                    let turbo_unfreeze = unfreeze_pids(turbo_pids.into_iter());
+                    display_turbo.clear_frozen();
+
                     {
                         let mut metrics = state.metrics.lock_recover();
                         metrics.metrics.wake_events += 1;
                         metrics.metrics.post_wake_grace_entries += 1;
-                        metrics.metrics.post_wake_defensive_unfreezes += unfreeze_count;
-                        metrics.metrics.unfreezes_applied += unfreeze_count;
-                        metrics.metrics.throttle_reverted += unfreeze_count;
+                        metrics.metrics.post_wake_defensive_unfreezes +=
+                            unfreeze_count + turbo_unfreeze;
+                        metrics.metrics.unfreezes_applied += unfreeze_count + turbo_unfreeze;
+                        metrics.metrics.throttle_reverted += unfreeze_count + turbo_unfreeze;
                     }
                 }
                 process_guard.wake_state.last_cycle_wallclock = now_wall;
