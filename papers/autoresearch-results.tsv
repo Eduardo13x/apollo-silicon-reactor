@@ -1,6 +1,0 @@
-iter	action	equations	cited_claims	clarity	keep	notes
-0	baseline	15	45	7	—	Initial Opus draft. Solid structure, needs formal math and crisper related work.
-1	formalize_nars+stack_def	19	47	8	YES	Added Definition 1 (cognitive stack tuple), Proposition 1 (NARS convergence), full evidence weight derivation with two axioms
-2	related_work_table	19	53	8.5	YES	Replaced 3-sentence prose with 9-capability Table 1 across 5 systems + 4 new refs (MLOS, Kephart, bpftune, sched_ext)
-3	theorem1_necessity	22	57	9	YES	Added Theorem 1 (three-pillar necessity+sufficiency), Definition 2 (AGI-grade CRM), Corollary 1 (Layer 4 necessity), 3 proof sketches
-4	abstract_polish_limits	22	57	9.5	YES	Abstract now leads with Theorem 1. Limitations restructured into L1-L5 (single-machine, benchmark, theory, warmstart, platform)
