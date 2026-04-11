@@ -872,7 +872,8 @@ impl ChromiumManager {
             .values()
             .filter(|r| r.frozen)
             .map(|r| r.memory_bytes as f64 / 1_048_576.0)
-            .sum();
+            .sum::<f64>()
+            .max(0.0);
 
         let mut browsers: Vec<String> = self.browsers.keys().cloned().collect();
         browsers.sort();

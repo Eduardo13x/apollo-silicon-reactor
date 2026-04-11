@@ -928,6 +928,17 @@ fn main() -> anyhow::Result<()> {
                 Some(state.mach_qos.clone()),
             );
             // Overflow guard: aprende de eventos OOM y ajusta thresholds adaptativamente.
+            // SleepNotifier: IOKit pre-sleep callback — fires kIOMessageSystemWillSleep
+            // ~30s before the kernel suspends, giving us time to release all SIGSTOP'd
+            // processes so macOS can compress/Jetsam them normally during hibernation.
+            // Without this, frozen processes block Jetsam's target set, leading to
+            // more aggressive kills of other processes (widgets, extensions).
+            let sleep_notifier = apollo_optimizer::engine::sleep_notifier::SleepNotifier::new();
+            tracing::info!(
+                available = sleep_notifier.available,
+                "sleep_notifier: IOKit pre-sleep hook {}",
+                if sleep_notifier.available { "registered" } else { "unavailable (running without IOKit access)" }
+            );
             let mut overflow_guard = OverflowGuard::load_or_default(
                 std::path::Path::new(overflow_history_path()),
                 Some(std::path::Path::new(rl_threshold_path())),
@@ -1884,6 +1895,64 @@ fn main() -> anyhow::Result<()> {
                     proc_snaps.iter().map(|p| p.name.as_str()).collect();
                 let hour_of_day = Utc::now().hour() as u8;
 
+                // ── Pre-sleep unfreeze ───────────────────────────────────────
+                // kIOMessageSystemWillSleep fires ~30s before kernel suspends.
+                // Release all SIGSTOP'd processes so macOS can compress/Jetsam
+                // them during sleep. Without this, frozen PIDs block Jetsam's
+                // target set → more aggressive kills of widgets/extensions.
+                // The wake path (post-wake grace) already re-evaluates from scratch.
+                if sleep_notifier.will_sleep_pending() {
+                    let mut frozen_guard = state.frozen_state.lock_recover();
+                    let count = unfreeze_pids(frozen_guard.keys().copied());
+                    if count > 0 {
+                        tracing::info!(
+                            count,
+                            "pre-sleep: released {} frozen PID(s) — \
+                             handing back to macOS memory manager",
+                            count
+                        );
+                        frozen_guard.clear();
+                        write_frozen_state(&frozen_state_path, &frozen_guard);
+                        state.metrics.lock_recover().metrics.unfreezes_applied += count;
+                    }
+                    // Turbo frozen set: thaw those PIDs too.
+                    for pid in display_turbo.turbo_frozen_pids_snapshot() {
+                        let _ = unfreeze_pids(std::iter::once(pid));
+                    }
+                    display_turbo.clear_frozen();
+                    sleep_notifier.acknowledge();
+                }
+
+                // ── Ghost-PID reconciliation ─────────────────────────────────
+                // A frozen process can die via manual kill, Force Quit, or
+                // jetsam while kqueue NOTE_EXIT isn't registered (e.g., after
+                // a daemon restart). Without cleanup, frozen_state retains
+                // ghost entries whose RSS is counted as frozen_ram_mb even
+                // though the OS already reclaimed that memory.
+                //
+                // proc_snaps is authoritative for live PIDs (built from
+                // sysinfo::System::processes() which reflects the current
+                // kernel process table). Any frozen PID absent here is dead.
+                {
+                    let live_pids: HashSet<u32> =
+                        proc_snaps.iter().map(|p| p.pid).collect();
+                    let mut frozen_guard = state.frozen_state.lock_recover();
+                    let before = frozen_guard.len();
+                    frozen_guard.retain(|pid, _| live_pids.contains(pid));
+                    let removed = before - frozen_guard.len();
+                    if removed > 0 {
+                        tracing::info!(
+                            removed,
+                            "frozen_state: evicted {} ghost PID(s) \
+                             (died without kqueue notification)",
+                            removed
+                        );
+                        write_frozen_state(&frozen_state_path, &frozen_guard);
+                    }
+                    // Turbo set: same reconciliation, no disk write needed.
+                    display_turbo.gc_dead_pids(&live_pids);
+                }
+
                 // MemoryAnalyzer: profile top-50 processes for memory leaks each cycle.
                 // For the top-10 by RSS, refine WSS with real TASK_VM_INFO data.
                 for (i, snap) in proc_snaps.iter().take(50).enumerate() {
@@ -2216,7 +2285,7 @@ fn main() -> anyhow::Result<()> {
                 // thermal_predicted_* escape to metrics (predictive thermal observability).
                 let mut gpu_thermal_throttled = false;
                 let mut thermal_predicted_throttle: u8 = 0;
-                let mut thermal_seconds_to_throttle: i32 = -1;
+                let mut thermal_seconds_to_throttle: Option<i32> = None;
                 let mut thermal_trend_predicted = String::new();
                 {
                     if let Some(hw) = &cycle_hw_snap {
@@ -2380,19 +2449,26 @@ fn main() -> anyhow::Result<()> {
                                             &format!("kqueue-{:?}", level),
                                             snapshot.pressure.compressor_pressure,
                                         );
-                                        // Teach hazard model about this overflow.
+                                        // Teach hazard model only on real OOM indicators:
+                                        // swap must be GROWING (delta > 512KB/s) and present
+                                        // (> 10% used). kqueue Critical fires at ~80% pressure
+                                        // which is normal; training on it saturates base_rate.
                                         let sr = if snapshot.pressure.swap_total_bytes > 0 {
                                             snapshot.pressure.swap_used_bytes as f64
                                                 / snapshot.pressure.swap_total_bytes as f64
                                         } else {
                                             0.0
                                         };
-                                        lctx.signal_intel.record_overflow(
-                                            snapshot.pressure.memory_pressure,
-                                            sr,
-                                            snapshot.pressure.memory_pressure,
-                                            1.0,
-                                        );
+                                        let swap_growing =
+                                            snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
+                                        if sr > 0.10 && swap_growing {
+                                            lctx.signal_intel.record_overflow(
+                                                snapshot.pressure.memory_pressure,
+                                                sr,
+                                                snapshot.pressure.memory_pressure,
+                                                1.0,
+                                            );
+                                        }
                                     }
                                     VmPressureLevel::Warning => {
                                         reactor_weight = (reactor_weight + 0.5).min(1.0);
@@ -4718,12 +4794,17 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         0.0
                     };
-                    lctx.signal_intel.record_overflow(
-                        snapshot.pressure.memory_pressure,
-                        sr,
-                        snapshot.pressure.memory_pressure,
-                        1.0,
-                    );
+                    // Only train hazard model when swap is actively growing (real OOM risk).
+                    let swap_growing =
+                        snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
+                    if sr > 0.10 && swap_growing {
+                        lctx.signal_intel.record_overflow(
+                            snapshot.pressure.memory_pressure,
+                            sr,
+                            snapshot.pressure.memory_pressure,
+                            1.0,
+                        );
+                    }
                 }
                 // Decaimiento gradual: si el sistema está en calma, relajar thresholds.
                 lctx.overflow_guard.tick_decay(
@@ -6356,7 +6437,8 @@ fn main() -> anyhow::Result<()> {
                         .iter()
                         .filter_map(|(pid, _)| sys.process(sysinfo::Pid::from_u32(*pid)))
                         .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
-                        .sum();
+                        .sum::<f64>()
+                        .max(0.0);
                     // cycles_high_pressure — consecutive cycles above bg_pressure.
                     let bg_threshold = overflow_thresholds.bg_pressure;
                     if snapshot.pressure.memory_pressure > bg_threshold {
@@ -6389,7 +6471,7 @@ fn main() -> anyhow::Result<()> {
                     // Causal QoS upgrades this cycle (FreezeProcess → ThrottleProcess).
                     m.metrics.causal_qos_upgrades_cycle = causal_qos_upgrades_cycle;
                     // Predictive thermal state from ThermalManager (previously discarded).
-                    // seconds_to_throttle: -1 = no forecast, 0-30 = imminent risk.
+                    // seconds_to_throttle: null = no forecast, 0 = throttling now, >0 = seconds of headroom.
                     m.metrics.thermal_predicted_throttle = thermal_predicted_throttle;
                     m.metrics.thermal_seconds_to_throttle = thermal_seconds_to_throttle;
                     m.metrics.thermal_trend_predicted = thermal_trend_predicted.clone();

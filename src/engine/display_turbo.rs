@@ -290,6 +290,23 @@ impl DisplayTurbo {
     pub fn remove_pid(&mut self, pid: u32) {
         self.turbo_frozen_pids.remove(&pid);
     }
+
+    /// Snapshot of current turbo-frozen PIDs (for pre-sleep release).
+    pub fn turbo_frozen_pids_snapshot(&self) -> Vec<u32> {
+        self.turbo_frozen_pids.iter().copied().collect()
+    }
+
+    /// Clear all turbo-frozen PIDs (caller is responsible for sending SIGCONT first).
+    pub fn clear_frozen(&mut self) {
+        self.turbo_frozen_pids.clear();
+    }
+
+    /// Remove all PIDs that are no longer in the live process set.
+    /// Called once per cycle after proc_snaps is built to evict ghost entries
+    /// for processes that died without triggering a kqueue NOTE_EXIT event.
+    pub fn gc_dead_pids(&mut self, live_pids: &std::collections::HashSet<u32>) {
+        self.turbo_frozen_pids.retain(|pid| live_pids.contains(pid));
+    }
 }
 
 /// Action returned by `DisplayTurbo::tick()`.
