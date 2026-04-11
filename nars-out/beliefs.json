@@ -1,365 +1,157 @@
 {
   "beliefs": [
     {
-      "id": "B002",
-      "subject": "prepare.rs",
-      "node_id": "prepare",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
+      "id": "B031",
+      "subject": "nested_learner.rs — L2→L0 feedback path",
+      "predicate": "gate threshold is constant (0.25), L2 meta-velocity never adjusts it — paper §6.2 claim unimplemented",
       "evidence": [
-        "god_node_67_edges"
+        "grep: L1_GATE_THRESHOLD is const not dynamic",
+        "grep: flush_l2() stores l2_context but no caller reads it to adjust gate",
+        "paper_gap: §6.2 'L2 meta-velocity feeds back to L0 gate threshold'",
+        "nested_learner.rs:51 L1_GATE_THRESHOLD: f64 = 0.25"
       ],
-      "truth": {
-        "f": 0.85,
-        "c": 0.99
-      },
-      "priority": 0.8415
+      "truth": { "f": 0.90, "c": 0.90 },
+      "priority": 0.810,
+      "category": "implementation_gap",
+      "sources": ["code_grep", "paper_§6.2"]
     },
     {
-      "id": "B008",
-      "subject": "decide()",
-      "node_id": "prepare_decide",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
+      "id": "B032",
+      "subject": "causal_graph.mechanism() → QoS/SIGSTOP routing",
+      "predicate": "MechanismAttribution tracked but never consulted at set_tier call sites — paper §5.2 claim unimplemented",
       "evidence": [
-        "god_node_55_edges"
+        "grep: causal_graph.rs exposes mechanism() API at line 415",
+        "grep: main.rs set_tier calls use hardcoded Foreground/Background tiers",
+        "grep: zero matches for 'mechanism.*set_tier' or 'set_tier.*mechanism'",
+        "paper_gap: §5.2 'CPU reduction → QoS tiering rather than SIGSTOP'"
       ],
-      "truth": {
-        "f": 0.85,
-        "c": 0.99
-      },
-      "priority": 0.8415
+      "truth": { "f": 0.88, "c": 0.88 },
+      "priority": 0.774,
+      "category": "implementation_gap",
+      "sources": ["code_grep", "paper_§5.2"]
     },
     {
-      "id": "B009",
-      "subject": "learned_state.rs",
-      "node_id": "learned_state",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
+      "id": "B033",
+      "subject": "benchmark suite — continuous workload coverage",
+      "predicate": "165 fixed deterministic scenarios do not cover adversarial/gradual/continuous workloads — L2 limitation in paper §8.3",
       "evidence": [
-        "god_node_53_edges"
+        "paper_gap: §8.3 L2 'does not capture adversarial workloads, multi-hour gradual memory leaks'",
+        "paper_gap: §8.3 'future work: continuous workload simulation benchmark'",
+        "hyperedge_6_nodes | confidence_1.0 | Prediction & Forecasting (B018 revision)",
+        "1602 tests but all deterministic"
       ],
-      "truth": {
-        "f": 0.85,
-        "c": 0.99
-      },
-      "priority": 0.8415
-    },
-    {
-      "id": "B010",
-      "subject": "nars_belief.rs",
-      "node_id": "nars_belief",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_50_edges"
-      ],
-      "truth": {
-        "f": 0.85,
-        "c": 0.99
-      },
-      "priority": 0.8415
-    },
-    {
-      "id": "B006",
-      "subject": "chromium_manager.rs",
-      "node_id": "chromium_manager",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_64_edges",
-        "community_3_cohesion_0.0494"
-      ],
-      "truth": {
-        "f": 0.8482,
-        "c": 0.99
-      },
-      "priority": 0.8397
-    },
-    {
-      "id": "B003",
-      "subject": "predictive_agent.rs",
-      "node_id": "predictive_agent",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_67_edges",
-        "community_2_cohesion_0.0489"
-      ],
-      "truth": {
-        "f": 0.8467,
-        "c": 0.99
-      },
-      "priority": 0.8382
-    },
-    {
-      "id": "B011",
-      "subject": "decide_actions.rs",
-      "node_id": "decide_actions",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_49_edges"
-      ],
-      "truth": {
-        "f": 0.85,
-        "c": 0.98
-      },
-      "priority": 0.833
-    },
-    {
-      "id": "B007",
-      "subject": "safety.rs",
-      "node_id": "safety",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_59_edges",
-        "community_12_cohesion_0.0427"
-      ],
-      "truth": {
-        "f": 0.8307,
-        "c": 0.99
-      },
-      "priority": 0.8224
-    },
-    {
-      "id": "B004",
-      "subject": "outcome_tracker.rs",
-      "node_id": "outcome_tracker",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_66_edges",
-        "community_1_cohesion_0.0403"
-      ],
-      "truth": {
-        "f": 0.8254,
-        "c": 0.99
-      },
-      "priority": 0.8171
-    },
-    {
-      "id": "B001",
-      "subject": "daemon_helpers.rs",
-      "node_id": "daemon_helpers",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_68_edges",
-        "community_6_cohesion_0.0353"
-      ],
-      "truth": {
-        "f": 0.8157,
-        "c": 0.99
-      },
-      "priority": 0.8075
-    },
-    {
-      "id": "B014",
-      "subject": "signal_intelligence.rs",
-      "node_id": "signal_intelligence",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_47_edges"
-      ],
-      "truth": {
-        "f": 0.85,
-        "c": 0.94
-      },
-      "priority": 0.799
-    },
-    {
-      "id": "B012",
-      "subject": "level8_adaptive_intelligence.rs",
-      "node_id": "level8_adaptive_intelligence",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_48_edges",
-        "community_15_cohesion_0.0407"
-      ],
-      "truth": {
-        "f": 0.8257,
-        "c": 0.9674
-      },
-      "priority": 0.7988
-    },
-    {
-      "id": "B013",
-      "subject": ".new()",
-      "node_id": "outcome_tracker_outcometracker_new",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_48_edges",
-        "community_1_cohesion_0.0403"
-      ],
-      "truth": {
-        "f": 0.8248,
-        "c": 0.9678
-      },
-      "priority": 0.7982
-    },
-    {
-      "id": "B015",
-      "subject": "dashboard.rs",
-      "node_id": "dashboard",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_46_edges"
-      ],
-      "truth": {
-        "f": 0.85,
-        "c": 0.92
-      },
-      "priority": 0.782
-    },
-    {
-      "id": "B005",
-      "subject": "types.rs",
-      "node_id": "types",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_64_edges",
-        "community_0_cohesion_0.0139"
-      ],
-      "truth": {
-        "f": 0.7867,
-        "c": 0.99
-      },
-      "priority": 0.7788
-    },
-    {
-      "id": "B016",
-      "subject": "snap()",
-      "node_id": "prepare_snap",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_45_edges"
-      ],
-      "truth": {
-        "f": 0.85,
-        "c": 0.9
-      },
-      "priority": 0.765
-    },
-    {
-      "id": "B017",
-      "subject": "foreground.rs",
-      "node_id": "foreground",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_45_edges"
-      ],
-      "truth": {
-        "f": 0.85,
-        "c": 0.9
-      },
-      "priority": 0.765
-    },
-    {
-      "id": "B022",
-      "subject": "Main Optimization Pipeline",
-      "predicate": "pipeline is well-understood \u2014 prime refactor target",
-      "evidence": [
-        "hyperedge_extracted_1.0",
-        "nodes:['tier1_heuristics', 'tier2_ml', 'tier3_llm']"
-      ],
-      "truth": {
-        "f": 0.9,
-        "c": 0.85
-      },
-      "priority": 0.765
-    },
-    {
-      "id": "B023",
-      "subject": "ARM64 Optimization Phases",
-      "predicate": "pipeline is well-understood \u2014 prime refactor target",
-      "evidence": [
-        "hyperedge_extracted_1.0",
-        "nodes:['phase1_thread_scheduling', 'phase2_direct_mach', 'phase3_rwlock']"
-      ],
-      "truth": {
-        "f": 0.9,
-        "c": 0.85
-      },
-      "priority": 0.765
-    },
-    {
-      "id": "B024",
-      "subject": "Critical Architecture Bugs",
-      "predicate": "pipeline is well-understood \u2014 prime refactor target",
-      "evidence": [
-        "hyperedge_extracted_1.0",
-        "nodes:['bug_pending_trial_skill', 'bug_cooccurrence_eviction', 'bug_f32_precision']"
-      ],
-      "truth": {
-        "f": 0.9,
-        "c": 0.85
-      },
-      "priority": 0.765
-    },
-    {
-      "id": "B018",
-      "subject": "find_decision()",
-      "node_id": "prepare_find_decision",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_44_edges"
-      ],
-      "truth": {
-        "f": 0.85,
-        "c": 0.88
-      },
-      "priority": 0.748
-    },
-    {
-      "id": "B020",
-      "subject": "llm.rs",
-      "node_id": "llm",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_42_edges",
-        "community_0_cohesion_0.0139"
-      ],
-      "truth": {
-        "f": 0.7807,
-        "c": 0.9555
-      },
-      "priority": 0.746
-    },
-    {
-      "id": "B019",
-      "subject": "proc_taskinfo.rs",
-      "node_id": "proc_taskinfo",
-      "predicate": "is over-coupled \u2014 decompose or delegate",
-      "evidence": [
-        "god_node_42_edges",
-        "community_13_cohesion_0.0459"
-      ],
-      "truth": {
-        "f": 0.8367,
-        "c": 0.8531
-      },
-      "priority": 0.7138
+      "truth": { "f": 0.90, "c": 0.88 },
+      "priority": 0.792,
+      "category": "benchmark_gap",
+      "sources": ["paper_§8.3", "hyperedge_B018_revision"]
     },
     {
       "id": "B021",
-      "subject": "Menu Bar UI Layer",
-      "community_id": 0,
-      "predicate": "is a God Community \u2014 split by domain",
-      "evidence": [
-        "size_204_nodes",
-        "cohesion_0.0139"
-      ],
-      "truth": {
-        "f": 0.7485,
-        "c": 0.911
-      },
-      "priority": 0.6819
+      "subject": "Adams & MacKay 2007 — Bayesian Online Changepoint Detection ↔ Uncertainty Quantification",
+      "predicate": "bridges Affective & Cognitive Neuroscience → Uncertainty Quantification & Ensembles — novel cross-domain insight",
+      "evidence": ["cross_community_edge", "relation_conceptually_related_to", "confidence_1.0"],
+      "truth": { "f": 0.80, "c": 1.00 },
+      "priority": 0.800,
+      "category": "bridge",
+      "sources": ["surprising_connections"]
     },
     {
-      "id": "B025",
-      "subject": "ane_analysis \u2194 amx_analysis",
-      "predicate": "duplicate logic \u2014 unify or make link explicit",
-      "evidence": [
-        "relation_semantically_similar_to",
-        "confidence_INFERRED"
-      ],
-      "truth": {
-        "f": 0.8,
-        "c": 0.75
-      },
-      "priority": 0.6
+      "id": "B022",
+      "subject": "Yerkes & Dodson 1908 — Arousal and Performance Law ↔ Affective & Cognitive Computing",
+      "predicate": "bridges Systems Reliability & Data Management → Affective & Cognitive Neuroscience — novel cross-domain insight",
+      "evidence": ["cross_community_edge", "relation_conceptually_related_to", "confidence_1.0"],
+      "truth": { "f": 0.80, "c": 1.00 },
+      "priority": 0.800,
+      "category": "bridge",
+      "sources": ["surprising_connections"]
+    },
+    {
+      "id": "B015",
+      "subject": "Memory Management & Working Set Papers",
+      "predicate": "forms a unified cognitive subsystem in Apollo",
+      "evidence": ["hyperedge_6_nodes", "confidence_1.0", "EXTRACTED"],
+      "truth": { "f": 0.90, "c": 0.857 },
+      "priority": 0.771,
+      "category": "subsystem",
+      "sources": ["hyperedge analysis"]
+    },
+    {
+      "id": "B018",
+      "subject": "Prediction & Forecasting Papers",
+      "predicate": "forms a unified cognitive subsystem in Apollo",
+      "evidence": ["hyperedge_6_nodes", "confidence_1.0", "EXTRACTED"],
+      "truth": { "f": 0.90, "c": 0.857 },
+      "priority": 0.771,
+      "category": "subsystem",
+      "sources": ["hyperedge analysis"]
+    },
+    {
+      "id": "B019",
+      "subject": "Affective & Cognitive Science Papers",
+      "predicate": "forms a unified cognitive subsystem in Apollo",
+      "evidence": ["hyperedge_6_nodes", "confidence_1.0", "EXTRACTED"],
+      "truth": { "f": 0.90, "c": 0.857 },
+      "priority": 0.771,
+      "category": "subsystem",
+      "sources": ["hyperedge analysis"]
+    },
+    {
+      "id": "B020",
+      "subject": "Deep Learning & Neural Architecture Papers",
+      "predicate": "forms a unified cognitive subsystem in Apollo",
+      "evidence": ["hyperedge_7_nodes", "confidence_0.95", "INFERRED"],
+      "truth": { "f": 0.75, "c": 0.90 },
+      "priority": 0.675,
+      "category": "subsystem",
+      "sources": ["hyperedge analysis"]
+    },
+    {
+      "id": "B011",
+      "subject": "Causal Reasoning Papers",
+      "predicate": "forms a unified cognitive subsystem in Apollo",
+      "evidence": ["hyperedge_4_nodes", "confidence_1.0", "EXTRACTED"],
+      "truth": { "f": 0.90, "c": 0.571 },
+      "priority": 0.514,
+      "category": "subsystem",
+      "sources": ["hyperedge analysis"]
+    },
+    {
+      "id": "B016",
+      "subject": "Self-Improvement & Meta-Learning Papers",
+      "predicate": "forms a unified cognitive subsystem in Apollo",
+      "evidence": ["hyperedge_4_nodes", "confidence_1.0", "EXTRACTED"],
+      "truth": { "f": 0.90, "c": 0.571 },
+      "priority": 0.514,
+      "category": "subsystem",
+      "sources": ["hyperedge analysis"]
+    },
+    {
+      "id": "B001",
+      "subject": "Pearl 2009 — Causality: Models, Reasoning, and Inference",
+      "predicate": "is a core architectural pillar of Apollo AGI",
+      "evidence": ["god_node_5_edges", "cross_community_bridge"],
+      "truth": { "f": 0.85, "c": 0.50 },
+      "priority": 0.425,
+      "category": "pillar",
+      "sources": ["god_nodes analysis"]
+    },
+    {
+      "id": "B003",
+      "subject": "nars_belief.rs",
+      "predicate": "is a core architectural pillar of Apollo AGI",
+      "evidence": ["god_node_5_edges", "cross_community_bridge"],
+      "truth": { "f": 0.85, "c": 0.50 },
+      "priority": 0.425,
+      "category": "pillar",
+      "sources": ["god_nodes analysis"]
     }
-  ]
+  ],
+  "meta": {
+    "generated": "2026-04-10",
+    "source": "papers/apollo_agi_paper_draft.md + code grep analysis",
+    "new_this_session": ["B031", "B032", "B033"],
+    "nars_revisions": ["B033 revised from B018 evidence (Prediction hyperedge + paper §8.3)"],
+    "baseline_tests": 1602,
+    "baseline_scenarios": "165/165"
+  }
 }
