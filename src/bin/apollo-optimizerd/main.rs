@@ -2669,7 +2669,7 @@ fn main() -> anyhow::Result<()> {
                 // downstream consumers (decide_actions, page_reclaim, io_shaper,
                 // skill_registry, signal_intel) see the fully-boosted value
                 // without requiring individual call-site changes.
-                let (pressure_ram, _pressure_components) = effective_pressure::compute(
+                let (pressure_ram, pressure_components) = effective_pressure::compute(
                     snapshot.pressure.memory_pressure,
                     hw_boost,
                     batt_boost,
@@ -2735,6 +2735,11 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.swap_delta_bps = snapshot.pressure.swap_delta_bytes_per_sec;
                     metrics.metrics.memory_pressure = snapshot.pressure.memory_pressure;
                     metrics.metrics.thermal_level = snapshot.pressure.thermal_level.clone();
+                    // Expose pressure boost breakdown so the dashboard shows WHY effective
+                    // pressure exceeds raw memory_pressure (hardware/thermal/battery factors).
+                    metrics.metrics.pressure_total_boost = pressure_components.total_boost();
+                    metrics.metrics.pressure_dominant_factor =
+                        pressure_components.dominant_factor().to_string();
                     // Expose the new sensor surface (thrashing flow + per-core
                     // saturation + PSI stall fraction) so the dashboard,
                     // socket status and runtime_metrics.json all see the same
@@ -5770,6 +5775,15 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.outcome_pending_depth = pending_depth;
                 }
 
+                // Snapshot causal QoS preferences before exec_outcomes consumes final_actions.
+                // FreezeProcess actions for CPU-dominant processes will be upgraded to
+                // ThrottleProcess(aggressive=true) — QoS Background tier is less invasive
+                // than SIGSTOP when CPU reduction is the only causal mechanism needed.
+                // [Pearl 2009 §3] mediation analysis  [Nygard 2018] bulkhead: least-invasive first
+                let causal_qos_names: std::collections::HashSet<String> =
+                    lctx.causal_graph.qos_preferred_names();
+                let mut causal_qos_upgrades_cycle = 0u32;
+
                 // Captura los nombres de throttles antes de mover final_actions.
                 let throttle_names_for_outcome: Vec<String> = final_actions
                     .iter()
@@ -5888,6 +5902,37 @@ fn main() -> anyhow::Result<()> {
                         *PREV_THROTTLED.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(this_cycle);
                         deduped
+                    };
+
+                    // Causal QoS upgrade: FreezeProcess → ThrottleProcess for CPU-dominant processes.
+                    // Iterates the deduped action list once; no-op when causal_qos_names is empty
+                    // (cold start or no CPU-dominant evidence yet — defaults to safe SIGSTOP path).
+                    let filtered_actions: Vec<RootAction> = if !causal_qos_names.is_empty() {
+                        filtered_actions
+                            .into_iter()
+                            .map(|a| match a {
+                                RootAction::FreezeProcess {
+                                    pid,
+                                    name,
+                                    reason,
+                                    start_sec,
+                                    start_usec,
+                                } if causal_qos_names.contains(name.as_str()) => {
+                                    causal_qos_upgrades_cycle += 1;
+                                    RootAction::ThrottleProcess {
+                                        pid,
+                                        name,
+                                        aggressive: true,
+                                        reason: format!("{} [causal:qos]", reason),
+                                        start_sec,
+                                        start_usec,
+                                    }
+                                }
+                                other => other,
+                            })
+                            .collect()
+                    } else {
+                        filtered_actions
                     };
 
                     // Extract a temporary HashSet for execute_actions (which requires &mut HashSet<u32>).
@@ -6334,6 +6379,8 @@ fn main() -> anyhow::Result<()> {
                     m.metrics.reptile_cached_workloads = cognitive_state.reptile.cached_workloads();
                     m.metrics.drift_early_warning =
                         lctx.outcome_tracker.drift_detector.early_warning();
+                    // Causal QoS upgrades this cycle (FreezeProcess → ThrottleProcess).
+                    m.metrics.causal_qos_upgrades_cycle = causal_qos_upgrades_cycle;
                 }
 
                 // ── Periodic stage: GC and observability (% 100 / % 500 / % 7200 gates) ──

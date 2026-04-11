@@ -1063,6 +1063,21 @@ pub struct RuntimeMetrics {
     /// DriftDetector early warning score [0,1].
     #[serde(default)]
     pub drift_early_warning: f64,
+
+    /// FreezeProcess actions upgraded to ThrottleProcess (QoS Background) this cycle.
+    /// Non-zero = causal attribution identified CPU-dominant processes.
+    /// [Pearl 2009] causal mediation — QoS achieves CPU reduction without SIGSTOP.
+    #[serde(default)]
+    pub causal_qos_upgrades_cycle: u32,
+    /// Sum of all active pressure boost factors (hardware + thermal + battery + …).
+    /// effective_pressure = memory_pressure + pressure_total_boost (clamped 0..1).
+    /// Shows WHY effective pressure differs from raw memory_pressure.
+    #[serde(default)]
+    pub pressure_total_boost: f64,
+    /// Largest active pressure boost factor ("thermal", "hardware",
+    /// "memory_bandwidth", "llm_workload", etc.). "none" = no active boosts.
+    #[serde(default)]
+    pub pressure_dominant_factor: String,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.

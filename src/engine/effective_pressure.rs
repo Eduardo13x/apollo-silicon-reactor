@@ -58,6 +58,28 @@ impl PressureComponents {
             + self.smc_thermal
             + self.battery_overheat
     }
+
+    /// Name of the largest active boost factor, or "none" if all are zero.
+    /// Useful for observability: shows WHY effective pressure exceeds raw pressure.
+    pub fn dominant_factor(&self) -> &str {
+        let factors = [
+            (self.hardware, "hardware"),
+            (self.battery, "battery"),
+            (self.thermal, "thermal"),
+            (self.llm_workload, "llm_workload"),
+            (self.charging_stress, "charging_stress"),
+            (self.battery_low, "battery_low"),
+            (self.memory_bandwidth, "memory_bandwidth"),
+            (self.smc_thermal, "smc_thermal"),
+            (self.battery_overheat, "battery_overheat"),
+        ];
+        factors
+            .iter()
+            .filter(|(v, _)| *v >= 0.01)
+            .max_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(_, name)| *name)
+            .unwrap_or("none")
+    }
 }
 
 /// Compute the effective system memory pressure including all boost factors.

@@ -456,6 +456,25 @@ impl CausalGraph {
         }
     }
 
+    /// Returns all process names for which `prefer_qos_over_sigstop()` is true.
+    /// Used by the execution pipeline to bulk-upgrade FreezeProcess → ThrottleProcess
+    /// when causal evidence identifies CPU reduction as the primary mechanism.
+    /// [Pearl 2009 §3] — identify causal pathway before choosing intervention
+    pub fn qos_preferred_names(&self) -> std::collections::HashSet<String> {
+        self.edges
+            .keys()
+            .filter_map(|(action_key, _)| {
+                action_key.strip_prefix("throttle:").and_then(|name| {
+                    if self.prefer_qos_over_sigstop(name) {
+                        Some(name.to_string())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect()
+    }
+
     /// Count of edges with slow-horizon data (slow_confidence != 0.5 prior).
     pub fn slow_horizon_count(&self) -> usize {
         self.edges

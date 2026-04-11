@@ -545,7 +545,9 @@ fn collect_pressure_facts() -> (f64, u64, u64, f64, f64) {
             // (0.45 scale: pages convert to pressure relief at ~half rate since
             //  kernel reclaim isn't instantaneous; 0.18 cap avoids under-reporting
             //  in genuinely high-pressure situations.)
-            let soft_available = s.inactive_count as u64 + s.purgeable_count as u64;
+            let soft_available = s.inactive_count as u64
+                + s.purgeable_count as u64
+                + s.speculative_count as u64;
             let relief = ((soft_available as f64 / total_pages as f64) * 0.45).min(0.18);
             (raw - relief).max(0.0)
         } else {
