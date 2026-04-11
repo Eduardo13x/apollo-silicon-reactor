@@ -1059,23 +1059,17 @@ mod tests {
 
     #[test]
     fn is_renderer_brave() {
-        assert!(ChromiumManager::is_renderer(
-            "Brave Browser Helper (Renderer)"
-        ));
+        assert!(ChromiumManager::is_renderer("Brave Browser Helper (Renderer)"));
     }
 
     #[test]
     fn is_renderer_chrome() {
-        assert!(ChromiumManager::is_renderer(
-            "Google Chrome Helper (Renderer)"
-        ));
+        assert!(ChromiumManager::is_renderer("Google Chrome Helper (Renderer)"));
     }
 
     #[test]
     fn is_renderer_edge() {
-        assert!(ChromiumManager::is_renderer(
-            "Microsoft Edge Helper (Renderer)"
-        ));
+        assert!(ChromiumManager::is_renderer("Microsoft Edge Helper (Renderer)"));
     }
 
     #[test]
@@ -1157,58 +1151,37 @@ mod tests {
 
     #[test]
     fn browser_name_brave() {
-        assert_eq!(
-            ChromiumManager::browser_name("Brave Browser Helper (Renderer)"),
-            "Brave Browser"
-        );
+        assert_eq!(ChromiumManager::browser_name("Brave Browser Helper (Renderer)"), "Brave Browser");
     }
 
     #[test]
     fn browser_name_chrome() {
-        assert_eq!(
-            ChromiumManager::browser_name("Google Chrome Helper (Renderer)"),
-            "Google Chrome"
-        );
+        assert_eq!(ChromiumManager::browser_name("Google Chrome Helper (Renderer)"), "Google Chrome");
     }
 
     #[test]
     fn browser_name_edge() {
-        assert_eq!(
-            ChromiumManager::browser_name("Microsoft Edge Helper (Renderer)"),
-            "Microsoft Edge"
-        );
+        assert_eq!(ChromiumManager::browser_name("Microsoft Edge Helper (Renderer)"), "Microsoft Edge");
     }
 
     #[test]
     fn browser_name_slack() {
-        assert_eq!(
-            ChromiumManager::browser_name("Slack Helper (Renderer)"),
-            "Slack"
-        );
+        assert_eq!(ChromiumManager::browser_name("Slack Helper (Renderer)"), "Slack");
     }
 
     #[test]
     fn browser_name_code() {
-        assert_eq!(
-            ChromiumManager::browser_name("Code Helper (Renderer)"),
-            "Code"
-        );
+        assert_eq!(ChromiumManager::browser_name("Code Helper (Renderer)"), "Code");
     }
 
     #[test]
     fn browser_name_gpu_helper() {
-        assert_eq!(
-            ChromiumManager::browser_name("Brave Browser Helper (GPU)"),
-            "Brave Browser"
-        );
+        assert_eq!(ChromiumManager::browser_name("Brave Browser Helper (GPU)"), "Brave Browser");
     }
 
     #[test]
     fn browser_name_arc() {
-        assert_eq!(
-            ChromiumManager::browser_name("Arc Helper (Renderer)"),
-            "Arc"
-        );
+        assert_eq!(ChromiumManager::browser_name("Arc Helper (Renderer)"), "Arc");
     }
 
     // ── Idle counter tracking ──────────────────────────────────────────────────
