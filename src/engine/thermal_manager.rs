@@ -12,7 +12,7 @@ pub struct ThermalState {
     pub current_throttle_level: u8, // 0-100
     pub predicted_throttle_level: u8,
     pub thermal_trend: ThermalTrend,
-    pub seconds_to_throttle: i32, // -1 if none
+    pub seconds_to_throttle: Option<i32>, // None = no forecast
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,18 +169,17 @@ impl ThermalManager {
         ((predicted as u16 + last.throttle_level as u16) / 2) as u8
     }
 
-    fn time_to_throttle(&self, current_temp: f32) -> i32 {
-        if self.history.len() < 2 || current_temp >= self.throttle_threshold {
-            return if current_temp >= self.throttle_threshold {
-                0
-            } else {
-                -1
-            };
+    fn time_to_throttle(&self, current_temp: f32) -> Option<i32> {
+        if current_temp >= self.throttle_threshold {
+            return Some(0); // already at throttle threshold
+        }
+        if self.history.len() < 2 {
+            return None;
         }
 
         let recent: Vec<_> = self.history.iter().rev().take(5).collect();
         if recent.len() < 2 {
-            return -1;
+            return None;
         }
 
         let mut temp_rise_per_sec = 0.0;
@@ -201,12 +200,12 @@ impl ThermalManager {
         temp_rise_per_sec /= (recent.len() - 1) as f32;
 
         if temp_rise_per_sec <= 0.0 {
-            return -1; // Cooling down
+            return None; // cooling down — no throttle forecast
         }
 
         let temp_to_throttle = self.throttle_threshold - current_temp;
         let raw = temp_to_throttle / temp_rise_per_sec;
-        raw.clamp(0.0, 86400.0) as i32 // max 24h
+        Some(raw.clamp(0.0, 86400.0) as i32) // max 24h
     }
 
     /// Get recommended actions based on thermal state

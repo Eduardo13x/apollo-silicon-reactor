@@ -123,8 +123,8 @@ fn thermal_manager_estimates_time_to_throttle() {
     manager.update(74.0, 69.0, 64.0, 0, 0);
 
     let state = manager.update(75.0, 70.0, 65.0, 0, 0);
-    if state.seconds_to_throttle > 0 {
-        assert!(state.seconds_to_throttle > 0);
+    if let Some(secs) = state.seconds_to_throttle {
+        assert!(secs > 0);
     }
 }
 

@@ -1069,9 +1069,9 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub thermal_predicted_throttle: u8,
     /// Seconds until thermal throttling predicted by ThermalManager.
-    /// -1 = no throttle predicted. 0–30 = imminent. >30 = headroom available.
+    /// null = no forecast (cooling or insufficient history). 0 = already throttling. >0 = seconds of headroom.
     #[serde(default)]
-    pub thermal_seconds_to_throttle: i32,
+    pub thermal_seconds_to_throttle: Option<i32>,
     /// ThermalManager trend label: "Cooling" | "Stable" | "Warming" | "Critical".
     #[serde(default)]
     pub thermal_trend_predicted: String,
