@@ -1173,11 +1173,7 @@ mod tests {
     fn context_interactive_focus_when_low_pressure() {
         let snap = make_snapshot(10.0, 0.10, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
-        assert!(
-            matches!(ctx, InteractiveContext::InteractiveFocus),
-            "low CPU + low memory should yield InteractiveFocus, got {:?}",
-            ctx
-        );
+        assert!(matches!(ctx, InteractiveContext::InteractiveFocus), "low CPU + low memory should yield InteractiveFocus, got {:?}", ctx);
     }
 
     #[test]
@@ -1185,11 +1181,7 @@ mod tests {
         // memory_pressure 0.80 > default bg_pressure 0.78
         let snap = make_snapshot(30.0, 0.80, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
-        assert!(
-            matches!(ctx, InteractiveContext::BackgroundPressure),
-            "high memory pressure should yield BackgroundPressure, got {:?}",
-            ctx
-        );
+        assert!(matches!(ctx, InteractiveContext::BackgroundPressure), "high memory pressure should yield BackgroundPressure, got {:?}", ctx);
     }
 
     #[test]
@@ -1197,11 +1189,7 @@ mod tests {
         // CPU 75% > 72.0 threshold
         let snap = make_snapshot(75.0, 0.10, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
-        assert!(
-            matches!(ctx, InteractiveContext::BackgroundPressure),
-            "CPU > 72% should yield BackgroundPressure, got {:?}",
-            ctx
-        );
+        assert!(matches!(ctx, InteractiveContext::BackgroundPressure), "CPU > 72% should yield BackgroundPressure, got {:?}", ctx);
     }
 
     #[test]
@@ -1209,11 +1197,7 @@ mod tests {
         // CPU 92% > 88.0 threshold
         let snap = make_snapshot(92.0, 0.10, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
-        assert!(
-            matches!(ctx, InteractiveContext::ThermalConstrained),
-            "CPU > 88% should yield ThermalConstrained, got {:?}",
-            ctx
-        );
+        assert!(matches!(ctx, InteractiveContext::ThermalConstrained), "CPU > 88% should yield ThermalConstrained, got {:?}", ctx);
     }
 
     #[test]
@@ -1221,11 +1205,7 @@ mod tests {
         // memory_pressure 0.95 > default critical_pressure 0.88
         let snap = make_snapshot(20.0, 0.95, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
-        assert!(
-            matches!(ctx, InteractiveContext::ThermalConstrained),
-            "memory_pressure > critical should yield ThermalConstrained, got {:?}",
-            ctx
-        );
+        assert!(matches!(ctx, InteractiveContext::ThermalConstrained), "memory_pressure > critical should yield ThermalConstrained, got {:?}", ctx);
     }
 
     #[test]
@@ -1237,11 +1217,7 @@ mod tests {
             ..OverflowThresholds::default()
         };
         let ctx = context_from_pressure(&snap, &thresholds);
-        assert!(
-            matches!(ctx, InteractiveContext::BackgroundPressure),
-            "custom threshold should lower the bar, got {:?}",
-            ctx
-        );
+        assert!(matches!(ctx, InteractiveContext::BackgroundPressure), "custom threshold should lower the bar, got {:?}", ctx);
     }
 
     // ── blocker_score_formula tests ──────────────────────────────────────
@@ -1249,33 +1225,21 @@ mod tests {
     #[test]
     fn blocker_score_all_zero() {
         let score = blocker_score_formula(0.0, 0.0, false, 0.0, 0.0);
-        assert!(
-            (score - 0.0).abs() < 1e-9,
-            "all-zero inputs should produce 0.0, got {}",
-            score
-        );
+        assert!((score - 0.0).abs() < 1e-9, "all-zero inputs should produce 0.0, got {}", score);
     }
 
     #[test]
     fn blocker_score_max_all_components() {
         let score = blocker_score_formula(1.0, 1.0, true, 1.0, 1.0);
         // 0.40 + 0.30 + 0.10 + 0.10 + 0.10 = 1.0
-        assert!(
-            (score - 1.0).abs() < 1e-9,
-            "max inputs should produce 1.0, got {}",
-            score
-        );
+        assert!((score - 1.0).abs() < 1e-9, "max inputs should produce 1.0, got {}", score);
     }
 
     #[test]
     fn blocker_score_seen_recently_adds_010() {
         let without = blocker_score_formula(0.5, 0.0, false, 0.0, 0.0);
         let with = blocker_score_formula(0.5, 0.0, true, 0.0, 0.0);
-        assert!(
-            (with - without - 0.10).abs() < 1e-9,
-            "seen_recently should add exactly 0.10, delta={}",
-            with - without
-        );
+        assert!((with - without - 0.10).abs() < 1e-9, "seen_recently should add exactly 0.10, delta={}", with - without);
     }
 
     #[test]
@@ -1283,22 +1247,13 @@ mod tests {
         // compressor_pressure > 1.0 should be clamped to 1.0
         let score_clamped = blocker_score_formula(0.0, 0.0, false, 0.0, 5.0);
         let score_max = blocker_score_formula(0.0, 0.0, false, 0.0, 1.0);
-        assert!(
-            (score_clamped - score_max).abs() < 1e-9,
-            "compressor > 1.0 should be clamped: {} vs {}",
-            score_clamped,
-            score_max
-        );
+        assert!((score_clamped - score_max).abs() < 1e-9, "compressor > 1.0 should be clamped: {} vs {}", score_clamped, score_max);
     }
 
     #[test]
     fn blocker_score_negative_compressor_clamped_to_zero() {
         let score = blocker_score_formula(0.0, 0.0, false, 0.0, -1.0);
-        assert!(
-            (score - 0.0).abs() < 1e-9,
-            "negative compressor should clamp to 0.0, got {}",
-            score
-        );
+        assert!((score - 0.0).abs() < 1e-9, "negative compressor should clamp to 0.0, got {}", score);
     }
 
     // ── Helper classification tests ──────────────────────────────────────
@@ -1335,10 +1290,7 @@ mod tests {
         // [Saltzer & Schroeder 1975] Economy of Mechanism — one policy per resource.
         // A process in both lists gets conflicting treatment in the same cycle.
         for noise in &NOISE_APPS {
-            assert!(
-                !DEFERRABLE_DAEMONS.iter().any(|d| d == noise),
-                "{noise} is in both NOISE_APPS and DEFERRABLE_DAEMONS"
-            );
+            assert!(!DEFERRABLE_DAEMONS.iter().any(|d| d == noise), "{noise} is in both NOISE_APPS and DEFERRABLE_DAEMONS");
         }
     }
 
