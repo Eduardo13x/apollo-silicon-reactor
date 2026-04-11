@@ -46,12 +46,23 @@ const L0_ALPHA: f64 = 0.15;
 /// EMA decay for L1 aggregate outcome (slower, per-outcome).
 const L1_ALPHA: f64 = 0.20;
 
-/// Minimum L0 signal quality required to allow L1 updates.
-/// Below this, signal is too noisy to trust outcome measurements.
+/// Baseline L0 signal quality required to allow L1 updates.
+/// Dynamically raised by L2 meta-velocity: high meta-velocity → require cleaner signal.
+/// [Google NL 2025 §6.2] — bidirectional context flow.
 const L1_GATE_THRESHOLD: f64 = 0.25;
 
 /// L1 flushes required before an L2 meta-context update fires.
 const L2_GATE_PERIOD: u32 = 20;
+
+/// EMA decay for L2 meta-velocity tracking (slow, per-flush).
+const L2_VELOCITY_ALPHA: f64 = 0.30;
+
+/// How much meta-velocity raises the L1 gate threshold.
+/// At max velocity (1.0), gate rises to 0.25 + 0.20 = 0.45.
+const L2_VELOCITY_GATE_SCALE: f64 = 0.20;
+
+/// Gate ceiling — even at extreme meta-velocity, L1 never becomes fully blocked.
+const L1_GATE_MAX: f64 = 0.60;
 
 // ── NestedLearner ─────────────────────────────────────────────────────────────
 
@@ -78,6 +89,16 @@ pub struct NestedLearner {
     pub l2_context: f64,
     /// Total L2 flushes (for diagnostics).
     pub l2_total: u64,
+
+    // ── L2→L0 feedback ────────────────────────────────────────────────────────
+    /// Previous l2_context value — used to compute meta-velocity delta.
+    #[serde(default)]
+    pub l2_prev_context: f64,
+    /// EMA of |l2_context delta| per flush. High velocity = rapid meta-change.
+    /// Feeds back to L0 gate: high velocity → raise quality bar for L1 updates.
+    /// [Google NL 2025 §6.2] — "L2 meta-velocity feeds back to L0 gate threshold"
+    #[serde(default)]
+    pub l2_meta_velocity: f64,
 }
 
 impl Default for NestedLearner {
@@ -89,6 +110,8 @@ impl Default for NestedLearner {
             l1_total: 0,
             l2_context: 0.5,
             l2_total: 0,
+            l2_prev_context: 0.5,
+            l2_meta_velocity: 0.0, // no velocity initially → gate = L1_GATE_THRESHOLD
         }
     }
 }
@@ -105,11 +128,27 @@ impl NestedLearner {
     /// `signal_quality` should be in [0, 1] — 1.0 means signal is perfectly clean,
     /// 0.0 means all noise. Use `SignalDigest::composite_score()` or equivalent.
     ///
-    /// Returns `true` when L0 quality is above the L1 gate threshold,
+    /// Returns `true` when L0 quality is above the dynamic L1 gate threshold,
     /// meaning outcome observations this cycle are trustworthy.
+    ///
+    /// The gate is raised by L2 meta-velocity: rapid meta-changes demand cleaner
+    /// signal before allowing new outcome observations to influence beliefs.
+    /// [Google NL 2025 §6.2] — bidirectional context flow closes the feedback loop.
     pub fn tick_l0(&mut self, signal_quality: f64) -> bool {
         self.l0_quality = (1.0 - L0_ALPHA) * self.l0_quality + L0_ALPHA * signal_quality.clamp(0.0, 1.0);
-        self.l0_quality >= L1_GATE_THRESHOLD
+        self.l0_quality >= self.dynamic_l1_gate()
+    }
+
+    /// Dynamic L1 gate threshold, raised by L2 meta-velocity.
+    ///
+    /// `gate = L1_GATE_THRESHOLD + L2_VELOCITY_GATE_SCALE * l2_meta_velocity`
+    /// clamped to [L1_GATE_THRESHOLD, L1_GATE_MAX].
+    ///
+    /// At zero velocity (steady state): gate = 0.25 (unchanged from prior behavior).
+    /// At max velocity (1.0):           gate = 0.45 (demands better signal).
+    pub fn dynamic_l1_gate(&self) -> f64 {
+        (L1_GATE_THRESHOLD + L2_VELOCITY_GATE_SCALE * self.l2_meta_velocity)
+            .clamp(L1_GATE_THRESHOLD, L1_GATE_MAX)
     }
 
     // ── L1: per-outcome observation ───────────────────────────────────────────
@@ -146,6 +185,13 @@ impl NestedLearner {
     /// The L2 context feeds back to outer-loop systems (meta-learning rate, zone
     /// learning, specialist weighting) — this is the downward context flow.
     pub fn flush_l2(&mut self) -> f64 {
+        // Compute meta-velocity: how much did l2_context change this flush?
+        // [Google NL 2025 §6.2] — meta-velocity feeds back to L0 gate threshold.
+        let delta = (self.l1_aggregate - self.l2_prev_context).abs();
+        self.l2_meta_velocity = (1.0 - L2_VELOCITY_ALPHA) * self.l2_meta_velocity
+            + L2_VELOCITY_ALPHA * delta.clamp(0.0, 1.0);
+
+        self.l2_prev_context = self.l2_context;
         self.l2_context = self.l1_aggregate;
         self.l1_since_l2 = 0;
         self.l2_total += 1;
@@ -159,8 +205,10 @@ impl NestedLearner {
         NestedLearnerDiagnostics {
             l0_quality: self.l0_quality,
             l1_aggregate: self.l1_aggregate,
-            l1_gate_open: self.l0_quality >= L1_GATE_THRESHOLD,
+            l1_gate_open: self.l0_quality >= self.dynamic_l1_gate(),
+            l1_gate_threshold: self.dynamic_l1_gate(),
             l2_context: self.l2_context,
+            l2_meta_velocity: self.l2_meta_velocity,
             l1_total: self.l1_total,
             l2_total: self.l2_total,
         }
@@ -173,7 +221,11 @@ pub struct NestedLearnerDiagnostics {
     pub l0_quality: f64,
     pub l1_aggregate: f64,
     pub l1_gate_open: bool,
+    /// Current dynamic gate threshold (raised by L2 meta-velocity).
+    pub l1_gate_threshold: f64,
     pub l2_context: f64,
+    /// EMA of |l2_context delta| — how rapidly the meta-context is changing.
+    pub l2_meta_velocity: f64,
     pub l1_total: u64,
     pub l2_total: u64,
 }
@@ -273,7 +325,48 @@ mod tests {
         for _ in 0..50 { nl.tick_l0(0.8); }
         let d = nl.diagnostics();
         assert!((d.l0_quality - nl.l0_quality).abs() < 1e-10);
-        assert_eq!(d.l1_gate_open, nl.l0_quality >= 0.25);
+        assert_eq!(d.l1_gate_open, nl.l0_quality >= nl.dynamic_l1_gate());
+    }
+
+    // ── L2→L0 feedback tests ──────────────────────────────────────────────────
+
+    /// At zero meta-velocity, dynamic gate == L1_GATE_THRESHOLD (backward compatible).
+    #[test]
+    fn dynamic_gate_equals_baseline_at_zero_velocity() {
+        let nl = NestedLearner::new();
+        assert_eq!(nl.l2_meta_velocity, 0.0);
+        assert!((nl.dynamic_l1_gate() - L1_GATE_THRESHOLD).abs() < 1e-10,
+            "gate should equal L1_GATE_THRESHOLD when velocity=0, got {}", nl.dynamic_l1_gate());
+    }
+
+    /// High meta-velocity raises the gate above baseline.
+    #[test]
+    fn dynamic_gate_rises_with_meta_velocity() {
+        let mut nl = NestedLearner::new();
+        // Simulate oscillating l1_aggregate to produce high meta-velocity
+        for _ in 0..50 { nl.tick_l0(1.0); }
+        // Alternate high/low outcomes to force l2_context swings
+        for _ in 0..10 {
+            for _ in 0..L2_GATE_PERIOD { nl.tick_l1(1.0); }
+            nl.flush_l2();
+            for _ in 0..L2_GATE_PERIOD { nl.tick_l1(0.0); }
+            nl.flush_l2();
+        }
+        let gate = nl.dynamic_l1_gate();
+        assert!(gate > L1_GATE_THRESHOLD,
+            "gate should rise above {} with high velocity, got {}", L1_GATE_THRESHOLD, gate);
+    }
+
+    /// Gate never exceeds L1_GATE_MAX regardless of velocity magnitude.
+    #[test]
+    fn dynamic_gate_clamped_at_max() {
+        let mut nl = NestedLearner::new();
+        nl.l2_meta_velocity = 100.0; // extreme artificial value
+        let gate = nl.dynamic_l1_gate();
+        assert!(gate <= L1_GATE_MAX,
+            "gate must not exceed L1_GATE_MAX={}, got {}", L1_GATE_MAX, gate);
+        assert!(gate >= L1_GATE_THRESHOLD,
+            "gate must not fall below L1_GATE_THRESHOLD={}, got {}", L1_GATE_THRESHOLD, gate);
     }
 
     /// Production calibration test: simulates macOS realistic pressure drops (1-5%).
