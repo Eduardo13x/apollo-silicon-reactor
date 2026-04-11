@@ -527,16 +527,23 @@ pub fn run_learning_tick<'a>(
         for event in &log_events {
             match event {
                 SystemEvent::OomKill { process_name, .. } => {
-                    // Feed hazard model: OOM is a real overflow event
+                    // Feed hazard model only when swap is actively growing.
+                    // Jetsam kills at moderate pressure with stable swap are
+                    // macOS memory tiering, not imminent OOM — same velocity
+                    // gate as the kqueue Critical and overflow_guard paths.
                     let mem_pressure = snapshot.pressure.memory_pressure;
                     let swap_ratio = snapshot.pressure.swap_used_bytes as f64
                         / (snapshot.pressure.swap_total_bytes.max(1) as f64);
-                    lctx.signal_intel.record_overflow(
-                        mem_pressure,
-                        swap_ratio,
-                        signal_digest.pressure_smooth, // compressor proxy
-                        1.0, // ~1 hour since last (conservative)
-                    );
+                    let swap_growing =
+                        snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
+                    if swap_ratio > 0.10 && swap_growing {
+                        lctx.signal_intel.record_overflow(
+                            mem_pressure,
+                            swap_ratio,
+                            signal_digest.pressure_smooth, // compressor proxy
+                            1.0, // ~1 hour since last (conservative)
+                        );
+                    }
                     // NARS: crisis-level salience for OOM kill
                     let salience = Salience {
                         arousal: 1.0,
