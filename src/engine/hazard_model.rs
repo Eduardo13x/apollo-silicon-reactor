@@ -384,4 +384,97 @@ mod tests {
             );
         }
     }
+
+    /// validate_after_restore() resets a saturated model to a safe prior.
+    /// Base rate > 1 OOM/hour is physically impossible for a stable system
+    /// — it indicates the model was trained on pressure events, not real OOMs.
+    #[test]
+    fn test_validate_after_restore_resets_saturated_base_rate() {
+        let mut model = HazardModel::new();
+        // Simulate saturation: feed many "overflow" events in quick succession
+        let feat = HazardModel::risk_features(0.85, 0.05, 0.9, 0.8);
+        for _ in 0..200 {
+            model.record_event(&feat, 0.1); // 0.1 hour each
+        }
+        // Model should now have a very high base_rate
+        assert!(
+            model.base_rate > 1.0 / 3600.0,
+            "base_rate should be saturated after many events in short time"
+        );
+
+        model.validate_after_restore();
+
+        // After validation, base_rate must be <= 1/hour (1/3600 s^-1)
+        assert!(
+            model.base_rate <= 1.0 / 3600.0,
+            "validate_after_restore must clamp base_rate to sane range, got {}",
+            model.base_rate
+        );
+        // total_events should be reset to 0 (prevents re-saturation on next tick)
+        assert_eq!(model.total_events, 0, "total_events must reset to prevent re-saturation");
+        // total_hours preserved (denominator for future estimates)
+        assert!(model.total_hours > 0.0, "total_hours should be preserved");
+        // beta values must all be in valid range
+        for b in model.beta.iter() {
+            assert!(*b >= 0.0 && *b <= 5.0, "beta must stay in valid range after validate");
+        }
+    }
+
+    /// validate_after_restore() must be a no-op for a healthy model.
+    #[test]
+    fn test_validate_after_restore_noop_on_healthy_model() {
+        let mut model = HazardModel::new();
+        let feat = HazardModel::risk_features(0.5, 0.03, 0.4, 0.3);
+        model.record_event(&feat, 24.0); // one event in 24 hours — healthy rate
+        let rate_before = model.base_rate;
+        let events_before = model.total_events;
+
+        model.validate_after_restore();
+
+        assert_eq!(
+            model.total_events, events_before,
+            "validate should not change events on healthy model"
+        );
+        assert!(
+            (model.base_rate - rate_before).abs() < 1e-15,
+            "validate should not change base_rate on healthy model"
+        );
+    }
+
+    /// tick_survived_high_pressure() must decay base_rate (negative evidence).
+    #[test]
+    fn test_survived_high_pressure_decays_base_rate() {
+        let mut model = HazardModel::new();
+        // Give it a somewhat elevated base_rate first
+        let feat = HazardModel::risk_features(0.75, 0.02, 0.8, 0.7);
+        model.record_event(&feat, 1.0);
+        let rate_before = model.base_rate;
+
+        // Simulate survival: system was at high pressure but no OOM occurred
+        model.tick_survived_high_pressure(&feat, 30.0); // 30 seconds of survival
+
+        assert!(
+            model.base_rate < rate_before,
+            "survival evidence should decay base_rate: before={}, after={}",
+            rate_before, model.base_rate
+        );
+    }
+
+    /// beta values must stay in valid range after tick_survived_high_pressure().
+    #[test]
+    fn test_survived_high_pressure_beta_stays_bounded() {
+        let mut model = HazardModel::new();
+        let feat = HazardModel::risk_features(0.9, 0.01, 0.95, 0.85);
+        // Apply many survival ticks — beta must never go below 0.5 floor
+        for _ in 0..500 {
+            model.tick_survived_high_pressure(&feat, 5.0);
+        }
+        for (i, b) in model.beta.iter().enumerate() {
+            assert!(
+                *b >= 0.5,
+                "beta[{}] fell below floor of 0.5: got {}",
+                i, b
+            );
+        }
+    }
 }
