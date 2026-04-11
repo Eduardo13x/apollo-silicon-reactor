@@ -529,7 +529,11 @@ impl ChromiumManager {
         }
 
         // ── Step 6: Build actions ──────────────────────────────────────────────
-        let mut actions = Vec::new();
+        let mut actions: Vec<ChromiumAction> = Vec::new();
+        // Helper: true when a ThawRenderer for `pid` is already queued.
+        let already_thawing = |acts: &[ChromiumAction], pid: u32| {
+            acts.iter().any(|a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == pid))
+        };
 
         // Determine which browser is in the foreground (by foreground_pid)
         let fg_browser: Option<String> = foreground_pid.and_then(|fg| {
@@ -581,9 +585,7 @@ impl ChromiumManager {
                     if info.browser == predicted_browser
                         && info.frozen
                         && !main_frozen.contains(&pid)
-                        && !actions.iter().any(
-                            |a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == pid),
-                        )
+                        && !already_thawing(&actions, pid)
                     {
                         actions.push(ChromiumAction::ThawRenderer {
                             pid,
@@ -619,10 +621,7 @@ impl ChromiumManager {
             }
 
             // Skip if already queued for thaw by the fg-change pass above
-            if actions
-                .iter()
-                .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == *pid))
-            {
+            if already_thawing(&actions, *pid) {
                 continue;
             }
 
@@ -821,13 +820,8 @@ impl ChromiumManager {
                     continue;
                 }
                 if let Some(info) = self.renderers.get(&pid) {
-                    if !actions.iter().any(
-                        |a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == pid),
-                    ) {
-                        actions.push(ChromiumAction::ThawRenderer {
-                            pid,
-                            name: info.name.clone(),
-                        });
+                    if !already_thawing(&actions, pid) {
+                        actions.push(ChromiumAction::ThawRenderer { pid, name: info.name.clone() });
                     }
                 }
             }
@@ -873,10 +867,6 @@ impl ChromiumManager {
                 bs.freed_memory_mb += info.memory_bytes as f64 / 1_048_576.0;
             }
         }
-        for _ in 0..self.ecore_count {
-            // ecore_renderers tracked via ecore_count — update per-browser on demand
-        }
-
         actions
     }
 
