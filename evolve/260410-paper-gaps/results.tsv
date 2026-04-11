@@ -1,0 +1,4 @@
+iteration	commit	metric	delta	guard	status	paper_cited	description
+1	ee6b9a4	tests=1605	+3	PASS	KEEP	Google NL 2025 §6.2; Hochreiter 1997	nested_learner L2→L0 dynamic gate: l2_meta_velocity EMA closes bidirectional context flow
+2	dee8515	tests=3666	+61	PASS	KEEP	Page 1954; Kuncheva 2004	continuous workload benchmark: 4 temporal sequences validate dynamic gate under drift
+3	b38d8ca	tests=3672	+6	PASS	KEEP	Pearl 2009 Ch.3; Nygard 2018	causal mechanism QoS routing: prefer_qos_over_sigstop() closes paper §5.2 mediation claim

@@ -2,156 +2,272 @@
   "beliefs": [
     {
       "id": "B031",
-      "subject": "nested_learner.rs — L2→L0 feedback path",
-      "predicate": "gate threshold is constant (0.25), L2 meta-velocity never adjusts it — paper §6.2 claim unimplemented",
+      "subject": "nested_learner.rs \u2014 L2\u2192L0 feedback path",
+      "predicate": "gate threshold is constant (0.25), L2 meta-velocity never adjusts it \u2014 paper \u00a76.2 claim unimplemented",
       "evidence": [
         "grep: L1_GATE_THRESHOLD is const not dynamic",
         "grep: flush_l2() stores l2_context but no caller reads it to adjust gate",
-        "paper_gap: §6.2 'L2 meta-velocity feeds back to L0 gate threshold'",
-        "nested_learner.rs:51 L1_GATE_THRESHOLD: f64 = 0.25"
+        "paper_gap: \u00a76.2 'L2 meta-velocity feeds back to L0 gate threshold'",
+        "nested_learner.rs:51 L1_GATE_THRESHOLD: f64 = 0.25",
+        "experiment_passed_iter_2026-04-10"
       ],
-      "truth": { "f": 0.90, "c": 0.90 },
-      "priority": 0.810,
+      "truth": {
+        "f": 0.9500000000000001,
+        "c": 0.99
+      },
+      "priority": 0.9405,
       "category": "implementation_gap",
-      "sources": ["code_grep", "paper_§6.2"]
+      "sources": [
+        "code_grep",
+        "paper_\u00a76.2"
+      ]
     },
     {
       "id": "B032",
-      "subject": "causal_graph.mechanism() → QoS/SIGSTOP routing",
-      "predicate": "MechanismAttribution tracked but never consulted at set_tier call sites — paper §5.2 claim unimplemented",
+      "subject": "causal_graph.mechanism() \u2192 QoS/SIGSTOP routing",
+      "predicate": "MechanismAttribution tracked but never consulted at set_tier call sites \u2014 paper \u00a75.2 claim unimplemented",
       "evidence": [
         "grep: causal_graph.rs exposes mechanism() API at line 415",
         "grep: main.rs set_tier calls use hardcoded Foreground/Background tiers",
         "grep: zero matches for 'mechanism.*set_tier' or 'set_tier.*mechanism'",
-        "paper_gap: §5.2 'CPU reduction → QoS tiering rather than SIGSTOP'"
+        "paper_gap: \u00a75.2 'CPU reduction \u2192 QoS tiering rather than SIGSTOP'",
+        "experiment_passed_iter_2026-04-10"
       ],
-      "truth": { "f": 0.88, "c": 0.88 },
-      "priority": 0.774,
+      "truth": {
+        "f": 0.93,
+        "c": 0.98
+      },
+      "priority": 0.9114,
       "category": "implementation_gap",
-      "sources": ["code_grep", "paper_§5.2"]
+      "sources": [
+        "code_grep",
+        "paper_\u00a75.2"
+      ]
     },
     {
       "id": "B033",
-      "subject": "benchmark suite — continuous workload coverage",
-      "predicate": "165 fixed deterministic scenarios do not cover adversarial/gradual/continuous workloads — L2 limitation in paper §8.3",
+      "subject": "benchmark suite \u2014 continuous workload coverage",
+      "predicate": "165 fixed deterministic scenarios do not cover adversarial/gradual/continuous workloads \u2014 L2 limitation in paper \u00a78.3",
       "evidence": [
-        "paper_gap: §8.3 L2 'does not capture adversarial workloads, multi-hour gradual memory leaks'",
-        "paper_gap: §8.3 'future work: continuous workload simulation benchmark'",
+        "paper_gap: \u00a78.3 L2 'does not capture adversarial workloads, multi-hour gradual memory leaks'",
+        "paper_gap: \u00a78.3 'future work: continuous workload simulation benchmark'",
         "hyperedge_6_nodes | confidence_1.0 | Prediction & Forecasting (B018 revision)",
-        "1602 tests but all deterministic"
+        "1602 tests but all deterministic",
+        "experiment_passed_iter_2026-04-10"
       ],
-      "truth": { "f": 0.90, "c": 0.88 },
-      "priority": 0.792,
+      "truth": {
+        "f": 0.9500000000000001,
+        "c": 0.98
+      },
+      "priority": 0.931,
       "category": "benchmark_gap",
-      "sources": ["paper_§8.3", "hyperedge_B018_revision"]
+      "sources": [
+        "paper_\u00a78.3",
+        "hyperedge_B018_revision"
+      ]
     },
     {
       "id": "B021",
-      "subject": "Adams & MacKay 2007 — Bayesian Online Changepoint Detection ↔ Uncertainty Quantification",
-      "predicate": "bridges Affective & Cognitive Neuroscience → Uncertainty Quantification & Ensembles — novel cross-domain insight",
-      "evidence": ["cross_community_edge", "relation_conceptually_related_to", "confidence_1.0"],
-      "truth": { "f": 0.80, "c": 1.00 },
-      "priority": 0.800,
+      "subject": "Adams & MacKay 2007 \u2014 Bayesian Online Changepoint Detection \u2194 Uncertainty Quantification",
+      "predicate": "bridges Affective & Cognitive Neuroscience \u2192 Uncertainty Quantification & Ensembles \u2014 novel cross-domain insight",
+      "evidence": [
+        "cross_community_edge",
+        "relation_conceptually_related_to",
+        "confidence_1.0"
+      ],
+      "truth": {
+        "f": 0.8,
+        "c": 1.0
+      },
+      "priority": 0.8,
       "category": "bridge",
-      "sources": ["surprising_connections"]
+      "sources": [
+        "surprising_connections"
+      ]
     },
     {
       "id": "B022",
-      "subject": "Yerkes & Dodson 1908 — Arousal and Performance Law ↔ Affective & Cognitive Computing",
-      "predicate": "bridges Systems Reliability & Data Management → Affective & Cognitive Neuroscience — novel cross-domain insight",
-      "evidence": ["cross_community_edge", "relation_conceptually_related_to", "confidence_1.0"],
-      "truth": { "f": 0.80, "c": 1.00 },
-      "priority": 0.800,
+      "subject": "Yerkes & Dodson 1908 \u2014 Arousal and Performance Law \u2194 Affective & Cognitive Computing",
+      "predicate": "bridges Systems Reliability & Data Management \u2192 Affective & Cognitive Neuroscience \u2014 novel cross-domain insight",
+      "evidence": [
+        "cross_community_edge",
+        "relation_conceptually_related_to",
+        "confidence_1.0"
+      ],
+      "truth": {
+        "f": 0.8,
+        "c": 1.0
+      },
+      "priority": 0.8,
       "category": "bridge",
-      "sources": ["surprising_connections"]
+      "sources": [
+        "surprising_connections"
+      ]
     },
     {
       "id": "B015",
       "subject": "Memory Management & Working Set Papers",
       "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": ["hyperedge_6_nodes", "confidence_1.0", "EXTRACTED"],
-      "truth": { "f": 0.90, "c": 0.857 },
+      "evidence": [
+        "hyperedge_6_nodes",
+        "confidence_1.0",
+        "EXTRACTED"
+      ],
+      "truth": {
+        "f": 0.9,
+        "c": 0.857
+      },
       "priority": 0.771,
       "category": "subsystem",
-      "sources": ["hyperedge analysis"]
+      "sources": [
+        "hyperedge analysis"
+      ]
     },
     {
       "id": "B018",
       "subject": "Prediction & Forecasting Papers",
       "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": ["hyperedge_6_nodes", "confidence_1.0", "EXTRACTED"],
-      "truth": { "f": 0.90, "c": 0.857 },
+      "evidence": [
+        "hyperedge_6_nodes",
+        "confidence_1.0",
+        "EXTRACTED"
+      ],
+      "truth": {
+        "f": 0.9,
+        "c": 0.857
+      },
       "priority": 0.771,
       "category": "subsystem",
-      "sources": ["hyperedge analysis"]
+      "sources": [
+        "hyperedge analysis"
+      ]
     },
     {
       "id": "B019",
       "subject": "Affective & Cognitive Science Papers",
       "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": ["hyperedge_6_nodes", "confidence_1.0", "EXTRACTED"],
-      "truth": { "f": 0.90, "c": 0.857 },
+      "evidence": [
+        "hyperedge_6_nodes",
+        "confidence_1.0",
+        "EXTRACTED"
+      ],
+      "truth": {
+        "f": 0.9,
+        "c": 0.857
+      },
       "priority": 0.771,
       "category": "subsystem",
-      "sources": ["hyperedge analysis"]
+      "sources": [
+        "hyperedge analysis"
+      ]
     },
     {
       "id": "B020",
       "subject": "Deep Learning & Neural Architecture Papers",
       "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": ["hyperedge_7_nodes", "confidence_0.95", "INFERRED"],
-      "truth": { "f": 0.75, "c": 0.90 },
+      "evidence": [
+        "hyperedge_7_nodes",
+        "confidence_0.95",
+        "INFERRED"
+      ],
+      "truth": {
+        "f": 0.75,
+        "c": 0.9
+      },
       "priority": 0.675,
       "category": "subsystem",
-      "sources": ["hyperedge analysis"]
+      "sources": [
+        "hyperedge analysis"
+      ]
     },
     {
       "id": "B011",
       "subject": "Causal Reasoning Papers",
       "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": ["hyperedge_4_nodes", "confidence_1.0", "EXTRACTED"],
-      "truth": { "f": 0.90, "c": 0.571 },
+      "evidence": [
+        "hyperedge_4_nodes",
+        "confidence_1.0",
+        "EXTRACTED"
+      ],
+      "truth": {
+        "f": 0.9,
+        "c": 0.571
+      },
       "priority": 0.514,
       "category": "subsystem",
-      "sources": ["hyperedge analysis"]
+      "sources": [
+        "hyperedge analysis"
+      ]
     },
     {
       "id": "B016",
       "subject": "Self-Improvement & Meta-Learning Papers",
       "predicate": "forms a unified cognitive subsystem in Apollo",
-      "evidence": ["hyperedge_4_nodes", "confidence_1.0", "EXTRACTED"],
-      "truth": { "f": 0.90, "c": 0.571 },
+      "evidence": [
+        "hyperedge_4_nodes",
+        "confidence_1.0",
+        "EXTRACTED"
+      ],
+      "truth": {
+        "f": 0.9,
+        "c": 0.571
+      },
       "priority": 0.514,
       "category": "subsystem",
-      "sources": ["hyperedge analysis"]
+      "sources": [
+        "hyperedge analysis"
+      ]
     },
     {
       "id": "B001",
-      "subject": "Pearl 2009 — Causality: Models, Reasoning, and Inference",
+      "subject": "Pearl 2009 \u2014 Causality: Models, Reasoning, and Inference",
       "predicate": "is a core architectural pillar of Apollo AGI",
-      "evidence": ["god_node_5_edges", "cross_community_bridge"],
-      "truth": { "f": 0.85, "c": 0.50 },
+      "evidence": [
+        "god_node_5_edges",
+        "cross_community_bridge"
+      ],
+      "truth": {
+        "f": 0.85,
+        "c": 0.5
+      },
       "priority": 0.425,
       "category": "pillar",
-      "sources": ["god_nodes analysis"]
+      "sources": [
+        "god_nodes analysis"
+      ]
     },
     {
       "id": "B003",
       "subject": "nars_belief.rs",
       "predicate": "is a core architectural pillar of Apollo AGI",
-      "evidence": ["god_node_5_edges", "cross_community_bridge"],
-      "truth": { "f": 0.85, "c": 0.50 },
+      "evidence": [
+        "god_node_5_edges",
+        "cross_community_bridge"
+      ],
+      "truth": {
+        "f": 0.85,
+        "c": 0.5
+      },
       "priority": 0.425,
       "category": "pillar",
-      "sources": ["god_nodes analysis"]
+      "sources": [
+        "god_nodes analysis"
+      ]
     }
   ],
   "meta": {
     "generated": "2026-04-10",
     "source": "papers/apollo_agi_paper_draft.md + code grep analysis",
-    "new_this_session": ["B031", "B032", "B033"],
-    "nars_revisions": ["B033 revised from B018 evidence (Prediction hyperedge + paper §8.3)"],
-    "baseline_tests": 1602,
-    "baseline_scenarios": "165/165"
+    "new_this_session": [
+      "B031",
+      "B032",
+      "B033"
+    ],
+    "nars_revisions": [
+      "B033 revised from B018 evidence (Prediction hyperedge + paper \u00a78.3)"
+    ],
+    "baseline_tests": 3672,
+    "baseline_scenarios": "165/165",
+    "last_evolve": "2026-04-10"
   }
 }
