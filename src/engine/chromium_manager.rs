@@ -557,10 +557,7 @@ impl ChromiumManager {
             if let Some(new_fg) = &fg_browser {
                 for (&pid, info) in &self.renderers {
                     if &info.browser == new_fg && info.frozen && !main_frozen.contains(&pid) {
-                        actions.push(ChromiumAction::ThawRenderer {
-                            pid,
-                            name: info.name.clone(),
-                        });
+                        actions.push(ChromiumAction::ThawRenderer { pid, name: info.name.clone() });
                     }
                 }
             }
@@ -587,10 +584,7 @@ impl ChromiumManager {
                         && !main_frozen.contains(&pid)
                         && !already_thawing(&actions, pid)
                     {
-                        actions.push(ChromiumAction::ThawRenderer {
-                            pid,
-                            name: info.name.clone(),
-                        });
+                        actions.push(ChromiumAction::ThawRenderer { pid, name: info.name.clone() });
                         tracing::info!(
                             browser = predicted_browser.as_str(),
                             prob = prob,
@@ -628,10 +622,7 @@ impl ChromiumManager {
             // Thaw check 1: frozen renderer with CPU spike
             // (rare — would mean SIGSTOP failed or OS resumed it externally)
             if info.frozen && info.cpu_pct > THAW_CPU_THRESHOLD {
-                actions.push(ChromiumAction::ThawRenderer {
-                    pid: *pid,
-                    name: info.name.clone(),
-                });
+                actions.push(ChromiumAction::ThawRenderer { pid: *pid, name: info.name.clone() });
                 continue;
             }
 
@@ -651,10 +642,7 @@ impl ChromiumManager {
                 && is_fg_browser
                 && info.frozen_cycles >= MAX_FOREGROUND_FROZEN_CYCLES
             {
-                actions.push(ChromiumAction::ThawRenderer {
-                    pid: *pid,
-                    name: info.name.clone(),
-                });
+                actions.push(ChromiumAction::ThawRenderer { pid: *pid, name: info.name.clone() });
                 continue;
             }
 
@@ -663,10 +651,7 @@ impl ChromiumManager {
             // frozen if a foreground change was missed.
             // [Denning 1968] A process suspended too long must be reintegrated.
             if info.frozen && info.frozen_cycles >= MAX_FROZEN_CYCLES {
-                actions.push(ChromiumAction::ThawRenderer {
-                    pid: *pid,
-                    name: info.name.clone(),
-                });
+                actions.push(ChromiumAction::ThawRenderer { pid: *pid, name: info.name.clone() });
                 continue;
             }
 
@@ -674,10 +659,7 @@ impl ChromiumManager {
             // Only emit once per renderer, not every cycle (mach_qos.set_tier is sticky)
             // (`is_fg_browser` was already computed above for the foreground TTL check.)
             if !is_fg_browser && !info.frozen && !self.ecore_demoted.contains(pid) {
-                actions.push(ChromiumAction::DemoteToEcores {
-                    pid: *pid,
-                    name: info.name.clone(),
-                });
+                actions.push(ChromiumAction::DemoteToEcores { pid: *pid, name: info.name.clone() });
                 self.ecore_count += 1;
             }
         }
@@ -787,11 +769,7 @@ impl ChromiumManager {
                 for pid in sorted.iter().take(max_additional) {
                     if let Some(info) = self.renderers.get(pid) {
                         let mb = info.memory_bytes as f64 / 1_048_576.0;
-                        actions.push(ChromiumAction::FreezeRenderer {
-                            pid: *pid,
-                            name: info.name.clone(),
-                            estimated_mb: mb,
-                        });
+                        actions.push(ChromiumAction::FreezeRenderer { pid: *pid, name: info.name.clone(), estimated_mb: mb });
                     }
                 }
             }
