@@ -565,78 +565,32 @@ pub fn decide_actions(
                         && matches!(profile, OptimizationProfile::AggressiveRoot)
                 }
             };
-            // System-wide CPU stall override: when the protected set is
-            // being starved at the system level (Phase 4 wiring of the
-            // stall_fraction signal), force aggressive throttling of any
-            // non-interactive process regardless of context. The
-            // protected set already has Foreground QoS — the only lever
-            // left to free CPU for them is to push the non-interactive
-            // tail to E-cores harder.
-            let aggressive = aggressive || system_cpu_stalled;
-            // Wakeup vampire boost: if process has high wakeup rate (>100/s),
-            // it is a battery drain even when idle. Mark as aggressive regardless
-            // of profile — wakeup vampires waste power doing nothing useful.
-            // [Apple Energy Diagnostics] >100 wakeups/s = measurable battery impact.
+            // Per-process signals for reason string and aggressive override.
             let wakeup_rate = wakeup_hints.get(&pid).copied().unwrap_or(0.0);
-            let is_wakeup_vampire = wakeup_rate >= 100.0;
-            let aggressive = aggressive || is_wakeup_vampire;
-
-            // DRAM bandwidth saturation: when memory bandwidth > 80%, prefer
-            // throttling the process with highest physical footprint (most BW usage).
-            // [Intel Memory Bandwidth Allocation / IOReport AMC] bandwidth saturation
-            // causes system-wide latency spikes worse than CPU contention.
             let footprint_mb = footprint_hints.get(&pid).copied().unwrap_or(0.0);
-            let bandwidth_priority = dram_bandwidth_pct >= 0.80 && footprint_mb > 100.0;
-
-            // I/O burst: background process writing >5 MB/s competes for disk bandwidth
-            // with LLM model weight loading. Throttle it to protect inference throughput.
-            // [Bhagwan & Savage 2002 OSDI] I/O bursts saturate disk queue depth and
-            // degrade latency-sensitive co-located workloads — throttle the I/O abuser.
             let disk_mbps = io_burst_hints.get(&pid).copied().unwrap_or(0.0);
-            let is_io_burst = disk_mbps >= 5.0;
-            // io_burst always aggressive — disk saturation is immediate and binary.
-            let aggressive = aggressive || is_io_burst;
-
-            // Behavioral anomaly: process deviating ≥ 3 MADs from its learned baseline.
-            // A process that is normally idle but suddenly active is a higher priority
-            // target than a consistently high-load process that we already know about.
-            // [Chandola 2009 ACM CSUR §3.1] deviation-from-baseline as anomaly signal.
             let anomaly_score = anomaly_hints.get(&pid).copied().unwrap_or(0.0);
+            let is_wakeup_vampire = wakeup_rate >= 100.0;
+            let is_io_burst = disk_mbps >= 5.0;
             let is_anomalous = anomaly_score >= crate::engine::process_baseline::ANOMALY_THRESHOLD;
-            // Anomalous behavior = aggressive throttle — the process broke its contract.
-            let aggressive = aggressive || is_anomalous;
+            // DRAM bandwidth: prefer throttling high-footprint processes when bus is saturated.
+            // [Intel Memory Bandwidth Allocation / IOReport AMC]
+            let bandwidth_priority = dram_bandwidth_pct >= 0.80 && footprint_mb > 100.0;
+            // Aggressive modifiers: stall, vampire, I/O-burst, anomaly all escalate to aggressive.
+            // [Apple Energy Diagnostics; Bhagwan & Savage 2002; Chandola 2009]
+            let aggressive = aggressive || system_cpu_stalled || is_wakeup_vampire || is_io_burst || is_anomalous;
 
+            let ipc = ipc_hints.get(&pid).copied().unwrap_or(0.0);
             let reason = if is_anomalous {
-                format!(
-                    "anomaly throttle (score={:.1}x baseline, ipc={:.2})",
-                    anomaly_score,
-                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
-                )
+                format!("anomaly throttle (score={:.1}x baseline, ipc={:.2})", anomaly_score, ipc)
             } else if is_io_burst {
-                format!(
-                    "io-burst throttle ({:.1} MB/s writes, ipc={:.2})",
-                    disk_mbps,
-                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
-                )
+                format!("io-burst throttle ({:.1} MB/s writes, ipc={:.2})", disk_mbps, ipc)
             } else if is_wakeup_vampire {
-                format!(
-                    "wakeup-vampire throttle ({:.0}/s wakeups, ipc={:.2})",
-                    wakeup_rate,
-                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
-                )
+                format!("wakeup-vampire throttle ({:.0}/s wakeups, ipc={:.2})", wakeup_rate, ipc)
             } else if bandwidth_priority {
-                format!(
-                    "dram-bw throttle (bw={:.0}%, footprint={:.0}MB, ipc={:.2})",
-                    dram_bandwidth_pct * 100.0,
-                    footprint_mb,
-                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
-                )
+                format!("dram-bw throttle (bw={:.0}%, footprint={:.0}MB, ipc={:.2})", dram_bandwidth_pct * 100.0, footprint_mb, ipc)
             } else {
-                format!(
-                    "ipc-aware throttle ({:?}, ipc={:.2})",
-                    context,
-                    ipc_hints.get(&pid).copied().unwrap_or(0.0)
-                )
+                format!("ipc-aware throttle ({:?}, ipc={:.2})", context, ipc)
             };
 
             actions.push(RootAction::ThrottleProcess {
