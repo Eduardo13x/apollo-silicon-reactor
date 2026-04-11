@@ -1408,10 +1408,7 @@ mod tests {
             .filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. }))
             .count();
         // E-core demotions must still happen even with freeze_paused=true
-        assert!(
-            ecore > 0,
-            "E-core demotions must continue during window ops"
-        );
+        assert!(ecore > 0, "E-core demotions must continue during window ops");
     }
 
     // ── Shutdown cleanup ───────────────────────────────────────────────────────
@@ -1486,11 +1483,7 @@ mod tests {
         );
 
         // Must be < 200µs per call on M1 (conservatively allowing 2× the stated goal)
-        assert!(
-            elapsed.as_millis() < 200,
-            "ChromiumManager.update() too slow: {:?}/call",
-            elapsed / 1000
-        );
+        assert!(elapsed.as_millis() < 200, "ChromiumManager.update() too slow: {:?}/call", elapsed / 1000);
     }
 
     // ── Thaw behaviour fixes ───────────────────────────────────────────────────
@@ -1697,10 +1690,7 @@ mod tests {
         let thawed = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 500));
-        assert!(
-            thawed,
-            "predictive pre-thaw must fire when switch is 8s away (< 10s window)"
-        );
+        assert!(thawed, "predictive pre-thaw must fire when switch is 8s away (< 10s window)");
     }
 
     /// A: pre-thaw does NOT fire when switch is far away (> 10s).
@@ -1718,10 +1708,7 @@ mod tests {
         let thawed = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 501));
-        assert!(
-            !thawed,
-            "pre-thaw must NOT fire when 40s remain before predicted switch"
-        );
+        assert!(!thawed, "pre-thaw must NOT fire when 40s remain before predicted switch");
     }
 
     /// A: low-probability prediction (P < 0.35) is ignored.
@@ -1739,10 +1726,7 @@ mod tests {
         let thawed = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 502));
-        assert!(
-            !thawed,
-            "prediction with P=0.20 must be ignored (threshold = 0.35)"
-        );
+        assert!(!thawed, "prediction with P=0.20 must be ignored (threshold = 0.35)");
     }
 
     // ── Enhancement B: ArousalState adaptive aggressiveness ───────────────────
@@ -1752,10 +1736,7 @@ mod tests {
     fn arousal_crisis_sets_idle_cycles_1() {
         let mut mgr = ChromiumManager::new();
         mgr.set_arousal_context(0.80);
-        assert_eq!(
-            mgr.idle_cycles_required, 1,
-            "crisis arousal must set idle_cycles_required = 1"
-        );
+        assert_eq!(mgr.idle_cycles_required, 1, "crisis arousal must set idle_cycles_required = 1");
     }
 
     /// B: idle arousal (< 0.20) sets arousal_thaw_all = true.
@@ -1763,10 +1744,7 @@ mod tests {
     fn arousal_idle_sets_thaw_all() {
         let mut mgr = ChromiumManager::new();
         mgr.set_arousal_context(0.15);
-        assert!(
-            mgr.arousal_thaw_all,
-            "arousal < 0.20 must set arousal_thaw_all = true"
-        );
+        assert!(mgr.arousal_thaw_all, "arousal < 0.20 must set arousal_thaw_all = true");
     }
 
     /// B: arousal_thaw_all triggers thaw of frozen renderers in update().
@@ -1783,10 +1761,7 @@ mod tests {
         let thawed = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 503));
-        assert!(
-            thawed,
-            "arousal_thaw_all must cause update() to emit ThawRenderer for frozen renderer"
-        );
+        assert!(thawed, "arousal_thaw_all must cause update() to emit ThawRenderer for frozen renderer");
     }
 
     /// Iter 2: long-idle renderer gets frozen at LOW pressure.
@@ -1852,10 +1827,7 @@ mod tests {
         let any_frozen = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::FreezeRenderer { pid, .. } if *pid == 821 || *pid == 822));
-        assert!(
-            !any_frozen,
-            "short-idle renderer must NOT be frozen at low pressure"
-        );
+        assert!(!any_frozen, "short-idle renderer must NOT be frozen at low pressure");
     }
 
     /// Iter 3: build preemption freezes background renderers after 1 idle cycle.
@@ -1911,10 +1883,7 @@ mod tests {
         // At arousal=0.80, idle_cycles_required=1 so freezes happen naturally.
         // The preemption API is additive; this test just documents that without
         // preemption, the system still relies on the pressure/arousal gates.
-        assert!(
-            without_flag_freezes >= 1,
-            "at arousal 0.80, freeze should fire via pressure/arousal gate"
-        );
+        assert!(without_flag_freezes >= 1, "at arousal 0.80, freeze should fire via pressure/arousal gate");
     }
 
     /// Regression guard: frozen renderers must PERSIST at low pressure when
@@ -1939,11 +1908,7 @@ mod tests {
         let thawed = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 701));
-        assert!(
-            !thawed,
-            "frozen renderer must NOT be thawed just because pressure is low \
-             when user is still working (arousal normal)"
-        );
+        assert!(!thawed, "frozen renderer must NOT be thawed just because pressure is low when user is still working (arousal normal)");
     }
 
     // ── Enhancement C: NARS belief-based freeze confidence ────────────────────
@@ -1953,11 +1918,7 @@ mod tests {
     fn nars_confidence_default_allows_freeze() {
         let mgr = ChromiumManager::new();
         let confidence = mgr.freeze_confidence("Brave Browser");
-        assert!(
-            (confidence - 0.70).abs() < 1e-5,
-            "default freeze confidence must be 0.70, got {}",
-            confidence
-        );
+        assert!((confidence - 0.70).abs() < 1e-5, "default freeze confidence must be 0.70, got {}", confidence);
     }
 
     /// C: multiple failure observations lower confidence below 0.50.
@@ -1968,11 +1929,7 @@ mod tests {
             mgr.observe_freeze_outcome("Brave Browser", false, 0.8);
         }
         let confidence = mgr.freeze_confidence("Brave Browser");
-        assert!(
-            confidence < 0.50,
-            "5 failure observations must pull confidence below 0.50, got {}",
-            confidence
-        );
+        assert!(confidence < 0.50, "5 failure observations must pull confidence below 0.50, got {}", confidence);
     }
 
     /// C: NARS confidence gate blocks freeze when confidence is low.
@@ -2001,10 +1958,7 @@ mod tests {
                 any_freeze = true;
             }
         }
-        assert!(
-            !any_freeze,
-            "NARS confidence gate must block freeze when confidence < 0.35"
-        );
+        assert!(!any_freeze, "NARS confidence gate must block freeze when confidence < 0.35");
     }
 
     // ── chromium_app_to_browser helper ────────────────────────────────────────
@@ -2012,27 +1966,10 @@ mod tests {
     /// D: chromium_app_to_browser maps known apps correctly.
     #[test]
     fn chromium_app_to_browser_maps_known_apps() {
-        assert_eq!(
-            ChromiumManager::chromium_app_to_browser("Brave Browser"),
-            Some("Brave Browser".to_string())
-        );
-        assert_eq!(
-            ChromiumManager::chromium_app_to_browser("Slack"),
-            Some("Slack".to_string())
-        );
-        assert_eq!(
-            ChromiumManager::chromium_app_to_browser("Code"),
-            Some("Code".to_string())
-        );
-        assert_eq!(
-            ChromiumManager::chromium_app_to_browser("Terminal"),
-            None,
-            "Terminal is not a Chromium browser"
-        );
-        assert_eq!(
-            ChromiumManager::chromium_app_to_browser("Finder"),
-            None,
-            "Finder is not a Chromium browser"
-        );
+        assert_eq!(ChromiumManager::chromium_app_to_browser("Brave Browser"), Some("Brave Browser".to_string()));
+        assert_eq!(ChromiumManager::chromium_app_to_browser("Slack"), Some("Slack".to_string()));
+        assert_eq!(ChromiumManager::chromium_app_to_browser("Code"), Some("Code".to_string()));
+        assert_eq!(ChromiumManager::chromium_app_to_browser("Terminal"), None, "Terminal is not a Chromium browser");
+        assert_eq!(ChromiumManager::chromium_app_to_browser("Finder"), None, "Finder is not a Chromium browser");
     }
 }
