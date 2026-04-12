@@ -429,10 +429,12 @@ pub fn llm_reactive_tick(
         .llm_state
         .last_suggestion_outcome
         .clone();
+    let frozen_count = state.frozen_state.lock_recover().len();
     let teacher = TeacherContext {
         pattern_scores: &pattern_scores_owned,
         previous_outcome: previous_outcome_owned.as_ref(),
         heuristic_struggling,
+        frozen_count,
     };
 
     let suggestion_res = advisor.call_raw(snapshot, &api_key, Some(&current_policy), Some(&teacher));

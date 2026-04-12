@@ -1518,10 +1518,29 @@ fn main() -> anyhow::Result<()> {
 
                     // Staggered wake unfreeze: queue PIDs instead of mass SIGCONT.
                     // Draining 5 PIDs/cycle avoids 1-3GB decompression spike on 8GB M1.
+                    // Priority: interactive PIDs first (user notices their latency).
                     // [Nygard 2018 — bulkhead: bound blast radius of state transitions]
                     let mut frozen_state = state.frozen_state.lock_recover();
                     let total_queued = frozen_state.len() as u64;
-                    wake_unfreeze_queue.extend(frozen_state.keys().copied());
+                    let interactive_pats = state
+                        .policy
+                        .lock_recover()
+                        .learned_policy
+                        .interactive_patterns
+                        .clone();
+                    let mut interactive_pids = Vec::new();
+                    let mut other_pids = Vec::new();
+                    for (&pid, entry) in frozen_state.iter() {
+                        let name = entry.process_name.as_deref().unwrap_or("");
+                        if interactive_pats.iter().any(|pat| name.contains(pat.as_str())) {
+                            interactive_pids.push(pid);
+                        } else {
+                            other_pids.push(pid);
+                        }
+                    }
+                    // Interactive first, then the rest.
+                    wake_unfreeze_queue.extend(interactive_pids);
+                    wake_unfreeze_queue.extend(other_pids);
                     frozen_state.clear();
                     write_frozen_state(&frozen_state_path, &frozen_state);
 

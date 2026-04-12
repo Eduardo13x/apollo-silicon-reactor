@@ -178,6 +178,8 @@ pub struct TeacherContext<'a> {
     pub previous_outcome: Option<&'a SuggestionOutcome>,
     /// El OutcomeTracker detectó que el heurístico está fallando.
     pub heuristic_struggling: bool,
+    /// Procesos actualmente congelados por Apollo.
+    pub frozen_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -752,9 +754,11 @@ fn build_summary(snapshot: &SystemSnapshot, teacher: Option<&TeacherContext<'_>>
     struct Summary<'a> {
         cpu_global: f32,
         mem_pressure: f64,
+        compressor_pressure: f64,
         swap_used_bytes: u64,
         swap_delta_bps: f64,
         thermal_level: &'a str,
+        frozen_count: usize,
         top_processes: &'a [crate::collector::ProcessStats],
     }
     // Cap top_processes to 8 — keeps prompt under ~600 tokens for local models.
@@ -763,12 +767,15 @@ fn build_summary(snapshot: &SystemSnapshot, teacher: Option<&TeacherContext<'_>>
     } else {
         &snapshot.top_processes
     };
+    let frozen_count = teacher.map(|t| t.frozen_count).unwrap_or(0);
     let s = Summary {
         cpu_global: snapshot.cpu.global_usage,
         mem_pressure: snapshot.pressure.memory_pressure,
+        compressor_pressure: snapshot.pressure.compressor_pressure,
         swap_used_bytes: snapshot.pressure.swap_used_bytes,
         swap_delta_bps: snapshot.pressure.swap_delta_bytes_per_sec,
         thermal_level: &snapshot.pressure.thermal_level,
+        frozen_count,
         top_processes: proc_slice,
     };
     let mut out = serde_json::to_string_pretty(&s).unwrap_or_default();
