@@ -68,9 +68,12 @@ const FD_CHECK_EVERY_N_CYCLES: u8 = 5;
 /// Renderers always have Unix-domain IPC sockets; we only block on TCP/UDP.
 const MIN_INET_SOCKETS_TO_BLOCK: usize = 1;
 
-/// Max cycles a renderer stays frozen before forced thaw (~5 min at 2s/cycle).
-/// Prevents renderers stuck frozen if fg-change detection misses a tab switch.
-const MAX_FROZEN_CYCLES: u8 = 150;
+/// Max cycles a renderer stays frozen before forced thaw (~5 s at 100ms/cycle).
+/// Kept short so that when Brave closes a tab, the frozen renderer is thawed
+/// before Brave's ~15s "not responding" timeout fires. Previous value (150)
+/// caused a race: tab closed → renderer SIGSTOP'd → Brave IPC blocked →
+/// "window not responding" dialog for an already-closed tab.
+const MAX_FROZEN_CYCLES: u8 = 50;
 
 /// Aggressive TTL for renderers of the **currently foreground** Chromium
 /// browser. Bounds the user-visible "stuck tab" hang when the foreground-
@@ -107,6 +110,9 @@ pub struct RendererInfo {
     cpu_history: [f32; 3],
     /// Cycles elapsed since this renderer was frozen (for max-freeze-duration guard).
     frozen_cycles: u8,
+    /// RSS at the moment of freeze. When RSS drops >50% while frozen, the browser
+    /// is reclaiming memory from a closed tab — thaw immediately so it can exit cleanly.
+    frozen_rss_baseline: u64,
 }
 
 impl RendererInfo {
@@ -123,6 +129,7 @@ impl RendererInfo {
             has_assertion: false,
             cpu_history: [cpu_pct, 0.0, 0.0],
             frozen_cycles: 0,
+            frozen_rss_baseline: 0,
         }
     }
 
@@ -630,6 +637,26 @@ impl ChromiumManager {
                 continue;
             }
 
+            // Thaw check 1b: RSS-drop detection — browser is reclaiming memory from
+            // a closed tab. When RSS drops >50% vs freeze baseline, the renderer is
+            // being cleaned up by the browser. Thaw immediately so it can exit cleanly
+            // rather than getting stuck frozen until the time-based TTL fires.
+            // Avoids "window not responding" dialogs for already-closed tabs.
+            if info.frozen
+                && info.frozen_rss_baseline > 0
+                && info.memory_bytes < info.frozen_rss_baseline / 2
+            {
+                actions.push(ChromiumAction::ThawRenderer { pid: *pid, name: info.name.clone() });
+                tracing::info!(
+                    pid = *pid,
+                    name = info.name.as_str(),
+                    rss_before = info.frozen_rss_baseline,
+                    rss_now = info.memory_bytes,
+                    "chromium: thawing renderer (RSS drop >50% — tab cleanup detected)"
+                );
+                continue;
+            }
+
             // Thaw check 2a: foreground-browser renderers get an aggressive
             // TTL (~30 s) so a missed tab-switch detection cannot leave the
             // tab the user is looking at stuck for minutes. The user
@@ -823,6 +850,7 @@ impl ChromiumManager {
                     self.freezes_applied += 1;
                     if let Some(info) = self.renderers.get_mut(pid) {
                         info.frozen = true;
+                        info.frozen_rss_baseline = info.memory_bytes;
                     }
                 }
                 ChromiumAction::ThawRenderer { pid, .. } => {

@@ -114,6 +114,9 @@ pub struct LlmState {
     /// Resultado medido de la última sugerencia — cerrado el loop.
     #[serde(default)]
     pub last_suggestion_outcome: Option<SuggestionOutcome>,
+    /// Protected patterns added by the pending suggestion — used to revert on WORSENED outcome.
+    #[serde(default)]
+    pub pending_added_protected: Vec<String>,
 }
 
 impl LlmState {

@@ -818,10 +818,31 @@ impl SignalIntelligence {
         self.mpc.restore_effects(&p.mpc);
         self.learned_mid_entry = p.learned_mid_entry;
         self.learned_high_entry = p.learned_high_entry;
-        self.utility_entropy = p.utility_entropy;
-        self.utility_hazard = p.utility_hazard;
-        self.utility_lotka = p.utility_lotka;
-        self.utility_mpc = p.utility_mpc;
+        // Sanitize utility EMAs: denormals/NaN lock the subsystem out forever
+        // (the EMA gate uses `> UTIL_THRESHOLD = 0.15`, so any subnormal stays
+        // below threshold and never receives updates). Reset to 0.5 so each
+        // subsystem gets a fair chance to earn its place after restore.
+        const UTILITY_MIN: f64 = 1e-6;
+        self.utility_entropy = if p.utility_entropy.is_finite() && p.utility_entropy >= UTILITY_MIN {
+            p.utility_entropy.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        self.utility_hazard = if p.utility_hazard.is_finite() && p.utility_hazard >= UTILITY_MIN {
+            p.utility_hazard.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        self.utility_lotka = if p.utility_lotka.is_finite() && p.utility_lotka >= UTILITY_MIN {
+            p.utility_lotka.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        self.utility_mpc = if p.utility_mpc.is_finite() && p.utility_mpc >= UTILITY_MIN {
+            p.utility_mpc.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
         if let Some(kf) = p.kf_pressure {
             self.kf_pressure = kf;
         }

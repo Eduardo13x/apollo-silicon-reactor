@@ -107,31 +107,71 @@ pub fn llm_reactive_tick(
 
     // ── Fase 3: resolver outcome pendiente si ya pasaron ≥30s ─────────────
     {
-        let mut guard = state.llm.lock_recover();
-        if let (Some(pending_at), Some(pending_pressure)) = (
-            guard.llm_state.pending_outcome_at,
-            guard.llm_state.pending_outcome_pressure,
-        ) {
-            if now - pending_at >= ChronoDuration::seconds(30) {
-                let pressure_after = snapshot.pressure.memory_pressure;
-                let delta = pressure_after - pending_pressure;
-                let rationale = guard
-                    .llm_state
-                    .pending_outcome_rationale
-                    .clone()
-                    .unwrap_or_default();
-                guard.llm_state.last_suggestion_outcome = Some(SuggestionOutcome {
-                    applied_at: pending_at,
-                    pressure_before: pending_pressure,
-                    pressure_after,
-                    pressure_delta: delta,
-                    rationale_snippet: rationale.chars().take(80).collect(),
-                });
-                guard.llm_state.pending_outcome_at = None;
-                guard.llm_state.pending_outcome_pressure = None;
-                guard.llm_state.pending_outcome_rationale = None;
-                write_json(&llm_state_path, &guard.llm_state, Some(0o600));
+        // Extract outcome data without holding the lock across policy access.
+        let outcome_data = {
+            let guard = state.llm.lock_recover();
+            match (guard.llm_state.pending_outcome_at, guard.llm_state.pending_outcome_pressure) {
+                (Some(pending_at), Some(pending_pressure))
+                    if now - pending_at >= ChronoDuration::seconds(30) =>
+                {
+                    Some((
+                        pending_at,
+                        pending_pressure,
+                        guard.llm_state.pending_outcome_rationale.clone().unwrap_or_default(),
+                        guard.llm_state.pending_added_protected.clone(),
+                    ))
+                }
+                _ => None,
             }
+        };
+
+        if let Some((pending_at, pending_pressure, rationale, added_protected)) = outcome_data {
+            let pressure_after = snapshot.pressure.memory_pressure;
+            let delta = pressure_after - pending_pressure;
+
+            // WORSENED revert: if pressure increased significantly, remove the protected
+            // patterns that Gemma added — they were shielding processes that cause pressure.
+            // Threshold 0.08 (8pp) avoids reverting on noise while catching real regressions.
+            if delta > 0.08 && !added_protected.is_empty() {
+                let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
+                let lp_snap = {
+                    let mut pg = state.policy.lock_recover();
+                    let before = pg.learned_policy.protected_patterns.len();
+                    pg.learned_policy
+                        .protected_patterns
+                        .retain(|p| !added_protected.contains(p));
+                    let reverted = before - pg.learned_policy.protected_patterns.len();
+                    if reverted > 0 {
+                        pg.learned_policy.protected_patterns.sort();
+                        pg.learned_policy.learned_at = Some(now);
+                        let lp_clone = pg.learned_policy.clone();
+                        pg.adaptive_governor
+                            .update_learned_policy(&lp_clone);
+                        tracing::info!(
+                            reverted,
+                            delta,
+                            ?added_protected,
+                            "llm: WORSENED outcome — reverted protected patterns"
+                        );
+                    }
+                    pg.learned_policy.clone()
+                };
+                write_json(&learned_policy_path, &lp_snap, Some(0o600));
+            }
+
+            let mut guard = state.llm.lock_recover();
+            guard.llm_state.last_suggestion_outcome = Some(SuggestionOutcome {
+                applied_at: pending_at,
+                pressure_before: pending_pressure,
+                pressure_after,
+                pressure_delta: delta,
+                rationale_snippet: rationale.chars().take(80).collect(),
+            });
+            guard.llm_state.pending_outcome_at = None;
+            guard.llm_state.pending_outcome_pressure = None;
+            guard.llm_state.pending_outcome_rationale = None;
+            guard.llm_state.pending_added_protected.clear();
+            write_json(&llm_state_path, &guard.llm_state, Some(0o600));
         }
     }
 
@@ -303,6 +343,10 @@ pub fn llm_reactive_tick(
     if heuristic_struggling && !trigger_active {
         trigger_active = true;
         rising_edge = !counters.prev_trigger_active;
+        // BUG FIX: update prev_trigger_active to reflect the override. Without this,
+        // counters.prev_trigger_active stays false (set from the original trigger_active=false
+        // at line above), so rising_edge fires again every cycle — trigger storm.
+        counters.prev_trigger_active = true;
     }
 
     if !trigger_active {
@@ -363,13 +407,39 @@ pub fn llm_reactive_tick(
         let mut guard = state.llm.lock_recover();
         guard.llm_state.last_trigger_at = Some(now);
         guard.llm_state.last_trigger_reason = Some(trigger_reason.clone());
-        guard.llm_state.trigger_events.push(now);
+        // Backstop cooldown: only push to trigger_events once per 60s regardless
+        // of rising-edge rate. Prevents pressure oscillation near threshold from
+        // inflating triggers_recent (which controls mode=Sensitive) on restarts.
+        let last_push = guard
+            .llm_state
+            .trigger_events
+            .last()
+            .copied()
+            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+        if now - last_push >= ChronoDuration::seconds(60) {
+            guard.llm_state.trigger_events.push(now);
+        }
         guard.llm_state.no_trigger_since = None;
         write_json(&llm_state_path, &guard.llm_state, Some(0o600));
     }
 
     // Call gating: only call on rising edge.
     if !rising_edge {
+        return;
+    }
+
+    // Metal OOM guard: high swap means unified memory is fragmented — Gemma's
+    // 99-layer Metal inference will fail with kIOGPUCommandBufferCallbackErrorOutOfMemory.
+    // Skip the call and let Apollo reduce pressure first; retry next trigger.
+    // 2 GB threshold: observed OOMs at ~2.5-3 GB swap on M1 8 GB.
+    const METAL_OOM_SWAP_THRESHOLD: u64 = 2 * 1024 * 1024 * 1024;
+    if snapshot.pressure.swap_used_bytes > METAL_OOM_SWAP_THRESHOLD {
+        let mut guard = state.llm.lock_recover();
+        guard.llm_state.last_error = Some(format!(
+            "metal-oom-risk swap={:.1}GB — skipped",
+            snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        ));
+        write_json(&llm_state_path, &guard.llm_state, Some(0o600));
         return;
     }
 
@@ -623,6 +693,9 @@ pub fn llm_reactive_tick(
                         let snippet: String =
                             suggestion.rationale.chars().take(80).collect();
                         guard.llm_state.pending_outcome_rationale = Some(snippet);
+                        // Track protected patterns added so we can revert on WORSENED.
+                        guard.llm_state.pending_added_protected =
+                            suggestion.add_protected_patterns.clone();
                     }
                     write_json(&llm_state_path, &guard.llm_state, Some(0o600));
                 }
