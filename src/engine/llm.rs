@@ -496,29 +496,31 @@ impl LlmAdvisor {
         let policy_context = policy.map(build_policy_context).unwrap_or_default();
         let system_prompt = r#"You are an optimization advisor for a macOS system optimizer daemon.
 
-Return ONLY valid JSON with this shape:
+Return ONLY valid JSON (no markdown, no ```). Shape:
 {
   "suggest_profile": "balanced-root"|"aggressive-root"|"safe-root"|null,
   "suggest_latency_target": "low"|"normal"|"max"|null,
   "suggest_lists": {
-    "add_interactive_patterns": ["..."],
-    "add_noise_patterns": ["..."],
-    "add_protected_patterns": ["..."]
+    "add_interactive_patterns": [],
+    "add_noise_patterns": [],
+    "add_protected_patterns": []
   },
   "confidence": 0.0,
   "rationale": "short reason"
 }
 
-Constraints:
-- Do NOT suggest touching Spotlight stack (mds/mdworker/mds_stores/Spotlight).
-- Keep pattern strings short substrings; no regex.
-- If unsure, set suggestions to null and confidence low.
-- Do NOT add processes already in the current policy lists (they are already classified).
-- Do NOT put the same process in both noise and protected.
-- low-value processes have been throttled many times with no effect; consider adding them to protected instead of noise.
-- 'PatternEffectiveness' shows measured Bayesian throttle outcomes. If effectiveness < 0.30, the process is NOT causing pressure — suggest protected, not noise.
-- 'PreviousGemmaSuggestion outcome' shows what happened after your last advice. If WORSENED or NO_EFFECT, revise your strategy.
-- 'HEURISTIC_STRUGGLING' means Apollo's rule-based system cannot reduce pressure — be more decisive in your suggestions.
+HARD RULES (violation = rejected):
+1. NEVER add a process to a category where it ALREADY belongs (e.g. don't add "Brave" to interactive if it's already there). You MAY move a process from noise→protected if PatternEffectiveness shows it is NOT causing pressure.
+2. NEVER put the same process in both noise and protected in the same response. Pick one.
+3. NEVER suggest Spotlight stack (mds/mdworker/mds_stores/Spotlight).
+4. Keep pattern strings as short substrings, no regex.
+
+GUIDANCE:
+- If PatternEffectiveness shows effectiveness < 0.30 → that process does NOT cause pressure. Suggest it for protected (not noise).
+- If PreviousGemmaSuggestion outcome was WORSENED or NO_EFFECT → revise your strategy for this call.
+- If HEURISTIC_STRUGGLING=true → Apollo's rules are failing. Be decisive.
+- If nothing new to suggest, return empty lists with confidence 0.80 and rationale explaining why current policy is sufficient.
+- Confidence should reflect how sure you are. 0.70+ means you have clear evidence. Do not default to 0.65.
 "#;
 
         let user_prompt = format!(
@@ -755,13 +757,19 @@ fn build_summary(snapshot: &SystemSnapshot, teacher: Option<&TeacherContext<'_>>
         thermal_level: &'a str,
         top_processes: &'a [crate::collector::ProcessStats],
     }
+    // Cap top_processes to 8 — keeps prompt under ~600 tokens for local models.
+    let proc_slice = if snapshot.top_processes.len() > 8 {
+        &snapshot.top_processes[..8]
+    } else {
+        &snapshot.top_processes
+    };
     let s = Summary {
         cpu_global: snapshot.cpu.global_usage,
         mem_pressure: snapshot.pressure.memory_pressure,
         swap_used_bytes: snapshot.pressure.swap_used_bytes,
         swap_delta_bps: snapshot.pressure.swap_delta_bytes_per_sec,
         thermal_level: &snapshot.pressure.thermal_level,
-        top_processes: &snapshot.top_processes,
+        top_processes: proc_slice,
     };
     let mut out = serde_json::to_string_pretty(&s).unwrap_or_default();
 

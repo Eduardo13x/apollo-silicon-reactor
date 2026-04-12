@@ -1226,6 +1226,11 @@ fn main() -> anyhow::Result<()> {
             // rustc process-count dynamics. Informs reactor_weight policy.
             use apollo_optimizer::engine::build_tracker::{BuildPhase, BuildTracker};
             let mut build_tracker = BuildTracker::new();
+            // Staggered wake unfreeze queue: instead of SIGCONT-ing all frozen PIDs
+            // at once on display wake (which decompresses 1-3GB in <500ms on 8GB M1),
+            // spread unfreezes across cycles — 5 PIDs per cycle (~2s apart).
+            const WAKE_UNFREEZE_BATCH: usize = 5;
+            let mut wake_unfreeze_queue: VecDeque<u32> = VecDeque::new();
             // Pending trial skill: (name, pressure_before). Recorded next cycle.
             // Restored from LearnedState so a trial started before a crash is still evaluated.
             let mut pending_trial_skill: Option<(String, f64)> = restored_trial_skill;
@@ -1440,6 +1445,16 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // ── Staggered wake unfreeze: drain batch per cycle ──────────
+                // Instead of SIGCONT-ing 50 PIDs at once, spread across cycles
+                // to avoid decompressing 1-3GB in one shot on 8GB M1.
+                if !wake_unfreeze_queue.is_empty() {
+                    let batch: Vec<u32> = wake_unfreeze_queue
+                        .drain(..wake_unfreeze_queue.len().min(WAKE_UNFREEZE_BATCH))
+                        .collect();
+                    unfreeze_pids(batch.into_iter());
+                }
+
                 // Mark reactor as stalled only if the reactor thread has sent
                 // zero pulses after 60 s — that means the thread itself died,
                 // not just that the system has been quiet.
@@ -1501,15 +1516,19 @@ fn main() -> anyhow::Result<()> {
                         Some(now_wall + ChronoDuration::seconds(60));
                     grace_active = true;
 
+                    // Staggered wake unfreeze: queue PIDs instead of mass SIGCONT.
+                    // Draining 5 PIDs/cycle avoids 1-3GB decompression spike on 8GB M1.
+                    // [Nygard 2018 — bulkhead: bound blast radius of state transitions]
                     let mut frozen_state = state.frozen_state.lock_recover();
-                    let unfreeze_count = unfreeze_pids(frozen_state.keys().copied());
+                    let total_queued = frozen_state.len() as u64;
+                    wake_unfreeze_queue.extend(frozen_state.keys().copied());
                     frozen_state.clear();
                     write_frozen_state(&frozen_state_path, &frozen_state);
 
-                    // Also thaw display_turbo frozen PIDs — separate registry, would stay
-                    // SIGSTOP'd until next DeactivateTurbo or ghost GC cycle otherwise.
+                    // Turbo PIDs also staggered.
                     let turbo_pids = display_turbo.turbo_frozen_pids_snapshot();
-                    let turbo_unfreeze = unfreeze_pids(turbo_pids.into_iter());
+                    let turbo_count = turbo_pids.len() as u64;
+                    wake_unfreeze_queue.extend(turbo_pids.into_iter());
                     display_turbo.clear_frozen();
 
                     {
@@ -1517,9 +1536,9 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.wake_events += 1;
                         metrics.metrics.post_wake_grace_entries += 1;
                         metrics.metrics.post_wake_defensive_unfreezes +=
-                            unfreeze_count + turbo_unfreeze;
-                        metrics.metrics.unfreezes_applied += unfreeze_count + turbo_unfreeze;
-                        metrics.metrics.throttle_reverted += unfreeze_count + turbo_unfreeze;
+                            total_queued + turbo_count;
+                        metrics.metrics.unfreezes_applied += total_queued + turbo_count;
+                        metrics.metrics.throttle_reverted += total_queued + turbo_count;
                     }
                 }
                 process_guard.wake_state.last_cycle_wallclock = now_wall;
