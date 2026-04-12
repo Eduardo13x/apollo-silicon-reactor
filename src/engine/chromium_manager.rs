@@ -577,7 +577,11 @@ impl ChromiumManager {
                 None => continue,
             };
             let time_to_switch = avg_dwell - self.elapsed_dwell_secs;
-            if time_to_switch < 10.0 {
+            // Only pre-thaw within a reasonable window: predicted switch is
+            // 0-10s away.  Deeply negative values mean the prediction is stale
+            // (elapsed >> avg_dwell) — firing on those creates a freeze/thaw
+            // thrashing loop that pins pressure at 100%.
+            if time_to_switch > -5.0 && time_to_switch < 10.0 {
                 for (&pid, info) in &self.renderers {
                     if info.browser == predicted_browser
                         && info.frozen
@@ -700,7 +704,7 @@ impl ChromiumManager {
                 let effective_required = if self.build_preemption_active {
                     1
                 } else {
-                    self.idle_cycles_required
+                    self.idle_cycles_required.max(1) // invariant: never 0
                 };
                 let meets_pressure_gate = info.consecutive_idle_cycles >= effective_required;
                 let meets_long_idle = info.consecutive_idle_cycles >= LONG_IDLE_CYCLES;
@@ -811,6 +815,9 @@ impl ChromiumManager {
                 ChromiumAction::FreezeRenderer {
                     pid, estimated_mb, ..
                 } => {
+                    // Optimistic: mark as frozen in internal model.
+                    // If SIGSTOP fails, daemon calls confirm_freeze(pid, false)
+                    // to roll back — prevents state drift on failed freeze.
                     self.frozen_pids.insert(*pid);
                     self.total_freed_mb += estimated_mb;
                     self.freezes_applied += 1;
@@ -1036,6 +1043,18 @@ impl ChromiumManager {
         {
             let _ = pid;
             false
+        }
+    }
+
+    /// Roll back optimistic freeze state if SIGSTOP failed.
+    /// Call with `ok=false` when freeze_renderer() returned false so the
+    /// internal model stays consistent with reality.
+    pub fn confirm_freeze(&mut self, pid: u32, ok: bool) {
+        if !ok {
+            self.frozen_pids.remove(&pid);
+            if let Some(info) = self.renderers.get_mut(&pid) {
+                info.frozen = false;
+            }
         }
     }
 
@@ -1680,6 +1699,26 @@ mod tests {
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 501));
         assert!(!thawed, "pre-thaw must NOT fire when 40s remain before predicted switch");
+    }
+
+    /// A: stale prediction (time_to_switch deeply negative) does NOT fire.
+    /// Regression test for BUG-PRETHAW: missing lower bound caused freeze/thaw
+    /// thrashing loop when elapsed >> avg_dwell.
+    #[test]
+    fn predictive_pre_thaw_no_fire_when_stale() {
+        let (mut mgr, none_set) = brave_mgr_with_frozen_renderer(503);
+        // avg_dwell=50s, elapsed=160s → time_to_switch = -110s (deeply stale)
+        let preds = vec![("Brave Browser".to_string(), 0.90_f64, 50.0_f64)];
+        mgr.set_markov_context(&preds, 160.0);
+
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(503, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
+        let actions = mgr.update(&procs, None, &none_set, &none_set);
+
+        let thawed = actions
+            .iter()
+            .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 503));
+        assert!(!thawed, "stale prediction (time_to_switch=-110s) must NOT trigger pre-thaw");
     }
 
     /// A: low-probability prediction (P < 0.35) is ignored.

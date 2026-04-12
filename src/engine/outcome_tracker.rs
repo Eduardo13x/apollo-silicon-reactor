@@ -707,6 +707,34 @@ impl OutcomeTracker {
     pub fn gc_weights(&mut self) {
         self.weights
             .retain(|_, w| w.throttle_count >= 5 || w.effective_count >= 2);
+
+        // Cap process_effect_time to 500 entries — evict farthest-from-default.
+        if self.process_effect_time.len() > 500 {
+            let mut entries: Vec<(String, f64)> = self
+                .process_effect_time
+                .drain()
+                .collect();
+            // Keep entries most different from default (30.0) — they carry signal.
+            entries.sort_by(|a, b| {
+                let da = (a.1 - 30.0).abs();
+                let db = (b.1 - 30.0).abs();
+                db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            entries.truncate(400);
+            self.process_effect_time = entries.into_iter().collect();
+        }
+
+        // Cap hop_groups to 300 entries — evict lowest-count groups.
+        if self.hop_groups.len() > 300 {
+            let mut entries: Vec<_> = self.hop_groups.drain().collect();
+            entries.sort_by(|a, b| {
+                b.1.throttle_count
+                    .cmp(&a.1.throttle_count)
+                    .reverse()
+            });
+            entries.truncate(200);
+            self.hop_groups = entries.into_iter().collect();
+        }
     }
 
     /// Penalty signal for the RL agent: negative reward proportional to

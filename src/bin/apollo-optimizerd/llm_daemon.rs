@@ -381,8 +381,12 @@ pub fn llm_reactive_tick(
         if let Some(last_call) = guard.llm_state.last_call_at {
             if now - last_call < ChronoDuration::hours(2) {
                 if let Some(ref prev) = guard.llm_state.last_suggestion_outcome {
+                    // Compare against pressure_after (measured outcome), not
+                    // pressure_before (pre-intervention baseline).  Using _before
+                    // causes false skips when pressure returns to pre-suggestion
+                    // levels after the suggestion's effect wears off.
                     let pressure_change = (snapshot.pressure.memory_pressure
-                        - prev.pressure_before)
+                        - prev.pressure_after)
                         .abs();
                     if pressure_change < 0.10 {
                         return; // same scenario, Gemma would repeat herself

@@ -1460,7 +1460,16 @@ fn main() -> anyhow::Result<()> {
                     let batch: Vec<u32> = wake_unfreeze_queue
                         .drain(..wake_unfreeze_queue.len().min(WAKE_UNFREEZE_BATCH))
                         .collect();
-                    unfreeze_pids(batch.into_iter());
+                    unfreeze_pids(batch.iter().copied());
+                    // Remove from frozen_state only after actual SIGCONT —
+                    // crash before this point leaves PIDs in state for recovery.
+                    {
+                        let mut frozen_guard = state.frozen_state.lock_recover();
+                        for pid in &batch {
+                            frozen_guard.remove(pid);
+                        }
+                        write_frozen_state(&frozen_state_path, &frozen_guard);
+                    }
                 }
 
                 // Mark reactor as stalled only if the reactor thread has sent
@@ -1517,6 +1526,10 @@ fn main() -> anyhow::Result<()> {
                     .post_wake_grace_until
                     .map(|t| t > now_wall)
                     .unwrap_or(false);
+                // Clear expired grace so it doesn't carry across unrelated wakes.
+                if !grace_active {
+                    process_guard.wake_state.post_wake_grace_until = None;
+                }
                 if wake_jump > ChronoDuration::seconds(90) {
                     // Treat as wake: engage grace window and unfreeze anything Apollo froze.
                     process_guard.wake_state.last_wake_at = Some(now_wall);
@@ -1528,7 +1541,7 @@ fn main() -> anyhow::Result<()> {
                     // Draining 5 PIDs/cycle avoids 1-3GB decompression spike on 8GB M1.
                     // Priority: interactive PIDs first (user notices their latency).
                     // [Nygard 2018 — bulkhead: bound blast radius of state transitions]
-                    let mut frozen_state = state.frozen_state.lock_recover();
+                    let frozen_state = state.frozen_state.lock_recover();
                     let total_queued = frozen_state.len() as u64;
                     let interactive_pats = state
                         .policy
@@ -1547,10 +1560,10 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     // Interactive first, then the rest.
+                    // PIDs stay in frozen_state until actually SIGCONTed in
+                    // the drain loop — crash mid-drain won't orphan them.
                     wake_unfreeze_queue.extend(interactive_pids);
                     wake_unfreeze_queue.extend(other_pids);
-                    frozen_state.clear();
-                    write_frozen_state(&frozen_state_path, &frozen_state);
 
                     // Turbo PIDs also staggered.
                     let turbo_pids = display_turbo.turbo_frozen_pids_snapshot();
@@ -1654,6 +1667,9 @@ fn main() -> anyhow::Result<()> {
                             }
                             write_frozen_state(&frozen_state_path, &frozen_guard);
                             drop(frozen_guard);
+                            // Clear turbo internal state so stale PIDs don't
+                            // block re-freeze on next display-off cycle.
+                            display_turbo.clear_frozen();
                             state.metrics.lock_recover().metrics.unfreezes_applied +=
                                 unfreeze_count;
                             // Jank is recorded only when we ACTUALLY froze processes during turbo
@@ -1797,28 +1813,29 @@ fn main() -> anyhow::Result<()> {
                     if pred.probability >= 0.35 {
                         let elapsed = focus_markov.elapsed_dwell_secs();
                         let time_to_switch = pred.avg_dwell_secs - elapsed;
-                        if time_to_switch < 10.0 {
+                        // Only pre-thaw within [-5s, +10s] window.  Deeply negative
+                        // values = stale prediction → skip to avoid freeze/thaw thrashing.
+                        if time_to_switch > -5.0 && time_to_switch < 10.0 {
                             use apollo_optimizer::engine::freeze_intelligence::FreezeIntelligence;
                             let hint_categories = FreezeIntelligence::pre_thaw_hint(&pred.app_name);
-                            // Collect pids + names from frozen_state that match hint categories.
-                            let candidates: Vec<(u32, String)> = {
-                                let frozen_guard = state.frozen_state.lock_recover();
-                                frozen_guard
-                                    .iter()
-                                    .filter_map(|(&pid, entry)| {
-                                        let pname = entry.process_name.as_deref().unwrap_or("");
-                                        if !pname.is_empty() {
-                                            let cat = FreezeIntelligence::classify(pname);
-                                            if hint_categories.contains(&cat) {
-                                                return Some((pid, pname.to_string()));
-                                            }
+                            // Single lock scope: collect + act atomically to avoid
+                            // TOCTOU where another thread removes PIDs between
+                            // candidate collection and SIGCONT.
+                            let mut frozen_guard = state.frozen_state.lock_recover();
+                            let candidates: Vec<(u32, String)> = frozen_guard
+                                .iter()
+                                .filter_map(|(&pid, entry)| {
+                                    let pname = entry.process_name.as_deref().unwrap_or("");
+                                    if !pname.is_empty() {
+                                        let cat = FreezeIntelligence::classify(pname);
+                                        if hint_categories.contains(&cat) {
+                                            return Some((pid, pname.to_string()));
                                         }
-                                        None
-                                    })
-                                    .collect()
-                            };
+                                    }
+                                    None
+                                })
+                                .collect();
                             if !candidates.is_empty() {
-                                let mut frozen_guard = state.frozen_state.lock_recover();
                                 for (pid, pname) in &candidates {
                                     if frozen_guard.remove(pid).is_some() {
                                         unfreeze_pids(std::iter::once(*pid));
@@ -5501,6 +5518,10 @@ fn main() -> anyhow::Result<()> {
                                     "chromium: freezing idle renderer"
                                 );
                                 let ok = apollo_optimizer::engine::chromium_manager::ChromiumManager::freeze_renderer(*pid);
+                                // Confirm or roll back the optimistic internal state
+                                // set during update() — keeps chromium_manager in sync
+                                // with reality when SIGSTOP fails (PID died in flight).
+                                chromium_mgr.confirm_freeze(*pid, ok);
                                 if ok {
                                     // Register in the main frozen_state for crash-recovery
                                     // and unified observability.

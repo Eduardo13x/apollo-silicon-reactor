@@ -9,7 +9,8 @@
 //! - `is_peer_root()` — peer credential check
 
 use std::ffi::CString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
@@ -307,19 +308,20 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             DaemonResponse::Ok
         }
         DaemonRequest::PanicRestore => {
-            // Symlink protection: refuse to create kill switch through a symlink
+            // Symlink protection: open with O_NOFOLLOW so the check and create
+            // are atomic — no TOCTOU window for a symlink to be swapped in.
             let ks = kill_switch_path();
-            let ks_path = Path::new(ks);
-            if ks_path.exists() {
-                if let Ok(meta) = fs::symlink_metadata(ks_path) {
-                    if meta.file_type().is_symlink() {
-                        return DaemonResponse::Error {
-                            message: "kill switch path is a symlink — refusing".to_string(),
-                        };
-                    }
-                }
+            let result = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(ks);
+            if let Err(e) = result {
+                return DaemonResponse::Error {
+                    message: format!("kill switch create failed (symlink?): {e}"),
+                };
             }
-            let _ = File::create(ks);
             state.policy.lock_recover().governor.set_auto_profile(false);
             let mut frozen_state = state.frozen_state.lock_recover();
             for pid in frozen_state.keys() {
