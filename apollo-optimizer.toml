@@ -17,8 +17,8 @@ force_json = false
 
 # Timeouts más holgados para inferencia local en M1 8GB.
 timeout_ms          = 180000
-min_interval_secs   = 1800    # 30 min mínimo entre llamadas
-max_calls_per_hour  = 2
+min_interval_secs   = 3600    # 1 hora mínimo entre llamadas
+max_calls_per_hour  = 1
 
 # Umbral de confianza más bajo para modelo local (menor calibración que GPT).
 min_confidence = 0.60

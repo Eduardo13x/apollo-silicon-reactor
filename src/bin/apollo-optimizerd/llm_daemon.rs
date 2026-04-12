@@ -373,6 +373,44 @@ pub fn llm_reactive_tick(
         return;
     }
 
+    // ── Smart skip: don't call Gemma if she has nothing new to say ────────
+    // Guard 1: if last suggestion was <2 hours ago and pressure hasn't changed
+    // more than 10%, Gemma would give the same answer. Skip.
+    {
+        let guard = state.llm.lock_recover();
+        if let Some(last_call) = guard.llm_state.last_call_at {
+            if now - last_call < ChronoDuration::hours(2) {
+                if let Some(ref prev) = guard.llm_state.last_suggestion_outcome {
+                    let pressure_change = (snapshot.pressure.memory_pressure
+                        - prev.pressure_before)
+                        .abs();
+                    if pressure_change < 0.10 {
+                        return; // same scenario, Gemma would repeat herself
+                    }
+                }
+            }
+        }
+    }
+    // Guard 2: if all top processes already have high_value pattern_weights,
+    // Apollo's S1 already knows what to do — no need to consult S2.
+    {
+        let policy = state.policy.lock_recover();
+        let top_names: Vec<&str> = snapshot
+            .top_processes
+            .iter()
+            .take(5)
+            .map(|p| p.name.as_str())
+            .collect();
+        let all_known = top_names.iter().all(|name| {
+            policy.learned_policy.interactive_patterns.iter().any(|p| name.contains(p.as_str()))
+                || policy.learned_policy.noise_patterns.iter().any(|p| name.contains(p.as_str()))
+                || policy.learned_policy.protected_patterns.iter().any(|p| name.contains(p.as_str()))
+        });
+        if all_known && !heuristic_struggling {
+            return; // S1 already has all answers, skip S2
+        }
+    }
+
     // Budget + cadence.
     {
         let mut guard = state.llm.lock_recover();
