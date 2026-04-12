@@ -516,6 +516,12 @@ pub struct RuntimeMetrics {
     pub wake_events: u64,
     pub post_wake_grace_entries: u64,
     pub post_wake_defensive_unfreezes: u64,
+    /// Teacher consolidation events (Gemma outcomes compiled into S1).
+    #[serde(default)]
+    pub teacher_consolidations: u64,
+    /// Subset that IMPROVED pressure (positive valence).
+    #[serde(default)]
+    pub teacher_improvements: u64,
     pub post_wake_throttle_suppressed: u64,
     pub post_wake_freeze_suppressed: u64,
     pub swap_used_bytes: u64,

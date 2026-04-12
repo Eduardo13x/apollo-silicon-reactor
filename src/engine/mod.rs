@@ -97,6 +97,7 @@ pub mod syscall_classifier;
 pub mod system_log_ingester;
 pub mod sysctl_direct;
 pub mod sysctl_governor;
+pub mod teacher_consolidation;
 pub mod telemetry_logger;
 pub mod temporal_predictor;
 pub mod thermal_bailout;

@@ -1270,6 +1270,14 @@ fn main() -> anyhow::Result<()> {
             // across restarts. [Yerkes & Dodson 1908]
             let mut arousal_state = restored_arousal
                 .unwrap_or_else(apollo_optimizer::engine::nars_belief::ArousalState::default);
+            // Teacher consolidation: compiles Gemma 4 suggestions into S1
+            // pattern_weights + NARS beliefs via dopamine/acetylcholine modulation.
+            // [McGaugh 2004, Yerkes-Dodson 1908, Kahneman 2011]
+            let mut teacher_consolidator =
+                apollo_optimizer::engine::teacher_consolidation::TeacherConsolidator::new();
+            // Tracks the last resolved outcome's applied_at so we only
+            // consolidate each outcome exactly once.
+            let mut last_consolidated_at: Option<chrono::DateTime<chrono::Utc>> = None;
             // Neurocognitive state: 8-module cognitive pipeline wired into hot loop.
             // [CognitiveRewardBus, MetaCognition, SelfRewardingEvaluator, EpistemicUncertainty,
             //  ReptileMeta, AdversarialProbe, ProactiveDrift, CognitiveHealthScore]
@@ -2466,6 +2474,44 @@ fn main() -> anyhow::Result<()> {
                     &mut llm_counters,
                     lctx.outcome_tracker.heuristic_is_struggling(),
                 );
+
+                // ── Teacher consolidation: S2 → S1 memory transfer ────────
+                // When llm_reactive_tick resolves a pending outcome, compile
+                // Gemma's suggestion into pattern_weights + NARS beliefs using
+                // dopamine/acetylcholine modulation. Each outcome consolidated
+                // exactly once (tracked by applied_at timestamp).
+                {
+                    let (new_outcome, matching_suggestion) = {
+                        let guard = state.llm.lock_recover();
+                        let outcome = guard.llm_state.last_suggestion_outcome.clone();
+                        let suggestion = guard.llm_state.last_suggestion.clone();
+                        (outcome, suggestion)
+                    };
+                    if let (Some(outcome), Some(suggestion)) =
+                        (new_outcome, matching_suggestion)
+                    {
+                        if last_consolidated_at != Some(outcome.applied_at) {
+                            let natural_drift = lctx.outcome_tracker.natural_drift();
+                            let report = teacher_consolidator.consolidate(
+                                &outcome,
+                                &suggestion,
+                                natural_drift,
+                                &mut lctx.outcome_tracker.weights,
+                                &mut lctx.outcome_tracker.drift_detector,
+                                &mut arousal_state,
+                            );
+                            last_consolidated_at = Some(outcome.applied_at);
+                            // Journal: record the consolidation event for observability.
+                            if !matches!(report.verdict, "BELOW_DEADBAND") {
+                                let mut mx = state.metrics.lock_recover();
+                                mx.metrics.teacher_consolidations += 1;
+                                if report.verdict == "IMPROVED" {
+                                    mx.metrics.teacher_improvements += 1;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 let mut reactor_weight = state.metrics.lock_recover().reactor_event_weight;
                 reactor_weight = (reactor_weight * 0.75).clamp(0.0, 1.0);
