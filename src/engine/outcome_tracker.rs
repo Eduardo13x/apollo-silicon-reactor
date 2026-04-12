@@ -233,7 +233,7 @@ impl ExperienceMemory {
                 pressure_at_action: sum_pressure / count as f64,
                 pressure_drop: sum_drop / count as f64,
                 effective: eff_count * 2 >= count, // majority vote
-                workload: 0, // compressed summaries lose workload specificity
+                workload: 0,                       // compressed summaries lose workload specificity
             });
         }
     }
@@ -669,13 +669,13 @@ impl OutcomeTracker {
             *entry = *entry * 0.8 + elapsed_secs * 0.2;
 
             // Update weights
-            let weight = self
-                .weights
-                .entry(outcome.process_name.clone())
-                .or_insert(PatternWeight {
-                    throttle_count: 0,
-                    effective_count: 0,
-                });
+            let weight =
+                self.weights
+                    .entry(outcome.process_name.clone())
+                    .or_insert(PatternWeight {
+                        throttle_count: 0,
+                        effective_count: 0,
+                    });
             weight.throttle_count += 1;
             if effective {
                 weight.effective_count += 1;
@@ -710,10 +710,7 @@ impl OutcomeTracker {
 
         // Cap process_effect_time to 500 entries — evict farthest-from-default.
         if self.process_effect_time.len() > 500 {
-            let mut entries: Vec<(String, f64)> = self
-                .process_effect_time
-                .drain()
-                .collect();
+            let mut entries: Vec<(String, f64)> = self.process_effect_time.drain().collect();
             // Keep entries most different from default (30.0) — they carry signal.
             entries.sort_by(|a, b| {
                 let da = (a.1 - 30.0).abs();
@@ -727,11 +724,7 @@ impl OutcomeTracker {
         // Cap hop_groups to 300 entries — evict lowest-count groups.
         if self.hop_groups.len() > 300 {
             let mut entries: Vec<_> = self.hop_groups.drain().collect();
-            entries.sort_by(|a, b| {
-                b.1.throttle_count
-                    .cmp(&a.1.throttle_count)
-                    .reverse()
-            });
+            entries.sort_by(|a, b| b.1.throttle_count.cmp(&a.1.throttle_count).reverse());
             entries.truncate(200);
             self.hop_groups = entries.into_iter().collect();
         }
@@ -1507,7 +1500,9 @@ mod tests {
                 workload: 3,
             });
         }
-        assert!(mem.query_similar_contextual("Safari", 0.65, 0.10, 3).is_none());
+        assert!(mem
+            .query_similar_contextual("Safari", 0.65, 0.10, 3)
+            .is_none());
     }
 
     // ── Outcome acceleration tests (Phase 7) ──────────────────────────────────
@@ -1556,7 +1551,11 @@ mod tests {
         });
         assert_eq!(tracker.pending.len(), 2);
         let batch = tracker.urgency_flush(0.70); // pressure dropped to 0.70
-        assert_eq!(tracker.pending.len(), 0, "urgency flush should drain all pending");
+        assert_eq!(
+            tracker.pending.len(),
+            0,
+            "urgency flush should drain all pending"
+        );
         assert_eq!(batch.resolved_outcomes.len(), 2);
         // Both should be effective (0.85-0.70=0.15 > 0.01 and 0.82-0.70=0.12 > 0.01)
         assert_eq!(batch.effective_names.len(), 2);

@@ -515,8 +515,7 @@ mod tests {
         let mut analyzer = MemoryAnalyzer::new();
         let mut last = 0.0;
         for i in 0..10u64 {
-            let profile =
-                analyzer.analyze_process(42, "short", 100_000_000 + i * 50_000_000, 0, 0);
+            let profile = analyzer.analyze_process(42, "short", 100_000_000 + i * 50_000_000, 0, 0);
             last = profile.memory_leak_probability;
         }
         assert_eq!(last, 0.0, "short history must not flag as leak");

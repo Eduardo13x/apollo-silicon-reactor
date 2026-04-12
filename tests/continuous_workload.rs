@@ -58,14 +58,18 @@ fn workload_compilation_spike() {
         let effectiveness = (pressure - 0.30) / 0.55;
         let signal_quality = 0.80; // clean during compilation
         let (gate, agg, _) = step(&mut nl, signal_quality, effectiveness);
-        if !gate { gate_closures += 1; }
+        if !gate {
+            gate_closures += 1;
+        }
         max_aggregate = max_aggregate.max(agg);
     }
 
     // Phase 2: plateau at peak pressure (high effectiveness)
     for _ in 0..10 {
         let (gate, agg, _) = step(&mut nl, 0.78, 0.90);
-        if !gate { gate_closures += 1; }
+        if !gate {
+            gate_closures += 1;
+        }
         max_aggregate = max_aggregate.max(agg);
     }
 
@@ -167,13 +171,17 @@ fn workload_llm_steady() {
 
     for _ in 0..60 {
         // Deterministic noise in ±0.03 range
-        pseudo_noise = pseudo_noise.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        pseudo_noise = pseudo_noise
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let noise = ((pseudo_noise >> 33) as f64 / u32::MAX as f64) * 0.06 - 0.03;
         let signal_quality = (0.78 + noise * 0.5).clamp(0.0, 1.0);
         let effectiveness = (0.55 + noise).clamp(0.0, 1.0); // moderate effectiveness
 
         let (gate, _, _) = step(&mut nl, signal_quality, effectiveness);
-        if !gate { gate_closures += 1; }
+        if !gate {
+            gate_closures += 1;
+        }
     }
 
     // Invariants
@@ -242,7 +250,8 @@ fn workload_mixed_adversarial_raises_gate() {
     assert!(
         final_gate >= baseline_gate,
         "gate should not drop below baseline after adversarial regimes: baseline={}, final={}",
-        baseline_gate, final_gate
+        baseline_gate,
+        final_gate
     );
 
     // Ideally gate has risen — but only assert if velocity is substantial
@@ -250,7 +259,8 @@ fn workload_mixed_adversarial_raises_gate() {
         assert!(
             final_gate > 0.25,
             "with meta-velocity={:.3}, gate should exceed 0.25, got {}",
-            nl.l2_meta_velocity, final_gate
+            nl.l2_meta_velocity,
+            final_gate
         );
     }
 

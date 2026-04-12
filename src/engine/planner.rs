@@ -173,9 +173,8 @@ impl CalibrationRow {
     const MAX_FROZEN_CYCLES: u64 = 150;
 
     fn from_observation(obs: &MetricsObservation) -> Self {
-        let gate_c_would_fire =
-            obs.thrashing_score > Self::GATE_C_THRASHING
-                && obs.memory_pressure >= Self::GATE_C_PRESSURE_FLOOR;
+        let gate_c_would_fire = obs.thrashing_score > Self::GATE_C_THRASHING
+            && obs.memory_pressure >= Self::GATE_C_PRESSURE_FLOOR;
         Self {
             ts: Utc::now(),
             memory_pressure: obs.memory_pressure,
@@ -558,7 +557,10 @@ mod tests {
         let t0 = Utc::now();
         // Up, down, up, down — overall slope ≈ 0, steadiness ≈ 0.
         for (i, p) in [0.5, 0.6, 0.5, 0.6, 0.5].iter().enumerate() {
-            w.push(t0 + ChronoDuration::seconds(i as i64 * 30), obs(*p, 0.0, 0.0));
+            w.push(
+                t0 + ChronoDuration::seconds(i as i64 * 30),
+                obs(*p, 0.0, 0.0),
+            );
         }
         let s = w.steadiness(|o| o.memory_pressure);
         // Overall slope is exactly 0 → steadiness returns 0 by contract.
@@ -597,7 +599,9 @@ mod tests {
         // 0.025 per 30s = 0.000833/s — still below 0.005/s threshold.
         let hints = p.derive_hints();
         assert!(
-            !hints.iter().any(|h| matches!(h.kind, HintKind::PressureSpike { .. })),
+            !hints
+                .iter()
+                .any(|h| matches!(h.kind, HintKind::PressureSpike { .. })),
             "0.000833/s slope should NOT emit pressure spike"
         );
     }
@@ -688,10 +692,12 @@ mod tests {
         }];
         Planner::persist(&path, &hints).expect("persist must succeed");
         let raw = std::fs::read_to_string(&path).expect("file must exist");
-        let parsed: PlannerHintFile =
-            serde_json::from_str(&raw).expect("JSON must be valid");
+        let parsed: PlannerHintFile = serde_json::from_str(&raw).expect("JSON must be valid");
         assert_eq!(parsed.hints.len(), 1);
-        assert!(matches!(parsed.hints[0].kind, HintKind::PressureSpike { .. }));
+        assert!(matches!(
+            parsed.hints[0].kind,
+            HintKind::PressureSpike { .. }
+        ));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -718,7 +724,10 @@ mod tests {
             kills_applied: 0,
         };
         let row = CalibrationRow::from_observation(&obs);
-        assert!(row.gate_c_would_fire, "thrashing 19890 + pressure 0.81 must trigger gate_c");
+        assert!(
+            row.gate_c_would_fire,
+            "thrashing 19890 + pressure 0.81 must trigger gate_c"
+        );
         assert!(!row.stall_above_threshold, "stall 0.07 must NOT cross 0.85");
         assert_eq!(row.gate_c_thrashing_threshold, 5_000.0);
         assert_eq!(row.stall_threshold, 0.85);
@@ -747,15 +756,18 @@ mod tests {
         // the planner row, this test fails — and the calibration log
         // becomes silently misleading otherwise.
         assert_eq!(
-            CalibrationRow::GATE_C_THRASHING, 5_000.0,
+            CalibrationRow::GATE_C_THRASHING,
+            5_000.0,
             "gate_c thrashing threshold drifted from decide_actions::gate_c"
         );
         assert_eq!(
-            CalibrationRow::GATE_C_PRESSURE_FLOOR, 0.55,
+            CalibrationRow::GATE_C_PRESSURE_FLOOR,
+            0.55,
             "gate_c pressure floor drifted from decide_actions::gate_c"
         );
         assert_eq!(
-            CalibrationRow::STALL_THRESHOLD, 0.85,
+            CalibrationRow::STALL_THRESHOLD,
+            0.85,
             "stall threshold drifted from main.rs::record_stall_fraction"
         );
         assert_eq!(
@@ -764,11 +776,13 @@ mod tests {
             "cold boot window drifted from stability_oracle"
         );
         assert_eq!(
-            CalibrationRow::FG_FREEZE_TTL, 15,
+            CalibrationRow::FG_FREEZE_TTL,
+            15,
             "fg-renderer TTL drifted from chromium_manager"
         );
         assert_eq!(
-            CalibrationRow::MAX_FROZEN_CYCLES, 150,
+            CalibrationRow::MAX_FROZEN_CYCLES,
+            150,
             "max frozen cycles drifted from chromium_manager"
         );
     }
@@ -792,8 +806,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "two calls = two lines");
         // Each line must be valid JSON object.
         for line in &lines {
-            let _: serde_json::Value =
-                serde_json::from_str(line).expect("each line is valid JSON");
+            let _: serde_json::Value = serde_json::from_str(line).expect("each line is valid JSON");
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -808,7 +821,9 @@ mod tests {
         assert!(p.calibration_path.is_none(), "default: disabled");
         let p2 = p.with_calibration_log(PathBuf::from("/tmp/cal.jsonl"));
         assert_eq!(
-            p2.calibration_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            p2.calibration_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             Some("/tmp/cal.jsonl".to_string())
         );
     }

@@ -189,8 +189,7 @@ impl TelemetryLogger {
 
         // Check event triggers with cooldown to prevent I/O saturation.
         let event_cooldown_ok = self.last_event_dump_cycle == 0
-            || self.cycle_count.saturating_sub(self.last_event_dump_cycle)
-                >= EVENT_COOLDOWN_CYCLES;
+            || self.cycle_count.saturating_sub(self.last_event_dump_cycle) >= EVENT_COOLDOWN_CYCLES;
 
         let kind = if vec.p_oom_30s > 0.6 && event_cooldown_ok {
             DumpKind::OomRisk
@@ -336,7 +335,12 @@ impl TelemetryLogger {
         for _ in 0..n_vecs {
             let mut arr = [0f32; N_FEATURES];
             for f in arr.iter_mut() {
-                let bytes = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+                let bytes = [
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ];
                 *f = f32::from_le_bytes(bytes);
                 offset += 4;
             }
@@ -593,7 +597,11 @@ mod tests {
         let mut fresh = TelemetryLogger::new(dir.clone());
         assert_eq!(fresh.len(), 0);
         fresh.warm_start_from_dir(3);
-        assert!(fresh.len() > 100, "expected warm-start to load >100 vectors, got {}", fresh.len());
+        assert!(
+            fresh.len() > 100,
+            "expected warm-start to load >100 vectors, got {}",
+            fresh.len()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

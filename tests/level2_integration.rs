@@ -173,7 +173,16 @@ fn execute_non_allowlisted_sysctl_is_denied() {
     let mut caps = no_caps();
     caps.can_sysctl = true; // cap granted, but key is not in allowlist
 
-    let outcomes = execute_actions(actions, &caps, null_journal(), &mut frozen, &[], &[], None, false);
+    let outcomes = execute_actions(
+        actions,
+        &caps,
+        null_journal(),
+        &mut frozen,
+        &[],
+        &[],
+        None,
+        false,
+    );
     assert_eq!(
         outcomes.sysctl_applied, 0,
         "non-allowlisted sysctl must not be applied"
@@ -195,7 +204,16 @@ fn execute_sysctl_without_cap_is_skipped() {
     let mut frozen = HashSet::new();
     let caps = no_caps(); // can_sysctl = false
 
-    let outcomes = execute_actions(actions, &caps, null_journal(), &mut frozen, &[], &[], None, false);
+    let outcomes = execute_actions(
+        actions,
+        &caps,
+        null_journal(),
+        &mut frozen,
+        &[],
+        &[],
+        None,
+        false,
+    );
     assert_eq!(
         outcomes.sysctl_applied, 0,
         "sysctl without capability must be skipped"

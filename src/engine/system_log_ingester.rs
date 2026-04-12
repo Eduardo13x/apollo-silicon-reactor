@@ -297,16 +297,13 @@ impl SystemLogIngester {
             }
         }
 
-        child
-            .stdout
-            .take()
-            .and_then(|out| {
-                use std::io::Read;
-                let mut buf = String::new();
-                let mut reader = out;
-                reader.read_to_string(&mut buf).ok()?;
-                Some(buf)
-            })
+        child.stdout.take().and_then(|out| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let mut reader = out;
+            reader.read_to_string(&mut buf).ok()?;
+            Some(buf)
+        })
     }
 
     /// Parse raw log output into structured events.
@@ -412,11 +409,17 @@ impl SystemLogIngester {
 
 /// Extension trait for `std::process::Child` to add wait-with-timeout.
 trait ChildExt {
-    fn wait_timeout(&mut self, timeout: Duration) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn wait_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>>;
 }
 
 impl ChildExt for std::process::Child {
-    fn wait_timeout(&mut self, timeout: Duration) -> std::io::Result<Option<std::process::ExitStatus>> {
+    fn wait_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
         let start = Instant::now();
         loop {
             match self.try_wait()? {
@@ -479,11 +482,15 @@ mod tests {
 
     #[test]
     fn test_parse_jetsam_bracketed_name() {
-        let line = "2026-04-06 memorystatus: killing process 1234 [Safari] (per-process-limit) pid: 1234";
+        let line =
+            "2026-04-06 memorystatus: killing process 1234 [Safari] (per-process-limit) pid: 1234";
         let events = SystemLogIngester::parse_log_output(line);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            SystemEvent::OomKill { process_name, reason } => {
+            SystemEvent::OomKill {
+                process_name,
+                reason,
+            } => {
                 assert_eq!(process_name, "Safari");
                 assert_eq!(reason, "per-process-limit");
             }
@@ -497,7 +504,10 @@ mod tests {
         let events = SystemLogIngester::parse_log_output(line);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            SystemEvent::OomKill { process_name, reason } => {
+            SystemEvent::OomKill {
+                process_name,
+                reason,
+            } => {
                 assert_eq!(process_name, "com.apple.WebKit");
                 assert_eq!(reason, "vm-pageshortage");
             }
@@ -511,7 +521,10 @@ mod tests {
         let events = SystemLogIngester::parse_log_output(line);
         assert!(!events.is_empty());
         match &events[0] {
-            SystemEvent::Crash { process_name, signal } => {
+            SystemEvent::Crash {
+                process_name,
+                signal,
+            } => {
                 assert_eq!(process_name, "myapp");
                 assert_eq!(signal, "EXC_CRASH");
             }
@@ -525,7 +538,10 @@ mod tests {
         let events = SystemLogIngester::parse_log_output(line);
         assert!(!events.is_empty());
         match &events[0] {
-            SystemEvent::Crash { process_name, signal } => {
+            SystemEvent::Crash {
+                process_name,
+                signal,
+            } => {
                 assert_eq!(process_name, "daemon_helper");
                 assert_eq!(signal, "SIGKILL");
             }

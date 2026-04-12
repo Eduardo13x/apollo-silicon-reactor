@@ -260,9 +260,7 @@ pub fn cpu_contention_ratio(prev: &RusageInfo, curr: &RusageInfo) -> Option<f64>
     /// because the scheduler does give it SOME time eventually.
     const MIN_ON_CPU_NS: u64 = 100_000; // 100 μs
 
-    let runnable_delta = curr
-        .runnable_time_ns
-        .saturating_sub(prev.runnable_time_ns);
+    let runnable_delta = curr.runnable_time_ns.saturating_sub(prev.runnable_time_ns);
     let on_cpu_delta = curr.on_cpu_ns().saturating_sub(prev.on_cpu_ns());
     let total = runnable_delta.saturating_add(on_cpu_delta);
     if total < IDLE_NOISE_FLOOR_NS {

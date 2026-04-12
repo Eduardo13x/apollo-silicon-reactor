@@ -320,7 +320,10 @@ pub fn execute_actions(
                         if caps.can_taskpolicy {
                             // Phase 2: direct Mach syscalls (~50µs vs ~5ms fork/exec).
                             if let Some(ref mut mgr) = qos_mgr {
-                                mgr.set_tier(*pid, crate::engine::mach_qos::SchedulingTier::Foreground);
+                                mgr.set_tier(
+                                    *pid,
+                                    crate::engine::mach_qos::SchedulingTier::Foreground,
+                                );
                                 mgr.set_latency_and_throughput(
                                     *pid,
                                     LatencyTier::Interactive,
@@ -381,7 +384,8 @@ pub fn execute_actions(
                                     crate::engine::mach_qos::SchedulingTier::Background
                                 // E-cores only
                                 } else {
-                                    crate::engine::mach_qos::SchedulingTier::Normal // scheduler decides, less invasive than E-cores-only
+                                    crate::engine::mach_qos::SchedulingTier::Normal
+                                    // scheduler decides, less invasive than E-cores-only
                                 };
                                 mgr.set_tier(*pid, sched_tier);
                                 let lat = if aggressive {
@@ -484,7 +488,10 @@ pub fn execute_actions(
                             if rc == 0 {
                                 // Restore I/O tier to Standard on unfreeze.
                                 if caps.can_taskpolicy {
-                                    apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Standard);
+                                    apply_io_tier(
+                                        *pid,
+                                        crate::engine::io_tiering::IOTier::Standard,
+                                    );
                                     // Warmup boost: temporary Foreground QoS burst accelerates
                                     // working-set reload from the compressor on resume.
                                     // Next cycle re-evaluates and may demote back.
@@ -714,14 +721,24 @@ mod tests {
             })
             .collect();
         let outcomes = execute_actions(
-            actions, &make_caps(), &journal, &mut frozen, &[], &[], None, false,
+            actions,
+            &make_caps(),
+            &journal,
+            &mut frozen,
+            &[],
+            &[],
+            None,
+            false,
         );
         // All 5 ghost pids are dead → should be removed from frozen set.
         // unfreezes_applied stays 0 because the live-branch (which increments
         // the counter) never runs for dead pids — but the frozen set MUST be
         // cleaned up so the daemon doesn't get stuck thinking they're still
         // frozen forever.
-        assert!(frozen.is_empty(), "dead pids must be removed from frozen set, still holds: {frozen:?}");
+        assert!(
+            frozen.is_empty(),
+            "dead pids must be removed from frozen set, still holds: {frozen:?}"
+        );
         assert_eq!(outcomes.failures, 0);
     }
 

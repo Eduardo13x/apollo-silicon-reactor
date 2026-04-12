@@ -384,8 +384,16 @@ fn concurrent_freeze_unfreeze_frozen_set_is_consistent() {
                     .collect();
                 let mut f = frozen.lock().unwrap();
                 // Dead PIDs → PID validation skips them; frozen set should not grow.
-                let _outcomes =
-                    execute_actions(actions, &no_caps(), null_journal(), &mut f, &[], &[], None, false);
+                let _outcomes = execute_actions(
+                    actions,
+                    &no_caps(),
+                    null_journal(),
+                    &mut f,
+                    &[],
+                    &[],
+                    None,
+                    false,
+                );
             })
         })
         .collect();

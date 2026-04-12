@@ -36,14 +36,14 @@ use apollo_optimizer::engine::compressor_aware::{
     scan_regions, MemoryAction,
 };
 use apollo_optimizer::engine::daemon_helpers::{
-    audit_log, battery_pressure_boost, frozen_state_path, governor_state_path, holt_winters_path,
-    hop_groups_path, journal_path, kill_switch_path, learned_state_path, load_frozen_state,
-    load_governor_state, load_wake_state, markov_path, merge_seed_into, metrics_path,
-    overflow_history_path, parse_profile, pid_start_time, predictive_agent_path, rl_threshold_path,
-    detect_prior_crash, remove_crash_sentinel, should_rotate_oldest, should_unfreeze,
+    audit_log, battery_pressure_boost, detect_prior_crash, frozen_state_path, governor_state_path,
+    holt_winters_path, hop_groups_path, journal_path, kill_switch_path, learned_state_path,
+    load_frozen_state, load_governor_state, load_wake_state, markov_path, merge_seed_into,
+    metrics_path, overflow_history_path, parse_profile, pid_start_time, predictive_agent_path,
+    remove_crash_sentinel, rl_threshold_path, should_rotate_oldest, should_unfreeze,
     signal_intelligence_path, skills_path, socket_path, spotlight_set_indexing,
-    telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_pids,
-    wake_state_path, write_frozen_state, write_governor_state, write_wake_state,
+    telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_pids, wake_state_path,
+    write_frozen_state, write_governor_state, write_wake_state,
 };
 use apollo_optimizer::engine::effective_pressure;
 use apollo_optimizer::engine::execute_actions::execute_actions;
@@ -57,7 +57,9 @@ use apollo_optimizer::engine::iokit_sensors::{HardwareSnapshot, ThermalState};
 use apollo_optimizer::engine::jetsam_control;
 use apollo_optimizer::engine::kqueue_pressure;
 use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
-use apollo_optimizer::engine::learned_state::{LearnableParams, LearnedState, RestoreQualityMonitor};
+use apollo_optimizer::engine::learned_state::{
+    LearnableParams, LearnedState, RestoreQualityMonitor,
+};
 use apollo_optimizer::engine::llm::{
     delete_file_best_effort, feedback_path_root, load_repo_config, pending_trial_path,
     policy_path_root, read_json, state_paths_root, suggestions_path_root, write_json,
@@ -751,7 +753,9 @@ fn main() -> anyhow::Result<()> {
                     "cautious_cycles": 50,
                     "action": "freeze+throttle thresholds raised +0.10 for first 50 cycles",
                 }));
-                tracing::warn!("apollo: prior session ended abnormally — cautious mode active for 50 cycles");
+                tracing::warn!(
+                    "apollo: prior session ended abnormally — cautious mode active for 50 cycles"
+                );
             }
             let mut cautious_cycles_remaining: u32 = if prior_crash { 50 } else { 0 };
 
@@ -842,15 +846,17 @@ fn main() -> anyhow::Result<()> {
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
             // TelemetryLogger: ring-buffer collection for time-series training data.
             // [Welch 1967, Tuli et al. 2022] — event-triggered dumps capture pre-anomaly context.
-            let mut telemetry_logger = apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(
-                PathBuf::from(telemetry_output_dir()),
-            );
+            let mut telemetry_logger =
+                apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(PathBuf::from(
+                    telemetry_output_dir(),
+                ));
             // Warm-start: reload recent history so anomaly detector skips cold-start.
             // [Gray & Reuter 1992] §11.3 — restart protocols restore in-flight state.
             telemetry_logger.warm_start_from_dir(3);
             // StabilityOracle: aggregate jank + zombie + swap-spike into RL reward.
             // [Schulman et al. 2017] PPO per-cycle reward; [Nygard 2018] cascading instability.
-            let mut stability_oracle = apollo_optimizer::engine::stability_oracle::StabilityOracle::new();
+            let mut stability_oracle =
+                apollo_optimizer::engine::stability_oracle::StabilityOracle::new();
             let hw_path = PathBuf::from(holt_winters_path());
             let mut holt_winters = HoltWinters::load(&hw_path).unwrap_or_default();
             let mut hw_last_hour: Option<u8> = None;
@@ -939,7 +945,11 @@ fn main() -> anyhow::Result<()> {
             tracing::info!(
                 available = sleep_notifier.available,
                 "sleep_notifier: IOKit pre-sleep hook {}",
-                if sleep_notifier.available { "registered" } else { "unavailable (running without IOKit access)" }
+                if sleep_notifier.available {
+                    "registered"
+                } else {
+                    "unavailable (running without IOKit access)"
+                }
             );
             let mut overflow_guard = OverflowGuard::load_or_default(
                 std::path::Path::new(overflow_history_path()),
@@ -1004,11 +1014,15 @@ fn main() -> anyhow::Result<()> {
                 // BUG-01: WAL fallback — if LearnedState didn't carry a pending trial
                 // (e.g., daemon crashed before periodic persist), recover from WAL file.
                 if restored_trial_skill.is_none() {
-                    if let Ok(data) = apollo_optimizer::engine::types::HardPath::read_to_string_limited(
-                        &pending_trial_path(is_root),
-                        512,
-                    ) {
-                        restored_trial_skill = serde_json::from_str::<Option<(String, f64)>>(&data).ok().flatten();
+                    if let Ok(data) =
+                        apollo_optimizer::engine::types::HardPath::read_to_string_limited(
+                            &pending_trial_path(is_root),
+                            512,
+                        )
+                    {
+                        restored_trial_skill = serde_json::from_str::<Option<(String, f64)>>(&data)
+                            .ok()
+                            .flatten();
                     }
                 }
                 // apply() restores skills from learned_state.json if present,
@@ -1016,15 +1030,21 @@ fn main() -> anyhow::Result<()> {
                 // If skill_registry field is absent (old file), the legacy load is kept.
                 // Returns (overflow_history, frozen_pids, arousal_state) for
                 // components that need caller-side wiring.
-                let (ls_overflow_history, ls_frozen_pids, ls_arousal, ls_baselines, restored_lp, restored_nl) =
-                    learned.apply(
-                        &mut signal_intel,
-                        &mut outcome_tracker,
-                        &mut specialist_accuracy,
-                        &mut skill_registry,
-                        &mut effectiveness_tracker,
-                        Some(&mut causal_graph),
-                    );
+                let (
+                    ls_overflow_history,
+                    ls_frozen_pids,
+                    ls_arousal,
+                    ls_baselines,
+                    restored_lp,
+                    restored_nl,
+                ) = learned.apply(
+                    &mut signal_intel,
+                    &mut outcome_tracker,
+                    &mut specialist_accuracy,
+                    &mut skill_registry,
+                    &mut effectiveness_tracker,
+                    Some(&mut causal_graph),
+                );
                 learnable_params = restored_lp;
                 if let Some(nl) = restored_nl {
                     nested_learner = nl;
@@ -1240,7 +1260,8 @@ fn main() -> anyhow::Result<()> {
             // System log ingester: polls macOS unified logs for OOM/crash events (Phase 5).
             // Runs in background thread to avoid blocking the daemon hot path with
             // `log show` subprocess latency (100-300ms when it fires).
-            let mut log_ingester = apollo_optimizer::engine::system_log_ingester::SystemLogIngester::new();
+            let mut log_ingester =
+                apollo_optimizer::engine::system_log_ingester::SystemLogIngester::new();
             log_ingester.start_background();
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
@@ -1361,8 +1382,7 @@ fn main() -> anyhow::Result<()> {
                 // In dry-run the condvar wait is already 100ms; skip the additional floor.
                 let min_inter_cycle_ms = if dry_run { 0 } else { 300 };
                 let since_last = last_cycle_end.elapsed();
-                if min_inter_cycle_ms > 0
-                    && since_last < Duration::from_millis(min_inter_cycle_ms)
+                if min_inter_cycle_ms > 0 && since_last < Duration::from_millis(min_inter_cycle_ms)
                 {
                     thread::sleep(Duration::from_millis(min_inter_cycle_ms) - since_last);
                 }
@@ -1413,7 +1433,8 @@ fn main() -> anyhow::Result<()> {
                         // Zero-allocation direct byte write — no String, no fmt overhead.
                         // [Drepper 2007 "What Every Programmer Should Know About Memory"]
                         // stack-allocate digit buffer, write directly into batch Vec.
-                        const PREFIX: &[u8] = b"{\"type\":\"StatusPush\",\"payload\":{\"metrics\":{\"cycles\":";
+                        const PREFIX: &[u8] =
+                            b"{\"type\":\"StatusPush\",\"payload\":{\"metrics\":{\"cycles\":";
                         const SUFFIX: &[u8] = b"}}}\n";
                         dry_run_batch.extend_from_slice(PREFIX);
                         {
@@ -1553,7 +1574,10 @@ fn main() -> anyhow::Result<()> {
                     let mut other_pids = Vec::new();
                     for (&pid, entry) in frozen_state.iter() {
                         let name = entry.process_name.as_deref().unwrap_or("");
-                        if interactive_pats.iter().any(|pat| name.contains(pat.as_str())) {
+                        if interactive_pats
+                            .iter()
+                            .any(|pat| name.contains(pat.as_str()))
+                        {
                             interactive_pids.push(pid);
                         } else {
                             other_pids.push(pid);
@@ -1575,8 +1599,7 @@ fn main() -> anyhow::Result<()> {
                         let mut metrics = state.metrics.lock_recover();
                         metrics.metrics.wake_events += 1;
                         metrics.metrics.post_wake_grace_entries += 1;
-                        metrics.metrics.post_wake_defensive_unfreezes +=
-                            total_queued + turbo_count;
+                        metrics.metrics.post_wake_defensive_unfreezes += total_queued + turbo_count;
                         metrics.metrics.unfreezes_applied += total_queued + turbo_count;
                         metrics.metrics.throttle_reverted += total_queued + turbo_count;
                     }
@@ -1734,7 +1757,10 @@ fn main() -> anyhow::Result<()> {
                     if cycles_elapsed >= 1 {
                         let hit = foreground_app
                             .as_deref()
-                            .map(|fa| fa.to_ascii_lowercase().contains(&predicted.to_ascii_lowercase()))
+                            .map(|fa| {
+                                fa.to_ascii_lowercase()
+                                    .contains(&predicted.to_ascii_lowercase())
+                            })
                             .unwrap_or(false);
                         if hit {
                             markov_hit_count += 1;
@@ -2016,8 +2042,7 @@ fn main() -> anyhow::Result<()> {
                 // sysinfo::System::processes() which reflects the current
                 // kernel process table). Any frozen PID absent here is dead.
                 {
-                    let live_pids: HashSet<u32> =
-                        proc_snaps.iter().map(|p| p.pid).collect();
+                    let live_pids: HashSet<u32> = proc_snaps.iter().map(|p| p.pid).collect();
                     let mut frozen_guard = state.frozen_state.lock_recover();
                     let before = frozen_guard.len();
                     frozen_guard.retain(|pid, _| live_pids.contains(pid));
@@ -2504,9 +2529,7 @@ fn main() -> anyhow::Result<()> {
                         let suggestion = guard.llm_state.last_suggestion.clone();
                         (outcome, suggestion)
                     };
-                    if let (Some(outcome), Some(suggestion)) =
-                        (new_outcome, matching_suggestion)
-                    {
+                    if let (Some(outcome), Some(suggestion)) = (new_outcome, matching_suggestion) {
                         if last_consolidated_at != Some(outcome.applied_at) {
                             let natural_drift = lctx.outcome_tracker.natural_drift();
                             let report = teacher_consolidator.consolidate(
@@ -3934,14 +3957,14 @@ fn main() -> anyhow::Result<()> {
                         "modelmanagerd",        // On-device model cache
                         "rtcreportingd",        // RealTimeComm diagnostics
                         // Added 2026-04-09 from journal boost audit:
-                        "cfprefsd",             // Preference caching daemon — I/O-bound, 33 false boosts
-                        "xpcproxy",             // XPC service launcher — ephemeral, 40 false boosts
-                        "log",                  // Unified log CLI — spawned by log_ingester, 30 false boosts
-                        "apollo-optimizerd",    // Self — execute_actions blocks but 45 wasted journal entries
-                        "apollo-optimizerctl",  // Our own CLI client
-                        "diagnostics_agent",    // System diagnostics — throttled 749x but also boosted
-                        "socketfilterfw",       // Application firewall — I/O-bound, not interactive
-                        "stable",              // /usr/libexec/stable — system process, 67 false boosts
+                        "cfprefsd", // Preference caching daemon — I/O-bound, 33 false boosts
+                        "xpcproxy", // XPC service launcher — ephemeral, 40 false boosts
+                        "log",      // Unified log CLI — spawned by log_ingester, 30 false boosts
+                        "apollo-optimizerd", // Self — execute_actions blocks but 45 wasted journal entries
+                        "apollo-optimizerctl", // Our own CLI client
+                        "diagnostics_agent", // System diagnostics — throttled 749x but also boosted
+                        "socketfilterfw",    // Application firewall — I/O-bound, not interactive
+                        "stable", // /usr/libexec/stable — system process, 67 false boosts
                     ];
                     let model = state.usage.lock_recover();
                     let interactive_names: HashSet<&str> = model
@@ -4923,8 +4946,7 @@ fn main() -> anyhow::Result<()> {
                         0.0
                     };
                     // Only train hazard model when swap is actively growing (real OOM risk).
-                    let swap_growing =
-                        snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
+                    let swap_growing = snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
                     if sr > 0.10 && swap_growing {
                         lctx.signal_intel.record_overflow(
                             snapshot.pressure.memory_pressure,
@@ -5275,9 +5297,7 @@ fn main() -> anyhow::Result<()> {
                     .record_thrashing_score(pressure_collector.latest().thrashing_score);
                 // System-wide CPU stall fraction from the global contention
                 // tracker — fraction of tracked pids with PSI ratio ≥ 0.5.
-                if let Ok(tracker) =
-                    apollo_optimizer::engine::contention_tracker::global().lock()
-                {
+                if let Ok(tracker) = apollo_optimizer::engine::contention_tracker::global().lock() {
                     // 0.85: see metrics-population site for the rationale —
                     // Darwin's runnable counter saturates above 0.5 under any
                     // normal load, so a lower threshold misclassifies normal
@@ -5474,9 +5494,8 @@ fn main() -> anyhow::Result<()> {
                     // renderers BEFORE rustc/cargo/clang demand RAM. This is
                     // what prevents OOM-driven reboots on 8GB systems: bulkhead
                     // renderer memory from build memory.
-                    chromium_mgr.set_build_preemption(
-                        win_workload_intent == WorkloadIntent::BuildSession,
-                    );
+                    chromium_mgr
+                        .set_build_preemption(win_workload_intent == WorkloadIntent::BuildSession);
                     // Pause freeze decisions during window ops / app launches
                     chromium_mgr.set_fluidity_context(
                         fluidity_state.window_op_active(),
@@ -6324,7 +6343,9 @@ fn main() -> anyhow::Result<()> {
                         &mut prev_workload_mode,
                         &mut arousal_state,
                         pending_trial_skill.clone(),
-                        last_specialist_votes.as_ref().map(|(v, i)| (v.as_slice(), *i)),
+                        last_specialist_votes
+                            .as_ref()
+                            .map(|(v, i)| (v.as_slice(), *i)),
                         &mut log_ingester,
                         &mut learnable_params,
                         ls_path.to_str().unwrap_or(""),

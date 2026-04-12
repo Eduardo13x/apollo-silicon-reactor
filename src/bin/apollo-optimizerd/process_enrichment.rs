@@ -203,9 +203,7 @@ pub fn build_enriched_process_data_with_tree(
             // or when the process was idle) and stores the new sample as
             // the next baseline. The mutex is held only for the observe
             // call itself; no other I/O happens under it.
-            if let Ok(mut tracker) =
-                apollo_optimizer::engine::contention_tracker::global().lock()
-            {
+            if let Ok(mut tracker) = apollo_optimizer::engine::contention_tracker::global().lock() {
                 if let Some(ratio) = tracker.observe(pid_u32, ri.clone()) {
                     contention_map.insert(pid_u32, ratio);
                 }
@@ -290,8 +288,8 @@ pub fn build_enriched_process_data_with_tree(
         // (~3 µs on M1) per pid, only here in enrichment. The result is
         // cached on ProcessSnapshot so downstream consumers don't repeat
         // the syscall.
-        let is_app_bundle = apollo_optimizer::engine::proc_taskinfo::is_user_app_bundle(pid_u32)
-            .unwrap_or(false);
+        let is_app_bundle =
+            apollo_optimizer::engine::proc_taskinfo::is_user_app_bundle(pid_u32).unwrap_or(false);
 
         proc_snaps.push(ProcessSnapshot {
             pid: pid_u32,

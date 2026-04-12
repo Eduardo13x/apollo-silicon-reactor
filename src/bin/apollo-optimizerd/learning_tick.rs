@@ -25,16 +25,18 @@ use apollo_optimizer::engine::daemon_state::SharedState;
 use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_optimizer::engine::execute_actions::ExecuteOutcomes;
 use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
-use apollo_optimizer::engine::learned_state::{LearnableParams, LearnedState, RestoreQualityMonitor};
+use apollo_optimizer::engine::learned_state::{
+    LearnableParams, LearnedState, RestoreQualityMonitor,
+};
 use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningPipeline};
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::nars_belief::{ArousalState, Salience};
+use apollo_optimizer::engine::nested_learner::NestedLearner;
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
 use apollo_optimizer::engine::predictive_agent::{Intervention, SpecialistVote};
 use apollo_optimizer::engine::signal_intelligence::SignalDigest;
 use apollo_optimizer::engine::system_log_ingester::{SystemEvent, SystemLogIngester};
 use apollo_optimizer::engine::types::{FrozenPidEntry, FrozenStatePersisted};
-use apollo_optimizer::engine::nested_learner::NestedLearner;
 use apollo_optimizer::engine::workload_classifier::WorkloadMode;
 
 /// Run all per-cycle learning pipeline work.
@@ -342,7 +344,8 @@ pub fn run_learning_tick<'a>(
                         "{{\"process\":{:?},\"effectiveness\":{:.3},\"pressure\":{:.3},\"workload\":{:?},\"cycle\":{}}}\n",
                         name, w.effectiveness(), pressure, workload, cycle_count
                     );
-                    let novel_path = apollo_optimizer::engine::daemon_helpers::novel_patterns_path();
+                    let novel_path =
+                        apollo_optimizer::engine::daemon_helpers::novel_patterns_path();
                     let _ = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
@@ -407,16 +410,22 @@ pub fn run_learning_tick<'a>(
             let effective = post_pressure < pre_pressure - 0.01;
             {
                 let skill_name = format!("throttle:{}", name);
-                lctx.skill_registry
-                    .record_result_with_pressure(&skill_name, effective, pre_pressure as f32);
+                lctx.skill_registry.record_result_with_pressure(
+                    &skill_name,
+                    effective,
+                    pre_pressure as f32,
+                );
             }
             // Also match pending_trial_skill: induced skills (group:/batch:)
             // that were trialed get outcome feedback through their skill name.
             if let Some((ref trial_name, _)) = pending_trial_skill {
                 // Check if this process is a target of the trialed skill.
                 // The trial skill targets may include this process name.
-                lctx.skill_registry
-                    .record_result_with_pressure(trial_name, effective, pre_pressure as f32);
+                lctx.skill_registry.record_result_with_pressure(
+                    trial_name,
+                    effective,
+                    pre_pressure as f32,
+                );
             }
 
             let obs = LearningObservation {
@@ -435,8 +444,7 @@ pub fn run_learning_tick<'a>(
             // 0.02 maps a 2pp drop to 1.0, a 1pp drop to 0.5 — matches real macOS behavior.
             // Context flow: L0 quality weights how much this outcome shifts L1 aggregate.
             {
-                let effectiveness =
-                    ((pre_pressure - post_pressure) / 0.02).clamp(0.0, 1.0);
+                let effectiveness = ((pre_pressure - post_pressure) / 0.02).clamp(0.0, 1.0);
                 if nested_learner.tick_l1(effectiveness) {
                     nested_learner.flush_l2();
                 }
@@ -466,11 +474,8 @@ pub fn run_learning_tick<'a>(
                 WorkloadMode::Browsing => 3,
                 WorkloadMode::Idle => 0,
             };
-            lctx.signal_intel.zone_feedback_workload(
-                pressure,
-                effectiveness > 0.50,
-                wl_id,
-            );
+            lctx.signal_intel
+                .zone_feedback_workload(pressure, effectiveness > 0.50, wl_id);
         }
     }
 
@@ -535,8 +540,7 @@ pub fn run_learning_tick<'a>(
                     let mem_pressure = snapshot.pressure.memory_pressure;
                     let swap_ratio = snapshot.pressure.swap_used_bytes as f64
                         / (snapshot.pressure.swap_total_bytes.max(1) as f64);
-                    let swap_growing =
-                        snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
+                    let swap_growing = snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
                     if swap_ratio > 0.10 && swap_growing {
                         lctx.signal_intel.record_overflow(
                             mem_pressure,
@@ -598,9 +602,8 @@ pub fn run_learning_tick<'a>(
         let raw_effectiveness = lctx.outcome_tracker.overall_effectiveness();
         let effectiveness = 0.70 * raw_effectiveness + 0.30 * nested_learner.l2_context;
         // Compute param delta as proxy for velocity: zone alpha change rate
-        let zone_delta = (signal_digest.pressure_smooth
-            - lctx.signal_intel.effective_zones(0).0)
-            .abs();
+        let zone_delta =
+            (signal_digest.pressure_smooth - lctx.signal_intel.effective_zones(0).0).abs();
         learnable_params.meta_learn(effectiveness, zone_delta);
     }
 

@@ -10,8 +10,8 @@
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};

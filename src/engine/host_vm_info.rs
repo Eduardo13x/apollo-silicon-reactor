@@ -97,19 +97,12 @@ impl VmRate {
             cow_faults_per_sec: curr.cow_faults.saturating_sub(prev.cow_faults) as f64 / div,
             pageins_per_sec: curr.pageins.saturating_sub(prev.pageins) as f64 / div,
             pageouts_per_sec: curr.pageouts.saturating_sub(prev.pageouts) as f64 / div,
-            compressions_per_sec: curr
-                .compressions
-                .saturating_sub(prev.compressions) as f64
-                / div,
-            decompressions_per_sec: curr
-                .decompressions
-                .saturating_sub(prev.decompressions) as f64
+            compressions_per_sec: curr.compressions.saturating_sub(prev.compressions) as f64 / div,
+            decompressions_per_sec: curr.decompressions.saturating_sub(prev.decompressions) as f64
                 / div,
             swapins_per_sec: curr.swapins.saturating_sub(prev.swapins) as f64 / div,
             swapouts_per_sec: curr.swapouts.saturating_sub(prev.swapouts) as f64 / div,
-            reactivations_per_sec: curr
-                .reactivations
-                .saturating_sub(prev.reactivations) as f64
+            reactivations_per_sec: curr.reactivations.saturating_sub(prev.reactivations) as f64
                 / div,
             purges_per_sec: curr.purges.saturating_sub(prev.purges) as f64 / div,
         }

@@ -21,12 +21,12 @@ use std::collections::HashMap;
 use crate::engine::causal_graph::{CausalEdge, CausalGraph};
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
 use crate::engine::nars_belief::ArousalState;
+use crate::engine::nested_learner::NestedLearner;
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
 use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
 use crate::engine::overflow_guard::OverflowHistory;
 use crate::engine::predictive_agent::SpecialistAccuracyTracker;
 use crate::engine::process_baseline::ProcessBaselineMap;
-use crate::engine::nested_learner::NestedLearner;
 use crate::engine::signal_intelligence::{SignalIntelligence, SignalIntelligencePersisted};
 use crate::engine::types::FrozenStatePersisted;
 
@@ -316,7 +316,8 @@ impl LearnableParams {
             // Converged: slow down — multiply learning rates ×0.8
             self.zone_alpha *= 0.8;
             self.hazard_lr *= 0.8;
-            self.nars_decay_factor = (self.nars_decay_factor * 1.005).min(0.99); // slower forgetting
+            self.nars_decay_factor = (self.nars_decay_factor * 1.005).min(0.99);
+            // slower forgetting
         }
         // High velocity → actively adapting, no change needed
 
@@ -1363,7 +1364,10 @@ mod tests {
         assert!(
             lp.zone_alpha > alpha_before || lp.hazard_lr > lr_before,
             "stuck system should increase learning rates: zone_alpha {} vs {}, hazard_lr {} vs {}",
-            lp.zone_alpha, alpha_before, lp.hazard_lr, lr_before
+            lp.zone_alpha,
+            alpha_before,
+            lp.hazard_lr,
+            lr_before
         );
     }
 

@@ -4,9 +4,7 @@
 //! out of the main daemon loop into a dedicated background thread that polls
 //! at a configurable interval.  The main loop reads cached data in <1 μs.
 
-use crate::engine::cpu_saturation::{
-    self as cpu_sat, CpuSaturation, PerCoreTicks,
-};
+use crate::engine::cpu_saturation::{self as cpu_sat, CpuSaturation, PerCoreTicks};
 use crate::engine::host_vm_info::{self, VmPageStats, VmRate};
 use crate::engine::sysctl_direct;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -102,8 +100,7 @@ impl PressureCollector {
                 let mut prev_cpu_ticks: Vec<PerCoreTicks> = Vec::new();
 
                 loop {
-                    let (mem_pressure, vm_sample, swap_used, swap_total) =
-                        collect_pressure_facts();
+                    let (mem_pressure, vm_sample, swap_used, swap_total) = collect_pressure_facts();
                     let curr_cpu_ticks = cpu_sat::read_per_core_ticks();
                     let now = Instant::now();
                     let swap_delta = match (prev_swap_used, prev_swap_at) {
@@ -134,10 +131,7 @@ impl PressureCollector {
                     // CPU saturation: compute vs prev sample, then update prev.
                     // The compute() helper returns Default on empty/mismatched
                     // samples, so the first cycle naturally yields no signal.
-                    let cpu_saturation = CpuSaturation::compute(
-                        &prev_cpu_ticks,
-                        &curr_cpu_ticks,
-                    );
+                    let cpu_saturation = CpuSaturation::compute(&prev_cpu_ticks, &curr_cpu_ticks);
                     prev_cpu_ticks = curr_cpu_ticks;
 
                     *c.lock_recover() = PressureData {

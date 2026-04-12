@@ -539,7 +539,8 @@ impl ChromiumManager {
         let mut actions: Vec<ChromiumAction> = Vec::new();
         // Helper: true when a ThawRenderer for `pid` is already queued.
         let already_thawing = |acts: &[ChromiumAction], pid: u32| {
-            acts.iter().any(|a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == pid))
+            acts.iter()
+                .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == pid))
         };
 
         // Determine which browser is in the foreground (by foreground_pid)
@@ -564,7 +565,10 @@ impl ChromiumManager {
             if let Some(new_fg) = &fg_browser {
                 for (&pid, info) in &self.renderers {
                     if &info.browser == new_fg && info.frozen && !main_frozen.contains(&pid) {
-                        actions.push(ChromiumAction::ThawRenderer { pid, name: info.name.clone() });
+                        actions.push(ChromiumAction::ThawRenderer {
+                            pid,
+                            name: info.name.clone(),
+                        });
                     }
                 }
             }
@@ -595,7 +599,10 @@ impl ChromiumManager {
                         && !main_frozen.contains(&pid)
                         && !already_thawing(&actions, pid)
                     {
-                        actions.push(ChromiumAction::ThawRenderer { pid, name: info.name.clone() });
+                        actions.push(ChromiumAction::ThawRenderer {
+                            pid,
+                            name: info.name.clone(),
+                        });
                         tracing::info!(
                             browser = predicted_browser.as_str(),
                             prob = prob,
@@ -633,7 +640,10 @@ impl ChromiumManager {
             // Thaw check 1: frozen renderer with CPU spike
             // (rare — would mean SIGSTOP failed or OS resumed it externally)
             if info.frozen && info.cpu_pct > THAW_CPU_THRESHOLD {
-                actions.push(ChromiumAction::ThawRenderer { pid: *pid, name: info.name.clone() });
+                actions.push(ChromiumAction::ThawRenderer {
+                    pid: *pid,
+                    name: info.name.clone(),
+                });
                 continue;
             }
 
@@ -646,7 +656,10 @@ impl ChromiumManager {
                 && info.frozen_rss_baseline > 0
                 && info.memory_bytes < info.frozen_rss_baseline / 2
             {
-                actions.push(ChromiumAction::ThawRenderer { pid: *pid, name: info.name.clone() });
+                actions.push(ChromiumAction::ThawRenderer {
+                    pid: *pid,
+                    name: info.name.clone(),
+                });
                 tracing::info!(
                     pid = *pid,
                     name = info.name.as_str(),
@@ -669,11 +682,11 @@ impl ChromiumManager {
                 .as_ref()
                 .map(|fb| fb == &info.browser)
                 .unwrap_or(false);
-            if info.frozen
-                && is_fg_browser
-                && info.frozen_cycles >= MAX_FOREGROUND_FROZEN_CYCLES
-            {
-                actions.push(ChromiumAction::ThawRenderer { pid: *pid, name: info.name.clone() });
+            if info.frozen && is_fg_browser && info.frozen_cycles >= MAX_FOREGROUND_FROZEN_CYCLES {
+                actions.push(ChromiumAction::ThawRenderer {
+                    pid: *pid,
+                    name: info.name.clone(),
+                });
                 continue;
             }
 
@@ -682,7 +695,10 @@ impl ChromiumManager {
             // frozen if a foreground change was missed.
             // [Denning 1968] A process suspended too long must be reintegrated.
             if info.frozen && info.frozen_cycles >= MAX_FROZEN_CYCLES {
-                actions.push(ChromiumAction::ThawRenderer { pid: *pid, name: info.name.clone() });
+                actions.push(ChromiumAction::ThawRenderer {
+                    pid: *pid,
+                    name: info.name.clone(),
+                });
                 continue;
             }
 
@@ -690,7 +706,10 @@ impl ChromiumManager {
             // Only emit once per renderer, not every cycle (mach_qos.set_tier is sticky)
             // (`is_fg_browser` was already computed above for the foreground TTL check.)
             if !is_fg_browser && !info.frozen && !self.ecore_demoted.contains(pid) {
-                actions.push(ChromiumAction::DemoteToEcores { pid: *pid, name: info.name.clone() });
+                actions.push(ChromiumAction::DemoteToEcores {
+                    pid: *pid,
+                    name: info.name.clone(),
+                });
                 self.ecore_count += 1;
             }
         }
@@ -800,7 +819,11 @@ impl ChromiumManager {
                 for pid in sorted.iter().take(max_additional) {
                     if let Some(info) = self.renderers.get(pid) {
                         let mb = info.memory_bytes as f64 / 1_048_576.0;
-                        actions.push(ChromiumAction::FreezeRenderer { pid: *pid, name: info.name.clone(), estimated_mb: mb });
+                        actions.push(ChromiumAction::FreezeRenderer {
+                            pid: *pid,
+                            name: info.name.clone(),
+                            estimated_mb: mb,
+                        });
                     }
                 }
             }
@@ -830,7 +853,10 @@ impl ChromiumManager {
                 }
                 if let Some(info) = self.renderers.get(&pid) {
                     if !already_thawing(&actions, pid) {
-                        actions.push(ChromiumAction::ThawRenderer { pid, name: info.name.clone() });
+                        actions.push(ChromiumAction::ThawRenderer {
+                            pid,
+                            name: info.name.clone(),
+                        });
                     }
                 }
             }
@@ -1107,17 +1133,23 @@ mod tests {
 
     #[test]
     fn is_renderer_brave() {
-        assert!(ChromiumManager::is_renderer("Brave Browser Helper (Renderer)"));
+        assert!(ChromiumManager::is_renderer(
+            "Brave Browser Helper (Renderer)"
+        ));
     }
 
     #[test]
     fn is_renderer_chrome() {
-        assert!(ChromiumManager::is_renderer("Google Chrome Helper (Renderer)"));
+        assert!(ChromiumManager::is_renderer(
+            "Google Chrome Helper (Renderer)"
+        ));
     }
 
     #[test]
     fn is_renderer_edge() {
-        assert!(ChromiumManager::is_renderer("Microsoft Edge Helper (Renderer)"));
+        assert!(ChromiumManager::is_renderer(
+            "Microsoft Edge Helper (Renderer)"
+        ));
     }
 
     #[test]
@@ -1189,7 +1221,9 @@ mod tests {
         assert!(ChromiumManager::is_gpu_helper("Brave Browser Helper (GPU)"));
         assert!(ChromiumManager::is_gpu_helper("Google Chrome Helper (GPU)"));
         assert!(ChromiumManager::is_gpu_helper("Slack Helper (GPU)"));
-        assert!(!ChromiumManager::is_gpu_helper("Brave Browser Helper (Renderer)"));
+        assert!(!ChromiumManager::is_gpu_helper(
+            "Brave Browser Helper (Renderer)"
+        ));
         assert!(!ChromiumManager::is_gpu_helper("Brave Browser"));
     }
 
@@ -1197,37 +1231,58 @@ mod tests {
 
     #[test]
     fn browser_name_brave() {
-        assert_eq!(ChromiumManager::browser_name("Brave Browser Helper (Renderer)"), "Brave Browser");
+        assert_eq!(
+            ChromiumManager::browser_name("Brave Browser Helper (Renderer)"),
+            "Brave Browser"
+        );
     }
 
     #[test]
     fn browser_name_chrome() {
-        assert_eq!(ChromiumManager::browser_name("Google Chrome Helper (Renderer)"), "Google Chrome");
+        assert_eq!(
+            ChromiumManager::browser_name("Google Chrome Helper (Renderer)"),
+            "Google Chrome"
+        );
     }
 
     #[test]
     fn browser_name_edge() {
-        assert_eq!(ChromiumManager::browser_name("Microsoft Edge Helper (Renderer)"), "Microsoft Edge");
+        assert_eq!(
+            ChromiumManager::browser_name("Microsoft Edge Helper (Renderer)"),
+            "Microsoft Edge"
+        );
     }
 
     #[test]
     fn browser_name_slack() {
-        assert_eq!(ChromiumManager::browser_name("Slack Helper (Renderer)"), "Slack");
+        assert_eq!(
+            ChromiumManager::browser_name("Slack Helper (Renderer)"),
+            "Slack"
+        );
     }
 
     #[test]
     fn browser_name_code() {
-        assert_eq!(ChromiumManager::browser_name("Code Helper (Renderer)"), "Code");
+        assert_eq!(
+            ChromiumManager::browser_name("Code Helper (Renderer)"),
+            "Code"
+        );
     }
 
     #[test]
     fn browser_name_gpu_helper() {
-        assert_eq!(ChromiumManager::browser_name("Brave Browser Helper (GPU)"), "Brave Browser");
+        assert_eq!(
+            ChromiumManager::browser_name("Brave Browser Helper (GPU)"),
+            "Brave Browser"
+        );
     }
 
     #[test]
     fn browser_name_arc() {
-        assert_eq!(ChromiumManager::browser_name("Arc Helper (Renderer)"), "Arc");
+        assert_eq!(
+            ChromiumManager::browser_name("Arc Helper (Renderer)"),
+            "Arc"
+        );
     }
 
     // ── Idle counter tracking ──────────────────────────────────────────────────
@@ -1244,7 +1299,11 @@ mod tests {
         mgr.update(&procs, None, &none_set, &none_set);
 
         let info = mgr.renderers.get(&100).expect("renderer must be tracked");
-        assert!(info.consecutive_idle_cycles >= 2, "idle counter should be ≥ 2 after 3 updates: got {}", info.consecutive_idle_cycles);
+        assert!(
+            info.consecutive_idle_cycles >= 2,
+            "idle counter should be ≥ 2 after 3 updates: got {}",
+            info.consecutive_idle_cycles
+        );
     }
 
     #[test]
@@ -1265,7 +1324,10 @@ mod tests {
         mgr.update(&active, None, &none_set, &none_set);
 
         let info = mgr.renderers.get(&100).unwrap();
-        assert_eq!(info.consecutive_idle_cycles, 0, "idle counter must reset to 0 after CPU spike");
+        assert_eq!(
+            info.consecutive_idle_cycles, 0,
+            "idle counter must reset to 0 after CPU spike"
+        );
     }
 
     // ── MAX_FREEZE_RATIO enforcement ───────────────────────────────────────────
@@ -1293,7 +1355,11 @@ mod tests {
         let freeze_count = mgr.renderers.values().filter(|r| r.frozen).count();
 
         // 50% of 4 = 2, so at most 2 should be frozen
-        assert!(freeze_count <= 2, "MAX_FREEZE_RATIO violated: {} frozen out of 4 (max=2)", freeze_count);
+        assert!(
+            freeze_count <= 2,
+            "MAX_FREEZE_RATIO violated: {} frozen out of 4 (max=2)",
+            freeze_count
+        );
     }
 
     // ── Renderer with assertion must not be frozen ─────────────────────────────
@@ -1316,7 +1382,10 @@ mod tests {
         }
 
         let info = mgr.renderers.get(&pid).unwrap();
-        assert!(!info.frozen, "renderer with power assertion must never be frozen");
+        assert!(
+            !info.frozen,
+            "renderer with power assertion must never be frozen"
+        );
     }
 
     // ── main_frozen PIDs must not be touched ───────────────────────────────────
@@ -1359,12 +1428,18 @@ mod tests {
         let procs1: Vec<(u32, &str, f32, u64)> =
             vec![(500, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
         mgr.update(&procs1, None, &none_set, &none_set);
-        assert!(mgr.renderers.contains_key(&500), "PID 500 should be tracked");
+        assert!(
+            mgr.renderers.contains_key(&500),
+            "PID 500 should be tracked"
+        );
 
         // Next cycle: PID 500 is gone
         let procs2: Vec<(u32, &str, f32, u64)> = vec![];
         mgr.update(&procs2, None, &none_set, &none_set);
-        assert!(!mgr.renderers.contains_key(&500), "PID 500 should be pruned");
+        assert!(
+            !mgr.renderers.contains_key(&500),
+            "PID 500 should be pruned"
+        );
     }
 
     #[test]
@@ -1385,21 +1460,30 @@ mod tests {
     fn pressure_high_reduces_idle_cycles_required() {
         let mut mgr = ChromiumManager::new();
         mgr.set_pressure_context(0.85);
-        assert_eq!(mgr.idle_cycles_required, 1, "high pressure → 1 cycle required");
+        assert_eq!(
+            mgr.idle_cycles_required, 1,
+            "high pressure → 1 cycle required"
+        );
     }
 
     #[test]
     fn pressure_low_increases_idle_cycles_required() {
         let mut mgr = ChromiumManager::new();
         mgr.set_pressure_context(0.30);
-        assert_eq!(mgr.idle_cycles_required, 5, "low pressure → 5 cycles (never freeze)");
+        assert_eq!(
+            mgr.idle_cycles_required, 5,
+            "low pressure → 5 cycles (never freeze)"
+        );
     }
 
     #[test]
     fn pressure_normal_uses_default() {
         let mut mgr = ChromiumManager::new();
         mgr.set_pressure_context(0.55);
-        assert_eq!(mgr.idle_cycles_required, 3, "normal pressure → default 3 cycles");
+        assert_eq!(
+            mgr.idle_cycles_required, 3,
+            "normal pressure → default 3 cycles"
+        );
     }
 
     // ── Fluidity pause ─────────────────────────────────────────────────────────
@@ -1440,7 +1524,10 @@ mod tests {
             .filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. }))
             .count();
         // E-core demotions must still happen even with freeze_paused=true
-        assert!(ecore > 0, "E-core demotions must continue during window ops");
+        assert!(
+            ecore > 0,
+            "E-core demotions must continue during window ops"
+        );
     }
 
     // ── Shutdown cleanup ───────────────────────────────────────────────────────
@@ -1452,8 +1539,15 @@ mod tests {
         mgr.frozen_pids.insert(900);
         mgr.frozen_pids.insert(901);
         let thawed = mgr.shutdown_cleanup();
-        assert_eq!(thawed.len(), 2, "shutdown_cleanup must return all frozen PIDs");
-        assert!(mgr.frozen_pids.is_empty(), "frozen_pids must be empty after cleanup");
+        assert_eq!(
+            thawed.len(),
+            2,
+            "shutdown_cleanup must return all frozen PIDs"
+        );
+        assert!(
+            mgr.frozen_pids.is_empty(),
+            "frozen_pids must be empty after cleanup"
+        );
     }
 
     // ── ChromiumMetrics ────────────────────────────────────────────────────────
@@ -1482,8 +1576,14 @@ mod tests {
         let m = mgr.metrics();
         assert_eq!(m.total_renderers, 3);
         assert!(m.total_renderer_memory_mb > 0.0);
-        assert!(m.browsers_managed.contains(&"Brave Browser".to_string()), "Brave Browser must be tracked");
-        assert!(m.browsers_managed.contains(&"Slack".to_string()), "Slack must be tracked");
+        assert!(
+            m.browsers_managed.contains(&"Brave Browser".to_string()),
+            "Brave Browser must be tracked"
+        );
+        assert!(
+            m.browsers_managed.contains(&"Slack".to_string()),
+            "Slack must be tracked"
+        );
     }
 
     // ── Performance benchmark ──────────────────────────────────────────────────
@@ -1515,7 +1615,11 @@ mod tests {
         );
 
         // Must be < 200µs per call on M1 (conservatively allowing 2× the stated goal)
-        assert!(elapsed.as_millis() < 200, "ChromiumManager.update() too slow: {:?}/call", elapsed / 1000);
+        assert!(
+            elapsed.as_millis() < 200,
+            "ChromiumManager.update() too slow: {:?}/call",
+            elapsed / 1000
+        );
     }
 
     // ── Thaw behaviour fixes ───────────────────────────────────────────────────
@@ -1573,7 +1677,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(thaws.len(), 2, "Both frozen Brave renderers must thaw on fg change, got {:?}", thaws);
+        assert_eq!(
+            thaws.len(),
+            2,
+            "Both frozen Brave renderers must thaw on fg change, got {:?}",
+            thaws
+        );
         assert!(thaws.contains(&200), "pid 200 must be thawed");
         assert!(thaws.contains(&201), "pid 201 must be thawed");
     }
@@ -1609,7 +1718,10 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 500))
             .collect();
-        assert!(!thaws.is_empty(), "Foreground-browser renderer must thaw at MAX_FOREGROUND_FROZEN_CYCLES");
+        assert!(
+            !thaws.is_empty(),
+            "Foreground-browser renderer must thaw at MAX_FOREGROUND_FROZEN_CYCLES"
+        );
     }
 
     /// Bug fix #2: Max-freeze-duration guard — renderer frozen too long gets
@@ -1636,7 +1748,10 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 300))
             .collect();
-        assert!(!thaws.is_empty(), "Renderer must be thawed after MAX_FROZEN_CYCLES");
+        assert!(
+            !thaws.is_empty(),
+            "Renderer must be thawed after MAX_FROZEN_CYCLES"
+        );
     }
 
     /// Bug fix #4: E-core demotion must not be re-emitted every cycle for the
@@ -1662,7 +1777,10 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. }))
             .count();
-        assert_eq!(demotions2, 0, "Subsequent cycles must NOT re-emit demotion for same PID");
+        assert_eq!(
+            demotions2, 0,
+            "Subsequent cycles must NOT re-emit demotion for same PID"
+        );
     }
 
     /// Bug fix #3: FreezeSource::ChromiumManager must exist as distinct variant.
@@ -1708,7 +1826,10 @@ mod tests {
         let thawed = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 500));
-        assert!(thawed, "predictive pre-thaw must fire when switch is 8s away (< 10s window)");
+        assert!(
+            thawed,
+            "predictive pre-thaw must fire when switch is 8s away (< 10s window)"
+        );
     }
 
     /// A: pre-thaw does NOT fire when switch is far away (> 10s).
@@ -1726,7 +1847,10 @@ mod tests {
         let thawed = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 501));
-        assert!(!thawed, "pre-thaw must NOT fire when 40s remain before predicted switch");
+        assert!(
+            !thawed,
+            "pre-thaw must NOT fire when 40s remain before predicted switch"
+        );
     }
 
     /// A: stale prediction (time_to_switch deeply negative) does NOT fire.
@@ -1746,7 +1870,10 @@ mod tests {
         let thawed = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 503));
-        assert!(!thawed, "stale prediction (time_to_switch=-110s) must NOT trigger pre-thaw");
+        assert!(
+            !thawed,
+            "stale prediction (time_to_switch=-110s) must NOT trigger pre-thaw"
+        );
     }
 
     /// A: low-probability prediction (P < 0.35) is ignored.
@@ -1764,7 +1891,10 @@ mod tests {
         let thawed = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 502));
-        assert!(!thawed, "prediction with P=0.20 must be ignored (threshold = 0.35)");
+        assert!(
+            !thawed,
+            "prediction with P=0.20 must be ignored (threshold = 0.35)"
+        );
     }
 
     // ── Enhancement B: ArousalState adaptive aggressiveness ───────────────────
@@ -1774,7 +1904,10 @@ mod tests {
     fn arousal_crisis_sets_idle_cycles_1() {
         let mut mgr = ChromiumManager::new();
         mgr.set_arousal_context(0.80);
-        assert_eq!(mgr.idle_cycles_required, 1, "crisis arousal must set idle_cycles_required = 1");
+        assert_eq!(
+            mgr.idle_cycles_required, 1,
+            "crisis arousal must set idle_cycles_required = 1"
+        );
     }
 
     /// B: idle arousal (< 0.20) sets arousal_thaw_all = true.
@@ -1782,7 +1915,10 @@ mod tests {
     fn arousal_idle_sets_thaw_all() {
         let mut mgr = ChromiumManager::new();
         mgr.set_arousal_context(0.15);
-        assert!(mgr.arousal_thaw_all, "arousal < 0.20 must set arousal_thaw_all = true");
+        assert!(
+            mgr.arousal_thaw_all,
+            "arousal < 0.20 must set arousal_thaw_all = true"
+        );
     }
 
     /// B: arousal_thaw_all triggers thaw of frozen renderers in update().
@@ -1799,7 +1935,10 @@ mod tests {
         let thawed = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 503));
-        assert!(thawed, "arousal_thaw_all must cause update() to emit ThawRenderer for frozen renderer");
+        assert!(
+            thawed,
+            "arousal_thaw_all must cause update() to emit ThawRenderer for frozen renderer"
+        );
     }
 
     /// Iter 2: long-idle renderer gets frozen at LOW pressure.
@@ -1832,7 +1971,11 @@ mod tests {
 
         // After 31+ cycles, at least one of the renderers must be in frozen_pids.
         // MAX_FREEZE_RATIO caps at floor(2 * 0.5) = 1, so exactly 1 gets frozen.
-        assert!(mgr.frozen_pids.contains(&811) || mgr.frozen_pids.contains(&812), "at least one long-idle renderer must be frozen at low pressure (frozen_pids={:?})", mgr.frozen_pids);
+        assert!(
+            mgr.frozen_pids.contains(&811) || mgr.frozen_pids.contains(&812),
+            "at least one long-idle renderer must be frozen at low pressure (frozen_pids={:?})",
+            mgr.frozen_pids
+        );
     }
 
     /// Iter 2: short-idle renderer stays running at low pressure.
@@ -1860,7 +2003,10 @@ mod tests {
         let any_frozen = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::FreezeRenderer { pid, .. } if *pid == 821 || *pid == 822));
-        assert!(!any_frozen, "short-idle renderer must NOT be frozen at low pressure");
+        assert!(
+            !any_frozen,
+            "short-idle renderer must NOT be frozen at low pressure"
+        );
     }
 
     /// Iter 3: build preemption freezes background renderers after 1 idle cycle.
@@ -1885,7 +2031,11 @@ mod tests {
         mgr.update(&procs, None, &none_set, &none_set);
         mgr.update(&procs, None, &none_set, &none_set);
 
-        assert!(mgr.frozen_pids.contains(&901) || mgr.frozen_pids.contains(&902), "build preemption must freeze a background renderer within 2 cycles (frozen_pids={:?})", mgr.frozen_pids);
+        assert!(
+            mgr.frozen_pids.contains(&901) || mgr.frozen_pids.contains(&902),
+            "build preemption must freeze a background renderer within 2 cycles (frozen_pids={:?})",
+            mgr.frozen_pids
+        );
     }
 
     /// Iter 3: build preemption does NOT fire when not set, at low pressure.
@@ -1911,7 +2061,10 @@ mod tests {
         // At arousal=0.80, idle_cycles_required=1 so freezes happen naturally.
         // The preemption API is additive; this test just documents that without
         // preemption, the system still relies on the pressure/arousal gates.
-        assert!(without_flag_freezes >= 1, "at arousal 0.80, freeze should fire via pressure/arousal gate");
+        assert!(
+            without_flag_freezes >= 1,
+            "at arousal 0.80, freeze should fire via pressure/arousal gate"
+        );
     }
 
     /// Regression guard: frozen renderers must PERSIST at low pressure when
@@ -1946,7 +2099,11 @@ mod tests {
     fn nars_confidence_default_allows_freeze() {
         let mgr = ChromiumManager::new();
         let confidence = mgr.freeze_confidence("Brave Browser");
-        assert!((confidence - 0.70).abs() < 1e-5, "default freeze confidence must be 0.70, got {}", confidence);
+        assert!(
+            (confidence - 0.70).abs() < 1e-5,
+            "default freeze confidence must be 0.70, got {}",
+            confidence
+        );
     }
 
     /// C: multiple failure observations lower confidence below 0.50.
@@ -1957,7 +2114,11 @@ mod tests {
             mgr.observe_freeze_outcome("Brave Browser", false, 0.8);
         }
         let confidence = mgr.freeze_confidence("Brave Browser");
-        assert!(confidence < 0.50, "5 failure observations must pull confidence below 0.50, got {}", confidence);
+        assert!(
+            confidence < 0.50,
+            "5 failure observations must pull confidence below 0.50, got {}",
+            confidence
+        );
     }
 
     /// C: NARS confidence gate blocks freeze when confidence is low.
@@ -1986,7 +2147,10 @@ mod tests {
                 any_freeze = true;
             }
         }
-        assert!(!any_freeze, "NARS confidence gate must block freeze when confidence < 0.35");
+        assert!(
+            !any_freeze,
+            "NARS confidence gate must block freeze when confidence < 0.35"
+        );
     }
 
     // ── chromium_app_to_browser helper ────────────────────────────────────────
@@ -1994,10 +2158,27 @@ mod tests {
     /// D: chromium_app_to_browser maps known apps correctly.
     #[test]
     fn chromium_app_to_browser_maps_known_apps() {
-        assert_eq!(ChromiumManager::chromium_app_to_browser("Brave Browser"), Some("Brave Browser".to_string()));
-        assert_eq!(ChromiumManager::chromium_app_to_browser("Slack"), Some("Slack".to_string()));
-        assert_eq!(ChromiumManager::chromium_app_to_browser("Code"), Some("Code".to_string()));
-        assert_eq!(ChromiumManager::chromium_app_to_browser("Terminal"), None, "Terminal is not a Chromium browser");
-        assert_eq!(ChromiumManager::chromium_app_to_browser("Finder"), None, "Finder is not a Chromium browser");
+        assert_eq!(
+            ChromiumManager::chromium_app_to_browser("Brave Browser"),
+            Some("Brave Browser".to_string())
+        );
+        assert_eq!(
+            ChromiumManager::chromium_app_to_browser("Slack"),
+            Some("Slack".to_string())
+        );
+        assert_eq!(
+            ChromiumManager::chromium_app_to_browser("Code"),
+            Some("Code".to_string())
+        );
+        assert_eq!(
+            ChromiumManager::chromium_app_to_browser("Terminal"),
+            None,
+            "Terminal is not a Chromium browser"
+        );
+        assert_eq!(
+            ChromiumManager::chromium_app_to_browser("Finder"),
+            None,
+            "Finder is not a Chromium browser"
+        );
     }
 }

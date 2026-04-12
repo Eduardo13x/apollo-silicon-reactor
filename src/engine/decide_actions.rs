@@ -578,17 +578,35 @@ pub fn decide_actions(
             let bandwidth_priority = dram_bandwidth_pct >= 0.80 && footprint_mb > 100.0;
             // Aggressive modifiers: stall, vampire, I/O-burst, anomaly all escalate to aggressive.
             // [Apple Energy Diagnostics; Bhagwan & Savage 2002; Chandola 2009]
-            let aggressive = aggressive || system_cpu_stalled || is_wakeup_vampire || is_io_burst || is_anomalous;
+            let aggressive = aggressive
+                || system_cpu_stalled
+                || is_wakeup_vampire
+                || is_io_burst
+                || is_anomalous;
 
             let ipc = ipc_hints.get(&pid).copied().unwrap_or(0.0);
             let reason = if is_anomalous {
-                format!("anomaly throttle (score={:.1}x baseline, ipc={:.2})", anomaly_score, ipc)
+                format!(
+                    "anomaly throttle (score={:.1}x baseline, ipc={:.2})",
+                    anomaly_score, ipc
+                )
             } else if is_io_burst {
-                format!("io-burst throttle ({:.1} MB/s writes, ipc={:.2})", disk_mbps, ipc)
+                format!(
+                    "io-burst throttle ({:.1} MB/s writes, ipc={:.2})",
+                    disk_mbps, ipc
+                )
             } else if is_wakeup_vampire {
-                format!("wakeup-vampire throttle ({:.0}/s wakeups, ipc={:.2})", wakeup_rate, ipc)
+                format!(
+                    "wakeup-vampire throttle ({:.0}/s wakeups, ipc={:.2})",
+                    wakeup_rate, ipc
+                )
             } else if bandwidth_priority {
-                format!("dram-bw throttle (bw={:.0}%, footprint={:.0}MB, ipc={:.2})", dram_bandwidth_pct * 100.0, footprint_mb, ipc)
+                format!(
+                    "dram-bw throttle (bw={:.0}%, footprint={:.0}MB, ipc={:.2})",
+                    dram_bandwidth_pct * 100.0,
+                    footprint_mb,
+                    ipc
+                )
             } else {
                 format!("ipc-aware throttle ({:?}, ipc={:.2})", context, ipc)
             };
@@ -1157,13 +1175,28 @@ mod tests {
     ) -> DecisionOutput {
         let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
         decide_actions(
-            snap, sys, profile, latency, reactor,
-            &interactive, &noise,
-            OverflowThresholds::default(), None,
-            &weights, 0.0, &pids, &ipc, &hops, &hab, &causal,
+            snap,
+            sys,
+            profile,
+            latency,
+            reactor,
+            &interactive,
+            &noise,
+            OverflowThresholds::default(),
+            None,
+            &weights,
+            0.0,
+            &pids,
+            &ipc,
+            &hops,
+            &hab,
+            &causal,
             &UserContext::default(),
-            &HashMap::new(), &HashMap::new(), 0.0,
-            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            &HashMap::new(),
         )
     }
 
@@ -1173,7 +1206,11 @@ mod tests {
     fn context_interactive_focus_when_low_pressure() {
         let snap = make_snapshot(10.0, 0.10, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
-        assert!(matches!(ctx, InteractiveContext::InteractiveFocus), "low CPU + low memory should yield InteractiveFocus, got {:?}", ctx);
+        assert!(
+            matches!(ctx, InteractiveContext::InteractiveFocus),
+            "low CPU + low memory should yield InteractiveFocus, got {:?}",
+            ctx
+        );
     }
 
     #[test]
@@ -1181,7 +1218,11 @@ mod tests {
         // memory_pressure 0.80 > default bg_pressure 0.78
         let snap = make_snapshot(30.0, 0.80, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
-        assert!(matches!(ctx, InteractiveContext::BackgroundPressure), "high memory pressure should yield BackgroundPressure, got {:?}", ctx);
+        assert!(
+            matches!(ctx, InteractiveContext::BackgroundPressure),
+            "high memory pressure should yield BackgroundPressure, got {:?}",
+            ctx
+        );
     }
 
     #[test]
@@ -1189,7 +1230,11 @@ mod tests {
         // CPU 75% > 72.0 threshold
         let snap = make_snapshot(75.0, 0.10, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
-        assert!(matches!(ctx, InteractiveContext::BackgroundPressure), "CPU > 72% should yield BackgroundPressure, got {:?}", ctx);
+        assert!(
+            matches!(ctx, InteractiveContext::BackgroundPressure),
+            "CPU > 72% should yield BackgroundPressure, got {:?}",
+            ctx
+        );
     }
 
     #[test]
@@ -1197,7 +1242,11 @@ mod tests {
         // CPU 92% > 88.0 threshold
         let snap = make_snapshot(92.0, 0.10, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
-        assert!(matches!(ctx, InteractiveContext::ThermalConstrained), "CPU > 88% should yield ThermalConstrained, got {:?}", ctx);
+        assert!(
+            matches!(ctx, InteractiveContext::ThermalConstrained),
+            "CPU > 88% should yield ThermalConstrained, got {:?}",
+            ctx
+        );
     }
 
     #[test]
@@ -1205,7 +1254,11 @@ mod tests {
         // memory_pressure 0.95 > default critical_pressure 0.88
         let snap = make_snapshot(20.0, 0.95, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
-        assert!(matches!(ctx, InteractiveContext::ThermalConstrained), "memory_pressure > critical should yield ThermalConstrained, got {:?}", ctx);
+        assert!(
+            matches!(ctx, InteractiveContext::ThermalConstrained),
+            "memory_pressure > critical should yield ThermalConstrained, got {:?}",
+            ctx
+        );
     }
 
     #[test]
@@ -1217,7 +1270,11 @@ mod tests {
             ..OverflowThresholds::default()
         };
         let ctx = context_from_pressure(&snap, &thresholds);
-        assert!(matches!(ctx, InteractiveContext::BackgroundPressure), "custom threshold should lower the bar, got {:?}", ctx);
+        assert!(
+            matches!(ctx, InteractiveContext::BackgroundPressure),
+            "custom threshold should lower the bar, got {:?}",
+            ctx
+        );
     }
 
     // ── blocker_score_formula tests ──────────────────────────────────────
@@ -1225,21 +1282,33 @@ mod tests {
     #[test]
     fn blocker_score_all_zero() {
         let score = blocker_score_formula(0.0, 0.0, false, 0.0, 0.0);
-        assert!((score - 0.0).abs() < 1e-9, "all-zero inputs should produce 0.0, got {}", score);
+        assert!(
+            (score - 0.0).abs() < 1e-9,
+            "all-zero inputs should produce 0.0, got {}",
+            score
+        );
     }
 
     #[test]
     fn blocker_score_max_all_components() {
         let score = blocker_score_formula(1.0, 1.0, true, 1.0, 1.0);
         // 0.40 + 0.30 + 0.10 + 0.10 + 0.10 = 1.0
-        assert!((score - 1.0).abs() < 1e-9, "max inputs should produce 1.0, got {}", score);
+        assert!(
+            (score - 1.0).abs() < 1e-9,
+            "max inputs should produce 1.0, got {}",
+            score
+        );
     }
 
     #[test]
     fn blocker_score_seen_recently_adds_010() {
         let without = blocker_score_formula(0.5, 0.0, false, 0.0, 0.0);
         let with = blocker_score_formula(0.5, 0.0, true, 0.0, 0.0);
-        assert!((with - without - 0.10).abs() < 1e-9, "seen_recently should add exactly 0.10, delta={}", with - without);
+        assert!(
+            (with - without - 0.10).abs() < 1e-9,
+            "seen_recently should add exactly 0.10, delta={}",
+            with - without
+        );
     }
 
     #[test]
@@ -1247,13 +1316,22 @@ mod tests {
         // compressor_pressure > 1.0 should be clamped to 1.0
         let score_clamped = blocker_score_formula(0.0, 0.0, false, 0.0, 5.0);
         let score_max = blocker_score_formula(0.0, 0.0, false, 0.0, 1.0);
-        assert!((score_clamped - score_max).abs() < 1e-9, "compressor > 1.0 should be clamped: {} vs {}", score_clamped, score_max);
+        assert!(
+            (score_clamped - score_max).abs() < 1e-9,
+            "compressor > 1.0 should be clamped: {} vs {}",
+            score_clamped,
+            score_max
+        );
     }
 
     #[test]
     fn blocker_score_negative_compressor_clamped_to_zero() {
         let score = blocker_score_formula(0.0, 0.0, false, 0.0, -1.0);
-        assert!((score - 0.0).abs() < 1e-9, "negative compressor should clamp to 0.0, got {}", score);
+        assert!(
+            (score - 0.0).abs() < 1e-9,
+            "negative compressor should clamp to 0.0, got {}",
+            score
+        );
     }
 
     // ── Helper classification tests ──────────────────────────────────────
@@ -1290,7 +1368,10 @@ mod tests {
         // [Saltzer & Schroeder 1975] Economy of Mechanism — one policy per resource.
         // A process in both lists gets conflicting treatment in the same cycle.
         for noise in &NOISE_APPS {
-            assert!(!DEFERRABLE_DAEMONS.iter().any(|d| d == noise), "{noise} is in both NOISE_APPS and DEFERRABLE_DAEMONS");
+            assert!(
+                !DEFERRABLE_DAEMONS.iter().any(|d| d == noise),
+                "{noise} is in both NOISE_APPS and DEFERRABLE_DAEMONS"
+            );
         }
     }
 
@@ -1305,11 +1386,26 @@ mod tests {
         // bundle paths must still classify as user-facing via the
         // behavioural path:
         let bundle_only_apps = [
-            ("/Applications/Bartender 4.app/Contents/MacOS/Bartender 4", "Bartender 4"),
-            ("/Applications/Setapp/CleanShot X.app/Contents/MacOS/CleanShot X", "CleanShot X"),
-            ("/Applications/Raycast.app/Contents/MacOS/Raycast", "Raycast"),
-            ("/Applications/1Password 7 - Password Manager.app/Contents/MacOS/1Password 7", "1Password 7"),
-            ("/Users/me/Applications/CustomApp.app/Contents/MacOS/CustomApp", "CustomApp"),
+            (
+                "/Applications/Bartender 4.app/Contents/MacOS/Bartender 4",
+                "Bartender 4",
+            ),
+            (
+                "/Applications/Setapp/CleanShot X.app/Contents/MacOS/CleanShot X",
+                "CleanShot X",
+            ),
+            (
+                "/Applications/Raycast.app/Contents/MacOS/Raycast",
+                "Raycast",
+            ),
+            (
+                "/Applications/1Password 7 - Password Manager.app/Contents/MacOS/1Password 7",
+                "1Password 7",
+            ),
+            (
+                "/Users/me/Applications/CustomApp.app/Contents/MacOS/CustomApp",
+                "CustomApp",
+            ),
         ];
         for (path, name) in bundle_only_apps {
             assert!(
@@ -1430,19 +1526,43 @@ mod tests {
     fn decide_actions_empty_system_returns_no_actions() {
         let snap = make_snapshot(10.0, 0.10, 0.0);
         let sys = System::new();
-        let output = call_decide(&snap, &sys, OptimizationProfile::BalancedRoot, LatencyTarget::Normal, 0.0);
-        assert!(output.actions.is_empty(), "empty system should yield no actions");
-        assert!(output.blockers.is_empty(), "empty system should yield no blockers");
+        let output = call_decide(
+            &snap,
+            &sys,
+            OptimizationProfile::BalancedRoot,
+            LatencyTarget::Normal,
+            0.0,
+        );
+        assert!(
+            output.actions.is_empty(),
+            "empty system should yield no actions"
+        );
+        assert!(
+            output.blockers.is_empty(),
+            "empty system should yield no blockers"
+        );
         assert!(output.low_value_skipped.is_empty());
-        assert!(matches!(output.context, InteractiveContext::InteractiveFocus), "low pressure should yield InteractiveFocus");
+        assert!(
+            matches!(output.context, InteractiveContext::InteractiveFocus),
+            "low pressure should yield InteractiveFocus"
+        );
     }
 
     #[test]
     fn decide_actions_preserves_reactor_event_weight() {
         let snap = make_snapshot(10.0, 0.10, 0.0);
         let sys = System::new();
-        let output = call_decide(&snap, &sys, OptimizationProfile::BalancedRoot, LatencyTarget::Normal, 0.42);
-        assert!((output.reactor_event_weight - 0.42).abs() < 1e-9, "reactor_event_weight should be passed through");
+        let output = call_decide(
+            &snap,
+            &sys,
+            OptimizationProfile::BalancedRoot,
+            LatencyTarget::Normal,
+            0.42,
+        );
+        assert!(
+            (output.reactor_event_weight - 0.42).abs() < 1e-9,
+            "reactor_event_weight should be passed through"
+        );
     }
 
     #[test]
@@ -1450,16 +1570,43 @@ mod tests {
         let sys = System::new();
 
         // Low pressure
-        let out_low = call_decide(&make_snapshot(10.0, 0.10, 0.0), &sys, OptimizationProfile::BalancedRoot, LatencyTarget::Normal, 0.0);
-        assert!(matches!(out_low.context, InteractiveContext::InteractiveFocus));
+        let out_low = call_decide(
+            &make_snapshot(10.0, 0.10, 0.0),
+            &sys,
+            OptimizationProfile::BalancedRoot,
+            LatencyTarget::Normal,
+            0.0,
+        );
+        assert!(matches!(
+            out_low.context,
+            InteractiveContext::InteractiveFocus
+        ));
 
         // Medium pressure (CPU > 72)
-        let out_mid = call_decide(&make_snapshot(75.0, 0.10, 0.0), &sys, OptimizationProfile::BalancedRoot, LatencyTarget::Normal, 0.0);
-        assert!(matches!(out_mid.context, InteractiveContext::BackgroundPressure));
+        let out_mid = call_decide(
+            &make_snapshot(75.0, 0.10, 0.0),
+            &sys,
+            OptimizationProfile::BalancedRoot,
+            LatencyTarget::Normal,
+            0.0,
+        );
+        assert!(matches!(
+            out_mid.context,
+            InteractiveContext::BackgroundPressure
+        ));
 
         // High pressure (CPU > 88)
-        let out_high = call_decide(&make_snapshot(92.0, 0.10, 0.0), &sys, OptimizationProfile::BalancedRoot, LatencyTarget::Normal, 0.0);
-        assert!(matches!(out_high.context, InteractiveContext::ThermalConstrained));
+        let out_high = call_decide(
+            &make_snapshot(92.0, 0.10, 0.0),
+            &sys,
+            OptimizationProfile::BalancedRoot,
+            LatencyTarget::Normal,
+            0.0,
+        );
+        assert!(matches!(
+            out_high.context,
+            InteractiveContext::ThermalConstrained
+        ));
     }
 
     #[test]
@@ -1467,10 +1614,18 @@ mod tests {
         let snap = make_snapshot(10.0, 0.10, 0.0);
         let sys = System::new();
 
-        for profile in [OptimizationProfile::BalancedRoot, OptimizationProfile::AggressiveRoot, OptimizationProfile::SafeRoot] {
+        for profile in [
+            OptimizationProfile::BalancedRoot,
+            OptimizationProfile::AggressiveRoot,
+            OptimizationProfile::SafeRoot,
+        ] {
             let output = call_decide(&snap, &sys, profile, LatencyTarget::Normal, 0.0);
             // Should not panic, and with no processes should produce no actions.
-            assert!(output.actions.is_empty(), "profile {:?} with empty sys should be empty", profile);
+            assert!(
+                output.actions.is_empty(),
+                "profile {:?} with empty sys should be empty",
+                profile
+            );
         }
     }
 
@@ -1479,7 +1634,11 @@ mod tests {
         let snap = make_snapshot(10.0, 0.10, 0.0);
         let sys = System::new();
 
-        for target in [LatencyTarget::Low, LatencyTarget::Normal, LatencyTarget::Max] {
+        for target in [
+            LatencyTarget::Low,
+            LatencyTarget::Normal,
+            LatencyTarget::Max,
+        ] {
             let output = call_decide(&snap, &sys, OptimizationProfile::BalancedRoot, target, 0.0);
             assert!(output.actions.is_empty());
         }

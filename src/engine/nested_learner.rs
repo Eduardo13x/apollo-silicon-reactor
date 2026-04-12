@@ -135,7 +135,8 @@ impl NestedLearner {
     /// signal before allowing new outcome observations to influence beliefs.
     /// [Google NL 2025 §6.2] — bidirectional context flow closes the feedback loop.
     pub fn tick_l0(&mut self, signal_quality: f64) -> bool {
-        self.l0_quality = (1.0 - L0_ALPHA) * self.l0_quality + L0_ALPHA * signal_quality.clamp(0.0, 1.0);
+        self.l0_quality =
+            (1.0 - L0_ALPHA) * self.l0_quality + L0_ALPHA * signal_quality.clamp(0.0, 1.0);
         self.l0_quality >= self.dynamic_l1_gate()
     }
 
@@ -169,7 +170,8 @@ impl NestedLearner {
         let weighted = outcome_effectiveness.clamp(0.0, 1.0) * self.l0_quality;
         // Blend: high L0 quality → outcome moves aggregate; low → almost ignored.
         let effective_alpha = L1_ALPHA * self.l0_quality.max(0.1);
-        self.l1_aggregate = (1.0 - effective_alpha) * self.l1_aggregate + effective_alpha * weighted;
+        self.l1_aggregate =
+            (1.0 - effective_alpha) * self.l1_aggregate + effective_alpha * weighted;
         self.l1_since_l2 += 1;
         self.l1_total += 1;
         self.l1_since_l2 >= L2_GATE_PERIOD
@@ -243,7 +245,11 @@ mod tests {
         for _ in 0..100 {
             nl.tick_l0(0.8);
         }
-        assert!((nl.l0_quality - 0.8).abs() < 0.01, "L0 should converge to 0.8, got {}", nl.l0_quality);
+        assert!(
+            (nl.l0_quality - 0.8).abs() < 0.01,
+            "L0 should converge to 0.8, got {}",
+            nl.l0_quality
+        );
     }
 
     #[test]
@@ -254,7 +260,10 @@ mod tests {
             nl.tick_l0(0.0);
         }
         // Gate should be closed
-        assert!(!nl.tick_l0(0.0), "L1 gate should be closed when signal quality is low");
+        assert!(
+            !nl.tick_l0(0.0),
+            "L1 gate should be closed when signal quality is low"
+        );
     }
 
     #[test]
@@ -264,7 +273,10 @@ mod tests {
         for _ in 0..100 {
             nl.tick_l0(1.0);
         }
-        assert!(nl.tick_l0(1.0), "L1 gate should open when signal quality is high");
+        assert!(
+            nl.tick_l0(1.0),
+            "L1 gate should open when signal quality is high"
+        );
     }
 
     #[test]
@@ -273,9 +285,13 @@ mod tests {
         let mut nl_low = NestedLearner::new();
 
         // Drive high quality
-        for _ in 0..50 { nl_high.tick_l0(1.0); }
+        for _ in 0..50 {
+            nl_high.tick_l0(1.0);
+        }
         // Drive low quality
-        for _ in 0..50 { nl_low.tick_l0(0.1); }
+        for _ in 0..50 {
+            nl_low.tick_l0(0.1);
+        }
 
         // Same outcome effectiveness
         for _ in 0..5 {
@@ -287,7 +303,8 @@ mod tests {
         assert!(
             nl_high.l1_aggregate > nl_low.l1_aggregate,
             "High L0 quality should produce higher L1 aggregate: high={}, low={}",
-            nl_high.l1_aggregate, nl_low.l1_aggregate
+            nl_high.l1_aggregate,
+            nl_low.l1_aggregate
         );
     }
 
@@ -295,7 +312,9 @@ mod tests {
     fn l2_flush_triggers_after_gate_period() {
         let mut nl = NestedLearner::new();
         // Drive L0 quality above gate
-        for _ in 0..50 { nl.tick_l0(1.0); }
+        for _ in 0..50 {
+            nl.tick_l0(1.0);
+        }
 
         let mut l2_fired = false;
         for _ in 0..L2_GATE_PERIOD {
@@ -308,7 +327,10 @@ mod tests {
                 break;
             }
         }
-        assert!(l2_fired, "L2 should have fired after L2_GATE_PERIOD L1 updates");
+        assert!(
+            l2_fired,
+            "L2 should have fired after L2_GATE_PERIOD L1 updates"
+        );
     }
 
     #[test]
@@ -322,7 +344,9 @@ mod tests {
     #[test]
     fn diagnostics_reflect_state() {
         let mut nl = NestedLearner::new();
-        for _ in 0..50 { nl.tick_l0(0.8); }
+        for _ in 0..50 {
+            nl.tick_l0(0.8);
+        }
         let d = nl.diagnostics();
         assert!((d.l0_quality - nl.l0_quality).abs() < 1e-10);
         assert_eq!(d.l1_gate_open, nl.l0_quality >= nl.dynamic_l1_gate());
@@ -335,8 +359,11 @@ mod tests {
     fn dynamic_gate_equals_baseline_at_zero_velocity() {
         let nl = NestedLearner::new();
         assert_eq!(nl.l2_meta_velocity, 0.0);
-        assert!((nl.dynamic_l1_gate() - L1_GATE_THRESHOLD).abs() < 1e-10,
-            "gate should equal L1_GATE_THRESHOLD when velocity=0, got {}", nl.dynamic_l1_gate());
+        assert!(
+            (nl.dynamic_l1_gate() - L1_GATE_THRESHOLD).abs() < 1e-10,
+            "gate should equal L1_GATE_THRESHOLD when velocity=0, got {}",
+            nl.dynamic_l1_gate()
+        );
     }
 
     /// High meta-velocity raises the gate above baseline.
@@ -344,17 +371,27 @@ mod tests {
     fn dynamic_gate_rises_with_meta_velocity() {
         let mut nl = NestedLearner::new();
         // Simulate oscillating l1_aggregate to produce high meta-velocity
-        for _ in 0..50 { nl.tick_l0(1.0); }
+        for _ in 0..50 {
+            nl.tick_l0(1.0);
+        }
         // Alternate high/low outcomes to force l2_context swings
         for _ in 0..10 {
-            for _ in 0..L2_GATE_PERIOD { nl.tick_l1(1.0); }
+            for _ in 0..L2_GATE_PERIOD {
+                nl.tick_l1(1.0);
+            }
             nl.flush_l2();
-            for _ in 0..L2_GATE_PERIOD { nl.tick_l1(0.0); }
+            for _ in 0..L2_GATE_PERIOD {
+                nl.tick_l1(0.0);
+            }
             nl.flush_l2();
         }
         let gate = nl.dynamic_l1_gate();
-        assert!(gate > L1_GATE_THRESHOLD,
-            "gate should rise above {} with high velocity, got {}", L1_GATE_THRESHOLD, gate);
+        assert!(
+            gate > L1_GATE_THRESHOLD,
+            "gate should rise above {} with high velocity, got {}",
+            L1_GATE_THRESHOLD,
+            gate
+        );
     }
 
     /// Gate never exceeds L1_GATE_MAX regardless of velocity magnitude.
@@ -363,10 +400,18 @@ mod tests {
         let mut nl = NestedLearner::new();
         nl.l2_meta_velocity = 100.0; // extreme artificial value
         let gate = nl.dynamic_l1_gate();
-        assert!(gate <= L1_GATE_MAX,
-            "gate must not exceed L1_GATE_MAX={}, got {}", L1_GATE_MAX, gate);
-        assert!(gate >= L1_GATE_THRESHOLD,
-            "gate must not fall below L1_GATE_THRESHOLD={}, got {}", L1_GATE_THRESHOLD, gate);
+        assert!(
+            gate <= L1_GATE_MAX,
+            "gate must not exceed L1_GATE_MAX={}, got {}",
+            L1_GATE_MAX,
+            gate
+        );
+        assert!(
+            gate >= L1_GATE_THRESHOLD,
+            "gate must not fall below L1_GATE_THRESHOLD={}, got {}",
+            L1_GATE_THRESHOLD,
+            gate
+        );
     }
 
     /// Production calibration test: simulates macOS realistic pressure drops (1-5%).
@@ -382,7 +427,9 @@ mod tests {
     fn l1_aggregate_nonzero_with_macos_typical_drops() {
         let mut nl = NestedLearner::new();
         // Stable, moderately good signal quality
-        for _ in 0..100 { nl.tick_l0(0.6); }
+        for _ in 0..100 {
+            nl.tick_l0(0.6);
+        }
         assert!(nl.tick_l0(0.6), "gate should be open at quality 0.6");
 
         // Simulate 40 outcomes with 3% pressure drop (calibrated as 0.60 effective)
@@ -411,15 +458,21 @@ mod tests {
     #[test]
     fn l1_aggregate_converges_to_zero_on_no_pressure_drop() {
         let mut nl = NestedLearner::new();
-        for _ in 0..100 { nl.tick_l0(0.7); }
+        for _ in 0..100 {
+            nl.tick_l0(0.7);
+        }
         // Start from non-zero
-        for _ in 0..20 { nl.tick_l1(0.5); }
+        for _ in 0..20 {
+            nl.tick_l1(0.5);
+        }
         nl.flush_l2();
 
         // Feed 100 zero-effectiveness outcomes
         for _ in 0..100 {
             nl.tick_l1(0.0);
-            if nl.l1_since_l2 >= L2_GATE_PERIOD { nl.flush_l2(); }
+            if nl.l1_since_l2 >= L2_GATE_PERIOD {
+                nl.flush_l2();
+            }
         }
 
         assert!(

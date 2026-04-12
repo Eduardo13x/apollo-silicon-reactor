@@ -475,7 +475,7 @@ mod tests {
         let mut s = snap("Chrome Renderer");
         s.has_gui_window = true;
         s.secs_since_user_interaction = 600; // not recently active
-        // "Renderer" pattern + GUI → AppHelper
+                                             // "Renderer" pattern + GUI → AppHelper
         assert_eq!(c.classify(&s), ProcessTier::AppHelper);
     }
 
@@ -577,22 +577,14 @@ mod tests {
     fn waste_score_telemetry_is_high() {
         let s = snap("DiagnosticReporter");
         let w = waste_score(&s, ProcessTier::Telemetry);
-        assert!(
-            w >= 0.80,
-            "telemetry waste must be >= 0.80, got {}",
-            w
-        );
+        assert!(w >= 0.80, "telemetry waste must be >= 0.80, got {}", w);
     }
 
     #[test]
     fn waste_score_app_helper_is_low() {
         let s = snap("Chrome Helper");
         let w = waste_score(&s, ProcessTier::AppHelper);
-        assert!(
-            w <= 0.25,
-            "AppHelper waste must be <= 0.25, got {}",
-            w
-        );
+        assert!(w <= 0.25, "AppHelper waste must be <= 0.25, got {}", w);
     }
 
     // ── score_waste() standalone ──────────────────────────────────────────────

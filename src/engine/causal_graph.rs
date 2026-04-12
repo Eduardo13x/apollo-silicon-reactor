@@ -122,7 +122,11 @@ impl CausalEdge {
         // Always apply EMA decay; target = observed delta when effective, else 0.
         // Prevents avg_delta from freezing at historical highs when an edge stops
         // being effective — repeated failures should decay it toward 0.
-        let delta_target = if was_effective && delta > 0.0 { delta } else { 0.0 };
+        let delta_target = if was_effective && delta > 0.0 {
+            delta
+        } else {
+            0.0
+        };
         self.avg_delta = self.avg_delta * 0.85 + delta_target * 0.15;
     }
 
@@ -130,7 +134,11 @@ impl CausalEdge {
     fn update_slow(&mut self, was_effective: bool, delta: f32) {
         let target = if was_effective { 1.0 } else { 0.0 };
         self.slow_confidence = self.slow_confidence * 0.9 + target * 0.1;
-        let delta_target = if was_effective && delta > 0.0 { delta } else { 0.0 };
+        let delta_target = if was_effective && delta > 0.0 {
+            delta
+        } else {
+            0.0
+        };
         self.slow_avg_delta = self.slow_avg_delta * 0.85 + delta_target * 0.15;
     }
 
@@ -997,14 +1005,23 @@ mod tests {
     #[test]
     fn prefer_qos_cpu_dominant() {
         let mut g = CausalGraph::new();
-        let res_before = ResourceSnapshot { rss_mb: 200.0, cpu_pct: 40.0, swap_mb: 500.0 };
+        let res_before = ResourceSnapshot {
+            rss_mb: 200.0,
+            cpu_pct: 40.0,
+            swap_mb: 500.0,
+        };
         // Simulate CPU-dominant effect: large CPU drop, small RSS/swap change
         for cycle in 0..5u64 {
-            g.record_action_with_resources("throttle:electron_bg", 0.80, cycle * 4, res_before.clone());
+            g.record_action_with_resources(
+                "throttle:electron_bg",
+                0.80,
+                cycle * 4,
+                res_before.clone(),
+            );
             let res_after = ResourceSnapshot {
-                rss_mb: 195.0,   // ~2.5% RSS change — minor
-                cpu_pct: 15.0,   // 25% CPU freed — dominant
-                swap_mb: 498.0,  // ~0.4% swap — negligible
+                rss_mb: 195.0,  // ~2.5% RSS change — minor
+                cpu_pct: 15.0,  // 25% CPU freed — dominant
+                swap_mb: 498.0, // ~0.4% swap — negligible
             };
             g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after);
         }
@@ -1019,14 +1036,23 @@ mod tests {
     #[test]
     fn prefer_sigstop_rss_dominant() {
         let mut g = CausalGraph::new();
-        let res_before = ResourceSnapshot { rss_mb: 800.0, cpu_pct: 15.0, swap_mb: 500.0 };
+        let res_before = ResourceSnapshot {
+            rss_mb: 800.0,
+            cpu_pct: 15.0,
+            swap_mb: 500.0,
+        };
         // RSS-dominant: large RSS freed, moderate CPU, small swap
         for cycle in 0..5u64 {
-            g.record_action_with_resources("throttle:chrome_renderer", 0.80, cycle * 4, res_before.clone());
+            g.record_action_with_resources(
+                "throttle:chrome_renderer",
+                0.80,
+                cycle * 4,
+                res_before.clone(),
+            );
             let res_after = ResourceSnapshot {
-                rss_mb: 400.0,   // 400MB RSS freed — dominant
-                cpu_pct: 12.0,   // 3% CPU — minor
-                swap_mb: 490.0,  // 10MB swap — minor
+                rss_mb: 400.0,  // 400MB RSS freed — dominant
+                cpu_pct: 12.0,  // 3% CPU — minor
+                swap_mb: 490.0, // 10MB swap — minor
             };
             g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after);
         }

@@ -395,7 +395,8 @@ impl SignalIntelligence {
 
             // Survival feedback: high pressure + slow/no swap growth = model over-estimated.
             if !swap_growing_fast && memory_pressure >= 0.60 {
-                self.hazard.tick_survived_high_pressure(&risk_features, dt_secs);
+                self.hazard
+                    .tick_survived_high_pressure(&risk_features, dt_secs);
             } else {
                 self.hazard.tick_no_event(dt_secs);
             }
@@ -823,7 +824,8 @@ impl SignalIntelligence {
         // below threshold and never receives updates). Reset to 0.5 so each
         // subsystem gets a fair chance to earn its place after restore.
         const UTILITY_MIN: f64 = 1e-6;
-        self.utility_entropy = if p.utility_entropy.is_finite() && p.utility_entropy >= UTILITY_MIN {
+        self.utility_entropy = if p.utility_entropy.is_finite() && p.utility_entropy >= UTILITY_MIN
+        {
             p.utility_entropy.clamp(0.0, 1.0)
         } else {
             0.5
@@ -860,18 +862,16 @@ impl SignalIntelligence {
     /// Zone feedback with workload context: learns per-workload zone offsets.
     /// If a workload consistently needs different zone thresholds, the offset
     /// accumulates so zones auto-adapt per workload type.
-    pub fn zone_feedback_workload(
-        &mut self,
-        pressure: f64,
-        was_effective: bool,
-        workload: u8,
-    ) {
+    pub fn zone_feedback_workload(&mut self, pressure: f64, was_effective: bool, workload: u8) {
         // Regular zone feedback (global)
         self.zone_feedback(pressure, was_effective);
 
         // Per-workload offset learning (α = 0.002, very slow)
         let alpha = 0.002;
-        let entry = self.workload_zone_offsets.entry(workload).or_insert((0.0, 0.0));
+        let entry = self
+            .workload_zone_offsets
+            .entry(workload)
+            .or_insert((0.0, 0.0));
         if was_effective {
             // Effective → lower zones for this workload (engage earlier)
             entry.0 -= alpha;

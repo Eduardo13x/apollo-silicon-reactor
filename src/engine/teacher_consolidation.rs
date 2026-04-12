@@ -496,7 +496,14 @@ mod tests {
             rationale: "test".to_string(),
         };
 
-        c.consolidate(&outcome, &suggestion, 0.0, &mut weights, &mut detector, &mut arousal);
+        c.consolidate(
+            &outcome,
+            &suggestion,
+            0.0,
+            &mut weights,
+            &mut detector,
+            &mut arousal,
+        );
 
         // Noise and Protected should both be updated, Interactive not.
         assert!(c.gemma_trust.count(SuggestionCategory::Noise) > 0);
@@ -552,7 +559,14 @@ mod tests {
         for _ in 0..5 {
             let outcome = mk_outcome(0.80, 0.65);
             let suggestion = mk_suggestion();
-            c.consolidate(&outcome, &suggestion, 0.0, &mut weights, &mut detector, &mut arousal);
+            c.consolidate(
+                &outcome,
+                &suggestion,
+                0.0,
+                &mut weights,
+                &mut detector,
+                &mut arousal,
+            );
         }
 
         // After 5 positive bursts, the pattern_weight for cfprefsd should
@@ -689,7 +703,9 @@ mod tests {
         };
 
         // Interleave 7 good + 3 bad outcomes.
-        let sequence = [true, true, false, true, true, false, true, true, false, true];
+        let sequence = [
+            true, true, false, true, true, false, true, true, false, true,
+        ];
         for &is_good in &sequence {
             let outcome = if is_good { &good } else { &bad };
             c.consolidate(

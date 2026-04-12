@@ -298,7 +298,15 @@ mod scenarios {
     /// to the graduated-idle path.
     #[test]
     fn s71_gpu_worker_high_faults_long_idle_allowed() {
-        let mut s = snap(7100, "com.apple.metal.shader-cache", 0.5, 800, false, 28800, 28800); // 8h idle
+        let mut s = snap(
+            7100,
+            "com.apple.metal.shader-cache",
+            0.5,
+            800,
+            false,
+            28800,
+            28800,
+        ); // 8h idle
         s.faults_total = 2_000_000; // 2M faults = was doing massive GPU buffer work
         s.wakeups_per_sec = 2.0;
         let snaps = vec![s];
@@ -382,7 +390,15 @@ mod scenarios {
     /// faults = initialization burst, not a broken timer. ALLOW.
     #[test]
     fn s74_xpc_burst_init_allowed() {
-        let mut s = snap(7400, "com.apple.xpc.launchd.domain.user", 15.0, 80, false, 5, 5);
+        let mut s = snap(
+            7400,
+            "com.apple.xpc.launchd.domain.user",
+            15.0,
+            80,
+            false,
+            5,
+            5,
+        );
         s.process_uptime_secs = 10; // just started
         s.wakeups_per_sec = 300.0;
         s.faults_total = 500_000; // loading page tables during init
@@ -485,7 +501,15 @@ mod scenarios {
     /// Apollo must always KILL zombies. KILL.
     #[test]
     fn s79_true_zombie_always_killed() {
-        let mut s = snap(7900, "com.apple.WebKit.Networking", 0.0, 50, false, 99999, 99999);
+        let mut s = snap(
+            7900,
+            "com.apple.WebKit.Networking",
+            0.0,
+            50,
+            false,
+            99999,
+            99999,
+        );
         s.is_zombie = true;
         s.parent_alive = false;
         let snaps = vec![s];
@@ -524,7 +548,15 @@ mod scenarios {
     /// it has not crossed the threshold. Must be ALLOWED (boundary exclusive).
     #[test]
     fn s81_graduated_idle_at_6h_boundary_not_triggered() {
-        let s = snap(8100, "com.apple.coredata.sync", 0.3, 60, false, 21600, 21600);
+        let s = snap(
+            8100,
+            "com.apple.coredata.sync",
+            0.3,
+            60,
+            false,
+            21600,
+            21600,
+        );
         let snaps = vec![s];
         let results = decide(&snaps, None);
         let d = find_decision(&results, "com.apple.coredata.sync");
@@ -571,7 +603,15 @@ mod scenarios {
     /// THROTTLE or FREEZE.
     #[test]
     fn s83_ipc_hub_exactly_at_threshold_not_protected() {
-        let mut s = snap(8300, "com.apple.appkit.xpc.agent", 0.1, 80, false, 14400, 14400);
+        let mut s = snap(
+            8300,
+            "com.apple.appkit.xpc.agent",
+            0.1,
+            80,
+            false,
+            14400,
+            14400,
+        );
         s.mach_port_count = 80; // exactly at threshold (NOT strictly > 80)
         let snaps = vec![s];
         let results = decide(&snaps, None);
@@ -590,8 +630,8 @@ mod scenarios {
     #[test]
     fn s84_graduated_idle_12h_frozen() {
         let mut s = snap(8400, "com.apple.quicklookd", 1.5, 60, false, 43201, 43201); // 12h+ idle
-        // wakeups_per_sec = 1.0 (default) → SilentDaemon tier; cpu=1.5 > 0.5 → idle override skipped
-        // → hits graduated idle rule: secs > 43200 && !has_gui_window && faults < 500K → Freeze
+                                                                                      // wakeups_per_sec = 1.0 (default) → SilentDaemon tier; cpu=1.5 > 0.5 → idle override skipped
+                                                                                      // → hits graduated idle rule: secs > 43200 && !has_gui_window && faults < 500K → Freeze
         s.wakeups_per_sec = 1.0;
         s.faults_total = 0;
         let snaps = vec![s];
@@ -610,7 +650,15 @@ mod scenarios {
     /// has_network || wakeups>5 → protected. ALLOW.
     #[test]
     fn s85_chrome_helper_with_network_protected() {
-        let mut s = snap(8500, "Google Chrome Helper (Renderer)", 3.0, 120, false, 30, 30);
+        let mut s = snap(
+            8500,
+            "Google Chrome Helper (Renderer)",
+            3.0,
+            120,
+            false,
+            30,
+            30,
+        );
         s.has_network = true;
         s.wakeups_per_sec = 30.0;
         let snaps = vec![s];

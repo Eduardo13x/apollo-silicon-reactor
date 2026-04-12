@@ -181,8 +181,7 @@ impl HazardModel {
             // de observación sin evento — equivale a añadir evidencia negativa.
             // Factor 3× para que la supervivencia a presión alta cuente más.
             let effective_hours = self.total_hours + (dt_secs / 3600.0) * 2.0;
-            self.base_rate =
-                (self.total_events as f64 + 1.0) / ((effective_hours + 24.0) * 3600.0);
+            self.base_rate = (self.total_events as f64 + 1.0) / ((effective_hours + 24.0) * 3600.0);
         }
         // Contra-gradiente en β: apply every SURVIVAL_BETA_STRIDE ticks only.
         // At ~5s cycles and frequent high-pressure periods, survival ticks outnumber
@@ -439,14 +438,23 @@ mod tests {
             model.base_rate
         );
         // total_events should be reset to 0 (prevents re-saturation on next tick)
-        assert_eq!(model.total_events, 0, "total_events must reset to prevent re-saturation");
+        assert_eq!(
+            model.total_events, 0,
+            "total_events must reset to prevent re-saturation"
+        );
         // total_hours reset to 24h prior window (NOT preserved — preserving months of
         // uptime would make base_rate ≈ 0 after events=0 reset)
-        assert!((model.total_hours - 24.0).abs() < 1e-10,
-            "total_hours should be reset to 24h prior, got {}", model.total_hours);
+        assert!(
+            (model.total_hours - 24.0).abs() < 1e-10,
+            "total_hours should be reset to 24h prior, got {}",
+            model.total_hours
+        );
         // beta values must all be in valid range
         for b in model.beta.iter() {
-            assert!(*b >= 0.0 && *b <= 5.0, "beta must stay in valid range after validate");
+            assert!(
+                *b >= 0.0 && *b <= 5.0,
+                "beta must stay in valid range after validate"
+            );
         }
     }
 
@@ -486,7 +494,8 @@ mod tests {
         assert!(
             model.base_rate < rate_before,
             "survival evidence should decay base_rate: before={}, after={}",
-            rate_before, model.base_rate
+            rate_before,
+            model.base_rate
         );
     }
 
@@ -502,11 +511,7 @@ mod tests {
             model.tick_survived_high_pressure(&feat, 5.0);
         }
         for (i, b) in model.beta.iter().enumerate() {
-            assert!(
-                *b >= 0.1,
-                "beta[{}] fell below floor of 0.1: got {}",
-                i, b
-            );
+            assert!(*b >= 0.1, "beta[{}] fell below floor of 0.1: got {}", i, b);
         }
     }
 }

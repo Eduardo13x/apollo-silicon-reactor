@@ -421,7 +421,11 @@ impl DriftDetector {
             + (1.0 - DRIFT_SCORE_ALPHA) * self.drift_score;
 
         // Recount drifted beliefs
-        self.drifted_count = self.beliefs.values().filter(|e| e.is_drifted(self.drift_threshold)).count();
+        self.drifted_count = self
+            .beliefs
+            .values()
+            .filter(|e| e.is_drifted(self.drift_threshold))
+            .count();
 
         delta
     }
@@ -560,7 +564,11 @@ impl DriftDetector {
             self.beliefs.remove(&key);
         }
         // Recount drifted beliefs after pruning
-        self.drifted_count = self.beliefs.values().filter(|e| e.is_drifted(self.drift_threshold)).count();
+        self.drifted_count = self
+            .beliefs
+            .values()
+            .filter(|e| e.is_drifted(self.drift_threshold))
+            .count();
     }
 
     /// Number of tracked beliefs.

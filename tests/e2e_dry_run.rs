@@ -48,8 +48,16 @@ fn spawn_daemon_guard() -> DaemonGuard {
 
 fn spawn_daemon_guard_with_profile(profile: &str) -> DaemonGuard {
     let tmpdir = tempfile::tempdir().expect("create tempdir");
-    let socket = tmpdir.path().join("apollo.sock").to_string_lossy().into_owned();
-    let kill_switch = tmpdir.path().join("apollo.disable").to_string_lossy().into_owned();
+    let socket = tmpdir
+        .path()
+        .join("apollo.sock")
+        .to_string_lossy()
+        .into_owned();
+    let kill_switch = tmpdir
+        .path()
+        .join("apollo.disable")
+        .to_string_lossy()
+        .into_owned();
 
     let child = Command::new(DAEMON_BIN)
         .args(["daemon", "--profile", profile, "--dry-run"])
@@ -73,7 +81,12 @@ fn spawn_daemon_guard_with_profile(profile: &str) -> DaemonGuard {
         "daemon socket not created within {BOOT_TIMEOUT:?} — daemon may have crashed"
     );
 
-    DaemonGuard { child, socket, kill_switch, _tmpdir: tmpdir }
+    DaemonGuard {
+        child,
+        socket,
+        kill_switch,
+        _tmpdir: tmpdir,
+    }
 }
 
 /// Send one JSON request, return the raw response line.
@@ -84,7 +97,9 @@ fn send_request(socket: &str, json: &str) -> String {
 fn send_request_timeout(socket: &str, json: &str, timeout: Duration) -> String {
     let mut stream = UnixStream::connect(socket).expect("connect to daemon socket");
     stream.set_read_timeout(Some(timeout)).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     writeln!(stream, "{}", json).expect("write request");
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -94,21 +109,31 @@ fn send_request_timeout(socket: &str, json: &str, timeout: Duration) -> String {
 
 /// Like send_request but returns None on any IO error (for adversarial tests).
 fn try_send_request(socket: &str, json: &str) -> Option<String> {
-    let Ok(mut stream) = UnixStream::connect(socket) else { return None };
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return None;
+    };
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .ok()?;
     writeln!(stream, "{}", json).ok()?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
-    if line.is_empty() { None } else { Some(line) }
+    if line.is_empty() {
+        None
+    } else {
+        Some(line)
+    }
 }
 
 /// Subscribe to the daemon and collect up to `n` push messages.
 fn subscribe_collect(socket: &str, n: usize, timeout: Duration) -> Vec<serde_json::Value> {
     let mut stream = UnixStream::connect(socket).expect("connect for subscribe");
     stream.set_read_timeout(Some(timeout)).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     writeln!(stream, r#"{{"type":"Subscribe"}}"#).expect("write subscribe");
 
     let mut reader = BufReader::new(stream);
@@ -133,9 +158,8 @@ fn subscribe_collect(socket: &str, n: usize, timeout: Duration) -> Vec<serde_jso
 
 /// Parse response and return the Value.
 fn parse(resp: &str) -> serde_json::Value {
-    serde_json::from_str(resp).unwrap_or_else(|e| {
-        panic!("failed to parse response as JSON: {e}\nResponse was: {resp:?}")
-    })
+    serde_json::from_str(resp)
+        .unwrap_or_else(|e| panic!("failed to parse response as JSON: {e}\nResponse was: {resp:?}"))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -149,7 +173,10 @@ fn e2e_boots_and_serves_status() {
     let resp = send_request(&guard.socket, r#"{"type":"GetStatus"}"#);
     let v = parse(&resp);
     assert_eq!(v["type"], "Status", "expected Status response, got: {v}");
-    assert_eq!(v["payload"]["running"], true, "daemon must report running=true");
+    assert_eq!(
+        v["payload"]["running"], true,
+        "daemon must report running=true"
+    );
 }
 
 #[test]
@@ -171,9 +198,15 @@ fn e2e_capabilities_coherent() {
     assert_eq!(v["type"], "Capabilities", "expected Capabilities, got: {v}");
     let caps = &v["payload"];
     // Non-root test runner: memorystatus requires root.
-    assert_eq!(caps["can_memorystatus"], false, "non-root must have can_memorystatus=false");
+    assert_eq!(
+        caps["can_memorystatus"], false,
+        "non-root must have can_memorystatus=false"
+    );
     // macOS: taskpolicy always available.
-    assert_eq!(caps["can_taskpolicy"], true, "macOS must have can_taskpolicy=true");
+    assert_eq!(
+        caps["can_taskpolicy"], true,
+        "macOS must have can_taskpolicy=true"
+    );
 }
 
 #[test]
@@ -187,8 +220,12 @@ fn e2e_cycles_increment() {
         pushes.len()
     );
     // cycles must be monotonically increasing.
-    let c1 = pushes[0]["payload"]["metrics"]["cycles"].as_u64().unwrap_or(0);
-    let c2 = pushes[1]["payload"]["metrics"]["cycles"].as_u64().unwrap_or(0);
+    let c1 = pushes[0]["payload"]["metrics"]["cycles"]
+        .as_u64()
+        .unwrap_or(0);
+    let c2 = pushes[1]["payload"]["metrics"]["cycles"]
+        .as_u64()
+        .unwrap_or(0);
     assert!(c2 > c1, "cycles must increase: {c1} → {c2}");
 }
 
@@ -198,7 +235,9 @@ fn e2e_doctor_returns_checks() {
     let resp = send_request(&guard.socket, r#"{"type":"Doctor"}"#);
     let v = parse(&resp);
     assert_eq!(v["type"], "Doctor", "expected Doctor, got: {v}");
-    let checks = v["payload"]["checks"].as_array().expect("checks must be array");
+    let checks = v["payload"]["checks"]
+        .as_array()
+        .expect("checks must be array");
     assert!(!checks.is_empty(), "Doctor must return at least one check");
 }
 
@@ -238,7 +277,10 @@ fn e2e_kill_switch_pauses_and_resumes() {
     // Verify not paused initially.
     let resp = send_request(&guard.socket, r#"{"type":"GetStatus"}"#);
     let v = parse(&resp);
-    assert_eq!(v["payload"]["kill_switch"], false, "kill_switch must start false");
+    assert_eq!(
+        v["payload"]["kill_switch"], false,
+        "kill_switch must start false"
+    );
 
     // Create kill switch file.
     std::fs::write(&guard.kill_switch, "").expect("create kill switch");
@@ -282,7 +324,11 @@ fn e2e_rapid_profile_switching() {
 
     // 20 rapid profile switches alternating Performance / SafeRoot.
     for i in 0..20 {
-        let profile = if i % 2 == 0 { "Performance" } else { "SafeRoot" };
+        let profile = if i % 2 == 0 {
+            "Performance"
+        } else {
+            "SafeRoot"
+        };
         let json = format!(
             r#"{{"type":"SetProfile","payload":{{"profile":"{profile}","ttl_minutes":null}}}}"#
         );
@@ -294,7 +340,10 @@ fn e2e_rapid_profile_switching() {
     // Daemon must still serve a coherent status after the barrage.
     let resp = send_request(&guard.socket, r#"{"type":"GetStatus"}"#);
     let v = parse(&resp);
-    assert_eq!(v["type"], "Status", "daemon must serve Status after rapid switching");
+    assert_eq!(
+        v["type"], "Status",
+        "daemon must serve Status after rapid switching"
+    );
 }
 
 #[test]
@@ -387,7 +436,10 @@ fn e2e_socket_flood_33_rejected_gracefully() {
     // Release held connections so daemon frees the slots.
     drop(held);
 
-    assert!(rejected, "33rd connection must be rejected when 32 are held open");
+    assert!(
+        rejected,
+        "33rd connection must be rejected when 32 are held open"
+    );
 
     // After the flood: daemon must still serve requests normally.
     std::thread::sleep(Duration::from_millis(500));
@@ -424,7 +476,10 @@ fn e2e_malformed_json_doesnt_crash() {
     // Daemon must still be alive and responding.
     let resp = send_request(&guard.socket, r#"{"type":"GetStatus"}"#);
     let v = parse(&resp);
-    assert_eq!(v["type"], "Status", "daemon must survive malformed JSON payloads");
+    assert_eq!(
+        v["type"], "Status",
+        "daemon must survive malformed JSON payloads"
+    );
 }
 
 #[test]
@@ -433,9 +488,8 @@ fn e2e_oversized_request_rejected() {
 
     // Send a 128 KB request — well above the 64 KB limit in the socket handler.
     let big_note = "x".repeat(128 * 1024);
-    let oversized = format!(
-        r#"{{"type":"Feedback","payload":{{"rating":"good","note":"{big_note}"}}}}"#
-    );
+    let oversized =
+        format!(r#"{{"type":"Feedback","payload":{{"rating":"good","note":"{big_note}"}}}}"#);
 
     if let Ok(mut stream) = UnixStream::connect(&guard.socket) {
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -465,7 +519,9 @@ fn e2e_rapid_subscribe_unsubscribe() {
     // Open and immediately close 50 subscription connections.
     for _ in 0..50 {
         if let Ok(mut stream) = UnixStream::connect(&guard.socket) {
-            stream.set_write_timeout(Some(Duration::from_millis(200))).ok();
+            stream
+                .set_write_timeout(Some(Duration::from_millis(200)))
+                .ok();
             let _ = writeln!(stream, r#"{{"type":"Subscribe"}}"#);
             // Drop stream immediately — abrupt disconnect.
         }
@@ -477,7 +533,10 @@ fn e2e_rapid_subscribe_unsubscribe() {
     // Daemon must still serve requests without fd exhaustion.
     let resp = send_request(&guard.socket, r#"{"type":"GetStatus"}"#);
     let v = parse(&resp);
-    assert_eq!(v["type"], "Status", "daemon must survive 50 rapid subscribe/unsubscribe");
+    assert_eq!(
+        v["type"], "Status",
+        "daemon must survive 50 rapid subscribe/unsubscribe"
+    );
 }
 
 #[test]
@@ -487,7 +546,11 @@ fn e2e_unknown_request_type_handled() {
     // Send a request with an unknown type tag.
     if let Ok(mut stream) = UnixStream::connect(&guard.socket) {
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        writeln!(stream, r#"{{"type":"FakeNonExistentCommand","payload":{{}}}}"#).ok();
+        writeln!(
+            stream,
+            r#"{{"type":"FakeNonExistentCommand","payload":{{}}}}"#
+        )
+        .ok();
         let mut buf = String::new();
         let _ = BufReader::new(stream).read_line(&mut buf);
         // Daemon may close the connection or return an error — both are fine.
@@ -497,7 +560,10 @@ fn e2e_unknown_request_type_handled() {
     // Daemon must still serve valid requests.
     let resp = send_request(&guard.socket, r#"{"type":"GetVersion"}"#);
     let v = parse(&resp);
-    assert_eq!(v["type"], "VersionInfo", "daemon must survive unknown request type");
+    assert_eq!(
+        v["type"], "VersionInfo",
+        "daemon must survive unknown request type"
+    );
 }
 
 #[test]
@@ -505,7 +571,13 @@ fn e2e_concurrent_set_profile_race() {
     let guard = spawn_daemon_guard();
     let socket = guard.socket.clone();
 
-    let profiles = ["aggressive-root", "safe-root", "balanced-root", "aggressive-root", "safe-root"];
+    let profiles = [
+        "aggressive-root",
+        "safe-root",
+        "balanced-root",
+        "aggressive-root",
+        "safe-root",
+    ];
     let handles: Vec<_> = profiles
         .iter()
         .enumerate()
@@ -530,9 +602,15 @@ fn e2e_concurrent_set_profile_race() {
     // After concurrent mutations, GetStatus must return a valid, parseable profile.
     let resp = send_request(&guard.socket, r#"{"type":"GetStatus"}"#);
     let v = parse(&resp);
-    assert_eq!(v["type"], "Status", "daemon must survive concurrent SetProfile race");
+    assert_eq!(
+        v["type"], "Status",
+        "daemon must survive concurrent SetProfile race"
+    );
     let profile = v["payload"]["profile"].as_str().unwrap_or("");
-    assert!(!profile.is_empty(), "profile must not be empty after concurrent writes");
+    assert!(
+        !profile.is_empty(),
+        "profile must not be empty after concurrent writes"
+    );
 }
 
 #[test]
@@ -542,7 +620,9 @@ fn e2e_client_disconnect_survives() {
     // Abruptly disconnect 20 subscriptions without reading.
     for _ in 0..20 {
         if let Ok(mut stream) = UnixStream::connect(&guard.socket) {
-            stream.set_write_timeout(Some(Duration::from_millis(100))).ok();
+            stream
+                .set_write_timeout(Some(Duration::from_millis(100)))
+                .ok();
             let _ = writeln!(stream, r#"{{"type":"Subscribe"}}"#);
             // Drop → abrupt disconnect while daemon is waiting to push.
         }
@@ -554,7 +634,10 @@ fn e2e_client_disconnect_survives() {
     // Daemon must still run after 20 broken-pipe events.
     let resp = send_request(&guard.socket, r#"{"type":"GetStatus"}"#);
     let v = parse(&resp);
-    assert_eq!(v["type"], "Status", "daemon must survive 20 abrupt client disconnects");
+    assert_eq!(
+        v["type"], "Status",
+        "daemon must survive 20 abrupt client disconnects"
+    );
 }
 
 #[test]
@@ -571,10 +654,18 @@ fn e2e_metrics_bounded_after_stress() {
 
     let m = &v["payload"];
     let cycle_count = m["cycles"].as_u64().unwrap_or(0);
-    assert!(cycle_count >= 2, "cycles must be ≥2 after waiting, got {cycle_count}");
+    assert!(
+        cycle_count >= 2,
+        "cycles must be ≥2 after waiting, got {cycle_count}"
+    );
 
     // Counters must be non-negative (JSON numbers, present in the payload).
-    for field in &["freezes_applied", "throttles_applied", "boosts_applied", "unfreezes_applied"] {
+    for field in &[
+        "freezes_applied",
+        "throttles_applied",
+        "boosts_applied",
+        "unfreezes_applied",
+    ] {
         let val = m[field].as_u64();
         assert!(
             val.is_some(),
@@ -612,8 +703,12 @@ fn e2e_score() {
     // We collect up to 40 pushes, bounded by the 10s window.
     let mut cycle_stream =
         UnixStream::connect(&guard.socket).expect("connect for throughput measurement");
-    cycle_stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-    cycle_stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    cycle_stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    cycle_stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     writeln!(cycle_stream, r#"{{"type":"Subscribe"}}"#).expect("write subscribe");
 
     let mut reader = BufReader::new(cycle_stream);
@@ -671,7 +766,9 @@ fn e2e_score() {
         let st_resp = send_request(&guard.socket, r#"{"type":"GetStatus"}"#);
         let st_v = serde_json::from_str::<serde_json::Value>(&st_resp).unwrap_or_default();
         let effective = st_v["payload"]["effective_profile"].as_str().unwrap_or("");
-        let override_active = st_v["payload"]["override_active"].as_bool().unwrap_or(false);
+        let override_active = st_v["payload"]["override_active"]
+            .as_bool()
+            .unwrap_or(false);
         if effective.contains("aggressive") || override_active {
             1
         } else {
@@ -685,9 +782,15 @@ fn e2e_score() {
     // We already spent 10s so cycles have run; check health directly.
     let health_resp = send_request(&guard.socket, r#"{"type":"GetHealth"}"#);
     let health_v = serde_json::from_str::<serde_json::Value>(&health_resp).unwrap_or_default();
-    let cb_state = health_v["payload"]["circuit_breaker"].as_str().unwrap_or("");
+    let cb_state = health_v["payload"]["circuit_breaker"]
+        .as_str()
+        .unwrap_or("");
     let op_mode = health_v["payload"]["operation_mode"].as_str().unwrap_or("");
-    let health_clean: u32 = if cb_state == "closed" && op_mode == "full" { 1 } else { 0 };
+    let health_clean: u32 = if cb_state == "closed" && op_mode == "full" {
+        1
+    } else {
+        0
+    };
 
     // ── Composite score ───────────────────────────────────────────────────────
     let score = (cycles_in_10s * 20)

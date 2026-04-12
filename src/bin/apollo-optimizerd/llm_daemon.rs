@@ -79,8 +79,7 @@ pub fn llm_reactive_tick(
             guard.llm_state.enabled = true;
             guard.llm_state.training_started_at = Some(now);
             // 10-year TTL — effectively permanent for local models.
-            guard.llm_state.training_expires_at =
-                Some(now + ChronoDuration::days(365 * 10));
+            guard.llm_state.training_expires_at = Some(now + ChronoDuration::days(365 * 10));
             write_json(&llm_state_path, &guard.llm_state, Some(0o600));
         }
     } else {
@@ -110,14 +109,21 @@ pub fn llm_reactive_tick(
         // Extract outcome data without holding the lock across policy access.
         let outcome_data = {
             let guard = state.llm.lock_recover();
-            match (guard.llm_state.pending_outcome_at, guard.llm_state.pending_outcome_pressure) {
+            match (
+                guard.llm_state.pending_outcome_at,
+                guard.llm_state.pending_outcome_pressure,
+            ) {
                 (Some(pending_at), Some(pending_pressure))
                     if now - pending_at >= ChronoDuration::seconds(30) =>
                 {
                     Some((
                         pending_at,
                         pending_pressure,
-                        guard.llm_state.pending_outcome_rationale.clone().unwrap_or_default(),
+                        guard
+                            .llm_state
+                            .pending_outcome_rationale
+                            .clone()
+                            .unwrap_or_default(),
                         guard.llm_state.pending_added_protected.clone(),
                     ))
                 }
@@ -145,8 +151,7 @@ pub fn llm_reactive_tick(
                         pg.learned_policy.protected_patterns.sort();
                         pg.learned_policy.learned_at = Some(now);
                         let lp_clone = pg.learned_policy.clone();
-                        pg.adaptive_governor
-                            .update_learned_policy(&lp_clone);
+                        pg.adaptive_governor.update_learned_policy(&lp_clone);
                         tracing::info!(
                             reverted,
                             delta,
@@ -455,9 +460,8 @@ pub fn llm_reactive_tick(
                     // pressure_before (pre-intervention baseline).  Using _before
                     // causes false skips when pressure returns to pre-suggestion
                     // levels after the suggestion's effect wears off.
-                    let pressure_change = (snapshot.pressure.memory_pressure
-                        - prev.pressure_after)
-                        .abs();
+                    let pressure_change =
+                        (snapshot.pressure.memory_pressure - prev.pressure_after).abs();
                     if pressure_change < 0.10 {
                         return; // same scenario, Gemma would repeat herself
                     }
@@ -476,9 +480,21 @@ pub fn llm_reactive_tick(
             .map(|p| p.name.as_str())
             .collect();
         let all_known = top_names.iter().all(|name| {
-            policy.learned_policy.interactive_patterns.iter().any(|p| name.contains(p.as_str()))
-                || policy.learned_policy.noise_patterns.iter().any(|p| name.contains(p.as_str()))
-                || policy.learned_policy.protected_patterns.iter().any(|p| name.contains(p.as_str()))
+            policy
+                .learned_policy
+                .interactive_patterns
+                .iter()
+                .any(|p| name.contains(p.as_str()))
+                || policy
+                    .learned_policy
+                    .noise_patterns
+                    .iter()
+                    .any(|p| name.contains(p.as_str()))
+                || policy
+                    .learned_policy
+                    .protected_patterns
+                    .iter()
+                    .any(|p| name.contains(p.as_str()))
         });
         if all_known && !heuristic_struggling {
             return; // S1 already has all answers, skip S2
@@ -549,7 +565,8 @@ pub fn llm_reactive_tick(
         frozen_count,
     };
 
-    let suggestion_res = advisor.call_raw(snapshot, &api_key, Some(&current_policy), Some(&teacher));
+    let suggestion_res =
+        advisor.call_raw(snapshot, &api_key, Some(&current_policy), Some(&teacher));
 
     // Apply suggestion and persist state.
     match suggestion_res {
@@ -690,8 +707,7 @@ pub fn llm_reactive_tick(
                         guard.llm_state.pending_outcome_pressure =
                             Some(snapshot.pressure.memory_pressure);
                         guard.llm_state.pending_outcome_at = Some(now);
-                        let snippet: String =
-                            suggestion.rationale.chars().take(80).collect();
+                        let snippet: String = suggestion.rationale.chars().take(80).collect();
                         guard.llm_state.pending_outcome_rationale = Some(snippet);
                         // Track protected patterns added so we can revert on WORSENED.
                         guard.llm_state.pending_added_protected =

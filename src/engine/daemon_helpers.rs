@@ -294,8 +294,8 @@ pub fn detect_prior_crash() -> bool {
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
         match prev_started {
             Some(started) => {
-                let lived = chrono::Utc::now()
-                    .signed_duration_since(started.with_timezone(&chrono::Utc));
+                let lived =
+                    chrono::Utc::now().signed_duration_since(started.with_timezone(&chrono::Utc));
                 lived.num_seconds() >= 60
             }
             None => true, // unparseable old format → be conservative, treat as crash
@@ -632,7 +632,9 @@ mod tests {
     /// Serialize sentinel tests — they share a global file path.
     fn sentinel_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -643,7 +645,10 @@ mod tests {
         let crashed = detect_prior_crash();
         assert!(!crashed, "fresh start should not appear as crash");
         remove_crash_sentinel();
-        assert!(!std::path::Path::new(path).exists(), "sentinel should be removed after clean shutdown");
+        assert!(
+            !std::path::Path::new(path).exists(),
+            "sentinel should be removed after clean shutdown"
+        );
     }
 
     #[test]
@@ -651,14 +656,17 @@ mod tests {
         let _guard = sentinel_test_lock();
         let path = crash_sentinel_path();
         let _ = fs::remove_file(path); // clean state
-        // Inject an aged sentinel: previous session "started" 120s ago.
+                                       // Inject an aged sentinel: previous session "started" 120s ago.
         let aged = chrono::Utc::now() - chrono::Duration::seconds(120);
         let _ = fs::write(
             path,
             format!("{{\"pid\":1,\"started\":\"{}\"}}", aged.to_rfc3339()),
         );
         let crashed = detect_prior_crash(); // sees aged sentinel → real crash
-        assert!(crashed, "aged sentinel (≥60s uptime) should be detected as crash");
+        assert!(
+            crashed,
+            "aged sentinel (≥60s uptime) should be detected as crash"
+        );
         remove_crash_sentinel();
     }
 
