@@ -298,12 +298,15 @@ impl OverflowGuard {
             .map(|r| r.current_adjustment)
             .unwrap_or(0.0);
         // device_offset: -0.05 on ≤8 GB (act sooner), +0.05 on >16 GB (more headroom).
-        let total_offset = off + workload_bonus + rl_adj + self.device_offset;
+        // Cap compound offset at -0.15 to prevent positive feedback loop:
+        // overflow → lower thresholds → more overflows → even lower thresholds.
+        // On 8GB M1, uncapped compound reached -0.33 (critical_pressure 0.55).
+        let total_offset = (off + workload_bonus + rl_adj + self.device_offset).max(-0.15);
 
         OverflowThresholds {
             bg_pressure: (0.78 + total_offset).max(RL_ABSOLUTE_FLOOR),
-            critical_pressure: (0.88 + total_offset).max(0.65),
-            extreme_pressure: (0.90 + total_offset).max(0.70),
+            critical_pressure: (0.88 + total_offset).max(0.73),
+            extreme_pressure: (0.90 + total_offset).max(0.78),
             workload_mode,
         }
     }

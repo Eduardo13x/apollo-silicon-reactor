@@ -288,6 +288,12 @@ pub fn apply_qos_routing(
     }
 }
 
+/// How often to flush runtime_metrics.json to disk.
+/// At 300ms/cycle the file would otherwise be written ~3/s (73KB/s with
+/// atomic-write overhead), hitting macOS's daily 2GB write budget in ~8h.
+/// Writing every 25 cycles (~7.5s) reduces disk I/O by 25x.
+const METRICS_DISK_WRITE_EVERY_N_CYCLES: u64 = 25;
+
 /// Phase 3: Merge execution outcomes into metrics, update cycle timing, write to disk.
 ///
 /// Acquires `state.metrics` once, merges all `exec_outcomes` counters, records
@@ -313,6 +319,8 @@ pub fn merge_cycle_metrics<'a>(
     critical_failure_timestamps: &mut Vec<Instant>,
     timeline_path: &Path,
     metrics_path: &Path,
+    cycle_count: u64,
+    in_sleep: bool,
 ) {
     let mut metrics = state.metrics.lock_recover();
     metrics.metrics.boosts_applied += exec_outcomes.boosts_applied;
@@ -420,5 +428,13 @@ pub fn merge_cycle_metrics<'a>(
     // and holding the lock during I/O blocks GetStatus requests.
     let metrics_snapshot = metrics.metrics.clone();
     drop(metrics);
-    write_metrics(metrics_path, &metrics_snapshot);
+    // Rate-limit disk writes: atomic write (temp+rename) at 300ms/cycle was
+    // writing 11KB × 2 = 22KB every 300ms = 73KB/s. Write every 25 cycles
+    // (~7.5s) to stay within macOS's 24.86KB/s daily disk write budget.
+    // Also skip writes while the system is sleeping — macOS accounts disk
+    // writes against the daemon even during pre-sleep, burning the daily
+    // budget while the machine is idle.
+    if !in_sleep && cycle_count % METRICS_DISK_WRITE_EVERY_N_CYCLES == 0 {
+        write_metrics(metrics_path, &metrics_snapshot);
+    }
 }

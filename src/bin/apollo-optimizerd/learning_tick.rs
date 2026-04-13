@@ -95,6 +95,7 @@ pub fn run_learning_tick<'a>(
     persist_generations: u32,
     skills_path: &str,
     nested_learner: &mut NestedLearner,
+    in_sleep: bool,
 ) {
     // ── Arousal EMA: update every cycle from current pressure + swap ─────────
     // p_oom_est ∈ [0,1]: proxy for OOM risk derived from pressure above 0.70.
@@ -669,9 +670,12 @@ pub fn run_learning_tick<'a>(
         snapshot.pressure.memory_pressure,
     );
 
-    // ── Periodic persist: every 100 cycles ───────────────────────────────────
-    // Flush any buffered observations before persisting state.
-    if cycle_count % 100 == 0 {
+    // ── Periodic persist: every 300 cycles (~90s at 300ms/cycle) ─────────────
+    // Was every 100 cycles (~30s), causing learned_state.json (1MB) to be
+    // written at 33KB/s — pushing total daemon writes past macOS's 24.86KB/s
+    // daily budget. 300 cycles reduces this component to ~11KB/s.
+    // Also skipped while in_sleep: no point persisting while system is asleep.
+    if !in_sleep && cycle_count % 300 == 0 {
         learning_pipeline.flush_remaining(
             lctx.outcome_tracker,
             lctx.causal_graph,

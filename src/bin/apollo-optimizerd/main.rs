@@ -83,6 +83,7 @@ use apollo_optimizer::engine::predictive_agent::{
 use apollo_optimizer::engine::proc_taskinfo;
 use apollo_optimizer::engine::process_tree::{ProcessEntry, ProcessTree};
 use apollo_optimizer::engine::profile_governor::GovernorInput;
+use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
 use apollo_optimizer::engine::safety::{
     behavioral_protection_score, classify_protection, critical_background_processes,
     enforce_limits_with_budget, infrastructure_processes, is_user_interactive_app,
@@ -1314,6 +1315,7 @@ fn main() -> anyhow::Result<()> {
             // Spotlight pause state: true when Apollo has paused Spotlight indexing
             // via mdutil to relieve memory pressure.  Re-enabled when pressure normalizes.
             let mut spotlight_paused: bool = false;
+            let mut spotlight_paused_at: Option<Instant> = None;
             // EMA interactivity classifier: track per-PID rusage CPU deltas
             // to compute cpu_wall_ratio. Key = PID, value = (prev_user_ns,
             // prev_system_ns, proc_start_abstime) for delta computation.
@@ -4102,8 +4104,10 @@ fn main() -> anyhow::Result<()> {
                 // Jiang & Zhang 2005 — proactive beats reactive by 20-40%.
                 // Runs every 10 cycles (~5s) to avoid vm_stat overhead every cycle.
                 if cycle_count % 10 == 0 {
+                    // snapshot.pressure.memory_pressure already includes battery
+                    // + thermal boosts via effective_pressure::compute(). Don't add again.
                     let freed = page_reclaim.tick(
-                        (snapshot.pressure.memory_pressure + battery_pressure_boost(&power_mgr) + thermal_pressure_boost).clamp(0.0, 1.0),
+                        snapshot.pressure.memory_pressure,
                         display_turbo.is_turbo_active() || thermal_action.phase >= apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase2Moderate,
                         foreground_idle,
                     );
@@ -4523,7 +4527,9 @@ fn main() -> anyhow::Result<()> {
                 // re-enable when pressure normalizes.  Uses mdutil (clean handshake
                 // with Spotlight server) rather than SIGSTOP — no index corruption risk.
                 // Gate: memory_pressure ≥ 0.75 AND swap ≥ 1.5 GB → pause.
-                // Re-enable: memory_pressure < 0.55 AND spotlight was paused by us.
+                // Re-enable: memory_pressure < 0.40 AND paused ≥ 120s (cooldown).
+                // Previous re-enable at 0.55 was too aggressive — caused rapid
+                // on/off oscillation and mdworker memory storms.
                 {
                     let mem_p = snapshot.pressure.memory_pressure;
                     let swap_gb =
@@ -4541,7 +4547,12 @@ fn main() -> anyhow::Result<()> {
                                 },
                             );
                             spotlight_paused = true;
-                        } else if spotlight_paused && mem_p < 0.55 {
+                            spotlight_paused_at = Some(Instant::now());
+                        } else if spotlight_paused && mem_p < 0.40
+                            && spotlight_paused_at
+                                .map(|t| t.elapsed() >= Duration::from_secs(120))
+                                .unwrap_or(true)
+                        {
                             actions.push(
                                 apollo_optimizer::engine::types::RootAction::ToggleSpotlight {
                                     enabled: true,
@@ -4550,6 +4561,7 @@ fn main() -> anyhow::Result<()> {
                                 },
                             );
                             spotlight_paused = false;
+                            spotlight_paused_at = None;
                         }
                     }
                 }
@@ -4598,9 +4610,10 @@ fn main() -> anyhow::Result<()> {
                             .top_processes
                             .iter()
                             .filter(|p| {
-                                !interactive_pats
-                                    .iter()
-                                    .any(|pat| p.name.contains(pat.as_str()))
+                                !is_interactive_app_name(&p.name)
+                                    && !interactive_pats
+                                        .iter()
+                                        .any(|pat| p.name.contains(pat.as_str()))
                                     && !protected_pats
                                         .iter()
                                         .any(|pat| p.name.contains(pat.as_str()))
@@ -4640,6 +4653,12 @@ fn main() -> anyhow::Result<()> {
                     let mut bg_procs: Vec<_> = proc_snaps
                         .iter()
                         .filter(|p| {
+                            // Skip hardcoded interactive apps (Brave, Chrome, etc.) —
+                            // these are boosted by decide_actions; hinting them causes
+                            // boost↔degrade thrashing that inflates wired memory.
+                            if is_interactive_app_name(&p.name) {
+                                return false;
+                            }
                             // Skip system-critical, infra, and policy-protected processes.
                             let is_interactive =
                                 is_user_interactive_app(p.has_gui_window, p.secs_since_user_interaction, p.rss_bytes, &p.name);
@@ -6374,6 +6393,7 @@ fn main() -> anyhow::Result<()> {
                         persist_generations,
                         skills_path(),
                         &mut nested_learner,
+                        sleep_notifier.is_sleeping(),
                     );
                     // Apply ws_spike_threshold / fluidity_degraded_threshold from LearnableParams.
                     // Keeps fluidity detection calibrated with learned values.
@@ -6585,6 +6605,8 @@ fn main() -> anyhow::Result<()> {
                     &mut critical_failure_timestamps,
                     Path::new(&timeline_path),
                     Path::new(&metrics_path),
+                    cycle_count,
+                    sleep_notifier.is_sleeping(),
                 );
 
                 // ── Enriched telemetry wiring (2026-04-04) ──────────────────────────────

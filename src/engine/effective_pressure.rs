@@ -118,8 +118,11 @@ pub fn compute(
         (0.0..=1.0).contains(&base),
         "base pressure out of range: {base}"
     );
-    let effective = (base
-        + hardware
+    // Cap total boost delta at 0.30 to prevent artificial pressure inflation
+    // from triggering ThermalConstrained false positives. Individual boosts
+    // are small (0.04-0.30) but 10 factors can stack to 2.34 uncapped.
+    // With cap, effective = base + min(sum_boosts, 0.30).
+    let total_boost = (hardware
         + battery
         + thermal
         + llm_workload
@@ -128,7 +131,8 @@ pub fn compute(
         + memory_bandwidth
         + smc_thermal
         + battery_overheat)
-        .clamp(0.0, 1.0);
+        .min(0.30);
+    let effective = (base + total_boost).clamp(0.0, 1.0);
 
     let components = PressureComponents {
         base,
@@ -161,18 +165,17 @@ mod tests {
     }
 
     #[test]
-    fn all_boosts_maxed_clamps_to_one() {
-        // hw=0.30, batt=0.18, thermal=0.40, llm=0.20, charging=0.06,
-        // batt_low=0.08, mem_bw=0.10, smc_thermal=0.30, overheat=0.12
-        // sum = 0.60 + 1.74 = 2.34 → clamped to 1.0
+    fn all_boosts_maxed_caps_at_030_delta() {
+        // Total boost sum = 1.74 but capped at 0.30 → effective = 0.60 + 0.30 = 0.90
         let (eff, comp) = compute(0.60, 0.30, 0.18, 0.40, 0.20, 0.06, 0.08, 0.10, 0.30, 0.12);
-        assert_eq!(eff, 1.0);
-        assert_eq!(comp.effective, 1.0);
-        // base is preserved even though effective is clamped
+        assert!(
+            (eff - 0.90).abs() < 1e-9,
+            "expected 0.90 (base 0.60 + cap 0.30), got {eff}"
+        );
         assert_eq!(comp.base, 0.60);
         assert!(
             comp.total_boost() > 1.0,
-            "boosts sum should exceed 1.0 in worst case"
+            "raw boosts sum should exceed 1.0 in worst case"
         );
     }
 
@@ -222,8 +225,9 @@ mod tests {
 
     #[test]
     fn thermal_boost_only() {
+        // Single boost of 0.40 > cap 0.30, so effective = 0.40 + 0.30 = 0.70
         let (eff, comp) = compute(0.40, 0.0, 0.0, 0.40, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        assert!((eff - 0.80).abs() < 1e-9);
+        assert!((eff - 0.70).abs() < 1e-9);
         assert_eq!(comp.thermal, 0.40);
     }
 

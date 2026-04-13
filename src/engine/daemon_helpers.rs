@@ -366,17 +366,16 @@ pub fn append_timeline(path: &Path, transition: &ProfileTransition) {
 }
 
 pub fn rotate_timeline(path: &Path) {
-    const MAX_BYTES: u64 = 10 * 1024 * 1024;
+    // Keep cap small (2MB) and only 1 rotation — was 10MB × 3 = 30MB per log.
+    // discrepancy.jsonl alone had 3 × 10MB = 30MB of stale ML override logs.
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
     if fs::symlink_metadata(path)
         .map(|m| !m.file_type().is_symlink() && m.len() > MAX_BYTES)
         .unwrap_or(false)
     {
         let p1 = format!("{}.1", path.display());
-        let p2 = format!("{}.2", path.display());
-        let p3 = format!("{}.3", path.display());
-        let _ = fs::remove_file(&p3);
-        let _ = fs::rename(&p2, &p3);
-        let _ = fs::rename(&p1, &p2);
+        // Remove old rotation and replace with current file.
+        let _ = fs::remove_file(&p1);
         let _ = fs::rename(path, &p1);
     }
 }

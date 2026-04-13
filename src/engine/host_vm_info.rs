@@ -134,18 +134,27 @@ impl VmPageStats {
     /// Matches `memory_pressure -Q` output: pressure = 1.0 - free_percentage.
     /// Free percentage includes free + inactive + speculative pages (reclaimable).
     pub fn pressure(&self) -> f64 {
-        let total = self.free_pages
+        let total_pages = self.free_pages
             + self.active_pages
             + self.inactive_pages
             + self.speculative_pages
             + self.wired_pages
             + self.compressor_pages;
-        if total == 0 {
+        if total_pages == 0 {
             return 0.0;
         }
-        let free_pct =
-            (self.free_pages + self.inactive_pages + self.speculative_pages) as f64 / total as f64;
-        (1.0 - free_pct).clamp(0.0, 1.0)
+        // Available = free + inactive + speculative + purgeable (soft-available).
+        // Wired and compressor are NOT available — but active pages may be
+        // reclaimable under pressure. Treat active as 50% available since
+        // kernel can demote them to inactive when needed.
+        // Previous formula treated active as 0% available, yielding ~0.93
+        // on 8GB M1 under normal load — massive over-report that triggered
+        // unnecessary throttle storms.
+        let available = self.free_pages as f64
+            + self.inactive_pages as f64
+            + self.speculative_pages as f64
+            + self.active_pages as f64 * 0.50;
+        (1.0 - available / total_pages as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -300,12 +309,13 @@ mod tests {
     }
 
     #[test]
-    fn full_pressure_when_all_wired() {
+    fn high_pressure_when_all_wired() {
         let stats = VmPageStats {
             wired_pages: 1000,
             page_size: 16384,
             ..Default::default()
         };
+        // All wired = 100% unavailable
         assert!((stats.pressure() - 1.0).abs() < f64::EPSILON);
     }
 

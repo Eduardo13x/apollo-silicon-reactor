@@ -22,6 +22,11 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct SleepNotifier {
     will_sleep: Arc<AtomicBool>,
+    /// True from `kIOMessageSystemWillSleep` until `kIOMessageSystemHasPoweredOn`.
+    /// Stays true across the entire sleep period — unlike `will_sleep` which is
+    /// cleared by `acknowledge()` right after the pre-sleep flush.
+    /// Use this to gate disk writes: no point flushing while the system is asleep.
+    in_sleep: Arc<AtomicBool>,
     /// Whether we successfully registered with IOKit.
     pub available: bool,
 }
@@ -32,13 +37,16 @@ impl SleepNotifier {
     /// Safe to call without root — registration itself doesn't require privileges.
     pub fn new() -> Self {
         let will_sleep = Arc::new(AtomicBool::new(false));
+        let in_sleep = Arc::new(AtomicBool::new(false));
 
         #[cfg(target_os = "macos")]
         {
             let flag = will_sleep.clone();
-            let available = spawn_iokit_listener(flag);
+            let sleep_flag = in_sleep.clone();
+            let available = spawn_iokit_listener(flag, sleep_flag);
             Self {
                 will_sleep,
+                in_sleep,
                 available,
             }
         }
@@ -46,6 +54,7 @@ impl SleepNotifier {
         #[cfg(not(target_os = "macos"))]
         Self {
             will_sleep,
+            in_sleep,
             available: false,
         }
     }
@@ -53,6 +62,13 @@ impl SleepNotifier {
     /// Check if a sleep event is pending. Non-blocking.
     pub fn will_sleep_pending(&self) -> bool {
         self.will_sleep.load(Ordering::Acquire)
+    }
+
+    /// True from pre-sleep until system has powered on after wake.
+    /// Gate non-critical disk writes on `!is_sleeping()` to avoid burning
+    /// the macOS daily disk-write budget (~2GB/day) during idle sleep periods.
+    pub fn is_sleeping(&self) -> bool {
+        self.in_sleep.load(Ordering::Acquire)
     }
 
     /// Acknowledge the sleep event after performing the flush.
@@ -64,7 +80,7 @@ impl SleepNotifier {
 // ── IOKit FFI ────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
-fn spawn_iokit_listener(flag: Arc<AtomicBool>) -> bool {
+fn spawn_iokit_listener(flag: Arc<AtomicBool>, in_sleep: Arc<AtomicBool>) -> bool {
     use std::os::raw::c_void;
 
     // IOKit power management types.
@@ -77,6 +93,8 @@ fn spawn_iokit_listener(flag: Arc<AtomicBool>) -> bool {
     type CFRunLoopRef = *mut c_void;
     type CFRunLoopSourceRef = *mut c_void;
     type CFStringRef = *const c_void;
+
+    const K_IO_MESSAGE_SYSTEM_HAS_POWERED_ON: u32 = 0xe0000300;
 
     extern "C" {
         fn IORegisterForSystemPower(
@@ -103,9 +121,12 @@ fn spawn_iokit_listener(flag: Arc<AtomicBool>) -> bool {
         static kCFRunLoopDefaultMode: CFStringRef;
     }
 
-    // The callback context: just a pointer to our AtomicBool.
+    // The callback context: pointers to our AtomicBool flags.
     struct CallbackCtx {
         flag: Arc<AtomicBool>,
+        /// Set true on WILL_SLEEP, cleared on HAS_POWERED_ON.
+        /// Stays true across the full sleep period so callers can gate I/O.
+        in_sleep: Arc<AtomicBool>,
         root_port: u32,
     }
 
@@ -120,6 +141,8 @@ fn spawn_iokit_listener(flag: Arc<AtomicBool>) -> bool {
             K_IO_MESSAGE_SYSTEM_WILL_SLEEP => {
                 // System is about to sleep — signal the main loop.
                 ctx.flag.store(true, Ordering::Release);
+                // Mark as sleeping; stays true until HAS_POWERED_ON.
+                ctx.in_sleep.store(true, Ordering::Release);
                 // We MUST acknowledge within 30s or the kernel proceeds anyway.
                 // The main loop will do the flush and acknowledge, but we also
                 // allow here as a safety net (double-allow is harmless).
@@ -130,6 +153,10 @@ fn spawn_iokit_listener(flag: Arc<AtomicBool>) -> bool {
             K_IO_MESSAGE_CAN_SYSTEM_SLEEP => {
                 // We always allow sleep — we just want the pre-notification.
                 IOAllowPowerChange(ctx.root_port, message_argument as isize);
+            }
+            K_IO_MESSAGE_SYSTEM_HAS_POWERED_ON => {
+                // System woke up — clear the sleep gate so disk writes resume.
+                ctx.in_sleep.store(false, Ordering::Release);
             }
             _ => {}
         }
@@ -147,6 +174,7 @@ fn spawn_iokit_listener(flag: Arc<AtomicBool>) -> bool {
             // Leak the context — it lives for the process lifetime.
             let ctx = Box::new(CallbackCtx {
                 flag,
+                in_sleep,
                 root_port: 0, // will be set after registration
             });
             let ctx_ptr = Box::into_raw(ctx);

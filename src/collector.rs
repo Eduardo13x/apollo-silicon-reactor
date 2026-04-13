@@ -429,7 +429,7 @@ impl SystemCollector {
 }
 
 /// Read a u64 sysctl value directly via libc — no subprocess, ~200 ns.
-fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
+pub(crate) fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
     let mut val: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
     let rc = unsafe {
@@ -531,23 +531,30 @@ fn collect_pressure_facts() -> (f64, u64, u64, f64, f64) {
                 .map(|b| b / 16384)
                 .unwrap_or(1)
                 .max(1);
-            // Use the logical (uncompressed) size: this is the real memory footprint
-            // of data currently held in the compressor — what would be needed if
-            // the compressor were flushed back to RAM.
-            let uncompressed_pages = s.total_uncompressed_pages_in_compressor;
-            let raw = (uncompressed_pages as f64 / total_pages as f64).clamp(0.0, 1.0) * 0.85;
+            // Blend physical and logical compressor size:
+            // - Physical (compressor_page_count): actual RAM consumed by compressor.
+            // - Logical (uncompressed): decompression latency proxy.
+            // Weight physical 0.65, logical 0.35 — RAM cost matters more than
+            // latency (kernel_pressure already captures latency via memorystatus).
+            // Previous approach used 100% logical × 0.85, which over-reported
+            // pressure when compressor had high compression ratio (common on M1).
+            let phys_pages = s.compressor_page_count as f64;
+            let logical_pages = s.total_uncompressed_pages_in_compressor as f64;
+            let blended = phys_pages * 0.65 + logical_pages * 0.35;
+            let raw = (blended / total_pages as f64).clamp(0.0, 1.0) * 0.85;
 
-            // Inactive + purgeable pages are soft-available: the kernel can reclaim
-            // them on demand without any I/O (inactive) or immediately on request
-            // (purgeable). They act as a buffer — if they exist, the compressor
-            // is not truly the bottleneck that raw ratio suggests.
-            // Relief = (inactive + purgeable) / total * 0.45, capped at 0.18.
-            // (0.45 scale: pages convert to pressure relief at ~half rate since
-            //  kernel reclaim isn't instantaneous; 0.18 cap avoids under-reporting
-            //  in genuinely high-pressure situations.)
+            // Free + inactive + purgeable pages are available: the kernel can
+            // reclaim them without I/O. Free pages are immediately available;
+            // inactive/purgeable need a page-table update but no disk I/O.
+            // Free pages get full weight (0.65) since they're truly free;
+            // soft-available (inactive/purgeable/speculative) get 0.45.
+            // Combined relief capped at 0.30 to avoid under-reporting when
+            // compressor genuinely holds stale data that should be evicted.
             let soft_available =
                 s.inactive_count as u64 + s.purgeable_count as u64 + s.speculative_count as u64;
-            let relief = ((soft_available as f64 / total_pages as f64) * 0.45).min(0.18);
+            let free_relief = (s.free_count as f64 / total_pages as f64) * 0.65;
+            let soft_relief = (soft_available as f64 / total_pages as f64) * 0.45;
+            let relief = (free_relief + soft_relief).min(0.30);
             (raw - relief).max(0.0)
         } else {
             0.0

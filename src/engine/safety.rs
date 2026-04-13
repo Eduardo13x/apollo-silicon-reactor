@@ -307,6 +307,11 @@ pub fn infrastructure_processes() -> HashSet<&'static str> {
         "kafka",
         "zookeeper",
         "rabbitmq",
+        // LLM inference servers — freezing kills token generation mid-stream,
+        // causes client timeout, and post-thaw model reload spikes RAM.
+        "llama-server",
+        "ollama_llama_server",
+        "ollama",
     ]
     .into_iter()
     .collect()
