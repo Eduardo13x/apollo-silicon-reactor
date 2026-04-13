@@ -548,13 +548,15 @@ fn collect_pressure_facts() -> (f64, u64, u64, f64, f64) {
             // inactive/purgeable need a page-table update but no disk I/O.
             // Free pages get full weight (0.65) since they're truly free;
             // soft-available (inactive/purgeable/speculative) get 0.45.
-            // Combined relief capped at 0.30 to avoid under-reporting when
-            // compressor genuinely holds stale data that should be evicted.
+            // Combined relief capped at 0.40 — previous cap of 0.30 was too
+            // conservative: on 8GB M1 with ~30% inactive pages, the cap
+            // truncated legitimate relief, keeping compressor_pressure above
+            // kernel_pressure even when the kernel itself reported low pressure.
             let soft_available =
                 s.inactive_count as u64 + s.purgeable_count as u64 + s.speculative_count as u64;
             let free_relief = (s.free_count as f64 / total_pages as f64) * 0.65;
             let soft_relief = (soft_available as f64 / total_pages as f64) * 0.45;
-            let relief = (free_relief + soft_relief).min(0.30);
+            let relief = (free_relief + soft_relief).min(0.40);
             (raw - relief).max(0.0)
         } else {
             0.0

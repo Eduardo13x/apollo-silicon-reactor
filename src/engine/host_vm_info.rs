@@ -143,17 +143,18 @@ impl VmPageStats {
         if total_pages == 0 {
             return 0.0;
         }
-        // Available = free + inactive + speculative + purgeable (soft-available).
-        // Wired and compressor are NOT available — but active pages may be
-        // reclaimable under pressure. Treat active as 50% available since
-        // kernel can demote them to inactive when needed.
-        // Previous formula treated active as 0% available, yielding ~0.93
-        // on 8GB M1 under normal load — massive over-report that triggered
-        // unnecessary throttle storms.
+        // Available = free + inactive + speculative + partial active + partial compressor.
+        // Wired is truly locked. Active pages may be demoted to inactive under
+        // pressure — treat as 50% available. Compressor pages are partially
+        // reclaimable: kernel can discard purgeable compressed pages without I/O
+        // and decompress on-demand (latency, not loss) — treat as 30% available.
+        // Without compressor credit, formula yields ~0.55 while kernel reports
+        // 59% free (0.41 pressure). The 0.30 weight closes 40% of that gap.
         let available = self.free_pages as f64
             + self.inactive_pages as f64
             + self.speculative_pages as f64
-            + self.active_pages as f64 * 0.50;
+            + self.active_pages as f64 * 0.50
+            + self.compressor_pages as f64 * 0.30;
         (1.0 - available / total_pages as f64).clamp(0.0, 1.0)
     }
 }

@@ -116,12 +116,14 @@ fn query_ram_gb() -> f64 {
 }
 
 /// Compute a device-level threshold offset based on total RAM.
-/// Memory-constrained devices (≤8 GB) get -0.05 (act sooner).
+/// Memory-constrained devices (≤8 GB) get -0.03 (act slightly sooner).
+/// Previous -0.05 was too aggressive: combined with other offsets it
+/// pushed thresholds low enough to trigger false positives on M1 8GB.
 /// Mid-range (≤16 GB) get 0.0 (no change).
 /// Large-memory devices (>16 GB) get +0.05 (more headroom).
 pub fn device_threshold_offset(ram_gb: f64) -> f64 {
     if ram_gb <= 8.0 {
-        -0.05
+        -0.03
     } else if ram_gb <= 16.0 {
         0.0
     } else {
@@ -499,7 +501,7 @@ mod tests {
 
     #[test]
     fn device_offset_8gb_lowers_thresholds() {
-        let guard_8gb = make_guard_with_device_offset(-0.05);
+        let guard_8gb = make_guard_with_device_offset(-0.03);
         let guard_base = make_guard_with_device_offset(0.0);
         let t_8gb = guard_8gb.thresholds(WorkloadMode::Idle);
         let t_base = guard_base.thresholds(WorkloadMode::Idle);
@@ -510,8 +512,8 @@ mod tests {
             t_base.bg_pressure
         );
         assert!(
-            (t_base.bg_pressure - t_8gb.bg_pressure - 0.05).abs() < 1e-9,
-            "offset should be exactly -0.05pp: diff={}",
+            (t_base.bg_pressure - t_8gb.bg_pressure - 0.03).abs() < 1e-9,
+            "offset should be exactly -0.03pp: diff={}",
             t_base.bg_pressure - t_8gb.bg_pressure
         );
     }
@@ -537,12 +539,12 @@ mod tests {
     #[test]
     fn device_threshold_offset_buckets() {
         assert!(
-            (device_threshold_offset(8.0) - (-0.05)).abs() < 1e-9,
-            "8 GB exactly -> -0.05"
+            (device_threshold_offset(8.0) - (-0.03)).abs() < 1e-9,
+            "8 GB exactly -> -0.03"
         );
         assert!(
-            (device_threshold_offset(7.9) - (-0.05)).abs() < 1e-9,
-            "< 8 GB -> -0.05"
+            (device_threshold_offset(7.9) - (-0.03)).abs() < 1e-9,
+            "< 8 GB -> -0.03"
         );
         assert!(
             (device_threshold_offset(16.0) - 0.0).abs() < 1e-9,
