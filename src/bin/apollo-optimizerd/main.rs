@@ -6294,11 +6294,14 @@ fn main() -> anyhow::Result<()> {
                     let mut frozen_state = state.frozen_state.lock_recover();
                     // Add newly frozen PIDs.
                     for pid in &frozen_set {
-                        frozen_state.entry(*pid).or_insert(FrozenEntry {
-                            frozen_at: now,
-                            source: FreezeSource::MainLoop,
-                            pressure_at_freeze: snapshot.pressure.memory_pressure,
-                            process_name: None, // name not available in this execute path
+                        frozen_state.entry(*pid).or_insert_with(|| {
+                            let name = apollo_optimizer::engine::process_identity::proc_name_for_pid(*pid);
+                            FrozenEntry {
+                                frozen_at: now,
+                                source: FreezeSource::MainLoop,
+                                pressure_at_freeze: snapshot.pressure.memory_pressure,
+                                process_name: name,
+                            }
                         });
                     }
                     // Remove PIDs that are no longer frozen.
