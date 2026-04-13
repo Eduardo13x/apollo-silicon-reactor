@@ -650,6 +650,13 @@ impl SignalIntelligence {
         } else {
             self.zone_stall_cycles += 1;
         }
+        // Enforce mid < high with minimum gap of 0.05 to prevent zone collapse.
+        // Without this, both zones can converge (mid=0.40, high=0.35 after
+        // independent clamping) creating inverted thresholds where mid_zone
+        // pressure is classified as all_heavy.
+        if self.learned_mid_entry >= self.learned_high_entry - 0.05 {
+            self.learned_mid_entry = (self.learned_high_entry - 0.05).max(0.20);
+        }
     }
 
     /// Current learned zone boundaries (for observability).
