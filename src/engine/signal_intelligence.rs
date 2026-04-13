@@ -865,9 +865,13 @@ impl SignalIntelligence {
     }
 
     /// Reset learned zones to defaults (called when restore quality is stale).
+    /// Also clears feedback history to prevent stale oscillation data from
+    /// halving the zone alpha on the fresh zones.
     pub fn reset_zones(&mut self) {
         self.learned_mid_entry = 0.30;
         self.learned_high_entry = 0.50;
+        self.zone_feedback_history = [0i8; 8];
+        self.zone_feedback_idx = 0;
     }
 
     /// Zone feedback with workload context: learns per-workload zone offsets.
