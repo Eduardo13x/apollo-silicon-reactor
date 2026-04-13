@@ -17,7 +17,7 @@
 use crate::engine::sysctl_direct;
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -156,8 +156,11 @@ pub struct SysctlGovernor {
     ipc: IpcTuningState,
     /// Minimum time between tuning the same key.
     cooldown: Duration,
-    /// Last time each key was tuned.
-    last_tuning: HashMap<String, Instant>,
+    /// Last time each key was tuned.  Uses `SystemTime` (wall-clock) instead
+    /// of `Instant` because `Instant` does not advance during macOS sleep.
+    /// A 60s cooldown set before an 8-hour sleep would still show 58s
+    /// remaining with `Instant`, causing re-application storms on wake.
+    last_tuning: HashMap<String, SystemTime>,
     /// Default values captured at init (for revert).
     defaults: HashMap<String, String>,
     /// Current tuned values for observability.
@@ -512,13 +515,13 @@ impl SysctlGovernor {
     /// Accepts a reference to the `NetworkMonitor` to fill in the real
     /// EMA retransmission and listen-drop rates.
     pub fn status(&self, net_monitor: &NetworkMonitor) -> SysctlGovernorStatus {
-        let now = Instant::now();
+        let now = SystemTime::now();
         let last_tune_secs_ago: HashMap<String, u64> = self
             .last_tuning
             .iter()
             .map(|(k, t)| {
                 let secs = now
-                    .checked_duration_since(*t)
+                    .duration_since(*t)
                     .unwrap_or(Duration::from_secs(0))
                     .as_secs();
                 (k.clone(), secs)
@@ -587,7 +590,7 @@ impl SysctlGovernor {
             let new_send = ((self.tcp.sendspace as f64 * 1.25) as u64).min(TCP_BUFFER_MAX);
             let new_recv = ((self.tcp.recvspace as f64 * 1.25) as u64).min(TCP_BUFFER_MAX);
 
-            if new_send != self.tcp.sendspace && self.cooldown_ok("net.inet.tcp.sendspace", now) {
+            if new_send != self.tcp.sendspace && self.cooldown_ok("net.inet.tcp.sendspace") {
                 self.emit_sysctl(
                     "net.inet.tcp.sendspace",
                     &new_send.to_string(),
@@ -597,7 +600,7 @@ impl SysctlGovernor {
                 );
                 self.tcp.sendspace = new_send;
             }
-            if new_recv != self.tcp.recvspace && self.cooldown_ok("net.inet.tcp.recvspace", now) {
+            if new_recv != self.tcp.recvspace && self.cooldown_ok("net.inet.tcp.recvspace") {
                 self.emit_sysctl(
                     "net.inet.tcp.recvspace",
                     &new_recv.to_string(),
@@ -619,7 +622,7 @@ impl SysctlGovernor {
             let new_send = ((self.tcp.sendspace as f64 * 0.75) as u64).max(TCP_BUFFER_MIN);
             let new_recv = ((self.tcp.recvspace as f64 * 0.75) as u64).max(TCP_BUFFER_MIN);
 
-            if new_send != self.tcp.sendspace && self.cooldown_ok("net.inet.tcp.sendspace", now) {
+            if new_send != self.tcp.sendspace && self.cooldown_ok("net.inet.tcp.sendspace") {
                 self.emit_sysctl(
                     "net.inet.tcp.sendspace",
                     &new_send.to_string(),
@@ -629,7 +632,7 @@ impl SysctlGovernor {
                 );
                 self.tcp.sendspace = new_send;
             }
-            if new_recv != self.tcp.recvspace && self.cooldown_ok("net.inet.tcp.recvspace", now) {
+            if new_recv != self.tcp.recvspace && self.cooldown_ok("net.inet.tcp.recvspace") {
                 self.emit_sysctl(
                     "net.inet.tcp.recvspace",
                     &new_recv.to_string(),
@@ -653,7 +656,7 @@ impl SysctlGovernor {
             self.tcp.delayed_ack // Keep current.
         };
 
-        if desired_ack != self.tcp.delayed_ack && self.cooldown_ok("net.inet.tcp.delayed_ack", now)
+        if desired_ack != self.tcp.delayed_ack && self.cooldown_ok("net.inet.tcp.delayed_ack")
         {
             self.emit_sysctl(
                 "net.inet.tcp.delayed_ack",
@@ -690,7 +693,7 @@ impl SysctlGovernor {
         // Scale UP: listen_drops > 0 for 2 consecutive cycles.
         if self.ipc.consecutive_drops >= 2 {
             let new_val = ((self.ipc.somaxconn as f64 * 1.5) as u64).min(SOMAXCONN_MAX);
-            if new_val != self.ipc.somaxconn && self.cooldown_ok("kern.ipc.somaxconn", now) {
+            if new_val != self.ipc.somaxconn && self.cooldown_ok("kern.ipc.somaxconn") {
                 self.emit_sysctl(
                     "kern.ipc.somaxconn",
                     &new_val.to_string(),
@@ -706,7 +709,7 @@ impl SysctlGovernor {
         // Scale DOWN: listen_drops == 0 for 30 consecutive cycles.
         if self.ipc.consecutive_clean >= 30 {
             let new_val = ((self.ipc.somaxconn as f64 * 0.75) as u64).max(SOMAXCONN_MIN);
-            if new_val != self.ipc.somaxconn && self.cooldown_ok("kern.ipc.somaxconn", now) {
+            if new_val != self.ipc.somaxconn && self.cooldown_ok("kern.ipc.somaxconn") {
                 self.emit_sysctl(
                     "kern.ipc.somaxconn",
                     &new_val.to_string(),
@@ -761,7 +764,7 @@ impl SysctlGovernor {
         if inputs.swap_trend == SwapTrend::Critical {
             #[cfg(target_os = "macos")]
             if self.vm.poll_interval != 100
-                && self.cooldown_ok("vm.compressor_eval_period_in_msecs", now)
+                && self.cooldown_ok("vm.compressor_eval_period_in_msecs")
             {
                 self.emit_sysctl(
                     "vm.compressor_eval_period_in_msecs",
@@ -779,7 +782,7 @@ impl SysctlGovernor {
             #[cfg(target_os = "macos")]
             {
                 if self.vm.poll_interval != 100
-                    && self.cooldown_ok("vm.compressor_eval_period_in_msecs", now)
+                    && self.cooldown_ok("vm.compressor_eval_period_in_msecs")
                 {
                     self.emit_sysctl(
                         "vm.compressor_eval_period_in_msecs",
@@ -791,7 +794,7 @@ impl SysctlGovernor {
                     self.vm.poll_interval = 100;
                 }
                 if self.vm.sample_min != 250
-                    && self.cooldown_ok("vm.compressor_sample_min_in_msecs", now)
+                    && self.cooldown_ok("vm.compressor_sample_min_in_msecs")
                 {
                     self.emit_sysctl(
                         "vm.compressor_sample_min_in_msecs",
@@ -806,7 +809,7 @@ impl SysctlGovernor {
             #[cfg(not(target_os = "macos"))]
             {
                 if self.vm.poll_interval != 10
-                    && self.cooldown_ok("vm.compressor_poll_interval", now)
+                    && self.cooldown_ok("vm.compressor_poll_interval")
                 {
                     self.emit_sysctl(
                         "vm.compressor_poll_interval",
@@ -817,7 +820,7 @@ impl SysctlGovernor {
                     );
                     self.vm.poll_interval = 10;
                 }
-                if self.vm.sample_min != 5 && self.cooldown_ok("vm.compressor_sample_min", now) {
+                if self.vm.sample_min != 5 && self.cooldown_ok("vm.compressor_sample_min") {
                     self.emit_sysctl(
                         "vm.compressor_sample_min",
                         "5",
@@ -836,7 +839,7 @@ impl SysctlGovernor {
             #[cfg(target_os = "macos")]
             {
                 if self.vm.poll_interval != 500
-                    && self.cooldown_ok("vm.compressor_eval_period_in_msecs", now)
+                    && self.cooldown_ok("vm.compressor_eval_period_in_msecs")
                 {
                     self.emit_sysctl(
                         "vm.compressor_eval_period_in_msecs",
@@ -848,7 +851,7 @@ impl SysctlGovernor {
                     self.vm.poll_interval = 500;
                 }
                 if self.vm.sample_min != 1000
-                    && self.cooldown_ok("vm.compressor_sample_min_in_msecs", now)
+                    && self.cooldown_ok("vm.compressor_sample_min_in_msecs")
                 {
                     self.emit_sysctl(
                         "vm.compressor_sample_min_in_msecs",
@@ -863,7 +866,7 @@ impl SysctlGovernor {
             #[cfg(not(target_os = "macos"))]
             {
                 if self.vm.poll_interval != 40
-                    && self.cooldown_ok("vm.compressor_poll_interval", now)
+                    && self.cooldown_ok("vm.compressor_poll_interval")
                 {
                     self.emit_sysctl(
                         "vm.compressor_poll_interval",
@@ -874,7 +877,7 @@ impl SysctlGovernor {
                     );
                     self.vm.poll_interval = 40;
                 }
-                if self.vm.sample_min != 20 && self.cooldown_ok("vm.compressor_sample_min", now) {
+                if self.vm.sample_min != 20 && self.cooldown_ok("vm.compressor_sample_min") {
                     self.emit_sysctl(
                         "vm.compressor_sample_min",
                         "20",
@@ -896,7 +899,7 @@ impl SysctlGovernor {
             #[cfg(target_os = "macos")]
             {
                 if self.vm.poll_interval != 250
-                    && self.cooldown_ok("vm.compressor_eval_period_in_msecs", now)
+                    && self.cooldown_ok("vm.compressor_eval_period_in_msecs")
                 {
                     self.emit_sysctl(
                         "vm.compressor_eval_period_in_msecs",
@@ -908,7 +911,7 @@ impl SysctlGovernor {
                     self.vm.poll_interval = 250;
                 }
                 if self.vm.sample_min != 500
-                    && self.cooldown_ok("vm.compressor_sample_min_in_msecs", now)
+                    && self.cooldown_ok("vm.compressor_sample_min_in_msecs")
                 {
                     self.emit_sysctl(
                         "vm.compressor_sample_min_in_msecs",
@@ -923,7 +926,7 @@ impl SysctlGovernor {
             #[cfg(not(target_os = "macos"))]
             {
                 if self.vm.poll_interval != 20
-                    && self.cooldown_ok("vm.compressor_poll_interval", now)
+                    && self.cooldown_ok("vm.compressor_poll_interval")
                 {
                     self.emit_sysctl(
                         "vm.compressor_poll_interval",
@@ -934,7 +937,7 @@ impl SysctlGovernor {
                     );
                     self.vm.poll_interval = 20;
                 }
-                if self.vm.sample_min != 10 && self.cooldown_ok("vm.compressor_sample_min", now) {
+                if self.vm.sample_min != 10 && self.cooldown_ok("vm.compressor_sample_min") {
                     self.emit_sysctl(
                         "vm.compressor_sample_min",
                         "10",
@@ -967,7 +970,7 @@ impl SysctlGovernor {
         // Scale UP: vnode_usage > 80% for 3 cycles.
         if self.fs.consecutive_high >= 3 {
             let new_val = ((self.fs.maxvnodes as f64 * 1.25) as u64).min(MAXVNODES_MAX);
-            if new_val != self.fs.maxvnodes && self.cooldown_ok("kern.maxvnodes", now) {
+            if new_val != self.fs.maxvnodes && self.cooldown_ok("kern.maxvnodes") {
                 self.emit_sysctl(
                     "kern.maxvnodes",
                     &new_val.to_string(),
@@ -983,7 +986,7 @@ impl SysctlGovernor {
         // Scale DOWN: vnode_usage < 30% for 30 cycles.
         if self.fs.consecutive_low >= 30 {
             let new_val = ((self.fs.maxvnodes as f64 * 0.85) as u64).max(MAXVNODES_MIN);
-            if new_val != self.fs.maxvnodes && self.cooldown_ok("kern.maxvnodes", now) {
+            if new_val != self.fs.maxvnodes && self.cooldown_ok("kern.maxvnodes") {
                 self.emit_sysctl(
                     "kern.maxvnodes",
                     &new_val.to_string(),
@@ -1000,12 +1003,12 @@ impl SysctlGovernor {
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     /// Check whether the cooldown period has elapsed for a given key.
-    fn cooldown_ok(&self, key: &str, now: Instant) -> bool {
+    /// Uses wall-clock (`SystemTime`) so sleep duration counts toward cooldown.
+    fn cooldown_ok(&self, key: &str) -> bool {
         match self.last_tuning.get(key) {
-            // Use checked_duration_since to handle clock going backwards
-            // during NTP adjustments or sleep/wake transitions.
             Some(last) => {
-                now.checked_duration_since(*last)
+                SystemTime::now()
+                    .duration_since(*last)
                     .unwrap_or(Duration::from_secs(0))
                     >= self.cooldown
             }
@@ -1023,7 +1026,7 @@ impl SysctlGovernor {
         value: &str,
         reason: &str,
         actions: &mut Vec<RootAction>,
-        now: Instant,
+        _now: Instant,
     ) {
         if self.unavailable_keys.iter().any(|k| k == key) {
             return;
@@ -1033,7 +1036,7 @@ impl SysctlGovernor {
             value: value.to_string(),
             reason: reason.to_string(),
         });
-        self.last_tuning.insert(key.to_string(), now);
+        self.last_tuning.insert(key.to_string(), SystemTime::now());
         self.current_values
             .insert(key.to_string(), value.to_string());
         self.total_writes += 1;
