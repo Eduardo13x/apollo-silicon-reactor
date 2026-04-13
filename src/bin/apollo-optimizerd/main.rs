@@ -1491,6 +1491,16 @@ fn main() -> anyhow::Result<()> {
                         }
                         write_frozen_state(&frozen_state_path, &frozen_guard);
                     }
+                    // Restore Mach QoS from Background (E-cores) → Normal so
+                    // processes resume on P-cores. Wake unfreeze is the highest-
+                    // urgency thaw path (user just returned to desktop), so P-core
+                    // routing is critical for perceived responsiveness.
+                    {
+                        let mut qos = state.mach_qos.lock_recover();
+                        for pid in &batch {
+                            let _ = qos.set_tier(*pid, apollo_optimizer::engine::mach_qos::SchedulingTier::Normal);
+                        }
+                    }
                 }
 
                 // Mark reactor as stalled only if the reactor thread has sent
@@ -5467,7 +5477,9 @@ fn main() -> anyhow::Result<()> {
                 // for idle tab renderers across ALL Chromium/Electron apps.
                 // Runs after all main-loop freeze decisions so we can exclude those PIDs.
                 // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
-                {
+                // Set to false to re-enable Chromium renderer freezing.
+                const CHROMIUM_FREEZE_DISABLED: bool = true;
+                if !CHROMIUM_FREEZE_DISABLED {
                     use apollo_optimizer::engine::chromium_manager::ChromiumAction;
 
                     // FocusMarkov context: top-5 predictions + elapsed dwell time.
@@ -5562,6 +5574,16 @@ fn main() -> anyhow::Result<()> {
                                     "chromium: thawing renderer (became active)"
                                 );
                                 apollo_optimizer::engine::chromium_manager::ChromiumManager::thaw_renderer(*pid);
+                                // Restore Mach scheduling tier to Normal (P-cores).
+                                // If the renderer was previously demoted to Background
+                                // (E-cores), it would resume on slow Icestorm cores —
+                                // the user sees slow tab rendering even though SIGCONT
+                                // was sent. Restoring to Normal removes the E-core cap
+                                // so macOS routes the renderer to P-cores on next wake.
+                                {
+                                    let mut qos = state.mach_qos.lock_recover();
+                                    let _ = qos.set_tier(*pid, apollo_optimizer::engine::mach_qos::SchedulingTier::Normal);
+                                }
                                 state.frozen_state.lock_recover().remove(pid);
                                 // NARS belief update: observe whether renderer survived freeze.
                                 // Pass the full process name — FreezeIntelligence.classify()

@@ -76,17 +76,19 @@ const MIN_INET_SOCKETS_TO_BLOCK: usize = 1;
 const MAX_FROZEN_CYCLES: u8 = 50;
 
 /// Aggressive TTL for renderers of the **currently foreground** Chromium
-/// browser. Bounds the user-visible "stuck tab" hang when the foreground-
-/// change detector misses a tab switch (which is the common case: switching
-/// tabs WITHIN the same browser does not change the foreground browser
-/// name, so the fg_changed thaw path never fires).
-///
-/// 15 cycles ≈ 30 s at the standard 2-s daemon period. Background browsers
-/// keep the long `MAX_FROZEN_CYCLES` TTL because their renderers are not
-/// user-visible and the long TTL maximises memory reclaim. The asymmetry
+/// browser. Kept at 3 cycles (~300ms) — below human perception threshold
+/// (~250ms) so tab switches feel instant. Background browsers keep the
+/// longer `MAX_FROZEN_CYCLES` TTL for maximum memory reclaim. The asymmetry
 /// matches user expectation: the browser you're looking at recovers
 /// quickly; the ones you switched away from stay paused.
-const MAX_FOREGROUND_FROZEN_CYCLES: u8 = 15;
+const MAX_FOREGROUND_FROZEN_CYCLES: u8 = 3;
+
+/// Cycles a renderer must wait after a thaw before it can be frozen again.
+/// Post-SIGCONT, the renderer reports CPU=0 while still waking up — without
+/// this guard it immediately looks idle and gets re-frozen, creating the
+/// freeze→thaw→freeze thrashing loop seen in production logs.
+/// 10 cycles ≈ 20s — enough for a tab to re-render and show non-zero CPU.
+const POST_THAW_GRACE_CYCLES: u8 = 10;
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -110,9 +112,17 @@ pub struct RendererInfo {
     cpu_history: [f32; 3],
     /// Cycles elapsed since this renderer was frozen (for max-freeze-duration guard).
     frozen_cycles: u8,
+    /// Cycles since this renderer was first seen. New renderers (loading a fresh tab)
+    /// show 0% CPU before content loads — skip freeze during this warmup window.
+    age_cycles: u8,
     /// RSS at the moment of freeze. When RSS drops >50% while frozen, the browser
     /// is reclaiming memory from a closed tab — thaw immediately so it can exit cleanly.
     frozen_rss_baseline: u64,
+    /// Cycles remaining before this renderer is eligible to be frozen again.
+    /// Set to POST_THAW_GRACE_CYCLES after each thaw — prevents the re-freeze
+    /// thrashing loop where CPU=0 post-SIGCONT looks idle and triggers immediate
+    /// re-freeze before the renderer has had a chance to do any work.
+    thaw_cooldown_cycles: u8,
 }
 
 impl RendererInfo {
@@ -129,7 +139,9 @@ impl RendererInfo {
             has_assertion: false,
             cpu_history: [cpu_pct, 0.0, 0.0],
             frozen_cycles: 0,
+            age_cycles: 0,
             frozen_rss_baseline: 0,
+            thaw_cooldown_cycles: 0,
         }
     }
 
@@ -517,8 +529,18 @@ impl ChromiumManager {
                 entry.frozen_cycles = 0;
             }
 
-            // Periodic network FD check (expensive — rate limited)
-            if do_fd_check || !entry.has_inet_sockets {
+            // Age counter — saturate at 255 (never wraps back to 0)
+            entry.age_cycles = entry.age_cycles.saturating_add(1);
+
+            // Post-thaw cooldown countdown
+            entry.thaw_cooldown_cycles = entry.thaw_cooldown_cycles.saturating_sub(1);
+
+            // Periodic network FD check (expensive — rate limited).
+            // Also force-recheck for non-frozen idle renderers that previously
+            // had sockets: their socket may have closed since the last check,
+            // and we must not skip-freeze based on a stale `has_inet_sockets=true`.
+            let is_idle_freeze_candidate = !entry.frozen && entry.consecutive_idle_cycles > 0;
+            if do_fd_check || !entry.has_inet_sockets || (entry.has_inet_sockets && is_idle_freeze_candidate) {
                 entry.has_inet_sockets = Self::has_inet_sockets(pid);
             }
         }
@@ -737,6 +759,20 @@ impl ChromiumManager {
                 if info.has_inet_sockets {
                     continue; // active network connection
                 }
+                // New-tab grace period: renderer just spawned shows 0% CPU while loading.
+                // At high pressure (idle_cycles_required=1) it would be frozen before the
+                // page renders, making new tabs appear stuck. Skip freeze for first 10 cycles
+                // (~1s) so the tab has time to load before becoming a freeze candidate.
+                const NEW_RENDERER_GRACE_CYCLES: u8 = 10;
+                if info.age_cycles < NEW_RENDERER_GRACE_CYCLES {
+                    continue;
+                }
+                // Post-thaw cooldown: renderer just received SIGCONT reports CPU=0 while
+                // waking up. Without this guard it looks idle immediately and is re-frozen,
+                // producing the freeze→thaw→freeze thrashing loop seen in production.
+                if info.thaw_cooldown_cycles > 0 {
+                    continue;
+                }
                 // Three acceptance paths:
                 //   1. Pressure-adaptive: idle for `idle_cycles_required` cycles
                 //      (1/2/3/5 depending on pressure — strict when pressure high).
@@ -747,8 +783,12 @@ impl ChromiumManager {
                 //   3. Build preemption: when BuildSession is active, a single
                 //      idle cycle is enough. This pre-sheds renderer memory
                 //      before rustc spikes — bulkheading the build workload.
+                // Build preemption: require 2 idle cycles (not 1) to avoid
+                // freezing a mid-render tab that briefly dips to 0% CPU during
+                // layout/paint. One cycle (~2s) is within normal render pauses;
+                // two consecutive cycles reliably signal an abandoned background tab.
                 let effective_required = if self.build_preemption_active {
-                    1
+                    2
                 } else {
                     self.idle_cycles_required.max(1) // invariant: never 0
                 };
@@ -792,11 +832,25 @@ impl ChromiumManager {
                     .push(*pid);
             }
 
-            // Apply MAX_FREEZE_RATIO per browser
+            // Apply MAX_FREEZE_RATIO per browser.
+            // Subtract queued thaws from the frozen count so the ratio uses live
+            // numbers — without this, a batch of thaws queued earlier in the same
+            // tick doesn't reduce `already_frozen`, causing the freeze gate to
+            // reject candidates that would be within budget after the thaws land.
             for (browser, candidates) in &candidates_by_browser {
                 let browser_state = self.browsers.get(browser).cloned().unwrap_or_default();
                 let total = browser_state.total_renderers.max(1) as f32;
-                let already_frozen = browser_state.frozen_renderers as f32;
+                let queued_thaws = actions
+                    .iter()
+                    .filter(|a| {
+                        if let ChromiumAction::ThawRenderer { pid, .. } = a {
+                            self.renderers.get(pid).map(|r| r.browser == *browser).unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    })
+                    .count() as f32;
+                let already_frozen = (browser_state.frozen_renderers as f32 - queued_thaws).max(0.0);
                 let max_additional = ((total * MAX_FREEZE_RATIO) - already_frozen).floor() as usize;
                 let max_additional = max_additional.min(candidates.len());
 
@@ -882,10 +936,19 @@ impl ChromiumManager {
                 ChromiumAction::ThawRenderer { pid, .. } => {
                     self.frozen_pids.remove(pid);
                     self.recoveries_applied += 1;
+                    // Clear E-core demotion so the renderer is eligible for
+                    // re-demotion on the next cycle if it stays idle.
+                    // Without this removal the `ecore_demoted` set grows forever
+                    // and thawed renderers are never re-demoted.
+                    self.ecore_demoted.remove(pid);
                     if let Some(info) = self.renderers.get_mut(pid) {
                         info.frozen = false;
                         info.consecutive_idle_cycles = 0;
                         info.frozen_cycles = 0;
+                        // Set post-thaw cooldown so this renderer cannot be immediately
+                        // re-frozen. Post-SIGCONT CPU=0 looks idle — without cooldown
+                        // the freeze→thaw→freeze thrashing loop triggers every cycle.
+                        info.thaw_cooldown_cycles = POST_THAW_GRACE_CYCLES;
                     }
                 }
                 ChromiumAction::DemoteToEcores { pid, .. } => {
