@@ -449,6 +449,12 @@ impl SignalIntelligence {
 
         // ── Update utility EMAs ──────────────────────────────────────────
         // "Actionable" = non-trivial signal that could influence decisions.
+        // Floor at 0.08: prevents subnormal lockout where EMA drops below
+        // UTIL_THRESHOLD (0.15), causing run_X=false, causing no updates,
+        // causing permanent lockout. 0.08 is below the gate threshold so
+        // the subsystem stays gated, but above denormal so it can recover
+        // when pressure enters the high zone (which always runs).
+        const UTIL_FLOOR: f64 = 0.08;
         if run_entropy {
             let useful = if entropy_anomaly.abs() > 0.5 {
                 1.0
@@ -469,6 +475,11 @@ impl SignalIntelligence {
             let useful = if mpc_recommendation != 0 { 1.0 } else { 0.0 };
             self.utility_mpc += UTIL_ALPHA * (useful - self.utility_mpc);
         }
+        // Enforce floor to prevent denormal/subnormal lockout during operation.
+        self.utility_entropy = self.utility_entropy.max(UTIL_FLOOR);
+        self.utility_hazard = self.utility_hazard.max(UTIL_FLOOR);
+        self.utility_lotka = self.utility_lotka.max(UTIL_FLOOR);
+        self.utility_mpc = self.utility_mpc.max(UTIL_FLOOR);
 
         // ── 7. Urgency score compuesto ───────────────────────────────────
         let urgency = compute_urgency(
