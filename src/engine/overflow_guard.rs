@@ -164,6 +164,8 @@ impl OverflowGuard {
         heavy_apps: &[String],
         cause: &str,
         compressor_pressure: f64,
+        pressure_bands: &[f64; 3],
+        compressor_bands: &[f64; 2],
     ) {
         // Deduplicar: no registrar dos eventos del mismo overflow (ventana 60s).
         if let Some(last) = self.last_event_at {
@@ -209,11 +211,16 @@ impl OverflowGuard {
                 .join(", ")
         );
 
-        // RL agent: tick with overflow=true.
+        // RL agent: tick with overflow=true using adaptive bands.
         let overflows_1h = self.recent_overflow_count_hours(1);
         if let Some(rl) = &mut self.rl_agent {
-            let rl_state =
-                RlState::from_metrics(memory_pressure, compressor_pressure, overflows_1h);
+            let rl_state = RlState::from_metrics_with_bands(
+                memory_pressure,
+                compressor_pressure,
+                overflows_1h,
+                pressure_bands,
+                compressor_bands,
+            );
             rl.tick(rl_state, true);
             rl.persist();
         }
@@ -252,13 +259,25 @@ impl OverflowGuard {
     ///
     /// `memory_pressure` and `compressor_pressure` feed the RL agent state
     /// so it can learn from stable (no-overflow) ticks.
-    pub fn tick_decay(&mut self, memory_pressure: f64, compressor_pressure: f64) {
+    pub fn tick_decay(
+        &mut self,
+        memory_pressure: f64,
+        compressor_pressure: f64,
+        pressure_bands: &[f64; 3],
+        compressor_bands: &[f64; 2],
+    ) {
         // RL agent: tick every cycle (stable tick, no overflow).
-        // Compute overflows_1h BEFORE taking &mut self.rl_agent to avoid borrow conflict.
+        // Use adaptive bands from LearnableParams so Q-table state
+        // discretization stays aligned with auto-tuned boundaries.
         let overflows_1h = self.recent_overflow_count_hours(1);
         if let Some(rl) = &mut self.rl_agent {
-            let rl_state =
-                RlState::from_metrics(memory_pressure, compressor_pressure, overflows_1h);
+            let rl_state = RlState::from_metrics_with_bands(
+                memory_pressure,
+                compressor_pressure,
+                overflows_1h,
+                pressure_bands,
+                compressor_bands,
+            );
             rl.tick(rl_state, false);
             if rl.total_ticks() % 50 == 0 {
                 rl.persist();

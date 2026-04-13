@@ -2603,6 +2603,8 @@ fn main() -> anyhow::Result<()> {
                                             &heavy,
                                             &format!("kqueue-{:?}", level),
                                             snapshot.pressure.compressor_pressure,
+                                            &learnable_params.rl_pressure_bands,
+                                            &learnable_params.rl_compressor_bands,
                                         );
                                         // Teach hazard model only on real OOM indicators:
                                         // swap must be GROWING (delta > 512KB/s) and present
@@ -4967,6 +4969,8 @@ fn main() -> anyhow::Result<()> {
                         &heavy,
                         "survival-mode",
                         snapshot.pressure.compressor_pressure,
+                        &learnable_params.rl_pressure_bands,
+                        &learnable_params.rl_compressor_bands,
                     );
                     let sr = if snapshot.pressure.swap_total_bytes > 0 {
                         snapshot.pressure.swap_used_bytes as f64
@@ -4988,6 +4992,8 @@ fn main() -> anyhow::Result<()> {
                 lctx.overflow_guard.tick_decay(
                     snapshot.pressure.memory_pressure,
                     snapshot.pressure.compressor_pressure,
+                    &learnable_params.rl_pressure_bands,
+                    &learnable_params.rl_compressor_bands,
                 );
 
                 // ── Neuromodulator: bio-inspired parameter modulation ────────
