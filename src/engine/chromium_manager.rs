@@ -1175,14 +1175,18 @@ impl ChromiumManager {
         }
     }
 
-    /// Send SIGCONT to a renderer process.
-    pub fn thaw_renderer(pid: u32) {
+    /// Send SIGCONT to a renderer process. Returns true if signal was delivered.
+    pub fn thaw_renderer(pid: u32) -> bool {
         #[cfg(target_os = "macos")]
-        unsafe {
-            libc::kill(pid as i32, libc::SIGCONT);
+        {
+            let rc = unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+            rc == 0
         }
         #[cfg(not(target_os = "macos"))]
-        let _ = pid;
+        {
+            let _ = pid;
+            false
+        }
     }
 }
 
