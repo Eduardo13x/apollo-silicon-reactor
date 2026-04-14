@@ -560,7 +560,16 @@ pub fn decide_memory_action(
         return MemoryAction::PressureHint;
     }
 
-    MemoryAction::Freeze
+    // Default: pressure gate. Below 0.65 the compressor is coping — prefer a
+    // gentle hint over a SIGSTOP that stalls IPC and flushes SLC. Only freeze
+    // by default when pressure is genuinely elevated and hints have proven
+    // insufficient (processes that respond to hints reduce their footprint and
+    // raise compression_ratio, eventually hitting the >= 2.0 path above).
+    if system_pressure >= 0.65 {
+        MemoryAction::Freeze
+    } else {
+        MemoryAction::PressureHint
+    }
 }
 
 /// Enhanced freeze decision using temperature + WSS + SLC knowledge.
