@@ -715,9 +715,12 @@ fn migrate_to_ecores(
         if let Some(ref mut mgr) = qos_guard {
             mgr.set_tier(pid_u32, SchedulingTier::Background);
         } else {
-            // Fallback: direct setpriority if QoS manager unavailable.
+            // Fallback: PRIO_DARWIN_BG (turnstile-compatible background QoS).
+            // Do NOT use PRIO_PROCESS+nice=20 — that breaks the Mach
+            // priority-inheritance chain and causes WindowServer IPC hangs.
+            const PRIO_DARWIN_BG: libc::c_int = 0x1000;
             unsafe {
-                libc::setpriority(libc::PRIO_PROCESS, pid_u32, 20);
+                libc::setpriority(PRIO_DARWIN_BG, pid_u32, 1);
             }
         }
         migrated += 1;

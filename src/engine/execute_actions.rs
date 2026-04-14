@@ -401,11 +401,13 @@ pub fn execute_actions(
                                 mgr.set_latency_and_throughput(*pid, lat, thr);
                             }
                             // Granular I/O tiering based on aggressiveness.
+                            // apply_io_tier uses PRIO_DARWIN_BG which is
+                            // turnstile-compatible — do NOT also set nice=20
+                            // via PRIO_PROCESS, as that breaks the Mach
+                            // priority-inheritance chain (Finder/Settings hangs).
                             let io_tier = io_tier_for_throttle(aggressive);
                             apply_io_tier(*pid, io_tier);
                         }
-                        let nice_val: i32 = if aggressive { 20 } else { 10 };
-                        let _ = set_nice(*pid, nice_val);
                     }
                     out.throttles_applied += 1;
                 }
