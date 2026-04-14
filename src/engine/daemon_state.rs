@@ -234,6 +234,5 @@ pub struct SharedState {
 
     // Read-only paths (set once at init)
     pub config_path: PathBuf,
-    pub discrepancy_log_path: PathBuf,
     pub user_profile_path: PathBuf,
 }

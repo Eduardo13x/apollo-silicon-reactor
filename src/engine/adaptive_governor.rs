@@ -484,11 +484,15 @@ impl AdaptiveGovernor {
         // Night mode: between midnight and 6AM, nobody is watching the screen.
         // Non-GUI background processes with idle > 15min should be throttled to
         // save energy. Placed AFTER FG helper check so Safari tabs survive at 3AM.
+        // Guard: skip hard-protected OS daemons (audio stack, display, etc.).
         let is_night = hour_of_day < 6;
         if is_night
             && !snap.has_gui_window
             && snap.secs_since_foreground > 900
             && adjusted_utility < 0.55
+            && !crate::engine::safety::protected_processes()
+                .iter()
+                .any(|&p| snap.name.contains(p))
         {
             return pd(
                 GovernorDecision::Throttle,

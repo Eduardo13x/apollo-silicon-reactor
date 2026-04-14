@@ -4,7 +4,6 @@
 //! - `filter_boost_cooldown()` — dedup boost actions with per-PID cooldowns
 //! - `apply_post_wake_grace_policy()` — suppress freeze/throttle during post-wake grace
 //! - `context_to_thermal()` — interactive context → thermal string
-//! - `append_discrepancy_log()` — log safety precedence overrides
 //! - `build_foreground_family()` — compute foreground PID set from process tree
 //! - `build_enriched_process_data_with_tree()` — build ProcessSnapshot + HuntSnapshot
 //! - `convert_and_merge_heuristic_decisions()` — merge heuristic decisions into actions
@@ -125,27 +124,6 @@ pub fn context_to_thermal(context: InteractiveContext) -> String {
         InteractiveContext::BackgroundPressure => "elevated".to_string(),
         InteractiveContext::InteractiveFocus => "nominal".to_string(),
     }
-}
-
-pub fn append_discrepancy_log(
-    path: &std::path::Path,
-    protected_app: &str,
-    actions_removed: usize,
-    workload: &str,
-    confidence: f32,
-    reason: &str,
-) {
-    let entry = serde_json::json!({
-        "at": chrono::Utc::now().to_rfc3339(),
-        "event": "safety_precedence_override",
-        "protected_app": protected_app,
-        "actions_removed": actions_removed,
-        "ml_workload": workload,
-        "ml_confidence": confidence,
-        "reason": reason,
-    });
-    append_jsonl(path, &entry);
-    rotate_timeline(path);
 }
 
 // ── Foreground Family ──────────────────────────────────────────────────────

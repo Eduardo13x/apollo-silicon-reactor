@@ -50,6 +50,7 @@ pub fn protected_processes() -> HashSet<&'static str> {
         "runningboardd",  // Process lifecycle manager — freeze → broken app launches
         "SystemUIServer", // Menu bar / status bar rendering
         "ControlCenter",  // Control center overlay rendering
+        "Finder",         // File browser / open+save delegate — throttle → slow dialogs, nav hangs
         // Core services — freeze → Finder hangs, app associations break, no icon updates.
         // [Apple TN3113] coreservicesd manages Launch Services database, UTI resolution,
         // and app registration. SIGSTOP leaves the system unable to resolve file types.
@@ -67,6 +68,84 @@ pub fn protected_processes() -> HashSet<&'static str> {
         // times over 19 hours (2026-04-09 journal audit). sharingd respawns and
         // immediately gets re-frozen — infinite loop, AirDrop permanently broken.
         "sharingd",
+        // Watchdog-adjacent daemons — SIGSTOP any of these causes kernel panic.
+        // watchdogd monitors logd + WindowServer + opendirectoryd + configd checkins
+        // every 120s. A single FreezeProcess on logd is enough to trigger the
+        // "userspace watchdog timeout" kernel panic (observed 2026-04-14 in prod).
+        "logd",
+        "watchdogd",
+        "syslogd",
+        "OSLogService",
+        // Bluetooth stack — freeze any of these = BT keyboard/trackpad dead on M1.
+        // IOUserBluetoothSerialDriver seen 297 throttles in prod; BTLEServer 114.
+        // No recovery without killing the freeze manually or rebooting.
+        "bluetoothd",
+        "BTLEServer",
+        "bluetoothuserd",
+        "IOUserBluetoothSerialDriver",
+        // WiFi daemon — freeze = network drops immediately.
+        "airportd",
+        // DNS/Bonjour — freeze = all DNS resolution stops (affects every app, every URL).
+        "mDNSResponder",
+        // Filesystem events daemon — freeze = Time Machine, Spotlight, all FSEvents broken.
+        // Observed 4 freezes in prod (2026-04-14 journal audit).
+        "fseventsd",
+        // NTP time sync — freeze = system clock drifts, TLS cert validation fails.
+        "timed",
+        // Kernel event bridge — routes disk-full, mount, unmount events to userspace.
+        // 99 throttles observed in prod. Silent throttle = user never sees disk alerts.
+        "KernelEventAgent",
+        // Authentication daemon — freeze = TouchID / password prompts hang forever.
+        "coreauthd",
+        // User shells — throttling active zsh/bash blocks interactive commands.
+        // 126 zsh throttles observed in prod; no GUI window so is_user_interactive misses it.
+        "zsh",
+        "bash",
+        "fish",
+        // AppKit open/save panel service — freeze = dialog hangs indefinitely.
+        // 61 freezes observed in prod (2026-04-14 journal audit). User opens save
+        // dialog → Apollo freezes the XPC service → dialog never responds → stuck.
+        "openAndSavePanelService",
+        // Audio driver helpers — throttle = audio dropouts, buffer underruns.
+        // 122+40 throttles observed in prod. Includes DriverKit audio path.
+        "Core-Audio-Driver-Service",
+        "audio.SandboxHelper",
+        "AudioComponentRegistrar",
+        // Video decode XPC — throttle = video stutter in every app (YouTube, QuickTime).
+        // 79 throttles observed in prod.
+        "VTDecoderXPCService",
+        // Camera / CMIO video capture — throttle = camera hangs mid-session.
+        // 43 throttles in prod. Affects FaceTime, Zoom, OBS.
+        "cmio.videodriverkithostextension",
+        // Display brightness daemon — throttle = auto-brightness stuck, manual slider laggy.
+        // 63 throttles in prod.
+        "corebrightnessd",
+        // Display extension — 33 FREEZES in prod. Freeze = display pipeline stall.
+        "DisplaysExt",
+        // Display timing daemon (IOMFB) — throttle = frame pacing issues, tearing.
+        "IOMFB_bics_daemon",
+        // WiFi DriverKit extension — freeze/throttle = WiFi drops at driver level.
+        // 9 freezes + 16 throttles in prod (complements airportd above).
+        "DriverKit-AppleBCMWLAN",
+        // Karabiner keyboard remapper — throttle = key remapping stops mid-session.
+        // 36 throttles in prod. User loses custom shortcuts silently.
+        "Karabiner-DriverKit-VirtualHIDDevice",
+        // Code signing integrity daemon — throttle = app launches hang at signature check.
+        // 10 throttles in prod. amfid is on the critical path for every app launch.
+        "amfid",
+        // Apple Neural Engine user daemon — throttle = on-device ML inference stalls.
+        "aneuserd",
+        // login process — throttle = session management stalls.
+        "login",
+        // Sandbox policy daemon — throttle = sandboxed app operations hang.
+        "sandboxd",
+        // Security init daemon — throttle = security subsystem slow to respond.
+        "secinitd",
+        // UIKit system process — throttle = UI framework operations stall.
+        "UIKitSystem",
+        // Apollo own binary (all variants) — prevent self-freeze of old/new binary names.
+        "apollo_optimizer",
+        "apollo-optimizer",
     ]
     .into_iter()
     .collect()

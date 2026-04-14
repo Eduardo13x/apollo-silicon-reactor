@@ -378,10 +378,18 @@ pub fn decide_actions(
 
     // Dev-first: protect critical background workloads and their children.
     let critical_patterns = critical_background_processes();
+    let hard_protected = crate::engine::safety::protected_processes();
     let mut critical_pids: HashSet<u32> = HashSet::new();
     for (pid, process) in sys.processes() {
         let name = process.name().to_string();
         if critical_patterns.iter().any(|p| name.contains(p)) {
+            critical_pids.insert(pid.as_u32());
+        }
+        // Seed hard-protected PIDs into critical_pids so the child-walk below
+        // also covers their forked children (XPC helpers with different names).
+        // Name-substring alone misses children whose names don't inherit the
+        // parent's name (common for DriverKit extensions and helper tools).
+        if hard_protected.iter().any(|p| name.contains(p)) {
             critical_pids.insert(pid.as_u32());
         }
     }
@@ -393,6 +401,7 @@ pub fn decide_actions(
     }
 
     // Add children-of-critical by walking parent chain once.
+    // Covers both critical_background_processes() and hard protected_processes().
     // Depth-limited to prevent infinite loops from PID recycling (BUG 10 fix).
     const MAX_PARENT_DEPTH: usize = 20;
     for pid in sys.processes().keys() {

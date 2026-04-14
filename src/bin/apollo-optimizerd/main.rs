@@ -577,11 +577,6 @@ fn main() -> anyhow::Result<()> {
                     },
                 })),
 
-                discrepancy_log_path: if is_root {
-                    PathBuf::from("/var/lib/apollo/discrepancy.jsonl")
-                } else {
-                    PathBuf::from("/tmp/apollo-discrepancy.jsonl")
-                },
                 user_profile_path: if is_root {
                     PathBuf::from("/var/lib/apollo/user_profile.json")
                 } else {
@@ -4343,8 +4338,19 @@ fn main() -> anyhow::Result<()> {
                             .iter()
                             .flat_map(|s| s.throttle_targets.iter().cloned())
                             .collect();
+                        let skill_hard_protected =
+                            apollo_optimizer::engine::safety::protected_processes();
                         for (pid, process) in collector.system().processes() {
                             let name = process.name().to_string();
+                            // Guard: never throttle hard-protected OS daemons via skills,
+                            // even if the skill registry learned them as "effective targets".
+                            // Skills can encode stale or spurious correlations.
+                            if skill_hard_protected
+                                .iter()
+                                .any(|&p| name.contains(p))
+                            {
+                                continue;
+                            }
                             if skill_targets.contains(&name) && !already_actioned.contains(&name) {
                                 let skill_name = skill_matches
                                     .iter()
@@ -5441,53 +5447,29 @@ fn main() -> anyhow::Result<()> {
 
                 // F3 — Safety Precedence: foreground app is NEVER throttled or frozen.
                 // Also protects recently active apps (minimized but used in the last 5 min).
-                // Only logs to discrepancy when the reason is ambiguous (not covered by
-                // foreground detection or activity sensor) — those are the cases where
-                // the LLM teacher actually adds value.
                 {
                     let fg_family_pids =
                         process_enrichment::build_foreground_family(foreground_pid, &process_tree);
                     let recently_active_window = std::time::Duration::from_secs(300);
 
-                    let mut ambiguous_removed = 0usize;
                     actions.retain(|a| match a {
                         RootAction::ThrottleProcess { pid, name, .. }
                         | RootAction::FreezeProcess { pid, name, .. } => {
-                            // Foreground by PID family — deterministic, don't log.
                             if fg_family_pids.contains(pid) {
                                 return false;
                             }
-                            // Foreground by name — deterministic, don't log.
                             if let Some(fg) = &foreground_app {
                                 if name.contains(fg.as_str()) {
                                     return false;
                                 }
                             }
-                            // Recently active — deterministic, don't log.
                             if fg_detector.is_recently_active(name, recently_active_window) {
                                 return false;
                             }
-                            // From here: protected by learned_policy or critical_bg —
-                            // these ARE ambiguous cases worth logging for LLM learning.
-                            ambiguous_removed += 1;
                             true
                         }
                         _ => true,
                     });
-                    // Only log truly ambiguous cases — where signals didn't explain the
-                    // protection. This is the useful signal for the LLM teacher.
-                    if ambiguous_removed > 0 {
-                        if let Some(fg) = &foreground_app {
-                            process_enrichment::append_discrepancy_log(
-                                &state.discrepancy_log_path,
-                                fg,
-                                ambiguous_removed,
-                                &format!("{:?}", ml_class.workload),
-                                ml_class.confidence,
-                                "ambiguous",
-                            );
-                        }
-                    }
                 }
 
                 // F4 — Thermal Master Switch: >95°C P-cluster — suppress all Boost actions.
