@@ -3318,7 +3318,20 @@ fn main() -> anyhow::Result<()> {
                     if let Some(ref iopm) = iopm_snap {
                         metrics.metrics.iopm_thermal_warning =
                             format!("{:?}", iopm.thermal_warning);
-                        metrics.metrics.iopm_power_source = format!("{:?}", iopm.power_source);
+                        // IOPMrootDomain CurrentPowerSource key fails on macOS 26+.
+                        // Fall back to power_mgr (IOPSCopyPowerSourcesInfo) which works.
+                        metrics.metrics.iopm_power_source =
+                            if iopm.power_source == apollo_optimizer::engine::thermal_iokit::PowerSource::Unknown {
+                                if power_mgr.battery_status.is_charging {
+                                    "AC".to_string()
+                                } else if power_mgr.battery_status.percentage > 0 {
+                                    "Battery".to_string()
+                                } else {
+                                    format!("{:?}", iopm.power_source)
+                                }
+                            } else {
+                                format!("{:?}", iopm.power_source)
+                            };
                     }
 
                     // Per-process energy top consumer
