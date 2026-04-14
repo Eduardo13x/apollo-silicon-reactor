@@ -354,6 +354,8 @@ pub struct MachQoSManager {
     prev_thread_cpu: HashMap<(u32, u32), u64>,
     /// PIDs currently in App Nap suppression mode.
     app_napped: HashSet<u32>,
+    /// Cached IO tier per PID — skip task_for_pid when tier unchanged.
+    io_tier_cache: HashMap<u32, i32>,
 }
 
 impl MachQoSManager {
@@ -363,6 +365,7 @@ impl MachQoSManager {
             permanently_blocked: HashSet::new(),
             prev_thread_cpu: HashMap::new(),
             app_napped: HashSet::new(),
+            io_tier_cache: HashMap::new(),
         }
     }
 
@@ -460,6 +463,8 @@ impl MachQoSManager {
             .retain(|&(pid, _), _| (unsafe { libc::kill(pid as i32, 0) }) == 0);
         self.app_napped
             .retain(|&pid| (unsafe { libc::kill(pid as i32, 0) }) == 0);
+        self.io_tier_cache
+            .retain(|&pid, _| (unsafe { libc::kill(pid as i32, 0) }) == 0);
     }
 
     /// Apply QoS changes to many processes in one pass.
@@ -864,6 +869,13 @@ impl MachQoSManager {
             self.permanently_blocked.insert(pid);
             return false;
         }
+        // Skip task_for_pid syscall when IO tier unchanged — same idea as
+        // current_tier cache for QoS tier. Eliminates the dominant source of
+        // unnecessary Mach port lookups when process count exceeds IoShaper's
+        // MAX_TRACKED_PIDS cache.
+        if self.io_tier_cache.get(&pid) == Some(&io_tier) {
+            return true;
+        }
 
         unsafe {
             use self::ffi::*;
@@ -897,7 +909,11 @@ impl MachQoSManager {
             );
 
             mach_port_deallocate(mach_task_self(), task_port);
-            kr2 == KERN_SUCCESS
+            let ok = kr2 == KERN_SUCCESS;
+            if ok {
+                self.io_tier_cache.insert(pid, io_tier);
+            }
+            ok
         }
     }
 
