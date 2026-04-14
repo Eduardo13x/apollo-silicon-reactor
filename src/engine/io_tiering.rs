@@ -115,22 +115,41 @@ pub fn io_tier_for_throttle(aggressive: bool) -> IOTier {
     }
 }
 
-/// Apply an I/O tier to a process via `libc::setpriority`.
+/// Darwin background scheduling tier constant (sys/resource.h).
+/// `setpriority(PRIO_DARWIN_BG, pid, 1)` puts a process into background
+/// scheduling class — lower CPU + IO priority, but **turnstile-compatible**:
+/// the kernel can temporarily override it for priority inheritance when a
+/// higher-priority thread blocks on an IPC from a background process.
+/// Unlike `setpriority(PRIO_PROCESS, pid, 20)` (nice=20), this does NOT
+/// create a hard scheduling floor that breaks the turnstile chain.
+#[cfg(target_os = "macos")]
+const PRIO_DARWIN_BG: libc::c_int = 0x1000;
+
+/// Apply an I/O tier to a process via `PRIO_DARWIN_BG`.
 /// Best-effort: returns false on failure but does not panic.
+///
+/// Uses `PRIO_DARWIN_BG` (Darwin background QoS) instead of
+/// `PRIO_PROCESS + nice=20`. The distinction matters for system stability:
+/// nice=20 permanently degrades CPU scheduling and breaks the Mach turnstile
+/// priority-inheritance chain. Darwin background QoS is overrideable by the
+/// kernel when a higher-priority thread (e.g. WindowServer, Finder) blocks
+/// on an IPC from a backgrounded process.
 pub fn apply_io_tier(pid: u32, tier: IOTier) -> bool {
-    // PRIO_DARWIN_BG (0x1000) puts the process into background QoS
-    // which includes IO throttling. For finer control, we use the
-    // MachQoSManager path (apply_io_tier_direct). This is the fallback.
+    #[cfg(target_os = "macos")]
     match tier {
-        IOTier::Interactive => {
-            // Remove background status.
-            unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 0) == 0 }
+        IOTier::Interactive | IOTier::Standard => {
+            // Remove Darwin background status — restore normal scheduling.
+            unsafe { libc::setpriority(PRIO_DARWIN_BG, pid, 0) == 0 }
         }
-        IOTier::Standard => unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 0) == 0 },
         IOTier::Utility | IOTier::Throttle | IOTier::Passive => {
-            // Set to background priority (includes IO throttle).
-            unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 20) == 0 }
+            // Set Darwin background (turnstile-compatible background QoS).
+            unsafe { libc::setpriority(PRIO_DARWIN_BG, pid, 1) == 0 }
         }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, tier);
+        false
     }
 }
 
@@ -158,7 +177,10 @@ pub fn apply_io_tier_direct(
 const MIN_REAPPLY_SECS: u64 = 60;
 
 /// Maximum tracked PIDs (prevent unbounded growth).
-const MAX_TRACKED_PIDS: usize = 200;
+/// Must exceed the typical live-process count (500-600 on macOS) to avoid
+/// cache thrashing: when this is too small, entries are evicted and
+/// re-applied every run, causing hundreds of unnecessary task_for_pid syscalls.
+const MAX_TRACKED_PIDS: usize = 800;
 
 /// Tracks per-PID I/O tier assignments and applies them reactively.
 pub struct IoShaper {
