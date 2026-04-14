@@ -708,6 +708,9 @@ fn migrate_to_ecores(
         if bufs.is_essential(name) || bufs.is_protected(name) {
             continue;
         }
+        if crate::engine::process_identity::is_apple_platform_process(pid_u32) {
+            continue;
+        }
         if proc_info.cpu_usage() < 5.0 {
             continue;
         }
@@ -822,6 +825,11 @@ fn freeze_non_critical(
                 .unwrap_or(false); // process no longer exists → do not signal
             if !name_matches {
                 // PID recycled or process exited between snapshot and now.
+                continue;
+            }
+            // Apple platform check: skip CS_PLATFORM_BINARY processes even in
+            // thermal emergency — freezing WindowServer helpers causes display hangs.
+            if crate::engine::process_identity::is_apple_platform_process(*pid_u32) {
                 continue;
             }
             unsafe {

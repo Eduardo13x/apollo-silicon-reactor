@@ -198,6 +198,106 @@ pub fn validate_pid(pid: u32, expected_name: &str) -> bool {
     }
 }
 
+// ── Apple platform binary detection ─────────────────────────────────────────
+
+/// Code-signing status operations (csops syscall).
+#[cfg(target_os = "macos")]
+const CS_OPS_STATUS: u32 = 0;
+
+/// `CS_PLATFORM_BINARY` — set by the kernel for Apple-signed platform binaries.
+/// All processes in `/System/`, `/usr/`, XNU itself, and Apple daemons carry this flag.
+/// It is checked by SIP, TCC, and the kernel trust layer — the most reliable
+/// signal that a process is part of the Apple system stack.
+#[cfg(target_os = "macos")]
+const CS_PLATFORM_BINARY: u32 = 0x0400_0000;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    /// `csops(pid, ops, useraddr, usersize)` — query/set code-signing state.
+    /// With `CS_OPS_STATUS` returns a `u32` bitmask of `CS_*` flags.
+    fn csops(pid: libc::pid_t, ops: u32, useraddr: *mut libc::c_void, usersize: usize)
+        -> libc::c_int;
+}
+
+/// `proc_pidpath` — already declared in proc_taskinfo; re-use via extern here.
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn proc_pidpath(pid: libc::c_int, buffer: *mut u8, buffersize: u32) -> libc::c_int;
+}
+
+/// Maximum path buffer size for `proc_pidpath`.
+#[cfg(target_os = "macos")]
+const PROC_PIDPATHINFO_MAXSIZE: u32 = 4096;
+
+/// Returns `true` if `pid` belongs to the Apple platform:
+/// Apple-signed system binary, Apple daemon, or SIP-protected system service.
+///
+/// # Detection layers (ordered fastest → most expensive)
+///
+/// 1. **`csops` `CS_PLATFORM_BINARY`** (~1 µs): kernel-authoritative flag set on
+///    all Apple-signed platform binaries. No false positives. No path needed.
+///
+/// 2. **`proc_pidpath` prefix** (~3 µs fallback): binary lives under a system
+///    path (`/System/`, `/usr/` excl. `/usr/local/`, `/sbin/`, `/bin/`,
+///    `/Library/Apple/`). Covers binaries that run before codesign is verified
+///    and kernel helpers that `csops` returns 0 for.
+///
+/// Returns `false` for any process Apollo should be allowed to optimize
+/// (user apps, third-party daemons, Homebrew services, etc.).
+///
+/// Cost: ~1–4 µs. Safe to call every cycle per-process because the answer
+/// is stable for the lifetime of the process — callers should cache.
+#[cfg(target_os = "macos")]
+pub fn is_apple_platform_process(pid: u32) -> bool {
+    // Layer 1: csops CS_PLATFORM_BINARY — kernel-authoritative.
+    let mut flags: u32 = 0;
+    let rc = unsafe {
+        csops(
+            pid as libc::pid_t,
+            CS_OPS_STATUS,
+            &mut flags as *mut u32 as *mut libc::c_void,
+            std::mem::size_of::<u32>(),
+        )
+    };
+    if rc == 0 && (flags & CS_PLATFORM_BINARY) != 0 {
+        return true;
+    }
+
+    // Layer 2: path prefix — catches kernel helpers / early-boot processes
+    // where csops may return 0 flags but the binary lives in a protected path.
+    let mut buf = [0u8; PROC_PIDPATHINFO_MAXSIZE as usize];
+    let path_len =
+        unsafe { proc_pidpath(pid as libc::c_int, buf.as_mut_ptr(), PROC_PIDPATHINFO_MAXSIZE) };
+    if path_len > 0 {
+        let path = std::str::from_utf8(&buf[..path_len as usize]).unwrap_or("");
+        if is_apple_system_path(path) {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_apple_platform_process(_pid: u32) -> bool {
+    false
+}
+
+/// Returns `true` if `path` is a known Apple system binary location.
+///
+/// Excludes `/usr/local/` (Homebrew) — that is user-managed territory.
+pub fn is_apple_system_path(path: &str) -> bool {
+    path.starts_with("/System/")
+        || path.starts_with("/usr/bin/")
+        || path.starts_with("/usr/sbin/")
+        || path.starts_with("/usr/libexec/")
+        || path.starts_with("/usr/lib/")
+        || path.starts_with("/sbin/")
+        || path.starts_with("/bin/")
+        || path.starts_with("/Library/Apple/")
+        || path.starts_with("/private/var/db/")
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -223,5 +323,47 @@ mod tests {
     fn launchd_is_not_translated() {
         // PID 1 (launchd) is always native.
         assert!(!is_translated(1));
+    }
+
+    #[test]
+    fn launchd_is_apple_platform() {
+        // PID 1 (launchd) is always an Apple platform binary.
+        assert!(
+            is_apple_platform_process(1),
+            "launchd must be detected as Apple platform binary"
+        );
+    }
+
+    #[test]
+    fn dead_pid_is_not_apple() {
+        assert!(!is_apple_platform_process(999_999_999));
+    }
+
+    #[test]
+    fn own_process_not_apple_platform() {
+        // cargo test is not a platform binary — it lives in /Users/ or ~/.cargo/
+        let own_pid = std::process::id();
+        assert!(
+            !is_apple_platform_process(own_pid),
+            "cargo test should NOT be detected as Apple platform binary"
+        );
+    }
+
+    #[test]
+    fn apple_system_paths() {
+        assert!(is_apple_system_path("/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"));
+        assert!(is_apple_system_path("/usr/libexec/AirPlayXPCHelper"));
+        assert!(is_apple_system_path("/usr/bin/codesign"));
+        assert!(is_apple_system_path("/sbin/launchd"));
+        assert!(is_apple_system_path("/bin/sh"));
+        assert!(is_apple_system_path("/Library/Apple/System/Library/Extensions/AppleT8101PCIe.kext/Contents/MacOS/AppleT8101PCIe"));
+    }
+
+    #[test]
+    fn non_apple_paths() {
+        assert!(!is_apple_system_path("/usr/local/bin/brew"));
+        assert!(!is_apple_system_path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"));
+        assert!(!is_apple_system_path("/Users/eduardocortez/.cargo/bin/cargo"));
+        assert!(!is_apple_system_path("/usr/local/libexec/apollo-optimizerd"));
     }
 }

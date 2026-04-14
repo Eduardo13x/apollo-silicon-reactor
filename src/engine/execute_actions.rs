@@ -370,6 +370,13 @@ pub fn execute_actions(
                         out.push_skip(format!("pid-recycled:{}", name));
                         return Ok(());
                     }
+                    // PID-level Apple platform check: csops CS_PLATFORM_BINARY + path prefix.
+                    // Catches system helpers not in the explicit name list (e.g. CoreGraphics
+                    // compositor helpers, SkyLight workers, DriverKit services).
+                    if process_identity::is_apple_platform_process(*pid) {
+                        out.push_skip(format!("apple-platform:{}", name));
+                        return Ok(());
+                    }
                     let is_critical_bg = critical_bg.iter().any(|p| name.contains(p));
                     let aggressive = if is_critical_bg { false } else { *aggressive };
                     if is_critical_bg {
@@ -443,6 +450,11 @@ pub fn execute_actions(
                     }
                     // Validate PID identity with start-time (prevents A-B-A recycling).
                     if !verify_pid_identity(*pid, name, *start_sec, *start_usec) {
+                        return Ok(());
+                    }
+                    // PID-level Apple platform check: csops CS_PLATFORM_BINARY + path prefix.
+                    if process_identity::is_apple_platform_process(*pid) {
+                        out.push_skip(format!("apple-platform:{}", name));
                         return Ok(());
                     }
                     // Never freeze processes with active power assertions
