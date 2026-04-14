@@ -59,8 +59,10 @@ const HEAVY_APP_PATTERNS: &[&str] = &[
 
 /// Substrings identifying active compilation / build processes.
 const BUILD_PATTERNS: &[&str] = &[
-    "cargo", "rustc", "stable", "clang", "clang++", "cc", "c++", "make", "ninja", "gradle",
-    "swift", "javac",
+    // Keep only unambiguous patterns that won't substring-match system daemons.
+    // Removed: "cc" (matches accessd, accountsd, etc.), "c++" (too rare as process name),
+    //          "stable" (rust toolchain wrapper — rarely a standalone process name on macOS).
+    "cargo", "rustc", "clang", "clang++", "make", "ninja", "gradle", "swift", "javac",
 ];
 
 /// Substrings identifying ML inference / AI workloads.

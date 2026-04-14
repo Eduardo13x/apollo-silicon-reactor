@@ -482,15 +482,33 @@ pub fn classify_workload_mode(features: &WorkloadFeatures) -> (WorkloadMode, f64
 
     distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let d_min = distances[0].1;
-    let d_second = distances[1].1;
+    // Hard constraint: Build mode requires at least one build tool running.
+    // Without this, high RSS alone (≈5 GB) matches the Build centroid and
+    // incorrectly applies -8pp threshold bonus on a browsing/idle system.
+    let best = if distances[0].0 == WorkloadMode::Build && features.build_tool_count < 1.0 {
+        // Fall back to next-closest mode that isn't Build.
+        distances
+            .iter()
+            .find(|(m, _)| *m != WorkloadMode::Build)
+            .copied()
+            .unwrap_or(distances[0])
+    } else {
+        distances[0]
+    };
+
+    let d_min = best.1;
+    let d_second = distances
+        .iter()
+        .find(|(m, _)| *m != best.0)
+        .map(|(_, d)| *d)
+        .unwrap_or(d_min);
     let confidence = if d_min + d_second > 0.0 {
         1.0 - d_min / (d_min + d_second)
     } else {
         0.5
     };
 
-    (distances[0].0, confidence.clamp(0.0, 1.0))
+    (best.0, confidence.clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
