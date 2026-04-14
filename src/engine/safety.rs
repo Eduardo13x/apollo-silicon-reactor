@@ -32,14 +32,26 @@ pub fn protected_processes() -> HashSet<&'static str> {
         "xpcproxy",
         "trustd",
         "distnoted",
-        // Spotlight stack (never touch — throttling these breaks app search).
+        // Spotlight stack (never touch — throttling these breaks app search and
+        // prevents reindexing from ever completing).
         "Spotlight",
         "mds",
         "mds_stores",
         "mdworker",
         "mdworker_shared",
+        "mdbulkimport",   // bulk initial import — throttle = reindex never finishes
+        "mdwrite",        // writes Spotlight DB — throttle = index never updates
+        "mdutil",         // Spotlight control tool — throttle = mdutil commands stall
         "corespotlightd",
         "spotlightknowledged",
+        // Network / contacts / font — throttle causes app network timeouts,
+        // Contacts/Settings hangs, and slow app launches with custom fonts.
+        "nsurlsessiond",  // URL session broker — throttle → network timeouts in apps
+        "contactsd",      // Contacts DB daemon — throttle → Settings/Contacts hang
+        "fontworker",     // font catalog builder — throttle → slow app launch
+        "imagent",        // iMessage agent — throttle → message send delays
+        "spindump",       // crash diagnostic — short-lived, but throttle corrupts reports
+        "ReportCrash",    // crash reporter — throttle → crash reports lost/corrupt
         // Display & audio rendering pipeline — freezing any of these causes frame drops,
         // animation jank, or audio glitches visible to the user. [WWDC 2021 "Tune CPU job
         // scheduling with QoS"; Apple TN2169 SIP/process policy]
