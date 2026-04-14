@@ -263,14 +263,27 @@ pub fn is_apple_platform_process(pid: u32) -> bool {
         return true;
     }
 
-    // Layer 2: path prefix — catches kernel helpers / early-boot processes
-    // where csops may return 0 flags but the binary lives in a protected path.
+    // Layer 2: path prefix + name heuristic.
+    // Covers: kernel helpers, early-boot processes (csops returns 0),
+    // third-party DriverKit dexts (no CS_PLATFORM_BINARY but SIP-managed path),
+    // and system extensions installed under /Library/SystemExtensions/.
     let mut buf = [0u8; PROC_PIDPATHINFO_MAXSIZE as usize];
     let path_len =
         unsafe { proc_pidpath(pid as libc::c_int, buf.as_mut_ptr(), PROC_PIDPATHINFO_MAXSIZE) };
     if path_len > 0 {
         let path = std::str::from_utf8(&buf[..path_len as usize]).unwrap_or("");
-        if is_apple_system_path(path) {
+        if is_system_driver_path(path) {
+            return true;
+        }
+    }
+
+    // Layer 3: name heuristic for DriverKit processes whose path is a bundle ID.
+    // DriverKit dext processes report their bundle identifier as their name
+    // (e.g. "com.apple.DriverKit-AppleBCMWLAN", "org.pqrs.Karabiner-DriverKit-…").
+    // proc_pidpath on these returns the .dext bundle path which layer 2 catches,
+    // but as a belt-and-suspenders guard we also check the name directly.
+    if let Some(name) = crate::engine::process_identity::proc_name_for_pid(pid) {
+        if is_driver_process_name(&name) {
             return true;
         }
     }
@@ -296,6 +309,44 @@ pub fn is_apple_system_path(path: &str) -> bool {
         || path.starts_with("/bin/")
         || path.starts_with("/Library/Apple/")
         || path.starts_with("/private/var/db/")
+}
+
+/// Returns `true` if `path` is a system driver or extension location.
+///
+/// Covers Apple system paths plus driver/extension-specific locations:
+///
+/// - `/Library/SystemExtensions/` — SIP-managed; macOS approves each extension
+///   before it lands here (Network Extensions, Endpoint Security, DriverKit dexts).
+/// - `/Library/DriverExtensions/` — DriverKit dexts for third-party hardware.
+/// - Any path containing `.dext/` — DriverKit driver bundle executable.
+/// - Any path containing `.systemextension/` — System Extension bundle executable.
+/// - Any path containing `.kext/` — kernel extension bundle (legacy drivers).
+///
+/// Note: third-party DriverKit processes (e.g. Karabiner, audio interfaces) lack
+/// `CS_PLATFORM_BINARY` but are just as critical — freezing them hangs HID input,
+/// audio, or USB entirely.
+pub fn is_system_driver_path(path: &str) -> bool {
+    is_apple_system_path(path)
+        || path.starts_with("/Library/SystemExtensions/")
+        || path.starts_with("/Library/DriverExtensions/")
+        || path.contains(".dext/")
+        || path.contains(".systemextension/")
+        || path.contains(".kext/")
+}
+
+/// Returns `true` if the process name looks like a DriverKit bundle identifier.
+///
+/// DriverKit dexts report their bundle ID as their process name, e.g.:
+/// - `com.apple.DriverKit-AppleBCMWLAN`
+/// - `com.apple.DriverKit-IOUserDockChannelSerial`
+/// - `org.pqrs.Karabiner-DriverKit-VirtualHIDDevice`
+///
+/// Matching on "DriverKit" in the name catches all of them regardless of vendor.
+pub fn is_driver_process_name(name: &str) -> bool {
+    name.contains("DriverKit")
+        || name.ends_with(".dext")
+        || name.ends_with(".kext")
+        || name.ends_with(".systemextension")
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -365,5 +416,44 @@ mod tests {
         assert!(!is_apple_system_path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"));
         assert!(!is_apple_system_path("/Users/eduardocortez/.cargo/bin/cargo"));
         assert!(!is_apple_system_path("/usr/local/libexec/apollo-optimizerd"));
+    }
+
+    #[test]
+    fn driver_paths_detected() {
+        // SIP-managed system extensions (DriverKit dexts, NExt, EndpointSecurity).
+        assert!(is_system_driver_path(
+            "/Library/SystemExtensions/55CD9E59/org.pqrs.Karabiner-DriverKit-VirtualHIDDevice.dext/Contents/MacOS/org.pqrs.Karabiner-DriverKit-VirtualHIDDevice"
+        ));
+        // .dext bundle anywhere.
+        assert!(is_system_driver_path(
+            "/System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/Contents/MacOS/com.apple.DriverKit-AppleBCMWLAN"
+        ));
+        // System extension bundle.
+        assert!(is_system_driver_path(
+            "/usr/libexec/com.apple.cmio.videodriverkithostextension.systemextension/Contents/MacOS/com.apple.cmio.videodriverkithostextension"
+        ));
+        // Legacy kext bundle.
+        assert!(is_system_driver_path(
+            "/Library/Extensions/SoftRAID.kext/Contents/MacOS/SoftRAID"
+        ));
+        // Third-party driver extensions path.
+        assert!(is_system_driver_path("/Library/DriverExtensions/com.vendor.MyHIDDevice.dext/Contents/MacOS/com.vendor.MyHIDDevice"));
+    }
+
+    #[test]
+    fn driver_names_detected() {
+        assert!(is_driver_process_name("com.apple.DriverKit-AppleBCMWLAN"));
+        assert!(is_driver_process_name("org.pqrs.Karabiner-DriverKit-VirtualHIDDevice"));
+        assert!(is_driver_process_name("com.apple.DriverKit-IOUserDockChannelSerial"));
+        assert!(!is_driver_process_name("Brave Browser"));
+        assert!(!is_driver_process_name("apollo-optimizerd"));
+        assert!(!is_driver_process_name("cargo"));
+    }
+
+    #[test]
+    fn non_driver_paths_not_caught() {
+        assert!(!is_system_driver_path("/usr/local/bin/brew"));
+        assert!(!is_system_driver_path("/Applications/AudioHijack.app/Contents/MacOS/AudioHijack"));
+        assert!(!is_system_driver_path("/Users/edu/.cargo/bin/rustc"));
     }
 }
