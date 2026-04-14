@@ -72,7 +72,7 @@ use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
 use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
 use apollo_optimizer::engine::network_optimizer::NetworkProfile;
 use apollo_optimizer::engine::neuromodulator::NeuroSignals;
-use apollo_optimizer::engine::overflow_guard::{OverflowGuard, BUILD_TOOLS};
+use apollo_optimizer::engine::overflow_guard::{is_build_tool_name, OverflowGuard};
 use apollo_optimizer::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
 use apollo_optimizer::engine::pipeline::periodic_stage::{run_periodic, PeriodicContext};
@@ -1124,6 +1124,12 @@ fn main() -> anyhow::Result<()> {
             let mut llm_detector =
                 apollo_optimizer::engine::llm_inference_mode::LlmInferenceDetector::new();
             let mut llm_spotlight_disabled = false;
+            // Defensive restore: if a previous daemon crash left Spotlight disabled
+            // (killed mid-LLM inference), re-enable on startup so indexing can resume
+            // rather than restart from scratch on next mds event.
+            if is_root {
+                spotlight_set_indexing(true);
+            }
 
             // ── Feature 3: RT Boost for Foreground ───────────────────────────
             // THREAD_TIME_CONSTRAINT_POLICY: guarantee 2ms/10ms to foreground UI thread.
@@ -2135,7 +2141,7 @@ fn main() -> anyhow::Result<()> {
                                 rss_bytes: s.rss_bytes,
                                 working_set_bytes: wss_bytes,
                                 is_foreground: s.has_gui_window && s.secs_since_foreground == 0,
-                                is_build_tool: BUILD_TOOLS.iter().any(|t| s.name.contains(t)),
+                                is_build_tool: is_build_tool_name(&s.name),
                                 presence_ema: presence,
                                 interactive_ema: interactive,
                             }
@@ -3395,7 +3401,7 @@ fn main() -> anyhow::Result<()> {
                     };
                     let build_tool_count = all_proc_names
                         .iter()
-                        .filter(|n| BUILD_TOOLS.iter().any(|t| n.to_lowercase().contains(t)))
+                        .filter(|n| is_build_tool_name(n))
                         .count() as f64;
                     let gpu_watts = cycle_hw_snap
                         .as_ref()

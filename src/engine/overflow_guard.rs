@@ -102,6 +102,26 @@ pub const BUILD_TOOLS: &[&str] = &[
     "rustc", "cargo", "swift", "clang", "make", "gcc", "ld", "link", "stable",
 ];
 
+/// Match a process name against build tool patterns.
+///
+/// Short patterns (≤4 chars) use exact matching to prevent false positives:
+/// - `"ld"` should match the linker (`ld`) but NOT `triald`, `linkd`,
+///   `IOUserBluetoothSerialDriver`, etc.
+/// - `"link"` should match the Windows linker stub but NOT `linkd`,
+///   `contentlinkingd`, etc.
+///
+/// Longer patterns use `contains()` as before (e.g. `"rustc"` in `"rustc-1.77"`).
+pub fn is_build_tool_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    BUILD_TOOLS.iter().any(|&t| {
+        if t.len() <= 4 {
+            lower == t
+        } else {
+            lower.contains(t)
+        }
+    })
+}
+
 /// Query total physical RAM in GB using `sysctl -n hw.memsize`.
 /// Falls back to 8.0 GB if the query fails (conservative default for M1 Air).
 fn query_ram_gb() -> f64 {
@@ -336,7 +356,7 @@ impl OverflowGuard {
     pub fn detect_build_mode(proc_names: &[&str]) -> bool {
         let count = proc_names
             .iter()
-            .filter(|n| BUILD_TOOLS.iter().any(|t| n.to_lowercase().contains(t)))
+            .filter(|n| is_build_tool_name(n))
             .count();
         count >= 2
     }
