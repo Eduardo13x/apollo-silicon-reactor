@@ -273,9 +273,11 @@ impl IOReportReader {
             let channel = c_chars_to_str(&ch.channel);
 
             // ── CPU cluster utilization ──────────────────────────────────────
-            // Driver: "AppleARMCPUPowerState" or similar
-            // Channel: "CPU Complex Performance States 0" (E) / "1" (P)
-            if channel.contains("CPU Complex Performance States") {
+            // macOS ≤15: "CPU Complex Performance States 0/1"
+            // macOS 26+: channel name may differ; match any CPU+Performance States combo.
+            if channel.contains("CPU Complex Performance States")
+                || (channel.contains("CPU") && channel.contains("Performance States"))
+            {
                 let active_pct = active_fraction(&ch.duty_cycles, &ch.state_names, ch.state_count);
                 // Cluster 0 = E-cores, Cluster 1 = P-cores on M1.
                 if channel.ends_with('0') {
