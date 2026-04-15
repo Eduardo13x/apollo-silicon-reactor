@@ -664,6 +664,21 @@ impl PredictiveAgent {
             return (Intervention::Observe, 0.0);
         }
 
+        // ε-greedy forced exploration: every 20 cycles rotate through non-Observe arms.
+        // Prevents the bandit from locking permanently on Observe (arm 0) when the
+        // reward signal for active arms is too sparse to compete with Observe's 0.0.
+        // No external deps — use total_cycles as a cheap deterministic rotator.
+        // Forced pulls are marked with 0.0 confidence so callers can weight them.
+        const EXPLORE_PERIOD: u64 = 20; // ~5% exploration rate
+        if self.total_cycles > 0 && self.total_cycles % EXPLORE_PERIOD == 0 && K > 1 {
+            // Rotate through arms 1..K-1 (never force arm 0 = Observe).
+            let forced_arm =
+                ((self.total_cycles / EXPLORE_PERIOD) % (K as u64 - 1)) as usize + 1;
+            let intervention = Intervention::from_index(forced_arm);
+            self.last_action = Some((intervention, ctx.features, ctx.features[0]));
+            return (intervention, 0.0);
+        }
+
         let mut scores = [(0usize, f64::NEG_INFINITY); K];
         for i in 0..K {
             scores[i] = (i, self.arms[i].score(&ctx.features, self.alpha));
@@ -708,13 +723,19 @@ impl PredictiveAgent {
                 0.0
             }
         } else {
-            // Active intervention
+            // Active intervention.
+            // NOTE: interventions take 3-10 cycles to show pressure impact.
+            // Measuring 1 cycle after action almost never captures the full drop,
+            // so the old -0.1 "unnecessary action" penalty was applied in ~95% of
+            // active pulls, causing the bandit to converge permanently to Observe.
+            // Fix: no penalty when pressure is stable — we don't know yet whether
+            // the action was useful. Only penalize when pressure actively worsened.
             if delta > 0.05 {
-                (delta * 5.0).clamp(0.0, 1.0)
+                (delta * 5.0).clamp(0.0, 1.0) // clear improvement
             } else if delta < -0.03 {
-                -0.5
+                -0.5 // pressure worsened — bad action
             } else {
-                -0.1 // cost of unnecessary action
+                0.0 // neutral: too early to judge
             }
         };
 
