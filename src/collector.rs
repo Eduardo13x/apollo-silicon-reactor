@@ -138,13 +138,11 @@ impl SystemCollector {
             self.process_refresh_skip_count += 1;
             self.sys.refresh_cpu();
             self.sys.refresh_memory();
-        } else if self.light_call_count % 30 == 0 {
-            // Full refresh for disk/network stats (for journal and metrics).
-            self.sys.refresh_all();
-            self.disks.refresh_list();
-            self.networks.refresh();
         } else {
             // Light path: enough for all scheduling decisions.
+            // Disk/network refresh was removed — DiskStats/NetworkStats captured
+            // but never consumed, and sysinfo's macOS disk refresh triggers the
+            // CacheDelete framework logging subsystem (→ logd spam, wasted power).
             self.sys.refresh_cpu();
             self.sys.refresh_memory();
             self.sys.refresh_processes();
@@ -185,28 +183,10 @@ impl SystemCollector {
         self.prev_swap_used_bytes = Some(swap_used_bytes);
         self.prev_swap_at = Some(nowi);
 
-        // Disks
-        let disks = self
-            .disks
-            .iter()
-            .map(|disk| DiskStats {
-                name: disk.name().to_string_lossy().into_owned(),
-                mount_point: disk.mount_point().to_string_lossy().into_owned(),
-                total_space: disk.total_space(),
-                available_space: disk.available_space(),
-            })
-            .collect();
-
-        // Networks
-        let networks = self
-            .networks
-            .iter()
-            .map(|(name, data)| NetworkStats {
-                interface_name: name.clone(),
-                received: data.received(),
-                transmitted: data.transmitted(),
-            })
-            .collect();
+        // Disks/networks: captured fields retained for Metrics struct
+        // compatibility but never refreshed (see refresh path above).
+        let disks = Vec::new();
+        let networks = Vec::new();
 
         // Processes - Get top 10 by CPU usage
         let mut processes: Vec<ProcessStats> = self
