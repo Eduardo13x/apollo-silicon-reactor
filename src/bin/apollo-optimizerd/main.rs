@@ -1627,6 +1627,15 @@ fn main() -> anyhow::Result<()> {
                         Some(now_wall + ChronoDuration::seconds(60));
                     grace_active = true;
 
+                    // Reset volatile filter state. Pre-sleep Kalman position +
+                    // OutcomeTracker short-window deltas reflect a system that
+                    // was idle/paused for arbitrary time; without a reset they
+                    // inject phantom velocity/drift into the first post-wake
+                    // decisions and can sustain bad action choices for minutes.
+                    // Long-term learned state (R, weights, EMAs) is preserved.
+                    signal_intel.reset_after_wake();
+                    outcome_tracker.reset_after_wake();
+
                     // Staggered wake unfreeze: queue PIDs instead of mass SIGCONT.
                     // Draining 5 PIDs/cycle avoids 1-3GB decompression spike on 8GB M1.
                     // Priority: interactive PIDs first (user notices their latency).
@@ -5893,9 +5902,14 @@ fn main() -> anyhow::Result<()> {
                                     return false;
                                 }
                                 let count = freeze_candidates.entry(*pid).or_insert(0);
-                                *count += 1;
                                 // Pre-emptive mode: act after 1 cycle instead of 2
                                 let required = if fluidity_preemptive { 1 } else { 2 };
+                                // Cap at required+1: PIDs proposed every cycle but
+                                // skipped downstream (deep-scan, fluidity gate) would
+                                // otherwise accumulate count indefinitely. Once the
+                                // confirmation threshold is met, capping at +1 is enough
+                                // to keep the gate "armed" without unbounded growth.
+                                *count = (*count + 1).min(required + 1);
                                 *count >= required
                             } else {
                                 true

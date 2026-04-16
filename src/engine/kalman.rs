@@ -79,6 +79,19 @@ impl Kalman1D {
         }
     }
 
+    /// Clear estimated state (position/velocity/covariance) but preserve
+    /// learned q/r noise parameters. Use after a wake from sleep where the
+    /// pre-sleep state is stale and would inject false velocity into the
+    /// next measurement [Crassidis & Junkins 2012, §3.7].
+    pub fn reset_state(&mut self) {
+        self.x = 0.0;
+        self.v = 0.0;
+        self.p00 = 1.0;
+        self.p01 = 0.0;
+        self.p11 = 1.0;
+        self.initialized = false;
+    }
+
     /// Predict + update con una nueva observación.
     ///
     /// - `measurement`: valor observado crudo.

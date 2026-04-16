@@ -334,6 +334,28 @@ impl CausalGraph {
                 j += 1;
             }
         }
+
+        // In-cycle cap: persist-time prune in LearnedState::self_improve runs
+        // every ~300 cycles (~150s). Within that window the edges HashMap can
+        // grow with every unique (process_name, effect) pair the daemon sees,
+        // and lookups in solid_edges_by_impact / effectiveness become O(N).
+        // Hard cap at 500 entries; on overflow, evict the lowest-impact edge.
+        // The persist-time decay-and-retain still runs and does the principled
+        // GC; this is just a safety valve to keep hot-path lookups bounded.
+        // [Cormen et al. 2009] §11 — bounded-size HashMap keeps O(1) amortised.
+        const HOT_PATH_EDGE_CAP: usize = 500;
+        if self.edges.len() > HOT_PATH_EDGE_CAP {
+            // Score = impact_score (higher = more useful). Evict lowest.
+            // Multiply by 1000 + cast to i32 for stable Ord.
+            if let Some(weakest) = self
+                .edges
+                .iter()
+                .min_by_key(|(_, e)| (e.impact_score() * 1000.0) as i32)
+                .map(|(k, _)| k.clone())
+            {
+                self.edges.remove(&weakest);
+            }
+        }
     }
 
     /// Get a specific causal edge if it exists.

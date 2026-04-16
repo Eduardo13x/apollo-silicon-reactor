@@ -632,11 +632,21 @@ impl LearnedState {
                 edge.mechanism.cpu_delta_pct *= 0.95;
                 edge.mechanism.swap_delta_mb *= 0.95;
             }
-            // Prune edges near uninformed prior with low evidence — no signal.
+            // Prune edges that have lost signal:
+            //   a) near-prior confidence + low evidence (cold edge, never converged), OR
+            //   b) mechanism EMAs all decayed to near-zero (high-evidence edge that
+            //      hasn't been updated in many persists — staleness gate).
+            // Without (b) a stale edge with e.g. evidence_count=200 from a workload
+            // that no longer runs survives forever and corrupts ranking.
             edges.retain(|(_, e)| {
                 let near_prior =
                     (e.confidence - 0.5).abs() < 0.05 && (e.slow_confidence - 0.5).abs() < 0.05;
-                !(near_prior && e.evidence_count < 10)
+                let mech_dead = e.mechanism.rss_delta_mb.abs() < 0.5
+                    && e.mechanism.cpu_delta_pct.abs() < 0.5
+                    && e.mechanism.swap_delta_mb.abs() < 0.5;
+                let cold_unconverged = near_prior && e.evidence_count < 10;
+                let stale_high_evidence = near_prior && mech_dead;
+                !(cold_unconverged || stale_high_evidence)
             });
         }
     }

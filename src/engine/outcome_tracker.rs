@@ -418,6 +418,19 @@ impl OutcomeTracker {
         }
     }
 
+    /// Clear volatile post-cycle state after wake from sleep. Pre-sleep
+    /// pressure deltas and prev_pressure are stale (system was idle/sleeping
+    /// for arbitrary time) and would inject phantom drift velocity into the
+    /// next causal attribution. Preserves Bayesian weights, experience, and
+    /// long-term EMAs (those are still valid).
+    pub fn reset_after_wake(&mut self) {
+        self.short_window_deltas.clear();
+        self.short_drift_velocity = 0.0;
+        self.prev_pressure = None;
+        self.drift_accumulator = 0.0;
+        self.ticks_since_action = 0;
+    }
+
     /// Current NARS drift score [0,1]. High = model has drifted from reality.
     pub fn nars_drift_score(&self) -> f64 {
         self.drift_detector.score()
@@ -482,6 +495,23 @@ impl OutcomeTracker {
         if self.pending.len() > 300 {
             eprintln!("apollo: outcome_tracker: discarded 100 pending outcomes (cap)");
             self.pending.drain(..100);
+        }
+
+        // In-cycle cap: persist-time prune runs every ~150s; without an
+        // in-cycle ceiling, weights HashMap can grow to thousands between
+        // persists on bursty workloads (one entry per unique process name).
+        // Evict weakest (lowest throttle_count) — high-count entries are
+        // load-bearing for Bayesian salience.
+        const HOT_PATH_WEIGHTS_CAP: usize = 200;
+        if self.weights.len() > HOT_PATH_WEIGHTS_CAP {
+            if let Some(weakest_key) = self
+                .weights
+                .iter()
+                .min_by_key(|(_, w)| w.throttle_count)
+                .map(|(k, _)| k.clone())
+            {
+                self.weights.remove(&weakest_key);
+            }
         }
     }
 

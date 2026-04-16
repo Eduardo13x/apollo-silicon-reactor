@@ -871,6 +871,15 @@ impl SignalIntelligence {
         }
     }
 
+    /// Clear volatile filter state after a wake from sleep. Pre-sleep
+    /// Kalman position/velocity are stale and would inject false velocity
+    /// into the first post-wake observation. Preserves learned R noise
+    /// (the auto-tuned values are still valid).
+    pub fn reset_after_wake(&mut self) {
+        self.kf_pressure.reset_state();
+        self.kf_swap.reset_state();
+    }
+
     /// Reset learned zones to defaults (called when restore quality is stale).
     /// Also clears feedback history to prevent stale oscillation data from
     /// halving the zone alpha on the fresh zones.
