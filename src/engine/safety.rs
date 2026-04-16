@@ -155,6 +155,11 @@ pub fn protected_processes() -> HashSet<&'static str> {
         "secinitd",
         // UIKit system process — throttle = UI framework operations stall.
         "UIKitSystem",
+        // Media players — freeze = audio/video playback drops immediately.
+        // VLC runs its own audio thread decoupled from the GUI window; background
+        // playback (e.g. music while coding) has no foreground window so
+        // is_user_interactive_app() misses it → freeze kills audio silently.
+        "VLC",
         // Apollo own binary (all variants) — prevent self-freeze of old/new binary names.
         "apollo_optimizer",
         "apollo-optimizer",

@@ -5872,12 +5872,21 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
 
+                    let mut seen_freeze_pids: HashSet<u32> = HashSet::new();
                     let confirmed_actions: Vec<RootAction> = graced_actions
                         .into_iter()
                         .filter(|a| {
                             if let RootAction::FreezeProcess { pid, .. } = a {
                                 // Skip new freezes during app launch (launch acceleration)
                                 if fluidity_launch_active {
+                                    return false;
+                                }
+                                // Per-cycle dedup: FreezeProcess can be proposed by
+                                // multiple upstream paths (stale-app, adaptive_governor,
+                                // survival-mode). Without dedup, downstream deep-scan
+                                // converts each dup to a separate SetMemorystatus hit
+                                // on the same PID → wasted syscalls and journal spam.
+                                if !seen_freeze_pids.insert(*pid) {
                                     return false;
                                 }
                                 let count = freeze_candidates.entry(*pid).or_insert(0);
