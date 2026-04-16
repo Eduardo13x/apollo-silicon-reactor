@@ -1145,11 +1145,36 @@ fn main() -> anyhow::Result<()> {
             let mut llm_detector =
                 apollo_optimizer::engine::llm_inference_mode::LlmInferenceDetector::new();
             let mut llm_spotlight_disabled = false;
+            // Pressure-triggered spotlight state (mirrors the pressure gate at
+            // the bottom of the main loop). Declared here so the startup
+            // defensive restore can mark spotlight_paused=true when it skips
+            // the restore under heavy pressure.
+            let mut spotlight_paused: bool = false;
+            let mut spotlight_paused_at: Option<Instant> = None;
             // Defensive restore: if a previous daemon crash left Spotlight disabled
             // (killed mid-LLM inference), re-enable on startup so indexing can resume
             // rather than restart from scratch on next mds event.
+            //
+            // PRESSURE GATE: skip the restore if the system is already under heavy
+            // memory pressure. Turning mds/mds_stores back on during a crisis
+            // triggers a full reindex (74% CPU on M1 8GB) that makes pressure
+            // worse before the main loop's protection logic can kick in. Mark
+            // spotlight_paused=true so the regular re-enable path (mem < 0.40)
+            // still fires naturally once pressure drops.
             if is_root {
-                spotlight_set_indexing(true);
+                let startup_pressure = apollo_optimizer::engine::host_vm_info::read_vm_stats()
+                    .map(|s| s.pressure())
+                    .unwrap_or(0.0);
+                if startup_pressure < 0.60 {
+                    spotlight_set_indexing(true);
+                } else {
+                    tracing::warn!(
+                        pressure = startup_pressure,
+                        "startup: skipping Spotlight re-enable — pressure too high"
+                    );
+                    spotlight_paused = true;
+                    spotlight_paused_at = Some(Instant::now());
+                }
             }
 
             // ── Feature 3: RT Boost for Foreground ───────────────────────────
@@ -1334,10 +1359,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(baselines) = restored_process_baselines {
                 energy_pid_tracker.restore_baseline(baselines);
             }
-            // Spotlight pause state: true when Apollo has paused Spotlight indexing
-            // via mdutil to relieve memory pressure.  Re-enabled when pressure normalizes.
-            let mut spotlight_paused: bool = false;
-            let mut spotlight_paused_at: Option<Instant> = None;
+            // Spotlight pause state moved earlier (see startup defensive restore).
             // EMA interactivity classifier: track per-PID rusage CPU deltas
             // to compute cpu_wall_ratio. Key = PID, value = (prev_user_ns,
             // prev_system_ns, proc_start_abstime) for delta computation.
