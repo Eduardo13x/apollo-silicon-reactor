@@ -145,7 +145,7 @@ pub struct LearnableParams {
     pub tuning_cycles: u64,
 
     // ── Diagnostics ───────────────────────────────────────────────────
-    /// True when `nars_decay_factor` is stuck at its 0.80 floor.
+    /// True when `nars_decay_factor` is stuck near its 0.90 floor (B5).
     /// At the floor, beliefs decay maximally fast and are therefore unreliable.
     /// Exposed as a diagnostic flag so future decision logic can reduce
     /// confidence in NARS outputs when this is set.
@@ -271,7 +271,10 @@ impl LearnableParams {
         self.outcome_effective_threshold = self.outcome_effective_threshold.clamp(0.005, 0.05);
         self.experience_pressure_band = self.experience_pressure_band.clamp(0.02, 0.25);
         self.nars_drift_threshold = self.nars_drift_threshold.clamp(0.05, 0.40);
-        self.nars_decay_factor = self.nars_decay_factor.clamp(0.80, 0.99);
+        // B5 fix (round-3): raise decay floor 0.80 → 0.90.
+        // Previously 7 persist cycles collapsed confidence to 0.80^7 ≈ 0.21
+        // (79% evidence lost). New floor 0.90^7 ≈ 0.48 retains half the mass.
+        self.nars_decay_factor = self.nars_decay_factor.clamp(0.90, 0.99);
         self.cusum_k = self.cusum_k.clamp(0.005, 0.10);
         self.cusum_h = self.cusum_h.clamp(0.05, 0.30);
         self.pid_target = self.pid_target.clamp(0.40, 0.85);
@@ -317,10 +320,17 @@ impl LearnableParams {
             (current_effectiveness - self.meta_effectiveness_ema).abs() < 0.02;
 
         if velocity_low && effectiveness_falling {
-            // Stuck: increase exploration — multiply learning rates ×1.5
-            self.zone_alpha *= 1.5;
-            self.hazard_lr *= 1.5;
-            self.nars_decay_factor = (self.nars_decay_factor * 0.98).max(0.80); // faster forgetting
+            // Stuck: increase exploration — multiply learning rates ×1.5.
+            //
+            // B4 fix (round-3): cap at an *interim* ceiling (half of the hard
+            // clamp in `validate()`) before assignment so a crash between the
+            // multiply and the next `validate()` call leaves rates in a still-
+            // sane range.  Hard clamps: zone_alpha ≤ 0.05, hazard_lr ≤ 0.1.
+            const ZONE_ALPHA_INTERIM_MAX: f64 = 0.025; // 0.05 / 2
+            const HAZARD_LR_INTERIM_MAX: f64 = 0.05; // 0.1 / 2
+            self.zone_alpha = (self.zone_alpha * 1.5).min(ZONE_ALPHA_INTERIM_MAX);
+            self.hazard_lr = (self.hazard_lr * 1.5).min(HAZARD_LR_INTERIM_MAX);
+            self.nars_decay_factor = (self.nars_decay_factor * 0.98).max(0.90); // faster forgetting (bounded by new 0.90 floor — B5)
         } else if velocity_low && effectiveness_stable {
             // Converged: slow down — multiply learning rates ×0.8
             self.zone_alpha *= 0.8;
@@ -335,7 +345,9 @@ impl LearnableParams {
 
         // When decay is at floor, beliefs are unreliable — mark stale so
         // decision makers can reduce confidence in NARS outputs.
-        self.nars_beliefs_stale = self.nars_decay_factor <= 0.82;
+        // Threshold shifted with the new 0.90 floor (B5): mark stale when
+        // within 2pp of the floor, indicating decay is stuck.
+        self.nars_beliefs_stale = self.nars_decay_factor <= 0.92;
     }
 }
 
@@ -1332,7 +1344,7 @@ mod tests {
         assert!(lp.rl_compressor_bands[1] > lp.rl_compressor_bands[0]);
         assert_eq!(lp.zone_alpha, 0.001);
         assert_eq!(lp.outcome_wait_secs, 10);
-        assert_eq!(lp.nars_decay_factor, 0.80);
+        assert_eq!(lp.nars_decay_factor, 0.90);
         assert_eq!(lp.pid_target, 0.40);
         assert_eq!(lp.meta_effectiveness_ema, 1.0);
     }

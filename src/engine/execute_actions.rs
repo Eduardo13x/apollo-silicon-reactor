@@ -20,6 +20,12 @@ use crate::engine::types::{CapabilityReport, JournalEntry, RootAction};
 /// Set the nice value for a process via `setpriority(2)`.
 /// Returns `Ok(())` on success, or an error if the call failed.
 fn set_nice(pid: u32, nice: i32) -> anyhow::Result<()> {
+    // A2 fix (round-3): skip zombies before setpriority. setpriority on a
+    // zombie returns ESRCH which was previously silenced but still wasted a
+    // syscall and polluted the error log path.
+    if proc_taskinfo::is_zombie_pid(pid) {
+        return Ok(());
+    }
     // errno must be cleared before setpriority — a return of -1 is ambiguous
     // because -1 is a valid priority.  We use the errno convention instead.
     unsafe {
@@ -81,41 +87,115 @@ fn run_sysctl_write(key: &str, value: &str) -> anyhow::Result<()> {
 }
 
 // ── Timeout wrappers for kernel syscalls that can block as root ──────────
+//
+// A1 fix (round-3): the previous implementation spawned one `thread::spawn`
+// per timeout call and leaked it on timeout.  Over hours that produced
+// thousands of detached zombies.  Replace with a single dedicated worker
+// thread, spawned lazily on first use and fed via a mpsc request queue.
+// On timeout, the caller abandons the response channel; the worker continues
+// to completion on its own thread and silently discards the result — only
+// one worker total, no matter how many requests.
+
+enum SysctlRequest {
+    Read {
+        key: String,
+        reply: std::sync::mpsc::Sender<Option<String>>,
+    },
+    WriteStr {
+        key: String,
+        value: String,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
+    WriteI32 {
+        key: String,
+        value: i32,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
+}
+
+fn sysctl_request_tx() -> &'static std::sync::mpsc::Sender<SysctlRequest> {
+    use std::sync::OnceLock;
+    static TX: OnceLock<std::sync::mpsc::Sender<SysctlRequest>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<SysctlRequest>();
+        std::thread::Builder::new()
+            .name("apollo-sysctl-worker".to_string())
+            .spawn(move || {
+                // Dedicated serial worker. A stuck syscall only blocks this
+                // single thread — subsequent requests queue up but the main
+                // loop is never blocked because callers recv_timeout().
+                while let Ok(req) = rx.recv() {
+                    match req {
+                        SysctlRequest::Read { key, reply } => {
+                            let _ = reply.send(sysctl_direct::read_str(&key));
+                        }
+                        SysctlRequest::WriteStr { key, value, reply } => {
+                            let _ = reply.send(sysctl_direct::write_str_value(&key, &value));
+                        }
+                        SysctlRequest::WriteI32 { key, value, reply } => {
+                            let _ = reply.send(sysctl_direct::write_i32(&key, value));
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn apollo-sysctl-worker");
+        tx
+    })
+}
 
 /// Read a sysctl with 500ms timeout. Prevents `sysctlbyname` from blocking
 /// the daemon loop indefinitely under kernel lock contention.
 fn sysctl_read_with_timeout(key: &str) -> Option<String> {
-    let key = key.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(sysctl_direct::read_str(&key));
-    });
-    rx.recv_timeout(std::time::Duration::from_millis(500))
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    if sysctl_request_tx()
+        .send(SysctlRequest::Read {
+            key: key.to_string(),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return None;
+    }
+    reply_rx
+        .recv_timeout(std::time::Duration::from_millis(500))
         .ok()
         .flatten()
 }
 
 /// Write a sysctl with 500ms timeout.
 fn sysctl_write_with_timeout(key: &str, value: &str) -> bool {
-    let key = key.to_string();
-    let value = value.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(sysctl_direct::write_str_value(&key, &value));
-    });
-    rx.recv_timeout(std::time::Duration::from_millis(500))
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    if sysctl_request_tx()
+        .send(SysctlRequest::WriteStr {
+            key: key.to_string(),
+            value: value.to_string(),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    reply_rx
+        .recv_timeout(std::time::Duration::from_millis(500))
         .ok()
         .unwrap_or(false)
 }
 
 /// Write an i32 sysctl with 500ms timeout.
 fn sysctl_write_i32_with_timeout(key: &str, value: i32) -> bool {
-    let key = key.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(sysctl_direct::write_i32(&key, value));
-    });
-    rx.recv_timeout(std::time::Duration::from_millis(500))
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    if sysctl_request_tx()
+        .send(SysctlRequest::WriteI32 {
+            key: key.to_string(),
+            value,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    reply_rx
+        .recv_timeout(std::time::Duration::from_millis(500))
         .ok()
         .unwrap_or(false)
 }
@@ -169,6 +249,11 @@ pub struct ExecuteOutcomes {
     /// PIDs that were successfully frozen (SIGSTOP sent) this cycle.
     /// Used by causal graph to record only new freeze actions, not all active frozen PIDs.
     pub newly_frozen_pids: Vec<u32>,
+    /// A3 + A5/D1 fix (round-3): per-PID identity snapshot captured at the
+    /// moment of SIGSTOP.  Parallel to `newly_frozen_pids`.
+    /// `(start_sec, original_jetsam_priority)` — either may be 0/None if
+    /// the lookup failed.
+    pub newly_frozen_identity: Vec<(u32, u64, Option<i32>)>,
 }
 
 impl ExecuteOutcomes {
@@ -469,12 +554,29 @@ pub fn execute_actions(
                         frozen.insert(*pid);
                         out.freezes_applied += 1;
                         out.newly_frozen_pids.push(*pid);
+                        out.newly_frozen_identity.push((*pid, *start_sec, None));
                     } else {
+                        // A2/A4 fix (round-3): skip zombies before SIGSTOP. SIGSTOP on
+                        // a zombie is a kernel no-op that still burns a syscall.
+                        if proc_taskinfo::is_zombie_pid(*pid) {
+                            out.push_skip(format!("zombie:{}", name));
+                            return Ok(());
+                        }
                         // Demote disk I/O to Passive before SIGSTOP.
                         // This prevents the process from hoarding SSD bandwidth on resume.
                         if caps.can_taskpolicy {
                             apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Passive);
                         }
+                        // A5/D1: capture the original jetsam priority BEFORE we demote
+                        // the PID to BACKGROUND.  Saved on the FrozenEntry (propagated
+                        // via ExecuteOutcomes::newly_frozen_identity) so unfreeze can
+                        // restore the exact original value instead of blanket-setting
+                        // Interactive (which previously lost AUDIO / VITAL).
+                        let captured_priority = if caps.can_memorystatus {
+                            crate::engine::jetsam_control::get_priority(*pid)
+                        } else {
+                            None
+                        };
                         // Jetsam: marcar como BACKGROUND en el kernel antes de SIGSTOP.
                         // Así si el sistema entra en OOM mientras el proceso está frozen,
                         // el kernel lo mata primero en lugar de matar procesos interactivos.
@@ -486,6 +588,11 @@ pub fn execute_actions(
                             frozen.insert(*pid);
                             out.freezes_applied += 1;
                             out.newly_frozen_pids.push(*pid);
+                            out.newly_frozen_identity.push((
+                                *pid,
+                                *start_sec,
+                                captured_priority,
+                            ));
                         }
                     }
                 }
@@ -496,6 +603,11 @@ pub fn execute_actions(
                         out.unfreezes_applied += 1;
                         out.throttle_reverted += 1;
                     } else {
+                        // A2 fix (round-3): skip zombies — SIGCONT is a no-op on them.
+                        if proc_taskinfo::is_zombie_pid(*pid) {
+                            frozen.remove(pid);
+                            return Ok(());
+                        }
                         let alive = unsafe { libc::kill(*pid as i32, 0) } == 0;
                         if alive {
                             let rc = unsafe { libc::kill(*pid as i32, libc::SIGCONT) };
@@ -518,10 +630,14 @@ pub fn execute_actions(
                                         );
                                     }
                                 }
-                                // Restaurar prioridad jetsam a FOREGROUND al descongelar.
-                                if caps.can_memorystatus {
-                                    let _ = apply_apollo_policy(*pid, JetsamClass::Interactive);
-                                }
+                                // A5/D1 fix (round-3): previously we blanket-set
+                                // JetsamClass::Interactive (FOREGROUND=9), which clobbered
+                                // AUDIO (18), AUDIO_AND_ACCESSORY (10), VITAL (12), etc.
+                                // The correct restoration path runs from
+                                // daemon_helpers::unfreeze_pids_verified(), which has
+                                // access to `FrozenEntry::original_jetsam_priority`.  Here
+                                // we leave jetsam priority untouched when we don't know
+                                // the original value.
                                 frozen.remove(pid);
                                 out.unfreezes_applied += 1;
                                 out.throttle_reverted += 1;

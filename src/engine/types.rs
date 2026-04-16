@@ -422,6 +422,24 @@ pub struct FrozenEntry {
     /// recycled and we skip SIGCONT (the original process is already gone).
     #[serde(default)]
     pub process_name: Option<String>,
+    /// Kernel start-time (`pbi_start_tvsec`) captured at freeze time.
+    ///
+    /// A3 fix (round-3): prevents A-B-A PID recycling in the unfreeze pre-pass.
+    /// On SIGCONT, the caller re-reads the current PID's start-time; if it no
+    /// longer matches, the original process is gone and SIGCONT is skipped
+    /// (the new process at that PID is not ours to resume).
+    ///
+    /// 0 = not captured (legacy entry or capture failed) → fall back to
+    /// name-only check for backward compatibility.
+    #[serde(default)]
+    pub start_sec: u64,
+    /// Jetsam priority captured at freeze time (snapshot of the value before
+    /// we demoted to BACKGROUND).  A5/D1 fix (round-3): on unfreeze we
+    /// restore this exact value instead of unconditionally setting
+    /// Interactive, which previously lost AUDIO / AUDIO_AND_ACCESSORY /
+    /// VITAL priorities.  `None` = unknown → leave jetsam untouched.
+    #[serde(default)]
+    pub original_jetsam_priority: Option<i32>,
 }
 
 fn frozen_entry_pressure_default() -> f64 {
@@ -1289,6 +1307,8 @@ mod tests {
             source: FreezeSource::MainLoop,
             pressure_at_freeze: 0.75,
             process_name: Some("TestProcess".to_string()),
+            start_sec: 0,
+            original_jetsam_priority: None,
         };
         let json = serde_json::to_string(&entry).expect("serialize FrozenEntry");
         let rt: FrozenEntry = serde_json::from_str(&json).expect("deserialize FrozenEntry");

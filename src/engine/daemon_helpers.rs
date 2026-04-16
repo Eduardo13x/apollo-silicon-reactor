@@ -428,7 +428,51 @@ pub fn load_wake_state(path: &Path) -> WakeRuntimeState {
 
 // ── Frozen State ────────────────────────────────────────────────────────────
 
+/// Single background writer thread for frozen_state.json.
+///
+/// C3 fix (round-3): callers always invoke `write_frozen_state` while holding
+/// `state.frozen_state` — the previous implementation did the disk write
+/// synchronously, blocking the entire main loop on a slow disk (observed
+/// 200ms+ on a loaded SSD).  The snapshot (`FrozenStatePersisted`) is built
+/// cheaply under the caller's lock, then handed to a dedicated writer thread
+/// via mpsc.  Lock is released immediately after `send`.
+fn frozen_state_writer() -> &'static std::sync::mpsc::Sender<(std::path::PathBuf, FrozenStatePersisted)>
+{
+    use std::sync::OnceLock;
+    static TX: OnceLock<std::sync::mpsc::Sender<(std::path::PathBuf, FrozenStatePersisted)>> =
+        OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) =
+            std::sync::mpsc::channel::<(std::path::PathBuf, FrozenStatePersisted)>();
+        std::thread::Builder::new()
+            .name("apollo-frozen-writer".to_string())
+            .spawn(move || {
+                while let Ok((path, state)) = rx.recv() {
+                    // Coalesce: if the queue already has newer entries for the
+                    // same path, drop intermediate ones to avoid amplifying disk
+                    // writes during rapid bursts.
+                    let mut latest = state;
+                    let mut target = path;
+                    while let Ok((p, s)) = rx.try_recv() {
+                        if p == target {
+                            latest = s;
+                        } else {
+                            // Different path — flush current then switch.
+                            write_json(&target, &latest, Some(0o600));
+                            target = p;
+                            latest = s;
+                        }
+                    }
+                    write_json(&target, &latest, Some(0o600));
+                }
+            })
+            .expect("failed to spawn apollo-frozen-writer");
+        tx
+    })
+}
+
 pub fn write_frozen_state(path: &Path, frozen_state: &HashMap<u32, FrozenEntry>) {
+    // Build snapshot inline (cheap: names are small Option<String>).
     let persisted = FrozenStatePersisted {
         frozen: frozen_state
             .iter()
@@ -439,7 +483,9 @@ pub fn write_frozen_state(path: &Path, frozen_state: &HashMap<u32, FrozenEntry>)
             })
             .collect(),
     };
-    write_json(path, &persisted, Some(0o600));
+    // Hand off to writer thread; caller may still hold the frozen_state lock
+    // but that's fine because we don't need it after the snapshot is built.
+    let _ = frozen_state_writer().send((path.to_path_buf(), persisted));
 }
 
 pub fn load_frozen_state(path: &Path) -> HashMap<u32, FrozenEntry> {
@@ -456,6 +502,11 @@ pub fn load_frozen_state(path: &Path) -> HashMap<u32, FrozenEntry> {
                             source: FreezeSource::MainLoop,
                             pressure_at_freeze: 1.0,
                             process_name: e.name,
+                            // Legacy persisted entries: start_sec unknown and
+                            // original jetsam priority unknown. Callers fall
+                            // back to name-only check when start_sec == 0.
+                            start_sec: 0,
+                            original_jetsam_priority: None,
                         },
                     )
                 })
@@ -470,8 +521,55 @@ pub fn load_frozen_state(path: &Path) -> HashMap<u32, FrozenEntry> {
 pub fn unfreeze_pids(pids: impl Iterator<Item = u32>) -> u64 {
     let mut count = 0_u64;
     for pid in pids {
+        // A2 fix (round-3): skip zombies — SIGCONT to a zombie is a no-op
+        // that still burns a syscall and inflates error counters.
+        if crate::engine::proc_taskinfo::is_zombie_pid(pid) {
+            continue;
+        }
         unsafe {
             libc::kill(pid as i32, libc::SIGCONT);
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Unfreeze variant that verifies kernel start-time before signalling.
+///
+/// A3 fix (round-3): when a `FrozenEntry::start_sec > 0` is known, this
+/// helper checks that the current process at `pid` still has the same
+/// start-time.  If the PID was recycled between freeze and unfreeze, we
+/// skip SIGCONT — otherwise we'd be resuming an unrelated process that
+/// was never stopped by us.
+///
+/// Entries without `start_sec` (legacy, or capture failed) fall through
+/// to the plain name-based behaviour.
+pub fn unfreeze_pids_verified(entries: &HashMap<u32, FrozenEntry>) -> u64 {
+    let mut count = 0_u64;
+    for (&pid, entry) in entries.iter() {
+        if crate::engine::proc_taskinfo::is_zombie_pid(pid) {
+            continue;
+        }
+        if entry.start_sec > 0 {
+            if let Some(current) = ProcessIdentity::from_pid(pid) {
+                if current.start_sec != entry.start_sec {
+                    // PID was recycled — the frozen process is gone, and
+                    // the new occupant must not receive our SIGCONT.
+                    continue;
+                }
+            } else {
+                // process gone
+                continue;
+            }
+        }
+        unsafe {
+            libc::kill(pid as i32, libc::SIGCONT);
+        }
+        // A5/D1 restoration: if we captured a jetsam priority at freeze
+        // time, restore it verbatim instead of letting the caller clobber
+        // it with a blanket FOREGROUND.
+        if let Some(prio) = entry.original_jetsam_priority {
+            let _ = crate::engine::jetsam_control::set_priority(pid, prio);
         }
         count += 1;
     }

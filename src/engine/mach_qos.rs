@@ -349,7 +349,14 @@ pub struct MachQoSManager {
     /// Current tier per PID — we only issue a syscall when it changes.
     current_tier: HashMap<u32, SchedulingTier>,
     /// PIDs permanently skipped (SIP, hardened runtime, or entitlement-protected).
+    ///
+    /// A7 fix (round-3): paired with `permanently_blocked_since` so GC can
+    /// expire entries after a TTL, preventing a recycled PID from inheriting
+    /// the "blocked" verdict of a long-dead process.
     permanently_blocked: HashSet<u32>,
+    /// Insertion timestamps for `permanently_blocked`, used for TTL-based
+    /// expiry alongside the liveness-based `gc_dead_pids`.
+    permanently_blocked_since: HashMap<u32, std::time::Instant>,
     /// Previous thread CPU times for delta tracking: (pid, thread_idx) → total_cpu_us.
     prev_thread_cpu: HashMap<(u32, u32), u64>,
     /// PIDs currently in App Nap suppression mode.
@@ -363,9 +370,20 @@ impl MachQoSManager {
         Self {
             current_tier: HashMap::new(),
             permanently_blocked: HashSet::new(),
+            permanently_blocked_since: HashMap::new(),
             prev_thread_cpu: HashMap::new(),
             app_napped: HashSet::new(),
             io_tier_cache: HashMap::new(),
+        }
+    }
+
+    /// Record `pid` as permanently blocked, stamping insertion time for
+    /// TTL-based GC (A7).
+    #[inline]
+    fn mark_blocked(&mut self, pid: u32) {
+        if self.permanently_blocked.insert(pid) {
+            self.permanently_blocked_since
+                .insert(pid, std::time::Instant::now());
         }
     }
 
@@ -407,7 +425,7 @@ impl MachQoSManager {
             if result.success {
                 self.current_tier.insert(pid, tier);
             } else {
-                self.permanently_blocked.insert(pid);
+                self.mark_blocked(pid);
                 self.current_tier.remove(&pid);
                 return QoSOutcome {
                     pid,
@@ -423,7 +441,7 @@ impl MachQoSManager {
         // Pre-filter: if the executable is in a SIP-protected path or
         // proc_pidpath fails, block permanently without attempting task_for_pid.
         if Self::is_sip_protected(pid) {
-            self.permanently_blocked.insert(pid);
+            self.mark_blocked(pid);
             return QoSOutcome {
                 pid,
                 tier,
@@ -438,7 +456,7 @@ impl MachQoSManager {
             self.current_tier.insert(pid, tier);
         } else {
             // task_for_pid failed — block permanently and report as silent skip.
-            self.permanently_blocked.insert(pid);
+            self.mark_blocked(pid);
             self.current_tier.remove(&pid);
             return QoSOutcome {
                 pid,
@@ -454,9 +472,33 @@ impl MachQoSManager {
     /// Purge dead PIDs from all tracking maps.
     /// Call periodically (e.g. every 30 cycles) to prevent unbounded growth
     /// and to handle PID recycling — a recycled PID must be re-evaluated.
+    ///
+    /// A7 fix (round-3): also TTL-expire `permanently_blocked` entries after
+    /// 60s.  `kill(pid, 0) == 0` alone cannot distinguish "original blocked
+    /// process still running" from "PID was recycled to a fresh process that
+    /// we should actually evaluate".  The TTL forces re-evaluation so a new
+    /// occupant isn't inheriting a zombie decision.
     pub fn gc_dead_pids(&mut self) {
-        self.permanently_blocked
-            .retain(|&pid| (unsafe { libc::kill(pid as i32, 0) }) == 0);
+        const PERM_BLOCK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        let now = std::time::Instant::now();
+        let blocked_since = &self.permanently_blocked_since;
+        self.permanently_blocked.retain(|&pid| {
+            let alive = (unsafe { libc::kill(pid as i32, 0) }) == 0;
+            if !alive {
+                return false;
+            }
+            // Alive: keep only if the block was recorded recently.  Expired
+            // entries are re-evaluated next set_tier call (which will re-add
+            // them via mark_blocked on subsequent failure).
+            match blocked_since.get(&pid) {
+                Some(t) => now.duration_since(*t) < PERM_BLOCK_TTL,
+                // Unknown insertion time (upgrade from older state) — drop
+                // so it gets re-stamped if it really is still blocked.
+                None => false,
+            }
+        });
+        self.permanently_blocked_since
+            .retain(|&pid, _| self.permanently_blocked.contains(&pid));
         self.current_tier
             .retain(|&pid, _| (unsafe { libc::kill(pid as i32, 0) }) == 0);
         self.prev_thread_cpu
@@ -777,7 +819,7 @@ impl MachQoSManager {
         throughput: ThroughputTier,
     ) -> QoSOutcome {
         if self.permanently_blocked.contains(&pid) || Self::is_sip_protected(pid) {
-            self.permanently_blocked.insert(pid);
+            self.mark_blocked(pid);
             return QoSOutcome {
                 pid,
                 tier: SchedulingTier::Normal,
@@ -794,7 +836,7 @@ impl MachQoSManager {
             let kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);
 
             if kr != KERN_SUCCESS {
-                self.permanently_blocked.insert(pid);
+                self.mark_blocked(pid);
                 return QoSOutcome {
                     pid,
                     tier: SchedulingTier::Normal,
@@ -866,7 +908,7 @@ impl MachQoSManager {
     #[cfg(target_os = "macos")]
     pub fn set_io_tier(&mut self, pid: u32, io_tier: i32) -> bool {
         if self.permanently_blocked.contains(&pid) || Self::is_sip_protected(pid) {
-            self.permanently_blocked.insert(pid);
+            self.mark_blocked(pid);
             return false;
         }
         // Skip task_for_pid syscall when IO tier unchanged — same idea as
@@ -885,7 +927,7 @@ impl MachQoSManager {
             let kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);
 
             if kr != KERN_SUCCESS {
-                self.permanently_blocked.insert(pid);
+                self.mark_blocked(pid);
                 return false;
             }
 
@@ -934,7 +976,7 @@ impl MachQoSManager {
     #[cfg(target_os = "macos")]
     pub fn set_app_nap(&mut self, pid: u32, suppressed: bool) -> bool {
         if self.permanently_blocked.contains(&pid) || Self::is_sip_protected(pid) {
-            self.permanently_blocked.insert(pid);
+            self.mark_blocked(pid);
             return false;
         }
         // Skip if already in the target state.
@@ -949,7 +991,7 @@ impl MachQoSManager {
             let mut task_port: MachPortT = MACH_PORT_NULL;
             let kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);
             if kr != KERN_SUCCESS {
-                self.permanently_blocked.insert(pid);
+                self.mark_blocked(pid);
                 return false;
             }
 
@@ -1042,7 +1084,7 @@ impl MachQoSManager {
             let mut task_port: MachPortT = MACH_PORT_NULL;
             let kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);
             if kr != KERN_SUCCESS {
-                self.permanently_blocked.insert(pid);
+                self.mark_blocked(pid);
                 return false;
             }
 

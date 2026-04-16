@@ -413,8 +413,15 @@ pub fn merge_cycle_metrics<'a>(
     // Actualizar métricas del overflow guard antes de escribir.
     metrics.metrics.overflow_events_total = lctx.overflow_guard.history.total_overflows;
     metrics.metrics.overflow_events_7d = lctx.overflow_guard.recent_overflow_count(7);
-    metrics.metrics.overflow_threshold_offset_pp =
-        (lctx.overflow_guard.compute_dynamic_offset() * 100.0).round() as i32;
+    // B6 fix (round-3): report the *applied* compound offset (dynamic + RL +
+    // workload + device, capped at -0.15) rather than the dynamic component
+    // alone — otherwise the dashboard could show "recovered" while the live
+    // threshold was still pinned at the floor.
+    metrics.metrics.overflow_threshold_offset_pp = (lctx
+        .overflow_guard
+        .applied_offset(overflow_thresholds.workload_mode)
+        * 100.0)
+        .round() as i32;
     metrics.metrics.overflow_workload_mode = overflow_thresholds.workload_mode.as_str().to_string();
 
     // RL threshold agent metrics (Phase 4).

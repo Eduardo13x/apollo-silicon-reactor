@@ -125,7 +125,11 @@ impl TruthValue {
     pub fn new(frequency: f32, confidence: f32) -> Self {
         Self {
             frequency: frequency.clamp(0.0, 1.0),
-            confidence: confidence.clamp(0.0, 0.9999),
+            // B1 fix (round-3): drop clamp ceiling from 0.9999 → 0.99 so the
+            // revision rule always has room to incorporate new evidence.
+            // Saturation at 0.9999 created a dead zone where beliefs stopped
+            // updating even after contradictory observations.
+            confidence: confidence.clamp(0.0, 0.99),
         }
     }
 

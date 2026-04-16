@@ -84,6 +84,18 @@ impl ActionQueue {
         }
     }
 
+    /// Current per-cycle dispatch budget (normal + background).
+    /// C8 fix (round-3): callers reduce this on battery to save energy.
+    pub fn max_per_cycle(&self) -> usize {
+        self.max_per_cycle
+    }
+
+    /// Adjust the per-cycle dispatch budget.  Urgent (Unfreeze) actions are
+    /// not counted against this limit.
+    pub fn set_max_per_cycle(&mut self, n: usize) {
+        self.max_per_cycle = n.max(1);
+    }
+
     /// Push a single action into the appropriate priority tier.
     pub fn push(&mut self, action: RootAction) {
         match action_priority(&action) {

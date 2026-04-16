@@ -187,9 +187,12 @@ impl OverflowGuard {
         pressure_bands: &[f64; 3],
         compressor_bands: &[f64; 2],
     ) {
-        // Deduplicar: no registrar dos eventos del mismo overflow (ventana 60s).
+        // B3 fix (round-3): reduce dedup window 60s → 8s so bursts of overflow
+        // events (e.g. rapid compressor thrashing during a memory storm) each
+        // get registered. Previously, 60s dedup collapsed a burst to a single
+        // event, leaving the RL agent + dynamic offset with no signal.
         if let Some(last) = self.last_event_at {
-            if last.elapsed() < Duration::from_secs(60) {
+            if last.elapsed() < Duration::from_secs(8) {
                 return;
             }
         }
@@ -345,20 +348,7 @@ impl OverflowGuard {
     /// `workload_mode` comes from the nearest-centroid classifier (Phase 3).
     /// Each mode applies a different threshold bonus via `WorkloadMode::threshold_bonus()`.
     pub fn thresholds(&self, workload_mode: WorkloadMode) -> OverflowThresholds {
-        let off = self.compute_dynamic_offset();
-        let workload_bonus = workload_mode.threshold_bonus();
-
-        // RL adjustment: additive correction learned via Q-learning (Phase 4).
-        let rl_adj = self
-            .rl_agent
-            .as_ref()
-            .map(|r| r.current_adjustment)
-            .unwrap_or(0.0);
-        // device_offset: -0.05 on ≤8 GB (act sooner), +0.05 on >16 GB (more headroom).
-        // Cap compound offset at -0.15 to prevent positive feedback loop:
-        // overflow → lower thresholds → more overflows → even lower thresholds.
-        // On 8GB M1, uncapped compound reached -0.33 (critical_pressure 0.55).
-        let total_offset = (off + workload_bonus + rl_adj + self.device_offset).max(-0.15);
+        let total_offset = self.applied_offset(workload_mode);
 
         OverflowThresholds {
             bg_pressure: (0.78 + total_offset).max(RL_ABSOLUTE_FLOOR),
@@ -366,6 +356,25 @@ impl OverflowGuard {
             extreme_pressure: (0.90 + total_offset).max(0.78),
             workload_mode,
         }
+    }
+
+    /// The compound offset actually applied to thresholds this cycle.
+    ///
+    /// B6 fix (round-3): single source of truth for reporting. Metric
+    /// `overflow_threshold_offset_pp` previously read only the dynamic
+    /// component (`compute_dynamic_offset`) and so could show "recovered"
+    /// while the live threshold was still pinned at the floor due to the
+    /// RL + device + workload contributions.  Callers that report to the
+    /// operator must use this value.
+    pub fn applied_offset(&self, workload_mode: WorkloadMode) -> f64 {
+        let off = self.compute_dynamic_offset();
+        let workload_bonus = workload_mode.threshold_bonus();
+        let rl_adj = self
+            .rl_agent
+            .as_ref()
+            .map(|r| r.current_adjustment)
+            .unwrap_or(0.0);
+        (off + workload_bonus + rl_adj + self.device_offset).max(-0.15)
     }
 
     /// ¿Hay herramientas de compilación corriendo activamente?

@@ -855,6 +855,8 @@ fn freeze_non_critical(
                     source: FreezeSource::Sentinel,
                     pressure_at_freeze: 1.0,
                     process_name: None,
+                    start_sec: 0,
+                    original_jetsam_priority: None,
                 });
             }
         }

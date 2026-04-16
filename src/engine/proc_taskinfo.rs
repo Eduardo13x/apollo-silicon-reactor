@@ -400,6 +400,62 @@ pub fn is_user_app_bundle(pid: u32) -> Option<bool> {
     get_proc_path(pid).map(|p| is_app_bundle_path(&p))
 }
 
+/// Check whether `pid` is a zombie (exited but not reaped).
+///
+/// A2/A4 fix (round-3): before issuing `setpriority` / `SIGSTOP` / `SIGCONT`
+/// to a process, callers skip if it's a zombie — the syscall would ESRCH or
+/// no-op and inflate error counters.
+///
+/// Uses `proc_pidinfo(PROC_PIDTBSDINFO)` — flavor 3, ABI stable on macOS.
+/// SZOMB kernel state = 5 (see xnu `bsd/sys/proc.h`).
+pub fn is_zombie_pid(pid: u32) -> bool {
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct ProcBsdInfo {
+        pbi_flags: u32,
+        pbi_status: u32,
+        pbi_xstatus: u32,
+        pbi_pid: u32,
+        pbi_ppid: u32,
+        pbi_uid: u32,
+        pbi_gid: u32,
+        pbi_ruid: u32,
+        pbi_rgid: u32,
+        pbi_svuid: u32,
+        pbi_svgid: u32,
+        rfu_1: u32,
+        pbi_comm: [u8; 16],
+        pbi_name: [u8; 32],
+        pbi_nfiles: u32,
+        pbi_pgid: u32,
+        pbi_pjobc: u32,
+        e_tdev: u32,
+        e_tpgid: u32,
+        pbi_nice: i32,
+        pbi_start_tvsec: u64,
+        pbi_start_tvusec: u64,
+    }
+    const PROC_PIDTBSDINFO: i32 = 3;
+    const SZOMB: u32 = 5;
+    let mut info = ProcBsdInfo::default();
+    let rc = unsafe {
+        proc_pidinfo(
+            pid as i32,
+            PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<ProcBsdInfo>() as i32,
+        )
+    };
+    // rc <= 0 means either the process is gone or the syscall failed.
+    // Treat "gone" as non-zombie: the caller's subsequent kill() will return
+    // ESRCH which is silently handled.
+    if rc <= 0 {
+        return false;
+    }
+    info.pbi_status == SZOMB
+}
+
 /// Get all PIDs on the system. Returns sorted list.
 pub fn list_all_pids() -> Vec<u32> {
     // First call with null to get count

@@ -34,6 +34,8 @@ pub mod priority {
 const MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES: u32 = 6;
 const MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES: u32 = 7;
 const MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES: u32 = 8;
+/// Ask the kernel for the current jetsam priority of a PID (xnu 4570+).
+const MEMORYSTATUS_CMD_GET_PRIORITY_LIST: u32 = 1;
 
 // ─── C structs (must match xnu ABI exactly) ───────────────────────────────────
 #[repr(C)]
@@ -92,6 +94,41 @@ pub fn set_priority(pid: u32, jetsam_priority: i32) -> Result<(), String> {
             unsafe { *libc::__error() }
         ))
     }
+}
+
+/// Read the kernel's current jetsam priority for `pid`.
+///
+/// A5/D1 fix (round-3): captured at freeze time so unfreeze can restore the
+/// *exact* priority instead of unconditionally using FOREGROUND.  Previously
+/// unfreeze always set FOREGROUND (9), losing AUDIO (18),
+/// AUDIO_AND_ACCESSORY (10), VITAL (12), etc.
+///
+/// Uses `MEMORYSTATUS_CMD_GET_PRIORITY_LIST` with buffer sized for one entry
+/// and the `flags=pid` argument (kernel filters to that PID).  Returns
+/// `None` if the entry is unavailable.
+pub fn get_priority(pid: u32) -> Option<i32> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct PriorityEntry {
+        pid: i32,
+        priority: i32,
+        user_data: u64,
+    }
+    let mut entry = PriorityEntry::default();
+    let ret = unsafe {
+        memorystatus_control(
+            MEMORYSTATUS_CMD_GET_PRIORITY_LIST,
+            pid as i32,
+            0,
+            &mut entry as *mut _ as *mut c_void,
+            std::mem::size_of::<PriorityEntry>(),
+        )
+    };
+    // Returns the number of bytes filled. Non-negative success, <0 errno.
+    if ret <= 0 || entry.pid != pid as i32 {
+        return None;
+    }
+    Some(entry.priority)
 }
 
 /// Set memory limits for a process (active and inactive).

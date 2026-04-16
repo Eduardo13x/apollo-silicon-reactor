@@ -114,7 +114,12 @@ pub struct RendererInfo {
     frozen_cycles: u8,
     /// Cycles since this renderer was first seen. New renderers (loading a fresh tab)
     /// show 0% CPU before content loads — skip freeze during this warmup window.
-    age_cycles: u8,
+    ///
+    /// D2 fix (round-3): widened `u8 → u16`. With a 500ms fast-tick the u8
+    /// counter saturated at 255 in ~128s, after which age-based LRU thaw
+    /// scoring could not distinguish older-vs-newer frozen renderers and
+    /// the long-idle freeze path was effectively broken for long-lived tabs.
+    age_cycles: u16,
     /// RSS at the moment of freeze. When RSS drops >50% while frozen, the browser
     /// is reclaiming memory from a closed tab — thaw immediately so it can exit cleanly.
     frozen_rss_baseline: u64,
@@ -763,7 +768,7 @@ impl ChromiumManager {
                 // At high pressure (idle_cycles_required=1) it would be frozen before the
                 // page renders, making new tabs appear stuck. Skip freeze for first 10 cycles
                 // (~1s) so the tab has time to load before becoming a freeze candidate.
-                const NEW_RENDERER_GRACE_CYCLES: u8 = 10;
+                const NEW_RENDERER_GRACE_CYCLES: u16 = 10;
                 if info.age_cycles < NEW_RENDERER_GRACE_CYCLES {
                     continue;
                 }

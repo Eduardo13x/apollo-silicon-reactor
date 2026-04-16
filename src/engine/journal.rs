@@ -247,6 +247,8 @@ mod tests {
             source: FreezeSource::MainLoop,
             pressure_at_freeze: 0.5,
             process_name: None,
+            start_sec: 0,
+            original_jetsam_priority: None,
         };
         assert!(!entry.pressure_at_freeze.is_nan());
     }

@@ -685,8 +685,27 @@ fn main() -> anyhow::Result<()> {
                     .update_learned_policy(&policy);
             }
 
+            // C5 fix (round-3): wrap the reactor thread so fast_tick_until is
+            // forcibly cleared if it panics or returns.  Otherwise a dead
+            // reactor would leave the main loop stuck in 500ms-tick mode for
+            // up to REACTOR_FAST_TICK_SECS with stale signal data.
             let reactor_state = state.clone();
             thread::spawn(move || {
+                // Drop-guard: runs whether the closure panics or returns.
+                struct FastTickGuard {
+                    state: SharedState,
+                }
+                impl Drop for FastTickGuard {
+                    fn drop(&mut self) {
+                        // Reactor exited unexpectedly (panic or return). Clear
+                        // fast_tick so the main loop goes back to the normal
+                        // 2s cadence instead of spinning on stale data.
+                        self.state.metrics.lock_recover().fast_tick_until = None;
+                    }
+                }
+                let _guard = FastTickGuard {
+                    state: reactor_state.clone(),
+                };
                 let _ = run_reactor(reactor_state);
             });
 
@@ -1073,6 +1092,8 @@ fn main() -> anyhow::Result<()> {
                                     source: FreezeSource::MainLoop,
                                     pressure_at_freeze: 1.0,
                                     process_name: e.name,
+                                    start_sec: 0,
+                                    original_jetsam_priority: None,
                                 },
                             )
                         })
@@ -1385,17 +1406,44 @@ fn main() -> anyhow::Result<()> {
                 // In dry-run the condvar wait is already 100ms; skip the additional floor.
                 // BUG #3 fix: also bypass the 300ms floor during fast-tick mode so the
                 // daemon can respond to kqueue Critical / hw_predictor events at full speed.
-                let is_fast_tick = state
+                let is_fast_tick_raw = state
                     .metrics
                     .lock_recover()
                     .fast_tick_until
                     .map(|t| Instant::now() < t)
                     .unwrap_or(false);
-                let min_inter_cycle_ms = if dry_run || is_fast_tick { 0 } else { 300 };
+                // C1/C4 fix (round-3): disable fast-tick when running on battery
+                // below 20%.  Continuous 500ms cycles drain ~5%/2min — unacceptable
+                // near empty.  Also ensures min_inter_cycle_ms is at least 1000 in
+                // that case so event-storm CPU burn can't chew battery either.
+                let battery_low = !power_mgr.battery_status.is_charging
+                    && power_mgr.battery_status.percentage < 20;
+                let is_fast_tick = is_fast_tick_raw && !battery_low;
+                let min_inter_cycle_ms = if dry_run || is_fast_tick {
+                    0
+                } else if battery_low {
+                    1000
+                } else {
+                    300
+                };
                 let since_last = last_cycle_end.elapsed();
                 if min_inter_cycle_ms > 0 && since_last < Duration::from_millis(min_inter_cycle_ms)
                 {
                     thread::sleep(Duration::from_millis(min_inter_cycle_ms) - since_last);
+                }
+
+                // C8 fix (round-3): halve the normal action-queue budget when
+                // battery < 30% and not charging — same work volume on battery
+                // as on AC was wasting energy with no latency benefit. Urgent
+                // unfreezes still bypass the cap by design.
+                {
+                    let battery_conservation = !power_mgr.battery_status.is_charging
+                        && power_mgr.battery_status.percentage < 30;
+                    let base: usize = 20;
+                    let target = if battery_conservation { base / 2 } else { base };
+                    if action_queue.max_per_cycle() != target {
+                        action_queue.set_max_per_cycle(target);
+                    }
                 }
 
                 // In dry-run mode skip the kill-switch stat() syscall — tests never
@@ -1690,6 +1738,11 @@ fn main() -> anyhow::Result<()> {
                                                 .latest()
                                                 .memory_pressure,
                                             process_name: Some(name.clone()),
+                                            // A3: capture start_sec for identity check on unfreeze.
+                                            start_sec: apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid_u32)
+                                                .map(|pi| pi.start_sec)
+                                                .unwrap_or(0),
+                                            original_jetsam_priority: None,
                                         },
                                     );
                                     turbo_frozen += 1;
@@ -2341,6 +2394,10 @@ fn main() -> anyhow::Result<()> {
                                     source: FreezeSource::ThermalPreThrottle,
                                     pressure_at_freeze: snapshot.pressure.memory_pressure,
                                     process_name: Some(name.clone()),
+                                    start_sec: apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid_u32)
+                                        .map(|pi| pi.start_sec)
+                                        .unwrap_or(0),
+                                    original_jetsam_priority: None,
                                 },
                             );
                             thermal_frozen += 1;
@@ -5618,6 +5675,10 @@ fn main() -> anyhow::Result<()> {
                                             source: apollo_optimizer::engine::types::FreezeSource::ChromiumManager,
                                             pressure_at_freeze: snapshot.pressure.memory_pressure,
                                             process_name: Some(name.clone()),
+                                            start_sec: apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(*pid)
+                                                .map(|pi| pi.start_sec)
+                                                .unwrap_or(0),
+                                            original_jetsam_priority: None,
                                         },
                                     );
                                 }
@@ -6337,6 +6398,10 @@ fn main() -> anyhow::Result<()> {
                                 source: FreezeSource::MainLoop,
                                 pressure_at_freeze: snapshot.pressure.memory_pressure,
                                 process_name: name,
+                                start_sec: apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(*pid)
+                                    .map(|pi| pi.start_sec)
+                                    .unwrap_or(0),
+                                original_jetsam_priority: None,
                             }
                         });
                     }
@@ -6793,17 +6858,21 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     Duration::from_secs(2)
                 };
+                // C2 fix (round-3): use `wait_timeout_while` so the predicate
+                // and the wait release are a single atomic operation. The
+                // previous `if !*triggered { wait_timeout } else { reset }`
+                // pattern was technically correct for the "event before wait"
+                // case, but spurious wakeups and a possible timeout-coinciding-
+                // with-notify race could swallow a signal and delay the next
+                // cycle by up to 2 seconds. `wait_timeout_while` explicitly
+                // loops on the predicate under the lock, eliminating the race.
                 {
                     let (lock, cvar) = &*state.cycle_condvar;
-                    let mut triggered = lock.lock_recover();
-                    if !*triggered {
-                        let (mut guard, _) = cvar
-                            .wait_timeout(triggered, wait_duration)
-                            .unwrap_or_else(|e| e.into_inner());
-                        *guard = false;
-                    } else {
-                        *triggered = false;
-                    }
+                    let guard = lock.lock_recover();
+                    let (mut triggered, _) = cvar
+                        .wait_timeout_while(guard, wait_duration, |t| !*t)
+                        .unwrap_or_else(|e| e.into_inner());
+                    *triggered = false;
                 }
             }
 
