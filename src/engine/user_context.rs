@@ -101,9 +101,22 @@ impl UserContext {
     }
 
     /// Any signal that means "don't freeze interactive processes".
+    ///
+    /// `call_in_progress` is unconditional — interrupting a video call is never OK.
+    /// `has_sleep_assertion` is gated by memory pressure: at high pressure
+    /// (≥ 0.75) the OOM risk outweighs interrupting a background download or
+    /// long-running task that merely holds `PreventUserIdleSleep`. Without this
+    /// bypass, a single Electron/Claude process holding the assertion blocks
+    /// EVERY freeze even when RAM is at the brink and swap is climbing.
     #[inline]
-    pub fn freeze_protected(&self) -> bool {
-        self.call_in_progress || self.has_sleep_assertion
+    pub fn freeze_protected(&self, memory_pressure: f64) -> bool {
+        if self.call_in_progress {
+            return true;
+        }
+        if memory_pressure >= 0.75 {
+            return false;
+        }
+        self.has_sleep_assertion
     }
 
     /// Pressure threshold delta in percentage-points based on idle state.
@@ -280,9 +293,14 @@ mod tests {
             ..Default::default()
         };
         let normal = UserContext::default();
-        assert!(call.freeze_protected());
-        assert!(assertion.freeze_protected());
-        assert!(!normal.freeze_protected());
+        // Low pressure: assertion blocks freeze, normal does not.
+        assert!(call.freeze_protected(0.30));
+        assert!(assertion.freeze_protected(0.30));
+        assert!(!normal.freeze_protected(0.30));
+        // High pressure: call still blocks (cannot interrupt), assertion no longer.
+        assert!(call.freeze_protected(0.85));
+        assert!(!assertion.freeze_protected(0.85));
+        assert!(!normal.freeze_protected(0.85));
     }
 
     #[test]

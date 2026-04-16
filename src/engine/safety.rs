@@ -160,6 +160,17 @@ pub fn protected_processes() -> HashSet<&'static str> {
         // playback (e.g. music while coding) has no foreground window so
         // is_user_interactive_app() misses it → freeze kills audio silently.
         "VLC",
+        // IDE language servers — freeze stalls code completion/diagnostics and
+        // can cascade into IDE process death (Antigravity, VS Code). They have
+        // no GUI window of their own, so is_user_interactive_app() misses them.
+        "language_server_macos_arm",
+        "language_server_linux_x64",
+        "rust-analyzer",
+        "gopls",
+        "pyright",
+        "typescript-language-server",
+        "tsserver",
+        "clangd",
         // Apollo own binary (all variants) — prevent self-freeze of old/new binary names.
         "apollo_optimizer",
         "apollo-optimizer",

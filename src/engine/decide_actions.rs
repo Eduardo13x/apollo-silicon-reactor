@@ -898,7 +898,11 @@ pub fn decide_actions(
     // - recently_active (<15s) → tighten gate thresholds (+5pp pressure, +30% swap commit)
     //   User is actively present; conserve fluidity headroom.
     // [Riva & Mantovani 2014] "User context awareness for mobile computing"
-    let freeze_skip_by_user = user_ctx.freeze_protected();
+    // Pass current memory pressure so a high-pressure crisis (≥0.75) overrides
+    // background-task sleep assertions. Without this, a single Electron renderer
+    // holding PreventUserIdleSleep blocks every freeze even when swap is climbing.
+    let freeze_skip_by_user =
+        user_ctx.freeze_protected(snapshot.pressure.memory_pressure);
     let gate_offset = user_ctx.pressure_gate_offset();
 
     match context {

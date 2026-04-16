@@ -254,10 +254,17 @@ pub struct ExecuteOutcomes {
     /// `(start_sec, original_jetsam_priority)` — either may be 0/None if
     /// the lookup failed.
     pub newly_frozen_identity: Vec<(u32, u64, Option<i32>)>,
+    /// Per-action skip reason channel — set by `push_skip`, drained by the
+    /// outer journal-write code so the journal entry records `success=false`
+    /// with the actual skip reason instead of falsely claiming success.
+    /// Reset to `None` at the start of every action iteration.
+    pub last_skip: Option<String>,
 }
 
 impl ExecuteOutcomes {
     fn push_skip(&mut self, what: String) {
+        // Channel the skip reason out to the per-action journal write.
+        self.last_skip = Some(what.clone());
         if self.top_skipped.len() < 12 && !self.top_skipped.contains(&what) {
             self.top_skipped.push(what);
         }
@@ -267,6 +274,10 @@ impl ExecuteOutcomes {
 /// Execute a list of actions. Returns an [ExecuteOutcomes] accumulator that
 /// the caller can merge into RuntimeMetrics **after** releasing any locks,
 /// eliminating the need to hold locks across blocking I/O.
+///
+/// `memory_pressure` is the current kernel/compressor pressure in [0.0, 1.0]; at
+/// or above 0.75 the per-PID power-assertion gate is bypassed so OOM-pressure
+/// freezes can land even when a background app holds `PreventUserIdleSleep`.
 pub fn execute_actions(
     actions: Vec<RootAction>,
     caps: &CapabilityReport,
@@ -276,6 +287,7 @@ pub fn execute_actions(
     learned_interactive: &[String],
     mut qos_mgr: Option<&mut MachQoSManager>,
     dry_run: bool,
+    memory_pressure: f64,
 ) -> ExecuteOutcomes {
     let protected = protected_processes();
     // Only infrastructure (docker, postgres, redis, etc.) gets unconditional protection
@@ -372,6 +384,8 @@ pub fn execute_actions(
     }
 
     for action in actions {
+        // Drain any leftover skip reason from prior iteration before running.
+        out.last_skip = None;
         let mut success = false;
         let mut before = None;
         let mut after = None;
@@ -544,10 +558,17 @@ pub fn execute_actions(
                     }
                     // Never freeze processes with active power assertions
                     // (audio playback, active downloads, background tasks).
-                    let busy = assertion_pids.get_or_insert_with(pids_with_assertions);
-                    if busy.contains(pid) {
-                        out.push_skip(format!("assertion-active:{}", name));
-                        return Ok(());
+                    //
+                    // High-pressure bypass: at or above 0.75 kernel/compressor
+                    // pressure the OOM risk outweighs interrupting a download
+                    // or background task — without this, a single PID holding
+                    // PreventUserIdleSleep blocks every freeze while swap climbs.
+                    if memory_pressure < 0.75 {
+                        let busy = assertion_pids.get_or_insert_with(pids_with_assertions);
+                        if busy.contains(pid) {
+                            out.push_skip(format!("assertion-active:{}", name));
+                            return Ok(());
+                        }
                     }
                     if dry_run {
                         // Simulate success without touching the process.
@@ -766,12 +787,22 @@ pub fn execute_actions(
             Ok(())
         })();
 
+        // Skip paths set `out.last_skip`; drain it so the journal entry
+        // records success=false with the skip reason (not the original
+        // action reason). Without this, every skipped freeze/throttle logs
+        // as success=true, masking capacity bugs like this one.
+        let skip_reason = out.last_skip.take();
         if let Err(e) = result {
             out.failures += 1;
             out.last_error = Some(e.to_string());
-        } else {
+        } else if skip_reason.is_none() {
             success = true;
         }
+
+        let journal_reason = match skip_reason {
+            Some(s) => format!("skip:{s}"),
+            None => reason,
+        };
 
         pending_journal.push(JournalEntry {
             timestamp: Utc::now(),
@@ -779,7 +810,7 @@ pub fn execute_actions(
             before,
             after,
             success,
-            reason,
+            reason: journal_reason,
         });
     }
 
@@ -829,6 +860,7 @@ mod tests {
             learned_interactive,
             None,
             false,
+            0.0,
         )
     }
 
@@ -859,6 +891,7 @@ mod tests {
             &[],
             None,
             false,
+            0.0,
         );
         // All 5 ghost pids are dead → should be removed from frozen set.
         // unfreezes_applied stays 0 because the live-branch (which increments
