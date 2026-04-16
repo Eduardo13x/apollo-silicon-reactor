@@ -43,6 +43,11 @@ pub const RL_ABSOLUTE_FLOOR: f64 = 0.45;
 const ADJUSTMENT_FLOOR: f64 = -0.20;
 const ADJUSTMENT_CEIL: f64 = 0.05;
 
+/// Hard floor for the compound offset (overflow_guard total_offset).
+/// When the compound is at this floor, Lower5pp has no further effect —
+/// the overflow_guard clamps the result anyway.
+const COMPOUND_FLOOR: f64 = -0.15;
+
 /// Infrastructure-locked constraints (Hermes/Tinker-Atropos pattern).
 /// These are hard walls the RL agent can NEVER cross, regardless of reward.
 /// Prevents learning to sacrifice system stability for marginal improvements.
@@ -215,6 +220,14 @@ pub struct RlThresholdAgent {
     compressor_histogram: Vec<f64>,
     /// Write cursor for histogram ring buffer.
     histogram_cursor: usize,
+
+    // ── Compound floor feedback ───────────────────────────────────────
+    /// Set by overflow_guard::tick_decay() when the compound total_offset
+    /// is hitting the hard floor (-0.15). When true, Lower5pp actions
+    /// receive no reward because the overflow_guard clamps them anyway.
+    /// This prevents the RL agent from learning spurious causal relationships
+    /// between its Lower5pp action and any subsequent pressure improvement.
+    pub compound_at_floor: bool,
 }
 
 impl RlThresholdAgent {
@@ -275,6 +288,7 @@ impl RlThresholdAgent {
             pressure_histogram: Vec::with_capacity(200),
             compressor_histogram: Vec::with_capacity(200),
             histogram_cursor: 0,
+            compound_at_floor: false,
         }
     }
 
@@ -347,7 +361,20 @@ impl RlThresholdAgent {
         } else {
             REWARD_STABLE
         };
-        let reward = base_reward + shaped * 2.0;
+        let mut reward = base_reward + shaped * 2.0;
+
+        // BUG-D fix: when the compound offset is at the hard floor (-0.15),
+        // the overflow_guard clamps Lower5pp's effect away — the RL agent's
+        // action had no real impact. Suppress reward so the agent doesn't
+        // learn a spurious causal link between Lower5pp and pressure changes.
+        // Only suppress positive rewards — keep overflow penalties so the agent
+        // still learns that this state is dangerous.
+        if self.compound_at_floor
+            && matches!(self.last_action, Some(RlAction::Lower5pp))
+            && reward > 0.0
+        {
+            reward = 0.0;
+        }
 
         if let (Some(prev_state), Some(prev_action)) = (self.last_state, self.last_action) {
             let s = prev_state.index();
@@ -624,6 +651,7 @@ mod tests {
             pressure_histogram: Vec::new(),
             compressor_histogram: Vec::new(),
             histogram_cursor: 0,
+            compound_at_floor: false,
         }
     }
 

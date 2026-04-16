@@ -1383,7 +1383,15 @@ fn main() -> anyhow::Result<()> {
 
                 // Enforce minimum inter-cycle delay to prevent event-storm CPU burn.
                 // In dry-run the condvar wait is already 100ms; skip the additional floor.
-                let min_inter_cycle_ms = if dry_run { 0 } else { 300 };
+                // BUG #3 fix: also bypass the 300ms floor during fast-tick mode so the
+                // daemon can respond to kqueue Critical / hw_predictor events at full speed.
+                let is_fast_tick = state
+                    .metrics
+                    .lock_recover()
+                    .fast_tick_until
+                    .map(|t| Instant::now() < t)
+                    .unwrap_or(false);
+                let min_inter_cycle_ms = if dry_run || is_fast_tick { 0 } else { 300 };
                 let since_last = last_cycle_end.elapsed();
                 if min_inter_cycle_ms > 0 && since_last < Duration::from_millis(min_inter_cycle_ms)
                 {
@@ -4662,10 +4670,20 @@ fn main() -> anyhow::Result<()> {
                 // Direct paging hints: when pressure > 0.60, hint top 3 background
                 // memory consumers. Safe (voluntary cache release, no freeze/kill).
                 // Rate-limited by safety module's max_paging_hints_per_cycle.
-                let already_has_hints = actions
+                // BUG #2 fix: per-PID dedup instead of "any SetMemorystatus → skip all".
+                // Old check would skip ALL three processes if any one already had a hint
+                // (e.g. from the predictive agent), wasting the remaining budget.
+                let hinted_pids: std::collections::HashSet<u32> = actions
                     .iter()
-                    .any(|a| matches!(a, RootAction::SetMemorystatus { .. }));
-                if signal_digest.pressure_smooth >= 0.60 && !already_has_hints {
+                    .filter_map(|a| {
+                        if let RootAction::SetMemorystatus { pid, .. } = a {
+                            Some(*pid)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if signal_digest.pressure_smooth >= 0.60 {
                     let protected_pats = state
                         .policy
                         .lock_recover()
@@ -4701,7 +4719,15 @@ fn main() -> anyhow::Result<()> {
                         })
                         .collect();
                     bg_procs.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
-                    for proc in bg_procs.iter().take(3) {
+                    let mut added = 0usize;
+                    for proc in bg_procs.iter() {
+                        if added >= 3 {
+                            break;
+                        }
+                        // Per-PID dedup: skip if this process already has a hint.
+                        if hinted_pids.contains(&proc.pid) {
+                            continue;
+                        }
                         actions.push(RootAction::set_memorystatus(
                             proc.pid,
                             -1,
@@ -4712,6 +4738,7 @@ fn main() -> anyhow::Result<()> {
                                 proc.rss_bytes / 1024 / 1024,
                             ),
                         ));
+                        added += 1;
                     }
                 }
 
@@ -5520,8 +5547,10 @@ fn main() -> anyhow::Result<()> {
                         chromium_mgr.set_markov_context(&preds, elapsed);
                     }
 
-                    // Pressure-adaptive aggressiveness
-                    chromium_mgr.set_pressure_context(snapshot.pressure.memory_pressure as f32);
+                    // Pressure-adaptive aggressiveness — use Kalman-filtered signal
+                    // so kqueue Critical events and trend are already incorporated.
+                    // BUG #1 fix: was using raw memory_pressure; use pressure_smooth instead.
+                    chromium_mgr.set_pressure_context(signal_digest.pressure_smooth as f32);
                     // Arousal-adaptive aggressiveness [Yerkes-Dodson 1908]
                     // Override pressure thresholds with arousal-based ones when
                     // arousal signal is available — crisis arousal freezes faster,

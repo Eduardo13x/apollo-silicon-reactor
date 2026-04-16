@@ -143,6 +143,14 @@ pub struct LearnableParams {
     /// Total tuning cycles that have contributed to these parameters.
     #[serde(default)]
     pub tuning_cycles: u64,
+
+    // ── Diagnostics ───────────────────────────────────────────────────
+    /// True when `nars_decay_factor` is stuck at its 0.80 floor.
+    /// At the floor, beliefs decay maximally fast and are therefore unreliable.
+    /// Exposed as a diagnostic flag so future decision logic can reduce
+    /// confidence in NARS outputs when this is set.
+    #[serde(default)]
+    pub nars_beliefs_stale: bool,
 }
 
 // ── LearnableParams defaults (match original hardcoded values) ─────────
@@ -229,6 +237,7 @@ impl Default for LearnableParams {
             meta_effectiveness_ema: 0.0,
             meta_learning_velocity: 0.0,
             tuning_cycles: 0,
+            nars_beliefs_stale: false,
         }
     }
 }
@@ -323,6 +332,10 @@ impl LearnableParams {
 
         // Re-validate after adjustment
         self.validate();
+
+        // When decay is at floor, beliefs are unreliable — mark stale so
+        // decision makers can reduce confidence in NARS outputs.
+        self.nars_beliefs_stale = self.nars_decay_factor <= 0.82;
     }
 }
 

@@ -118,6 +118,13 @@ impl ExperienceMemory {
             self.records.pop_front();
         }
         self.records.push_back(record);
+        // Hard cap: belt-and-suspenders guard for cases where capacity is misset
+        // or records are bulk-loaded from a large persisted file. Drain oldest 100
+        // if the deque exceeds 600 entries — keeps memory bounded between persists
+        // without waiting for self_improve() to run.
+        if self.records.len() > 600 {
+            drop(self.records.drain(..100));
+        }
     }
 
     /// Query: expected effectiveness for throttling `process` at `pressure`.

@@ -233,6 +233,10 @@ impl OverflowGuard {
 
         // RL agent: tick with overflow=true using adaptive bands.
         let overflows_1h = self.recent_overflow_count_hours(1);
+        // BUG-D fix: compute dynamic offset BEFORE the mutable borrow of rl_agent
+        // to satisfy the borrow checker (compute_dynamic_offset takes &self).
+        let dynamic_off_for_rl = self.compute_dynamic_offset();
+        let device_offset_snap = self.device_offset;
         if let Some(rl) = &mut self.rl_agent {
             let rl_state = RlState::from_metrics_with_bands(
                 memory_pressure,
@@ -241,6 +245,10 @@ impl OverflowGuard {
                 pressure_bands,
                 compressor_bands,
             );
+            // Compound = dynamic_offset + rl_adjustment + device_offset.
+            // When at the hard floor (-0.15), Lower5pp has no real effect.
+            let compound = dynamic_off_for_rl + rl.current_adjustment + device_offset_snap;
+            rl.compound_at_floor = compound <= -0.15 + 0.005;
             rl.tick(rl_state, true);
             rl.persist();
         }
@@ -290,6 +298,9 @@ impl OverflowGuard {
         // Use adaptive bands from LearnableParams so Q-table state
         // discretization stays aligned with auto-tuned boundaries.
         let overflows_1h = self.recent_overflow_count_hours(1);
+        // BUG-D fix: compute dynamic offset BEFORE the mutable borrow of rl_agent.
+        let dynamic_off_for_rl = self.compute_dynamic_offset();
+        let device_offset_snap = self.device_offset;
         if let Some(rl) = &mut self.rl_agent {
             let rl_state = RlState::from_metrics_with_bands(
                 memory_pressure,
@@ -298,6 +309,11 @@ impl OverflowGuard {
                 pressure_bands,
                 compressor_bands,
             );
+            // Inform the RL agent whether the compound offset is already at the
+            // hard floor (-0.15) so it can suppress Lower5pp rewards that have
+            // no real effect (overflow_guard clamps them away anyway).
+            let compound = dynamic_off_for_rl + rl.current_adjustment + device_offset_snap;
+            rl.compound_at_floor = compound <= -0.15 + 0.005;
             rl.tick(rl_state, false);
             if rl.total_ticks() % 50 == 0 {
                 rl.persist();

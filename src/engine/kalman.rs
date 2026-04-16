@@ -156,6 +156,16 @@ impl Kalman1D {
         self.p00 = p00_pred - k0 * p00_pred;
         self.p01 = p01_pred - k0 * p01_pred;
         self.p11 = p11_pred - k1 * p01_pred;
+
+        // Enforce positive semi-definiteness of the covariance matrix.
+        // Numerical drift can push p00/p11 slightly negative, which causes
+        // the Kalman gain to diverge on subsequent steps.
+        // [Crassidis & Junkins 2012 §3.5] — clamp diagonal to a small positive floor.
+        self.p00 = self.p00.max(1e-8);
+        self.p11 = self.p11.max(1e-8);
+        // p01 must satisfy |p01| ≤ sqrt(p00 * p11) (Cauchy-Schwarz for covariance).
+        let p_cross_max = (self.p00 * self.p11).sqrt();
+        self.p01 = self.p01.clamp(-p_cross_max, p_cross_max);
     }
 
     /// Posición estimada (valor suavizado).

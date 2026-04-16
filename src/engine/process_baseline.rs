@@ -184,13 +184,27 @@ impl ProcessSignals {
 pub struct ProcessBaselineMap {
     /// Process name → per-signal baseline.
     pub entries: HashMap<String, ProcessSignals>,
+    /// Per-entry generation counter: updated in `observe()`, compared in `prune_stale()`.
+    /// Entries not seen in the last 500 ticks (~4 hours) are pruned.
+    #[serde(default)]
+    pub last_seen_gen: HashMap<String, u32>,
+    /// Monotonically-incrementing generation counter, advanced by `tick()`.
+    #[serde(default)]
+    pub current_gen: u32,
 }
 
 impl ProcessBaselineMap {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            last_seen_gen: HashMap::new(),
+            current_gen: 0,
         }
+    }
+
+    /// Advance the generation counter. Call once per daemon cycle (persist tick).
+    pub fn tick(&mut self) {
+        self.current_gen = self.current_gen.wrapping_add(1);
     }
 
     /// Update the baseline for `name` with a new observation.
@@ -198,6 +212,8 @@ impl ProcessBaselineMap {
     pub fn observe(&mut self, name: &str, ipc: f64, wakeup_rate: f64, disk_mbps: f64) {
         let entry = self.entries.entry(name.to_string()).or_default();
         entry.update(ipc, wakeup_rate, disk_mbps);
+        self.last_seen_gen
+            .insert(name.to_string(), self.current_gen);
     }
 
     /// Anomaly score for a process given its current readings.
@@ -222,11 +238,28 @@ impl ProcessBaselineMap {
             .map(|e| e.dominant_signal(ipc, wakeup_rate, disk_mbps))
     }
 
-    /// Prune entries for processes not seen in the last `max_unseen_cycles` persist cycles.
+    /// Prune stale entries from `entries` and `last_seen_gen`.
+    ///
+    /// Removes entries where the process has not been observed in the last 500 ticks
+    /// (~4 hours at one tick per daemon persist cycle). Also removes entries with zero
+    /// observations as a defensive fallback.
     /// Called from `LearnedState::self_improve()` to bound map size.
-    /// For now: prune entries with 0 observations (should not exist but defensive).
     pub fn prune_stale(&mut self) {
-        self.entries.retain(|_, v| v.min_obs() > 0);
+        let current = self.current_gen;
+        let ttl = 500u32;
+        self.entries.retain(|name, v| {
+            // Always remove zero-obs entries (defensive).
+            if v.min_obs() == 0 {
+                return false;
+            }
+            // Remove entries not seen within the TTL window.
+            // Use wrapping subtraction to handle gen counter overflow correctly.
+            let last = self.last_seen_gen.get(name).copied().unwrap_or(0);
+            current.wrapping_sub(last) <= ttl
+        });
+        // Keep last_seen_gen in sync: prune keys no longer in entries.
+        self.last_seen_gen
+            .retain(|name, _| self.entries.contains_key(name));
     }
 
     /// Number of entries with warm baselines (>= MIN_OBS).
