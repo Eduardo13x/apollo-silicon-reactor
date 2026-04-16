@@ -1145,44 +1145,15 @@ fn main() -> anyhow::Result<()> {
             let mut llm_detector =
                 apollo_optimizer::engine::llm_inference_mode::LlmInferenceDetector::new();
             let mut llm_spotlight_disabled = false;
-            // Pressure-triggered spotlight state (mirrors the pressure gate at
-            // the bottom of the main loop). Declared here so the startup
-            // defensive restore can mark spotlight_paused=true when it skips
-            // the restore under heavy pressure.
             let mut spotlight_paused: bool = false;
             let mut spotlight_paused_at: Option<Instant> = None;
-            // Defensive restore: if a previous daemon crash left Spotlight disabled
-            // (killed mid-LLM inference), re-enable on startup so indexing can resume
-            // rather than restart from scratch on next mds event.
-            //
-            // PRESSURE GATE: skip the restore unless the system is genuinely
-            // calm. Turning mds/mds_stores back on triggers a full reindex
-            // (~74% CPU on M1 8GB); on a system that already has swap in use,
-            // vm.pressure() can read momentarily low (kernel already pushed
-            // pages to compressor) yet the act of reindexing immediately
-            // saturates again. Mirror the regular re-enable criterion:
-            // mem_pressure < 0.40 AND swap_used < 1.0 GB. If we skip, mark
-            // spotlight_paused=true so the regular path re-enables naturally
-            // when those gates open.
+            // Defensive restore: if a previous daemon run left Spotlight
+            // disabled, re-enable on startup so indexing can resume. The
+            // regular pressure-gate at the bottom of the main loop
+            // (mem>=0.75 && swap>=1.5GB) will re-disable if a reindex storm
+            // actually materialises. User preference: keep Spotlight on.
             if is_root {
-                let startup_pressure = apollo_optimizer::engine::host_vm_info::read_vm_stats()
-                    .map(|s| s.pressure())
-                    .unwrap_or(0.0);
-                let startup_swap_gb =
-                    apollo_optimizer::engine::sysctl_direct::read_swap_usage()
-                        .map(|(_, used)| used as f64 / (1024.0 * 1024.0 * 1024.0))
-                        .unwrap_or(0.0);
-                if startup_pressure < 0.40 && startup_swap_gb < 1.0 {
-                    spotlight_set_indexing(true);
-                } else {
-                    tracing::warn!(
-                        pressure = startup_pressure,
-                        swap_gb = startup_swap_gb,
-                        "startup: skipping Spotlight re-enable — system not calm"
-                    );
-                    spotlight_paused = true;
-                    spotlight_paused_at = Some(Instant::now());
-                }
+                spotlight_set_indexing(true);
             }
 
             // ── Feature 3: RT Boost for Foreground ───────────────────────────
