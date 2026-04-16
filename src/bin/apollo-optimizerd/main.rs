@@ -2141,6 +2141,14 @@ fn main() -> anyhow::Result<()> {
                     }
                     // Turbo set: same reconciliation, no disk write needed.
                     display_turbo.gc_dead_pids(&live_pids);
+
+                    // MachQoSManager: reap per-thread CPU samples, current_tier,
+                    // app_napped, io_tier_cache, permanently_blocked for dead PIDs.
+                    // Every 60 cycles (~30s at 2Hz) — libc::kill(pid, 0) is cheap
+                    // but the HashMaps can have thousands of entries under Chrome.
+                    if cycle_count % 60 == 0 {
+                        state.mach_qos.lock_recover().gc_dead_pids();
+                    }
                 }
 
                 // MemoryAnalyzer: profile top-50 processes for memory leaks each cycle.
@@ -6661,6 +6669,11 @@ fn main() -> anyhow::Result<()> {
                     // GC stale entries from cache warmer + I/O shaper.
                     cache_warmer.gc();
                     io_shaper.gc();
+                    // EffectivenessTracker: drop entries stale >7200 cycles
+                    // (~1h) with <3 observations. Persists across restarts, so
+                    // without this, process-name variants (build tools, CI
+                    // scripts, short-lived workers) accumulate forever.
+                    effectiveness_tracker.gc(3, 7200, cycle_count);
                     // Persist temporal predictor state.
                     temporal_predictor.persist();
                 }
