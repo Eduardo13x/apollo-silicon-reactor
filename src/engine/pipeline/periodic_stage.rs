@@ -23,7 +23,47 @@
 //! | % 7200 == 0   | Hourly GC: needs `cache_warmer`, `io_shaper`,          |
 //! |               | `temporal_predictor` (binary-local types)              |
 
+use crate::engine::config_reloader::{LlmConfigReloader, ReloadOutcome};
+use crate::engine::llm::LlmConfig;
 use crate::engine::pipeline::learning_context::LearningContext;
+
+/// How often the daemon polls `config.toml` for mtime changes.
+///
+/// 100 cycles ≈ 50s at the 500ms daemon cadence — fast enough that an
+/// operator edit lands within a minute, slow enough that `fs::metadata`
+/// on the config file adds zero measurable cost.
+pub const CONFIG_RELOAD_GATE_CYCLES: u64 = 100;
+
+/// Opt-in helper that wraps the `% CONFIG_RELOAD_GATE_CYCLES` gate around
+/// `LlmConfigReloader::tick`.
+///
+/// The daemon main loop calls this once per cycle with its owned reloader +
+/// the current `LlmConfig`. On non-gate cycles the call is a single modulo
+/// comparison and returns `None`. On gate cycles it polls the file mtime —
+/// also ~free when the file has not changed because `fs::metadata` is a
+/// cheap `stat(2)` on macOS.
+///
+/// Returns `Some(outcome)` iff the gate fired so the caller can log `applied`
+/// diffs, WARN on `rejected`, or swap the in-memory `LlmConfig` from
+/// `outcome.new_cfg`.
+///
+/// # Why a free helper, not a field on `PeriodicContext`
+///
+/// Threading `&mut LlmConfigReloader` through `PeriodicContext` would force
+/// every existing call site to construct (or `Option::None`-out) a reloader
+/// even when the daemon does not use Gemma. Keeping the gate as a separate
+/// free function means the wire-up is a single line in the main loop and
+/// does not churn any other caller.
+pub fn maybe_reload_llm_config(
+    cycle_count: u64,
+    reloader: &mut LlmConfigReloader,
+    current: &LlmConfig,
+) -> Option<ReloadOutcome> {
+    if cycle_count % CONFIG_RELOAD_GATE_CYCLES != 0 {
+        return None;
+    }
+    Some(reloader.tick(current))
+}
 
 /// Everything the periodic stage needs to do its work.
 ///
@@ -273,5 +313,100 @@ mod tests {
         assert!(!r.did_hourly);
         assert!(r.causal_solid_edges.is_none());
         assert!(r.induced_skills.is_none());
+    }
+
+    // ── maybe_reload_llm_config gate ───────────────────────────────────────
+
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn tmp_cfg(name: &str, contents: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "apollo_periodic_reload_{}_{}",
+            std::process::id(),
+            name
+        ));
+        let _ = fs::remove_file(&p);
+        let mut f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&p)
+            .unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        p
+    }
+
+    const BASE_CFG: &str = r#"
+[llm]
+enabled = true
+endpoint = "http://127.0.0.1:8080"
+timeout_ms = 60000
+always_on = true
+"#;
+
+    fn current_cfg() -> LlmConfig {
+        #[derive(serde::Deserialize)]
+        struct Repo {
+            llm: LlmConfig,
+        }
+        let parsed: Repo = toml::from_str(BASE_CFG).unwrap();
+        parsed.llm
+    }
+
+    /// Non-gate cycles: helper short-circuits before touching the file.
+    /// Proven by using a bogus path — if `tick` were called it would fail
+    /// to read metadata.  Because the modulo gate returns first, the helper
+    /// returns `None` without touching the filesystem.
+    #[test]
+    fn maybe_reload_returns_none_off_gate() {
+        let nonexistent = PathBuf::from("/definitely/not/here/config.toml");
+        let wal = PathBuf::from("/definitely/not/here/wal.json");
+        let mut reloader = LlmConfigReloader::new(nonexistent, wal);
+        let cfg = current_cfg();
+        // Cycle 1 ..= CONFIG_RELOAD_GATE_CYCLES-1 should all skip.
+        for cycle in [1u64, 50, 99, 101, 199] {
+            assert!(
+                maybe_reload_llm_config(cycle, &mut reloader, &cfg).is_none(),
+                "cycle {cycle} should skip the gate",
+            );
+        }
+    }
+
+    /// On-gate cycles: helper returns `Some(outcome)`.
+    #[test]
+    fn maybe_reload_fires_on_gate() {
+        let cfg_path = tmp_cfg("gate.toml", BASE_CFG);
+        let wal = std::env::temp_dir().join(format!(
+            "apollo_periodic_reload_{}_gate_wal.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&wal);
+        let mut reloader = LlmConfigReloader::new(cfg_path, wal);
+        let cfg = current_cfg();
+        // 100, 200, 300 are all on the gate; must all return Some.
+        for cycle in [100u64, 200, 300, 7200] {
+            assert!(
+                maybe_reload_llm_config(cycle, &mut reloader, &cfg).is_some(),
+                "cycle {cycle} should be on the gate",
+            );
+        }
+    }
+
+    /// Cycle 0 sits on the gate arithmetically (0 % 100 == 0) — document this
+    /// so anyone bumping the gate sees the boot-edge behavior is intended.
+    #[test]
+    fn maybe_reload_cycle_zero_is_on_gate() {
+        let cfg_path = tmp_cfg("zero.toml", BASE_CFG);
+        let wal = std::env::temp_dir().join(format!(
+            "apollo_periodic_reload_{}_zero_wal.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&wal);
+        let mut reloader = LlmConfigReloader::new(cfg_path, wal);
+        let cfg = current_cfg();
+        assert!(maybe_reload_llm_config(0, &mut reloader, &cfg).is_some());
     }
 }
