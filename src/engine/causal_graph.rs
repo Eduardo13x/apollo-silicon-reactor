@@ -541,6 +541,35 @@ impl CausalGraph {
             .count()
     }
 
+    /// Pearl-mediation breakdown: count causal edges by the dominant resource
+    /// channel they attribute to.  Returns `(rss, cpu, swap, unknown)` where
+    /// `unknown` covers edges that don't yet have ≥3 observations.
+    ///
+    /// Consumed as an observability surface in runtime metrics so an operator
+    /// can tell at a glance *why* the daemon is choosing SIGSTOP vs throttle
+    /// vs E-core demotion — RSS-dominant edges justify SIGSTOP, CPU-dominant
+    /// edges justify QoS-background, swap-dominant edges justify page_reclaim.
+    /// [Pearl 2009 §3] mediation analysis — intervention follows mechanism
+    pub fn mechanism_breakdown(&self) -> (usize, usize, usize, usize) {
+        let mut rss = 0usize;
+        let mut cpu = 0usize;
+        let mut swap = 0usize;
+        let mut unknown = 0usize;
+        for edge in self.edges.values() {
+            if edge.mechanism.observations < 3 {
+                unknown += 1;
+                continue;
+            }
+            match edge.mechanism.primary() {
+                "rss" => rss += 1,
+                "cpu" => cpu += 1,
+                "swap" => swap += 1,
+                _ => unknown += 1,
+            }
+        }
+        (rss, cpu, swap, unknown)
+    }
+
     /// Co-occurrence cluster boosting: if process B co-occurs with solid process A
     /// (confidence > 0.70) ≥ 5 times, and B's own confidence is below skip threshold,
     /// boost B's confidence to the cluster average. [Pearl 2009] Ch.2: confounding —
@@ -992,6 +1021,56 @@ mod tests {
             g.evaluate_with_resources(0.60, i * 4 + 3, &after);
         }
         assert!(g.mechanism_count() > 0);
+    }
+
+    #[test]
+    fn mechanism_breakdown_empty_graph_returns_all_zero() {
+        let g = CausalGraph::new();
+        assert_eq!(g.mechanism_breakdown(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn mechanism_breakdown_classifies_dominant_channels() {
+        // Build three distinct edges, each with a different dominant mechanism.
+        let mut g = CausalGraph::new();
+
+        // Edge 1: RSS-dominant (500MB → 300MB vs small CPU/swap).
+        let before = ResourceSnapshot { rss_mb: 500.0, cpu_pct: 30.0, swap_mb: 100.0 };
+        let after = ResourceSnapshot { rss_mb: 300.0, cpu_pct: 28.0, swap_mb: 98.0 };
+        for i in 0..5u64 {
+            g.record_action_with_resources("throttle:Rss", 0.80, i * 10, before.clone());
+            g.evaluate_with_resources(0.60, i * 10 + 3, &after);
+        }
+
+        // Edge 2: CPU-dominant (80% → 10% vs small rss/swap delta).
+        let before = ResourceSnapshot { rss_mb: 500.0, cpu_pct: 80.0, swap_mb: 100.0 };
+        let after = ResourceSnapshot { rss_mb: 498.0, cpu_pct: 10.0, swap_mb: 99.0 };
+        for i in 0..5u64 {
+            g.record_action_with_resources("throttle:Cpu", 0.80, 100 + i * 10, before.clone());
+            g.evaluate_with_resources(0.60, 100 + i * 10 + 3, &after);
+        }
+
+        // Edge 3: no observations yet → unknown.
+        g.record_action("throttle:Cold", 0.80, 1000);
+
+        let (rss, cpu, swap, unknown) = g.mechanism_breakdown();
+        assert_eq!(rss, 1, "expected 1 rss-dominant edge, breakdown={:?}", (rss, cpu, swap, unknown));
+        assert_eq!(cpu, 1, "expected 1 cpu-dominant edge, breakdown={:?}", (rss, cpu, swap, unknown));
+        assert_eq!(swap, 0);
+        assert!(unknown >= 1, "cold edge with 0 observations must land in unknown bucket");
+    }
+
+    #[test]
+    fn mechanism_breakdown_total_equals_edge_count() {
+        // Invariant: every edge lands in exactly one bucket, so the four
+        // buckets must sum to the total edge count.  Load-bearing if metrics
+        // are ever wired to display percentages.
+        let mut g = CausalGraph::new();
+        for i in 0..3u64 {
+            g.record_action(&format!("throttle:proc-{}", i), 0.80, i * 10);
+        }
+        let (rss, cpu, swap, unknown) = g.mechanism_breakdown();
+        assert_eq!(rss + cpu + swap + unknown, g.edges.len());
     }
 
     // ── Impact map test ─────────────────────────────────────────────────
