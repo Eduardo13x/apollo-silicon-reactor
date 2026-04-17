@@ -457,16 +457,16 @@ fn sentinel_loop(
         let memory_signaled = state.memory_signal.swap(false, Ordering::AcqRel);
         let _power_signaled = state.power_signal.swap(false, Ordering::AcqRel);
 
-        // Determine current resource severity.
-        let temp_c = hw_temp.unwrap_or(0.0);
-        let rate_of_rise = if temp_c > 0.0 {
-            bufs.record_temp(temp_c)
-        } else {
-            0.0
+        // Determine current resource severity. Preserve `None` when the SMC
+        // reader has not yet populated so compute_phase sees the unknown
+        // state explicitly instead of a silent `0.0` sentinel.
+        let rate_of_rise = match hw_temp {
+            Some(t) if t > 0.0 => bufs.record_temp(t),
+            _ => 0.0,
         };
 
         let new_phase = compute_phase(
-            temp_c,
+            hw_temp,
             rate_of_rise,
             &pressure,
             thermal_signaled,
@@ -490,18 +490,22 @@ fn sentinel_loop(
         };
 
         // Apply hysteresis: only downgrade if temp is well below threshold.
+        // When temp is unknown (reader boot-edge or stuck), `below` returns
+        // false so hysteresis keeps the higher phase — prefer over-mitigation
+        // to under-mitigation when we have no thermal evidence.
+        let below = |limit: f32| hw_temp.map(|t| t < limit).unwrap_or(false);
         let effective_phase = if new_phase < prev_phase {
             let hysteresis_ok = match prev_phase {
                 InterruptPhase::SuperEmergency => {
-                    temp_c < config.thermal_super_emergency_c - config.hysteresis_c
+                    below(config.thermal_super_emergency_c - config.hysteresis_c)
                         && pressure.memory_pressure < config.memory_pressure_emergency - 0.05
                 }
                 InterruptPhase::Emergency => {
-                    temp_c < config.thermal_emergency_c - config.hysteresis_c
+                    below(config.thermal_emergency_c - config.hysteresis_c)
                         && pressure.memory_pressure < config.memory_pressure_moderate - 0.05
                 }
                 InterruptPhase::Moderate => {
-                    temp_c < config.thermal_moderate_c - config.hysteresis_c
+                    below(config.thermal_moderate_c - config.hysteresis_c)
                         && pressure.memory_pressure < config.memory_pressure_moderate - 0.10
                 }
                 InterruptPhase::Idle => true,
@@ -587,8 +591,17 @@ fn sentinel_loop(
 }
 
 /// Compute the target phase based on current sensor readings.
+///
+/// `temp_c` is `None` when the SMC reader has not yet produced a sample
+/// (boot-edge) or is stuck. Previously this was collapsed to `0.0` at the
+/// call site via `unwrap_or(0.0)`, which silently erased the "unknown"
+/// state and could keep the sentinel in `Idle` even while the CPU was hot
+/// if the reader had stalled. Option propagates the missing-sensor case
+/// through the decision logic so the thermal branches are simply skipped
+/// when we don't know the temperature — pressure and reactor signals can
+/// still escalate the phase on their own.
 fn compute_phase(
-    temp_c: f32,
+    temp_c: Option<f32>,
     rate_of_rise: f32,
     pressure: &PressureData,
     thermal_signaled: bool,
@@ -597,16 +610,18 @@ fn compute_phase(
     config: &SentinelConfig,
 ) -> InterruptPhase {
     // Super-emergency: extreme temperature OR dangerous rate-of-rise.
-    if temp_c >= config.thermal_super_emergency_c
-        || (temp_c >= config.thermal_emergency_c && rate_of_rise >= config.rate_of_rise_threshold)
-    {
-        return InterruptPhase::SuperEmergency;
+    if let Some(t) = temp_c {
+        if t >= config.thermal_super_emergency_c
+            || (t >= config.thermal_emergency_c && rate_of_rise >= config.rate_of_rise_threshold)
+        {
+            return InterruptPhase::SuperEmergency;
+        }
+        if t >= config.thermal_emergency_c {
+            return InterruptPhase::Emergency;
+        }
     }
 
-    // Emergency: high temperature OR critical memory + swap thrash.
-    if temp_c >= config.thermal_emergency_c {
-        return InterruptPhase::Emergency;
-    }
+    // Emergency: critical memory + swap thrash (sensor-independent).
     if pressure.memory_pressure >= config.memory_pressure_emergency
         && pressure.swap_delta_bps >= 500_000.0
     {
@@ -614,8 +629,10 @@ fn compute_phase(
     }
 
     // Moderate: warm OR memory pressure rising.
-    if temp_c >= config.thermal_moderate_c {
-        return InterruptPhase::Moderate;
+    if let Some(t) = temp_c {
+        if t >= config.thermal_moderate_c {
+            return InterruptPhase::Moderate;
+        }
     }
     if pressure.memory_pressure >= config.memory_pressure_moderate {
         return InterruptPhase::Moderate;
@@ -1022,7 +1039,7 @@ mod tests {
             ..PressureData::default()
         };
         let phase = compute_phase(
-            50.0,
+            Some(50.0),
             0.0,
             &pressure,
             false,
@@ -1038,7 +1055,7 @@ mod tests {
         let cfg = SentinelConfig::default();
         let pressure = PressureData::default();
         let phase = compute_phase(
-            91.0,
+            Some(91.0),
             0.0,
             &pressure,
             false,
@@ -1057,7 +1074,7 @@ mod tests {
             ..PressureData::default()
         };
         let phase = compute_phase(
-            50.0,
+            Some(50.0),
             0.0,
             &pressure,
             false,
@@ -1073,7 +1090,7 @@ mod tests {
         let cfg = SentinelConfig::default();
         let pressure = PressureData::default();
         let phase = compute_phase(
-            96.0,
+            Some(96.0),
             0.0,
             &pressure,
             false,
@@ -1093,7 +1110,7 @@ mod tests {
             ..PressureData::default()
         };
         let phase = compute_phase(
-            50.0,
+            Some(50.0),
             0.0,
             &pressure,
             false,
@@ -1109,7 +1126,7 @@ mod tests {
         let cfg = SentinelConfig::default();
         let pressure = PressureData::default();
         let phase = compute_phase(
-            101.0,
+            Some(101.0),
             0.0,
             &pressure,
             false,
@@ -1126,7 +1143,7 @@ mod tests {
         let pressure = PressureData::default();
         // 96°C + 1.5°C/s rate-of-rise → super-emergency
         let phase = compute_phase(
-            96.0,
+            Some(96.0),
             1.5,
             &pressure,
             false,
@@ -1141,8 +1158,10 @@ mod tests {
     fn compute_phase_reactor_thermal_signal_triggers_moderate() {
         let cfg = SentinelConfig::default();
         let pressure = PressureData::default();
-        // Thermal signal from reactor, even if temp is unknown (0.0).
-        let phase = compute_phase(0.0, 0.0, &pressure, true, false, InterruptPhase::Idle, &cfg);
+        // Reader has not populated yet (None) — thermal signal from reactor
+        // still escalates to Moderate because the decision is sensor-independent.
+        let phase =
+            compute_phase(None, 0.0, &pressure, true, false, InterruptPhase::Idle, &cfg);
         assert_eq!(phase, InterruptPhase::Moderate);
     }
 
@@ -1153,9 +1172,9 @@ mod tests {
             memory_pressure: 0.5,
             ..PressureData::default()
         };
-        // Memory signal but low pressure → still idle
+        // Memory signal but low pressure → still idle, temp unknown.
         let phase = compute_phase(
-            0.0,
+            None,
             0.0,
             &low_pressure,
             false,
@@ -1169,9 +1188,9 @@ mod tests {
             memory_pressure: 0.75,
             ..PressureData::default()
         };
-        // Memory signal + pressure ≥ 0.70 → moderate
+        // Memory signal + pressure ≥ 0.70 → moderate, temp unknown.
         let phase = compute_phase(
-            0.0,
+            None,
             0.0,
             &high_pressure,
             false,
