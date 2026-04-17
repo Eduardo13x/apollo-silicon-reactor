@@ -88,6 +88,13 @@ pub fn protected_processes() -> HashSet<&'static str> {
         "watchdogd",
         "syslogd",
         "OSLogService",
+        // `log` CLI tool — ephemeral (<3s) subprocess spawned by apollo's own
+        // system_log_ingester (src/engine/system_log_ingester.rs). Night-mode
+        // heuristic was targeting these; by execute_actions time the PID had
+        // recycled/died, producing 4052 consecutive `skip:pid-recycled:log`
+        // entries with 0% throttle success (prod observation 2026-04-16, 11h
+        // window). Self-inflicted cascade [Nygard 2018 Ch.4].
+        "log",
         // Bluetooth stack — freeze any of these = BT keyboard/trackpad dead on M1.
         // IOUserBluetoothSerialDriver seen 297 throttles in prod; BTLEServer 114.
         // No recovery without killing the freeze manually or rebooting.
