@@ -14,6 +14,7 @@ pub mod coalition;
 pub mod cognitive_bus;
 pub mod cognitive_health;
 pub mod compressor_aware;
+pub mod config_reloader;
 pub mod contention_detector;
 pub mod contention_tracker;
 pub mod cpu_saturation;
