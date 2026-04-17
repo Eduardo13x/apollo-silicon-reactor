@@ -559,11 +559,13 @@ pub fn execute_actions(
                     // Never freeze processes with active power assertions
                     // (audio playback, active downloads, background tasks).
                     //
-                    // High-pressure bypass: at or above 0.75 kernel/compressor
+                    // High-pressure bypass: at or above 0.70 kernel/compressor
                     // pressure the OOM risk outweighs interrupting a download
                     // or background task — without this, a single PID holding
                     // PreventUserIdleSleep blocks every freeze while swap climbs.
-                    if memory_pressure < 0.75 {
+                    // Lowered from 0.75: at 74.5% pressure + thrashing_score=121k the system
+                    // was paralysed for 0.5pp — empirical evidence the old threshold was too high.
+                    if memory_pressure < 0.70 {
                         let busy = assertion_pids.get_or_insert_with(pids_with_assertions);
                         if busy.contains(pid) {
                             out.push_skip(format!("assertion-active:{}", name));

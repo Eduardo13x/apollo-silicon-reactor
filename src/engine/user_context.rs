@@ -104,16 +104,18 @@ impl UserContext {
     ///
     /// `call_in_progress` is unconditional — interrupting a video call is never OK.
     /// `has_sleep_assertion` is gated by memory pressure: at high pressure
-    /// (≥ 0.75) the OOM risk outweighs interrupting a background download or
+    /// (≥ 0.70) the OOM risk outweighs interrupting a background download or
     /// long-running task that merely holds `PreventUserIdleSleep`. Without this
     /// bypass, a single Electron/Claude process holding the assertion blocks
     /// EVERY freeze even when RAM is at the brink and swap is climbing.
+    /// Lowered from 0.75: at 74.5% pressure + thrashing_score=121k the system
+    /// was paralysed for 0.5pp — empirical evidence the old threshold was too high.
     #[inline]
     pub fn freeze_protected(&self, memory_pressure: f64) -> bool {
         if self.call_in_progress {
             return true;
         }
-        if memory_pressure >= 0.75 {
+        if memory_pressure >= 0.70 {
             return false;
         }
         self.has_sleep_assertion
