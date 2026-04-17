@@ -835,3 +835,65 @@ fn build_summary(snapshot: &SystemSnapshot, teacher: Option<&TeacherContext<'_>>
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml_src: &str) -> LlmConfig {
+        let cfg: RepoConfig =
+            toml::from_str(toml_src).expect("test fixture must be valid TOML");
+        cfg.llm.expect("test fixture must set [llm]")
+    }
+
+    #[test]
+    fn always_on_defaults_to_false() {
+        let cfg = parse("[llm]\nenabled = true\n");
+        assert!(!cfg.always_on(),
+            "always_on must default false so cloud configs keep training-TTL gating");
+    }
+
+    #[test]
+    fn always_on_parses_true_from_toml() {
+        let cfg = parse("[llm]\nenabled = true\nalways_on = true\n");
+        assert!(cfg.always_on());
+        assert!(cfg.enabled());
+    }
+
+    #[test]
+    fn always_on_true_does_not_force_enabled_true() {
+        // `always_on` is independent from the master `enabled` switch. The
+        // daemon tick must still honor enabled=false (the user's kill
+        // switch) — always_on only changes the TTL-bypass path, not the
+        // initial gate. Regression guard: if these ever collapse into one
+        // flag, the user loses the kill-switch mid-session.
+        let cfg = parse("[llm]\nenabled = false\nalways_on = true\n");
+        assert!(!cfg.enabled(),
+            "enabled=false must disable even when always_on=true");
+        assert!(cfg.always_on());
+    }
+
+    #[test]
+    fn timeout_uses_override_when_provided() {
+        // Regression guard for the 180s Gemma-4-on-M1 config: local models
+        // need longer than the 5s cloud default or every inference trips
+        // the timeout before it completes.
+        let cfg = parse("[llm]\nenabled = true\ntimeout_ms = 180000\n");
+        assert_eq!(cfg.timeout(), Duration::from_millis(180_000));
+    }
+
+    #[test]
+    fn timeout_falls_back_to_5s_default_when_unset() {
+        let cfg = parse("[llm]\nenabled = true\n");
+        assert_eq!(cfg.timeout(), Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn min_interval_secs_override_respected() {
+        // Production Gemma 4 config sets 1800s (30min). Tests were relying
+        // on the 900s default — a silent regression here would flood the
+        // local model and drain battery.
+        let cfg = parse("[llm]\nenabled = true\nmin_interval_secs = 1800\n");
+        assert_eq!(cfg.min_interval_secs(), 1800);
+    }
+}
