@@ -504,6 +504,7 @@ impl ChromiumManager {
         &mut self,
         processes: &[(u32, &str, f32, u64)],
         foreground_pid: Option<u32>,
+        foreground_app: Option<&str>,
         assertion_pids: &HashSet<u32>,
         main_frozen: &HashSet<u32>,
     ) -> Vec<ChromiumAction> {
@@ -614,13 +615,19 @@ impl ChromiumManager {
                 .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid: p, .. } if *p == pid))
         };
 
-        // Determine which browser is in the foreground (by foreground_pid)
-        let fg_browser: Option<String> = foreground_pid.and_then(|fg| {
-            processes
-                .iter()
-                .find(|&&(pid, _, _, _)| pid == fg)
-                .map(|&(_, name, _, _)| Self::browser_name(name).to_string())
-        });
+        // Determine which browser is in the foreground.
+        // Primary: look up foreground_pid in proc list (exact match).
+        // Fallback: use foreground_app name directly (from lsappinfo) — handles
+        // stale PIDs and lookup misses that would otherwise set fg_browser=None,
+        // disabling the freeze guard and allowing fg browser renderers to be frozen.
+        let fg_browser: Option<String> = foreground_pid
+            .and_then(|fg| {
+                processes
+                    .iter()
+                    .find(|&&(pid, _, _, _)| pid == fg)
+                    .map(|&(_, name, _, _)| Self::browser_name(name).to_string())
+            })
+            .or_else(|| foreground_app.map(|a| Self::browser_name(a).to_string()));
 
         // Collect freeze/thaw decisions per browser (respect MAX_FREEZE_RATIO)
 
@@ -1411,9 +1418,9 @@ mod tests {
             vec![(100, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
         let none_set = HashSet::new();
 
-        mgr.update(&procs, None, &none_set, &none_set);
-        mgr.update(&procs, None, &none_set, &none_set);
-        mgr.update(&procs, None, &none_set, &none_set);
+        mgr.update(&procs, None, None, &none_set, &none_set);
+        mgr.update(&procs, None, None, &none_set, &none_set);
+        mgr.update(&procs, None, None, &none_set, &none_set);
 
         let info = mgr.renderers.get(&100).expect("renderer must be tracked");
         assert!(
@@ -1431,14 +1438,14 @@ mod tests {
         // Three idle cycles
         let idle: Vec<(u32, &str, f32, u64)> =
             vec![(100, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
-        mgr.update(&idle, None, &none_set, &none_set);
-        mgr.update(&idle, None, &none_set, &none_set);
-        mgr.update(&idle, None, &none_set, &none_set);
+        mgr.update(&idle, None, None, &none_set, &none_set);
+        mgr.update(&idle, None, None, &none_set, &none_set);
+        mgr.update(&idle, None, None, &none_set, &none_set);
 
         // CPU spike
         let active: Vec<(u32, &str, f32, u64)> =
             vec![(100, "Brave Browser Helper (Renderer)", 15.0, 50_000_000)];
-        mgr.update(&active, None, &none_set, &none_set);
+        mgr.update(&active, None, None, &none_set, &none_set);
 
         let info = mgr.renderers.get(&100).unwrap();
         assert_eq!(
@@ -1466,7 +1473,7 @@ mod tests {
 
         // Run enough cycles to accumulate idle time
         for _ in 0..4 {
-            mgr.update(&procs, None, &none_set, &none_set);
+            mgr.update(&procs, None, None, &none_set, &none_set);
         }
 
         let freeze_count = mgr.renderers.values().filter(|r| r.frozen).count();
@@ -1495,7 +1502,7 @@ mod tests {
 
         let none_set = HashSet::new();
         for _ in 0..5 {
-            mgr.update(&procs, None, &assertion_pids, &none_set);
+            mgr.update(&procs, None, None, &assertion_pids, &none_set);
         }
 
         let info = mgr.renderers.get(&pid).unwrap();
@@ -1522,7 +1529,7 @@ mod tests {
         let none_set = HashSet::new();
         let mut all_actions = Vec::new();
         for _ in 0..5 {
-            let acts = mgr.update(&procs, None, &none_set, &main_frozen);
+            let acts = mgr.update(&procs, None, None, &none_set, &main_frozen);
             all_actions.extend(acts);
         }
 
@@ -1544,7 +1551,7 @@ mod tests {
 
         let procs1: Vec<(u32, &str, f32, u64)> =
             vec![(500, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
-        mgr.update(&procs1, None, &none_set, &none_set);
+        mgr.update(&procs1, None, None, &none_set, &none_set);
         assert!(
             mgr.renderers.contains_key(&500),
             "PID 500 should be tracked"
@@ -1552,7 +1559,7 @@ mod tests {
 
         // Next cycle: PID 500 is gone
         let procs2: Vec<(u32, &str, f32, u64)> = vec![];
-        mgr.update(&procs2, None, &none_set, &none_set);
+        mgr.update(&procs2, None, None, &none_set, &none_set);
         assert!(
             !mgr.renderers.contains_key(&500),
             "PID 500 should be pruned"
@@ -1566,7 +1573,7 @@ mod tests {
 
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(600, "Code Helper (Renderer)", 0.5, 30_000_000)];
-        mgr.update(&procs, None, &none_set, &none_set);
+        mgr.update(&procs, None, None, &none_set, &none_set);
         assert!(mgr.renderers.contains_key(&600), "new PID should be added");
         assert_eq!(mgr.renderers.get(&600).unwrap().browser, "Code");
     }
@@ -1617,7 +1624,7 @@ mod tests {
 
         let mut freeze_count = 0;
         for _ in 0..5 {
-            let acts = mgr.update(&procs, None, &none_set, &none_set);
+            let acts = mgr.update(&procs, None, None, &none_set, &none_set);
             freeze_count += acts
                 .iter()
                 .filter(|a| matches!(a, ChromiumAction::FreezeRenderer { .. }))
@@ -1635,7 +1642,7 @@ mod tests {
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(800, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
 
-        let acts = mgr.update(&procs, None, &none_set, &none_set);
+        let acts = mgr.update(&procs, None, None, &none_set, &none_set);
         let ecore = acts
             .iter()
             .filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. }))
@@ -1688,7 +1695,7 @@ mod tests {
             (1002, "Brave Browser Helper (Renderer)", 0.1, 80_000_000),
             (1003, "Slack Helper (Renderer)", 0.2, 60_000_000),
         ];
-        mgr.update(&procs, None, &none_set, &none_set);
+        mgr.update(&procs, None, None, &none_set, &none_set);
 
         let m = mgr.metrics();
         assert_eq!(m.total_renderers, 3);
@@ -1721,7 +1728,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         for _ in 0..1000 {
-            let _ = mgr.update(&procs, None, &none_set, &none_set);
+            let _ = mgr.update(&procs, None, None, &none_set, &none_set);
         }
         let elapsed = start.elapsed();
 
@@ -1756,7 +1763,7 @@ mod tests {
         ];
         mgr.set_pressure_context(0.80); // aggressive: 1 cycle to freeze
         for _ in 0..4 {
-            mgr.update(&brave_procs, None, &none_set, &none_set);
+            mgr.update(&brave_procs, None, None, &none_set, &none_set);
         }
 
         // Mark renderers as frozen (simulate daemon executing FreezeRenderer actions)
@@ -1778,7 +1785,7 @@ mod tests {
         ];
 
         // No foreground — no thaw yet
-        let actions = mgr.update(&frozen_procs, None, &none_set, &none_set);
+        let actions = mgr.update(&frozen_procs, None, None, &none_set, &none_set);
         let thaws: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, ChromiumAction::ThawRenderer { .. }))
@@ -1786,7 +1793,7 @@ mod tests {
         assert!(thaws.is_empty(), "No thaw when no foreground browser");
 
         // User switches to Brave (pid 200 is now foreground)
-        let actions = mgr.update(&frozen_procs, Some(200), &none_set, &none_set);
+        let actions = mgr.update(&frozen_procs, Some(200), None, &none_set, &none_set);
         let thaws: Vec<u32> = actions
             .iter()
             .filter_map(|a| match a {
@@ -1819,7 +1826,7 @@ mod tests {
         // backgrounded inside the browser).
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(500, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
-        mgr.update(&procs, Some(500), &none_set, &none_set);
+        mgr.update(&procs, Some(500), None, &none_set, &none_set);
         if let Some(r) = mgr.renderers.get_mut(&500) {
             r.frozen = true;
             r.frozen_cycles = MAX_FOREGROUND_FROZEN_CYCLES;
@@ -1830,7 +1837,7 @@ mod tests {
         // Update with Brave still in foreground — pid 500 must be thawed
         // because it crossed MAX_FOREGROUND_FROZEN_CYCLES (~30 s) even
         // though it's far below the background MAX_FROZEN_CYCLES (~5 min).
-        let actions = mgr.update(&procs, Some(500), &none_set, &none_set);
+        let actions = mgr.update(&procs, Some(500), None, &none_set, &none_set);
         let thaws: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 500))
@@ -1850,7 +1857,7 @@ mod tests {
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(300, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
 
-        mgr.update(&procs, None, &none_set, &none_set);
+        mgr.update(&procs, None, None, &none_set, &none_set);
         // Simulate frozen state
         if let Some(r) = mgr.renderers.get_mut(&300) {
             r.frozen = true;
@@ -1860,7 +1867,7 @@ mod tests {
 
         // One more cycle pushes frozen_cycles to MAX_FROZEN_CYCLES+1 via saturating_add
         // But since we set it to MAX_FROZEN_CYCLES directly, update() sees >= MAX and thaws
-        let actions = mgr.update(&procs, None, &none_set, &none_set);
+        let actions = mgr.update(&procs, None, None, &none_set, &none_set);
         let thaws: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, ChromiumAction::ThawRenderer { pid, .. } if *pid == 300))
@@ -1881,7 +1888,7 @@ mod tests {
             vec![(400, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
 
         // Cycle 1: first time — should emit DemoteToEcores
-        let actions1 = mgr.update(&procs, None, &none_set, &none_set);
+        let actions1 = mgr.update(&procs, None, None, &none_set, &none_set);
         let demotions1 = actions1
             .iter()
             .filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. }))
@@ -1889,7 +1896,7 @@ mod tests {
         assert_eq!(demotions1, 1, "First cycle must emit exactly 1 demotion");
 
         // Cycle 2: same renderer — must NOT re-emit (already demoted)
-        let actions2 = mgr.update(&procs, None, &none_set, &none_set);
+        let actions2 = mgr.update(&procs, None, None, &none_set, &none_set);
         let demotions2 = actions2
             .iter()
             .filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. }))
@@ -1919,7 +1926,7 @@ mod tests {
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(pid, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
         mgr.set_pressure_context(0.80);
-        mgr.update(&procs, None, &none_set, &none_set);
+        mgr.update(&procs, None, None, &none_set, &none_set);
         // Manually mark as frozen (simulate daemon having executed FreezeRenderer)
         if let Some(r) = mgr.renderers.get_mut(&pid) {
             r.frozen = true;
@@ -1938,7 +1945,7 @@ mod tests {
 
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(500, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
-        let actions = mgr.update(&procs, None, &none_set, &none_set);
+        let actions = mgr.update(&procs, None, None, &none_set, &none_set);
 
         let thawed = actions
             .iter()
@@ -1959,7 +1966,7 @@ mod tests {
 
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(501, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
-        let actions = mgr.update(&procs, None, &none_set, &none_set);
+        let actions = mgr.update(&procs, None, None, &none_set, &none_set);
 
         let thawed = actions
             .iter()
@@ -1982,7 +1989,7 @@ mod tests {
 
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(503, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
-        let actions = mgr.update(&procs, None, &none_set, &none_set);
+        let actions = mgr.update(&procs, None, None, &none_set, &none_set);
 
         let thawed = actions
             .iter()
@@ -2003,7 +2010,7 @@ mod tests {
 
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(502, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
-        let actions = mgr.update(&procs, None, &none_set, &none_set);
+        let actions = mgr.update(&procs, None, None, &none_set, &none_set);
 
         let thawed = actions
             .iter()
@@ -2047,7 +2054,7 @@ mod tests {
 
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(503, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
-        let actions = mgr.update(&procs, None, &none_set, &none_set);
+        let actions = mgr.update(&procs, None, None, &none_set, &none_set);
 
         let thawed = actions
             .iter()
@@ -2083,7 +2090,7 @@ mod tests {
         // (idle_cycles_required=2 WOULD fire earlier, but the test verifies the
         // long-idle path works — the default state already makes this fire).
         for _ in 0..31 {
-            mgr.update(&procs, None, &none_set, &none_set);
+            mgr.update(&procs, None, None, &none_set, &none_set);
         }
 
         // After 31+ cycles, at least one of the renderers must be in frozen_pids.
@@ -2113,10 +2120,10 @@ mod tests {
             (822, "Notion Helper (Renderer)", 0.1, 80_000_000),
         ];
         for _ in 0..3 {
-            mgr.update(&procs, None, &none_set, &none_set);
+            mgr.update(&procs, None, None, &none_set, &none_set);
         }
 
-        let actions = mgr.update(&procs, None, &none_set, &none_set);
+        let actions = mgr.update(&procs, None, None, &none_set, &none_set);
         let any_frozen = actions
             .iter()
             .any(|a| matches!(a, ChromiumAction::FreezeRenderer { pid, .. } if *pid == 821 || *pid == 822));
@@ -2152,7 +2159,7 @@ mod tests {
         // effective_required (2). Still far below LONG_IDLE_CYCLES (30), so
         // the kept freeze is attributable to the preemption path alone.
         for _ in 0..11 {
-            mgr.update(&procs, None, &none_set, &none_set);
+            mgr.update(&procs, None, None, &none_set, &none_set);
         }
 
         assert!(
@@ -2182,7 +2189,7 @@ mod tests {
         // 11 cycles clears NEW_RENDERER_GRACE_CYCLES (10) and satisfies
         // idle_cycles_required=1 set by arousal=0.80.
         for _ in 0..11 {
-            mgr.update(&procs, None, &none_set, &none_set);
+            mgr.update(&procs, None, None, &none_set, &none_set);
         }
         assert!(
             !mgr.frozen_pids.is_empty(),
@@ -2208,7 +2215,7 @@ mod tests {
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(701, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
         // No foreground browser (user focused on a non-Chromium app like Warp).
-        let actions = mgr.update(&procs, None, &none_set, &none_set);
+        let actions = mgr.update(&procs, None, None, &none_set, &none_set);
 
         let thawed = actions
             .iter()
@@ -2263,7 +2270,7 @@ mod tests {
         // Run enough cycles that renderer would otherwise be frozen
         let mut any_freeze = false;
         for _ in 0..5 {
-            let actions = mgr.update(&procs, None, &none_set, &none_set);
+            let actions = mgr.update(&procs, None, None, &none_set, &none_set);
             if actions
                 .iter()
                 .any(|a| matches!(a, ChromiumAction::FreezeRenderer { pid, .. } if *pid == 600))
@@ -2303,6 +2310,38 @@ mod tests {
             ChromiumManager::chromium_app_to_browser("Finder"),
             None,
             "Finder is not a Chromium browser"
+        );
+    }
+
+    /// When foreground_pid lookup fails (stale PID not in proc list), the
+    /// foreground_app name fallback must prevent fg browser renderers from being frozen.
+    /// Root cause of "tabs stay frozen": fg_browser=None when PID stale → guard disabled.
+    #[test]
+    fn foreground_app_fallback_guards_fg_browser_renderers() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+
+        // Renderer for Brave Browser (fg browser)
+        let procs: Vec<(u32, &str, f32, u64)> = vec![
+            (100, "Brave Browser Helper (Renderer)", 0.0, 100_000_000),
+            // NOTE: no "Brave Browser" main process in list (stale PID scenario)
+        ];
+
+        // Warm up (age past new-renderer grace)
+        for _ in 0..15 {
+            mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        }
+        mgr.set_pressure_context(0.80); // high pressure — would freeze aggressively
+
+        // Many idle cycles — without fallback guard this renderer would be frozen
+        for _ in 0..10 {
+            mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        }
+
+        let metrics = mgr.metrics();
+        assert_eq!(
+            metrics.frozen_renderers, 0,
+            "foreground_app fallback must prevent freezing fg browser renderers even when PID lookup fails"
         );
     }
 }

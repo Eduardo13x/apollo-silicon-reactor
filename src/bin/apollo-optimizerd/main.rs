@@ -5640,7 +5640,7 @@ fn main() -> anyhow::Result<()> {
                 // Runs after all main-loop freeze decisions so we can exclude those PIDs.
                 // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
                 // Set to false to re-enable Chromium renderer freezing.
-                const CHROMIUM_FREEZE_DISABLED: bool = true;
+                const CHROMIUM_FREEZE_DISABLED: bool = false;
 
                 // Always update renderer inventory for observability — decoupled from
                 // action execution. [Jones 2011] observability must not be gated behind
@@ -5679,6 +5679,7 @@ fn main() -> anyhow::Result<()> {
                     let chromium_actions = chromium_mgr.update(
                         &proc_list,
                         foreground_pid,
+                        foreground_app.as_deref(),
                         &chromium_assertion_pids,
                         &main_frozen_set,
                     );
