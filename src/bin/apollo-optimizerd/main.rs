@@ -42,8 +42,9 @@ use apollo_optimizer::engine::daemon_helpers::{
     metrics_path, overflow_history_path, parse_profile, pid_start_time, predictive_agent_path,
     remove_crash_sentinel, rl_threshold_path, should_rotate_oldest, should_unfreeze,
     signal_intelligence_path, skills_path, socket_path, spotlight_set_indexing,
-    telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_pids, wake_state_path,
-    write_frozen_state, write_governor_state, write_wake_state,
+    telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_pids,
+    unfreeze_pids_verified, wake_state_path, write_frozen_state, write_governor_state,
+    write_wake_state,
 };
 use apollo_optimizer::engine::effective_pressure;
 use apollo_optimizer::engine::execute_actions::execute_actions;
@@ -1779,9 +1780,19 @@ fn main() -> anyhow::Result<()> {
                         TurboAction::DeactivateTurbo {
                             unfreeze_pids: pids,
                         } => {
-                            // Unfreeze all PIDs we froze during turbo.
-                            let unfreeze_count = unfreeze_pids(pids.iter().copied());
+                            // A-B-A defense: verify PID identity before SIGCONT.
+                            // Lock frozen_guard first so we can read start_sec for
+                            // each PID before the signal. PIDs recycled between the
+                            // display-off freeze and the display-on thaw are skipped.
+                            // [Saltzer & Kaashoek 2009] §3.3 Complete Mediation.
                             let mut frozen_guard = state.frozen_state.lock_recover();
+                            let entries_to_unfreeze: std::collections::HashMap<u32, FrozenEntry> = pids
+                                .iter()
+                                .filter_map(|&pid| {
+                                    frozen_guard.get(&pid).map(|e| (pid, e.clone()))
+                                })
+                                .collect();
+                            let unfreeze_count = unfreeze_pids_verified(&entries_to_unfreeze);
                             for pid in &pids {
                                 frozen_guard.remove(pid);
                             }
