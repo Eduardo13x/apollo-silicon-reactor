@@ -983,3 +983,117 @@ pub fn apply_learned_policy_actions(
 
     actions
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apollo_optimizer::collector::{CpuStats, MemoryStats, PressureStats, ProcessStats, SystemSnapshot};
+
+    fn snapshot_with(processes: Vec<ProcessStats>) -> SystemSnapshot {
+        SystemSnapshot {
+            timestamp: chrono::Utc::now(),
+            cpu: CpuStats { global_usage: 0.0, core_count: 1 },
+            memory: MemoryStats { total_ram: 0, used_ram: 0, free_ram: 0, total_swap: 0, used_swap: 0 },
+            pressure: PressureStats {
+                memory_pressure: 0.0, swap_used_bytes: 0, swap_total_bytes: 0,
+                swap_delta_bytes_per_sec: 0.0, thermal_level: "nominal".into(),
+                compressor_pressure: 0.0, thrashing_score: 0.0,
+            },
+            disks: vec![],
+            networks: vec![],
+            top_processes: processes,
+        }
+    }
+
+    fn proc(pid: u32, name: &str, cpu: f32) -> ProcessStats {
+        ProcessStats { pid, name: name.into(), cpu_usage: cpu, memory_usage: 0, cpu_wall_ratio: None }
+    }
+
+    fn policy(interactive: &[&str], noise: &[&str], protected: &[&str]) -> LearnedPolicy {
+        LearnedPolicy {
+            interactive_patterns: interactive.iter().map(|s| s.to_string()).collect(),
+            noise_patterns: noise.iter().map(|s| s.to_string()).collect(),
+            protected_patterns: protected.iter().map(|s| s.to_string()).collect(),
+            learned_at: None,
+            pattern_weights: HashMap::new(),
+        }
+    }
+
+    // ── windowserver_cpu ─────────────────────────────────────────────────────
+
+    #[test]
+    fn windowserver_cpu_empty_snapshot_returns_zero() {
+        assert_eq!(windowserver_cpu(&snapshot_with(vec![])), 0.0);
+    }
+
+    #[test]
+    fn windowserver_cpu_finds_exact_name() {
+        let snap = snapshot_with(vec![proc(1, "WindowServer", 42.5)]);
+        assert_eq!(windowserver_cpu(&snap), 42.5);
+    }
+
+    #[test]
+    fn windowserver_cpu_matches_substring() {
+        let snap = snapshot_with(vec![proc(1, "com.apple.WindowServer", 10.0)]);
+        assert_eq!(windowserver_cpu(&snap), 10.0);
+    }
+
+    #[test]
+    fn windowserver_cpu_case_sensitive_miss() {
+        let snap = snapshot_with(vec![proc(1, "windowserver", 99.0)]);
+        assert_eq!(windowserver_cpu(&snap), 0.0, "lookup is case-sensitive");
+    }
+
+    // ── apply_learned_policy_actions ─────────────────────────────────────────
+
+    #[test]
+    fn apply_empty_policy_passthrough() {
+        let snap = snapshot_with(vec![]);
+        let actions = vec![RootAction::BoostProcess { pid: 1, name: "app".into(), reason: "r".into() }];
+        let result = apply_learned_policy_actions(&snap, &policy(&[], &[], &[]), actions);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn apply_protected_pattern_removes_freeze() {
+        let snap = snapshot_with(vec![]);
+        let actions = vec![RootAction::FreezeProcess {
+            pid: 1, name: "claude".into(), reason: "r".into(), start_sec: 0, start_usec: 0,
+        }];
+        let result = apply_learned_policy_actions(&snap, &policy(&[], &[], &["claude"]), actions);
+        assert!(result.is_empty(), "claude must be protected");
+    }
+
+    #[test]
+    fn apply_protected_pattern_keeps_non_matching() {
+        let snap = snapshot_with(vec![]);
+        let actions = vec![RootAction::FreezeProcess {
+            pid: 2, name: "slack".into(), reason: "r".into(), start_sec: 0, start_usec: 0,
+        }];
+        let result = apply_learned_policy_actions(&snap, &policy(&[], &[], &["claude"]), actions);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn apply_interactive_pattern_adds_boost() {
+        let snap = snapshot_with(vec![proc(42, "Xcode", 20.0)]);
+        let result = apply_learned_policy_actions(&snap, &policy(&["Xcode"], &[], &[]), vec![]);
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            RootAction::BoostProcess { pid, name, .. } => {
+                assert_eq!(*pid, 42);
+                assert_eq!(name, "Xcode");
+            }
+            _ => panic!("expected BoostProcess"),
+        }
+    }
+
+    #[test]
+    fn apply_no_duplicate_boost_when_already_present() {
+        let snap = snapshot_with(vec![proc(42, "Xcode", 20.0)]);
+        let existing = vec![RootAction::BoostProcess { pid: 42, name: "Xcode".into(), reason: "existing".into() }];
+        let result = apply_learned_policy_actions(&snap, &policy(&["Xcode"], &[], &[]), existing);
+        let boosts = result.iter().filter(|a| matches!(a, RootAction::BoostProcess { .. })).count();
+        assert_eq!(boosts, 1, "must not duplicate existing boost");
+    }
+}
