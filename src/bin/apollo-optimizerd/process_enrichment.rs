@@ -418,3 +418,122 @@ pub fn convert_and_merge_heuristic_decisions(
 
     (new_actions, stats)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apollo_optimizer::engine::process_tree::ProcessEntry;
+
+    // ── context_to_thermal ────────────────────────────────────────────────────
+
+    #[test]
+    fn context_to_thermal_constrained() {
+        assert_eq!(context_to_thermal(InteractiveContext::ThermalConstrained), "constrained");
+    }
+
+    #[test]
+    fn context_to_thermal_background_pressure() {
+        assert_eq!(context_to_thermal(InteractiveContext::BackgroundPressure), "elevated");
+    }
+
+    #[test]
+    fn context_to_thermal_interactive_focus() {
+        assert_eq!(context_to_thermal(InteractiveContext::InteractiveFocus), "nominal");
+    }
+
+    // ── build_foreground_family ───────────────────────────────────────────────
+
+    #[test]
+    fn foreground_family_none_pid_returns_empty() {
+        let tree = ProcessTree::build(&[]);
+        assert!(build_foreground_family(None, &tree).is_empty());
+    }
+
+    #[test]
+    fn foreground_family_root_only_no_children() {
+        let entries = vec![ProcessEntry {
+            pid: 100, ppid: 1, name: "app".into(), cpu_usage: 0.0, memory_bytes: 0,
+        }];
+        let tree = ProcessTree::build(&entries);
+        let result = build_foreground_family(Some(100), &tree);
+        assert!(result.contains(&100), "root pid must be in family");
+    }
+
+    #[test]
+    fn foreground_family_includes_children_excludes_unrelated() {
+        let entries = vec![
+            ProcessEntry { pid: 100, ppid: 1,   name: "app".into(),    cpu_usage: 0.0, memory_bytes: 0 },
+            ProcessEntry { pid: 200, ppid: 100, name: "helper".into(), cpu_usage: 0.0, memory_bytes: 0 },
+            ProcessEntry { pid: 300, ppid: 1,   name: "other".into(),  cpu_usage: 0.0, memory_bytes: 0 },
+        ];
+        let tree = ProcessTree::build(&entries);
+        let result = build_foreground_family(Some(100), &tree);
+        assert!(result.contains(&100));
+        assert!(result.contains(&200), "child of foreground must be in family");
+        assert!(!result.contains(&300), "unrelated PID must not be in family");
+    }
+
+    // ── apply_post_wake_grace_policy ──────────────────────────────────────────
+    // [Aniche 2022 §2] Category-partition: each RootAction variant is a distinct
+    // category; grace_active is the toggle.
+
+    fn freeze(pid: u32) -> RootAction {
+        RootAction::FreezeProcess { pid, name: "p".into(), reason: "r".into(), start_sec: 0, start_usec: 0 }
+    }
+    fn throttle(pid: u32, aggressive: bool) -> RootAction {
+        RootAction::ThrottleProcess { pid, name: "p".into(), aggressive, reason: "r".into(), start_sec: 0, start_usec: 0 }
+    }
+    fn quarantine() -> RootAction {
+        RootAction::QuarantineDaemon { daemon: "d".into(), active: true, reason: "r".into() }
+    }
+    fn boost(pid: u32) -> RootAction {
+        RootAction::BoostProcess { pid, name: "p".into(), reason: "r".into() }
+    }
+
+    #[test]
+    fn grace_inactive_passes_all_actions_unchanged() {
+        let actions = vec![freeze(1), throttle(2, true), boost(3)];
+        let (out, ts, fs) = apply_post_wake_grace_policy(actions, false);
+        assert_eq!(out.len(), 3);
+        assert_eq!(ts, 0);
+        assert_eq!(fs, 0);
+    }
+
+    #[test]
+    fn grace_active_suppresses_freeze_and_quarantine() {
+        let actions = vec![freeze(1), quarantine()];
+        let (out, _ts, fs) = apply_post_wake_grace_policy(actions, true);
+        assert!(out.is_empty());
+        assert_eq!(fs, 2);
+    }
+
+    #[test]
+    fn grace_active_downgrades_aggressive_throttle_to_gentle() {
+        let actions = vec![throttle(1, true)];
+        let (out, ts, fs) = apply_post_wake_grace_policy(actions, true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(ts, 1);
+        assert_eq!(fs, 0);
+        match &out[0] {
+            RootAction::ThrottleProcess { aggressive, .. } => assert!(!aggressive, "must be downgraded"),
+            _ => panic!("expected ThrottleProcess"),
+        }
+    }
+
+    #[test]
+    fn grace_active_passes_non_aggressive_throttle_unchanged() {
+        let actions = vec![throttle(1, false)];
+        let (out, ts, _fs) = apply_post_wake_grace_policy(actions, true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(ts, 0);
+    }
+
+    #[test]
+    fn grace_active_passes_boost_unchanged() {
+        let actions = vec![boost(42)];
+        let (out, ts, fs) = apply_post_wake_grace_policy(actions, true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(ts, 0);
+        assert_eq!(fs, 0);
+    }
+}
