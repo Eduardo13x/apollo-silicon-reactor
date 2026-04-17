@@ -28,6 +28,7 @@ use crate::engine::overflow_guard::OverflowHistory;
 use crate::engine::predictive_agent::SpecialistAccuracyTracker;
 use crate::engine::process_baseline::ProcessBaselineMap;
 use crate::engine::signal_intelligence::{SignalIntelligence, SignalIntelligencePersisted};
+use crate::engine::teacher_consolidation::TeacherConsolidator;
 use crate::engine::types::FrozenStatePersisted;
 
 /// Adaptive parameters that replace hardcoded thresholds.
@@ -448,6 +449,15 @@ pub struct LearnedState {
     /// [Google Nested Learning 2025] — multi-level context flow state.
     #[serde(default)]
     pub nested_learner: Option<NestedLearner>,
+
+    /// GemmaTrust EMA per suggestion category (Interactive / Noise / Protected /
+    /// Profile / Latency) + total consolidations + improvement count.  Without
+    /// this, trust resets to 0.5 neutral on every daemon restart and the
+    /// is_reliable() gate needs ≥3 fresh observations before Apollo re-accepts
+    /// advice it already proved reliable pre-restart.  [McGaugh 2004] long-term
+    /// consolidation; [Gray & Reuter 1992] atomic persistence of learned state.
+    #[serde(default)]
+    pub teacher_consolidator: Option<TeacherConsolidator>,
 }
 
 fn default_version() -> u32 {
@@ -500,6 +510,7 @@ impl LearnedState {
             process_baselines,
             learnable_params,
             nested_learner,
+            teacher_consolidator: None,
         }
     }
 
@@ -790,6 +801,26 @@ impl LearnedState {
         state.persist(path);
     }
 
+    /// Patch only the `teacher_consolidator` field of an existing persisted file.
+    /// Same rationale as `patch_process_baselines` — persist_improved() does not
+    /// thread the TeacherConsolidator through its signature; callers invoke this
+    /// after persist_improved() to snapshot Gemma trust EMA + consolidation totals.
+    /// No-op if file is missing (cold start is safe).
+    pub fn patch_teacher_consolidator(path: &Path, tc: TeacherConsolidator) {
+        let Some(mut state) = Self::load(path) else {
+            return;
+        };
+        state.teacher_consolidator = Some(tc);
+        state.persist(path);
+    }
+
+    /// Load only the `teacher_consolidator` field from disk (cold-start safe).
+    /// Returns `None` if the file is missing, unreadable, malformed, or the
+    /// field is absent (old file format pre-dating GemmaTrust persistence).
+    pub fn load_teacher_consolidator(path: &Path) -> Option<TeacherConsolidator> {
+        Self::load(path)?.teacher_consolidator
+    }
+
     /// Load from disk. Returns None on any error (cold start is safe).
     pub fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read_to_string(path).ok()?;
@@ -994,6 +1025,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
+            teacher_consolidator: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1022,6 +1054,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
+            teacher_consolidator: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1048,6 +1081,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
+            teacher_consolidator: None,
         };
         assert_eq!(
             state
@@ -1093,6 +1127,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
+            teacher_consolidator: None,
         };
         state.self_improve();
         assert_eq!(
@@ -1132,6 +1167,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
+            teacher_consolidator: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -1174,6 +1210,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
+            teacher_consolidator: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1464,5 +1501,105 @@ mod tests {
         assert_eq!(lp.tuning_cycles, 1);
         lp.meta_learn(0.50, 0.01);
         assert_eq!(lp.tuning_cycles, 2);
+    }
+
+    #[test]
+    fn teacher_consolidator_default_absent_on_collect() {
+        use crate::engine::effectiveness_tracker::EffectivenessTracker;
+        use crate::engine::optimization_skills::SkillRegistry;
+        use crate::engine::outcome_tracker::OutcomeTracker;
+        use crate::engine::predictive_agent::SpecialistAccuracyTracker;
+        use crate::engine::signal_intelligence::SignalIntelligence;
+
+        let si = SignalIntelligence::new();
+        let ot = OutcomeTracker::new();
+        let sa = SpecialistAccuracyTracker::new();
+        let sr = SkillRegistry::new();
+        let et = EffectivenessTracker::new();
+        let state = LearnedState::collect(
+            &si, &ot, &sa, &sr, &et, None, None, None, None, None, None, None,
+        );
+        assert!(state.teacher_consolidator.is_none(),
+            "collect() leaves teacher_consolidator None; callers must patch post-persist");
+    }
+
+    #[test]
+    fn patch_teacher_consolidator_roundtrip() {
+        use crate::engine::teacher_consolidation::{SuggestionCategory, TeacherConsolidator};
+        let tmp = std::env::temp_dir().join(format!(
+            "apollo_tc_patch_{}.json",
+            std::process::id()
+        ));
+        // Seed a minimal file so load() succeeds.
+        let seed = LearnedState {
+            version: 1,
+            signal_intelligence: None,
+            outcome_tracker: None,
+            specialist_accuracy: None,
+            persist_generations: 0,
+            last_restore_quality: None,
+            pending_trial_skill: None,
+            skill_registry: None,
+            overflow_guard_history: None,
+            frozen_pids: None,
+            effectiveness_tracker: None,
+            arousal_state: None,
+            causal_graph_edges: None,
+            process_baselines: None,
+            learnable_params: None,
+            nested_learner: None,
+            teacher_consolidator: None,
+        };
+        seed.persist(&tmp);
+
+        let mut tc = TeacherConsolidator::new();
+        // Drive one IMPROVED observation on Noise so trust > 0.5.
+        tc.gemma_trust.update(SuggestionCategory::Noise, 1.0);
+        tc.total_consolidations = 7;
+        tc.total_improvements = 5;
+
+        LearnedState::patch_teacher_consolidator(&tmp, tc.clone());
+
+        let loaded = LearnedState::load_teacher_consolidator(&tmp)
+            .expect("patched field must survive round-trip");
+        assert_eq!(loaded.total_consolidations, 7);
+        assert_eq!(loaded.total_improvements, 5);
+        assert_eq!(loaded.gemma_trust.count(SuggestionCategory::Noise), 1);
+        assert!(loaded.gemma_trust.trust(SuggestionCategory::Noise) > 0.5);
+        // Untouched categories fall back to the neutral 0.5 default.
+        assert!(
+            (loaded.gemma_trust.trust(SuggestionCategory::Interactive) - 0.5).abs() < 1e-9
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_teacher_consolidator_missing_file_returns_none() {
+        let tmp = std::env::temp_dir()
+            .join(format!("apollo_tc_missing_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        assert!(LearnedState::load_teacher_consolidator(&tmp).is_none());
+    }
+
+    #[test]
+    fn patch_teacher_consolidator_noop_when_file_missing() {
+        use crate::engine::teacher_consolidation::TeacherConsolidator;
+        let tmp = std::env::temp_dir()
+            .join(format!("apollo_tc_noop_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        // Must not panic, must not create the file.
+        LearnedState::patch_teacher_consolidator(&tmp, TeacherConsolidator::new());
+        assert!(!tmp.exists(), "patch is no-op when the state file is absent");
+    }
+
+    #[test]
+    fn teacher_consolidator_serde_backward_compat_missing_field() {
+        // Old file format: no teacher_consolidator key. Must deserialize cleanly
+        // with the field defaulting to None, so upgrades do not erase state.
+        let old_json = r#"{"version":1}"#;
+        let state: LearnedState = serde_json::from_str(old_json)
+            .expect("missing teacher_consolidator must default to None");
+        assert!(state.teacher_consolidator.is_none());
     }
 }
