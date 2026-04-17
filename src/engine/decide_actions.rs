@@ -1699,7 +1699,7 @@ mod tests {
     #[test]
     fn habituated_pid_is_skipped() {
         // A process in habituated_pids should produce no action.
-        let snap = make_snapshot(50.0, 0.85, 0.60);
+        let _snap = make_snapshot(50.0, 0.85, 0.60);
         let (interactive, noise, weights, behavior_pids, ipc_hints, hop_groups, _, causal) =
             empty_params();
         let mut habituated: HashSet<u32> = HashSet::new();

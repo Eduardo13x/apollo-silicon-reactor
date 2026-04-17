@@ -219,7 +219,7 @@ extern "C" {
         -> libc::c_int;
 }
 
-/// `proc_pidpath` — already declared in proc_taskinfo; re-use via extern here.
+// `proc_pidpath` — already declared in proc_taskinfo; re-use via extern here.
 #[cfg(target_os = "macos")]
 extern "C" {
     fn proc_pidpath(pid: libc::c_int, buffer: *mut u8, buffersize: u32) -> libc::c_int;

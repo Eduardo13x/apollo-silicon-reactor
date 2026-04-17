@@ -9,7 +9,7 @@
 //! - `is_peer_root()` — peer credential check
 
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;

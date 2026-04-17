@@ -1283,6 +1283,9 @@ fn main() -> anyhow::Result<()> {
             let mut pending_trial_skill: Option<(String, f64)> = restored_trial_skill;
             // Last specialist votes + chosen intervention for disagreement feedback.
             // Stored when had_disagreement is true; consumed by learning_tick next cycle.
+            // The initial `None` is overwritten by every path in the cycle body before the
+            // read at the learning_tick call site — mark the init assignment as allowed.
+            #[allow(unused_assignments)]
             let mut last_specialist_votes: Option<(Vec<SpecialistVote>, Intervention)> = None;
             // System log ingester: polls macOS unified logs for OOM/crash events (Phase 5).
             // Runs in background thread to avoid blocking the daemon hot path with

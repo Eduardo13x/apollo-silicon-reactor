@@ -210,7 +210,7 @@ mod tests {
     fn learns_daily_pattern() {
         let mut hw = HoltWinters::new();
         // Simulate: mornings (8-12) high pressure, afternoons low.
-        for day in 0..5 {
+        for _day in 0..5 {
             for hour in 0..24u8 {
                 let pressure = if (8..=12).contains(&hour) {
                     0.80 // Build time

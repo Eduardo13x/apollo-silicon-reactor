@@ -117,7 +117,7 @@ mod scenarios {
         let state = RlState::from_metrics(0.85, 0.40, 0);
         // First tick: establish state-action pair.
         agent.tick(state, false);
-        let q_before = agent.last_q_value();
+        let _q_before = agent.last_q_value();
         // Second tick with overflow: updates Q for previous state-action.
         agent.tick(state, true);
         // Third tick to read the updated Q for the state.

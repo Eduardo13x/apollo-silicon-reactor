@@ -15,9 +15,7 @@ use std::time::{Duration, Instant};
 
 use apollo_optimizer::engine::adaptive_governor::{GovernorDecision, ProcessDecision};
 use apollo_optimizer::engine::daemon_helpers::pid_start_time;
-use apollo_optimizer::engine::daemon_helpers::rotate_timeline;
 use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
-use apollo_optimizer::engine::llm::append_jsonl;
 use apollo_optimizer::engine::proc_taskinfo;
 use apollo_optimizer::engine::process_classifier::{ProcessSnapshot, ProcessTier};
 use apollo_optimizer::engine::process_tree::ProcessTree;

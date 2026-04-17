@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
-use sysinfo::{Disks, Networks, System};
+use sysinfo::System;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SystemSnapshot {
@@ -78,8 +78,6 @@ pub struct ProcessStats {
 
 pub struct SystemCollector {
     sys: System,
-    disks: Disks,
-    networks: Networks,
     prev_swap_used_bytes: Option<u64>,
     prev_swap_at: Option<Instant>,
     /// Number of process refresh cycles skipped (startup grace).
@@ -106,12 +104,8 @@ impl SystemCollector {
         sys.refresh_cpu();
         sys.refresh_memory();
         sys.refresh_processes();
-        let disks = Disks::new_with_refreshed_list();
-        let networks = Networks::new_with_refreshed_list();
         Self {
             sys,
-            disks,
-            networks,
             prev_swap_used_bytes: None,
             prev_swap_at: None,
             process_refresh_skip_count: 0,

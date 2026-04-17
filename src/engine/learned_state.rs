@@ -921,7 +921,7 @@ pub struct RestoreVerdict {
 mod tests {
     use super::*;
     use crate::engine::outcome_tracker::{
-        ExperienceRecord, HopGroupWeight, PatternWeight, WorkloadHop,
+        ExperienceRecord, PatternWeight,
     };
     use std::collections::HashMap;
 

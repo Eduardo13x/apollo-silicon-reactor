@@ -43,11 +43,6 @@ pub const RL_ABSOLUTE_FLOOR: f64 = 0.45;
 const ADJUSTMENT_FLOOR: f64 = -0.20;
 const ADJUSTMENT_CEIL: f64 = 0.05;
 
-/// Hard floor for the compound offset (overflow_guard total_offset).
-/// When the compound is at this floor, Lower5pp has no further effect —
-/// the overflow_guard clamps the result anyway.
-const COMPOUND_FLOOR: f64 = -0.15;
-
 /// Infrastructure-locked constraints (Hermes/Tinker-Atropos pattern).
 /// These are hard walls the RL agent can NEVER cross, regardless of reward.
 /// Prevents learning to sacrifice system stability for marginal improvements.

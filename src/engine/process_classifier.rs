@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn score_utility_translated_binary_penalized() {
-        let mut s = snap("legacy-app");
+        let s = snap("legacy-app");
         let mut s_translated = snap("legacy-app");
         s_translated.is_translated = true;
         let u = score_utility(&s);
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn score_utility_high_cpu_adds_bonus() {
-        let mut s = snap("cpu-worker");
+        let s = snap("cpu-worker");
         let mut s_high = snap("cpu-worker");
         s_high.cpu_percent = 15.0; // > 10% threshold
         let u_low = score_utility(&s);
@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn throttle_candidates_excludes_essential_and_foreground() {
         let c = ProcessClassifier::new();
-        let mut essential = snap("WindowServer");
+        let essential = snap("WindowServer");
         let mut active = snap("MyApp");
         active.has_gui_window = true;
         active.secs_since_user_interaction = 5;
