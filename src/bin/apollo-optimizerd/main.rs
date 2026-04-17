@@ -1555,11 +1555,17 @@ fn main() -> anyhow::Result<()> {
                     let batch: Vec<u32> = wake_unfreeze_queue
                         .drain(..wake_unfreeze_queue.len().min(WAKE_UNFREEZE_BATCH))
                         .collect();
-                    unfreeze_pids(batch.iter().copied());
-                    // Remove from frozen_state only after actual SIGCONT —
-                    // crash before this point leaves PIDs in state for recovery.
+                    // A-B-A defense: lock frozen_guard first to read identity
+                    // (start_sec) before signalling. Crash before SIGCONT leaves
+                    // PIDs in frozen_state for recovery on restart (WAL semantics).
+                    // [Saltzer & Kaashoek 2009] §3.3 Complete Mediation.
                     {
                         let mut frozen_guard = state.frozen_state.lock_recover();
+                        let entries: std::collections::HashMap<u32, FrozenEntry> = batch
+                            .iter()
+                            .filter_map(|&pid| frozen_guard.get(&pid).map(|e| (pid, e.clone())))
+                            .collect();
+                        unfreeze_pids_verified(&entries);
                         for pid in &batch {
                             frozen_guard.remove(pid);
                         }
@@ -2119,7 +2125,12 @@ fn main() -> anyhow::Result<()> {
                 // The wake path (post-wake grace) already re-evaluates from scratch.
                 if sleep_notifier.will_sleep_pending() {
                     let mut frozen_guard = state.frozen_state.lock_recover();
-                    let count = unfreeze_pids(frozen_guard.keys().copied());
+                    // A-B-A defense: verify identity before SIGCONT.
+                    // Turbo PIDs are inserted into frozen_guard at freeze time,
+                    // so unfreeze_pids_verified covers both regular + turbo PIDs
+                    // in one pass — the separate turbo loop is redundant.
+                    // [Saltzer & Kaashoek 2009] §3.3 Complete Mediation.
+                    let count = unfreeze_pids_verified(&frozen_guard);
                     if count > 0 {
                         tracing::info!(
                             count,
@@ -2130,10 +2141,6 @@ fn main() -> anyhow::Result<()> {
                         frozen_guard.clear();
                         write_frozen_state(&frozen_state_path, &frozen_guard);
                         state.metrics.lock_recover().metrics.unfreezes_applied += count;
-                    }
-                    // Turbo frozen set: thaw those PIDs too.
-                    for pid in display_turbo.turbo_frozen_pids_snapshot() {
-                        let _ = unfreeze_pids(std::iter::once(pid));
                     }
                     display_turbo.clear_frozen();
                     sleep_notifier.acknowledge();
