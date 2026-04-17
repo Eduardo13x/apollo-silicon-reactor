@@ -191,6 +191,45 @@ pub fn apply_io_shaping(
     }
 }
 
+/// Pure mapping: per-process governor decision + foreground family + thermal
+/// state → target `SchedulingTier` (or `None` to skip the `task_for_pid`
+/// syscall entirely).
+///
+/// Extracted from `apply_qos_routing` so the QoS routing policy can be unit
+/// tested without needing a `SharedState`, `ProcessTree`, or `MachQoSManager`.
+/// Precedence is load-bearing and matches the production behavior:
+///   1. Thermal `force_ecores` demotes every non-foreground PID to Background.
+///   2. Foreground-family membership promotes to Foreground (tree cascade).
+///   3. Heuristic governor decision:
+///      - `Allow` + `ActiveForeground` → Foreground
+///      - `Allow` + other tiers        → None (skip no-op syscall)
+///      - `Throttle`                   → None (QoS not the tool for throttling)
+///      - `Freeze` | `Kill`            → Background
+fn decide_qos_tier(
+    decision: &ProcessDecision,
+    fg_family: &HashSet<u32>,
+    thermal_force_ecores: bool,
+) -> Option<SchedulingTier> {
+    if thermal_force_ecores && !fg_family.contains(&decision.pid) {
+        return Some(SchedulingTier::Background);
+    }
+    if fg_family.contains(&decision.pid) {
+        return Some(SchedulingTier::Foreground);
+    }
+    use apollo_optimizer::engine::adaptive_governor::GovernorDecision as GovDecision;
+    match decision.decision {
+        GovDecision::Allow => {
+            if decision.tier == ProcessTier::ActiveForeground {
+                Some(SchedulingTier::Foreground)
+            } else {
+                None
+            }
+        }
+        GovDecision::Throttle => None,
+        GovDecision::Freeze | GovDecision::Kill => Some(SchedulingTier::Background),
+    }
+}
+
 /// MachQoS routing: assign P-Cores / E-Cores based on heuristic decisions.
 ///
 /// Skips SIGSTOP'd processes and forces E-Cores for all non-foreground processes
@@ -231,34 +270,8 @@ pub fn apply_qos_routing(
                 && !interrupt_frozen.contains(&d.pid)
         })
         .filter_map(|decision| {
-            let tier = if thermal_action.force_ecores && !fg_family.contains(&decision.pid) {
-                // Thermal pre-throttle: route backgrounds to E-Cores at Phase2+ (85°C).
-                // Foreground app stays on P-Cores for responsiveness.
-                SchedulingTier::Background
-            } else if fg_family.contains(&decision.pid) {
-                // Process tree cascade: children of the foreground app
-                // get Foreground tier even if the heuristic didn't
-                // classify them as ActiveForeground by name alone.
-                SchedulingTier::Foreground
-            } else {
-                use apollo_optimizer::engine::adaptive_governor::GovernorDecision as GovDecision;
-                match decision.decision {
-                    GovDecision::Allow => {
-                        if decision.tier == ProcessTier::ActiveForeground {
-                            SchedulingTier::Foreground
-                        } else {
-                            // Normal/TASK_UNSPECIFIED is a no-op — skip the
-                            // syscall to avoid wasting task_for_pid on ~400
-                            // processes that either don't need changes or are
-                            // SIP-protected and always fail.
-                            return None;
-                        }
-                    }
-                    GovDecision::Throttle => return None,
-                    GovDecision::Freeze | GovDecision::Kill => SchedulingTier::Background,
-                }
-            };
-            Some((decision.pid, tier))
+            decide_qos_tier(decision, &fg_family, thermal_action.force_ecores)
+                .map(|tier| (decision.pid, tier))
         })
         .collect();
 
@@ -468,5 +481,87 @@ pub fn merge_cycle_metrics<'a>(
     // budget while the machine is idle.
     if !in_sleep && cycle_count % METRICS_DISK_WRITE_EVERY_N_CYCLES == 0 {
         write_metrics(metrics_path, &metrics_snapshot);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apollo_optimizer::engine::adaptive_governor::GovernorDecision as GovDecision;
+
+    fn decision(pid: u32, dec: GovDecision, tier: ProcessTier) -> ProcessDecision {
+        ProcessDecision {
+            pid,
+            name: format!("proc-{}", pid),
+            decision: dec,
+            tier,
+            utility_score: 0.5,
+            waste_score: 0.1,
+            reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn thermal_force_ecores_routes_non_fg_to_background() {
+        let fg: HashSet<u32> = HashSet::new();
+        let d = decision(42, GovDecision::Allow, ProcessTier::ActiveForeground);
+        // Even ActiveForeground gets demoted when thermal force_ecores fires
+        // AND the pid is not in the foreground family.
+        assert_eq!(decide_qos_tier(&d, &fg, true), Some(SchedulingTier::Background));
+    }
+
+    #[test]
+    fn thermal_force_ecores_keeps_fg_family_foreground() {
+        let mut fg = HashSet::new();
+        fg.insert(42);
+        let d = decision(42, GovDecision::Allow, ProcessTier::SilentDaemon);
+        // Foreground family survives thermal demotion — UI responsiveness wins.
+        assert_eq!(decide_qos_tier(&d, &fg, true), Some(SchedulingTier::Foreground));
+    }
+
+    #[test]
+    fn fg_family_overrides_governor_decision() {
+        let mut fg = HashSet::new();
+        fg.insert(7);
+        // Even Throttle (which would otherwise map to None) is ignored for
+        // fg-family members; tree cascade promotes to Foreground.
+        let d = decision(7, GovDecision::Throttle, ProcessTier::SilentDaemon);
+        assert_eq!(decide_qos_tier(&d, &fg, false), Some(SchedulingTier::Foreground));
+    }
+
+    #[test]
+    fn allow_active_foreground_maps_to_foreground() {
+        let fg: HashSet<u32> = HashSet::new();
+        let d = decision(100, GovDecision::Allow, ProcessTier::ActiveForeground);
+        assert_eq!(decide_qos_tier(&d, &fg, false), Some(SchedulingTier::Foreground));
+    }
+
+    #[test]
+    fn allow_non_active_foreground_is_noop() {
+        let fg: HashSet<u32> = HashSet::new();
+        // Allow + non-ActiveForeground → None (skip task_for_pid syscall that
+        // would otherwise fail SIP-protected and waste ~400 calls/cycle).
+        let d = decision(100, GovDecision::Allow, ProcessTier::SilentDaemon);
+        assert_eq!(decide_qos_tier(&d, &fg, false), None);
+        let d = decision(101, GovDecision::Allow, ProcessTier::SystemEssential);
+        assert_eq!(decide_qos_tier(&d, &fg, false), None);
+    }
+
+    #[test]
+    fn throttle_skips_qos_routing() {
+        let fg: HashSet<u32> = HashSet::new();
+        // Throttle is handled via renice, not QoS tier — return None so the
+        // caller doesn't fight itself by also demoting via MachQoS.
+        let d = decision(200, GovDecision::Throttle, ProcessTier::SilentDaemon);
+        assert_eq!(decide_qos_tier(&d, &fg, false), None);
+    }
+
+    #[test]
+    fn freeze_and_kill_route_to_background() {
+        let fg: HashSet<u32> = HashSet::new();
+        let d = decision(300, GovDecision::Freeze, ProcessTier::SilentDaemon);
+        assert_eq!(decide_qos_tier(&d, &fg, false), Some(SchedulingTier::Background));
+        let d = decision(301, GovDecision::Kill, ProcessTier::SilentDaemon);
+        assert_eq!(decide_qos_tier(&d, &fg, false), Some(SchedulingTier::Background));
     }
 }
