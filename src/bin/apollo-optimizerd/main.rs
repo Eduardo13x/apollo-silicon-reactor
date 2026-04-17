@@ -1146,15 +1146,29 @@ fn main() -> anyhow::Result<()> {
             let mut llm_detector =
                 apollo_optimizer::engine::llm_inference_mode::LlmInferenceDetector::new();
             let mut llm_spotlight_disabled = false;
-            let mut spotlight_paused: bool = false;
-            let mut spotlight_paused_at: Option<Instant> = None;
-            // Defensive restore: if a previous daemon run left Spotlight
-            // disabled, re-enable on startup so indexing can resume. The
-            // regular pressure-gate at the bottom of the main loop
-            // (mem>=0.75 && swap>=1.5GB) will re-disable if a reindex storm
-            // actually materialises. User preference: keep Spotlight on.
+            // Read last saved metrics to decide startup Spotlight state.
+            // Blind re-enable caused oscillation: mds spins up → pressure
+            // rises back above 0.75 → disable → loop [Nygard 2018 §4].
+            // Use the same calm-threshold as the re-enable gate (p<0.35 + swap<1GB).
+            let (startup_pressure, startup_swap_gb): (f64, f64) =
+                std::fs::read_to_string(
+                    apollo_optimizer::engine::daemon_helpers::metrics_path(),
+                )
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .map(|v| {
+                    let p = v["memory_pressure"].as_f64().unwrap_or(1.0);
+                    let swap = v["swap_used_bytes"].as_f64().unwrap_or(0.0)
+                        / (1024.0 * 1024.0 * 1024.0);
+                    (p, swap)
+                })
+                .unwrap_or((1.0, 0.0));
+            let startup_calm = startup_pressure < 0.35 && startup_swap_gb < 1.0;
+            let mut spotlight_paused: bool = is_root && !startup_calm;
+            let mut spotlight_paused_at: Option<Instant> =
+                if spotlight_paused { Some(Instant::now()) } else { None };
             if is_root {
-                spotlight_set_indexing(true);
+                spotlight_set_indexing(startup_calm);
             }
 
             // ── Feature 3: RT Boost for Foreground ───────────────────────────
