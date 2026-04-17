@@ -1597,4 +1597,153 @@ mod tests {
             "THREAD_BASIC_INFO_COUNT must equal 10 to match the kernel ABI"
         );
     }
+
+    // ── analyze_threads: ThreadPattern classification ─────────────────
+    // These tests exercise the pure classification logic without FFI.
+    // analyze_threads populates hot/cold vecs only when prev_thread_cpu
+    // has a prior entry for the (pid, thread_idx) key — so "Saturated"
+    // and "IoBound" cases need two calls (first seeds deltas).
+
+    fn mk_thread(idx: u32, cpu_us: u64, cpu_raw: i32, running: bool) -> ThreadSnapshot {
+        ThreadSnapshot {
+            thread_index: idx,
+            user_time_us: cpu_us,
+            system_time_us: 0,
+            cpu_usage_raw: cpu_raw,
+            run_state: if running {
+                mach_sys::TH_STATE_RUNNING
+            } else {
+                mach_sys::TH_STATE_WAITING
+            },
+        }
+    }
+
+    #[test]
+    fn analyze_empty_returns_normal() {
+        let mut m = MachQoSManager::new();
+        let a = m.analyze_threads(1, &[]);
+        assert_eq!(a.pattern, ThreadPattern::Normal);
+        assert_eq!(a.thread_count, 0);
+        assert_eq!(a.active_count, 0);
+        assert!(a.hot.is_empty() && a.cold.is_empty());
+    }
+
+    #[test]
+    fn analyze_runaway_one_hot_rest_waiting() {
+        // 1 thread at >80% (raw=900), 3 waiting with low raw → Runaway.
+        // Does NOT require delta seeding: Runaway condition only reads raw + run_state.
+        let mut m = MachQoSManager::new();
+        let threads = vec![
+            mk_thread(0, 100_000, 900, true), // very hot
+            mk_thread(1, 0, 0, false),        // waiting
+            mk_thread(2, 0, 0, false),        // waiting
+            mk_thread(3, 0, 0, false),        // waiting
+        ];
+        let a = m.analyze_threads(42, &threads);
+        assert_eq!(a.pattern, ThreadPattern::Runaway);
+        assert_eq!(a.thread_count, 4);
+        assert_eq!(a.active_count, 1);
+    }
+
+    #[test]
+    fn analyze_saturated_most_hot() {
+        // All 4 threads hot → Saturated. Needs delta seeding (first call
+        // establishes baseline, second call sees delta > 50ms).
+        let mut m = MachQoSManager::new();
+        let baseline: Vec<_> = (0..4).map(|i| mk_thread(i, 0, 0, true)).collect();
+        let _ = m.analyze_threads(7, &baseline);
+        let hot: Vec<_> = (0..4)
+            .map(|i| mk_thread(i, 200_000, 100, true))
+            .collect(); // +200ms delta each
+        let a = m.analyze_threads(7, &hot);
+        assert_eq!(a.pattern, ThreadPattern::Saturated);
+        assert_eq!(a.hot.len(), 4);
+        assert_eq!(a.active_count, 4);
+    }
+
+    #[test]
+    fn analyze_iobound_most_cold() {
+        // 5 threads, all waiting with cpu_raw < 5 → IoBound.
+        let mut m = MachQoSManager::new();
+        let baseline: Vec<_> = (0..5).map(|i| mk_thread(i, 0, 0, false)).collect();
+        let _ = m.analyze_threads(9, &baseline);
+        let cold: Vec<_> = (0..5).map(|i| mk_thread(i, 100, 1, false)).collect();
+        let a = m.analyze_threads(9, &cold);
+        assert_eq!(a.pattern, ThreadPattern::IoBound);
+        assert!(a.cold.len() >= 4, "expected ≥4 cold, got {}", a.cold.len());
+        assert_eq!(a.active_count, 0);
+    }
+
+    #[test]
+    fn analyze_normal_mixed_not_classified() {
+        // 4 threads: 1 hot, 1 cold, 2 in-between → neither runaway
+        // (needs 1 very_hot + ≥75% waiting) nor saturated/iobound → Normal.
+        let mut m = MachQoSManager::new();
+        let baseline = vec![
+            mk_thread(0, 0, 0, true),
+            mk_thread(1, 0, 0, true),
+            mk_thread(2, 0, 0, false),
+            mk_thread(3, 0, 0, false),
+        ];
+        let _ = m.analyze_threads(11, &baseline);
+        let mixed = vec![
+            mk_thread(0, 100_000, 60, true), // hot
+            mk_thread(1, 10_000, 20, true),  // not hot, not cold
+            mk_thread(2, 200, 10, false),    // not cold (raw≥5)
+            mk_thread(3, 50, 1, false),      // cold
+        ];
+        let a = m.analyze_threads(11, &mixed);
+        assert_eq!(a.pattern, ThreadPattern::Normal);
+    }
+
+    #[test]
+    fn analyze_invariant_hot_cold_disjoint() {
+        // hot and cold sets must never overlap (classifications are exclusive).
+        let mut m = MachQoSManager::new();
+        let baseline: Vec<_> = (0..6).map(|i| mk_thread(i, 0, 0, true)).collect();
+        let _ = m.analyze_threads(13, &baseline);
+        let next = vec![
+            mk_thread(0, 100_000, 100, true),
+            mk_thread(1, 100, 1, false),
+            mk_thread(2, 50_000, 60, true),
+            mk_thread(3, 200, 2, false),
+            mk_thread(4, 10, 0, false),
+            mk_thread(5, 0, 0, false),
+        ];
+        let a = m.analyze_threads(13, &next);
+        for h in &a.hot {
+            assert!(
+                !a.cold.contains(h),
+                "thread {} appears in both hot and cold",
+                h
+            );
+        }
+    }
+
+    #[test]
+    fn analyze_single_thread_is_normal() {
+        // thread_count < 2 → Normal regardless of state.
+        let mut m = MachQoSManager::new();
+        let t = vec![mk_thread(0, 500_000, 999, true)];
+        let a = m.analyze_threads(99, &t);
+        assert_eq!(a.pattern, ThreadPattern::Normal);
+        assert_eq!(a.thread_count, 1);
+    }
+
+    #[test]
+    fn classify_threads_matches_analyze() {
+        // classify_threads is a thin wrapper — results must align with analyze_threads.
+        let mut m = MachQoSManager::new();
+        let baseline: Vec<_> = (0..3).map(|i| mk_thread(i, 0, 0, true)).collect();
+        let _ = m.analyze_threads(21, &baseline);
+        let next = vec![
+            mk_thread(0, 200_000, 100, true),
+            mk_thread(1, 0, 0, false),
+            mk_thread(2, 0, 1, false),
+        ];
+        let a = m.analyze_threads(21, &next);
+        let (hot, cold) = m.classify_threads(21, &next);
+        assert_eq!(hot, a.hot);
+        assert_eq!(cold, a.cold);
+    }
 }
