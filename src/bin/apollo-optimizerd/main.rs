@@ -4689,9 +4689,10 @@ fn main() -> anyhow::Result<()> {
                             );
                             spotlight_paused = true;
                             spotlight_paused_at = Some(Instant::now());
-                        } else if spotlight_paused && mem_p < 0.40
+                        } else if spotlight_paused && mem_p < 0.35
+                            && swap_gb < 1.0
                             && spotlight_paused_at
-                                .map(|t| t.elapsed() >= Duration::from_secs(120))
+                                .map(|t| t.elapsed() >= Duration::from_secs(300))
                                 .unwrap_or(true)
                         {
                             actions.push(
