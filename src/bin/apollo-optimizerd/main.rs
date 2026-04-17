@@ -1372,6 +1372,16 @@ fn main() -> anyhow::Result<()> {
                 };
 
             let mut decision_stage = DecisionStage::new();
+            // LlmConfig live-reload: polls /etc/apollo-optimizer/config.toml every 100
+            // cycles for mtime changes, applies whitelisted diffs only.
+            // Guard: only reload when pending_trial_skill.is_none() to prevent
+            // corrupting BUG-01 WAL outcome attribution during an active experiment.
+            // [Gray & Reuter 1992 §11 — stable params during causal observation window]
+            let mut llm_cfg_reloader =
+                apollo_optimizer::engine::config_reloader::LlmConfigReloader::new(
+                    PathBuf::from("/etc/apollo-optimizer/config.toml"),
+                    pending_trial_path(is_root),
+                );
 
             loop {
                 // Check both: Arc flag (set by ctrlc) and static flag (set by SIGTERM handler).
@@ -6623,6 +6633,23 @@ fn main() -> anyhow::Result<()> {
                     )
                 };
                 prev_cog_decision = Some(cog_decision);
+                // LlmConfig live-reload: whitelisted fields only; skip if trial active
+                // to avoid corrupting GemmaTrust outcome attribution. [Gray & Reuter 1992]
+                if cycle_count % 100 == 0 && pending_trial_skill.is_none() {
+                    use apollo_optimizer::engine::pipeline::periodic_stage::maybe_reload_llm_config;
+                    let current_cfg = state.llm.lock_recover().llm_cfg.clone();
+                    if let Some(outcome) =
+                        maybe_reload_llm_config(cycle_count, &mut llm_cfg_reloader, &current_cfg)
+                    {
+                        if let Some(new_cfg) = outcome.new_cfg {
+                            state.llm.lock_recover().llm_cfg = new_cfg;
+                            tracing::info!("llm config live-reloaded from disk");
+                        }
+                        for rejected in &outcome.rejected {
+                            tracing::warn!(field = %rejected.field, "llm config reload: field rejected (not in whitelist)");
+                        }
+                    }
+                }
                 // Autonomous rule induction: mine experience memory + co-occurrence
                 // graph for new skills every 100 cycles (~50s).  No human needed —
                 // Apollo crystallizes its own observations into reusable rules.
