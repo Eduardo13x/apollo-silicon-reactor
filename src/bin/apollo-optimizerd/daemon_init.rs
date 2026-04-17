@@ -125,3 +125,23 @@ impl DaemonSubsystems {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_hw_caps_sane() {
+        let (cores, ram_gb) = detect_hw_caps();
+        assert!(cores >= 1, "cores must be >= 1, got {cores}");
+        assert!(ram_gb >= 1.0, "ram_gb must be >= 1.0, got {ram_gb}");
+    }
+
+    #[test]
+    fn daemon_subsystems_constructs_without_panic() {
+        // Characterization test: every field in DaemonSubsystems::new() must construct
+        // without panicking regardless of filesystem state (missing hop_groups / skills
+        // files are silently tolerated by the loaders). [Feathers 2004 §11]
+        let _ = DaemonSubsystems::new();
+    }
+}
