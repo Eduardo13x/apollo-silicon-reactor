@@ -237,6 +237,35 @@ run_autoresearch() {
     elif [ "$AR_SCORE" -ge 50 ]; then AR_VERDICT="NEEDS WORK"
     else AR_VERDICT="UNSTABLE"; fi
 
+    # ── AdversarialProbe gate ────────────────────────────────────────────────
+    # If the daemon's self-probing has tripped a safety alert (pass_rate <
+    # 0.75 after adversarial scenarios — Madry 2018 ICLR) the deploy is
+    # NOT safe regardless of the surface score. A passing build that
+    # silently violates invariants is worse than a failed one, so force
+    # the verdict to UNSAFE and slash the score in half so curriculum
+    # level cannot LEVEL UP on a broken deploy.
+    local AR_ADV_RATE AR_ADV_ALERT AR_ADV_RATE_PCT
+    AR_ADV_RATE=$(echo "$AR_FINAL" | grep -oE '"adversarial_pass_rate": [0-9.]+' | grep -oE '[0-9.]+' | head -1)
+    AR_ADV_ALERT=$(echo "$AR_FINAL" | grep -oE '"adversarial_safety_alert": (true|false)' | grep -oE '(true|false)' | head -1)
+    if [ -z "$AR_ADV_RATE" ] && [ -z "$AR_ADV_ALERT" ]; then
+        # No probe data yet (daemon just booted — probes run every 500
+        # cycles, ~4min at 500ms cadence). Skip the gate to avoid false
+        # UNSAFE verdicts on fresh deploys; the next autoresearch cycle
+        # will see data.
+        write_report "ADVERSARIAL: n/a (no probe data yet — daemon too fresh)"
+    else
+        AR_ADV_RATE="${AR_ADV_RATE:-1}"
+        AR_ADV_ALERT="${AR_ADV_ALERT:-false}"
+        AR_ADV_RATE_PCT=$(echo "$AR_ADV_RATE" | awk '{ printf "%d", $1 * 100 }')
+        if [ "$AR_ADV_ALERT" = "true" ] || [ "${AR_ADV_RATE_PCT:-100}" -lt 75 ]; then
+            write_report "ADVERSARIAL: FAIL (pass_rate=${AR_ADV_RATE}, alert=${AR_ADV_ALERT}) — deploy UNSAFE"
+            AR_VERDICT="UNSAFE"
+            AR_SCORE=$((AR_SCORE / 2))
+        else
+            write_report "ADVERSARIAL: OK (pass_rate=${AR_ADV_RATE}, alert=${AR_ADV_ALERT})"
+        fi
+    fi
+
     write_report "STABILITY: $AR_STAB/25 (cycles=$AR_DELTA, expected=$AR_EXPECTED, hang=$AR_HANG)"
     write_report "EFFICIENCY: $AR_EFF/20 (avg=${AR_AVG}ms, max=${AR_MAX_MS}ms)"
     write_report "FLUIDITY: $AR_FLUID/15 (ok=$AR_CTL_OK, fail=$AR_CTL_FAIL)"
