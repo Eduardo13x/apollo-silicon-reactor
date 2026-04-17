@@ -82,7 +82,43 @@ impl ProfileGovernor {
         }
     }
 
-    pub fn from_persisted(p: GovernorPersisted) -> Self {
+    pub fn from_persisted(mut p: GovernorPersisted) -> Self {
+        // Startup sanity: clear stale persisted state that would otherwise
+        // silently block auto-management.
+        //
+        // 1. Expired manual_override — if the override deadline already passed,
+        //    it has no semantic effect at decide-time but (a) confuses operators
+        //    inspecting governor_state.json and (b) can leave auto_profile_enabled
+        //    disabled under the mistaken assumption that the override is still
+        //    steering. Clear it.
+        // 2. Ancient cooldown_until — prod observation 2026-04-16: cooldown_until
+        //    was frozen at 2026-04-07 (9 days stale). Harmless at runtime
+        //    (in_cooldown compares to now) but pollutes diagnostics. Clear any
+        //    cooldown whose deadline already passed.
+        // 3. auto_profile_enabled re-enable — if auto was disabled solely because
+        //    a manual override was taking over, clearing the override means we
+        //    should resume auto management. Re-enable unless the persisted state
+        //    was explicitly without a pending override when disabled (i.e. user
+        //    asked for manual mode deliberately).
+        let now = Utc::now();
+        let had_expired_override = p
+            .manual_override
+            .as_ref()
+            .map(|o| o.expires_at <= now)
+            .unwrap_or(false);
+        if had_expired_override {
+            p.manual_override = None;
+            if !p.auto_profile_enabled {
+                // Auto was off solely because the override was active; resume auto.
+                p.auto_profile_enabled = true;
+            }
+        }
+        if let Some(t) = p.governor_state.cooldown_until {
+            if t <= now {
+                p.governor_state.cooldown_until = None;
+            }
+        }
+
         Self {
             auto_profile_enabled: p.auto_profile_enabled,
             base_profile: p.base_profile,
