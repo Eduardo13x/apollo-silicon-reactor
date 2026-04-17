@@ -1114,6 +1114,28 @@ pub struct RuntimeMetrics {
     /// "memory_bandwidth", "llm_workload", etc.). "none" = no active boosts.
     #[serde(default)]
     pub pressure_dominant_factor: String,
+
+    // ── Apollo Intelligence Score (AIS) — composite quality metric ─────
+    // Computed every AIS_COMPUTE_EVERY_N_CYCLES (~60s) in merge_cycle_metrics.
+    // See engine::intelligence_score for dimension formulas.
+    #[serde(default)]
+    pub ais_score: f64,
+    #[serde(default)]
+    pub ais_grade: String,
+    #[serde(default)]
+    pub ais_decision: f64,
+    #[serde(default)]
+    pub ais_signal: f64,
+    #[serde(default)]
+    pub ais_learning: f64,
+    #[serde(default)]
+    pub ais_resource: f64,
+    #[serde(default)]
+    pub ais_safety: f64,
+    #[serde(default)]
+    pub ais_adaptability: f64,
+    #[serde(default)]
+    pub ais_pareto_balanced: bool,
 }
 
 /// Serializable foreground app info for the protocol/dashboard.

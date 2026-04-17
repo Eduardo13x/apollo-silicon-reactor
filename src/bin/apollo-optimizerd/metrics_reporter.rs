@@ -294,6 +294,11 @@ pub fn apply_qos_routing(
 /// Writing every 25 cycles (~7.5s) reduces disk I/O by 25x.
 const METRICS_DISK_WRITE_EVERY_N_CYCLES: u64 = 25;
 
+/// How often to recompute the Apollo Intelligence Score. 120 cycles ≈ 60s
+/// at the 500ms daemon cadence — cheap (reads 4 state files, no compute)
+/// but not tight enough to dominate I/O.
+const AIS_COMPUTE_EVERY_N_CYCLES: u64 = 120;
+
 /// Phase 3: Merge execution outcomes into metrics, update cycle timing, write to disk.
 ///
 /// Acquires `state.metrics` once, merges all `exec_outcomes` counters, records
@@ -322,6 +327,13 @@ pub fn merge_cycle_metrics<'a>(
     cycle_count: u64,
     in_sleep: bool,
 ) {
+    // Compute AIS off the hot path — reads 4 state files, never holds metrics lock.
+    let ais_snapshot = if cycle_count % AIS_COMPUTE_EVERY_N_CYCLES == 0 {
+        apollo_optimizer::engine::intelligence_score::compute_runtime_ais()
+    } else {
+        None
+    };
+
     let mut metrics = state.metrics.lock_recover();
     metrics.metrics.boosts_applied += exec_outcomes.boosts_applied;
     metrics.metrics.throttles_applied += exec_outcomes.throttles_applied;
@@ -429,6 +441,19 @@ pub fn merge_cycle_metrics<'a>(
         metrics.metrics.rl_adjustment_pp = (rl.current_adjustment * 100.0).round() as i32;
         metrics.metrics.rl_total_ticks = rl.total_ticks();
         metrics.metrics.rl_total_overflows = rl.total_overflows();
+    }
+
+    // Populate AIS fields (computed before the lock was taken).
+    if let Some(s) = ais_snapshot {
+        metrics.metrics.ais_score = s.total;
+        metrics.metrics.ais_grade = s.grade.to_string();
+        metrics.metrics.ais_decision = s.decision_precision;
+        metrics.metrics.ais_signal = s.signal_quality;
+        metrics.metrics.ais_learning = s.learning_velocity;
+        metrics.metrics.ais_resource = s.resource_efficiency;
+        metrics.metrics.ais_safety = s.safety_compliance;
+        metrics.metrics.ais_adaptability = s.adaptability;
+        metrics.metrics.ais_pareto_balanced = s.pareto_balanced;
     }
 
     // Clone before releasing lock — write_metrics does file I/O
