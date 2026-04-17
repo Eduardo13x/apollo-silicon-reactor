@@ -973,6 +973,11 @@ pub fn decide_actions(
                 // memory-heavy background app (zoom.us, Figma, Electron apps)
                 // now qualifies. Protection stack in execute_actions still applies.
                 let protected = crate::engine::safety::protected_processes();
+                let softly_protected = crate::engine::safety::softly_protected_processes();
+                let survival_mode = crate::engine::safety::survival_mode_active(
+                    snapshot.pressure.memory_pressure,
+                    snapshot.pressure.swap_used_bytes,
+                );
                 let mut freeze_candidates: Vec<(u32, String, u64, f32, u64)> = sys
                     .processes()
                     .iter()
@@ -991,6 +996,12 @@ pub fn decide_actions(
                         // loginwindow downstream but sharingd was NOT protected and
                         // got frozen in a 19-hour loop. AirDrop/Handoff broken.
                         if protected.iter().any(|p| name.contains(p)) {
+                            return None;
+                        }
+                        // Softly-protected processes (LLM servers, etc.) lose protection
+                        // only in survival mode (≥0.85 pressure + ≥2GB swap).
+                        // [Nygard 2018] Load shedding: shed non-critical services before OOM.
+                        if !survival_mode && softly_protected.iter().any(|p| name.contains(p)) {
                             return None;
                         }
                         if is_interactive(&name, pid_u32) {

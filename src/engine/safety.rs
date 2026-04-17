@@ -421,14 +421,52 @@ pub fn infrastructure_processes() -> HashSet<&'static str> {
         "kafka",
         "zookeeper",
         "rabbitmq",
-        // LLM inference servers — freezing kills token generation mid-stream,
-        // causes client timeout, and post-thaw model reload spikes RAM.
-        "llama-server",
-        "ollama_llama_server",
-        "ollama",
+        // LLM inference servers — moved to softly_protected_processes().
+        // Unconditional protection removed: at survival pressure (≥0.85) these
+        // become freeze candidates. See softly_protected_processes().
     ]
     .into_iter()
     .collect()
+}
+
+/// Processes protected at NORMAL pressure but expendable at survival pressure
+/// (memory_pressure ≥ 0.85 AND swap_gb ≥ 2.0).
+///
+/// Tier philosophy [Nygard 2018 "Release It!" Ch.5 — Load Shedding]:
+///   Tier 0 (always protected): OS daemons, Claude, foreground app.
+///   Tier 1 (softly protected): AI model servers, background IDE helpers.
+///     Frozen only when the alternative is OOM reboot.
+///
+/// Adding a new model server: put it here, not in infrastructure_processes().
+/// It will be protected at healthy pressure but shedable in crisis.
+pub fn softly_protected_processes() -> HashSet<&'static str> {
+    [
+        // LLM inference servers — freezing kills token generation mid-stream
+        // at normal pressure. At ≥0.85 / 2GB swap the OOM risk outweighs
+        // a single interrupted inference call (caller retries on ECONNRESET).
+        "llama-server",
+        "ollama_llama_server",
+        "ollama",
+        "lm-studio",
+        "lmstudio",
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Survival pressure threshold above which softly_protected processes lose
+/// their protection and become freeze candidates.
+pub const SOFT_PROTECTION_PRESSURE_THRESHOLD: f64 = 0.85;
+
+/// Swap threshold (GB) that must ALSO be exceeded before soft protection drops.
+/// Prevents premature shedding on transient pressure spikes with healthy swap headroom.
+pub const SOFT_PROTECTION_SWAP_GB_THRESHOLD: f64 = 2.0;
+
+/// Returns true when conditions justify shedding softly_protected processes.
+#[inline]
+pub fn survival_mode_active(memory_pressure: f64, swap_used_bytes: u64) -> bool {
+    let swap_gb = swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    memory_pressure >= SOFT_PROTECTION_PRESSURE_THRESHOLD && swap_gb >= SOFT_PROTECTION_SWAP_GB_THRESHOLD
 }
 
 /// Dev runtime patterns: processes that MAY be doing useful work (web server,
@@ -1154,6 +1192,20 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn survival_mode_tiers() {
+        // Normal pressure: llama-server softly protected (not in freeze candidates)
+        assert!(!survival_mode_active(0.70, (1.5 * 1024.0 * 1024.0 * 1024.0) as u64));
+        // High pressure but low swap: still protected
+        assert!(!survival_mode_active(0.90, (1.0 * 1024.0 * 1024.0 * 1024.0) as u64));
+        // Survival: both thresholds crossed → shed soft protection
+        assert!(survival_mode_active(0.85, (2.0 * 1024.0 * 1024.0 * 1024.0) as u64));
+        assert!(survival_mode_active(0.95, (4.0 * 1024.0 * 1024.0 * 1024.0) as u64));
+        // llama-server in soft list, not hard list
+        assert!(!protected_processes().contains("llama-server"));
+        assert!(softly_protected_processes().contains("llama-server"));
     }
 
     /// The hard-protected fast path (OnceLock) must agree with the full set.
