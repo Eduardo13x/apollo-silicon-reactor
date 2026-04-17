@@ -42,7 +42,14 @@ pub enum SystemEvent {
 ///
 /// [Nygard 2018] "Release It!" Ch.5 — adjacent subsystems going silent are
 /// as informative as error responses; detect them as first-class signals.
-pub const PLATFORM_UNHEALTHY_FAIL_THRESHOLD: u32 = 3;
+pub const PLATFORM_UNHEALTHY_FAIL_THRESHOLD: u32 = 5;
+
+/// Hysteresis: after the unhealthy flag is raised, require this many consecutive
+/// successful queries before flipping it back to healthy. Without it, logd that
+/// flaps (common on M1 8GB under sustained memory pressure) produces a constant
+/// stream of alternating degraded/recovered log lines. [Nygard 2018 Ch.5 —
+/// circuit-breaker half-open state requires repeated success before closing].
+pub const PLATFORM_HEALTHY_SUCCESS_THRESHOLD: u32 = 5;
 
 /// Ingester that periodically queries macOS system logs.
 pub struct SystemLogIngester {
@@ -63,6 +70,11 @@ pub struct SystemLogIngester {
     receiver: Option<mpsc::Receiver<Option<Vec<SystemEvent>>>>,
     /// Consecutive `log show` query failures. Reset on any success.
     consecutive_query_failures: u32,
+    /// Consecutive successes accumulated while `platform_unhealthy = true`.
+    /// Required to cross `PLATFORM_HEALTHY_SUCCESS_THRESHOLD` before flipping
+    /// back to healthy. Silences the degraded/recovered flapping observed in
+    /// prod (2026-04-16 err log, 11h window, ~20 pairs).
+    consecutive_successes_while_unhealthy: u32,
     /// Sticky "platform unhealthy" flag. Set when consecutive failures cross
     /// `PLATFORM_UNHEALTHY_FAIL_THRESHOLD`; cleared on the first success after
     /// the flag was raised (and a single-line stderr transition is logged on
@@ -83,6 +95,7 @@ impl SystemLogIngester {
             total_crash_events: 0,
             receiver: None,
             consecutive_query_failures: 0,
+            consecutive_successes_while_unhealthy: 0,
             platform_unhealthy: false,
         }
     }
@@ -104,8 +117,16 @@ impl SystemLogIngester {
     fn record_query_success(&mut self) {
         self.consecutive_query_failures = 0;
         if self.platform_unhealthy {
-            eprintln!("[log_ingester] platform log subsystem recovered (`log show` succeeded)");
-            self.platform_unhealthy = false;
+            self.consecutive_successes_while_unhealthy =
+                self.consecutive_successes_while_unhealthy.saturating_add(1);
+            if self.consecutive_successes_while_unhealthy >= PLATFORM_HEALTHY_SUCCESS_THRESHOLD {
+                eprintln!(
+                    "[log_ingester] platform log subsystem recovered ({} consecutive `log show` successes)",
+                    self.consecutive_successes_while_unhealthy
+                );
+                self.platform_unhealthy = false;
+                self.consecutive_successes_while_unhealthy = 0;
+            }
         }
     }
 
@@ -114,6 +135,7 @@ impl SystemLogIngester {
     /// crosses `PLATFORM_UNHEALTHY_FAIL_THRESHOLD`.
     fn record_query_failure(&mut self) {
         self.consecutive_query_failures = self.consecutive_query_failures.saturating_add(1);
+        self.consecutive_successes_while_unhealthy = 0;
         if !self.platform_unhealthy
             && self.consecutive_query_failures >= PLATFORM_UNHEALTHY_FAIL_THRESHOLD
         {
@@ -457,15 +479,50 @@ mod tests {
     }
 
     #[test]
-    fn platform_unhealthy_clears_after_success() {
+    fn platform_unhealthy_clears_after_sustained_success_hysteresis() {
         let mut ing = SystemLogIngester::new();
-        for _ in 0..5 {
+        for _ in 0..PLATFORM_UNHEALTHY_FAIL_THRESHOLD {
             ing.record_query_failure();
         }
         assert!(ing.is_platform_unhealthy());
+        // A single success MUST NOT flip back (hysteresis silences flapping).
         ing.record_query_success();
+        assert!(
+            ing.is_platform_unhealthy(),
+            "hysteresis: one success must not clear unhealthy"
+        );
+        // Need PLATFORM_HEALTHY_SUCCESS_THRESHOLD total successes (already have 1).
+        for _ in 1..PLATFORM_HEALTHY_SUCCESS_THRESHOLD {
+            ing.record_query_success();
+        }
         assert!(!ing.is_platform_unhealthy());
         assert_eq!(ing.consecutive_query_failures(), 0);
+    }
+
+    #[test]
+    fn hysteresis_resets_on_any_failure_during_recovery() {
+        let mut ing = SystemLogIngester::new();
+        for _ in 0..PLATFORM_UNHEALTHY_FAIL_THRESHOLD {
+            ing.record_query_failure();
+        }
+        assert!(ing.is_platform_unhealthy());
+        // Accumulate successes but short of threshold, then a single failure
+        // resets the recovery counter — flag stays unhealthy.
+        for _ in 0..(PLATFORM_HEALTHY_SUCCESS_THRESHOLD - 1) {
+            ing.record_query_success();
+        }
+        ing.record_query_failure();
+        assert!(ing.is_platform_unhealthy());
+        // Recovery must now accumulate a full threshold run again.
+        for _ in 0..(PLATFORM_HEALTHY_SUCCESS_THRESHOLD - 1) {
+            ing.record_query_success();
+        }
+        assert!(
+            ing.is_platform_unhealthy(),
+            "recovery counter reset — still unhealthy after partial run"
+        );
+        ing.record_query_success();
+        assert!(!ing.is_platform_unhealthy());
     }
 
     #[test]
