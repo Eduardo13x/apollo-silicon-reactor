@@ -5623,11 +5623,14 @@ fn main() -> anyhow::Result<()> {
                 // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
                 // Set to false to re-enable Chromium renderer freezing.
                 const CHROMIUM_FREEZE_DISABLED: bool = true;
-                if !CHROMIUM_FREEZE_DISABLED {
-                    use apollo_optimizer::engine::chromium_manager::ChromiumAction;
 
-                    // FocusMarkov context: top-5 predictions + elapsed dwell time.
-                    // [Altmann & Trafton 2002] Pre-thaw browsers predicted as next switch.
+                // Always update renderer inventory for observability — decoupled from
+                // action execution. [Jones 2011] observability must not be gated behind
+                // actuation flags: metrics should reflect reality even when freeze is off.
+                {
+                    // Context setters prime thresholds used by update()'s freeze logic.
+                    // Run unconditionally so state is warm when CHROMIUM_FREEZE_DISABLED
+                    // is later set to false.
                     {
                         let preds: Vec<(String, f64, f64)> = focus_markov
                             .predict_top_n(foreground_app.as_deref().unwrap_or(""), 5)
@@ -5637,37 +5640,19 @@ fn main() -> anyhow::Result<()> {
                         let elapsed = focus_markov.elapsed_dwell_secs();
                         chromium_mgr.set_markov_context(&preds, elapsed);
                     }
-
-                    // Pressure-adaptive aggressiveness — use Kalman-filtered signal
-                    // so kqueue Critical events and trend are already incorporated.
-                    // BUG #1 fix: was using raw memory_pressure; use pressure_smooth instead.
                     chromium_mgr.set_pressure_context(signal_digest.pressure_smooth as f32);
-                    // Arousal-adaptive aggressiveness [Yerkes-Dodson 1908]
-                    // Override pressure thresholds with arousal-based ones when
-                    // arousal signal is available — crisis arousal freezes faster,
-                    // idle arousal thaws everything.
                     chromium_mgr.set_arousal_context(arousal_state.level);
-                    // Build preemption: when the user is in a build session,
-                    // force maximum freeze aggressiveness on background
-                    // renderers BEFORE rustc/cargo/clang demand RAM. This is
-                    // what prevents OOM-driven reboots on 8GB systems: bulkhead
-                    // renderer memory from build memory.
                     chromium_mgr
                         .set_build_preemption(win_workload_intent == WorkloadIntent::BuildSession);
-                    // Pause freeze decisions during window ops / app launches
                     chromium_mgr.set_fluidity_context(
                         fluidity_state.window_op_active(),
                         fluidity_state.launch_active,
                     );
 
-                    // Build assertion PID set from existing frozen/active tracking
                     let chromium_assertion_pids =
                         apollo_optimizer::engine::activity_sensor::pids_with_assertions();
-
-                    // Current main-daemon frozen set (don't interfere)
                     let main_frozen_set: HashSet<u32> =
                         state.frozen_state.lock_recover().keys().copied().collect();
-
                     let proc_list: Vec<(u32, &str, f32, u64)> = proc_snaps
                         .iter()
                         .map(|p| (p.pid, p.name.as_str(), p.cpu_percent, p.rss_bytes))
@@ -5680,6 +5665,19 @@ fn main() -> anyhow::Result<()> {
                         &main_frozen_set,
                     );
 
+                    // Metrics always populated — renderer count visible even with freeze off.
+                    {
+                        let cm = chromium_mgr.metrics();
+                        let mut m = state.metrics.lock_recover();
+                        m.metrics.chromium_renderers_total = cm.total_renderers;
+                        m.metrics.chromium_renderers_frozen = cm.frozen_renderers;
+                        m.metrics.chromium_renderers_ecore = cm.ecore_renderers;
+                        m.metrics.chromium_freed_mb = cm.estimated_freed_mb;
+                        m.metrics.chromium_browsers_managed = cm.browsers_managed;
+                    }
+
+                    if !CHROMIUM_FREEZE_DISABLED {
+                    use apollo_optimizer::engine::chromium_manager::ChromiumAction;
                     // Execute chromium actions
                     for action in &chromium_actions {
                         match action {
@@ -5763,16 +5761,7 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    // Update chromium metrics in RuntimeMetrics
-                    {
-                        let cm = chromium_mgr.metrics();
-                        let mut m = state.metrics.lock_recover();
-                        m.metrics.chromium_renderers_total = cm.total_renderers;
-                        m.metrics.chromium_renderers_frozen = cm.frozen_renderers;
-                        m.metrics.chromium_renderers_ecore = cm.ecore_renderers;
-                        m.metrics.chromium_freed_mb = cm.estimated_freed_mb;
-                        m.metrics.chromium_browsers_managed = cm.browsers_managed;
-                    }
+                    } // if !CHROMIUM_FREEZE_DISABLED
                 }
 
                 let policy = SafetyPolicy::for_capabilities(
