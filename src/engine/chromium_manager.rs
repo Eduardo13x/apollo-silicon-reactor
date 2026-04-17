@@ -2126,12 +2126,14 @@ mod tests {
         );
     }
 
-    /// Iter 3: build preemption freezes background renderers after 1 idle cycle.
-    /// When workload is BuildSession the daemon calls set_build_preemption(true),
-    /// which makes the freeze gate treat `idle_cycles_required = 1`. This
-    /// pre-sheds renderer memory BEFORE rustc starts competing for RAM.
+    /// Iter 3: build preemption freezes background renderers once the
+    /// `NEW_RENDERER_GRACE_CYCLES` window (~10 cycles / ~1 s) elapses, even at
+    /// low pressure + normal arousal where `idle_cycles_required` would
+    /// otherwise be 5. When workload is BuildSession the daemon calls
+    /// `set_build_preemption(true)`, which the freeze gate enforces as a 2-cycle
+    /// idle floor — pre-sheds renderer memory BEFORE rustc spikes.
     #[test]
-    fn build_preemption_freezes_after_single_idle_cycle() {
+    fn build_preemption_freezes_after_grace_period() {
         let mut mgr = ChromiumManager::new();
         let none_set: HashSet<u32> = HashSet::new();
         // Low pressure + normal arousal → idle_cycles_required would be 5/3.
@@ -2144,21 +2146,29 @@ mod tests {
             (901, "Brave Browser Helper (Renderer)", 0.1, 150_000_000),
             (902, "Brave Browser Helper (Renderer)", 0.1, 150_000_000),
         ];
-        // Only 2 cycles — far below LONG_IDLE_CYCLES (30) and pressure gate (2).
-        mgr.update(&procs, None, &none_set, &none_set);
-        mgr.update(&procs, None, &none_set, &none_set);
+        // Must clear NEW_RENDERER_GRACE_CYCLES (= 10) in chromium_manager.rs
+        // before the freeze gate even considers a renderer. Run 11 idle cycles
+        // so age_cycles > 10 AND consecutive_idle_cycles >= build_preemption
+        // effective_required (2). Still far below LONG_IDLE_CYCLES (30), so
+        // the kept freeze is attributable to the preemption path alone.
+        for _ in 0..11 {
+            mgr.update(&procs, None, &none_set, &none_set);
+        }
 
         assert!(
             mgr.frozen_pids.contains(&901) || mgr.frozen_pids.contains(&902),
-            "build preemption must freeze a background renderer within 2 cycles (frozen_pids={:?})",
+            "build preemption must freeze a background renderer once the new-renderer grace period clears (frozen_pids={:?})",
             mgr.frozen_pids
         );
     }
 
-    /// Iter 3: build preemption does NOT fire when not set, at low pressure.
-    /// Regression guard: the preemption must be opt-in, not a silent default.
+    /// Iter 3: at high arousal (≥ 0.75) the pressure/arousal gate alone
+    /// triggers a freeze once the new-renderer grace period clears — no build
+    /// preemption flag needed. Documents that the preemption API is additive:
+    /// it changes the *idle-cycles* threshold, not the grace-period or
+    /// opt-out semantics of the existing gate.
     #[test]
-    fn without_build_preemption_low_pressure_stays_conservative() {
+    fn without_build_preemption_high_arousal_freezes_after_grace_period() {
         let mut mgr = ChromiumManager::new();
         let none_set: HashSet<u32> = HashSet::new();
         mgr.set_pressure_context(0.25);
@@ -2169,18 +2179,15 @@ mod tests {
             (911, "Brave Browser Helper (Renderer)", 0.1, 150_000_000),
             (912, "Brave Browser Helper (Renderer)", 0.1, 150_000_000),
         ];
-        // Arousal 0.80 sets idle_cycles_required=1 already, so 2 cycles is enough.
-        // This test confirms the preemption flag alone is independent: we get
-        // the same behavior without the flag when arousal is already high.
-        mgr.update(&procs, None, &none_set, &none_set);
-        mgr.update(&procs, None, &none_set, &none_set);
-        let without_flag_freezes = mgr.frozen_pids.len();
-        // At arousal=0.80, idle_cycles_required=1 so freezes happen naturally.
-        // The preemption API is additive; this test just documents that without
-        // preemption, the system still relies on the pressure/arousal gates.
+        // 11 cycles clears NEW_RENDERER_GRACE_CYCLES (10) and satisfies
+        // idle_cycles_required=1 set by arousal=0.80.
+        for _ in 0..11 {
+            mgr.update(&procs, None, &none_set, &none_set);
+        }
         assert!(
-            without_flag_freezes >= 1,
-            "at arousal 0.80, freeze should fire via pressure/arousal gate"
+            !mgr.frozen_pids.is_empty(),
+            "at arousal 0.80 the pressure/arousal gate must fire after the grace period (frozen_pids={:?})",
+            mgr.frozen_pids
         );
     }
 
