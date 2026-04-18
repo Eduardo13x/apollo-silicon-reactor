@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 /// that the main loop checks alongside `state.stop`.
 mod cognitive_tick;
 mod daemon_init;
+mod daemon_turbo_manager;
 mod learning_tick;
 mod llm_daemon;
 mod metrics_reporter;
@@ -1739,118 +1740,18 @@ fn main() -> anyhow::Result<()> {
                 drop(process_guard);
 
                 // Display-Off Turbo: Android Doze-like power management.
-                // Battery-aware dwell: on battery shorten dwell to 2s so turbo activates
-                // faster → more aggressive power savings when user steps away.
-                display_turbo.set_dwell_secs(if power_mgr.is_on_battery() { 2 } else { 5 });
-
-                // When display is off for >5s (or 2s on battery), freeze all non-essential processes.
-                // On display-on, instantly unfreeze everything we froze.
-                {
-                    use apollo_optimizer::engine::display_turbo::TurboAction;
-                    match display_turbo.tick() {
-                        TurboAction::ActivateTurbo => {
-                            // Freeze non-essential background processes.
-                            let turbo_hard = protected_processes();
-                            let turbo_infra = infrastructure_processes();
-                            let policy_protected = state
-                                .policy
-                                .lock_recover()
-                                .learned_policy
-                                .protected_patterns
-                                .clone();
-                            let fg_pid = fg_detector.detect().pid();
-                            let mut frozen_guard = state.frozen_state.lock_recover();
-                            let mut turbo_frozen = 0u32;
-                            let max_freeze = display_turbo.max_freeze_count();
-
-                            for (pid, process) in collector.system().processes() {
-                                let pid_u32 = pid.as_u32();
-                                let name = process.name().to_string();
-                                // Never freeze: foreground, OS/infra/policy-protected,
-                                // dev runtimes (behavioral gate not available here),
-                                // or Apollo itself.
-                                let protection = classify_protection(
-                                    &name,
-                                    &turbo_hard,
-                                    &turbo_infra,
-                                    &policy_protected,
-                                    false,
-                                );
-                                if Some(pid_u32) == fg_pid
-                                    || protection != ProtectionLevel::Unprotected
-                                    || matches_dev_runtime(&name)
-                                    || name == "apollo-optimizerd"
-                                    || frozen_guard.contains_key(&pid_u32)
-                                {
-                                    continue;
-                                }
-                                if turbo_frozen as usize >= max_freeze {
-                                    break;
-                                }
-                                // SIGSTOP the process.
-                                if unsafe { libc::kill(pid_u32 as i32, libc::SIGSTOP) } == 0 {
-                                    display_turbo.record_turbo_freeze(pid_u32);
-                                    frozen_guard.insert(
-                                        pid_u32,
-                                        FrozenEntry {
-                                            frozen_at: Utc::now(),
-                                            source: FreezeSource::MainLoop,
-                                            pressure_at_freeze: pressure_collector
-                                                .latest()
-                                                .memory_pressure,
-                                            process_name: Some(name.clone()),
-                                            // A3: capture start_sec for identity check on unfreeze.
-                                            start_sec: apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid_u32)
-                                                .map(|pi| pi.start_sec)
-                                                .unwrap_or(0),
-                                            original_jetsam_priority: None,
-                                        },
-                                    );
-                                    turbo_frozen += 1;
-                                }
-                            }
-                            write_frozen_state(&frozen_state_path, &frozen_guard);
-                            drop(frozen_guard);
-                            state.metrics.lock_recover().metrics.freezes_applied +=
-                                turbo_frozen as u64;
-                        }
-                        TurboAction::DeactivateTurbo {
-                            unfreeze_pids: pids,
-                        } => {
-                            // A-B-A defense: verify PID identity before SIGCONT.
-                            // Lock frozen_guard first so we can read start_sec for
-                            // each PID before the signal. PIDs recycled between the
-                            // display-off freeze and the display-on thaw are skipped.
-                            // [Saltzer & Kaashoek 2009] §3.3 Complete Mediation.
-                            let mut frozen_guard = state.frozen_state.lock_recover();
-                            let entries_to_unfreeze: std::collections::HashMap<u32, FrozenEntry> = pids
-                                .iter()
-                                .filter_map(|&pid| {
-                                    frozen_guard.get(&pid).map(|e| (pid, e.clone()))
-                                })
-                                .collect();
-                            let unfreeze_count = unfreeze_pids_verified(&entries_to_unfreeze);
-                            for pid in &pids {
-                                frozen_guard.remove(pid);
-                            }
-                            write_frozen_state(&frozen_state_path, &frozen_guard);
-                            drop(frozen_guard);
-                            // Clear turbo internal state so stale PIDs don't
-                            // block re-freeze on next display-off cycle.
-                            display_turbo.clear_frozen();
-                            state.metrics.lock_recover().metrics.unfreezes_applied +=
-                                unfreeze_count;
-                            // Jank is recorded only when we ACTUALLY froze processes during turbo
-                            // (unfreeze_count > 0). Pure display on/off cycles with zero freezes
-                            // are normal user behavior, not jank events.
-                            // [Nielsen 1993] usability heuristics — count only user-perceptible impact.
-                            stability_oracle.record_display_jank(unfreeze_count > 0);
-                        }
-                        TurboAction::None => {
-                            stability_oracle.record_display_jank(false);
-                        }
-                    }
-                }
+                // Extracted to daemon_turbo_manager::run_turbo_tick().
+                // [Nygard 2018] bulkhead: bound blast radius of display state transitions.
+                daemon_turbo_manager::run_turbo_tick(
+                    &mut display_turbo,
+                    &state,
+                    &fg_detector,
+                    &collector,
+                    &pressure_collector,
+                    &frozen_state_path,
+                    &mut stability_oracle,
+                    power_mgr.is_on_battery(),
+                );
 
                 // Adaptive snapshot: use lightweight path (no disk/net refresh) every cycle
                 // except a full-refresh heartbeat every 30 cycles (~15s).
