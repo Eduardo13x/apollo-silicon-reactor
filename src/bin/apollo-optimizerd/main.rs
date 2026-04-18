@@ -5180,16 +5180,23 @@ fn main() -> anyhow::Result<()> {
                 // Observability: count one activation per cycle survival is active.
                 // Previously the counter was declared but never incremented, so
                 // survival_mode_activations was always 0 in runtime_metrics.json.
-                if apollo_optimizer::engine::safety::survival_mode_active_total(
+                let survival_active = apollo_optimizer::engine::safety::survival_mode_active_total(
                     snapshot.pressure.memory_pressure,
                     snapshot.pressure.swap_used_bytes,
                     snapshot.pressure.swap_total_bytes,
-                ) {
+                );
+                if survival_active {
                     state
                         .metrics
                         .lock_recover()
                         .metrics
                         .survival_mode_activations += 1;
+
+                    // Jetsam demotion: mark non-foreground Chromium renderers
+                    // as BACKGROUND so the kernel kills them first under OOM
+                    // pressure — softer than SIGSTOP, keeps them responsive
+                    // until the kernel actually reclaims. Idempotent syscall.
+                    let _ = chromium_mgr.demote_background_renderers();
                 }
 
                 // Decaimiento gradual: si el sistema está en calma, relajar thresholds.

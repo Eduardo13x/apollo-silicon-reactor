@@ -1069,6 +1069,35 @@ impl ChromiumManager {
         }
     }
 
+    /// Demote background (non-foreground, non-frozen) renderers to jetsam
+    /// BACKGROUND priority so the kernel kills them first under OOM instead
+    /// of interactive apps (Claude, Antigravity, Terminal).
+    ///
+    /// Called from the daemon when survival mode is active. Safer than SIGSTOP:
+    /// the renderer stays responsive for user input until the kernel actually
+    /// reclaims it. Idempotent — the kernel no-ops if priority is unchanged.
+    ///
+    /// Returns the number of demotion calls that succeeded.
+    pub fn demote_background_renderers(&self) -> u32 {
+        use crate::engine::jetsam_control;
+        let fg = self.prev_fg_browser.as_deref();
+        let mut demoted = 0u32;
+        for info in self.renderers.values() {
+            if info.frozen {
+                continue;
+            }
+            if Some(info.browser.as_str()) == fg {
+                continue;
+            }
+            if jetsam_control::set_priority(info.pid, jetsam_control::priority::BACKGROUND)
+                .is_ok()
+            {
+                demoted = demoted.saturating_add(1);
+            }
+        }
+        demoted
+    }
+
     /// SIGCONT all frozen renderers on daemon shutdown.
     /// Returns the list of PIDs that were thawed.
     pub fn shutdown_cleanup(&mut self) -> Vec<u32> {
