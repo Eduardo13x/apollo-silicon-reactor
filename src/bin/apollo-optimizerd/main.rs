@@ -15,6 +15,7 @@ mod daemon_cognitive_tick;
 mod daemon_feature_gates;
 mod daemon_freeze_executor;
 mod daemon_init;
+mod daemon_neuro_tick;
 mod daemon_pressure_aggregator;
 mod daemon_process_collector;
 mod daemon_sensor_tick;
@@ -79,7 +80,6 @@ use apollo_optimizer::engine::mach_qos::{MachQoSManager, SchedulingTier};
 use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
 use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
 use apollo_optimizer::engine::network_optimizer::NetworkProfile;
-use apollo_optimizer::engine::neuromodulator::NeuroSignals;
 use apollo_optimizer::engine::overflow_guard::{is_build_tool_name, OverflowGuard};
 use apollo_optimizer::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
@@ -4611,46 +4611,14 @@ fn main() -> anyhow::Result<()> {
                 );
 
                 // ── Neuromodulator: bio-inspired parameter modulation ────────
-                {
-                    let overflow_occurred = lctx.overflow_guard.history.total_overflows > 0;
-                    let neuro_signals = NeuroSignals {
-                        pressure_drop: signal_digest.pressure_smooth as f64 * -1.0
-                            * signal_digest.pressure_velocity,
-                        // Combine outcome-tracker RL penalty with stability oracle signal.
-                        // rl_penalty ∈ [-3, 0]; instability_penalty ∈ [0, 1] scaled by 0.5
-                        // → max additional penalty = -0.5, keeping the existing penalty
-                        // dominant while letting stability shape policy at the margin.
-                        // [Sutton & Barto 2018] §17.4 — reward shaping must preserve scale
-                        // hierarchy or it inverts the optimal policy.
-                        outcome_penalty: lctx.outcome_tracker.rl_penalty()
-                            - 0.5
-                                * stability_oracle.instability_penalty_attenuated(
-                                    apollo_optimizer::engine::daemon_helpers::system_uptime_secs(),
-                                ),
-                        overflow_occurred,
-                        urgency: signal_digest.urgency,
-                        regime_shift_up: signal_digest.regime_shift_up,
-                        pressure_velocity: signal_digest.pressure_velocity,
-                        thermal_emergency: thermal_action.phase
-                            >= apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase2Moderate,
-                        pressure_smooth: signal_digest.pressure_smooth as f64,
-                        regime_shift_down: signal_digest.regime_shift_down,
-                        process_count: collector.system().processes().len(),
-                        entropy_anomaly: signal_digest.entropy_anomaly as f64,
-                        rl_exploring: lctx.overflow_guard.rl_agent.as_ref()
-                            .map_or(false, |rl| rl.total_ticks() < 200),
-                    };
-                    lctx.neuromod.tick(&neuro_signals);
-
-                    // Push derived params to subsystems + enforce constraints.
-                    if let Some(rl) = &mut lctx.overflow_guard.rl_agent {
-                        rl.neuro_alpha_mult = lctx.neuromod.alpha_multiplier;
-                        rl.neuro_epsilon_bonus = lctx.neuromod.epsilon_bonus;
-                        rl.dyna_steps = lctx.neuromod.dyna_steps;
-                        rl.enforce_constraints(); // Infrastructure-locked (Hermes)
-                    }
-                    lctx.signal_intel.neuro_serotonin_shift = lctx.neuromod.serotonin_shift;
-                }
+                // Extracted to daemon_neuro_tick::apply_neuromodulator (Wave 8).
+                daemon_neuro_tick::apply_neuromodulator(
+                    &mut lctx,
+                    &signal_digest,
+                    &stability_oracle,
+                    &thermal_action,
+                    collector.system().processes().len(),
+                );
 
                 // ProcessRecoveryManager: freeze confirmed leakers. NEVER kill.
                 //
@@ -5824,80 +5792,19 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                 } // end if !cognitive_pause
-                  // ── Neurocognitive tick ──────────────────────────────────────────────
-                  // Runs after learning_tick so all signals (drift, causal, arousal) are
-                  // fresh. Feeds 8 cognitive modules. Result stored in prev_cog_decision
-                  // for gating next-cycle learning and current-cycle metrics.
-                let cog_decision = {
-                    // ── Derive real epistemic signals from subsystems ─────────────────
-                    // [Lakshminarayanan 2017] predictive uncertainty from ensemble variance.
-                    // RL Q-value variance: std-dev across arm avg-rewards → spread = uncertainty.
-                    let rl_q_variance = {
-                        let avg = lctx.predictive_agent.arm_avg_rewards();
-                        let n = avg.len() as f64;
-                        let mean = avg.iter().sum::<f64>() / n;
-                        let var = avg.iter().map(|&r| (r - mean).powi(2)).sum::<f64>() / n;
-                        (var.sqrt() as f32).clamp(0.0, 1.0)
-                    };
-                    // LinUCB exploration: UCB for the most-pulled arm (lower = more exploited).
-                    let linucb_exploration = {
-                        let pulls = lctx.predictive_agent.arm_pulls();
-                        let total = lctx.predictive_agent.total_cycles();
-                        if total > 1 {
-                            let best = pulls.iter().copied().max().unwrap_or(1).max(1);
-                            ((2.0 * (total as f64).ln() / best as f64).sqrt().min(1.0) as f32)
-                                .clamp(0.0, 1.0)
-                        } else {
-                            1.0 // maximum uncertainty on cold start
-                        }
-                    };
-                    // Full causal confidence map — lets SelfRewardingEvaluator look up
-                    // any past action's confidence, not just the current one.
-                    // [Yuan 2024 §3 DR-ZERO]: CausalGraph as internal oracle for JuicyScore.
-                    let causal_confidence_map: Vec<(String, f32)> =
-                        lctx.causal_graph.confidence_map().into_iter().collect();
-                    let top_causal = lctx
-                        .causal_graph
-                        .solid_edges_by_impact()
-                        .first()
-                        .map(|e| e.confidence)
-                        .unwrap_or(0.0);
-                    let cog_inputs = cognitive_tick::CognitiveTickInputs {
-                        cycle: cycle_count as u64,
-                        pressure: signal_digest.pressure_smooth,
-                        drift_score: lctx.outcome_tracker.nars_drift_score(),
-                        rl_q_variance,
-                        linucb_exploration,
-                        nars_min_confidence: (1.0 - lctx.outcome_tracker.nars_drift_score() as f32)
-                            .clamp(0.0, 1.0),
-                        outcome_effectiveness: lctx.outcome_tracker.overall_effectiveness(),
-                        causal_confidence: top_causal,
-                        causal_confidence_map,
-                        latest_action: throttle_names_for_outcome
-                            .first()
-                            .map(|n| format!("throttle:{}", n)),
-                        predicted_score: lctx
-                            .predictive_agent
-                            .arm_avg_rewards()
-                            .iter()
-                            .cloned()
-                            .fold(f64::NEG_INFINITY, f64::max)
-                            .clamp(0.0, 1.0) as f32,
-                        workload_fingerprint: workload_mode
-                            .as_str()
-                            .bytes()
-                            .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64)),
-                        rl_state_idx: 0,
-                        rl_q_delta: 0.0,
-                        linucb_arm_idx: 0,
-                        linucb_delta: 0.0,
-                    };
-                    cognitive_tick::run_cognitive_tick(
-                        &mut cognitive_state,
-                        &cog_inputs,
-                        Some(&mut lctx.outcome_tracker.drift_detector),
-                    )
-                };
+                // ── Neurocognitive tick ──────────────────────────────────────────────
+                // Runs after learning_tick so all signals (drift, causal, arousal) are
+                // fresh. Feeds 8 cognitive modules. Result stored in prev_cog_decision
+                // for gating next-cycle learning and current-cycle metrics.
+                // Extracted to daemon_neuro_tick::run_neurocognitive_tick (Wave 8).
+                let cog_decision = daemon_neuro_tick::run_neurocognitive_tick(
+                    &mut lctx,
+                    &mut cognitive_state,
+                    cycle_count as u64,
+                    &signal_digest,
+                    &throttle_names_for_outcome,
+                    workload_mode.as_str(),
+                );
                 prev_cog_decision = Some(cog_decision);
                 // LlmConfig live-reload: whitelisted fields only; skip if trial active
                 // to avoid corrupting GemmaTrust outcome attribution. [Gray & Reuter 1992]
