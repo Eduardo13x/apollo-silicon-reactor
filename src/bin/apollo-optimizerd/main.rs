@@ -14,6 +14,7 @@ mod cognitive_tick;
 mod daemon_freeze_executor;
 mod daemon_init;
 mod daemon_process_collector;
+mod daemon_socket_handler;
 mod daemon_turbo_manager;
 mod daemon_wake_handler;
 mod learning_tick;
@@ -777,29 +778,11 @@ fn main() -> anyhow::Result<()> {
             }
             let mut cautious_cycles_remaining: u32 = if prior_crash { 50 } else { 0 };
 
-            // Spawn socket server and wait for bind confirmation before entering main loop.
-            // If bind fails (e.g., another instance already running), exit(1) immediately.
-            // Without this guard, a second daemon instance would silently run headless —
-            // no socket, no control, but actively mutating frozen_state and frozen_state.json
-            // concurrently with the first instance.
-            let socket_state = state.clone();
-            let (bind_tx, bind_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
-            thread::spawn(move || {
-                socket_handler::run_socket_server_with_notify(socket_state, bind_tx);
-            });
-            match bind_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                Ok(Ok(())) => { /* bind succeeded, continue */ }
-                Ok(Err(e)) => {
-                    tracing::error!(err = ?e, "FATAL: socket bind failed — another instance may be running");
-                    eprintln!("apollo-optimizerd: socket bind failed: {e}");
-                    eprintln!("  Is another instance already running?");
-                    eprintln!("  Check: pgrep apollo-optimizerd");
-                    std::process::exit(1);
-                }
-                Err(_timeout) => {
-                    tracing::warn!("socket bind confirmation timed out — continuing anyway");
-                }
-            }
+            // Startup glue: spawn control socket server + synchronously wait for
+            // bind confirmation. On bind failure this exits(1) — prevents a second
+            // headless instance racing on frozen_state.json. See
+            // `daemon_socket_handler::spawn_control_socket` for the full rationale.
+            daemon_socket_handler::spawn_control_socket(&state);
 
             let stop = state.stop.clone();
             ctrlc::set_handler(move || {
