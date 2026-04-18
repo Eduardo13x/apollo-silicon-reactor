@@ -134,20 +134,21 @@ pub fn context_from_pressure(
 ) -> InteractiveContext {
     let ram_pressure = snapshot.pressure.memory_pressure;
     let cpu_pressure = snapshot.cpu.global_usage as f64;
-    let swap_gb = snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
 
-    // Swap exhaustion override: if swap is near-full (≥4GB), force at least
-    // BackgroundPressure regardless of kernel pressure reading.
+    // Swap exhaustion override: if swap is near-full (≥max(4GB, 35% swap_total)),
+    // force at least BackgroundPressure regardless of kernel pressure reading.
     // Kernel pressure lags because the compressor absorbed pages before they
     // hit swap — the RL-adjusted bg_pressure threshold may then classify the
     // system as InteractiveFocus while swap is minutes from exhaustion
     // [Nygard 2018 §4, macOS memorystatus internals].
+    // Relative threshold scales with machine: 8GB swap → 4GB floor; 16GB → 5.6GB.
+    let swap_exhausted = snapshot.pressure.swap_used_bytes
+        >= crate::engine::safety::swap_exhaustion_threshold_bytes(
+            snapshot.pressure.swap_total_bytes,
+        );
     if cpu_pressure > 88.0 || ram_pressure > thresholds.critical_pressure {
         InteractiveContext::ThermalConstrained
-    } else if cpu_pressure > 72.0
-        || ram_pressure > thresholds.bg_pressure
-        || swap_gb >= crate::engine::safety::SWAP_EXHAUSTION_GB
-    {
+    } else if cpu_pressure > 72.0 || ram_pressure > thresholds.bg_pressure || swap_exhausted {
         InteractiveContext::BackgroundPressure
     } else {
         InteractiveContext::InteractiveFocus
@@ -984,9 +985,10 @@ pub fn decide_actions(
                 // now qualifies. Protection stack in execute_actions still applies.
                 let protected = crate::engine::safety::protected_processes();
                 let softly_protected = crate::engine::safety::softly_protected_processes();
-                let survival_mode = crate::engine::safety::survival_mode_active(
+                let survival_mode = crate::engine::safety::survival_mode_active_total(
                     snapshot.pressure.memory_pressure,
                     snapshot.pressure.swap_used_bytes,
+                    snapshot.pressure.swap_total_bytes,
                 );
                 let mut freeze_candidates: Vec<(u32, String, u64, f32, u64)> = sys
                     .processes()

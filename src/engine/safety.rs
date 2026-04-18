@@ -467,17 +467,53 @@ pub const SOFT_PROTECTION_SWAP_GB_THRESHOLD: f64 = 2.0;
 /// kernel pressure can read LOW while swap is near-full because the compressor
 /// has already absorbed the pages — the pressure signal lags the real risk
 /// [Nygard 2018 §4, macOS memorystatus internals].
+///
+/// Used as an absolute floor; the effective threshold is `max(this, swap_total × pct)`
+/// so machines with larger swap (16GB+) also trigger at a reasonable utilization.
 pub const SWAP_EXHAUSTION_GB: f64 = 4.0;
+
+/// Fraction of total swap that counts as "exhaustion" on larger machines.
+/// 35% of swap_total is aggressive enough to fire before the compressor saturates
+/// but high enough to avoid false positives during normal paging bursts.
+/// [Denning 1968] — working-set approximation: beyond this fraction, the kernel is
+/// paging hot working-set pages, not just cold tail.
+pub const SWAP_EXHAUSTION_PCT: f64 = 0.35;
+
+/// Effective swap-exhaustion byte threshold for a given swap_total.
+/// Returns `max(SWAP_EXHAUSTION_GB, swap_total × SWAP_EXHAUSTION_PCT)`.
+/// When `swap_total == 0` (misreported / no swap), falls back to the absolute floor.
+#[inline]
+pub fn swap_exhaustion_threshold_bytes(swap_total_bytes: u64) -> u64 {
+    let gib: u64 = 1024 * 1024 * 1024;
+    let abs_floor = (SWAP_EXHAUSTION_GB * gib as f64) as u64;
+    let pct_floor = ((swap_total_bytes as f64) * SWAP_EXHAUSTION_PCT) as u64;
+    abs_floor.max(pct_floor)
+}
 
 /// Returns true when conditions justify shedding softly_protected processes.
 /// Two independent triggers (OR):
 ///   1. Both pressure AND swap above normal thresholds (sustained crisis)
-///   2. Swap alone near exhaustion (≥4GB) — pressure signal may lag
+///   2. Swap alone near exhaustion — scales with swap_total via
+///      `swap_exhaustion_threshold_bytes()`
+///
+/// When `swap_total_bytes == 0` the function degrades to the absolute 4GB floor.
+#[inline]
+pub fn survival_mode_active_total(
+    memory_pressure: f64,
+    swap_used_bytes: u64,
+    swap_total_bytes: u64,
+) -> bool {
+    let swap_gb = swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let exhausted = swap_used_bytes >= swap_exhaustion_threshold_bytes(swap_total_bytes);
+    (memory_pressure >= SOFT_PROTECTION_PRESSURE_THRESHOLD && swap_gb >= SOFT_PROTECTION_SWAP_GB_THRESHOLD)
+        || exhausted
+}
+
+/// Backward-compatible shim: assumes swap_total is unknown → absolute 4GB floor only.
+/// Call sites that have `swap_total_bytes` should prefer `survival_mode_active_total`.
 #[inline]
 pub fn survival_mode_active(memory_pressure: f64, swap_used_bytes: u64) -> bool {
-    let swap_gb = swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    (memory_pressure >= SOFT_PROTECTION_PRESSURE_THRESHOLD && swap_gb >= SOFT_PROTECTION_SWAP_GB_THRESHOLD)
-        || swap_gb >= SWAP_EXHAUSTION_GB
+    survival_mode_active_total(memory_pressure, swap_used_bytes, 0)
 }
 
 /// Dev runtime patterns: processes that MAY be doing useful work (web server,
@@ -1223,6 +1259,48 @@ mod tests {
         // llama-server in soft list, not hard list
         assert!(!protected_processes().contains("llama-server"));
         assert!(softly_protected_processes().contains("llama-server"));
+    }
+
+    #[test]
+    fn swap_exhaustion_threshold_scales_with_total() {
+        let gib = 1024u64 * 1024 * 1024;
+        // Small swap (8GB): absolute 4GB floor dominates (35% = 2.8GB < 4GB).
+        assert_eq!(swap_exhaustion_threshold_bytes(8 * gib), 4 * gib);
+        // Medium swap (12GB): 35% = 4.2GB > absolute floor → relative dominates.
+        let t12 = swap_exhaustion_threshold_bytes(12 * gib);
+        assert!(t12 > 4 * gib);
+        // Large swap (16GB): 35% = 5.6GB — relative dominates.
+        let t16 = swap_exhaustion_threshold_bytes(16 * gib);
+        assert!(t16 >= (5.5 * gib as f64) as u64);
+        assert!(t16 <= (5.7 * gib as f64) as u64);
+        // Zero total (unknown): falls back to absolute floor.
+        assert_eq!(swap_exhaustion_threshold_bytes(0), 4 * gib);
+    }
+
+    #[test]
+    fn survival_total_variant_respects_relative_threshold() {
+        let gib = 1024u64 * 1024 * 1024;
+        // On 16GB swap machine, 4.5GB used should NOT yet trigger survival
+        // (threshold ≈ 5.6GB at 35%).
+        assert!(!survival_mode_active_total(
+            0.50,
+            (4.5 * gib as f64) as u64,
+            16 * gib,
+        ));
+        // Same 4.5GB on 8GB swap machine SHOULD trigger (absolute 4GB floor).
+        assert!(survival_mode_active_total(
+            0.50,
+            (4.5 * gib as f64) as u64,
+            8 * gib,
+        ));
+        // 6GB on 16GB machine triggers (above relative 5.6GB).
+        assert!(survival_mode_active_total(
+            0.50,
+            6 * gib,
+            16 * gib,
+        ));
+        // Back-compat shim: no total known → absolute floor.
+        assert!(survival_mode_active(0.50, (4.0 * gib as f64) as u64));
     }
 
     /// The hard-protected fast path (OnceLock) must agree with the full set.
