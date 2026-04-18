@@ -5769,87 +5769,14 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.post_wake_throttle_suppressed += throttle_suppressed;
                     metrics.metrics.post_wake_freeze_suppressed += freeze_suppressed;
 
-                    // Freeze confirmation: only freeze PIDs flagged for 2+ consecutive cycles.
-                    // This filters out short-lived transients that die before execute_actions.
-                    // First, collect all PIDs proposed for freeze this cycle (before filtering).
-                    let proposed_freeze_pids: HashSet<u32> = graced_actions
-                        .iter()
-                        .filter_map(|a| {
-                            if let RootAction::FreezeProcess { pid, .. } = a {
-                                Some(*pid)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    // Fluidity launch guard: defer ALL new freezes while an app launch
-                    // is in progress. App startup is a latency-sensitive critical path —
-                    // background interference causes visible jank and slow launch times.
-                    // [Selkowitz 1984] "Graphical Simulation" — launch is the user's
-                    // primary interaction moment; background must yield completely.
-                    let fluidity_launch_active = fluidity_state.launch_active;
-                    if fluidity_launch_active {
-                        tracing::debug!(
-                            launch = %fluidity_state.launch_name,
-                            cycles_remaining = fluidity_state.launch_cycles_remaining,
-                            "fluidity: launch active — deferring new freezes"
-                        );
-                    }
-
-                    // Pre-emptive fluidity response: when Kalman predicts fluidity will drop
-                    // below 0.60 within 3 cycles AND velocity is negative, lower the freeze
-                    // confirmation threshold from 2 to 1 cycle. This allows Apollo to act
-                    // before the degradation is perceptible to the user.
-                    // [Welch & Bishop 2006] Kalman prediction enables anticipatory control.
-                    // [Shavit & Lotan 2000] pre-emptive action on predicted queue saturation.
-                    let fluidity_preemptive = !fluidity_launch_active
-                        && fluidity_state.fluidity_predicted_3s < 0.60
-                        && fluidity_state.fluidity_velocity < -0.05;
-                    if fluidity_preemptive {
-                        tracing::info!(
-                            predicted = fluidity_state.fluidity_predicted_3s,
-                            velocity = fluidity_state.fluidity_velocity,
-                            "fluidity: predicted drop to {:.2} — pre-emptive freeze threshold lowered",
-                            fluidity_state.fluidity_predicted_3s
-                        );
-                    }
-
-                    let mut seen_freeze_pids: HashSet<u32> = HashSet::new();
-                    let confirmed_actions: Vec<RootAction> = graced_actions
-                        .into_iter()
-                        .filter(|a| {
-                            if let RootAction::FreezeProcess { pid, .. } = a {
-                                // Skip new freezes during app launch (launch acceleration)
-                                if fluidity_launch_active {
-                                    return false;
-                                }
-                                // Per-cycle dedup: FreezeProcess can be proposed by
-                                // multiple upstream paths (stale-app, adaptive_governor,
-                                // survival-mode). Without dedup, downstream deep-scan
-                                // converts each dup to a separate SetMemorystatus hit
-                                // on the same PID → wasted syscalls and journal spam.
-                                if !seen_freeze_pids.insert(*pid) {
-                                    return false;
-                                }
-                                let count = freeze_candidates.entry(*pid).or_insert(0);
-                                // Pre-emptive mode: act after 1 cycle instead of 2
-                                let required = if fluidity_preemptive { 1 } else { 2 };
-                                // Cap at required+1: PIDs proposed every cycle but
-                                // skipped downstream (deep-scan, fluidity gate) would
-                                // otherwise accumulate count indefinitely. Once the
-                                // confirmation threshold is met, capping at +1 is enough
-                                // to keep the gate "armed" without unbounded growth.
-                                *count = (*count + 1).min(required + 1);
-                                *count >= required
-                            } else {
-                                true
-                            }
-                        })
-                        .collect();
-                    // Decay: remove PIDs no longer proposed for freeze this cycle.
-                    // Use proposed_freeze_pids (all proposals) not just confirmed ones,
-                    // so first-cycle candidates survive to reach count >= 2.
-                    freeze_candidates.retain(|pid, _| proposed_freeze_pids.contains(pid));
+                    // Freeze confirmation gate: 2 cycles normal, 1 pre-emptive,
+                    // 0 during launch. Per-cycle dedup + decay of stale candidates.
+                    // Extracted to daemon_freeze_executor::apply_freeze_confirmation().
+                    let confirmed_actions = daemon_freeze_executor::apply_freeze_confirmation(
+                        graced_actions,
+                        &fluidity_state,
+                        &mut freeze_candidates,
+                    );
 
                     // Compressor-aware + deep-scan freeze decisions (v0.7.0).
                     // For top 3 freeze candidates, run vm_region scan + temperature probe.
