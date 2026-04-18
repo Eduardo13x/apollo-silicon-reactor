@@ -263,6 +263,12 @@ pub struct ChromiumManager {
     /// [Pei Wang 2013] Truth values updated by revision rule on each freeze outcome.
     /// App-agnostic: chromium-renderer, ide-lsp, app-helper, etc.
     intelligence: FreezeIntelligence,
+    /// PIDs that currently own an on-screen window (from `cg_window::visible_pids()`).
+    /// Set by the daemon before each `update()` call. Renderers in this set are
+    /// never SIGSTOPped — their tabs are visible to the user. They receive a
+    /// jetsam BACKGROUND demotion instead so the kernel kills them first under
+    /// OOM without the user noticing a frozen tab.
+    visible_pids: HashSet<u32>,
 }
 
 impl Default for ChromiumManager {
@@ -294,7 +300,15 @@ impl ChromiumManager {
             arousal_thaw_all: false,
             build_preemption_active: false,
             intelligence: FreezeIntelligence::new(),
+            visible_pids: HashSet::new(),
         }
+    }
+
+    /// Update the set of PIDs with visible windows (from CGWindowList).
+    /// Call once per cycle before `update()`. Renderers in this set will be
+    /// demoted via jetsam instead of SIGSTOPped.
+    pub fn set_visible_pids(&mut self, pids: HashSet<u32>) {
+        self.visible_pids = pids;
     }
 
     /// Enable/disable build-preemption mode. When active, the freeze candidate
@@ -878,6 +892,18 @@ impl ChromiumManager {
                         process = info.name.as_str(),
                         confidence = confidence,
                         "chromium: skipping freeze — NARS confidence too low"
+                    );
+                    continue;
+                }
+
+                // Visibility gate: if this renderer owns a visible window
+                // (CGWindowList), SIGSTOP would freeze a tab the user can see.
+                // Demote via jetsam instead — the tab stays live but becomes
+                // kill-prone under OOM pressure. Safer user experience.
+                if self.visible_pids.contains(pid) {
+                    let _ = crate::engine::jetsam_control::set_priority(
+                        *pid,
+                        crate::engine::jetsam_control::priority::BACKGROUND,
                     );
                     continue;
                 }

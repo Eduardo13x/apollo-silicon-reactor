@@ -5748,6 +5748,14 @@ fn main() -> anyhow::Result<()> {
                         fluidity_state.launch_active,
                     );
 
+                    // F3: CGWindowList visibility gate — refresh at most every
+                    // 10 cycles (~5s) since window ownership rarely changes
+                    // faster than that and the syscall is ~1-3ms.
+                    if cycle_count % 10 == 0 {
+                        let visible = apollo_optimizer::engine::cg_window::visible_pids();
+                        chromium_mgr.set_visible_pids(visible);
+                    }
+
                     let chromium_assertion_pids =
                         apollo_optimizer::engine::activity_sensor::pids_with_assertions();
                     let main_frozen_set: HashSet<u32> =

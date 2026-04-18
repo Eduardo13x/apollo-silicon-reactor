@@ -8,6 +8,7 @@ pub mod build_tracker;
 pub mod cache_warmer;
 pub mod capabilities;
 pub mod causal_graph;
+pub mod cg_window;
 pub mod chromium_manager;
 pub mod circuit_breaker;
 pub mod coalition;
