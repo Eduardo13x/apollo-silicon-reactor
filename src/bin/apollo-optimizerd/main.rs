@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 mod cognitive_tick;
 mod daemon_freeze_executor;
 mod daemon_init;
+mod daemon_process_collector;
 mod daemon_turbo_manager;
 mod daemon_wake_handler;
 mod learning_tick;
@@ -84,7 +85,6 @@ use apollo_optimizer::engine::predictive_agent::{
     specialist, tally_votes, AgentContext, Intervention, PredictiveAgent, SpecialistVote,
 };
 use apollo_optimizer::engine::proc_taskinfo;
-use apollo_optimizer::engine::process_tree::{ProcessEntry, ProcessTree};
 use apollo_optimizer::engine::profile_governor::GovernorInput;
 use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
 use apollo_optimizer::engine::safety::{
@@ -1954,21 +1954,8 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // Process tree: build from the full process table for child grouping.
-                let process_tree = {
-                    let sys = collector.system();
-                    let entries: Vec<ProcessEntry> = sys
-                        .processes()
-                        .iter()
-                        .map(|(pid, process)| ProcessEntry {
-                            pid: pid.as_u32(),
-                            ppid: process.parent().map(|p| p.as_u32()).unwrap_or(0),
-                            name: process.name().to_string(),
-                            cpu_usage: process.cpu_usage(),
-                            memory_bytes: process.memory(),
-                        })
-                        .collect();
-                    ProcessTree::build(&entries)
-                };
+                // Extracted to daemon_process_collector::build_process_tree().
+                let process_tree = daemon_process_collector::build_process_tree(&collector);
 
                 // Build enriched process data using foreground detector + process tree.
                 // A process is considered foreground if it IS the foreground app or a
@@ -1984,71 +1971,27 @@ fn main() -> anyhow::Result<()> {
                     proc_snaps.iter().map(|p| p.name.as_str()).collect();
                 let hour_of_day = Utc::now().hour() as u8;
 
-                // ── Pre-sleep unfreeze ───────────────────────────────────────
-                // kIOMessageSystemWillSleep fires ~30s before kernel suspends.
-                // Release all SIGSTOP'd processes so macOS can compress/Jetsam
-                // them during sleep. Without this, frozen PIDs block Jetsam's
-                // target set → more aggressive kills of widgets/extensions.
-                // The wake path (post-wake grace) already re-evaluates from scratch.
-                if sleep_notifier.will_sleep_pending() {
-                    let mut frozen_guard = state.frozen_state.lock_recover();
-                    // A-B-A defense: verify identity before SIGCONT.
-                    // Turbo PIDs are inserted into frozen_guard at freeze time,
-                    // so unfreeze_pids_verified covers both regular + turbo PIDs
-                    // in one pass — the separate turbo loop is redundant.
-                    // [Saltzer & Kaashoek 2009] §3.3 Complete Mediation.
-                    let count = unfreeze_pids_verified(&frozen_guard);
-                    if count > 0 {
-                        tracing::info!(
-                            count,
-                            "pre-sleep: released {} frozen PID(s) — \
-                             handing back to macOS memory manager",
-                            count
-                        );
-                        frozen_guard.clear();
-                        write_frozen_state(&frozen_state_path, &frozen_guard);
-                        state.metrics.lock_recover().metrics.unfreezes_applied += count;
-                    }
-                    display_turbo.clear_frozen();
-                    sleep_notifier.acknowledge();
-                }
+                // Pre-sleep unfreeze: release every SIGSTOP'd PID before kernel suspends.
+                // Extracted to daemon_process_collector::run_pre_sleep_unfreeze().
+                // [Saltzer & Kaashoek 2009] §3.3 A-B-A defense via unfreeze_pids_verified.
+                daemon_process_collector::run_pre_sleep_unfreeze(
+                    &state,
+                    &frozen_state_path,
+                    &mut display_turbo,
+                    &sleep_notifier,
+                );
 
-                // ── Ghost-PID reconciliation ─────────────────────────────────
-                // A frozen process can die via manual kill, Force Quit, or
-                // jetsam while kqueue NOTE_EXIT isn't registered (e.g., after
-                // a daemon restart). Without cleanup, frozen_state retains
-                // ghost entries whose RSS is counted as frozen_ram_mb even
-                // though the OS already reclaimed that memory.
-                //
-                // proc_snaps is authoritative for live PIDs (built from
-                // sysinfo::System::processes() which reflects the current
-                // kernel process table). Any frozen PID absent here is dead.
-                {
-                    let live_pids: HashSet<u32> = proc_snaps.iter().map(|p| p.pid).collect();
-                    let mut frozen_guard = state.frozen_state.lock_recover();
-                    let before = frozen_guard.len();
-                    frozen_guard.retain(|pid, _| live_pids.contains(pid));
-                    let removed = before - frozen_guard.len();
-                    if removed > 0 {
-                        tracing::info!(
-                            removed,
-                            "frozen_state: evicted {} ghost PID(s) \
-                             (died without kqueue notification)",
-                            removed
-                        );
-                        write_frozen_state(&frozen_state_path, &frozen_guard);
-                    }
-                    // Turbo set: same reconciliation, no disk write needed.
-                    display_turbo.gc_dead_pids(&live_pids);
-
-                    // MachQoSManager: reap per-thread CPU samples, current_tier,
-                    // app_napped, io_tier_cache, permanently_blocked for dead PIDs.
-                    // Every 60 cycles (~30s at 2Hz) — libc::kill(pid, 0) is cheap
-                    // but the HashMaps can have thousands of entries under Chrome.
-                    if cycle_count % 60 == 0 {
-                        state.mach_qos.lock_recover().gc_dead_pids();
-                    }
-                }
+                // Ghost-PID reconciliation — evict dead PIDs from frozen_state +
+                // turbo set; GC mach_qos HashMaps every 60 cycles.
+                let live_pids: HashSet<u32> =
+                    proc_snaps.iter().map(|p| p.pid).collect();
+                daemon_process_collector::run_ghost_pid_reconciliation(
+                    &state,
+                    &live_pids,
+                    &frozen_state_path,
+                    &mut display_turbo,
+                    cycle_count,
+                );
 
                 // MemoryAnalyzer: profile top-50 processes for memory leaks each cycle.
                 // For the top-10 by RSS, refine WSS with real TASK_VM_INFO data.
