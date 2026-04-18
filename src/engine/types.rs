@@ -543,6 +543,12 @@ pub struct RuntimeMetrics {
     pub post_wake_throttle_suppressed: u64,
     pub post_wake_freeze_suppressed: u64,
     pub swap_used_bytes: u64,
+    /// Total swap capacity in bytes (dynamic on macOS).
+    /// Zero only when sysctl read fails. Consumers computing swap ratios must
+    /// guard against the zero case — divide-by-zero bugs here silently disable
+    /// relative thresholds (see `safety::survival_mode_active_total`).
+    #[serde(default)]
+    pub swap_total_bytes: u64,
     pub swap_delta_bps: f64,
     pub memory_pressure: f64,
     /// Composite VM thrashing score from `VmRate::thrashing_score()`.

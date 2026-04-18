@@ -1491,6 +1491,7 @@ fn main() -> anyhow::Result<()> {
                         if pressure_collector.data_age() < Duration::from_secs(10) {
                             metrics.metrics.memory_pressure = cached.memory_pressure;
                             metrics.metrics.swap_used_bytes = cached.swap_used_bytes;
+                            metrics.metrics.swap_total_bytes = cached.swap_total_bytes;
                             metrics.metrics.swap_delta_bps = cached.swap_delta_bps;
                         }
                         if let Some(hw) = smc_reader.latest() {
@@ -3104,6 +3105,7 @@ fn main() -> anyhow::Result<()> {
                 {
                     let mut metrics = state.metrics.lock_recover();
                     metrics.metrics.swap_used_bytes = snapshot.pressure.swap_used_bytes;
+                    metrics.metrics.swap_total_bytes = snapshot.pressure.swap_total_bytes;
                     metrics.metrics.swap_delta_bps = snapshot.pressure.swap_delta_bytes_per_sec;
                     metrics.metrics.memory_pressure = snapshot.pressure.memory_pressure;
                     metrics.metrics.thermal_level = snapshot.pressure.thermal_level.clone();
