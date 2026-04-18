@@ -46,7 +46,6 @@ use apollo_optimizer::engine::daemon_helpers::{
     signal_intelligence_path, skills_path, socket_path, spotlight_set_indexing,
     telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_pids,
     unfreeze_pids_verified, wake_state_path, write_frozen_state, write_governor_state,
-    write_wake_state,
 };
 use apollo_optimizer::engine::effective_pressure;
 use apollo_optimizer::engine::execute_actions::execute_actions;
@@ -112,7 +111,7 @@ use apollo_optimizer::engine::workload_classifier::classify_by_memory;
 use apollo_optimizer::engine::workload_classifier::{
     classify_workload_mode, WorkloadFeatures, WorkloadMode,
 };
-use chrono::{Duration as ChronoDuration, Timelike, Utc};
+use chrono::{Timelike, Utc};
 use clap::{Parser, Subcommand};
 
 // v0.9.0: canonical SharedState — all domain groups live in daemon_state.rs
