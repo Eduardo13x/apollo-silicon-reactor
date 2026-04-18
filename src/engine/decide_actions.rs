@@ -134,10 +134,20 @@ pub fn context_from_pressure(
 ) -> InteractiveContext {
     let ram_pressure = snapshot.pressure.memory_pressure;
     let cpu_pressure = snapshot.cpu.global_usage as f64;
+    let swap_gb = snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
 
+    // Swap exhaustion override: if swap is near-full (≥4GB), force at least
+    // BackgroundPressure regardless of kernel pressure reading.
+    // Kernel pressure lags because the compressor absorbed pages before they
+    // hit swap — the RL-adjusted bg_pressure threshold may then classify the
+    // system as InteractiveFocus while swap is minutes from exhaustion
+    // [Nygard 2018 §4, macOS memorystatus internals].
     if cpu_pressure > 88.0 || ram_pressure > thresholds.critical_pressure {
         InteractiveContext::ThermalConstrained
-    } else if cpu_pressure > 72.0 || ram_pressure > thresholds.bg_pressure {
+    } else if cpu_pressure > 72.0
+        || ram_pressure > thresholds.bg_pressure
+        || swap_gb >= crate::engine::safety::SWAP_EXHAUSTION_GB
+    {
         InteractiveContext::BackgroundPressure
     } else {
         InteractiveContext::InteractiveFocus
