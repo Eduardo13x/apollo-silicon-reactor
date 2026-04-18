@@ -951,12 +951,18 @@ pub fn apply_learned_policy_actions(
         }
     }
 
+    let survival = apollo_optimizer::engine::safety::survival_mode_active(
+        snapshot.pressure.memory_pressure,
+        snapshot.pressure.swap_used_bytes,
+    );
+
     for p in &snapshot.top_processes {
         if policy
             .interactive_patterns
             .iter()
             .any(|pat| p.name.contains(pat))
             && !seen.contains(&(p.pid, "boost"))
+            && !survival
         {
             actions.push(RootAction::BoostProcess {
                 pid: p.pid,
