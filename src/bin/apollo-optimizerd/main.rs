@@ -2667,13 +2667,23 @@ fn main() -> anyhow::Result<()> {
                 // LLM teacher mode (cloud) - optional, rate-limited, and guarded.
                 // This runs before governor evaluation so a high-confidence suggestion can set a
                 // short-lived manual override during the training window.
-                llm_daemon::llm_reactive_tick(
-                    &state,
-                    &mut llm_advisor,
-                    &snapshot,
-                    &mut llm_counters,
-                    lctx.outcome_tracker.heuristic_is_struggling(),
-                );
+                //
+                // Arousal gate [Kahneman 2011] S1/S2 dual-path: Gemma (System 2, ~124s latency)
+                // must not be consulted during a memory crisis — by the time it responds, the
+                // crisis is over or the OOM already fired. Suppress calls when arousal_state is
+                // high (system under stress) so the fast reactive path (System 1) operates
+                // uncontested. Gemma runs during calm periods and compiles insights into
+                // SkillRegistry / pattern_weights for future fast-path use.
+                let llm_calm_gate = arousal_state.level <= 0.70;
+                if llm_calm_gate {
+                    llm_daemon::llm_reactive_tick(
+                        &state,
+                        &mut llm_advisor,
+                        &snapshot,
+                        &mut llm_counters,
+                        lctx.outcome_tracker.heuristic_is_struggling(),
+                    );
+                }
 
                 // ── Teacher consolidation: S2 → S1 memory transfer ────────
                 // When llm_reactive_tick resolves a pending outcome, compile
