@@ -975,11 +975,20 @@ pub fn apply_learned_policy_actions(
             && !seen.contains(&(p.pid, "throttle"))
         {
             let (ss, su) = pid_start_time(p.pid);
+            // Under survival mode, upgrade to aggressive throttle. Non-aggressive
+            // (background QoS demotion) is too weak when swap ≥4GB — the process
+            // still pages in/out at the same rate. Aggressive adds SIGSTOP pulses.
+            // [Nygard 2018 §5] — under load, shed harder on processes already
+            // classified as noise.
             actions.push(RootAction::ThrottleProcess {
                 pid: p.pid,
                 name: p.name.clone(),
-                aggressive: false,
-                reason: "learned-policy noise".to_string(),
+                aggressive: survival,
+                reason: if survival {
+                    "learned-policy noise (survival)".to_string()
+                } else {
+                    "learned-policy noise".to_string()
+                },
                 start_sec: ss,
                 start_usec: su,
             });
