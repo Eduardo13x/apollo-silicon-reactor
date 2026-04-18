@@ -21,13 +21,11 @@ use apollo_optimizer::engine::display_turbo::DisplayTurbo;
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
 
 /// Run one wake-detection tick.
 ///
-/// Returns `(grace_active, now_wall)`:
-/// - `grace_active` — true if currently inside a post-wake grace window.
-/// - `now_wall`     — current wall-clock time (used downstream for timestamps).
+/// Returns `grace_active`: true if currently inside a post-wake grace window.
 ///
 /// # Parameters
 /// - `state` — Shared daemon state (process, frozen_state, policy, metrics).
@@ -44,7 +42,7 @@ pub fn run_wake_tick(
     wake_unfreeze_queue: &mut VecDeque<u32>,
     display_turbo: &mut DisplayTurbo,
     wake_state_path: &Path,
-) -> (bool, DateTime<Utc>) {
+) -> bool {
     let now_wall = Utc::now();
     let mut process_guard = state.process.lock_recover();
     let wake_jump = now_wall - process_guard.wake_state.last_cycle_wallclock;
@@ -122,5 +120,5 @@ pub fn run_wake_tick(
     write_wake_state(wake_state_path, &process_guard.wake_state);
     drop(process_guard);
 
-    (grace_active, now_wall)
+    grace_active
 }

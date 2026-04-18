@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 /// Signal handlers cannot capture Arc/closures, so we use a static AtomicBool
 /// that the main loop checks alongside `state.stop`.
 mod cognitive_tick;
+mod daemon_freeze_executor;
 mod daemon_init;
 mod daemon_turbo_manager;
 mod daemon_wake_handler;
@@ -42,7 +43,7 @@ use apollo_optimizer::engine::daemon_helpers::{
     holt_winters_path, hop_groups_path, journal_path, kill_switch_path, learned_state_path,
     load_frozen_state, load_governor_state, load_wake_state, markov_path, merge_seed_into,
     metrics_path, overflow_history_path, parse_profile, pid_start_time, predictive_agent_path,
-    remove_crash_sentinel, rl_threshold_path, should_rotate_oldest, should_unfreeze,
+    remove_crash_sentinel, rl_threshold_path,
     signal_intelligence_path, skills_path, socket_path, spotlight_set_indexing,
     telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_pids,
     unfreeze_pids_verified, wake_state_path, write_frozen_state, write_governor_state,
@@ -1664,7 +1665,7 @@ fn main() -> anyhow::Result<()> {
                 // Sleep/wake detection + post-wake grace window.
                 // Extracted to daemon_wake_handler::run_wake_tick().
                 // [Nygard 2018] bulkhead: staggered SIGCONT avoids 1-3GB decompression spike.
-                let (grace_active, now_wall) = daemon_wake_handler::run_wake_tick(
+                let grace_active = daemon_wake_handler::run_wake_tick(
                     &state,
                     &mut signal_intel,
                     &mut outcome_tracker,
@@ -5747,57 +5748,15 @@ fn main() -> anyhow::Result<()> {
                 // across the blocking I/O inside execute_actions.
                 let final_actions = {
                     let mut metrics = state.metrics.lock_recover();
-                    // TTL: don't leave freezes hanging forever.
-                    // Skip PIDs currently frozen by the resource interrupt handler.
-                    {
-                        let now = Utc::now();
-                        let interrupt_pids = state
-                            .resource_interrupt
-                            .interrupt_frozen_pids
-                            .try_lock()
-                            .ok()
-                            .map(|g| g.clone())
-                            .unwrap_or_default();
-                        let current_pressure = snapshot.pressure.memory_pressure;
-                        let mut frozen_state = state.frozen_state.lock_recover();
-                        let total_frozen = frozen_state.len();
-                        let mut expired: Vec<u32> = frozen_state
-                            .iter()
-                            .filter(|(pid, entry)| {
-                                let elapsed =
-                                    now.signed_duration_since(entry.frozen_at).num_seconds();
-                                should_unfreeze(elapsed, entry.pressure_at_freeze, current_pressure)
-                                    && !interrupt_pids.contains(pid)
-                            })
-                            .map(|(pid, _)| *pid)
-                            .collect();
-                        // FIFO rotation: on 8GB hardware, rotate oldest frozen
-                        // process to prevent resource hoarding under sustained pressure.
-                        if let Some((&oldest_pid, oldest_entry)) = frozen_state
-                            .iter()
-                            .filter(|(pid, _)| {
-                                !interrupt_pids.contains(pid) && !expired.contains(pid)
-                            })
-                            .min_by_key(|(_, e)| e.frozen_at)
-                        {
-                            let elapsed = now
-                                .signed_duration_since(oldest_entry.frozen_at)
-                                .num_seconds();
-                            if should_rotate_oldest(elapsed, total_frozen) {
-                                expired.push(oldest_pid);
-                            }
-                        }
-                        if !expired.is_empty() {
-                            let count = unfreeze_pids(expired.iter().copied());
-                            for pid in &expired {
-                                frozen_state.remove(pid);
-                            }
-                            write_frozen_state(&frozen_state_path, &frozen_state);
-                            metrics.metrics.post_wake_defensive_unfreezes += count;
-                            metrics.metrics.unfreezes_applied += count;
-                            metrics.metrics.throttle_reverted += count;
-                        }
-                    }
+                    // TTL unfreeze + FIFO rotation.
+                    // Extracted to daemon_freeze_executor::run_ttl_unfreeze_sweep().
+                    // [Belady 1966] FIFO replacement under sustained memory pressure.
+                    daemon_freeze_executor::run_ttl_unfreeze_sweep(
+                        &state,
+                        &frozen_state_path,
+                        snapshot.pressure.memory_pressure,
+                        &mut metrics,
+                    );
                     metrics.metrics.budgets.cycle_boosts = 0;
                     metrics.metrics.budgets.cycle_throttles = 0;
                     metrics.metrics.budgets.cycle_hints = 0;
