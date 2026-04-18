@@ -1175,6 +1175,11 @@ fn main() -> anyhow::Result<()> {
             // to veto Raise1pp during sustained swap growth (see rl_threshold.rs).
             let mut swap_growth_streak: u32 = 0;
 
+            // Rate-limit `purge(8)` invocations to at most once per 10 minutes
+            // under severe swap pressure. `purge` forces the kernel to drain
+            // inactive pages — effective but expensive (blocks for ~2s on 8GB).
+            let mut last_purge_at: Option<Instant> = None;
+
             // ── Feature 3: RT Boost for Foreground ───────────────────────────
             // THREAD_TIME_CONSTRAINT_POLICY: guarantee 2ms/10ms to foreground UI thread.
             // Eliminates UI hitches during heavy CPU load (e.g., LLM inference + browser).
@@ -5197,6 +5202,29 @@ fn main() -> anyhow::Result<()> {
                     // pressure — softer than SIGSTOP, keeps them responsive
                     // until the kernel actually reclaims. Idempotent syscall.
                     let _ = chromium_mgr.demote_background_renderers();
+
+                    // Last-resort page reclaim: when swap crosses 80% of the
+                    // exhaustion threshold, spawn `purge` to force the kernel
+                    // to drain inactive file-backed pages. Rate-limited to
+                    // once per 10 min — purge is expensive (~2s latency) and
+                    // moderating the cadence avoids cascading I/O storms.
+                    let threshold = apollo_optimizer::engine::safety::swap_exhaustion_threshold_bytes(
+                        snapshot.pressure.swap_total_bytes,
+                    );
+                    let swap_used = snapshot.pressure.swap_used_bytes;
+                    if swap_used as f64 >= threshold as f64 * 0.80 {
+                        let can_purge = last_purge_at
+                            .map(|t| t.elapsed() >= Duration::from_secs(600))
+                            .unwrap_or(true);
+                        if can_purge {
+                            // Spawn non-blocking — purge runs in its own process
+                            // and we don't wait on it. If spawn fails the daemon
+                            // continues; the RL gate still throttles allocators.
+                            if std::process::Command::new("purge").spawn().is_ok() {
+                                last_purge_at = Some(Instant::now());
+                            }
+                        }
+                    }
                 }
 
                 // Decaimiento gradual: si el sistema está en calma, relajar thresholds.
