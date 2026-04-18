@@ -14,6 +14,7 @@ mod cognitive_tick;
 mod daemon_freeze_executor;
 mod daemon_init;
 mod daemon_process_collector;
+mod daemon_sensor_tick;
 mod daemon_socket_handler;
 mod daemon_turbo_manager;
 mod daemon_wake_handler;
@@ -2577,152 +2578,40 @@ fn main() -> anyhow::Result<()> {
                 let batt_boost = battery_pressure_boost(&power_mgr);
 
                 // ── IOReport: P/E cluster utilization + real power telemetry ──
-                // Sample delta every cycle (≥500ms interval typical).
-                // end_sample() + begin_sample() gives rolling inter-cycle window.
-                if ioreport.available
-                    && last_ioreport_sample.elapsed() >= Duration::from_millis(900)
-                {
-                    #[cfg(target_os = "macos")]
-                    {
-                        last_ioreport = ioreport.end_sample();
-                        ioreport.begin_sample();
-                    }
-                    last_ioreport_sample = Instant::now();
-                }
-
-                // ── SMC Direct: power, lid, sleep/wake, battery ─────────────
-                if smc_direct.available {
-                    last_smc = smc_direct.read_snapshot();
-                }
-
-                // ── KPC: hardware performance counters (IPC) ────────────────
-                let kpc_snap = if kpc_reader.available {
-                    kpc_reader.sample()
-                } else {
-                    None
-                };
-
-                // ── Rosetta AOT: poll for oahd-helper activity ──────────────
-                rosetta_monitor.poll();
-
-                // ── Per-process energy ranking (ri_billed_energy) ────────────
-                let energy_pid_results = {
-                    let procs: Vec<(u32, &str)> = snapshot
-                        .top_processes
-                        .iter()
-                        .map(|p| (p.pid, p.name.as_str()))
-                        .collect();
-                    energy_pid_tracker.sample(&procs, cycle_dt_secs)
-                };
-
-                // Build IPC hint map for decide_actions (pid → IPC from rusage).
-                let ipc_hints: HashMap<u32, f64> = energy_pid_results
-                    .iter()
-                    .filter(|e| e.ipc > 0.0)
-                    .map(|e| (e.pid, e.ipc))
-                    .collect();
-
-                // Battery vampire detection: processes with >50 wakeups/s get priority throttle.
-                let wakeup_hints =
-                    apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_wakeup_hints(
-                        &energy_pid_results,
-                        50.0,
-                    );
-                // Physical footprint hints for accurate freeze ranking.
-                let footprint_hints =
-                    apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_footprint_hints(
-                        &energy_pid_results,
-                    );
-                // I/O burst hints: background processes writing >5 MB/s compete for
-                // disk bandwidth with LLM model weight loading — throttle during inference.
-                let io_burst_hints =
-                    apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_io_burst_hints(
-                        &energy_pid_results,
-                        5.0,
-                    );
-                // Behavioral anomaly hints: processes deviating ≥ threshold MADs from
-                // their learned {ipc, wakeup_rate, disk_mbps} baseline get priority throttle.
-                // Threshold is raised during cold start (< 10 warm baselines) to suppress
-                // false positives from poorly-trained detectors. [Chandola 2009 §4.1]
-                let anomaly_thresh =
-                    apollo_optimizer::engine::process_baseline::effective_threshold(
-                        energy_pid_tracker.baseline.warm_count(),
-                    );
-                let anomaly_hints: std::collections::HashMap<u32, f64> = energy_pid_results
-                    .iter()
-                    .filter(|r| r.anomaly_score >= anomaly_thresh)
-                    .map(|r| (r.pid, r.anomaly_score))
-                    .collect();
-
-                // ── Syscall-aware profiling: identify JIT-compiling processes ──
-                // Sample top processes through the syscall classifier and collect
-                // PIDs currently in JitCompiling state.  These are merged into
-                // behavior_interactive_pids below so decide_actions protects them
-                // from throttling (same path as I/O-bound interactive processes).
-                // Evict stale entries every 60 cycles to keep the HashMap bounded.
-                let jit_protected_pids: HashSet<u32> = {
-                    let pids: Vec<u32> = snapshot.top_processes.iter().map(|p| p.pid).collect();
-                    if cycle_count % 60 == 0 {
-                        syscall_classifier.evict_stale(&pids);
-                    }
-                    pids.iter()
-                        .filter_map(|&pid| {
-                            syscall_classifier
-                                .sample(pid)
-                                .filter(|p| {
-                                    *p == apollo_optimizer::engine::syscall_classifier::SyscallProfile::JitCompiling
-                                })
-                                .map(|_| pid)
-                        })
-                        .collect()
-                };
-
-                // ── IOPMrootDomain direct thermal (every 10 cycles, aligned with HwPredictor) ──
-                let iopm_snap = if cycle_count % 10 == 0 {
-                    apollo_optimizer::engine::thermal_iokit::read_iopm_state()
-                } else {
-                    None
-                };
-
-                // ── Memory bandwidth pressure boost ─────────────────────────
-                // AMC bandwidth > 80% = memory-bound → freeze more aggressively.
-                let mem_bw_boost = last_ioreport
-                    .as_ref()
-                    .filter(|ir| ir.memory_bandwidth_saturated())
-                    .map(|_| 0.10)
-                    .unwrap_or(0.0);
-
-                // ── SMC thermal direct boost ────────────────────────────────
-                // CPU temp from SMC is real-time (<100µs). Use it to augment
-                // thermal_bailout when powermetrics is stale.
-                let smc_thermal_boost = last_smc
-                    .as_ref()
-                    .and_then(|s| s.cpu_temp_celsius)
-                    .map(|t| {
-                        if t >= 100.0 {
-                            0.30
-                        }
-                        // critical
-                        else if t >= 90.0 {
-                            0.15
-                        }
-                        // severe
-                        else if t >= 80.0 {
-                            0.05
-                        }
-                        // moderate
-                        else {
-                            0.0
-                        }
-                    })
-                    .unwrap_or(0.0);
-
-                // ── Battery overheat protection ─────────────────────────────
-                let battery_overheat_boost = last_smc
-                    .as_ref()
-                    .filter(|s| s.battery_overheating())
-                    .map(|_| 0.12)
-                    .unwrap_or(0.0);
+                // ── Per-cycle sensor telemetry pass (Strangler Fig extraction) ──
+                // IOReport delta, SMC direct, KPC IPC, Rosetta poll, per-process
+                // energy ranking + hint maps, syscall-aware JIT detection,
+                // IOPMrootDomain thermal, and upstream boost factors (mem-bw,
+                // SMC thermal, battery overheat). No lock acquisition, never
+                // blocks. See `daemon_sensor_tick` module. [Fowler 2004]
+                let daemon_sensor_tick::SensorTickOutput {
+                    kpc_snap,
+                    energy_pid_results,
+                    ipc_hints,
+                    wakeup_hints,
+                    footprint_hints,
+                    io_burst_hints,
+                    anomaly_hints,
+                    anomaly_thresh,
+                    jit_protected_pids,
+                    iopm_snap,
+                    mem_bw_boost,
+                    smc_thermal_boost,
+                    battery_overheat_boost,
+                } = daemon_sensor_tick::run_sensor_tick(
+                    &snapshot,
+                    cycle_count,
+                    cycle_dt_secs,
+                    &mut ioreport,
+                    &mut last_ioreport,
+                    &mut last_ioreport_sample,
+                    &smc_direct,
+                    &mut last_smc,
+                    &mut kpc_reader,
+                    &mut rosetta_monitor,
+                    &mut energy_pid_tracker,
+                    &mut syscall_classifier,
+                );
 
                 // ── Feature 1: LLM Inference Mode ─────────────────────────────
                 // Detect ollama/llama.cpp/MLX and boost pressure gates aggressively.
