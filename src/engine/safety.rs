@@ -462,11 +462,22 @@ pub const SOFT_PROTECTION_PRESSURE_THRESHOLD: f64 = 0.85;
 /// Prevents premature shedding on transient pressure spikes with healthy swap headroom.
 pub const SOFT_PROTECTION_SWAP_GB_THRESHOLD: f64 = 2.0;
 
+/// Absolute swap exhaustion floor: trigger survival regardless of kernel pressure.
+/// On M1 8GB, swap maxes at ~5GB. At 4GB the system is minutes from OOM panic.
+/// kernel pressure can read LOW while swap is near-full because the compressor
+/// has already absorbed the pages — the pressure signal lags the real risk
+/// [Nygard 2018 §4, macOS memorystatus internals].
+pub const SWAP_EXHAUSTION_GB: f64 = 4.0;
+
 /// Returns true when conditions justify shedding softly_protected processes.
+/// Two independent triggers (OR):
+///   1. Both pressure AND swap above normal thresholds (sustained crisis)
+///   2. Swap alone near exhaustion (≥4GB) — pressure signal may lag
 #[inline]
 pub fn survival_mode_active(memory_pressure: f64, swap_used_bytes: u64) -> bool {
     let swap_gb = swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    memory_pressure >= SOFT_PROTECTION_PRESSURE_THRESHOLD && swap_gb >= SOFT_PROTECTION_SWAP_GB_THRESHOLD
+    (memory_pressure >= SOFT_PROTECTION_PRESSURE_THRESHOLD && swap_gb >= SOFT_PROTECTION_SWAP_GB_THRESHOLD)
+        || swap_gb >= SWAP_EXHAUSTION_GB
 }
 
 /// Dev runtime patterns: processes that MAY be doing useful work (web server,
@@ -1196,13 +1207,19 @@ mod tests {
 
     #[test]
     fn survival_mode_tiers() {
-        // Normal pressure: llama-server softly protected (not in freeze candidates)
+        // Normal: llama-server softly protected
         assert!(!survival_mode_active(0.70, (1.5 * 1024.0 * 1024.0 * 1024.0) as u64));
         // High pressure but low swap: still protected
         assert!(!survival_mode_active(0.90, (1.0 * 1024.0 * 1024.0 * 1024.0) as u64));
-        // Survival: both thresholds crossed → shed soft protection
+        // Survival: both pressure+swap thresholds crossed
         assert!(survival_mode_active(0.85, (2.0 * 1024.0 * 1024.0 * 1024.0) as u64));
         assert!(survival_mode_active(0.95, (4.0 * 1024.0 * 1024.0 * 1024.0) as u64));
+        // Swap exhaustion alone (≥4GB) triggers even with low pressure
+        // — kernel pressure lags when compressor absorbed the crisis [Nygard 2018]
+        assert!(survival_mode_active(0.59, (4.0 * 1024.0 * 1024.0 * 1024.0) as u64));
+        assert!(survival_mode_active(0.40, (4.5 * 1024.0 * 1024.0 * 1024.0) as u64));
+        // Below exhaustion floor: not triggered by swap alone
+        assert!(!survival_mode_active(0.50, (3.9 * 1024.0 * 1024.0 * 1024.0) as u64));
         // llama-server in soft list, not hard list
         assert!(!protected_processes().contains("llama-server"));
         assert!(softly_protected_processes().contains("llama-server"));
