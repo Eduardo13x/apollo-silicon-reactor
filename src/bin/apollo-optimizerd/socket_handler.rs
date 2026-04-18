@@ -304,7 +304,10 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 }
             }
             frozen_state.clear();
-            let _ = fs::remove_file(kill_switch_path());
+            // NOTE: kill switch (/var/run/apollo.disable) is intentionally NOT
+            // cleared here. Restore reverts Apollo's mutations (frozen PIDs,
+            // sysctls) but does not override a manual operator pause.
+            // PanicRestore is the correct path to toggle the kill switch.
             DaemonResponse::Ok
         }
         DaemonRequest::PanicRestore => {
