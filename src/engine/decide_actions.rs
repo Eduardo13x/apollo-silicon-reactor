@@ -902,7 +902,7 @@ pub fn decide_actions(
     // background-task sleep assertions. Without this, a single Electron renderer
     // holding PreventUserIdleSleep blocks every freeze even when swap is climbing.
     let freeze_skip_by_user =
-        user_ctx.freeze_protected(snapshot.pressure.memory_pressure);
+        user_ctx.freeze_protected(snapshot.pressure.memory_pressure, snapshot.pressure.swap_used_bytes);
     let gate_offset = user_ctx.pressure_gate_offset();
 
     match context {

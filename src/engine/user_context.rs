@@ -103,19 +103,19 @@ impl UserContext {
     /// Any signal that means "don't freeze interactive processes".
     ///
     /// `call_in_progress` is unconditional — interrupting a video call is never OK.
-    /// `has_sleep_assertion` is gated by memory pressure: at high pressure
-    /// (≥ 0.70) the OOM risk outweighs interrupting a background download or
-    /// long-running task that merely holds `PreventUserIdleSleep`. Without this
-    /// bypass, a single Electron/Claude process holding the assertion blocks
-    /// EVERY freeze even when RAM is at the brink and swap is climbing.
-    /// Lowered from 0.75: at 74.5% pressure + thrashing_score=121k the system
-    /// was paralysed for 0.5pp — empirical evidence the old threshold was too high.
+    /// `has_sleep_assertion` is bypassed when the system is in genuine crisis:
+    ///   • memory_pressure >= 0.70 (kernel-reported RAM pressure)
+    ///   • swap_used_bytes >= 4GB (near-exhaustion; kernel pressure lags because
+    ///     the compressor absorbed pages before they hit swap — [Nygard 2018 §4])
+    /// Without dual bypass, a single Electron renderer holding PreventUserIdleSleep
+    /// locks every freeze even when swap is at 84% and minutes from OOM panic.
     #[inline]
-    pub fn freeze_protected(&self, memory_pressure: f64) -> bool {
+    pub fn freeze_protected(&self, memory_pressure: f64, swap_used_bytes: u64) -> bool {
         if self.call_in_progress {
             return true;
         }
-        if memory_pressure >= 0.70 {
+        let swap_gb = swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        if memory_pressure >= 0.70 || swap_gb >= 4.0 {
             return false;
         }
         self.has_sleep_assertion
@@ -295,14 +295,20 @@ mod tests {
             ..Default::default()
         };
         let normal = UserContext::default();
-        // Low pressure: assertion blocks freeze, normal does not.
-        assert!(call.freeze_protected(0.30));
-        assert!(assertion.freeze_protected(0.30));
-        assert!(!normal.freeze_protected(0.30));
+        let low_swap = (1u64 << 30); // 1 GB
+        let high_swap = (4u64 << 30); // 4 GB — exhaustion floor
+        // Low pressure + low swap: assertion blocks freeze, normal does not.
+        assert!(call.freeze_protected(0.30, low_swap));
+        assert!(assertion.freeze_protected(0.30, low_swap));
+        assert!(!normal.freeze_protected(0.30, low_swap));
         // High pressure: call still blocks (cannot interrupt), assertion no longer.
-        assert!(call.freeze_protected(0.85));
-        assert!(!assertion.freeze_protected(0.85));
-        assert!(!normal.freeze_protected(0.85));
+        assert!(call.freeze_protected(0.85, low_swap));
+        assert!(!assertion.freeze_protected(0.85, low_swap));
+        assert!(!normal.freeze_protected(0.85, low_swap));
+        // Low pressure BUT swap exhaustion (≥4GB): assertion no longer blocks.
+        assert!(call.freeze_protected(0.59, high_swap));  // call still unconditional
+        assert!(!assertion.freeze_protected(0.59, high_swap));
+        assert!(!normal.freeze_protected(0.59, high_swap));
     }
 
     #[test]
