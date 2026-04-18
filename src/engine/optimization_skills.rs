@@ -653,9 +653,10 @@ mod tests {
     #[test]
     fn test_purge_unexecutable_preserves_individual_skills() {
         let mut reg = SkillRegistry::new();
-        // Individual (non-induced) skills are never removed
-        reg.learn("cloud_throttle", 0.50, "any", vec!["kernel_task".into()]);
-        reg.purge_unexecutable(&["kernel_task"]);
+        // Individual (non-induced) skills are never removed.
+        // Use a non-protected target so learn() doesn't silently drop the skill.
+        reg.learn("cloud_throttle", 0.50, "any", vec!["Dropbox".into()]);
+        reg.purge_unexecutable(&["Dropbox"]);
         assert_eq!(reg.len(), 1, "individual skills always kept");
     }
 
