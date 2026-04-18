@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 mod cognitive_tick;
 mod daemon_freeze_executor;
 mod daemon_init;
+mod daemon_pressure_aggregator;
 mod daemon_process_collector;
 mod daemon_sensor_tick;
 mod daemon_socket_handler;
@@ -51,7 +52,6 @@ use apollo_optimizer::engine::daemon_helpers::{
     telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_pids,
     unfreeze_pids_verified, wake_state_path, write_frozen_state, write_governor_state,
 };
-use apollo_optimizer::engine::effective_pressure;
 use apollo_optimizer::engine::execute_actions::execute_actions;
 use apollo_optimizer::engine::focus_markov::FocusMarkov;
 use apollo_optimizer::engine::foreground::{ForegroundDetector, ForegroundState};
@@ -2667,82 +2667,35 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // ── Charging thermal stress ──────────────────────────────────
-                // On fanless M1 Air, charging + heavy compute simultaneously
-                // causes SoC thermal throttling.  IOReport total_watts > 8W
-                // while charging is a strong indicator.
-                // Boost pressure by 0.06 to proactively freeze backgrounds
-                // before hardware throttles.
-                // Prefer SMC PSTR (real-time, <100µs) over IOReport total_watts.
-                let system_watts = last_smc
-                    .as_ref()
-                    .and_then(|s| s.system_power_watts)
-                    .or_else(|| last_ioreport.as_ref().map(|ir| ir.total_watts()));
-
-                let charging_stress_boost = if let Some(watts) = system_watts {
-                    let is_charging = last_smc
-                        .as_ref()
-                        .and_then(|s| s.charger_watts)
-                        .map(|cw| cw > 0.0)
-                        .unwrap_or_else(|| {
-                            cycle_hw_snap
-                                .as_ref()
-                                .and_then(|h| h.battery_watts)
-                                .map(|w| w < 0.0) // negative = charging
-                                .unwrap_or(false)
-                        });
-                    if is_charging && watts > 8.0 {
-                        0.06
-                    } else {
-                        0.0
-                    }
-                } else {
-                    0.0
-                };
-
-                // ── Battery aggressiveness: B0TE < 20 min → extra pressure ──
-                let battery_low_boost = last_smc
-                    .as_ref()
-                    .and_then(|s| s.battery_time_to_empty_min)
-                    .filter(|&tte| tte < 20)
-                    .map(|_| 0.08)
-                    .unwrap_or(0.0);
-
-                // ── Effective pressure: aggregate all boost factors ──────────
-                // Raw memory_pressure misses hardware stress (thermal, battery,
-                // bandwidth saturation). effective_pressure::compute() is the
-                // authoritative value. We write it back into snapshot so all
-                // downstream consumers (decide_actions, page_reclaim, io_shaper,
-                // skill_registry, signal_intel) see the fully-boosted value
-                // without requiring individual call-site changes.
-                let (pressure_ram, pressure_components) = effective_pressure::compute(
+                // ── Effective pressure aggregation (Strangler Fig) ───────────
+                // Charging thermal stress + B0TE aggressiveness + 9-boost
+                // additive sum (capped at +0.30) + cautious post-crash
+                // subtract. Pure transform — see `daemon_pressure_aggregator`
+                // for invariants. `audit_log` side effect stays here so the
+                // helper remains stateless.
+                let pressure_aggregation = daemon_pressure_aggregator::aggregate_cycle_pressure(
                     snapshot.pressure.memory_pressure,
                     hw_boost,
                     batt_boost,
                     thermal_pressure_boost,
                     llm_boost,
-                    charging_stress_boost,
-                    battery_low_boost,
                     mem_bw_boost,
                     smc_thermal_boost,
                     battery_overheat_boost,
+                    last_smc.as_ref(),
+                    last_ioreport.as_ref(),
+                    cycle_hw_snap.as_ref(),
+                    cautious_cycles_remaining,
                 );
+                let pressure_ram = pressure_aggregation.effective_pressure;
+                let pressure_components = pressure_aggregation.components;
                 snapshot.pressure.memory_pressure = pressure_ram;
-
-                // Cautious mode: if previous session crashed, raise effective pressure
-                // by +0.10 for the first 50 cycles so freeze/throttle gates trigger
-                // at a higher threshold — reducing risk of repeating the instability.
-                // [Gray & Reuter 1992 §3 — conservative restart after abnormal termination]
-                if cautious_cycles_remaining > 0 {
-                    snapshot.pressure.memory_pressure =
-                        (snapshot.pressure.memory_pressure - 0.10).max(0.0);
-                    cautious_cycles_remaining -= 1;
-                    if cautious_cycles_remaining == 0 {
-                        audit_log(&serde_json::json!({
-                            "event": "cautious_mode_ended",
-                            "message": "returning to normal thresholds after post-crash caution period",
-                        }));
-                    }
+                cautious_cycles_remaining = pressure_aggregation.cautious.remaining;
+                if pressure_aggregation.cautious.ended {
+                    audit_log(&serde_json::json!({
+                        "event": "cautious_mode_ended",
+                        "message": "returning to normal thresholds after post-crash caution period",
+                    }));
                 }
 
                 let pressure_wait = snapshot
