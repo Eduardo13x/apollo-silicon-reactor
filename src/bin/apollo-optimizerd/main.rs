@@ -1150,6 +1150,13 @@ fn main() -> anyhow::Result<()> {
             // Blind re-enable caused oscillation: mds spins up → pressure
             // rises back above 0.75 → disable → loop [Nygard 2018 §4].
             // Use the same calm-threshold as the re-enable gate (p<0.35 + swap<1GB).
+            //
+            // Fail-safe defaults: when any field is missing or the file is
+            // corrupted/absent we fall back to values that make `startup_calm`
+            // FALSE (pressure=1.0, swap=99.0). The previous default of
+            // swap=0.0 was fail-open: a file with bad pressure parsed as calm
+            // when swap was actually multi-GB. Defaulting swap high matches
+            // the pressure default so any read failure pauses Spotlight.
             let (startup_pressure, startup_swap_gb): (f64, f64) =
                 std::fs::read_to_string(
                     apollo_optimizer::engine::daemon_helpers::metrics_path(),
@@ -1158,11 +1165,11 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                 .map(|v| {
                     let p = v["memory_pressure"].as_f64().unwrap_or(1.0);
-                    let swap = v["swap_used_bytes"].as_f64().unwrap_or(0.0)
+                    let swap = v["swap_used_bytes"].as_f64().unwrap_or(99.0 * 1024.0 * 1024.0 * 1024.0)
                         / (1024.0 * 1024.0 * 1024.0);
                     (p, swap)
                 })
-                .unwrap_or((1.0, 0.0));
+                .unwrap_or((1.0, 99.0));
             let startup_calm = startup_pressure < 0.35 && startup_swap_gb < 1.0;
             let mut spotlight_paused: bool = is_root && !startup_calm;
             let mut spotlight_paused_at: Option<Instant> =
