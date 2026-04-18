@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 /// Signal handlers cannot capture Arc/closures, so we use a static AtomicBool
 /// that the main loop checks alongside `state.stop`.
 mod cognitive_tick;
+mod daemon_action_pipeline;
 mod daemon_cognitive_tick;
 mod daemon_feature_gates;
 mod daemon_freeze_executor;
@@ -5454,144 +5455,25 @@ fn main() -> anyhow::Result<()> {
                     })
                     .collect();
                 let exec_outcomes = {
-                    use apollo_optimizer::engine::degradation::{DegradationInputs, OperationMode};
+                    use apollo_optimizer::engine::degradation::DegradationInputs;
 
-                    // ── Circuit breaker + degradation pre-check ───────────────
-                    // Snapshot circuit breaker state before acquiring heavy locks.
-                    let (cb_is_open, cb_open_duration) = {
-                        let pg = state.policy.lock_recover();
-                        let is_open = *pg.circuit_breaker.state()
-                            == apollo_optimizer::engine::circuit_breaker::CircuitState::Open;
-                        let dur = pg.circuit_breaker.open_duration();
-                        (is_open, dur)
-                    };
-
-                    // Evaluate degradation tier; update last-cycle inputs.
-                    let op_mode = {
-                        // kernel_task CPU from top_processes (already captured this cycle).
-                        let kernel_cpu = snapshot
-                            .top_processes
-                            .iter()
-                            .find(|p| p.name == "kernel_task")
-                            .map(|p| p.cpu_usage as f64)
-                            .unwrap_or(0.0);
-                        let mut pg = state.policy.lock_recover();
-                        let inp = DegradationInputs {
-                            new_failures: 0, // incremental failures added after execution
-                            kernel_task_cpu_pct: kernel_cpu,
-                            circuit_open: cb_is_open,
-                            circuit_open_duration: cb_open_duration,
-                        };
-                        pg.degradation.update(&inp).clone()
-                    };
-
-                    // ── Cognitive gate: block_aggressive / observe_only ──────────────
-                    // Epistemic uncertainty > 0.70 → Conservative (no SIGSTOP, no throttle).
-                    // Epistemic uncertainty > 0.85 → Observe (no actions at all).
-                    // [Sutton 2018 §13: reduce action scope under high policy uncertainty]
-                    // [Lakshminarayanan 2017: predictive uncertainty → action inhibition]
-                    let op_mode = if prev_cog_decision.as_ref().map_or(false, |d| d.observe_only)
-                        && op_mode == OperationMode::Full
-                    {
-                        tracing::debug!("cognitive gate: observe_only → OperationMode::Observe");
-                        OperationMode::Observe
-                    } else if prev_cog_decision
-                        .as_ref()
-                        .map_or(false, |d| d.block_aggressive)
-                        && op_mode == OperationMode::Full
-                    {
-                        tracing::debug!(
-                            "cognitive gate: block_aggressive → OperationMode::Conservative"
-                        );
-                        OperationMode::Conservative
-                    } else {
-                        op_mode
-                    };
-
-                    // Filter actions based on degradation tier.
-                    let filtered_actions: Vec<RootAction> = if op_mode == OperationMode::Emergency {
-                        // Emergency: only unfreeze, no new actions.
-                        final_actions
-                            .into_iter()
-                            .filter(|a| matches!(a, RootAction::UnfreezeProcess { .. }))
-                            .collect()
-                    } else if op_mode == OperationMode::Observe {
-                        // Observe: no actions at all.
-                        Vec::new()
-                    } else if op_mode == OperationMode::Conservative {
-                        // Conservative: only unfreeze + QoS hints (no SIGSTOP, no throttle).
-                        final_actions
-                            .into_iter()
-                            .filter(|a| {
-                                matches!(
-                                    a,
-                                    RootAction::UnfreezeProcess { .. }
-                                        | RootAction::SetThreadQoS { .. }
-                                        | RootAction::BoostProcess { .. }
-                                )
-                            })
-                            .collect()
-                    } else {
-                        // Full: all actions pass through.
-                        final_actions
-                    };
-
-                    // Dedup: skip ThrottleProcess for PIDs already throttled last cycle.
-                    // Without this, decide_actions re-throttles 30+ PIDs every cycle,
-                    // each producing a journal write → I/O saturation → system freeze.
-                    let filtered_actions = {
-                        use std::sync::Mutex;
-                        static PREV_THROTTLED: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
-                        let prev = PREV_THROTTLED.lock().unwrap_or_else(|e| e.into_inner());
-                        let prev_set = prev.clone().unwrap_or_default();
-                        drop(prev);
-                        let mut this_cycle = HashSet::new();
-                        let deduped: Vec<RootAction> = filtered_actions
-                            .into_iter()
-                            .filter(|a| {
-                                if let RootAction::ThrottleProcess { pid, .. } = a {
-                                    this_cycle.insert(*pid);
-                                    !prev_set.contains(pid)
-                                } else {
-                                    true
-                                }
-                            })
-                            .collect();
-                        *PREV_THROTTLED.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(this_cycle);
-                        deduped
-                    };
-
-                    // Causal QoS upgrade: FreezeProcess → ThrottleProcess for CPU-dominant processes.
-                    // Iterates the deduped action list once; no-op when causal_qos_names is empty
-                    // (cold start or no CPU-dominant evidence yet — defaults to safe SIGSTOP path).
-                    let filtered_actions: Vec<RootAction> = if !causal_qos_names.is_empty() {
-                        filtered_actions
-                            .into_iter()
-                            .map(|a| match a {
-                                RootAction::FreezeProcess {
-                                    pid,
-                                    name,
-                                    reason,
-                                    start_sec,
-                                    start_usec,
-                                } if causal_qos_names.contains(name.as_str()) => {
-                                    causal_qos_upgrades_cycle += 1;
-                                    RootAction::ThrottleProcess {
-                                        pid,
-                                        name,
-                                        aggressive: true,
-                                        reason: format!("{} [causal:qos]", reason),
-                                        start_sec,
-                                        start_usec,
-                                    }
-                                }
-                                other => other,
-                            })
-                            .collect()
-                    } else {
-                        filtered_actions
-                    };
+                    // ── Filter pipeline (Wave 9 Pass 1) ──────────────────────
+                    // Circuit-breaker snapshot + degradation tier + cognitive
+                    // gates (observe_only / block_aggressive) + mode filter +
+                    // throttle dedup + causal QoS upgrade.  All mutation
+                    // stays inside daemon_action_pipeline; this helper only
+                    // touches `state.policy` — no metrics/frozen_state/mach_qos.
+                    let filter_outcome = daemon_action_pipeline::run_filter_pipeline(
+                        final_actions,
+                        &state,
+                        &snapshot,
+                        prev_cog_decision.as_ref(),
+                        &causal_qos_names,
+                    );
+                    let cb_is_open = filter_outcome.cb_is_open;
+                    let op_mode = filter_outcome.op_mode;
+                    let filtered_actions = filter_outcome.filtered_actions;
+                    causal_qos_upgrades_cycle += filter_outcome.causal_qos_upgrades;
 
                     // Extract a temporary HashSet for execute_actions (which requires &mut HashSet<u32>).
                     let mut frozen_set: HashSet<u32> =
