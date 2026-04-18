@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 mod cognitive_tick;
 mod daemon_action_pipeline;
 mod daemon_cognitive_tick;
+mod daemon_cycle_tail;
 mod daemon_feature_gates;
 mod daemon_freeze_executor;
 mod daemon_init;
@@ -84,7 +85,6 @@ use apollo_optimizer::engine::network_optimizer::NetworkProfile;
 use apollo_optimizer::engine::overflow_guard::{is_build_tool_name, OverflowGuard};
 use apollo_optimizer::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
 use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
-use apollo_optimizer::engine::pipeline::periodic_stage::{run_periodic, PeriodicContext};
 use apollo_optimizer::engine::power_management::detect_battery_status;
 use apollo_optimizer::engine::predictive_agent::{
     AgentContext, Intervention, PredictiveAgent, SpecialistVote,
@@ -5796,29 +5796,13 @@ fn main() -> anyhow::Result<()> {
                 );
 
                 // ── Fluidity QoS elevation ───────────────────────────────────
-                // When a window operation or app launch is active, elevate the
-                // foreground app to Foreground (P-Core) tier immediately.
-                // [Apple QoS Programming Guide 2014] user-interactive QoS =
-                // render-frame priority on P-Cores (Firestorm).
-                if (fluidity_state.window_op_active() || fluidity_state.app_launching())
-                    && !thermal_action.force_ecores
-                {
-                    if let Some(fg_pid) = foreground_pid {
-                        let mut qos = state.mach_qos.lock_recover();
-                        let outcome = qos.set_tier(
-                            fg_pid,
-                            apollo_optimizer::engine::mach_qos::SchedulingTier::Foreground,
-                        );
-                        if outcome.success {
-                            tracing::debug!(
-                                pid = fg_pid,
-                                window_op = fluidity_state.window_op_active(),
-                                launching = fluidity_state.launch_active,
-                                "fluidity: elevated foreground to P-Core (Foreground QoS)"
-                            );
-                        }
-                    }
-                }
+                // Extracted to daemon_cycle_tail::apply_fluidity_qos (Wave 10).
+                daemon_cycle_tail::apply_fluidity_qos(
+                    &state,
+                    &fluidity_state,
+                    &thermal_action,
+                    foreground_pid,
+                );
 
                 metrics_reporter::merge_cycle_metrics(
                     &state,
@@ -5840,76 +5824,35 @@ fn main() -> anyhow::Result<()> {
                     sleep_notifier.is_sleeping(),
                 );
 
-                // ── Enriched telemetry wiring (2026-04-04) ──────────────────────────────
-                // Fields added to RuntimeMetrics that can only be computed here in the
-                // main loop where swap_forecast, sys, and cycle state are in scope.
-                {
-                    let mut m = state.metrics.lock_recover();
-                    // SwapTrend — previously computed but never exposed.
-                    m.metrics.swap_trend = format!("{:?}", swap_forecast.swap_trend);
-                    // WindowServer CPU — use EMA from FluidityState (already computed
-                    // each cycle in the proc_snaps block). More stable than raw sample.
-                    m.metrics.windowserver_cpu_pct = fluidity_state.windowserver_cpu_ema;
-                    // Compression signal from the EMA-smoothed compressor_pressure already
-                    // computed by the collector (ratio of compressor pages to total physical
-                    // pages × 0.85). The old formula used_ram - (total - free) was wrong:
-                    // on macOS total ≠ used + free (inactive/wired/speculative pages exist),
-                    // producing saturating_sub underflow → always 0 or nonsense.
-                    m.metrics.compressed_memory_ratio =
-                        snapshot.pressure.compressor_pressure.clamp(0.0, 1.0);
-                    // Frozen RAM: sum of RSS of currently frozen PIDs.
-                    let sys = collector.system();
-                    let frozen_pids = state.frozen_state.lock_recover().clone();
-                    m.metrics.frozen_ram_mb = frozen_pids
-                        .iter()
-                        .filter_map(|(pid, _)| sys.process(sysinfo::Pid::from_u32(*pid)))
-                        .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
-                        .sum::<f64>()
-                        .max(0.0);
-                    // cycles_high_pressure — consecutive cycles above bg_pressure.
-                    let bg_threshold = overflow_thresholds.bg_pressure;
-                    if snapshot.pressure.memory_pressure > bg_threshold {
-                        m.metrics.cycles_high_pressure =
-                            m.metrics.cycles_high_pressure.saturating_add(1);
-                    } else {
-                        m.metrics.cycles_high_pressure = 0;
-                    }
-                    // behavior_interactive_pid_count — how many PIDs learned dynamically.
-                    m.metrics.behavior_interactive_pid_count = behavior_interactive_pids.len();
-                    // rl_threshold_current — absolute threshold (bg_pressure + rl_adj).
-                    m.metrics.rl_threshold_current =
-                        bg_threshold + m.metrics.rl_adjustment_pp as f64 / 100.0;
-                    // ── UCHS / Neurocognitive metrics (8 cognitive modules) ──────────
-                    m.metrics.uchs_composite = cog_decision.uchs_composite;
-                    m.metrics.uchs_grade = cognitive_state.health.grade.clone();
-                    m.metrics.uchs_recovery_mode = cognitive_state.health.recovery_mode;
-                    m.metrics.epistemic_uncertainty = cognitive_state.epistemic.composite;
-                    m.metrics.epistemic_level = cognitive_state.epistemic.level_label().to_string();
-                    m.metrics.meta_confidence = cognitive_state.meta_cognition.meta_confidence;
-                    m.metrics.humble_mode = cog_decision.humble_mode;
-                    m.metrics.adversarial_pass_rate =
-                        cognitive_state.adversarial.lifetime_pass_rate() as f32;
-                    m.metrics.adversarial_safety_alert = cog_decision.safety_alert;
-                    m.metrics.cognitive_snr = cognitive_state.reward_bus.signal_to_noise();
-                    m.metrics.self_eval_quality = cognitive_state.self_evaluator.evaluator_trust();
-                    m.metrics.reptile_cached_workloads = cognitive_state.reptile.cached_workloads();
-                    m.metrics.drift_early_warning =
-                        lctx.outcome_tracker.drift_detector.early_warning();
-                    // Causal QoS upgrades this cycle (FreezeProcess → ThrottleProcess).
-                    m.metrics.causal_qos_upgrades_cycle = causal_qos_upgrades_cycle;
-                    // Predictive thermal state from ThermalManager (previously discarded).
-                    // seconds_to_throttle: null = no forecast, 0 = throttling now, >0 = seconds of headroom.
-                    m.metrics.thermal_predicted_throttle = thermal_predicted_throttle;
-                    m.metrics.thermal_seconds_to_throttle = thermal_seconds_to_throttle;
-                    m.metrics.thermal_trend_predicted = thermal_trend_predicted.clone();
-                }
+                // ── Enriched telemetry + UCHS neurocognitive metrics ────────────────────
+                // Extracted to daemon_cycle_tail::wire_enriched_telemetry (Wave 10).
+                // Combines the two original blocks under a single state.metrics lock guard.
+                daemon_cycle_tail::wire_enriched_telemetry(
+                    &state,
+                    &collector,
+                    &daemon_cycle_tail::EnrichedTelemetryInputs {
+                        snapshot: &snapshot,
+                        swap_forecast: &swap_forecast,
+                        fluidity_state: &fluidity_state,
+                        overflow_thresholds: &overflow_thresholds,
+                        behavior_interactive_pids: &behavior_interactive_pids,
+                        cog_decision: &cog_decision,
+                        cognitive_state: &cognitive_state,
+                        lctx: &lctx,
+                        causal_qos_upgrades_cycle,
+                        thermal_predicted_throttle,
+                        thermal_seconds_to_throttle,
+                        thermal_trend_predicted: &thermal_trend_predicted,
+                    },
+                );
 
                 // ── Periodic stage: GC and observability (% 100 / % 500 / % 7200 gates) ──
-                // % 500 GC (experience compress, weight prune, skill GC) runs here.
+                // Extracted to daemon_cycle_tail::run_periodic_stage (Wave 10).
+                // % 500 GC (experience compress, weight prune, skill GC) runs inside.
                 // % 100 persist and rule-induction remain inline above (need SharedState).
                 // % 7200 hourly GC remains inline above (binary-local types).
-                {
-                    let mut pctx = PeriodicContext {
+                let _periodic_result = daemon_cycle_tail::run_periodic_stage(
+                    daemon_cycle_tail::PeriodicStageInputs {
                         cycle_count,
                         current_pressure: snapshot.pressure.memory_pressure,
                         workload_mode: workload_mode.as_str(),
@@ -5920,10 +5863,9 @@ fn main() -> anyhow::Result<()> {
                         persist_generations,
                         last_restore_quality,
                         pending_trial_skill: pending_trial_skill.clone(),
-                        lctx: &mut lctx,
-                    };
-                    let _periodic_result = run_periodic(&mut pctx);
-                }
+                    },
+                    &mut lctx,
+                );
 
                 // Push estado a suscriptores activos (menubar, etc.)
                 socket_handler::broadcast_current_status(&state);
