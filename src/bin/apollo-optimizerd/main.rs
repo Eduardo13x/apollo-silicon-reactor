@@ -5177,6 +5177,21 @@ fn main() -> anyhow::Result<()> {
                     rl.set_swap_growth_streak(swap_growth_streak);
                 }
 
+                // Observability: count one activation per cycle survival is active.
+                // Previously the counter was declared but never incremented, so
+                // survival_mode_activations was always 0 in runtime_metrics.json.
+                if apollo_optimizer::engine::safety::survival_mode_active_total(
+                    snapshot.pressure.memory_pressure,
+                    snapshot.pressure.swap_used_bytes,
+                    snapshot.pressure.swap_total_bytes,
+                ) {
+                    state
+                        .metrics
+                        .lock_recover()
+                        .metrics
+                        .survival_mode_activations += 1;
+                }
+
                 // Decaimiento gradual: si el sistema está en calma, relajar thresholds.
                 lctx.overflow_guard.tick_decay(
                     snapshot.pressure.memory_pressure,
