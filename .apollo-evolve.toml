@@ -1,0 +1,8 @@
+# apollo-evolve config — consumed by the apollo-evolve skill.
+# See ~/.claude/skills/apollo-evolve/references/notebooklm-integration.md
+
+[notebooklm]
+notebook_id = "8344b94c-a014-4803-abea-076a55753cfd"
+name = "Apollo Optimizer — apollo-evolve"
+# Sources uploaded on 2026-04-16: commits.txt, GRAPH_REPORT.md, CLAUDE.md,
+# memory.md, specs.md, modules.md, ais.md, papers.txt, runtime_metrics.txt

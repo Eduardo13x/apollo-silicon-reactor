@@ -208,6 +208,13 @@ pub struct RlThresholdAgent {
     /// Consecutive Lower5pp actions (for constraint enforcement).
     consecutive_lower: u32,
 
+    /// Consecutive ticks where swap grew > 1 MB/s. Set by daemon via
+    /// `set_swap_growth_streak`. When ≥ 3, Raise1pp is vetoed to prevent
+    /// RL from relaxing the freeze gate while swap is climbing.
+    /// Kernel pressure lags swap growth [Nygard 2018 §4] — swap delta is
+    /// the faster crisis signal, and the RL reward (overflow-only) misses it.
+    swap_growth_streak: u32,
+
     // ── Pressure histogram for band auto-tuning (Phase 2) ────────────
     /// Ring buffer of recent pressure observations for quantile estimation.
     pressure_histogram: Vec<f64>,
@@ -284,7 +291,15 @@ impl RlThresholdAgent {
             compressor_histogram: Vec::with_capacity(200),
             histogram_cursor: 0,
             compound_at_floor: false,
+            swap_growth_streak: 0,
         }
+    }
+
+    /// Daemon sets this each cycle based on observed swap delta.
+    /// Pass the running count of consecutive ticks with swap_delta > 1 MB/s.
+    /// Reset to 0 when swap stabilizes. See `swap_growth_streak` field doc.
+    pub fn set_swap_growth_streak(&mut self, streak: u32) {
+        self.swap_growth_streak = streak;
     }
 
     pub fn epsilon(&self) -> f64 {
@@ -405,6 +420,14 @@ impl RlThresholdAgent {
         }
 
         let mut action = self.select_action(state);
+        // Meta-gate: under sustained swap growth (≥3 cycles > 1MB/s), veto
+        // Raise1pp. RL reward is overflow-only, so it doesn't "feel" swap
+        // exhaustion until kernel pressure catches up. Until then, letting
+        // the threshold drift up during a crisis is unsafe.
+        // [Nygard 2018 §4] — shed load on the faster crisis signal.
+        if self.swap_growth_streak >= 3 && matches!(action, RlAction::Raise1pp) {
+            action = RlAction::Hold;
+        }
         // Infrastructure-locked constraint (Hermes/Tinker-Atropos):
         // Prevent threshold collapse from too many consecutive Lower5pp.
         if matches!(action, RlAction::Lower5pp) {
@@ -647,7 +670,50 @@ mod tests {
             compressor_histogram: Vec::new(),
             histogram_cursor: 0,
             compound_at_floor: false,
+            swap_growth_streak: 0,
         }
+    }
+
+    #[test]
+    fn test_swap_growth_streak_vetoes_raise() {
+        let mut agent = make_agent();
+        // Pre-seed Q-table so Raise1pp is the preferred action in this state.
+        let state = RlState::from_metrics(0.50, 0.30, 0);
+        let idx = state.index();
+        agent.q_table[idx][RlAction::Raise1pp as usize] = 10.0;
+        agent.q_table[idx][RlAction::Hold as usize] = 0.0;
+        agent.q_table[idx][RlAction::Lower5pp as usize] = -5.0;
+        // Force deterministic exploit path (no exploration).
+        agent.total_ticks = EPSILON_DECAY_TICKS + 1;
+        agent.set_swap_growth_streak(3);
+        let before = agent.current_adjustment;
+        agent.tick(state, false);
+        // Raise1pp would have increased by 0.01 — veto should keep it flat.
+        assert!(
+            (agent.current_adjustment - before).abs() < 1e-9,
+            "Raise1pp must be vetoed under swap growth: before={} after={}",
+            before,
+            agent.current_adjustment
+        );
+        assert!(matches!(agent.last_action, Some(RlAction::Hold)));
+    }
+
+    #[test]
+    fn test_swap_growth_streak_below_threshold_permits_raise() {
+        let mut agent = make_agent();
+        let state = RlState::from_metrics(0.50, 0.30, 0);
+        let idx = state.index();
+        agent.q_table[idx][RlAction::Raise1pp as usize] = 10.0;
+        agent.total_ticks = EPSILON_DECAY_TICKS + 1;
+        agent.set_swap_growth_streak(2); // below threshold
+        let before = agent.current_adjustment;
+        agent.tick(state, false);
+        assert!(
+            agent.current_adjustment > before,
+            "Raise1pp must apply when streak<3: before={} after={}",
+            before,
+            agent.current_adjustment
+        );
     }
 
     #[test]

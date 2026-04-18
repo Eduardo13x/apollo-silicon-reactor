@@ -1171,6 +1171,10 @@ fn main() -> anyhow::Result<()> {
                 spotlight_set_indexing(startup_calm);
             }
 
+            // Consecutive cycles where swap_delta > 1MB/s. Fed to RL meta-gate
+            // to veto Raise1pp during sustained swap growth (see rl_threshold.rs).
+            let mut swap_growth_streak: u32 = 0;
+
             // ── Feature 3: RT Boost for Foreground ───────────────────────────
             // THREAD_TIME_CONSTRAINT_POLICY: guarantee 2ms/10ms to foreground UI thread.
             // Eliminates UI hitches during heavy CPU load (e.g., LLM inference + browser).
@@ -5161,6 +5165,16 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
+                // Track swap growth streak → RL meta-gate.
+                if snapshot.pressure.swap_delta_bytes_per_sec > 1_048_576.0 {
+                    swap_growth_streak = swap_growth_streak.saturating_add(1);
+                } else {
+                    swap_growth_streak = 0;
+                }
+                if let Some(rl) = lctx.overflow_guard.rl_agent.as_mut() {
+                    rl.set_swap_growth_streak(swap_growth_streak);
+                }
+
                 // Decaimiento gradual: si el sistema está en calma, relajar thresholds.
                 lctx.overflow_guard.tick_decay(
                     snapshot.pressure.memory_pressure,
