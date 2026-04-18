@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 /// Signal handlers cannot capture Arc/closures, so we use a static AtomicBool
 /// that the main loop checks alongside `state.stop`.
 mod cognitive_tick;
+mod daemon_cognitive_tick;
 mod daemon_feature_gates;
 mod daemon_freeze_executor;
 mod daemon_init;
@@ -85,7 +86,7 @@ use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
 use apollo_optimizer::engine::pipeline::periodic_stage::{run_periodic, PeriodicContext};
 use apollo_optimizer::engine::power_management::detect_battery_status;
 use apollo_optimizer::engine::predictive_agent::{
-    specialist, tally_votes, AgentContext, Intervention, PredictiveAgent, SpecialistVote,
+    AgentContext, Intervention, PredictiveAgent, SpecialistVote,
 };
 use apollo_optimizer::engine::proc_taskinfo;
 use apollo_optimizer::engine::profile_governor::GovernorInput;
@@ -880,9 +881,8 @@ fn main() -> anyhow::Result<()> {
                 Arc::new(ForegroundDetector::new().with_cache_ttl(Duration::from_secs(3)));
 
             // Habituation filter (Thompson & Spencer 1966, inspired by memoria-core).
-            // Tracks per-process (cpu_bucket, rss_bucket, cycles_unchanged).
-            // Processes unchanged for ≥5 cycles are skipped in decide_actions.
-            const HABITUATION_THRESHOLD: u32 = 5;
+            // Per-cycle update + GC lives in `daemon_cognitive_tick::update_habituation_state`;
+            // only the (pid → bucket-state) map is owned here for cross-cycle carry.
             let mut habituation_map: HashMap<u32, (u8, u8, u32)> = HashMap::new();
             // Track cycle-to-cycle wall time for energy dt calculation.
             let mut last_cycle_instant = Instant::now();
@@ -961,14 +961,12 @@ fn main() -> anyhow::Result<()> {
             // Predictive agent: LinUCB contextual bandit for proactive interventions.
             let mut predictive_agent =
                 PredictiveAgent::load_or_default(std::path::Path::new(predictive_agent_path()));
-            // Track previous cycle pressure to detect spikes (for accuracy feedback).
-            let mut prev_pressure_smooth: f64 = 0.0;
-            // Track previous cycle's actual specialist firing signals for accurate
-            // accuracy feedback (avoids pressure-proxy approximations).
-            let mut prev_hazard_fired: bool = false;
-            let mut prev_monopoly_fired: bool = false;
-            let mut prev_kalman_fired: bool = false;
-            let mut prev_linucb_intervened: bool = false;
+            // Super Learner cross-cycle feedback state: prev pressure + actual
+            // firing signals for each specialist.  Owned by the main loop so the
+            // extracted `daemon_cognitive_tick::apply_specialist_voting` can grade
+            // next cycle's accuracy against what *actually* fired.
+            let mut specialist_feedback =
+                daemon_cognitive_tick::SpecialistFeedbackState::default();
 
             // ZeroTune: seed with hardware meta-features on cold start.
             // Reduces warmup from 200→50 cycles by injecting domain knowledge priors.
@@ -3516,164 +3514,22 @@ fn main() -> anyhow::Result<()> {
                         .predictive_agent
                         .select_action_with_confidence(&agent_ctx);
 
-                    // ── Specialist accuracy feedback (Super Learner) ─────────────────
-                    // Compare prev cycle's ACTUAL specialist signals against observed outcome.
-                    // Using real firing conditions (not pressure proxies) ensures the tracker
-                    // measures what the specialist actually predicted, not a heuristic stand-in.
-                    // A spike is a pressure rise of ≥0.08 over the previous cycle.
-                    {
-                        let pressure_spiked =
-                            signal_digest.pressure_smooth >= prev_pressure_smooth + 0.08;
-                        // Hazard: did prev cycle's hazard specialist fire (p_oom_30s > 0.30)?
-                        let hazard_correct = (prev_hazard_fired && pressure_spiked)
-                            || (!prev_hazard_fired && !pressure_spiked);
-                        lctx.specialist_accuracy
-                            .update(specialist::HAZARD, hazard_correct);
-
-                        // Monopoly: did prev cycle's monopoly specialist fire (monopoly_risk > 0.5)?
-                        let monopoly_correct = (prev_monopoly_fired && pressure_spiked)
-                            || (!prev_monopoly_fired && !pressure_spiked);
-                        lctx.specialist_accuracy
-                            .update(specialist::MONOPOLY, monopoly_correct);
-
-                        // Kalman: did prev cycle's Kalman predict spike (pressure_predicted_5s > 0.85)?
-                        let kalman_correct = (prev_kalman_fired && pressure_spiked)
-                            || (!prev_kalman_fired && !pressure_spiked);
-                        lctx.specialist_accuracy
-                            .update(specialist::KALMAN, kalman_correct);
-
-                        // LinUCB: voted for non-Observe intervention. Correct if pressure spiked.
-                        let linucb_correct = (prev_linucb_intervened && pressure_spiked)
-                            || (!prev_linucb_intervened && !pressure_spiked);
-                        lctx.specialist_accuracy
-                            .update(specialist::LINUCB, linucb_correct);
-                    }
-                    // Save current cycle's actual specialist firing signals for next cycle's feedback.
-                    prev_pressure_smooth = signal_digest.pressure_smooth;
-                    prev_hazard_fired = signal_digest.p_oom_30s > 0.30;
-                    prev_monopoly_fired = signal_digest.monopoly_risk > 0.5;
-                    prev_kalman_fired = signal_digest.pressure_predicted_5s > 0.85;
-                    prev_linucb_intervened = linucb_choice != Intervention::Observe;
-
-                    // ── Specialist voting: weighted ensemble replaces override chain ──
-                    // Confidences are modulated by learned accuracy weights (Super Learner).
-                    // SpecialistAccuracyTracker EMA-tracks per-specialist correctness;
-                    // a specialist consistently right gets weight→1.0, wrong gets→0.0.
-                    let mut votes = vec![
-                        // LinUCB: primary agent — UCB confidence × learned accuracy weight.
-                        // linucb_confidence is the normalized margin of the winning arm [0.5, 1.0]:
-                        // dominant winner → near 1.0, all arms tied → 0.5.
-                        SpecialistVote {
-                            name: "linucb",
-                            intervention: linucb_choice,
-                            confidence: linucb_confidence
-                                * lctx.specialist_accuracy.weight(specialist::LINUCB),
-                        },
-                    ];
-
-                    // Hazard specialist: high P(OOM) → use MPC recommendation.
-                    if signal_digest.p_oom_30s > 0.30 {
-                        votes.push(SpecialistVote {
-                            name: "hazard",
-                            intervention: Intervention::from_index(
-                                signal_digest.mpc_recommendation,
-                            ),
-                            confidence: signal_digest.p_oom_30s.min(1.0)
-                                * lctx.specialist_accuracy.weight(specialist::HAZARD),
-                        });
-                    }
-
-                    // Monopoly specialist: one process hogging RAM → throttle noise.
-                    if signal_digest.monopoly_risk > 0.5 {
-                        votes.push(SpecialistVote {
-                            name: "monopoly",
-                            intervention: Intervention::PreThrottleNoise,
-                            confidence: signal_digest.monopoly_risk.min(1.0)
-                                * lctx.specialist_accuracy.weight(specialist::MONOPOLY),
-                        });
-                    }
-
-                    // Kalman specialist: predicted pressure spike → tighten.
-                    if signal_digest.pressure_predicted_5s > 0.85 {
-                        votes.push(SpecialistVote {
-                            name: "kalman",
-                            intervention: Intervention::TightenThresholds,
-                            confidence: (signal_digest.pressure_predicted_5s - 0.85).min(0.15)
-                                / 0.15
-                                * lctx.specialist_accuracy.weight(specialist::KALMAN),
-                        });
-                    }
-
-                    // Proactive-30s specialist: Kalman projects overflow in ~30s but we're
-                    // still below the action threshold — act NOW before RAM fills up.
-                    // This is the key advantage over purely reactive systems:
-                    // the OS can only react; Apollo can predict and pre-empt.
-                    let p30_trigger = overflow_thresholds.bg_pressure as f64 - 0.05;
-                    let p30_clear = overflow_thresholds.bg_pressure as f64 - 0.08;
-                    if signal_digest.pressure_predicted_30s > p30_trigger
-                        && signal_digest.pressure_smooth < p30_clear
-                    {
-                        let strength = ((signal_digest.pressure_predicted_30s - p30_trigger)
-                            / 0.10)
-                            .clamp(0.0, 1.0);
-                        votes.push(SpecialistVote {
-                            name: "proactive-30s",
-                            intervention: Intervention::TightenThresholds,
-                            confidence: strength
-                                * lctx.specialist_accuracy.weight(specialist::KALMAN),
-                        });
-                    }
-
-                    let vote_result = tally_votes(&votes);
-                    let intervention = vote_result.intervention;
-
-                    // Loop 3: store votes for disagreement outcome feedback next cycle.
-                    if vote_result.had_disagreement {
-                        last_specialist_votes = Some((votes.clone(), intervention));
-                    } else {
-                        last_specialist_votes = None;
-                    }
-
-                    // Cable: had_disagreement → conservative safety route.
-                    // When specialists disagree AND the winning score is weak (<0.4),
-                    // the signal is ambiguous. Fall back to Observe instead of risking
-                    // a wrong aggressive action. Only override if not in survival mode.
-                    let intervention = if vote_result.had_disagreement {
-                        audit_log(&serde_json::json!({
-                            "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                            "event": "specialist_disagreement",
-                            "winner": format!("{:?}", intervention),
-                            "score": (vote_result.winning_score * 100.0).round() / 100.0,
-                            "n_votes": votes.len(),
-                            "pressure": (signal_digest.pressure_smooth * 1000.0).round() / 1000.0,
-                        }));
-                        if vote_result.winning_score < 0.4 && signal_digest.pressure_smooth < 0.80 {
-                            // Low confidence + not critical pressure → play it safe.
-                            Intervention::Observe
-                        } else {
-                            intervention
-                        }
-                    } else {
-                        intervention
-                    };
-
-                    // Apply threshold tightening if selected.
-                    overflow_thresholds =
-                        lctx.predictive_agent.adjust_thresholds(overflow_thresholds);
-
-                    // SuggestAggressive: set a 5-minute manual override to aggressive profile.
-                    if intervention == Intervention::SuggestAggressive {
-                        let mut pg = state.policy.lock_recover();
-                        if pg.governor.manual_override.is_none() {
-                            pg.governor.set_manual_override(
-                                OptimizationProfile::AggressiveRoot,
-                                5,
-                                "predictive-agent: proactive pressure mitigation".to_string(),
-                            );
-                        }
-                    }
-
-                    intervention
+                    // Super Learner specialist voting + accuracy feedback.
+                    // Extracted to `daemon_cognitive_tick::apply_specialist_voting`
+                    // during V1.1.0 Strangler Fig wave 7 — pure move, no semantic
+                    // change.  Ordering: runs after LinUCB select and before the
+                    // decision_stage, same as the original inline form.
+                    let voting_out = daemon_cognitive_tick::apply_specialist_voting(
+                        &state,
+                        &mut lctx,
+                        &signal_digest,
+                        &mut specialist_feedback,
+                        &mut overflow_thresholds,
+                        linucb_choice,
+                        linucb_confidence,
+                    );
+                    last_specialist_votes = voting_out.disagreement_record;
+                    voting_out.intervention
                 };
 
                 // Build behavior-interactive PID set from usage model EMA data.
@@ -3851,51 +3707,17 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // ── Habituation: update per-process state tracking ─────────
+                // Habituation per-process state tracking — extracted to
+                // `daemon_cognitive_tick::update_habituation_state`.
                 // Inspired by Thompson & Spencer 1966 / memoria-core habituation.rs.
                 // Processes whose CPU and RSS bucket are unchanged for ≥5 cycles
-                // are skipped in decide_actions (their last action is maintained).
-                // Dishabituation: any bucket change resets the counter.
-                let habituated_pids: HashSet<u32> = {
-                    let mut hab_set = HashSet::new();
-                    for (pid, process) in collector.system().processes() {
-                        let pid_u32 = pid.as_u32();
-                        let cpu_bucket = (process.cpu_usage() / 5.0) as u8;
-                        let rss_bucket = (process.memory() / (50 * 1024 * 1024)) as u8;
-                        match habituation_map.get_mut(&pid_u32) {
-                            Some(entry) => {
-                                if entry.0 == cpu_bucket && entry.1 == rss_bucket {
-                                    entry.2 += 1; // unchanged
-                                    if entry.2 >= HABITUATION_THRESHOLD {
-                                        hab_set.insert(pid_u32);
-                                    }
-                                } else {
-                                    // Dishabituation: state changed.
-                                    *entry = (cpu_bucket, rss_bucket, 0);
-                                }
-                            }
-                            None => {
-                                habituation_map.insert(pid_u32, (cpu_bucket, rss_bucket, 0));
-                            }
-                        }
-                    }
-                    // GC dead PIDs every 100 cycles.
-                    if cycle_count % 100 == 0 {
-                        let live: HashSet<u32> = collector
-                            .system()
-                            .processes()
-                            .keys()
-                            .map(|p| p.as_u32())
-                            .collect();
-                        habituation_map.retain(|pid, _| live.contains(pid));
-                    }
-                    hab_set
-                };
-                // Emit habituation count so AIS runtime benchmark can read it.
-                {
-                    let mut m = state.metrics.lock_recover();
-                    m.metrics.habituation_skips += habituated_pids.len() as u64;
-                }
+                // are skipped in decide_actions.  Dishabituation on any change.
+                let habituated_pids: HashSet<u32> = daemon_cognitive_tick::update_habituation_state(
+                    &state,
+                    collector.system(),
+                    &mut habituation_map,
+                    cycle_count,
+                );
 
                 // [Pearl 2009 + Kahneman 1973] Blend causal graph with experience priors.
                 // Cold processes (< 5 observations) get warm-start priors from
@@ -3922,45 +3744,18 @@ fn main() -> anyhow::Result<()> {
                     &lctx.outcome_tracker.drift_detector,
                 );
 
-                // ── User context: "telepathy" — what is the user doing right now? ──
-                // idle_secs from IOHIDSystem HIDIdleTime — fast ioreg call, safe every cycle.
-                // Sleep assertions + call detection from pmset — amortised: every 5 cycles.
-                // cpu_temp comes from hw_snapshot (already collected by SMC reader above).
-                // [Riva & Mantovani 2014] idle time + media state = highest-signal context cues.
-                let user_context = {
-                    use apollo_optimizer::engine::user_context::UserContext;
-                    // Poll pmset every 3 cycles (~9s) — balances subprocess cost vs
-                    // responsiveness (call starts → detected within 9s, not 15s).
-                    let collect_assertions = cycle_count % 3 == 0;
-                    let mut ctx = UserContext::collect(collect_assertions);
-                    // Merge: on non-assertion cycles, carry forward last known state.
-                    // Prevents freeze_gate from flickering between "user-protected" and
-                    // "delta/committed" every cycle. [Cook et al. 2019]
-                    if collect_assertions {
-                        last_user_assertions = (
-                            ctx.has_sleep_assertion,
-                            ctx.call_in_progress,
-                            ctx.audio_active,
-                        );
-                    } else {
-                        ctx.has_sleep_assertion = last_user_assertions.0;
-                        ctx.call_in_progress = last_user_assertions.1;
-                        ctx.audio_active = last_user_assertions.2;
-                    }
-                    // Merge cpu_temp from hw_snapshot (already in RuntimeMetrics).
-                    // If P-cluster temp > 75°C, treat as if more active (raise pressure gate)
-                    // so Apollo conserves thermal headroom for the user's workload.
-                    if let Some(ref hw) = cycle_hw_snap {
-                        if let Some(p_temp) = hw.temps.p_cluster_celsius {
-                            if p_temp > 75.0 && !ctx.is_idle_long() {
-                                // Simulate "recently active" to raise freeze gates and
-                                // protect thermal headroom — overrides any idle signal.
-                                ctx.idle_secs = ctx.idle_secs.min(10.0);
-                            }
-                        }
-                    }
-                    ctx
-                };
+                // User context "telepathy" — extracted to
+                // `daemon_cognitive_tick::compute_user_context`.
+                // [Riva & Mantovani 2014] idle time + media state = highest-signal
+                // context cues.  Uses IOHIDSystem HIDIdleTime every cycle, pmset
+                // (sleep/call/audio) every 3 cycles with carry-forward to avoid
+                // freeze_gate flicker, and SMC P-cluster temp > 75 °C to clamp
+                // idle_secs for thermal headroom protection.
+                let user_context = daemon_cognitive_tick::compute_user_context(
+                    cycle_count,
+                    &mut last_user_assertions,
+                    cycle_hw_snap.as_ref(),
+                );
 
                 // Bypass habituation under critical conditions.
                 // Habituation assumes "stable RSS = no problem", but under heavy swap
