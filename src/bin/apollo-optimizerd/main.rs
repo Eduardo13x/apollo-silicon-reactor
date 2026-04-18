@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 /// Signal handlers cannot capture Arc/closures, so we use a static AtomicBool
 /// that the main loop checks alongside `state.stop`.
 mod cognitive_tick;
+mod daemon_feature_gates;
 mod daemon_freeze_executor;
 mod daemon_init;
 mod daemon_pressure_aggregator;
@@ -1415,23 +1416,13 @@ fn main() -> anyhow::Result<()> {
                 // If more than 30s passed since the last cycle, the system was
                 // sleeping. Apply 60s App-Nap window to all non-essential
                 // backgrounds so the foreground app restores its state first.
-                let elapsed_since_last_cycle = last_cycle_instant.elapsed();
-                if elapsed_since_last_cycle > Duration::from_secs(30) {
-                    wake_suppression_until = Some(Instant::now() + Duration::from_secs(60));
-                    println!(
-                        "[wake] System woke from sleep ({}s gap) — 60s background suppression active",
-                        elapsed_since_last_cycle.as_secs()
-                    );
-                    // Release any App Nap set before sleep; re-evaluate fresh.
-                    let mut qos = state.mach_qos.lock_recover();
-                    qos.release_all_app_nap();
-                }
-                // NOTE: do NOT reset last_cycle_instant here — it must span the full
-                // inter-cycle interval so that cycle_dt_secs (computed later) reflects
-                // the real wall-clock gap between cycles, not just intra-cycle work time.
-                let in_wake_suppression = wake_suppression_until
-                    .map(|t| Instant::now() < t)
-                    .unwrap_or(false);
+                // (last_cycle_instant is NOT reset here — must span the full
+                // inter-cycle interval so cycle_dt_secs reflects real wall-clock.)
+                let in_wake_suppression = daemon_feature_gates::apply_post_wake_suppression(
+                    &state,
+                    last_cycle_instant,
+                    &mut wake_suppression_until,
+                );
 
                 // Enforce minimum inter-cycle delay to prevent event-storm CPU burn.
                 // In dry-run the condvar wait is already 100ms; skip the additional floor.
@@ -2615,57 +2606,25 @@ fn main() -> anyhow::Result<()> {
 
                 // ── Feature 1: LLM Inference Mode ─────────────────────────────
                 // Detect ollama/llama.cpp/MLX and boost pressure gates aggressively.
-                let llm_boost = {
-                    let proc_iter = snapshot
-                        .top_processes
-                        .iter()
-                        .map(|p| (p.pid, p.name.as_str(), p.cpu_usage));
-                    llm_detector.observe(proc_iter);
-                    llm_detector.pressure_boost()
-                };
-                let llm_active = llm_detector.is_active();
-
-                // Spotlight management: disable during LLM inference, re-enable when done.
-                if is_root {
-                    if llm_active && !llm_spotlight_disabled {
-                        spotlight_set_indexing(false);
-                        llm_spotlight_disabled = true;
-                        println!("[llm-mode] Spotlight indexing disabled for inference");
-                    } else if !llm_active && llm_spotlight_disabled {
-                        spotlight_set_indexing(true);
-                        llm_spotlight_disabled = false;
-                        println!("[llm-mode] Spotlight indexing re-enabled");
-                    }
-                }
+                let daemon_feature_gates::LlmInferenceOutcome {
+                    llm_boost,
+                    llm_active,
+                } = daemon_feature_gates::run_llm_inference_mode_tick(
+                    &snapshot,
+                    &mut llm_detector,
+                    &mut llm_spotlight_disabled,
+                    is_root,
+                );
 
                 // ── Feature 3: RT Boost for Foreground ────────────────────────
                 // Apply THREAD_TIME_CONSTRAINT_POLICY to foreground UI thread.
-                // Only when thermal is not critical (Phase3+ would negate the benefit).
-                if thermal_action.phase
-                    < apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase3Aggressive
-                {
-                    if let Some(fg_pid) = foreground_pid {
-                        if rt_boosted_pid != Some(fg_pid) {
-                            // Clear RT boost from previous foreground.
-                            if let Some(old_pid) = rt_boosted_pid {
-                                let mut qos = state.mach_qos.lock_recover();
-                                qos.clear_realtime_boost(old_pid);
-                            }
-                            // Apply RT boost to new foreground.
-                            let mut qos = state.mach_qos.lock_recover();
-                            if qos.set_realtime_boost(fg_pid) {
-                                rt_boosted_pid = Some(fg_pid);
-                            } else {
-                                rt_boosted_pid = None;
-                            }
-                        }
-                    } else if let Some(old_pid) = rt_boosted_pid {
-                        // No foreground — clear boost.
-                        let mut qos = state.mach_qos.lock_recover();
-                        qos.clear_realtime_boost(old_pid);
-                        rt_boosted_pid = None;
-                    }
-                }
+                // Skipped during thermal Phase3+ (P-core pinning would defeat cooling).
+                daemon_feature_gates::apply_rt_boost_foreground(
+                    &state,
+                    &thermal_action,
+                    foreground_pid,
+                    &mut rt_boosted_pid,
+                );
 
                 // ── Effective pressure aggregation (Strangler Fig) ───────────
                 // Charging thermal stress + B0TE aggressiveness + 9-boost
@@ -4943,118 +4902,27 @@ fn main() -> anyhow::Result<()> {
                 // ── Feature 5: Wakeup Budget Enforcer ───────────────────────
                 // Graduated severity response: Critical/High → App Nap,
                 // Medium → Background tier (E-cores), Low → skip.
-                // [Nygard 2018 "Release It!" Ch.5 — graduated response avoids
-                // over-reaction to transient wakeup bursts.]
-                let storms = wake_storm.detect_storms();
-                {
-                    use apollo_optimizer::engine::mach_qos::SchedulingTier;
-                    use apollo_optimizer::engine::wake_storm_detector::StormSeverity;
-                    let storm_pids: std::collections::HashSet<u32> =
-                        storms.iter().map(|s| s.pid).collect();
-                    let mut qos = state.mach_qos.lock_recover();
-
-                    // Apply severity-graduated mitigation.
-                    for storm in &storms {
-                        if heuristic_critical_pids.contains(&storm.pid)
-                            || Some(storm.pid) == foreground_pid
-                        {
-                            continue;
-                        }
-                        let severity = wake_storm.get_severity(storm.wakeups_per_second);
-                        match severity {
-                            StormSeverity::Critical | StormSeverity::High => {
-                                qos.set_app_nap(storm.pid, true);
-                            }
-                            StormSeverity::Medium => {
-                                // E-core routing without full App Nap suppression.
-                                qos.set_tier(storm.pid, SchedulingTier::Background);
-                            }
-                            StormSeverity::Low => {
-                                // Below threshold: monitor only, no intervention.
-                            }
-                        }
-                    }
-
-                    // Release App Nap for pids that are no longer in a storm.
-                    // (gc_dead_pids handles dead pids; this handles calmed pids)
-                    let app_napped_snapshot: Vec<u32> = qos
-                        .current_tier_keys()
-                        .iter()
-                        .filter(|(pid, _)| qos.is_app_napped(*pid))
-                        .map(|(pid, _)| *pid)
-                        .collect();
-                    for pid in app_napped_snapshot {
-                        if !storm_pids.contains(&pid) {
-                            qos.set_app_nap(pid, false);
-                        }
-                    }
-                }
+                // [Nygard 2018 "Release It!" Ch.5]
+                let storms = daemon_feature_gates::enforce_wakeup_budget(
+                    &state,
+                    &mut wake_storm,
+                    &heuristic_critical_pids,
+                    foreground_pid,
+                );
 
                 // ── Feature 2 + 4: App Nap for LLM mode and post-wake window ──
-                // During LLM inference: App-Nap all non-foreground non-essential.
-                // During wake suppression: same, to give foreground first crack.
-                if llm_active || in_wake_suppression {
-                    let appnap_hard = protected_processes();
-                    let appnap_infra = infrastructure_processes();
-                    let appnap_policy = state
-                        .policy
-                        .lock_recover()
-                        .learned_policy
-                        .protected_patterns
-                        .clone();
-                    let mut qos = state.mach_qos.lock_recover();
-                    for (pid, process) in collector.system().processes() {
-                        let pid_u32 = pid.as_u32();
-                        let name = process.name();
-                        let is_foreground = Some(pid_u32) == foreground_pid;
-                        // Evaluate behavioral signals for Tier-4 interactive detection.
-                        let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
-                        let has_gui = snap.map_or(false, |s| s.has_gui_window);
-                        let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
-                        let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
-                        let is_interactive = is_user_interactive_app(has_gui, idle_s, rss, name);
-                        let protection = classify_protection(
-                            name,
-                            &appnap_hard,
-                            &appnap_infra,
-                            &appnap_policy,
-                            is_interactive,
-                        );
-                        // Apollo itself is never app-napped (self-protection).
-                        // Unconditional: OS/infra/policy — always skip.
-                        // ConditionalForeground: user-interactive apps — skip only when foreground.
-                        let should_protect = name == "apollo-optimizerd"
-                            || protection == ProtectionLevel::Unconditional
-                            || (protection == ProtectionLevel::ConditionalForeground
-                                && is_foreground);
-                        if should_protect {
-                            // Protected: ensure NOT app-napped.
-                            if qos.is_app_napped(pid_u32) {
-                                qos.set_app_nap(pid_u32, false);
-                            }
-                            continue;
-                        }
-                        // Skip if already app-napped (dedup).
-                        if !qos.is_app_napped(pid_u32) {
-                            qos.set_app_nap(pid_u32, true);
-                        }
-                    }
-                } else if !in_wake_suppression && !llm_active {
-                    // Neither LLM nor wake: release any LLM/wake App Naps that
-                    // aren't also wake-storm offenders.
-                    let storm_pids: std::collections::HashSet<u32> =
-                        storms.iter().map(|s| s.pid).collect();
-                    let mut qos = state.mach_qos.lock_recover();
-                    let app_napped: Vec<u32> = qos
-                        .current_tier_keys()
-                        .iter()
-                        .filter(|(pid, _)| qos.is_app_napped(*pid) && !storm_pids.contains(pid))
-                        .map(|(pid, _)| *pid)
-                        .collect();
-                    for pid in app_napped {
-                        qos.set_app_nap(pid, false);
-                    }
-                }
+                // During LLM inference or wake suppression: App-Nap all
+                // non-foreground non-essential. Otherwise: release any
+                // LLM/wake App-Nap that isn't also a live wake-storm offender.
+                daemon_feature_gates::apply_app_nap_scheduling(
+                    &state,
+                    &collector,
+                    &proc_snaps,
+                    foreground_pid,
+                    llm_active,
+                    in_wake_suppression,
+                    &storms,
+                );
 
                 // Paging hints: targeted non-fatal memory pressure to idle hoarders.
                 // Uses memorystatus_control warn limit (non-fatal memlimit_inactive)
