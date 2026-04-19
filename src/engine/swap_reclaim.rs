@@ -80,13 +80,12 @@ pub const NET_RATE_FLOOR_BYTES_SEC: f64 = 4_096.0; // 4 KB/s
 pub const MIN_SWAP_CAPACITY_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
 
 /// Minimum swapout rate (pages/s) to escalate to Critical.
-/// Below this threshold the compressor is still absorbing — I/O-level pressure
-/// has not reached the SSD yet.  On M1 8GB swap stays "sticky" (XNU does not
-/// eagerly reclaim swap pages), so `reclaim_rate` is chronically ≈ 0 and
-/// T_sat alone would produce perpetual false-Critical alarms.
-/// Requiring at least one page/s of active swapout confirms real disk I/O.
+/// Set to 0.5 pps (= 8 KB/s to SSD) rather than 1.0 to catch "slow-boil"
+/// scenarios: a process generating 0.5 pps sustained will exhaust swap in
+/// minutes without crossing a 1.0 floor.  The EMA (α=0.2, τ≈4 cycles) already
+/// smooths burst noise, so 0.5 represents genuine sustained I/O, not a spike.
 /// [Zhao et al. 2009] — swapout = compressor overflow event (observable I/O).
-pub const SWAPOUT_FLOOR_PPS: f64 = 1.0;
+pub const SWAPOUT_FLOOR_PPS: f64 = 0.5;
 
 /// Saturation risk classification derived from `T_sat` and `net_rate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +342,17 @@ mod tests {
         let f = m.update(&sample(100.0, 0.0, 0.0, used, gb(8)));
         assert_eq!(f.risk, SwapRisk::Overflow);
         assert!(f.t_sat_sec.is_none()); // already over, eta undefined
+    }
+
+    #[test]
+    fn critical_at_slow_boil_swapout_rate() {
+        // Slow-boil regression: 0.6 pps sustained swapout (above SWAPOUT_FLOOR_PPS=0.5)
+        // with short T_sat must escalate to Critical, not stay at Building.
+        let mut m = SwapReclaimModel::new();
+        let used = (gb(8) as f64 * 0.80) as u64;
+        let f = m.update(&sample_io(10_000.0, 0.0, 0.0, 0.6, used, gb(8)));
+        assert_eq!(f.risk, SwapRisk::Critical,
+            "slow-boil 0.6 pps (> SWAPOUT_FLOOR_PPS=0.5) must escalate to Critical");
     }
 
     #[test]
