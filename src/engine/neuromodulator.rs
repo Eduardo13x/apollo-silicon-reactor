@@ -48,6 +48,10 @@ pub struct NeuroSignals {
     /// τ-divergence [0.0, 1.0]: mean relative deviation of learned τ from default.
     /// ACh tracks novelty [Schultz 1997]; heterogeneous τ = diverse reload behaviors.
     pub tau_divergence: f64,
+    /// G11 — L2 Contention: fraction of cycles with L2 cache stalls [0.0, 1.0].
+    /// High contention = unexpected memory-access pattern = ACh novelty signal.
+    /// [Hasler & Mahowald 1994] — attentional gating amplifies novel stimuli.
+    pub contention_stall_fraction: f64,
 }
 
 pub struct ApolloNeuromodulator {
@@ -133,7 +137,10 @@ impl ApolloNeuromodulator {
         let ach_explore = if s.rl_exploring { 0.2 } else { 0.05 };
         // [Schultz 1997] ACh novelty: heterogeneous τ across apps = diverse physical behaviors.
         let ach_tau = s.tau_divergence.clamp(0.0, 1.0) * 0.15;
-        let ach_signal = (ach_churn + ach_entropy + ach_explore + ach_tau).clamp(0.0, 1.0);
+        // G11: L2 contention novelty — unexpected cache pressure signals access-pattern shift.
+        let ach_contention = s.contention_stall_fraction.clamp(0.0, 1.0) * 0.10;
+        let ach_signal = (ach_churn + ach_entropy + ach_explore + ach_tau + ach_contention)
+            .clamp(0.0, 1.0);
         self.acetylcholine =
             (self.acetylcholine * (1.0 - DECAY) + ach_signal * DECAY).clamp(0.0, 1.0);
 
@@ -176,6 +183,7 @@ mod tests {
             entropy_anomaly: 0.0,
             rl_exploring: false,
             tau_divergence: 0.0,
+            contention_stall_fraction: 0.0,
         }
     }
 

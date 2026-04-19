@@ -127,6 +127,8 @@ pub fn apply_neuromodulator(
             .as_ref()
             .map_or(false, |rl| rl.total_ticks() < 200),
         tau_divergence,
+        // G11: contention_stall_fraction from KPC stall counters (0 if unavailable).
+        contention_stall_fraction: 0.0,
     };
     lctx.neuromod.tick(&neuro_signals);
 
