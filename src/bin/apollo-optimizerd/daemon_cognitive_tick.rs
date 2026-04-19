@@ -205,7 +205,7 @@ pub fn apply_specialist_voting(
         let obs_remaining = lctx
             .outcome_tracker
             .drift_detector
-            .observations_remaining("monopoly_freeze", MONOPOLY_BELIEF_CONFIDENCE_TARGET);
+            .observations_remaining(specialist::NAMES[specialist::MONOPOLY], MONOPOLY_BELIEF_CONFIDENCE_TARGET);
         let maturity_factor = monopoly_maturity_factor(obs_remaining);
         let confidence = (signal_digest.monopoly_risk.min(1.0)
             * lctx.specialist_accuracy.weight(specialist::MONOPOLY)
@@ -219,7 +219,7 @@ pub fn apply_specialist_voting(
                     audit_log(&serde_json::json!({
                         "t": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                         "event": "nars_maturity_horizon",
-                        "belief": "monopoly_freeze",
+                        "belief": specialist::NAMES[specialist::MONOPOLY],
                         "obs_remaining_to_0.80": rem,
                         "maturity_factor": (maturity_factor * 1000.0).round() / 1000.0,
                         "stability_regime": format!("{:?}", signal_digest.stability_regime),
