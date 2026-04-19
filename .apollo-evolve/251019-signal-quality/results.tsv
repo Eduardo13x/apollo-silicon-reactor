@@ -1,0 +1,7 @@
+iteration	commit	metric	delta	status	paper	opens	closes	note
+1	dcae938	tests=1698	+1	KEEP	Zhao2009|Denning1968	0	0	gate Critical on swapout_ema≥1.0 pps — eliminates M1 sticky-swap false-Critical alarms
+2	3eb718a	tests=1698	0	KEEP	Nygard2018	0	0	wake_thaw_pids Vec tracks staggered-wake SIGCONT PIDs; unfreeze_decay sees correct T0
+3	189a474	tests=1698	0	KEEP	Denning1968	0	0	observe_sample_with_wss: TASK_VM_INFO WSS anchors M∞ as kernel ground-truth
+4	bd9d815	tests=1699	+1	KEEP	Zhao2009	0	0	lower SWAPOUT_FLOOR_PPS 1.0→0.5 — catches slow-boil at 0.5 pps sustained
+5	647274b	tests=1699	0	KEEP	Hellerstein2004|Li2010	0	0	ODE physics → LinUCB context dims 12-13 (D 12→14); closes epistemic loop
+6	AUDIT	tests=1699	0	NO-OP	-	0	0	RL reward audit: record_overflow uses raw swap_delta_bps + p_oom_30s — independent of swapout_ema gate, no corruption

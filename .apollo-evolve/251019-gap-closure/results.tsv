@@ -1,0 +1,4 @@
+iteration	commit	metric	delta	status	paper	opens	closes	note
+1	3bfd014	tests=1699	0	KEEP	Garcia&Fernandez2015	0	1	ODE physical model overrides observe_only→Conservative when SwapRisk::Critical
+2	ec0cf7d	tests=1700	+1	KEEP	Wilson&Dayan2004	0	1	graded thermal_stress replaces binary thermal_emergency; SMC→IOKit→phase fallback chain
+3	d4d9293	tests=1701	+1	KEEP	Deacon2013	0	1	ODE swap urgency wired into Noradrenaline — leading indicator closes predictive loop

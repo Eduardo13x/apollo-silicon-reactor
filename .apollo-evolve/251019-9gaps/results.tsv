@@ -1,0 +1,10 @@
+iteration	commit	metric	delta	status	paper	opens	closes	note
+1	00669b8	tests=1704	+5	KEEP	Nygard 2018 (bulkhead)	0	1	Gap 1: swap_risk→idle_multiplier=0.25 under Critical/Overflow
+2	aee4101	tests=1704	+0	KEEP	Denning 1968 (tau-based WSS)	0	1	Gap 2: high_tau_pids prefer Throttle over Freeze
+3	d1bec4b	tests=1704	+0	KEEP	Sutton&Barto 2018 §17.4 (reward shaping)	0	1	Gap 3: Cable E — RL T_sat penalty via inject_external_reward
+4	c4be23a	tests=1704	+0	KEEP	pre-loop regression fix	0	0	Pre-gap: m15 footprint-aware freeze gate fix
+5	4715690	tests=1706	+2	KEEP	Schultz 1997 (RPE)	0	2	Gaps 4+5: DA ode_rss_surprise + ACh tau_divergence
+6	4aa86fb	tests=1706	+0	KEEP	Nygard 2018 (dynamic bulkhead)	0	1	Gap 6: wake_unfreeze batch scales with swap_delta_bps
+7	3fe3856	tests=1709	+3	KEEP	Hellerstein 2004 §9 (PID D-term)	0	1	Gap 7: D-term lowers overflow thresholds when pressure rising fast
+8	0302335	tests=1710	+1	KEEP	Hellerstein 2004 §9 (noise rejection)	0	1	Gap 8: OdeDivergenceResilient adversarial scenario (5th probe)
+9	a5ab9fe	tests=1716	+6	KEEP	Zhao 2009 (EMA), Hellerstein 2004	0	1	Gap 9: CyberPhysicalSignal trait unifies ODE normalization
