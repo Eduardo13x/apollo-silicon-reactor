@@ -1585,14 +1585,24 @@ fn main() -> anyhow::Result<()> {
                 // pressure_velocity > 0 = rising; scale 5→1 over [0.0, 0.2].
                 if !wake_unfreeze_queue.is_empty() {
                     let wake_batch = {
-                        // dM/dt proxy: swap_delta_bps > 0 = swap growing.
-                        // 50 MB/s growth → rate_factor = 1.0 → batch = 1.
-                        let rate_factor =
-                            (pressure_collector.latest().swap_delta_bps / (50.0 * 1024.0 * 1024.0))
+                        // G21 — Thermal Bulkhead: serious/critical thermal → single-process
+                        // thaw prevents CPU surge from simultaneous reactivation.
+                        // [Nygard 2018 §4.3 — bulkhead limits blast radius under resource stress]
+                        let thermal_str = state.metrics.lock_recover().thermal_level_real.clone();
+                        if thermal_str == "serious" || thermal_str == "critical" {
+                            1_usize
+                        } else {
+                            // dM/dt proxy: swap_delta_bps > 0 = swap growing.
+                            // 50 MB/s growth → rate_factor = 1.0 → batch = 1.
+                            let rate_factor = (pressure_collector
+                                .latest()
+                                .swap_delta_bps
+                                / (50.0 * 1024.0 * 1024.0))
                                 .clamp(0.0, 1.0);
-                        (WAKE_UNFREEZE_BATCH as f64 * (1.0 - rate_factor * 0.8))
-                            .max(1.0)
-                            .round() as usize
+                            (WAKE_UNFREEZE_BATCH as f64 * (1.0 - rate_factor * 0.8))
+                                .max(1.0)
+                                .round() as usize
+                        }
                     };
                     let batch: Vec<u32> = wake_unfreeze_queue
                         .drain(..wake_unfreeze_queue.len().min(wake_batch))
