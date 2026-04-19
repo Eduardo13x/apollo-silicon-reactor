@@ -5876,6 +5876,7 @@ fn main() -> anyhow::Result<()> {
                         skills_path(),
                         &mut nested_learner,
                         sleep_notifier.is_sleeping(),
+                        ode_t_sat_urgency,
                     );
                     // Apply ws_spike_threshold / fluidity_degraded_threshold from LearnableParams.
                     // Keeps fluidity detection calibrated with learned values.

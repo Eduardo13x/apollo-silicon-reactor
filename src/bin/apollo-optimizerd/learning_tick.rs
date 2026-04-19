@@ -96,6 +96,8 @@ pub fn run_learning_tick<'a>(
     skills_path: &str,
     nested_learner: &mut NestedLearner,
     in_sleep: bool,
+    // ODE swap saturation urgency [0,1] for T_sat penalty (Cable E).
+    ode_t_sat_urgency: f64,
 ) {
     // ── Arousal EMA: update every cycle from current pressure + swap ─────────
     // p_oom_est ∈ [0,1]: proxy for OOM risk derived from pressure above 0.70.
@@ -641,6 +643,21 @@ pub fn run_learning_tick<'a>(
         *prev_package_watts = curr_w;
     }
     *prev_workload_mode = workload_mode;
+
+    // ── Cable E: ODE T_sat penalty → RL ─────────────────────────────────────
+    // When swap saturation is imminent (urgency > 0.5), penalize the RL agent
+    // for whatever action/threshold it set that contributed to this state.
+    // Penalty scales with urgency: urgency=1.0 (T_sat ≤ 60s) → -5.0.
+    // [Sutton & Barto 2018 §17.4] reward shaping: keep penalty dominant vs
+    // Cable A (-3.0 max) but proportional to physical severity.
+    // [Deacon 2013] predictive NA already raised dyna_steps; this closes the
+    // RL Q-value loop so policy learns to act before T_sat fires.
+    if ode_t_sat_urgency > 0.5 {
+        if let Some(rl) = &mut lctx.overflow_guard.rl_agent {
+            let t_sat_penalty = -(ode_t_sat_urgency * 5.0).clamp(0.0, 5.0);
+            rl.inject_external_reward(t_sat_penalty);
+        }
+    }
 
     // ── Dr. Zero feedback loop (every 60 cycles) ─────────────────────────────
     // File written by watch-deploy.sh after each autoresearch run.
