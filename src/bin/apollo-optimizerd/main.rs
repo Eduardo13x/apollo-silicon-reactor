@@ -5474,10 +5474,26 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.budgets.cycle_sysctl_writes = 0;
                     metrics.metrics.budgets.boost_denied_cooldown = 0;
 
-                    let (graced_actions, throttle_suppressed, freeze_suppressed) =
+                    let (mut graced_actions, throttle_suppressed, freeze_suppressed) =
                         process_enrichment::apply_post_wake_grace_policy(actions, grace_active);
                     metrics.metrics.post_wake_throttle_suppressed += throttle_suppressed;
                     metrics.metrics.post_wake_freeze_suppressed += freeze_suppressed;
+
+                    // G19 — τ-Informed Ranking: sort freeze actions by learned τ ascending.
+                    // Short τ = fast reload = freeze first (maximum RSS reclaim, minimum
+                    // disruption when thawed). Non-freeze actions are left in original order.
+                    // [Denning 1968] τ-based WSS — lower τ processes have smaller working-set
+                    // reload cost and are safer to freeze/thaw first.
+                    graced_actions.sort_by(|a, b| {
+                        let tau_of = |action: &RootAction| -> f64 {
+                            if let RootAction::FreezeProcess { name, .. } = action {
+                                unfreeze_decay.tau_for_app(name)
+                            } else {
+                                f64::MAX // non-freeze actions sort to end
+                            }
+                        };
+                        tau_of(a).partial_cmp(&tau_of(b)).unwrap_or(std::cmp::Ordering::Equal)
+                    });
 
                     // Freeze confirmation gate: 2 cycles normal, 1 pre-emptive,
                     // 0 during launch. Per-cycle dedup + decay of stale candidates.
