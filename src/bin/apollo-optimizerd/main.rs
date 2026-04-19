@@ -3421,10 +3421,11 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 // ODE swap urgency — hoisted for use in Neuromodulator AND LinUCB.
-                // (CRITICAL_ETA_SEC / t_sat_sec).clamp(0,1): 0=safe, 1=saturation imminent.
-                let ode_t_sat_urgency = reclaim_forecast.t_sat_sec
-                    .map(|t| (apollo_optimizer::engine::swap_reclaim::CRITICAL_ETA_SEC / t.max(1.0)).clamp(0.0, 1.0))
-                    .unwrap_or(0.0);
+                // Normalization owned by TsatUrgency [CyberPhysicalSignal trait].
+                let ode_t_sat_urgency = {
+                    use apollo_optimizer::engine::swap_reclaim::{CyberPhysicalSignal, TsatUrgency};
+                    TsatUrgency(reclaim_forecast.t_sat_sec).normalized()
+                };
 
                 // Signal intelligence → reactor_weight boosting.
                 // CUSUM regime shift: pressure drifting up significantly.
@@ -3565,8 +3566,11 @@ fn main() -> anyhow::Result<()> {
                     };
                     // ODE physics features for LinUCB context (slots 12-13).
                     // [Hellerstein 2004] — derivative control closes the epistemic loop.
-                    // ode_t_sat_urgency already computed in outer scope (also used by neuromodulator).
-                    let ode_net_rate_norm = (reclaim_forecast.net_rate_bps / 200_000_000.0).clamp(0.0, 1.0);
+                    // Normalization owned by NetRateNorm [CyberPhysicalSignal trait].
+                    let ode_net_rate_norm = {
+                        use apollo_optimizer::engine::swap_reclaim::{CyberPhysicalSignal, NetRateNorm};
+                        NetRateNorm(reclaim_forecast.net_rate_bps).normalized()
+                    };
                     let agent_ctx = AgentContext::build(
                         signal_digest.pressure_smooth, // Kalman-filtered instead of raw
                         swap_forecast.swap_trend,

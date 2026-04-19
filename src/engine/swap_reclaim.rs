@@ -112,6 +112,51 @@ impl SwapRisk {
     }
 }
 
+/// Normalization ceiling for `net_rate_bps` → [0, 1].
+/// 200 MB/s ≈ peak WKdm compression rate on M-series under extreme load.
+pub const NET_RATE_CEILING_BPS: f64 = 200_000_000.0;
+
+// ── CyberPhysical trait ────────────────────────────────────────────────────────
+
+/// Trait for ODE-derived signals that normalize raw physical quantities to [0,1].
+///
+/// Unifies the ad-hoc `(CRITICAL_ETA_SEC / t).clamp(0,1)` and
+/// `(net_rate / 200 MB/s).clamp(0,1)` patterns scattered across callers.
+/// Each implementor owns its normalization constant — callers just call `.normalized()`.
+pub trait CyberPhysicalSignal {
+    /// Map this signal to [0.0, 1.0] for use in RL/LinUCB/neuromodulator contexts.
+    fn normalized(&self) -> f64;
+    /// Signal name for logging/observability.
+    fn name(&self) -> &'static str;
+}
+
+/// T_sat urgency: (CRITICAL_ETA_SEC / t_sat_sec).clamp(0,1).
+/// 0 = safe, 1 = saturation within `CRITICAL_ETA_SEC` seconds.
+pub struct TsatUrgency(pub Option<f64>);
+
+/// Net rate normalized: net_rate_bps / NET_RATE_CEILING_BPS, clamped [0,1].
+pub struct NetRateNorm(pub f64);
+
+impl CyberPhysicalSignal for TsatUrgency {
+    fn normalized(&self) -> f64 {
+        self.0
+            .map(|t| (CRITICAL_ETA_SEC / t.max(1.0)).clamp(0.0, 1.0))
+            .unwrap_or(0.0)
+    }
+    fn name(&self) -> &'static str {
+        "t_sat_urgency"
+    }
+}
+
+impl CyberPhysicalSignal for NetRateNorm {
+    fn normalized(&self) -> f64 {
+        (self.0 / NET_RATE_CEILING_BPS).clamp(0.0, 1.0)
+    }
+    fn name(&self) -> &'static str {
+        "net_rate_norm"
+    }
+}
+
 /// Snapshot produced each cycle — consumed by `SignalDigest` and decision logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaturationForecast {
@@ -418,5 +463,48 @@ mod tests {
         let mut m = SwapReclaimModel::new();
         let f = m.update(&sample(0.0, 0.0, 0.0, gb(2), gb(8)));
         assert!((f.swap_ratio - 0.25).abs() < 0.01);
+    }
+
+    // ── CyberPhysicalSignal trait tests ─────────────────────────────────────
+
+    #[test]
+    fn tsat_urgency_none_is_zero() {
+        use super::CyberPhysicalSignal;
+        assert_eq!(super::TsatUrgency(None).normalized(), 0.0);
+    }
+
+    #[test]
+    fn tsat_urgency_at_critical_eta_is_one() {
+        use super::CyberPhysicalSignal;
+        let u = super::TsatUrgency(Some(CRITICAL_ETA_SEC)).normalized();
+        assert!((u - 1.0).abs() < 1e-9, "t_sat == CRITICAL_ETA → urgency = 1.0, got {u}");
+    }
+
+    #[test]
+    fn tsat_urgency_far_future_is_small() {
+        use super::CyberPhysicalSignal;
+        let u = super::TsatUrgency(Some(3600.0)).normalized();
+        assert!(u < 0.05, "t_sat=3600s → urgency should be tiny, got {u}");
+    }
+
+    #[test]
+    fn net_rate_norm_ceiling_is_one() {
+        use super::CyberPhysicalSignal;
+        let n = super::NetRateNorm(NET_RATE_CEILING_BPS).normalized();
+        assert!((n - 1.0).abs() < 1e-9, "ceiling rate → norm = 1.0, got {n}");
+    }
+
+    #[test]
+    fn net_rate_norm_half_ceiling_is_half() {
+        use super::CyberPhysicalSignal;
+        let n = super::NetRateNorm(NET_RATE_CEILING_BPS * 0.5).normalized();
+        assert!((n - 0.5).abs() < 1e-9, "half ceiling → 0.5, got {n}");
+    }
+
+    #[test]
+    fn net_rate_norm_beyond_ceiling_clamped() {
+        use super::CyberPhysicalSignal;
+        let n = super::NetRateNorm(NET_RATE_CEILING_BPS * 10.0).normalized();
+        assert!((n - 1.0).abs() < 1e-9, "beyond ceiling → clamped 1.0, got {n}");
     }
 }
