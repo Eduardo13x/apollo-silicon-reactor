@@ -95,6 +95,7 @@ pub mod smc_direct;
 pub mod smc_reader;
 pub mod stability_oracle;
 pub mod swap_predictor;
+pub mod swap_reclaim;
 pub mod syscall_classifier;
 pub mod sysctl_direct;
 pub mod sysctl_governor;
