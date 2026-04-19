@@ -5555,6 +5555,7 @@ fn main() -> anyhow::Result<()> {
                         &snapshot,
                         prev_cog_decision.as_ref(),
                         &causal_qos_names,
+                        reclaim_forecast.risk,
                     );
                     let cb_is_open = filter_outcome.cb_is_open;
                     let op_mode = filter_outcome.op_mode;

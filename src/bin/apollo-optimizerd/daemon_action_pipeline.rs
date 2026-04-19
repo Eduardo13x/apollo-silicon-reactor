@@ -52,6 +52,7 @@ use apollo_optimizer::engine::circuit_breaker::CircuitState;
 use apollo_optimizer::engine::daemon_state::SharedState;
 use apollo_optimizer::engine::degradation::{DegradationInputs, OperationMode};
 use apollo_optimizer::engine::lock_ext::LockRecover;
+use apollo_optimizer::engine::swap_reclaim::SwapRisk;
 use apollo_optimizer::engine::types::RootAction;
 
 use crate::cognitive_tick::CognitiveDecision;
@@ -91,12 +92,16 @@ static PREV_THROTTLED: std::sync::Mutex<Option<HashSet<u32>>> = std::sync::Mutex
 /// - `prev_cog_decision` — last-cycle cognitive decision; gates current cycle.
 /// - `causal_qos_names` — process names flagged as CPU-dominant by the
 ///   causal graph; their freezes are upgraded to QoS throttles.
+/// - `swap_risk` — ODE physical model risk level; Critical/Overflow overrides
+///   `observe_only` gate from Observe to Conservative so swap-pressure actions
+///   are never fully suppressed by epistemic uncertainty alone.
 pub fn run_filter_pipeline(
     final_actions: Vec<RootAction>,
     state: &SharedState,
     snapshot: &SystemSnapshot,
     prev_cog_decision: Option<&CognitiveDecision>,
     causal_qos_names: &HashSet<String>,
+    swap_risk: SwapRisk,
 ) -> FilterOutcome {
     // ── Circuit breaker snapshot ─────────────────────────────────
     let (cb_is_open, cb_open_duration) = {
@@ -131,11 +136,27 @@ pub fn run_filter_pipeline(
     // because "no actions" strictly dominates "no aggressive actions".
     // [Lakshminarayanan 2017] predictive-uncertainty action inhibition
     // [Sutton 2018 §13] reduce action scope under high policy uncertainty
+    //
+    // ODE arbiter: when the physical swap model signals Critical or Overflow,
+    // epistemic uncertainty may not suppress all actions — the ODE provides
+    // physical certainty that overrides behavioral uncertainty.
+    // [Garcia & Fernandez 2015] safe RL — constraint violations bypass uncertainty gates.
+    let ode_physical_critical =
+        matches!(swap_risk, SwapRisk::Critical | SwapRisk::Overflow);
     let op_mode = if prev_cog_decision.map_or(false, |d| d.observe_only)
         && op_mode == OperationMode::Full
     {
-        tracing::debug!("cognitive gate: observe_only → OperationMode::Observe");
-        OperationMode::Observe
+        if ode_physical_critical {
+            // ODE override: floor at Conservative so freeze/throttle survive.
+            tracing::debug!(
+                "cognitive gate: observe_only overridden by ODE physical Critical \
+                 → OperationMode::Conservative"
+            );
+            OperationMode::Conservative
+        } else {
+            tracing::debug!("cognitive gate: observe_only → OperationMode::Observe");
+            OperationMode::Observe
+        }
     } else if prev_cog_decision.map_or(false, |d| d.block_aggressive)
         && op_mode == OperationMode::Full
     {
