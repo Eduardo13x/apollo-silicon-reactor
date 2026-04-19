@@ -3528,6 +3528,7 @@ fn main() -> anyhow::Result<()> {
                         &mut overflow_thresholds,
                         linucb_choice,
                         linucb_confidence,
+                        cycle_count,
                     );
                     last_specialist_votes = voting_out.disagreement_record;
                     voting_out.intervention

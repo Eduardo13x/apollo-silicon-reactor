@@ -111,6 +111,7 @@ pub fn apply_specialist_voting(
     overflow_thresholds: &mut OverflowThresholds,
     linucb_choice: Intervention,
     linucb_confidence: f64,
+    cycle_count: u64,
 ) -> SpecialistVotingOutput {
     // ── Specialist accuracy feedback (Super Learner) ─────────────────
     // Compare prev cycle's ACTUAL specialist signals against observed outcome.
@@ -191,16 +192,18 @@ pub fn apply_specialist_voting(
             * lctx.specialist_accuracy.weight(specialist::MONOPOLY)
             * stability_boost)
             .min(1.0);
-        // Log NARS maturity horizon for monopoly belief (observations to 0.80 confidence).
-        if let Some(rem) = lctx.outcome_tracker.drift_detector.observations_remaining("monopoly_freeze", 0.80) {
-            if rem > 0 {
-                audit_log(&serde_json::json!({
-                    "t": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    "event": "nars_maturity_horizon",
-                    "belief": "monopoly_freeze",
-                    "obs_remaining_to_0.80": rem,
-                    "stability_regime": format!("{:?}", signal_digest.stability_regime),
-                }));
+        // Log NARS maturity horizon every 30 cycles to avoid journal spam.
+        if cycle_count % 30 == 0 {
+            if let Some(rem) = lctx.outcome_tracker.drift_detector.observations_remaining("monopoly_freeze", 0.80) {
+                if rem > 0 {
+                    audit_log(&serde_json::json!({
+                        "t": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        "event": "nars_maturity_horizon",
+                        "belief": "monopoly_freeze",
+                        "obs_remaining_to_0.80": rem,
+                        "stability_regime": format!("{:?}", signal_digest.stability_regime),
+                    }));
+                }
             }
         }
         votes.push(SpecialistVote {
