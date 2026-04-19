@@ -16,6 +16,7 @@
 use apollo_optimizer::engine::adversarial_probe::{AdversarialProbe, ProbeResult};
 use apollo_optimizer::engine::cognitive_bus::{CognitiveRewardBus, RewardSignal, RewardSource};
 use apollo_optimizer::engine::cognitive_health::{CognitiveHealthScore, CognitiveInputs};
+use apollo_optimizer::engine::daemon_helpers::audit_log;
 use apollo_optimizer::engine::epistemic::EpistemicUncertainty;
 use apollo_optimizer::engine::meta_cognition::{MetaCognition, SubsystemId};
 use apollo_optimizer::engine::nars_belief::DriftDetector;
@@ -285,6 +286,18 @@ pub fn run_cognitive_tick(
                 }
             };
             results.push(ProbeResult { cycle, ..result });
+        }
+        // Journal any failures so prod adversarial_pass_rate regressions
+        // can be traced back to the specific invariant that broke.
+        // [Gray & Reuter 1992 §2 — audit trails must identify the failing unit].
+        for r in results.iter().filter(|r| !r.passed) {
+            audit_log(&serde_json::json!({
+                "t": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "event": "adversarial_probe_failed",
+                "cycle": r.cycle,
+                "expectation": format!("{:?}", r.expectation),
+                "description": r.description,
+            }));
         }
         cog.adversarial.record_results(results, cycle);
     }
