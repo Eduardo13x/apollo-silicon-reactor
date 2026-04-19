@@ -12,6 +12,7 @@ use crate::engine::{
     llm::LearnedPolicy,
     process_classifier::{score_utility, ProcessClassifier, ProcessSnapshot, ProcessTier},
     silicon_probe::SiliconInfo,
+    swap_reclaim::SwapRisk,
     user_profile::{UserProfile, WorkloadType},
     workload_classifier::{WorkloadClassification, WorkloadClassifier},
     zombie_hunter::{HuntSnapshot, ZombieAction, ZombieHunter},
@@ -79,6 +80,9 @@ pub struct AdaptiveGovernor {
     pub user_profile: UserProfile,
     workload_classifier: WorkloadClassifier,
     last_classification: WorkloadClassification,
+    /// Physical swap pressure from the ODE model — scales idle thresholds.
+    /// [Hellerstein 2004] §9: resource targets must reflect operating regime.
+    pub swap_risk: SwapRisk,
 }
 
 impl AdaptiveGovernor {
@@ -98,6 +102,7 @@ impl AdaptiveGovernor {
                 confidence: 0.0,
                 sources: Vec::new(),
             },
+            swap_risk: SwapRisk::Safe,
         }
     }
 
@@ -378,13 +383,26 @@ impl AdaptiveGovernor {
             );
         }
 
+        // Idle multiplier: under ODE swap Critical/Overflow, shed faster.
+        // [Hellerstein 2004 §9] resource targets must reflect operating regime.
+        // [Nygard 2018 Ch.5] proportional capacity reduction under overload.
+        // [Denning 1968] idle > threshold → zero working-set activity.
+        // Multiplier 0.25 → SilentDaemon: 3600s→900s, Graduated: 21600s→5400s.
+        let idle_multiplier: f64 =
+            if matches!(self.swap_risk, SwapRisk::Critical | SwapRisk::Overflow) {
+                0.25
+            } else {
+                1.0
+            };
+
         // SilentDaemon idle override: if a daemon has near-zero CPU and has been
         // idle for over an hour with no GUI, it's effectively stale.
         // Rosetta (translated) processes get frozen instead of throttled because
         // they use ~2x memory (JIT page tables) — freeing them is more valuable.
+        let silent_idle_threshold = (3600.0 * idle_multiplier) as u64;
         if tier == ProcessTier::SilentDaemon
             && snap.cpu_percent < 0.5
-            && snap.secs_since_foreground > 3600
+            && snap.secs_since_foreground > silent_idle_threshold
             && !snap.has_gui_window
         {
             // Translated (2x memory) or RSS hog (>1GB): freeze to reclaim memory.
@@ -397,8 +415,8 @@ impl AdaptiveGovernor {
                 decision,
                 utility,
                 format!(
-                    "SilentDaemon idle override (cpu={:.1}%, idle={}s)",
-                    snap.cpu_percent, snap.secs_since_foreground
+                    "SilentDaemon idle override (cpu={:.1}%, idle={}s, swap_risk={:?})",
+                    snap.cpu_percent, snap.secs_since_foreground, self.swap_risk
                 ),
             );
         }
@@ -437,11 +455,16 @@ impl AdaptiveGovernor {
         // Graduated idle: the idle override (above) only catches cpu < 0.5%.
         // But a daemon idle for 6h+ is effectively abandoned even at moderate CPU.
         // Graduated: >6h → Throttle, >12h → Freeze. No GUI required.
+        // Under ODE swap Critical/Overflow the multiplier compresses to 1.5h/3h.
         // Processes with high faults (>500K) are doing active GPU/memory work —
         // their idle time is deceptive (e.g. Metal shader caches between frames).
-        if !snap.has_gui_window && snap.secs_since_foreground > 21600 && snap.faults_total < 500_000
+        let grad_throttle_threshold = (21600.0 * idle_multiplier) as u64;
+        let grad_freeze_threshold = (43200.0 * idle_multiplier) as u64;
+        if !snap.has_gui_window
+            && snap.secs_since_foreground > grad_throttle_threshold
+            && snap.faults_total < 500_000
         {
-            let decision = if snap.secs_since_foreground > 43200 {
+            let decision = if snap.secs_since_foreground > grad_freeze_threshold {
                 GovernorDecision::Freeze
             } else {
                 GovernorDecision::Throttle
@@ -450,9 +473,10 @@ impl AdaptiveGovernor {
                 decision,
                 adjusted_utility,
                 format!(
-                    "Graduated idle ({}h, no GUI) — {}",
+                    "Graduated idle ({}h, no GUI, swap_risk={:?}) — {}",
                     snap.secs_since_foreground / 3600,
-                    if snap.secs_since_foreground > 43200 {
+                    self.swap_risk,
+                    if snap.secs_since_foreground > grad_freeze_threshold {
                         "freeze"
                     } else {
                         "throttle"
@@ -1197,6 +1221,84 @@ mod tests {
     }
 
     // ── Micro-benchmark: decide_all latency ──────────────────────────────────
+
+    #[test]
+    fn swap_risk_critical_lowers_silent_daemon_threshold() {
+        // Under Critical swap, SilentDaemon idle threshold drops 3600s→900s.
+        // A process idle for 1800s (between 900 and 3600) should trigger under
+        // Critical but not under Safe.
+        let proc = ProcessSnapshot {
+            cpu_percent: 0.1,
+            secs_since_foreground: 1800,
+            has_gui_window: false,
+            ..base_proc(1, "idle-daemon")
+        };
+        let mut gov_safe = governor();
+        gov_safe.swap_risk = SwapRisk::Safe;
+        let d_safe = gov_safe.decide_all(
+            &[proc.clone()],
+            &no_hunts(),
+            None,
+            &["idle-daemon"],
+            12,
+        );
+
+        let mut gov_crit = governor();
+        gov_crit.swap_risk = SwapRisk::Critical;
+        let d_crit = gov_crit.decide_all(
+            &[proc],
+            &no_hunts(),
+            None,
+            &["idle-daemon"],
+            12,
+        );
+
+        // Safe: 1800s < 3600s threshold → Allow (utility-based)
+        assert_ne!(
+            d_safe[0].decision,
+            GovernorDecision::Freeze,
+            "Safe swap: idle daemon at 1800s should not be frozen"
+        );
+        // Critical: 1800s > 900s threshold → Throttle (cpu=0.1% < 0.5% for SilentDaemon)
+        assert_ne!(
+            d_crit[0].decision,
+            GovernorDecision::Allow,
+            "Critical swap: idle daemon at 1800s should be acted on: {:?}",
+            d_crit[0].decision
+        );
+    }
+
+    #[test]
+    fn swap_risk_critical_graduated_idle_compresses() {
+        // Under Critical, graduated-idle threshold drops from 21600s (6h) to 5400s (1.5h).
+        // A process idle for 10800s (3h) should trigger under Critical.
+        let proc = ProcessSnapshot {
+            cpu_percent: 2.0,
+            secs_since_foreground: 10800,
+            has_gui_window: false,
+            faults_total: 100,
+            ..base_proc(2, "bg-daemon")
+        };
+
+        let mut gov_safe = governor();
+        gov_safe.swap_risk = SwapRisk::Safe;
+        let d_safe = gov_safe.decide_all(&[proc.clone()], &no_hunts(), None, &["bg-daemon"], 12);
+
+        let mut gov_crit = governor();
+        gov_crit.swap_risk = SwapRisk::Critical;
+        let d_crit = gov_crit.decide_all(&[proc], &no_hunts(), None, &["bg-daemon"], 12);
+
+        assert_eq!(
+            d_safe[0].decision,
+            GovernorDecision::Allow,
+            "Safe: 3h idle should not trigger graduated idle (threshold 6h)"
+        );
+        assert_ne!(
+            d_crit[0].decision,
+            GovernorDecision::Allow,
+            "Critical: 3h idle exceeds compressed threshold 1.5h → act"
+        );
+    }
 
     #[test]
     fn bench_decide_all_latency() {

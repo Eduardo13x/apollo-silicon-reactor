@@ -4342,8 +4342,10 @@ fn main() -> anyhow::Result<()> {
 
                 // Heuristic pass: AdaptiveGovernor
                 // Pass hw_features (sampled every 5 cycles) for Bayesian fusion + online learning.
+                // Wire ODE swap risk so idle thresholds scale with physical swap state.
                 let heuristic_decisions = {
                     let mut pg = state.policy.lock_recover();
+                    pg.adaptive_governor.swap_risk = reclaim_forecast.risk;
                     pg.adaptive_governor.decide_all_with_hw(
                         &proc_snaps,
                         &hunt_snaps,

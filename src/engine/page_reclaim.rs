@@ -260,7 +260,7 @@ mod tests {
         let bytes = inactive_page_bytes();
         // On any running macOS, we should have some inactive pages.
         // (unless running in a very minimal VM)
-        assert!(bytes > 0 || true, "vm_stat may return 0 in containers");
+        let _ = bytes; // vm_stat may return 0 in containers — non-fatal
     }
 
     #[test]
