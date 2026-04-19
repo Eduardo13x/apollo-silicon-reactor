@@ -676,6 +676,24 @@ pub fn run_learning_tick<'a>(
         }
     }
 
+    // ── G15 — RL Complacency Fix ─────────────────────────────────────────────
+    // If previous cycle's agent chose Observe AND pressure is now ≥ 0.80
+    // (overflow-level), inject a complacency penalty. The agent did nothing
+    // while the system drifted into danger — penalize so Q-values for Observe
+    // at high pressure decrease over time.
+    // [Sutton & Barto 2018 §6.5 — TD error closes the passive-observation gap]
+    if snapshot.pressure.memory_pressure >= 0.80 {
+        if let Some((_, prev_intervention)) = last_specialist_votes {
+            if prev_intervention == Intervention::Observe {
+                let pressure_excess = (snapshot.pressure.memory_pressure - 0.80) / 0.20;
+                let penalty = -(pressure_excess * 3.0).clamp(0.0, 3.0);
+                if let Some(rl) = &mut lctx.overflow_guard.rl_agent {
+                    rl.inject_external_reward(penalty);
+                }
+            }
+        }
+    }
+
     // ── Predictive agent: observe outcome + MPC feedback ────────────────────
     lctx.predictive_agent
         .observe_outcome(snapshot.pressure.memory_pressure);
