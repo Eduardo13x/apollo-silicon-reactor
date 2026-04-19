@@ -560,12 +560,11 @@ pub fn decide_memory_action(
         return MemoryAction::PressureHint;
     }
 
-    // Default: pressure gate. Below 0.65 the compressor is coping — prefer a
-    // gentle hint over a SIGSTOP that stalls IPC and flushes SLC. Only freeze
-    // by default when pressure is genuinely elevated and hints have proven
-    // insufficient (processes that respond to hints reduce their footprint and
-    // raise compression_ratio, eventually hitting the >= 2.0 path above).
-    if system_pressure >= 0.65 {
+    // Moderate ratio (1.5–2.0): compression benefit exists but is not dramatic.
+    // Small footprint (≤ 200MB): freeze/thaw cost is low — freeze regardless of pressure.
+    // Large footprint: gate on pressure to avoid swap storms at moderate pressure.
+    // [d50c79c rationale] 86% freeze rate came from large processes; small ones are safe.
+    if profile.phys_footprint <= 200 * 1024 * 1024 || system_pressure >= 0.65 {
         MemoryAction::Freeze
     } else {
         MemoryAction::PressureHint
