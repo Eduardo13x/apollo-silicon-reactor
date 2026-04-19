@@ -150,9 +150,27 @@ impl UnfreezeDecayModel {
 
     /// Ingest a fresh RSS sample for a `pid` known to be relaxing.
     ///
+    /// `wss_hint` — optional working-set size from `TASK_VM_INFO` (measured by
+    /// `MemoryAnalyzer`).  When available, it anchors M∞ to a kernel-measured
+    /// value instead of relying on the back-computed running maximum.  For a
+    /// process that was frozen mid-session, pre-freeze WSS is the ground truth
+    /// for its steady-state demand [Denning 1968].
+    ///
     /// No-op if the pid isn't tracked (silently ignored — caller can feed
     /// every live process without bothering to filter).
     pub fn observe_sample(&mut self, pid: u32, current_rss: u64, now: Instant, now_epoch_sec: u64) {
+        self.observe_sample_with_wss(pid, current_rss, now, now_epoch_sec, None);
+    }
+
+    /// Same as `observe_sample` but with an optional WSS hint from the kernel.
+    pub fn observe_sample_with_wss(
+        &mut self,
+        pid: u32,
+        current_rss: u64,
+        now: Instant,
+        now_epoch_sec: u64,
+        wss_hint: Option<u64>,
+    ) {
         // Clone just the fields we need (short read) — we need a mutable borrow
         // below to write back `last_sample`.
         let (app, m_0, thaw_at, prev_sample) = match self.active_thaws.get(&pid) {
@@ -217,7 +235,11 @@ impl UnfreezeDecayModel {
         };
         // Track M∞ as a running max of self-consistent estimates — still a
         // running max, but of a well-conditioned quantity rather than raw RSS.
-        entry.m_infinity = entry.m_infinity.max(m_inf_est).max(current_rss);
+        // If the caller provides a WSS from TASK_VM_INFO, prefer it as the
+        // ground-truth lower bound [Denning 1968 — WSS is the only reliable
+        // predictor of steady-state RAM demand].
+        let wss_lower = wss_hint.unwrap_or(0);
+        entry.m_infinity = entry.m_infinity.max(m_inf_est).max(current_rss).max(wss_lower);
         entry.last_updated_epoch_sec = now_epoch_sec;
 
         if dt > GC_TAU_MULTIPLIER * entry.tau_sec || dt > STALE_HARD_LIMIT_SEC {

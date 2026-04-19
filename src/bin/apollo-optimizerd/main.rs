@@ -5740,11 +5740,17 @@ fn main() -> anyhow::Result<()> {
                         if let Some(proc) =
                             collector.system().process(sysinfo::Pid::from_u32(pid))
                         {
-                            unfreeze_decay.observe_sample(
+                            // Provide WSS from TASK_VM_INFO as M∞ ground-truth anchor.
+                            // [Denning 1968] — WSS is the reliable predictor of steady-state
+                            // RAM demand; eliminates running-max convergence noise.
+                            let wss_hint = query_memory_profile(pid)
+                                .map(|mp| mp.working_set_bytes);
+                            unfreeze_decay.observe_sample_with_wss(
                                 pid,
                                 proc.memory(),
                                 now_instant,
                                 now_epoch_sec,
+                                wss_hint,
                             );
                         }
                     }
