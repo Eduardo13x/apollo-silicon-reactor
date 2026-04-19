@@ -27,7 +27,7 @@ use crate::engine::user_profile::WorkloadType;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const D: usize = 12; // feature dimensions
+const D: usize = 14; // feature dimensions (12 system + 2 ODE physics signals)
 const K: usize = 5; // number of arms
 const WARMUP_CYCLES: u32 = 200;
 const SEEDED_WARMUP_CYCLES: u32 = 50;
@@ -364,6 +364,12 @@ impl AgentContext {
         overflow_threshold_offset: f64,
         outcome_effectiveness: f64,
         low_value_ratio: f64,
+        // ODE swap T_sat urgency: (CRITICAL_ETA_SEC / t_sat_sec).clamp(0,1).
+        // 0 = draining/safe, 1 = saturation imminent. [Zhao 2009, Denning 1968]
+        ode_t_sat_urgency: f64,
+        // ODE net compressor accumulation rate, normalised to [0,1] at 200 MB/s.
+        // Provides the velocity the swap ODE sees. [Hellerstein 2004]
+        ode_net_rate_norm: f64,
     ) -> Self {
         let swap_ord = match swap_trend {
             SwapTrend::Decreasing => 0.0,
@@ -400,6 +406,8 @@ impl AgentContext {
                 reactor_weight.clamp(0.0, 1.0),               // 9
                 overflow_threshold_offset.clamp(-0.20, 0.0),  // 10
                 feedback_signal,                              // 11
+                ode_t_sat_urgency.clamp(0.0, 1.0),            // 12 ODE swap urgency
+                ode_net_rate_norm.clamp(0.0, 1.0),            // 13 ODE net rate
             ],
         }
     }
@@ -895,6 +903,8 @@ mod tests {
             0.0,
             0.5,
             0.0, // low_value_ratio
+            0.0, // ode_t_sat_urgency
+            0.0, // ode_net_rate_norm
         )
     }
 
@@ -1061,6 +1071,8 @@ mod tests {
             0.0,
             0.80, // outcome_effectiveness
             0.0,  // low_value_ratio
+            0.0,  // ode_t_sat_urgency
+            0.0,  // ode_net_rate_norm
         );
         assert!(
             (ctx_good.features[11] - 0.80).abs() < 1e-6,
@@ -1081,6 +1093,8 @@ mod tests {
             0.0,
             0.80, // outcome_effectiveness
             0.50, // 50% low-value
+            0.0,  // ode_t_sat_urgency
+            0.0,  // ode_net_rate_norm
         );
         assert!(
             (ctx_bad.features[11] - 0.40).abs() < 1e-6,
@@ -1107,6 +1121,8 @@ mod tests {
             -0.15,
             0.8,
             0.3, // low_value_ratio
+            0.0, // ode_t_sat_urgency
+            0.0, // ode_net_rate_norm
         );
         // memory_pressure clamped
         assert!((ctx.features[0] - 1.0).abs() < 1e-10);
@@ -1606,6 +1622,8 @@ mod tests {
             0.0,
             0.0,
             0.0,
+            0.0, // ode_t_sat_urgency
+            0.0, // ode_net_rate_norm
         );
         assert!((ctx.features[0] - 0.0).abs() < 1e-10);
         assert!(
@@ -1629,6 +1647,8 @@ mod tests {
             -0.20,
             1.0,
             1.0,
+            1.0, // ode_t_sat_urgency = max urgency
+            1.0, // ode_net_rate_norm = max rate
         );
         assert!((ctx.features[0] - 1.0).abs() < 1e-10);
         assert!(

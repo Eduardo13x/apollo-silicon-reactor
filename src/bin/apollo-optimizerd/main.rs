@@ -3535,6 +3535,12 @@ fn main() -> anyhow::Result<()> {
                             0.0
                         }
                     };
+                    // ODE physics features for LinUCB context (slots 12-13).
+                    // [Hellerstein 2004] — derivative control closes the epistemic loop.
+                    let ode_t_sat_urgency = reclaim_forecast.t_sat_sec
+                        .map(|t| (apollo_optimizer::engine::swap_reclaim::CRITICAL_ETA_SEC / t.max(1.0)).clamp(0.0, 1.0))
+                        .unwrap_or(0.0);
+                    let ode_net_rate_norm = (reclaim_forecast.net_rate_bps / 200_000_000.0).clamp(0.0, 1.0);
                     let agent_ctx = AgentContext::build(
                         signal_digest.pressure_smooth, // Kalman-filtered instead of raw
                         swap_forecast.swap_trend,
@@ -3548,6 +3554,8 @@ fn main() -> anyhow::Result<()> {
                         lctx.overflow_guard.history.threshold_offset,
                         lctx.outcome_tracker.overall_effectiveness(),
                         lv_ratio,
+                        ode_t_sat_urgency,
+                        ode_net_rate_norm,
                     );
                     let (linucb_choice, linucb_confidence) = lctx
                         .predictive_agent
