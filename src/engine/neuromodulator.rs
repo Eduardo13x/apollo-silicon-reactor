@@ -26,7 +26,8 @@ pub struct NeuroSignals {
     pub urgency: f64, // signal_digest.urgency
     pub regime_shift_up: bool,
     pub pressure_velocity: f64, // positive = rising pressure
-    pub thermal_emergency: bool,
+    /// Graded thermal stress [0.0, 1.0]: 0 at 60°C, 0.5 at 80°C, 1.0 at ≥100°C.
+    pub thermal_stress: f64,
 
     // Serotonin inputs
     pub pressure_smooth: f64, // for streak tracking
@@ -89,7 +90,7 @@ impl ApolloNeuromodulator {
         let na_urgency = s.urgency.clamp(0.0, 1.0) * 0.4;
         let na_regime = if s.regime_shift_up { 0.3 } else { 0.0 };
         let na_velocity = (s.pressure_velocity * 2.0).clamp(0.0, 0.3);
-        let na_thermal = if s.thermal_emergency { 0.2 } else { 0.0 };
+        let na_thermal = s.thermal_stress.clamp(0.0, 1.0) * 0.2;
         let na_signal = (na_urgency + na_regime + na_velocity + na_thermal).clamp(0.0, 1.0);
         self.noradrenaline =
             (self.noradrenaline * (1.0 - DECAY) + na_signal * DECAY).clamp(0.0, 1.0);
@@ -147,7 +148,7 @@ mod tests {
             urgency: 0.4,
             regime_shift_up: false,
             pressure_velocity: 0.0,
-            thermal_emergency: false,
+            thermal_stress: 0.0,
             pressure_smooth: 0.50,
             regime_shift_down: false,
             process_count: 400,
@@ -186,7 +187,7 @@ mod tests {
         let mut nm = ApolloNeuromodulator::new();
         let mut s = default_signals();
         s.urgency = 0.9;
-        s.thermal_emergency = true;
+        s.thermal_stress = 1.0; // full thermal emergency (≥100°C equivalent)
         for _ in 0..20 {
             nm.tick(&s);
         }
@@ -248,7 +249,7 @@ mod tests {
         let mut s = default_signals();
         // Extreme stress
         s.urgency = 1.0;
-        s.thermal_emergency = true;
+        s.thermal_stress = 1.0;
         s.regime_shift_up = true;
         s.pressure_velocity = 1.0;
         s.overflow_occurred = true;
@@ -270,14 +271,14 @@ mod tests {
         let mut s = default_signals();
         // Spike noradrenaline
         s.urgency = 1.0;
-        s.thermal_emergency = true;
+        s.thermal_stress = 1.0;
         for _ in 0..20 {
             nm.tick(&s);
         }
         let na_high = nm.noradrenaline;
         // Remove stress
         s.urgency = 0.1;
-        s.thermal_emergency = false;
+        s.thermal_stress = 0.0;
         for _ in 0..50 {
             nm.tick(&s);
         }
@@ -286,6 +287,37 @@ mod tests {
             "NA should decay: {} < {}",
             nm.noradrenaline,
             na_high
+        );
+    }
+
+    #[test]
+    fn test_graded_thermal_stress_proportional() {
+        // thermal_stress=0.5 (80°C) should produce NA between cold(0.0) and hot(1.0).
+        let mut nm_cold = ApolloNeuromodulator::new();
+        let mut nm_warm = ApolloNeuromodulator::new();
+        let mut nm_hot = ApolloNeuromodulator::new();
+        let mut s_cold = default_signals();
+        let mut s_warm = default_signals();
+        let mut s_hot = default_signals();
+        s_cold.thermal_stress = 0.0;
+        s_warm.thermal_stress = 0.5;
+        s_hot.thermal_stress = 1.0;
+        for _ in 0..20 {
+            nm_cold.tick(&s_cold);
+            nm_warm.tick(&s_warm);
+            nm_hot.tick(&s_hot);
+        }
+        assert!(
+            nm_cold.noradrenaline < nm_warm.noradrenaline,
+            "warm NA({}) should exceed cold NA({})",
+            nm_warm.noradrenaline,
+            nm_cold.noradrenaline
+        );
+        assert!(
+            nm_warm.noradrenaline < nm_hot.noradrenaline,
+            "hot NA({}) should exceed warm NA({})",
+            nm_hot.noradrenaline,
+            nm_warm.noradrenaline
         );
     }
 }

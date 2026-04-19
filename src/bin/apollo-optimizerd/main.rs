@@ -4699,12 +4699,23 @@ fn main() -> anyhow::Result<()> {
 
                 // ── Neuromodulator: bio-inspired parameter modulation ────────
                 // Extracted to daemon_neuro_tick::apply_neuromodulator (Wave 8).
+                // Best-available CPU temperature: SMC direct first, then IOKit estimate.
+                let cpu_temp_celsius: Option<f64> = last_smc
+                    .as_ref()
+                    .and_then(|s| s.cpu_temp_celsius)
+                    .or_else(|| {
+                        cycle_hw_snap
+                            .as_ref()
+                            .and_then(|h| h.temps.p_cluster_celsius)
+                            .map(|t| t as f64)
+                    });
                 daemon_neuro_tick::apply_neuromodulator(
                     &mut lctx,
                     &signal_digest,
                     &stability_oracle,
                     &thermal_action,
                     collector.system().processes().len(),
+                    cpu_temp_celsius,
                 );
 
                 // ProcessRecoveryManager: freeze confirmed leakers. NEVER kill.
