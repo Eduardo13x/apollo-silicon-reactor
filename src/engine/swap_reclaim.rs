@@ -79,6 +79,15 @@ pub const NET_RATE_FLOOR_BYTES_SEC: f64 = 4_096.0; // 4 KB/s
 /// on systems with swap disabled or tiny swap files).
 pub const MIN_SWAP_CAPACITY_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
 
+/// Minimum swapout rate (pages/s) to escalate to Critical.
+/// Below this threshold the compressor is still absorbing — I/O-level pressure
+/// has not reached the SSD yet.  On M1 8GB swap stays "sticky" (XNU does not
+/// eagerly reclaim swap pages), so `reclaim_rate` is chronically ≈ 0 and
+/// T_sat alone would produce perpetual false-Critical alarms.
+/// Requiring at least one page/s of active swapout confirms real disk I/O.
+/// [Zhao et al. 2009] — swapout = compressor overflow event (observable I/O).
+pub const SWAPOUT_FLOOR_PPS: f64 = 1.0;
+
 /// Saturation risk classification derived from `T_sat` and `net_rate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwapRisk {
@@ -113,10 +122,12 @@ pub struct SaturationForecast {
     pub reclaim_rate_bps: f64,
     /// Net accumulation rate = dirty − reclaim (bytes/s).  Negative = draining.
     pub net_rate_bps: f64,
+    /// EMA-smoothed swapout rate (pages/s).  > 0 = compressor spilling to SSD.
+    pub swapouts_ema_pps: f64,
     /// Predicted seconds until compressor occupancy hits 85 % of swap capacity.
     /// `None` when net_rate ≤ 0 (system is draining) or capacity unknown.
     pub t_sat_sec: Option<f64>,
-    /// Risk level derived from `t_sat_sec` and current occupancy.
+    /// Risk level derived from `t_sat_sec`, current occupancy, and swapout rate.
     pub risk: SwapRisk,
     /// Current swap occupancy ratio in [0.0, 1.0] for reference.
     pub swap_ratio: f64,
@@ -137,13 +148,15 @@ pub struct VmFlowSample {
     pub swap_total_bytes: u64,
 }
 
-/// The swap reclaim model — owns EMA state for dirty and reclaim rates.
+/// The swap reclaim model — owns EMA state for dirty, reclaim, and swapout rates.
 #[derive(Debug, Default)]
 pub struct SwapReclaimModel {
     /// EMA of dirty_rate (bytes/s).
     dirty_ema_bps: f64,
     /// EMA of reclaim_rate (bytes/s).
     reclaim_ema_bps: f64,
+    /// EMA of swapout rate (pages/s) — gates Critical escalation.
+    swapout_ema_pps: f64,
     /// Number of samples ingested (warm-up guard).
     samples: u32,
 }
@@ -168,10 +181,13 @@ impl SwapReclaimModel {
         if self.samples == 0 {
             self.dirty_ema_bps = dirty_bps;
             self.reclaim_ema_bps = reclaim_bps;
+            self.swapout_ema_pps = sample.swapouts_per_sec;
         } else {
             self.dirty_ema_bps = EMA_ALPHA * dirty_bps + (1.0 - EMA_ALPHA) * self.dirty_ema_bps;
             self.reclaim_ema_bps =
                 EMA_ALPHA * reclaim_bps + (1.0 - EMA_ALPHA) * self.reclaim_ema_bps;
+            self.swapout_ema_pps = EMA_ALPHA * sample.swapouts_per_sec
+                + (1.0 - EMA_ALPHA) * self.swapout_ema_pps;
         }
         self.samples = self.samples.saturating_add(1);
 
@@ -185,6 +201,10 @@ impl SwapReclaimModel {
         };
 
         // Risk classification.
+        // Critical requires active swapouts (confirmed SSD I/O) to distinguish
+        // from the M1 "sticky swap" baseline where reclaim_rate ≈ 0 and T_sat
+        // is always short despite no real disk pressure [Zhao 2009].
+        let has_io = self.swapout_ema_pps >= SWAPOUT_FLOOR_PPS;
         let risk = if swap_total < MIN_SWAP_CAPACITY_BYTES {
             SwapRisk::Safe // no swap configured
         } else if swap_ratio >= SWAP_CRITICAL_RATIO {
@@ -197,7 +217,7 @@ impl SwapReclaimModel {
                 .max(0.0)
                 - swap_used as f64;
             let t_sat = headroom.max(0.0) / net_rate;
-            if t_sat <= CRITICAL_ETA_SEC {
+            if t_sat <= CRITICAL_ETA_SEC && has_io {
                 SwapRisk::Critical
             } else {
                 SwapRisk::Building
@@ -220,6 +240,7 @@ impl SwapReclaimModel {
             dirty_rate_bps: self.dirty_ema_bps,
             reclaim_rate_bps: self.reclaim_ema_bps,
             net_rate_bps: net_rate,
+            swapouts_ema_pps: self.swapout_ema_pps,
             t_sat_sec,
             risk,
             swap_ratio,
@@ -257,6 +278,17 @@ mod tests {
         }
     }
 
+    fn sample_io(comp: f64, decomp: f64, purge: f64, swapouts: f64, used: u64, total: u64) -> VmFlowSample {
+        VmFlowSample {
+            compressions_per_sec: comp,
+            decompressions_per_sec: decomp,
+            purges_per_sec: purge,
+            swapouts_per_sec: swapouts,
+            swap_used_bytes: used,
+            swap_total_bytes: total,
+        }
+    }
+
     #[test]
     fn safe_when_reclaim_exceeds_dirty() {
         let mut m = SwapReclaimModel::new();
@@ -280,16 +312,28 @@ mod tests {
     }
 
     #[test]
-    fn critical_when_t_sat_within_threshold() {
+    fn critical_when_t_sat_within_threshold_and_swapouts_active() {
         let mut m = SwapReclaimModel::new();
-        // comp=10_000 pages/s, decomp=0 → net ≈ 163 MB/s
+        // comp=10_000 pages/s, swapouts=10 pps → real SSD I/O confirmed
         // swap 80 % full, capacity 8 GB → headroom to 85% = 409 MB
         // T_sat = 409M / 163M ≈ 2.5 s → Critical
         let used = (gb(8) as f64 * 0.80) as u64;
-        let f = m.update(&sample(10_000.0, 0.0, 0.0, used, gb(8)));
+        let f = m.update(&sample_io(10_000.0, 0.0, 0.0, 10.0, used, gb(8)));
         assert_eq!(f.risk, SwapRisk::Critical);
         let eta = f.t_sat_sec.unwrap();
         assert!(eta <= CRITICAL_ETA_SEC, "eta={}", eta);
+    }
+
+    #[test]
+    fn building_when_t_sat_short_but_no_swapouts() {
+        // M1 sticky-swap regression test: short T_sat without active swapouts
+        // should stay at Building, not escalate to Critical.
+        // Reclaim ≈ 0 (XNU does not defrag swap eagerly) but compressor not spilling.
+        let mut m = SwapReclaimModel::new();
+        let used = (gb(8) as f64 * 0.80) as u64;
+        let f = m.update(&sample(10_000.0, 0.0, 0.0, used, gb(8)));
+        assert_eq!(f.risk, SwapRisk::Building,
+            "short T_sat without swapouts should be Building (sticky-swap false-alarm gate)");
     }
 
     #[test]
@@ -326,22 +370,23 @@ mod tests {
     }
 
     #[test]
-    fn sustained_dirty_eventually_escalates() {
+    fn sustained_dirty_with_swapouts_eventually_escalates() {
         let mut m = SwapReclaimModel::new();
         let used = (gb(8) as f64 * 0.80) as u64;
-        // 20 cycles of high dirty_rate near threshold
+        // 20 cycles of high dirty_rate + active swapouts near threshold
         let mut last = SaturationForecast {
             dirty_rate_bps: 0.0,
             reclaim_rate_bps: 0.0,
             net_rate_bps: 0.0,
+            swapouts_ema_pps: 0.0,
             t_sat_sec: None,
             risk: SwapRisk::Safe,
             swap_ratio: 0.0,
         };
         for _ in 0..20 {
-            last = m.update(&sample(10_000.0, 0.0, 0.0, used, gb(8)));
+            last = m.update(&sample_io(10_000.0, 0.0, 0.0, 5.0, used, gb(8)));
         }
-        // After sustained pressure, EMA converges → Critical
+        // After sustained pressure + swapouts, EMA converges → Critical
         assert_eq!(last.risk, SwapRisk::Critical);
     }
 
