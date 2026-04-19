@@ -28,6 +28,10 @@ pub struct NeuroSignals {
     pub pressure_velocity: f64, // positive = rising pressure
     /// Graded thermal stress [0.0, 1.0]: 0 at 60°C, 0.5 at 80°C, 1.0 at ≥100°C.
     pub thermal_stress: f64,
+    /// ODE swap saturation urgency [0.0, 1.0]: (CRITICAL_ETA_SEC / t_sat_sec).clamp(0,1).
+    /// 0 = safe, 1 = saturation within CRITICAL_ETA_SEC. Leading indicator — rises
+    /// before memory pressure changes so NA responds predictively, not reactively.
+    pub ode_swap_urgency: f64,
 
     // Serotonin inputs
     pub pressure_smooth: f64, // for streak tracking
@@ -87,11 +91,15 @@ impl ApolloNeuromodulator {
         self.dopamine = (self.dopamine * (1.0 - DECAY) + da_signal * DECAY).clamp(0.0, 1.0);
 
         // ── Noradrenaline: stress/urgency ────────────────────────────
-        let na_urgency = s.urgency.clamp(0.0, 1.0) * 0.4;
+        // [Deacon 2013] predictive NA: ode_swap_urgency is a leading indicator
+        // that rises before pressure changes — reduces urgency weight slightly
+        // to keep total NA scale stable while adding anticipatory ODE signal.
+        let na_urgency = s.urgency.clamp(0.0, 1.0) * 0.35;
         let na_regime = if s.regime_shift_up { 0.3 } else { 0.0 };
         let na_velocity = (s.pressure_velocity * 2.0).clamp(0.0, 0.3);
         let na_thermal = s.thermal_stress.clamp(0.0, 1.0) * 0.2;
-        let na_signal = (na_urgency + na_regime + na_velocity + na_thermal).clamp(0.0, 1.0);
+        let na_ode = s.ode_swap_urgency.clamp(0.0, 1.0) * 0.15;
+        let na_signal = (na_urgency + na_regime + na_velocity + na_thermal + na_ode).clamp(0.0, 1.0);
         self.noradrenaline =
             (self.noradrenaline * (1.0 - DECAY) + na_signal * DECAY).clamp(0.0, 1.0);
 
@@ -149,6 +157,7 @@ mod tests {
             regime_shift_up: false,
             pressure_velocity: 0.0,
             thermal_stress: 0.0,
+            ode_swap_urgency: 0.0,
             pressure_smooth: 0.50,
             regime_shift_down: false,
             process_count: 400,
@@ -318,6 +327,33 @@ mod tests {
             "hot NA({}) should exceed warm NA({})",
             nm_hot.noradrenaline,
             nm_warm.noradrenaline
+        );
+    }
+
+    #[test]
+    fn test_ode_swap_urgency_raises_na() {
+        // ODE urgency=1.0 (swap saturating now) should raise NA above baseline.
+        let mut nm_safe = ApolloNeuromodulator::new();
+        let mut nm_critical = ApolloNeuromodulator::new();
+        let mut s_safe = default_signals();
+        let mut s_critical = default_signals();
+        s_safe.ode_swap_urgency = 0.0;
+        s_critical.ode_swap_urgency = 1.0;
+        for _ in 0..20 {
+            nm_safe.tick(&s_safe);
+            nm_critical.tick(&s_critical);
+        }
+        assert!(
+            nm_critical.noradrenaline > nm_safe.noradrenaline,
+            "critical ODE NA({}) should exceed safe NA({})",
+            nm_critical.noradrenaline,
+            nm_safe.noradrenaline
+        );
+        assert!(
+            nm_critical.dyna_steps > nm_safe.dyna_steps,
+            "critical ODE dyna_steps({}) should exceed safe({})",
+            nm_critical.dyna_steps,
+            nm_safe.dyna_steps
         );
     }
 }

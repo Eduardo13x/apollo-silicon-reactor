@@ -75,6 +75,7 @@ pub fn apply_neuromodulator(
     thermal_action: &ThermalAction,
     process_count: usize,
     cpu_temp_celsius: Option<f64>,
+    ode_swap_urgency: f64,
 ) {
     // Graded thermal stress [0, 1]: 0 at ≤60°C, 0.5 at 80°C, 1.0 at ≥100°C.
     // Falls back to thermal phase estimate when SMC/IOKit temperature is unavailable.
@@ -109,6 +110,7 @@ pub fn apply_neuromodulator(
         regime_shift_up: signal_digest.regime_shift_up,
         pressure_velocity: signal_digest.pressure_velocity,
         thermal_stress,
+        ode_swap_urgency,
         pressure_smooth: signal_digest.pressure_smooth as f64,
         regime_shift_down: signal_digest.regime_shift_down,
         process_count,
