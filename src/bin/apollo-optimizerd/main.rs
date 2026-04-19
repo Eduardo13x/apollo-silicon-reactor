@@ -1487,6 +1487,18 @@ fn main() -> anyhow::Result<()> {
                     if action_queue.max_per_cycle() != target {
                         action_queue.set_max_per_cycle(target);
                     }
+                    // G12 — DRAM Bandwidth Backpressure: if memory bandwidth is saturated
+                    // (amc_bandwidth_pct > 80), halve max_per_cycle to prevent additional
+                    // process activations from amplifying DRAM congestion.
+                    // [Hellerstein 2004 §9 — backpressure gates downstream work under saturation]
+                    let dram_bw_pct = last_ioreport
+                        .as_ref()
+                        .map(|ir| ir.amc_bandwidth_pct)
+                        .unwrap_or(0.0);
+                    if dram_bw_pct > 80.0 {
+                        let capped = (action_queue.max_per_cycle() / 2).max(1);
+                        action_queue.set_max_per_cycle(capped);
+                    }
                 }
 
                 // In dry-run mode skip the kill-switch stat() syscall — tests never
@@ -3548,6 +3560,15 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     _ => {}
+                }
+
+                // G10 — AMX Proactive Steering: when AMX is active AND LLM inference is
+                // running, boost reactor_weight to pre-position before ML memory pressure.
+                // AMX matrix-multiply pipelines fill in 100-200ms bursts; without this boost
+                // the daemon reacts after pressure already spikes.
+                // [Hellerstein 2004 §9 — derivative control precedes integrator saturation]
+                if amx_available && llm_active {
+                    reactor_weight = (reactor_weight + 0.15).min(1.0);
                 }
 
                 // Predictive agent: build context from existing signals and select intervention.
