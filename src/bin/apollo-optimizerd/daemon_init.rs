@@ -30,6 +30,7 @@ use apollo_optimizer::engine::syscall_classifier::SyscallClassifier;
 use apollo_optimizer::engine::thermal_bailout::ThermalBailout;
 use apollo_optimizer::engine::thermal_manager::ThermalManager;
 use apollo_optimizer::engine::thread_selfcounts::CycleIpcTracker;
+use apollo_optimizer::engine::swap_reclaim::SwapReclaimModel;
 use apollo_optimizer::engine::unfreeze_decay::UnfreezeDecayModel;
 use apollo_optimizer::engine::wake_storm_detector::WakeStormDetector;
 
@@ -69,6 +70,9 @@ pub(super) struct DaemonSubsystems {
     /// First-order ODE model of post-SIGCONT RSS re-accumulation.
     /// Learns per-app τ from observed thaws and predicts RSS for the next cycle.
     pub unfreeze_decay: UnfreezeDecayModel,
+    /// ODE model for compressor/swap saturation dynamics.
+    /// dS/dt = dirty_rate − reclaim_rate; predicts time-to-saturation each cycle.
+    pub swap_reclaim: SwapReclaimModel,
 }
 
 /// Detect hardware capabilities (core count and RAM) once at startup.
@@ -127,6 +131,7 @@ impl DaemonSubsystems {
             energy_pid_tracker: EnergyPidTracker::new(),
             cycle_ipc_tracker: CycleIpcTracker::new(),
             unfreeze_decay: UnfreezeDecayModel::new(),
+            swap_reclaim: SwapReclaimModel::new(),
         }
     }
 }

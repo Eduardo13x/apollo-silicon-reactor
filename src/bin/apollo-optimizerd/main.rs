@@ -847,6 +847,7 @@ fn main() -> anyhow::Result<()> {
                 mut energy_pid_tracker,
                 mut cycle_ipc_tracker,
                 mut unfreeze_decay,
+                mut swap_reclaim,
             } = daemon_init::DaemonSubsystems::new();
             let mut nested_learner = apollo_optimizer::engine::nested_learner::NestedLearner::new();
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
@@ -3373,6 +3374,23 @@ fn main() -> anyhow::Result<()> {
                     d
                 };
 
+                // Swap Reclaim ODE — feed vm_rate from background collector.
+                // Produces SaturationForecast used by the freeze gate below.
+                // [Denning 1968; Zhao et al. 2009 WKdm rate model]
+                let reclaim_forecast = {
+                    use apollo_optimizer::engine::swap_reclaim::VmFlowSample;
+                    let pd = pressure_collector.latest();
+                    let flow = VmFlowSample {
+                        compressions_per_sec: pd.vm_rate.compressions_per_sec,
+                        decompressions_per_sec: pd.vm_rate.decompressions_per_sec,
+                        purges_per_sec: pd.vm_rate.purges_per_sec,
+                        swapouts_per_sec: pd.vm_rate.swapouts_per_sec,
+                        swap_used_bytes: pd.swap_used_bytes,
+                        swap_total_bytes: pd.swap_total_bytes,
+                    };
+                    swap_reclaim.update(&flow)
+                };
+
                 // Signal intelligence → reactor_weight boosting.
                 // CUSUM regime shift: pressure drifting up significantly.
                 if signal_digest.regime_shift_up {
@@ -3777,6 +3795,45 @@ fn main() -> anyhow::Result<()> {
                 // processes have stable RSS (swapped out) and stable CPU (not running) —
                 // they LOOK calm but are the source of thrashing.  Force a fresh look
                 // when p_oom ≥ 0.95 or swap ≥ 8 GB.
+                // Swap reclaim ODE gate: when the model predicts saturation
+                // within CRITICAL_ETA_SEC, pre-emptively boost reactor_weight
+                // so the freeze decision stage acts before the threshold is hit.
+                // [Denning 1968] — working-set overflow must be caught early;
+                // [Zhao 2009] — compression-rate signal leads level signal.
+                {
+                    use apollo_optimizer::engine::swap_reclaim::{SwapRisk, CRITICAL_ETA_SEC};
+                    match reclaim_forecast.risk {
+                        SwapRisk::Critical => {
+                            // T_sat ≤ 60 s: moderate pre-emptive boost.
+                            reactor_weight = (reactor_weight + 0.25).min(1.0);
+                            if let Some(eta) = reclaim_forecast.t_sat_sec {
+                                tracing::info!(
+                                    target: "apollo.swap_reclaim",
+                                    eta_sec = format!("{:.1}", eta),
+                                    net_mbps = format!("{:.2}",
+                                        reclaim_forecast.net_rate_bps / (1024.0 * 1024.0)),
+                                    "swap reclaim ODE: Critical — reactor boosted +0.25"
+                                );
+                            }
+                        }
+                        SwapRisk::Overflow => {
+                            // Already past threshold — maximum boost, bypass habituated list.
+                            reactor_weight = 1.0;
+                            tracing::warn!(
+                                target: "apollo.swap_reclaim",
+                                swap_ratio = format!("{:.2}", reclaim_forecast.swap_ratio),
+                                "swap reclaim ODE: Overflow — reactor_weight=1.0"
+                            );
+                        }
+                        SwapRisk::Building => {
+                            // Net positive but far from threshold — small early nudge.
+                            let _ = CRITICAL_ETA_SEC; // used in risk classifier
+                            reactor_weight = (reactor_weight + 0.05).min(1.0);
+                        }
+                        SwapRisk::Safe => {}
+                    }
+                }
+
                 let swap_critical = snapshot.pressure.swap_used_bytes >= 8 * 1_073_741_824;
                 let oom_critical = signal_digest.p_oom_30s >= 0.95;
                 let empty_hab: HashSet<u32> = HashSet::new();
