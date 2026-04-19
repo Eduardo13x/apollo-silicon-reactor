@@ -311,6 +311,16 @@ impl UnfreezeDecayModel {
         Some(-tau * (1.0 - ratio).ln())
     }
 
+    /// Learned τ for `app`, or DEFAULT_TAU_SEC if unknown/insufficient samples.
+    /// [Denning 1968] high τ = slow working-set re-growth → freeze is expensive.
+    pub fn tau_for_app(&self, app: &str) -> f64 {
+        self.tau_estimates
+            .get(app)
+            .filter(|e| e.samples >= MIN_SAMPLES_FOR_LEARNING as u32)
+            .map(|e| e.tau_sec)
+            .unwrap_or(DEFAULT_TAU_SEC)
+    }
+
     /// Snapshot of the learned τ map for persistence.
     pub fn tau_snapshot(&self) -> HashMap<String, TauEstimate> {
         self.tau_estimates.clone()

@@ -83,6 +83,9 @@ pub struct AdaptiveGovernor {
     /// Physical swap pressure from the ODE model — scales idle thresholds.
     /// [Hellerstein 2004] §9: resource targets must reflect operating regime.
     pub swap_risk: SwapRisk,
+    /// PIDs whose learned τ exceeds HIGH_TAU_SEC — freeze is expensive for these.
+    /// [Denning 1968] high τ = slow RSS re-growth → prefer Throttle over Freeze.
+    pub high_tau_pids: std::collections::HashSet<u32>,
 }
 
 impl AdaptiveGovernor {
@@ -103,6 +106,7 @@ impl AdaptiveGovernor {
                 sources: Vec::new(),
             },
             swap_risk: SwapRisk::Safe,
+            high_tau_pids: std::collections::HashSet::new(),
         }
     }
 
@@ -399,14 +403,23 @@ impl AdaptiveGovernor {
         // idle for over an hour with no GUI, it's effectively stale.
         // Rosetta (translated) processes get frozen instead of throttled because
         // they use ~2x memory (JIT page tables) — freeing them is more valuable.
+        // High-τ processes grow back rapidly after SIGCONT — freeze gives short relief.
+        // Prefer Throttle over Freeze for these unless swap is already Critical/Overflow.
+        // [Denning 1968] working-set quality is usage rate, not residency.
+        let high_tau = self.high_tau_pids.contains(&snap.pid);
+        let swap_critical = matches!(self.swap_risk, SwapRisk::Critical | SwapRisk::Overflow);
+
         let silent_idle_threshold = (3600.0 * idle_multiplier) as u64;
         if tier == ProcessTier::SilentDaemon
             && snap.cpu_percent < 0.5
             && snap.secs_since_foreground > silent_idle_threshold
             && !snap.has_gui_window
         {
-            // Translated (2x memory) or RSS hog (>1GB): freeze to reclaim memory.
-            let decision = if snap.is_translated || snap.rss_bytes > 1024 * 1024 * 1024 {
+            // Translated (2x memory) or RSS hog (>1GB): freeze to reclaim memory
+            // unless high-τ and swap is not yet critical (freeze cost > benefit).
+            let decision = if (snap.is_translated || snap.rss_bytes > 1024 * 1024 * 1024)
+                && (!high_tau || swap_critical)
+            {
                 GovernorDecision::Freeze
             } else {
                 GovernorDecision::Throttle
@@ -415,8 +428,8 @@ impl AdaptiveGovernor {
                 decision,
                 utility,
                 format!(
-                    "SilentDaemon idle override (cpu={:.1}%, idle={}s, swap_risk={:?})",
-                    snap.cpu_percent, snap.secs_since_foreground, self.swap_risk
+                    "SilentDaemon idle override (cpu={:.1}%, idle={}s, swap_risk={:?}, high_tau={})",
+                    snap.cpu_percent, snap.secs_since_foreground, self.swap_risk, high_tau
                 ),
             );
         }
@@ -464,7 +477,9 @@ impl AdaptiveGovernor {
             && snap.secs_since_foreground > grad_throttle_threshold
             && snap.faults_total < 500_000
         {
-            let decision = if snap.secs_since_foreground > grad_freeze_threshold {
+            // High-τ: even at freeze threshold, prefer Throttle unless swap critical.
+            let would_freeze = snap.secs_since_foreground > grad_freeze_threshold;
+            let decision = if would_freeze && (!high_tau || swap_critical) {
                 GovernorDecision::Freeze
             } else {
                 GovernorDecision::Throttle
@@ -473,10 +488,11 @@ impl AdaptiveGovernor {
                 decision,
                 adjusted_utility,
                 format!(
-                    "Graduated idle ({}h, no GUI, swap_risk={:?}) — {}",
+                    "Graduated idle ({}h, no GUI, swap_risk={:?}, high_tau={}) — {}",
                     snap.secs_since_foreground / 3600,
                     self.swap_risk,
-                    if snap.secs_since_foreground > grad_freeze_threshold {
+                    high_tau,
+                    if matches!(decision, GovernorDecision::Freeze) {
                         "freeze"
                     } else {
                         "throttle"
@@ -1221,6 +1237,43 @@ mod tests {
     }
 
     // ── Micro-benchmark: decide_all latency ──────────────────────────────────
+
+    #[test]
+    fn high_tau_pid_prefers_throttle_over_freeze_on_silent_daemon() {
+        // A large-RSS (>1GB) SilentDaemon idle 2h would normally Freeze.
+        // If its PID is in high_tau_pids (slow recovery), downgrade to Throttle
+        // unless swap is Critical. Under Critical swap, still freeze.
+        let proc = ProcessSnapshot {
+            cpu_percent: 0.1,
+            secs_since_foreground: 7200, // 2h > 1h safe threshold, > 900s critical threshold
+            has_gui_window: false,
+            faults_total: 100,
+            rss_bytes: 1500 * 1024 * 1024, // >1GB → triggers freeze in SilentDaemon path
+            ..base_proc(99, "slow-app")
+        };
+
+        // Safe swap + high τ → Throttle (freeze cost > benefit)
+        let mut gov = governor();
+        gov.swap_risk = SwapRisk::Safe;
+        gov.high_tau_pids.insert(99);
+        let d = gov.decide_all(&[proc.clone()], &no_hunts(), None, &["slow-app"], 12);
+        assert_eq!(
+            d[0].decision,
+            GovernorDecision::Throttle,
+            "Safe + high-τ + >1GB: prefer Throttle (freeze cost > benefit)"
+        );
+
+        // Critical swap + high τ → Freeze (emergency overrides cost concern)
+        let mut gov_crit = governor();
+        gov_crit.swap_risk = SwapRisk::Critical;
+        gov_crit.high_tau_pids.insert(99);
+        let d_crit = gov_crit.decide_all(&[proc], &no_hunts(), None, &["slow-app"], 12);
+        assert_eq!(
+            d_crit[0].decision,
+            GovernorDecision::Freeze,
+            "Critical + high-τ + >1GB: emergency overrides τ cost → Freeze"
+        );
+    }
 
     #[test]
     fn swap_risk_critical_lowers_silent_daemon_threshold() {

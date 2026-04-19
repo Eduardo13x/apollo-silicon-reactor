@@ -4342,10 +4342,19 @@ fn main() -> anyhow::Result<()> {
 
                 // Heuristic pass: AdaptiveGovernor
                 // Pass hw_features (sampled every 5 cycles) for Bayesian fusion + online learning.
-                // Wire ODE swap risk so idle thresholds scale with physical swap state.
+                // Wire ODE swap risk + high-τ PIDs so idle thresholds and freeze decisions
+                // reflect physical memory state. [Denning 1968] high-τ = slow WSS re-growth.
+                const HIGH_TAU_SEC: f64 = 300.0;
                 let heuristic_decisions = {
                     let mut pg = state.policy.lock_recover();
                     pg.adaptive_governor.swap_risk = reclaim_forecast.risk;
+                    pg.adaptive_governor.high_tau_pids = proc_snaps
+                        .iter()
+                        .filter(|s| {
+                            unfreeze_decay.tau_for_app(&s.name) > HIGH_TAU_SEC
+                        })
+                        .map(|s| s.pid)
+                        .collect();
                     pg.adaptive_governor.decide_all_with_hw(
                         &proc_snaps,
                         &hunt_snaps,
