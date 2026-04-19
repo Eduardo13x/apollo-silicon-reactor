@@ -58,8 +58,19 @@ use apollo_optimizer::engine::predictive_agent::{
     specialist, tally_votes, Intervention, SpecialistVote,
 };
 use apollo_optimizer::engine::lotka_volterra::StabilityRegime;
+use apollo_optimizer::engine::nars_belief::TruthValue;
 use apollo_optimizer::engine::signal_intelligence::SignalDigest;
 use apollo_optimizer::engine::types::OptimizationProfile;
+
+/// NARS belief confidence target for monopoly_freeze maturity gate.
+/// At c=0.80 the belief carries enough evidence to act on without
+/// second-guessing [Pei Wang 2013 §3.3.1].
+const MONOPOLY_BELIEF_CONFIDENCE_TARGET: f32 = 0.80;
+
+/// Floor for maturity factor — even with zero evidence, keep a minimal
+/// vote weight so pathological monopoly_risk > 0.5 never gets silenced
+/// completely [Gray & Reuter 1992 §11, evidence-gated decisions].
+const MONOPOLY_MATURITY_FLOOR: f64 = 0.4;
 use apollo_optimizer::engine::user_context::UserContext;
 
 /// Per-process habituation bucket window size: unchanged ≥ this many cycles
@@ -188,19 +199,29 @@ pub fn apply_specialist_voting(
             StabilityRegime::UnstableSaddle => 1.08_f64,
             _ => 1.0_f64,
         };
+        // NARS belief maturity gate: scale confidence by accumulated evidence.
+        // Young beliefs get floor-weight (0.4); mature beliefs get full weight.
+        // [Pei Wang 2013 §3.3.1, Gray & Reuter 1992 §11]
+        let obs_remaining = lctx
+            .outcome_tracker
+            .drift_detector
+            .observations_remaining("monopoly_freeze", MONOPOLY_BELIEF_CONFIDENCE_TARGET);
+        let maturity_factor = monopoly_maturity_factor(obs_remaining);
         let confidence = (signal_digest.monopoly_risk.min(1.0)
             * lctx.specialist_accuracy.weight(specialist::MONOPOLY)
-            * stability_boost)
+            * stability_boost
+            * maturity_factor)
             .min(1.0);
         // Log NARS maturity horizon every 30 cycles to avoid journal spam.
         if cycle_count % 30 == 0 {
-            if let Some(rem) = lctx.outcome_tracker.drift_detector.observations_remaining("monopoly_freeze", 0.80) {
+            if let Some(rem) = obs_remaining {
                 if rem > 0 {
                     audit_log(&serde_json::json!({
                         "t": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                         "event": "nars_maturity_horizon",
                         "belief": "monopoly_freeze",
                         "obs_remaining_to_0.80": rem,
+                        "maturity_factor": (maturity_factor * 1000.0).round() / 1000.0,
                         "stability_regime": format!("{:?}", signal_digest.stability_regime),
                     }));
                 }
@@ -402,6 +423,30 @@ pub fn compute_user_context(
     ctx
 }
 
+/// Maturity-weighted confidence factor for the monopoly specialist.
+///
+/// Scales in `[MONOPOLY_MATURITY_FLOOR, 1.0]` based on how close the
+/// `monopoly_freeze` NARS belief is to the confidence target.
+///
+/// - `None` (belief absent): returns floor — no evidence, cautious.
+/// - `Some(0)` (mature): returns 1.0 — full trust.
+/// - `Some(rem > 0)`: linear interpolation from floor toward 1.0 as
+///   evidence accumulates.
+///
+/// [Pei Wang 2013 §3.3.1, Gray & Reuter 1992 §11]
+pub fn monopoly_maturity_factor(obs_remaining: Option<u32>) -> f64 {
+    match obs_remaining {
+        None => MONOPOLY_MATURITY_FLOOR,
+        Some(0) => 1.0,
+        Some(rem) => {
+            let needed = TruthValue::observations_to_reach(MONOPOLY_BELIEF_CONFIDENCE_TARGET)
+                .max(1) as f64;
+            let progress = 1.0 - ((rem as f64 / needed).min(1.0));
+            MONOPOLY_MATURITY_FLOOR + (1.0 - MONOPOLY_MATURITY_FLOOR) * progress
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -411,6 +456,40 @@ mod tests {
     #[test]
     fn habituation_threshold_is_five() {
         assert_eq!(HABITUATION_THRESHOLD, 5);
+    }
+
+    #[test]
+    fn maturity_factor_no_belief_returns_floor() {
+        assert_eq!(monopoly_maturity_factor(None), MONOPOLY_MATURITY_FLOOR);
+    }
+
+    #[test]
+    fn maturity_factor_mature_belief_returns_one() {
+        assert_eq!(monopoly_maturity_factor(Some(0)), 1.0);
+    }
+
+    #[test]
+    fn maturity_factor_half_progress_is_midway() {
+        let needed =
+            TruthValue::observations_to_reach(MONOPOLY_BELIEF_CONFIDENCE_TARGET) as f64;
+        let half = (needed / 2.0).ceil() as u32;
+        let factor = monopoly_maturity_factor(Some(half));
+        // ~midway between floor and 1.0 (0.7 ± ε)
+        assert!(
+            factor > MONOPOLY_MATURITY_FLOOR + 0.2 && factor < 1.0,
+            "half-progress factor was {}",
+            factor
+        );
+    }
+
+    #[test]
+    fn maturity_factor_monotone_in_evidence() {
+        // more evidence (smaller rem) ⇒ higher factor
+        let f_young = monopoly_maturity_factor(Some(100));
+        let f_mid = monopoly_maturity_factor(Some(4));
+        let f_mature = monopoly_maturity_factor(Some(1));
+        assert!(f_young <= f_mid, "{} <= {}", f_young, f_mid);
+        assert!(f_mid <= f_mature, "{} <= {}", f_mid, f_mature);
     }
 
     #[test]

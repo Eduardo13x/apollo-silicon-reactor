@@ -790,6 +790,40 @@ mod tests {
     }
 
     #[test]
+    fn observations_remaining_none_for_unknown_key() {
+        let dd = DriftDetector::new();
+        assert_eq!(dd.observations_remaining("ghost_key", 0.80), None);
+    }
+
+    #[test]
+    fn observations_remaining_zero_when_mature() {
+        let mut dd = DriftDetector::new();
+        // Enough positive observations to clear c=0.80 target
+        for _ in 0..50 {
+            dd.observe("mature_key", true);
+        }
+        let rem = dd
+            .observations_remaining("mature_key", 0.80)
+            .expect("belief exists");
+        assert_eq!(rem, 0, "mature belief should need 0 more observations");
+    }
+
+    #[test]
+    fn observations_remaining_decreases_with_evidence() {
+        let mut dd = DriftDetector::new();
+        dd.observe("k", true);
+        let rem1 = dd.observations_remaining("k", 0.80).unwrap();
+        for _ in 0..3 {
+            dd.observe("k", true);
+        }
+        let rem4 = dd.observations_remaining("k", 0.80).unwrap();
+        assert!(
+            rem4 <= rem1,
+            "rem should shrink with more evidence: {rem1} → {rem4}"
+        );
+    }
+
+    #[test]
     fn truth_value_defaults_to_ignorance_prior() {
         let tv = TruthValue::default();
         assert_eq!(tv.frequency, 0.5);
