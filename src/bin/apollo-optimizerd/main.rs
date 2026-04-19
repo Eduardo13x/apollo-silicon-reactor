@@ -1136,6 +1136,11 @@ fn main() -> anyhow::Result<()> {
             // Throttle IOReport to every ~2 cycles (≥1s between samples).
             let mut last_ioreport_sample = Instant::now();
 
+            // G12 fallback: previous cycle's entropy anomaly used as proxy when
+            // ioreport_amc_bandwidth_pct is dead (M1 without IOReport entitlement).
+            // 1-cycle lag is acceptable — DRAM BP is integrative, not cycle-precise.
+            let mut prev_entropy_anomaly: f64 = 0.0;
+
             // ── Warn-limit tracking (non-fatal targeted memory pressure) ──────
             // PIDs that have an active warn_limit set; cleared after 3 cycles.
             let mut warn_limit_pids: HashMap<u32, u8> = HashMap::new();
@@ -1491,11 +1496,19 @@ fn main() -> anyhow::Result<()> {
                     // (amc_bandwidth_pct > 80), halve max_per_cycle to prevent additional
                     // process activations from amplifying DRAM congestion.
                     // [Hellerstein 2004 §9 — backpressure gates downstream work under saturation]
+                    //
+                    // M1 fallback: when amc_bandwidth_pct == 0.0 (no IOReport
+                    // entitlement), use prev-cycle entropy_anomaly > 2.0 as proxy.
+                    // Raw entropy_anomaly can exceed 1.0 on real contention events —
+                    // ≥2.0 is the same threshold used by signal_intel for true anomalies.
+                    // [Heil 2021 PACT §3] — workload entropy tracks LLC pressure.
                     let dram_bw_pct = last_ioreport
                         .as_ref()
                         .map(|ir| ir.amc_bandwidth_pct)
                         .unwrap_or(0.0);
-                    if dram_bw_pct > 80.0 {
+                    let dram_bp_trigger = dram_bw_pct > 80.0
+                        || (dram_bw_pct == 0.0 && prev_entropy_anomaly > 2.0);
+                    if dram_bp_trigger {
                         let capped = (action_queue.max_per_cycle() / 2).max(1);
                         action_queue.set_max_per_cycle(capped);
                     }
@@ -3430,6 +3443,10 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     signal_digest.pressure_velocity
                 };
+
+                // G12 fallback carry-over: cache entropy_anomaly for next cycle's
+                // DRAM BP proxy (used when amc_bandwidth_pct is dead on M1).
+                prev_entropy_anomaly = signal_digest.entropy_anomaly;
 
                 // Swap Reclaim ODE — feed vm_rate from background collector.
                 // Produces SaturationForecast used by the freeze gate below.
