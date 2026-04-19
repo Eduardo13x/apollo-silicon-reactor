@@ -308,6 +308,13 @@ impl UnfreezeDecayModel {
     pub fn learned_app_count(&self) -> usize {
         self.tau_estimates.len()
     }
+
+    /// Snapshot of the pids currently being tracked — the caller can then
+    /// query its process collector for a fresh RSS reading and feed it back
+    /// via `observe_sample`.
+    pub fn active_thaw_pids(&self) -> Vec<u32> {
+        self.active_thaws.keys().copied().collect()
+    }
 }
 
 /// Solve `(1 − e^{−t1/τ}) / (1 − e^{−t2/τ}) = r` for τ by bisection.

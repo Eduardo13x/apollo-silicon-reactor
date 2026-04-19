@@ -249,6 +249,10 @@ pub struct ExecuteOutcomes {
     /// PIDs that were successfully frozen (SIGSTOP sent) this cycle.
     /// Used by causal graph to record only new freeze actions, not all active frozen PIDs.
     pub newly_frozen_pids: Vec<u32>,
+    /// PIDs that were successfully thawed (SIGCONT sent) this cycle.
+    /// Consumed by `UnfreezeDecayModel::record_thaw` — the model needs exactly
+    /// the set of pids whose post-thaw RSS should start being tracked.
+    pub newly_unfrozen_pids: Vec<u32>,
     /// A3 + A5/D1 fix (round-3): per-PID identity snapshot captured at the
     /// moment of SIGSTOP.  Parallel to `newly_frozen_pids`.
     /// `(start_sec, original_jetsam_priority)` — either may be 0/None if
@@ -625,6 +629,7 @@ pub fn execute_actions(
                         frozen.remove(pid);
                         out.unfreezes_applied += 1;
                         out.throttle_reverted += 1;
+                        out.newly_unfrozen_pids.push(*pid);
                     } else {
                         // A2 fix (round-3): skip zombies — SIGCONT is a no-op on them.
                         if proc_taskinfo::is_zombie_pid(*pid) {
@@ -664,6 +669,7 @@ pub fn execute_actions(
                                 frozen.remove(pid);
                                 out.unfreezes_applied += 1;
                                 out.throttle_reverted += 1;
+                                out.newly_unfrozen_pids.push(*pid);
                             }
                             // If SIGCONT failed (e.g. permission denied), keep in frozen set
                             // so the TTL or next cycle can retry.

@@ -846,6 +846,7 @@ fn main() -> anyhow::Result<()> {
                 mut ioreport,
                 mut energy_pid_tracker,
                 mut cycle_ipc_tracker,
+                mut unfreeze_decay,
             } = daemon_init::DaemonSubsystems::new();
             let mut nested_learner = apollo_optimizer::engine::nested_learner::NestedLearner::new();
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
@@ -5581,6 +5582,42 @@ fn main() -> anyhow::Result<()> {
                     outcomes
                     // frozen_state lock released here
                 };
+
+                // Unfreeze decay ODE: record fresh thaws, observe active ones, GC.
+                // Bounded per-cycle: O(active_thaws) sysinfo lookups, no I/O.
+                // [Strogatz 2015 §2.3 linear ODE; Denning 1968 working set]
+                {
+                    let now_instant = std::time::Instant::now();
+                    let now_epoch_sec = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    for &pid in &exec_outcomes.newly_unfrozen_pids {
+                        if let Some(proc) =
+                            collector.system().process(sysinfo::Pid::from_u32(pid))
+                        {
+                            unfreeze_decay.record_thaw(
+                                pid,
+                                proc.name().to_string(),
+                                proc.memory(),
+                                now_instant,
+                            );
+                        }
+                    }
+                    for pid in unfreeze_decay.active_thaw_pids() {
+                        if let Some(proc) =
+                            collector.system().process(sysinfo::Pid::from_u32(pid))
+                        {
+                            unfreeze_decay.observe_sample(
+                                pid,
+                                proc.memory(),
+                                now_instant,
+                                now_epoch_sec,
+                            );
+                        }
+                    }
+                    unfreeze_decay.gc(now_instant, now_epoch_sec);
+                }
 
                 // kqueue: watch newly frozen PIDs for death (OOM/jetsam push notification).
                 if exec_outcomes.freezes_applied > 0 {

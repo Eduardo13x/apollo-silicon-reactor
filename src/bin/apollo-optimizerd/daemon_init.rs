@@ -30,6 +30,7 @@ use apollo_optimizer::engine::syscall_classifier::SyscallClassifier;
 use apollo_optimizer::engine::thermal_bailout::ThermalBailout;
 use apollo_optimizer::engine::thermal_manager::ThermalManager;
 use apollo_optimizer::engine::thread_selfcounts::CycleIpcTracker;
+use apollo_optimizer::engine::unfreeze_decay::UnfreezeDecayModel;
 use apollo_optimizer::engine::wake_storm_detector::WakeStormDetector;
 
 /// Subsystems constructed once at daemon startup with no shared-state dependencies.
@@ -65,6 +66,9 @@ pub(super) struct DaemonSubsystems {
     pub ioreport: IOReportReader,
     pub energy_pid_tracker: EnergyPidTracker,
     pub cycle_ipc_tracker: CycleIpcTracker,
+    /// First-order ODE model of post-SIGCONT RSS re-accumulation.
+    /// Learns per-app τ from observed thaws and predicts RSS for the next cycle.
+    pub unfreeze_decay: UnfreezeDecayModel,
 }
 
 /// Detect hardware capabilities (core count and RAM) once at startup.
@@ -122,6 +126,7 @@ impl DaemonSubsystems {
             ioreport: IOReportReader::new(),
             energy_pid_tracker: EnergyPidTracker::new(),
             cycle_ipc_tracker: CycleIpcTracker::new(),
+            unfreeze_decay: UnfreezeDecayModel::new(),
         }
     }
 }
