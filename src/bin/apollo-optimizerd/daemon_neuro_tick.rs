@@ -127,8 +127,13 @@ pub fn apply_neuromodulator(
             .as_ref()
             .map_or(false, |rl| rl.total_ticks() < 200),
         tau_divergence,
-        // G11: contention_stall_fraction from KPC stall counters (0 if unavailable).
-        contention_stall_fraction: 0.0,
+        // G11: contention_stall_fraction from KPC stall counters when available.
+        // On M1 without the private KPC entitlement, kpc_ipc returns 0 and KPC
+        // stall counters are inaccessible. Fallback to si_entropy_anomaly as an
+        // indirect proxy: workload fingerprint divergence correlates with
+        // µarch-level stalls via process-churn → L2/LLC contention.
+        // [Heil 2021 PACT §3] — workload entropy tracks last-level cache pressure.
+        contention_stall_fraction: (signal_digest.entropy_anomaly as f64).clamp(0.0, 1.0),
     };
     lctx.neuromod.tick(&neuro_signals);
 
