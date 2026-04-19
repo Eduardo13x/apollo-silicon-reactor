@@ -5474,8 +5474,60 @@ fn main() -> anyhow::Result<()> {
                     );
                     let cb_is_open = filter_outcome.cb_is_open;
                     let op_mode = filter_outcome.op_mode;
-                    let filtered_actions = filter_outcome.filtered_actions;
+                    let mut filtered_actions = filter_outcome.filtered_actions;
                     causal_qos_upgrades_cycle += filter_outcome.causal_qos_upgrades;
+
+                    // ── Predictive thaw gate ─────────────────────────────
+                    // When pressure is already high, refuse to thaw any
+                    // process whose ODE model predicts > MAX_PRED_GROWTH_BYTES
+                    // of RSS re-accumulation within 5 seconds.  Prevents the
+                    // classic failure mode: thaw browser tab under 0.82 →
+                    // 0.95 pressure spike 3 s later → swap storm.
+                    // [Strogatz 2015 §2.3] model-informed control;
+                    // [Nygard 2018 §5] backpressure by action refusal.
+                    {
+                        const PRED_GATE_PRESSURE: f64 = 0.80;
+                        const MAX_PRED_GROWTH_BYTES: u64 = 200 * 1024 * 1024; // 200 MB
+                        let pressure = snapshot.pressure.memory_pressure as f64;
+                        if pressure > PRED_GATE_PRESSURE {
+                            let mut deferred = 0u32;
+                            filtered_actions.retain(|a| {
+                                if let RootAction::UnfreezeProcess { pid, name, .. } = a {
+                                    let m_0 = collector
+                                        .system()
+                                        .process(sysinfo::Pid::from_u32(*pid))
+                                        .map(|p| p.memory())
+                                        .unwrap_or(0);
+                                    let predicted =
+                                        unfreeze_decay.predict_rss(name, m_0, 5.0);
+                                    let growth = predicted.saturating_sub(m_0);
+                                    if growth > MAX_PRED_GROWTH_BYTES {
+                                        tracing::info!(
+                                            target: "apollo.unfreeze_decay",
+                                            pid = *pid,
+                                            name = %name,
+                                            pressure = %format!("{:.2}", pressure),
+                                            growth_mb = growth / (1024 * 1024),
+                                            "deferring thaw: predicted RSS growth exceeds headroom"
+                                        );
+                                        deferred += 1;
+                                        return false;
+                                    }
+                                }
+                                true
+                            });
+                            if deferred > 0 {
+                                tracing::warn!(
+                                    target: "apollo.unfreeze_decay",
+                                    deferred,
+                                    active_thaws = unfreeze_decay.active_thaw_count(),
+                                    learned_apps = unfreeze_decay.learned_app_count(),
+                                    "predictive thaw gate dropped {} candidate(s)",
+                                    deferred
+                                );
+                            }
+                        }
+                    }
 
                     // Extract a temporary HashSet for execute_actions (which requires &mut HashSet<u32>).
                     let mut frozen_set: HashSet<u32> =
