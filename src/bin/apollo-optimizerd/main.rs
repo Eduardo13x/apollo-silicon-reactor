@@ -4350,11 +4350,13 @@ fn main() -> anyhow::Result<()> {
                             .learned_policy
                             .protected_patterns
                             .clone();
+                        let daemon_pid = std::process::id();
                         let mut bg_procs: Vec<_> = snapshot
                             .top_processes
                             .iter()
                             .filter(|p| {
-                                !is_interactive_app_name(&p.name)
+                                p.pid != daemon_pid // never hint self — self-inflicted cache purge spiral
+                                    && !is_interactive_app_name(&p.name)
                                     && !interactive_pats
                                         .iter()
                                         .any(|pat| p.name.contains(pat.as_str()))
