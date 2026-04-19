@@ -536,6 +536,21 @@ impl DriftDetector {
         self.beliefs.get(key).map(|e| e.tv)
     }
 
+    /// How many more observations needed to lift `key` belief to `c_target`.
+    /// Returns `None` if belief not found or already at/above target.
+    /// Uses algebraic inverse n = c/(1-c) [Pei Wang 2013 §3.3.1].
+    pub fn observations_remaining(&self, key: &str, c_target: f32) -> Option<u32> {
+        let tv = self.beliefs.get(key)?.tv;
+        if tv.confidence >= c_target {
+            return Some(0);
+        }
+        let needed = TruthValue::observations_to_reach(c_target);
+        // Current effective n: inverse of confidence_from_count(n) = c/(1-c).
+        let eps = 1e-6_f32;
+        let current_n = (tv.confidence / (1.0 - tv.confidence + eps)).ceil() as u32;
+        Some(needed.saturating_sub(current_n))
+    }
+
     /// Reset drift signals after recalibration has been applied.
     /// Does NOT reset the beliefs themselves — keeps accumulated evidence.
     pub fn acknowledge_recalibration(&mut self) {

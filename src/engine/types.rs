@@ -729,6 +729,9 @@ pub struct RuntimeMetrics {
     pub si_monopoly_risk: f64,
     #[serde(default)]
     pub si_entropy_anomaly: f64,
+    /// Lotka-Volterra Jacobian stability class: 0=Degenerate 1=StableNode 2=StableSpiral 3=UnstableSaddle 4=Unstable
+    #[serde(default)]
+    pub si_stability_regime: u8,
     // Thread-level QoS metrics (Phase 1)
     #[serde(default)]
     pub thread_qos_applied: u64,

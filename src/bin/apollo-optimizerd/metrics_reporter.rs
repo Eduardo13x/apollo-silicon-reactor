@@ -76,6 +76,7 @@ pub fn update_learning_metrics<'a>(
     }
     m.metrics.si_monopoly_risk = signal_digest.monopoly_risk;
     m.metrics.si_entropy_anomaly = signal_digest.entropy_anomaly;
+    m.metrics.si_stability_regime = signal_digest.stability_regime as u8;
     // Cable 4: top_causal_pairs() → expose in metrics for observability.
     m.metrics.causal_pairs = lctx
         .outcome_tracker

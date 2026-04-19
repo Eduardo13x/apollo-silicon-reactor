@@ -32,19 +32,20 @@ use serde::{Deserialize, Serialize};
 ///   λ = (tr ± √(tr²−4·det)) / 2
 ///
 /// [Strogatz 2015] "Nonlinear Dynamics and Chaos" §6.4 — two-species competition.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StabilityRegime {
     /// Re(λ) < 0, Im(λ) ≠ 0 — oscillates but converges. System self-regulates.
-    StableSpiral,
+    StableSpiral = 2,
     /// Re(λ) < 0, Im(λ) = 0 — smooth monotone decay to coexistence.
-    StableNode,
+    StableNode = 1,
     /// det < 0 — saddle point; outcome depends on initial conditions.
     /// Dominant above separatrix → monopoly. High intervention priority.
-    UnstableSaddle,
+    UnstableSaddle = 3,
     /// Re(λ) > 0 — coexistence equilibrium is a repellor. Dominant will monopolize.
-    Unstable,
+    Unstable = 4,
     /// Coexistence equilibrium does not exist (insufficient data or α₁₂·α₂₁ ≈ 1).
-    Degenerate,
+    Degenerate = 0,
 }
 
 /// Estado de competencia entre el proceso dominante y el resto.

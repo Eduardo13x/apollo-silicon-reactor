@@ -25,7 +25,7 @@ use crate::engine::entropy_anomaly::EntropyDetector;
 use crate::engine::hazard_model::HazardModel;
 use crate::engine::kalman::Kalman1D;
 use crate::engine::learned_state::LearnableParams;
-use crate::engine::lotka_volterra::CompetitionState;
+use crate::engine::lotka_volterra::{CompetitionState, StabilityRegime};
 use crate::engine::mpc_horizon::{MpcController, MpcPersisted};
 
 /// Resumen compacto de las señales procesadas. Todo normalizado 0–1 o con signo.
@@ -69,6 +69,9 @@ pub struct SignalDigest {
     // ── Lotka-Volterra ───────────────────────────────────────────────────
     /// Riesgo de monopolización de RAM por un solo proceso (0–1).
     pub monopoly_risk: f64,
+    /// Régimen de estabilidad del equilibrio de coexistencia (Jacobian analítico).
+    /// Degenerate = datos insuficientes / equilibrio no existe.
+    pub stability_regime: StabilityRegime,
 
     // ── MPC ──────────────────────────────────────────────────────────────
     /// Acción recomendada por MPC (índice 0–4).
@@ -414,7 +417,7 @@ impl SignalIntelligence {
         };
 
         // ── 5. Lotka-Volterra ────────────────────────────────────────────
-        let monopoly_risk = if run_lotka {
+        let (monopoly_risk, stability_regime) = if run_lotka {
             self.competition.update(
                 dominant_name,
                 dominant_bytes,
@@ -422,9 +425,12 @@ impl SignalIntelligence {
                 total_available_bytes,
                 dt_secs,
             );
-            self.competition.monopoly_risk()
+            (
+                self.competition.monopoly_risk(),
+                self.competition.stability_regime(),
+            )
         } else {
-            0.0
+            (0.0, StabilityRegime::Degenerate)
         };
 
         // ── 6. MPC (constraint-aware) ─────────────────────────────────────
@@ -488,6 +494,7 @@ impl SignalIntelligence {
             regime_shift_up,
             p_oom_30s,
             monopoly_risk,
+            stability_regime,
             entropy_anomaly,
         );
 
@@ -504,6 +511,7 @@ impl SignalIntelligence {
             entropy_anomaly,
             p_oom_30s,
             monopoly_risk,
+            stability_regime,
             mpc_recommendation,
             urgency,
             transformer_anomaly: 0.0,
@@ -1004,35 +1012,33 @@ fn compute_urgency(
     regime_shift: bool,
     p_oom: f64,
     monopoly_risk: f64,
+    stability_regime: StabilityRegime,
     entropy_anomaly: f64,
 ) -> f64 {
-    // Cada señal aporta al score con peso diferente.
     let mut score = 0.0;
-
-    // Presión actual (peso alto).
     score += pressure * 0.30;
-
-    // Velocidad positiva (presión subiendo).
     if velocity > 0.0 {
         score += (velocity / 0.05).clamp(0.0, 1.0) * 0.20;
     }
-
-    // CUSUM regime shift.
     if regime_shift {
         score += 0.15;
     }
-
-    // P(OOM) calibrada.
     score += p_oom * 0.20;
 
-    // Monopolización de RAM.
-    score += monopoly_risk * 0.10;
+    // Monopoly weight boosted when Jacobian confirms repellor/saddle regime.
+    // Unstable: +0.05 max extra (repellor — dominant will monopolize analytically).
+    // UnstableSaddle: +0.02 max extra (outcome depends on separatrix position).
+    // [Strogatz 2015] §6.4 — stability classification from Jacobian eigenvalues.
+    let monopoly_weight = match stability_regime {
+        StabilityRegime::Unstable       => 0.15,
+        StabilityRegime::UnstableSaddle => 0.12,
+        _                               => 0.10,
+    };
+    score += monopoly_risk * monopoly_weight;
 
-    // Anomalía de entropía (solo si es positiva = caótico).
     if entropy_anomaly > 1.0 {
         score += ((entropy_anomaly - 1.0) / 3.0).clamp(0.0, 1.0) * 0.05;
     }
-
     score.clamp(0.0, 1.0)
 }
 
@@ -1097,6 +1103,7 @@ mod tests {
             fluidity_score: 1.0,
             window_op_active: false,
             app_launching: false,
+            stability_regime: StabilityRegime::Degenerate,
         };
         for _ in 0..20 {
             digest = tick_nominal(&mut si);
@@ -1538,6 +1545,7 @@ mod tests {
             fluidity_score: 1.0,
             window_op_active: false,
             app_launching: false,
+            stability_regime: StabilityRegime::Degenerate,
         };
         for i in 0..20 {
             let pressure = 0.55 + i as f64 * 0.005;
@@ -1794,6 +1802,7 @@ mod tests {
             fluidity_score: 1.0,
             window_op_active: false,
             app_launching: false,
+            stability_regime: StabilityRegime::Degenerate,
         };
         for _ in 0..30 {
             last = si.tick(
@@ -1873,7 +1882,7 @@ mod tests {
         let pressures = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
         let mut prev_urgency = -1.0;
         for &p in &pressures {
-            let u = compute_urgency(p, 0.0, false, 0.0, 0.0, 0.0);
+            let u = compute_urgency(p, 0.0, false, 0.0, 0.0, StabilityRegime::Degenerate, 0.0);
             assert!(
                 u >= prev_urgency,
                 "urgency not monotonic: p={}, urgency={}, prev={}",
@@ -1888,9 +1897,9 @@ mod tests {
     /// compute_urgency must be bounded [0, 1] even with extreme inputs.
     #[test]
     fn test_urgency_bounded_extreme_inputs() {
-        let u = compute_urgency(1.0, 1.0, true, 1.0, 1.0, 5.0);
+        let u = compute_urgency(1.0, 1.0, true, 1.0, 1.0, StabilityRegime::Unstable, 5.0);
         assert!(u >= 0.0 && u <= 1.0, "urgency {} out of bounds", u);
-        let u_zero = compute_urgency(0.0, 0.0, false, 0.0, 0.0, 0.0);
+        let u_zero = compute_urgency(0.0, 0.0, false, 0.0, 0.0, StabilityRegime::Degenerate, 0.0);
         assert!(u_zero >= 0.0 && u_zero <= 1.0);
     }
 

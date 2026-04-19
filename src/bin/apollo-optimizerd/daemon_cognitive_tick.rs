@@ -57,6 +57,7 @@ use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
 use apollo_optimizer::engine::predictive_agent::{
     specialist, tally_votes, Intervention, SpecialistVote,
 };
+use apollo_optimizer::engine::lotka_volterra::StabilityRegime;
 use apollo_optimizer::engine::signal_intelligence::SignalDigest;
 use apollo_optimizer::engine::types::OptimizationProfile;
 use apollo_optimizer::engine::user_context::UserContext;
@@ -177,12 +178,35 @@ pub fn apply_specialist_voting(
     }
 
     // Monopoly specialist: one process hogging RAM → throttle noise.
+    // Ecological instability (Jacobian eigenvalue sign) amplifies confidence:
+    // an Unstable regime means competition dynamics are diverging — act sooner.
+    // [Strogatz 2015 §6.4 + Pei Wang 2013 §3.3.1]
     if signal_digest.monopoly_risk > 0.5 {
+        let stability_boost = match signal_digest.stability_regime {
+            StabilityRegime::Unstable => 1.15_f64,
+            StabilityRegime::UnstableSaddle => 1.08_f64,
+            _ => 1.0_f64,
+        };
+        let confidence = (signal_digest.monopoly_risk.min(1.0)
+            * lctx.specialist_accuracy.weight(specialist::MONOPOLY)
+            * stability_boost)
+            .min(1.0);
+        // Log NARS maturity horizon for monopoly belief (observations to 0.80 confidence).
+        if let Some(rem) = lctx.outcome_tracker.drift_detector.observations_remaining("monopoly_freeze", 0.80) {
+            if rem > 0 {
+                audit_log(&serde_json::json!({
+                    "t": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    "event": "nars_maturity_horizon",
+                    "belief": "monopoly_freeze",
+                    "obs_remaining_to_0.80": rem,
+                    "stability_regime": format!("{:?}", signal_digest.stability_regime),
+                }));
+            }
+        }
         votes.push(SpecialistVote {
             name: "monopoly",
             intervention: Intervention::PreThrottleNoise,
-            confidence: signal_digest.monopoly_risk.min(1.0)
-                * lctx.specialist_accuracy.weight(specialist::MONOPOLY),
+            confidence,
         });
     }
 
