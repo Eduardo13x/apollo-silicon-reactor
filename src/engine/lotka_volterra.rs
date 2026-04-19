@@ -26,6 +26,27 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Stability regime of the coexistence equilibrium.
+///
+/// Determined by eigenvalues of the Jacobian at (x*, y*):
+///   λ = (tr ± √(tr²−4·det)) / 2
+///
+/// [Strogatz 2015] "Nonlinear Dynamics and Chaos" §6.4 — two-species competition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StabilityRegime {
+    /// Re(λ) < 0, Im(λ) ≠ 0 — oscillates but converges. System self-regulates.
+    StableSpiral,
+    /// Re(λ) < 0, Im(λ) = 0 — smooth monotone decay to coexistence.
+    StableNode,
+    /// det < 0 — saddle point; outcome depends on initial conditions.
+    /// Dominant above separatrix → monopoly. High intervention priority.
+    UnstableSaddle,
+    /// Re(λ) > 0 — coexistence equilibrium is a repellor. Dominant will monopolize.
+    Unstable,
+    /// Coexistence equilibrium does not exist (insufficient data or α₁₂·α₂₁ ≈ 1).
+    Degenerate,
+}
+
 /// Estado de competencia entre el proceso dominante y el resto.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompetitionState {
@@ -194,6 +215,75 @@ impl CompetitionState {
     pub fn dominant_growth_rate(&self) -> f64 {
         self.growth_dominant
     }
+
+    /// Classify the stability of the coexistence equilibrium analytically.
+    ///
+    /// Coexistence fixed point (K=1):
+    ///   x* = (1 − α₁₂) / (1 − α₁₂·α₂₁)
+    ///   y* = (1 − α₂₁) / (1 − α₁₂·α₂₁)
+    ///
+    /// Jacobian at (x*, y*) — using equilibrium condition x*+α₁₂y*=K:
+    ///   J = [[ −r₁·x*,   −r₁·α₁₂·x* ],
+    ///        [ −r₂·α₂₁·y*,  −r₂·y*  ]]
+    ///
+    /// trace = −(r₁·x* + r₂·y*),  det = r₁·r₂·x*·y*·(1 − α₁₂·α₂₁)
+    /// discriminant = trace² − 4·det
+    ///   det < 0         → UnstableSaddle
+    ///   trace > 0       → Unstable
+    ///   discriminant < 0 → StableSpiral (complex eigenvalues, oscillatory)
+    ///   else            → StableNode
+    ///
+    /// [Strogatz 2015] §6.4, [Murray 2002] "Mathematical Biology" §3.5.
+    pub fn stability_regime(&self) -> StabilityRegime {
+        if self.ticks < 5 {
+            return StabilityRegime::Degenerate;
+        }
+        let r1 = self.growth_dominant;
+        let r2 = self.growth_rest;
+        let a12 = self.alpha_dom_rest;
+        let a21 = self.alpha_rest_dom;
+
+        let denom = 1.0 - a12 * a21;
+        if denom.abs() < 1e-9 {
+            return StabilityRegime::Degenerate;
+        }
+        let x_star = (1.0 - a12) / denom;
+        let y_star = (1.0 - a21) / denom;
+        if x_star <= 0.0 || y_star <= 0.0 {
+            return StabilityRegime::Degenerate;
+        }
+
+        // Jacobian elements at (x*, y*) with K=1.
+        let j00 = -r1 * x_star;
+        let j11 = -r2 * y_star;
+        let j01 = -r1 * a12 * x_star;
+        let j10 = -r2 * a21 * y_star;
+
+        let trace = j00 + j11;
+        let det = j00 * j11 - j01 * j10;
+        let discriminant = trace * trace - 4.0 * det;
+
+        if det < 0.0 {
+            StabilityRegime::UnstableSaddle
+        } else if trace > 0.0 {
+            StabilityRegime::Unstable
+        } else if discriminant < 0.0 {
+            StabilityRegime::StableSpiral
+        } else {
+            StabilityRegime::StableNode
+        }
+    }
+
+    /// Human-readable action hint for the current stability regime.
+    pub fn stability_action_hint(&self) -> &'static str {
+        match self.stability_regime() {
+            StabilityRegime::StableSpiral   => "oscillating but self-regulating — watch",
+            StabilityRegime::StableNode     => "smooth convergence to coexistence — ok",
+            StabilityRegime::UnstableSaddle => "saddle: outcome depends on initial share — monitor",
+            StabilityRegime::Unstable       => "repellor: dominant will monopolize — intervene",
+            StabilityRegime::Degenerate     => "insufficient data",
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -259,6 +349,43 @@ mod tests {
             "predicted share must be in [0,1], got {}",
             predicted_share
         );
+    }
+
+    #[test]
+    fn test_stability_regime_stable_node() {
+        // Classic stable coexistence: a12=0.5, a21=0.5 → denom=0.75, x*=y*=2/3
+        // With positive growth rates: trace<0, det>0, discriminant>=0 → StableNode.
+        let mut cs = CompetitionState::new();
+        cs.ticks = 10;
+        cs.growth_dominant = 0.5;
+        cs.growth_rest = 0.5;
+        cs.alpha_dom_rest = 0.5;
+        cs.alpha_rest_dom = 0.5;
+        // trace = -(0.5*2/3 + 0.5*2/3) = -2/3 < 0
+        // det = 0.5*0.5*(2/3)*(2/3)*(1-0.25) = positive
+        assert_ne!(cs.stability_regime(), StabilityRegime::Degenerate);
+        assert_ne!(cs.stability_regime(), StabilityRegime::Unstable);
+        assert_ne!(cs.stability_regime(), StabilityRegime::UnstableSaddle);
+    }
+
+    #[test]
+    fn test_stability_regime_saddle_high_competition() {
+        // a12=1.5, a21=1.5 → a12*a21=2.25 > 1 → denom=-1.25
+        // x* = (1-1.5)/(-1.25) = 0.4, y* = 0.4 → both positive
+        // det = r1*r2*x*y*(1-a12*a21) = positive * negative < 0 → saddle
+        let mut cs = CompetitionState::new();
+        cs.ticks = 10;
+        cs.growth_dominant = 0.3;
+        cs.growth_rest = 0.3;
+        cs.alpha_dom_rest = 1.5;
+        cs.alpha_rest_dom = 1.5;
+        assert_eq!(cs.stability_regime(), StabilityRegime::UnstableSaddle);
+    }
+
+    #[test]
+    fn test_stability_degenerate_low_ticks() {
+        let cs = CompetitionState::new();
+        assert_eq!(cs.stability_regime(), StabilityRegime::Degenerate);
     }
 
     #[test]
