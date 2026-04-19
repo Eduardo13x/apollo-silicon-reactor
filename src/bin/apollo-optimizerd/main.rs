@@ -1186,6 +1186,9 @@ fn main() -> anyhow::Result<()> {
             // under severe swap pressure. `purge` forces the kernel to drain
             // inactive pages — effective but expensive (blocks for ~2s on 8GB).
             let mut last_purge_at: Option<Instant> = None;
+            // D-term for overflow threshold PID: pressure velocity from previous cycle.
+            // One-cycle lag is acceptable; 0.0 default is conservative (no D-offset on cold start).
+            let mut last_pressure_velocity: f64 = 0.0;
 
             // ── Feature 3: RT Boost for Foreground ───────────────────────────
             // THREAD_TIME_CONSTRAINT_POLICY: guarantee 2ms/10ms to foreground UI thread.
@@ -3235,8 +3238,11 @@ fn main() -> anyhow::Result<()> {
                     write_governor_state(&governor_state_path, &pg.governor);
                 }
 
-                // Thresholds adaptativos: workload-aware via Phase 3 classifier.
-                let mut overflow_thresholds = lctx.overflow_guard.thresholds(workload_mode);
+                // Thresholds adaptativos: workload-aware + D-term (pressure velocity).
+                // [Hellerstein 2004] §9 PID operating-regime control.
+                let mut overflow_thresholds = lctx
+                    .overflow_guard
+                    .thresholds_with_d_term(workload_mode, last_pressure_velocity);
 
                 // Signal intelligence: Kalman + CUSUM + Entropy + Hazard + LV + MPC.
                 let signal_digest = {
@@ -3393,6 +3399,9 @@ fn main() -> anyhow::Result<()> {
 
                     d
                 };
+
+                // Update D-term: capture Kalman pressure velocity for next cycle.
+                last_pressure_velocity = signal_digest.pressure_velocity;
 
                 // Swap Reclaim ODE — feed vm_rate from background collector.
                 // Produces SaturationForecast used by the freeze gate below.

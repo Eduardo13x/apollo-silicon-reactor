@@ -358,6 +358,30 @@ impl OverflowGuard {
         }
     }
 
+    /// Same as [`thresholds`] but adds a PID derivative term so thresholds
+    /// tighten when pressure is rising fast, not only when levels are high.
+    ///
+    /// `d_offset = -(velocity * kd).clamp(0, 0.05)`; kd=0.30 so 0.17/tick
+    /// velocity produces the maximum 0.05 offset (≈5 pp tighter threshold).
+    ///
+    /// [Hellerstein 2004] §9 — PID operating-regime control.
+    pub fn thresholds_with_d_term(
+        &self,
+        workload_mode: WorkloadMode,
+        pressure_velocity: f64,
+    ) -> OverflowThresholds {
+        const KD: f64 = 0.30;
+        const MAX_D_OFFSET: f64 = 0.05;
+        let d_offset = -(pressure_velocity.max(0.0) * KD).min(MAX_D_OFFSET);
+        let base = self.thresholds(workload_mode);
+        OverflowThresholds {
+            bg_pressure: (base.bg_pressure + d_offset).max(RL_ABSOLUTE_FLOOR),
+            critical_pressure: (base.critical_pressure + d_offset).max(0.68),
+            extreme_pressure: (base.extreme_pressure + d_offset).max(0.73),
+            workload_mode: base.workload_mode,
+        }
+    }
+
     /// The compound offset actually applied to thresholds this cycle.
     ///
     /// B6 fix (round-3): single source of truth for reporting. Metric
@@ -625,6 +649,47 @@ mod tests {
         assert!(
             (device_threshold_offset(16.1) - 0.05).abs() < 1e-9,
             "> 16 GB -> +0.05"
+        );
+    }
+
+    #[test]
+    fn d_term_zero_velocity_matches_base_thresholds() {
+        let guard = make_guard_with_device_offset(0.0);
+        let base = guard.thresholds(WorkloadMode::Idle);
+        let d = guard.thresholds_with_d_term(WorkloadMode::Idle, 0.0);
+        assert!(
+            (base.bg_pressure - d.bg_pressure).abs() < 1e-9,
+            "zero velocity: D-term should add no offset"
+        );
+    }
+
+    #[test]
+    fn d_term_positive_velocity_tightens_thresholds() {
+        let guard = make_guard_with_device_offset(0.0);
+        let base = guard.thresholds(WorkloadMode::Idle);
+        let d = guard.thresholds_with_d_term(WorkloadMode::Idle, 0.1);
+        assert!(
+            d.bg_pressure < base.bg_pressure,
+            "rising pressure: D-term should lower bg threshold {}<{}",
+            d.bg_pressure,
+            base.bg_pressure
+        );
+        assert!(
+            d.critical_pressure < base.critical_pressure,
+            "rising pressure: D-term should lower critical threshold"
+        );
+    }
+
+    #[test]
+    fn d_term_capped_at_max_offset() {
+        let guard = make_guard_with_device_offset(0.0);
+        let base = guard.thresholds(WorkloadMode::Idle);
+        // velocity=10.0 >> kd threshold — should be capped at MAX_D_OFFSET=0.05
+        let d = guard.thresholds_with_d_term(WorkloadMode::Idle, 10.0);
+        assert!(
+            (base.bg_pressure - d.bg_pressure - 0.05).abs() < 1e-9,
+            "D-term capped: offset should be exactly 0.05, got {}",
+            base.bg_pressure - d.bg_pressure
         );
     }
 }
