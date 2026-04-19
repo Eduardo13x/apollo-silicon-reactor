@@ -1577,9 +1577,22 @@ fn main() -> anyhow::Result<()> {
                 // ── Staggered wake unfreeze: drain batch per cycle ──────────
                 // Instead of SIGCONT-ing 50 PIDs at once, spread across cycles
                 // to avoid decompressing 1-3GB in one shot on 8GB M1.
+                // [Nygard 2018] Dynamic bulkhead: shrink batch when memory grows
+                // fast (dM/dt high) — prevents RSS spike from multiple thaws.
+                // pressure_velocity > 0 = rising; scale 5→1 over [0.0, 0.2].
                 if !wake_unfreeze_queue.is_empty() {
+                    let wake_batch = {
+                        // dM/dt proxy: swap_delta_bps > 0 = swap growing.
+                        // 50 MB/s growth → rate_factor = 1.0 → batch = 1.
+                        let rate_factor =
+                            (pressure_collector.latest().swap_delta_bps / (50.0 * 1024.0 * 1024.0))
+                                .clamp(0.0, 1.0);
+                        (WAKE_UNFREEZE_BATCH as f64 * (1.0 - rate_factor * 0.8))
+                            .max(1.0)
+                            .round() as usize
+                    };
                     let batch: Vec<u32> = wake_unfreeze_queue
-                        .drain(..wake_unfreeze_queue.len().min(WAKE_UNFREEZE_BATCH))
+                        .drain(..wake_unfreeze_queue.len().min(wake_batch))
                         .collect();
                     // A-B-A defense: lock frozen_guard first to read identity
                     // (start_sec) before signalling. Crash before SIGCONT leaves
