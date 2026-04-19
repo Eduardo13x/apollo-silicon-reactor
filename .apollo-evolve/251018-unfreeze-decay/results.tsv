@@ -1,0 +1,2 @@
+iteration	commit	metric	delta	status	paper	opens	closes	note
+1	pending	tests=1688	+9	KEEP	Strogatz2015|Denning1968|Bansal2004	1	0	new module unfreeze_decay: 2-sample ratio fit + bisection, risk mitigations baked in

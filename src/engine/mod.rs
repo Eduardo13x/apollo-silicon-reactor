@@ -107,6 +107,7 @@ pub mod thermal_interrupt;
 pub mod thermal_iokit;
 pub mod thermal_manager;
 pub mod types;
+pub mod unfreeze_decay;
 pub mod usage_model;
 pub mod user_context;
 pub mod user_profile;
