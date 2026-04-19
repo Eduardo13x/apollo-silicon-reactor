@@ -277,6 +277,12 @@ pub fn run_cognitive_tick(
                 apollo_optimizer::engine::adversarial_probe::ProbeExpectation::OdeDivergenceResilient => {
                     AdversarialProbe::probe_ode_divergence()
                 }
+                apollo_optimizer::engine::adversarial_probe::ProbeExpectation::StickySwapSpotlightSuppressed => {
+                    AdversarialProbe::probe_sticky_swap_spotlight()
+                }
+                apollo_optimizer::engine::adversarial_probe::ProbeExpectation::SubnormalFloorRecovery => {
+                    AdversarialProbe::probe_subnormal_floor_recovery()
+                }
             };
             results.push(ProbeResult { cycle, ..result });
         }

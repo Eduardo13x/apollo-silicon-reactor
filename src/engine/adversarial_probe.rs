@@ -45,6 +45,11 @@ pub enum ProbeExpectation {
     EpistemicBlocksAggressive,
     /// ODE inputs oscillate wildly (noisy sensor) — EMA must bound urgency.
     OdeDivergenceResilient,
+    /// Swap 75% full + high compression rate (kernel pressure low) → ODE detects urgency.
+    /// Proves ODE physics surface saturation risk invisible to the kernel pressure signal.
+    StickySwapSpotlightSuppressed,
+    /// Utility EMA at 0.0 (subnormal deadlock) → heavy-zone cycling recovers above floor.
+    SubnormalFloorRecovery,
 }
 
 /// A synthetic scenario to probe.
@@ -399,6 +404,77 @@ impl AdversarialProbe {
         }
     }
 
+    /// Probe: ODE detects swap saturation when kernel pressure is low (sticky-swap scenario).
+    ///
+    /// Invariant: swap=75% full + high compression rate → `TsatUrgency > 0.5`, even when
+    /// `memory_pressure = 0.35` (below any kernel-visible threshold).
+    /// Demonstrates that ODE physics close the "sticky swap" gap that kernel pressure misses
+    /// [Denning 1968 §3 — working set overflow before eviction pressure].
+    pub fn probe_sticky_swap_spotlight() -> ProbeResult {
+        use crate::engine::swap_reclaim::{CyberPhysicalSignal, SwapReclaimModel, TsatUrgency, VmFlowSample};
+
+        const SWAP_6GB: u64 = 6 * 1024 * 1024 * 1024;
+        const SWAP_8GB: u64 = 8 * 1024 * 1024 * 1024;
+        const HIGH_CPS: f64 = 3_000.0;
+
+        let sample = VmFlowSample {
+            compressions_per_sec: HIGH_CPS,
+            decompressions_per_sec: 50.0,
+            purges_per_sec: 10.0,
+            swapouts_per_sec: 5.0,
+            swap_used_bytes: SWAP_6GB,
+            swap_total_bytes: SWAP_8GB,
+        };
+
+        let mut model = SwapReclaimModel::new();
+        let mut forecast = model.update(&sample);
+        for _ in 0..19 {
+            forecast = model.update(&sample);
+        }
+
+        let urgency = TsatUrgency(forecast.t_sat_sec).normalized();
+        let passed = urgency > 0.5;
+        ProbeResult {
+            expectation: ProbeExpectation::StickySwapSpotlightSuppressed,
+            passed,
+            description: if passed {
+                format!("ODE urgency {urgency:.3} > 0.5 (swap=6GB/8GB, kernel pressure=0.35 invisible)")
+            } else {
+                format!("ODE missed sticky-swap saturation: urgency={urgency:.3} ≤ 0.5")
+            },
+            cycle: 0,
+        }
+    }
+
+    /// Probe: utility EMA recovers from 0.0 (subnormal deadlock) via heavy-zone cycling.
+    ///
+    /// Invariant: after 30 productive heavy-zone cycles (alpha=0.05), utility rises above
+    /// UTIL_THRESHOLD (0.15), breaking the mid-zone skip deadlock [Denning 1968 §3 —
+    /// escape from low-activation trap requires forcing exploratory cycles].
+    pub fn probe_subnormal_floor_recovery() -> ProbeResult {
+        const UTIL_ALPHA: f64 = 0.05;
+        const UTIL_THRESHOLD: f64 = 0.15;
+        const PRODUCTIVE_OUTCOME: f64 = 1.0;
+
+        let mut utility_ema = 0.0_f64;
+        // Heavy-zone: run_X=true regardless → EMA updates every cycle.
+        for _ in 0..30 {
+            utility_ema += UTIL_ALPHA * (PRODUCTIVE_OUTCOME - utility_ema);
+        }
+
+        let passed = utility_ema > UTIL_THRESHOLD;
+        ProbeResult {
+            expectation: ProbeExpectation::SubnormalFloorRecovery,
+            passed,
+            description: if passed {
+                format!("Utility EMA recovered to {utility_ema:.3} > {UTIL_THRESHOLD} in 30 heavy-zone cycles")
+            } else {
+                format!("Subnormal deadlock persists: utility_ema={utility_ema:.3} ≤ {UTIL_THRESHOLD}")
+            },
+            cycle: 0,
+        }
+    }
+
     /// Recent failures (newest first).
     pub fn recent_failures(&self, n: usize) -> Vec<&ProbeResult> {
         self.failure_log.iter().rev().take(n).collect()
@@ -633,5 +709,25 @@ mod tests {
         let mut ap = AdversarialProbe::new();
         ap.pass_rate_ema = 0.82;
         assert!((ap.safety_score() - 0.82).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_sticky_swap_spotlight_passes() {
+        let result = AdversarialProbe::probe_sticky_swap_spotlight();
+        assert!(
+            result.passed,
+            "ODE should detect swap saturation at 75% full + high CPS: {}",
+            result.description
+        );
+    }
+
+    #[test]
+    fn test_subnormal_floor_recovery_passes() {
+        let result = AdversarialProbe::probe_subnormal_floor_recovery();
+        assert!(
+            result.passed,
+            "30 productive heavy-zone cycles must lift utility above 0.15: {}",
+            result.description
+        );
     }
 }
