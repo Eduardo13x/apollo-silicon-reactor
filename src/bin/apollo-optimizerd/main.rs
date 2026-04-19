@@ -4921,6 +4921,15 @@ fn main() -> anyhow::Result<()> {
                     ode_t_sat_urgency,
                     unfreeze_decay.tau_novelty(),
                 );
+                // G14 — ODE Surprise Arousal: inject leading ODE prediction error
+                // into arousal EMA before kernel pressure reacts.
+                // [Schultz 1997 RPE] — prediction error is the primary arousal driver.
+                {
+                    let ode_rss_surprise = (ode_t_sat_urgency
+                        * (-signal_digest.pressure_velocity as f64).max(0.0))
+                        .clamp(0.0, 1.0);
+                    arousal_state.inject_ode_surprise(ode_rss_surprise);
+                }
 
                 // ProcessRecoveryManager: freeze confirmed leakers. NEVER kill.
                 //

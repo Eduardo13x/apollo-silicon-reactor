@@ -758,6 +758,20 @@ impl ArousalState {
             _ => "Crisis",
         }
     }
+
+    /// G14 — ODE Surprise Arousal: inject ODE prediction error into arousal EMA.
+    /// Surprise (ode_rss_surprise > 0) boosts arousal before kernel pressure rises,
+    /// so the affective system reacts to leading ODE physics signals.
+    /// [Schultz 1997 RPE] — prediction error is the primary arousal driver.
+    pub fn inject_ode_surprise(&mut self, ode_rss_surprise: f64) {
+        if ode_rss_surprise > 0.0 {
+            let surprise_arousal = (ode_rss_surprise as f32).clamp(0.0, 1.0);
+            let boost_alpha = (self.alpha * 2.0).min(0.30);
+            self.level = boost_alpha * surprise_arousal + (1.0 - boost_alpha) * self.level;
+            self.level = self.level.clamp(0.0, 1.0);
+            self.samples += 1;
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
