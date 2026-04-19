@@ -1309,6 +1309,10 @@ fn main() -> anyhow::Result<()> {
             // spread unfreezes across cycles — 5 PIDs per cycle (~2s apart).
             const WAKE_UNFREEZE_BATCH: usize = 5;
             let mut wake_unfreeze_queue: VecDeque<u32> = VecDeque::new();
+            // PIDs SIGCONT'd via the staggered wake path this cycle.
+            // Drained by the unfreeze_decay ODE wiring below so τ learning
+            // starts at the correct T0 (actual SIGCONT, not decision time).
+            let mut wake_thaw_pids: Vec<u32> = Vec::new();
             // Pending trial skill: (name, pressure_before). Recorded next cycle.
             // Restored from LearnedState so a trial started before a crash is still evaluated.
             let mut pending_trial_skill: Option<(String, f64)> = restored_trial_skill;
@@ -1422,6 +1426,7 @@ fn main() -> anyhow::Result<()> {
                     break;
                 }
 
+                wake_thaw_pids.clear();
                 cycle_count += 1;
                 lf_metrics.inc_cycles();
 
@@ -1602,6 +1607,8 @@ fn main() -> anyhow::Result<()> {
                             let _ = qos.set_tier(*pid, apollo_optimizer::engine::mach_qos::SchedulingTier::Normal);
                         }
                     }
+                    // Record actual-SIGCONT T0 for unfreeze_decay ODE τ learning.
+                    wake_thaw_pids.extend_from_slice(&batch);
                 }
 
                 // Mark reactor as stalled only if the reactor thread has sent
@@ -5713,7 +5720,11 @@ fn main() -> anyhow::Result<()> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    for &pid in &exec_outcomes.newly_unfrozen_pids {
+                    // Track PIDs from both the regular action path and the
+                    // staggered wake-unfreeze queue (5 PIDs/cycle from display wake).
+                    let all_thaw_pids = exec_outcomes.newly_unfrozen_pids.iter().copied()
+                        .chain(wake_thaw_pids.iter().copied());
+                    for pid in all_thaw_pids {
                         if let Some(proc) =
                             collector.system().process(sysinfo::Pid::from_u32(pid))
                         {
