@@ -4732,6 +4732,7 @@ fn main() -> anyhow::Result<()> {
                     collector.system().processes().len(),
                     cpu_temp_celsius,
                     ode_t_sat_urgency,
+                    unfreeze_decay.tau_novelty(),
                 );
 
                 // ProcessRecoveryManager: freeze confirmed leakers. NEVER kill.

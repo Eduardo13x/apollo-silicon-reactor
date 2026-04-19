@@ -311,6 +311,22 @@ impl UnfreezeDecayModel {
         Some(-tau * (1.0 - ratio).ln())
     }
 
+    /// Physical novelty signal [0, 1]: mean relative deviation of learned τ from
+    /// the default. High → apps' growth behavior is diverging from prior baseline
+    /// → ACh boost for re-exploration. [Schultz 1997] novelty ↑ ACh.
+    pub fn tau_novelty(&self) -> f64 {
+        let entries: Vec<f64> = self
+            .tau_estimates
+            .values()
+            .filter(|e| e.samples >= MIN_SAMPLES_FOR_LEARNING as u32)
+            .map(|e| (e.tau_sec - DEFAULT_TAU_SEC).abs() / DEFAULT_TAU_SEC)
+            .collect();
+        if entries.is_empty() {
+            return 0.0;
+        }
+        (entries.iter().sum::<f64>() / entries.len() as f64).clamp(0.0, 1.0)
+    }
+
     /// Learned τ for `app`, or DEFAULT_TAU_SEC if unknown/insufficient samples.
     /// [Denning 1968] high τ = slow working-set re-growth → freeze is expensive.
     pub fn tau_for_app(&self, app: &str) -> f64 {

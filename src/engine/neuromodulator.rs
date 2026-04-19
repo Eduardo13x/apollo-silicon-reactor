@@ -22,6 +22,10 @@ pub struct NeuroSignals {
     pub outcome_penalty: f64, // from OutcomeTracker (negative = bad)
     pub overflow_occurred: bool,
 
+    /// ODE prediction error [0.0, 1.0]: positive when swap was feared but pressure fell.
+    /// DA encodes RPE [Schultz 1997] — better-than-predicted outcome boosts reward signal.
+    pub ode_rss_surprise: f64,
+
     // Noradrenaline inputs
     pub urgency: f64, // signal_digest.urgency
     pub regime_shift_up: bool,
@@ -41,6 +45,9 @@ pub struct NeuroSignals {
     pub process_count: usize,
     pub entropy_anomaly: f64,
     pub rl_exploring: bool,
+    /// τ-divergence [0.0, 1.0]: mean relative deviation of learned τ from default.
+    /// ACh tracks novelty [Schultz 1997]; heterogeneous τ = diverse reload behaviors.
+    pub tau_divergence: f64,
 }
 
 pub struct ApolloNeuromodulator {
@@ -87,7 +94,9 @@ impl ApolloNeuromodulator {
         let da_reward = if s.overflow_occurred { 0.0 } else { 0.3 };
         let da_drop = s.pressure_drop.clamp(0.0, 0.5) * 0.8;
         let da_outcome = (1.0 + s.outcome_penalty / 5.0).clamp(0.0, 1.0) * 0.2;
-        let da_signal = (da_reward + da_drop + da_outcome).clamp(0.0, 1.0);
+        // [Schultz 1997] RPE: ODE feared saturation but pressure fell → positive surprise.
+        let da_ode = s.ode_rss_surprise.clamp(0.0, 1.0) * 0.10;
+        let da_signal = (da_reward + da_drop + da_outcome + da_ode).clamp(0.0, 1.0);
         self.dopamine = (self.dopamine * (1.0 - DECAY) + da_signal * DECAY).clamp(0.0, 1.0);
 
         // ── Noradrenaline: stress/urgency ────────────────────────────
@@ -122,7 +131,9 @@ impl ApolloNeuromodulator {
         let ach_churn = (churn as f64 / 20.0).clamp(0.0, 0.4);
         let ach_entropy = (s.entropy_anomaly.abs() / 3.0).clamp(0.0, 0.3);
         let ach_explore = if s.rl_exploring { 0.2 } else { 0.05 };
-        let ach_signal = (ach_churn + ach_entropy + ach_explore).clamp(0.0, 1.0);
+        // [Schultz 1997] ACh novelty: heterogeneous τ across apps = diverse physical behaviors.
+        let ach_tau = s.tau_divergence.clamp(0.0, 1.0) * 0.15;
+        let ach_signal = (ach_churn + ach_entropy + ach_explore + ach_tau).clamp(0.0, 1.0);
         self.acetylcholine =
             (self.acetylcholine * (1.0 - DECAY) + ach_signal * DECAY).clamp(0.0, 1.0);
 
@@ -153,6 +164,7 @@ mod tests {
             pressure_drop: 0.0,
             outcome_penalty: 0.0,
             overflow_occurred: false,
+            ode_rss_surprise: 0.0,
             urgency: 0.4,
             regime_shift_up: false,
             pressure_velocity: 0.0,
@@ -163,6 +175,7 @@ mod tests {
             process_count: 400,
             entropy_anomaly: 0.0,
             rl_exploring: false,
+            tau_divergence: 0.0,
         }
     }
 
@@ -327,6 +340,46 @@ mod tests {
             "hot NA({}) should exceed warm NA({})",
             nm_hot.noradrenaline,
             nm_warm.noradrenaline
+        );
+    }
+
+    #[test]
+    fn test_ode_rss_surprise_raises_da() {
+        let mut nm_flat = ApolloNeuromodulator::new();
+        let mut nm_surprised = ApolloNeuromodulator::new();
+        let mut s_flat = default_signals();
+        let mut s_surprised = default_signals();
+        s_flat.ode_rss_surprise = 0.0;
+        s_surprised.ode_rss_surprise = 1.0;
+        for _ in 0..20 {
+            nm_flat.tick(&s_flat);
+            nm_surprised.tick(&s_surprised);
+        }
+        assert!(
+            nm_surprised.dopamine > nm_flat.dopamine,
+            "DA with surprise({}) should exceed no-surprise({})",
+            nm_surprised.dopamine,
+            nm_flat.dopamine
+        );
+    }
+
+    #[test]
+    fn test_tau_divergence_raises_ach() {
+        let mut nm_uniform = ApolloNeuromodulator::new();
+        let mut nm_diverse = ApolloNeuromodulator::new();
+        let mut s_uniform = default_signals();
+        let mut s_diverse = default_signals();
+        s_uniform.tau_divergence = 0.0;
+        s_diverse.tau_divergence = 1.0;
+        for _ in 0..20 {
+            nm_uniform.tick(&s_uniform);
+            nm_diverse.tick(&s_diverse);
+        }
+        assert!(
+            nm_diverse.acetylcholine > nm_uniform.acetylcholine,
+            "ACh with τ-divergence({}) should exceed uniform({})",
+            nm_diverse.acetylcholine,
+            nm_uniform.acetylcholine
         );
     }
 

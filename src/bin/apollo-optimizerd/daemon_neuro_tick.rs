@@ -76,6 +76,7 @@ pub fn apply_neuromodulator(
     process_count: usize,
     cpu_temp_celsius: Option<f64>,
     ode_swap_urgency: f64,
+    tau_divergence: f64,
 ) {
     // Graded thermal stress [0, 1]: 0 at ≤60°C, 0.5 at 80°C, 1.0 at ≥100°C.
     // Falls back to thermal phase estimate when SMC/IOKit temperature is unavailable.
@@ -90,10 +91,15 @@ pub fn apply_neuromodulator(
             0.0
         }
     };
+    // [Schultz 1997] DA RPE: ODE predicted high swap urgency but pressure fell → positive.
+    let ode_rss_surprise = (ode_swap_urgency
+        * (-signal_digest.pressure_velocity as f64).max(0.0))
+        .clamp(0.0, 1.0);
     let overflow_occurred = lctx.overflow_guard.history.total_overflows > 0;
     let neuro_signals = NeuroSignals {
         pressure_drop: signal_digest.pressure_smooth as f64 * -1.0
             * signal_digest.pressure_velocity,
+        ode_rss_surprise,
         // Combine outcome-tracker RL penalty with stability oracle signal.
         // rl_penalty ∈ [-3, 0]; instability_penalty ∈ [0, 1] scaled by 0.5
         // → max additional penalty = -0.5, keeping the existing penalty
@@ -120,6 +126,7 @@ pub fn apply_neuromodulator(
             .rl_agent
             .as_ref()
             .map_or(false, |rl| rl.total_ticks() < 200),
+        tau_divergence,
     };
     lctx.neuromod.tick(&neuro_signals);
 
