@@ -274,6 +274,9 @@ pub fn run_cognitive_tick(
                         composite > 0.70
                     })
                 }
+                apollo_optimizer::engine::adversarial_probe::ProbeExpectation::OdeDivergenceResilient => {
+                    AdversarialProbe::probe_ode_divergence()
+                }
             };
             results.push(ProbeResult { cycle, ..result });
         }
