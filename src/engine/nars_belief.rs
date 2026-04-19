@@ -164,6 +164,17 @@ impl TruthValue {
     pub fn confidence_from_count(n: u32) -> f32 {
         n as f32 / (n as f32 + 1.0)
     }
+
+    /// Observations needed to reach `c_target` from zero prior evidence.
+    ///
+    /// Algebraic inverse of `confidence_from_count`: c = n/(n+1) → n = c/(1−c).
+    /// Lets Apollo estimate when a belief will be trusted enough to act on.
+    ///
+    /// [Pei Wang 2013] §3.3.1 — confidence planning horizon.
+    pub fn observations_to_reach(c_target: f32) -> u32 {
+        let c = c_target.clamp(0.0, 0.98);
+        (c / (1.0 - c)).ceil() as u32
+    }
 }
 
 // ── Salience ─────────────────────────────────────────────────────────────────
@@ -741,6 +752,27 @@ mod tests {
     use super::*;
 
     // ── TruthValue ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn observations_to_reach_inverts_confidence_from_count() {
+        // Round-trip: confidence_from_count(n) → observations_to_reach ≤ n+1
+        for n in [1u32, 3, 9, 19, 49, 99] {
+            let c = TruthValue::confidence_from_count(n);
+            let n_back = TruthValue::observations_to_reach(c);
+            assert!(
+                n_back <= n + 1,
+                "n={n} c={c:.4} n_back={n_back}"
+            );
+        }
+    }
+
+    #[test]
+    fn observations_to_reach_monotone() {
+        let n50 = TruthValue::observations_to_reach(0.50);
+        let n75 = TruthValue::observations_to_reach(0.75);
+        let n90 = TruthValue::observations_to_reach(0.90);
+        assert!(n50 < n75 && n75 < n90, "must be monotone: {n50} < {n75} < {n90}");
+    }
 
     #[test]
     fn truth_value_defaults_to_ignorance_prior() {
