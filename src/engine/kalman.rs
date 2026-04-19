@@ -267,6 +267,10 @@ fn mv8_default_p() -> [f64; 64] {
     p
 }
 
+fn mv8_default_r_scale() -> f64 {
+    1.0
+}
+
 #[inline(always)]
 fn mv8_mat_mul(a: &[f64; 64], b: &[f64; 64]) -> [f64; 64] {
     let mut c = [0.0f64; 64];
@@ -414,6 +418,12 @@ pub struct KalmanMV8 {
     #[serde(skip, default = "mv8_default_p")]
     p: [f64; 64],
     initialized: bool,
+    /// Cycles since first observation. Not serialized — warmup re-runs after restart.
+    #[serde(skip)]
+    warmup_cycles: u64,
+    /// KPC IPC-derived R scale for pressure dimensions [0,1]. Default=1.0.
+    #[serde(skip, default = "mv8_default_r_scale")]
+    kpc_r_scale: f64,
 }
 
 impl Default for KalmanMV8 {
@@ -428,6 +438,8 @@ impl KalmanMV8 {
             x: [0.0; MV8_D],
             p: mv8_default_p(),
             initialized: false,
+            warmup_cycles: 0,
+            kpc_r_scale: 1.0,
         }
     }
 
@@ -460,13 +472,17 @@ impl KalmanMV8 {
             self.initialized = true;
             return true;
         }
+        self.warmup_cycles += 1;
         // y = z - x (H=I)
         let mut y = [0.0f64; MV8_D];
         for i in 0..MV8_D {
             y[i] = z[i] - self.x[i];
         }
-        // S = P + diag(R)
-        let s = mv8_add_diag(&self.p, &MV8_R);
+        // S = P + diag(R), with KPC IPC scaling on pressure dimensions [0,1].
+        let mut r = MV8_R;
+        r[0] *= self.kpc_r_scale;
+        r[1] *= self.kpc_r_scale;
+        let s = mv8_add_diag(&self.p, &r);
         let s_inv = match mv8_mat_inv(&s) {
             Some(inv) => inv,
             None => return false,
@@ -506,32 +522,34 @@ impl KalmanMV8 {
         &self.x
     }
 
+    /// Fused memory pressure estimate. Clamped to [0,1].
     pub fn memory_pressure(&self) -> f64 {
-        self.x[0]
+        self.x[0].clamp(0.0, 1.0)
     }
 
+    /// Fused pressure velocity (cross-informed by swap + ODE coupling).
     pub fn pressure_velocity(&self) -> f64 {
         self.x[1]
     }
 
     pub fn swap_norm(&self) -> f64 {
-        self.x[2]
+        self.x[2].clamp(0.0, 1.0)
     }
 
     pub fn ode_net_rate(&self) -> f64 {
-        self.x[4]
+        self.x[4].clamp(0.0, 1.0)
     }
 
     pub fn ode_t_sat_urgency(&self) -> f64 {
-        self.x[5]
+        self.x[5].clamp(0.0, 1.0)
     }
 
     pub fn cpu_saturation(&self) -> f64 {
-        self.x[6]
+        self.x[6].clamp(0.0, 1.0)
     }
 
     pub fn thermal_stress(&self) -> f64 {
-        self.x[7]
+        self.x[7].clamp(0.0, 1.0)
     }
 
     /// Posterior variance (uncertainty) for state dimension i.
@@ -539,10 +557,56 @@ impl KalmanMV8 {
         self.p[i * MV8_D + i]
     }
 
+    /// Tr(P) / D — normalized Riccati trace.
+    /// < 0.10 indicates filter has reconciled sensor noise with process noise.
+    pub fn trace_per_dim(&self) -> f64 {
+        let tr: f64 = (0..MV8_D).map(|i| self.p[i * MV8_D + i]).sum();
+        tr / MV8_D as f64
+    }
+
+    /// P[1,1]: velocity dimension variance. Gate criterion for D-term switch.
+    pub fn velocity_variance(&self) -> f64 {
+        self.p[1 * MV8_D + 1]
+    }
+
+    /// True when warmup ≥ 50 cycles AND Tr(P)/D < 0.10.
+    /// [NotebookLM KalmanMV8 spec; mirrors RestoreQualityMonitor 50-cycle warmup]
+    pub fn is_converged(&self) -> bool {
+        self.initialized && self.warmup_cycles >= 50 && self.trace_per_dim() < 0.10
+    }
+
+    /// True when warmup ≥ 50 cycles AND P[1,1] ≤ Q[1].
+    /// Gate for switching D-term PID from 1D Kalman velocity to MV8 velocity.
+    pub fn velocity_converged(&self) -> bool {
+        self.initialized && self.warmup_cycles >= 50 && self.velocity_variance() <= MV8_Q[1]
+    }
+
+    /// Linear blend factor: 0.0 (start) → 1.0 (full MV8) over 200 cycles.
+    /// Use: `(1 - α)*x_1d + α*x_mv8` to avoid LinUCB feature shock.
+    pub fn blend_alpha(&self) -> f64 {
+        (self.warmup_cycles as f64 / 200.0).min(1.0)
+    }
+
+    /// Modulate R[0,1] (pressure dimensions) based on KPC IPC.
+    /// Low IPC (memory-bound) → pressure signal more reliable → scale R down.
+    /// [03b78fa wiring pattern; NotebookLM IPC-aware R scaling spec]
+    pub fn set_kpc_ipc(&mut self, ipc: f64) {
+        self.kpc_r_scale = if ipc <= 0.0 {
+            1.0
+        } else if ipc < 0.5 {
+            0.4 // memory-bound: trust pressure measurements more
+        } else if ipc > 1.5 {
+            2.5 // compute-bound: pressure is noisy
+        } else {
+            1.0
+        };
+    }
+
     pub fn reset_state(&mut self) {
         self.x = [0.0; MV8_D];
         self.p = mv8_default_p();
         self.initialized = false;
+        self.warmup_cycles = 0;
     }
 }
 
@@ -803,6 +867,68 @@ mod tests {
         kf.reset_state();
         assert!(!kf.is_initialized());
         assert_eq!(kf.memory_pressure(), 0.0);
+    }
+
+    #[test]
+    fn test_mv8_not_converged_before_warmup() {
+        let mut kf = KalmanMV8::new();
+        let z = [0.5, 0.0, 0.1, 0.1, 0.1, 0.05, 0.3, 0.0];
+        // First update initializes but does NOT increment warmup_cycles.
+        // Subsequent predict+update increments by 1 each.
+        // Need 50 predict+update pairs to reach warmup_cycles=50.
+        kf.update(&z);
+        // Feed 49 predict+update → warmup_cycles=49: not yet converged.
+        for _ in 0..49 {
+            kf.predict(2.0);
+            kf.update(&z);
+        }
+        assert!(
+            !kf.is_converged(),
+            "warmup={} should be < 50",
+            kf.warmup_cycles
+        );
+        // 50th predict+update → warmup_cycles=50: converged.
+        kf.predict(2.0);
+        kf.update(&z);
+        assert!(
+            kf.is_converged(),
+            "trace_per_dim={:.4} warmup={}",
+            kf.trace_per_dim(),
+            kf.warmup_cycles
+        );
+    }
+
+    #[test]
+    fn test_mv8_blend_alpha_ramps() {
+        let mut kf = KalmanMV8::new();
+        assert_eq!(kf.blend_alpha(), 0.0);
+        let z = [0.5, 0.0, 0.1, 0.1, 0.1, 0.05, 0.3, 0.0];
+        kf.update(&z);
+        for _ in 0..99 {
+            kf.predict(2.0);
+            kf.update(&z);
+        }
+        // 100 update cycles → α = 0.5.
+        let alpha = kf.blend_alpha();
+        assert!(
+            (alpha - 0.5).abs() < 0.01,
+            "expected α≈0.5, got {:.3}",
+            alpha
+        );
+    }
+
+    #[test]
+    fn test_mv8_kpc_ipc_scales_r() {
+        let mut kf = KalmanMV8::new();
+        // Memory-bound: R scale should drop to 0.4.
+        kf.set_kpc_ipc(0.3);
+        assert!((kf.kpc_r_scale - 0.4).abs() < 1e-10);
+        // Compute-bound: R scale up.
+        kf.set_kpc_ipc(2.0);
+        assert!((kf.kpc_r_scale - 2.5).abs() < 1e-10);
+        // Unknown: default.
+        kf.set_kpc_ipc(0.0);
+        assert!((kf.kpc_r_scale - 1.0).abs() < 1e-10);
     }
 
     #[test]

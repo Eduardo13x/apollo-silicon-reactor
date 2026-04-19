@@ -262,6 +262,7 @@ impl SignalIntelligence {
             self.kf_pressure
                 .set_measurement_noise(self.kf_pressure_base_r * scale);
         }
+        self.kf_mv.set_kpc_ipc(ipc);
     }
 
     /// Feed KPC IPC trend (velocity EMA). Negative = system becoming memory-bound.
@@ -908,12 +909,12 @@ impl SignalIntelligence {
         self.kf_mv.update(z);
     }
 
-    /// Multivariate-fused memory pressure estimate.
+    /// Multivariate-fused memory pressure estimate. Clamped [0,1].
     pub fn kf_mv_pressure(&self) -> f64 {
         self.kf_mv.memory_pressure()
     }
 
-    /// Multivariate-fused pressure velocity estimate (cross-informed by swap + ODE).
+    /// Multivariate-fused pressure velocity (cross-informed by swap + ODE coupling).
     pub fn kf_mv_pressure_velocity(&self) -> f64 {
         self.kf_mv.pressure_velocity()
     }
@@ -921,6 +922,21 @@ impl SignalIntelligence {
     /// Full fused state vector [D=8].
     pub fn kf_mv_state(&self) -> &[f64; 8] {
         self.kf_mv.state()
+    }
+
+    /// True when MV8 has completed 50-cycle warmup AND Tr(P)/D < 0.10.
+    pub fn kf_mv_is_converged(&self) -> bool {
+        self.kf_mv.is_converged()
+    }
+
+    /// True when MV8 velocity covariance P[1,1] ≤ Q[1]. Gate for D-term switch.
+    pub fn kf_mv_velocity_converged(&self) -> bool {
+        self.kf_mv.velocity_converged()
+    }
+
+    /// Blend factor 0→1 over 200 cycles. Use for LinUCB gradual transition.
+    pub fn kf_mv_blend_alpha(&self) -> f64 {
+        self.kf_mv.blend_alpha()
     }
 
     /// Reset learned zones to defaults (called when restore quality is stale).

@@ -3400,8 +3400,14 @@ fn main() -> anyhow::Result<()> {
                     d
                 };
 
-                // Update D-term: capture Kalman pressure velocity for next cycle.
-                last_pressure_velocity = signal_digest.pressure_velocity;
+                // Update D-term: use MV8 velocity when P[1,1] ≤ Q[1]=0.005 (converged).
+                // Fallback to 1D KF until MV8 velocity covariance has stabilized.
+                // [NotebookLM: gated switch prevents 200× velocity noise from cold start]
+                last_pressure_velocity = if lctx.signal_intel.kf_mv_velocity_converged() {
+                    lctx.signal_intel.kf_mv_pressure_velocity()
+                } else {
+                    signal_digest.pressure_velocity
+                };
 
                 // Swap Reclaim ODE — feed vm_rate from background collector.
                 // Produces SaturationForecast used by the freeze gate below.
@@ -3609,8 +3615,17 @@ fn main() -> anyhow::Result<()> {
                         lctx.signal_intel.tick_mv(&z_mv, cycle_dt_secs);
                     }
 
+                    // LinUCB slot 0: blend 1D→MV8 pressure over 200 cycles.
+                    // Prevents "feature shock" from abrupt context vector shift.
+                    // α=0 for first 200 cycles → pure 1D; α=1 after → pure MV8.
+                    // [NotebookLM KalmanMV8 wiring spec; Welch & Bishop 2006]
+                    let agent_pressure = {
+                        let alpha = lctx.signal_intel.kf_mv_blend_alpha();
+                        (1.0 - alpha) * signal_digest.pressure_smooth
+                            + alpha * lctx.signal_intel.kf_mv_pressure()
+                    };
                     let agent_ctx = AgentContext::build(
-                        signal_digest.pressure_smooth, // Kalman-filtered instead of raw
+                        agent_pressure,
                         swap_forecast.swap_trend,
                         swap_forecast.time_to_swap_critical,
                         hw_tp,
