@@ -3689,6 +3689,7 @@ fn main() -> anyhow::Result<()> {
                         linucb_choice,
                         linucb_confidence,
                         cycle_count,
+                        ode_t_sat_urgency,
                     );
                     last_specialist_votes = voting_out.disagreement_record;
                     voting_out.intervention

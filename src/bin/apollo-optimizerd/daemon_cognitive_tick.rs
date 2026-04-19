@@ -123,6 +123,11 @@ pub fn apply_specialist_voting(
     linucb_choice: Intervention,
     linucb_confidence: f64,
     cycle_count: u64,
+    // G13 — Epistemic Arbiter: ODE T_sat urgency boosts hazard vote 1.5× when > 0.5.
+    // When ODE physics predict imminent saturation, the hazard specialist's confidence
+    // is amplified to resolve Lotka-Volterra vs ODE-swap specialist ties decisively.
+    // [Kuncheva 2004 §5.2 — ensemble arbitration under conflicting specialist signals]
+    ode_t_sat_urgency: f64,
 ) -> SpecialistVotingOutput {
     // ── Specialist accuracy feedback (Super Learner) ─────────────────
     // Compare prev cycle's ACTUAL specialist signals against observed outcome.
@@ -180,12 +185,18 @@ pub fn apply_specialist_voting(
     ];
 
     // Hazard specialist: high P(OOM) → use MPC recommendation.
+    // G13: when ODE urgency > 0.5, boost confidence 1.5× to resolve arbiter ties
+    // decisively in favour of the physics-informed signal.
+    // [Kuncheva 2004 §5.2 — ensemble arbitration under conflicting specialist signals]
     if signal_digest.p_oom_30s > 0.30 {
+        let ode_boost = if ode_t_sat_urgency > 0.5 { 1.5_f64 } else { 1.0_f64 };
         votes.push(SpecialistVote {
             name: "hazard",
             intervention: Intervention::from_index(signal_digest.mpc_recommendation),
-            confidence: signal_digest.p_oom_30s.min(1.0)
-                * lctx.specialist_accuracy.weight(specialist::HAZARD),
+            confidence: (signal_digest.p_oom_30s.min(1.0)
+                * lctx.specialist_accuracy.weight(specialist::HAZARD)
+                * ode_boost)
+                .min(1.0),
         });
     }
 
