@@ -43,6 +43,8 @@ pub enum ProbeExpectation {
     NarsDriftRecovery,
     /// High epistemic uncertainty must block aggressive actions.
     EpistemicBlocksAggressive,
+    /// ODE inputs oscillate wildly (noisy sensor) — EMA must bound urgency.
+    OdeDivergenceResilient,
 }
 
 /// A synthetic scenario to probe.
@@ -149,6 +151,13 @@ impl AdversarialProbe {
                 expectation: ProbeExpectation::EpistemicBlocksAggressive,
                 pressure: 0.80,
                 p_oom: 0.50,
+                protected_names: vec![],
+            },
+            // Scenario 5: Noisy ODE sensor — alternating 0/max dirty rate
+            SyntheticScenario {
+                expectation: ProbeExpectation::OdeDivergenceResilient,
+                pressure: 0.70,
+                p_oom: 0.40,
                 protected_names: vec![],
             },
         ]
@@ -325,6 +334,71 @@ impl AdversarialProbe {
         }
     }
 
+    /// Verify EMA damps oscillating dirty-rate inputs vs sustained inputs.
+    ///
+    /// Invariant: avg urgency under alternating 0/HIGH input < avg urgency under
+    /// sustained HIGH input. EMA steady-state for 0/HIGH oscillation converges to
+    /// ~half the sustained rate [Zhao 2009 §4.2 EMA smoothing].
+    ///
+    /// [Hellerstein 2004] §9 — PID sensor noise rejection must attenuate
+    /// high-frequency oscillations while tracking real load shifts.
+    pub fn probe_ode_divergence() -> ProbeResult {
+        use crate::engine::swap_reclaim::{SwapReclaimModel, VmFlowSample, CRITICAL_ETA_SEC};
+
+        const SWAP_CAP: u64 = 8 * 1024 * 1024 * 1024; // 8 GB
+        let swap_used = (SWAP_CAP as f64 * 0.50) as u64; // 50% used
+        let high_cps = 2_000.0_f64; // pages/s peak
+
+        let urgency_of = |sample: &VmFlowSample, model: &mut SwapReclaimModel| -> f64 {
+            model
+                .update(sample)
+                .t_sat_sec
+                .map(|t| (CRITICAL_ETA_SEC / t.max(1.0)).clamp(0.0, 1.0))
+                .unwrap_or(0.0)
+        };
+
+        let make_sample = |cps: f64| VmFlowSample {
+            compressions_per_sec: cps,
+            decompressions_per_sec: 0.0,
+            purges_per_sec: 0.0,
+            swapouts_per_sec: 0.0,
+            swap_used_bytes: swap_used,
+            swap_total_bytes: SWAP_CAP,
+        };
+
+        let mut model_sustained = SwapReclaimModel::new();
+        let avg_sustained: f64 = (0..20)
+            .map(|_| urgency_of(&make_sample(high_cps), &mut model_sustained))
+            .sum::<f64>()
+            / 20.0;
+
+        let mut model_oscillating = SwapReclaimModel::new();
+        let avg_oscillating: f64 = (0..20)
+            .map(|i| {
+                let cps = if i % 2 == 0 { high_cps } else { 0.0 };
+                urgency_of(&make_sample(cps), &mut model_oscillating)
+            })
+            .sum::<f64>()
+            / 20.0;
+
+        // EMA damps 0/HIGH to ~half the sustained rate → lower average urgency.
+        let passed = avg_oscillating < avg_sustained;
+        ProbeResult {
+            expectation: ProbeExpectation::OdeDivergenceResilient,
+            passed,
+            description: if passed {
+                format!(
+                    "EMA damps oscillating urgency {avg_oscillating:.3} < sustained {avg_sustained:.3}"
+                )
+            } else {
+                format!(
+                    "EMA noise rejection failed: oscillating {avg_oscillating:.3} ≥ sustained {avg_sustained:.3}"
+                )
+            },
+            cycle: 0,
+        }
+    }
+
     /// Recent failures (newest first).
     pub fn recent_failures(&self, n: usize) -> Vec<&ProbeResult> {
         self.failure_log.iter().rev().take(n).collect()
@@ -369,22 +443,21 @@ mod tests {
     #[test]
     fn test_generate_scenarios() {
         let scenarios = AdversarialProbe::generate_scenarios();
-        assert_eq!(scenarios.len(), 4);
-        assert_eq!(
-            scenarios[0].expectation,
-            ProbeExpectation::NoFreezeProtected
-        );
-        assert_eq!(
-            scenarios[1].expectation,
-            ProbeExpectation::SafetyFloorRespected
-        );
-        assert_eq!(
-            scenarios[2].expectation,
-            ProbeExpectation::NarsDriftRecovery
-        );
-        assert_eq!(
-            scenarios[3].expectation,
-            ProbeExpectation::EpistemicBlocksAggressive
+        assert_eq!(scenarios.len(), 5);
+        assert_eq!(scenarios[0].expectation, ProbeExpectation::NoFreezeProtected);
+        assert_eq!(scenarios[1].expectation, ProbeExpectation::SafetyFloorRespected);
+        assert_eq!(scenarios[2].expectation, ProbeExpectation::NarsDriftRecovery);
+        assert_eq!(scenarios[3].expectation, ProbeExpectation::EpistemicBlocksAggressive);
+        assert_eq!(scenarios[4].expectation, ProbeExpectation::OdeDivergenceResilient);
+    }
+
+    #[test]
+    fn test_ode_divergence_probe_passes() {
+        let result = AdversarialProbe::probe_ode_divergence();
+        assert!(
+            result.passed,
+            "EMA should smooth oscillating sensor: {}",
+            result.description
         );
     }
 
