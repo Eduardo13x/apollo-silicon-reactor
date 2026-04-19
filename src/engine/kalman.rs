@@ -242,6 +242,310 @@ impl Kalman1D {
     }
 }
 
+// ── KalmanMV8 — 8-dimensional multivariate Kalman filter ────────────────────
+
+const MV8_D: usize = 8;
+
+/// Process noise diagonal Q.
+/// [memory_pressure, pressure_velocity, swap_norm, thrashing_norm,
+///  ode_net_rate, ode_t_sat, cpu_saturation, thermal_stress]
+const MV8_Q: [f64; MV8_D] = [0.005, 0.005, 0.015, 0.015, 0.015, 0.015, 0.020, 0.001];
+/// Measurement noise diagonal R.
+const MV8_R: [f64; MV8_D] = [0.020, 0.020, 0.050, 0.050, 0.015, 0.015, 0.080, 0.010];
+/// swap_norm → pressure_velocity coupling in F.
+const MV8_ALPHA: f64 = 0.05;
+/// thrashing_norm → pressure_velocity coupling in F.
+const MV8_BETA: f64 = 0.05;
+/// t_sat_urgency → ode_net_rate coupling in F.
+const MV8_GAMMA: f64 = 0.10;
+
+fn mv8_default_p() -> [f64; 64] {
+    let mut p = [0.0f64; 64];
+    for i in 0..MV8_D {
+        p[i * MV8_D + i] = MV8_Q[i];
+    }
+    p
+}
+
+#[inline(always)]
+fn mv8_mat_mul(a: &[f64; 64], b: &[f64; 64]) -> [f64; 64] {
+    let mut c = [0.0f64; 64];
+    for i in 0..MV8_D {
+        for k in 0..MV8_D {
+            let aik = a[i * MV8_D + k];
+            if aik == 0.0 {
+                continue;
+            }
+            for j in 0..MV8_D {
+                c[i * MV8_D + j] += aik * b[k * MV8_D + j];
+            }
+        }
+    }
+    c
+}
+
+#[inline(always)]
+fn mv8_mat_transpose(a: &[f64; 64]) -> [f64; 64] {
+    let mut t = [0.0f64; 64];
+    for i in 0..MV8_D {
+        for j in 0..MV8_D {
+            t[j * MV8_D + i] = a[i * MV8_D + j];
+        }
+    }
+    t
+}
+
+/// S = a + diag(d). Only touches diagonal elements.
+#[inline(always)]
+fn mv8_add_diag(a: &[f64; 64], d: &[f64; MV8_D]) -> [f64; 64] {
+    let mut s = *a;
+    for i in 0..MV8_D {
+        s[i * MV8_D + i] += d[i];
+    }
+    s
+}
+
+#[inline(always)]
+fn mv8_mat_vec_mul(m: &[f64; 64], v: &[f64; MV8_D]) -> [f64; MV8_D] {
+    let mut r = [0.0f64; MV8_D];
+    for i in 0..MV8_D {
+        for j in 0..MV8_D {
+            r[i] += m[i * MV8_D + j] * v[j];
+        }
+    }
+    r
+}
+
+fn mv8_identity() -> [f64; 64] {
+    let mut m = [0.0f64; 64];
+    for i in 0..MV8_D {
+        m[i * MV8_D + i] = 1.0;
+    }
+    m
+}
+
+/// Gauss-Jordan inversion of 8×8 matrix. Returns None if near-singular (pivot < 1e-12).
+fn mv8_mat_inv(m: &[f64; 64]) -> Option<[f64; 64]> {
+    // Augmented [m | I], 8 rows × 16 cols.
+    let cols = MV8_D * 2;
+    let mut aug = [0.0f64; MV8_D * MV8_D * 2];
+    for i in 0..MV8_D {
+        for j in 0..MV8_D {
+            aug[i * cols + j] = m[i * MV8_D + j];
+        }
+        aug[i * cols + MV8_D + i] = 1.0;
+    }
+    for col in 0..MV8_D {
+        // Partial pivot.
+        let mut max_row = col;
+        let mut max_val = aug[col * cols + col].abs();
+        for row in (col + 1)..MV8_D {
+            let v = aug[row * cols + col].abs();
+            if v > max_val {
+                max_val = v;
+                max_row = row;
+            }
+        }
+        if max_val < 1e-12 {
+            return None;
+        }
+        if max_row != col {
+            for j in 0..cols {
+                aug.swap(col * cols + j, max_row * cols + j);
+            }
+        }
+        let pivot = aug[col * cols + col];
+        for j in 0..cols {
+            aug[col * cols + j] /= pivot;
+        }
+        for row in 0..MV8_D {
+            if row == col {
+                continue;
+            }
+            let factor = aug[row * cols + col];
+            if factor == 0.0 {
+                continue;
+            }
+            for j in 0..cols {
+                let sub = aug[col * cols + j] * factor;
+                aug[row * cols + j] -= sub;
+            }
+        }
+    }
+    let mut inv = [0.0f64; 64];
+    for i in 0..MV8_D {
+        for j in 0..MV8_D {
+            inv[i * MV8_D + j] = aug[i * cols + MV8_D + j];
+        }
+    }
+    Some(inv)
+}
+
+/// Build F matrix for time step dt.
+/// F = I + kinematic and cross-signal coupling terms.
+fn mv8_build_f(dt: f64) -> [f64; 64] {
+    let mut f = mv8_identity();
+    f[0 * MV8_D + 1] = dt;         // pressure_smooth += velocity * dt
+    f[1 * MV8_D + 2] = MV8_ALPHA;  // swap_norm → pressure_velocity
+    f[1 * MV8_D + 3] = MV8_BETA;   // thrashing_norm → pressure_velocity
+    f[4 * MV8_D + 5] = MV8_GAMMA;  // t_sat_urgency → ode_net_rate
+    f
+}
+
+/// 8-dimensional multivariate Kalman filter fusing memory pressure + ODE signals.
+///
+/// State vector indices:
+///   0: memory_pressure      1: pressure_velocity    2: swap_norm
+///   3: thrashing_norm       4: ode_net_rate         5: ode_t_sat_urgency
+///   6: cpu_saturation       7: thermal_stress
+///
+/// H = I₈ (all states directly observable each cycle).
+/// Zero heap allocation — all matrices stored as `[f64; 64]` on the stack.
+///
+/// Q diagonal: [0.005, 0.005, 0.015, 0.015, 0.015, 0.015, 0.020, 0.001]
+/// R diagonal: [0.020, 0.020, 0.050, 0.050, 0.015, 0.015, 0.080, 0.010]
+/// P init = diag(Q). Covariance (P) is not serialized — reconverges in ~10 cycles.
+///
+/// [Welch & Bishop 2006] "An Introduction to the Kalman Filter"
+/// [Kalman 1960] "A New Approach to Linear Filtering and Prediction Problems"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KalmanMV8 {
+    x: [f64; MV8_D],
+    #[serde(skip, default = "mv8_default_p")]
+    p: [f64; 64],
+    initialized: bool,
+}
+
+impl Default for KalmanMV8 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KalmanMV8 {
+    pub fn new() -> Self {
+        Self {
+            x: [0.0; MV8_D],
+            p: mv8_default_p(),
+            initialized: false,
+        }
+    }
+
+    /// Predict: x = F*x, P = F*P*F' + Q.
+    pub fn predict(&mut self, dt: f64) {
+        if !self.initialized || !dt.is_finite() {
+            return;
+        }
+        let f = mv8_build_f(dt.max(0.001));
+        let ft = mv8_mat_transpose(&f);
+        self.x = mv8_mat_vec_mul(&f, &self.x);
+        let fp = mv8_mat_mul(&f, &self.p);
+        self.p = mv8_mat_mul(&fp, &ft);
+        // P += Q (diagonal process noise)
+        for i in 0..MV8_D {
+            self.p[i * MV8_D + i] += MV8_Q[i];
+            self.p[i * MV8_D + i] = self.p[i * MV8_D + i].max(1e-9);
+        }
+    }
+
+    /// Update with observation z (H=I, so y = z - x).
+    /// Returns false if z contains non-finite values or S is singular.
+    pub fn update(&mut self, z: &[f64; MV8_D]) -> bool {
+        if z.iter().any(|v| !v.is_finite()) {
+            return false;
+        }
+        if !self.initialized {
+            self.x = *z;
+            // P stays as diag(Q) from new()
+            self.initialized = true;
+            return true;
+        }
+        // y = z - x (H=I)
+        let mut y = [0.0f64; MV8_D];
+        for i in 0..MV8_D {
+            y[i] = z[i] - self.x[i];
+        }
+        // S = P + diag(R)
+        let s = mv8_add_diag(&self.p, &MV8_R);
+        let s_inv = match mv8_mat_inv(&s) {
+            Some(inv) => inv,
+            None => return false,
+        };
+        // K = P * S^{-1}
+        let k = mv8_mat_mul(&self.p, &s_inv);
+        // x += K * y
+        let ky = mv8_mat_vec_mul(&k, &y);
+        for i in 0..MV8_D {
+            self.x[i] += ky[i];
+        }
+        // P = (I - K) * P
+        let mut ik = mv8_identity();
+        for i in 0..MV8_D {
+            for j in 0..MV8_D {
+                ik[i * MV8_D + j] -= k[i * MV8_D + j];
+            }
+        }
+        self.p = mv8_mat_mul(&ik, &self.p);
+        // Enforce PSD: symmetrize + clamp diagonal.
+        for i in 0..MV8_D {
+            self.p[i * MV8_D + i] = self.p[i * MV8_D + i].max(1e-9);
+            for j in (i + 1)..MV8_D {
+                let sym = (self.p[i * MV8_D + j] + self.p[j * MV8_D + i]) * 0.5;
+                self.p[i * MV8_D + j] = sym;
+                self.p[j * MV8_D + i] = sym;
+            }
+        }
+        true
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    pub fn state(&self) -> &[f64; MV8_D] {
+        &self.x
+    }
+
+    pub fn memory_pressure(&self) -> f64 {
+        self.x[0]
+    }
+
+    pub fn pressure_velocity(&self) -> f64 {
+        self.x[1]
+    }
+
+    pub fn swap_norm(&self) -> f64 {
+        self.x[2]
+    }
+
+    pub fn ode_net_rate(&self) -> f64 {
+        self.x[4]
+    }
+
+    pub fn ode_t_sat_urgency(&self) -> f64 {
+        self.x[5]
+    }
+
+    pub fn cpu_saturation(&self) -> f64 {
+        self.x[6]
+    }
+
+    pub fn thermal_stress(&self) -> f64 {
+        self.x[7]
+    }
+
+    /// Posterior variance (uncertainty) for state dimension i.
+    pub fn variance(&self, i: usize) -> f64 {
+        self.p[i * MV8_D + i]
+    }
+
+    pub fn reset_state(&mut self) {
+        self.x = [0.0; MV8_D];
+        self.p = mv8_default_p();
+        self.initialized = false;
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -412,5 +716,112 @@ mod tests {
         assert_eq!(kf.residual_samples(), 1);
         kf.update(0.51, 0.5);
         assert_eq!(kf.residual_samples(), 2);
+    }
+
+    // ── KalmanMV8 tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mv8_new_uninitialized() {
+        let kf = KalmanMV8::new();
+        assert!(!kf.is_initialized());
+        assert_eq!(kf.memory_pressure(), 0.0);
+    }
+
+    #[test]
+    fn test_mv8_first_update_initializes() {
+        let mut kf = KalmanMV8::new();
+        let z = [0.5, 0.01, 0.1, 0.2, 0.1, 0.05, 0.3, 0.0];
+        let ok = kf.update(&z);
+        assert!(ok);
+        assert!(kf.is_initialized());
+        assert!((kf.memory_pressure() - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_mv8_constant_signal_converges() {
+        let mut kf = KalmanMV8::new();
+        let z = [0.60, 0.0, 0.1, 0.1, 0.1, 0.05, 0.3, 0.0];
+        for _ in 0..100 {
+            kf.predict(2.0);
+            kf.update(&z);
+        }
+        assert!(
+            (kf.memory_pressure() - 0.60).abs() < 0.02,
+            "pressure converged to {} (expected 0.60)",
+            kf.memory_pressure()
+        );
+        // Velocity should converge near 0 for constant input.
+        assert!(
+            kf.pressure_velocity().abs() < 0.05,
+            "velocity {} should be near 0",
+            kf.pressure_velocity()
+        );
+    }
+
+    #[test]
+    fn test_mv8_nan_rejected() {
+        let mut kf = KalmanMV8::new();
+        let z_good = [0.5, 0.0, 0.1, 0.1, 0.1, 0.05, 0.3, 0.0];
+        kf.update(&z_good);
+        let pos_before = kf.memory_pressure();
+
+        let mut z_nan = z_good;
+        z_nan[0] = f64::NAN;
+        let ok = kf.update(&z_nan);
+        assert!(!ok, "NaN update should return false");
+        assert!((kf.memory_pressure() - pos_before).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_mv8_pressure_velocity_cross_propagates() {
+        // Rising memory pressure should push pressure_velocity positive via F kinematics.
+        let mut kf = KalmanMV8::new();
+        // Seed with some cycles then feed rising pressure.
+        for i in 0..30 {
+            let p = 0.40 + i as f64 * 0.01;
+            let z = [p, 0.01 * i as f64, 0.05, 0.05, 0.05, 0.02, 0.3, 0.0];
+            kf.predict(2.0);
+            kf.update(&z);
+        }
+        // After 30 cycles of rising pressure, velocity estimate should be positive.
+        assert!(
+            kf.pressure_velocity() > 0.0,
+            "velocity {} should be > 0 with rising pressure",
+            kf.pressure_velocity()
+        );
+    }
+
+    #[test]
+    fn test_mv8_reset_clears_state() {
+        let mut kf = KalmanMV8::new();
+        let z = [0.7, 0.05, 0.2, 0.3, 0.1, 0.1, 0.4, 0.33];
+        for _ in 0..10 {
+            kf.predict(2.0);
+            kf.update(&z);
+        }
+        assert!(kf.is_initialized());
+        kf.reset_state();
+        assert!(!kf.is_initialized());
+        assert_eq!(kf.memory_pressure(), 0.0);
+    }
+
+    #[test]
+    fn test_mv8_gauss_jordan_identity() {
+        // Inverting the identity matrix should return identity.
+        let i8 = mv8_identity();
+        let inv = mv8_mat_inv(&i8).expect("identity is invertible");
+        for r in 0..MV8_D {
+            for c in 0..MV8_D {
+                let expected = if r == c { 1.0 } else { 0.0 };
+                assert!(
+                    (inv[r * MV8_D + c] - expected).abs() < 1e-10,
+                    "inv[{},{}]={} expected {}",
+                    r,
+                    c,
+                    inv[r * MV8_D + c],
+                    expected
+                );
+            }
+        }
     }
 }

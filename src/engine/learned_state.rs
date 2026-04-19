@@ -1175,6 +1175,7 @@ mod tests {
             utility_mpc: 0.3,
             kf_pressure: None,
             kf_swap: None,
+            kf_mv: None,
         };
         let mut state = LearnedState {
             version: 1,

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::engine::cusum::Cusum;
 use crate::engine::entropy_anomaly::EntropyDetector;
 use crate::engine::hazard_model::HazardModel;
-use crate::engine::kalman::Kalman1D;
+use crate::engine::kalman::{Kalman1D, KalmanMV8};
 use crate::engine::learned_state::LearnableParams;
 use crate::engine::lotka_volterra::{CompetitionState, StabilityRegime};
 use crate::engine::mpc_horizon::{MpcController, MpcPersisted};
@@ -105,6 +105,8 @@ pub struct SignalIntelligence {
     // Kalman filters
     kf_pressure: Kalman1D,
     kf_swap: Kalman1D,
+    /// 8-dimensional Kalman filter fusing all ODE + pressure signals.
+    kf_mv: KalmanMV8,
 
     // CUSUM detectors
     cusum_pressure: Cusum,
@@ -246,6 +248,7 @@ impl SignalIntelligence {
             workload_zone_offsets: HashMap::new(),
             oom_event_buffer: Vec::new(),
             last_oom_instant: None,
+            kf_mv: KalmanMV8::new(),
         }
     }
 
@@ -817,6 +820,7 @@ impl SignalIntelligence {
             utility_mpc: self.utility_mpc,
             kf_pressure: Some(self.kf_pressure.clone()),
             kf_swap: Some(self.kf_swap.clone()),
+            kf_mv: Some(self.kf_mv.clone()),
         }
     }
 
@@ -877,6 +881,9 @@ impl SignalIntelligence {
         if let Some(kf) = p.kf_swap {
             self.kf_swap = kf;
         }
+        if let Some(kf) = p.kf_mv {
+            self.kf_mv = kf;
+        }
     }
 
     /// Clear volatile filter state after a wake from sleep. Pre-sleep
@@ -886,6 +893,34 @@ impl SignalIntelligence {
     pub fn reset_after_wake(&mut self) {
         self.kf_pressure.reset_state();
         self.kf_swap.reset_state();
+        self.kf_mv.reset_state();
+    }
+
+    /// Feed the 8-dimensional multivariate Kalman filter.
+    /// Call once per cycle AFTER tick(), with all ODE-derived signals available.
+    ///
+    /// z = [memory_pressure, pressure_velocity, swap_norm, thrashing_norm,
+    ///      ode_net_rate, ode_t_sat_urgency, cpu_saturation, thermal_stress]
+    ///
+    /// [Welch & Bishop 2006] — H=I fused estimate, cross-covariance propagation.
+    pub fn tick_mv(&mut self, z: &[f64; 8], dt: f64) {
+        self.kf_mv.predict(dt);
+        self.kf_mv.update(z);
+    }
+
+    /// Multivariate-fused memory pressure estimate.
+    pub fn kf_mv_pressure(&self) -> f64 {
+        self.kf_mv.memory_pressure()
+    }
+
+    /// Multivariate-fused pressure velocity estimate (cross-informed by swap + ODE).
+    pub fn kf_mv_pressure_velocity(&self) -> f64 {
+        self.kf_mv.pressure_velocity()
+    }
+
+    /// Full fused state vector [D=8].
+    pub fn kf_mv_state(&self) -> &[f64; 8] {
+        self.kf_mv.state()
     }
 
     /// Reset learned zones to defaults (called when restore quality is stale).
@@ -993,6 +1028,9 @@ pub struct SignalIntelligencePersisted {
     /// Kalman filter state for swap velocity.
     #[serde(default)]
     pub kf_swap: Option<Kalman1D>,
+    /// Multivariate Kalman filter state (x only; P reconverges in ~10 cycles).
+    #[serde(default)]
+    pub kf_mv: Option<KalmanMV8>,
 }
 
 fn default_mid_entry() -> f64 {

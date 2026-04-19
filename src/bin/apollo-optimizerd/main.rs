@@ -3571,6 +3571,44 @@ fn main() -> anyhow::Result<()> {
                         use apollo_optimizer::engine::swap_reclaim::{CyberPhysicalSignal, NetRateNorm};
                         NetRateNorm(reclaim_forecast.net_rate_bps).normalized()
                     };
+
+                    // KalmanMV8: fuse all 8 signals after ODE outputs are available.
+                    // [Welch & Bishop 2006] H=I cross-covariance propagation.
+                    {
+                        use apollo_optimizer::engine::swap_reclaim::NET_RATE_CEILING_BPS;
+                        let swap_raw_norm = (snapshot.pressure.swap_delta_bytes_per_sec
+                            / NET_RATE_CEILING_BPS)
+                            .clamp(0.0, 1.0);
+                        let cpu_mean = {
+                            let procs = &snapshot.top_processes;
+                            if procs.is_empty() {
+                                0.0
+                            } else {
+                                (procs.iter().map(|p| p.cpu_usage as f64).sum::<f64>()
+                                    / procs.len() as f64
+                                    / 100.0)
+                                    .clamp(0.0, 1.0)
+                            }
+                        };
+                        let thermal_f64 = match snapshot.pressure.thermal_level.as_str() {
+                            "light" => 0.33,
+                            "serious" => 0.66,
+                            "critical" => 1.0,
+                            _ => 0.0,
+                        };
+                        let z_mv: [f64; 8] = [
+                            snapshot.pressure.memory_pressure, // [0] pressure
+                            signal_digest.pressure_velocity,   // [1] velocity (1D KF)
+                            swap_raw_norm,                     // [2] swap_norm
+                            snapshot.pressure.memory_pressure, // [3] compressor proxy
+                            ode_net_rate_norm,                 // [4] ode_net_rate
+                            ode_t_sat_urgency,                 // [5] ode_t_sat
+                            cpu_mean,                          // [6] cpu_saturation
+                            thermal_f64,                       // [7] thermal_stress
+                        ];
+                        lctx.signal_intel.tick_mv(&z_mv, cycle_dt_secs);
+                    }
+
                     let agent_ctx = AgentContext::build(
                         signal_digest.pressure_smooth, // Kalman-filtered instead of raw
                         swap_forecast.swap_trend,
