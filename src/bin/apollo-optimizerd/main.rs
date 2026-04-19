@@ -4429,6 +4429,82 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // G20 — Velocity Paging Hints: ODE net-rate > 0.5 triggers paging hints even
+                // when kernel pressure < 0.60. ODE is a leading indicator: rising compression
+                // rate predicts pressure before the kernel threshold fires.
+                // [Hellerstein 2004 §9 — derivative control acts before integrator saturates]
+                {
+                    use apollo_optimizer::engine::swap_reclaim::{CyberPhysicalSignal, NetRateNorm};
+                    let ode_rate_norm = NetRateNorm(reclaim_forecast.net_rate_bps).normalized();
+                    if ode_rate_norm > 0.5 && signal_digest.pressure_smooth < 0.60 {
+                        let hinted_pids_ode: std::collections::HashSet<u32> = actions
+                            .iter()
+                            .filter_map(|a| {
+                                if let RootAction::SetMemorystatus { pid, .. } = a {
+                                    Some(*pid)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        let protected_pats = state
+                            .policy
+                            .lock_recover()
+                            .learned_policy
+                            .protected_patterns
+                            .clone();
+                        let hard_protected = protected_processes();
+                        let infra_protected = infrastructure_processes();
+                        let mut bg_procs: Vec<_> = proc_snaps
+                            .iter()
+                            .filter(|p| {
+                                if is_interactive_app_name(&p.name) {
+                                    return false;
+                                }
+                                let is_interactive = is_user_interactive_app(
+                                    p.has_gui_window,
+                                    p.secs_since_user_interaction,
+                                    p.rss_bytes,
+                                    &p.name,
+                                );
+                                classify_protection(
+                                    &p.name,
+                                    &hard_protected,
+                                    &infra_protected,
+                                    &protected_pats,
+                                    is_interactive,
+                                ) == ProtectionLevel::Unprotected
+                                    && p.rss_bytes > 80 * 1024 * 1024
+                                    && p.pid != std::process::id()
+                                    && !p.has_gui_window
+                                    && foreground_app.as_ref().map(|fg| p.name != *fg).unwrap_or(true)
+                                    && p.secs_since_user_interaction > 60
+                            })
+                            .collect();
+                        bg_procs.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
+                        let mut added = 0usize;
+                        for proc in bg_procs.iter() {
+                            if added >= 2 {
+                                break;
+                            }
+                            if hinted_pids_ode.contains(&proc.pid) {
+                                continue;
+                            }
+                            actions.push(RootAction::set_memorystatus(
+                                proc.pid,
+                                -1,
+                                format!(
+                                    "ode-velocity hint (net_rate={:.0}%): {} ({}MB)",
+                                    ode_rate_norm * 100.0,
+                                    proc.name,
+                                    proc.rss_bytes / 1024 / 1024,
+                                ),
+                            ));
+                            added += 1;
+                        }
+                    }
+                }
+
                 // Heuristic pass: AdaptiveGovernor
                 // Pass hw_features (sampled every 5 cycles) for Bayesian fusion + online learning.
                 // Wire ODE swap risk + high-τ PIDs so idle thresholds and freeze decisions
