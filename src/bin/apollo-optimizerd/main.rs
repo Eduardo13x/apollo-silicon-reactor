@@ -1028,6 +1028,18 @@ fn main() -> anyhow::Result<()> {
                             .flatten();
                     }
                 }
+                // Restore learned τ for unfreeze-decay BEFORE apply() consumes
+                // `learned`.  The field is `Option<HashMap<…>>`; absent on old
+                // files or cold start → decay model stays at defaults.
+                if let Some(tau_map) = learned.unfreeze_decay_tau.clone() {
+                    let count = tau_map.len();
+                    unfreeze_decay.restore(tau_map);
+                    tracing::info!(
+                        target: "apollo.unfreeze_decay",
+                        learned_apps = count,
+                        "restored unfreeze-decay τ estimates from learned_state"
+                    );
+                }
                 // apply() restores skills from learned_state.json if present,
                 // overwriting the legacy optimization_skills.json load above.
                 // If skill_registry field is absent (old file), the legacy load is kept.
@@ -6072,6 +6084,9 @@ fn main() -> anyhow::Result<()> {
                 Some(learnable_params.clone()),
                 Some(nested_learner.clone()),
             );
+            // Patch unfreeze-decay τ snapshot after the main persist so a crash
+            // mid-persist leaves the previous learned-τ file intact.
+            LearnedState::patch_unfreeze_decay(ls_path, unfreeze_decay.tau_snapshot());
 
             // Revert sysctls to defaults on shutdown.
             {

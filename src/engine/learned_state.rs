@@ -30,6 +30,7 @@ use crate::engine::process_baseline::ProcessBaselineMap;
 use crate::engine::signal_intelligence::{SignalIntelligence, SignalIntelligencePersisted};
 use crate::engine::teacher_consolidation::TeacherConsolidator;
 use crate::engine::types::FrozenStatePersisted;
+use crate::engine::unfreeze_decay::TauEstimate;
 
 /// Adaptive parameters that replace hardcoded thresholds.
 ///
@@ -458,6 +459,13 @@ pub struct LearnedState {
     /// consolidation; [Gray & Reuter 1992] atomic persistence of learned state.
     #[serde(default)]
     pub teacher_consolidator: Option<TeacherConsolidator>,
+
+    /// Per-app learned τ for the unfreeze-decay ODE.  Without this, a daemon
+    /// restart cold-starts every app's decay model and the predictive thaw
+    /// gate falls back to `DEFAULT_TAU_SEC` for ~3 samples per app post-thaw.
+    /// [Strogatz 2015 §2.3 — learned time constants of linear relaxation]
+    #[serde(default)]
+    pub unfreeze_decay_tau: Option<HashMap<String, TauEstimate>>,
 }
 
 fn default_version() -> u32 {
@@ -511,6 +519,7 @@ impl LearnedState {
             learnable_params,
             nested_learner,
             teacher_consolidator: None,
+            unfreeze_decay_tau: None,
         }
     }
 
@@ -814,6 +823,19 @@ impl LearnedState {
         state.persist(path);
     }
 
+    /// Patch only the `unfreeze_decay_tau` field of an existing persisted file.
+    /// Same pattern as `patch_teacher_consolidator` — persist_improved() does
+    /// not thread the UnfreezeDecayModel through its signature; callers invoke
+    /// this after persist_improved() to snapshot learned τ per app.
+    /// No-op if file is missing (cold start is safe).
+    pub fn patch_unfreeze_decay(path: &Path, tau_map: HashMap<String, TauEstimate>) {
+        let Some(mut state) = Self::load(path) else {
+            return;
+        };
+        state.unfreeze_decay_tau = Some(tau_map);
+        state.persist(path);
+    }
+
     /// Load only the `teacher_consolidator` field from disk (cold-start safe).
     /// Returns `None` if the file is missing, unreadable, malformed, or the
     /// field is absent (old file format pre-dating GemmaTrust persistence).
@@ -1026,6 +1048,7 @@ mod tests {
             learnable_params: None,
             nested_learner: None,
             teacher_consolidator: None,
+            unfreeze_decay_tau: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1055,6 +1078,7 @@ mod tests {
             learnable_params: None,
             nested_learner: None,
             teacher_consolidator: None,
+            unfreeze_decay_tau: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1082,6 +1106,7 @@ mod tests {
             learnable_params: None,
             nested_learner: None,
             teacher_consolidator: None,
+            unfreeze_decay_tau: None,
         };
         assert_eq!(
             state
@@ -1128,6 +1153,7 @@ mod tests {
             learnable_params: None,
             nested_learner: None,
             teacher_consolidator: None,
+            unfreeze_decay_tau: None,
         };
         state.self_improve();
         assert_eq!(
@@ -1168,6 +1194,7 @@ mod tests {
             learnable_params: None,
             nested_learner: None,
             teacher_consolidator: None,
+            unfreeze_decay_tau: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -1211,6 +1238,7 @@ mod tests {
             learnable_params: None,
             nested_learner: None,
             teacher_consolidator: None,
+            unfreeze_decay_tau: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1549,6 +1577,7 @@ mod tests {
             learnable_params: None,
             nested_learner: None,
             teacher_consolidator: None,
+            unfreeze_decay_tau: None,
         };
         seed.persist(&tmp);
 
