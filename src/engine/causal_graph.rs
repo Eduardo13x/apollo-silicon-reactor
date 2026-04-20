@@ -1073,6 +1073,96 @@ mod tests {
         assert_eq!(rss + cpu + swap + unknown, g.edges.len());
     }
 
+    // ── Causal Counterfactual Validity Contract [Pearl 2009 §3] ────────────
+
+    #[test]
+    fn causal_counterfactual_effective_action_strengthens_edge() {
+        // If Apollo takes action A in context C and pressure drops,
+        // the causal edge C→A must strengthen (more solid evidence).
+        // [Pearl 2009 §3] causal mediation — effective actions build evidence.
+        //
+        // API: record_action(key, pressure_before, cycle) followed by
+        // evaluate(pressure_after, cycle+delay). When pressure_before - pressure_after
+        // >= MIN_DELTA (0.02), the action is deemed effective.
+        // is_solid() requires confidence > 0.7 AND evidence_count >= 5.
+        let mut g = CausalGraph::new();
+
+        // Record action with pressure drop on each cycle (effective: 0.80 → 0.70, delta=0.10)
+        for i in 0..20u64 {
+            g.record_action("throttle:Safari", 0.80, i * 4);
+            g.evaluate(0.70, i * 4 + 3); // 3 cycles later (eval_delay=3), pressure dropped
+        }
+
+        let solid_edges = g.solid_edges_by_impact();
+        let safari_solid = solid_edges
+            .iter()
+            .any(|e| e.cause.contains("Safari") && e.effect == "pressure_drop");
+        assert!(
+            safari_solid,
+            "Effective repeated action should produce solid causal edge for pressure_drop. \
+             Edge count: {}, solid_edges: {:?}",
+            g.edge_count(),
+            solid_edges.iter().map(|e| (&e.cause, &e.effect, e.confidence)).collect::<Vec<_>>()
+        );
+
+        // Also verify the edge confidence is substantial
+        let drop_edge = g.get_edge("throttle:Safari", "pressure_drop");
+        assert!(
+            drop_edge.is_some(),
+            "pressure_drop edge must exist after repeated effective actions"
+        );
+        let edge = drop_edge.unwrap();
+        assert!(
+            edge.confidence > 0.5,
+            "Solid edge confidence should exceed 0.5, got {}",
+            edge.confidence
+        );
+    }
+
+    #[test]
+    fn causal_counterfactual_ineffective_action_weakens_edge() {
+        // If the action doesn't help, the pressure_drop edge should NOT become solid.
+        // [Pearl 2009 §3] — spurious correlations must not elevate to solid.
+        //
+        // We record actions where pressure barely changes (0.75 → 0.74, delta=0.01 < MIN_DELTA=0.02)
+        // so the action is consistently classified as NOT effective.
+        let mut g = CausalGraph::new();
+
+        // Record action with negligible pressure change (ineffective: delta < 0.02)
+        for i in 0..20u64 {
+            g.record_action("throttle:contactsd", 0.75, i * 4);
+            g.evaluate(0.74, i * 4 + 3); // delta=0.01 < MIN_DELTA=0.02 → not effective
+        }
+
+        let solid_edges = g.solid_edges_by_impact();
+        let contactsd_solid = solid_edges
+            .iter()
+            .any(|e| e.cause.contains("contactsd") && e.effect == "pressure_drop");
+        assert!(
+            !contactsd_solid,
+            "Ineffective action should not produce solid causal edge for pressure_drop. \
+             edge confidence: {:?}",
+            g.get_edge("throttle:contactsd", "pressure_drop")
+                .map(|e| e.confidence)
+        );
+
+        // The action should have produced a solid edge for pressure_no_change instead
+        // (this validates the anti-edge correctly learns the right outcome)
+        let no_change_edge = g.get_edge("throttle:contactsd", "pressure_no_change");
+        assert!(
+            no_change_edge.is_some(),
+            "Repeated ineffective actions should register a pressure_no_change edge"
+        );
+        if let Some(edge) = no_change_edge {
+            assert!(
+                edge.confidence > 0.5,
+                "pressure_no_change edge should be confident after repeated ineffective actions, \
+                 got {}",
+                edge.confidence
+            );
+        }
+    }
+
     // ── Impact map test ─────────────────────────────────────────────────
 
     #[test]
