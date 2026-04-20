@@ -88,6 +88,7 @@ pub mod rosetta_monitor;
 pub mod rule_inducer;
 pub mod safety;
 pub mod self_reward;
+pub mod signal_health;
 pub mod signal_intelligence;
 pub mod silicon_probe;
 pub mod sleep_notifier;

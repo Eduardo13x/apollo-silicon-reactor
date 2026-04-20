@@ -27,6 +27,7 @@ use crate::engine::kalman::{Kalman1D, KalmanMV8};
 use crate::engine::learned_state::LearnableParams;
 use crate::engine::lotka_volterra::{CompetitionState, StabilityRegime};
 use crate::engine::mpc_horizon::{MpcController, MpcPersisted};
+use crate::engine::signal_health::SignalHealthMonitor;
 
 /// Resumen compacto de las señales procesadas. Todo normalizado 0–1 o con signo.
 #[derive(Debug, Clone)]
@@ -189,6 +190,12 @@ pub struct SignalIntelligence {
     /// Timestamp of the last recorded OOM/overflow event.
     /// Used to compute real inter-event intervals instead of hardcoded 1.0.
     last_oom_instant: Option<std::time::Instant>,
+
+    /// Numerical health monitor for KalmanMV8/CUSUM filter outputs.
+    /// Counts NaN/Inf/subnormal values detected in the signal pipeline.
+    /// A rising count in production signals filter divergence before it
+    /// corrupts downstream decisions. [Goldberg 1991]
+    pub signal_health: SignalHealthMonitor,
 }
 
 impl Default for SignalIntelligence {
@@ -249,6 +256,7 @@ impl SignalIntelligence {
             oom_event_buffer: Vec::new(),
             last_oom_instant: None,
             kf_mv: KalmanMV8::new(),
+            signal_health: SignalHealthMonitor::new(),
         }
     }
 
@@ -907,6 +915,16 @@ impl SignalIntelligence {
     pub fn tick_mv(&mut self, z: &[f64; 8], dt: f64) {
         self.kf_mv.predict(dt);
         self.kf_mv.update(z);
+        // Check fused state for NaN/Inf/subnormal after update.
+        // Matrix inversions in update() can produce subnormals under near-singular covariance.
+        // [Goldberg 1991] — subnormals silently corrupt downstream comparisons.
+        self.signal_health.check_slice(self.kf_mv.state());
+    }
+
+    /// Total NaN/Inf/subnormal violations detected in the signal pipeline since startup.
+    /// Rising count indicates filter divergence. [Goldberg 1991]
+    pub fn signal_health_violations(&self) -> u64 {
+        self.signal_health.violations_total
     }
 
     /// Multivariate-fused memory pressure estimate. Clamped [0,1].
