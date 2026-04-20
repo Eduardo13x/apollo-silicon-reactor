@@ -19,6 +19,7 @@ use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
 use apollo_optimizer::engine::proc_taskinfo;
 use apollo_optimizer::engine::process_classifier::{ProcessSnapshot, ProcessTier};
 use apollo_optimizer::engine::process_tree::ProcessTree;
+use apollo_optimizer::engine::safety::is_protected_name;
 use apollo_optimizer::engine::types::{InteractiveContext, RootAction, SafetyPolicy};
 use apollo_optimizer::engine::zombie_hunter::HuntSnapshot;
 use sysinfo::ProcessStatus;
@@ -357,21 +358,24 @@ pub fn convert_and_merge_heuristic_decisions(
             continue;
         }
 
-        // Complete Mediation guard: apply the same interactive-app name check that
-        // decide_actions uses, so Freeze/Kill decisions from the AdaptiveGovernor
-        // never bypass it. Production data (2026-04-06): "Antigravity Helper (Renderer)"
-        // frozen 1x, "Notion"/"Notion Helper (Renderer)" frozen 7x — both contain a
-        // known interactive app name but their PIDs were absent from critical_pids
-        // because classify_protection yields ConditionalForeground for helper subprocesses
-        // (only the exact foreground PID is inserted, not the parent's helpers).
-        // [Saltzer & Kaashoek 2009] "Principles of Computer System Design" §3.3
-        // Complete Mediation — every access path must go through the same gate.
-        // Extend to ALL action types (Freeze, Kill, AND Throttle) for interactive
-        // app names. Production data: "Brave Helper (Renderer)" with AppHelper tier
-        // can receive GovernorDecision::Throttle — throttling a renderer subprocess
-        // degrades the parent browser's frame rate just as much as freezing it.
-        // [Saltzer & Kaashoek 2009] Complete Mediation — same gate for all paths.
-        if is_interactive_app_name(&decision.name) {
+        // Complete Mediation guard — [Saltzer & Kaashoek 2009] §3.3: every path to a
+        // privileged action must pass through the same access control point.
+        //
+        // Two-layer check (both must pass before an action is emitted):
+        //
+        // Layer 1 — is_protected_name(): single truth point for name-based protection.
+        //   Covers OS essentials (protected_processes), infrastructure (docker/postgres),
+        //   and dev runtimes (rustc/clippy-driver). Hot-path safe via OnceLock caches.
+        //   Closes bypass class 1 (sharingd/logd loop): OS daemons not in INTERACTIVE_APPS
+        //   were previously missed by the interactive-only check below.
+        //
+        // Layer 2 — is_interactive_app_name(): user-facing apps (Brave, Claude, Arc…).
+        //   Covers Electron/WebKit helpers via substring match, closing bypass class 2
+        //   (Notion Helper/Antigravity frozen 7x — not in OS list but in INTERACTIVE_APPS).
+        //
+        // Applies to ALL action types (Freeze, Kill, Throttle) — bypass class 3 was
+        // that the original guard covered Freeze/Kill but not Throttle for renderer helpers.
+        if is_protected_name(&decision.name) || is_interactive_app_name(&decision.name) {
             continue;
         }
 

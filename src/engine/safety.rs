@@ -196,6 +196,63 @@ fn is_hard_protected(name: &str) -> bool {
     CACHE.get_or_init(protected_processes).contains(name)
 }
 
+/// Fast membership test against the infrastructure-protected set (hot-path safe).
+/// Uses `OnceLock` to initialise once and share across all subsequent calls.
+/// Infrastructure set uses substring matching (consistent with `classify_protection`
+/// Sites B–E) — catches bundled executables like `com.docker.backend`.
+fn is_infra_protected(name: &str) -> bool {
+    static CACHE: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    CACHE
+        .get_or_init(infrastructure_processes)
+        .iter()
+        .any(|p| name.contains(p))
+}
+
+/// Single truth point for name-based process protection.
+///
+/// Returns `true` if the process should NEVER receive a Freeze, Throttle, or Kill
+/// action, regardless of memory pressure or optimization decisions.
+///
+/// This is the [Saltzer & Kaashoek 2009] §3.3 Complete Mediation guard — every
+/// code path that emits a potentially harmful action (freeze_gate, thermal_interrupt,
+/// process_enrichment, decide_actions) can call this one function and be guaranteed
+/// complete coverage across all protection tiers.
+///
+/// **Tiers checked (in order):**
+/// 1. OS/system essentials via `protected_processes()` — kernel, WindowServer, Dock, etc.
+///    Hard-protected: unconditional, no exceptions. Uses exact name match.
+/// 2. Infrastructure services via `infrastructure_processes()` — Docker, Postgres, Redis.
+///    Uses substring match to catch bundled executables (`com.docker.backend`).
+/// 3. Dev runtime patterns via `matches_dev_runtime()` — rustc, clippy-driver, node, etc.
+///    Word-boundary aware to avoid false positives (e.g. "go" vs "mongod").
+///
+/// **NOT included:** behavioral/interactive app checks (e.g. "Brave Browser" with GUI).
+/// Those are context-dependent (foreground vs background) and handled by
+/// `is_user_interactive_app()` + `classify_protection()` at callsites that have
+/// runtime behavioral data.
+///
+/// # Performance
+/// Hot-path safe: all three checks use `OnceLock` caches or static slices.
+/// No allocations on repeated calls.
+///
+/// # When to use this vs `classify_protection()`
+/// - Use `is_protected_name()` when you only have a name and need a fast boolean skip
+///   (e.g., before building action lists, in filter loops).
+/// - Use `classify_protection()` when you have full runtime context and need to
+///   distinguish `Unconditional` vs `ConditionalForeground` vs `Unprotected`.
+pub fn is_protected_name(name: &str) -> bool {
+    // Tier 1: OS/system essentials — exact match (fast OnceLock path).
+    if is_hard_protected(name) {
+        return true;
+    }
+    // Tier 2: Infrastructure services — substring match (docker, postgres, redis…).
+    if is_infra_protected(name) {
+        return true;
+    }
+    // Tier 3: Dev runtime patterns — word-boundary aware (rustc, clippy-driver, node…).
+    matches_dev_runtime(name)
+}
+
 /// Returns true if a process should be treated as a user-interactive app
 /// — i.e. protection is foreground-conditional rather than unconditional.
 ///
@@ -1316,5 +1373,115 @@ mod tests {
         }
         // Negative check.
         assert!(!is_hard_protected("random_process_xyz"));
+    }
+
+    // ── is_protected_name() — Single Truth Point tests ──────────────────────
+    //
+    // These tests prove that is_protected_name() closes the three known bypass
+    // classes identified in the 360° Muscle Map:
+    //
+    //   Bypass class 1 (sharingd loop): OS daemons not in INTERACTIVE_APPS
+    //     were missed by callers that only called is_interactive_app_name().
+    //     is_protected_name() covers Tier 1 (OS essentials) unconditionally.
+    //
+    //   Bypass class 2 (Notion/Antigravity): Callers checked critical_pids
+    //     (PID-based) but not process names for ConditionalForeground helpers.
+    //     is_protected_name() + classify_protection() together close this.
+    //
+    //   Bypass class 3 (clippy-driver/rustc): Compiler toolchain missed because
+    //     the freeze guard only checked INTERACTIVE_APPS names, not dev_runtime
+    //     patterns. is_protected_name() covers Tier 3 (dev_runtime) explicitly.
+
+    /// Tier 1: OS/system essentials must all be protected.
+    #[test]
+    fn is_protected_name_covers_os_essentials() {
+        // Representative sample — exact names from protected_processes().
+        for name in &[
+            "kernel_task",
+            "launchd",
+            "WindowServer",
+            "Dock",
+            "sharingd",    // Bug 6: frozen 173× via gate_c (missed protected_processes)
+            "logd",        // watchdog-adjacent — SIGSTOP triggers kernel panic
+            "watchdogd",
+            "coreaudiod",
+            "mDNSResponder",
+            "airportd",
+            "bluetoothd",
+        ] {
+            assert!(
+                is_protected_name(name),
+                "is_protected_name('{}') must return true — OS essential",
+                name
+            );
+        }
+    }
+
+    /// Tier 2: Infrastructure services must be protected via substring match.
+    #[test]
+    fn is_protected_name_covers_infrastructure() {
+        // Exact names from infrastructure_processes().
+        assert!(is_protected_name("postgres"), "postgres must be protected");
+        assert!(is_protected_name("redis-server"), "redis-server must be protected");
+        assert!(is_protected_name("docker"), "docker must be protected");
+        // Bundled variant — substring match catches this.
+        assert!(
+            is_protected_name("com.docker.backend"),
+            "com.docker.backend must be protected via substring match on 'docker'"
+        );
+    }
+
+    /// Tier 3: Dev runtime patterns must be protected (compiler toolchain bypass fix).
+    #[test]
+    fn is_protected_name_covers_dev_runtimes() {
+        // Bug 3 / Bypass class 3: rustc and clippy-driver were frozen because the
+        // freeze guard only checked INTERACTIVE_APPS, not dev_runtime_patterns.
+        assert!(is_protected_name("rustc"), "rustc must be protected — compiler toolchain");
+        assert!(
+            is_protected_name("clippy-driver"),
+            "clippy-driver must be protected — 7 freezes during builds in prod"
+        );
+        assert!(is_protected_name("node"), "node must be protected");
+        assert!(is_protected_name("python3.13"), "python3.13 must be protected via substring");
+    }
+
+    /// Negative cases: non-protected apps must NOT be blocked.
+    #[test]
+    fn is_protected_name_does_not_over_protect() {
+        // User apps that are NOT in the protection tiers — they're
+        // ConditionalForeground (behavioral), not Unconditional.
+        // is_protected_name() correctly returns false for these;
+        // the caller then uses classify_protection() for full nuance.
+        assert!(
+            !is_protected_name("Safari"),
+            "Safari is ConditionalForeground (behavioral), not hard-protected"
+        );
+        assert!(
+            !is_protected_name("Spotify"),
+            "Spotify is ConditionalForeground, not hard-protected"
+        );
+        assert!(
+            !is_protected_name("com.example.random-daemon"),
+            "Unknown process must not be over-protected"
+        );
+        // Word-boundary: "go" must not match "google-chrome" or "Cargo".
+        // Note: "mongod" IS in infrastructure_processes() (MongoDB daemon) so it
+        // correctly returns true — the word-boundary test for "go" is separate
+        // (see go_does_not_match_substrings test for matches_dev_runtime).
+        assert!(!is_protected_name("google-chrome"), "google-chrome must NOT match 'go'");
+        assert!(!is_protected_name("Cargo"), "Cargo must NOT match 'go'");
+    }
+
+    /// Self-protection: Apollo's own binaries must be protected (prevent self-freeze).
+    #[test]
+    fn is_protected_name_covers_apollo_self() {
+        assert!(
+            is_protected_name("apollo-optimizerd"),
+            "apollo-optimizerd must be self-protected"
+        );
+        assert!(
+            is_protected_name("apollo-optimizerctl"),
+            "apollo-optimizerctl must be self-protected"
+        );
     }
 }
