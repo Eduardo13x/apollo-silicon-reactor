@@ -2043,6 +2043,241 @@ mod tests {
         );
     }
 
+    // ── AIS Golden Dataset [Jain 1991 §3] ────────────────────────────────────
+
+    /// Helper: build an AisInput representing a healthy, well-tuned system.
+    fn golden_healthy_input() -> AisInput {
+        AisInput {
+            // D1: all process classes handled correctly
+            total_decisions: 1000,
+            correct_decisions: 980,
+            protected_preserved: 50,
+            protected_total: 50,   // 100% protected recall
+            noise_throttled: 80,
+            noise_total: 80,       // 100% noise precision
+            interactive_boosted: 30,
+            interactive_total: 30, // 100% interactive recall
+
+            // D2: good signal quality — low Kalman RMSE, good CUSUM, calibrated hazard
+            kalman_rmse: 0.04,
+            cusum_true_positives: 10,
+            cusum_false_positives: 0,
+            cusum_actual_shifts: 10,
+            hazard_calibration_error: 0.02,
+            entropy_tpr: 0.90,
+
+            // D3: good learning — converged RL, solid causal edges, reliable skills
+            rl_q_variance: 50.0,
+            rl_convergence_ticks: 200,
+            rl_max_ticks: 500,
+            rl_total_ticks: 600, // past convergence → rl_speed = 1.0
+            causal_solid_edges: 8,
+            causal_weak_edges: 2,
+            causal_total_edges: 10,
+            reliable_skills: 4,
+            total_skills: 5,
+            experience_records: 50,
+            dyna_transitions: 200,
+
+            // D4: efficient resource use — fast cycles, good budget
+            p95_cycle_ms: 60.0,
+            target_cycle_ms: 100.0,
+            subsystem_skips: 40,
+            subsystem_evals: 100, // 40% skip rate (optimal band)
+            habituation_skips: 25,
+            process_evals: 100,
+            current_pressure: 0.25, // low pressure (skip-rate scoring applies)
+
+            // D5: clean safety record
+            kills_applied: 0,
+            survival_activations: 0,
+            overflow_events_7d: 0,
+            failures: 0,
+            frozen_critical: 0,
+
+            // D6: good adaptability
+            correct_profile_switches: 5,
+            total_profile_switches: 5,
+            correct_workload_class: 10,
+            total_workload_class: 10,
+            regime_shifts_detected: 4,
+            regime_shifts_total: 4,
+
+            hardware_cores: 8,
+            hardware_memory_gb: 8,
+            kalman_riccati_rmse: 0.0, // simulation mode
+        }
+    }
+
+    #[test]
+    fn ais_golden_dataset_healthy_system() {
+        // Golden dataset: known "healthy" state should score 80-100.
+        // Healthy = low Kalman RMSE, perfect protected recall, converged RL,
+        // no safety violations, good adaptability.
+        // [Jain 1991 §3] — performance metrics must correlate with observed behavior.
+        let input = golden_healthy_input();
+        let score = compute_ais(&input);
+        assert!(
+            score.total >= 80.0 && score.total <= 100.0,
+            "Healthy system should score 80-100, got {:.1}. \
+             D1={:.2} D2={:.2} D3={:.2} D4={:.2} D5={:.2} D6={:.2}",
+            score.total,
+            score.decision_precision,
+            score.signal_quality,
+            score.learning_velocity,
+            score.resource_efficiency,
+            score.safety_compliance,
+            score.adaptability
+        );
+    }
+
+    #[test]
+    fn ais_golden_dataset_memory_crisis() {
+        // Known crisis state (high pressure, poor signal, safety events) should score 30-70.
+        // [Jain 1991 §3] — scores must discriminate between operating conditions.
+        let input = AisInput {
+            // D1: poor — many throttles reverted, poor class handling
+            total_decisions: 500,
+            correct_decisions: 200,
+            protected_preserved: 20,
+            protected_total: 50,   // 40% protected recall (many missed)
+            noise_throttled: 30,
+            noise_total: 100,      // 30% noise precision (many reverted)
+            interactive_boosted: 5,
+            interactive_total: 30, // low interactive recall
+
+            // D2: poor signal — high Kalman error, many CUSUM false positives
+            kalman_rmse: 0.25,
+            cusum_true_positives: 3,
+            cusum_false_positives: 8,
+            cusum_actual_shifts: 10,
+            hazard_calibration_error: 0.40,
+            entropy_tpr: 0.30,
+
+            // D3: poor learning — unconverged RL, few solid edges
+            rl_q_variance: 5.0, // low variance = unconverged
+            rl_convergence_ticks: 450,
+            rl_max_ticks: 500,
+            rl_total_ticks: 0, // simulation mode
+            causal_solid_edges: 1,
+            causal_weak_edges: 1,
+            causal_total_edges: 8, // most edges still ambiguous
+            reliable_skills: 0,
+            total_skills: 3,
+            experience_records: 5,
+            dyna_transitions: 0,
+
+            // D4: poor efficiency — slow cycles, poor budget
+            p95_cycle_ms: 200.0,
+            target_cycle_ms: 100.0,
+            subsystem_skips: 0,
+            subsystem_evals: 50,
+            habituation_skips: 0,
+            process_evals: 100,
+            current_pressure: 0.85, // high pressure — budget_score=1.0 (correct to run all)
+
+            // D5: safety incidents
+            kills_applied: 2,
+            survival_activations: 1,
+            overflow_events_7d: 40,
+            failures: 3,
+            frozen_critical: 0, // critical freeze = instant 0, keep it 0 for range test
+
+            // D6: poor adaptability
+            correct_profile_switches: 2,
+            total_profile_switches: 10,
+            correct_workload_class: 3,
+            total_workload_class: 10,
+            regime_shifts_detected: 1,
+            regime_shifts_total: 8,
+
+            hardware_cores: 8,
+            hardware_memory_gb: 8,
+            kalman_riccati_rmse: 0.0,
+        };
+        let score = compute_ais(&input);
+        assert!(
+            score.total >= 20.0 && score.total <= 70.0,
+            "Memory crisis should score 20-70, got {:.1}. \
+             D1={:.2} D2={:.2} D3={:.2} D4={:.2} D5={:.2} D6={:.2}",
+            score.total,
+            score.decision_precision,
+            score.signal_quality,
+            score.learning_velocity,
+            score.resource_efficiency,
+            score.safety_compliance,
+            score.adaptability
+        );
+    }
+
+    #[test]
+    fn ais_golden_dataset_not_vacuous_empty_state() {
+        // Historical bug: protected_rate=1.0 when no protected processes → perfect D1 score.
+        // Empty state (no processes, no decisions, no learning) should NOT produce
+        // a near-perfect score — a system that has done nothing is not intelligent.
+        // [Jain 1991 §3] — vacuous truth must not inflate scores.
+        //
+        // D1: protected_total=0 → protected_rate=1.0 (vacuous — fixed in code via
+        //     the "empty set" comment in decision_precision()).
+        // D2: zero CUSUM/hazard data → fallback to 0.5 neutral.
+        // D3: no learning at all → near 0.
+        // D4: no cycle data → 0 (habituation_skips and process_evals = 0).
+        // D5: no events → perfect safety (0.30+0.25+0.20+0.25=1.0 — this is correct:
+        //     a daemon that just started and hasn't crashed IS safe).
+        // D6: no switches → safe_ratio_u32(0,0) = 0.5 each → 0.5.
+        //
+        // The vacuously-perfect score would be if ALL dimensions were 1.0.
+        // The contract is simply: empty state < 95 (not near-perfect).
+        let input = AisInput::default();
+        let score = compute_ais(&input);
+        assert!(
+            score.total < 95.0,
+            "Empty state should not produce near-perfect AIS score, got {:.1} (vacuous truth bug). \
+             D1={:.2} D2={:.2} D3={:.2} D4={:.2} D5={:.2} D6={:.2}",
+            score.total,
+            score.decision_precision,
+            score.signal_quality,
+            score.learning_velocity,
+            score.resource_efficiency,
+            score.safety_compliance,
+            score.adaptability
+        );
+    }
+
+    #[test]
+    fn ais_golden_dataset_healthy_beats_crisis() {
+        // Meta-contract: the healthy golden input must outscore the crisis input.
+        // If this fails, the scoring formula does not discriminate operating conditions.
+        // [Jain 1991] — score ordering must match operational reality.
+        let healthy = compute_ais(&golden_healthy_input());
+        let crisis = compute_ais(&AisInput {
+            kills_applied: 2,
+            survival_activations: 1,
+            overflow_events_7d: 40,
+            failures: 3,
+            frozen_critical: 0,
+            protected_preserved: 20,
+            protected_total: 50,
+            noise_throttled: 30,
+            noise_total: 100,
+            kalman_rmse: 0.25,
+            hazard_calibration_error: 0.40,
+            entropy_tpr: 0.30,
+            causal_solid_edges: 1,
+            causal_weak_edges: 1,
+            causal_total_edges: 8,
+            p95_cycle_ms: 200.0,
+            current_pressure: 0.85,
+            ..Default::default()
+        });
+        assert!(
+            healthy.total > crisis.total,
+            "Healthy ({:.1}) must outscore crisis ({:.1})",
+            healthy.total,
+            crisis.total
+        );
+    }
+
     /// D2 signal_quality: Riccati dynamic threshold takes precedence over fixed threshold.
     #[test]
     fn test_kalman_riccati_overrides_fixed_threshold() {
