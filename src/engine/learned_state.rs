@@ -468,8 +468,56 @@ pub struct LearnedState {
     pub unfreeze_decay_tau: Option<HashMap<String, TauEstimate>>,
 }
 
+/// Current schema version for [`LearnedState`].
+///
+/// Bump this constant whenever a structural change is made to `LearnedState`
+/// that cannot be handled by `#[serde(default)]` alone (e.g., a field whose
+/// absence must trigger a data-shape migration, not just a default value).
+/// The migration logic lives in [`try_migrate`].
+///
+/// Version history:
+/// - 0: implicit (files written before versioning was added — no `version` key)
+/// - 1: first versioned baseline; no structural changes from v0
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
 fn default_version() -> u32 {
-    1
+    // Files that pre-date schema versioning have no `version` key.
+    // Deserializing them yields 0, so `try_migrate` can handle the upgrade path.
+    0
+}
+
+/// Migrate a [`LearnedState`] from `schema_version` up to [`CURRENT_SCHEMA_VERSION`].
+///
+/// This is a pure function: it never performs I/O and never panics.
+/// Each `match` arm must leave `state.version` set to the version it produces.
+///
+/// # Adding a new migration
+/// 1. Bump `CURRENT_SCHEMA_VERSION`.
+/// 2. Add a `match` arm for the old version that transforms `state` and sets
+///    `state.version` to the new version, then `continue`s the loop.
+///
+/// [Gray & Reuter 1992 §11] — write-ahead versioning prevents crash-recovery
+/// from reading structurally-stale data.
+pub fn try_migrate(schema_version: u32, mut state: LearnedState) -> LearnedState {
+    let mut v = schema_version;
+    loop {
+        match v {
+            // v0 → v1: first versioned baseline; no structural changes needed —
+            // all fields already carry `#[serde(default)]`. Just stamp the version.
+            0 => {
+                state.version = 1;
+                v = 1;
+            }
+            // Up to date — nothing left to migrate.
+            _ if v >= CURRENT_SCHEMA_VERSION => {
+                state.version = CURRENT_SCHEMA_VERSION;
+                return state;
+            }
+            // Unknown future version loaded by an older binary. Keep as-is so
+            // we do not destroy data the older binary cannot understand.
+            _ => return state,
+        }
+    }
 }
 
 // ── Self-improvement constants ──────────────────────────────────────────────
@@ -502,7 +550,7 @@ impl LearnedState {
         nested_learner: Option<NestedLearner>,
     ) -> Self {
         Self {
-            version: 1,
+            version: CURRENT_SCHEMA_VERSION,
             signal_intelligence: Some(signal_intel.to_persisted()),
             outcome_tracker: Some(outcome_tracker.to_persisted()),
             specialist_accuracy: Some(specialist_accuracy.clone()),
@@ -844,9 +892,13 @@ impl LearnedState {
     }
 
     /// Load from disk. Returns None on any error (cold start is safe).
+    ///
+    /// Automatically runs [`try_migrate`] so callers always receive a struct
+    /// at [`CURRENT_SCHEMA_VERSION`], regardless of how old the on-disk file is.
     pub fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&data).ok()
+        let state: Self = serde_json::from_str(&data).ok()?;
+        Some(try_migrate(state.version, state))
     }
 }
 
@@ -1631,5 +1683,48 @@ mod tests {
         let state: LearnedState = serde_json::from_str(old_json)
             .expect("missing teacher_consolidator must default to None");
         assert!(state.teacher_consolidator.is_none());
+    }
+
+    // ── Schema versioning tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_schema_version_default_is_zero() {
+        // JSON with no `version` key represents a pre-versioning file.
+        // `default_version()` must return 0 so `try_migrate` can upgrade it.
+        let state: LearnedState = serde_json::from_str("{}").expect("empty object must deserialize");
+        assert_eq!(
+            state.version, 0,
+            "missing version key must deserialize as 0 (pre-versioning baseline)"
+        );
+    }
+
+    #[test]
+    fn test_migrate_v0_to_current() {
+        // v0 → v1 is a no-op baseline: no structural changes, just stamps version.
+        let state = LearnedState {
+            version: 0,
+            signal_intelligence: None,
+            outcome_tracker: None,
+            specialist_accuracy: None,
+            persist_generations: 0,
+            last_restore_quality: None,
+            pending_trial_skill: None,
+            skill_registry: None,
+            overflow_guard_history: None,
+            frozen_pids: None,
+            effectiveness_tracker: None,
+            arousal_state: None,
+            causal_graph_edges: None,
+            process_baselines: None,
+            learnable_params: None,
+            nested_learner: None,
+            teacher_consolidator: None,
+            unfreeze_decay_tau: None,
+        };
+        let migrated = try_migrate(0, state);
+        assert_eq!(
+            migrated.version, CURRENT_SCHEMA_VERSION,
+            "try_migrate(0, _) must stamp version == CURRENT_SCHEMA_VERSION"
+        );
     }
 }
