@@ -12,8 +12,35 @@
 //! At baseline (all 0.5), derived parameters equal current hardcoded values.
 //! Cost: ~50ns per cycle, 0 allocations, 0 dependencies.
 
+use serde::{Deserialize, Serialize};
+
 /// Decay rate per tick. With tau=10, levels return to baseline in ~10 ticks.
 const DECAY: f64 = 0.10;
+
+/// Serializable snapshot of the four raw neurotransmitter levels and the
+/// low-pressure streak counter — everything needed to resume leaky integration
+/// across a daemon restart without cold-starting at baseline 0.5.
+///
+/// Derived parameters (`alpha_multiplier`, `dyna_steps`, `serotonin_shift`,
+/// `epsilon_bonus`) are NOT persisted: they are recomputed from the raw levels
+/// on the next `tick()` call and their in-flight values are safe to reconstruct.
+///
+/// [Schultz 1997] — reward prediction error signals require continuity;
+/// cold restarts erase the entire prediction history accumulated since startup.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NeuroState {
+    /// Dopamine level [0.0, 1.0]. DA → alpha_multiplier [0.5, 1.5].
+    pub dopamine: f64,
+    /// Noradrenaline level [0.0, 1.0]. NA → dyna_steps [4, 20].
+    pub noradrenaline: f64,
+    /// Serotonin level [0.0, 1.0]. 5-HT → serotonin_shift [-0.05, +0.05].
+    pub serotonin: f64,
+    /// Acetylcholine level [0.0, 1.0]. ACh → epsilon_bonus [0.0, 0.05].
+    pub acetylcholine: f64,
+    /// Consecutive cycles where pressure_smooth < 0.30.
+    /// Persisted so serotonin warm-start resumes the streak correctly.
+    pub low_pressure_streak: u32,
+}
 
 /// Input signals from Apollo's subsystems, collected each cycle.
 pub struct NeuroSignals {
@@ -159,6 +186,68 @@ impl ApolloNeuromodulator {
             self.serotonin,
             self.acetylcholine,
         )
+    }
+
+    /// Capture raw neurotransmitter levels for persistence.
+    ///
+    /// Derived parameters are omitted — they are recomputed from levels on the
+    /// next `tick()`. The `last_process_count` internal counter is not persisted
+    /// because it only affects ACh churn on the FIRST tick post-restore, a
+    /// single-cycle artefact that is safe to absorb.
+    pub fn snapshot(&self) -> NeuroState {
+        NeuroState {
+            dopamine: self.dopamine,
+            noradrenaline: self.noradrenaline,
+            serotonin: self.serotonin,
+            acetylcholine: self.acetylcholine,
+            low_pressure_streak: self.low_pressure_streak,
+        }
+    }
+
+    /// Restore neurotransmitter levels from a persisted snapshot.
+    ///
+    /// All values are clamped to their valid ranges before being applied so
+    /// corrupted or extreme disk state cannot destabilise the policy.  A NaN
+    /// or Inf in any field is silently replaced with the neutral baseline (0.5).
+    ///
+    /// # Safety
+    /// Even at extreme restored values (e.g. dopamine=1.0, noradrenaline=1.0)
+    /// the worst outcome is an elevated alpha_multiplier and more Dyna-Q steps
+    /// for the first few cycles.  The leaky integrator (τ≈10 ticks) returns
+    /// signals to their ambient equilibrium within ~30 cycles regardless of
+    /// starting point, bounding any transient distortion.
+    pub fn restore(&mut self, s: NeuroState) {
+        self.dopamine = if s.dopamine.is_finite() {
+            s.dopamine.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        self.noradrenaline = if s.noradrenaline.is_finite() {
+            s.noradrenaline.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        self.serotonin = if s.serotonin.is_finite() {
+            s.serotonin.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        self.acetylcholine = if s.acetylcholine.is_finite() {
+            s.acetylcholine.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        // Streak is bounded by how many ticks the daemon has been running; cap
+        // at 1000 to prevent an absurdly high persisted value from pinning
+        // serotonin at its ceiling until the streak naturally decays.
+        self.low_pressure_streak = s.low_pressure_streak.min(1000);
+        // Recompute derived parameters immediately from restored raw levels so
+        // the first read of alpha_multiplier / dyna_steps / etc. is correct
+        // even before the next tick() call.
+        self.alpha_multiplier = 0.5 + self.dopamine;
+        self.dyna_steps = (4.0 + self.noradrenaline * 16.0).round() as usize;
+        self.serotonin_shift = (self.serotonin - 0.5) * 0.10;
+        self.epsilon_bonus = self.acetylcholine * 0.05;
     }
 }
 
@@ -389,6 +478,242 @@ mod tests {
             nm_diverse.acetylcholine,
             nm_uniform.acetylcholine
         );
+    }
+
+    // ── Warm-start tests ────────────────────────────────────────────────
+
+    #[test]
+    fn neuro_warm_start_survives_roundtrip() {
+        // Tick neuromod to a non-neutral state by driving all signals hard.
+        let mut neuro = ApolloNeuromodulator::new();
+        let mut s = default_signals();
+        s.pressure_drop = 0.40;        // drives DA up
+        s.urgency = 0.90;              // NA urgency component
+        s.regime_shift_up = true;      // NA regime component (+0.30)
+        s.pressure_velocity = 0.50;    // NA velocity component
+        s.thermal_stress = 1.0;        // NA thermal component (+0.20)
+        s.pressure_smooth = 0.15;      // drives SE streak up (low pressure)
+        s.entropy_anomaly = 2.0;       // ACh novelty
+        s.rl_exploring = true;
+        for _ in 0..30 {
+            neuro.tick(&s);
+        }
+        // DA and NA should have drifted above 0.5 baseline under these inputs.
+        // (NA steady-state ≈ urgency*0.35 + regime*0.30 + velocity*0.30 + thermal*0.20 ≈ 1.0)
+        assert!(neuro.dopamine > 0.5, "DA should rise above baseline: {}", neuro.dopamine);
+        assert!(neuro.noradrenaline > 0.5, "NA should rise above baseline: {}", neuro.noradrenaline);
+
+        // Snapshot and restore into a fresh instance.
+        let snap = neuro.snapshot();
+        let mut neuro2 = ApolloNeuromodulator::new();
+        neuro2.restore(snap.clone());
+
+        // Raw levels must match exactly.
+        assert!((neuro2.dopamine - snap.dopamine).abs() < 1e-10,
+            "dopamine mismatch: {} vs {}", neuro2.dopamine, snap.dopamine);
+        assert!((neuro2.noradrenaline - snap.noradrenaline).abs() < 1e-10,
+            "noradrenaline mismatch: {} vs {}", neuro2.noradrenaline, snap.noradrenaline);
+        assert!((neuro2.serotonin - snap.serotonin).abs() < 1e-10,
+            "serotonin mismatch: {} vs {}", neuro2.serotonin, snap.serotonin);
+        assert!((neuro2.acetylcholine - snap.acetylcholine).abs() < 1e-10,
+            "acetylcholine mismatch: {} vs {}", neuro2.acetylcholine, snap.acetylcholine);
+
+        // Derived parameters are recomputed on restore — verify they match
+        // the source instance.
+        assert!((neuro2.alpha_multiplier - neuro.alpha_multiplier).abs() < 1e-10,
+            "alpha_multiplier mismatch after restore");
+        assert_eq!(neuro2.dyna_steps, neuro.dyna_steps,
+            "dyna_steps mismatch after restore");
+        assert!((neuro2.serotonin_shift - neuro.serotonin_shift).abs() < 1e-10,
+            "serotonin_shift mismatch after restore");
+        assert!((neuro2.epsilon_bonus - neuro.epsilon_bonus).abs() < 1e-10,
+            "epsilon_bonus mismatch after restore");
+    }
+
+    #[test]
+    fn neuro_restore_clamps_corrupted_state() {
+        let mut neuro = ApolloNeuromodulator::new();
+        // Corrupted disk state with out-of-range values.
+        neuro.restore(NeuroState {
+            dopamine: 999.0,      // way above [0.0, 1.0]
+            noradrenaline: -5.0,  // below [0.0, 1.0]
+            serotonin: f64::NAN,  // NaN → neutral baseline
+            acetylcholine: f64::INFINITY, // Inf → clamp
+            low_pressure_streak: u32::MAX, // cap to 1000
+        });
+        assert!(neuro.dopamine >= 0.0 && neuro.dopamine <= 1.0,
+            "dopamine out of range: {}", neuro.dopamine);
+        assert!(neuro.noradrenaline >= 0.0 && neuro.noradrenaline <= 1.0,
+            "noradrenaline out of range: {}", neuro.noradrenaline);
+        assert!(neuro.serotonin.is_finite() && neuro.serotonin >= 0.0 && neuro.serotonin <= 1.0,
+            "serotonin should be finite and clamped: {}", neuro.serotonin);
+        assert!(neuro.acetylcholine >= 0.0 && neuro.acetylcholine <= 1.0,
+            "acetylcholine out of range: {}", neuro.acetylcholine);
+        assert!(neuro.low_pressure_streak <= 1000,
+            "streak should be capped at 1000: {}", neuro.low_pressure_streak);
+        // Derived params must also be in their valid ranges.
+        assert!(neuro.alpha_multiplier >= 0.5 && neuro.alpha_multiplier <= 1.5,
+            "alpha_multiplier out of range: {}", neuro.alpha_multiplier);
+        assert!(neuro.dyna_steps >= 4 && neuro.dyna_steps <= 20,
+            "dyna_steps out of range: {}", neuro.dyna_steps);
+        assert!(neuro.serotonin_shift >= -0.05 && neuro.serotonin_shift <= 0.05,
+            "serotonin_shift out of range: {}", neuro.serotonin_shift);
+        assert!(neuro.epsilon_bonus >= 0.0 && neuro.epsilon_bonus <= 0.05,
+            "epsilon_bonus out of range: {}", neuro.epsilon_bonus);
+    }
+
+    #[test]
+    fn neuro_warm_start_serde_roundtrip() {
+        // The NeuroState must survive JSON serialization cleanly.
+        let original = NeuroState {
+            dopamine: 0.72,
+            noradrenaline: 0.61,
+            serotonin: 0.44,
+            acetylcholine: 0.55,
+            low_pressure_streak: 7,
+        };
+        let json = serde_json::to_string(&original).expect("serialize NeuroState");
+        let restored: NeuroState = serde_json::from_str(&json).expect("deserialize NeuroState");
+        assert!((restored.dopamine - original.dopamine).abs() < 1e-10);
+        assert!((restored.noradrenaline - original.noradrenaline).abs() < 1e-10);
+        assert!((restored.serotonin - original.serotonin).abs() < 1e-10);
+        assert!((restored.acetylcholine - original.acetylcholine).abs() < 1e-10);
+        assert_eq!(restored.low_pressure_streak, original.low_pressure_streak);
+    }
+
+    #[test]
+    fn neuro_default_snapshot_is_neutral() {
+        // A freshly constructed neuromodulator should snapshot at 0.5 baseline.
+        let neuro = ApolloNeuromodulator::new();
+        let snap = neuro.snapshot();
+        assert!((snap.dopamine - 0.5).abs() < 1e-10);
+        assert!((snap.noradrenaline - 0.5).abs() < 1e-10);
+        assert!((snap.serotonin - 0.5).abs() < 1e-10);
+        assert!((snap.acetylcholine - 0.5).abs() < 1e-10);
+        assert_eq!(snap.low_pressure_streak, 0);
+    }
+
+    #[test]
+    fn neuro_restore_recomputes_derived_immediately() {
+        // After restore(), derived params must be correct without a tick().
+        let mut neuro = ApolloNeuromodulator::new();
+        neuro.restore(NeuroState {
+            dopamine: 1.0,
+            noradrenaline: 1.0,
+            serotonin: 1.0,
+            acetylcholine: 1.0,
+            low_pressure_streak: 0,
+        });
+        assert!((neuro.alpha_multiplier - 1.5).abs() < 1e-10,
+            "alpha_multiplier should be 1.5 when dopamine=1.0, got {}", neuro.alpha_multiplier);
+        assert_eq!(neuro.dyna_steps, 20,
+            "dyna_steps should be 20 when noradrenaline=1.0, got {}", neuro.dyna_steps);
+        assert!((neuro.serotonin_shift - 0.05).abs() < 1e-10,
+            "serotonin_shift should be 0.05 when serotonin=1.0, got {}", neuro.serotonin_shift);
+        assert!((neuro.epsilon_bonus - 0.05).abs() < 1e-10,
+            "epsilon_bonus should be 0.05 when acetylcholine=1.0, got {}", neuro.epsilon_bonus);
+    }
+
+    #[test]
+    fn neuro_restore_then_tick_is_stable() {
+        // Restoring at non-neutral values should not cause divergence — the
+        // leaky integrator damps back to ambient equilibrium within 50 ticks.
+        let mut neuro = ApolloNeuromodulator::new();
+        neuro.restore(NeuroState {
+            dopamine: 1.0,
+            noradrenaline: 1.0,
+            serotonin: 0.0,
+            acetylcholine: 0.0,
+            low_pressure_streak: 0,
+        });
+        let mut s = default_signals(); // neutral inputs
+        s.urgency = 0.2;
+        for _ in 0..50 {
+            neuro.tick(&s);
+        }
+        // After 50 ticks under neutral pressure, extreme values should have decayed.
+        // Not asserting specific values — just that nothing is NaN or out of [0,1].
+        let (da, na, se, ach) = neuro.levels();
+        assert!(da.is_finite() && (0.0..=1.0).contains(&da), "dopamine not in range: {}", da);
+        assert!(na.is_finite() && (0.0..=1.0).contains(&na), "noradrenaline not in range: {}", na);
+        assert!(se.is_finite() && (0.0..=1.0).contains(&se), "serotonin not in range: {}", se);
+        assert!(ach.is_finite() && (0.0..=1.0).contains(&ach), "acetylcholine not in range: {}", ach);
+    }
+
+    #[test]
+    fn neuro_warm_start_better_than_cold_start() {
+        // A warm-started neuromod should be closer to the steady-state of a
+        // continuously-running neuromod than a cold-started one, measured after
+        // a further 5 ticks.  This verifies the entire warm-start value proposition.
+        let mut reference = ApolloNeuromodulator::new();
+        let mut s = default_signals();
+        s.pressure_drop = 0.30;
+        s.urgency = 0.70;
+        for _ in 0..30 {
+            reference.tick(&s);
+        }
+        let steady_state_da = reference.dopamine;
+
+        // Cold start.
+        let mut cold = ApolloNeuromodulator::new();
+        for _ in 0..5 {
+            cold.tick(&s);
+        }
+
+        // Warm start from reference snapshot.
+        let snap = reference.snapshot();
+        let mut warm = ApolloNeuromodulator::new();
+        warm.restore(snap);
+        for _ in 0..5 {
+            warm.tick(&s);
+        }
+
+        let cold_err = (cold.dopamine - steady_state_da).abs();
+        let warm_err = (warm.dopamine - steady_state_da).abs();
+        assert!(warm_err < cold_err,
+            "warm-start (err={:.4}) should be closer to steady-state than cold-start (err={:.4})",
+            warm_err, cold_err);
+    }
+
+    #[test]
+    fn neuro_restore_streak_is_capped() {
+        let mut neuro = ApolloNeuromodulator::new();
+        neuro.restore(NeuroState {
+            low_pressure_streak: u32::MAX,
+            ..Default::default()
+        });
+        assert!(neuro.low_pressure_streak <= 1000,
+            "streak not capped: {}", neuro.low_pressure_streak);
+    }
+
+    #[test]
+    fn neuro_snapshot_restore_cold_is_neutral() {
+        // Default snapshot (all zeros from Default) restores to safe values.
+        let mut neuro = ApolloNeuromodulator::new();
+        neuro.restore(NeuroState::default());
+        // dopamine=0.0 → alpha_multiplier=0.5 (floor of range, not baseline but valid).
+        assert!(neuro.alpha_multiplier >= 0.5,
+            "alpha_multiplier below floor: {}", neuro.alpha_multiplier);
+        assert!(neuro.dyna_steps >= 4,
+            "dyna_steps below floor: {}", neuro.dyna_steps);
+    }
+
+    #[test]
+    fn neuro_restore_nan_in_one_field_uses_neutral() {
+        // If only one field is NaN, only that field falls back; others stay.
+        let mut neuro = ApolloNeuromodulator::new();
+        neuro.restore(NeuroState {
+            dopamine: f64::NAN, // NaN → 0.5
+            noradrenaline: 0.8,
+            serotonin: 0.3,
+            acetylcholine: 0.6,
+            low_pressure_streak: 5,
+        });
+        assert_eq!(neuro.dopamine, 0.5, "NaN dopamine should default to 0.5");
+        assert!((neuro.noradrenaline - 0.8).abs() < 1e-10, "noradrenaline should be preserved");
+        assert!((neuro.serotonin - 0.3).abs() < 1e-10, "serotonin should be preserved");
+        assert!((neuro.acetylcholine - 0.6).abs() < 1e-10, "acetylcholine should be preserved");
+        assert_eq!(neuro.low_pressure_streak, 5);
     }
 
     #[test]

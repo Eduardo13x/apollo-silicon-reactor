@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::engine::causal_graph::{CausalEdge, CausalGraph};
+use crate::engine::neuromodulator::NeuroState;
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
 use crate::engine::nars_belief::ArousalState;
 use crate::engine::nested_learner::NestedLearner;
@@ -466,6 +467,18 @@ pub struct LearnedState {
     /// [Strogatz 2015 §2.3 — learned time constants of linear relaxation]
     #[serde(default)]
     pub unfreeze_decay_tau: Option<HashMap<String, TauEstimate>>,
+
+    /// Neuromodulator raw signal levels — DA/ACh/NA/5-HT plus the
+    /// low-pressure streak counter.  Without this, every daemon restart
+    /// cold-starts at neutral (0.5) regardless of the system state before
+    /// shutdown, discarding all accumulated reward-prediction history.
+    ///
+    /// [Schultz 1997] — reward prediction error signals require continuity;
+    /// cold restarts erase the entire prediction history.
+    ///
+    /// `None` = first run or old file format → `ApolloNeuromodulator::new()` baseline.
+    #[serde(default)]
+    pub neuro_state: Option<NeuroState>,
 }
 
 /// Current schema version for [`LearnedState`].
@@ -568,6 +581,7 @@ impl LearnedState {
             nested_learner,
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
+            neuro_state: None,
         }
     }
 
@@ -884,6 +898,32 @@ impl LearnedState {
         state.persist(path);
     }
 
+    /// Patch only the `neuro_state` field of an existing persisted file.
+    ///
+    /// Same pattern as `patch_unfreeze_decay` — `persist_improved()` does not
+    /// thread `ApolloNeuromodulator` through its signature.  Callers invoke this
+    /// after `persist_improved()` to snapshot the four neurotransmitter levels so
+    /// DA/ACh/NA/5-HT state survives daemon restarts without cold-starting at 0.5.
+    ///
+    /// No-op if the file is missing (cold start is safe — neuromodulator
+    /// initialises at baseline on the first ever run).
+    ///
+    /// [Schultz 1997] — reward prediction error signals require continuity.
+    pub fn patch_neuro_state(path: &Path, ns: NeuroState) {
+        let Some(mut state) = Self::load(path) else {
+            return;
+        };
+        state.neuro_state = Some(ns);
+        state.persist(path);
+    }
+
+    /// Load only the `neuro_state` field from disk (cold-start safe).
+    /// Returns `None` if the file is missing, unreadable, malformed, or the
+    /// field is absent (old file format pre-dating NeuroState persistence).
+    pub fn load_neuro_state(path: &Path) -> Option<NeuroState> {
+        Self::load(path)?.neuro_state
+    }
+
     /// Load only the `teacher_consolidator` field from disk (cold-start safe).
     /// Returns `None` if the file is missing, unreadable, malformed, or the
     /// field is absent (old file format pre-dating GemmaTrust persistence).
@@ -1101,6 +1141,7 @@ mod tests {
             nested_learner: None,
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
+            neuro_state: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1131,6 +1172,7 @@ mod tests {
             nested_learner: None,
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
+            neuro_state: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1159,6 +1201,7 @@ mod tests {
             nested_learner: None,
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
+            neuro_state: None,
         };
         assert_eq!(
             state
@@ -1206,6 +1249,7 @@ mod tests {
             nested_learner: None,
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
+            neuro_state: None,
         };
         state.self_improve();
         assert_eq!(
@@ -1248,6 +1292,7 @@ mod tests {
             nested_learner: None,
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
+            neuro_state: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -1292,6 +1337,7 @@ mod tests {
             nested_learner: None,
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
+            neuro_state: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1631,6 +1677,7 @@ mod tests {
             nested_learner: None,
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
+            neuro_state: None,
         };
         seed.persist(&tmp);
 
@@ -1720,6 +1767,7 @@ mod tests {
             nested_learner: None,
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
+            neuro_state: None,
         };
         let migrated = try_migrate(0, state);
         assert_eq!(

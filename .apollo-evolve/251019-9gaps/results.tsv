@@ -8,3 +8,13 @@ iteration	commit	metric	delta	status	paper	opens	closes	note
 7	3fe3856	tests=1709	+3	KEEP	Hellerstein 2004 §9 (PID D-term)	0	1	Gap 7: D-term lowers overflow thresholds when pressure rising fast
 8	0302335	tests=1710	+1	KEEP	Hellerstein 2004 §9 (noise rejection)	0	1	Gap 8: OdeDivergenceResilient adversarial scenario (5th probe)
 9	a5ab9fe	tests=1716	+6	KEEP	Zhao 2009 (EMA), Hellerstein 2004	0	1	Gap 9: CyberPhysicalSignal trait unifies ODE normalization
+10	6635da0	tests=1726	+10	KEEP	Welch&Bishop 2006 (Kalman), Hellerstein 2004	0	3	KalmanMV8 8D filter + LinUCB blend + D-term gate (G10 consumers)
+11	11ea395	tests=1728	+2	KEEP	Denning 1968 §3 (ODE physics)	0	2	G17+G18: sticky-swap ODE probe + subnormal floor recovery probe
+12	0a1646d	tests=1728	+0	KEEP	Nygard 2018 §4.3 (bulkhead)	0	1	G21: thermal bulkhead wake_batch=1 under serious/critical thermal
+13	78d659f	tests=1728	+0	KEEP	Hellerstein 2004 §9 (derivative control)	0	1	G20: ODE velocity paging hints at net_rate>0.5 before pressure threshold
+14	af217c4	tests=1728	+0	KEEP	Hellerstein 2004 §9	0	2	G10+G12: AMX proactive reactor_weight boost + DRAM bandwidth backpressure
+15	110277f	tests=1728	+0	KEEP	Sutton&Barto 2018 §6.5 (TD error)	0	1	G15: RL complacency fix — Observe→overflow penalty
+16	d89fe8c	tests=1728	+0	KEEP	Kuncheva 2004 §5.2 (ensemble arbitration)	0	1	G13: epistemic arbiter — hazard 1.5x boost when ODE urgency>0.5
+17	7ed5118	tests=1728	+0	KEEP	Schultz 1997 (RPE)	0	1	G14: ODE surprise arousal — leading indicator boosts ArousalState
+18	979c2cb	tests=1728	+0	KEEP	Hasler&Mahowald 1994 (attentional gating)	1	1	G11: L2 contention ACh signal (KPC wire deferred)
+19	5d50414	tests=1728	+0	KEEP	Denning 1968 §3 (tau-based WSS)	0	1	G19: τ-informed freeze ranking — short-τ processes frozen first

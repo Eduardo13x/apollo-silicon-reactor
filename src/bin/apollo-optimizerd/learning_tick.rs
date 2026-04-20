@@ -753,6 +753,13 @@ pub fn run_learning_tick<'a>(
             Some(learnable_params.clone()),
             Some(nested_learner.clone()),
         );
+        // Patch neuromodulator warm-start state after the main persist so a crash
+        // mid-persist leaves the previous neurotransmitter snapshot intact.
+        // [Schultz 1997] — DA/ACh/NA/5-HT signals require continuity across restarts.
+        LearnedState::patch_neuro_state(
+            std::path::Path::new(ls_path),
+            lctx.neuromod.snapshot(),
+        );
         // Causal graph observability: log solid/weak links discovered.
         let solid = lctx.causal_graph.solid_count();
         let total = lctx.causal_graph.edge_count();

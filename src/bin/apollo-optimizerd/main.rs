@@ -1041,6 +1041,17 @@ fn main() -> anyhow::Result<()> {
                         "restored unfreeze-decay τ estimates from learned_state"
                     );
                 }
+                // Warm-start the neuromodulator from persisted signal levels.
+                // Without this, DA/ACh/NA/5-HT cold-start at 0.5 neutral on every
+                // restart, discarding accumulated reward-prediction history.
+                // [Schultz 1997] — continuity of prediction-error signals is critical.
+                if let Some(ns) = learned.neuro_state.clone() {
+                    neuromod.restore(ns);
+                    tracing::info!(
+                        target: "apollo.neuromodulator",
+                        "warm-started neuromodulator from learned_state"
+                    );
+                }
                 // apply() restores skills from learned_state.json if present,
                 // overwriting the legacy optimization_skills.json load above.
                 // If skill_registry field is absent (old file), the legacy load is kept.
@@ -6430,6 +6441,9 @@ fn main() -> anyhow::Result<()> {
             // Patch unfreeze-decay τ snapshot after the main persist so a crash
             // mid-persist leaves the previous learned-τ file intact.
             LearnedState::patch_unfreeze_decay(ls_path, unfreeze_decay.tau_snapshot());
+            // Persist neuromodulator signal levels so DA/ACh/NA/5-HT survive restart.
+            // [Schultz 1997] — reward prediction error signals require continuity.
+            LearnedState::patch_neuro_state(ls_path, neuromod.snapshot());
 
             // Revert sysctls to defaults on shutdown.
             {
