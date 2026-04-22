@@ -2567,6 +2567,13 @@ fn main() -> anyhow::Result<()> {
                 {
                     reactor_weight = (reactor_weight + 0.10).min(1.0);
                 }
+                // Lyapunov chaos: positive FTLE = exponential divergence in pressure trajectory.
+                // [Wolf et al. 1985 Physica D 16] λ > 0.5 at moderate pressure = regime change.
+                if signal_digest.lyapunov_exponent > 0.5
+                    && signal_digest.pressure_smooth > 0.40
+                {
+                    reactor_weight = (reactor_weight + 0.08).min(1.0);
+                }
                 // Darwin-Boltzmann anomaly: learned pattern deviation.
                 // Score > 0.5 means the system state deviates significantly from
                 // the Hopfield memory + SAE ensemble's learned "normal" manifold.

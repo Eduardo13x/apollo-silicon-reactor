@@ -105,6 +105,13 @@ pub struct SignalDigest {
     /// [Øksendal 2003 §3] diffusion term. High σ at low mean = "sticky swap"
     /// harbinger — wired from SaturationForecast after ODE tick.
     pub swap_net_rate_volatility: f64,
+
+    // ── Chaos / Lyapunov ─────────────────────────────────────────────
+    /// EMA-smoothed finite-time Lyapunov exponent (FTLE) of pressure trajectory.
+    /// [Wolf et al. 1985 Physica D 16] log-ratio of consecutive Δp values.
+    /// λ > 0 = exponential divergence (chaotic); λ < 0 = convergent (stable).
+    /// Near-zero = borderline; extreme positive = imminent regime change.
+    pub lyapunov_exponent: f64,
 }
 
 /// Orquestador de señales. Inicializar una vez en el daemon, llamar tick() cada ciclo.
@@ -202,6 +209,12 @@ pub struct SignalIntelligence {
     /// A rising count in production signals filter divergence before it
     /// corrupts downstream decisions. [Goldberg 1991]
     pub signal_health: SignalHealthMonitor,
+
+    // ── FTLE (Finite-Time Lyapunov Exponent) ─────────────────────────
+    /// Previous smoothed pressure Δ — needed for log-ratio computation.
+    lyapunov_prev_delta: f64,
+    /// EMA-smoothed FTLE. α=0.10 for stability.
+    lyapunov_ema: f64,
 }
 
 impl Default for SignalIntelligence {
@@ -263,6 +276,8 @@ impl SignalIntelligence {
             last_oom_instant: None,
             kf_mv: KalmanMV8::new(),
             signal_health: SignalHealthMonitor::new(),
+            lyapunov_prev_delta: 0.0,
+            lyapunov_ema: 0.0,
         }
     }
 
@@ -516,6 +531,23 @@ impl SignalIntelligence {
             entropy_anomaly,
         );
 
+        // ── 8. FTLE (Finite-Time Lyapunov Exponent) ──────────────────────
+        // [Wolf et al. 1985 Physica D 16] Online approximation: log|Δpₜ / Δpₜ₋₁|.
+        // EMA-smoothed with α=0.10 to suppress single-tick noise.
+        // Numerically safe: skip update when |Δpₜ₋₁| < ε.
+        let lyapunov_exponent = {
+            const FTLE_ALPHA: f64 = 0.10;
+            const FTLE_EPS: f64 = 1e-6;
+            let delta = pressure_velocity; // Kalman-smoothed Δp/s is already the velocity
+            if self.lyapunov_prev_delta.abs() > FTLE_EPS && delta.abs() > FTLE_EPS {
+                let ratio = (delta / self.lyapunov_prev_delta).abs();
+                let ftle = ratio.ln();
+                self.lyapunov_ema = FTLE_ALPHA * ftle + (1.0 - FTLE_ALPHA) * self.lyapunov_ema;
+            }
+            self.lyapunov_prev_delta = delta;
+            self.lyapunov_ema
+        };
+
         SignalDigest {
             pressure_smooth,
             pressure_velocity,
@@ -540,6 +572,7 @@ impl SignalIntelligence {
             app_launching: false,
             // ODE stochastic: wired from SaturationForecast after ODE tick.
             swap_net_rate_volatility: 0.0,
+            lyapunov_exponent,
         }
     }
 
@@ -1185,6 +1218,7 @@ mod tests {
             app_launching: false,
             stability_regime: StabilityRegime::Degenerate,
             swap_net_rate_volatility: 0.0,
+            lyapunov_exponent: 0.0,
         };
         for _ in 0..20 {
             digest = tick_nominal(&mut si);
@@ -1628,6 +1662,7 @@ mod tests {
             app_launching: false,
             stability_regime: StabilityRegime::Degenerate,
             swap_net_rate_volatility: 0.0,
+            lyapunov_exponent: 0.0,
         };
         for i in 0..20 {
             let pressure = 0.55 + i as f64 * 0.005;
@@ -1886,6 +1921,7 @@ mod tests {
             app_launching: false,
             stability_regime: StabilityRegime::Degenerate,
             swap_net_rate_volatility: 0.0,
+            lyapunov_exponent: 0.0,
         };
         for _ in 0..30 {
             last = si.tick(
@@ -2112,6 +2148,84 @@ mod tests {
             si.workload_zone_count() <= 8,
             "should cap at 8 entries, got {}",
             si.workload_zone_count()
+        );
+    }
+
+    // ── FTLE (Lyapunov exponent) tests ─────────────────────────────────────
+
+    #[test]
+    fn lyapunov_zero_on_stable_pressure() {
+        let mut si = SignalIntelligence::new();
+        // Constant pressure → velocity ≈ 0 every tick → prev_delta stays near 0 → FTLE skipped.
+        for _ in 0..20 {
+            tick_stressed(&mut si, 0.50);
+        }
+        let digest = tick_stressed(&mut si, 0.50);
+        // With stable signal, FTLE should remain near zero (no divergence).
+        assert!(
+            digest.lyapunov_exponent.abs() < 0.5,
+            "stable pressure FTLE={:.4} expected near 0",
+            digest.lyapunov_exponent
+        );
+    }
+
+    #[test]
+    fn lyapunov_positive_on_accelerating_pressure() {
+        let mut si = SignalIntelligence::new();
+        // Feed linearly accelerating pressure: Δp grows each tick → log(Δpₜ/Δpₜ₋₁) > 0.
+        let mut last = tick_nominal(&mut si);
+        for i in 1..=30 {
+            let pressure = 0.30 + (i as f64) * 0.02; // accelerating ramp
+            last = si.tick(
+                pressure, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app",
+                500_000_000, 2_000_000_000, 8_000_000_000, 0.5,
+            );
+        }
+        // Accelerating divergence → λ > 0.
+        assert!(
+            last.lyapunov_exponent > 0.0,
+            "accelerating pressure FTLE={:.4} should be positive",
+            last.lyapunov_exponent
+        );
+    }
+
+    #[test]
+    fn lyapunov_lower_during_deceleration_than_acceleration() {
+        // Accelerating instance.
+        let mut si_acc = SignalIntelligence::new();
+        let mut acc_digest = tick_nominal(&mut si_acc);
+        for i in 1..=30 {
+            let pressure = 0.30 + (i as f64) * 0.02;
+            acc_digest = si_acc.tick(
+                pressure, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app",
+                500_000_000, 2_000_000_000, 8_000_000_000, 0.5,
+            );
+        }
+
+        // Decelerating instance: large steps shrink to small steps.
+        let mut si_dec = SignalIntelligence::new();
+        // Ramp up fast then slow down.
+        for i in 0..10 {
+            si_dec.tick(
+                0.30 + (i as f64) * 0.05, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app",
+                500_000_000, 2_000_000_000, 8_000_000_000, 0.5,
+            );
+        }
+        let mut dec_digest = si_dec.tick(0.80, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app",
+                500_000_000, 2_000_000_000, 8_000_000_000, 0.5);
+        for i in 1..=20 {
+            // Shrinking steps → ratio < 1 → negative contribution.
+            let pressure = 0.80 + (1.0 / (i as f64 + 1.0)) * 0.10;
+            dec_digest = si_dec.tick(
+                pressure, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app",
+                500_000_000, 2_000_000_000, 8_000_000_000, 0.5,
+            );
+        }
+        assert!(
+            dec_digest.lyapunov_exponent < acc_digest.lyapunov_exponent,
+            "deceleration FTLE={:.4} should be < acceleration FTLE={:.4}",
+            dec_digest.lyapunov_exponent,
+            acc_digest.lyapunov_exponent
         );
     }
 }
