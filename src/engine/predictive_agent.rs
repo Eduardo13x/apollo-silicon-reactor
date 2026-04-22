@@ -27,7 +27,7 @@ use crate::engine::user_profile::WorkloadType;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const D: usize = 14; // feature dimensions (12 system + 2 ODE physics signals)
+const D: usize = 16; // feature dimensions (12 system + 2 ODE physics + 2 chaos/stress)
 const K: usize = 5; // number of arms
 const WARMUP_CYCLES: u32 = 200;
 const SEEDED_WARMUP_CYCLES: u32 = 50;
@@ -370,6 +370,12 @@ impl AgentContext {
         // ODE net compressor accumulation rate, normalised to [0,1] at 200 MB/s.
         // Provides the velocity the swap ODE sees. [Hellerstein 2004]
         ode_net_rate_norm: f64,
+        // Cumulative stress: slow EMA of urgency — chronic overload signal.
+        // [Yerkes & Dodson 1908] persistent arousal outlasts individual spikes.
+        cumulative_stress: f64,
+        // Lyapunov exponent normalized to [0,1] at λ=2.0.
+        // [Wolf et al. 1985] trajectory divergence — chaotic pressure harbinger.
+        lyapunov_norm: f64,
     ) -> Self {
         let swap_ord = match swap_trend {
             SwapTrend::Decreasing => 0.0,
@@ -408,6 +414,8 @@ impl AgentContext {
                 feedback_signal,                              // 11
                 ode_t_sat_urgency.clamp(0.0, 1.0),            // 12 ODE swap urgency
                 ode_net_rate_norm.clamp(0.0, 1.0),            // 13 ODE net rate
+                cumulative_stress.clamp(0.0, 1.0),            // 14 chronic overload
+                lyapunov_norm.clamp(0.0, 1.0),                // 15 chaos exponent
             ],
         }
     }
@@ -905,6 +913,8 @@ mod tests {
             0.0, // low_value_ratio
             0.0, // ode_t_sat_urgency
             0.0, // ode_net_rate_norm
+            0.0, // cumulative_stress
+            0.0, // lyapunov_norm
         )
     }
 
@@ -1073,6 +1083,8 @@ mod tests {
             0.0,  // low_value_ratio
             0.0,  // ode_t_sat_urgency
             0.0,  // ode_net_rate_norm
+            0.0,  // cumulative_stress
+            0.0,  // lyapunov_norm
         );
         assert!(
             (ctx_good.features[11] - 0.80).abs() < 1e-6,
@@ -1095,6 +1107,8 @@ mod tests {
             0.50, // 50% low-value
             0.0,  // ode_t_sat_urgency
             0.0,  // ode_net_rate_norm
+            0.0,  // cumulative_stress
+            0.0,  // lyapunov_norm
         );
         assert!(
             (ctx_bad.features[11] - 0.40).abs() < 1e-6,
@@ -1123,6 +1137,8 @@ mod tests {
             0.3, // low_value_ratio
             0.0, // ode_t_sat_urgency
             0.0, // ode_net_rate_norm
+            0.0, // cumulative_stress
+            0.0, // lyapunov_norm
         );
         // memory_pressure clamped
         assert!((ctx.features[0] - 1.0).abs() < 1e-10);
@@ -1624,6 +1640,8 @@ mod tests {
             0.0,
             0.0, // ode_t_sat_urgency
             0.0, // ode_net_rate_norm
+            0.0, // cumulative_stress
+            0.0, // lyapunov_norm
         );
         assert!((ctx.features[0] - 0.0).abs() < 1e-10);
         assert!(
@@ -1649,6 +1667,8 @@ mod tests {
             1.0,
             1.0, // ode_t_sat_urgency = max urgency
             1.0, // ode_net_rate_norm = max rate
+            1.0, // cumulative_stress
+            1.0, // lyapunov_norm
         );
         assert!((ctx.features[0] - 1.0).abs() < 1e-10);
         assert!(

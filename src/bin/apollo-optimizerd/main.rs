@@ -2781,6 +2781,8 @@ fn main() -> anyhow::Result<()> {
                         lv_ratio,
                         ode_t_sat_urgency,
                         ode_net_rate_norm,
+                        signal_digest.cumulative_stress,
+                        (signal_digest.lyapunov_exponent / 2.0).clamp(0.0, 1.0),
                     );
                     let (linucb_choice, linucb_confidence) = lctx
                         .predictive_agent
