@@ -25,6 +25,7 @@ mod daemon_signal_tick;
 mod daemon_skill_tick;
 mod daemon_chromium_tick;
 mod daemon_cognitive_tick;
+mod daemon_markov_tick;
 mod daemon_memory_budget;
 mod daemon_survival_tick;
 mod daemon_cycle_tail;
@@ -81,7 +82,6 @@ use apollo_optimizer::engine::holt_winters::HoltWinters;
 use apollo_optimizer::engine::hw_bayes::HwFeatures;
 use apollo_optimizer::engine::hw_predictor::{sample_hw_pressure, HwPressure};
 use apollo_optimizer::engine::iokit_sensors::{HardwareSnapshot, ThermalState};
-use apollo_optimizer::engine::jetsam_control;
 use apollo_optimizer::engine::kqueue_pressure;
 use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
 use apollo_optimizer::engine::learned_state::{
@@ -1502,197 +1502,29 @@ fn main() -> anyhow::Result<()> {
                 let foreground_pid = fg_state.pid();
                 let foreground_idle = fg_state.is_idle();
 
-                // FocusMarkov miss check: did last high-confidence prediction materialize?
-                // [Sutton & Barto 1998 §6 — temporal difference credit assignment]
-                if let Some((ref predicted, pred_cycle)) = last_markov_prethaw {
-                    let cycles_elapsed = cycle_count.saturating_sub(pred_cycle);
-                    if cycles_elapsed >= 1 {
-                        let hit = foreground_app
-                            .as_deref()
-                            .map(|fa| {
-                                fa.to_ascii_lowercase()
-                                    .contains(&predicted.to_ascii_lowercase())
-                            })
-                            .unwrap_or(false);
-                        if hit {
-                            markov_hit_count += 1;
-                        } else {
-                            markov_miss_count += 1;
-                        }
-                        last_markov_prethaw = None;
-                        // Log accuracy every 50 evaluations to audit trail.
-                        let total = markov_hit_count + markov_miss_count;
-                        if total > 0 && total % 50 == 0 {
-                            let accuracy = markov_hit_count as f64 / total as f64;
-                            audit_log(&serde_json::json!({
-                                "event": "markov_prediction_accuracy",
-                                "hits": markov_hit_count,
-                                "misses": markov_miss_count,
-                                "accuracy": (accuracy * 1000.0).round() / 1000.0,
-                            }));
-                        }
-                    }
-                }
-
-                // Markov chain: observe foreground transition, predict next app.
-                // Pre-warm the predicted app by unfreezing + boosting QoS before
-                // the user switches to it — eliminates perceived switch latency.
-                let markov_prediction = focus_markov.observe(foreground_app.as_deref());
-                if let Some(ref pred) = markov_prediction {
-                    // Find the PID of the predicted app in the process table.
-                    let pred_name_lc = pred.app_name.to_ascii_lowercase();
-                    let predicted_pid: Option<u32> = collector
-                        .system()
-                        .processes()
-                        .iter()
-                        .find(|(_, p)| p.name().to_ascii_lowercase() == pred_name_lc)
-                        .map(|(pid, _)| pid.as_u32());
-
-                    if let Some(pid) = predicted_pid {
-                        // Pre-warm: if predicted app is frozen, unfreeze it now.
-                        let mut frozen_guard = state.frozen_state.lock_recover();
-                        if frozen_guard.remove(&pid).is_some() {
-                            unfreeze_pids(std::iter::once(pid));
-                            write_frozen_state(&frozen_state_path, &frozen_guard);
-                            state.metrics.lock_recover().metrics.unfreezes_applied += 1;
-                        }
-                        drop(frozen_guard);
-
-                        // Boost jetsam priority so kernel protects this app's pages
-                        // before the user switches to it (pages stay resident).
-                        if pred.probability >= 0.50 {
-                            let _ = jetsam_control::set_priority(
-                                pid,
-                                jetsam_control::priority::FOREGROUND,
-                            );
-                            // Cable C: Proactive QoS — route predicted app to P-cores
-                            // BEFORE the user switches to it (predictive DVFS pattern).
-                            // Eliminates the ~50ms QoS transition lag on app switch.
-                            {
-                                let mut qos = state.mach_qos.lock_recover();
-                                qos.set_tier(pid, SchedulingTier::Foreground);
-                            }
-                            // File cache warming: pre-read the app's executable into
-                            // the buffer cache so code pages don't fault from SSD.
-                            // Cao et al. 1994 — app-controlled prefetch cuts I/O wait 50%.
-                            cache_warmer.warm_pid(pid);
-                            // Record prediction for miss tracking on next cycle.
-                            last_markov_prethaw = Some((pred.app_name.clone(), cycle_count));
-                        }
-                    }
-                }
-
-                // Universal pre-thaw: FocusMarkov prediction → pre-thaw ALL frozen processes
-                // whose category matches the hint for the predicted next app.
-                // App-agnostic: covers Chromium renderers, IDE LSP helpers, media helpers,
-                // generic app helpers — not just Chromium browsers.
-                // [Altmann & Trafton 2002] Pre-activate resources before predicted task switch.
-                if let Some(ref pred) = markov_prediction {
-                    if pred.probability >= 0.35 {
-                        let elapsed = focus_markov.elapsed_dwell_secs();
-                        let time_to_switch = pred.avg_dwell_secs - elapsed;
-                        // Only pre-thaw within [-5s, +10s] window.  Deeply negative
-                        // values = stale prediction → skip to avoid freeze/thaw thrashing.
-                        if time_to_switch > -5.0 && time_to_switch < 10.0 {
-                            use apollo_optimizer::engine::freeze_intelligence::FreezeIntelligence;
-                            let hint_categories = FreezeIntelligence::pre_thaw_hint(&pred.app_name);
-                            // Single lock scope: collect + act atomically to avoid
-                            // TOCTOU where another thread removes PIDs between
-                            // candidate collection and SIGCONT.
-                            let mut frozen_guard = state.frozen_state.lock_recover();
-                            let candidates: Vec<(u32, String)> = frozen_guard
-                                .iter()
-                                .filter_map(|(&pid, entry)| {
-                                    let pname = entry.process_name.as_deref().unwrap_or("");
-                                    if !pname.is_empty() {
-                                        let cat = FreezeIntelligence::classify(pname);
-                                        if hint_categories.contains(&cat) {
-                                            return Some((pid, pname.to_string()));
-                                        }
-                                    }
-                                    None
-                                })
-                                .collect();
-                            if !candidates.is_empty() {
-                                for (pid, pname) in &candidates {
-                                    if frozen_guard.remove(pid).is_some() {
-                                        unfreeze_pids(std::iter::once(*pid));
-                                        tracing::info!(
-                                            pid = pid,
-                                            process = pname.as_str(),
-                                            predicted_app = pred.app_name.as_str(),
-                                            prob = pred.probability,
-                                            time_to_switch = time_to_switch,
-                                            "freeze_intelligence: universal pre-thaw — switch imminent"
-                                        );
-                                    }
-                                }
-                                write_frozen_state(&frozen_state_path, &frozen_guard);
-                            }
-                        }
-                    }
-                }
-
-                // Temporal app predictor: observe foreground app + hour for time-of-day patterns.
-                // Shin et al. 2012 — temporal patterns predict app launches with ~80% accuracy.
-                // On foreground change, record observation + get temporal prediction for
-                // proactive pre-warming of apps the user habitually opens at this hour.
-                // Observe only on app transition (not every cycle) to avoid count inflation
-                // and excess disk writes. last_fg_name is updated at end of ctx-switch block.
-                // Update temporal hour/weekday unconditionally every cycle so that
-                // pressure_headroom_for_incoming() always uses the real current time,
-                // even when no foreground app is detected (lock screen, screensaver).
-                {
-                    let now_chrono = Utc::now();
-                    temporal_hour = now_chrono.hour() as u8;
-                    temporal_weekday =
-                        chrono::Datelike::weekday(&now_chrono).num_days_from_monday() as u8;
-                }
-                if let Some(ref fg_name) = foreground_app {
-                    let now_chrono = Utc::now();
-                    let hour = now_chrono.hour() as u8;
-                    let weekday =
-                        chrono::Datelike::weekday(&now_chrono).num_days_from_monday() as u8;
-                    temporal_hour = hour;
-                    temporal_weekday = weekday;
-                    let fg_changed = last_fg_name.as_deref() != Some(fg_name.as_str());
-                    if fg_changed {
-                        temporal_predictor.observe(fg_name, hour, weekday);
-                    }
-
-                    // Build Markov probability map for blending with temporal model.
-                    let markov_probs: std::collections::HashMap<String, f64> = focus_markov
-                        .predict_top_n(fg_name, 5)
-                        .into_iter()
-                        .map(|p| (p.app_name, p.probability))
-                        .collect();
-
-                    // Get temporal-blended predictions: apps likely needed at this time.
-                    let temporal_preds = temporal_predictor.predict(hour, weekday, &markov_probs);
-
-                    // Pre-warm temporal predictions that Markov alone wouldn't catch.
-                    // Only warm if temporal_score > 0.3 (strong time signal) and
-                    // probability > 0.15 (avoid warming everything).
-                    for tpred in &temporal_preds {
-                        if tpred.temporal_score > 0.3
-                            && tpred.probability > 0.15
-                            && tpred.markov_score < 0.30
-                        {
-                            // This is a purely temporal prediction — Markov wouldn't
-                            // have caught it.  Pre-warm via cache warmer.
-                            let pred_lc = tpred.app_name.to_ascii_lowercase();
-                            if let Some(pid) = collector
-                                .system()
-                                .processes()
-                                .iter()
-                                .find(|(_, p)| p.name().to_ascii_lowercase() == pred_lc)
-                                .map(|(pid, _)| pid.as_u32())
-                            {
-                                cache_warmer.warm_pid(pid);
-                            }
-                        }
-                    }
-                }
+                // FocusMarkov miss check, Markov observe+pre-warm, universal pre-thaw, temporal predictor.
+                // Extracted to daemon_markov_tick::run_markov_tick (Wave 29).
+                // [Fowler 2004] Strangler Fig — pure move, no semantic change.
+                let daemon_markov_tick::MarkovTickOutput {
+                    temporal_hour: markov_temporal_hour,
+                    temporal_weekday: markov_temporal_weekday,
+                } = daemon_markov_tick::run_markov_tick(
+                    foreground_app.as_deref(),
+                    foreground_pid,
+                    last_fg_name.as_deref(),
+                    cycle_count as u64,
+                    &mut focus_markov,
+                    &mut temporal_predictor,
+                    &mut last_markov_prethaw,
+                    &mut markov_hit_count,
+                    &mut markov_miss_count,
+                    &state,
+                    &collector,
+                    &mut cache_warmer,
+                    &frozen_state_path,
+                );
+                temporal_hour = markov_temporal_hour;
+                temporal_weekday = markov_temporal_weekday;
 
                 // Context-switch burst detector + reactive unfreeze.
                 // Si el foreground cambió y el nuevo app estaba congelado, lo descongelamos
