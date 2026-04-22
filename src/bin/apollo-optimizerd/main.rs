@@ -2574,6 +2574,11 @@ fn main() -> anyhow::Result<()> {
                 {
                     reactor_weight = (reactor_weight + 0.08).min(1.0);
                 }
+                // Cumulative stress: chronic high urgency boosts reactor even at moderate snapshots.
+                // [Yerkes & Dodson 1908] persistent arousal signals structural problem, not spike.
+                if signal_digest.cumulative_stress > 0.55 {
+                    reactor_weight = (reactor_weight + 0.07).min(1.0);
+                }
                 // Darwin-Boltzmann anomaly: learned pattern deviation.
                 // Score > 0.5 means the system state deviates significantly from
                 // the Hopfield memory + SAE ensemble's learned "normal" manifold.

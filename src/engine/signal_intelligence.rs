@@ -112,6 +112,12 @@ pub struct SignalDigest {
     /// λ > 0 = exponential divergence (chaotic); λ < 0 = convergent (stable).
     /// Near-zero = borderline; extreme positive = imminent regime change.
     pub lyapunov_exponent: f64,
+
+    // ── Cumulative Stress ─────────────────────────────────────────────
+    /// EMA of urgency over time. α=0.05 (slow decay, ~20 cycles half-life).
+    /// [Yerkes & Dodson 1908] persists across individual-cycle snapshots.
+    /// High cumulative_stress at moderate instant urgency = chronic overload.
+    pub cumulative_stress: f64,
 }
 
 /// Orquestador de señales. Inicializar una vez en el daemon, llamar tick() cada ciclo.
@@ -215,6 +221,11 @@ pub struct SignalIntelligence {
     lyapunov_prev_delta: f64,
     /// EMA-smoothed FTLE. α=0.10 for stability.
     lyapunov_ema: f64,
+
+    // ── Cumulative Stress Index ───────────────────────────────────────
+    /// EMA over urgency values. α=0.05 (slow) — "running temperature".
+    /// [Yerkes & Dodson 1908] chronic arousal outlasts individual peaks.
+    cumulative_stress: f64,
 }
 
 impl Default for SignalIntelligence {
@@ -278,6 +289,7 @@ impl SignalIntelligence {
             signal_health: SignalHealthMonitor::new(),
             lyapunov_prev_delta: 0.0,
             lyapunov_ema: 0.0,
+            cumulative_stress: 0.0,
         }
     }
 
@@ -550,6 +562,13 @@ impl SignalIntelligence {
             lyapunov_exponent,
         );
 
+        // ── 9. Cumulative stress index ────────────────────────────────────
+        // [Yerkes & Dodson 1908] slow EMA (α=0.05) of urgency — "running temperature".
+        const STRESS_ALPHA: f64 = 0.05;
+        self.cumulative_stress =
+            STRESS_ALPHA * urgency + (1.0 - STRESS_ALPHA) * self.cumulative_stress;
+        let cumulative_stress = self.cumulative_stress;
+
         SignalDigest {
             pressure_smooth,
             pressure_velocity,
@@ -575,6 +594,7 @@ impl SignalIntelligence {
             // ODE stochastic: wired from SaturationForecast after ODE tick.
             swap_net_rate_volatility: 0.0,
             lyapunov_exponent,
+            cumulative_stress,
         }
     }
 
@@ -1229,6 +1249,7 @@ mod tests {
             stability_regime: StabilityRegime::Degenerate,
             swap_net_rate_volatility: 0.0,
             lyapunov_exponent: 0.0,
+            cumulative_stress: 0.0,
         };
         for _ in 0..20 {
             digest = tick_nominal(&mut si);
@@ -1673,6 +1694,7 @@ mod tests {
             stability_regime: StabilityRegime::Degenerate,
             swap_net_rate_volatility: 0.0,
             lyapunov_exponent: 0.0,
+            cumulative_stress: 0.0,
         };
         for i in 0..20 {
             let pressure = 0.55 + i as f64 * 0.005;
@@ -1932,6 +1954,7 @@ mod tests {
             stability_regime: StabilityRegime::Degenerate,
             swap_net_rate_volatility: 0.0,
             lyapunov_exponent: 0.0,
+            cumulative_stress: 0.0,
         };
         for _ in 0..30 {
             last = si.tick(
