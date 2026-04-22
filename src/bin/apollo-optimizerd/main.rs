@@ -17,6 +17,7 @@ mod daemon_behavior_pids;
 mod daemon_cluster_actions;
 mod daemon_stale_apps;
 mod daemon_thermal_freeze;
+mod daemon_thermal_tick;
 mod daemon_warn_limits;
 mod daemon_paging_hints;
 mod daemon_signal_tick;
@@ -71,7 +72,7 @@ use apollo_optimizer::engine::daemon_helpers::{
 use apollo_optimizer::engine::execute_actions::execute_actions;
 use apollo_optimizer::engine::focus_markov::FocusMarkov;
 use apollo_optimizer::engine::foreground::{ForegroundDetector, ForegroundState};
-use apollo_optimizer::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
+use apollo_optimizer::engine::gpu_manager::GPUManager;
 use apollo_optimizer::engine::holt_winters::HoltWinters;
 use apollo_optimizer::engine::hw_bayes::HwFeatures;
 use apollo_optimizer::engine::hw_predictor::{sample_hw_pressure, HwPressure};
@@ -636,7 +637,7 @@ fn main() -> anyhow::Result<()> {
             // Detected once at startup via detect_hw_caps() (~1ms sysinfo query).
             let (hw_cores, hw_ram_gb) = daemon_init::detect_hw_caps();
             // GPU thermal monitoring: integrates with thermal_manager for GPU-aware decisions.
-            let gpu_mgr = GPUManager::new();
+            let mut gpu_mgr = GPUManager::new();
             // Foreground detection: replaces get_foreground_app() with cached, richer detection.
             // Wrapped in Arc so it can be shared with the resource sentinel thread.
             // TTL raised from 200ms → 3s: daemon cycle is ~3s, lsappinfo subprocess
@@ -2056,70 +2057,20 @@ fn main() -> anyhow::Result<()> {
                     (HwPressure::Nominal, 0u64, None)
                 };
 
-                // ThermalManager + GPUManager: tick every cycle with latest IOKit temperatures.
-                // gpu_thermal_throttled escapes this block to feed into governor input.
-                // thermal_predicted_* escape to metrics (predictive thermal observability).
-                let mut gpu_thermal_throttled = false;
-                let mut thermal_predicted_throttle: u8 = 0;
-                let mut thermal_seconds_to_throttle: Option<i32> = None;
-                let mut thermal_trend_predicted = String::new();
-                {
-                    if let Some(hw) = &cycle_hw_snap {
-                        let cpu_t = hw.temps.p_cluster_celsius.unwrap_or(0.0);
-                        let gpu_t = hw.temps.gpu_celsius.unwrap_or(cpu_t);
-                        let thermal_state = thermal_mgr.update(cpu_t, gpu_t, 0.0, 0, jitter_us);
-                        thermal_predicted_throttle = thermal_state.predicted_throttle_level;
-                        thermal_seconds_to_throttle = thermal_state.seconds_to_throttle;
-                        thermal_trend_predicted = format!("{:?}", thermal_state.thermal_trend);
-
-                        // GPU-aware thermal management: build GPU metrics from IOKit data
-                        // and feed into gpu_manager for workload-specific recommendations.
-                        let gpu_watts = hw.power.gpu_watts.unwrap_or(0.0);
-                        let gpu_util = (gpu_watts / 15.0 * 100.0).clamp(0.0, 100.0);
-                        let gpu_metrics = GPUMetrics {
-                            gpu_temp: gpu_t,
-                            gpu_utilization: gpu_util,
-                            gpu_frequency: 0, // Not available from IOKit
-                            gpu_memory_used: 0,
-                            gpu_memory_total: 0,
-                            throttle_active: gpu_mgr.needs_cooling(&GPUMetrics {
-                                gpu_temp: gpu_t,
-                                gpu_utilization: gpu_util,
-                                gpu_frequency: 0,
-                                gpu_memory_used: 0,
-                                gpu_memory_total: 0,
-                                throttle_active: false,
-                                power_state: GPUPowerState::Dynamic,
-                            }),
-                            power_state: gpu_mgr.recommend_power_state(gpu_util, gpu_t),
-                        };
-                        // If GPU is thermally throttled, engage fast-tick for quicker response.
-                        if gpu_metrics.power_state == GPUPowerState::Throttled {
-                            gpu_thermal_throttled = true;
-                            state.metrics.lock_recover().fast_tick_until =
-                                Some(Instant::now() + Duration::from_secs(15));
-                        }
-                        // Cable: GPU thermal audit — log thermal_recommendations on throttle
-                        // transitions and workload-specific hints for observability.
-                        if gpu_metrics.throttle_active
-                            || gpu_metrics.power_state == GPUPowerState::Throttled
-                        {
-                            let recs = gpu_mgr.thermal_recommendations(&gpu_metrics);
-                            if !recs.is_empty() {
-                                audit_log(&serde_json::json!({
-                                    "event": "gpu_thermal",
-                                    "gpu_temp": gpu_t,
-                                    "gpu_util": gpu_util,
-                                    "power_state": format!("{:?}", gpu_metrics.power_state),
-                                    "recommendations": recs,
-                                }));
-                            }
-                        }
-                        // Store GPU power state in metrics for status reporting.
-                        state.metrics.lock_recover().metrics.energy_gpu_watts =
-                            Some(hw.power.gpu_watts.unwrap_or(0.0) as f64);
-                    }
-                }
+                // ThermalManager + GPUManager tick.
+                // Extracted to daemon_thermal_tick::run_thermal_tick (Wave 24).
+                let daemon_thermal_tick::ThermalTickOutput {
+                    gpu_thermal_throttled,
+                    thermal_predicted_throttle,
+                    thermal_seconds_to_throttle,
+                    thermal_trend_predicted,
+                } = daemon_thermal_tick::run_thermal_tick(
+                    cycle_hw_snap.as_ref(),
+                    &mut thermal_mgr,
+                    &mut gpu_mgr,
+                    &state,
+                    jitter_us,
+                );
 
                 // SwapPredictor: update trend forecast every cycle.
                 let swap_forecast = swap_predictor.update(
