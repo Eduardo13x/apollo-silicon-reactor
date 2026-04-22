@@ -20,10 +20,7 @@ use apollo_optimizer::engine::display_turbo::{DisplayTurbo, TurboAction};
 use apollo_optimizer::engine::foreground::ForegroundDetector;
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::process_identity::ProcessIdentity;
-use apollo_optimizer::engine::safety::{
-    classify_protection, infrastructure_processes, matches_dev_runtime, protected_processes,
-    ProtectionLevel,
-};
+use apollo_optimizer::engine::safety::is_protected_name;
 use apollo_optimizer::engine::stability_oracle::StabilityOracle;
 use apollo_optimizer::engine::types::{FreezeSource, FrozenEntry};
 use chrono::Utc;
@@ -63,8 +60,6 @@ pub fn run_turbo_tick(
     match display_turbo.tick() {
         TurboAction::ActivateTurbo => {
             // Freeze non-essential background processes.
-            let turbo_hard = protected_processes();
-            let turbo_infra = infrastructure_processes();
             let policy_protected = state
                 .policy
                 .lock_recover()
@@ -79,18 +74,11 @@ pub fn run_turbo_tick(
             for (pid, process) in collector.system().processes() {
                 let pid_u32 = pid.as_u32();
                 let name = process.name().to_string();
-                // Never freeze: foreground, OS/infra/policy-protected,
-                // dev runtimes, or Apollo itself.
-                let protection = classify_protection(
-                    &name,
-                    &turbo_hard,
-                    &turbo_infra,
-                    &policy_protected,
-                    false,
-                );
+                // Never freeze: foreground, OS/infra/dev-runtime/policy-protected,
+                // or Apollo itself. [Saltzer & Kaashoek 2009] Complete Mediation.
                 if Some(pid_u32) == fg_pid
-                    || protection != ProtectionLevel::Unprotected
-                    || matches_dev_runtime(&name)
+                    || is_protected_name(&name)
+                    || policy_protected.iter().any(|p| name.contains(p.as_str()))
                     || name == "apollo-optimizerd"
                     || frozen_guard.contains_key(&pid_u32)
                 {

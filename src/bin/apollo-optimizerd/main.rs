@@ -96,9 +96,8 @@ use apollo_optimizer::engine::proc_taskinfo;
 use apollo_optimizer::engine::profile_governor::GovernorInput;
 use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
 use apollo_optimizer::engine::safety::{
-    behavioral_protection_score, classify_protection, critical_background_processes,
-    enforce_limits_with_budget, infrastructure_processes, is_user_interactive_app,
-    matches_dev_runtime, protected_processes, ProtectionLevel,
+    critical_background_processes, enforce_limits_with_budget, infrastructure_processes,
+    is_protected_name, is_user_interactive_app,
 };
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
 use apollo_optimizer::engine::smc_reader::SmcReader;
@@ -2019,8 +2018,6 @@ fn main() -> anyhow::Result<()> {
                 // Unfreeze when temperature drops back to Phase2 or below (hysteresis built into
                 // ThermalBailout keeps us from thrashing).
                 if thermal_action.freeze_background || thermal_action.freeze_all_non_critical {
-                    let thermal_hard = protected_processes();
-                    let thermal_infra = infrastructure_processes();
                     let policy_protected = state
                         .policy
                         .lock_recover()
@@ -2042,17 +2039,10 @@ fn main() -> anyhow::Result<()> {
                         let pid_u32 = pid.as_u32();
                         let name = process.name().to_string();
                         let cpu = process.cpu_usage();
-                        let protection = classify_protection(
-                            &name,
-                            &thermal_hard,
-                            &thermal_infra,
-                            &policy_protected,
-                            false,
-                        );
                         if cpu > cpu_threshold
                             || Some(pid_u32) == fg_pid
-                            || protection != ProtectionLevel::Unprotected
-                            || matches_dev_runtime(&name)
+                            || is_protected_name(&name)
+                            || policy_protected.iter().any(|p| name.contains(p.as_str()))
                             || name == "apollo-optimizerd"
                             || frozen_guard.contains_key(&pid_u32)
                         {
@@ -3774,9 +3764,6 @@ fn main() -> anyhow::Result<()> {
                     if let Some(skill) = trial {
                         let skill_name = skill.name.clone();
                         let pressure_before = snapshot.pressure.memory_pressure;
-                        let hard_protected =
-                            apollo_optimizer::engine::safety::protected_processes();
-                        let infra_protected = infrastructure_processes();
                         let policy_prot = state
                             .policy
                             .lock_recover()
@@ -3797,18 +3784,12 @@ fn main() -> anyhow::Result<()> {
                         // skill for respecting the foreground gate.
                         let mut targets_found_but_skipped = false;
                         for target in &skill.throttle_targets.clone() {
-                            // Skip targets that are hard-protected, infra-protected, or
-                            // policy-protected daemons.
-                            // ConditionalForeground (user apps) are NOT skipped here —
-                            // the foreground check happens per-pid in the inner loop below.
-                            // is_interactive=false: no behavioral data at target-name level.
-                            if classify_protection(
-                                target,
-                                &hard_protected,
-                                &infra_protected,
-                                &policy_prot,
-                                false,
-                            ) == ProtectionLevel::Unconditional
+                            // [Saltzer & Kaashoek 2009] Complete Mediation — is_protected_name
+                            // is the single truth point for static lists; policy_prot adds
+                            // learned patterns. ConditionalForeground apps are not skipped
+                            // here — the per-pid foreground check handles them below.
+                            if is_protected_name(target)
+                                || policy_prot.iter().any(|p| target.contains(p.as_str()))
                             {
                                 continue;
                             }
@@ -4049,8 +4030,6 @@ fn main() -> anyhow::Result<()> {
                     // Use proc_snaps (full process list) not top_processes (top 10 by CPU).
                     // Only skip core interactive apps — paging hints are gentle (voluntary
                     // cache release), so we use a tighter filter than freeze/throttle.
-                    let hard_protected = protected_processes();
-                    let infra_protected = infrastructure_processes();
                     let mut bg_procs: Vec<_> = proc_snaps
                         .iter()
                         .filter(|p| {
@@ -4060,11 +4039,13 @@ fn main() -> anyhow::Result<()> {
                             if is_interactive_app_name(&p.name) {
                                 return false;
                             }
-                            // Skip system-critical, infra, and policy-protected processes.
+                            // Skip system-critical, infra, dev-runtime, interactive, and
+                            // policy-protected processes. [Saltzer & Kaashoek 2009]
                             let is_interactive =
                                 is_user_interactive_app(p.has_gui_window, p.secs_since_user_interaction, p.rss_bytes, &p.name);
-                            classify_protection(&p.name, &hard_protected, &infra_protected, &protected_pats, is_interactive)
-                                == ProtectionLevel::Unprotected
+                            !is_protected_name(&p.name)
+                                && !is_interactive
+                                && !protected_pats.iter().any(|pat| p.name.contains(pat.as_str()))
                                 && p.rss_bytes > 80 * 1024 * 1024 // >80 MB RSS
                                 && p.pid != std::process::id()
                                 && !p.has_gui_window
@@ -4122,8 +4103,6 @@ fn main() -> anyhow::Result<()> {
                             .learned_policy
                             .protected_patterns
                             .clone();
-                        let hard_protected = protected_processes();
-                        let infra_protected = infrastructure_processes();
                         let mut bg_procs: Vec<_> = proc_snaps
                             .iter()
                             .filter(|p| {
@@ -4136,13 +4115,9 @@ fn main() -> anyhow::Result<()> {
                                     p.rss_bytes,
                                     &p.name,
                                 );
-                                classify_protection(
-                                    &p.name,
-                                    &hard_protected,
-                                    &infra_protected,
-                                    &protected_pats,
-                                    is_interactive,
-                                ) == ProtectionLevel::Unprotected
+                                !is_protected_name(&p.name)
+                                    && !is_interactive
+                                    && !protected_pats.iter().any(|pat| p.name.contains(pat.as_str()))
                                     && p.rss_bytes > 80 * 1024 * 1024
                                     && p.pid != std::process::id()
                                     && !p.has_gui_window
