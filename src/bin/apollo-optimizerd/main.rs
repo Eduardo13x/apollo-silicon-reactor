@@ -29,6 +29,7 @@ mod daemon_ctx_switch_tick;
 mod daemon_holt_winters_tick;
 mod daemon_markov_tick;
 mod daemon_memory_budget;
+mod daemon_proc_scan_tick;
 mod daemon_survival_tick;
 mod daemon_cycle_tail;
 mod daemon_feature_gates;
@@ -97,7 +98,6 @@ use apollo_optimizer::engine::llm::{
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
 use apollo_optimizer::engine::mach_qos::{MachQoSManager, SchedulingTier};
-use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
 use apollo_optimizer::engine::network_optimizer::NetworkProfile;
 use apollo_optimizer::engine::overflow_guard::{is_build_tool_name, OverflowGuard};
 use apollo_optimizer::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
@@ -1579,40 +1579,14 @@ fn main() -> anyhow::Result<()> {
                     cycle_count,
                 );
 
-                // MemoryAnalyzer: profile top-50 processes for memory leaks each cycle.
-                // For the top-10 by RSS, refine WSS with real TASK_VM_INFO data.
-                for (i, snap) in proc_snaps.iter().take(50).enumerate() {
-                    let mut profile = mem_analyzer.analyze_process(
-                        snap.pid,
-                        &snap.name,
-                        snap.rss_bytes,
-                        snap.rss_bytes, // vms not tracked at this level; use rss as proxy
-                        snap.pageins_total as u64, // major faults (page-ins from disk/swap/compressor)
-                    );
-                    // Top-10 by RSS: refine WSS with Mach TASK_VM_INFO (~50µs per call).
-                    if i < 10 {
-                        if let Some(mem_profile) = query_memory_profile(snap.pid) {
-                            MemoryAnalyzer::refine_wss(&mut profile, mem_profile.working_set_bytes);
-                        }
-                    }
-                    if profile.memory_leak_probability >= 0.75 {
-                        proc_recovery.register_leak(
-                            snap.pid,
-                            snap.name.clone(),
-                            profile.memory_leak_probability,
-                            snap.rss_bytes,
-                        );
-                    }
-                }
-                proc_recovery.cleanup_resolved();
-
-                // WakeStormDetector: record wakeups for any process reporting elevated rates.
-                for snap in proc_snaps.iter().take(50) {
-                    if snap.wakeups_per_sec > 10.0 {
-                        wake_storm.record_wakeup(snap.pid, snap.name.clone());
-                    }
-                }
-                wake_storm.cleanup_stale(Duration::from_secs(300));
+                // MemoryAnalyzer profiling + WakeStormDetector per-cycle scan.
+                // Extracted to daemon_proc_scan_tick::run_proc_scan_tick (Wave 32).
+                daemon_proc_scan_tick::run_proc_scan_tick(
+                    &proc_snaps,
+                    &mut mem_analyzer,
+                    &mut proc_recovery,
+                    &mut wake_storm,
+                );
 
                 // Memory budgets: jetsam inactive limits for over-budget processes.
                 // Extracted to daemon_memory_budget::run_memory_budget (Wave 28).
