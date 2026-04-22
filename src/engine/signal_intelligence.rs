@@ -99,6 +99,12 @@ pub struct SignalDigest {
     pub window_op_active: bool,
     /// True when a new app launch is in progress.
     pub app_launching: bool,
+
+    // ── ODE Stochastic (SDE) ──────────────────────────────────────────
+    /// Empirical volatility σ of swap net_rate (bytes/s std-dev per cycle).
+    /// [Øksendal 2003 §3] diffusion term. High σ at low mean = "sticky swap"
+    /// harbinger — wired from SaturationForecast after ODE tick.
+    pub swap_net_rate_volatility: f64,
 }
 
 /// Orquestador de señales. Inicializar una vez en el daemon, llamar tick() cada ciclo.
@@ -532,6 +538,8 @@ impl SignalIntelligence {
             fluidity_score: 1.0,
             window_op_active: false,
             app_launching: false,
+            // ODE stochastic: wired from SaturationForecast after ODE tick.
+            swap_net_rate_volatility: 0.0,
         }
     }
 
@@ -1176,6 +1184,7 @@ mod tests {
             window_op_active: false,
             app_launching: false,
             stability_regime: StabilityRegime::Degenerate,
+            swap_net_rate_volatility: 0.0,
         };
         for _ in 0..20 {
             digest = tick_nominal(&mut si);
@@ -1618,6 +1627,7 @@ mod tests {
             window_op_active: false,
             app_launching: false,
             stability_regime: StabilityRegime::Degenerate,
+            swap_net_rate_volatility: 0.0,
         };
         for i in 0..20 {
             let pressure = 0.55 + i as f64 * 0.005;
@@ -1875,6 +1885,7 @@ mod tests {
             window_op_active: false,
             app_launching: false,
             stability_regime: StabilityRegime::Degenerate,
+            swap_net_rate_volatility: 0.0,
         };
         for _ in 0..30 {
             last = si.tick(

@@ -2534,6 +2534,10 @@ fn main() -> anyhow::Result<()> {
                     swap_reclaim.update(&flow)
                 };
 
+                // Wire ODE σ into SignalDigest. [Øksendal 2003 §3] diffusion term.
+                let mut signal_digest = signal_digest;
+                signal_digest.swap_net_rate_volatility = reclaim_forecast.net_rate_volatility;
+
                 // ODE swap urgency — hoisted for use in Neuromodulator AND LinUCB.
                 // Normalization owned by TsatUrgency [CyberPhysicalSignal trait].
                 let ode_t_sat_urgency = {
@@ -2553,6 +2557,15 @@ fn main() -> anyhow::Result<()> {
                 // Entropy anomaly: chaotic process distribution change.
                 if signal_digest.entropy_anomaly > 2.0 {
                     reactor_weight = (reactor_weight + 0.15).min(1.0);
+                }
+                // SDE sticky-swap: high σ at moderate pressure = oscillation harbinger.
+                // [Øksendal 2003] diffusion term predicts instability before mean crosses threshold.
+                // Threshold: σ > 1MB/s at pressure 0.35–0.65 = pre-crisis zone.
+                if signal_digest.swap_net_rate_volatility > 1_000_000.0
+                    && signal_digest.pressure_smooth > 0.35
+                    && signal_digest.pressure_smooth < 0.65
+                {
+                    reactor_weight = (reactor_weight + 0.10).min(1.0);
                 }
                 // Darwin-Boltzmann anomaly: learned pattern deviation.
                 // Score > 0.5 means the system state deviates significantly from
