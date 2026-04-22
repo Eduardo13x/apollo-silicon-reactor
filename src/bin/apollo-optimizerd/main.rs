@@ -25,6 +25,7 @@ mod daemon_signal_tick;
 mod daemon_skill_tick;
 mod daemon_chromium_tick;
 mod daemon_cognitive_tick;
+mod daemon_holt_winters_tick;
 mod daemon_markov_tick;
 mod daemon_memory_budget;
 mod daemon_survival_tick;
@@ -2898,54 +2899,19 @@ fn main() -> anyhow::Result<()> {
                     overflow_thresholds.extreme_pressure -= integral_adjustment;
                 }
 
-                // Holt-Winters seasonal forecasting: accumulate pressure samples,
-                // observe once per hour, and use forecast to proactively lower thresholds
-                // before predicted high-pressure periods.
-                {
-                    hw_pressure_accum += snapshot.pressure.memory_pressure;
-                    hw_pressure_count += 1;
-
-                    // When the hour changes, feed the average pressure to Holt-Winters.
-                    if hw_last_hour != Some(hour_of_day) {
-                        if let Some(prev_hour) = hw_last_hour {
-                            if hw_pressure_count > 0 {
-                                let avg = hw_pressure_accum / hw_pressure_count as f64;
-                                holt_winters.observe(prev_hour, avg);
-                            }
-                        }
-                        hw_last_hour = Some(hour_of_day);
-                        hw_pressure_accum = 0.0;
-                        hw_pressure_count = 0;
-                    }
-
-                    // Forecast: if next hour's predicted pressure is high, tighten now.
-                    let (forecast_1h, confidence) = holt_winters.forecast(hour_of_day, 1);
-                    if confidence > 0.3 && forecast_1h > 0.75 {
-                        // Scale adjustment by confidence and how high the forecast is.
-                        let hw_adjustment = (forecast_1h - 0.75) * confidence * 0.10;
-                        let hw_adjustment = hw_adjustment.min(0.04); // Max 4pp from forecast
-
-                        // Cross-reference with UserProfile: if the next hour is typically
-                        // a build session, apply extra tightening (builds spike fast).
-                        let next_hour = (hour_of_day + 1) % 24;
-                        let next_workload = state
-                            .policy
-                            .lock_recover()
-                            .adaptive_governor
-                            .user_profile
-                            .likely_workload_at_hour(next_hour);
-                        let workload_multiplier = match next_workload {
-                            apollo_optimizer::engine::user_profile::WorkloadType::Coding => 1.5,
-                            apollo_optimizer::engine::user_profile::WorkloadType::VideoEdit => 1.3,
-                            _ => 1.0,
-                        };
-
-                        let final_adjustment = (hw_adjustment * workload_multiplier).min(0.06);
-                        overflow_thresholds.bg_pressure -= final_adjustment;
-                        overflow_thresholds.critical_pressure -= final_adjustment;
-                        overflow_thresholds.extreme_pressure -= final_adjustment;
-                    }
-                }
+                // Holt-Winters seasonal forecasting: accumulate samples, observe hourly,
+                // tighten overflow_thresholds proactively.
+                // Extracted to daemon_holt_winters_tick::run_holt_winters_tick (Wave 30).
+                daemon_holt_winters_tick::run_holt_winters_tick(
+                    snapshot.pressure.memory_pressure,
+                    hour_of_day,
+                    &mut holt_winters,
+                    &mut hw_pressure_accum,
+                    &mut hw_pressure_count,
+                    &mut hw_last_hour,
+                    &state,
+                    &mut overflow_thresholds,
+                );
 
                 // Perceptual latency monitor: composite score from existing signals.
                 // If UI responsiveness is degraded, boost reactor_weight to trigger
