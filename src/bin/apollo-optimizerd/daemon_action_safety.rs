@@ -14,11 +14,13 @@
 //! are computed for this cycle, and AFTER `decide_actions` has produced `actions`.
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 
 use apollo_optimizer::collector::SystemCollector;
 use apollo_optimizer::engine::adaptive_governor::ProcessDecision;
 use apollo_optimizer::engine::daemon_helpers::audit_log;
 use apollo_optimizer::engine::daemon_state::SharedState;
+use apollo_optimizer::engine::foreground::ForegroundDetector;
 use apollo_optimizer::engine::hw_bayes::HwFeatures;
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::outcome_tracker::ExperienceMemory;
@@ -36,7 +38,9 @@ use apollo_optimizer::engine::{
 };
 use chrono::Utc;
 
-use crate::process_enrichment::{convert_and_merge_heuristic_decisions, HeuristicStats};
+use apollo_optimizer::engine::process_tree::ProcessTree;
+
+use crate::process_enrichment::{build_foreground_family, convert_and_merge_heuristic_decisions, HeuristicStats};
 
 pub struct HeuristicPassOutput {
     pub heuristic_decisions: Vec<ProcessDecision>,
@@ -243,5 +247,55 @@ pub fn run_heuristic_pass(
         heuristic_critical_pids,
         heuristic_stats,
         additional_actions,
+    }
+}
+
+/// F3 + F4 safety filters — extracted from main.rs (Wave 36).
+/// [Fowler 2004] Strangler Fig — pure move, no semantic change.
+///
+/// F3 — Safety Precedence: foreground family and recently-active apps are
+/// never throttled or frozen. Protects the user's active context.
+///
+/// F4 — Thermal Master Switch: suppress Boost actions during thermal
+/// emergency (>95°C P-cluster) or resource interrupt Emergency/SuperEmergency.
+///
+/// Both filters mutate `actions` in place; ordering (F3 before F4) is stable.
+pub fn apply_pre_exec_safety_filters(
+    actions: &mut Vec<RootAction>,
+    foreground_pid: Option<u32>,
+    process_tree: &ProcessTree,
+    foreground_app: Option<&str>,
+    fg_detector: &ForegroundDetector,
+    thermal_emergency: bool,
+    state: &SharedState,
+) {
+    // F3 — foreground family + recently-active protection.
+    {
+        let fg_family_pids = build_foreground_family(foreground_pid, process_tree);
+        let recently_active_window = std::time::Duration::from_secs(300);
+        actions.retain(|a| match a {
+            RootAction::ThrottleProcess { pid, name, .. }
+            | RootAction::FreezeProcess { pid, name, .. } => {
+                if fg_family_pids.contains(pid) {
+                    return false;
+                }
+                if let Some(fg) = foreground_app {
+                    if name.contains(fg) {
+                        return false;
+                    }
+                }
+                if fg_detector.is_recently_active(name, recently_active_window) {
+                    return false;
+                }
+                true
+            }
+            _ => true,
+        });
+    }
+
+    // F4 — thermal / resource-interrupt Boost suppression.
+    let interrupt_phase = state.resource_interrupt.phase.load(Ordering::Acquire);
+    if thermal_emergency || interrupt_phase >= 2 {
+        actions.retain(|a| !matches!(a, RootAction::BoostProcess { .. }));
     }
 }

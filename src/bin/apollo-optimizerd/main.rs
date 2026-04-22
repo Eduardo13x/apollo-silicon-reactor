@@ -3450,39 +3450,18 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // F3 — Safety Precedence: foreground app is NEVER throttled or frozen.
-                // Also protects recently active apps (minimized but used in the last 5 min).
-                {
-                    let fg_family_pids =
-                        process_enrichment::build_foreground_family(foreground_pid, &process_tree);
-                    let recently_active_window = std::time::Duration::from_secs(300);
-
-                    actions.retain(|a| match a {
-                        RootAction::ThrottleProcess { pid, name, .. }
-                        | RootAction::FreezeProcess { pid, name, .. } => {
-                            if fg_family_pids.contains(pid) {
-                                return false;
-                            }
-                            if let Some(fg) = &foreground_app {
-                                if name.contains(fg.as_str()) {
-                                    return false;
-                                }
-                            }
-                            if fg_detector.is_recently_active(name, recently_active_window) {
-                                return false;
-                            }
-                            true
-                        }
-                        _ => true,
-                    });
-                }
-
-                // F4 — Thermal Master Switch: >95°C P-cluster — suppress all Boost actions.
-                // Also suppress during resource interrupt Emergency/SuperEmergency.
-                let interrupt_phase = state.resource_interrupt.phase.load(Ordering::Acquire);
-                if thermal_emergency || interrupt_phase >= 2 {
-                    actions.retain(|a| !matches!(a, RootAction::BoostProcess { .. }));
-                }
+                // F3 + F4 — Safety Precedence + Thermal Master Switch.
+                // Extracted to daemon_action_safety::apply_pre_exec_safety_filters (Wave 36).
+                // [Fowler 2004] Strangler Fig — pure move, no semantic change.
+                daemon_action_safety::apply_pre_exec_safety_filters(
+                    &mut actions,
+                    foreground_pid,
+                    &process_tree,
+                    foreground_app.as_deref(),
+                    &fg_detector,
+                    thermal_emergency,
+                    &state,
+                );
 
                 // ── Chromium Renderer Manager ────────────────────────────────────
                 // Extracted to daemon_chromium_tick::run_chromium_tick (Wave 11).

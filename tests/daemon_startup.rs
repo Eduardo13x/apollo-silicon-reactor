@@ -9,7 +9,7 @@ use apollo_optimizer::engine::capabilities::detect_capabilities;
 use apollo_optimizer::engine::daemon_helpers::{
     journal_path, kill_switch_path, learned_state_path, socket_path,
 };
-use apollo_optimizer::engine::learned_state::LearnedState;
+use apollo_optimizer::engine::learned_state::{LearnedState, CURRENT_SCHEMA_VERSION};
 
 // ── Test 1: detect_capabilities returns coherent report ─────────────────────
 
@@ -125,7 +125,7 @@ fn learned_state_roundtrip_and_validate() {
     let mut state: LearnedState =
         serde_json::from_str("{}").expect("empty JSON must deserialize to LearnedState");
 
-    assert_eq!(state.version, 1, "default version must be 1");
+    assert_eq!(state.version, 0, "missing version key must deserialize as 0 (pre-versioning sentinel)");
     assert!(
         state.signal_intelligence.is_none(),
         "cold-start signal_intelligence must be None"
@@ -146,7 +146,8 @@ fn learned_state_roundtrip_and_validate() {
     state.persist(&path);
     let reloaded = LearnedState::load(&path).expect("must reload persisted state");
 
-    assert_eq!(reloaded.version, state.version);
+    // load() runs try_migrate which upgrades version 0 → CURRENT_SCHEMA_VERSION.
+    assert_eq!(reloaded.version, CURRENT_SCHEMA_VERSION);
     assert_eq!(reloaded.persist_generations, state.persist_generations);
     assert!(reloaded.signal_intelligence.is_none());
     assert!(reloaded.outcome_tracker.is_none());
