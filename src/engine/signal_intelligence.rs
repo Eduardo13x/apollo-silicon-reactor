@@ -520,20 +520,10 @@ impl SignalIntelligence {
         self.utility_lotka = self.utility_lotka.max(UTIL_FLOOR);
         self.utility_mpc = self.utility_mpc.max(UTIL_FLOOR);
 
-        // ── 7. Urgency score compuesto ───────────────────────────────────
-        let urgency = compute_urgency(
-            pressure_smooth,
-            pressure_velocity,
-            regime_shift_up,
-            p_oom_30s,
-            monopoly_risk,
-            stability_regime,
-            entropy_anomaly,
-        );
-
-        // ── 8. FTLE (Finite-Time Lyapunov Exponent) ──────────────────────
+        // ── 7. FTLE (Finite-Time Lyapunov Exponent) ──────────────────────
         // [Wolf et al. 1985 Physica D 16] Online approximation: log|Δpₜ / Δpₜ₋₁|.
         // EMA-smoothed with α=0.10 to suppress single-tick noise.
+        // Computed before urgency so chaos amplifies the composite score.
         // Numerically safe: skip update when |Δpₜ₋₁| < ε.
         let lyapunov_exponent = {
             const FTLE_ALPHA: f64 = 0.10;
@@ -547,6 +537,18 @@ impl SignalIntelligence {
             self.lyapunov_prev_delta = delta;
             self.lyapunov_ema
         };
+
+        // ── 8. Urgency score compuesto (includes Lyapunov chaos) ─────────
+        let urgency = compute_urgency(
+            pressure_smooth,
+            pressure_velocity,
+            regime_shift_up,
+            p_oom_30s,
+            monopoly_risk,
+            stability_regime,
+            entropy_anomaly,
+            lyapunov_exponent,
+        );
 
         SignalDigest {
             pressure_smooth,
@@ -1127,6 +1129,7 @@ fn compute_urgency(
     monopoly_risk: f64,
     stability_regime: StabilityRegime,
     entropy_anomaly: f64,
+    lyapunov: f64,
 ) -> f64 {
     let mut score = 0.0;
     score += pressure * 0.30;
@@ -1152,6 +1155,13 @@ fn compute_urgency(
     if entropy_anomaly > 1.0 {
         score += ((entropy_anomaly - 1.0) / 3.0).clamp(0.0, 1.0) * 0.05;
     }
+
+    // Lyapunov chaos: positive λ amplifies urgency — trajectory is diverging.
+    // [Wolf et al. 1985] cap contribution at 0.10 to prevent dominating other signals.
+    if lyapunov > 0.0 {
+        score += lyapunov.min(2.0) / 2.0 * 0.10;
+    }
+
     score.clamp(0.0, 1.0)
 }
 
@@ -2001,7 +2011,7 @@ mod tests {
         let pressures = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
         let mut prev_urgency = -1.0;
         for &p in &pressures {
-            let u = compute_urgency(p, 0.0, false, 0.0, 0.0, StabilityRegime::Degenerate, 0.0);
+            let u = compute_urgency(p, 0.0, false, 0.0, 0.0, StabilityRegime::Degenerate, 0.0, 0.0);
             assert!(
                 u >= prev_urgency,
                 "urgency not monotonic: p={}, urgency={}, prev={}",
@@ -2016,9 +2026,9 @@ mod tests {
     /// compute_urgency must be bounded [0, 1] even with extreme inputs.
     #[test]
     fn test_urgency_bounded_extreme_inputs() {
-        let u = compute_urgency(1.0, 1.0, true, 1.0, 1.0, StabilityRegime::Unstable, 5.0);
+        let u = compute_urgency(1.0, 1.0, true, 1.0, 1.0, StabilityRegime::Unstable, 5.0, 2.0);
         assert!(u >= 0.0 && u <= 1.0, "urgency {} out of bounds", u);
-        let u_zero = compute_urgency(0.0, 0.0, false, 0.0, 0.0, StabilityRegime::Degenerate, 0.0);
+        let u_zero = compute_urgency(0.0, 0.0, false, 0.0, 0.0, StabilityRegime::Degenerate, 0.0, 0.0);
         assert!(u_zero >= 0.0 && u_zero <= 1.0);
     }
 
