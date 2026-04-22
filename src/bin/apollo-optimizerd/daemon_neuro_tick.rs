@@ -144,6 +144,8 @@ pub fn apply_neuromodulator(
                 0.0
             }
         },
+        cumulative_stress: signal_digest.cumulative_stress,
+        lyapunov_norm: (signal_digest.lyapunov_exponent / 2.0).clamp(0.0, 1.0),
     };
     lctx.neuromod.tick(&neuro_signals);
 

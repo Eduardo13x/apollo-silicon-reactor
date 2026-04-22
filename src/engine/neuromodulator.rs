@@ -79,6 +79,14 @@ pub struct NeuroSignals {
     /// High contention = unexpected memory-access pattern = ACh novelty signal.
     /// [Hasler & Mahowald 1994] — attentional gating amplifies novel stimuli.
     pub contention_stall_fraction: f64,
+
+    /// Cumulative stress EMA [0.0, 1.0]. [Yerkes & Dodson 1908] chronic arousal.
+    /// Amplifies NA beyond single-cycle urgency — models sustained stress state.
+    pub cumulative_stress: f64,
+
+    /// Lyapunov exponent, normalized to [0,1] at λ=2.0. [Wolf et al. 1985]
+    /// Positive = trajectory diverging (chaotic). Boosts NA preemptively.
+    pub lyapunov_norm: f64,
 }
 
 pub struct ApolloNeuromodulator {
@@ -139,7 +147,13 @@ impl ApolloNeuromodulator {
         let na_velocity = (s.pressure_velocity * 2.0).clamp(0.0, 0.3);
         let na_thermal = s.thermal_stress.clamp(0.0, 1.0) * 0.2;
         let na_ode = s.ode_swap_urgency.clamp(0.0, 1.0) * 0.15;
-        let na_signal = (na_urgency + na_regime + na_velocity + na_thermal + na_ode).clamp(0.0, 1.0);
+        // [Yerkes & Dodson 1908] chronic stress amplifies NA beyond instant urgency.
+        let na_stress = s.cumulative_stress.clamp(0.0, 1.0) * 0.07;
+        // [Wolf et al. 1985] trajectory divergence is a predictive NA trigger.
+        let na_lyapunov = s.lyapunov_norm.clamp(0.0, 1.0) * 0.05;
+        let na_signal = (na_urgency + na_regime + na_velocity + na_thermal + na_ode
+            + na_stress + na_lyapunov)
+            .clamp(0.0, 1.0);
         self.noradrenaline =
             (self.noradrenaline * (1.0 - DECAY) + na_signal * DECAY).clamp(0.0, 1.0);
 
@@ -273,6 +287,8 @@ mod tests {
             rl_exploring: false,
             tau_divergence: 0.0,
             contention_stall_fraction: 0.0,
+            cumulative_stress: 0.0,
+            lyapunov_norm: 0.0,
         }
     }
 
