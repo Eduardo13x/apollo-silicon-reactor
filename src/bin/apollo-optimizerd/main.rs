@@ -15,6 +15,7 @@ mod daemon_action_safety;
 mod daemon_agent_actions;
 mod daemon_behavior_pids;
 mod daemon_cluster_actions;
+mod daemon_thermal_freeze;
 mod daemon_paging_hints;
 mod daemon_signal_tick;
 mod daemon_skill_tick;
@@ -2013,95 +2014,17 @@ fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                // Thermal Pre-Throttle: proactively freeze SilentDaemon/Stale backgrounds at
-                // Phase3Aggressive (≥90°C) before hardware throttling causes visible stutter.
-                // M1 Air has no fan — acting here is 5-10°C ahead of the hardware ceiling.
-                // Unfreeze when temperature drops back to Phase2 or below (hysteresis built into
-                // ThermalBailout keeps us from thrashing).
-                if thermal_action.freeze_background || thermal_action.freeze_all_non_critical {
-                    let policy_protected = state
-                        .policy
-                        .lock_recover()
-                        .learned_policy
-                        .protected_patterns
-                        .clone();
-                    let fg_pid = foreground_pid;
-                    let mut frozen_guard = state.frozen_state.lock_recover();
-                    let mut thermal_frozen = 0u32;
-                    // Phase3: only freeze idle backgrounds (<2% CPU).
-                    // Phase4: freeze everything non-critical regardless of CPU.
-                    let cpu_threshold: f32 = if thermal_action.freeze_all_non_critical {
-                        100.0 // Phase4: no CPU filter
-                    } else {
-                        2.0 // Phase3: only idle processes
-                    };
-
-                    for (pid, process) in collector.system().processes() {
-                        let pid_u32 = pid.as_u32();
-                        let name = process.name().to_string();
-                        let cpu = process.cpu_usage();
-                        if cpu > cpu_threshold
-                            || Some(pid_u32) == fg_pid
-                            || is_protected_name(&name)
-                            || policy_protected.iter().any(|p| name.contains(p.as_str()))
-                            || name == "apollo-optimizerd"
-                            || frozen_guard.contains_key(&pid_u32)
-                        {
-                            continue;
-                        }
-                        if thermal_frozen >= 80 {
-                            break;
-                        }
-                        if unsafe { libc::kill(pid_u32 as i32, libc::SIGSTOP) } == 0 {
-                            frozen_guard.insert(
-                                pid_u32,
-                                FrozenEntry {
-                                    frozen_at: Utc::now(),
-                                    source: FreezeSource::ThermalPreThrottle,
-                                    pressure_at_freeze: snapshot.pressure.memory_pressure,
-                                    process_name: Some(name.clone()),
-                                    start_sec: apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid_u32)
-                                        .map(|pi| pi.start_sec)
-                                        .unwrap_or(0),
-                                    original_jetsam_priority: None,
-                                },
-                            );
-                            thermal_frozen += 1;
-                        }
-                    }
-                    if thermal_frozen > 0 {
-                        write_frozen_state(&frozen_state_path, &frozen_guard);
-                        state.metrics.lock_recover().metrics.freezes_applied +=
-                            thermal_frozen as u64;
-                        println!(
-                            "[thermal] Phase {:?}: froze {} background processes (pre-throttle)",
-                            thermal_action.phase, thermal_frozen
-                        );
-                    }
-                    drop(frozen_guard);
-                } else {
-                    // Temperature dropped back to Phase2 or below — unfreeze any PIDs we froze
-                    // thermally so the system returns to normal when it's cool enough.
-                    let thermal_frozen_pids: Vec<u32> = {
-                        let frozen_guard = state.frozen_state.lock_recover();
-                        frozen_guard
-                            .iter()
-                            .filter(|(_, e)| e.source == FreezeSource::ThermalPreThrottle)
-                            .map(|(&pid, _)| pid)
-                            .collect()
-                    };
-                    if !thermal_frozen_pids.is_empty() {
-                        let n = unfreeze_pids(thermal_frozen_pids.iter().copied());
-                        let mut frozen_guard = state.frozen_state.lock_recover();
-                        for pid in &thermal_frozen_pids {
-                            frozen_guard.remove(pid);
-                        }
-                        write_frozen_state(&frozen_state_path, &frozen_guard);
-                        drop(frozen_guard);
-                        state.metrics.lock_recover().metrics.unfreezes_applied += n;
-                        println!("[thermal] Cooled: unfroze {} pre-throttled processes", n);
-                    }
-                }
+                // Thermal pre-throttle freeze/unfreeze.
+                // Extracted to daemon_thermal_freeze::run_thermal_freeze (Wave 20).
+                // M1 Air has no fan — acting 5-10°C ahead of the hardware ceiling.
+                daemon_thermal_freeze::run_thermal_freeze(
+                    &thermal_action,
+                    &state,
+                    &collector,
+                    foreground_pid,
+                    snapshot.pressure.memory_pressure,
+                    std::path::Path::new(&frozen_state_path),
+                );
 
                 // HwPredictor: sample hardware signals every 10 cycles (~5s at normal rate).
                 // Runs in <50ms (16MB cache probe + 32MB BW probe) and gives advance warning
