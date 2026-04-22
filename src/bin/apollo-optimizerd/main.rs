@@ -13,6 +13,7 @@ mod cognitive_tick;
 mod daemon_action_pipeline;
 mod daemon_action_safety;
 mod daemon_behavior_pids;
+mod daemon_paging_hints;
 mod daemon_signal_tick;
 mod daemon_skill_tick;
 mod daemon_chromium_tick;
@@ -97,10 +98,7 @@ use apollo_optimizer::engine::predictive_agent::{
 use apollo_optimizer::engine::proc_taskinfo;
 use apollo_optimizer::engine::profile_governor::GovernorInput;
 use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
-use apollo_optimizer::engine::safety::{
-    critical_background_processes, enforce_limits_with_budget, is_protected_name,
-    is_user_interactive_app,
-};
+use apollo_optimizer::engine::safety::{critical_background_processes, enforce_limits_with_budget, is_protected_name};
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
 use apollo_optimizer::engine::smc_reader::SmcReader;
 use apollo_optimizer::engine::sysctl_governor::{
@@ -3817,149 +3815,19 @@ fn main() -> anyhow::Result<()> {
                     _ => {} // Observe, TightenThresholds, SuggestAggressive handled above
                 }
 
-                // Direct paging hints: when pressure > 0.60, hint top 3 background
-                // memory consumers. Safe (voluntary cache release, no freeze/kill).
-                // Rate-limited by safety module's max_paging_hints_per_cycle.
-                // BUG #2 fix: per-PID dedup instead of "any SetMemorystatus → skip all".
-                // Old check would skip ALL three processes if any one already had a hint
-                // (e.g. from the predictive agent), wasting the remaining budget.
-                let hinted_pids: std::collections::HashSet<u32> = actions
-                    .iter()
-                    .filter_map(|a| {
-                        if let RootAction::SetMemorystatus { pid, .. } = a {
-                            Some(*pid)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if signal_digest.pressure_smooth >= 0.60 {
-                    let protected_pats = state
-                        .policy
-                        .lock_recover()
-                        .learned_policy
-                        .protected_patterns
-                        .clone();
-                    // Use proc_snaps (full process list) not top_processes (top 10 by CPU).
-                    // Only skip core interactive apps — paging hints are gentle (voluntary
-                    // cache release), so we use a tighter filter than freeze/throttle.
-                    let mut bg_procs: Vec<_> = proc_snaps
-                        .iter()
-                        .filter(|p| {
-                            // Skip hardcoded interactive apps (Brave, Chrome, etc.) —
-                            // these are boosted by decide_actions; hinting them causes
-                            // boost↔degrade thrashing that inflates wired memory.
-                            if is_interactive_app_name(&p.name) {
-                                return false;
-                            }
-                            // Skip system-critical, infra, dev-runtime, interactive, and
-                            // policy-protected processes. [Saltzer & Kaashoek 2009]
-                            let is_interactive =
-                                is_user_interactive_app(p.has_gui_window, p.secs_since_user_interaction, p.rss_bytes, &p.name);
-                            !is_protected_name(&p.name)
-                                && !is_interactive
-                                && !protected_pats.iter().any(|pat| p.name.contains(pat.as_str()))
-                                && p.rss_bytes > 80 * 1024 * 1024 // >80 MB RSS
-                                && p.pid != std::process::id()
-                                && !p.has_gui_window
-                                // Skip foreground app
-                                && foreground_app.as_ref().map(|fg| p.name != *fg).unwrap_or(true)
-                                // Skip processes with recent interaction (<60s)
-                                && p.secs_since_user_interaction > 60
-                        })
-                        .collect();
-                    bg_procs.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
-                    let mut added = 0usize;
-                    for proc in bg_procs.iter() {
-                        if added >= 3 {
-                            break;
-                        }
-                        // Per-PID dedup: skip if this process already has a hint.
-                        if hinted_pids.contains(&proc.pid) {
-                            continue;
-                        }
-                        actions.push(RootAction::set_memorystatus(
-                            proc.pid,
-                            -1,
-                            format!(
-                                "pressure-driven hint (p={:.0}%): {} ({}MB)",
-                                signal_digest.pressure_smooth * 100.0,
-                                proc.name,
-                                proc.rss_bytes / 1024 / 1024,
-                            ),
-                        ));
-                        added += 1;
-                    }
-                }
-
-                // G20 — Velocity Paging Hints: ODE net-rate > 0.5 triggers paging hints even
-                // when kernel pressure < 0.60. ODE is a leading indicator: rising compression
-                // rate predicts pressure before the kernel threshold fires.
-                // [Hellerstein 2004 §9 — derivative control acts before integrator saturates]
+                // Direct pressure hints + G20 ODE velocity hints.
+                // Extracted to daemon_paging_hints::run_paging_hints (Wave 17).
+                // [Jiang & Zhang 2005] proactive beats reactive; [Hellerstein 2004 §9] ODE leads.
                 {
-                    use apollo_optimizer::engine::swap_reclaim::{CyberPhysicalSignal, NetRateNorm};
-                    let ode_rate_norm = NetRateNorm(reclaim_forecast.net_rate_bps).normalized();
-                    if ode_rate_norm > 0.5 && signal_digest.pressure_smooth < 0.60 {
-                        let hinted_pids_ode: std::collections::HashSet<u32> = actions
-                            .iter()
-                            .filter_map(|a| {
-                                if let RootAction::SetMemorystatus { pid, .. } = a {
-                                    Some(*pid)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        let protected_pats = state
-                            .policy
-                            .lock_recover()
-                            .learned_policy
-                            .protected_patterns
-                            .clone();
-                        let mut bg_procs: Vec<_> = proc_snaps
-                            .iter()
-                            .filter(|p| {
-                                if is_interactive_app_name(&p.name) {
-                                    return false;
-                                }
-                                let is_interactive = is_user_interactive_app(
-                                    p.has_gui_window,
-                                    p.secs_since_user_interaction,
-                                    p.rss_bytes,
-                                    &p.name,
-                                );
-                                !is_protected_name(&p.name)
-                                    && !is_interactive
-                                    && !protected_pats.iter().any(|pat| p.name.contains(pat.as_str()))
-                                    && p.rss_bytes > 80 * 1024 * 1024
-                                    && p.pid != std::process::id()
-                                    && !p.has_gui_window
-                                    && foreground_app.as_ref().map(|fg| p.name != *fg).unwrap_or(true)
-                                    && p.secs_since_user_interaction > 60
-                            })
-                            .collect();
-                        bg_procs.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
-                        let mut added = 0usize;
-                        for proc in bg_procs.iter() {
-                            if added >= 2 {
-                                break;
-                            }
-                            if hinted_pids_ode.contains(&proc.pid) {
-                                continue;
-                            }
-                            actions.push(RootAction::set_memorystatus(
-                                proc.pid,
-                                -1,
-                                format!(
-                                    "ode-velocity hint (net_rate={:.0}%): {} ({}MB)",
-                                    ode_rate_norm * 100.0,
-                                    proc.name,
-                                    proc.rss_bytes / 1024 / 1024,
-                                ),
-                            ));
-                            added += 1;
-                        }
-                    }
+                    let hint_new = daemon_paging_hints::run_paging_hints(
+                        &proc_snaps,
+                        &state,
+                        signal_digest.pressure_smooth,
+                        reclaim_forecast.net_rate_bps,
+                        foreground_app.as_deref(),
+                        &actions,
+                    );
+                    actions.extend(hint_new);
                 }
 
                 // ── Heuristic pass: AdaptiveGovernor + protection scoring ────────────
