@@ -25,6 +25,7 @@ mod daemon_signal_tick;
 mod daemon_skill_tick;
 mod daemon_chromium_tick;
 mod daemon_cognitive_tick;
+mod daemon_memory_budget;
 mod daemon_survival_tick;
 mod daemon_cycle_tail;
 mod daemon_feature_gates;
@@ -95,7 +96,6 @@ use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
 use apollo_optimizer::engine::mach_qos::{MachQoSManager, SchedulingTier};
 use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
-use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
 use apollo_optimizer::engine::network_optimizer::NetworkProfile;
 use apollo_optimizer::engine::overflow_guard::{is_build_tool_name, OverflowGuard};
 use apollo_optimizer::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
@@ -1799,63 +1799,16 @@ fn main() -> anyhow::Result<()> {
                 }
                 wake_storm.cleanup_stale(Duration::from_secs(300));
 
-                // Memory budgets: compute and enforce jetsam limits when pressure ≥ 0.60.
-                // Only recompute under pressure to avoid unnecessary syscalls in idle.
-                if snapshot.pressure.memory_pressure >= 0.60 {
-                    let usage_guard = state.usage.lock_recover();
-                    let budget_inputs: Vec<ProcessBudgetInput> = proc_snaps
-                        .iter()
-                        .take(30) // Top 30 processes
-                        .filter(|s| s.rss_bytes > 50 * 1024 * 1024) // Only >50MB
-                        .map(|s| {
-                            let (presence, interactive) = usage_guard
-                                .usage_model
-                                .entries()
-                                .get(&s.name.to_ascii_lowercase())
-                                .map(|e| (e.presence_ema, e.interactive_ema))
-                                .unwrap_or((0.1, 0.0));
-                            // Use real WSS from TASK_VM_INFO when available,
-                            // fall back to fault-rate heuristic.
-                            let wss_bytes = query_memory_profile(s.pid)
-                                .map(|p| p.working_set_bytes)
-                                .unwrap_or_else(|| {
-                                    let fault_rate = mem_analyzer.major_fault_rate(s.pid);
-                                    if fault_rate > 50.0 {
-                                        (s.rss_bytes as f64 * 1.3) as u64
-                                    } else {
-                                        s.rss_bytes
-                                    }
-                                });
-                            ProcessBudgetInput {
-                                pid: s.pid,
-                                name: s.name.clone(),
-                                rss_bytes: s.rss_bytes,
-                                working_set_bytes: wss_bytes,
-                                is_foreground: s.has_gui_window && s.secs_since_foreground == 0,
-                                is_build_tool: is_build_tool_name(&s.name),
-                                presence_ema: presence,
-                                interactive_ema: interactive,
-                            }
-                        })
-                        .collect();
-                    drop(usage_guard);
-
-                    if !budget_inputs.is_empty() {
-                        let budgets = memory_budget::compute_budgets(
-                            snapshot.memory.total_ram,
-                            &budget_inputs,
-                        );
-
-                        // Apply jetsam inactive limits for over-budget processes.
-                        for budget in budgets.iter().filter(|b| b.over_budget) {
-                            let _ = jetsam_control::set_memlimit(
-                                budget.pid,
-                                0, // active: unlimited (don't kill foreground)
-                                budget.inactive_limit_mb,
-                            );
-                        }
-                    }
-                }
+                // Memory budgets: jetsam inactive limits for over-budget processes.
+                // Extracted to daemon_memory_budget::run_memory_budget (Wave 28).
+                // [Fowler 2004] Strangler Fig — pure move.
+                daemon_memory_budget::run_memory_budget(
+                    snapshot.pressure.memory_pressure,
+                    snapshot.memory.total_ram,
+                    &state,
+                    &proc_snaps,
+                    &mem_analyzer,
+                );
 
                 // Audit fix #5: Read cached hardware data from background SmcReader thread.
                 // No more blocking 500 ms powermetrics calls on the hot path.
