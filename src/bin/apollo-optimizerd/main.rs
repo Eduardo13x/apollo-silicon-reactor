@@ -13,6 +13,7 @@ mod cognitive_tick;
 mod daemon_action_pipeline;
 mod daemon_action_safety;
 mod daemon_behavior_pids;
+mod daemon_cluster_actions;
 mod daemon_paging_hints;
 mod daemon_signal_tick;
 mod daemon_skill_tick;
@@ -3653,98 +3654,23 @@ fn main() -> anyhow::Result<()> {
                     actions.extend(skill_new);
                 }
 
-                // Coordinated multi-process freezing (Pearl 2009 causal clusters).
-                // If process A is already being actioned AND B co-occurs with A during
-                // pressure spikes (≥8 observed co-occurrences), include B in this cycle.
-                // This exploits the causal graph: "Safari + cloudd together cause 20%
-                // pressure drop; individually each is only 10%."
-                // Only triggers near the overflow threshold to avoid false over-throttling.
-                if snapshot.pressure.memory_pressure
-                    >= overflow_thresholds.bg_pressure as f64 - 0.05
+                // Coordinated cluster freezing + Spotlight pressure gate.
+                // Extracted to daemon_cluster_actions::run_cluster_actions (Wave 18).
                 {
                     let causal_pairs = lctx.outcome_tracker.top_causal_pairs(5);
-                    let actioned: std::collections::HashSet<String> = actions
-                        .iter()
-                        .filter_map(|a| match a {
-                            RootAction::ThrottleProcess { name, .. }
-                            | RootAction::FreezeProcess { name, .. } => Some(name.clone()),
-                            _ => None,
-                        })
-                        .collect();
-                    for (pa, pb, count) in &causal_pairs {
-                        if *count < 8 {
-                            continue;
-                        }
-                        let a_acted = actioned.iter().any(|n| n.contains(pa));
-                        let b_acted = actioned.iter().any(|n| n.contains(pb));
-                        if a_acted == b_acted {
-                            continue; // both already actioned or neither
-                        }
-                        let missing = if a_acted { pb } else { pa };
-                        let partner = if a_acted { pa } else { pb };
-                        // Find the missing co-cluster partner and throttle it.
-                        for (pid, proc) in collector.system().processes() {
-                            let proc_name = proc.name().to_string();
-                            if proc_name.contains(missing)
-                                && !actioned.iter().any(|n| n.contains(missing))
-                            {
-                                actions.push(RootAction::throttle(
-                                    pid.as_u32(),
-                                    proc_name,
-                                    false,
-                                    format!(
-                                        "coordinated-cluster: co-occurs with {} (n={})",
-                                        partner, count
-                                    ),
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Spotlight pressure gate: pause indexing when swap is heavy and
-                // re-enable when pressure normalizes.  Uses mdutil (clean handshake
-                // with Spotlight server) rather than SIGSTOP — no index corruption risk.
-                // Gate: memory_pressure ≥ 0.75 AND swap ≥ 1.5 GB → pause.
-                // Re-enable: memory_pressure < 0.40 AND paused ≥ 120s (cooldown).
-                // Previous re-enable at 0.55 was too aggressive — caused rapid
-                // on/off oscillation and mdworker memory storms.
-                {
-                    let mem_p = snapshot.pressure.memory_pressure;
-                    let swap_gb =
-                        snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                    let can_mdutil = std::path::Path::new("/usr/bin/mdutil").exists();
-                    if can_mdutil {
-                        if !spotlight_paused && mem_p >= 0.75 && swap_gb >= 1.5 {
-                            actions.push(
-                                apollo_optimizer::engine::types::RootAction::ToggleSpotlight {
-                                    enabled: false,
-                                    reason: format!(
-                                        "swap-pressure: mem={:.2} swap={:.1}GB",
-                                        mem_p, swap_gb
-                                    ),
-                                },
-                            );
-                            spotlight_paused = true;
-                            spotlight_paused_at = Some(Instant::now());
-                        } else if spotlight_paused && mem_p < 0.35
-                            && swap_gb < 1.0
-                            && spotlight_paused_at
-                                .map(|t| t.elapsed() >= Duration::from_secs(300))
-                                .unwrap_or(true)
-                        {
-                            actions.push(
-                                apollo_optimizer::engine::types::RootAction::ToggleSpotlight {
-                                    enabled: true,
-                                    reason: "pressure-normalized: re-enabling spotlight"
-                                        .to_string(),
-                                },
-                            );
-                            spotlight_paused = false;
-                            spotlight_paused_at = None;
-                        }
-                    }
+                    let cluster_out = daemon_cluster_actions::run_cluster_actions(
+                        &causal_pairs,
+                        &actions,
+                        &collector,
+                        snapshot.pressure.memory_pressure,
+                        snapshot.pressure.swap_used_bytes,
+                        overflow_thresholds.bg_pressure,
+                        spotlight_paused,
+                        spotlight_paused_at,
+                    );
+                    actions.extend(cluster_out.new_actions);
+                    spotlight_paused = cluster_out.spotlight_paused;
+                    spotlight_paused_at = cluster_out.spotlight_paused_at;
                 }
 
                 // Predictive agent: inject soft actions for PreThrottleNoise / ProactivePurge.
