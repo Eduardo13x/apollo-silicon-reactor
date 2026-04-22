@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 /// that the main loop checks alongside `state.stop`.
 mod cognitive_tick;
 mod daemon_action_pipeline;
+mod daemon_action_safety;
 mod daemon_chromium_tick;
 mod daemon_cognitive_tick;
 mod daemon_cycle_tail;
@@ -4314,205 +4315,32 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Heuristic pass: AdaptiveGovernor
-                // Pass hw_features (sampled every 5 cycles) for Bayesian fusion + online learning.
-                // Wire ODE swap risk + high-τ PIDs so idle thresholds and freeze decisions
-                // reflect physical memory state. [Denning 1968] high-τ = slow WSS re-growth.
-                const HIGH_TAU_SEC: f64 = 300.0;
-                let heuristic_decisions = {
-                    let mut pg = state.policy.lock_recover();
-                    pg.adaptive_governor.swap_risk = reclaim_forecast.risk;
-                    pg.adaptive_governor.high_tau_pids = proc_snaps
-                        .iter()
-                        .filter(|s| {
-                            unfreeze_decay.tau_for_app(&s.name) > HIGH_TAU_SEC
-                        })
-                        .map(|s| s.pid)
-                        .collect();
-                    pg.adaptive_governor.decide_all_with_hw(
-                        &proc_snaps,
-                        &hunt_snaps,
-                        foreground_app.as_deref(),
-                        &all_proc_names,
-                        hour_of_day,
-                        hw_features,
-                    )
-                };
-
-                // Build critical_pids set for heuristic merge.
-                //
-                // Infrastructure (docker, postgres, redis) → always protected.
-                // Dev runtimes (python, node, java, go, nginx) → protected only
-                // when behaviorally active (Android LMK + TMO ASPLOS'22 model).
-                // Score compared against system pressure: as memory stress rises,
-                // only truly active dev runtimes keep their exemption.
-                let heuristic_critical_pids: HashSet<u32> = {
-                    let sys = collector.system();
-                    let infra_pats = infrastructure_processes();
-                    let protected_pats = protected_processes();
-                    let policy_protected = state
-                        .policy
-                        .lock_recover()
-                        .learned_policy
-                        .protected_patterns
-                        .clone();
-                    let pressure = signal_digest.pressure_smooth;
-                    let total_ram = apollo_optimizer::engine::sysctl_direct::read_u64("hw.memsize")
-                        .unwrap_or(8 * 1024 * 1024 * 1024);
-                    let mut cpids: HashSet<u32> = HashSet::new();
-                    let mut bps_eval = 0u64;
-                    let mut bps_prot = 0u64;
-                    let mut bps_dem = 0u64;
-                    let mut bps_min = f64::MAX;
-                    let mut bps_min_name = String::new();
-                    for (pid, process) in sys.processes() {
-                        let pid_u32 = pid.as_u32();
-                        let name = process.name().to_string();
-                        // Evaluate interactive-app behavioral signals before calling
-                        // classify_protection so the result is available for Tier 4.
-                        let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
-                        let has_gui = snap.map_or(false, |s| s.has_gui_window);
-                        let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
-                        let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
-                        let is_interactive = is_user_interactive_app(has_gui, idle_s, rss, &name);
-                        match classify_protection(
-                            &name,
-                            &protected_pats,
-                            &infra_pats,
-                            &policy_protected,
-                            is_interactive,
-                        ) {
-                            ProtectionLevel::Unconditional => {
-                                // OS/system essentials, infrastructure, policy-learned
-                                // daemons → always skip.
-                                cpids.insert(pid_u32);
-                                continue;
-                            }
-                            ProtectionLevel::ConditionalForeground => {
-                                // User-interactive apps: protect when foreground, eligible
-                                // for QoS hint / throttle when in background.
-                                if Some(pid_u32) == foreground_pid {
-                                    cpids.insert(pid_u32);
-                                }
-                                // Background user app: not inserted → eligible for
-                                // throttle/QoS.
-                                continue;
-                            }
-                            ProtectionLevel::Unprotected => {
-                                // Fall through to dev-runtime behavioral gate below.
-                            }
-                        }
-                        // Dev runtimes: behavioral gate — protection earned, not given.
-                        if matches_dev_runtime(&name) {
-                            let pid_u32 = pid.as_u32();
-                            // Re-use the enriched ProcessSnapshot already looked up above
-                            // (snap/has_gui/idle_s/rss are in scope from classify_protection
-                            // evaluation), adding wakeups and network from the same snapshot.
-                            let (cpu, wakeups, net, gui) = if let Some(s) = snap {
-                                (
-                                    s.cpu_percent,
-                                    s.wakeups_per_sec,
-                                    s.has_network,
-                                    s.has_gui_window,
-                                )
-                            } else {
-                                // Fallback: sysinfo process — limited signals but real RSS.
-                                (process.cpu_usage(), 0.0, false, false)
-                            };
-                            let raw_score = behavioral_protection_score(
-                                cpu, wakeups, net, gui, idle_s, rss, total_ram,
-                            );
-                            // Cable 5: process_relevance() → modulate BPS with user profile.
-                            // If the user actively uses this process (relevance > 0), boost
-                            // its behavioral score. If irrelevant (0.0), no change.
-                            // This means a dev runtime the user has interacted with recently
-                            // gets a relevance bonus, while one that's been stale loses it.
-                            let relevance = state
-                                .policy
-                                .lock_recover()
-                                .adaptive_governor
-                                .user_profile
-                                .process_relevance(&name);
-                            // Boost: relevance 1.0 adds up to +0.15 to score, relevance 0.0 adds 0.
-                            let score = raw_score + (relevance as f64 * 0.15);
-                            bps_eval += 1;
-                            let protected = score >= pressure as f64;
-                            if score < bps_min {
-                                bps_min = score;
-                                bps_min_name = format!("{}({})", name, pid_u32);
-                            }
-                            audit_log(&serde_json::json!({
-                                "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                                "event": "bps_eval",
-                                "pid": pid_u32,
-                                "name": name,
-                                "score": (score * 10000.0).round() / 10000.0,
-                                "raw_score": (raw_score * 10000.0).round() / 10000.0,
-                                "relevance": (relevance * 100.0).round() / 100.0,
-                                "pressure": (pressure * 1000.0).round() / 1000.0,
-                                "protected": protected,
-                                "cpu": cpu,
-                                "wakeups": wakeups,
-                                "net": net,
-                                "gui": gui,
-                                "idle_s": idle_s,
-                                "rss_mb": rss / 1024 / 1024,
-                            }));
-                            if protected {
-                                bps_prot += 1;
-                                cpids.insert(pid_u32);
-                            } else {
-                                bps_dem += 1;
-                            }
-                        }
-                    }
-                    {
-                        let mut m = state.metrics.lock_recover();
-                        m.metrics.bps_evaluated += bps_eval;
-                        m.metrics.bps_protected += bps_prot;
-                        m.metrics.bps_demoted += bps_dem;
-                        if bps_min < f64::MAX {
-                            m.metrics.bps_min_score = bps_min;
-                            m.metrics.bps_min_score_name = bps_min_name;
-                        }
-                    }
-                    // AMX/ML workloads: never throttle/freeze ML inference processes.
-                    cpids.extend(amx_detector::ml_protected_pids());
-                    cpids
-                };
-
-                // Convert heuristic decisions to RootActions and merge
-                let (heuristic_actions, heuristic_stats) =
-                    process_enrichment::convert_and_merge_heuristic_decisions(
-                        &heuristic_decisions,
-                        &actions,
-                        &heuristic_critical_pids,
-                    );
-                // Cable 2: query_similar() → skip throttles that experience says won't work.
-                // If we have ≥3 records of throttling process X at similar pressure and it
-                // never helped (avg_drop ≤ 0), skip wasting the action budget on it.
-                let current_pressure = snapshot.pressure.memory_pressure;
-                let exp_band = learnable_params.experience_pressure_band;
-                let heuristic_actions: Vec<RootAction> = heuristic_actions
-                    .into_iter()
-                    .filter(|a| {
-                        if let RootAction::ThrottleProcess { ref name, .. } = a {
-                            if let Some((avg_drop, confidence)) = lctx
-                                .outcome_tracker
-                                .experience
-                                .query_similar_with_band(name, current_pressure, exp_band)
-                            {
-                                if confidence >= 0.5 && avg_drop <= 0.0 {
-                                    // Experience says throttling this process at this pressure
-                                    // has never reduced pressure. Skip it.
-                                    return false;
-                                }
-                            }
-                        }
-                        true
-                    })
-                    .collect();
-                actions.extend(heuristic_actions);
+                // ── Heuristic pass: AdaptiveGovernor + protection scoring ────────────
+                // Extracted to daemon_action_safety::run_heuristic_pass (Wave 13).
+                // [Saltzer & Kaashoek 2009] Complete Mediation — single callsite for
+                // all protection decisions. [Denning 1968] high-τ PIDs wired to ODE model.
+                let heuristic_pass = daemon_action_safety::run_heuristic_pass(
+                    &proc_snaps,
+                    &hunt_snaps,
+                    foreground_app.as_deref(),
+                    foreground_pid,
+                    &all_proc_names,
+                    hour_of_day,
+                    hw_features,
+                    &state,
+                    signal_digest.pressure_smooth,
+                    &unfreeze_decay,
+                    &reclaim_forecast,
+                    &collector,
+                    &actions,
+                    &lctx.outcome_tracker.experience,
+                    learnable_params.experience_pressure_band,
+                    snapshot.pressure.memory_pressure,
+                );
+                let heuristic_decisions = heuristic_pass.heuristic_decisions;
+                let heuristic_critical_pids = heuristic_pass.heuristic_critical_pids;
+                let heuristic_stats = heuristic_pass.heuristic_stats;
+                actions.extend(heuristic_pass.additional_actions);
 
                 // Cable: stale_apps() → nominate stale background apps as freeze candidates.
                 // When pressure is elevated, apps the user hasn't interacted with for >30min
