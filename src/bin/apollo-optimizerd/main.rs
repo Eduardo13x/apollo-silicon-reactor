@@ -14,6 +14,7 @@ mod daemon_action_pipeline;
 mod daemon_action_safety;
 mod daemon_agent_actions;
 mod daemon_behavior_pids;
+mod daemon_kqueue_tick;
 mod daemon_cluster_actions;
 mod daemon_stale_apps;
 mod daemon_thermal_freeze;
@@ -2135,85 +2136,20 @@ fn main() -> anyhow::Result<()> {
                 let mut reactor_weight = state.metrics.lock_recover().reactor_event_weight;
                 reactor_weight = (reactor_weight * 0.75).clamp(0.0, 1.0);
 
-                // kqueue: consume VM pressure events from kernel push notifications.
-                // Critical/SuddenTerminate → boost reactor_weight + engage fast-tick.
-                // This is the fastest possible pressure detection — zero polling latency.
-                if let Some(ref mut kq) = kq_frozen {
-                    for event in kq.poll_events() {
-                        match event {
-                            kqueue_pressure::PressureEvent::VmPressure(level) => {
-                                use kqueue_pressure::VmPressureLevel;
-                                match level {
-                                    VmPressureLevel::Critical
-                                    | VmPressureLevel::SuddenTerminate => {
-                                        reactor_weight = 1.0;
-                                        state.metrics.lock_recover().fast_tick_until =
-                                            Some(Instant::now() + Duration::from_secs(30));
-                                        println!(
-                                            "kqueue: VM pressure {:?} — fast-tick engaged",
-                                            level
-                                        );
-                                        // Registrar overflow: ajustar thresholds para prevenir próxima vez.
-                                        // Excluir el propio daemon — aparece en top_processes durante
-                                        // survival-mode por el trabajo intensivo que hace, contaminando
-                                        // el diagnóstico de causa del overflow.
-                                        let heavy: Vec<String> = snapshot
-                                            .top_processes
-                                            .iter()
-                                            .filter(|p| p.name != "apollo-optimizerd")
-                                            .take(8)
-                                            .map(|p| p.name.clone())
-                                            .collect();
-                                        lctx.overflow_guard.record_event(
-                                            snapshot.pressure.memory_pressure,
-                                            snapshot.pressure.swap_delta_bytes_per_sec,
-                                            &heavy,
-                                            &format!("kqueue-{:?}", level),
-                                            snapshot.pressure.compressor_pressure,
-                                            &learnable_params.rl_pressure_bands,
-                                            &learnable_params.rl_compressor_bands,
-                                        );
-                                        // Teach hazard model only on real OOM indicators:
-                                        // swap must be GROWING (delta > 512KB/s) and present
-                                        // (> 10% used). kqueue Critical fires at ~80% pressure
-                                        // which is normal; training on it saturates base_rate.
-                                        let sr = if snapshot.pressure.swap_total_bytes > 0 {
-                                            snapshot.pressure.swap_used_bytes as f64
-                                                / snapshot.pressure.swap_total_bytes as f64
-                                        } else {
-                                            0.0
-                                        };
-                                        let swap_growing =
-                                            snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
-                                        if sr > 0.10 && swap_growing {
-                                            lctx.signal_intel.record_overflow(
-                                                snapshot.pressure.memory_pressure,
-                                                sr,
-                                                snapshot.pressure.memory_pressure,
-                                            );
-                                        }
-                                    }
-                                    VmPressureLevel::Warning => {
-                                        reactor_weight = (reactor_weight + 0.5).min(1.0);
-                                    }
-                                    VmPressureLevel::Normal => {}
-                                }
-                            }
-                            kqueue_pressure::PressureEvent::ProcessExited(pid) => {
-                                // Frozen process died (jetsam/OOM) — clean up immediately.
-                                let mut frozen_state = state.frozen_state.lock_recover();
-                                if frozen_state.remove(&pid).is_some() {
-                                    write_frozen_state(&frozen_state_path, &frozen_state);
-                                    state.metrics.lock_recover().metrics.unfreezes_applied += 1;
-                                }
-                                // Also clean up display turbo's set — prevents unbounded
-                                // growth if many processes die while frozen during turbo.
-                                display_turbo.remove_pid(pid);
-                            }
-                            kqueue_pressure::PressureEvent::TimerTick => {}
-                        }
-                    }
-                }
+                // kqueue: consume VM pressure events (kernel push, zero latency).
+                // Extracted to daemon_kqueue_tick::run_kqueue_tick (Wave 26).
+                // Critical/SuddenTerminate → reactor_weight=1.0 + fast-tick 30s.
+                daemon_kqueue_tick::run_kqueue_tick(
+                    &mut kq_frozen,
+                    &mut reactor_weight,
+                    &state,
+                    &snapshot,
+                    &mut lctx.overflow_guard,
+                    lctx.signal_intel,
+                    &mut display_turbo,
+                    &frozen_state_path,
+                    &learnable_params,
+                );
 
                 // hw_predictor can elevate pressure before standard metrics catch up.
                 let hw_boost = match hw_pressure {
