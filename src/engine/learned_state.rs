@@ -491,7 +491,9 @@ pub struct LearnedState {
 /// Version history:
 /// - 0: implicit (files written before versioning was added — no `version` key)
 /// - 1: first versioned baseline; no structural changes from v0
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// - 2: KalmanMV8 slot 3 semantics changed (pressure proxy → lyapunov_norm);
+///       kf_mv is reset to None so the filter reconverges cleanly [Wolf 1985 FTLE]
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 fn default_version() -> u32 {
     // Files that pre-date schema versioning have no `version` key.
@@ -520,6 +522,17 @@ pub fn try_migrate(schema_version: u32, mut state: LearnedState) -> LearnedState
             0 => {
                 state.version = 1;
                 v = 1;
+            }
+            // v1 → v2: KalmanMV8 slot 3 changed from pressure proxy to lyapunov_norm.
+            // Stale x[3] carries wrong-domain state; reset so the filter reconverges
+            // in ~10 cycles rather than starting with a corrupted initial estimate.
+            // [Wolf et al. 1985 Physica D §3] — FTLE slot is orthogonal to pressure.
+            1 => {
+                if let Some(si) = state.signal_intelligence.as_mut() {
+                    si.kf_mv = None;
+                }
+                state.version = 2;
+                v = 2;
             }
             // Up to date — nothing left to migrate.
             _ if v >= CURRENT_SCHEMA_VERSION => {
@@ -1773,6 +1786,47 @@ mod tests {
         assert_eq!(
             migrated.version, CURRENT_SCHEMA_VERSION,
             "try_migrate(0, _) must stamp version == CURRENT_SCHEMA_VERSION"
+        );
+    }
+
+    #[test]
+    fn test_migrate_v1_resets_kf_mv() {
+        // v1 → v2: kf_mv slot 3 changed semantics (pressure proxy → lyapunov_norm).
+        // Migration must clear kf_mv so the filter reconverges cleanly rather than
+        // inheriting stale slot-3 state from the previous signal assignment.
+        use crate::engine::signal_intelligence::SignalIntelligence;
+        let si_persisted = SignalIntelligence::new().to_persisted();
+        assert!(si_persisted.kf_mv.is_some(), "precondition: kf_mv present");
+        let state = LearnedState {
+            version: 1,
+            signal_intelligence: Some(si_persisted),
+            outcome_tracker: None,
+            specialist_accuracy: None,
+            persist_generations: 0,
+            last_restore_quality: None,
+            pending_trial_skill: None,
+            skill_registry: None,
+            effectiveness_tracker: None,
+            overflow_guard_history: None,
+            frozen_pids: None,
+            arousal_state: None,
+            causal_graph_edges: None,
+            process_baselines: None,
+            learnable_params: None,
+            nested_learner: None,
+            teacher_consolidator: None,
+            unfreeze_decay_tau: None,
+            neuro_state: None,
+        };
+        let migrated = try_migrate(1, state);
+        assert_eq!(migrated.version, CURRENT_SCHEMA_VERSION);
+        assert!(
+            migrated
+                .signal_intelligence
+                .as_ref()
+                .and_then(|si| si.kf_mv.as_ref())
+                .is_none(),
+            "v1→v2 must clear kf_mv to None"
         );
     }
 }
