@@ -25,6 +25,7 @@ mod daemon_signal_tick;
 mod daemon_skill_tick;
 mod daemon_chromium_tick;
 mod daemon_cognitive_tick;
+mod daemon_survival_tick;
 mod daemon_cycle_tail;
 mod daemon_feature_gates;
 mod daemon_freeze_executor;
@@ -3503,122 +3504,20 @@ fn main() -> anyhow::Result<()> {
                     actions.extend(stale_new);
                 }
 
-                // Survival Mode: active when memory pressure is critical or swap is thrashing.
-                // swap_delta_bps > 1MB/s means we're actively writing to swap (thrashing).
-                // Survival Mode: critical memory pressure or swap thrashing.
-                // p_oom_30s amplifies: if SI predicts OOM with high confidence AND
-                // pressure is already elevated (≥0.70), escalate to survival.
-                // Requires warmup (≥5 cycles) to avoid stale persisted p_oom values.
-                let p_oom_escalation = cycle_count > 5
-                    && signal_digest.p_oom_30s > 0.80
-                    && snapshot.pressure.memory_pressure >= 0.70;
-                let survival_mode = snapshot.pressure.memory_pressure > 0.85
-                    || snapshot.pressure.swap_delta_bytes_per_sec > 1_000_000.0
-                    || p_oom_escalation;
-
-                // Overflow guard: only record as overflow when there is real memory
-                // pressure (≥ 0.60).  Swap storms at low pressure (36-42%) were
-                // poisoning the guard with false positives, keeping thresholds
-                // permanently at the floor and making Apollo overly aggressive.
-                //
-                // survival_mode still gates aggressive actions (jetsam kill,
-                // freeze recovery) regardless of this gate — we just don't let
-                // low-pressure swap storms train the adaptive thresholds.
-                let real_overflow = survival_mode && snapshot.pressure.memory_pressure >= 0.60;
-                if real_overflow {
-                    let heavy: Vec<String> = snapshot
-                        .top_processes
-                        .iter()
-                        .filter(|p| p.name != "apollo-optimizerd")
-                        .take(8)
-                        .map(|p| p.name.clone())
-                        .collect();
-                    lctx.overflow_guard.record_event(
-                        snapshot.pressure.memory_pressure,
-                        snapshot.pressure.swap_delta_bytes_per_sec,
-                        &heavy,
-                        "survival-mode",
-                        snapshot.pressure.compressor_pressure,
-                        &learnable_params.rl_pressure_bands,
-                        &learnable_params.rl_compressor_bands,
-                    );
-                    let sr = if snapshot.pressure.swap_total_bytes > 0 {
-                        snapshot.pressure.swap_used_bytes as f64
-                            / snapshot.pressure.swap_total_bytes as f64
-                    } else {
-                        0.0
-                    };
-                    // Only train hazard model when swap is actively growing (real OOM risk).
-                    let swap_growing = snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
-                    if sr > 0.10 && swap_growing {
-                        lctx.signal_intel.record_overflow(
-                            snapshot.pressure.memory_pressure,
-                            sr,
-                            snapshot.pressure.memory_pressure,
-                        );
-                    }
-                }
-                // Track swap growth streak → RL meta-gate.
-                if snapshot.pressure.swap_delta_bytes_per_sec > 1_048_576.0 {
-                    swap_growth_streak = swap_growth_streak.saturating_add(1);
-                } else {
-                    swap_growth_streak = 0;
-                }
-                if let Some(rl) = lctx.overflow_guard.rl_agent.as_mut() {
-                    rl.set_swap_growth_streak(swap_growth_streak);
-                }
-
-                // Observability: count one activation per cycle survival is active.
-                // Previously the counter was declared but never incremented, so
-                // survival_mode_activations was always 0 in runtime_metrics.json.
-                let survival_active = apollo_optimizer::engine::safety::survival_mode_active_total(
-                    snapshot.pressure.memory_pressure,
-                    snapshot.pressure.swap_used_bytes,
-                    snapshot.pressure.swap_total_bytes,
-                );
-                if survival_active {
-                    state
-                        .metrics
-                        .lock_recover()
-                        .metrics
-                        .survival_mode_activations += 1;
-
-                    // Jetsam demotion: mark non-foreground Chromium renderers
-                    // as BACKGROUND so the kernel kills them first under OOM
-                    // pressure — softer than SIGSTOP, keeps them responsive
-                    // until the kernel actually reclaims. Idempotent syscall.
-                    let _ = chromium_mgr.demote_background_renderers();
-
-                    // Last-resort page reclaim: when swap crosses 80% of the
-                    // exhaustion threshold, spawn `purge` to force the kernel
-                    // to drain inactive file-backed pages. Rate-limited to
-                    // once per 10 min — purge is expensive (~2s latency) and
-                    // moderating the cadence avoids cascading I/O storms.
-                    let threshold = apollo_optimizer::engine::safety::swap_exhaustion_threshold_bytes(
-                        snapshot.pressure.swap_total_bytes,
-                    );
-                    let swap_used = snapshot.pressure.swap_used_bytes;
-                    if swap_used as f64 >= threshold as f64 * 0.80 {
-                        let can_purge = last_purge_at
-                            .map(|t| t.elapsed() >= Duration::from_secs(600))
-                            .unwrap_or(true);
-                        if can_purge {
-                            // Spawn non-blocking — purge runs in its own process
-                            // and we don't wait on it. If spawn fails the daemon
-                            // continues; the RL gate still throttles allocators.
-                            if std::process::Command::new("purge").spawn().is_ok() {
-                                last_purge_at = Some(Instant::now());
-                            }
-                        }
-                    }
-                }
-
-                // Decaimiento gradual: si el sistema está en calma, relajar thresholds.
-                lctx.overflow_guard.tick_decay(
-                    snapshot.pressure.memory_pressure,
-                    snapshot.pressure.compressor_pressure,
-                    &learnable_params.rl_pressure_bands,
-                    &learnable_params.rl_compressor_bands,
+                // Survival mode: overflow recording, swap streak, purge, threshold decay.
+                // Extracted to daemon_survival_tick::run_survival_tick (Wave 27).
+                // [Fowler 2004] Strangler Fig — pure move.
+                daemon_survival_tick::run_survival_tick(
+                    &snapshot,
+                    &signal_digest,
+                    cycle_count as u64,
+                    &mut lctx.overflow_guard,
+                    lctx.signal_intel,
+                    &learnable_params,
+                    &mut swap_growth_streak,
+                    &state,
+                    &mut chromium_mgr,
+                    &mut last_purge_at,
                 );
 
                 // ── Neuromodulator: bio-inspired parameter modulation ────────
