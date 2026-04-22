@@ -1,0 +1,185 @@
+//! # Daemon Skill Tick
+//!
+//! Per-cycle skill application extracted from main.rs (Wave 16).
+//! [Fowler 2004] Strangler Fig — pure move, no semantic change.
+//!
+//! ## Responsibilities
+//! - Apply learned skills: throttle processes with solid causal links (matching_skills)
+//! - Run trial skill: try one unproven induced skill per cycle; record result next cycle
+//!   via WAL (BUG-01 crash recovery [Gray & Reuter 1992 §11])
+//!
+//! ## Ordering invariant
+//! Must run AFTER decide_actions populates `current_actions` (for dedup), and AFTER
+//! signal_digest is available (pressure threshold gating). Returns new throttle actions
+//! to append; caller merges into the main actions vec.
+
+use std::collections::HashSet;
+
+use apollo_optimizer::collector::SystemCollector;
+use apollo_optimizer::collector::SystemSnapshot;
+use apollo_optimizer::engine::daemon_state::SharedState;
+use apollo_optimizer::engine::llm::{delete_file_best_effort, pending_trial_path, write_json_critical};
+use apollo_optimizer::engine::lock_ext::LockRecover;
+use apollo_optimizer::engine::optimization_skills::SkillRegistry;
+use apollo_optimizer::engine::safety::is_protected_name;
+use apollo_optimizer::engine::types::RootAction;
+
+/// Per-cycle skill application tick.
+///
+/// # Parameters
+/// - `skill_registry` — mutable ref to lctx.skill_registry
+/// - `snapshot` — system snapshot for this cycle
+/// - `state` — SharedState (policy lock for learned protection patterns)
+/// - `collector` — SystemCollector (process iterator for target matching)
+/// - `foreground_pid` — current foreground PID (foreground gate for trial)
+/// - `workload_mode` — current workload mode string (skill selection)
+/// - `is_root` — whether daemon runs as root (for WAL path)
+/// - `current_actions` — actions accumulated so far (for dedup)
+/// - `pending_trial_skill` — mutable: resolved on entry, set on new trial
+///
+/// # Returns
+/// New throttle actions from skills and trial (caller appends to main actions vec).
+#[allow(clippy::too_many_arguments)]
+pub fn run_skill_tick(
+    skill_registry: &mut SkillRegistry,
+    snapshot: &SystemSnapshot,
+    state: &SharedState,
+    collector: &SystemCollector,
+    foreground_pid: Option<u32>,
+    workload_mode: &str,
+    is_root: bool,
+    current_actions: &[RootAction],
+    pending_trial_skill: &mut Option<(String, f64)>,
+) -> Vec<RootAction> {
+    let mut new_actions: Vec<RootAction> = Vec::new();
+
+    // ── Apply learned skills ─────────────────────────────────────────────────
+    // Throttle processes with solid causal links (confidence × avg_delta).
+    // matching_skills() gates on pressure ≥ skill.min_pressure AND is_reliable()
+    // (≥5 observations, ≥60% success rate). [Sutton & Barto 2018]
+    {
+        let skill_matches = skill_registry.matching_skills(
+            snapshot.pressure.memory_pressure as f32,
+            workload_mode,
+        );
+        if !skill_matches.is_empty() {
+            let already_actioned: HashSet<String> = current_actions
+                .iter()
+                .filter_map(|a| match a {
+                    RootAction::ThrottleProcess { name, .. }
+                    | RootAction::FreezeProcess { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let skill_targets: HashSet<String> = skill_matches
+                .iter()
+                .flat_map(|s| s.throttle_targets.iter().cloned())
+                .collect();
+            for (pid, process) in collector.system().processes() {
+                let name = process.name().to_string();
+                // [Saltzer & Kaashoek 2009] never throttle protected daemons via skills
+                // even if the registry learned them as "effective" (stale correlation).
+                if is_protected_name(&name) {
+                    continue;
+                }
+                if skill_targets.contains(&name) && !already_actioned.contains(&name) {
+                    let skill_name = skill_matches
+                        .iter()
+                        .find(|s| s.throttle_targets.contains(&name))
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("skill");
+                    new_actions.push(RootAction::throttle(
+                        pid.as_u32(),
+                        name,
+                        false,
+                        format!("skill:{}", skill_name),
+                    ));
+                }
+            }
+        }
+    }
+
+    // ── Trial induced skills ─────────────────────────────────────────────────
+    // Each cycle at elevated pressure: try one unproven skill; record next cycle.
+    // WAL write-ahead ensures trial survives daemon crash [Gray & Reuter 1992 §11].
+    {
+        // Resolve pending trial from previous cycle.
+        if let Some((ref pending_name, pressure_before)) = *pending_trial_skill {
+            let effective = snapshot.pressure.memory_pressure < pressure_before - 0.01;
+            skill_registry.record_result_with_pressure(
+                pending_name,
+                effective,
+                pressure_before as f32,
+            );
+            *pending_trial_skill = None;
+            delete_file_best_effort(&pending_trial_path(is_root));
+        }
+
+        let trial = skill_registry.next_trial_skill(
+            snapshot.pressure.memory_pressure as f32,
+            workload_mode,
+        );
+        if let Some(skill) = trial {
+            let skill_name = skill.name.clone();
+            let pressure_before = snapshot.pressure.memory_pressure;
+            let policy_prot = state
+                .policy
+                .lock_recover()
+                .learned_policy
+                .protected_patterns
+                .clone();
+            let already_actioned: HashSet<String> = current_actions
+                .iter()
+                .chain(new_actions.iter())
+                .filter_map(|a| match a {
+                    RootAction::ThrottleProcess { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let mut trialed = false;
+            // "Foreground-blocked" ≠ "ineffective": skill couldn't run this cycle.
+            let mut targets_found_but_skipped = false;
+            for target in &skill.throttle_targets.clone() {
+                // [Saltzer & Kaashoek 2009] is_protected_name is the single truth point.
+                if is_protected_name(target)
+                    || policy_prot.iter().any(|p| target.contains(p.as_str()))
+                {
+                    continue;
+                }
+                for (pid, process) in collector.system().processes() {
+                    if process.name() == target {
+                        if Some(pid.as_u32()) == foreground_pid {
+                            targets_found_but_skipped = true;
+                        } else {
+                            if !already_actioned.contains(target) {
+                                new_actions.push(RootAction::throttle(
+                                    pid.as_u32(),
+                                    target.clone(),
+                                    false,
+                                    format!("trial:{}", skill_name),
+                                ));
+                            }
+                            trialed = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if trialed {
+                *pending_trial_skill = Some((skill_name.clone(), pressure_before));
+                write_json_critical(
+                    &pending_trial_path(is_root),
+                    &*pending_trial_skill,
+                    Some(0o600),
+                );
+            } else if targets_found_but_skipped {
+                // Foreground-blocked — skill is not penalised; wait for next cycle.
+            } else {
+                // Targets absent: mark ineffective so registry GC's the skill.
+                skill_registry.record_result(&skill_name, false);
+            }
+        }
+    }
+
+    new_actions
+}

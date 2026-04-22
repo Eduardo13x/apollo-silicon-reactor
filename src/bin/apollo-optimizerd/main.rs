@@ -14,6 +14,7 @@ mod daemon_action_pipeline;
 mod daemon_action_safety;
 mod daemon_behavior_pids;
 mod daemon_signal_tick;
+mod daemon_skill_tick;
 mod daemon_chromium_tick;
 mod daemon_cognitive_tick;
 mod daemon_cycle_tail;
@@ -76,9 +77,9 @@ use apollo_optimizer::engine::learned_state::{
     LearnableParams, LearnedState, RestoreQualityMonitor,
 };
 use apollo_optimizer::engine::llm::{
-    delete_file_best_effort, feedback_path_root, load_repo_config, pending_trial_path,
+    feedback_path_root, load_repo_config, pending_trial_path,
     policy_path_root, read_json, state_paths_root, suggestions_path_root, write_json,
-    write_json_critical, LearnedPolicy, LlmAdvisor, LlmConfig, LlmState,
+    LearnedPolicy, LlmAdvisor, LlmConfig, LlmState,
 };
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
@@ -3636,160 +3637,22 @@ fn main() -> anyhow::Result<()> {
                     actions = llm_daemon::apply_learned_policy_actions(&snapshot, &policy, actions);
                 }
 
-                // Apply learned skills: throttle processes with solid causal links to
-                // pressure reduction. Skills are earned from causal graph solid edges
-                // (confidence × avg_delta). matching_skills() already gates on
-                // pressure ≥ skill.min_pressure AND is_reliable() (≥5 obs, ≥60% success).
+                // Apply learned skills + trial induced skills.
+                // Extracted to daemon_skill_tick::run_skill_tick (Wave 16).
+                // [Fowler 2004] Strangler Fig — pure move, no semantic change.
                 {
-                    let skill_matches = lctx.skill_registry.matching_skills(
-                        snapshot.pressure.memory_pressure as f32,
+                    let skill_new = daemon_skill_tick::run_skill_tick(
+                        &mut lctx.skill_registry,
+                        &snapshot,
+                        &state,
+                        &collector,
+                        foreground_pid,
                         workload_mode.as_str(),
+                        is_root,
+                        &actions,
+                        &mut pending_trial_skill,
                     );
-                    if !skill_matches.is_empty() {
-                        let already_actioned: std::collections::HashSet<String> = actions
-                            .iter()
-                            .filter_map(|a| match a {
-                                RootAction::ThrottleProcess { name, .. }
-                                | RootAction::FreezeProcess { name, .. } => Some(name.clone()),
-                                _ => None,
-                            })
-                            .collect();
-                        let skill_targets: std::collections::HashSet<String> = skill_matches
-                            .iter()
-                            .flat_map(|s| s.throttle_targets.iter().cloned())
-                            .collect();
-                        let skill_hard_protected =
-                            apollo_optimizer::engine::safety::protected_processes();
-                        for (pid, process) in collector.system().processes() {
-                            let name = process.name().to_string();
-                            // Guard: never throttle hard-protected OS daemons via skills,
-                            // even if the skill registry learned them as "effective targets".
-                            // Skills can encode stale or spurious correlations.
-                            if skill_hard_protected
-                                .iter()
-                                .any(|&p| name.contains(p))
-                            {
-                                continue;
-                            }
-                            if skill_targets.contains(&name) && !already_actioned.contains(&name) {
-                                let skill_name = skill_matches
-                                    .iter()
-                                    .find(|s| s.throttle_targets.contains(&name))
-                                    .map(|s| s.name.as_str())
-                                    .unwrap_or("skill");
-                                actions.push(RootAction::throttle(
-                                    pid.as_u32(),
-                                    name,
-                                    false,
-                                    format!("skill:{}", skill_name),
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                // Trial induced skills: group:/batch: skills start at apply_count=0
-                // and can never reach is_reliable() without real observations.
-                // Each cycle at elevated pressure we try one unproven skill and record
-                // the result on the NEXT cycle by comparing pressure before vs after.
-
-                {
-                    // Record result from previous cycle's trial if pending.
-                    if let Some((ref pending_name, pressure_before)) = pending_trial_skill {
-                        let effective = snapshot.pressure.memory_pressure < pressure_before - 0.01;
-                        lctx.skill_registry.record_result_with_pressure(
-                            pending_name,
-                            effective,
-                            pressure_before as f32,
-                        );
-                        pending_trial_skill = None;
-                        // BUG-01: delete WAL file now that trial is resolved.
-                        delete_file_best_effort(&pending_trial_path(is_root));
-                    }
-
-                    let trial = lctx.skill_registry.next_trial_skill(
-                        snapshot.pressure.memory_pressure as f32,
-                        workload_mode.as_str(),
-                    );
-                    if let Some(skill) = trial {
-                        let skill_name = skill.name.clone();
-                        let pressure_before = snapshot.pressure.memory_pressure;
-                        let policy_prot = state
-                            .policy
-                            .lock_recover()
-                            .learned_policy
-                            .protected_patterns
-                            .clone();
-                        let already_actioned: std::collections::HashSet<String> = actions
-                            .iter()
-                            .filter_map(|a| match a {
-                                RootAction::ThrottleProcess { name, .. } => Some(name.clone()),
-                                _ => None,
-                            })
-                            .collect();
-                        let mut trialed = false;
-                        // Tracks whether at least one target exists in the process list
-                        // but was blocked solely because it is the current foreground app.
-                        // "Foreground-blocked" ≠ "ineffective" — we must not penalise the
-                        // skill for respecting the foreground gate.
-                        let mut targets_found_but_skipped = false;
-                        for target in &skill.throttle_targets.clone() {
-                            // [Saltzer & Kaashoek 2009] Complete Mediation — is_protected_name
-                            // is the single truth point for static lists; policy_prot adds
-                            // learned patterns. ConditionalForeground apps are not skipped
-                            // here — the per-pid foreground check handles them below.
-                            if is_protected_name(target)
-                                || policy_prot.iter().any(|p| target.contains(p.as_str()))
-                            {
-                                continue;
-                            }
-                            for (pid, process) in collector.system().processes() {
-                                if process.name() == target {
-                                    if Some(pid.as_u32()) == foreground_pid {
-                                        // Process exists but is the active foreground app —
-                                        // we intentionally skip it this cycle.
-                                        targets_found_but_skipped = true;
-                                    } else {
-                                        // Add throttle only if not already actioned by individual skills.
-                                        // But mark trialed=true regardless — the pressure measurement
-                                        // captures the combined effect of all throttles in this cycle,
-                                        // including targets already covered by throttle:X skills.
-                                        if !already_actioned.contains(target) {
-                                            actions.push(RootAction::throttle(
-                                                pid.as_u32(),
-                                                target.clone(),
-                                                false,
-                                                format!("trial:{}", skill_name),
-                                            ));
-                                        }
-                                        trialed = true;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        if trialed {
-                            pending_trial_skill = Some((skill_name.clone(), pressure_before));
-                            // BUG-01: write-ahead so trial survives daemon crash.
-                            // [Gray & Reuter 1992 §11 — write-ahead crash recovery]
-                            write_json_critical(
-                                &pending_trial_path(is_root),
-                                &pending_trial_skill,
-                                Some(0o600),
-                            );
-                        } else if targets_found_but_skipped {
-                            // At least one target exists but is foreground-protected this cycle.
-                            // This is NOT an ineffective outcome — the skill simply couldn't run.
-                            // Leave pending_trial_skill as None and wait for the next cycle when
-                            // the process may be in the background.
-                            // (apply_count is NOT incremented, so the skill is not GC'd.)
-                        } else {
-                            // No targets found in the process list at all — the skill's targets
-                            // are genuinely absent (crashed, jetsam'd, or never launched).
-                            // Mark as ineffective so the skill gets GC'd after enough failures.
-                            lctx.skill_registry.record_result(&skill_name, false);
-                        }
-                    }
+                    actions.extend(skill_new);
                 }
 
                 // Coordinated multi-process freezing (Pearl 2009 causal clusters).
