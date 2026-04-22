@@ -98,18 +98,24 @@ impl HazardModel {
     /// Calcula el vector de riesgo a partir de señales del sistema.
     ///
     /// Todas las features se normalizan a ~0–1 para que los β sean comparables.
+    ///
+    /// Slot 3: `max(compressor_ratio, cumulative_stress * 0.7)` — enriches the
+    /// temporal dimension without resizing NEON dot4. [Yerkes & Dodson 1908]
+    /// cumulative_stress captures chronic overload that compressor_ratio misses
+    /// at moderate (but sustained) pressure levels.
     pub fn risk_features(
         memory_pressure: f64,
         pressure_velocity: f64, // del Kalman, unidades/segundo
         swap_ratio: f64,        // swap_used / swap_total, 0–1
         compressor_ratio: f64,  // de collector.rs, 0–1
+        cumulative_stress: f64, // slow EMA of urgency, 0–1 [Yerkes-Dodson 1908]
     ) -> [f64; N_RISK] {
         [
             memory_pressure.clamp(0.0, 1.0),
             // Velocidad: normalizar a 0–1 (0.1/s = bastante rápido para presión)
             (pressure_velocity / 0.1).clamp(0.0, 1.0),
             swap_ratio.clamp(0.0, 1.0),
-            compressor_ratio.clamp(0.0, 1.0),
+            compressor_ratio.clamp(0.0, 1.0).max((cumulative_stress * 0.7).clamp(0.0, 1.0)),
         ]
     }
 
@@ -259,7 +265,7 @@ mod tests {
     #[test]
     fn test_low_risk_low_probability() {
         let mut model = HazardModel::new();
-        let features = HazardModel::risk_features(0.3, 0.0, 0.0, 0.1);
+        let features = HazardModel::risk_features(0.3, 0.0, 0.0, 0.1, 0.0);
         let p = model.probability_oom(&features, 30.0);
         assert!(p < 0.01, "low risk should give low P(OOM), got {}", p);
     }
@@ -269,10 +275,10 @@ mod tests {
         let mut model = HazardModel::new();
         // Record some events to raise base_rate.
         for _ in 0..5 {
-            let feat = HazardModel::risk_features(0.9, 0.08, 0.7, 0.8);
+            let feat = HazardModel::risk_features(0.9, 0.08, 0.7, 0.8, 0.0);
             model.record_event(&feat, 2.0);
         }
-        let features = HazardModel::risk_features(0.95, 0.1, 0.8, 0.9);
+        let features = HazardModel::risk_features(0.95, 0.1, 0.8, 0.9, 0.0);
         let p = model.probability_oom(&features, 30.0);
         assert!(
             p > 0.01,
@@ -284,7 +290,7 @@ mod tests {
     #[test]
     fn test_longer_horizon_higher_probability() {
         let mut model = HazardModel::new();
-        let features = HazardModel::risk_features(0.7, 0.05, 0.4, 0.5);
+        let features = HazardModel::risk_features(0.7, 0.05, 0.4, 0.5, 0.0);
         let p5 = model.probability_oom(&features, 5.0);
         let p30 = model.probability_oom(&features, 30.0);
         let p120 = model.probability_oom(&features, 120.0);
@@ -296,7 +302,7 @@ mod tests {
     fn test_record_event_increases_beta() {
         let mut model = HazardModel::new();
         let beta_before = model.beta;
-        let feat = HazardModel::risk_features(0.9, 0.08, 0.7, 0.8);
+        let feat = HazardModel::risk_features(0.9, 0.08, 0.7, 0.8, 0.0);
         model.record_event(&feat, 1.0);
         // Feature 0 (pressure=0.9) > 0.5, so beta[0] should increase.
         assert!(
@@ -321,10 +327,10 @@ mod tests {
     fn test_probability_bounded_0_1() {
         let mut model = HazardModel::new();
         for _ in 0..20 {
-            let feat = HazardModel::risk_features(0.99, 0.1, 0.99, 0.99);
+            let feat = HazardModel::risk_features(0.99, 0.1, 0.99, 0.99, 0.0);
             model.record_event(&feat, 0.5);
         }
-        let features = HazardModel::risk_features(1.0, 0.1, 1.0, 1.0);
+        let features = HazardModel::risk_features(1.0, 0.1, 1.0, 1.0, 0.0);
         let p = model.probability_oom(&features, 300.0);
         assert!(p >= 0.0 && p <= 1.0, "P should be in [0,1], got {}", p);
     }
@@ -337,7 +343,7 @@ mod tests {
         let pressures = [0.1, 0.3, 0.5, 0.7, 0.9];
         let mut prev_p = 0.0;
         for &pr in &pressures {
-            let feat = HazardModel::risk_features(pr, 0.02, pr * 0.5, pr * 0.5);
+            let feat = HazardModel::risk_features(pr, 0.02, pr * 0.5, pr * 0.5, 0.0);
             let p = model.probability_oom(&feat, 30.0);
             assert!(
                 p >= prev_p,
@@ -354,7 +360,7 @@ mod tests {
     #[test]
     fn test_zero_horizon_zero_probability() {
         let mut model = HazardModel::new();
-        let feat = HazardModel::risk_features(0.9, 0.1, 0.8, 0.8);
+        let feat = HazardModel::risk_features(0.9, 0.1, 0.8, 0.8, 0.0);
         let p = model.probability_oom(&feat, 0.0);
         assert!(
             p.abs() < 1e-10,
@@ -369,7 +375,7 @@ mod tests {
         let mut model = HazardModel::new();
         // Record 100 events with extreme features.
         for _ in 0..100 {
-            let feat = HazardModel::risk_features(1.0, 0.1, 1.0, 1.0);
+            let feat = HazardModel::risk_features(1.0, 0.1, 1.0, 1.0, 0.0);
             model.record_event(&feat, 0.1);
         }
         for &b in &model.beta_weights() {
@@ -380,7 +386,7 @@ mod tests {
     /// risk_features must clamp inputs to [0, 1] for normalized features.
     #[test]
     fn test_risk_features_clamps_out_of_range() {
-        let feat = HazardModel::risk_features(-0.5, -1.0, 2.0, 1.5);
+        let feat = HazardModel::risk_features(-0.5, -1.0, 2.0, 1.5, 0.0);
         assert_eq!(feat[0], 0.0, "negative pressure should clamp to 0");
         assert_eq!(feat[1], 0.0, "negative velocity should clamp to 0");
         assert_eq!(feat[2], 1.0, "swap > 1.0 should clamp to 1.0");
@@ -391,7 +397,7 @@ mod tests {
     #[test]
     fn test_serde_roundtrip() {
         let mut model = HazardModel::new();
-        let feat = HazardModel::risk_features(0.8, 0.05, 0.5, 0.6);
+        let feat = HazardModel::risk_features(0.8, 0.05, 0.5, 0.6, 0.0);
         model.record_event(&feat, 3.0);
         model.tick_no_event(7200.0);
 
@@ -419,7 +425,7 @@ mod tests {
     fn test_validate_after_restore_resets_saturated_base_rate() {
         let mut model = HazardModel::new();
         // Simulate saturation: feed many "overflow" events in quick succession
-        let feat = HazardModel::risk_features(0.85, 0.05, 0.9, 0.8);
+        let feat = HazardModel::risk_features(0.85, 0.05, 0.9, 0.8, 0.0);
         for _ in 0..200 {
             model.record_event(&feat, 0.1); // 0.1 hour each
         }
@@ -462,7 +468,7 @@ mod tests {
     #[test]
     fn test_validate_after_restore_noop_on_healthy_model() {
         let mut model = HazardModel::new();
-        let feat = HazardModel::risk_features(0.5, 0.03, 0.4, 0.3);
+        let feat = HazardModel::risk_features(0.5, 0.03, 0.4, 0.3, 0.0);
         model.record_event(&feat, 24.0); // one event in 24 hours — healthy rate
         let rate_before = model.base_rate;
         let events_before = model.total_events;
@@ -484,7 +490,7 @@ mod tests {
     fn test_survived_high_pressure_decays_base_rate() {
         let mut model = HazardModel::new();
         // Give it a somewhat elevated base_rate first
-        let feat = HazardModel::risk_features(0.75, 0.02, 0.8, 0.7);
+        let feat = HazardModel::risk_features(0.75, 0.02, 0.8, 0.7, 0.0);
         model.record_event(&feat, 1.0);
         let rate_before = model.base_rate;
 
@@ -503,7 +509,7 @@ mod tests {
     #[test]
     fn test_survived_high_pressure_beta_stays_bounded() {
         let mut model = HazardModel::new();
-        let feat = HazardModel::risk_features(0.9, 0.01, 0.95, 0.85);
+        let feat = HazardModel::risk_features(0.9, 0.01, 0.95, 0.85, 0.0);
         // Apply many survival ticks — beta must never go below 0.1 floor.
         // Floor lowered from 0.5 to 0.1 (H-2 fix) to allow feature discrimination
         // without zeroing out features entirely.

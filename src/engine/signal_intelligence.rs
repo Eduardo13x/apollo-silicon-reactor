@@ -433,6 +433,7 @@ impl SignalIntelligence {
                 pressure_velocity,
                 swap_ratio,
                 compressor_ratio,
+                self.cumulative_stress,
             );
             // KPC IPC trend modulates hazard horizon:
             // Falling IPC (negative trend) → look further ahead (more conservative).
@@ -632,6 +633,7 @@ impl SignalIntelligence {
             self.kf_pressure.velocity(),
             swap_ratio,
             compressor_ratio,
+            self.cumulative_stress,
         );
         self.hazard.record_event(&features, hours_since_last);
         // Buffer event for batch retrain.
@@ -1882,7 +1884,7 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..200 {
             let p = 0.65 + (i % 10) as f64 * 0.02;
-            let features = HazardModel::risk_features(p, 0.005, 0.60, 0.50);
+            let features = HazardModel::risk_features(p, 0.005, 0.60, 0.50, 0.0);
             hazard.record_event(&features, 8.0);
         }
         // 6 predictions at different pressure levels
@@ -1890,7 +1892,7 @@ mod tests {
         let p_ooms: Vec<f64> = pressures
             .iter()
             .map(|&p| {
-                let f = HazardModel::risk_features(p, 0.003, p * 0.7, p * 0.6);
+                let f = HazardModel::risk_features(p, 0.003, p * 0.7, p * 0.6, 0.0);
                 hazard.probability_oom(&f, 30.0)
             })
             .collect();

@@ -1427,7 +1427,7 @@ mod tests {
         let sim_overflows = 200u32;
         for i in 0..sim_overflows {
             let pressure = 0.65 + (i % 10) as f64 * 0.02; // 0.65..0.85
-            let features = HazardModel::risk_features(pressure, 0.02, 0.75, 0.60);
+            let features = HazardModel::risk_features(pressure, 0.02, 0.75, 0.60, 0.0);
             hazard.record_event(&features, 8.0); // ~8h between events on average
         }
         // Measure calibration: p_oom should be MONOTONICALLY correct — higher pressure
@@ -1436,7 +1436,7 @@ mod tests {
         let test_pressures = [0.40f64, 0.50, 0.60, 0.70, 0.80, 0.90];
         let mut p_ooms = Vec::new();
         for &p in &test_pressures {
-            let features = HazardModel::risk_features(p, 0.003, 0.60, 0.50);
+            let features = HazardModel::risk_features(p, 0.003, 0.60, 0.50, 0.0);
             p_ooms.push(hazard.probability_oom(&features, 30.0));
         }
         // Count inversions (where p_oom[i] > p_oom[i+1] despite pressure[i] < pressure[i+1])
