@@ -36,6 +36,7 @@ mod daemon_sensor_tick;
 mod daemon_socket_handler;
 mod daemon_turbo_manager;
 mod daemon_wake_handler;
+mod daemon_wake_unfreeze;
 mod learning_tick;
 mod llm_daemon;
 mod metrics_reporter;
@@ -67,7 +68,7 @@ use apollo_optimizer::engine::daemon_helpers::{
     remove_crash_sentinel, rl_threshold_path,
     signal_intelligence_path, skills_path, socket_path, spotlight_set_indexing,
     telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_pids,
-    unfreeze_pids_verified, wake_state_path, write_frozen_state, write_governor_state,
+    wake_state_path, write_frozen_state, write_governor_state,
 };
 use apollo_optimizer::engine::execute_actions::execute_actions;
 use apollo_optimizer::engine::focus_markov::FocusMarkov;
@@ -1086,10 +1087,6 @@ fn main() -> anyhow::Result<()> {
             // rustc process-count dynamics. Informs reactor_weight policy.
             use apollo_optimizer::engine::build_tracker::{BuildPhase, BuildTracker};
             let mut build_tracker = BuildTracker::new();
-            // Staggered wake unfreeze queue: instead of SIGCONT-ing all frozen PIDs
-            // at once on display wake (which decompresses 1-3GB in <500ms on 8GB M1),
-            // spread unfreezes across cycles — 5 PIDs per cycle (~2s apart).
-            const WAKE_UNFREEZE_BATCH: usize = 5;
             let mut wake_unfreeze_queue: VecDeque<u32> = VecDeque::new();
             // PIDs SIGCONT'd via the staggered wake path this cycle.
             // Drained by the unfreeze_decay ODE wiring below so τ learning
@@ -1376,65 +1373,17 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // ── Staggered wake unfreeze: drain batch per cycle ──────────
-                // Instead of SIGCONT-ing 50 PIDs at once, spread across cycles
-                // to avoid decompressing 1-3GB in one shot on 8GB M1.
-                // [Nygard 2018] Dynamic bulkhead: shrink batch when memory grows
-                // fast (dM/dt high) — prevents RSS spike from multiple thaws.
-                // pressure_velocity > 0 = rising; scale 5→1 over [0.0, 0.2].
-                if !wake_unfreeze_queue.is_empty() {
-                    let wake_batch = {
-                        // G21 — Thermal Bulkhead: serious/critical thermal → single-process
-                        // thaw prevents CPU surge from simultaneous reactivation.
-                        // [Nygard 2018 §4.3 — bulkhead limits blast radius under resource stress]
-                        let thermal_str = state.metrics.lock_recover().thermal_level_real.clone();
-                        if thermal_str == "serious" || thermal_str == "critical" {
-                            1_usize
-                        } else {
-                            // dM/dt proxy: swap_delta_bps > 0 = swap growing.
-                            // 50 MB/s growth → rate_factor = 1.0 → batch = 1.
-                            let rate_factor = (pressure_collector
-                                .latest()
-                                .swap_delta_bps
-                                / (50.0 * 1024.0 * 1024.0))
-                                .clamp(0.0, 1.0);
-                            (WAKE_UNFREEZE_BATCH as f64 * (1.0 - rate_factor * 0.8))
-                                .max(1.0)
-                                .round() as usize
-                        }
-                    };
-                    let batch: Vec<u32> = wake_unfreeze_queue
-                        .drain(..wake_unfreeze_queue.len().min(wake_batch))
-                        .collect();
-                    // A-B-A defense: lock frozen_guard first to read identity
-                    // (start_sec) before signalling. Crash before SIGCONT leaves
-                    // PIDs in frozen_state for recovery on restart (WAL semantics).
-                    // [Saltzer & Kaashoek 2009] §3.3 Complete Mediation.
-                    {
-                        let mut frozen_guard = state.frozen_state.lock_recover();
-                        let entries: std::collections::HashMap<u32, FrozenEntry> = batch
-                            .iter()
-                            .filter_map(|&pid| frozen_guard.get(&pid).map(|e| (pid, e.clone())))
-                            .collect();
-                        unfreeze_pids_verified(&entries);
-                        for pid in &batch {
-                            frozen_guard.remove(pid);
-                        }
-                        write_frozen_state(&frozen_state_path, &frozen_guard);
-                    }
-                    // Restore Mach QoS from Background (E-cores) → Normal so
-                    // processes resume on P-cores. Wake unfreeze is the highest-
-                    // urgency thaw path (user just returned to desktop), so P-core
-                    // routing is critical for perceived responsiveness.
-                    {
-                        let mut qos = state.mach_qos.lock_recover();
-                        for pid in &batch {
-                            let _ = qos.set_tier(*pid, apollo_optimizer::engine::mach_qos::SchedulingTier::Normal);
-                        }
-                    }
-                    // Record actual-SIGCONT T0 for unfreeze_decay ODE τ learning.
-                    wake_thaw_pids.extend_from_slice(&batch);
-                }
+                // Staggered wake unfreeze: drain one batch per cycle.
+                // Extracted to daemon_wake_unfreeze::run_wake_unfreeze (Wave 25).
+                // [Nygard 2018] bulkhead: spread SIGCONT across cycles; shrink under
+                // thermal/swap-velocity stress to avoid 1-3GB decompression spike.
+                daemon_wake_unfreeze::run_wake_unfreeze(
+                    &mut wake_unfreeze_queue,
+                    &mut wake_thaw_pids,
+                    &state,
+                    &pressure_collector,
+                    &frozen_state_path,
+                );
 
                 // Mark reactor as stalled only if the reactor thread has sent
                 // zero pulses after 60 s — that means the thread itself died,
