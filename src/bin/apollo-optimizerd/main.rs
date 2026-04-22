@@ -15,6 +15,7 @@ mod daemon_action_safety;
 mod daemon_agent_actions;
 mod daemon_behavior_pids;
 mod daemon_cluster_actions;
+mod daemon_stale_apps;
 mod daemon_thermal_freeze;
 mod daemon_paging_hints;
 mod daemon_signal_tick;
@@ -3651,57 +3652,18 @@ fn main() -> anyhow::Result<()> {
                 actions.extend(heuristic_pass.additional_actions);
 
                 // Cable: stale_apps() → nominate stale background apps as freeze candidates.
-                // When pressure is elevated, apps the user hasn't interacted with for >30min
-                // are prime freeze targets — they're consuming RAM without doing useful work.
-                // Only nominate non-foreground, non-critical, non-already-acting processes.
-                if signal_digest.pressure_smooth >= 0.50 {
-                    let existing_pids: HashSet<u32> = actions
-                        .iter()
-                        .filter_map(|a| match a {
-                            RootAction::FreezeProcess { pid, .. }
-                            | RootAction::ThrottleProcess { pid, .. }
-                            | RootAction::BoostProcess { pid, .. } => Some(*pid),
-                            _ => None,
-                        })
-                        .collect();
-                    let stale_names = {
-                        let running: Vec<&str> = all_proc_names.iter().copied().collect();
-                        let pg = state.policy.lock_recover();
-                        pg.adaptive_governor.user_profile.stale_apps(&running, 1800)
-                        // 30 min threshold
-                    };
-                    let sys = collector.system();
-                    for (pid, process) in sys.processes() {
-                        let pid_u32 = pid.as_u32();
-                        let name = process.name().to_string();
-                        if !stale_names.contains(&name) {
-                            continue;
-                        }
-                        if Some(pid_u32) == foreground_pid {
-                            continue;
-                        }
-                        if heuristic_critical_pids.contains(&pid_u32) {
-                            continue;
-                        }
-                        if existing_pids.contains(&pid_u32) {
-                            continue;
-                        }
-                        // Only freeze if using meaningful memory (>50MB RSS).
-                        if process.memory() < 50 * 1024 * 1024 {
-                            continue;
-                        }
-                        let (ss, su) = pid_start_time(pid_u32);
-                        actions.push(RootAction::freeze_full(
-                            pid_u32,
-                            name.clone(),
-                            format!(
-                                "stale-app: no user interaction for >30min, rss={}MB",
-                                process.memory() / 1024 / 1024
-                            ),
-                            ss,
-                            su,
-                        ));
-                    }
+                // Extracted to daemon_stale_apps::run_stale_app_freeze (Wave 21).
+                {
+                    let stale_new = daemon_stale_apps::run_stale_app_freeze(
+                        signal_digest.pressure_smooth,
+                        &all_proc_names,
+                        &state,
+                        &collector,
+                        foreground_pid,
+                        &heuristic_critical_pids,
+                        &actions,
+                    );
+                    actions.extend(stale_new);
                 }
 
                 // Survival Mode: active when memory pressure is critical or swap is thrashing.
