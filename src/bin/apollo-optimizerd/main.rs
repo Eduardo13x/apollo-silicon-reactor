@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 mod cognitive_tick;
 mod daemon_action_pipeline;
 mod daemon_action_safety;
+mod daemon_signal_tick;
 mod daemon_chromium_tick;
 mod daemon_cognitive_tick;
 mod daemon_cycle_tail;
@@ -3048,174 +3049,32 @@ fn main() -> anyhow::Result<()> {
                     .overflow_guard
                     .thresholds_with_d_term(workload_mode, last_pressure_velocity);
 
-                // Signal intelligence: Kalman + CUSUM + Entropy + Hazard + LV + MPC.
-                let signal_digest = {
-                    let cpu_vals: Vec<f64> = snapshot
-                        .top_processes
-                        .iter()
-                        .map(|p| p.cpu_usage as f64)
-                        .collect();
-                    let mem_vals: Vec<f64> = snapshot
-                        .top_processes
-                        .iter()
-                        .map(|p| p.memory_usage as f64)
-                        .collect();
-                    let (dom_name, dom_bytes) = snapshot
-                        .top_processes
-                        .iter()
-                        .max_by_key(|p| p.memory_usage)
-                        .map(|p| (p.name.as_str(), p.memory_usage))
-                        .unwrap_or(("", 0));
-                    let total_used: u64 =
-                        snapshot.top_processes.iter().map(|p| p.memory_usage).sum();
-                    let swap_ratio = if snapshot.pressure.swap_total_bytes > 0 {
-                        snapshot.pressure.swap_used_bytes as f64
-                            / snapshot.pressure.swap_total_bytes as f64
-                    } else {
-                        0.0
-                    };
-                    // Energy-aware routing: shift subsystem thresholds by battery/thermal.
-                    lctx.signal_intel.set_energy_bias(
-                        power_mgr.battery_status.percentage,
-                        power_mgr.battery_status.is_charging,
-                        thermal_emergency,
-                    );
-                    // Power-aware bias: when real watts are high, engage optimizer earlier.
-                    // M1 Air TDP ~15W; >8W = active load, >12W = stressed.
-                    if let Some(pkg_w) = cycle_hw_snap.as_ref().and_then(|h| h.power.package_watts)
-                    {
-                        lctx.signal_intel.adjust_bias_for_power(pkg_w);
-                    }
-                    // Workload-aware bias: heavy workloads (Coding/VideoEdit) spike pressure
-                    // fast — engage optimizer 2pp earlier during those hours.
-                    {
-                        let wl = state
-                            .policy
-                            .lock_recover()
-                            .adaptive_governor
-                            .user_profile
-                            .likely_workload_at_hour(hour_of_day);
-                        lctx.signal_intel.adjust_bias_for_workload(wl);
-                    }
-                    let _si_result = lctx.signal_intel.tick(
-                        snapshot.pressure.memory_pressure,
-                        snapshot.pressure.swap_delta_bytes_per_sec,
-                        swap_ratio,
-                        snapshot.pressure.memory_pressure, // compressor proxy
-                        &cpu_vals,
-                        &mem_vals,
-                        dom_name,
-                        dom_bytes,
-                        total_used,
-                        snapshot.memory.total_ram,
-                        cycle_dt_secs,
-                    );
-                    _si_result
-                };
-
-                // v0.7.0: Mark memory scan available when pressure is in mid/high zone.
-                // The actual scan runs lazily during freeze decision (cost-gated).
-                // DBAD: build telemetry vector from signal digest and score.
-                let signal_digest = {
-                    let mut d = signal_digest;
-                    if d.pressure_smooth >= 0.30 {
-                        d.memory_scan_available = true;
-                    }
-                    // Darwin-Boltzmann anomaly scoring: feed signal digest into
-                    // Hopfield memory + evolving SAE population for learned anomaly detection.
-                    use apollo_optimizer::engine::telemetry_logger::TelemetryVector;
-                    let dom_share = {
-                        let max_mem = snapshot
-                            .top_processes
-                            .iter()
-                            .map(|p| p.memory_usage)
-                            .max()
-                            .unwrap_or(0) as f64;
-                        let total = snapshot.memory.total_ram as f64;
-                        if total > 0.0 {
-                            (max_mem / total) as f32
-                        } else {
-                            0.0
-                        }
-                    };
-                    let thermal_score = match snapshot.pressure.thermal_level.as_str() {
-                        "nominal" => 0.0f32,
-                        "light" => 0.33,
-                        "serious" => 0.66,
-                        "critical" => 1.0,
-                        _ => 0.0,
-                    };
-                    let cpu_total = snapshot
-                        .top_processes
-                        .iter()
-                        .map(|p| p.cpu_usage)
-                        .sum::<f32>()
-                        / 100.0;
-                    let active_count = (snapshot.top_processes.len() as f32 / 200.0).min(1.0);
-                    let tv = TelemetryVector {
-                        pressure_smooth: d.pressure_smooth as f32,
-                        pressure_velocity: d.pressure_velocity as f32,
-                        pressure_predicted_5s: d.pressure_predicted_5s as f32,
-                        swap_velocity_smooth: (d.swap_velocity_smooth as f32).clamp(-5.0, 5.0),
-                        pressure_integral: d.pressure_integral as f32,
-                        cusum_score: d.cusum_score as f32,
-                        entropy_anomaly: d.entropy_anomaly as f32,
-                        p_oom_30s: d.p_oom_30s as f32,
-                        monopoly_risk: d.monopoly_risk as f32,
-                        urgency: d.urgency as f32,
-                        cpu_total: cpu_total.min(1.0),
-                        compressor_ratio: snapshot.pressure.memory_pressure as f32,
-                        dominant_share: dom_share,
-                        latency_score: 0.0, // no perceptual latency sensor yet
-                        active_proc_count: active_count,
-                        thermal_score,
-                    };
-                    d.transformer_anomaly =
-                        darwin_anomaly.score(tv.as_f32_slice(), d.pressure_smooth as f32);
-                    // Record to TelemetryLogger ring buffer.  record() self-triggers
-                    // disk dumps (event-triggered at OOM/urgency/latency thresholds,
-                    // periodic every ~10 min). [Welch 1967, Tuli et al. 2022]
-                    telemetry_logger.record(tv);
-                    // Audit DBAD score every ~60 cycles or when anomaly detected.
-                    if d.transformer_anomaly > 0.3 || cycle_count % 60 == 0 {
-                        audit_log(&serde_json::json!({
-                            "event": "dbad_score",
-                            "score": (d.transformer_anomaly * 1000.0).round() / 1000.0,
-                            "alpha": (darwin_anomaly.alpha() * 100.0).round() / 100.0,
-                            "samples": darwin_anomaly.sample_count(),
-                            "ready": darwin_anomaly.is_ready(),
-                            "pressure": (d.pressure_smooth * 1000.0).round() / 1000.0,
-                        }));
-                    }
-
-                    // Fluidity signals → SignalDigest.
-                    // [Jain 1991] Composite urgency includes fluidity degradation:
-                    // sustained low fluidity (< 0.65) adds up to 0.30 to urgency,
-                    // allowing the predictive agent to account for rendering pressure.
-                    d.fluidity_score = fluidity_state.fluidity_ema;
-                    d.window_op_active = fluidity_state.window_op_active();
-                    d.app_launching = fluidity_state.launch_active;
-                    if fluidity_state.fluidity_degraded {
-                        let fluidity_urgency =
-                            ((0.65 - fluidity_state.fluidity_ema as f64) * 0.4).max(0.0);
-                        d.urgency = (d.urgency + fluidity_urgency).min(1.0);
-                    }
-
-                    d
-                };
-
-                // Update D-term: use MV8 velocity when P[1,1] ≤ Q[1]=0.005 (converged).
-                // Fallback to 1D KF until MV8 velocity covariance has stabilized.
-                // [NotebookLM: gated switch prevents 200× velocity noise from cold start]
-                last_pressure_velocity = if lctx.signal_intel.kf_mv_velocity_converged() {
-                    lctx.signal_intel.kf_mv_pressure_velocity()
-                } else {
-                    signal_digest.pressure_velocity
-                };
-
-                // G12 fallback carry-over: cache entropy_anomaly for next cycle's
-                // DRAM BP proxy (used when amc_bandwidth_pct is dead on M1).
-                prev_entropy_anomaly = signal_digest.entropy_anomaly;
+                // ── Signal intelligence: Kalman + CUSUM + Entropy + Hazard + LV + MPC ──
+                // Extracted to daemon_signal_tick::run_signal_tick (Wave 14).
+                // [Fowler 2004] Strangler Fig — pure move, no semantic change.
+                // NLM warning: cycle_dt_secs passed as parameter (never recalculate
+                // here) — avoids mid-loop reset bug dac6de9 that corrupted ODE models.
+                let daemon_signal_tick::SignalTickOutput {
+                    signal_digest,
+                    last_pressure_velocity: new_lpv,
+                    entropy_anomaly: new_entropy,
+                } = daemon_signal_tick::run_signal_tick(
+                    lctx.signal_intel,
+                    &snapshot,
+                    cycle_dt_secs,
+                    power_mgr.battery_status.percentage,
+                    power_mgr.battery_status.is_charging,
+                    thermal_emergency,
+                    cycle_hw_snap.as_ref().and_then(|h| h.power.package_watts),
+                    hour_of_day,
+                    &state,
+                    &mut darwin_anomaly,
+                    &mut telemetry_logger,
+                    &fluidity_state,
+                    cycle_count as u64,
+                );
+                last_pressure_velocity = new_lpv;
+                prev_entropy_anomaly = new_entropy;
 
                 // Swap Reclaim ODE — feed vm_rate from background collector.
                 // Produces SaturationForecast used by the freeze gate below.
