@@ -17,6 +17,7 @@ mod daemon_behavior_pids;
 mod daemon_cluster_actions;
 mod daemon_stale_apps;
 mod daemon_thermal_freeze;
+mod daemon_warn_limits;
 mod daemon_paging_hints;
 mod daemon_signal_tick;
 mod daemon_skill_tick;
@@ -3883,100 +3884,20 @@ fn main() -> anyhow::Result<()> {
                     &storms,
                 );
 
-                // Paging hints: targeted non-fatal memory pressure to idle hoarders.
-                // Uses memorystatus_control warn limit (non-fatal memlimit_inactive)
-                // to send DISPATCH_SOURCE_TYPE_MEMORYPRESSURE to specific processes —
-                // much more surgical than system-wide vm_pressure_notify().
-                // Coalition API augments the foreground family beyond heuristic name-matching:
-                // browser XPC helpers and GPU processes share the foreground coalition.
-                let mem_pressure = snapshot.pressure.memory_pressure;
-                let swap_active = snapshot.pressure.swap_used_bytes > 256 * 1024 * 1024;
-                if mem_pressure > 0.45 && swap_active && is_root {
-                    // Build foreground family via process tree (heuristic).
-                    let mut fg_pids =
-                        process_enrichment::build_foreground_family(foreground_pid, &process_tree);
-                    // Augment with kernel-authoritative coalition membership.
-                    // Any PID sharing a coalition with the foreground PID is excluded.
-                    if let Some(fg_pid) = foreground_pid {
-                        let all_pids: Vec<u32> = proc_snaps.iter().map(|s| s.pid).collect();
-                        for coalition_pid in coalition_tracker.family_of(fg_pid, &all_pids) {
-                            fg_pids.insert(coalition_pid);
-                        }
-                    }
-                    let interactive_pats: Vec<String> = state
-                        .policy
-                        .lock_recover()
-                        .learned_policy
-                        .interactive_patterns
-                        .clone();
-                    for snap in proc_snaps.iter().take(100) {
-                        if heuristic_critical_pids.contains(&snap.pid)
-                            || fg_pids.contains(&snap.pid)
-                        {
-                            continue;
-                        }
-                        if interactive_pats
-                            .iter()
-                            .any(|p| snap.name.contains(p.as_str()))
-                        {
-                            continue;
-                        }
-                        // Rosetta 2 processes incur ~10-30% JIT overhead.
-                        // Under memory pressure, they get a lower RSS threshold
-                        // because freezing them recovers more real throughput.
-                        let rss_threshold = if snap.is_translated {
-                            80 * 1024 * 1024 // 80MB for Rosetta (vs 120MB for native)
-                        } else {
-                            120 * 1024 * 1024
-                        };
-                        let is_hoarder = snap.rss_bytes > rss_threshold
-                            && snap.secs_since_user_interaction > 120
-                            && !snap.has_gui_window;
-                        let is_bg_renderer = snap.rss_bytes > 60 * 1024 * 1024
-                            && snap.secs_since_user_interaction > 120
-                            && (snap.name.contains("Helper (Renderer)")
-                                || snap.name.contains("Helper (Plugin)")
-                                || snap.name.contains(" Renderer"));
-                        // Mach port leak: >5000 ports is suspicious IPC flooding.
-                        // Only check lazily for processes already meeting RSS threshold.
-                        let is_port_leaker = if snap.rss_bytes > 50 * 1024 * 1024
-                            && snap.secs_since_user_interaction > 60
-                        {
-                            let qos = state.mach_qos.lock_recover();
-                            qos.get_mach_port_count(snap.pid)
-                                .map(|c| c > 5000)
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        };
-                        if is_hoarder || is_bg_renderer || is_port_leaker {
-                            // Targeted non-fatal warn limit: set to 75% of current RSS.
-                            // Rosetta processes get a tighter squeeze (60% of RSS).
-                            let ratio = if snap.is_translated { 3u64 } else { 4u64 };
-                            let warn_mb = (snap.rss_bytes * ratio / 5 / 1024 / 1024) as i32;
-                            let warn_mb = warn_mb.max(32); // floor: 32 MB
-                            if let Err(e) = jetsam_control::set_warn_limit(snap.pid, warn_mb) {
-                                // Non-fatal: log at debug level and continue.
-                                if cfg!(debug_assertions) {
-                                    tracing::warn!(err = %e, "warn-limit");
-                                }
-                            } else {
-                                warn_limit_pids.insert(snap.pid, 3); // clear after 3 cycles
-                            }
-                        }
-                    }
-                }
-
-                // Clear expired warn limits (process has had time to respond).
-                warn_limit_pids.retain(|&pid, countdown| {
-                    *countdown -= 1;
-                    if *countdown == 0 {
-                        let _ = jetsam_control::set_warn_limit(pid, 0);
-                        false
-                    } else {
-                        true
-                    }
-                });
+                // Targeted warn-limit paging + expiry.
+                // Extracted to daemon_warn_limits::run_warn_limits (Wave 23).
+                daemon_warn_limits::run_warn_limits(
+                    snapshot.pressure.memory_pressure,
+                    snapshot.pressure.swap_used_bytes,
+                    is_root,
+                    foreground_pid,
+                    &process_tree,
+                    &proc_snaps,
+                    &coalition_tracker,
+                    &state,
+                    &heuristic_critical_pids,
+                    &mut warn_limit_pids,
+                );
 
                 // Snapshot workload + ml_class from policy BEFORE acquiring metrics lock
                 // (avoids holding two domain locks simultaneously).
