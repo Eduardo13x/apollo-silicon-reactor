@@ -2755,7 +2755,9 @@ fn main() -> anyhow::Result<()> {
                             snapshot.pressure.memory_pressure, // [0] pressure
                             signal_digest.pressure_velocity,   // [1] velocity (1D KF)
                             swap_raw_norm,                     // [2] swap_norm
-                            snapshot.pressure.memory_pressure, // [3] compressor proxy
+                            // [3] lyapunov_norm replaces duplicate pressure proxy.
+                            // [Wolf et al. 1985] orthogonal chaos signal improves KF covariance.
+                            (signal_digest.lyapunov_exponent / 2.0).clamp(0.0, 1.0),
                             ode_net_rate_norm,                 // [4] ode_net_rate
                             ode_t_sat_urgency,                 // [5] ode_t_sat
                             cpu_mean,                          // [6] cpu_saturation
