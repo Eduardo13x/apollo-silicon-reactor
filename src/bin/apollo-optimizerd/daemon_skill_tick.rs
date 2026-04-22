@@ -15,13 +15,16 @@
 
 use std::collections::HashSet;
 
+use std::path::Path;
+
 use apollo_optimizer::collector::SystemCollector;
 use apollo_optimizer::collector::SystemSnapshot;
 use apollo_optimizer::engine::daemon_state::SharedState;
 use apollo_optimizer::engine::llm::{delete_file_best_effort, pending_trial_path, write_json_critical};
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::optimization_skills::SkillRegistry;
-use apollo_optimizer::engine::safety::is_protected_name;
+use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
+use apollo_optimizer::engine::safety::{is_protected_name, protected_processes};
 use apollo_optimizer::engine::types::RootAction;
 
 /// Per-cycle skill application tick.
@@ -182,4 +185,58 @@ pub fn run_skill_tick(
     }
 
     new_actions
+}
+
+/// Run autonomous rule induction every 100 cycles.
+///
+/// Mines experience memory + co-occurrence graph for new skills. Filters
+/// targets that are protected (static or policy-learned) so induced skills
+/// are always executable. Persists when new skills are crystallised.
+///
+/// # Parameters
+/// - `skill_registry` — mutable skill registry (receives induced skills)
+/// - `outcome_tracker` — source of experience memory + causal pairs
+/// - `state` — SharedState (policy lock for protected_patterns)
+/// - `workload_mode` — current workload string (skill scope filter)
+/// - `skills_path` — path to persist registry after induction
+/// - `cycle_count` — caller passes only when gate fires (% 100 == 0)
+pub fn run_rule_induction(
+    skill_registry: &mut SkillRegistry,
+    outcome_tracker: &OutcomeTracker,
+    state: &SharedState,
+    workload_mode: &str,
+    skills_path: &Path,
+) {
+    let existing_names = skill_registry.name_set();
+    let top_pairs = outcome_tracker.top_causal_pairs(100);
+    let protected_set = protected_processes();
+    let policy_prot = state
+        .policy
+        .lock_recover()
+        .learned_policy
+        .protected_patterns
+        .clone();
+    let policy_prot_refs: Vec<&str> = policy_prot.iter().map(|s| s.as_str()).collect();
+    let mut all_protected: Vec<&str> = protected_set.iter().copied().collect();
+    all_protected.extend_from_slice(&policy_prot_refs);
+    let new_skills = apollo_optimizer::engine::rule_inducer::induce(
+        &outcome_tracker.experience,
+        &top_pairs,
+        &existing_names,
+        &all_protected,
+        workload_mode,
+    );
+    let induced_count = new_skills.len();
+    for skill in new_skills {
+        skill_registry.register_induced(skill);
+    }
+    skill_registry.purge_unexecutable(&all_protected);
+    if induced_count > 0 {
+        println!(
+            "rule_inducer: {} new skills crystallized (total={})",
+            induced_count,
+            skill_registry.len()
+        );
+        skill_registry.persist(skills_path);
+    }
 }

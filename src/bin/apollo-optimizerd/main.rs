@@ -4877,49 +4877,16 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                // Autonomous rule induction: mine experience memory + co-occurrence
-                // graph for new skills every 100 cycles (~50s).  No human needed —
-                // Apollo crystallizes its own observations into reusable rules.
+                // Autonomous rule induction every 100 cycles.
+                // Extracted to daemon_skill_tick::run_rule_induction (Wave 22).
                 if cycle_count % 100 == 0 {
-                    let existing_names = lctx.skill_registry.name_set();
-                    let top_pairs = lctx.outcome_tracker.top_causal_pairs(100);
-                    let protected_set = apollo_optimizer::engine::safety::protected_processes();
-                    // Also exclude policy-protected processes (learned by LLM/user).
-                    // Without this, rule_inducer generates skills whose targets are
-                    // unthrottleable — they accumulate zero observations forever.
-                    let policy_prot = state
-                        .policy
-                        .lock_recover()
-                        .learned_policy
-                        .protected_patterns
-                        .clone();
-                    let policy_prot_refs: Vec<&str> =
-                        policy_prot.iter().map(|s| s.as_str()).collect();
-                    let mut all_protected: Vec<&str> = protected_set.iter().copied().collect();
-                    all_protected.extend_from_slice(&policy_prot_refs);
-                    let new_skills = apollo_optimizer::engine::rule_inducer::induce(
-                        &lctx.outcome_tracker.experience,
-                        &top_pairs,
-                        &existing_names,
-                        &all_protected,
+                    daemon_skill_tick::run_rule_induction(
+                        &mut lctx.skill_registry,
+                        &lctx.outcome_tracker,
+                        &state,
                         workload_mode.as_str(),
+                        std::path::Path::new(skills_path()),
                     );
-                    let induced_count = new_skills.len();
-                    for skill in new_skills {
-                        lctx.skill_registry.register_induced(skill);
-                    }
-                    // Purge induced skills whose targets are all protected —
-                    // they can never execute and would spin in the trial loop forever.
-                    lctx.skill_registry.purge_unexecutable(&all_protected);
-                    if induced_count > 0 {
-                        println!(
-                            "rule_inducer: {} new skills crystallized (total={})",
-                            induced_count,
-                            lctx.skill_registry.len()
-                        );
-                        lctx.skill_registry
-                            .persist(std::path::Path::new(skills_path()));
-                    }
                 }
                 // State compression (% 500) is handled by run_periodic() below.
                 // Hourly housekeeping (7200 cycles × 500ms ≈ 1 hour).
