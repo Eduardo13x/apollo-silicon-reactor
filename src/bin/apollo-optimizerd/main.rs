@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 mod cognitive_tick;
 mod daemon_action_pipeline;
 mod daemon_action_safety;
+mod daemon_behavior_pids;
 mod daemon_signal_tick;
 mod daemon_chromium_tick;
 mod daemon_cognitive_tick;
@@ -96,8 +97,8 @@ use apollo_optimizer::engine::proc_taskinfo;
 use apollo_optimizer::engine::profile_governor::GovernorInput;
 use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
 use apollo_optimizer::engine::safety::{
-    critical_background_processes, enforce_limits_with_budget, infrastructure_processes,
-    is_protected_name, is_user_interactive_app,
+    critical_background_processes, enforce_limits_with_budget, is_protected_name,
+    is_user_interactive_app,
 };
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
 use apollo_optimizer::engine::smc_reader::SmcReader;
@@ -2723,8 +2724,6 @@ fn main() -> anyhow::Result<()> {
                             && pressure > 0.30
                             && !contention.pairs.is_empty()
                         {
-                            let sep_hard = apollo_optimizer::engine::safety::protected_processes();
-                            let sep_infra = infrastructure_processes();
                             let policy_prot = state
                                 .policy
                                 .lock_recover()
@@ -2736,10 +2735,9 @@ fn main() -> anyhow::Result<()> {
                                 if pair.confidence() < 0.25 {
                                     continue;
                                 }
-                                // Skip if either process matches any protection list.
+                                // [Saltzer & Kaashoek 2009] single truth point.
                                 let protected = |name: &str| {
-                                    sep_hard.iter().any(|p| name.contains(p))
-                                        || sep_infra.iter().any(|p| name.contains(p))
+                                    is_protected_name(name)
                                         || policy_prot.iter().any(|p| {
                                             name.to_ascii_lowercase()
                                                 .contains(&p.to_ascii_lowercase())
@@ -3331,63 +3329,15 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 // Build behavior-interactive PID set from usage model EMA data.
-                // Processes with sustained low cpu_wall_ratio are I/O-bound (interactive).
-                // JIT-compiling PIDs (from syscall_classifier) are merged in so that
-                // decide_actions treats them as interactive and skips throttling.
-                let behavior_interactive_pids: HashSet<u32> = {
-                    // Apple background daemons that are I/O-bound (low cpu_wall_ratio)
-                    // but must NEVER be classified as interactive or boosted.
-                    // The bad_interactive scrubber only covers learned_interactive;
-                    // this denylist covers the behavioral (cpu_wall_ratio) path.
-                    // [Android LMK] Protection earned by user interaction, not I/O.
-                    // Production data: searchpartyd got 17 incorrect boosts via this path.
-                    // Journal audit 2026-04-09: these daemons have low cpu_wall_ratio
-                    // (I/O-bound) which the behavioral detector mis-classifies as
-                    // "interactive". Each name was observed receiving 30-100+ incorrect
-                    // boosts per session. Without the denylist they'd get Foreground QoS
-                    // every cycle, wasting scheduler priority on system background work.
-                    const BEHAVIOR_DENYLIST: &[&str] = &[
-                        "searchpartyd",         // Find My / Handoff BLE scanning
-                        "corespeechd",          // Siri speech (background)
-                        "suggestd",             // Spotlight/Siri suggestions ML
-                        "duetexpertd",          // Siri predictions / Proactive
-                        "photoanalysisd",       // Photos ML tagging
-                        "mediaanalysisd",       // Media content analysis
-                        "intelligencecontextd", // Apple Intelligence
-                        "mlhostd",              // Core ML inference host
-                        "modelmanagerd",        // On-device model cache
-                        "rtcreportingd",        // RealTimeComm diagnostics
-                        // Added 2026-04-09 from journal boost audit:
-                        "cfprefsd", // Preference caching daemon — I/O-bound, 33 false boosts
-                        "xpcproxy", // XPC service launcher — ephemeral, 40 false boosts
-                        "log",      // Unified log CLI — spawned by log_ingester, 30 false boosts
-                        "apollo-optimizerd", // Self — execute_actions blocks but 45 wasted journal entries
-                        "apollo-optimizerctl", // Our own CLI client
-                        "diagnostics_agent", // System diagnostics — throttled 749x but also boosted
-                        "socketfilterfw",    // Application firewall — I/O-bound, not interactive
-                        "stable", // /usr/libexec/stable — system process, 67 false boosts
-                    ];
-                    let model = state.usage.lock_recover();
-                    let interactive_names: HashSet<&str> = model
-                        .usage_model
-                        .entries()
-                        .iter()
-                        .filter(|(name, entry)| {
-                            apollo_optimizer::engine::usage_model::is_behavior_interactive(entry)
-                                && !BEHAVIOR_DENYLIST.iter().any(|d| name.contains(d))
-                        })
-                        .map(|(name, _)| name.as_str())
-                        .collect();
-                    // Map interactive names back to running PIDs, then union JIT PIDs.
-                    let mut pids: HashSet<u32> = snapshot
-                        .top_processes
-                        .iter()
-                        .filter(|p| interactive_names.contains(p.name.as_str()))
-                        .map(|p| p.pid)
-                        .collect();
-                    pids.extend(jit_protected_pids.iter().copied());
-                    pids
-                };
+                // Extracted to daemon_behavior_pids::build_behavior_interactive_pids (Wave 15).
+                // [Android LMK] Sustained low cpu_wall_ratio → I/O-bound → interactive.
+                // JIT PIDs from syscall_classifier are merged in unconditionally.
+                let behavior_interactive_pids: HashSet<u32> =
+                    daemon_behavior_pids::build_behavior_interactive_pids(
+                        &state,
+                        &snapshot,
+                        &jit_protected_pids,
+                    );
 
                 // PID integral adjustment: if pressure has been chronically above target,
                 // lower thresholds proportionally. Ki = 0.02 → 1.0 pressure-second of
