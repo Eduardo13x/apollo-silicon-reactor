@@ -175,6 +175,11 @@ pub struct SaturationForecast {
     pub risk: SwapRisk,
     /// Current swap occupancy ratio in [0.0, 1.0] for reference.
     pub swap_ratio: f64,
+    /// Empirical volatility of net_rate (bytes/s) — std-dev estimated via EMA
+    /// of squared deviations [Welford 1962]. High σ at low mean = "sticky swap"
+    /// harbinger: pressure will spike faster than T_sat predicts.
+    /// [Øksendal 2003 §3] — σ is the diffusion term in the SDE dS = μ dt + σ dW.
+    pub net_rate_volatility: f64,
 }
 
 /// Per-cycle input: caller provides the macOS VM flow rates and current swap
@@ -201,6 +206,11 @@ pub struct SwapReclaimModel {
     reclaim_ema_bps: f64,
     /// EMA of swapout rate (pages/s) — gates Critical escalation.
     swapout_ema_pps: f64,
+    /// EMA of squared net_rate first-differences — Welford variance estimate.
+    /// σ = sqrt(net_rate_var_ema) exposed in SaturationForecast.
+    net_rate_var_ema: f64,
+    /// Previous cycle's net_rate for first-difference volatility computation.
+    net_rate_prev: f64,
     /// Number of samples ingested (warm-up guard).
     samples: u32,
 }
@@ -236,6 +246,20 @@ impl SwapReclaimModel {
         self.samples = self.samples.saturating_add(1);
 
         let net_rate = self.dirty_ema_bps - self.reclaim_ema_bps;
+
+        // Volatility: EMA of squared first-differences of net_rate.
+        // [Welford 1962] online variance; [Øksendal 2003 §3] σ = diffusion term.
+        // δ = net_rate - prev_net_rate captures cycle-to-cycle change rate.
+        // After warm-up (≥2 samples), σ² = EMA(δ²) is valid.
+        let delta = net_rate - self.net_rate_prev;
+        self.net_rate_var_ema =
+            EMA_ALPHA * (delta * delta) + (1.0 - EMA_ALPHA) * self.net_rate_var_ema;
+        let net_rate_volatility = if self.samples >= 2 {
+            self.net_rate_var_ema.sqrt()
+        } else {
+            0.0
+        };
+
         let swap_total = sample.swap_total_bytes;
         let swap_used = sample.swap_used_bytes;
         let swap_ratio = if swap_total > 0 {
@@ -280,6 +304,8 @@ impl SwapReclaimModel {
             None
         };
 
+        self.net_rate_prev = net_rate;
+
         SaturationForecast {
             dirty_rate_bps: self.dirty_ema_bps,
             reclaim_rate_bps: self.reclaim_ema_bps,
@@ -288,6 +314,7 @@ impl SwapReclaimModel {
             t_sat_sec,
             risk,
             swap_ratio,
+            net_rate_volatility,
         }
     }
 
@@ -437,6 +464,7 @@ mod tests {
             t_sat_sec: None,
             risk: SwapRisk::Safe,
             swap_ratio: 0.0,
+            net_rate_volatility: 0.0,
         };
         for _ in 0..20 {
             last = m.update(&sample_io(10_000.0, 0.0, 0.0, 5.0, used, gb(8)));
@@ -506,5 +534,64 @@ mod tests {
         use super::CyberPhysicalSignal;
         let n = super::NetRateNorm(NET_RATE_CEILING_BPS * 10.0).normalized();
         assert!((n - 1.0).abs() < 1e-9, "beyond ceiling → clamped 1.0, got {n}");
+    }
+
+    // ── Volatility (σ) tests ────────────────────────────────────────────────
+
+    #[test]
+    fn volatility_zero_on_first_sample() {
+        // [Welford 1962] warm-up: σ undefined until 2 samples; return 0.
+        let mut m = SwapReclaimModel::new();
+        let f = m.update(&sample(100.0, 50.0, 0.0, gb(1), gb(8)));
+        assert_eq!(f.net_rate_volatility, 0.0, "first sample must have σ=0");
+    }
+
+    #[test]
+    fn volatility_nonzero_after_rate_change() {
+        // After a change in net_rate, σ must become positive.
+        let mut m = SwapReclaimModel::new();
+        m.update(&sample(100.0, 50.0, 0.0, gb(1), gb(8))); // seed
+        let f = m.update(&sample(200.0, 50.0, 0.0, gb(1), gb(8))); // step up
+        assert!(f.net_rate_volatility > 0.0, "σ must be positive after net_rate change");
+    }
+
+    #[test]
+    fn volatility_higher_for_volatile_signal() {
+        // Alternating high/low dirty_rate → high σ vs steady → low σ.
+        let mut m_stable = SwapReclaimModel::new();
+        let mut m_volatile = SwapReclaimModel::new();
+        for _ in 0..20 {
+            m_stable.update(&sample(200.0, 100.0, 0.0, gb(1), gb(8)));
+        }
+        for i in 0..20 {
+            let comp = if i % 2 == 0 { 10.0 } else { 5_000.0 };
+            m_volatile.update(&sample(comp, 0.0, 0.0, gb(1), gb(8)));
+        }
+        let f_stable = m_stable.update(&sample(200.0, 100.0, 0.0, gb(1), gb(8)));
+        let f_volatile = m_volatile.update(&sample(2_500.0, 0.0, 0.0, gb(1), gb(8)));
+        assert!(
+            f_volatile.net_rate_volatility > f_stable.net_rate_volatility,
+            "volatile signal (σ={:.0}) must exceed stable (σ={:.0})",
+            f_volatile.net_rate_volatility, f_stable.net_rate_volatility
+        );
+    }
+
+    #[test]
+    fn volatility_sticky_swap_harbinger() {
+        // Sticky-swap: low mean net_rate but high volatility (oscillates around 0).
+        // This is the pattern that T_sat alone misses.
+        let mut m = SwapReclaimModel::new();
+        for i in 0..30 {
+            // Oscillate between slight compression and slight decompression.
+            let (comp, decomp) = if i % 2 == 0 {
+                (55.0, 50.0) // net slightly positive
+            } else {
+                (50.0, 55.0) // net slightly negative
+            };
+            m.update(&sample(comp, decomp, 0.0, gb(3), gb(8)));
+        }
+        let f = m.update(&sample(55.0, 50.0, 0.0, gb(3), gb(8)));
+        // net_rate is small (near 0) but volatility is non-trivial.
+        assert!(f.net_rate_volatility > 0.0, "oscillating signal must have σ > 0");
     }
 }
