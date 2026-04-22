@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 mod cognitive_tick;
 mod daemon_action_pipeline;
 mod daemon_action_safety;
+mod daemon_agent_actions;
 mod daemon_behavior_pids;
 mod daemon_cluster_actions;
 mod daemon_paging_hints;
@@ -98,7 +99,6 @@ use apollo_optimizer::engine::predictive_agent::{
 };
 use apollo_optimizer::engine::proc_taskinfo;
 use apollo_optimizer::engine::profile_governor::GovernorInput;
-use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
 use apollo_optimizer::engine::safety::{critical_background_processes, enforce_limits_with_budget, is_protected_name};
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
 use apollo_optimizer::engine::smc_reader::SmcReader;
@@ -3674,71 +3674,15 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // Predictive agent: inject soft actions for PreThrottleNoise / ProactivePurge.
-                match agent_intervention {
-                    Intervention::PreThrottleNoise => {
-                        // Renice top 3 noise processes (soft throttle, no SIGSTOP).
-                        let noise_pats = state
-                            .policy
-                            .lock_recover()
-                            .learned_policy
-                            .noise_patterns
-                            .clone();
-                        let mut noise_procs: Vec<_> = snapshot
-                            .top_processes
-                            .iter()
-                            .filter(|p| noise_pats.iter().any(|pat| p.name.contains(pat.as_str())))
-                            .collect();
-                        noise_procs.sort_by(|a, b| {
-                            b.cpu_usage
-                                .partial_cmp(&a.cpu_usage)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        for proc in noise_procs.iter().take(3) {
-                            actions.push(RootAction::throttle(
-                                proc.pid as u32,
-                                proc.name.clone(),
-                                false,
-                                "predictive-agent: pre-throttle noise",
-                            ));
-                        }
-                    }
-                    Intervention::ProactivePurge => {
-                        // Send paging hints to top 3 background processes by RSS.
-                        // SetMemorystatus with priority -1 asks the process to release caches
-                        // voluntarily — no freeze, no kill. Passes through safety in execute_actions.
-                        let interactive_pats = decide_interactive.clone();
-                        let protected_pats = state
-                            .policy
-                            .lock_recover()
-                            .learned_policy
-                            .protected_patterns
-                            .clone();
-                        let daemon_pid = std::process::id();
-                        let mut bg_procs: Vec<_> = snapshot
-                            .top_processes
-                            .iter()
-                            .filter(|p| {
-                                p.pid != daemon_pid // never hint self — self-inflicted cache purge spiral
-                                    && !is_interactive_app_name(&p.name)
-                                    && !interactive_pats
-                                        .iter()
-                                        .any(|pat| p.name.contains(pat.as_str()))
-                                    && !protected_pats
-                                        .iter()
-                                        .any(|pat| p.name.contains(pat.as_str()))
-                                    && p.memory_usage > 50 * 1024 * 1024 // >50 MB RSS
-                            })
-                            .collect();
-                        bg_procs.sort_by(|a, b| b.memory_usage.cmp(&a.memory_usage));
-                        for proc in bg_procs.iter().take(3) {
-                            actions.push(RootAction::SetMemorystatus {
-                                pid: proc.pid,
-                                priority: -1,
-                                reason: "predictive-agent: proactive purge hint".to_string(),
-                            });
-                        }
-                    }
-                    _ => {} // Observe, TightenThresholds, SuggestAggressive handled above
+                // Extracted to daemon_agent_actions::run_agent_actions (Wave 19).
+                {
+                    let agent_new = daemon_agent_actions::run_agent_actions(
+                        &agent_intervention,
+                        &snapshot.top_processes,
+                        &state,
+                        &decide_interactive,
+                    );
+                    actions.extend(agent_new);
                 }
 
                 // Direct pressure hints + G20 ODE velocity hints.
