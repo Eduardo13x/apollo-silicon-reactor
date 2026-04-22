@@ -30,6 +30,7 @@ mod daemon_holt_winters_tick;
 mod daemon_markov_tick;
 mod daemon_memory_budget;
 mod daemon_proc_scan_tick;
+mod daemon_rusage_tick;
 mod daemon_survival_tick;
 mod daemon_cycle_tail;
 mod daemon_feature_gates;
@@ -1774,41 +1775,13 @@ fn main() -> anyhow::Result<()> {
                 // PowerManager: advisory tick (no real sensor data yet).
                 let _power_rec = power_mgr.get_recommendation();
 
-                // EMA interactivity classifier: compute cpu_wall_ratio per PID
-                // from proc_pid_rusage deltas. This measures how CPU-bound each
-                // process is (low ratio = I/O-bound/interactive, high = CPU-bound).
-                let elapsed_rusage = last_rusage_at.elapsed();
-                last_rusage_at = Instant::now();
-                let mut cpu_wall_ratios: HashMap<String, f32> = HashMap::new();
-                let mut new_rusage_prev: HashMap<u32, (u64, u64, u64)> = HashMap::new();
-                for p in &snapshot.top_processes {
-                    if let Some(ri) = proc_taskinfo::get_rusage_info(p.pid) {
-                        let total_cpu = ri.user_time_ns + ri.system_time_ns;
-                        if let Some(&(prev_user, prev_system, prev_start)) =
-                            rusage_cpu_prev.get(&p.pid)
-                        {
-                            // PID recycling guard: if proc_start_abstime changed,
-                            // this is a different process reusing the PID.
-                            if ri.proc_start_abstime == prev_start {
-                                let prev_total = prev_user + prev_system;
-                                if total_cpu >= prev_total {
-                                    let delta_cpu = total_cpu - prev_total;
-                                    let delta_wall = elapsed_rusage.as_nanos() as u64;
-                                    if delta_wall > 0 {
-                                        let ratio =
-                                            (delta_cpu as f64 / delta_wall as f64).min(1.0) as f32;
-                                        cpu_wall_ratios.insert(p.name.clone(), ratio);
-                                    }
-                                }
-                            }
-                        }
-                        new_rusage_prev.insert(
-                            p.pid,
-                            (ri.user_time_ns, ri.system_time_ns, ri.proc_start_abstime),
-                        );
-                    }
-                }
-                rusage_cpu_prev = new_rusage_prev;
+                // EMA interactivity classifier: cpu_wall_ratio per PID from rusage deltas.
+                // Extracted to daemon_rusage_tick::compute_cpu_wall_ratios (Wave 33).
+                let cpu_wall_ratios = daemon_rusage_tick::compute_cpu_wall_ratios(
+                    &snapshot,
+                    &mut last_rusage_at,
+                    &mut rusage_cpu_prev,
+                );
 
                 // Online usage learning (root-only, no UI sensors): infer frequently-used apps
                 // and processes correlated with jank, then promote patterns conservatively.
