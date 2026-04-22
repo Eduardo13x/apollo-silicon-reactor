@@ -2579,6 +2579,13 @@ fn main() -> anyhow::Result<()> {
                 if signal_digest.cumulative_stress > 0.55 {
                     reactor_weight = (reactor_weight + 0.07).min(1.0);
                 }
+                // HW seasonal anomaly: pressure far above what's normal for this hour.
+                // [Holt 1957, Winters 1960] structural problem, not workload spike.
+                if signal_digest.hw_seasonal_anomaly > 1.5
+                    && holt_winters.observations() >= 24
+                {
+                    reactor_weight = (reactor_weight + 0.06).min(1.0);
+                }
                 // Darwin-Boltzmann anomaly: learned pattern deviation.
                 // Score > 0.5 means the system state deviates significantly from
                 // the Hopfield memory + SAE ensemble's learned "normal" manifold.
@@ -2844,6 +2851,16 @@ fn main() -> anyhow::Result<()> {
                     &state,
                     &mut overflow_thresholds,
                 );
+
+                // HW seasonal anomaly: ratio of actual pressure to seasonal expectation.
+                // [Holt 1957, Winters 1960] >1.0 = above norm; >1.5 at quiet hour = structural.
+                {
+                    let level = holt_winters.level();
+                    let sf = holt_winters.seasonal_factor(hour_of_day);
+                    let expected = (level * sf).max(1e-6);
+                    signal_digest.hw_seasonal_anomaly =
+                        (snapshot.pressure.memory_pressure / expected).clamp(0.0, 3.0);
+                }
 
                 // Perceptual latency monitor: composite score from existing signals.
                 // If UI responsiveness is degraded, boost reactor_weight to trigger

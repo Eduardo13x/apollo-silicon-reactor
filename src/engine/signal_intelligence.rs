@@ -118,6 +118,13 @@ pub struct SignalDigest {
     /// [Yerkes & Dodson 1908] persists across individual-cycle snapshots.
     /// High cumulative_stress at moderate instant urgency = chronic overload.
     pub cumulative_stress: f64,
+
+    // ── Holt-Winters Seasonal Anomaly ────────────────────────────────
+    /// How far above the seasonal expectation current pressure is.
+    /// [Holt 1957, Winters 1960] ratio: actual / (level * seasonal_factor).
+    /// >1.0 = above seasonal norm. >1.5 at quiet hours = structural problem.
+    /// Wired from HoltWinters after each hourly update cycle.
+    pub hw_seasonal_anomaly: f64,
 }
 
 /// Orquestador de señales. Inicializar una vez en el daemon, llamar tick() cada ciclo.
@@ -595,6 +602,8 @@ impl SignalIntelligence {
             swap_net_rate_volatility: 0.0,
             lyapunov_exponent,
             cumulative_stress,
+            // Wired from HoltWinters after hourly update (main.rs post-tick).
+            hw_seasonal_anomaly: 1.0,
         }
     }
 
@@ -1250,6 +1259,7 @@ mod tests {
             swap_net_rate_volatility: 0.0,
             lyapunov_exponent: 0.0,
             cumulative_stress: 0.0,
+            hw_seasonal_anomaly: 1.0,
         };
         for _ in 0..20 {
             digest = tick_nominal(&mut si);
@@ -1695,6 +1705,7 @@ mod tests {
             swap_net_rate_volatility: 0.0,
             lyapunov_exponent: 0.0,
             cumulative_stress: 0.0,
+            hw_seasonal_anomaly: 1.0,
         };
         for i in 0..20 {
             let pressure = 0.55 + i as f64 * 0.005;
@@ -1955,6 +1966,7 @@ mod tests {
             swap_net_rate_volatility: 0.0,
             lyapunov_exponent: 0.0,
             cumulative_stress: 0.0,
+            hw_seasonal_anomaly: 1.0,
         };
         for _ in 0..30 {
             last = si.tick(
