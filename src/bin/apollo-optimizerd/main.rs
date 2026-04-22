@@ -25,6 +25,7 @@ mod daemon_signal_tick;
 mod daemon_skill_tick;
 mod daemon_chromium_tick;
 mod daemon_cognitive_tick;
+mod daemon_ctx_switch_tick;
 mod daemon_holt_winters_tick;
 mod daemon_markov_tick;
 mod daemon_memory_budget;
@@ -1528,34 +1529,15 @@ fn main() -> anyhow::Result<()> {
                 temporal_weekday = markov_temporal_weekday;
 
                 // Context-switch burst detector + reactive unfreeze.
-                // Si el foreground cambió y el nuevo app estaba congelado, lo descongelamos
-                // de inmediato — sin esperar al siguiente ciclo de optimización.
-                {
-                    let fg_now = foreground_app.clone();
-                    let fg_changed =
-                        fg_now.is_some() && last_fg_name.is_some() && fg_now != last_fg_name;
-
-                    if fg_changed {
-                        ctx_switch_times.push_back(Instant::now());
-                    }
-
-                    // Reactive unfreeze: si el pid activo está en frozen_state, SIGCONT inmediato.
-                    // Usamos solo el foreground_pid aquí (process_tree aún no está construido);
-                    // el resto de la familia se descongela en el siguiente ciclo normal.
-                    if let Some(fg_pid) = foreground_pid {
-                        let mut frozen_guard = state.frozen_state.lock_recover();
-                        if frozen_guard.remove(&fg_pid).is_some() {
-                            unfreeze_pids(std::iter::once(fg_pid));
-                            write_frozen_state(&frozen_state_path, &frozen_guard);
-                            drop(frozen_guard);
-                            state.metrics.lock_recover().metrics.unfreezes_applied += 1;
-                        }
-                    }
-
-                    last_fg_name = fg_now;
-                    let cutoff = Instant::now() - Duration::from_secs(300);
-                    ctx_switch_times.retain(|t| *t > cutoff);
-                }
+                // Extracted to daemon_ctx_switch_tick::run_ctx_switch_tick (Wave 31).
+                daemon_ctx_switch_tick::run_ctx_switch_tick(
+                    foreground_app.clone(),
+                    foreground_pid,
+                    &mut last_fg_name,
+                    &mut ctx_switch_times,
+                    &state,
+                    &frozen_state_path,
+                );
 
                 // Process tree: build from the full process table for child grouping.
                 // Extracted to daemon_process_collector::build_process_tree().
