@@ -187,7 +187,19 @@ impl ApolloNeuromodulator {
 
         // ── Derive parameters ────────────────────────────────────────
         self.alpha_multiplier = 0.5 + self.dopamine; // [0.5, 1.5]
+
+        // NA→dyna_steps ceiling guard: cap planning depth under chronic stress to
+        // break the chaos-CPU-stress spiral identified by NotebookLM debrief.
+        // [Nygard 2018 §4] Fail Fast / Bulkhead: don't let one subsystem (planning)
+        // consume resources that worsen the very condition it's trying to fix.
+        let max_dyna = if s.cumulative_stress > 0.70 {
+            8 // throttle planning depth when system is chronically stressed
+        } else {
+            20
+        };
         self.dyna_steps = (4.0 + self.noradrenaline * 16.0).round() as usize; // [4, 20]
+        self.dyna_steps = self.dyna_steps.min(max_dyna);
+
         self.serotonin_shift = (self.serotonin - 0.5) * 0.10; // [-0.05, +0.05]
         self.epsilon_bonus = self.acetylcholine * 0.05; // [0.0, 0.05]
     }
