@@ -31,6 +31,7 @@ mod daemon_markov_tick;
 mod daemon_memory_budget;
 mod daemon_proc_scan_tick;
 mod daemon_rusage_tick;
+mod daemon_teacher_tick;
 mod daemon_survival_tick;
 mod daemon_cycle_tail;
 mod daemon_feature_gates;
@@ -1813,41 +1814,15 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                // ── Teacher consolidation: S2 → S1 memory transfer ────────
-                // When llm_reactive_tick resolves a pending outcome, compile
-                // Gemma's suggestion into pattern_weights + NARS beliefs using
-                // dopamine/acetylcholine modulation. Each outcome consolidated
-                // exactly once (tracked by applied_at timestamp).
-                {
-                    let (new_outcome, matching_suggestion) = {
-                        let guard = state.llm.lock_recover();
-                        let outcome = guard.llm_state.last_suggestion_outcome.clone();
-                        let suggestion = guard.llm_state.last_suggestion.clone();
-                        (outcome, suggestion)
-                    };
-                    if let (Some(outcome), Some(suggestion)) = (new_outcome, matching_suggestion) {
-                        if last_consolidated_at != Some(outcome.applied_at) {
-                            let natural_drift = lctx.outcome_tracker.natural_drift();
-                            let report = teacher_consolidator.consolidate(
-                                &outcome,
-                                &suggestion,
-                                natural_drift,
-                                &mut lctx.outcome_tracker.weights,
-                                &mut lctx.outcome_tracker.drift_detector,
-                                &mut arousal_state,
-                            );
-                            last_consolidated_at = Some(outcome.applied_at);
-                            // Journal: record the consolidation event for observability.
-                            if !matches!(report.verdict, "BELOW_DEADBAND") {
-                                let mut mx = state.metrics.lock_recover();
-                                mx.metrics.teacher_consolidations += 1;
-                                if report.verdict == "IMPROVED" {
-                                    mx.metrics.teacher_improvements += 1;
-                                }
-                            }
-                        }
-                    }
-                }
+                // Teacher consolidation: S2 → S1 memory transfer.
+                // Extracted to daemon_teacher_tick::run_teacher_consolidation (Wave 34).
+                daemon_teacher_tick::run_teacher_consolidation(
+                    &state,
+                    &mut lctx.outcome_tracker,
+                    &mut teacher_consolidator,
+                    &mut last_consolidated_at,
+                    &mut arousal_state,
+                );
 
                 let mut reactor_weight = state.metrics.lock_recover().reactor_event_weight;
                 reactor_weight = (reactor_weight * 0.75).clamp(0.0, 1.0);
