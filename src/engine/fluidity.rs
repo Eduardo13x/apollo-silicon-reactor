@@ -25,6 +25,7 @@
 use std::collections::VecDeque;
 
 use crate::engine::kalman::Kalman1D;
+use crate::engine::safety::is_protected_name;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -55,39 +56,6 @@ const OFFENDER_EMA_ALPHA: f32 = 0.3;
 
 /// Max number of tracked offenders (bounded to avoid unbounded growth).
 const MAX_OFFENDERS: usize = 20;
-
-/// Process names that are always protected and never flagged as offenders.
-/// Includes system essentials + interactive apps from decide_actions::INTERACTIVE_APPS.
-/// [Lampson 1974] One policy per resource — keep in sync with thermal_interrupt.
-const PROTECTED_NAMES: &[&str] = &[
-    // System essentials
-    "WindowServer",
-    "launchd",
-    "kernel_task",
-    "loginwindow",
-    "SystemUIServer",
-    "Dock",
-    "Finder",
-    "coreaudiod",
-    "apollo-optimizerd",
-    // Build tools
-    "cargo",
-    "rustc",
-    "clippy-driver",
-    // User interactive (synced from INTERACTIVE_APPS)
-    "Claude",
-    "Antigravity",
-    "Brave",
-    "Google Chrome",
-    "Safari",
-    "Firefox",
-    "Arc",
-    "Code",
-    "Cursor",
-    "zoom.us",
-    "Notion",
-    "Spotify",
-];
 
 // ── Core State ────────────────────────────────────────────────────────────────
 
@@ -313,7 +281,7 @@ impl FluidityState {
         // When fluidity is degraded, correlate high-CPU processes as offenders.
         if self.fluidity_degraded {
             for (pid, name, cpu) in processes {
-                if *cpu > OFFENDER_CPU_THRESHOLD && !is_protected(name) {
+                if *cpu > OFFENDER_CPU_THRESHOLD && !is_protected_name(name) {
                     // Update or insert offender record.
                     // Match on PID + name to guard against PID reuse: macOS recycles
                     // PIDs aggressively and a reused PID is a different process.
@@ -450,11 +418,6 @@ fn is_launchable_app(name: &str) -> bool {
         || name == "ollama"
         || name == "python3"
         || name == "python"
-}
-
-/// True if the process is protected and should never be flagged as an offender.
-fn is_protected(name: &str) -> bool {
-    PROTECTED_NAMES.iter().any(|p| name.contains(p))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -598,23 +561,27 @@ mod tests {
     #[test]
     fn protected_processes_not_flagged_as_offenders() {
         let mut state = FluidityState::new();
-        // Force degraded state by using high WS CPU across many cycles
+        // Force degraded state by using high WS CPU across many cycles.
+        // Use `coreaudiod` — hard-protected by safety::is_protected_name oracle.
+        // (User-interactive apps like "Brave Browser" are ConditionalForeground
+        // and intentionally not covered by the name-only oracle; see
+        // classify_protection() for foreground-aware decisions.)
         let procs = make_procs(&[
             ("WindowServer", 80.0),
-            ("Brave Browser", 50.0),     // protected
+            ("coreaudiod", 50.0),        // protected (hard)
             ("SomeBackgroundApp", 40.0), // not protected
         ]);
         // Run multiple cycles to trigger degradation
         for _ in 0..10 {
             state.update(&procs, 0.5, 2.0);
         }
-        // Brave Browser should NOT appear as offender
-        let brave_in_offenders = state
+        // coreaudiod should NOT appear as offender
+        let protected_in_offenders = state
             .fluidity_offenders
             .iter()
-            .any(|(_, name, _)| name.contains("Brave Browser"));
+            .any(|(_, name, _)| name.contains("coreaudiod"));
         assert!(
-            !brave_in_offenders,
+            !protected_in_offenders,
             "protected process must not be an offender"
         );
     }
