@@ -292,6 +292,7 @@ pub fn execute_actions(
     mut qos_mgr: Option<&mut MachQoSManager>,
     dry_run: bool,
     memory_pressure: f64,
+    thrashing_score: f64,
 ) -> ExecuteOutcomes {
     let protected = protected_processes();
     // Only infrastructure (docker, postgres, redis, etc.) gets unconditional protection
@@ -567,9 +568,13 @@ pub fn execute_actions(
                     // pressure the OOM risk outweighs interrupting a download
                     // or background task — without this, a single PID holding
                     // PreventUserIdleSleep blocks every freeze while swap climbs.
-                    // Lowered from 0.75: at 74.5% pressure + thrashing_score=121k the system
-                    // was paralysed for 0.5pp — empirical evidence the old threshold was too high.
-                    if memory_pressure < 0.70 {
+                    // Bypass per-PID assertion gate under physical crisis:
+                    //   pressure ≥ 0.70 — RAM level critical
+                    //   thrashing ≥ 10k — flow crisis (Gate C); compressor churning,
+                    //                     OOM imminent regardless of assertion intent.
+                    // Mirror of UserContext::freeze_protected bypass conditions.
+                    // [Nygard 2018] load shedding overrides politeness under overload.
+                    if memory_pressure < 0.70 && thrashing_score < 10_000.0 {
                         let busy = assertion_pids.get_or_insert_with(pids_with_assertions);
                         if busy.contains(pid) {
                             out.push_skip(format!("assertion-active:{}", name));
@@ -869,6 +874,7 @@ mod tests {
             None,
             false,
             0.0,
+            0.0,
         )
     }
 
@@ -899,6 +905,7 @@ mod tests {
             &[],
             None,
             false,
+            0.0,
             0.0,
         );
         // All 5 ghost pids are dead → should be removed from frozen set.

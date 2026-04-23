@@ -110,12 +110,24 @@ impl UserContext {
     /// Without dual bypass, a single Electron renderer holding PreventUserIdleSleep
     /// locks every freeze even when swap is at 84% and minutes from OOM panic.
     #[inline]
-    pub fn freeze_protected(&self, memory_pressure: f64, swap_used_bytes: u64) -> bool {
+    pub fn freeze_protected(
+        &self,
+        memory_pressure: f64,
+        swap_used_bytes: u64,
+        thrashing_score: f64,
+    ) -> bool {
         if self.call_in_progress {
             return true;
         }
         let swap_gb = swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-        if memory_pressure >= 0.70 || swap_gb >= 4.0 {
+        // Bypass sleep-assertion gate under any of three physical-crisis conditions:
+        //   pressure ≥ 0.70 — RAM level critical
+        //   swap ≥ 4 GB    — swap exhaustion
+        //   thrashing ≥ 10k — Gate C flow crisis (6× Gate C threshold means compressor
+        //                      is churning; sleep assertion contributing to the panic)
+        // [Denning 1968] fault rate > residency defines working-set quality;
+        // [Nygard 2018] load shedding must override politeness under overload.
+        if memory_pressure >= 0.70 || swap_gb >= 4.0 || thrashing_score >= 10_000.0 {
             return false;
         }
         self.has_sleep_assertion
@@ -297,18 +309,24 @@ mod tests {
         let normal = UserContext::default();
         let low_swap = (1u64 << 30); // 1 GB
         let high_swap = (4u64 << 30); // 4 GB — exhaustion floor
-        // Low pressure + low swap: assertion blocks freeze, normal does not.
-        assert!(call.freeze_protected(0.30, low_swap));
-        assert!(assertion.freeze_protected(0.30, low_swap));
-        assert!(!normal.freeze_protected(0.30, low_swap));
+        let no_thrash = 0.0_f64;
+        let thrashing = 15_000.0_f64; // above 10k bypass threshold
+        // Low pressure + low swap + no thrashing: assertion blocks freeze, normal does not.
+        assert!(call.freeze_protected(0.30, low_swap, no_thrash));
+        assert!(assertion.freeze_protected(0.30, low_swap, no_thrash));
+        assert!(!normal.freeze_protected(0.30, low_swap, no_thrash));
         // High pressure: call still blocks (cannot interrupt), assertion no longer.
-        assert!(call.freeze_protected(0.85, low_swap));
-        assert!(!assertion.freeze_protected(0.85, low_swap));
-        assert!(!normal.freeze_protected(0.85, low_swap));
+        assert!(call.freeze_protected(0.85, low_swap, no_thrash));
+        assert!(!assertion.freeze_protected(0.85, low_swap, no_thrash));
+        assert!(!normal.freeze_protected(0.85, low_swap, no_thrash));
         // Low pressure BUT swap exhaustion (≥4GB): assertion no longer blocks.
-        assert!(call.freeze_protected(0.59, high_swap));  // call still unconditional
-        assert!(!assertion.freeze_protected(0.59, high_swap));
-        assert!(!normal.freeze_protected(0.59, high_swap));
+        assert!(call.freeze_protected(0.59, high_swap, no_thrash));  // call still unconditional
+        assert!(!assertion.freeze_protected(0.59, high_swap, no_thrash));
+        assert!(!normal.freeze_protected(0.59, high_swap, no_thrash));
+        // Low pressure + low swap BUT thrashing ≥ 10k: assertion no longer blocks.
+        assert!(call.freeze_protected(0.59, low_swap, thrashing));  // call still unconditional
+        assert!(!assertion.freeze_protected(0.59, low_swap, thrashing));
+        assert!(!normal.freeze_protected(0.59, low_swap, thrashing));
     }
 
     #[test]

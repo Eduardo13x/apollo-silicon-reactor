@@ -3436,6 +3436,7 @@ fn main() -> anyhow::Result<()> {
                             // No freeze actions in a sysctl-revert batch — pressure
                             // is irrelevant here; pass 0.0 so the assertion gate stays armed.
                             0.0,
+                            0.0,
                         );
                         if outcomes.failures == 0 {
                             sysctl_governor.mark_reverted();
@@ -3937,6 +3938,7 @@ fn main() -> anyhow::Result<()> {
                             Some(&mut qos),
                             dry_run,
                             snapshot.pressure.memory_pressure,
+                            snapshot.pressure.thrashing_score,
                         )
                     } else {
                         // Circuit Closed or HalfOpen: run normally, then report outcome.
@@ -3950,6 +3952,7 @@ fn main() -> anyhow::Result<()> {
                             Some(&mut qos),
                             dry_run,
                             snapshot.pressure.memory_pressure,
+                            snapshot.pressure.thrashing_score,
                         );
                         // Report outcome to circuit breaker (lock released before I/O above).
                         {
@@ -4444,6 +4447,7 @@ fn main() -> anyhow::Result<()> {
                         None,
                         dry_run,
                         // Shutdown sysctl-revert batch — no freezes in here.
+                        0.0,
                         0.0,
                     );
                     if outcomes.failures == 0 {

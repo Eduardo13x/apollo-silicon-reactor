@@ -61,6 +61,7 @@ fn execute_boost_dead_pid_is_skipped() {
         None,
         false,
         0.0,
+        0.0,
     );
     assert_eq!(
         outcomes.failures, 0,
@@ -92,6 +93,7 @@ fn execute_freeze_dead_pid_is_skipped() {
         &[],
         None,
         false,
+        0.0,
         0.0,
     );
     assert_eq!(
@@ -127,6 +129,7 @@ fn execute_throttle_dead_pid_is_skipped() {
         None,
         false,
         0.0,
+        0.0,
     );
     assert_eq!(outcomes.throttles_applied, 0);
     assert_eq!(outcomes.failures, 0);
@@ -150,6 +153,7 @@ fn execute_unfreeze_dead_pid_is_safe() {
         &[],
         None,
         false,
+        0.0,
         0.0,
     );
     // Unfreeze always increments even on dead PID (SIGCONT to dead PID is a no-op).
@@ -187,6 +191,7 @@ fn execute_non_allowlisted_sysctl_is_denied() {
         None,
         false,
         0.0,
+        0.0,
     );
     assert_eq!(
         outcomes.sysctl_applied, 0,
@@ -218,6 +223,7 @@ fn execute_sysctl_without_cap_is_skipped() {
         &[],
         None,
         false,
+        0.0,
         0.0,
     );
     assert_eq!(
@@ -276,6 +282,7 @@ fn execute_outcomes_all_zero_for_dead_pids() {
         &[],
         None,
         false,
+        0.0,
         0.0,
     );
 
@@ -472,6 +479,7 @@ fn execute_actions_skips_protected_name_regardless_of_pid() {
         &[],
         None,
         false,
+        0.0,
         0.0,
     );
     // Protected name → skipped. No failure, no boost counted.
