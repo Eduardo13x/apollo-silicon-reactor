@@ -2540,11 +2540,16 @@ fn main() -> anyhow::Result<()> {
 
                 // Publish shadow signals for decide_actions' shadow-mode ActionContext.
                 // Consumed by ShadowEvaluator via shadow_signals::get_* — keeps
-                // decide_actions' signature stable while wiring F6 + thermal + interrupt.
+                // decide_actions' signature stable while wiring predictive + context.
                 apollo_optimizer::engine::shadow_signals::set_p_oom_30s(signal_digest.p_oom_30s);
                 apollo_optimizer::engine::shadow_signals::set_thermal_emergency(thermal_emergency);
                 apollo_optimizer::engine::shadow_signals::set_interrupt_phase(
                     state.resource_interrupt.phase.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                // Foreground PID + epistemic proxy (urgency composite).
+                apollo_optimizer::engine::shadow_signals::set_foreground_pid(foreground_pid);
+                apollo_optimizer::engine::shadow_signals::set_epistemic_uncertainty(
+                    signal_digest.urgency,
                 );
 
                 // ODE swap urgency — hoisted for use in Neuromodulator AND LinUCB.
@@ -3571,6 +3576,10 @@ fn main() -> anyhow::Result<()> {
                     let mut ds_freeze = 0u64;
                     let mut ds_skip = 0u64;
                     let mut ds_hint = 0u64;
+                    // Shadow aggregate: max hot-page fraction / WSS across candidates this cycle.
+                    // Published to shadow_signals after the loop for next cycle's class-level probe.
+                    let mut max_hot_frac: f64 = 0.0;
+                    let mut max_wss_mb: f64 = 0.0;
                     let confirmed_actions: Vec<RootAction> = confirmed_actions.into_iter().filter_map(|a| {
                         if let RootAction::FreezeProcess { pid, name: ref freeze_name, ref reason, .. } = a {
                             // query_memory_profile falls back to proc_pid_rusage (~3µs)
@@ -3578,6 +3587,9 @@ fn main() -> anyhow::Result<()> {
                             if let Some(profile) = query_memory_profile(pid) {
                                 ds_scans += 1;
                                 let fault_rate = mem_analyzer.major_fault_rate(pid);
+                                // Shadow aggregate: track max WSS across candidates for next-cycle probe.
+                                let wss_mb_i = profile.working_set_bytes as f64 / (1024.0 * 1024.0);
+                                if wss_mb_i > max_wss_mb { max_wss_mb = wss_mb_i; }
                                 // Deep scan: vm_region + temperature (only in mid/high zone).
                                 let temp = if signal_digest.pressure_smooth >= 0.30 {
                                     ds_probes += 1;
@@ -3585,6 +3597,10 @@ fn main() -> anyhow::Result<()> {
                                 } else {
                                     None
                                 };
+                                // Shadow aggregate: track max hot-page fraction when temp probe ran.
+                                if let Some(tp) = &temp {
+                                    if tp.pct_hot > max_hot_frac { max_hot_frac = tp.pct_hot; }
+                                }
                                 // Cable: classify_by_memory() → skip freezing LLM/Database processes.
                                 // If vm_region scan reveals an LLM inference or database layout,
                                 // freezing would be destructive (model eviction, buffer pool loss).
@@ -3704,6 +3720,13 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.deep_scan_freeze += ds_freeze;
                     metrics.metrics.deep_scan_skip += ds_skip;
                     metrics.metrics.deep_scan_hint += ds_hint;
+                    // Publish shadow aggregates for next cycle's class-level scorer probe.
+                    if max_hot_frac > 0.0 {
+                        apollo_optimizer::engine::shadow_signals::set_max_hot_page_fraction(max_hot_frac);
+                    }
+                    if max_wss_mb > 0.0 {
+                        apollo_optimizer::engine::shadow_signals::set_max_wss_mb(max_wss_mb);
+                    }
 
                     // Rosetta AOT: skip freezing oahd/oahd-helper during AOT compilation.
                     let confirmed_actions: Vec<RootAction> = if rosetta_monitor.is_compiling() {

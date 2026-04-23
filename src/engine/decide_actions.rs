@@ -1021,24 +1021,26 @@ pub fn decide_actions(
                     has_sleep_assertion: user_ctx.has_sleep_assertion,
                     call_in_progress: user_ctx.call_in_progress,
                     idle_secs: user_ctx.idle_secs,
-                    // Per-PID foreground info not in scope at the class-level gate.
-                    foreground_pid: None,
+                    // Foreground PID published by main loop via ForegroundDetector.
+                    foreground_pid: crate::engine::shadow_signals::get_foreground_pid(),
+                    // Class-level shadow — no specific PID to check family.
                     is_foreground_family: false,
                     is_recently_active: user_ctx.is_recently_active(),
-                    // Thermal / interrupt state — main loop publishes via
-                    // shadow_signals before decide_actions is called.
                     thermal_emergency: crate::engine::shadow_signals::get_thermal_emergency(),
                     interrupt_phase: crate::engine::shadow_signals::get_interrupt_phase(),
-                    // Conservative default — gate-tower handles per-name protection
-                    // downstream; the synthetic probe has no name to classify.
+                    // Class-level probe — per-name protection handled by gate tower.
                     protection_level: ProtectionLevel::Unprotected,
-                    // F5 deep scan data pipeline pending.
-                    hot_page_fraction: None,
-                    wss_mb: None,
-                    // F7 sensor freshness pipeline pending.
-                    sensor_age_ms: None,
-                    // Epistemic uncertainty plumbing pending.
-                    epistemic_uncertainty: 0.0,
+                    // F5 deep scan: MAX hot-page fraction / WSS across last-cycle's
+                    // freeze candidates (published after main.rs deep scan loop).
+                    hot_page_fraction: crate::engine::shadow_signals::get_max_hot_page_fraction(),
+                    wss_mb: crate::engine::shadow_signals::get_max_wss_mb(),
+                    // F7 sensor age — computed from snapshot timestamp. Clamped to
+                    // u64 range; huge ages (clock skew) saturate harmlessly.
+                    sensor_age_ms: {
+                        let age = (chrono::Utc::now() - snapshot.timestamp).num_milliseconds();
+                        if age < 0 { Some(0u64) } else { Some(age as u64) }
+                    },
+                    epistemic_uncertainty: crate::engine::shadow_signals::get_epistemic_uncertainty(),
                 };
                 shadow_evaluator_cell().evaluate_blocked(
                     &probe,
