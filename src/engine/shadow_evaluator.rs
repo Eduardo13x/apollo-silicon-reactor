@@ -19,7 +19,7 @@ use crate::engine::action_policy::{
     ActionContext, PolicyScorer, PressureBenefitFeature, ProtectionFeature,
     UserDisruptionCostFeature,
 };
-use crate::engine::blocked_action_journal::{emit, BlockedActionEvent, BlockerKind};
+use crate::engine::blocked_action_journal::{emit_async, BlockedActionEvent, BlockerKind};
 use crate::engine::policy_feature_deep_scan::DeepScanCostFeature;
 use crate::engine::policy_feature_predictive::PredictiveBenefitFeature;
 use crate::engine::policy_feature_sensor_age::SensorAgeFeature;
@@ -70,9 +70,7 @@ impl ShadowEvaluator {
                 ctx.thrashing_score,
                 ctx.p_oom_30s,
             );
-            if let Err(e) = emit(journal_path, &event) {
-                eprintln!("shadow journal emit failed: {}", e);
-            }
+            emit_async(journal_path.to_path_buf(), &event);
         }
     }
 
@@ -100,9 +98,7 @@ impl ShadowEvaluator {
                 ctx.thrashing_score,
                 ctx.p_oom_30s,
             );
-            if let Err(e) = emit(journal_path, &event) {
-                eprintln!("shadow journal emit failed: {}", e);
-            }
+            emit_async(journal_path.to_path_buf(), &event);
         }
     }
 }
@@ -192,6 +188,37 @@ mod tests {
         p
     }
 
+    /// Poll up to 2s for the async writer to flush `expected_lines` to `path`.
+    /// Returns the contents once the expected line count is present, or the last
+    /// observed contents on timeout (tests then assert on the result).
+    fn wait_for_lines(path: &std::path::Path, expected_lines: usize) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                let count = s.lines().filter(|l| !l.is_empty()).count();
+                if count >= expected_lines || std::time::Instant::now() >= deadline {
+                    return s;
+                }
+            } else if std::time::Instant::now() >= deadline {
+                return String::new();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Poll up to 300ms confirming the file remains empty/absent (for
+    /// "scorer agrees, nothing should be written" assertions).
+    fn wait_for_empty(path: &std::path::Path) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        match std::fs::read_to_string(path) {
+            Ok(s) => s.lines().filter(|l| !l.is_empty()).count() == 0,
+            Err(_) => true,
+        }
+    }
+
     fn freeze_action() -> RootAction {
         RootAction::freeze_full(4242, "background-daemon", "shadow-test", 0, 0)
     }
@@ -205,7 +232,6 @@ mod tests {
 
     #[test]
     fn evaluator_emits_disagreement_when_scorer_accepts_blocked_action() {
-        use std::io::Read as _;
         let eval = ShadowEvaluator::default();
         let ctx = make_ctx(); // high pressure + oom + thrashing → scorer accepts
         let path = unique_tmp("disagree");
@@ -213,11 +239,7 @@ mod tests {
 
         eval.evaluate_blocked(&action, &ctx, BlockerKind::UserContextAssertion, &path);
 
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("journal exists after disagreement")
-            .read_to_string(&mut contents)
-            .expect("read");
+        let contents = wait_for_lines(&path, 1);
         let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 1, "expected exactly one disagreement line");
         let ev: BlockedActionEvent =
@@ -251,13 +273,10 @@ mod tests {
 
         eval.evaluate_blocked(&action, &ctx, BlockerKind::HardProtection, &path);
 
-        // File either doesn't exist (no write) or is empty.
-        let empty_or_absent = match std::fs::read_to_string(&path) {
-            Ok(s) => s.lines().filter(|l| !l.is_empty()).count() == 0,
-            Err(_) => true,
-        };
+        // File either doesn't exist (no write) or is empty — poll 300ms to
+        // give the async writer a fair chance to NOT write.
         assert!(
-            empty_or_absent,
+            wait_for_empty(&path),
             "journal should be empty/absent when scorer agrees with block"
         );
         let _ = std::fs::remove_file(&path);
@@ -279,7 +298,6 @@ mod tests {
 
     #[test]
     fn evaluate_accepted_emits_when_scorer_rejects() {
-        use std::io::Read as _;
         let eval = ShadowEvaluator::default();
         let mut ctx = make_ctx();
         // Force scorer to REJECT via hard veto while gate accepts.
@@ -289,11 +307,7 @@ mod tests {
 
         eval.evaluate_accepted(&action, &ctx, &path);
 
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("journal exists after reverse disagreement")
-            .read_to_string(&mut contents)
-            .expect("read");
+        let contents = wait_for_lines(&path, 1);
         let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 1);
         let ev: BlockedActionEvent = serde_json::from_str(lines[0]).unwrap();

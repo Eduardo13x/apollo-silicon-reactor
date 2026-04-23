@@ -19,7 +19,9 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
+use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -88,11 +90,55 @@ impl BlockedActionEvent {
 /// On failure returns io::Error — callers MUST decide whether to swallow (hot path)
 /// or propagate. This is a best-effort observability primitive; a failed write must
 /// never abort the daemon's main loop.
+///
+/// **Synchronous** — do NOT call from the daemon hot path. Use `emit_async` instead.
+/// This function remains for tests and offline tools.
 pub fn emit(path: &Path, event: &BlockedActionEvent) -> io::Result<()> {
     let line = serde_json::to_string(event)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{}", line)
+}
+
+/// Background writer thread — mirrors the `apollo-frozen-writer` pattern
+/// (daemon_helpers.rs:439) to keep filesystem I/O off the daemon hot path.
+///
+/// Per [Nygard 2018 §7] the daemon's 10ms per-cycle budget must not absorb
+/// filesystem tail latency. Shadow events are serialized on the caller thread
+/// (cheap — a few µs) then shipped via unbounded mpsc to a dedicated writer
+/// thread. Send is non-blocking and never fails under normal operation; if the
+/// writer has panicked, the send silently drops (best-effort by design).
+fn writer_tx() -> &'static Sender<(PathBuf, String)> {
+    static TX: OnceLock<Sender<(PathBuf, String)>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<(PathBuf, String)>();
+        std::thread::Builder::new()
+            .name("apollo-shadow-writer".to_string())
+            .spawn(move || {
+                while let Ok((path, line)) = rx.recv() {
+                    // Best-effort: if open or write fails, log once and drop.
+                    // We do NOT block or retry — observability must never stall.
+                    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+                        let _ = writeln!(f, "{}", line);
+                    }
+                }
+            })
+            .expect("failed to spawn apollo-shadow-writer");
+        tx
+    })
+}
+
+/// Async, non-blocking emit for hot-path use. Serializes the event on the
+/// caller thread (~µs) and hands it to a background writer via mpsc. Returns
+/// immediately. Errors during serialization are swallowed — observability must
+/// never abort the daemon.
+pub fn emit_async(path: PathBuf, event: &BlockedActionEvent) {
+    let Ok(line) = serde_json::to_string(event) else {
+        return; // serialization failure is a programmer error; drop silently in prod
+    };
+    // Send is effectively infallible unless the writer thread panicked.
+    // If it did, the send returns Err and we drop — by design.
+    let _ = writer_tx().send((path, line));
 }
 
 #[cfg(test)]
@@ -124,6 +170,65 @@ mod tests {
         let b = BlockerKind::Other("custom-gate".to_string());
         let json = serde_json::to_string(&b).unwrap();
         assert!(json.contains("custom-gate"));
+    }
+
+    #[test]
+    fn emit_async_is_nonblocking_and_writes_eventually() {
+        // Unique path per-test to avoid cross-test pollution.
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "apollo-blocked-journal-emit-async-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = std::fs::remove_file(&p);
+
+        let e = BlockedActionEvent::new(
+            "Freeze",
+            "bg-daemon",
+            Some(9999),
+            BlockerKind::UserContextAssertion,
+            0.70,
+            1.0,
+            9_500.0,
+            Some(0.35),
+        );
+
+        // Non-blocking: this must return in microseconds.
+        let start = std::time::Instant::now();
+        emit_async(p.clone(), &e);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(5),
+            "emit_async blocked hot path for {:?}",
+            elapsed
+        );
+
+        // Poll up to 2s for the async writer to flush.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut contents = String::new();
+        loop {
+            if let Ok(s) = std::fs::read_to_string(&p) {
+                if !s.trim().is_empty() {
+                    contents = s;
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "async writer should have flushed exactly one line");
+        let back: BlockedActionEvent =
+            serde_json::from_str(lines[0]).expect("parses as BlockedActionEvent");
+        assert_eq!(back.target_pid, Some(9999));
+
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
