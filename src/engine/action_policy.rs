@@ -118,6 +118,28 @@ pub struct PolicyScore {
 }
 
 /// Composable decision surface. Construct via [`PolicyScorer::builder`].
+///
+/// # Uncertainty composition — Root-Sum-Square (RSS) with saturation
+///
+/// Per-feature uncertainties are aggregated via RSS (`sqrt(Σ uᵢ²)`), bounded
+/// at [`PolicyScorer::uncertainty_saturation`] (default 1.5). Linear sum
+/// would assume each feature reports *independent additive* information
+/// loss — that is wrong for overlapping feature scopes (e.g. cold-start
+/// F5+F6+F7 all reporting `uncertainty=1.0` over the same missing-data
+/// event would yield 3.0 and overwhelm any benefit, locking the scorer in
+/// permanent OBSERVE). RSS treats contributions as independent
+/// Gaussian-like variance sources, so growth is sublinear and the natural
+/// ceiling (after saturation) lets high-benefit decisions still clear the
+/// threshold.
+///
+/// Theory:
+/// - [Shafer 1976] A Mathematical Theory of Evidence — belief-function
+///   composition rules for multi-source evidence.
+/// - [Gelman et al. 2013] Bayesian Data Analysis §3 — variance of a sum
+///   vs. sum of variances for independent sources.
+/// - [Lakshminarayanan 2017] Simple and Scalable Predictive Uncertainty
+///   Estimation using Deep Ensembles — RSS aggregation of ensemble
+///   uncertainty.
 pub struct PolicyScorer {
     features: Vec<Box<dyn PolicyFeature>>,
     /// Accept threshold: accept iff
@@ -125,6 +147,8 @@ pub struct PolicyScorer {
     threshold: f64,
     lambda_cost: f64,
     lambda_unc: f64,
+    /// Ceiling for aggregated uncertainty (post-RSS). Default 1.5.
+    uncertainty_saturation: f64,
 }
 
 impl PolicyScorer {
@@ -139,19 +163,25 @@ impl PolicyScorer {
             Vec::with_capacity(self.features.len());
         let mut total_benefit = 0.0f64;
         let mut total_cost = 0.0f64;
-        let mut total_uncertainty = 0.0f64;
+        // Accumulate sum of squares; compose via RSS after the loop so N
+        // features with uncertainty≈1.0 each can't linearly stack into a
+        // compositional bomb. See [Shafer 1976], [Gelman 2013 BDA §3].
+        let mut unc_ss = 0.0f64;
         let mut vetoed_by: Option<String> = None;
 
         for f in &self.features {
             let c = f.contribute(action, ctx);
             total_benefit += c.benefit.max(0.0);
             total_cost += c.cost.max(0.0);
-            total_uncertainty += c.uncertainty.max(0.0);
+            let u = c.uncertainty.max(0.0);
+            unc_ss += u * u;
             if c.hard_veto && vetoed_by.is_none() {
                 vetoed_by = Some(f.name().to_string());
             }
             per_feature.push((f.name(), c));
         }
+
+        let total_uncertainty = unc_ss.sqrt().min(self.uncertainty_saturation);
 
         let net =
             total_benefit - self.lambda_cost * total_cost - self.lambda_unc * total_uncertainty;
@@ -189,6 +219,7 @@ pub struct PolicyScorerBuilder {
     threshold: Option<f64>,
     lambda_cost: Option<f64>,
     lambda_unc: Option<f64>,
+    uncertainty_saturation: Option<f64>,
 }
 
 impl PolicyScorerBuilder {
@@ -213,12 +244,23 @@ impl PolicyScorerBuilder {
         self
     }
 
+    /// Ceiling for aggregated (post-RSS) uncertainty. Default 1.5.
+    ///
+    /// Even with many features each reporting `uncertainty=1.0`, the
+    /// aggregate cannot exceed this cap — keeping the epistemic penalty
+    /// bounded so high-benefit decisions can still clear the threshold.
+    pub fn uncertainty_saturation(mut self, f: f64) -> Self {
+        self.uncertainty_saturation = Some(f);
+        self
+    }
+
     pub fn build(self) -> PolicyScorer {
         PolicyScorer {
             features: self.features,
             threshold: self.threshold.unwrap_or(0.0),
             lambda_cost: self.lambda_cost.unwrap_or(1.0),
             lambda_unc: self.lambda_unc.unwrap_or(0.5),
+            uncertainty_saturation: self.uncertainty_saturation.unwrap_or(1.5),
         }
     }
 }
@@ -665,14 +707,158 @@ mod tests {
         let s = scorer.score(&throttle(7), &ctx);
         let sum_b: f64 = s.per_feature.iter().map(|(_, c)| c.benefit.max(0.0)).sum();
         let sum_c: f64 = s.per_feature.iter().map(|(_, c)| c.cost.max(0.0)).sum();
-        let sum_u: f64 = s
+        // RSS (Step 1): total_uncertainty = sqrt(Σ uᵢ²), not Σ uᵢ.
+        let rss_u: f64 = s
             .per_feature
             .iter()
-            .map(|(_, c)| c.uncertainty.max(0.0))
-            .sum();
+            .map(|(_, c)| {
+                let u = c.uncertainty.max(0.0);
+                u * u
+            })
+            .sum::<f64>()
+            .sqrt()
+            .min(1.5);
         assert!((sum_b - s.total_benefit).abs() < 1e-9);
         assert!((sum_c - s.total_cost).abs() < 1e-9);
-        assert!((sum_u - s.total_uncertainty).abs() < 1e-9);
+        assert!((rss_u - s.total_uncertainty).abs() < 1e-9);
+    }
+
+    // -------------------------------------------------------------------------
+    // RSS uncertainty composition (Step 1) — tests
+    // -------------------------------------------------------------------------
+
+    /// Test-only feature emitting a fixed uncertainty contribution.
+    struct FixedUncertaintyFeature {
+        name: &'static str,
+        uncertainty: f64,
+    }
+
+    impl PolicyFeature for FixedUncertaintyFeature {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn contribute(&self, _action: &RootAction, _ctx: &ActionContext) -> Contribution {
+            Contribution {
+                benefit: 0.0,
+                cost: 0.0,
+                uncertainty: self.uncertainty,
+                hard_veto: false,
+            }
+        }
+    }
+
+    #[test]
+    fn rss_caps_aggregate_uncertainty_below_saturation() {
+        // Three features each at uncertainty=1.0 → sqrt(3) ≈ 1.732, capped at 1.5.
+        let scorer = PolicyScorer::builder()
+            .feature(FixedUncertaintyFeature {
+                name: "f1",
+                uncertainty: 1.0,
+            })
+            .feature(FixedUncertaintyFeature {
+                name: "f2",
+                uncertainty: 1.0,
+            })
+            .feature(FixedUncertaintyFeature {
+                name: "f3",
+                uncertainty: 1.0,
+            })
+            .build();
+        let s = scorer.score(&freeze(1), &base_ctx());
+        let expected = 3.0f64.sqrt().min(1.5);
+        assert!((s.total_uncertainty - expected).abs() < 1e-9);
+        assert!((s.total_uncertainty - 1.5).abs() < 1e-9, "expected saturated");
+    }
+
+    #[test]
+    fn rss_single_feature_preserves_input() {
+        let scorer = PolicyScorer::builder()
+            .feature(FixedUncertaintyFeature {
+                name: "f1",
+                uncertainty: 0.5,
+            })
+            .build();
+        let s = scorer.score(&freeze(1), &base_ctx());
+        assert!((s.total_uncertainty - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rss_below_saturation_matches_sqrt_ss() {
+        // Two features at 0.6 each → sqrt(0.72) ≈ 0.8485, NOT 1.2 (linear).
+        let scorer = PolicyScorer::builder()
+            .feature(FixedUncertaintyFeature {
+                name: "f1",
+                uncertainty: 0.6,
+            })
+            .feature(FixedUncertaintyFeature {
+                name: "f2",
+                uncertainty: 0.6,
+            })
+            .build();
+        let s = scorer.score(&freeze(1), &base_ctx());
+        let expected = (0.6f64 * 0.6 + 0.6 * 0.6).sqrt();
+        assert!(
+            (s.total_uncertainty - expected).abs() < 1e-9,
+            "got {}, expected {}",
+            s.total_uncertainty,
+            expected
+        );
+        // Guard-rail: ensure we did NOT revert to linear sum.
+        assert!(
+            (s.total_uncertainty - 1.2).abs() > 1e-3,
+            "linear-sum regression detected"
+        );
+    }
+
+    #[test]
+    fn saturation_configurable_via_builder() {
+        // Two features at 1.0 each → sqrt(2) ≈ 1.414, but custom cap = 0.5.
+        let scorer = PolicyScorer::builder()
+            .feature(FixedUncertaintyFeature {
+                name: "f1",
+                uncertainty: 1.0,
+            })
+            .feature(FixedUncertaintyFeature {
+                name: "f2",
+                uncertainty: 1.0,
+            })
+            .uncertainty_saturation(0.5)
+            .build();
+        let s = scorer.score(&freeze(1), &base_ctx());
+        assert!((s.total_uncertainty - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn default_saturation_is_1_5() {
+        let built = PolicyScorer::builder().build();
+        assert!((built.uncertainty_saturation - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn zero_features_zero_uncertainty_regardless_of_saturation() {
+        for &sat in &[0.0_f64, 0.5, 1.5, 99.0] {
+            let scorer = PolicyScorer::builder().uncertainty_saturation(sat).build();
+            let s = scorer.score(&freeze(1), &base_ctx());
+            assert_eq!(s.total_uncertainty, 0.0, "sat={}", sat);
+        }
+    }
+
+    #[test]
+    fn rss_preserves_existing_score_test() {
+        // Re-run a scenario that asserts total_uncertainty via a single source
+        // (idle_secs<5 in UserDisruptionCostFeature → 0.3). RSS of a single
+        // 0.3 source is still 0.3 — so existing behaviour is preserved.
+        let scorer = PolicyScorer::builder()
+            .feature(UserDisruptionCostFeature)
+            .build();
+        let mut ctx = base_ctx();
+        ctx.idle_secs = 2.0;
+        let s = scorer.score(&freeze(1), &ctx);
+        assert!(
+            (s.total_uncertainty - 0.3).abs() < 1e-9,
+            "RSS composition (Step 1): single 0.3 source → 0.3, got {}",
+            s.total_uncertainty
+        );
     }
 
     #[test]
