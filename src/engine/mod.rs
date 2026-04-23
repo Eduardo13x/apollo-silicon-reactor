@@ -4,6 +4,7 @@ pub mod adaptive_governor;
 pub mod adversarial_probe;
 pub mod analytics;
 pub mod background_collectors;
+pub mod blocked_action_journal;
 pub mod build_tracker;
 pub mod cache_warmer;
 pub mod capabilities;
