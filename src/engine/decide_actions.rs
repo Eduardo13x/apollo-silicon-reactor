@@ -949,8 +949,8 @@ pub fn decide_actions(
     // holding PreventUserIdleSleep blocks every freeze even when swap is climbing.
     let freeze_skip_by_user = user_ctx.freeze_protected(
         snapshot.pressure.memory_pressure,
-        snapshot.pressure.swap_used_bytes,
         snapshot.pressure.thrashing_score,
+        crate::engine::shadow_signals::get_p_oom_30s().unwrap_or(0.0),
     );
     let gate_offset = user_ctx.pressure_gate_offset();
 

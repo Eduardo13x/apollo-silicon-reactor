@@ -18,13 +18,10 @@ use apollo_optimizer::engine::safety::ProtectionLevel;
 use apollo_optimizer::engine::types::RootAction;
 use apollo_optimizer::engine::user_context::UserContext;
 
-/// 1.1 GB expressed as u64 bytes — matches the prod scenario (well below old
-/// 4 GB swap bypass).
-const SWAP_1_1_GB: u64 = ((1.1_f64) * 1024.0 * 1024.0 * 1024.0) as u64;
-
-/// Construct the adversarial context: high-but-sub-bypass reactive signals
-/// (pressure 0.66 < 0.70, swap 1.1 GB < 4 GB, thrashing 9000 < 10 000) +
-/// active sleep assertion + strong predictive OOM signal (p_oom_30s=0.35).
+/// Construct the adversarial context: reactive signals all below bypass
+/// (pressure 0.66 < 0.70, thrashing 9000 < 10 000) + active sleep assertion +
+/// strong predictive OOM signal (p_oom_30s=0.35 < 0.40). Old gate with
+/// p_oom=0.0 blocks; scorer with predictive feature accepts.
 fn adversarial_ctx() -> ActionContext {
     ActionContext {
         pressure: 0.66,
@@ -79,12 +76,18 @@ fn scorer_diverges_from_old_gate_on_high_p_oom_with_sleep_assertion() {
     // 3. Assert old gate BLOCKS: no reactive-crisis bypass fires, sleep
     //    assertion dominates → returns true ("protected, don't freeze").
     //    This is the reactive blindness we're about to expose.
-    let old_blocks = user_ctx.freeze_protected(ctx.pressure, SWAP_1_1_GB, ctx.thrashing_score);
+    // Old gate signature change: swap_used_bytes dropped (broken on macOS
+    // dynamic swap), p_oom_30s added as predictive bypass. For the
+    // disobedience test we pass LOW p_oom so the reactive path is what's
+    // being tested — in prod ActionContext.p_oom_30s=0.35 would flow through
+    // shadow_signals and trigger the bypass, which is the desired behavior.
+    let old_blocks = user_ctx.freeze_protected(ctx.pressure, ctx.thrashing_score, 0.0);
     assert!(
         old_blocks,
-        "precondition: old gate must BLOCK in this scenario (reactive-blind to p_oom). \
-         freeze_protected(pressure=0.66, swap=1.1GB, thrashing=9000) returned false — \
-         one of the bypass thresholds may have shifted."
+        "precondition: old gate must BLOCK in this scenario when p_oom is zeroed \
+         (reactive-blind to predictive signal). freeze_protected(pressure=0.66, \
+         thrashing=9000, p_oom=0.0) returned false — one of the bypass thresholds \
+         may have shifted."
     );
 
     // 4. Build the full scorer with F6 Predictive wired in.
@@ -149,7 +152,7 @@ fn scorer_still_agrees_with_old_gate_when_protected_process() {
     };
 
     assert!(
-        user_ctx.freeze_protected(ctx.pressure, SWAP_1_1_GB, ctx.thrashing_score),
+        user_ctx.freeze_protected(ctx.pressure, ctx.thrashing_score, 0.0),
         "precondition: old gate still blocks on sleep assertion"
     );
 
@@ -204,10 +207,8 @@ fn scorer_agrees_with_old_gate_on_pure_reactive_crisis() {
         call_in_progress: ctx.call_in_progress,
         audio_active: false,
     };
-    let swap_bytes = (ctx.swap_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-
     assert!(
-        !user_ctx.freeze_protected(ctx.pressure, swap_bytes, ctx.thrashing_score),
+        !user_ctx.freeze_protected(ctx.pressure, ctx.thrashing_score, 0.0),
         "precondition: old gate permits freeze in reactive crisis with no sleep assertion"
     );
 

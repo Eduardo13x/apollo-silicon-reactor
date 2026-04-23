@@ -572,9 +572,15 @@ pub fn execute_actions(
                     //   pressure ≥ 0.70 — RAM level critical
                     //   thrashing ≥ 10k — flow crisis (Gate C); compressor churning,
                     //                     OOM imminent regardless of assertion intent.
+                    //   p_oom_30s ≥ 0.40 — hazard model predicts OOM within 30s.
                     // Mirror of UserContext::freeze_protected bypass conditions.
-                    // [Nygard 2018] load shedding overrides politeness under overload.
-                    if memory_pressure < 0.70 && thrashing_score < 10_000.0 {
+                    // [Nygard 2018] load shedding overrides politeness under overload;
+                    // [Camacho 2007] predictive bypass catches crises before thrashing.
+                    let p_oom_30s = crate::engine::shadow_signals::get_p_oom_30s().unwrap_or(0.0);
+                    if memory_pressure < 0.70
+                        && thrashing_score < 10_000.0
+                        && p_oom_30s < 0.40
+                    {
                         let busy = assertion_pids.get_or_insert_with(pids_with_assertions);
                         if busy.contains(pid) {
                             out.push_skip(format!("assertion-active:{}", name));
