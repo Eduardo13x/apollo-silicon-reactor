@@ -1,3 +1,0 @@
-iteration	commit	metric	delta	status	paper	opens	closes	note
-1	c650356	tests=1697	+9	KEEP	Denning1968|Zhao2009|AhoUllman1972	1	0	new module swap_reclaim: ODE dS/dt=dirty-reclaim, EMA smoothed, 9 tests
-2+3	8cb9b0a	tests=1697	0	KEEP	Denning1968|Zhao2009	0	1	wire per-cycle update + reactor_weight gate (Building+0.05, Critical+0.25, Overflow=1.0)

@@ -1,5 +1,0 @@
-iter	score	delta	decision	notes
-0	98.9	0.0	baseline	D=100% S=99% L=99% R=95% Sf=100% A=100%
-1	99.0	+0.1	keep	traj write 10→100; R 95→96; eliminate 9 file I/O per benchmark
-2	99.1	+0.1	keep	causal_graph: eliminate Vec alloc + 1 String clone in evaluate()
-3	99.1	+0.0	keep	kalman p11=q: RMSE 0.0054→0.00537; 4/5 runs show 99.1 vs 1/4 before

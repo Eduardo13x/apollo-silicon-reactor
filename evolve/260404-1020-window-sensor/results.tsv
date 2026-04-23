@@ -1,5 +1,0 @@
-iteration	commit	metric	delta	guard	status	paper_cited	description
-1	e9a22f4	22 tests	+11	0 errors	KEPT	GoF Observer + Mogul USENIX 1997	window_sensor.rs module — diff-based lifecycle detector
-2	738df7c	22 tests	0	0 errors	KEPT	—	Wire sensor into daemon loop + 3 RuntimeMetrics fields
-3	95b1aff	22 tests	0	0 errors	KEPT	Hellerstein 2004 Ch.4 Feed-Forward	Pressure relief on tab/app close: reactor_weight -= 0.25 for N cycles
-4	—	2301 tests	+38	0 errors	KEPT	—	Full test suite: all pass, deploy to production

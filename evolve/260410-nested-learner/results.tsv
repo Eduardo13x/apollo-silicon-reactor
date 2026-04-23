@@ -1,9 +1,0 @@
-iteration	commit	scenarios	delta_scenarios	lib_tests	guard	status	paper_cited	description
-0	e23d464	165	—	1593	pass	baseline	—	Baseline: 165 scenarios, 1593 lib tests
-1	00c5af4	165	+0	+7	pass	KEEP	[Google NL 2025]+[LSTM 1997]	New nested_learner.rs module: L0/L1/L2 hierarchy with context flow (OPENS:1)
-2	a1aa6bf	165	+0	0	pass	KEEP	[Google NL 2025]	Wire L0+L1 ticks in learning_tick.rs — signal_quality gates outcomes (OPENS:1 CLOSES:1)
-3	fd906ab	165	+0	0	pass	KEEP	[Google NL 2025]+[LSTM 1997]	L2 context → meta_learn (0.70×raw + 0.30×l2_ctx) — downward flow complete (OPENS:0 CLOSES:1)
-4	91351ec	165	+0	0	pass	KEEP	[GoF Strategy]+[Gray&Reuter 1992]	Persist NestedLearner in LearnedState — EMAs survive daemon restarts (OPENS:0 CLOSES:0)
-5	1dbbcdc	165	+0	0	pass	KEEP	[Kleppmann 2017 DDIA]	Add L0/L1/L2 observability log every 100 cycles for prod validation (OPENS:0 CLOSES:0)
-6	8383eda	165	+0	0	pass	KEEP	[Apollo prod baseline 2026-04-10]	Recalibrate L1 normalization /0.30→/0.05 from prod data l1_agg=0.026 (OPENS:0 CLOSES:0)
-7	6de1721	165	+0	+2	pass	KEEP	[GoF Observer]+[Apollo prod data]	Add 2 calibration tests (macOS drops + idle convergence) — 9 total nested_learner tests (OPENS:0 CLOSES:0)

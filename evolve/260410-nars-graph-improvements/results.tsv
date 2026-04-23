@@ -1,4 +1,0 @@
-iteration	commit	tests	delta_tests	clippy	status	paper_cited	description
-1	896d3be	1593	+2	0	KEEP	Lampson1974+Nygard2018	Remove dead process_refresh_hung field + cross-module protection invariants (B006)
-2	c0b8a9d	1593	0	0	KEEP	McIlroy1969	Consolidate 4 duplicate ema_f32/ema_f64 helpers into neon_ema (B007)
-3	e23d464	1593	0	0	KEEP	Lampson1974	Use HardPath::verify_no_symlink in journal instead of inline check (graph surprise B from append_journal↔HardPath)

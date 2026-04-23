@@ -1,5 +1,0 @@
-iter	hypothesis	mutation	result	delta	commit	paper
-1	prefer_qos_over_sigstop() never called from execution path	Add qos_preferred_names() + FreezeProcess→ThrottleProcess transform in main.rs exec pipeline	KEEP	CPU-dominant processes now get QoS Background instead of SIGSTOP	94f9fd4	Pearl 2009 §3 mediation; Nygard 2018 bulkhead
-2	speculative_count excluded from pressure relief formula	soft_available += speculative_count in collector.rs	KEEP	~3-8% more pages counted as soft-available → lower effective pressure in quiet system	94f9fd4	XNU vm_statistics64 docs
-3	_pressure_components discarded every cycle	Rename to pressure_components + expose total_boost + dominant_factor in RuntimeMetrics	KEEP	pressure_total_boost + pressure_dominant_factor now visible in runtime_metrics.json	94f9fd4	—
-4	thermal_mgr.update() return discarded (_thermal_state)	Capture thermal_state, expose predicted_throttle + seconds_to_throttle + thermal_trend in metrics	KEEP	thermal_trend_predicted=Stable confirmed live in daemon	6ed2ace	—

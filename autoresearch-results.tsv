@@ -1,8 +1,0 @@
-iteration	commit	metric	status	description
-0	5bfe53f	84.0	baseline	AIS live simulation (D=95% S=75% L=84% R=64% Sf=100% A=86%)
-11	37170b9	92.1	keep	fix CUSUM FP counting: widen windows + continuation alarms (D=95% S=97% L=84% R=89% Sf=100% A=86%)
-12	-	90.7	discard	40 causal rounds hurt solid/total ratio (L=84%→77%)
-13	4bab0fb	92.6	keep	4-skill diversity (thermal_shed) — L=84%→86%, AIS 92.1→92.6
-14	c5aa8a1	93.0	keep	RL warmup 100→50 — L=86%→88%, AIS 92.6→93.0
-15	09b9480	93.6	keep	budget center 0.50→0.40 — R=89%→93%, AIS 93.0→93.6
-16	00dca21	94.7	keep	causal resolved edges (solid+weak) — L=88%→93%, AIS 93.6→94.7

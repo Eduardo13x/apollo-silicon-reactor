@@ -1,5 +1,0 @@
-iteration	commit	metric	delta	status	paper	opens	closes	note
-1	0620151	tests=1688	+9	KEEP	Strogatz2015|Denning1968|Bansal2004	1	0	new module unfreeze_decay: 2-sample ratio fit + bisection, risk mitigations baked in
-2	9c61626	tests=1688	0	KEEP	Strogatz2015|Denning1968	1	1	wire record_thaw+observe+gc in daemon cycle; closes iter1 wire-point
-3	b5a63c0	tests=1688	0	KEEP	Strogatz2015|Nygard2018	0	1	predictive thaw gate at pressure>0.80, drops thaws whose 5s growth>200MB
-4	b08f941	tests=1688	0	KEEP	GrayReuter1992	1	1	persist unfreeze_decay_tau in LearnedState, restore on startup, patch at shutdown

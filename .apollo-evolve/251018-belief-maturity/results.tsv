@@ -1,3 +1,0 @@
-iteration	commit	metric	delta	guard	status	paper	description
-1	291960b	1679	+3	clippy=277 (=)	KEEP	Pei Wang 2013 §3.3.1 + Gray & Reuter 1992 §11	monopoly specialist confidence gated by NARS belief maturity
-2	c8521e5	1679	0	clippy=277 (=)	KEEP	Pei Wang 2013 §3.3.1	fix belief key — gate was collapsed to floor
