@@ -2538,6 +2538,15 @@ fn main() -> anyhow::Result<()> {
                 let mut signal_digest = signal_digest;
                 signal_digest.swap_net_rate_volatility = reclaim_forecast.net_rate_volatility;
 
+                // Publish shadow signals for decide_actions' shadow-mode ActionContext.
+                // Consumed by ShadowEvaluator via shadow_signals::get_* — keeps
+                // decide_actions' signature stable while wiring F6 + thermal + interrupt.
+                apollo_optimizer::engine::shadow_signals::set_p_oom_30s(signal_digest.p_oom_30s);
+                apollo_optimizer::engine::shadow_signals::set_thermal_emergency(thermal_emergency);
+                apollo_optimizer::engine::shadow_signals::set_interrupt_phase(
+                    state.resource_interrupt.phase.load(std::sync::atomic::Ordering::Relaxed),
+                );
+
                 // ODE swap urgency — hoisted for use in Neuromodulator AND LinUCB.
                 // Normalization owned by TsatUrgency [CyberPhysicalSignal trait].
                 let ode_t_sat_urgency = {

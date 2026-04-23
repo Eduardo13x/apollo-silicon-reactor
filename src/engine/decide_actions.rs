@@ -1013,11 +1013,11 @@ pub fn decide_actions(
                     pressure: snapshot.pressure.memory_pressure,
                     swap_gb: snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                     thrashing_score: snapshot.pressure.thrashing_score,
-                    // p_oom_30s lives on RuntimeMetrics, not the raw snapshot;
-                    // F6 data pipeline wiring into decide_actions is pending.
-                    p_oom_30s: None,
-                    // F6 jank predictor data pipeline pending.
-                    p_jank_60s: None,
+                    // F6 predictive signals — populated by main loop via
+                    // shadow_signals::set_p_oom_30s after signal_intel.tick().
+                    // None until first tick (cold start) or producer absent (tests).
+                    p_oom_30s: crate::engine::shadow_signals::get_p_oom_30s(),
+                    p_jank_60s: crate::engine::shadow_signals::get_p_jank_60s(),
                     has_sleep_assertion: user_ctx.has_sleep_assertion,
                     call_in_progress: user_ctx.call_in_progress,
                     idle_secs: user_ctx.idle_secs,
@@ -1025,9 +1025,10 @@ pub fn decide_actions(
                     foreground_pid: None,
                     is_foreground_family: false,
                     is_recently_active: user_ctx.is_recently_active(),
-                    // Thermal / interrupt phase not threaded to this call site yet.
-                    thermal_emergency: false,
-                    interrupt_phase: 0,
+                    // Thermal / interrupt state — main loop publishes via
+                    // shadow_signals before decide_actions is called.
+                    thermal_emergency: crate::engine::shadow_signals::get_thermal_emergency(),
+                    interrupt_phase: crate::engine::shadow_signals::get_interrupt_phase(),
                     // Conservative default — gate-tower handles per-name protection
                     // downstream; the synthetic probe has no name to classify.
                     protection_level: ProtectionLevel::Unprotected,
