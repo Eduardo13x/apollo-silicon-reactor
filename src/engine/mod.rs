@@ -75,6 +75,7 @@ pub mod outcome_tracker;
 pub mod overflow_guard;
 pub mod page_reclaim;
 pub mod planner;
+pub mod policy_feature_sensor_age;
 pub mod power_management;
 pub mod predictive_agent;
 pub mod process_baseline;
