@@ -2546,10 +2546,22 @@ fn main() -> anyhow::Result<()> {
                 apollo_optimizer::engine::shadow_signals::set_interrupt_phase(
                     state.resource_interrupt.phase.load(std::sync::atomic::Ordering::Relaxed),
                 );
-                // Foreground PID + epistemic proxy (urgency composite).
                 apollo_optimizer::engine::shadow_signals::set_foreground_pid(foreground_pid);
+                // Epistemic proxy — urgency is "need to act", not "how uncertain".
+                // Better signal: entropy_anomaly (distribution shift) + transformer_anomaly
+                // (learned-deviation from Hopfield memory). Both measure IGNORANCE of
+                // current state, not urgency. [Lakshminarayanan 2017] epistemic from
+                // distribution shift. NotebookLM audit 2026-04-22 flagged the urgency
+                // mis-wire; this is the corrected proxy until full EpistemicState is
+                // instantiated in the daemon (separate effort).
+                let epistemic_proxy = {
+                    let entropy_term = (signal_digest.entropy_anomaly.abs() / 3.0).clamp(0.0, 1.0);
+                    let anomaly_term = signal_digest.transformer_anomaly.clamp(0.0, 1.0);
+                    // Max — either source indicates ignorance on its own.
+                    entropy_term.max(anomaly_term)
+                };
                 apollo_optimizer::engine::shadow_signals::set_epistemic_uncertainty(
-                    signal_digest.urgency,
+                    epistemic_proxy,
                 );
 
                 // ODE swap urgency — hoisted for use in Neuromodulator AND LinUCB.

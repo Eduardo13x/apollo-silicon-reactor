@@ -20,8 +20,23 @@
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
+
+/// Liveness counters for the shadow writer thread. If `writes_failed` grows
+/// without `writes_succeeded` growing, the writer is dead or the disk is full
+/// — caller can alert via RuntimeMetrics. [Nygard 2018 §9] observability must
+/// observe itself.
+static SHADOW_WRITES_OK: AtomicU64 = AtomicU64::new(0);
+static SHADOW_WRITES_FAILED: AtomicU64 = AtomicU64::new(0);
+
+pub fn shadow_writes_succeeded() -> u64 {
+    SHADOW_WRITES_OK.load(Ordering::Relaxed)
+}
+pub fn shadow_writes_failed() -> u64 {
+    SHADOW_WRITES_FAILED.load(Ordering::Relaxed)
+}
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -116,10 +131,16 @@ fn writer_tx() -> &'static Sender<(PathBuf, String)> {
             .name("apollo-shadow-writer".to_string())
             .spawn(move || {
                 while let Ok((path, line)) = rx.recv() {
-                    // Best-effort: if open or write fails, log once and drop.
-                    // We do NOT block or retry — observability must never stall.
-                    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-                        let _ = writeln!(f, "{}", line);
+                    // Best-effort: if open or write fails, bump fail counter
+                    // and drop. We do NOT block or retry — observability must
+                    // never stall. Callers monitor liveness via the exposed
+                    // succeeded/failed counters.
+                    match OpenOptions::new().create(true).append(true).open(&path) {
+                        Ok(mut f) => match writeln!(f, "{}", line) {
+                            Ok(()) => { SHADOW_WRITES_OK.fetch_add(1, Ordering::Relaxed); }
+                            Err(_) => { SHADOW_WRITES_FAILED.fetch_add(1, Ordering::Relaxed); }
+                        },
+                        Err(_) => { SHADOW_WRITES_FAILED.fetch_add(1, Ordering::Relaxed); }
                     }
                 }
             })
@@ -134,11 +155,14 @@ fn writer_tx() -> &'static Sender<(PathBuf, String)> {
 /// never abort the daemon.
 pub fn emit_async(path: PathBuf, event: &BlockedActionEvent) {
     let Ok(line) = serde_json::to_string(event) else {
-        return; // serialization failure is a programmer error; drop silently in prod
+        SHADOW_WRITES_FAILED.fetch_add(1, Ordering::Relaxed);
+        return;
     };
-    // Send is effectively infallible unless the writer thread panicked.
-    // If it did, the send returns Err and we drop — by design.
-    let _ = writer_tx().send((path, line));
+    // Send fails iff writer thread panicked. Bump fail counter — callers
+    // detect dead writer via SHADOW_WRITES_FAILED climbing without _OK.
+    if writer_tx().send((path, line)).is_err() {
+        SHADOW_WRITES_FAILED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

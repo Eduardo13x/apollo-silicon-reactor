@@ -113,9 +113,11 @@ pub fn get_foreground_pid() -> Option<u32> {
     if v < 0 { None } else { Some(v as u32) }
 }
 
-/// Published by main.rs after each cycle's deep scan aggregation: the MAX
-/// hot-page fraction observed across top freeze candidates. Shadow uses this
-/// as the worst-case cost proxy at class-level (no per-PID in scope there).
+/// Published by main.rs AFTER each cycle's deep scan loop completes. Readers
+/// in the SAME cycle see `None` on the first cycle and previous-cycle's value
+/// thereafter. This is a known 1-cycle lag — acceptable for class-level cost
+/// estimation (hot pages shift slowly), unacceptable for per-PID gating.
+/// [NotebookLM audit 2026-04-22: aliasing temporal, documentado no oculto.]
 pub fn set_max_hot_page_fraction(f: f64) {
     MAX_HOT_PAGE_FRACTION_BITS.store(f.to_bits(), Ordering::Relaxed);
     MAX_HOT_PAGE_WRITTEN.store(true, Ordering::Relaxed);
