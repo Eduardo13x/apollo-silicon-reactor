@@ -726,6 +726,35 @@ mod tests {
         assert!(!should_rotate_oldest(59, 2));
     }
 
+    /// F3 — ABA race defense: unfreeze_pids_verified must return 0 (no SIGCONT
+    /// issued) for a PID that is either dead or whose kernel start_sec does
+    /// not match the stored FrozenEntry. Uses a very high PID unlikely to be
+    /// live + a bogus start_sec so identity check always fails.
+    /// [Gray & Reuter 1992 §11] crash recovery identity invariants.
+    #[test]
+    fn unfreeze_pids_verified_skips_dead_or_recycled_pid() {
+        use crate::engine::types::{FreezeSource, FrozenEntry};
+        let mut entries = HashMap::new();
+        // PID 999_999 is virtually guaranteed not to exist; start_sec is a
+        // bogus sentinel that won't match any live process's pbi_start_tvsec.
+        entries.insert(
+            999_999_u32,
+            FrozenEntry {
+                frozen_at: chrono::Utc::now(),
+                source: FreezeSource::MainLoop,
+                pressure_at_freeze: 0.8,
+                process_name: Some("ghost-process".to_string()),
+                start_sec: 1_u64,
+                original_jetsam_priority: None,
+            },
+        );
+        let count = unfreeze_pids_verified(&entries);
+        assert_eq!(
+            count, 0,
+            "unfreeze_pids_verified must skip dead/recycled PIDs (no SIGCONT sent)"
+        );
+    }
+
     /// Serialize sentinel tests — they share a global file path.
     fn sentinel_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();

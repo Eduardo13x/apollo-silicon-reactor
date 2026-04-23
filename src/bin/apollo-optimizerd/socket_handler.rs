@@ -26,7 +26,7 @@ use chrono::{Duration as ChronoDuration, Local, Utc};
 use apollo_optimizer::collector::SystemCollector;
 use apollo_optimizer::engine::capabilities::detect_capabilities;
 use apollo_optimizer::engine::daemon_helpers::{
-    kill_switch_path, merge_seed_into, metrics_path, socket_path,
+    kill_switch_path, merge_seed_into, metrics_path, socket_path, unfreeze_pids_verified,
 };
 use apollo_optimizer::engine::llm::{
     append_jsonl, delete_file_best_effort, load_repo_config, write_json, write_secret,
@@ -297,12 +297,14 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             DaemonResponse::Ok
         }
         DaemonRequest::Restore => {
+            // F3 — A-B-A defense: verify PID identity (name + start_sec) before
+            // SIGCONT. If a frozen PID died and was recycled before this CLI-
+            // triggered restore arrived, the new occupant must NOT receive our
+            // SIGCONT. `unfreeze_pids_verified` re-reads each current PID's
+            // kernel start-time and skips mismatches (or gone PIDs) silently.
+            // [Gray & Reuter 1992 §11] crash recovery identity invariants.
             let mut frozen_state = state.frozen_state.lock_recover();
-            for pid in frozen_state.keys() {
-                unsafe {
-                    libc::kill(*pid as i32, libc::SIGCONT);
-                }
-            }
+            unfreeze_pids_verified(&frozen_state);
             frozen_state.clear();
             // NOTE: kill switch (/var/run/apollo.disable) is intentionally NOT
             // cleared here. Restore reverts Apollo's mutations (frozen PIDs,
@@ -326,12 +328,14 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 };
             }
             state.policy.lock_recover().governor.set_auto_profile(false);
+            // F3 — A-B-A defense (PanicRestore path): same identity check as
+            // Restore. PanicRestore is usually invoked during emergencies where
+            // the system may have been under severe pressure — higher odds of
+            // frozen PIDs having died + been recycled. `unfreeze_pids_verified`
+            // skips any PID whose (name, start_sec) no longer matches.
+            // [Gray & Reuter 1992 §11] crash recovery identity invariants.
             let mut frozen_state = state.frozen_state.lock_recover();
-            for pid in frozen_state.keys() {
-                unsafe {
-                    libc::kill(*pid as i32, libc::SIGCONT);
-                }
-            }
+            unfreeze_pids_verified(&frozen_state);
             frozen_state.clear();
             DaemonResponse::Ok
         }
