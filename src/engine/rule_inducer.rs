@@ -33,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::engine::optimization_skills::OptimizationSkill;
 use crate::engine::outcome_tracker::ExperienceMemory;
+use crate::engine::safety::is_protected_name;
 
 /// Only use experience records above this pressure threshold.
 /// Low-pressure throttles add noise: background daemons often show negative
@@ -255,6 +256,12 @@ struct ProcessStats {
 }
 
 fn is_protected(name: &str, protected: &[&str]) -> bool {
+    // Hard protection from the unified oracle wins unconditionally
+    // [Saltzer & Kaashoek 2009] Complete Mediation — single choke-point.
+    if is_protected_name(name) {
+        return true;
+    }
+    // Then the caller-provided policy/override list (substring, case-insensitive).
     let nl = name.to_ascii_lowercase();
     protected
         .iter()
@@ -294,8 +301,10 @@ mod tests {
     #[test]
     fn group_skill_from_high_cooccur_bypass() {
         // Very high co-occurrence bypasses a_ok/b_ok individual evidence requirement.
+        // Use non-protected background daemons — the unified oracle now hard-rejects
+        // names like `coreaudiod` before the co-occurrence path is even considered.
         let mem = ExperienceMemory::new(300);
-        let pairs = vec![("coreaudiod", "corespeechd", HIGH_COOCCUR_BYPASS + 10)];
+        let pairs = vec![("corespeechd", "suggestd", HIGH_COOCCUR_BYPASS + 10)];
         let skills = induce(&mem, &pairs, &HashSet::new(), &[], "any");
         let group = skills.iter().find(|s| s.name.starts_with("group:"));
         assert!(
@@ -317,10 +326,12 @@ mod tests {
 
     #[test]
     fn skips_already_existing_group() {
+        // Use non-protected background daemons so protection isn't what short-circuits
+        // induction — the test subject is the existing-skill dedup path.
         let mem = ExperienceMemory::new(300);
-        let pairs = vec![("coreaudiod", "corespeechd", HIGH_COOCCUR_BYPASS + 10)];
+        let pairs = vec![("corespeechd", "suggestd", HIGH_COOCCUR_BYPASS + 10)];
         let mut existing = HashSet::new();
-        existing.insert("group:coreaudiod+corespeechd".to_string());
+        existing.insert("group:corespeechd+suggestd".to_string());
         let skills = induce(&mem, &pairs, &existing, &[], "any");
         assert!(skills.is_empty(), "must not re-induce existing skill");
     }
@@ -407,8 +418,9 @@ mod tests {
     #[test]
     fn group_skills_always_tagged_any() {
         // Group skills are structural (cross-workload) — always tagged "any".
+        // Use non-protected background daemons (unified oracle hard-rejects `coreaudiod`).
         let mem = ExperienceMemory::new(300);
-        let pairs = vec![("coreaudiod", "corespeechd", HIGH_COOCCUR_BYPASS + 10)];
+        let pairs = vec![("corespeechd", "suggestd", HIGH_COOCCUR_BYPASS + 10)];
         let skills = induce(&mem, &pairs, &HashSet::new(), &[], "build");
         let group = skills
             .iter()
