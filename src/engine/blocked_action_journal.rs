@@ -17,6 +17,10 @@
 //! [Bengio 2013] Counterfactual reasoning requires observing the COUNTERFACTUAL,
 //! not just the taken action. [Nygard 2018 §8.5] Adaptive capacity limits.
 
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::Path;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +84,17 @@ impl BlockedActionEvent {
     }
 }
 
+/// Append a single event as one JSON line to `path`. Creates the file if missing.
+/// On failure returns io::Error — callers MUST decide whether to swallow (hot path)
+/// or propagate. This is a best-effort observability primitive; a failed write must
+/// never abort the daemon's main loop.
+pub fn emit(path: &Path, event: &BlockedActionEvent) -> io::Result<()> {
+    let line = serde_json::to_string(event)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{}", line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +124,63 @@ mod tests {
         let b = BlockerKind::Other("custom-gate".to_string());
         let json = serde_json::to_string(&b).unwrap();
         assert!(json.contains("custom-gate"));
+    }
+
+    #[test]
+    fn emit_appends_one_jsonl_line() {
+        use std::io::Read as _;
+
+        // Per-test unique path under std::env::temp_dir() — no tempfile dep.
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "apollo-blocked-journal-emit-{}-{}.jsonl",
+            std::process::id(),
+            // nanos to avoid collision if multiple tests run in same PID
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        // Clean up any stale file from prior runs.
+        let _ = std::fs::remove_file(&p);
+
+        let e1 = BlockedActionEvent::new(
+            "Freeze",
+            "firefox",
+            Some(1234),
+            BlockerKind::UserContextAssertion,
+            0.66,
+            1.07,
+            29_599.0,
+            Some(0.40),
+        );
+        let e2 = BlockedActionEvent::new(
+            "Throttle",
+            "chrome",
+            Some(2345),
+            BlockerKind::HardProtection,
+            0.80,
+            2.10,
+            15_000.0,
+            None,
+        );
+
+        emit(&p, &e1).expect("first emit");
+        emit(&p, &e2).expect("second emit");
+
+        let mut contents = String::new();
+        std::fs::File::open(&p)
+            .expect("file exists")
+            .read_to_string(&mut contents)
+            .expect("read");
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "expected 2 non-empty lines, got {}", lines.len());
+        for l in &lines {
+            let _: BlockedActionEvent =
+                serde_json::from_str(l).expect("each line parses as BlockedActionEvent");
+        }
+
+        // Clean up.
+        let _ = std::fs::remove_file(&p);
     }
 }
