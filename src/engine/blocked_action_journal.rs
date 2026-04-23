@@ -115,6 +115,25 @@ pub fn emit(path: &Path, event: &BlockedActionEvent) -> io::Result<()> {
     writeln!(f, "{}", line)
 }
 
+/// Max shadow journal size before rotation (10 MB — same policy as journal.rs).
+const MAX_SHADOW_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Rotate the shadow journal once per call if it exceeds the size cap.
+/// Non-atomic by design: the writer thread owns it, so there's no concurrent
+/// writer to race with. Old `.1` is clobbered; we keep only the most recent
+/// rotation to bound disk usage at ~20 MB total. [Same policy as journal.rs
+/// rotation_when_file_exceeds_10mb to prevent the 8.6GB TelemetryLogger-style
+/// SSD saturation that froze the system 2026-04-09.]
+fn rotate_if_needed(path: &Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_symlink() && meta.len() > MAX_SHADOW_BYTES {
+            let rotated = path.with_extension("jsonl.1");
+            let _ = std::fs::remove_file(&rotated);
+            let _ = std::fs::rename(path, &rotated);
+        }
+    }
+}
+
 /// Background writer thread — mirrors the `apollo-frozen-writer` pattern
 /// (daemon_helpers.rs:439) to keep filesystem I/O off the daemon hot path.
 ///
@@ -131,6 +150,8 @@ fn writer_tx() -> &'static Sender<(PathBuf, String)> {
             .name("apollo-shadow-writer".to_string())
             .spawn(move || {
                 while let Ok((path, line)) = rx.recv() {
+                    // Rotate BEFORE opening — bounds disk usage at ~2 × 10 MB.
+                    rotate_if_needed(&path);
                     // Best-effort: if open or write fails, bump fail counter
                     // and drop. We do NOT block or retry — observability must
                     // never stall. Callers monitor liveness via the exposed
@@ -252,6 +273,68 @@ mod tests {
             serde_json::from_str(lines[0]).expect("parses as BlockedActionEvent");
         assert_eq!(back.target_pid, Some(9999));
 
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rotate_if_needed_rotates_file_over_cap() {
+        use std::io::Write as _;
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "apollo-shadow-rotate-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let rotated = p.with_extension("jsonl.1");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&rotated);
+
+        // Write just over the cap.
+        {
+            let mut f = std::fs::File::create(&p).expect("create");
+            let chunk = vec![b'x'; 1024 * 1024]; // 1 MB
+            for _ in 0..11 {
+                f.write_all(&chunk).expect("write chunk");
+            }
+        }
+        let size_before = std::fs::metadata(&p).unwrap().len();
+        assert!(size_before > MAX_SHADOW_BYTES);
+
+        rotate_if_needed(&p);
+
+        // Primary file is gone, rotated file exists.
+        assert!(!p.exists(), "primary should have been renamed");
+        assert!(rotated.exists(), "rotated file should exist");
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&rotated);
+    }
+
+    #[test]
+    fn rotate_if_needed_noop_below_cap() {
+        use std::io::Write as _;
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "apollo-shadow-norotate-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = std::fs::remove_file(&p);
+
+        std::fs::File::create(&p)
+            .expect("create")
+            .write_all(b"small")
+            .expect("write");
+
+        rotate_if_needed(&p);
+
+        assert!(p.exists(), "small file must NOT rotate");
         let _ = std::fs::remove_file(&p);
     }
 
