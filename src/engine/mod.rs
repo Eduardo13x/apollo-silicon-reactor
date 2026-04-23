@@ -77,6 +77,7 @@ pub mod page_reclaim;
 pub mod planner;
 pub mod policy_feature_deep_scan;
 pub mod policy_feature_predictive;
+pub mod policy_feature_sensor_age;
 pub mod power_management;
 pub mod predictive_agent;
 pub mod process_baseline;
