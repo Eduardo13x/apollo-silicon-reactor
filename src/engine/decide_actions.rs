@@ -1,17 +1,52 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use sysinfo::System;
 
 use crate::collector::SystemSnapshot;
+use crate::engine::action_policy::ActionContext;
 use crate::engine::amx_detector;
+use crate::engine::blocked_action_journal::BlockerKind;
 use crate::engine::outcome_tracker::{HopGroupWeight, PatternWeight, WorkloadHop};
 use crate::engine::overflow_guard::OverflowThresholds;
-use crate::engine::safety::critical_background_processes;
+use crate::engine::safety::{critical_background_processes, ProtectionLevel};
+use crate::engine::shadow_evaluator::ShadowEvaluator;
 use crate::engine::thread_selfcounts::IpcClass;
 use crate::engine::types::{
     BlockerScore, InteractiveContext, LatencyTarget, OptimizationProfile, RootAction,
 };
 use crate::engine::user_context::UserContext;
+
+// ── Shadow-mode ActionPolicyScorer wiring ────────────────────────────────────
+//
+// Lazy OnceLocks so we don't change `decide_actions()`'s signature. The
+// evaluator runs ALONGSIDE the existing gate tower; it never gates. When its
+// verdict disagrees with the gate, a single-line event lands in
+// `shadow_disagreements_path()` for offline analysis.
+//
+// Paper: [Nygard 2018 §8.5] adaptive capacity limits via shadowing.
+
+fn shadow_evaluator_cell() -> &'static ShadowEvaluator {
+    static CELL: OnceLock<ShadowEvaluator> = OnceLock::new();
+    CELL.get_or_init(ShadowEvaluator::default)
+}
+
+fn shadow_disagreements_path() -> &'static Path {
+    static CELL: OnceLock<PathBuf> = OnceLock::new();
+    CELL.get_or_init(|| {
+        // Mirror the convention in engine::daemon_helpers: /var/lib/apollo when
+        // root, else /tmp. Duplicated here (tiny) to avoid pulling the daemon
+        // helper module into decide_actions.
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            PathBuf::from("/var/lib/apollo/shadow_disagreements.jsonl")
+        } else {
+            PathBuf::from("/tmp/apollo-shadow_disagreements.jsonl")
+        }
+    })
+    .as_path()
+}
 
 /// User-facing interactive applications that must NEVER be frozen or throttled
 /// by heuristic or adaptive governor decisions. Substring match — catches helpers
@@ -968,6 +1003,48 @@ pub fn decide_actions(
             // User in call / media playing: skip freeze — jank is worse than memory pressure.
             if freeze_skip_by_user {
                 freeze_gate = "user-protected".to_string();
+                // SHADOW: let the scorer evaluate the class of blocked freeze
+                // actions. Never gates — just logs disagreement for offline
+                // analysis. Uses a synthetic probe candidate (pid=0) because
+                // the gate blocks the entire class; individual PIDs are not
+                // yet enumerated at this branch. [Nygard 2018 §8.5]
+                let probe = RootAction::freeze_full(0, "<shadow-probe>", "shadow-probe", 0, 0);
+                let ctx = ActionContext {
+                    pressure: snapshot.pressure.memory_pressure,
+                    swap_gb: snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    thrashing_score: snapshot.pressure.thrashing_score,
+                    // p_oom_30s lives on RuntimeMetrics, not the raw snapshot;
+                    // F6 data pipeline wiring into decide_actions is pending.
+                    p_oom_30s: None,
+                    // F6 jank predictor data pipeline pending.
+                    p_jank_60s: None,
+                    has_sleep_assertion: user_ctx.has_sleep_assertion,
+                    call_in_progress: user_ctx.call_in_progress,
+                    idle_secs: user_ctx.idle_secs,
+                    // Per-PID foreground info not in scope at the class-level gate.
+                    foreground_pid: None,
+                    is_foreground_family: false,
+                    is_recently_active: user_ctx.is_recently_active(),
+                    // Thermal / interrupt phase not threaded to this call site yet.
+                    thermal_emergency: false,
+                    interrupt_phase: 0,
+                    // Conservative default — gate-tower handles per-name protection
+                    // downstream; the synthetic probe has no name to classify.
+                    protection_level: ProtectionLevel::Unprotected,
+                    // F5 deep scan data pipeline pending.
+                    hot_page_fraction: None,
+                    wss_mb: None,
+                    // F7 sensor freshness pipeline pending.
+                    sensor_age_ms: None,
+                    // Epistemic uncertainty plumbing pending.
+                    epistemic_uncertainty: 0.0,
+                };
+                shadow_evaluator_cell().evaluate_blocked(
+                    &probe,
+                    &ctx,
+                    BlockerKind::UserContextAssertion,
+                    shadow_disagreements_path(),
+                );
             }
             let extreme_freeze_ok = (gate_a || gate_b || gate_c) && !freeze_skip_by_user;
             if extreme_freeze_ok {
