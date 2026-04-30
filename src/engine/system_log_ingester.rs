@@ -165,6 +165,18 @@ impl SystemLogIngester {
                 // burdened with a potentially slow `log show` call.
                 std::thread::sleep(poll_interval);
                 loop {
+                    // Crisis backoff: spawning `log show` under high OOM
+                    // probability adds memory + I/O pressure to a system
+                    // already in jetsam territory (observed 2026-04-30
+                    // lockup: ingester polled every 60s while p_oom > 0.85,
+                    // compounding the crisis it was trying to observe).
+                    // Skip the poll and sleep 5× longer when p_oom > 0.50.
+                    let p_oom = crate::engine::shadow_signals::get_p_oom_30s()
+                        .unwrap_or(0.0);
+                    if p_oom > 0.50 {
+                        std::thread::sleep(poll_interval * 5);
+                        continue;
+                    }
                     let result = Self::run_query_static(timeout);
                     if tx.send(result).is_err() {
                         // Main thread dropped receiver — exit cleanly.

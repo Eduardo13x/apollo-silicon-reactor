@@ -739,11 +739,23 @@ pub fn execute_actions(
                             })
                             .unwrap_or(false);
                         if !is_protected {
-                            let _ = sysctl_write_i32_with_timeout(
+                            // Capture sysctl result so a failed write doesn't
+                            // get silently logged as success in the journal.
+                            // Observed 2026-04-30: sysctl writes failed under
+                            // OOM crisis but `paging_hints_applied` still
+                            // incremented, masking the broken signal path.
+                            let ok = sysctl_write_i32_with_timeout(
                                 "kern.memorystatus_vm_pressure_send",
                                 *pid as i32,
                             );
-                            out.paging_hints_applied += 1;
+                            if ok {
+                                out.paging_hints_applied += 1;
+                            } else {
+                                out.push_skip(format!(
+                                    "memorystatus-send-failed:pid={}",
+                                    *pid
+                                ));
+                            }
                         }
                     }
                 }
