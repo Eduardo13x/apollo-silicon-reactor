@@ -957,21 +957,13 @@ fn main() -> anyhow::Result<()> {
                     (p, swap)
                 })
                 .unwrap_or((1.0, 99.0));
-            // Don't toggle Spotlight at startup. Each daemon restart used to
-            // fire `mdutil -i on/off` based on boot pressure, which retriggered
-            // mds_stores indexing runs (when calm) or raced with in-progress
-            // indexing (when stressed). The runtime pressure gate in
-            // daemon_cluster_actions handles toggle correctly with hysteresis;
-            // startup just initializes state to "not managed by Apollo" and
-            // lets the gate observe real pressure to decide.
-            // Observed 2026-04-30: 113k survival-mode activations → many
-            // daemon restarts → constant Spotlight churn → indexing never
-            // completed.
-            let _ = startup_pressure;
-            let _ = startup_swap_gb;
-            let mut spotlight_paused: bool = false;
-            let mut spotlight_paused_at: Option<Instant> = None;
-            let mut spotlight_last_assert_at: Option<Instant> = None;
+            // Spotlight management removed entirely 2026-04-30. Apollo no
+            // longer toggles `mdutil` because `-i off` aborts indexing rather
+            // than pausing it, causing repeated restart-from-zero cycles that
+            // prevent the index from ever completing. macOS manages Spotlight
+            // natively; Apollo handles pressure via other mechanisms (freezes,
+            // throttles, paging hints).
+            let _ = (startup_pressure, startup_swap_gb);
 
             // Consecutive cycles where swap_delta > 1MB/s. Fed to RL meta-gate
             // to veto Raise1pp during sustained swap growth (see rl_threshold.rs).
@@ -3124,16 +3116,9 @@ fn main() -> anyhow::Result<()> {
                         &actions,
                         &collector,
                         snapshot.pressure.memory_pressure,
-                        snapshot.pressure.swap_used_bytes,
                         overflow_thresholds.bg_pressure,
-                        spotlight_paused,
-                        spotlight_paused_at,
-                        spotlight_last_assert_at,
                     );
                     actions.extend(cluster_out.new_actions);
-                    spotlight_paused = cluster_out.spotlight_paused;
-                    spotlight_paused_at = cluster_out.spotlight_paused_at;
-                    spotlight_last_assert_at = cluster_out.spotlight_last_assert_at;
                 }
 
                 // Predictive agent: inject soft actions for PreThrottleNoise / ProactivePurge.
