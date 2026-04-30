@@ -26,6 +26,10 @@ pub struct ClusterActionsOutput {
     pub spotlight_paused: bool,
     /// Updated timestamp when spotlight was paused.
     pub spotlight_paused_at: Option<Instant>,
+    /// Timestamp of last `mdutil -i off` re-assertion. Tracked separately
+    /// from `spotlight_paused_at` so re-asserting doesn't reset the
+    /// minimum-hold gate (300s) used by the resume path.
+    pub spotlight_last_assert_at: Option<Instant>,
 }
 
 /// Run coordinated cluster freezing and spotlight pressure gate for this cycle.
@@ -49,6 +53,7 @@ pub fn run_cluster_actions(
     bg_pressure_threshold: f64,
     spotlight_paused: bool,
     spotlight_paused_at: Option<Instant>,
+    spotlight_last_assert_at: Option<Instant>,
 ) -> ClusterActionsOutput {
     let mut new_actions: Vec<RootAction> = Vec::new();
 
@@ -105,6 +110,7 @@ pub fn run_cluster_actions(
     // [Previously 0.55 re-enable was too aggressive: rapid on/off + mdworker storms]
     let mut new_spotlight_paused = spotlight_paused;
     let mut new_spotlight_paused_at = spotlight_paused_at;
+    let mut new_spotlight_last_assert_at = spotlight_last_assert_at;
     let swap_gb = swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     if std::path::Path::new("/usr/bin/mdutil").exists() {
         if !spotlight_paused && memory_pressure >= 0.75 && swap_gb >= 1.5 {
@@ -116,7 +122,9 @@ pub fn run_cluster_actions(
                 ),
             });
             new_spotlight_paused = true;
-            new_spotlight_paused_at = Some(Instant::now());
+            let now = Instant::now();
+            new_spotlight_paused_at = Some(now);
+            new_spotlight_last_assert_at = Some(now);
         } else if spotlight_paused
             && memory_pressure < 0.35
             && swap_gb < 1.0
@@ -130,6 +138,27 @@ pub fn run_cluster_actions(
             });
             new_spotlight_paused = false;
             new_spotlight_paused_at = None;
+            new_spotlight_last_assert_at = None;
+        } else if spotlight_paused
+            && memory_pressure >= 0.60
+            && spotlight_last_assert_at
+                .map(|t| t.elapsed() >= Duration::from_secs(120))
+                .unwrap_or(true)
+        {
+            // Re-assert pause every 120s while pressure is still elevated.
+            // mdutil only acts on the edge — macOS or other apps can flip
+            // indexing back on (volume mounts, mdfind, system events) and
+            // Apollo would silently drift out of sync with reality.
+            // Observed 2026-04-30: Spotlight kept re-indexing despite
+            // Apollo believing it was paused.
+            new_actions.push(RootAction::ToggleSpotlight {
+                enabled: false,
+                reason: format!(
+                    "re-assert-pause: mem={:.2} swap={:.1}GB",
+                    memory_pressure, swap_gb
+                ),
+            });
+            new_spotlight_last_assert_at = Some(Instant::now());
         }
     }
 
@@ -137,5 +166,6 @@ pub fn run_cluster_actions(
         new_actions,
         spotlight_paused: new_spotlight_paused,
         spotlight_paused_at: new_spotlight_paused_at,
+        spotlight_last_assert_at: new_spotlight_last_assert_at,
     }
 }

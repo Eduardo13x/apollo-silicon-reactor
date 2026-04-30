@@ -67,15 +67,26 @@ fn killall_by_name(daemon: &str, signal: i32) -> anyhow::Result<()> {
 /// Toggle Spotlight indexing via `mdutil -a -i on/off`.
 ///
 /// mdutil communicates with the Spotlight server via XPC (com.apple.spotlightserver).
-/// Fire-and-forget: `.spawn()` instead of `.status()` to avoid blocking the daemon
-/// loop indefinitely if the Spotlight server is unresponsive.
+/// Spawned on a detached worker thread to (a) not block the daemon hot path
+/// and (b) actually reap the child instead of leaking a zombie. Previous
+/// `let _ = spawn()` left the Child to drop without `wait()`, accumulating
+/// zombies across the daemon's lifetime (xnu does NOT auto-reap dropped
+/// Child handles — Drop on `std::process::Child` is a no-op by design).
 fn spotlight_set_indexing(enabled: bool) {
     let flag = if enabled { "on" } else { "off" };
-    let _ = std::process::Command::new("/usr/bin/mdutil")
-        .args(["-a", "-i", flag])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn(); // non-blocking — child reaps automatically
+    std::thread::Builder::new()
+        .name("apollo-mdutil".to_string())
+        .spawn(move || {
+            let result = std::process::Command::new("/usr/bin/mdutil")
+                .args(["-a", "-i", flag])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if let Err(e) = result {
+                eprintln!("[spotlight] mdutil -i {} spawn failed: {}", flag, e);
+            }
+        })
+        .ok();
 }
 
 fn run_sysctl_write(key: &str, value: &str) -> anyhow::Result<()> {
