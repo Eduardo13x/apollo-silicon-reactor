@@ -1188,6 +1188,7 @@ mod tests {
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
+            meta_cognition: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1219,6 +1220,7 @@ mod tests {
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
+            meta_cognition: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1248,6 +1250,7 @@ mod tests {
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
+            meta_cognition: None,
         };
         assert_eq!(
             state
@@ -1296,6 +1299,7 @@ mod tests {
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
+            meta_cognition: None,
         };
         state.self_improve();
         assert_eq!(
@@ -1339,6 +1343,7 @@ mod tests {
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
+            meta_cognition: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -1384,6 +1389,7 @@ mod tests {
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
+            meta_cognition: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1724,6 +1730,7 @@ mod tests {
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
+            meta_cognition: None,
         };
         seed.persist(&tmp);
 
@@ -1814,6 +1821,7 @@ mod tests {
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
+            meta_cognition: None,
         };
         let migrated = try_migrate(0, state);
         assert_eq!(
@@ -1850,6 +1858,7 @@ mod tests {
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
+            meta_cognition: None,
         };
         let migrated = try_migrate(1, state);
         assert_eq!(migrated.version, CURRENT_SCHEMA_VERSION);

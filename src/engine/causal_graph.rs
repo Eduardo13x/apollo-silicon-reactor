@@ -277,7 +277,19 @@ impl CausalGraph {
             if current_cycle.saturating_sub(self.pending[i].cycle) >= delay {
                 let pending = self.pending.swap_remove(i);
                 let delta = pending.pressure_at_action - current_pressure;
-                let was_effective = delta >= MIN_DELTA;
+                // High-swap regime: natural pressure drift is 3-4% per cycle due
+                // to kernel compressor flushes, independent of Apollo actions.
+                // Require a larger delta to credit an edge as causal; otherwise
+                // the graph attributes natural reclaim to throttle actions and
+                // builds overconfident edges (predicted=0.90 vs actual=0.30).
+                // [Pearl 2009] §3: confounding — swap flushes are a common cause
+                // of both "we acted" and "pressure dropped"; higher bar required.
+                let effective_min_delta = if pending.resources.swap_mb > 2000.0 {
+                    MIN_DELTA * 2.0
+                } else {
+                    MIN_DELTA
+                };
+                let was_effective = delta >= effective_min_delta;
 
                 let (effect, anti_effect) = if was_effective {
                     (EFFECT_PRESSURE_DROP, EFFECT_PRESSURE_UNCHANGED)

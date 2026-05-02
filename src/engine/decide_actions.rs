@@ -1000,6 +1000,24 @@ pub fn decide_actions(
             let gate_c = snapshot.pressure.thrashing_score > 5_000.0
                 && snapshot.pressure.memory_pressure >= 0.55;
 
+            // Gate D: high swap ratio + hazard model OOM risk + sustained pressure.
+            // Fires when swap is >70% full and p_oom_30s signals real risk, even
+            // without active swap growth (M1 swap is "sticky" — pages don't return
+            // freely; delta stays near zero while system is actually under threat).
+            // Prevents the freezer from being zombified in the common case of
+            // sustained-but-stable high swap with moderate memory pressure.
+            // [Camacho 2007] predictive control outperforms reactive snapshots.
+            let swap_ratio_d = if snapshot.pressure.swap_total_bytes > 0 {
+                snapshot.pressure.swap_used_bytes as f64
+                    / snapshot.pressure.swap_total_bytes as f64
+            } else {
+                0.0
+            };
+            let p_oom_d = crate::engine::shadow_signals::get_p_oom_30s().unwrap_or(0.0);
+            let gate_d = swap_ratio_d >= 0.70
+                && p_oom_d >= 0.35
+                && snapshot.pressure.memory_pressure >= 0.60;
+
             // User in call / media playing: skip freeze — jank is worse than memory pressure.
             if freeze_skip_by_user {
                 freeze_gate = "user-protected".to_string();
@@ -1049,14 +1067,17 @@ pub fn decide_actions(
                     shadow_disagreements_path(),
                 );
             }
-            let extreme_freeze_ok = (gate_a || gate_b || gate_c) && !freeze_skip_by_user;
+            let extreme_freeze_ok =
+                (gate_a || gate_b || gate_c || gate_d) && !freeze_skip_by_user;
             if extreme_freeze_ok {
                 freeze_gate = if gate_a {
                     "delta".to_string()
                 } else if gate_b {
                     "committed".to_string()
-                } else {
+                } else if gate_c {
                     "thrashing".to_string()
+                } else {
+                    "swap-oom".to_string()
                 };
                 // RSS-rank selection: freeze/throttle the largest-RSS background
                 // processes first — maximum pressure relief per action.

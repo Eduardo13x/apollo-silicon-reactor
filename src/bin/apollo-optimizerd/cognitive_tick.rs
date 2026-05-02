@@ -390,13 +390,16 @@ mod tests {
     #[test]
     fn test_cognitive_tick_high_uncertainty_blocks() {
         let mut cog = CognitiveState::new();
+        // All 4 spread-based components at max → composite = 0.25+0.20+0.20+0.10 = 0.75 > 0.70.
+        // calibration_error contributes W_CALIB=0.25 but requires MIN_OBS_FOR_ECE=10 to activate;
+        // a fresh state has 0 calibration so we drive composite via the other components alone.
         let inputs = CognitiveTickInputs {
             cycle: 100,
             pressure: 0.80,
-            drift_score: 0.50,
-            rl_q_variance: 0.95,
-            linucb_exploration: 0.90,
-            nars_min_confidence: 0.10,
+            drift_score: 1.0,
+            rl_q_variance: 1.0,
+            linucb_exploration: 1.0,
+            nars_min_confidence: 0.0,
             outcome_effectiveness: 0.2,
             ..Default::default()
         };

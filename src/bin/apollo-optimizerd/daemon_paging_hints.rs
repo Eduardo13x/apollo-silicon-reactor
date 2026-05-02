@@ -84,6 +84,10 @@ pub fn run_paging_hints(
                     && !p.has_gui_window
                     && foreground_app.map(|fg| p.name != fg).unwrap_or(true)
                     && p.secs_since_user_interaction > 60
+                    // Virtualization.framework VMs reject memorystatus_control even
+                    // as root (sandbox + hardened runtime blocks the sysctl write).
+                    // Skip early to avoid repeated journal spam for known-failed hints.
+                    && !p.name.contains("VirtualMachine")
             })
             .collect();
         bg_procs.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
