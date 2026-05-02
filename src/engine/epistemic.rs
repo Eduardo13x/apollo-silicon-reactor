@@ -6,11 +6,20 @@
 //! to gate risky actions when the system is genuinely unsure.
 //!
 //! ## Design
-//! Composite uncertainty from 4 independent sources:
+//! Composite uncertainty from 5 independent sources:
 //! - RL Q-value variance (how spread are Q-values in current state)
 //! - LinUCB exploration bonus (√(x'A⁻¹x) for chosen arm)
 //! - NARS confidence spread (1 - min confidence across relevant beliefs)
 //! - Drift score (DriftDetector.score() — model-reality divergence)
+//! - MetaCognition calibration error (predicted-vs-actual gap across subsystems)
+//!
+//! Why calibration is a 5th component (added 2026-04-30):
+//! Without it, a system with low Q-variance + few NARS observations + no drift
+//! reads epistemic=LOW even when MetaCognition has measured a >0.20 calibration
+//! error and activated humble_mode. The two signals would contradict each other
+//! ("I'm 99% sure" vs "your predictions don't match reality"). Calibration error
+//! is the most authoritative confidence signal — it directly compares prediction
+//! to outcome — so it deserves explicit weight in the composite.
 //!
 //! When composite > 0.70 → block aggressive freezes.
 //! When composite > 0.85 → force Observe arm only (zero side effects).
@@ -18,6 +27,8 @@
 //! ## References
 //! - [Lakshminarayanan 2017] "Simple and Scalable Predictive Uncertainty
 //!   Estimation using Deep Ensembles" NeurIPS §3
+//! - [Guo 2017] "On Calibration of Modern Neural Networks" ICML §3
+//!   ECE > 0.20 indicates miscalibration — overconfident predictions
 
 use serde::{Deserialize, Serialize};
 
@@ -29,10 +40,14 @@ const OBSERVE_ONLY_THRESHOLD: f32 = 0.85;
 
 /// Weights for composite uncertainty formula.
 /// Sum = 1.0. Tuned for Apollo's multi-agent architecture.
-const W_RL: f32 = 0.30;
-const W_LINUCB: f32 = 0.30;
-const W_NARS: f32 = 0.25;
-const W_DRIFT: f32 = 0.15;
+/// Calibration carries 0.25 (highest single weight) because it's the only
+/// signal that directly compares predictions to actual outcomes — the others
+/// measure spread/exploration, not correctness.
+const W_RL: f32 = 0.25;
+const W_LINUCB: f32 = 0.20;
+const W_NARS: f32 = 0.20;
+const W_DRIFT: f32 = 0.10;
+const W_CALIB: f32 = 0.25;
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -58,8 +73,13 @@ pub struct EpistemicUncertainty {
     /// High = model has drifted from reality → past learning is unreliable.
     pub drift_score: f32,
 
+    /// MetaCognition aggregate calibration error [0, 1].
+    /// High = predicted confidence ≠ actual outcomes across subsystems.
+    /// The most authoritative confidence signal (compares prediction to truth).
+    pub meta_calibration_error: f32,
+
     /// Composite uncertainty [0, 1].
-    /// Weighted combination of all 4 sources.
+    /// Weighted combination of all 5 sources.
     pub composite: f32,
 
     /// Whether high uncertainty mode is active (composite > 0.70).
@@ -77,23 +97,29 @@ impl EpistemicUncertainty {
     /// Update all uncertainty components and recompute composite.
     ///
     /// All inputs should be in [0, 1]. Out-of-range values are clamped.
+    /// `meta_calibration_error` should come from `MetaCognition.calibration_error`
+    /// after `meta_cognition.tick()` has run in the same cycle.
     pub fn update(
         &mut self,
         rl_q_variance: f32,
         linucb_exploration: f32,
         nars_confidence_spread: f32,
         drift_score: f32,
+        meta_calibration_error: f32,
     ) {
         self.rl_q_variance = rl_q_variance.clamp(0.0, 1.0);
         self.linucb_exploration = linucb_exploration.clamp(0.0, 1.0);
         self.nars_confidence_spread = nars_confidence_spread.clamp(0.0, 1.0);
         self.drift_score = drift_score.clamp(0.0, 1.0);
+        self.meta_calibration_error = meta_calibration_error.clamp(0.0, 1.0);
 
-        // Composite: weighted sum [Lakshminarayanan 2017 §3 predictive entropy]
+        // Composite: weighted sum [Lakshminarayanan 2017 §3 predictive entropy
+        // + Guo 2017 §3 ECE calibration]
         self.composite = W_RL * self.rl_q_variance
             + W_LINUCB * self.linucb_exploration
             + W_NARS * self.nars_confidence_spread
-            + W_DRIFT * self.drift_score;
+            + W_DRIFT * self.drift_score
+            + W_CALIB * self.meta_calibration_error;
         self.composite = self.composite.clamp(0.0, 1.0);
 
         // Mode transitions
@@ -131,6 +157,7 @@ impl EpistemicUncertainty {
             (self.linucb_exploration * W_LINUCB, "LinUCB-Explore"),
             (self.nars_confidence_spread * W_NARS, "NARS-Spread"),
             (self.drift_score * W_DRIFT, "Drift"),
+            (self.meta_calibration_error * W_CALIB, "Calibration"),
         ];
         components
             .iter()
@@ -154,6 +181,11 @@ impl EpistemicUncertainty {
                 self.nars_confidence_spread * W_NARS,
             ),
             ("Drift", self.drift_score, self.drift_score * W_DRIFT),
+            (
+                "Calibration",
+                self.meta_calibration_error,
+                self.meta_calibration_error * W_CALIB,
+            ),
         ]
     }
 }
@@ -175,7 +207,7 @@ mod tests {
     #[test]
     fn test_all_low_uncertainty() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.1, 0.1, 0.1, 0.05);
+        eu.update(0.1, 0.1, 0.1, 0.05, 0.05);
         assert!(eu.composite < 0.15);
         assert!(!eu.should_block_aggressive());
         assert!(!eu.should_observe_only());
@@ -185,7 +217,7 @@ mod tests {
     #[test]
     fn test_all_high_uncertainty() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(1.0, 1.0, 1.0, 1.0);
+        eu.update(1.0, 1.0, 1.0, 1.0, 1.0);
         assert!(eu.composite > 0.95);
         assert!(eu.should_block_aggressive());
         assert!(eu.should_observe_only());
@@ -195,8 +227,8 @@ mod tests {
     #[test]
     fn test_high_mode_threshold() {
         let mut eu = EpistemicUncertainty::new();
-        // Composite just above 0.70
-        eu.update(0.80, 0.80, 0.70, 0.30);
+        // Composite just above 0.70 — all components elevated
+        eu.update(0.80, 0.80, 0.70, 0.30, 0.70);
         assert!(eu.should_block_aggressive());
         assert!(!eu.should_observe_only());
         assert_eq!(eu.level_label(), "HIGH");
@@ -205,23 +237,24 @@ mod tests {
     #[test]
     fn test_observe_only_threshold() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.95, 0.95, 0.90, 0.60);
+        eu.update(0.95, 0.95, 0.90, 0.60, 0.95);
         assert!(eu.should_observe_only());
     }
 
     #[test]
     fn test_moderate_level() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.50, 0.50, 0.50, 0.30);
+        eu.update(0.50, 0.50, 0.50, 0.30, 0.50);
         assert_eq!(eu.level_label(), "MODERATE");
     }
 
     #[test]
     fn test_clamping_out_of_range() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(5.0, -2.0, 1.5, 3.0);
+        eu.update(5.0, -2.0, 1.5, 3.0, 4.0);
         assert!(eu.rl_q_variance <= 1.0);
         assert!(eu.linucb_exploration >= 0.0);
+        assert!(eu.meta_calibration_error <= 1.0);
         assert!(eu.composite <= 1.0);
         assert!(eu.composite >= 0.0);
     }
@@ -229,21 +262,47 @@ mod tests {
     #[test]
     fn test_dominant_source_rl() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(1.0, 0.0, 0.0, 0.0);
+        eu.update(1.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(eu.dominant_source(), "RL-QVar");
     }
 
     #[test]
     fn test_dominant_source_drift() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.0, 0.0, 0.0, 1.0);
+        eu.update(0.0, 0.0, 0.0, 1.0, 0.0);
+        // W_CALIB=0.25 > W_DRIFT=0.10, so drift alone wins only when drift_score=1.0
+        // and calibration is 0.0. Verify drift wins.
         assert_eq!(eu.dominant_source(), "Drift");
+    }
+
+    #[test]
+    fn test_dominant_source_calibration() {
+        let mut eu = EpistemicUncertainty::new();
+        eu.update(0.0, 0.0, 0.0, 0.0, 1.0);
+        assert_eq!(eu.dominant_source(), "Calibration");
+    }
+
+    #[test]
+    fn test_calibration_inflates_composite() {
+        // The bug NotebookLM caught: epistemic could read LOW while
+        // humble_mode was true. With calibration as a 5th component,
+        // a high calibration error must drag composite up.
+        let mut eu = EpistemicUncertainty::new();
+        eu.update(0.0, 0.0, 0.0, 0.0, 0.0);
+        let baseline = eu.composite;
+        eu.update(0.0, 0.0, 0.0, 0.0, 0.80);
+        assert!(
+            eu.composite > baseline + 0.15,
+            "calibration=0.80 should add ≥0.15 to composite (W_CALIB=0.25), got {} → {}",
+            baseline,
+            eu.composite
+        );
     }
 
     #[test]
     fn test_breakdown_sums_to_composite() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.6, 0.4, 0.3, 0.2);
+        eu.update(0.6, 0.4, 0.3, 0.2, 0.5);
         let bd = eu.breakdown();
         let sum: f32 = bd.iter().map(|(_, _, w)| w).sum();
         assert!(
@@ -255,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_weights_sum_to_one() {
-        let sum = W_RL + W_LINUCB + W_NARS + W_DRIFT;
+        let sum = W_RL + W_LINUCB + W_NARS + W_DRIFT + W_CALIB;
         assert!(
             (sum - 1.0).abs() < 0.001,
             "Weights should sum to 1.0: {sum}"
@@ -265,7 +324,7 @@ mod tests {
     #[test]
     fn test_serde_roundtrip() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.5, 0.3, 0.7, 0.1);
+        eu.update(0.5, 0.3, 0.7, 0.1, 0.4);
 
         let json = serde_json::to_string(&eu).expect("serialize");
         let restored: EpistemicUncertainty = serde_json::from_str(&json).expect("deserialize");
@@ -278,11 +337,11 @@ mod tests {
     fn test_mode_transitions_hysteresis() {
         let mut eu = EpistemicUncertainty::new();
         // Enter high mode
-        eu.update(0.9, 0.9, 0.8, 0.5);
+        eu.update(0.9, 0.9, 0.8, 0.5, 0.5);
         assert!(eu.high_uncertainty_mode);
 
         // Drop below → should exit
-        eu.update(0.2, 0.2, 0.1, 0.1);
+        eu.update(0.2, 0.2, 0.1, 0.1, 0.1);
         assert!(!eu.high_uncertainty_mode);
     }
 }

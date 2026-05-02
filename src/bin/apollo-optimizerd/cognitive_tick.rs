@@ -210,11 +210,15 @@ pub fn run_cognitive_tick(
     }
 
     // ── 4. EpistemicUncertainty: update composite ─────────────────────────
+    // Calibration error feeds in as 5th component (W_CALIB=0.25). Keeps the
+    // composite honest when MetaCognition has measured a humble-mode-worthy
+    // calibration gap that the spread-based components alone would miss.
     cog.epistemic.update(
         inputs.rl_q_variance,
         inputs.linucb_exploration,
         1.0 - inputs.nars_min_confidence,
         inputs.drift_score as f32,
+        cog.meta_cognition.calibration_error,
     );
 
     // ── 5. ReptileMeta: detect fingerprint changes + apply deltas ────────
@@ -270,8 +274,9 @@ pub fn run_cognitive_tick(
                     AdversarialProbe::probe_nars_recovery(20)
                 }
                 apollo_optimizer::engine::adversarial_probe::ProbeExpectation::EpistemicBlocksAggressive => {
-                    AdversarialProbe::probe_epistemic_blocks(|rv, le, ns, ds| {
-                        let composite = 0.30 * rv + 0.30 * le + 0.25 * ns + 0.15 * ds;
+                    AdversarialProbe::probe_epistemic_blocks(|rv, le, ns, ds, ce| {
+                        // Mirror EpistemicUncertainty composite weights.
+                        let composite = 0.25 * rv + 0.20 * le + 0.20 * ns + 0.10 * ds + 0.25 * ce;
                         composite > 0.70
                     })
                 }

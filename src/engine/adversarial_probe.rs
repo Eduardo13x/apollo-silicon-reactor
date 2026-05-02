@@ -320,13 +320,13 @@ impl AdversarialProbe {
     /// Run an EpistemicBlocksAggressive probe.
     ///
     /// `epistemic_blocks_fn`: returns true if epistemic uncertainty would block
-    /// aggressive actions at given (rl_var, linucb_exp, nars_spread, drift).
+    /// aggressive actions at given (rl_var, linucb_exp, nars_spread, drift, calib).
     pub fn probe_epistemic_blocks<F>(epistemic_blocks_fn: F) -> ProbeResult
     where
-        F: Fn(f32, f32, f32, f32) -> bool,
+        F: Fn(f32, f32, f32, f32, f32) -> bool,
     {
         // Max uncertainty on all dimensions → MUST block
-        let blocks = epistemic_blocks_fn(1.0, 1.0, 1.0, 1.0);
+        let blocks = epistemic_blocks_fn(1.0, 1.0, 1.0, 1.0, 1.0);
         ProbeResult {
             expectation: ProbeExpectation::EpistemicBlocksAggressive,
             passed: blocks,
@@ -590,9 +590,9 @@ mod tests {
 
     #[test]
     fn test_epistemic_blocks_at_max_uncertainty() {
-        let result = AdversarialProbe::probe_epistemic_blocks(|rv, le, ns, ds| {
-            // Correct: block when all dimensions at max
-            let composite = 0.30 * rv + 0.30 * le + 0.25 * ns + 0.15 * ds;
+        let result = AdversarialProbe::probe_epistemic_blocks(|rv, le, ns, ds, ce| {
+            // Correct: block when all dimensions at max (5-component formula)
+            let composite = 0.25 * rv + 0.20 * le + 0.20 * ns + 0.10 * ds + 0.25 * ce;
             composite > 0.70
         });
         assert!(result.passed);
@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_epistemic_blocks_fails_when_not_blocking() {
-        let result = AdversarialProbe::probe_epistemic_blocks(|_, _, _, _| false);
+        let result = AdversarialProbe::probe_epistemic_blocks(|_, _, _, _, _| false);
         assert!(!result.passed);
     }
 
