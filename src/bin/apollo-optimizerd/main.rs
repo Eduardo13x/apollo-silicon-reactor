@@ -782,6 +782,9 @@ fn main() -> anyhow::Result<()> {
                 apollo_optimizer::engine::process_baseline::ProcessBaselineMap,
             > = None;
             let mut learnable_params = LearnableParams::default();
+            let mut restored_meta_cognition: Option<
+                apollo_optimizer::engine::meta_cognition::MetaCognition,
+            > = None;
             if let Some(learned) = LearnedState::load(ls_path) {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
@@ -823,6 +826,10 @@ fn main() -> anyhow::Result<()> {
                         "warm-started neuromodulator from learned_state"
                     );
                 }
+                // Stash MetaCognition snapshot for restore after CognitiveState::new()
+                // is constructed below. Cloned here because `learned` is consumed by
+                // the upcoming apply() call.
+                restored_meta_cognition = learned.meta_cognition.clone();
                 // apply() restores skills from learned_state.json if present,
                 // overwriting the legacy optimization_skills.json load above.
                 // If skill_registry field is absent (old file), the legacy load is kept.
@@ -1154,6 +1161,18 @@ fn main() -> anyhow::Result<()> {
             // [CognitiveRewardBus, MetaCognition, SelfRewardingEvaluator, EpistemicUncertainty,
             //  ReptileMeta, AdversarialProbe, ProactiveDrift, CognitiveHealthScore]
             let mut cognitive_state = cognitive_tick::CognitiveState::new();
+            // Restore MetaCognition from learned_state if present. Preserves
+            // per-subsystem calibration history across daemon restarts so the
+            // first ~50 cycles after a restart aren't blindly optimistic.
+            if let Some(mc) = restored_meta_cognition {
+                cognitive_state.meta_cognition = mc;
+                tracing::info!(
+                    target: "apollo.meta_cognition",
+                    calibration_error = cognitive_state.meta_cognition.calibration_error,
+                    humble_mode = cognitive_state.meta_cognition.humble_mode,
+                    "restored MetaCognition from learned_state"
+                );
+            }
             // CognitiveDecision from the PREVIOUS cycle — gates current cycle's
             // aggressive actions. None on first cycle (no restriction). [Sutton 2018]
             let mut prev_cog_decision: Option<cognitive_tick::CognitiveDecision> = None;
@@ -4179,6 +4198,19 @@ fn main() -> anyhow::Result<()> {
                         sleep_notifier.is_sleeping(),
                         ode_t_sat_urgency,
                     );
+                    // Patch MetaCognition into the freshly-persisted learned_state.
+                    // run_learning_tick triggers persist_improved every 300 cycles;
+                    // mirror that cadence so calibration history (per-subsystem
+                    // accuracy EMAs, humble_mode flag, observation count) survives
+                    // restarts. Without this, cog.meta_cognition cold-starts at
+                    // baseline on every reboot and the system is blindly optimistic
+                    // for ~50 cycles until calibration re-accumulates.
+                    if !sleep_notifier.is_sleeping() && cycle_count % 300 == 0 {
+                        apollo_optimizer::engine::learned_state::LearnedState::patch_meta_cognition(
+                            ls_path,
+                            cognitive_state.meta_cognition.clone(),
+                        );
+                    }
                     // Apply ws_spike_threshold / fluidity_degraded_threshold from LearnableParams.
                     // Keeps fluidity detection calibrated with learned values.
                     if persist_generations % 100 == 50 {

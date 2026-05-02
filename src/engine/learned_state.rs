@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use crate::engine::causal_graph::{CausalEdge, CausalGraph};
 use crate::engine::neuromodulator::NeuroState;
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
+use crate::engine::meta_cognition::MetaCognition;
 use crate::engine::nars_belief::ArousalState;
 use crate::engine::nested_learner::NestedLearner;
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
@@ -479,6 +480,22 @@ pub struct LearnedState {
     /// `None` = first run or old file format → `ApolloNeuromodulator::new()` baseline.
     #[serde(default)]
     pub neuro_state: Option<NeuroState>,
+
+    /// MetaCognition second-order calibration tracker — per-subsystem accuracy
+    /// EMA (RL, LinUCB, NARS, CausalGraph, SignalKalman, FreezeIntel),
+    /// aggregate calibration_error, humble_mode flag, and observation count.
+    /// Without this, every daemon restart cold-starts calibration at 0.0
+    /// (humble_mode=false), making the system blindly optimistic for ~50
+    /// cycles until it re-accumulates enough observations to detect a
+    /// calibration gap that was visible pre-restart.
+    ///
+    /// [Guo 2017 §3] ECE is a population statistic — meaningful only after
+    /// many observations; throwing it away on each restart resets the
+    /// observability of the cognitive system to itself.
+    ///
+    /// `None` = first run or old file format → `MetaCognition::new()` baseline.
+    #[serde(default)]
+    pub meta_cognition: Option<MetaCognition>,
 }
 
 /// Current schema version for [`LearnedState`].
@@ -595,6 +612,7 @@ impl LearnedState {
             teacher_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
+            meta_cognition: None,
         }
     }
 
@@ -935,6 +953,21 @@ impl LearnedState {
     /// field is absent (old file format pre-dating NeuroState persistence).
     pub fn load_neuro_state(path: &Path) -> Option<NeuroState> {
         Self::load(path)?.neuro_state
+    }
+
+    /// Patch only the `meta_cognition` field of an existing persisted file.
+    /// Reads the file, updates the field, writes back. No-op if the file is
+    /// missing — cold start is safe; MetaCognition initialises at baseline
+    /// (calibration_error=0.0, humble_mode=false, no subsystem observations).
+    ///
+    /// [Guo 2017 §3] — calibration is a population statistic; persisting it
+    /// across restarts preserves second-order observability of the system.
+    pub fn patch_meta_cognition(path: &Path, mc: MetaCognition) {
+        let Some(mut state) = Self::load(path) else {
+            return;
+        };
+        state.meta_cognition = Some(mc);
+        state.persist(path);
     }
 
     /// Load only the `teacher_consolidator` field from disk (cold-start safe).
