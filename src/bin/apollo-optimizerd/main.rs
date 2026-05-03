@@ -24,6 +24,7 @@ mod daemon_paging_hints;
 mod daemon_signal_tick;
 mod daemon_skill_tick;
 mod daemon_chromium_tick;
+mod daemon_fluidity_tick;
 mod daemon_cognitive_tick;
 mod daemon_ctx_switch_tick;
 mod daemon_holt_winters_tick;
@@ -2289,39 +2290,29 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     // ── Fluidity Intelligence ────────────────────────────────
+                    // Extracted to daemon_fluidity_tick (Wave 37).
                     // Update FluidityState from process snapshot + GPU load.
-                    // WindowServer CPU → spike detection (window resize/move).
-                    // New PIDs → app launch detection + protection window.
-                    // [Jain 1991] composite score, [Welch & Bishop 2006] Kalman prediction
                     {
-                        let fl_procs: Vec<(u32, &str, f32)> = proc_snaps
-                            .iter()
-                            .map(|p| (p.pid, p.name.as_str(), p.cpu_percent))
-                            .collect();
-                        // GPU load from IOKit hw_snap (normalized 0–1).
-                        let fl_gpu_load = cycle_hw_snap
-                            .as_ref()
-                            .and_then(|hw| hw.power.gpu_watts)
-                            .map(|w| (w / 15.0).clamp(0.0, 1.0) as f32)
-                            .unwrap_or(0.0);
-                        fluidity_state.update(&fl_procs, fl_gpu_load, cycle_dt_secs as f32);
-
-                        // Snapshot signal for use later in the cycle
-                        let fl_sig = apollo_optimizer::engine::fluidity::FluiditySignal::from(
-                            &fluidity_state,
-                        );
+                        let fl_sig = daemon_fluidity_tick::run_fluidity_tick(
+                            daemon_fluidity_tick::FluidityTickInput {
+                                proc_snaps: &proc_snaps,
+                                cycle_hw_snap: cycle_hw_snap.as_ref(),
+                                cycle_dt_secs: cycle_dt_secs as f32,
+                                fluidity_state: &mut fluidity_state,
+                            }
+                        ).fl_signal;
 
                         // Wire into RuntimeMetrics for status/dashboard reporting
                         metrics.metrics.fluidity_score = fl_sig.fluidity_score;
                         metrics.metrics.window_op_active = fl_sig.window_op_active;
                         metrics.metrics.app_launching = fl_sig.app_launching;
-                        metrics.metrics.app_launch_name = fl_sig.launch_name.clone();
+                        metrics.metrics.app_launch_name = fl_sig.launch_name;
                         metrics.metrics.fluidity_degraded = fl_sig.fluidity_degraded;
                         // Kalman prediction for pre-emptive response
                         metrics.metrics.fluidity_predicted_3s = fl_sig.fluidity_predicted_3s;
                         metrics.metrics.fluidity_velocity = fl_sig.fluidity_velocity;
                         // Also update windowserver_cpu_pct (existing field)
-                        metrics.metrics.windowserver_cpu_pct = fluidity_state.windowserver_cpu_ema;
+                        metrics.metrics.windowserver_cpu_pct = fl_sig.windowserver_cpu_ema;
                     }
 
                     // Build progress tick — updates build_tracker.phase and
