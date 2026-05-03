@@ -94,6 +94,15 @@ const MAX_FROZEN_CYCLES: u8 = 50;
 /// quickly; the ones you switched away from stay paused.
 const MAX_FOREGROUND_FROZEN_CYCLES: u8 = 3;
 
+/// Re-purge cadence (in cycles) for PurgePurgeable hints under velocity
+/// escalation. At the daemon's 2 Hz tick rate, 500 cycles ≈ 4 minutes —
+/// long enough that renderers can rebuild meaningful purgeable caches
+/// between hints, short enough that long-lived browsers don't drift back
+/// to multi-GB cache footprints during a sustained swap-storm regime.
+/// [Notebook 2026-05-03] one-shot dedup is "INSUFFICIENT FOR M1 8GB" —
+/// browser purgeable allocations grow continuously.
+const RE_PURGE_INTERVAL_CYCLES: u64 = 500;
+
 /// Cycles a renderer must wait after a thaw before it can be frozen again.
 /// Post-SIGCONT, the renderer reports CPU=0 while still waking up — without
 /// this guard it immediately looks idle and gets re-frozen, creating the
@@ -255,10 +264,22 @@ pub struct ChromiumManager {
     prev_fg_browser: Option<String>,
     /// PIDs already sent to E-core demotion — avoid repeat calls each cycle.
     ecore_demoted: HashSet<u32>,
-    /// PIDs that received a purgeable-region hint under velocity escalation.
+    /// PIDs that received a purgeable-region hint under velocity escalation,
+    /// mapped to the cycle counter at which the last hint fired. Re-emit once
+    /// `RE_PURGE_INTERVAL_CYCLES` have elapsed so long-lived renderers that
+    /// rebuild caches between escalations get periodic relief.
     /// Separate from `ecore_demoted` so a renderer first seen at low velocity
     /// can still be purged the first time velocity escalates above the gate.
-    velocity_purged: HashSet<u32>,
+    velocity_purged: HashMap<u32, u64>,
+    /// Monotonic counter incremented at each `update()` entry. Drives the
+    /// re-purge cadence in `velocity_purged`. Independent of any external
+    /// cycle clock so the manager remains self-contained.
+    cycle_counter: u64,
+    /// PIDs purged in the most recent `update()` call, with renderer name.
+    /// Drained by the daemon after `update()` to feed `CausalGraph` so that
+    /// the LearningPipeline can attribute pressure_drop / swap_delta to this
+    /// action via Pearl 2009 interventional reasoning. Reset every cycle.
+    purged_this_cycle: Vec<(u32, String)>,
 
     // ── Cognitive context (Enhancement A/B/C) ─────────────────────────────────
     /// FocusMarkov top-N predictions: (app_name, probability, avg_dwell_secs).
@@ -319,8 +340,18 @@ impl ChromiumManager {
             intelligence: FreezeIntelligence::new(),
             visible_pids: HashSet::new(),
             current_swap_velocity_bps: 0.0,
-            velocity_purged: HashSet::new(),
+            velocity_purged: HashMap::new(),
+            cycle_counter: 0,
+            purged_this_cycle: Vec::new(),
         }
+    }
+
+    /// Drain the renderers purged in the most recent `update()` call so the
+    /// daemon can feed them into `CausalGraph::record_action_with_resources`
+    /// for Pearl 2009 interventional attribution. Returns (pid, renderer_name)
+    /// pairs and clears the buffer. Call exactly once per cycle after `update()`.
+    pub fn drain_purged_this_cycle(&mut self) -> Vec<(u32, String)> {
+        std::mem::take(&mut self.purged_this_cycle)
     }
 
     /// Update smoothed swap velocity (bytes/sec) for anticipatory E-core demotion.
@@ -553,6 +584,9 @@ impl ChromiumManager {
         self.freezes_applied = 0;
         self.recoveries_applied = 0;
         self.ecore_count = 0;
+        // Internal cycle clock for re-purge cadence + reset per-cycle audit log.
+        self.cycle_counter = self.cycle_counter.wrapping_add(1);
+        self.purged_this_cycle.clear();
 
         // ── Step 1: Build current PID → (name, cpu, mem) maps ─────────────────
         let mut current_renderers: HashMap<u32, (&str, f32, u64)> = HashMap::new();
@@ -740,7 +774,7 @@ impl ChromiumManager {
         // is allowed to be purged again (purgeable regions are reset when a
         // process exits — the new owner has its own region map).
         self.velocity_purged
-            .retain(|pid| self.renderers.contains_key(pid));
+            .retain(|pid, _| self.renderers.contains_key(pid));
 
         // First pass: per-renderer thaws (non-frozen CPU spike) and E-core demotions
         let pids: Vec<u32> = self.renderers.keys().copied().collect();
@@ -854,19 +888,26 @@ impl ChromiumManager {
 
             // RAM reclaim path: under velocity escalation we ALSO mark purgeable
             // regions of invisible renderers volatile. The kernel can then drop
-            // those pages on demand without SIGSTOP. Cost ~200-500µs per pid;
-            // bounded by `velocity_purged` dedup so the syscall fires at most once
-            // per renderer lifetime.
+            // those pages on demand without SIGSTOP. Cost ~200-500µs per pid.
+            // Re-purge cadence: emit on first sight, then again every
+            // `RE_PURGE_INTERVAL_CYCLES` so long-lived renderers that rebuild
+            // caches under sustained pressure get periodic relief instead of
+            // the original one-shot-per-lifetime hint (NotebookLM gap, 2026-05-03).
+            let due_for_repurge = match self.velocity_purged.get(pid) {
+                None => true,
+                Some(last) => self.cycle_counter.saturating_sub(*last) >= RE_PURGE_INTERVAL_CYCLES,
+            };
             if velocity_escalate
                 && !info.frozen
                 && !self.visible_pids.contains(pid)
-                && !self.velocity_purged.contains(pid)
+                && due_for_repurge
             {
                 actions.push(ChromiumAction::PurgePurgeable {
                     pid: *pid,
                     name: info.name.clone(),
                 });
-                self.velocity_purged.insert(*pid);
+                self.velocity_purged.insert(*pid, self.cycle_counter);
+                self.purged_this_cycle.push((*pid, info.name.clone()));
             }
         }
 
@@ -2087,6 +2128,95 @@ mod tests {
             purged_pids,
             vec![402],
             "Velocity escalation must purge ONLY invisible FG-browser renderers"
+        );
+    }
+
+    /// Re-purge cadence (F2): a renderer that was purged once must NOT be
+    /// re-purged on the very next cycle, but MUST be re-purged after
+    /// `RE_PURGE_INTERVAL_CYCLES` have elapsed. Closes the NotebookLM gap
+    /// (2026-05-03): one-shot dedup leaves long-lived browsers without relief
+    /// when they rebuild caches under sustained pressure.
+    #[test]
+    fn velocity_purge_re_emits_after_interval() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(420, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
+        mgr.set_pressure_context(0.60);
+        mgr.set_velocity_context(2_097_152.0); // 2 MB/s — above gate
+
+        // Cycle 1: first purge fires.
+        let cycle1 = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        let p1 = cycle1
+            .iter()
+            .filter(|a| matches!(a, ChromiumAction::PurgePurgeable { .. }))
+            .count();
+        assert_eq!(p1, 1, "First cycle under velocity must purge once");
+
+        // Cycle 2 (immediately after): dedup must suppress re-emission.
+        let cycle2 = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        let p2 = cycle2
+            .iter()
+            .filter(|a| matches!(a, ChromiumAction::PurgePurgeable { .. }))
+            .count();
+        assert_eq!(p2, 0, "Re-purge must NOT fire on the cycle right after");
+
+        // Advance internal clock to the cycle right BEFORE the interval elapses.
+        // Each `update()` is itself a tick that increments `cycle_counter`, so
+        // we step exactly `RE_PURGE_INTERVAL_CYCLES - 2` cycles to land on the
+        // boundary cycle where the next update must re-emit.
+        for _ in 0..(RE_PURGE_INTERVAL_CYCLES - 2) {
+            let actions =
+                mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, ChromiumAction::PurgePurgeable { .. }))
+                    .count(),
+                0,
+                "Re-purge must NOT fire before the interval elapses"
+            );
+        }
+
+        // Boundary cycle: diff between cycle_counter and last purge equals the
+        // interval — re-purge must fire here.
+        let cycle_n = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        let p_n = cycle_n
+            .iter()
+            .filter(|a| matches!(a, ChromiumAction::PurgePurgeable { .. }))
+            .count();
+        assert_eq!(p_n, 1, "Re-purge must fire after RE_PURGE_INTERVAL_CYCLES");
+    }
+
+    /// Drain (F1): renderers purged this cycle must surface via
+    /// `drain_purged_this_cycle()` so the daemon can wire them into
+    /// `CausalGraph::record_action_with_resources()`.
+    #[test]
+    fn drain_purged_this_cycle_returns_emitted_pids() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        let procs: Vec<(u32, &str, f32, u64)> = vec![
+            (430, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
+            (431, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
+        ];
+        mgr.set_pressure_context(0.60);
+        mgr.set_velocity_context(2_097_152.0);
+
+        let _ = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        let drained = mgr.drain_purged_this_cycle();
+        let mut pids: Vec<u32> = drained.iter().map(|(pid, _)| *pid).collect();
+        pids.sort_unstable(); // HashMap iteration order is non-deterministic.
+        assert_eq!(
+            pids,
+            vec![430, 431],
+            "drain must return both purged renderers"
+        );
+
+        // Drain must clear the buffer — calling again returns empty.
+        let drained_again = mgr.drain_purged_this_cycle();
+        assert!(
+            drained_again.is_empty(),
+            "drain_purged_this_cycle must clear the buffer"
         );
     }
 

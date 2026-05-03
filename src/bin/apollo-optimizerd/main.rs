@@ -3523,6 +3523,37 @@ fn main() -> anyhow::Result<()> {
                     signal_digest.swap_velocity_smooth as f32,
                 );
 
+                // F1: Causal attribution for velocity-anticipatory purges
+                // [Pearl 2009] interventional reasoning. Without this the
+                // LearningPipeline has a blind spot for whether the purge hint
+                // actually drops pressure for this user's workload.
+                {
+                    let purged = chromium_mgr.drain_purged_this_cycle();
+                    if !purged.is_empty() {
+                        use apollo_optimizer::engine::causal_graph::ResourceSnapshot;
+                        let pressure_now = snapshot.pressure.memory_pressure as f32;
+                        let swap_mb_now =
+                            snapshot.pressure.swap_used_bytes as f32 / 1_048_576.0;
+                        for (pid, name) in &purged {
+                            let res = proc_snaps
+                                .iter()
+                                .find(|p| p.pid == *pid)
+                                .map(|p| ResourceSnapshot {
+                                    rss_mb: p.rss_bytes as f32 / 1_048_576.0,
+                                    cpu_pct: p.cpu_percent,
+                                    swap_mb: swap_mb_now,
+                                })
+                                .unwrap_or_default();
+                            lctx.causal_graph.record_action_with_resources(
+                                &format!("purge_purgeable:{}", name),
+                                pressure_now,
+                                cycle_count as u64,
+                                res,
+                            );
+                        }
+                    }
+                }
+
                 let policy = SafetyPolicy::for_capabilities(
                     SafetyPolicy::for_profile(current_profile),
                     hw_cores,
