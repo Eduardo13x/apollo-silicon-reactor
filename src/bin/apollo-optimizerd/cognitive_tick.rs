@@ -260,9 +260,13 @@ pub fn run_cognitive_tick(
             let result = match scenario.expectation {
                 apollo_optimizer::engine::adversarial_probe::ProbeExpectation::NoFreezeProtected => {
                     AdversarialProbe::probe_no_freeze_protected(scenario, |name, _p, _oom| {
-                        // Protected processes should never be frozen
-                        let protected = apollo_optimizer::engine::safety::protected_processes();
-                        !protected.contains(name)
+                        // Protected processes should never be frozen.
+                        // Use the unified safety oracle (is_protected_name) so the
+                        // adversarial probe stresses the *real* protection logic
+                        // (Tier 1 hard + Tier 2 infra + Tier 3 dev runtime),
+                        // not a slice of it. [Saltzer & Kaashoek 2009] §3.3
+                        // Complete Mediation — single source of truth.
+                        !apollo_optimizer::engine::safety::is_protected_name(name)
                     })
                 }
                 apollo_optimizer::engine::adversarial_probe::ProbeExpectation::SafetyFloorRespected => {
