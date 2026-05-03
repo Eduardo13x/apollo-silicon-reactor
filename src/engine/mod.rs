@@ -38,6 +38,7 @@ pub mod execute_actions;
 pub mod fluidity;
 pub mod focus_markov;
 pub mod foreground;
+pub mod freeze_cooldown;
 pub mod freeze_intelligence;
 pub mod gpu_manager;
 pub mod hazard_model;
