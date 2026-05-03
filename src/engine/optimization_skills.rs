@@ -128,15 +128,18 @@ impl SkillRegistry {
     pub fn learn(&mut self, name: &str, pressure: f32, workload: &str, targets: Vec<String>) {
         // Filter protected OS daemons and system processes at ingestion time.
         // Two-layer check:
-        // 1. Explicit hard list (safety::protected_processes)
+        // 1. Unified exact-match oracle (safety::is_protected_name) — covers
+        //    Tier 1 OS essentials, Tier 2 infra services, Tier 3 dev runtimes.
+        //    Replaces previous substring scan which over-protected (e.g.,
+        //    "WindowServer-helper" matched "WindowServer" as false-positive).
+        //    Saltzer & Kaashoek 2009 §3.3 Complete Mediation.
         // 2. Structural heuristic: Apple/system naming patterns that signal
         //    OS infrastructure — these should never be skill targets regardless
         //    of observed correlations.
-        let protected = crate::engine::safety::protected_processes();
         let clean_targets: Vec<String> = targets
             .into_iter()
             .filter(|t| {
-                !protected.iter().any(|&p| t.contains(p)) && !is_system_process_name(t)
+                !crate::engine::safety::is_protected_name(t) && !is_system_process_name(t)
             })
             .collect();
         if clean_targets.is_empty() {
@@ -312,7 +315,10 @@ impl SkillRegistry {
         // Purge skills whose keys reference protected OS daemons or system
         // process naming patterns. Guards against stale disk state from before
         // these protections were added.
-        let protected = crate::engine::safety::protected_processes();
+        // Migrated from substring scan over protected_processes() to the
+        // unified is_protected_name() oracle (Tier 1/2/3) — closes
+        // "WindowServer-helper" false-positive class. Saltzer & Kaashoek 2009
+        // §3.3 Complete Mediation.
         self.skills = map
             .into_iter()
             .filter(|(k, _)| {
@@ -321,7 +327,7 @@ impl SkillRegistry {
                     .trim_start_matches("throttle:")
                     .trim_start_matches("group:")
                     .trim_start_matches("induced:");
-                !protected.iter().any(|&p| proc_name.contains(p))
+                !crate::engine::safety::is_protected_name(proc_name)
                     && !is_system_process_name(proc_name)
             })
             .collect();

@@ -6,7 +6,6 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::collector::{ProcessStats, SystemSnapshot};
-use crate::engine::safety::protected_processes;
 
 const PRESENCE_HALF_LIFE_DAYS: f64 = 5.0;
 const JANK_HALF_LIFE_DAYS: f64 = 2.0;
@@ -214,9 +213,13 @@ impl UsageModel {
             .map(summarize_entry)
             .collect();
 
-        // Filter protected and obviously critical substrings.
-        let protected = protected_processes();
-        entries.retain(|e| !protected.iter().any(|p| e.name.contains(p)));
+        // Filter protected processes via the unified exact-match oracle.
+        // Previously used `protected_processes().iter().any(|p| name.contains(p))`
+        // which over-protected by substring (e.g., "WindowServer-helper" was
+        // wrongly excluded because it contained "WindowServer"). is_protected_name()
+        // is the single authoritative classifier (Tier 1 exact / Tier 2 infra /
+        // Tier 3 dev runtime) — Saltzer & Kaashoek 2009 §3.3 Complete Mediation.
+        entries.retain(|e| !crate::engine::safety::is_protected_name(&e.name));
 
         let mut interactive = entries.clone();
         // BUG 20 fix: unwrap on partial_cmp could panic if NaN. Use unwrap_or(Equal).
@@ -272,7 +275,6 @@ impl UsageModel {
             return Vec::new();
         }
 
-        let protected = protected_processes();
         let never_interactive = never_promote_interactive();
         let mut candidates: Vec<UsageEntrySummary> = self
             .persisted
@@ -280,7 +282,12 @@ impl UsageModel {
             .values()
             .map(summarize_entry)
             .collect();
-        candidates.retain(|e| !protected.iter().any(|p| e.name.contains(p)));
+        // Use unified exact-match oracle for protected processes (closes
+        // substring false-positive bug — see top_report() comment above).
+        // never_promote_interactive() retains substring scan: it is a
+        // separate, intentionally-permissive heuristic over name fragments
+        // like "helper", not exact OS-daemon identities.
+        candidates.retain(|e| !crate::engine::safety::is_protected_name(&e.name));
         candidates.retain(|e| !never_interactive.iter().any(|p| e.name.contains(p)));
 
         // Conservative: require age.

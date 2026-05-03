@@ -535,9 +535,11 @@ impl AdaptiveGovernor {
             && adjusted_utility < 0.55
             && !snap.is_zombie
             && snap.process_uptime_secs >= 30
-            && !crate::engine::safety::protected_processes()
-                .iter()
-                .any(|&p| snap.name.contains(p))
+            // Use the unified exact-match oracle (closes substring false-positive
+            // bug — e.g., "WindowServer-helper" was wrongly skipped). Tier 1 hard
+            // exact / Tier 2 infra substring / Tier 3 dev runtime word-boundary.
+            // Saltzer & Kaashoek 2009 §3.3 Complete Mediation.
+            && !crate::engine::safety::is_protected_name(&snap.name)
         {
             return pd(
                 GovernorDecision::Throttle,
