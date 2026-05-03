@@ -536,6 +536,19 @@ pub const SWAP_EXHAUSTION_GB: f64 = 4.0;
 /// paging hot working-set pages, not just cold tail.
 pub const SWAP_EXHAUSTION_PCT: f64 = 0.35;
 
+/// Hard survival trigger — fires when swap_used / swap_total ≥ this fraction,
+/// regardless of absolute swap size. Closes a calibration trap on M1 8GB where
+/// swap_total = 4 GB makes the `max(4 GB, ...)` absolute floor unreachable
+/// before 100% saturation: production swap = 3.92 GB / 4 GB (91 %) never fires
+/// `swap_exhaustion_threshold_bytes` (= 4 GB). Production cycles=91k,
+/// freezes_applied=0, freeze_gate=thrashing — the gate fires but candidates
+/// (softly_protected) are still protected because survival mode never crosses.
+/// Original design intent (memory.md "Época 8"): `swap_used >= 0.80 * swap_total`.
+/// Cross-hardware sanity: 16 GB swap → fires at 13.6 GB (severe but legitimate
+/// crisis); 32 GB swap → 27.2 GB (effectively kernel-panic territory).
+/// [Nygard 2018 §5] Load Shedding — at this saturation, shed before kernel does.
+pub const SURVIVAL_SWAP_PCT_THRESHOLD: f64 = 0.85;
+
 /// Effective swap-exhaustion byte threshold for a given swap_total.
 /// Returns `max(SWAP_EXHAUSTION_GB, swap_total × SWAP_EXHAUSTION_PCT)`.
 /// When `swap_total == 0` (misreported / no swap), falls back to the absolute floor.
@@ -562,8 +575,11 @@ pub fn survival_mode_active_total(
 ) -> bool {
     let swap_gb = swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let exhausted = swap_used_bytes >= swap_exhaustion_threshold_bytes(swap_total_bytes);
+    let pct_exhausted = swap_total_bytes > 0
+        && (swap_used_bytes as f64 / swap_total_bytes as f64) >= SURVIVAL_SWAP_PCT_THRESHOLD;
     (memory_pressure >= SOFT_PROTECTION_PRESSURE_THRESHOLD && swap_gb >= SOFT_PROTECTION_SWAP_GB_THRESHOLD)
         || exhausted
+        || pct_exhausted
 }
 
 /// Backward-compatible shim: assumes swap_total is unknown → absolute 4GB floor only.
@@ -1358,6 +1374,31 @@ mod tests {
         ));
         // Back-compat shim: no total known → absolute floor.
         assert!(survival_mode_active(0.50, (4.0 * gib as f64) as u64));
+    }
+
+    /// M1 8GB trap: swap_total = 4 GB makes the absolute 4 GB floor unreachable
+    /// before 100 % saturation. Production observed swap_used = 3.92 GB / 4 GB
+    /// (91 %) with `freezes_applied=0` because survival never activated. The
+    /// percentage trigger (0.85) must fire here.
+    #[test]
+    fn survival_pct_trigger_closes_m1_8gb_trap() {
+        let gib = 1024u64 * 1024 * 1024;
+        let four_gb = 4 * gib;
+        // 91 % of 4 GB swap → percentage trigger fires even with moderate pressure.
+        let used_91 = ((4.0 * gib as f64) * 0.91) as u64;
+        assert!(survival_mode_active_total(0.78, used_91, four_gb));
+        // 80 % of 4 GB → below 0.85 trigger AND below 4 GB absolute → must NOT fire.
+        let used_80 = ((4.0 * gib as f64) * 0.80) as u64;
+        assert!(!survival_mode_active_total(0.50, used_80, four_gb));
+        // 86 % of 4 GB → just above the percentage trigger.
+        let used_86 = ((4.0 * gib as f64) * 0.86) as u64;
+        assert!(survival_mode_active_total(0.50, used_86, four_gb));
+        // 16 GB swap at 14 GB used (87 %) → percentage trigger also fires.
+        assert!(survival_mode_active_total(0.50, 14 * gib, 16 * gib));
+        // 16 GB swap at 13 GB used (81 %) → below pct trigger AND below
+        // 35 % × 16 = 5.6 GB absolute → AND-branch needs pressure ≥ 0.85.
+        // 13 GB > 5.6 GB → exhausted branch fires; survival should be true.
+        assert!(survival_mode_active_total(0.50, 13 * gib, 16 * gib));
     }
 
     /// The hard-protected fast path (OnceLock) must agree with the full set.
