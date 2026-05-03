@@ -1163,6 +1163,7 @@ mod tests {
             natural_drift_ema: 0.01,
             hop_groups: HashMap::new(),
             drift_detector: None,
+            blocked_patterns: HashMap::new(),
         }
     }
 
@@ -1368,6 +1369,7 @@ mod tests {
             natural_drift_ema: -0.5, // out of range
             hop_groups: HashMap::new(),
             drift_detector: None,
+            blocked_patterns: HashMap::new(),
         };
         let mut state = LearnedState {
             version: 1,

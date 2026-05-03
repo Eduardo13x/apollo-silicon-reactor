@@ -1742,6 +1742,8 @@ fn main() -> anyhow::Result<()> {
                 // Thermal pre-throttle freeze/unfreeze.
                 // Extracted to daemon_thermal_freeze::run_thermal_freeze (Wave 20).
                 // M1 Air has no fan — acting 5-10°C ahead of the hardware ceiling.
+                // Passes &mut outcome_tracker (via LearningContext) so blocked
+                // freezes feed the survival-bias closure (shadow-mode-only).
                 daemon_thermal_freeze::run_thermal_freeze(
                     &thermal_action,
                     &state,
@@ -1749,6 +1751,7 @@ fn main() -> anyhow::Result<()> {
                     foreground_pid,
                     snapshot.pressure.memory_pressure,
                     std::path::Path::new(&frozen_state_path),
+                    lctx.outcome_tracker,
                 );
 
                 // HwPredictor: sample hardware signals every 10 cycles (~5s at normal rate).

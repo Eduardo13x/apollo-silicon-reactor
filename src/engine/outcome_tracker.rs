@@ -64,6 +64,72 @@ struct PendingOutcome {
     swap_gb_at_throttle: f64,
 }
 
+// ── Survival-bias closure: blocked-action counterfactual learning ────────────
+//
+// The OutcomeTracker historically only learned from EXECUTED actions. Actions
+// blocked by safety gates (user-protected freeze skip, is_protected_name,
+// budget exhaustion, thermal interrupt, …) were invisible to the learning
+// loop, creating a survival-bias gap: the agent could not distinguish
+//
+//   "this class of action is genuinely bad" (tried, didn't help)
+//   from
+//   "this class of action was never tried" (gated out before execution)
+//
+// The fix:
+//   1. record_blocked() is called at every gate site → enqueues a
+//      PendingBlocked with the pressure snapshot at block time.
+//   2. tick_with_params() resolves old pending blocks: if pressure ROSE in
+//      the next ~15 cycles (≈30s @ 2 Hz, matching the executed-throttle
+//      window), the blocked action receives "would_have_helped" credit —
+//      WITH counterfactual correction via natural_drift_ema [Rubin 1974].
+//   3. blocked_effectiveness(key) returns a Laplace-smoothed Bayesian
+//      score for offline / shadow-mode analysis.
+//
+// IMPORTANT: this signal is SHADOW-MODE-ONLY. It MUST NOT be used to
+// auto-unblock gated actions — the feedback loop risk (system unblocks an
+// action because the journal says it "would have helped", that action then
+// causes user-visible jank, …) is too high. Per NotebookLM peer review
+// 2026-05-03 conversation 379c81af.
+//
+// References:
+//   [Rubin 1974] Potential Outcomes — counterfactual via natural_drift_ema.
+//   [Bengio 2013] Counterfactual reasoning needs the unobserved branch.
+//   [Pearl 2009] do-calculus is the principled tool for full causal
+//     inference; we do NOT need it here because we keep the signal in
+//     prior-only Bayesian shadow mode.
+
+/// Per-(action_class, gate) Bayesian counts for blocked-action learning.
+///
+/// `action_class` is a coarse key (e.g. "freeze", "throttle", "boost") rather
+/// than per-PID — gates typically block whole classes ("user is in a call →
+/// no freezes for ANY pid this cycle"), so per-class is the right grain.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlockedPattern {
+    /// Times this (action_class, gate) was blocked.
+    pub blocked_count: u32,
+    /// Of those blocks, how many had pressure RISE in the post-block window
+    /// (after subtracting natural_drift baseline) — i.e., the action would
+    /// likely have helped.
+    pub would_have_helped_count: u32,
+}
+
+impl BlockedPattern {
+    /// Laplace-smoothed Bayesian estimate that this blocked class was a
+    /// missed opportunity. (1+helped)/(2+blocked). Returns 0.5 with no data.
+    pub fn effectiveness(&self) -> f64 {
+        (self.would_have_helped_count as f64 + 1.0) / (self.blocked_count as f64 + 2.0)
+    }
+}
+
+/// In-flight blocked decision awaiting post-hoc counterfactual evaluation.
+#[derive(Debug, Clone)]
+struct PendingBlocked {
+    /// Composite key "<action_class>:<gate>" — same shape used in queries.
+    key: String,
+    blocked_at: Instant,
+    pressure_before: f64,
+}
+
 /// Resumen de la resolución de un batch de outcomes.
 pub struct OutcomeBatch {
     /// Nombres de procesos cuyo throttle fue efectivo esta ronda.
@@ -393,6 +459,15 @@ pub struct OutcomeTracker {
     /// Processes that respond quickly (effect visible in 10s) get shorter wait times.
     /// Processes that respond slowly keep the default 30s.
     process_effect_time: HashMap<String, f64>,
+
+    // ── Survival-bias closure (blocked actions) ──────────────────────────
+    /// In-flight blocked decisions awaiting post-hoc counterfactual eval.
+    /// Resolved after BLOCKED_EVAL_WINDOW_SECS by `tick_blocked()` /
+    /// `tick_with_params()`. Capped at 300 to bound memory.
+    pending_blocked: VecDeque<PendingBlocked>,
+    /// Per-key Bayesian counts for the survival-bias closure. Key shape:
+    /// `"<action_class>:<gate>"`. Persisted via OutcomeTrackerPersisted.
+    pub blocked_patterns: HashMap<String, BlockedPattern>,
 }
 
 impl OutcomeTracker {
@@ -415,6 +490,8 @@ impl OutcomeTracker {
             hop_groups: HashMap::new(),
             drift_detector: DriftDetector::new(),
             process_effect_time: HashMap::new(),
+            pending_blocked: VecDeque::new(),
+            blocked_patterns: HashMap::new(),
         }
     }
 
@@ -429,6 +506,11 @@ impl OutcomeTracker {
         self.prev_pressure = None;
         self.drift_accumulator = 0.0;
         self.ticks_since_action = 0;
+        // Drop pending blocked observations: their Instants and
+        // pressure_before are stale across sleep, and resolving them now
+        // would inject phantom counterfactual signal. Bayesian counts in
+        // blocked_patterns survive (they are validated, restart-safe).
+        self.pending_blocked.clear();
     }
 
     /// Current NARS drift score [0,1]. High = model has drifted from reality.
@@ -513,6 +595,123 @@ impl OutcomeTracker {
                 self.weights.remove(&weakest_key);
             }
         }
+    }
+
+    // ── Survival-bias closure: blocked-action API ─────────────────────────
+
+    /// Cap on pending blocked observations — analogous to the throttle
+    /// pending cap (300). Bounds memory under bursty gate firing.
+    const BLOCKED_PENDING_CAP: usize = 300;
+    /// Post-block evaluation window in seconds. 30s @ 2 Hz ≈ 15 cycles —
+    /// matches the executed-throttle eval window so "would have helped"
+    /// is comparable to "did help". [Validated by NotebookLM 2026-05-03].
+    const BLOCKED_EVAL_WINDOW_SECS: u64 = 30;
+    /// Threshold (after subtracting natural drift) above which a post-block
+    /// pressure rise is attributed to "the blocked action would have helped".
+    /// 0.02 mirrors the executed-throttle effective_threshold floor; a 2pp
+    /// counterfactual delta above natural drift is a meaningful miss.
+    const BLOCKED_EFFECTIVE_THRESHOLD: f64 = 0.02;
+
+    /// Record that a class of action was blocked by a gate. Drives the
+    /// survival-bias closure: every block enqueues a pending observation
+    /// that `tick_with_params()` will resolve ~30s later by checking
+    /// whether pressure rose by more than natural drift.
+    ///
+    /// `action_class` should be a coarse class string ("freeze",
+    /// "throttle", "boost", …) rather than a per-PID identifier — gates
+    /// typically block at the class level.
+    /// `gate` is the [`crate::engine::blocked_action_journal::BlockerKind`]
+    /// reason, lowercased / dasherized for use as a stable key.
+    /// `pressure_at_block` is the live memory pressure when the block fired.
+    ///
+    /// SHADOW-MODE-ONLY: this signal MUST NOT be used to auto-unblock gated
+    /// actions. The feedback-loop risk (system unblocks an action because
+    /// the journal claims it "would have helped" → that action actually
+    /// causes user-visible jank → journal still says good → loop tightens)
+    /// is too high. Per NotebookLM peer review 2026-05-03.
+    pub fn record_blocked(&mut self, action_class: &str, gate: &str, pressure_at_block: f64) {
+        let key = format!("{}:{}", action_class, gate);
+        let entry = self.blocked_patterns.entry(key.clone()).or_default();
+        entry.blocked_count = entry.blocked_count.saturating_add(1);
+
+        self.pending_blocked.push_back(PendingBlocked {
+            key,
+            blocked_at: Instant::now(),
+            pressure_before: pressure_at_block,
+        });
+
+        // Bound memory: drop oldest unresolved observations under burst.
+        if self.pending_blocked.len() > Self::BLOCKED_PENDING_CAP {
+            let drop_n = self.pending_blocked.len() - (Self::BLOCKED_PENDING_CAP - 100);
+            self.pending_blocked.drain(..drop_n);
+        }
+
+        // Hard cap the patterns map (mirror weights HashMap defense). Evict
+        // the lowest-blocked-count entry so high-count signals are kept.
+        const HOT_PATH_BLOCKED_CAP: usize = 200;
+        if self.blocked_patterns.len() > HOT_PATH_BLOCKED_CAP {
+            if let Some(weakest_key) = self
+                .blocked_patterns
+                .iter()
+                .min_by_key(|(_, p)| p.blocked_count)
+                .map(|(k, _)| k.clone())
+            {
+                self.blocked_patterns.remove(&weakest_key);
+            }
+        }
+    }
+
+    /// Resolve pending blocked observations whose evaluation window has
+    /// elapsed. For each one, compute counterfactual delta = (pressure_now
+    /// - pressure_before) - natural_drift_ema (Rubin 1974 potential
+    /// outcomes). If delta > BLOCKED_EFFECTIVE_THRESHOLD the pressure
+    /// rose more than baseline drift would predict, so the blocked
+    /// action would likely have helped — increment helped count.
+    ///
+    /// Called from `tick_with_params()`; can also be called standalone in
+    /// tests or shadow-mode tools.
+    pub fn tick_blocked(&mut self, current_pressure: f64) {
+        let window = Duration::from_secs(Self::BLOCKED_EVAL_WINDOW_SECS);
+        let drift = self.natural_drift_ema;
+        while let Some(front) = self.pending_blocked.front() {
+            if front.blocked_at.elapsed() < window {
+                break;
+            }
+            let pb = self.pending_blocked.pop_front().unwrap();
+            // Pressure RISE (positive delta) is bad — it means the system
+            // got worse during the block window. natural_drift_ema models
+            // baseline DROP (positive = pressure tends to drop), so the
+            // counterfactual rise above baseline is:
+            //   (current - before) + drift   (drift is drop magnitude)
+            // i.e., we add drift back because not-dropping is the miss.
+            let observed_rise = current_pressure - pb.pressure_before;
+            let counterfactual_rise = observed_rise + drift;
+
+            if counterfactual_rise > Self::BLOCKED_EFFECTIVE_THRESHOLD {
+                if let Some(p) = self.blocked_patterns.get_mut(&pb.key) {
+                    p.would_have_helped_count = p.would_have_helped_count.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Bayesian effectiveness estimate for a blocked (action_class, gate)
+    /// pair. Key shape: `"<action_class>:<gate>"`. Returns Laplace prior
+    /// 0.5 when the pattern has no observations.
+    ///
+    /// Interpretation: high values mean blocks of this class are
+    /// associated with subsequent pressure rises beyond natural drift —
+    /// candidate for offline review of gate calibration.
+    pub fn blocked_effectiveness(&self, action_key: &str) -> f64 {
+        match self.blocked_patterns.get(action_key) {
+            Some(p) => p.effectiveness(),
+            None => 0.5, // Laplace prior with no data
+        }
+    }
+
+    /// Number of currently pending (unresolved) blocked observations.
+    pub fn blocked_pending_depth(&self) -> usize {
+        self.pending_blocked.len()
     }
 
     /// Resuelve los outcomes pendientes con más de 30s de antigüedad.
@@ -623,6 +822,11 @@ impl OutcomeTracker {
             .filter(|(_, w)| w.is_low_value_vs_baseline(threshold))
             .map(|(name, _)| name.clone())
             .collect();
+
+        // Survival-bias closure: resolve pending blocked observations whose
+        // 30s evaluation window has elapsed. Cheap (HashMap update only) and
+        // shares the same pressure read as the throttle resolver.
+        self.tick_blocked(current_pressure);
 
         OutcomeBatch {
             effective_names,
@@ -1036,6 +1240,7 @@ impl OutcomeTracker {
             natural_drift_ema: self.natural_drift_ema,
             hop_groups: self.hop_groups.clone(),
             drift_detector: Some(self.drift_detector.clone()),
+            blocked_patterns: self.blocked_patterns.clone(),
         }
     }
 
@@ -1058,6 +1263,11 @@ impl OutcomeTracker {
         if let Some(dd) = p.drift_detector {
             self.drift_detector = dd;
         }
+        // Survival-bias closure: restore Bayesian counts. Pending in-flight
+        // blocked observations are NOT persisted (they are bound to live
+        // Instants); they reset on restart, which is correct — pressure
+        // baselines from before a restart are stale anyway.
+        self.blocked_patterns = p.blocked_patterns;
     }
 }
 
@@ -1077,6 +1287,12 @@ pub struct OutcomeTrackerPersisted {
     /// Confidence values are meaningless if beliefs reset every restart.
     #[serde(default)]
     pub drift_detector: Option<DriftDetector>,
+    /// Survival-bias closure: per-(action_class, gate) Bayesian counts of
+    /// blocked actions and their inferred "would_have_helped" outcomes.
+    /// `#[serde(default)]` keeps old learned_state.json files
+    /// deserializable — missing field becomes empty HashMap.
+    #[serde(default)]
+    pub blocked_patterns: HashMap<String, BlockedPattern>,
 }
 
 #[cfg(test)]
@@ -2388,6 +2604,262 @@ mod tests {
             b1.effective_names.len(),
             b2.effective_names.len(),
             "record_throttle_with_swap must resolve same as record_throttle"
+        );
+    }
+
+    // ── Survival-bias closure: blocked-action tests ─────────────────────────
+
+    /// Test 1: record_blocked increments per-key counter under composite
+    /// key "<class>:<gate>" and survives multiple gates for the same class.
+    #[test]
+    fn record_blocked_increments_counter() {
+        let mut tracker = OutcomeTracker::new();
+
+        tracker.record_blocked("freeze", "is-protected-name", 0.65);
+        tracker.record_blocked("freeze", "is-protected-name", 0.70);
+        tracker.record_blocked("freeze", "user-protected", 0.72);
+        tracker.record_blocked("throttle", "is-protected-name", 0.55);
+
+        let p_proto = tracker
+            .blocked_patterns
+            .get("freeze:is-protected-name")
+            .expect("freeze:is-protected-name pattern present");
+        assert_eq!(p_proto.blocked_count, 2, "two same-key blocks → count 2");
+        assert_eq!(p_proto.would_have_helped_count, 0);
+
+        let p_user = tracker
+            .blocked_patterns
+            .get("freeze:user-protected")
+            .expect("freeze:user-protected pattern present");
+        assert_eq!(p_user.blocked_count, 1);
+
+        let p_throttle = tracker
+            .blocked_patterns
+            .get("throttle:is-protected-name")
+            .expect("throttle:is-protected-name pattern present");
+        assert_eq!(p_throttle.blocked_count, 1);
+
+        // Pending observations enqueued for later counterfactual eval.
+        assert_eq!(
+            tracker.blocked_pending_depth(),
+            4,
+            "pending blocked queue must hold all 4 observations"
+        );
+    }
+
+    /// Test 2: blocked_effectiveness returns Bayesian Laplace prior 0.5
+    /// when the pattern has no observations, and tracks prior correctly
+    /// for low-count patterns. Counts < 3 should remain near the 0.5
+    /// prior to avoid drawing strong conclusions from noise.
+    #[test]
+    fn blocked_effectiveness_returns_bayesian_prior_when_undersampled() {
+        let mut tracker = OutcomeTracker::new();
+
+        // No data → exactly the 0.5 Laplace prior.
+        let unknown = tracker.blocked_effectiveness("freeze:user-protected");
+        assert!(
+            (unknown - 0.5).abs() < 1e-9,
+            "Laplace prior must be 0.5 with no data, got {}",
+            unknown
+        );
+
+        // 1 block, 0 helped → (0+1)/(1+2) = 0.333… (still close to prior).
+        tracker.record_blocked("freeze", "user-protected", 0.60);
+        let one_block = tracker.blocked_effectiveness("freeze:user-protected");
+        assert!(
+            (one_block - (1.0 / 3.0)).abs() < 1e-9,
+            "expected 1/3 with 1 block 0 helped, got {}",
+            one_block
+        );
+
+        // 2 blocks, 1 helped (manually inject) → (1+1)/(2+2) = 0.5.
+        // Verifies the formula and that we converge correctly.
+        tracker.record_blocked("freeze", "user-protected", 0.65);
+        if let Some(p) = tracker.blocked_patterns.get_mut("freeze:user-protected") {
+            p.would_have_helped_count = 1;
+        }
+        let half = tracker.blocked_effectiveness("freeze:user-protected");
+        assert!(
+            (half - 0.5).abs() < 1e-9,
+            "expected 0.5 with 2 blocks 1 helped, got {}",
+            half
+        );
+
+        // Undersample (count<3): still close to 0.5 prior. This is the
+        // explicit "Bayesian with prior correct when count<3" property.
+        assert!(
+            tracker
+                .blocked_patterns
+                .get("freeze:user-protected")
+                .map(|p| p.blocked_count < 3)
+                .unwrap_or(false),
+            "test precondition: blocked_count must be <3 for prior dominance"
+        );
+    }
+
+    /// Test 3: serialization roundtrip — blocked_patterns survives a full
+    /// to_persisted → JSON → from JSON → restore cycle, including counts.
+    #[test]
+    fn blocked_patterns_persistence_roundtrip() {
+        // Stage state with non-trivial counts.
+        let mut original = OutcomeTracker::new();
+        original.record_blocked("freeze", "is-protected-name", 0.70);
+        original.record_blocked("freeze", "is-protected-name", 0.72);
+        original.record_blocked("freeze", "is-protected-name", 0.74);
+        if let Some(p) = original
+            .blocked_patterns
+            .get_mut("freeze:is-protected-name")
+        {
+            p.would_have_helped_count = 1;
+        }
+        original.record_blocked("throttle", "user-protected", 0.55);
+
+        // Serialize → JSON → deserialize.
+        let snapshot = original.to_persisted();
+        let json =
+            serde_json::to_string(&snapshot).expect("OutcomeTrackerPersisted serializes to JSON");
+
+        // Forward-compat: old files (no blocked_patterns key) must still
+        // deserialize with serde(default) → empty map. Test that explicitly.
+        assert!(
+            json.contains("\"blocked_patterns\""),
+            "expected blocked_patterns field in serialized JSON, got: {}",
+            json
+        );
+
+        let parsed: OutcomeTrackerPersisted =
+            serde_json::from_str(&json).expect("JSON roundtrips back to OutcomeTrackerPersisted");
+
+        // Restore into a fresh tracker.
+        let mut restored = OutcomeTracker::new();
+        restored.restore(parsed);
+
+        let p_freeze = restored
+            .blocked_patterns
+            .get("freeze:is-protected-name")
+            .expect("freeze pattern restored");
+        assert_eq!(p_freeze.blocked_count, 3);
+        assert_eq!(p_freeze.would_have_helped_count, 1);
+
+        let p_throttle = restored
+            .blocked_patterns
+            .get("throttle:user-protected")
+            .expect("throttle pattern restored");
+        assert_eq!(p_throttle.blocked_count, 1);
+        assert_eq!(p_throttle.would_have_helped_count, 0);
+
+        // Effectiveness query reproduces correctly post-restore.
+        let eff = restored.blocked_effectiveness("freeze:is-protected-name");
+        // (1+1)/(3+2) = 0.4
+        assert!(
+            (eff - 0.4).abs() < 1e-9,
+            "post-restore effectiveness must equal pre-persist computation, got {}",
+            eff
+        );
+    }
+
+    /// Bonus: forward-compat — old persisted blob without blocked_patterns
+    /// key deserializes to empty map (not error), thanks to #[serde(default)].
+    #[test]
+    fn blocked_patterns_missing_field_deserializes_to_empty() {
+        // Hand-built JSON missing the blocked_patterns key (simulates old
+        // learned_state.json files written before this commit).
+        let legacy_json = r#"{
+            "weights": {},
+            "total_effective": 0,
+            "total_resolved": 0,
+            "baseline_drop_ema": 0.0,
+            "baseline_samples": 0,
+            "experience_records": [],
+            "co_occurrence": [],
+            "natural_drift_ema": 0.0,
+            "hop_groups": {}
+        }"#;
+
+        let parsed: OutcomeTrackerPersisted = serde_json::from_str(legacy_json)
+            .expect("legacy JSON without blocked_patterns must still parse");
+        assert!(
+            parsed.blocked_patterns.is_empty(),
+            "missing blocked_patterns must default to empty map"
+        );
+    }
+
+    /// Counterfactual resolver: pressure rising > drift baseline within
+    /// the eval window must promote blocked_count → would_have_helped_count.
+    #[test]
+    fn tick_blocked_credits_post_block_pressure_rise() {
+        let mut tracker = OutcomeTracker::new();
+        // Natural drift EMA = 0 (presure stable on its own).
+        tracker.natural_drift_ema = 0.0;
+
+        // Block a freeze at pressure 0.50.
+        tracker.record_blocked("freeze", "is-protected-name", 0.50);
+        // Backdate to past the eval window.
+        tracker.pending_blocked[0].blocked_at = Instant::now() - Duration::from_secs(35);
+
+        // 35s later pressure rose to 0.60 → counterfactual rise +0.10
+        // is well above the 0.02 effective threshold. Block was a miss.
+        tracker.tick_blocked(0.60);
+        let p = tracker
+            .blocked_patterns
+            .get("freeze:is-protected-name")
+            .expect("pattern present");
+        assert_eq!(p.blocked_count, 1);
+        assert_eq!(
+            p.would_have_helped_count, 1,
+            "post-block pressure rise above drift must promote helped count"
+        );
+        assert_eq!(
+            tracker.blocked_pending_depth(),
+            0,
+            "resolved observation must drain from pending queue"
+        );
+    }
+
+    /// Counterfactual resolver: pressure that DROPPED naturally must NOT
+    /// give the blocked action credit (no missed opportunity).
+    #[test]
+    fn tick_blocked_does_not_credit_natural_drop() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.natural_drift_ema = 0.05; // baseline drops 5pp / window
+
+        tracker.record_blocked("freeze", "is-protected-name", 0.70);
+        tracker.pending_blocked[0].blocked_at = Instant::now() - Duration::from_secs(35);
+
+        // Pressure dropped to 0.65 (rise = -0.05). Counterfactual = -0.05
+        // + drift 0.05 = 0.00, well below the 0.02 threshold.
+        tracker.tick_blocked(0.65);
+        let p = tracker
+            .blocked_patterns
+            .get("freeze:is-protected-name")
+            .expect("pattern present");
+        assert_eq!(p.blocked_count, 1);
+        assert_eq!(
+            p.would_have_helped_count, 0,
+            "natural pressure drop must NOT credit blocked action"
+        );
+    }
+
+    /// reset_after_wake clears in-flight pending blocks but preserves
+    /// learned Bayesian counts (those are restart-safe by design).
+    #[test]
+    fn reset_after_wake_clears_pending_blocked_but_preserves_counts() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.record_blocked("freeze", "is-protected-name", 0.60);
+        tracker.record_blocked("freeze", "user-protected", 0.65);
+        assert_eq!(tracker.blocked_pending_depth(), 2);
+        assert_eq!(tracker.blocked_patterns.len(), 2);
+
+        tracker.reset_after_wake();
+        assert_eq!(
+            tracker.blocked_pending_depth(),
+            0,
+            "pending blocked queue must drain on wake (stale Instants)"
+        );
+        assert_eq!(
+            tracker.blocked_patterns.len(),
+            2,
+            "learned Bayesian counts must survive wake"
         );
     }
 }

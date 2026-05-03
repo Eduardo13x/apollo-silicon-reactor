@@ -21,6 +21,7 @@ use apollo_optimizer::collector::SystemCollector;
 use apollo_optimizer::engine::daemon_helpers::{unfreeze_pids, write_frozen_state};
 use apollo_optimizer::engine::daemon_state::SharedState;
 use apollo_optimizer::engine::lock_ext::LockRecover;
+use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
 use apollo_optimizer::engine::process_identity::ProcessIdentity;
 use apollo_optimizer::engine::safety::is_protected_name;
 use apollo_optimizer::engine::thermal_bailout::ThermalAction;
@@ -36,6 +37,10 @@ use chrono::Utc;
 /// - `foreground_pid` — current foreground PID (never frozen thermally)
 /// - `memory_pressure` — effective memory pressure for this cycle
 /// - `frozen_state_path` — path to persist frozen state JSON
+/// - `outcome_tracker` — recipient of survival-bias closure events: each
+///   freeze candidate skipped here is `record_blocked` so the learning
+///   loop can later infer (counterfactually) whether the block was a
+///   missed opportunity. SHADOW-MODE-ONLY signal.
 pub fn run_thermal_freeze(
     thermal_action: &ThermalAction,
     state: &SharedState,
@@ -43,6 +48,7 @@ pub fn run_thermal_freeze(
     foreground_pid: Option<u32>,
     memory_pressure: f64,
     frozen_state_path: &Path,
+    outcome_tracker: &mut OutcomeTracker,
 ) {
     if thermal_action.freeze_background || thermal_action.freeze_all_non_critical {
         let policy_protected = state
@@ -63,6 +69,25 @@ pub fn run_thermal_freeze(
             let pid_u32 = pid.as_u32();
             let name = process.name().to_string();
             let cpu = process.cpu_usage();
+            // Survival-bias closure: when is_protected_name blocks a freeze
+            // candidate that otherwise qualified (cpu/foreground/duplicate
+            // checks already passed), record the block so OutcomeTracker can
+            // post-hoc infer whether the protection was a missed opportunity.
+            // Only the is_protected_name branch is recorded; the other
+            // skip reasons (foreground, already-frozen, apollo itself,
+            // policy-protected user pattern) are not learning signals.
+            //
+            // [Bengio 2013] Counterfactual reasoning needs the unobserved
+            // branch. SHADOW-MODE-ONLY — never used to auto-unblock.
+            if cpu <= cpu_threshold
+                && Some(pid_u32) != foreground_pid
+                && !frozen_guard.contains_key(&pid_u32)
+                && name != "apollo-optimizerd"
+                && !policy_protected.iter().any(|p| name.contains(p.as_str()))
+                && is_protected_name(&name)
+            {
+                outcome_tracker.record_blocked("freeze", "is-protected-name", memory_pressure);
+            }
             if cpu > cpu_threshold
                 || Some(pid_u32) == foreground_pid
                 || is_protected_name(&name)
