@@ -65,6 +65,8 @@ pub fn run_pre_sleep_unfreeze(
     // Turbo PIDs live in frozen_guard too, so this covers both regular + turbo.
     let count = unfreeze_pids_verified(&frozen_guard);
     if count > 0 {
+        // Snapshot thawed PIDs before clearing for cooldown bookkeeping.
+        let thawed_pids: Vec<u32> = frozen_guard.keys().copied().collect();
         tracing::info!(
             count,
             "pre-sleep: released {} frozen PID(s) — \
@@ -73,7 +75,16 @@ pub fn run_pre_sleep_unfreeze(
         );
         frozen_guard.clear();
         write_frozen_state(frozen_state_path, &frozen_guard);
+        drop(frozen_guard);
         state.metrics.lock_recover().metrics.unfreezes_applied += count;
+        // Mark thawed PIDs in cooldown to prevent gate_e re-freeze oscillation.
+        // [Nygard 2018] §8.5 — circuit breaker hold-down after recovery.
+        {
+            let mut cooldown = state.freeze_cooldown.lock_recover();
+            for pid in &thawed_pids {
+                cooldown.mark_thawed(*pid);
+            }
+        }
     }
     display_turbo.clear_frozen();
     sleep_notifier.acknowledge();

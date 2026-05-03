@@ -130,6 +130,14 @@ pub fn run_turbo_tick(
             }
             write_frozen_state(frozen_state_path, &frozen_guard);
             drop(frozen_guard);
+            // Mark thawed PIDs in cooldown to prevent gate_e re-freeze oscillation.
+            // [Nygard 2018] §8.5 — circuit breaker hold-down after recovery.
+            {
+                let mut cooldown = state.freeze_cooldown.lock_recover();
+                for pid in &pids {
+                    cooldown.mark_thawed(*pid);
+                }
+            }
             // Clear turbo internal state so stale PIDs don't block re-freeze on
             // the next display-off cycle.
             display_turbo.clear_frozen();

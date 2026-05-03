@@ -84,6 +84,15 @@ pub fn run_wake_unfreeze(
         write_frozen_state(frozen_state_path, &frozen_guard);
     }
 
+    // Mark thawed PIDs in cooldown to prevent gate_e re-freeze oscillation.
+    // [Nygard 2018] §8.5 — circuit breaker hold-down after recovery.
+    {
+        let mut cooldown = state.freeze_cooldown.lock_recover();
+        for pid in &batch {
+            cooldown.mark_thawed(*pid);
+        }
+    }
+
     // Restore Mach QoS from Background (E-cores) → Normal so
     // processes resume on P-cores. Wake unfreeze is the highest-
     // urgency thaw path (user just returned to desktop), so P-core

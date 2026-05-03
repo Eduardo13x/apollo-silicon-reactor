@@ -1238,6 +1238,10 @@ fn main() -> anyhow::Result<()> {
                 cycle_count += 1;
                 lf_metrics.inc_cycles();
 
+                // Decrement freeze cooldown counters once per cycle.
+                // [Nygard 2018] §8.5 circuit-breaker hold-down decay.
+                state.freeze_cooldown.lock_recover().tick();
+
                 // ── Feature 4: Post-Wake Suppression ─────────────────────────
                 // If more than 30s passed since the last cycle, the system was
                 // sleeping. Apply 60s App-Nap window to all non-essential
