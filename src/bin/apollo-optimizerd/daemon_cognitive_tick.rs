@@ -4,6 +4,14 @@
 //! the daemon main loop as part of the V1.1.0 Strangler Fig pass
 //! [Fowler 2004].
 //!
+//! ## Wave 38 Note: Distinction from `cognitive_tick.rs`
+//!
+//! Despite the similar naming, this module is **not** a duplicate of `cognitive_tick.rs`.
+//! `cognitive_tick.rs` contains the core neurocognitive state pipeline (RewardBus, 
+//! MetaCognition, EpistemicUncertainty, etc.). This file (`daemon_cognitive_tick.rs`) 
+//! contains disjoint pre-execution logic (Specialist Voting, Habituation, User Context) 
+//! that was extracted from `main.rs`. Both are intentional and co-exist safely.
+//!
 //! ## Three blocks
 //!
 //! 1. **Specialist voting + accuracy feedback** (Super Learner ensemble).
