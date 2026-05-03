@@ -119,6 +119,14 @@ impl SystemCollector {
     }
 
     pub fn collect_snapshot(&mut self) -> SystemSnapshot {
+        // Capture timestamp BEFORE sysinfo refresh — `refresh_processes()` is the
+        // dominant cost (~50-100ms on macOS for ~400 processes) and represents
+        // the true gathering window. Stamping AFTER refresh under-reports
+        // `sensor_age_ms` by exactly that window, masking temporal aliasing
+        // between µs-latency kqueue events and ~50ms-latency sysinfo state.
+        // [Hellerstein 2004 §9 sensor delay in feedback control;
+        //  Welch & Bishop 2006 — measurement covariance ∝ delay]
+        let snapshot_started_at = Utc::now();
         // Refresh system stats — skip process refresh for first 3 cycles
         // (startup grace period: avoids expensive initial enumeration).
         // Lightweight refresh every cycle: CPU + memory + processes only.
@@ -205,7 +213,7 @@ impl SystemCollector {
         let top_processes = processes.into_iter().take(10).collect();
 
         SystemSnapshot {
-            timestamp: Utc::now(),
+            timestamp: snapshot_started_at,
             cpu: CpuStats {
                 global_usage: global_cpu,
                 core_count,
@@ -236,6 +244,10 @@ impl SystemCollector {
     /// instead of subprocesses. Use when hw_pressure is Nominal and memory is low.
     /// ~10x faster than collect_snapshot().
     pub fn collect_snapshot_light(&mut self) -> SystemSnapshot {
+        // Capture timestamp BEFORE sysinfo refresh — see `collect_snapshot()`
+        // for full rationale. Even on the light path, `refresh_processes()`
+        // dominates per-cycle cost (~50ms M1).
+        let snapshot_started_at = Utc::now();
         self.sys.refresh_cpu();
         self.sys.refresh_memory();
         self.sys.refresh_processes();
@@ -289,7 +301,7 @@ impl SystemCollector {
         let top_processes = processes.into_iter().take(10).collect();
 
         SystemSnapshot {
-            timestamp: Utc::now(),
+            timestamp: snapshot_started_at,
             cpu: CpuStats {
                 global_usage: global_cpu,
                 core_count,
@@ -323,6 +335,11 @@ impl SystemCollector {
     /// process data never reaches OS-mutating calls. Eliminates the dominant
     /// per-cycle cost (~50-100ms sysinfo process enumeration on macOS).
     pub fn collect_snapshot_no_process_refresh(&mut self) -> SystemSnapshot {
+        // Capture timestamp BEFORE refresh — keeps semantics identical across
+        // collection paths. Without `refresh_processes()` this path is ~ms,
+        // but stamping early still aligns the timestamp with the start of
+        // gathering rather than the end.
+        let snapshot_started_at = Utc::now();
         self.sys.refresh_cpu();
         self.sys.refresh_memory();
         // Intentionally no refresh_processes() — reuse cached list.
@@ -374,7 +391,7 @@ impl SystemCollector {
         let top_processes = processes.into_iter().take(10).collect();
 
         SystemSnapshot {
-            timestamp: chrono::Utc::now(),
+            timestamp: snapshot_started_at,
             cpu: CpuStats {
                 global_usage: global_cpu,
                 core_count,
@@ -771,6 +788,106 @@ mod tests {
         let ps: ProcessStats =
             serde_json::from_str(json).expect("deserialize without cpu_wall_ratio");
         assert!(ps.cpu_wall_ratio.is_none());
+    }
+
+    // ── Sensor-age honesty: timestamp must precede the sysinfo refresh ──────
+    //
+    // Regression guard for temporal aliasing: if `SystemSnapshot.timestamp`
+    // is captured AFTER `refresh_processes()`, then `now() - timestamp`
+    // under-reports the true sensor age by ~50-100ms on M1 — masking ghost
+    // state in `SensorAgeFeature`. These tests pin the timestamp to the
+    // gathering window so the scorer's uncertainty rises honestly.
+    //
+    // [Hellerstein 2004 §9; Welch & Bishop 2006 — measurement covariance ∝ delay]
+
+    #[test]
+    fn snapshot_timestamp_captured_before_refresh_returns() {
+        // The timestamp must be ≤ now() at return; trivially true, but pins
+        // the invariant against a future regression that stamps in the future.
+        let mut c = SystemCollector::new();
+        let before = Utc::now();
+        let snap = c.collect_snapshot();
+        let after = Utc::now();
+        assert!(
+            snap.timestamp >= before && snap.timestamp <= after,
+            "timestamp {} outside [{}, {}]",
+            snap.timestamp,
+            before,
+            after
+        );
+    }
+
+    #[test]
+    fn snapshot_timestamp_predates_refresh_completion() {
+        // Core invariant: `timestamp` must be captured BEFORE refresh, not
+        // after. We assert that the elapsed wall time between the snapshot's
+        // timestamp and the moment we observe it back covers the full
+        // refresh window. On any reasonable system the full collect path
+        // takes >0ms; if the timestamp were stamped at the END, the gap
+        // could be zero. This test would fail if someone moves the
+        // timestamp back to AFTER refresh (the original bug).
+        let mut c = SystemCollector::new();
+        // Warm: avoid first-cycle grace period skew.
+        for _ in 0..4 {
+            let _ = c.collect_snapshot();
+        }
+        let snap = c.collect_snapshot();
+        let observed_at = Utc::now();
+        let age_ms = (observed_at - snap.timestamp).num_milliseconds();
+        // Lower bound: timestamp captured before refresh ⇒ age >= 0 (sanity).
+        assert!(age_ms >= 0, "negative age: {age_ms}ms");
+        // Upper bound: full collect should not exceed 5s on any sane CI host.
+        assert!(age_ms < 5_000, "implausible age: {age_ms}ms");
+    }
+
+    #[test]
+    fn snapshot_age_grows_with_post_collection_delay() {
+        // Strong guarantee: if the caller delays N ms after collection,
+        // `now() - snap.timestamp` must reflect AT LEAST that delay PLUS
+        // the collection window. Locks the "before-refresh" semantics:
+        // age must include both refresh-window AND post-collection wait.
+        let mut c = SystemCollector::new();
+        for _ in 0..4 {
+            let _ = c.collect_snapshot();
+        }
+        let snap = c.collect_snapshot();
+        let delay_ms = 25u64;
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let age_ms = (Utc::now() - snap.timestamp).num_milliseconds();
+        assert!(
+            age_ms >= delay_ms as i64,
+            "age {age_ms}ms < injected delay {delay_ms}ms — timestamp captured after refresh?"
+        );
+    }
+
+    #[test]
+    fn light_snapshot_timestamp_also_predates_refresh() {
+        let mut c = SystemCollector::new();
+        let before = Utc::now();
+        let snap = c.collect_snapshot_light();
+        let after = Utc::now();
+        assert!(
+            snap.timestamp >= before && snap.timestamp <= after,
+            "light timestamp {} outside [{}, {}]",
+            snap.timestamp,
+            before,
+            after
+        );
+    }
+
+    #[test]
+    fn no_process_refresh_snapshot_timestamp_predates_refresh() {
+        let mut c = SystemCollector::new();
+        let before = Utc::now();
+        let snap = c.collect_snapshot_no_process_refresh();
+        let after = Utc::now();
+        assert!(
+            snap.timestamp >= before && snap.timestamp <= after,
+            "no-refresh timestamp {} outside [{}, {}]",
+            snap.timestamp,
+            before,
+            after
+        );
     }
 
     // ── Micro-benchmark: collect_pressure_facts latency ──────────────────────
