@@ -223,6 +223,10 @@ pub struct SharedState {
     pub frozen_state: Arc<Mutex<HashMap<u32, FrozenEntry>>>,
     pub mach_qos: Arc<Mutex<MachQoSManager>>,
 
+    /// Per-PID post-thaw cooldown set. Prevents gate_e from re-freezing a PID
+    /// that was just thawed by the TTL path. See `freeze_cooldown` module.
+    pub freeze_cooldown: Arc<Mutex<crate::engine::freeze_cooldown::FreezeCooldown>>,
+
     // Infrastructure (lock-free or low-frequency)
     pub stop: Arc<AtomicBool>,
     /// Set by socket handler when a `RevertSysctls` RPC is received.

@@ -334,6 +334,9 @@ fn main() -> anyhow::Result<()> {
                 })),
 
                 mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
+                freeze_cooldown: Arc::new(Mutex::new(
+                    apollo_optimizer::engine::freeze_cooldown::FreezeCooldown::new(),
+                )),
                 hardware: Arc::new(Mutex::new(HardwareState {
                     last_hw_snapshot: None,
                     sysctl_governor_status: SysctlGovernorStatus {
