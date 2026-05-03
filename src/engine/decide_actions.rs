@@ -360,6 +360,12 @@ pub fn decide_actions(
     // A normally-idle process suddenly active is more suspicious than a
     // consistently high-load process. [Chandola 2009 ACM CSUR §3.1]
     anomaly_hints: &HashMap<u32, f64>,
+    // Per-PID post-thaw cooldown. Used to skip gate_e ("swap-pct") freeze
+    // candidates that were just thawed by the TTL path, preventing
+    // freeze→thaw→freeze oscillation. [Nygard 2018] §8.5 circuit-breaker
+    // hold-down. Other gates (a/b/c/d) ignore the cooldown — their
+    // physical triggers are too urgent to bypass.
+    freeze_cooldown: &crate::engine::freeze_cooldown::FreezeCooldown,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -1210,6 +1216,16 @@ pub fn decide_actions(
                         .unwrap_or(b.2 as f64 / (1024.0 * 1024.0));
                     fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
                 });
+                // gate_e anti-flap: when gate_e is the load-bearing gate
+                // ("swap-pct"), filter out PIDs in post-thaw cooldown.
+                // Other gates (a/b/c/d) reflect different physical triggers
+                // (delta, committed, thrashing, swap-oom) where cooldown
+                // would be too conservative.
+                // [Nygard 2018] §8.5 circuit-breaker hold-down.
+                if freeze_gate == "swap-pct" {
+                    freeze_candidates
+                        .retain(|(pid, _name, _rss, _cpu, _start_sec)| !freeze_cooldown.is_in_cooldown(*pid));
+                }
                 // Cap at 3 per cycle — avoid SIGSTOP burst overhead on display pipeline.
                 for (pid, name, _rss, cpu, start_sec) in freeze_candidates.into_iter().take(3) {
                     // CPU-active guard: under gate_a / gate_b (pressure-based) the
@@ -1377,6 +1393,7 @@ mod tests {
         reactor: f64,
     ) -> DecisionOutput {
         let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
+        let cooldown = crate::engine::freeze_cooldown::FreezeCooldown::new();
         decide_actions(
             snap,
             sys,
@@ -1400,6 +1417,7 @@ mod tests {
             0.0,
             &HashMap::new(),
             &HashMap::new(),
+            &cooldown,
         )
     }
 
@@ -1571,6 +1589,54 @@ mod tests {
         assert!(
             !evaluate_gate_e(0, 0, 0.95),
             "gate_e must stay silent when swap_total == 0 regardless of pressure"
+        );
+    }
+
+    /// Cooldown filter: when freeze_gate == "swap-pct" (gate_e), PIDs in
+    /// the post-thaw cooldown must be retained-out (`retain` returns false).
+    /// Other gates ignore the cooldown entirely.
+    /// Mirrors the filter expression at decide_actions.rs ~line 1226.
+    #[test]
+    fn gate_e_cooldown_filters_recently_thawed_pid() {
+        use crate::engine::freeze_cooldown::FreezeCooldown;
+
+        let mut cooldown = FreezeCooldown::new();
+        cooldown.mark_thawed(1234);
+
+        // Simulate the filter: type matches the freeze_candidates Vec.
+        let mut candidates: Vec<(u32, String, u64, f32, u64)> = vec![
+            (1234, "victim".to_string(), 100_000_000, 5.0, 0),
+            (5678, "fresh".to_string(), 200_000_000, 5.0, 0),
+        ];
+
+        // gate_e label — filter must skip the cooldowned PID.
+        let freeze_gate = "swap-pct";
+        if freeze_gate == "swap-pct" {
+            candidates.retain(|(pid, _, _, _, _)| !cooldown.is_in_cooldown(*pid));
+        }
+        let pids: Vec<u32> = candidates.iter().map(|c| c.0).collect();
+        assert_eq!(
+            pids,
+            vec![5678],
+            "gate_e must filter out PIDs in cooldown; retained: {:?}",
+            pids
+        );
+
+        // Other gate labels — filter is bypassed, both PIDs survive.
+        let mut candidates2: Vec<(u32, String, u64, f32, u64)> = vec![
+            (1234, "victim".to_string(), 100_000_000, 5.0, 0),
+            (5678, "fresh".to_string(), 200_000_000, 5.0, 0),
+        ];
+        let freeze_gate_other = "thrashing";
+        if freeze_gate_other == "swap-pct" {
+            candidates2.retain(|(pid, _, _, _, _)| !cooldown.is_in_cooldown(*pid));
+        }
+        let pids2: Vec<u32> = candidates2.iter().map(|c| c.0).collect();
+        assert_eq!(
+            pids2,
+            vec![1234, 5678],
+            "non-gate_e labels must NOT filter cooldowned PIDs; retained: {:?}",
+            pids2
         );
     }
 

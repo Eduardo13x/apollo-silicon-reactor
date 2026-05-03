@@ -112,6 +112,11 @@ pub struct PolicyContext<'a> {
     /// Per-process behavioral anomaly score vs learned hardware counter baseline.
     /// ≥ 3.0 MADs from {ipc, wakeup_rate, disk_mbps} baseline = priority throttle.
     pub anomaly_hints: &'a HashMap<u32, f64>,
+
+    /// Per-PID post-thaw cooldown set. gate_e ("swap-pct") freeze candidates
+    /// in cooldown are skipped to prevent freeze→thaw→freeze oscillation.
+    /// Other gates (a/b/c/d) ignore the cooldown.
+    pub freeze_cooldown: &'a crate::engine::freeze_cooldown::FreezeCooldown,
 }
 
 /// The output returned by [`DecisionStage::run`].
@@ -201,6 +206,7 @@ impl DecisionStage {
             policy.dram_bandwidth_pct,
             policy.io_burst_hints,
             policy.anomaly_hints,
+            policy.freeze_cooldown,
         );
 
         DecisionStageOutput { decision }
@@ -258,6 +264,7 @@ mod tests {
         hops: &'a HashMap<WorkloadHop, HopGroupWeight>,
         causal: &'a HashMap<String, f32>,
         user_ctx: &'a UserContext,
+        cooldown: &'a crate::engine::freeze_cooldown::FreezeCooldown,
     ) -> PolicyContext<'a> {
         PolicyContext {
             decide_interactive: interactive,
@@ -275,6 +282,7 @@ mod tests {
             dram_bandwidth_pct: 0.0,
             io_burst_hints: ipc,
             anomaly_hints: ipc,
+            freeze_cooldown: cooldown,
         }
     }
 
@@ -294,6 +302,7 @@ mod tests {
         let empty_hops: HashMap<WorkloadHop, HopGroupWeight> = HashMap::new();
         let empty_causal: HashMap<String, f32> = HashMap::new();
         let user_ctx = UserContext::default();
+        let cooldown = crate::engine::freeze_cooldown::FreezeCooldown::new();
         let policy = make_policy(
             &empty_interactive,
             &empty_noise,
@@ -303,6 +312,7 @@ mod tests {
             &empty_hops,
             &empty_causal,
             &user_ctx,
+            &cooldown,
         );
 
         let output = stage.run(
@@ -338,6 +348,7 @@ mod tests {
         let empty_hops: HashMap<WorkloadHop, HopGroupWeight> = HashMap::new();
         let empty_causal: HashMap<String, f32> = HashMap::new();
         let user_ctx = UserContext::default();
+        let cooldown = crate::engine::freeze_cooldown::FreezeCooldown::new();
         let policy = make_policy(
             &empty_interactive,
             &empty_noise,
@@ -347,6 +358,7 @@ mod tests {
             &empty_hops,
             &empty_causal,
             &user_ctx,
+            &cooldown,
         );
 
         let output = stage.run(

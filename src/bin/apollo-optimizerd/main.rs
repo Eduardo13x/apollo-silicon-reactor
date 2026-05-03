@@ -3043,6 +3043,13 @@ fn main() -> anyhow::Result<()> {
                         .as_ref()
                         .map(|ir| ir.amc_bandwidth_pct)
                         .unwrap_or(0.0);
+                    // Snapshot the cooldown set under lock, then drop the
+                    // guard so the decision pass holds no mutex on
+                    // freeze_cooldown. Cloning is O(n) over active PIDs
+                    // (typically <30) and avoids holding the lock across
+                    // the full decision computation.
+                    let freeze_cooldown_snapshot =
+                        state.freeze_cooldown.lock_recover().clone();
                     let policy = PolicyContext {
                         decide_interactive: &decide_interactive,
                         decide_noise: &decide_noise,
@@ -3059,6 +3066,7 @@ fn main() -> anyhow::Result<()> {
                         dram_bandwidth_pct,
                         io_burst_hints: &io_burst_hints,
                         anomaly_hints: &anomaly_hints,
+                        freeze_cooldown: &freeze_cooldown_snapshot,
                     };
                     decision_stage
                         .run(
