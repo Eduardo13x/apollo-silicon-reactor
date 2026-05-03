@@ -103,6 +103,43 @@ const MAX_FOREGROUND_FROZEN_CYCLES: u8 = 3;
 /// browser purgeable allocations grow continuously.
 const RE_PURGE_INTERVAL_CYCLES: u64 = 500;
 
+/// Adaptive velocity threshold for `PurgePurgeable` hints, in bytes/sec.
+///
+/// The CPU-level escalation (`DemoteToEcores`) keeps the cheap, reversible
+/// 1 MB/s gate — `PRIO_DARWIN_BG` is turnstile-compatible so demoting under
+/// modest swap pressure is safe load-shedding [Nygard 2018].
+///
+/// Memory-level escalation (`PurgePurgeable` via `mach_vm_purgable_control`)
+/// is *not* free: marking volatile regions causes a measurable page-in burst
+/// when the renderer next touches them, and on M1 8GB the unified-memory
+/// fabric is bandwidth-bound. So we want to fire purgeable hints only when
+/// pressure is high enough that the kernel will likely drop the pages
+/// anyway, AND when there's a sustained swap regime that justifies the
+/// re-touch cost.
+///
+/// Lerp:
+/// |  pressure  | threshold | rationale                                     |
+/// |------------|-----------|-----------------------------------------------|
+/// | ≤ 0.50     | 5.0 MB/s  | Tolerant — only purge during real storms      |
+/// | 0.50–0.85  | linear    | Sensitivity rises with pressure               |
+/// | ≥ 0.85     | 1.0 MB/s  | Critical — match the CPU-demote gate          |
+///
+/// Range source: NotebookLM peer-review (2026-05-03, conversation
+/// `379c81af`). The naive lerp 80→30 MB/s proposed initially was a
+/// "capitulación al OOM" on 8GB hardware: at 30 MB/s the system burns
+/// 1.8 GB/min of swap, which on M1 8GB hits jetsam before Apollo can
+/// react. The graph evidence (commits 7b4ea42, bdd62b7) shows production
+/// disasters trigger between 1–5 MB/s sustained.
+fn adaptive_velocity_threshold_bps(memory_pressure: f32) -> f32 {
+    // Clamp pressure to the active band; below 0.5 the gate is moot
+    // because `velocity_escalate` already requires `current_pressure >= 0.50`
+    // upstream — no purge ever fires at low pressure regardless.
+    let p = memory_pressure.clamp(0.5, 0.85);
+    let frac = (p - 0.5) / 0.35; // 0.0 .. 1.0
+    let mb_per_sec = 5.0 - (frac * 4.0); // 5.0 → 1.0
+    mb_per_sec * 1024.0 * 1024.0
+}
+
 /// Cycles a renderer must wait after a thaw before it can be frozen again.
 /// Post-SIGCONT, the renderer reports CPU=0 while still waking up — without
 /// this guard it immediately looks idle and gets re-frozen, creating the
@@ -871,8 +908,11 @@ impl ChromiumManager {
             // [Denning 1968] working-set; [Nygard 2018] load shedding.
             // PRIO_DARWIN_BG is turnstile-compatible so a UI thread blocked on IPC
             // from a demoted renderer can still elevate it temporarily (commit 97410cd).
-            let velocity_escalate = self.current_swap_velocity_bps > 1_048_576.0
-                && self.current_pressure >= 0.50;
+            // CPU-level escalation: cheap, reversible, turnstile-compatible.
+            // Keep the original 1 MB/s gate so we still shed CPU priority
+            // proactively under modest swap growth.
+            let velocity_escalate =
+                self.current_swap_velocity_bps > 1_048_576.0 && self.current_pressure >= 0.50;
             let demote_eligible = if velocity_escalate {
                 !self.visible_pids.contains(pid)
             } else {
@@ -886,6 +926,20 @@ impl ChromiumManager {
                 self.ecore_count += 1;
             }
 
+            // Memory-level escalation: pressure-adaptive threshold for
+            // `PurgePurgeable`. Purging volatile regions has a non-zero
+            // page-in cost on re-touch (DRAM bandwidth on M1 8GB is the
+            // scarce resource), so we ramp sensitivity with pressure:
+            // tolerant (5 MB/s) at moderate pressure, aggressive (1 MB/s)
+            // at critical. Always gated by `current_pressure >= 0.50` so we
+            // never purge at low pressure regardless of velocity.
+            // [Denning 1968] working set; [NotebookLM 2026-05-03] M1 8GB
+            // bandwidth physics — anything above 5 MB/s is already a
+            // jetsam-storm precursor on this hardware.
+            let mem_threshold_bps = adaptive_velocity_threshold_bps(self.current_pressure);
+            let velocity_escalate_mem =
+                self.current_swap_velocity_bps > mem_threshold_bps && self.current_pressure >= 0.50;
+
             // RAM reclaim path: under velocity escalation we ALSO mark purgeable
             // regions of invisible renderers volatile. The kernel can then drop
             // those pages on demand without SIGSTOP. Cost ~200-500µs per pid.
@@ -897,7 +951,7 @@ impl ChromiumManager {
                 None => true,
                 Some(last) => self.cycle_counter.saturating_sub(*last) >= RE_PURGE_INTERVAL_CYCLES,
             };
-            if velocity_escalate
+            if velocity_escalate_mem
                 && !info.frozen
                 && !self.visible_pids.contains(pid)
                 && due_for_repurge
@@ -2071,11 +2125,13 @@ mod tests {
         );
     }
 
-    /// Velocity-anticipatory escalation: under sustained swap growth (>1 MB/s)
-    /// at moderate pressure (≥0.50), invisible renderers of the FG browser must
-    /// be demoted to E-cores and receive a PurgePurgeable hint — even though the
-    /// baseline `!is_fg_browser` gate would normally exempt them. Visible tabs
-    /// of the same browser stay on P-cores.
+    /// Velocity-anticipatory escalation: under sustained swap growth above the
+    /// adaptive memory-velocity threshold at moderate pressure (≥0.50), invisible
+    /// renderers of the FG browser must be demoted to E-cores and receive a
+    /// PurgePurgeable hint — even though the baseline `!is_fg_browser` gate would
+    /// normally exempt them. Visible tabs of the same browser stay on P-cores.
+    /// Velocity used here (6 MB/s) sits above the adaptive ceiling (5 MB/s @
+    /// pressure=0.50) so it triggers across the whole pressure band.
     #[test]
     fn velocity_escalation_demotes_invisible_fg_browser_renderers() {
         let mut mgr = ChromiumManager::new();
@@ -2102,8 +2158,10 @@ mod tests {
             "FG-browser renderers must NOT be demoted at zero velocity"
         );
 
-        // Escalate: velocity = 2 MB/s. Invisible (402) demoted + purged, visible (401) untouched.
-        mgr.set_velocity_context(2_097_152.0);
+        // Escalate: velocity = 6 MB/s — above the adaptive purge threshold at
+        // every pressure level. Invisible (402) demoted + purged, visible (401)
+        // untouched.
+        mgr.set_velocity_context(6_291_456.0);
         let actions = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
         let demoted_pids: Vec<u32> = actions
             .iter()
@@ -2143,7 +2201,7 @@ mod tests {
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(420, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
         mgr.set_pressure_context(0.60);
-        mgr.set_velocity_context(2_097_152.0); // 2 MB/s — above gate
+        mgr.set_velocity_context(6_291_456.0); // 6 MB/s — above adaptive purge gate (~3.86 MB/s @ p=0.60)
 
         // Cycle 1: first purge fires.
         let cycle1 = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
@@ -2200,7 +2258,7 @@ mod tests {
             (431, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
         ];
         mgr.set_pressure_context(0.60);
-        mgr.set_velocity_context(2_097_152.0);
+        mgr.set_velocity_context(6_291_456.0); // 6 MB/s — above adaptive purge gate (~3.86 MB/s @ p=0.60)
 
         let _ = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
         let drained = mgr.drain_purged_this_cycle();
@@ -2241,6 +2299,109 @@ mod tests {
             purges, 0,
             "Velocity below 1 MB/s gate must NOT emit PurgePurgeable"
         );
+    }
+
+    // ── Adaptive velocity threshold (NotebookLM 2026-05-03) ──────────────────
+
+    /// Adaptive threshold at the low-pressure floor (≥0.50) returns the
+    /// tolerant ceiling (~5 MB/s). Tolerant means: only purge during real
+    /// swap storms when there's still RAM headroom.
+    #[test]
+    fn adaptive_threshold_at_low_pressure_returns_high_floor() {
+        let bps = adaptive_velocity_threshold_bps(0.50);
+        let mb_per_sec = bps / (1024.0 * 1024.0);
+        assert!(
+            (mb_per_sec - 5.0).abs() < 0.01,
+            "At pressure=0.50 threshold must be ~5 MB/s, got {} MB/s",
+            mb_per_sec
+        );
+    }
+
+    /// Adaptive threshold at the high-pressure ceiling (≥0.85) returns the
+    /// aggressive floor (~1 MB/s). Aggressive means: any sustained swap
+    /// growth justifies a purge hint because the kernel is about to drop
+    /// pages anyway.
+    #[test]
+    fn adaptive_threshold_at_high_pressure_returns_low_floor() {
+        let bps = adaptive_velocity_threshold_bps(0.85);
+        let mb_per_sec = bps / (1024.0 * 1024.0);
+        assert!(
+            (mb_per_sec - 1.0).abs() < 0.01,
+            "At pressure=0.85 threshold must be ~1 MB/s, got {} MB/s",
+            mb_per_sec
+        );
+    }
+
+    /// Below the lerp band (pressure < 0.50) the threshold clamps to the
+    /// tolerant ceiling. This is defence-in-depth — the upstream
+    /// `current_pressure >= 0.50` gate already suppresses purging at low
+    /// pressure, but if that gate ever drifts the clamp ensures we don't
+    /// over-purge under healthy memory conditions.
+    #[test]
+    fn adaptive_threshold_clamped_below_min_pressure() {
+        let bps = adaptive_velocity_threshold_bps(0.30);
+        let mb_per_sec = bps / (1024.0 * 1024.0);
+        assert!(
+            (mb_per_sec - 5.0).abs() < 0.01,
+            "Below pressure=0.50 threshold must clamp to 5 MB/s ceiling, got {} MB/s",
+            mb_per_sec
+        );
+    }
+
+    /// Above the lerp band (pressure > 0.85) the threshold clamps to the
+    /// aggressive floor. Going below 1 MB/s would put us at the noise floor
+    /// of the Kalman-filtered `swap_velocity_smooth` sensor and cause
+    /// false-positive purges on every xpcproxy spike.
+    #[test]
+    fn adaptive_threshold_clamped_above_max_pressure() {
+        let bps = adaptive_velocity_threshold_bps(0.95);
+        let mb_per_sec = bps / (1024.0 * 1024.0);
+        assert!(
+            (mb_per_sec - 1.0).abs() < 0.01,
+            "Above pressure=0.85 threshold must clamp to 1 MB/s floor, got {} MB/s",
+            mb_per_sec
+        );
+    }
+
+    /// Anti-thrashing invariant: even when the adaptive memory threshold is
+    /// crossed, `RE_PURGE_INTERVAL_CYCLES` must continue to suppress
+    /// re-emission within the cooldown window. This is the load-bearing
+    /// guard against "page-in storm" — without it, the more sensitive
+    /// adaptive threshold would amplify thrashing instead of dampening it.
+    #[test]
+    fn adaptive_threshold_does_not_bypass_re_purge_interval() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(440, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
+        // High pressure → adaptive threshold = 1 MB/s, so 2 MB/s clearly
+        // crosses it cycle after cycle.
+        mgr.set_pressure_context(0.85);
+        mgr.set_velocity_context(2_097_152.0);
+
+        // Cycle 1: first purge fires.
+        let cycle1 = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        let p1 = cycle1
+            .iter()
+            .filter(|a| matches!(a, ChromiumAction::PurgePurgeable { .. }))
+            .count();
+        assert_eq!(p1, 1, "First cycle under adaptive threshold must purge");
+
+        // Cycles 2..N (N < RE_PURGE_INTERVAL_CYCLES): cooldown holds even
+        // though velocity stays above the (now-aggressive) threshold.
+        for i in 0..(RE_PURGE_INTERVAL_CYCLES - 2) {
+            let actions = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+            let p = actions
+                .iter()
+                .filter(|a| matches!(a, ChromiumAction::PurgePurgeable { .. }))
+                .count();
+            assert_eq!(
+                p,
+                0,
+                "Re-purge must NOT fire at cycle offset {} despite adaptive gate open",
+                i + 2
+            );
+        }
     }
 
     /// Bug fix #3: FreezeSource::ChromiumManager must exist as distinct variant.
