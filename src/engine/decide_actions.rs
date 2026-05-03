@@ -276,6 +276,27 @@ fn top_blockers(
     blockers
 }
 
+/// Evaluate freeze Gate E: relative swap floor + memory pressure floor.
+///
+/// Returns `true` when the system is at the kernel's practical compressor
+/// limit (`swap_pct >= 0.85`) AND memory pressure is sustained
+/// (`memory_pressure >= 0.70`). Acts as a last-resort freeze trigger when
+/// gate_d zombifies on M1 8GB (slow swap growth defeats hazard model).
+///
+/// `swap_total_bytes == 0` returns `false` (no swap configured / pre-init).
+pub(crate) fn evaluate_gate_e(
+    swap_used_bytes: u64,
+    swap_total_bytes: u64,
+    memory_pressure: f64,
+) -> bool {
+    let swap_pct = if swap_total_bytes > 0 {
+        swap_used_bytes as f64 / swap_total_bytes as f64
+    } else {
+        0.0
+    };
+    swap_pct >= 0.85 && memory_pressure >= 0.70
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn decide_actions(
     snapshot: &SystemSnapshot,
@@ -1008,8 +1029,7 @@ pub fn decide_actions(
             // sustained-but-stable high swap with moderate memory pressure.
             // [Camacho 2007] predictive control outperforms reactive snapshots.
             let swap_ratio_d = if snapshot.pressure.swap_total_bytes > 0 {
-                snapshot.pressure.swap_used_bytes as f64
-                    / snapshot.pressure.swap_total_bytes as f64
+                snapshot.pressure.swap_used_bytes as f64 / snapshot.pressure.swap_total_bytes as f64
             } else {
                 0.0
             };
@@ -1017,6 +1037,39 @@ pub fn decide_actions(
             let gate_d = swap_ratio_d >= 0.70
                 && p_oom_d >= 0.35
                 && snapshot.pressure.memory_pressure >= 0.60;
+
+            // Gate E: relative swap floor + pressure — last-resort when gate_d zombified.
+            //
+            // Problem: gate_d uses swap_ratio >= 0.70 + p_oom_30s >= 0.35. M1 8GB hazard model
+            // has weak signal under slow swap growth (no spike → no delta → low p_oom), and
+            // macOS swap_total expansion can keep ratio below 0.70 for hours of real stress.
+            // Production observation: 4GB swap used, pressure=0.70, ratio stuck at ~0.50
+            // because swap_total grew to 8GB+. Result: 0 freezes in thousands of cycles.
+            //
+            // Solution: physical signals trump probabilistic ones at high absolute swap
+            // utilization. swap_pct >= 0.85 means the kernel is at its practical compressor
+            // limit regardless of swap_total magnitude.
+            //
+            // Cooldown: per-process MAX_FROZEN_CYCLES=150 (planner) is the load-bearing
+            // anti-flap mechanism at the individual-PID level. Gate-level cooldown is
+            // unnecessary because the per-process guard already prevents oscillation on
+            // the candidate that was just thawed. Precedent: commit 8155755 added
+            // hysteresis to log_ingester for the same reason on M1 8GB.
+            //
+            // Rejected absolute-GB version (per NotebookLM peer review citing commit
+            // 602c993): swap_used_gb >= 3.5 would trip on healthy 3-4GB workloads with
+            // fluidity 0.968. Relative swap_pct preserves headroom semantics across
+            // dynamic swap_total expansion.
+            //
+            // [Denning 1968] Working Set Model — physical page absence is binary failure;
+            // no probability needed when no page room remains.
+            // [Camacho 2007] predictive control must ground in platform topology, not
+            // abstract ratios.
+            let gate_e = evaluate_gate_e(
+                snapshot.pressure.swap_used_bytes,
+                snapshot.pressure.swap_total_bytes,
+                snapshot.pressure.memory_pressure,
+            );
 
             // User in call / media playing: skip freeze — jank is worse than memory pressure.
             if freeze_skip_by_user {
@@ -1056,9 +1109,14 @@ pub fn decide_actions(
                     // u64 range; huge ages (clock skew) saturate harmlessly.
                     sensor_age_ms: {
                         let age = (chrono::Utc::now() - snapshot.timestamp).num_milliseconds();
-                        if age < 0 { Some(0u64) } else { Some(age as u64) }
+                        if age < 0 {
+                            Some(0u64)
+                        } else {
+                            Some(age as u64)
+                        }
                     },
-                    epistemic_uncertainty: crate::engine::shadow_signals::get_epistemic_uncertainty(),
+                    epistemic_uncertainty: crate::engine::shadow_signals::get_epistemic_uncertainty(
+                    ),
                 };
                 shadow_evaluator_cell().evaluate_blocked(
                     &probe,
@@ -1068,16 +1126,21 @@ pub fn decide_actions(
                 );
             }
             let extreme_freeze_ok =
-                (gate_a || gate_b || gate_c || gate_d) && !freeze_skip_by_user;
+                (gate_a || gate_b || gate_c || gate_d || gate_e) && !freeze_skip_by_user;
             if extreme_freeze_ok {
+                // Severity cascade: gate_d ("swap-oom" with p_oom_30s evidence) wins
+                // over gate_e ("swap-pct" pure-physical) when both fire, preserving
+                // existing journal semantics. gate_e fires only when gate_d zombified.
                 freeze_gate = if gate_a {
                     "delta".to_string()
                 } else if gate_b {
                     "committed".to_string()
                 } else if gate_c {
                     "thrashing".to_string()
-                } else {
+                } else if gate_d {
                     "swap-oom".to_string()
+                } else {
+                    "swap-pct".to_string()
                 };
                 // RSS-rank selection: freeze/throttle the largest-RSS background
                 // processes first — maximum pressure relief per action.
@@ -1461,6 +1524,53 @@ mod tests {
             "compressor > 1.0 should be clamped: {} vs {}",
             score_clamped,
             score_max
+        );
+    }
+
+    // ── gate_e tests (M1 8GB zombified-freezer last-resort) ─────────────
+
+    /// Both thresholds met: gate_e fires.
+    #[test]
+    fn gate_e_fires_at_swap_pct_threshold() {
+        // swap_pct = 0.85, pressure = 0.70 — use exact integer ratio
+        // (85/100) to avoid f64→u64 truncation falling below threshold.
+        let swap_total: u64 = 100 * 1024 * 1024 * 1024;
+        let swap_used: u64 = 85 * 1024 * 1024 * 1024;
+        assert!(
+            evaluate_gate_e(swap_used, swap_total, 0.70),
+            "gate_e must fire when swap_pct >= 0.85 and pressure >= 0.70"
+        );
+    }
+
+    /// Pressure floor not met: gate_e silent even at high swap utilization.
+    #[test]
+    fn gate_e_silent_below_pressure() {
+        let swap_total: u64 = 8 * 1024 * 1024 * 1024;
+        let swap_used: u64 = ((swap_total as f64) * 0.85) as u64;
+        assert!(
+            !evaluate_gate_e(swap_used, swap_total, 0.65),
+            "gate_e must stay silent when pressure < 0.70 even if swap_pct >= 0.85"
+        );
+    }
+
+    /// Swap utilization below 0.85: gate_e silent even at high pressure.
+    #[test]
+    fn gate_e_silent_below_swap_pct() {
+        let swap_total: u64 = 8 * 1024 * 1024 * 1024;
+        let swap_used: u64 = ((swap_total as f64) * 0.80) as u64;
+        assert!(
+            !evaluate_gate_e(swap_used, swap_total, 0.75),
+            "gate_e must stay silent when swap_pct < 0.85 even if pressure >= 0.70"
+        );
+    }
+
+    /// Defensive: zero swap_total (pre-init / no swap) must not divide by zero
+    /// nor accidentally fire. Belt-and-suspenders for the helper's guard.
+    #[test]
+    fn gate_e_silent_when_swap_total_zero() {
+        assert!(
+            !evaluate_gate_e(0, 0, 0.95),
+            "gate_e must stay silent when swap_total == 0 regardless of pressure"
         );
     }
 
