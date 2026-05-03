@@ -47,6 +47,9 @@ use apollo_optimizer::engine::window_sensor::WorkloadIntent;
 /// - `pressure_smooth` — Smoothed memory pressure [0,1].
 /// - `memory_pressure_at_freeze` — Raw pressure at freeze time (stored in FrozenEntry).
 /// - `cycle_count` — Current cycle number (CGWindowList refresh rate gate).
+/// - `swap_velocity_bps` — Kalman-smoothed swap I/O velocity (bytes/sec) from
+///   `signal_digest.swap_velocity_smooth`. Drives anticipatory E-core demotion of
+///   invisible fg-browser tabs before pressure peaks.
 #[allow(clippy::too_many_arguments)]
 pub fn run_chromium_tick(
     chromium_mgr: &mut ChromiumManager,
@@ -61,6 +64,7 @@ pub fn run_chromium_tick(
     pressure_smooth: f32,
     memory_pressure_at_freeze: f64,
     cycle_count: u64,
+    swap_velocity_bps: f32,
 ) {
     // Set to false to re-enable Chromium renderer freezing.
     const CHROMIUM_FREEZE_DISABLED: bool = true;
@@ -79,6 +83,7 @@ pub fn run_chromium_tick(
     chromium_mgr.set_pressure_context(pressure_smooth);
     chromium_mgr.set_arousal_context(arousal_state.level);
     chromium_mgr.set_build_preemption(win_workload_intent == WorkloadIntent::BuildSession);
+    chromium_mgr.set_velocity_context(swap_velocity_bps);
     chromium_mgr.set_fluidity_context(
         fluidity_state.window_op_active(),
         fluidity_state.launch_active,
@@ -118,6 +123,36 @@ pub fn run_chromium_tick(
         m.metrics.chromium_renderers_ecore = cm.ecore_renderers;
         m.metrics.chromium_freed_mb = cm.estimated_freed_mb;
         m.metrics.chromium_browsers_managed = cm.browsers_managed;
+    }
+
+    // Non-SIGSTOP actions run UNCONDITIONALLY. DemoteToEcores uses
+    // PRIO_DARWIN_BG (turnstile-compatible, commit 97410cd) and PurgePurgeable
+    // marks pages volatile via mach_vm_purgable_control — neither triggers the
+    // Brave IPC timeout that motivated CHROMIUM_FREEZE_DISABLED.
+    for action in &chromium_actions {
+        match action {
+            ChromiumAction::DemoteToEcores { pid, name } => {
+                tracing::debug!(
+                    pid = pid,
+                    name = name.as_str(),
+                    "chromium: E-core demotion for background renderer"
+                );
+                let mut qos = state.mach_qos.lock_recover();
+                let _ = qos.set_tier(*pid, SchedulingTier::Background);
+            }
+            ChromiumAction::PurgePurgeable { pid, name } => {
+                let purged =
+                    apollo_optimizer::engine::compressor_aware::purge_purgeable_regions(*pid)
+                        .unwrap_or(0);
+                tracing::debug!(
+                    pid = pid,
+                    name = name.as_str(),
+                    regions_purged = purged,
+                    "chromium: velocity-anticipatory purgeable hint"
+                );
+            }
+            _ => {} // SIGSTOP-related actions handled in the gated block below.
+        }
     }
 
     if !CHROMIUM_FREEZE_DISABLED {
@@ -174,14 +209,9 @@ pub fn run_chromium_tick(
                         if alive { 0.3 } else { 0.8 },
                     );
                 }
-                ChromiumAction::DemoteToEcores { pid, name } => {
-                    tracing::debug!(
-                        pid = pid,
-                        name = name.as_str(),
-                        "chromium: E-core demotion for background renderer"
-                    );
-                    let mut qos = state.mach_qos.lock_recover();
-                    let _ = qos.set_tier(*pid, SchedulingTier::Background);
+                ChromiumAction::DemoteToEcores { .. }
+                | ChromiumAction::PurgePurgeable { .. } => {
+                    // Already handled in the unconditional block above.
                 }
             }
         }

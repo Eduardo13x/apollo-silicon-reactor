@@ -204,6 +204,12 @@ pub enum ChromiumAction {
     ThawRenderer { pid: u32, name: String },
     /// Demote renderer/GPU helper to E-cores via Mach QoS.
     DemoteToEcores { pid: u32, name: String },
+    /// Hint the kernel to reclaim purgeable VM regions of an invisible
+    /// renderer (mach_vm_purgable_control marks pages volatile). Emitted
+    /// alongside DemoteToEcores under sustained swap-velocity escalation.
+    /// Reclaims RAM cross-process without SIGSTOP — the "secret weapon" path
+    /// from commit `456002f`. [Denning 1968] working-set; [Nygard 2018].
+    PurgePurgeable { pid: u32, name: String },
 }
 
 // ── Main Manager ───────────────────────────────────────────────────────────────
@@ -249,6 +255,10 @@ pub struct ChromiumManager {
     prev_fg_browser: Option<String>,
     /// PIDs already sent to E-core demotion — avoid repeat calls each cycle.
     ecore_demoted: HashSet<u32>,
+    /// PIDs that received a purgeable-region hint under velocity escalation.
+    /// Separate from `ecore_demoted` so a renderer first seen at low velocity
+    /// can still be purged the first time velocity escalates above the gate.
+    velocity_purged: HashSet<u32>,
 
     // ── Cognitive context (Enhancement A/B/C) ─────────────────────────────────
     /// FocusMarkov top-N predictions: (app_name, probability, avg_dwell_secs).
@@ -269,6 +279,13 @@ pub struct ChromiumManager {
     /// jetsam BACKGROUND demotion instead so the kernel kills them first under
     /// OOM without the user noticing a frozen tab.
     visible_pids: HashSet<u32>,
+    /// Smoothed swap I/O velocity in bytes/sec, fed from
+    /// `SignalIntelligence.swap_velocity_smooth` (Kalman-filtered). Drives the
+    /// anticipatory E-core demotion gate: under sustained swap growth we
+    /// shed CPU priority from invisible fg-browser tabs *before* pressure
+    /// peaks, instead of waiting for the reactive `is_fg_browser` exemption
+    /// to expire. [Denning 1968] working-set + [Nygard 2018] load shedding.
+    current_swap_velocity_bps: f32,
 }
 
 impl Default for ChromiumManager {
@@ -301,7 +318,17 @@ impl ChromiumManager {
             build_preemption_active: false,
             intelligence: FreezeIntelligence::new(),
             visible_pids: HashSet::new(),
+            current_swap_velocity_bps: 0.0,
+            velocity_purged: HashSet::new(),
         }
+    }
+
+    /// Update smoothed swap velocity (bytes/sec) for anticipatory E-core demotion.
+    /// Source: `SignalIntelligence.swap_velocity_smooth` from `signal_digest`.
+    /// When velocity > 1 MB/s and pressure ≥ 0.50 the gate at the DemoteToEcores
+    /// branch widens to include invisible renderers of the foreground browser.
+    pub fn set_velocity_context(&mut self, swap_velocity_bps: f32) {
+        self.current_swap_velocity_bps = swap_velocity_bps;
     }
 
     /// Update the set of PIDs with visible windows (from CGWindowList).
@@ -709,6 +736,11 @@ impl ChromiumManager {
         // Prune dead PIDs from ecore_demoted set (Bug fix #4)
         self.ecore_demoted
             .retain(|pid| self.renderers.contains_key(pid));
+        // Same prune for the velocity-escalation purge dedup so a recycled PID
+        // is allowed to be purged again (purgeable regions are reset when a
+        // process exits — the new owner has its own region map).
+        self.velocity_purged
+            .retain(|pid| self.renderers.contains_key(pid));
 
         // First pass: per-renderer thaws (non-frozen CPU spike) and E-core demotions
         let pids: Vec<u32> = self.renderers.keys().copied().collect();
@@ -797,12 +829,44 @@ impl ChromiumManager {
             // E-core demotion for non-foreground renderers — deduplicated (Bug fix #4)
             // Only emit once per renderer, not every cycle (mach_qos.set_tier is sticky)
             // (`is_fg_browser` was already computed above for the foreground TTL check.)
-            if !is_fg_browser && !info.frozen && !self.ecore_demoted.contains(pid) {
+            //
+            // Anticipatory escalation: under sustained swap growth (>1 MB/s) at
+            // moderate pressure (≥0.50), drop the `!is_fg_browser` exemption for
+            // *invisible* renderers of the fg browser. Visible tabs (per CGWindowList)
+            // remain on P-cores so the user-facing tab never feels demoted.
+            // [Denning 1968] working-set; [Nygard 2018] load shedding.
+            // PRIO_DARWIN_BG is turnstile-compatible so a UI thread blocked on IPC
+            // from a demoted renderer can still elevate it temporarily (commit 97410cd).
+            let velocity_escalate = self.current_swap_velocity_bps > 1_048_576.0
+                && self.current_pressure >= 0.50;
+            let demote_eligible = if velocity_escalate {
+                !self.visible_pids.contains(pid)
+            } else {
+                !is_fg_browser
+            };
+            if demote_eligible && !info.frozen && !self.ecore_demoted.contains(pid) {
                 actions.push(ChromiumAction::DemoteToEcores {
                     pid: *pid,
                     name: info.name.clone(),
                 });
                 self.ecore_count += 1;
+            }
+
+            // RAM reclaim path: under velocity escalation we ALSO mark purgeable
+            // regions of invisible renderers volatile. The kernel can then drop
+            // those pages on demand without SIGSTOP. Cost ~200-500µs per pid;
+            // bounded by `velocity_purged` dedup so the syscall fires at most once
+            // per renderer lifetime.
+            if velocity_escalate
+                && !info.frozen
+                && !self.visible_pids.contains(pid)
+                && !self.velocity_purged.contains(pid)
+            {
+                actions.push(ChromiumAction::PurgePurgeable {
+                    pid: *pid,
+                    name: info.name.clone(),
+                });
+                self.velocity_purged.insert(*pid);
             }
         }
 
@@ -1037,6 +1101,10 @@ impl ChromiumManager {
                 ChromiumAction::DemoteToEcores { pid, .. } => {
                     self.ecore_demotions += 1;
                     self.ecore_demoted.insert(*pid);
+                }
+                ChromiumAction::PurgePurgeable { .. } => {
+                    // Internal accounting for the purge hint is the
+                    // `velocity_purged` set, already updated at emission time.
                 }
             }
         }
@@ -1959,6 +2027,89 @@ mod tests {
         assert_eq!(
             demotions2, 0,
             "Subsequent cycles must NOT re-emit demotion for same PID"
+        );
+    }
+
+    /// Velocity-anticipatory escalation: under sustained swap growth (>1 MB/s)
+    /// at moderate pressure (≥0.50), invisible renderers of the FG browser must
+    /// be demoted to E-cores and receive a PurgePurgeable hint — even though the
+    /// baseline `!is_fg_browser` gate would normally exempt them. Visible tabs
+    /// of the same browser stay on P-cores.
+    #[test]
+    fn velocity_escalation_demotes_invisible_fg_browser_renderers() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        // Two FG-browser renderers: pid 401 visible, pid 402 invisible.
+        let procs: Vec<(u32, &str, f32, u64)> = vec![
+            (401, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
+            (402, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
+        ];
+        let mut visible: HashSet<u32> = HashSet::new();
+        visible.insert(401);
+        mgr.set_visible_pids(visible);
+        mgr.set_pressure_context(0.60);
+
+        // Baseline: velocity=0 — neither demoted (is_fg_browser exempt).
+        mgr.set_velocity_context(0.0);
+        let baseline = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        let baseline_demotions = baseline
+            .iter()
+            .filter(|a| matches!(a, ChromiumAction::DemoteToEcores { .. }))
+            .count();
+        assert_eq!(
+            baseline_demotions, 0,
+            "FG-browser renderers must NOT be demoted at zero velocity"
+        );
+
+        // Escalate: velocity = 2 MB/s. Invisible (402) demoted + purged, visible (401) untouched.
+        mgr.set_velocity_context(2_097_152.0);
+        let actions = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        let demoted_pids: Vec<u32> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ChromiumAction::DemoteToEcores { pid, .. } => Some(*pid),
+                _ => None,
+            })
+            .collect();
+        let purged_pids: Vec<u32> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ChromiumAction::PurgePurgeable { pid, .. } => Some(*pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            demoted_pids,
+            vec![402],
+            "Velocity escalation must demote ONLY invisible FG-browser renderers"
+        );
+        assert_eq!(
+            purged_pids,
+            vec![402],
+            "Velocity escalation must purge ONLY invisible FG-browser renderers"
+        );
+    }
+
+    /// Velocity gate must NOT fire below threshold (1 MB/s) even at high pressure.
+    /// Catches regressions where the threshold drifts toward the 512 KB/s
+    /// "swap_growing_fast" sensor (over-aggressive in steady state).
+    #[test]
+    fn velocity_below_1mb_per_sec_does_not_escalate() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        let procs: Vec<(u32, &str, f32, u64)> =
+            vec![(403, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
+        mgr.set_pressure_context(0.80);
+        mgr.set_velocity_context(900_000.0); // 0.9 MB/s — below 1 MB/s gate
+
+        let actions = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        let purges = actions
+            .iter()
+            .filter(|a| matches!(a, ChromiumAction::PurgePurgeable { .. }))
+            .count();
+        assert_eq!(
+            purges, 0,
+            "Velocity below 1 MB/s gate must NOT emit PurgePurgeable"
         );
     }
 

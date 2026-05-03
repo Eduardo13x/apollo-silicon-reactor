@@ -3520,6 +3520,7 @@ fn main() -> anyhow::Result<()> {
                     signal_digest.pressure_smooth as f32,
                     snapshot.pressure.memory_pressure,
                     cycle_count as u64,
+                    signal_digest.swap_velocity_smooth as f32,
                 );
 
                 let policy = SafetyPolicy::for_capabilities(
