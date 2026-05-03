@@ -215,6 +215,94 @@ fn handle_dashboard() -> anyhow::Result<()> {
     }
 }
 
+/// Truncate a string for column-aligned printing. Adds an ellipsis when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else if max <= 1 {
+        s.chars().take(max).collect()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Read the daemon's last `SuggestionOutcome` from `llm_state.json`.
+/// Returns Ok(None) when the file exists but no outcome is present, Err when
+/// the file is unreadable (e.g. running as non-root with 0o600 perms).
+fn read_last_suggestion_outcome(
+) -> anyhow::Result<Option<apollo_optimizer::engine::llm::SuggestionOutcome>> {
+    let candidates = ["/var/lib/apollo/llm_state.json", "/tmp/apollo-llm_state.json"];
+    let mut last_err: Option<anyhow::Error> = None;
+    for path in candidates {
+        match fs::read_to_string(path) {
+            Ok(raw) => {
+                let v: serde_json::Value = serde_json::from_str(&raw)
+                    .with_context(|| format!("parse llm_state at {}", path))?;
+                let outcome = v
+                    .get("last_suggestion_outcome")
+                    .and_then(|x| {
+                        if x.is_null() {
+                            None
+                        } else {
+                            serde_json::from_value(x.clone()).ok()
+                        }
+                    });
+                return Ok(outcome);
+            }
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!("{}: {}", path, e));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no llm_state.json found")))
+}
+
+/// Read the top causal edges from `learned_state.json`, ranked by
+/// `confidence * evidence_count`. The file is world-readable in production,
+/// so this works without elevated privileges.
+fn read_top_causal_edges(
+    limit: usize,
+) -> anyhow::Result<Vec<apollo_optimizer::engine::causal_graph::CausalEdge>> {
+    let candidates = [
+        "/var/lib/apollo/learned_state.json",
+        "/tmp/apollo-learned_state.json",
+    ];
+    let mut last_err: Option<anyhow::Error> = None;
+    for path in candidates {
+        match fs::read_to_string(path) {
+            Ok(raw) => {
+                let v: serde_json::Value = serde_json::from_str(&raw)
+                    .with_context(|| format!("parse learned_state at {}", path))?;
+                let edges_v = match v.get("causal_graph_edges") {
+                    Some(e) if !e.is_null() => e,
+                    _ => return Ok(Vec::new()),
+                };
+                // Persisted shape: Vec<((cause, effect), CausalEdge)>.
+                // We only need the CausalEdge values — the inner struct already
+                // carries `cause` and `effect` fields.
+                let parsed: Vec<((String, String), apollo_optimizer::engine::causal_graph::CausalEdge)> =
+                    serde_json::from_value(edges_v.clone())
+                        .with_context(|| "deserialize causal_graph_edges")?;
+                let mut edges: Vec<apollo_optimizer::engine::causal_graph::CausalEdge> =
+                    parsed.into_iter().map(|(_, e)| e).collect();
+                edges.sort_by(|a, b| {
+                    let sa = a.confidence as f64 * a.evidence_count as f64;
+                    let sb = b.confidence as f64 * b.evidence_count as f64;
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                edges.truncate(limit);
+                return Ok(edges);
+            }
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!("{}: {}", path, e));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no learned_state.json found")))
+}
+
 fn handle_teach_export() -> anyhow::Result<()> {
     // 1. Get current policy
     let policy = match send_request(DaemonRequest::GetLearnedPolicy)? {
@@ -259,6 +347,23 @@ fn handle_teach_export() -> anyhow::Result<()> {
         println!("Protected: {}", policy.protected_patterns.join(", "));
     }
     println!();
+
+    let mut scored: Vec<_> = policy.pattern_weights.iter()
+        .filter(|(_, w)| w.throttle_count >= 3)
+        .collect();
+    scored.sort_by(|a, b| b.1.throttle_count.cmp(&a.1.throttle_count));
+    
+    if !scored.is_empty() {
+        println!("## Causal Pattern Effectiveness (Bayesian, throttle_count >= 3)");
+        println!("(High effectiveness = process causes pressure. Low effectiveness = harmless noise.)");
+        println!("{:<30} {:>10} {:>14}", "Process", "Throttles", "Effectiveness");
+        for (name, w) in scored.into_iter().take(20) {
+            let eff = (w.effective_count as f64 + 1.0) / (w.throttle_count as f64 + 2.0);
+            let tag = if eff < 0.30 { " (HARMLESS)" } else if eff > 0.75 { " (CAUSAL)" } else { "" };
+            println!("{:<30} {:>10} {:>13.1}%{}", name, w.throttle_count, eff * 100.0, tag);
+        }
+        println!();
+    }
 
     println!("## Usage Model — Top 30 by Usage Score (candidates for interactive)");
     println!(
@@ -316,11 +421,126 @@ fn handle_teach_export() -> anyhow::Result<()> {
     );
     println!();
 
+    // ── Effectiveness Notes (Student's Notebook) ─────────────────────────────
+    // Mirrors what the automatic LLM path feeds Gemma in TeacherContext:
+    // pattern_weights filtered by throttle_count >= 3, sorted by effectiveness.
+    println!("## Effectiveness Notes (Student's Notebook)");
+    println!(
+        "# Bayesian effectiveness from pattern_weights (filter: throttle_count >= 3)."
+    );
+    println!(
+        "# was_helpful = effectiveness > 0.5 — empirically validated classifications."
+    );
+    let mut effectiveness_rows: Vec<(String, u32, f64)> = policy
+        .pattern_weights
+        .iter()
+        .filter(|(_, w)| w.throttle_count >= 3)
+        .map(|(name, w)| (name.clone(), w.throttle_count, w.effectiveness()))
+        .collect();
+    effectiveness_rows.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.1.cmp(&a.1))
+    });
+    if effectiveness_rows.is_empty() {
+        println!(
+            "(no patterns yet — daemon needs at least 3 throttle observations per process)"
+        );
+    } else {
+        println!(
+            "{:<3} {:<40} {:>14} {:>14} {:>11}",
+            "#", "Name", "throttle_count", "effectiveness%", "was_helpful"
+        );
+        for (i, (name, count, eff)) in effectiveness_rows.iter().enumerate() {
+            println!(
+                "{:<3} {:<40} {:>14} {:>13.1}% {:>11}",
+                i + 1,
+                truncate(name, 40),
+                count,
+                eff * 100.0,
+                if *eff > 0.5 { "yes" } else { "no" },
+            );
+        }
+    }
+    println!();
+
+    // ── Previous Suggestion Outcome ──────────────────────────────────────────
+    // Read llm_state.json directly. File is 0o600 (root-only); print friendly
+    // hint if unreadable instead of failing.
+    println!("## Previous Suggestion Outcome");
+    match read_last_suggestion_outcome() {
+        Ok(Some(outcome)) => {
+            let verdict = if outcome.pressure_delta < -0.02 {
+                "IMPROVED"
+            } else if outcome.pressure_delta > 0.02 {
+                "WORSENED"
+            } else {
+                "NO_EFFECT"
+            };
+            println!("Verdict: {}", verdict);
+            println!(
+                "Applied at: {} | pressure {:.3} -> {:.3} (delta {:+.3})",
+                outcome.applied_at.to_rfc3339(),
+                outcome.pressure_before,
+                outcome.pressure_after,
+                outcome.pressure_delta,
+            );
+            println!("Rationale: {}", outcome.rationale_snippet);
+        }
+        Ok(None) => {
+            println!("(no prior LLM suggestion outcome on record)");
+        }
+        Err(_) => {
+            println!(
+                "# llm_state.json unreadable — run `sudo apollo-optimizerctl teach export` to include this section."
+            );
+        }
+    }
+    println!();
+
+    // ── Causal Graph — Top Action→Effect Confidences ─────────────────────────
+    // Read learned_state.json directly (no GetCausalGraph endpoint exists).
+    // Top 10 by confidence * evidence_count.
+    println!("## Causal Graph — Top Action→Effect Confidences");
+    println!(
+        "# Apollo's measured cause→effect edges (confidence x evidence rank). What it has actually learned."
+    );
+    match read_top_causal_edges(10) {
+        Ok(edges) if !edges.is_empty() => {
+            println!(
+                "{:<3} {:<40} {:<22} {:>10} {:>9} {:>10}",
+                "#", "action_key", "effect", "confidence", "evidence", "avg_delta"
+            );
+            for (i, edge) in edges.iter().enumerate() {
+                println!(
+                    "{:<3} {:<40} {:<22} {:>9.3} {:>9} {:>+10.4}",
+                    i + 1,
+                    truncate(&edge.cause, 40),
+                    truncate(&edge.effect, 22),
+                    edge.confidence,
+                    edge.evidence_count,
+                    edge.avg_delta,
+                );
+            }
+        }
+        Ok(_) => {
+            println!("(no causal edges with evidence_count >= 3 yet)");
+        }
+        Err(_) => {
+            println!(
+                "# learned_state.json unreadable — run `sudo apollo-optimizerctl teach export` to include this section."
+            );
+        }
+    }
+    println!();
+
     println!("## Instructions for Claude");
-    println!("Analyze the usage model entries and current policy.");
+    println!("Analyze the usage model entries, the causal effectiveness, and current policy.");
     println!("Determine which processes are genuinely interactive (user-facing apps,");
     println!("latency-sensitive audio/video/input) vs background daemons that just");
     println!("happen to run frequently alongside user activity (correlation != causation).");
+    println!("Pay special attention to Causal Pattern Effectiveness: if a process is HARMLESS (<30%),");
+    println!("it does NOT cause memory pressure and should be protected so Apollo stops trying to throttle it.");
     println!();
     println!("Output a JSON file with this exact structure:");
     println!("```json");
