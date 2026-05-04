@@ -23,9 +23,11 @@ mod daemon_warn_limits;
 mod daemon_paging_hints;
 mod daemon_signal_tick;
 mod daemon_skill_tick;
+mod daemon_reactor_tick;
 mod daemon_chromium_tick;
 mod daemon_fluidity_tick;
 mod daemon_cognitive_tick;
+mod daemon_dispatch_tick;
 mod daemon_ctx_switch_tick;
 mod daemon_holt_winters_tick;
 mod daemon_markov_tick;
@@ -1093,7 +1095,7 @@ fn main() -> anyhow::Result<()> {
             // Window session intelligence — updated each cycle by window_sensor.tick().
             // Declared here so they're accessible in both the proc_snaps block and
             // the reactor_weight section which runs after signal_digest computation.
-            use apollo_optimizer::engine::window_sensor::{SessionPhase, WorkloadIntent};
+
             let mut win_session_phase;
             let mut win_workload_intent;
             let mut win_pressure_floor: f64;
@@ -1103,7 +1105,7 @@ fn main() -> anyhow::Result<()> {
             let mut temporal_weekday: u8;
             // Build progress tracker: estimates cargo build completion from
             // rustc process-count dynamics. Informs reactor_weight policy.
-            use apollo_optimizer::engine::build_tracker::{BuildPhase, BuildTracker};
+            use apollo_optimizer::engine::build_tracker::BuildTracker;
             let mut build_tracker = BuildTracker::new();
             let mut wake_unfreeze_queue: VecDeque<u32> = VecDeque::new();
             // PIDs SIGCONT'd via the staggered wake path this cycle.
@@ -2591,149 +2593,26 @@ fn main() -> anyhow::Result<()> {
                     TsatUrgency(reclaim_forecast.t_sat_sec).normalized()
                 };
 
-                // Signal intelligence → reactor_weight boosting.
-                // CUSUM regime shift: pressure drifting up significantly.
-                if signal_digest.regime_shift_up {
-                    reactor_weight = (reactor_weight + 0.3).min(1.0);
-                }
-                // High composite urgency: multiple signals converging on danger.
-                if signal_digest.urgency > 0.7 {
-                    reactor_weight = (reactor_weight + 0.2).min(1.0);
-                }
-                // Entropy anomaly: chaotic process distribution change.
-                if signal_digest.entropy_anomaly > 2.0 {
-                    reactor_weight = (reactor_weight + 0.15).min(1.0);
-                }
-                // SDE sticky-swap: high σ at moderate pressure = oscillation harbinger.
-                // [Øksendal 2003] diffusion term predicts instability before mean crosses threshold.
-                // Threshold: σ > 1MB/s at pressure 0.35–0.65 = pre-crisis zone.
-                if signal_digest.swap_net_rate_volatility > 1_000_000.0
-                    && signal_digest.pressure_smooth > 0.35
-                    && signal_digest.pressure_smooth < 0.65
-                {
-                    reactor_weight = (reactor_weight + 0.10).min(1.0);
-                }
-                // Lyapunov chaos: positive FTLE = exponential divergence in pressure trajectory.
-                // [Wolf et al. 1985 Physica D 16] λ > 0.5 at moderate pressure = regime change.
-                if signal_digest.lyapunov_exponent > 0.5
-                    && signal_digest.pressure_smooth > 0.40
-                {
-                    reactor_weight = (reactor_weight + 0.08).min(1.0);
-                }
-                // Cumulative stress: chronic high urgency boosts reactor even at moderate snapshots.
-                // [Yerkes & Dodson 1908] persistent arousal signals structural problem, not spike.
-                if signal_digest.cumulative_stress > 0.55 {
-                    reactor_weight = (reactor_weight + 0.07).min(1.0);
-                }
-                // HW seasonal anomaly: pressure far above what's normal for this hour.
-                // [Holt 1957, Winters 1960] structural problem, not workload spike.
-                if signal_digest.hw_seasonal_anomaly > 1.5
-                    && holt_winters.observations() >= 24
-                {
-                    reactor_weight = (reactor_weight + 0.06).min(1.0);
-                }
-                // Darwin-Boltzmann anomaly: learned pattern deviation.
-                // Score > 0.5 means the system state deviates significantly from
-                // the Hopfield memory + SAE ensemble's learned "normal" manifold.
-                if signal_digest.transformer_anomaly > 0.5 {
-                    reactor_weight = (reactor_weight + 0.2).min(1.0);
-                }
-                // Feed-forward pressure relief [Hellerstein 2004]: tabs closed or heavy
-                // app terminated → RAM will be freed. Back off reactor_weight for N cycles
-                // instead of waiting for Kalman filter to catch the pressure drop.
-                if window_relief_cycles > 0 {
-                    reactor_weight = (reactor_weight - 0.25).max(0.0);
-                    window_relief_cycles -= 1;
-                }
+                // ── Reactor weight: adaptive modulation ──────────────────────────────
+                // Extracted to daemon_reactor_tick::run_reactor_tick (Wave 39).
+                // [Denning 1968; Pirolli & Card 1999; Hellerstein 2004]
+                reactor_weight = daemon_reactor_tick::run_reactor_tick(daemon_reactor_tick::ReactorTickInput {
+                    signal_digest: &signal_digest,
+                    holt_winters: &holt_winters,
+                    window_relief_cycles: &mut window_relief_cycles,
+                    win_session_phase: &win_session_phase,
+                    win_pressure_floor,
+                    win_workload_intent: &win_workload_intent,
+                    raw_pressure: snapshot.pressure.memory_pressure,
+                    temporal_predictor: &temporal_predictor,
+                    temporal_hour,
+                    temporal_weekday,
+                    build_tracker: &build_tracker,
+                    amx_available,
+                    llm_active,
+                    base_reactor_weight: reactor_weight,
+                });
 
-                // Session phase feed-forward [Pirolli & Card 1999].
-                // Ramping = user is expanding session → expect pressure rise → pre-position.
-                // WindingDown = already handled by window_relief_cycles above.
-                if win_session_phase == SessionPhase::Ramping {
-                    reactor_weight = (reactor_weight + 0.15).min(1.0);
-                }
-
-                // Pressure floor correction [Denning 1968].
-                // If current pressure is largely "explained" by the browser's working set,
-                // dial back reactor aggressiveness. 13 tabs → floor=0.156: pressure of
-                // 0.65 is not an emergency — it's the expected baseline for this session.
-                let raw_pressure = snapshot.pressure.memory_pressure;
-                if win_pressure_floor > 0.08 && raw_pressure < win_pressure_floor + 0.15 {
-                    reactor_weight = (reactor_weight - win_pressure_floor * 0.5).max(0.0);
-                }
-
-                // Workload intent adjustments [Yang et al. 2013 PowerAPI].
-                // Apollo applies workload-specific resource policy based on what the
-                // user is actually doing — inferred from process signatures.
-                match win_workload_intent {
-                    WorkloadIntent::AISession => {
-                        // Ollama/Python inference: high memory IS expected and intentional.
-                        // Don't be aggressive while AI inference is running.
-                        // Conservative: only back off if pressure is not critical.
-                        if raw_pressure < 0.85 {
-                            reactor_weight = (reactor_weight - 0.20).max(0.0);
-                        }
-                    }
-                    WorkloadIntent::ResearchSession => {
-                        // Many tabs open: renderer memory is load-bearing for the user's
-                        // research context. Back off moderately — don't freeze their tabs.
-                        if raw_pressure < 0.80 {
-                            reactor_weight = (reactor_weight - 0.10).max(0.0);
-                        }
-                    }
-                    WorkloadIntent::BuildSession => {
-                        // Build session: cargo/rustc need RAM and CPU priority.
-                        // Boost slightly so Apollo acts faster to clear non-build memory.
-                        reactor_weight = (reactor_weight + 0.10).min(1.0);
-                    }
-                    WorkloadIntent::MediaSession => {
-                        // Media playing: avoid heavy I/O actions (sysctl writes, spotlight)
-                        // that could cause audio glitches. Slight back-off.
-                        if raw_pressure < 0.75 {
-                            reactor_weight = (reactor_weight - 0.08).max(0.0);
-                        }
-                    }
-                    WorkloadIntent::General => {}
-                }
-
-                // Temporal pre-positioning [Denning 1968 Working Set Model].
-                // Pre-carve headroom before predicted heavy app arrives.
-                // Skip when build is already active: BuildTracker handles the boost
-                // and adding temporal headroom on top would double-count the signal.
-                let temporal_headroom = temporal_predictor
-                    .pressure_headroom_for_incoming(temporal_hour, temporal_weekday);
-                if temporal_headroom > 0.02 && !build_tracker.build_active {
-                    reactor_weight = (reactor_weight + temporal_headroom).min(1.0);
-                }
-
-                // Build progress [McKenney 2004]: rustc-count dynamics proxy.
-                // Starting phase: cargo just spawned — pre-clear non-build memory so
-                // compilation gets all available RAM.
-                // Finishing phase: rustc count declining — build about to complete,
-                // relax to avoid disruptive actions during linker phase.
-                match build_tracker.phase {
-                    BuildPhase::Starting => {
-                        // Boost aggressiveness: help cargo get RAM now.
-                        reactor_weight = (reactor_weight + 0.15).min(1.0);
-                    }
-                    BuildPhase::Finishing => {
-                        // Back off: linker/metadata writes are latency-sensitive.
-                        let raw_pressure = snapshot.pressure.memory_pressure;
-                        if raw_pressure < 0.80 {
-                            reactor_weight = (reactor_weight - 0.12).max(0.0);
-                        }
-                    }
-                    _ => {}
-                }
-
-                // G10 — AMX Proactive Steering: when AMX is active AND LLM inference is
-                // running, boost reactor_weight to pre-position before ML memory pressure.
-                // AMX matrix-multiply pipelines fill in 100-200ms bursts; without this boost
-                // the daemon reacts after pressure already spikes.
-                // [Hellerstein 2004 §9 — derivative control precedes integrator saturation]
-                if amx_available && llm_active {
-                    reactor_weight = (reactor_weight + 0.15).min(1.0);
-                }
 
                 // Predictive agent: build context from existing signals and select intervention.
                 // Feed Kalman-smoothed pressure instead of raw — cleaner signal for LinUCB.
@@ -3926,187 +3805,25 @@ fn main() -> anyhow::Result<()> {
                         }
                     })
                     .collect();
-                let exec_outcomes = {
-                    use apollo_optimizer::engine::degradation::DegradationInputs;
-
-                    // ── Filter pipeline (Wave 9 Pass 1) ──────────────────────
-                    // Circuit-breaker snapshot + degradation tier + cognitive
-                    // gates (observe_only / block_aggressive) + mode filter +
-                    // throttle dedup + causal QoS upgrade.  All mutation
-                    // stays inside daemon_action_pipeline; this helper only
-                    // touches `state.policy` — no metrics/frozen_state/mach_qos.
-                    let filter_outcome = daemon_action_pipeline::run_filter_pipeline(
+                let (exec_outcomes, causal_qos_upgrades) = {
+                    use daemon_dispatch_tick::{DispatchTickInput, run_dispatch_tick};
+                    let output = run_dispatch_tick(DispatchTickInput {
+                        state: &state,
+                        caps: &caps,
+                        journal_path: &journal_path,
+                        frozen_state_path: &frozen_state_path,
                         final_actions,
-                        &state,
-                        &snapshot,
-                        prev_cog_decision.as_ref(),
-                        &causal_qos_names,
-                        reclaim_forecast.risk,
-                    );
-                    let cb_is_open = filter_outcome.cb_is_open;
-                    let op_mode = filter_outcome.op_mode;
-                    let mut filtered_actions = filter_outcome.filtered_actions;
-                    causal_qos_upgrades_cycle += filter_outcome.causal_qos_upgrades;
-
-                    // ── Predictive thaw gate ─────────────────────────────
-                    // When pressure is already high, refuse to thaw any
-                    // process whose ODE model predicts > MAX_PRED_GROWTH_BYTES
-                    // of RSS re-accumulation within 5 seconds.  Prevents the
-                    // classic failure mode: thaw browser tab under 0.82 →
-                    // 0.95 pressure spike 3 s later → swap storm.
-                    // [Strogatz 2015 §2.3] model-informed control;
-                    // [Nygard 2018 §5] backpressure by action refusal.
-                    {
-                        const PRED_GATE_PRESSURE: f64 = 0.80;
-                        const MAX_PRED_GROWTH_BYTES: u64 = 200 * 1024 * 1024; // 200 MB
-                        let pressure = snapshot.pressure.memory_pressure as f64;
-                        if pressure > PRED_GATE_PRESSURE {
-                            let mut deferred = 0u32;
-                            filtered_actions.retain(|a| {
-                                if let RootAction::UnfreezeProcess { pid, name, .. } = a {
-                                    let m_0 = collector
-                                        .system()
-                                        .process(sysinfo::Pid::from_u32(*pid))
-                                        .map(|p| p.memory())
-                                        .unwrap_or(0);
-                                    let predicted =
-                                        unfreeze_decay.predict_rss(name, m_0, 5.0);
-                                    let growth = predicted.saturating_sub(m_0);
-                                    if growth > MAX_PRED_GROWTH_BYTES {
-                                        tracing::info!(
-                                            target: "apollo.unfreeze_decay",
-                                            pid = *pid,
-                                            name = %name,
-                                            pressure = %format!("{:.2}", pressure),
-                                            growth_mb = growth / (1024 * 1024),
-                                            "deferring thaw: predicted RSS growth exceeds headroom"
-                                        );
-                                        deferred += 1;
-                                        return false;
-                                    }
-                                }
-                                true
-                            });
-                            if deferred > 0 {
-                                tracing::warn!(
-                                    target: "apollo.unfreeze_decay",
-                                    deferred,
-                                    active_thaws = unfreeze_decay.active_thaw_count(),
-                                    learned_apps = unfreeze_decay.learned_app_count(),
-                                    "predictive thaw gate dropped {} candidate(s)",
-                                    deferred
-                                );
-                            }
-                        }
-                    }
-
-                    // Extract a temporary HashSet for execute_actions (which requires &mut HashSet<u32>).
-                    let mut frozen_set: HashSet<u32> =
-                        state.frozen_state.lock_recover().keys().copied().collect();
-                    // Snapshot before execution — used to detect changes and skip redundant disk writes.
-                    let frozen_before: HashSet<u32> = frozen_set.clone();
-                    let (learned_protected, learned_interactive) = {
-                        let pg = state.policy.lock_recover();
-                        (
-                            pg.learned_policy.protected_patterns.clone(),
-                            pg.learned_policy.interactive_patterns.clone(),
-                        )
-                    };
-                    let mut qos = state.mach_qos.lock_recover();
-
-                    // ── Circuit breaker + execute_actions ────────────────────
-                    // We use the external record_success/record_failure API so the
-                    // Mutex is never held across blocking I/O.
-                    let outcomes = if cb_is_open {
-                        // Circuit Open: only dispatch unfreeze (always safe).
-                        tracing::warn!(
-                            op_mode = op_mode.as_str(),
-                            "circuit-breaker: open — skipping execute_actions, dispatching unfreeze only"
-                        );
-                        let safe_actions: Vec<RootAction> = filtered_actions
-                            .into_iter()
-                            .filter(|a| matches!(a, RootAction::UnfreezeProcess { .. }))
-                            .collect();
-                        execute_actions(
-                            safe_actions,
-                            &caps,
-                            &journal_path,
-                            &mut frozen_set,
-                            &learned_protected,
-                            &learned_interactive,
-                            Some(&mut qos),
-                            dry_run,
-                            snapshot.pressure.memory_pressure,
-                            snapshot.pressure.thrashing_score,
-                        )
-                    } else {
-                        // Circuit Closed or HalfOpen: run normally, then report outcome.
-                        let out = execute_actions(
-                            filtered_actions,
-                            &caps,
-                            &journal_path,
-                            &mut frozen_set,
-                            &learned_protected,
-                            &learned_interactive,
-                            Some(&mut qos),
-                            dry_run,
-                            snapshot.pressure.memory_pressure,
-                            snapshot.pressure.thrashing_score,
-                        );
-                        // Report outcome to circuit breaker (lock released before I/O above).
-                        {
-                            let mut pg = state.policy.lock_recover();
-                            if out.failures == 0 {
-                                pg.circuit_breaker.record_success();
-                            } else {
-                                for _ in 0..out.failures {
-                                    pg.circuit_breaker.record_failure();
-                                }
-                            }
-                        }
-                        out
-                    };
-
-                    // Update degradation controller with new failure count from this cycle.
-                    if outcomes.failures > 0 {
-                        let mut pg = state.policy.lock_recover();
-                        let inp = DegradationInputs {
-                            new_failures: outcomes.failures,
-                            kernel_task_cpu_pct: 0.0,
-                            circuit_open: false,
-                            circuit_open_duration: None,
-                        };
-                        pg.degradation.update(&inp);
-                    }
-
-                    // Sync the temporary set back into the unified frozen_state map.
-                    let now = Utc::now();
-                    let mut frozen_state = state.frozen_state.lock_recover();
-                    // Add newly frozen PIDs.
-                    for pid in &frozen_set {
-                        frozen_state.entry(*pid).or_insert_with(|| {
-                            let name = apollo_optimizer::engine::process_identity::proc_name_for_pid(*pid);
-                            FrozenEntry {
-                                frozen_at: now,
-                                source: FreezeSource::MainLoop,
-                                pressure_at_freeze: snapshot.pressure.memory_pressure,
-                                process_name: name,
-                                start_sec: apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(*pid)
-                                    .map(|pi| pi.start_sec)
-                                    .unwrap_or(0),
-                                original_jetsam_priority: None,
-                            }
-                        });
-                    }
-                    // Remove PIDs that are no longer frozen.
-                    frozen_state.retain(|pid, _| frozen_set.contains(pid));
-                    // Only persist to disk when the frozen set actually changed.
-                    if frozen_set != frozen_before {
-                        write_frozen_state(&frozen_state_path, &frozen_state);
-                    }
-                    outcomes
-                    // frozen_state lock released here
+                        snapshot: &snapshot,
+                        prev_cog_decision: prev_cog_decision.as_ref(),
+                        causal_qos_names: &causal_qos_names,
+                        reclaim_risk: reclaim_forecast.risk,
+                        unfreeze_decay: &mut unfreeze_decay,
+                        collector: &collector,
+                        dry_run,
+                    });
+                    (output.outcomes, output.causal_qos_upgrades)
                 };
+                causal_qos_upgrades_cycle += causal_qos_upgrades;
 
                 // Unfreeze decay ODE: record fresh thaws, observe active ones, GC.
                 // Bounded per-cycle: O(active_thaws) sysinfo lookups, no I/O.
