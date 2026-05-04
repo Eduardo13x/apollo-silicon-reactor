@@ -7,7 +7,7 @@
 //! 4. Circuit breaker and degradation state updates.
 //! 5. Frozen state persistence.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::path::Path;
 use chrono::Utc;
 
@@ -200,19 +200,35 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     // Sync frozen state back and persist if changed.
     {
         let now = Utc::now();
+        // Build identity map from this cycle's freeze results so FrozenEntry carries
+        // the correct start_sec and original_jetsam_priority captured at SIGSTOP time.
+        // [A5/D1 fix] Without this, the normal loop path always stored None for
+        // original_jetsam_priority, preventing proper priority restoration on thaw.
+        let identity_map: HashMap<u32, (u64, Option<i32>)> = outcomes
+            .newly_frozen_identity
+            .iter()
+            .map(|(pid, start_sec, pri)| (*pid, (*start_sec, *pri)))
+            .collect();
         let mut frozen_state = state.frozen_state.lock_recover();
         for pid in &frozen_set {
             frozen_state.entry(*pid).or_insert_with(|| {
                 let name = apollo_optimizer::engine::process_identity::proc_name_for_pid(*pid);
+                let (start_sec, original_jetsam_priority) = identity_map
+                    .get(pid)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        let s = apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(*pid)
+                            .map(|pi| pi.start_sec)
+                            .unwrap_or(0);
+                        (s, None)
+                    });
                 FrozenEntry {
                     frozen_at: now,
                     source: FreezeSource::MainLoop,
                     pressure_at_freeze: snapshot.pressure.memory_pressure,
                     process_name: name,
-                    start_sec: apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(*pid)
-                        .map(|pi| pi.start_sec)
-                        .unwrap_or(0),
-                    original_jetsam_priority: None,
+                    start_sec,
+                    original_jetsam_priority,
                 }
             });
         }
