@@ -173,6 +173,10 @@ pub struct SaturationForecast {
     pub t_sat_sec: Option<f64>,
     /// Risk level derived from `t_sat_sec`, current occupancy, and swapout rate.
     pub risk: SwapRisk,
+    /// True only on the first cycle transitioning into Overflow (swap_ratio ≥ 0.85).
+    /// False on subsequent consecutive Overflow cycles. Callers should gate WARN logs
+    /// on this flag to prevent log spam during sustained swap saturation.
+    pub overflow_entered: bool,
     /// Current swap occupancy ratio in [0.0, 1.0] for reference.
     pub swap_ratio: f64,
     /// Empirical volatility of net_rate (bytes/s) — std-dev estimated via EMA
@@ -213,6 +217,10 @@ pub struct SwapReclaimModel {
     net_rate_prev: f64,
     /// Number of samples ingested (warm-up guard).
     samples: u32,
+    /// Consecutive cycles where risk == Overflow. Used to gate WARN log spam:
+    /// only the first cycle in an overflow run emits WARN; subsequent cycles
+    /// are suppressed until the system exits and re-enters Overflow.
+    overflow_cycles: u32,
 }
 
 impl SwapReclaimModel {
@@ -306,6 +314,15 @@ impl SwapReclaimModel {
 
         self.net_rate_prev = net_rate;
 
+        // Track overflow run length to gate WARN log spam.
+        let overflow_entered = if matches!(risk, SwapRisk::Overflow) {
+            self.overflow_cycles = self.overflow_cycles.saturating_add(1);
+            self.overflow_cycles == 1 // true only on entry cycle
+        } else {
+            self.overflow_cycles = 0;
+            false
+        };
+
         SaturationForecast {
             dirty_rate_bps: self.dirty_ema_bps,
             reclaim_rate_bps: self.reclaim_ema_bps,
@@ -313,6 +330,7 @@ impl SwapReclaimModel {
             swapouts_ema_pps: self.swapout_ema_pps,
             t_sat_sec,
             risk,
+            overflow_entered,
             swap_ratio,
             net_rate_volatility,
         }
@@ -463,6 +481,7 @@ mod tests {
             swapouts_ema_pps: 0.0,
             t_sat_sec: None,
             risk: SwapRisk::Safe,
+            overflow_entered: false,
             swap_ratio: 0.0,
             net_rate_volatility: 0.0,
         };
@@ -484,6 +503,26 @@ mod tests {
         // After reset + 1 quiet sample, should be Safe
         let f = m.update(&sample(0.0, 100.0, 0.0, gb(1), gb(8)));
         assert_eq!(f.risk, SwapRisk::Safe);
+    }
+
+    #[test]
+    fn overflow_entered_true_only_on_first_overflow_cycle() {
+        let mut m = SwapReclaimModel::new();
+        let over_used = (gb(8) as f64 * SWAP_CRITICAL_RATIO + 1.0) as u64;
+        // Cycle 1: enters Overflow → overflow_entered = true
+        let f1 = m.update(&sample(0.0, 0.0, 0.0, over_used, gb(8)));
+        assert_eq!(f1.risk, SwapRisk::Overflow);
+        assert!(f1.overflow_entered, "first overflow cycle must set overflow_entered");
+        // Cycle 2: still Overflow → overflow_entered = false (already in overflow)
+        let f2 = m.update(&sample(0.0, 0.0, 0.0, over_used, gb(8)));
+        assert_eq!(f2.risk, SwapRisk::Overflow);
+        assert!(!f2.overflow_entered, "subsequent overflow cycles must NOT set overflow_entered");
+        // Drop back to Safe, then re-enter Overflow → overflow_entered = true again
+        let safe_used = gb(1);
+        let _fs = m.update(&sample(0.0, 0.0, 0.0, safe_used, gb(8)));
+        let f3 = m.update(&sample(0.0, 0.0, 0.0, over_used, gb(8)));
+        assert_eq!(f3.risk, SwapRisk::Overflow);
+        assert!(f3.overflow_entered, "re-entry into overflow must set overflow_entered again");
     }
 
     #[test]

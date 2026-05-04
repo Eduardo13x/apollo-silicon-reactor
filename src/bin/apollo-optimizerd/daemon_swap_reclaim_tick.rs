@@ -40,11 +40,16 @@ pub fn apply_swap_reclaim_boost(
         }
         SwapRisk::Overflow => {
             *reactor_weight = 1.0;
-            tracing::warn!(
-                target: "apollo.swap_reclaim",
-                swap_ratio = format!("{:.2}", reclaim_forecast.swap_ratio),
-                "swap reclaim ODE: Overflow — reactor_weight=1.0"
-            );
+            // Log only on overflow entry (first cycle ≥ 0.85) to prevent WARN spam
+            // during sustained saturation. Subsequent cycles remain at reactor_weight=1.0
+            // silently. [Thompson & Spencer 1966 habituation — repeated stimulus, same response]
+            if reclaim_forecast.overflow_entered {
+                tracing::warn!(
+                    target: "apollo.swap_reclaim",
+                    swap_ratio = format!("{:.2}", reclaim_forecast.swap_ratio),
+                    "swap reclaim ODE: Overflow entered — reactor_weight=1.0"
+                );
+            }
         }
         SwapRisk::Building => {
             let _ = CRITICAL_ETA_SEC;
