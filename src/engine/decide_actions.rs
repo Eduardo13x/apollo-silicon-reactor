@@ -7,6 +7,7 @@ use sysinfo::System;
 use crate::collector::SystemSnapshot;
 use crate::engine::action_policy::ActionContext;
 use crate::engine::amx_detector;
+use crate::engine::audit_types::DecisionReason;
 use crate::engine::blocked_action_journal::BlockerKind;
 use crate::engine::outcome_tracker::{HopGroupWeight, PatternWeight, WorkloadHop};
 use crate::engine::overflow_guard::OverflowThresholds;
@@ -530,6 +531,7 @@ pub fn decide_actions(
             pid: blocker.pid,
             name: blocker.name.clone(),
             reason: format!("wait-graph blocker score {:.2}", blocker.score),
+            decision_reason: DecisionReason::WaitGraphBlocker,
         });
     }
 
@@ -554,6 +556,7 @@ pub fn decide_actions(
                 pid,
                 name,
                 reason: "interactive focus boost".to_string(),
+                decision_reason: DecisionReason::InteractiveFocus,
             });
             continue;
         }
@@ -667,30 +670,45 @@ pub fn decide_actions(
                 || is_anomalous;
 
             let ipc = ipc_hints.get(&pid).copied().unwrap_or(0.0);
-            let reason = if is_anomalous {
-                format!(
-                    "anomaly throttle (score={:.1}x baseline, ipc={:.2})",
-                    anomaly_score, ipc
+            let (reason, decision_reason) = if is_anomalous {
+                (
+                    format!(
+                        "anomaly throttle (score={:.1}x baseline, ipc={:.2})",
+                        anomaly_score, ipc
+                    ),
+                    DecisionReason::AnomalyDetected,
                 )
             } else if is_io_burst {
-                format!(
-                    "io-burst throttle ({:.1} MB/s writes, ipc={:.2})",
-                    disk_mbps, ipc
+                (
+                    format!(
+                        "io-burst throttle ({:.1} MB/s writes, ipc={:.2})",
+                        disk_mbps, ipc
+                    ),
+                    DecisionReason::IoBurst,
                 )
             } else if is_wakeup_vampire {
-                format!(
-                    "wakeup-vampire throttle ({:.0}/s wakeups, ipc={:.2})",
-                    wakeup_rate, ipc
+                (
+                    format!(
+                        "wakeup-vampire throttle ({:.0}/s wakeups, ipc={:.2})",
+                        wakeup_rate, ipc
+                    ),
+                    DecisionReason::WakeupVampire,
                 )
             } else if bandwidth_priority {
-                format!(
-                    "dram-bw throttle (bw={:.0}%, footprint={:.0}MB, ipc={:.2})",
-                    dram_bandwidth_pct * 100.0,
-                    footprint_mb,
-                    ipc
+                (
+                    format!(
+                        "dram-bw throttle (bw={:.0}%, footprint={:.0}MB, ipc={:.2})",
+                        dram_bandwidth_pct * 100.0,
+                        footprint_mb,
+                        ipc
+                    ),
+                    DecisionReason::DramBandwidth,
                 )
             } else {
-                format!("ipc-aware throttle ({:?}, ipc={:.2})", context, ipc)
+                (
+                    format!("ipc-aware throttle ({:?}, ipc={:.2})", context, ipc),
+                    DecisionReason::PressureContext,
+                )
             };
 
             actions.push(RootAction::ThrottleProcess {
@@ -698,6 +716,7 @@ pub fn decide_actions(
                 name,
                 aggressive,
                 reason,
+                decision_reason,
                 start_sec: process.start_time(),
                 start_usec: 0,
             });
@@ -712,6 +731,7 @@ pub fn decide_actions(
                 pid: ml_pid,
                 name: process.name().to_string(),
                 reason: "ML/AMX workload — P-core routing".to_string(),
+                decision_reason: DecisionReason::MLWorkload,
             });
         }
     }
@@ -740,6 +760,7 @@ pub fn decide_actions(
                         pid: pid.as_u32(),
                         name,
                         reason: format!("display pipeline — swap +{:.1} MB/s", swap_delta_mb),
+                        decision_reason: DecisionReason::DisplayPipeline,
                     });
                 }
             }
@@ -767,6 +788,7 @@ pub fn decide_actions(
                         "display compositor high CPU ({:.0}%) — P-core priority",
                         process.cpu_usage()
                     ),
+                    decision_reason: DecisionReason::CompositorPriority,
                 });
                 break; // Only one WindowServer process
             }
@@ -827,6 +849,7 @@ pub fn decide_actions(
                                     "runaway thread #{} in {} (1 hot / {} threads)",
                                     idx, name, analysis.thread_count
                                 ),
+                                decision_reason: DecisionReason::AnomalyDetected,
                             });
                             thread_actions_emitted += 1;
                         }
@@ -848,6 +871,7 @@ pub fn decide_actions(
                                     "cold thread #{} in saturated {} ({}/{} active)",
                                     idx, name, analysis.active_count, analysis.thread_count
                                 ),
+                                decision_reason: DecisionReason::PressureContext,
                             });
                             thread_actions_emitted += 1;
                         }
@@ -871,6 +895,7 @@ pub fn decide_actions(
                                     analysis.cold.len(),
                                     analysis.thread_count,
                                 ),
+                                decision_reason: DecisionReason::PressureContext,
                             });
                             thread_actions_emitted += 1;
                         }
@@ -890,6 +915,7 @@ pub fn decide_actions(
                                     "hot thread #{} in {} (cpu={:.1}%)",
                                     idx, name, cpu
                                 ),
+                                decision_reason: DecisionReason::PressureContext,
                             });
                             thread_actions_emitted += 1;
                         }
@@ -903,6 +929,7 @@ pub fn decide_actions(
                                 thread_index: idx,
                                 tier: "background".to_string(),
                                 reason: format!("cold thread #{} in {} (waiting)", idx, name),
+                                decision_reason: DecisionReason::PressureContext,
                             });
                             thread_actions_emitted += 1;
                         }
@@ -956,6 +983,7 @@ pub fn decide_actions(
                     // weaker (6-char prefix/suffix comparison only).
                     start_sec: process.start_time(),
                     start_usec: 0,
+                    decision_reason: DecisionReason::MLWorkload,
                 });
             }
         }
@@ -1085,7 +1113,7 @@ pub fn decide_actions(
                 // analysis. Uses a synthetic probe candidate (pid=0) because
                 // the gate blocks the entire class; individual PIDs are not
                 // yet enumerated at this branch. [Nygard 2018 §8.5]
-                let probe = RootAction::freeze_full(0, "<shadow-probe>", "shadow-probe", 0, 0);
+                let probe = RootAction::freeze_full(0, "<shadow-probe>", "shadow-probe", 0, 0, DecisionReason::PressureContext);
                 let ctx = ActionContext {
                     pressure: snapshot.pressure.memory_pressure,
                     swap_gb: snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -1250,6 +1278,7 @@ pub fn decide_actions(
                             ),
                             start_sec,
                             start_usec: 0,
+                            decision_reason: DecisionReason::PressureContext,
                         });
                     } else {
                         let reason = if gate_c && cpu > 10.0 {
@@ -1266,6 +1295,7 @@ pub fn decide_actions(
                             reason,
                             start_sec,
                             start_usec: 0,
+                            decision_reason: DecisionReason::PressureContext,
                         });
                     }
                 }
@@ -2149,6 +2179,7 @@ mod tests {
                 pid: 42,
                 name: "test".to_string(),
                 reason: "testing".to_string(),
+                decision_reason: DecisionReason::PressureContext,
             }],
             low_value_skipped: vec!["skipped".to_string()],
             display_boosts_emitted: 0,

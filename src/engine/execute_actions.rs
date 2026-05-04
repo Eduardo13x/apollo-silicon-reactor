@@ -15,6 +15,7 @@ use crate::engine::safety::{
     allowlisted_sysctls, allowlisted_sysctls_with_ranges, classify_protection,
     infrastructure_processes, protected_processes, ProtectionLevel,
 };
+use crate::engine::audit_types::{BlockReason, PolicyDecisionTrace};
 use crate::engine::types::{CapabilityReport, JournalEntry, RootAction};
 
 /// Set the nice value for a process via `setpriority(2)`.
@@ -274,6 +275,8 @@ pub struct ExecuteOutcomes {
     /// with the actual skip reason instead of falsely claiming success.
     /// Reset to `None` at the start of every action iteration.
     pub last_skip: Option<String>,
+    /// Audit traces for all intended actions.
+    pub audit_traces: Vec<PolicyDecisionTrace>,
 }
 
 impl ExecuteOutcomes {
@@ -373,14 +376,7 @@ pub fn execute_actions(
     for action in &actions {
         if let RootAction::UnfreezeProcess { pid, name, .. } = action {
             // PID recycling guard: verify the process at this PID still has
-            // the expected name before sending SIGCONT. Without this check,
-            // a recycled PID could belong to a DIFFERENT process that is
-            // legitimately SIGSTOP'd (e.g. by a debugger like lldb). Sending
-            // SIGCONT to that process would break the debugger's control.
-            //
-            // Cost: one proc_name_for_pid (~2 µs) per unfreeze candidate.
-            // For typical batches of 1-30 unfreezes this is 2-60 µs — well
-            // within the pre-pass's latency budget.
+            // the expected name before sending SIGCONT.
             let name_matches = process_identity::proc_name_for_pid(*pid)
                 .map(|current_name| {
                     current_name == *name
@@ -389,12 +385,11 @@ pub fn execute_actions(
                 })
                 .unwrap_or(false);
             if !name_matches {
-                continue; // PID recycled or process dead — skip
+                continue;
             }
             if dry_run {
                 continue;
             }
-            // SAFETY: single syscall, no shared state, no dereference.
             unsafe { libc::kill(*pid as i32, libc::SIGCONT) };
         }
     }
@@ -402,9 +397,21 @@ pub fn execute_actions(
     for action in actions {
         // Drain any leftover skip reason from prior iteration before running.
         out.last_skip = None;
-        let mut success = false;
         let mut before = None;
         let mut after = None;
+        
+        let decision_reason = match &action {
+            RootAction::BoostProcess { decision_reason, .. }
+            | RootAction::ThrottleProcess { decision_reason, .. }
+            | RootAction::FreezeProcess { decision_reason, .. }
+            | RootAction::UnfreezeProcess { decision_reason, .. }
+            | RootAction::SetSysctl { decision_reason, .. }
+            | RootAction::SetMemorystatus { decision_reason, .. }
+            | RootAction::ToggleSpotlight { decision_reason, .. }
+            | RootAction::QuarantineDaemon { decision_reason, .. }
+            | RootAction::SetThreadQoS { decision_reason, .. } => decision_reason.clone(),
+        };
+
         let reason = match &action {
             RootAction::BoostProcess { reason, .. }
             | RootAction::ThrottleProcess { reason, .. }
@@ -413,9 +420,14 @@ pub fn execute_actions(
             | RootAction::SetMemorystatus { reason, .. }
             | RootAction::ToggleSpotlight { reason, .. }
             | RootAction::QuarantineDaemon { reason, .. }
-            | RootAction::SetThreadQoS { reason, .. } => reason.clone(),
-            RootAction::UnfreezeProcess { .. } => "unfreeze".to_string(),
+            | RootAction::SetThreadQoS { reason, .. }
+            | RootAction::UnfreezeProcess { reason, .. } => reason.clone(),
         };
+
+        let mut block_reason = None;
+        if dry_run {
+            block_reason = Some(BlockReason::DryRun);
+        }
 
         let result: anyhow::Result<()> = (|| {
             match &action {
@@ -429,6 +441,7 @@ pub fn execute_actions(
                     }
                     // Validate PID identity (name-only for boost — no start-time available).
                     if !verify_pid_identity(*pid, name, 0, 0) {
+                        block_reason = Some(BlockReason::PidRecycled);
                         return Ok(());
                     }
                     if !dry_run {
@@ -471,6 +484,7 @@ pub fn execute_actions(
                     match classify_protection(name, &protected, &empty_infra, &policy_all, false) {
                         ProtectionLevel::Unconditional => {
                             out.push_skip(format!("protected:{}", name));
+                            block_reason = Some(BlockReason::ProtectedProcess);
                             return Ok(());
                         }
                         ProtectionLevel::ConditionalForeground | ProtectionLevel::Unprotected => {}
@@ -478,18 +492,19 @@ pub fn execute_actions(
                     // ML/AMX protection: never throttle inference workloads.
                     if ml_pids.contains(pid) {
                         out.push_skip(format!("ml-protected:{}", name));
+                        block_reason = Some(BlockReason::MlProtected);
                         return Ok(());
                     }
                     // Validate PID identity with start-time (prevents A-B-A recycling).
                     if !verify_pid_identity(*pid, name, *start_sec, *start_usec) {
                         out.push_skip(format!("pid-recycled:{}", name));
+                        block_reason = Some(BlockReason::PidRecycled);
                         return Ok(());
                     }
                     // PID-level Apple platform check: csops CS_PLATFORM_BINARY + path prefix.
-                    // Catches system helpers not in the explicit name list (e.g. CoreGraphics
-                    // compositor helpers, SkyLight workers, DriverKit services).
                     if process_identity::is_apple_platform_process(*pid) {
                         out.push_skip(format!("apple-platform:{}", name));
+                        block_reason = Some(BlockReason::ApplePlatform);
                         return Ok(());
                     }
                     let is_critical_bg = critical_bg.iter().any(|p| name.contains(p));
@@ -497,6 +512,7 @@ pub fn execute_actions(
                     if is_critical_bg {
                         out.critical_background_skips += 1;
                         out.push_skip(format!("critical-bg:{}", name));
+                        block_reason = Some(BlockReason::CriticalBackground);
                     }
                     if !dry_run {
                         if caps.can_taskpolicy {
@@ -554,6 +570,7 @@ pub fn execute_actions(
                                 out.critical_background_skips += 1;
                             }
                             out.push_skip(format!("protected:{}", name));
+                            block_reason = Some(BlockReason::ProtectedProcess);
                             return Ok(());
                         }
                         ProtectionLevel::ConditionalForeground | ProtectionLevel::Unprotected => {}
@@ -561,15 +578,18 @@ pub fn execute_actions(
                     // ML/AMX protection: never freeze inference workloads.
                     if ml_pids.contains(pid) {
                         out.push_skip(format!("ml-protected:{}", name));
+                        block_reason = Some(BlockReason::MlProtected);
                         return Ok(());
                     }
                     // Validate PID identity with start-time (prevents A-B-A recycling).
                     if !verify_pid_identity(*pid, name, *start_sec, *start_usec) {
+                        block_reason = Some(BlockReason::PidRecycled);
                         return Ok(());
                     }
                     // PID-level Apple platform check: csops CS_PLATFORM_BINARY + path prefix.
                     if process_identity::is_apple_platform_process(*pid) {
                         out.push_skip(format!("apple-platform:{}", name));
+                        block_reason = Some(BlockReason::ApplePlatform);
                         return Ok(());
                     }
                     // Never freeze processes with active power assertions
@@ -595,6 +615,7 @@ pub fn execute_actions(
                         let busy = assertion_pids.get_or_insert_with(pids_with_assertions);
                         if busy.contains(pid) {
                             out.push_skip(format!("assertion-active:{}", name));
+                            block_reason = Some(BlockReason::AssertionActive);
                             return Ok(());
                         }
                     }
@@ -609,6 +630,7 @@ pub fn execute_actions(
                         // a zombie is a kernel no-op that still burns a syscall.
                         if proc_taskinfo::is_zombie_pid(*pid) {
                             out.push_skip(format!("zombie:{}", name));
+                            block_reason = Some(BlockReason::Zombie);
                             return Ok(());
                         }
                         // Demote disk I/O to Passive before SIGSTOP.
@@ -656,6 +678,7 @@ pub fn execute_actions(
                         // A2 fix (round-3): skip zombies — SIGCONT is a no-op on them.
                         if proc_taskinfo::is_zombie_pid(*pid) {
                             frozen.remove(pid);
+                            block_reason = Some(BlockReason::Zombie);
                             return Ok(());
                         }
                         let alive = unsafe { libc::kill(*pid as i32, 0) } == 0;
@@ -712,6 +735,7 @@ pub fn execute_actions(
                             if numeric_val < range.min || numeric_val > range.max {
                                 out.invalid_sysctl_denied += 1;
                                 out.push_skip(format!("sysctl-out-of-range:{}={}", key, value));
+                                block_reason = Some(BlockReason::SysctlOutOfRange);
                                 return Ok(());
                             }
                         }
@@ -726,6 +750,7 @@ pub fn execute_actions(
                         None => {
                             out.invalid_sysctl_denied += 1;
                             out.push_skip(format!("invalid-sysctl:{}", key));
+                            block_reason = Some(BlockReason::InvalidSysctl);
                             return Ok(());
                         }
                     }
@@ -766,6 +791,7 @@ pub fn execute_actions(
                                     "memorystatus-send-failed:pid={}",
                                     *pid
                                 ));
+                                block_reason = Some(BlockReason::MemorystatusFailed);
                             }
                         }
                     }
@@ -832,16 +858,26 @@ pub fn execute_actions(
         // Skip paths set `out.last_skip`; drain it so the journal entry
         // records success=false with the skip reason (not the original
         // action reason). Without this, every skipped freeze/throttle logs
-        // as success=true, masking capacity bugs like this one.
-        let skip_reason = out.last_skip.take();
+        let success = result.is_ok() && out.last_skip.is_none();
+        
+        out.audit_traces.push(PolicyDecisionTrace {
+            t: Utc::now(),
+            cycle: 0, // Filled by caller
+            intended_action: action.clone(),
+            decision_reason,
+            applied: success,
+            block_reason,
+            pressure: memory_pressure as f32,
+            swap_gb: (crate::engine::host_vm_info::get_swap_used_bytes() as f32 / (1024.0 * 1024.0 * 1024.0)),
+            thrashing: thrashing_score as f32,
+        });
+
         if let Err(e) = result {
             out.failures += 1;
             out.last_error = Some(e.to_string());
-        } else if skip_reason.is_none() {
-            success = true;
         }
 
-        let journal_reason = match skip_reason {
+        let journal_reason = match out.last_skip.take() {
             Some(s) => format!("skip:{s}"),
             None => reason,
         };
@@ -871,6 +907,7 @@ pub fn execute_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::audit_types::DecisionReason;
     use std::collections::HashSet;
 
     fn make_caps() -> CapabilityReport {
@@ -923,6 +960,8 @@ mod tests {
             .map(|pid| RootAction::UnfreezeProcess {
                 pid,
                 name: format!("ghost-{pid}"),
+                reason: "test".to_string(),
+                decision_reason: DecisionReason::PressureContext,
             })
             .collect();
         let outcomes = execute_actions(
@@ -960,6 +999,7 @@ mod tests {
                 name: "MyInteractiveApp".to_string(),
                 aggressive: false,
                 reason: "test".to_string(),
+                decision_reason: DecisionReason::PressureContext,
                 start_sec: 0,
                 start_usec: 0,
             }],
@@ -987,6 +1027,7 @@ mod tests {
                 pid: GHOST_PID,
                 name: "MyInteractiveApp".to_string(),
                 reason: "test".to_string(),
+                decision_reason: DecisionReason::PressureContext,
                 start_sec: 0,
                 start_usec: 0,
             }],
@@ -1018,6 +1059,7 @@ mod tests {
                 reason: "test".to_string(),
                 start_sec: 0,
                 start_usec: 0,
+                decision_reason: DecisionReason::PressureContext,
             }],
             &[],
             &interactive,
@@ -1036,6 +1078,7 @@ mod tests {
                 reason: "test".to_string(),
                 start_sec: 0,
                 start_usec: 0,
+                decision_reason: DecisionReason::PressureContext,
             }],
             &protected,
             &[],

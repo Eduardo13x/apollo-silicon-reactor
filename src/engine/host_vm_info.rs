@@ -268,6 +268,46 @@ pub fn trigger_purge() {
     crate::engine::sysctl_direct::write_i32("kern.memorystatus_vm_pressure_send", 1);
 }
 
+/// Returns the current swap usage in bytes.
+pub fn get_swap_used_bytes() -> u64 {
+    let mut xsw = [0u64; 5];
+    let mut len = std::mem::size_of_val(&xsw);
+    let rc = unsafe {
+        libc::sysctlbyname(
+            "vm.swapusage\0".as_ptr() as *const libc::c_char,
+            xsw.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        xsw[2] // used
+    } else {
+        0
+    }
+}
+
+/// Returns the total swap capacity in bytes.
+pub fn get_swap_total_bytes() -> u64 {
+    let mut xsw = [0u64; 5];
+    let mut len = std::mem::size_of_val(&xsw);
+    let rc = unsafe {
+        libc::sysctlbyname(
+            "vm.swapusage\0".as_ptr() as *const libc::c_char,
+            xsw.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        xsw[0] // total
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

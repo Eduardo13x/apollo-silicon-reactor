@@ -199,11 +199,14 @@ impl ActionQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::audit_types::DecisionReason;
 
     fn make_unfreeze(pid: u32) -> RootAction {
         RootAction::UnfreezeProcess {
             pid,
             name: format!("proc{}", pid),
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::PressureContext,
         }
     }
 
@@ -215,6 +218,7 @@ mod tests {
             reason: "test".to_string(),
             start_sec: 0,
             start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
         }
     }
 
@@ -223,6 +227,7 @@ mod tests {
             key: key.to_string(),
             value: "1".to_string(),
             reason: "test".to_string(),
+            decision_reason: DecisionReason::PressureContext,
         }
     }
 
@@ -233,6 +238,7 @@ mod tests {
             reason: "test".to_string(),
             start_sec: 0,
             start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
         }
     }
 

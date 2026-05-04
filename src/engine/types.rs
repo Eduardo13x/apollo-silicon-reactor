@@ -249,12 +249,16 @@ pub enum RootAction {
         pid: u32,
         name: String,
         reason: String,
+        #[serde(default = "default_decision_reason")]
+        decision_reason: crate::engine::audit_types::DecisionReason,
     },
     ThrottleProcess {
         pid: u32,
         name: String,
         aggressive: bool,
         reason: String,
+        #[serde(default = "default_decision_reason")]
+        decision_reason: crate::engine::audit_types::DecisionReason,
         /// Kernel start-time for PID identity validation (prevents A-B-A recycling).
         #[serde(default)]
         start_sec: u64,
@@ -265,6 +269,8 @@ pub enum RootAction {
         pid: u32,
         name: String,
         reason: String,
+        #[serde(default = "default_decision_reason")]
+        decision_reason: crate::engine::audit_types::DecisionReason,
         /// Kernel start-time for PID identity validation (prevents A-B-A recycling).
         #[serde(default)]
         start_sec: u64,
@@ -274,25 +280,37 @@ pub enum RootAction {
     UnfreezeProcess {
         pid: u32,
         name: String,
+        #[serde(default)]
+        reason: String,
+        #[serde(default = "default_decision_reason")]
+        decision_reason: crate::engine::audit_types::DecisionReason,
     },
     SetSysctl {
         key: String,
         value: String,
         reason: String,
+        #[serde(default = "default_decision_reason")]
+        decision_reason: crate::engine::audit_types::DecisionReason,
     },
     SetMemorystatus {
         pid: u32,
         priority: i32,
         reason: String,
+        #[serde(default = "default_decision_reason")]
+        decision_reason: crate::engine::audit_types::DecisionReason,
     },
     ToggleSpotlight {
         enabled: bool,
         reason: String,
+        #[serde(default = "default_decision_reason")]
+        decision_reason: crate::engine::audit_types::DecisionReason,
     },
     QuarantineDaemon {
         daemon: String,
         active: bool,
         reason: String,
+        #[serde(default = "default_decision_reason")]
+        decision_reason: crate::engine::audit_types::DecisionReason,
     },
     /// Per-thread QoS: route a specific thread to P-core or E-core.
     SetThreadQoS {
@@ -302,7 +320,13 @@ pub enum RootAction {
         /// "interactive", "background", or "utility"
         tier: String,
         reason: String,
+        #[serde(default = "default_decision_reason")]
+        decision_reason: crate::engine::audit_types::DecisionReason,
     },
+}
+
+fn default_decision_reason() -> crate::engine::audit_types::DecisionReason {
+    crate::engine::audit_types::DecisionReason::PressureContext
 }
 
 impl RootAction {
@@ -315,8 +339,9 @@ impl RootAction {
         name: impl Into<String>,
         aggressive: bool,
         reason: impl Into<String>,
+        decision_reason: crate::engine::audit_types::DecisionReason,
     ) -> Self {
-        Self::throttle_full(pid, name, aggressive, reason, 0, 0)
+        Self::throttle_full(pid, name, aggressive, reason, 0, 0, decision_reason)
     }
 
     pub fn throttle_full(
@@ -326,19 +351,26 @@ impl RootAction {
         reason: impl Into<String>,
         start_sec: u64,
         start_usec: u64,
+        decision_reason: crate::engine::audit_types::DecisionReason,
     ) -> Self {
         RootAction::ThrottleProcess {
             pid,
             name: name.into(),
             aggressive,
             reason: reason.into(),
+            decision_reason,
             start_sec,
             start_usec,
         }
     }
 
-    pub fn freeze(pid: u32, name: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self::freeze_full(pid, name, reason, 0, 0)
+    pub fn freeze(
+        pid: u32,
+        name: impl Into<String>,
+        reason: impl Into<String>,
+        decision_reason: crate::engine::audit_types::DecisionReason,
+    ) -> Self {
+        Self::freeze_full(pid, name, reason, 0, 0, decision_reason)
     }
 
     pub fn freeze_full(
@@ -347,11 +379,13 @@ impl RootAction {
         reason: impl Into<String>,
         start_sec: u64,
         start_usec: u64,
+        decision_reason: crate::engine::audit_types::DecisionReason,
     ) -> Self {
         RootAction::FreezeProcess {
             pid,
             name: name.into(),
             reason: reason.into(),
+            decision_reason,
             start_sec,
             start_usec,
         }
@@ -361,33 +395,53 @@ impl RootAction {
         key: impl Into<String>,
         value: impl Into<String>,
         reason: impl Into<String>,
+        decision_reason: crate::engine::audit_types::DecisionReason,
     ) -> Self {
         RootAction::SetSysctl {
             key: key.into(),
             value: value.into(),
             reason: reason.into(),
+            decision_reason,
         }
     }
 
-    pub fn set_memorystatus(pid: u32, priority: i32, reason: impl Into<String>) -> Self {
+    pub fn set_memorystatus(
+        pid: u32,
+        priority: i32,
+        reason: impl Into<String>,
+        decision_reason: crate::engine::audit_types::DecisionReason,
+    ) -> Self {
         RootAction::SetMemorystatus {
             pid,
             priority,
             reason: reason.into(),
+            decision_reason,
         }
     }
 
-    pub fn toggle_spotlight(enabled: bool, reason: impl Into<String>) -> Self {
+    pub fn toggle_spotlight(
+        enabled: bool,
+        reason: impl Into<String>,
+        decision_reason: crate::engine::audit_types::DecisionReason,
+    ) -> Self {
         RootAction::ToggleSpotlight {
             enabled,
             reason: reason.into(),
+            decision_reason,
         }
     }
 
-    pub fn unfreeze(pid: u32, name: impl Into<String>) -> Self {
+    pub fn unfreeze(
+        pid: u32,
+        name: impl Into<String>,
+        reason: impl Into<String>,
+        decision_reason: crate::engine::audit_types::DecisionReason,
+    ) -> Self {
         RootAction::UnfreezeProcess {
             pid,
             name: name.into(),
+            reason: reason.into(),
+            decision_reason,
         }
     }
 }

@@ -71,6 +71,14 @@ pub fn journal_path() -> &'static str {
     }
 }
 
+pub fn policy_audit_path() -> &'static str {
+    if is_root() {
+        "/var/lib/apollo/policy_audit.jsonl"
+    } else {
+        "/tmp/apollo-policy_audit.jsonl"
+    }
+}
+
 pub fn audit_log_path() -> &'static str {
     if is_root() {
         "/var/lib/apollo/deep_scan_audit.jsonl"

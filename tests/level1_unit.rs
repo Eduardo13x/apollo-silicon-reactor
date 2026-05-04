@@ -11,6 +11,7 @@ use apollo_optimizer::engine::safety::{
 use apollo_optimizer::engine::types::{
     ActionBudgetState, OptimizationProfile, RootAction, SafetyPolicy,
 };
+use apollo_optimizer::engine::audit_types::DecisionReason;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -20,6 +21,7 @@ fn make_boosts(n: usize) -> Vec<RootAction> {
             pid: (1000 + i) as u32,
             name: format!("app-{}", i),
             reason: "test boost".into(),
+            decision_reason: DecisionReason::PressureContext,
         })
         .collect()
 }
@@ -33,6 +35,7 @@ fn make_throttles(n: usize) -> Vec<RootAction> {
             reason: "test throttle".into(),
             start_sec: 0,
             start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
         })
         .collect()
 }
@@ -45,6 +48,7 @@ fn make_freezes(n: usize) -> Vec<RootAction> {
             reason: "test freeze".into(),
             start_sec: 0,
             start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
         })
         .collect()
 }
@@ -158,6 +162,7 @@ fn enforce_limits_caps_sysctl_at_policy_max() {
             key: format!("vm.key_{}", i),
             value: "1".into(),
             reason: "test".into(),
+            decision_reason: DecisionReason::PressureContext,
         })
         .collect();
     let filtered = enforce_limits(actions, &policy);

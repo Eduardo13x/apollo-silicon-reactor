@@ -149,6 +149,7 @@ fn target_pid(a: &RootAction) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::engine::safety::ProtectionLevel;
+    use crate::engine::audit_types::DecisionReason;
 
     fn make_ctx() -> ActionContext {
         ActionContext {
@@ -220,7 +221,7 @@ mod tests {
     }
 
     fn freeze_action() -> RootAction {
-        RootAction::freeze_full(4242, "background-daemon", "shadow-test", 0, 0)
+        RootAction::freeze_full(4242, "background-daemon", "shadow-test", 0, 0, DecisionReason::PressureContext)
     }
 
     #[test]

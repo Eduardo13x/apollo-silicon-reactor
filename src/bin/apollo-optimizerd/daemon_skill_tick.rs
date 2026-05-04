@@ -26,6 +26,7 @@ use apollo_optimizer::engine::optimization_skills::SkillRegistry;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
 use apollo_optimizer::engine::safety::{is_protected_name, protected_processes};
 use apollo_optimizer::engine::types::RootAction;
+use apollo_optimizer::engine::audit_types::DecisionReason;
 
 /// Per-cycle skill application tick.
 ///
@@ -96,6 +97,7 @@ pub fn run_skill_tick(
                         name,
                         false,
                         format!("skill:{}", skill_name),
+                        DecisionReason::MLWorkload,
                     ));
                 }
             }
@@ -160,6 +162,7 @@ pub fn run_skill_tick(
                                     target.clone(),
                                     false,
                                     format!("trial:{}", skill_name),
+                                    DecisionReason::MLWorkload,
                                 ));
                             }
                             trialed = true;

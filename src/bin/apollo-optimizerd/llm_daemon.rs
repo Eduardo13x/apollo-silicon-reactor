@@ -19,6 +19,7 @@ use apollo_optimizer::engine::llm::{
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::safety::pattern_conflicts_with_protected;
 use apollo_optimizer::engine::types::{HardPath, LlmRunMode, RootAction};
+use apollo_optimizer::engine::audit_types::DecisionReason;
 
 use super::SharedState;
 
@@ -969,6 +970,7 @@ pub fn apply_learned_policy_actions(
                 pid: p.pid,
                 name: p.name.clone(),
                 reason: "learned-policy interactive".to_string(),
+                decision_reason: DecisionReason::PressureContext,
             });
             seen.insert((p.pid, "boost"));
         }
@@ -992,6 +994,7 @@ pub fn apply_learned_policy_actions(
                 },
                 start_sec: ss,
                 start_usec: su,
+                decision_reason: DecisionReason::PressureContext,
             });
             seen.insert((p.pid, "throttle"));
         }
@@ -1065,7 +1068,12 @@ mod tests {
     #[test]
     fn apply_empty_policy_passthrough() {
         let snap = snapshot_with(vec![]);
-        let actions = vec![RootAction::BoostProcess { pid: 1, name: "app".into(), reason: "r".into() }];
+        let actions = vec![RootAction::BoostProcess {
+            pid: 1,
+            name: "app".into(),
+            reason: "r".into(),
+            decision_reason: DecisionReason::PressureContext,
+        }];
         let result = apply_learned_policy_actions(&snap, &policy(&[], &[], &[]), actions);
         assert_eq!(result.len(), 1);
     }
@@ -1074,7 +1082,12 @@ mod tests {
     fn apply_protected_pattern_removes_freeze() {
         let snap = snapshot_with(vec![]);
         let actions = vec![RootAction::FreezeProcess {
-            pid: 1, name: "claude".into(), reason: "r".into(), start_sec: 0, start_usec: 0,
+            pid: 1,
+            name: "claude".into(),
+            reason: "r".into(),
+            start_sec: 0,
+            start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
         }];
         let result = apply_learned_policy_actions(&snap, &policy(&[], &[], &["claude"]), actions);
         assert!(result.is_empty(), "claude must be protected");
@@ -1084,7 +1097,12 @@ mod tests {
     fn apply_protected_pattern_keeps_non_matching() {
         let snap = snapshot_with(vec![]);
         let actions = vec![RootAction::FreezeProcess {
-            pid: 2, name: "slack".into(), reason: "r".into(), start_sec: 0, start_usec: 0,
+            pid: 2,
+            name: "slack".into(),
+            reason: "r".into(),
+            start_sec: 0,
+            start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
         }];
         let result = apply_learned_policy_actions(&snap, &policy(&[], &[], &["claude"]), actions);
         assert_eq!(result.len(), 1);
@@ -1107,7 +1125,12 @@ mod tests {
     #[test]
     fn apply_no_duplicate_boost_when_already_present() {
         let snap = snapshot_with(vec![proc(42, "Xcode", 20.0)]);
-        let existing = vec![RootAction::BoostProcess { pid: 42, name: "Xcode".into(), reason: "existing".into() }];
+        let existing = vec![RootAction::BoostProcess {
+            pid: 42,
+            name: "Xcode".into(),
+            reason: "existing".into(),
+            decision_reason: DecisionReason::PressureContext,
+        }];
         let result = apply_learned_policy_actions(&snap, &policy(&["Xcode"], &[], &[]), existing);
         let boosts = result.iter().filter(|a| matches!(a, RootAction::BoostProcess { .. })).count();
         assert_eq!(boosts, 1, "must not duplicate existing boost");

@@ -234,6 +234,7 @@ pub fn run_filter_pipeline(
                     reason,
                     start_sec,
                     start_usec,
+                    decision_reason,
                 } if causal_qos_names.contains(name.as_str()) => {
                     causal_qos_upgrades += 1;
                     RootAction::ThrottleProcess {
@@ -243,6 +244,7 @@ pub fn run_filter_pipeline(
                         reason: format!("{} [causal:qos]", reason),
                         start_sec,
                         start_usec,
+                        decision_reason,
                     }
                 }
                 other => other,

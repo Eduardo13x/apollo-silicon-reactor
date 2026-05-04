@@ -19,6 +19,7 @@ use apollo_optimizer::engine::safety::enforce_limits_with_budget;
 use apollo_optimizer::engine::types::{
     ActionBudgetState, CapabilityReport, OptimizationProfile, RootAction, SafetyPolicy,
 };
+use apollo_optimizer::engine::audit_types::DecisionReason;
 use chrono::Utc;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -82,6 +83,7 @@ fn concurrent_budget_enforcement_no_overflow() {
                         pid,
                         name: format!("app-{}-{}", t, pid),
                         reason: "stress".into(),
+                        decision_reason: DecisionReason::PressureContext,
                     })
                     .collect();
 
@@ -156,6 +158,7 @@ fn three_phase_cycles_all_complete_with_correct_totals() {
                             pid,
                             name: format!("fake-{}-{}", t, pid),
                             reason: "concurrent".into(),
+                            decision_reason: DecisionReason::PressureContext,
                         })
                         .collect::<Vec<_>>()
                 }; // metrics lock released
@@ -335,6 +338,7 @@ fn shared_budget_invariant_holds_under_max_contention() {
                         pid: (t as u32) * 100 + i,
                         name: format!("stress-{}-{}", t, i),
                         reason: "stress".into(),
+                        decision_reason: DecisionReason::PressureContext,
                     })
                     .collect();
 
@@ -384,6 +388,7 @@ fn concurrent_freeze_unfreeze_frozen_set_is_consistent() {
                         reason: "test freeze".into(),
                         start_sec: 0,
                         start_usec: 0,
+                        decision_reason: DecisionReason::PressureContext,
                     })
                     .collect();
                 let mut f = frozen.lock().unwrap();

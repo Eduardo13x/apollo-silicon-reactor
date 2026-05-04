@@ -96,6 +96,7 @@ use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
 use apollo_optimizer::engine::learned_state::{
     LearnableParams, LearnedState, RestoreQualityMonitor,
 };
+use apollo_optimizer::engine::audit_types::DecisionReason;
 use apollo_optimizer::engine::llm::{
     feedback_path_root, load_repo_config, pending_trial_path,
     policy_path_root, read_json, state_paths_root, suggestions_path_root, write_json,
@@ -3185,6 +3186,7 @@ fn main() -> anyhow::Result<()> {
                         ),
                         ss,
                         su,
+                        DecisionReason::PressureContext,
                     ));
                     proc_recovery.record_kill_attempt(target.pid);
                 }
@@ -3337,6 +3339,7 @@ fn main() -> anyhow::Result<()> {
                             key,
                             value,
                             format!("network-optimizer: {:?} profile", net_profile),
+                            DecisionReason::PressureContext,
                         ));
                     }
                 }
@@ -3632,6 +3635,7 @@ fn main() -> anyhow::Result<()> {
                                                 temp.as_ref().map(|t| format!("hot={:.0}%", t.pct_hot * 100.0))
                                                     .unwrap_or_else(|| "n/a".to_string()),
                                             ),
+                                            decision_reason: DecisionReason::PressureContext,
                                         })
                                     }
                                     MemoryAction::Skip => {

@@ -14,6 +14,7 @@
 //! All emitted actions use keys from the safety module's allowlist.  The
 //! governor only emits actions when running as root.
 
+use crate::engine::audit_types::DecisionReason;
 use crate::engine::sysctl_direct;
 use std::collections::HashMap;
 use std::path::Path;
@@ -338,6 +339,7 @@ impl SysctlGovernor {
                 key: key.clone(),
                 value: value.clone(),
                 reason: "sysctl-governor: reverting to default".to_string(),
+                decision_reason: DecisionReason::PressureContext,
             })
             .collect();
 
@@ -357,6 +359,7 @@ impl SysctlGovernor {
                         "sysctl-governor: reverting '{}' using fallback (no default captured)",
                         key
                     ),
+                    decision_reason: DecisionReason::PressureContext,
                 });
             } else {
                 // Key not available on this macOS version — skip silently.
@@ -465,6 +468,7 @@ impl SysctlGovernor {
                 key: key.to_string(),
                 value: value.to_string(),
                 reason: format!("sysctl-governor: initial tuning — {}", reason),
+                decision_reason: DecisionReason::PressureContext,
             })
             .collect()
     }
@@ -1035,6 +1039,7 @@ impl SysctlGovernor {
             key: key.to_string(),
             value: value.to_string(),
             reason: reason.to_string(),
+            decision_reason: DecisionReason::PressureContext,
         });
         self.last_tuning.insert(key.to_string(), SystemTime::now());
         self.current_values

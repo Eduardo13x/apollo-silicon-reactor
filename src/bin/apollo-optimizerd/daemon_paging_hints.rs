@@ -19,6 +19,7 @@ use apollo_optimizer::engine::process_classifier::ProcessSnapshot;
 use apollo_optimizer::engine::safety::{is_protected_name, is_user_interactive_app};
 use apollo_optimizer::engine::swap_reclaim::{CyberPhysicalSignal, NetRateNorm};
 use apollo_optimizer::engine::types::RootAction;
+use apollo_optimizer::engine::audit_types::DecisionReason;
 
 /// Emit direct pressure-driven and ODE-velocity paging hints for this cycle.
 ///
@@ -108,6 +109,7 @@ pub fn run_paging_hints(
                     proc.name,
                     proc.rss_bytes / 1024 / 1024,
                 ),
+                DecisionReason::PressureContext,
             ));
             added += 1;
         }
@@ -176,6 +178,7 @@ pub fn run_paging_hints(
                     proc.name,
                     proc.rss_bytes / 1024 / 1024,
                 ),
+                DecisionReason::PressureContext,
             ));
             added += 1;
         }

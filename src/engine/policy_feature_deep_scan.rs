@@ -108,6 +108,7 @@ impl PolicyFeature for DeepScanCostFeature {
 mod tests {
     use super::*;
     use crate::engine::safety::ProtectionLevel;
+    use crate::engine::audit_types::DecisionReason;
 
     /// Build an `ActionContext` with sensible defaults; tests override what they need.
     fn make_ctx(hot_page_fraction: Option<f64>, wss_mb: Option<f64>) -> ActionContext {
@@ -140,6 +141,7 @@ mod tests {
             reason: "t".into(),
             start_sec: 0,
             start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
         }
     }
 
@@ -151,6 +153,7 @@ mod tests {
             reason: "t".into(),
             start_sec: 0,
             start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
         }
     }
 
@@ -159,6 +162,7 @@ mod tests {
             pid: 1234,
             name: "test".into(),
             reason: "t".into(),
+            decision_reason: DecisionReason::PressureContext,
         }
     }
 

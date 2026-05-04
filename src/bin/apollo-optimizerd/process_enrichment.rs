@@ -21,6 +21,7 @@ use apollo_optimizer::engine::process_classifier::{ProcessSnapshot, ProcessTier}
 use apollo_optimizer::engine::process_tree::ProcessTree;
 use apollo_optimizer::engine::safety::is_protected_name;
 use apollo_optimizer::engine::types::{InteractiveContext, RootAction, SafetyPolicy};
+use apollo_optimizer::engine::audit_types::DecisionReason;
 use apollo_optimizer::engine::zombie_hunter::HuntSnapshot;
 use sysinfo::ProcessStatus;
 
@@ -97,6 +98,7 @@ pub fn apply_post_wake_grace_policy(
                 reason,
                 start_sec,
                 start_usec,
+                decision_reason,
             } => {
                 throttle_suppressed += 1;
                 out.push(RootAction::ThrottleProcess {
@@ -106,6 +108,7 @@ pub fn apply_post_wake_grace_policy(
                     reason,
                     start_sec,
                     start_usec,
+                    decision_reason,
                 });
             }
             _ => out.push(action),
@@ -389,6 +392,7 @@ pub fn convert_and_merge_heuristic_decisions(
                     reason: format!("heuristic: {}", decision.reason),
                     start_sec: ss,
                     start_usec: su,
+                    decision_reason: DecisionReason::PressureContext,
                 });
                 stats.throttles += 1;
             }
@@ -400,6 +404,7 @@ pub fn convert_and_merge_heuristic_decisions(
                     reason: format!("heuristic: {}", decision.reason),
                     start_sec: ss,
                     start_usec: su,
+                    decision_reason: DecisionReason::PressureContext,
                 });
                 stats.freezes += 1;
             }
@@ -412,6 +417,7 @@ pub fn convert_and_merge_heuristic_decisions(
                     reason: format!("heuristic (kill→freeze): {}", decision.reason),
                     start_sec: ss,
                     start_usec: su,
+                    decision_reason: DecisionReason::PressureContext,
                 });
                 stats.kills_downgraded += 1;
                 stats.freezes += 1;
@@ -482,16 +488,16 @@ mod tests {
     // category; grace_active is the toggle.
 
     fn freeze(pid: u32) -> RootAction {
-        RootAction::FreezeProcess { pid, name: "p".into(), reason: "r".into(), start_sec: 0, start_usec: 0 }
+        RootAction::FreezeProcess { pid, name: "p".into(), reason: "r".into(), start_sec: 0, start_usec: 0, decision_reason: DecisionReason::PressureContext }
     }
     fn throttle(pid: u32, aggressive: bool) -> RootAction {
-        RootAction::ThrottleProcess { pid, name: "p".into(), aggressive, reason: "r".into(), start_sec: 0, start_usec: 0 }
+        RootAction::ThrottleProcess { pid, name: "p".into(), aggressive, reason: "r".into(), start_sec: 0, start_usec: 0, decision_reason: DecisionReason::PressureContext }
     }
     fn quarantine() -> RootAction {
-        RootAction::QuarantineDaemon { daemon: "d".into(), active: true, reason: "r".into() }
+        RootAction::QuarantineDaemon { daemon: "d".into(), active: true, reason: "r".into(), decision_reason: DecisionReason::PressureContext }
     }
     fn boost(pid: u32) -> RootAction {
-        RootAction::BoostProcess { pid, name: "p".into(), reason: "r".into() }
+        RootAction::BoostProcess { pid, name: "p".into(), reason: "r".into(), decision_reason: DecisionReason::PressureContext }
     }
 
     #[test]

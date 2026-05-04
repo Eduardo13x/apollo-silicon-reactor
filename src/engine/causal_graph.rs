@@ -19,6 +19,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Hard cap for in-cycle edge count. Raised from 500 → 1500 after canary
+/// telemetry showed the graph was saturating immediately, causing edges to be
+/// evicted before they could accumulate the 3-15 cycles of evidence needed for
+/// causal evaluation. Sub-microsecond compaction (0.000375ms) confirms this is
+/// safe for CPU budget. [Cormen et al. 2009] §11 — bounded HashMap.
+pub const HOT_PATH_EDGE_CAP: usize = 1500;
+
 /// A causal edge: action X caused outcome Y with measured confidence.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CausalEdge {
@@ -201,6 +208,8 @@ pub struct CausalGraph {
     pending_slow: Vec<PendingAction>,
     /// Cycles to wait before evaluating outcome (fast horizon).
     eval_delay: u8,
+    /// Counter for edges evicted due to hot-path capacity limits.
+    evictions_total: u64,
 }
 
 const EFFECT_PRESSURE_DROP: &str = "pressure_drop";
@@ -215,6 +224,7 @@ impl CausalGraph {
             pending: Vec::new(),
             pending_slow: Vec::new(),
             eval_delay: 3,
+            evictions_total: 0,
         }
     }
 
@@ -355,7 +365,6 @@ impl CausalGraph {
         // The persist-time decay-and-retain still runs and does the principled
         // GC; this is just a safety valve to keep hot-path lookups bounded.
         // [Cormen et al. 2009] §11 — bounded-size HashMap keeps O(1) amortised.
-        const HOT_PATH_EDGE_CAP: usize = 500;
         if self.edges.len() > HOT_PATH_EDGE_CAP {
             // Score = impact_score (higher = more useful). Evict lowest.
             // Multiply by 1000 + cast to i32 for stable Ord.
@@ -366,6 +375,7 @@ impl CausalGraph {
                 .map(|(k, _)| k.clone())
             {
                 self.edges.remove(&weakest);
+                self.evictions_total += 1;
             }
         }
     }
@@ -420,6 +430,61 @@ impl CausalGraph {
     /// Number of solid causal links discovered.
     pub fn solid_count(&self) -> usize {
         self.edges.values().filter(|e| e.is_solid()).count()
+    }
+
+    /// Number of unique causes (nodes) in the graph.
+    pub fn nodes_count(&self) -> usize {
+        let mut unique_causes = std::collections::HashSet::new();
+        for (cause, _) in self.edges.keys() {
+            unique_causes.insert(cause.as_str());
+        }
+        unique_causes.len()
+    }
+
+    /// Total number of evictions due to capacity limits.
+    pub fn evictions_total(&self) -> u64 {
+        self.evictions_total
+    }
+
+    /// Age of the oldest pending action in cycles.
+    pub fn oldest_pending_action_age_cycles(&self, current_cycle: u64) -> u64 {
+        let oldest_fast = self.pending.iter().map(|p| p.cycle).min().unwrap_or(current_cycle);
+        let oldest_slow = self.pending_slow.iter().map(|p| p.cycle).min().unwrap_or(current_cycle);
+        
+        let oldest = std::cmp::min(oldest_fast, oldest_slow);
+        current_cycle.saturating_sub(oldest)
+    }
+
+    /// Count edges whose cause matches known ephemeral process patterns.
+    /// This is an **observation-only** metric for Fase 2 planning.
+    /// Does NOT filter or block anything — just reports how much of the
+    /// graph's capacity is occupied by likely short-lived XPC/Helper processes.
+    pub fn ephemeral_edge_count(&self) -> usize {
+        self.edges
+            .keys()
+            .filter(|(cause, _)| {
+                // Extract process name from "throttle:name" or "freeze:name".
+                let name = cause
+                    .strip_prefix("throttle:")
+                    .or_else(|| cause.strip_prefix("freeze:"))
+                    .unwrap_or(cause);
+                Self::is_ephemeral_name(name)
+            })
+            .count()
+    }
+
+    /// Heuristic: does this process name look like a short-lived XPC or helper?
+    /// Conservative: only matches patterns with very high confidence of being
+    /// ephemeral. Does NOT match all com.apple.* (many are long-lived daemons).
+    fn is_ephemeral_name(name: &str) -> bool {
+        name == "xpcproxy"
+            || name.contains("XPCService")
+            || name.starts_with("com.apple.WebKit.WebContent")
+            || name.starts_with("com.apple.WebKit.Networking")
+            || name.starts_with("com.apple.WebKit.GPU")
+            || name.contains("(Utility)")
+            || name.contains("(Renderer)")
+            || (name.contains("Helper") && name.contains("("))
     }
 
     /// Build a map of action_key → causal_confidence for use in decide_actions.

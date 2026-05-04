@@ -15,6 +15,7 @@ use apollo_optimizer::engine::safety::{
 use apollo_optimizer::engine::types::{
     ActionBudgetState, CapabilityReport, OptimizationProfile, RootAction, SafetyPolicy,
 };
+use apollo_optimizer::engine::audit_types::DecisionReason;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -49,6 +50,7 @@ fn execute_boost_dead_pid_is_skipped() {
         pid: dead_pid(),
         name: "ghost-app".into(),
         reason: "test".into(),
+        decision_reason: DecisionReason::PressureContext,
     }];
     let mut frozen = HashSet::new();
     let outcomes = execute_actions(
@@ -82,6 +84,7 @@ fn execute_freeze_dead_pid_is_skipped() {
         reason: "test".into(),
         start_sec: 0,
         start_usec: 0,
+        decision_reason: DecisionReason::PressureContext,
     }];
     let mut frozen = HashSet::new();
     let outcomes = execute_actions(
@@ -117,6 +120,7 @@ fn execute_throttle_dead_pid_is_skipped() {
         reason: "test".into(),
         start_sec: 0,
         start_usec: 0,
+        decision_reason: DecisionReason::PressureContext,
     }];
     let mut frozen = HashSet::new();
     let outcomes = execute_actions(
@@ -141,6 +145,8 @@ fn execute_unfreeze_dead_pid_is_safe() {
     let actions = vec![RootAction::UnfreezeProcess {
         pid: dead_pid(),
         name: "ghost-app".into(),
+        reason: "test".to_string(),
+        decision_reason: DecisionReason::PressureContext,
     }];
     let mut frozen = HashSet::new();
     frozen.insert(dead_pid());
@@ -176,6 +182,7 @@ fn execute_non_allowlisted_sysctl_is_denied() {
         key: "kern.securelevel".into(), // NOT in the allowlist
         value: "0".into(),
         reason: "test".into(),
+        decision_reason: DecisionReason::PressureContext,
     }];
     let mut frozen = HashSet::new();
     let mut caps = no_caps();
@@ -210,6 +217,7 @@ fn execute_sysctl_without_cap_is_skipped() {
         key: "vm.compressor_poll_interval".into(), // in allowlist
         value: "20".into(),
         reason: "test".into(),
+        decision_reason: DecisionReason::PressureContext,
     }];
     let mut frozen = HashSet::new();
     let caps = no_caps(); // can_sysctl = false
@@ -244,17 +252,20 @@ fn execute_outcomes_all_zero_for_dead_pids() {
             pid: dead,
             name: "dead1".into(),
             reason: "test".into(),
+            decision_reason: DecisionReason::PressureContext,
         },
         RootAction::BoostProcess {
             pid: dead + 1,
             name: "dead2".into(),
             reason: "test".into(),
+            decision_reason: DecisionReason::PressureContext,
         },
         RootAction::ThrottleProcess {
             pid: dead + 2,
             name: "dead3".into(),
             aggressive: false,
             reason: "test".into(),
+            decision_reason: DecisionReason::PressureContext,
             start_sec: 0,
             start_usec: 0,
         },
@@ -262,6 +273,7 @@ fn execute_outcomes_all_zero_for_dead_pids() {
             pid: dead + 3,
             name: "dead4".into(),
             reason: "test".into(),
+            decision_reason: DecisionReason::PressureContext,
             start_sec: 0,
             start_usec: 0,
         },
@@ -269,6 +281,7 @@ fn execute_outcomes_all_zero_for_dead_pids() {
             key: "kern.securelevel".into(),
             value: "0".into(),
             reason: "bad".into(),
+            decision_reason: DecisionReason::PressureContext,
         },
     ];
 
@@ -310,6 +323,7 @@ fn full_pipeline_respects_all_caps() {
                 pid: (1000 + i) as u32,
                 name: format!("app-{}", i),
                 reason: "focus".into(),
+                decision_reason: DecisionReason::PressureContext,
             },
             1 => RootAction::ThrottleProcess {
                 pid: (2000 + i) as u32,
@@ -318,6 +332,7 @@ fn full_pipeline_respects_all_caps() {
                 reason: "noise".into(),
                 start_sec: 0,
                 start_usec: 0,
+                decision_reason: DecisionReason::PressureContext,
             },
             _ => RootAction::FreezeProcess {
                 pid: (3000 + i) as u32,
@@ -325,6 +340,7 @@ fn full_pipeline_respects_all_caps() {
                 reason: "pressure".into(),
                 start_sec: 0,
                 start_usec: 0,
+                decision_reason: DecisionReason::PressureContext,
             },
         })
         .collect();
@@ -422,6 +438,7 @@ fn budget_cycle_counters_reset_but_minute_counter_persists() {
             pid: (1000 + i) as u32,
             name: format!("app-{}", i),
             reason: "test".into(),
+            decision_reason: DecisionReason::PressureContext,
         })
         .collect();
     enforce_limits_with_budget(actions1, &policy, &mut budget, 100);
@@ -443,6 +460,7 @@ fn budget_cycle_counters_reset_but_minute_counter_persists() {
             reason: "test".into(),
             start_sec: 0,
             start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
         })
         .collect();
     enforce_limits_with_budget(actions2, &policy, &mut budget, 100);
@@ -468,6 +486,7 @@ fn execute_actions_skips_protected_name_regardless_of_pid() {
         pid: 1, // PID 1 (launchd) — definitely exists, but name check fires before PID check
         name: "kernel_task".into(),
         reason: "test".into(),
+        decision_reason: DecisionReason::PressureContext,
     }];
     let mut frozen = HashSet::new();
     let outcomes = execute_actions(

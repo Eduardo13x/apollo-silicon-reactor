@@ -40,6 +40,7 @@ pub fn shadow_writes_failed() -> u64 {
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use crate::engine::audit_types::PolicyDecisionTrace;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BlockerKind {
@@ -181,6 +182,17 @@ pub fn emit_async(path: PathBuf, event: &BlockedActionEvent) {
     };
     // Send fails iff writer thread panicked. Bump fail counter — callers
     // detect dead writer via SHADOW_WRITES_FAILED climbing without _OK.
+    if writer_tx().send((path, line)).is_err() {
+        SHADOW_WRITES_FAILED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Async, non-blocking emit for policy audit traces.
+pub fn emit_audit_async(path: PathBuf, trace: &PolicyDecisionTrace) {
+    let Ok(line) = serde_json::to_string(trace) else {
+        SHADOW_WRITES_FAILED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
     if writer_tx().send((path, line)).is_err() {
         SHADOW_WRITES_FAILED.fetch_add(1, Ordering::Relaxed);
     }

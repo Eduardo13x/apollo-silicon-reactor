@@ -23,6 +23,7 @@ use apollo_optimizer::collector::SystemSnapshot;
 use apollo_optimizer::engine::daemon_helpers::{hop_groups_path, signal_intelligence_path};
 use apollo_optimizer::engine::daemon_state::SharedState;
 use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
+use apollo_optimizer::engine::blocked_action_journal::emit_audit_async;
 use apollo_optimizer::engine::execute_actions::ExecuteOutcomes;
 use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
 use apollo_optimizer::engine::learned_state::{
@@ -205,8 +206,42 @@ pub fn run_learning_tick<'a>(
             cpu_pct: snapshot.top_processes.iter().map(|p| p.cpu_usage).sum(),
             swap_mb: swap_mb_now,
         };
+        let eval_start = std::time::Instant::now();
         lctx.causal_graph
             .evaluate_with_resources(pressure_now, cycle_count, &current_res);
+        let compaction_duration_ms = eval_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Sample every 10 cycles to avoid log bloat. Always emit if
+        // compaction_duration_ms exceeds the canary rollback threshold (10ms).
+        if cycle_count % 10 == 0 || compaction_duration_ms > 10.0 {
+            use apollo_optimizer::engine::causal_graph::HOT_PATH_EDGE_CAP;
+            let cap_utilization_ratio =
+                lctx.causal_graph.edge_count() as f64 / HOT_PATH_EDGE_CAP as f64;
+            tracing::debug!(
+                target: "apollo.causal_graph",
+                nodes_total = lctx.causal_graph.nodes_count(),
+                edges_total = lctx.causal_graph.edge_count(),
+                ephemeral_edges = lctx.causal_graph.ephemeral_edge_count(),
+                cap_utilization_ratio,
+                evictions_total = lctx.causal_graph.evictions_total(),
+                compaction_duration_ms,
+                oldest_event_age_cycles = lctx.causal_graph.oldest_pending_action_age_cycles(cycle_count),
+                "causal_graph_metrics"
+            );
+        }
+    }
+
+    // ── Policy Decision Audit (Observability Phase 2) ────────────────────────
+    // Emit full traces for every intended action, including success/block outcome.
+    // Asynchronous I/O via apollo-shadow-writer.
+    {
+        use apollo_optimizer::engine::daemon_helpers::policy_audit_path;
+        let audit_path = std::path::PathBuf::from(policy_audit_path());
+        for trace in &exec_outcomes.audit_traces {
+            let mut final_trace = trace.clone();
+            final_trace.cycle = cycle_count;
+            emit_audit_async(audit_path.clone(), &final_trace);
+        }
     }
 
     // ── Causal graph: process co-occurrence at high pressure ─────────────────

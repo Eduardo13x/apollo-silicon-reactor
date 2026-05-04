@@ -17,6 +17,7 @@ use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::predictive_agent::Intervention;
 use apollo_optimizer::engine::types::RootAction;
+use apollo_optimizer::engine::audit_types::DecisionReason;
 
 /// Inject predictive-agent soft actions for this cycle.
 ///
@@ -59,6 +60,7 @@ pub fn run_agent_actions(
                     proc.name.clone(),
                     false,
                     "predictive-agent: pre-throttle noise",
+                    DecisionReason::PressureContext,
                 ));
             }
         }
@@ -92,6 +94,7 @@ pub fn run_agent_actions(
                     pid: proc.pid,
                     priority: -1,
                     reason: "predictive-agent: proactive purge hint".to_string(),
+                    decision_reason: DecisionReason::PressureContext,
                 });
             }
         }

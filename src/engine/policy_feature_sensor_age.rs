@@ -82,6 +82,7 @@ impl PolicyFeature for SensorAgeFeature {
 mod tests {
     use super::*;
     use crate::engine::safety::ProtectionLevel;
+    use crate::engine::audit_types::DecisionReason;
 
     fn ctx_with_age(age: Option<u64>) -> ActionContext {
         ActionContext {
@@ -107,11 +108,11 @@ mod tests {
     }
 
     fn freeze() -> RootAction {
-        RootAction::freeze(1234, "testproc", "unit-test")
+        RootAction::freeze(1234, "testproc", "unit-test", DecisionReason::PressureContext)
     }
 
     fn throttle() -> RootAction {
-        RootAction::throttle(1234, "testproc", false, "unit-test")
+        RootAction::throttle(1234, "testproc", false, "unit-test", DecisionReason::PressureContext)
     }
 
     fn boost() -> RootAction {
@@ -119,6 +120,7 @@ mod tests {
             pid: 1234,
             name: "testproc".into(),
             reason: "unit-test".into(),
+            decision_reason: DecisionReason::PressureContext,
         }
     }
 

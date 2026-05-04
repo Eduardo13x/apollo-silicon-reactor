@@ -468,6 +468,7 @@ impl PolicyFeature for UserDisruptionCostFeature {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::audit_types::DecisionReason;
 
     fn base_ctx() -> ActionContext {
         ActionContext {
@@ -493,11 +494,11 @@ mod tests {
     }
 
     fn freeze(pid: u32) -> RootAction {
-        RootAction::freeze(pid, format!("p{pid}"), "test")
+        RootAction::freeze(pid, format!("p{pid}"), "test", DecisionReason::PressureContext)
     }
 
     fn throttle(pid: u32) -> RootAction {
-        RootAction::throttle(pid, format!("p{pid}"), false, "test")
+        RootAction::throttle(pid, format!("p{pid}"), false, "test", DecisionReason::PressureContext)
     }
 
     fn boost(pid: u32) -> RootAction {
@@ -505,6 +506,7 @@ mod tests {
             pid,
             name: format!("p{pid}"),
             reason: "test".into(),
+            decision_reason: DecisionReason::PressureContext,
         }
     }
 

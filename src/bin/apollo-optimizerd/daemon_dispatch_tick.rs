@@ -259,6 +259,7 @@ mod tests {
     use apollo_optimizer::engine::usage_model::UsageModel;
     use apollo_optimizer::engine::daemon_helpers::WakeRuntimeState;
     use apollo_optimizer::engine::types::{CapabilityReport, RuntimeMetrics, OptimizationProfile, LatencyTarget};
+    use apollo_optimizer::engine::audit_types::DecisionReason;
     use apollo_optimizer::engine::circuit_breaker::{CircuitBreaker, CircuitState};
     use apollo_optimizer::engine::degradation::DegradationController;
     use apollo_optimizer::collector::{CpuStats, MemoryStats, PressureStats};
@@ -401,8 +402,8 @@ mod tests {
             journal_path: Path::new("/tmp/apollo_test_journal"),
             frozen_state_path: Path::new("/tmp/apollo_test_frozen"),
             final_actions: vec![
-                RootAction::throttle(1234, "test", true, "test"),
-                RootAction::unfreeze(5678, "test_unfreeze"),
+                RootAction::throttle(1234, "test", true, "test", DecisionReason::PressureContext),
+                RootAction::unfreeze(5678, "test_unfreeze", "test", DecisionReason::PressureContext),
             ],
             snapshot: &snapshot,
             prev_cog_decision: None,

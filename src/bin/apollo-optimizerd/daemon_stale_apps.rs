@@ -18,6 +18,7 @@ use apollo_optimizer::engine::daemon_helpers::pid_start_time;
 use apollo_optimizer::engine::daemon_state::SharedState;
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::types::RootAction;
+use apollo_optimizer::engine::audit_types::DecisionReason;
 
 /// Nominate stale background apps as freeze candidates.
 ///
@@ -85,6 +86,7 @@ pub fn run_stale_app_freeze(
             ),
             ss,
             su,
+            DecisionReason::PressureContext,
         ));
     }
 

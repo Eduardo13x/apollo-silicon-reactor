@@ -17,6 +17,7 @@ use std::collections::HashSet;
 
 use apollo_optimizer::collector::SystemCollector;
 use apollo_optimizer::engine::types::RootAction;
+use apollo_optimizer::engine::audit_types::DecisionReason;
 
 pub struct ClusterActionsOutput {
     /// New throttle actions to append to the main actions vec.
@@ -78,6 +79,7 @@ pub fn run_cluster_actions(
                             "coordinated-cluster: co-occurs with {} (n={})",
                             partner, count
                         ),
+                        DecisionReason::PressureContext,
                     ));
                     break;
                 }

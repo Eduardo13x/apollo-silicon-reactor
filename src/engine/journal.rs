@@ -109,6 +109,7 @@ pub fn read_journal(path: &Path) -> anyhow::Result<Vec<JournalEntry>> {
 mod tests {
     use super::*;
     use crate::engine::types::{FreezeSource, FrozenEntry, RootAction};
+    use crate::engine::audit_types::DecisionReason;
     use std::io::Write;
 
     fn make_entry() -> JournalEntry {
@@ -118,6 +119,7 @@ mod tests {
                 pid: 42,
                 name: "test-proc".to_string(),
                 reason: "test".to_string(),
+                decision_reason: DecisionReason::PressureContext,
             },
             before: None,
             after: None,
