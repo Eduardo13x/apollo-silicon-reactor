@@ -14,7 +14,7 @@ pub struct RepoConfig {
     pub llm: Option<LlmConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct LlmConfig {
     /// Master switch (in addition to key TTL state).
     pub enabled: Option<bool>,

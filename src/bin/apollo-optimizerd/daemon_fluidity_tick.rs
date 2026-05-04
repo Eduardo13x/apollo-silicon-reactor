@@ -16,20 +16,20 @@ pub struct FluidityTickOutput {
 pub fn run_fluidity_tick(input: FluidityTickInput) -> FluidityTickOutput {
     // Migrated from main.rs:2291-2310 (Strangler Fig).
     // Compute GPU load 0-1 from package watts.
-    let fl_procs: Vec<(u32, &str, f32)> = input
-        .proc_snaps
-        .iter()
-        .map(|p| (p.pid, p.name.as_str(), p.cpu_percent))
-        .collect();
     let fl_gpu_load = input
         .cycle_hw_snap
         .and_then(|hw| hw.power.gpu_watts)
         .map(|w| (w / 15.0).clamp(0.0, 1.0) as f32)
         .unwrap_or(0.0);
 
-    input
-        .fluidity_state
-        .update(&fl_procs, fl_gpu_load, input.cycle_dt_secs);
+    input.fluidity_state.update(
+        input
+            .proc_snaps
+            .iter()
+            .map(|p| (p.pid, p.name.as_str(), p.cpu_percent)),
+        fl_gpu_load,
+        input.cycle_dt_secs,
+    );
 
     FluidityTickOutput {
         fl_signal: FluiditySignal::from(&*input.fluidity_state),
@@ -69,7 +69,7 @@ mod tests {
             is_app_bundle: false,
         }).collect::<Vec<_>>();
 
-        let mut input = FluidityTickInput {
+        let input = FluidityTickInput {
             proc_snaps: &proc_snaps,
             cycle_hw_snap: None,
             cycle_dt_secs: 0.5,
@@ -92,6 +92,6 @@ mod tests {
         let mut state = apollo_optimizer::engine::fluidity::FluidityState::new();
         let _sig = apollo_optimizer::engine::fluidity::FluiditySignal::from(&state);
         // Mutating state after snapshot must not affect snapshot
-        state.update(&[(415, "WindowServer", 50.0)], 0.0, 0.5);
+        state.update(vec![(415, "WindowServer", 50.0)], 0.0, 0.5);
     }
 }

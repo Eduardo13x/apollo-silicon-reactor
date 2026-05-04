@@ -131,13 +131,13 @@ pub fn run_reactor_tick(input: ReactorTickInput) -> f64 {
         reactor_weight = (reactor_weight + 0.15).min(1.0);
     }
 
-    reactor_weight
+    reactor_weight.clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apollo_optimizer::engine::signal_intelligence::{SignalDigest, SignalIntelligence};
+    use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
     use std::path::PathBuf;
 
     #[test]

@@ -625,6 +625,7 @@ fn main() -> anyhow::Result<()> {
                 mut cycle_ipc_tracker,
                 mut unfreeze_decay,
                 mut swap_reclaim,
+                mut memory_budget,
             } = daemon_init::DaemonSubsystems::new();
             let mut nested_learner = apollo_optimizer::engine::nested_learner::NestedLearner::new();
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
@@ -1629,6 +1630,7 @@ fn main() -> anyhow::Result<()> {
                     &state,
                     &proc_snaps,
                     &mem_analyzer,
+                    &mut memory_budget,
                 );
 
                 // Audit fix #5: Read cached hardware data from background SmcReader thread.

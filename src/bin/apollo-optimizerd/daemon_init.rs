@@ -33,6 +33,7 @@ use apollo_optimizer::engine::thread_selfcounts::CycleIpcTracker;
 use apollo_optimizer::engine::swap_reclaim::SwapReclaimModel;
 use apollo_optimizer::engine::unfreeze_decay::UnfreezeDecayModel;
 use apollo_optimizer::engine::wake_storm_detector::WakeStormDetector;
+use crate::daemon_memory_budget::MemoryBudgetState;
 
 /// Subsystems constructed once at daemon startup with no shared-state dependencies.
 ///
@@ -73,6 +74,8 @@ pub(super) struct DaemonSubsystems {
     /// ODE model for compressor/swap saturation dynamics.
     /// dS/dt = dirty_rate − reclaim_rate; predicts time-to-saturation each cycle.
     pub swap_reclaim: SwapReclaimModel,
+    /// Persistent state for memory budget hysteresis and rate-limiting.
+    pub memory_budget: MemoryBudgetState,
 }
 
 /// Detect hardware capabilities (core count and RAM) once at startup.
@@ -132,6 +135,7 @@ impl DaemonSubsystems {
             cycle_ipc_tracker: CycleIpcTracker::new(),
             unfreeze_decay: UnfreezeDecayModel::new(),
             swap_reclaim: SwapReclaimModel::new(),
+            memory_budget: MemoryBudgetState::default(),
         }
     }
 }
