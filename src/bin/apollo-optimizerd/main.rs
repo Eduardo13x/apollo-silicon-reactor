@@ -629,6 +629,12 @@ fn main() -> anyhow::Result<()> {
                 mut memory_budget,
                 mut self_diagnosis,
             } = daemon_init::DaemonSubsystems::new();
+            // Cumulative dedup_drops counters from prior cycle — used to
+            // compute per-cycle delta for self_diagnosis recording.
+            let mut last_dedup_setmem: u64 = 0;
+            let mut last_dedup_throttle: u64 = 0;
+            let mut last_dedup_freeze: u64 = 0;
+            let mut last_dedup_unfreeze: u64 = 0;
             let mut nested_learner = apollo_optimizer::engine::nested_learner::NestedLearner::new();
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
             // TelemetryLogger: ring-buffer collection for time-series training data.
@@ -4206,14 +4212,28 @@ fn main() -> anyhow::Result<()> {
                 // Record this cycle's signals + check thresholds. Detection-only;
                 // alerts surface via tracing::warn! and append to
                 // /var/lib/apollo/self_diagnosis.jsonl for next-session pickup.
+                //
+                // dedup_drops counters are CUMULATIVE (atomic add) — convert to
+                // per-cycle delta by tracking last-seen totals.
                 {
                     let snap = lf_metrics.snapshot();
-                    let dedup_total = snap.dedup_drops_setmemorystatus
-                        + snap.dedup_drops_throttle
-                        + snap.dedup_drops_freeze
-                        + snap.dedup_drops_unfreeze;
+                    let cur_setmem = snap.dedup_drops_setmemorystatus;
+                    let cur_throttle = snap.dedup_drops_throttle;
+                    let cur_freeze = snap.dedup_drops_freeze;
+                    let cur_unfreeze = snap.dedup_drops_unfreeze;
+                    let delta_setmem = cur_setmem.saturating_sub(last_dedup_setmem);
+                    let delta_throttle = cur_throttle.saturating_sub(last_dedup_throttle);
+                    let delta_freeze = cur_freeze.saturating_sub(last_dedup_freeze);
+                    let delta_unfreeze = cur_unfreeze.saturating_sub(last_dedup_unfreeze);
+                    last_dedup_setmem = cur_setmem;
+                    last_dedup_throttle = cur_throttle;
+                    last_dedup_freeze = cur_freeze;
+                    last_dedup_unfreeze = cur_unfreeze;
                     self_diagnosis.record_cycle(
-                        dedup_total,
+                        delta_setmem,
+                        delta_throttle,
+                        delta_freeze,
+                        delta_unfreeze,
                         snap.refresh_duration_us,
                         snapshot.pressure.memory_pressure,
                     );

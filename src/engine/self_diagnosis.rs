@@ -48,12 +48,24 @@ struct CycleObservation {
     /// time-correlation features (e.g., burst detection).
     #[allow(dead_code)]
     at: Instant,
-    dedup_drops_total: u64,
+    dedup_drops_setmemorystatus: u64,
+    dedup_drops_throttle: u64,
+    dedup_drops_freeze: u64,
+    dedup_drops_unfreeze: u64,
     refresh_duration_us: u64,
     /// Coarse pressure zone discrimination via memory_pressure value.
     /// Avoids depending on `MemoryBudgetState::current_zone` which would
     /// pull in daemon binary types into a library module.
     in_normal_zone: bool,
+}
+
+impl CycleObservation {
+    fn dedup_drops_total(&self) -> u64 {
+        self.dedup_drops_setmemorystatus
+            + self.dedup_drops_throttle
+            + self.dedup_drops_freeze
+            + self.dedup_drops_unfreeze
+    }
 }
 
 /// Diagnosis event severity matches NotebookLM gap classification.
@@ -103,10 +115,14 @@ impl SelfDiagnosis {
         }
     }
 
-    /// Record one cycle's signals. Bounded ring buffer.
+    /// Record one cycle's signals with per-kind dedup breakdown.
+    /// Bounded ring buffer.
     pub fn record_cycle(
         &mut self,
-        dedup_drops_total: u64,
+        dedup_drops_setmemorystatus: u64,
+        dedup_drops_throttle: u64,
+        dedup_drops_freeze: u64,
+        dedup_drops_unfreeze: u64,
         refresh_duration_us: u64,
         memory_pressure: f64,
     ) {
@@ -115,7 +131,10 @@ impl SelfDiagnosis {
         }
         self.window.push_back(CycleObservation {
             at: Instant::now(),
-            dedup_drops_total,
+            dedup_drops_setmemorystatus,
+            dedup_drops_throttle,
+            dedup_drops_freeze,
+            dedup_drops_unfreeze,
             refresh_duration_us,
             in_normal_zone: memory_pressure < 0.65,
         });
@@ -134,23 +153,38 @@ impl SelfDiagnosis {
         }
 
         // ── Signal 1: dedup_drops trending up ────────────────────────────────
-        // If avg drops/cycle over the window > 0.5, upstream paths are emitting
-        // duplicates frequently — Phase 1 chokepoint is catching them but a
-        // new emission path was likely added without dedup awareness.
-        let total_drops: u64 = self.window.iter().map(|o| o.dedup_drops_total).sum();
-        let avg_drops_per_cycle = total_drops as f64 / self.window.len() as f64;
-        if avg_drops_per_cycle > 0.5 && self.cooldown_ok("dedup_regression", now) {
+        // Per-kind breakdown lets the alert pinpoint which emission class is
+        // regressing (Throttle vs SetMemorystatus vs Freeze).
+        //
+        // Threshold tuned 2026-05-06 from 0.5 → 3.0 actions/cycle: steady-state
+        // baseline measured at ~7.6/cycle in prod (multiple modules emitting
+        // independent decisions for the same PID, expected behavior). Alert now
+        // fires only when drops climb significantly above that floor — the
+        // signal we WANT is "regression beyond steady-state", not "any dup".
+        let total_drops: u64 = self.window.iter().map(|o| o.dedup_drops_total()).sum();
+        let throttle_drops: u64 = self.window.iter().map(|o| o.dedup_drops_throttle).sum();
+        let setmem_drops: u64 = self.window.iter().map(|o| o.dedup_drops_setmemorystatus).sum();
+        let freeze_drops: u64 = self.window.iter().map(|o| o.dedup_drops_freeze).sum();
+        let unfreeze_drops: u64 = self.window.iter().map(|o| o.dedup_drops_unfreeze).sum();
+        let n = self.window.len() as f64;
+        let avg_drops_per_cycle = total_drops as f64 / n;
+
+        if avg_drops_per_cycle > 3.0 && self.cooldown_ok("dedup_regression", now) {
             self.last_alert_at.insert("dedup_regression", now);
             alerts.push(DiagnosisAlert {
                 at: Utc::now(),
                 kind: "dedup_regression".to_string(),
                 severity: DiagnosisSeverity::Medium,
                 summary: format!(
-                    "dedup chokepoint dropping {:.2} actions/cycle (window={} cycles); upstream emission path likely missing dedup",
+                    "dedup chokepoint dropping {:.2}/cycle (throttle={:.2}, setmem={:.2}, freeze={:.2}, unfreeze={:.2}; window={} cycles, threshold=3.0)",
                     avg_drops_per_cycle,
+                    throttle_drops as f64 / n,
+                    setmem_drops as f64 / n,
+                    freeze_drops as f64 / n,
+                    unfreeze_drops as f64 / n,
                     self.window.len()
                 ),
-                recommended_action: "audit recent commits to action emission paths (decide_actions, daemon_paging_hints, daemon_agent_actions, llm_daemon, ChromiumManager) — verify per-PID local dedup at emission OR rely on chokepoint".to_string(),
+                recommended_action: "audit emission paths for the dominant kind: ThrottleProcess most often = process_enrichment + decide_actions heuristic-pass producing parallel decisions for same PID; SetMemorystatus = daemon_paging_hints + main.rs deep-scan + daemon_agent_actions; Freeze = process_enrichment GovernorDecision::Freeze + Kill→Freeze downgrade".to_string(),
             });
         }
 
@@ -238,7 +272,8 @@ mod tests {
     fn under_60_cycles_emits_no_alerts() {
         let mut sd = SelfDiagnosis::new(temp_path());
         for _ in 0..30 {
-            sd.record_cycle(10, 50_000, 0.5);
+            // throttle=10 well above threshold but below cycle quorum.
+            sd.record_cycle(0, 10, 0, 0, 50_000, 0.5);
         }
         let alerts = sd.check();
         assert!(alerts.is_empty(), "below window-min threshold");
@@ -247,21 +282,41 @@ mod tests {
     #[test]
     fn dedup_drops_above_threshold_emits_alert() {
         let mut sd = SelfDiagnosis::new(temp_path());
-        // 100 cycles avg drops = 1.0/cycle — well above 0.5 threshold.
+        // 100 cycles each with 4 throttle drops = 4.0/cycle (above 3.0 threshold).
         for _ in 0..100 {
-            sd.record_cycle(1, 10_000, 0.5);
+            sd.record_cycle(0, 4, 0, 0, 10_000, 0.5);
         }
         let alerts = sd.check();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].kind, "dedup_regression");
         assert_eq!(alerts[0].severity, DiagnosisSeverity::Medium);
+        assert!(
+            alerts[0].summary.contains("throttle="),
+            "summary should break down by kind: {}",
+            alerts[0].summary
+        );
+    }
+
+    #[test]
+    fn dedup_drops_steady_state_no_alert() {
+        let mut sd = SelfDiagnosis::new(temp_path());
+        // 100 cycles each with 2 throttle drops = 2.0/cycle (steady state, below 3.0).
+        // Mirrors prod baseline ~7.6/cycle but well below regression threshold.
+        for _ in 0..100 {
+            sd.record_cycle(0, 2, 0, 0, 10_000, 0.5);
+        }
+        let alerts = sd.check();
+        assert!(
+            alerts.iter().all(|a| a.kind != "dedup_regression"),
+            "steady-state drops below threshold should not alert"
+        );
     }
 
     #[test]
     fn dedup_drops_zero_emits_no_alert() {
         let mut sd = SelfDiagnosis::new(temp_path());
         for _ in 0..100 {
-            sd.record_cycle(0, 10_000, 0.5);
+            sd.record_cycle(0, 0, 0, 0, 10_000, 0.5);
         }
         let alerts = sd.check();
         assert!(alerts.iter().all(|a| a.kind != "dedup_regression"));
@@ -271,7 +326,7 @@ mod tests {
     fn cooldown_suppresses_repeated_alerts() {
         let mut sd = SelfDiagnosis::new(temp_path());
         for _ in 0..100 {
-            sd.record_cycle(1, 10_000, 0.5);
+            sd.record_cycle(0, 4, 0, 0, 10_000, 0.5);
         }
         let first = sd.check();
         assert_eq!(first.len(), 1);
@@ -285,7 +340,7 @@ mod tests {
         let mut sd = SelfDiagnosis::new(temp_path());
         // 100 cycles in Normal zone with refresh 50ms — above 30ms threshold.
         for _ in 0..100 {
-            sd.record_cycle(0, 50_000, 0.5);
+            sd.record_cycle(0, 0, 0, 0, 50_000, 0.5);
         }
         let alerts = sd.check();
         assert!(alerts.iter().any(|a| a.kind == "sysinfo_regression"));
@@ -297,7 +352,7 @@ mod tests {
         // 100 cycles in Elevated zone with refresh 50ms — should NOT alert
         // (only Normal zone has the staggered-refresh expectation).
         for _ in 0..100 {
-            sd.record_cycle(0, 50_000, 0.70);
+            sd.record_cycle(0, 0, 0, 0, 50_000, 0.70);
         }
         let alerts = sd.check();
         assert!(
@@ -310,7 +365,7 @@ mod tests {
     fn rolling_window_bounded() {
         let mut sd = SelfDiagnosis::new(temp_path());
         for _ in 0..1000 {
-            sd.record_cycle(0, 10_000, 0.5);
+            sd.record_cycle(0, 0, 0, 0, 10_000, 0.5);
         }
         assert!(sd.window.len() <= sd.window_capacity);
     }
