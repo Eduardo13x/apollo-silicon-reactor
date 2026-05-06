@@ -1400,14 +1400,17 @@ fn main() -> anyhow::Result<()> {
                                 .retain_mut(|stream| stream.write_all(batch).is_ok());
                             dry_run_batch.clear();
                             dry_run_batch_count = 0;
-                            // Sync atomic cycle count to state.metrics once per batch
-                            // so GetMetrics/GetHealth return non-stale data (16x amortized).
-                            state.metrics.lock_recover().metrics.cycles = cycles;
                         }
                     }
                     last_cycle_end = Instant::now();
                     lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
                     lf_metrics.commit();
+
+                    // Periodic sync for observability in dry-run mode.
+                    if cycle_count % 5 == 0 {
+                        let snap = lf_metrics.snapshot();
+                        state.metrics.lock_recover().sync_from_lockfree(&snap);
+                    }
                     continue;
                 }
 
@@ -1502,16 +1505,14 @@ fn main() -> anyhow::Result<()> {
                 // Dropping the pressure gate removes ~15-25ms of disk/net I/O at 0.70+ pressure
                 // where the old 0.40 threshold never fired anyway.
                 let use_light = cycle_count % 30 != 0;
-                let mut snapshot = if dry_run && use_light {
-                    // In dry-run, skip refresh_processes() — stale process list is
-                    // harmless when execute_actions() is a no-op. Removes the dominant
-                    // per-cycle cost (~50-100ms sysinfo process enumeration).
+                let (mut snapshot, refresh_duration) = if dry_run && use_light {
                     collector.collect_snapshot_no_process_refresh()
                 } else if use_light {
-                    collector.collect_snapshot_light()
+                    collector.collect_snapshot_light(pressure_collector.latest().memory_pressure)
                 } else {
                     collector.collect_snapshot()
                 };
+                lf_metrics.set_refresh_duration_us(refresh_duration.as_micros() as u64);
                 // Overlay pressure data from background PressureCollector cache
                 // when it's fresh (< 10s old), avoiding blocking subprocesses on hot path.
                 {
@@ -1625,6 +1626,7 @@ fn main() -> anyhow::Result<()> {
                 // Memory budgets: jetsam inactive limits for over-budget processes.
                 // Extracted to daemon_memory_budget::run_memory_budget (Wave 28).
                 // [Fowler 2004] Strangler Fig — pure move.
+                let mem_budget_start = Instant::now();
                 daemon_memory_budget::run_memory_budget(
                     snapshot.pressure.memory_pressure,
                     snapshot.memory.total_ram,
@@ -1633,6 +1635,7 @@ fn main() -> anyhow::Result<()> {
                     &mem_analyzer,
                     &mut memory_budget,
                 );
+                lf_metrics.set_memory_budget_duration_us(mem_budget_start.elapsed().as_micros() as u64);
 
                 // Audit fix #5: Read cached hardware data from background SmcReader thread.
                 // No more blocking 500 ms powermetrics calls on the hot path.
@@ -2599,6 +2602,7 @@ fn main() -> anyhow::Result<()> {
                 // ── Reactor weight: adaptive modulation ──────────────────────────────
                 // Extracted to daemon_reactor_tick::run_reactor_tick (Wave 39).
                 // [Denning 1968; Pirolli & Card 1999; Hellerstein 2004]
+                let reactor_start = Instant::now();
                 reactor_weight = daemon_reactor_tick::run_reactor_tick(daemon_reactor_tick::ReactorTickInput {
                     signal_digest: &signal_digest,
                     holt_winters: &holt_winters,
@@ -2615,6 +2619,7 @@ fn main() -> anyhow::Result<()> {
                     llm_active,
                     base_reactor_weight: reactor_weight,
                 });
+                lf_metrics.set_reactor_duration_us(reactor_start.elapsed().as_micros() as u64);
 
 
                 // Predictive agent: build context from existing signals and select intervention.
@@ -4193,6 +4198,13 @@ fn main() -> anyhow::Result<()> {
                 last_cycle_end = Instant::now();
                 lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
                 lf_metrics.commit();
+
+                // Periodic sync of lock-free hot path metrics to the Mutex-protected state
+                // once every 5 cycles (~1.5s - 10s depending on load). Reduces lock contention.
+                if cycle_count % 5 == 0 {
+                    let snap = lf_metrics.snapshot();
+                    state.metrics.lock_recover().sync_from_lockfree(&snap);
+                }
                 // Reactive: condvar.wait_timeout instead of thread::sleep.
                 // Wakes immediately on reactor events; otherwise max 500ms (fast) or 2s (idle).
                 // In dry-run mode, skip the condvar wait entirely — pure cycle throughput.

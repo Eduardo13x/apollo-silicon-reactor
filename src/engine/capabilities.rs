@@ -28,6 +28,12 @@ pub fn detect_capabilities() -> CapabilityReport {
     }
 
     let is_root = unsafe { libc::geteuid() == 0 };
+    
+    // Core counts (Apple Silicon clusters)
+    // perflevel0 = P-cores (Firestorm/Avalanche/etc.)
+    // perflevel1 = E-cores (Icestorm/Blizzard/etc.)
+    let p_core_count = crate::engine::sysctl_direct::read_u32_val("hw.perflevel0.logicalcpu");
+    let e_core_count = crate::engine::sysctl_direct::read_u32_val("hw.perflevel1.logicalcpu");
 
     CapabilityReport {
         can_taskpolicy,
@@ -36,6 +42,8 @@ pub fn detect_capabilities() -> CapabilityReport {
         can_mdutil,
         can_tmutil,
         is_root,
+        p_core_count,
+        e_core_count,
         unavailable,
     }
 }

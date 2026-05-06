@@ -30,15 +30,15 @@ pub fn run_reactor_tick(input: ReactorTickInput) -> f64 {
     // Signal intelligence → reactor_weight boosting.
     // CUSUM regime shift: pressure drifting up significantly.
     if signal_digest.regime_shift_up {
-        reactor_weight = (reactor_weight + 0.3).min(1.0);
+        reactor_weight = (reactor_weight + 0.15).min(1.0);
     }
     // High composite urgency: multiple signals converging on danger.
     if signal_digest.urgency > 0.7 {
-        reactor_weight = (reactor_weight + 0.2).min(1.0);
+        reactor_weight = (reactor_weight + 0.1).min(1.0);
     }
     // Entropy anomaly: chaotic process distribution change.
     if signal_digest.entropy_anomaly > 2.0 {
-        reactor_weight = (reactor_weight + 0.15).min(1.0);
+        reactor_weight = (reactor_weight + 0.07).min(1.0);
     }
     // SDE sticky-swap: high σ at moderate pressure = oscillation harbinger.
     if signal_digest.swap_net_rate_volatility > 1_000_000.0
@@ -65,7 +65,7 @@ pub fn run_reactor_tick(input: ReactorTickInput) -> f64 {
     }
     // Darwin-Boltzmann anomaly: learned pattern deviation.
     if signal_digest.transformer_anomaly > 0.5 {
-        reactor_weight = (reactor_weight + 0.2).min(1.0);
+        reactor_weight = (reactor_weight + 0.1).min(1.0);
     }
     // Feed-forward pressure relief: tabs closed or heavy app terminated.
     if *input.window_relief_cycles > 0 {

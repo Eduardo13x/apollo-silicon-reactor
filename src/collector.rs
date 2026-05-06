@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use sysinfo::System;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -118,15 +118,9 @@ impl SystemCollector {
         &self.sys
     }
 
-    pub fn collect_snapshot(&mut self) -> SystemSnapshot {
-        // Capture timestamp BEFORE sysinfo refresh — `refresh_processes()` is the
-        // dominant cost (~50-100ms on macOS for ~400 processes) and represents
-        // the true gathering window. Stamping AFTER refresh under-reports
-        // `sensor_age_ms` by exactly that window, masking temporal aliasing
-        // between µs-latency kqueue events and ~50ms-latency sysinfo state.
-        // [Hellerstein 2004 §9 sensor delay in feedback control;
-        //  Welch & Bishop 2006 — measurement covariance ∝ delay]
+    pub fn collect_snapshot(&mut self) -> (SystemSnapshot, Duration) {
         let snapshot_started_at = Utc::now();
+        let start = Instant::now();
         // Refresh system stats — skip process refresh for first 3 cycles
         // (startup grace period: avoids expensive initial enumeration).
         // Lightweight refresh every cycle: CPU + memory + processes only.
@@ -212,45 +206,65 @@ impl SystemCollector {
         });
         let top_processes = processes.into_iter().take(10).collect();
 
-        SystemSnapshot {
-            timestamp: snapshot_started_at,
-            cpu: CpuStats {
-                global_usage: global_cpu,
-                core_count,
+        (
+            SystemSnapshot {
+                timestamp: snapshot_started_at,
+                cpu: CpuStats {
+                    global_usage: global_cpu,
+                    core_count,
+                },
+                memory: MemoryStats {
+                    total_ram,
+                    used_ram,
+                    free_ram,
+                    total_swap,
+                    used_swap,
+                },
+                pressure: PressureStats {
+                    memory_pressure: mem_pressure,
+                    swap_used_bytes,
+                    swap_total_bytes,
+                    swap_delta_bytes_per_sec: swap_delta_bps,
+                    thermal_level: "unknown".to_string(),
+                    compressor_pressure,
+                    thrashing_score: 0.0, // populated by daemon from pressure collector
+                },
+                disks,
+                networks,
+                top_processes,
             },
-            memory: MemoryStats {
-                total_ram,
-                used_ram,
-                free_ram,
-                total_swap,
-                used_swap,
-            },
-            pressure: PressureStats {
-                memory_pressure: mem_pressure,
-                swap_used_bytes,
-                swap_total_bytes,
-                swap_delta_bytes_per_sec: swap_delta_bps,
-                thermal_level: "unknown".to_string(),
-                compressor_pressure,
-                thrashing_score: 0.0, // populated by daemon from pressure collector
-            },
-            disks,
-            networks,
-            top_processes,
-        }
+            start.elapsed(),
+        )
     }
 
     /// Light snapshot: skips disk/network refresh and uses direct sysctl calls
     /// instead of subprocesses. Use when hw_pressure is Nominal and memory is low.
     /// ~10x faster than collect_snapshot().
-    pub fn collect_snapshot_light(&mut self) -> SystemSnapshot {
-        // Capture timestamp BEFORE sysinfo refresh — see `collect_snapshot()`
-        // for full rationale. Even on the light path, `refresh_processes()`
-        // dominates per-cycle cost (~50ms M1).
+    pub fn collect_snapshot_light(&mut self, pressure: f64) -> (SystemSnapshot, Duration) {
         let snapshot_started_at = Utc::now();
+        let start = Instant::now();
+        
         self.sys.refresh_cpu();
         self.sys.refresh_memory();
-        self.sys.refresh_processes();
+        
+        // Staggered process refresh:
+        // Normal (<0.65): refresh every 8 cycles (~2.4s)
+        // Elevated (0.65-0.80): refresh every 4 cycles (~1.2s)
+        // Critical (>0.80): refresh EVERY cycle
+        let refresh_interval = if pressure >= 0.80 {
+            1
+        } else if pressure >= 0.65 {
+            4
+        } else {
+            8
+        };
+
+        if self.light_call_count % refresh_interval == 0 {
+            self.sys.refresh_processes();
+        }
+        self.light_call_count = self.light_call_count.wrapping_add(1);
+        
+        let refresh_duration = start.elapsed();
 
         let global_cpu = self.sys.global_cpu_info().cpu_usage();
         let core_count = self.sys.cpus().len();
@@ -300,32 +314,35 @@ impl SystemCollector {
         });
         let top_processes = processes.into_iter().take(10).collect();
 
-        SystemSnapshot {
-            timestamp: snapshot_started_at,
-            cpu: CpuStats {
-                global_usage: global_cpu,
-                core_count,
+        (
+            SystemSnapshot {
+                timestamp: snapshot_started_at,
+                cpu: CpuStats {
+                    global_usage: global_cpu,
+                    core_count,
+                },
+                memory: MemoryStats {
+                    total_ram,
+                    used_ram,
+                    free_ram,
+                    total_swap,
+                    used_swap,
+                },
+                pressure: PressureStats {
+                    memory_pressure: mem_pressure,
+                    swap_used_bytes,
+                    swap_total_bytes,
+                    swap_delta_bytes_per_sec: swap_delta_bps,
+                    thermal_level: "unknown".to_string(),
+                    compressor_pressure,
+                    thrashing_score: 0.0, // populated by daemon from pressure collector
+                },
+                disks: vec![],    // skipped in light mode
+                networks: vec![], // skipped in light mode
+                top_processes,
             },
-            memory: MemoryStats {
-                total_ram,
-                used_ram,
-                free_ram,
-                total_swap,
-                used_swap,
-            },
-            pressure: PressureStats {
-                memory_pressure: mem_pressure,
-                swap_used_bytes,
-                swap_total_bytes,
-                swap_delta_bytes_per_sec: swap_delta_bps,
-                thermal_level: "unknown".to_string(),
-                compressor_pressure,
-                thrashing_score: 0.0, // populated by daemon from pressure collector
-            },
-            disks: vec![],    // skipped in light mode
-            networks: vec![], // skipped in light mode
-            top_processes,
-        }
+            refresh_duration,
+        )
     }
 
     /// Like `collect_snapshot_light()` but skips `refresh_processes()`,
@@ -334,12 +351,9 @@ impl SystemCollector {
     /// Safe in dry-run mode only: `execute_actions()` is a no-op so stale
     /// process data never reaches OS-mutating calls. Eliminates the dominant
     /// per-cycle cost (~50-100ms sysinfo process enumeration on macOS).
-    pub fn collect_snapshot_no_process_refresh(&mut self) -> SystemSnapshot {
-        // Capture timestamp BEFORE refresh — keeps semantics identical across
-        // collection paths. Without `refresh_processes()` this path is ~ms,
-        // but stamping early still aligns the timestamp with the start of
-        // gathering rather than the end.
+    pub fn collect_snapshot_no_process_refresh(&mut self) -> (SystemSnapshot, Duration) {
         let snapshot_started_at = Utc::now();
+        let start = Instant::now();
         self.sys.refresh_cpu();
         self.sys.refresh_memory();
         // Intentionally no refresh_processes() — reuse cached list.
@@ -390,32 +404,35 @@ impl SystemCollector {
         });
         let top_processes = processes.into_iter().take(10).collect();
 
-        SystemSnapshot {
-            timestamp: snapshot_started_at,
-            cpu: CpuStats {
-                global_usage: global_cpu,
-                core_count,
+        (
+            SystemSnapshot {
+                timestamp: snapshot_started_at,
+                cpu: CpuStats {
+                    global_usage: global_cpu,
+                    core_count,
+                },
+                memory: MemoryStats {
+                    total_ram,
+                    used_ram,
+                    free_ram,
+                    total_swap,
+                    used_swap,
+                },
+                pressure: PressureStats {
+                    memory_pressure: mem_pressure,
+                    swap_used_bytes,
+                    swap_total_bytes,
+                    swap_delta_bytes_per_sec: swap_delta_bps,
+                    thermal_level: "unknown".to_string(),
+                    compressor_pressure,
+                    thrashing_score: 0.0,
+                },
+                disks: vec![],
+                networks: vec![],
+                top_processes,
             },
-            memory: MemoryStats {
-                total_ram,
-                used_ram,
-                free_ram,
-                total_swap,
-                used_swap,
-            },
-            pressure: PressureStats {
-                memory_pressure: mem_pressure,
-                swap_used_bytes,
-                swap_total_bytes,
-                swap_delta_bytes_per_sec: swap_delta_bps,
-                thermal_level: "unknown".to_string(),
-                compressor_pressure,
-                thrashing_score: 0.0,
-            },
-            disks: vec![],
-            networks: vec![],
-            top_processes,
-        }
+            start.elapsed(),
+        )
     }
 }
 
@@ -732,7 +749,7 @@ mod tests {
     #[test]
     fn collect_snapshot_light_returns_valid_pressure() {
         let mut collector = SystemCollector::new();
-        let snap = collector.collect_snapshot_light();
+        let (snap, _) = collector.collect_snapshot_light(0.5);
         assert!((0.0..=1.0).contains(&snap.pressure.memory_pressure));
         assert!((0.0..=1.0).contains(&snap.pressure.compressor_pressure));
         assert!(
@@ -742,12 +759,12 @@ mod tests {
     }
 
     #[test]
-    fn collect_snapshot_increments_light_call_count() {
+    fn collect_snapshot_light_increments_light_call_count() {
         let mut collector = SystemCollector::new();
         assert_eq!(collector.light_call_count, 0);
-        collector.collect_snapshot();
+        let _ = collector.collect_snapshot_light(0.5);
         assert_eq!(collector.light_call_count, 1);
-        collector.collect_snapshot();
+        let _ = collector.collect_snapshot_light(0.5);
         assert_eq!(collector.light_call_count, 2);
     }
 
@@ -755,7 +772,7 @@ mod tests {
     fn swap_delta_is_zero_on_first_call() {
         let mut collector = SystemCollector::new();
         // On first collect_snapshot, prev_swap_at is None → delta = 0.
-        let snap = collector.collect_snapshot();
+        let (snap, _) = collector.collect_snapshot();
         assert_eq!(
             snap.pressure.swap_delta_bytes_per_sec, 0.0,
             "first-call delta should be 0"
@@ -806,7 +823,7 @@ mod tests {
         // the invariant against a future regression that stamps in the future.
         let mut c = SystemCollector::new();
         let before = Utc::now();
-        let snap = c.collect_snapshot();
+        let (snap, _) = c.collect_snapshot();
         let after = Utc::now();
         assert!(
             snap.timestamp >= before && snap.timestamp <= after,
@@ -819,38 +836,24 @@ mod tests {
 
     #[test]
     fn snapshot_timestamp_predates_refresh_completion() {
-        // Core invariant: `timestamp` must be captured BEFORE refresh, not
-        // after. We assert that the elapsed wall time between the snapshot's
-        // timestamp and the moment we observe it back covers the full
-        // refresh window. On any reasonable system the full collect path
-        // takes >0ms; if the timestamp were stamped at the END, the gap
-        // could be zero. This test would fail if someone moves the
-        // timestamp back to AFTER refresh (the original bug).
         let mut c = SystemCollector::new();
-        // Warm: avoid first-cycle grace period skew.
         for _ in 0..4 {
             let _ = c.collect_snapshot();
         }
-        let snap = c.collect_snapshot();
+        let (snap, _) = c.collect_snapshot();
         let observed_at = Utc::now();
         let age_ms = (observed_at - snap.timestamp).num_milliseconds();
-        // Lower bound: timestamp captured before refresh ⇒ age >= 0 (sanity).
         assert!(age_ms >= 0, "negative age: {age_ms}ms");
-        // Upper bound: full collect should not exceed 5s on any sane CI host.
         assert!(age_ms < 5_000, "implausible age: {age_ms}ms");
     }
 
     #[test]
     fn snapshot_age_grows_with_post_collection_delay() {
-        // Strong guarantee: if the caller delays N ms after collection,
-        // `now() - snap.timestamp` must reflect AT LEAST that delay PLUS
-        // the collection window. Locks the "before-refresh" semantics:
-        // age must include both refresh-window AND post-collection wait.
         let mut c = SystemCollector::new();
         for _ in 0..4 {
             let _ = c.collect_snapshot();
         }
-        let snap = c.collect_snapshot();
+        let (snap, _) = c.collect_snapshot();
         let delay_ms = 25u64;
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         let age_ms = (Utc::now() - snap.timestamp).num_milliseconds();
@@ -864,7 +867,7 @@ mod tests {
     fn light_snapshot_timestamp_also_predates_refresh() {
         let mut c = SystemCollector::new();
         let before = Utc::now();
-        let snap = c.collect_snapshot_light();
+        let (snap, _) = c.collect_snapshot_light(0.5);
         let after = Utc::now();
         assert!(
             snap.timestamp >= before && snap.timestamp <= after,
@@ -879,7 +882,7 @@ mod tests {
     fn no_process_refresh_snapshot_timestamp_predates_refresh() {
         let mut c = SystemCollector::new();
         let before = Utc::now();
-        let snap = c.collect_snapshot_no_process_refresh();
+        let (snap, _) = c.collect_snapshot_no_process_refresh();
         let after = Utc::now();
         assert!(
             snap.timestamp >= before && snap.timestamp <= after,

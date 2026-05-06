@@ -27,6 +27,8 @@ fn no_caps() -> CapabilityReport {
         can_mdutil: false,
         can_tmutil: false,
         is_root: false,
+        p_core_count: Some(8),
+        e_core_count: Some(4),
         unavailable: vec![],
     }
 }

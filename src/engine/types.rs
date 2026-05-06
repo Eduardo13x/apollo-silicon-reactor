@@ -240,6 +240,8 @@ pub struct CapabilityReport {
     pub can_mdutil: bool,
     pub can_tmutil: bool,
     pub is_root: bool,
+    pub p_core_count: Option<u32>,
+    pub e_core_count: Option<u32>,
     pub unavailable: Vec<String>,
 }
 
@@ -573,6 +575,10 @@ pub struct RuntimeMetrics {
     pub last_error: Option<String>,
     pub last_cycle_at: Option<DateTime<Utc>>,
     pub p95_cycle_ms: f64,
+    pub refresh_duration_ms: f64,
+    pub memory_budget_duration_ms: f64,
+    pub reactor_duration_ms: f64,
+    pub lock_wait_duration_ms: f64,
     pub throttle_reverted: u64,
     pub reactor_pulses: u64,
     pub effective_profile: OptimizationProfile,

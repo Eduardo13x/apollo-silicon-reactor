@@ -30,6 +30,12 @@ pub enum DecisionReason {
     CompositorPriority,
     /// Action prompted by general system pressure context.
     PressureContext,
+    /// Action prompted by memory budget enforcement (8GB/16GB constraints).
+    MemoryBudget,
+    /// Action triggered by entering Critical zone (bypassing rate-limit).
+    CriticalBypass,
+    /// Action allowed after hysteresis recovery (exiting high pressure).
+    HysteresisRecovery,
     /// Heuristic skip: user is recently active and pressure is low.
     UserActiveSkip,
     /// Heuristic skip: HRPO group effectiveness is too low (Dr. Zero).

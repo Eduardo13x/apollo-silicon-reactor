@@ -13,7 +13,7 @@
 //! the main decision pass.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 
 use apollo_optimizer::engine::compressor_aware::query_memory_profile;
 use apollo_optimizer::engine::daemon_state::SharedState;
@@ -41,6 +41,8 @@ pub struct MemoryBudgetState {
     pub last_applied_at: Option<Instant>,
     /// Current operating regime for hysteresis.
     pub current_zone: PressureZone,
+    /// Last time a Critical zone bypass triggered immediate evaluation.
+    pub last_critical_bypass_at: Option<Instant>,
 }
 
 impl Default for MemoryBudgetState {
@@ -49,7 +51,26 @@ impl Default for MemoryBudgetState {
             last_applied_limits: HashMap::new(),
             last_applied_at: None,
             current_zone: PressureZone::Normal,
+            last_critical_bypass_at: None,
         }
+    }
+}
+
+/// Explicit thresholds for pressure zones.
+/// [Hellerstein 2004] Operating-regime control.
+const ELEVATED_ENTER_PRESSURE: f64 = 0.65;
+const ELEVATED_EXIT_PRESSURE: f64 = 0.55;
+const CRITICAL_ENTER_PRESSURE: f64 = 0.80;
+const CRITICAL_EXIT_PRESSURE: f64 = 0.74; // Widened to prevent bouncing
+const CRITICAL_BYPASS_COOLDOWN: Duration = Duration::from_secs(20);
+
+/// Get the enforcement interval based on the current pressure zone.
+/// [Hellerstein 2004] Adaptive sampling frequency.
+pub fn memory_budget_enforcement_interval(zone: PressureZone) -> Duration {
+    match zone {
+        PressureZone::Normal => Duration::from_secs(60),
+        PressureZone::Elevated => Duration::from_secs(10), // Closes the OOM window gap
+        PressureZone::Critical => Duration::from_secs(5),
     }
 }
 
@@ -65,28 +86,26 @@ pub fn run_memory_budget(
     mem_analyzer: &MemoryAnalyzer,
     budget_state: &mut MemoryBudgetState,
 ) {
-    // 1. Update Pressure Zone with hysteresis.
-    // Elevated: entry >= 0.65, exit <= 0.55
-    // Critical: entry >= 0.80, exit <= 0.70
+    // 1. Update Pressure Zone with explicit hysteresis.
     let next_zone = match budget_state.current_zone {
         PressureZone::Normal => {
-            if memory_pressure >= 0.65 {
+            if memory_pressure >= ELEVATED_ENTER_PRESSURE {
                 PressureZone::Elevated
             } else {
                 PressureZone::Normal
             }
         }
         PressureZone::Elevated => {
-            if memory_pressure >= 0.80 {
+            if memory_pressure >= CRITICAL_ENTER_PRESSURE {
                 PressureZone::Critical
-            } else if memory_pressure <= 0.55 {
+            } else if memory_pressure <= ELEVATED_EXIT_PRESSURE {
                 PressureZone::Normal
             } else {
                 PressureZone::Elevated
             }
         }
         PressureZone::Critical => {
-            if memory_pressure <= 0.70 {
+            if memory_pressure <= CRITICAL_EXIT_PRESSURE {
                 PressureZone::Elevated
             } else {
                 PressureZone::Critical
@@ -114,13 +133,27 @@ pub fn run_memory_budget(
     let now = Instant::now();
     let time_since_last = budget_state
         .last_applied_at
-        .map(|t| now.duration_since(t).as_secs())
-        .unwrap_or(u64::MAX);
+        .map(|t| now.duration_since(t))
+        .unwrap_or(Duration::from_secs(u64::MAX));
 
-    // Evaluate if zone changed, 30s passed, or if we just entered Critical (bypass).
-    // Entering Critical from Normal/Elevated should always trigger immediate action.
+    let rate_limit = memory_budget_enforcement_interval(next_zone);
+
+    // Evaluate if zone changed, adaptive time passed, or if we just entered Critical (bypass).
+    // Entering Critical triggers immediate action, but with a cooldown to prevent
+    // "bang-bang" oscillation (e.g. 0.79-0.81 bouncing).
+    let time_since_last_bypass = budget_state
+        .last_critical_bypass_at
+        .map(|t| now.duration_since(t))
+        .unwrap_or(Duration::from_secs(u64::MAX));
+
     let entering_critical = zone_changed && next_zone == PressureZone::Critical;
-    let force_eval = zone_changed || time_since_last >= 30 || entering_critical;
+    let bypass_cooldown_ok = time_since_last_bypass >= CRITICAL_BYPASS_COOLDOWN;
+    
+    let force_eval = zone_changed || time_since_last >= rate_limit || (entering_critical && bypass_cooldown_ok);
+
+    if entering_critical && bypass_cooldown_ok {
+        budget_state.last_critical_bypass_at = Some(now);
+    }
 
     let usage_guard = state.usage.lock_recover();
     let budget_inputs: Vec<ProcessBudgetInput> = proc_snaps
@@ -200,12 +233,13 @@ pub fn run_memory_budget(
                 zone = ?next_zone,
                 "memlimit_applied"
             );
-        } else if time_since_last < 30 {
+        } else if time_since_last < rate_limit {
             tracing::debug!(
                 target: "apollo.memory_budget",
                 pid = budget.pid,
                 name = %budget.name,
-                time_since_last,
+                ?time_since_last,
+                ?rate_limit,
                 "memlimit_skipped_due_to_cooldown"
             );
         } else {
@@ -343,5 +377,68 @@ mod tests {
 
         run_memory_budget(0.55, 8589934592, &shared, &[], &analyzer, &mut state);
         assert_eq!(state.current_zone, PressureZone::Normal);
+    }
+
+    #[test]
+    fn test_memory_budget_enforcement_intervals() {
+        assert_eq!(memory_budget_enforcement_interval(PressureZone::Normal), Duration::from_secs(60));
+        assert_eq!(memory_budget_enforcement_interval(PressureZone::Elevated), Duration::from_secs(10));
+        assert_eq!(memory_budget_enforcement_interval(PressureZone::Critical), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_pressure_zone_hysteresis_hardened() {
+        let mut state = MemoryBudgetState::default();
+        let shared = mock_state();
+        let analyzer = MemoryAnalyzer::new();
+        
+        // Entry to Elevated >= 0.65
+        run_memory_budget(0.65, 8589934592, &shared, &[], &analyzer, &mut state);
+        assert_eq!(state.current_zone, PressureZone::Elevated);
+
+        // Entry to Critical >= 0.80
+        run_memory_budget(0.80, 8589934592, &shared, &[], &analyzer, &mut state);
+        assert_eq!(state.current_zone, PressureZone::Critical);
+
+        // Exit Critical <= 0.74 (Hysteresis)
+        run_memory_budget(0.75, 8589934592, &shared, &[], &analyzer, &mut state);
+        assert_eq!(state.current_zone, PressureZone::Critical);
+
+        run_memory_budget(0.74, 8589934592, &shared, &[], &analyzer, &mut state);
+        assert_eq!(state.current_zone, PressureZone::Elevated);
+    }
+
+    #[test]
+    fn test_critical_bypass_cooldown() {
+        let mut state = MemoryBudgetState::default();
+        let shared = mock_state();
+        let analyzer = MemoryAnalyzer::new();
+        let now = Instant::now();
+
+        // 1. Initial bypass allowed
+        // Step 1: Normal -> Elevated
+        run_memory_budget(0.70, 8589934592, &shared, &[], &analyzer, &mut state);
+        assert_eq!(state.current_zone, PressureZone::Elevated);
+        
+        // Step 2: Elevated -> Critical (triggers bypass)
+        run_memory_budget(0.81, 8589934592, &shared, &[], &analyzer, &mut state);
+        assert_eq!(state.current_zone, PressureZone::Critical);
+        assert!(state.last_critical_bypass_at.is_some());
+        let first_bypass = state.last_critical_bypass_at.unwrap();
+
+        // 2. Drop to Elevated then back to Critical immediately
+        run_memory_budget(0.70, 8589934592, &shared, &[], &analyzer, &mut state);
+        assert_eq!(state.current_zone, PressureZone::Elevated);
+        
+        run_memory_budget(0.81, 8589934592, &shared, &[], &analyzer, &mut state);
+        // Bypass should NOT re-trigger because of cooldown
+        assert_eq!(state.last_critical_bypass_at.unwrap(), first_bypass);
+
+        // 3. Mock time passing for cooldown (20s)
+        state.last_critical_bypass_at = Some(now - Duration::from_secs(21));
+        run_memory_budget(0.70, 8589934592, &shared, &[], &analyzer, &mut state);
+        run_memory_budget(0.81, 8589934592, &shared, &[], &analyzer, &mut state);
+        // Bypass should re-trigger
+        assert!(state.last_critical_bypass_at.unwrap() > first_bypass);
     }
 }

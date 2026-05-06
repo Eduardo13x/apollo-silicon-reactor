@@ -51,6 +51,28 @@ pub struct MetricsState {
     pub reactor_status: ReactorStatus,
 }
 
+impl MetricsState {
+    /// Synchronize metrics from the lock-free hot path buffer into this Mutex-protected state.
+    /// Establish p95/durations based on raw microsecond counters.
+    pub fn sync_from_lockfree(&mut self, lf: &crate::engine::lse_counters::MetricsSnapshot) {
+        self.metrics.cycles = lf.cycles;
+        self.metrics.boosts_applied = lf.actions_applied; // map to boosts for now or split
+        self.metrics.freezes_applied = lf.freezes;
+        self.metrics.unfreezes_applied = lf.unfreezes;
+        self.metrics.throttles_applied = lf.throttles;
+        self.metrics.throttle_reverted = lf.throttle_reverted;
+        
+        // Latency durations (convert us -> ms)
+        self.metrics.p95_cycle_ms = lf.cycle_time_us as f64 / 1000.0;
+        self.metrics.refresh_duration_ms = lf.refresh_duration_us as f64 / 1000.0;
+        self.metrics.memory_budget_duration_ms = lf.memory_budget_duration_us as f64 / 1000.0;
+        self.metrics.reactor_duration_ms = lf.reactor_duration_us as f64 / 1000.0;
+        
+        // Reactor pulses
+        self.metrics.reactor_pulses = lf.signals_sent;
+    }
+}
+
 /// Reactor thread counters and status.
 pub struct ReactorStatus {
     pub events_total: u64,

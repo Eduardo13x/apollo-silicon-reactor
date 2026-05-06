@@ -493,7 +493,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
 
             // Collect a one-off snapshot for this test.
             let mut collector = SystemCollector::new();
-            let mut snapshot = collector.collect_snapshot();
+            let (mut snapshot, _) = collector.collect_snapshot();
             snapshot.pressure.thermal_level =
                 state.metrics.lock_recover().thermal_level_real.clone();
 

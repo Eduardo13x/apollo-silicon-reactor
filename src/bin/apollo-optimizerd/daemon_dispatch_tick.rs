@@ -372,6 +372,8 @@ mod tests {
             can_mdutil: true,
             can_tmutil: true,
             is_root: true,
+            p_core_count: Some(8),
+            e_core_count: Some(4),
             unavailable: Vec::new(),
         };
 

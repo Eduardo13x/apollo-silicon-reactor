@@ -46,6 +46,9 @@ pub struct LockFreeMetrics {
     pub cycle_time_us: AtomicU64,
     pub snapshot_time_us: AtomicU64,
     pub decide_time_us: AtomicU64,
+    pub refresh_duration_us: AtomicU64,
+    pub memory_budget_duration_us: AtomicU64,
+    pub reactor_duration_us: AtomicU64,
 }
 
 impl LockFreeMetrics {
@@ -69,6 +72,9 @@ impl LockFreeMetrics {
             cycle_time_us: AtomicU64::new(0),
             snapshot_time_us: AtomicU64::new(0),
             decide_time_us: AtomicU64::new(0),
+            refresh_duration_us: AtomicU64::new(0),
+            memory_budget_duration_us: AtomicU64::new(0),
+            reactor_duration_us: AtomicU64::new(0),
         }
     }
 
@@ -139,6 +145,21 @@ impl LockFreeMetrics {
         self.decide_time_us.store(us, Ordering::Relaxed);
     }
 
+    #[inline(always)]
+    pub fn set_refresh_duration_us(&self, us: u64) {
+        self.refresh_duration_us.store(us, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn set_memory_budget_duration_us(&self, us: u64) {
+        self.memory_budget_duration_us.store(us, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn set_reactor_duration_us(&self, us: u64) {
+        self.reactor_duration_us.store(us, Ordering::Relaxed);
+    }
+
     /// Bump epoch after a batch of updates. This establishes the
     /// happens-before edge for readers calling `snapshot()`.
     #[inline(always)]
@@ -172,6 +193,9 @@ impl LockFreeMetrics {
             cycle_time_us: self.cycle_time_us.load(Ordering::Relaxed),
             snapshot_time_us: self.snapshot_time_us.load(Ordering::Relaxed),
             decide_time_us: self.decide_time_us.load(Ordering::Relaxed),
+            refresh_duration_us: self.refresh_duration_us.load(Ordering::Relaxed),
+            memory_budget_duration_us: self.memory_budget_duration_us.load(Ordering::Relaxed),
+            reactor_duration_us: self.reactor_duration_us.load(Ordering::Relaxed),
         }
     }
 }
@@ -200,6 +224,9 @@ pub struct MetricsSnapshot {
     pub cycle_time_us: u64,
     pub snapshot_time_us: u64,
     pub decide_time_us: u64,
+    pub refresh_duration_us: u64,
+    pub memory_budget_duration_us: u64,
+    pub reactor_duration_us: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
