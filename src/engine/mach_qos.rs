@@ -52,6 +52,18 @@ mod mach_sys {
     pub const THREAD_LATENCY_QOS_POLICY_COUNT: u32 = 1;
     pub const THREAD_THROUGHPUT_QOS_POLICY_COUNT: u32 = 1;
 
+    // Thread affinity (P/E cluster routing on Apple Silicon).
+    // Threads with the same nonzero affinity_tag are clustered together;
+    // tag=0 means "no preference". macOS treats this as a hint, not a hard binding.
+    // Convention used in Apollo:
+    //   AFFINITY_TAG_P_CLUSTER (1) — latency-sensitive, route to Firestorm/Avalanche.
+    //   AFFINITY_TAG_E_CLUSTER (2) — battery/throughput, route to Icestorm/Blizzard.
+    pub const THREAD_AFFINITY_POLICY: i32 = 4;
+    pub const THREAD_AFFINITY_POLICY_COUNT: u32 = 1;
+    pub const AFFINITY_TAG_NONE: u32 = 0;
+    pub const AFFINITY_TAG_P_CLUSTER: u32 = 1;
+    pub const AFFINITY_TAG_E_CLUSTER: u32 = 2;
+
     // Task-level QoS flavors (for direct latency/throughput QoS)
     pub const TASK_POLICY_QOS: i32 = 9;
     pub const TASK_BASE_QOS_POLICY: i32 = 8;
@@ -114,6 +126,14 @@ mod ffi {
     pub struct TaskQosPolicy {
         pub task_latency_qos_tier: c_int,
         pub task_throughput_qos_tier: c_int,
+    }
+
+    /// thread_affinity_policy_data_t — single u32 affinity tag.
+    /// Threads with same tag → kernel clusters them on the same cluster
+    /// (best-effort hint, not enforced). [Apple TN: ARM big.LITTLE QoS]
+    #[repr(C)]
+    pub struct ThreadAffinityPolicy {
+        pub affinity_tag: c_uint,
     }
 
     /// thread_basic_info structure for thread_info().
@@ -785,6 +805,81 @@ impl MachQoSManager {
 
     #[cfg(not(target_os = "macos"))]
     pub fn set_thread_qos(&self, _pid: u32, _thread_idx: u32, _tier: ThreadTier) -> bool {
+        false
+    }
+
+    /// Hint a thread's preferred cluster (P-core or E-core) on Apple Silicon.
+    ///
+    /// Uses THREAD_AFFINITY_POLICY which the macOS scheduler treats as a hint.
+    /// `tag` should be one of `mach_sys::AFFINITY_TAG_P_CLUSTER`,
+    /// `AFFINITY_TAG_E_CLUSTER`, or `AFFINITY_TAG_NONE`. Threads sharing the
+    /// same nonzero tag are coalesced onto the same cluster best-effort.
+    ///
+    /// Returns true on successful policy application; false if the thread or
+    /// process is unavailable (e.g., PID died mid-call). On non-macOS targets
+    /// this is a no-op that returns false.
+    ///
+    /// **Downstream wiring**: callers should consume `p_core_count` /
+    /// `e_core_count` from `CapabilityReport` to skip affinity hints when the
+    /// hardware lacks heterogeneous clusters (i.e., return early if either
+    /// count is None or 0).
+    ///
+    /// [ARM big.LITTLE 2013 §3] thread-level affinity hints reduce migration
+    /// cost when threads cooperate on shared data within a cluster.
+    #[cfg(target_os = "macos")]
+    pub fn set_thread_affinity_tag(&self, pid: u32, thread_idx: u32, tag: u32) -> bool {
+        if self.permanently_blocked.contains(&pid) {
+            return true; // silently skip
+        }
+
+        unsafe {
+            use self::ffi::*;
+            use self::mach_sys::*;
+
+            let mut task_port: MachPortT = MACH_PORT_NULL;
+            let kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);
+            if kr != KERN_SUCCESS {
+                return false;
+            }
+
+            let mut thread_list: *mut MachPortT = std::ptr::null_mut();
+            let mut thread_count: MachMsgTypeNumberT = 0;
+            let kr = task_threads(task_port, &mut thread_list, &mut thread_count);
+            mach_port_deallocate(mach_task_self(), task_port);
+
+            if kr != KERN_SUCCESS || thread_list.is_null() || thread_idx >= thread_count {
+                if !thread_list.is_null() && thread_count > 0 {
+                    for i in 0..thread_count {
+                        mach_port_deallocate(mach_task_self(), *thread_list.add(i as usize));
+                    }
+                    let list_size =
+                        (thread_count as u64) * (std::mem::size_of::<MachPortT>() as u64);
+                    vm_deallocate(mach_task_self(), thread_list as usize, list_size as usize);
+                }
+                return false;
+            }
+
+            let target_thread = *thread_list.add(thread_idx as usize);
+            let affinity_policy = ThreadAffinityPolicy { affinity_tag: tag };
+            let kr_aff = thread_policy_set(
+                target_thread,
+                THREAD_AFFINITY_POLICY,
+                &affinity_policy as *const _ as *const std::ffi::c_void,
+                THREAD_AFFINITY_POLICY_COUNT,
+            );
+
+            for i in 0..thread_count {
+                mach_port_deallocate(mach_task_self(), *thread_list.add(i as usize));
+            }
+            let list_size = (thread_count as u64) * (std::mem::size_of::<MachPortT>() as u64);
+            vm_deallocate(mach_task_self(), thread_list as usize, list_size as usize);
+
+            kr_aff == KERN_SUCCESS
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn set_thread_affinity_tag(&self, _pid: u32, _thread_idx: u32, _tag: u32) -> bool {
         false
     }
 
@@ -1536,6 +1631,44 @@ pub fn batch_mach_port_counts() -> Vec<(i32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affinity_constants_match_apple_abi() {
+        // THREAD_AFFINITY_POLICY = 4 per Apple <mach/thread_policy.h>.
+        assert_eq!(mach_sys::THREAD_AFFINITY_POLICY, 4);
+        assert_eq!(mach_sys::THREAD_AFFINITY_POLICY_COUNT, 1);
+        assert_eq!(mach_sys::AFFINITY_TAG_NONE, 0);
+        // Convention: nonzero tags map to clusters; semantics enforced by Apollo,
+        // not the kernel (kernel only requires "same tag = same cluster" hint).
+        assert_ne!(mach_sys::AFFINITY_TAG_P_CLUSTER, 0);
+        assert_ne!(mach_sys::AFFINITY_TAG_E_CLUSTER, 0);
+        assert_ne!(
+            mach_sys::AFFINITY_TAG_P_CLUSTER,
+            mach_sys::AFFINITY_TAG_E_CLUSTER,
+            "P and E cluster tags must differ"
+        );
+    }
+
+    #[test]
+    fn affinity_policy_struct_size() {
+        // ThreadAffinityPolicy is a single u32 affinity_tag; Apple ABI is 4 bytes.
+        assert_eq!(
+            std::mem::size_of::<ffi::ThreadAffinityPolicy>(),
+            std::mem::size_of::<u32>()
+        );
+    }
+
+    #[test]
+    fn affinity_helper_blocks_known_pids() {
+        // permanently_blocked PIDs (e.g., system processes that reject task_for_pid)
+        // should silently succeed (return true) without attempting the FFI call.
+        let mut mgr = MachQoSManager::new();
+        mgr.permanently_blocked.insert(0); // PID 0 is kernel_task — always blocked
+        assert!(
+            mgr.set_thread_affinity_tag(0, 0, mach_sys::AFFINITY_TAG_P_CLUSTER),
+            "blocked PIDs return true to silence callers"
+        );
+    }
 
     #[test]
     fn enumerate_no_crash() {
