@@ -627,6 +627,7 @@ fn main() -> anyhow::Result<()> {
                 mut unfreeze_decay,
                 mut swap_reclaim,
                 mut memory_budget,
+                mut self_diagnosis,
             } = daemon_init::DaemonSubsystems::new();
             let mut nested_learner = apollo_optimizer::engine::nested_learner::NestedLearner::new();
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
@@ -4200,6 +4201,38 @@ fn main() -> anyhow::Result<()> {
                 last_cycle_end = Instant::now();
                 lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
                 lf_metrics.commit();
+
+                // ── Self-diagnosis (Phase 6 self-healing layer) ────────────────
+                // Record this cycle's signals + check thresholds. Detection-only;
+                // alerts surface via tracing::warn! and append to
+                // /var/lib/apollo/self_diagnosis.jsonl for next-session pickup.
+                {
+                    let snap = lf_metrics.snapshot();
+                    let dedup_total = snap.dedup_drops_setmemorystatus
+                        + snap.dedup_drops_throttle
+                        + snap.dedup_drops_freeze
+                        + snap.dedup_drops_unfreeze;
+                    self_diagnosis.record_cycle(
+                        dedup_total,
+                        snap.refresh_duration_us,
+                        snapshot.pressure.memory_pressure,
+                    );
+                    // Run threshold check every 60 cycles to amortize cost.
+                    if cycle_count % 60 == 0 {
+                        let alerts = self_diagnosis.check();
+                        for alert in &alerts {
+                            tracing::warn!(
+                                target: "apollo.self_diagnosis",
+                                kind = %alert.kind,
+                                severity = ?alert.severity,
+                                summary = %alert.summary,
+                                action = %alert.recommended_action,
+                                "self-diagnosis: regression detected"
+                            );
+                        }
+                        self_diagnosis.persist(&alerts);
+                    }
+                }
 
                 // Periodic sync of lock-free hot path metrics to the Mutex-protected state
                 // once every 5 cycles (~1.5s - 10s depending on load). Reduces lock contention.

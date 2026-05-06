@@ -76,6 +76,10 @@ pub(super) struct DaemonSubsystems {
     pub swap_reclaim: SwapReclaimModel,
     /// Persistent state for memory budget hysteresis and rate-limiting.
     pub memory_budget: MemoryBudgetState,
+    /// Self-diagnosis meta-observer over known regression classes
+    /// (dedup spam, sysinfo cadence drift, reactor saturation).
+    /// [Hellerstein 2004 §9] detection-only meta-observer.
+    pub self_diagnosis: apollo_optimizer::engine::self_diagnosis::SelfDiagnosis,
 }
 
 /// Detect hardware capabilities (core count and RAM) once at startup.
@@ -136,6 +140,13 @@ impl DaemonSubsystems {
             unfreeze_decay: UnfreezeDecayModel::new(),
             swap_reclaim: SwapReclaimModel::new(),
             memory_budget: MemoryBudgetState::default(),
+            self_diagnosis: apollo_optimizer::engine::self_diagnosis::SelfDiagnosis::new(
+                if unsafe { libc::geteuid() } == 0 {
+                    std::path::PathBuf::from("/var/lib/apollo/self_diagnosis.jsonl")
+                } else {
+                    std::path::PathBuf::from("/tmp/apollo_self_diagnosis.jsonl")
+                },
+            ),
         }
     }
 }
