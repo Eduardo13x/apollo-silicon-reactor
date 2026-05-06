@@ -40,6 +40,18 @@ pub enum DecisionReason {
     UserActiveSkip,
     /// Heuristic skip: HRPO group effectiveness is too low (Dr. Zero).
     HrpoSkip,
+    /// Adaptive governor swarm rule (>30 procs competing, waste >= 0.30, no GUI).
+    /// [Saltzer & Schroeder 1975] economy of mechanism — system-wide signal,
+    /// not per-process pressure attribution.
+    SwarmThrottling,
+    /// Adaptive governor graduated-idle rules: 6h+ idle no GUI → Throttle;
+    /// 12h+ idle → Freeze; 24h+ GUI abandonment → Freeze.
+    /// [Denning 1968] working-set decay; cold-set reclamation.
+    GraduatedIdle,
+    /// Per-thread Mach QoS routing decision (interactive vs background tier,
+    /// or P-cluster/E-cluster affinity hint on Apple Silicon).
+    /// [ARM big.LITTLE 2013 §3] thread-level affinity reduces migration cost.
+    ThreadQoSRouting,
     /// Other — free-form reason.
     Other(String),
 }

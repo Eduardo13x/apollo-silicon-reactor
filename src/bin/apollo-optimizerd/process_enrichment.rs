@@ -382,6 +382,12 @@ pub fn convert_and_merge_heuristic_decisions(
             continue;
         }
 
+        // Map governor reason string → specific DecisionReason variant.
+        // Closes NotebookLM Low-priority gap: PressureContext was 62.5%
+        // catch-all; SwarmThrottling/GraduatedIdle differentiate two
+        // well-known governor rule classes that account for ~20% of throttles.
+        let dr = classify_governor_reason(&decision.reason);
+
         match decision.decision {
             GovernorDecision::Throttle => {
                 let (ss, su) = pid_start_time(decision.pid);
@@ -392,7 +398,7 @@ pub fn convert_and_merge_heuristic_decisions(
                     reason: format!("heuristic: {}", decision.reason),
                     start_sec: ss,
                     start_usec: su,
-                    decision_reason: DecisionReason::PressureContext,
+                    decision_reason: dr.clone(),
                 });
                 stats.throttles += 1;
             }
@@ -404,7 +410,7 @@ pub fn convert_and_merge_heuristic_decisions(
                     reason: format!("heuristic: {}", decision.reason),
                     start_sec: ss,
                     start_usec: su,
-                    decision_reason: DecisionReason::PressureContext,
+                    decision_reason: dr.clone(),
                 });
                 stats.freezes += 1;
             }
@@ -417,7 +423,7 @@ pub fn convert_and_merge_heuristic_decisions(
                     reason: format!("heuristic (kill→freeze): {}", decision.reason),
                     start_sec: ss,
                     start_usec: su,
-                    decision_reason: DecisionReason::PressureContext,
+                    decision_reason: dr,
                 });
                 stats.kills_downgraded += 1;
                 stats.freezes += 1;
@@ -429,10 +435,66 @@ pub fn convert_and_merge_heuristic_decisions(
     (new_actions, stats)
 }
 
+/// Map an adaptive_governor reason string → specific DecisionReason variant.
+///
+/// Closes NotebookLM Low-priority gap (2026-05-06): PressureContext was a
+/// 62.5% catch-all in the audit log. Two well-known governor rule classes
+/// account for ~20% of throttles and deserve their own labels:
+///
+/// - `Swarm throttle (...)` (adaptive_governor.rs:616) → `SwarmThrottling`
+/// - `graduated idle` / `GUI app abandoned >24h` → `GraduatedIdle`
+///
+/// All other governor rules continue to fall back to PressureContext.
+/// Future iteration: wire ThreadQoSRouting at SetThreadQoS sites once the
+/// downstream mach_qos affinity consumer lands (see Phase 3 commit bef1f0b).
+pub fn classify_governor_reason(reason: &str) -> DecisionReason {
+    if reason.starts_with("Swarm throttle") {
+        DecisionReason::SwarmThrottling
+    } else if reason.contains("graduated idle")
+        || reason.contains("GUI app abandoned")
+        || reason.contains("idle >6h")
+        || reason.contains("idle >12h")
+    {
+        DecisionReason::GraduatedIdle
+    } else {
+        DecisionReason::PressureContext
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use apollo_optimizer::engine::process_tree::ProcessEntry;
+
+    // ── context_to_thermal ────────────────────────────────────────────────────
+
+    // ── classify_governor_reason ──────────────────────────────────────────────
+
+    #[test]
+    fn classify_swarm_throttle_string() {
+        let r = "Swarm throttle (52 procs, waste=0.65, util=0.40)";
+        assert_eq!(classify_governor_reason(r), DecisionReason::SwarmThrottling);
+    }
+
+    #[test]
+    fn classify_graduated_idle_strings() {
+        // Multiple phrasings produced by adaptive_governor.rs.
+        assert_eq!(
+            classify_governor_reason("graduated idle 6h+ throttle"),
+            DecisionReason::GraduatedIdle
+        );
+        assert_eq!(
+            classify_governor_reason("GUI app abandoned >24h (idle=26h)"),
+            DecisionReason::GraduatedIdle
+        );
+    }
+
+    #[test]
+    fn classify_unknown_reason_falls_back_to_pressurecontext() {
+        // Default safety: any unrecognized string maps to PressureContext.
+        let r = "extreme pressure RSS-rank cpu-active 25%";
+        assert_eq!(classify_governor_reason(r), DecisionReason::PressureContext);
+    }
 
     // ── context_to_thermal ────────────────────────────────────────────────────
 
