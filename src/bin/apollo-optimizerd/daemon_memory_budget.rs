@@ -464,4 +464,30 @@ mod tests {
         // Bypass should re-trigger
         assert!(state.last_critical_bypass_at.unwrap() > first_bypass);
     }
+
+    #[test]
+    fn test_recovering_from_critical_window() {
+        let mut state = MemoryBudgetState::default();
+        let shared = mock_state();
+        let analyzer = MemoryAnalyzer::new();
+
+        // Fresh state — no Critical exit yet.
+        assert!(!state.recovering_from_critical());
+
+        // Drive Normal → Elevated → Critical → Elevated; expect last_critical_exit_at set.
+        run_memory_budget(0.70, 8589934592, &shared, &[], &analyzer, &mut state);
+        run_memory_budget(0.85, 8589934592, &shared, &[], &analyzer, &mut state);
+        assert_eq!(state.current_zone, PressureZone::Critical);
+        assert!(state.last_critical_exit_at.is_none());
+
+        // Exit Critical → Elevated should set last_critical_exit_at.
+        run_memory_budget(0.70, 8589934592, &shared, &[], &analyzer, &mut state);
+        assert_eq!(state.current_zone, PressureZone::Elevated);
+        assert!(state.last_critical_exit_at.is_some());
+        assert!(state.recovering_from_critical(), "should be recovering immediately after exit");
+
+        // Simulate 31s elapsed: recovery window closed.
+        state.last_critical_exit_at = Some(Instant::now() - Duration::from_secs(31));
+        assert!(!state.recovering_from_critical(), "should NOT be recovering after 30s window");
+    }
 }
