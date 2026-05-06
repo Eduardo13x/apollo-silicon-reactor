@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use apollo_optimizer::engine::adaptive_governor::{GovernorDecision, ProcessDecision};
-use apollo_optimizer::engine::recently_applied::RecentlyApplied;
+use apollo_optimizer::engine::recently_applied::{CachedActionKind, RecentlyApplied};
 use apollo_optimizer::engine::daemon_helpers::pid_start_time;
 use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
 use apollo_optimizer::engine::proc_taskinfo;
@@ -364,19 +364,14 @@ pub fn convert_and_merge_heuristic_decisions(
         }
 
         // Cross-cycle state memory (SuperPlan 2026-05-06): if this PID had the
-        // SAME decision applied within the last 30s AND nothing else acts on it
-        // this cycle, suppress emission. The kernel would just say no-op
-        // ("PID already in target state") wasting a syscall + journal entry.
-        // [Hellerstein 2004 §9] state-aware feedback control.
-        // Mapping Kill→Freeze before cache check (downgrade is already happening
-        // below); Kill itself is never recorded — Apollo never executes Kill.
-        let cache_key = if decision.decision == GovernorDecision::Kill {
-            GovernorDecision::Freeze
-        } else {
-            decision.decision
-        };
-        if recently_applied.is_recent(decision.pid, cache_key) {
-            continue;
+        // SAME decision applied within the last 30s, suppress emission. The
+        // kernel would just say no-op ("PID already in target state") wasting
+        // a syscall + journal entry. [Hellerstein 2004 §9] state-aware control.
+        // CachedActionKind::from_governor maps Kill→Freeze automatically.
+        if let Some(kind) = CachedActionKind::from_governor(decision.decision) {
+            if recently_applied.is_recent(decision.pid, kind) {
+                continue;
+            }
         }
 
         // Complete Mediation guard — [Saltzer & Kaashoek 2009] §3.3: every path to a
@@ -419,7 +414,7 @@ pub fn convert_and_merge_heuristic_decisions(
                     decision_reason: dr.clone(),
                 });
                 stats.throttles += 1;
-                recently_applied.record(decision.pid, GovernorDecision::Throttle);
+                recently_applied.record(decision.pid, CachedActionKind::Throttle);
             }
             GovernorDecision::Freeze => {
                 let (ss, su) = pid_start_time(decision.pid);
@@ -432,7 +427,7 @@ pub fn convert_and_merge_heuristic_decisions(
                     decision_reason: dr.clone(),
                 });
                 stats.freezes += 1;
-                recently_applied.record(decision.pid, GovernorDecision::Freeze);
+                recently_applied.record(decision.pid, CachedActionKind::Freeze);
             }
             GovernorDecision::Kill => {
                 let (ss, su) = pid_start_time(decision.pid);
@@ -447,7 +442,7 @@ pub fn convert_and_merge_heuristic_decisions(
                 });
                 stats.kills_downgraded += 1;
                 stats.freezes += 1;
-                recently_applied.record(decision.pid, GovernorDecision::Freeze);
+                recently_applied.record(decision.pid, CachedActionKind::Freeze);
             }
             GovernorDecision::Allow => unreachable!(),
         }
@@ -535,7 +530,7 @@ mod tests {
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(stats.throttles, 1);
-        assert!(cache.is_recent(1234, GovernorDecision::Throttle));
+        assert!(cache.is_recent(1234, CachedActionKind::Throttle));
     }
 
     #[test]
@@ -594,7 +589,7 @@ mod tests {
         let (a1, stats1) = convert_and_merge_heuristic_decisions(&kill, &[], &critical, &mut cache);
         assert_eq!(a1.len(), 1);
         assert_eq!(stats1.kills_downgraded, 1);
-        assert!(cache.is_recent(1234, GovernorDecision::Freeze));
+        assert!(cache.is_recent(1234, CachedActionKind::Freeze));
 
         // Subsequent Freeze for same PID must be suppressed.
         let freeze = vec![make_decision(1234, "testproc", GovernorDecision::Freeze)];

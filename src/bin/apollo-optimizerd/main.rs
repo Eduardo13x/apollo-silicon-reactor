@@ -3006,7 +3006,28 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // Apply any locally learned policy patterns (and keep them even after LLM is disabled).
-                let mut actions = decision.actions;
+                // Cross-cycle state-memory filter (SuperPlan Iter 8 2026-05-06):
+                // decide_actions has ~14 emission sites (multi-thread QoS, freeze
+                // gates, swarm throttle, predictive policy etc.) without per-site
+                // cross-cycle dedup. Single chokepoint here filters ALL of them
+                // against the recently_applied cache. [Saltzer & Schroeder 1975]
+                // Economy of Mechanism — single filter beats per-site fixes.
+                let mut actions: Vec<RootAction> = {
+                    let raw = decision.actions;
+                    let mut filtered = Vec::with_capacity(raw.len());
+                    for action in raw {
+                        if let Some((pid, kind)) =
+                            apollo_optimizer::engine::recently_applied::CachedActionKind::from_root_action(&action)
+                        {
+                            if recently_applied.is_recent(pid, kind) {
+                                continue;
+                            }
+                            recently_applied.record(pid, kind);
+                        }
+                        filtered.push(action);
+                    }
+                    filtered
+                };
                 {
                     let policy = state.policy.lock_recover().learned_policy.clone();
                     actions = llm_daemon::apply_learned_policy_actions(&snapshot, &policy, actions);
@@ -3068,6 +3089,7 @@ fn main() -> anyhow::Result<()> {
                         foreground_app.as_deref(),
                         &actions,
                         memory_budget.recovering_from_critical(),
+                        &mut recently_applied,
                     );
                     actions.extend(hint_new);
                 }
@@ -3622,10 +3644,16 @@ fn main() -> anyhow::Result<()> {
                                 match action {
                                     MemoryAction::PressureHint => {
                                         ds_hint += 1;
+                                        // Cross-cycle dedup (SuperPlan Iter 7):
+                                        // deep-scan path emits SetMemorystatus -1 every cycle for
+                                        // stale apps. Skip if same hint within 30s TTL.
+                                        if recently_applied.is_recent(
+                                            pid,
+                                            apollo_optimizer::engine::recently_applied::CachedActionKind::SetMemorystatus
+                                        ) {
+                                            None::<RootAction>
+                                        } else {
                                         // Cable: purge_purgeable_regions() → reclaim RAM without freeze.
-                                        // When we'd only send a hint, also actively purge purgeable
-                                        // regions. This is the "secret weapon": free RAM from a live
-                                        // process without SIGSTOP, by marking purgeable pages volatile.
                                         if profile.purgeable_bytes > 10 * 1024 * 1024 {
                                             let purged = purge_purgeable_regions(pid).unwrap_or(0);
                                             if purged > 0 {
@@ -3639,6 +3667,10 @@ fn main() -> anyhow::Result<()> {
                                                 }));
                                             }
                                         }
+                                        recently_applied.record(
+                                            pid,
+                                            apollo_optimizer::engine::recently_applied::CachedActionKind::SetMemorystatus
+                                        );
                                         Some(RootAction::SetMemorystatus {
                                             pid,
                                             priority: -1,
@@ -3652,6 +3684,7 @@ fn main() -> anyhow::Result<()> {
                                             ),
                                             decision_reason: DecisionReason::MemoryBudget,
                                         })
+                                        }
                                     }
                                     MemoryAction::Skip => {
                                         ds_skip += 1;
@@ -3792,6 +3825,31 @@ fn main() -> anyhow::Result<()> {
 
                 // Phase 2: Execute actions WITHOUT holding the metrics lock.
                 //
+                // SuperPlan Iter 9 — universal cross-cycle filter at FINAL chokepoint.
+                // Earlier per-path wires (process_enrichment, paging_hints, deep-scan,
+                // decide_actions Iter 8) cover most emitters but llm_daemon's
+                // apply_learned_policy_actions, skill_tick, agent_actions add later.
+                // This single filter catches any remaining cross-cycle re-emissions
+                // and records them so subsequent cycles see the cache state.
+                // [Saltzer & Schroeder 1975] Economy of Mechanism — single filter
+                // beats per-site fixes.
+                let final_actions: Vec<RootAction> = {
+                    let raw = final_actions;
+                    let mut filtered = Vec::with_capacity(raw.len());
+                    for action in raw {
+                        if let Some((pid, kind)) =
+                            apollo_optimizer::engine::recently_applied::CachedActionKind::from_root_action(&action)
+                        {
+                            if recently_applied.is_recent(pid, kind) {
+                                continue;
+                            }
+                            recently_applied.record(pid, kind);
+                        }
+                        filtered.push(action);
+                    }
+                    filtered
+                };
+
                 // Priority action queue: buffer this cycle's decided actions and
                 // dispatch at most max_per_cycle per cycle. Urgent (Unfreeze) actions
                 // bypass the cap. Any overflow stays in the queue for the next cycle.

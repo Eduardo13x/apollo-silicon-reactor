@@ -20,6 +20,7 @@ use apollo_optimizer::engine::safety::{is_protected_name, is_user_interactive_ap
 use apollo_optimizer::engine::swap_reclaim::{CyberPhysicalSignal, NetRateNorm};
 use apollo_optimizer::engine::types::RootAction;
 use apollo_optimizer::engine::audit_types::DecisionReason;
+use apollo_optimizer::engine::recently_applied::{CachedActionKind, RecentlyApplied};
 
 /// Emit direct pressure-driven and ODE-velocity paging hints for this cycle.
 ///
@@ -41,6 +42,7 @@ pub fn run_paging_hints(
     foreground_app: Option<&str>,
     current_actions: &[RootAction],
     recovering_from_critical: bool,
+    recently_applied: &mut RecentlyApplied,
 ) -> Vec<RootAction> {
     let mut new_actions: Vec<RootAction> = Vec::new();
 
@@ -101,6 +103,13 @@ pub fn run_paging_hints(
             if hinted_pids.contains(&proc.pid) {
                 continue;
             }
+            // Cross-cycle state memory (SuperPlan Iter 6 2026-05-06):
+            // SetMemorystatus -1 is a hint to the kernel — repeat hints for the
+            // same PID across cycles get no-op'd at the syscall layer. Skip if
+            // we already hinted this PID within the TTL window.
+            if recently_applied.is_recent(proc.pid, CachedActionKind::SetMemorystatus) {
+                continue;
+            }
             new_actions.push(RootAction::set_memorystatus(
                 proc.pid,
                 -1,
@@ -110,10 +119,6 @@ pub fn run_paging_hints(
                     proc.name,
                     proc.rss_bytes / 1024 / 1024,
                 ),
-                // Regime-aware DecisionReason:
-                //   Critical (≥0.80)            → CriticalBypass (emergency)
-                //   recently exited Critical    → HysteresisRecovery (cooldown)
-                //   else                         → MemoryBudget (normal budget)
                 if pressure_smooth >= 0.80 {
                     DecisionReason::CriticalBypass
                 } else if recovering_from_critical {
@@ -122,6 +127,7 @@ pub fn run_paging_hints(
                     DecisionReason::MemoryBudget
                 },
             ));
+            recently_applied.record(proc.pid, CachedActionKind::SetMemorystatus);
             added += 1;
         }
     }
@@ -180,6 +186,10 @@ pub fn run_paging_hints(
             if hinted_pids_ode.contains(&proc.pid) {
                 continue;
             }
+            // Cross-cycle dedup (SuperPlan Iter 6).
+            if recently_applied.is_recent(proc.pid, CachedActionKind::SetMemorystatus) {
+                continue;
+            }
             new_actions.push(RootAction::set_memorystatus(
                 proc.pid,
                 -1,
@@ -191,6 +201,7 @@ pub fn run_paging_hints(
                 ),
                 DecisionReason::MemoryBudget,
             ));
+            recently_applied.record(proc.pid, CachedActionKind::SetMemorystatus);
             added += 1;
         }
     }
