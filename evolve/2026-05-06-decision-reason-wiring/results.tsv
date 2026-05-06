@@ -1,0 +1,7 @@
+iteration	commit	metric	delta	guard	status	paper_cited	description
+0	e55c0bd	1869_tests_pass	+0	pass	KEEP	Hellerstein2004,Jiang2005	Foundation: lock-free metrics + memory budget hysteresis + reactor weights halved + sysctl P/E cores + DecisionReason variants
+1	ba84257	memorybudget_emit	0->wired	pass	KEEP	Jiang_Zhang_2005	Wire MemoryBudget to 3 paging-hint sites (deep-scan, pressure-driven, ODE velocity)
+2	e220476	criticalbypass_emit	0->wired	pass	KEEP	Hellerstein_2004_§9	Wire CriticalBypass when pressure_smooth >= 0.80
+3	2da70e4	hysteresisrecovery_emit	0->wired	pass	KEEP	Hellerstein_2004_§9	Wire HysteresisRecovery in 30s window after exit Critical
+4	018cc35	test_recovery_window	+1_test	pass	KEEP	—	Lock recovery_from_critical invariant behind regression test
+5	prod-deploy	pressurectx_pct	0.97->0.625	pass	KEEP	—	Deploy + measure: PressureContext -34.5pp, MemoryBudget 0->20.5%
