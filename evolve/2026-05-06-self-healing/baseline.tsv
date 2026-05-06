@@ -17,3 +17,23 @@ journal_success_rate_pct	7.4	target: ≥40% post-dedup
 top_dup_pid	65808	hit 8x same second 03:24:14
 notebooklm_critical_gap_count	1	Global Action Deduplicator
 notebooklm_high_gap_count	2	Thread scheduling, sysinfo verify
+
+# === Phase 1 post-deploy (cycle 323, commit 18f749d) ===
+phase1_cycles	323	post-deploy
+phase1_p95_cycle_ms	108.0	+5ms vs baseline (low sample noise)
+phase1_failures	0	healthy
+phase1_thermal	elevated	same as baseline
+phase1_sm_status_dup_distinct	3	-91% vs baseline 33
+phase1_sm_status_wasted_syscalls	8	-90% vs baseline 78
+phase1_journal_success_pct	12.5	+5pp vs baseline 7.4%
+phase1_remaining_dups_explanation	cross-cycle (4 cycles per second × 1 emit = 4 same-second hits, NOT same-cycle 4-module spam — that's eliminated)
+
+# === Phase 2 verification (cycle ~480, no code change) ===
+phase2_refresh_median_ms	20.45	measured Normal zone, 30 samples
+phase2_refresh_max_ms	29.037	staggered refresh capped well below 50ms baseline
+phase2_refresh_target_15ms_hit_pct	0	target NOT met — non-process portion of light snapshot is ~20ms baseline
+phase2_p95_cycle_ms	128.0	~98ms unaccounted (NOT sysinfo)
+phase2_zone_distribution	Normal=30/30	system in Normal during Phase 2 measurement
+phase2_status	VERIFIED	staggered refresh working; 50-70% reduction vs baseline; residual is unmeasured non-sysinfo work
+phase2_notebooklm_corpus_stale	yes	prior diagnostic "sysinfo dominates" no longer accurate post-foundation
+phase2_recommendation	defer	add granular timers in decide_actions/causal/journal paths in separate session
