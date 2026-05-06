@@ -3831,6 +3831,11 @@ fn main() -> anyhow::Result<()> {
                 // apply_learned_policy_actions, skill_tick, agent_actions add later.
                 // This single filter catches any remaining cross-cycle re-emissions
                 // and records them so subsequent cycles see the cache state.
+                //
+                // SuperPlan post-debrief (2026-05-06): also filters ApplePlatform
+                // procs at emit time. SIP-protected Apple binaries reject task_for_pid
+                // so Throttle/Freeze/SetThreadQoS for them are guaranteed to fail —
+                // no point emitting at all (was 271/500 = 54% of journal `success: false`).
                 // [Saltzer & Schroeder 1975] Economy of Mechanism — single filter
                 // beats per-site fixes.
                 let final_actions: Vec<RootAction> = {
@@ -3840,7 +3845,23 @@ fn main() -> anyhow::Result<()> {
                         if let Some((pid, kind)) =
                             apollo_optimizer::engine::recently_applied::CachedActionKind::from_root_action(&action)
                         {
+                            // Cross-cycle dedup.
                             if recently_applied.is_recent(pid, kind) {
+                                continue;
+                            }
+                            // ApplePlatform pre-filter for actions kernel will reject.
+                            // Boost/SetMemorystatus may still succeed for some Apple
+                            // procs (no task_for_pid required), so allow those through.
+                            let blocks_under_sip = matches!(
+                                kind,
+                                apollo_optimizer::engine::recently_applied::CachedActionKind::Throttle
+                                    | apollo_optimizer::engine::recently_applied::CachedActionKind::Freeze
+                                    | apollo_optimizer::engine::recently_applied::CachedActionKind::Unfreeze
+                                    | apollo_optimizer::engine::recently_applied::CachedActionKind::SetThreadQoS
+                            );
+                            if blocks_under_sip
+                                && apollo_optimizer::engine::process_identity::is_apple_platform_process(pid)
+                            {
                                 continue;
                             }
                             recently_applied.record(pid, kind);

@@ -24,6 +24,7 @@ use apollo_optimizer::engine::llm::{delete_file_best_effort, pending_trial_path,
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::optimization_skills::SkillRegistry;
 use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
+use apollo_optimizer::engine::process_identity::is_apple_platform_process;
 use apollo_optimizer::engine::safety::{is_protected_name, protected_processes};
 use apollo_optimizer::engine::types::RootAction;
 use apollo_optimizer::engine::audit_types::DecisionReason;
@@ -86,6 +87,16 @@ pub fn run_skill_tick(
                 if is_protected_name(&name) {
                     continue;
                 }
+                let pid_u32 = pid.as_u32();
+                // ApplePlatform pre-filter (SuperPlan post-debrief 2026-05-06):
+                // SIP-protected Apple binaries reject task_for_pid + memorystatus_control.
+                // Apollo's skill_registry was learning "throttle:kernelmanagerd" etc. as
+                // "effective" but the kernel ALWAYS rejects → 271/500 journal entries
+                // were `success: false` with BlockReason::ApplePlatform. Skip emission
+                // for any Apple platform binary (csops CS_PLATFORM_BINARY check, ~1µs).
+                if is_apple_platform_process(pid_u32) {
+                    continue;
+                }
                 if skill_targets.contains(&name) && !already_actioned.contains(&name) {
                     let skill_name = skill_matches
                         .iter()
@@ -93,7 +104,7 @@ pub fn run_skill_tick(
                         .map(|s| s.name.as_str())
                         .unwrap_or("skill");
                     new_actions.push(RootAction::throttle(
-                        pid.as_u32(),
+                        pid_u32,
                         name,
                         false,
                         format!("skill:{}", skill_name),
@@ -153,12 +164,20 @@ pub fn run_skill_tick(
                 }
                 for (pid, process) in collector.system().processes() {
                     if process.name() == target {
-                        if Some(pid.as_u32()) == foreground_pid {
+                        let pid_u32 = pid.as_u32();
+                        // ApplePlatform pre-filter (also applies to trial skills).
+                        if is_apple_platform_process(pid_u32) {
+                            // Mark trial as not-runnable so skill_registry doesn't
+                            // penalize the skill for SIP-blocked targets.
+                            targets_found_but_skipped = true;
+                            break;
+                        }
+                        if Some(pid_u32) == foreground_pid {
                             targets_found_but_skipped = true;
                         } else {
                             if !already_actioned.contains(target) {
                                 new_actions.push(RootAction::throttle(
-                                    pid.as_u32(),
+                                    pid_u32,
                                     target.clone(),
                                     false,
                                     format!("trial:{}", skill_name),
