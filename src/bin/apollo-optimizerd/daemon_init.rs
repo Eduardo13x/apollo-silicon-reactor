@@ -80,6 +80,10 @@ pub(super) struct DaemonSubsystems {
     /// (dedup spam, sysinfo cadence drift, reactor saturation).
     /// [Hellerstein 2004 §9] detection-only meta-observer.
     pub self_diagnosis: apollo_optimizer::engine::self_diagnosis::SelfDiagnosis,
+    /// Cross-cycle governor state memory (SuperPlan 2026-05-06).
+    /// Suppresses re-emission of identical decisions for PIDs already in
+    /// the target state. Closes 87.5% journal `success: false` rate.
+    pub recently_applied: apollo_optimizer::engine::recently_applied::RecentlyApplied,
 }
 
 /// Detect hardware capabilities (core count and RAM) once at startup.
@@ -147,6 +151,7 @@ impl DaemonSubsystems {
                     std::path::PathBuf::from("/tmp/apollo_self_diagnosis.jsonl")
                 },
             ),
+            recently_applied: apollo_optimizer::engine::recently_applied::RecentlyApplied::new(),
         }
     }
 }

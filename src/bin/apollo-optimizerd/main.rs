@@ -628,6 +628,7 @@ fn main() -> anyhow::Result<()> {
                 mut swap_reclaim,
                 mut memory_budget,
                 mut self_diagnosis,
+                mut recently_applied,
             } = daemon_init::DaemonSubsystems::new();
             // Cumulative dedup_drops counters from prior cycle — used to
             // compute per-cycle delta for self_diagnosis recording.
@@ -3092,6 +3093,7 @@ fn main() -> anyhow::Result<()> {
                     &lctx.outcome_tracker.experience,
                     learnable_params.experience_pressure_band,
                     snapshot.pressure.memory_pressure,
+                    &mut recently_applied,
                 );
                 let heuristic_decisions = heuristic_pass.heuristic_decisions;
                 let heuristic_critical_pids = heuristic_pass.heuristic_critical_pids;
@@ -4207,6 +4209,21 @@ fn main() -> anyhow::Result<()> {
                 last_cycle_end = Instant::now();
                 lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
                 lf_metrics.commit();
+
+                // ── recently_applied cache cleanup (SuperPlan iter 3) ──────────
+                // O(n) sweep every 60 cycles to amortize. Drops expired entries
+                // (TTL 30s default) so cache size stays bounded under sustained load.
+                if cycle_count % 60 == 0 {
+                    let drained = recently_applied.cleanup_expired();
+                    if drained > 0 {
+                        tracing::debug!(
+                            target: "apollo.recently_applied",
+                            drained,
+                            remaining = recently_applied.len(),
+                            "cache cleanup expired entries"
+                        );
+                    }
+                }
 
                 // ── Self-diagnosis (Phase 6 self-healing layer) ────────────────
                 // Record this cycle's signals + check thresholds. Detection-only;

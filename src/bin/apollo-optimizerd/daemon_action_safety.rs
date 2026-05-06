@@ -41,6 +41,7 @@ use chrono::Utc;
 use apollo_optimizer::engine::process_tree::ProcessTree;
 
 use crate::process_enrichment::{build_foreground_family, convert_and_merge_heuristic_decisions, HeuristicStats};
+use apollo_optimizer::engine::recently_applied::RecentlyApplied;
 
 pub struct HeuristicPassOutput {
     pub heuristic_decisions: Vec<ProcessDecision>,
@@ -85,6 +86,7 @@ pub fn run_heuristic_pass(
     experience: &ExperienceMemory,
     experience_pressure_band: f64,
     current_pressure: f64,
+    recently_applied: &mut RecentlyApplied,
 ) -> HeuristicPassOutput {
     const HIGH_TAU_SEC: f64 = 300.0;
 
@@ -225,6 +227,7 @@ pub fn run_heuristic_pass(
         &heuristic_decisions,
         current_actions,
         &heuristic_critical_pids,
+        recently_applied,
     );
     let additional_actions: Vec<RootAction> = heuristic_actions
         .into_iter()

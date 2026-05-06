@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use apollo_optimizer::engine::adaptive_governor::{GovernorDecision, ProcessDecision};
+use apollo_optimizer::engine::recently_applied::RecentlyApplied;
 use apollo_optimizer::engine::daemon_helpers::pid_start_time;
 use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
 use apollo_optimizer::engine::proc_taskinfo;
@@ -318,6 +319,7 @@ pub fn convert_and_merge_heuristic_decisions(
     decisions: &[ProcessDecision],
     existing_actions: &[RootAction],
     critical_pids: &HashSet<u32>,
+    recently_applied: &mut RecentlyApplied,
 ) -> (Vec<RootAction>, HeuristicStats) {
     let mut stats = HeuristicStats {
         decisions_total: decisions.len() as u64,
@@ -361,6 +363,22 @@ pub fn convert_and_merge_heuristic_decisions(
             continue;
         }
 
+        // Cross-cycle state memory (SuperPlan 2026-05-06): if this PID had the
+        // SAME decision applied within the last 30s AND nothing else acts on it
+        // this cycle, suppress emission. The kernel would just say no-op
+        // ("PID already in target state") wasting a syscall + journal entry.
+        // [Hellerstein 2004 §9] state-aware feedback control.
+        // Mapping Kill→Freeze before cache check (downgrade is already happening
+        // below); Kill itself is never recorded — Apollo never executes Kill.
+        let cache_key = if decision.decision == GovernorDecision::Kill {
+            GovernorDecision::Freeze
+        } else {
+            decision.decision
+        };
+        if recently_applied.is_recent(decision.pid, cache_key) {
+            continue;
+        }
+
         // Complete Mediation guard — [Saltzer & Kaashoek 2009] §3.3: every path to a
         // privileged action must pass through the same access control point.
         //
@@ -401,6 +419,7 @@ pub fn convert_and_merge_heuristic_decisions(
                     decision_reason: dr.clone(),
                 });
                 stats.throttles += 1;
+                recently_applied.record(decision.pid, GovernorDecision::Throttle);
             }
             GovernorDecision::Freeze => {
                 let (ss, su) = pid_start_time(decision.pid);
@@ -413,6 +432,7 @@ pub fn convert_and_merge_heuristic_decisions(
                     decision_reason: dr.clone(),
                 });
                 stats.freezes += 1;
+                recently_applied.record(decision.pid, GovernorDecision::Freeze);
             }
             GovernorDecision::Kill => {
                 let (ss, su) = pid_start_time(decision.pid);
@@ -427,6 +447,7 @@ pub fn convert_and_merge_heuristic_decisions(
                 });
                 stats.kills_downgraded += 1;
                 stats.freezes += 1;
+                recently_applied.record(decision.pid, GovernorDecision::Freeze);
             }
             GovernorDecision::Allow => unreachable!(),
         }
@@ -487,6 +508,98 @@ mod tests {
             classify_governor_reason("GUI app abandoned >24h (idle=26h)"),
             DecisionReason::GraduatedIdle
         );
+    }
+
+    fn make_decision(pid: u32, name: &str, kind: GovernorDecision) -> ProcessDecision {
+        ProcessDecision {
+            pid,
+            name: name.to_string(),
+            decision: kind,
+            tier: ProcessTier::SilentDaemon,
+            utility_score: 0.1,
+            waste_score: 0.5,
+            reason: format!("test {:?}", kind),
+        }
+    }
+
+    #[test]
+    fn convert_and_merge_emits_first_throttle_normally() {
+        let mut cache = RecentlyApplied::new();
+        let critical = HashSet::new();
+        let decisions = vec![make_decision(1234, "testproc", GovernorDecision::Throttle)];
+        let (actions, stats) = convert_and_merge_heuristic_decisions(
+            &decisions,
+            &[],
+            &critical,
+            &mut cache,
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(stats.throttles, 1);
+        assert!(cache.is_recent(1234, GovernorDecision::Throttle));
+    }
+
+    #[test]
+    fn convert_and_merge_suppresses_duplicate_within_ttl() {
+        // Same decision for same PID across two calls — second call must drop.
+        let mut cache = RecentlyApplied::new();
+        let critical = HashSet::new();
+        let decisions = vec![make_decision(1234, "testproc", GovernorDecision::Throttle)];
+
+        // Cycle 1: first emission
+        let (actions1, _) = convert_and_merge_heuristic_decisions(
+            &decisions,
+            &[],
+            &critical,
+            &mut cache,
+        );
+        assert_eq!(actions1.len(), 1);
+
+        // Cycle 2: same decision must be SUPPRESSED (within 30s TTL).
+        let (actions2, stats2) = convert_and_merge_heuristic_decisions(
+            &decisions,
+            &[],
+            &critical,
+            &mut cache,
+        );
+        assert_eq!(actions2.len(), 0, "duplicate within TTL must be suppressed");
+        assert_eq!(stats2.throttles, 0);
+    }
+
+    #[test]
+    fn convert_and_merge_allows_freeze_after_throttle() {
+        // Per-kind cache: a PID can be throttled, then later upgraded to freeze.
+        let mut cache = RecentlyApplied::new();
+        let critical = HashSet::new();
+
+        let throttle = vec![make_decision(1234, "testproc", GovernorDecision::Throttle)];
+        let freeze = vec![make_decision(1234, "testproc", GovernorDecision::Freeze)];
+
+        let (a1, _) = convert_and_merge_heuristic_decisions(&throttle, &[], &critical, &mut cache);
+        assert_eq!(a1.len(), 1);
+
+        // Freeze for SAME pid is a different cache key — should pass through.
+        let (a2, _) = convert_and_merge_heuristic_decisions(&freeze, &[], &critical, &mut cache);
+        assert_eq!(a2.len(), 1, "Freeze with prior Throttle must emit");
+    }
+
+    #[test]
+    fn convert_and_merge_kill_caches_as_freeze() {
+        // Apollo downgrades Kill→Freeze; cache key must reflect the EFFECTIVE
+        // decision so a follow-up Freeze for the same PID is suppressed (no
+        // double-freezing the same PID).
+        let mut cache = RecentlyApplied::new();
+        let critical = HashSet::new();
+
+        let kill = vec![make_decision(1234, "testproc", GovernorDecision::Kill)];
+        let (a1, stats1) = convert_and_merge_heuristic_decisions(&kill, &[], &critical, &mut cache);
+        assert_eq!(a1.len(), 1);
+        assert_eq!(stats1.kills_downgraded, 1);
+        assert!(cache.is_recent(1234, GovernorDecision::Freeze));
+
+        // Subsequent Freeze for same PID must be suppressed.
+        let freeze = vec![make_decision(1234, "testproc", GovernorDecision::Freeze)];
+        let (a2, _) = convert_and_merge_heuristic_decisions(&freeze, &[], &critical, &mut cache);
+        assert_eq!(a2.len(), 0, "Freeze after Kill→Freeze must be suppressed");
     }
 
     #[test]
