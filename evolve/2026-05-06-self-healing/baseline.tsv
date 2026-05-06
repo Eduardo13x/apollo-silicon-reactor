@@ -1,0 +1,19 @@
+metric	value	notes
+cycles	1950	cycle counter at baseline capture
+p95_cycle_ms	103.153	target: ≤100ms
+failures	0	daemon health
+last_error	None	daemon health
+thermal_state	elevated	already under thermal pressure
+effective_profile	aggressive-root	governor in defensive mode
+refresh_duration_ms	None	NOT YET SYNCED — sync_from_lockfree every 5 cycles, may have not flushed
+distinct_decision_reasons	4	target: ≥7 (3 wired + 4 existing)
+pressurecontext_share_pct	82.5	target: ≤45%
+memorybudget_share_pct	15.0	NEW from prior session, 0 → 15%
+sm_status_dup_distinct_pid_ts	33	pids with >1 SetMemorystatus same second
+sm_status_wasted_syscalls	78	wasted out of 111 dup entries (70% waste)
+journal_success_count	37	in last 500 events
+journal_fail_count	463	mostly success:false (already-applied + dup spam)
+journal_success_rate_pct	7.4	target: ≥40% post-dedup
+top_dup_pid	65808	hit 8x same second 03:24:14
+notebooklm_critical_gap_count	1	Global Action Deduplicator
+notebooklm_high_gap_count	2	Thread scheduling, sysinfo verify

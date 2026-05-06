@@ -17,9 +17,127 @@ use apollo_optimizer::engine::degradation::DegradationInputs;
 use apollo_optimizer::engine::unfreeze_decay::UnfreezeDecayModel;
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::daemon_state::SharedState;
+use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
 use apollo_optimizer::engine::swap_reclaim::SwapRisk;
 use apollo_optimizer::collector::{SystemCollector, SystemSnapshot};
 use apollo_optimizer::engine::daemon_helpers::write_frozen_state;
+
+/// Action kinds tracked for per-PID dedup.
+/// Variants without a target PID (SetSysctl, ToggleSpotlight, QuarantineDaemon)
+/// bypass the consolidator and are kept verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DedupKind {
+    SetMemorystatus,
+    Throttle,
+    Freeze,
+    Unfreeze,
+    Boost,
+    SetThreadQoS,
+}
+
+/// Counts of duplicate actions dropped per kind in a single dispatch cycle.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DedupStats {
+    pub set_memorystatus: u64,
+    pub throttle: u64,
+    pub freeze: u64,
+    pub unfreeze: u64,
+    pub boost: u64,
+    pub set_thread_qos: u64,
+}
+
+impl DedupStats {
+    pub fn total_dropped(&self) -> u64 {
+        self.set_memorystatus
+            + self.throttle
+            + self.freeze
+            + self.unfreeze
+            + self.boost
+            + self.set_thread_qos
+    }
+}
+
+/// Extract `(pid, kind)` for actions targeting a specific process. Returns
+/// `None` for actions without a PID target (sysctl, spotlight, quarantine).
+///
+/// SetThreadQoS uses `(pid, thread_index)`-aware key by encoding thread_index
+/// into the kind via secondary discriminator — but because all SetThreadQoS
+/// for the same pid+thread are equivalent for dedup purposes, we treat
+/// `(pid, SetThreadQoS, thread_index)` as the key.
+fn dedup_key(action: &RootAction) -> Option<(u32, DedupKind, u32)> {
+    match action {
+        RootAction::SetMemorystatus { pid, .. } => Some((*pid, DedupKind::SetMemorystatus, 0)),
+        RootAction::ThrottleProcess { pid, .. } => Some((*pid, DedupKind::Throttle, 0)),
+        RootAction::FreezeProcess { pid, .. } => Some((*pid, DedupKind::Freeze, 0)),
+        RootAction::UnfreezeProcess { pid, .. } => Some((*pid, DedupKind::Unfreeze, 0)),
+        RootAction::BoostProcess { pid, .. } => Some((*pid, DedupKind::Boost, 0)),
+        RootAction::SetThreadQoS {
+            pid, thread_index, ..
+        } => Some((*pid, DedupKind::SetThreadQoS, *thread_index)),
+        RootAction::SetSysctl { .. }
+        | RootAction::ToggleSpotlight { .. }
+        | RootAction::QuarantineDaemon { .. } => None,
+    }
+}
+
+/// Consolidate per-PID actions: keep at most one action per `(pid, kind)`,
+/// drop subsequent duplicates. Conflict resolution between different kinds
+/// for the same PID is intentionally NOT performed here — those represent
+/// distinct intents (e.g., Throttle and SetMemorystatus on the same PID
+/// can coexist legitimately).
+///
+/// Closes the Critical gap from NotebookLM peer review (2026-05-06):
+/// 14 emission paths constructed RootActions without per-PID dedup,
+/// causing pid 65808 to receive SetMemorystatus 8× in same second.
+///
+/// [Saltzer & Schroeder 1975] Economy of Mechanism — single chokepoint
+/// before execute_actions eliminates the bug class without touching
+/// every emission site.
+pub fn consolidate_actions_per_pid(
+    actions: Vec<RootAction>,
+) -> (Vec<RootAction>, DedupStats) {
+    let mut seen: HashSet<(u32, DedupKind, u32)> = HashSet::with_capacity(actions.len());
+    let mut stats = DedupStats::default();
+    let mut out: Vec<RootAction> = Vec::with_capacity(actions.len());
+
+    for action in actions {
+        match dedup_key(&action) {
+            Some(key) => {
+                if seen.insert(key) {
+                    out.push(action);
+                } else {
+                    match key.1 {
+                        DedupKind::SetMemorystatus => stats.set_memorystatus += 1,
+                        DedupKind::Throttle => stats.throttle += 1,
+                        DedupKind::Freeze => stats.freeze += 1,
+                        DedupKind::Unfreeze => stats.unfreeze += 1,
+                        DedupKind::Boost => stats.boost += 1,
+                        DedupKind::SetThreadQoS => stats.set_thread_qos += 1,
+                    }
+                }
+            }
+            None => out.push(action),
+        }
+    }
+    (out, stats)
+}
+
+/// Increment lock-free dedup_drops counters from DedupStats.
+/// Called by run_dispatch_tick after consolidate_actions_per_pid.
+pub fn record_dedup_drops(lf: &LockFreeMetrics, stats: &DedupStats) {
+    if stats.set_memorystatus > 0 {
+        lf.add_dedup_drops_setmemorystatus(stats.set_memorystatus);
+    }
+    if stats.throttle > 0 {
+        lf.add_dedup_drops_throttle(stats.throttle);
+    }
+    if stats.freeze > 0 {
+        lf.add_dedup_drops_freeze(stats.freeze);
+    }
+    if stats.unfreeze > 0 {
+        lf.add_dedup_drops_unfreeze(stats.unfreeze);
+    }
+}
 
 use crate::{daemon_action_pipeline, cognitive_tick};
 
@@ -37,12 +155,20 @@ pub struct DispatchTickInput<'a> {
     pub unfreeze_decay: &'a mut UnfreezeDecayModel,
     pub collector: &'a SystemCollector,
     pub dry_run: bool,
+    /// Lock-free metrics for per-cycle dedup_drops accounting.
+    /// Optional so legacy callers and unit tests can pass `None`.
+    pub lf_metrics: Option<&'a LockFreeMetrics>,
 }
 
 /// Output results from the dispatch tick.
 pub struct DispatchTickOutput {
     pub outcomes: ExecuteOutcomes,
     pub causal_qos_upgrades: u32,
+    /// Dedup statistics from this cycle's consolidation pass.
+    /// Currently consumed only by lf_metrics counters; may be read by
+    /// downstream observers (Phase 6 self-healing layer) in future.
+    #[allow(dead_code)]
+    pub dedup_stats: DedupStats,
 }
 
 /// Runs the dispatch and execution orchestration logic.
@@ -60,6 +186,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         unfreeze_decay,
         collector,
         dry_run,
+        lf_metrics,
     } = input;
 
     // ── Filter pipeline ──────────────────────────────────────────────────────
@@ -75,6 +202,30 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     let op_mode = filter_outcome.op_mode;
     let mut filtered_actions = filter_outcome.filtered_actions;
     let causal_qos_upgrades = filter_outcome.causal_qos_upgrades;
+
+    // ── Per-PID dedup chokepoint ─────────────────────────────────────────────
+    // Single consolidation pass before execute_actions. 14 upstream emission
+    // paths (decide_actions, daemon_paging_hints, daemon_agent_actions,
+    // process_enrichment, llm_daemon, freeze-confirmation, etc.) push freely;
+    // here we collapse duplicate (pid, kind) pairs. Without this, pid 65808
+    // received SetMemorystatus 8× in the same second (prod observation).
+    // [Saltzer & Schroeder 1975] Economy of Mechanism.
+    let (deduped, dedup_stats) = consolidate_actions_per_pid(filtered_actions);
+    filtered_actions = deduped;
+    if let Some(lf) = lf_metrics {
+        record_dedup_drops(lf, &dedup_stats);
+    }
+    if dedup_stats.total_dropped() > 0 {
+        tracing::debug!(
+            target: "apollo.dispatch.dedup",
+            dropped_total = dedup_stats.total_dropped(),
+            sm_status = dedup_stats.set_memorystatus,
+            throttle = dedup_stats.throttle,
+            freeze = dedup_stats.freeze,
+            unfreeze = dedup_stats.unfreeze,
+            "consolidate_actions_per_pid: collapsed duplicates"
+        );
+    }
 
     // ── Predictive thaw gate ─────────────────────────────────────────────
     // [Strogatz 2015 §2.3] model-informed control;
@@ -241,6 +392,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     DispatchTickOutput {
         outcomes,
         causal_qos_upgrades,
+        dedup_stats,
     }
 }
 
@@ -414,12 +566,134 @@ mod tests {
             unfreeze_decay: &mut unfreeze_decay,
             collector: &collector,
             dry_run: true,
+            lf_metrics: None,
         };
 
         let output = run_dispatch_tick(input);
-        
+
         // When circuit is open, only unfreeze actions should be dispatched.
         assert_eq!(output.outcomes.unfreezes_applied, 1);
         assert_eq!(output.outcomes.throttles_applied, 0);
+    }
+
+    // ── Per-PID dedup unit tests ─────────────────────────────────────────────
+
+    fn sm_status(pid: u32) -> RootAction {
+        RootAction::SetMemorystatus {
+            pid,
+            priority: -1,
+            reason: format!("test pid {}", pid),
+            decision_reason: DecisionReason::MemoryBudget,
+        }
+    }
+
+    fn throttle(pid: u32) -> RootAction {
+        RootAction::ThrottleProcess {
+            pid,
+            name: format!("p{}", pid),
+            aggressive: false,
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
+        }
+    }
+
+    fn freeze(pid: u32) -> RootAction {
+        RootAction::FreezeProcess {
+            pid,
+            name: format!("p{}", pid),
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
+        }
+    }
+
+    #[test]
+    fn consolidate_drops_4x_setmemorystatus_same_pid() {
+        // Reproduces prod observation: pid 65808 SetMemorystatus 4× per cycle.
+        let actions = vec![sm_status(65808), sm_status(65808), sm_status(65808), sm_status(65808)];
+        let (out, stats) = consolidate_actions_per_pid(actions);
+        assert_eq!(out.len(), 1, "should keep first occurrence only");
+        assert_eq!(stats.set_memorystatus, 3, "should drop 3 duplicates");
+        assert_eq!(stats.total_dropped(), 3);
+    }
+
+    #[test]
+    fn consolidate_keeps_distinct_pid_setmemorystatus() {
+        let actions = vec![sm_status(100), sm_status(200), sm_status(300)];
+        let (out, stats) = consolidate_actions_per_pid(actions);
+        assert_eq!(out.len(), 3, "distinct PIDs not deduped");
+        assert_eq!(stats.total_dropped(), 0);
+    }
+
+    #[test]
+    fn consolidate_keeps_throttle_and_setmemorystatus_same_pid() {
+        // Different kinds for same PID coexist legitimately.
+        let actions = vec![throttle(100), sm_status(100)];
+        let (out, stats) = consolidate_actions_per_pid(actions);
+        assert_eq!(out.len(), 2, "different kinds for same PID coexist");
+        assert_eq!(stats.total_dropped(), 0);
+    }
+
+    #[test]
+    fn consolidate_drops_mixed_duplicates_per_kind() {
+        // 3× SetMemorystatus + 2× Throttle + 1 Freeze for pid 100; 1 Freeze for pid 200.
+        let actions = vec![
+            sm_status(100),
+            sm_status(100),
+            sm_status(100),
+            throttle(100),
+            throttle(100),
+            freeze(100),
+            freeze(200),
+        ];
+        let (out, stats) = consolidate_actions_per_pid(actions);
+        // Survivors: 1 SM(100), 1 Throttle(100), 1 Freeze(100), 1 Freeze(200) = 4
+        assert_eq!(out.len(), 4);
+        assert_eq!(stats.set_memorystatus, 2);
+        assert_eq!(stats.throttle, 1);
+        assert_eq!(stats.freeze, 0);
+        assert_eq!(stats.total_dropped(), 3);
+    }
+
+    #[test]
+    fn consolidate_preserves_action_order() {
+        // First occurrence wins — order must be deterministic.
+        let actions = vec![sm_status(1), sm_status(2), sm_status(1), sm_status(3)];
+        let (out, stats) = consolidate_actions_per_pid(actions);
+        assert_eq!(out.len(), 3);
+        assert_eq!(stats.set_memorystatus, 1);
+        // Verify pid order is 1, 2, 3 (not re-sorted).
+        if let RootAction::SetMemorystatus { pid, .. } = &out[0] {
+            assert_eq!(*pid, 1);
+        } else { panic!("expected SetMemorystatus first"); }
+        if let RootAction::SetMemorystatus { pid, .. } = &out[1] {
+            assert_eq!(*pid, 2);
+        } else { panic!("expected SetMemorystatus second"); }
+        if let RootAction::SetMemorystatus { pid, .. } = &out[2] {
+            assert_eq!(*pid, 3);
+        } else { panic!("expected SetMemorystatus third"); }
+    }
+
+    #[test]
+    fn consolidate_passes_through_non_pid_actions() {
+        // SetSysctl / ToggleSpotlight have no PID — never deduped, always pass through.
+        let actions = vec![
+            RootAction::ToggleSpotlight {
+                enabled: false,
+                reason: "test".to_string(),
+                decision_reason: DecisionReason::PressureContext,
+            },
+            RootAction::ToggleSpotlight {
+                enabled: false,
+                reason: "test2".to_string(),
+                decision_reason: DecisionReason::PressureContext,
+            },
+        ];
+        let (out, stats) = consolidate_actions_per_pid(actions);
+        assert_eq!(out.len(), 2, "non-PID actions pass through");
+        assert_eq!(stats.total_dropped(), 0);
     }
 }

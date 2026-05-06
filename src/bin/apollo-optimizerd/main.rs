@@ -3832,6 +3832,7 @@ fn main() -> anyhow::Result<()> {
                         unfreeze_decay: &mut unfreeze_decay,
                         collector: &collector,
                         dry_run,
+                        lf_metrics: Some(&lf_metrics),
                     });
                     (output.outcomes, output.causal_qos_upgrades)
                 };

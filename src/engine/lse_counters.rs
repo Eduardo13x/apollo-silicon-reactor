@@ -49,6 +49,14 @@ pub struct LockFreeMetrics {
     pub refresh_duration_us: AtomicU64,
     pub memory_budget_duration_us: AtomicU64,
     pub reactor_duration_us: AtomicU64,
+
+    // Per-PID action dedup drops (Phase 1 self-healing — wasted-syscall counter).
+    // Each increment corresponds to a duplicate action collapsed at the dispatch
+    // chokepoint before reaching execute_actions.
+    pub dedup_drops_setmemorystatus: AtomicU64,
+    pub dedup_drops_throttle: AtomicU64,
+    pub dedup_drops_freeze: AtomicU64,
+    pub dedup_drops_unfreeze: AtomicU64,
 }
 
 impl LockFreeMetrics {
@@ -75,6 +83,10 @@ impl LockFreeMetrics {
             refresh_duration_us: AtomicU64::new(0),
             memory_budget_duration_us: AtomicU64::new(0),
             reactor_duration_us: AtomicU64::new(0),
+            dedup_drops_setmemorystatus: AtomicU64::new(0),
+            dedup_drops_throttle: AtomicU64::new(0),
+            dedup_drops_freeze: AtomicU64::new(0),
+            dedup_drops_unfreeze: AtomicU64::new(0),
         }
     }
 
@@ -160,6 +172,26 @@ impl LockFreeMetrics {
         self.reactor_duration_us.store(us, Ordering::Relaxed);
     }
 
+    #[inline(always)]
+    pub fn add_dedup_drops_setmemorystatus(&self, n: u64) {
+        self.dedup_drops_setmemorystatus.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn add_dedup_drops_throttle(&self, n: u64) {
+        self.dedup_drops_throttle.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn add_dedup_drops_freeze(&self, n: u64) {
+        self.dedup_drops_freeze.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn add_dedup_drops_unfreeze(&self, n: u64) {
+        self.dedup_drops_unfreeze.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Bump epoch after a batch of updates. This establishes the
     /// happens-before edge for readers calling `snapshot()`.
     #[inline(always)]
@@ -196,6 +228,10 @@ impl LockFreeMetrics {
             refresh_duration_us: self.refresh_duration_us.load(Ordering::Relaxed),
             memory_budget_duration_us: self.memory_budget_duration_us.load(Ordering::Relaxed),
             reactor_duration_us: self.reactor_duration_us.load(Ordering::Relaxed),
+            dedup_drops_setmemorystatus: self.dedup_drops_setmemorystatus.load(Ordering::Relaxed),
+            dedup_drops_throttle: self.dedup_drops_throttle.load(Ordering::Relaxed),
+            dedup_drops_freeze: self.dedup_drops_freeze.load(Ordering::Relaxed),
+            dedup_drops_unfreeze: self.dedup_drops_unfreeze.load(Ordering::Relaxed),
         }
     }
 }
@@ -227,6 +263,10 @@ pub struct MetricsSnapshot {
     pub refresh_duration_us: u64,
     pub memory_budget_duration_us: u64,
     pub reactor_duration_us: u64,
+    pub dedup_drops_setmemorystatus: u64,
+    pub dedup_drops_throttle: u64,
+    pub dedup_drops_freeze: u64,
+    pub dedup_drops_unfreeze: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
