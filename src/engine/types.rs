@@ -324,6 +324,17 @@ pub enum RootAction {
         reason: String,
         #[serde(default = "default_decision_reason")]
         decision_reason: crate::engine::audit_types::DecisionReason,
+        /// Optional cluster-affinity hint (Phase B 2026-05-06).
+        /// Some(1) → P-cluster preference (Firestorm/Avalanche)
+        /// Some(2) → E-cluster preference (Icestorm/Blizzard)
+        /// Some(0) or None → no hint, kernel default scheduling
+        ///
+        /// Heterogeneous-hardware-only: only emitted when CapabilityReport
+        /// reports both p_core_count AND e_core_count Some(>0).
+        /// [ARM big.LITTLE 2013 §3] thread-level affinity reduces migration
+        /// cost when threads cooperate on shared data within a cluster.
+        #[serde(default)]
+        affinity_tag: Option<u32>,
     },
 }
 

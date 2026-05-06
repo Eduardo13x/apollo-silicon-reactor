@@ -850,6 +850,8 @@ pub fn decide_actions(
                                     idx, name, analysis.thread_count
                                 ),
                                 decision_reason: DecisionReason::AnomalyDetected,
+                                // Runaway: route hot thread to E-cluster (penalize).
+                                affinity_tag: Some(crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER),
                             });
                             thread_actions_emitted += 1;
                         }
@@ -871,7 +873,8 @@ pub fn decide_actions(
                                     "cold thread #{} in saturated {} ({}/{} active)",
                                     idx, name, analysis.active_count, analysis.thread_count
                                 ),
-                                decision_reason: DecisionReason::PressureContext,
+                                decision_reason: DecisionReason::ThreadQoSRouting,
+                                affinity_tag: Some(crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER),
                             });
                             thread_actions_emitted += 1;
                         }
@@ -895,7 +898,10 @@ pub fn decide_actions(
                                     analysis.cold.len(),
                                     analysis.thread_count,
                                 ),
-                                decision_reason: DecisionReason::PressureContext,
+                                decision_reason: DecisionReason::ThreadQoSRouting,
+                                // I/O-bound: kernel handles I/O wait better than user-space hint.
+                                // Leave tag=None to let kernel keep default scheduling.
+                                affinity_tag: None,
                             });
                             thread_actions_emitted += 1;
                         }
@@ -915,7 +921,9 @@ pub fn decide_actions(
                                     "hot thread #{} in {} (cpu={:.1}%)",
                                     idx, name, cpu
                                 ),
-                                decision_reason: DecisionReason::PressureContext,
+                                decision_reason: DecisionReason::ThreadQoSRouting,
+                                // Normal hot thread: P-cluster preference (latency-sensitive).
+                                affinity_tag: Some(crate::engine::mach_qos::mach_sys::AFFINITY_TAG_P_CLUSTER),
                             });
                             thread_actions_emitted += 1;
                         }
@@ -929,7 +937,9 @@ pub fn decide_actions(
                                 thread_index: idx,
                                 tier: "background".to_string(),
                                 reason: format!("cold thread #{} in {} (waiting)", idx, name),
-                                decision_reason: DecisionReason::PressureContext,
+                                decision_reason: DecisionReason::ThreadQoSRouting,
+                                // Normal cold thread: E-cluster (battery-friendly).
+                                affinity_tag: Some(crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER),
                             });
                             thread_actions_emitted += 1;
                         }

@@ -28,7 +28,10 @@ use std::collections::{HashMap, HashSet};
 // ── Low-level FFI ─────────────────────────────────────────────────────────────
 
 /// Subset of Mach constants used here.
-mod mach_sys {
+// Made `pub` (was private) to expose AFFINITY_TAG_* constants for
+// downstream consumers (decide_actions.rs Phase B 2026-05-06).
+// All other constants in this module are equally Apple-ABI public values.
+pub mod mach_sys {
     #![allow(non_upper_case_globals, dead_code)]
 
     pub const KERN_SUCCESS: i32 = 0;

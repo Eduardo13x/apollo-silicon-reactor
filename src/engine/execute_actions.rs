@@ -830,6 +830,7 @@ pub fn execute_actions(
                     name,
                     thread_index,
                     tier,
+                    affinity_tag,
                     ..
                 } => {
                     if protected.iter().any(|p| name.contains(p)) {
@@ -847,6 +848,18 @@ pub fn execute_actions(
                         if let Some(ref mut mgr) = qos_mgr {
                             if mgr.set_thread_qos(*pid, *thread_index, thread_tier) {
                                 out.thread_qos_applied += 1;
+                            }
+                            // Phase B (2026-05-06): emit P/E cluster affinity hint
+                            // alongside QoS tier when caller specified one.
+                            // tag=None or Some(0) → no hint; kernel default.
+                            if let Some(tag) = affinity_tag {
+                                if *tag != 0 {
+                                    let _ = mgr.set_thread_affinity_tag(
+                                        *pid,
+                                        *thread_index,
+                                        *tag,
+                                    );
+                                }
                             }
                         }
                     }
