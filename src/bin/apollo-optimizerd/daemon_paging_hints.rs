@@ -109,7 +109,14 @@ pub fn run_paging_hints(
                     proc.name,
                     proc.rss_bytes / 1024 / 1024,
                 ),
-                DecisionReason::MemoryBudget,
+                // Critical zone (≥0.80) bypasses normal budget rate-limit —
+                // record the bypass so the LLM teacher can distinguish
+                // sustained pressure mitigation from emergency intervention.
+                if pressure_smooth >= 0.80 {
+                    DecisionReason::CriticalBypass
+                } else {
+                    DecisionReason::MemoryBudget
+                },
             ));
             added += 1;
         }
