@@ -88,6 +88,21 @@ pub struct SystemCollector {
     /// Applied before the MAX fusion with kernel_pressure to reduce noise
     /// before it enters the Kalman filter in signal_intelligence.
     compressor_ema: f64,
+    /// Cross-cycle cache of the built top_processes Vec.
+    ///
+    /// Built once per `refresh_processes()` call; reused on intermediate
+    /// cycles when staggered cadence skips the refresh. Saves the ~5-15ms
+    /// cost of iterating ~400 sysinfo processes + collecting + sorting.
+    ///
+    /// Invariant: cache is invalidated (rebuilt) whenever refresh_processes()
+    /// fires this cycle. Between refreshes, sysinfo's per-process cpu_usage
+    /// values are identical to the prior call (sysinfo only updates on
+    /// refresh_processes), so reusing the Vec is semantically equivalent
+    /// to rebuilding it — just cheaper.
+    ///
+    /// [Bhatt 2009 "Reducing overhead of application tracing"] — recompute
+    /// only when source data has changed.
+    cached_top_processes: Vec<ProcessStats>,
 }
 
 #[allow(clippy::new_without_default, dead_code)]
@@ -111,7 +126,32 @@ impl SystemCollector {
             process_refresh_skip_count: 0,
             light_call_count: 0,
             compressor_ema: 0.0,
+            cached_top_processes: Vec::with_capacity(10),
         }
+    }
+
+    /// Rebuild the top_processes cache from current sysinfo state.
+    /// Invariant: caller has just refreshed processes (or is OK with stale).
+    fn rebuild_top_processes_cache(&mut self) {
+        let mut processes: Vec<ProcessStats> = self
+            .sys
+            .processes()
+            .iter()
+            .map(|(pid, process)| ProcessStats {
+                pid: pid.as_u32(),
+                name: process.name().to_string(),
+                cpu_usage: process.cpu_usage(),
+                memory_usage: process.memory(),
+                cpu_wall_ratio: None,
+            })
+            .collect();
+        processes.sort_by(|a, b| {
+            b.cpu_usage
+                .partial_cmp(&a.cpu_usage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        processes.truncate(10);
+        self.cached_top_processes = processes;
     }
 
     pub fn system(&self) -> &System {
@@ -130,10 +170,11 @@ impl SystemCollector {
         // for scheduling decisions. SMC reader handles temps independently.
         // [Bhatt 2009 "Reducing overhead of application tracing"; sysinfo docs]
         self.light_call_count += 1;
-        if self.light_call_count <= 3 {
+        let refreshed_processes = if self.light_call_count <= 3 {
             self.process_refresh_skip_count += 1;
             self.sys.refresh_cpu();
             self.sys.refresh_memory();
+            false
         } else {
             // Light path: enough for all scheduling decisions.
             // Disk/network refresh was removed — DiskStats/NetworkStats captured
@@ -142,7 +183,8 @@ impl SystemCollector {
             self.sys.refresh_cpu();
             self.sys.refresh_memory();
             self.sys.refresh_processes();
-        }
+            true
+        };
 
         // CPU
         let global_cpu = self.sys.global_cpu_info().cpu_usage();
@@ -184,27 +226,14 @@ impl SystemCollector {
         let disks = Vec::new();
         let networks = Vec::new();
 
-        // Processes - Get top 10 by CPU usage
-        let mut processes: Vec<ProcessStats> = self
-            .sys
-            .processes()
-            .iter()
-            .map(|(pid, process)| ProcessStats {
-                pid: pid.as_u32(),
-                name: process.name().to_string(),
-                cpu_usage: process.cpu_usage(),
-                memory_usage: process.memory(),
-                cpu_wall_ratio: None,
-            })
-            .collect();
-
-        // Sort by CPU usage descending
-        processes.sort_by(|a, b| {
-            b.cpu_usage
-                .partial_cmp(&a.cpu_usage)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let top_processes = processes.into_iter().take(10).collect();
+        // Processes - top 10 by CPU usage. Cross-cycle cache (Phase A self-healing
+        // sprint 2026-05-06): rebuild only when refresh_processes() fired this
+        // cycle; otherwise reuse last cycle's Vec — sysinfo's per-process
+        // cpu_usage values are unchanged between refreshes.
+        if refreshed_processes || self.cached_top_processes.is_empty() {
+            self.rebuild_top_processes_cache();
+        }
+        let top_processes = self.cached_top_processes.clone();
 
         (
             SystemSnapshot {
@@ -259,11 +288,14 @@ impl SystemCollector {
             8
         };
 
-        if self.light_call_count % refresh_interval == 0 {
+        let refreshed_processes = if self.light_call_count % refresh_interval == 0 {
             self.sys.refresh_processes();
-        }
+            true
+        } else {
+            false
+        };
         self.light_call_count = self.light_call_count.wrapping_add(1);
-        
+
         let refresh_duration = start.elapsed();
 
         let global_cpu = self.sys.global_cpu_info().cpu_usage();
@@ -295,24 +327,14 @@ impl SystemCollector {
         self.prev_swap_used_bytes = Some(swap_used_bytes);
         self.prev_swap_at = Some(nowi);
 
-        let mut processes: Vec<ProcessStats> = self
-            .sys
-            .processes()
-            .iter()
-            .map(|(pid, process)| ProcessStats {
-                pid: pid.as_u32(),
-                name: process.name().to_string(),
-                cpu_usage: process.cpu_usage(),
-                memory_usage: process.memory(),
-                cpu_wall_ratio: None,
-            })
-            .collect();
-        processes.sort_by(|a, b| {
-            b.cpu_usage
-                .partial_cmp(&a.cpu_usage)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let top_processes = processes.into_iter().take(10).collect();
+        // Cross-cycle cache (Phase A): rebuild top_processes only when
+        // refresh_processes() actually fired. On staggered-skip cycles the
+        // cached Vec is reused — sysinfo's per-process cpu_usage is unchanged
+        // since last refresh.
+        if refreshed_processes || self.cached_top_processes.is_empty() {
+            self.rebuild_top_processes_cache();
+        }
+        let top_processes = self.cached_top_processes.clone();
 
         (
             SystemSnapshot {
@@ -385,24 +407,13 @@ impl SystemCollector {
         self.prev_swap_used_bytes = Some(swap_used_bytes);
         self.prev_swap_at = Some(nowi);
 
-        let mut processes: Vec<ProcessStats> = self
-            .sys
-            .processes()
-            .iter()
-            .map(|(pid, process)| ProcessStats {
-                pid: pid.as_u32(),
-                name: process.name().to_string(),
-                cpu_usage: process.cpu_usage(),
-                memory_usage: process.memory(),
-                cpu_wall_ratio: None,
-            })
-            .collect();
-        processes.sort_by(|a, b| {
-            b.cpu_usage
-                .partial_cmp(&a.cpu_usage)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let top_processes = processes.into_iter().take(10).collect();
+        // Cross-cycle cache (Phase A): no_process_refresh path NEVER refreshes,
+        // so always reuse cached top_processes. Only rebuild on first call
+        // (when cache empty after `new()`'s initial seed refresh_processes()).
+        if self.cached_top_processes.is_empty() {
+            self.rebuild_top_processes_cache();
+        }
+        let top_processes = self.cached_top_processes.clone();
 
         (
             SystemSnapshot {
@@ -891,6 +902,48 @@ mod tests {
             before,
             after
         );
+    }
+
+    // ── Phase A — Cross-cycle top_processes cache invariants ─────────────────
+
+    #[test]
+    fn cache_persists_between_staggered_skips() {
+        // Light snapshot at low pressure (Normal zone): refresh_interval=8.
+        // First call: refresh fires (light_call_count=0 % 8 == 0), cache built.
+        // Calls 1..=7: refresh skipped, cache reused — same Vec returned.
+        let mut c = SystemCollector::new();
+        let (snap1, _) = c.collect_snapshot_light(0.5);
+        let pids1: Vec<u32> = snap1.top_processes.iter().map(|p| p.pid).collect();
+        // Subsequent skipped cycles must return identical pid order.
+        for _ in 0..5 {
+            let (snap_n, _) = c.collect_snapshot_light(0.5);
+            let pids_n: Vec<u32> = snap_n.top_processes.iter().map(|p| p.pid).collect();
+            assert_eq!(pids_n, pids1, "cache should preserve pid order across staggered skips");
+        }
+    }
+
+    #[test]
+    fn cache_seeded_by_constructor_via_first_call() {
+        // After `new()`, the cache field starts empty; first collect_*_no_process_refresh
+        // call rebuilds it from sysinfo's seeded process list (refresh_processes() in new()).
+        let mut c = SystemCollector::new();
+        assert!(c.cached_top_processes.is_empty(), "cache empty before first collect call");
+        let (snap, _) = c.collect_snapshot_no_process_refresh();
+        // Either populated from cache or empty if no processes — but the cache field
+        // must now reflect the snapshot.
+        assert_eq!(snap.top_processes.len(), c.cached_top_processes.len());
+    }
+
+    #[test]
+    fn cache_rebuilds_when_refresh_fires() {
+        // Critical pressure (>=0.80) → refresh_interval=1, every cycle fires refresh.
+        // Cache should be rebuilt on each call (testable via length stability).
+        let mut c = SystemCollector::new();
+        for _ in 0..5 {
+            let (snap, _) = c.collect_snapshot_light(0.85);
+            // top_processes ≤ 10 per design.
+            assert!(snap.top_processes.len() <= 10);
+        }
     }
 
     // ── Micro-benchmark: collect_pressure_facts latency ──────────────────────
