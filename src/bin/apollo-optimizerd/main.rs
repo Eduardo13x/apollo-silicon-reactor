@@ -3640,7 +3640,7 @@ fn main() -> anyhow::Result<()> {
                                                 temp.as_ref().map(|t| format!("hot={:.0}%", t.pct_hot * 100.0))
                                                     .unwrap_or_else(|| "n/a".to_string()),
                                             ),
-                                            decision_reason: DecisionReason::PressureContext,
+                                            decision_reason: DecisionReason::MemoryBudget,
                                         })
                                     }
                                     MemoryAction::Skip => {

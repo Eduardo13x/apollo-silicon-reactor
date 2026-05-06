@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.eduardocortez.systemoptimizerd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/apollo-optimizerd</string>
+        <string>daemon</string>
+        <string>--profile</string>
+        <string>balanced-root</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>APOLLO_LOG</key>
+        <string>debug</string>
+        <key>APOLLO_EXPERIMENTAL_ECORE_BOOST</key>
+        <string>true</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+        <key>Always</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/var/log/apollo-optimizer.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/apollo-optimizer.err.log</string>
+</dict>
+</plist>

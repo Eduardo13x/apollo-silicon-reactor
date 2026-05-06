@@ -109,7 +109,7 @@ pub fn run_paging_hints(
                     proc.name,
                     proc.rss_bytes / 1024 / 1024,
                 ),
-                DecisionReason::PressureContext,
+                DecisionReason::MemoryBudget,
             ));
             added += 1;
         }
@@ -178,7 +178,7 @@ pub fn run_paging_hints(
                     proc.name,
                     proc.rss_bytes / 1024 / 1024,
                 ),
-                DecisionReason::PressureContext,
+                DecisionReason::MemoryBudget,
             ));
             added += 1;
         }
