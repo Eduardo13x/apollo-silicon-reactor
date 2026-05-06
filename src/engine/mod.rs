@@ -6,6 +6,7 @@ pub mod adversarial_probe;
 pub mod analytics;
 pub mod audit_types;
 pub mod self_diagnosis;
+pub mod recently_applied;
 pub mod background_collectors;
 pub mod blocked_action_journal;
 pub mod build_tracker;
