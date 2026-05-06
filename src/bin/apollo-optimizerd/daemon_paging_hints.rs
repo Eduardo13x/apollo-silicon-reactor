@@ -40,6 +40,7 @@ pub fn run_paging_hints(
     ode_net_rate_bps: f64,
     foreground_app: Option<&str>,
     current_actions: &[RootAction],
+    recovering_from_critical: bool,
 ) -> Vec<RootAction> {
     let mut new_actions: Vec<RootAction> = Vec::new();
 
@@ -109,11 +110,14 @@ pub fn run_paging_hints(
                     proc.name,
                     proc.rss_bytes / 1024 / 1024,
                 ),
-                // Critical zone (≥0.80) bypasses normal budget rate-limit —
-                // record the bypass so the LLM teacher can distinguish
-                // sustained pressure mitigation from emergency intervention.
+                // Regime-aware DecisionReason:
+                //   Critical (≥0.80)            → CriticalBypass (emergency)
+                //   recently exited Critical    → HysteresisRecovery (cooldown)
+                //   else                         → MemoryBudget (normal budget)
                 if pressure_smooth >= 0.80 {
                     DecisionReason::CriticalBypass
+                } else if recovering_from_critical {
+                    DecisionReason::HysteresisRecovery
                 } else {
                     DecisionReason::MemoryBudget
                 },

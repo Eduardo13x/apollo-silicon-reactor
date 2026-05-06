@@ -43,6 +43,22 @@ pub struct MemoryBudgetState {
     pub current_zone: PressureZone,
     /// Last time a Critical zone bypass triggered immediate evaluation.
     pub last_critical_bypass_at: Option<Instant>,
+    /// Last time the system exited Critical zone — used to mark
+    /// HysteresisRecovery on subsequent paging hints during the
+    /// 30s recovery window.
+    pub last_critical_exit_at: Option<Instant>,
+}
+
+impl MemoryBudgetState {
+    /// Returns true when the system is in a hysteresis recovery window:
+    /// exited Critical zone within the last 30 seconds.
+    /// [Hellerstein 2004 §9] — recovery markers preserve regime context
+    /// for downstream consumers (audit log, LLM teacher).
+    pub fn recovering_from_critical(&self) -> bool {
+        self.last_critical_exit_at
+            .map(|t| t.elapsed() <= Duration::from_secs(30))
+            .unwrap_or(false)
+    }
 }
 
 impl Default for MemoryBudgetState {
@@ -52,6 +68,7 @@ impl Default for MemoryBudgetState {
             last_applied_at: None,
             current_zone: PressureZone::Normal,
             last_critical_bypass_at: None,
+            last_critical_exit_at: None,
         }
     }
 }
@@ -121,6 +138,12 @@ pub fn run_memory_budget(
             pressure = memory_pressure,
             "pressure_zone_changed"
         );
+        // Mark exit from Critical to enable HysteresisRecovery on subsequent hints.
+        if budget_state.current_zone == PressureZone::Critical
+            && next_zone != PressureZone::Critical
+        {
+            budget_state.last_critical_exit_at = Some(Instant::now());
+        }
     }
     budget_state.current_zone = next_zone;
 

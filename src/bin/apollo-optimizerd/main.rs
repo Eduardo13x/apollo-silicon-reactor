@@ -3059,6 +3059,7 @@ fn main() -> anyhow::Result<()> {
                         reclaim_forecast.net_rate_bps,
                         foreground_app.as_deref(),
                         &actions,
+                        memory_budget.recovering_from_critical(),
                     );
                     actions.extend(hint_new);
                 }
