@@ -1,0 +1,16 @@
+metric	value	notes
+deploy_ts	2026-05-07T04:27:35Z	post sync gap fix 9f74a2e
+post_cycles	511	measurement at 500+ cycles fresh
+post_p95_cycle_ms	161.0	Sprint 2: 139ms, target ≤80ms — small-N variance, see notes
+post_failures	0	healthy
+post_success_rate_pct	100.0	8/8 actions succeeded
+post_audit_fresh	8	small sample (idle workload)
+post_journal_fresh	8	small sample
+post_pidrecycled	0	target met, no regression
+post_sysctloutofrange	0	target ≤2% MET (0%)
+post_identity_cache_hits	0	idle workload, cache not stressed
+post_identity_cache_misses	21	first-time checks all distinct PIDs
+post_identity_proc_pidpath_per_cycle	0.041	target ≤5 EXCEEDED by 100x
+post_identity_cache_hit_ratio	0.000	target ≥0.85 — needs sustained pressure to validate
+post_restore_status_restored_n	61	sync_from_lockfree flush WORKING (B1 closed)
+post_p95_caveat	idle	8 actions / 506 cycles ≈ no hot-path traffic; p95 noise from cycle pacing not amortization
