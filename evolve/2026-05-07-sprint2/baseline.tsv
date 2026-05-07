@@ -1,0 +1,15 @@
+metric	value	notes
+deploy_ts	2026-05-07T03:43:49Z	commit b29d4ff..58a0b59 deployed
+post_cycles	267	measurement at 250+ cycles fresh daemon
+post_p95_cycle_ms	139.0	vs prior 75.45 (Sprint 1 final)
+post_failures	0	healthy
+post_audit_n_fresh	31	small sample — Sprint 1 used 500
+post_journal_n_fresh	31	small sample
+post_journal_success_rate_pct	64.5	baseline 73.7%, target ≥85% — small-N noise
+post_blocks_pidrecycled	0	target ≥80% drop — MET
+post_blocks_appleplatform	0	from Sprint 1 fix
+post_blocks_protectedprocess	0	from Sprint 1 fix
+post_blocks_sysctloutofrange	11	NEW gap class — not addressed by Sprint 2
+post_pidrecycled_journal_skips	0	A1+A2 working
+post_decisionreason_pressurecontext_share	100	all 31 actions PressureContext (small sample)
+post_restore_status	all_zero	B1 telemetry not flushed to runtime_metrics.json — sync_from_lockfree gap
