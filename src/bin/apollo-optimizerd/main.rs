@@ -3459,19 +3459,14 @@ fn main() -> anyhow::Result<()> {
                         }
                     };
                     for (key, value) in net_optimizer.get_sysctl_recommendations(net_profile) {
-                        // Phase C clamp also applies here — network_optimizer
-                        // returns raw kernel-buffer recommendations (e.g. 4MB
-                        // sendspace) that exceed safety::allowlist range.
-                        // Without clamping, execute_actions correctly rejects
-                        // them but inflates the journal with 73+ out-of-range
-                        // skip entries per cycle (fix 2026-05-07).
-                        let clamped = match value.parse::<i64>() {
-                            Ok(n) => apollo_optimizer::engine::sysctl_governor::clamp_to_allowed_range(&key, n).to_string(),
-                            Err(_) => value,
-                        };
+                        // Sprint 4 Phase 4 seal: `RootAction::set_sysctl` is the
+                        // only public construction path and clamps internally
+                        // via `sysctl_limits::clamp_to_allowed_range`. The
+                        // inline pre-clamp that fixed Bug 6 (commit 0a8c319) is
+                        // now redundant — it's enforced at the type level.
                         actions.push(RootAction::set_sysctl(
                             key,
-                            clamped,
+                            value,
                             format!("network-optimizer: {:?} profile", net_profile),
                             DecisionReason::PressureContext,
                         ));
@@ -3913,7 +3908,7 @@ fn main() -> anyhow::Result<()> {
                         fa.iter().filter(|a| matches!(a, RootAction::BoostProcess { .. })).count(),
                         fa.iter().filter(|a| matches!(a, RootAction::ThrottleProcess { .. })).count(),
                         fa.iter().filter(|a| matches!(a, RootAction::FreezeProcess { .. })).count(),
-                        fa.iter().filter(|a| matches!(a, RootAction::SetSysctl { .. })).count(),
+                        fa.iter().filter(|a| matches!(a, RootAction::SetSysctl(_))).count(),
                         metrics.metrics.invalid_sysctl_denied
                     );
                     fa

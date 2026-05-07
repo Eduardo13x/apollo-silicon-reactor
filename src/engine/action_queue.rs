@@ -35,7 +35,7 @@ pub fn action_priority(action: &RootAction) -> ActionPriority {
         RootAction::FreezeProcess { .. }
         | RootAction::ThrottleProcess { .. }
         | RootAction::BoostProcess { .. } => ActionPriority::Normal,
-        RootAction::SetSysctl { .. }
+        RootAction::SetSysctl(_)
         | RootAction::SetMemorystatus { .. }
         | RootAction::ToggleSpotlight { .. }
         | RootAction::QuarantineDaemon { .. }
@@ -223,12 +223,12 @@ mod tests {
     }
 
     fn make_sysctl(key: &str) -> RootAction {
-        RootAction::SetSysctl {
-            key: key.to_string(),
-            value: "1".to_string(),
-            reason: "test".to_string(),
-            decision_reason: DecisionReason::PressureContext,
-        }
+        RootAction::set_sysctl(
+            key.to_string(),
+            "1",
+            "test",
+            DecisionReason::PressureContext,
+        )
     }
 
     fn make_freeze(pid: u32) -> RootAction {

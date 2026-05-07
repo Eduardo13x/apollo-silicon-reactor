@@ -74,7 +74,7 @@ fn dedup_key(action: &RootAction) -> Option<(u32, DedupKind, u32)> {
         RootAction::SetThreadQoS {
             pid, thread_index, ..
         } => Some((*pid, DedupKind::SetThreadQoS, *thread_index)),
-        RootAction::SetSysctl { .. }
+        RootAction::SetSysctl(_)
         | RootAction::ToggleSpotlight { .. }
         | RootAction::QuarantineDaemon { .. } => None,
     }

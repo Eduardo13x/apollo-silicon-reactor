@@ -180,12 +180,12 @@ fn execute_unfreeze_dead_pid_is_safe() {
 /// Non-allowlisted sysctl must not be applied even when cap is granted.
 #[test]
 fn execute_non_allowlisted_sysctl_is_denied() {
-    let actions = vec![RootAction::SetSysctl {
-        key: "kern.securelevel".into(), // NOT in the allowlist
-        value: "0".into(),
-        reason: "test".into(),
-        decision_reason: DecisionReason::PressureContext,
-    }];
+    let actions = vec![RootAction::set_sysctl(
+        "kern.securelevel", // NOT in the allowlist
+        "0",
+        "test",
+        DecisionReason::PressureContext,
+    )];
     let mut frozen = HashSet::new();
     let mut caps = no_caps();
     caps.can_sysctl = true; // cap granted, but key is not in allowlist
@@ -215,12 +215,12 @@ fn execute_non_allowlisted_sysctl_is_denied() {
 /// Allowlisted sysctl without can_sysctl capability must be skipped.
 #[test]
 fn execute_sysctl_without_cap_is_skipped() {
-    let actions = vec![RootAction::SetSysctl {
-        key: "vm.compressor_poll_interval".into(), // in allowlist
-        value: "20".into(),
-        reason: "test".into(),
-        decision_reason: DecisionReason::PressureContext,
-    }];
+    let actions = vec![RootAction::set_sysctl(
+        "vm.compressor_poll_interval", // in allowlist
+        "20",
+        "test",
+        DecisionReason::PressureContext,
+    )];
     let mut frozen = HashSet::new();
     let caps = no_caps(); // can_sysctl = false
 
@@ -279,12 +279,12 @@ fn execute_outcomes_all_zero_for_dead_pids() {
             start_sec: 0,
             start_usec: 0,
         },
-        RootAction::SetSysctl {
-            key: "kern.securelevel".into(),
-            value: "0".into(),
-            reason: "bad".into(),
-            decision_reason: DecisionReason::PressureContext,
-        },
+        RootAction::set_sysctl(
+            "kern.securelevel",
+            "0",
+            "bad",
+            DecisionReason::PressureContext,
+        ),
     ];
 
     let mut frozen = HashSet::new();

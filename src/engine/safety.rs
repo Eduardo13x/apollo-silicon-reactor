@@ -771,7 +771,7 @@ pub fn enforce_limits(actions: Vec<RootAction>, policy: &SafetyPolicy) -> Vec<Ro
                 freezes += 1;
                 freezes <= policy.max_freezes_per_cycle
             }
-            RootAction::SetSysctl { .. } => {
+            RootAction::SetSysctl(_) => {
                 sysctl_writes += 1;
                 sysctl_writes <= policy.max_sysctl_writes_per_cycle
             }
@@ -809,7 +809,7 @@ pub fn enforce_limits_with_budget(
             RootAction::ThrottleProcess { .. } => budget.cycle_throttles += 1,
             RootAction::SetMemorystatus { .. } => budget.cycle_hints += 1,
             RootAction::FreezeProcess { .. } => budget.cycle_freezes += 1,
-            RootAction::SetSysctl { .. } => budget.cycle_sysctl_writes += 1,
+            RootAction::SetSysctl(_) => budget.cycle_sysctl_writes += 1,
             RootAction::SetThreadQoS { .. } => budget.cycle_thread_qos += 1,
             _ => {}
         }

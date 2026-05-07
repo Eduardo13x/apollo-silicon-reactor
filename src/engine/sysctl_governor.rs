@@ -27,29 +27,14 @@ use crate::engine::swap_predictor::SwapTrend;
 use crate::engine::types::{HardPath, RootAction};
 
 // ── Safety clamp helper ───────────────────────────────────────────────────────
-
-/// Clamp a proposed sysctl value to the allowed range from
-/// `safety::allowlisted_sysctls_with_ranges()`.
-///
-/// Sprint 3 Phase C — Governor↔Safety contract reconcile. Sprint 2
-/// measurement showed 35% of journal failures were `BlockReason::SysctlOutOfRange`.
-/// Preventing emission for out-of-range values eliminates wasted journal
-/// entries and audit log noise.
-///
-/// Returns clamped value (always within allowed range), or the original
-/// if no range exists for this key.
-///
-/// [Anti-Corruption Layer Pattern — 1001 patterns slide 48]
-pub fn clamp_to_allowed_range(key: &str, proposed: i64) -> i64 {
-    let ranges = crate::engine::safety::allowlisted_sysctls_with_ranges();
-    if let Some(r) = ranges.iter().find(|r| r.key == key) {
-        proposed.clamp(r.min, r.max)
-    } else {
-        // Key not in allowlist — execute_actions will reject with
-        // InvalidSysctl. Pass through unchanged so the failure surfaces.
-        proposed
-    }
-}
+//
+// `clamp_to_allowed_range` was relocated to `sysctl_limits` in Sprint 4
+// Phase 4 so non-governor emitters (e.g. `network-optimizer` at
+// `main.rs:3577`, the site of Bug 6) can share the same single source of
+// truth without depending on the governor module. Re-exported here for
+// backwards compatibility with any external callers.
+#[allow(unused_imports)]
+pub use crate::engine::sysctl_limits::clamp_to_allowed_range;
 
 // ── Input bundle ─────────────────────────────────────────────────────────────
 
@@ -361,16 +346,14 @@ impl SysctlGovernor {
             .defaults
             .iter()
             .map(|(key, value)| {
-                let clamped_value = match value.parse::<i64>() {
-                    Ok(n) => format!("{}", clamp_to_allowed_range(key, n)),
-                    Err(_) => value.clone(),
-                };
-                RootAction::SetSysctl {
-                    key: key.clone(),
-                    value: clamped_value,
-                    reason: "sysctl-governor: reverting to default".to_string(),
-                    decision_reason: DecisionReason::PressureContext,
-                }
+                // Clamping is applied automatically by `RootAction::set_sysctl`
+                // (Sprint 4 Phase 4 seal). Local pre-clamp removed.
+                RootAction::set_sysctl(
+                    key.clone(),
+                    value.clone(),
+                    "sysctl-governor: reverting to default",
+                    DecisionReason::PressureContext,
+                )
             })
             .collect();
 
@@ -383,19 +366,15 @@ impl SysctlGovernor {
                      using current value '{}' as fallback for revert",
                     key, current
                 );
-                let clamped_value = match current.parse::<i64>() {
-                    Ok(n) => format!("{}", clamp_to_allowed_range(key, n)),
-                    Err(_) => current,
-                };
-                actions.push(RootAction::SetSysctl {
-                    key: key.clone(),
-                    value: clamped_value,
-                    reason: format!(
+                actions.push(RootAction::set_sysctl(
+                    key.clone(),
+                    current,
+                    format!(
                         "sysctl-governor: reverting '{}' using fallback (no default captured)",
                         key
                     ),
-                    decision_reason: DecisionReason::PressureContext,
-                });
+                    DecisionReason::PressureContext,
+                ));
             } else {
                 // Key not available on this macOS version — skip silently.
             }
@@ -500,16 +479,12 @@ impl SysctlGovernor {
             .iter()
             .filter(|(key, _, _)| !self.unavailable_keys.contains(&key.to_string()))
             .map(|(key, value, reason)| {
-                let clamped_value = match value.parse::<i64>() {
-                    Ok(n) => format!("{}", clamp_to_allowed_range(key, n)),
-                    Err(_) => value.to_string(),
-                };
-                RootAction::SetSysctl {
-                    key: key.to_string(),
-                    value: clamped_value,
-                    reason: format!("sysctl-governor: initial tuning — {}", reason),
-                    decision_reason: DecisionReason::PressureContext,
-                }
+                RootAction::set_sysctl(
+                    key.to_string(),
+                    value.to_string(),
+                    format!("sysctl-governor: initial tuning — {}", reason),
+                    DecisionReason::PressureContext,
+                )
             })
             .collect()
     }
@@ -545,11 +520,11 @@ impl SysctlGovernor {
         }
         println!("Applying kernel performance tuning...");
         for action in self.apply_initial_tuning() {
-            if let RootAction::SetSysctl { key, value, .. } = &action {
-                if sysctl_direct::write_str_value(key, value) {
-                    println!("  {} = {}", key, value);
+            if let RootAction::SetSysctl(a) = &action {
+                if sysctl_direct::write_str_value(a.key(), a.value()) {
+                    println!("  {} = {}", a.key(), a.value());
                 } else {
-                    eprintln!("  WARN: failed to set {} = {}", key, value);
+                    eprintln!("  WARN: failed to set {} = {}", a.key(), a.value());
                 }
             }
         }
@@ -1076,19 +1051,25 @@ impl SysctlGovernor {
         if self.unavailable_keys.iter().any(|k| k == key) {
             return;
         }
-        let clamped_value = match value.parse::<i64>() {
-            Ok(n) => format!("{}", clamp_to_allowed_range(key, n)),
-            Err(_) => value.to_string(),
+        // Sprint 4 Phase 4 seal: the factory clamps the value internally
+        // (single source of truth in `sysctl_limits::clamp_to_allowed_range`).
+        // We re-read the post-clamp value via the accessor to keep
+        // `current_values` in sync with what the kernel will actually receive.
+        let action = RootAction::set_sysctl(
+            key.to_string(),
+            value.to_string(),
+            reason.to_string(),
+            DecisionReason::PressureContext,
+        );
+        let clamped_value = if let RootAction::SetSysctl(a) = &action {
+            a.value().to_string()
+        } else {
+            // Unreachable — set_sysctl always returns the SetSysctl variant.
+            value.to_string()
         };
-        actions.push(RootAction::SetSysctl {
-            key: key.to_string(),
-            value: clamped_value.clone(),
-            reason: reason.to_string(),
-            decision_reason: DecisionReason::PressureContext,
-        });
+        actions.push(action);
         self.last_tuning.insert(key.to_string(), SystemTime::now());
-        self.current_values
-            .insert(key.to_string(), clamped_value);
+        self.current_values.insert(key.to_string(), clamped_value);
         self.total_writes += 1;
     }
 }
@@ -1379,8 +1360,8 @@ mod tests {
         );
         // Verify at least one SetSysctl for sendspace or recvspace.
         let has_buffer_tune = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl { key, .. }
-                if key == "net.inet.tcp.sendspace" || key == "net.inet.tcp.recvspace")
+            matches!(a, RootAction::SetSysctl(s)
+                if s.key() == "net.inet.tcp.sendspace" || s.key() == "net.inet.tcp.recvspace")
         });
         assert!(has_buffer_tune, "expected buffer scaling action");
     }
@@ -1399,7 +1380,7 @@ mod tests {
         let actions = tick_ok(&mut gov, &inputs);
         let has_somaxconn = actions
             .iter()
-            .any(|a| matches!(a, RootAction::SetSysctl { key, .. } if key == "kern.ipc.somaxconn"));
+            .any(|a| matches!(a, RootAction::SetSysctl(s) if s.key() == "kern.ipc.somaxconn"));
         assert!(has_somaxconn, "expected somaxconn scale-up on cycle 2");
     }
 
@@ -1422,11 +1403,11 @@ mod tests {
 
         // On macOS the governor uses the _in_msecs variants; on other platforms the legacy names.
         let has_aggressive = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl { key, .. }
-                if key == "vm.compressor_poll_interval"
-                    || key == "vm.compressor_eval_period_in_msecs"
-                    || key == "vm.compressor_sample_min"
-                    || key == "vm.compressor_sample_min_in_msecs")
+            matches!(a, RootAction::SetSysctl(s)
+                if s.key() == "vm.compressor_poll_interval"
+                    || s.key() == "vm.compressor_eval_period_in_msecs"
+                    || s.key() == "vm.compressor_sample_min"
+                    || s.key() == "vm.compressor_sample_min_in_msecs")
         });
         assert!(
             has_aggressive,
@@ -1445,8 +1426,8 @@ mod tests {
         );
         for action in &reverts {
             match action {
-                RootAction::SetSysctl { reason, .. } => {
-                    assert!(reason.contains("reverting"));
+                RootAction::SetSysctl(s) => {
+                    assert!(s.reason().contains("reverting"));
                 }
                 _ => panic!("expected SetSysctl actions only"),
             }
@@ -1478,7 +1459,7 @@ mod tests {
         gov.tcp.consecutive_high = 3; // Force counter.
         let second_actions = tick_ok(&mut gov, &inputs);
         let has_sendspace = second_actions.iter().any(
-            |a| matches!(a, RootAction::SetSysctl { key, .. } if key == "net.inet.tcp.sendspace"),
+            |a| matches!(a, RootAction::SetSysctl(s) if s.key() == "net.inet.tcp.sendspace"),
         );
         assert!(
             !has_sendspace,
@@ -1502,8 +1483,8 @@ mod tests {
 
         let actions = gov.tick(&inputs);
         let has_ack_change = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl { key, value, .. }
-                if key == "net.inet.tcp.delayed_ack" && value == "0")
+            matches!(a, RootAction::SetSysctl(s)
+                if s.key() == "net.inet.tcp.delayed_ack" && s.value() == "0")
         });
         assert!(has_ack_change, "expected delayed_ack=0 for coding workload");
     }
@@ -1522,47 +1503,14 @@ mod tests {
 
         let actions = gov.tick(&inputs);
         let has_ack_change = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl { key, value, .. }
-                if key == "net.inet.tcp.delayed_ack" && value == "3")
+            matches!(a, RootAction::SetSysctl(s)
+                if s.key() == "net.inet.tcp.delayed_ack" && s.value() == "3")
         });
         assert!(has_ack_change, "expected delayed_ack=3 on battery");
     }
 
-    #[test]
-    fn clamp_value_within_range_passes_through() {
-        // First, find an actual range from safety to use realistic values.
-        let ranges = crate::engine::safety::allowlisted_sysctls_with_ranges();
-        if let Some(r) = ranges.first() {
-            // Pick a value in the middle of the range
-            let mid = (r.min + r.max) / 2;
-            let v = clamp_to_allowed_range(&r.key, mid);
-            assert_eq!(v, mid, "value within range must pass through unchanged");
-        }
-    }
-
-    #[test]
-    fn clamp_value_above_max_clamps_to_max() {
-        let ranges = crate::engine::safety::allowlisted_sysctls_with_ranges();
-        if let Some(r) = ranges.first() {
-            let v = clamp_to_allowed_range(&r.key, r.max + 999_999);
-            assert_eq!(v, r.max, "out-of-range high must clamp to max");
-        }
-    }
-
-    #[test]
-    fn clamp_value_below_min_clamps_to_min() {
-        let ranges = crate::engine::safety::allowlisted_sysctls_with_ranges();
-        if let Some(r) = ranges.first() {
-            let v = clamp_to_allowed_range(&r.key, r.min - 1);
-            assert_eq!(v, r.min, "out-of-range low must clamp to min");
-        }
-    }
-
-    #[test]
-    fn clamp_unknown_key_passes_through() {
-        // Unknown keys: pass through unchanged (execute_actions catches via
-        // InvalidSysctl block reason)
-        let v = clamp_to_allowed_range("not.in.allowlist", 12345);
-        assert_eq!(v, 12345);
-    }
+    // Unit tests for `clamp_to_allowed_range` live with the helper in
+    // `sysctl_limits.rs` — see Sprint 4 Phase 4 relocation. The integration
+    // tests above (`tcp_scale_up_after_3_high_cycles`, etc.) still exercise
+    // the clamp via the governor's emit path.
 }

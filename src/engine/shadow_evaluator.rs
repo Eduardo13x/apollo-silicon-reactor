@@ -109,7 +109,7 @@ fn action_kind_str(a: &RootAction) -> &'static str {
         RootAction::ThrottleProcess { .. } => "Throttle",
         RootAction::FreezeProcess { .. } => "Freeze",
         RootAction::UnfreezeProcess { .. } => "Unfreeze",
-        RootAction::SetSysctl { .. } => "SetSysctl",
+        RootAction::SetSysctl(_) => "SetSysctl",
         RootAction::SetMemorystatus { .. } => "SetMemorystatus",
         RootAction::ToggleSpotlight { .. } => "ToggleSpotlight",
         RootAction::QuarantineDaemon { .. } => "QuarantineDaemon",
@@ -124,7 +124,7 @@ fn target_name(a: &RootAction) -> String {
         | RootAction::FreezeProcess { name, .. }
         | RootAction::UnfreezeProcess { name, .. }
         | RootAction::SetThreadQoS { name, .. } => name.clone(),
-        RootAction::SetSysctl { key, .. } => key.clone(),
+        RootAction::SetSysctl(s) => s.key().to_string(),
         RootAction::SetMemorystatus { pid, .. } => format!("pid:{}", pid),
         RootAction::ToggleSpotlight { .. } => "spotlight".to_string(),
         RootAction::QuarantineDaemon { daemon, .. } => daemon.clone(),
@@ -139,7 +139,7 @@ fn target_pid(a: &RootAction) -> Option<u32> {
         | RootAction::UnfreezeProcess { pid, .. }
         | RootAction::SetMemorystatus { pid, .. }
         | RootAction::SetThreadQoS { pid, .. } => Some(*pid),
-        RootAction::SetSysctl { .. }
+        RootAction::SetSysctl(_)
         | RootAction::ToggleSpotlight { .. }
         | RootAction::QuarantineDaemon { .. } => None,
     }

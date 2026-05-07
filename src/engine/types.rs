@@ -245,6 +245,91 @@ pub struct CapabilityReport {
     pub unavailable: Vec<String>,
 }
 
+/// Sealed payload for `RootAction::SetSysctl`.
+///
+/// Sprint 4 Phase 4 (2026-05-07) — fields are private so the only path to
+/// construction is `SetSysctlAction::new_clamped`, which routes every
+/// proposed value through `sysctl_limits::clamp_to_allowed_range`. This
+/// closes the Bug 6 regression class: external emit sites (e.g.
+/// `network-optimizer` at `main.rs:3577`) can no longer struct-literal-bypass
+/// the safety clamp — type-system enforcement, not convention.
+///
+/// JSON serialization shape is preserved by serde's externally-tagged enum
+/// default + a newtype-variant: a previous `RootAction::SetSysctl { key,
+/// value, reason, decision_reason }` and the new `RootAction::SetSysctl(
+/// SetSysctlAction { key, value, reason, decision_reason })` both serialize
+/// to `{"SetSysctl": {"key": ..., "value": ..., "reason": ...,
+/// "decision_reason": ...}}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SetSysctlAction {
+    key: String,
+    value: String,
+    reason: String,
+    #[serde(default = "default_decision_reason")]
+    decision_reason: crate::engine::audit_types::DecisionReason,
+}
+
+impl SetSysctlAction {
+    /// Only public constructor for sysctl actions. Parses `value` as `i64`
+    /// and clamps to the
+    /// `safety::allowlisted_sysctls_with_ranges()` entry for `key`.
+    /// Non-numeric values pass through unchanged. Non-allowlist keys pass
+    /// through unchanged (execute_actions rejects them with
+    /// `BlockReason::InvalidSysctl` — defense in depth).
+    ///
+    /// Emits a `tracing::debug!` only when the clamp actually changed the
+    /// value (no log spam on the common no-op path). When `clamped ==
+    /// proposed` this method is silent, and `execute_actions` separately
+    /// skips no-op writes when the kernel already reports the same value
+    /// (see `BlockReason` early-return at the `RootAction::SetSysctl` arm).
+    pub fn new_clamped(
+        key: impl Into<String>,
+        value: impl Into<String>,
+        reason: impl Into<String>,
+        decision_reason: crate::engine::audit_types::DecisionReason,
+    ) -> Self {
+        let key = key.into();
+        let value = value.into();
+        let clamped = match value.parse::<i64>() {
+            Ok(n) => {
+                let limited = crate::engine::sysctl_limits::clamp_to_allowed_range(&key, n);
+                if limited != n {
+                    tracing::debug!(
+                        target: "apollo.sysctl",
+                        key = %key,
+                        proposed = n,
+                        clamped = limited,
+                        "SetSysctlAction clamped to allowed range"
+                    );
+                    limited.to_string()
+                } else {
+                    value
+                }
+            }
+            Err(_) => value,
+        };
+        Self {
+            key,
+            value: clamped,
+            reason: reason.into(),
+            decision_reason,
+        }
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+    pub fn decision_reason(&self) -> &crate::engine::audit_types::DecisionReason {
+        &self.decision_reason
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RootAction {
     BoostProcess {
@@ -287,13 +372,17 @@ pub enum RootAction {
         #[serde(default = "default_decision_reason")]
         decision_reason: crate::engine::audit_types::DecisionReason,
     },
-    SetSysctl {
-        key: String,
-        value: String,
-        reason: String,
-        #[serde(default = "default_decision_reason")]
-        decision_reason: crate::engine::audit_types::DecisionReason,
-    },
+    /// Sealed sysctl action — the only construction path is
+    /// `SetSysctlAction::new_clamped(...)` (or its public delegate
+    /// `RootAction::set_sysctl`), which routes the proposed value through
+    /// `sysctl_limits::clamp_to_allowed_range` automatically.
+    ///
+    /// Sprint 4 Phase 4 (2026-05-07): wrapped in a private-fielded struct to
+    /// prevent regressions of Bug 6 (`network-optimizer` emitting raw
+    /// 4 MB buffers without clamping). Future emit sites that try to
+    /// struct-literal-construct a `SetSysctlAction` will fail to compile
+    /// outside `engine::types`, forcing them through the clamping factory.
+    SetSysctl(SetSysctlAction),
     SetMemorystatus {
         pid: u32,
         priority: i32,
@@ -368,7 +457,7 @@ impl RootAction {
                 Some((*pid, Some(name.as_str()), 0, 0))
             }
             RootAction::SetMemorystatus { pid, .. } => Some((*pid, None, 0, 0)),
-            RootAction::SetSysctl { .. }
+            RootAction::SetSysctl(_)
             | RootAction::ToggleSpotlight { .. }
             | RootAction::QuarantineDaemon { .. } => None,
         }
@@ -435,18 +524,26 @@ impl RootAction {
         }
     }
 
+    /// Build a `RootAction::SetSysctl` with automatic value clamping.
+    ///
+    /// This is the only public construction path for sysctl actions
+    /// (Sprint 4 Phase 4 seal). The proposed `value` is parsed as `i64` and
+    /// clamped to the safety allowlist range for `key`; non-numeric or
+    /// non-allowlist values pass through unchanged so `execute_actions`
+    /// can reject them with `BlockReason::InvalidSysctl` (defense in
+    /// depth).
     pub fn set_sysctl(
         key: impl Into<String>,
         value: impl Into<String>,
         reason: impl Into<String>,
         decision_reason: crate::engine::audit_types::DecisionReason,
     ) -> Self {
-        RootAction::SetSysctl {
-            key: key.into(),
-            value: value.into(),
-            reason: reason.into(),
+        RootAction::SetSysctl(SetSysctlAction::new_clamped(
+            key,
+            value,
+            reason,
             decision_reason,
-        }
+        ))
     }
 
     pub fn set_memorystatus(
@@ -1649,13 +1746,108 @@ mod tests {
 
     #[test]
     fn identity_fields_set_sysctl_returns_none() {
-        let a = RootAction::SetSysctl {
-            key: "net.inet.tcp.delayed_ack".into(),
-            value: "3".into(),
-            reason: "tune".into(),
-            decision_reason: DecisionReason::PressureContext,
-        };
+        let a = RootAction::set_sysctl(
+            "net.inet.tcp.delayed_ack",
+            "3",
+            "tune",
+            DecisionReason::PressureContext,
+        );
         assert_eq!(a.identity_fields(), None);
+    }
+
+    #[test]
+    fn set_sysctl_action_clamps_bug6_regression() {
+        // Regression for Bug 6 (Sprint 4 Phase 4 motivator): network-optimizer
+        // emitted `SetSysctl { value: "4194304", .. }` for
+        // `net.inet.tcp.sendspace`, which exceeds the safety allowlist max.
+        // The factory must clamp to the allowlist max — not pass through.
+        let action = crate::engine::types::SetSysctlAction::new_clamped(
+            "net.inet.tcp.sendspace",
+            "4194304",
+            "bug6 regression",
+            DecisionReason::PressureContext,
+        );
+        let ranges = crate::engine::safety::allowlisted_sysctls_with_ranges();
+        let max_for_key = ranges
+            .iter()
+            .find(|r| r.key == "net.inet.tcp.sendspace")
+            .map(|r| r.max)
+            .expect("net.inet.tcp.sendspace must be in allowlist");
+        assert_eq!(
+            action.value(),
+            max_for_key.to_string(),
+            "value must clamp to allowlist max, not the raw 4194304"
+        );
+        assert_ne!(
+            action.value(),
+            "4194304",
+            "raw 4194304 must not survive — that was Bug 6"
+        );
+    }
+
+    #[test]
+    fn set_sysctl_action_non_allowlist_passthrough() {
+        let action = crate::engine::types::SetSysctlAction::new_clamped(
+            "kern.totally.fake",
+            "999",
+            "passthrough",
+            DecisionReason::PressureContext,
+        );
+        // Non-allowlist keys pass through unchanged so execute_actions can
+        // reject them with BlockReason::InvalidSysctl.
+        assert_eq!(action.value(), "999");
+        assert_eq!(action.key(), "kern.totally.fake");
+    }
+
+    #[test]
+    fn set_sysctl_action_unparseable_preserved() {
+        // Non-numeric values must not panic and must round-trip unchanged.
+        let action = crate::engine::types::SetSysctlAction::new_clamped(
+            "kern.maxfiles",
+            "auto",
+            "unparseable",
+            DecisionReason::PressureContext,
+        );
+        assert_eq!(action.value(), "auto");
+    }
+
+    #[test]
+    fn set_sysctl_json_shape_unchanged_after_seal() {
+        // Sprint 4 Phase 4: the variant changed from a struct variant to a
+        // newtype variant wrapping `SetSysctlAction`. With Serde's default
+        // externally-tagged enum + a newtype-variant whose inner struct has
+        // the same field names, the JSON shape must be identical to the
+        // pre-seal struct-variant form. Dashboards / journals / ops tools
+        // that grep `"SetSysctl":{"key":...}` continue to work.
+        let action = RootAction::set_sysctl(
+            "net.inet.tcp.delayed_ack",
+            "0",
+            "tune",
+            DecisionReason::PressureContext,
+        );
+        let json = serde_json::to_string(&action).expect("serialize");
+        // Externally tagged variant: top-level object {"SetSysctl": ...}.
+        assert!(
+            json.starts_with("{\"SetSysctl\":{\""),
+            "expected externally-tagged shape, got: {}",
+            json
+        );
+        // Inner fields are visible at the inner object level.
+        assert!(json.contains("\"key\":\"net.inet.tcp.delayed_ack\""));
+        assert!(json.contains("\"value\":\"0\""));
+        assert!(json.contains("\"reason\":\"tune\""));
+
+        // Round-trip back through deserialize to confirm bidirectional
+        // shape stability.
+        let back: RootAction = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            RootAction::SetSysctl(s) => {
+                assert_eq!(s.key(), "net.inet.tcp.delayed_ack");
+                assert_eq!(s.value(), "0");
+                assert_eq!(s.reason(), "tune");
+            }
+            _ => panic!("round-trip yielded wrong variant"),
+        }
     }
 
     #[test]

@@ -376,23 +376,23 @@ pub fn execute_actions(
             | RootAction::ThrottleProcess { decision_reason, .. }
             | RootAction::FreezeProcess { decision_reason, .. }
             | RootAction::UnfreezeProcess { decision_reason, .. }
-            | RootAction::SetSysctl { decision_reason, .. }
             | RootAction::SetMemorystatus { decision_reason, .. }
             | RootAction::ToggleSpotlight { decision_reason, .. }
             | RootAction::QuarantineDaemon { decision_reason, .. }
             | RootAction::SetThreadQoS { decision_reason, .. } => decision_reason.clone(),
+            RootAction::SetSysctl(s) => s.decision_reason().clone(),
         };
 
         let reason = match &action {
             RootAction::BoostProcess { reason, .. }
             | RootAction::ThrottleProcess { reason, .. }
             | RootAction::FreezeProcess { reason, .. }
-            | RootAction::SetSysctl { reason, .. }
             | RootAction::SetMemorystatus { reason, .. }
             | RootAction::ToggleSpotlight { reason, .. }
             | RootAction::QuarantineDaemon { reason, .. }
             | RootAction::SetThreadQoS { reason, .. }
             | RootAction::UnfreezeProcess { reason, .. } => reason.clone(),
+            RootAction::SetSysctl(s) => s.reason().to_string(),
         };
 
         let mut block_reason = None;
@@ -695,13 +695,22 @@ pub fn execute_actions(
                         }
                     }
                 }
-                RootAction::SetSysctl { key, value, .. } => {
-                    if !allowlist.contains(key.as_str()) || !caps.can_sysctl {
+                RootAction::SetSysctl(s) => {
+                    let key = s.key();
+                    let value = s.value();
+                    if !allowlist.contains(key) || !caps.can_sysctl {
                         return Ok(());
                     }
-                    // Validate value range — prevents dangerous values like kern.maxfiles=1.
+                    // Defense-in-depth range check. The
+                    // `SetSysctlAction::new_clamped` factory already clamps
+                    // numeric values, but we re-validate here to catch:
+                    //   1. Type-system escape via deserialization from a
+                    //      hostile journal/socket payload (Sprint 4 Phase 4
+                    //      seal protects construction in-process only).
+                    //   2. Kernel-rejected ranges the safety allowlist
+                    //      doesn't model fully.
                     let ranges = allowlisted_sysctls_with_ranges();
-                    if let Some(range) = ranges.iter().find(|r| r.key == key.as_str()) {
+                    if let Some(range) = ranges.iter().find(|r| r.key == key) {
                         if let Ok(numeric_val) = value.parse::<i64>() {
                             if numeric_val < range.min || numeric_val > range.max {
                                 out.invalid_sysctl_denied += 1;
@@ -736,7 +745,7 @@ pub fn execute_actions(
                     // emitting clamped-to-current writes (e.g. delayed_ack=3
                     // when sysctl already reads 3), inflating the journal
                     // with success-but-unchanged entries (fix 2026-05-07).
-                    if before.as_deref() == Some(value.as_str()) {
+                    if before.as_deref() == Some(value) {
                         out.push_skip(format!("sysctl-noop:{}={}", key, value));
                         return Ok(());
                     }

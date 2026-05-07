@@ -158,17 +158,19 @@ fn enforce_limits_caps_freezes_at_policy_max() {
 fn enforce_limits_caps_sysctl_at_policy_max() {
     let policy = SafetyPolicy::for_profile(OptimizationProfile::BalancedRoot);
     let actions: Vec<RootAction> = (0..30)
-        .map(|i| RootAction::SetSysctl {
-            key: format!("vm.key_{}", i),
-            value: "1".into(),
-            reason: "test".into(),
-            decision_reason: DecisionReason::PressureContext,
+        .map(|i| {
+            RootAction::set_sysctl(
+                format!("vm.key_{}", i),
+                "1",
+                "test",
+                DecisionReason::PressureContext,
+            )
         })
         .collect();
     let filtered = enforce_limits(actions, &policy);
     let count = filtered
         .iter()
-        .filter(|a| matches!(a, RootAction::SetSysctl { .. }))
+        .filter(|a| matches!(a, RootAction::SetSysctl(_)))
         .count();
     assert_eq!(
         count, policy.max_sysctl_writes_per_cycle,

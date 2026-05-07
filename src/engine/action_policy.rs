@@ -275,7 +275,7 @@ fn action_kind_name(action: &RootAction) -> &'static str {
         RootAction::ThrottleProcess { .. } => "ThrottleProcess",
         RootAction::FreezeProcess { .. } => "FreezeProcess",
         RootAction::UnfreezeProcess { .. } => "UnfreezeProcess",
-        RootAction::SetSysctl { .. } => "SetSysctl",
+        RootAction::SetSysctl(_) => "SetSysctl",
         RootAction::SetMemorystatus { .. } => "SetMemorystatus",
         RootAction::ToggleSpotlight { .. } => "ToggleSpotlight",
         RootAction::QuarantineDaemon { .. } => "QuarantineDaemon",

@@ -113,6 +113,7 @@ pub mod swap_reclaim;
 pub mod syscall_classifier;
 pub mod sysctl_direct;
 pub mod sysctl_governor;
+pub mod sysctl_limits;
 pub mod system_log_ingester;
 pub mod teacher_consolidation;
 pub mod telemetry_logger;
