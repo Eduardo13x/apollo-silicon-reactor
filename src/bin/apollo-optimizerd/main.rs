@@ -3841,6 +3841,17 @@ fn main() -> anyhow::Result<()> {
                 let final_actions: Vec<RootAction> = {
                     let raw = final_actions;
                     let mut filtered = Vec::with_capacity(raw.len());
+                    // Snapshot protection state ONCE per cycle (not per action).
+                    // [Saltzer & Kaashoek 2009 §3.3] Complete Mediation — single check
+                    // path matches what execute_actions safety layer will do.
+                    let hard_protected = apollo_optimizer::engine::safety::protected_processes();
+                    let infra_protected = apollo_optimizer::engine::safety::infrastructure_processes();
+                    let policy_protected: Vec<String> = state
+                        .policy
+                        .lock_recover()
+                        .learned_policy
+                        .protected_patterns
+                        .clone();
                     for action in raw {
                         if let Some((pid, kind)) =
                             apollo_optimizer::engine::recently_applied::CachedActionKind::from_root_action(&action)
@@ -3850,8 +3861,6 @@ fn main() -> anyhow::Result<()> {
                                 continue;
                             }
                             // ApplePlatform pre-filter for actions kernel will reject.
-                            // Boost/SetMemorystatus may still succeed for some Apple
-                            // procs (no task_for_pid required), so allow those through.
                             let blocks_under_sip = matches!(
                                 kind,
                                 apollo_optimizer::engine::recently_applied::CachedActionKind::Throttle
@@ -3864,16 +3873,11 @@ fn main() -> anyhow::Result<()> {
                             {
                                 continue;
                             }
-                            // ProtectedProcess pre-filter (post-debrief 2026-05-06):
-                            // 365/432 of remaining `success: false` were ProtectedProcess
-                            // blocks at safety layer. Pre-check here to avoid emitting at
-                            // all. NotebookLM Critical recommendation — Complete Mediation
-                            // [Saltzer & Kaashoek 2009 §3.3]: every privileged-action path
-                            // must pass through the same access-control point.
-                            //
-                            // is_protected_name takes &str and returns true for the ~80
-                            // hardcoded protected names (kernel_task, launchd, mds, etc.).
-                            // Skip Boost (Apollo's own boost on protected procs is OK).
+                            // ProtectedProcess pre-filter via classify_protection():
+                            // mirrors execute_actions safety layer logic. Covers Tier 1
+                            // (hardcoded), Tier 2 (infra: docker/postgres/redis), and
+                            // Tier 3 (learned policy substring case-insensitive).
+                            // Skip Boost + Unfreeze: those are CORRECTIVE on protected.
                             let blocks_for_protected = !matches!(
                                 kind,
                                 apollo_optimizer::engine::recently_applied::CachedActionKind::Boost
@@ -3889,7 +3893,14 @@ fn main() -> anyhow::Result<()> {
                                     _ => None,
                                 };
                                 if let Some(name) = action_name {
-                                    if apollo_optimizer::engine::safety::is_protected_name(name) {
+                                    let level = apollo_optimizer::engine::safety::classify_protection(
+                                        name,
+                                        &hard_protected,
+                                        &infra_protected,
+                                        &policy_protected,
+                                        false,
+                                    );
+                                    if level == apollo_optimizer::engine::safety::ProtectionLevel::Unconditional {
                                         continue;
                                     }
                                 }
