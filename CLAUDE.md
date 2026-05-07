@@ -2,6 +2,30 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Critical lesson — NotebookLM is NOT a final gatekeeper (2026-05-07)
+
+NotebookLM peer-review (notebook `8344b94c-a014-4803-abea-076a55753cfd`) is a research librarian, not a senior engineer. It paraphrases and elaborates with confidence; it does NOT catch logic gaps in your diff, calibrate severity honestly, or push back when you're wrong.
+
+**Observed failure (Sprint 3)**: Sprint declared "closed" with NotebookLM verdict citing Hellerstein 130ms and 3 severity-ranked gaps. Empirical re-verification 7h later found **5 real bugs** that NotebookLM missed despite having full source access:
+1. Cache only cached 2/6 RootAction variants (start_sec=0 path skipped)
+2. ABA window introduced by my own lookup_by_pid fix without invalidate_pid wire
+3. SetSysctl no-op writes (clamp emitted, write succeeded but `before == after`)
+4. network-optimizer raw emit at main.rs:3577 bypassing Phase C clamp
+5. Dashboard verdict using sticky `survival_mode_activations > 0` as live state flag
+
+**Mandatory adversarial pass before declaring any sprint "closed":**
+1. Mechanical re-verification in production — read live `runtime_metrics.json` + `journal.jsonl` post-deploy with fresh-only timestamp filter. Classify entries by actual outcome. Compare against pre-deploy baseline.
+2. Re-read your own diff with adversarial lens — for each modified file ask "what variants does this miss?", "what lifecycle event invalidates this state?", "what call site bypasses this guard?".
+3. Sample size sanity — anything <500 events post-deploy is preliminary, not closed. NotebookLM treats N=8 as conclusive; do not.
+
+If any of those 3 passes find an issue, sprint is **not** closed regardless of NotebookLM verdict.
+
+**Inflation pattern**: NotebookLM defaults to severity-ranked tables with ≥1 🔴 Critical entry per debrief. Discount one severity level mentally — if everything is Critical, nothing is.
+
+**What NotebookLM is good for**: surfacing forgotten cross-session context, structured debrief templates, paper citation lookup, ideation for Phase 1 brainstorming. Use as research aid, never as validation gate.
+
+See `~/.claude/skills/apollo-evolve/SKILL.md` for full discipline.
+
 ## Project Overview
 
 **apollo-optimizer** is a macOS system optimization tool written in Rust (edition 2021). It intelligently manages system resources by freezing/throttling processes, tuning sysctls, and optimizing for specific workloads (e.g., LLM/AI workloads).
