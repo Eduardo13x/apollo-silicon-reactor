@@ -3912,6 +3912,37 @@ fn main() -> anyhow::Result<()> {
                                     }
                                 }
                             }
+                            // Phase A1 (Sprint 2 2026-05-07) — pre-emit identity re-verify.
+                            // Closes ~1ms race window between snapshot and execute. If the
+                            // process died OR was recycled (start_sec mismatch), drop the
+                            // action here instead of letting it hit safety layer where it
+                            // would log as `block_reason: PidRecycled`. The Idempotency
+                            // Pattern says: action must be safe to re-emit if state has
+                            // shifted; here we VERIFY state didn't shift before emission.
+                            //
+                            // For actions emitted with start_sec=0 (legacy paths), only
+                            // check liveness (proc still exists). For actions with non-
+                            // zero start_sec, verify identity match.
+                            //
+                            // Cost: ~3µs from_pid call × ~50 actions/cycle = 150µs negligible.
+                            // [Anti-pattern: Ignoring Idempotency — 1001 patterns slide 59]
+                            let action_start_sec = match &action {
+                                apollo_optimizer::engine::types::RootAction::ThrottleProcess { start_sec, .. }
+                                | apollo_optimizer::engine::types::RootAction::FreezeProcess { start_sec, .. } => *start_sec,
+                                _ => 0,
+                            };
+                            match apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid) {
+                                None => {
+                                    // Process already dead — silently skip.
+                                    continue;
+                                }
+                                Some(current) => {
+                                    if action_start_sec > 0 && current.start_sec != action_start_sec {
+                                        // PID recycled: same number, different process. Skip.
+                                        continue;
+                                    }
+                                }
+                            }
                             recently_applied.record(pid, kind);
                         }
                         filtered.push(action);
