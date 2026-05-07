@@ -26,6 +26,17 @@ If any of those 3 passes find an issue, sprint is **not** closed regardless of N
 
 See `~/.claude/skills/apollo-evolve/SKILL.md` for full discipline.
 
+## Supervision mode (active 2026-05-07 onward)
+
+User explicitly opted into supervision over autopilot. Rules:
+
+1. **NEVER declare work complete without mechanical verification AND raw output shown to user.** "Tests pass" is not proof — paste the test runner output. "Deploy succeeded" is not proof — paste `launchctl print` state. "Bug closed" is not proof — paste the journal/runtime_metrics diff that demonstrates the fix.
+2. **User is the gatekeeper, not the AI, not NotebookLM.** Present evidence, let the user draw conclusions. Do not pre-conclude on the user's behalf.
+3. **Show commands before running them on irreversible/shared state** (deploy, restart daemon, modify production config). Wait for explicit go-ahead.
+4. **Prefer "preliminary" over "closed"** when sample size is small or evidence indirect. Reserve "closed" for outcomes verified in production with N≥500 events or equivalent stress signal.
+5. **Surface discrepancies, don't paper over them.** If NotebookLM says X and prod metrics say Y, report both — don't pick the prettier one.
+6. **No celebratory summaries.** End-of-task message lists what was changed and what remains uncertain. Skip the victory lap.
+
 ## Project Overview
 
 **apollo-optimizer** is a macOS system optimization tool written in Rust (edition 2021). It intelligently manages system resources by freezing/throttling processes, tuning sysctls, and optimizing for specific workloads (e.g., LLM/AI workloads).
