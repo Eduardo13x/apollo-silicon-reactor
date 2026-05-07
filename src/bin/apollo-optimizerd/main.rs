@@ -3914,32 +3914,50 @@ fn main() -> anyhow::Result<()> {
                             }
                             // Phase A1 (Sprint 2 2026-05-07) — pre-emit identity re-verify.
                             // Closes ~1ms race window between snapshot and execute. If the
-                            // process died OR was recycled (start_sec mismatch), drop the
-                            // action here instead of letting it hit safety layer where it
-                            // would log as `block_reason: PidRecycled`. The Idempotency
-                            // Pattern says: action must be safe to re-emit if state has
-                            // shifted; here we VERIFY state didn't shift before emission.
+                            // process died OR was recycled (start_sec/start_usec mismatch),
+                            // drop the action here instead of letting it hit safety layer
+                            // where it would log as `block_reason: PidRecycled`.
                             //
-                            // For actions emitted with start_sec=0 (legacy paths), only
-                            // check liveness (proc still exists). For actions with non-
-                            // zero start_sec, verify identity match.
+                            // Mirrors execute_actions::verify_pid_identity exactly:
+                            //   - start_sec match (PID-recycle guard)
+                            //   - start_usec match when both non-zero (sub-second recycle)
+                            //   - name fallback for legacy start_sec=0 actions
                             //
-                            // Cost: ~3µs from_pid call × ~50 actions/cycle = 150µs negligible.
                             // [Anti-pattern: Ignoring Idempotency — 1001 patterns slide 59]
-                            let action_start_sec = match &action {
-                                apollo_optimizer::engine::types::RootAction::ThrottleProcess { start_sec, .. }
-                                | apollo_optimizer::engine::types::RootAction::FreezeProcess { start_sec, .. } => *start_sec,
-                                _ => 0,
+                            let (action_start_sec, action_start_usec) = match &action {
+                                apollo_optimizer::engine::types::RootAction::ThrottleProcess { start_sec, start_usec, .. }
+                                | apollo_optimizer::engine::types::RootAction::FreezeProcess { start_sec, start_usec, .. } => (*start_sec, *start_usec),
+                                _ => (0u64, 0u64),
+                            };
+                            let identity_action_name: Option<&str> = match &action {
+                                apollo_optimizer::engine::types::RootAction::ThrottleProcess { name, .. }
+                                | apollo_optimizer::engine::types::RootAction::FreezeProcess { name, .. }
+                                | apollo_optimizer::engine::types::RootAction::UnfreezeProcess { name, .. }
+                                | apollo_optimizer::engine::types::RootAction::BoostProcess { name, .. }
+                                | apollo_optimizer::engine::types::RootAction::SetThreadQoS { name, .. } => Some(name.as_str()),
+                                _ => None,
                             };
                             match apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid) {
-                                None => {
-                                    // Process already dead — silently skip.
-                                    continue;
-                                }
+                                None => continue,
                                 Some(current) => {
                                     if action_start_sec > 0 && current.start_sec != action_start_sec {
-                                        // PID recycled: same number, different process. Skip.
                                         continue;
+                                    }
+                                    if action_start_sec > 0
+                                        && action_start_usec > 0
+                                        && current.start_usec != action_start_usec
+                                    {
+                                        continue;
+                                    }
+                                    if action_start_sec == 0 {
+                                        if let Some(expected) = identity_action_name {
+                                            let name_ok = current.name == expected
+                                                || (current.name.len() >= 6 && expected.starts_with(&current.name))
+                                                || (expected.len() >= 6 && current.name.starts_with(expected));
+                                            if !name_ok {
+                                                continue;
+                                            }
+                                        }
                                     }
                                 }
                             }
