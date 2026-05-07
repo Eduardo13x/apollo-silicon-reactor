@@ -9,7 +9,7 @@ use apollo_optimizer::engine::action_queue::ActionQueue;
 use apollo_optimizer::engine::analytics::AnalyticsEngine;
 use apollo_optimizer::engine::causal_graph::CausalGraph;
 use apollo_optimizer::engine::coalition::CoalitionTracker;
-use apollo_optimizer::engine::daemon_helpers::{hop_groups_path, skills_path};
+use apollo_optimizer::engine::daemon_helpers::{hop_groups_path, skills_path, recently_applied_path};
 use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_optimizer::engine::energy::EnergyTracker;
 use apollo_optimizer::engine::energy_pid::EnergyPidTracker;
@@ -84,6 +84,7 @@ pub(super) struct DaemonSubsystems {
     /// Suppresses re-emission of identical decisions for PIDs already in
     /// the target state. Closes 87.5% journal `success: false` rate.
     pub recently_applied: apollo_optimizer::engine::recently_applied::RecentlyApplied,
+    pub recently_applied_restore_status: apollo_optimizer::engine::recently_applied::RestoreStatus,
 }
 
 /// Detect hardware capabilities (core count and RAM) once at startup.
@@ -111,6 +112,11 @@ impl DaemonSubsystems {
 
         let mut skill_registry = SkillRegistry::new();
         skill_registry.load(std::path::Path::new(skills_path()));
+
+        let (recently_applied_cache, restore_status) = 
+            apollo_optimizer::engine::recently_applied::RecentlyApplied::load_from_disk(
+                std::path::Path::new(recently_applied_path())
+            );
 
         DaemonSubsystems {
             analytics: AnalyticsEngine::new(),
@@ -151,7 +157,8 @@ impl DaemonSubsystems {
                     std::path::PathBuf::from("/tmp/apollo_self_diagnosis.jsonl")
                 },
             ),
-            recently_applied: apollo_optimizer::engine::recently_applied::RecentlyApplied::new(),
+            recently_applied: recently_applied_cache,
+            recently_applied_restore_status: restore_status,
         }
     }
 }

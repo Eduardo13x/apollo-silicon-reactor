@@ -704,7 +704,12 @@ fn main() -> anyhow::Result<()> {
                 mut memory_budget,
                 mut self_diagnosis,
                 mut recently_applied,
+                recently_applied_restore_status: _,  // telemetry wiring deferred to Task 8
             } = daemon_init::DaemonSubsystems::new();
+            {
+                let mut m_guard = state.metrics.lock().unwrap();
+                m_guard.metrics.recently_applied_restore_status = Some(recently_applied_restore_status);
+            }
             // Cumulative dedup_drops counters from prior cycle — used to
             // compute per-cycle delta for self_diagnosis recording.
             let mut last_dedup_setmem: u64 = 0;
@@ -4442,6 +4447,7 @@ fn main() -> anyhow::Result<()> {
                             "cache cleanup expired entries"
                         );
                     }
+                    recently_applied.save_to_disk(std::path::Path::new(apollo_optimizer::engine::daemon_helpers::recently_applied_path()));
                 }
 
                 // ── Self-diagnosis (Phase 6 self-healing layer) ────────────────
@@ -4612,6 +4618,24 @@ fn main() -> anyhow::Result<()> {
                         "chromium: shutdown cleanup — thawed all frozen renderers"
                     );
                 }
+            }
+
+            // Phase B1.4 (Sprint 2 2026-05-07) — persist RecentlyApplied for next boot.
+            // Best-effort: errors are logged but do NOT block shutdown.
+            // [Inbox Pattern — 1001 patterns slide 42]
+            {
+                let path = if is_root {
+                    std::path::PathBuf::from("/var/lib/apollo/recently_applied.jsonl")
+                } else {
+                    std::path::PathBuf::from("/tmp/apollo_recently_applied.jsonl")
+                };
+                recently_applied.save_to_disk(&path);
+                tracing::info!(
+                    target: "apollo.recently_applied",
+                    path = %path.display(),
+                    n = recently_applied.len(),
+                    "persist on shutdown"
+                );
             }
 
             // BUG 19 fix: unfreeze all frozen processes on daemon shutdown so
