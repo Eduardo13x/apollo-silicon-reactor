@@ -57,6 +57,14 @@ pub struct LockFreeMetrics {
     pub dedup_drops_throttle: AtomicU64,
     pub dedup_drops_freeze: AtomicU64,
     pub dedup_drops_unfreeze: AtomicU64,
+
+    /// Restore status telemetry (Phase B1 — recently_applied persistence).
+    /// Mutually-exclusive: exactly one of these is incremented per startup.
+    pub restore_status_missing: AtomicU64,
+    pub restore_status_restored_n: AtomicU64,
+    pub restore_status_discarded_corrupt: AtomicU64,
+    pub restore_status_discarded_clock_delta: AtomicU64,
+    pub restore_status_discarded_boot_crossed: AtomicU64,
 }
 
 impl LockFreeMetrics {
@@ -87,6 +95,11 @@ impl LockFreeMetrics {
             dedup_drops_throttle: AtomicU64::new(0),
             dedup_drops_freeze: AtomicU64::new(0),
             dedup_drops_unfreeze: AtomicU64::new(0),
+            restore_status_missing: AtomicU64::new(0),
+            restore_status_restored_n: AtomicU64::new(0),
+            restore_status_discarded_corrupt: AtomicU64::new(0),
+            restore_status_discarded_clock_delta: AtomicU64::new(0),
+            restore_status_discarded_boot_crossed: AtomicU64::new(0),
         }
     }
 
@@ -232,6 +245,11 @@ impl LockFreeMetrics {
             dedup_drops_throttle: self.dedup_drops_throttle.load(Ordering::Relaxed),
             dedup_drops_freeze: self.dedup_drops_freeze.load(Ordering::Relaxed),
             dedup_drops_unfreeze: self.dedup_drops_unfreeze.load(Ordering::Relaxed),
+            restore_status_missing: self.restore_status_missing.load(Ordering::Relaxed),
+            restore_status_restored_n: self.restore_status_restored_n.load(Ordering::Relaxed),
+            restore_status_discarded_corrupt: self.restore_status_discarded_corrupt.load(Ordering::Relaxed),
+            restore_status_discarded_clock_delta: self.restore_status_discarded_clock_delta.load(Ordering::Relaxed),
+            restore_status_discarded_boot_crossed: self.restore_status_discarded_boot_crossed.load(Ordering::Relaxed),
         }
     }
 }
@@ -267,6 +285,11 @@ pub struct MetricsSnapshot {
     pub dedup_drops_throttle: u64,
     pub dedup_drops_freeze: u64,
     pub dedup_drops_unfreeze: u64,
+    pub restore_status_missing: u64,
+    pub restore_status_restored_n: u64,
+    pub restore_status_discarded_corrupt: u64,
+    pub restore_status_discarded_clock_delta: u64,
+    pub restore_status_discarded_boot_crossed: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
