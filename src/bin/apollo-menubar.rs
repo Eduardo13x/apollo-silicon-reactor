@@ -183,8 +183,12 @@ fn build_menu(status: &Option<DaemonStatus>, updated_secs_ago: u64) -> tray_icon
         "🔴  Emergencia termica — throttling activo"
     } else if m.memory_pressure > 0.85 {
         "🔴  Presion de memoria critica"
-    } else if m.survival_mode_activations > 0 {
-        "🟠  Modo supervivencia activado"
+    } else if apollo_optimizer::engine::safety::survival_mode_active_total(
+        m.memory_pressure,
+        m.swap_used_bytes,
+        m.swap_total_bytes,
+    ) {
+        "🟠  Modo supervivencia activo"
     } else if m.memory_pressure > 0.60 {
         "🟡  Presion moderada — monitoreando"
     } else if s.last_blockers.len() > 5 {

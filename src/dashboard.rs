@@ -1078,11 +1078,15 @@ fn render_verdict(status: &DaemonStatus) -> Vec<String> {
             "Presión de memoria crítica",
             "Swap elevado — liberando recursos.",
         )
-    } else if m.survival_mode_activations > 0 {
+    } else if crate::engine::safety::survival_mode_active_total(
+        m.memory_pressure,
+        m.swap_used_bytes,
+        m.swap_total_bytes,
+    ) {
         (
             "🟠",
-            "Modo supervivencia activado",
-            "Recursos extremos — kills preventivos aplicados.",
+            "Modo supervivencia activo",
+            "Pressure + swap por encima de umbrales — gates de freeze priorizados.",
         )
     } else if m.memory_pressure > 0.60 {
         (
