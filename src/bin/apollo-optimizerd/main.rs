@@ -3846,12 +3846,19 @@ fn main() -> anyhow::Result<()> {
                     // path matches what execute_actions safety layer will do.
                     let hard_protected = apollo_optimizer::engine::safety::protected_processes();
                     let infra_protected = apollo_optimizer::engine::safety::infrastructure_processes();
-                    let policy_protected: Vec<String> = state
-                        .policy
-                        .lock_recover()
-                        .learned_policy
-                        .protected_patterns
-                        .clone();
+                    // Match execute_actions safety layer EXACTLY: policy_all is the
+                    // UNION of learned_protected + learned_interactive (both are treated
+                    // as Unconditional at execute time when no foreground context is
+                    // available). See execute_actions.rs `let policy_all = ...`.
+                    let policy_protected: Vec<String> = {
+                        let pg = state.policy.lock_recover();
+                        pg.learned_policy
+                            .protected_patterns
+                            .iter()
+                            .chain(pg.learned_policy.interactive_patterns.iter())
+                            .cloned()
+                            .collect()
+                    };
                     for action in raw {
                         if let Some((pid, kind)) =
                             apollo_optimizer::engine::recently_applied::CachedActionKind::from_root_action(&action)
