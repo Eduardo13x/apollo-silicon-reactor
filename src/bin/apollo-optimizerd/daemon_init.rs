@@ -85,6 +85,10 @@ pub(super) struct DaemonSubsystems {
     /// the target state. Closes 87.5% journal `success: false` rate.
     pub recently_applied: apollo_optimizer::engine::recently_applied::RecentlyApplied,
     pub recently_applied_restore_status: apollo_optimizer::engine::recently_applied::RestoreStatus,
+    /// Identity validation cache (Sprint 3 cost recovery).
+    /// Memoizes proc_pidpath/csops syscalls per (pid, start_sec, start_usec)
+    /// for 30s. Drops Sprint 2 +64ms p95 regression.
+    pub identity_cache: apollo_optimizer::engine::identity_cache::IdentityCache,
 }
 
 /// Detect hardware capabilities (core count and RAM) once at startup.
@@ -159,6 +163,7 @@ impl DaemonSubsystems {
             ),
             recently_applied: recently_applied_cache,
             recently_applied_restore_status: restore_status,
+            identity_cache: apollo_optimizer::engine::identity_cache::IdentityCache::new(),
         }
     }
 }

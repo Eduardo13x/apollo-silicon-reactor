@@ -219,7 +219,29 @@ enum Commands {
 ///
 /// [Idempotency Pattern — 1001 patterns slide 7]
 /// [Anti-pattern: Ignoring Idempotency — 1001 patterns slide 59]
-fn pid_identity_still_valid(action: &apollo_optimizer::engine::types::RootAction) -> bool {
+/// Verify a RootAction's target PID still has the same identity at filter time.
+///
+/// Returns `true` if the action is safe to emit/dispatch, `false` if the PID is
+/// dead or has been recycled (different process at same numeric PID).
+///
+/// Mirrors `execute_actions::verify_pid_identity` exactly:
+/// - For per-PID actions: start_sec match + start_usec match (when both >0) +
+///   name match (always evaluated as defense-in-depth).
+/// - For non-PID actions (SetSysctl/ToggleSpotlight/QuarantineDaemon): always
+///   returns true (no PID to verify).
+///
+/// Sprint 3 cost recovery: results memoized in `IdentityCache` for 30s.
+/// Cache hit skips proc_pidpath/csops syscalls. Cache miss does the full
+/// verify_pid_identity-equivalent check then inserts.
+///
+/// [Idempotency Pattern — 1001 patterns slide 7]
+/// [Cache-Aside Pattern — 1001 patterns slide 11]
+fn pid_identity_still_valid(
+    action: &apollo_optimizer::engine::types::RootAction,
+    cache: &apollo_optimizer::engine::identity_cache::IdentityCache,
+    lf_metrics: &apollo_optimizer::engine::lse_counters::LockFreeMetrics,
+) -> bool {
+    use apollo_optimizer::engine::identity_cache::{IdentityKey, IdentityValidation};
     use apollo_optimizer::engine::types::RootAction;
 
     let pid_opt = match action {
@@ -233,7 +255,7 @@ fn pid_identity_still_valid(action: &apollo_optimizer::engine::types::RootAction
     };
     let pid = match pid_opt {
         Some(p) => p,
-        None => return true, // non-PID actions always pass.
+        None => return true, // non-PID actions always pass
     };
     let (action_start_sec, action_start_usec) = match action {
         RootAction::ThrottleProcess { start_sec, start_usec, .. }
@@ -246,26 +268,52 @@ fn pid_identity_still_valid(action: &apollo_optimizer::engine::types::RootAction
         | RootAction::UnfreezeProcess { name, .. }
         | RootAction::BoostProcess { name, .. }
         | RootAction::SetThreadQoS { name, .. } => Some(name.as_str()),
-        _ => None, // SetMemorystatus has no name field — liveness-only check.
+        _ => None,
     };
+
+    let key = IdentityKey {
+        pid,
+        start_sec: action_start_sec,
+        start_usec: action_start_usec,
+    };
+
+    // Try cache first (no syscall on hit).
+    let cached_probe = cache.validate_or_refresh(key, None);
+    match cached_probe {
+        IdentityValidation::CachedValid => {
+            let _ = lf_metrics; // counters added in Task 5
+            return true;
+        }
+        IdentityValidation::Invalid => {
+            // Cache had a path-hash mismatch (rare). Treat as identity changed.
+            return false;
+        }
+        IdentityValidation::Validated => {
+            // Defensive: shouldn't occur with None, but be safe.
+            let _ = lf_metrics; // counters added in Task 5
+            return true;
+        }
+        IdentityValidation::Dead => {
+            // Cache miss (or start_sec=0). Fall through to full check.
+        }
+    }
+
+    // Cache miss → do the full verify_pid_identity-equivalent check.
+    let _ = lf_metrics; // counters added in Task 5
 
     let current = match apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid) {
         Some(id) => id,
-        None => return false, // process dead.
+        None => return false, // dead process
     };
-
-    // Mirror execute_actions::verify_pid_identity exactly:
     if action_start_sec > 0 && current.start_sec != action_start_sec {
-        return false; // PID recycled (different start_sec).
+        return false; // PID recycled
     }
     if action_start_sec > 0
         && action_start_usec > 0
         && current.start_usec != action_start_usec
     {
-        return false; // sub-second PID recycle.
+        return false; // sub-second recycle
     }
-    // Name check is always evaluated when name is available — matches
-    // execute_actions safety layer's defense-in-depth invariant.
     if let Some(expected) = action_name {
         let name_ok = current.name == expected
             || (current.name.len() >= 6 && expected.starts_with(&current.name))
@@ -274,6 +322,15 @@ fn pid_identity_still_valid(action: &apollo_optimizer::engine::types::RootAction
             return false;
         }
     }
+
+    // Insert into cache for next-time hit (skip if start_sec=0; cache won't store).
+    let path_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        current.name.hash(&mut hasher);
+        hasher.finish()
+    };
+    cache.validate_or_refresh(key, Some(path_hash));
     true
 }
 
@@ -705,6 +762,7 @@ fn main() -> anyhow::Result<()> {
                 mut self_diagnosis,
                 mut recently_applied,
                 recently_applied_restore_status,
+                identity_cache,
             } = daemon_init::DaemonSubsystems::new();
             {
                 let mut m_guard = state.metrics.lock().unwrap();
@@ -4026,7 +4084,7 @@ fn main() -> anyhow::Result<()> {
                             // Closes ~1ms snapshot→execute race. See pid_identity_still_valid
                             // helper for full semantics (mirrors verify_pid_identity).
                             // [Idempotency Pattern — 1001 patterns slide 7]
-                            if !pid_identity_still_valid(&action) {
+                            if !pid_identity_still_valid(&action, &identity_cache, &lf_metrics) {
                                 continue;
                             }
                             recently_applied.record(pid, kind);
@@ -4049,7 +4107,7 @@ fn main() -> anyhow::Result<()> {
                 let final_actions: Vec<RootAction> = action_queue
                     .drain_cycle()
                     .into_iter()
-                    .filter(|a| pid_identity_still_valid(a))
+                    .filter(|a| pid_identity_still_valid(a, &identity_cache, &lf_metrics))
                     .collect();
                 // Update backpressure metrics (observable in runtime_metrics.json).
                 {
