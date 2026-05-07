@@ -3864,6 +3864,36 @@ fn main() -> anyhow::Result<()> {
                             {
                                 continue;
                             }
+                            // ProtectedProcess pre-filter (post-debrief 2026-05-06):
+                            // 365/432 of remaining `success: false` were ProtectedProcess
+                            // blocks at safety layer. Pre-check here to avoid emitting at
+                            // all. NotebookLM Critical recommendation — Complete Mediation
+                            // [Saltzer & Kaashoek 2009 §3.3]: every privileged-action path
+                            // must pass through the same access-control point.
+                            //
+                            // is_protected_name takes &str and returns true for the ~80
+                            // hardcoded protected names (kernel_task, launchd, mds, etc.).
+                            // Skip Boost (Apollo's own boost on protected procs is OK).
+                            let blocks_for_protected = !matches!(
+                                kind,
+                                apollo_optimizer::engine::recently_applied::CachedActionKind::Boost
+                                    | apollo_optimizer::engine::recently_applied::CachedActionKind::Unfreeze
+                            );
+                            if blocks_for_protected {
+                                let action_name = match &action {
+                                    apollo_optimizer::engine::types::RootAction::ThrottleProcess { name, .. }
+                                    | apollo_optimizer::engine::types::RootAction::FreezeProcess { name, .. }
+                                    | apollo_optimizer::engine::types::RootAction::SetThreadQoS { name, .. }
+                                    | apollo_optimizer::engine::types::RootAction::BoostProcess { name, .. }
+                                    | apollo_optimizer::engine::types::RootAction::UnfreezeProcess { name, .. } => Some(name.as_str()),
+                                    _ => None,
+                                };
+                                if let Some(name) = action_name {
+                                    if apollo_optimizer::engine::safety::is_protected_name(name) {
+                                        continue;
+                                    }
+                                }
+                            }
                             recently_applied.record(pid, kind);
                         }
                         filtered.push(action);
