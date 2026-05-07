@@ -704,7 +704,7 @@ fn main() -> anyhow::Result<()> {
                 mut memory_budget,
                 mut self_diagnosis,
                 mut recently_applied,
-                recently_applied_restore_status: _,  // telemetry wiring deferred to Task 8
+                recently_applied_restore_status,
             } = daemon_init::DaemonSubsystems::new();
             {
                 let mut m_guard = state.metrics.lock().unwrap();
@@ -1294,6 +1294,36 @@ fn main() -> anyhow::Result<()> {
                 if let Err(e) = vm_surgeon::pin_memory(ptr, len) {
                     tracing::warn!(err = %e, "mlock on LockFreeMetrics failed, continuing unpinned");
                 }
+            }
+            // Phase B1.5 — wire RecentlyApplied restore_status to lf_metrics telemetry.
+            // Exactly one of the 5 counters is set to a non-zero value per startup,
+            // letting NotebookLM debrief distinguish "persistence helps" vs "always
+            // starts empty". [Inbox Pattern — 1001 patterns slide 42]
+            {
+                use apollo_optimizer::engine::recently_applied::RestoreStatus;
+                use std::sync::atomic::Ordering;
+                match recently_applied_restore_status {
+                    RestoreStatus::Missing => {
+                        lf_metrics.restore_status_missing.store(1, Ordering::Relaxed);
+                    }
+                    RestoreStatus::RestoredN(n) => {
+                        lf_metrics.restore_status_restored_n.store(n as u64, Ordering::Relaxed);
+                    }
+                    RestoreStatus::DiscardedCorrupt => {
+                        lf_metrics.restore_status_discarded_corrupt.store(1, Ordering::Relaxed);
+                    }
+                    RestoreStatus::DiscardedClockDelta => {
+                        lf_metrics.restore_status_discarded_clock_delta.store(1, Ordering::Relaxed);
+                    }
+                    RestoreStatus::DiscardedBootCrossed => {
+                        lf_metrics.restore_status_discarded_boot_crossed.store(1, Ordering::Relaxed);
+                    }
+                }
+                tracing::info!(
+                    target: "apollo.recently_applied",
+                    status = ?recently_applied_restore_status,
+                    "restore status telemetry wired"
+                );
             }
             // kqueue reactor for frozen-PID death detection (push, not poll).
             // When a frozen process dies (OOM, jetsam), the kernel pushes
@@ -4624,11 +4654,7 @@ fn main() -> anyhow::Result<()> {
             // Best-effort: errors are logged but do NOT block shutdown.
             // [Inbox Pattern — 1001 patterns slide 42]
             {
-                let path = if is_root {
-                    std::path::PathBuf::from("/var/lib/apollo/recently_applied.jsonl")
-                } else {
-                    std::path::PathBuf::from("/tmp/apollo_recently_applied.jsonl")
-                };
+                let path = std::path::PathBuf::from(apollo_optimizer::engine::daemon_helpers::recently_applied_path());
                 recently_applied.save_to_disk(&path);
                 tracing::info!(
                     target: "apollo.recently_applied",
