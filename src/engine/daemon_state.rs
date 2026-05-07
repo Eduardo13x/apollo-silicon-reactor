@@ -65,6 +65,12 @@ impl MetricsState {
         // Latency durations (convert us -> ms)
         self.metrics.p95_cycle_ms = lf.cycle_time_us as f64 / 1000.0;
         self.metrics.refresh_duration_ms = lf.refresh_duration_us as f64 / 1000.0;
+        // Sprint 3 Phase B — flush restore_status_* counters from lf to runtime metrics.
+        self.metrics.restore_status_missing = lf.restore_status_missing;
+        self.metrics.restore_status_restored_n = lf.restore_status_restored_n;
+        self.metrics.restore_status_discarded_corrupt = lf.restore_status_discarded_corrupt;
+        self.metrics.restore_status_discarded_clock_delta = lf.restore_status_discarded_clock_delta;
+        self.metrics.restore_status_discarded_boot_crossed = lf.restore_status_discarded_boot_crossed;
         self.metrics.memory_budget_duration_ms = lf.memory_budget_duration_us as f64 / 1000.0;
         self.metrics.reactor_duration_ms = lf.reactor_duration_us as f64 / 1000.0;
         

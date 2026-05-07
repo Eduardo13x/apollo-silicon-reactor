@@ -800,6 +800,21 @@ pub struct RuntimeMetrics {
     pub si_monopoly_risk: f64,
     #[serde(default)]
     pub si_entropy_anomaly: f64,
+    #[serde(default)]
+    pub recently_applied_restore_status: Option<crate::engine::recently_applied::RestoreStatus>,
+    /// Restore status telemetry (Sprint 3 Phase B — flushed from lf_metrics).
+    /// Mutually-exclusive: at most one is non-zero per startup.
+    /// Replaces/parallels the legacy `recently_applied_restore_status` Option.
+    #[serde(default)]
+    pub restore_status_missing: u64,
+    #[serde(default)]
+    pub restore_status_restored_n: u64,
+    #[serde(default)]
+    pub restore_status_discarded_corrupt: u64,
+    #[serde(default)]
+    pub restore_status_discarded_clock_delta: u64,
+    #[serde(default)]
+    pub restore_status_discarded_boot_crossed: u64,
     /// Lotka-Volterra Jacobian stability class: 0=Degenerate 1=StableNode 2=StableSpiral 3=UnstableSaddle 4=Unstable
     #[serde(default)]
     pub si_stability_regime: u8,
