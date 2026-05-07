@@ -65,6 +65,16 @@ pub struct LockFreeMetrics {
     pub restore_status_discarded_corrupt: AtomicU64,
     pub restore_status_discarded_clock_delta: AtomicU64,
     pub restore_status_discarded_boot_crossed: AtomicU64,
+
+    /// IdentityCache telemetry (Phase A4 — Sprint 3 cost recovery).
+    /// Lets NotebookLM debrief verify the cache hit ratio and quantify
+    /// proc_pidpath syscall amortization.
+    pub identity_cache_hits: AtomicU64,
+    pub identity_cache_misses: AtomicU64,
+    pub identity_cache_evictions: AtomicU64,
+    pub identity_cache_ttl_expired: AtomicU64,
+    pub identity_cache_exit_invalidations: AtomicU64,
+    pub identity_proc_pidpath_calls: AtomicU64,
 }
 
 impl LockFreeMetrics {
@@ -100,6 +110,12 @@ impl LockFreeMetrics {
             restore_status_discarded_corrupt: AtomicU64::new(0),
             restore_status_discarded_clock_delta: AtomicU64::new(0),
             restore_status_discarded_boot_crossed: AtomicU64::new(0),
+            identity_cache_hits: AtomicU64::new(0),
+            identity_cache_misses: AtomicU64::new(0),
+            identity_cache_evictions: AtomicU64::new(0),
+            identity_cache_ttl_expired: AtomicU64::new(0),
+            identity_cache_exit_invalidations: AtomicU64::new(0),
+            identity_proc_pidpath_calls: AtomicU64::new(0),
         }
     }
 
@@ -250,6 +266,12 @@ impl LockFreeMetrics {
             restore_status_discarded_corrupt: self.restore_status_discarded_corrupt.load(Ordering::Relaxed),
             restore_status_discarded_clock_delta: self.restore_status_discarded_clock_delta.load(Ordering::Relaxed),
             restore_status_discarded_boot_crossed: self.restore_status_discarded_boot_crossed.load(Ordering::Relaxed),
+            identity_cache_hits: self.identity_cache_hits.load(Ordering::Relaxed),
+            identity_cache_misses: self.identity_cache_misses.load(Ordering::Relaxed),
+            identity_cache_evictions: self.identity_cache_evictions.load(Ordering::Relaxed),
+            identity_cache_ttl_expired: self.identity_cache_ttl_expired.load(Ordering::Relaxed),
+            identity_cache_exit_invalidations: self.identity_cache_exit_invalidations.load(Ordering::Relaxed),
+            identity_proc_pidpath_calls: self.identity_proc_pidpath_calls.load(Ordering::Relaxed),
         }
     }
 }
@@ -290,6 +312,12 @@ pub struct MetricsSnapshot {
     pub restore_status_discarded_corrupt: u64,
     pub restore_status_discarded_clock_delta: u64,
     pub restore_status_discarded_boot_crossed: u64,
+    pub identity_cache_hits: u64,
+    pub identity_cache_misses: u64,
+    pub identity_cache_evictions: u64,
+    pub identity_cache_ttl_expired: u64,
+    pub identity_cache_exit_invalidations: u64,
+    pub identity_proc_pidpath_calls: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

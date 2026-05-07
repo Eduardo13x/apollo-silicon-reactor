@@ -281,7 +281,9 @@ fn pid_identity_still_valid(
     let cached_probe = cache.validate_or_refresh(key, None);
     match cached_probe {
         IdentityValidation::CachedValid => {
-            let _ = lf_metrics; // counters added in Task 5
+            lf_metrics
+                .identity_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return true;
         }
         IdentityValidation::Invalid => {
@@ -290,7 +292,9 @@ fn pid_identity_still_valid(
         }
         IdentityValidation::Validated => {
             // Defensive: shouldn't occur with None, but be safe.
-            let _ = lf_metrics; // counters added in Task 5
+            lf_metrics
+                .identity_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return true;
         }
         IdentityValidation::Dead => {
@@ -299,7 +303,12 @@ fn pid_identity_still_valid(
     }
 
     // Cache miss → do the full verify_pid_identity-equivalent check.
-    let _ = lf_metrics; // counters added in Task 5
+    lf_metrics
+        .identity_cache_misses
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    lf_metrics
+        .identity_proc_pidpath_calls
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let current = match apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid) {
         Some(id) => id,
