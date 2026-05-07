@@ -82,10 +82,185 @@ impl IdentityCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Validate process identity, using cache when fresh.
+    /// Caller provides current path hash from `proc_pidpath` if cache misses.
+    ///
+    /// Behavior:
+    /// - start_sec == 0 → forces validation, NEVER caches (legacy actions, no identity proof)
+    /// - Cache hit + path_hash match (or fresh_path_hash None) + within TTL → CachedValid (no syscall)
+    /// - Cache hit + path_hash mismatch → evict + return Invalid
+    /// - Cache miss + Some(path_hash) → insert and return Validated
+    /// - Cache miss + None → return Dead
+    /// - Cache hit + expired → fall through to refresh path
+    pub fn validate_or_refresh(
+        &self,
+        key: IdentityKey,
+        fresh_path_hash: Option<u64>,
+    ) -> IdentityValidation {
+        // start_sec == 0 means caller doesn't have identity proof. Force refresh,
+        // do NOT insert into cache (would lock the wrong entity).
+        if key.start_sec == 0 {
+            return match fresh_path_hash {
+                Some(_) => IdentityValidation::Validated,
+                None => IdentityValidation::Dead,
+            };
+        }
+
+        let now = Instant::now();
+        let mut entries = match self.entries.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        if let Some(entry) = entries.get(&key) {
+            if now < entry.expires_at {
+                // Path-hash mismatch on refresh forces eviction (rare).
+                if let Some(fresh) = fresh_path_hash {
+                    if fresh != entry.path_hash {
+                        entries.remove(&key);
+                        return IdentityValidation::Invalid;
+                    }
+                }
+                return IdentityValidation::CachedValid;
+            } else {
+                // Expired — fall through to refresh.
+                entries.remove(&key);
+            }
+        }
+
+        // Cache miss OR expired. Caller's fresh_path_hash drives result.
+        match fresh_path_hash {
+            Some(hash) => {
+                // Capacity check (cheap O(n) eviction when full).
+                if entries.len() >= self.capacity {
+                    if let Some((oldest_k, _)) = entries
+                        .iter()
+                        .min_by_key(|(_, e)| e.validated_at)
+                        .map(|(k, e)| (*k, *e))
+                    {
+                        entries.remove(&oldest_k);
+                    }
+                }
+                entries.insert(
+                    key,
+                    IdentityCacheEntry {
+                        path_hash: hash,
+                        validated_at: now,
+                        expires_at: now + self.ttl,
+                    },
+                );
+                IdentityValidation::Validated
+            }
+            None => IdentityValidation::Dead,
+        }
+    }
+
+    /// Forget all entries for a PID. Call when caller knows process exited.
+    /// Returns number of entries evicted.
+    pub fn invalidate_pid(&self, pid: u32) -> usize {
+        let mut entries = match self.entries.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let before = entries.len();
+        entries.retain(|k, _| k.pid != pid);
+        before - entries.len()
+    }
+
+    /// Sweep expired entries. O(n). Call periodically (e.g., every 60 cycles).
+    /// Returns number of entries evicted.
+    pub fn cleanup_expired(&self) -> usize {
+        let mut entries = match self.entries.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let now = Instant::now();
+        let before = entries.len();
+        entries.retain(|_, e| now < e.expires_at);
+        before - entries.len()
+    }
 }
 
 impl Default for IdentityCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(pid: u32) -> IdentityKey {
+        IdentityKey { pid, start_sec: 100, start_usec: 200 }
+    }
+
+    #[test]
+    fn empty_cache_returns_validated_on_first_call() {
+        let cache = IdentityCache::new();
+        let r = cache.validate_or_refresh(key(123), Some(0xdead));
+        assert_eq!(r, IdentityValidation::Validated);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn cache_hit_within_ttl_returns_cached_valid() {
+        let cache = IdentityCache::new();
+        // Prime
+        let r1 = cache.validate_or_refresh(key(123), Some(0xdead));
+        assert_eq!(r1, IdentityValidation::Validated);
+        // Hit
+        let r2 = cache.validate_or_refresh(key(123), None);
+        assert_eq!(r2, IdentityValidation::CachedValid);
+    }
+
+    #[test]
+    fn ttl_expiry_forces_refresh() {
+        let cache = IdentityCache::with_ttl(Duration::from_millis(40));
+        cache.validate_or_refresh(key(123), Some(0xdead));
+        std::thread::sleep(Duration::from_millis(70));
+        // Now expired — should refresh on miss
+        let r = cache.validate_or_refresh(key(123), Some(0xdead));
+        assert_eq!(r, IdentityValidation::Validated);
+    }
+
+    #[test]
+    fn invalidate_pid_evicts_all_keys_for_pid() {
+        let cache = IdentityCache::new();
+        cache.validate_or_refresh(
+            IdentityKey { pid: 100, start_sec: 1, start_usec: 0 },
+            Some(0xa),
+        );
+        cache.validate_or_refresh(
+            IdentityKey { pid: 100, start_sec: 2, start_usec: 0 },
+            Some(0xb),
+        );
+        cache.validate_or_refresh(
+            IdentityKey { pid: 200, start_sec: 1, start_usec: 0 },
+            Some(0xc),
+        );
+        let evicted = cache.invalidate_pid(100);
+        assert_eq!(evicted, 2);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn dead_process_returns_dead() {
+        let cache = IdentityCache::new();
+        let r = cache.validate_or_refresh(key(99_999), None);
+        assert_eq!(r, IdentityValidation::Dead);
+        assert_eq!(cache.len(), 0, "dead process must not be cached");
+    }
+
+    #[test]
+    fn path_hash_mismatch_forces_invalid() {
+        let cache = IdentityCache::new();
+        cache.validate_or_refresh(key(123), Some(0xdead));
+        // Same key but different path hash → identity changed (e.g., exec replaced binary)
+        let r = cache.validate_or_refresh(key(123), Some(0xbeef));
+        assert_eq!(r, IdentityValidation::Invalid);
+        // Must have been evicted.
+        assert_eq!(cache.len(), 0);
     }
 }
