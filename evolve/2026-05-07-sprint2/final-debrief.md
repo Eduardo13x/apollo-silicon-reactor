@@ -96,4 +96,37 @@ Sprint 2 achieved its **primary goal** (PidRecycled elimination) and **all audit
 
 Apollo is now **identity-honest**: actions for dead/recycled PIDs are dropped at filter time, not logged as block_reason at safety layer. The trade-off is per-action syscall cost which next session must amortize via cache.
 
-**Sprint 2 closed. 21 + 15 = 36 commits total over original `7f2aae7`.**
+> Sprint 2 successfully eliminated recycled-PID unsafe action paths and
+> established identity honesty as a first-class invariant. The remaining
+> architectural debt is not correctness but cost: identity validation
+> must be amortized to bring p95 back under the hot-path budget.
+
+> Sprint 2 cerró la deuda de identidad: Apollo ya no actúa sobre procesos
+> ambiguos. La nueva deuda no es de seguridad, sino de performance:
+> validar identidad en el hot-path debe pasar de syscall repetitivo a
+> verificación cacheada y amortizada.
+
+**Sprint 2 closed. 46 commits total over original `7f2aae7` (21 self-healing + 15 SuperPlan + helper-extraction polish).**
+
+## Sprint 3 sketch (per closing peer-review)
+
+The next sprint's architectural focus is *cost recovery*, not new correctness:
+
+1. **Identity-check cache** — extend `RecentlyApplied` (or new sibling) to
+   memoize `(pid, start_sec, start_usec, name_hash)` for the TTL window.
+   First check hits `proc_pidpath` once; subsequent hits within TTL skip
+   the syscall entirely. Invalidation rules: TTL expiry, kqueue NOTE_EXIT,
+   any anomaly signal that suggests state has shifted.
+
+2. **`sync_from_lockfree` 5-field flush** — extend `daemon_state.rs::sync_from_lockfree`
+   so `restore_status_*` counters land in `runtime_metrics.json`. Without
+   this, NotebookLM gap-sweep cannot distinguish "persistence helps" from
+   "always starts empty".
+
+3. **Governor ↔ Safety contract** — reconcile sysctl proposal ranges so
+   `SysctlOutOfRange` events drop to ≤2% of fails. Either narrow Governor
+   output clamping OR widen safety allowed ranges with full kernel
+   validation. Two-way alignment, not one-side compromise.
+
+> *First correctness, then performance recovery.* Sprint 3 owns the
+> performance recovery half of that equation.
