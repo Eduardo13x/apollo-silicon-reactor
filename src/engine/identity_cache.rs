@@ -11,7 +11,9 @@
 //! - `RecentlyApplied`: "did I act recently?" (action dedup)
 //! - `IdentityCache`: "is this still the same entity?" (identity validation)
 //!
-//! TTL is 30s (matches RecentlyApplied). Invalidation is conservative:
+//! TTL is 180s (calibrated 2026-05-07 from prod gaps: predictive-agent
+//! retries same PID at 57-184s cadence; 30s TTL never caught repeats).
+//! Invalidation is conservative:
 //! - TTL expiry (per-entry, lazy on lookup)
 //! - Periodic `cleanup_expired()` from daemon main loop
 //! - `invalidate_pid()` callable on process exit observation
@@ -62,9 +64,9 @@ pub struct IdentityCache {
 }
 
 impl IdentityCache {
-    /// Default 30s TTL, 5000-entry capacity.
+    /// Default 180s TTL, 5000-entry capacity.
     pub fn new() -> Self {
-        Self::with_ttl(Duration::from_secs(30))
+        Self::with_ttl(Duration::from_secs(180))
     }
 
     pub fn with_ttl(ttl: Duration) -> Self {
@@ -154,6 +156,28 @@ impl IdentityCache {
             }
             None => IdentityValidation::Dead,
         }
+    }
+
+    /// PID-only lookup for callers without start_sec/start_usec proof
+    /// (SetMemorystatus, Boost, Unfreeze, SetThreadQoS — actions that don't
+    /// carry identity tuples). Returns Some(CachedValid) if any non-expired
+    /// entry exists for this PID, else None. Caller MUST verify identity via
+    /// syscall on None and insert with full key (Sprint 3 calibration fix).
+    pub fn lookup_by_pid(&self, pid: u32) -> Option<IdentityValidation> {
+        if pid == 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let entries = match self.entries.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        for (k, e) in entries.iter() {
+            if k.pid == pid && now < e.expires_at {
+                return Some(IdentityValidation::CachedValid);
+            }
+        }
+        None
     }
 
     /// Forget all entries for a PID. Call when caller knows process exited.
@@ -303,5 +327,35 @@ mod tests {
         let evicted = cache.invalidate_pid(0);
         assert_eq!(evicted, 0);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn lookup_by_pid_finds_any_fresh_entry_for_pid() {
+        let cache = IdentityCache::new();
+        cache.validate_or_refresh(
+            IdentityKey { pid: 4242, start_sec: 1000, start_usec: 500 },
+            Some(0xabcd),
+        );
+        assert_eq!(
+            cache.lookup_by_pid(4242),
+            Some(IdentityValidation::CachedValid)
+        );
+        assert_eq!(cache.lookup_by_pid(9999), None);
+        assert_eq!(cache.lookup_by_pid(0), None);
+    }
+
+    #[test]
+    fn lookup_by_pid_returns_none_after_ttl_expiry() {
+        let cache = IdentityCache::with_ttl(Duration::from_millis(40));
+        cache.validate_or_refresh(
+            IdentityKey { pid: 5050, start_sec: 1000, start_usec: 500 },
+            Some(0xbeef),
+        );
+        assert_eq!(
+            cache.lookup_by_pid(5050),
+            Some(IdentityValidation::CachedValid)
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(cache.lookup_by_pid(5050), None);
     }
 }

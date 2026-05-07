@@ -277,6 +277,18 @@ fn pid_identity_still_valid(
         start_usec: action_start_usec,
     };
 
+    // PID-only fast path for actions without start_sec proof
+    // (SetMemorystatus, Boost, Unfreeze, SetThreadQoS). Hits avoid the
+    // syscall when an earlier verified entry for the same PID is fresh.
+    if action_start_sec == 0 {
+        if let Some(IdentityValidation::CachedValid) = cache.lookup_by_pid(pid) {
+            lf_metrics
+                .identity_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+    }
+
     // Try cache first (no syscall on hit).
     let cached_probe = cache.validate_or_refresh(key, None);
     match cached_probe {
@@ -332,14 +344,27 @@ fn pid_identity_still_valid(
         }
     }
 
-    // Insert into cache for next-time hit (skip if start_sec=0; cache won't store).
+    // Insert into cache for next-time hit. If action carried start_sec/usec=0
+    // (SetMemorystatus, Boost, Unfreeze, SetThreadQoS — most action variants),
+    // use the start_sec/usec just obtained from the syscall to build a cacheable
+    // key. Without this, those variants never cache and re-issue the syscall
+    // on every call (Sprint 3 calibration bug, fixed 2026-05-07).
     let path_hash = {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         current.name.hash(&mut hasher);
         hasher.finish()
     };
-    cache.validate_or_refresh(key, Some(path_hash));
+    let cacheable_key = if action_start_sec == 0 {
+        IdentityKey {
+            pid,
+            start_sec: current.start_sec,
+            start_usec: current.start_usec,
+        }
+    } else {
+        key
+    };
+    cache.validate_or_refresh(cacheable_key, Some(path_hash));
     true
 }
 

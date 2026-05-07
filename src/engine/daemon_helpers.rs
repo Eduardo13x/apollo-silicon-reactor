@@ -215,6 +215,14 @@ pub fn telemetry_output_dir() -> &'static str {
     }
 }
 
+pub fn recently_applied_path() -> &'static str {
+    if is_root() {
+        "/var/lib/apollo/recently_applied.jsonl"
+    } else {
+        "/tmp/apollo-recently_applied.jsonl"
+    }
+}
+
 /// Seconds since the macOS kernel booted.
 ///
 /// Reads `kern.boottime` via `sysctlbyname` and subtracts from wall clock.
