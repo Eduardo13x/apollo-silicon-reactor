@@ -38,8 +38,45 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use crate::engine::adaptive_governor::GovernorDecision;
 use crate::engine::types::RootAction;
+
+/// Persistable record (single entry in `/var/lib/apollo/recently_applied.jsonl`).
+///
+/// Wall-clock timestamp is recorded so post-restart staleness check can
+/// drop entries older than TTL. We do NOT persist `Instant` directly because
+/// `Instant` is monotonic-clock based and meaningless across reboots.
+///
+/// **Fail-empty restore policy** (Sprint 2 spec §B1):
+/// - File missing → start empty (normal first boot)
+/// - Parse error / malformed JSON → start empty + DELETE corrupt file
+/// - Wall-clock delta write→read > 15s → discard all entries
+/// - Per-entry wall-clock > 30s old → drop that entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistRecord {
+    pub pid: u32,
+    pub kind: CachedActionKind,
+    /// Unix wall-clock seconds at write time.
+    pub wall_unix_sec: u64,
+}
+
+/// Restore-status telemetry. Five mutually-exclusive states reported in
+/// `runtime_metrics.json` for NotebookLM debrief observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreStatus {
+    /// File did not exist on startup (first boot or never persisted).
+    Missing,
+    /// Successful restore of N entries.
+    RestoredN(u32),
+    /// File existed but parse error / malformed JSON.
+    DiscardedCorrupt,
+    /// Wall-clock delta between write and read exceeded 15s.
+    DiscardedClockDelta,
+    /// Boot-time crossed (uptime is less than file age).
+    DiscardedBootCrossed,
+}
 
 /// Action kind for cache keying — broader than GovernorDecision because
 /// it covers paths that emit RootAction directly (paging_hints, deep-scan,
@@ -49,7 +86,7 @@ use crate::engine::types::RootAction;
 /// - SetMemorystatus has no GovernorDecision equivalent (it's an OS-level hint)
 /// - Boost is a RootAction but not a heuristic decision
 /// - Maps Kill→Freeze (Apollo always downgrades Kill, never executes it)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CachedActionKind {
     Throttle,
     Freeze,
