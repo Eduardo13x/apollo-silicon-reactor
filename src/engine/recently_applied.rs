@@ -36,7 +36,9 @@
 //! remember its own actions to avoid redundant emission.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::fs;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -219,6 +221,157 @@ impl RecentlyApplied {
             self.map.remove(&oldest_key);
         }
     }
+
+    /// Snapshot current cache as persistable records. Caller serializes
+    /// to disk on graceful shutdown.
+    pub fn to_persist_records(&self) -> Vec<PersistRecord> {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let now_instant = Instant::now();
+        self.map
+            .iter()
+            .map(|((pid, kind), instant)| {
+                // Map Instant elapsed → wall-clock seconds ago.
+                let age_secs = now_instant.duration_since(*instant).as_secs();
+                PersistRecord {
+                    pid: *pid,
+                    kind: *kind,
+                    wall_unix_sec: now_unix.saturating_sub(age_secs),
+                }
+            })
+            .collect()
+    }
+
+    /// Restore cache from records loaded from disk. Applies fail-empty
+    /// policy: stale entries (>TTL old) are dropped per-entry.
+    /// Returns the number of records actually restored.
+    ///
+    /// Caller is responsible for the GLOBAL fail-empty checks (parse error,
+    /// clock delta, boot crossing) — this method only does per-entry checks.
+    pub fn restore_from_records(&mut self, records: Vec<PersistRecord>) -> u32 {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ttl_secs = self.ttl.as_secs();
+        let now_instant = Instant::now();
+        let mut restored = 0u32;
+        for r in records {
+            // Per-entry staleness check.
+            let age = now_unix.saturating_sub(r.wall_unix_sec);
+            if age > ttl_secs {
+                continue; // drop only this entry
+            }
+            // Compute monotonic Instant for this entry's timestamp.
+            let entry_instant = now_instant
+                .checked_sub(std::time::Duration::from_secs(age))
+                .unwrap_or(now_instant);
+            self.map.insert((r.pid, r.kind), entry_instant);
+            restored += 1;
+        }
+        restored
+    }
+
+    /// Save cache to disk.
+    pub fn save(&mut self, path: &Path) {
+        self.cleanup_expired();
+        if self.is_empty() {
+            let _ = fs::remove_file(path); // Clean up if empty
+            return;
+        }
+
+        let now_sys = SystemTime::now();
+        let now_instant = Instant::now();
+
+        let mut entries = Vec::with_capacity(self.map.len());
+        for (&(pid, kind), &t) in &self.map {
+            // Calculate how old the entry is to get its absolute epoch time
+            let age = now_instant.saturating_duration_since(t);
+            let epoch_ms = now_sys.checked_sub(age)
+                .unwrap_or(UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis() as u64;
+
+            entries.push(PersistedEntry {
+                pid,
+                kind,
+                timestamp_ms: epoch_ms,
+            });
+        }
+
+        let persisted = RecentlyAppliedPersisted {
+            entries,
+            ttl_secs: self.ttl.as_secs(),
+        };
+
+        if let Ok(json) = serde_json::to_string(&persisted) {
+            let _ = fs::write(path, json);
+        }
+    }
+
+    /// Load cache from disk with extreme Fail-Empty policy.
+    pub fn load(path: &Path) -> Self {
+        let mut cache = Self::new();
+        
+        let json = match fs::read_to_string(path) {
+            Ok(j) => j,
+            Err(_) => return cache, // Does not exist or cannot read
+        };
+
+        let persisted: RecentlyAppliedPersisted = match serde_json::from_str(&json) {
+            Ok(p) => p,
+            Err(_) => return cache, // Corrupt JSON
+        };
+
+        cache.ttl = Duration::from_secs(persisted.ttl_secs);
+        
+        let now_sys = SystemTime::now();
+        let now_ms = now_sys.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_millis() as u64;
+
+        // Verify timestamps: if ANY timestamp is drifting or older than TTL, 
+        // abort and fail-empty.
+        for entry in &persisted.entries {
+            // Drift into the future? Fail empty.
+            if entry.timestamp_ms > now_ms + 2000 {
+                tracing::warn!("RecentlyApplied cache contains future timestamps (clock drift). Dropping cache.");
+                return Self::new();
+            }
+            
+            // Older than TTL? Fail empty entirely to avoid stale assumptions.
+            let age_ms = now_ms.saturating_sub(entry.timestamp_ms);
+            if age_ms > cache.ttl.as_millis() as u64 {
+                tracing::warn!("RecentlyApplied cache contains stale entries (reboot took too long). Dropping cache.");
+                return Self::new();
+            }
+        }
+
+        // All entries valid, reconstruct HashMap
+        let now_instant = Instant::now();
+        for entry in persisted.entries {
+            let age_ms = now_ms.saturating_sub(entry.timestamp_ms);
+            let t = now_instant.checked_sub(Duration::from_millis(age_ms)).unwrap_or(now_instant);
+            cache.map.insert((entry.pid, entry.kind), t);
+        }
+
+        tracing::info!(loaded_entries = cache.len(), "RecentlyApplied cache restored from disk");
+        cache
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedEntry {
+    pid: u32,
+    kind: CachedActionKind,
+    timestamp_ms: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecentlyAppliedPersisted {
+    entries: Vec<PersistedEntry>,
+    ttl_secs: u64,
 }
 
 impl Default for RecentlyApplied {
@@ -393,5 +546,109 @@ mod tests {
         // Allow is no-op.
         cache.record_governor(456, GovernorDecision::Allow);
         assert!(!cache.is_recent_governor(456, GovernorDecision::Allow));
+    }
+
+    #[test]
+    fn load_missing_returns_empty() {
+        let path = Path::new("/tmp/apollo_test_missing_cache.json");
+        let _ = fs::remove_file(path);
+        let cache = RecentlyApplied::load(path);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let path = Path::new("/tmp/apollo_test_cache.json");
+        let _ = fs::remove_file(path);
+
+        let mut cache = RecentlyApplied::new();
+        cache.record(123, CachedActionKind::Throttle);
+        cache.record(456, CachedActionKind::Freeze);
+        
+        cache.save(path);
+        assert!(path.exists());
+
+        let loaded = RecentlyApplied::load(path);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.is_recent(123, CachedActionKind::Throttle));
+        assert!(loaded.is_recent(456, CachedActionKind::Freeze));
+        
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_stale_data_fails_empty() {
+        let path = Path::new("/tmp/apollo_test_stale_cache.json");
+        let _ = fs::remove_file(path);
+
+        // Manually write stale data (2 minutes old)
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let stale_ms = now_ms - 120_000;
+        
+        let persisted = RecentlyAppliedPersisted {
+            entries: vec![PersistedEntry {
+                pid: 123,
+                kind: CachedActionKind::Throttle,
+                timestamp_ms: stale_ms,
+            }],
+            ttl_secs: 30,
+        };
+        fs::write(path, serde_json::to_string(&persisted).unwrap()).unwrap();
+
+        let loaded = RecentlyApplied::load(path);
+        assert!(loaded.is_empty(), "Stale data must result in empty cache");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn to_persist_records_yields_all_entries() {
+        let mut cache = RecentlyApplied::new();
+        cache.record(100, CachedActionKind::Throttle);
+        cache.record(200, CachedActionKind::Freeze);
+        let records = cache.to_persist_records();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn restore_from_records_skips_stale_entries() {
+        let mut cache = RecentlyApplied::with_ttl(Duration::from_secs(30));
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let records = vec![
+            PersistRecord { pid: 1, kind: CachedActionKind::Throttle, wall_unix_sec: now_unix - 10 }, // fresh
+            PersistRecord { pid: 2, kind: CachedActionKind::Throttle, wall_unix_sec: now_unix - 60 }, // stale
+        ];
+        let restored = cache.restore_from_records(records);
+        assert_eq!(restored, 1, "only fresh entry should restore");
+        assert!(cache.is_recent(1, CachedActionKind::Throttle));
+        assert!(!cache.is_recent(2, CachedActionKind::Throttle));
+    }
+
+    #[test]
+    fn restore_then_persist_roundtrip() {
+        let mut cache = RecentlyApplied::new();
+        cache.record(42, CachedActionKind::SetMemorystatus);
+        let records = cache.to_persist_records();
+        let json: Vec<String> = records.iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        let parsed: Vec<PersistRecord> = json.iter()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        let mut cache2 = RecentlyApplied::new();
+        let restored = cache2.restore_from_records(parsed);
+        assert_eq!(restored, 1);
+        assert!(cache2.is_recent(42, CachedActionKind::SetMemorystatus));
+    }
+
+    #[test]
+    fn restore_empty_records_yields_zero() {
+        let mut cache = RecentlyApplied::new();
+        let restored = cache.restore_from_records(vec![]);
+        assert_eq!(restored, 0);
+        assert!(cache.is_empty());
     }
 }
