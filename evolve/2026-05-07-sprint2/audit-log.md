@@ -93,3 +93,35 @@ filter) and post-drain (action_queue exit) chokepoints.
 
 [Anti-patterns: No-Timeout / Retry-Storm / Ignoring-Idempotency —
 1001 patterns slides 56, 57, 59 — ALL N/A or CLOSED]
+
+
+## Phase C — Dedup/Homologate scan
+
+**Result:** PASS — no duplicate dedup logic. HashSet<u32> usages have
+distinct semantics, not redundant copies of RecentlyApplied.
+
+| Site | Purpose | Distinct from RecentlyApplied? |
+|------|---------|-------------------------------|
+| daemon_chromium_tick.rs:101 | main_frozen_set (which PIDs are SIGSTOPped) | Yes — kernel state, not action history |
+| metrics_reporter.rs:211, 249 | fg_family / heuristic_critical_pids | Yes — current foreground tree |
+| metrics_reporter.rs:254 | frozen_pids (current) | Yes — kernel state |
+| daemon_cycle_tail.rs:99 | behavior_interactive_pids | Yes — interactive heuristic snapshot |
+
+Each HashSet<u32> represents a DIFFERENT slice of system state (frozen
+set, foreground family, interactive heuristic). RecentlyApplied tracks
+ACTION HISTORY by (pid, kind, instant). Orthogonal data structures with
+distinct invariants and mutation patterns. No homologation needed.
+
+The earlier within-cycle dedup in `daemon_paging_hints.rs:53-62` is a
+LOCAL pre-skip (avoid emitting same SetMemorystatus twice in same cycle).
+This is orthogonal to `RecentlyApplied`'s cross-cycle dedup. Both are
+needed: local dedup avoids per-cycle work, cross-cycle dedup avoids
+re-doing already-applied actions.
+
+Phase A1+A2 added `pid_identity_still_valid()` helper that REPLACED two
+inline ~30-50 line blocks (commit 984f565). Net dedup gain.
+
+Phase B4 confirmed 9 `is_protected_name` callers are orthogonal pre-skips
+(not bypasses of classify_protection).
+
+[Dedup audit — 0 redundancies — no refactor required]
