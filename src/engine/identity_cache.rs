@@ -263,4 +263,45 @@ mod tests {
         // Must have been evicted.
         assert_eq!(cache.len(), 0);
     }
+
+    #[test]
+    fn start_sec_zero_forces_validation_no_cache_insert() {
+        // Legacy actions with start_sec=0 must not be cached — no identity
+        // proof. validate_or_refresh treats fresh_path_hash=Some as Validated
+        // (caller did the syscall) but does NOT insert into cache.
+        let cache = IdentityCache::new();
+        let legacy_key = IdentityKey { pid: 123, start_sec: 0, start_usec: 0 };
+        let r = cache.validate_or_refresh(legacy_key, Some(0xdead));
+        assert_eq!(r, IdentityValidation::Validated);
+        assert_eq!(cache.len(), 0, "start_sec=0 must NOT be cached");
+    }
+
+    #[test]
+    fn start_sec_zero_with_no_path_returns_dead() {
+        let cache = IdentityCache::new();
+        let legacy_key = IdentityKey { pid: 123, start_sec: 0, start_usec: 0 };
+        let r = cache.validate_or_refresh(legacy_key, None);
+        assert_eq!(r, IdentityValidation::Dead);
+    }
+
+    #[test]
+    fn cleanup_expired_drops_only_stale_entries() {
+        let cache = IdentityCache::with_ttl(Duration::from_millis(40));
+        cache.validate_or_refresh(key(1), Some(0xa));
+        cache.validate_or_refresh(key(2), Some(0xb));
+        std::thread::sleep(Duration::from_millis(70));
+        cache.validate_or_refresh(key(3), Some(0xc)); // fresh
+        let drained = cache.cleanup_expired();
+        assert_eq!(drained, 2);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn invalidate_pid_zero_evicts_zero() {
+        let cache = IdentityCache::new();
+        cache.validate_or_refresh(key(123), Some(0xdead));
+        let evicted = cache.invalidate_pid(0);
+        assert_eq!(evicted, 0);
+        assert_eq!(cache.len(), 1);
+    }
 }
