@@ -86,6 +86,25 @@ first cycle after restart. Phase A idempotency layer + universal filter's
 `is_recent` check absorb it harmlessly. Better than a ghost-cache false
 positive starving a critical process of resources.
 
+**Inline code contract** (per peer-review 2026-05-07):
+```rust
+// restore_recently_applied should be fail-empty:
+//   any global integrity doubt => empty cache
+//   per-entry staleness         => drop only that entry
+```
+
+**Telemetry metric** `recently_applied_restore_status` with 5 mutually-
+exclusive states (added to `lf_metrics` + reported in `runtime_metrics.json`):
+- `missing` — file did not exist on startup
+- `restored_n` — successful restore (N entries)
+- `discarded_corrupt` — parse error / malformed JSON
+- `discarded_clock_delta` — wall-clock delta > 15s
+- `discarded_boot_crossed` — monotonic time reset detected
+
+This lets `NotebookLM` debrief distinguish "persistence is providing value"
+from "always starts empty" — without this metric, B1's effectiveness is
+unobservable.
+
 **Why TTL is 30s and Inbox value is short-lived**: at 1-2s cycle time,
 30s = 15-30 cycles, which is enough to suppress steady-state cross-cycle
 dups but short enough that workload regime shifts get fresh evaluation.
