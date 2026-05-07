@@ -71,6 +71,13 @@ impl MetricsState {
         self.metrics.restore_status_discarded_corrupt = lf.restore_status_discarded_corrupt;
         self.metrics.restore_status_discarded_clock_delta = lf.restore_status_discarded_clock_delta;
         self.metrics.restore_status_discarded_boot_crossed = lf.restore_status_discarded_boot_crossed;
+        // Sprint 3 Phase A4 — flush identity_cache_* counters from lf to runtime metrics.
+        self.metrics.identity_cache_hits = lf.identity_cache_hits;
+        self.metrics.identity_cache_misses = lf.identity_cache_misses;
+        self.metrics.identity_cache_evictions = lf.identity_cache_evictions;
+        self.metrics.identity_cache_ttl_expired = lf.identity_cache_ttl_expired;
+        self.metrics.identity_cache_exit_invalidations = lf.identity_cache_exit_invalidations;
+        self.metrics.identity_proc_pidpath_calls = lf.identity_proc_pidpath_calls;
         self.metrics.memory_budget_duration_ms = lf.memory_budget_duration_us as f64 / 1000.0;
         self.metrics.reactor_duration_ms = lf.reactor_duration_us as f64 / 1000.0;
         

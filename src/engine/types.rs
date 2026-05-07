@@ -815,6 +815,21 @@ pub struct RuntimeMetrics {
     pub restore_status_discarded_clock_delta: u64,
     #[serde(default)]
     pub restore_status_discarded_boot_crossed: u64,
+    /// IdentityCache telemetry (Sprint 3 Phase A4 — flushed from lf_metrics).
+    /// Hit ratio derivable as hits / (hits + misses).
+    /// proc_pidpath_calls validates that p95 recovery is genuine amortization.
+    #[serde(default)]
+    pub identity_cache_hits: u64,
+    #[serde(default)]
+    pub identity_cache_misses: u64,
+    #[serde(default)]
+    pub identity_cache_evictions: u64,
+    #[serde(default)]
+    pub identity_cache_ttl_expired: u64,
+    #[serde(default)]
+    pub identity_cache_exit_invalidations: u64,
+    #[serde(default)]
+    pub identity_proc_pidpath_calls: u64,
     /// Lotka-Volterra Jacobian stability class: 0=Degenerate 1=StableNode 2=StableSpiral 3=UnstableSaddle 4=Unstable
     #[serde(default)]
     pub si_stability_regime: u8,
