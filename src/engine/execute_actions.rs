@@ -748,8 +748,13 @@ pub fn execute_actions(
                             before = Some(val);
                         }
                         None => {
+                            // Read timed out (worker thread saturated) or key
+                            // unreadable. Without push_skip, journal records
+                            // success=true with before=null/after=null —
+                            // 146 phantom entries observed in 7h prod soak
+                            // (fix 2026-05-07).
                             out.invalid_sysctl_denied += 1;
-                            out.push_skip(format!("invalid-sysctl:{}", key));
+                            out.push_skip(format!("sysctl-read-failed:{}", key));
                             block_reason = Some(BlockReason::InvalidSysctl);
                             return Ok(());
                         }

@@ -3575,9 +3575,19 @@ fn main() -> anyhow::Result<()> {
                         }
                     };
                     for (key, value) in net_optimizer.get_sysctl_recommendations(net_profile) {
+                        // Phase C clamp also applies here — network_optimizer
+                        // returns raw kernel-buffer recommendations (e.g. 4MB
+                        // sendspace) that exceed safety::allowlist range.
+                        // Without clamping, execute_actions correctly rejects
+                        // them but inflates the journal with 73+ out-of-range
+                        // skip entries per cycle (fix 2026-05-07).
+                        let clamped = match value.parse::<i64>() {
+                            Ok(n) => apollo_optimizer::engine::sysctl_governor::clamp_to_allowed_range(&key, n).to_string(),
+                            Err(_) => value,
+                        };
                         actions.push(RootAction::set_sysctl(
                             key,
-                            value,
+                            clamped,
                             format!("network-optimizer: {:?} profile", net_profile),
                             DecisionReason::PressureContext,
                         ));

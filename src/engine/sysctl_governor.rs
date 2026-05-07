@@ -40,7 +40,7 @@ use crate::engine::types::{HardPath, RootAction};
 /// if no range exists for this key.
 ///
 /// [Anti-Corruption Layer Pattern — 1001 patterns slide 48]
-fn clamp_to_allowed_range(key: &str, proposed: i64) -> i64 {
+pub fn clamp_to_allowed_range(key: &str, proposed: i64) -> i64 {
     let ranges = crate::engine::safety::allowlisted_sysctls_with_ranges();
     if let Some(r) = ranges.iter().find(|r| r.key == key) {
         proposed.clamp(r.min, r.max)
