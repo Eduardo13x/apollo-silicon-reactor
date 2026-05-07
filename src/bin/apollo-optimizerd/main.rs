@@ -4538,6 +4538,21 @@ fn main() -> anyhow::Result<()> {
                     recently_applied.save_to_disk(std::path::Path::new(apollo_optimizer::engine::daemon_helpers::recently_applied_path()));
                 }
 
+                // Phase A3 (Sprint 3 2026-05-07) — periodic IdentityCache cleanup.
+                // Lazy expiry on lookup is sufficient for correctness, but a
+                // periodic sweep keeps memory bounded under sustained load.
+                if cycle_count % 60 == 0 {
+                    let drained = identity_cache.cleanup_expired();
+                    if drained > 0 {
+                        tracing::debug!(
+                            target: "apollo.identity_cache",
+                            drained,
+                            remaining = identity_cache.len(),
+                            "cache cleanup expired entries"
+                        );
+                    }
+                }
+
                 // ── Self-diagnosis (Phase 6 self-healing layer) ────────────────
                 // Record this cycle's signals + check thresholds. Detection-only;
                 // alerts surface via tracing::warn! and append to
