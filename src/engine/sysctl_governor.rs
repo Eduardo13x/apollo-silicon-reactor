@@ -26,6 +26,31 @@ use crate::engine::network_monitor::NetworkMonitor;
 use crate::engine::swap_predictor::SwapTrend;
 use crate::engine::types::{HardPath, RootAction};
 
+// ── Safety clamp helper ───────────────────────────────────────────────────────
+
+/// Clamp a proposed sysctl value to the allowed range from
+/// `safety::allowlisted_sysctls_with_ranges()`.
+///
+/// Sprint 3 Phase C — Governor↔Safety contract reconcile. Sprint 2
+/// measurement showed 35% of journal failures were `BlockReason::SysctlOutOfRange`.
+/// Preventing emission for out-of-range values eliminates wasted journal
+/// entries and audit log noise.
+///
+/// Returns clamped value (always within allowed range), or the original
+/// if no range exists for this key.
+///
+/// [Anti-Corruption Layer Pattern — 1001 patterns slide 48]
+fn clamp_to_allowed_range(key: &str, proposed: i64) -> i64 {
+    let ranges = crate::engine::safety::allowlisted_sysctls_with_ranges();
+    if let Some(r) = ranges.iter().find(|r| r.key == key) {
+        proposed.clamp(r.min, r.max)
+    } else {
+        // Key not in allowlist — execute_actions will reject with
+        // InvalidSysctl. Pass through unchanged so the failure surfaces.
+        proposed
+    }
+}
+
 // ── Input bundle ─────────────────────────────────────────────────────────────
 
 /// All inputs the governor needs for one decision cycle.
@@ -335,11 +360,17 @@ impl SysctlGovernor {
         let mut actions: Vec<RootAction> = self
             .defaults
             .iter()
-            .map(|(key, value)| RootAction::SetSysctl {
-                key: key.clone(),
-                value: value.clone(),
-                reason: "sysctl-governor: reverting to default".to_string(),
-                decision_reason: DecisionReason::PressureContext,
+            .map(|(key, value)| {
+                let clamped_value = match value.parse::<i64>() {
+                    Ok(n) => format!("{}", clamp_to_allowed_range(key, n)),
+                    Err(_) => value.clone(),
+                };
+                RootAction::SetSysctl {
+                    key: key.clone(),
+                    value: clamped_value,
+                    reason: "sysctl-governor: reverting to default".to_string(),
+                    decision_reason: DecisionReason::PressureContext,
+                }
             })
             .collect();
 
@@ -352,9 +383,13 @@ impl SysctlGovernor {
                      using current value '{}' as fallback for revert",
                     key, current
                 );
+                let clamped_value = match current.parse::<i64>() {
+                    Ok(n) => format!("{}", clamp_to_allowed_range(key, n)),
+                    Err(_) => current,
+                };
                 actions.push(RootAction::SetSysctl {
                     key: key.clone(),
-                    value: current,
+                    value: clamped_value,
                     reason: format!(
                         "sysctl-governor: reverting '{}' using fallback (no default captured)",
                         key
@@ -464,11 +499,17 @@ impl SysctlGovernor {
         tunings
             .iter()
             .filter(|(key, _, _)| !self.unavailable_keys.contains(&key.to_string()))
-            .map(|(key, value, reason)| RootAction::SetSysctl {
-                key: key.to_string(),
-                value: value.to_string(),
-                reason: format!("sysctl-governor: initial tuning — {}", reason),
-                decision_reason: DecisionReason::PressureContext,
+            .map(|(key, value, reason)| {
+                let clamped_value = match value.parse::<i64>() {
+                    Ok(n) => format!("{}", clamp_to_allowed_range(key, n)),
+                    Err(_) => value.to_string(),
+                };
+                RootAction::SetSysctl {
+                    key: key.to_string(),
+                    value: clamped_value,
+                    reason: format!("sysctl-governor: initial tuning — {}", reason),
+                    decision_reason: DecisionReason::PressureContext,
+                }
             })
             .collect()
     }
@@ -1035,15 +1076,19 @@ impl SysctlGovernor {
         if self.unavailable_keys.iter().any(|k| k == key) {
             return;
         }
+        let clamped_value = match value.parse::<i64>() {
+            Ok(n) => format!("{}", clamp_to_allowed_range(key, n)),
+            Err(_) => value.to_string(),
+        };
         actions.push(RootAction::SetSysctl {
             key: key.to_string(),
-            value: value.to_string(),
+            value: clamped_value.clone(),
             reason: reason.to_string(),
             decision_reason: DecisionReason::PressureContext,
         });
         self.last_tuning.insert(key.to_string(), SystemTime::now());
         self.current_values
-            .insert(key.to_string(), value.to_string());
+            .insert(key.to_string(), clamped_value);
         self.total_writes += 1;
     }
 }
@@ -1481,5 +1526,43 @@ mod tests {
                 if key == "net.inet.tcp.delayed_ack" && value == "3")
         });
         assert!(has_ack_change, "expected delayed_ack=3 on battery");
+    }
+
+    #[test]
+    fn clamp_value_within_range_passes_through() {
+        // First, find an actual range from safety to use realistic values.
+        let ranges = crate::engine::safety::allowlisted_sysctls_with_ranges();
+        if let Some(r) = ranges.first() {
+            // Pick a value in the middle of the range
+            let mid = (r.min + r.max) / 2;
+            let v = clamp_to_allowed_range(&r.key, mid);
+            assert_eq!(v, mid, "value within range must pass through unchanged");
+        }
+    }
+
+    #[test]
+    fn clamp_value_above_max_clamps_to_max() {
+        let ranges = crate::engine::safety::allowlisted_sysctls_with_ranges();
+        if let Some(r) = ranges.first() {
+            let v = clamp_to_allowed_range(&r.key, r.max + 999_999);
+            assert_eq!(v, r.max, "out-of-range high must clamp to max");
+        }
+    }
+
+    #[test]
+    fn clamp_value_below_min_clamps_to_min() {
+        let ranges = crate::engine::safety::allowlisted_sysctls_with_ranges();
+        if let Some(r) = ranges.first() {
+            let v = clamp_to_allowed_range(&r.key, r.min - 1);
+            assert_eq!(v, r.min, "out-of-range low must clamp to min");
+        }
+    }
+
+    #[test]
+    fn clamp_unknown_key_passes_through() {
+        // Unknown keys: pass through unchanged (execute_actions catches via
+        // InvalidSysctl block reason)
+        let v = clamp_to_allowed_range("not.in.allowlist", 12345);
+        assert_eq!(v, 12345);
     }
 }
