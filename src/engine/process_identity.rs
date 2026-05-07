@@ -456,4 +456,27 @@ mod tests {
         assert!(!is_system_driver_path("/Applications/AudioHijack.app/Contents/MacOS/AudioHijack"));
         assert!(!is_system_driver_path("/Users/edu/.cargo/bin/rustc"));
     }
+
+    #[test]
+    fn from_pid_for_self_returns_some() {
+        // self pid is always alive at test time.
+        let me = std::process::id();
+        let id = ProcessIdentity::from_pid(me);
+        assert!(id.is_some(), "from_pid for self must succeed");
+    }
+
+    #[test]
+    fn from_pid_for_dead_pid_returns_none() {
+        // PID 99999 is reserved and never alive on macOS.
+        let id = ProcessIdentity::from_pid(99_999);
+        assert!(id.is_none(), "dead PID must return None");
+    }
+
+    #[test]
+    fn from_pid_self_start_sec_is_nonzero() {
+        // Live process must have a positive start_sec.
+        let me = std::process::id();
+        let id = ProcessIdentity::from_pid(me).unwrap();
+        assert!(id.start_sec > 0, "live process start_sec must be > 0");
+    }
 }
