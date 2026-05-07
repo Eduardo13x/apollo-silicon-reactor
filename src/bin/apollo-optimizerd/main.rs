@@ -238,100 +238,18 @@ enum Commands {
 /// [Cache-Aside Pattern — 1001 patterns slide 11]
 fn pid_identity_still_valid(
     action: &apollo_optimizer::engine::types::RootAction,
-    cache: &apollo_optimizer::engine::identity_cache::IdentityCache,
+    manager: &apollo_optimizer::engine::identity_cache_manager::IdentityCacheManager,
     lf_metrics: &apollo_optimizer::engine::lse_counters::LockFreeMetrics,
 ) -> bool {
-    use apollo_optimizer::engine::identity_cache::{IdentityKey, IdentityValidation};
-    use apollo_optimizer::engine::process_identity::ProcessIdentity;
-
-    let (pid, name, action_start_sec, action_start_usec) = match action.identity_fields() {
-        Some(fields) => fields,
-        None => return true, // non-PID action — Spotlight, sysctl, etc.
-    };
-
-    let key = IdentityKey {
-        pid,
-        start_sec: action_start_sec,
-        start_usec: action_start_usec,
-    };
-
-    // PID-only fast path for actions without start_sec proof
-    // (SetMemorystatus, Boost, Unfreeze, SetThreadQoS). Hits avoid the
-    // syscall when an earlier verified entry for the same PID is fresh.
-    if action_start_sec == 0 {
-        if let Some(IdentityValidation::CachedValid) = cache.lookup_by_pid(pid) {
-            lf_metrics
-                .identity_cache_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return true;
+    // Action-aware shim over the cache lifecycle manager. Identity-bearing
+    // actions delegate to manager.verify; non-PID actions (Spotlight,
+    // sysctl, daemon quarantine) trivially pass.
+    match action.identity_fields() {
+        Some((pid, name, start_sec, start_usec)) => {
+            manager.verify(pid, name, start_sec, start_usec, lf_metrics)
         }
+        None => true,
     }
-
-    // Try cache first (no syscall on hit).
-    let cached_probe = cache.validate_or_refresh(key, None);
-    match cached_probe {
-        IdentityValidation::CachedValid => {
-            lf_metrics
-                .identity_cache_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return true;
-        }
-        IdentityValidation::Invalid => {
-            // Cache had a path-hash mismatch (rare). Treat as identity changed.
-            return false;
-        }
-        IdentityValidation::Validated => {
-            // Defensive: shouldn't occur with None, but be safe.
-            lf_metrics
-                .identity_cache_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return true;
-        }
-        IdentityValidation::Dead => {
-            // Cache miss (or start_sec=0). Fall through to full check.
-        }
-    }
-
-    // Cache miss → consult the kernel for live identity, then run the shared
-    // ProcessIdentity::matches predicate (single source of truth — Sprint 4
-    // IdentityVerifier merge).
-    lf_metrics
-        .identity_cache_misses
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    lf_metrics
-        .identity_proc_pidpath_calls
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    let current = match ProcessIdentity::from_pid(pid) {
-        Some(id) => id,
-        None => return false, // dead process
-    };
-    if !current.matches(name, action_start_sec, action_start_usec) {
-        return false;
-    }
-
-    // Insert into cache for next-time hit. If action carried start_sec/usec=0
-    // (SetMemorystatus, Boost, Unfreeze, SetThreadQoS — most action variants),
-    // use the start_sec/usec just obtained from the syscall to build a cacheable
-    // key. Without this, those variants never cache and re-issue the syscall
-    // on every call (Sprint 3 calibration fix preserved).
-    let path_hash = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        current.name.hash(&mut hasher);
-        hasher.finish()
-    };
-    let cacheable_key = if action_start_sec == 0 {
-        IdentityKey {
-            pid,
-            start_sec: current.start_sec,
-            start_usec: current.start_usec,
-        }
-    } else {
-        key
-    };
-    cache.validate_or_refresh(cacheable_key, Some(path_hash));
-    true
 }
 
 /// Toggle Spotlight indexing via `mdutil -a -i on/off`.
@@ -4553,7 +4471,7 @@ fn main() -> anyhow::Result<()> {
                 // Lazy expiry on lookup is sufficient for correctness, but a
                 // periodic sweep keeps memory bounded under sustained load.
                 if cycle_count % 60 == 0 {
-                    let drained = identity_cache.cleanup_expired();
+                    let drained = identity_cache.tick_cleanup();
                     if drained > 0 {
                         tracing::debug!(
                             target: "apollo.identity_cache",
