@@ -3972,7 +3972,72 @@ fn main() -> anyhow::Result<()> {
                 // dispatch at most max_per_cycle per cycle. Urgent (Unfreeze) actions
                 // bypass the cap. Any overflow stays in the queue for the next cycle.
                 action_queue.push_all(final_actions);
-                let final_actions = action_queue.drain_cycle();
+                let final_actions = {
+                    let drained = action_queue.drain_cycle();
+                    // Phase A2 (Sprint 2 2026-05-07) — post-drain identity re-verify.
+                    // Actions queued cycle N may dispatch cycle N+1 due to priority
+                    // budget; PID can die between push and drain. Re-verify here
+                    // closes the multi-cycle race window. Same logic as A1 but at
+                    // a different chokepoint (queue exit vs queue entry).
+                    //
+                    // Mirrors execute_actions::verify_pid_identity exactly:
+                    //   - start_sec match (PID-recycle guard)
+                    //   - start_usec match when both non-zero (sub-second recycle)
+                    //   - name fallback for legacy start_sec=0 actions
+                    let mut alive = Vec::with_capacity(drained.len());
+                    for action in drained {
+                        let pid_opt = match &action {
+                            apollo_optimizer::engine::types::RootAction::ThrottleProcess { pid, .. }
+                            | apollo_optimizer::engine::types::RootAction::FreezeProcess { pid, .. }
+                            | apollo_optimizer::engine::types::RootAction::UnfreezeProcess { pid, .. }
+                            | apollo_optimizer::engine::types::RootAction::BoostProcess { pid, .. }
+                            | apollo_optimizer::engine::types::RootAction::SetMemorystatus { pid, .. }
+                            | apollo_optimizer::engine::types::RootAction::SetThreadQoS { pid, .. } => Some(*pid),
+                            _ => None,
+                        };
+                        let (action_start_sec, action_start_usec) = match &action {
+                            apollo_optimizer::engine::types::RootAction::ThrottleProcess { start_sec, start_usec, .. }
+                            | apollo_optimizer::engine::types::RootAction::FreezeProcess { start_sec, start_usec, .. } => (*start_sec, *start_usec),
+                            _ => (0u64, 0u64),
+                        };
+                        let action_name: Option<&str> = match &action {
+                            apollo_optimizer::engine::types::RootAction::ThrottleProcess { name, .. }
+                            | apollo_optimizer::engine::types::RootAction::FreezeProcess { name, .. }
+                            | apollo_optimizer::engine::types::RootAction::UnfreezeProcess { name, .. }
+                            | apollo_optimizer::engine::types::RootAction::BoostProcess { name, .. }
+                            | apollo_optimizer::engine::types::RootAction::SetThreadQoS { name, .. } => Some(name.as_str()),
+                            _ => None,
+                        };
+                        if let Some(pid) = pid_opt {
+                            match apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid) {
+                                None => continue,
+                                Some(current) => {
+                                    if action_start_sec > 0 && current.start_sec != action_start_sec {
+                                        continue;
+                                    }
+                                    if action_start_sec > 0
+                                        && action_start_usec > 0
+                                        && current.start_usec != action_start_usec
+                                    {
+                                        continue;
+                                    }
+                                    if action_start_sec == 0 {
+                                        if let Some(expected) = action_name {
+                                            let name_ok = current.name == expected
+                                                || (current.name.len() >= 6 && expected.starts_with(&current.name))
+                                                || (expected.len() >= 6 && current.name.starts_with(expected));
+                                            if !name_ok {
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        alive.push(action);
+                    }
+                    alive
+                };
                 // Update backpressure metrics (observable in runtime_metrics.json).
                 {
                     let bp = action_queue.backpressure_ratio();
