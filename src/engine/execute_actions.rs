@@ -212,35 +212,6 @@ fn sysctl_write_i32_with_timeout(key: &str, value: i32) -> bool {
         .unwrap_or(false)
 }
 
-/// Verify PID identity using kernel start-time.
-///
-/// If `start_sec > 0`, checks that the process still has the same start-time
-/// (prevents A-B-A PID recycling). Falls back to name-only check when
-/// start-time is unavailable (legacy actions with `start_sec == 0`).
-fn verify_pid_identity(pid: u32, expected_name: &str, start_sec: u64, start_usec: u64) -> bool {
-    match ProcessIdentity::from_pid(pid) {
-        Some(current) => {
-            // start_sec check: guards against PID recycling between snapshot and execution.
-            if start_sec > 0 && current.start_sec != start_sec {
-                return false;
-            }
-            // start_usec check: only when explicitly provided (non-zero).
-            // decide_actions passes start_usec=0 because sysinfo doesn't expose
-            // sub-second precision — treating 0 as "not provided" prevents false
-            // positives where pbi_start_tvusec != 0 for every live process.
-            if start_sec > 0 && start_usec > 0 && current.start_usec != start_usec {
-                return false;
-            }
-            // Name check as defense-in-depth (handles start_sec==0 fallback too).
-            let name_ok = current.name == expected_name
-                || (current.name.len() >= 6 && expected_name.starts_with(&current.name))
-                || (expected_name.len() >= 6 && current.name.starts_with(expected_name));
-            name_ok
-        }
-        None => false, // Process already dead.
-    }
-}
-
 /// Aggregate counters returned by execute_actions so callers do not need to
 /// hold a RuntimeMetrics lock during blocking I/O.
 #[derive(Debug, Default)]
@@ -440,7 +411,7 @@ pub fn execute_actions(
                         return Ok(());
                     }
                     // Validate PID identity (name-only for boost — no start-time available).
-                    if !verify_pid_identity(*pid, name, 0, 0) {
+                    if !ProcessIdentity::verify(*pid, Some(name), 0, 0) {
                         block_reason = Some(BlockReason::PidRecycled);
                         return Ok(());
                     }
@@ -496,7 +467,7 @@ pub fn execute_actions(
                         return Ok(());
                     }
                     // Validate PID identity with start-time (prevents A-B-A recycling).
-                    if !verify_pid_identity(*pid, name, *start_sec, *start_usec) {
+                    if !ProcessIdentity::verify(*pid, Some(name), *start_sec, *start_usec) {
                         out.push_skip(format!("pid-recycled:{}", name));
                         block_reason = Some(BlockReason::PidRecycled);
                         return Ok(());
@@ -582,7 +553,7 @@ pub fn execute_actions(
                         return Ok(());
                     }
                     // Validate PID identity with start-time (prevents A-B-A recycling).
-                    if !verify_pid_identity(*pid, name, *start_sec, *start_usec) {
+                    if !ProcessIdentity::verify(*pid, Some(name), *start_sec, *start_usec) {
                         block_reason = Some(BlockReason::PidRecycled);
                         return Ok(());
                     }
@@ -851,7 +822,7 @@ pub fn execute_actions(
                     if protected.iter().any(|p| name.contains(p)) {
                         return Ok(());
                     }
-                    if !verify_pid_identity(*pid, name, 0, 0) {
+                    if !ProcessIdentity::verify(*pid, Some(name), 0, 0) {
                         return Ok(());
                     }
                     let thread_tier = match tier.as_str() {

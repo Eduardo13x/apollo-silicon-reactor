@@ -105,6 +105,62 @@ impl ProcessIdentity {
             })
             .unwrap_or(false)
     }
+
+    /// Pure predicate: check whether this just-fetched identity matches the
+    /// expected fields supplied by the caller.
+    ///
+    /// Semantics (Sprint 4 — semantics-preserving merge of
+    /// `verify_pid_identity` and `pid_identity_still_valid`):
+    /// - `start_sec == 0` is the legacy fallback (action without process
+    ///   birth timestamp). The start_sec/start_usec checks are skipped and
+    ///   identity is decided by name alone. TODO: tighten once all action
+    ///   emitters populate identity tuples.
+    /// - When `start_sec > 0`, A-B-A PID recycling is rejected by checking
+    ///   `current.start_sec == start_sec` (and `start_usec` if provided).
+    /// - `expected_name == None` skips the name check entirely. Used by
+    ///   actions that don't carry a name (e.g. `SetMemorystatus`).
+    /// - Name match is prefix-tolerant in either direction when one name is
+    ///   ≥6 chars: macOS kernel APIs truncate `p_comm` to ~15 chars while
+    ///   action emitters carry the full path-derived name.
+    pub fn matches(
+        &self,
+        expected_name: Option<&str>,
+        start_sec: u64,
+        start_usec: u64,
+    ) -> bool {
+        if start_sec > 0 && self.start_sec != start_sec {
+            return false;
+        }
+        if start_sec > 0 && start_usec > 0 && self.start_usec != start_usec {
+            return false;
+        }
+        match expected_name {
+            None => true,
+            Some(expected) => {
+                self.name == expected
+                    || (self.name.len() >= 6 && expected.starts_with(&self.name))
+                    || (expected.len() >= 6 && self.name.starts_with(expected))
+            }
+        }
+    }
+
+    /// One-shot identity check: fetch live `ProcessIdentity` for `pid` and
+    /// compare against expected fields. Returns `false` if the process is
+    /// already dead or any field check fails.
+    ///
+    /// Replaces the duplicated `verify_pid_identity` helper that lived in
+    /// both `execute_actions.rs` and `daemon main.rs::pid_identity_still_valid`.
+    pub fn verify(
+        pid: u32,
+        expected_name: Option<&str>,
+        start_sec: u64,
+        start_usec: u64,
+    ) -> bool {
+        match Self::from_pid(pid) {
+            Some(id) => id.matches(expected_name, start_sec, start_usec),
+            None => false,
+        }
+    }
 }
 
 /// Fast process name lookup via `proc_name()`.  ~2 μs per call.
@@ -478,5 +534,77 @@ mod tests {
         let me = std::process::id();
         let id = ProcessIdentity::from_pid(me).unwrap();
         assert!(id.start_sec > 0, "live process start_sec must be > 0");
+    }
+
+    // ── matches() / verify() — Sprint 4 IdentityVerifier merge ────────────────
+
+    fn fixture(name: &str, start_sec: u64, start_usec: u64) -> ProcessIdentity {
+        ProcessIdentity { pid: 1234, start_sec, start_usec, name: name.into() }
+    }
+
+    #[test]
+    fn matches_happy_path() {
+        let id = fixture("Brave Browser", 1_000_000, 500_000);
+        assert!(id.matches(Some("Brave Browser"), 1_000_000, 500_000));
+    }
+
+    #[test]
+    fn matches_recycled_start_sec_returns_false() {
+        let id = fixture("Brave Browser", 2_000_000, 0);
+        assert!(!id.matches(Some("Brave Browser"), 1_000_000, 0));
+    }
+
+    #[test]
+    fn matches_recycled_start_usec_returns_false() {
+        let id = fixture("Brave Browser", 1_000_000, 999_000);
+        assert!(!id.matches(Some("Brave Browser"), 1_000_000, 500_000));
+    }
+
+    #[test]
+    fn matches_name_mismatch_returns_false() {
+        let id = fixture("Brave Browser", 1_000_000, 500_000);
+        assert!(!id.matches(Some("Firefox"), 1_000_000, 500_000));
+    }
+
+    #[test]
+    fn matches_name_none_skips_check() {
+        // SetMemorystatus has no name field; identity_fields returns None.
+        // Verifier must accept any name when expected_name is None.
+        let id = fixture("Whatever", 1_000_000, 500_000);
+        assert!(id.matches(None, 1_000_000, 500_000));
+    }
+
+    #[test]
+    fn matches_prefix_tolerance_kernel_truncated() {
+        // macOS kernel truncates p_comm to ~15 chars. Allow prefix match
+        // when one name is long enough (≥6) to disambiguate.
+        let kernel_truncated = fixture("StatusKitAgent", 1_000_000, 500_000);
+        assert!(kernel_truncated.matches(
+            Some("StatusKitAgent (long.binary.path)"),
+            1_000_000,
+            500_000,
+        ));
+    }
+
+    #[test]
+    fn matches_legacy_start_sec_zero_uses_name_only() {
+        // Legacy actions emit start_sec=0; matches must skip the start-time
+        // check and rely on name match alone.
+        let id = fixture("Brave Browser", 999_999, 999_999);
+        assert!(id.matches(Some("Brave Browser"), 0, 0));
+    }
+
+    #[test]
+    fn verify_dead_pid_returns_false() {
+        // PID 99999 reserved on macOS — from_pid returns None.
+        assert!(!ProcessIdentity::verify(99_999, Some("anything"), 0, 0));
+    }
+
+    #[test]
+    fn verify_self_happy_path() {
+        let me = std::process::id();
+        let id = ProcessIdentity::from_pid(me).unwrap();
+        // Use the just-fetched start_sec/usec so the call cannot race.
+        assert!(ProcessIdentity::verify(me, Some(&id.name), id.start_sec, id.start_usec));
     }
 }

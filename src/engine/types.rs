@@ -343,6 +343,37 @@ fn default_decision_reason() -> crate::engine::audit_types::DecisionReason {
 }
 
 impl RootAction {
+    /// Extract the identity tuple `(pid, name, start_sec, start_usec)` from
+    /// any PID-bearing variant. Returns `None` for actions that do not act on
+    /// a process (`SetSysctl`, `ToggleSpotlight`, `QuarantineDaemon`).
+    ///
+    /// Variants without process birth timestamps (`BoostProcess`,
+    /// `UnfreezeProcess`, `SetMemorystatus`, `SetThreadQoS`) report
+    /// `start_sec = start_usec = 0` — see `ProcessIdentity::matches` for the
+    /// legacy-fallback semantics. `SetMemorystatus` carries no name field in
+    /// the action variant and reports `name = None`.
+    ///
+    /// Single source of truth for the field-extraction logic that previously
+    /// duplicated between `daemon main.rs::pid_identity_still_valid` and the
+    /// callers of `execute_actions::verify_pid_identity` (Sprint 4 merge).
+    pub fn identity_fields(&self) -> Option<(u32, Option<&str>, u64, u64)> {
+        match self {
+            RootAction::ThrottleProcess { pid, name, start_sec, start_usec, .. }
+            | RootAction::FreezeProcess { pid, name, start_sec, start_usec, .. } => {
+                Some((*pid, Some(name.as_str()), *start_sec, *start_usec))
+            }
+            RootAction::BoostProcess { pid, name, .. }
+            | RootAction::UnfreezeProcess { pid, name, .. }
+            | RootAction::SetThreadQoS { pid, name, .. } => {
+                Some((*pid, Some(name.as_str()), 0, 0))
+            }
+            RootAction::SetMemorystatus { pid, .. } => Some((*pid, None, 0, 0)),
+            RootAction::SetSysctl { .. }
+            | RootAction::ToggleSpotlight { .. }
+            | RootAction::QuarantineDaemon { .. } => None,
+        }
+    }
+
     /// Construct a `ThrottleProcess` with zero start times.
     ///
     /// Use this when the action is queued before PID identity validation
@@ -1494,5 +1525,130 @@ mod tests {
         assert_eq!(m.cycles, 0);
         assert_eq!(m.boosts_applied, 0);
         assert_eq!(m.failures, 0);
+    }
+
+    // ── RootAction::identity_fields — Sprint 4 IdentityVerifier merge ─────────
+
+    use crate::engine::audit_types::DecisionReason;
+
+    #[test]
+    fn identity_fields_throttle_carries_full_tuple() {
+        let a = RootAction::ThrottleProcess {
+            pid: 100,
+            name: "Brave".into(),
+            aggressive: false,
+            reason: "test".into(),
+            decision_reason: DecisionReason::PressureContext,
+            start_sec: 1_000_000,
+            start_usec: 500_000,
+        };
+        assert_eq!(
+            a.identity_fields(),
+            Some((100u32, Some("Brave"), 1_000_000u64, 500_000u64))
+        );
+    }
+
+    #[test]
+    fn identity_fields_freeze_carries_full_tuple() {
+        let a = RootAction::FreezeProcess {
+            pid: 200,
+            name: "Slack".into(),
+            reason: "stale".into(),
+            decision_reason: DecisionReason::PressureContext,
+            start_sec: 9_999,
+            start_usec: 1,
+        };
+        assert_eq!(
+            a.identity_fields(),
+            Some((200u32, Some("Slack"), 9_999u64, 1u64))
+        );
+    }
+
+    #[test]
+    fn identity_fields_boost_has_no_start_sec() {
+        let a = RootAction::BoostProcess {
+            pid: 300,
+            name: "Alacritty".into(),
+            reason: "fg".into(),
+            decision_reason: DecisionReason::InteractiveFocus,
+        };
+        assert_eq!(
+            a.identity_fields(),
+            Some((300u32, Some("Alacritty"), 0u64, 0u64))
+        );
+    }
+
+    #[test]
+    fn identity_fields_unfreeze_has_no_start_sec() {
+        let a = RootAction::UnfreezeProcess {
+            pid: 400,
+            name: "Code Helper".into(),
+            reason: "thaw".into(),
+            decision_reason: DecisionReason::PressureContext,
+        };
+        assert_eq!(
+            a.identity_fields(),
+            Some((400u32, Some("Code Helper"), 0u64, 0u64))
+        );
+    }
+
+    #[test]
+    fn identity_fields_set_memorystatus_has_pid_no_name() {
+        let a = RootAction::SetMemorystatus {
+            pid: 500,
+            priority: -1,
+            reason: "purge hint".into(),
+            decision_reason: DecisionReason::PressureContext,
+        };
+        assert_eq!(a.identity_fields(), Some((500u32, None, 0u64, 0u64)));
+    }
+
+    #[test]
+    fn identity_fields_set_thread_qos_carries_name() {
+        let a = RootAction::SetThreadQoS {
+            pid: 600,
+            name: "Brave Helper".into(),
+            thread_index: 3,
+            tier: "background".into(),
+            reason: "demote".into(),
+            decision_reason: DecisionReason::ThreadQoSRouting,
+            affinity_tag: None,
+        };
+        assert_eq!(
+            a.identity_fields(),
+            Some((600u32, Some("Brave Helper"), 0u64, 0u64))
+        );
+    }
+
+    #[test]
+    fn identity_fields_set_sysctl_returns_none() {
+        let a = RootAction::SetSysctl {
+            key: "net.inet.tcp.delayed_ack".into(),
+            value: "3".into(),
+            reason: "tune".into(),
+            decision_reason: DecisionReason::PressureContext,
+        };
+        assert_eq!(a.identity_fields(), None);
+    }
+
+    #[test]
+    fn identity_fields_toggle_spotlight_returns_none() {
+        let a = RootAction::ToggleSpotlight {
+            enabled: false,
+            reason: "off".into(),
+            decision_reason: DecisionReason::PressureContext,
+        };
+        assert_eq!(a.identity_fields(), None);
+    }
+
+    #[test]
+    fn identity_fields_quarantine_returns_none() {
+        let a = RootAction::QuarantineDaemon {
+            daemon: "mds".into(),
+            active: true,
+            reason: "noisy".into(),
+            decision_reason: DecisionReason::PressureContext,
+        };
+        assert_eq!(a.identity_fields(), None);
     }
 }

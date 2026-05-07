@@ -242,33 +242,11 @@ fn pid_identity_still_valid(
     lf_metrics: &apollo_optimizer::engine::lse_counters::LockFreeMetrics,
 ) -> bool {
     use apollo_optimizer::engine::identity_cache::{IdentityKey, IdentityValidation};
-    use apollo_optimizer::engine::types::RootAction;
+    use apollo_optimizer::engine::process_identity::ProcessIdentity;
 
-    let pid_opt = match action {
-        RootAction::ThrottleProcess { pid, .. }
-        | RootAction::FreezeProcess { pid, .. }
-        | RootAction::UnfreezeProcess { pid, .. }
-        | RootAction::BoostProcess { pid, .. }
-        | RootAction::SetMemorystatus { pid, .. }
-        | RootAction::SetThreadQoS { pid, .. } => Some(*pid),
-        _ => None,
-    };
-    let pid = match pid_opt {
-        Some(p) => p,
-        None => return true, // non-PID actions always pass
-    };
-    let (action_start_sec, action_start_usec) = match action {
-        RootAction::ThrottleProcess { start_sec, start_usec, .. }
-        | RootAction::FreezeProcess { start_sec, start_usec, .. } => (*start_sec, *start_usec),
-        _ => (0u64, 0u64),
-    };
-    let action_name: Option<&str> = match action {
-        RootAction::ThrottleProcess { name, .. }
-        | RootAction::FreezeProcess { name, .. }
-        | RootAction::UnfreezeProcess { name, .. }
-        | RootAction::BoostProcess { name, .. }
-        | RootAction::SetThreadQoS { name, .. } => Some(name.as_str()),
-        _ => None,
+    let (pid, name, action_start_sec, action_start_usec) = match action.identity_fields() {
+        Some(fields) => fields,
+        None => return true, // non-PID action — Spotlight, sysctl, etc.
     };
 
     let key = IdentityKey {
@@ -314,7 +292,9 @@ fn pid_identity_still_valid(
         }
     }
 
-    // Cache miss → do the full verify_pid_identity-equivalent check.
+    // Cache miss → consult the kernel for live identity, then run the shared
+    // ProcessIdentity::matches predicate (single source of truth — Sprint 4
+    // IdentityVerifier merge).
     lf_metrics
         .identity_cache_misses
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -322,33 +302,19 @@ fn pid_identity_still_valid(
         .identity_proc_pidpath_calls
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let current = match apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid) {
+    let current = match ProcessIdentity::from_pid(pid) {
         Some(id) => id,
         None => return false, // dead process
     };
-    if action_start_sec > 0 && current.start_sec != action_start_sec {
-        return false; // PID recycled
-    }
-    if action_start_sec > 0
-        && action_start_usec > 0
-        && current.start_usec != action_start_usec
-    {
-        return false; // sub-second recycle
-    }
-    if let Some(expected) = action_name {
-        let name_ok = current.name == expected
-            || (current.name.len() >= 6 && expected.starts_with(&current.name))
-            || (expected.len() >= 6 && current.name.starts_with(expected));
-        if !name_ok {
-            return false;
-        }
+    if !current.matches(name, action_start_sec, action_start_usec) {
+        return false;
     }
 
     // Insert into cache for next-time hit. If action carried start_sec/usec=0
     // (SetMemorystatus, Boost, Unfreeze, SetThreadQoS — most action variants),
     // use the start_sec/usec just obtained from the syscall to build a cacheable
     // key. Without this, those variants never cache and re-issue the syscall
-    // on every call (Sprint 3 calibration bug, fixed 2026-05-07).
+    // on every call (Sprint 3 calibration fix preserved).
     let path_hash = {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
