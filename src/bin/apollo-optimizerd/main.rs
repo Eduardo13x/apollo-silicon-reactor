@@ -202,6 +202,81 @@ enum Commands {
 // append_discrepancy_log, build_foreground_family, build_enriched_process_data_with_tree,
 // convert_and_merge_heuristic_decisions, HeuristicStats → process_enrichment
 
+/// Verify a RootAction's target PID still has the same identity at filter time.
+///
+/// Returns `true` if the action is safe to emit/dispatch, `false` if the PID is
+/// dead or has been recycled (different process at same numeric PID).
+///
+/// Mirrors `execute_actions::verify_pid_identity` exactly:
+/// - For per-PID actions: start_sec match + start_usec match (when both >0) +
+///   name match (always evaluated as defense-in-depth).
+/// - For non-PID actions (SetSysctl/ToggleSpotlight/QuarantineDaemon): always
+///   returns true (no PID to verify).
+///
+/// Used by Phase A1 (universal pre-emit filter) and Phase A2 (post-drain
+/// re-verify) to drop actions whose target PID became invalid before they
+/// reach the safety layer (where they would log as `block_reason: PidRecycled`).
+///
+/// [Idempotency Pattern — 1001 patterns slide 7]
+/// [Anti-pattern: Ignoring Idempotency — 1001 patterns slide 59]
+fn pid_identity_still_valid(action: &apollo_optimizer::engine::types::RootAction) -> bool {
+    use apollo_optimizer::engine::types::RootAction;
+
+    let pid_opt = match action {
+        RootAction::ThrottleProcess { pid, .. }
+        | RootAction::FreezeProcess { pid, .. }
+        | RootAction::UnfreezeProcess { pid, .. }
+        | RootAction::BoostProcess { pid, .. }
+        | RootAction::SetMemorystatus { pid, .. }
+        | RootAction::SetThreadQoS { pid, .. } => Some(*pid),
+        _ => None,
+    };
+    let pid = match pid_opt {
+        Some(p) => p,
+        None => return true, // non-PID actions always pass.
+    };
+    let (action_start_sec, action_start_usec) = match action {
+        RootAction::ThrottleProcess { start_sec, start_usec, .. }
+        | RootAction::FreezeProcess { start_sec, start_usec, .. } => (*start_sec, *start_usec),
+        _ => (0u64, 0u64),
+    };
+    let action_name: Option<&str> = match action {
+        RootAction::ThrottleProcess { name, .. }
+        | RootAction::FreezeProcess { name, .. }
+        | RootAction::UnfreezeProcess { name, .. }
+        | RootAction::BoostProcess { name, .. }
+        | RootAction::SetThreadQoS { name, .. } => Some(name.as_str()),
+        _ => None, // SetMemorystatus has no name field — liveness-only check.
+    };
+
+    let current = match apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid) {
+        Some(id) => id,
+        None => return false, // process dead.
+    };
+
+    // Mirror execute_actions::verify_pid_identity exactly:
+    if action_start_sec > 0 && current.start_sec != action_start_sec {
+        return false; // PID recycled (different start_sec).
+    }
+    if action_start_sec > 0
+        && action_start_usec > 0
+        && current.start_usec != action_start_usec
+    {
+        return false; // sub-second PID recycle.
+    }
+    // Name check is always evaluated when name is available — matches
+    // execute_actions safety layer's defense-in-depth invariant.
+    if let Some(expected) = action_name {
+        let name_ok = current.name == expected
+            || (current.name.len() >= 6 && expected.starts_with(&current.name))
+            || (expected.len() >= 6 && current.name.starts_with(expected));
+        if !name_ok {
+            return false;
+        }
+    }
+    true
+}
+
 /// Toggle Spotlight indexing via `mdutil -a -i on/off`.
 ///
 fn main() -> anyhow::Result<()> {
@@ -3913,53 +3988,11 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                             // Phase A1 (Sprint 2 2026-05-07) — pre-emit identity re-verify.
-                            // Closes ~1ms race window between snapshot and execute. If the
-                            // process died OR was recycled (start_sec/start_usec mismatch),
-                            // drop the action here instead of letting it hit safety layer
-                            // where it would log as `block_reason: PidRecycled`.
-                            //
-                            // Mirrors execute_actions::verify_pid_identity exactly:
-                            //   - start_sec match (PID-recycle guard)
-                            //   - start_usec match when both non-zero (sub-second recycle)
-                            //   - name fallback for legacy start_sec=0 actions
-                            //
-                            // [Anti-pattern: Ignoring Idempotency — 1001 patterns slide 59]
-                            let (action_start_sec, action_start_usec) = match &action {
-                                apollo_optimizer::engine::types::RootAction::ThrottleProcess { start_sec, start_usec, .. }
-                                | apollo_optimizer::engine::types::RootAction::FreezeProcess { start_sec, start_usec, .. } => (*start_sec, *start_usec),
-                                _ => (0u64, 0u64),
-                            };
-                            let identity_action_name: Option<&str> = match &action {
-                                apollo_optimizer::engine::types::RootAction::ThrottleProcess { name, .. }
-                                | apollo_optimizer::engine::types::RootAction::FreezeProcess { name, .. }
-                                | apollo_optimizer::engine::types::RootAction::UnfreezeProcess { name, .. }
-                                | apollo_optimizer::engine::types::RootAction::BoostProcess { name, .. }
-                                | apollo_optimizer::engine::types::RootAction::SetThreadQoS { name, .. } => Some(name.as_str()),
-                                _ => None,
-                            };
-                            match apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid) {
-                                None => continue,
-                                Some(current) => {
-                                    if action_start_sec > 0 && current.start_sec != action_start_sec {
-                                        continue;
-                                    }
-                                    if action_start_sec > 0
-                                        && action_start_usec > 0
-                                        && current.start_usec != action_start_usec
-                                    {
-                                        continue;
-                                    }
-                                    if action_start_sec == 0 {
-                                        if let Some(expected) = identity_action_name {
-                                            let name_ok = current.name == expected
-                                                || (current.name.len() >= 6 && expected.starts_with(&current.name))
-                                                || (expected.len() >= 6 && current.name.starts_with(expected));
-                                            if !name_ok {
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
+                            // Closes ~1ms snapshot→execute race. See pid_identity_still_valid
+                            // helper for full semantics (mirrors verify_pid_identity).
+                            // [Idempotency Pattern — 1001 patterns slide 7]
+                            if !pid_identity_still_valid(&action) {
+                                continue;
                             }
                             recently_applied.record(pid, kind);
                         }
@@ -3972,72 +4005,17 @@ fn main() -> anyhow::Result<()> {
                 // dispatch at most max_per_cycle per cycle. Urgent (Unfreeze) actions
                 // bypass the cap. Any overflow stays in the queue for the next cycle.
                 action_queue.push_all(final_actions);
-                let final_actions = {
-                    let drained = action_queue.drain_cycle();
-                    // Phase A2 (Sprint 2 2026-05-07) — post-drain identity re-verify.
-                    // Actions queued cycle N may dispatch cycle N+1 due to priority
-                    // budget; PID can die between push and drain. Re-verify here
-                    // closes the multi-cycle race window. Same logic as A1 but at
-                    // a different chokepoint (queue exit vs queue entry).
-                    //
-                    // Mirrors execute_actions::verify_pid_identity exactly:
-                    //   - start_sec match (PID-recycle guard)
-                    //   - start_usec match when both non-zero (sub-second recycle)
-                    //   - name fallback for legacy start_sec=0 actions
-                    let mut alive = Vec::with_capacity(drained.len());
-                    for action in drained {
-                        let pid_opt = match &action {
-                            apollo_optimizer::engine::types::RootAction::ThrottleProcess { pid, .. }
-                            | apollo_optimizer::engine::types::RootAction::FreezeProcess { pid, .. }
-                            | apollo_optimizer::engine::types::RootAction::UnfreezeProcess { pid, .. }
-                            | apollo_optimizer::engine::types::RootAction::BoostProcess { pid, .. }
-                            | apollo_optimizer::engine::types::RootAction::SetMemorystatus { pid, .. }
-                            | apollo_optimizer::engine::types::RootAction::SetThreadQoS { pid, .. } => Some(*pid),
-                            _ => None,
-                        };
-                        let (action_start_sec, action_start_usec) = match &action {
-                            apollo_optimizer::engine::types::RootAction::ThrottleProcess { start_sec, start_usec, .. }
-                            | apollo_optimizer::engine::types::RootAction::FreezeProcess { start_sec, start_usec, .. } => (*start_sec, *start_usec),
-                            _ => (0u64, 0u64),
-                        };
-                        let action_name: Option<&str> = match &action {
-                            apollo_optimizer::engine::types::RootAction::ThrottleProcess { name, .. }
-                            | apollo_optimizer::engine::types::RootAction::FreezeProcess { name, .. }
-                            | apollo_optimizer::engine::types::RootAction::UnfreezeProcess { name, .. }
-                            | apollo_optimizer::engine::types::RootAction::BoostProcess { name, .. }
-                            | apollo_optimizer::engine::types::RootAction::SetThreadQoS { name, .. } => Some(name.as_str()),
-                            _ => None,
-                        };
-                        if let Some(pid) = pid_opt {
-                            match apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(pid) {
-                                None => continue,
-                                Some(current) => {
-                                    if action_start_sec > 0 && current.start_sec != action_start_sec {
-                                        continue;
-                                    }
-                                    if action_start_sec > 0
-                                        && action_start_usec > 0
-                                        && current.start_usec != action_start_usec
-                                    {
-                                        continue;
-                                    }
-                                    if action_start_sec == 0 {
-                                        if let Some(expected) = action_name {
-                                            let name_ok = current.name == expected
-                                                || (current.name.len() >= 6 && expected.starts_with(&current.name))
-                                                || (expected.len() >= 6 && current.name.starts_with(expected));
-                                            if !name_ok {
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        alive.push(action);
-                    }
-                    alive
-                };
+                // Phase A2 (Sprint 2 2026-05-07) — post-drain identity re-verify.
+                // Actions queued cycle N may dispatch cycle N+1 due to priority
+                // budget; PID can die between push and drain. Re-verify here
+                // closes the multi-cycle race window. See pid_identity_still_valid
+                // helper for full semantics (mirrors verify_pid_identity).
+                // [Idempotency Pattern — 1001 patterns slide 7]
+                let final_actions: Vec<RootAction> = action_queue
+                    .drain_cycle()
+                    .into_iter()
+                    .filter(|a| pid_identity_still_valid(a))
+                    .collect();
                 // Update backpressure metrics (observable in runtime_metrics.json).
                 {
                     let bp = action_queue.backpressure_ratio();
