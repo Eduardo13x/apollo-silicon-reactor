@@ -23,6 +23,7 @@ use apollo_optimizer::engine::learned_state::LearnableParams;
 use apollo_optimizer::engine::lock_ext::LockRecover;
 use apollo_optimizer::engine::overflow_guard::OverflowGuard;
 use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
+use apollo_optimizer::engine::identity_cache::IdentityCache;
 use apollo_optimizer::collector::SystemSnapshot;
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,7 @@ pub fn run_kqueue_tick(
     display_turbo: &mut DisplayTurbo,
     frozen_state_path: &Path,
     learnable_params: &LearnableParams,
+    identity_cache: &IdentityCache,
 ) {
     let kq = match kq_frozen.as_mut() {
         Some(kq) => kq,
@@ -123,6 +125,11 @@ pub fn run_kqueue_tick(
                 // Also clean up display turbo's set — prevents unbounded
                 // growth if many processes die while frozen during turbo.
                 display_turbo.remove_pid(pid);
+                // Drop any identity cache entry for the dead PID. Without
+                // this, kernel may recycle the PID within the TTL window
+                // and lookup_by_pid would return CachedValid for a
+                // different process (ABA bug — fix 2026-05-07).
+                identity_cache.invalidate_pid(pid);
             }
             kqueue_pressure::PressureEvent::TimerTick => {}
         }

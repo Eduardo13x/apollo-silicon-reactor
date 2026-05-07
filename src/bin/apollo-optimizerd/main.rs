@@ -2089,6 +2089,7 @@ fn main() -> anyhow::Result<()> {
                     &mut display_turbo,
                     &frozen_state_path,
                     &learnable_params,
+                    &identity_cache,
                 );
 
                 // hw_predictor can elevate pressure before standard metrics catch up.

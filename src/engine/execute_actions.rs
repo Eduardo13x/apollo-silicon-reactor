@@ -754,6 +754,16 @@ pub fn execute_actions(
                             return Ok(());
                         }
                     }
+                    // Skip no-op writes: if current value already equals the
+                    // proposed value, don't issue the write nor emit a journal
+                    // entry. After the Phase C clamp landed, governor began
+                    // emitting clamped-to-current writes (e.g. delayed_ack=3
+                    // when sysctl already reads 3), inflating the journal
+                    // with success-but-unchanged entries (fix 2026-05-07).
+                    if before.as_deref() == Some(value.as_str()) {
+                        out.push_skip(format!("sysctl-noop:{}={}", key, value));
+                        return Ok(());
+                    }
                     if !dry_run {
                         run_sysctl_write(key, value)?;
                         after = sysctl_read_with_timeout(key);
