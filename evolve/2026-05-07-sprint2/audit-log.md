@@ -30,3 +30,27 @@ No missing compensating transactions. The shutdown handler implements all
 inverse operations for transactions Apollo applies during runtime.
 
 [Compensating Transaction — 1001 patterns slide 49 — APPLIED]
+
+
+## Phase B4 — ACL hygiene audit
+
+**Result:** PASS — all 9 direct callers are orthogonal pre-skips, not bypasses.
+
+`classify_protection()` at `src/engine/safety.rs:327` remains the SINGLE source of safety truth at the universal filter chokepoint and execute_actions safety layer. The 9 direct `is_protected_name()` callers serve a different purpose: per-site early-skip to avoid wasted work BEFORE candidate enters the action vector.
+
+| Site | Purpose | Verdict |
+|------|---------|---------|
+| daemon_skill_tick.rs:87 | skill_registry pre-skip protected target | orthogonal early-skip |
+| daemon_skill_tick.rs:160 | trial skill pre-skip | orthogonal |
+| cognitive_tick.rs:269 | cognitive bus pre-skip | orthogonal |
+| process_enrichment.rs:382 | governor decision pre-skip | orthogonal (Layer 1) |
+| process_enrichment.rs:394 | governor convert pre-skip | orthogonal |
+| main.rs:2239 | resource interrupt pre-skip | orthogonal |
+| daemon_turbo_manager.rs:80 | turbo deactivation guard | orthogonal |
+| daemon_thermal_freeze.rs:87,93 | thermal freeze guard | orthogonal |
+| daemon_paging_hints.rs:83 | paging hint pre-filter | orthogonal |
+
+NONE of these REPLACE classify_protection at the chokepoint. They are
+defense-in-depth pre-skips that shed work early. No refactor needed.
+
+[ACL Pattern — 1001 patterns slide 48 — VERIFIED]
