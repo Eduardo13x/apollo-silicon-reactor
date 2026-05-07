@@ -54,3 +54,42 @@ NONE of these REPLACE classify_protection at the chokepoint. They are
 defense-in-depth pre-skips that shed work early. No refactor needed.
 
 [ACL Pattern — 1001 patterns slide 48 — VERIFIED]
+
+
+## Phase B5 — Anti-pattern scan
+
+**Result:** PASS — no No-Timeout, no Retry-Storm, no Ignoring-Idempotency.
+
+### No-Timeout (recv()/lock()/wait() without timeout)
+
+3 sites use `while let Ok(...) = rx.recv()`:
+- `daemon_helpers.rs:458` — frozen_state writer thread
+- `blocked_action_journal.rs:153` — async audit appender
+- `execute_actions.rs:139` — execute_actions worker
+
+All are `while let Ok(...) = rx.recv()` loops that exit when the sender
+drops at shutdown — this is the IDIOMATIC Rust pattern for graceful
+worker thread teardown, NOT an unbounded wait. Sender-side bounded
+channels ensure backpressure.
+
+Mutex use throughout daemon: `lock_recover()` pattern (handles poisoning)
+or `try_lock()` for non-blocking probes. No raw `lock()` calls in hot
+path that could deadlock.
+
+condvar.wait_timeout used in main loop pacing — explicit timeout always
+present.
+
+### Retry-Storm (post-B2)
+
+N/A — no production retries found. See Phase B2 audit above.
+
+### Ignoring-Idempotency (post-A1+A2)
+
+CLOSED by Phase A1 + A2 — `pid_identity_still_valid()` helper at
+`main.rs:~140` (commit 984f565) mirrors `verify_pid_identity` exactly:
+start_sec match + start_usec match (when both nonzero) + name match
+(unconditional defense-in-depth). Used at both pre-emit (universal
+filter) and post-drain (action_queue exit) chokepoints.
+
+[Anti-patterns: No-Timeout / Retry-Storm / Ignoring-Idempotency —
+1001 patterns slides 56, 57, 59 — ALL N/A or CLOSED]
