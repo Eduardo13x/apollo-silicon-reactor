@@ -61,12 +61,34 @@ sprint extends that foundation.
 
 ### Phase B — 1001 Pattern Audit (4-5 commits)
 
-**B1 — Inbox pattern persistence**
+**B1 — Inbox pattern persistence (FAIL-EMPTY restore)**
 - `RecentlyApplied` is in-memory only; lost on daemon restart.
 - Persist last N entries to `/var/lib/apollo/recently_applied.jsonl`
   on graceful shutdown.
-- Restore on startup with TTL filter (drop entries > 30s old).
-- Prevents double-processing across restart.
+- Persist record format: `{ pid, kind, instant_ns_since_boot, wall_clock }`.
+
+**FAIL-EMPTY restore policy** (per peer-review consensus 2026-05-07):
+
+Because TTL is 30s and idempotency layer (Phase A) already prevents
+double-action, a stale cache after restart is more dangerous than
+starting fresh. Apply extreme conservatism:
+
+| Condition | Action |
+|-----------|--------|
+| File missing | Start empty (normal first boot) |
+| File parse error / malformed JSON | Start empty + DELETE corrupt file (no panic) |
+| Wall-clock delta write→read > 15s | Discard all entries (clock drift / long restart) |
+| Boot-time crossed (monotonic resets) | Discard all entries |
+| Per-entry wall-clock > 30s old | Drop that entry only |
+
+**Trade-off**: allow at most ONE redundant action per process in the
+first cycle after restart. Phase A idempotency layer + universal filter's
+`is_recent` check absorb it harmlessly. Better than a ghost-cache false
+positive starving a critical process of resources.
+
+**Why TTL is 30s and Inbox value is short-lived**: at 1-2s cycle time,
+30s = 15-30 cycles, which is enough to suppress steady-state cross-cycle
+dups but short enough that workload regime shifts get fresh evaluation.
 
 **B2 — Retry+jitter audit**
 - Search: `for _ in 0..N { ... }` retry loops without backoff.
