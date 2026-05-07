@@ -702,8 +702,21 @@ pub struct RuntimeMetrics {
     pub zombies_detected: u64,
     #[serde(default)]
     pub kills_applied: u64,
-    #[serde(default)]
-    pub survival_mode_activations: u64,
+    /// Cumulative number of times survival mode was *entered* this session.
+    /// Sticky counter — never decrements, even after recovery. Persists in
+    /// JSON under the legacy key `survival_mode_activations` for backward
+    /// compatibility (runtime_metrics.json, AIS rm_u lookups).
+    ///
+    /// **Do NOT use as a live state flag.** Today's value `> 0` only proves
+    /// the daemon entered survival mode at least once since boot. For the
+    /// current state, call
+    /// [`crate::engine::safety::survival_mode_active_total`] which evaluates
+    /// pressure + swap thresholds live.
+    ///
+    /// See `RuntimeMetrics::ever_entered_survival_mode` for the explicit
+    /// "did we ever?" predicate, and `CLAUDE.md` for the bug history.
+    #[serde(default, rename = "survival_mode_activations")]
+    pub survival_mode_entry_count: u64,
     pub qos_foreground_count: u64,
     pub qos_background_count: u64,
     pub qos_errors: u64,
@@ -1279,6 +1292,20 @@ pub struct RuntimeMetrics {
     pub ais_pareto_balanced: bool,
 }
 
+impl RuntimeMetrics {
+    /// True iff survival mode was entered at least once during this session.
+    ///
+    /// **Cumulative semantic** — once true, stays true until daemon restart,
+    /// even if the system long-since recovered to a healthy state. Use this
+    /// for "did we ever?" questions (AI scoring, post-mortem audits). For
+    /// "are we in survival now?" call
+    /// [`crate::engine::safety::survival_mode_active_total`] with live
+    /// pressure and swap inputs.
+    pub fn ever_entered_survival_mode(&self) -> bool {
+        self.survival_mode_entry_count > 0
+    }
+}
+
 /// Serializable foreground app info for the protocol/dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForegroundAppInfo {
@@ -1650,5 +1677,57 @@ mod tests {
             decision_reason: DecisionReason::PressureContext,
         };
         assert_eq!(a.identity_fields(), None);
+    }
+
+    // ── Sticky counter rename (Sprint 4 Fase 3) ─────────────────────────────
+
+    #[test]
+    fn survival_mode_entry_count_default_zero_and_helper_false() {
+        let m = RuntimeMetrics::default();
+        assert_eq!(m.survival_mode_entry_count, 0);
+        assert!(!m.ever_entered_survival_mode());
+    }
+
+    #[test]
+    fn ever_entered_survival_mode_true_after_one_entry() {
+        let mut m = RuntimeMetrics::default();
+        m.survival_mode_entry_count = 1;
+        assert!(m.ever_entered_survival_mode());
+        m.survival_mode_entry_count = 42;
+        assert!(m.ever_entered_survival_mode());
+    }
+
+    #[test]
+    fn round_trip_keeps_count_under_legacy_json_key() {
+        // End-to-end: serialize a RuntimeMetrics with the new field name,
+        // deserialize the resulting JSON back, count survives. This proves
+        // serde rename is bidirectional — runtime_metrics.json round trips
+        // without losing the survival counter.
+        let mut m = RuntimeMetrics::default();
+        m.survival_mode_entry_count = 7;
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"survival_mode_activations\":7"));
+        let parsed: RuntimeMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.survival_mode_entry_count, 7);
+        assert!(parsed.ever_entered_survival_mode());
+    }
+
+    #[test]
+    fn serializes_under_legacy_json_key_for_consumers() {
+        // Producer side: writers (runtime_metrics.json, ctl status JSON)
+        // emit the legacy key so existing tools (rm_u lookups in
+        // intelligence_score.rs, dashboards, external scripts) keep working.
+        let mut m = RuntimeMetrics::default();
+        m.survival_mode_entry_count = 5;
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            json.contains("\"survival_mode_activations\":5"),
+            "expected legacy key in serialization, got: {}",
+            json
+        );
+        assert!(
+            !json.contains("\"survival_mode_entry_count\":"),
+            "new field name leaked into JSON; will break rm_u callers"
+        );
     }
 }

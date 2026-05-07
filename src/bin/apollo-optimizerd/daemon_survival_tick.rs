@@ -7,7 +7,7 @@
 //! - Detect survival mode (pressure >0.85 / swap thrashing / p_oom escalation)
 //! - Record overflow into OverflowGuard + hazard model when real overflow detected
 //! - Track swap growth streak for RL meta-gate
-//! - Increment survival_mode_activations, demote Chromium renderers, last-resort purge
+//! - Increment survival_mode_entry_count, demote Chromium renderers, last-resort purge
 //! - overflow_guard.tick_decay each cycle (calm relaxation)
 //!
 //! ## Ordering invariant
@@ -35,7 +35,7 @@ use apollo_optimizer::engine::signal_intelligence::SignalDigest;
 /// - `signal_intel` — lctx.signal_intel (hazard model training)
 /// - `learnable_params` — RL pressure/compressor bands
 /// - `swap_growth_streak` — mutable swap-growth counter for RL meta-gate
-/// - `state` — SharedState (survival_mode_activations metric)
+/// - `state` — SharedState (survival_mode_entry_count metric)
 /// - `chromium_mgr` — demote renderers in survival mode
 /// - `last_purge_at` — rate-limit guard for `purge` command (once per 10 min)
 #[allow(clippy::too_many_arguments)]
@@ -112,7 +112,7 @@ pub fn run_survival_tick(
         snapshot.pressure.swap_total_bytes,
     );
     if survival_active {
-        state.metrics.lock_recover().metrics.survival_mode_activations += 1;
+        state.metrics.lock_recover().metrics.survival_mode_entry_count += 1;
 
         // Jetsam demotion: mark non-foreground Chromium renderers as BACKGROUND
         // so the kernel kills them first under OOM — softer than SIGSTOP.
