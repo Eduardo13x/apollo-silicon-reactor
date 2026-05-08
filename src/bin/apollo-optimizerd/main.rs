@@ -96,6 +96,9 @@ use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
 use apollo_optimizer::engine::learned_state::{
     LearnableParams, LearnedState, RestoreQualityMonitor,
 };
+use apollo_optimizer::engine::action_accumulator::{
+    ActionAccumulator, ActionPhase, EmitContext,
+};
 use apollo_optimizer::engine::audit_types::DecisionReason;
 use apollo_optimizer::engine::llm::{
     feedback_path_root, load_repo_config, pending_trial_path,
@@ -3099,7 +3102,16 @@ fn main() -> anyhow::Result<()> {
                 // cross-cycle dedup. Single chokepoint here filters ALL of them
                 // against the recently_applied cache. [Saltzer & Schroeder 1975]
                 // Economy of Mechanism — single filter beats per-site fixes.
-                let mut actions: Vec<RootAction> = {
+                //
+                // Sprint 4 Fase 5 (2026-05-07): the raw `Vec<RootAction>` accumulator
+                // is now wrapped in `ActionAccumulator`, a typed builder that:
+                //  - validates shape on `push_*` methods,
+                //  - emits per-variant counters + tracing on every push,
+                //  - exposes `view()` for read-only peeks (heuristic_pass et al),
+                //  - has a single terminal exit `finalize()` (`#[must_use]`).
+                // The dedup chokepoint and learned-policy filter still run BEFORE
+                // the accumulator (semantics-preserving — no reorder).
+                let initial_filtered: Vec<RootAction> = {
                     let raw = decision.actions;
                     let mut filtered = Vec::with_capacity(raw.len());
                     for action in raw {
@@ -3115,10 +3127,20 @@ fn main() -> anyhow::Result<()> {
                     }
                     filtered
                 };
-                {
+                let initial_filtered = {
                     let policy = state.policy.lock_recover().learned_policy.clone();
-                    actions = llm_daemon::apply_learned_policy_actions(&snapshot, &policy, actions);
-                }
+                    llm_daemon::apply_learned_policy_actions(&snapshot, &policy, initial_filtered)
+                };
+                let mut acc = ActionAccumulator::with_capacity(initial_filtered.len() + 16);
+                acc.extend_raw(
+                    initial_filtered,
+                    EmitContext::new(
+                        ActionPhase::Decide,
+                        "main.rs::3102 decide+learned_policy",
+                        "decide_actions+learned_policy",
+                    ),
+                    &lf_metrics,
+                );
 
                 // Apply learned skills + trial induced skills.
                 // Extracted to daemon_skill_tick::run_skill_tick (Wave 16).
@@ -3132,10 +3154,18 @@ fn main() -> anyhow::Result<()> {
                         foreground_pid,
                         workload_mode.as_str(),
                         is_root,
-                        &actions,
+                        acc.view(),
                         &mut pending_trial_skill,
                     );
-                    actions.extend(skill_new);
+                    acc.extend_raw(
+                        skill_new,
+                        EmitContext::new(
+                            ActionPhase::SkillTick,
+                            "main.rs::3138 skill_tick",
+                            "learned_skills+trial",
+                        ),
+                        &lf_metrics,
+                    );
                 }
 
                 // Coordinated cluster freezing + Spotlight pressure gate.
@@ -3144,12 +3174,20 @@ fn main() -> anyhow::Result<()> {
                     let causal_pairs = lctx.outcome_tracker.top_causal_pairs(5);
                     let cluster_out = daemon_cluster_actions::run_cluster_actions(
                         &causal_pairs,
-                        &actions,
+                        acc.view(),
                         &collector,
                         snapshot.pressure.memory_pressure,
                         overflow_thresholds.bg_pressure,
                     );
-                    actions.extend(cluster_out.new_actions);
+                    acc.extend_raw(
+                        cluster_out.new_actions,
+                        EmitContext::new(
+                            ActionPhase::ClusterActions,
+                            "main.rs::3152 cluster_actions",
+                            "coordinated_freeze+spotlight",
+                        ),
+                        &lf_metrics,
+                    );
                 }
 
                 // Predictive agent: inject soft actions for PreThrottleNoise / ProactivePurge.
@@ -3161,7 +3199,15 @@ fn main() -> anyhow::Result<()> {
                         &state,
                         &decide_interactive,
                     );
-                    actions.extend(agent_new);
+                    acc.extend_raw(
+                        agent_new,
+                        EmitContext::new(
+                            ActionPhase::AgentActions,
+                            "main.rs::3164 agent_actions",
+                            "predictive_agent",
+                        ),
+                        &lf_metrics,
+                    );
                 }
 
                 // Direct pressure hints + G20 ODE velocity hints.
@@ -3174,11 +3220,19 @@ fn main() -> anyhow::Result<()> {
                         signal_digest.pressure_smooth,
                         reclaim_forecast.net_rate_bps,
                         foreground_app.as_deref(),
-                        &actions,
+                        acc.view(),
                         memory_budget.recovering_from_critical(),
                         &mut recently_applied,
                     );
-                    actions.extend(hint_new);
+                    acc.extend_raw(
+                        hint_new,
+                        EmitContext::new(
+                            ActionPhase::PagingHints,
+                            "main.rs::3181 paging_hints",
+                            "pressure+ode_velocity",
+                        ),
+                        &lf_metrics,
+                    );
                 }
 
                 // ── Heuristic pass: AdaptiveGovernor + protection scoring ────────────
@@ -3198,7 +3252,7 @@ fn main() -> anyhow::Result<()> {
                     &unfreeze_decay,
                     &reclaim_forecast,
                     &collector,
-                    &actions,
+                    acc.view(),
                     &lctx.outcome_tracker.experience,
                     learnable_params.experience_pressure_band,
                     snapshot.pressure.memory_pressure,
@@ -3207,7 +3261,15 @@ fn main() -> anyhow::Result<()> {
                 let heuristic_decisions = heuristic_pass.heuristic_decisions;
                 let heuristic_critical_pids = heuristic_pass.heuristic_critical_pids;
                 let heuristic_stats = heuristic_pass.heuristic_stats;
-                actions.extend(heuristic_pass.additional_actions);
+                acc.extend_raw(
+                    heuristic_pass.additional_actions,
+                    EmitContext::new(
+                        ActionPhase::Heuristic,
+                        "main.rs::3210 heuristic_pass",
+                        "adaptive_governor+protection",
+                    ),
+                    &lf_metrics,
+                );
 
                 // Cable: stale_apps() → nominate stale background apps as freeze candidates.
                 // Extracted to daemon_stale_apps::run_stale_app_freeze (Wave 21).
@@ -3219,9 +3281,17 @@ fn main() -> anyhow::Result<()> {
                         &collector,
                         foreground_pid,
                         &heuristic_critical_pids,
-                        &actions,
+                        acc.view(),
                     );
-                    actions.extend(stale_new);
+                    acc.extend_raw(
+                        stale_new,
+                        EmitContext::new(
+                            ActionPhase::StaleApps,
+                            "main.rs::3224 stale_apps",
+                            "background_freeze",
+                        ),
+                        &lf_metrics,
+                    );
                 }
 
                 // Survival mode: overflow recording, swap streak, purge, threshold decay.
@@ -3299,7 +3369,7 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     let (ss, su) = pid_start_time(target.pid);
-                    actions.push(RootAction::freeze_full(
+                    acc.push_freeze(
                         target.pid,
                         target.name.clone(),
                         format!(
@@ -3308,10 +3378,16 @@ fn main() -> anyhow::Result<()> {
                             target.rss_bytes / 1024 / 1024,
                             target.recovery_attempts,
                         ),
+                        DecisionReason::PressureContext,
                         ss,
                         su,
-                        DecisionReason::PressureContext,
-                    ));
+                        EmitContext::new(
+                            ActionPhase::Survival,
+                            "main.rs::3302 proc_recovery_freeze",
+                            "memory_leak_recovery",
+                        ),
+                        &lf_metrics,
+                    );
                     proc_recovery.record_kill_attempt(target.pid);
                 }
 
@@ -3443,7 +3519,19 @@ fn main() -> anyhow::Result<()> {
                     on_battery: power_mgr.is_on_battery(),
                     is_root,
                 });
-                actions.extend(sysctl_actions);
+                // sysctl_governor.tick() returns sealed `SetSysctlAction` values
+                // already constructed via the clamping factory (Fase 4 seal). They
+                // are validated; we go through `push_raw` to record the emit
+                // context and wire the per-variant counter without re-clamping.
+                acc.extend_raw(
+                    sysctl_actions,
+                    EmitContext::new(
+                        ActionPhase::SysctlGovernor,
+                        "main.rs::3446 sysctl_governor.tick",
+                        "reactive_tcp+memory",
+                    ),
+                    &lf_metrics,
+                );
 
                 // NetworkOptimizer: profile-driven TCP tuning complements sysctl_governor.
                 // Select network profile based on optimization profile + battery state.
@@ -3464,12 +3552,23 @@ fn main() -> anyhow::Result<()> {
                         // via `sysctl_limits::clamp_to_allowed_range`. The
                         // inline pre-clamp that fixed Bug 6 (commit 0a8c319) is
                         // now redundant — it's enforced at the type level.
-                        actions.push(RootAction::set_sysctl(
+                        //
+                        // Sprint 4 Phase 5 (2026-05-07): typed accumulator emit.
+                        // `push_set_sysctl_clamped` wraps the Fase 4 sealed
+                        // factory and emits a per-variant counter +
+                        // structured tracing event with full EmitContext.
+                        acc.push_set_sysctl_clamped(
                             key,
                             value,
                             format!("network-optimizer: {:?} profile", net_profile),
                             DecisionReason::PressureContext,
-                        ));
+                            EmitContext::new(
+                                ActionPhase::NetworkOptimizer,
+                                "main.rs::3461 network_optimizer",
+                                "profile_tcp_tune",
+                            ),
+                            &lf_metrics,
+                        );
                     }
                 }
 
@@ -3511,6 +3610,21 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         sysctl_governor.mark_reverted();
                     }
+                }
+
+                // Sprint 4 Fase 5 — terminal exit of the typed accumulator.
+                // Per-variant + raw + rejected_shape counters were already
+                // published into `lf_metrics` per push; we read the local
+                // telemetry here for cycle-level audit logging when verbose.
+                let acc_telemetry = acc.telemetry();
+                let mut actions: Vec<RootAction> = acc.finalize();
+                if acc_telemetry.rejected_shape > 0 {
+                    tracing::warn!(
+                        target: "apollo.accumulator",
+                        rejected = acc_telemetry.rejected_shape,
+                        total_pushed = acc_telemetry.total_pushed,
+                        "ActionAccumulator finalize: shape-rejected pushes this cycle"
+                    );
                 }
 
                 // F3 + F4 — Safety Precedence + Thermal Master Switch.

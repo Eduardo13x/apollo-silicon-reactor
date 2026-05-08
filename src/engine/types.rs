@@ -971,6 +971,34 @@ pub struct RuntimeMetrics {
     pub identity_cache_exit_invalidations: u64,
     #[serde(default)]
     pub identity_proc_pidpath_calls: u64,
+    /// ActionAccumulator telemetry (Sprint 4 Fase 5 — flushed from lf_metrics).
+    /// Per-variant push counters published from `ActionAccumulator::telemetry()`
+    /// at finalize time. Counters are cumulative across all daemon cycles.
+    /// Invariant: Σ(typed per-variant) + actions_pushed_raw_total ==
+    /// total emitted into the dispatcher (push_raw is the escape-hatch path
+    /// and does NOT increment any per-variant total).
+    #[serde(default)]
+    pub actions_pushed_throttle_total: u64,
+    #[serde(default)]
+    pub actions_pushed_freeze_total: u64,
+    #[serde(default)]
+    pub actions_pushed_unfreeze_total: u64,
+    #[serde(default)]
+    pub actions_pushed_boost_total: u64,
+    #[serde(default)]
+    pub actions_pushed_set_memorystatus_total: u64,
+    #[serde(default)]
+    pub actions_pushed_set_thread_qos_total: u64,
+    #[serde(default)]
+    pub actions_pushed_set_sysctl_total: u64,
+    #[serde(default)]
+    pub actions_pushed_toggle_spotlight_total: u64,
+    #[serde(default)]
+    pub actions_pushed_quarantine_daemon_total: u64,
+    #[serde(default)]
+    pub actions_pushed_raw_total: u64,
+    #[serde(default)]
+    pub actions_rejected_shape_total: u64,
     /// Lotka-Volterra Jacobian stability class: 0=Degenerate 1=StableNode 2=StableSpiral 3=UnstableSaddle 4=Unstable
     #[serde(default)]
     pub si_stability_regime: u8,

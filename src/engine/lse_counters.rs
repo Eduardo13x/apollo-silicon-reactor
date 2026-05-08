@@ -75,6 +75,42 @@ pub struct LockFreeMetrics {
     pub identity_cache_ttl_expired: AtomicU64,
     pub identity_cache_exit_invalidations: AtomicU64,
     pub identity_proc_pidpath_calls: AtomicU64,
+
+    /// ActionAccumulator telemetry (Sprint 4 Fase 5 — typed action builder).
+    /// Per-variant push counters published from `ActionAccumulator::telemetry()`
+    /// at finalize time. Counters are cumulative across all daemon cycles.
+    ///
+    /// `actions_rejected_shape_total` increments when a typed `push_*` rejects
+    /// an action because of malformed shape (pid=0, empty name, empty sysctl
+    /// key) — these rejections leave evidence (warn-level tracing event +
+    /// counter increment) without ever reaching the dispatcher.
+    ///
+    /// `actions_pushed_raw_total` increments on `push_raw` / `extend_raw`
+    /// (escape hatch for revert/confirmed/decide_actions paths). Per-variant
+    /// counters (`actions_pushed_freeze_total`, etc.) increment ONLY for
+    /// typed `push_*` methods — raw pushes do NOT bump the per-variant
+    /// counter. The invariant
+    ///
+    ///     Σ(typed per-variant) + actions_pushed_raw_total == total_pushed
+    ///
+    /// holds. Dashboards compute "% bypassing typed shape validation" as
+    /// `actions_pushed_raw_total / total_pushed`.
+    ///
+    /// FOLLOW-UP (not in Fase 5): a `drop_ratio_5min` windowed alarm that
+    /// fires when rejected_shape / total_pushed exceeds a threshold over a
+    /// rolling window. Needs windowed-counter infrastructure that doesn't
+    /// exist yet; these absolute counters are the foundation it would build on.
+    pub actions_pushed_throttle_total: AtomicU64,
+    pub actions_pushed_freeze_total: AtomicU64,
+    pub actions_pushed_unfreeze_total: AtomicU64,
+    pub actions_pushed_boost_total: AtomicU64,
+    pub actions_pushed_set_memorystatus_total: AtomicU64,
+    pub actions_pushed_set_thread_qos_total: AtomicU64,
+    pub actions_pushed_set_sysctl_total: AtomicU64,
+    pub actions_pushed_toggle_spotlight_total: AtomicU64,
+    pub actions_pushed_quarantine_daemon_total: AtomicU64,
+    pub actions_pushed_raw_total: AtomicU64,
+    pub actions_rejected_shape_total: AtomicU64,
 }
 
 impl LockFreeMetrics {
@@ -116,6 +152,17 @@ impl LockFreeMetrics {
             identity_cache_ttl_expired: AtomicU64::new(0),
             identity_cache_exit_invalidations: AtomicU64::new(0),
             identity_proc_pidpath_calls: AtomicU64::new(0),
+            actions_pushed_throttle_total: AtomicU64::new(0),
+            actions_pushed_freeze_total: AtomicU64::new(0),
+            actions_pushed_unfreeze_total: AtomicU64::new(0),
+            actions_pushed_boost_total: AtomicU64::new(0),
+            actions_pushed_set_memorystatus_total: AtomicU64::new(0),
+            actions_pushed_set_thread_qos_total: AtomicU64::new(0),
+            actions_pushed_set_sysctl_total: AtomicU64::new(0),
+            actions_pushed_toggle_spotlight_total: AtomicU64::new(0),
+            actions_pushed_quarantine_daemon_total: AtomicU64::new(0),
+            actions_pushed_raw_total: AtomicU64::new(0),
+            actions_rejected_shape_total: AtomicU64::new(0),
         }
     }
 
@@ -272,6 +319,17 @@ impl LockFreeMetrics {
             identity_cache_ttl_expired: self.identity_cache_ttl_expired.load(Ordering::Relaxed),
             identity_cache_exit_invalidations: self.identity_cache_exit_invalidations.load(Ordering::Relaxed),
             identity_proc_pidpath_calls: self.identity_proc_pidpath_calls.load(Ordering::Relaxed),
+            actions_pushed_throttle_total: self.actions_pushed_throttle_total.load(Ordering::Relaxed),
+            actions_pushed_freeze_total: self.actions_pushed_freeze_total.load(Ordering::Relaxed),
+            actions_pushed_unfreeze_total: self.actions_pushed_unfreeze_total.load(Ordering::Relaxed),
+            actions_pushed_boost_total: self.actions_pushed_boost_total.load(Ordering::Relaxed),
+            actions_pushed_set_memorystatus_total: self.actions_pushed_set_memorystatus_total.load(Ordering::Relaxed),
+            actions_pushed_set_thread_qos_total: self.actions_pushed_set_thread_qos_total.load(Ordering::Relaxed),
+            actions_pushed_set_sysctl_total: self.actions_pushed_set_sysctl_total.load(Ordering::Relaxed),
+            actions_pushed_toggle_spotlight_total: self.actions_pushed_toggle_spotlight_total.load(Ordering::Relaxed),
+            actions_pushed_quarantine_daemon_total: self.actions_pushed_quarantine_daemon_total.load(Ordering::Relaxed),
+            actions_pushed_raw_total: self.actions_pushed_raw_total.load(Ordering::Relaxed),
+            actions_rejected_shape_total: self.actions_rejected_shape_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -318,6 +376,17 @@ pub struct MetricsSnapshot {
     pub identity_cache_ttl_expired: u64,
     pub identity_cache_exit_invalidations: u64,
     pub identity_proc_pidpath_calls: u64,
+    pub actions_pushed_throttle_total: u64,
+    pub actions_pushed_freeze_total: u64,
+    pub actions_pushed_unfreeze_total: u64,
+    pub actions_pushed_boost_total: u64,
+    pub actions_pushed_set_memorystatus_total: u64,
+    pub actions_pushed_set_thread_qos_total: u64,
+    pub actions_pushed_set_sysctl_total: u64,
+    pub actions_pushed_toggle_spotlight_total: u64,
+    pub actions_pushed_quarantine_daemon_total: u64,
+    pub actions_pushed_raw_total: u64,
+    pub actions_rejected_shape_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

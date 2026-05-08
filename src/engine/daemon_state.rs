@@ -78,6 +78,20 @@ impl MetricsState {
         self.metrics.identity_cache_ttl_expired = lf.identity_cache_ttl_expired;
         self.metrics.identity_cache_exit_invalidations = lf.identity_cache_exit_invalidations;
         self.metrics.identity_proc_pidpath_calls = lf.identity_proc_pidpath_calls;
+        // Sprint 4 Phase 5 — flush actions_pushed_* counters from lf to runtime metrics.
+        // Invariant: Σ(typed per-variant) + actions_pushed_raw_total ==
+        // total emitted (push_raw does not double-count per-variant).
+        self.metrics.actions_pushed_throttle_total = lf.actions_pushed_throttle_total;
+        self.metrics.actions_pushed_freeze_total = lf.actions_pushed_freeze_total;
+        self.metrics.actions_pushed_unfreeze_total = lf.actions_pushed_unfreeze_total;
+        self.metrics.actions_pushed_boost_total = lf.actions_pushed_boost_total;
+        self.metrics.actions_pushed_set_memorystatus_total = lf.actions_pushed_set_memorystatus_total;
+        self.metrics.actions_pushed_set_thread_qos_total = lf.actions_pushed_set_thread_qos_total;
+        self.metrics.actions_pushed_set_sysctl_total = lf.actions_pushed_set_sysctl_total;
+        self.metrics.actions_pushed_toggle_spotlight_total = lf.actions_pushed_toggle_spotlight_total;
+        self.metrics.actions_pushed_quarantine_daemon_total = lf.actions_pushed_quarantine_daemon_total;
+        self.metrics.actions_pushed_raw_total = lf.actions_pushed_raw_total;
+        self.metrics.actions_rejected_shape_total = lf.actions_rejected_shape_total;
         self.metrics.memory_budget_duration_ms = lf.memory_budget_duration_us as f64 / 1000.0;
         self.metrics.reactor_duration_ms = lf.reactor_duration_us as f64 / 1000.0;
         

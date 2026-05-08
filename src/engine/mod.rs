@@ -1,3 +1,4 @@
+pub mod action_accumulator;
 pub mod action_policy;
 pub mod action_queue;
 pub mod activity_sensor;
