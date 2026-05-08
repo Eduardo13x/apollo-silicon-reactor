@@ -5,7 +5,10 @@ use std::path::Path;
 use crate::engine::types::{HardPath, JournalEntry};
 
 /// Maximum journal size before rotation (10 MB).
-const MAX_JOURNAL_BYTES: u64 = 10 * 1024 * 1024;
+// Tightened 2026-05-08 from 10 MB after macOS Resource Coalition flagged
+// the daemon for sustained-write rate >4x the 99 KB/s limit. Smaller cap +
+// faster rotation = less SSD page churn + bounded disk usage at ~4 MB total.
+const MAX_JOURNAL_BYTES: u64 = 2 * 1024 * 1024;
 
 pub fn append_journal(path: &Path, entry: &JournalEntry) -> anyhow::Result<()> {
     append_journal_batch(path, std::slice::from_ref(entry))

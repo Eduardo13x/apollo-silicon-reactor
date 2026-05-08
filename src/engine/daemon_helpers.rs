@@ -344,9 +344,12 @@ pub fn remove_crash_sentinel() {
 pub fn audit_log(entry: &serde_json::Value) {
     use std::fs::OpenOptions;
     let path = audit_log_path();
-    // Rotate at 5MB to avoid unbounded growth.
+    // Rotate at 2MB (tightened 2026-05-08 from 5MB after macOS flagged the
+    // daemon for excessive sustained-write rate). Caps disk usage at ~4MB
+    // (live + .1) and shortens rotation cadence so old policy decisions
+    // roll off SSD pages sooner.
     if let Ok(meta) = fs::metadata(path) {
-        if meta.len() > 5 * 1024 * 1024 {
+        if meta.len() > 2 * 1024 * 1024 {
             let rotated = format!("{}.1", path);
             let _ = fs::remove_file(&rotated);
             let _ = fs::rename(path, &rotated);

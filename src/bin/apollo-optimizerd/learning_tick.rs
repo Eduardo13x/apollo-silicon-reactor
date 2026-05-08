@@ -232,12 +232,27 @@ pub fn run_learning_tick<'a>(
     }
 
     // ── Policy Decision Audit (Observability Phase 2) ────────────────────────
-    // Emit full traces for every intended action, including success/block outcome.
+    // Emit traces for every intended action, including success/block outcome.
     // Asynchronous I/O via apollo-shadow-writer.
+    //
+    // I/O reduction (2026-05-08): skip silent SetSysctl rejections.
+    // SetSysctl no-ops and read-failures use push_skip without a block_reason
+    // and the same information already lands in journal.jsonl. Without this
+    // filter, ~45% of audit traces in a typical hour are duplicate sysctl
+    // noise — pushing the daemon's sustained write rate past macOS's
+    // resource-coalition limit (~99 KB/s) and triggering disk-write
+    // microstackshots / I/O QoS throttling system-wide.
     {
         use apollo_optimizer::engine::daemon_helpers::policy_audit_path;
+        use apollo_optimizer::engine::types::RootAction;
         let audit_path = std::path::PathBuf::from(policy_audit_path());
         for trace in &exec_outcomes.audit_traces {
+            let is_silent_sysctl_skip = !trace.applied
+                && trace.block_reason.is_none()
+                && matches!(trace.intended_action, RootAction::SetSysctl(_));
+            if is_silent_sysctl_skip {
+                continue;
+            }
             let mut final_trace = trace.clone();
             final_trace.cycle = cycle_count;
             emit_audit_async(audit_path.clone(), &final_trace);

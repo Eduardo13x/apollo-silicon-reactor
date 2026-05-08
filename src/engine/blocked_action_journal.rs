@@ -116,8 +116,12 @@ pub fn emit(path: &Path, event: &BlockedActionEvent) -> io::Result<()> {
     writeln!(f, "{}", line)
 }
 
-/// Max shadow journal size before rotation (10 MB — same policy as journal.rs).
-const MAX_SHADOW_BYTES: u64 = 10 * 1024 * 1024;
+/// Max shadow journal size before rotation. Tightened to 2 MB on 2026-05-08
+/// after macOS Resource Coalition flagged the daemon for 4.5x sustained-write
+/// rate (~447 KB/s vs 99 KB/s limit). Bounds disk usage at ~4 MB total
+/// (live + .1 rotation) and forces a faster rotate cadence so old shadow
+/// disagreements roll off SSD pages sooner.
+const MAX_SHADOW_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Rotate the shadow journal once per call if it exceeds the size cap.
 /// Non-atomic by design: the writer thread owns it, so there's no concurrent
