@@ -1,17 +1,9 @@
-// The CLI binary compiles its own copy of `collector` and `engine` because
-// `apollo-optimizer` predates the library split. The daemon (`apollo-optimizerd`)
-// and client (`apollo-optimizerctl`) consume the same code via the `apollo_optimizer`
-// lib crate, so the CLI binary only exercises a narrow subset — most items here
-// look dead from main.rs's perspective. Suppressing dead_code at the binary
-// crate root keeps the warnings clean without duplicating the gate on every
-// lib item. Removing this requires routing the CLI through the lib crate.
+// The CLI binary routes through the apollo_optimizer lib crate (facade over
+// apollo_engine) so collector and engine code is not duplicated here.
 #![allow(dead_code)]
 
-mod collector;
-mod engine;
-
+use apollo_optimizer::collector::SystemCollector;
 use clap::{Parser, Subcommand};
-use collector::SystemCollector;
 use std::fs::File;
 use std::io::Write;
 

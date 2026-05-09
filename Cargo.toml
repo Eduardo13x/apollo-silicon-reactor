@@ -37,6 +37,7 @@ path = "src/lib.rs"
 [dependencies]
 # default includes multithread (rayon) — disable it: rayon coordination overhead
 # exceeds benefit for ~400 process refresh on M1 (measured: 110/4049 samples).
+apollo-engine = { path = "crates/apollo-engine" }
 sysinfo = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -54,7 +55,6 @@ tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
 tempfile.workspace = true
 
 [build-dependencies]
-cc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon.workspace = true

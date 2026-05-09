@@ -17,3 +17,9 @@ toml.workspace = true
 ureq = { workspace = true, features = ["json"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[build-dependencies]
+cc = { workspace = true }

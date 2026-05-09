@@ -1,6 +1,18 @@
-pub mod collector;
+//! apollo-optimizer — facade crate for binaries and integration tests.
+//!
+//! TEMPORARY (Commit 2 only): the `engine` module here is a re-export
+//! of `apollo_engine::engine` so existing `crate::engine::*` paths in
+//! src/bin/ keep compiling during the move. Commit 3 removes this
+//! shim and bins migrate to `apollo_engine::engine::*`.
+
+pub mod collector {
+    pub use apollo_engine::collector::*;
+}
 pub mod dashboard;
-pub mod engine;
+
+pub mod engine {
+    pub use apollo_engine::engine::*;
+}
 
 /// Convenient re-exports of the types most commonly needed by consumers
 /// of this crate (`apollo-optimizerctl`, `apollo-menubar`, integration tests).

@@ -9,7 +9,7 @@ fn main() {
 
         // ── IOReport bridge ──────────────────────────────────────────────
         cc::Build::new()
-            .file("src/engine_c/ioreport_bridge.c")
+            .file("native/ioreport_bridge.c")
             // Objective-C blocks runtime (required by IOReportIterate callback).
             // On macOS/Clang, -fblocks is supported natively; libSystem.dylib
             // provides the blocks runtime, so no extra -lBlocksRuntime needed.
@@ -29,11 +29,11 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
 
         // Re-run if the bridge C file changes.
-        println!("cargo:rerun-if-changed=src/engine_c/ioreport_bridge.c");
+        println!("cargo:rerun-if-changed=native/ioreport_bridge.c");
 
         // ── SMC bridge ───────────────────────────────────────────────────
         cc::Build::new()
-            .file("src/engine_c/smc_bridge.c")
+            .file("native/smc_bridge.c")
             .flag("-O2")
             .flag("-isysroot")
             .flag(&sdk_path)
@@ -42,6 +42,6 @@ fn main() {
         // IOKit is already linked by ioreport_bridge (framework = IOKit).
         // Adding it here is harmless (linker deduplicates).
         println!("cargo:rustc-link-lib=framework=IOKit");
-        println!("cargo:rerun-if-changed=src/engine_c/smc_bridge.c");
+        println!("cargo:rerun-if-changed=native/smc_bridge.c");
     }
 }
