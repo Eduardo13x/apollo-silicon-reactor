@@ -24,7 +24,7 @@ This is a prerequisite for Sprint 5 Mes 1-3 (constraints.rs, NARS user-feedback 
 
 ```
 system-optimizer/                 (workspace root)
-├── Cargo.toml                    [workspace + package for bins, no root lib]
+├── Cargo.toml                    [workspace + package for bins + facade lib]
 ├── Cargo.lock                    (single, shared across workspace)
 ├── crates/
 │   └── apollo-engine/
@@ -44,6 +44,7 @@ system-optimizer/                 (workspace root)
 │           ├── level3_golden_action_accumulator.rs
 │           └── level3_telemetry_sync.rs
 ├── src/
+│   ├── lib.rs                    (facade ONLY: pub use apollo_engine::*)
 │   └── bin/
 │       ├── apollo-optimizer/     (cli, optional move from src/main.rs)
 │       │   └── main.rs
@@ -92,6 +93,27 @@ system-optimizer/                 (workspace root)
 - UI/CLI/ASCII-formatting concerns stay with their binary consumer
 - Future-proof: if engine ever published, no UI baggage
 
+### Why root keeps a facade `lib.rs`
+
+NotebookLM peer-review (2026-05-09) flagged a CRITICAL issue: Cargo integration tests in root `tests/` cannot import types from a binary-only crate. Without `[lib]` in root, `level1_unit.rs` and `level2_integration.rs` would fail to compile because they currently do `use apollo_optimizer::engine::...`.
+
+Solution: keep a **facade lib only** in root, no logic:
+
+```rust
+// src/lib.rs (root, post-split)
+//! apollo-optimizer facade — re-exports apollo-engine for binary
+//! consumers and integration tests. NO original logic lives here.
+//! Engine internals are owned by `apollo-engine`.
+pub use apollo_engine::*;
+```
+
+Discipline:
+- Facade NEVER hosts new modules. If you're tempted to add code here, it goes in `apollo-engine` or a bin.
+- Old `apollo_optimizer::engine::...` paths in tests resolve via this re-export. Fewer tests need rewriting.
+- Bin crates use `apollo_engine::*` directly (cleaner, no facade hop) — facade is for tests + backward compat only.
+
+This keeps the workspace honest (no monolith disguised) while letting the existing test suite compile without a `tests/` rewrite Sprint of its own.
+
 ## Migration plan (5 commits + boundary-leak rule)
 
 ### Commit 1: Workspace skeleton
@@ -103,26 +125,46 @@ members = ["crates/apollo-engine", "."]
 resolver = "2"
 
 [workspace.dependencies]
-sysinfo = { version = "0.30", default-features = false, features = ["serde"] }
-serde = { version = "1.0", features = ["derive"] }
+# Pin VERSIONS only here. Crates declare their own features explicitly to
+# prevent feature unification leak (e.g. UI crate enabling Rayon-via-sysinfo
+# unintentionally activating it in apollo-engine hot path).
+sysinfo = { version = "0.30", default-features = false }
+serde = "1.0"
 serde_json = "1.0"
-clap = { version = "4.4", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
+clap = "4.4"
+chrono = "0.4"
 anyhow = "1.0"
 libc = "0.2"
-ctrlc = { version = "3.4", features = ["termination"] }
+ctrlc = "3.4"
 toml = "0.8"
-ureq = { version = "2.12", features = ["json"] }
+ureq = "2.12"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-subscriber = "0.3"
 tempfile = "3"
 
 [package]
 name = "apollo-optimizer"
 version = "1.0.0"
 edition = "2021"
-# NO [lib] section — root is bins only
+
+[lib]
+path = "src/lib.rs"   # facade ONLY (re-exports apollo-engine)
 ```
+
+Per-crate `[dependencies]` declares features explicitly:
+```toml
+# crates/apollo-engine/Cargo.toml
+[dependencies]
+sysinfo = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+chrono = { workspace = true, features = ["serde"] }
+ctrlc = { workspace = true, features = ["termination"] }
+ureq = { workspace = true, features = ["json"] }
+tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
+# Other deps inherit version from workspace, no extra features
+```
+
+This pattern prevents feature unification across workspace members. The CLAUDE.md hot-path invariant ("Rayon disabled — coordination overhead exceeds benefit on M1, measured: 110/4049 samples") stays enforced.
 
 `crates/apollo-engine/Cargo.toml` — empty stub:
 ```toml
@@ -169,18 +211,34 @@ Root `lib.rs` may temporarily keep `pub mod engine` re-export shim for ONE COMMI
 
 **State after Commit 2**: engine code physically in apollo-engine. Shim allowed to keep root buildable.
 
-### Commit 3: Mechanical import migration (NO shim)
+### Commit 3: Mechanical import migration + compiler-driven cleanup (NO shim)
 
-Mass sed across all bins + tests:
+NotebookLM peer-review flagged sed-alone is insufficient because:
+1. `super::` paths inside engine modules break when files move to a new crate
+2. `pub(crate)` declarations re-scope to apollo-engine; bins lose access
+3. Some imports are nested in macros / `cfg!` blocks that sed misses
+
+Approach: **sed primary + compiler-driven repair**.
+
+Step 3a — bulk sed:
 ```bash
 find src/bin tests -name "*.rs" -exec sed -i '' \
   -e 's|crate::engine::|apollo_engine::engine::|g' \
   -e 's|apollo_optimizer::engine::|apollo_engine::engine::|g' {} +
 ```
 
-Remove `pub mod engine;` shim from root crate.
+Step 3b — replace the root `pub mod engine` shim added in Commit 2 with the facade re-export `pub use apollo_engine::*;`. Tests using the legacy `apollo_optimizer::engine::...` path resolve through the facade.
 
-`cargo check --workspace` MUST pass with NO shim. Compiler-driven cleanup of `pub(crate)` → `pub` only where binaries explicitly demand access.
+Step 3c — compiler-driven repair loop:
+```
+while ! cargo check --workspace; do
+  # fix one error, commit progress as needed
+done
+```
+Common fixes:
+- `super::foo` paths inside engine modules: rewrite as `crate::engine::foo` (relative to apollo-engine crate root, not the old root crate)
+- `pub(crate)` items used by bins: promote to `pub` ONLY with explicit comment justifying why bin needs cross-crate access (no blanket promotion)
+- Macro-internal paths: handle case-by-case, never silently `use ... as ...`
 
 **Boundary-leak rule** (CRITICAL):
 
@@ -192,15 +250,24 @@ If circular dependency surfaces (root → apollo-engine → root):
 - Document in this spec under "Discovered boundary leaks"
 - Continue split — circular deps are valuable signal for future architectural cleanup
 
-**State after Commit 3**: `apollo_engine::engine::types::RootAction` is the canonical path. NO shim. Boundary leaks if any are surfaced.
+**Abort threshold**: if Commit 3 surfaces >30 distinct boundary leaks (not just simple `pub` promotions, real circular deps), STOP. The graph report shows god-nodes `decide()` (55 edges), `snap()` (45 edges), `find_decision()` (44 edges) suggesting `SharedState` may be too coupled to extract cleanly in this Sprint. Reassess scope before Commit 4.
 
-### Commit 4: Visibility cleanup minimum
+**State after Commit 3**: `apollo_engine::engine::types::RootAction` is the canonical path. NO `pub mod engine` shim. Facade re-export only. Boundary leaks (if any) surfaced and counted.
 
-Only changes the compiler demanded in Commit 3. Specifically:
-- `pub(crate)` → `pub` for items that bins now access via `apollo_engine::*`
-- NO renames
-- NO module restructure
-- NO API redesign
+### Commit 4: Explicit visibility audit (proactive, not minimal)
+
+NotebookLM peer-review reframed this commit: NOT "minimal where the compiler demanded" but proactive audit of the visibility surface that was implicitly exposed by the split.
+
+Audit targets:
+- `types.rs`: every `pub(crate)` item — does an external bin actually need it? Promote to `pub` only with justification comment.
+- `protocol.rs`: same audit. Wire protocol must be intentionally public.
+- `daemon_state::SharedState`: god-node per graph report. Audit each field's pub level. Document any `pub` promotion as ARCH-DECISION with rationale.
+- Other widely-used types (`RootAction`, `RuntimeMetrics`, `MetricsState`): confirm pub semantics match actual cross-crate usage.
+
+Discipline (Information Hiding [Parnas 1972]):
+- Default to most-restrictive that compiles: `pub(crate)` > `pub(super)` > `pub`
+- Each `pub` promotion in this commit gets a doc comment explaining WHY a bin needs it
+- NO blanket sed `pub(crate)` → `pub` — every change is intentional
 
 `cargo clippy --workspace --all-targets` MUST show no new warnings beyond baseline.
 
@@ -249,10 +316,15 @@ Root `/tests/` keeps `level1_unit.rs` and `level2_integration.rs` (cross-cutting
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| Circular dep root↔engine surfaced in Commit 3 | 🟠 High | Per boundary-leak rule: surface, don't paper. May add 1-2 cleanup commits before merge. |
-| Cargo.lock drift / dep version mismatch post-split | 🟡 Medium | `[workspace.dependencies]` forces single version. Diff Cargo.lock pre/post — should only add apollo-engine entries. |
-| Build script (engine native FFI) breaks under new path | 🟡 Medium | build.rs `OUT_DIR` semantics differ in workspace member. Test compile in Commit 2 BEFORE moving bins. |
-| Test discovery breaks (integration tests dir per crate) | 🟢 Low | `cargo test --workspace` walks all members. Verified in Commit 5 gate. |
+| Circular dep root↔engine surfaced in Commit 3 | 🟠 High | Per boundary-leak rule: surface, don't paper. >30 leaks = abort threshold. Graph report's god-nodes (decide=55, snap=45 edges) make this realistic. |
+| Tests in root `tests/` fail without root `[lib]` | 🔴 Critical → Mitigated | Facade lib `pub use apollo_engine::*` keeps `apollo_optimizer::engine::...` paths resolvable. Caught in NotebookLM review. |
+| Feature unification leak (e.g. Rayon enabled via UI crate) | 🟡 Medium | Workspace deps pin VERSIONS only; per-crate `[dependencies]` declares features explicitly. CLAUDE.md hot-path invariant ("Rayon disabled") preserved. |
+| `super::` paths inside engine modules break when files relocate | 🟠 High | Commit 3 reformulated as sed primary + compiler-driven repair loop. NOT sed-only. |
+| `pub(crate)` mass promotion violates Information Hiding | 🟠 High | Commit 4 reframed as proactive audit, not blanket promotion. Each `pub` change gets doc comment justifying it. |
+| Cargo.lock drift / dep version mismatch post-split | 🟡 Medium | `[workspace.dependencies]` single version source. Diff Cargo.lock pre/post — should only add apollo-engine entries. |
+| Build script (engine native FFI) breaks under new path | 🟡 Medium | build.rs uses `CARGO_MANIFEST_DIR` for `cc` source paths. Test compile in Commit 2 BEFORE moving bins. |
+| Wall-time targets ≤8 / ≤12 min optimistic for M1 8GB | 🟡 Medium | Keep `.cargo/config.toml` `codegen-units=256` + `debug=false` in profile.test (already set). Linker swap is the bottleneck on M1 RAM. |
+| Test discovery breaks (integration tests per crate) | 🟢 Low | `cargo test --workspace` walks all members. Verified in Commit 5 gate. |
 | Daemon binary codesigning under new build path | 🟢 Low | `target/release/apollo-optimizerd` location unchanged for workspace members. `sudo cp` + launchctl unchanged. |
 | Deploy break: ctl binary moved location | 🟢 Low | Build path stays `target/release/apollo-optimizerctl`. Deploy script unchanged. |
 
@@ -303,6 +375,8 @@ If post-split wall time ≥ baseline, rollback. If ≤ baseline, success.
 ## References
 
 - NotebookLM peer-review session 2026-05-08 (notebook `8344b94c-a014-4803-abea-076a55753cfd`): GO-with-limited-scope verdict, workspace split as critical prerequisite
+- NotebookLM adversarial spec review 2026-05-09: 3 critical fixes integrated (facade lib, sed-vs-compiler-driven, proactive visibility audit) + feature unification + abort threshold
 - CLAUDE.md supervision-mode rules (top section)
 - Sprint 4 backlog: `.plan/SPRINT4_BACKLOG.md`
 - Tag stable: `v0.6.1`
+- Parnas D.L. 1972 — "On the Criteria To Be Used in Decomposing Systems into Modules" (Information Hiding principle, cited by NotebookLM for visibility audit rationale)
