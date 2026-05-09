@@ -1,0 +1,18 @@
+date_utc: 2026-05-09
+commit: 72e35802af3a32428c39a889340c60be04746dc3
+branch: sprint5-mes0-workspace-split
+
+cargo_test_no_run_real_time: 2m37.70s
+cargo_test_release_real_time: 2.60s (target/ warm; cold compile above)
+test_count_pass: 1967
+test_count_fail: 1
+test_count_ignored: 1
+known_flake: engine::thread_selfcounts::tests::selfcounts_increases_with_work
+
+clippy_warning_count: 218
+
+daemon_pid: 71281
+daemon_state: running
+daemon_failures: 0
+daemon_p95_ms: 189.0
+daemon_last_error: None
