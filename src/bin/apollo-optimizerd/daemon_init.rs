@@ -5,34 +5,34 @@
 //! here reduces the line count in `main.rs` and provides a single place to track
 //! which subsystems exist.
 
-use apollo_optimizer::engine::action_queue::ActionQueue;
-use apollo_optimizer::engine::analytics::AnalyticsEngine;
-use apollo_optimizer::engine::causal_graph::CausalGraph;
-use apollo_optimizer::engine::coalition::CoalitionTracker;
-use apollo_optimizer::engine::daemon_helpers::{hop_groups_path, skills_path, recently_applied_path};
-use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
-use apollo_optimizer::engine::energy::EnergyTracker;
-use apollo_optimizer::engine::energy_pid::EnergyPidTracker;
-use apollo_optimizer::engine::evolved_anomaly::EvolvedAnomalyDetector;
-use apollo_optimizer::engine::ioreport::IOReportReader;
-use apollo_optimizer::engine::learning_pipeline::LearningPipeline;
-use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
-use apollo_optimizer::engine::network_monitor::NetworkMonitor;
-use apollo_optimizer::engine::network_optimizer::NetworkOptimizer;
-use apollo_optimizer::engine::neuromodulator::ApolloNeuromodulator;
-use apollo_optimizer::engine::optimization_skills::SkillRegistry;
-use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
-use apollo_optimizer::engine::power_management::PowerManager;
-use apollo_optimizer::engine::predictive_agent::SpecialistAccuracyTracker;
-use apollo_optimizer::engine::process_recovery::ProcessRecoveryManager;
-use apollo_optimizer::engine::swap_predictor::SwapPredictor;
-use apollo_optimizer::engine::syscall_classifier::SyscallClassifier;
-use apollo_optimizer::engine::thermal_bailout::ThermalBailout;
-use apollo_optimizer::engine::thermal_manager::ThermalManager;
-use apollo_optimizer::engine::thread_selfcounts::CycleIpcTracker;
-use apollo_optimizer::engine::swap_reclaim::SwapReclaimModel;
-use apollo_optimizer::engine::unfreeze_decay::UnfreezeDecayModel;
-use apollo_optimizer::engine::wake_storm_detector::WakeStormDetector;
+use apollo_engine::engine::action_queue::ActionQueue;
+use apollo_engine::engine::analytics::AnalyticsEngine;
+use apollo_engine::engine::causal_graph::CausalGraph;
+use apollo_engine::engine::coalition::CoalitionTracker;
+use apollo_engine::engine::daemon_helpers::{hop_groups_path, skills_path, recently_applied_path};
+use apollo_engine::engine::effectiveness_tracker::EffectivenessTracker;
+use apollo_engine::engine::energy::EnergyTracker;
+use apollo_engine::engine::energy_pid::EnergyPidTracker;
+use apollo_engine::engine::evolved_anomaly::EvolvedAnomalyDetector;
+use apollo_engine::engine::ioreport::IOReportReader;
+use apollo_engine::engine::learning_pipeline::LearningPipeline;
+use apollo_engine::engine::memory_analyzer::MemoryAnalyzer;
+use apollo_engine::engine::network_monitor::NetworkMonitor;
+use apollo_engine::engine::network_optimizer::NetworkOptimizer;
+use apollo_engine::engine::neuromodulator::ApolloNeuromodulator;
+use apollo_engine::engine::optimization_skills::SkillRegistry;
+use apollo_engine::engine::outcome_tracker::OutcomeTracker;
+use apollo_engine::engine::power_management::PowerManager;
+use apollo_engine::engine::predictive_agent::SpecialistAccuracyTracker;
+use apollo_engine::engine::process_recovery::ProcessRecoveryManager;
+use apollo_engine::engine::swap_predictor::SwapPredictor;
+use apollo_engine::engine::syscall_classifier::SyscallClassifier;
+use apollo_engine::engine::thermal_bailout::ThermalBailout;
+use apollo_engine::engine::thermal_manager::ThermalManager;
+use apollo_engine::engine::thread_selfcounts::CycleIpcTracker;
+use apollo_engine::engine::swap_reclaim::SwapReclaimModel;
+use apollo_engine::engine::unfreeze_decay::UnfreezeDecayModel;
+use apollo_engine::engine::wake_storm_detector::WakeStormDetector;
 use crate::daemon_memory_budget::MemoryBudgetState;
 
 /// Subsystems constructed once at daemon startup with no shared-state dependencies.
@@ -58,9 +58,9 @@ pub(super) struct DaemonSubsystems {
     pub skill_registry: SkillRegistry,
     pub specialist_accuracy: SpecialistAccuracyTracker,
     pub effectiveness_tracker: EffectivenessTracker,
-    pub cache_warmer: apollo_optimizer::engine::cache_warmer::CacheWarmer,
-    pub display_turbo: apollo_optimizer::engine::display_turbo::DisplayTurbo,
-    pub io_shaper: apollo_optimizer::engine::io_tiering::IoShaper,
+    pub cache_warmer: apollo_engine::engine::cache_warmer::CacheWarmer,
+    pub display_turbo: apollo_engine::engine::display_turbo::DisplayTurbo,
+    pub io_shaper: apollo_engine::engine::io_tiering::IoShaper,
     pub thermal_bailout: ThermalBailout,
     pub coalition_tracker: CoalitionTracker,
     pub action_queue: ActionQueue,
@@ -79,17 +79,17 @@ pub(super) struct DaemonSubsystems {
     /// Self-diagnosis meta-observer over known regression classes
     /// (dedup spam, sysinfo cadence drift, reactor saturation).
     /// [Hellerstein 2004 §9] detection-only meta-observer.
-    pub self_diagnosis: apollo_optimizer::engine::self_diagnosis::SelfDiagnosis,
+    pub self_diagnosis: apollo_engine::engine::self_diagnosis::SelfDiagnosis,
     /// Cross-cycle governor state memory (SuperPlan 2026-05-06).
     /// Suppresses re-emission of identical decisions for PIDs already in
     /// the target state. Closes 87.5% journal `success: false` rate.
-    pub recently_applied: apollo_optimizer::engine::recently_applied::RecentlyApplied,
-    pub recently_applied_restore_status: apollo_optimizer::engine::recently_applied::RestoreStatus,
+    pub recently_applied: apollo_engine::engine::recently_applied::RecentlyApplied,
+    pub recently_applied_restore_status: apollo_engine::engine::recently_applied::RestoreStatus,
     /// Identity validation cache lifecycle owner (Sprint 3 cost recovery +
     /// Sprint 4 Fase 2 manager consolidation).
     /// Memoizes proc_pidpath/csops syscalls per (pid, start_sec, start_usec)
     /// behind a single owner that concentrates verify/notify_exited/cleanup.
-    pub identity_cache: apollo_optimizer::engine::identity_cache_manager::IdentityCacheManager,
+    pub identity_cache: apollo_engine::engine::identity_cache_manager::IdentityCacheManager,
 }
 
 /// Detect hardware capabilities (core count and RAM) once at startup.
@@ -119,7 +119,7 @@ impl DaemonSubsystems {
         skill_registry.load(std::path::Path::new(skills_path()));
 
         let (recently_applied_cache, restore_status) = 
-            apollo_optimizer::engine::recently_applied::RecentlyApplied::load_from_disk(
+            apollo_engine::engine::recently_applied::RecentlyApplied::load_from_disk(
                 std::path::Path::new(recently_applied_path())
             );
 
@@ -142,9 +142,9 @@ impl DaemonSubsystems {
             skill_registry,
             specialist_accuracy: SpecialistAccuracyTracker::new(),
             effectiveness_tracker: EffectivenessTracker::new(),
-            cache_warmer: apollo_optimizer::engine::cache_warmer::CacheWarmer::new(),
-            display_turbo: apollo_optimizer::engine::display_turbo::DisplayTurbo::new(),
-            io_shaper: apollo_optimizer::engine::io_tiering::IoShaper::new(),
+            cache_warmer: apollo_engine::engine::cache_warmer::CacheWarmer::new(),
+            display_turbo: apollo_engine::engine::display_turbo::DisplayTurbo::new(),
+            io_shaper: apollo_engine::engine::io_tiering::IoShaper::new(),
             thermal_bailout: ThermalBailout::new(),
             coalition_tracker: CoalitionTracker::new(),
             action_queue: ActionQueue::new(20, 100),
@@ -155,7 +155,7 @@ impl DaemonSubsystems {
             unfreeze_decay: UnfreezeDecayModel::new(),
             swap_reclaim: SwapReclaimModel::new(),
             memory_budget: MemoryBudgetState::default(),
-            self_diagnosis: apollo_optimizer::engine::self_diagnosis::SelfDiagnosis::new(
+            self_diagnosis: apollo_engine::engine::self_diagnosis::SelfDiagnosis::new(
                 if unsafe { libc::geteuid() } == 0 {
                     std::path::PathBuf::from("/var/lib/apollo/self_diagnosis.jsonl")
                 } else {
@@ -164,7 +164,7 @@ impl DaemonSubsystems {
             ),
             recently_applied: recently_applied_cache,
             recently_applied_restore_status: restore_status,
-            identity_cache: apollo_optimizer::engine::identity_cache_manager::IdentityCacheManager::new(),
+            identity_cache: apollo_engine::engine::identity_cache_manager::IdentityCacheManager::new(),
         }
     }
 }

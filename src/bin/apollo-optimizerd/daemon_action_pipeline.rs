@@ -47,13 +47,13 @@
 
 use std::collections::HashSet;
 
-use apollo_optimizer::collector::SystemSnapshot;
-use apollo_optimizer::engine::circuit_breaker::CircuitState;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::degradation::{DegradationInputs, OperationMode};
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::swap_reclaim::SwapRisk;
-use apollo_optimizer::engine::types::RootAction;
+use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::circuit_breaker::CircuitState;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::degradation::{DegradationInputs, OperationMode};
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::swap_reclaim::SwapRisk;
+use apollo_engine::engine::types::RootAction;
 
 use crate::cognitive_tick::CognitiveDecision;
 

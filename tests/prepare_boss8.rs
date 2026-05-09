@@ -17,9 +17,9 @@
 
 #[cfg(test)]
 mod scenarios {
-    use apollo_optimizer::engine::adaptive_governor::{AdaptiveGovernor, GovernorDecision};
-    use apollo_optimizer::engine::process_classifier::ProcessSnapshot;
-    use apollo_optimizer::engine::zombie_hunter::HuntSnapshot;
+    use apollo_engine::engine::adaptive_governor::{AdaptiveGovernor, GovernorDecision};
+    use apollo_engine::engine::process_classifier::ProcessSnapshot;
+    use apollo_engine::engine::zombie_hunter::HuntSnapshot;
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 

@@ -13,13 +13,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use apollo_optimizer::engine::daemon_helpers::{
+use apollo_engine::engine::daemon_helpers::{
     should_rotate_oldest, should_unfreeze, unfreeze_pids, write_frozen_state,
 };
-use apollo_optimizer::engine::daemon_state::{MetricsState, SharedState};
-use apollo_optimizer::engine::fluidity::FluidityState;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::types::RootAction;
+use apollo_engine::engine::daemon_state::{MetricsState, SharedState};
+use apollo_engine::engine::fluidity::FluidityState;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::types::RootAction;
 use chrono::Utc;
 
 /// Sweep expired freezes and rotate the oldest under sustained pressure.

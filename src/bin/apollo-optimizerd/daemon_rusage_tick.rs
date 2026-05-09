@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use apollo_optimizer::collector::SystemSnapshot;
-use apollo_optimizer::engine::proc_taskinfo;
+use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::proc_taskinfo;
 
 /// Compute per-process cpu_wall_ratio from rusage deltas.
 ///

@@ -3,13 +3,13 @@
 //! Tests for the heuristic-based intelligent system:
 //! process_classifier, zombie_hunter, user_profile, adaptive_governor
 
-use apollo_optimizer::engine::adaptive_governor::{AdaptiveGovernor, GovernorDecision};
-use apollo_optimizer::engine::process_classifier::{
+use apollo_engine::engine::adaptive_governor::{AdaptiveGovernor, GovernorDecision};
+use apollo_engine::engine::process_classifier::{
     essential_process_names, score_utility, score_waste, telemetry_process_names,
     ProcessClassifier, ProcessSnapshot, ProcessTier,
 };
-use apollo_optimizer::engine::user_profile::{UserProfile, WorkloadType};
-use apollo_optimizer::engine::zombie_hunter::{
+use apollo_engine::engine::user_profile::{UserProfile, WorkloadType};
+use apollo_engine::engine::zombie_hunter::{
     HuntSnapshot, ZombieAction, ZombieClass, ZombieHunter,
 };
 
@@ -309,7 +309,7 @@ fn test_zombie_hunter_memory_hoarder() {
 #[test]
 fn test_zombie_hunter_total_reclaimable() {
     let dead = vec![
-        apollo_optimizer::engine::zombie_hunter::DeadWeightProcess {
+        apollo_engine::engine::zombie_hunter::DeadWeightProcess {
             pid: 1,
             name: "a".into(),
             zombie_class: ZombieClass::TrueZombie,
@@ -318,7 +318,7 @@ fn test_zombie_hunter_total_reclaimable() {
             recommended_action: ZombieAction::Kill,
             reason: "".into(),
         },
-        apollo_optimizer::engine::zombie_hunter::DeadWeightProcess {
+        apollo_engine::engine::zombie_hunter::DeadWeightProcess {
             pid: 2,
             name: "b".into(),
             zombie_class: ZombieClass::MemoryHoarder,

@@ -15,15 +15,15 @@
 
 use std::time::{Duration, Instant};
 
-use apollo_optimizer::collector::SystemSnapshot;
-use apollo_optimizer::engine::chromium_manager::ChromiumManager;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::learned_state::LearnableParams;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::overflow_guard::OverflowGuard;
-use apollo_optimizer::engine::safety::{survival_mode_active_total, swap_exhaustion_threshold_bytes};
-use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
-use apollo_optimizer::engine::signal_intelligence::SignalDigest;
+use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::chromium_manager::ChromiumManager;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::learned_state::LearnableParams;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::overflow_guard::OverflowGuard;
+use apollo_engine::engine::safety::{survival_mode_active_total, swap_exhaustion_threshold_bytes};
+use apollo_engine::engine::signal_intelligence::SignalIntelligence;
+use apollo_engine::engine::signal_intelligence::SignalDigest;
 
 /// Run survival-mode detection, overflow recording, and threshold decay.
 ///

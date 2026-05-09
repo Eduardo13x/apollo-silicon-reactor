@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 use crate::engine::usage_model::{UsageEntrySummary, UsageTopReport};
 
 /// Centralized utility for hardened file system operations to prevent TOCTOU and symlink attacks.
+///
+/// Cross-crate visibility: required by apollo-optimizerd (main.rs, llm_daemon.rs) and
+/// apollo-optimizerctl for secure path validation. Audited 2026-05-09 during Sprint 5
+/// Mes 0 workspace split.
 pub struct HardPath;
 
 impl HardPath {
@@ -74,6 +78,9 @@ impl HardPath {
     }
 }
 
+/// Cross-crate visibility: used by apollo-optimizerctl (profile set commands),
+/// apollo-menubar (profile display and switching), and apollo-optimizerd main loop.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum OptimizationProfile {
@@ -98,6 +105,9 @@ impl OptimizationProfile {
     }
 }
 
+/// Cross-crate visibility: used by apollo-optimizerctl (latency target commands) and
+/// apollo-optimizerd main loop for per-cycle latency tuning decisions.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum LatencyTarget {
@@ -112,6 +122,9 @@ impl Default for LatencyTarget {
     }
 }
 
+/// Cross-crate visibility: used by apollo-menubar (policy display), apollo-optimizerd
+/// (process_enrichment.rs, main.rs safety validation). Audited 2026-05-09 during Sprint 5
+/// Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafetyPolicy {
     pub max_boosts_per_cycle: usize,
@@ -200,6 +213,9 @@ impl SafetyPolicy {
     }
 }
 
+/// Cross-crate visibility: used by apollo-optimizerd process_enrichment.rs to classify
+/// per-process interaction context for decision routing. Audited 2026-05-09 during Sprint 5
+/// Mes 0 workspace split.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum InteractiveContext {
@@ -208,6 +224,8 @@ pub enum InteractiveContext {
     ThermalConstrained,
 }
 
+/// Cross-crate visibility: used by apollo-optimizerd metrics_reporter.rs to build
+/// per-process blocker score reports. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockerScore {
     pub name: String,
@@ -219,6 +237,9 @@ pub struct BlockerScore {
     pub reactor_event_weight: f64,
 }
 
+/// Cross-crate visibility: required because `safety::enforce_limits_with_budget` is `pub`
+/// and takes `budget: &mut ActionBudgetState`; apollo-optimizerd main.rs calls it directly.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ActionBudgetState {
     pub cycle_boosts: usize,
@@ -232,6 +253,9 @@ pub struct ActionBudgetState {
     pub cycle_thread_qos: usize,
 }
 
+/// Cross-crate visibility: used by apollo-optimizerd daemon_dispatch_tick.rs tests and
+/// main.rs for capability-based decision gating. Audited 2026-05-09 during Sprint 5
+/// Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityReport {
     pub can_taskpolicy: bool,
@@ -253,6 +277,10 @@ pub struct CapabilityReport {
 /// closes the Bug 6 regression class: external emit sites (e.g.
 /// `network-optimizer` at `main.rs:3577`) can no longer struct-literal-bypass
 /// the safety clamp — type-system enforcement, not convention.
+///
+/// Cross-crate visibility: type appears in the `RootAction::SetSysctl(SetSysctlAction)`
+/// variant which is `pub` and used across the workspace. Bins match on `RootAction::SetSysctl`
+/// and call the pub accessor methods. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 ///
 /// JSON serialization shape is preserved by serde's externally-tagged enum
 /// default + a newtype-variant: a previous `RootAction::SetSysctl { key,
@@ -330,6 +358,10 @@ impl SetSysctlAction {
     }
 }
 
+/// Cross-crate visibility: the primary action type dispatched by apollo-optimizerd across
+/// daemon_dispatch_tick, daemon_agent_actions, learning_tick, and daemon_skill_tick.
+/// Central to the workspace — removing pub would break the entire action pipeline.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RootAction {
     BoostProcess {
@@ -587,6 +619,9 @@ impl RootAction {
     }
 }
 
+/// Cross-crate visibility: used by apollo-optimizerd (daemon_chromium_tick, daemon_thermal_freeze,
+/// daemon_dispatch_tick, daemon_turbo_manager) to tag the origin of freeze decisions.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub enum FreezeSource {
@@ -602,6 +637,9 @@ pub enum FreezeSource {
     Unknown,
 }
 
+/// Cross-crate visibility: used by apollo-optimizerd (daemon_chromium_tick, daemon_thermal_freeze,
+/// daemon_dispatch_tick, daemon_turbo_manager) as the value type in the frozen-state map.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrozenEntry {
     pub frozen_at: DateTime<Utc>,
@@ -642,6 +680,9 @@ fn frozen_entry_pressure_default() -> f64 {
 }
 
 /// Summary of a currently frozen process, included in `DaemonStatus` for observability.
+///
+/// Cross-crate visibility: used by apollo-optimizerd socket_handler.rs to build the frozen
+/// process list in `DaemonResponse::Status`. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrozenProcessInfo {
     pub pid: u32,
@@ -653,6 +694,9 @@ pub struct FrozenProcessInfo {
     pub pressure_at_freeze: f64,
 }
 
+/// Cross-crate visibility: used by apollo-optimizerd learning_tick.rs to persist and
+/// recover frozen-PID entries across daemon restarts. Audited 2026-05-09 during Sprint 5
+/// Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrozenPidEntry {
     pub pid: u32,
@@ -662,11 +706,18 @@ pub struct FrozenPidEntry {
     pub name: Option<String>,
 }
 
+/// Cross-crate visibility: used by apollo-optimizerd learning_tick.rs to persist the full
+/// frozen-state snapshot to disk for crash recovery. Audited 2026-05-09 during Sprint 5
+/// Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrozenStatePersisted {
     pub frozen: Vec<FrozenPidEntry>,
 }
 
+// AUDIT-PENDING: JournalEntry is used only internally (journal.rs, execute_actions.rs).
+// No bin imports it directly. However pub fn append_journal/read_journal in journal.rs
+// reference it — those fns must be demoted to pub(crate) first before this can be
+// tightened. Deferred to a follow-up sprint (cannot touch journal.rs in this commit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub timestamp: DateTime<Utc>,
@@ -677,6 +728,9 @@ pub struct JournalEntry {
     pub reason: String,
 }
 
+/// Cross-crate visibility: embedded in `DaemonResponse::ProfileTimeline(Vec<ProfileTransition>)`.
+/// apollo-optimizerctl deserializes and pretty-prints the timeline. Cannot be `pub(crate)` while
+/// `DaemonResponse` remains `pub`. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileTransition {
     pub from: OptimizationProfile,
@@ -686,6 +740,10 @@ pub struct ProfileTransition {
     pub pressure_score: f64,
 }
 
+/// Cross-crate visibility: exposed as `pub governor_state: GovernorState` on the `pub struct
+/// ProfileGovernor` in profile_governor.rs, which is used cross-crate by daemon_memory_budget
+/// and daemon_dispatch_tick. Cannot be `pub(crate)` while ProfileGovernor fields remain `pub`.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernorState {
     pub effective_profile: OptimizationProfile,
@@ -694,6 +752,10 @@ pub struct GovernorState {
     pub consecutive_low: u32,
 }
 
+/// Cross-crate visibility: exposed as `pub manual_override: Option<ManualOverride>` on the
+/// `pub struct ProfileGovernor` in profile_governor.rs, which is used cross-crate.
+/// Cannot be `pub(crate)` while ProfileGovernor fields remain `pub`.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManualOverride {
     pub profile: OptimizationProfile,
@@ -701,6 +763,9 @@ pub struct ManualOverride {
     pub reason: String,
 }
 
+/// Cross-crate visibility: used by apollo-optimizerd socket_handler.rs, metrics_reporter.rs,
+/// and daemon_dispatch_tick.rs tests; also by apollo-menubar (indirectly via DaemonStatus).
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeMetrics {
     pub cycles: u64,
@@ -1432,6 +1497,9 @@ impl RuntimeMetrics {
 }
 
 /// Serializable foreground app info for the protocol/dashboard.
+///
+/// Cross-crate visibility: used by apollo-optimizerd main.rs to build foreground-app reports.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForegroundAppInfo {
     pub pid: u32,
@@ -1440,6 +1508,9 @@ pub struct ForegroundAppInfo {
 }
 
 /// Serializable per-app energy info for the protocol/dashboard.
+///
+/// Cross-crate visibility: used by apollo-optimizerd main.rs to populate energy consumer
+/// reports in DaemonStatus. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnergyConsumerInfo {
     pub name: String,
@@ -1447,6 +1518,9 @@ pub struct EnergyConsumerInfo {
     pub percentage: f64,
 }
 
+/// Cross-crate visibility: the primary status response type. Used by apollo-menubar,
+/// apollo-optimizerctl, and apollo-optimizerd socket_handler to transmit daemon state over IPC.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub running: bool,
@@ -1476,6 +1550,9 @@ pub struct DaemonStatus {
     pub frozen_processes: Vec<FrozenProcessInfo>,
 }
 
+/// Cross-crate visibility: embedded in DaemonStatus.llm; read by apollo-optimizerctl and
+/// apollo-menubar via the DaemonResponse IPC path. Audited 2026-05-09 during Sprint 5
+/// Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmStatus {
     pub enabled: bool,
@@ -1498,18 +1575,24 @@ pub struct LlmStatus {
     pub learned_policy: LearnedPolicyStatus,
 }
 
+/// Demoted to pub(crate): no bin imports or uses this type; no pub function takes it as
+/// parameter. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsageStatus {
-    pub entries: usize,
-    pub last_updated_at: Option<DateTime<Utc>>,
+pub(crate) struct UsageStatus {
+    pub(crate) entries: usize,
+    pub(crate) last_updated_at: Option<DateTime<Utc>>,
 }
 
+/// Cross-crate visibility: used by apollo-optimizerctl to handle usage-top and explain
+/// commands over IPC. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UsageResponse {
     Top(UsageTopReport),
     Explain(UsageEntrySummary),
 }
 
+/// Cross-crate visibility: embedded in LlmStatus and returned via DaemonResponse; accessed by
+/// apollo-optimizerctl and apollo-menubar. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LearnedPolicyStatus {
     pub interactive_patterns: usize,
@@ -1518,6 +1601,8 @@ pub struct LearnedPolicyStatus {
     pub learned_at: Option<DateTime<Utc>>,
 }
 
+/// Cross-crate visibility: used by apollo-optimizerd llm_daemon.rs and returned in LlmStatus
+/// over IPC to monitoring clients. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum LlmRunMode {
@@ -1533,6 +1618,10 @@ impl Default for LlmRunMode {
 }
 
 /// Summary of circuit breaker and degradation state, returned by `GetHealth`.
+///
+/// Cross-crate visibility: used by apollo-optimizerd socket_handler.rs to build the
+/// GetHealth response; accessed by apollo-optimizerctl. Audited 2026-05-09 during Sprint 5
+/// Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthReport {
     /// "healthy" | "degraded" | "emergency"

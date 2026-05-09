@@ -1,8 +1,8 @@
-use apollo_optimizer::engine::signal_intelligence::SignalDigest;
-use apollo_optimizer::engine::window_sensor::{SessionPhase, WorkloadIntent};
-use apollo_optimizer::engine::holt_winters::HoltWinters;
-use apollo_optimizer::engine::temporal_predictor::TemporalPredictor;
-use apollo_optimizer::engine::build_tracker::{BuildTracker, BuildPhase};
+use apollo_engine::engine::signal_intelligence::SignalDigest;
+use apollo_engine::engine::window_sensor::{SessionPhase, WorkloadIntent};
+use apollo_engine::engine::holt_winters::HoltWinters;
+use apollo_engine::engine::temporal_predictor::TemporalPredictor;
+use apollo_engine::engine::build_tracker::{BuildTracker, BuildPhase};
 
 pub struct ReactorTickInput<'a> {
     pub signal_digest: &'a SignalDigest,
@@ -137,7 +137,7 @@ pub fn run_reactor_tick(input: ReactorTickInput) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
+    use apollo_engine::engine::signal_intelligence::SignalIntelligence;
     use std::path::PathBuf;
 
     #[test]

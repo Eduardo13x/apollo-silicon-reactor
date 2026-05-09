@@ -42,20 +42,20 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use apollo_optimizer::collector::{SystemCollector, SystemSnapshot};
+use apollo_engine::collector::{SystemCollector, SystemSnapshot};
 // spotlight_set_indexing import removed 2026-05-08: Apollo no longer
 // touches mdutil automatically (user-reported Finder beachball regression).
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::llm_inference_mode::LlmInferenceDetector;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::mach_qos::SchedulingTier;
-use apollo_optimizer::engine::process_classifier::ProcessSnapshot;
-use apollo_optimizer::engine::safety::{
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::llm_inference_mode::LlmInferenceDetector;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::mach_qos::SchedulingTier;
+use apollo_engine::engine::process_classifier::ProcessSnapshot;
+use apollo_engine::engine::safety::{
     classify_protection, infrastructure_processes, is_user_interactive_app, protected_processes,
     ProtectionLevel,
 };
-use apollo_optimizer::engine::thermal_bailout::{CoolingPhase, ThermalAction};
-use apollo_optimizer::engine::wake_storm_detector::{
+use apollo_engine::engine::thermal_bailout::{CoolingPhase, ThermalAction};
+use apollo_engine::engine::wake_storm_detector::{
     StormSeverity, WakePattern, WakeStormDetector,
 };
 

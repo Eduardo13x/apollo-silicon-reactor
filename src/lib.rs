@@ -1,15 +1,15 @@
-pub mod collector;
-pub mod dashboard;
-pub mod engine;
+//! apollo-optimizer — facade crate for binaries and integration tests.
+//!
+//! Sprint 5 Mes 0: this lib is a thin facade that re-exports
+//! `apollo-engine` so legacy paths `apollo_optimizer::engine::...`
+//! in integration tests continue to resolve.
+//!
+//! Discipline:
+//! - This file MUST stay this size (one re-export, no other modules).
+//! - New logic goes in `apollo-engine` (lib) or `src/bin/<name>/` (bin).
+//! - If you're tempted to add `pub mod foo` here, you're rebuilding the
+//!   monolith. Don't.
+//!
+//! See docs/superpowers/specs/2026-05-09-workspace-split-design.md.
 
-/// Convenient re-exports of the types most commonly needed by consumers
-/// of this crate (`apollo-optimizerctl`, `apollo-menubar`, integration tests).
-///
-/// Import with: `use apollo_optimizer::prelude::*;`
-pub mod prelude {
-    pub use crate::engine::protocol::{DaemonRequest, DaemonResponse, PROTOCOL_VERSION};
-    pub use crate::engine::types::{
-        BlockerScore, CapabilityReport, DaemonStatus, FrozenEntry, LatencyTarget,
-        OptimizationProfile, RuntimeMetrics, SafetyPolicy,
-    };
-}
+pub use apollo_engine::*;

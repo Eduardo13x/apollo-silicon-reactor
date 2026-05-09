@@ -15,11 +15,11 @@
 
 #[cfg(test)]
 mod scenarios {
-    use apollo_optimizer::collector::{CpuStats, MemoryStats, PressureStats, SystemSnapshot};
-    use apollo_optimizer::engine::decide_actions::blocker_score_formula;
-    use apollo_optimizer::engine::decide_actions::context_from_pressure;
-    use apollo_optimizer::engine::overflow_guard::OverflowThresholds;
-    use apollo_optimizer::engine::types::InteractiveContext;
+    use apollo_engine::collector::{CpuStats, MemoryStats, PressureStats, SystemSnapshot};
+    use apollo_engine::engine::decide_actions::blocker_score_formula;
+    use apollo_engine::engine::decide_actions::context_from_pressure;
+    use apollo_engine::engine::overflow_guard::OverflowThresholds;
+    use apollo_engine::engine::types::InteractiveContext;
     use chrono::Utc;
 
     fn make_snapshot(cpu_usage: f32, mem_pressure: f64, swap_delta: f64) -> SystemSnapshot {

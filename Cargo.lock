@@ -139,11 +139,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
 
 [[package]]
-name = "apollo-optimizer"
+name = "apollo-engine"
 version = "1.0.0"
 dependencies = [
  "anyhow",
  "cc",
+ "chrono",
+ "libc",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+]
+
+[[package]]
+name = "apollo-optimizer"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "apollo-engine",
  "chrono",
  "clap",
  "cocoa",

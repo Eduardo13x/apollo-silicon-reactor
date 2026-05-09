@@ -17,9 +17,9 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use apollo_optimizer::engine::daemon_helpers::{unfreeze_pids, write_frozen_state};
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::lock_ext::LockRecover;
+use apollo_engine::engine::daemon_helpers::{unfreeze_pids, write_frozen_state};
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::lock_ext::LockRecover;
 
 /// Run context-switch burst detector and reactive foreground unfreeze.
 ///

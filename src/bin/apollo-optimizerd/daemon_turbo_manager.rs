@@ -12,17 +12,17 @@
 
 use std::path::Path;
 
-use apollo_optimizer::collector::SystemCollector;
-use apollo_optimizer::engine::background_collectors::PressureCollector;
-use apollo_optimizer::engine::daemon_helpers::{unfreeze_pids_verified, write_frozen_state};
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::display_turbo::{DisplayTurbo, TurboAction};
-use apollo_optimizer::engine::foreground::ForegroundDetector;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::process_identity::ProcessIdentity;
-use apollo_optimizer::engine::safety::is_protected_name;
-use apollo_optimizer::engine::stability_oracle::StabilityOracle;
-use apollo_optimizer::engine::types::{FreezeSource, FrozenEntry};
+use apollo_engine::collector::SystemCollector;
+use apollo_engine::engine::background_collectors::PressureCollector;
+use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified, write_frozen_state};
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::display_turbo::{DisplayTurbo, TurboAction};
+use apollo_engine::engine::foreground::ForegroundDetector;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::process_identity::ProcessIdentity;
+use apollo_engine::engine::safety::is_protected_name;
+use apollo_engine::engine::stability_oracle::StabilityOracle;
+use apollo_engine::engine::types::{FreezeSource, FrozenEntry};
 use chrono::Utc;
 
 /// Run one display-off turbo tick.

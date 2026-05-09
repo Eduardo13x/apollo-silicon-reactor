@@ -17,17 +17,17 @@ use std::collections::HashSet;
 
 use std::path::Path;
 
-use apollo_optimizer::collector::SystemCollector;
-use apollo_optimizer::collector::SystemSnapshot;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::llm::{delete_file_best_effort, pending_trial_path, write_json_critical};
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::optimization_skills::SkillRegistry;
-use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
-use apollo_optimizer::engine::process_identity::is_apple_platform_process;
-use apollo_optimizer::engine::safety::{is_protected_name, protected_processes};
-use apollo_optimizer::engine::types::RootAction;
-use apollo_optimizer::engine::audit_types::DecisionReason;
+use apollo_engine::collector::SystemCollector;
+use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::llm::{delete_file_best_effort, pending_trial_path, write_json_critical};
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::optimization_skills::SkillRegistry;
+use apollo_engine::engine::outcome_tracker::OutcomeTracker;
+use apollo_engine::engine::process_identity::is_apple_platform_process;
+use apollo_engine::engine::safety::{is_protected_name, protected_processes};
+use apollo_engine::engine::types::RootAction;
+use apollo_engine::engine::audit_types::DecisionReason;
 
 /// Per-cycle skill application tick.
 ///
@@ -241,7 +241,7 @@ pub fn run_rule_induction(
     let policy_prot_refs: Vec<&str> = policy_prot.iter().map(|s| s.as_str()).collect();
     let mut all_protected: Vec<&str> = protected_set.iter().copied().collect();
     all_protected.extend_from_slice(&policy_prot_refs);
-    let new_skills = apollo_optimizer::engine::rule_inducer::induce(
+    let new_skills = apollo_engine::engine::rule_inducer::induce(
         &outcome_tracker.experience,
         &top_pairs,
         &existing_names,

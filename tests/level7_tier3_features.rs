@@ -1,8 +1,8 @@
 //! Level 7: TIER 3 Features Tests
 //! Tests for analytics and power_management (including battery)
 
-use apollo_optimizer::engine::analytics::AnalyticsEngine;
-use apollo_optimizer::engine::power_management::{
+use apollo_engine::engine::analytics::AnalyticsEngine;
+use apollo_engine::engine::power_management::{
     BatteryMode, BatteryStatus, PowerManager, PowerMode,
 };
 

@@ -8,10 +8,10 @@
 //! - LSE counters under heavy contention
 //! - Cross-module integration: kqueue + proc + vm acting together
 
-use apollo_optimizer::engine::kqueue_pressure::{KqueuePressure, PressureEvent};
-use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
-use apollo_optimizer::engine::proc_taskinfo;
-use apollo_optimizer::engine::vm_surgeon;
+use apollo_engine::engine::kqueue_pressure::{KqueuePressure, PressureEvent};
+use apollo_engine::engine::lse_counters::LockFreeMetrics;
+use apollo_engine::engine::proc_taskinfo;
+use apollo_engine::engine::vm_surgeon;
 
 use std::sync::Arc;
 use std::thread;
@@ -460,7 +460,7 @@ fn lse_snapshot_never_decreases() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn lse_asm_instructions_work() {
-    use apollo_optimizer::engine::lse_counters::{lse_cas, lse_swap, verify_lse_atomic_add};
+    use apollo_engine::engine::lse_counters::{lse_cas, lse_swap, verify_lse_atomic_add};
     use std::sync::atomic::AtomicU64;
 
     // ldaddal

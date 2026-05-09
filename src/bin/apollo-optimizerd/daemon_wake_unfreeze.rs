@@ -15,11 +15,11 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
-use apollo_optimizer::engine::daemon_helpers::{unfreeze_pids_verified, write_frozen_state};
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::mach_qos::SchedulingTier;
-use apollo_optimizer::engine::background_collectors::PressureCollector;
+use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified, write_frozen_state};
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::mach_qos::SchedulingTier;
+use apollo_engine::engine::background_collectors::PressureCollector;
 
 /// Maximum PIDs to SIGCONT per cycle under normal conditions.
 const WAKE_UNFREEZE_BATCH: usize = 5;
@@ -72,7 +72,7 @@ pub fn run_wake_unfreeze(
     // [Saltzer & Kaashoek 2009] §3.3 Complete Mediation.
     {
         let mut frozen_guard = state.frozen_state.lock_recover();
-        let entries: std::collections::HashMap<u32, apollo_optimizer::engine::types::FrozenEntry> =
+        let entries: std::collections::HashMap<u32, apollo_engine::engine::types::FrozenEntry> =
             batch
                 .iter()
                 .filter_map(|&pid| frozen_guard.get(&pid).map(|e| (pid, e.clone())))

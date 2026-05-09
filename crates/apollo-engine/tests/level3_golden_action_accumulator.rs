@@ -28,14 +28,14 @@
 //!
 //! Then we assert variant-sequence equivalence and per-variant counters.
 
-use apollo_optimizer::engine::action_accumulator::{
+use apollo_engine::engine::action_accumulator::{
     ActionAccumulator, ActionPhase, EmitContext,
 };
-use apollo_optimizer::engine::audit_types::DecisionReason;
-use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
-use apollo_optimizer::engine::network_optimizer::{NetworkOptimizer, NetworkProfile};
-use apollo_optimizer::engine::sysctl_limits::clamp_to_allowed_range;
-use apollo_optimizer::engine::types::{RootAction, SetSysctlAction};
+use apollo_engine::engine::audit_types::DecisionReason;
+use apollo_engine::engine::lse_counters::LockFreeMetrics;
+use apollo_engine::engine::network_optimizer::{NetworkOptimizer, NetworkProfile};
+use apollo_engine::engine::sysctl_limits::clamp_to_allowed_range;
+use apollo_engine::engine::types::{RootAction, SetSysctlAction};
 
 fn ctx(phase: ActionPhase, site: &'static str, reason: &'static str) -> EmitContext {
     EmitContext::new(phase, site, reason)

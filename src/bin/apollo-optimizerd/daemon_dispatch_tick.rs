@@ -11,16 +11,16 @@ use std::collections::{HashSet, HashMap};
 use std::path::Path;
 use chrono::Utc;
 
-use apollo_optimizer::engine::types::{RootAction, FrozenEntry, FreezeSource};
-use apollo_optimizer::engine::execute_actions::{execute_actions, ExecuteOutcomes};
-use apollo_optimizer::engine::degradation::DegradationInputs;
-use apollo_optimizer::engine::unfreeze_decay::UnfreezeDecayModel;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
-use apollo_optimizer::engine::swap_reclaim::SwapRisk;
-use apollo_optimizer::collector::{SystemCollector, SystemSnapshot};
-use apollo_optimizer::engine::daemon_helpers::write_frozen_state;
+use apollo_engine::engine::types::{RootAction, FrozenEntry, FreezeSource};
+use apollo_engine::engine::execute_actions::{execute_actions, ExecuteOutcomes};
+use apollo_engine::engine::degradation::DegradationInputs;
+use apollo_engine::engine::unfreeze_decay::UnfreezeDecayModel;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::lse_counters::LockFreeMetrics;
+use apollo_engine::engine::swap_reclaim::SwapRisk;
+use apollo_engine::collector::{SystemCollector, SystemSnapshot};
+use apollo_engine::engine::daemon_helpers::write_frozen_state;
 
 /// Action kinds tracked for per-PID dedup.
 /// Variants without a target PID (SetSysctl, ToggleSpotlight, QuarantineDaemon)
@@ -144,7 +144,7 @@ use crate::{daemon_action_pipeline, cognitive_tick};
 /// Input dependencies for the dispatch tick.
 pub struct DispatchTickInput<'a> {
     pub state: &'a SharedState,
-    pub caps: &'a apollo_optimizer::engine::types::CapabilityReport,
+    pub caps: &'a apollo_engine::engine::types::CapabilityReport,
     pub journal_path: &'a Path,
     pub frozen_state_path: &'a Path,
     pub final_actions: Vec<RootAction>,
@@ -363,12 +363,12 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         let mut frozen_state = state.frozen_state.lock_recover();
         for pid in &frozen_set {
             frozen_state.entry(*pid).or_insert_with(|| {
-                let name = apollo_optimizer::engine::process_identity::proc_name_for_pid(*pid);
+                let name = apollo_engine::engine::process_identity::proc_name_for_pid(*pid);
                 let (start_sec, original_jetsam_priority) = identity_map
                     .get(pid)
                     .copied()
                     .unwrap_or_else(|| {
-                        let s = apollo_optimizer::engine::process_identity::ProcessIdentity::from_pid(*pid)
+                        let s = apollo_engine::engine::process_identity::ProcessIdentity::from_pid(*pid)
                             .map(|pi| pi.start_sec)
                             .unwrap_or(0);
                         (s, None)
@@ -403,25 +403,25 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::path::PathBuf;
     use std::collections::HashMap;
-    use apollo_optimizer::engine::daemon_state::{PolicyState, MetricsState, ProcessState, HardwareState, LlmDomainState, UsageDomainState};
-    use apollo_optimizer::engine::adaptive_governor::AdaptiveGovernor;
-    use apollo_optimizer::engine::llm::{LlmConfig, LlmState, LearnedPolicy};
-    use apollo_optimizer::engine::mach_qos::MachQoSManager;
-    use apollo_optimizer::engine::sysctl_governor::SysctlGovernorStatus;
-    use apollo_optimizer::engine::usage_model::UsageModel;
-    use apollo_optimizer::engine::daemon_helpers::WakeRuntimeState;
-    use apollo_optimizer::engine::types::{CapabilityReport, RuntimeMetrics, OptimizationProfile, LatencyTarget};
-    use apollo_optimizer::engine::audit_types::DecisionReason;
-    use apollo_optimizer::engine::circuit_breaker::{CircuitBreaker, CircuitState};
-    use apollo_optimizer::engine::degradation::DegradationController;
-    use apollo_optimizer::collector::{CpuStats, MemoryStats, PressureStats};
+    use apollo_engine::engine::daemon_state::{PolicyState, MetricsState, ProcessState, HardwareState, LlmDomainState, UsageDomainState};
+    use apollo_engine::engine::adaptive_governor::AdaptiveGovernor;
+    use apollo_engine::engine::llm::{LlmConfig, LlmState, LearnedPolicy};
+    use apollo_engine::engine::mach_qos::MachQoSManager;
+    use apollo_engine::engine::sysctl_governor::SysctlGovernorStatus;
+    use apollo_engine::engine::usage_model::UsageModel;
+    use apollo_engine::engine::daemon_helpers::WakeRuntimeState;
+    use apollo_engine::engine::types::{CapabilityReport, RuntimeMetrics, OptimizationProfile, LatencyTarget};
+    use apollo_engine::engine::audit_types::DecisionReason;
+    use apollo_engine::engine::circuit_breaker::{CircuitBreaker, CircuitState};
+    use apollo_engine::engine::degradation::DegradationController;
+    use apollo_engine::collector::{CpuStats, MemoryStats, PressureStats};
 
     fn create_test_state() -> SharedState {
         SharedState {
             policy: Arc::new(Mutex::new(PolicyState {
                 profile: OptimizationProfile::BalancedRoot,
                 latency_target: LatencyTarget::Normal,
-                governor: apollo_optimizer::engine::profile_governor::ProfileGovernor::new(OptimizationProfile::BalancedRoot),
+                governor: apollo_engine::engine::profile_governor::ProfileGovernor::new(OptimizationProfile::BalancedRoot),
                 learned_policy: LearnedPolicy::default(),
                 adaptive_governor: AdaptiveGovernor::new(),
                 timeline: std::collections::VecDeque::new(),
@@ -435,7 +435,7 @@ mod tests {
                 thermal_level_real: "unknown".to_string(),
                 fast_tick_until: None,
                 reactor_event_weight: 0.0,
-                reactor_status: apollo_optimizer::engine::daemon_state::ReactorStatus::default(),
+                reactor_status: apollo_engine::engine::daemon_state::ReactorStatus::default(),
             })),
             frozen_state: Arc::new(Mutex::new(HashMap::new())),
             process: Arc::new(Mutex::new(ProcessState {
@@ -473,10 +473,10 @@ mod tests {
                 usage_model: UsageModel::default(),
                 usage_model_path: PathBuf::from("/tmp/apollo_test_um"),
                 usage_events_path: PathBuf::from("/tmp/apollo_test_ue"),
-                usage_tracker: apollo_optimizer::engine::daemon_state::UsageTrackerState::default(),
+                usage_tracker: apollo_engine::engine::daemon_state::UsageTrackerState::default(),
             })),
             mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
-            freeze_cooldown: Arc::new(Mutex::new(apollo_optimizer::engine::freeze_cooldown::FreezeCooldown::new())),
+            freeze_cooldown: Arc::new(Mutex::new(apollo_engine::engine::freeze_cooldown::FreezeCooldown::new())),
             hardware: Arc::new(Mutex::new(HardwareState {
                 last_hw_snapshot: None,
                 sysctl_governor_status: SysctlGovernorStatus {
@@ -500,7 +500,7 @@ mod tests {
             })),
             revert_sysctls_requested: Arc::new(AtomicBool::new(false)),
             cycle_condvar: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
-            resource_interrupt: Arc::new(apollo_optimizer::engine::thermal_interrupt::ResourceInterruptState::new()),
+            resource_interrupt: Arc::new(apollo_engine::engine::thermal_interrupt::ResourceInterruptState::new()),
             subscribers: Arc::new(Mutex::new(Vec::new())),
         }
     }

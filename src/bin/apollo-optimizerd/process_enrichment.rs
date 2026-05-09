@@ -13,17 +13,17 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use apollo_optimizer::engine::adaptive_governor::{GovernorDecision, ProcessDecision};
-use apollo_optimizer::engine::recently_applied::{CachedActionKind, RecentlyApplied};
-use apollo_optimizer::engine::daemon_helpers::pid_start_time;
-use apollo_optimizer::engine::decide_actions::is_interactive_app_name;
-use apollo_optimizer::engine::proc_taskinfo;
-use apollo_optimizer::engine::process_classifier::{ProcessSnapshot, ProcessTier};
-use apollo_optimizer::engine::process_tree::ProcessTree;
-use apollo_optimizer::engine::safety::is_protected_name;
-use apollo_optimizer::engine::types::{InteractiveContext, RootAction, SafetyPolicy};
-use apollo_optimizer::engine::audit_types::DecisionReason;
-use apollo_optimizer::engine::zombie_hunter::HuntSnapshot;
+use apollo_engine::engine::adaptive_governor::{GovernorDecision, ProcessDecision};
+use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
+use apollo_engine::engine::daemon_helpers::pid_start_time;
+use apollo_engine::engine::decide_actions::is_interactive_app_name;
+use apollo_engine::engine::proc_taskinfo;
+use apollo_engine::engine::process_classifier::{ProcessSnapshot, ProcessTier};
+use apollo_engine::engine::process_tree::ProcessTree;
+use apollo_engine::engine::safety::is_protected_name;
+use apollo_engine::engine::types::{InteractiveContext, RootAction, SafetyPolicy};
+use apollo_engine::engine::audit_types::DecisionReason;
+use apollo_engine::engine::zombie_hunter::HuntSnapshot;
 use sysinfo::ProcessStatus;
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -184,7 +184,7 @@ pub fn build_enriched_process_data_with_tree(
             // or when the process was idle) and stores the new sample as
             // the next baseline. The mutex is held only for the observe
             // call itself; no other I/O happens under it.
-            if let Ok(mut tracker) = apollo_optimizer::engine::contention_tracker::global().lock() {
+            if let Ok(mut tracker) = apollo_engine::engine::contention_tracker::global().lock() {
                 if let Some(ratio) = tracker.observe(pid_u32, ri.clone()) {
                     contention_map.insert(pid_u32, ratio);
                 }
@@ -206,7 +206,7 @@ pub fn build_enriched_process_data_with_tree(
     }
     // GC any tracker entries for pids that disappeared this cycle so the
     // map can't grow beyond the live pid set over a long-running session.
-    if let Ok(mut tracker) = apollo_optimizer::engine::contention_tracker::global().lock() {
+    if let Ok(mut tracker) = apollo_engine::engine::contention_tracker::global().lock() {
         tracker.gc(&live_pids);
     }
 
@@ -270,7 +270,7 @@ pub fn build_enriched_process_data_with_tree(
         // cached on ProcessSnapshot so downstream consumers don't repeat
         // the syscall.
         let is_app_bundle =
-            apollo_optimizer::engine::proc_taskinfo::is_user_app_bundle(pid_u32).unwrap_or(false);
+            apollo_engine::engine::proc_taskinfo::is_user_app_bundle(pid_u32).unwrap_or(false);
 
         proc_snaps.push(ProcessSnapshot {
             pid: pid_u32,
@@ -287,7 +287,7 @@ pub fn build_enriched_process_data_with_tree(
             process_uptime_secs,
             faults_total,
             pageins_total,
-            is_translated: apollo_optimizer::engine::process_identity::is_translated(pid_u32),
+            is_translated: apollo_engine::engine::process_identity::is_translated(pid_u32),
             mach_port_count: 0, // populated lazily for hoarder candidates only
             cpu_contention: contention_map.get(&pid_u32).copied(),
             is_app_bundle,
@@ -480,7 +480,7 @@ pub fn classify_governor_reason(reason: &str) -> DecisionReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apollo_optimizer::engine::process_tree::ProcessEntry;
+    use apollo_engine::engine::process_tree::ProcessEntry;
 
     // ── context_to_thermal ────────────────────────────────────────────────────
 

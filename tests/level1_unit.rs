@@ -4,14 +4,14 @@
 //! enforce_limits_with_budget, allowlisted_sysctls, protected/critical processes,
 //! and EMA convergence (BUG 13).
 
-use apollo_optimizer::engine::safety::{
+use apollo_engine::engine::safety::{
     allowlisted_sysctls, critical_background_processes, enforce_limits, enforce_limits_with_budget,
     protected_processes,
 };
-use apollo_optimizer::engine::types::{
+use apollo_engine::engine::types::{
     ActionBudgetState, OptimizationProfile, RootAction, SafetyPolicy,
 };
-use apollo_optimizer::engine::audit_types::DecisionReason;
+use apollo_engine::engine::audit_types::DecisionReason;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

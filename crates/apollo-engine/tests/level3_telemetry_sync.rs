@@ -12,9 +12,9 @@
 
 use std::sync::atomic::Ordering;
 
-use apollo_optimizer::engine::daemon_state::{MetricsState, ReactorStatus};
-use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
-use apollo_optimizer::engine::types::RuntimeMetrics;
+use apollo_engine::engine::daemon_state::{MetricsState, ReactorStatus};
+use apollo_engine::engine::lse_counters::LockFreeMetrics;
+use apollo_engine::engine::types::RuntimeMetrics;
 
 fn fresh_metrics_state() -> MetricsState {
     MetricsState {

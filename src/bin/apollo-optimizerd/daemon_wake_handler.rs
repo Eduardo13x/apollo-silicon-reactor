@@ -15,12 +15,12 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
-use apollo_optimizer::engine::daemon_helpers::write_wake_state;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::display_turbo::DisplayTurbo;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
-use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
+use apollo_engine::engine::daemon_helpers::write_wake_state;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::display_turbo::DisplayTurbo;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::outcome_tracker::OutcomeTracker;
+use apollo_engine::engine::signal_intelligence::SignalIntelligence;
 use chrono::{Duration as ChronoDuration, Utc};
 
 /// Run one wake-detection tick.

@@ -13,7 +13,7 @@
 
 #[cfg(test)]
 mod scenarios {
-    use apollo_optimizer::engine::process_classifier::{
+    use apollo_engine::engine::process_classifier::{
         score_utility, waste_score, ProcessClassifier, ProcessSnapshot, ProcessTier,
     };
 

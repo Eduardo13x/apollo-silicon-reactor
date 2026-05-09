@@ -33,18 +33,18 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use apollo_optimizer::collector::{SystemCollector, SystemSnapshot};
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::fluidity::FluidityState;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::mach_qos::SchedulingTier;
-use apollo_optimizer::engine::overflow_guard::OverflowThresholds;
-use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
-use apollo_optimizer::engine::pipeline::periodic_stage::{
+use apollo_engine::collector::{SystemCollector, SystemSnapshot};
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::fluidity::FluidityState;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::mach_qos::SchedulingTier;
+use apollo_engine::engine::overflow_guard::OverflowThresholds;
+use apollo_engine::engine::pipeline::learning_context::LearningContext;
+use apollo_engine::engine::pipeline::periodic_stage::{
     run_periodic, PeriodicContext, PeriodicResult,
 };
-use apollo_optimizer::engine::swap_predictor::SwapForecast;
-use apollo_optimizer::engine::thermal_bailout::ThermalAction;
+use apollo_engine::engine::swap_predictor::SwapForecast;
+use apollo_engine::engine::thermal_bailout::ThermalAction;
 
 use crate::cognitive_tick::{CognitiveDecision, CognitiveState};
 

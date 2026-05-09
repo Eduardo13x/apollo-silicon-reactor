@@ -9,15 +9,15 @@
 //! Paper: [Camacho 2007] MPC — predictive control must diverge from reactive
 //! baseline on signals the reactive path can't observe.
 
-use apollo_optimizer::engine::action_policy::{
+use apollo_engine::engine::action_policy::{
     ActionContext, PolicyScorer, PressureBenefitFeature, ProtectionFeature,
     UserDisruptionCostFeature,
 };
-use apollo_optimizer::engine::policy_feature_predictive::PredictiveBenefitFeature;
-use apollo_optimizer::engine::safety::ProtectionLevel;
-use apollo_optimizer::engine::types::RootAction;
-use apollo_optimizer::engine::audit_types::DecisionReason;
-use apollo_optimizer::engine::user_context::UserContext;
+use apollo_engine::engine::policy_feature_predictive::PredictiveBenefitFeature;
+use apollo_engine::engine::safety::ProtectionLevel;
+use apollo_engine::engine::types::RootAction;
+use apollo_engine::engine::audit_types::DecisionReason;
+use apollo_engine::engine::user_context::UserContext;
 
 /// Construct the adversarial context: reactive signals all below bypass
 /// (pressure 0.66 < 0.70, thrashing 9000 < 10 000) + active sleep assertion +

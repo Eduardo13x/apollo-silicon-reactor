@@ -16,20 +16,20 @@
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
-use apollo_optimizer::collector::SystemCollector;
-use apollo_optimizer::engine::adaptive_governor::ProcessDecision;
-use apollo_optimizer::engine::daemon_helpers::audit_log;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::foreground::ForegroundDetector;
-use apollo_optimizer::engine::hw_bayes::HwFeatures;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::outcome_tracker::ExperienceMemory;
-use apollo_optimizer::engine::process_classifier::ProcessSnapshot;
-use apollo_optimizer::engine::swap_reclaim::SaturationForecast;
-use apollo_optimizer::engine::types::RootAction;
-use apollo_optimizer::engine::unfreeze_decay::UnfreezeDecayModel;
-use apollo_optimizer::engine::zombie_hunter::HuntSnapshot;
-use apollo_optimizer::engine::{
+use apollo_engine::collector::SystemCollector;
+use apollo_engine::engine::adaptive_governor::ProcessDecision;
+use apollo_engine::engine::daemon_helpers::audit_log;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::foreground::ForegroundDetector;
+use apollo_engine::engine::hw_bayes::HwFeatures;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::outcome_tracker::ExperienceMemory;
+use apollo_engine::engine::process_classifier::ProcessSnapshot;
+use apollo_engine::engine::swap_reclaim::SaturationForecast;
+use apollo_engine::engine::types::RootAction;
+use apollo_engine::engine::unfreeze_decay::UnfreezeDecayModel;
+use apollo_engine::engine::zombie_hunter::HuntSnapshot;
+use apollo_engine::engine::{
     amx_detector,
     safety::{
         behavioral_protection_score, classify_protection, infrastructure_processes,
@@ -38,10 +38,10 @@ use apollo_optimizer::engine::{
 };
 use chrono::Utc;
 
-use apollo_optimizer::engine::process_tree::ProcessTree;
+use apollo_engine::engine::process_tree::ProcessTree;
 
 use crate::process_enrichment::{build_foreground_family, convert_and_merge_heuristic_decisions, HeuristicStats};
-use apollo_optimizer::engine::recently_applied::RecentlyApplied;
+use apollo_engine::engine::recently_applied::RecentlyApplied;
 
 pub struct HeuristicPassOutput {
     pub heuristic_decisions: Vec<ProcessDecision>,
@@ -125,7 +125,7 @@ pub fn run_heuristic_pass(
             .learned_policy
             .protected_patterns
             .clone();
-        let total_ram = apollo_optimizer::engine::sysctl_direct::read_u64("hw.memsize")
+        let total_ram = apollo_engine::engine::sysctl_direct::read_u64("hw.memsize")
             .unwrap_or(8 * 1024 * 1024 * 1024);
         let mut cpids: HashSet<u32> = HashSet::new();
         let mut bps_eval = 0u64;
