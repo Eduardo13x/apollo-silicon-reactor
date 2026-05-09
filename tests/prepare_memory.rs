@@ -14,7 +14,7 @@
 
 #[cfg(test)]
 mod scenarios {
-    use apollo_optimizer::engine::compressor_aware::{
+    use apollo_engine::engine::compressor_aware::{
         compressor_efficiency_score, decide_enhanced, decide_memory_action, MemoryAction,
         ProcessMemoryProfile, TempProfile,
     };

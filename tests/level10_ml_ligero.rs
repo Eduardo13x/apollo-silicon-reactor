@@ -1,7 +1,7 @@
 // tests/level10_ml_ligero.rs
 // Tests for the ML Ligero Bayesian workload classifier.
 
-use apollo_optimizer::engine::{
+use apollo_engine::engine::{
     adaptive_governor::AdaptiveGovernor,
     llm::LearnedPolicy,
     user_profile::{UserProfile, UserProfilePersisted, WorkloadType},

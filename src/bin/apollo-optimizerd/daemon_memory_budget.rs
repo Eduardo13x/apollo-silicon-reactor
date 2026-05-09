@@ -15,14 +15,14 @@
 use std::collections::HashMap;
 use std::time::{Instant, Duration};
 
-use apollo_optimizer::engine::compressor_aware::query_memory_profile;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::jetsam_control;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
-use apollo_optimizer::engine::memory_budget::{self, ProcessBudgetInput};
-use apollo_optimizer::engine::overflow_guard::is_build_tool_name;
-use apollo_optimizer::engine::process_classifier::ProcessSnapshot;
+use apollo_engine::engine::compressor_aware::query_memory_profile;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::jetsam_control;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::memory_analyzer::MemoryAnalyzer;
+use apollo_engine::engine::memory_budget::{self, ProcessBudgetInput};
+use apollo_engine::engine::overflow_guard::is_build_tool_name;
+use apollo_engine::engine::process_classifier::ProcessSnapshot;
 
 /// Pressure zones with hysteresis thresholds.
 /// [Hellerstein 2004] Operating-regime control.
@@ -284,21 +284,21 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::path::PathBuf;
     use std::collections::{HashMap, VecDeque};
-    use apollo_optimizer::engine::daemon_state::{
+    use apollo_engine::engine::daemon_state::{
         MetricsState, PolicyState, ProcessState, HardwareState, LlmDomainState, UsageDomainState,
         ReactorStatus, UsageTrackerState,
     };
-    use apollo_optimizer::engine::types::{OptimizationProfile, LatencyTarget, RuntimeMetrics};
-    use apollo_optimizer::engine::adaptive_governor::AdaptiveGovernor;
-    use apollo_optimizer::engine::profile_governor::ProfileGovernor;
-    use apollo_optimizer::engine::llm::{LlmConfig, LlmState, LearnedPolicy};
-    use apollo_optimizer::engine::circuit_breaker::CircuitBreaker;
-    use apollo_optimizer::engine::degradation::DegradationController;
-    use apollo_optimizer::engine::usage_model::UsageModel;
-    use apollo_optimizer::engine::mach_qos::MachQoSManager;
-    use apollo_optimizer::engine::daemon_helpers::WakeRuntimeState;
-    use apollo_optimizer::engine::sysctl_governor::SysctlGovernorStatus;
-    use apollo_optimizer::engine::thermal_interrupt::ResourceInterruptState;
+    use apollo_engine::engine::types::{OptimizationProfile, LatencyTarget, RuntimeMetrics};
+    use apollo_engine::engine::adaptive_governor::AdaptiveGovernor;
+    use apollo_engine::engine::profile_governor::ProfileGovernor;
+    use apollo_engine::engine::llm::{LlmConfig, LlmState, LearnedPolicy};
+    use apollo_engine::engine::circuit_breaker::CircuitBreaker;
+    use apollo_engine::engine::degradation::DegradationController;
+    use apollo_engine::engine::usage_model::UsageModel;
+    use apollo_engine::engine::mach_qos::MachQoSManager;
+    use apollo_engine::engine::daemon_helpers::WakeRuntimeState;
+    use apollo_engine::engine::sysctl_governor::SysctlGovernorStatus;
+    use apollo_engine::engine::thermal_interrupt::ResourceInterruptState;
     use std::sync::Condvar;
 
     fn mock_state() -> SharedState {
@@ -369,7 +369,7 @@ mod tests {
             })),
             frozen_state: Arc::new(Mutex::new(HashMap::new())),
             mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
-            freeze_cooldown: Arc::new(Mutex::new(apollo_optimizer::engine::freeze_cooldown::FreezeCooldown::new())),
+            freeze_cooldown: Arc::new(Mutex::new(apollo_engine::engine::freeze_cooldown::FreezeCooldown::new())),
             stop: Arc::new(AtomicBool::new(false)),
             revert_sysctls_requested: Arc::new(AtomicBool::new(false)),
             cycle_condvar: Arc::new((Mutex::new(false), Condvar::new())),

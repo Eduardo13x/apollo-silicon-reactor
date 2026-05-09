@@ -15,7 +15,7 @@
 //! BEFORE decision_stage.run() so the boosted reactor_weight flows into the
 //! freeze gate.
 
-use apollo_optimizer::engine::swap_reclaim::{SaturationForecast, SwapRisk, CRITICAL_ETA_SEC};
+use apollo_engine::engine::swap_reclaim::{SaturationForecast, SwapRisk, CRITICAL_ETA_SEC};
 
 /// Apply pre-emptive reactor_weight boost based on ODE saturation forecast.
 ///

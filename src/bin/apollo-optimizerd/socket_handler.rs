@@ -23,19 +23,19 @@ use std::thread;
 use anyhow::Context;
 use chrono::{Duration as ChronoDuration, Local, Utc};
 
-use apollo_optimizer::collector::SystemCollector;
-use apollo_optimizer::engine::capabilities::detect_capabilities;
-use apollo_optimizer::engine::daemon_helpers::{
+use apollo_engine::collector::SystemCollector;
+use apollo_engine::engine::capabilities::detect_capabilities;
+use apollo_engine::engine::daemon_helpers::{
     kill_switch_path, merge_seed_into, metrics_path, socket_path, unfreeze_pids_verified,
 };
-use apollo_optimizer::engine::llm::{
+use apollo_engine::engine::llm::{
     append_jsonl, delete_file_best_effort, load_repo_config, write_json, write_secret,
     FeedbackEntry, LlmAdvisor,
 };
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::protocol::{DaemonRequest, DaemonResponse};
-use apollo_optimizer::engine::safety::pattern_conflicts_with_protected;
-use apollo_optimizer::engine::types::{
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::protocol::{DaemonRequest, DaemonResponse};
+use apollo_engine::engine::safety::pattern_conflicts_with_protected;
+use apollo_engine::engine::types::{
     DaemonStatus, FrozenProcessInfo, HardPath, HealthReport, LearnedPolicyStatus, LlmRunMode,
     LlmStatus, RuntimeMetrics, UsageResponse,
 };
@@ -359,11 +359,11 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 },
                 format!(
                     "swapusage_readable: {}",
-                    apollo_optimizer::engine::sysctl_direct::read_swap_usage().is_some()
+                    apollo_engine::engine::sysctl_direct::read_swap_usage().is_some()
                 ),
                 format!(
                     "memory_pressure_readable: {}",
-                    apollo_optimizer::engine::host_vm_info::read_vm_stats().is_some()
+                    apollo_engine::engine::host_vm_info::read_vm_stats().is_some()
                 ),
             ];
             DaemonResponse::Doctor { checks }
@@ -550,23 +550,23 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 }
                 Err(err) => {
                     let (http_status, msg) = match err {
-                        apollo_optimizer::engine::llm::LlmCallError::Cooldown => {
+                        apollo_engine::engine::llm::LlmCallError::Cooldown => {
                             (None, "cooldown".to_string())
                         }
-                        apollo_optimizer::engine::llm::LlmCallError::HttpStatus {
+                        apollo_engine::engine::llm::LlmCallError::HttpStatus {
                             code,
                             body_excerpt,
                         } => (
                             Some(code),
                             format!("http {} {}", code, body_excerpt.unwrap_or_default()),
                         ),
-                        apollo_optimizer::engine::llm::LlmCallError::Transport(e) => {
+                        apollo_engine::engine::llm::LlmCallError::Transport(e) => {
                             (None, format!("transport {}", e))
                         }
-                        apollo_optimizer::engine::llm::LlmCallError::Parse(e) => {
+                        apollo_engine::engine::llm::LlmCallError::Parse(e) => {
                             (None, format!("parse {}", e))
                         }
-                        apollo_optimizer::engine::llm::LlmCallError::Rejected(e) => {
+                        apollo_engine::engine::llm::LlmCallError::Rejected(e) => {
                             (None, format!("rejected {}", e))
                         }
                     };
@@ -701,8 +701,8 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             DaemonResponse::Ok
         }
         DaemonRequest::GetHealth => {
-            use apollo_optimizer::engine::circuit_breaker::CircuitState;
-            use apollo_optimizer::engine::degradation::OperationMode;
+            use apollo_engine::engine::circuit_breaker::CircuitState;
+            use apollo_engine::engine::degradation::OperationMode;
 
             let (cb_state_str, cb_trips) = {
                 let pg = state.policy.lock_recover();
@@ -746,7 +746,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
         // Subscribe es manejado antes de llegar aqui (en handle_client)
         DaemonRequest::Subscribe => DaemonResponse::Ok,
         DaemonRequest::GetVersion => DaemonResponse::VersionInfo {
-            protocol: apollo_optimizer::engine::protocol::PROTOCOL_VERSION,
+            protocol: apollo_engine::engine::protocol::PROTOCOL_VERSION,
             build: env!("CARGO_PKG_VERSION").to_string(),
         },
     }

@@ -15,16 +15,16 @@
 
 use std::path::Path;
 
-use apollo_optimizer::engine::daemon_helpers::write_frozen_state;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::display_turbo::DisplayTurbo;
-use apollo_optimizer::engine::kqueue_pressure;
-use apollo_optimizer::engine::learned_state::LearnableParams;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::overflow_guard::OverflowGuard;
-use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
-use apollo_optimizer::engine::identity_cache_manager::IdentityCacheManager;
-use apollo_optimizer::collector::SystemSnapshot;
+use apollo_engine::engine::daemon_helpers::write_frozen_state;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::display_turbo::DisplayTurbo;
+use apollo_engine::engine::kqueue_pressure;
+use apollo_engine::engine::learned_state::LearnableParams;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::overflow_guard::OverflowGuard;
+use apollo_engine::engine::signal_intelligence::SignalIntelligence;
+use apollo_engine::engine::identity_cache_manager::IdentityCacheManager;
+use apollo_engine::collector::SystemSnapshot;
 use std::time::{Duration, Instant};
 
 /// Drain kqueue events for this cycle and update reactor_weight.

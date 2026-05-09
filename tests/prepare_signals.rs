@@ -14,7 +14,7 @@
 
 #[cfg(test)]
 mod scenarios {
-    use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
+    use apollo_engine::engine::signal_intelligence::SignalIntelligence;
 
     /// Helper: tick with given pressure, all else nominal.
     fn tick_at(si: &mut SignalIntelligence, pressure: f64) {
@@ -360,7 +360,7 @@ mod scenarios {
     fn tick_at_returning(
         si: &mut SignalIntelligence,
         pressure: f64,
-    ) -> apollo_optimizer::engine::signal_intelligence::SignalDigest {
+    ) -> apollo_engine::engine::signal_intelligence::SignalDigest {
         si.tick(
             pressure,
             10.0,
@@ -379,7 +379,7 @@ mod scenarios {
     fn tick_stressed_returning(
         si: &mut SignalIntelligence,
         pressure: f64,
-    ) -> apollo_optimizer::engine::signal_intelligence::SignalDigest {
+    ) -> apollo_engine::engine::signal_intelligence::SignalDigest {
         si.tick(
             pressure,
             50_000.0,

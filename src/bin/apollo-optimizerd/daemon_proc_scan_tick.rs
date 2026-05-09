@@ -14,11 +14,11 @@
 
 use std::time::Duration;
 
-use apollo_optimizer::engine::compressor_aware::query_memory_profile;
-use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
-use apollo_optimizer::engine::process_classifier::ProcessSnapshot;
-use apollo_optimizer::engine::process_recovery::ProcessRecoveryManager;
-use apollo_optimizer::engine::wake_storm_detector::WakeStormDetector;
+use apollo_engine::engine::compressor_aware::query_memory_profile;
+use apollo_engine::engine::memory_analyzer::MemoryAnalyzer;
+use apollo_engine::engine::process_classifier::ProcessSnapshot;
+use apollo_engine::engine::process_recovery::ProcessRecoveryManager;
+use apollo_engine::engine::wake_storm_detector::WakeStormDetector;
 
 /// Profile top-50 processes for memory leaks and elevated wakeup rates.
 ///

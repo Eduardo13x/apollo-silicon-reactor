@@ -11,15 +11,15 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use apollo_optimizer::collector::SystemCollector;
-use apollo_optimizer::engine::daemon_helpers::{
+use apollo_engine::collector::SystemCollector;
+use apollo_engine::engine::daemon_helpers::{
     unfreeze_pids_verified, write_frozen_state,
 };
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::display_turbo::DisplayTurbo;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::process_tree::{ProcessEntry, ProcessTree};
-use apollo_optimizer::engine::sleep_notifier::SleepNotifier;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::display_turbo::DisplayTurbo;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::process_tree::{ProcessEntry, ProcessTree};
+use apollo_engine::engine::sleep_notifier::SleepNotifier;
 
 /// Build the parent/child process tree from the latest sysinfo snapshot.
 ///

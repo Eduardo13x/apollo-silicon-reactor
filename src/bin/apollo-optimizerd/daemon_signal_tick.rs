@@ -15,14 +15,14 @@
 //! [NLM warning: pass cycle_dt_secs as parameter — never recalculate it here
 //!  to avoid the mid-loop reset bug (dac6de9) that corrupted ODE models.]
 
-use apollo_optimizer::engine::daemon_helpers::audit_log;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::evolved_anomaly::EvolvedAnomalyDetector;
-use apollo_optimizer::engine::fluidity::FluidityState;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::signal_intelligence::{SignalDigest, SignalIntelligence};
-use apollo_optimizer::engine::telemetry_logger::{TelemetryLogger, TelemetryVector};
-use apollo_optimizer::collector::SystemSnapshot;
+use apollo_engine::engine::daemon_helpers::audit_log;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::evolved_anomaly::EvolvedAnomalyDetector;
+use apollo_engine::engine::fluidity::FluidityState;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::signal_intelligence::{SignalDigest, SignalIntelligence};
+use apollo_engine::engine::telemetry_logger::{TelemetryLogger, TelemetryVector};
+use apollo_engine::collector::SystemSnapshot;
 
 pub struct SignalTickOutput {
     pub signal_digest: SignalDigest,

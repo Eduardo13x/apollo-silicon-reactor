@@ -15,16 +15,16 @@
 
 use std::path::Path;
 
-use apollo_optimizer::collector::SystemCollector;
-use apollo_optimizer::engine::cache_warmer::CacheWarmer;
-use apollo_optimizer::engine::daemon_helpers::{unfreeze_pids, write_frozen_state};
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::focus_markov::FocusMarkov;
-use apollo_optimizer::engine::freeze_intelligence::FreezeIntelligence;
-use apollo_optimizer::engine::jetsam_control;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::mach_qos::SchedulingTier;
-use apollo_optimizer::engine::temporal_predictor::TemporalPredictor;
+use apollo_engine::collector::SystemCollector;
+use apollo_engine::engine::cache_warmer::CacheWarmer;
+use apollo_engine::engine::daemon_helpers::{unfreeze_pids, write_frozen_state};
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::focus_markov::FocusMarkov;
+use apollo_engine::engine::freeze_intelligence::FreezeIntelligence;
+use apollo_engine::engine::jetsam_control;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::mach_qos::SchedulingTier;
+use apollo_engine::engine::temporal_predictor::TemporalPredictor;
 use chrono::{Timelike, Utc};
 
 pub struct MarkovTickOutput {
@@ -81,7 +81,7 @@ pub fn run_markov_tick(
             let total = *markov_hit_count + *markov_miss_count;
             if total > 0 && total % 50 == 0 {
                 let accuracy = *markov_hit_count as f64 / total as f64;
-                apollo_optimizer::engine::daemon_helpers::audit_log(&serde_json::json!({
+                apollo_engine::engine::daemon_helpers::audit_log(&serde_json::json!({
                     "event": "markov_prediction_accuracy",
                     "hits": markov_hit_count,
                     "misses": markov_miss_count,

@@ -3,11 +3,11 @@
 //! Tests for mach_qos (P/E-Core routing) and iokit_sensors (hardware telemetry).
 //! All tests are non-root-safe: they verify logic, parsing, and mapping only.
 
-use apollo_optimizer::engine::iokit_sensors::{
+use apollo_engine::engine::iokit_sensors::{
     ClusterTemps, HardwareSnapshot, IOKitSensorReader, PowerReading, ThermalState,
 };
-use apollo_optimizer::engine::mach_qos::{tier_for_process, MachQoSManager, SchedulingTier};
-use apollo_optimizer::engine::process_classifier::ProcessTier;
+use apollo_engine::engine::mach_qos::{tier_for_process, MachQoSManager, SchedulingTier};
+use apollo_engine::engine::process_classifier::ProcessTier;
 
 // ── MachQoS unit tests ────────────────────────────────────────────────────────
 

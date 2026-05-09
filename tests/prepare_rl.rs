@@ -15,7 +15,7 @@
 mod scenarios {
     use std::path::PathBuf;
 
-    use apollo_optimizer::engine::rl_threshold::{RlState, RlThresholdAgent, RL_ABSOLUTE_FLOOR};
+    use apollo_engine::engine::rl_threshold::{RlState, RlThresholdAgent, RL_ABSOLUTE_FLOOR};
 
     fn make_agent() -> RlThresholdAgent {
         RlThresholdAgent::load_or_default(&PathBuf::from("/dev/null"))

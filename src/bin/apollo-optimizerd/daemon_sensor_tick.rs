@@ -32,14 +32,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use apollo_optimizer::collector::SystemSnapshot;
-use apollo_optimizer::engine::energy_pid::{EnergyPidTracker, ProcessEnergyDelta};
-use apollo_optimizer::engine::ioreport::{IOReportReader, IOReportSnapshot};
-use apollo_optimizer::engine::kpc_counters::{KpcReader, KpcSnapshot};
-use apollo_optimizer::engine::rosetta_monitor::RosettaMonitor;
-use apollo_optimizer::engine::smc_direct::{SmcDirectReader, SmcSnapshot};
-use apollo_optimizer::engine::syscall_classifier::SyscallClassifier;
-use apollo_optimizer::engine::thermal_iokit::IoPmSnapshot;
+use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::energy_pid::{EnergyPidTracker, ProcessEnergyDelta};
+use apollo_engine::engine::ioreport::{IOReportReader, IOReportSnapshot};
+use apollo_engine::engine::kpc_counters::{KpcReader, KpcSnapshot};
+use apollo_engine::engine::rosetta_monitor::RosettaMonitor;
+use apollo_engine::engine::smc_direct::{SmcDirectReader, SmcSnapshot};
+use apollo_engine::engine::syscall_classifier::SyscallClassifier;
+use apollo_engine::engine::thermal_iokit::IoPmSnapshot;
 
 /// Aggregate output of the per-cycle sensor pass.
 ///
@@ -154,19 +154,19 @@ pub fn run_sensor_tick(
 
     // Battery vampire detection: processes with >50 wakeups/s get priority throttle.
     let wakeup_hints =
-        apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_wakeup_hints(
+        apollo_engine::engine::energy_pid::EnergyPidTracker::build_wakeup_hints(
             &energy_pid_results,
             50.0,
         );
     // Physical footprint hints for accurate freeze ranking.
     let footprint_hints =
-        apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_footprint_hints(
+        apollo_engine::engine::energy_pid::EnergyPidTracker::build_footprint_hints(
             &energy_pid_results,
         );
     // I/O burst hints: background processes writing >5 MB/s compete for
     // disk bandwidth with LLM model weight loading — throttle during inference.
     let io_burst_hints =
-        apollo_optimizer::engine::energy_pid::EnergyPidTracker::build_io_burst_hints(
+        apollo_engine::engine::energy_pid::EnergyPidTracker::build_io_burst_hints(
             &energy_pid_results,
             5.0,
         );
@@ -175,7 +175,7 @@ pub fn run_sensor_tick(
     // Threshold is raised during cold start (< 10 warm baselines) to suppress
     // false positives from poorly-trained detectors. [Chandola 2009 §4.1]
     let anomaly_thresh =
-        apollo_optimizer::engine::process_baseline::effective_threshold(
+        apollo_engine::engine::process_baseline::effective_threshold(
             energy_pid_tracker.baseline.warm_count(),
         );
     let anomaly_hints: HashMap<u32, f64> = energy_pid_results
@@ -200,7 +200,7 @@ pub fn run_sensor_tick(
                 syscall_classifier
                     .sample(pid)
                     .filter(|p| {
-                        *p == apollo_optimizer::engine::syscall_classifier::SyscallProfile::JitCompiling
+                        *p == apollo_engine::engine::syscall_classifier::SyscallProfile::JitCompiling
                     })
                     .map(|_| pid)
             })
@@ -209,7 +209,7 @@ pub fn run_sensor_tick(
 
     // ── IOPMrootDomain direct thermal (every 10 cycles, aligned with HwPredictor) ──
     let iopm_snap = if cycle_count % 10 == 0 {
-        apollo_optimizer::engine::thermal_iokit::read_iopm_state()
+        apollo_engine::engine::thermal_iokit::read_iopm_state()
     } else {
         None
     };

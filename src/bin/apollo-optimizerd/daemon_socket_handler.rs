@@ -23,7 +23,7 @@
 use std::thread;
 use std::time::Duration;
 
-use apollo_optimizer::engine::daemon_state::SharedState;
+use apollo_engine::engine::daemon_state::SharedState;
 
 use super::socket_handler;
 

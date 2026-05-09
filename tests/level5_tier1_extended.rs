@@ -2,9 +2,9 @@
 //! Tests for process_recovery, swap_predictor, and gpu_manager modules
 //! These are the highest-priority missing optimization features
 
-use apollo_optimizer::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
-use apollo_optimizer::engine::process_recovery::{LeakingProcess, ProcessRecoveryManager};
-use apollo_optimizer::engine::swap_predictor::{SwapPredictor, SwapTrend};
+use apollo_engine::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
+use apollo_engine::engine::process_recovery::{LeakingProcess, ProcessRecoveryManager};
+use apollo_engine::engine::swap_predictor::{SwapPredictor, SwapTrend};
 use std::time::{Duration, Instant};
 
 // ============================================================================

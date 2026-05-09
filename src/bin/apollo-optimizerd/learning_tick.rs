@@ -18,27 +18,27 @@
 //! 9. **Predictive agent** — observe pressure outcome, MPC feedback
 //! 10. **Periodic persist (% 100)** — flush pipeline, persist signal/state/skills, causal edge learning
 
-use apollo_optimizer::collector::SystemCollector;
-use apollo_optimizer::collector::SystemSnapshot;
-use apollo_optimizer::engine::daemon_helpers::{hop_groups_path, signal_intelligence_path};
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::effectiveness_tracker::EffectivenessTracker;
-use apollo_optimizer::engine::blocked_action_journal::emit_audit_async;
-use apollo_optimizer::engine::execute_actions::ExecuteOutcomes;
-use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
-use apollo_optimizer::engine::learned_state::{
+use apollo_engine::collector::SystemCollector;
+use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::daemon_helpers::{hop_groups_path, signal_intelligence_path};
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::effectiveness_tracker::EffectivenessTracker;
+use apollo_engine::engine::blocked_action_journal::emit_audit_async;
+use apollo_engine::engine::execute_actions::ExecuteOutcomes;
+use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
+use apollo_engine::engine::learned_state::{
     LearnableParams, LearnedState, RestoreQualityMonitor,
 };
-use apollo_optimizer::engine::learning_pipeline::{LearningObservation, LearningPipeline};
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::nars_belief::{ArousalState, Salience};
-use apollo_optimizer::engine::nested_learner::NestedLearner;
-use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
-use apollo_optimizer::engine::predictive_agent::{Intervention, SpecialistVote};
-use apollo_optimizer::engine::signal_intelligence::SignalDigest;
-use apollo_optimizer::engine::system_log_ingester::{SystemEvent, SystemLogIngester};
-use apollo_optimizer::engine::types::{FrozenPidEntry, FrozenStatePersisted};
-use apollo_optimizer::engine::workload_classifier::WorkloadMode;
+use apollo_engine::engine::learning_pipeline::{LearningObservation, LearningPipeline};
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::nars_belief::{ArousalState, Salience};
+use apollo_engine::engine::nested_learner::NestedLearner;
+use apollo_engine::engine::pipeline::learning_context::LearningContext;
+use apollo_engine::engine::predictive_agent::{Intervention, SpecialistVote};
+use apollo_engine::engine::signal_intelligence::SignalDigest;
+use apollo_engine::engine::system_log_ingester::{SystemEvent, SystemLogIngester};
+use apollo_engine::engine::types::{FrozenPidEntry, FrozenStatePersisted};
+use apollo_engine::engine::workload_classifier::WorkloadMode;
 
 /// Run all per-cycle learning pipeline work.
 ///
@@ -157,7 +157,7 @@ pub fn run_learning_tick<'a>(
     // Record throttle/freeze actions for causal evaluation with resource snapshots
     // for mechanism attribution. Multi-horizon eval: 3 cycles (fast) + 15 cycles (slow).
     {
-        use apollo_optimizer::engine::causal_graph::ResourceSnapshot;
+        use apollo_engine::engine::causal_graph::ResourceSnapshot;
         let pressure_now = snapshot.pressure.memory_pressure as f32;
         let swap_mb_now = snapshot.pressure.swap_used_bytes as f32 / 1_048_576.0;
         for name in throttle_names_for_outcome {
@@ -214,7 +214,7 @@ pub fn run_learning_tick<'a>(
         // Sample every 10 cycles to avoid log bloat. Always emit if
         // compaction_duration_ms exceeds the canary rollback threshold (10ms).
         if cycle_count % 10 == 0 || compaction_duration_ms > 10.0 {
-            use apollo_optimizer::engine::causal_graph::HOT_PATH_EDGE_CAP;
+            use apollo_engine::engine::causal_graph::HOT_PATH_EDGE_CAP;
             let cap_utilization_ratio =
                 lctx.causal_graph.edge_count() as f64 / HOT_PATH_EDGE_CAP as f64;
             tracing::debug!(
@@ -243,8 +243,8 @@ pub fn run_learning_tick<'a>(
     // resource-coalition limit (~99 KB/s) and triggering disk-write
     // microstackshots / I/O QoS throttling system-wide.
     {
-        use apollo_optimizer::engine::daemon_helpers::policy_audit_path;
-        use apollo_optimizer::engine::types::RootAction;
+        use apollo_engine::engine::daemon_helpers::policy_audit_path;
+        use apollo_engine::engine::types::RootAction;
         let audit_path = std::path::PathBuf::from(policy_audit_path());
         for trace in &exec_outcomes.audit_traces {
             let is_silent_sysctl_skip = !trace.applied
@@ -398,7 +398,7 @@ pub fn run_learning_tick<'a>(
                         name, w.effectiveness(), pressure, workload, cycle_count
                     );
                     let novel_path =
-                        apollo_optimizer::engine::daemon_helpers::novel_patterns_path();
+                        apollo_engine::engine::daemon_helpers::novel_patterns_path();
                     let _ = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
@@ -412,7 +412,7 @@ pub fn run_learning_tick<'a>(
         }
         // Opportunistic rotation: every 100 cycles, check size and rotate if > 64 KiB.
         if cycle_count % 100 == 0 {
-            let novel_path = apollo_optimizer::engine::daemon_helpers::novel_patterns_path();
+            let novel_path = apollo_engine::engine::daemon_helpers::novel_patterns_path();
             if let Ok(meta) = std::fs::metadata(novel_path) {
                 if meta.len() > 64 * 1024 {
                     let old_path = format!("{}.old", novel_path);

@@ -15,7 +15,7 @@
 //! 3. **llm_steady** — constant ~0.72 ± 0.03 noise (LLM inference)
 //! 4. **mixed_adversarial** — alternating regimes every 10 steps (high meta-velocity)
 
-use apollo_optimizer::engine::nested_learner::NestedLearner;
+use apollo_engine::engine::nested_learner::NestedLearner;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

@@ -11,15 +11,15 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{Duration as ChronoDuration, Local, Timelike, Utc};
 
-use apollo_optimizer::engine::daemon_helpers::pid_start_time;
-use apollo_optimizer::engine::llm::{
+use apollo_engine::engine::daemon_helpers::pid_start_time;
+use apollo_engine::engine::llm::{
     append_jsonl, delete_file_best_effort, load_repo_config, write_json, LearnedPolicy, LlmAdvisor,
     SuggestionOutcome, TeacherContext,
 };
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::safety::pattern_conflicts_with_protected;
-use apollo_optimizer::engine::types::{HardPath, LlmRunMode, RootAction};
-use apollo_optimizer::engine::audit_types::DecisionReason;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::safety::pattern_conflicts_with_protected;
+use apollo_engine::engine::types::{HardPath, LlmRunMode, RootAction};
+use apollo_engine::engine::audit_types::DecisionReason;
 
 use super::SharedState;
 
@@ -35,7 +35,7 @@ pub struct LlmReactiveCounters {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-pub fn windowserver_cpu(snapshot: &apollo_optimizer::collector::SystemSnapshot) -> f32 {
+pub fn windowserver_cpu(snapshot: &apollo_engine::collector::SystemSnapshot) -> f32 {
     snapshot
         .top_processes
         .iter()
@@ -49,7 +49,7 @@ pub fn windowserver_cpu(snapshot: &apollo_optimizer::collector::SystemSnapshot) 
 pub fn llm_reactive_tick(
     state: &SharedState,
     advisor: &mut LlmAdvisor,
-    snapshot: &apollo_optimizer::collector::SystemSnapshot,
+    snapshot: &apollo_engine::collector::SystemSnapshot,
     counters: &mut LlmReactiveCounters,
     heuristic_struggling: bool,
 ) {
@@ -722,10 +722,10 @@ pub fn llm_reactive_tick(
             let mut guard = state.llm.lock_recover();
             guard.llm_state.consecutive_failures += 1;
             match err {
-                apollo_optimizer::engine::llm::LlmCallError::Cooldown => {
+                apollo_engine::engine::llm::LlmCallError::Cooldown => {
                     guard.llm_state.last_error = Some("cooldown".to_string());
                 }
-                apollo_optimizer::engine::llm::LlmCallError::HttpStatus { code, body_excerpt } => {
+                apollo_engine::engine::llm::LlmCallError::HttpStatus { code, body_excerpt } => {
                     guard.llm_state.last_http_status = Some(code);
                     guard.llm_state.last_error = Some(format!(
                         "http-status {} {}",
@@ -733,13 +733,13 @@ pub fn llm_reactive_tick(
                         body_excerpt.unwrap_or_default()
                     ));
                 }
-                apollo_optimizer::engine::llm::LlmCallError::Transport(e) => {
+                apollo_engine::engine::llm::LlmCallError::Transport(e) => {
                     guard.llm_state.last_error = Some(format!("transport {}", e));
                 }
-                apollo_optimizer::engine::llm::LlmCallError::Parse(e) => {
+                apollo_engine::engine::llm::LlmCallError::Parse(e) => {
                     guard.llm_state.last_error = Some(format!("parse {}", e));
                 }
-                apollo_optimizer::engine::llm::LlmCallError::Rejected(e) => {
+                apollo_engine::engine::llm::LlmCallError::Rejected(e) => {
                     guard.llm_state.last_error = Some(format!("rejected {}", e));
                 }
             }
@@ -757,7 +757,7 @@ pub fn llm_reactive_tick(
 
 pub fn usage_learning_tick(
     state: &SharedState,
-    snapshot: &apollo_optimizer::collector::SystemSnapshot,
+    snapshot: &apollo_engine::collector::SystemSnapshot,
     has_foreground: bool,
     cpu_wall_ratios: &HashMap<String, f32>,
 ) {
@@ -913,7 +913,7 @@ pub fn usage_learning_tick(
 // ── Apply Learned Policy Actions ───────────────────────────────────────────
 
 pub fn apply_learned_policy_actions(
-    snapshot: &apollo_optimizer::collector::SystemSnapshot,
+    snapshot: &apollo_engine::collector::SystemSnapshot,
     policy: &LearnedPolicy,
     mut actions: Vec<RootAction>,
 ) -> Vec<RootAction> {
@@ -952,7 +952,7 @@ pub fn apply_learned_policy_actions(
         }
     }
 
-    let survival = apollo_optimizer::engine::safety::survival_mode_active_total(
+    let survival = apollo_engine::engine::safety::survival_mode_active_total(
         snapshot.pressure.memory_pressure,
         snapshot.pressure.swap_used_bytes,
         snapshot.pressure.swap_total_bytes,
@@ -1006,7 +1006,7 @@ pub fn apply_learned_policy_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apollo_optimizer::collector::{CpuStats, MemoryStats, PressureStats, ProcessStats, SystemSnapshot};
+    use apollo_engine::collector::{CpuStats, MemoryStats, PressureStats, ProcessStats, SystemSnapshot};
 
     fn snapshot_with(processes: Vec<ProcessStats>) -> SystemSnapshot {
         SystemSnapshot {

@@ -14,9 +14,9 @@
 
 use std::collections::HashSet;
 
-use apollo_optimizer::collector::SystemSnapshot;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::lock_ext::LockRecover;
+use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::lock_ext::LockRecover;
 
 /// Daemons that are I/O-bound (low cpu_wall_ratio) but must NEVER be classified
 /// as interactive. [Android LMK] Protection earned by user interaction, not I/O.
@@ -57,7 +57,7 @@ pub fn build_behavior_interactive_pids(
         .entries()
         .iter()
         .filter(|(name, entry)| {
-            apollo_optimizer::engine::usage_model::is_behavior_interactive(entry)
+            apollo_engine::engine::usage_model::is_behavior_interactive(entry)
                 && !BEHAVIOR_DENYLIST.iter().any(|d| name.contains(d))
         })
         .map(|(name, _)| name.as_str())

@@ -56,19 +56,19 @@ use std::collections::{HashMap, HashSet};
 
 use sysinfo::System;
 
-use apollo_optimizer::engine::daemon_helpers::audit_log;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::overflow_guard::OverflowThresholds;
-use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
-use apollo_optimizer::engine::predictive_agent::{
+use apollo_engine::engine::daemon_helpers::audit_log;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::overflow_guard::OverflowThresholds;
+use apollo_engine::engine::pipeline::learning_context::LearningContext;
+use apollo_engine::engine::predictive_agent::{
     specialist, tally_votes, Intervention, SpecialistVote,
 };
-use apollo_optimizer::engine::lotka_volterra::StabilityRegime;
-use apollo_optimizer::engine::nars_belief::TruthValue;
-use apollo_optimizer::engine::signal_intelligence::SignalDigest;
-use apollo_optimizer::engine::types::OptimizationProfile;
+use apollo_engine::engine::lotka_volterra::StabilityRegime;
+use apollo_engine::engine::nars_belief::TruthValue;
+use apollo_engine::engine::signal_intelligence::SignalDigest;
+use apollo_engine::engine::types::OptimizationProfile;
 
 /// NARS belief confidence target for monopoly_freeze maturity gate.
 /// At c=0.80 the belief carries enough evidence to act on without
@@ -79,7 +79,7 @@ const MONOPOLY_BELIEF_CONFIDENCE_TARGET: f32 = 0.80;
 /// vote weight so pathological monopoly_risk > 0.5 never gets silenced
 /// completely [Gray & Reuter 1992 §11, evidence-gated decisions].
 const MONOPOLY_MATURITY_FLOOR: f64 = 0.4;
-use apollo_optimizer::engine::user_context::UserContext;
+use apollo_engine::engine::user_context::UserContext;
 
 /// Per-process habituation bucket window size: unchanged ≥ this many cycles
 /// ⇒ habituated and skipped in `decide_actions`.

@@ -14,12 +14,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use apollo_optimizer::engine::coalition::CoalitionTracker;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::jetsam_control;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::process_classifier::ProcessSnapshot;
-use apollo_optimizer::engine::process_tree::ProcessTree;
+use apollo_engine::engine::coalition::CoalitionTracker;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::jetsam_control;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::process_classifier::ProcessSnapshot;
+use apollo_engine::engine::process_tree::ProcessTree;
 
 use crate::process_enrichment;
 

@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use apollo_optimizer::engine::protocol::{DaemonRequest, DaemonResponse};
-use apollo_optimizer::engine::types::{DaemonStatus, OptimizationProfile, SafetyPolicy};
+use apollo_engine::engine::protocol::{DaemonRequest, DaemonResponse};
+use apollo_engine::engine::types::{DaemonStatus, OptimizationProfile, SafetyPolicy};
 
 // ── IPC ──
 
@@ -183,7 +183,7 @@ fn build_menu(status: &Option<DaemonStatus>, updated_secs_ago: u64) -> tray_icon
         "🔴  Emergencia termica — throttling activo"
     } else if m.memory_pressure > 0.85 {
         "🔴  Presion de memoria critica"
-    } else if apollo_optimizer::engine::safety::survival_mode_active_total(
+    } else if apollo_engine::engine::safety::survival_mode_active_total(
         m.memory_pressure,
         m.swap_used_bytes,
         m.swap_total_bytes,

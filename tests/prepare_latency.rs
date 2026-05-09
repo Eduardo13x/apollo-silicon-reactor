@@ -15,7 +15,7 @@
 
 #[cfg(test)]
 mod scenarios {
-    use apollo_optimizer::engine::latency_monitor::{
+    use apollo_engine::engine::latency_monitor::{
         compute_latency, LatencyCategory, LatencySignals,
     };
 

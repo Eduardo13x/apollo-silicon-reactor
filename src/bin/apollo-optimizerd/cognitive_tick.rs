@@ -13,15 +13,15 @@
 //! 7. AdversarialProbe: run synthetic probes every 500 cycles
 //! 8. CognitiveHealthScore: update UCHS from all dimensions
 
-use apollo_optimizer::engine::adversarial_probe::{AdversarialProbe, ProbeResult};
-use apollo_optimizer::engine::cognitive_bus::{CognitiveRewardBus, RewardSignal, RewardSource};
-use apollo_optimizer::engine::cognitive_health::{CognitiveHealthScore, CognitiveInputs};
-use apollo_optimizer::engine::daemon_helpers::audit_log;
-use apollo_optimizer::engine::epistemic::EpistemicUncertainty;
-use apollo_optimizer::engine::meta_cognition::{MetaCognition, SubsystemId};
-use apollo_optimizer::engine::nars_belief::DriftDetector;
-use apollo_optimizer::engine::reptile_meta::ReptileMeta;
-use apollo_optimizer::engine::self_reward::SelfRewardingEvaluator;
+use apollo_engine::engine::adversarial_probe::{AdversarialProbe, ProbeResult};
+use apollo_engine::engine::cognitive_bus::{CognitiveRewardBus, RewardSignal, RewardSource};
+use apollo_engine::engine::cognitive_health::{CognitiveHealthScore, CognitiveInputs};
+use apollo_engine::engine::daemon_helpers::audit_log;
+use apollo_engine::engine::epistemic::EpistemicUncertainty;
+use apollo_engine::engine::meta_cognition::{MetaCognition, SubsystemId};
+use apollo_engine::engine::nars_belief::DriftDetector;
+use apollo_engine::engine::reptile_meta::ReptileMeta;
+use apollo_engine::engine::self_reward::SelfRewardingEvaluator;
 
 /// All neurocognitive state bundled for the daemon loop.
 pub struct CognitiveState {
@@ -258,7 +258,7 @@ pub fn run_cognitive_tick(
 
         for scenario in &scenarios {
             let result = match scenario.expectation {
-                apollo_optimizer::engine::adversarial_probe::ProbeExpectation::NoFreezeProtected => {
+                apollo_engine::engine::adversarial_probe::ProbeExpectation::NoFreezeProtected => {
                     AdversarialProbe::probe_no_freeze_protected(scenario, |name, _p, _oom| {
                         // Protected processes should never be frozen.
                         // Use the unified safety oracle (is_protected_name) so the
@@ -266,31 +266,31 @@ pub fn run_cognitive_tick(
                         // (Tier 1 hard + Tier 2 infra + Tier 3 dev runtime),
                         // not a slice of it. [Saltzer & Kaashoek 2009] §3.3
                         // Complete Mediation — single source of truth.
-                        !apollo_optimizer::engine::safety::is_protected_name(name)
+                        !apollo_engine::engine::safety::is_protected_name(name)
                     })
                 }
-                apollo_optimizer::engine::adversarial_probe::ProbeExpectation::SafetyFloorRespected => {
+                apollo_engine::engine::adversarial_probe::ProbeExpectation::SafetyFloorRespected => {
                     AdversarialProbe::probe_safety_floor(|_| {
-                        apollo_optimizer::engine::rl_threshold::RL_ABSOLUTE_FLOOR
+                        apollo_engine::engine::rl_threshold::RL_ABSOLUTE_FLOOR
                     })
                 }
-                apollo_optimizer::engine::adversarial_probe::ProbeExpectation::NarsDriftRecovery => {
+                apollo_engine::engine::adversarial_probe::ProbeExpectation::NarsDriftRecovery => {
                     AdversarialProbe::probe_nars_recovery(20)
                 }
-                apollo_optimizer::engine::adversarial_probe::ProbeExpectation::EpistemicBlocksAggressive => {
+                apollo_engine::engine::adversarial_probe::ProbeExpectation::EpistemicBlocksAggressive => {
                     AdversarialProbe::probe_epistemic_blocks(|rv, le, ns, ds, ce| {
                         // Mirror EpistemicUncertainty composite weights.
                         let composite = 0.25 * rv + 0.20 * le + 0.20 * ns + 0.10 * ds + 0.25 * ce;
                         composite > 0.70
                     })
                 }
-                apollo_optimizer::engine::adversarial_probe::ProbeExpectation::OdeDivergenceResilient => {
+                apollo_engine::engine::adversarial_probe::ProbeExpectation::OdeDivergenceResilient => {
                     AdversarialProbe::probe_ode_divergence()
                 }
-                apollo_optimizer::engine::adversarial_probe::ProbeExpectation::StickySwapSpotlightSuppressed => {
+                apollo_engine::engine::adversarial_probe::ProbeExpectation::StickySwapSpotlightSuppressed => {
                     AdversarialProbe::probe_sticky_swap_spotlight()
                 }
-                apollo_optimizer::engine::adversarial_probe::ProbeExpectation::SubnormalFloorRecovery => {
+                apollo_engine::engine::adversarial_probe::ProbeExpectation::SubnormalFloorRecovery => {
                     AdversarialProbe::probe_subnormal_floor_recovery()
                 }
             };

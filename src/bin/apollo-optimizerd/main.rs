@@ -63,17 +63,17 @@ extern "C" fn handle_sigterm(_sig: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::Release);
 }
 
-use apollo_optimizer::collector::SystemCollector;
-use apollo_optimizer::engine::adaptive_governor::AdaptiveGovernor;
-use apollo_optimizer::engine::amx_detector;
-use apollo_optimizer::engine::background_collectors::PressureCollector;
-use apollo_optimizer::engine::capabilities::detect_capabilities;
-use apollo_optimizer::engine::causal_graph::CausalGraph;
-use apollo_optimizer::engine::compressor_aware::{
+use apollo_engine::collector::SystemCollector;
+use apollo_engine::engine::adaptive_governor::AdaptiveGovernor;
+use apollo_engine::engine::amx_detector;
+use apollo_engine::engine::background_collectors::PressureCollector;
+use apollo_engine::engine::capabilities::detect_capabilities;
+use apollo_engine::engine::causal_graph::CausalGraph;
+use apollo_engine::engine::compressor_aware::{
     decide_enhanced, purge_purgeable_regions, query_memory_profile, sample_process_temperature,
     scan_regions, MemoryAction,
 };
-use apollo_optimizer::engine::daemon_helpers::{
+use apollo_engine::engine::daemon_helpers::{
     audit_log, battery_pressure_boost, detect_prior_crash, frozen_state_path, governor_state_path,
     holt_winters_path, hop_groups_path, journal_path, kill_switch_path, learned_state_path,
     load_frozen_state, load_governor_state, load_wake_state, markov_path, merge_seed_into,
@@ -83,67 +83,67 @@ use apollo_optimizer::engine::daemon_helpers::{
     telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_pids,
     wake_state_path, write_frozen_state, write_governor_state,
 };
-use apollo_optimizer::engine::execute_actions::execute_actions;
-use apollo_optimizer::engine::focus_markov::FocusMarkov;
-use apollo_optimizer::engine::foreground::{ForegroundDetector, ForegroundState};
-use apollo_optimizer::engine::gpu_manager::GPUManager;
-use apollo_optimizer::engine::holt_winters::HoltWinters;
-use apollo_optimizer::engine::hw_bayes::HwFeatures;
-use apollo_optimizer::engine::hw_predictor::{sample_hw_pressure, HwPressure};
-use apollo_optimizer::engine::iokit_sensors::{HardwareSnapshot, ThermalState};
-use apollo_optimizer::engine::kqueue_pressure;
-use apollo_optimizer::engine::latency_monitor::{self, LatencySignals};
-use apollo_optimizer::engine::learned_state::{
+use apollo_engine::engine::execute_actions::execute_actions;
+use apollo_engine::engine::focus_markov::FocusMarkov;
+use apollo_engine::engine::foreground::{ForegroundDetector, ForegroundState};
+use apollo_engine::engine::gpu_manager::GPUManager;
+use apollo_engine::engine::holt_winters::HoltWinters;
+use apollo_engine::engine::hw_bayes::HwFeatures;
+use apollo_engine::engine::hw_predictor::{sample_hw_pressure, HwPressure};
+use apollo_engine::engine::iokit_sensors::{HardwareSnapshot, ThermalState};
+use apollo_engine::engine::kqueue_pressure;
+use apollo_engine::engine::latency_monitor::{self, LatencySignals};
+use apollo_engine::engine::learned_state::{
     LearnableParams, LearnedState, RestoreQualityMonitor,
 };
-use apollo_optimizer::engine::action_accumulator::{
+use apollo_engine::engine::action_accumulator::{
     ActionAccumulator, ActionPhase, EmitContext,
 };
-use apollo_optimizer::engine::audit_types::DecisionReason;
-use apollo_optimizer::engine::llm::{
+use apollo_engine::engine::audit_types::DecisionReason;
+use apollo_engine::engine::llm::{
     feedback_path_root, load_repo_config, pending_trial_path,
     policy_path_root, read_json, state_paths_root, suggestions_path_root, write_json,
     LearnedPolicy, LlmAdvisor, LlmConfig, LlmState,
 };
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::lse_counters::LockFreeMetrics;
-use apollo_optimizer::engine::mach_qos::{MachQoSManager, SchedulingTier};
-use apollo_optimizer::engine::network_optimizer::NetworkProfile;
-use apollo_optimizer::engine::overflow_guard::{is_build_tool_name, OverflowGuard};
-use apollo_optimizer::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
-use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
-use apollo_optimizer::engine::power_management::detect_battery_status;
-use apollo_optimizer::engine::predictive_agent::{
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::lse_counters::LockFreeMetrics;
+use apollo_engine::engine::mach_qos::{MachQoSManager, SchedulingTier};
+use apollo_engine::engine::network_optimizer::NetworkProfile;
+use apollo_engine::engine::overflow_guard::{is_build_tool_name, OverflowGuard};
+use apollo_engine::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
+use apollo_engine::engine::pipeline::learning_context::LearningContext;
+use apollo_engine::engine::power_management::detect_battery_status;
+use apollo_engine::engine::predictive_agent::{
     AgentContext, Intervention, PredictiveAgent, SpecialistVote,
 };
-use apollo_optimizer::engine::proc_taskinfo;
-use apollo_optimizer::engine::profile_governor::GovernorInput;
-use apollo_optimizer::engine::safety::{critical_background_processes, enforce_limits_with_budget, is_protected_name};
-use apollo_optimizer::engine::signal_intelligence::SignalIntelligence;
-use apollo_optimizer::engine::smc_reader::SmcReader;
-use apollo_optimizer::engine::sysctl_governor::{
+use apollo_engine::engine::proc_taskinfo;
+use apollo_engine::engine::profile_governor::GovernorInput;
+use apollo_engine::engine::safety::{critical_background_processes, enforce_limits_with_budget, is_protected_name};
+use apollo_engine::engine::signal_intelligence::SignalIntelligence;
+use apollo_engine::engine::smc_reader::SmcReader;
+use apollo_engine::engine::sysctl_governor::{
     SysctlGovernor, SysctlGovernorInput, SysctlGovernorStatus,
 };
-use apollo_optimizer::engine::thermal_interrupt::{
+use apollo_engine::engine::thermal_interrupt::{
     spawn_resource_sentinel, ResourceInterruptState, SentinelConfig,
 };
-use apollo_optimizer::engine::types::{
+use apollo_engine::engine::types::{
     EnergyConsumerInfo, ForegroundAppInfo, FreezeSource, FrozenEntry, FrozenPidEntry,
     FrozenStatePersisted, LatencyTarget, OptimizationProfile, RootAction, RuntimeMetrics,
     SafetyPolicy,
 };
-use apollo_optimizer::engine::usage_model::{usage_model_path_root, UsageModel};
-use apollo_optimizer::engine::user_profile::{UserProfile, UserProfilePersisted};
-use apollo_optimizer::engine::wait_graph;
-use apollo_optimizer::engine::workload_classifier::classify_by_memory;
-use apollo_optimizer::engine::workload_classifier::{
+use apollo_engine::engine::usage_model::{usage_model_path_root, UsageModel};
+use apollo_engine::engine::user_profile::{UserProfile, UserProfilePersisted};
+use apollo_engine::engine::wait_graph;
+use apollo_engine::engine::workload_classifier::classify_by_memory;
+use apollo_engine::engine::workload_classifier::{
     classify_workload_mode, WorkloadFeatures, WorkloadMode,
 };
 use chrono::{Timelike, Utc};
 use clap::{Parser, Subcommand};
 
 // v0.9.0: canonical SharedState — all domain groups live in daemon_state.rs
-use apollo_optimizer::engine::daemon_state::{
+use apollo_engine::engine::daemon_state::{
     HardwareState, LlmDomainState, MetricsState, PolicyState, ProcessState,
     ReactorStatus as DomainReactorStatus, SharedState, UsageDomainState, UsageTrackerState,
 };
@@ -240,9 +240,9 @@ enum Commands {
 /// [Idempotency Pattern — 1001 patterns slide 7]
 /// [Cache-Aside Pattern — 1001 patterns slide 11]
 fn pid_identity_still_valid(
-    action: &apollo_optimizer::engine::types::RootAction,
-    manager: &apollo_optimizer::engine::identity_cache_manager::IdentityCacheManager,
-    lf_metrics: &apollo_optimizer::engine::lse_counters::LockFreeMetrics,
+    action: &apollo_engine::engine::types::RootAction,
+    manager: &apollo_engine::engine::identity_cache_manager::IdentityCacheManager,
+    lf_metrics: &apollo_engine::engine::lse_counters::LockFreeMetrics,
 ) -> bool {
     // Action-aware shim over the cache lifecycle manager. Identity-bearing
     // actions delegate to manager.verify; non-PID actions (Spotlight,
@@ -342,9 +342,9 @@ fn main() -> anyhow::Result<()> {
                     adaptive_governor: AdaptiveGovernor::new(),
                     timeline: VecDeque::new(),
                     circuit_breaker:
-                        apollo_optimizer::engine::circuit_breaker::CircuitBreaker::default(),
+                        apollo_engine::engine::circuit_breaker::CircuitBreaker::default(),
                     degradation:
-                        apollo_optimizer::engine::degradation::DegradationController::default(),
+                        apollo_engine::engine::degradation::DegradationController::default(),
                 })),
                 metrics: Arc::new(Mutex::new(MetricsState {
                     metrics: RuntimeMetrics {
@@ -392,7 +392,7 @@ fn main() -> anyhow::Result<()> {
 
                 mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
                 freeze_cooldown: Arc::new(Mutex::new(
-                    apollo_optimizer::engine::freeze_cooldown::FreezeCooldown::new(),
+                    apollo_engine::engine::freeze_cooldown::FreezeCooldown::new(),
                 )),
                 hardware: Arc::new(Mutex::new(HardwareState {
                     last_hw_snapshot: None,
@@ -695,12 +695,12 @@ fn main() -> anyhow::Result<()> {
             let mut last_dedup_throttle: u64 = 0;
             let mut last_dedup_freeze: u64 = 0;
             let mut last_dedup_unfreeze: u64 = 0;
-            let mut nested_learner = apollo_optimizer::engine::nested_learner::NestedLearner::new();
+            let mut nested_learner = apollo_engine::engine::nested_learner::NestedLearner::new();
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
             // TelemetryLogger: ring-buffer collection for time-series training data.
             // [Welch 1967, Tuli et al. 2022] — event-triggered dumps capture pre-anomaly context.
             let mut telemetry_logger =
-                apollo_optimizer::engine::telemetry_logger::TelemetryLogger::new(PathBuf::from(
+                apollo_engine::engine::telemetry_logger::TelemetryLogger::new(PathBuf::from(
                     telemetry_output_dir(),
                 ));
             // Warm-start: reload recent history so anomaly detector skips cold-start.
@@ -709,7 +709,7 @@ fn main() -> anyhow::Result<()> {
             // StabilityOracle: aggregate jank + zombie + swap-spike into RL reward.
             // [Schulman et al. 2017] PPO per-cycle reward; [Nygard 2018] cascading instability.
             let mut stability_oracle =
-                apollo_optimizer::engine::stability_oracle::StabilityOracle::new();
+                apollo_engine::engine::stability_oracle::StabilityOracle::new();
             let hw_path = PathBuf::from(holt_winters_path());
             let mut holt_winters = HoltWinters::load(&hw_path).unwrap_or_default();
             let mut hw_last_hour: Option<u8> = None;
@@ -754,7 +754,7 @@ fn main() -> anyhow::Result<()> {
                 // (line 795). Use the helper function directly here so
                 // we don't depend on that ordering.
                 let metrics_pb = std::path::PathBuf::from(
-                    apollo_optimizer::engine::daemon_helpers::metrics_path(),
+                    apollo_engine::engine::daemon_helpers::metrics_path(),
                 );
                 let is_root_for_planner = unsafe { libc::geteuid() } == 0;
                 let hints_pb = if is_root_for_planner {
@@ -767,7 +767,7 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     std::path::PathBuf::from("/tmp/apollo-calibration.jsonl")
                 };
-                let _planner_stop = apollo_optimizer::engine::planner::Planner::new(
+                let _planner_stop = apollo_engine::engine::planner::Planner::new(
                     Duration::from_secs(30),
                     metrics_pb,
                     hints_pb,
@@ -793,7 +793,7 @@ fn main() -> anyhow::Result<()> {
             // processes so macOS can compress/Jetsam them normally during hibernation.
             // Without this, frozen processes block Jetsam's target set, leading to
             // more aggressive kills of other processes (widgets, extensions).
-            let sleep_notifier = apollo_optimizer::engine::sleep_notifier::SleepNotifier::new();
+            let sleep_notifier = apollo_engine::engine::sleep_notifier::SleepNotifier::new();
             tracing::info!(
                 available = sleep_notifier.available,
                 "sleep_notifier: IOKit pre-sleep hook {}",
@@ -820,10 +820,10 @@ fn main() -> anyhow::Result<()> {
             // ZeroTune: seed with hardware meta-features on cold start.
             // Reduces warmup from 200→50 cycles by injecting domain knowledge priors.
             if !predictive_agent.is_active() && predictive_agent.total_cycles() == 0 {
-                let ram_gb = apollo_optimizer::engine::sysctl_direct::read_u64("hw.memsize")
+                let ram_gb = apollo_engine::engine::sysctl_direct::read_u64("hw.memsize")
                     .unwrap_or(8 * 1024 * 1024 * 1024) as f64
                     / (1024.0 * 1024.0 * 1024.0);
-                let cores = apollo_optimizer::engine::sysctl_direct::read_u64("hw.ncpu")
+                let cores = apollo_engine::engine::sysctl_direct::read_u64("hw.ncpu")
                     .unwrap_or(4) as usize;
                 predictive_agent.meta_seed(ram_gb, cores);
             }
@@ -851,14 +851,14 @@ fn main() -> anyhow::Result<()> {
             // Restored pending trial skill from the previous run (if daemon crashed mid-trial).
             let mut restored_trial_skill: Option<(String, f64)> = None;
             // Restored arousal state — applied after arousal_state is declared below.
-            let mut restored_arousal: Option<apollo_optimizer::engine::nars_belief::ArousalState> =
+            let mut restored_arousal: Option<apollo_engine::engine::nars_belief::ArousalState> =
                 None;
             let mut restored_process_baselines: Option<
-                apollo_optimizer::engine::process_baseline::ProcessBaselineMap,
+                apollo_engine::engine::process_baseline::ProcessBaselineMap,
             > = None;
             let mut learnable_params = LearnableParams::default();
             let mut restored_meta_cognition: Option<
-                apollo_optimizer::engine::meta_cognition::MetaCognition,
+                apollo_engine::engine::meta_cognition::MetaCognition,
             > = None;
             if let Some(learned) = LearnedState::load(ls_path) {
                 persist_generations = learned.persist_generations;
@@ -868,7 +868,7 @@ fn main() -> anyhow::Result<()> {
                 // (e.g., daemon crashed before periodic persist), recover from WAL file.
                 if restored_trial_skill.is_none() {
                     if let Ok(data) =
-                        apollo_optimizer::engine::types::HardPath::read_to_string_limited(
+                        apollo_engine::engine::types::HardPath::read_to_string_limited(
                             &pending_trial_path(is_root),
                             512,
                         )
@@ -975,14 +975,14 @@ fn main() -> anyhow::Result<()> {
             // Shin et al. 2012 — temporal patterns predict app launches with ~80% accuracy.
             // Combined with Markov chain for 85% top-3 accuracy (Baeza-Yates et al. 2015).
             let mut temporal_predictor =
-                apollo_optimizer::engine::temporal_predictor::TemporalPredictor::new(
+                apollo_engine::engine::temporal_predictor::TemporalPredictor::new(
                     std::path::PathBuf::from(temporal_histograms_path()),
                 );
             // Adaptive Page Reclaim: pressure-driven file cache purging.
             // Jiang & Zhang 2005 — proactive reclaim of low-IRR pages outperforms
             // reactive LRU eviction by 20-40% in cache hit ratio.
             let mut page_reclaim =
-                apollo_optimizer::engine::page_reclaim::PageReclaim::new(is_root);
+                apollo_engine::engine::page_reclaim::PageReclaim::new(is_root);
 
             // ── IOReport reader (hardware telemetry without subprocess overhead) ─
             // Provides P/E cluster utilization, GPU%, ANE activity, per-component mW.
@@ -995,7 +995,7 @@ fn main() -> anyhow::Result<()> {
                 println!("[ioreport] IOReport unavailable, using SMC fallback");
             }
             // Last IOReport snapshot (updated each cycle).
-            let mut last_ioreport: Option<apollo_optimizer::engine::ioreport::IOReportSnapshot> =
+            let mut last_ioreport: Option<apollo_engine::engine::ioreport::IOReportSnapshot> =
                 None;
             // Throttle IOReport to every ~2 cycles (≥1s between samples).
             let mut last_ioreport_sample = Instant::now();
@@ -1013,7 +1013,7 @@ fn main() -> anyhow::Result<()> {
             // Auto-detect ollama / llama.cpp / MLX / LM Studio inference.
             // When active: +20pp pressure boost, Spotlight off, App Nap non-essential.
             let mut llm_detector =
-                apollo_optimizer::engine::llm_inference_mode::LlmInferenceDetector::new();
+                apollo_engine::engine::llm_inference_mode::LlmInferenceDetector::new();
             let mut llm_spotlight_disabled = false;
             // Read last saved metrics to decide startup Spotlight state.
             // Blind re-enable caused oscillation: mds spins up → pressure
@@ -1028,7 +1028,7 @@ fn main() -> anyhow::Result<()> {
             // the pressure default so any read failure pauses Spotlight.
             let (startup_pressure, startup_swap_gb): (f64, f64) =
                 std::fs::read_to_string(
-                    apollo_optimizer::engine::daemon_helpers::metrics_path(),
+                    apollo_engine::engine::daemon_helpers::metrics_path(),
                 )
                 .ok()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -1072,8 +1072,8 @@ fn main() -> anyhow::Result<()> {
 
             // ── SMC Direct Read ──────────────────────────────────────────────
             // Sub-100µs power, lid, sleep/wake, battery telemetry (replaces powermetrics).
-            let smc_direct = apollo_optimizer::engine::smc_direct::SmcDirectReader::new();
-            let mut last_smc: Option<apollo_optimizer::engine::smc_direct::SmcSnapshot> = None;
+            let smc_direct = apollo_engine::engine::smc_direct::SmcDirectReader::new();
+            let mut last_smc: Option<apollo_engine::engine::smc_direct::SmcSnapshot> = None;
             if smc_direct.available {
                 let keys = smc_direct.probe_available_keys();
                 if keys.is_empty() {
@@ -1095,7 +1095,7 @@ fn main() -> anyhow::Result<()> {
 
             // ── KPC Hardware Performance Counters ────────────────────────────
             // Per-core IPC via libkpc.dylib (fixed counters: cycles + instructions).
-            let mut kpc_reader = apollo_optimizer::engine::kpc_counters::KpcReader::new();
+            let mut kpc_reader = apollo_engine::engine::kpc_counters::KpcReader::new();
             if kpc_reader.available {
                 println!("[kpc] Hardware performance counters active");
             } else {
@@ -1120,19 +1120,19 @@ fn main() -> anyhow::Result<()> {
             // Detects L2 cache competition between co-executing high-CPU processes
             // using system-wide IPC as proxy. Observation-only until Phase 3.
             let mut contention_detector =
-                apollo_optimizer::engine::contention_detector::ContentionDetector::new();
+                apollo_engine::engine::contention_detector::ContentionDetector::new();
 
             // ── Window/App Lifecycle Sensor ─────────────────────────────────
             // Diff-based: tracks app terminated/launched, browser tab delta,
             // foreground changes. Works as root daemon (no GUI session needed).
             // [GoF Observer Pattern via cycle-to-cycle process diff]
-            let mut window_sensor = apollo_optimizer::engine::window_sensor::WindowSensor::new();
+            let mut window_sensor = apollo_engine::engine::window_sensor::WindowSensor::new();
 
             // ── Fluidity Intelligence ────────────────────────────────────────
             // Tracks WindowServer CPU spike (window resize/move), app launches,
             // GPU render load → composite fluidity score 0–1.
             // [Jain 1991] EMA composite scoring, [Welch & Bishop 2006] Kalman prediction
-            let mut fluidity_state = apollo_optimizer::engine::fluidity::FluidityState::new();
+            let mut fluidity_state = apollo_engine::engine::fluidity::FluidityState::new();
 
             // ── Chromium Renderer Manager ────────────────────────────────────
             // Manages RAM/CPU for ALL Chromium/Electron renderer subprocesses:
@@ -1140,12 +1140,12 @@ fn main() -> anyhow::Result<()> {
             // Tier 1: E-core demotion (safe). Tier 2: SIGSTOP idle renderers (guarded).
             // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
             let mut chromium_mgr =
-                apollo_optimizer::engine::chromium_manager::ChromiumManager::new();
+                apollo_engine::engine::chromium_manager::ChromiumManager::new();
 
             // ── Rosetta AOT Monitor ─────────────────────────────────────────
             // Watches /var/db/oah/ for write events → suppress freezing oahd.
             let mut rosetta_monitor =
-                apollo_optimizer::engine::rosetta_monitor::RosettaMonitor::new();
+                apollo_engine::engine::rosetta_monitor::RosettaMonitor::new();
             if rosetta_monitor.available {
                 println!("[rosetta] AOT compilation monitor active");
             } else {
@@ -1174,7 +1174,7 @@ fn main() -> anyhow::Result<()> {
             let mut temporal_weekday: u8;
             // Build progress tracker: estimates cargo build completion from
             // rustc process-count dynamics. Informs reactor_weight policy.
-            use apollo_optimizer::engine::build_tracker::BuildTracker;
+            use apollo_engine::engine::build_tracker::BuildTracker;
             let mut build_tracker = BuildTracker::new();
             let mut wake_unfreeze_queue: VecDeque<u32> = VecDeque::new();
             // PIDs SIGCONT'd via the staggered wake path this cycle.
@@ -1194,7 +1194,7 @@ fn main() -> anyhow::Result<()> {
             // Runs in background thread to avoid blocking the daemon hot path with
             // `log show` subprocess latency (100-300ms when it fires).
             let mut log_ingester =
-                apollo_optimizer::engine::system_log_ingester::SystemLogIngester::new();
+                apollo_engine::engine::system_log_ingester::SystemLogIngester::new();
             log_ingester.start_background();
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
@@ -1223,12 +1223,12 @@ fn main() -> anyhow::Result<()> {
             // Restored from learned_state.json if available — preserves crisis context
             // across restarts. [Yerkes & Dodson 1908]
             let mut arousal_state = restored_arousal
-                .unwrap_or_else(apollo_optimizer::engine::nars_belief::ArousalState::default);
+                .unwrap_or_else(apollo_engine::engine::nars_belief::ArousalState::default);
             // Teacher consolidation: compiles Gemma 4 suggestions into S1
             // pattern_weights + NARS beliefs via dopamine/acetylcholine modulation.
             // [McGaugh 2004, Yerkes-Dodson 1908, Kahneman 2011]
             let mut teacher_consolidator =
-                apollo_optimizer::engine::teacher_consolidation::TeacherConsolidator::new();
+                apollo_engine::engine::teacher_consolidation::TeacherConsolidator::new();
             // Tracks the last resolved outcome's applied_at so we only
             // consolidate each outcome exactly once.
             let mut last_consolidated_at: Option<chrono::DateTime<chrono::Utc>> = None;
@@ -1267,7 +1267,7 @@ fn main() -> anyhow::Result<()> {
             // vm_surgeon: pin the lock-free metrics buffer in physical RAM.
             // Guarantees zero page-fault latency on the hot path under memory pressure.
             {
-                use apollo_optimizer::engine::vm_surgeon;
+                use apollo_engine::engine::vm_surgeon;
                 let ptr = &*lf_metrics as *const LockFreeMetrics as *const u8;
                 let len = std::mem::size_of::<LockFreeMetrics>();
                 if let Err(e) = vm_surgeon::pin_memory(ptr, len) {
@@ -1279,7 +1279,7 @@ fn main() -> anyhow::Result<()> {
             // letting NotebookLM debrief distinguish "persistence helps" vs "always
             // starts empty". [Inbox Pattern — 1001 patterns slide 42]
             {
-                use apollo_optimizer::engine::recently_applied::RestoreStatus;
+                use apollo_engine::engine::recently_applied::RestoreStatus;
                 use std::sync::atomic::Ordering;
                 match recently_applied_restore_status {
                     RestoreStatus::Missing => {
@@ -1323,7 +1323,7 @@ fn main() -> anyhow::Result<()> {
             // corrupting BUG-01 WAL outcome attribution during an active experiment.
             // [Gray & Reuter 1992 §11 — stable params during causal observation window]
             let mut llm_cfg_reloader =
-                apollo_optimizer::engine::config_reloader::LlmConfigReloader::new(
+                apollo_engine::engine::config_reloader::LlmConfigReloader::new(
                     PathBuf::from("/etc/apollo-optimizer/config.toml"),
                     pending_trial_path(is_root),
                 );
@@ -1805,14 +1805,14 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         thermal_bailout.evaluate(&HardwareSnapshot {
                             thermal_state:
-                                apollo_optimizer::engine::iokit_sensors::ThermalState::Normal,
-                            temps: apollo_optimizer::engine::iokit_sensors::ClusterTemps {
+                                apollo_engine::engine::iokit_sensors::ThermalState::Normal,
+                            temps: apollo_engine::engine::iokit_sensors::ClusterTemps {
                                 p_cluster_celsius: None,
                                 e_cluster_celsius: None,
                                 gpu_celsius: None,
                                 nand_celsius: None,
                             },
-                            power: apollo_optimizer::engine::iokit_sensors::PowerReading {
+                            power: apollo_engine::engine::iokit_sensors::PowerReading {
                                 package_watts: None,
                                 cpu_watts: None,
                                 gpu_watts: None,
@@ -1834,13 +1834,13 @@ fn main() -> anyhow::Result<()> {
                 // M1 Air has no fan — acting 5-10°C before the hardware ceiling prevents
                 // visible stutter caused by hardware-level frequency reduction.
                 let thermal_pressure_boost = match thermal_action.phase {
-                    apollo_optimizer::engine::thermal_bailout::CoolingPhase::Normal => 0.0,
-                    apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase1Gentle => 0.07,
-                    apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase2Moderate => 0.15,
-                    apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase3Aggressive => {
+                    apollo_engine::engine::thermal_bailout::CoolingPhase::Normal => 0.0,
+                    apollo_engine::engine::thermal_bailout::CoolingPhase::Phase1Gentle => 0.07,
+                    apollo_engine::engine::thermal_bailout::CoolingPhase::Phase2Moderate => 0.15,
+                    apollo_engine::engine::thermal_bailout::CoolingPhase::Phase3Aggressive => {
                         0.25
                     }
-                    apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase4Emergency => {
+                    apollo_engine::engine::thermal_bailout::CoolingPhase::Phase4Emergency => {
                         0.40
                     }
                 };
@@ -2130,7 +2130,7 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.cpu_max_busy = pd.cpu_saturation.max_busy;
                     metrics.metrics.cpu_pegged_fraction = pd.cpu_saturation.pegged_fraction;
                     if let Ok(tracker) =
-                        apollo_optimizer::engine::contention_tracker::global().lock()
+                        apollo_engine::engine::contention_tracker::global().lock()
                     {
                         // Threshold 0.85: Darwin's ri_runnable_time accumulates
                         // run-queue wait time on EVERY scheduling quantum, so the
@@ -2448,7 +2448,7 @@ fn main() -> anyhow::Result<()> {
                         // IOPMrootDomain CurrentPowerSource key fails on macOS 26+.
                         // Fall back to power_mgr (IOPSCopyPowerSourcesInfo) which works.
                         metrics.metrics.iopm_power_source =
-                            if iopm.power_source == apollo_optimizer::engine::thermal_iokit::PowerSource::Unknown {
+                            if iopm.power_source == apollo_engine::engine::thermal_iokit::PowerSource::Unknown {
                                 if power_mgr.battery_status.is_charging {
                                     "AC".to_string()
                                 } else if power_mgr.battery_status.percentage > 0 {
@@ -2647,7 +2647,7 @@ fn main() -> anyhow::Result<()> {
                 // Produces SaturationForecast used by the freeze gate below.
                 // [Denning 1968; Zhao et al. 2009 WKdm rate model]
                 let reclaim_forecast = {
-                    use apollo_optimizer::engine::swap_reclaim::VmFlowSample;
+                    use apollo_engine::engine::swap_reclaim::VmFlowSample;
                     let pd = pressure_collector.latest();
                     let flow = VmFlowSample {
                         compressions_per_sec: pd.vm_rate.compressions_per_sec,
@@ -2667,12 +2667,12 @@ fn main() -> anyhow::Result<()> {
                 // Publish shadow signals for decide_actions' shadow-mode ActionContext.
                 // Consumed by ShadowEvaluator via shadow_signals::get_* — keeps
                 // decide_actions' signature stable while wiring predictive + context.
-                apollo_optimizer::engine::shadow_signals::set_p_oom_30s(signal_digest.p_oom_30s);
-                apollo_optimizer::engine::shadow_signals::set_thermal_emergency(thermal_emergency);
-                apollo_optimizer::engine::shadow_signals::set_interrupt_phase(
+                apollo_engine::engine::shadow_signals::set_p_oom_30s(signal_digest.p_oom_30s);
+                apollo_engine::engine::shadow_signals::set_thermal_emergency(thermal_emergency);
+                apollo_engine::engine::shadow_signals::set_interrupt_phase(
                     state.resource_interrupt.phase.load(std::sync::atomic::Ordering::Relaxed),
                 );
-                apollo_optimizer::engine::shadow_signals::set_foreground_pid(foreground_pid);
+                apollo_engine::engine::shadow_signals::set_foreground_pid(foreground_pid);
                 // Epistemic proxy — urgency is "need to act", not "how uncertain".
                 // Better signal: entropy_anomaly (distribution shift) + transformer_anomaly
                 // (learned-deviation from Hopfield memory). Both measure IGNORANCE of
@@ -2686,14 +2686,14 @@ fn main() -> anyhow::Result<()> {
                     // Max — either source indicates ignorance on its own.
                     entropy_term.max(anomaly_term)
                 };
-                apollo_optimizer::engine::shadow_signals::set_epistemic_uncertainty(
+                apollo_engine::engine::shadow_signals::set_epistemic_uncertainty(
                     epistemic_proxy,
                 );
 
                 // ODE swap urgency — hoisted for use in Neuromodulator AND LinUCB.
                 // Normalization owned by TsatUrgency [CyberPhysicalSignal trait].
                 let ode_t_sat_urgency = {
-                    use apollo_optimizer::engine::swap_reclaim::{CyberPhysicalSignal, TsatUrgency};
+                    use apollo_engine::engine::swap_reclaim::{CyberPhysicalSignal, TsatUrgency};
                     TsatUrgency(reclaim_forecast.t_sat_sec).normalized()
                 };
 
@@ -2754,14 +2754,14 @@ fn main() -> anyhow::Result<()> {
                     // [Hellerstein 2004] — derivative control closes the epistemic loop.
                     // Normalization owned by NetRateNorm [CyberPhysicalSignal trait].
                     let ode_net_rate_norm = {
-                        use apollo_optimizer::engine::swap_reclaim::{CyberPhysicalSignal, NetRateNorm};
+                        use apollo_engine::engine::swap_reclaim::{CyberPhysicalSignal, NetRateNorm};
                         NetRateNorm(reclaim_forecast.net_rate_bps).normalized()
                     };
 
                     // KalmanMV8: fuse all 8 signals after ODE outputs are available.
                     // [Welch & Bishop 2006] H=I cross-covariance propagation.
                     {
-                        use apollo_optimizer::engine::swap_reclaim::NET_RATE_CEILING_BPS;
+                        use apollo_engine::engine::swap_reclaim::NET_RATE_CEILING_BPS;
                         let swap_raw_norm = (snapshot.pressure.swap_delta_bytes_per_sec
                             / NET_RATE_CEILING_BPS)
                             .clamp(0.0, 1.0);
@@ -2942,7 +2942,7 @@ fn main() -> anyhow::Result<()> {
                     // + thermal boosts via effective_pressure::compute(). Don't add again.
                     let freed = page_reclaim.tick(
                         snapshot.pressure.memory_pressure,
-                        display_turbo.is_turbo_active() || thermal_action.phase >= apollo_optimizer::engine::thermal_bailout::CoolingPhase::Phase2Moderate,
+                        display_turbo.is_turbo_active() || thermal_action.phase >= apollo_engine::engine::thermal_bailout::CoolingPhase::Phase2Moderate,
                         foreground_idle,
                     );
                     if freed > 0 {
@@ -3116,7 +3116,7 @@ fn main() -> anyhow::Result<()> {
                     let mut filtered = Vec::with_capacity(raw.len());
                     for action in raw {
                         if let Some((pid, kind)) =
-                            apollo_optimizer::engine::recently_applied::CachedActionKind::from_root_action(&action)
+                            apollo_engine::engine::recently_applied::CachedActionKind::from_root_action(&action)
                         {
                             if recently_applied.is_recent(pid, kind) {
                                 continue;
@@ -3472,7 +3472,7 @@ fn main() -> anyhow::Result<()> {
                     .record_thrashing_score(pressure_collector.latest().thrashing_score);
                 // System-wide CPU stall fraction from the global contention
                 // tracker — fraction of tracked pids with PSI ratio ≥ 0.5.
-                if let Ok(tracker) = apollo_optimizer::engine::contention_tracker::global().lock() {
+                if let Ok(tracker) = apollo_engine::engine::contention_tracker::global().lock() {
                     // 0.85: see metrics-population site for the rationale —
                     // Darwin's runnable counter saturates above 0.5 under any
                     // normal load, so a lower threshold misclassifies normal
@@ -3666,7 +3666,7 @@ fn main() -> anyhow::Result<()> {
                 {
                     let purged = chromium_mgr.drain_purged_this_cycle();
                     if !purged.is_empty() {
-                        use apollo_optimizer::engine::causal_graph::ResourceSnapshot;
+                        use apollo_engine::engine::causal_graph::ResourceSnapshot;
                         let pressure_now = snapshot.pressure.memory_pressure as f32;
                         let swap_mb_now =
                             snapshot.pressure.swap_used_bytes as f32 / 1_048_576.0;
@@ -3801,7 +3801,7 @@ fn main() -> anyhow::Result<()> {
                                 let memory_hint = scan_regions(pid)
                                     .and_then(|regions| classify_by_memory(&regions));
                                 if let Some((hint, conf)) = &memory_hint {
-                                    use apollo_optimizer::engine::workload_classifier::MemoryLayoutHint;
+                                    use apollo_engine::engine::workload_classifier::MemoryLayoutHint;
                                     if conf > &0.7 && matches!(hint, MemoryLayoutHint::LlmInference | MemoryLayoutHint::DatabaseEngine) {
                                         ds_skip += 1;
                                         audit_log(&serde_json::json!({
@@ -3855,7 +3855,7 @@ fn main() -> anyhow::Result<()> {
                                         // stale apps. Skip if same hint within 30s TTL.
                                         if recently_applied.is_recent(
                                             pid,
-                                            apollo_optimizer::engine::recently_applied::CachedActionKind::SetMemorystatus
+                                            apollo_engine::engine::recently_applied::CachedActionKind::SetMemorystatus
                                         ) {
                                             None::<RootAction>
                                         } else {
@@ -3875,7 +3875,7 @@ fn main() -> anyhow::Result<()> {
                                         }
                                         recently_applied.record(
                                             pid,
-                                            apollo_optimizer::engine::recently_applied::CachedActionKind::SetMemorystatus
+                                            apollo_engine::engine::recently_applied::CachedActionKind::SetMemorystatus
                                         );
                                         Some(RootAction::SetMemorystatus {
                                             pid,
@@ -3928,15 +3928,15 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.deep_scan_hint += ds_hint;
                     // Publish shadow aggregates for next cycle's class-level scorer probe.
                     if max_hot_frac > 0.0 {
-                        apollo_optimizer::engine::shadow_signals::set_max_hot_page_fraction(max_hot_frac);
+                        apollo_engine::engine::shadow_signals::set_max_hot_page_fraction(max_hot_frac);
                     }
                     if max_wss_mb > 0.0 {
-                        apollo_optimizer::engine::shadow_signals::set_max_wss_mb(max_wss_mb);
+                        apollo_engine::engine::shadow_signals::set_max_wss_mb(max_wss_mb);
                     }
 
                     // Rosetta AOT: skip freezing oahd/oahd-helper during AOT compilation.
                     let confirmed_actions: Vec<RootAction> = if rosetta_monitor.is_compiling() {
-                        let rosetta_immune = apollo_optimizer::engine::rosetta_monitor::RosettaMonitor::immune_processes();
+                        let rosetta_immune = apollo_engine::engine::rosetta_monitor::RosettaMonitor::immune_processes();
                         confirmed_actions
                             .into_iter()
                             .filter(|a| {
@@ -4050,8 +4050,8 @@ fn main() -> anyhow::Result<()> {
                     // Snapshot protection state ONCE per cycle (not per action).
                     // [Saltzer & Kaashoek 2009 §3.3] Complete Mediation — single check
                     // path matches what execute_actions safety layer will do.
-                    let hard_protected = apollo_optimizer::engine::safety::protected_processes();
-                    let infra_protected = apollo_optimizer::engine::safety::infrastructure_processes();
+                    let hard_protected = apollo_engine::engine::safety::protected_processes();
+                    let infra_protected = apollo_engine::engine::safety::infrastructure_processes();
                     // Match execute_actions safety layer EXACTLY: policy_all is the
                     // UNION of learned_protected + learned_interactive (both are treated
                     // as Unconditional at execute time when no foreground context is
@@ -4067,7 +4067,7 @@ fn main() -> anyhow::Result<()> {
                     };
                     for action in raw {
                         if let Some((pid, kind)) =
-                            apollo_optimizer::engine::recently_applied::CachedActionKind::from_root_action(&action)
+                            apollo_engine::engine::recently_applied::CachedActionKind::from_root_action(&action)
                         {
                             // Cross-cycle dedup.
                             if recently_applied.is_recent(pid, kind) {
@@ -4076,13 +4076,13 @@ fn main() -> anyhow::Result<()> {
                             // ApplePlatform pre-filter for actions kernel will reject.
                             let blocks_under_sip = matches!(
                                 kind,
-                                apollo_optimizer::engine::recently_applied::CachedActionKind::Throttle
-                                    | apollo_optimizer::engine::recently_applied::CachedActionKind::Freeze
-                                    | apollo_optimizer::engine::recently_applied::CachedActionKind::Unfreeze
-                                    | apollo_optimizer::engine::recently_applied::CachedActionKind::SetThreadQoS
+                                apollo_engine::engine::recently_applied::CachedActionKind::Throttle
+                                    | apollo_engine::engine::recently_applied::CachedActionKind::Freeze
+                                    | apollo_engine::engine::recently_applied::CachedActionKind::Unfreeze
+                                    | apollo_engine::engine::recently_applied::CachedActionKind::SetThreadQoS
                             );
                             if blocks_under_sip
-                                && apollo_optimizer::engine::process_identity::is_apple_platform_process(pid)
+                                && apollo_engine::engine::process_identity::is_apple_platform_process(pid)
                             {
                                 continue;
                             }
@@ -4093,27 +4093,27 @@ fn main() -> anyhow::Result<()> {
                             // Skip Boost + Unfreeze: those are CORRECTIVE on protected.
                             let blocks_for_protected = !matches!(
                                 kind,
-                                apollo_optimizer::engine::recently_applied::CachedActionKind::Boost
-                                    | apollo_optimizer::engine::recently_applied::CachedActionKind::Unfreeze
+                                apollo_engine::engine::recently_applied::CachedActionKind::Boost
+                                    | apollo_engine::engine::recently_applied::CachedActionKind::Unfreeze
                             );
                             if blocks_for_protected {
                                 let action_name = match &action {
-                                    apollo_optimizer::engine::types::RootAction::ThrottleProcess { name, .. }
-                                    | apollo_optimizer::engine::types::RootAction::FreezeProcess { name, .. }
-                                    | apollo_optimizer::engine::types::RootAction::SetThreadQoS { name, .. }
-                                    | apollo_optimizer::engine::types::RootAction::BoostProcess { name, .. }
-                                    | apollo_optimizer::engine::types::RootAction::UnfreezeProcess { name, .. } => Some(name.as_str()),
+                                    apollo_engine::engine::types::RootAction::ThrottleProcess { name, .. }
+                                    | apollo_engine::engine::types::RootAction::FreezeProcess { name, .. }
+                                    | apollo_engine::engine::types::RootAction::SetThreadQoS { name, .. }
+                                    | apollo_engine::engine::types::RootAction::BoostProcess { name, .. }
+                                    | apollo_engine::engine::types::RootAction::UnfreezeProcess { name, .. } => Some(name.as_str()),
                                     _ => None,
                                 };
                                 if let Some(name) = action_name {
-                                    let level = apollo_optimizer::engine::safety::classify_protection(
+                                    let level = apollo_engine::engine::safety::classify_protection(
                                         name,
                                         &hard_protected,
                                         &infra_protected,
                                         &policy_protected,
                                         false,
                                     );
-                                    if level == apollo_optimizer::engine::safety::ProtectionLevel::Unconditional {
+                                    if level == apollo_engine::engine::safety::ProtectionLevel::Unconditional {
                                         continue;
                                     }
                                 }
@@ -4336,7 +4336,7 @@ fn main() -> anyhow::Result<()> {
                     // baseline on every reboot and the system is blindly optimistic
                     // for ~50 cycles until calibration re-accumulates.
                     if !sleep_notifier.is_sleeping() && cycle_count % 300 == 0 {
-                        apollo_optimizer::engine::learned_state::LearnedState::patch_meta_cognition(
+                        apollo_engine::engine::learned_state::LearnedState::patch_meta_cognition(
                             ls_path,
                             cognitive_state.meta_cognition.clone(),
                         );
@@ -4367,7 +4367,7 @@ fn main() -> anyhow::Result<()> {
                 // LlmConfig live-reload: whitelisted fields only; skip if trial active
                 // to avoid corrupting GemmaTrust outcome attribution. [Gray & Reuter 1992]
                 if cycle_count % 100 == 0 && pending_trial_skill.is_none() {
-                    use apollo_optimizer::engine::pipeline::periodic_stage::maybe_reload_llm_config;
+                    use apollo_engine::engine::pipeline::periodic_stage::maybe_reload_llm_config;
                     let current_cfg = state.llm.lock_recover().llm_cfg.clone();
                     if let Some(outcome) =
                         maybe_reload_llm_config(cycle_count, &mut llm_cfg_reloader, &current_cfg)
@@ -4573,7 +4573,7 @@ fn main() -> anyhow::Result<()> {
                             "cache cleanup expired entries"
                         );
                     }
-                    recently_applied.save_to_disk(std::path::Path::new(apollo_optimizer::engine::daemon_helpers::recently_applied_path()));
+                    recently_applied.save_to_disk(std::path::Path::new(apollo_engine::engine::daemon_helpers::recently_applied_path()));
                 }
 
                 // Phase A3 (Sprint 3 2026-05-07) — periodic IdentityCache cleanup.
@@ -4765,7 +4765,7 @@ fn main() -> anyhow::Result<()> {
             // Best-effort: errors are logged but do NOT block shutdown.
             // [Inbox Pattern — 1001 patterns slide 42]
             {
-                let path = std::path::PathBuf::from(apollo_optimizer::engine::daemon_helpers::recently_applied_path());
+                let path = std::path::PathBuf::from(apollo_engine::engine::daemon_helpers::recently_applied_path());
                 recently_applied.save_to_disk(&path);
                 tracing::info!(
                     target: "apollo.recently_applied",

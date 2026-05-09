@@ -48,12 +48,12 @@
 //! caller — nothing is smuggled through globals or statics.
 
 use crate::cognitive_tick::{self, CognitiveDecision, CognitiveState, CognitiveTickInputs};
-use apollo_optimizer::engine::neuromodulator::NeuroSignals;
-use apollo_optimizer::engine::nars_belief::DriftDetector;
-use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
-use apollo_optimizer::engine::signal_intelligence::SignalDigest;
-use apollo_optimizer::engine::stability_oracle::StabilityOracle;
-use apollo_optimizer::engine::thermal_bailout::{CoolingPhase, ThermalAction};
+use apollo_engine::engine::neuromodulator::NeuroSignals;
+use apollo_engine::engine::nars_belief::DriftDetector;
+use apollo_engine::engine::pipeline::learning_context::LearningContext;
+use apollo_engine::engine::signal_intelligence::SignalDigest;
+use apollo_engine::engine::stability_oracle::StabilityOracle;
+use apollo_engine::engine::thermal_bailout::{CoolingPhase, ThermalAction};
 
 /// Apply the bio-inspired neuromodulator: build NeuroSignals, tick the
 /// neuromodulator, then push derived parameters into the RL agent and
@@ -109,7 +109,7 @@ pub fn apply_neuromodulator(
         outcome_penalty: lctx.outcome_tracker.rl_penalty()
             - 0.5
                 * stability_oracle.instability_penalty_attenuated(
-                    apollo_optimizer::engine::daemon_helpers::system_uptime_secs(),
+                    apollo_engine::engine::daemon_helpers::system_uptime_secs(),
                 ),
         overflow_occurred,
         urgency: signal_digest.urgency,

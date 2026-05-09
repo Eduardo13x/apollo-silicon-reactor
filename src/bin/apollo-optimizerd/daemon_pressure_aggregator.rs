@@ -16,7 +16,7 @@
 //! 2. **Battery low aggressiveness.** SMC `B0TE` < 20 min adds +0.08 so
 //!    the system sheds load while the battery is the critical resource.
 //! 3. **Aggregation.** Defers to
-//!    [`apollo_optimizer::engine::effective_pressure::compute`] so the
+//!    [`apollo_engine::engine::effective_pressure::compute`] so the
 //!    boost-cap (≤ 0.30) and clamp semantics stay in one place.
 //! 4. **Cautious-mode adjustment.** Subtracts 0.10 for the first 50 cycles
 //!    after a crash restart, so freeze / throttle gates trigger at higher
@@ -40,10 +40,10 @@
 //! Extracted from `main.rs` during the V1.1.0 Strangler Fig pass
 //! [Fowler 2004 — *Refactoring*].
 
-use apollo_optimizer::engine::effective_pressure::{self, PressureComponents};
-use apollo_optimizer::engine::ioreport::IOReportSnapshot;
-use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
-use apollo_optimizer::engine::smc_direct::SmcSnapshot;
+use apollo_engine::engine::effective_pressure::{self, PressureComponents};
+use apollo_engine::engine::ioreport::IOReportSnapshot;
+use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
+use apollo_engine::engine::smc_direct::SmcSnapshot;
 
 /// Aggregated per-cycle pressure output.
 #[derive(Debug, Clone)]

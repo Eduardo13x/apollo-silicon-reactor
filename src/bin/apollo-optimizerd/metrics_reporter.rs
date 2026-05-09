@@ -25,29 +25,29 @@ use std::time::Instant;
 
 use chrono::Utc;
 
-use apollo_optimizer::collector::SystemSnapshot;
-use apollo_optimizer::engine::adaptive_governor::ProcessDecision;
-use apollo_optimizer::engine::daemon_helpers::{
+use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::adaptive_governor::ProcessDecision;
+use apollo_engine::engine::daemon_helpers::{
     append_timeline, battery_pressure_boost, compute_p95, write_metrics,
 };
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::execute_actions::ExecuteOutcomes;
-use apollo_optimizer::engine::io_tiering::IoShaper;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::mach_qos::SchedulingTier;
-use apollo_optimizer::engine::nars_belief::ArousalState;
-use apollo_optimizer::engine::network_monitor::NetworkMonitor;
-use apollo_optimizer::engine::overflow_guard::OverflowThresholds;
-use apollo_optimizer::engine::pipeline::learning_context::LearningContext;
-use apollo_optimizer::engine::power_management::PowerManager;
-use apollo_optimizer::engine::predictive_agent::Intervention;
-use apollo_optimizer::engine::process_classifier::ProcessTier;
-use apollo_optimizer::engine::process_tree::ProcessTree;
-use apollo_optimizer::engine::profile_governor::GovernorDecision;
-use apollo_optimizer::engine::signal_intelligence::SignalDigest;
-use apollo_optimizer::engine::thermal_bailout::ThermalAction;
-use apollo_optimizer::engine::types::BlockerScore;
-use apollo_optimizer::engine::types::OptimizationProfile;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::execute_actions::ExecuteOutcomes;
+use apollo_engine::engine::io_tiering::IoShaper;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::mach_qos::SchedulingTier;
+use apollo_engine::engine::nars_belief::ArousalState;
+use apollo_engine::engine::network_monitor::NetworkMonitor;
+use apollo_engine::engine::overflow_guard::OverflowThresholds;
+use apollo_engine::engine::pipeline::learning_context::LearningContext;
+use apollo_engine::engine::power_management::PowerManager;
+use apollo_engine::engine::predictive_agent::Intervention;
+use apollo_engine::engine::process_classifier::ProcessTier;
+use apollo_engine::engine::process_tree::ProcessTree;
+use apollo_engine::engine::profile_governor::GovernorDecision;
+use apollo_engine::engine::signal_intelligence::SignalDigest;
+use apollo_engine::engine::thermal_bailout::ThermalAction;
+use apollo_engine::engine::types::BlockerScore;
+use apollo_engine::engine::types::OptimizationProfile;
 
 use crate::process_enrichment;
 
@@ -217,7 +217,7 @@ fn decide_qos_tier(
     if fg_family.contains(&decision.pid) {
         return Some(SchedulingTier::Foreground);
     }
-    use apollo_optimizer::engine::adaptive_governor::GovernorDecision as GovDecision;
+    use apollo_engine::engine::adaptive_governor::GovernorDecision as GovDecision;
     match decision.decision {
         GovDecision::Allow => {
             if decision.tier == ProcessTier::ActiveForeground {
@@ -343,7 +343,7 @@ pub fn merge_cycle_metrics<'a>(
 ) {
     // Compute AIS off the hot path — reads 4 state files, never holds metrics lock.
     let ais_snapshot = if cycle_count % AIS_COMPUTE_EVERY_N_CYCLES == 0 {
-        apollo_optimizer::engine::intelligence_score::compute_runtime_ais()
+        apollo_engine::engine::intelligence_score::compute_runtime_ais()
     } else {
         None
     };
@@ -488,7 +488,7 @@ pub fn merge_cycle_metrics<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apollo_optimizer::engine::adaptive_governor::GovernorDecision as GovDecision;
+    use apollo_engine::engine::adaptive_governor::GovernorDecision as GovDecision;
 
     fn decision(pid: u32, dec: GovDecision, tier: ProcessTier) -> ProcessDecision {
         ProcessDecision {

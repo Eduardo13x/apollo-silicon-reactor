@@ -1,6 +1,6 @@
-use apollo_optimizer::engine::fluidity::{FluidityState, FluiditySignal};
-use apollo_optimizer::engine::process_classifier::ProcessSnapshot;
-use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
+use apollo_engine::engine::fluidity::{FluidityState, FluiditySignal};
+use apollo_engine::engine::process_classifier::ProcessSnapshot;
+use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
 
 pub struct FluidityTickInput<'a> {
     pub proc_snaps: &'a [ProcessSnapshot],
@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     fn fluidity_tick_updates_state_from_proc_snaps() {
-        let mut state = apollo_optimizer::engine::fluidity::FluidityState::new();
+        let mut state = apollo_engine::engine::fluidity::FluidityState::new();
         let procs: Vec<(u32, String, f32)> = vec![
             (415, "WindowServer".to_string(), 25.0),
             (1234, "Brave".to_string(), 5.0),
@@ -89,8 +89,8 @@ mod tests {
 
     #[test]
     fn fluidity_signal_snapshot_is_clone_independent() {
-        let mut state = apollo_optimizer::engine::fluidity::FluidityState::new();
-        let _sig = apollo_optimizer::engine::fluidity::FluiditySignal::from(&state);
+        let mut state = apollo_engine::engine::fluidity::FluidityState::new();
+        let _sig = apollo_engine::engine::fluidity::FluiditySignal::from(&state);
         // Mutating state after snapshot must not affect snapshot
         state.update(vec![(415, "WindowServer", 50.0)], 0.0, 0.5);
     }

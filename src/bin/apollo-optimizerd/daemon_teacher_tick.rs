@@ -12,11 +12,11 @@
 //! Must run AFTER llm_reactive_tick resolves a pending outcome and BEFORE
 //! the reactor_weight / decision pass — arousal_state is modified here.
 
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::nars_belief::ArousalState;
-use apollo_optimizer::engine::outcome_tracker::OutcomeTracker;
-use apollo_optimizer::engine::teacher_consolidation::TeacherConsolidator;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::nars_belief::ArousalState;
+use apollo_engine::engine::outcome_tracker::OutcomeTracker;
+use apollo_engine::engine::teacher_consolidation::TeacherConsolidator;
 use chrono::{DateTime, Utc};
 
 /// Run teacher consolidation: compile Gemma suggestion into pattern_weights + NARS beliefs.

@@ -12,12 +12,12 @@
 //! Must run AFTER cycle_hw_snap is populated (daemon_sensor_tick) and BEFORE
 //! the thermal_action evaluation (overflow_thresholds boost).
 
-use apollo_optimizer::engine::daemon_helpers::audit_log;
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
-use apollo_optimizer::engine::iokit_sensors::HardwareSnapshot;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::thermal_manager::ThermalManager;
+use apollo_engine::engine::daemon_helpers::audit_log;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::gpu_manager::{GPUManager, GPUMetrics, GPUPowerState};
+use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::thermal_manager::ThermalManager;
 use std::time::{Duration, Instant};
 
 pub struct ThermalTickOutput {

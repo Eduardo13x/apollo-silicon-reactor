@@ -1,7 +1,7 @@
 //! Level 4: Advanced feature tests — memory analysis, thermal prediction
 
-use apollo_optimizer::engine::memory_analyzer::MemoryAnalyzer;
-use apollo_optimizer::engine::thermal_manager::{ThermalManager, ThermalTrend};
+use apollo_engine::engine::memory_analyzer::MemoryAnalyzer;
+use apollo_engine::engine::thermal_manager::{ThermalManager, ThermalTrend};
 
 // ── Memory Analyzer Tests ───────────────────────────────────────────────────
 

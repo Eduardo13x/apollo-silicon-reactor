@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use apollo_optimizer::dashboard;
-use apollo_optimizer::engine::llm::LearnedPolicy;
-use apollo_optimizer::engine::protocol::{DaemonRequest, DaemonResponse, PROTOCOL_VERSION};
-use apollo_optimizer::engine::types::{LatencyTarget, OptimizationProfile, UsageResponse};
+use apollo_engine::engine::llm::LearnedPolicy;
+use apollo_engine::engine::protocol::{DaemonRequest, DaemonResponse, PROTOCOL_VERSION};
+use apollo_engine::engine::types::{LatencyTarget, OptimizationProfile, UsageResponse};
 use clap::{Parser, Subcommand};
 
 static VERSION_CHECKED: AtomicBool = AtomicBool::new(false);
@@ -232,7 +232,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// Returns Ok(None) when the file exists but no outcome is present, Err when
 /// the file is unreadable (e.g. running as non-root with 0o600 perms).
 fn read_last_suggestion_outcome(
-) -> anyhow::Result<Option<apollo_optimizer::engine::llm::SuggestionOutcome>> {
+) -> anyhow::Result<Option<apollo_engine::engine::llm::SuggestionOutcome>> {
     let candidates = ["/var/lib/apollo/llm_state.json", "/tmp/apollo-llm_state.json"];
     let mut last_err: Option<anyhow::Error> = None;
     for path in candidates {
@@ -264,7 +264,7 @@ fn read_last_suggestion_outcome(
 /// so this works without elevated privileges.
 fn read_top_causal_edges(
     limit: usize,
-) -> anyhow::Result<Vec<apollo_optimizer::engine::causal_graph::CausalEdge>> {
+) -> anyhow::Result<Vec<apollo_engine::engine::causal_graph::CausalEdge>> {
     let candidates = [
         "/var/lib/apollo/learned_state.json",
         "/tmp/apollo-learned_state.json",
@@ -282,10 +282,10 @@ fn read_top_causal_edges(
                 // Persisted shape: Vec<((cause, effect), CausalEdge)>.
                 // We only need the CausalEdge values — the inner struct already
                 // carries `cause` and `effect` fields.
-                let parsed: Vec<((String, String), apollo_optimizer::engine::causal_graph::CausalEdge)> =
+                let parsed: Vec<((String, String), apollo_engine::engine::causal_graph::CausalEdge)> =
                     serde_json::from_value(edges_v.clone())
                         .with_context(|| "deserialize causal_graph_edges")?;
-                let mut edges: Vec<apollo_optimizer::engine::causal_graph::CausalEdge> =
+                let mut edges: Vec<apollo_engine::engine::causal_graph::CausalEdge> =
                     parsed.into_iter().map(|(_, e)| e).collect();
                 edges.sort_by(|a, b| {
                     let sa = a.confidence as f64 * a.evidence_count as f64;
@@ -558,7 +558,7 @@ fn handle_teach_export() -> anyhow::Result<()> {
 }
 
 fn handle_teach_apply(file: &str) -> anyhow::Result<()> {
-    use apollo_optimizer::engine::types::HardPath;
+    use apollo_engine::engine::types::HardPath;
     let content = HardPath::read_to_string_limited(Path::new(file), 1024 * 1024)
         .with_context(|| format!("cannot read file or limit exceeded: {}", file))?;
     let policy: LearnedPolicy = serde_json::from_str(&content)

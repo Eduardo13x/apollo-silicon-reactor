@@ -5,11 +5,11 @@
 
 use std::path::Path;
 
-use apollo_optimizer::engine::capabilities::detect_capabilities;
-use apollo_optimizer::engine::daemon_helpers::{
+use apollo_engine::engine::capabilities::detect_capabilities;
+use apollo_engine::engine::daemon_helpers::{
     journal_path, kill_switch_path, learned_state_path, socket_path,
 };
-use apollo_optimizer::engine::learned_state::{LearnedState, CURRENT_SCHEMA_VERSION};
+use apollo_engine::engine::learned_state::{LearnedState, CURRENT_SCHEMA_VERSION};
 
 // ── Test 1: detect_capabilities returns coherent report ─────────────────────
 

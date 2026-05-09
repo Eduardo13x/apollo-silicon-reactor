@@ -13,10 +13,10 @@
 //! Must run AFTER overflow_thresholds is computed (D-term PID) and signal_tick,
 //! so the seasonal tightening stacks on top of the reactive adjustment.
 
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::holt_winters::HoltWinters;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::overflow_guard::OverflowThresholds;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::holt_winters::HoltWinters;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::overflow_guard::OverflowThresholds;
 
 /// Apply Holt-Winters seasonal forecast: accumulate samples, observe on hour change,
 /// and tighten overflow thresholds when next-hour pressure is predicted high.
@@ -68,8 +68,8 @@ pub fn run_holt_winters_tick(
             .user_profile
             .likely_workload_at_hour(next_hour);
         let workload_multiplier = match next_workload {
-            apollo_optimizer::engine::user_profile::WorkloadType::Coding => 1.5,
-            apollo_optimizer::engine::user_profile::WorkloadType::VideoEdit => 1.3,
+            apollo_engine::engine::user_profile::WorkloadType::Coding => 1.5,
+            apollo_engine::engine::user_profile::WorkloadType::VideoEdit => 1.3,
             _ => 1.0,
         };
 

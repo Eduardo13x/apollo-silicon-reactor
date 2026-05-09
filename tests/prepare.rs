@@ -21,9 +21,9 @@
 
 #[cfg(test)]
 mod scenarios {
-    use apollo_optimizer::engine::adaptive_governor::{AdaptiveGovernor, GovernorDecision};
-    use apollo_optimizer::engine::process_classifier::ProcessSnapshot;
-    use apollo_optimizer::engine::zombie_hunter::HuntSnapshot;
+    use apollo_engine::engine::adaptive_governor::{AdaptiveGovernor, GovernorDecision};
+    use apollo_engine::engine::process_classifier::ProcessSnapshot;
+    use apollo_engine::engine::zombie_hunter::HuntSnapshot;
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -413,7 +413,7 @@ mod scenarios {
 
     #[test]
     fn s19_utility_ranking_foreground_gt_background_gt_stale() {
-        use apollo_optimizer::engine::process_classifier::score_utility;
+        use apollo_engine::engine::process_classifier::score_utility;
         let fg = snap(1, "fg_app", 10.0, 200, true, 5, 0);
         let bg = snap(2, "bg_app", 5.0, 200, true, 300, 300);
         let stale = snap(3, "stale", 0.0, 200, false, 36000, 36000);
@@ -438,7 +438,7 @@ mod scenarios {
 
     #[test]
     fn s20_network_daemon_utility_higher_than_silent() {
-        use apollo_optimizer::engine::process_classifier::score_utility;
+        use apollo_engine::engine::process_classifier::score_utility;
         let mut networked = snap(1, "db", 3.0, 300, false, 3600, 3600);
         networked.has_network = true;
         let silent = snap(2, "idle", 0.0, 50, false, 3600, 3600);

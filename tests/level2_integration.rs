@@ -8,14 +8,14 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use apollo_optimizer::engine::execute_actions::execute_actions;
-use apollo_optimizer::engine::safety::{
+use apollo_engine::engine::execute_actions::execute_actions;
+use apollo_engine::engine::safety::{
     critical_background_processes, enforce_limits_with_budget, protected_processes,
 };
-use apollo_optimizer::engine::types::{
+use apollo_engine::engine::types::{
     ActionBudgetState, CapabilityReport, OptimizationProfile, RootAction, SafetyPolicy,
 };
-use apollo_optimizer::engine::audit_types::DecisionReason;
+use apollo_engine::engine::audit_types::DecisionReason;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

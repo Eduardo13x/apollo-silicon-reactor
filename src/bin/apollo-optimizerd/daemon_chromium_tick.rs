@@ -17,17 +17,17 @@
 
 use std::collections::HashSet;
 
-use apollo_optimizer::engine::chromium_manager::{ChromiumAction, ChromiumManager};
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::fluidity::FluidityState;
-use apollo_optimizer::engine::focus_markov::FocusMarkov;
-use apollo_optimizer::engine::lock_ext::LockRecover;
-use apollo_optimizer::engine::mach_qos::SchedulingTier;
-use apollo_optimizer::engine::nars_belief::ArousalState;
-use apollo_optimizer::engine::process_classifier::ProcessSnapshot;
-use apollo_optimizer::engine::process_identity::ProcessIdentity;
-use apollo_optimizer::engine::types::{FreezeSource, FrozenEntry};
-use apollo_optimizer::engine::window_sensor::WorkloadIntent;
+use apollo_engine::engine::chromium_manager::{ChromiumAction, ChromiumManager};
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::fluidity::FluidityState;
+use apollo_engine::engine::focus_markov::FocusMarkov;
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::mach_qos::SchedulingTier;
+use apollo_engine::engine::nars_belief::ArousalState;
+use apollo_engine::engine::process_classifier::ProcessSnapshot;
+use apollo_engine::engine::process_identity::ProcessIdentity;
+use apollo_engine::engine::types::{FreezeSource, FrozenEntry};
+use apollo_engine::engine::window_sensor::WorkloadIntent;
 
 /// Per-cycle Chromium renderer management tick.
 ///
@@ -92,12 +92,12 @@ pub fn run_chromium_tick(
     // F3: CGWindowList visibility gate — refresh at most every 10 cycles (~5s).
     // Syscall costs ~1-3ms; window ownership rarely changes faster than that.
     if cycle_count % 10 == 0 {
-        let visible = apollo_optimizer::engine::cg_window::visible_pids();
+        let visible = apollo_engine::engine::cg_window::visible_pids();
         chromium_mgr.set_visible_pids(visible);
     }
 
     let chromium_assertion_pids =
-        apollo_optimizer::engine::activity_sensor::pids_with_assertions();
+        apollo_engine::engine::activity_sensor::pids_with_assertions();
     let main_frozen_set: HashSet<u32> =
         state.frozen_state.lock_recover().keys().copied().collect();
     let proc_list: Vec<(u32, &str, f32, u64)> = proc_snaps
@@ -142,7 +142,7 @@ pub fn run_chromium_tick(
             }
             ChromiumAction::PurgePurgeable { pid, name } => {
                 let purged =
-                    apollo_optimizer::engine::compressor_aware::purge_purgeable_regions(*pid)
+                    apollo_engine::engine::compressor_aware::purge_purgeable_regions(*pid)
                         .unwrap_or(0);
                 tracing::debug!(
                     pid = pid,

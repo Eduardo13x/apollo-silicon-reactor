@@ -18,8 +18,8 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use apollo_optimizer::engine::daemon_state::SharedState;
-use apollo_optimizer::engine::lock_ext::LockRecover;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::lock_ext::LockRecover;
 use chrono::Utc;
 
 /// Fast-tick window after a reactor event (seconds).
@@ -59,7 +59,7 @@ pub fn run_reactor(state: SharedState, stop_requested: &AtomicBool) -> anyhow::R
         // Memory pressure via sysctl polling (all push APIs are broken on macOS 15).
         // Polls kern.memorystatus_vm_pressure_level (~1µs) on each loop iteration.
         let mut pressure_monitor =
-            apollo_optimizer::engine::dispatch_pressure::KernelPressureMonitor::new();
+            apollo_engine::engine::dispatch_pressure::KernelPressureMonitor::new();
 
         // notify → thermal
         let mut thermal_fd: libc::c_int = 0;
@@ -166,7 +166,7 @@ pub fn run_reactor(state: SharedState, stop_requested: &AtomicBool) -> anyhow::R
             // Poll kernel pressure level on every iteration (~1µs sysctl read).
             // Fires memory signal on level transitions (Normal↔Warning↔Critical).
             if let Some(level) = pressure_monitor.poll() {
-                use apollo_optimizer::engine::dispatch_pressure::KernelPressureLevel;
+                use apollo_engine::engine::dispatch_pressure::KernelPressureLevel;
                 if level >= KernelPressureLevel::Warning {
                     state
                         .resource_interrupt
