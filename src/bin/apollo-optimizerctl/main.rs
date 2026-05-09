@@ -4,8 +4,9 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod dashboard;
+
 use anyhow::Context;
-use apollo_optimizer::dashboard;
 use apollo_engine::engine::llm::LearnedPolicy;
 use apollo_engine::engine::protocol::{DaemonRequest, DaemonResponse, PROTOCOL_VERSION};
 use apollo_engine::engine::types::{LatencyTarget, OptimizationProfile, UsageResponse};

@@ -16,3 +16,25 @@ daemon_state: running
 daemon_failures: 0
 daemon_p95_ms: 189.0
 daemon_last_error: None
+
+---
+post_split_date_utc: 2026-05-09
+post_split_commit: 754374058f9cdf2faa85fe21856beb3191e84c71
+
+post_split_cargo_test_workspace_real_time: 3m21.13s (wall; 2 flaky failures pre-existing)
+post_split_cargo_test_engine_real_time: 2.833s (wall; 1 pre-existing flake)
+post_split_test_count_pass: 1961 (workspace) / 1961 (engine-only, excluding flake)
+post_split_test_count_fail: 2 (workspace pre-existing flakes) / 1 (engine-only pre-existing flake)
+known_flakes: engine::thread_selfcounts::tests::selfcounts_increases_with_work (PMC), engine::background_collectors::tests::pressure_collector_spawn_and_read (timeout under load)
+
+post_split_clippy_warning_count: 219 (+1 UsageStatus dead_code, pre-existing from Commit 4)
+
+post_split_daemon_pid: 27909
+post_split_daemon_failures: 0
+post_split_daemon_p95_ms: 107.0
+post_split_daemon_last_error: None
+
+delta_workspace_test_wall_time: -43s vs cold-no-run baseline (warm cache; not meaningful)
+delta_engine_test_wall_time: 2.833s vs full workspace 3m21s — engine-only tests now run in <3s
+ipc_status_ok: true (JSON with effective_profile, metrics, failures fields)
+dashboard_render_ok: true (VEREDICTO line rendered: "🟠 Modo supervivencia activo")

@@ -3,7 +3,7 @@
 //! Renders a visual summary of daemon status using Unicode box-drawing,
 //! ANSI colors, and emoji indicators.
 
-use crate::engine::types::{
+use apollo_engine::engine::types::{
     BlockerScore, DaemonStatus, EnergyConsumerInfo, FreezeSource, OptimizationProfile, SafetyPolicy,
 };
 use chrono::Utc;
@@ -1078,7 +1078,7 @@ fn render_verdict(status: &DaemonStatus) -> Vec<String> {
             "Presión de memoria crítica",
             "Swap elevado — liberando recursos.",
         )
-    } else if crate::engine::safety::survival_mode_active_total(
+    } else if apollo_engine::engine::safety::survival_mode_active_total(
         m.memory_pressure,
         m.swap_used_bytes,
         m.swap_total_bytes,
