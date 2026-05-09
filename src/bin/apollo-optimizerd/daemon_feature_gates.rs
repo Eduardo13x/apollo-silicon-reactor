@@ -43,7 +43,8 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use apollo_optimizer::collector::{SystemCollector, SystemSnapshot};
-use apollo_optimizer::engine::daemon_helpers::spotlight_set_indexing;
+// spotlight_set_indexing import removed 2026-05-08: Apollo no longer
+// touches mdutil automatically (user-reported Finder beachball regression).
 use apollo_optimizer::engine::daemon_state::SharedState;
 use apollo_optimizer::engine::llm_inference_mode::LlmInferenceDetector;
 use apollo_optimizer::engine::lock_ext::LockRecover;
@@ -91,18 +92,13 @@ pub fn run_llm_inference_mode_tick(
     };
     let llm_active = llm_detector.is_active();
 
-    // Spotlight management: disable during LLM inference, re-enable when done.
-    if is_root {
-        if llm_active && !*llm_spotlight_disabled {
-            spotlight_set_indexing(false);
-            *llm_spotlight_disabled = true;
-            println!("[llm-mode] Spotlight indexing disabled for inference");
-        } else if !llm_active && *llm_spotlight_disabled {
-            spotlight_set_indexing(true);
-            *llm_spotlight_disabled = false;
-            println!("[llm-mode] Spotlight indexing re-enabled");
-        }
-    }
+    // Spotlight toggle disabled (2026-05-08): user reported Finder beachball
+    // when Apollo flipped mdutil during LLM bursts. The off→on edge invalidates
+    // Spotlight metadata caches and any open Finder window stalls waiting on
+    // mds. We keep the LLM detection + pressure boost, but never touch
+    // `mdutil` automatically. Re-enable behind a config flag if ever needed.
+    let _ = is_root;
+    let _ = llm_spotlight_disabled;
 
     LlmInferenceOutcome {
         llm_boost,
