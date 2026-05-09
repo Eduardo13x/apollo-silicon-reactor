@@ -40,6 +40,9 @@ use crate::engine::usage_model::UsageModel;
 
 /// Runtime metrics, thermal state, reactor counters — the "dashboard" data.
 /// Highest contention group (~32 accesses), mitigated by try_lock in socket handler.
+///
+/// Cross-crate visibility: used by apollo-optimizerd daemon_freeze_executor.rs and main.rs
+/// to access per-cycle metrics state. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 pub struct MetricsState {
     pub metrics: RuntimeMetrics,
     pub throttle_level: String,
@@ -101,6 +104,9 @@ impl MetricsState {
 }
 
 /// Reactor thread counters and status.
+///
+/// Cross-crate visibility: constructed in apollo-optimizerd main.rs and daemon_memory_budget.rs
+/// tests. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 pub struct ReactorStatus {
     pub events_total: u64,
     pub events_mem: u64,
@@ -134,6 +140,10 @@ impl Default for ReactorStatus {
 // ── Policy Domain ───────────────────────────────────────────────────────────
 
 /// Optimization profile, governor, learned policy — the "brain" state.
+///
+/// Cross-crate visibility: constructed in apollo-optimizerd main.rs and daemon_memory_budget.rs,
+/// daemon_dispatch_tick.rs tests; contains `ProfileGovernor`, `AdaptiveGovernor` etc. which
+/// are used by daemon ticks. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 pub struct PolicyState {
     pub profile: OptimizationProfile,
     pub governor: ProfileGovernor,
@@ -151,6 +161,9 @@ pub struct PolicyState {
 
 /// Blockers + wake state — the "process management" data.
 /// Note: frozen_state lives as a flat SharedState field (sentinel coupling; see feedback_lock_migration.md).
+///
+/// Cross-crate visibility: constructed in apollo-optimizerd main.rs and daemon_memory_budget.rs,
+/// daemon_dispatch_tick.rs tests. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 pub struct ProcessState {
     pub last_blockers: Vec<BlockerScore>,
     pub wake_state: WakeRuntimeState,
@@ -160,6 +173,9 @@ pub struct ProcessState {
 
 /// Hardware snapshots, sysctl governor — the "hardware" layer.
 /// Note: mach_qos lives as a flat SharedState field (sentinel coupling; see feedback_lock_migration.md).
+///
+/// Cross-crate visibility: constructed in apollo-optimizerd main.rs and daemon tests.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 pub struct HardwareState {
     pub last_hw_snapshot: Option<HardwareSnapshot>,
     pub sysctl_governor_status: SysctlGovernorStatus,
@@ -168,6 +184,10 @@ pub struct HardwareState {
 // ── LLM Domain ──────────────────────────────────────────────────────────────
 
 /// LLM configuration, state, and associated file paths.
+///
+/// Cross-crate visibility: constructed in apollo-optimizerd main.rs and daemon tests;
+/// accessed by daemon_skill_tick.rs and llm_daemon.rs. Audited 2026-05-09 during Sprint 5
+/// Mes 0 workspace split.
 pub struct LlmDomainState {
     pub llm_cfg: LlmConfig,
     pub llm_state: LlmState,
@@ -182,6 +202,9 @@ pub struct LlmDomainState {
 // ── Usage Domain ────────────────────────────────────────────────────────────
 
 /// Usage model and tracker — the "learning" data.
+///
+/// Cross-crate visibility: constructed in apollo-optimizerd main.rs and daemon tests.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 pub struct UsageDomainState {
     pub usage_model: UsageModel,
     pub usage_tracker: UsageTrackerState,
@@ -190,6 +213,9 @@ pub struct UsageDomainState {
 }
 
 /// Usage model lifecycle counters.
+///
+/// Cross-crate visibility: constructed in apollo-optimizerd main.rs and daemon tests.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Default)]
 pub struct UsageTrackerState {
     pub last_persist_at: Option<DateTime<Utc>>,
@@ -250,6 +276,12 @@ mod tests {
 
 /// The daemon's shared state, grouped into 6 domain-specific Mutex groups.
 /// Reduces ~20 individual Mutex fields to 6 coarser-grained locks.
+///
+/// Cross-crate visibility: the god-node of the daemon. Every daemon tick module
+/// (daemon_signal_tick, daemon_chromium_tick, daemon_skill_tick, daemon_ctx_switch_tick,
+/// daemon_dispatch_tick, metrics_reporter, socket_handler, etc.) takes `Arc<SharedState>`
+/// or `&SharedState`. All fields must remain `pub` for tick modules to access them.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 ///
 /// # Lock ordering (to prevent deadlocks)
 /// Never hold two domain locks simultaneously. Acquire one, complete the

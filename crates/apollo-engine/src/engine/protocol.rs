@@ -5,12 +5,20 @@ use crate::engine::llm::{LearnedPolicy, LlmSuggestion};
 /// Wire protocol version.  Bump when adding variants that older clients/daemons
 /// cannot understand.  Both apollo-optimizerd and apollo-optimizerctl expose
 /// this at runtime so a version mismatch can be reported cleanly.
+///
+/// Cross-crate visibility: read by apollo-optimizerctl to detect daemon version mismatches.
+/// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 pub const PROTOCOL_VERSION: u32 = 1;
 use crate::engine::types::{
     BlockerScore, CapabilityReport, DaemonStatus, HealthReport, LatencyTarget, LlmStatus,
     OptimizationProfile, ProfileTransition, RuntimeMetrics, UsageResponse,
 };
 
+/// IPC request type.
+///
+/// Cross-crate visibility: all bins that communicate with the daemon (apollo-optimizerctl,
+/// apollo-menubar, apollo-optimizerd socket_handler) construct and match on this type.
+/// Must remain `pub`. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum DaemonRequest {
@@ -126,6 +134,11 @@ impl DaemonRequest {
     }
 }
 
+/// IPC response type.
+///
+/// Cross-crate visibility: all IPC clients (apollo-optimizerctl, apollo-menubar) match on
+/// variants of this type; socket_handler.rs in apollo-optimizerd constructs them.
+/// Must remain `pub`. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 #[allow(clippy::large_enum_variant)]
