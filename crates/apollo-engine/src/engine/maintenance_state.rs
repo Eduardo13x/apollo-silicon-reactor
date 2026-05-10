@@ -31,6 +31,51 @@ impl MaintenanceState {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub fn secs_since_any_purge(&self) -> u64 {
+        match self.last_any_purge_at {
+            None => u64::MAX,
+            Some(t) => SystemTime::now()
+                .duration_since(t)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+
+    pub fn secs_since_cli_purge(&self) -> u64 {
+        match self.last_cli_purge_at {
+            None => u64::MAX,
+            Some(t) => SystemTime::now()
+                .duration_since(t)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+
+    pub fn secs_since_wake(&self) -> u64 {
+        match self.last_wake_at {
+            None => u64::MAX,
+            Some(t) => t.elapsed().as_secs(),
+        }
+    }
+
+    pub fn push_swap_delta(&mut self, delta_bps: f64) {
+        self.swap_delta_window.push(SystemTime::now(), delta_bps);
+    }
+
+    pub fn mark_purged(&mut self) {
+        self.last_any_purge_at = Some(SystemTime::now());
+    }
+
+    pub fn mark_cli_purged(&mut self) {
+        let now = SystemTime::now();
+        self.last_cli_purge_at = Some(now);
+        self.last_any_purge_at = Some(now);
+    }
+
+    pub fn observe_wake(&mut self) {
+        self.last_wake_at = Some(Instant::now());
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -132,5 +177,34 @@ mod tests {
             w.push(t, 50_000.0);
         }
         assert!(!w.sustained_below(256_000.0, 90));
+    }
+
+    #[test]
+    fn secs_since_any_purge_none_returns_max() {
+        let s = MaintenanceState::default();
+        assert_eq!(s.secs_since_any_purge(), u64::MAX);
+    }
+
+    #[test]
+    fn secs_since_any_purge_clock_backwards_returns_zero() {
+        let mut s = MaintenanceState::default();
+        s.last_any_purge_at = Some(SystemTime::now() + Duration::from_secs(60));
+        assert_eq!(s.secs_since_any_purge(), 0);
+    }
+
+    #[test]
+    fn mark_cli_purged_updates_both_timestamps() {
+        let mut s = MaintenanceState::default();
+        s.mark_cli_purged();
+        assert!(s.last_cli_purge_at.is_some());
+        assert!(s.last_any_purge_at.is_some());
+    }
+
+    #[test]
+    fn mark_purged_only_updates_any_not_cli() {
+        let mut s = MaintenanceState::default();
+        s.mark_purged();
+        assert!(s.last_any_purge_at.is_some());
+        assert!(s.last_cli_purge_at.is_none());
     }
 }
