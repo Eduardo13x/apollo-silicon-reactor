@@ -121,6 +121,22 @@ pub struct LockFreeMetrics {
     pub maintenance_purge_skipped_idle_total: AtomicU64,
     pub maintenance_purge_skipped_build_mode_total: AtomicU64,
     pub maintenance_purge_skipped_rate_limit_total: AtomicU64,
+
+    /// Phase 0 lock-decomposition instrumentation (2026-05-10).
+    /// Tracks contention on the `state.metrics` god-lock to decide whether
+    /// decomposition will actually move p95. Per NotebookLM round-3:
+    /// "If wait_ns accounts for <5ms of the 135ms p95, lock decomposition
+    /// will fail to meet the user's ≤100ms target — bottleneck is
+    /// elsewhere (process-tree O(N) sort)."
+    ///
+    /// `wait` = time spent BLOCKED in `.lock_recover()` before acquire.
+    /// `held` = time the guard is held (predicts decomp benefit).
+    pub metrics_lock_wait_total_ns: AtomicU64,
+    pub metrics_lock_wait_count: AtomicU64,
+    pub metrics_lock_wait_max_ns: AtomicU64,
+    pub metrics_lock_held_total_ns: AtomicU64,
+    pub metrics_lock_held_count: AtomicU64,
+    pub metrics_lock_held_max_ns: AtomicU64,
 }
 
 impl LockFreeMetrics {
@@ -180,7 +196,34 @@ impl LockFreeMetrics {
             maintenance_purge_skipped_idle_total: AtomicU64::new(0),
             maintenance_purge_skipped_build_mode_total: AtomicU64::new(0),
             maintenance_purge_skipped_rate_limit_total: AtomicU64::new(0),
+            metrics_lock_wait_total_ns: AtomicU64::new(0),
+            metrics_lock_wait_count: AtomicU64::new(0),
+            metrics_lock_wait_max_ns: AtomicU64::new(0),
+            metrics_lock_held_total_ns: AtomicU64::new(0),
+            metrics_lock_held_count: AtomicU64::new(0),
+            metrics_lock_held_max_ns: AtomicU64::new(0),
         }
+    }
+
+    /// Record a metrics-lock acquisition + held duration.
+    /// Caller passes the wait time (lock acquisition) and held time
+    /// (between acquire and guard drop). Both in nanoseconds.
+    ///
+    /// Used by Phase 0 lock-decomposition baseline measurement
+    /// (2026-05-10). Removed once lock-decomp lands and the metrics
+    /// god-lock no longer exists.
+    #[inline(always)]
+    pub fn record_metrics_lock(&self, wait_ns: u64, held_ns: u64) {
+        self.metrics_lock_wait_total_ns
+            .fetch_add(wait_ns, Ordering::Relaxed);
+        self.metrics_lock_wait_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics_lock_wait_max_ns
+            .fetch_max(wait_ns, Ordering::Relaxed);
+        self.metrics_lock_held_total_ns
+            .fetch_add(held_ns, Ordering::Relaxed);
+        self.metrics_lock_held_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics_lock_held_max_ns
+            .fetch_max(held_ns, Ordering::Relaxed);
     }
 
     // ── Writer methods (hot path — Relaxed ordering, single LSE instruction) ─

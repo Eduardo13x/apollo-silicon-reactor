@@ -108,6 +108,8 @@ pub struct EnrichedTelemetryInputs<'a> {
     /// (Sprint Coalition 2026-05-10). 0 when nothing is foreground;
     /// 1-3 in steady-state app-switching.
     pub active_coalitions_count: u32,
+    /// Lock-free metrics for Phase 0 lock-decomp instrumentation.
+    pub lf_metrics: &'a apollo_engine::engine::lse_counters::LockFreeMetrics,
 }
 
 /// Wire enriched telemetry + UCHS neurocognitive metrics into
@@ -178,6 +180,42 @@ pub fn wire_enriched_telemetry(
     // commits a381c6b..1ab6bdb is actually firing in production.
     m.metrics.guard_overprotection = inputs.cognitive_state.epistemic.guard_overprotection;
     m.metrics.active_coalitions_count = inputs.active_coalitions_count;
+    // Phase 0 lock-decomp baseline (2026-05-10). Average over all
+    // record_metrics_lock() observations since daemon start; max is
+    // monotonic. If avg_wait << avg_held in steady state, the metrics
+    // god-lock is held-time-bound not contention-bound, so
+    // lock-decomposition would shift the bottleneck rather than eliminate it.
+    let lf = inputs.lf_metrics;
+    let wc = lf
+        .metrics_lock_wait_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let ws = lf
+        .metrics_lock_wait_total_ns
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let wm = lf
+        .metrics_lock_wait_max_ns
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let hc = lf
+        .metrics_lock_held_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let hs = lf
+        .metrics_lock_held_total_ns
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let hm = lf
+        .metrics_lock_held_max_ns
+        .load(std::sync::atomic::Ordering::Relaxed);
+    m.metrics.metrics_lock_wait_avg_us = if wc > 0 {
+        (ws as f64 / wc as f64) / 1000.0
+    } else {
+        0.0
+    };
+    m.metrics.metrics_lock_wait_max_us = wm / 1000;
+    m.metrics.metrics_lock_held_avg_us = if hc > 0 {
+        (hs as f64 / hc as f64) / 1000.0
+    } else {
+        0.0
+    };
+    m.metrics.metrics_lock_held_max_us = hm / 1000;
     m.metrics.meta_confidence = inputs.cognitive_state.meta_cognition.meta_confidence;
     m.metrics.humble_mode = inputs.cog_decision.humble_mode;
     m.metrics.adversarial_pass_rate =

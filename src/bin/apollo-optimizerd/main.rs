@@ -2125,8 +2125,13 @@ fn main() -> anyhow::Result<()> {
                 let interactive_heavy = interactive_cpu_sum >= 60.0;
 
                 // Populate real pressure metrics for observability.
+                // Phase 0 lock-decomp instrumentation: time wait + hold of
+                // the longest known metrics-lock hold (~410 LoC).
                 {
+                    let t_wait = std::time::Instant::now();
                     let mut metrics = state.metrics.lock_recover();
+                    let wait_ns = t_wait.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    let t_held = std::time::Instant::now();
                     metrics.metrics.swap_used_bytes = snapshot.pressure.swap_used_bytes;
                     metrics.metrics.swap_total_bytes = snapshot.pressure.swap_total_bytes;
                     metrics.metrics.swap_delta_bps = snapshot.pressure.swap_delta_bytes_per_sec;
@@ -2533,6 +2538,9 @@ fn main() -> anyhow::Result<()> {
                     // Daemon self-IPC (thread_selfcounts syscall 186)
                     let _cycle_ipc = cycle_ipc_tracker.tick();
                     metrics.metrics.daemon_cycle_ipc = cycle_ipc_tracker.ema_ipc();
+                    drop(metrics);
+                    let held_ns = t_held.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    lf_metrics.record_metrics_lock(wait_ns, held_ns);
                 }
 
                 let (decide_interactive, decide_noise, decide_weights, outcome_baseline) = {
@@ -4673,6 +4681,7 @@ fn main() -> anyhow::Result<()> {
                         thermal_seconds_to_throttle,
                         thermal_trend_predicted: &thermal_trend_predicted,
                         active_coalitions_count: active_coalitions.len() as u32,
+                        lf_metrics: &lf_metrics,
                     },
                 );
 

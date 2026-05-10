@@ -1425,6 +1425,17 @@ pub struct RuntimeMetrics {
     /// 0 = no recent fg, 1-3 = healthy app-switching window.
     #[serde(default)]
     pub active_coalitions_count: u32,
+    /// Phase 0 lock-decomp baseline (2026-05-10).
+    /// Average + max wait time (µs) for the metrics god-lock. If avg << held
+    /// → contention is NOT the bottleneck → lock-decomp won't help.
+    #[serde(default)]
+    pub metrics_lock_wait_avg_us: f64,
+    #[serde(default)]
+    pub metrics_lock_wait_max_us: u64,
+    #[serde(default)]
+    pub metrics_lock_held_avg_us: f64,
+    #[serde(default)]
+    pub metrics_lock_held_max_us: u64,
     /// MetaCognition meta_confidence [0,1].
     #[serde(default)]
     pub meta_confidence: f32,
