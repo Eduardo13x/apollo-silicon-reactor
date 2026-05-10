@@ -111,6 +111,16 @@ pub struct LockFreeMetrics {
     pub actions_pushed_quarantine_daemon_total: AtomicU64,
     pub actions_pushed_raw_total: AtomicU64,
     pub actions_rejected_shape_total: AtomicU64,
+
+    /// Maintenance Purge Gate telemetry (Sprint 5 Mes 0 — 2026-05-10).
+    /// Tracks how often the purge gate fires and which guard skips it.
+    pub maintenance_purge_total: AtomicU64,
+    pub maintenance_purge_skipped_pressure_total: AtomicU64,
+    pub maintenance_purge_skipped_swap_floor_total: AtomicU64,
+    pub maintenance_purge_skipped_growing_total: AtomicU64,
+    pub maintenance_purge_skipped_idle_total: AtomicU64,
+    pub maintenance_purge_skipped_build_mode_total: AtomicU64,
+    pub maintenance_purge_skipped_rate_limit_total: AtomicU64,
 }
 
 impl LockFreeMetrics {
@@ -163,6 +173,13 @@ impl LockFreeMetrics {
             actions_pushed_quarantine_daemon_total: AtomicU64::new(0),
             actions_pushed_raw_total: AtomicU64::new(0),
             actions_rejected_shape_total: AtomicU64::new(0),
+            maintenance_purge_total: AtomicU64::new(0),
+            maintenance_purge_skipped_pressure_total: AtomicU64::new(0),
+            maintenance_purge_skipped_swap_floor_total: AtomicU64::new(0),
+            maintenance_purge_skipped_growing_total: AtomicU64::new(0),
+            maintenance_purge_skipped_idle_total: AtomicU64::new(0),
+            maintenance_purge_skipped_build_mode_total: AtomicU64::new(0),
+            maintenance_purge_skipped_rate_limit_total: AtomicU64::new(0),
         }
     }
 
@@ -330,6 +347,13 @@ impl LockFreeMetrics {
             actions_pushed_quarantine_daemon_total: self.actions_pushed_quarantine_daemon_total.load(Ordering::Relaxed),
             actions_pushed_raw_total: self.actions_pushed_raw_total.load(Ordering::Relaxed),
             actions_rejected_shape_total: self.actions_rejected_shape_total.load(Ordering::Relaxed),
+            maintenance_purge_total: self.maintenance_purge_total.load(Ordering::Relaxed),
+            maintenance_purge_skipped_pressure_total: self.maintenance_purge_skipped_pressure_total.load(Ordering::Relaxed),
+            maintenance_purge_skipped_swap_floor_total: self.maintenance_purge_skipped_swap_floor_total.load(Ordering::Relaxed),
+            maintenance_purge_skipped_growing_total: self.maintenance_purge_skipped_growing_total.load(Ordering::Relaxed),
+            maintenance_purge_skipped_idle_total: self.maintenance_purge_skipped_idle_total.load(Ordering::Relaxed),
+            maintenance_purge_skipped_build_mode_total: self.maintenance_purge_skipped_build_mode_total.load(Ordering::Relaxed),
+            maintenance_purge_skipped_rate_limit_total: self.maintenance_purge_skipped_rate_limit_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -387,6 +411,13 @@ pub struct MetricsSnapshot {
     pub actions_pushed_quarantine_daemon_total: u64,
     pub actions_pushed_raw_total: u64,
     pub actions_rejected_shape_total: u64,
+    pub maintenance_purge_total: u64,
+    pub maintenance_purge_skipped_pressure_total: u64,
+    pub maintenance_purge_skipped_swap_floor_total: u64,
+    pub maintenance_purge_skipped_growing_total: u64,
+    pub maintenance_purge_skipped_idle_total: u64,
+    pub maintenance_purge_skipped_build_mode_total: u64,
+    pub maintenance_purge_skipped_rate_limit_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
