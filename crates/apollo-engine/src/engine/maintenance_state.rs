@@ -55,6 +55,27 @@ impl SwapDeltaWindow {
         }
         self.samples.push_back((t, delta_bps));
     }
+
+    pub fn sustained_below(&self, threshold_bps: f64, secs: u64) -> bool {
+        // Add 1-second grace to the cutoff to avoid boundary jitter at exact window edges.
+        let cutoff = match SystemTime::now().checked_sub(Duration::from_secs(secs + 1)) {
+            Some(t) => t,
+            None => return false,
+        };
+
+        let recent: Vec<&(SystemTime, f64)> = self
+            .samples
+            .iter()
+            .filter(|(t, _)| *t >= cutoff)
+            .collect();
+
+        let min_samples = (secs / 2).max(1) as usize;
+        if recent.len() < min_samples {
+            return false;
+        }
+
+        recent.iter().all(|(_, bps)| *bps < threshold_bps)
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +92,16 @@ mod tests {
         assert_eq!(w.len(), SwapDeltaWindow::CAP);
         // First sample retained should be sample index 5 (50 - 45)
         assert_eq!(w.samples.front().unwrap().1, 5.0);
+    }
+
+    #[test]
+    fn swap_delta_window_sustained_below_with_full_window_returns_true() {
+        let mut w = SwapDeltaWindow::default();
+        let now = SystemTime::now();
+        for i in 0..45 {
+            let t = now - Duration::from_secs(90) + Duration::from_secs(i * 2);
+            w.push(t, 50_000.0);
+        }
+        assert!(w.sustained_below(256_000.0, 90));
     }
 }
