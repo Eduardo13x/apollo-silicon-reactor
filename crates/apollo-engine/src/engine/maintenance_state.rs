@@ -48,9 +48,28 @@ impl SwapDeltaWindow {
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
+
+    pub fn push(&mut self, t: SystemTime, delta_bps: f64) {
+        if self.samples.len() >= Self::CAP {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((t, delta_bps));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_delta_window_drops_oldest_at_capacity() {
+        let mut w = SwapDeltaWindow::default();
+        let t = SystemTime::now();
+        for i in 0..50 {
+            w.push(t + Duration::from_secs(i as u64), i as f64);
+        }
+        assert_eq!(w.len(), SwapDeltaWindow::CAP);
+        // First sample retained should be sample index 5 (50 - 45)
+        assert_eq!(w.samples.front().unwrap().1, 5.0);
+    }
 }
