@@ -53,6 +53,7 @@ mod daemon_wake_handler;
 mod daemon_wake_unfreeze;
 mod learning_tick;
 mod llm_daemon;
+mod main_loop_msg;
 mod metrics_reporter;
 mod process_enrichment;
 mod socket_handler;
@@ -613,6 +614,15 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             let mut cautious_cycles_remaining: u32 = if prior_crash { 50 } else { 0 };
+
+            // IPC mpsc channel: socket threads forward CLI Purge requests here.
+            // Initialized before spawn_control_socket so the OnceLock is set
+            // before any socket thread can attempt MAIN_LOOP_TX.get().
+            let (main_loop_tx, main_loop_rx) =
+                std::sync::mpsc::channel::<main_loop_msg::MainLoopMsg>();
+            main_loop_msg::MAIN_LOOP_TX
+                .set(std::sync::Mutex::new(main_loop_tx))
+                .map_err(|_| anyhow::anyhow!("MAIN_LOOP_TX already set"))?;
 
             // Startup glue: spawn control socket server + synchronously wait for
             // bind confirmation. On bind failure this exits(1) — prevents a second
@@ -4533,6 +4543,43 @@ fn main() -> anyhow::Result<()> {
                     },
                     &mut lctx,
                 );
+
+                // Drain CLI purge requests from socket threads.
+                // The mpsc receiver is in scope as `main_loop_rx`. Each iteration of the
+                // outer loop (one daemon cycle) drains pending requests and replies inline.
+                while let Ok(msg) = main_loop_rx.try_recv() {
+                    match msg {
+                        main_loop_msg::MainLoopMsg::CliPurge { response_tx } => {
+                            let resp = if maintenance_state.secs_since_cli_purge() < 300 {
+                                let wait = 300 - maintenance_state.secs_since_cli_purge();
+                                apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                    fired: false,
+                                    reason: format!("rate_limited — wait {}s", wait),
+                                }
+                            } else if maintenance_state.secs_since_any_purge() < 60 {
+                                apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                    fired: false,
+                                    reason: "rate_limited — auto-purge fired recently".into(),
+                                }
+                            } else if std::process::Command::new("purge").spawn().is_ok() {
+                                maintenance_state.mark_cli_purged();
+                                lf_metrics
+                                    .maintenance_purge_total
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                    fired: true,
+                                    reason: "ok".into(),
+                                }
+                            } else {
+                                apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                    fired: false,
+                                    reason: "purge spawn failed".into(),
+                                }
+                            };
+                            let _ = response_tx.send(resp);
+                        }
+                    }
+                }
 
                 // Push estado a suscriptores activos (menubar, etc.)
                 socket_handler::broadcast_current_status(&state);
