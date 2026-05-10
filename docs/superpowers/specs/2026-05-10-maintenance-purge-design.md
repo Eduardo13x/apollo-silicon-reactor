@@ -54,7 +54,12 @@ src/bin/apollo-optimizerd/
 
 ### Tick ordering invariant
 
-`survival_tick → maintenance_tick → dispatch_tick` (strict serial). Both purge ticks read/write the **same** `last_any_purge_at` field on `MaintenanceState`. If survival fires in cycle N, it updates the shared timestamp; maintenance_tick in the same cycle reads it and skips on rate-limit. **No flag-based "first wins"** — flags drift across forks/restarts; a single timestamp is the source of truth.
+`survival_tick → maintenance_tick → dispatch_tick` (strict serial). The shared `last_any_purge_at` is **asymmetric**:
+
+- **Survival tick** — IGNORES `last_any_purge_at` for gating (keeps existing 10-min `Instant`-based local cooldown via `survival_purge_at` field). Survival is physical-crisis sovereign. After firing, **writes** `last_any_purge_at` so maintenance backs off.
+- **Maintenance tick** — READS `last_any_purge_at` and skips if < 30 min. Writes after firing.
+
+**Why asymmetric** (NotebookLM round 2 finding): if maintenance fires at pressure 0.70 and pressure escalates to 0.90 within 30 min, a fully-shared cooldown would block survival from firing exactly when it's most needed. Asymmetric design: maintenance is opportunistic and yields; survival never yields.
 
 ## Threshold logic (post-Skeptic hardening)
 
@@ -71,10 +76,12 @@ fn should_fire(snap: &SystemSnapshot, ctx: &UserContext, state: &MaintenanceStat
     if raw_pressure < 0.65 { return Some(SkipReason::PressureLow); }
     if raw_pressure >= 0.85 { return Some(SkipReason::PressureSurvival); }
 
-    // 2. Absolute swap floor — closes M1 cold-boot calibration trap
+    // 2. Absolute swap floor — closes M1 cold-boot calibration trap.
     //    macOS dynamically grows swap_total; cold-boot 800MB allocation would
-    //    fire at 50% with only 400MB swap, which is trivial. Floor at 2 GB.
-    let swap_floor = std::cmp::max(2 * 1024 * 1024 * 1024, swap_total / 2);
+    //    fire at 50% with only 400MB swap, which is trivial. NotebookLM round 2
+    //    flagged 2 GB as too rigid for M1 8GB (typical swap_total = 2-4 GB);
+    //    relaxed to 1.5 GB so users with 2.4 GB swap_total still benefit.
+    let swap_floor = std::cmp::max(1_536 * 1024 * 1024, swap_total / 2);
     if swap_used < swap_floor { return Some(SkipReason::SwapFloor); }
 
     // 3. Swap delta sustained 90s via NEW window struct.
@@ -108,11 +115,11 @@ fn should_fire(snap: &SystemSnapshot, ctx: &UserContext, state: &MaintenanceStat
 |---|---|---|---|
 | Pressure source | effective | **raw** | Skeptic: purge addresses memory pressure only; effective pressure includes thermal/hw/llm/battery boosts that purge cannot fix. NotebookLM initially recommended effective for "consistency"; Skeptic argument wins on physical correctness. |
 | Pressure window | ≥ 0.65 | **0.65 ≤ p < 0.85** | Clean handoff to survival_tick — no ambiguous overlap zone. |
-| Swap pct | > 50% × total | **max(2 GB, 50% × total)** | Absolute 2 GB floor closes M1 cold-boot trap (small swap_total). |
+| Swap pct | > 50% × total | **max(1.5 GB, 50% × total)** | Absolute 1.5 GB floor closes M1 cold-boot trap (small swap_total) without being too rigid for M1 8GB typical swap_total range (NotebookLM r2). |
 | Swap delta | < 100 KB/s for 60s | **< 256 KB/s for 90s** | 100 KB/s is below collector noise floor on M1; 90s eliminates single-cycle anomalies that 60s could miss. |
 | Idle gate | > 120s standalone | **UserContext::is_idle_long()** + 10s post-wake quiet | Reuse existing semantic + close lid-open race. |
 | Build bypass | none | **skip if dev_runtime_active** | Prevent page cache invalidation during cargo/Xcode builds. |
-| Rate-limit | 20 min isolated | **30 min shared** with survival | macOS purge throttling + SSD wear; single source of truth via `last_any_purge_at`. |
+| Rate-limit | 20 min isolated | **30 min asymmetric** | Maintenance reads/writes `last_any_purge_at`; survival writes only (never gated by it). NotebookLM r2 flagged that fully-shared cooldown would block survival in pressure-escalation scenarios. |
 
 ### CLI rate-limit (separate from auto-purge)
 
