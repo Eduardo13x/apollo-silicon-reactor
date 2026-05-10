@@ -200,6 +200,11 @@ impl CompanionGraph {
     pub fn edge_count(&self) -> usize {
         self.per_app.values().map(|a| a.edges.len()).sum()
     }
+
+    /// Total observation cycles. Exposed for persistence sanity checks.
+    pub fn total_cycles(&self) -> u64 {
+        self.total_cycles
+    }
 }
 
 #[cfg(test)]

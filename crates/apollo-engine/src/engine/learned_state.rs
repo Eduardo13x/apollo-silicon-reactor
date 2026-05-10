@@ -26,6 +26,7 @@ use crate::engine::nars_belief::ArousalState;
 use crate::engine::nested_learner::NestedLearner;
 use crate::engine::neuromodulator::NeuroState;
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
+use crate::engine::companion_graph::CompanionGraph;
 use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
 use crate::engine::overflow_guard::OverflowHistory;
 use crate::engine::predictive_agent::SpecialistAccuracyTracker;
@@ -507,6 +508,14 @@ pub struct LearnedState {
     /// Separate from last_any_purge_at so 5-min CLI rate-limit is independent.
     #[serde(default)]
     pub last_cli_purge_at: Option<std::time::SystemTime>,
+
+    /// Directional companion graph (Sprint C 2026-05-10) — `P(proc | fg_app)`
+    /// with Lift normalization. Stores raw counters only; the membership
+    /// decision (lift ≥ 2.0, conf ≥ 0.5, N ≥ 180) is recomputed at query
+    /// time, so changing thresholds takes effect retroactively without
+    /// re-learning. Decay continues post-restore on the live graph.
+    #[serde(default)]
+    pub companion_graph: Option<CompanionGraph>,
 }
 
 /// Current schema version for [`LearnedState`].
@@ -627,6 +636,9 @@ impl LearnedState {
             meta_cognition: None,
             last_any_purge_at: maintenance_state.last_any_purge_at,
             last_cli_purge_at: maintenance_state.last_cli_purge_at,
+            // Filled by patch_companion_graph after persist_improved (same
+            // pattern as unfreeze_decay / neuro_state); collect leaves None.
+            companion_graph: None,
         }
     }
 
@@ -977,6 +989,46 @@ impl LearnedState {
         Self::load(path)?.neuro_state
     }
 
+    /// Patch only the `companion_graph` field. Same pattern as
+    /// `patch_unfreeze_decay` / `patch_neuro_state`. No-op when the file is
+    /// missing — cold start is safe; the live graph rebuilds in ~15 min of
+    /// foreground use even without persistence.
+    pub fn patch_companion_graph(path: &Path, graph: &CompanionGraph) {
+        let Some(mut state) = Self::load(path) else {
+            return;
+        };
+        state.companion_graph = Some(graph.clone());
+        state.persist(path);
+    }
+
+    /// Load only the `companion_graph` field, applying defensive checks.
+    ///
+    /// Robustness layers (in order):
+    /// 1. File missing / unreadable / malformed JSON → return None (cold start).
+    /// 2. Field absent (older binary's persisted file) → return None.
+    /// 3. Counters absurdly large (≥ ABSURD_COUNTER_CAP, suggesting
+    ///    corruption or an old run-away test fixture) → return None so the
+    ///    daemon starts fresh rather than carrying poisoned weights.
+    /// 4. Otherwise return the graph; the caller should run
+    ///    `self_improve(current_cycle)` once after restore to apply decay
+    ///    (any data sitting on disk is by definition >= 1 cycle stale).
+    ///
+    /// Note: the lift gate at query time is the primary defense against
+    /// false-positive companions. These load-time checks only guard against
+    /// outright corruption; ordinary stale data is handled by ongoing decay.
+    pub fn load_companion_graph(path: &Path) -> Option<CompanionGraph> {
+        const ABSURD_COUNTER_CAP: u64 = 100_000_000; // ~16 years @ 5s/cycle
+        let graph = Self::load(path)?.companion_graph?;
+        let json = serde_json::to_string(&graph).ok()?;
+        if json.contains("\"NaN\"") || json.contains("\"Infinity\"") {
+            return None;
+        }
+        if graph.total_cycles() > ABSURD_COUNTER_CAP {
+            return None;
+        }
+        Some(graph)
+    }
+
     /// Patch only the `meta_cognition` field of an existing persisted file.
     /// Reads the file, updates the field, writes back. No-op if the file is
     /// missing — cold start is safe; MetaCognition initialises at baseline
@@ -1212,6 +1264,7 @@ mod tests {
             meta_cognition: None,
             last_any_purge_at: None,
             last_cli_purge_at: None,
+            companion_graph: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1246,6 +1299,7 @@ mod tests {
             meta_cognition: None,
             last_any_purge_at: None,
             last_cli_purge_at: None,
+            companion_graph: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1278,6 +1332,7 @@ mod tests {
             meta_cognition: None,
             last_any_purge_at: None,
             last_cli_purge_at: None,
+            companion_graph: None,
         };
         assert_eq!(
             state
@@ -1329,6 +1384,7 @@ mod tests {
             meta_cognition: None,
             last_any_purge_at: None,
             last_cli_purge_at: None,
+            companion_graph: None,
         };
         state.self_improve();
         assert_eq!(
@@ -1375,6 +1431,7 @@ mod tests {
             meta_cognition: None,
             last_any_purge_at: None,
             last_cli_purge_at: None,
+            companion_graph: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -1424,6 +1481,7 @@ mod tests {
             meta_cognition: None,
             last_any_purge_at: None,
             last_cli_purge_at: None,
+            companion_graph: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1767,6 +1825,7 @@ mod tests {
             meta_cognition: None,
             last_any_purge_at: None,
             last_cli_purge_at: None,
+            companion_graph: None,
         };
         seed.persist(&tmp);
 
@@ -1861,6 +1920,7 @@ mod tests {
             meta_cognition: None,
             last_any_purge_at: None,
             last_cli_purge_at: None,
+            companion_graph: None,
         };
         let migrated = try_migrate(0, state);
         assert_eq!(
@@ -1900,6 +1960,7 @@ mod tests {
             meta_cognition: None,
             last_any_purge_at: None,
             last_cli_purge_at: None,
+            companion_graph: None,
         };
         let migrated = try_migrate(1, state);
         assert_eq!(migrated.version, CURRENT_SCHEMA_VERSION);
@@ -1911,5 +1972,64 @@ mod tests {
                 .is_none(),
             "v1→v2 must clear kf_mv to None"
         );
+    }
+
+    #[test]
+    fn companion_graph_patch_load_roundtrip() {
+        use crate::engine::companion_graph::CompanionGraph;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ls.json");
+
+        // Seed an empty file so patch_companion_graph can load+update.
+        let blank = LearnedState {
+            version: CURRENT_SCHEMA_VERSION,
+            signal_intelligence: None,
+            outcome_tracker: None,
+            specialist_accuracy: None,
+            persist_generations: 0,
+            last_restore_quality: None,
+            pending_trial_skill: None,
+            skill_registry: None,
+            effectiveness_tracker: None,
+            overflow_guard_history: None,
+            frozen_pids: None,
+            arousal_state: None,
+            causal_graph_edges: None,
+            process_baselines: None,
+            learnable_params: None,
+            nested_learner: None,
+            teacher_consolidator: None,
+            unfreeze_decay_tau: None,
+            neuro_state: None,
+            meta_cognition: None,
+            last_any_purge_at: None,
+            last_cli_purge_at: None,
+            companion_graph: None,
+        };
+        blank.persist(&path);
+
+        // Mirror the lift-gate test fixture: Slack co-occurs with Brave but
+        // a separate workload runs without Slack, so its global base rate
+        // stays low and lift > 2.0.
+        let mut g = CompanionGraph::new();
+        for c in 0..200 {
+            g.observe_cycle(Some("Brave"), &["Slack".into()], c);
+        }
+        for c in 200..1000 {
+            g.observe_cycle(Some("Other"), &["unrelated".into()], c);
+        }
+        LearnedState::patch_companion_graph(&path, &g);
+
+        let restored = LearnedState::load_companion_graph(&path)
+            .expect("companion graph should be restored");
+        assert!(restored.is_companion_of("Brave", "Slack"));
+        assert_eq!(restored.total_cycles(), g.total_cycles());
+    }
+
+    #[test]
+    fn load_companion_graph_returns_none_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing.json");
+        assert!(LearnedState::load_companion_graph(&path).is_none());
     }
 }

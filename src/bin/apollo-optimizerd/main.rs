@@ -847,6 +847,13 @@ fn main() -> anyhow::Result<()> {
             }
             // Unified persistence layer: restore all learned state from a single file.
             let ls_path = std::path::Path::new(learned_state_path());
+            // Restore companion graph from disk if a prior run persisted one.
+            // load_companion_graph drops the field on absurd / corrupt data
+            // (counter cap check + JSON sanity), so a poisoned file falls back
+            // to a fresh empty graph rather than carrying garbage forward.
+            if let Some(restored) = LearnedState::load_companion_graph(ls_path) {
+                companion_graph = restored;
+            }
             let mut persist_generations: u32 = 0;
             let mut last_restore_quality: Option<f64> = None;
             let mut restore_monitor = RestoreQualityMonitor::new();
@@ -4834,6 +4841,10 @@ fn main() -> anyhow::Result<()> {
             // Persist neuromodulator signal levels so DA/ACh/NA/5-HT survive restart.
             // [Schultz 1997] — reward prediction error signals require continuity.
             LearnedState::patch_neuro_state(ls_path, neuromod.snapshot());
+            // Persist companion graph so workflow context survives restarts.
+            // Counters only — query-time thresholds (lift, conf, N) re-applied
+            // on load, so changing thresholds takes effect retroactively.
+            LearnedState::patch_companion_graph(ls_path, &companion_graph);
 
             // Revert sysctls to defaults on shutdown.
             {
