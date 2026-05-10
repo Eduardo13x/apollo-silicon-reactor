@@ -53,8 +53,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Minimum foreground-cycles for an app before its companion edges are
-/// trusted. ~15 minutes at 5s/cycle (cf. NotebookLM mature-evidence gate
-/// N≥15-20 in Apollo's existing OutcomeTracker / SkillRegistry).
+/// trusted. ~15 minutes of *qualified* fg time at 5s/cycle (cf. NotebookLM
+/// mature-evidence gate N≥15-20 in Apollo's existing OutcomeTracker /
+/// SkillRegistry). Cumulative, not continuous — bursty workflows still
+/// mature naturally over a few sessions.
 const MIN_OBSERVATIONS: u64 = 180;
 /// Minimum P(B|A) to consider B a companion of A.
 const MIN_CONFIDENCE: f32 = 0.50;
@@ -66,6 +68,13 @@ const DECAY_FACTOR: f32 = 0.97;
 const EVICT_AFTER_CYCLES: u64 = 4_320;
 /// Hard cap on number of distinct fg-app entries (memory ceiling).
 const MAX_APPS: usize = 64;
+/// Attention Floor — fg-bursts shorter than this contribute nothing to
+/// anchor maturity. Keeps Slack-notification-15s blips out of the
+/// statistic so a context-switching user's true workflow (sustained
+/// sessions ≥ 30 s) is what teaches the graph. [Altmann & Trafton 2002]
+/// Memory for Goals: pre-activation cost separates real task-resumption
+/// from transient interruption. 6 cycles × 5 s = 30 s wall clock.
+const ATTENTION_FLOOR: u64 = 6;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct AppEdges {
@@ -81,6 +90,15 @@ pub struct CompanionGraph {
     /// Global presence counter used as the Lift denominator base.
     global: HashMap<String, u64>,
     total_cycles: u64,
+    /// Current consecutive-cycle counter for the active fg app.
+    /// Reset to 0 when fg changes. Anchor data is only credited once
+    /// `current_streak >= ATTENTION_FLOOR`, so 15-second notification
+    /// blips don't pollute conf(B|A) in steady state. Runtime-only;
+    /// `serde(default)` so old persisted graphs load without it.
+    #[serde(default, skip_serializing)]
+    current_fg: Option<String>,
+    #[serde(default, skip_serializing)]
+    current_streak: u64,
 }
 
 impl CompanionGraph {
@@ -95,6 +113,13 @@ impl CompanionGraph {
     ///   the full top_processes slice; the graph only learns from what it
     ///   sees, so a stable sampling strategy matters more than completeness).
     /// `current_cycle` — monotonic cycle counter for decay/GC bookkeeping.
+    ///
+    /// Attention Floor semantics: per-anchor data (`cycles_fg` and `edges`)
+    /// is credited only once the current fg burst has lasted at least
+    /// `ATTENTION_FLOOR` consecutive cycles. Global counters and
+    /// `total_cycles` always update — the Lift denominator must reflect
+    /// total observation time including transient bursts, otherwise short
+    /// blips would inflate lift for everything.
     pub fn observe_cycle(
         &mut self,
         fg_app: Option<&str>,
@@ -105,6 +130,29 @@ impl CompanionGraph {
         for name in alive_procs {
             *self.global.entry(name.clone()).or_insert(0) += 1;
         }
+
+        // Maintain attention streak. Reset on fg-app change (or fg=None).
+        match (fg_app, self.current_fg.as_deref()) {
+            (Some(now), Some(prev)) if now == prev => {
+                self.current_streak = self.current_streak.saturating_add(1);
+            }
+            (Some(now), _) => {
+                self.current_fg = Some(now.to_string());
+                self.current_streak = 1;
+            }
+            (None, _) => {
+                self.current_fg = None;
+                self.current_streak = 0;
+                return;
+            }
+        }
+
+        // Below the floor → nothing credits to the anchor. Burst that dies
+        // before reaching the floor is dropped silently.
+        if self.current_streak < ATTENTION_FLOOR {
+            return;
+        }
+
         let Some(fg) = fg_app else { return };
         if self.per_app.len() >= MAX_APPS && !self.per_app.contains_key(fg) {
             return; // capped — wait for GC to free a slot
@@ -294,5 +342,57 @@ mod tests {
         let g2: CompanionGraph = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(g.total_cycles, g2.total_cycles);
         assert!(g2.is_companion_of("Brave", "Slack"));
+    }
+
+    #[test]
+    fn attention_floor_drops_short_burst() {
+        // 3-cycle burst on "Notification" should not credit any anchor data.
+        let mut g = CompanionGraph::new();
+        for c in 0..3 {
+            g.observe_cycle(Some("Notification"), &["bg-proc".into()], c);
+        }
+        // total_cycles still ticks (Lift denominator must be honest).
+        assert_eq!(g.total_cycles, 3);
+        // Anchor itself never created — burst was below floor.
+        assert!(g.confidence("Notification", "bg-proc").is_none());
+    }
+
+    #[test]
+    fn attention_floor_credits_once_streak_passes() {
+        // A 200-cycle continuous Brave session should credit cycles_fg=
+        // 200 - (ATTENTION_FLOOR - 1) = 195. The first 5 cycles are below
+        // the floor and not credited.
+        let mut g = CompanionGraph::new();
+        for c in 0..200 {
+            g.observe_cycle(Some("Brave"), &["Slack".into()], c);
+        }
+        // 200 cycles - 5 below-floor cycles = 195 credited.
+        let cred = g
+            .per_app
+            .get("Brave")
+            .map(|a| a.cycles_fg)
+            .unwrap_or_default();
+        assert_eq!(cred, 200 - (ATTENTION_FLOOR - 1));
+    }
+
+    #[test]
+    fn attention_floor_resets_on_app_switch() {
+        // Bursty workflow: 4 cycles on Notification (below floor), then
+        // 200 cycles on Brave. Notification contributes 0; Brave starts
+        // counting from cycle 1 of its session (after floor warmup).
+        let mut g = CompanionGraph::new();
+        for c in 0..4 {
+            g.observe_cycle(Some("Notification"), &["bg".into()], c);
+        }
+        for c in 4..204 {
+            g.observe_cycle(Some("Brave"), &["Slack".into(), "kernel_task".into()], c);
+        }
+        for c in 204..1000 {
+            g.observe_cycle(Some("Other"), &["kernel_task".into()], c);
+        }
+        // Notification never matured.
+        assert!(g.confidence("Notification", "bg").is_none());
+        // Brave reached maturity (cumulative 200 - 5 = 195 ≥ MIN_OBSERVATIONS).
+        assert!(g.is_companion_of("Brave", "Slack"));
     }
 }
