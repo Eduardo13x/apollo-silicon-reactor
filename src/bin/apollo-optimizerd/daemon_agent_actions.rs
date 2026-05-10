@@ -14,6 +14,7 @@
 use apollo_engine::collector::ProcessStats;
 use apollo_engine::engine::apple_owned::is_apple_owned;
 use apollo_engine::engine::audit_types::DecisionReason;
+use apollo_engine::engine::coalition::CoalitionTracker;
 use apollo_engine::engine::companion_graph::CompanionGraph;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::decide_actions::is_interactive_app_name;
@@ -22,6 +23,7 @@ use apollo_engine::engine::predictive_agent::Intervention;
 use apollo_engine::engine::safety::is_protected_name;
 use apollo_engine::engine::types::RootAction;
 use apollo_engine::engine::user_context::UserContext;
+use std::collections::HashSet;
 
 /// Inject predictive-agent soft actions for this cycle.
 ///
@@ -47,7 +49,9 @@ pub fn run_agent_actions(
     decide_interactive: &[String],
     user_ctx: &UserContext,
     foreground_app: Option<&str>,
+    foreground_pid: Option<u32>,
     companion_graph: &CompanionGraph,
+    coalition_tracker: &CoalitionTracker,
 ) -> Vec<RootAction> {
     let mut new_actions: Vec<RootAction> = Vec::new();
 
@@ -93,6 +97,26 @@ pub fn run_agent_actions(
             }
             // Send paging hints to top 3 background processes by RSS.
             // SetMemorystatus priority -1 = voluntary cache release — no freeze, no kill.
+            //
+            // Coalition family of the foreground app — computed once. macOS
+            // coalitions group an app with all its XPC services, GPU helpers,
+            // and renderer subprocesses regardless of name or PPID
+            // reparenting (orphans that get adopted by launchd still keep
+            // their original coalition_id). This is the strongest available
+            // grouping signal for "subprocesses of the active app". Falls
+            // back gracefully to a single-PID set when the kernel returns
+            // coalition_id=0 (e.g., Apollo running without root in tests).
+            let fg_family: HashSet<u32> = match foreground_pid {
+                Some(fpid) => {
+                    let all_pids: Vec<u32> =
+                        top_processes.iter().map(|p| p.pid).collect();
+                    coalition_tracker
+                        .family_of(fpid, &all_pids)
+                        .into_iter()
+                        .collect()
+                }
+                None => HashSet::new(),
+            };
             //
             // Lock policy once and run the entire filter inside the guard so
             // process_relevance(name) can be queried without per-iteration
@@ -143,7 +167,16 @@ pub fn run_agent_actions(
                     let is_companion = foreground_app
                         .map(|fg| companion_graph.is_companion_of(fg, &p.name))
                         .unwrap_or(false);
+                    // Coalition guard: any PID in the foreground app's
+                    // coalition is a subprocess of the active workflow
+                    // (Electron renderer, IDE LSP host, audio.mojom utility,
+                    // XPC service spawned on demand). This is the
+                    // name-stability fix the user asked for — the helper can
+                    // rename across versions ("Antigravity Helper (Renderer)"
+                    // → "Antigravity Helper v2") without losing protection.
+                    let in_fg_family = fg_family.contains(&p.pid);
                     p.pid != daemon_pid
+                        && !in_fg_family
                         && !is_apple_owned(p.pid)
                         && !is_protected_name(&p.name)
                         && !is_interactive_app_name(&p.name)

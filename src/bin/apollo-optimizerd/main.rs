@@ -3248,7 +3248,9 @@ fn main() -> anyhow::Result<()> {
                         &decide_interactive,
                         &user_context,
                         foreground_app.as_deref(),
+                        foreground_pid,
                         &companion_graph,
+                        &coalition_tracker,
                     );
                     acc.extend_raw(
                         agent_new,
