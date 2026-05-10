@@ -104,4 +104,33 @@ mod tests {
         }
         assert!(w.sustained_below(256_000.0, 90));
     }
+
+    #[test]
+    fn swap_delta_window_sustained_below_with_one_spike_returns_false() {
+        let mut w = SwapDeltaWindow::default();
+        let now = SystemTime::now();
+        for i in 0..30 {
+            let t = now - Duration::from_secs(90) + Duration::from_secs(i * 2);
+            w.push(t, 50_000.0);
+        }
+        w.push(now - Duration::from_secs(10), 500_000.0);
+        assert!(!w.sustained_below(256_000.0, 90));
+    }
+
+    #[test]
+    fn swap_delta_window_sustained_below_empty_returns_false() {
+        let w = SwapDeltaWindow::default();
+        assert!(!w.sustained_below(256_000.0, 90));
+    }
+
+    #[test]
+    fn swap_delta_window_sustained_below_partial_window_returns_false() {
+        let mut w = SwapDeltaWindow::default();
+        let now = SystemTime::now();
+        for i in 0..10 {
+            let t = now - Duration::from_secs(20) + Duration::from_secs(i * 2);
+            w.push(t, 50_000.0);
+        }
+        assert!(!w.sustained_below(256_000.0, 90));
+    }
 }
