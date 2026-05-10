@@ -102,8 +102,7 @@ impl SwapDeltaWindow {
     }
 
     pub fn sustained_below(&self, threshold_bps: f64, secs: u64) -> bool {
-        // Add 1-second grace to the cutoff to avoid boundary jitter at exact window edges.
-        let cutoff = match SystemTime::now().checked_sub(Duration::from_secs(secs + 1)) {
+        let cutoff = match SystemTime::now().checked_sub(Duration::from_secs(secs)) {
             Some(t) => t,
             None => return false,
         };
@@ -144,7 +143,7 @@ mod tests {
         let mut w = SwapDeltaWindow::default();
         let now = SystemTime::now();
         for i in 0..45 {
-            let t = now - Duration::from_secs(90) + Duration::from_secs(i * 2);
+            let t = now - Duration::from_secs(89) + Duration::from_secs(i * 2);
             w.push(t, 50_000.0);
         }
         assert!(w.sustained_below(256_000.0, 90));
@@ -155,7 +154,7 @@ mod tests {
         let mut w = SwapDeltaWindow::default();
         let now = SystemTime::now();
         for i in 0..30 {
-            let t = now - Duration::from_secs(90) + Duration::from_secs(i * 2);
+            let t = now - Duration::from_secs(89) + Duration::from_secs(i * 2);
             w.push(t, 50_000.0);
         }
         w.push(now - Duration::from_secs(10), 500_000.0);
