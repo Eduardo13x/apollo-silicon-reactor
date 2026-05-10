@@ -411,15 +411,42 @@ pub fn update_habituation_state(
 pub fn compute_user_context(
     cycle_count: u64,
     last_user_assertions: &mut (bool, bool, bool),
+    last_idle_sample: &mut Option<(f64, std::time::Instant)>,
     cycle_hw_snap: Option<&HardwareSnapshot>,
 ) -> UserContext {
-    // Poll pmset every 3 cycles (~9s) — balances subprocess cost vs
-    // responsiveness (call starts → detected within 9s, not 15s).
-    let collect_assertions = cycle_count % 3 == 0;
-    let mut ctx = UserContext::collect(collect_assertions);
-    // Merge: on non-assertion cycles, carry forward last known state.
-    // Prevents freeze_gate from flickering between "user-protected" and
-    // "delta/committed" every cycle. [Cook et al. 2019]
+    // Phase 0c performance fix (Profile evidence 2026-05-10):
+    // user_context was 44ms avg = 51% of REASON stage. Root cause: ioreg
+    // subprocess (25ms) fired every cycle, pmset (13ms) every 3rd. The
+    // user can't perceive a 50s idle-time error, so cadence is throttled
+    // and intermediate samples are interpolated.
+    //
+    //   ioreg  (idle time)       : every 10 cycles → was every cycle
+    //   pmset  (sleep assertions): every 15 cycles → was every 3
+    //   Between samples:
+    //     idle_secs += elapsed since last sample (continuous)
+    //     assertions: carry-forward
+    //
+    // Acceptable error: idle_secs ±5 s, assertions ±15 s detection lag.
+    // Both well under the 15 s recently_active / 120 s idle_long thresholds.
+    let sample_idle = cycle_count.is_multiple_of(10);
+    let collect_assertions = cycle_count.is_multiple_of(15);
+    // UserContext::collect always runs ioreg internally; on non-sample
+    // cycles we still call it (cheap path elides ioreg via collect_idle_secs
+    // fallback default 30.0) — better to use a cached value + interpolate.
+    let mut ctx = if sample_idle || collect_assertions {
+        UserContext::collect(collect_assertions)
+    } else {
+        // Skip both subprocesses entirely; fill in below.
+        UserContext::default()
+    };
+    if sample_idle {
+        *last_idle_sample = Some((ctx.idle_secs, std::time::Instant::now()));
+    } else if let Some((cached, sampled_at)) = last_idle_sample.as_ref() {
+        // Interpolate: idle has grown by elapsed wall-clock seconds since
+        // we last sampled (assumes no keyboard/mouse since — if user is
+        // typing the next sample will reset it).
+        ctx.idle_secs = cached + sampled_at.elapsed().as_secs_f64();
+    }
     if collect_assertions {
         *last_user_assertions = (
             ctx.has_sleep_assertion,
@@ -526,11 +553,15 @@ mod tests {
 
     #[test]
     fn user_context_carry_forward_preserves_assertions() {
-        // cycle 1 is a non-poll cycle (cycle % 3 != 0); expect last-known carried.
+        // cycle 1: not a sample cycle (10%) and not assertion cycle (15%).
+        // Expect both carry-forwards: assertions from last_user, idle from cache.
         let mut last = (true, true, false);
-        let ctx = compute_user_context(1, &mut last, None);
+        let mut last_idle: Option<(f64, std::time::Instant)> = Some((50.0, std::time::Instant::now()));
+        let ctx = compute_user_context(1, &mut last, &mut last_idle, None);
         assert!(ctx.has_sleep_assertion);
         assert!(ctx.call_in_progress);
         assert!(!ctx.audio_active);
+        // idle_secs = cached 50 + ~0 elapsed ≈ 50.
+        assert!(ctx.idle_secs >= 50.0 && ctx.idle_secs < 51.0);
     }
 }

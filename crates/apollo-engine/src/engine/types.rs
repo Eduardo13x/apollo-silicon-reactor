@@ -1459,6 +1459,15 @@ pub struct RuntimeMetrics {
     pub stage_persist_avg_ms: f64,
     #[serde(default)]
     pub stage_persist_max_ms: f64,
+    /// Phase 0c REASON sub-stage split (2026-05-10).
+    #[serde(default)]
+    pub stage_reason_signal_avg_ms: f64,
+    #[serde(default)]
+    pub stage_reason_signal_max_ms: f64,
+    #[serde(default)]
+    pub stage_reason_usercontext_avg_ms: f64,
+    #[serde(default)]
+    pub stage_reason_usercontext_max_ms: f64,
     /// MetaCognition meta_confidence [0,1].
     #[serde(default)]
     pub meta_confidence: f32,

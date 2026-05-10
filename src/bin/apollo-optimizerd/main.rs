@@ -1222,6 +1222,10 @@ fn main() -> anyhow::Result<()> {
             // forward to prevent the freeze gate from flickering on/off every cycle.
             // [Cook et al. 2019] "Caching volatile state in reactive systems"
             let mut last_user_assertions: (bool, bool, bool) = (false, false, false); // (sleep_assert, call, audio)
+            // Phase 0c cache: last ioreg HIDIdleTime sample + when. Lets
+            // compute_user_context interpolate idle_secs between every-10-cycle
+            // ioreg subprocess spawns. ~25 ms saved per intermediate cycle.
+            let mut last_idle_sample: Option<(f64, Instant)> = None;
                                                                                       // Track previous cycle's package_watts for RL power-reduction reward.
             let mut prev_package_watts: Option<f64> = None;
             // Track previous cycle's workload for onset detection (build-onset-proactive).
@@ -2654,6 +2658,9 @@ fn main() -> anyhow::Result<()> {
                 // [Fowler 2004] Strangler Fig — pure move, no semantic change.
                 // NLM warning: cycle_dt_secs passed as parameter (never recalculate
                 // here) — avoids mid-loop reset bug dac6de9 that corrupted ODE models.
+                // Phase 0c sub-stage: time run_signal_tick (Kalman MV8 + CUSUM +
+                // Entropy + Hazard + LV + MPC — the 666-LoC inline block).
+                let _t_signal_start = Instant::now();
                 let daemon_signal_tick::SignalTickOutput {
                     signal_digest,
                     last_pressure_velocity: new_lpv,
@@ -2675,6 +2682,10 @@ fn main() -> anyhow::Result<()> {
                 );
                 last_pressure_velocity = new_lpv;
                 prev_entropy_anomaly = new_entropy;
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::ReasonSignalTick,
+                    _t_signal_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
 
                 // Swap Reclaim ODE — feed vm_rate from background collector.
                 // Produces SaturationForecast used by the freeze gate below.
@@ -3025,15 +3036,17 @@ fn main() -> anyhow::Result<()> {
 
                 // User context "telepathy" — extracted to
                 // `daemon_cognitive_tick::compute_user_context`.
-                // [Riva & Mantovani 2014] idle time + media state = highest-signal
-                // context cues.  Uses IOHIDSystem HIDIdleTime every cycle, pmset
-                // (sleep/call/audio) every 3 cycles with carry-forward to avoid
-                // freeze_gate flicker, and SMC P-cluster temp > 75 °C to clamp
-                // idle_secs for thermal headroom protection.
+                // Phase 0c sub-stage: pmset+ioreg can be latent.
+                let _t_uc_start = Instant::now();
                 let user_context = daemon_cognitive_tick::compute_user_context(
                     cycle_count,
                     &mut last_user_assertions,
+                    &mut last_idle_sample,
                     cycle_hw_snap.as_ref(),
+                );
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::ReasonUserContext,
+                    _t_uc_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
 
                 // Swap reclaim ODE: pre-emptive reactor_weight boost on saturation risk.

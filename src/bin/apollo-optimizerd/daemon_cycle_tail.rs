@@ -246,6 +246,23 @@ pub fn wire_enriched_telemetry(
         to_avg_ms(lf.stage_persist_total_ns.load(std::sync::atomic::Ordering::Relaxed));
     m.metrics.stage_persist_max_ms =
         ns_to_ms(lf.stage_persist_max_ns.load(std::sync::atomic::Ordering::Relaxed));
+    // REASON sub-stages (Phase 0c).
+    m.metrics.stage_reason_signal_avg_ms = to_avg_ms(
+        lf.stage_reason_signal_total_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_reason_signal_max_ms = ns_to_ms(
+        lf.stage_reason_signal_max_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_reason_usercontext_avg_ms = to_avg_ms(
+        lf.stage_reason_usercontext_total_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_reason_usercontext_max_ms = ns_to_ms(
+        lf.stage_reason_usercontext_max_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
     m.metrics.meta_confidence = inputs.cognitive_state.meta_cognition.meta_confidence;
     m.metrics.humble_mode = inputs.cog_decision.humble_mode;
     m.metrics.adversarial_pass_rate =

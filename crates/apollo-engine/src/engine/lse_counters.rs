@@ -24,6 +24,13 @@ pub enum CycleStage {
     Execute,
     Learn,
     Persist,
+    /// Sub-stages of Reason — track inside the dominant stage so its
+    /// 83 ms avg can be attributed to specific cognitive ticks.
+    /// NotebookLM 2026-05-10 priority targets:
+    ReasonSignalTick,
+    ReasonDecide,
+    ReasonNeuro,
+    ReasonUserContext,
 }
 
 // ── Lock-free metrics ────────────────────────────────────────────────────────
@@ -173,6 +180,15 @@ pub struct LockFreeMetrics {
     pub stage_persist_total_ns: AtomicU64,
     pub stage_persist_max_ns: AtomicU64,
     pub stage_count: AtomicU64,
+    /// Phase 0c sub-stages of REASON (the 93% bottleneck).
+    pub stage_reason_signal_total_ns: AtomicU64,
+    pub stage_reason_signal_max_ns: AtomicU64,
+    pub stage_reason_decide_total_ns: AtomicU64,
+    pub stage_reason_decide_max_ns: AtomicU64,
+    pub stage_reason_neuro_total_ns: AtomicU64,
+    pub stage_reason_neuro_max_ns: AtomicU64,
+    pub stage_reason_usercontext_total_ns: AtomicU64,
+    pub stage_reason_usercontext_max_ns: AtomicU64,
 }
 
 impl LockFreeMetrics {
@@ -249,6 +265,14 @@ impl LockFreeMetrics {
             stage_persist_total_ns: AtomicU64::new(0),
             stage_persist_max_ns: AtomicU64::new(0),
             stage_count: AtomicU64::new(0),
+            stage_reason_signal_total_ns: AtomicU64::new(0),
+            stage_reason_signal_max_ns: AtomicU64::new(0),
+            stage_reason_decide_total_ns: AtomicU64::new(0),
+            stage_reason_decide_max_ns: AtomicU64::new(0),
+            stage_reason_neuro_total_ns: AtomicU64::new(0),
+            stage_reason_neuro_max_ns: AtomicU64::new(0),
+            stage_reason_usercontext_total_ns: AtomicU64::new(0),
+            stage_reason_usercontext_max_ns: AtomicU64::new(0),
         }
     }
 
@@ -261,6 +285,22 @@ impl LockFreeMetrics {
             CycleStage::Execute => (&self.stage_execute_total_ns, &self.stage_execute_max_ns),
             CycleStage::Learn => (&self.stage_learn_total_ns, &self.stage_learn_max_ns),
             CycleStage::Persist => (&self.stage_persist_total_ns, &self.stage_persist_max_ns),
+            CycleStage::ReasonSignalTick => (
+                &self.stage_reason_signal_total_ns,
+                &self.stage_reason_signal_max_ns,
+            ),
+            CycleStage::ReasonDecide => (
+                &self.stage_reason_decide_total_ns,
+                &self.stage_reason_decide_max_ns,
+            ),
+            CycleStage::ReasonNeuro => (
+                &self.stage_reason_neuro_total_ns,
+                &self.stage_reason_neuro_max_ns,
+            ),
+            CycleStage::ReasonUserContext => (
+                &self.stage_reason_usercontext_total_ns,
+                &self.stage_reason_usercontext_max_ns,
+            ),
         };
         total.fetch_add(ns, Ordering::Relaxed);
         max.fetch_max(ns, Ordering::Relaxed);
