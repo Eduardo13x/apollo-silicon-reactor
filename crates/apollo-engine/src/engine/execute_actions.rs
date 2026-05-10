@@ -3,6 +3,7 @@ use std::collections::HashSet;
 
 use chrono::Utc;
 
+use crate::engine::active_coalition_envelope::CoalitionGuard;
 use crate::engine::activity_sensor::pids_with_assertions;
 use crate::engine::amx_detector;
 use crate::engine::audit_types::{BlockReason, PolicyDecisionTrace};
@@ -278,6 +279,7 @@ pub fn execute_actions(
     dry_run: bool,
     memory_pressure: f64,
     thrashing_score: f64,
+    coalition_guard: Option<&CoalitionGuard<'_>>,
 ) -> ExecuteOutcomes {
     let protected = protected_processes();
     // Only infrastructure (docker, postgres, redis, etc.) gets unconditional protection
@@ -463,6 +465,14 @@ pub fn execute_actions(
                     if *pid == my_pid {
                         return Ok(());
                     }
+                    // Coalition guard: never throttle a PID whose coalition
+                    // is in the active fg envelope (current + 5-min grace).
+                    // Subprocesses of the user's active workflow stay
+                    // unthrottled even when names drift across versions.
+                    if coalition_guard.map(|g| g.is_protected(*pid)).unwrap_or(false) {
+                        block_reason = Some(BlockReason::ActiveCoalition);
+                        return Ok(());
+                    }
                     // Unified protection check: hard OS names + policy-learned + interactive.
                     // learned_interactive is treated as Unconditional at execute time because
                     // no foreground context is available here (see policy_all pre-computation).
@@ -544,6 +554,15 @@ pub fn execute_actions(
                     ..
                 } => {
                     if *pid == my_pid {
+                        return Ok(());
+                    }
+                    // Coalition guard: never freeze a PID whose coalition is
+                    // in the active fg envelope. Tabbing momentarily away
+                    // from Antigravity to run `git status` does not strip
+                    // its renderers of freeze immunity.
+                    if coalition_guard.map(|g| g.is_protected(*pid)).unwrap_or(false) {
+                        out.push_skip(format!("active-coalition:{}", name));
+                        block_reason = Some(BlockReason::ActiveCoalition);
                         return Ok(());
                     }
                     // Unified protection check: hard OS names + infra + policy-learned + interactive.
@@ -766,6 +785,15 @@ pub fn execute_actions(
                     out.sysctl_applied += 1;
                 }
                 RootAction::SetMemorystatus { pid, .. } => {
+                    // Coalition guard: never pressure a PID whose coalition
+                    // is in the active fg envelope. memorystatus_vm_pressure_send
+                    // forces the target to drop caches; doing this to a
+                    // helper of the user's active app produces stutter.
+                    if coalition_guard.map(|g| g.is_protected(*pid)).unwrap_or(false) {
+                        out.push_skip(format!("active-coalition:pid={}", *pid));
+                        block_reason = Some(BlockReason::ActiveCoalition);
+                        return Ok(());
+                    }
                     if !dry_run && caps.can_memorystatus {
                         // Guard: never send memory pressure to protected/critical processes.
                         let is_protected = crate::engine::process_identity::proc_name_for_pid(*pid)
@@ -836,6 +864,16 @@ pub fn execute_actions(
                     ..
                 } => {
                     if protected.iter().any(|p| name.contains(p)) {
+                        return Ok(());
+                    }
+                    // Coalition guard: only skip when the requested QoS would
+                    // demote (Background / Utility). Boosting (Interactive)
+                    // toward an active-coalition helper is desirable.
+                    let demotes = !matches!(tier.as_str(), "interactive");
+                    if demotes
+                        && coalition_guard.map(|g| g.is_protected(*pid)).unwrap_or(false)
+                    {
+                        block_reason = Some(BlockReason::ActiveCoalition);
                         return Ok(());
                     }
                     if !ProcessIdentity::verify(*pid, Some(name), 0, 0) {
@@ -955,6 +993,7 @@ mod tests {
             false,
             0.0,
             0.0,
+            None,
         )
     }
 
@@ -989,6 +1028,7 @@ mod tests {
             false,
             0.0,
             0.0,
+            None,
         );
         // All 5 ghost pids are dead → should be removed from frozen set.
         // unfreezes_applied stays 0 because the live-branch (which increments

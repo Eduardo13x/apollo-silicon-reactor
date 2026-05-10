@@ -20,6 +20,7 @@ pub mod cognitive_bus;
 pub mod cognitive_health;
 pub mod compressor_aware;
 pub mod config_reloader;
+pub mod active_coalition_envelope;
 pub mod apple_owned;
 pub mod companion_graph;
 pub mod contention_detector;

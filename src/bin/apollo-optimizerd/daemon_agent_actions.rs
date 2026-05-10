@@ -12,6 +12,7 @@
 //! paging hints (Wave 17) so per-PID dedup is correct.
 
 use apollo_engine::collector::ProcessStats;
+use apollo_engine::engine::active_coalition_envelope::ActiveCoalitionEnvelope;
 use apollo_engine::engine::apple_owned::is_apple_owned;
 use apollo_engine::engine::audit_types::DecisionReason;
 use apollo_engine::engine::coalition::CoalitionTracker;
@@ -23,7 +24,6 @@ use apollo_engine::engine::predictive_agent::Intervention;
 use apollo_engine::engine::safety::is_protected_name;
 use apollo_engine::engine::types::RootAction;
 use apollo_engine::engine::user_context::UserContext;
-use std::collections::HashSet;
 
 /// Inject predictive-agent soft actions for this cycle.
 ///
@@ -52,6 +52,7 @@ pub fn run_agent_actions(
     foreground_pid: Option<u32>,
     companion_graph: &CompanionGraph,
     coalition_tracker: &CoalitionTracker,
+    active_coalitions: &ActiveCoalitionEnvelope,
 ) -> Vec<RootAction> {
     let mut new_actions: Vec<RootAction> = Vec::new();
 
@@ -98,25 +99,17 @@ pub fn run_agent_actions(
             // Send paging hints to top 3 background processes by RSS.
             // SetMemorystatus priority -1 = voluntary cache release — no freeze, no kill.
             //
-            // Coalition family of the foreground app — computed once. macOS
-            // coalitions group an app with all its XPC services, GPU helpers,
-            // and renderer subprocesses regardless of name or PPID
-            // reparenting (orphans that get adopted by launchd still keep
-            // their original coalition_id). This is the strongest available
-            // grouping signal for "subprocesses of the active app". Falls
-            // back gracefully to a single-PID set when the kernel returns
-            // coalition_id=0 (e.g., Apollo running without root in tests).
-            let fg_family: HashSet<u32> = match foreground_pid {
-                Some(fpid) => {
-                    let all_pids: Vec<u32> =
-                        top_processes.iter().map(|p| p.pid).collect();
-                    coalition_tracker
-                        .family_of(fpid, &all_pids)
-                        .into_iter()
-                        .collect()
-                }
-                None => HashSet::new(),
-            };
+            // Active-coalition envelope check — protect every PID whose
+            // coalition_id is in the recent fg envelope (current fg + last
+            // 2 within a 5-min grace window). Closes the rapid-app-switch
+            // gap: tabbing from Antigravity to Terminal for `git status`
+            // does NOT immediately strip Antigravity helpers of protection.
+            //
+            // Coalition_id is computed per-PID via proc_pidinfo
+            // (~200ns/call). top_processes is bounded so the per-cycle
+            // cost is ≤ 10µs. Strictly subsumes the older single-fg
+            // `family_of` call.
+            let _ = foreground_pid; // not needed here; envelope already updated upstream
             //
             // Lock policy once and run the entire filter inside the guard so
             // process_relevance(name) can be queried without per-iteration
@@ -167,14 +160,16 @@ pub fn run_agent_actions(
                     let is_companion = foreground_app
                         .map(|fg| companion_graph.is_companion_of(fg, &p.name))
                         .unwrap_or(false);
-                    // Coalition guard: any PID in the foreground app's
-                    // coalition is a subprocess of the active workflow
+                    // Coalition guard: any PID whose coalition_id matches a
+                    // recently-active fg coalition (current + 5-min grace
+                    // for last 2) is a subprocess of an active workflow
                     // (Electron renderer, IDE LSP host, audio.mojom utility,
                     // XPC service spawned on demand). This is the
                     // name-stability fix the user asked for — the helper can
                     // rename across versions ("Antigravity Helper (Renderer)"
                     // → "Antigravity Helper v2") without losing protection.
-                    let in_fg_family = fg_family.contains(&p.pid);
+                    let in_fg_family =
+                        active_coalitions.is_active(coalition_tracker.get_coalition_id(p.pid));
                     p.pid != daemon_pid
                         && !in_fg_family
                         && !is_apple_owned(p.pid)

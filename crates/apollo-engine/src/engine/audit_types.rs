@@ -90,6 +90,9 @@ pub enum BlockReason {
     CircuitBreakerActive,
     /// Epistemic uncertainty too high.
     EpistemicHigh,
+    /// Process belongs to a coalition that was foreground within the
+    /// active grace window — subprocess of an active user workflow.
+    ActiveCoalition,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -694,6 +694,7 @@ fn main() -> anyhow::Result<()> {
                 identity_cache,
                 mut maintenance_state,
                 mut companion_graph,
+                mut active_coalitions,
             } = daemon_init::DaemonSubsystems::new();
             {
                 let mut m_guard = state.metrics.lock().unwrap();
@@ -3237,6 +3238,17 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                // ActiveCoalitionEnvelope — record current fg coalition so
+                // recent fg apps keep coalition protection during the 5-min
+                // grace window. Closes rapid-app-switch gap (tabbing to
+                // Terminal for `git status` doesn't strip Antigravity helpers).
+                if let Some(fpid) = foreground_pid {
+                    let cid = coalition_tracker.get_coalition_id(fpid);
+                    active_coalitions.record_foreground(cid);
+                    if (cycle_count as u64).is_multiple_of(60) {
+                        active_coalitions.evict_stale();
+                    }
+                }
 
                 // Predictive agent: inject soft actions for PreThrottleNoise / ProactivePurge.
                 // Extracted to daemon_agent_actions::run_agent_actions (Wave 19).
@@ -3251,6 +3263,7 @@ fn main() -> anyhow::Result<()> {
                         foreground_pid,
                         &companion_graph,
                         &coalition_tracker,
+                        &active_coalitions,
                     );
                     acc.extend_raw(
                         agent_new,
@@ -3672,6 +3685,9 @@ fn main() -> anyhow::Result<()> {
                             // is irrelevant here; pass 0.0 so the assertion gate stays armed.
                             0.0,
                             0.0,
+                            // Sysctl-only batch — no per-PID destructive actions, so
+                            // coalition guard is irrelevant.
+                            None,
                         );
                         if outcomes.failures == 0 {
                             sysctl_governor.mark_reverted();
@@ -4255,6 +4271,13 @@ fn main() -> anyhow::Result<()> {
                     .collect();
                 let (exec_outcomes, causal_qos_upgrades) = {
                     use daemon_dispatch_tick::{run_dispatch_tick, DispatchTickInput};
+                    // Build the coalition guard: tracker + envelope are owned
+                    // long-lived in this scope; the guard is a thin borrow
+                    // bundle, cheap to construct each cycle.
+                    let cg = apollo_engine::engine::active_coalition_envelope::CoalitionGuard::new(
+                        &coalition_tracker,
+                        &active_coalitions,
+                    );
                     let output = run_dispatch_tick(DispatchTickInput {
                         state: &state,
                         caps: &caps,
@@ -4269,6 +4292,7 @@ fn main() -> anyhow::Result<()> {
                         collector: &collector,
                         dry_run,
                         lf_metrics: Some(&lf_metrics),
+                        coalition_guard: Some(&cg),
                     });
                     (output.outcomes, output.causal_qos_upgrades)
                 };
@@ -4866,6 +4890,7 @@ fn main() -> anyhow::Result<()> {
                         // Shutdown sysctl-revert batch — no freezes in here.
                         0.0,
                         0.0,
+                        None,
                     );
                     if outcomes.failures == 0 {
                         sysctl_governor.mark_reverted();

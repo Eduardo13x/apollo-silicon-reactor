@@ -156,6 +156,10 @@ pub struct DispatchTickInput<'a> {
     /// Lock-free metrics for per-cycle dedup_drops accounting.
     /// Optional so legacy callers and unit tests can pass `None`.
     pub lf_metrics: Option<&'a LockFreeMetrics>,
+    /// Coalition guard: tracker + recent-fg envelope. None opts out of
+    /// coalition-aware skipping (legacy callers / tests).
+    pub coalition_guard:
+        Option<&'a apollo_engine::engine::active_coalition_envelope::CoalitionGuard<'a>>,
 }
 
 /// Output results from the dispatch tick.
@@ -185,6 +189,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         collector,
         dry_run,
         lf_metrics,
+        coalition_guard,
     } = input;
 
     // ── Filter pipeline ──────────────────────────────────────────────────────
@@ -305,6 +310,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             dry_run,
             snapshot.pressure.memory_pressure,
             snapshot.pressure.thrashing_score,
+            coalition_guard,
         )
     } else {
         // Circuit Closed or HalfOpen: run normally, then report outcome.
@@ -319,6 +325,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             dry_run,
             snapshot.pressure.memory_pressure,
             snapshot.pressure.thrashing_score,
+            coalition_guard,
         );
         // Report outcome to circuit breaker.
         {

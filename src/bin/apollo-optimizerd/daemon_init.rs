@@ -97,6 +97,12 @@ pub(super) struct DaemonSubsystems {
     /// with Lift normalization. Protects satellites of actively-used apps
     /// from ProactivePurge without a hardcoded list.
     pub companion_graph: apollo_engine::engine::companion_graph::CompanionGraph,
+    /// Time-decayed envelope of recently-active app coalitions (Sprint C
+    /// 2026-05-10). Closes the gap during rapid app switching: tabbing
+    /// from Antigravity to Terminal for a 3-second `git status` no longer
+    /// strips Antigravity's helpers of coalition protection.
+    pub active_coalitions:
+        apollo_engine::engine::active_coalition_envelope::ActiveCoalitionEnvelope,
 }
 
 /// Detect hardware capabilities (core count and RAM) once at startup.
@@ -175,6 +181,8 @@ impl DaemonSubsystems {
                 apollo_engine::engine::identity_cache_manager::IdentityCacheManager::new(),
             maintenance_state: apollo_engine::engine::maintenance_state::MaintenanceState::new(),
             companion_graph: apollo_engine::engine::companion_graph::CompanionGraph::new(),
+            active_coalitions:
+                apollo_engine::engine::active_coalition_envelope::ActiveCoalitionEnvelope::new(),
         }
     }
 }
