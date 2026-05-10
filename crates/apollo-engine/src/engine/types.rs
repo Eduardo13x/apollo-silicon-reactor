@@ -1600,14 +1600,6 @@ pub struct LlmStatus {
     pub learned_policy: LearnedPolicyStatus,
 }
 
-/// Demoted to pub(crate): no bin imports or uses this type; no pub function takes it as
-/// parameter. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct UsageStatus {
-    pub(crate) entries: usize,
-    pub(crate) last_updated_at: Option<DateTime<Utc>>,
-}
-
 /// Cross-crate visibility: used by apollo-optimizerctl to handle usage-top and explain
 /// commands over IPC. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
