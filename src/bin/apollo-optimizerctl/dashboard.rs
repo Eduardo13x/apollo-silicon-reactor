@@ -823,12 +823,11 @@ fn render_actions(status: &DaemonStatus) -> Vec<String> {
 }
 
 fn render_blockers(blockers: &[BlockerScore]) -> Vec<String> {
-    let mut lines = vec![bold("🔴 TOP BLOQUEADORES")];
-
+    // Hide section entirely when no blockers — quiet UI, no alarming empty red.
     if blockers.is_empty() {
-        lines.push(green("Sin bloqueadores activos"));
-        return lines;
+        return Vec::new();
     }
+    let mut lines = vec![bold("🔴 TOP BLOQUEADORES")];
 
     lines.push("┌────┬──────────────────┬────────┬────────┬─────────────────┐".into());
     lines.push("│ #  │ Proceso          │  PID   │ Score  │ Veredicto       │".into());
@@ -1442,37 +1441,36 @@ fn render_gates_band(status: &DaemonStatus) -> Vec<String> {
 
     // Survival: based on memory pressure
     let surv = if m.memory_pressure >= 0.85 {
-        red("🔴 ACTIVE")
+        red("🔴")
     } else {
-        green("🟢 ready")
+        green("🟢")
     };
 
-    // Maintenance purge: blocked by media or other gates?
-    let media_blocked = m.user_audio_active || m.user_call_in_progress || m.user_has_sleep_assertion;
-    let purge_state = if media_blocked {
-        let reason = if m.user_call_in_progress {
-            "call"
-        } else if m.user_audio_active {
-            "audio"
-        } else {
-            "sleep-assertion"
-        };
-        red(&format!("🔴 BLOCKED ({})", reason))
+    // Auto-purge: paused by media (audio/call/presentation), idle (low pressure),
+    // or armed (ready to fire if pressure crosses 0.65). Short reason chip in row.
+    let purge = if m.user_call_in_progress {
+        yellow("💤 call")
+    } else if m.user_audio_active {
+        yellow("💤 audio")
+    } else if m.user_has_sleep_assertion {
+        yellow("💤 video/media")
     } else if m.memory_pressure < 0.65 {
-        dim("⬜ idle (p<0.65)")
+        dim("⬜ idle")
     } else {
-        green("🟢 ready")
+        green("🟢 armed")
     };
 
-    lines.push(format!("survival {}  ·  maintenance-purge {}", surv, purge_state));
-
-    // Build mode + post-wake
     let post_wake = if status.post_wake_grace_active {
-        yellow(&format!("⚠ grace ({}s)", status.post_wake_grace_remaining_secs))
+        yellow(&format!("⚠ {}s", status.post_wake_grace_remaining_secs))
     } else {
-        green("🟢 ready")
+        green("🟢")
     };
-    lines.push(format!("freeze 🟢 user-protected  ·  post-wake {}", post_wake));
+
+    // Single compact row: 4 gates side-by-side
+    lines.push(format!(
+        "survival {} · purge {} · freeze 🟢 · wake {}",
+        surv, purge, post_wake
+    ));
 
     // Maintenance purge counters
     let total_skipped = m.maintenance_purge_skipped_pressure_total
