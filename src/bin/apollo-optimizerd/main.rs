@@ -4298,6 +4298,37 @@ fn main() -> anyhow::Result<()> {
                 };
                 causal_qos_upgrades_cycle += causal_qos_upgrades;
 
+                // ActiveCoalition blocks → OutcomeTracker survival-bias channel.
+                // The new coalition guard skips actions silently inside
+                // execute_actions; without this hook RL/Bayes go blind to the
+                // opportunity cost of over-protection. record_blocked sets up
+                // the Rubin 1974 counterfactual: if pressure rose >2pp above
+                // natural drift in the next 30 s, the block was probably wrong.
+                // SHADOW-MODE-ONLY (per OutcomeTracker::record_blocked doc) —
+                // never auto-unblocks. NotebookLM peer-review 2026-05-10.
+                {
+                    use apollo_engine::engine::audit_types::BlockReason;
+                    use apollo_engine::engine::types::RootAction;
+                    let pressure = snapshot.pressure.memory_pressure;
+                    for trace in &exec_outcomes.audit_traces {
+                        if trace.block_reason != Some(BlockReason::ActiveCoalition) {
+                            continue;
+                        }
+                        let class = match &trace.intended_action {
+                            RootAction::ThrottleProcess { .. } => "throttle",
+                            RootAction::FreezeProcess { .. } => "freeze",
+                            RootAction::SetMemorystatus { .. } => "memorystatus",
+                            RootAction::SetThreadQoS { .. } => "thread-qos",
+                            _ => continue,
+                        };
+                        // Use the lctx-held mutable borrow; the LearningContext
+                        // owns &mut outcome_tracker for the rest of the cycle
+                        // (see line ~1800 where lctx is constructed).
+                        lctx.outcome_tracker
+                            .record_blocked(class, "active-coalition", pressure);
+                    }
+                }
+
                 // Unfreeze decay ODE: record fresh thaws, observe active ones, GC.
                 // Bounded per-cycle: O(active_thaws) sysinfo lookups, no I/O.
                 // [Strogatz 2015 §2.3 linear ODE; Denning 1968 working set]
