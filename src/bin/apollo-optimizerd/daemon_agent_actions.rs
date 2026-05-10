@@ -12,6 +12,7 @@
 //! paging hints (Wave 17) so per-PID dedup is correct.
 
 use apollo_engine::collector::ProcessStats;
+use apollo_engine::engine::apple_owned::is_apple_owned;
 use apollo_engine::engine::audit_types::DecisionReason;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::decide_actions::is_interactive_app_name;
@@ -106,7 +107,13 @@ pub fn run_agent_actions(
                     // process (observed: pid 422 WindowServer) ended up as a
                     // top-3 victim and received memorystatus_vm_pressure_send,
                     // forcing graphics-cache eviction and visible UI stutter.
+                    //
+                    // Future-proof guard: `apple_owned::is_apple_owned` classifies
+                    // by SIP path prefix + codesign authority chain (cached). Any
+                    // new Apple daemon shipped in a future macOS release is
+                    // auto-protected without code change — no list to update.
                     p.pid != daemon_pid
+                        && !is_apple_owned(p.pid)
                         && !is_protected_name(&p.name)
                         && !is_interactive_app_name(&p.name)
                         && !decide_interactive
