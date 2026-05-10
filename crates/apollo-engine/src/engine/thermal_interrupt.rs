@@ -1160,8 +1160,15 @@ mod tests {
         let pressure = PressureData::default();
         // Reader has not populated yet (None) — thermal signal from reactor
         // still escalates to Moderate because the decision is sensor-independent.
-        let phase =
-            compute_phase(None, 0.0, &pressure, true, false, InterruptPhase::Idle, &cfg);
+        let phase = compute_phase(
+            None,
+            0.0,
+            &pressure,
+            true,
+            false,
+            InterruptPhase::Idle,
+            &cfg,
+        );
         assert_eq!(phase, InterruptPhase::Moderate);
     }
 

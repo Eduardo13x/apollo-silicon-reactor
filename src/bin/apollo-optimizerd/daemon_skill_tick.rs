@@ -19,15 +19,17 @@ use std::path::Path;
 
 use apollo_engine::collector::SystemCollector;
 use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::audit_types::DecisionReason;
 use apollo_engine::engine::daemon_state::SharedState;
-use apollo_engine::engine::llm::{delete_file_best_effort, pending_trial_path, write_json_critical};
+use apollo_engine::engine::llm::{
+    delete_file_best_effort, pending_trial_path, write_json_critical,
+};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::optimization_skills::SkillRegistry;
 use apollo_engine::engine::outcome_tracker::OutcomeTracker;
 use apollo_engine::engine::process_identity::is_apple_platform_process;
 use apollo_engine::engine::safety::{is_protected_name, protected_processes};
 use apollo_engine::engine::types::RootAction;
-use apollo_engine::engine::audit_types::DecisionReason;
 
 /// Per-cycle skill application tick.
 ///
@@ -63,10 +65,8 @@ pub fn run_skill_tick(
     // matching_skills() gates on pressure ≥ skill.min_pressure AND is_reliable()
     // (≥5 observations, ≥60% success rate). [Sutton & Barto 2018]
     {
-        let skill_matches = skill_registry.matching_skills(
-            snapshot.pressure.memory_pressure as f32,
-            workload_mode,
-        );
+        let skill_matches =
+            skill_registry.matching_skills(snapshot.pressure.memory_pressure as f32, workload_mode);
         if !skill_matches.is_empty() {
             let already_actioned: HashSet<String> = current_actions
                 .iter()
@@ -131,10 +131,8 @@ pub fn run_skill_tick(
             delete_file_best_effort(&pending_trial_path(is_root));
         }
 
-        let trial = skill_registry.next_trial_skill(
-            snapshot.pressure.memory_pressure as f32,
-            workload_mode,
-        );
+        let trial = skill_registry
+            .next_trial_skill(snapshot.pressure.memory_pressure as f32, workload_mode);
         if let Some(skill) = trial {
             let skill_name = skill.name.clone();
             let pressure_before = snapshot.pressure.memory_pressure;

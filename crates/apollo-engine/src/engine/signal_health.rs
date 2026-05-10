@@ -35,7 +35,9 @@ pub struct SignalHealthMonitor {
 impl SignalHealthMonitor {
     /// Create a fresh monitor with zero violations.
     pub fn new() -> Self {
-        Self { violations_total: 0 }
+        Self {
+            violations_total: 0,
+        }
     }
 
     /// Returns `true` if `v` is healthy (finite and not subnormal).
@@ -74,7 +76,11 @@ impl SignalHealthMonitor {
     /// let safe_pressure = signal_health.sanitize(kalman_output, last_known_good);
     /// ```
     pub fn sanitize(&mut self, v: f64, fallback: f64) -> f64 {
-        if self.check_f64(v) { v } else { fallback }
+        if self.check_f64(v) {
+            v
+        } else {
+            fallback
+        }
     }
 }
 
@@ -85,7 +91,10 @@ mod tests {
     #[test]
     fn test_nan_detected() {
         let mut m = SignalHealthMonitor::new();
-        assert!(!m.check_f64(f64::NAN), "NaN must be detected as pathological");
+        assert!(
+            !m.check_f64(f64::NAN),
+            "NaN must be detected as pathological"
+        );
         assert_eq!(m.violations_total, 1);
     }
 
@@ -103,7 +112,10 @@ mod tests {
         // f64::MIN_POSITIVE / 2.0 is a subnormal (denormal) value.
         let subnormal = f64::MIN_POSITIVE / 2.0;
         assert!(subnormal != 0.0, "subnormal is not zero");
-        assert!(subnormal.abs() < f64::MIN_POSITIVE, "subnormal is below MIN_POSITIVE");
+        assert!(
+            subnormal.abs() < f64::MIN_POSITIVE,
+            "subnormal is below MIN_POSITIVE"
+        );
         assert!(!m.check_f64(subnormal), "subnormal must be flagged");
         assert_eq!(m.violations_total, 1);
     }
@@ -136,6 +148,9 @@ mod tests {
 
         let result2 = m.sanitize(0.8, 0.0);
         assert_eq!(result2, 0.8, "healthy value returned unchanged");
-        assert_eq!(m.violations_total, 1, "no extra violation for healthy value");
+        assert_eq!(
+            m.violations_total, 1,
+            "no extra violation for healthy value"
+        );
     }
 }

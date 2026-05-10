@@ -20,18 +20,16 @@
 
 use apollo_engine::collector::SystemCollector;
 use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::blocked_action_journal::emit_audit_async;
 use apollo_engine::engine::daemon_helpers::{hop_groups_path, signal_intelligence_path};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::effectiveness_tracker::EffectivenessTracker;
-use apollo_engine::engine::blocked_action_journal::emit_audit_async;
 use apollo_engine::engine::execute_actions::ExecuteOutcomes;
 use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
-use apollo_engine::engine::learned_state::{
-    LearnableParams, LearnedState, RestoreQualityMonitor,
-};
-use apollo_engine::engine::maintenance_state::MaintenanceState;
+use apollo_engine::engine::learned_state::{LearnableParams, LearnedState, RestoreQualityMonitor};
 use apollo_engine::engine::learning_pipeline::{LearningObservation, LearningPipeline};
 use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::maintenance_state::MaintenanceState;
 use apollo_engine::engine::nars_belief::{ArousalState, Salience};
 use apollo_engine::engine::nested_learner::NestedLearner;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
@@ -399,8 +397,7 @@ pub fn run_learning_tick<'a>(
                         "{{\"process\":{:?},\"effectiveness\":{:.3},\"pressure\":{:.3},\"workload\":{:?},\"cycle\":{}}}\n",
                         name, w.effectiveness(), pressure, workload, cycle_count
                     );
-                    let novel_path =
-                        apollo_engine::engine::daemon_helpers::novel_patterns_path();
+                    let novel_path = apollo_engine::engine::daemon_helpers::novel_patterns_path();
                     let _ = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
@@ -809,10 +806,7 @@ pub fn run_learning_tick<'a>(
         // Patch neuromodulator warm-start state after the main persist so a crash
         // mid-persist leaves the previous neurotransmitter snapshot intact.
         // [Schultz 1997] — DA/ACh/NA/5-HT signals require continuity across restarts.
-        LearnedState::patch_neuro_state(
-            std::path::Path::new(ls_path),
-            lctx.neuromod.snapshot(),
-        );
+        LearnedState::patch_neuro_state(std::path::Path::new(ls_path), lctx.neuromod.snapshot());
         // Causal graph observability: log solid/weak links discovered.
         let solid = lctx.causal_graph.solid_count();
         let total = lctx.causal_graph.edge_count();

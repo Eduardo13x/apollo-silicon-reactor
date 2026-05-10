@@ -38,9 +38,8 @@ pub fn run_ctx_switch_tick(
     state: &SharedState,
     frozen_state_path: &Path,
 ) {
-    let fg_changed = foreground_app.is_some()
-        && last_fg_name.is_some()
-        && foreground_app != *last_fg_name;
+    let fg_changed =
+        foreground_app.is_some() && last_fg_name.is_some() && foreground_app != *last_fg_name;
 
     if fg_changed {
         ctx_switch_times.push_back(Instant::now());

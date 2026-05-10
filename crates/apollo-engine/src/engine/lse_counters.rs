@@ -267,7 +267,8 @@ impl LockFreeMetrics {
 
     #[inline(always)]
     pub fn add_dedup_drops_setmemorystatus(&self, n: u64) {
-        self.dedup_drops_setmemorystatus.fetch_add(n, Ordering::Relaxed);
+        self.dedup_drops_setmemorystatus
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     #[inline(always)]
@@ -327,33 +328,67 @@ impl LockFreeMetrics {
             dedup_drops_unfreeze: self.dedup_drops_unfreeze.load(Ordering::Relaxed),
             restore_status_missing: self.restore_status_missing.load(Ordering::Relaxed),
             restore_status_restored_n: self.restore_status_restored_n.load(Ordering::Relaxed),
-            restore_status_discarded_corrupt: self.restore_status_discarded_corrupt.load(Ordering::Relaxed),
-            restore_status_discarded_clock_delta: self.restore_status_discarded_clock_delta.load(Ordering::Relaxed),
-            restore_status_discarded_boot_crossed: self.restore_status_discarded_boot_crossed.load(Ordering::Relaxed),
+            restore_status_discarded_corrupt: self
+                .restore_status_discarded_corrupt
+                .load(Ordering::Relaxed),
+            restore_status_discarded_clock_delta: self
+                .restore_status_discarded_clock_delta
+                .load(Ordering::Relaxed),
+            restore_status_discarded_boot_crossed: self
+                .restore_status_discarded_boot_crossed
+                .load(Ordering::Relaxed),
             identity_cache_hits: self.identity_cache_hits.load(Ordering::Relaxed),
             identity_cache_misses: self.identity_cache_misses.load(Ordering::Relaxed),
             identity_cache_evictions: self.identity_cache_evictions.load(Ordering::Relaxed),
             identity_cache_ttl_expired: self.identity_cache_ttl_expired.load(Ordering::Relaxed),
-            identity_cache_exit_invalidations: self.identity_cache_exit_invalidations.load(Ordering::Relaxed),
+            identity_cache_exit_invalidations: self
+                .identity_cache_exit_invalidations
+                .load(Ordering::Relaxed),
             identity_proc_pidpath_calls: self.identity_proc_pidpath_calls.load(Ordering::Relaxed),
-            actions_pushed_throttle_total: self.actions_pushed_throttle_total.load(Ordering::Relaxed),
+            actions_pushed_throttle_total: self
+                .actions_pushed_throttle_total
+                .load(Ordering::Relaxed),
             actions_pushed_freeze_total: self.actions_pushed_freeze_total.load(Ordering::Relaxed),
-            actions_pushed_unfreeze_total: self.actions_pushed_unfreeze_total.load(Ordering::Relaxed),
+            actions_pushed_unfreeze_total: self
+                .actions_pushed_unfreeze_total
+                .load(Ordering::Relaxed),
             actions_pushed_boost_total: self.actions_pushed_boost_total.load(Ordering::Relaxed),
-            actions_pushed_set_memorystatus_total: self.actions_pushed_set_memorystatus_total.load(Ordering::Relaxed),
-            actions_pushed_set_thread_qos_total: self.actions_pushed_set_thread_qos_total.load(Ordering::Relaxed),
-            actions_pushed_set_sysctl_total: self.actions_pushed_set_sysctl_total.load(Ordering::Relaxed),
-            actions_pushed_toggle_spotlight_total: self.actions_pushed_toggle_spotlight_total.load(Ordering::Relaxed),
-            actions_pushed_quarantine_daemon_total: self.actions_pushed_quarantine_daemon_total.load(Ordering::Relaxed),
+            actions_pushed_set_memorystatus_total: self
+                .actions_pushed_set_memorystatus_total
+                .load(Ordering::Relaxed),
+            actions_pushed_set_thread_qos_total: self
+                .actions_pushed_set_thread_qos_total
+                .load(Ordering::Relaxed),
+            actions_pushed_set_sysctl_total: self
+                .actions_pushed_set_sysctl_total
+                .load(Ordering::Relaxed),
+            actions_pushed_toggle_spotlight_total: self
+                .actions_pushed_toggle_spotlight_total
+                .load(Ordering::Relaxed),
+            actions_pushed_quarantine_daemon_total: self
+                .actions_pushed_quarantine_daemon_total
+                .load(Ordering::Relaxed),
             actions_pushed_raw_total: self.actions_pushed_raw_total.load(Ordering::Relaxed),
             actions_rejected_shape_total: self.actions_rejected_shape_total.load(Ordering::Relaxed),
             maintenance_purge_total: self.maintenance_purge_total.load(Ordering::Relaxed),
-            maintenance_purge_skipped_pressure_total: self.maintenance_purge_skipped_pressure_total.load(Ordering::Relaxed),
-            maintenance_purge_skipped_swap_floor_total: self.maintenance_purge_skipped_swap_floor_total.load(Ordering::Relaxed),
-            maintenance_purge_skipped_growing_total: self.maintenance_purge_skipped_growing_total.load(Ordering::Relaxed),
-            maintenance_purge_skipped_idle_total: self.maintenance_purge_skipped_idle_total.load(Ordering::Relaxed),
-            maintenance_purge_skipped_build_mode_total: self.maintenance_purge_skipped_build_mode_total.load(Ordering::Relaxed),
-            maintenance_purge_skipped_rate_limit_total: self.maintenance_purge_skipped_rate_limit_total.load(Ordering::Relaxed),
+            maintenance_purge_skipped_pressure_total: self
+                .maintenance_purge_skipped_pressure_total
+                .load(Ordering::Relaxed),
+            maintenance_purge_skipped_swap_floor_total: self
+                .maintenance_purge_skipped_swap_floor_total
+                .load(Ordering::Relaxed),
+            maintenance_purge_skipped_growing_total: self
+                .maintenance_purge_skipped_growing_total
+                .load(Ordering::Relaxed),
+            maintenance_purge_skipped_idle_total: self
+                .maintenance_purge_skipped_idle_total
+                .load(Ordering::Relaxed),
+            maintenance_purge_skipped_build_mode_total: self
+                .maintenance_purge_skipped_build_mode_total
+                .load(Ordering::Relaxed),
+            maintenance_purge_skipped_rate_limit_total: self
+                .maintenance_purge_skipped_rate_limit_total
+                .load(Ordering::Relaxed),
         }
     }
 }

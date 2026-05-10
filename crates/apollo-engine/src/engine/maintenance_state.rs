@@ -107,11 +107,8 @@ impl SwapDeltaWindow {
             None => return false,
         };
 
-        let recent: Vec<&(SystemTime, f64)> = self
-            .samples
-            .iter()
-            .filter(|(t, _)| *t >= cutoff)
-            .collect();
+        let recent: Vec<&(SystemTime, f64)> =
+            self.samples.iter().filter(|(t, _)| *t >= cutoff).collect();
 
         let min_samples = (secs / 2).max(1) as usize;
         if recent.len() < min_samples {

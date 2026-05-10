@@ -13,7 +13,7 @@
 //! the main decision pass.
 
 use std::collections::HashMap;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
 use apollo_engine::engine::compressor_aware::query_memory_profile;
 use apollo_engine::engine::daemon_state::SharedState;
@@ -171,8 +171,9 @@ pub fn run_memory_budget(
 
     let entering_critical = zone_changed && next_zone == PressureZone::Critical;
     let bypass_cooldown_ok = time_since_last_bypass >= CRITICAL_BYPASS_COOLDOWN;
-    
-    let force_eval = zone_changed || time_since_last >= rate_limit || (entering_critical && bypass_cooldown_ok);
+
+    let force_eval =
+        zone_changed || time_since_last >= rate_limit || (entering_critical && bypass_cooldown_ok);
 
     if entering_critical && bypass_cooldown_ok {
         budget_state.last_critical_bypass_at = Some(now);
@@ -280,26 +281,26 @@ pub fn run_memory_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use std::sync::atomic::AtomicBool;
-    use std::path::PathBuf;
-    use std::collections::{HashMap, VecDeque};
-    use apollo_engine::engine::daemon_state::{
-        MetricsState, PolicyState, ProcessState, HardwareState, LlmDomainState, UsageDomainState,
-        ReactorStatus, UsageTrackerState,
-    };
-    use apollo_engine::engine::types::{OptimizationProfile, LatencyTarget, RuntimeMetrics};
     use apollo_engine::engine::adaptive_governor::AdaptiveGovernor;
-    use apollo_engine::engine::profile_governor::ProfileGovernor;
-    use apollo_engine::engine::llm::{LlmConfig, LlmState, LearnedPolicy};
     use apollo_engine::engine::circuit_breaker::CircuitBreaker;
-    use apollo_engine::engine::degradation::DegradationController;
-    use apollo_engine::engine::usage_model::UsageModel;
-    use apollo_engine::engine::mach_qos::MachQoSManager;
     use apollo_engine::engine::daemon_helpers::WakeRuntimeState;
+    use apollo_engine::engine::daemon_state::{
+        HardwareState, LlmDomainState, MetricsState, PolicyState, ProcessState, ReactorStatus,
+        UsageDomainState, UsageTrackerState,
+    };
+    use apollo_engine::engine::degradation::DegradationController;
+    use apollo_engine::engine::llm::{LearnedPolicy, LlmConfig, LlmState};
+    use apollo_engine::engine::mach_qos::MachQoSManager;
+    use apollo_engine::engine::profile_governor::ProfileGovernor;
     use apollo_engine::engine::sysctl_governor::SysctlGovernorStatus;
     use apollo_engine::engine::thermal_interrupt::ResourceInterruptState;
+    use apollo_engine::engine::types::{LatencyTarget, OptimizationProfile, RuntimeMetrics};
+    use apollo_engine::engine::usage_model::UsageModel;
+    use std::collections::{HashMap, VecDeque};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
     use std::sync::Condvar;
+    use std::sync::{Arc, Mutex};
 
     fn mock_state() -> SharedState {
         SharedState {
@@ -369,7 +370,9 @@ mod tests {
             })),
             frozen_state: Arc::new(Mutex::new(HashMap::new())),
             mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
-            freeze_cooldown: Arc::new(Mutex::new(apollo_engine::engine::freeze_cooldown::FreezeCooldown::new())),
+            freeze_cooldown: Arc::new(Mutex::new(
+                apollo_engine::engine::freeze_cooldown::FreezeCooldown::new(),
+            )),
             stop: Arc::new(AtomicBool::new(false)),
             revert_sysctls_requested: Arc::new(AtomicBool::new(false)),
             cycle_condvar: Arc::new((Mutex::new(false), Condvar::new())),
@@ -404,9 +407,18 @@ mod tests {
 
     #[test]
     fn test_memory_budget_enforcement_intervals() {
-        assert_eq!(memory_budget_enforcement_interval(PressureZone::Normal), Duration::from_secs(60));
-        assert_eq!(memory_budget_enforcement_interval(PressureZone::Elevated), Duration::from_secs(10));
-        assert_eq!(memory_budget_enforcement_interval(PressureZone::Critical), Duration::from_secs(5));
+        assert_eq!(
+            memory_budget_enforcement_interval(PressureZone::Normal),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            memory_budget_enforcement_interval(PressureZone::Elevated),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            memory_budget_enforcement_interval(PressureZone::Critical),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]
@@ -414,7 +426,7 @@ mod tests {
         let mut state = MemoryBudgetState::default();
         let shared = mock_state();
         let analyzer = MemoryAnalyzer::new();
-        
+
         // Entry to Elevated >= 0.65
         run_memory_budget(0.65, 8589934592, &shared, &[], &analyzer, &mut state);
         assert_eq!(state.current_zone, PressureZone::Elevated);
@@ -442,7 +454,7 @@ mod tests {
         // Step 1: Normal -> Elevated
         run_memory_budget(0.70, 8589934592, &shared, &[], &analyzer, &mut state);
         assert_eq!(state.current_zone, PressureZone::Elevated);
-        
+
         // Step 2: Elevated -> Critical (triggers bypass)
         run_memory_budget(0.81, 8589934592, &shared, &[], &analyzer, &mut state);
         assert_eq!(state.current_zone, PressureZone::Critical);
@@ -452,7 +464,7 @@ mod tests {
         // 2. Drop to Elevated then back to Critical immediately
         run_memory_budget(0.70, 8589934592, &shared, &[], &analyzer, &mut state);
         assert_eq!(state.current_zone, PressureZone::Elevated);
-        
+
         run_memory_budget(0.81, 8589934592, &shared, &[], &analyzer, &mut state);
         // Bypass should NOT re-trigger because of cooldown
         assert_eq!(state.last_critical_bypass_at.unwrap(), first_bypass);
@@ -484,10 +496,16 @@ mod tests {
         run_memory_budget(0.70, 8589934592, &shared, &[], &analyzer, &mut state);
         assert_eq!(state.current_zone, PressureZone::Elevated);
         assert!(state.last_critical_exit_at.is_some());
-        assert!(state.recovering_from_critical(), "should be recovering immediately after exit");
+        assert!(
+            state.recovering_from_critical(),
+            "should be recovering immediately after exit"
+        );
 
         // Simulate 31s elapsed: recovery window closed.
         state.last_critical_exit_at = Some(Instant::now() - Duration::from_secs(31));
-        assert!(!state.recovering_from_critical(), "should NOT be recovering after 30s window");
+        assert!(
+            !state.recovering_from_critical(),
+            "should NOT be recovering after 30s window"
+        );
     }
 }

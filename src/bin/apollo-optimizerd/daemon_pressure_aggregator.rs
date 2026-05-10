@@ -41,8 +41,8 @@
 //! [Fowler 2004 — *Refactoring*].
 
 use apollo_engine::engine::effective_pressure::{self, PressureComponents};
-use apollo_engine::engine::ioreport::IOReportSnapshot;
 use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
+use apollo_engine::engine::ioreport::IOReportSnapshot;
 use apollo_engine::engine::smc_direct::SmcSnapshot;
 
 /// Aggregated per-cycle pressure output.
@@ -124,7 +124,8 @@ pub fn aggregate_cycle_pressure(
     cycle_hw_snap: Option<&HardwareSnapshot>,
     cautious_cycles_remaining: u32,
 ) -> PressureAggregation {
-    let charging_stress_boost = compute_charging_stress_boost(last_smc, last_ioreport, cycle_hw_snap);
+    let charging_stress_boost =
+        compute_charging_stress_boost(last_smc, last_ioreport, cycle_hw_snap);
     let battery_low_boost = compute_battery_low_boost(last_smc);
 
     // Raw memory_pressure misses hardware stress (thermal, battery,
@@ -252,9 +253,8 @@ mod tests {
 
     #[test]
     fn cautious_mode_ends_on_final_cycle() {
-        let out = aggregate_cycle_pressure(
-            0.60, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None, None, None, 1,
-        );
+        let out =
+            aggregate_cycle_pressure(0.60, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None, None, None, 1);
         assert_eq!(out.cautious.remaining, 0);
         assert!(out.cautious.ended);
         assert!(out.cautious.active);
@@ -273,25 +273,16 @@ mod tests {
         let mut smc = dummy_smc();
         smc.system_power_watts = Some(10.0);
         smc.charger_watts = Some(30.0);
-        assert_eq!(
-            compute_charging_stress_boost(Some(&smc), None, None),
-            0.06
-        );
+        assert_eq!(compute_charging_stress_boost(Some(&smc), None, None), 0.06);
 
         // Charging but low watts → no boost.
         smc.system_power_watts = Some(5.0);
-        assert_eq!(
-            compute_charging_stress_boost(Some(&smc), None, None),
-            0.0
-        );
+        assert_eq!(compute_charging_stress_boost(Some(&smc), None, None), 0.0);
 
         // High watts but not charging → no boost.
         smc.system_power_watts = Some(10.0);
         smc.charger_watts = None;
-        assert_eq!(
-            compute_charging_stress_boost(Some(&smc), None, None),
-            0.0
-        );
+        assert_eq!(compute_charging_stress_boost(Some(&smc), None, None), 0.0);
     }
 
     #[test]

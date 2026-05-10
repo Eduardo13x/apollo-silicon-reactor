@@ -540,9 +540,9 @@ mod tests {
 
     #[test]
     #[allow(deprecated)] // libc::mach_task_self / mach_absolute_time are used as
-    // oracle values here — the test's purpose is to verify that the direct
-    // Mach SVC path returns the same values libc returns. Migrating the
-    // oracle to the `mach2` crate would change what we're comparing against.
+                         // oracle values here — the test's purpose is to verify that the direct
+                         // Mach SVC path returns the same values libc returns. Migrating the
+                         // oracle to the `mach2` crate would change what we're comparing against.
     fn probe_mach_svc_direct() {
         // Llamar al kernel Mach directamente sin libc
         let task_port_raw = mach_task_self_raw();

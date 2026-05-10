@@ -138,9 +138,7 @@ impl SkillRegistry {
         //    of observed correlations.
         let clean_targets: Vec<String> = targets
             .into_iter()
-            .filter(|t| {
-                !crate::engine::safety::is_protected_name(t) && !is_system_process_name(t)
-            })
+            .filter(|t| !crate::engine::safety::is_protected_name(t) && !is_system_process_name(t))
             .collect();
         if clean_targets.is_empty() {
             return;

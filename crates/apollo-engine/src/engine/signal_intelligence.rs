@@ -1177,9 +1177,9 @@ fn compute_urgency(
     // UnstableSaddle: +0.02 max extra (outcome depends on separatrix position).
     // [Strogatz 2015] §6.4 — stability classification from Jacobian eigenvalues.
     let monopoly_weight = match stability_regime {
-        StabilityRegime::Unstable       => 0.15,
+        StabilityRegime::Unstable => 0.15,
         StabilityRegime::UnstableSaddle => 0.12,
-        _                               => 0.10,
+        _ => 0.10,
     };
     score += monopoly_risk * monopoly_weight;
 
@@ -2048,7 +2048,16 @@ mod tests {
         let pressures = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
         let mut prev_urgency = -1.0;
         for &p in &pressures {
-            let u = compute_urgency(p, 0.0, false, 0.0, 0.0, StabilityRegime::Degenerate, 0.0, 0.0);
+            let u = compute_urgency(
+                p,
+                0.0,
+                false,
+                0.0,
+                0.0,
+                StabilityRegime::Degenerate,
+                0.0,
+                0.0,
+            );
             assert!(
                 u >= prev_urgency,
                 "urgency not monotonic: p={}, urgency={}, prev={}",
@@ -2063,9 +2072,27 @@ mod tests {
     /// compute_urgency must be bounded [0, 1] even with extreme inputs.
     #[test]
     fn test_urgency_bounded_extreme_inputs() {
-        let u = compute_urgency(1.0, 1.0, true, 1.0, 1.0, StabilityRegime::Unstable, 5.0, 2.0);
+        let u = compute_urgency(
+            1.0,
+            1.0,
+            true,
+            1.0,
+            1.0,
+            StabilityRegime::Unstable,
+            5.0,
+            2.0,
+        );
         assert!(u >= 0.0 && u <= 1.0, "urgency {} out of bounds", u);
-        let u_zero = compute_urgency(0.0, 0.0, false, 0.0, 0.0, StabilityRegime::Degenerate, 0.0, 0.0);
+        let u_zero = compute_urgency(
+            0.0,
+            0.0,
+            false,
+            0.0,
+            0.0,
+            StabilityRegime::Degenerate,
+            0.0,
+            0.0,
+        );
         assert!(u_zero >= 0.0 && u_zero <= 1.0);
     }
 
@@ -2224,8 +2251,17 @@ mod tests {
         for i in 1..=30 {
             let pressure = 0.30 + (i as f64) * 0.02; // accelerating ramp
             last = si.tick(
-                pressure, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app",
-                500_000_000, 2_000_000_000, 8_000_000_000, 0.5,
+                pressure,
+                0.0,
+                0.05,
+                0.1,
+                &[10.0],
+                &[500e6],
+                "app",
+                500_000_000,
+                2_000_000_000,
+                8_000_000_000,
+                0.5,
             );
         }
         // Accelerating divergence → λ > 0.
@@ -2244,8 +2280,17 @@ mod tests {
         for i in 1..=30 {
             let pressure = 0.30 + (i as f64) * 0.02;
             acc_digest = si_acc.tick(
-                pressure, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app",
-                500_000_000, 2_000_000_000, 8_000_000_000, 0.5,
+                pressure,
+                0.0,
+                0.05,
+                0.1,
+                &[10.0],
+                &[500e6],
+                "app",
+                500_000_000,
+                2_000_000_000,
+                8_000_000_000,
+                0.5,
             );
         }
 
@@ -2254,18 +2299,47 @@ mod tests {
         // Ramp up fast then slow down.
         for i in 0..10 {
             si_dec.tick(
-                0.30 + (i as f64) * 0.05, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app",
-                500_000_000, 2_000_000_000, 8_000_000_000, 0.5,
+                0.30 + (i as f64) * 0.05,
+                0.0,
+                0.05,
+                0.1,
+                &[10.0],
+                &[500e6],
+                "app",
+                500_000_000,
+                2_000_000_000,
+                8_000_000_000,
+                0.5,
             );
         }
-        let mut dec_digest = si_dec.tick(0.80, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app",
-                500_000_000, 2_000_000_000, 8_000_000_000, 0.5);
+        let mut dec_digest = si_dec.tick(
+            0.80,
+            0.0,
+            0.05,
+            0.1,
+            &[10.0],
+            &[500e6],
+            "app",
+            500_000_000,
+            2_000_000_000,
+            8_000_000_000,
+            0.5,
+        );
         for i in 1..=20 {
             // Shrinking steps → ratio < 1 → negative contribution.
             let pressure = 0.80 + (1.0 / (i as f64 + 1.0)) * 0.10;
             dec_digest = si_dec.tick(
-                pressure, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app",
-                500_000_000, 2_000_000_000, 8_000_000_000, 0.5,
+                pressure,
+                0.0,
+                0.05,
+                0.1,
+                &[10.0],
+                &[500e6],
+                "app",
+                500_000_000,
+                2_000_000_000,
+                8_000_000_000,
+                0.5,
             );
         }
         assert!(

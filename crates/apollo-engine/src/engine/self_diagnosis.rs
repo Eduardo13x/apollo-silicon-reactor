@@ -163,7 +163,11 @@ impl SelfDiagnosis {
         // signal we WANT is "regression beyond steady-state", not "any dup".
         let total_drops: u64 = self.window.iter().map(|o| o.dedup_drops_total()).sum();
         let throttle_drops: u64 = self.window.iter().map(|o| o.dedup_drops_throttle).sum();
-        let setmem_drops: u64 = self.window.iter().map(|o| o.dedup_drops_setmemorystatus).sum();
+        let setmem_drops: u64 = self
+            .window
+            .iter()
+            .map(|o| o.dedup_drops_setmemorystatus)
+            .sum();
         let freeze_drops: u64 = self.window.iter().map(|o| o.dedup_drops_freeze).sum();
         let unfreeze_drops: u64 = self.window.iter().map(|o| o.dedup_drops_unfreeze).sum();
         let n = self.window.len() as f64;
@@ -375,15 +379,13 @@ mod tests {
         let path = temp_path();
         let _ = std::fs::remove_file(&path);
         let sd = SelfDiagnosis::new(path.clone());
-        let alerts = vec![
-            DiagnosisAlert {
-                at: Utc::now(),
-                kind: "test".to_string(),
-                severity: DiagnosisSeverity::Low,
-                summary: "test alert".to_string(),
-                recommended_action: "noop".to_string(),
-            },
-        ];
+        let alerts = vec![DiagnosisAlert {
+            at: Utc::now(),
+            kind: "test".to_string(),
+            severity: DiagnosisSeverity::Low,
+            summary: "test alert".to_string(),
+            recommended_action: "noop".to_string(),
+        }];
         sd.persist(&alerts);
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"kind\":\"test\""));

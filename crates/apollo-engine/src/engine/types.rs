@@ -479,15 +479,23 @@ impl RootAction {
     /// callers of `execute_actions::verify_pid_identity` (Sprint 4 merge).
     pub fn identity_fields(&self) -> Option<(u32, Option<&str>, u64, u64)> {
         match self {
-            RootAction::ThrottleProcess { pid, name, start_sec, start_usec, .. }
-            | RootAction::FreezeProcess { pid, name, start_sec, start_usec, .. } => {
-                Some((*pid, Some(name.as_str()), *start_sec, *start_usec))
+            RootAction::ThrottleProcess {
+                pid,
+                name,
+                start_sec,
+                start_usec,
+                ..
             }
+            | RootAction::FreezeProcess {
+                pid,
+                name,
+                start_sec,
+                start_usec,
+                ..
+            } => Some((*pid, Some(name.as_str()), *start_sec, *start_usec)),
             RootAction::BoostProcess { pid, name, .. }
             | RootAction::UnfreezeProcess { pid, name, .. }
-            | RootAction::SetThreadQoS { pid, name, .. } => {
-                Some((*pid, Some(name.as_str()), 0, 0))
-            }
+            | RootAction::SetThreadQoS { pid, name, .. } => Some((*pid, Some(name.as_str()), 0, 0)),
             RootAction::SetMemorystatus { pid, .. } => Some((*pid, None, 0, 0)),
             RootAction::SetSysctl(_)
             | RootAction::ToggleSpotlight { .. }

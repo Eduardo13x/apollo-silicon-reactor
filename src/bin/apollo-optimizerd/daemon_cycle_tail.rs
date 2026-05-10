@@ -161,8 +161,7 @@ pub fn wire_enriched_telemetry(
     // behavior_interactive_pid_count — how many PIDs learned dynamically.
     m.metrics.behavior_interactive_pid_count = inputs.behavior_interactive_pids.len();
     // rl_threshold_current — absolute threshold (bg_pressure + rl_adj).
-    m.metrics.rl_threshold_current =
-        bg_threshold + m.metrics.rl_adjustment_pp as f64 / 100.0;
+    m.metrics.rl_threshold_current = bg_threshold + m.metrics.rl_adjustment_pp as f64 / 100.0;
     // ── UCHS / Neurocognitive metrics (8 cognitive modules) ──────────
     m.metrics.uchs_composite = inputs.cog_decision.uchs_composite;
     m.metrics.uchs_grade = inputs.cognitive_state.health.grade.clone();

@@ -12,15 +12,15 @@
 //! Must run AFTER signal_digest and reclaim_forecast are computed.
 //! Must run BEFORE heuristic_pass (so hinted PIDs are visible for dedup).
 
+use apollo_engine::engine::audit_types::DecisionReason;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::decide_actions::is_interactive_app_name;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::process_classifier::ProcessSnapshot;
+use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
 use apollo_engine::engine::safety::{is_protected_name, is_user_interactive_app};
 use apollo_engine::engine::swap_reclaim::{CyberPhysicalSignal, NetRateNorm};
 use apollo_engine::engine::types::RootAction;
-use apollo_engine::engine::audit_types::DecisionReason;
-use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
 
 /// Emit direct pressure-driven and ODE-velocity paging hints for this cycle.
 ///
@@ -169,7 +169,9 @@ pub fn run_paging_hints(
                 );
                 !is_protected_name(&p.name)
                     && !is_interactive
-                    && !protected_pats.iter().any(|pat| p.name.contains(pat.as_str()))
+                    && !protected_pats
+                        .iter()
+                        .any(|pat| p.name.contains(pat.as_str()))
                     && p.rss_bytes > 80 * 1024 * 1024
                     && p.pid != std::process::id()
                     && !p.has_gui_window

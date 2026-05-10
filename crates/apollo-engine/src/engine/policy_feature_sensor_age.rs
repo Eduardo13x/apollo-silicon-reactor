@@ -81,8 +81,8 @@ impl PolicyFeature for SensorAgeFeature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::safety::ProtectionLevel;
     use crate::engine::audit_types::DecisionReason;
+    use crate::engine::safety::ProtectionLevel;
 
     fn ctx_with_age(age: Option<u64>) -> ActionContext {
         ActionContext {
@@ -108,11 +108,22 @@ mod tests {
     }
 
     fn freeze() -> RootAction {
-        RootAction::freeze(1234, "testproc", "unit-test", DecisionReason::PressureContext)
+        RootAction::freeze(
+            1234,
+            "testproc",
+            "unit-test",
+            DecisionReason::PressureContext,
+        )
     }
 
     fn throttle() -> RootAction {
-        RootAction::throttle(1234, "testproc", false, "unit-test", DecisionReason::PressureContext)
+        RootAction::throttle(
+            1234,
+            "testproc",
+            false,
+            "unit-test",
+            DecisionReason::PressureContext,
+        )
     }
 
     fn boost() -> RootAction {
@@ -159,8 +170,8 @@ mod tests {
         let f = SensorAgeFeature::default();
         // 1000ms is half of stale_threshold_ms (2000ms).
         let c = f.contribute(&freeze(), &ctx_with_age(Some(1000)));
-        let expected = f.baseline_uncertainty
-            + 0.5 * (f.saturation_uncertainty - f.baseline_uncertainty);
+        let expected =
+            f.baseline_uncertainty + 0.5 * (f.saturation_uncertainty - f.baseline_uncertainty);
         assert!(
             (c.uncertainty - expected).abs() < 1e-9,
             "expected {}, got {}",

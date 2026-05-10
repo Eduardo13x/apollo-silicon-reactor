@@ -28,7 +28,7 @@ pub fn detect_capabilities() -> CapabilityReport {
     }
 
     let is_root = unsafe { libc::geteuid() == 0 };
-    
+
     // Core counts (Apple Silicon clusters)
     // perflevel0 = P-cores (Firestorm/Avalanche/etc.)
     // perflevel1 = E-cores (Icestorm/Blizzard/etc.)

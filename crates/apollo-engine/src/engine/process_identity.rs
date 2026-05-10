@@ -122,12 +122,7 @@ impl ProcessIdentity {
     /// - Name match is prefix-tolerant in either direction when one name is
     ///   ≥6 chars: macOS kernel APIs truncate `p_comm` to ~15 chars while
     ///   action emitters carry the full path-derived name.
-    pub fn matches(
-        &self,
-        expected_name: Option<&str>,
-        start_sec: u64,
-        start_usec: u64,
-    ) -> bool {
+    pub fn matches(&self, expected_name: Option<&str>, start_sec: u64, start_usec: u64) -> bool {
         if start_sec > 0 && self.start_sec != start_sec {
             return false;
         }
@@ -150,12 +145,7 @@ impl ProcessIdentity {
     ///
     /// Replaces the duplicated `verify_pid_identity` helper that lived in
     /// both `execute_actions.rs` and `daemon main.rs::pid_identity_still_valid`.
-    pub fn verify(
-        pid: u32,
-        expected_name: Option<&str>,
-        start_sec: u64,
-        start_usec: u64,
-    ) -> bool {
+    pub fn verify(pid: u32, expected_name: Option<&str>, start_sec: u64, start_usec: u64) -> bool {
         match Self::from_pid(pid) {
             Some(id) => id.matches(expected_name, start_sec, start_usec),
             None => false,
@@ -271,8 +261,12 @@ const CS_PLATFORM_BINARY: u32 = 0x0400_0000;
 extern "C" {
     /// `csops(pid, ops, useraddr, usersize)` — query/set code-signing state.
     /// With `CS_OPS_STATUS` returns a `u32` bitmask of `CS_*` flags.
-    fn csops(pid: libc::pid_t, ops: u32, useraddr: *mut libc::c_void, usersize: usize)
-        -> libc::c_int;
+    fn csops(
+        pid: libc::pid_t,
+        ops: u32,
+        useraddr: *mut libc::c_void,
+        usersize: usize,
+    ) -> libc::c_int;
 }
 
 // `proc_pidpath` — already declared in proc_taskinfo; re-use via extern here.
@@ -324,8 +318,13 @@ pub fn is_apple_platform_process(pid: u32) -> bool {
     // third-party DriverKit dexts (no CS_PLATFORM_BINARY but SIP-managed path),
     // and system extensions installed under /Library/SystemExtensions/.
     let mut buf = [0u8; PROC_PIDPATHINFO_MAXSIZE as usize];
-    let path_len =
-        unsafe { proc_pidpath(pid as libc::c_int, buf.as_mut_ptr(), PROC_PIDPATHINFO_MAXSIZE) };
+    let path_len = unsafe {
+        proc_pidpath(
+            pid as libc::c_int,
+            buf.as_mut_ptr(),
+            PROC_PIDPATHINFO_MAXSIZE,
+        )
+    };
     if path_len > 0 {
         let path = std::str::from_utf8(&buf[..path_len as usize]).unwrap_or("");
         if is_system_driver_path(path) {
@@ -458,7 +457,9 @@ mod tests {
 
     #[test]
     fn apple_system_paths() {
-        assert!(is_apple_system_path("/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"));
+        assert!(is_apple_system_path(
+            "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+        ));
         assert!(is_apple_system_path("/usr/libexec/AirPlayXPCHelper"));
         assert!(is_apple_system_path("/usr/bin/codesign"));
         assert!(is_apple_system_path("/sbin/launchd"));
@@ -469,9 +470,15 @@ mod tests {
     #[test]
     fn non_apple_paths() {
         assert!(!is_apple_system_path("/usr/local/bin/brew"));
-        assert!(!is_apple_system_path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"));
-        assert!(!is_apple_system_path("/Users/eduardocortez/.cargo/bin/cargo"));
-        assert!(!is_apple_system_path("/usr/local/libexec/apollo-optimizerd"));
+        assert!(!is_apple_system_path(
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+        ));
+        assert!(!is_apple_system_path(
+            "/Users/eduardocortez/.cargo/bin/cargo"
+        ));
+        assert!(!is_apple_system_path(
+            "/usr/local/libexec/apollo-optimizerd"
+        ));
     }
 
     #[test]
@@ -499,8 +506,12 @@ mod tests {
     #[test]
     fn driver_names_detected() {
         assert!(is_driver_process_name("com.apple.DriverKit-AppleBCMWLAN"));
-        assert!(is_driver_process_name("org.pqrs.Karabiner-DriverKit-VirtualHIDDevice"));
-        assert!(is_driver_process_name("com.apple.DriverKit-IOUserDockChannelSerial"));
+        assert!(is_driver_process_name(
+            "org.pqrs.Karabiner-DriverKit-VirtualHIDDevice"
+        ));
+        assert!(is_driver_process_name(
+            "com.apple.DriverKit-IOUserDockChannelSerial"
+        ));
         assert!(!is_driver_process_name("Brave Browser"));
         assert!(!is_driver_process_name("apollo-optimizerd"));
         assert!(!is_driver_process_name("cargo"));
@@ -509,7 +520,9 @@ mod tests {
     #[test]
     fn non_driver_paths_not_caught() {
         assert!(!is_system_driver_path("/usr/local/bin/brew"));
-        assert!(!is_system_driver_path("/Applications/AudioHijack.app/Contents/MacOS/AudioHijack"));
+        assert!(!is_system_driver_path(
+            "/Applications/AudioHijack.app/Contents/MacOS/AudioHijack"
+        ));
         assert!(!is_system_driver_path("/Users/edu/.cargo/bin/rustc"));
     }
 
@@ -539,7 +552,12 @@ mod tests {
     // ── matches() / verify() — Sprint 4 IdentityVerifier merge ────────────────
 
     fn fixture(name: &str, start_sec: u64, start_usec: u64) -> ProcessIdentity {
-        ProcessIdentity { pid: 1234, start_sec, start_usec, name: name.into() }
+        ProcessIdentity {
+            pid: 1234,
+            start_sec,
+            start_usec,
+            name: name.into(),
+        }
     }
 
     #[test]
@@ -605,6 +623,11 @@ mod tests {
         let me = std::process::id();
         let id = ProcessIdentity::from_pid(me).unwrap();
         // Use the just-fetched start_sec/usec so the call cannot race.
-        assert!(ProcessIdentity::verify(me, Some(&id.name), id.start_sec, id.start_usec));
+        assert!(ProcessIdentity::verify(
+            me,
+            Some(&id.name),
+            id.start_sec,
+            id.start_usec
+        ));
     }
 }

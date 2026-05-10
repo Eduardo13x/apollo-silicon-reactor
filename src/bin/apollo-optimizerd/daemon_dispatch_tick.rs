@@ -7,20 +7,20 @@
 //! 4. Circuit breaker and degradation state updates.
 //! 5. Frozen state persistence.
 
-use std::collections::{HashSet, HashMap};
-use std::path::Path;
 use chrono::Utc;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
-use apollo_engine::engine::types::{RootAction, FrozenEntry, FreezeSource};
-use apollo_engine::engine::execute_actions::{execute_actions, ExecuteOutcomes};
-use apollo_engine::engine::degradation::DegradationInputs;
-use apollo_engine::engine::unfreeze_decay::UnfreezeDecayModel;
-use apollo_engine::engine::lock_ext::LockRecover;
-use apollo_engine::engine::daemon_state::SharedState;
-use apollo_engine::engine::lse_counters::LockFreeMetrics;
-use apollo_engine::engine::swap_reclaim::SwapRisk;
 use apollo_engine::collector::{SystemCollector, SystemSnapshot};
 use apollo_engine::engine::daemon_helpers::write_frozen_state;
+use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::degradation::DegradationInputs;
+use apollo_engine::engine::execute_actions::{execute_actions, ExecuteOutcomes};
+use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::lse_counters::LockFreeMetrics;
+use apollo_engine::engine::swap_reclaim::SwapRisk;
+use apollo_engine::engine::types::{FreezeSource, FrozenEntry, RootAction};
+use apollo_engine::engine::unfreeze_decay::UnfreezeDecayModel;
 
 /// Action kinds tracked for per-PID dedup.
 /// Variants without a target PID (SetSysctl, ToggleSpotlight, QuarantineDaemon)
@@ -93,9 +93,7 @@ fn dedup_key(action: &RootAction) -> Option<(u32, DedupKind, u32)> {
 /// [Saltzer & Schroeder 1975] Economy of Mechanism — single chokepoint
 /// before execute_actions eliminates the bug class without touching
 /// every emission site.
-pub fn consolidate_actions_per_pid(
-    actions: Vec<RootAction>,
-) -> (Vec<RootAction>, DedupStats) {
+pub fn consolidate_actions_per_pid(actions: Vec<RootAction>) -> (Vec<RootAction>, DedupStats) {
     let mut seen: HashSet<(u32, DedupKind, u32)> = HashSet::with_capacity(actions.len());
     let mut stats = DedupStats::default();
     let mut out: Vec<RootAction> = Vec::with_capacity(actions.len());
@@ -139,7 +137,7 @@ pub fn record_dedup_drops(lf: &LockFreeMetrics, stats: &DedupStats) {
     }
 }
 
-use crate::{daemon_action_pipeline, cognitive_tick};
+use crate::{cognitive_tick, daemon_action_pipeline};
 
 /// Input dependencies for the dispatch tick.
 pub struct DispatchTickInput<'a> {
@@ -276,7 +274,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     // ── Circuit breaker + execute_actions ────────────────────
     let mut frozen_set: HashSet<u32> = state.frozen_state.lock_recover().keys().copied().collect();
     let frozen_before: HashSet<u32> = frozen_set.clone();
-    
+
     let (learned_protected, learned_interactive) = {
         let pg = state.policy.lock_recover();
         (
@@ -364,13 +362,13 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         for pid in &frozen_set {
             frozen_state.entry(*pid).or_insert_with(|| {
                 let name = apollo_engine::engine::process_identity::proc_name_for_pid(*pid);
-                let (start_sec, original_jetsam_priority) = identity_map
-                    .get(pid)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        let s = apollo_engine::engine::process_identity::ProcessIdentity::from_pid(*pid)
-                            .map(|pi| pi.start_sec)
-                            .unwrap_or(0);
+                let (start_sec, original_jetsam_priority) =
+                    identity_map.get(pid).copied().unwrap_or_else(|| {
+                        let s = apollo_engine::engine::process_identity::ProcessIdentity::from_pid(
+                            *pid,
+                        )
+                        .map(|pi| pi.start_sec)
+                        .unwrap_or(0);
                         (s, None)
                     });
                 FrozenEntry {
@@ -399,29 +397,35 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use std::sync::atomic::AtomicBool;
-    use std::path::PathBuf;
-    use std::collections::HashMap;
-    use apollo_engine::engine::daemon_state::{PolicyState, MetricsState, ProcessState, HardwareState, LlmDomainState, UsageDomainState};
+    use apollo_engine::collector::{CpuStats, MemoryStats, PressureStats};
     use apollo_engine::engine::adaptive_governor::AdaptiveGovernor;
-    use apollo_engine::engine::llm::{LlmConfig, LlmState, LearnedPolicy};
-    use apollo_engine::engine::mach_qos::MachQoSManager;
-    use apollo_engine::engine::sysctl_governor::SysctlGovernorStatus;
-    use apollo_engine::engine::usage_model::UsageModel;
-    use apollo_engine::engine::daemon_helpers::WakeRuntimeState;
-    use apollo_engine::engine::types::{CapabilityReport, RuntimeMetrics, OptimizationProfile, LatencyTarget};
     use apollo_engine::engine::audit_types::DecisionReason;
     use apollo_engine::engine::circuit_breaker::{CircuitBreaker, CircuitState};
+    use apollo_engine::engine::daemon_helpers::WakeRuntimeState;
+    use apollo_engine::engine::daemon_state::{
+        HardwareState, LlmDomainState, MetricsState, PolicyState, ProcessState, UsageDomainState,
+    };
     use apollo_engine::engine::degradation::DegradationController;
-    use apollo_engine::collector::{CpuStats, MemoryStats, PressureStats};
+    use apollo_engine::engine::llm::{LearnedPolicy, LlmConfig, LlmState};
+    use apollo_engine::engine::mach_qos::MachQoSManager;
+    use apollo_engine::engine::sysctl_governor::SysctlGovernorStatus;
+    use apollo_engine::engine::types::{
+        CapabilityReport, LatencyTarget, OptimizationProfile, RuntimeMetrics,
+    };
+    use apollo_engine::engine::usage_model::UsageModel;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
 
     fn create_test_state() -> SharedState {
         SharedState {
             policy: Arc::new(Mutex::new(PolicyState {
                 profile: OptimizationProfile::BalancedRoot,
                 latency_target: LatencyTarget::Normal,
-                governor: apollo_engine::engine::profile_governor::ProfileGovernor::new(OptimizationProfile::BalancedRoot),
+                governor: apollo_engine::engine::profile_governor::ProfileGovernor::new(
+                    OptimizationProfile::BalancedRoot,
+                ),
                 learned_policy: LearnedPolicy::default(),
                 adaptive_governor: AdaptiveGovernor::new(),
                 timeline: std::collections::VecDeque::new(),
@@ -476,7 +480,9 @@ mod tests {
                 usage_tracker: apollo_engine::engine::daemon_state::UsageTrackerState::default(),
             })),
             mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
-            freeze_cooldown: Arc::new(Mutex::new(apollo_engine::engine::freeze_cooldown::FreezeCooldown::new())),
+            freeze_cooldown: Arc::new(Mutex::new(
+                apollo_engine::engine::freeze_cooldown::FreezeCooldown::new(),
+            )),
             hardware: Arc::new(Mutex::new(HardwareState {
                 last_hw_snapshot: None,
                 sysctl_governor_status: SysctlGovernorStatus {
@@ -500,7 +506,9 @@ mod tests {
             })),
             revert_sysctls_requested: Arc::new(AtomicBool::new(false)),
             cycle_condvar: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
-            resource_interrupt: Arc::new(apollo_engine::engine::thermal_interrupt::ResourceInterruptState::new()),
+            resource_interrupt: Arc::new(
+                apollo_engine::engine::thermal_interrupt::ResourceInterruptState::new(),
+            ),
             subscribers: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -533,8 +541,17 @@ mod tests {
         let collector = SystemCollector::new();
         let snapshot = SystemSnapshot {
             timestamp: Utc::now(),
-            cpu: CpuStats { global_usage: 0.0, core_count: 1 },
-            memory: MemoryStats { total_ram: 0, used_ram: 0, free_ram: 0, total_swap: 0, used_swap: 0 },
+            cpu: CpuStats {
+                global_usage: 0.0,
+                core_count: 1,
+            },
+            memory: MemoryStats {
+                total_ram: 0,
+                used_ram: 0,
+                free_ram: 0,
+                total_swap: 0,
+                used_swap: 0,
+            },
             pressure: PressureStats {
                 memory_pressure: 0.0,
                 swap_used_bytes: 0,
@@ -557,7 +574,12 @@ mod tests {
             frozen_state_path: Path::new("/tmp/apollo_test_frozen"),
             final_actions: vec![
                 RootAction::throttle(1234, "test", true, "test", DecisionReason::PressureContext),
-                RootAction::unfreeze(5678, "test_unfreeze", "test", DecisionReason::PressureContext),
+                RootAction::unfreeze(
+                    5678,
+                    "test_unfreeze",
+                    "test",
+                    DecisionReason::PressureContext,
+                ),
             ],
             snapshot: &snapshot,
             prev_cog_decision: None,
@@ -613,7 +635,12 @@ mod tests {
     #[test]
     fn consolidate_drops_4x_setmemorystatus_same_pid() {
         // Reproduces prod observation: pid 65808 SetMemorystatus 4× per cycle.
-        let actions = vec![sm_status(65808), sm_status(65808), sm_status(65808), sm_status(65808)];
+        let actions = vec![
+            sm_status(65808),
+            sm_status(65808),
+            sm_status(65808),
+            sm_status(65808),
+        ];
         let (out, stats) = consolidate_actions_per_pid(actions);
         assert_eq!(out.len(), 1, "should keep first occurrence only");
         assert_eq!(stats.set_memorystatus, 3, "should drop 3 duplicates");
@@ -668,13 +695,19 @@ mod tests {
         // Verify pid order is 1, 2, 3 (not re-sorted).
         if let RootAction::SetMemorystatus { pid, .. } = &out[0] {
             assert_eq!(*pid, 1);
-        } else { panic!("expected SetMemorystatus first"); }
+        } else {
+            panic!("expected SetMemorystatus first");
+        }
         if let RootAction::SetMemorystatus { pid, .. } = &out[1] {
             assert_eq!(*pid, 2);
-        } else { panic!("expected SetMemorystatus second"); }
+        } else {
+            panic!("expected SetMemorystatus second");
+        }
         if let RootAction::SetMemorystatus { pid, .. } = &out[2] {
             assert_eq!(*pid, 3);
-        } else { panic!("expected SetMemorystatus third"); }
+        } else {
+            panic!("expected SetMemorystatus third");
+        }
     }
 
     #[test]

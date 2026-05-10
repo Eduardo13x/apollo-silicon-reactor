@@ -70,7 +70,10 @@ pub fn run_markov_tick(
         let cycles_elapsed = cycle_count.saturating_sub(pred_cycle);
         if cycles_elapsed >= 1 {
             let hit = foreground_app
-                .map(|fa| fa.to_ascii_lowercase().contains(&predicted.to_ascii_lowercase()))
+                .map(|fa| {
+                    fa.to_ascii_lowercase()
+                        .contains(&predicted.to_ascii_lowercase())
+                })
                 .unwrap_or(false);
             if hit {
                 *markov_hit_count += 1;
@@ -172,8 +175,7 @@ pub fn run_markov_tick(
     // Update hour/weekday unconditionally every cycle for pressure_headroom_for_incoming().
     let now_chrono = Utc::now();
     let mut temporal_hour = now_chrono.hour() as u8;
-    let mut temporal_weekday =
-        chrono::Datelike::weekday(&now_chrono).num_days_from_monday() as u8;
+    let mut temporal_weekday = chrono::Datelike::weekday(&now_chrono).num_days_from_monday() as u8;
 
     if let Some(fg_name) = foreground_app {
         let now_chrono = Utc::now();
@@ -195,10 +197,7 @@ pub fn run_markov_tick(
         let temporal_preds = temporal_predictor.predict(hour, weekday, &markov_probs);
 
         for tpred in &temporal_preds {
-            if tpred.temporal_score > 0.3
-                && tpred.probability > 0.15
-                && tpred.markov_score < 0.30
-            {
+            if tpred.temporal_score > 0.3 && tpred.probability > 0.15 && tpred.markov_score < 0.30 {
                 let pred_lc = tpred.app_name.to_ascii_lowercase();
                 if let Some(pid) = collector
                     .system()

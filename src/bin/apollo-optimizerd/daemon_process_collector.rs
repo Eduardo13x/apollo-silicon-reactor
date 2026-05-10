@@ -12,9 +12,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use apollo_engine::collector::SystemCollector;
-use apollo_engine::engine::daemon_helpers::{
-    unfreeze_pids_verified, write_frozen_state,
-};
+use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified, write_frozen_state};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::display_turbo::DisplayTurbo;
 use apollo_engine::engine::lock_ext::LockRecover;

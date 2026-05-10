@@ -448,9 +448,19 @@ impl CausalGraph {
 
     /// Age of the oldest pending action in cycles.
     pub fn oldest_pending_action_age_cycles(&self, current_cycle: u64) -> u64 {
-        let oldest_fast = self.pending.iter().map(|p| p.cycle).min().unwrap_or(current_cycle);
-        let oldest_slow = self.pending_slow.iter().map(|p| p.cycle).min().unwrap_or(current_cycle);
-        
+        let oldest_fast = self
+            .pending
+            .iter()
+            .map(|p| p.cycle)
+            .min()
+            .unwrap_or(current_cycle);
+        let oldest_slow = self
+            .pending_slow
+            .iter()
+            .map(|p| p.cycle)
+            .min()
+            .unwrap_or(current_cycle);
+
         let oldest = std::cmp::min(oldest_fast, oldest_slow);
         current_cycle.saturating_sub(oldest)
     }
@@ -1112,16 +1122,32 @@ mod tests {
         let mut g = CausalGraph::new();
 
         // Edge 1: RSS-dominant (500MB → 300MB vs small CPU/swap).
-        let before = ResourceSnapshot { rss_mb: 500.0, cpu_pct: 30.0, swap_mb: 100.0 };
-        let after = ResourceSnapshot { rss_mb: 300.0, cpu_pct: 28.0, swap_mb: 98.0 };
+        let before = ResourceSnapshot {
+            rss_mb: 500.0,
+            cpu_pct: 30.0,
+            swap_mb: 100.0,
+        };
+        let after = ResourceSnapshot {
+            rss_mb: 300.0,
+            cpu_pct: 28.0,
+            swap_mb: 98.0,
+        };
         for i in 0..5u64 {
             g.record_action_with_resources("throttle:Rss", 0.80, i * 10, before.clone());
             g.evaluate_with_resources(0.60, i * 10 + 3, &after);
         }
 
         // Edge 2: CPU-dominant (80% → 10% vs small rss/swap delta).
-        let before = ResourceSnapshot { rss_mb: 500.0, cpu_pct: 80.0, swap_mb: 100.0 };
-        let after = ResourceSnapshot { rss_mb: 498.0, cpu_pct: 10.0, swap_mb: 99.0 };
+        let before = ResourceSnapshot {
+            rss_mb: 500.0,
+            cpu_pct: 80.0,
+            swap_mb: 100.0,
+        };
+        let after = ResourceSnapshot {
+            rss_mb: 498.0,
+            cpu_pct: 10.0,
+            swap_mb: 99.0,
+        };
         for i in 0..5u64 {
             g.record_action_with_resources("throttle:Cpu", 0.80, 100 + i * 10, before.clone());
             g.evaluate_with_resources(0.60, 100 + i * 10 + 3, &after);
@@ -1131,10 +1157,23 @@ mod tests {
         g.record_action("throttle:Cold", 0.80, 1000);
 
         let (rss, cpu, swap, unknown) = g.mechanism_breakdown();
-        assert_eq!(rss, 1, "expected 1 rss-dominant edge, breakdown={:?}", (rss, cpu, swap, unknown));
-        assert_eq!(cpu, 1, "expected 1 cpu-dominant edge, breakdown={:?}", (rss, cpu, swap, unknown));
+        assert_eq!(
+            rss,
+            1,
+            "expected 1 rss-dominant edge, breakdown={:?}",
+            (rss, cpu, swap, unknown)
+        );
+        assert_eq!(
+            cpu,
+            1,
+            "expected 1 cpu-dominant edge, breakdown={:?}",
+            (rss, cpu, swap, unknown)
+        );
         assert_eq!(swap, 0);
-        assert!(unknown >= 1, "cold edge with 0 observations must land in unknown bucket");
+        assert!(
+            unknown >= 1,
+            "cold edge with 0 observations must land in unknown bucket"
+        );
     }
 
     #[test]
@@ -1179,7 +1218,10 @@ mod tests {
             "Effective repeated action should produce solid causal edge for pressure_drop. \
              Edge count: {}, solid_edges: {:?}",
             g.edge_count(),
-            solid_edges.iter().map(|e| (&e.cause, &e.effect, e.confidence)).collect::<Vec<_>>()
+            solid_edges
+                .iter()
+                .map(|e| (&e.cause, &e.effect, e.confidence))
+                .collect::<Vec<_>>()
         );
 
         // Also verify the edge confidence is substantial

@@ -38,9 +38,9 @@ pub fn shadow_writes_failed() -> u64 {
     SHADOW_WRITES_FAILED.load(Ordering::Relaxed)
 }
 
+use crate::engine::audit_types::PolicyDecisionTrace;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use crate::engine::audit_types::PolicyDecisionTrace;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BlockerKind {
@@ -110,8 +110,8 @@ impl BlockedActionEvent {
 /// **Synchronous** — do NOT call from the daemon hot path. Use `emit_async` instead.
 /// This function remains for tests and offline tools.
 pub fn emit(path: &Path, event: &BlockedActionEvent) -> io::Result<()> {
-    let line = serde_json::to_string(event)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let line =
+        serde_json::to_string(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{}", line)
 }
@@ -163,10 +163,16 @@ fn writer_tx() -> &'static Sender<(PathBuf, String)> {
                     // succeeded/failed counters.
                     match OpenOptions::new().create(true).append(true).open(&path) {
                         Ok(mut f) => match writeln!(f, "{}", line) {
-                            Ok(()) => { SHADOW_WRITES_OK.fetch_add(1, Ordering::Relaxed); }
-                            Err(_) => { SHADOW_WRITES_FAILED.fetch_add(1, Ordering::Relaxed); }
+                            Ok(()) => {
+                                SHADOW_WRITES_OK.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                SHADOW_WRITES_FAILED.fetch_add(1, Ordering::Relaxed);
+                            }
                         },
-                        Err(_) => { SHADOW_WRITES_FAILED.fetch_add(1, Ordering::Relaxed); }
+                        Err(_) => {
+                            SHADOW_WRITES_FAILED.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             })
@@ -284,7 +290,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), 1, "async writer should have flushed exactly one line");
+        assert_eq!(
+            lines.len(),
+            1,
+            "async writer should have flushed exactly one line"
+        );
         let back: BlockedActionEvent =
             serde_json::from_str(lines[0]).expect("parses as BlockedActionEvent");
         assert_eq!(back.target_pid, Some(9999));
@@ -402,7 +412,12 @@ mod tests {
             .read_to_string(&mut contents)
             .expect("read");
         let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), 2, "expected 2 non-empty lines, got {}", lines.len());
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected 2 non-empty lines, got {}",
+            lines.len()
+        );
         for l in &lines {
             let _: BlockedActionEvent =
                 serde_json::from_str(l).expect("each line parses as BlockedActionEvent");

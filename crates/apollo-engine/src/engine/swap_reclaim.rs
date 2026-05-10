@@ -231,8 +231,7 @@ impl SwapReclaimModel {
     /// Ingest one cycle's VM flow rates and return a `SaturationForecast`.
     pub fn update(&mut self, sample: &VmFlowSample) -> SaturationForecast {
         // Convert page/sec → bytes/sec.
-        let dirty_bps =
-            sample.compressions_per_sec * PAGE_SIZE_BYTES as f64;
+        let dirty_bps = sample.compressions_per_sec * PAGE_SIZE_BYTES as f64;
         // reclaim = voluntary decompressions + forced purges.
         // swapouts are NOT counted as reclaim — they represent compressor
         // overflow spilling to disk, which is the emergency state we predict.
@@ -248,8 +247,8 @@ impl SwapReclaimModel {
             self.dirty_ema_bps = EMA_ALPHA * dirty_bps + (1.0 - EMA_ALPHA) * self.dirty_ema_bps;
             self.reclaim_ema_bps =
                 EMA_ALPHA * reclaim_bps + (1.0 - EMA_ALPHA) * self.reclaim_ema_bps;
-            self.swapout_ema_pps = EMA_ALPHA * sample.swapouts_per_sec
-                + (1.0 - EMA_ALPHA) * self.swapout_ema_pps;
+            self.swapout_ema_pps =
+                EMA_ALPHA * sample.swapouts_per_sec + (1.0 - EMA_ALPHA) * self.swapout_ema_pps;
         }
         self.samples = self.samples.saturating_add(1);
 
@@ -289,9 +288,7 @@ impl SwapReclaimModel {
             SwapRisk::Safe // draining or at rest
         } else {
             // T_sat = headroom / net_rate
-            let headroom = (swap_total as f64 * SWAP_CRITICAL_RATIO)
-                .max(0.0)
-                - swap_used as f64;
+            let headroom = (swap_total as f64 * SWAP_CRITICAL_RATIO).max(0.0) - swap_used as f64;
             let t_sat = headroom.max(0.0) / net_rate;
             if t_sat <= CRITICAL_ETA_SEC && has_io {
                 SwapRisk::Critical
@@ -305,8 +302,7 @@ impl SwapReclaimModel {
             && net_rate >= NET_RATE_FLOOR_BYTES_SEC
             && swap_ratio < SWAP_CRITICAL_RATIO
         {
-            let headroom =
-                (swap_total as f64 * SWAP_CRITICAL_RATIO) - swap_used as f64;
+            let headroom = (swap_total as f64 * SWAP_CRITICAL_RATIO) - swap_used as f64;
             Some((headroom.max(0.0) / net_rate).min(3600.0)) // cap at 1 hour
         } else {
             None
@@ -367,7 +363,14 @@ mod tests {
         }
     }
 
-    fn sample_io(comp: f64, decomp: f64, purge: f64, swapouts: f64, used: u64, total: u64) -> VmFlowSample {
+    fn sample_io(
+        comp: f64,
+        decomp: f64,
+        purge: f64,
+        swapouts: f64,
+        used: u64,
+        total: u64,
+    ) -> VmFlowSample {
         VmFlowSample {
             compressions_per_sec: comp,
             decompressions_per_sec: decomp,
@@ -421,8 +424,11 @@ mod tests {
         let mut m = SwapReclaimModel::new();
         let used = (gb(8) as f64 * 0.80) as u64;
         let f = m.update(&sample(10_000.0, 0.0, 0.0, used, gb(8)));
-        assert_eq!(f.risk, SwapRisk::Building,
-            "short T_sat without swapouts should be Building (sticky-swap false-alarm gate)");
+        assert_eq!(
+            f.risk,
+            SwapRisk::Building,
+            "short T_sat without swapouts should be Building (sticky-swap false-alarm gate)"
+        );
     }
 
     #[test]
@@ -441,8 +447,11 @@ mod tests {
         let mut m = SwapReclaimModel::new();
         let used = (gb(8) as f64 * 0.80) as u64;
         let f = m.update(&sample_io(10_000.0, 0.0, 0.0, 0.6, used, gb(8)));
-        assert_eq!(f.risk, SwapRisk::Critical,
-            "slow-boil 0.6 pps (> SWAPOUT_FLOOR_PPS=0.5) must escalate to Critical");
+        assert_eq!(
+            f.risk,
+            SwapRisk::Critical,
+            "slow-boil 0.6 pps (> SWAPOUT_FLOOR_PPS=0.5) must escalate to Critical"
+        );
     }
 
     #[test]
@@ -465,8 +474,12 @@ mod tests {
         // not an outlier filter for that magnitude).  Use a realistic 50× spike:
         // dirty_ema ≈ 1.8 MB/s, T_sat ≈ 5000 s → Building, not Critical.
         let f = m.update(&sample(500.0, 0.0, 0.0, gb(1), gb(8)));
-        assert_eq!(f.risk, SwapRisk::Building,
-            "moderate spike (50×) should be Building, not Critical — got {:?}", f.risk);
+        assert_eq!(
+            f.risk,
+            SwapRisk::Building,
+            "moderate spike (50×) should be Building, not Critical — got {:?}",
+            f.risk
+        );
     }
 
     #[test]
@@ -512,17 +525,26 @@ mod tests {
         // Cycle 1: enters Overflow → overflow_entered = true
         let f1 = m.update(&sample(0.0, 0.0, 0.0, over_used, gb(8)));
         assert_eq!(f1.risk, SwapRisk::Overflow);
-        assert!(f1.overflow_entered, "first overflow cycle must set overflow_entered");
+        assert!(
+            f1.overflow_entered,
+            "first overflow cycle must set overflow_entered"
+        );
         // Cycle 2: still Overflow → overflow_entered = false (already in overflow)
         let f2 = m.update(&sample(0.0, 0.0, 0.0, over_used, gb(8)));
         assert_eq!(f2.risk, SwapRisk::Overflow);
-        assert!(!f2.overflow_entered, "subsequent overflow cycles must NOT set overflow_entered");
+        assert!(
+            !f2.overflow_entered,
+            "subsequent overflow cycles must NOT set overflow_entered"
+        );
         // Drop back to Safe, then re-enter Overflow → overflow_entered = true again
         let safe_used = gb(1);
         let _fs = m.update(&sample(0.0, 0.0, 0.0, safe_used, gb(8)));
         let f3 = m.update(&sample(0.0, 0.0, 0.0, over_used, gb(8)));
         assert_eq!(f3.risk, SwapRisk::Overflow);
-        assert!(f3.overflow_entered, "re-entry into overflow must set overflow_entered again");
+        assert!(
+            f3.overflow_entered,
+            "re-entry into overflow must set overflow_entered again"
+        );
     }
 
     #[test]
@@ -544,7 +566,10 @@ mod tests {
     fn tsat_urgency_at_critical_eta_is_one() {
         use super::CyberPhysicalSignal;
         let u = super::TsatUrgency(Some(CRITICAL_ETA_SEC)).normalized();
-        assert!((u - 1.0).abs() < 1e-9, "t_sat == CRITICAL_ETA → urgency = 1.0, got {u}");
+        assert!(
+            (u - 1.0).abs() < 1e-9,
+            "t_sat == CRITICAL_ETA → urgency = 1.0, got {u}"
+        );
     }
 
     #[test]
@@ -572,7 +597,10 @@ mod tests {
     fn net_rate_norm_beyond_ceiling_clamped() {
         use super::CyberPhysicalSignal;
         let n = super::NetRateNorm(NET_RATE_CEILING_BPS * 10.0).normalized();
-        assert!((n - 1.0).abs() < 1e-9, "beyond ceiling → clamped 1.0, got {n}");
+        assert!(
+            (n - 1.0).abs() < 1e-9,
+            "beyond ceiling → clamped 1.0, got {n}"
+        );
     }
 
     // ── Volatility (σ) tests ────────────────────────────────────────────────
@@ -591,7 +619,10 @@ mod tests {
         let mut m = SwapReclaimModel::new();
         m.update(&sample(100.0, 50.0, 0.0, gb(1), gb(8))); // seed
         let f = m.update(&sample(200.0, 50.0, 0.0, gb(1), gb(8))); // step up
-        assert!(f.net_rate_volatility > 0.0, "σ must be positive after net_rate change");
+        assert!(
+            f.net_rate_volatility > 0.0,
+            "σ must be positive after net_rate change"
+        );
     }
 
     #[test]
@@ -611,7 +642,8 @@ mod tests {
         assert!(
             f_volatile.net_rate_volatility > f_stable.net_rate_volatility,
             "volatile signal (σ={:.0}) must exceed stable (σ={:.0})",
-            f_volatile.net_rate_volatility, f_stable.net_rate_volatility
+            f_volatile.net_rate_volatility,
+            f_stable.net_rate_volatility
         );
     }
 
@@ -631,6 +663,9 @@ mod tests {
         }
         let f = m.update(&sample(55.0, 50.0, 0.0, gb(3), gb(8)));
         // net_rate is small (near 0) but volatility is non-trivial.
-        assert!(f.net_rate_volatility > 0.0, "oscillating signal must have σ > 0");
+        assert!(
+            f.net_rate_volatility > 0.0,
+            "oscillating signal must have σ > 0"
+        );
     }
 }

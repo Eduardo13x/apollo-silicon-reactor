@@ -5,6 +5,7 @@ use chrono::Utc;
 
 use crate::engine::activity_sensor::pids_with_assertions;
 use crate::engine::amx_detector;
+use crate::engine::audit_types::{BlockReason, PolicyDecisionTrace};
 use crate::engine::io_tiering::{apply_io_tier, io_tier_for_throttle};
 use crate::engine::jetsam_control::{apply_apollo_policy, JetsamClass};
 use crate::engine::journal::append_journal_batch;
@@ -15,7 +16,6 @@ use crate::engine::safety::{
     allowlisted_sysctls, allowlisted_sysctls_with_ranges, classify_protection,
     infrastructure_processes, protected_processes, ProtectionLevel,
 };
-use crate::engine::audit_types::{BlockReason, PolicyDecisionTrace};
 use crate::engine::types::{CapabilityReport, JournalEntry, RootAction};
 
 /// Set the nice value for a process via `setpriority(2)`.
@@ -370,16 +370,32 @@ pub fn execute_actions(
         out.last_skip = None;
         let mut before = None;
         let mut after = None;
-        
+
         let decision_reason = match &action {
-            RootAction::BoostProcess { decision_reason, .. }
-            | RootAction::ThrottleProcess { decision_reason, .. }
-            | RootAction::FreezeProcess { decision_reason, .. }
-            | RootAction::UnfreezeProcess { decision_reason, .. }
-            | RootAction::SetMemorystatus { decision_reason, .. }
-            | RootAction::ToggleSpotlight { decision_reason, .. }
-            | RootAction::QuarantineDaemon { decision_reason, .. }
-            | RootAction::SetThreadQoS { decision_reason, .. } => decision_reason.clone(),
+            RootAction::BoostProcess {
+                decision_reason, ..
+            }
+            | RootAction::ThrottleProcess {
+                decision_reason, ..
+            }
+            | RootAction::FreezeProcess {
+                decision_reason, ..
+            }
+            | RootAction::UnfreezeProcess {
+                decision_reason, ..
+            }
+            | RootAction::SetMemorystatus {
+                decision_reason, ..
+            }
+            | RootAction::ToggleSpotlight {
+                decision_reason, ..
+            }
+            | RootAction::QuarantineDaemon {
+                decision_reason, ..
+            }
+            | RootAction::SetThreadQoS {
+                decision_reason, ..
+            } => decision_reason.clone(),
             RootAction::SetSysctl(s) => s.decision_reason().clone(),
         };
 
@@ -579,10 +595,7 @@ pub fn execute_actions(
                     // [Nygard 2018] load shedding overrides politeness under overload;
                     // [Camacho 2007] predictive bypass catches crises before thrashing.
                     let p_oom_30s = crate::engine::shadow_signals::get_p_oom_30s().unwrap_or(0.0);
-                    if memory_pressure < 0.70
-                        && thrashing_score < 10_000.0
-                        && p_oom_30s < 0.40
-                    {
+                    if memory_pressure < 0.70 && thrashing_score < 10_000.0 && p_oom_30s < 0.40 {
                         let busy = assertion_pids.get_or_insert_with(pids_with_assertions);
                         if busy.contains(pid) {
                             out.push_skip(format!("assertion-active:{}", name));
@@ -630,11 +643,8 @@ pub fn execute_actions(
                             frozen.insert(*pid);
                             out.freezes_applied += 1;
                             out.newly_frozen_pids.push(*pid);
-                            out.newly_frozen_identity.push((
-                                *pid,
-                                *start_sec,
-                                captured_priority,
-                            ));
+                            out.newly_frozen_identity
+                                .push((*pid, *start_sec, captured_priority));
                         }
                     }
                 }
@@ -782,10 +792,7 @@ pub fn execute_actions(
                             if ok {
                                 out.paging_hints_applied += 1;
                             } else {
-                                out.push_skip(format!(
-                                    "memorystatus-send-failed:pid={}",
-                                    *pid
-                                ));
+                                out.push_skip(format!("memorystatus-send-failed:pid={}", *pid));
                                 block_reason = Some(BlockReason::MemorystatusFailed);
                             }
                         }
@@ -849,11 +856,7 @@ pub fn execute_actions(
                             // tag=None or Some(0) → no hint; kernel default.
                             if let Some(tag) = affinity_tag {
                                 if *tag != 0 {
-                                    let _ = mgr.set_thread_affinity_tag(
-                                        *pid,
-                                        *thread_index,
-                                        *tag,
-                                    );
+                                    let _ = mgr.set_thread_affinity_tag(*pid, *thread_index, *tag);
                                 }
                             }
                         }
@@ -867,7 +870,7 @@ pub fn execute_actions(
         // records success=false with the skip reason (not the original
         // action reason). Without this, every skipped freeze/throttle logs
         let success = result.is_ok() && out.last_skip.is_none();
-        
+
         out.audit_traces.push(PolicyDecisionTrace {
             t: Utc::now(),
             cycle: 0, // Filled by caller
@@ -876,7 +879,8 @@ pub fn execute_actions(
             applied: success,
             block_reason,
             pressure: memory_pressure as f32,
-            swap_gb: (crate::engine::host_vm_info::get_swap_used_bytes() as f32 / (1024.0 * 1024.0 * 1024.0)),
+            swap_gb: (crate::engine::host_vm_info::get_swap_used_bytes() as f32
+                / (1024.0 * 1024.0 * 1024.0)),
             thrashing: thrashing_score as f32,
         });
 

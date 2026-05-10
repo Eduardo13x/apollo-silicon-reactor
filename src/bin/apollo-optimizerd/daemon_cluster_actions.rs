@@ -16,8 +16,8 @@
 use std::collections::HashSet;
 
 use apollo_engine::collector::SystemCollector;
-use apollo_engine::engine::types::RootAction;
 use apollo_engine::engine::audit_types::DecisionReason;
+use apollo_engine::engine::types::RootAction;
 
 pub struct ClusterActionsOutput {
     /// New throttle actions to append to the main actions vec.
@@ -68,9 +68,7 @@ pub fn run_cluster_actions(
             let partner = if a_acted { pa } else { pb };
             for (pid, proc) in collector.system().processes() {
                 let proc_name = proc.name().to_string();
-                if proc_name.contains(missing)
-                    && !actioned.iter().any(|n| n.contains(missing))
-                {
+                if proc_name.contains(missing) && !actioned.iter().any(|n| n.contains(missing)) {
                     new_actions.push(RootAction::throttle(
                         pid.as_u32(),
                         proc_name,

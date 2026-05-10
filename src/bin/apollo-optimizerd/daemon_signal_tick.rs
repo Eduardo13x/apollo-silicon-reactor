@@ -15,6 +15,7 @@
 //! [NLM warning: pass cycle_dt_secs as parameter — never recalculate it here
 //!  to avoid the mid-loop reset bug (dac6de9) that corrupted ODE models.]
 
+use apollo_engine::collector::SystemSnapshot;
 use apollo_engine::engine::daemon_helpers::audit_log;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::evolved_anomaly::EvolvedAnomalyDetector;
@@ -22,7 +23,6 @@ use apollo_engine::engine::fluidity::FluidityState;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::signal_intelligence::{SignalDigest, SignalIntelligence};
 use apollo_engine::engine::telemetry_logger::{TelemetryLogger, TelemetryVector};
-use apollo_engine::collector::SystemSnapshot;
 
 pub struct SignalTickOutput {
     pub signal_digest: SignalDigest,
@@ -82,8 +82,7 @@ pub fn run_signal_tick(
             .unwrap_or(("", 0));
         let total_used: u64 = snapshot.top_processes.iter().map(|p| p.memory_usage).sum();
         let swap_ratio = if snapshot.pressure.swap_total_bytes > 0 {
-            snapshot.pressure.swap_used_bytes as f64
-                / snapshot.pressure.swap_total_bytes as f64
+            snapshot.pressure.swap_used_bytes as f64 / snapshot.pressure.swap_total_bytes as f64
         } else {
             0.0
         };
@@ -174,8 +173,7 @@ pub fn run_signal_tick(
             active_proc_count: active_count,
             thermal_score,
         };
-        d.transformer_anomaly =
-            darwin_anomaly.score(tv.as_f32_slice(), d.pressure_smooth as f32);
+        d.transformer_anomaly = darwin_anomaly.score(tv.as_f32_slice(), d.pressure_smooth as f32);
         // Record to TelemetryLogger ring buffer. record() self-triggers disk dumps
         // (event-triggered at OOM/urgency/latency thresholds, periodic ~10 min).
         // [Welch 1967, Tuli et al. 2022]
@@ -196,8 +194,7 @@ pub fn run_signal_tick(
         d.window_op_active = fluidity_state.window_op_active();
         d.app_launching = fluidity_state.launch_active;
         if fluidity_state.fluidity_degraded {
-            let fluidity_urgency =
-                ((0.65 - fluidity_state.fluidity_ema as f64) * 0.4).max(0.0);
+            let fluidity_urgency = ((0.65 - fluidity_state.fluidity_ema as f64) * 0.4).max(0.0);
             d.urgency = (d.urgency + fluidity_urgency).min(1.0);
         }
         d

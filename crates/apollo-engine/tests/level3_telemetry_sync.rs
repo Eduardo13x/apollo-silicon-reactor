@@ -106,7 +106,8 @@ fn fase5_all_eleven_action_counters_reach_runtime_metrics() {
         .fetch_add(2, Ordering::Relaxed);
     lf.actions_pushed_unfreeze_total
         .fetch_add(3, Ordering::Relaxed);
-    lf.actions_pushed_boost_total.fetch_add(4, Ordering::Relaxed);
+    lf.actions_pushed_boost_total
+        .fetch_add(4, Ordering::Relaxed);
     lf.actions_pushed_set_memorystatus_total
         .fetch_add(5, Ordering::Relaxed);
     lf.actions_pushed_set_thread_qos_total

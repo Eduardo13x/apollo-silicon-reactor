@@ -239,7 +239,11 @@ impl UnfreezeDecayModel {
         // ground-truth lower bound [Denning 1968 — WSS is the only reliable
         // predictor of steady-state RAM demand].
         let wss_lower = wss_hint.unwrap_or(0);
-        entry.m_infinity = entry.m_infinity.max(m_inf_est).max(current_rss).max(wss_lower);
+        entry.m_infinity = entry
+            .m_infinity
+            .max(m_inf_est)
+            .max(current_rss)
+            .max(wss_lower);
         entry.last_updated_epoch_sec = now_epoch_sec;
 
         if dt > GC_TAU_MULTIPLIER * entry.tau_sec || dt > STALE_HARD_LIMIT_SEC {
@@ -455,7 +459,13 @@ mod tests {
         let predicted = model.predict_rss("bench", m_0, 15.0);
         let truth = curve(15.0);
         let err = (predicted as f64 - truth as f64).abs() / truth as f64;
-        assert!(err < 0.10, "predicted={} truth={} err={}", predicted, truth, err);
+        assert!(
+            err < 0.10,
+            "predicted={} truth={} err={}",
+            predicted,
+            truth,
+            err
+        );
     }
 
     #[test]

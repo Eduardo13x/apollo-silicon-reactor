@@ -278,11 +278,11 @@ impl CompetitionState {
     /// Human-readable action hint for the current stability regime.
     pub fn stability_action_hint(&self) -> &'static str {
         match self.stability_regime() {
-            StabilityRegime::StableSpiral   => "oscillating but self-regulating — watch",
-            StabilityRegime::StableNode     => "smooth convergence to coexistence — ok",
+            StabilityRegime::StableSpiral => "oscillating but self-regulating — watch",
+            StabilityRegime::StableNode => "smooth convergence to coexistence — ok",
             StabilityRegime::UnstableSaddle => "saddle: outcome depends on initial share — monitor",
-            StabilityRegime::Unstable       => "repellor: dominant will monopolize — intervene",
-            StabilityRegime::Degenerate     => "insufficient data",
+            StabilityRegime::Unstable => "repellor: dominant will monopolize — intervene",
+            StabilityRegime::Degenerate => "insufficient data",
         }
     }
 }

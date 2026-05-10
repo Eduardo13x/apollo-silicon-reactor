@@ -84,8 +84,11 @@ pub fn visible_pids() -> HashSet<u32> {
                 continue;
             }
             let mut pid_val: i64 = 0;
-            if CFNumberGetValue(pid_ref, CF_NUMBER_S_INT64, &mut pid_val as *mut _ as *mut c_void)
-                && pid_val > 0
+            if CFNumberGetValue(
+                pid_ref,
+                CF_NUMBER_S_INT64,
+                &mut pid_val as *mut _ as *mut c_void,
+            ) && pid_val > 0
                 && pid_val <= u32::MAX as i64
             {
                 out.insert(pid_val as u32);

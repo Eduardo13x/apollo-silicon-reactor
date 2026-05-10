@@ -5,11 +5,12 @@
 //! here reduces the line count in `main.rs` and provides a single place to track
 //! which subsystems exist.
 
+use crate::daemon_memory_budget::MemoryBudgetState;
 use apollo_engine::engine::action_queue::ActionQueue;
 use apollo_engine::engine::analytics::AnalyticsEngine;
 use apollo_engine::engine::causal_graph::CausalGraph;
 use apollo_engine::engine::coalition::CoalitionTracker;
-use apollo_engine::engine::daemon_helpers::{hop_groups_path, skills_path, recently_applied_path};
+use apollo_engine::engine::daemon_helpers::{hop_groups_path, recently_applied_path, skills_path};
 use apollo_engine::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_engine::engine::energy::EnergyTracker;
 use apollo_engine::engine::energy_pid::EnergyPidTracker;
@@ -26,14 +27,13 @@ use apollo_engine::engine::power_management::PowerManager;
 use apollo_engine::engine::predictive_agent::SpecialistAccuracyTracker;
 use apollo_engine::engine::process_recovery::ProcessRecoveryManager;
 use apollo_engine::engine::swap_predictor::SwapPredictor;
+use apollo_engine::engine::swap_reclaim::SwapReclaimModel;
 use apollo_engine::engine::syscall_classifier::SyscallClassifier;
 use apollo_engine::engine::thermal_bailout::ThermalBailout;
 use apollo_engine::engine::thermal_manager::ThermalManager;
 use apollo_engine::engine::thread_selfcounts::CycleIpcTracker;
-use apollo_engine::engine::swap_reclaim::SwapReclaimModel;
 use apollo_engine::engine::unfreeze_decay::UnfreezeDecayModel;
 use apollo_engine::engine::wake_storm_detector::WakeStormDetector;
-use crate::daemon_memory_budget::MemoryBudgetState;
 
 /// Subsystems constructed once at daemon startup with no shared-state dependencies.
 ///
@@ -121,9 +121,9 @@ impl DaemonSubsystems {
         let mut skill_registry = SkillRegistry::new();
         skill_registry.load(std::path::Path::new(skills_path()));
 
-        let (recently_applied_cache, restore_status) = 
+        let (recently_applied_cache, restore_status) =
             apollo_engine::engine::recently_applied::RecentlyApplied::load_from_disk(
-                std::path::Path::new(recently_applied_path())
+                std::path::Path::new(recently_applied_path()),
             );
 
         DaemonSubsystems {
@@ -167,7 +167,8 @@ impl DaemonSubsystems {
             ),
             recently_applied: recently_applied_cache,
             recently_applied_restore_status: restore_status,
-            identity_cache: apollo_engine::engine::identity_cache_manager::IdentityCacheManager::new(),
+            identity_cache:
+                apollo_engine::engine::identity_cache_manager::IdentityCacheManager::new(),
             maintenance_state: apollo_engine::engine::maintenance_state::MaintenanceState::new(),
         }
     }

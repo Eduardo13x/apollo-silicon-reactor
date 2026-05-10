@@ -237,22 +237,23 @@ fn truncate(s: &str, max: usize) -> String {
 /// the file is unreadable (e.g. running as non-root with 0o600 perms).
 fn read_last_suggestion_outcome(
 ) -> anyhow::Result<Option<apollo_engine::engine::llm::SuggestionOutcome>> {
-    let candidates = ["/var/lib/apollo/llm_state.json", "/tmp/apollo-llm_state.json"];
+    let candidates = [
+        "/var/lib/apollo/llm_state.json",
+        "/tmp/apollo-llm_state.json",
+    ];
     let mut last_err: Option<anyhow::Error> = None;
     for path in candidates {
         match fs::read_to_string(path) {
             Ok(raw) => {
                 let v: serde_json::Value = serde_json::from_str(&raw)
                     .with_context(|| format!("parse llm_state at {}", path))?;
-                let outcome = v
-                    .get("last_suggestion_outcome")
-                    .and_then(|x| {
-                        if x.is_null() {
-                            None
-                        } else {
-                            serde_json::from_value(x.clone()).ok()
-                        }
-                    });
+                let outcome = v.get("last_suggestion_outcome").and_then(|x| {
+                    if x.is_null() {
+                        None
+                    } else {
+                        serde_json::from_value(x.clone()).ok()
+                    }
+                });
                 return Ok(outcome);
             }
             Err(e) => {
@@ -286,9 +287,11 @@ fn read_top_causal_edges(
                 // Persisted shape: Vec<((cause, effect), CausalEdge)>.
                 // We only need the CausalEdge values — the inner struct already
                 // carries `cause` and `effect` fields.
-                let parsed: Vec<((String, String), apollo_engine::engine::causal_graph::CausalEdge)> =
-                    serde_json::from_value(edges_v.clone())
-                        .with_context(|| "deserialize causal_graph_edges")?;
+                let parsed: Vec<(
+                    (String, String),
+                    apollo_engine::engine::causal_graph::CausalEdge,
+                )> = serde_json::from_value(edges_v.clone())
+                    .with_context(|| "deserialize causal_graph_edges")?;
                 let mut edges: Vec<apollo_engine::engine::causal_graph::CausalEdge> =
                     parsed.into_iter().map(|(_, e)| e).collect();
                 edges.sort_by(|a, b| {
@@ -352,19 +355,38 @@ fn handle_teach_export() -> anyhow::Result<()> {
     }
     println!();
 
-    let mut scored: Vec<_> = policy.pattern_weights.iter()
+    let mut scored: Vec<_> = policy
+        .pattern_weights
+        .iter()
         .filter(|(_, w)| w.throttle_count >= 3)
         .collect();
     scored.sort_by(|a, b| b.1.throttle_count.cmp(&a.1.throttle_count));
-    
+
     if !scored.is_empty() {
         println!("## Causal Pattern Effectiveness (Bayesian, throttle_count >= 3)");
-        println!("(High effectiveness = process causes pressure. Low effectiveness = harmless noise.)");
-        println!("{:<30} {:>10} {:>14}", "Process", "Throttles", "Effectiveness");
+        println!(
+            "(High effectiveness = process causes pressure. Low effectiveness = harmless noise.)"
+        );
+        println!(
+            "{:<30} {:>10} {:>14}",
+            "Process", "Throttles", "Effectiveness"
+        );
         for (name, w) in scored.into_iter().take(20) {
             let eff = (w.effective_count as f64 + 1.0) / (w.throttle_count as f64 + 2.0);
-            let tag = if eff < 0.30 { " (HARMLESS)" } else if eff > 0.75 { " (CAUSAL)" } else { "" };
-            println!("{:<30} {:>10} {:>13.1}%{}", name, w.throttle_count, eff * 100.0, tag);
+            let tag = if eff < 0.30 {
+                " (HARMLESS)"
+            } else if eff > 0.75 {
+                " (CAUSAL)"
+            } else {
+                ""
+            };
+            println!(
+                "{:<30} {:>10} {:>13.1}%{}",
+                name,
+                w.throttle_count,
+                eff * 100.0,
+                tag
+            );
         }
         println!();
     }
@@ -429,12 +451,8 @@ fn handle_teach_export() -> anyhow::Result<()> {
     // Mirrors what the automatic LLM path feeds Gemma in TeacherContext:
     // pattern_weights filtered by throttle_count >= 3, sorted by effectiveness.
     println!("## Effectiveness Notes (Student's Notebook)");
-    println!(
-        "# Bayesian effectiveness from pattern_weights (filter: throttle_count >= 3)."
-    );
-    println!(
-        "# was_helpful = effectiveness > 0.5 — empirically validated classifications."
-    );
+    println!("# Bayesian effectiveness from pattern_weights (filter: throttle_count >= 3).");
+    println!("# was_helpful = effectiveness > 0.5 — empirically validated classifications.");
     let mut effectiveness_rows: Vec<(String, u32, f64)> = policy
         .pattern_weights
         .iter()
@@ -447,9 +465,7 @@ fn handle_teach_export() -> anyhow::Result<()> {
             .then(b.1.cmp(&a.1))
     });
     if effectiveness_rows.is_empty() {
-        println!(
-            "(no patterns yet — daemon needs at least 3 throttle observations per process)"
-        );
+        println!("(no patterns yet — daemon needs at least 3 throttle observations per process)");
     } else {
         println!(
             "{:<3} {:<40} {:>14} {:>14} {:>11}",
@@ -543,7 +559,9 @@ fn handle_teach_export() -> anyhow::Result<()> {
     println!("Determine which processes are genuinely interactive (user-facing apps,");
     println!("latency-sensitive audio/video/input) vs background daemons that just");
     println!("happen to run frequently alongside user activity (correlation != causation).");
-    println!("Pay special attention to Causal Pattern Effectiveness: if a process is HARMLESS (<30%),");
+    println!(
+        "Pay special attention to Causal Pattern Effectiveness: if a process is HARMLESS (<30%),"
+    );
     println!("it does NOT cause memory pressure and should be protected so Apollo stops trying to throttle it.");
     println!();
     println!("Output a JSON file with this exact structure:");
@@ -754,10 +772,13 @@ fn main() -> anyhow::Result<()> {
         }
         DaemonResponse::Health(h) => println!("{}", serde_json::to_string_pretty(&h)?),
         DaemonResponse::PurgeResult { fired, reason } => {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "fired": fired,
-                "reason": reason,
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "fired": fired,
+                    "reason": reason,
+                }))?
+            );
         }
         DaemonResponse::Error { message } => {
             anyhow::bail!(message);

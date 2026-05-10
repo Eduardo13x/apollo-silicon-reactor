@@ -158,8 +158,8 @@ mod tests {
         let mut state = MaintenanceState::default();
         let now = std::time::SystemTime::now();
         for i in 0..45 {
-            let t = now - std::time::Duration::from_secs(89)
-                + std::time::Duration::from_secs(i * 2);
+            let t =
+                now - std::time::Duration::from_secs(89) + std::time::Duration::from_secs(i * 2);
             state.swap_delta_window.push(t, 50_000.0);
         }
         state
@@ -212,8 +212,8 @@ mod tests {
 
         let now = std::time::SystemTime::now();
         for i in 0..45 {
-            let t = now - std::time::Duration::from_secs(89)
-                + std::time::Duration::from_secs(i * 2);
+            let t =
+                now - std::time::Duration::from_secs(89) + std::time::Duration::from_secs(i * 2);
             state.swap_delta_window.push(t, 50_000.0);
         }
         assert_ne!(
@@ -264,9 +264,8 @@ mod tests {
         let snap = synth_snap(0.70, 3_000_000_000, 4_000_000_000);
         let ctx = idle_ctx();
         let mut state = make_ready_state();
-        state.last_any_purge_at = Some(
-            std::time::SystemTime::now() - std::time::Duration::from_secs(100),
-        );
+        state.last_any_purge_at =
+            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(100));
         assert_eq!(
             should_fire(&snap, &ctx, &state, false),
             Some(SkipReason::RateLimit)

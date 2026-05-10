@@ -13,10 +13,10 @@ use apollo_engine::engine::action_policy::{
     ActionContext, PolicyScorer, PressureBenefitFeature, ProtectionFeature,
     UserDisruptionCostFeature,
 };
+use apollo_engine::engine::audit_types::DecisionReason;
 use apollo_engine::engine::policy_feature_predictive::PredictiveBenefitFeature;
 use apollo_engine::engine::safety::ProtectionLevel;
 use apollo_engine::engine::types::RootAction;
-use apollo_engine::engine::audit_types::DecisionReason;
 use apollo_engine::engine::user_context::UserContext;
 
 /// Construct the adversarial context: reactive signals all below bypass
@@ -58,7 +58,12 @@ fn full_scorer() -> PolicyScorer {
 }
 
 fn freeze_action(pid: u32) -> RootAction {
-    RootAction::freeze(pid, "heavy_bg_proc", "shadow-mode disobedience test", DecisionReason::PressureContext)
+    RootAction::freeze(
+        pid,
+        "heavy_bg_proc",
+        "shadow-mode disobedience test",
+        DecisionReason::PressureContext,
+    )
 }
 
 #[test]

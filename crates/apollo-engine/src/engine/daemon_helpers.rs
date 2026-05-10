@@ -455,14 +455,13 @@ pub fn load_wake_state(path: &Path) -> WakeRuntimeState {
 /// 200ms+ on a loaded SSD).  The snapshot (`FrozenStatePersisted`) is built
 /// cheaply under the caller's lock, then handed to a dedicated writer thread
 /// via mpsc.  Lock is released immediately after `send`.
-fn frozen_state_writer() -> &'static std::sync::mpsc::Sender<(std::path::PathBuf, FrozenStatePersisted)>
-{
+fn frozen_state_writer(
+) -> &'static std::sync::mpsc::Sender<(std::path::PathBuf, FrozenStatePersisted)> {
     use std::sync::OnceLock;
     static TX: OnceLock<std::sync::mpsc::Sender<(std::path::PathBuf, FrozenStatePersisted)>> =
         OnceLock::new();
     TX.get_or_init(|| {
-        let (tx, rx) =
-            std::sync::mpsc::channel::<(std::path::PathBuf, FrozenStatePersisted)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(std::path::PathBuf, FrozenStatePersisted)>();
         std::thread::Builder::new()
             .name("apollo-frozen-writer".to_string())
             .spawn(move || {

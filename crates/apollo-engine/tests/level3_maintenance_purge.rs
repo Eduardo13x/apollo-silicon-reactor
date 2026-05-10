@@ -72,7 +72,10 @@ fn maintenance_state_swap_floor_blocks_m1_cold_boot() {
     let swap_used: u64 = 500 * 1024 * 1024;
     let swap_floor = std::cmp::max(1_536u64 * 1024 * 1024, swap_total / 2);
     assert_eq!(swap_floor, 1_536 * 1024 * 1024);
-    assert!(swap_used < swap_floor, "M1 cold boot should not trigger maintenance");
+    assert!(
+        swap_used < swap_floor,
+        "M1 cold boot should not trigger maintenance"
+    );
 }
 
 #[test]
@@ -90,15 +93,16 @@ fn maintenance_window_requires_90s_sustained() {
     let mut w = SwapDeltaWindow::default();
     let now = std::time::SystemTime::now();
     for i in 0..30 {
-        let t = now - std::time::Duration::from_secs(60)
-            + std::time::Duration::from_secs(i * 2);
+        let t = now - std::time::Duration::from_secs(60) + std::time::Duration::from_secs(i * 2);
         w.push(t, 50_000.0);
     }
-    assert!(!w.sustained_below(256_000.0, 90), "60s history should fail 90s requirement");
+    assert!(
+        !w.sustained_below(256_000.0, 90),
+        "60s history should fail 90s requirement"
+    );
 
     for i in 0..15 {
-        let t = now - std::time::Duration::from_secs(30)
-            + std::time::Duration::from_secs(i * 2);
+        let t = now - std::time::Duration::from_secs(30) + std::time::Duration::from_secs(i * 2);
         w.push(t, 50_000.0);
     }
     assert!(w.sustained_below(256_000.0, 90), "90s history should pass");

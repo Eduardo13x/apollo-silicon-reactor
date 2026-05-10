@@ -788,10 +788,7 @@ mod tests {
         for n in [1u32, 3, 9, 19, 49, 99] {
             let c = TruthValue::confidence_from_count(n);
             let n_back = TruthValue::observations_to_reach(c);
-            assert!(
-                n_back <= n + 1,
-                "n={n} c={c:.4} n_back={n_back}"
-            );
+            assert!(n_back <= n + 1, "n={n} c={c:.4} n_back={n_back}");
         }
     }
 
@@ -800,7 +797,10 @@ mod tests {
         let n50 = TruthValue::observations_to_reach(0.50);
         let n75 = TruthValue::observations_to_reach(0.75);
         let n90 = TruthValue::observations_to_reach(0.90);
-        assert!(n50 < n75 && n75 < n90, "must be monotone: {n50} < {n75} < {n90}");
+        assert!(
+            n50 < n75 && n75 < n90,
+            "must be monotone: {n50} < {n75} < {n90}"
+        );
     }
 
     #[test]
@@ -1511,7 +1511,9 @@ mod tests {
         for _ in 0..20 {
             dd.observe("throttle:Safari", true);
         }
-        let belief = dd.belief("throttle:Safari").expect("belief must exist after 20 observations");
+        let belief = dd
+            .belief("throttle:Safari")
+            .expect("belief must exist after 20 observations");
         assert!(
             belief.confidence > 0.6,
             "After 20 stable observations, confidence should exceed 0.6, got {}",

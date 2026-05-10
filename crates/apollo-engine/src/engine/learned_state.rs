@@ -19,12 +19,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::engine::causal_graph::{CausalEdge, CausalGraph};
-use crate::engine::maintenance_state::MaintenanceState;
-use crate::engine::neuromodulator::NeuroState;
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
+use crate::engine::maintenance_state::MaintenanceState;
 use crate::engine::meta_cognition::MetaCognition;
 use crate::engine::nars_belief::ArousalState;
 use crate::engine::nested_learner::NestedLearner;
+use crate::engine::neuromodulator::NeuroState;
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
 use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
 use crate::engine::overflow_guard::OverflowHistory;
@@ -1133,9 +1133,7 @@ pub struct RestoreVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::outcome_tracker::{
-        ExperienceRecord, PatternWeight,
-    };
+    use crate::engine::outcome_tracker::{ExperienceRecord, PatternWeight};
     use std::collections::HashMap;
 
     fn make_ot_persisted() -> OutcomeTrackerPersisted {
@@ -1733,20 +1731,18 @@ mod tests {
         let et = EffectivenessTracker::new();
         let maint = MaintenanceState::default();
         let state = LearnedState::collect(
-            &si, &ot, &sa, &sr, &et, None, None, None, None, None, None, None,
-            &maint,
+            &si, &ot, &sa, &sr, &et, None, None, None, None, None, None, None, &maint,
         );
-        assert!(state.teacher_consolidator.is_none(),
-            "collect() leaves teacher_consolidator None; callers must patch post-persist");
+        assert!(
+            state.teacher_consolidator.is_none(),
+            "collect() leaves teacher_consolidator None; callers must patch post-persist"
+        );
     }
 
     #[test]
     fn patch_teacher_consolidator_roundtrip() {
         use crate::engine::teacher_consolidation::{SuggestionCategory, TeacherConsolidator};
-        let tmp = std::env::temp_dir().join(format!(
-            "apollo_tc_patch_{}.json",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("apollo_tc_patch_{}.json", std::process::id()));
         // Seed a minimal file so load() succeeds.
         let seed = LearnedState {
             version: 1,
@@ -1789,17 +1785,15 @@ mod tests {
         assert_eq!(loaded.gemma_trust.count(SuggestionCategory::Noise), 1);
         assert!(loaded.gemma_trust.trust(SuggestionCategory::Noise) > 0.5);
         // Untouched categories fall back to the neutral 0.5 default.
-        assert!(
-            (loaded.gemma_trust.trust(SuggestionCategory::Interactive) - 0.5).abs() < 1e-9
-        );
+        assert!((loaded.gemma_trust.trust(SuggestionCategory::Interactive) - 0.5).abs() < 1e-9);
 
         let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn load_teacher_consolidator_missing_file_returns_none() {
-        let tmp = std::env::temp_dir()
-            .join(format!("apollo_tc_missing_{}.json", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("apollo_tc_missing_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         assert!(LearnedState::load_teacher_consolidator(&tmp).is_none());
     }
@@ -1807,12 +1801,14 @@ mod tests {
     #[test]
     fn patch_teacher_consolidator_noop_when_file_missing() {
         use crate::engine::teacher_consolidation::TeacherConsolidator;
-        let tmp = std::env::temp_dir()
-            .join(format!("apollo_tc_noop_{}.json", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("apollo_tc_noop_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         // Must not panic, must not create the file.
         LearnedState::patch_teacher_consolidator(&tmp, TeacherConsolidator::new());
-        assert!(!tmp.exists(), "patch is no-op when the state file is absent");
+        assert!(
+            !tmp.exists(),
+            "patch is no-op when the state file is absent"
+        );
     }
 
     #[test]
@@ -1831,7 +1827,8 @@ mod tests {
     fn test_schema_version_default_is_zero() {
         // JSON with no `version` key represents a pre-versioning file.
         // `default_version()` must return 0 so `try_migrate` can upgrade it.
-        let state: LearnedState = serde_json::from_str("{}").expect("empty object must deserialize");
+        let state: LearnedState =
+            serde_json::from_str("{}").expect("empty object must deserialize");
         assert_eq!(
             state.version, 0,
             "missing version key must deserialize as 0 (pre-versioning baseline)"

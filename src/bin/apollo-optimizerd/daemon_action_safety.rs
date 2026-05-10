@@ -40,7 +40,9 @@ use chrono::Utc;
 
 use apollo_engine::engine::process_tree::ProcessTree;
 
-use crate::process_enrichment::{build_foreground_family, convert_and_merge_heuristic_decisions, HeuristicStats};
+use crate::process_enrichment::{
+    build_foreground_family, convert_and_merge_heuristic_decisions, HeuristicStats,
+};
 use apollo_engine::engine::recently_applied::RecentlyApplied;
 
 pub struct HeuristicPassOutput {
@@ -162,7 +164,12 @@ pub fn run_heuristic_pass(
             }
             if matches_dev_runtime(&name) {
                 let (cpu, wakeups, net, gui) = if let Some(s) = snap {
-                    (s.cpu_percent, s.wakeups_per_sec, s.has_network, s.has_gui_window)
+                    (
+                        s.cpu_percent,
+                        s.wakeups_per_sec,
+                        s.has_network,
+                        s.has_gui_window,
+                    )
                 } else {
                     (process.cpu_usage(), 0.0, false, false)
                 };
@@ -233,9 +240,11 @@ pub fn run_heuristic_pass(
         .into_iter()
         .filter(|a| {
             if let RootAction::ThrottleProcess { ref name, .. } = a {
-                if let Some((avg_drop, confidence)) =
-                    experience.query_similar_with_band(name, current_pressure, experience_pressure_band)
-                {
+                if let Some((avg_drop, confidence)) = experience.query_similar_with_band(
+                    name,
+                    current_pressure,
+                    experience_pressure_band,
+                ) {
                     if confidence >= 0.5 && avg_drop <= 0.0 {
                         return false;
                     }

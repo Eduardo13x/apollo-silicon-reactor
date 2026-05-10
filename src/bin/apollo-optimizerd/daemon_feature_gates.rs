@@ -55,9 +55,7 @@ use apollo_engine::engine::safety::{
     ProtectionLevel,
 };
 use apollo_engine::engine::thermal_bailout::{CoolingPhase, ThermalAction};
-use apollo_engine::engine::wake_storm_detector::{
-    StormSeverity, WakePattern, WakeStormDetector,
-};
+use apollo_engine::engine::wake_storm_detector::{StormSeverity, WakePattern, WakeStormDetector};
 
 /// Result of the Feature 1 per-cycle tick.
 pub struct LlmInferenceOutcome {

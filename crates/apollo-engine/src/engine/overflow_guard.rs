@@ -403,10 +403,7 @@ impl OverflowGuard {
 
     /// ¿Hay herramientas de compilación corriendo activamente?
     pub fn detect_build_mode(proc_names: &[&str]) -> bool {
-        let count = proc_names
-            .iter()
-            .filter(|n| is_build_tool_name(n))
-            .count();
+        let count = proc_names.iter().filter(|n| is_build_tool_name(n)).count();
         count >= 2
     }
 

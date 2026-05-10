@@ -688,8 +688,7 @@ impl PredictiveAgent {
         const EXPLORE_PERIOD: u64 = 20; // ~5% exploration rate
         if self.total_cycles > 0 && self.total_cycles % EXPLORE_PERIOD == 0 && K > 1 {
             // Rotate through arms 1..K-1 (never force arm 0 = Observe).
-            let forced_arm =
-                ((self.total_cycles / EXPLORE_PERIOD) % (K as u64 - 1)) as usize + 1;
+            let forced_arm = ((self.total_cycles / EXPLORE_PERIOD) % (K as u64 - 1)) as usize + 1;
             let intervention = Intervention::from_index(forced_arm);
             self.last_action = Some((intervention, ctx.features, ctx.features[0]));
             return (intervention, 0.0);

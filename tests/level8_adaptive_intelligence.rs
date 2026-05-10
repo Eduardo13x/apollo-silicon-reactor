@@ -9,9 +9,7 @@ use apollo_engine::engine::process_classifier::{
     ProcessClassifier, ProcessSnapshot, ProcessTier,
 };
 use apollo_engine::engine::user_profile::{UserProfile, WorkloadType};
-use apollo_engine::engine::zombie_hunter::{
-    HuntSnapshot, ZombieAction, ZombieClass, ZombieHunter,
-};
+use apollo_engine::engine::zombie_hunter::{HuntSnapshot, ZombieAction, ZombieClass, ZombieHunter};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 

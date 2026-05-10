@@ -15,16 +15,16 @@
 
 use std::path::Path;
 
+use apollo_engine::collector::SystemSnapshot;
 use apollo_engine::engine::daemon_helpers::write_frozen_state;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::display_turbo::DisplayTurbo;
+use apollo_engine::engine::identity_cache_manager::IdentityCacheManager;
 use apollo_engine::engine::kqueue_pressure;
 use apollo_engine::engine::learned_state::LearnableParams;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::overflow_guard::OverflowGuard;
 use apollo_engine::engine::signal_intelligence::SignalIntelligence;
-use apollo_engine::engine::identity_cache_manager::IdentityCacheManager;
-use apollo_engine::collector::SystemSnapshot;
 use std::time::{Duration, Instant};
 
 /// Drain kqueue events for this cycle and update reactor_weight.
@@ -99,8 +99,7 @@ pub fn run_kqueue_tick(
                         } else {
                             0.0
                         };
-                        let swap_growing =
-                            snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
+                        let swap_growing = snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
                         if sr > 0.10 && swap_growing {
                             signal_intel.record_overflow(
                                 snapshot.pressure.memory_pressure,

@@ -14,15 +14,15 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use apollo_engine::engine::adaptive_governor::{GovernorDecision, ProcessDecision};
-use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
+use apollo_engine::engine::audit_types::DecisionReason;
 use apollo_engine::engine::daemon_helpers::pid_start_time;
 use apollo_engine::engine::decide_actions::is_interactive_app_name;
 use apollo_engine::engine::proc_taskinfo;
 use apollo_engine::engine::process_classifier::{ProcessSnapshot, ProcessTier};
 use apollo_engine::engine::process_tree::ProcessTree;
+use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
 use apollo_engine::engine::safety::is_protected_name;
 use apollo_engine::engine::types::{InteractiveContext, RootAction, SafetyPolicy};
-use apollo_engine::engine::audit_types::DecisionReason;
 use apollo_engine::engine::zombie_hunter::HuntSnapshot;
 use sysinfo::ProcessStatus;
 
@@ -522,12 +522,8 @@ mod tests {
         let mut cache = RecentlyApplied::new();
         let critical = HashSet::new();
         let decisions = vec![make_decision(1234, "testproc", GovernorDecision::Throttle)];
-        let (actions, stats) = convert_and_merge_heuristic_decisions(
-            &decisions,
-            &[],
-            &critical,
-            &mut cache,
-        );
+        let (actions, stats) =
+            convert_and_merge_heuristic_decisions(&decisions, &[], &critical, &mut cache);
         assert_eq!(actions.len(), 1);
         assert_eq!(stats.throttles, 1);
         assert!(cache.is_recent(1234, CachedActionKind::Throttle));
@@ -541,21 +537,13 @@ mod tests {
         let decisions = vec![make_decision(1234, "testproc", GovernorDecision::Throttle)];
 
         // Cycle 1: first emission
-        let (actions1, _) = convert_and_merge_heuristic_decisions(
-            &decisions,
-            &[],
-            &critical,
-            &mut cache,
-        );
+        let (actions1, _) =
+            convert_and_merge_heuristic_decisions(&decisions, &[], &critical, &mut cache);
         assert_eq!(actions1.len(), 1);
 
         // Cycle 2: same decision must be SUPPRESSED (within 30s TTL).
-        let (actions2, stats2) = convert_and_merge_heuristic_decisions(
-            &decisions,
-            &[],
-            &critical,
-            &mut cache,
-        );
+        let (actions2, stats2) =
+            convert_and_merge_heuristic_decisions(&decisions, &[], &critical, &mut cache);
         assert_eq!(actions2.len(), 0, "duplicate within TTL must be suppressed");
         assert_eq!(stats2.throttles, 0);
     }
@@ -608,17 +596,26 @@ mod tests {
 
     #[test]
     fn context_to_thermal_constrained() {
-        assert_eq!(context_to_thermal(InteractiveContext::ThermalConstrained), "constrained");
+        assert_eq!(
+            context_to_thermal(InteractiveContext::ThermalConstrained),
+            "constrained"
+        );
     }
 
     #[test]
     fn context_to_thermal_background_pressure() {
-        assert_eq!(context_to_thermal(InteractiveContext::BackgroundPressure), "elevated");
+        assert_eq!(
+            context_to_thermal(InteractiveContext::BackgroundPressure),
+            "elevated"
+        );
     }
 
     #[test]
     fn context_to_thermal_interactive_focus() {
-        assert_eq!(context_to_thermal(InteractiveContext::InteractiveFocus), "nominal");
+        assert_eq!(
+            context_to_thermal(InteractiveContext::InteractiveFocus),
+            "nominal"
+        );
     }
 
     // ── build_foreground_family ───────────────────────────────────────────────
@@ -632,7 +629,11 @@ mod tests {
     #[test]
     fn foreground_family_root_only_no_children() {
         let entries = vec![ProcessEntry {
-            pid: 100, ppid: 1, name: "app".into(), cpu_usage: 0.0, memory_bytes: 0,
+            pid: 100,
+            ppid: 1,
+            name: "app".into(),
+            cpu_usage: 0.0,
+            memory_bytes: 0,
         }];
         let tree = ProcessTree::build(&entries);
         let result = build_foreground_family(Some(100), &tree);
@@ -642,15 +643,39 @@ mod tests {
     #[test]
     fn foreground_family_includes_children_excludes_unrelated() {
         let entries = vec![
-            ProcessEntry { pid: 100, ppid: 1,   name: "app".into(),    cpu_usage: 0.0, memory_bytes: 0 },
-            ProcessEntry { pid: 200, ppid: 100, name: "helper".into(), cpu_usage: 0.0, memory_bytes: 0 },
-            ProcessEntry { pid: 300, ppid: 1,   name: "other".into(),  cpu_usage: 0.0, memory_bytes: 0 },
+            ProcessEntry {
+                pid: 100,
+                ppid: 1,
+                name: "app".into(),
+                cpu_usage: 0.0,
+                memory_bytes: 0,
+            },
+            ProcessEntry {
+                pid: 200,
+                ppid: 100,
+                name: "helper".into(),
+                cpu_usage: 0.0,
+                memory_bytes: 0,
+            },
+            ProcessEntry {
+                pid: 300,
+                ppid: 1,
+                name: "other".into(),
+                cpu_usage: 0.0,
+                memory_bytes: 0,
+            },
         ];
         let tree = ProcessTree::build(&entries);
         let result = build_foreground_family(Some(100), &tree);
         assert!(result.contains(&100));
-        assert!(result.contains(&200), "child of foreground must be in family");
-        assert!(!result.contains(&300), "unrelated PID must not be in family");
+        assert!(
+            result.contains(&200),
+            "child of foreground must be in family"
+        );
+        assert!(
+            !result.contains(&300),
+            "unrelated PID must not be in family"
+        );
     }
 
     // ── apply_post_wake_grace_policy ──────────────────────────────────────────
@@ -658,16 +683,41 @@ mod tests {
     // category; grace_active is the toggle.
 
     fn freeze(pid: u32) -> RootAction {
-        RootAction::FreezeProcess { pid, name: "p".into(), reason: "r".into(), start_sec: 0, start_usec: 0, decision_reason: DecisionReason::PressureContext }
+        RootAction::FreezeProcess {
+            pid,
+            name: "p".into(),
+            reason: "r".into(),
+            start_sec: 0,
+            start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
+        }
     }
     fn throttle(pid: u32, aggressive: bool) -> RootAction {
-        RootAction::ThrottleProcess { pid, name: "p".into(), aggressive, reason: "r".into(), start_sec: 0, start_usec: 0, decision_reason: DecisionReason::PressureContext }
+        RootAction::ThrottleProcess {
+            pid,
+            name: "p".into(),
+            aggressive,
+            reason: "r".into(),
+            start_sec: 0,
+            start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
+        }
     }
     fn quarantine() -> RootAction {
-        RootAction::QuarantineDaemon { daemon: "d".into(), active: true, reason: "r".into(), decision_reason: DecisionReason::PressureContext }
+        RootAction::QuarantineDaemon {
+            daemon: "d".into(),
+            active: true,
+            reason: "r".into(),
+            decision_reason: DecisionReason::PressureContext,
+        }
     }
     fn boost(pid: u32) -> RootAction {
-        RootAction::BoostProcess { pid, name: "p".into(), reason: "r".into(), decision_reason: DecisionReason::PressureContext }
+        RootAction::BoostProcess {
+            pid,
+            name: "p".into(),
+            reason: "r".into(),
+            decision_reason: DecisionReason::PressureContext,
+        }
     }
 
     #[test]
@@ -695,7 +745,9 @@ mod tests {
         assert_eq!(ts, 1);
         assert_eq!(fs, 0);
         match &out[0] {
-            RootAction::ThrottleProcess { aggressive, .. } => assert!(!aggressive, "must be downgraded"),
+            RootAction::ThrottleProcess { aggressive, .. } => {
+                assert!(!aggressive, "must be downgraded")
+            }
             _ => panic!("expected ThrottleProcess"),
         }
     }

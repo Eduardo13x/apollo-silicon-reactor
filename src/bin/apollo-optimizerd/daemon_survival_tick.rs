@@ -24,8 +24,8 @@ use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
 use apollo_engine::engine::overflow_guard::OverflowGuard;
 use apollo_engine::engine::safety::{survival_mode_active_total, swap_exhaustion_threshold_bytes};
-use apollo_engine::engine::signal_intelligence::SignalIntelligence;
 use apollo_engine::engine::signal_intelligence::SignalDigest;
+use apollo_engine::engine::signal_intelligence::SignalIntelligence;
 
 /// Survival's own 10-min Instant cooldown — independent from
 /// maintenance_state.last_any_purge_at. This is the asymmetric design:
@@ -91,8 +91,7 @@ pub fn run_survival_tick(
             &learnable_params.rl_compressor_bands,
         );
         let sr = if snapshot.pressure.swap_total_bytes > 0 {
-            snapshot.pressure.swap_used_bytes as f64
-                / snapshot.pressure.swap_total_bytes as f64
+            snapshot.pressure.swap_used_bytes as f64 / snapshot.pressure.swap_total_bytes as f64
         } else {
             0.0
         };
@@ -124,7 +123,11 @@ pub fn run_survival_tick(
         snapshot.pressure.swap_total_bytes,
     );
     if survival_active {
-        state.metrics.lock_recover().metrics.survival_mode_entry_count += 1;
+        state
+            .metrics
+            .lock_recover()
+            .metrics
+            .survival_mode_entry_count += 1;
 
         // Jetsam demotion: mark non-foreground Chromium renderers as BACKGROUND
         // so the kernel kills them first under OOM — softer than SIGSTOP.

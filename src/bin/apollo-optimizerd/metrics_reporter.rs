@@ -508,7 +508,10 @@ mod tests {
         let d = decision(42, GovDecision::Allow, ProcessTier::ActiveForeground);
         // Even ActiveForeground gets demoted when thermal force_ecores fires
         // AND the pid is not in the foreground family.
-        assert_eq!(decide_qos_tier(&d, &fg, true), Some(SchedulingTier::Background));
+        assert_eq!(
+            decide_qos_tier(&d, &fg, true),
+            Some(SchedulingTier::Background)
+        );
     }
 
     #[test]
@@ -517,7 +520,10 @@ mod tests {
         fg.insert(42);
         let d = decision(42, GovDecision::Allow, ProcessTier::SilentDaemon);
         // Foreground family survives thermal demotion — UI responsiveness wins.
-        assert_eq!(decide_qos_tier(&d, &fg, true), Some(SchedulingTier::Foreground));
+        assert_eq!(
+            decide_qos_tier(&d, &fg, true),
+            Some(SchedulingTier::Foreground)
+        );
     }
 
     #[test]
@@ -527,14 +533,20 @@ mod tests {
         // Even Throttle (which would otherwise map to None) is ignored for
         // fg-family members; tree cascade promotes to Foreground.
         let d = decision(7, GovDecision::Throttle, ProcessTier::SilentDaemon);
-        assert_eq!(decide_qos_tier(&d, &fg, false), Some(SchedulingTier::Foreground));
+        assert_eq!(
+            decide_qos_tier(&d, &fg, false),
+            Some(SchedulingTier::Foreground)
+        );
     }
 
     #[test]
     fn allow_active_foreground_maps_to_foreground() {
         let fg: HashSet<u32> = HashSet::new();
         let d = decision(100, GovDecision::Allow, ProcessTier::ActiveForeground);
-        assert_eq!(decide_qos_tier(&d, &fg, false), Some(SchedulingTier::Foreground));
+        assert_eq!(
+            decide_qos_tier(&d, &fg, false),
+            Some(SchedulingTier::Foreground)
+        );
     }
 
     #[test]
@@ -561,8 +573,14 @@ mod tests {
     fn freeze_and_kill_route_to_background() {
         let fg: HashSet<u32> = HashSet::new();
         let d = decision(300, GovDecision::Freeze, ProcessTier::SilentDaemon);
-        assert_eq!(decide_qos_tier(&d, &fg, false), Some(SchedulingTier::Background));
+        assert_eq!(
+            decide_qos_tier(&d, &fg, false),
+            Some(SchedulingTier::Background)
+        );
         let d = decision(301, GovDecision::Kill, ProcessTier::SilentDaemon);
-        assert_eq!(decide_qos_tier(&d, &fg, false), Some(SchedulingTier::Background));
+        assert_eq!(
+            decide_qos_tier(&d, &fg, false),
+            Some(SchedulingTier::Background)
+        );
     }
 }

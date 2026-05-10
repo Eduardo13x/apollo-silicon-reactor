@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{Duration as ChronoDuration, Local, Timelike, Utc};
 
+use apollo_engine::engine::audit_types::DecisionReason;
 use apollo_engine::engine::daemon_helpers::pid_start_time;
 use apollo_engine::engine::llm::{
     append_jsonl, delete_file_best_effort, load_repo_config, write_json, LearnedPolicy, LlmAdvisor,
@@ -19,7 +20,6 @@ use apollo_engine::engine::llm::{
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::safety::pattern_conflicts_with_protected;
 use apollo_engine::engine::types::{HardPath, LlmRunMode, RootAction};
-use apollo_engine::engine::audit_types::DecisionReason;
 
 use super::SharedState;
 
@@ -1006,17 +1006,32 @@ pub fn apply_learned_policy_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apollo_engine::collector::{CpuStats, MemoryStats, PressureStats, ProcessStats, SystemSnapshot};
+    use apollo_engine::collector::{
+        CpuStats, MemoryStats, PressureStats, ProcessStats, SystemSnapshot,
+    };
 
     fn snapshot_with(processes: Vec<ProcessStats>) -> SystemSnapshot {
         SystemSnapshot {
             timestamp: chrono::Utc::now(),
-            cpu: CpuStats { global_usage: 0.0, core_count: 1 },
-            memory: MemoryStats { total_ram: 0, used_ram: 0, free_ram: 0, total_swap: 0, used_swap: 0 },
+            cpu: CpuStats {
+                global_usage: 0.0,
+                core_count: 1,
+            },
+            memory: MemoryStats {
+                total_ram: 0,
+                used_ram: 0,
+                free_ram: 0,
+                total_swap: 0,
+                used_swap: 0,
+            },
             pressure: PressureStats {
-                memory_pressure: 0.0, swap_used_bytes: 0, swap_total_bytes: 0,
-                swap_delta_bytes_per_sec: 0.0, thermal_level: "nominal".into(),
-                compressor_pressure: 0.0, thrashing_score: 0.0,
+                memory_pressure: 0.0,
+                swap_used_bytes: 0,
+                swap_total_bytes: 0,
+                swap_delta_bytes_per_sec: 0.0,
+                thermal_level: "nominal".into(),
+                compressor_pressure: 0.0,
+                thrashing_score: 0.0,
             },
             disks: vec![],
             networks: vec![],
@@ -1025,7 +1040,13 @@ mod tests {
     }
 
     fn proc(pid: u32, name: &str, cpu: f32) -> ProcessStats {
-        ProcessStats { pid, name: name.into(), cpu_usage: cpu, memory_usage: 0, cpu_wall_ratio: None }
+        ProcessStats {
+            pid,
+            name: name.into(),
+            cpu_usage: cpu,
+            memory_usage: 0,
+            cpu_wall_ratio: None,
+        }
     }
 
     fn policy(interactive: &[&str], noise: &[&str], protected: &[&str]) -> LearnedPolicy {
@@ -1132,7 +1153,10 @@ mod tests {
             decision_reason: DecisionReason::PressureContext,
         }];
         let result = apply_learned_policy_actions(&snap, &policy(&["Xcode"], &[], &[]), existing);
-        let boosts = result.iter().filter(|a| matches!(a, RootAction::BoostProcess { .. })).count();
+        let boosts = result
+            .iter()
+            .filter(|a| matches!(a, RootAction::BoostProcess { .. }))
+            .count();
         assert_eq!(boosts, 1, "must not duplicate existing boost");
     }
 }
