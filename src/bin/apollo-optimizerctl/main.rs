@@ -749,6 +749,12 @@ fn main() -> anyhow::Result<()> {
             let _ = fs::metadata("/tmp/apollo-optimizer.sock");
         }
         DaemonResponse::Health(h) => println!("{}", serde_json::to_string_pretty(&h)?),
+        DaemonResponse::PurgeResult { fired, reason } => {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "fired": fired,
+                "reason": reason,
+            }))?);
+        }
         DaemonResponse::Error { message } => {
             anyhow::bail!(message);
         }
