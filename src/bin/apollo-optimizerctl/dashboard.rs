@@ -1222,26 +1222,18 @@ fn render_sense_q(status: &DaemonStatus) -> Vec<String> {
         mp * 100.0
     ));
 
+    // Swap: bar normalized vs 8 GB headroom (M1 dynamic swap typical max),
+    // not vs swap_total which macOS resizes dynamically. Avoids alarming "80%"
+    // readings when the underlying file is small but auto-growing.
     let swap_gb = m.swap_used_bytes as f64 / 1_073_741_824.0;
-    let swap_total_gb = (m.swap_total_bytes as f64 / 1_073_741_824.0).max(0.1);
-    let swap_ratio = (swap_gb / swap_total_gb).clamp(0.0, 1.0);
-    let swap_emoji = if swap_ratio >= 0.85 {
-        "🔴"
-    } else if swap_ratio >= 0.50 {
-        "🟡"
-    } else {
-        "🟢"
-    };
+    let swap_visual_ratio = (swap_gb / 8.0).clamp(0.0, 1.0);
+    let swap_label = swap_status_label(swap_gb, m.swap_delta_bps);
     lines.push(format!(
-        "Swap   {} {:>3.0}% {}",
-        render_bar(swap_ratio, 8),
-        swap_ratio * 100.0,
-        swap_emoji
+        "Swap   {} {:.1}GB",
+        render_bar(swap_visual_ratio, 8),
+        swap_gb
     ));
-    lines.push(format!(
-        "       {:.1}/{:.1}GB",
-        swap_gb, swap_total_gb
-    ));
+    lines.push(format!("       {}", swap_label));
 
     lines.push(format!(
         "Temp   {} {}",
