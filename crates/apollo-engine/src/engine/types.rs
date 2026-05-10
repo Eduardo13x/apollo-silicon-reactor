@@ -1436,6 +1436,29 @@ pub struct RuntimeMetrics {
     pub metrics_lock_held_avg_us: f64,
     #[serde(default)]
     pub metrics_lock_held_max_us: u64,
+    /// Phase 0b cycle-stage split (NotebookLM priority #1, 2026-05-10).
+    /// Mean + max latency per stage in ms. Total of all 5 means ≈ avg
+    /// cycle latency. Identifies which stage dominates p95.
+    #[serde(default)]
+    pub stage_sense_avg_ms: f64,
+    #[serde(default)]
+    pub stage_sense_max_ms: f64,
+    #[serde(default)]
+    pub stage_reason_avg_ms: f64,
+    #[serde(default)]
+    pub stage_reason_max_ms: f64,
+    #[serde(default)]
+    pub stage_execute_avg_ms: f64,
+    #[serde(default)]
+    pub stage_execute_max_ms: f64,
+    #[serde(default)]
+    pub stage_learn_avg_ms: f64,
+    #[serde(default)]
+    pub stage_learn_max_ms: f64,
+    #[serde(default)]
+    pub stage_persist_avg_ms: f64,
+    #[serde(default)]
+    pub stage_persist_max_ms: f64,
     /// MetaCognition meta_confidence [0,1].
     #[serde(default)]
     pub meta_confidence: f32,

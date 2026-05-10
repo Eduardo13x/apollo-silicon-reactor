@@ -12,6 +12,20 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// ── Cycle-stage enum (Phase 0b 2026-05-10) ──────────────────────────────────
+
+/// Five-stage breakdown of the daemon main-loop cycle. Each stage is timed
+/// independently into `LockFreeMetrics::stage_*_total_ns/max_ns` so the
+/// dominant contributor to p95 latency can be measured, not guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleStage {
+    Sense,
+    Reason,
+    Execute,
+    Learn,
+    Persist,
+}
+
 // ── Lock-free metrics ────────────────────────────────────────────────────────
 
 /// Lock-free daemon metrics. Each field is an independent atomic counter.
@@ -137,6 +151,28 @@ pub struct LockFreeMetrics {
     pub metrics_lock_held_total_ns: AtomicU64,
     pub metrics_lock_held_count: AtomicU64,
     pub metrics_lock_held_max_ns: AtomicU64,
+
+    /// Phase 0b cycle-stage split (NotebookLM priority #1, 2026-05-10).
+    /// Bucket per-cycle latency by stage so the dominant contributor to
+    /// p95 is identified instead of guessed. Replaces the single
+    /// `cycle_time_us` measurement that hides where the work happens.
+    /// Stages map to main.rs cycle layout 1468→4803:
+    ///   sense   = pre-snapshot to collect_snapshot_*
+    ///   reason  = signal_intelligence + decide_actions + cognitive
+    ///   execute = run_dispatch_tick (filter + execute_actions)
+    ///   learn   = learning_tick (outcome resolution + persist)
+    ///   persist = enriched_telemetry + journal + condvar wait
+    pub stage_sense_total_ns: AtomicU64,
+    pub stage_sense_max_ns: AtomicU64,
+    pub stage_reason_total_ns: AtomicU64,
+    pub stage_reason_max_ns: AtomicU64,
+    pub stage_execute_total_ns: AtomicU64,
+    pub stage_execute_max_ns: AtomicU64,
+    pub stage_learn_total_ns: AtomicU64,
+    pub stage_learn_max_ns: AtomicU64,
+    pub stage_persist_total_ns: AtomicU64,
+    pub stage_persist_max_ns: AtomicU64,
+    pub stage_count: AtomicU64,
 }
 
 impl LockFreeMetrics {
@@ -202,7 +238,40 @@ impl LockFreeMetrics {
             metrics_lock_held_total_ns: AtomicU64::new(0),
             metrics_lock_held_count: AtomicU64::new(0),
             metrics_lock_held_max_ns: AtomicU64::new(0),
+            stage_sense_total_ns: AtomicU64::new(0),
+            stage_sense_max_ns: AtomicU64::new(0),
+            stage_reason_total_ns: AtomicU64::new(0),
+            stage_reason_max_ns: AtomicU64::new(0),
+            stage_execute_total_ns: AtomicU64::new(0),
+            stage_execute_max_ns: AtomicU64::new(0),
+            stage_learn_total_ns: AtomicU64::new(0),
+            stage_learn_max_ns: AtomicU64::new(0),
+            stage_persist_total_ns: AtomicU64::new(0),
+            stage_persist_max_ns: AtomicU64::new(0),
+            stage_count: AtomicU64::new(0),
         }
+    }
+
+    /// Record a per-cycle stage duration. Five callers per cycle.
+    #[inline(always)]
+    pub fn record_stage(&self, stage: CycleStage, ns: u64) {
+        let (total, max) = match stage {
+            CycleStage::Sense => (&self.stage_sense_total_ns, &self.stage_sense_max_ns),
+            CycleStage::Reason => (&self.stage_reason_total_ns, &self.stage_reason_max_ns),
+            CycleStage::Execute => (&self.stage_execute_total_ns, &self.stage_execute_max_ns),
+            CycleStage::Learn => (&self.stage_learn_total_ns, &self.stage_learn_max_ns),
+            CycleStage::Persist => (&self.stage_persist_total_ns, &self.stage_persist_max_ns),
+        };
+        total.fetch_add(ns, Ordering::Relaxed);
+        max.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    /// Increment the stage_count once per cycle (after all 5 stages
+    /// recorded). The count divides every stage_*_total_ns to compute
+    /// per-stage avg latency.
+    #[inline(always)]
+    pub fn finish_stage_cycle(&self) {
+        self.stage_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a metrics-lock acquisition + held duration.

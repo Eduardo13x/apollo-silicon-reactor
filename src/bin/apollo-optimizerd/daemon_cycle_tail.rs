@@ -216,6 +216,36 @@ pub fn wire_enriched_telemetry(
         0.0
     };
     m.metrics.metrics_lock_held_max_us = hm / 1000;
+    // Phase 0b stage split.
+    let sc = lf.stage_count.load(std::sync::atomic::Ordering::Relaxed);
+    let to_avg_ms = |total: u64| -> f64 {
+        if sc > 0 {
+            (total as f64 / sc as f64) / 1_000_000.0
+        } else {
+            0.0
+        }
+    };
+    let ns_to_ms = |ns: u64| -> f64 { ns as f64 / 1_000_000.0 };
+    m.metrics.stage_sense_avg_ms =
+        to_avg_ms(lf.stage_sense_total_ns.load(std::sync::atomic::Ordering::Relaxed));
+    m.metrics.stage_sense_max_ms =
+        ns_to_ms(lf.stage_sense_max_ns.load(std::sync::atomic::Ordering::Relaxed));
+    m.metrics.stage_reason_avg_ms =
+        to_avg_ms(lf.stage_reason_total_ns.load(std::sync::atomic::Ordering::Relaxed));
+    m.metrics.stage_reason_max_ms =
+        ns_to_ms(lf.stage_reason_max_ns.load(std::sync::atomic::Ordering::Relaxed));
+    m.metrics.stage_execute_avg_ms =
+        to_avg_ms(lf.stage_execute_total_ns.load(std::sync::atomic::Ordering::Relaxed));
+    m.metrics.stage_execute_max_ms =
+        ns_to_ms(lf.stage_execute_max_ns.load(std::sync::atomic::Ordering::Relaxed));
+    m.metrics.stage_learn_avg_ms =
+        to_avg_ms(lf.stage_learn_total_ns.load(std::sync::atomic::Ordering::Relaxed));
+    m.metrics.stage_learn_max_ms =
+        ns_to_ms(lf.stage_learn_max_ns.load(std::sync::atomic::Ordering::Relaxed));
+    m.metrics.stage_persist_avg_ms =
+        to_avg_ms(lf.stage_persist_total_ns.load(std::sync::atomic::Ordering::Relaxed));
+    m.metrics.stage_persist_max_ms =
+        ns_to_ms(lf.stage_persist_max_ns.load(std::sync::atomic::Ordering::Relaxed));
     m.metrics.meta_confidence = inputs.cognitive_state.meta_cognition.meta_confidence;
     m.metrics.humble_mode = inputs.cog_decision.humble_mode;
     m.metrics.adversarial_pass_rate =

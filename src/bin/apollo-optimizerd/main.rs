@@ -1466,6 +1466,7 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 let cycle_start = Instant::now();
+                let _t_sense_start = cycle_start;
 
                 // ── Dry-run ultra-fast-path ───────────────────────────────────
                 // Moved BEFORE snapshot collection: snapshot is only used in the
@@ -1631,6 +1632,12 @@ fn main() -> anyhow::Result<()> {
                     collector.collect_snapshot()
                 };
                 lf_metrics.set_refresh_duration_us(refresh_duration.as_micros() as u64);
+                // Phase 0b stage timing: sense complete, reason starts.
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::Sense,
+                    _t_sense_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                let _t_reason_start = Instant::now();
                 // Overlay pressure data from background PressureCollector cache
                 // when it's fresh (< 10s old), avoiding blocking subprocesses on hot path.
                 {
@@ -4278,6 +4285,10 @@ fn main() -> anyhow::Result<()> {
                         }
                     })
                     .collect();
+                // Phase 0b: hoist execute-start outside the block scope so it
+                // remains visible after the inner block closes (where the
+                // record_stage call lives).
+                let _t_execute_start_outer;
                 let (exec_outcomes, causal_qos_upgrades) = {
                     use daemon_dispatch_tick::{run_dispatch_tick, DispatchTickInput};
                     // Build the coalition guard: tracker + envelope are owned
@@ -4287,6 +4298,12 @@ fn main() -> anyhow::Result<()> {
                         &coalition_tracker,
                         &active_coalitions,
                     );
+                    // Phase 0b stage timing: reason complete, execute starts.
+                    lf_metrics.record_stage(
+                        apollo_engine::engine::lse_counters::CycleStage::Reason,
+                        _t_reason_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    );
+                    _t_execute_start_outer = Instant::now();
                     let output = run_dispatch_tick(DispatchTickInput {
                         state: &state,
                         caps: &caps,
@@ -4485,6 +4502,13 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // Phase 0b stage timing: execute complete, learn starts.
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::Execute,
+                    _t_execute_start_outer.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                let _t_learn_start = Instant::now();
+
                 // Learning tick: outcome tracking, causal graph, RL cables, predictive
                 // agent, and periodic persist (every 100 cycles). Extracted to
                 // learning_tick.rs for readability; behaviour is unchanged.
@@ -4661,6 +4685,13 @@ fn main() -> anyhow::Result<()> {
                     sleep_notifier.is_sleeping(),
                 );
 
+                // Phase 0b stage timing: learn complete, persist starts.
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::Learn,
+                    _t_learn_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                let _t_persist_start = Instant::now();
+
                 // ── Enriched telemetry + UCHS neurocognitive metrics ────────────────────
                 // Extracted to daemon_cycle_tail::wire_enriched_telemetry (Wave 10).
                 // Combines the two original blocks under a single state.metrics lock guard.
@@ -4801,6 +4832,12 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or(false);
                 last_cycle_end = Instant::now();
                 lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
+                // Phase 0b stage timing: persist complete, cycle done.
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::Persist,
+                    _t_persist_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                lf_metrics.finish_stage_cycle();
                 lf_metrics.commit();
 
                 // ── recently_applied cache cleanup (SuperPlan iter 3) ──────────
