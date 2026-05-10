@@ -1480,6 +1480,23 @@ pub struct RuntimeMetrics {
     pub ais_adaptability: f64,
     #[serde(default)]
     pub ais_pareto_balanced: bool,
+
+    /// Maintenance Purge Gate telemetry (Sprint 5 Mes 0 — 2026-05-10).
+    /// Flushed from lf_metrics each cycle via sync_from_lockfree.
+    #[serde(default)]
+    pub maintenance_purge_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_pressure_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_swap_floor_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_growing_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_idle_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_build_mode_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_rate_limit_total: u64,
 }
 
 impl RuntimeMetrics {
