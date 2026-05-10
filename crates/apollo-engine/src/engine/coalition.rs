@@ -42,11 +42,27 @@ const COALITION_TYPE_RESOURCE: usize = 0;
 const COALITION_TYPE_JETSAM: usize = 1;
 
 /// proc_pidcoalitioninfo layout (XNU ABI).
-/// Contains two coalition IDs: [RESOURCE, JETSAM].
+///
+/// Historical (pre-macOS 26 Tahoe): 16 bytes — `coalition_id: [u64; 2]`.
+/// macOS 26+ (build 25E*): kernel rejects buffer < 40 bytes; the struct now
+/// carries coalition_id [4] + coalition_type [4] + coalition_role [4] for
+/// the four coalition kinds (RESOURCE, JETSAM, plus two reserved). Empirically
+/// verified via direct `proc_pidinfo(pid, 20, &buf, N)` probe on macOS 26.4.1
+/// (build 25E253): N=16/24/32 returns ret=0 (silent fail); N≥40 returns
+/// ret=40 with valid `coalition_id[0]` (resource coalition).
+///
+/// Old 16-byte struct silently zeroed every coalition_id on macOS 26 — Apollo
+/// thought every PID belonged to "kernel coalition 0", so the
+/// ActiveCoalitionEnvelope (Sprint Coalition 2026-05-10) never recorded
+/// anything and the guard NEVER fired in production. Diagnosed 2026-05-10
+/// from runtime_metrics `active_coalitions_count = 0` despite valid foreground
+/// detection. The `[u64; 4]` extension matches what XNU writes today.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 struct ProcPidCoalitionInfo {
-    coalition_id: [u64; 2],
+    coalition_id: [u64; 4],
+    coalition_type: [u32; 4],
+    coalition_role: [u32; 4],
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -126,6 +142,15 @@ impl CoalitionTracker {
     /// Get the resource coalition ID for a PID.
     ///
     /// Returns 0 (kernel coalition) if proc_pidinfo fails.
+    ///
+    /// macOS 26 (Tahoe) ABI note: kernel returns exactly 40 bytes for this
+    /// flavor regardless of the buffer size we pass (must be ≥40 or kernel
+    /// returns 0 silently). Our struct is 64 bytes (defensive — covers any
+    /// future ABI growth) but the validity check is `ret >= 40` (the actual
+    /// kernel-written size) rather than `ret >= sizeof(struct)`. The first
+    /// 32 bytes (`coalition_id[0..4]`) are guaranteed populated when ret=40,
+    /// and `coalition_id[COALITION_TYPE_RESOURCE]` lives at index 0.
+    const MIN_KERNEL_REPLY_BYTES: libc::c_int = 40;
     pub fn get_coalition_id(&self, pid: u32) -> u64 {
         #[cfg(target_os = "macos")]
         {
@@ -139,7 +164,7 @@ impl CoalitionTracker {
                     std::mem::size_of::<ProcPidCoalitionInfo>() as libc::c_int,
                 )
             };
-            if ret >= std::mem::size_of::<ProcPidCoalitionInfo>() as libc::c_int {
+            if ret >= Self::MIN_KERNEL_REPLY_BYTES {
                 info.coalition_id[COALITION_TYPE_RESOURCE]
             } else {
                 0 // kernel coalition
@@ -337,9 +362,16 @@ mod tests {
     }
 
     #[test]
-    fn proc_pid_coalition_info_size_is_sixteen_bytes() {
-        // XNU ABI: struct contains two u64 fields → 16 bytes.
-        assert_eq!(std::mem::size_of::<ProcPidCoalitionInfo>(), 16);
+    fn proc_pid_coalition_info_size_meets_macos26_minimum() {
+        // macOS 26 (Tahoe) requires the proc_pidinfo buffer to be ≥40 bytes
+        // for PROC_PIDCOALITIONINFO; below that the kernel silently returns
+        // ret=0 and the struct stays zeroed. Our struct must be at least 40
+        // bytes (we picked 64 for defensive headroom).
+        assert!(
+            std::mem::size_of::<ProcPidCoalitionInfo>() >= 40,
+            "ProcPidCoalitionInfo must be ≥40 bytes for macOS 26 ABI; got {}",
+            std::mem::size_of::<ProcPidCoalitionInfo>()
+        );
     }
 
     #[test]
