@@ -17,6 +17,7 @@ use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::decide_actions::is_interactive_app_name;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::predictive_agent::Intervention;
+use apollo_engine::engine::safety::is_protected_name;
 use apollo_engine::engine::types::RootAction;
 use apollo_engine::engine::user_context::UserContext;
 
@@ -98,7 +99,15 @@ pub fn run_agent_actions(
             let mut bg_procs: Vec<_> = top_processes
                 .iter()
                 .filter(|p| {
+                    // OS-essential guard: WindowServer / coreaudiod / launchd /
+                    // loginwindow / configd live in safety::is_protected_name and
+                    // are not user-interactive apps, so the INTERACTIVE_APPS list
+                    // never matched them. Without this guard a high-RSS system
+                    // process (observed: pid 422 WindowServer) ended up as a
+                    // top-3 victim and received memorystatus_vm_pressure_send,
+                    // forcing graphics-cache eviction and visible UI stutter.
                     p.pid != daemon_pid
+                        && !is_protected_name(&p.name)
                         && !is_interactive_app_name(&p.name)
                         && !decide_interactive
                             .iter()
