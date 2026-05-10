@@ -30,6 +30,7 @@ mod daemon_cognitive_tick;
 mod daemon_dispatch_tick;
 mod daemon_ctx_switch_tick;
 mod daemon_holt_winters_tick;
+mod daemon_maintenance_tick;
 mod daemon_markov_tick;
 mod daemon_memory_budget;
 mod daemon_proc_scan_tick;
