@@ -102,7 +102,7 @@ pub fn read_iopm_state() -> Option<IoPmSnapshot> {
     const K_IO_MAIN_PORT_DEFAULT: u32 = 0;
 
     unsafe {
-        let matching = IOServiceMatching(b"IOPMrootDomain\0".as_ptr() as *const i8);
+        let matching = IOServiceMatching(c"IOPMrootDomain".as_ptr());
         if matching.is_null() {
             return None;
         }

@@ -274,7 +274,7 @@ pub fn get_swap_used_bytes() -> u64 {
     let mut len = std::mem::size_of_val(&xsw);
     let rc = unsafe {
         libc::sysctlbyname(
-            "vm.swapusage\0".as_ptr() as *const libc::c_char,
+            c"vm.swapusage".as_ptr(),
             xsw.as_mut_ptr() as *mut libc::c_void,
             &mut len,
             std::ptr::null_mut(),
@@ -294,7 +294,7 @@ pub fn get_swap_total_bytes() -> u64 {
     let mut len = std::mem::size_of_val(&xsw);
     let rc = unsafe {
         libc::sysctlbyname(
-            "vm.swapusage\0".as_ptr() as *const libc::c_char,
+            c"vm.swapusage".as_ptr(),
             xsw.as_mut_ptr() as *mut libc::c_void,
             &mut len,
             std::ptr::null_mut(),

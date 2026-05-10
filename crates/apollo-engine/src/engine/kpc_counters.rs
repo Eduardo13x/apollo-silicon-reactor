@@ -127,7 +127,7 @@ impl KpcReader {
         {
             let handle = unsafe {
                 libc::dlopen(
-                    b"/usr/lib/libkpc.dylib\0".as_ptr() as *const i8,
+                    c"/usr/lib/libkpc.dylib".as_ptr(),
                     libc::RTLD_LAZY,
                 )
             };
