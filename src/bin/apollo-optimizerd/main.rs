@@ -1571,7 +1571,7 @@ fn main() -> anyhow::Result<()> {
                 // Sleep/wake detection + post-wake grace window.
                 // Extracted to daemon_wake_handler::run_wake_tick().
                 // [Nygard 2018] bulkhead: staggered SIGCONT avoids 1-3GB decompression spike.
-                let grace_active = daemon_wake_handler::run_wake_tick(
+                let (grace_active, wake_just_detected) = daemon_wake_handler::run_wake_tick(
                     &state,
                     &mut signal_intel,
                     &mut outcome_tracker,
@@ -1579,6 +1579,9 @@ fn main() -> anyhow::Result<()> {
                     &mut display_turbo,
                     &wake_state_path,
                 );
+                if wake_just_detected {
+                    maintenance_state.observe_wake();
+                }
 
                 // Display-Off Turbo: Android Doze-like power management.
                 // Extracted to daemon_turbo_manager::run_turbo_tick().
