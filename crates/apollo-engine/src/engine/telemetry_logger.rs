@@ -197,7 +197,7 @@ impl TelemetryLogger {
             DumpKind::Urgency
         } else if vec.latency_score > 0.7 && event_cooldown_ok {
             DumpKind::Latency
-        } else if self.cycle_count % PERIODIC_INTERVAL == 0 {
+        } else if self.cycle_count.is_multiple_of(PERIODIC_INTERVAL) {
             DumpKind::Periodic
         } else {
             return None;

@@ -705,7 +705,7 @@ impl EvolvedAnomalyDetector {
         }
 
         // 7. Evolution step (Darwinian selection with MAP-Elites speciation).
-        if self.sample_count % EVOLVE_INTERVAL == 0 {
+        if self.sample_count.is_multiple_of(EVOLVE_INTERVAL) {
             self.evolve();
         }
 

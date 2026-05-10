@@ -59,7 +59,7 @@ pub fn maybe_reload_llm_config(
     reloader: &mut LlmConfigReloader,
     current: &LlmConfig,
 ) -> Option<ReloadOutcome> {
-    if cycle_count % CONFIG_RELOAD_GATE_CYCLES != 0 {
+    if !cycle_count.is_multiple_of(CONFIG_RELOAD_GATE_CYCLES) {
         return None;
     }
     Some(reloader.tick(current))
@@ -141,14 +141,14 @@ pub fn run_periodic(ctx: &mut PeriodicContext<'_, '_>) -> PeriodicResult {
     // ── Every 100 cycles: observability snapshot ─────────────────────────────
     // Full persist (signal_intel, LearnedState, skills) remains inline because
     // it requires learning_pipeline and effectiveness_tracker from the binary.
-    if ctx.cycle_count % 100 == 0 {
+    if ctx.cycle_count.is_multiple_of(100) {
         result.did_persist = true;
         result.causal_solid_edges = Some(ctx.lctx.causal_graph.solid_count());
         result.induced_skills = Some(0); // rule induction stays inline (needs SharedState)
     }
 
     // ── Every 500 cycles: GC and compression ─────────────────────────────────
-    if ctx.cycle_count % 500 == 0 {
+    if ctx.cycle_count.is_multiple_of(500) {
         // Compress old experience records to save memory (Hermes pattern).
         ctx.lctx.outcome_tracker.experience.compress_old();
         // Prune low-signal Bayesian weight entries (BUG-04).
@@ -163,7 +163,7 @@ pub fn run_periodic(ctx: &mut PeriodicContext<'_, '_>) -> PeriodicResult {
     // ── Every 7200 cycles (~2 hours): hourly housekeeping ────────────────────
     // cache_warmer.gc(), io_shaper.gc(), temporal_predictor.persist() remain
     // inline: they are binary-local types that cannot be imported here.
-    if ctx.cycle_count % 7200 == 0 {
+    if ctx.cycle_count.is_multiple_of(7200) {
         result.did_hourly = true;
     }
 

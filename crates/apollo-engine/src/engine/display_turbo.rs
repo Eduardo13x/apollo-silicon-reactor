@@ -103,7 +103,7 @@ fn is_display_on() -> bool {
         const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
 
         unsafe {
-            let matching = IOServiceMatching(b"IODisplayWrangler\0".as_ptr() as *const i8);
+            let matching = IOServiceMatching(c"IODisplayWrangler".as_ptr());
             if matching.is_null() {
                 return true;
             }
@@ -115,7 +115,7 @@ fn is_display_on() -> bool {
 
             let key = CFStringCreateWithCString(
                 std::ptr::null(),
-                b"DevicePowerState\0".as_ptr() as *const i8,
+                c"DevicePowerState".as_ptr(),
                 K_CF_STRING_ENCODING_UTF8,
             );
             if key.is_null() {

@@ -389,10 +389,10 @@ fn mv8_mat_inv(m: &[f64; 64]) -> Option<[f64; 64]> {
 /// F = I + kinematic and cross-signal coupling terms.
 fn mv8_build_f(dt: f64) -> [f64; 64] {
     let mut f = mv8_identity();
-    f[0 * MV8_D + 1] = dt; // pressure_smooth += velocity * dt
-    f[1 * MV8_D + 2] = MV8_ALPHA; // swap_norm → pressure_velocity
-    f[1 * MV8_D + 3] = MV8_BETA; // thrashing_norm → pressure_velocity
-    f[4 * MV8_D + 5] = MV8_GAMMA; // t_sat_urgency → ode_net_rate
+    f[1] = dt; // [0,1] pressure_smooth += velocity * dt
+    f[MV8_D + 2] = MV8_ALPHA; // [1,2] swap_norm → pressure_velocity
+    f[MV8_D + 3] = MV8_BETA; // [1,3] thrashing_norm → pressure_velocity
+    f[4 * MV8_D + 5] = MV8_GAMMA; // [4,5] t_sat_urgency → ode_net_rate
     f
 }
 
@@ -566,7 +566,7 @@ impl KalmanMV8 {
 
     /// P[1,1]: velocity dimension variance. Gate criterion for D-term switch.
     pub fn velocity_variance(&self) -> f64 {
-        self.p[1 * MV8_D + 1]
+        self.p[MV8_D + 1]
     }
 
     /// True when warmup ≥ 50 cycles AND Tr(P)/D < 0.10.
