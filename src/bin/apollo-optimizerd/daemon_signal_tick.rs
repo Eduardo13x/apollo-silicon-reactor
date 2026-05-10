@@ -104,6 +104,29 @@ pub fn run_signal_tick(
                 .likely_workload_at_hour(hour_of_day);
             signal_intel.adjust_bias_for_workload(wl);
         }
+        // UserProfile hygiene — once per ~hour (720 cycles ≈ 60 min @ 5s/cycle).
+        // Apps idle >30d decay (total_foreground_secs *= 0.5); idle >90d evict
+        // unless their lifetime usage is high (>50h grace window). Keeps
+        // process_relevance reflecting current habits and prevents the model
+        // from protecting ghosts of uninstalled apps.
+        if cycle_count.is_multiple_of(720) {
+            const DECAY_AFTER_SECS: u64 = 30 * 86_400; // 30 days
+            const EVICT_AFTER_SECS: u64 = 90 * 86_400; // 90 days
+            const DECAY_FACTOR: f32 = 0.5;
+            const HIGH_USAGE_GRACE_SECS: u64 = 50 * 3_600; // 50 hours lifetime
+            let evicted = state.policy.lock_recover().adaptive_governor.user_profile.prune_stale(
+                DECAY_AFTER_SECS,
+                EVICT_AFTER_SECS,
+                DECAY_FACTOR,
+                HIGH_USAGE_GRACE_SECS,
+            );
+            if evicted > 0 {
+                audit_log(&serde_json::json!({
+                    "event": "user_profile_prune",
+                    "evicted": evicted,
+                }));
+            }
+        }
         signal_intel.tick(
             snapshot.pressure.memory_pressure,
             snapshot.pressure.swap_delta_bytes_per_sec,

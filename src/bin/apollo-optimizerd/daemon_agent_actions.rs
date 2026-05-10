@@ -90,12 +90,23 @@ pub fn run_agent_actions(
             }
             // Send paging hints to top 3 background processes by RSS.
             // SetMemorystatus priority -1 = voluntary cache release — no freeze, no kill.
-            let protected_pats = state
-                .policy
-                .lock_recover()
-                .learned_policy
-                .protected_patterns
-                .clone();
+            //
+            // Lock policy once and run the entire filter inside the guard so
+            // process_relevance(name) can be queried without per-iteration
+            // re-locking. top_processes is bounded (~50), so the critical
+            // section stays short.
+            let policy = state.policy.lock_recover();
+            let protected_pats = &policy.learned_policy.protected_patterns;
+            let user_profile = &policy.adaptive_governor.user_profile;
+            // Threshold tuned conservatively: process_relevance returns
+            //   1.0  → matches the current workload's signature directly
+            //   0.8  → used in the last 5 minutes
+            //   0.5  → used in the last hour
+            //   0.2  → used in the last 24 hours
+            //   0.0  → never seen / >24h ago
+            // 0.30 protects "actively-used" apps (within ~1h) without
+            // requiring the user to be in their dominant workload right now.
+            const USAGE_RELEVANCE_PROTECT_THRESHOLD: f32 = 0.30;
             let daemon_pid = std::process::id();
             let mut bg_procs: Vec<_> = top_processes
                 .iter()
@@ -112,10 +123,19 @@ pub fn run_agent_actions(
                     // by SIP path prefix + codesign authority chain (cached). Any
                     // new Apple daemon shipped in a future macOS release is
                     // auto-protected without code change — no list to update.
+                    //
+                    // Personalised guard: `process_relevance` reflects what THIS
+                    // user actually uses (foreground time, recency, current
+                    // workload signature). Bridges the gap between the static
+                    // INTERACTIVE_APPS list and the user's real habits, so apps
+                    // the user touches every day are auto-protected even if
+                    // they aren't in any hardcoded list.
                     p.pid != daemon_pid
                         && !is_apple_owned(p.pid)
                         && !is_protected_name(&p.name)
                         && !is_interactive_app_name(&p.name)
+                        && user_profile.process_relevance(&p.name)
+                            < USAGE_RELEVANCE_PROTECT_THRESHOLD
                         && !decide_interactive
                             .iter()
                             .any(|pat| p.name.contains(pat.as_str()))

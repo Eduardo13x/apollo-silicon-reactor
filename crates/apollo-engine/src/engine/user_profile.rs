@@ -304,6 +304,54 @@ impl UserProfile {
             .collect()
     }
 
+    /// Hygiene: decay then evict app stats so the model reflects current
+    /// behaviour rather than ancient history.
+    ///
+    /// Two phases:
+    ///
+    /// 1. **Decay** — apps idle longer than `decay_after_secs` (default 30 d)
+    ///    have their `total_foreground_secs` multiplied by `decay_factor`
+    ///    (default 0.5). Their imprint shrinks each pass without dropping
+    ///    them, so an app reopened after a month doesn't have to rebuild
+    ///    history from zero — it just weighs less than active apps.
+    ///
+    /// 2. **Evict** — apps idle longer than `evict_after_secs` (default 90 d)
+    ///    are removed entirely UNLESS their lifetime usage is high
+    ///    (`total_foreground_secs >= grace_secs`, default 50 h). High-usage
+    ///    apps are kept indefinitely even if dormant — Eduardo might still
+    ///    open Final Cut after a quarter.
+    ///
+    /// Returns the number of evicted entries (decay is silent).
+    /// Caller should call this on a low-frequency tick (once per ~hour);
+    /// running it every cycle is wasteful and stats only change on observe().
+    pub fn prune_stale(
+        &mut self,
+        decay_after_secs: u64,
+        evict_after_secs: u64,
+        decay_factor: f32,
+        grace_secs: u64,
+    ) -> usize {
+        let mut to_remove: Vec<String> = Vec::new();
+        for (name, stats) in &mut self.app_stats {
+            if stats.secs_since_last_use > evict_after_secs
+                && stats.total_foreground_secs < grace_secs
+            {
+                to_remove.push(name.clone());
+            } else if stats.secs_since_last_use > decay_after_secs {
+                // Cosmetic for current relevance buckets, but future-proof:
+                // any future weight that reads total_foreground_secs sees a
+                // smaller imprint for dormant apps.
+                stats.total_foreground_secs =
+                    ((stats.total_foreground_secs as f32) * decay_factor) as u64;
+            }
+        }
+        let evicted = to_remove.len();
+        for name in to_remove {
+            self.app_stats.remove(&name);
+        }
+        evicted
+    }
+
     /// Confidence (0.0–1.0) that a process is needed for the current workload.
     pub fn process_relevance(&self, process_name: &str) -> f32 {
         // Check if process directly matches current workload signature
@@ -573,5 +621,79 @@ mod tests {
             rel > 0.9,
             "expected relevance ~1.0 for coding process during coding workload, got {rel}"
         );
+    }
+
+    #[test]
+    fn prune_stale_evicts_idle_low_usage_apps() {
+        let mut up = UserProfile::new();
+        up.app_stats.insert(
+            "AncientLowUsage".to_string(),
+            AppStats {
+                total_foreground_secs: 60, // 1 min — low usage
+                launch_count: 1,
+                avg_session_secs: 60,
+                dominant_workload: None,
+                secs_since_last_use: 100 * 86_400, // 100 days idle
+            },
+        );
+        let evicted = up.prune_stale(30 * 86_400, 90 * 86_400, 0.5, 50 * 3_600);
+        assert_eq!(evicted, 1);
+        assert!(!up.app_stats.contains_key("AncientLowUsage"));
+    }
+
+    #[test]
+    fn prune_stale_keeps_high_usage_app_even_when_dormant() {
+        let mut up = UserProfile::new();
+        up.app_stats.insert(
+            "FinalCutPro".to_string(),
+            AppStats {
+                total_foreground_secs: 200 * 3_600, // 200 h lifetime — past grace
+                launch_count: 50,
+                avg_session_secs: 4 * 3_600,
+                dominant_workload: Some(WorkloadType::VideoEdit),
+                secs_since_last_use: 100 * 86_400, // 100 days idle
+            },
+        );
+        let evicted = up.prune_stale(30 * 86_400, 90 * 86_400, 0.5, 50 * 3_600);
+        assert_eq!(evicted, 0);
+        assert!(up.app_stats.contains_key("FinalCutPro"));
+    }
+
+    #[test]
+    fn prune_stale_decays_idle_apps_without_eviction() {
+        let mut up = UserProfile::new();
+        up.app_stats.insert(
+            "OldButRecent".to_string(),
+            AppStats {
+                total_foreground_secs: 1000,
+                launch_count: 10,
+                avg_session_secs: 100,
+                dominant_workload: None,
+                secs_since_last_use: 45 * 86_400, // 45 days — between decay and evict
+            },
+        );
+        let evicted = up.prune_stale(30 * 86_400, 90 * 86_400, 0.5, 50 * 3_600);
+        assert_eq!(evicted, 0);
+        let stats = up.app_stats.get("OldButRecent").expect("not evicted");
+        assert_eq!(stats.total_foreground_secs, 500); // halved
+    }
+
+    #[test]
+    fn prune_stale_leaves_active_apps_untouched() {
+        let mut up = UserProfile::new();
+        up.app_stats.insert(
+            "DailyDriver".to_string(),
+            AppStats {
+                total_foreground_secs: 10_000,
+                launch_count: 100,
+                avg_session_secs: 100,
+                dominant_workload: None,
+                secs_since_last_use: 60, // active 1 min ago
+            },
+        );
+        let evicted = up.prune_stale(30 * 86_400, 90 * 86_400, 0.5, 50 * 3_600);
+        assert_eq!(evicted, 0);
+        let stats = up.app_stats.get("DailyDriver").expect("not evicted");
+        assert_eq!(stats.total_foreground_secs, 10_000); // untouched
     }
 }
