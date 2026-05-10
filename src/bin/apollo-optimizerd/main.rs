@@ -925,6 +925,7 @@ fn main() -> anyhow::Result<()> {
                     &mut skill_registry,
                     &mut effectiveness_tracker,
                     Some(&mut causal_graph),
+                    &mut maintenance_state,
                 );
                 learnable_params = restored_lp;
                 if let Some(nl) = restored_nl {
@@ -4328,6 +4329,7 @@ fn main() -> anyhow::Result<()> {
                         &mut nested_learner,
                         sleep_notifier.is_sleeping(),
                         ode_t_sat_urgency,
+                        &maintenance_state,
                     );
                     // Patch MetaCognition into the freshly-persisted learned_state.
                     // run_learning_tick triggers persist_improved every 300 cycles;
@@ -4709,6 +4711,7 @@ fn main() -> anyhow::Result<()> {
                 Some(energy_pid_tracker.baseline.clone()),
                 Some(learnable_params.clone()),
                 Some(nested_learner.clone()),
+                &maintenance_state,
             );
             // Patch unfreeze-decay τ snapshot after the main persist so a crash
             // mid-persist leaves the previous learned-τ file intact.

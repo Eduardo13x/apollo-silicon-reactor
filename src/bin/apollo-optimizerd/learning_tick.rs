@@ -29,6 +29,7 @@ use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
 use apollo_engine::engine::learned_state::{
     LearnableParams, LearnedState, RestoreQualityMonitor,
 };
+use apollo_engine::engine::maintenance_state::MaintenanceState;
 use apollo_engine::engine::learning_pipeline::{LearningObservation, LearningPipeline};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::nars_belief::{ArousalState, Salience};
@@ -99,6 +100,7 @@ pub fn run_learning_tick<'a>(
     in_sleep: bool,
     // ODE swap saturation urgency [0,1] for T_sat penalty (Cable E).
     ode_t_sat_urgency: f64,
+    maintenance_state: &MaintenanceState,
 ) {
     // ── Arousal EMA: update every cycle from current pressure + swap ─────────
     // p_oom_est ∈ [0,1]: proxy for OOM risk derived from pressure above 0.70.
@@ -802,6 +804,7 @@ pub fn run_learning_tick<'a>(
             None, // process_baselines: persisted at shutdown via main.rs
             Some(learnable_params.clone()),
             Some(nested_learner.clone()),
+            maintenance_state,
         );
         // Patch neuromodulator warm-start state after the main persist so a crash
         // mid-persist leaves the previous neurotransmitter snapshot intact.

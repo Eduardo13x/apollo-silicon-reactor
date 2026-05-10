@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::engine::causal_graph::{CausalEdge, CausalGraph};
+use crate::engine::maintenance_state::MaintenanceState;
 use crate::engine::neuromodulator::NeuroState;
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
 use crate::engine::meta_cognition::MetaCognition;
@@ -496,6 +497,16 @@ pub struct LearnedState {
     /// `None` = first run or old file format → `MetaCognition::new()` baseline.
     #[serde(default)]
     pub meta_cognition: Option<MetaCognition>,
+
+    /// Wall-clock timestamp of last successful purge from any tick or CLI.
+    /// SystemTime survives sleep/wake. Persisted so rate-limit survives crash.
+    #[serde(default)]
+    pub last_any_purge_at: Option<std::time::SystemTime>,
+
+    /// Wall-clock timestamp of last CLI-triggered purge.
+    /// Separate from last_any_purge_at so 5-min CLI rate-limit is independent.
+    #[serde(default)]
+    pub last_cli_purge_at: Option<std::time::SystemTime>,
 }
 
 /// Current schema version for [`LearnedState`].
@@ -591,6 +602,7 @@ impl LearnedState {
         process_baselines: Option<ProcessBaselineMap>,
         learnable_params: Option<LearnableParams>,
         nested_learner: Option<NestedLearner>,
+        maintenance_state: &MaintenanceState,
     ) -> Self {
         Self {
             version: CURRENT_SCHEMA_VERSION,
@@ -613,6 +625,8 @@ impl LearnedState {
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
+            last_any_purge_at: maintenance_state.last_any_purge_at,
+            last_cli_purge_at: maintenance_state.last_cli_purge_at,
         }
     }
 
@@ -633,6 +647,7 @@ impl LearnedState {
         skill_registry: &mut SkillRegistry,
         effectiveness_tracker: &mut EffectivenessTracker,
         causal_graph: Option<&mut CausalGraph>,
+        maintenance_state: &mut MaintenanceState,
     ) -> (
         Option<OverflowHistory>,
         Option<FrozenStatePersisted>,
@@ -642,6 +657,11 @@ impl LearnedState {
         Option<NestedLearner>,
     ) {
         self.validate();
+        // Restore purge timestamps so rate-limit survives crash.
+        // swap_delta_window NOT restored — warms up in ~90s post-restart.
+        // last_wake_at NOT restored — Instant is process-relative (meaningless across restarts).
+        maintenance_state.last_any_purge_at = self.last_any_purge_at;
+        maintenance_state.last_cli_purge_at = self.last_cli_purge_at;
         if let Some(si) = self.signal_intelligence {
             signal_intel.restore(si);
         }
@@ -843,6 +863,7 @@ impl LearnedState {
         process_baselines: Option<ProcessBaselineMap>,
         learnable_params: Option<LearnableParams>,
         nested_learner: Option<NestedLearner>,
+        maintenance_state: &MaintenanceState,
     ) {
         let mut state = Self::collect(
             signal_intel,
@@ -857,6 +878,7 @@ impl LearnedState {
             process_baselines,
             learnable_params,
             nested_learner,
+            maintenance_state,
         );
         state.persist_generations = prev_generations.saturating_add(1);
         state.last_restore_quality = last_quality;
@@ -1190,6 +1212,8 @@ mod tests {
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
+            last_any_purge_at: None,
+            last_cli_purge_at: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1222,6 +1246,8 @@ mod tests {
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
+            last_any_purge_at: None,
+            last_cli_purge_at: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1252,6 +1278,8 @@ mod tests {
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
+            last_any_purge_at: None,
+            last_cli_purge_at: None,
         };
         assert_eq!(
             state
@@ -1301,6 +1329,8 @@ mod tests {
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
+            last_any_purge_at: None,
+            last_cli_purge_at: None,
         };
         state.self_improve();
         assert_eq!(
@@ -1345,6 +1375,8 @@ mod tests {
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
+            last_any_purge_at: None,
+            last_cli_purge_at: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -1392,6 +1424,8 @@ mod tests {
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
+            last_any_purge_at: None,
+            last_cli_purge_at: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1697,8 +1731,10 @@ mod tests {
         let sa = SpecialistAccuracyTracker::new();
         let sr = SkillRegistry::new();
         let et = EffectivenessTracker::new();
+        let maint = MaintenanceState::default();
         let state = LearnedState::collect(
             &si, &ot, &sa, &sr, &et, None, None, None, None, None, None, None,
+            &maint,
         );
         assert!(state.teacher_consolidator.is_none(),
             "collect() leaves teacher_consolidator None; callers must patch post-persist");
@@ -1733,6 +1769,8 @@ mod tests {
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
+            last_any_purge_at: None,
+            last_cli_purge_at: None,
         };
         seed.persist(&tmp);
 
@@ -1824,6 +1862,8 @@ mod tests {
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
+            last_any_purge_at: None,
+            last_cli_purge_at: None,
         };
         let migrated = try_migrate(0, state);
         assert_eq!(
@@ -1861,6 +1901,8 @@ mod tests {
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
+            last_any_purge_at: None,
+            last_cli_purge_at: None,
         };
         let migrated = try_migrate(1, state);
         assert_eq!(migrated.version, CURRENT_SCHEMA_VERSION);
