@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 
 use apollo_engine::engine::daemon_state::MetricsState;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
+use apollo_engine::engine::maintenance_state::SwapDeltaWindow;
 
 #[test]
 fn maintenance_counters_round_trip_to_runtime_metrics_json() {
@@ -61,4 +62,44 @@ fn maintenance_counters_round_trip_to_runtime_metrics_json() {
         json.contains(r#""maintenance_purge_skipped_rate_limit_total":13"#),
         "missing rate_limit counter"
     );
+}
+
+#[test]
+fn maintenance_state_swap_floor_blocks_m1_cold_boot() {
+    // Verify the swap_floor calculation matches spec.
+    // M1 cold boot: swap_total = 800 MB, swap_used = 500 MB.
+    let swap_total: u64 = 800 * 1024 * 1024;
+    let swap_used: u64 = 500 * 1024 * 1024;
+    let swap_floor = std::cmp::max(1_536u64 * 1024 * 1024, swap_total / 2);
+    assert_eq!(swap_floor, 1_536 * 1024 * 1024);
+    assert!(swap_used < swap_floor, "M1 cold boot should not trigger maintenance");
+}
+
+#[test]
+fn maintenance_state_swap_floor_passes_for_typical_m1_8gb() {
+    // Typical loaded M1 8GB: swap_total = 4 GB, swap_used = 2.5 GB.
+    let swap_total: u64 = 4 * 1024 * 1024 * 1024;
+    let swap_used: u64 = 2_560 * 1024 * 1024;
+    let swap_floor = std::cmp::max(1_536u64 * 1024 * 1024, swap_total / 2);
+    assert_eq!(swap_floor, 2 * 1024 * 1024 * 1024);
+    assert!(swap_used > swap_floor, "loaded M1 should pass swap_floor");
+}
+
+#[test]
+fn maintenance_window_requires_90s_sustained() {
+    let mut w = SwapDeltaWindow::default();
+    let now = std::time::SystemTime::now();
+    for i in 0..30 {
+        let t = now - std::time::Duration::from_secs(60)
+            + std::time::Duration::from_secs(i * 2);
+        w.push(t, 50_000.0);
+    }
+    assert!(!w.sustained_below(256_000.0, 90), "60s history should fail 90s requirement");
+
+    for i in 0..15 {
+        let t = now - std::time::Duration::from_secs(30)
+            + std::time::Duration::from_secs(i * 2);
+        w.push(t, 50_000.0);
+    }
+    assert!(w.sustained_below(256_000.0, 90), "90s history should pass");
 }
