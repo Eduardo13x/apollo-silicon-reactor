@@ -93,6 +93,12 @@ pub enum BlockReason {
     /// Process belongs to a coalition that was foreground within the
     /// active grace window — subprocess of an active user workflow.
     ActiveCoalition,
+    /// CPU pegged across cores while memory headroom adequate — freeze
+    /// would worsen scheduler contention without easing the real bottleneck.
+    /// Per `cpu_saturation::CpuSaturation::pegged_fraction` >= 0.80 AND
+    /// memory_pressure < 0.75. Sensor introduced 2026-04-08; wired into
+    /// decision path 2026-05-10.
+    CpuSaturated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

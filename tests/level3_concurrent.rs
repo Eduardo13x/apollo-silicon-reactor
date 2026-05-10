@@ -108,6 +108,8 @@ fn concurrent_budget_enforcement_no_overflow() {
                     false,
                     0.0,
                     0.0,
+                    None,
+                    0.0,
                 );
 
                 final_actions.len()
@@ -178,6 +180,8 @@ fn three_phase_cycles_all_complete_with_correct_totals() {
                         None,
                         false,
                         0.0,
+                        0.0,
+                        None,
                         0.0,
                     )
                 };
@@ -405,6 +409,8 @@ fn concurrent_freeze_unfreeze_frozen_set_is_consistent() {
                     None,
                     false,
                     0.0,
+                    0.0,
+                    None,
                     0.0,
                 );
             })

@@ -3688,6 +3688,7 @@ fn main() -> anyhow::Result<()> {
                             // Sysctl-only batch — no per-PID destructive actions, so
                             // coalition guard is irrelevant.
                             None,
+                            0.0, // cpu_pegged_fraction — sysctl path, no PID gate
                         );
                         if outcomes.failures == 0 {
                             sysctl_governor.mark_reverted();
@@ -4293,6 +4294,10 @@ fn main() -> anyhow::Result<()> {
                         dry_run,
                         lf_metrics: Some(&lf_metrics),
                         coalition_guard: Some(&cg),
+                        cpu_pegged_fraction: pressure_collector
+                            .latest()
+                            .cpu_saturation
+                            .pegged_fraction,
                     });
                     (output.outcomes, output.causal_qos_upgrades)
                 };
@@ -4971,6 +4976,7 @@ fn main() -> anyhow::Result<()> {
                         0.0,
                         0.0,
                         None,
+                        0.0, // cpu_pegged_fraction
                     );
                     if outcomes.failures == 0 {
                         sysctl_governor.mark_reverted();

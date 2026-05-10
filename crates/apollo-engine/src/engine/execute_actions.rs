@@ -280,6 +280,7 @@ pub fn execute_actions(
     memory_pressure: f64,
     thrashing_score: f64,
     coalition_guard: Option<&CoalitionGuard<'_>>,
+    cpu_pegged_fraction: f64,
 ) -> ExecuteOutcomes {
     let protected = protected_processes();
     // Only infrastructure (docker, postgres, redis, etc.) gets unconditional protection
@@ -473,6 +474,16 @@ pub fn execute_actions(
                         block_reason = Some(BlockReason::ActiveCoalition);
                         return Ok(());
                     }
+                    // CPU-saturation guard: when ≥80% of cores are pegged
+                    // and memory pressure is still healthy (<0.75), throttling
+                    // adds scheduler contention without easing the real
+                    // bottleneck. Threshold pair derived from cpu_saturation.rs
+                    // pegged_fraction ≥0.80 (one core idle) and the survival
+                    // threshold above which freezes are mandatory regardless.
+                    if cpu_pegged_fraction >= 0.80 && memory_pressure < 0.75 {
+                        block_reason = Some(BlockReason::CpuSaturated);
+                        return Ok(());
+                    }
                     // Unified protection check: hard OS names + policy-learned + interactive.
                     // learned_interactive is treated as Unconditional at execute time because
                     // no foreground context is available here (see policy_all pre-computation).
@@ -563,6 +574,18 @@ pub fn execute_actions(
                     if coalition_guard.map(|g| g.is_protected(*pid)).unwrap_or(false) {
                         out.push_skip(format!("active-coalition:{}", name));
                         block_reason = Some(BlockReason::ActiveCoalition);
+                        return Ok(());
+                    }
+                    // CPU-saturation guard: when CPU is pegged but memory
+                    // headroom is fine, freezing a background process moves
+                    // its threads off the run queue but doesn't release any
+                    // memory pressure (because there isn't any). The page
+                    // residency stays, the freeze adds context-switch cost
+                    // on resume, and the user perceives "system feels slow
+                    // during CPU-heavy task". Skip with CpuSaturated.
+                    if cpu_pegged_fraction >= 0.80 && memory_pressure < 0.75 {
+                        out.push_skip(format!("cpu-saturated:{}", name));
+                        block_reason = Some(BlockReason::CpuSaturated);
                         return Ok(());
                     }
                     // Unified protection check: hard OS names + infra + policy-learned + interactive.
@@ -994,6 +1017,7 @@ mod tests {
             0.0,
             0.0,
             None,
+            0.0,
         )
     }
 
@@ -1029,6 +1053,7 @@ mod tests {
             0.0,
             0.0,
             None,
+            0.0,
         );
         // All 5 ghost pids are dead → should be removed from frozen set.
         // unfreezes_applied stays 0 because the live-branch (which increments

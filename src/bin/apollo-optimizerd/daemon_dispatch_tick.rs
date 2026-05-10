@@ -160,6 +160,11 @@ pub struct DispatchTickInput<'a> {
     /// coalition-aware skipping (legacy callers / tests).
     pub coalition_guard:
         Option<&'a apollo_engine::engine::active_coalition_envelope::CoalitionGuard<'a>>,
+    /// Per-cycle fraction of CPU cores pegged ≥0.80 busy (from
+    /// background_collectors.cpu_saturation.pegged_fraction). When this
+    /// rises above 0.80 with memory pressure <0.75, freeze/throttle are
+    /// gated as `BlockReason::CpuSaturated`.
+    pub cpu_pegged_fraction: f64,
 }
 
 /// Output results from the dispatch tick.
@@ -190,6 +195,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         dry_run,
         lf_metrics,
         coalition_guard,
+        cpu_pegged_fraction,
     } = input;
 
     // ── Filter pipeline ──────────────────────────────────────────────────────
@@ -311,6 +317,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             snapshot.pressure.memory_pressure,
             snapshot.pressure.thrashing_score,
             coalition_guard,
+            cpu_pegged_fraction,
         )
     } else {
         // Circuit Closed or HalfOpen: run normally, then report outcome.
@@ -326,6 +333,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             snapshot.pressure.memory_pressure,
             snapshot.pressure.thrashing_score,
             coalition_guard,
+            cpu_pegged_fraction,
         );
         // Report outcome to circuit breaker.
         {
@@ -597,6 +605,7 @@ mod tests {
             dry_run: true,
             lf_metrics: None,
             coalition_guard: None,
+            cpu_pegged_fraction: 0.0,
         };
 
         let output = run_dispatch_tick(input);
