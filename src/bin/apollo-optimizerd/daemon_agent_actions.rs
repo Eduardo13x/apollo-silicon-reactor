@@ -14,6 +14,7 @@
 use apollo_engine::collector::ProcessStats;
 use apollo_engine::engine::apple_owned::is_apple_owned;
 use apollo_engine::engine::audit_types::DecisionReason;
+use apollo_engine::engine::companion_graph::CompanionGraph;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::decide_actions::is_interactive_app_name;
 use apollo_engine::engine::lock_ext::LockRecover;
@@ -45,6 +46,8 @@ pub fn run_agent_actions(
     state: &SharedState,
     decide_interactive: &[String],
     user_ctx: &UserContext,
+    foreground_app: Option<&str>,
+    companion_graph: &CompanionGraph,
 ) -> Vec<RootAction> {
     let mut new_actions: Vec<RootAction> = Vec::new();
 
@@ -130,10 +133,21 @@ pub fn run_agent_actions(
                     // INTERACTIVE_APPS list and the user's real habits, so apps
                     // the user touches every day are auto-protected even if
                     // they aren't in any hardcoded list.
+                    // Companion-graph guard: if the user has put `fg_app` in
+                    // foreground enough times for the graph to mature, processes
+                    // that are reliably alive WITH that fg_app and lift > 2.0
+                    // are considered satellites of the active workflow and
+                    // protected from purge. Lift gating naturally rejects
+                    // always-on daemons (kernel_task, mds, etc.) whose global
+                    // base rate ≈ 1.0.
+                    let is_companion = foreground_app
+                        .map(|fg| companion_graph.is_companion_of(fg, &p.name))
+                        .unwrap_or(false);
                     p.pid != daemon_pid
                         && !is_apple_owned(p.pid)
                         && !is_protected_name(&p.name)
                         && !is_interactive_app_name(&p.name)
+                        && !is_companion
                         && user_profile.process_relevance(&p.name)
                             < USAGE_RELEVANCE_PROTECT_THRESHOLD
                         && !decide_interactive

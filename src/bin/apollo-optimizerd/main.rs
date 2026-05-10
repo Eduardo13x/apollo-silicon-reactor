@@ -693,6 +693,7 @@ fn main() -> anyhow::Result<()> {
                 recently_applied_restore_status,
                 identity_cache,
                 mut maintenance_state,
+                mut companion_graph,
             } = daemon_init::DaemonSubsystems::new();
             {
                 let mut m_guard = state.metrics.lock().unwrap();
@@ -3201,6 +3202,35 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
 
+                // CompanionGraph observation — once per cycle, record what is
+                // alive while `foreground_app` is fg. Cheap (HashMap inserts on
+                // top_processes ~50 entries). Membership query consumed below.
+                // Decay+GC every 500 cycles (~40 min @ 5s/cycle) keeps the
+                // graph adapting and bounded.
+                {
+                    let alive: Vec<String> = snapshot
+                        .top_processes
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect();
+                    companion_graph.observe_cycle(
+                        foreground_app.as_deref(),
+                        &alive,
+                        cycle_count as u64,
+                    );
+                    if (cycle_count as u64).is_multiple_of(500) {
+                        let evicted = companion_graph.self_improve(cycle_count as u64);
+                        if evicted > 0 {
+                            apollo_engine::engine::daemon_helpers::audit_log(&serde_json::json!({
+                                "event": "companion_graph_gc",
+                                "evicted": evicted,
+                                "anchors": companion_graph.anchor_count(),
+                                "edges": companion_graph.edge_count(),
+                            }));
+                        }
+                    }
+                }
+
                 // Predictive agent: inject soft actions for PreThrottleNoise / ProactivePurge.
                 // Extracted to daemon_agent_actions::run_agent_actions (Wave 19).
                 {
@@ -3210,6 +3240,8 @@ fn main() -> anyhow::Result<()> {
                         &state,
                         &decide_interactive,
                         &user_context,
+                        foreground_app.as_deref(),
+                        &companion_graph,
                     );
                     acc.extend_raw(
                         agent_new,

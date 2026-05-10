@@ -21,6 +21,7 @@ pub mod cognitive_health;
 pub mod compressor_aware;
 pub mod config_reloader;
 pub mod apple_owned;
+pub mod companion_graph;
 pub mod contention_detector;
 pub mod contention_tracker;
 pub mod coreaudio_active;

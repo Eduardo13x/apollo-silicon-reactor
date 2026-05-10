@@ -93,6 +93,10 @@ pub(super) struct DaemonSubsystems {
     /// Maintenance Purge Gate state (2026-05-10) — opportunistic non-crisis
     /// purge orchestration with asymmetric cooldown vs survival_tick.
     pub maintenance_state: apollo_engine::engine::maintenance_state::MaintenanceState,
+    /// Directional companion graph (Sprint C 2026-05-10) — `P(proc | fg_app)`
+    /// with Lift normalization. Protects satellites of actively-used apps
+    /// from ProactivePurge without a hardcoded list.
+    pub companion_graph: apollo_engine::engine::companion_graph::CompanionGraph,
 }
 
 /// Detect hardware capabilities (core count and RAM) once at startup.
@@ -170,6 +174,7 @@ impl DaemonSubsystems {
             identity_cache:
                 apollo_engine::engine::identity_cache_manager::IdentityCacheManager::new(),
             maintenance_state: apollo_engine::engine::maintenance_state::MaintenanceState::new(),
+            companion_graph: apollo_engine::engine::companion_graph::CompanionGraph::new(),
         }
     }
 }
