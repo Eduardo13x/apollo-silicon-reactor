@@ -7,6 +7,11 @@
 //! - Swap floor: max(1.5 GB, 50% × swap_total)
 //! - Swap delta sustained < 256 KB/s for 90s (via SwapDeltaWindow)
 //! - User idle ≥120s + 10s post-wake quiet
+//! - Media-active bypass: audio playing / video call / generic sleep-assertion
+//!   `purge` invalidates the entire file-backed page cache; processes with
+//!   active media re-fault frames from SSD causing audio glitches and video
+//!   stutter. UserContext.audio_active/call_in_progress/has_sleep_assertion
+//!   are sticky 60s-window signals (pmset assertions).
 //! - Build-active bypass (caller passes bool from BuildTracker)
 //! - Reads + writes shared last_any_purge_at (30 min)
 
@@ -25,6 +30,9 @@ pub enum SkipReason {
     Growing,
     Idle,
     PostWake,
+    /// Audio playing / video call active / generic sleep-assertion held.
+    /// Skipping prevents page-cache invalidation glitches in active media.
+    MediaActive,
     BuildMode,
     RateLimit,
 }
@@ -59,7 +67,7 @@ pub fn run_maintenance_tick(
                 }
                 SkipReason::SwapFloor => &lf_metrics.maintenance_purge_skipped_swap_floor_total,
                 SkipReason::Growing => &lf_metrics.maintenance_purge_skipped_growing_total,
-                SkipReason::Idle | SkipReason::PostWake => {
+                SkipReason::Idle | SkipReason::PostWake | SkipReason::MediaActive => {
                     &lf_metrics.maintenance_purge_skipped_idle_total
                 }
                 SkipReason::BuildMode => &lf_metrics.maintenance_purge_skipped_build_mode_total,
@@ -100,6 +108,13 @@ pub(crate) fn should_fire(
     }
     if state.secs_since_wake() < 10 {
         return Some(SkipReason::PostWake);
+    }
+    // Media-active gate: audio playback / video calls / sleep-assertion
+    // holders cannot tolerate page-cache invalidation. UserContext flags are
+    // refreshed every cycle (pmset -g assertions polled with TTL) and combine
+    // coreaudiod NoIdleSleep + NSPreventIdleSystemSleep + conferencing apps.
+    if ctx.audio_active || ctx.call_in_progress || ctx.has_sleep_assertion {
+        return Some(SkipReason::MediaActive);
     }
     if build_active {
         return Some(SkipReason::BuildMode);
@@ -245,6 +260,51 @@ mod tests {
         assert_eq!(
             should_fire(&snap, &ctx, &state, false),
             Some(SkipReason::PostWake)
+        );
+    }
+
+    #[test]
+    fn should_fire_audio_active_returns_media_active() {
+        let snap = synth_snap(0.70, 3_000_000_000, 4_000_000_000);
+        let ctx = UserContext {
+            idle_secs: 200.0,
+            audio_active: true,
+            ..Default::default()
+        };
+        let state = make_ready_state();
+        assert_eq!(
+            should_fire(&snap, &ctx, &state, false),
+            Some(SkipReason::MediaActive)
+        );
+    }
+
+    #[test]
+    fn should_fire_call_in_progress_returns_media_active() {
+        let snap = synth_snap(0.70, 3_000_000_000, 4_000_000_000);
+        let ctx = UserContext {
+            idle_secs: 200.0,
+            call_in_progress: true,
+            ..Default::default()
+        };
+        let state = make_ready_state();
+        assert_eq!(
+            should_fire(&snap, &ctx, &state, false),
+            Some(SkipReason::MediaActive)
+        );
+    }
+
+    #[test]
+    fn should_fire_sleep_assertion_returns_media_active() {
+        let snap = synth_snap(0.70, 3_000_000_000, 4_000_000_000);
+        let ctx = UserContext {
+            idle_secs: 200.0,
+            has_sleep_assertion: true,
+            ..Default::default()
+        };
+        let state = make_ready_state();
+        assert_eq!(
+            should_fire(&snap, &ctx, &state, false),
+            Some(SkipReason::MediaActive)
         );
     }
 

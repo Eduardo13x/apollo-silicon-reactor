@@ -4563,6 +4563,16 @@ fn main() -> anyhow::Result<()> {
                                     fired: false,
                                     reason: "rate_limited — auto-purge fired recently".into(),
                                 }
+                            } else if user_context.audio_active
+                                || user_context.call_in_progress
+                                || user_context.has_sleep_assertion
+                            {
+                                // Audio/video/conferencing active → page-cache invalidation
+                                // would cause stutter. User can `sudo purge` directly to bypass.
+                                apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                    fired: false,
+                                    reason: "media_active — audio/video/call running; pause media or use `sudo purge` to bypass".into(),
+                                }
                             } else if std::process::Command::new("purge").spawn().is_ok() {
                                 maintenance_state.mark_cli_purged();
                                 lf_metrics
