@@ -3309,6 +3309,27 @@ fn main() -> anyhow::Result<()> {
                     &mut maintenance_state,
                 );
 
+                // Maintenance Purge Gate (2026-05-10) — opportunistic non-crisis purge
+                // between survival_tick and dispatch_tick. Asymmetric cooldown: survival
+                // is sovereign and bypasses last_any_purge_at; maintenance reads+writes.
+                let maintenance_fired = daemon_maintenance_tick::run_maintenance_tick(
+                    &snapshot,
+                    &user_context,
+                    &mut maintenance_state,
+                    &lf_metrics,
+                    build_tracker.build_active,
+                );
+                if maintenance_fired {
+                    // Record cause for observational outcome tracking via CausalGraph.
+                    // Validation requires ≥30 samples per CLAUDE.md supervision rule.
+                    lctx.causal_graph.record_action_with_resources(
+                        "system_maintenance_purge",
+                        snapshot.pressure.memory_pressure as f32,
+                        cycle_count as u64,
+                        Default::default(),
+                    );
+                }
+
                 // ── Neuromodulator: bio-inspired parameter modulation ────────
                 // Extracted to daemon_neuro_tick::apply_neuromodulator (Wave 8).
                 // Best-available CPU temperature: SMC direct first, then IOKit estimate.
