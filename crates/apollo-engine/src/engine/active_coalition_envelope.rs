@@ -11,6 +11,29 @@
 //! the protected set for `GRACE_SECS` after it was last fg, so
 //! micro-switches between apps don't strip protection mid-task.
 //!
+//! ## Persistence — NOT persisted, by design
+//!
+//! macOS coalition_ids are kernel-assigned at task creation via a global
+//! counter (XNU `coalition_create()`); they do NOT survive a reboot. An
+//! id of 42 yesterday refers to a different (or missing) coalition today.
+//! Persisting yesterday's envelope after a reboot would protect the
+//! wrong coalitions — the same anti-pattern as the historical Ghost-PID
+//! bugs (B003 / display_turbo) where stale kernel handles were
+//! restored across reboots.
+//!
+//! The 5-minute grace window also makes persistence pointless: if the
+//! daemon was offline longer than that, every entry is already expired
+//! by `SystemTime`. If the daemon restarts faster (deploy, kickstart),
+//! cycle 1 records the current fg coalition and bootstrap is effectively
+//! free. During the bootstrap window, this envelope is intentionally an
+//! OPPORTUNISTIC interactivity layer — protection rests on the L0
+//! invariants (`is_protected_name`, `apple_owned`, `INTERACTIVE_APPS`,
+//! `infrastructure_processes`) that are always loaded before cycle 1.
+//!
+//! Same pattern as `MaintenanceState::SwapDeltaWindow` (90s rolling),
+//! which is also runtime-only — short-TTL state is reconstructed faster
+//! than it is persisted.
+//!
 //! ## Guarantees
 //!
 //! - Bounded memory: `MAX_TRACKED` (3) entries.
