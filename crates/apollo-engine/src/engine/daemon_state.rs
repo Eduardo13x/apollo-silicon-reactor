@@ -100,6 +100,14 @@ impl MetricsState {
         
         // Reactor pulses
         self.metrics.reactor_pulses = lf.signals_sent;
+        // Maintenance Purge Gate (2026-05-10) — Sprint 3 telemetry sync chain
+        self.metrics.maintenance_purge_total = lf.maintenance_purge_total;
+        self.metrics.maintenance_purge_skipped_pressure_total = lf.maintenance_purge_skipped_pressure_total;
+        self.metrics.maintenance_purge_skipped_swap_floor_total = lf.maintenance_purge_skipped_swap_floor_total;
+        self.metrics.maintenance_purge_skipped_growing_total = lf.maintenance_purge_skipped_growing_total;
+        self.metrics.maintenance_purge_skipped_idle_total = lf.maintenance_purge_skipped_idle_total;
+        self.metrics.maintenance_purge_skipped_build_mode_total = lf.maintenance_purge_skipped_build_mode_total;
+        self.metrics.maintenance_purge_skipped_rate_limit_total = lf.maintenance_purge_skipped_rate_limit_total;
     }
 }
 
