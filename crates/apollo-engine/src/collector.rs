@@ -288,7 +288,7 @@ impl SystemCollector {
             8
         };
 
-        let refreshed_processes = if self.light_call_count % refresh_interval == 0 {
+        let refreshed_processes = if self.light_call_count.is_multiple_of(refresh_interval) {
             self.sys.refresh_processes();
             true
         } else {
