@@ -1,0 +1,3 @@
+=== Apollo state ===
+ACTIVE — optimization running normally
+cycles=19025 pressure=0.65 swap_gb=3.0 failures=0

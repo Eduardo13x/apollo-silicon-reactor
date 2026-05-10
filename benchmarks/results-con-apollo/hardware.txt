@@ -1,0 +1,9 @@
+=== Hardware ===
+Apple M1
+8
+8
+RAM: 8.0 GB
+ProductName:		macOS
+ProductVersion:		26.4.1
+BuildVersion:		25E253
+2026-05-10T03:18:19Z

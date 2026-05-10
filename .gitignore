@@ -4,3 +4,6 @@
 .graphify_analysis.json
 graphify-out/
 src/graphify-out/
+
+# CoreMark — external git repo, install via setup_apple_benchmark.sh
+benchmarks/coremark/

@@ -1,0 +1,9 @@
+stress-ng: info:  [27273] setting to a 20 secs run per stressor
+stress-ng: info:  [27273] dispatching hogs: 1 vm
+stress-ng: info:  [27273] note: system has only 119 MB of free memory and swap, recommend using --oom-avoid
+stress-ng: info:  [27275] vm: using 4GB per stressor instance (total 4GB of 8GB available memory)
+stress-ng: info:  [27273] skipped: 0
+stress-ng: info:  [27273] passed: 1: vm (1)
+stress-ng: info:  [27273] failed: 0
+stress-ng: info:  [27273] metrics untrustworthy: 0
+stress-ng: info:  [27273] successful run completed in 25.51 secs

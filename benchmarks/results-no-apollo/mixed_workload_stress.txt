@@ -1,0 +1,10 @@
+stress-ng: info:  [28935] setting to a 30 secs run per stressor
+stress-ng: info:  [28935] dispatching hogs: 4 cpu, 2 io, 1 vm
+stress-ng: info:  [28942] vm: using 1GB per stressor instance (total 1GB of 8GB available memory)
+stress-ng: fail:  [28941] io: rmdir './tmp-stress-ng-io-28941-1' failed, errno=2 (No such file or directory)
+stress-ng: fail:  [28940] io: rmdir './tmp-stress-ng-io-28940-0' failed, errno=2 (No such file or directory)
+stress-ng: info:  [28935] skipped: 0
+stress-ng: info:  [28935] passed: 7: cpu (4) io (2) vm (1)
+stress-ng: info:  [28935] failed: 0
+stress-ng: info:  [28935] metrics untrustworthy: 0
+stress-ng: info:  [28935] successful run completed in 30.41 secs

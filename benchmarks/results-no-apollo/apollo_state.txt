@@ -1,0 +1,4 @@
+=== Apollo state ===
+PAUSED — kill switch active: /var/run/apollo.disable
+To resume: sudo apollo-optimizerctl resume
+cycles=19250 pressure=0.61 swap_gb=4.1 failures=0

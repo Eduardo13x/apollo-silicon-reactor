@@ -1,0 +1,11 @@
+stress-ng: info:  [28294] setting to a 30 secs run per stressor
+stress-ng: info:  [28294] dispatching hogs: 4 cpu, 2 io, 1 vm
+stress-ng: info:  [28294] note: system has only 155 MB of free memory and swap, recommend using --oom-avoid
+stress-ng: info:  [28301] vm: using 1GB per stressor instance (total 1GB of 8GB available memory)
+stress-ng: fail:  [28299] io: rmdir './tmp-stress-ng-io-28299-0' failed, errno=2 (No such file or directory)
+stress-ng: fail:  [28300] io: rmdir './tmp-stress-ng-io-28300-1' failed, errno=2 (No such file or directory)
+stress-ng: info:  [28294] skipped: 0
+stress-ng: info:  [28294] passed: 7: cpu (4) io (2) vm (1)
+stress-ng: info:  [28294] failed: 0
+stress-ng: info:  [28294] metrics untrustworthy: 0
+stress-ng: info:  [28294] successful run completed in 30.29 secs

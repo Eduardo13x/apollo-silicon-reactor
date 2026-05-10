@@ -1,0 +1,26 @@
+/Library/Developer/CommandLineTools/usr/bin/make XCFLAGS=" -DPERFORMANCE_RUN=1" load run1.log
+/Library/Developer/CommandLineTools/usr/bin/make port_preload
+make[2]: Nothing to be done for `port_preload'.
+echo Loading done ./coremark.exe
+Loading done ./coremark.exe
+/Library/Developer/CommandLineTools/usr/bin/make port_postload
+make[2]: Nothing to be done for `port_postload'.
+/Library/Developer/CommandLineTools/usr/bin/make port_prerun
+make[2]: Nothing to be done for `port_prerun'.
+./coremark.exe  0x0 0x0 0x66 0 7 1 2000 > ./run1.log
+/Library/Developer/CommandLineTools/usr/bin/make port_postrun
+make[2]: Nothing to be done for `port_postrun'.
+/Library/Developer/CommandLineTools/usr/bin/make XCFLAGS=" -DVALIDATION_RUN=1" load run2.log
+/Library/Developer/CommandLineTools/usr/bin/make port_preload
+make[2]: Nothing to be done for `port_preload'.
+echo Loading done ./coremark.exe
+Loading done ./coremark.exe
+/Library/Developer/CommandLineTools/usr/bin/make port_postload
+make[2]: Nothing to be done for `port_postload'.
+/Library/Developer/CommandLineTools/usr/bin/make port_prerun
+make[2]: Nothing to be done for `port_prerun'.
+./coremark.exe  0x3415 0x3415 0x66 0 7 1 2000  > ./run2.log
+/Library/Developer/CommandLineTools/usr/bin/make port_postrun
+make[2]: Nothing to be done for `port_postrun'.
+Check run1.log and run2.log for results.
+See README.md for run and reporting rules.
