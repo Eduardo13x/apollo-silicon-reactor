@@ -1053,10 +1053,6 @@ fn main() -> anyhow::Result<()> {
             // to veto Raise1pp during sustained swap growth (see rl_threshold.rs).
             let mut swap_growth_streak: u32 = 0;
 
-            // Rate-limit `purge(8)` invocations to at most once per 10 minutes
-            // under severe swap pressure. `purge` forces the kernel to drain
-            // inactive pages — effective but expensive (blocks for ~2s on 8GB).
-            let mut last_purge_at: Option<Instant> = None;
             // D-term for overflow threshold PID: pressure velocity from previous cycle.
             // One-cycle lag is acceptable; 0.0 default is conservative (no D-offset on cold start).
             let mut last_pressure_velocity: f64 = 0.0;
@@ -3309,7 +3305,7 @@ fn main() -> anyhow::Result<()> {
                     &mut swap_growth_streak,
                     &state,
                     &mut chromium_mgr,
-                    &mut last_purge_at,
+                    &mut maintenance_state,
                 );
 
                 // ── Neuromodulator: bio-inspired parameter modulation ────────
