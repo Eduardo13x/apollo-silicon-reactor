@@ -1415,6 +1415,16 @@ pub struct RuntimeMetrics {
     /// Epistemic uncertainty level label.
     #[serde(default)]
     pub epistemic_level: String,
+    /// Guard-tower over-protection signal (6th composite component, 2026-05-10).
+    /// OutcomeTracker.mean_blocked_overprotection() — Bayesian-Laplace aggregate
+    /// over mature blocked patterns. High = blocks "would have helped" per Rubin
+    /// 1974 counterfactual → guard policy is over-protecting.
+    #[serde(default)]
+    pub guard_overprotection: f32,
+    /// Active-coalition envelope size (recently-foreground coalitions, 5 min grace).
+    /// 0 = no recent fg, 1-3 = healthy app-switching window.
+    #[serde(default)]
+    pub active_coalitions_count: u32,
     /// MetaCognition meta_confidence [0,1].
     #[serde(default)]
     pub meta_confidence: f32,

@@ -1373,6 +1373,24 @@ fn render_decide_q(status: &DaemonStatus) -> Vec<String> {
         lines.push("Teach calls ❌ off".to_string());
     }
 
+    // Sprint Coalition — guard tower visibility (2026-05-10).
+    // Guard% = mean over-protection signal across mature blocked patterns.
+    // Coalitions = recently-fg apps protected by 5-min envelope.
+    // Yellow when guard >= 0.40 (policy showing over-protection signs).
+    // Red when guard >= 0.70 (epistemic likely in HIGH mode).
+    let guard_pct = (m.guard_overprotection * 100.0) as i32;
+    let guard_label = if m.guard_overprotection >= 0.70 {
+        red(&format!("{}%", guard_pct))
+    } else if m.guard_overprotection >= 0.40 {
+        yellow(&format!("{}%", guard_pct))
+    } else {
+        dim(&format!("{}%", guard_pct))
+    };
+    lines.push(format!(
+        "Guard  {} · Coalitions {}",
+        guard_label, m.active_coalitions_count
+    ));
+
     lines
 }
 

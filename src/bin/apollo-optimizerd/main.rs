@@ -4629,6 +4629,7 @@ fn main() -> anyhow::Result<()> {
                         thermal_predicted_throttle,
                         thermal_seconds_to_throttle,
                         thermal_trend_predicted: &thermal_trend_predicted,
+                        active_coalitions_count: active_coalitions.len() as u32,
                     },
                 );
 

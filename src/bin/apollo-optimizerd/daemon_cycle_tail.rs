@@ -104,6 +104,10 @@ pub struct EnrichedTelemetryInputs<'a> {
     pub thermal_predicted_throttle: u8,
     pub thermal_seconds_to_throttle: Option<i32>,
     pub thermal_trend_predicted: &'a str,
+    /// Number of recent foreground coalitions in the active envelope
+    /// (Sprint Coalition 2026-05-10). 0 when nothing is foreground;
+    /// 1-3 in steady-state app-switching.
+    pub active_coalitions_count: u32,
 }
 
 /// Wire enriched telemetry + UCHS neurocognitive metrics into
@@ -168,6 +172,12 @@ pub fn wire_enriched_telemetry(
     m.metrics.uchs_recovery_mode = inputs.cognitive_state.health.recovery_mode;
     m.metrics.epistemic_uncertainty = inputs.cognitive_state.epistemic.composite;
     m.metrics.epistemic_level = inputs.cognitive_state.epistemic.level_label().to_string();
+    // Sprint Coalition 2026-05-10 metrics — guard-tower over-protection
+    // signal (6th component of epistemic composite) + active-coalition
+    // envelope size. Surfaces whether the new layered protection from
+    // commits a381c6b..1ab6bdb is actually firing in production.
+    m.metrics.guard_overprotection = inputs.cognitive_state.epistemic.guard_overprotection;
+    m.metrics.active_coalitions_count = inputs.active_coalitions_count;
     m.metrics.meta_confidence = inputs.cognitive_state.meta_cognition.meta_confidence;
     m.metrics.humble_mode = inputs.cog_decision.humble_mode;
     m.metrics.adversarial_pass_rate =
