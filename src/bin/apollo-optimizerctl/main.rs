@@ -211,7 +211,7 @@ fn handle_dashboard() -> anyhow::Result<()> {
         .context("No se pudo conectar al daemon. ¿Está corriendo apollo-optimizerd?")?;
     match response {
         DaemonResponse::Status(s) => {
-            print!("{}", dashboard::render_dashboard(&s));
+            print!("{}", dashboard::render_dashboard_v2(&s));
             Ok(())
         }
         DaemonResponse::Error { message } => anyhow::bail!(message),

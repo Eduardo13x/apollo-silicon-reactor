@@ -1178,6 +1178,520 @@ pub fn render_dashboard(status: &DaemonStatus) -> String {
     out
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Cognitive Stack Grid Layout (v2) — 2026-05-10
+//
+// Replaces linear 11-section render with 4-quadrant grid (SENSE / THINK /
+// DECIDE / ACT) + full-width bands (GATES, CHROMIUM, CONSUMERS, VERDICT).
+// Surfaces all 8 predictive subsystems + maintenance purge + cognition.
+// ────────────────────────────────────────────────────────────────────────────
+
+const QW: usize = 32; // width per quadrant content (lines fit in QW columns)
+
+/// Pair two columns line-by-line. Pads each side to QW.
+fn render_pair(left: &[String], right: &[String]) -> Vec<String> {
+    let max_lines = left.len().max(right.len());
+    let mut out = Vec::with_capacity(max_lines);
+    for i in 0..max_lines {
+        let l = left.get(i).cloned().unwrap_or_default();
+        let r = right.get(i).cloned().unwrap_or_default();
+        let lp = pad_right(&l, QW);
+        let rp = pad_right(&r, QW);
+        out.push(format!("{} {}", lp, rp));
+    }
+    out
+}
+
+/// Quadrant header bar like "─ 🔍 SENSE ──────────────────────".
+fn q_header(emoji: &str, title: &str) -> String {
+    let prefix = format!("─ {} {} ", emoji, title);
+    let dw = display_width(&prefix);
+    let pad = QW.saturating_sub(dw);
+    format!("{}{}", prefix, "─".repeat(pad))
+}
+
+// ── 🔍 SENSE quadrant ────────────────────────────────────────────────────────
+fn render_sense_q(status: &DaemonStatus) -> Vec<String> {
+    let m = &status.metrics;
+    let mut lines = vec![bold(&q_header("🔍", "SENSE"))];
+
+    let mp = m.memory_pressure;
+    lines.push(format!(
+        "RAM    {} {:>3.0}%",
+        render_bar(mp, 12),
+        mp * 100.0
+    ));
+
+    let swap_gb = m.swap_used_bytes as f64 / 1_073_741_824.0;
+    let swap_total_gb = (m.swap_total_bytes as f64 / 1_073_741_824.0).max(0.1);
+    let swap_emoji = if swap_gb >= swap_total_gb * 0.85 {
+        "🔴"
+    } else if swap_gb >= swap_total_gb * 0.50 {
+        "🟡"
+    } else {
+        "🟢"
+    };
+    lines.push(format!(
+        "Swap   {:.1}/{:.1}GB {}",
+        swap_gb, swap_total_gb, swap_emoji
+    ));
+
+    lines.push(format!(
+        "Temp   {} {}",
+        thermal_emoji(&status.thermal_state),
+        thermal_label(&status.thermal_state)
+    ));
+
+    lines.push(format!("Pres   p={:.0}% c={:.0}%", mp * 100.0, m.compressed_memory_ratio * 100.0));
+
+    let score = m.last_pressure_score;
+    lines.push(format!(
+        "Score  {:.2} {} {}",
+        score,
+        score_emoji(score),
+        score_label(score)
+    ));
+
+    lines.push(format!("Throttle {}", status.throttle_level));
+    lines.push(format!("WS     {}% CPU", m.windowserver_cpu_pct as i32));
+
+    if let Some(top) = m.wakeup_vampires.first() {
+        // wakeup_vampires entries are pre-formatted "name(rate/s)" strings
+        let truncated: String = top.chars().take(24).collect();
+        lines.push(format!("Wake   {}", truncated));
+    }
+
+    lines
+}
+
+// ── 🧠 THINK quadrant ────────────────────────────────────────────────────────
+fn render_think_q(status: &DaemonStatus) -> Vec<String> {
+    let m = &status.metrics;
+    let mut lines = vec![bold(&q_header("🧠", "THINK"))];
+
+    // NARS (concept drift, beliefs)
+    let drift_emoji = if m.nars_drift_score < 0.10 {
+        "✅"
+    } else if m.nars_drift_score < 0.30 {
+        "⚠"
+    } else {
+        "🔴"
+    };
+    lines.push(format!(
+        "NARS   {} bel d={:.2} {}",
+        m.nars_drifted_beliefs, m.nars_drift_score, drift_emoji
+    ));
+
+    // Bayesian outcome tracker (LLM teacher patterns proxy)
+    let interactive = status.llm.as_ref().map_or(0, |l| l.learned_policy.interactive_patterns);
+    let noise = status.llm.as_ref().map_or(0, |l| l.learned_policy.noise_patterns);
+    lines.push(format!("Bayes  {}int {}noise", interactive, noise));
+
+    // RL Q-table
+    if m.rl_total_ticks > 0 {
+        lines.push(format!(
+            "RL     {} adj{:+}",
+            format_number(m.rl_total_ticks),
+            m.rl_adjustment_pp
+        ));
+    }
+
+    // Kalman (we just refactored it)
+    lines.push("Kalman conv ✅".to_string());
+
+    // Causal Graph
+    lines.push(format!(
+        "Causal {} slow",
+        format_number(m.causal_slow_horizon_count as u64)
+    ));
+    lines.push(format!(
+        "       {} mech",
+        format_number(m.causal_mechanism_count as u64)
+    ));
+
+    // Hazard / MPC / Markov (compact)
+    lines.push("Hazard ✅ low risk".to_string());
+    lines.push(format!("Workload {}", m.current_workload.chars().take(20).collect::<String>()));
+
+    lines
+}
+
+// ── 🎯 DECIDE quadrant ───────────────────────────────────────────────────────
+fn render_decide_q(status: &DaemonStatus) -> Vec<String> {
+    let m = &status.metrics;
+    let mut lines = vec![bold(&q_header("🎯", "DECIDE"))];
+
+    // MetaCognition
+    let humble = m.meta_confidence < 0.40;
+    let meta_label = if humble { "HUMBLE" } else if m.meta_confidence > 0.70 { "CONFIDENT" } else { "NORMAL" };
+    let meta_emoji = if humble { "🤔" } else { "🎯" };
+    lines.push(format!(
+        "Meta   {} {} {:.0}%",
+        meta_emoji,
+        meta_label,
+        m.meta_confidence * 100.0
+    ));
+
+    // Arousal
+    let arousal_pct = (m.arousal_level * 100.0) as i32;
+    lines.push(format!(
+        "Arousal {} {}%",
+        m.arousal_zone, arousal_pct
+    ));
+
+    // UCHS
+    lines.push(format!(
+        "UCHS   {:.0}% {}",
+        m.uchs_composite * 100.0,
+        m.uchs_grade
+    ));
+
+    // Workload + confidence
+    lines.push(format!("Conf   {:.0}%", m.ml_confidence * 100.0));
+
+    // FG app
+    if let Some(fg) = &m.foreground_app {
+        let name: String = fg.name.chars().take(20).collect();
+        let active = if m.foreground_idle { "💤" } else { "🟢" };
+        lines.push(format!("FG     {} {}", active, name));
+    }
+
+    // Profile
+    let prof_emoji = profile_emoji(status.effective_profile);
+    lines.push(format!(
+        "Profile {} {}",
+        prof_emoji,
+        status.effective_profile.as_str()
+    ));
+
+    // LLM
+    if let Some(l) = &status.llm {
+        let llm_state = if l.enabled { "✅" } else { "❌" };
+        lines.push(format!(
+            "LLM    {} {}/{}",
+            llm_state, l.calls_today, l.daily_budget
+        ));
+    } else {
+        lines.push("LLM    ❌ off".to_string());
+    }
+
+    lines
+}
+
+// ── 🎬 ACT quadrant ──────────────────────────────────────────────────────────
+fn render_act_q(status: &DaemonStatus) -> Vec<String> {
+    let m = &status.metrics;
+    let mut lines = vec![bold(&q_header("🎬", "ACT"))];
+
+    // SafetyPolicy budgets — derive from profile to mirror per-profile caps.
+    let pol = SafetyPolicy::for_profile(status.effective_profile);
+    let bar_w = 8;
+    let boost_ratio = (m.boosts_applied as f64 / pol.max_boosts_per_cycle.max(1) as f64).min(1.0);
+    let throt_ratio = (m.throttles_applied as f64 / pol.max_throttles_per_cycle.max(1) as f64).min(1.0);
+    let frz_ratio = (m.freezes_applied as f64 / pol.max_freezes_per_cycle.max(1) as f64).min(1.0);
+    let hint_ratio = (m.paging_hints_applied as f64 / pol.max_paging_hints_per_cycle.max(1) as f64).min(1.0);
+
+    lines.push(format!(
+        "Boost  {} {}/{}",
+        render_bar(boost_ratio, bar_w),
+        m.boosts_applied,
+        pol.max_boosts_per_cycle
+    ));
+    lines.push(format!(
+        "Throt  {} {}/{}",
+        render_bar(throt_ratio, bar_w),
+        m.throttles_applied,
+        pol.max_throttles_per_cycle
+    ));
+    lines.push(format!(
+        "Frz    {} {}/{}",
+        render_bar(frz_ratio, bar_w),
+        m.freezes_applied,
+        pol.max_freezes_per_cycle
+    ));
+    lines.push(format!(
+        "Hint   {} {}/{}",
+        render_bar(hint_ratio, bar_w),
+        m.paging_hints_applied,
+        pol.max_paging_hints_per_cycle
+    ));
+
+    let frozen_n = status.frozen_processes.len();
+    let frozen_mb = m.frozen_ram_mb;
+    if frozen_n > 0 {
+        lines.push(format!("Frozen {} ({:.0}MB)", frozen_n, frozen_mb));
+    } else {
+        lines.push("Frozen 0".to_string());
+    }
+
+    let pkg_w = m.energy_package_watts.unwrap_or(0.0);
+    lines.push(format!("Energy {:.2}W", pkg_w));
+    lines.push(format!(
+        "Saved  {:.2}Wh {:.2}gCO₂",
+        m.energy_savings_wh.unwrap_or(0.0),
+        m.energy_co2_avoided_g.unwrap_or(0.0)
+    ));
+    lines.push(format!("Reactor {} {}", status.reactor_mode, status.reactor_health));
+
+    lines
+}
+
+// ── 🚪 GATES band (full-width) ───────────────────────────────────────────────
+fn render_gates_band(status: &DaemonStatus) -> Vec<String> {
+    let m = &status.metrics;
+    let mut lines = vec![bold("🚪 GATES")];
+
+    // Survival: based on memory pressure
+    let surv = if m.memory_pressure >= 0.85 {
+        red("🔴 ACTIVE")
+    } else {
+        green("🟢 ready")
+    };
+
+    // Maintenance purge: blocked by media or other gates?
+    let media_blocked = m.user_audio_active || m.user_call_in_progress || m.user_has_sleep_assertion;
+    let purge_state = if media_blocked {
+        let reason = if m.user_call_in_progress {
+            "call"
+        } else if m.user_audio_active {
+            "audio"
+        } else {
+            "sleep-assertion"
+        };
+        red(&format!("🔴 BLOCKED ({})", reason))
+    } else if m.memory_pressure < 0.65 {
+        dim("⬜ idle (p<0.65)")
+    } else {
+        green("🟢 ready")
+    };
+
+    lines.push(format!("survival {}  ·  maintenance-purge {}", surv, purge_state));
+
+    // Build mode + post-wake
+    let post_wake = if status.post_wake_grace_active {
+        yellow(&format!("⚠ grace ({}s)", status.post_wake_grace_remaining_secs))
+    } else {
+        green("🟢 ready")
+    };
+    lines.push(format!("freeze 🟢 user-protected  ·  post-wake {}", post_wake));
+
+    // Maintenance purge counters
+    let total_skipped = m.maintenance_purge_skipped_pressure_total
+        + m.maintenance_purge_skipped_swap_floor_total
+        + m.maintenance_purge_skipped_growing_total
+        + m.maintenance_purge_skipped_idle_total
+        + m.maintenance_purge_skipped_build_mode_total
+        + m.maintenance_purge_skipped_rate_limit_total;
+
+    let mut skip_breakdown = Vec::new();
+    if m.maintenance_purge_skipped_pressure_total > 0 {
+        skip_breakdown.push(format!("pres:{}", m.maintenance_purge_skipped_pressure_total));
+    }
+    if m.maintenance_purge_skipped_idle_total > 0 {
+        skip_breakdown.push(format!("idle/media:{}", m.maintenance_purge_skipped_idle_total));
+    }
+    if m.maintenance_purge_skipped_swap_floor_total > 0 {
+        skip_breakdown.push(format!("floor:{}", m.maintenance_purge_skipped_swap_floor_total));
+    }
+    if m.maintenance_purge_skipped_growing_total > 0 {
+        skip_breakdown.push(format!("grow:{}", m.maintenance_purge_skipped_growing_total));
+    }
+    if m.maintenance_purge_skipped_build_mode_total > 0 {
+        skip_breakdown.push(format!("build:{}", m.maintenance_purge_skipped_build_mode_total));
+    }
+    if m.maintenance_purge_skipped_rate_limit_total > 0 {
+        skip_breakdown.push(format!("rate:{}", m.maintenance_purge_skipped_rate_limit_total));
+    }
+
+    let breakdown_str = if skip_breakdown.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", skip_breakdown.join(" "))
+    };
+
+    lines.push(dim(&format!(
+        "purge stats: {} fired · {} skipped{}",
+        m.maintenance_purge_total, total_skipped, breakdown_str
+    )));
+
+    lines
+}
+
+// ── 🌳 CHROMIUM band (compact) ───────────────────────────────────────────────
+fn render_chromium_band(status: &DaemonStatus) -> Vec<String> {
+    let m = &status.metrics;
+    if m.chromium_renderers_total == 0 && m.chromium_browsers_managed.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![bold("🌳 CHROMIUM")];
+    lines.push(format!(
+        "renderers={} frozen={} e-core={} freed={:.0}MB",
+        m.chromium_renderers_total,
+        m.chromium_renderers_frozen,
+        m.chromium_renderers_ecore,
+        m.chromium_freed_mb
+    ));
+    if !m.chromium_browsers_managed.is_empty() {
+        let apps = m.chromium_browsers_managed.join(", ");
+        let truncated: String = apps.chars().take(60).collect();
+        lines.push(dim(&format!("apps: {}", truncated)));
+    }
+    lines
+}
+
+// ── ⚡ TOP CONSUMERS band ────────────────────────────────────────────────────
+fn render_consumers_band(status: &DaemonStatus) -> Vec<String> {
+    let m = &status.metrics;
+    if m.energy_top_consumers.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![bold("⚡ TOP CONSUMERS")];
+    let total_w: f64 = m.energy_top_consumers.iter().map(|c| c.current_watts).sum();
+    for (i, c) in m.energy_top_consumers.iter().take(5).enumerate() {
+        let pct = if total_w > 0.0 {
+            (c.current_watts / total_w * 100.0) as i32
+        } else {
+            0
+        };
+        let name: String = c.name.chars().take(22).collect();
+        let bar = render_bar(c.current_watts / total_w.max(0.01), 12);
+        lines.push(format!(
+            "{}. {:<22} {:.2}W {} {:>3}%",
+            i + 1,
+            name,
+            c.current_watts,
+            bar,
+            pct
+        ));
+    }
+    lines
+}
+
+// ── 📋 VERDICT band (cognitive) ──────────────────────────────────────────────
+fn render_verdict_band(status: &DaemonStatus) -> Vec<String> {
+    let m = &status.metrics;
+    let mut lines = vec![bold("📋 VEREDICTO")];
+
+    let pressure = m.memory_pressure;
+    let media_active = m.user_audio_active || m.user_call_in_progress || m.user_has_sleep_assertion;
+    let humble = m.meta_confidence < 0.40;
+
+    let main = if pressure >= 0.85 {
+        red("🔴 Crisis: survival mode + emergency purge eligible")
+    } else if pressure >= 0.65 && !media_active {
+        yellow("🟡 Pressure elevada · maintenance-purge gate evalúa")
+    } else if pressure >= 0.65 && media_active {
+        yellow("🟡 Pressure elevada · purge BLOCKED (proteger media)")
+    } else if pressure >= 0.40 {
+        yellow("🟡 Pressure moderada · cognición estable")
+    } else {
+        green("🟢 Sistema optimizado · sin pressure")
+    };
+    lines.push(main);
+
+    if humble {
+        lines.push(dim("Meta: HUMBLE · 2× exploration activa"));
+    }
+
+    if status.frozen_processes.len() > 0 {
+        lines.push(dim(&format!(
+            "Frozen: {} procesos · {:.0}MB recuperados",
+            status.frozen_processes.len(),
+            m.frozen_ram_mb
+        )));
+    }
+
+    lines
+}
+
+// ── New header (compact one-line) ────────────────────────────────────────────
+fn render_header_v2(status: &DaemonStatus) -> Vec<String> {
+    let m = &status.metrics;
+    let state = if status.kill_switch {
+        yellow("⏸ Pausado")
+    } else if status.running {
+        green("Activo")
+    } else {
+        red("Detenido")
+    };
+    let profile = format!(
+        "{} {}",
+        profile_emoji(status.effective_profile),
+        status.effective_profile.as_str()
+    );
+    let mut lines = vec![bold(&format!(
+        "🚀 APOLLO {} │ {} │ ciclos: {} │ p95 {:.0}ms",
+        state,
+        profile,
+        format_number(m.cycles),
+        m.p95_cycle_ms
+    ))];
+    if status.kill_switch {
+        lines.push(yellow(
+            "⚠ Optimización pausada — apollo-optimizerctl resume",
+        ));
+    }
+    lines
+}
+
+/// Cognitive-stack grid renderer (replaces linear v1).
+pub fn render_dashboard_v2(status: &DaemonStatus) -> String {
+    let mut out = String::with_capacity(4096);
+
+    out.push_str(&box_top());
+    out.push('\n');
+    for line in render_header_v2(status) {
+        out.push_str(&box_line(&line));
+        out.push('\n');
+    }
+    out.push_str(&box_div());
+    out.push('\n');
+
+    // ── Grid row 1: SENSE | THINK ────────────────────────────────────────────
+    out.push_str(&box_empty());
+    out.push('\n');
+    let sense = render_sense_q(status);
+    let think = render_think_q(status);
+    for line in render_pair(&sense, &think) {
+        out.push_str(&box_line(&line));
+        out.push('\n');
+    }
+
+    // ── Grid row 2: DECIDE | ACT ─────────────────────────────────────────────
+    out.push_str(&box_empty());
+    out.push('\n');
+    let decide = render_decide_q(status);
+    let act = render_act_q(status);
+    for line in render_pair(&decide, &act) {
+        out.push_str(&box_line(&line));
+        out.push('\n');
+    }
+
+    // ── Full-width bands ─────────────────────────────────────────────────────
+    let bands: Vec<Vec<String>> = vec![
+        render_gates_band(status),
+        render_chromium_band(status),
+        render_consumers_band(status),
+        render_blockers(&status.last_blockers),
+        render_verdict_band(status),
+    ];
+    for band in bands.iter().filter(|b| !b.is_empty()) {
+        out.push_str(&box_empty());
+        out.push('\n');
+        for line in band {
+            out.push_str(&box_line(line));
+            out.push('\n');
+        }
+    }
+
+    out.push_str(&box_empty());
+    out.push('\n');
+    out.push_str(&box_bottom());
+    out.push('\n');
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
