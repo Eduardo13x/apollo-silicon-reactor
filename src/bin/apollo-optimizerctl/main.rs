@@ -40,6 +40,9 @@ enum Commands {
     Capabilities,
     Restore,
     PanicRestore,
+    /// Trigger an immediate maintenance purge through the daemon.
+    /// Rate-limited to 5 minutes between successive invocations.
+    Purge,
     /// Pause all optimization (creates kill switch file)
     Pause,
     /// Resume optimization (removes kill switch file)
@@ -600,6 +603,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Capabilities => send_request(DaemonRequest::GetCapabilities),
         Commands::Restore => send_request(DaemonRequest::Restore),
         Commands::PanicRestore => send_request(DaemonRequest::PanicRestore),
+        Commands::Purge => send_request(DaemonRequest::Purge),
         Commands::Pause => {
             let path = if unsafe { libc::geteuid() } == 0 {
                 "/var/run/apollo.disable"
