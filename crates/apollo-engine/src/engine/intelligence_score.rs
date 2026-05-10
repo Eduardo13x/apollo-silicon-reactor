@@ -2052,9 +2052,9 @@ mod tests {
             total_decisions: 1000,
             correct_decisions: 980,
             protected_preserved: 50,
-            protected_total: 50,   // 100% protected recall
+            protected_total: 50, // 100% protected recall
             noise_throttled: 80,
-            noise_total: 80,       // 100% noise precision
+            noise_total: 80, // 100% noise precision
             interactive_boosted: 30,
             interactive_total: 30, // 100% interactive recall
 
@@ -2140,9 +2140,9 @@ mod tests {
             total_decisions: 500,
             correct_decisions: 200,
             protected_preserved: 20,
-            protected_total: 50,   // 40% protected recall (many missed)
+            protected_total: 50, // 40% protected recall (many missed)
             noise_throttled: 30,
-            noise_total: 100,      // 30% noise precision (many reverted)
+            noise_total: 100, // 30% noise precision (many reverted)
             interactive_boosted: 5,
             interactive_total: 30, // low interactive recall
 

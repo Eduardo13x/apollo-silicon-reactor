@@ -48,8 +48,8 @@
 //! caller — nothing is smuggled through globals or statics.
 
 use crate::cognitive_tick::{self, CognitiveDecision, CognitiveState, CognitiveTickInputs};
-use apollo_engine::engine::neuromodulator::NeuroSignals;
 use apollo_engine::engine::nars_belief::DriftDetector;
+use apollo_engine::engine::neuromodulator::NeuroSignals;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
 use apollo_engine::engine::signal_intelligence::SignalDigest;
 use apollo_engine::engine::stability_oracle::StabilityOracle;
@@ -92,12 +92,12 @@ pub fn apply_neuromodulator(
         }
     };
     // [Schultz 1997] DA RPE: ODE predicted high swap urgency but pressure fell → positive.
-    let ode_rss_surprise = (ode_swap_urgency
-        * (-signal_digest.pressure_velocity as f64).max(0.0))
-        .clamp(0.0, 1.0);
+    let ode_rss_surprise =
+        (ode_swap_urgency * (-signal_digest.pressure_velocity as f64).max(0.0)).clamp(0.0, 1.0);
     let overflow_occurred = lctx.overflow_guard.history.total_overflows > 0;
     let neuro_signals = NeuroSignals {
-        pressure_drop: signal_digest.pressure_smooth as f64 * -1.0
+        pressure_drop: signal_digest.pressure_smooth as f64
+            * -1.0
             * signal_digest.pressure_velocity,
         ode_rss_surprise,
         // Combine outcome-tracker RL penalty with stability oracle signal.
@@ -215,8 +215,7 @@ pub fn run_neurocognitive_tick(
         drift_score: lctx.outcome_tracker.nars_drift_score(),
         rl_q_variance,
         linucb_exploration,
-        nars_min_confidence: (1.0 - lctx.outcome_tracker.nars_drift_score() as f32)
-            .clamp(0.0, 1.0),
+        nars_min_confidence: (1.0 - lctx.outcome_tracker.nars_drift_score() as f32).clamp(0.0, 1.0),
         outcome_effectiveness: lctx.outcome_tracker.overall_effectiveness(),
         causal_confidence: top_causal,
         causal_confidence_map,

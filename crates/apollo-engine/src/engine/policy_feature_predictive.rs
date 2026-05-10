@@ -98,8 +98,8 @@ impl PolicyFeature for PredictiveBenefitFeature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::safety::ProtectionLevel;
     use crate::engine::audit_types::DecisionReason;
+    use crate::engine::safety::ProtectionLevel;
 
     fn base_ctx() -> ActionContext {
         ActionContext {
@@ -125,11 +125,22 @@ mod tests {
     }
 
     fn freeze(pid: u32) -> RootAction {
-        RootAction::freeze(pid, format!("p{pid}"), "test", DecisionReason::PressureContext)
+        RootAction::freeze(
+            pid,
+            format!("p{pid}"),
+            "test",
+            DecisionReason::PressureContext,
+        )
     }
 
     fn throttle(pid: u32) -> RootAction {
-        RootAction::throttle(pid, format!("p{pid}"), false, "test", DecisionReason::PressureContext)
+        RootAction::throttle(
+            pid,
+            format!("p{pid}"),
+            false,
+            "test",
+            DecisionReason::PressureContext,
+        )
     }
 
     fn boost(pid: u32) -> RootAction {

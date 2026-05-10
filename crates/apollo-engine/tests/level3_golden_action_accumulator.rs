@@ -28,9 +28,7 @@
 //!
 //! Then we assert variant-sequence equivalence and per-variant counters.
 
-use apollo_engine::engine::action_accumulator::{
-    ActionAccumulator, ActionPhase, EmitContext,
-};
+use apollo_engine::engine::action_accumulator::{ActionAccumulator, ActionPhase, EmitContext};
 use apollo_engine::engine::audit_types::DecisionReason;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::network_optimizer::{NetworkOptimizer, NetworkProfile};
@@ -205,7 +203,7 @@ fn legacy_vec_and_accumulator_produce_byte_equivalent_sequences() {
     legacy.extend(fixture[12..13].iter().cloned()); // stale_apps
     legacy.push(fixture[13].clone()); // proc_recovery typed
     legacy.extend(fixture[14..16].iter().cloned()); // sysctl_governor
-    // network_optimizer — typed, but legacy path was actions.push(set_sysctl(...))
+                                                    // network_optimizer — typed, but legacy path was actions.push(set_sysctl(...))
     legacy.push(fixture[16].clone());
 
     // Accumulator path: drive the same emissions through the typed builder.
@@ -222,7 +220,11 @@ fn legacy_vec_and_accumulator_produce_byte_equivalent_sequences() {
     );
     acc.extend_raw(
         fixture[5..7].iter().cloned(),
-        ctx(ActionPhase::ClusterActions, "test::cluster", "cluster_actions"),
+        ctx(
+            ActionPhase::ClusterActions,
+            "test::cluster",
+            "cluster_actions",
+        ),
         &lf,
     );
     acc.extend_raw(
@@ -270,7 +272,11 @@ fn legacy_vec_and_accumulator_produce_byte_equivalent_sequences() {
     }
     acc.extend_raw(
         fixture[14..16].iter().cloned(),
-        ctx(ActionPhase::SysctlGovernor, "test::sysctl", "sysctl_governor"),
+        ctx(
+            ActionPhase::SysctlGovernor,
+            "test::sysctl",
+            "sysctl_governor",
+        ),
         &lf,
     );
     // network_optimizer typed
@@ -328,7 +334,10 @@ fn legacy_vec_and_accumulator_produce_byte_equivalent_sequences() {
     //    In this fixture only proc_recovery (1 freeze) and network_optimizer
     //    (1 set_sysctl) go through typed pushes. Everything else goes via
     //    extend_raw and stays in `raw` only.
-    assert_eq!(acc_telemetry.freeze, 1, "only proc_recovery typed-pushes a freeze");
+    assert_eq!(
+        acc_telemetry.freeze, 1,
+        "only proc_recovery typed-pushes a freeze"
+    );
     assert_eq!(
         acc_telemetry.set_sysctl, 1,
         "only network_optimizer typed-pushes a set_sysctl"

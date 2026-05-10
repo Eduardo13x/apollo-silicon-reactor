@@ -7,9 +7,9 @@
 //! ## Wave 38 Note: Distinction from `cognitive_tick.rs`
 //!
 //! Despite the similar naming, this module is **not** a duplicate of `cognitive_tick.rs`.
-//! `cognitive_tick.rs` contains the core neurocognitive state pipeline (RewardBus, 
-//! MetaCognition, EpistemicUncertainty, etc.). This file (`daemon_cognitive_tick.rs`) 
-//! contains disjoint pre-execution logic (Specialist Voting, Habituation, User Context) 
+//! `cognitive_tick.rs` contains the core neurocognitive state pipeline (RewardBus,
+//! MetaCognition, EpistemicUncertainty, etc.). This file (`daemon_cognitive_tick.rs`)
+//! contains disjoint pre-execution logic (Specialist Voting, Habituation, User Context)
 //! that was extracted from `main.rs`. Both are intentional and co-exist safely.
 //!
 //! ## Three blocks
@@ -60,13 +60,13 @@ use apollo_engine::engine::daemon_helpers::audit_log;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
 use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::lotka_volterra::StabilityRegime;
+use apollo_engine::engine::nars_belief::TruthValue;
 use apollo_engine::engine::overflow_guard::OverflowThresholds;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
 use apollo_engine::engine::predictive_agent::{
     specialist, tally_votes, Intervention, SpecialistVote,
 };
-use apollo_engine::engine::lotka_volterra::StabilityRegime;
-use apollo_engine::engine::nars_belief::TruthValue;
 use apollo_engine::engine::signal_intelligence::SignalDigest;
 use apollo_engine::engine::types::OptimizationProfile;
 
@@ -143,8 +143,7 @@ pub fn apply_specialist_voting(
     // measures what the specialist actually predicted, not a heuristic stand-in.
     // A spike is a pressure rise of ≥0.08 over the previous cycle.
     {
-        let pressure_spiked =
-            signal_digest.pressure_smooth >= feedback.prev_pressure_smooth + 0.08;
+        let pressure_spiked = signal_digest.pressure_smooth >= feedback.prev_pressure_smooth + 0.08;
         // Hazard: did prev cycle's hazard specialist fire (p_oom_30s > 0.30)?
         let hazard_correct = (feedback.prev_hazard_fired && pressure_spiked)
             || (!feedback.prev_hazard_fired && !pressure_spiked);
@@ -187,8 +186,7 @@ pub fn apply_specialist_voting(
         SpecialistVote {
             name: "linucb",
             intervention: linucb_choice,
-            confidence: linucb_confidence
-                * lctx.specialist_accuracy.weight(specialist::LINUCB),
+            confidence: linucb_confidence * lctx.specialist_accuracy.weight(specialist::LINUCB),
         },
     ];
 
@@ -197,7 +195,11 @@ pub fn apply_specialist_voting(
     // decisively in favour of the physics-informed signal.
     // [Kuncheva 2004 §5.2 — ensemble arbitration under conflicting specialist signals]
     if signal_digest.p_oom_30s > 0.30 {
-        let ode_boost = if ode_t_sat_urgency > 0.5 { 1.5_f64 } else { 1.0_f64 };
+        let ode_boost = if ode_t_sat_urgency > 0.5 {
+            1.5_f64
+        } else {
+            1.0_f64
+        };
         votes.push(SpecialistVote {
             name: "hazard",
             intervention: Intervention::from_index(signal_digest.mpc_recommendation),
@@ -221,10 +223,10 @@ pub fn apply_specialist_voting(
         // NARS belief maturity gate: scale confidence by accumulated evidence.
         // Young beliefs get floor-weight (0.4); mature beliefs get full weight.
         // [Pei Wang 2013 §3.3.1, Gray & Reuter 1992 §11]
-        let obs_remaining = lctx
-            .outcome_tracker
-            .drift_detector
-            .observations_remaining(specialist::NAMES[specialist::MONOPOLY], MONOPOLY_BELIEF_CONFIDENCE_TARGET);
+        let obs_remaining = lctx.outcome_tracker.drift_detector.observations_remaining(
+            specialist::NAMES[specialist::MONOPOLY],
+            MONOPOLY_BELIEF_CONFIDENCE_TARGET,
+        );
         let maturity_factor = monopoly_maturity_factor(obs_remaining);
         let confidence = (signal_digest.monopoly_risk.min(1.0)
             * lctx.specialist_accuracy.weight(specialist::MONOPOLY)
@@ -272,8 +274,8 @@ pub fn apply_specialist_voting(
     if signal_digest.pressure_predicted_30s > p30_trigger
         && signal_digest.pressure_smooth < p30_clear
     {
-        let strength = ((signal_digest.pressure_predicted_30s - p30_trigger) / 0.10)
-            .clamp(0.0, 1.0);
+        let strength =
+            ((signal_digest.pressure_predicted_30s - p30_trigger) / 0.10).clamp(0.0, 1.0);
         votes.push(SpecialistVote {
             name: "proactive-30s",
             intervention: Intervention::TightenThresholds,
@@ -315,7 +317,9 @@ pub fn apply_specialist_voting(
     };
 
     // Apply threshold tightening if selected.
-    *overflow_thresholds = lctx.predictive_agent.adjust_thresholds(*overflow_thresholds);
+    *overflow_thresholds = lctx
+        .predictive_agent
+        .adjust_thresholds(*overflow_thresholds);
 
     // SuggestAggressive: set a 5-minute manual override to aggressive profile.
     if intervention == Intervention::SuggestAggressive {
@@ -458,8 +462,8 @@ pub fn monopoly_maturity_factor(obs_remaining: Option<u32>) -> f64 {
         None => MONOPOLY_MATURITY_FLOOR,
         Some(0) => 1.0,
         Some(rem) => {
-            let needed = TruthValue::observations_to_reach(MONOPOLY_BELIEF_CONFIDENCE_TARGET)
-                .max(1) as f64;
+            let needed =
+                TruthValue::observations_to_reach(MONOPOLY_BELIEF_CONFIDENCE_TARGET).max(1) as f64;
             let progress = 1.0 - ((rem as f64 / needed).min(1.0));
             MONOPOLY_MATURITY_FLOOR + (1.0 - MONOPOLY_MATURITY_FLOOR) * progress
         }
@@ -489,8 +493,7 @@ mod tests {
 
     #[test]
     fn maturity_factor_half_progress_is_midway() {
-        let needed =
-            TruthValue::observations_to_reach(MONOPOLY_BELIEF_CONFIDENCE_TARGET) as f64;
+        let needed = TruthValue::observations_to_reach(MONOPOLY_BELIEF_CONFIDENCE_TARGET) as f64;
         let half = (needed / 2.0).ceil() as u32;
         let factor = monopoly_maturity_factor(Some(half));
         // ~midway between floor and 1.0 (0.7 ± ε)

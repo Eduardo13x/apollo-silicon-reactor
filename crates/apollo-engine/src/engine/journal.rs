@@ -111,8 +111,8 @@ pub fn read_journal(path: &Path) -> anyhow::Result<Vec<JournalEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::types::{FreezeSource, FrozenEntry, RootAction};
     use crate::engine::audit_types::DecisionReason;
+    use crate::engine::types::{FreezeSource, FrozenEntry, RootAction};
     use std::io::Write;
 
     fn make_entry() -> JournalEntry {

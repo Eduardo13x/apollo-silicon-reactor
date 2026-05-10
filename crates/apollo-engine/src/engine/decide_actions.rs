@@ -851,7 +851,9 @@ pub fn decide_actions(
                                 ),
                                 decision_reason: DecisionReason::AnomalyDetected,
                                 // Runaway: route hot thread to E-cluster (penalize).
-                                affinity_tag: Some(crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER),
+                                affinity_tag: Some(
+                                    crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER,
+                                ),
                             });
                             thread_actions_emitted += 1;
                         }
@@ -874,7 +876,9 @@ pub fn decide_actions(
                                     idx, name, analysis.active_count, analysis.thread_count
                                 ),
                                 decision_reason: DecisionReason::ThreadQoSRouting,
-                                affinity_tag: Some(crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER),
+                                affinity_tag: Some(
+                                    crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER,
+                                ),
                             });
                             thread_actions_emitted += 1;
                         }
@@ -923,7 +927,9 @@ pub fn decide_actions(
                                 ),
                                 decision_reason: DecisionReason::ThreadQoSRouting,
                                 // Normal hot thread: P-cluster preference (latency-sensitive).
-                                affinity_tag: Some(crate::engine::mach_qos::mach_sys::AFFINITY_TAG_P_CLUSTER),
+                                affinity_tag: Some(
+                                    crate::engine::mach_qos::mach_sys::AFFINITY_TAG_P_CLUSTER,
+                                ),
                             });
                             thread_actions_emitted += 1;
                         }
@@ -939,7 +945,9 @@ pub fn decide_actions(
                                 reason: format!("cold thread #{} in {} (waiting)", idx, name),
                                 decision_reason: DecisionReason::ThreadQoSRouting,
                                 // Normal cold thread: E-cluster (battery-friendly).
-                                affinity_tag: Some(crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER),
+                                affinity_tag: Some(
+                                    crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER,
+                                ),
                             });
                             thread_actions_emitted += 1;
                         }
@@ -1123,7 +1131,14 @@ pub fn decide_actions(
                 // analysis. Uses a synthetic probe candidate (pid=0) because
                 // the gate blocks the entire class; individual PIDs are not
                 // yet enumerated at this branch. [Nygard 2018 §8.5]
-                let probe = RootAction::freeze_full(0, "<shadow-probe>", "shadow-probe", 0, 0, DecisionReason::PressureContext);
+                let probe = RootAction::freeze_full(
+                    0,
+                    "<shadow-probe>",
+                    "shadow-probe",
+                    0,
+                    0,
+                    DecisionReason::PressureContext,
+                );
                 let ctx = ActionContext {
                     pressure: snapshot.pressure.memory_pressure,
                     swap_gb: snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -1261,8 +1276,9 @@ pub fn decide_actions(
                 // would be too conservative.
                 // [Nygard 2018] §8.5 circuit-breaker hold-down.
                 if freeze_gate == "swap-pct" {
-                    freeze_candidates
-                        .retain(|(pid, _name, _rss, _cpu, _start_sec)| !freeze_cooldown.is_in_cooldown(*pid));
+                    freeze_candidates.retain(|(pid, _name, _rss, _cpu, _start_sec)| {
+                        !freeze_cooldown.is_in_cooldown(*pid)
+                    });
                 }
                 // Cap at 3 per cycle — avoid SIGSTOP burst overhead on display pipeline.
                 for (pid, name, _rss, cpu, start_sec) in freeze_candidates.into_iter().take(3) {

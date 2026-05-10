@@ -25,7 +25,10 @@ use chrono::{Duration as ChronoDuration, Utc};
 
 /// Run one wake-detection tick.
 ///
-/// Returns `grace_active`: true if currently inside a post-wake grace window.
+/// Returns `(grace_active, wake_just_detected)`:
+/// - `grace_active`: true if currently inside a post-wake grace window.
+/// - `wake_just_detected`: true if a new wake event was detected this cycle.
+///   The caller should invoke `maintenance_state.observe_wake()` when true.
 ///
 /// # Parameters
 /// - `state` — Shared daemon state (process, frozen_state, policy, metrics).
@@ -42,8 +45,9 @@ pub fn run_wake_tick(
     wake_unfreeze_queue: &mut VecDeque<u32>,
     display_turbo: &mut DisplayTurbo,
     wake_state_path: &Path,
-) -> bool {
+) -> (bool, bool) {
     let now_wall = Utc::now();
+    let mut wake_just_detected = false;
     let mut process_guard = state.process.lock_recover();
     let wake_jump = now_wall - process_guard.wake_state.last_cycle_wallclock;
     let mut grace_active = process_guard
@@ -57,6 +61,7 @@ pub fn run_wake_tick(
     }
     if wake_jump > ChronoDuration::seconds(90) {
         // Treat as wake: engage grace window and queue all frozen PIDs.
+        wake_just_detected = true;
         process_guard.wake_state.last_wake_at = Some(now_wall);
         process_guard.wake_state.post_wake_grace_until =
             Some(now_wall + ChronoDuration::seconds(60));
@@ -120,5 +125,5 @@ pub fn run_wake_tick(
     write_wake_state(wake_state_path, &process_guard.wake_state);
     drop(process_guard);
 
-    grace_active
+    (grace_active, wake_just_detected)
 }

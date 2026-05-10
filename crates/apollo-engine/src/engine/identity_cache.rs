@@ -217,7 +217,11 @@ mod tests {
     use super::*;
 
     fn key(pid: u32) -> IdentityKey {
-        IdentityKey { pid, start_sec: 100, start_usec: 200 }
+        IdentityKey {
+            pid,
+            start_sec: 100,
+            start_usec: 200,
+        }
     }
 
     #[test]
@@ -253,15 +257,27 @@ mod tests {
     fn invalidate_pid_evicts_all_keys_for_pid() {
         let cache = IdentityCache::new();
         cache.validate_or_refresh(
-            IdentityKey { pid: 100, start_sec: 1, start_usec: 0 },
+            IdentityKey {
+                pid: 100,
+                start_sec: 1,
+                start_usec: 0,
+            },
             Some(0xa),
         );
         cache.validate_or_refresh(
-            IdentityKey { pid: 100, start_sec: 2, start_usec: 0 },
+            IdentityKey {
+                pid: 100,
+                start_sec: 2,
+                start_usec: 0,
+            },
             Some(0xb),
         );
         cache.validate_or_refresh(
-            IdentityKey { pid: 200, start_sec: 1, start_usec: 0 },
+            IdentityKey {
+                pid: 200,
+                start_sec: 1,
+                start_usec: 0,
+            },
             Some(0xc),
         );
         let evicted = cache.invalidate_pid(100);
@@ -294,7 +310,11 @@ mod tests {
         // proof. validate_or_refresh treats fresh_path_hash=Some as Validated
         // (caller did the syscall) but does NOT insert into cache.
         let cache = IdentityCache::new();
-        let legacy_key = IdentityKey { pid: 123, start_sec: 0, start_usec: 0 };
+        let legacy_key = IdentityKey {
+            pid: 123,
+            start_sec: 0,
+            start_usec: 0,
+        };
         let r = cache.validate_or_refresh(legacy_key, Some(0xdead));
         assert_eq!(r, IdentityValidation::Validated);
         assert_eq!(cache.len(), 0, "start_sec=0 must NOT be cached");
@@ -303,7 +323,11 @@ mod tests {
     #[test]
     fn start_sec_zero_with_no_path_returns_dead() {
         let cache = IdentityCache::new();
-        let legacy_key = IdentityKey { pid: 123, start_sec: 0, start_usec: 0 };
+        let legacy_key = IdentityKey {
+            pid: 123,
+            start_sec: 0,
+            start_usec: 0,
+        };
         let r = cache.validate_or_refresh(legacy_key, None);
         assert_eq!(r, IdentityValidation::Dead);
     }
@@ -333,7 +357,11 @@ mod tests {
     fn lookup_by_pid_finds_any_fresh_entry_for_pid() {
         let cache = IdentityCache::new();
         cache.validate_or_refresh(
-            IdentityKey { pid: 4242, start_sec: 1000, start_usec: 500 },
+            IdentityKey {
+                pid: 4242,
+                start_sec: 1000,
+                start_usec: 500,
+            },
             Some(0xabcd),
         );
         assert_eq!(
@@ -348,7 +376,11 @@ mod tests {
     fn lookup_by_pid_returns_none_after_ttl_expiry() {
         let cache = IdentityCache::with_ttl(Duration::from_millis(40));
         cache.validate_or_refresh(
-            IdentityKey { pid: 5050, start_sec: 1000, start_usec: 500 },
+            IdentityKey {
+                pid: 5050,
+                start_sec: 1000,
+                start_usec: 500,
+            },
             Some(0xbeef),
         );
         assert_eq!(

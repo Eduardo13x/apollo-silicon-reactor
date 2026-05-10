@@ -841,16 +841,17 @@ mod tests {
     use super::*;
 
     fn parse(toml_src: &str) -> LlmConfig {
-        let cfg: RepoConfig =
-            toml::from_str(toml_src).expect("test fixture must be valid TOML");
+        let cfg: RepoConfig = toml::from_str(toml_src).expect("test fixture must be valid TOML");
         cfg.llm.expect("test fixture must set [llm]")
     }
 
     #[test]
     fn always_on_defaults_to_false() {
         let cfg = parse("[llm]\nenabled = true\n");
-        assert!(!cfg.always_on(),
-            "always_on must default false so cloud configs keep training-TTL gating");
+        assert!(
+            !cfg.always_on(),
+            "always_on must default false so cloud configs keep training-TTL gating"
+        );
     }
 
     #[test]
@@ -868,8 +869,10 @@ mod tests {
         // initial gate. Regression guard: if these ever collapse into one
         // flag, the user loses the kill-switch mid-session.
         let cfg = parse("[llm]\nenabled = false\nalways_on = true\n");
-        assert!(!cfg.enabled(),
-            "enabled=false must disable even when always_on=true");
+        assert!(
+            !cfg.enabled(),
+            "enabled=false must disable even when always_on=true"
+        );
         assert!(cfg.always_on());
     }
 

@@ -180,8 +180,7 @@ impl SystemLogIngester {
                     // already in jetsam territory (observed 2026-04-30
                     // lockup: ingester polled every 60s while p_oom > 0.85,
                     // compounding the crisis it was trying to observe).
-                    let p_oom = crate::engine::shadow_signals::get_p_oom_30s()
-                        .unwrap_or(0.0);
+                    let p_oom = crate::engine::shadow_signals::get_p_oom_30s().unwrap_or(0.0);
                     if p_oom > 0.50 && skip_streak < MAX_CONSECUTIVE_SKIPS {
                         skip_streak += 1;
                         std::thread::sleep(poll_interval * 5);

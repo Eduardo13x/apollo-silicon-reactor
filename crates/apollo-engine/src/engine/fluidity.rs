@@ -215,7 +215,11 @@ impl FluidityState {
 
         // Penalty computation [Jain 1991]
         let ws_penalty = (self.windowserver_cpu_ema / 100.0 * 0.4).min(0.4);
-        let spike_penalty = if self.windowserver_cpu_spike { 0.2 } else { 0.0 };
+        let spike_penalty = if self.windowserver_cpu_spike {
+            0.2
+        } else {
+            0.0
+        };
         let gpu_penalty = self.gpu_render_load * 0.2;
         let launch_penalty = if self.launch_active { 0.1 } else { 0.0 };
 
@@ -260,14 +264,17 @@ impl FluidityState {
             }
 
             // Offender tracking [Pearl 2009]
-            if self.fluidity_degraded && cpu > OFFENDER_CPU_THRESHOLD && !is_protected_name(name_ref) {
+            if self.fluidity_degraded
+                && cpu > OFFENDER_CPU_THRESHOLD
+                && !is_protected_name(name_ref)
+            {
                 if let Some(entry) = self
                     .fluidity_offenders
                     .iter_mut()
                     .find(|(p, n, _)| *p == pid && n == name_ref)
                 {
-                    entry.2 = OFFENDER_EMA_ALPHA * (cpu / 100.0)
-                        + (1.0 - OFFENDER_EMA_ALPHA) * entry.2;
+                    entry.2 =
+                        OFFENDER_EMA_ALPHA * (cpu / 100.0) + (1.0 - OFFENDER_EMA_ALPHA) * entry.2;
                 } else if self.fluidity_offenders.len() < MAX_OFFENDERS {
                     self.fluidity_offenders
                         .push((pid, name_ref.to_string(), cpu / 100.0));

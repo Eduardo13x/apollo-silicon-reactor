@@ -13,6 +13,7 @@
 //! ## Ordering invariant
 //! Must run AFTER signal_digest is available and BEFORE neuromodulator / decide_actions.
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use apollo_engine::collector::SystemSnapshot;
@@ -20,10 +21,17 @@ use apollo_engine::engine::chromium_manager::ChromiumManager;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::learned_state::LearnableParams;
 use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::maintenance_state::MaintenanceState;
 use apollo_engine::engine::overflow_guard::OverflowGuard;
 use apollo_engine::engine::safety::{survival_mode_active_total, swap_exhaustion_threshold_bytes};
-use apollo_engine::engine::signal_intelligence::SignalIntelligence;
 use apollo_engine::engine::signal_intelligence::SignalDigest;
+use apollo_engine::engine::signal_intelligence::SignalIntelligence;
+
+/// Survival's own 10-min Instant cooldown — independent from
+/// maintenance_state.last_any_purge_at. This is the asymmetric design:
+/// survival writes the shared timestamp but NEVER reads it, so a recent
+/// maintenance purge cannot block a real OOM-imminent purge.
+static SURVIVAL_LOCAL_COOLDOWN: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Run survival-mode detection, overflow recording, and threshold decay.
 ///
@@ -37,7 +45,11 @@ use apollo_engine::engine::signal_intelligence::SignalDigest;
 /// - `swap_growth_streak` — mutable swap-growth counter for RL meta-gate
 /// - `state` — SharedState (survival_mode_entry_count metric)
 /// - `chromium_mgr` — demote renderers in survival mode
-/// - `last_purge_at` — rate-limit guard for `purge` command (once per 10 min)
+/// - `maintenance_state` — asymmetric purge state. Survival keeps its
+///   own SURVIVAL_LOCAL_COOLDOWN (10-min Instant) for gating its fire
+///   decision and is NEVER blocked by maintenance's recent purge. After
+///   firing, writes maintenance_state.mark_purged() so maintenance_tick
+///   yields for 30 min. Survival is physical-crisis sovereign.
 #[allow(clippy::too_many_arguments)]
 pub fn run_survival_tick(
     snapshot: &SystemSnapshot,
@@ -49,7 +61,7 @@ pub fn run_survival_tick(
     swap_growth_streak: &mut u32,
     state: &SharedState,
     chromium_mgr: &mut ChromiumManager,
-    last_purge_at: &mut Option<Instant>,
+    maintenance_state: &mut MaintenanceState,
 ) {
     let p_oom_escalation = cycle_count > 5
         && signal_digest.p_oom_30s > 0.80
@@ -79,8 +91,7 @@ pub fn run_survival_tick(
             &learnable_params.rl_compressor_bands,
         );
         let sr = if snapshot.pressure.swap_total_bytes > 0 {
-            snapshot.pressure.swap_used_bytes as f64
-                / snapshot.pressure.swap_total_bytes as f64
+            snapshot.pressure.swap_used_bytes as f64 / snapshot.pressure.swap_total_bytes as f64
         } else {
             0.0
         };
@@ -112,23 +123,34 @@ pub fn run_survival_tick(
         snapshot.pressure.swap_total_bytes,
     );
     if survival_active {
-        state.metrics.lock_recover().metrics.survival_mode_entry_count += 1;
+        state
+            .metrics
+            .lock_recover()
+            .metrics
+            .survival_mode_entry_count += 1;
 
         // Jetsam demotion: mark non-foreground Chromium renderers as BACKGROUND
         // so the kernel kills them first under OOM — softer than SIGSTOP.
         let _ = chromium_mgr.demote_background_renderers();
 
         // Last-resort page reclaim: spawn `purge` when swap crosses 80% of
-        // exhaustion threshold. Rate-limited to once per 10 min.
+        // exhaustion threshold. Survival reads its OWN local cooldown only —
+        // asymmetric: never gated by shared maintenance_state.last_any_purge_at.
         let threshold = swap_exhaustion_threshold_bytes(snapshot.pressure.swap_total_bytes);
         let swap_used = snapshot.pressure.swap_used_bytes;
         if swap_used as f64 >= threshold as f64 * 0.80 {
-            let can_purge = last_purge_at
-                .map(|t| t.elapsed() >= Duration::from_secs(600))
+            let mut local = SURVIVAL_LOCAL_COOLDOWN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let can_purge = local
+                .map(|t: Instant| t.elapsed() >= Duration::from_secs(600))
                 .unwrap_or(true);
             if can_purge {
                 if std::process::Command::new("purge").spawn().is_ok() {
-                    *last_purge_at = Some(Instant::now());
+                    *local = Some(Instant::now());
+                    // Write shared timestamp so maintenance_tick yields.
+                    // Survival itself does NOT read this field — asymmetric.
+                    maintenance_state.mark_purged();
                 }
             }
         }

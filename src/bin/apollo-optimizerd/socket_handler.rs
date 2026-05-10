@@ -743,6 +743,31 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 degradation_transitions: deg_transitions,
             })
         }
+        DaemonRequest::Purge => {
+            use crate::main_loop_msg::{MainLoopMsg, MAIN_LOOP_TX};
+            let tx = match MAIN_LOOP_TX.get() {
+                Some(m) => m.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                None => {
+                    return DaemonResponse::PurgeResult {
+                        fired: false,
+                        reason: "main loop not ready".into(),
+                    };
+                }
+            };
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            if tx.send(MainLoopMsg::CliPurge { response_tx }).is_err() {
+                return DaemonResponse::PurgeResult {
+                    fired: false,
+                    reason: "main loop unreachable".into(),
+                };
+            }
+            response_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap_or(DaemonResponse::PurgeResult {
+                    fired: false,
+                    reason: "timeout".into(),
+                })
+        }
         // Subscribe es manejado antes de llegar aqui (en handle_client)
         DaemonRequest::Subscribe => DaemonResponse::Ok,
         DaemonRequest::GetVersion => DaemonResponse::VersionInfo {

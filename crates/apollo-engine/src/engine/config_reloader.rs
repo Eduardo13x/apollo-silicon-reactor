@@ -100,9 +100,7 @@ pub struct LlmConfigReloader {
 
 impl LlmConfigReloader {
     pub fn new(config_path: PathBuf, pending_trial_path: PathBuf) -> Self {
-        let last_mtime = fs::metadata(&config_path)
-            .and_then(|m| m.modified())
-            .ok();
+        let last_mtime = fs::metadata(&config_path).and_then(|m| m.modified()).ok();
         Self {
             config_path,
             pending_trial_path,

@@ -107,8 +107,8 @@ impl PolicyFeature for DeepScanCostFeature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::safety::ProtectionLevel;
     use crate::engine::audit_types::DecisionReason;
+    use crate::engine::safety::ProtectionLevel;
 
     /// Build an `ActionContext` with sensible defaults; tests override what they need.
     fn make_ctx(hot_page_fraction: Option<f64>, wss_mb: Option<f64>) -> ActionContext {

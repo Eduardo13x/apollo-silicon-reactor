@@ -96,10 +96,8 @@ pub fn run_chromium_tick(
         chromium_mgr.set_visible_pids(visible);
     }
 
-    let chromium_assertion_pids =
-        apollo_engine::engine::activity_sensor::pids_with_assertions();
-    let main_frozen_set: HashSet<u32> =
-        state.frozen_state.lock_recover().keys().copied().collect();
+    let chromium_assertion_pids = apollo_engine::engine::activity_sensor::pids_with_assertions();
+    let main_frozen_set: HashSet<u32> = state.frozen_state.lock_recover().keys().copied().collect();
     let proc_list: Vec<(u32, &str, f32, u64)> = proc_snaps
         .iter()
         .map(|p| (p.pid, p.name.as_str(), p.cpu_percent, p.rss_bytes))
@@ -141,9 +139,8 @@ pub fn run_chromium_tick(
                 let _ = qos.set_tier(*pid, SchedulingTier::Background);
             }
             ChromiumAction::PurgePurgeable { pid, name } => {
-                let purged =
-                    apollo_engine::engine::compressor_aware::purge_purgeable_regions(*pid)
-                        .unwrap_or(0);
+                let purged = apollo_engine::engine::compressor_aware::purge_purgeable_regions(*pid)
+                    .unwrap_or(0);
                 tracing::debug!(
                     pid = pid,
                     name = name.as_str(),
@@ -209,8 +206,7 @@ pub fn run_chromium_tick(
                         if alive { 0.3 } else { 0.8 },
                     );
                 }
-                ChromiumAction::DemoteToEcores { .. }
-                | ChromiumAction::PurgePurgeable { .. } => {
+                ChromiumAction::DemoteToEcores { .. } | ChromiumAction::PurgePurgeable { .. } => {
                     // Already handled in the unconditional block above.
                 }
             }

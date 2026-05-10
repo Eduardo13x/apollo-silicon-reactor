@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
 use crate::engine::types::RootAction;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DecisionReason {
@@ -96,19 +96,19 @@ pub enum BlockReason {
 pub struct PolicyDecisionTrace {
     pub t: DateTime<Utc>,
     pub cycle: u64,
-    
+
     /// The action the policy *intended* to take.
     pub intended_action: RootAction,
-    
+
     /// The reason why the policy chose this action.
     pub decision_reason: DecisionReason,
-    
+
     /// Whether the action was actually applied to the system.
     pub applied: bool,
-    
+
     /// If not applied, the reason why it was blocked.
     pub block_reason: Option<BlockReason>,
-    
+
     /// Snapshot of relevant pressure indicators.
     pub pressure: f32,
     pub swap_gb: f32,

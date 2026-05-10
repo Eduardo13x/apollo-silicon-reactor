@@ -40,11 +40,15 @@ pub struct IdentityCacheManager {
 
 impl IdentityCacheManager {
     pub fn new() -> Self {
-        Self { cache: IdentityCache::new() }
+        Self {
+            cache: IdentityCache::new(),
+        }
     }
 
     pub fn with_ttl(ttl: Duration) -> Self {
-        Self { cache: IdentityCache::with_ttl(ttl) }
+        Self {
+            cache: IdentityCache::with_ttl(ttl),
+        }
     }
 
     /// Cache-aware identity verification. Returns `true` iff the process at
@@ -63,27 +67,37 @@ impl IdentityCacheManager {
         start_usec: u64,
         lf_metrics: &LockFreeMetrics,
     ) -> bool {
-        let key = IdentityKey { pid, start_sec, start_usec };
+        let key = IdentityKey {
+            pid,
+            start_sec,
+            start_usec,
+        };
 
         // PID-only fast path for actions without start_sec proof
         // (SetMemorystatus, Boost, Unfreeze, SetThreadQoS).
         if start_sec == 0 {
             if let Some(IdentityValidation::CachedValid) = self.cache.lookup_by_pid(pid) {
-                lf_metrics.identity_cache_hits.fetch_add(1, Ordering::Relaxed);
+                lf_metrics
+                    .identity_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 return true;
             }
         }
 
         match self.cache.validate_or_refresh(key, None) {
             IdentityValidation::CachedValid | IdentityValidation::Validated => {
-                lf_metrics.identity_cache_hits.fetch_add(1, Ordering::Relaxed);
+                lf_metrics
+                    .identity_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 return true;
             }
             IdentityValidation::Invalid => return false,
             IdentityValidation::Dead => { /* fall through to syscall */ }
         }
 
-        lf_metrics.identity_cache_misses.fetch_add(1, Ordering::Relaxed);
+        lf_metrics
+            .identity_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
         lf_metrics
             .identity_proc_pidpath_calls
             .fetch_add(1, Ordering::Relaxed);
@@ -114,7 +128,8 @@ impl IdentityCacheManager {
         } else {
             key
         };
-        self.cache.validate_or_refresh(cacheable_key, Some(path_hash));
+        self.cache
+            .validate_or_refresh(cacheable_key, Some(path_hash));
         true
     }
 
@@ -167,10 +182,7 @@ mod tests {
         // Counters: 1 miss + 1 proc_pidpath call, no hits.
         assert_eq!(lf.identity_cache_hits.load(Ordering::Relaxed), 0);
         assert_eq!(lf.identity_cache_misses.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            lf.identity_proc_pidpath_calls.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(lf.identity_proc_pidpath_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

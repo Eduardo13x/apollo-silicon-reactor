@@ -141,30 +141,28 @@ pub fn run_filter_pipeline(
     // epistemic uncertainty may not suppress all actions — the ODE provides
     // physical certainty that overrides behavioral uncertainty.
     // [Garcia & Fernandez 2015] safe RL — constraint violations bypass uncertainty gates.
-    let ode_physical_critical =
-        matches!(swap_risk, SwapRisk::Critical | SwapRisk::Overflow);
-    let op_mode = if prev_cog_decision.map_or(false, |d| d.observe_only)
-        && op_mode == OperationMode::Full
-    {
-        if ode_physical_critical {
-            // ODE override: floor at Conservative so freeze/throttle survive.
-            tracing::debug!(
-                "cognitive gate: observe_only overridden by ODE physical Critical \
+    let ode_physical_critical = matches!(swap_risk, SwapRisk::Critical | SwapRisk::Overflow);
+    let op_mode =
+        if prev_cog_decision.map_or(false, |d| d.observe_only) && op_mode == OperationMode::Full {
+            if ode_physical_critical {
+                // ODE override: floor at Conservative so freeze/throttle survive.
+                tracing::debug!(
+                    "cognitive gate: observe_only overridden by ODE physical Critical \
                  → OperationMode::Conservative"
-            );
+                );
+                OperationMode::Conservative
+            } else {
+                tracing::debug!("cognitive gate: observe_only → OperationMode::Observe");
+                OperationMode::Observe
+            }
+        } else if prev_cog_decision.map_or(false, |d| d.block_aggressive)
+            && op_mode == OperationMode::Full
+        {
+            tracing::debug!("cognitive gate: block_aggressive → OperationMode::Conservative");
             OperationMode::Conservative
         } else {
-            tracing::debug!("cognitive gate: observe_only → OperationMode::Observe");
-            OperationMode::Observe
-        }
-    } else if prev_cog_decision.map_or(false, |d| d.block_aggressive)
-        && op_mode == OperationMode::Full
-    {
-        tracing::debug!("cognitive gate: block_aggressive → OperationMode::Conservative");
-        OperationMode::Conservative
-    } else {
-        op_mode
-    };
+            op_mode
+        };
 
     // ── Mode filter ──────────────────────────────────────────────
     let filtered_actions: Vec<RootAction> = if op_mode == OperationMode::Emergency {

@@ -39,19 +39,19 @@ pub fn protected_processes() -> HashSet<&'static str> {
         "mds_stores",
         "mdworker",
         "mdworker_shared",
-        "mdbulkimport",   // bulk initial import — throttle = reindex never finishes
-        "mdwrite",        // writes Spotlight DB — throttle = index never updates
-        "mdutil",         // Spotlight control tool — throttle = mdutil commands stall
+        "mdbulkimport", // bulk initial import — throttle = reindex never finishes
+        "mdwrite",      // writes Spotlight DB — throttle = index never updates
+        "mdutil",       // Spotlight control tool — throttle = mdutil commands stall
         "corespotlightd",
         "spotlightknowledged",
         // Network / contacts / font — throttle causes app network timeouts,
         // Contacts/Settings hangs, and slow app launches with custom fonts.
-        "nsurlsessiond",  // URL session broker — throttle → network timeouts in apps
-        "contactsd",      // Contacts DB daemon — throttle → Settings/Contacts hang
-        "fontworker",     // font catalog builder — throttle → slow app launch
-        "imagent",        // iMessage agent — throttle → message send delays
-        "spindump",       // crash diagnostic — short-lived, but throttle corrupts reports
-        "ReportCrash",    // crash reporter — throttle → crash reports lost/corrupt
+        "nsurlsessiond", // URL session broker — throttle → network timeouts in apps
+        "contactsd",     // Contacts DB daemon — throttle → Settings/Contacts hang
+        "fontworker",    // font catalog builder — throttle → slow app launch
+        "imagent",       // iMessage agent — throttle → message send delays
+        "spindump",      // crash diagnostic — short-lived, but throttle corrupts reports
+        "ReportCrash",   // crash reporter — throttle → crash reports lost/corrupt
         // Display & audio rendering pipeline — freezing any of these causes frame drops,
         // animation jank, or audio glitches visible to the user. [WWDC 2021 "Tune CPU job
         // scheduling with QoS"; Apple TN2169 SIP/process policy]
@@ -577,7 +577,8 @@ pub fn survival_mode_active_total(
     let exhausted = swap_used_bytes >= swap_exhaustion_threshold_bytes(swap_total_bytes);
     let pct_exhausted = swap_total_bytes > 0
         && (swap_used_bytes as f64 / swap_total_bytes as f64) >= SURVIVAL_SWAP_PCT_THRESHOLD;
-    (memory_pressure >= SOFT_PROTECTION_PRESSURE_THRESHOLD && swap_gb >= SOFT_PROTECTION_SWAP_GB_THRESHOLD)
+    (memory_pressure >= SOFT_PROTECTION_PRESSURE_THRESHOLD
+        && swap_gb >= SOFT_PROTECTION_SWAP_GB_THRESHOLD)
         || exhausted
         || pct_exhausted
 }
@@ -1317,18 +1318,39 @@ mod tests {
     #[test]
     fn survival_mode_tiers() {
         // Normal: llama-server softly protected
-        assert!(!survival_mode_active(0.70, (1.5 * 1024.0 * 1024.0 * 1024.0) as u64));
+        assert!(!survival_mode_active(
+            0.70,
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        ));
         // High pressure but low swap: still protected
-        assert!(!survival_mode_active(0.90, (1.0 * 1024.0 * 1024.0 * 1024.0) as u64));
+        assert!(!survival_mode_active(
+            0.90,
+            (1.0 * 1024.0 * 1024.0 * 1024.0) as u64
+        ));
         // Survival: both pressure+swap thresholds crossed
-        assert!(survival_mode_active(0.85, (2.0 * 1024.0 * 1024.0 * 1024.0) as u64));
-        assert!(survival_mode_active(0.95, (4.0 * 1024.0 * 1024.0 * 1024.0) as u64));
+        assert!(survival_mode_active(
+            0.85,
+            (2.0 * 1024.0 * 1024.0 * 1024.0) as u64
+        ));
+        assert!(survival_mode_active(
+            0.95,
+            (4.0 * 1024.0 * 1024.0 * 1024.0) as u64
+        ));
         // Swap exhaustion alone (≥4GB) triggers even with low pressure
         // — kernel pressure lags when compressor absorbed the crisis [Nygard 2018]
-        assert!(survival_mode_active(0.59, (4.0 * 1024.0 * 1024.0 * 1024.0) as u64));
-        assert!(survival_mode_active(0.40, (4.5 * 1024.0 * 1024.0 * 1024.0) as u64));
+        assert!(survival_mode_active(
+            0.59,
+            (4.0 * 1024.0 * 1024.0 * 1024.0) as u64
+        ));
+        assert!(survival_mode_active(
+            0.40,
+            (4.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        ));
         // Below exhaustion floor: not triggered by swap alone
-        assert!(!survival_mode_active(0.50, (3.9 * 1024.0 * 1024.0 * 1024.0) as u64));
+        assert!(!survival_mode_active(
+            0.50,
+            (3.9 * 1024.0 * 1024.0 * 1024.0) as u64
+        ));
         // llama-server in soft list, not hard list
         assert!(!protected_processes().contains("llama-server"));
         assert!(softly_protected_processes().contains("llama-server"));
@@ -1367,11 +1389,7 @@ mod tests {
             8 * gib,
         ));
         // 6GB on 16GB machine triggers (above relative 5.6GB).
-        assert!(survival_mode_active_total(
-            0.50,
-            6 * gib,
-            16 * gib,
-        ));
+        assert!(survival_mode_active_total(0.50, 6 * gib, 16 * gib,));
         // Back-compat shim: no total known → absolute floor.
         assert!(survival_mode_active(0.50, (4.0 * gib as f64) as u64));
     }
@@ -1442,8 +1460,8 @@ mod tests {
             "launchd",
             "WindowServer",
             "Dock",
-            "sharingd",    // Bug 6: frozen 173× via gate_c (missed protected_processes)
-            "logd",        // watchdog-adjacent — SIGSTOP triggers kernel panic
+            "sharingd", // Bug 6: frozen 173× via gate_c (missed protected_processes)
+            "logd",     // watchdog-adjacent — SIGSTOP triggers kernel panic
             "watchdogd",
             "coreaudiod",
             "mDNSResponder",
@@ -1463,7 +1481,10 @@ mod tests {
     fn is_protected_name_covers_infrastructure() {
         // Exact names from infrastructure_processes().
         assert!(is_protected_name("postgres"), "postgres must be protected");
-        assert!(is_protected_name("redis-server"), "redis-server must be protected");
+        assert!(
+            is_protected_name("redis-server"),
+            "redis-server must be protected"
+        );
         assert!(is_protected_name("docker"), "docker must be protected");
         // Bundled variant — substring match catches this.
         assert!(
@@ -1477,13 +1498,19 @@ mod tests {
     fn is_protected_name_covers_dev_runtimes() {
         // Bug 3 / Bypass class 3: rustc and clippy-driver were frozen because the
         // freeze guard only checked INTERACTIVE_APPS, not dev_runtime_patterns.
-        assert!(is_protected_name("rustc"), "rustc must be protected — compiler toolchain");
+        assert!(
+            is_protected_name("rustc"),
+            "rustc must be protected — compiler toolchain"
+        );
         assert!(
             is_protected_name("clippy-driver"),
             "clippy-driver must be protected — 7 freezes during builds in prod"
         );
         assert!(is_protected_name("node"), "node must be protected");
-        assert!(is_protected_name("python3.13"), "python3.13 must be protected via substring");
+        assert!(
+            is_protected_name("python3.13"),
+            "python3.13 must be protected via substring"
+        );
     }
 
     /// Negative cases: non-protected apps must NOT be blocked.
@@ -1509,7 +1536,10 @@ mod tests {
         // Note: "mongod" IS in infrastructure_processes() (MongoDB daemon) so it
         // correctly returns true — the word-boundary test for "go" is separate
         // (see go_does_not_match_substrings test for matches_dev_runtime).
-        assert!(!is_protected_name("google-chrome"), "google-chrome must NOT match 'go'");
+        assert!(
+            !is_protected_name("google-chrome"),
+            "google-chrome must NOT match 'go'"
+        );
         assert!(!is_protected_name("Cargo"), "Cargo must NOT match 'go'");
     }
 

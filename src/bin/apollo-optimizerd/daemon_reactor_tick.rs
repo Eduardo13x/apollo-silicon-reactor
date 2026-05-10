@@ -1,8 +1,8 @@
-use apollo_engine::engine::signal_intelligence::SignalDigest;
-use apollo_engine::engine::window_sensor::{SessionPhase, WorkloadIntent};
+use apollo_engine::engine::build_tracker::{BuildPhase, BuildTracker};
 use apollo_engine::engine::holt_winters::HoltWinters;
+use apollo_engine::engine::signal_intelligence::SignalDigest;
 use apollo_engine::engine::temporal_predictor::TemporalPredictor;
-use apollo_engine::engine::build_tracker::{BuildTracker, BuildPhase};
+use apollo_engine::engine::window_sensor::{SessionPhase, WorkloadIntent};
 
 pub struct ReactorTickInput<'a> {
     pub signal_digest: &'a SignalDigest,
@@ -48,9 +48,7 @@ pub fn run_reactor_tick(input: ReactorTickInput) -> f64 {
         reactor_weight = (reactor_weight + 0.10).min(1.0);
     }
     // Lyapunov chaos: positive FTLE = exponential divergence in pressure trajectory.
-    if signal_digest.lyapunov_exponent > 0.5
-        && signal_digest.pressure_smooth > 0.40
-    {
+    if signal_digest.lyapunov_exponent > 0.5 && signal_digest.pressure_smooth > 0.40 {
         reactor_weight = (reactor_weight + 0.08).min(1.0);
     }
     // Cumulative stress: chronic high urgency boosts reactor even at moderate snapshots.
@@ -58,9 +56,7 @@ pub fn run_reactor_tick(input: ReactorTickInput) -> f64 {
         reactor_weight = (reactor_weight + 0.07).min(1.0);
     }
     // HW seasonal anomaly: pressure far above what's normal for this hour.
-    if signal_digest.hw_seasonal_anomaly > 1.5
-        && input.holt_winters.observations() >= 24
-    {
+    if signal_digest.hw_seasonal_anomaly > 1.5 && input.holt_winters.observations() >= 24 {
         reactor_weight = (reactor_weight + 0.06).min(1.0);
     }
     // Darwin-Boltzmann anomaly: learned pattern deviation.
@@ -107,7 +103,8 @@ pub fn run_reactor_tick(input: ReactorTickInput) -> f64 {
     }
 
     // Temporal pre-positioning [Denning 1968 Working Set Model].
-    let temporal_headroom = input.temporal_predictor
+    let temporal_headroom = input
+        .temporal_predictor
         .pressure_headroom_for_incoming(input.temporal_hour, input.temporal_weekday);
     if temporal_headroom > 0.02 && !input.build_tracker.build_active {
         reactor_weight = (reactor_weight + temporal_headroom).min(1.0);
@@ -144,14 +141,23 @@ mod tests {
     fn test_reactor_weight_clamping() {
         let mut si = SignalIntelligence::new();
         let digest = si.tick(
-            0.5, 0.0, 0.05, 0.1, &[10.0], &[500e6], "app",
-            500_000_000, 2_000_000_000, 8_000_000_000, 0.5
+            0.5,
+            0.0,
+            0.05,
+            0.1,
+            &[10.0],
+            &[500e6],
+            "app",
+            500_000_000,
+            2_000_000_000,
+            8_000_000_000,
+            0.5,
         );
         let hw = HoltWinters::new();
         let tp = TemporalPredictor::new(PathBuf::from("/tmp/apollo_test_tp.json"));
         let bt = BuildTracker::new();
         let mut relief = 0;
-        
+
         let input = ReactorTickInput {
             signal_digest: &digest,
             holt_winters: &hw,

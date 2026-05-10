@@ -151,9 +151,9 @@ impl ApolloNeuromodulator {
         let na_stress = s.cumulative_stress.clamp(0.0, 1.0) * 0.07;
         // [Wolf et al. 1985] trajectory divergence is a predictive NA trigger.
         let na_lyapunov = s.lyapunov_norm.clamp(0.0, 1.0) * 0.05;
-        let na_signal = (na_urgency + na_regime + na_velocity + na_thermal + na_ode
-            + na_stress + na_lyapunov)
-            .clamp(0.0, 1.0);
+        let na_signal =
+            (na_urgency + na_regime + na_velocity + na_thermal + na_ode + na_stress + na_lyapunov)
+                .clamp(0.0, 1.0);
         self.noradrenaline =
             (self.noradrenaline * (1.0 - DECAY) + na_signal * DECAY).clamp(0.0, 1.0);
 
@@ -180,8 +180,8 @@ impl ApolloNeuromodulator {
         let ach_tau = s.tau_divergence.clamp(0.0, 1.0) * 0.15;
         // G11: L2 contention novelty — unexpected cache pressure signals access-pattern shift.
         let ach_contention = s.contention_stall_fraction.clamp(0.0, 1.0) * 0.10;
-        let ach_signal = (ach_churn + ach_entropy + ach_explore + ach_tau + ach_contention)
-            .clamp(0.0, 1.0);
+        let ach_signal =
+            (ach_churn + ach_entropy + ach_explore + ach_tau + ach_contention).clamp(0.0, 1.0);
         self.acetylcholine =
             (self.acetylcholine * (1.0 - DECAY) + ach_signal * DECAY).clamp(0.0, 1.0);
 
@@ -515,21 +515,29 @@ mod tests {
         // Tick neuromod to a non-neutral state by driving all signals hard.
         let mut neuro = ApolloNeuromodulator::new();
         let mut s = default_signals();
-        s.pressure_drop = 0.40;        // drives DA up
-        s.urgency = 0.90;              // NA urgency component
-        s.regime_shift_up = true;      // NA regime component (+0.30)
-        s.pressure_velocity = 0.50;    // NA velocity component
-        s.thermal_stress = 1.0;        // NA thermal component (+0.20)
-        s.pressure_smooth = 0.15;      // drives SE streak up (low pressure)
-        s.entropy_anomaly = 2.0;       // ACh novelty
+        s.pressure_drop = 0.40; // drives DA up
+        s.urgency = 0.90; // NA urgency component
+        s.regime_shift_up = true; // NA regime component (+0.30)
+        s.pressure_velocity = 0.50; // NA velocity component
+        s.thermal_stress = 1.0; // NA thermal component (+0.20)
+        s.pressure_smooth = 0.15; // drives SE streak up (low pressure)
+        s.entropy_anomaly = 2.0; // ACh novelty
         s.rl_exploring = true;
         for _ in 0..30 {
             neuro.tick(&s);
         }
         // DA and NA should have drifted above 0.5 baseline under these inputs.
         // (NA steady-state ≈ urgency*0.35 + regime*0.30 + velocity*0.30 + thermal*0.20 ≈ 1.0)
-        assert!(neuro.dopamine > 0.5, "DA should rise above baseline: {}", neuro.dopamine);
-        assert!(neuro.noradrenaline > 0.5, "NA should rise above baseline: {}", neuro.noradrenaline);
+        assert!(
+            neuro.dopamine > 0.5,
+            "DA should rise above baseline: {}",
+            neuro.dopamine
+        );
+        assert!(
+            neuro.noradrenaline > 0.5,
+            "NA should rise above baseline: {}",
+            neuro.noradrenaline
+        );
 
         // Snapshot and restore into a fresh instance.
         let snap = neuro.snapshot();
@@ -537,25 +545,49 @@ mod tests {
         neuro2.restore(snap.clone());
 
         // Raw levels must match exactly.
-        assert!((neuro2.dopamine - snap.dopamine).abs() < 1e-10,
-            "dopamine mismatch: {} vs {}", neuro2.dopamine, snap.dopamine);
-        assert!((neuro2.noradrenaline - snap.noradrenaline).abs() < 1e-10,
-            "noradrenaline mismatch: {} vs {}", neuro2.noradrenaline, snap.noradrenaline);
-        assert!((neuro2.serotonin - snap.serotonin).abs() < 1e-10,
-            "serotonin mismatch: {} vs {}", neuro2.serotonin, snap.serotonin);
-        assert!((neuro2.acetylcholine - snap.acetylcholine).abs() < 1e-10,
-            "acetylcholine mismatch: {} vs {}", neuro2.acetylcholine, snap.acetylcholine);
+        assert!(
+            (neuro2.dopamine - snap.dopamine).abs() < 1e-10,
+            "dopamine mismatch: {} vs {}",
+            neuro2.dopamine,
+            snap.dopamine
+        );
+        assert!(
+            (neuro2.noradrenaline - snap.noradrenaline).abs() < 1e-10,
+            "noradrenaline mismatch: {} vs {}",
+            neuro2.noradrenaline,
+            snap.noradrenaline
+        );
+        assert!(
+            (neuro2.serotonin - snap.serotonin).abs() < 1e-10,
+            "serotonin mismatch: {} vs {}",
+            neuro2.serotonin,
+            snap.serotonin
+        );
+        assert!(
+            (neuro2.acetylcholine - snap.acetylcholine).abs() < 1e-10,
+            "acetylcholine mismatch: {} vs {}",
+            neuro2.acetylcholine,
+            snap.acetylcholine
+        );
 
         // Derived parameters are recomputed on restore — verify they match
         // the source instance.
-        assert!((neuro2.alpha_multiplier - neuro.alpha_multiplier).abs() < 1e-10,
-            "alpha_multiplier mismatch after restore");
-        assert_eq!(neuro2.dyna_steps, neuro.dyna_steps,
-            "dyna_steps mismatch after restore");
-        assert!((neuro2.serotonin_shift - neuro.serotonin_shift).abs() < 1e-10,
-            "serotonin_shift mismatch after restore");
-        assert!((neuro2.epsilon_bonus - neuro.epsilon_bonus).abs() < 1e-10,
-            "epsilon_bonus mismatch after restore");
+        assert!(
+            (neuro2.alpha_multiplier - neuro.alpha_multiplier).abs() < 1e-10,
+            "alpha_multiplier mismatch after restore"
+        );
+        assert_eq!(
+            neuro2.dyna_steps, neuro.dyna_steps,
+            "dyna_steps mismatch after restore"
+        );
+        assert!(
+            (neuro2.serotonin_shift - neuro.serotonin_shift).abs() < 1e-10,
+            "serotonin_shift mismatch after restore"
+        );
+        assert!(
+            (neuro2.epsilon_bonus - neuro.epsilon_bonus).abs() < 1e-10,
+            "epsilon_bonus mismatch after restore"
+        );
     }
 
     #[test]
@@ -563,31 +595,58 @@ mod tests {
         let mut neuro = ApolloNeuromodulator::new();
         // Corrupted disk state with out-of-range values.
         neuro.restore(NeuroState {
-            dopamine: 999.0,      // way above [0.0, 1.0]
-            noradrenaline: -5.0,  // below [0.0, 1.0]
-            serotonin: f64::NAN,  // NaN → neutral baseline
-            acetylcholine: f64::INFINITY, // Inf → clamp
+            dopamine: 999.0,               // way above [0.0, 1.0]
+            noradrenaline: -5.0,           // below [0.0, 1.0]
+            serotonin: f64::NAN,           // NaN → neutral baseline
+            acetylcholine: f64::INFINITY,  // Inf → clamp
             low_pressure_streak: u32::MAX, // cap to 1000
         });
-        assert!(neuro.dopamine >= 0.0 && neuro.dopamine <= 1.0,
-            "dopamine out of range: {}", neuro.dopamine);
-        assert!(neuro.noradrenaline >= 0.0 && neuro.noradrenaline <= 1.0,
-            "noradrenaline out of range: {}", neuro.noradrenaline);
-        assert!(neuro.serotonin.is_finite() && neuro.serotonin >= 0.0 && neuro.serotonin <= 1.0,
-            "serotonin should be finite and clamped: {}", neuro.serotonin);
-        assert!(neuro.acetylcholine >= 0.0 && neuro.acetylcholine <= 1.0,
-            "acetylcholine out of range: {}", neuro.acetylcholine);
-        assert!(neuro.low_pressure_streak <= 1000,
-            "streak should be capped at 1000: {}", neuro.low_pressure_streak);
+        assert!(
+            neuro.dopamine >= 0.0 && neuro.dopamine <= 1.0,
+            "dopamine out of range: {}",
+            neuro.dopamine
+        );
+        assert!(
+            neuro.noradrenaline >= 0.0 && neuro.noradrenaline <= 1.0,
+            "noradrenaline out of range: {}",
+            neuro.noradrenaline
+        );
+        assert!(
+            neuro.serotonin.is_finite() && neuro.serotonin >= 0.0 && neuro.serotonin <= 1.0,
+            "serotonin should be finite and clamped: {}",
+            neuro.serotonin
+        );
+        assert!(
+            neuro.acetylcholine >= 0.0 && neuro.acetylcholine <= 1.0,
+            "acetylcholine out of range: {}",
+            neuro.acetylcholine
+        );
+        assert!(
+            neuro.low_pressure_streak <= 1000,
+            "streak should be capped at 1000: {}",
+            neuro.low_pressure_streak
+        );
         // Derived params must also be in their valid ranges.
-        assert!(neuro.alpha_multiplier >= 0.5 && neuro.alpha_multiplier <= 1.5,
-            "alpha_multiplier out of range: {}", neuro.alpha_multiplier);
-        assert!(neuro.dyna_steps >= 4 && neuro.dyna_steps <= 20,
-            "dyna_steps out of range: {}", neuro.dyna_steps);
-        assert!(neuro.serotonin_shift >= -0.05 && neuro.serotonin_shift <= 0.05,
-            "serotonin_shift out of range: {}", neuro.serotonin_shift);
-        assert!(neuro.epsilon_bonus >= 0.0 && neuro.epsilon_bonus <= 0.05,
-            "epsilon_bonus out of range: {}", neuro.epsilon_bonus);
+        assert!(
+            neuro.alpha_multiplier >= 0.5 && neuro.alpha_multiplier <= 1.5,
+            "alpha_multiplier out of range: {}",
+            neuro.alpha_multiplier
+        );
+        assert!(
+            neuro.dyna_steps >= 4 && neuro.dyna_steps <= 20,
+            "dyna_steps out of range: {}",
+            neuro.dyna_steps
+        );
+        assert!(
+            neuro.serotonin_shift >= -0.05 && neuro.serotonin_shift <= 0.05,
+            "serotonin_shift out of range: {}",
+            neuro.serotonin_shift
+        );
+        assert!(
+            neuro.epsilon_bonus >= 0.0 && neuro.epsilon_bonus <= 0.05,
+            "epsilon_bonus out of range: {}",
+            neuro.epsilon_bonus
+        );
     }
 
     #[test]
@@ -632,14 +691,26 @@ mod tests {
             acetylcholine: 1.0,
             low_pressure_streak: 0,
         });
-        assert!((neuro.alpha_multiplier - 1.5).abs() < 1e-10,
-            "alpha_multiplier should be 1.5 when dopamine=1.0, got {}", neuro.alpha_multiplier);
-        assert_eq!(neuro.dyna_steps, 20,
-            "dyna_steps should be 20 when noradrenaline=1.0, got {}", neuro.dyna_steps);
-        assert!((neuro.serotonin_shift - 0.05).abs() < 1e-10,
-            "serotonin_shift should be 0.05 when serotonin=1.0, got {}", neuro.serotonin_shift);
-        assert!((neuro.epsilon_bonus - 0.05).abs() < 1e-10,
-            "epsilon_bonus should be 0.05 when acetylcholine=1.0, got {}", neuro.epsilon_bonus);
+        assert!(
+            (neuro.alpha_multiplier - 1.5).abs() < 1e-10,
+            "alpha_multiplier should be 1.5 when dopamine=1.0, got {}",
+            neuro.alpha_multiplier
+        );
+        assert_eq!(
+            neuro.dyna_steps, 20,
+            "dyna_steps should be 20 when noradrenaline=1.0, got {}",
+            neuro.dyna_steps
+        );
+        assert!(
+            (neuro.serotonin_shift - 0.05).abs() < 1e-10,
+            "serotonin_shift should be 0.05 when serotonin=1.0, got {}",
+            neuro.serotonin_shift
+        );
+        assert!(
+            (neuro.epsilon_bonus - 0.05).abs() < 1e-10,
+            "epsilon_bonus should be 0.05 when acetylcholine=1.0, got {}",
+            neuro.epsilon_bonus
+        );
     }
 
     #[test]
@@ -662,10 +733,26 @@ mod tests {
         // After 50 ticks under neutral pressure, extreme values should have decayed.
         // Not asserting specific values — just that nothing is NaN or out of [0,1].
         let (da, na, se, ach) = neuro.levels();
-        assert!(da.is_finite() && (0.0..=1.0).contains(&da), "dopamine not in range: {}", da);
-        assert!(na.is_finite() && (0.0..=1.0).contains(&na), "noradrenaline not in range: {}", na);
-        assert!(se.is_finite() && (0.0..=1.0).contains(&se), "serotonin not in range: {}", se);
-        assert!(ach.is_finite() && (0.0..=1.0).contains(&ach), "acetylcholine not in range: {}", ach);
+        assert!(
+            da.is_finite() && (0.0..=1.0).contains(&da),
+            "dopamine not in range: {}",
+            da
+        );
+        assert!(
+            na.is_finite() && (0.0..=1.0).contains(&na),
+            "noradrenaline not in range: {}",
+            na
+        );
+        assert!(
+            se.is_finite() && (0.0..=1.0).contains(&se),
+            "serotonin not in range: {}",
+            se
+        );
+        assert!(
+            ach.is_finite() && (0.0..=1.0).contains(&ach),
+            "acetylcholine not in range: {}",
+            ach
+        );
     }
 
     #[test]
@@ -698,9 +785,12 @@ mod tests {
 
         let cold_err = (cold.dopamine - steady_state_da).abs();
         let warm_err = (warm.dopamine - steady_state_da).abs();
-        assert!(warm_err < cold_err,
+        assert!(
+            warm_err < cold_err,
             "warm-start (err={:.4}) should be closer to steady-state than cold-start (err={:.4})",
-            warm_err, cold_err);
+            warm_err,
+            cold_err
+        );
     }
 
     #[test]
@@ -710,8 +800,11 @@ mod tests {
             low_pressure_streak: u32::MAX,
             ..Default::default()
         });
-        assert!(neuro.low_pressure_streak <= 1000,
-            "streak not capped: {}", neuro.low_pressure_streak);
+        assert!(
+            neuro.low_pressure_streak <= 1000,
+            "streak not capped: {}",
+            neuro.low_pressure_streak
+        );
     }
 
     #[test]
@@ -720,10 +813,16 @@ mod tests {
         let mut neuro = ApolloNeuromodulator::new();
         neuro.restore(NeuroState::default());
         // dopamine=0.0 → alpha_multiplier=0.5 (floor of range, not baseline but valid).
-        assert!(neuro.alpha_multiplier >= 0.5,
-            "alpha_multiplier below floor: {}", neuro.alpha_multiplier);
-        assert!(neuro.dyna_steps >= 4,
-            "dyna_steps below floor: {}", neuro.dyna_steps);
+        assert!(
+            neuro.alpha_multiplier >= 0.5,
+            "alpha_multiplier below floor: {}",
+            neuro.alpha_multiplier
+        );
+        assert!(
+            neuro.dyna_steps >= 4,
+            "dyna_steps below floor: {}",
+            neuro.dyna_steps
+        );
     }
 
     #[test]
@@ -738,9 +837,18 @@ mod tests {
             low_pressure_streak: 5,
         });
         assert_eq!(neuro.dopamine, 0.5, "NaN dopamine should default to 0.5");
-        assert!((neuro.noradrenaline - 0.8).abs() < 1e-10, "noradrenaline should be preserved");
-        assert!((neuro.serotonin - 0.3).abs() < 1e-10, "serotonin should be preserved");
-        assert!((neuro.acetylcholine - 0.6).abs() < 1e-10, "acetylcholine should be preserved");
+        assert!(
+            (neuro.noradrenaline - 0.8).abs() < 1e-10,
+            "noradrenaline should be preserved"
+        );
+        assert!(
+            (neuro.serotonin - 0.3).abs() < 1e-10,
+            "serotonin should be preserved"
+        );
+        assert!(
+            (neuro.acetylcholine - 0.6).abs() < 1e-10,
+            "acetylcholine should be preserved"
+        );
         assert_eq!(neuro.low_pressure_streak, 5);
     }
 

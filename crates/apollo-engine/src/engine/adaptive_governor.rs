@@ -1290,23 +1290,11 @@ mod tests {
         };
         let mut gov_safe = governor();
         gov_safe.swap_risk = SwapRisk::Safe;
-        let d_safe = gov_safe.decide_all(
-            &[proc.clone()],
-            &no_hunts(),
-            None,
-            &["idle-daemon"],
-            12,
-        );
+        let d_safe = gov_safe.decide_all(&[proc.clone()], &no_hunts(), None, &["idle-daemon"], 12);
 
         let mut gov_crit = governor();
         gov_crit.swap_risk = SwapRisk::Critical;
-        let d_crit = gov_crit.decide_all(
-            &[proc],
-            &no_hunts(),
-            None,
-            &["idle-daemon"],
-            12,
-        );
+        let d_crit = gov_crit.decide_all(&[proc], &no_hunts(), None, &["idle-daemon"], 12);
 
         // Safe: 1800s < 3600s threshold → Allow (utility-based)
         assert_ne!(

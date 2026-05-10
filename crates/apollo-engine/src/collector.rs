@@ -272,10 +272,10 @@ impl SystemCollector {
     pub fn collect_snapshot_light(&mut self, pressure: f64) -> (SystemSnapshot, Duration) {
         let snapshot_started_at = Utc::now();
         let start = Instant::now();
-        
+
         self.sys.refresh_cpu();
         self.sys.refresh_memory();
-        
+
         // Staggered process refresh:
         // Normal (<0.65): refresh every 8 cycles (~2.4s)
         // Elevated (0.65-0.80): refresh every 4 cycles (~1.2s)
@@ -918,7 +918,10 @@ mod tests {
         for _ in 0..5 {
             let (snap_n, _) = c.collect_snapshot_light(0.5);
             let pids_n: Vec<u32> = snap_n.top_processes.iter().map(|p| p.pid).collect();
-            assert_eq!(pids_n, pids1, "cache should preserve pid order across staggered skips");
+            assert_eq!(
+                pids_n, pids1,
+                "cache should preserve pid order across staggered skips"
+            );
         }
     }
 
@@ -927,7 +930,10 @@ mod tests {
         // After `new()`, the cache field starts empty; first collect_*_no_process_refresh
         // call rebuilds it from sysinfo's seeded process list (refresh_processes() in new()).
         let mut c = SystemCollector::new();
-        assert!(c.cached_top_processes.is_empty(), "cache empty before first collect call");
+        assert!(
+            c.cached_top_processes.is_empty(),
+            "cache empty before first collect call"
+        );
         let (snap, _) = c.collect_snapshot_no_process_refresh();
         // Either populated from cache or empty if no processes — but the cache field
         // must now reflect the snapshot.

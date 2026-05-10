@@ -411,7 +411,9 @@ impl AdversarialProbe {
     /// Demonstrates that ODE physics close the "sticky swap" gap that kernel pressure misses
     /// [Denning 1968 §3 — working set overflow before eviction pressure].
     pub fn probe_sticky_swap_spotlight() -> ProbeResult {
-        use crate::engine::swap_reclaim::{CyberPhysicalSignal, SwapReclaimModel, TsatUrgency, VmFlowSample};
+        use crate::engine::swap_reclaim::{
+            CyberPhysicalSignal, SwapReclaimModel, TsatUrgency, VmFlowSample,
+        };
 
         const SWAP_6GB: u64 = 6 * 1024 * 1024 * 1024;
         const SWAP_8GB: u64 = 8 * 1024 * 1024 * 1024;
@@ -438,7 +440,9 @@ impl AdversarialProbe {
             expectation: ProbeExpectation::StickySwapSpotlightSuppressed,
             passed,
             description: if passed {
-                format!("ODE urgency {urgency:.3} > 0.5 (swap=6GB/8GB, kernel pressure=0.35 invisible)")
+                format!(
+                    "ODE urgency {urgency:.3} > 0.5 (swap=6GB/8GB, kernel pressure=0.35 invisible)"
+                )
             } else {
                 format!("ODE missed sticky-swap saturation: urgency={urgency:.3} ≤ 0.5")
             },
@@ -469,7 +473,9 @@ impl AdversarialProbe {
             description: if passed {
                 format!("Utility EMA recovered to {utility_ema:.3} > {UTIL_THRESHOLD} in 30 heavy-zone cycles")
             } else {
-                format!("Subnormal deadlock persists: utility_ema={utility_ema:.3} ≤ {UTIL_THRESHOLD}")
+                format!(
+                    "Subnormal deadlock persists: utility_ema={utility_ema:.3} ≤ {UTIL_THRESHOLD}"
+                )
             },
             cycle: 0,
         }
@@ -520,11 +526,26 @@ mod tests {
     fn test_generate_scenarios() {
         let scenarios = AdversarialProbe::generate_scenarios();
         assert_eq!(scenarios.len(), 5);
-        assert_eq!(scenarios[0].expectation, ProbeExpectation::NoFreezeProtected);
-        assert_eq!(scenarios[1].expectation, ProbeExpectation::SafetyFloorRespected);
-        assert_eq!(scenarios[2].expectation, ProbeExpectation::NarsDriftRecovery);
-        assert_eq!(scenarios[3].expectation, ProbeExpectation::EpistemicBlocksAggressive);
-        assert_eq!(scenarios[4].expectation, ProbeExpectation::OdeDivergenceResilient);
+        assert_eq!(
+            scenarios[0].expectation,
+            ProbeExpectation::NoFreezeProtected
+        );
+        assert_eq!(
+            scenarios[1].expectation,
+            ProbeExpectation::SafetyFloorRespected
+        );
+        assert_eq!(
+            scenarios[2].expectation,
+            ProbeExpectation::NarsDriftRecovery
+        );
+        assert_eq!(
+            scenarios[3].expectation,
+            ProbeExpectation::EpistemicBlocksAggressive
+        );
+        assert_eq!(
+            scenarios[4].expectation,
+            ProbeExpectation::OdeDivergenceResilient
+        );
     }
 
     #[test]

@@ -702,7 +702,10 @@ impl ChromiumManager {
             // had sockets: their socket may have closed since the last check,
             // and we must not skip-freeze based on a stale `has_inet_sockets=true`.
             let is_idle_freeze_candidate = !entry.frozen && entry.consecutive_idle_cycles > 0;
-            if do_fd_check || !entry.has_inet_sockets || (entry.has_inet_sockets && is_idle_freeze_candidate) {
+            if do_fd_check
+                || !entry.has_inet_sockets
+                || (entry.has_inet_sockets && is_idle_freeze_candidate)
+            {
                 entry.has_inet_sockets = Self::has_inet_sockets(pid);
             }
         }
@@ -1085,13 +1088,17 @@ impl ChromiumManager {
                     .iter()
                     .filter(|a| {
                         if let ChromiumAction::ThawRenderer { pid, .. } = a {
-                            self.renderers.get(pid).map(|r| r.browser == *browser).unwrap_or(false)
+                            self.renderers
+                                .get(pid)
+                                .map(|r| r.browser == *browser)
+                                .unwrap_or(false)
                         } else {
                             false
                         }
                     })
                     .count() as f32;
-                let already_frozen = (browser_state.frozen_renderers as f32 - queued_thaws).max(0.0);
+                let already_frozen =
+                    (browser_state.frozen_renderers as f32 - queued_thaws).max(0.0);
                 let max_additional =
                     ((total * self.max_freeze_ratio()) - already_frozen).floor() as usize;
                 let max_additional = max_additional.min(candidates.len());
@@ -1278,8 +1285,7 @@ impl ChromiumManager {
             if Some(info.browser.as_str()) == fg {
                 continue;
             }
-            if jetsam_control::set_priority(info.pid, jetsam_control::priority::BACKGROUND)
-                .is_ok()
+            if jetsam_control::set_priority(info.pid, jetsam_control::priority::BACKGROUND).is_ok()
             {
                 demoted = demoted.saturating_add(1);
             }
@@ -2224,8 +2230,7 @@ mod tests {
         // we step exactly `RE_PURGE_INTERVAL_CYCLES - 2` cycles to land on the
         // boundary cycle where the next update must re-emit.
         for _ in 0..(RE_PURGE_INTERVAL_CYCLES - 2) {
-            let actions =
-                mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+            let actions = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
             assert_eq!(
                 actions
                     .iter()

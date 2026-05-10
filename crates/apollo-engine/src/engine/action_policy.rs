@@ -494,11 +494,22 @@ mod tests {
     }
 
     fn freeze(pid: u32) -> RootAction {
-        RootAction::freeze(pid, format!("p{pid}"), "test", DecisionReason::PressureContext)
+        RootAction::freeze(
+            pid,
+            format!("p{pid}"),
+            "test",
+            DecisionReason::PressureContext,
+        )
     }
 
     fn throttle(pid: u32) -> RootAction {
-        RootAction::throttle(pid, format!("p{pid}"), false, "test", DecisionReason::PressureContext)
+        RootAction::throttle(
+            pid,
+            format!("p{pid}"),
+            false,
+            "test",
+            DecisionReason::PressureContext,
+        )
     }
 
     fn boost(pid: u32) -> RootAction {
@@ -769,7 +780,10 @@ mod tests {
         let s = scorer.score(&freeze(1), &base_ctx());
         let expected = 3.0f64.sqrt().min(1.5);
         assert!((s.total_uncertainty - expected).abs() < 1e-9);
-        assert!((s.total_uncertainty - 1.5).abs() < 1e-9, "expected saturated");
+        assert!(
+            (s.total_uncertainty - 1.5).abs() < 1e-9,
+            "expected saturated"
+        );
     }
 
     #[test]

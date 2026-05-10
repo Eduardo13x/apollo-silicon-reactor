@@ -110,7 +110,11 @@ pub fn set_foreground_pid(pid: Option<u32>) {
 
 pub fn get_foreground_pid() -> Option<u32> {
     let v = FOREGROUND_PID.load(Ordering::Relaxed);
-    if v < 0 { None } else { Some(v as u32) }
+    if v < 0 {
+        None
+    } else {
+        Some(v as u32)
+    }
 }
 
 /// Published by main.rs AFTER each cycle's deep scan loop completes. Readers
@@ -128,7 +132,11 @@ pub fn get_max_hot_page_fraction() -> Option<f64> {
         return None;
     }
     let raw = f64::from_bits(MAX_HOT_PAGE_FRACTION_BITS.load(Ordering::Relaxed));
-    if raw.is_finite() { Some(raw.clamp(0.0, 1.0)) } else { None }
+    if raw.is_finite() {
+        Some(raw.clamp(0.0, 1.0))
+    } else {
+        None
+    }
 }
 
 pub fn set_max_wss_mb(mb: f64) {
@@ -141,7 +149,11 @@ pub fn get_max_wss_mb() -> Option<f64> {
         return None;
     }
     let raw = f64::from_bits(MAX_WSS_MB_BITS.load(Ordering::Relaxed));
-    if raw.is_finite() && raw >= 0.0 { Some(raw) } else { None }
+    if raw.is_finite() && raw >= 0.0 {
+        Some(raw)
+    } else {
+        None
+    }
 }
 
 /// Epistemic uncertainty — published by main.rs from `signal_digest.urgency`
@@ -158,7 +170,11 @@ pub fn get_epistemic_uncertainty() -> f64 {
         return 0.0;
     }
     let raw = f64::from_bits(EPISTEMIC_UNCERTAINTY_BITS.load(Ordering::Relaxed));
-    if raw.is_finite() { raw.clamp(0.0, 1.0) } else { 0.0 }
+    if raw.is_finite() {
+        raw.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]

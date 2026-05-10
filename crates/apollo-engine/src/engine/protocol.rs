@@ -65,6 +65,9 @@ pub enum DaemonRequest {
     GetSysctlGovernor,
     /// Revert all sysctl changes made by the daemon to their startup defaults.
     RevertSysctls,
+    /// Trigger an immediate maintenance purge through the daemon.
+    /// Subject to MaintenanceState rate-limits (5 min CLI + 1 min auto spacing).
+    Purge,
     /// Suscripcion push: el daemon enviara StatusPush en cada ciclo de optimizacion.
     /// La conexion se mantiene abierta indefinidamente.
     Subscribe,
@@ -103,7 +106,8 @@ impl DaemonRequest {
             | Self::LlmTest
             | Self::Feedback { .. }
             | Self::SetLearnedPolicy { .. }
-            | Self::RevertSysctls => true,
+            | Self::RevertSysctls
+            | Self::Purge => true,
         }
     }
 
@@ -171,6 +175,10 @@ pub enum DaemonResponse {
     },
     /// Response to GetHealth.
     Health(HealthReport),
+    PurgeResult {
+        fired: bool,
+        reason: String,
+    },
     Error {
         message: String,
     },
@@ -355,5 +363,16 @@ mod tests {
     #[test]
     fn protocol_version_is_positive() {
         assert!(PROTOCOL_VERSION > 0);
+    }
+
+    #[test]
+    fn roundtrip_purge() {
+        let rt = roundtrip(&DaemonRequest::Purge);
+        assert!(matches!(rt, DaemonRequest::Purge));
+    }
+
+    #[test]
+    fn purge_is_privileged() {
+        assert!(DaemonRequest::Purge.is_privileged());
     }
 }

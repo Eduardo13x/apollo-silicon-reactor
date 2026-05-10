@@ -87,16 +87,15 @@ pub fn run_warn_limits(
                 && (snap.name.contains("Helper (Renderer)")
                     || snap.name.contains("Helper (Plugin)")
                     || snap.name.contains(" Renderer"));
-            let is_port_leaker = if snap.rss_bytes > 50 * 1024 * 1024
-                && snap.secs_since_user_interaction > 60
-            {
-                let qos = state.mach_qos.lock_recover();
-                qos.get_mach_port_count(snap.pid)
-                    .map(|c| c > 5000)
-                    .unwrap_or(false)
-            } else {
-                false
-            };
+            let is_port_leaker =
+                if snap.rss_bytes > 50 * 1024 * 1024 && snap.secs_since_user_interaction > 60 {
+                    let qos = state.mach_qos.lock_recover();
+                    qos.get_mach_port_count(snap.pid)
+                        .map(|c| c > 5000)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
             if is_hoarder || is_bg_renderer || is_port_leaker {
                 let ratio = if snap.is_translated { 3u64 } else { 4u64 };
                 let warn_mb = (snap.rss_bytes * ratio / 5 / 1024 / 1024) as i32;

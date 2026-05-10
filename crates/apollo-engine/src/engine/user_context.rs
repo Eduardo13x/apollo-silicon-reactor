@@ -131,10 +131,7 @@ impl UserContext {
         if self.call_in_progress {
             return true;
         }
-        if memory_pressure >= 0.70
-            || thrashing_score >= 10_000.0
-            || p_oom_30s >= 0.40
-        {
+        if memory_pressure >= 0.70 || thrashing_score >= 10_000.0 || p_oom_30s >= 0.40 {
             return false;
         }
         self.has_sleep_assertion

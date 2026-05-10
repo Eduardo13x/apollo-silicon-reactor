@@ -14,11 +14,11 @@
 use std::collections::HashSet;
 
 use apollo_engine::collector::SystemCollector;
+use apollo_engine::engine::audit_types::DecisionReason;
 use apollo_engine::engine::daemon_helpers::pid_start_time;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::types::RootAction;
-use apollo_engine::engine::audit_types::DecisionReason;
 
 /// Nominate stale background apps as freeze candidates.
 ///

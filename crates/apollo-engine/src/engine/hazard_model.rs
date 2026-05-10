@@ -115,7 +115,9 @@ impl HazardModel {
             // Velocidad: normalizar a 0–1 (0.1/s = bastante rápido para presión)
             (pressure_velocity / 0.1).clamp(0.0, 1.0),
             swap_ratio.clamp(0.0, 1.0),
-            compressor_ratio.clamp(0.0, 1.0).max((cumulative_stress * 0.7).clamp(0.0, 1.0)),
+            compressor_ratio
+                .clamp(0.0, 1.0)
+                .max((cumulative_stress * 0.7).clamp(0.0, 1.0)),
         ]
     }
 

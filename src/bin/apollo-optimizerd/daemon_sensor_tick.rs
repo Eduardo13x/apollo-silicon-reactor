@@ -109,8 +109,7 @@ pub fn run_sensor_tick(
 ) -> SensorTickOutput {
     // ── IOReport delta sample (throttled to ≥900ms between samples) ──────
     // end_sample() + begin_sample() gives a rolling inter-cycle window.
-    if ioreport.available
-        && last_ioreport_sample.elapsed() >= std::time::Duration::from_millis(900)
+    if ioreport.available && last_ioreport_sample.elapsed() >= std::time::Duration::from_millis(900)
     {
         #[cfg(target_os = "macos")]
         {
@@ -153,11 +152,10 @@ pub fn run_sensor_tick(
         .collect();
 
     // Battery vampire detection: processes with >50 wakeups/s get priority throttle.
-    let wakeup_hints =
-        apollo_engine::engine::energy_pid::EnergyPidTracker::build_wakeup_hints(
-            &energy_pid_results,
-            50.0,
-        );
+    let wakeup_hints = apollo_engine::engine::energy_pid::EnergyPidTracker::build_wakeup_hints(
+        &energy_pid_results,
+        50.0,
+    );
     // Physical footprint hints for accurate freeze ranking.
     let footprint_hints =
         apollo_engine::engine::energy_pid::EnergyPidTracker::build_footprint_hints(
@@ -165,19 +163,17 @@ pub fn run_sensor_tick(
         );
     // I/O burst hints: background processes writing >5 MB/s compete for
     // disk bandwidth with LLM model weight loading — throttle during inference.
-    let io_burst_hints =
-        apollo_engine::engine::energy_pid::EnergyPidTracker::build_io_burst_hints(
-            &energy_pid_results,
-            5.0,
-        );
+    let io_burst_hints = apollo_engine::engine::energy_pid::EnergyPidTracker::build_io_burst_hints(
+        &energy_pid_results,
+        5.0,
+    );
     // Behavioral anomaly hints: processes deviating ≥ threshold MADs from
     // their learned {ipc, wakeup_rate, disk_mbps} baseline get priority throttle.
     // Threshold is raised during cold start (< 10 warm baselines) to suppress
     // false positives from poorly-trained detectors. [Chandola 2009 §4.1]
-    let anomaly_thresh =
-        apollo_engine::engine::process_baseline::effective_threshold(
-            energy_pid_tracker.baseline.warm_count(),
-        );
+    let anomaly_thresh = apollo_engine::engine::process_baseline::effective_threshold(
+        energy_pid_tracker.baseline.warm_count(),
+    );
     let anomaly_hints: HashMap<u32, f64> = energy_pid_results
         .iter()
         .filter(|r| r.anomaly_score >= anomaly_thresh)

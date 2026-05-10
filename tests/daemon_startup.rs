@@ -125,7 +125,10 @@ fn learned_state_roundtrip_and_validate() {
     let mut state: LearnedState =
         serde_json::from_str("{}").expect("empty JSON must deserialize to LearnedState");
 
-    assert_eq!(state.version, 0, "missing version key must deserialize as 0 (pre-versioning sentinel)");
+    assert_eq!(
+        state.version, 0,
+        "missing version key must deserialize as 0 (pre-versioning sentinel)"
+    );
     assert!(
         state.signal_intelligence.is_none(),
         "cold-start signal_intelligence must be None"

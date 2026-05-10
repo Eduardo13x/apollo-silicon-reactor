@@ -77,12 +77,7 @@ impl ShadowEvaluator {
     /// Called when gate tower ACCEPTS a candidate. Runs scorer; if scorer would have
     /// rejected, emits a disagreement event. Offline analysis correlates with outcomes.
     #[allow(dead_code)] // wiring for accepted-case follows in a later commit
-    pub fn evaluate_accepted(
-        &self,
-        action: &RootAction,
-        ctx: &ActionContext,
-        journal_path: &Path,
-    ) {
+    pub fn evaluate_accepted(&self, action: &RootAction, ctx: &ActionContext, journal_path: &Path) {
         let score = self.scorer.score(action, ctx);
         if !score.accept {
             let event = BlockedActionEvent::new(
@@ -148,8 +143,8 @@ fn target_pid(a: &RootAction) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::safety::ProtectionLevel;
     use crate::engine::audit_types::DecisionReason;
+    use crate::engine::safety::ProtectionLevel;
 
     fn make_ctx() -> ActionContext {
         ActionContext {
@@ -221,7 +216,14 @@ mod tests {
     }
 
     fn freeze_action() -> RootAction {
-        RootAction::freeze_full(4242, "background-daemon", "shadow-test", 0, 0, DecisionReason::PressureContext)
+        RootAction::freeze_full(
+            4242,
+            "background-daemon",
+            "shadow-test",
+            0,
+            0,
+            DecisionReason::PressureContext,
+        )
     }
 
     #[test]
@@ -287,8 +289,8 @@ mod tests {
     fn evaluator_silent_on_emit_error_does_not_panic() {
         let eval = ShadowEvaluator::default();
         let ctx = make_ctx(); // scorer accepts → will attempt to emit
-        // Unwritable path — parent dir does not exist and cannot be created.
-        // On macOS /proc doesn't exist at all, so create/append fails cleanly.
+                              // Unwritable path — parent dir does not exist and cannot be created.
+                              // On macOS /proc doesn't exist at all, so create/append fails cleanly.
         let path = std::path::Path::new("/proc/apollo_shadow_unwritable_test_path/journal.jsonl");
         let action = freeze_action();
 

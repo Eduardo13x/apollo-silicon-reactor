@@ -676,8 +676,7 @@ impl SysctlGovernor {
             self.tcp.delayed_ack // Keep current.
         };
 
-        if desired_ack != self.tcp.delayed_ack && self.cooldown_ok("net.inet.tcp.delayed_ack")
-        {
+        if desired_ack != self.tcp.delayed_ack && self.cooldown_ok("net.inet.tcp.delayed_ack") {
             self.emit_sysctl(
                 "net.inet.tcp.delayed_ack",
                 &desired_ack.to_string(),
@@ -828,9 +827,7 @@ impl SysctlGovernor {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                if self.vm.poll_interval != 10
-                    && self.cooldown_ok("vm.compressor_poll_interval")
-                {
+                if self.vm.poll_interval != 10 && self.cooldown_ok("vm.compressor_poll_interval") {
                     self.emit_sysctl(
                         "vm.compressor_poll_interval",
                         "10",
@@ -885,9 +882,7 @@ impl SysctlGovernor {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                if self.vm.poll_interval != 40
-                    && self.cooldown_ok("vm.compressor_poll_interval")
-                {
+                if self.vm.poll_interval != 40 && self.cooldown_ok("vm.compressor_poll_interval") {
                     self.emit_sysctl(
                         "vm.compressor_poll_interval",
                         "40",
@@ -945,9 +940,7 @@ impl SysctlGovernor {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                if self.vm.poll_interval != 20
-                    && self.cooldown_ok("vm.compressor_poll_interval")
-                {
+                if self.vm.poll_interval != 20 && self.cooldown_ok("vm.compressor_poll_interval") {
                     self.emit_sysctl(
                         "vm.compressor_poll_interval",
                         "20",
@@ -1458,9 +1451,9 @@ mod tests {
         // Immediately try again: should be blocked by cooldown.
         gov.tcp.consecutive_high = 3; // Force counter.
         let second_actions = tick_ok(&mut gov, &inputs);
-        let has_sendspace = second_actions.iter().any(
-            |a| matches!(a, RootAction::SetSysctl(s) if s.key() == "net.inet.tcp.sendspace"),
-        );
+        let has_sendspace = second_actions
+            .iter()
+            .any(|a| matches!(a, RootAction::SetSysctl(s) if s.key() == "net.inet.tcp.sendspace"));
         assert!(
             !has_sendspace,
             "cooldown should prevent immediate re-tuning of sendspace"

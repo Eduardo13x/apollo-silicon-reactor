@@ -317,7 +317,11 @@ impl RecentlyApplied {
         // Boot-time crossing check: if the oldest record is older than uptime,
         // it belongs to a previous boot session. Instant is invalid across boots.
         let uptime = crate::engine::daemon_helpers::system_uptime_secs();
-        let oldest_record = records.iter().map(|r| r.wall_unix_sec).min().unwrap_or(now_unix);
+        let oldest_record = records
+            .iter()
+            .map(|r| r.wall_unix_sec)
+            .min()
+            .unwrap_or(now_unix);
         let record_age = now_unix.saturating_sub(oldest_record);
         if uptime > 0 && record_age > uptime {
             return (cache, RestoreStatus::DiscardedBootCrossed);
@@ -445,7 +449,10 @@ mod tests {
             Some(CachedActionKind::Freeze)
         );
         // Allow → None (no action to cache).
-        assert_eq!(CachedActionKind::from_governor(GovernorDecision::Allow), None);
+        assert_eq!(
+            CachedActionKind::from_governor(GovernorDecision::Allow),
+            None
+        );
     }
 
     #[test]
@@ -540,7 +547,10 @@ mod tests {
         let _ = fs::remove_file(path);
 
         // Manually write stale data (2 minutes old, beyond 30s TTL)
-        let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let stale_unix = now_unix - 120;
 
         let records = vec![PersistRecord {
@@ -573,8 +583,16 @@ mod tests {
             .unwrap()
             .as_secs();
         let records = vec![
-            PersistRecord { pid: 1, kind: CachedActionKind::Throttle, wall_unix_sec: now_unix - 10 }, // fresh
-            PersistRecord { pid: 2, kind: CachedActionKind::Throttle, wall_unix_sec: now_unix - 60 }, // stale
+            PersistRecord {
+                pid: 1,
+                kind: CachedActionKind::Throttle,
+                wall_unix_sec: now_unix - 10,
+            }, // fresh
+            PersistRecord {
+                pid: 2,
+                kind: CachedActionKind::Throttle,
+                wall_unix_sec: now_unix - 60,
+            }, // stale
         ];
         let restored = cache.restore_from_records(records);
         assert_eq!(restored, 1, "only fresh entry should restore");
@@ -587,10 +605,12 @@ mod tests {
         let mut cache = RecentlyApplied::new();
         cache.record(42, CachedActionKind::SetMemorystatus);
         let records = cache.to_persist_records();
-        let json: Vec<String> = records.iter()
+        let json: Vec<String> = records
+            .iter()
             .map(|r| serde_json::to_string(r).unwrap())
             .collect();
-        let parsed: Vec<PersistRecord> = json.iter()
+        let parsed: Vec<PersistRecord> = json
+            .iter()
             .map(|s| serde_json::from_str(s).unwrap())
             .collect();
         let mut cache2 = RecentlyApplied::new();

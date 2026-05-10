@@ -15,11 +15,11 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
+use apollo_engine::engine::background_collectors::PressureCollector;
 use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified, write_frozen_state};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::mach_qos::SchedulingTier;
-use apollo_engine::engine::background_collectors::PressureCollector;
 
 /// Maximum PIDs to SIGCONT per cycle under normal conditions.
 const WAKE_UNFREEZE_BATCH: usize = 5;

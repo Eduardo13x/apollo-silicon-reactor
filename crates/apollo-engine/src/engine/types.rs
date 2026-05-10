@@ -479,15 +479,23 @@ impl RootAction {
     /// callers of `execute_actions::verify_pid_identity` (Sprint 4 merge).
     pub fn identity_fields(&self) -> Option<(u32, Option<&str>, u64, u64)> {
         match self {
-            RootAction::ThrottleProcess { pid, name, start_sec, start_usec, .. }
-            | RootAction::FreezeProcess { pid, name, start_sec, start_usec, .. } => {
-                Some((*pid, Some(name.as_str()), *start_sec, *start_usec))
+            RootAction::ThrottleProcess {
+                pid,
+                name,
+                start_sec,
+                start_usec,
+                ..
             }
+            | RootAction::FreezeProcess {
+                pid,
+                name,
+                start_sec,
+                start_usec,
+                ..
+            } => Some((*pid, Some(name.as_str()), *start_sec, *start_usec)),
             RootAction::BoostProcess { pid, name, .. }
             | RootAction::UnfreezeProcess { pid, name, .. }
-            | RootAction::SetThreadQoS { pid, name, .. } => {
-                Some((*pid, Some(name.as_str()), 0, 0))
-            }
+            | RootAction::SetThreadQoS { pid, name, .. } => Some((*pid, Some(name.as_str()), 0, 0)),
             RootAction::SetMemorystatus { pid, .. } => Some((*pid, None, 0, 0)),
             RootAction::SetSysctl(_)
             | RootAction::ToggleSpotlight { .. }
@@ -1480,6 +1488,23 @@ pub struct RuntimeMetrics {
     pub ais_adaptability: f64,
     #[serde(default)]
     pub ais_pareto_balanced: bool,
+
+    /// Maintenance Purge Gate telemetry (Sprint 5 Mes 0 — 2026-05-10).
+    /// Flushed from lf_metrics each cycle via sync_from_lockfree.
+    #[serde(default)]
+    pub maintenance_purge_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_pressure_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_swap_floor_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_growing_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_idle_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_build_mode_total: u64,
+    #[serde(default)]
+    pub maintenance_purge_skipped_rate_limit_total: u64,
 }
 
 impl RuntimeMetrics {

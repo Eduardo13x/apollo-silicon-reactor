@@ -1788,9 +1788,7 @@ mod tests {
         let mut m = MachQoSManager::new();
         let baseline: Vec<_> = (0..4).map(|i| mk_thread(i, 0, 0, true)).collect();
         let _ = m.analyze_threads(7, &baseline);
-        let hot: Vec<_> = (0..4)
-            .map(|i| mk_thread(i, 200_000, 100, true))
-            .collect(); // +200ms delta each
+        let hot: Vec<_> = (0..4).map(|i| mk_thread(i, 200_000, 100, true)).collect(); // +200ms delta each
         let a = m.analyze_threads(7, &hot);
         assert_eq!(a.pattern, ThreadPattern::Saturated);
         assert_eq!(a.hot.len(), 4);

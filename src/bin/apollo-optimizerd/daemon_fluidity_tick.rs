@@ -1,6 +1,6 @@
-use apollo_engine::engine::fluidity::{FluidityState, FluiditySignal};
-use apollo_engine::engine::process_classifier::ProcessSnapshot;
+use apollo_engine::engine::fluidity::{FluiditySignal, FluidityState};
 use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
+use apollo_engine::engine::process_classifier::ProcessSnapshot;
 
 pub struct FluidityTickInput<'a> {
     pub proc_snaps: &'a [ProcessSnapshot],
@@ -47,27 +47,30 @@ mod tests {
             (415, "WindowServer".to_string(), 25.0),
             (1234, "Brave".to_string(), 5.0),
         ];
-        
-        let proc_snaps = procs.into_iter().map(|(pid, name, cpu_percent)| ProcessSnapshot {
-            pid,
-            name,
-            cpu_percent,
-            rss_bytes: 0,
-            is_zombie: false,
-            secs_since_foreground: 0,
-            secs_since_user_interaction: 0,
-            has_network: false,
-            has_gui_window: false,
-            wakeups_per_sec: 0.0,
-            parent_alive: true,
-            process_uptime_secs: 0,
-            faults_total: 0,
-            pageins_total: 0,
-            is_translated: false,
-            mach_port_count: 0,
-            cpu_contention: None,
-            is_app_bundle: false,
-        }).collect::<Vec<_>>();
+
+        let proc_snaps = procs
+            .into_iter()
+            .map(|(pid, name, cpu_percent)| ProcessSnapshot {
+                pid,
+                name,
+                cpu_percent,
+                rss_bytes: 0,
+                is_zombie: false,
+                secs_since_foreground: 0,
+                secs_since_user_interaction: 0,
+                has_network: false,
+                has_gui_window: false,
+                wakeups_per_sec: 0.0,
+                parent_alive: true,
+                process_uptime_secs: 0,
+                faults_total: 0,
+                pageins_total: 0,
+                is_translated: false,
+                mach_port_count: 0,
+                cpu_contention: None,
+                is_app_bundle: false,
+            })
+            .collect::<Vec<_>>();
 
         let input = FluidityTickInput {
             proc_snaps: &proc_snaps,

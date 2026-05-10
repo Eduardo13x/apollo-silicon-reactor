@@ -364,12 +364,7 @@ impl ActionAccumulator {
     /// `push_throttle()`" (typed shape-validated path), while
     /// `actions_pushed_raw_total` counts "any RootAction emitted via the
     /// `push_raw` / `extend_raw` escape hatch".
-    pub fn push_raw(
-        &mut self,
-        action: RootAction,
-        ctx: EmitContext,
-        lf_metrics: &LockFreeMetrics,
-    ) {
+    pub fn push_raw(&mut self, action: RootAction, ctx: EmitContext, lf_metrics: &LockFreeMetrics) {
         let variant = action_variant_name(&action);
         tracing::debug!(
             target: "apollo.accumulator",
@@ -505,11 +500,56 @@ mod tests {
         let lf = LockFreeMetrics::new();
         let mut acc = ActionAccumulator::new();
         // 15 pushes interleaving variants in a fixed order.
-        acc.push_throttle(101, "a", false, "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
-        acc.push_freeze(102, "b", "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
-        acc.push_set_sysctl_clamped("kern.ipc.somaxconn", "256", "r", DecisionReason::PressureContext, ctx(), &lf);
-        acc.push_throttle(103, "c", true, "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
-        acc.push_freeze(104, "d", "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
+        acc.push_throttle(
+            101,
+            "a",
+            false,
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_freeze(
+            102,
+            "b",
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_set_sysctl_clamped(
+            "kern.ipc.somaxconn",
+            "256",
+            "r",
+            DecisionReason::PressureContext,
+            ctx(),
+            &lf,
+        );
+        acc.push_throttle(
+            103,
+            "c",
+            true,
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_freeze(
+            104,
+            "d",
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
         acc.push_raw(
             RootAction::unfreeze(105, "e", "r", DecisionReason::PressureContext),
             ctx(),
@@ -525,9 +565,35 @@ mod tests {
             ctx(),
             &lf,
         );
-        acc.push_throttle(107, "f", false, "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
-        acc.push_freeze(108, "g", "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
-        acc.push_set_sysctl_clamped("net.inet.tcp.delayed_ack", "1", "r", DecisionReason::PressureContext, ctx(), &lf);
+        acc.push_throttle(
+            107,
+            "f",
+            false,
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_freeze(
+            108,
+            "g",
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_set_sysctl_clamped(
+            "net.inet.tcp.delayed_ack",
+            "1",
+            "r",
+            DecisionReason::PressureContext,
+            ctx(),
+            &lf,
+        );
         acc.push_raw(
             RootAction::BoostProcess {
                 pid: 109,
@@ -538,9 +604,35 @@ mod tests {
             ctx(),
             &lf,
         );
-        acc.push_throttle(110, "i", false, "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
-        acc.push_freeze(111, "j", "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
-        acc.push_set_sysctl_clamped("kern.maxvnodes", "200000", "r", DecisionReason::PressureContext, ctx(), &lf);
+        acc.push_throttle(
+            110,
+            "i",
+            false,
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_freeze(
+            111,
+            "j",
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_set_sysctl_clamped(
+            "kern.maxvnodes",
+            "200000",
+            "r",
+            DecisionReason::PressureContext,
+            ctx(),
+            &lf,
+        );
 
         let t = acc.telemetry();
         assert_eq!(t.total_pushed, 15);
@@ -553,8 +645,8 @@ mod tests {
         assert_eq!(t.set_memorystatus, 0); // via push_raw
         assert_eq!(t.toggle_spotlight, 0); // via push_raw
         assert_eq!(t.boost, 0); // via push_raw
-        // raw count = 4 push_raw calls (unfreeze, set_memorystatus,
-        // toggle_spotlight, boost).
+                                // raw count = 4 push_raw calls (unfreeze, set_memorystatus,
+                                // toggle_spotlight, boost).
         assert_eq!(t.raw, 4);
         // Invariant: Σ(typed per-variant) + raw == total_pushed.
         let typed_sum = t.throttle
@@ -596,23 +688,38 @@ mod tests {
     fn rejects_throttle_with_empty_name() {
         let lf = LockFreeMetrics::new();
         let mut acc = ActionAccumulator::new();
-        acc.push_throttle(42, "", false, "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
+        acc.push_throttle(
+            42,
+            "",
+            false,
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
         let t = acc.telemetry();
         assert_eq!(t.total_pushed, 0);
         assert_eq!(t.rejected_shape, 1);
         assert_eq!(t.throttle, 0);
-        assert_eq!(
-            lf.actions_rejected_shape_total
-                .load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(lf.actions_rejected_shape_total.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn rejects_freeze_with_pid_zero() {
         let lf = LockFreeMetrics::new();
         let mut acc = ActionAccumulator::new();
-        acc.push_freeze(0, "name", "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
+        acc.push_freeze(
+            0,
+            "name",
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
         let t = acc.telemetry();
         assert_eq!(t.total_pushed, 0);
         assert_eq!(t.rejected_shape, 1);
@@ -642,14 +749,12 @@ mod tests {
             &lf,
         );
         acc.push_raw(
-            RootAction::SetSysctl(
-                crate::engine::types::SetSysctlAction::new_clamped(
-                    "kern.maxvnodes",
-                    "200000",
-                    "r",
-                    DecisionReason::PressureContext,
-                ),
-            ),
+            RootAction::SetSysctl(crate::engine::types::SetSysctlAction::new_clamped(
+                "kern.maxvnodes",
+                "200000",
+                "r",
+                DecisionReason::PressureContext,
+            )),
             EmitContext::new(ActionPhase::SysctlGovernor, "test::raw_sysctl", "tick"),
             &lf,
         );
@@ -662,10 +767,7 @@ mod tests {
         assert_eq!(t.total_pushed, 2);
         assert_eq!(lf.actions_pushed_raw_total.load(Ordering::Relaxed), 2);
         // lf per-variant counters also untouched.
-        assert_eq!(
-            lf.actions_pushed_throttle_total.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(lf.actions_pushed_throttle_total.load(Ordering::Relaxed), 0);
         assert_eq!(
             lf.actions_pushed_set_sysctl_total.load(Ordering::Relaxed),
             0
@@ -676,9 +778,38 @@ mod tests {
     fn view_returns_partial_during_build() {
         let lf = LockFreeMetrics::new();
         let mut acc = ActionAccumulator::new();
-        acc.push_throttle(1, "a", false, "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
-        acc.push_freeze(2, "b", "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
-        acc.push_throttle(3, "c", true, "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
+        acc.push_throttle(
+            1,
+            "a",
+            false,
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_freeze(
+            2,
+            "b",
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_throttle(
+            3,
+            "c",
+            true,
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
         assert_eq!(acc.view().len(), 3);
         assert_eq!(acc.len(), 3);
         assert!(!acc.is_empty());
@@ -723,10 +854,39 @@ mod tests {
     fn telemetry_pushed_total_matches_actions_len() {
         let lf = LockFreeMetrics::new();
         let mut acc = ActionAccumulator::new();
-        acc.push_throttle(1, "a", false, "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
-        acc.push_freeze(2, "b", "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
+        acc.push_throttle(
+            1,
+            "a",
+            false,
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_freeze(
+            2,
+            "b",
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
         // Rejected push should not move total_pushed.
-        acc.push_throttle(0, "", false, "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
+        acc.push_throttle(
+            0,
+            "",
+            false,
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
         let t = acc.telemetry();
         assert_eq!(t.total_pushed, 2);
         assert_eq!(t.total_pushed, acc.len() as u64);
@@ -736,7 +896,17 @@ mod tests {
     fn finalize_consumes_self_and_returns_owned_vec() {
         let lf = LockFreeMetrics::new();
         let mut acc = ActionAccumulator::with_capacity(8);
-        acc.push_throttle(1, "a", false, "r", DecisionReason::PressureContext, 0, 0, ctx(), &lf);
+        acc.push_throttle(
+            1,
+            "a",
+            false,
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
         let v: Vec<RootAction> = acc.finalize();
         assert_eq!(v.len(), 1);
         // Compile-time guarantee via #[must_use] is checked by clippy lint;

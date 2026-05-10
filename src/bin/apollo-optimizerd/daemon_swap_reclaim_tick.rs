@@ -22,10 +22,7 @@ use apollo_engine::engine::swap_reclaim::{SaturationForecast, SwapRisk, CRITICAL
 /// # Parameters
 /// - `reclaim_forecast` — current cycle saturation forecast
 /// - `reactor_weight` — mutable reactor weight (clamped to [0.0, 1.0])
-pub fn apply_swap_reclaim_boost(
-    reclaim_forecast: &SaturationForecast,
-    reactor_weight: &mut f64,
-) {
+pub fn apply_swap_reclaim_boost(reclaim_forecast: &SaturationForecast, reactor_weight: &mut f64) {
     match reclaim_forecast.risk {
         SwapRisk::Critical => {
             *reactor_weight = (*reactor_weight + 0.25).min(1.0);

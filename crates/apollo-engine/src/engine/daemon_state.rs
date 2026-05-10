@@ -64,7 +64,7 @@ impl MetricsState {
         self.metrics.unfreezes_applied = lf.unfreezes;
         self.metrics.throttles_applied = lf.throttles;
         self.metrics.throttle_reverted = lf.throttle_reverted;
-        
+
         // Latency durations (convert us -> ms)
         self.metrics.p95_cycle_ms = lf.cycle_time_us as f64 / 1000.0;
         self.metrics.refresh_duration_ms = lf.refresh_duration_us as f64 / 1000.0;
@@ -73,7 +73,8 @@ impl MetricsState {
         self.metrics.restore_status_restored_n = lf.restore_status_restored_n;
         self.metrics.restore_status_discarded_corrupt = lf.restore_status_discarded_corrupt;
         self.metrics.restore_status_discarded_clock_delta = lf.restore_status_discarded_clock_delta;
-        self.metrics.restore_status_discarded_boot_crossed = lf.restore_status_discarded_boot_crossed;
+        self.metrics.restore_status_discarded_boot_crossed =
+            lf.restore_status_discarded_boot_crossed;
         // Sprint 3 Phase A4 — flush identity_cache_* counters from lf to runtime metrics.
         self.metrics.identity_cache_hits = lf.identity_cache_hits;
         self.metrics.identity_cache_misses = lf.identity_cache_misses;
@@ -88,18 +89,48 @@ impl MetricsState {
         self.metrics.actions_pushed_freeze_total = lf.actions_pushed_freeze_total;
         self.metrics.actions_pushed_unfreeze_total = lf.actions_pushed_unfreeze_total;
         self.metrics.actions_pushed_boost_total = lf.actions_pushed_boost_total;
-        self.metrics.actions_pushed_set_memorystatus_total = lf.actions_pushed_set_memorystatus_total;
+        self.metrics.actions_pushed_set_memorystatus_total =
+            lf.actions_pushed_set_memorystatus_total;
         self.metrics.actions_pushed_set_thread_qos_total = lf.actions_pushed_set_thread_qos_total;
         self.metrics.actions_pushed_set_sysctl_total = lf.actions_pushed_set_sysctl_total;
-        self.metrics.actions_pushed_toggle_spotlight_total = lf.actions_pushed_toggle_spotlight_total;
-        self.metrics.actions_pushed_quarantine_daemon_total = lf.actions_pushed_quarantine_daemon_total;
+        self.metrics.actions_pushed_toggle_spotlight_total =
+            lf.actions_pushed_toggle_spotlight_total;
+        self.metrics.actions_pushed_quarantine_daemon_total =
+            lf.actions_pushed_quarantine_daemon_total;
         self.metrics.actions_pushed_raw_total = lf.actions_pushed_raw_total;
         self.metrics.actions_rejected_shape_total = lf.actions_rejected_shape_total;
         self.metrics.memory_budget_duration_ms = lf.memory_budget_duration_us as f64 / 1000.0;
         self.metrics.reactor_duration_ms = lf.reactor_duration_us as f64 / 1000.0;
-        
+
         // Reactor pulses
         self.metrics.reactor_pulses = lf.signals_sent;
+        // Maintenance Purge Gate (2026-05-10) — Sprint 3 telemetry sync chain
+        self.metrics.maintenance_purge_total = lf.maintenance_purge_total;
+        self.metrics.maintenance_purge_skipped_pressure_total =
+            lf.maintenance_purge_skipped_pressure_total;
+        self.metrics.maintenance_purge_skipped_swap_floor_total =
+            lf.maintenance_purge_skipped_swap_floor_total;
+        self.metrics.maintenance_purge_skipped_growing_total =
+            lf.maintenance_purge_skipped_growing_total;
+        self.metrics.maintenance_purge_skipped_idle_total = lf.maintenance_purge_skipped_idle_total;
+        self.metrics.maintenance_purge_skipped_build_mode_total =
+            lf.maintenance_purge_skipped_build_mode_total;
+        self.metrics.maintenance_purge_skipped_rate_limit_total =
+            lf.maintenance_purge_skipped_rate_limit_total;
+    }
+}
+
+impl Default for MetricsState {
+    fn default() -> Self {
+        Self {
+            metrics: RuntimeMetrics::default(),
+            throttle_level: String::new(),
+            thermal_state: String::new(),
+            thermal_level_real: String::new(),
+            fast_tick_until: None,
+            reactor_event_weight: 0.0,
+            reactor_status: ReactorStatus::default(),
+        }
     }
 }
 
