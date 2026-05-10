@@ -1224,16 +1224,19 @@ fn render_sense_q(status: &DaemonStatus) -> Vec<String> {
 
     let swap_gb = m.swap_used_bytes as f64 / 1_073_741_824.0;
     let swap_total_gb = (m.swap_total_bytes as f64 / 1_073_741_824.0).max(0.1);
-    let swap_emoji = if swap_gb >= swap_total_gb * 0.85 {
+    let swap_ratio = (swap_gb / swap_total_gb).clamp(0.0, 1.0);
+    let swap_emoji = if swap_ratio >= 0.85 {
         "🔴"
-    } else if swap_gb >= swap_total_gb * 0.50 {
+    } else if swap_ratio >= 0.50 {
         "🟡"
     } else {
         "🟢"
     };
     lines.push(format!(
-        "Swap   {:.1}/{:.1}GB {}",
-        swap_gb, swap_total_gb, swap_emoji
+        "Swap   {} {:>3.0}% {}",
+        render_bar(swap_ratio, 12),
+        swap_ratio * 100.0,
+        swap_emoji
     ));
 
     lines.push(format!(
