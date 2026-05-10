@@ -84,6 +84,14 @@ impl FreezeIntelligence {
     /// category, so evidence transfers across all processes of the same type.
     ///
     /// Rules are applied in priority order (most specific first).
+    ///
+    /// Limitations: name-only. Cannot distinguish "apple-owned" (path /
+    /// codesign-derived) or "companion-of-fg" (foreground-context-derived).
+    /// Use `classify_full` when those signals are available — they preserve
+    /// NARS truth-value calibration for the legacy categories by routing
+    /// today's structurally-protected processes (apple-owned, companion) to
+    /// their own categories instead of misclassifying them as `background-noise`
+    /// or similar.
     pub fn classify(name: &str) -> &'static str {
         // Chromium/Electron helper variants (most specific first)
         if name.ends_with("Helper (Renderer)") {
@@ -121,6 +129,81 @@ impl FreezeIntelligence {
         }
 
         "generic"
+    }
+
+    /// Classify with full structural context (Sprint Coalition 2026-05-10).
+    ///
+    /// Preserves NARS belief calibration for the legacy categories by routing
+    /// structurally-protected processes to their own categories. Without this,
+    /// after Sprint Coalition deployed (commits a381c6b..1ab6bdb), every
+    /// process now under apple-owned guard or active-coalition envelope was
+    /// still being classified as `background-noise` / `app-helper` /
+    /// `generic` — but never throttled. NARS DriftDetector would slowly
+    /// corrupt truth-values for those categories: "we say throttle works on
+    /// background-noise, but observations show 0% throttle attempts ever
+    /// land on these procs". Adversarial review NotebookLM round-3 2026-05-10.
+    ///
+    /// Priority order (specific first, structural fallback for everything else):
+    ///   1. legacy name-pattern classify() — chromium-renderer, ide-lsp,
+    ///      xpc-service, media-helper, app-helper. These categories carry
+    ///      years of accumulated NARS evidence about freeze semantics, so a
+    ///      renderer that happens to also be a fg-companion still routes to
+    ///      `chromium-renderer` (the more specific belief).
+    ///   2. `apple-owned`  — overrides only when legacy returned `generic`.
+    ///      Origin-based: SIP path or codesign Apple chain.
+    ///   3. `companion-of-fg` — overrides only when legacy returned `generic`
+    ///      AND apple-owned didn't match. Statistical, name-keyed via Lift.
+    ///   4. fall through to `generic`.
+    ///
+    /// Routing today's structurally-protected `generic` processes to
+    /// `apple-owned` / `companion-of-fg` instead preserves NARS truth-value
+    /// calibration for the legacy categories.
+    pub fn classify_full(
+        name: &str,
+        pid: Option<u32>,
+        fg_app: Option<&str>,
+        companion_graph: Option<&crate::engine::companion_graph::CompanionGraph>,
+    ) -> &'static str {
+        let legacy = Self::classify(name);
+        if legacy != "generic" {
+            return legacy;
+        }
+        // Layer 2: apple-owned (path/codesign — structural).
+        if let Some(p) = pid {
+            if crate::engine::apple_owned::is_apple_owned(p) {
+                return "apple-owned";
+            }
+        }
+        // Layer 3: companion-of-fg (statistical, name-keyed).
+        if let (Some(fg), Some(g)) = (fg_app, companion_graph) {
+            if g.is_companion_of(fg, name) {
+                return "companion-of-fg";
+            }
+        }
+        "generic"
+    }
+
+    /// Same as `observe` but uses `classify_full` so apple-owned and
+    /// companion-of-fg processes accumulate evidence in their OWN NARS
+    /// categories instead of corrupting the legacy ones.
+    pub fn observe_full(
+        &mut self,
+        process_name: &str,
+        pid: Option<u32>,
+        fg_app: Option<&str>,
+        companion_graph: Option<&crate::engine::companion_graph::CompanionGraph>,
+        success: bool,
+        salience: f32,
+    ) {
+        let category = Self::classify_full(process_name, pid, fg_app, companion_graph);
+        self.beliefs.observe_salient(
+            category,
+            success,
+            Salience {
+                arousal: salience.clamp(0.0, 1.0),
+                valence: if success { 0.5 } else { -0.5 },
+            },
+        );
     }
 
     // ── Belief update ─────────────────────────────────────────────────────────
@@ -438,6 +521,74 @@ mod tests {
         assert!(
             fi.should_freeze("Brave Browser Helper (Renderer)"),
             "chromium-renderer confidence should be independent of ide-lsp failures"
+        );
+    }
+
+    #[test]
+    fn classify_full_returns_apple_owned_for_pid_zero() {
+        // pid 0 = kernel_task → is_apple_owned returns true → category apple-owned
+        let cat = FreezeIntelligence::classify_full("kernel_task", Some(0), None, None);
+        assert_eq!(cat, "apple-owned");
+    }
+
+    #[test]
+    fn classify_full_legacy_wins_over_new_categories() {
+        // Renderer name → legacy classify returns "chromium-renderer".
+        // Even with apple-owned pid signal, legacy wins because it's more
+        // specific (carries chromium-specific NARS evidence).
+        let cat = FreezeIntelligence::classify_full(
+            "Brave Browser Helper (Renderer)",
+            Some(0), // would be apple-owned, but legacy is more specific
+            None,
+            None,
+        );
+        assert_eq!(cat, "chromium-renderer");
+    }
+
+    #[test]
+    fn classify_full_returns_companion_when_graph_matches() {
+        use crate::engine::companion_graph::CompanionGraph;
+        let mut g = CompanionGraph::new();
+        // Build a Brave session that makes Slack a companion (lift > 2.0).
+        for c in 0..200 {
+            g.observe_cycle(Some("Brave"), &["Slack".into()], c);
+        }
+        for c in 200..1000 {
+            g.observe_cycle(Some("Other"), &["unrelated".into()], c);
+        }
+        // Slack while Brave is fg → companion-of-fg, NOT app-helper.
+        let cat = FreezeIntelligence::classify_full(
+            "Slack",
+            None, // no pid → skip apple_owned check
+            Some("Brave"),
+            Some(&g),
+        );
+        assert_eq!(cat, "companion-of-fg");
+    }
+
+    #[test]
+    fn observe_full_routes_evidence_to_new_categories() {
+        // Simulate 30 successful observations on apple-owned processes.
+        // Legacy `observe` would route them to `generic` (or whatever the
+        // name-based classification said). `observe_full` routes them to
+        // `apple-owned`, preserving `generic` calibration.
+        let mut fi = FreezeIntelligence::new();
+        for _ in 0..30 {
+            // pid 0 = kernel_task, ensures apple-owned routing.
+            fi.observe_full("kernel_task", Some(0), None, None, true, 0.5);
+        }
+        // apple-owned belief now has 30 successful observations → high
+        // confidence (>= default 0.70).
+        let apple_conf = fi.confidence_for_category("apple-owned");
+        assert!(
+            apple_conf >= 0.70,
+            "apple-owned should accumulate evidence, got {apple_conf}"
+        );
+        // generic stays at default — was NOT polluted.
+        let gen_conf = fi.confidence_for_category("generic");
+        assert!(
+            (gen_conf - 0.70).abs() < 0.01,
+            "generic should remain at default 0.70, got {gen_conf}"
         );
     }
 }

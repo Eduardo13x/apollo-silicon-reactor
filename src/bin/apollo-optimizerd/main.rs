@@ -4434,6 +4434,44 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
 
+                // NARS belief routing for newly-frozen non-chromium PIDs
+                // (Sprint A 2026-05-10). chromium_mgr already routes its own
+                // renderer freezes via observe_freeze_outcome → classify(name)
+                // (legacy path). For everything else, classify_full now routes
+                // apple-owned and companion-of-fg processes to their own NARS
+                // categories instead of corrupting `generic` / `app-helper`
+                // truth-values. Closes the NotebookLM round-3 NARS visibility
+                // gap (regime-shift drift).
+                {
+                    let intel = chromium_mgr.intelligence_mut();
+                    for &pid in &exec_outcomes.newly_frozen_pids {
+                        // Look up name from snapshot — bounded O(top_processes).
+                        let name = snapshot
+                            .top_processes
+                            .iter()
+                            .find(|p| p.pid == pid)
+                            .map(|p| p.name.clone())
+                            .unwrap_or_default();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        // Live freeze observation: success=alive (re-thaw worked
+                        // / process still healthy). For routing-only purposes
+                        // we record success=true with low salience so legacy
+                        // beliefs aren't perturbed; the goal is preserving
+                        // `generic` calibration by diverting the
+                        // structurally-protected category traffic.
+                        intel.observe_full(
+                            &name,
+                            Some(pid),
+                            foreground_app.as_deref(),
+                            Some(&companion_graph),
+                            true,
+                            0.10,
+                        );
+                    }
+                }
+
                 // Learning tick: outcome tracking, causal graph, RL cables, predictive
                 // agent, and periodic persist (every 100 cycles). Extracted to
                 // learning_tick.rs for readability; behaviour is unchanged.
