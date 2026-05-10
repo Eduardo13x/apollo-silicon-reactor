@@ -1364,15 +1364,15 @@ fn render_decide_q(status: &DaemonStatus) -> Vec<String> {
         status.effective_profile.as_str()
     ));
 
-    // LLM
+    // Teacher (Gemma 4 local LLM) — daily teach-call budget
     if let Some(l) = &status.llm {
-        let llm_state = if l.enabled { "✅" } else { "❌" };
+        let state = if l.enabled { "✅" } else { "❌" };
         lines.push(format!(
-            "LLM    {} {}/{}",
-            llm_state, l.calls_today, l.daily_budget
+            "Teach calls {} {}/{}",
+            state, l.calls_today, l.daily_budget
         ));
     } else {
-        lines.push("LLM    ❌ off".to_string());
+        lines.push("Teach calls ❌ off".to_string());
     }
 
     lines
