@@ -196,9 +196,18 @@ fn collect_idle_secs_inner() -> Option<f64> {
 /// [Apple TN3115] pmset assertions:
 ///   `PreventUserIdleSleep` / `PreventUserIdleSystemSleep` → active media/call
 ///   `NoIdleSleepAssertion` from coreaudiod → audio output active
+///
+/// `audio_active` is OR'd with a CoreAudio direct query
+/// (`kAudioDevicePropertyDeviceIsRunningSomewhere` on the default output
+/// device). Modern macOS no longer reliably emits the coreaudiod assertion
+/// for browser-sourced audio (HTML5 audio, podcasts, YouTube background
+/// playback), so the pmset path was missing those cases — letting the
+/// maintenance purge gate fire during media playback and cause stutter.
 #[cfg(target_os = "macos")]
 fn collect_pmset_assertions() -> (bool, bool, bool) {
-    collect_pmset_inner().unwrap_or((false, false, false))
+    let (sleep, call, audio_pmset) = collect_pmset_inner().unwrap_or((false, false, false));
+    let audio = audio_pmset || super::coreaudio_active::is_audio_running_somewhere();
+    (sleep, call, audio)
 }
 
 #[cfg(target_os = "macos")]

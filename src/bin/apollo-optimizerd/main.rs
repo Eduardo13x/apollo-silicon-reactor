@@ -3209,6 +3209,7 @@ fn main() -> anyhow::Result<()> {
                         &snapshot.top_processes,
                         &state,
                         &decide_interactive,
+                        &user_context,
                     );
                     acc.extend_raw(
                         agent_new,

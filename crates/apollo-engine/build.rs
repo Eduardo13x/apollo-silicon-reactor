@@ -43,5 +43,9 @@ fn main() {
         // Adding it here is harmless (linker deduplicates).
         println!("cargo:rustc-link-lib=framework=IOKit");
         println!("cargo:rerun-if-changed=native/smc_bridge.c");
+
+        // ── CoreAudio (used by coreaudio_active.rs) ─────────────────────
+        // AudioObjectGetPropertyData lives in CoreAudio.framework.
+        println!("cargo:rustc-link-lib=framework=CoreAudio");
     }
 }

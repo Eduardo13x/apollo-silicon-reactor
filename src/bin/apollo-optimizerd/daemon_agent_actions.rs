@@ -18,6 +18,7 @@ use apollo_engine::engine::decide_actions::is_interactive_app_name;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::predictive_agent::Intervention;
 use apollo_engine::engine::types::RootAction;
+use apollo_engine::engine::user_context::UserContext;
 
 /// Inject predictive-agent soft actions for this cycle.
 ///
@@ -26,6 +27,14 @@ use apollo_engine::engine::types::RootAction;
 /// - `top_processes` — snapshot.top_processes for this cycle
 /// - `state` — SharedState (policy lock for noise/interactive/protected patterns)
 /// - `decide_interactive` — interactive process name patterns from decide_actions
+/// - `user_ctx` — UserContext for media-active gate (audio_active /
+///   call_in_progress / has_sleep_assertion). `ProactivePurge` is suppressed
+///   when any media signal is held: `kern.memorystatus_vm_pressure_send`
+///   forces the target to drop caches, which on graphics-/audio-handling
+///   processes (e.g. WindowServer, coreaudiod helpers) causes stutter and
+///   skipped audio frames during podcast/video playback. The maintenance
+///   purge gate already enforces this for shell `purge`; the predictive
+///   path was the missing twin.
 ///
 /// Returns new actions to extend the main actions vec.
 pub fn run_agent_actions(
@@ -33,6 +42,7 @@ pub fn run_agent_actions(
     top_processes: &[ProcessStats],
     state: &SharedState,
     decide_interactive: &[String],
+    user_ctx: &UserContext,
 ) -> Vec<RootAction> {
     let mut new_actions: Vec<RootAction> = Vec::new();
 
@@ -65,6 +75,17 @@ pub fn run_agent_actions(
             }
         }
         Intervention::ProactivePurge => {
+            // Media-active gate: suppress proactive paging hints during audio /
+            // video / call playback. SetMemorystatus drops caches in the target
+            // process; firing it on WindowServer or audio helpers during media
+            // produces visible/audible stutter. Symmetric with the maintenance
+            // purge gate in daemon_maintenance_tick.rs::should_fire.
+            if user_ctx.audio_active
+                || user_ctx.call_in_progress
+                || user_ctx.has_sleep_assertion
+            {
+                return new_actions;
+            }
             // Send paging hints to top 3 background processes by RSS.
             // SetMemorystatus priority -1 = voluntary cache release — no freeze, no kill.
             let protected_pats = state
