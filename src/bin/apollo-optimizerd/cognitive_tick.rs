@@ -81,6 +81,10 @@ pub struct CognitiveTickInputs {
     /// LinUCB arm index and delta (for ReptileMeta learning).
     pub linucb_arm_idx: usize,
     pub linucb_delta: f64,
+    /// Mean blocked-action overprotection signal from OutcomeTracker
+    /// (Bayesian-Laplace aggregate over mature blocked patterns, [0,1]).
+    /// Feeds Epistemic composite W_GUARD=0.20.
+    pub guard_overprotection: f32,
 }
 
 impl Default for CognitiveTickInputs {
@@ -102,6 +106,7 @@ impl Default for CognitiveTickInputs {
             rl_q_delta: 0.0,
             linucb_arm_idx: 0,
             linucb_delta: 0.0,
+            guard_overprotection: 0.0,
         }
     }
 }
@@ -210,15 +215,18 @@ pub fn run_cognitive_tick(
     }
 
     // ── 4. EpistemicUncertainty: update composite ─────────────────────────
-    // Calibration error feeds in as 5th component (W_CALIB=0.25). Keeps the
-    // composite honest when MetaCognition has measured a humble-mode-worthy
-    // calibration gap that the spread-based components alone would miss.
+    // 6 components total. Guard-overprotection (W_GUARD=0.20) closes the
+    // Three-Pillar gap noted by NotebookLM 2026-05-10: an 8-layer guard tower
+    // could over-protect for hours without anyone noticing. The
+    // OutcomeTracker's Bayesian-Laplace aggregate over mature blocked
+    // patterns surfaces it.
     cog.epistemic.update(
         inputs.rl_q_variance,
         inputs.linucb_exploration,
         1.0 - inputs.nars_min_confidence,
         inputs.drift_score as f32,
         cog.meta_cognition.calibration_error,
+        inputs.guard_overprotection,
     );
 
     // ── 5. ReptileMeta: detect fingerprint changes + apply deltas ────────
@@ -394,9 +402,12 @@ mod tests {
     #[test]
     fn test_cognitive_tick_high_uncertainty_blocks() {
         let mut cog = CognitiveState::new();
-        // All 4 spread-based components at max → composite = 0.25+0.20+0.20+0.10 = 0.75 > 0.70.
-        // calibration_error contributes W_CALIB=0.25 but requires MIN_OBS_FOR_ECE=10 to activate;
-        // a fresh state has 0 calibration so we drive composite via the other components alone.
+        // 6-component composite (rebalanced 2026-05-10):
+        //   W_RL=0.20 + W_LINUCB=0.15 + W_NARS=0.15 + W_DRIFT=0.10
+        //   + W_CALIB=0.20 + W_GUARD=0.20 = 1.0
+        // 4 spread-based at max alone = 0.60 (below HIGH 0.70). Drive guard_overprotection
+        // to 1.0 too so composite reaches 0.80 > 0.70 — also exercises the new
+        // 6th component end-to-end.
         let inputs = CognitiveTickInputs {
             cycle: 100,
             pressure: 0.80,
@@ -405,6 +416,7 @@ mod tests {
             linucb_exploration: 1.0,
             nars_min_confidence: 0.0,
             outcome_effectiveness: 0.2,
+            guard_overprotection: 1.0,
             ..Default::default()
         };
 

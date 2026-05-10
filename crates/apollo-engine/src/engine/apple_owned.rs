@@ -27,16 +27,36 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 extern "C" {
     fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
 }
 
-/// Cached codesign verdicts keyed by absolute binary path.
-/// Invalidated implicitly on path change (binary replaced → different key
-/// the next time the proc with the new binary is queried).
-static CODESIGN_CACHE: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+/// Codesign verdict + timestamp. The `validated_at` is checked against
+/// `CACHE_TTL` so a binary replacement (e.g. macOS update writes a new
+/// executable to the same path) is re-validated within the TTL window
+/// instead of carrying yesterday's verdict for tomorrow's binary.
+/// Closes the split-brain risk NotebookLM peer-review flagged 2026-05-10
+/// against IdentityCache (which invalidates on NOTE_EXIT / start-time
+/// change). Path-keyed caches cannot use start_sec — TTL is the
+/// canonical refresh primitive.
+#[derive(Clone, Copy)]
+struct CodesignEntry {
+    is_apple: bool,
+    validated_at: Instant,
+}
+
+/// Re-validate codesign verdict at most once every CACHE_TTL.
+/// 6h is short enough to bound exposure to "binary replaced" edge cases,
+/// long enough that hot-path queries are O(1) cache hits in steady state.
+const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
+/// Hard cap on cache size. Apple Silicon Macs run ~100-300 unique binary
+/// paths in steady state; 1024 leaves comfortable headroom.
+const MAX_CACHE_ENTRIES: usize = 1024;
+
+static CODESIGN_CACHE: Mutex<Option<HashMap<String, CodesignEntry>>> = Mutex::new(None);
 
 /// True when the process is owned by Apple (system, framework, or kernel).
 ///
@@ -95,11 +115,32 @@ fn resolve_pid_path(pid: u32) -> Option<String> {
 fn is_apple_signed_cached(path: &str) -> bool {
     if let Ok(mut guard) = CODESIGN_CACHE.lock() {
         let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some(&v) = cache.get(path) {
-            return v;
+        let now = Instant::now();
+        // Hit only if entry exists AND is within TTL.
+        if let Some(entry) = cache.get(path) {
+            if now.duration_since(entry.validated_at) < CACHE_TTL {
+                return entry.is_apple;
+            }
         }
         let v = codesign_authority_is_apple(path);
-        cache.insert(path.to_string(), v);
+        // Hard cap: evict oldest entry when at capacity. O(n) on overflow
+        // (rare: bounded by unique-binary-count), O(1) on hit.
+        if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(path) {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, e)| e.validated_at)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
+        cache.insert(
+            path.to_string(),
+            CodesignEntry {
+                is_apple: v,
+                validated_at: now,
+            },
+        );
         return v;
     }
     // Mutex poisoned: skip cache, query live (still correct, just slower).

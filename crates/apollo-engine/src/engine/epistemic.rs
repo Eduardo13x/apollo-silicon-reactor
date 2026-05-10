@@ -6,20 +6,30 @@
 //! to gate risky actions when the system is genuinely unsure.
 //!
 //! ## Design
-//! Composite uncertainty from 5 independent sources:
+//! Composite uncertainty from 6 independent sources:
 //! - RL Q-value variance (how spread are Q-values in current state)
 //! - LinUCB exploration bonus (√(x'A⁻¹x) for chosen arm)
 //! - NARS confidence spread (1 - min confidence across relevant beliefs)
 //! - Drift score (DriftDetector.score() — model-reality divergence)
 //! - MetaCognition calibration error (predicted-vs-actual gap across subsystems)
+//! - Guard-tower over-protection (mean blocked-action effectiveness across mature
+//!   patterns; high = blocks "would have helped" → policy is over-protective)
 //!
 //! Why calibration is a 5th component (added 2026-04-30):
 //! Without it, a system with low Q-variance + few NARS observations + no drift
 //! reads epistemic=LOW even when MetaCognition has measured a >0.20 calibration
-//! error and activated humble_mode. The two signals would contradict each other
-//! ("I'm 99% sure" vs "your predictions don't match reality"). Calibration error
-//! is the most authoritative confidence signal — it directly compares prediction
-//! to outcome — so it deserves explicit weight in the composite.
+//! error and activated humble_mode.
+//!
+//! Why guard-overprotection is a 6th component (added 2026-05-10):
+//! After Sprint Coalition + CompanionGraph, ProactivePurge is gated by an 8-layer
+//! filter and execute_actions runs a 6-layer guard. Each gate fires unilaterally
+//! at high confidence; without a composed-uncertainty channel, the system can
+//! over-protect for hours without anyone noticing. OutcomeTracker's
+//! mean_blocked_overprotection() Bayesian-Laplace aggregate across mature blocked
+//! patterns is the empirical signal: if blocks repeatedly "would have helped"
+//! (Rubin 1974 counterfactual via tick_blocked), the guard tower is wrong and
+//! cumulative confidence must drop. Three-Pillar Theorem (apollo_agi_paper_draft.md)
+//! requires this composition under bounded rationality.
 //!
 //! When composite > 0.70 → block aggressive freezes.
 //! When composite > 0.85 → force Observe arm only (zero side effects).
@@ -40,14 +50,16 @@ const OBSERVE_ONLY_THRESHOLD: f32 = 0.85;
 
 /// Weights for composite uncertainty formula.
 /// Sum = 1.0. Tuned for Apollo's multi-agent architecture.
-/// Calibration carries 0.25 (highest single weight) because it's the only
-/// signal that directly compares predictions to actual outcomes — the others
-/// measure spread/exploration, not correctness.
-const W_RL: f32 = 0.25;
-const W_LINUCB: f32 = 0.20;
-const W_NARS: f32 = 0.20;
+/// Calibration and Guard-overprotection carry the largest single weights
+/// because they're the two signals that directly compare predictions /
+/// policies to actual outcomes — the others measure spread / exploration,
+/// not correctness. Rebalanced 2026-05-10 to admit Guard-overprotection.
+const W_RL: f32 = 0.20;
+const W_LINUCB: f32 = 0.15;
+const W_NARS: f32 = 0.15;
 const W_DRIFT: f32 = 0.10;
-const W_CALIB: f32 = 0.25;
+const W_CALIB: f32 = 0.20;
+const W_GUARD: f32 = 0.20;
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -78,8 +90,15 @@ pub struct EpistemicUncertainty {
     /// The most authoritative confidence signal (compares prediction to truth).
     pub meta_calibration_error: f32,
 
+    /// Guard-tower over-protection signal from `OutcomeTracker::
+    /// mean_blocked_overprotection()` [0, 1].
+    /// High = blocked actions repeatedly "would have helped" per Rubin 1974
+    /// counterfactual → guard policy is wrong → cumulative confidence drops.
+    #[serde(default)]
+    pub guard_overprotection: f32,
+
     /// Composite uncertainty [0, 1].
-    /// Weighted combination of all 5 sources.
+    /// Weighted combination of all 6 sources.
     pub composite: f32,
 
     /// Whether high uncertainty mode is active (composite > 0.70).
@@ -99,6 +118,9 @@ impl EpistemicUncertainty {
     /// All inputs should be in [0, 1]. Out-of-range values are clamped.
     /// `meta_calibration_error` should come from `MetaCognition.calibration_error`
     /// after `meta_cognition.tick()` has run in the same cycle.
+    /// `guard_overprotection` should come from
+    /// `OutcomeTracker.mean_blocked_overprotection()` after `tick_blocked` has
+    /// resolved any patterns that crossed their 30 s evaluation window.
     pub fn update(
         &mut self,
         rl_q_variance: f32,
@@ -106,20 +128,23 @@ impl EpistemicUncertainty {
         nars_confidence_spread: f32,
         drift_score: f32,
         meta_calibration_error: f32,
+        guard_overprotection: f32,
     ) {
         self.rl_q_variance = rl_q_variance.clamp(0.0, 1.0);
         self.linucb_exploration = linucb_exploration.clamp(0.0, 1.0);
         self.nars_confidence_spread = nars_confidence_spread.clamp(0.0, 1.0);
         self.drift_score = drift_score.clamp(0.0, 1.0);
         self.meta_calibration_error = meta_calibration_error.clamp(0.0, 1.0);
+        self.guard_overprotection = guard_overprotection.clamp(0.0, 1.0);
 
         // Composite: weighted sum [Lakshminarayanan 2017 §3 predictive entropy
-        // + Guo 2017 §3 ECE calibration]
+        // + Guo 2017 §3 ECE calibration + Rubin 1974 potential outcomes]
         self.composite = W_RL * self.rl_q_variance
             + W_LINUCB * self.linucb_exploration
             + W_NARS * self.nars_confidence_spread
             + W_DRIFT * self.drift_score
-            + W_CALIB * self.meta_calibration_error;
+            + W_CALIB * self.meta_calibration_error
+            + W_GUARD * self.guard_overprotection;
         self.composite = self.composite.clamp(0.0, 1.0);
 
         // Mode transitions
@@ -158,6 +183,7 @@ impl EpistemicUncertainty {
             (self.nars_confidence_spread * W_NARS, "NARS-Spread"),
             (self.drift_score * W_DRIFT, "Drift"),
             (self.meta_calibration_error * W_CALIB, "Calibration"),
+            (self.guard_overprotection * W_GUARD, "Guard-Overprotect"),
         ];
         components
             .iter()
@@ -186,6 +212,11 @@ impl EpistemicUncertainty {
                 self.meta_calibration_error,
                 self.meta_calibration_error * W_CALIB,
             ),
+            (
+                "Guard-Overprotect",
+                self.guard_overprotection,
+                self.guard_overprotection * W_GUARD,
+            ),
         ]
     }
 }
@@ -207,7 +238,7 @@ mod tests {
     #[test]
     fn test_all_low_uncertainty() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.1, 0.1, 0.1, 0.05, 0.05);
+        eu.update(0.1, 0.1, 0.1, 0.05, 0.05, 0.05);
         assert!(eu.composite < 0.15);
         assert!(!eu.should_block_aggressive());
         assert!(!eu.should_observe_only());
@@ -217,7 +248,7 @@ mod tests {
     #[test]
     fn test_all_high_uncertainty() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(1.0, 1.0, 1.0, 1.0, 1.0);
+        eu.update(1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
         assert!(eu.composite > 0.95);
         assert!(eu.should_block_aggressive());
         assert!(eu.should_observe_only());
@@ -227,8 +258,9 @@ mod tests {
     #[test]
     fn test_high_mode_threshold() {
         let mut eu = EpistemicUncertainty::new();
-        // Composite just above 0.70 — all components elevated
-        eu.update(0.80, 0.80, 0.70, 0.30, 0.70);
+        // Composite just above 0.70 — all components elevated, including
+        // guard_overprotection so the rebalanced 6-component formula crosses HIGH.
+        eu.update(0.80, 0.80, 0.70, 0.30, 0.70, 1.0);
         assert!(eu.should_block_aggressive());
         assert!(!eu.should_observe_only());
         assert_eq!(eu.level_label(), "HIGH");
@@ -237,21 +269,21 @@ mod tests {
     #[test]
     fn test_observe_only_threshold() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.95, 0.95, 0.90, 0.60, 0.95);
+        eu.update(0.95, 0.95, 0.90, 0.60, 0.95, 0.95);
         assert!(eu.should_observe_only());
     }
 
     #[test]
     fn test_moderate_level() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.50, 0.50, 0.50, 0.30, 0.50);
+        eu.update(0.50, 0.50, 0.50, 0.30, 0.50, 0.50);
         assert_eq!(eu.level_label(), "MODERATE");
     }
 
     #[test]
     fn test_clamping_out_of_range() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(5.0, -2.0, 1.5, 3.0, 4.0);
+        eu.update(5.0, -2.0, 1.5, 3.0, 4.0, 9.9);
         assert!(eu.rl_q_variance <= 1.0);
         assert!(eu.linucb_exploration >= 0.0);
         assert!(eu.meta_calibration_error <= 1.0);
@@ -262,24 +294,50 @@ mod tests {
     #[test]
     fn test_dominant_source_rl() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(1.0, 0.0, 0.0, 0.0, 0.0);
+        eu.update(1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(eu.dominant_source(), "RL-QVar");
     }
 
     #[test]
     fn test_dominant_source_drift() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.0, 0.0, 0.0, 1.0, 0.0);
-        // W_CALIB=0.25 > W_DRIFT=0.10, so drift alone wins only when drift_score=1.0
-        // and calibration is 0.0. Verify drift wins.
+        eu.update(0.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+        // Drift weighted contribution = 0.10 (W_DRIFT). Other components 0.
+        // Drift wins by default.
         assert_eq!(eu.dominant_source(), "Drift");
     }
 
     #[test]
     fn test_dominant_source_calibration() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.0, 0.0, 0.0, 0.0, 1.0);
+        eu.update(0.0, 0.0, 0.0, 0.0, 1.0, 0.0);
         assert_eq!(eu.dominant_source(), "Calibration");
+    }
+
+    #[test]
+    fn test_dominant_source_guard() {
+        // Guard-overprotection alone with everything else 0 → Guard wins.
+        let mut eu = EpistemicUncertainty::new();
+        eu.update(0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+        assert_eq!(eu.dominant_source(), "Guard-Overprotect");
+    }
+
+    #[test]
+    fn test_guard_inflates_composite() {
+        // The Three-Pillar gap NotebookLM caught 2026-05-10: an 8-layer guard
+        // tower could over-protect for hours with epistemic still reading LOW.
+        // With guard_overprotection as a 6th component (W_GUARD=0.20), a high
+        // empirical over-protection signal must drag composite up.
+        let mut eu = EpistemicUncertainty::new();
+        eu.update(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let baseline = eu.composite;
+        eu.update(0.0, 0.0, 0.0, 0.0, 0.0, 0.80);
+        assert!(
+            eu.composite > baseline + 0.10,
+            "guard=0.80 should add ≥0.10 to composite (W_GUARD=0.20), got {} → {}",
+            baseline,
+            eu.composite
+        );
     }
 
     #[test]
@@ -288,12 +346,12 @@ mod tests {
         // humble_mode was true. With calibration as a 5th component,
         // a high calibration error must drag composite up.
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.0, 0.0, 0.0, 0.0, 0.0);
+        eu.update(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let baseline = eu.composite;
-        eu.update(0.0, 0.0, 0.0, 0.0, 0.80);
+        eu.update(0.0, 0.0, 0.0, 0.0, 0.80, 0.0);
         assert!(
-            eu.composite > baseline + 0.15,
-            "calibration=0.80 should add ≥0.15 to composite (W_CALIB=0.25), got {} → {}",
+            eu.composite > baseline + 0.10,
+            "calibration=0.80 should add ≥0.10 to composite (W_CALIB=0.20), got {} → {}",
             baseline,
             eu.composite
         );
@@ -302,7 +360,7 @@ mod tests {
     #[test]
     fn test_breakdown_sums_to_composite() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.6, 0.4, 0.3, 0.2, 0.5);
+        eu.update(0.6, 0.4, 0.3, 0.2, 0.5, 0.7);
         let bd = eu.breakdown();
         let sum: f32 = bd.iter().map(|(_, _, w)| w).sum();
         assert!(
@@ -314,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_weights_sum_to_one() {
-        let sum = W_RL + W_LINUCB + W_NARS + W_DRIFT + W_CALIB;
+        let sum = W_RL + W_LINUCB + W_NARS + W_DRIFT + W_CALIB + W_GUARD;
         assert!(
             (sum - 1.0).abs() < 0.001,
             "Weights should sum to 1.0: {sum}"
@@ -324,7 +382,7 @@ mod tests {
     #[test]
     fn test_serde_roundtrip() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.5, 0.3, 0.7, 0.1, 0.4);
+        eu.update(0.5, 0.3, 0.7, 0.1, 0.4, 0.6);
 
         let json = serde_json::to_string(&eu).expect("serialize");
         let restored: EpistemicUncertainty = serde_json::from_str(&json).expect("deserialize");
@@ -336,12 +394,12 @@ mod tests {
     #[test]
     fn test_mode_transitions_hysteresis() {
         let mut eu = EpistemicUncertainty::new();
-        // Enter high mode
-        eu.update(0.9, 0.9, 0.8, 0.5, 0.5);
+        // Enter high mode (also crank guard so 6-component composite reaches HIGH)
+        eu.update(0.9, 0.9, 0.8, 0.5, 0.5, 0.9);
         assert!(eu.high_uncertainty_mode);
 
         // Drop below → should exit
-        eu.update(0.2, 0.2, 0.1, 0.1, 0.1);
+        eu.update(0.2, 0.2, 0.1, 0.1, 0.1, 0.1);
         assert!(!eu.high_uncertainty_mode);
     }
 }

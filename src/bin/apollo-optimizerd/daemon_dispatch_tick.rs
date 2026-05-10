@@ -596,6 +596,7 @@ mod tests {
             collector: &collector,
             dry_run: true,
             lf_metrics: None,
+            coalition_guard: None,
         };
 
         let output = run_dispatch_tick(input);

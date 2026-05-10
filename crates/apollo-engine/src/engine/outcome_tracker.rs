@@ -714,6 +714,34 @@ impl OutcomeTracker {
         self.pending_blocked.len()
     }
 
+    /// Aggregate over-protection signal across all blocked-action patterns
+    /// with enough observations to be trusted (≥10 blocks). Returns a value
+    /// in [0,1] suitable for `EpistemicUncertainty.guard_overprotection`:
+    /// 0.0 = no signal or all patterns at neutral 0.5 effectiveness;
+    /// 1.0 = every mature pattern says blocks "would have helped" 100% of
+    /// the time → guard tower is over-protecting and the system should
+    /// raise epistemic uncertainty.
+    ///
+    /// Maps each mature pattern's effectiveness `e` ∈ [0,1] to
+    /// `max(0, e - 0.5) * 2`, then averages across mature patterns. Patterns
+    /// below the maturity floor are ignored to suppress cold-start noise.
+    pub fn mean_blocked_overprotection(&self) -> f32 {
+        const MATURE_BLOCKED_FLOOR: u32 = 10;
+        let mature: Vec<&BlockedPattern> = self
+            .blocked_patterns
+            .values()
+            .filter(|p| p.blocked_count >= MATURE_BLOCKED_FLOOR)
+            .collect();
+        if mature.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = mature
+            .iter()
+            .map(|p| ((p.effectiveness() - 0.5) * 2.0).max(0.0))
+            .sum();
+        ((sum / mature.len() as f64).clamp(0.0, 1.0)) as f32
+    }
+
     /// Resuelve los outcomes pendientes con más de 30s de antigüedad.
     /// Retorna un batch con los resultados para que el llamador actualice
     /// el EnergyTracker y la LearnedPolicy.

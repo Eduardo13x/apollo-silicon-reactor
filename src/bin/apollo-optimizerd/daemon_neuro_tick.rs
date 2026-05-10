@@ -236,6 +236,7 @@ pub fn run_neurocognitive_tick(
         rl_q_delta: 0.0,
         linucb_arm_idx: 0,
         linucb_delta: 0.0,
+        guard_overprotection: lctx.outcome_tracker.mean_blocked_overprotection(),
     };
     let drift: &mut DriftDetector = &mut lctx.outcome_tracker.drift_detector;
     cognitive_tick::run_cognitive_tick(cognitive_state, &cog_inputs, Some(drift))
