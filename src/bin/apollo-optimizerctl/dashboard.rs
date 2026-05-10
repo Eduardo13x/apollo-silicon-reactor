@@ -1234,9 +1234,13 @@ fn render_sense_q(status: &DaemonStatus) -> Vec<String> {
     };
     lines.push(format!(
         "Swap   {} {:>3.0}% {}",
-        render_bar(swap_ratio, 12),
+        render_bar(swap_ratio, 8),
         swap_ratio * 100.0,
         swap_emoji
+    ));
+    lines.push(format!(
+        "       {:.1}/{:.1}GB",
+        swap_gb, swap_total_gb
     ));
 
     lines.push(format!(
