@@ -111,6 +111,20 @@ impl MetricsState {
     }
 }
 
+impl Default for MetricsState {
+    fn default() -> Self {
+        Self {
+            metrics: RuntimeMetrics::default(),
+            throttle_level: String::new(),
+            thermal_state: String::new(),
+            thermal_level_real: String::new(),
+            fast_tick_until: None,
+            reactor_event_weight: 0.0,
+            reactor_status: ReactorStatus::default(),
+        }
+    }
+}
+
 /// Reactor thread counters and status.
 ///
 /// Cross-crate visibility: constructed in apollo-optimizerd main.rs and daemon_memory_budget.rs
