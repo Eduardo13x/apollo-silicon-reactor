@@ -7,3 +7,7 @@ src/graphify-out/
 
 # CoreMark — external git repo, install via setup_apple_benchmark.sh
 benchmarks/coremark/
+
+# Autoresearch session-local artifacts (logs, one-shot mockups)
+autoresearch/**/*.log
+autoresearch/**/*-mockup.md
