@@ -154,6 +154,22 @@ pub fn run_cognitive_tick(
             cycle,
         });
     }
+    // Guard-tower over-protection penalty — closes the bus blind spot
+    // NotebookLM round-2 flagged 2026-05-10. record_blocked already updates
+    // local OutcomeTracker weights, but RL Q-values + LinUCB arms learning
+    // FROM the bus would otherwise stay on a survival-biased dataset.
+    // Emit a NEGATIVE signal proportional to the over-protection magnitude
+    // so RL learns: "high blocked-effectiveness = our policy is wrong".
+    // Floor 0.20 suppresses cold-start noise (signal < 0.20 means <2 mature
+    // patterns or near-neutral Bayesian priors).
+    if inputs.guard_overprotection > 0.20 {
+        cog.reward_bus.publish(RewardSignal {
+            source: RewardSource::Outcome,
+            value: -(inputs.guard_overprotection as f64),
+            confidence: inputs.guard_overprotection.min(1.0),
+            cycle,
+        });
+    }
     cog.reward_bus.flush_cycle();
 
     // ── 2. MetaCognition: observe subsystem accuracy ──────────────────────

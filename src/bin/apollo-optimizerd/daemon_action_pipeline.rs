@@ -140,8 +140,18 @@ pub fn run_filter_pipeline(
     // ODE arbiter: when the physical swap model signals Critical or Overflow,
     // epistemic uncertainty may not suppress all actions — the ODE provides
     // physical certainty that overrides behavioral uncertainty.
+    //
+    // Inaction Death Spiral defense (NotebookLM round-2 finding 2026-05-10):
+    // After commit 5e39c97 added W_GUARD=0.20 to the composite, the
+    // guard tower's own over-protection signal can drive composite past
+    // observe_only (0.85) even when SwapRisk is still Safe — the ODE
+    // hasn't yet caught up to slow-growing raw pressure. Add raw pressure
+    // ≥0.80 as a second physical override so a high-pressure / low-velocity
+    // scenario can't lock the system into pure-observation mode.
     // [Garcia & Fernandez 2015] safe RL — constraint violations bypass uncertainty gates.
-    let ode_physical_critical = matches!(swap_risk, SwapRisk::Critical | SwapRisk::Overflow);
+    let raw_pressure_critical = snapshot.pressure.memory_pressure >= 0.80;
+    let ode_physical_critical = matches!(swap_risk, SwapRisk::Critical | SwapRisk::Overflow)
+        || raw_pressure_critical;
     let op_mode =
         if prev_cog_decision.map_or(false, |d| d.observe_only) && op_mode == OperationMode::Full {
             if ode_physical_critical {

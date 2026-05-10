@@ -4311,9 +4311,20 @@ fn main() -> anyhow::Result<()> {
                     use apollo_engine::engine::types::RootAction;
                     let pressure = snapshot.pressure.memory_pressure;
                     for trace in &exec_outcomes.audit_traces {
-                        if trace.block_reason != Some(BlockReason::ActiveCoalition) {
-                            continue;
-                        }
+                        // Only count blocks that may indicate over-protection.
+                        // Hard invariants (ProtectedProcess, MlProtected,
+                        // PidRecycled, ApplePlatform, Zombie) are by design
+                        // permanent — recording them adds noise. The two
+                        // *policy* gates (ActiveCoalition, AssertionActive)
+                        // can over-protect: ActiveCoalition is brand-new and
+                        // AssertionActive blocks freezes when a per-PID power
+                        // assertion is held, which on M1 8GB has historically
+                        // caused stuck-pressure (commit e9a5603).
+                        let gate = match trace.block_reason {
+                            Some(BlockReason::ActiveCoalition) => "active-coalition",
+                            Some(BlockReason::AssertionActive) => "assertion-active",
+                            _ => continue,
+                        };
                         let class = match &trace.intended_action {
                             RootAction::ThrottleProcess { .. } => "throttle",
                             RootAction::FreezeProcess { .. } => "freeze",
@@ -4324,8 +4335,7 @@ fn main() -> anyhow::Result<()> {
                         // Use the lctx-held mutable borrow; the LearningContext
                         // owns &mut outcome_tracker for the rest of the cycle
                         // (see line ~1800 where lctx is constructed).
-                        lctx.outcome_tracker
-                            .record_blocked(class, "active-coalition", pressure);
+                        lctx.outcome_tracker.record_blocked(class, gate, pressure);
                     }
                 }
 
