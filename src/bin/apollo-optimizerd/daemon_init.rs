@@ -90,6 +90,9 @@ pub(super) struct DaemonSubsystems {
     /// Memoizes proc_pidpath/csops syscalls per (pid, start_sec, start_usec)
     /// behind a single owner that concentrates verify/notify_exited/cleanup.
     pub identity_cache: apollo_engine::engine::identity_cache_manager::IdentityCacheManager,
+    /// Maintenance Purge Gate state (2026-05-10) — opportunistic non-crisis
+    /// purge orchestration with asymmetric cooldown vs survival_tick.
+    pub maintenance_state: apollo_engine::engine::maintenance_state::MaintenanceState,
 }
 
 /// Detect hardware capabilities (core count and RAM) once at startup.
@@ -165,6 +168,7 @@ impl DaemonSubsystems {
             recently_applied: recently_applied_cache,
             recently_applied_restore_status: restore_status,
             identity_cache: apollo_engine::engine::identity_cache_manager::IdentityCacheManager::new(),
+            maintenance_state: apollo_engine::engine::maintenance_state::MaintenanceState::new(),
         }
     }
 }

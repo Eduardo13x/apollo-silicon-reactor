@@ -684,6 +684,7 @@ fn main() -> anyhow::Result<()> {
                 mut recently_applied,
                 recently_applied_restore_status,
                 identity_cache,
+                mut maintenance_state,
             } = daemon_init::DaemonSubsystems::new();
             {
                 let mut m_guard = state.metrics.lock().unwrap();
