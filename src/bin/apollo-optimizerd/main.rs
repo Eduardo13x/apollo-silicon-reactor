@@ -2921,6 +2921,7 @@ fn main() -> anyhow::Result<()> {
                 // Holt-Winters seasonal forecasting: accumulate samples, observe hourly,
                 // tighten overflow_thresholds proactively.
                 // Extracted to daemon_holt_winters_tick::run_holt_winters_tick (Wave 30).
+                let _t_hw_start = Instant::now();
                 daemon_holt_winters_tick::run_holt_winters_tick(
                     snapshot.pressure.memory_pressure,
                     hour_of_day,
@@ -2930,6 +2931,10 @@ fn main() -> anyhow::Result<()> {
                     &mut hw_last_hour,
                     &state,
                     &mut overflow_thresholds,
+                );
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::ReasonHoltWinters,
+                    _t_hw_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
 
                 // HW seasonal anomaly: ratio of actual pressure to seasonal expectation.
@@ -2984,6 +2989,7 @@ fn main() -> anyhow::Result<()> {
                 // but before the kernel is forced to evict reactively (which causes stalls).
                 // Jiang & Zhang 2005 — proactive beats reactive by 20-40%.
                 // Runs every 10 cycles (~5s) to avoid vm_stat overhead every cycle.
+                let _t_pr_start = Instant::now();
                 if cycle_count % 10 == 0 {
                     // snapshot.pressure.memory_pressure already includes battery
                     // + thermal boosts via effective_pressure::compute(). Don't add again.
@@ -2996,6 +3002,10 @@ fn main() -> anyhow::Result<()> {
                         state.metrics.lock_recover().metrics.paging_hints_applied += 1;
                     }
                 }
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::ReasonPageReclaim,
+                    _t_pr_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
 
                 // Habituation per-process state tracking — extracted to
                 // `daemon_cognitive_tick::update_habituation_state`.

@@ -1468,6 +1468,14 @@ pub struct RuntimeMetrics {
     pub stage_reason_usercontext_avg_ms: f64,
     #[serde(default)]
     pub stage_reason_usercontext_max_ms: f64,
+    #[serde(default)]
+    pub stage_reason_holtwinters_avg_ms: f64,
+    #[serde(default)]
+    pub stage_reason_holtwinters_max_ms: f64,
+    #[serde(default)]
+    pub stage_reason_pagereclaim_avg_ms: f64,
+    #[serde(default)]
+    pub stage_reason_pagereclaim_max_ms: f64,
     /// MetaCognition meta_confidence [0,1].
     #[serde(default)]
     pub meta_confidence: f32,

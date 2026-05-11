@@ -31,6 +31,8 @@ pub enum CycleStage {
     ReasonDecide,
     ReasonNeuro,
     ReasonUserContext,
+    ReasonHoltWinters,
+    ReasonPageReclaim,
 }
 
 // ── Lock-free metrics ────────────────────────────────────────────────────────
@@ -189,6 +191,10 @@ pub struct LockFreeMetrics {
     pub stage_reason_neuro_max_ns: AtomicU64,
     pub stage_reason_usercontext_total_ns: AtomicU64,
     pub stage_reason_usercontext_max_ns: AtomicU64,
+    pub stage_reason_holtwinters_total_ns: AtomicU64,
+    pub stage_reason_holtwinters_max_ns: AtomicU64,
+    pub stage_reason_pagereclaim_total_ns: AtomicU64,
+    pub stage_reason_pagereclaim_max_ns: AtomicU64,
 }
 
 impl LockFreeMetrics {
@@ -273,6 +279,10 @@ impl LockFreeMetrics {
             stage_reason_neuro_max_ns: AtomicU64::new(0),
             stage_reason_usercontext_total_ns: AtomicU64::new(0),
             stage_reason_usercontext_max_ns: AtomicU64::new(0),
+            stage_reason_holtwinters_total_ns: AtomicU64::new(0),
+            stage_reason_holtwinters_max_ns: AtomicU64::new(0),
+            stage_reason_pagereclaim_total_ns: AtomicU64::new(0),
+            stage_reason_pagereclaim_max_ns: AtomicU64::new(0),
         }
     }
 
@@ -300,6 +310,14 @@ impl LockFreeMetrics {
             CycleStage::ReasonUserContext => (
                 &self.stage_reason_usercontext_total_ns,
                 &self.stage_reason_usercontext_max_ns,
+            ),
+            CycleStage::ReasonHoltWinters => (
+                &self.stage_reason_holtwinters_total_ns,
+                &self.stage_reason_holtwinters_max_ns,
+            ),
+            CycleStage::ReasonPageReclaim => (
+                &self.stage_reason_pagereclaim_total_ns,
+                &self.stage_reason_pagereclaim_max_ns,
             ),
         };
         total.fetch_add(ns, Ordering::Relaxed);
