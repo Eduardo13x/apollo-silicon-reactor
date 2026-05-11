@@ -468,6 +468,28 @@ pub fn infrastructure_processes() -> HashSet<&'static str> {
         "com.docker",
         "vpnkit",
         "hyperkit",
+        // macOS Virtualization.framework helpers used by modern container
+        // tooling. Same blast radius as qemu-system: freezing them mid-write
+        // can corrupt the guest filesystem / journal. Added 2026-05-10 after
+        // a Podman VM journal-corruption incident — Apollo journal showed no
+        // direct hits, but `vfkit` was eligible for SIGSTOP because the
+        // pre-2024 name list ("podman", "qemu-system", "lima") missed the
+        // basename returned by sysinfo. NotebookLM peer review expanded the
+        // missing-helper set; all named here.
+        "vfkit",         // Virtualization.framework wrapper (Podman 5.x default)
+        "gvproxy",       // gvisor-tap-vsock networking helper (Podman/Lima)
+        "krunkit",       // libkrun-based microVM (alt Podman backend)
+        "vmapple",       // Tart VM helper (Virtualization.framework child)
+        "vmnetd",        // macOS vmnet daemon (bridge networking for Lima/Podman)
+        "slirp4netns",   // user-mode networking for rootless Podman
+        "containerd-shim", // Docker / containerd process shim — frozen = stuck container
+        "runc",          // OCI runtime — frozen mid-spawn = orphaned container
+        "orbstack",      // OrbStack main process
+        "orbstack-helper",
+        "orbstack-node", // OrbStack VM node
+        "lima-guestagent", // Lima guest agent helper
+        "dockerd",       // Docker daemon (not just "com.docker.backend")
+        "containerd",    // Standalone containerd
         // Databases / caches — freezing causes data corruption or client timeouts
         "postgres",
         "mysqld",
