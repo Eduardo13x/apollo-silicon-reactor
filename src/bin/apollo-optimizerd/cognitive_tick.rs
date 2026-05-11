@@ -85,6 +85,19 @@ pub struct CognitiveTickInputs {
     /// (Bayesian-Laplace aggregate over mature blocked patterns, [0,1]).
     /// Feeds Epistemic composite W_GUARD=0.20.
     pub guard_overprotection: f32,
+    /// MetaCognition CausalGraph calibration (2026-05-11 fix):
+    /// `predicted` = top causal edge's `avg_delta` normalized via
+    /// `clamp(|δ|, 0, 0.10) / 0.10` so 10% pressure drop = full signal.
+    /// `actual`    = `OutcomeTracker.causal_effect(observed_drop)` (Rubin
+    /// 1974 counterfactual: observed_drop − natural_drift_ema), normalized
+    /// the same way. `ready` is the warmup gate (skip observe() until
+    /// OutcomeTracker has accumulated ≥10 resolved outcomes — `0.5` from
+    /// `overall_effectiveness()` is the placeholder before that).
+    /// Replaces the toy `if pressure < 0.5 { 0.8 } else { 0.3 }` constant
+    /// that produced the "Hallucinated Calibration" pattern.
+    pub causal_predicted_delta_norm: f32,
+    pub causal_actual_delta_norm: f32,
+    pub causal_observation_ready: bool,
 }
 
 impl Default for CognitiveTickInputs {
@@ -107,6 +120,9 @@ impl Default for CognitiveTickInputs {
             linucb_arm_idx: 0,
             linucb_delta: 0.0,
             guard_overprotection: 0.0,
+            causal_predicted_delta_norm: 0.0,
+            causal_actual_delta_norm: 0.0,
+            causal_observation_ready: false,
         }
     }
 }
@@ -179,13 +195,21 @@ pub fn run_cognitive_tick(
         inputs.predicted_score,
         inputs.outcome_effectiveness as f32,
     );
-    // CausalGraph: confidence vs. actual pressure improvement
-    if inputs.causal_confidence > 0.0 {
-        let actual_improvement = if inputs.pressure < 0.5 { 0.8 } else { 0.3 };
+    // CausalGraph: predicted Δpressure (top edge avg_delta) vs. actual
+    // post-action Δpressure measured by OutcomeTracker.causal_effect()
+    // (Rubin 1974 counterfactual). Both already normalized via
+    // clamp(|δ|, 0, 0.10) / 0.10 in daemon_neuro_tick.rs. Gated on the
+    // warmup readiness flag — skip observation entirely until
+    // OutcomeTracker has enough resolved outcomes (≥10) for the
+    // counterfactual baseline to be meaningful. Previously this call
+    // passed a hardcoded `if pressure < 0.5 { 0.8 } else { 0.3 }` as
+    // `actual`, producing a "Hallucinated Calibration" gap of 0.53 that
+    // permanently flipped humble_mode. See `feedback_observability_…` memory.
+    if inputs.causal_observation_ready {
         cog.meta_cognition.observe(
             SubsystemId::CausalGraph,
-            inputs.causal_confidence,
-            actual_improvement,
+            inputs.causal_predicted_delta_norm,
+            inputs.causal_actual_delta_norm,
         );
     }
     cog.meta_cognition.tick();

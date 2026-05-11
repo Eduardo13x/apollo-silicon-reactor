@@ -209,6 +209,30 @@ pub fn run_neurocognitive_tick(
         .first()
         .map(|e| e.confidence)
         .unwrap_or(0.0);
+    // MetaCognition CausalGraph calibration (2026-05-11 fix):
+    // Map `top_edge.avg_delta` (predicted Δpressure) and
+    // `OutcomeTracker.causal_effect(velocity_short)` (Rubin counterfactual
+    // residual: short-window observed_drop minus natural_drift_ema) onto
+    // the [0,1] interval that MetaCognition.observe() expects.
+    // Normalizer: clamp(|δ|, 0, 0.10) / 0.10 — a 10% pressure drop is the
+    // empirical ceiling for "fully effective" on M1 8GB (cf. nested-learner
+    // recalibration 2026-04-10, commit 8383eda).
+    // Warmup gate: skip observation until OutcomeTracker has accumulated
+    // enough resolved outcomes that natural_drift_ema is meaningful.
+    // Without the gate, the first ~30 cycles would feed noise into the
+    // calibration EMA and reproduce the previous lock-up.
+    let causal_predicted_delta_norm = lctx
+        .causal_graph
+        .solid_edges_by_impact()
+        .first()
+        .map(|e| (e.avg_delta.abs() / 0.10).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    let observed_drop = lctx.outcome_tracker.pressure_velocity_short();
+    let actual_residual = lctx.outcome_tracker.causal_effect(observed_drop);
+    let causal_actual_delta_norm =
+        ((actual_residual.abs() / 0.10).clamp(0.0, 1.0)) as f32;
+    let causal_observation_ready = lctx.outcome_tracker.total_resolved >= 10
+        && causal_predicted_delta_norm > 0.0;
     let cog_inputs = CognitiveTickInputs {
         cycle: cycle_count,
         pressure: signal_digest.pressure_smooth,
@@ -237,6 +261,9 @@ pub fn run_neurocognitive_tick(
         linucb_arm_idx: 0,
         linucb_delta: 0.0,
         guard_overprotection: lctx.outcome_tracker.mean_blocked_overprotection(),
+        causal_predicted_delta_norm,
+        causal_actual_delta_norm,
+        causal_observation_ready,
     };
     let drift: &mut DriftDetector = &mut lctx.outcome_tracker.drift_detector;
     cognitive_tick::run_cognitive_tick(cognitive_state, &cog_inputs, Some(drift))
