@@ -33,6 +33,8 @@ pub enum CycleStage {
     ReasonUserContext,
     ReasonHoltWinters,
     ReasonPageReclaim,
+    ReasonChromium,
+    ReasonEnrich,
 }
 
 // ── Lock-free metrics ────────────────────────────────────────────────────────
@@ -195,6 +197,10 @@ pub struct LockFreeMetrics {
     pub stage_reason_holtwinters_max_ns: AtomicU64,
     pub stage_reason_pagereclaim_total_ns: AtomicU64,
     pub stage_reason_pagereclaim_max_ns: AtomicU64,
+    pub stage_reason_chromium_total_ns: AtomicU64,
+    pub stage_reason_chromium_max_ns: AtomicU64,
+    pub stage_reason_enrich_total_ns: AtomicU64,
+    pub stage_reason_enrich_max_ns: AtomicU64,
 }
 
 impl LockFreeMetrics {
@@ -283,6 +289,10 @@ impl LockFreeMetrics {
             stage_reason_holtwinters_max_ns: AtomicU64::new(0),
             stage_reason_pagereclaim_total_ns: AtomicU64::new(0),
             stage_reason_pagereclaim_max_ns: AtomicU64::new(0),
+            stage_reason_chromium_total_ns: AtomicU64::new(0),
+            stage_reason_chromium_max_ns: AtomicU64::new(0),
+            stage_reason_enrich_total_ns: AtomicU64::new(0),
+            stage_reason_enrich_max_ns: AtomicU64::new(0),
         }
     }
 
@@ -318,6 +328,14 @@ impl LockFreeMetrics {
             CycleStage::ReasonPageReclaim => (
                 &self.stage_reason_pagereclaim_total_ns,
                 &self.stage_reason_pagereclaim_max_ns,
+            ),
+            CycleStage::ReasonChromium => (
+                &self.stage_reason_chromium_total_ns,
+                &self.stage_reason_chromium_max_ns,
+            ),
+            CycleStage::ReasonEnrich => (
+                &self.stage_reason_enrich_total_ns,
+                &self.stage_reason_enrich_max_ns,
             ),
         };
         total.fetch_add(ns, Ordering::Relaxed);

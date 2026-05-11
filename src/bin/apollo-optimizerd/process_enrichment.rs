@@ -172,11 +172,22 @@ pub fn build_enriched_process_data_with_tree(
         // Only enrich non-foreground in the loop below
         let _ = pid;
     }
-    // Build rusage map for all PIDs — O(n) syscalls, ~3µs each
+    // Build rusage map for all PIDs — O(n) syscalls, ~3µs each.
+    // Phase 0d performance gate (2026-05-10): skip proc_taskinfo syscalls
+    // for PIDs we'll never act on (RSS < ENRICH_MIN_RSS_BYTES). On a
+    // typical Mac with 400 PIDs, ~250 are <2 MB tiny daemons we never
+    // throttle/freeze. Skipping their 2× syscalls cuts ~500 syscalls per
+    // cycle, ≈ 1.5 ms saved. Foreground family bypasses the gate so we
+    // never miss their state. [Hellerstein 2004 §9 sampling under load]
+    const ENRICH_MIN_RSS_BYTES: u64 = 2 * 1024 * 1024;
     let mut live_pids: HashSet<u32> = HashSet::new();
-    for (pid, _process) in sys.processes() {
+    for (pid, process) in sys.processes() {
         let pid_u32 = pid.as_u32();
         live_pids.insert(pid_u32);
+        // Gate: enrich only PIDs with meaningful RSS or in the fg family.
+        if process.memory() < ENRICH_MIN_RSS_BYTES && !fg_family.contains(&pid_u32) {
+            continue;
+        }
         if let Some(ri) = proc_taskinfo::get_rusage_info(pid_u32) {
             let idle_wk = ri.idle_wakeups;
             // Observe into the global contention tracker. This returns the

@@ -279,6 +279,22 @@ pub fn wire_enriched_telemetry(
         lf.stage_reason_pagereclaim_max_ns
             .load(std::sync::atomic::Ordering::Relaxed),
     );
+    m.metrics.stage_reason_chromium_avg_ms = to_avg_ms(
+        lf.stage_reason_chromium_total_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_reason_chromium_max_ms = ns_to_ms(
+        lf.stage_reason_chromium_max_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_reason_enrich_avg_ms = to_avg_ms(
+        lf.stage_reason_enrich_total_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_reason_enrich_max_ms = ns_to_ms(
+        lf.stage_reason_enrich_max_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
     m.metrics.meta_confidence = inputs.cognitive_state.meta_cognition.meta_confidence;
     m.metrics.humble_mode = inputs.cog_decision.humble_mode;
     m.metrics.adversarial_pass_rate =

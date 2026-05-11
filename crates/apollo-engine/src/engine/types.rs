@@ -1476,6 +1476,14 @@ pub struct RuntimeMetrics {
     pub stage_reason_pagereclaim_avg_ms: f64,
     #[serde(default)]
     pub stage_reason_pagereclaim_max_ms: f64,
+    #[serde(default)]
+    pub stage_reason_chromium_avg_ms: f64,
+    #[serde(default)]
+    pub stage_reason_chromium_max_ms: f64,
+    #[serde(default)]
+    pub stage_reason_enrich_avg_ms: f64,
+    #[serde(default)]
+    pub stage_reason_enrich_max_ms: f64,
     /// MetaCognition meta_confidence [0,1].
     #[serde(default)]
     pub meta_confidence: f32,

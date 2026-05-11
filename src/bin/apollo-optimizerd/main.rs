@@ -1705,6 +1705,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Process tree: build from the full process table for child grouping.
                 // Extracted to daemon_process_collector::build_process_tree().
+                let _t_enrich_start = Instant::now();
                 let process_tree = daemon_process_collector::build_process_tree(&collector);
 
                 // Build enriched process data using foreground detector + process tree.
@@ -1717,6 +1718,10 @@ fn main() -> anyhow::Result<()> {
                         foreground_pid,
                         &process_tree,
                     );
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::ReasonEnrich,
+                    _t_enrich_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
                 let all_proc_names: Vec<&str> =
                     proc_snaps.iter().map(|p| p.name.as_str()).collect();
                 let hour_of_day = Utc::now().hour() as u8;
@@ -3772,6 +3777,7 @@ fn main() -> anyhow::Result<()> {
                 // ── Chromium Renderer Manager ────────────────────────────────────
                 // Extracted to daemon_chromium_tick::run_chromium_tick (Wave 11).
                 // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
+                let _t_chrom_start = Instant::now();
                 daemon_chromium_tick::run_chromium_tick(
                     &mut chromium_mgr,
                     &focus_markov,
@@ -3786,6 +3792,10 @@ fn main() -> anyhow::Result<()> {
                     snapshot.pressure.memory_pressure,
                     cycle_count as u64,
                     signal_digest.swap_velocity_smooth as f32,
+                );
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
+                    _t_chrom_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
 
                 // F1: Causal attribution for velocity-anticipatory purges
