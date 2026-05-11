@@ -65,18 +65,27 @@ pub fn run_chromium_tick(
     memory_pressure_at_freeze: f64,
     cycle_count: u64,
     swap_velocity_bps: f32,
+    thrashing_score: f64,
 ) {
     // Step 2 (2026-05-11): conditional SIGSTOP enablement on crisis only.
     // Historical context (commit 712b927, Apr 21): SIGSTOP on chromium renderers
     // caused Brave IPC timeouts / beachballs. Kept globally disabled.
     // Step 2 reframes as "emergency-only": SIGSTOP fires only when memory is
-    // genuinely tight (pressure ≥ 0.75 OR compressor ≥ 0.45 OR swap ≥ 1500 MB
-    // raw memory_pressure). All other safety gates (visibility, MAX_FREEZE_RATIO,
-    // assertion check, inet sockets, NEW_RENDERER_GRACE) remain active.
-    // The pressure-floor (Step 1) DemoteToEcores + PurgePurgeable continue to
-    // run unconditionally at pressure ≥ 0.55, providing the soft escalation.
-    let chromium_freeze_disabled =
-        pressure_smooth < 0.75 && memory_pressure_at_freeze < 0.75;
+    // genuinely tight (pressure ≥ 0.75 OR thrashing ≥ 10k). All other safety
+    // gates (visibility, MAX_FREEZE_RATIO, assertion check, inet sockets,
+    // NEW_RENDERER_GRACE) remain active. The pressure-floor (Step 1)
+    // DemoteToEcores + PurgePurgeable continue to run unconditionally at
+    // pressure ≥ 0.55, providing the soft escalation.
+    //
+    // Thrashing escalation (2026-05-11 evening): user reported swap saturation
+    // at pressure ≈ 0.62 (below the 0.75 gate) — Apollo paralyzed while system
+    // crawled. Compressor 0.77, thrashing 94k (9× crisis threshold), swap 88%.
+    // Pressure-smooth alone misses sticky-swap states where the kernel has
+    // already swapped out hot pages and pressure relaxes. Thrashing >10k is an
+    // independent flow-crisis signal that justifies SIGSTOP on its own.
+    let chromium_freeze_disabled = pressure_smooth < 0.75
+        && memory_pressure_at_freeze < 0.75
+        && thrashing_score < 10_000.0;
 
     // Context setters prime thresholds used by update()'s freeze logic.
     // Run unconditionally so state is warm when CHROMIUM_FREEZE_DISABLED is set to false.

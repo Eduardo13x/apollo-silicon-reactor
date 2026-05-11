@@ -3792,6 +3792,7 @@ fn main() -> anyhow::Result<()> {
                     snapshot.pressure.memory_pressure,
                     cycle_count as u64,
                     signal_digest.swap_velocity_smooth as f32,
+                    snapshot.pressure.thrashing_score,
                 );
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
