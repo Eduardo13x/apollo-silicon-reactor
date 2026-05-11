@@ -617,10 +617,20 @@ pub fn battery_pressure_boost(power_mgr: &PowerManager) -> f64 {
     if !power_mgr.is_on_battery() {
         return 0.0;
     }
+    // 2026-05-11: halved from 0.04/0.10/0.18 → 0.02/0.05/0.10 after NotebookLM
+    // peer review flagged the Critical (+0.18) boost as too volatile on M1 8GB
+    // — it pushed effective_pressure ≥ 0.75 (Step 2 SIGSTOP gate) at raw
+    // memory_pressure as low as 0.57, increasing the risk of Brave IPC
+    // timeouts (the regression that motivated commit 712b927).
+    // The reduced curve keeps Step 1 (E-core demote + PurgePurgeable) as the
+    // primary mobility actuator and reserves Step 2 SIGSTOP for genuine
+    // physical-memory crises rather than software-induced ones.
+    // [Hellerstein 2004] control targets reflect operating regime
+    // [Camacho 2007] predictive control grounded in platform physical limits.
     match power_mgr.battery_mode_current() {
-        BatteryMode::Normal => 0.04,
-        BatteryMode::LowPower => 0.10,
-        BatteryMode::Critical => 0.18,
+        BatteryMode::Normal => 0.02,
+        BatteryMode::LowPower => 0.05,
+        BatteryMode::Critical => 0.10,
     }
 }
 
