@@ -280,6 +280,13 @@ pub struct ChromiumManager {
     current_pressure: f32,
     /// Whether to pause freeze decisions (fluidity: launch/window-op active).
     freeze_paused: bool,
+    /// External hard-disable for SIGSTOP path. Set by daemon based on
+    /// pressure/swap/compressor thresholds (Step 2, 2026-05-11). When true,
+    /// the freeze pass is skipped entirely so `info.frozen` is never marked.
+    /// Prevents the "phantom frozen" metric anomaly where chromium_manager
+    /// emits FreezeRenderer at moderate pressure but daemon gate blocks
+    /// execution — without this, metrics lie about freed_mb.
+    freeze_globally_disabled: bool,
     /// Workload preemption: when true (BuildSession detected), the freeze gate
     /// uses `idle_cycles_required = 1` regardless of pressure/arousal, so
     /// background renderers get frozen PROACTIVELY before rustc spikes memory.
@@ -363,6 +370,7 @@ impl ChromiumManager {
             idle_cycles_required: IDLE_CYCLES_DEFAULT,
             current_pressure: 0.0,
             freeze_paused: false,
+            freeze_globally_disabled: true,
             total_freed_mb: 0.0,
             ecore_demotions: 0,
             freezes_applied: 0,
@@ -509,6 +517,15 @@ impl ChromiumManager {
     /// E-core demotions continue regardless (they are safe at any time).
     pub fn set_fluidity_context(&mut self, window_op_active: bool, app_launching: bool) {
         self.freeze_paused = window_op_active || app_launching;
+    }
+
+    /// Step 2 hard-disable for SIGSTOP path. Daemon calls this each cycle
+    /// with the result of its pressure/swap/compressor gate. When `true`,
+    /// the second-pass freeze candidate loop is skipped entirely so neither
+    /// `FreezeRenderer` actions nor `info.frozen` are produced. E-core
+    /// demotion and PurgePurgeable (first pass) continue unaffected.
+    pub fn set_freeze_globally_disabled(&mut self, disabled: bool) {
+        self.freeze_globally_disabled = disabled;
     }
 
     /// Set FocusMarkov top-N predictions for predictive pre-thaw.
@@ -916,12 +933,23 @@ impl ChromiumManager {
             // proactively under modest swap growth.
             let velocity_escalate =
                 self.current_swap_velocity_bps > 1_048_576.0 && self.current_pressure >= 0.50;
-            let demote_eligible = if velocity_escalate {
+            // Sustained-pressure escalation: M1 8GB can sit at high pressure
+            // with near-zero swap velocity (steady-state thrash). Velocity is
+            // accelerator, not gate. [user feedback 2026-05-11]
+            let pressure_escalate = self.current_pressure >= 0.55;
+            let demote_eligible = if velocity_escalate || pressure_escalate {
                 !self.visible_pids.contains(pid)
             } else {
                 !is_fg_browser
             };
             if demote_eligible && !info.frozen && !self.ecore_demoted.contains(pid) {
+                tracing::debug!(
+                    pid = *pid,
+                    name = info.name.as_str(),
+                    pressure = self.current_pressure,
+                    pressure_escalate = pressure_escalate,
+                    "chromium: DemoteToEcores"
+                );
                 actions.push(ChromiumAction::DemoteToEcores {
                     pid: *pid,
                     name: info.name.clone(),
@@ -940,8 +968,12 @@ impl ChromiumManager {
             // bandwidth physics — anything above 5 MB/s is already a
             // jetsam-storm precursor on this hardware.
             let mem_threshold_bps = adaptive_velocity_threshold_bps(self.current_pressure);
-            let velocity_escalate_mem =
-                self.current_swap_velocity_bps > mem_threshold_bps && self.current_pressure >= 0.50;
+            // Same accelerator-not-gate principle as DemoteToEcores: sustained
+            // pressure ≥0.55 fires PurgePurgeable even without swap velocity.
+            // RE_PURGE_INTERVAL_CYCLES cooldown prevents per-cycle spam.
+            let velocity_escalate_mem = (self.current_swap_velocity_bps > mem_threshold_bps
+                && self.current_pressure >= 0.50)
+                || self.current_pressure >= 0.55;
 
             // RAM reclaim path: under velocity escalation we ALSO mark purgeable
             // regions of invisible renderers volatile. The kernel can then drop
@@ -968,8 +1000,9 @@ impl ChromiumManager {
             }
         }
 
-        // Second pass: freeze candidates (only if not paused by fluidity)
-        if !self.freeze_paused {
+        // Second pass: freeze candidates (only if not paused by fluidity AND
+        // not hard-disabled by daemon's pressure gate, Step 2 2026-05-11).
+        if !self.freeze_paused && !self.freeze_globally_disabled {
             // Group candidates by browser to enforce MAX_FREEZE_RATIO
             let mut candidates_by_browser: HashMap<String, Vec<u32>> = HashMap::new();
 
@@ -1122,6 +1155,13 @@ impl ChromiumManager {
                 for pid in sorted.iter().take(max_additional) {
                     if let Some(info) = self.renderers.get(pid) {
                         let mb = info.memory_bytes as f64 / 1_048_576.0;
+                        tracing::info!(
+                            pid = *pid,
+                            name = info.name.as_str(),
+                            estimated_mb = mb,
+                            pressure = self.current_pressure,
+                            "chromium: FreezeRenderer (Step 2 emergency)"
+                        );
                         actions.push(ChromiumAction::FreezeRenderer {
                             pid: *pid,
                             name: info.name.clone(),
@@ -2150,7 +2190,9 @@ mod tests {
         let mut visible: HashSet<u32> = HashSet::new();
         visible.insert(401);
         mgr.set_visible_pids(visible);
-        mgr.set_pressure_context(0.60);
+        // Pressure 0.50 keeps the sustained-pressure escalator (≥0.55, Step 1)
+        // OFF so this test can verify the velocity escalator path in isolation.
+        mgr.set_pressure_context(0.50);
 
         // Baseline: velocity=0 — neither demoted (is_fg_browser exempt).
         mgr.set_velocity_context(0.0);
@@ -2292,7 +2334,9 @@ mod tests {
         let none_set: HashSet<u32> = HashSet::new();
         let procs: Vec<(u32, &str, f32, u64)> =
             vec![(403, "Brave Browser Helper (Renderer)", 0.1, 50_000_000)];
-        mgr.set_pressure_context(0.80);
+        // Pressure < 0.55 (sustained-pressure floor) AND velocity < 1 MB/s
+        // (CPU gate) → both escalation paths blocked.
+        mgr.set_pressure_context(0.50);
         mgr.set_velocity_context(900_000.0); // 0.9 MB/s — below 1 MB/s gate
 
         let actions = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
@@ -2302,7 +2346,7 @@ mod tests {
             .count();
         assert_eq!(
             purges, 0,
-            "Velocity below 1 MB/s gate must NOT emit PurgePurgeable"
+            "Velocity below 1 MB/s and pressure below 0.55 must NOT emit PurgePurgeable"
         );
     }
 
@@ -2578,6 +2622,9 @@ mod tests {
     #[test]
     fn long_idle_renderer_frozen_at_low_pressure() {
         let mut mgr = ChromiumManager::new();
+        // Step 2 (2026-05-11): default new() now hard-disables freeze.
+        // Re-enable for this legacy test path (long-idle gate semantics).
+        mgr.set_freeze_globally_disabled(false);
         let none_set: HashSet<u32> = HashSet::new();
         mgr.set_pressure_context(0.25); // Low pressure: idle_cycles_required = 5
         mgr.set_arousal_context(0.50); // Normal working arousal (no thaw-all)
@@ -2644,6 +2691,7 @@ mod tests {
     #[test]
     fn build_preemption_freezes_after_grace_period() {
         let mut mgr = ChromiumManager::new();
+        mgr.set_freeze_globally_disabled(false);
         let none_set: HashSet<u32> = HashSet::new();
         // Low pressure + normal arousal → idle_cycles_required would be 5/3.
         mgr.set_pressure_context(0.25);
@@ -2679,6 +2727,7 @@ mod tests {
     #[test]
     fn without_build_preemption_high_arousal_freezes_after_grace_period() {
         let mut mgr = ChromiumManager::new();
+        mgr.set_freeze_globally_disabled(false);
         let none_set: HashSet<u32> = HashSet::new();
         mgr.set_pressure_context(0.25);
         mgr.set_arousal_context(0.80); // High arousal → idle_cycles_required = 1
@@ -2844,6 +2893,81 @@ mod tests {
         assert_eq!(
             metrics.frozen_renderers, 0,
             "foreground_app fallback must prevent freezing fg browser renderers even when PID lookup fails"
+        );
+    }
+
+    /// Sustained-pressure path (post-gate-relaxation, ~line 917-944): when
+    /// pressure >= 0.55, invisible FG-browser renderers must be demoted to
+    /// e-cores even when swap velocity is zero. Before the relaxation, the
+    /// `velocity > 1 MB/s AND pressure >= 0.50` AND-gate suppressed all
+    /// action under sustained-but-flat memory pressure on M1 8GB.
+    #[test]
+    fn pressure_sustained_demotes_invisible_fg_browser_renderers_without_velocity() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        let procs: Vec<(u32, &str, f32, u64)> = vec![
+            (401, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
+            (402, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
+        ];
+        let mut visible: HashSet<u32> = HashSet::new();
+        visible.insert(401);
+        mgr.set_visible_pids(visible);
+        mgr.set_pressure_context(0.62);
+        mgr.set_velocity_context(0.0);
+
+        let actions = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        let demoted_pids: Vec<u32> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ChromiumAction::DemoteToEcores { pid, .. } => Some(*pid),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            demoted_pids.contains(&402),
+            "Sustained pressure (>=0.55) alone must demote invisible FG-browser renderer 402; got {:?}",
+            demoted_pids
+        );
+        assert!(
+            !demoted_pids.contains(&401),
+            "Visible FG-browser renderer 401 must NEVER be demoted; got {:?}",
+            demoted_pids
+        );
+    }
+
+    /// Companion: PurgePurgeable must also fire on sustained-pressure-only
+    /// path for invisible FG-browser renderers.
+    #[test]
+    fn pressure_sustained_fires_purge_purgeable_without_velocity() {
+        let mut mgr = ChromiumManager::new();
+        let none_set: HashSet<u32> = HashSet::new();
+        let procs: Vec<(u32, &str, f32, u64)> = vec![
+            (401, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
+            (402, "Brave Browser Helper (Renderer)", 0.1, 50_000_000),
+        ];
+        let mut visible: HashSet<u32> = HashSet::new();
+        visible.insert(401);
+        mgr.set_visible_pids(visible);
+        mgr.set_pressure_context(0.62);
+        mgr.set_velocity_context(0.0);
+
+        let actions = mgr.update(&procs, None, Some("Brave Browser"), &none_set, &none_set);
+        let purged_pids: Vec<u32> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ChromiumAction::PurgePurgeable { pid, .. } => Some(*pid),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            purged_pids.contains(&402),
+            "Sustained pressure (>=0.55) alone must purge invisible FG-browser renderer 402; got {:?}",
+            purged_pids
+        );
+        assert!(
+            !purged_pids.contains(&401),
+            "Visible FG-browser renderer 401 must NEVER be purged; got {:?}",
+            purged_pids
         );
     }
 }

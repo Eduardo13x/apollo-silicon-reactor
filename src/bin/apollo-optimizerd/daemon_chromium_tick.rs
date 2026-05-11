@@ -66,8 +66,17 @@ pub fn run_chromium_tick(
     cycle_count: u64,
     swap_velocity_bps: f32,
 ) {
-    // Set to false to re-enable Chromium renderer freezing.
-    const CHROMIUM_FREEZE_DISABLED: bool = true;
+    // Step 2 (2026-05-11): conditional SIGSTOP enablement on crisis only.
+    // Historical context (commit 712b927, Apr 21): SIGSTOP on chromium renderers
+    // caused Brave IPC timeouts / beachballs. Kept globally disabled.
+    // Step 2 reframes as "emergency-only": SIGSTOP fires only when memory is
+    // genuinely tight (pressure ≥ 0.75 OR compressor ≥ 0.45 OR swap ≥ 1500 MB
+    // raw memory_pressure). All other safety gates (visibility, MAX_FREEZE_RATIO,
+    // assertion check, inet sockets, NEW_RENDERER_GRACE) remain active.
+    // The pressure-floor (Step 1) DemoteToEcores + PurgePurgeable continue to
+    // run unconditionally at pressure ≥ 0.55, providing the soft escalation.
+    let chromium_freeze_disabled =
+        pressure_smooth < 0.75 && memory_pressure_at_freeze < 0.75;
 
     // Context setters prime thresholds used by update()'s freeze logic.
     // Run unconditionally so state is warm when CHROMIUM_FREEZE_DISABLED is set to false.
@@ -88,6 +97,10 @@ pub fn run_chromium_tick(
         fluidity_state.window_op_active(),
         fluidity_state.launch_active,
     );
+    // Step 2 (2026-05-11): hard-disable freeze emit when pressure is low,
+    // so chromium_manager doesn't optimistically mark info.frozen for
+    // actions the daemon-side gate would block.
+    chromium_mgr.set_freeze_globally_disabled(chromium_freeze_disabled);
 
     // F3: CGWindowList visibility gate — refresh at most every 10 cycles (~5s).
     // Syscall costs ~1-3ms; window ownership rarely changes faster than that.
@@ -152,7 +165,7 @@ pub fn run_chromium_tick(
         }
     }
 
-    if !CHROMIUM_FREEZE_DISABLED {
+    if !chromium_freeze_disabled {
         for action in &chromium_actions {
             match action {
                 ChromiumAction::FreezeRenderer {
