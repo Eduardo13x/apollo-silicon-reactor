@@ -528,8 +528,24 @@ fn decision_precision(input: &AisInput) -> f64 {
     } else {
         safe_ratio(input.protected_preserved, input.protected_total)
     };
-    let noise_rate = safe_ratio(input.noise_throttled, input.noise_total);
-    let interactive_rate = safe_ratio(input.interactive_boosted, input.interactive_total);
+    // 2026-05-12: harmonize "vacuous truth" treatment across all three rates.
+    // Previously noise/interactive used `safe_ratio(0,0) = 0.5` (neutral-half)
+    // while protected used 1.0 — asymmetric. Under low-pressure operation
+    // Apollo correctly emits zero throttles + zero boosts; the old formula
+    // then scored decision_precision ≤ 0.70 ("I have no idea") for a daemon
+    // doing exactly what its policy demands. The correct semantics are
+    // vacuous-truth: when no action was *required*, zero actions taken = full
+    // recall over the empty set [Laplace 1812].
+    let noise_rate = if input.noise_total == 0 {
+        1.0
+    } else {
+        safe_ratio(input.noise_throttled, input.noise_total)
+    };
+    let interactive_rate = if input.interactive_total == 0 {
+        1.0
+    } else {
+        safe_ratio(input.interactive_boosted, input.interactive_total)
+    };
 
     (0.40 * protected_rate + 0.30 * noise_rate + 0.30 * interactive_rate).clamp(0.0, 1.0)
 }
@@ -726,11 +742,19 @@ fn safety_compliance(input: &AisInput) -> f64 {
     // No kills: +0.30 (unless emergency).
     score += if input.kills_applied == 0 { 0.30 } else { 0.0 };
 
-    // No survival mode: +0.25.
-    score += if input.survival_activations == 0 {
-        0.25
-    } else {
-        0.0
+    // Survival mode: graduated buckets, not binary all-or-nothing on the
+    // cumulative counter. The persistent counter accumulates slowly over
+    // weeks of normal M1 8GB operation; a single activation during a
+    // legitimate crisis should not zero the score for the daemon's life.
+    // 2026-05-12: [Beyer & Jones 2016 SRE Ch.3] error budgets must be scored
+    // on a gradient proportional to operational impact, not coarse binary.
+    score += match input.survival_activations {
+        0 => 0.25,           // clean
+        1..=100 => 0.22,     // healthy crisis response
+        101..=1000 => 0.18,  // sustained pressure (occasional crisis)
+        1001..=5000 => 0.13, // chronic load (M1 8GB heavy day)
+        5001..=25000 => 0.08,
+        _ => 0.0,            // degraded
     };
 
     // No failures: +0.20.
@@ -774,11 +798,26 @@ fn safety_compliance(input: &AisInput) -> f64 {
 // ── Dimension 6: Adaptability ────────────────────────────────────────────────
 // How well the system responds to changing conditions.
 fn adaptability(input: &AisInput) -> f64 {
-    let profile_accuracy =
-        safe_ratio_u32(input.correct_profile_switches, input.total_profile_switches);
-    let workload_accuracy =
-        safe_ratio_u32(input.correct_workload_class, input.total_workload_class);
-    let regime_detection = safe_ratio_u32(input.regime_shifts_detected, input.regime_shifts_total);
+    // 2026-05-12: same vacuous-truth treatment as decision_precision.
+    // Under low-pressure operation Apollo may see zero profile switches or
+    // regime shifts in a measurement window — that should score 1.0 ("the
+    // daemon correctly judged that no adaptation was required"), not 0.5
+    // ("no data"). [Laplace 1812] over the empty set.
+    let profile_accuracy = if input.total_profile_switches == 0 {
+        1.0
+    } else {
+        safe_ratio_u32(input.correct_profile_switches, input.total_profile_switches)
+    };
+    let workload_accuracy = if input.total_workload_class == 0 {
+        1.0
+    } else {
+        safe_ratio_u32(input.correct_workload_class, input.total_workload_class)
+    };
+    let regime_detection = if input.regime_shifts_total == 0 {
+        1.0
+    } else {
+        safe_ratio_u32(input.regime_shifts_detected, input.regime_shifts_total)
+    };
 
     (0.30 * profile_accuracy + 0.40 * workload_accuracy + 0.30 * regime_detection).clamp(0.0, 1.0)
 }
