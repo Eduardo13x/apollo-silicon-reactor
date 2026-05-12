@@ -3612,7 +3612,32 @@ fn main() -> anyhow::Result<()> {
                 {
                     let mut m = state.metrics.lock_recover();
                     m.metrics.ml_confidence = ml_class.confidence;
-                    m.metrics.current_workload = format!("{:?}", ml_class.workload).to_lowercase();
+                    // 2026-05-12: Media-playback override — the static workload
+                    // signatures list IINA/VLC/QuickTime but NOT browser-based
+                    // streaming (YouTube/Twitch/Netflix in Brave/Chrome/Safari).
+                    // When audio is actively flowing AND a browser is foreground,
+                    // we know the user is watching media regardless of the
+                    // process-name signature classifier. Override to
+                    // `mediaplayback` so downstream consumers (chromium gate,
+                    // sysctl governor, profile governor) apply media-aware
+                    // policy.
+                    let fg_lower = foreground_app
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let is_browser_fg = fg_lower.contains("brave")
+                        || fg_lower.contains("chrome")
+                        || fg_lower.contains("safari")
+                        || fg_lower.contains("firefox")
+                        || fg_lower.contains("zen")
+                        || fg_lower.contains("arc")
+                        || fg_lower.contains("vivaldi");
+                    let media_override = user_context.audio_active && is_browser_fg;
+                    m.metrics.current_workload = if media_override {
+                        "mediaplayback".to_string()
+                    } else {
+                        format!("{:?}", ml_class.workload).to_lowercase()
+                    };
                     m.metrics.ml_sources = ml_class.sources_summary();
                 }
                 // Cable: GPU optimize_for_workload → log GPU-specific hints when
@@ -3778,6 +3803,22 @@ fn main() -> anyhow::Result<()> {
                 // Extracted to daemon_chromium_tick::run_chromium_tick (Wave 11).
                 // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
                 let _t_chrom_start = Instant::now();
+                // Media-active signal: audio_active=true AND foreground is a
+                // browser → user watching streamed video. Pass through so the
+                // chromium gate can relax thresholds and free RAM for the
+                // video pipeline. Non-browser-fg (Spotify Music, IINA) NOT
+                // included — those apps have their own residency and don't
+                // benefit from browser-renderer SIGSTOP.
+                let media_active_chromium = user_context.audio_active && {
+                    let fg = foreground_app.as_deref().unwrap_or("").to_ascii_lowercase();
+                    fg.contains("brave")
+                        || fg.contains("chrome")
+                        || fg.contains("safari")
+                        || fg.contains("firefox")
+                        || fg.contains("zen")
+                        || fg.contains("arc")
+                        || fg.contains("vivaldi")
+                };
                 daemon_chromium_tick::run_chromium_tick(
                     &mut chromium_mgr,
                     &focus_markov,
@@ -3793,6 +3834,7 @@ fn main() -> anyhow::Result<()> {
                     cycle_count as u64,
                     signal_digest.swap_velocity_smooth as f32,
                     snapshot.pressure.thrashing_score,
+                    media_active_chromium,
                 );
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
