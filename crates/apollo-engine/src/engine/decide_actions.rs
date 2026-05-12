@@ -609,9 +609,22 @@ pub fn decide_actions(
                         if group.throttle_count >= 15
                             && !matches!(context, InteractiveContext::ThermalConstrained)
                         {
+                            // 2026-05-12: floor raised 0.25 → 0.50 per user
+                            // feedback ("Apollo se siente como que hace nada
+                            // ahora"). The 25% floor was correctly defensive
+                            // (anti subnormal-lockout per NotebookLM) but
+                            // dropped Browser throttle volume so far below
+                            // the prior baseline that the daemon felt
+                            // quiescent. 50% floor preserves exploration
+                            // recovery (predicted_effectiveness EMA α=0.1
+                            // still drives the upper half of the band) while
+                            // bringing throttle volume back to a perceptible
+                            // level. Browser at eff=0.19 → mult = clamp(0.195,
+                            // 0.50, 1.0) = 0.50 → ~50% of candidates admitted
+                            // instead of ~25%.
                             let mult = (0.5 * group.effectiveness()
                                 + 0.5 * group.predicted_effectiveness)
-                                .clamp(0.25, 1.0);
+                                .clamp(0.50, 1.0);
                             if mult < 1.0 {
                                 let hash = name
                                     .bytes()
