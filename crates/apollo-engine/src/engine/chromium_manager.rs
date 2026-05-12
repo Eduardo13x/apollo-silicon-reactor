@@ -1298,7 +1298,11 @@ impl ChromiumManager {
         ChromiumMetrics {
             total_renderers: self.renderers.len() as u32,
             frozen_renderers: total_frozen,
-            ecore_renderers: self.ecore_count,
+            // 2026-05-12: was `self.ecore_count` which resets per-cycle (line 623)
+            // making the gauge metric useless for monitoring. The
+            // `ecore_demoted` HashSet is the cumulative truth — pruned of dead
+            // PIDs at L828 and of recovered PIDs at L1232.
+            ecore_renderers: self.ecore_demoted.len() as u32,
             total_renderer_memory_mb: total_mem,
             estimated_freed_mb: freed_mb,
             browsers_managed: browsers,

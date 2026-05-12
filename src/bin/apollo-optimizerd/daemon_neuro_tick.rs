@@ -246,13 +246,22 @@ pub fn run_neurocognitive_tick(
         latest_action: throttle_names_for_outcome
             .first()
             .map(|n| format!("throttle:{}", n)),
-        predicted_score: lctx
-            .predictive_agent
-            .arm_avg_rewards()
-            .iter()
-            .cloned()
-            .fold(f64::NEG_INFINITY, f64::max)
-            .clamp(0.0, 1.0) as f32,
+        // 2026-05-12: was `.clamp(0.0, 1.0)` which collapsed signed-reward EMAs
+        // centered near zero (~0.0003) into ~0. MetaCognition then saw RlAgent
+        // predicted_ema≈0 vs actual_ema≈0.18 → gap 0.177 persistent.
+        // Map via `(tanh(reward * 5.0) + 1.0) / 2.0`: K=5 calibrated to the
+        // observed reward range (-0.5..+1.0 per pull, EMA typically -0.2..+0.3).
+        // Neutral 0.0 → 0.5; "good arm" avg 0.1 → 0.73; "bad arm" -0.2 → 0.27.
+        // Symmetric [0,1] contract for MetaCognition.observe().
+        predicted_score: {
+            let max_reward = lctx
+                .predictive_agent
+                .arm_avg_rewards()
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+            (((max_reward * 5.0).tanh() + 1.0) / 2.0) as f32
+        },
         workload_fingerprint: workload_mode_str
             .bytes()
             .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64)),

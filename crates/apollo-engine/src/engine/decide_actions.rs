@@ -581,20 +581,47 @@ pub fn decide_actions(
             }
 
             // HRPO group-level intelligence (Dr. Zero):
-            // 1. Skip: groups throttled ≥20x with effectiveness <15%
-            // 2. Explore: groups with high prediction error get tested regardless
+            // 1. Hard-skip: groups throttled ≥15x with effectiveness <12%
+            // 2. Graded-skip: groups 12-50% effectiveness throttled proportionally
+            //    (anti-paralysis floor at 25% per NotebookLM "Subnormal Lockout")
+            // 3. Explore: groups with high prediction error get tested regardless
+            //
+            // 2026-05-12: was binary cliff at <12%. Now graded so 80%-wasted
+            // groups (Browser eff 19%) get fewer throttles per cycle without
+            // exploration starvation. [Sutton & Barto 2018 §2.6] ε-greedy
+            // exploration floor; effective_count + predicted_effectiveness
+            // EMA (α=0.1, ~10-sample memory) ensures fast recovery if the
+            // workload changes (e.g., Brave update).
             {
                 let hop = WorkloadHop::from_process_name(&name);
                 if let Some(group) = hop_groups.get(&hop) {
-                    // Groups needing exploration bypass the skip — the solver
-                    // is uncertain about their effectiveness and needs more data.
                     if !group.needs_exploration() {
+                        // Hard skip retained for genuinely bad groups.
                         if group.throttle_count >= 15
                             && group.effectiveness() < 0.12
                             && !matches!(context, InteractiveContext::ThermalConstrained)
                         {
                             low_value_skipped.push(format!("hrpo-skip:{}", name));
                             continue;
+                        }
+                        // Graded skip via deterministic name hash, fractional
+                        // admission proportional to group health.
+                        if group.throttle_count >= 15
+                            && !matches!(context, InteractiveContext::ThermalConstrained)
+                        {
+                            let mult = (0.5 * group.effectiveness()
+                                + 0.5 * group.predicted_effectiveness)
+                                .clamp(0.25, 1.0);
+                            if mult < 1.0 {
+                                let hash = name
+                                    .bytes()
+                                    .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+                                let admit_threshold = (mult * 1024.0) as u32;
+                                if (hash % 1024) >= admit_threshold {
+                                    low_value_skipped.push(format!("hrpo-graded:{}", name));
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }
