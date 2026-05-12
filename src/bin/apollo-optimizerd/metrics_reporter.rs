@@ -467,6 +467,7 @@ pub fn merge_cycle_metrics<'a>(
         metrics.metrics.ais_resource = s.resource_efficiency;
         metrics.metrics.ais_safety = s.safety_compliance;
         metrics.metrics.ais_adaptability = s.adaptability;
+        metrics.metrics.ais_wisdom = s.wisdom;
         metrics.metrics.ais_pareto_balanced = s.pareto_balanced;
     }
 

@@ -1556,6 +1556,8 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub ais_adaptability: f64,
     #[serde(default)]
+    pub ais_wisdom: f64,
+    #[serde(default)]
     pub ais_pareto_balanced: bool,
 
     /// Maintenance Purge Gate telemetry (Sprint 5 Mes 0 — 2026-05-10).

@@ -24,12 +24,18 @@
 use serde::{Deserialize, Serialize};
 
 // ── Weights ──────────────────────────────────────────────────────────────────
-const W_DECISION: f64 = 0.25;
-const W_SIGNAL: f64 = 0.20;
-const W_LEARNING: f64 = 0.20;
-const W_RESOURCE: f64 = 0.15;
-const W_SAFETY: f64 = 0.12;
+const W_DECISION: f64 = 0.22;
+const W_SIGNAL: f64 = 0.18;
+const W_LEARNING: f64 = 0.18;
+const W_RESOURCE: f64 = 0.13;
+const W_SAFETY: f64 = 0.11;
 const W_ADAPT: f64 = 0.08;
+/// D7 Wisdom — knowledge accumulated over daemon lifetime.
+/// [Pei Wang 2013 NARS] uncertainty reduction via belief revision is the
+/// hallmark of a maturing intelligence. The 6 procedural dimensions measure
+/// *how well the daemon acts right now*; D7 measures *how much the daemon
+/// has learned*. Mature instances earn this weight; fresh installs do not.
+const W_WISDOM: f64 = 0.10;
 
 /// Input data for AIS computation. Can come from live daemon or simulation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -128,6 +134,17 @@ pub struct AisInput {
     /// Total actual regime shifts.
     pub regime_shifts_total: u32,
 
+    // ── Dimension 7: Wisdom (knowledge accumulation) ─────────────────────
+    /// CausalGraph mechanism count (Pearl 2009 causal edges learned).
+    #[serde(default)]
+    pub causal_mechanism_count: u32,
+    /// Experience memory size (OutcomeTracker episodic records).
+    #[serde(default)]
+    pub experience_memory_count: u32,
+    /// Novel patterns logged via Phase 4 self-healing (Simon 1955).
+    #[serde(default)]
+    pub novel_patterns_count: u32,
+
     // ── Hardware context (for normalization portability) ──────────────────
     /// Number of CPU cores on this machine. 0 = unknown (defaults to 8).
     /// Used to normalize thresholds that depend on parallelism capacity.
@@ -190,9 +207,15 @@ pub struct AisScore {
     pub resource_efficiency: f64,
     pub safety_compliance: f64,
     pub adaptability: f64,
+    /// D7 Wisdom — knowledge accumulated over the daemon lifetime.
+    /// Log-saturated normalization of causal mechanisms, experience memory,
+    /// novel patterns, reliable skills, and solid causal edges.
+    #[serde(default)]
+    pub wisdom: f64,
     /// Pareto frontier check: true if no dimension is below 0.30.
     pub pareto_balanced: bool,
-    /// Grade: S (≥90), A (≥80), B (≥70), C (≥60), D (≥50), F (<50).
+    /// Grade: ✦ (SS, wisdom-gated singularity), S (≥90), A (≥80), B (≥70),
+    /// C (≥60), D (≥50), F (<50).
     pub grade: char,
 }
 
@@ -373,6 +396,21 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         .unwrap_or(0) as u32;
     let dyna_transitions = rm_f("predictive_agent_cycles") as u64;
 
+    // D7 Wisdom signals — read from live runtime + file system.
+    let causal_mechanism_count = rm_u("causal_mechanism_count") as u32;
+    let experience_memory_count = rm_u("experience_memory_size") as u32;
+    let novel_patterns_count = {
+        // File lives next to runtime_metrics.json — derive sibling path.
+        let p = metrics_path();
+        let sibling = std::path::Path::new(p)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/var/lib/apollo"))
+            .join("novel_patterns.jsonl");
+        std::fs::read_to_string(&sibling)
+            .map(|s| s.lines().count() as u32)
+            .unwrap_or(0)
+    };
+
     // D4: P50 cycle time from ring buffer.
     let p95_cycle_ms = {
         if let Some(arr) = rm["cycle_durations_ms"].as_array() {
@@ -458,6 +496,10 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         regime_shifts_detected: regime_shifts,
         regime_shifts_total: (regime_shifts.saturating_add(regime_shifts / 20)).max(1),
 
+        causal_mechanism_count,
+        experience_memory_count,
+        novel_patterns_count,
+
         hardware_cores: 8,
         hardware_memory_gb: 8,
         kalman_riccati_rmse: kalman_riccati_floor,
@@ -477,20 +519,29 @@ pub fn compute_ais(input: &AisInput) -> AisScore {
     let d4 = resource_efficiency(input);
     let d5 = safety_compliance(input);
     let d6 = adaptability(input);
+    let d7 = wisdom(input);
 
     let total = (W_DECISION * d1
         + W_SIGNAL * d2
         + W_LEARNING * d3
         + W_RESOURCE * d4
         + W_SAFETY * d5
-        + W_ADAPT * d6)
+        + W_ADAPT * d6
+        + W_WISDOM * d7)
         * 100.0;
 
     let dims = [d1, d2, d3, d4, d5, d6];
     let pareto_balanced = dims.iter().all(|&d| d >= 0.30);
 
+    // 2026-05-12: SS-tier introduced. A daemon at S grade (≥90) that ALSO
+    // crosses the wisdom threshold (d7 ≥ 0.85) is the qualitative phase
+    // change from "well-behaved" to "deeply learned". This is the
+    // closest measurable analogue to a "singularity" point — the system
+    // is not only optimal in the moment but has accumulated enough
+    // experience to be self-correcting.
     let grade = match total as u32 {
-        90..=100 => 'S',
+        98..=u32::MAX if d7 >= 0.85 => '✦', // SS — wisdom-threshold
+        90..=u32::MAX => 'S',
         80..=89 => 'A',
         70..=79 => 'B',
         60..=69 => 'C',
@@ -506,6 +557,7 @@ pub fn compute_ais(input: &AisInput) -> AisScore {
         resource_efficiency: d4,
         safety_compliance: d5,
         adaptability: d6,
+        wisdom: d7,
         pareto_balanced,
         grade,
     }
@@ -820,6 +872,33 @@ fn adaptability(input: &AisInput) -> f64 {
     };
 
     (0.30 * profile_accuracy + 0.40 * workload_accuracy + 0.30 * regime_detection).clamp(0.0, 1.0)
+}
+
+// ── Dimension 7: Wisdom (knowledge accumulation) ────────────────────────────
+// Log-saturated normalization over five evidence streams. Each saturates at
+// its calibrated "fully mature" value so the dimension converges asymptotically.
+// [Pei Wang 2013 NARS] §3.2 — belief mass accumulates with experience but
+// confidence approaches 1.0 only in the limit. Mature daemons earn this
+// dimension; fresh installs score near zero.
+fn wisdom(input: &AisInput) -> f64 {
+    let log_sat = |x: u64, target: f64| -> f64 {
+        ((x as f64 + 1.0).ln() / (target + 1.0).ln()).clamp(0.0, 1.0)
+    };
+    // Calibration targets reflect "mature single-user daemon, ~1-3 mo uptime"
+    // on M1 8GB. A new daemon scores ~0, an actively-learning one ~0.5, a
+    // fully mature one ~0.9+.
+    let causal = log_sat(input.causal_mechanism_count as u64, 50.0);
+    let experience = log_sat(input.experience_memory_count as u64, 200.0);
+    let novel = log_sat(input.novel_patterns_count as u64, 50.0);
+    let skills_reliable = log_sat(input.reliable_skills as u64, 8.0);
+    let causal_edges = log_sat(input.causal_solid_edges as u64, 30.0);
+
+    (0.25 * causal
+        + 0.20 * experience
+        + 0.15 * novel
+        + 0.20 * skills_reliable
+        + 0.20 * causal_edges)
+        .clamp(0.0, 1.0)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1245,6 +1324,9 @@ mod tests {
             hardware_memory_gb: 8,
             // D2: dynamic Riccati threshold — [Kalman 1960] P* = (-Q + √(Q²+4QR)) / 2.
             // IPC-modulated R accurately reflects the noise floor under current system load.
+            causal_mechanism_count: 0,
+            experience_memory_count: 0,
+            novel_patterns_count: 0,
             kalman_riccati_rmse: kalman_riccati_floor,
         };
 
@@ -1356,6 +1438,9 @@ mod tests {
             hardware_memory_gb: 8,
             rl_total_ticks: 0,        // simulation mode: use convergence_ticks
             current_pressure: 0.0,    // simulation mode: use skip-rate formula
+            causal_mechanism_count: 0,
+            experience_memory_count: 0,
+            novel_patterns_count: 0,
             kalman_riccati_rmse: 0.0, // simulation mode: use fixed pressure-based thresholds
         };
 
@@ -1888,7 +1973,7 @@ mod tests {
 
     #[test]
     fn test_weights_sum_to_one() {
-        let sum = W_DECISION + W_SIGNAL + W_LEARNING + W_RESOURCE + W_SAFETY + W_ADAPT;
+        let sum = W_DECISION + W_SIGNAL + W_LEARNING + W_RESOURCE + W_SAFETY + W_ADAPT + W_WISDOM;
         assert!(
             (sum - 1.0).abs() < 1e-10,
             "Weights must sum to 1.0, got {}",
@@ -1944,6 +2029,9 @@ mod tests {
             hardware_memory_gb: 8,
             rl_total_ticks: 0,
             current_pressure: 0.0,
+            causal_mechanism_count: 0,
+            experience_memory_count: 0,
+            novel_patterns_count: 0,
             kalman_riccati_rmse: 0.0, // simulation mode: use fixed threshold
         };
         let score = compute_ais(&input);
@@ -2044,12 +2132,18 @@ mod tests {
         // At Riccati floor: RMSE < riccati_rmse → kalman sub-score = 1.0
         let at_floor = AisInput {
             kalman_rmse: 0.100,
+            causal_mechanism_count: 0,
+            experience_memory_count: 0,
+            novel_patterns_count: 0,
             kalman_riccati_rmse: 0.109,
             ..base.clone()
         };
         // Above Riccati floor: RMSE > riccati_rmse → kalman sub-score < 1.0
         let above_floor = AisInput {
             kalman_rmse: 0.150,
+            causal_mechanism_count: 0,
+            experience_memory_count: 0,
+            novel_patterns_count: 0,
             kalman_riccati_rmse: 0.109,
             ..base
         };
@@ -2065,6 +2159,9 @@ mod tests {
         // (kalman=1.0 is the maximum kalman sub-score).
         let perfect_kalman = AisInput {
             kalman_rmse: 0.0,
+            causal_mechanism_count: 0,
+            experience_memory_count: 0,
+            novel_patterns_count: 0,
             kalman_riccati_rmse: 0.109,
             cusum_true_positives: 10,
             cusum_false_positives: 0,
@@ -2144,6 +2241,9 @@ mod tests {
 
             hardware_cores: 8,
             hardware_memory_gb: 8,
+            causal_mechanism_count: 0,
+            experience_memory_count: 0,
+            novel_patterns_count: 0,
             kalman_riccati_rmse: 0.0, // simulation mode
         }
     }
@@ -2232,6 +2332,9 @@ mod tests {
 
             hardware_cores: 8,
             hardware_memory_gb: 8,
+            causal_mechanism_count: 0,
+            experience_memory_count: 0,
+            novel_patterns_count: 0,
             kalman_riccati_rmse: 0.0,
         };
         let score = compute_ais(&input);
@@ -2333,12 +2436,18 @@ mod tests {
         };
         let with_riccati = AisInput {
             kalman_rmse: 0.11,
+            causal_mechanism_count: 0,
+            experience_memory_count: 0,
+            novel_patterns_count: 0,
             kalman_riccati_rmse: 0.12,
             current_pressure: 0.80,
             ..base.clone()
         };
         let without_riccati = AisInput {
             kalman_rmse: 0.11,
+            causal_mechanism_count: 0,
+            experience_memory_count: 0,
+            novel_patterns_count: 0,
             kalman_riccati_rmse: 0.0,
             current_pressure: 0.80,
             ..base
