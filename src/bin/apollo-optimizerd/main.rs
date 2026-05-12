@@ -3613,26 +3613,20 @@ fn main() -> anyhow::Result<()> {
                     let mut m = state.metrics.lock_recover();
                     m.metrics.ml_confidence = ml_class.confidence;
                     // 2026-05-12: Media-playback override — the static workload
-                    // signatures list IINA/VLC/QuickTime but NOT browser-based
-                    // streaming (YouTube/Twitch/Netflix in Brave/Chrome/Safari).
-                    // When audio is actively flowing AND a browser is foreground,
-                    // we know the user is watching media regardless of the
-                    // process-name signature classifier. Override to
-                    // `mediaplayback` so downstream consumers (chromium gate,
-                    // sysctl governor, profile governor) apply media-aware
-                    // policy.
-                    let fg_lower = foreground_app
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    let is_browser_fg = fg_lower.contains("brave")
-                        || fg_lower.contains("chrome")
-                        || fg_lower.contains("safari")
-                        || fg_lower.contains("firefox")
-                        || fg_lower.contains("zen")
-                        || fg_lower.contains("arc")
-                        || fg_lower.contains("vivaldi");
-                    let media_override = user_context.audio_active && is_browser_fg;
+                    // signatures list IINA/VLC/QuickTime but miss the common
+                    // browser-streaming case (YouTube/Twitch/Netflix). The
+                    // CoreAudio `kAudioDevicePropertyDeviceIsRunningSomewhere`
+                    // signal is the canonical "media is flowing somewhere"
+                    // probe and does NOT depend on foreground. Triggering on
+                    // audio_active alone correctly covers:
+                    //   - YouTube in Brave while user tabbed to Alacritty
+                    //   - Spotify in background while coding
+                    //   - VLC playing offscreen
+                    // The downstream chromium gate still scopes its action to
+                    // INVISIBLE renderers (CGWindowList), so a foreground
+                    // browser tab playing audio never gets demoted/frozen by
+                    // the media-aware threshold.
+                    let media_override = user_context.audio_active;
                     m.metrics.current_workload = if media_override {
                         "mediaplayback".to_string()
                     } else {
@@ -3803,22 +3797,13 @@ fn main() -> anyhow::Result<()> {
                 // Extracted to daemon_chromium_tick::run_chromium_tick (Wave 11).
                 // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
                 let _t_chrom_start = Instant::now();
-                // Media-active signal: audio_active=true AND foreground is a
-                // browser → user watching streamed video. Pass through so the
-                // chromium gate can relax thresholds and free RAM for the
-                // video pipeline. Non-browser-fg (Spotify Music, IINA) NOT
-                // included — those apps have their own residency and don't
-                // benefit from browser-renderer SIGSTOP.
-                let media_active_chromium = user_context.audio_active && {
-                    let fg = foreground_app.as_deref().unwrap_or("").to_ascii_lowercase();
-                    fg.contains("brave")
-                        || fg.contains("chrome")
-                        || fg.contains("safari")
-                        || fg.contains("firefox")
-                        || fg.contains("zen")
-                        || fg.contains("arc")
-                        || fg.contains("vivaldi")
-                };
+                // Media-active signal: any audio flowing (CoreAudio
+                // is_running_somewhere). Includes browser-background streaming,
+                // Spotify, VLC, podcasts in HTML5 audio, etc. The chromium
+                // gate is scoped to INVISIBLE renderers via CGWindowList, so
+                // even a foreground browser tab playing audio is never
+                // demoted/frozen by the media-aware threshold relaxation.
+                let media_active_chromium = user_context.audio_active;
                 daemon_chromium_tick::run_chromium_tick(
                     &mut chromium_mgr,
                     &focus_markov,
