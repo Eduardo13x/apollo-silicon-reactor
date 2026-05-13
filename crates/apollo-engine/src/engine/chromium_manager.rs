@@ -79,12 +79,14 @@ const FD_CHECK_EVERY_N_CYCLES: u8 = 5;
 /// Renderers always have Unix-domain IPC sockets; we only block on TCP/UDP.
 const MIN_INET_SOCKETS_TO_BLOCK: usize = 1;
 
-/// Max cycles a renderer stays frozen before forced thaw (~5 s at 100ms/cycle).
-/// Kept short so that when Brave closes a tab, the frozen renderer is thawed
-/// before Brave's ~15s "not responding" timeout fires. Previous value (150)
-/// caused a race: tab closed → renderer SIGSTOP'd → Brave IPC blocked →
-/// "window not responding" dialog for an already-closed tab.
-const MAX_FROZEN_CYCLES: u8 = 50;
+/// Max cycles a renderer stays frozen before forced thaw.
+/// 2026-05-13: tightened 50→20 (~10s at 500ms/cycle, ~2s at 100ms/cycle)
+/// per user report "tabs frozen / slow to thaw". Even on background
+/// tabs the user-perceptible recovery window matters when they
+/// eventually click back. Below Brave's 15s IPC timeout with margin.
+/// Memory reclaim benefit of long TTL is small in practice (renderer
+/// pages already swapped after first ~5s on M1 8GB).
+const MAX_FROZEN_CYCLES: u8 = 20;
 
 /// Aggressive TTL for renderers of the **currently foreground** Chromium
 /// browser. Kept at 3 cycles (~300ms) — below human perception threshold
