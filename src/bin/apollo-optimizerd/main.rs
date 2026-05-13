@@ -3835,17 +3835,14 @@ fn main() -> anyhow::Result<()> {
                 // Extracted to daemon_chromium_tick::run_chromium_tick (Wave 11).
                 // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
                 let _t_chrom_start = Instant::now();
-                // Stage budget watchdog: skip chromium tick if cycle already
-                // exceeded 150ms in REASON. Chromium manager tolerates skipped
-                // cycles (it polls every cycle but doesn't decay state per
-                // cycle). Skipping here under stress prevents the daemon's
-                // own latency from compounding.
-                if stage_budget_exceeded {
-                    lf_metrics.record_stage(
-                        apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
-                        0,
-                    );
-                } else {
+                // 2026-05-13: removed watchdog skip on chromium tick — was
+                // suppressing chromium_gate_regime + chromium_renderers_frozen
+                // + chromium_freed_mb metric writes under stress, leaving them
+                // null/stale and masking the daemon's actual behavior. Empirical:
+                // stage_reason_chromium_avg ~0.78ms — far cheaper than the
+                // observability cost of skipping it. Watchdog still applies to
+                // HoltWinters + PageReclaim where the cost-benefit favors skip.
+                {
                 // Workload-aware chromium gates. Three independent signals
                 // feed the priority-strict-max chain inside run_chromium_tick:
                 //   media : any audio flowing (CoreAudio).
