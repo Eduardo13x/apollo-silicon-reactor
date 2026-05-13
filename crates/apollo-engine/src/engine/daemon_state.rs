@@ -102,8 +102,14 @@ impl MetricsState {
         self.metrics.memory_budget_duration_ms = lf.memory_budget_duration_us as f64 / 1000.0;
         self.metrics.reactor_duration_ms = lf.reactor_duration_us as f64 / 1000.0;
 
-        // Reactor pulses
-        self.metrics.reactor_pulses = lf.signals_sent;
+        // Reactor pulses — 2026-05-12: removed `= lf.signals_sent` overwrite.
+        // The lock-free `signals_sent` field is defined in lse_counters.rs:57 but
+        // is NEVER incremented anywhere in the codebase. The authoritative writers
+        // are `daemon_reactor.rs:164` (per kqueue iter) and `metrics_reporter.rs:389`
+        // (per cycle when reactor_weight>0.2). Clobbering with `signals_sent` reset
+        // the counter to 0 every cycle and broke the liveness watchdog at
+        // main.rs:1553 (would mark reactor "stalled" even when healthy). The
+        // in-memory counter is the source of truth — leave it untouched here.
         // Maintenance Purge Gate (2026-05-10) — Sprint 3 telemetry sync chain
         self.metrics.maintenance_purge_total = lf.maintenance_purge_total;
         self.metrics.maintenance_purge_skipped_pressure_total =

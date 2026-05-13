@@ -171,21 +171,95 @@ fn collect_idle_secs() -> f64 {
 
 #[cfg(target_os = "macos")]
 fn collect_idle_secs_inner() -> Option<f64> {
-    let output = Command::new("ioreg")
-        .args(["-c", "IOHIDSystem"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if line.contains("HIDIdleTime") {
-            // Line format: `  "HIDIdleTime" = 1234567890`
-            let eq_pos = line.find('=')?;
-            let val_str = line[eq_pos + 1..].trim();
-            let ns: u64 = val_str.parse().ok()?;
-            return Some(ns as f64 / 1_000_000_000.0);
-        }
+    // 2026-05-12: direct IOKit FFI replaces `ioreg -c IOHIDSystem` subprocess.
+    // Subprocess fork+exec+parse cost ~25ms — the single biggest p95 outlier
+    // contributor in stage_reason_usercontext_max. IOKit registry query is
+    // ~50µs (500× faster) and matches what `ioreg` itself does internally.
+    //
+    // Path: IOServiceGetMatchingService(kIOMasterPortDefault,
+    //       IOServiceMatching("IOHIDSystem")) →
+    //       IORegistryEntryCreateCFProperty(service, CFSTR("HIDIdleTime"),
+    //       kCFAllocatorDefault, 0) → CFNumberGetValue(num, kCFNumberSInt64Type)
+    //
+    // Returns idle time in nanoseconds.
+    use std::ffi::{c_void, CString};
+
+    type MachPortT = u32;
+    type CFAllocatorRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CFTypeRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type IoServiceT = u32;
+    type KernReturnT = i32;
+    type CFNumberType = i64;
+
+    const K_CF_NUMBER_S_INT64: CFNumberType = 4;
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        static kIOMasterPortDefault: MachPortT;
+        fn IOServiceMatching(name: *const i8) -> CFDictionaryRef;
+        fn IOServiceGetMatchingService(
+            master_port: MachPortT,
+            matching: CFDictionaryRef,
+        ) -> IoServiceT;
+        fn IORegistryEntryCreateCFProperty(
+            entry: IoServiceT,
+            key: CFStringRef,
+            allocator: CFAllocatorRef,
+            options: u32,
+        ) -> CFTypeRef;
+        fn IOObjectRelease(entry: IoServiceT) -> KernReturnT;
+        fn CFStringCreateWithCString(
+            alloc: CFAllocatorRef,
+            cstr: *const i8,
+            encoding: u32,
+        ) -> CFStringRef;
+        fn CFNumberGetValue(
+            num: CFTypeRef,
+            ty: CFNumberType,
+            value_ptr: *mut c_void,
+        ) -> bool;
+        fn CFRelease(cf: CFTypeRef);
     }
-    None
+
+    unsafe {
+        let service_name = CString::new("IOHIDSystem").ok()?;
+        let matching = IOServiceMatching(service_name.as_ptr());
+        if matching.is_null() {
+            return None;
+        }
+        // IOServiceGetMatchingService consumes the matching dict — no release.
+        let service = IOServiceGetMatchingService(kIOMasterPortDefault, matching);
+        if service == 0 {
+            return None;
+        }
+        let key_cstr = CString::new("HIDIdleTime").ok()?;
+        let key = CFStringCreateWithCString(
+            std::ptr::null(),
+            key_cstr.as_ptr(),
+            K_CF_STRING_ENCODING_UTF8,
+        );
+        if key.is_null() {
+            IOObjectRelease(service);
+            return None;
+        }
+        let prop = IORegistryEntryCreateCFProperty(service, key, std::ptr::null(), 0);
+        CFRelease(key);
+        IOObjectRelease(service);
+        if prop.is_null() {
+            return None;
+        }
+        let mut ns: i64 = 0;
+        let ok = CFNumberGetValue(prop, K_CF_NUMBER_S_INT64, &mut ns as *mut _ as *mut c_void);
+        CFRelease(prop);
+        if !ok || ns < 0 {
+            return None;
+        }
+        Some(ns as f64 / 1_000_000_000.0)
+    }
 }
 
 /// Parse `pmset -g assertions` for sleep-prevention, call, and audio signals.

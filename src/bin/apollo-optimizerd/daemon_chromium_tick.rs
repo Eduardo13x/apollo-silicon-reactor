@@ -69,6 +69,7 @@ pub fn run_chromium_tick(
     media_active: bool,
     build_active: bool,
     call_in_progress: bool,
+    llm_active: bool,
 ) {
     // Step 2 (2026-05-11): conditional SIGSTOP enablement on crisis only.
     // Historical context (commit 712b927, Apr 21): SIGSTOP on chromium renderers
@@ -104,15 +105,28 @@ pub fn run_chromium_tick(
     //
     // CGWindowList visibility gate (chromium_manager.rs:919) ensures
     // foreground/visible tabs are NEVER demoted/frozen regardless of regime.
-    let (pressure_gate, thrashing_gate) = if call_in_progress {
-        (0.55, 4_000.0)
-    } else if build_active {
-        (0.65, 6_000.0)
+    let (pressure_gate, thrashing_gate, regime) = if call_in_progress {
+        (0.55, 4_000.0, "call")
+    } else if llm_active {
+        // LLM inference (llama-server/ollama): 4GB+ resident, RAM-bound.
+        // Tied with media at (0.60, 5000) — same crisis topology, both
+        // benefit from freeing invisible browser tabs immediately.
+        (0.60, 5_000.0, "llm")
     } else if media_active {
-        (0.60, 5_000.0)
+        (0.60, 5_000.0, "media")
+    } else if build_active {
+        (0.65, 6_000.0, "build")
     } else {
-        (0.75, 10_000.0)
+        (0.75, 10_000.0, "default")
     };
+    // Surface regime for observability — silent regression to "default"
+    // under crisis would otherwise be invisible.
+    {
+        let mut m = state.metrics.lock_recover();
+        if m.metrics.chromium_gate_regime != regime {
+            m.metrics.chromium_gate_regime = regime.to_string();
+        }
+    }
     let chromium_freeze_disabled = pressure_smooth < pressure_gate as f32
         && memory_pressure_at_freeze < pressure_gate
         && thrashing_score < thrashing_gate;

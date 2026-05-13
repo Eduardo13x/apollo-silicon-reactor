@@ -3826,6 +3826,14 @@ fn main() -> anyhow::Result<()> {
                 let build_active_chromium = build_tracker.phase
                     != apollo_engine::engine::build_tracker::BuildPhase::Idle;
                 let call_active_chromium = user_context.call_in_progress;
+                // 2026-05-12: LLM inference also relaxes the chromium gate.
+                // llama-server / ollama hold 4GB resident; their detection
+                // already adds +0.20 pressure boost via aggregator, but that
+                // path is dampened by smoothing/clamps. A direct chromium gate
+                // entry at parity with media (0.60, 5000) is more immediate.
+                // `softly_protected_processes()` keeps llama-server itself
+                // safe from being frozen at sub-survival pressure.
+                let llm_active_chromium = llm_active;
                 daemon_chromium_tick::run_chromium_tick(
                     &mut chromium_mgr,
                     &focus_markov,
@@ -3844,6 +3852,7 @@ fn main() -> anyhow::Result<()> {
                     media_active_chromium,
                     build_active_chromium,
                     call_active_chromium,
+                    llm_active_chromium,
                 );
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,

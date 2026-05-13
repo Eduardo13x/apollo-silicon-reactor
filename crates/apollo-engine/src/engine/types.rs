@@ -1557,6 +1557,12 @@ pub struct RuntimeMetrics {
     pub ais_adaptability: f64,
     #[serde(default)]
     pub ais_wisdom: f64,
+    /// 2026-05-12 — Active regime selected by the chromium Step 2 gate's
+    /// priority chain in daemon_chromium_tick.rs. One of: "default",
+    /// "media", "build", "call", "llm". Surfaces silently-failing regime
+    /// transitions so a regression to "default" under crisis is visible.
+    #[serde(default)]
+    pub chromium_gate_regime: String,
     #[serde(default)]
     pub ais_pareto_balanced: bool,
 

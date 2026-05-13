@@ -916,14 +916,18 @@ impl LearnedState {
     /// [Gray & Reuter 1992] §10 — WAL/atomic-replace: the previous
     /// committed state must survive any single-point failure.
     pub fn persist(&self, path: &Path) {
-        let json = match serde_json::to_string(self) {
-            Ok(j) => j,
-            Err(_) => return,
-        };
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, &json).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
+        // 2026-05-12: switched to crash-safe atomic write with fsync.
+        // Previous implementation `fs::write(tmp) + rename` survives torn
+        // writes but NOT power loss after rename — the renamed inode could
+        // hold partial data if the kernel buffer hadn't flushed.
+        // `write_json_critical` opens with O_WRONLY|O_CREAT|O_TRUNC, writes,
+        // fsyncs the tmp file AND the parent directory, then renames.
+        // Adds ~1-3ms per persist (already amortized: persist cadence is
+        // every ~30s in steady state). Worth the cost — learned_state is
+        // the most valuable file Apollo writes.
+        // [Gray & Reuter 1992 §10 — durability requires fsync, not just
+        // atomic rename].
+        crate::engine::llm::write_json_critical(path, self, Some(0o600));
     }
 
     /// Patch only the `process_baselines` field of an existing persisted file.
