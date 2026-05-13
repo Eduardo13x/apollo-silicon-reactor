@@ -3834,6 +3834,24 @@ fn main() -> anyhow::Result<()> {
                 // `softly_protected_processes()` keeps llama-server itself
                 // safe from being frozen at sub-survival pressure.
                 let llm_active_chromium = llm_active;
+                // 2026-05-12: cached external-display snapshot. cg_display
+                // FFI costs ~50µs but topology changes rarely — sample every
+                // 50 cycles (~5 s @ 10 Hz). The cached value lives in a
+                // function-level static since DisplayState is Copy and the
+                // daemon loop is single-threaded for chromium tick.
+                static mut DISPLAY_STATE_CACHE:
+                    apollo_engine::engine::cg_display::DisplayState =
+                    apollo_engine::engine::cg_display::DisplayState {
+                        display_count: 0,
+                        external_4k_attached: false,
+                    };
+                let display_state_now = unsafe {
+                    if cycle_count % 50 == 0 {
+                        DISPLAY_STATE_CACHE = apollo_engine::engine::cg_display::snapshot();
+                    }
+                    DISPLAY_STATE_CACHE
+                };
+                let external_4k_attached = display_state_now.external_4k_attached;
                 daemon_chromium_tick::run_chromium_tick(
                     &mut chromium_mgr,
                     &focus_markov,
@@ -3853,6 +3871,7 @@ fn main() -> anyhow::Result<()> {
                     build_active_chromium,
                     call_active_chromium,
                     llm_active_chromium,
+                    external_4k_attached,
                 );
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,

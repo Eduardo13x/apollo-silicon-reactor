@@ -70,6 +70,7 @@ pub fn run_chromium_tick(
     build_active: bool,
     call_in_progress: bool,
     llm_active: bool,
+    external_4k_attached: bool,
 ) {
     // Step 2 (2026-05-11): conditional SIGSTOP enablement on crisis only.
     // Historical context (commit 712b927, Apr 21): SIGSTOP on chromium renderers
@@ -116,6 +117,12 @@ pub fn run_chromium_tick(
         (0.60, 5_000.0, "media")
     } else if build_active {
         (0.65, 6_000.0, "build")
+    } else if external_4k_attached {
+        // External 4K monitor attached: WindowServer compositor cost
+        // ~doubles per cycle (extra render pipeline + larger frame
+        // buffer competing with renderers for unified-memory bandwidth).
+        // Tied with build at (0.65, 6000) — bandwidth-bound, not crisis.
+        (0.65, 6_000.0, "external_4k")
     } else {
         (0.75, 10_000.0, "default")
     };
