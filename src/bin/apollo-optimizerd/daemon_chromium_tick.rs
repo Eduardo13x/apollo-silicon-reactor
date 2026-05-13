@@ -67,6 +67,8 @@ pub fn run_chromium_tick(
     swap_velocity_bps: f32,
     thrashing_score: f64,
     media_active: bool,
+    build_active: bool,
+    call_in_progress: bool,
 ) {
     // Step 2 (2026-05-11): conditional SIGSTOP enablement on crisis only.
     // Historical context (commit 712b927, Apr 21): SIGSTOP on chromium renderers
@@ -84,15 +86,29 @@ pub fn run_chromium_tick(
     // Pressure-smooth alone misses sticky-swap states where the kernel has
     // already swapped out hot pages and pressure relaxes. Thrashing >10k is an
     // independent flow-crisis signal that justifies SIGSTOP on its own.
-    // Media-aware threshold relaxation: during browser-based media playback
-    // (YouTube/Twitch/Netflix in Brave/Chrome/Safari) the user is decoding 4K
-    // video + audio buffer that compete with background browser tabs for
-    // unified-memory bandwidth on M1 8GB. Lower the Step 2 SIGSTOP gate so
-    // Apollo more readily freezes INVISIBLE background renderers (not the
-    // foreground audio renderer — already CGWindowList-protected) and frees
-    // ~100-300 MB for the video pipeline. [Denning 1968 working set] —
-    // foreground media is the working set the user actually cares about.
-    let (pressure_gate, thrashing_gate) = if media_active {
+    // Workload-aware threshold relaxation. Priority strict-max — NOT additive,
+    // because compounding gates (call+build+media → 0.40 SIGSTOP floor) would
+    // breach the freeze_protected invariant Apollo trusts elsewhere. The chain
+    // chooses ONE regime per cycle.
+    //
+    //   call_in_progress : strictest. Codec needs RAM+bandwidth, beachball =
+    //                      unacceptable. Lower gate → more aggressive on
+    //                      invisible browser tabs. freeze_protected still
+    //                      vetoes SIGSTOP downstream, so effect is via
+    //                      DemoteToEcores + PurgePurgeable only.
+    //   build_active      : 2-4 GB rustc heap imminent. Preempt invisible tabs
+    //                      BEFORE rustc spikes — Nygard 2018 bulkheading.
+    //   media_active      : 4K decode + audio buffer compete with background
+    //                      tabs. Same logic as commits 0f2c99c/8ab7d28.
+    //   default           : crisis-only.
+    //
+    // CGWindowList visibility gate (chromium_manager.rs:919) ensures
+    // foreground/visible tabs are NEVER demoted/frozen regardless of regime.
+    let (pressure_gate, thrashing_gate) = if call_in_progress {
+        (0.55, 4_000.0)
+    } else if build_active {
+        (0.65, 6_000.0)
+    } else if media_active {
         (0.60, 5_000.0)
     } else {
         (0.75, 10_000.0)

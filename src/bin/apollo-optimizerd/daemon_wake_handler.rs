@@ -65,6 +65,15 @@ pub fn run_wake_tick(
         process_guard.wake_state.last_wake_at = Some(now_wall);
         process_guard.wake_state.post_wake_grace_until =
             Some(now_wall + ChronoDuration::seconds(60));
+        // 2026-05-12: opposite-of-grace — engage AGGRESSIVE post-wake page
+        // reclaim window. After sleep, file-backed cache + stale daemons
+        // hold 1-2 GB on M1 8GB that the user already paid for hours ago.
+        // The 90s reclaim window overlaps with the 60s grace window so
+        // initial unfreeze (grace path) does not race against purge, then
+        // continues for 30s past grace to mop up cold daemon residency.
+        // page_reclaim.tick() reads this and bypasses its pressure floor.
+        process_guard.wake_state.post_wake_reclaim_until =
+            Some(now_wall + ChronoDuration::seconds(90));
         grace_active = true;
 
         // Reset volatile filter state. Pre-sleep Kalman position +

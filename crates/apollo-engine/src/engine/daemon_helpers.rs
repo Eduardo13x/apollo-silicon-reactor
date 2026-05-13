@@ -405,6 +405,14 @@ pub fn rotate_timeline(path: &Path) {
 pub struct WakeStatePersisted {
     pub last_wake_at: Option<DateTime<Utc>>,
     pub post_wake_grace_until: Option<DateTime<Utc>>,
+    /// 2026-05-12: opposite-of-grace window. After sleep, file-backed page
+    /// cache plus background daemons hold ~1-2 GB on M1 8GB that the user
+    /// already paid for hours ago. This timestamp marks the deadline after
+    /// which the post-wake aggressive purge mode stops bypassing the page
+    /// reclaim pressure gate. Set 30s ahead at wake-detect time; expired
+    /// timestamps are cleared per cycle just like grace.
+    #[serde(default)]
+    pub post_wake_reclaim_until: Option<DateTime<Utc>>,
     pub post_wake_policy: String,
 }
 
@@ -413,6 +421,7 @@ pub struct WakeRuntimeState {
     pub last_cycle_wallclock: DateTime<Utc>,
     pub last_wake_at: Option<DateTime<Utc>>,
     pub post_wake_grace_until: Option<DateTime<Utc>>,
+    pub post_wake_reclaim_until: Option<DateTime<Utc>>,
     pub post_wake_policy: String,
 }
 
@@ -420,6 +429,7 @@ pub fn write_wake_state(path: &Path, state: &WakeRuntimeState) {
     let persisted = WakeStatePersisted {
         last_wake_at: state.last_wake_at,
         post_wake_grace_until: state.post_wake_grace_until,
+        post_wake_reclaim_until: state.post_wake_reclaim_until,
         post_wake_policy: state.post_wake_policy.clone(),
     };
     write_json(path, &persisted, Some(0o600));
@@ -433,6 +443,7 @@ pub fn load_wake_state(path: &Path) -> WakeRuntimeState {
                 last_cycle_wallclock: now,
                 last_wake_at: state.last_wake_at,
                 post_wake_grace_until: state.post_wake_grace_until,
+                post_wake_reclaim_until: state.post_wake_reclaim_until,
                 post_wake_policy: state.post_wake_policy,
             };
         }
@@ -441,6 +452,7 @@ pub fn load_wake_state(path: &Path) -> WakeRuntimeState {
         last_cycle_wallclock: now,
         last_wake_at: None,
         post_wake_grace_until: None,
+        post_wake_reclaim_until: None,
         post_wake_policy: "grace-60s".to_string(),
     }
 }

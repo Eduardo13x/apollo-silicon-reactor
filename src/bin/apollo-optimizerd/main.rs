@@ -2998,10 +2998,28 @@ fn main() -> anyhow::Result<()> {
                 if cycle_count % 10 == 0 {
                     // snapshot.pressure.memory_pressure already includes battery
                     // + thermal boosts via effective_pressure::compute(). Don't add again.
-                    let freed = page_reclaim.tick(
+                    // 2026-05-12: post-wake aggressive purge — when the wake
+                    // handler set `post_wake_reclaim_until` within the last
+                    // 90s, bypass the pressure/foreground gates so stale
+                    // file-backed pages + cold daemon residency get reclaimed
+                    // even though the Kalman pressure reading is cold-start
+                    // noisy. Window auto-expires; this is not a permanent
+                    // override.
+                    let post_wake_reclaim_active = {
+                        let now_wall = chrono::Utc::now();
+                        state
+                            .process
+                            .lock_recover()
+                            .wake_state
+                            .post_wake_reclaim_until
+                            .map(|t| t > now_wall)
+                            .unwrap_or(false)
+                    };
+                    let freed = page_reclaim.tick_with_post_wake(
                         snapshot.pressure.memory_pressure,
                         display_turbo.is_turbo_active() || thermal_action.phase >= apollo_engine::engine::thermal_bailout::CoolingPhase::Phase2Moderate,
                         foreground_idle,
+                        post_wake_reclaim_active,
                     );
                     if freed > 0 {
                         state.metrics.lock_recover().metrics.paging_hints_applied += 1;
@@ -3797,13 +3815,17 @@ fn main() -> anyhow::Result<()> {
                 // Extracted to daemon_chromium_tick::run_chromium_tick (Wave 11).
                 // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
                 let _t_chrom_start = Instant::now();
-                // Media-active signal: any audio flowing (CoreAudio
-                // is_running_somewhere). Includes browser-background streaming,
-                // Spotify, VLC, podcasts in HTML5 audio, etc. The chromium
-                // gate is scoped to INVISIBLE renderers via CGWindowList, so
-                // even a foreground browser tab playing audio is never
-                // demoted/frozen by the media-aware threshold relaxation.
+                // Workload-aware chromium gates. Three independent signals
+                // feed the priority-strict-max chain inside run_chromium_tick:
+                //   media : any audio flowing (CoreAudio).
+                //   build : BuildPhase != Idle (cargo+rustc detected).
+                //   call  : pmset PreventUserIdleSleep + call_app_name match.
+                // The chain in daemon_chromium_tick.rs picks ONE regime —
+                // never additive — so freeze_protected invariants hold.
                 let media_active_chromium = user_context.audio_active;
+                let build_active_chromium = build_tracker.phase
+                    != apollo_engine::engine::build_tracker::BuildPhase::Idle;
+                let call_active_chromium = user_context.call_in_progress;
                 daemon_chromium_tick::run_chromium_tick(
                     &mut chromium_mgr,
                     &focus_markov,
@@ -3820,6 +3842,8 @@ fn main() -> anyhow::Result<()> {
                     signal_digest.swap_velocity_smooth as f32,
                     snapshot.pressure.thrashing_score,
                     media_active_chromium,
+                    build_active_chromium,
+                    call_active_chromium,
                 );
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,

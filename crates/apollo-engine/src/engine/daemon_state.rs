@@ -298,6 +298,7 @@ mod tests {
             last_cycle_wallclock: chrono::Utc::now(),
             last_wake_at: None,
             post_wake_grace_until: None,
+            post_wake_reclaim_until: None,
             post_wake_policy: "normal".to_string(),
         };
         assert_eq!(ws.post_wake_policy, "normal");

@@ -133,6 +133,26 @@ impl PageReclaim {
     ///
     /// Returns bytes freed if a purge was executed, 0 otherwise.
     pub fn tick(&mut self, memory_pressure: f64, display_off: bool, foreground_idle: bool) -> u64 {
+        self.tick_with_post_wake(memory_pressure, display_off, foreground_idle, false)
+    }
+
+    /// Same as [`tick`] but accepts an explicit post-wake aggressive-reclaim
+    /// signal. When `post_wake_reclaim` is true the pressure gate and the
+    /// foreground-interaction gate are both bypassed for this cycle —
+    /// rationale: after sleep, file-backed page cache + stale daemons hold
+    /// 1-2 GB on M1 8GB the user already paid for hours ago, and the user
+    /// is not actively interacting in the first ~90s post-wake (they are
+    /// reading the screen / unlocking / typing password). Caller is
+    /// responsible for clearing the flag after the window expires.
+    /// Cooldown + rate-limit are still respected — purge is expensive and
+    /// post-wake mode should NOT degrade into a purge storm.
+    pub fn tick_with_post_wake(
+        &mut self,
+        memory_pressure: f64,
+        display_off: bool,
+        foreground_idle: bool,
+        post_wake_reclaim: bool,
+    ) -> u64 {
         if !self.is_root {
             return 0; // purge requires root
         }
@@ -152,23 +172,32 @@ impl PageReclaim {
             return 0;
         }
 
-        // Pressure gate: use lower threshold when display is off.
+        // Pressure gate: use lower threshold when display is off. Post-wake
+        // reclaim window bypasses this entirely — we know the user just
+        // woke up and there is stale residency to clean regardless of the
+        // current snapshot pressure (Kalman was reset on wake, so the
+        // pressure reading is cold-start noisy anyway).
         let gate = if display_off {
             PRESSURE_GATE_DISPLAY_OFF
         } else {
             PRESSURE_GATE_INTERACTIVE
         };
 
-        if memory_pressure < gate {
+        if !post_wake_reclaim && memory_pressure < gate {
             return 0;
         }
 
         // Foreground gate: don't purge during active interaction
         // (the 200-500ms stall would be perceptible).
         // Exception: display off = nobody watching, OR critical pressure where
-        // the stall is less harmful than continued swap thrashing.
+        // the stall is less harmful than continued swap thrashing, OR within
+        // the post-wake window (user not yet interacting).
         let critical_override = memory_pressure >= PRESSURE_CRITICAL_OVERRIDE;
-        if !display_off && !foreground_idle && !critical_override {
+        if !display_off
+            && !foreground_idle
+            && !critical_override
+            && !post_wake_reclaim
+        {
             return 0;
         }
 
