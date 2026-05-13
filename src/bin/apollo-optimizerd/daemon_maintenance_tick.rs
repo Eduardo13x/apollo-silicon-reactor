@@ -49,6 +49,41 @@ pub fn run_maintenance_tick(
 ) -> bool {
     state.push_swap_delta(snap.pressure.swap_delta_bytes_per_sec);
 
+    // Gate F (2026-05-12): emergency thrashing-triggered purge bypass.
+    // The normal maintenance gate requires idle_long + 1800s rate-limit,
+    // both legitimate for "background maintenance". But the 180s stress
+    // test revealed Apollo's generic-pressure response gap: thrashing
+    // sustained at 22k while pressure peaked 0.75 (below survival 0.85),
+    // user-visible "system unresponsive" with no Apollo action available.
+    //
+    // Emergency path: thrashing > 25k for ≥3 cycles AND no media/call AND
+    // build_active false → purge bypass with 300s cooldown (not 1800s).
+    // [Camacho 2007] predictive control under sustained flow-crisis must
+    // override level gates that are tuned for level thresholds.
+    let thrash = snap.pressure.thrashing_score;
+    state.push_thrashing(thrash);
+    let emergency = thrash > 25_000.0
+        && state.thrashing_streak_above(15_000.0, 3)
+        && !ctx.audio_active
+        && !ctx.call_in_progress
+        && !ctx.has_sleep_assertion
+        && !build_active
+        && state.secs_since_any_purge() >= 300;
+    if emergency {
+        if std::process::Command::new("purge").spawn().is_ok() {
+            state.mark_purged();
+            lf_metrics
+                .maintenance_purge_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                thrashing = thrash as u64,
+                pressure = snap.pressure.memory_pressure,
+                "maintenance: emergency thrashing-bypass purge"
+            );
+            return true;
+        }
+    }
+
     match should_fire(snap, ctx, state, build_active) {
         None => {
             if std::process::Command::new("purge").spawn().is_ok() {

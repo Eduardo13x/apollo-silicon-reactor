@@ -2926,8 +2926,27 @@ fn main() -> anyhow::Result<()> {
                 // Holt-Winters seasonal forecasting: accumulate samples, observe hourly,
                 // tighten overflow_thresholds proactively.
                 // Extracted to daemon_holt_winters_tick::run_holt_winters_tick (Wave 30).
+                //
+                // 2026-05-12: stage budget watchdog. Under stress (cycle already
+                // > 150ms in REASON), skip the non-critical forecasting +
+                // page-reclaim + chromium ticks for THIS cycle. They tolerate
+                // a skipped cycle (forecaster accumulates samples, page-reclaim
+                // is gated on 10-cycle cadence anyway, chromium has its own
+                // internal grace). The critical path (Sense → Signal → Decide →
+                // Execute → Learn → Persist) always runs. [Hellerstein 2004 §9
+                // — saturation requires graceful degradation, not unbounded
+                // cycle latency that itself becomes a stressor].
+                let stage_budget_exceeded =
+                    _t_reason_start.elapsed().as_millis() > 150;
+                if stage_budget_exceeded {
+                    tracing::info!(
+                        elapsed_ms = _t_reason_start.elapsed().as_millis() as u64,
+                        "cycle: skipping HoltWinters/PageReclaim/Chromium (budget exceeded)"
+                    );
+                }
                 let _t_hw_start = Instant::now();
-                daemon_holt_winters_tick::run_holt_winters_tick(
+                if !stage_budget_exceeded {
+                    daemon_holt_winters_tick::run_holt_winters_tick(
                     snapshot.pressure.memory_pressure,
                     hour_of_day,
                     &mut holt_winters,
@@ -2937,6 +2956,7 @@ fn main() -> anyhow::Result<()> {
                     &state,
                     &mut overflow_thresholds,
                 );
+                }
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonHoltWinters,
                     _t_hw_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
@@ -2995,7 +3015,7 @@ fn main() -> anyhow::Result<()> {
                 // Jiang & Zhang 2005 — proactive beats reactive by 20-40%.
                 // Runs every 10 cycles (~5s) to avoid vm_stat overhead every cycle.
                 let _t_pr_start = Instant::now();
-                if cycle_count % 10 == 0 {
+                if cycle_count % 10 == 0 && !stage_budget_exceeded {
                     // snapshot.pressure.memory_pressure already includes battery
                     // + thermal boosts via effective_pressure::compute(). Don't add again.
                     // 2026-05-12: post-wake aggressive purge — when the wake
@@ -3815,6 +3835,17 @@ fn main() -> anyhow::Result<()> {
                 // Extracted to daemon_chromium_tick::run_chromium_tick (Wave 11).
                 // [Denning 1968] Working Set | [Jones 2011] Chromium Multi-Process Architecture
                 let _t_chrom_start = Instant::now();
+                // Stage budget watchdog: skip chromium tick if cycle already
+                // exceeded 150ms in REASON. Chromium manager tolerates skipped
+                // cycles (it polls every cycle but doesn't decay state per
+                // cycle). Skipping here under stress prevents the daemon's
+                // own latency from compounding.
+                if stage_budget_exceeded {
+                    lf_metrics.record_stage(
+                        apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
+                        0,
+                    );
+                } else {
                 // Workload-aware chromium gates. Three independent signals
                 // feed the priority-strict-max chain inside run_chromium_tick:
                 //   media : any audio flowing (CoreAudio).
@@ -3877,6 +3908,7 @@ fn main() -> anyhow::Result<()> {
                     apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
                     _t_chrom_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
+                } // close `else` from stage budget watchdog (chromium tick)
 
                 // F1: Causal attribution for velocity-anticipatory purges
                 // [Pearl 2009] interventional reasoning. Without this the
@@ -4686,6 +4718,10 @@ fn main() -> anyhow::Result<()> {
                   // fresh. Feeds 8 cognitive modules. Result stored in prev_cog_decision
                   // for gating next-cycle learning and current-cycle metrics.
                   // Extracted to daemon_neuro_tick::run_neurocognitive_tick (Wave 8).
+                // 2026-05-12: ReasonNeuro stage instrumentation. Was the
+                // largest unmeasured chunk of REASON — blind spot when
+                // p95 spikes under stress.
+                let _t_neuro_start = Instant::now();
                 let cog_decision = daemon_neuro_tick::run_neurocognitive_tick(
                     &mut lctx,
                     &mut cognitive_state,
@@ -4693,6 +4729,10 @@ fn main() -> anyhow::Result<()> {
                     &signal_digest,
                     &throttle_names_for_outcome,
                     workload_mode.as_str(),
+                );
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::ReasonNeuro,
+                    _t_neuro_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
                 prev_cog_decision = Some(cog_decision);
                 // LlmConfig live-reload: whitelisted fields only; skip if trial active

@@ -25,6 +25,13 @@ pub struct MaintenanceState {
 
     #[serde(skip)]
     pub last_wake_at: Option<Instant>,
+
+    /// 2026-05-12 Gate F: count of consecutive cycles with thrashing_score
+    /// above the "sustained flow crisis" threshold. Increments when thrash
+    /// > 15_000, resets to 0 below. Reaches ≥3 → emergency purge bypass.
+    /// Skipped from persistence — re-initializes to 0 per daemon restart.
+    #[serde(skip)]
+    pub consecutive_thrash_cycles: u32,
 }
 
 impl MaintenanceState {
@@ -61,6 +68,24 @@ impl MaintenanceState {
 
     pub fn push_swap_delta(&mut self, delta_bps: f64) {
         self.swap_delta_window.push(SystemTime::now(), delta_bps);
+    }
+
+    /// 2026-05-12 Gate F: track sustained thrashing via consecutive-cycle
+    /// streak (matches the "≥3 cycles" gating in run_maintenance_tick).
+    pub fn push_thrashing(&mut self, thrash: f64) {
+        if thrash > 15_000.0 {
+            self.consecutive_thrash_cycles =
+                self.consecutive_thrash_cycles.saturating_add(1);
+        } else {
+            self.consecutive_thrash_cycles = 0;
+        }
+    }
+
+    pub fn thrashing_streak_above(&self, _threshold: f64, min_cycles: u32) -> bool {
+        // _threshold parameter retained for API extensibility but the actual
+        // streak threshold is fixed at 15k in push_thrashing — caller passes
+        // the same value for documentation clarity.
+        self.consecutive_thrash_cycles >= min_cycles
     }
 
     pub fn mark_purged(&mut self) {
