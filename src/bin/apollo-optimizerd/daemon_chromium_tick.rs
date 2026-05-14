@@ -106,28 +106,41 @@ pub fn run_chromium_tick(
     //
     // CGWindowList visibility gate (chromium_manager.rs:919) ensures
     // foreground/visible tabs are NEVER demoted/frozen regardless of regime.
-    // 2026-05-13: thrashing gates raised significantly per user report
-    // "tabs frozen / slow to thaw". Original thresholds (5k-10k) triggered
-    // SIGSTOP on routine thrashing spikes — Brave's IPC architecture
-    // can't recover gracefully (the original regression that motivated
-    // commit 712b927 permanent disable). New thresholds make SIGSTOP
-    // genuinely emergency-only: thrashing must be 5-10× crisis level,
-    // i.e., the kernel is already paging hard and the user feels stall
-    // either way. Pressure gates untouched — they were already in the
-    // "real crisis" zone.
-    let (pressure_gate, thrashing_gate, regime) = if call_in_progress {
-        (0.55, 25_000.0, "call")
-    } else if llm_active {
-        (0.60, 30_000.0, "llm")
-    } else if media_active {
-        (0.60, 30_000.0, "media")
-    } else if build_active {
-        (0.65, 35_000.0, "build")
-    } else if external_4k_attached {
-        (0.65, 35_000.0, "external_4k")
-    } else {
-        (0.75, 50_000.0, "default")
-    };
+    // 2026-05-13 FINAL: SIGSTOP path PERMANENTLY DISABLED for chromium
+    // renderers. User confirmed (multiple report cycles in this session)
+    // that ANY threshold tuning still produces "tabs frozen, won't
+    // resume, eventually crashed" — the historical regression that
+    // motivated commit 712b927 (2026-04-17 permanent disable).
+    //
+    // Root cause is architectural per NotebookLM institutional memory:
+    //   Brave's main process retries IPC to frozen renderers with no
+    //   way for Apollo to intercept the timeout. The browser's own
+    //   watchdog kills the tab before SIGCONT can land. No threshold
+    //   makes this safe.
+    //
+    // Step 1 paths (DemoteToEcores + PurgePurgeable) remain ACTIVE —
+    // they are scheduling/RAM hints, not freezes, and have no IPC
+    // interaction risk. jetsam BACKGROUND demote under survival mode
+    // (commit 59b449d) still handles real OOM via kernel-managed
+    // discard. Maintenance Purge Gate (commit 41cf1161) cleans
+    // pre-emptively at moderate pressure to prevent reaching the
+    // crisis zone where Step 2 used to fire.
+    //
+    // Gate values below are kept (as comment) for future reference
+    // if a non-SIGSTOP "freeze" mechanism becomes available (e.g.,
+    // browser cooperation via CDP, Accessibility API).
+    let _regime_history = (
+        ("call",        0.55, 25_000.0),
+        ("llm",         0.60, 30_000.0),
+        ("media",       0.60, 30_000.0),
+        ("build",       0.65, 35_000.0),
+        ("external_4k", 0.65, 35_000.0),
+        ("default",     0.75, 50_000.0),
+    );
+    let _ = (call_in_progress, llm_active, media_active, build_active, external_4k_attached);
+    // Effective: chromium SIGSTOP unconditionally disabled.
+    let (pressure_gate, thrashing_gate, regime): (f64, f64, &str) =
+        (f64::INFINITY, f64::INFINITY, "disabled");
     // Surface regime for observability — silent regression to "default"
     // under crisis would otherwise be invisible.
     {
