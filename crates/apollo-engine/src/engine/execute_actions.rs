@@ -955,6 +955,17 @@ pub fn execute_actions(
             None => reason,
         };
 
+        // 2026-05-14: suppress sysctl-noop entries from journal flood.
+        // network_optimizer (main.rs:3726) emits 4 sysctls every 30 cycles
+        // without consulting the live kernel value; execute detects noop
+        // and would otherwise write a `skip:sysctl-noop:KEY=VAL` line on
+        // every cycle. These entries are non-actionable telemetry noise
+        // — the journal is for OUTCOMES, not for "we tried but the kernel
+        // already had the right value". Drop them at the journal boundary.
+        if journal_reason.starts_with("skip:sysctl-noop:") {
+            continue;
+        }
+
         pending_journal.push(JournalEntry {
             timestamp: Utc::now(),
             action,

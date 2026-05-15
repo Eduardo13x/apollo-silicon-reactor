@@ -973,12 +973,10 @@ pub struct RuntimeMetrics {
     pub invalid_sysctl_value_denied: u64,
     #[serde(default)]
     pub journal_rotations: u64,
-    #[serde(default)]
-    pub symlink_attacks_blocked: u64,
-    #[serde(default)]
-    pub policy_patterns_rejected: u64,
-    #[serde(default)]
-    pub request_size_exceeded: u64,
+    // 2026-05-14: removed dead security counters (symlink_attacks_blocked,
+    // policy_patterns_rejected, request_size_exceeded) — declared but no
+    // writer in production code. `serde(default)` makes runtime_metrics.json
+    // parsing from older daemon versions still work (extras ignored).
     // Overflow guard metrics
     #[serde(default)]
     pub overflow_events_total: u64,
@@ -1111,6 +1109,13 @@ pub struct RuntimeMetrics {
     pub smc_charger_watts: Option<f64>,
     #[serde(default)]
     pub smc_battery_tte_min: Option<u16>,
+    /// 2026-05-14: SMC reader bit-rotted on macOS 26 Tahoe (AppleSMC userclient
+    /// changed; smc_bridge.c keys unreadable). Field surfaces the failure mode
+    /// so the dashboard reflects reality instead of silent nulls. One of:
+    /// "ok" (live data), "unavailable_macos26" (SMC bridge broken),
+    /// "uninitialized" (daemon just started).
+    #[serde(default)]
+    pub smc_diagnostic: String,
     // KPC hardware performance counters
     #[serde(default)]
     pub kpc_ipc: f64,

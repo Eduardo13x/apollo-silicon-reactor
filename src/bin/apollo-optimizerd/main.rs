@@ -2284,7 +2284,13 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.process_tree_groups = process_tree.group_count();
                     metrics.metrics.process_tree_total = process_tree.len();
 
-                    // IOReport hardware telemetry.
+                    // IOReport hardware telemetry — DEPRECATED on macOS 26+
+                    // (requires Apple-private entitlements unavailable to
+                    // third-party binaries). When subscription is None, fall
+                    // back to sysinfo aggregate CPU% + SMC power for schema
+                    // stability; P/E cluster split is lost but downstream
+                    // consumers (`dram_bw_pct`, AMC bandwidth fallback) all
+                    // already document this regression class.
                     if let Some(ref ir) = last_ioreport {
                         metrics.metrics.ioreport_p_cluster_pct = ir.p_cluster_pct;
                         metrics.metrics.ioreport_e_cluster_pct = ir.e_cluster_pct;
@@ -2292,10 +2298,28 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.ioreport_ane_busy = ir.ane_busy;
                         metrics.metrics.ioreport_cpu_mw = ir.cpu_mw;
                         metrics.metrics.ioreport_total_watts = ir.total_watts();
+                    } else {
+                        let cpu_frac = (metrics.metrics.cpu_mean_busy).clamp(0.0, 1.0);
+                        metrics.metrics.ioreport_p_cluster_pct = cpu_frac;
+                        metrics.metrics.ioreport_total_watts = last_smc
+                            .as_ref()
+                            .and_then(|s| s.system_power_watts)
+                            .unwrap_or(0.0);
                     }
 
-                    // SMC direct metrics
+                    // SMC direct metrics. 2026-05-14: bit-rotted on macOS 26
+                    // Tahoe — AppleSMC userclient struct layout changed.
+                    // smc_diagnostic surfaces the failure mode so dashboards
+                    // can distinguish "sensor returned 0" from "sensor broken".
                     if let Some(ref smc) = last_smc {
+                        let any_read = smc.cpu_temp_celsius.is_some()
+                            || smc.gpu_temp_celsius.is_some()
+                            || smc.system_power_watts.is_some();
+                        metrics.metrics.smc_diagnostic = if any_read {
+                            "ok".to_string()
+                        } else {
+                            "unavailable_macos26".to_string()
+                        };
                         metrics.metrics.smc_system_power_watts = smc.system_power_watts;
                         metrics.metrics.smc_lid_closed = smc.lid_closed;
                         metrics.metrics.smc_charger_watts = smc.charger_watts;
