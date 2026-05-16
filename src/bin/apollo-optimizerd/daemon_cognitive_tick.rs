@@ -118,18 +118,21 @@ pub struct SpecialistVotingOutput {
 /// multiplicative factor for non-Observe specialist votes:
 ///
 /// * `None`          → `1.0` (no reliable evidence yet — leave votes neutral)
-/// * `Some(0.0)`     → `0.7` (max damp: all matched skills failed)
-/// * `Some(0.5)`     → `1.0` (neutral: 50/50 history)
-/// * `Some(1.0)`     → `1.3` (max boost: all matched skills succeeded)
+/// * `Some(0.0)`     → `0.85` (max damp: all matched skills failed)
+/// * `Some(0.5)`     → `1.00` (neutral: 50/50 history)
+/// * `Some(1.0)`     → `1.15` (max boost: all matched skills succeeded)
 ///
-/// The 0.7–1.3 band is intentionally narrow — skills add a tilt, not a veto.
-/// Specialists keep their causal authority (signal + physics boosts); the
-/// skill signal only adjusts how much the ensemble trusts their proposals
-/// in the current workload context. [Sutton 2018 §2.5 — pessimism initialisation]
+/// Band intentionally narrow ([0.85, 1.15]) after NotebookLM 2026-05-16 adversarial
+/// review: a wider [0.7, 1.3] band stacks multiplicatively with
+/// `SpecialistAccuracyTracker::weight()` (≈0.6–1.0) and the per-specialist signal
+/// (0.0–1.0) into a "cascade attenuation" — three factors at low end produce
+/// ≈0.33, dragging votes below the disagreement-safety floor and forcing Observe
+/// on M1 8GB regardless of physical pressure. ±15% keeps the tilt informative
+/// without losing dynamic range. [Sutton 2018 §2.5 — pessimism initialisation]
 #[inline]
 fn skill_aware_factor(signal: Option<f32>) -> f64 {
     match signal {
-        Some(s) => 0.7 + 0.6 * (s as f64),
+        Some(s) => 0.85 + 0.30 * (s as f64),
         None => 1.0,
     }
 }
@@ -328,10 +331,16 @@ pub fn apply_specialist_voting(
         lctx.skill_registry.workload_success_signal(workload_mode.as_str()),
     );
     if (skill_factor - 1.0).abs() > f64::EPSILON {
+        let mut modulated = 0_u64;
         for v in votes.iter_mut() {
             if v.intervention != Intervention::Observe {
                 v.confidence = (v.confidence * skill_factor).clamp(0.0, 1.0);
+                modulated += 1;
             }
+        }
+        if modulated > 0 {
+            apollo_engine::engine::lse_counters::LSE_COUNTERS
+                .add_skill_aware_modulations(modulated);
         }
     }
 
@@ -568,13 +577,13 @@ mod tests {
     }
 
     #[test]
-    fn skill_aware_factor_full_failure_damps_to_07() {
-        assert!((skill_aware_factor(Some(0.0)) - 0.7).abs() < 1e-9);
+    fn skill_aware_factor_full_failure_damps_to_085() {
+        assert!((skill_aware_factor(Some(0.0)) - 0.85).abs() < 1e-9);
     }
 
     #[test]
-    fn skill_aware_factor_full_success_boosts_to_13() {
-        assert!((skill_aware_factor(Some(1.0)) - 1.3).abs() < 1e-9);
+    fn skill_aware_factor_full_success_boosts_to_115() {
+        assert!((skill_aware_factor(Some(1.0)) - 1.15).abs() < 1e-9);
     }
 
     #[test]

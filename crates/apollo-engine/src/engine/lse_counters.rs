@@ -160,6 +160,15 @@ pub struct LockFreeMetrics {
     pub taskinfo_cache_exit_invalidations: AtomicU64,
     pub taskinfo_cache_cap_evictions: AtomicU64,
 
+    /// Phase 3.1 — Skill-Aware Prediction observability (Sprint 6, 2026-05-16).
+    /// Incremented each time a non-Observe specialist vote is multiplied by a
+    /// non-neutral `skill_aware_factor`. Dashboards compute the "tilt rate" as
+    /// `skill_aware_modulations_total / (cycles × avg_non_observe_votes)`.
+    /// NotebookLM 2026-05-16 flagged the absence of this counter as the same
+    /// "tautology trap" we hit with the F1-F7 shadow-mode: a feature wired in
+    /// without a measurement of whether it actually changed any decision.
+    pub skill_aware_modulations_total: AtomicU64,
+
     /// Phase 0 lock-decomposition instrumentation (2026-05-10).
     /// Tracks contention on the `state.metrics` god-lock to decide whether
     /// decomposition will actually move p95. Per NotebookLM round-3:
@@ -292,6 +301,7 @@ impl LockFreeMetrics {
             taskinfo_cache_misses: AtomicU64::new(0),
             taskinfo_cache_exit_invalidations: AtomicU64::new(0),
             taskinfo_cache_cap_evictions: AtomicU64::new(0),
+            skill_aware_modulations_total: AtomicU64::new(0),
             metrics_lock_wait_total_ns: AtomicU64::new(0),
             metrics_lock_wait_count: AtomicU64::new(0),
             metrics_lock_wait_max_ns: AtomicU64::new(0),
@@ -649,6 +659,9 @@ impl LockFreeMetrics {
             taskinfo_cache_cap_evictions: self
                 .taskinfo_cache_cap_evictions
                 .load(Ordering::Relaxed),
+            skill_aware_modulations_total: self
+                .skill_aware_modulations_total
+                .load(Ordering::Relaxed),
             profile_floor_hits: self.profile_floor_hits.load(Ordering::Relaxed),
             iokit_errors: self.iokit_errors.load(Ordering::Relaxed),
             reactor_pulses: self.reactor_pulses.load(Ordering::Relaxed),
@@ -673,6 +686,16 @@ impl LockFreeMetrics {
     }
     pub fn add_taskinfo_cache_cap_evictions(&self, n: u64) {
         self.taskinfo_cache_cap_evictions
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Phase 3.1 — Skill-Aware Prediction observability hook.
+    /// Call once per non-Observe specialist vote whose confidence was
+    /// modulated by a non-neutral `skill_aware_factor`. Used by
+    /// dashboards to verify the feature is actually influencing decisions
+    /// rather than no-op'ing on neutral signal (`None → 1.0`).
+    pub fn add_skill_aware_modulations(&self, n: u64) {
+        self.skill_aware_modulations_total
             .fetch_add(n, Ordering::Relaxed);
     }
 }
@@ -742,6 +765,7 @@ pub struct MetricsSnapshot {
     pub taskinfo_cache_misses: u64,
     pub taskinfo_cache_exit_invalidations: u64,
     pub taskinfo_cache_cap_evictions: u64,
+    pub skill_aware_modulations_total: u64,
     pub profile_floor_hits: u64,
     pub iokit_errors: u64,
     pub reactor_pulses: u64,
