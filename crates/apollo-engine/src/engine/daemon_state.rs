@@ -133,6 +133,17 @@ impl MetricsState {
             lf.maintenance_purge_skipped_build_mode_total;
         self.metrics.maintenance_purge_skipped_rate_limit_total =
             lf.maintenance_purge_skipped_rate_limit_total;
+
+        // Phase 4.2 — External-event causal attribution (Sprint 7, 2026-05-16).
+        // Surface per-kind blame totals so runtime_metrics.json shows how
+        // many recent pressure-drop edges had their credit confounded by
+        // thermal / disk / network events. The wiring of producers
+        // (CausalGraph::record_external_event call sites) is deferred to a
+        // follow-up commit; today these counters can only increase via
+        // tests, so prod values will be 0 until producers land.
+        self.metrics.causal_external_thermal_blames_total = lf.causal_external_thermal_blames_total;
+        self.metrics.causal_external_disk_blames_total = lf.causal_external_disk_blames_total;
+        self.metrics.causal_external_net_blames_total = lf.causal_external_net_blames_total;
     }
 }
 

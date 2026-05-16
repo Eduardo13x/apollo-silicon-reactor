@@ -1592,6 +1592,19 @@ pub struct RuntimeMetrics {
     pub maintenance_purge_skipped_build_mode_total: u64,
     #[serde(default)]
     pub maintenance_purge_skipped_rate_limit_total: u64,
+
+    /// Phase 4.2 — External-event causal attribution counters (Sprint 7,
+    /// 2026-05-16). Cumulative count of causal edges whose `pressure_drop`
+    /// credit is confounded by a recent external event firing inside
+    /// `EXTERNAL_BLAME_WINDOW` (10s). Operators read these to detect
+    /// "Apollo claiming credit for thermal/IO-driven pressure drops".
+    /// [Pearl 2009 §4] / [Rubin 1974].
+    #[serde(default)]
+    pub causal_external_thermal_blames_total: u64,
+    #[serde(default)]
+    pub causal_external_disk_blames_total: u64,
+    #[serde(default)]
+    pub causal_external_net_blames_total: u64,
 }
 
 impl RuntimeMetrics {

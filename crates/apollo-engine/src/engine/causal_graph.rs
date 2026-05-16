@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
 
 /// Hard cap for in-cycle edge count. Raised from 500 → 1500 after canary
 /// telemetry showed the graph was saturating immediately, causing edges to be
@@ -25,6 +26,60 @@ use std::collections::HashMap;
 /// causal evaluation. Sub-microsecond compaction (0.000375ms) confirms this is
 /// safe for CPU budget. [Cormen et al. 2009] §11 — bounded HashMap.
 pub const HOT_PATH_EDGE_CAP: usize = 1500;
+
+/// Phase 4.2 — External-event blame window (Sprint 7, 2026-05-16).
+///
+/// When an external systemic event (thermal throttle, disk I/O spike,
+/// network latency jump) precedes an Apollo action within this window,
+/// the causal edge produced by the action is tagged with `external_blame`.
+/// Tagged edges are surfaced via [`CausalGraph::recent_external_attributions`]
+/// so downstream confidence/impact computations can discount actions whose
+/// apparent pressure reduction is confounded by the external event.
+///
+/// [Pearl 2009 §4] interventional vs observational: without isolating
+/// external common causes, action attribution conflates "what we did" with
+/// "what the environment did anyway".
+/// [Rubin 1974] potential outcomes: a confounded effect is not a treatment
+/// effect — the counterfactual where Apollo did nothing must be considered.
+pub const EXTERNAL_BLAME_WINDOW: Duration = Duration::from_secs(10);
+
+/// Cap on the external-event ring buffer. O(1) amortized append, bounded
+/// memory. Sized so a daemon emitting one event per cycle (~500ms cadence)
+/// retains ≈ 50s of history, comfortably > [`EXTERNAL_BLAME_WINDOW`].
+pub const EXTERNAL_RING_CAP: usize = 100;
+
+/// Cap on how many recent edges are scanned by
+/// [`CausalGraph::recent_external_attributions`]. Matches `EXTERNAL_RING_CAP`
+/// so the accessor reports counts over the same logical horizon as the
+/// blame window.
+const RECENT_EDGES_FOR_ATTRIBUTION: usize = 100;
+
+/// Phase 4.2 — Class of external systemic event that can confound Apollo's
+/// causal attribution. These are NOT Apollo actions; they are environmental
+/// observables that drive pressure independently of any decision the daemon
+/// makes. Recording them via [`CausalGraph::record_external_event`] enables
+/// follow-up actions to be tagged with `external_blame` so dashboards and
+/// downstream scoring can discount confounded edges.
+///
+/// [Pearl 2009 §4] — exogenous events form the "U" set in a causal model;
+/// failing to condition on them inflates apparent action effects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ExternalEventKind {
+    /// Thermal pressure forced an SoC clock-down (and therefore a "natural"
+    /// pressure drop) — usually visible through IOKit thermal state or the
+    /// pmset throttling flag. Wiring point: `thermal_manager` /
+    /// `apple_owned::thermal` (deferred).
+    ThermalThrottle,
+    /// Sustained disk I/O wait completed (e.g., Spotlight indexer reaching
+    /// a quiescent window, or a Time Machine snapshot finishing). Wiring
+    /// point: `background_collectors::disk` / `mach_pressure` (deferred).
+    DiskIOSpike,
+    /// Network latency or throughput jumped (Wi-Fi handoff, VPN reconnect,
+    /// captive-portal redirect) creating user-perceived stall coincident
+    /// with a real pressure drop driven by Brave/Chromium tab swap.
+    /// Wiring point: `network_optimizer` (deferred).
+    NetworkLatencySpike,
+}
 
 /// A causal edge: action X caused outcome Y with measured confidence.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,6 +109,22 @@ pub struct CausalEdge {
     /// Tracks EMA of RSS delta, CPU delta, and swap delta per edge.
     /// [Pearl 2009] Ch.3 — mediation analysis: identify causal pathways.
     pub mechanism: MechanismAttribution,
+    /// Phase 4.2 — external-event blame tag (Sprint 7).
+    ///
+    /// When an external systemic event (thermal throttle, disk-I/O spike,
+    /// network latency jump) preceded this action within
+    /// [`EXTERNAL_BLAME_WINDOW`], the edge is tagged here so downstream
+    /// scoring can recognize that the observed pressure drop may be a
+    /// confounded effect, not a treatment effect.
+    ///
+    /// `None` = no recent external event (clean attribution).
+    /// `Some(kind)` = attribution is suspect; the indicated environment
+    /// event likely confounds the apparent action effect.
+    /// [Pearl 2009 §4] interventional vs observational distinction.
+    /// [Rubin 1974] potential outcomes — confounded effects are not
+    /// treatment effects.
+    #[serde(default)]
+    pub external_blame: Option<ExternalEventKind>,
 }
 
 /// Tracks WHICH resource changed when an action was effective.
@@ -111,6 +182,7 @@ impl CausalEdge {
             slow_confidence: 0.5,
             slow_avg_delta: 0.0,
             mechanism: MechanismAttribution::default(),
+            external_blame: None,
         }
     }
 
@@ -194,6 +266,22 @@ struct PendingAction {
     cycle: u64,
     /// Resource snapshot at action time — for mechanism attribution.
     resources: ResourceSnapshot,
+    /// Phase 4.2 — external-event blame captured at record time.
+    /// `Some(kind)` iff an external event fired within
+    /// [`EXTERNAL_BLAME_WINDOW`] *before* the action was recorded.
+    external_blame: Option<ExternalEventKind>,
+}
+
+/// Phase 4.2 — Entry in the external-event ring buffer.
+#[derive(Clone, Copy)]
+struct ExternalEventRecord {
+    kind: ExternalEventKind,
+    /// Wall-clock time the external event fired.
+    at: SystemTime,
+    /// Pressure observed when the event was reported (informational —
+    /// kept for future debrief / heatmap surfaces).
+    #[allow(dead_code)]
+    pressure_before: f64,
 }
 
 /// Causal graph tracking action → outcome relationships.
@@ -210,6 +298,17 @@ pub struct CausalGraph {
     eval_delay: u8,
     /// Counter for edges evicted due to hot-path capacity limits.
     evictions_total: u64,
+    /// Phase 4.2 — bounded ring buffer of recent external events.
+    /// Capped at [`EXTERNAL_RING_CAP`]. O(1) amortized append: when full
+    /// we shift the oldest entry out (since cap is small, this is fine).
+    /// Stored most-recent-last so a backward scan finds the freshest first.
+    external_events: Vec<ExternalEventRecord>,
+    /// Phase 4.2 — chronological log of external-blame tags emitted onto
+    /// edges. Capped at [`RECENT_EDGES_FOR_ATTRIBUTION`] entries. The
+    /// accessor [`CausalGraph::recent_external_attributions`] aggregates
+    /// this into per-kind counts so dashboards can answer "how many of
+    /// our recent attributions are confounded?".
+    recent_external_taints: Vec<ExternalEventKind>,
 }
 
 const EFFECT_PRESSURE_DROP: &str = "pressure_drop";
@@ -225,7 +324,100 @@ impl CausalGraph {
             pending_slow: Vec::new(),
             eval_delay: 3,
             evictions_total: 0,
+            external_events: Vec::new(),
+            recent_external_taints: Vec::new(),
         }
+    }
+
+    /// Phase 4.2 — Record an external systemic event (thermal throttle,
+    /// disk-I/O spike, network latency jump). Subsequent actions recorded
+    /// within [`EXTERNAL_BLAME_WINDOW`] inherit this event as their
+    /// `external_blame` tag.
+    ///
+    /// Bounded work: O(1) amortized. The ring buffer is capped at
+    /// [`EXTERNAL_RING_CAP`]; on overflow the oldest entry is removed.
+    ///
+    /// **Wiring**: this method is intentionally **not** called from the
+    /// daemon in Phase 4.2's first commit — observability for the three
+    /// signals lives in separate modules (thermal: `apple_owned`/
+    /// `thermal_manager`; disk: `background_collectors`; network:
+    /// `network_optimizer`). Wiring is deferred to a follow-up commit to
+    /// keep blast radius contained.
+    ///
+    /// [Pearl 2009 §4] register exogenous events so they can be
+    /// conditioned on; otherwise effect estimates are biased.
+    pub fn record_external_event(
+        &mut self,
+        kind: ExternalEventKind,
+        pressure_before: f64,
+        ts: SystemTime,
+    ) {
+        // Drop oldest if we'd exceed the cap (preserve chronological order).
+        if self.external_events.len() >= EXTERNAL_RING_CAP {
+            self.external_events.remove(0);
+        }
+        self.external_events.push(ExternalEventRecord {
+            kind,
+            at: ts,
+            pressure_before,
+        });
+    }
+
+    /// Phase 4.2 — Find the most recent external event still within
+    /// [`EXTERNAL_BLAME_WINDOW`] of `now`. Returns `None` when the buffer
+    /// is empty or all entries are stale.
+    ///
+    /// Backwards scan: typical N is small (≤100) and most-recent-last
+    /// ordering means we usually exit on the first iteration.
+    fn external_blame_for(&self, now: SystemTime) -> Option<ExternalEventKind> {
+        for rec in self.external_events.iter().rev() {
+            match now.duration_since(rec.at) {
+                Ok(age) if age <= EXTERNAL_BLAME_WINDOW => return Some(rec.kind),
+                Ok(_) => return None, // past the window; older entries are even older
+                Err(_) => continue,   // clock skew (rec.at > now) — skip
+            }
+        }
+        None
+    }
+
+    /// Phase 4.2 — Aggregate counts of external-blame tags emitted onto
+    /// the last [`RECENT_EDGES_FOR_ATTRIBUTION`] tainted edges. Surfaces
+    /// for runtime-metrics dashboards.
+    ///
+    /// Returns a `Vec<(kind, count)>` rather than a HashMap so callers can
+    /// rely on a stable ordering and don't need to import the enum just
+    /// to iterate.
+    pub fn recent_external_attributions(&self) -> Vec<(ExternalEventKind, u32)> {
+        let mut thermal = 0u32;
+        let mut disk = 0u32;
+        let mut net = 0u32;
+        for k in &self.recent_external_taints {
+            match k {
+                ExternalEventKind::ThermalThrottle => thermal += 1,
+                ExternalEventKind::DiskIOSpike => disk += 1,
+                ExternalEventKind::NetworkLatencySpike => net += 1,
+            }
+        }
+        let mut out = Vec::with_capacity(3);
+        if thermal > 0 {
+            out.push((ExternalEventKind::ThermalThrottle, thermal));
+        }
+        if disk > 0 {
+            out.push((ExternalEventKind::DiskIOSpike, disk));
+        }
+        if net > 0 {
+            out.push((ExternalEventKind::NetworkLatencySpike, net));
+        }
+        out
+    }
+
+    /// Phase 4.2 — internal helper to push a taint record, bounded by
+    /// [`RECENT_EDGES_FOR_ATTRIBUTION`].
+    fn note_external_taint(&mut self, kind: ExternalEventKind) {
+        if self.recent_external_taints.len() >= RECENT_EDGES_FOR_ATTRIBUTION {
+            self.recent_external_taints.remove(0);
+        }
+        self.recent_external_taints.push(kind);
     }
 
     /// Record that an action was taken on a process/group.
@@ -237,6 +429,12 @@ impl CausalGraph {
     /// Record action with resource snapshot for mechanism attribution.
     /// [Pearl 2009] Ch.3 mediation: track resource channels (RSS, CPU, swap)
     /// to learn WHY an action was effective, not just WHETHER.
+    ///
+    /// Phase 4.2: also captures any external event still inside
+    /// [`EXTERNAL_BLAME_WINDOW`]. The captured tag flows through both the
+    /// fast and slow `PendingAction` queues so the resulting edge is
+    /// marked `external_blame: Some(kind)` regardless of which horizon
+    /// produced the credit.
     pub fn record_action_with_resources(
         &mut self,
         action_key: &str,
@@ -244,11 +442,13 @@ impl CausalGraph {
         cycle: u64,
         resources: ResourceSnapshot,
     ) {
+        let external_blame = self.external_blame_for(SystemTime::now());
         let action = PendingAction {
             action_key: action_key.to_string(),
             pressure_at_action: pressure,
             cycle,
             resources: resources.clone(),
+            external_blame,
         };
         self.pending.push(action.clone());
         self.pending_slow.push(action);
@@ -280,6 +480,11 @@ impl CausalGraph {
         current_cycle: u64,
         current_resources: &ResourceSnapshot,
     ) {
+        // Phase 4.2 — collect blame tags here, apply after the borrow ends.
+        // We can't call `&mut self.note_external_taint(...)` while a
+        // `&mut edge` borrow of `self.edges` is live, so batch and replay.
+        let mut blame_to_note: Vec<ExternalEventKind> = Vec::new();
+
         // ── Fast horizon: 3 cycles (~1.5s) ──────────────────────────────────
         let delay = self.eval_delay as u64;
         let mut i = 0;
@@ -323,6 +528,18 @@ impl CausalGraph {
                         .observe(rss_d.max(0.0), cpu_d.max(0.0), swap_d.max(0.0));
                 }
 
+                // Phase 4.2 — propagate external blame onto the resulting
+                // pressure_drop edge. We tag only the pressure_drop edge
+                // (the "we caused a drop" claim is what the blame
+                // discounts); pressure_no_change edges are not a credit we
+                // are confusing with external behaviour.
+                if effect == EFFECT_PRESSURE_DROP {
+                    if let Some(kind) = pending.external_blame {
+                        edge.external_blame = Some(kind);
+                        blame_to_note.push(kind);
+                    }
+                }
+
                 let anti_key = (pending.action_key, anti_effect.to_string());
                 self.edges
                     .entry(anti_key)
@@ -352,8 +569,37 @@ impl CausalGraph {
                     .entry(drop_key)
                     .or_insert_with(|| CausalEdge::new(&pending.action_key, EFFECT_PRESSURE_DROP));
                 edge.update_slow(was_effective, delta.max(0.0));
+
+                // Phase 4.2 — slow-horizon edges inherit blame too. The
+                // 15-cycle (~7.5s) drop is just as confounded as the fast
+                // drop when the external event preceded the action. Avoid
+                // double-counting if the fast horizon already tagged.
+                if was_effective {
+                    if let Some(kind) = pending.external_blame {
+                        if edge.external_blame.is_none() {
+                            edge.external_blame = Some(kind);
+                            blame_to_note.push(kind);
+                        }
+                    }
+                }
             } else {
                 j += 1;
+            }
+        }
+
+        // Phase 4.2 — bookkeeping after edge borrows are dropped.
+        for kind in blame_to_note {
+            self.note_external_taint(kind);
+            match kind {
+                ExternalEventKind::ThermalThrottle => {
+                    crate::engine::lse_counters::LSE_COUNTERS.inc_causal_external_thermal_blame();
+                }
+                ExternalEventKind::DiskIOSpike => {
+                    crate::engine::lse_counters::LSE_COUNTERS.inc_causal_external_disk_blame();
+                }
+                ExternalEventKind::NetworkLatencySpike => {
+                    crate::engine::lse_counters::LSE_COUNTERS.inc_causal_external_net_blame();
+                }
             }
         }
 
@@ -1379,6 +1625,165 @@ mod tests {
         assert!(
             !g.prefer_qos_over_sigstop("unknown_process"),
             "no causal data should default to SIGSTOP (conservative)"
+        );
+    }
+
+    // ── Phase 4.2 — External-event causal attribution tests ────────────────
+    //
+    // Contract: when an external event (thermal, disk, network) fires
+    // within `EXTERNAL_BLAME_WINDOW` BEFORE an Apollo action that ends up
+    // being credited with a pressure drop, the resulting CausalEdge MUST
+    // carry `external_blame: Some(kind)` so downstream confidence scoring
+    // can recognize the credit is confounded.
+    //
+    // [Pearl 2009 §4] — without conditioning on the exogenous event, the
+    // edge represents observational correlation, not interventional
+    // effect; the blame tag is what makes the distinction visible.
+
+    /// External event fires; action recorded inside the 10s window; the
+    /// resulting pressure_drop edge must be tagged.
+    #[test]
+    fn external_event_within_window_taints_subsequent_edge() {
+        let mut g = CausalGraph::new();
+        // Thermal event fires "now".
+        g.record_external_event(ExternalEventKind::ThermalThrottle, 0.80, SystemTime::now());
+
+        // Apollo records an action moments later (inside window).
+        g.record_action("throttle:safari", 0.80, 10);
+        // 3 cycles later, pressure dropped enough to credit the edge.
+        g.evaluate(0.70, 13);
+
+        let edge = g
+            .get_edge("throttle:safari", "pressure_drop")
+            .expect("pressure_drop edge must exist");
+        assert_eq!(
+            edge.external_blame,
+            Some(ExternalEventKind::ThermalThrottle),
+            "edge must inherit blame tag from recent external event"
+        );
+
+        // And the per-kind counter aggregation must reflect the taint.
+        let attributions = g.recent_external_attributions();
+        let thermal_count: u32 = attributions
+            .iter()
+            .find(|(k, _)| *k == ExternalEventKind::ThermalThrottle)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        assert!(
+            thermal_count >= 1,
+            "thermal attribution count must be >=1, got attributions={:?}",
+            attributions
+        );
+    }
+
+    /// External event fires; action recorded AFTER the window has expired;
+    /// edge must NOT be tagged.
+    #[test]
+    fn external_event_outside_window_does_not_taint() {
+        let mut g = CausalGraph::new();
+        // Backdate the event to (now - 2*window) so it's well outside.
+        let stale_ts = SystemTime::now() - (EXTERNAL_BLAME_WINDOW * 2);
+        g.record_external_event(ExternalEventKind::DiskIOSpike, 0.80, stale_ts);
+
+        // Action recorded long after — should be clean attribution.
+        g.record_action("throttle:firefox", 0.80, 10);
+        g.evaluate(0.70, 13);
+
+        let edge = g
+            .get_edge("throttle:firefox", "pressure_drop")
+            .expect("pressure_drop edge must exist");
+        assert_eq!(
+            edge.external_blame,
+            None,
+            "edge must NOT inherit blame from a stale external event \
+             (ts {:?} ago, window {:?})",
+            stale_ts.elapsed().ok(),
+            EXTERNAL_BLAME_WINDOW
+        );
+
+        // Recent-attributions accessor must report no tags.
+        let attributions = g.recent_external_attributions();
+        assert!(
+            attributions.is_empty(),
+            "no edges tainted means accessor must return empty Vec, got {:?}",
+            attributions
+        );
+    }
+
+    /// The external-event ring buffer must cap at EXTERNAL_RING_CAP entries.
+    /// O(1) amortized append is the bounded-work contract.
+    #[test]
+    fn external_ring_buffer_caps_at_100() {
+        let mut g = CausalGraph::new();
+        // Push more than the cap; spread timestamps far apart so we don't
+        // accidentally test window-windowing behaviour here.
+        let base = SystemTime::now() - Duration::from_secs(10 * 3600);
+        for i in 0..250u64 {
+            g.record_external_event(
+                ExternalEventKind::NetworkLatencySpike,
+                0.50,
+                base + Duration::from_secs(i),
+            );
+        }
+        assert!(
+            g.external_events.len() <= EXTERNAL_RING_CAP,
+            "ring buffer must cap at {}, observed len={}",
+            EXTERNAL_RING_CAP,
+            g.external_events.len()
+        );
+    }
+
+    /// recent_external_attributions must count per-kind correctly across
+    /// multiple tainted edges. Builds a scenario with 2 thermal-tainted
+    /// and 1 disk-tainted action and asserts the counts.
+    #[test]
+    fn recent_external_attributions_counts_kinds() {
+        let mut g = CausalGraph::new();
+
+        // Event 1: thermal — triggers two consecutive actions.
+        g.record_external_event(ExternalEventKind::ThermalThrottle, 0.80, SystemTime::now());
+        g.record_action("throttle:proc_a", 0.80, 10);
+        g.evaluate(0.70, 13);
+        g.record_action("throttle:proc_b", 0.80, 20);
+        g.evaluate(0.70, 23);
+
+        // Event 2: disk — triggers one action.
+        g.record_external_event(ExternalEventKind::DiskIOSpike, 0.80, SystemTime::now());
+        g.record_action("throttle:proc_c", 0.80, 30);
+        g.evaluate(0.70, 33);
+
+        let attributions = g.recent_external_attributions();
+        let thermal: u32 = attributions
+            .iter()
+            .find(|(k, _)| *k == ExternalEventKind::ThermalThrottle)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        let disk: u32 = attributions
+            .iter()
+            .find(|(k, _)| *k == ExternalEventKind::DiskIOSpike)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        let net: u32 = attributions
+            .iter()
+            .find(|(k, _)| *k == ExternalEventKind::NetworkLatencySpike)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        assert!(
+            thermal >= 2,
+            "expected >=2 thermal blames (2 actions × 1+ horizons), got {} in {:?}",
+            thermal,
+            attributions
+        );
+        assert!(
+            disk >= 1,
+            "expected >=1 disk blame, got {} in {:?}",
+            disk,
+            attributions
+        );
+        assert_eq!(
+            net, 0,
+            "no network event was emitted, count must be 0; got {} in {:?}",
+            net, attributions
         );
     }
 }
