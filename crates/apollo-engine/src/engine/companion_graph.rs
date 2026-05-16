@@ -253,6 +253,122 @@ impl CompanionGraph {
     pub fn total_cycles(&self) -> u64 {
         self.total_cycles
     }
+
+    /// Phase 3.3 — **Cross-Group Attention Propagation (decider API)**.
+    ///
+    /// Given a list of `group_keys` (coalition_id / process_tree root names
+    /// supplied by the caller — one per "process family" currently alive),
+    /// infer weak companion edges between mature anchors that do **NOT**
+    /// share a group_key but **do** share at least one direct companion
+    /// pivot inside an observed group.
+    ///
+    /// # Algorithm
+    ///
+    /// For every ordered pair `(A, B)` of mature anchors in `per_app`:
+    /// 1. Find a process `P` such that both `conf(P|A)` and `conf(P|B)`
+    ///    pass [`MIN_CONFIDENCE`].
+    /// 2. Emit an inferred edge `(A, B, sqrt(conf_AP × conf_BP) × 0.5)`.
+    ///    - Geometric mean preserves NARS-style inheritance: the smaller
+    ///      confidence dominates [Pei Wang 2013] §3.3.1.
+    ///    - `× 0.5` is the Granovetter "weak tie" discount: cross-group
+    ///      inference is weaker than directly observed evidence
+    ///      [Granovetter 1973] *The Strength of Weak Ties*.
+    ///
+    /// # Guards
+    ///
+    /// - Empty result if `group_keys.len() < 2` (nothing to cross between).
+    /// - Hard cap at **100** returned entries to keep blast radius bounded
+    ///   (caller can wire this every cycle without unbounded work).
+    /// - **Does NOT mutate the graph.** This is a decider API — callers
+    ///   inspect the inferred edges and decide whether to act (e.g. raise
+    ///   protection on the cross-group satellite, or merely log).
+    ///
+    /// # Complexity
+    ///
+    /// O(V² · E) over anchors and edges. With `MAX_APPS=64` the inner
+    /// pair-loop is at most 64×63=4032 iterations; the cap-at-100 short-
+    /// circuit prevents pathological emission. Safe to call per-cycle.
+    ///
+    /// # Wiring (TODO — `OPENS: 1`)
+    ///
+    /// Caller is NOT wired in this commit. The intended call site is the
+    /// daemon main-loop "reason" stage (see
+    /// `apollo-optimizerd/src/main.rs` cycle layout — after coalition
+    /// enrichment), passing the live coalition_id set. Until wired the
+    /// counter [`crate::engine::lse_counters::LockFreeMetrics::companion_cross_group_inferences_total`]
+    /// stays at 0.
+    pub fn propagate_attention_across_groups(
+        &self,
+        group_keys: &[String],
+    ) -> Vec<(String, String, f32)> {
+        // Cross-group inference requires at least two groups to bridge.
+        if group_keys.len() < 2 {
+            return Vec::new();
+        }
+
+        const CAP: usize = 100;
+        let mut out: Vec<(String, String, f32)> = Vec::new();
+
+        // Collect mature anchors (`cycles_fg ≥ MIN_OBSERVATIONS`).
+        let mature: Vec<&String> = self
+            .per_app
+            .iter()
+            .filter(|(_, app)| app.cycles_fg >= MIN_OBSERVATIONS)
+            .map(|(name, _)| name)
+            .collect();
+
+        // For every ordered pair of distinct mature anchors find ONE shared
+        // pivot whose conf passes MIN_CONFIDENCE on both sides. We stop at
+        // the first qualifying pivot per pair — more would inflate the
+        // result and the cap is the only knob the caller controls.
+        'outer: for a in &mature {
+            let app_a = match self.per_app.get(a.as_str()) {
+                Some(x) => x,
+                None => continue,
+            };
+            for b in &mature {
+                if a == b {
+                    continue;
+                }
+                let app_b = match self.per_app.get(b.as_str()) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                // Find a shared pivot. Iterate the smaller edge set.
+                let (small, large) = if app_a.edges.len() <= app_b.edges.len() {
+                    (app_a, app_b)
+                } else {
+                    (app_b, app_a)
+                };
+                for pivot in small.edges.keys() {
+                    if !large.edges.contains_key(pivot) {
+                        continue;
+                    }
+                    let Some(conf_a) = self.confidence(a, pivot) else {
+                        continue;
+                    };
+                    if conf_a < MIN_CONFIDENCE {
+                        continue;
+                    }
+                    let Some(conf_b) = self.confidence(b, pivot) else {
+                        continue;
+                    };
+                    if conf_b < MIN_CONFIDENCE {
+                        continue;
+                    }
+                    // sqrt(conf_a × conf_b) × 0.5
+                    let score = (conf_a * conf_b).sqrt() * 0.5;
+                    out.push(((*a).clone(), (*b).clone(), score));
+                    if out.len() >= CAP {
+                        break 'outer;
+                    }
+                    break; // one inference per (A, B) pair
+                }
+            }
+        }
+
+        out
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +489,134 @@ mod tests {
             .map(|a| a.cycles_fg)
             .unwrap_or_default();
         assert_eq!(cred, 200 - (ATTENTION_FLOOR - 1));
+    }
+
+    // ── Phase 3.3 — Cross-Group Attention Propagation tests ─────────────────
+    //
+    // Decider-only API: callers receive inferred (A, B, score) triples and
+    // decide whether to act. The graph is NEVER mutated by these inferences.
+    //
+    // Algorithm: for every pair (A, B) of mature anchors that do NOT share a
+    // group_key, if both have a confident companion edge to the SAME third
+    // process P inside a group, infer a weak cross-group companion edge
+    // (A, B, sqrt(conf_AP × conf_BP) × 0.5). The geometric mean preserves
+    // NARS-style inheritance (smaller of the two evidence levels dominates;
+    // [Pei Wang 2013] §3.3.1); the 0.5 dampening is the Granovetter "weak
+    // tie" discount — inferred edges across groups carry less weight than
+    // directly observed ones [Granovetter 1973].
+
+    /// Helper: build a graph with two mature anchors that both see `pivot`.
+    fn build_two_anchor_session(pivot: &str) -> CompanionGraph {
+        let mut g = CompanionGraph::new();
+        // 250 cycles of AnchorA with pivot alive (mature, conf ≈ 1.0).
+        for c in 0..250 {
+            g.observe_cycle(Some("AnchorA"), &[pivot.into()], c);
+        }
+        // 250 cycles of AnchorB with the same pivot alive (also mature).
+        for c in 250..500 {
+            g.observe_cycle(Some("AnchorB"), &[pivot.into()], c);
+        }
+        g
+    }
+
+    #[test]
+    fn cross_group_returns_empty_when_no_overlap() {
+        // Two mature anchors but each lives in a DIFFERENT pivot group:
+        // AnchorA -> X, AnchorB -> Y. No shared third process, no inference.
+        let mut g = CompanionGraph::new();
+        for c in 0..250 {
+            g.observe_cycle(Some("AnchorA"), &["X".into()], c);
+        }
+        for c in 250..500 {
+            g.observe_cycle(Some("AnchorB"), &["Y".into()], c);
+        }
+        // Two distinct group_keys — anchors are NOT in the same group.
+        let groups = vec!["group-a".to_string(), "group-b".to_string()];
+        let inferred = g.propagate_attention_across_groups(&groups);
+        assert!(
+            inferred.is_empty(),
+            "no shared pivot ⇒ no cross-group edges, got {inferred:?}"
+        );
+    }
+
+    #[test]
+    fn cross_group_infers_geometric_mean_with_dampening() {
+        // Both AnchorA and AnchorB see the same pivot ("Pivot") with high
+        // confidence. Expected inferred edge:
+        //   conf_AP ≈ 1.0, conf_BP ≈ 1.0
+        //   score = sqrt(1.0 × 1.0) × 0.5 = 0.5
+        let g = build_two_anchor_session("Pivot");
+        let groups = vec!["g1".to_string(), "g2".to_string()];
+        let inferred = g.propagate_attention_across_groups(&groups);
+
+        // Expect both directions: (A,B) and (B,A).
+        let edge_ab = inferred
+            .iter()
+            .find(|(a, b, _)| a == "AnchorA" && b == "AnchorB");
+        let edge_ba = inferred
+            .iter()
+            .find(|(a, b, _)| a == "AnchorB" && b == "AnchorA");
+        assert!(edge_ab.is_some(), "expected A→B inference, got {inferred:?}");
+        assert!(edge_ba.is_some(), "expected B→A inference, got {inferred:?}");
+
+        let score = edge_ab.unwrap().2;
+        // conf_AP and conf_BP are Laplace-smoothed: (250+1)/(250+2) ≈ 0.996.
+        // sqrt(0.996 × 0.996) × 0.5 ≈ 0.498. Allow 0.02 slack.
+        assert!(
+            (score - 0.498).abs() < 0.02,
+            "expected score ≈ 0.498, got {score}"
+        );
+        // Symmetry: A→B and B→A should have the same score (geometric mean
+        // is commutative on the two confidences).
+        assert!(
+            (edge_ab.unwrap().2 - edge_ba.unwrap().2).abs() < 1e-6,
+            "geometric mean must be symmetric"
+        );
+    }
+
+    #[test]
+    fn cross_group_caps_at_100() {
+        // Build 20 mature anchors that all see the same pivot. With 20
+        // anchors, ordered pairs = 20 × 19 = 380 candidate inferences.
+        // The cap must clamp the result at 100.
+        let mut g = CompanionGraph::new();
+        let mut cycle = 0u64;
+        for i in 0..20 {
+            let app = format!("A{i}");
+            for _ in 0..200 {
+                g.observe_cycle(Some(&app), &["Pivot".into()], cycle);
+                cycle += 1;
+            }
+        }
+        // 20 distinct group_keys — every anchor is in its own group.
+        let groups: Vec<String> = (0..20).map(|i| format!("g{i}")).collect();
+        let inferred = g.propagate_attention_across_groups(&groups);
+        assert!(
+            inferred.len() <= 100,
+            "cap violated: got {} entries (expected ≤100)",
+            inferred.len()
+        );
+    }
+
+    #[test]
+    fn cross_group_does_not_mutate_graph() {
+        // Snapshot the graph before propagation; assert structural equality
+        // afterwards. Inference is decider-only — callers add edges via
+        // separate paths (observe_cycle), never through this method.
+        let g_before = build_two_anchor_session("Pivot");
+        let snap_before =
+            serde_json::to_string(&g_before).expect("serialize pre-propagation graph");
+
+        let mut g_after = g_before.clone();
+        let groups = vec!["g1".to_string(), "g2".to_string()];
+        let _ = g_after.propagate_attention_across_groups(&groups);
+
+        let snap_after =
+            serde_json::to_string(&g_after).expect("serialize post-propagation graph");
+        assert_eq!(
+            snap_before, snap_after,
+            "propagate_attention_across_groups must NOT mutate the graph"
+        );
     }
 
     #[test]

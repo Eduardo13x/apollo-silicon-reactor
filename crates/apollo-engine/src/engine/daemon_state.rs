@@ -142,6 +142,15 @@ impl MetricsState {
         // (Phase 3.1) and avoids a second touch on daemon_state.rs when wiring.
         self.metrics.battery_aware_penalty_emissions_total =
             lf.battery_aware_penalty_emissions_total;
+
+        // Phase 3.3 — Cross-Group Companion Attention (Sprint 6, 2026-05-16).
+        // Producers are NOT wired in this commit (OPENS: 1) — the counter
+        // remains 0 in prod until the daemon main-loop invokes
+        // CompanionGraph::propagate_attention_across_groups and bumps the
+        // LSE counter by the number of inferred triples. Plumbed now to
+        // avoid a second touch on daemon_state.rs when wiring lands.
+        self.metrics.companion_cross_group_inferences_total =
+            lf.companion_cross_group_inferences_total;
     }
 }
 

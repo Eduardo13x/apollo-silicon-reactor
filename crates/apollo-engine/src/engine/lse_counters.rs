@@ -244,6 +244,21 @@ pub struct LockFreeMetrics {
     /// counter remains 0 in prod until `decide_actions` invokes the
     /// penalty function and calls `inc_battery_aware_penalty_emission()`.
     pub battery_aware_penalty_emissions_total: AtomicU64,
+
+    /// Phase 3.3 — Cross-Group Companion Attention propagation
+    /// observability (Sprint 6, 2026-05-16). Incremented each time
+    /// [`crate::engine::companion_graph::CompanionGraph::propagate_attention_across_groups`]
+    /// returns one or more inferred (A, B, score) triples — counter is
+    /// bumped by the number of triples returned, NOT by call count.
+    /// Dashboards verify the feature actually fires (vs the "scaffolding
+    /// without wiring" anti-pattern documented in CLAUDE.md) and that
+    /// the per-cycle cap (100) is rarely hit (which would indicate
+    /// graph-wide saturation worth investigating).
+    ///
+    /// Note: producers are NOT wired in this commit (see `OPENS: 1`); the
+    /// counter remains 0 in prod until the daemon main-loop invokes the
+    /// propagation API and calls `add_companion_cross_group_inferences()`.
+    pub companion_cross_group_inferences_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -354,6 +369,7 @@ impl LockFreeMetrics {
             reactor_pulses: AtomicU64::new(0),
             reactor_event_weight_bits: AtomicU64::new(0_f64.to_bits()),
             battery_aware_penalty_emissions_total: AtomicU64::new(0),
+            companion_cross_group_inferences_total: AtomicU64::new(0),
         }
     }
 
@@ -686,6 +702,9 @@ impl LockFreeMetrics {
             battery_aware_penalty_emissions_total: self
                 .battery_aware_penalty_emissions_total
                 .load(Ordering::Relaxed),
+            companion_cross_group_inferences_total: self
+                .companion_cross_group_inferences_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -727,6 +746,17 @@ impl LockFreeMetrics {
     pub fn inc_battery_aware_penalty_emission(&self) {
         self.battery_aware_penalty_emissions_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Phase 3.3 — Cross-Group Companion Attention observability hook.
+    /// Increment by the number of triples returned from
+    /// [`crate::engine::companion_graph::CompanionGraph::propagate_attention_across_groups`].
+    /// Bumping by N (rather than calling N times) keeps the call site a
+    /// single LSE `ldaddal` even when the propagation returns many edges.
+    #[inline(always)]
+    pub fn add_companion_cross_group_inferences(&self, n: u64) {
+        self.companion_cross_group_inferences_total
+            .fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -802,6 +832,8 @@ pub struct MetricsSnapshot {
     pub reactor_event_weight: f64,
     /// Phase 5.2 — Battery-aware cost penalty emissions (Sprint 8).
     pub battery_aware_penalty_emissions_total: u64,
+    /// Phase 3.3 — Cross-Group Companion Attention inferences (Sprint 6).
+    pub companion_cross_group_inferences_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

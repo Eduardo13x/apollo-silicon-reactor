@@ -166,3 +166,37 @@ fn fase5_all_eleven_action_counters_reach_runtime_metrics() {
         );
     }
 }
+
+/// Phase 3.3 — Cross-Group Companion Attention counter round-trip.
+///
+/// Mirrors `fase5_counters_reach_runtime_metrics_json` for the
+/// `companion_cross_group_inferences_total` field added by
+/// `propagate_attention_across_groups`. Catches the "scaffolding without
+/// wiring" anti-pattern: the API can return triples but if the snapshot
+/// surface drops them, dashboards never see them.
+#[test]
+fn phase33_companion_cross_group_inferences_reach_runtime_metrics_json() {
+    let lf = LockFreeMetrics::new();
+    // Distinct literal so the assert below is unambiguous if any other
+    // test pollutes the counter via a process-wide static.
+    lf.add_companion_cross_group_inferences(37);
+    lf.commit();
+
+    let snap = lf.snapshot();
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+
+    // Strongly-typed assertion guards against "field exists in JSON but
+    // reads default zero" — same shape as the Fase 5 belt-and-braces test.
+    assert_eq!(
+        state.metrics.companion_cross_group_inferences_total, 37,
+        "counter must round-trip into RuntimeMetrics via sync_from_lockfree"
+    );
+
+    let json = serde_json::to_string(&state.metrics).expect("serialize RuntimeMetrics");
+    assert!(
+        json.contains("\"companion_cross_group_inferences_total\":37"),
+        "field absent or wrong value in JSON: {}",
+        json
+    );
+}
