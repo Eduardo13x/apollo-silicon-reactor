@@ -912,6 +912,36 @@ pub fn usage_learning_tick(
 
 // ── Apply Learned Policy Actions ───────────────────────────────────────────
 
+/// 2026-05-16: per-PID TTL dedup for learned-policy boost/throttle emissions.
+/// Without this, `apply_learned_policy_actions` re-emitted BoostProcess for
+/// every interactive PID every cycle (464/500 journal entries = boosts).
+/// Each emit ≡ mach_qos.set_tier syscall; mach_qos IS already sticky so
+/// the kernel work was redundant — but each emit also walked the safety
+/// stack + journal write, consuming 10% Apollo CPU and contributing to
+/// the very thrashing Apollo was trying to mitigate. 30s TTL chosen to
+/// match typical foreground app dwell time without re-firing on every
+/// per-cycle snapshot. Stale entries pruned lazily on next access.
+fn boost_dedup_cache() -> &'static std::sync::Mutex<HashMap<u32, std::time::Instant>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<u32, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn should_emit_boost(pid: u32, ttl_secs: u64) -> bool {
+    let now = std::time::Instant::now();
+    let ttl = std::time::Duration::from_secs(ttl_secs);
+    let mut cache = boost_dedup_cache().lock().unwrap_or_else(|e| e.into_inner());
+    // Prune stale entries opportunistically.
+    cache.retain(|_, t| now.duration_since(*t) < ttl);
+    match cache.get(&pid) {
+        Some(t) if now.duration_since(*t) < ttl => false,
+        _ => {
+            cache.insert(pid, now);
+            true
+        }
+    }
+}
+
 pub fn apply_learned_policy_actions(
     snapshot: &apollo_engine::collector::SystemSnapshot,
     policy: &LearnedPolicy,
@@ -965,6 +995,7 @@ pub fn apply_learned_policy_actions(
             .any(|pat| p.name.contains(pat))
             && !seen.contains(&(p.pid, "boost"))
             && !survival
+            && should_emit_boost(p.pid, 30)
         {
             actions.push(RootAction::BoostProcess {
                 pid: p.pid,
