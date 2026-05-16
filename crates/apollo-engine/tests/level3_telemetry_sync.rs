@@ -166,3 +166,67 @@ fn fase5_all_eleven_action_counters_reach_runtime_metrics() {
         );
     }
 }
+
+/// Batch 1 (Sprint 6/7/8) telemetry round-trip: the 7 counters added by
+/// phases 3.2 / 4.2 / 4.3 / 5.2 must all survive the full chain
+/// LockFreeMetrics → snapshot → sync_from_lockfree → RuntimeMetrics → JSON.
+///
+/// Sprint 3 telemetry-death scar: counter increments on the hot path but
+/// never reaches the dashboard. NotebookLM 2026-05-16 flagged ~12 manual
+/// merge resolutions in the metric sync chain as a potential reintroduction
+/// of that bug. This test pins each new counter to a distinct literal so
+/// regressions surface as test failures, not as silent dashboard zeros.
+#[test]
+fn batch1_phases_32_42_43_52_counters_reach_runtime_metrics_json() {
+    let lf = LockFreeMetrics::new();
+
+    // Phase 3.2 — arousal-modulated NARS decay
+    lf.add_arousal_decay_accelerations(13);
+
+    // Phase 4.2 — external-event causal attribution
+    lf.inc_causal_external_thermal_blame();
+    lf.inc_causal_external_thermal_blame();
+    lf.inc_causal_external_disk_blame();
+    lf.inc_causal_external_disk_blame();
+    lf.inc_causal_external_disk_blame();
+    for _ in 0..4 {
+        lf.inc_causal_external_net_blame();
+    }
+
+    // Phase 4.3 — policy rollback guard
+    for _ in 0..5 {
+        lf.inc_policy_rollback_evaluation();
+    }
+    lf.inc_policy_rollback_execution();
+    lf.inc_policy_rollback_execution();
+
+    // Phase 5.2 — battery-aware cost penalty
+    for _ in 0..6 {
+        lf.inc_battery_aware_penalty_emission();
+    }
+
+    let snap = lf.snapshot();
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+
+    let json = serde_json::to_string(&state.metrics).expect("serialize RuntimeMetrics");
+
+    for (field, expected) in [
+        ("arousal_decay_accelerations_total", 13u64),
+        ("causal_external_thermal_blames_total", 2),
+        ("causal_external_disk_blames_total", 3),
+        ("causal_external_net_blames_total", 4),
+        ("policy_rollback_evaluations_total", 5),
+        ("policy_rollback_executions_total", 2),
+        ("battery_aware_penalty_emissions_total", 6),
+    ] {
+        let needle = format!("\"{}\":{}", field, expected);
+        assert!(
+            json.contains(&needle),
+            "Batch 1 counter '{}' missing or wrong value (expected {}): {}",
+            field,
+            expected,
+            &json[..json.len().min(500)]
+        );
+    }
+}
