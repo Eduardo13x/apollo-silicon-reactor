@@ -217,6 +217,43 @@ fn phase5_1_add_user_presence_suppressions_increments() {
     assert_eq!(snap.user_presence_suppressions_total, 7);
 }
 
+/// Phase 2 god-lock decomposition (Sprint 8, 2026-05-16) — round-trip
+/// test for the migration of `habituation_skips` from a `state.metrics`
+/// mutex write to the LSE counter. Verifies:
+///   1. The new `LSE_COUNTERS.add_habituation_skips(N)` writes to
+///      `LockFreeMetrics::habituation_skips_total`.
+///   2. `MetricsSnapshot.habituation_skips_total` surfaces the value.
+///   3. `MetricsState::sync_from_lockfree` populates the legacy
+///      `RuntimeMetrics.habituation_skips` field from the atomic (single
+///      source of truth — AIS reads `rm_u("habituation_skips")` and the
+///      JSON dashboard reads the same key).
+#[test]
+fn phase_2_habituation_skips_round_trip() {
+    let lf = LockFreeMetrics::new();
+    lf.add_habituation_skips(17);
+    lf.commit();
+
+    let snap = lf.snapshot();
+    assert_eq!(
+        snap.habituation_skips_total, 17,
+        "lock-free snapshot did not surface habituation_skips_total"
+    );
+
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+    assert_eq!(
+        state.metrics.habituation_skips, 17,
+        "sync_from_lockfree did not populate legacy habituation_skips field"
+    );
+
+    let json = serde_json::to_string(&state.metrics).expect("serialize RuntimeMetrics");
+    assert!(
+        json.contains("\"habituation_skips\":17"),
+        "habituation_skips absent or wrong in JSON: {}",
+        json
+    );
+}
+
 /// Phase 4.3.1 (Sprint 8, 2026-05-16) — round-trip test for the
 /// `specialist_accuracy_purge_inhibitions_total` observability counter.
 ///

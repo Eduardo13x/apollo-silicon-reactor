@@ -158,6 +158,15 @@ impl MetricsState {
         // EMA accuracy update.
         self.metrics.specialist_accuracy_purge_inhibitions_total =
             lf.specialist_accuracy_purge_inhibitions_total;
+
+        // Phase 2 god-lock decomposition (Sprint 8, 2026-05-16): migrate
+        // habituation_skips OFF the metrics mutex. Producer is the
+        // lock-free `add_habituation_skips` call in
+        // `daemon_cognitive_tick::update_habituation_state`. The legacy
+        // `RuntimeMetrics.habituation_skips` field stays in place
+        // (AIS runtime benchmark reads it via `rm_u("habituation_skips")`),
+        // populated FROM the atomic here — single source of truth.
+        self.metrics.habituation_skips = lf.habituation_skips_total;
     }
 }
 

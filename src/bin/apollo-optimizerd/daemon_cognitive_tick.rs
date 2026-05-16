@@ -433,7 +433,13 @@ pub fn apply_specialist_voting(
 /// Also bumps `metrics.habituation_skips` by the returned set's size so
 /// the AIS runtime benchmark can read it.
 pub fn update_habituation_state(
-    state: &SharedState,
+    // Retained for ABI stability across the daemon's many call sites; the
+    // previous body needed `state.metrics.lock_recover()` to bump
+    // `habituation_skips`. Phase 2 god-lock decomposition (2026-05-16)
+    // moved that write to an LSE atomic, so the parameter is currently
+    // unused. Removing it is a separate commit (touches main.rs:3102 and
+    // every test caller).
+    _state: &SharedState,
     system: &System,
     habituation_map: &mut HashMap<u32, (u8, u8, u32)>,
     cycle_count: u64,
@@ -469,10 +475,13 @@ pub fn update_habituation_state(
         hab_set
     };
     // Emit habituation count so AIS runtime benchmark can read it.
-    {
-        let mut m = state.metrics.lock_recover();
-        m.metrics.habituation_skips += habituated_pids.len() as u64;
-    }
+    // Phase 2 god-lock decomposition (2026-05-16): migrated from
+    // `state.metrics.lock_recover().metrics.habituation_skips += N` to a
+    // lock-free LSE counter. The legacy `RuntimeMetrics.habituation_skips`
+    // field is populated FROM this atomic in
+    // `daemon_state::sync_from_lockfree` — single source of truth.
+    apollo_engine::engine::lse_counters::LSE_COUNTERS
+        .add_habituation_skips(habituated_pids.len() as u64);
     habituated_pids
 }
 

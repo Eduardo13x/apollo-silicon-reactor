@@ -276,6 +276,17 @@ pub struct LockFreeMetrics {
     /// [Rubin 1974] "Estimating Causal Effects of Treatments in Randomized
     /// and Nonrandomized Studies" — distinguishing intervention from confounder.
     pub specialist_accuracy_purge_inhibitions_total: AtomicU64,
+
+    /// Phase 2 god-lock decomposition (Sprint 8, 2026-05-16).
+    /// Cumulative count of processes skipped by habituation in
+    /// `daemon_cognitive_tick::update_habituation_state`. Migrated from
+    /// `state.metrics.lock_recover().metrics.habituation_skips += N` to remove
+    /// a god-lock contributor on the hot path. The legacy
+    /// `RuntimeMetrics.habituation_skips` field is now populated from this
+    /// atomic via `sync_from_lockfree` (no duplicate field — single source
+    /// of truth, atomic). [Hellerstein 2012] mutex avoidance for hot-path
+    /// counters.
+    pub habituation_skips_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -388,6 +399,7 @@ impl LockFreeMetrics {
             battery_aware_penalty_emissions_total: AtomicU64::new(0),
             user_presence_suppressions_total: AtomicU64::new(0),
             specialist_accuracy_purge_inhibitions_total: AtomicU64::new(0),
+            habituation_skips_total: AtomicU64::new(0),
         }
     }
 
@@ -726,6 +738,7 @@ impl LockFreeMetrics {
             specialist_accuracy_purge_inhibitions_total: self
                 .specialist_accuracy_purge_inhibitions_total
                 .load(Ordering::Relaxed),
+            habituation_skips_total: self.habituation_skips_total.load(Ordering::Relaxed),
         }
     }
 
@@ -796,6 +809,17 @@ impl LockFreeMetrics {
     pub fn inc_specialist_accuracy_purge_inhibitions(&self) {
         self.specialist_accuracy_purge_inhibitions_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Phase 2 god-lock decomposition (2026-05-16): cumulative habituation
+    /// skips. Called once per cycle by
+    /// `daemon_cognitive_tick::update_habituation_state` with
+    /// `habituated_pids.len() as u64`. Replaces the previous
+    /// `state.metrics.lock_recover().metrics.habituation_skips += N` god-lock
+    /// write — single LSE `ldadd` instead of `mutex.lock + write + drop`.
+    #[inline(always)]
+    pub fn add_habituation_skips(&self, n: u64) {
+        self.habituation_skips_total.fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -879,6 +903,12 @@ pub struct MetricsSnapshot {
     /// Count of cycles where `apply_specialist_voting` skipped the EMA
     /// accuracy updates because a maintenance purge happened ≤30 s ago.
     pub specialist_accuracy_purge_inhibitions_total: u64,
+    /// Phase 2 god-lock decomposition (Sprint 8, 2026-05-16).
+    /// Cumulative habituation skips, migrated off the `state.metrics`
+    /// mutex to a lock-free atomic. Mirrors the legacy
+    /// `RuntimeMetrics.habituation_skips` field (which is now populated
+    /// FROM this atomic via `sync_from_lockfree`).
+    pub habituation_skips_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
