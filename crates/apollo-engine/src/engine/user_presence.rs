@@ -120,6 +120,80 @@ pub fn user_presence_modulator(
     IDLE_MULTIPLIER
 }
 
+/// Phase 5.1 (Gap B, 2026-05-16) — passive-content-aware variant.
+///
+/// Extends [`user_presence_modulator`] with two binary signals from
+/// [`UserContext`](super::user_context::UserContext):
+///
+///   * `audio_active`        — coreaudiod is producing output OR CoreAudio
+///                             reports the default output device running
+///   * `has_sleep_assertion` — some non-Apollo process holds an IOKit
+///                             `PreventUserIdle*Sleep` assertion (after Step 1,
+///                             that includes `PreventUserIdleDisplaySleep`)
+///
+/// Tier rules (first match wins):
+///   1. `current_arousal >= CRISIS_AROUSAL_THRESHOLD` → 1.0 (survival > UX,
+///      identical to the base modulator)
+///   2. `audio_active || has_sleep_assertion` → 1.0
+///      (passive-content override: the user is consuming media or an app
+///      has explicitly asked the kernel to preserve wakefulness — throttling
+///      now is not a UX win, it's a stutter. Note: this returns 1.0, **not**
+///      a suppression multiplier — Apollo can still act on non-Observe
+///      votes, just without the extra penalty for "user is at keyboard".)
+///   3. else → delegate to [`user_presence_modulator`] (base band logic)
+///
+/// Why "passive content" wins over "active user":
+///   The base modulator treats `idle < 5s` + high HID rate as "active typing"
+///   and damps to 0.5. But a user watching a movie on the external display
+///   is `idle = 0s` (cursor still warm), `hid_rate = low`, and `audio_active
+///   = true`. Damping to 0.5 there penalises the very workload that needs
+///   smooth playback. The passive override returns 1.0 — no suppression of
+///   the throttle-class actions that keep memory healthy underneath the
+///   media playback.
+///
+/// Why crisis still beats passive:
+///   In a true OOM-imminent state (arousal ≥ 0.80), continued audio playback
+///   is going to stutter anyway because the kernel is about to start jetsam
+///   killing. Acting now (1.0 multiplier = full aggressiveness on votes,
+///   same as the survival policy) is strictly better than waiting for the
+///   audio to die naturally.
+///
+/// [Iqbal & Bailey 2008] "Effects of Interruptions on Task Performance" —
+/// passive content consumption is a different cost profile from active
+/// keyboard work: the relevant cost is glitch-free output, not
+/// interruption-free attention. A multiplier of 0.5 (the "active" tier)
+/// over-corrects for the passive case.
+///
+/// Side effects: increments `user_presence_suppressions_total` ONLY when the
+/// returned multiplier is `< 1.0`; the passive/crisis pass-through paths
+/// (which return 1.0) deliberately do not bump the counter — they are
+/// non-events for the dashboard purpose of "verify the feature is firing".
+pub fn user_presence_modulator_with_passive(
+    idle_seconds: f64,
+    hid_events_per_minute: f64,
+    current_arousal: f64,
+    audio_active: bool,
+    has_sleep_assertion: bool,
+) -> f64 {
+    // (1) Crisis override: survival always wins over UX politeness.
+    //     Identical to the base modulator's first check.
+    if current_arousal >= CRISIS_AROUSAL_THRESHOLD {
+        return IDLE_MULTIPLIER;
+    }
+
+    // (2) Passive-content override: media playback / display-keep-awake
+    //     assertion. Apollo can still optimize, but the "active user"
+    //     penalty is wrong here — return 1.0 (full aggressiveness on votes).
+    if audio_active || has_sleep_assertion {
+        return IDLE_MULTIPLIER;
+    }
+
+    // (3) Delegate to the base band logic for the active/semi-active/idle
+    //     tiers. The base function owns the counter increment for the
+    //     suppressing branches — we do not double-count here.
+    user_presence_modulator(idle_seconds, hid_events_per_minute, current_arousal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +288,114 @@ mod tests {
         // idle_seconds == SEMI_ACTIVE_IDLE_SECONDS is NOT < threshold → idle.
         let m = user_presence_modulator(30.0, 0.0, 0.3);
         assert!((m - IDLE_MULTIPLIER).abs() < f64::EPSILON);
+    }
+
+    // ── Phase 5.1 Gap B — passive-content override ────────────────────────
+
+    /// `audio_active=true` overrides the "active user" tier — the user is
+    /// listening to music while typing; the typing should not penalise the
+    /// throttle-class actions that keep memory healthy.
+    #[test]
+    fn presence_passive_audio_overrides_active_user_no_suppression() {
+        // Inputs that would normally yield ACTIVE_MULTIPLIER (0.5):
+        //   idle < 5s, high HID rate, sub-crisis arousal.
+        let m = user_presence_modulator_with_passive(
+            1.5,  // active idle
+            60.0, // active HID rate
+            0.3,  // sub-crisis
+            true, // audio_active
+            false,
+        );
+        assert!(
+            (m - IDLE_MULTIPLIER).abs() < f64::EPSILON,
+            "audio_active must override active-user suppression: got {m}"
+        );
+    }
+
+    /// `has_sleep_assertion=true` overrides the "active user" tier — an app
+    /// is keeping the display awake (presentation, streaming on external
+    /// monitor) and we should not throttle.
+    #[test]
+    fn presence_passive_sleep_assertion_overrides_no_suppression() {
+        let m = user_presence_modulator_with_passive(
+            1.5,
+            60.0,
+            0.3,
+            false,
+            true, // has_sleep_assertion
+        );
+        assert!(
+            (m - IDLE_MULTIPLIER).abs() < f64::EPSILON,
+            "has_sleep_assertion must override active-user suppression: got {m}"
+        );
+    }
+
+    /// Crisis arousal still wins over the passive-content override — if the
+    /// system is on the verge of OOM, audio is going to stutter regardless;
+    /// act now (returns 1.0 = full aggressiveness, same shape as both other
+    /// overrides but with strictly higher precedence).
+    ///
+    /// This test exercises the precedence: a single function with both
+    /// crisis AND passive flags set must still return 1.0 (which both
+    /// branches happen to do), and the early-return on crisis means the
+    /// passive branch is never evaluated.
+    #[test]
+    fn presence_crisis_still_overrides_passive_content() {
+        let m = user_presence_modulator_with_passive(
+            1.5,
+            60.0,
+            0.90, // crisis
+            true, // also passive
+            true,
+        );
+        assert!(
+            (m - IDLE_MULTIPLIER).abs() < f64::EPSILON,
+            "crisis must override even when passive flags are set: got {m}"
+        );
+    }
+
+    /// Passive flag set, low arousal, otherwise-idle inputs: still 1.0.
+    /// This is the no-op case — the user is consuming media and Apollo is
+    /// fully free to act (no suppression in the base path either).
+    #[test]
+    fn presence_passive_without_arousal_returns_one() {
+        let m = user_presence_modulator_with_passive(
+            120.0, // long idle
+            0.0,   // no HID events
+            0.2,   // far from crisis
+            true,  // audio playing in the background
+            false,
+        );
+        assert!(
+            (m - IDLE_MULTIPLIER).abs() < f64::EPSILON,
+            "passive + idle + low arousal → 1.0: got {m}"
+        );
+    }
+
+    /// When NEITHER passive flag is set, the function delegates to the base
+    /// band. Property: for any (idle, hid, arousal) tuple, the no-passive
+    /// path of `_with_passive` returns the same value as the base
+    /// `user_presence_modulator`.
+    #[test]
+    fn presence_non_passive_delegates_to_base_band() {
+        // Sample the active, semi-active, and idle tiers and the crisis
+        // override path of the base modulator and check identity.
+        let cases: &[(f64, f64, f64)] = &[
+            (1.5, 60.0, 0.3),   // tier 2 (active)
+            (20.0, 2.0, 0.3),   // tier 3 (semi-active)
+            (120.0, 0.0, 0.3),  // tier 4 (idle)
+            (1.0, 80.0, 0.85),  // tier 1 (crisis)
+        ];
+        for &(idle, hid, arousal) in cases {
+            let base = user_presence_modulator(idle, hid, arousal);
+            let extended =
+                user_presence_modulator_with_passive(idle, hid, arousal, false, false);
+            assert!(
+                (extended - base).abs() < f64::EPSILON,
+                "no-passive delegation must match base: idle={idle}, hid={hid}, \
+                 arousal={arousal} → base={base}, extended={extended}"
+            );
+        }
     }
 
     #[test]
