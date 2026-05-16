@@ -463,6 +463,105 @@ fn sanitize_f64(v: f64) -> f64 {
     }
 }
 
+// ── Phase 5.2 — Battery-Aware Cost Penalty ──────────────────────────────────
+//
+// **Goal**: optimise for Joules, not just cycles. On battery power, penalise
+// micro-wakeups and high-frequency context switching even when memory pressure
+// is low — those are the dominant draws on M1 8 GB once the cgroup itself is
+// idle.
+//
+// # Why a *cost* penalty (not a pressure boost)?
+//
+// Pressure boosts make the scorer *act*. We want the opposite: discourage
+// energy-noisy actions (boosts, throttle flips, wake-inducing signals) when on
+// battery and not in survival. The penalty therefore feeds into the **cost**
+// side of `ActionPolicy::Contribution`, raising the bar an action's benefit
+// must clear before it fires. Crucially, the penalty is **capped at 0.05**
+// once `memory_pressure ≥ 0.50` — survival actions (benefit typically ≥0.30)
+// must never be blocked by an energy concern.
+//
+// # Model
+//
+// Inputs are deliberately scalar so the function stays a pure O(1) calculator:
+// no I/O, no allocations, no global state. Callers compose battery state
+// (from `smc_direct`) and rate signals (from `wake_storm_detector` /
+// `proc_taskinfo`) at the dispatch site.
+//
+// - **AC power** → 0.0 (the wall socket pays for noise).
+// - **Battery + low pressure (`<0.50`)** →
+//   `penalty = 0.20 × clamp(wakeups_per_sec / 500, 0, 1)
+//           + 0.05 × clamp(ctx_switches_per_sec / 5000, 0, 1)`
+//   clamped to `[0, 0.20]`.
+// - **Battery + high pressure (`≥0.50`)** → cap at 0.05 (preserve survival
+//   headroom — see [Le Sueur & Heiser 2010] OSDI on DVFS not blocking
+//   critical work).
+//
+// # Citations
+//
+// [Tiwari 1994] "Power analysis of embedded software", IEEE TVLSI — the
+// instruction-level power model that grounds per-instruction (and therefore
+// per-wakeup / per-ctx-switch) energy accounting. Wakeups dominate when the
+// CPU never reaches deep idle.
+//
+// [Le Sueur & Heiser 2010] "Dynamic voltage and frequency scaling: The laws
+// of diminishing returns", USENIX OSDI HotPower — DVFS savings are bounded
+// and must never block critical-path work; this motivates the high-pressure
+// 0.05 cap.
+
+/// Pure scalar penalty added to action cost when running on battery.
+///
+/// See module-level docs for the model. Output is guaranteed to be in
+/// `[0.0, 0.20]` and finite even for NaN/Inf inputs.
+///
+/// # Arguments
+///
+/// * `is_on_battery` — `true` when the lid/charger telemetry reports battery
+///   discharge. AC power short-circuits to `0.0`.
+/// * `wakeups_per_sec` — System-wide (or per-process aggregate) idle wakeups
+///   per second. Negative / non-finite values are sanitized to `0.0`.
+/// * `ctx_switches_per_sec` — System-wide context switch rate. Same sanitization.
+/// * `memory_pressure` — Composite `[0.0, 1.0]` pressure used to switch between
+///   low-pressure (cap 0.20) and high-pressure (cap 0.05) regimes. NaN treated
+///   as `0.0` (low-pressure regime).
+///
+/// # Wiring (out of scope this commit — see `OPENS: 1`)
+///
+/// The intended caller is `decide_actions::score_action` (cost composition
+/// site) or the `action_policy::ActionPolicyScorer` as a new `PolicyFeature`
+/// named `BatteryAwareCostPenalty`. Plumbing happens in a follow-up commit.
+#[inline]
+pub fn battery_aware_cost_penalty(
+    is_on_battery: bool,
+    wakeups_per_sec: f64,
+    ctx_switches_per_sec: f64,
+    memory_pressure: f64,
+) -> f64 {
+    // 1. AC power short-circuit — wall socket pays for noise.
+    if !is_on_battery {
+        return 0.0;
+    }
+
+    // 2. Sanitize all numeric inputs. NaN/Inf/negative are treated as 0.
+    let wakeups = sanitize_f64(wakeups_per_sec);
+    let ctxs = sanitize_f64(ctx_switches_per_sec);
+    let pressure = if memory_pressure.is_finite() && memory_pressure >= 0.0 {
+        memory_pressure
+    } else {
+        0.0
+    };
+
+    // 3. Linear scaling against saturation thresholds (500 wakeups/s,
+    //    5000 ctx/s). Clamps avoid amplifying beyond the cap budget.
+    let wake_term = 0.20 * (wakeups / 500.0).clamp(0.0, 1.0);
+    let ctx_term = 0.05 * (ctxs / 5_000.0).clamp(0.0, 1.0);
+    let raw = wake_term + ctx_term;
+
+    // 4. Cap by regime. Low pressure: 0.20. High pressure: 0.05 (preserve
+    //    survival headroom — see [Le Sueur & Heiser 2010]).
+    let cap = if pressure >= 0.50 { 0.05 } else { 0.20 };
+    raw.min(cap).clamp(0.0, 0.20)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -966,5 +1065,156 @@ mod tests {
     fn default_trait() {
         let tracker = EnergyTracker::default();
         assert_eq!(tracker.tracked_count(), 0);
+    }
+
+    // ── Phase 5.2 — Battery-aware cost penalty tests ────────────────────────
+    //
+    // TDD red-phase tests for `battery_aware_cost_penalty`. The function must
+    // never penalize actions on AC power, must scale monotonically with
+    // wakeup pressure on battery, and must cap at 0.20 (or 0.05 under high
+    // memory pressure so survival actions are not blocked).
+    //
+    // [Tiwari 1994] frames CPU energy at instruction granularity; high
+    // wakeup/ctx-switch rates ⇒ many short bursts where the CPU never
+    // reaches the low-power C-state, so per-cycle Joules dominate over the
+    // wall-clock-CPU-pct model used elsewhere in this module.
+
+    #[test]
+    fn cost_penalty_zero_on_ac_power() {
+        // On AC power, no penalty is ever applied — even pathological
+        // wakeup/ctx-switch rates must yield 0.0.
+        assert_eq!(
+            battery_aware_cost_penalty(false, 0.0, 0.0, 0.0),
+            0.0,
+            "AC + idle ⇒ 0.0"
+        );
+        assert_eq!(
+            battery_aware_cost_penalty(false, 1_000.0, 50_000.0, 0.10),
+            0.0,
+            "AC + storm ⇒ still 0.0"
+        );
+        assert_eq!(
+            battery_aware_cost_penalty(false, 250.0, 2_500.0, 0.90),
+            0.0,
+            "AC + high pressure ⇒ still 0.0"
+        );
+    }
+
+    #[test]
+    fn cost_penalty_scales_with_wakeups_on_battery() {
+        // On battery + low pressure, the penalty must grow with wakeups_per_sec.
+        // At 0 wakeups + 0 ctx switches, penalty == 0. At full saturation
+        // (500 wakeups, 5000 ctx/s), penalty == 0.20 + 0.05 clamped to 0.20.
+        let p_idle = battery_aware_cost_penalty(true, 0.0, 0.0, 0.10);
+        let p_low = battery_aware_cost_penalty(true, 50.0, 500.0, 0.10);
+        let p_mid = battery_aware_cost_penalty(true, 250.0, 2_500.0, 0.10);
+        let p_high = battery_aware_cost_penalty(true, 500.0, 5_000.0, 0.10);
+
+        assert_eq!(p_idle, 0.0, "battery idle ⇒ 0.0, got {}", p_idle);
+        assert!(p_low > 0.0, "battery + light wakeups ⇒ >0, got {}", p_low);
+        assert!(
+            p_mid > p_low,
+            "penalty must scale up: p_low={} p_mid={}",
+            p_low,
+            p_mid
+        );
+        assert!(
+            p_high >= p_mid,
+            "penalty must keep scaling: p_mid={} p_high={}",
+            p_mid,
+            p_high
+        );
+    }
+
+    #[test]
+    fn cost_penalty_capped_at_020() {
+        // Even at 10x saturation, the penalty never exceeds 0.20 (low-pressure
+        // ceiling). This is the hard invariant the scorer relies on for
+        // bounded cost contributions.
+        let p = battery_aware_cost_penalty(true, 10_000.0, 100_000.0, 0.10);
+        assert!(
+            (p - 0.20).abs() < 1e-9,
+            "saturated penalty must equal 0.20, got {}",
+            p
+        );
+
+        // Sanity: at exactly the saturation point, also 0.20.
+        let p_sat = battery_aware_cost_penalty(true, 500.0, 5_000.0, 0.10);
+        assert!(
+            (p_sat - 0.20).abs() < 1e-9,
+            "exact saturation must equal 0.20, got {}",
+            p_sat
+        );
+    }
+
+    #[test]
+    fn cost_penalty_capped_at_005_under_high_pressure_on_battery() {
+        // Under high memory pressure (≥0.50), the penalty cap drops to 0.05 so
+        // it never blocks survival actions whose benefit exceeds 0.05.
+        // Even a pathological wakeup storm must not push the penalty above 0.05.
+        let p_storm = battery_aware_cost_penalty(true, 10_000.0, 100_000.0, 0.80);
+        assert!(
+            (p_storm - 0.05).abs() < 1e-9,
+            "high-pressure storm penalty must equal 0.05, got {}",
+            p_storm
+        );
+
+        let p_mid = battery_aware_cost_penalty(true, 250.0, 2_500.0, 0.55);
+        assert!(
+            p_mid <= 0.05 + 1e-9,
+            "high-pressure mid penalty must be ≤0.05, got {}",
+            p_mid
+        );
+
+        // At the boundary (pressure == 0.50), behave as high-pressure regime.
+        let p_boundary = battery_aware_cost_penalty(true, 10_000.0, 100_000.0, 0.50);
+        assert!(
+            p_boundary <= 0.05 + 1e-9,
+            "boundary pressure must be ≤0.05, got {}",
+            p_boundary
+        );
+    }
+
+    #[test]
+    fn cost_penalty_monotone_in_wakeups() {
+        // For a sweep of wakeup rates with all other inputs fixed, the
+        // penalty must be monotonically non-decreasing (relaxed: equality
+        // permitted once the cap is reached).
+        let pressures = [0.10, 0.55];
+        for pressure in pressures {
+            let mut prev = -1.0;
+            for w in [0.0, 50.0, 100.0, 200.0, 300.0, 400.0, 500.0, 800.0, 2_000.0] {
+                let p = battery_aware_cost_penalty(true, w, 0.0, pressure);
+                assert!(
+                    p >= prev - 1e-12,
+                    "penalty must be monotone in wakeups at pressure={}, \
+                     w={} ⇒ p={} prev={}",
+                    pressure,
+                    w,
+                    p,
+                    prev
+                );
+                assert!(p.is_finite(), "penalty must be finite, got {}", p);
+                assert!(p >= 0.0, "penalty must be ≥0, got {}", p);
+                assert!(p <= 0.20 + 1e-9, "penalty must be ≤0.20, got {}", p);
+                prev = p;
+            }
+        }
+    }
+
+    #[test]
+    fn cost_penalty_handles_nan_inputs() {
+        // Defensive guard: NaN/Inf inputs (sensor glitches) must not
+        // produce NaN/Inf outputs. Sanitize to zero.
+        let p_nan_w = battery_aware_cost_penalty(true, f64::NAN, 1_000.0, 0.10);
+        assert!(p_nan_w.is_finite(), "NaN wakeups must yield finite, got {}", p_nan_w);
+        assert!(p_nan_w >= 0.0 && p_nan_w <= 0.20);
+
+        let p_inf_c = battery_aware_cost_penalty(true, 100.0, f64::INFINITY, 0.10);
+        assert!(p_inf_c.is_finite(), "Inf ctx must yield finite, got {}", p_inf_c);
+        assert!(p_inf_c >= 0.0 && p_inf_c <= 0.20);
+
+        let p_neg = battery_aware_cost_penalty(true, -50.0, -500.0, 0.10);
+        assert_eq!(p_neg, 0.0, "negative rates ⇒ 0.0, got {}", p_neg);
     }
 }

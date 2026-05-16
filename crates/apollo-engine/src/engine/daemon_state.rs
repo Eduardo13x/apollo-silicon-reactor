@@ -133,6 +133,15 @@ impl MetricsState {
             lf.maintenance_purge_skipped_build_mode_total;
         self.metrics.maintenance_purge_skipped_rate_limit_total =
             lf.maintenance_purge_skipped_rate_limit_total;
+
+        // Phase 5.2 — Battery-aware cost penalty (Sprint 8, 2026-05-16).
+        // Producers are NOT wired in this commit (OPENS: 1) — the counter
+        // remains 0 in prod until decide_actions invokes the penalty
+        // function and increments the LSE counter. Plumbing the snapshot
+        // surface now keeps this in lockstep with skill_aware_modulations_total
+        // (Phase 3.1) and avoids a second touch on daemon_state.rs when wiring.
+        self.metrics.battery_aware_penalty_emissions_total =
+            lf.battery_aware_penalty_emissions_total;
     }
 }
 

@@ -1592,6 +1592,20 @@ pub struct RuntimeMetrics {
     pub maintenance_purge_skipped_build_mode_total: u64,
     #[serde(default)]
     pub maintenance_purge_skipped_rate_limit_total: u64,
+
+    /// Phase 5.2 — Battery-aware cost penalty emissions (Sprint 8,
+    /// 2026-05-16). Cumulative count of action-cost computations where
+    /// `battery_aware_cost_penalty` returned a strictly positive value
+    /// (battery + noise raised the action's cost). Stays at 0 on AC power
+    /// and on idle battery — non-zero only when the penalty actually
+    /// influenced a scoring decision.
+    ///
+    /// Wiring is deferred to a follow-up commit (see `OPENS: 1` on the
+    /// introducing commit). Producers will call
+    /// [`crate::engine::lse_counters::LockFreeMetrics::inc_battery_aware_penalty_emission`]
+    /// from the `decide_actions` cost-composition site.
+    #[serde(default)]
+    pub battery_aware_penalty_emissions_total: u64,
 }
 
 impl RuntimeMetrics {
