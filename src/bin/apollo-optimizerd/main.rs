@@ -2962,6 +2962,13 @@ fn main() -> anyhow::Result<()> {
                         current_arousal: arousal_state.level as f64,
                         audio_active: last_user_context_for_voting.audio_active,
                         has_sleep_assertion: last_user_context_for_voting.has_sleep_assertion,
+                        // Phase 5.1.1 production fix (2026-05-16) — raw
+                        // pressure feeds the critical-pressure bypass that
+                        // defuses the cascade-paralysis cycle observed in
+                        // prod (Score 0.85 + 0 actions). `signal_digest`
+                        // exposes the smoothed value used by every other
+                        // hot-path consumer, so reuse it here for consistency.
+                        memory_pressure: signal_digest.pressure_smooth,
                     };
                     let voting_out = daemon_cognitive_tick::apply_specialist_voting(
                         &state,

@@ -118,6 +118,13 @@ pub struct PresenceInputs {
     pub current_arousal: f64,
     pub audio_active: bool,
     pub has_sleep_assertion: bool,
+    /// Phase 5.1.1 production fix (2026-05-16) — raw memory pressure used
+    /// by the modulator's critical-pressure bypass. When `>= 0.65` the
+    /// modulator returns 1.0 (no suppression) regardless of HID activity,
+    /// so memory-survival actions are not zombified during interactive
+    /// sessions. See `user_presence::CRITICAL_PRESSURE_BYPASS` for the
+    /// empirical motivation (Score 0.85 + 0 actions cascade paralysis).
+    pub memory_pressure: f64,
 }
 
 /// Cross-cycle state needed by the Super Learner accuracy feedback loop.
@@ -464,6 +471,7 @@ pub fn apply_specialist_voting(
             presence_inputs.current_arousal,
             presence_inputs.audio_active,
             presence_inputs.has_sleep_assertion,
+            presence_inputs.memory_pressure,
         );
     let presence_modulated = apply_presence_factor(&mut votes, presence_factor);
     if presence_modulated > 0 {
@@ -732,6 +740,7 @@ mod tests {
             0.3,    // arousal (sub-crisis)
             false,  // audio_active
             false,  // has_sleep_assertion
+            0.0,    // memory_pressure (sub-critical — test the original suppression path)
         );
         // Sanity: this input combo MUST land in the active tier.
         assert!(

@@ -56,6 +56,23 @@ pub const SEMI_ACTIVE_MULTIPLIER: f64 = 0.75;
 /// 1.0 = "no suppression — Apollo can optimize freely".
 pub const IDLE_MULTIPLIER: f64 = 1.0;
 
+/// Phase 5.1.1 production fix (2026-05-16): bypass user-presence suppression
+/// when raw memory pressure crosses the "memory-thrash crisis floor" gate
+/// (`ram ≥ 0.60 && swap ≥ 1.5GB`, established in commit f16fa14). Mirrors the
+/// existing sleep-assertion bypass at `memory_pressure ≥ 0.75` from commit
+/// e9a5603: a polite UX guard must yield to a memory-survival action.
+///
+/// Empirical motivation: production dashboard at 2026-05-16 showed Score 0.85
+/// 🔴 Crítico + Profile aggressive-root + Pressure 66% c=58% + Alacritty FG +
+/// **zero actions applied** across a full cycle window. The 0.7× presence
+/// multiplier, cascaded with `SpecialistAccuracyTracker::weight() ≈ 0.7` and
+/// `skill_aware_factor ≈ 0.85`, dropped a typical 0.8 specialist confidence
+/// to `0.8 × 0.7 × 0.7 × 0.85 = 0.333` — below the 0.40 disagreement-safety
+/// floor. NotebookLM 2026-05-16 verdict matched the symptom: "Zombified
+/// Active State". This threshold defuses the cascade for genuine pressure
+/// regimes; UX-conditioned suppression still applies under calm pressure.
+pub const CRITICAL_PRESSURE_BYPASS: f64 = 0.65;
+
 /// Idle threshold for the "active" tier (seconds).
 /// Below this, the user is almost certainly at the keyboard.
 const ACTIVE_IDLE_SECONDS: f64 = 5.0;
@@ -175,7 +192,12 @@ pub fn user_presence_modulator_narrowed(
     current_arousal: f64,
     audio_active: bool,
     has_sleep_assertion: bool,
+    memory_pressure: f64,
 ) -> f64 {
+    // Phase 5.1.1 production fix: memory survival overrides UX suppression.
+    if memory_pressure >= CRITICAL_PRESSURE_BYPASS {
+        return IDLE_MULTIPLIER;
+    }
     if current_arousal >= CRISIS_AROUSAL_THRESHOLD {
         return IDLE_MULTIPLIER;
     }
@@ -209,7 +231,13 @@ pub fn user_presence_modulator_narrowed_no_counter(
     current_arousal: f64,
     audio_active: bool,
     has_sleep_assertion: bool,
+    memory_pressure: f64,
 ) -> f64 {
+    // Phase 5.1.1 production fix: memory survival overrides UX. See
+    // CRITICAL_PRESSURE_BYPASS docs for the empirical motivation.
+    if memory_pressure >= CRITICAL_PRESSURE_BYPASS {
+        return IDLE_MULTIPLIER;
+    }
     if current_arousal >= CRISIS_AROUSAL_THRESHOLD {
         return IDLE_MULTIPLIER;
     }
@@ -510,7 +538,7 @@ mod tests {
     /// Active tier (idle < 5s) under the narrowed band → 0.7.
     #[test]
     fn presence_narrowed_active_returns_07() {
-        let m = user_presence_modulator_narrowed(1.5, 60.0, 0.3, false, false);
+        let m = user_presence_modulator_narrowed(1.5, 60.0, 0.3, false, false, 0.0);
         assert!(
             (m - ACTIVE_MULTIPLIER_NARROWED).abs() < f64::EPSILON,
             "narrowed active tier must be 0.7, got {m}"
@@ -520,7 +548,7 @@ mod tests {
     /// Semi-active tier (idle in [5, 30)) under the narrowed band → 0.85.
     #[test]
     fn presence_narrowed_semi_active_returns_085() {
-        let m = user_presence_modulator_narrowed(20.0, 2.0, 0.3, false, false);
+        let m = user_presence_modulator_narrowed(20.0, 2.0, 0.3, false, false, 0.0);
         assert!(
             (m - SEMI_ACTIVE_MULTIPLIER_NARROWED).abs() < f64::EPSILON,
             "narrowed semi-active tier must be 0.85, got {m}"
@@ -532,20 +560,20 @@ mod tests {
     /// variant, by construction. Guard against future drift.
     #[test]
     fn presence_narrowed_no_counter_matches_counter_variant() {
-        let cases: &[(f64, f64, f64, bool, bool)] = &[
-            (1.5, 60.0, 0.3, false, false), // active
-            (20.0, 2.0, 0.3, false, false), // semi-active
-            (120.0, 0.0, 0.2, false, false), // idle
-            (1.0, 80.0, 0.85, false, false), // crisis
-            (1.0, 80.0, 0.3, true, false),   // passive audio
-            (1.0, 80.0, 0.3, false, true),   // passive sleep assertion
+        let cases: &[(f64, f64, f64, bool, bool, f64)] = &[
+            (1.5, 60.0, 0.3, false, false, 0.0), // active
+            (20.0, 2.0, 0.3, false, false, 0.0), // semi-active
+            (120.0, 0.0, 0.2, false, false, 0.0), // idle
+            (1.0, 80.0, 0.85, false, false, 0.0), // crisis
+            (1.0, 80.0, 0.3, true, false, 0.0),   // passive audio
+            (1.0, 80.0, 0.3, false, true, 0.0),   // passive sleep assertion
         ];
-        for &(idle, hid, arousal, audio, assertion) in cases {
+        for &(idle, hid, arousal, audio, assertion, pressure) in cases {
             let with_counter = user_presence_modulator_narrowed(
-                idle, hid, arousal, audio, assertion,
+                idle, hid, arousal, audio, assertion, pressure,
             );
             let no_counter = user_presence_modulator_narrowed_no_counter(
-                idle, hid, arousal, audio, assertion,
+                idle, hid, arousal, audio, assertion, pressure,
             );
             assert!(
                 (with_counter - no_counter).abs() < f64::EPSILON,
@@ -555,19 +583,43 @@ mod tests {
         }
     }
 
+    /// Phase 5.1.1 production fix — critical pressure bypasses HID suppression
+    /// even when the user is actively typing. Cascade-paralysis defuse.
+    #[test]
+    fn presence_narrowed_critical_pressure_bypasses_active_user() {
+        let m = user_presence_modulator_narrowed_no_counter(
+            1.0, 60.0, 0.3, false, false, 0.65,
+        );
+        assert!(
+            (m - IDLE_MULTIPLIER).abs() < f64::EPSILON,
+            "critical pressure must defuse cascade, got {m}"
+        );
+    }
+
+    #[test]
+    fn presence_narrowed_subcritical_pressure_keeps_suppression() {
+        let m = user_presence_modulator_narrowed_no_counter(
+            1.0, 60.0, 0.3, false, false, 0.64,
+        );
+        assert!(
+            (m - ACTIVE_MULTIPLIER_NARROWED).abs() < f64::EPSILON,
+            "subcritical pressure must retain suppression, got {m}"
+        );
+    }
+
     #[test]
     fn presence_narrowed_overrides_preserved() {
         // Crisis
-        let crisis = user_presence_modulator_narrowed(1.0, 80.0, 0.85, false, false);
+        let crisis = user_presence_modulator_narrowed(1.0, 80.0, 0.85, false, false, 0.0);
         assert!((crisis - IDLE_MULTIPLIER).abs() < f64::EPSILON);
         // Passive (audio)
-        let audio = user_presence_modulator_narrowed(1.0, 80.0, 0.3, true, false);
+        let audio = user_presence_modulator_narrowed(1.0, 80.0, 0.3, true, false, 0.0);
         assert!((audio - IDLE_MULTIPLIER).abs() < f64::EPSILON);
         // Passive (sleep assertion)
-        let assertion = user_presence_modulator_narrowed(1.0, 80.0, 0.3, false, true);
+        let assertion = user_presence_modulator_narrowed(1.0, 80.0, 0.3, false, true, 0.0);
         assert!((assertion - IDLE_MULTIPLIER).abs() < f64::EPSILON);
         // Idle (long, no HID, low arousal)
-        let idle = user_presence_modulator_narrowed(120.0, 0.0, 0.2, false, false);
+        let idle = user_presence_modulator_narrowed(120.0, 0.0, 0.2, false, false, 0.0);
         assert!((idle - IDLE_MULTIPLIER).abs() < f64::EPSILON);
     }
 
