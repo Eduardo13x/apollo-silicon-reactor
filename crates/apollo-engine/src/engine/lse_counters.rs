@@ -147,6 +147,17 @@ pub struct LockFreeMetrics {
     pub maintenance_purge_skipped_build_mode_total: AtomicU64,
     pub maintenance_purge_skipped_rate_limit_total: AtomicU64,
 
+    /// Phase 1 production-grade Change B (taskinfo cache, 2026-05-16).
+    /// Track hit/miss/evict so dashboards can verify the 4-cycle reuse
+    /// window is actually skipping syscalls under pressure (instead of
+    /// trusting the code path by inspection). NotebookLM 2026-05-16
+    /// flagged the absence of this counter as a gap blocking
+    /// "production-grade" status.
+    pub taskinfo_cache_hits: AtomicU64,
+    pub taskinfo_cache_misses: AtomicU64,
+    pub taskinfo_cache_exit_invalidations: AtomicU64,
+    pub taskinfo_cache_cap_evictions: AtomicU64,
+
     /// Phase 0 lock-decomposition instrumentation (2026-05-10).
     /// Tracks contention on the `state.metrics` god-lock to decide whether
     /// decomposition will actually move p95. Per NotebookLM round-3:
@@ -260,6 +271,10 @@ impl LockFreeMetrics {
             maintenance_purge_skipped_idle_total: AtomicU64::new(0),
             maintenance_purge_skipped_build_mode_total: AtomicU64::new(0),
             maintenance_purge_skipped_rate_limit_total: AtomicU64::new(0),
+            taskinfo_cache_hits: AtomicU64::new(0),
+            taskinfo_cache_misses: AtomicU64::new(0),
+            taskinfo_cache_exit_invalidations: AtomicU64::new(0),
+            taskinfo_cache_cap_evictions: AtomicU64::new(0),
             metrics_lock_wait_total_ns: AtomicU64::new(0),
             metrics_lock_wait_count: AtomicU64::new(0),
             metrics_lock_wait_max_ns: AtomicU64::new(0),
@@ -577,7 +592,33 @@ impl LockFreeMetrics {
             maintenance_purge_skipped_rate_limit_total: self
                 .maintenance_purge_skipped_rate_limit_total
                 .load(Ordering::Relaxed),
+            taskinfo_cache_hits: self.taskinfo_cache_hits.load(Ordering::Relaxed),
+            taskinfo_cache_misses: self.taskinfo_cache_misses.load(Ordering::Relaxed),
+            taskinfo_cache_exit_invalidations: self
+                .taskinfo_cache_exit_invalidations
+                .load(Ordering::Relaxed),
+            taskinfo_cache_cap_evictions: self
+                .taskinfo_cache_cap_evictions
+                .load(Ordering::Relaxed),
         }
+    }
+
+    /// Phase 1 prod-grade (2026-05-16): observability for the enrichment
+    /// syscall cache. Hit ratio = hits / (hits + misses). Eviction
+    /// counters help diagnose whether the hard cap is firing in prod.
+    pub fn inc_taskinfo_cache_hit(&self) {
+        self.taskinfo_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_taskinfo_cache_miss(&self) {
+        self.taskinfo_cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_taskinfo_cache_exit_invalidation(&self) {
+        self.taskinfo_cache_exit_invalidations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn add_taskinfo_cache_cap_evictions(&self, n: u64) {
+        self.taskinfo_cache_cap_evictions
+            .fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -641,6 +682,10 @@ pub struct MetricsSnapshot {
     pub maintenance_purge_skipped_idle_total: u64,
     pub maintenance_purge_skipped_build_mode_total: u64,
     pub maintenance_purge_skipped_rate_limit_total: u64,
+    pub taskinfo_cache_hits: u64,
+    pub taskinfo_cache_misses: u64,
+    pub taskinfo_cache_exit_invalidations: u64,
+    pub taskinfo_cache_cap_evictions: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

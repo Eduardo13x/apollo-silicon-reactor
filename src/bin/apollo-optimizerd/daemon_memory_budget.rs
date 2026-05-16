@@ -330,6 +330,7 @@ mod tests {
                     last_wake_at: None,
                     post_wake_grace_until: None,
                     post_wake_policy: "normal".to_string(),
+                    post_wake_reclaim_until: None,
                 },
             })),
             hardware: Arc::new(Mutex::new(HardwareState {

@@ -51,6 +51,7 @@ pub fn run_kqueue_tick(
     frozen_state_path: &Path,
     learnable_params: &LearnableParams,
     identity_cache: &IdentityCacheManager,
+    lf_metrics: Option<&apollo_engine::engine::lse_counters::LockFreeMetrics>,
 ) {
     let kq = match kq_frozen.as_mut() {
         Some(kq) => kq,
@@ -131,6 +132,16 @@ pub fn run_kqueue_tick(
                 // fix 2026-05-07; consolidated under
                 // IdentityCacheManager 2026-05-07 Fase 2).
                 identity_cache.notify_exited(pid);
+                // Phase 1 prod-grade (2026-05-16): purge dead PID from
+                // the enrichment-syscall cache too. Without this, the
+                // 4-cycle reuse window could serve stale rusage and
+                // contention values for a recycled PID — same hazard
+                // pattern that motivated the IdentityCache fix above,
+                // applied to the second cache that touches PIDs.
+                crate::process_enrichment::invalidate_cached_enrich(pid);
+                if let Some(m) = lf_metrics {
+                    m.inc_taskinfo_cache_exit_invalidation();
+                }
             }
             kqueue_pressure::PressureEvent::TimerTick => {}
         }

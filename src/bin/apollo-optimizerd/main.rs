@@ -1733,6 +1733,7 @@ fn main() -> anyhow::Result<()> {
                         &process_tree,
                         cycle_count,
                         prev_pressure_smooth,
+                        &lf_metrics,
                     );
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonEnrich,
@@ -2026,6 +2027,7 @@ fn main() -> anyhow::Result<()> {
                     &frozen_state_path,
                     &learnable_params,
                     &identity_cache,
+                    Some(&lf_metrics),
                 );
 
                 // hw_predictor can elevate pressure before standard metrics catch up.
