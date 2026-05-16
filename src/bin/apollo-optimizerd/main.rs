@@ -1291,17 +1291,23 @@ fn main() -> anyhow::Result<()> {
             let mut rusage_cpu_prev: HashMap<u32, (u64, u64, u64)> = HashMap::new();
             let mut last_rusage_at = Instant::now();
             // Lock-free metrics for hot-path counters (no mutex overhead).
-            let lf_metrics = std::sync::Arc::new(LockFreeMetrics::new());
-            // vm_surgeon: pin the lock-free metrics buffer in physical RAM.
-            // Guarantees zero page-fault latency on the hot path under memory pressure.
-            {
-                use apollo_engine::engine::vm_surgeon;
-                let ptr = &*lf_metrics as *const LockFreeMetrics as *const u8;
-                let len = std::mem::size_of::<LockFreeMetrics>();
-                if let Err(e) = vm_surgeon::pin_memory(ptr, len) {
-                    tracing::warn!(err = %e, "mlock on LockFreeMetrics failed, continuing unpinned");
-                }
-            }
+            //
+            // CRITICAL fix (2026-05-16): unify with the global `LSE_COUNTERS`
+            // static. Previously this was `Arc::new(LockFreeMetrics::new())`
+            // — a separate instance — which silently broke every `inc_*` call
+            // routed through `LSE_COUNTERS` (Phase 2 god-lock decomp, Phase 3.1
+            // skill_aware, Phase 5.1 user_presence, Phase 5.3 rationale, GAP 2
+            // reactor sticky, GAP 6 specialist purge, etc). Those wrote to the
+            // global, but `sync_from_lockfree` snapshot-read the local Arc, so
+            // the counters never reached runtime_metrics.json. Diagnostic on
+            // 2026-05-16 confirmed two distinct addresses (`0x100ee2a58` static
+            // vs `0x95385c7d8` Arc). Aliasing here closes the duplicate-state
+            // gap with a single line.
+            //
+            // mlock pinning removed: the static lives in BSS (zero-init at
+            // process start, kernel keeps it resident under normal pressure).
+            let lf_metrics: &'static LockFreeMetrics =
+                &apollo_engine::engine::lse_counters::LSE_COUNTERS;
             // Phase B1.5 — wire RecentlyApplied restore_status to lf_metrics telemetry.
             // Exactly one of the 5 counters is set to a non-zero value per startup,
             // letting NotebookLM debrief distinguish "persistence helps" vs "always
