@@ -86,6 +86,39 @@ use apollo_engine::engine::user_context::UserContext;
 /// ⇒ habituated and skipped in `decide_actions`.
 pub const HABITUATION_THRESHOLD: u32 = 5;
 
+/// Phase 5.1 wiring (2026-05-16) — inputs for the user-presence modulator
+/// applied inside [`apply_specialist_voting`].
+///
+/// All four signals are sampled from **last cycle's** [`UserContext`] plus
+/// the current cycle's `ArousalState::level`. The one-cycle lag on
+/// idle/audio/sleep_assertion is intentional and harmless: the
+/// `compute_user_context` block runs strictly *after*
+/// `apply_specialist_voting` in the daemon main loop ordering (see the
+/// "Ordering invariants" doc-block at the top of this file), so the current
+/// cycle's UserContext is not yet known when we need it for voting. A user
+/// who was typing 1 cycle ago (~80 ms) is overwhelmingly still typing now;
+/// the same logic the Phase 0c idle interpolation already relies on.
+///
+/// Defaults to "no suppression": `idle_seconds=120.0` (idle tier),
+/// `hid_events_per_minute=0.0`, `audio_active=false`, `has_sleep_assertion=false`,
+/// `arousal=0.0`. The first cycle of the daemon therefore returns
+/// `IDLE_MULTIPLIER` from `user_presence_modulator_narrowed_no_counter` and
+/// does not modulate votes. Subsequent cycles use real values.
+///
+/// `hid_events_per_minute` currently always 0.0 — no daemon-side accessor
+/// exists yet (TODO 2026-05-16). The 0.0 value cannot trigger the
+/// HID-rate clause; the modulator still operates correctly off `idle_seconds`
+/// alone. When a future activity-sensor lands, this field will pick up the
+/// real rate automatically.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PresenceInputs {
+    pub idle_seconds: f64,
+    pub hid_events_per_minute: f64,
+    pub current_arousal: f64,
+    pub audio_active: bool,
+    pub has_sleep_assertion: bool,
+}
+
 /// Cross-cycle state needed by the Super Learner accuracy feedback loop.
 ///
 /// At the end of each cycle the daemon updates this with the *actual* firing
@@ -110,6 +143,39 @@ pub struct SpecialistVotingOutput {
     /// tuple for the daemon to store in `last_specialist_votes` so Loop 3 can
     /// issue outcome feedback next cycle.  `None` when consensus.
     pub disagreement_record: Option<(Vec<SpecialistVote>, Intervention)>,
+}
+
+/// Phase 5.1 wiring — apply `presence_factor` to a vote bundle in place.
+///
+/// Returns the number of non-Observe votes that were modulated (caller uses
+/// this to drive the `user_presence_suppressions_total` counter on a
+/// per-modulated-vote basis, per NotebookLM 2026-05-16, Q2). Pure function
+/// over the vote slice — no I/O, no global mutation. Factored out of
+/// [`apply_specialist_voting`] for unit-testability without constructing the
+/// full [`LearningContext`] graph.
+///
+/// Contract:
+///   - `factor` is the value already produced by
+///     `user_presence_modulator_narrowed_no_counter`, so this helper does
+///     NOT itself decide whether the user is present.
+///   - When `factor` ≈ 1.0 the helper is a no-op and returns 0.
+///   - Otherwise non-Observe votes have their `confidence` multiplied by
+///     `factor` and clamped to `[0.0, 1.0]`; Observe votes are untouched
+///     (a "do nothing" vote must not be further suppressed — see the
+///     comment block in `apply_specialist_voting` for the rationale).
+#[inline]
+pub fn apply_presence_factor(votes: &mut [SpecialistVote], factor: f64) -> u64 {
+    if (factor - 1.0).abs() <= f64::EPSILON {
+        return 0;
+    }
+    let mut modulated = 0_u64;
+    for v in votes.iter_mut() {
+        if v.intervention != Intervention::Observe {
+            v.confidence = (v.confidence * factor).clamp(0.0, 1.0);
+            modulated += 1;
+        }
+    }
+    modulated
 }
 
 /// Phase 3.1 — Skill-Aware Prediction confidence multiplier.
@@ -167,6 +233,10 @@ pub fn apply_specialist_voting(
     // specialist votes by the historical success rate of past throttle-class
     // actions in this workload context.
     workload_mode: WorkloadMode,
+    // Phase 5.1 wiring (2026-05-16) — last cycle's UserContext + current
+    // arousal, used to scale non-Observe vote confidences by the narrowed
+    // user-presence multiplier ∈ [0.7, 1.0]. See [`PresenceInputs`].
+    presence_inputs: PresenceInputs,
 ) -> SpecialistVotingOutput {
     // ── Specialist accuracy feedback (Super Learner) ─────────────────
     // Compare prev cycle's ACTUAL specialist signals against observed outcome.
@@ -342,6 +412,42 @@ pub fn apply_specialist_voting(
             apollo_engine::engine::lse_counters::LSE_COUNTERS
                 .add_skill_aware_modulations(modulated);
         }
+    }
+
+    // Phase 5.1 wiring (2026-05-16) — User-Presence + passive-content
+    // suppression. Mirrors the Phase 3.1 skill-aware pattern: a multiplier
+    // ∈ [0.7, 1.0] (narrowed band, per NotebookLM 2026-05-16) scales each
+    // non-Observe vote's confidence. Observe votes are intentionally NOT
+    // modulated, identical reasoning to the skill-aware block: a "do
+    // nothing" vote should not be further suppressed by user-presence — that
+    // would let an active user permanently silence the system, with no way
+    // for the cognitive layer to recover its confidence.
+    //
+    // Counter `user_presence_suppressions_total` fires once per modulated
+    // vote (NotebookLM 2026-05-16, Q2 — per-vote granularity matches the
+    // skill_aware_modulations pattern and gives D1 Decision Precision
+    // enough signal density to diagnose which specialist paths are being
+    // damped).
+    //
+    // Wiring site chosen over `decide_actions.rs` cost composition per
+    // NotebookLM 2026-05-16, Q3 — user presence is a cognitive "telepathy"
+    // signal that modulates *confidence* (System 1 / System 2 separation
+    // [Kahneman 2011]), not a physical action cost. Folding it into
+    // decide_actions would conflate cognitive uncertainty with execution
+    // gates and re-introduce the God-Node coupling pattern flagged by NARS
+    // belief B001 / B008.
+    let presence_factor =
+        apollo_engine::engine::user_presence::user_presence_modulator_narrowed_no_counter(
+            presence_inputs.idle_seconds,
+            presence_inputs.hid_events_per_minute,
+            presence_inputs.current_arousal,
+            presence_inputs.audio_active,
+            presence_inputs.has_sleep_assertion,
+        );
+    let presence_modulated = apply_presence_factor(&mut votes, presence_factor);
+    if presence_modulated > 0 {
+        apollo_engine::engine::lse_counters::LSE_COUNTERS
+            .add_user_presence_suppressions(presence_modulated);
     }
 
     let vote_result = tally_votes(&votes);
@@ -567,6 +673,95 @@ mod tests {
     #[test]
     fn habituation_threshold_is_five() {
         assert_eq!(HABITUATION_THRESHOLD, 5);
+    }
+
+    // ── Phase 5.1 wiring — `apply_presence_factor` helper ────────────────────
+
+    fn vote(name: &'static str, intervention: Intervention, confidence: f64) -> SpecialistVote {
+        SpecialistVote {
+            name,
+            intervention,
+            confidence,
+        }
+    }
+
+    /// Active-user input (idle=2s, low HID, sub-crisis arousal, no passive
+    /// flags) → narrowed band returns 0.7 → non-Observe vote confidences
+    /// scale by 0.7×; Observe vote untouched.
+    ///
+    /// This is the round-trip test the spec calls out: with
+    ///   user_idle=2.0, hid_per_min=60.0, arousal=0.3,
+    ///   audio_active=false, has_sleep_assertion=false
+    /// the narrowed modulator returns 0.7 and `apply_presence_factor` must
+    /// multiply each non-Observe vote's confidence by 0.7.
+    #[test]
+    fn apply_specialist_voting_presence_factor_modulates_votes() {
+        let factor = apollo_engine::engine::user_presence::user_presence_modulator_narrowed_no_counter(
+            2.0,    // user_idle
+            60.0,   // hid_per_min
+            0.3,    // arousal (sub-crisis)
+            false,  // audio_active
+            false,  // has_sleep_assertion
+        );
+        // Sanity: this input combo MUST land in the active tier.
+        assert!(
+            (factor - 0.7).abs() < 1e-9,
+            "narrowed active tier expected 0.7, got {factor}"
+        );
+
+        let mut votes = vec![
+            vote("hazard", Intervention::TightenThresholds, 0.80),
+            vote("monopoly", Intervention::PreThrottleNoise, 0.60),
+            vote("linucb", Intervention::Observe, 0.55),
+        ];
+        let modulated = apply_presence_factor(&mut votes, factor);
+
+        assert_eq!(modulated, 2, "two non-Observe votes must be modulated");
+        // hazard: 0.80 × 0.7 = 0.56
+        assert!(
+            (votes[0].confidence - 0.56).abs() < 1e-9,
+            "hazard confidence: expected 0.56, got {}",
+            votes[0].confidence
+        );
+        // monopoly: 0.60 × 0.7 = 0.42
+        assert!(
+            (votes[1].confidence - 0.42).abs() < 1e-9,
+            "monopoly confidence: expected 0.42, got {}",
+            votes[1].confidence
+        );
+        // linucb (Observe): untouched.
+        assert!(
+            (votes[2].confidence - 0.55).abs() < 1e-9,
+            "Observe vote must NOT be modulated, got {}",
+            votes[2].confidence
+        );
+    }
+
+    /// Factor ≈ 1.0 (no suppression) → no-op, returns 0.
+    #[test]
+    fn apply_presence_factor_neutral_is_noop() {
+        let mut votes = vec![
+            vote("hazard", Intervention::TightenThresholds, 0.80),
+            vote("linucb", Intervention::Observe, 0.55),
+        ];
+        let before = votes.clone();
+        let modulated = apply_presence_factor(&mut votes, 1.0);
+        assert_eq!(modulated, 0);
+        for (a, b) in votes.iter().zip(before.iter()) {
+            assert!((a.confidence - b.confidence).abs() < f64::EPSILON);
+        }
+    }
+
+    /// Clamp to [0, 1]: a factor that would push confidence above 1.0 is
+    /// clamped. (Defensive — the narrowed band's max is 1.0 so this is a
+    /// belt-and-braces test against future caller misuse.)
+    #[test]
+    fn apply_presence_factor_clamps_into_unit_interval() {
+        let mut votes = vec![vote("h", Intervention::TightenThresholds, 0.9)];
+        // Pathological factor > 1 — should be clamped.
+        apply_presence_factor(&mut votes, 2.0);
+        assert!(votes[0].confidence <= 1.0);
+        assert!(votes[0].confidence >= 0.0);
     }
 
     // ── Phase 3.1 — Skill-Aware Prediction factor ────────────────────────────

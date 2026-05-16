@@ -120,6 +120,113 @@ pub fn user_presence_modulator(
     IDLE_MULTIPLIER
 }
 
+/// Narrowed "active" tier multiplier — Phase 5.1 wiring (2026-05-16).
+///
+/// NotebookLM peer-review post-Step-2 recommended narrowing the active-tier
+/// floor from 0.5 → 0.7 before wiring into `apply_specialist_voting`. The
+/// 0.5 floor multiplied with `SpecialistAccuracyTracker::weight()` (≈0.6),
+/// `skill_aware_factor` (0.85 at min damp) and a typical specialist confidence
+/// of 0.7 yields `0.6 × 0.85 × 0.7 × 0.5 = 0.179`, below the disagreement-
+/// safety floor (0.4). Result: every active-user cycle would collapse to
+/// Observe regardless of physical pressure ("Regression Paralysis"). With
+/// 0.7 the cascade min lifts to `0.6 × 0.85 × 0.7 × 0.7 = 0.250` — still
+/// roughly half typical confidence, but above the floor.
+///
+/// Used by [`user_presence_modulator_narrowed`].
+pub const ACTIVE_MULTIPLIER_NARROWED: f64 = 0.7;
+
+/// Narrowed "semi-active" tier multiplier — Phase 5.1 wiring.
+///
+/// 0.85 mirrors the same logic as [`ACTIVE_MULTIPLIER_NARROWED`]: keep the
+/// suppressive bite informative (15% damp) without dragging the cascade
+/// under the disagreement-safety floor. Centred symmetrically around the
+/// active-tier narrowing (0.7 → 0.85 → 1.0 = 15-point increments).
+pub const SEMI_ACTIVE_MULTIPLIER_NARROWED: f64 = 0.85;
+
+/// Phase 5.1 wiring — narrowed-band variant of
+/// [`user_presence_modulator_with_passive`].
+///
+/// Identical decision tree to `_with_passive` except the band is
+/// `[0.7, 1.0]` instead of `[0.5, 1.0]`. Preferred entry-point for the
+/// `apply_specialist_voting` wiring site. The wider-band variants remain
+/// exported for callers that want the original [Iqbal & Bailey 2008]
+/// damping profile (e.g., future `decide_actions.rs` cost composition).
+///
+/// Tier rules (first match wins):
+///   1. `current_arousal >= CRISIS_AROUSAL_THRESHOLD` → 1.0 (survival > UX)
+///   2. `audio_active || has_sleep_assertion` → 1.0 (passive content)
+///   3. active (idle < 5s OR hid_rate > 30) → 0.7
+///   4. semi-active (idle < 30s OR hid_rate > 5) → 0.85
+///   5. else → 1.0
+///
+/// Side effects: increments `user_presence_suppressions_total` ONCE per call
+/// that returns `< 1.0` (mirroring the base function's contract). The caller
+/// in `apply_specialist_voting` does NOT bump the counter again — that would
+/// double-count. The "fire per modulated vote" semantics requested by
+/// NotebookLM are implemented at the call site by issuing the
+/// `add_user_presence_suppressions(modulated)` only when this function
+/// returns `< 1.0`, with `modulated` equal to the number of non-Observe
+/// votes scaled in that cycle. To prevent the double-count we suppress the
+/// in-function increment via [`user_presence_modulator_narrowed_no_counter`],
+/// the variant invoked by the wiring site.
+pub fn user_presence_modulator_narrowed(
+    idle_seconds: f64,
+    hid_events_per_minute: f64,
+    current_arousal: f64,
+    audio_active: bool,
+    has_sleep_assertion: bool,
+) -> f64 {
+    if current_arousal >= CRISIS_AROUSAL_THRESHOLD {
+        return IDLE_MULTIPLIER;
+    }
+    if audio_active || has_sleep_assertion {
+        return IDLE_MULTIPLIER;
+    }
+    if idle_seconds < ACTIVE_IDLE_SECONDS || hid_events_per_minute > ACTIVE_HID_EVENTS_PER_MIN {
+        LSE_COUNTERS.add_user_presence_suppressions(1);
+        return ACTIVE_MULTIPLIER_NARROWED;
+    }
+    if idle_seconds < SEMI_ACTIVE_IDLE_SECONDS
+        || hid_events_per_minute > SEMI_ACTIVE_HID_EVENTS_PER_MIN
+    {
+        LSE_COUNTERS.add_user_presence_suppressions(1);
+        return SEMI_ACTIVE_MULTIPLIER_NARROWED;
+    }
+    IDLE_MULTIPLIER
+}
+
+/// Counter-free twin of [`user_presence_modulator_narrowed`] for the
+/// `apply_specialist_voting` wiring site, which increments the counter once
+/// per modulated vote (NotebookLM 2026-05-16 recommendation) rather than
+/// once per call.
+///
+/// Returns the same multiplier set `{0.7, 0.85, 1.0}` with identical
+/// decision logic; only the counter side-effect is omitted. The wiring
+/// site is the SOLE caller — do not export under a more general name.
+pub fn user_presence_modulator_narrowed_no_counter(
+    idle_seconds: f64,
+    hid_events_per_minute: f64,
+    current_arousal: f64,
+    audio_active: bool,
+    has_sleep_assertion: bool,
+) -> f64 {
+    if current_arousal >= CRISIS_AROUSAL_THRESHOLD {
+        return IDLE_MULTIPLIER;
+    }
+    if audio_active || has_sleep_assertion {
+        return IDLE_MULTIPLIER;
+    }
+    if idle_seconds < ACTIVE_IDLE_SECONDS || hid_events_per_minute > ACTIVE_HID_EVENTS_PER_MIN {
+        return ACTIVE_MULTIPLIER_NARROWED;
+    }
+    if idle_seconds < SEMI_ACTIVE_IDLE_SECONDS
+        || hid_events_per_minute > SEMI_ACTIVE_HID_EVENTS_PER_MIN
+    {
+        return SEMI_ACTIVE_MULTIPLIER_NARROWED;
+    }
+    IDLE_MULTIPLIER
+}
+
 /// Phase 5.1 (Gap B, 2026-05-16) — passive-content-aware variant.
 ///
 /// Extends [`user_presence_modulator`] with two binary signals from
@@ -396,6 +503,72 @@ mod tests {
                  arousal={arousal} → base={base}, extended={extended}"
             );
         }
+    }
+
+    // ── Phase 5.1 wiring — narrowed band [0.7, 1.0] ───────────────────────
+
+    /// Active tier (idle < 5s) under the narrowed band → 0.7.
+    #[test]
+    fn presence_narrowed_active_returns_07() {
+        let m = user_presence_modulator_narrowed(1.5, 60.0, 0.3, false, false);
+        assert!(
+            (m - ACTIVE_MULTIPLIER_NARROWED).abs() < f64::EPSILON,
+            "narrowed active tier must be 0.7, got {m}"
+        );
+    }
+
+    /// Semi-active tier (idle in [5, 30)) under the narrowed band → 0.85.
+    #[test]
+    fn presence_narrowed_semi_active_returns_085() {
+        let m = user_presence_modulator_narrowed(20.0, 2.0, 0.3, false, false);
+        assert!(
+            (m - SEMI_ACTIVE_MULTIPLIER_NARROWED).abs() < f64::EPSILON,
+            "narrowed semi-active tier must be 0.85, got {m}"
+        );
+    }
+
+    /// Crisis + passive overrides still return 1.0 under the narrowed band.
+    /// The no-counter twin returns the same multipliers as the counter
+    /// variant, by construction. Guard against future drift.
+    #[test]
+    fn presence_narrowed_no_counter_matches_counter_variant() {
+        let cases: &[(f64, f64, f64, bool, bool)] = &[
+            (1.5, 60.0, 0.3, false, false), // active
+            (20.0, 2.0, 0.3, false, false), // semi-active
+            (120.0, 0.0, 0.2, false, false), // idle
+            (1.0, 80.0, 0.85, false, false), // crisis
+            (1.0, 80.0, 0.3, true, false),   // passive audio
+            (1.0, 80.0, 0.3, false, true),   // passive sleep assertion
+        ];
+        for &(idle, hid, arousal, audio, assertion) in cases {
+            let with_counter = user_presence_modulator_narrowed(
+                idle, hid, arousal, audio, assertion,
+            );
+            let no_counter = user_presence_modulator_narrowed_no_counter(
+                idle, hid, arousal, audio, assertion,
+            );
+            assert!(
+                (with_counter - no_counter).abs() < f64::EPSILON,
+                "narrowed twins diverged at idle={idle}, hid={hid}, arousal={arousal}, \
+                 audio={audio}, assertion={assertion}: with={with_counter}, no={no_counter}"
+            );
+        }
+    }
+
+    #[test]
+    fn presence_narrowed_overrides_preserved() {
+        // Crisis
+        let crisis = user_presence_modulator_narrowed(1.0, 80.0, 0.85, false, false);
+        assert!((crisis - IDLE_MULTIPLIER).abs() < f64::EPSILON);
+        // Passive (audio)
+        let audio = user_presence_modulator_narrowed(1.0, 80.0, 0.3, true, false);
+        assert!((audio - IDLE_MULTIPLIER).abs() < f64::EPSILON);
+        // Passive (sleep assertion)
+        let assertion = user_presence_modulator_narrowed(1.0, 80.0, 0.3, false, true);
+        assert!((assertion - IDLE_MULTIPLIER).abs() < f64::EPSILON);
+        // Idle (long, no HID, low arousal)
+        let idle = user_presence_modulator_narrowed(120.0, 0.0, 0.2, false, false);
+        assert!((idle - IDLE_MULTIPLIER).abs() < f64::EPSILON);
     }
 
     #[test]
