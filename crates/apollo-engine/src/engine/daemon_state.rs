@@ -153,6 +153,13 @@ impl MetricsState {
         self.metrics.causal_external_thermal_blames_total = lf.causal_external_thermal_blames_total;
         self.metrics.causal_external_disk_blames_total = lf.causal_external_disk_blames_total;
         self.metrics.causal_external_net_blames_total = lf.causal_external_net_blames_total;
+
+        // Phase 4.3 — Policy Rollback Guard observability (Sprint 7).
+        // Per CLAUDE.md observability discipline: surface both counters
+        // so dashboards (and the user) can verify the guard is
+        // actually running.
+        self.metrics.policy_rollback_evaluations_total = lf.policy_rollback_evaluations_total;
+        self.metrics.policy_rollback_executions_total = lf.policy_rollback_executions_total;
     }
 }
 

@@ -257,6 +257,18 @@ pub struct LockFreeMetrics {
     pub causal_external_thermal_blames_total: AtomicU64,
     pub causal_external_disk_blames_total: AtomicU64,
     pub causal_external_net_blames_total: AtomicU64,
+
+    /// Phase 4.3 — Policy Rollback Guard observability (Sprint 7, 2026-05-16).
+    /// Each cycle the daemon will call `PolicyRollbackGuard::evaluate` to
+    /// check whether `RestoreQualityMonitor::quality` has fallen below the
+    /// safety floor for long enough to revert a recent parameter shift.
+    /// `evaluations_total` increments per call (success or not) — dashboards
+    /// can compute the fire ratio against `executions_total`. Both are
+    /// surfaced through `MetricsSnapshot → RuntimeMetrics → runtime_metrics.json`
+    /// so the user can verify the guard is actually running and not
+    /// silently dormant.
+    pub policy_rollback_evaluations_total: AtomicU64,
+    pub policy_rollback_executions_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -371,6 +383,9 @@ impl LockFreeMetrics {
             causal_external_thermal_blames_total: AtomicU64::new(0),
             causal_external_disk_blames_total: AtomicU64::new(0),
             causal_external_net_blames_total: AtomicU64::new(0),
+
+            policy_rollback_evaluations_total: AtomicU64::new(0),
+            policy_rollback_executions_total: AtomicU64::new(0),
         }
     }
 
@@ -712,6 +727,12 @@ impl LockFreeMetrics {
             causal_external_net_blames_total: self
                 .causal_external_net_blames_total
                 .load(Ordering::Relaxed),
+            policy_rollback_evaluations_total: self
+                .policy_rollback_evaluations_total
+                .load(Ordering::Relaxed),
+            policy_rollback_executions_total: self
+                .policy_rollback_executions_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -778,6 +799,19 @@ impl LockFreeMetrics {
     #[inline(always)]
     pub fn inc_causal_external_net_blame(&self) {
         self.causal_external_net_blames_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Phase 4.3 — Policy Rollback Guard observability hooks (Sprint 7).
+    /// Wired from `PolicyRollbackGuard::evaluate` and `mark_executed`
+    /// in `learned_state.rs`. Caller code in `daemon` will be wired in
+    /// a follow-up commit per the Phase 4.3 OPENS: 1 directive.
+    pub fn inc_policy_rollback_evaluation(&self) {
+        self.policy_rollback_evaluations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_policy_rollback_execution(&self) {
+        self.policy_rollback_executions_total
             .fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -859,6 +893,10 @@ pub struct MetricsSnapshot {
     pub causal_external_thermal_blames_total: u64,
     pub causal_external_disk_blames_total: u64,
     pub causal_external_net_blames_total: u64,
+
+    /// Phase 4.3 — Policy Rollback Guard observability (Sprint 7).
+    pub policy_rollback_evaluations_total: u64,
+    pub policy_rollback_executions_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
