@@ -278,6 +278,18 @@ pub struct LockFreeMetrics {
     /// in production rather than no-op'ing on a quiescent system.
     /// [McGaugh 2004] arousal → consolidation; [Yerkes & Dodson 1908].
     pub arousal_decay_accelerations_total: AtomicU64,
+
+    /// Phase 4.1 — Adaptive Drift Threshold observability (Sprint 7,
+    /// 2026-05-16). Incremented each time
+    /// [`crate::engine::nars_belief::AdaptiveDriftThreshold::recommended_threshold`]
+    /// returns a value strictly greater than the supplied base — i.e. the
+    /// adaptive layer raised the bar based on observed noise variance.
+    /// Mirrors the Phase 3.1 / 3.2 / 5.2 counter design so dashboards can
+    /// verify the feature actually engages in prod rather than silently
+    /// no-op'ing.
+    /// [Brown 1959] EMA; [Welford 1962] online variance; [Kuncheva 2004]
+    /// adaptive drift detection.
+    pub adaptive_drift_threshold_raises_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -397,6 +409,8 @@ impl LockFreeMetrics {
             policy_rollback_executions_total: AtomicU64::new(0),
 
             arousal_decay_accelerations_total: AtomicU64::new(0),
+
+            adaptive_drift_threshold_raises_total: AtomicU64::new(0),
         }
     }
 
@@ -746,6 +760,9 @@ impl LockFreeMetrics {
             arousal_decay_accelerations_total: self
                 .arousal_decay_accelerations_total
                 .load(Ordering::Relaxed),
+            adaptive_drift_threshold_raises_total: self
+                .adaptive_drift_threshold_raises_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -839,6 +856,18 @@ impl LockFreeMetrics {
         self.arousal_decay_accelerations_total
             .fetch_add(n, Ordering::Relaxed);
     }
+
+    /// Phase 4.1 — Adaptive Drift Threshold observability hook.
+    /// Call once per `AdaptiveDriftThreshold::recommended_threshold` that
+    /// returned strictly greater than the supplied base (i.e. the noise
+    /// variance bumped the threshold above the operator-tuned floor).
+    /// Mirrors the Phase 3.1 / 3.2 / 5.2 counter design so dashboards can
+    /// detect whether the adaptive layer actually engages in prod.
+    /// [Brown 1959]; [Welford 1962]; [Kuncheva 2004].
+    pub fn add_adaptive_drift_threshold_raises(&self, n: u64) {
+        self.adaptive_drift_threshold_raises_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 // Safe to share across threads — all fields are atomic.
@@ -925,6 +954,9 @@ pub struct MetricsSnapshot {
 
     /// Phase 3.2 — Arousal-Modulated NARS Decay counter.
     pub arousal_decay_accelerations_total: u64,
+
+    /// Phase 4.1 — Adaptive Drift Threshold raises counter (Sprint 7).
+    pub adaptive_drift_threshold_raises_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

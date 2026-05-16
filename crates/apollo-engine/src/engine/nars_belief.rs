@@ -849,6 +849,146 @@ impl ArousalState {
     }
 }
 
+// ── AdaptiveDriftThreshold (Phase 4.1) ───────────────────────────────────────
+
+/// Second-order EMA of drift-delta variance, used to raise the bar for
+/// what counts as a "significant drift" in noisy environments.
+///
+/// **Why a second-order EMA?** The first-order EMA (`noise_ema`) tracks the
+/// running mean of per-observation drift magnitudes (i.e. the noise floor).
+/// The second-order EMA (`noise_variance_ema`) tracks the running variance
+/// of the same signal around that mean. Together they yield an O(1) per
+/// observation estimate of σ on which we can build a 2σ confidence band
+/// without storing the full window — bounded per-cycle work as required by
+/// CLAUDE.md.
+///
+/// Tightness vs. deafness trade-off:
+///   stable system → variance → 0 → recommended ≈ base (no extra deafness)
+///   noisy system  → variance > 0 → recommended = base + 2σ (raise the bar)
+///   pathological  → cap at 2× base (never let the threshold run away)
+///
+/// **References**
+/// - [Brown 1959] "Statistical Forecasting for Inventory Control" —
+///   exponentially weighted moving average as the canonical online mean
+///   estimator with bounded memory.
+/// - [Welford 1962] "Note on a Method for Calculating Corrected Sums of
+///   Squares and Products" — online running variance, here adapted to the
+///   EMA form `var := α·(x − μ)² + (1−α)·var`.
+/// - [Kuncheva 2004] "Classifier Ensembles for Changing Environments" —
+///   concept-drift detectors need adaptive thresholds calibrated to the
+///   observed noise floor, otherwise they hair-trigger in stable regimes
+///   and lag in turbulent ones.
+///
+/// **Per-instance state size:** 24 bytes (two f64 + one u64). Hot-path
+/// safe; designed to live inside `DaemonState` or `DriftDetector`'s sibling
+/// fields without ballooning persisted state.
+///
+/// **OPENS: 1 — wiring deferred to a follow-up commit.** This commit ships
+/// the struct, the LSE counter
+/// (`adaptive_drift_threshold_raises_total`) and the full
+/// MetricsSnapshot → RuntimeMetrics surface so the next commit can land
+/// the producer with a single touch. Wiring points:
+///   1. **`observe()`** must fire once per persist cycle inside
+///      `apollo-optimizerd::learning_tick` (or wherever
+///      `DriftDetector::observe()` is invoked), passing the absolute
+///      value of the just-recorded per-belief drift delta.
+///   2. **`recommended_threshold(base)`** must replace the hardcoded
+///      `drift_threshold` read at `DriftDetector::observe_salient`
+///      (currently uses `self.drift_threshold` directly inside
+///      `BeliefEntry::is_drifted`). Adapter pattern: keep
+///      `self.drift_threshold` as the operator-tuned base; use the
+///      `recommended_threshold` return as the effective comparison value
+///      for the drifted-count count and incremented
+///      `LSE_COUNTERS.add_adaptive_drift_threshold_raises(1)` on
+///      `recommended > base`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdaptiveDriftThreshold {
+    /// First-order EMA of |drift_delta| samples. Acts as the running
+    /// estimate of the noise mean. Alpha = 0.05 — slow enough that a
+    /// single outlier doesn't whip the mean, fast enough that a sustained
+    /// regime change is reflected within ~60 samples.
+    #[serde(default)]
+    pub noise_ema: f64,
+    /// Second-order EMA: running variance of |drift_delta| around
+    /// `noise_ema`. Alpha = 0.02 — strictly slower than `noise_ema` so the
+    /// variance estimator is computed against a relatively settled mean
+    /// (avoids the bias of co-moving estimators).
+    #[serde(default)]
+    pub noise_variance_ema: f64,
+    /// Total observations seen. Used to gate the cold-start window
+    /// (≥50 samples before the recommended threshold can deviate from
+    /// base). u64 because the daemon runs for weeks at a time.
+    #[serde(default)]
+    pub samples: u64,
+}
+
+impl AdaptiveDriftThreshold {
+    /// EMA alpha for the first-order (mean) tracker. Tuned slow so a
+    /// single noisy cycle doesn't whip the noise floor.
+    const ALPHA_MEAN: f64 = 0.05;
+    /// EMA alpha for the second-order (variance) tracker. Strictly slower
+    /// than `ALPHA_MEAN` so the variance is computed against a settled
+    /// mean (avoids bias from co-moving estimators).
+    const ALPHA_VAR: f64 = 0.02;
+    /// Cold-start window: below this many observations, the recommended
+    /// threshold MUST equal `base`. 50 ≈ 100s at 0.5Hz daemon cycle, long
+    /// enough for the EMAs to leave their zero-init region.
+    const MIN_SAMPLES: u64 = 50;
+    /// Multiplier applied to √variance to derive the 2σ confidence band.
+    /// 2σ ≈ 95% of a Normal distribution; matches the [Kuncheva 2004]
+    /// drift-detector heuristic.
+    const SIGMA_K: f64 = 2.0;
+    /// Hard cap: recommended threshold may never exceed `base * MAX_RATIO`.
+    /// Prevents pathological signal from inducing complete drift deafness.
+    const MAX_RATIO: f64 = 2.0;
+
+    /// Record a single absolute drift delta. O(1) — two FP multiplies and
+    /// two FP adds. Bounded per-cycle work invariant preserved.
+    ///
+    /// `abs_drift_delta` is the magnitude (≥ 0) of the per-belief
+    /// frequency shift produced by an `observe()` call. Callers that have
+    /// signed deltas must apply `.abs()` first.
+    pub fn observe(&mut self, abs_drift_delta: f64) {
+        // Sanitise: clamp to a sane range. NaN/Inf are dropped to 0 so
+        // poisoned input from upstream never compounds inside our EMAs.
+        let x = if abs_drift_delta.is_finite() {
+            abs_drift_delta.max(0.0)
+        } else {
+            0.0
+        };
+        // First-order EMA: noise_ema := α·x + (1−α)·noise_ema
+        self.noise_ema = Self::ALPHA_MEAN * x + (1.0 - Self::ALPHA_MEAN) * self.noise_ema;
+        // Second-order EMA against the (just updated) mean:
+        //   var := α·(x − μ)² + (1−α)·var
+        // [Welford 1962] adapted to exponential-decay form.
+        let dev = x - self.noise_ema;
+        self.noise_variance_ema =
+            Self::ALPHA_VAR * dev * dev + (1.0 - Self::ALPHA_VAR) * self.noise_variance_ema;
+        // Saturating sample counter — daemon uptime exceeds 2^63 ns
+        // (~292 years) before this overflows, so saturate is symbolic.
+        self.samples = self.samples.saturating_add(1);
+    }
+
+    /// Compute the recommended drift threshold given a tuned base.
+    ///
+    /// Contract:
+    ///   - `samples < MIN_SAMPLES` → return `base` verbatim (cold start)
+    ///   - otherwise → `base + 2·√variance`, clamped to `[base, 2·base]`
+    ///
+    /// The lower clamp guarantees the adaptive layer never silently
+    /// deafens to below the operator-tuned base; the upper clamp prevents
+    /// pathological variance from inducing complete drift blindness.
+    pub fn recommended_threshold(&self, base_threshold: f64) -> f64 {
+        if self.samples < Self::MIN_SAMPLES {
+            return base_threshold;
+        }
+        let sigma = self.noise_variance_ema.max(0.0).sqrt();
+        let effective = base_threshold + Self::SIGMA_K * sigma;
+        let upper = base_threshold * Self::MAX_RATIO;
+        effective.clamp(base_threshold, upper)
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1798,5 +1938,101 @@ mod tests {
             );
             prev = f;
         }
+    }
+
+    // ── AdaptiveDriftThreshold (Phase 4.1) ────────────────────────────────────
+
+    #[test]
+    fn adaptive_threshold_cold_start_returns_base() {
+        // < 50 samples: recommended_threshold MUST return the base unchanged.
+        // No claim of "what counts as drift" can be made without enough data;
+        // returning a fabricated boost would prematurely deafen the detector.
+        let mut adt = AdaptiveDriftThreshold::default();
+        for _ in 0..49 {
+            adt.observe(0.50); // very noisy samples, but still cold-start
+        }
+        let base = 0.20_f64;
+        let rec = adt.recommended_threshold(base);
+        assert_eq!(
+            rec, base,
+            "Cold start (samples<50) must return base verbatim; got {rec}"
+        );
+    }
+
+    #[test]
+    fn adaptive_threshold_noisy_history_raises_threshold() {
+        // After 50+ samples with high variance, the recommended threshold
+        // must rise strictly above base by ~2 sigma. [Welford 1962] EMA variance
+        // as the running estimate of noise floor.
+        let mut adt = AdaptiveDriftThreshold::default();
+        // Inject alternating large drifts to build variance.
+        for i in 0..200 {
+            let v = if i % 2 == 0 { 0.30 } else { 0.05 };
+            adt.observe(v);
+        }
+        let base = 0.20_f64;
+        let rec = adt.recommended_threshold(base);
+        assert!(
+            rec > base,
+            "Noisy history must raise threshold above base; got rec={rec} base={base}"
+        );
+    }
+
+    #[test]
+    fn adaptive_threshold_stable_history_keeps_base() {
+        // After 50+ samples that are all near-zero (a stable system), the
+        // recommended threshold should stay at — or extremely close to —
+        // base. A stable noise floor should never deafen the detector.
+        let mut adt = AdaptiveDriftThreshold::default();
+        for _ in 0..200 {
+            adt.observe(0.0);
+        }
+        let base = 0.20_f64;
+        let rec = adt.recommended_threshold(base);
+        // Zero variance ⇒ 2*sqrt(0) = 0 ⇒ rec == base exactly.
+        assert!(
+            (rec - base).abs() < 1e-9,
+            "Stable history must keep base; got rec={rec} base={base}"
+        );
+    }
+
+    #[test]
+    fn adaptive_threshold_capped_at_2x_base() {
+        // Even an extremely noisy history must not push the threshold past
+        // 2× base. Guards against runaway deafness in pathological signal.
+        let mut adt = AdaptiveDriftThreshold::default();
+        for i in 0..500 {
+            // Huge oscillations: drift values swing 0..1.
+            let v = if i % 2 == 0 { 1.0 } else { 0.0 };
+            adt.observe(v);
+        }
+        let base = 0.20_f64;
+        let rec = adt.recommended_threshold(base);
+        assert!(
+            rec <= base * 2.0 + 1e-9,
+            "Threshold must be capped at 2× base; got rec={rec}, cap={}",
+            base * 2.0
+        );
+    }
+
+    #[test]
+    fn adaptive_threshold_never_below_base() {
+        // Invariant: recommended_threshold ≥ base for any input. The
+        // adaptive layer can only raise the bar; it must never silently
+        // lower a tuned base threshold and risk hair-trigger drift signals.
+        let mut adt = AdaptiveDriftThreshold::default();
+        // Mix of values (observe takes abs_drift_delta).
+        let samples = [0.0_f64, 0.01, 0.05, 0.10, 0.20, 0.30, 0.50, 0.80, 1.0];
+        for _ in 0..30 {
+            for &v in &samples {
+                adt.observe(v);
+            }
+        }
+        let base = 0.20_f64;
+        let rec = adt.recommended_threshold(base);
+        assert!(
+            rec >= base - 1e-9,
+            "Adaptive threshold must never go below base; got rec={rec} base={base}"
+        );
     }
 }

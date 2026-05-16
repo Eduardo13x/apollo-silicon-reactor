@@ -230,3 +230,42 @@ fn batch1_phases_32_42_43_52_counters_reach_runtime_metrics_json() {
         );
     }
 }
+
+/// Phase 4.1 (Sprint 7) telemetry round-trip: the
+/// `adaptive_drift_threshold_raises_total` counter added by Phase 4.1
+/// must survive the full chain LockFreeMetrics → snapshot →
+/// sync_from_lockfree → RuntimeMetrics → JSON. Mirrors the
+/// `batch1_phases_*` pattern; pins the counter to a distinct literal so
+/// regressions surface as test failures instead of as silent dashboard
+/// zeros.
+///
+/// Pinned literal `7` is arbitrary but distinct from neighbouring
+/// counters in `batch1_phases_*` (13, 2, 3, 4, 5, 2, 6) — keeps the
+/// "search the JSON for this exact number" diagnostic readable.
+#[test]
+fn phase_41_adaptive_drift_threshold_raises_reach_runtime_metrics_json() {
+    let lf = LockFreeMetrics::new();
+    for _ in 0..7 {
+        lf.add_adaptive_drift_threshold_raises(1);
+    }
+    // Sanity: also exercise the bulk-add path.
+    lf.add_adaptive_drift_threshold_raises(0);
+
+    let snap = lf.snapshot();
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+
+    assert_eq!(
+        state.metrics.adaptive_drift_threshold_raises_total, 7,
+        "RuntimeMetrics did not mirror lockfree counter"
+    );
+
+    let json = serde_json::to_string(&state.metrics).expect("serialize RuntimeMetrics");
+    let needle = "\"adaptive_drift_threshold_raises_total\":7";
+    assert!(
+        json.contains(needle),
+        "Phase 4.1 counter missing from JSON (looked for {}): {}",
+        needle,
+        &json[..json.len().min(500)]
+    );
+}
