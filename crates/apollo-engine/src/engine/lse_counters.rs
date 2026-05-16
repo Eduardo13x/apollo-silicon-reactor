@@ -230,6 +230,18 @@ pub struct LockFreeMetrics {
     pub reactor_pulses: AtomicU64,
     /// Store f64 reactor event weight as raw u64 bits.
     pub reactor_event_weight_bits: AtomicU64,
+
+    /// Phase 4.3 — Policy Rollback Guard observability (Sprint 7, 2026-05-16).
+    /// Each cycle the daemon will call `PolicyRollbackGuard::evaluate` to
+    /// check whether `RestoreQualityMonitor::quality` has fallen below the
+    /// safety floor for long enough to revert a recent parameter shift.
+    /// `evaluations_total` increments per call (success or not) — dashboards
+    /// can compute the fire ratio against `executions_total`. Both are
+    /// surfaced through `MetricsSnapshot → RuntimeMetrics → runtime_metrics.json`
+    /// so the user can verify the guard is actually running and not
+    /// silently dormant.
+    pub policy_rollback_evaluations_total: AtomicU64,
+    pub policy_rollback_executions_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -339,6 +351,8 @@ impl LockFreeMetrics {
             iokit_errors: AtomicU64::new(0),
             reactor_pulses: AtomicU64::new(0),
             reactor_event_weight_bits: AtomicU64::new(0_f64.to_bits()),
+            policy_rollback_evaluations_total: AtomicU64::new(0),
+            policy_rollback_executions_total: AtomicU64::new(0),
         }
     }
 
@@ -668,6 +682,12 @@ impl LockFreeMetrics {
             reactor_event_weight: f64::from_bits(
                 self.reactor_event_weight_bits.load(Ordering::Relaxed),
             ),
+            policy_rollback_evaluations_total: self
+                .policy_rollback_evaluations_total
+                .load(Ordering::Relaxed),
+            policy_rollback_executions_total: self
+                .policy_rollback_executions_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -697,6 +717,19 @@ impl LockFreeMetrics {
     pub fn add_skill_aware_modulations(&self, n: u64) {
         self.skill_aware_modulations_total
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Phase 4.3 — Policy Rollback Guard observability hooks (Sprint 7).
+    /// Wired from `PolicyRollbackGuard::evaluate` and `mark_executed`
+    /// in `learned_state.rs`. Caller code in `daemon` will be wired in
+    /// a follow-up commit per the Phase 4.3 OPENS: 1 directive.
+    pub fn inc_policy_rollback_evaluation(&self) {
+        self.policy_rollback_evaluations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_policy_rollback_execution(&self) {
+        self.policy_rollback_executions_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -770,6 +803,9 @@ pub struct MetricsSnapshot {
     pub iokit_errors: u64,
     pub reactor_pulses: u64,
     pub reactor_event_weight: f64,
+    /// Phase 4.3 — Policy Rollback Guard observability (Sprint 7).
+    pub policy_rollback_evaluations_total: u64,
+    pub policy_rollback_executions_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

@@ -133,6 +133,13 @@ impl MetricsState {
             lf.maintenance_purge_skipped_build_mode_total;
         self.metrics.maintenance_purge_skipped_rate_limit_total =
             lf.maintenance_purge_skipped_rate_limit_total;
+
+        // Phase 4.3 — Policy Rollback Guard observability (Sprint 7).
+        // Per CLAUDE.md observability discipline: surface both counters
+        // so dashboards (and the user) can verify the guard is
+        // actually running.
+        self.metrics.policy_rollback_evaluations_total = lf.policy_rollback_evaluations_total;
+        self.metrics.policy_rollback_executions_total = lf.policy_rollback_executions_total;
     }
 }
 

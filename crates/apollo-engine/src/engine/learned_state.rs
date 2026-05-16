@@ -1184,6 +1184,204 @@ pub struct RestoreVerdict {
     pub stale: bool,
 }
 
+// ── Phase 4.3 — Policy Rollback Guard (Sprint 7) ─────────────────────────────
+//
+// Real-time circuit breaker for aggressive parameter shifts.
+//
+// When meta-learning or RL-driven self-tuning pushes a `LearnableParams`
+// field toward a more aggressive value (higher band ceiling, faster zone
+// alpha, lower overflow threshold), the daemon may discover only later that
+// the new value degrades outcome quality — visible as a drop in
+// `RestoreQualityMonitor::quality`. This guard:
+//
+// 1. Records the *pre-shift* value of any tracked parameter whenever the
+//    caller mutates it (callers must opt-in via `record_shift`).
+// 2. Each cycle, the caller asks `evaluate(quality, now)` whether the
+//    current observed quality demands a rollback to a recent pre-shift
+//    value. The decision is conservative: only fires when quality is
+//    below the safety floor AND at least one shift happened in the last
+//    5 minutes AND the previous rollback cooldown has elapsed.
+// 3. The caller applies the rollback (this module DECIDES; it does not
+//    mutate `LearnableParams`) and then calls `mark_executed`, which
+//    starts a 10-minute cooldown and clears the recent-shifts buffer.
+//
+// References:
+// - [Nygard 2018] "Release It!" Ch.5 — circuit breaker as the canonical
+//   pattern for auto-reverting a misbehaving downstream policy.
+// - [Goodfellow 2016] "Deep Learning" §7 — when a learning rule degrades
+//   validation loss, regress to the last-known-good parameter snapshot
+//   rather than continuing to descend a poisoned gradient.
+
+/// Discriminator for which kind of `LearnableParams` field was shifted.
+/// Extend this enum (NEVER reorder existing variants — wire protocol
+/// invariant for journal lines downstream) when a new tracked parameter
+/// is added in a follow-up commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyShiftKind {
+    /// `overflow_thresholds.bg_pressure` shifted (background-pressure floor).
+    OverflowThresholdBgPressure,
+    /// `rl_pressure_bands` upper bound shifted (RL Q-table discretization).
+    RlBandUpper,
+    /// `zone_alpha` shifted (zone learning rate).
+    ZoneAlpha,
+}
+
+/// Maximum number of recent shifts retained in the ring buffer. Bounded
+/// per CLAUDE.md "bounded per-cycle work" and prevents memory growth in a
+/// long-running daemon.
+pub const POLICY_ROLLBACK_RING_CAP: usize = 20;
+
+/// Recency window for shift relevance. A shift older than this is treated
+/// as having "stuck" — its outcome is already baked into the long-term
+/// quality EMA and rolling back would be paper-shuffling.
+const POLICY_ROLLBACK_RECENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Cooldown after a rollback fires. Prevents thrashing if quality stays
+/// low for unrelated reasons (e.g., a workload spike).
+const POLICY_ROLLBACK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// One entry in the rollback ring buffer: which parameter, what its value
+/// was BEFORE the shift, and when the shift happened.
+#[derive(Debug, Clone, Copy)]
+struct PolicyShiftRecord {
+    at: std::time::SystemTime,
+    kind: PolicyShiftKind,
+    pre_value: f64,
+}
+
+/// Public output of `PolicyRollbackGuard::evaluate`. One entry per
+/// recent shift kind, with the value the caller should restore. The
+/// caller is responsible for actually applying the restoration to
+/// `LearnableParams` — this module only DECIDES.
+#[derive(Debug, Clone)]
+pub struct RollbackPlan {
+    pub entries: Vec<RollbackPlanEntry>,
+}
+
+/// A single restoration instruction within a [`RollbackPlan`].
+#[derive(Debug, Clone, Copy)]
+pub struct RollbackPlanEntry {
+    pub kind: PolicyShiftKind,
+    pub pre_value: f64,
+}
+
+/// Real-time guard that decides when recent policy shifts must be
+/// reverted on the basis of `RestoreQualityMonitor::quality`. See module
+/// header for the full contract.
+#[derive(Debug, Clone)]
+pub struct PolicyRollbackGuard {
+    /// Bounded FIFO of recent shifts. Newest at the back, oldest at the
+    /// front; evicted at `POLICY_ROLLBACK_RING_CAP`.
+    recent_shifts: std::collections::VecDeque<PolicyShiftRecord>,
+    /// Quality threshold below which a rollback fires.
+    safety_floor: f64,
+    /// `None` if no rollback has ever fired; otherwise the timestamp
+    /// before which `evaluate` must continue to return `None`.
+    cooldown_until: Option<std::time::SystemTime>,
+}
+
+impl PolicyRollbackGuard {
+    /// Construct a guard with the given safety floor on quality. Typical
+    /// production default is `0.35` (matches `RestoreQualityMonitor`'s
+    /// historical stale threshold pre-2026-05).
+    pub fn new(safety_floor: f64) -> Self {
+        Self {
+            recent_shifts: std::collections::VecDeque::with_capacity(POLICY_ROLLBACK_RING_CAP),
+            safety_floor,
+            cooldown_until: None,
+        }
+    }
+
+    /// Record that a tracked parameter was shifted. `pre_value` is the
+    /// value BEFORE the shift — i.e., the value the caller should restore
+    /// to if a rollback is later triggered.
+    ///
+    /// Bounded: oldest record is evicted once the ring reaches
+    /// [`POLICY_ROLLBACK_RING_CAP`].
+    pub fn record_shift(
+        &mut self,
+        kind: PolicyShiftKind,
+        pre_value: f64,
+        at: std::time::SystemTime,
+    ) {
+        if self.recent_shifts.len() == POLICY_ROLLBACK_RING_CAP {
+            self.recent_shifts.pop_front();
+        }
+        self.recent_shifts.push_back(PolicyShiftRecord {
+            at,
+            kind,
+            pre_value,
+        });
+    }
+
+    /// Decide whether a rollback should fire. O(1) ring scan — bounded by
+    /// `POLICY_ROLLBACK_RING_CAP`.
+    ///
+    /// Fires when:
+    /// - quality is strictly below `safety_floor`, AND
+    /// - cooldown has elapsed (or no rollback has ever fired), AND
+    /// - at least one recent shift sits within
+    ///   [`POLICY_ROLLBACK_RECENT_WINDOW`] of `now`.
+    ///
+    /// Increments the observability counter once per call (success or
+    /// not) so dashboards can compute "evaluation frequency / fire ratio".
+    pub fn evaluate(&mut self, quality: f64, now: std::time::SystemTime) -> Option<RollbackPlan> {
+        crate::engine::lse_counters::LSE_COUNTERS.inc_policy_rollback_evaluation();
+
+        if quality >= self.safety_floor {
+            return None;
+        }
+        if let Some(until) = self.cooldown_until {
+            if now < until {
+                return None;
+            }
+        }
+
+        // Build a plan from shifts that fall inside the recency window.
+        // Most-recent-first so the caller's vec[0] is the freshest.
+        let mut entries: Vec<RollbackPlanEntry> = Vec::new();
+        for rec in self.recent_shifts.iter().rev() {
+            // SystemTime arithmetic is fallible across clock changes; on
+            // failure we treat the record as out-of-window (safer than
+            // panicking, matches daemon best-effort discipline).
+            let in_window = match now.duration_since(rec.at) {
+                Ok(elapsed) => elapsed <= POLICY_ROLLBACK_RECENT_WINDOW,
+                Err(_) => false,
+            };
+            if in_window {
+                entries.push(RollbackPlanEntry {
+                    kind: rec.kind,
+                    pre_value: rec.pre_value,
+                });
+            }
+        }
+        if entries.is_empty() {
+            None
+        } else {
+            Some(RollbackPlan { entries })
+        }
+    }
+
+    /// Caller invokes this after applying a `RollbackPlan` so the guard
+    /// can start the cooldown and clear the now-stale shift buffer.
+    pub fn mark_executed(&mut self, now: std::time::SystemTime) {
+        self.cooldown_until = Some(now + POLICY_ROLLBACK_COOLDOWN);
+        self.recent_shifts.clear();
+        crate::engine::lse_counters::LSE_COUNTERS.inc_policy_rollback_execution();
+    }
+
+    /// Observability helper: current ring depth (for tests + dashboards).
+    pub fn recent_shifts_len(&self) -> usize {
+        self.recent_shifts.len()
+    }
+
+    /// Observability helper: oldest `pre_value` in the ring (for tests).
+    pub fn oldest_pre_value(&self) -> Option<f64> {
+        self.recent_shifts.front().map(|r| r.pre_value)
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2035,5 +2233,108 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("missing.json");
         assert!(LearnedState::load_companion_graph(&path).is_none());
+    }
+
+    // ── Phase 4.3 — PolicyRollbackGuard tests ─────────────────────────────
+    //
+    // Discipline: each test exercises ONE behavior of the guard's contract,
+    // and all four sit alongside the existing `RestoreQualityMonitor` tests
+    // because they share the same quality signal as input.
+
+    #[test]
+    fn policy_rollback_no_recent_shift_returns_none() {
+        // No shifts recorded → evaluate must return None even at terrible
+        // quality. Rationale: rollback only undoes a *recent* action; with
+        // no actions to undo, there is nothing to do.
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        let now = std::time::SystemTime::UNIX_EPOCH;
+        let plan = guard.evaluate(0.05, now);
+        assert!(plan.is_none(), "no shifts → no plan");
+    }
+
+    #[test]
+    fn policy_rollback_low_quality_with_recent_shift_returns_plan() {
+        // A shift was just recorded; quality drops below the floor → plan.
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        guard.record_shift(PolicyShiftKind::OverflowThresholdBgPressure, 0.62, now);
+        let plan = guard.evaluate(0.10, now + std::time::Duration::from_secs(30));
+        let plan = plan.expect("low quality with recent shift must produce a plan");
+        assert_eq!(plan.entries.len(), 1);
+        assert!(matches!(
+            plan.entries[0].kind,
+            PolicyShiftKind::OverflowThresholdBgPressure
+        ));
+        assert!((plan.entries[0].pre_value - 0.62).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn policy_rollback_cooldown_blocks_subsequent_eval() {
+        // After mark_executed, the next call must return None even if
+        // quality is still bad and new shifts were recorded. Prevents
+        // rollback storms during a sustained-bad-quality regime.
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
+        guard.record_shift(PolicyShiftKind::ZoneAlpha, 0.005, t0);
+        let plan = guard.evaluate(0.10, t0 + std::time::Duration::from_secs(60));
+        assert!(plan.is_some(), "first eval should fire");
+        guard.mark_executed(t0 + std::time::Duration::from_secs(60));
+
+        // Even with a new shift right after, cooldown blocks for 10 min.
+        guard.record_shift(
+            PolicyShiftKind::RlBandUpper,
+            0.92,
+            t0 + std::time::Duration::from_secs(120),
+        );
+        let plan2 = guard.evaluate(0.05, t0 + std::time::Duration::from_secs(180));
+        assert!(plan2.is_none(), "cooldown must block within 10 min");
+
+        // After the 10-minute cooldown elapses, a freshly-recorded shift
+        // plus low quality must fire again. The recency window (5 min)
+        // forces the new shift to be near the post-cooldown timestamp;
+        // anything older is correctly out-of-window.
+        let post_cooldown = t0 + std::time::Duration::from_secs(665);
+        guard.record_shift(PolicyShiftKind::ZoneAlpha, 0.01, post_cooldown);
+        let plan3 = guard.evaluate(0.05, post_cooldown + std::time::Duration::from_secs(5));
+        assert!(plan3.is_some(), "after cooldown, eval should fire again");
+    }
+
+    #[test]
+    fn policy_rollback_ring_buffer_caps_at_20() {
+        // Recording > 20 shifts must evict oldest (bounded memory).
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        for i in 0..30u64 {
+            guard.record_shift(
+                PolicyShiftKind::ZoneAlpha,
+                0.001 * i as f64,
+                base + std::time::Duration::from_secs(i),
+            );
+        }
+        assert_eq!(
+            guard.recent_shifts_len(),
+            POLICY_ROLLBACK_RING_CAP,
+            "ring buffer must cap at {}",
+            POLICY_ROLLBACK_RING_CAP
+        );
+        // Oldest evicted: first remaining entry is shift #10 (index 10).
+        let oldest = guard.oldest_pre_value().expect("ring not empty");
+        assert!(
+            (oldest - 0.001 * 10.0).abs() < f64::EPSILON,
+            "oldest pre_value should be from shift #10, got {}",
+            oldest
+        );
+    }
+
+    #[test]
+    fn policy_rollback_safe_quality_does_not_trigger() {
+        // Quality at or above the safety floor → no plan, even with a
+        // recent shift. Rollback is reserved for clearly-bad post-shift
+        // outcomes.
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5_000);
+        guard.record_shift(PolicyShiftKind::RlBandUpper, 0.92, now);
+        let plan = guard.evaluate(0.50, now + std::time::Duration::from_secs(30));
+        assert!(plan.is_none(), "quality ≥ floor must not trigger rollback");
     }
 }

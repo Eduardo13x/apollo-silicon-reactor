@@ -1592,6 +1592,17 @@ pub struct RuntimeMetrics {
     pub maintenance_purge_skipped_build_mode_total: u64,
     #[serde(default)]
     pub maintenance_purge_skipped_rate_limit_total: u64,
+
+    /// Phase 4.3 — Policy Rollback Guard observability (Sprint 7, 2026-05-16).
+    /// Total `PolicyRollbackGuard::evaluate` calls (per cycle). A long
+    /// stretch with `evaluations_total` increasing but `executions_total`
+    /// flat is the expected steady state: the daemon is checking each
+    /// cycle but no rollback was warranted. Both counters surface to
+    /// `runtime_metrics.json`.
+    #[serde(default)]
+    pub policy_rollback_evaluations_total: u64,
+    #[serde(default)]
+    pub policy_rollback_executions_total: u64,
 }
 
 impl RuntimeMetrics {
