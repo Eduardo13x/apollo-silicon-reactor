@@ -287,6 +287,41 @@ impl SkillRegistry {
         self.skills.get(name).map(|s| s.apply_count)
     }
 
+    /// Skill-Aware Prediction signal (Phase 3.1 — Sprint 6).
+    ///
+    /// Aggregates the historical success of reliable skills matching the given
+    /// workload into a single [0, 1] signal. Used by `apply_specialist_voting`
+    /// to modulate the confidence of non-Observe interventions: in workloads
+    /// where past throttle-class actions have empirically worked, specialist
+    /// votes are amplified; where they have failed, votes are damped.
+    ///
+    /// Weighting: each skill contributes `success_rate * apply_count`, so a
+    /// skill with 100 applications dominates one with 5 — more evidence wins.
+    /// Skills with `workload_hint == "any"` are included for every workload.
+    ///
+    /// Returns `None` when no reliable skill matches — caller should treat
+    /// this as "no signal" and leave the vote weight at 1.0 (neutral).
+    pub fn workload_success_signal(&self, workload: &str) -> Option<f32> {
+        let mut weighted_sum = 0.0_f32;
+        let mut weight_total = 0.0_f32;
+        for s in self.skills.values() {
+            if !s.is_reliable() {
+                continue;
+            }
+            if s.workload_hint != "any" && s.workload_hint != workload {
+                continue;
+            }
+            let w = s.apply_count as f32;
+            weighted_sum += s.success_rate * w;
+            weight_total += w;
+        }
+        if weight_total == 0.0 {
+            None
+        } else {
+            Some((weighted_sum / weight_total).clamp(0.0, 1.0))
+        }
+    }
+
     /// Retire ineffective skills.
     pub fn gc(&mut self) {
         self.skills.retain(|_, s| !s.should_retire());
@@ -696,6 +731,86 @@ mod tests {
         assert!(
             after > before,
             "effective outcome at higher pressure should shift threshold up"
+        );
+    }
+
+    // ── Phase 3.1 — Skill-Aware Prediction signal ────────────────────────────
+
+    fn make_reliable_skill(
+        name: &str,
+        workload: &str,
+        success_rate: f32,
+        apply_count: u32,
+    ) -> OptimizationSkill {
+        let success_count = (success_rate * apply_count as f32).round() as u32;
+        OptimizationSkill {
+            name: name.into(),
+            min_pressure: 0.60,
+            workload_hint: workload.into(),
+            throttle_targets: vec!["target".into()],
+            success_rate,
+            apply_count,
+            success_count,
+        }
+    }
+
+    #[test]
+    fn workload_success_signal_returns_none_when_empty() {
+        let reg = SkillRegistry::new();
+        assert_eq!(reg.workload_success_signal("coding"), None);
+    }
+
+    #[test]
+    fn workload_success_signal_excludes_unreliable_skills() {
+        let mut reg = SkillRegistry::new();
+        // Below reliability bar: apply_count < 5
+        reg.skills.insert(
+            "fresh".into(),
+            make_reliable_skill("fresh", "coding", 0.90, 3),
+        );
+        assert_eq!(reg.workload_success_signal("coding"), None);
+    }
+
+    #[test]
+    fn workload_success_signal_excludes_non_matching_workload() {
+        let mut reg = SkillRegistry::new();
+        reg.skills.insert(
+            "browser_only".into(),
+            make_reliable_skill("browser_only", "browser", 0.90, 20),
+        );
+        assert_eq!(reg.workload_success_signal("coding"), None);
+        assert!(reg.workload_success_signal("browser").is_some());
+    }
+
+    #[test]
+    fn workload_success_signal_includes_any_workload() {
+        let mut reg = SkillRegistry::new();
+        reg.skills.insert(
+            "universal".into(),
+            make_reliable_skill("universal", "any", 0.80, 10),
+        );
+        let sig = reg.workload_success_signal("coding").unwrap();
+        assert!((sig - 0.80).abs() < 0.001);
+    }
+
+    #[test]
+    fn workload_success_signal_weights_by_apply_count() {
+        let mut reg = SkillRegistry::new();
+        // 100 applications at 90% — dominant
+        reg.skills.insert(
+            "heavy".into(),
+            make_reliable_skill("heavy", "coding", 0.90, 100),
+        );
+        // 5 applications at 60% — minimal weight
+        reg.skills.insert(
+            "light".into(),
+            make_reliable_skill("light", "coding", 0.60, 5),
+        );
+        let sig = reg.workload_success_signal("coding").unwrap();
+        // Weighted avg = (0.90*100 + 0.60*5) / 105 = 93/105 ≈ 0.8857
+        assert!(
+            (sig - 0.8857).abs() < 0.001,
+            "weighted average failed, got {sig}"
         );
     }
 

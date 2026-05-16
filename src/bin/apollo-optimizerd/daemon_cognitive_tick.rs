@@ -69,6 +69,7 @@ use apollo_engine::engine::predictive_agent::{
 };
 use apollo_engine::engine::signal_intelligence::SignalDigest;
 use apollo_engine::engine::types::OptimizationProfile;
+use apollo_engine::engine::workload_classifier::WorkloadMode;
 
 /// NARS belief confidence target for monopoly_freeze maturity gate.
 /// At c=0.80 the belief carries enough evidence to act on without
@@ -111,6 +112,28 @@ pub struct SpecialistVotingOutput {
     pub disagreement_record: Option<(Vec<SpecialistVote>, Intervention)>,
 }
 
+/// Phase 3.1 — Skill-Aware Prediction confidence multiplier.
+///
+/// Maps the workload-conditional skill success signal `s ∈ [0, 1]` into a
+/// multiplicative factor for non-Observe specialist votes:
+///
+/// * `None`          → `1.0` (no reliable evidence yet — leave votes neutral)
+/// * `Some(0.0)`     → `0.7` (max damp: all matched skills failed)
+/// * `Some(0.5)`     → `1.0` (neutral: 50/50 history)
+/// * `Some(1.0)`     → `1.3` (max boost: all matched skills succeeded)
+///
+/// The 0.7–1.3 band is intentionally narrow — skills add a tilt, not a veto.
+/// Specialists keep their causal authority (signal + physics boosts); the
+/// skill signal only adjusts how much the ensemble trusts their proposals
+/// in the current workload context. [Sutton 2018 §2.5 — pessimism initialisation]
+#[inline]
+fn skill_aware_factor(signal: Option<f32>) -> f64 {
+    match signal {
+        Some(s) => 0.7 + 0.6 * (s as f64),
+        None => 1.0,
+    }
+}
+
 /// Super Learner specialist voting + accuracy feedback.
 ///
 /// Runs once per cycle, **after** `PredictiveAgent::select_action_with_confidence`
@@ -136,6 +159,11 @@ pub fn apply_specialist_voting(
     // is amplified to resolve Lotka-Volterra vs ODE-swap specialist ties decisively.
     // [Kuncheva 2004 §5.2 — ensemble arbitration under conflicting specialist signals]
     ode_t_sat_urgency: f64,
+    // Phase 3.1 — Skill-Aware Prediction: current workload feeds the
+    // `SkillRegistry::workload_success_signal` lookup, which modulates non-Observe
+    // specialist votes by the historical success rate of past throttle-class
+    // actions in this workload context.
+    workload_mode: WorkloadMode,
 ) -> SpecialistVotingOutput {
     // ── Specialist accuracy feedback (Super Learner) ─────────────────
     // Compare prev cycle's ACTUAL specialist signals against observed outcome.
@@ -281,6 +309,30 @@ pub fn apply_specialist_voting(
             intervention: Intervention::TightenThresholds,
             confidence: strength * lctx.specialist_accuracy.weight(specialist::KALMAN),
         });
+    }
+
+    // Phase 3.1 — Skill-Aware Prediction (Sprint 6).
+    //
+    // Modulate non-Observe votes by the workload-conditional skill success
+    // signal: in workloads where past throttle-class actions have empirically
+    // worked, specialist votes amplify; where they have failed, votes damp.
+    //
+    // Factor map: signal s ∈ [0, 1] → factor ∈ [0.7, 1.3], neutral 1.0 at s=0.5.
+    // No reliable skill matching → factor stays 1.0 (no signal, no change).
+    //
+    // Observe votes are intentionally NOT modulated: a "do nothing" vote should
+    // not be penalised because past actions failed — that would create a
+    // feedback loop where the system can't recover its own confidence after
+    // a bad run. Only positive-action votes are graded against skill history.
+    let skill_factor = skill_aware_factor(
+        lctx.skill_registry.workload_success_signal(workload_mode.as_str()),
+    );
+    if (skill_factor - 1.0).abs() > f64::EPSILON {
+        for v in votes.iter_mut() {
+            if v.intervention != Intervention::Observe {
+                v.confidence = (v.confidence * skill_factor).clamp(0.0, 1.0);
+            }
+        }
     }
 
     let vote_result = tally_votes(&votes);
@@ -506,6 +558,36 @@ mod tests {
     #[test]
     fn habituation_threshold_is_five() {
         assert_eq!(HABITUATION_THRESHOLD, 5);
+    }
+
+    // ── Phase 3.1 — Skill-Aware Prediction factor ────────────────────────────
+
+    #[test]
+    fn skill_aware_factor_none_signal_is_neutral() {
+        assert_eq!(skill_aware_factor(None), 1.0);
+    }
+
+    #[test]
+    fn skill_aware_factor_full_failure_damps_to_07() {
+        assert!((skill_aware_factor(Some(0.0)) - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn skill_aware_factor_full_success_boosts_to_13() {
+        assert!((skill_aware_factor(Some(1.0)) - 1.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn skill_aware_factor_half_signal_is_neutral_one() {
+        assert!((skill_aware_factor(Some(0.5)) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn skill_aware_factor_monotone_in_signal() {
+        let f_low = skill_aware_factor(Some(0.2));
+        let f_mid = skill_aware_factor(Some(0.5));
+        let f_high = skill_aware_factor(Some(0.9));
+        assert!(f_low < f_mid && f_mid < f_high);
     }
 
     #[test]
