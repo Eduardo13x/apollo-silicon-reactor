@@ -230,6 +230,20 @@ pub struct LockFreeMetrics {
     pub reactor_pulses: AtomicU64,
     /// Store f64 reactor event weight as raw u64 bits.
     pub reactor_event_weight_bits: AtomicU64,
+
+    /// Phase 5.2 — Battery-aware cost penalty observability (Sprint 8,
+    /// 2026-05-16). Incremented each time the
+    /// [`crate::engine::energy::battery_aware_cost_penalty`] returned a
+    /// strictly positive penalty (callers actually raised an action's cost
+    /// because we're on battery + noise). Mirrors the Phase 3.1
+    /// `skill_aware_modulations_total` design: this counter is the only way
+    /// to verify the feature actually influences decisions in prod rather
+    /// than no-op'ing.
+    ///
+    /// Note: producers are not wired in this commit (see `OPENS: 1`); the
+    /// counter remains 0 in prod until `decide_actions` invokes the
+    /// penalty function and calls `inc_battery_aware_penalty_emission()`.
+    pub battery_aware_penalty_emissions_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -339,6 +353,7 @@ impl LockFreeMetrics {
             iokit_errors: AtomicU64::new(0),
             reactor_pulses: AtomicU64::new(0),
             reactor_event_weight_bits: AtomicU64::new(0_f64.to_bits()),
+            battery_aware_penalty_emissions_total: AtomicU64::new(0),
         }
     }
 
@@ -668,6 +683,9 @@ impl LockFreeMetrics {
             reactor_event_weight: f64::from_bits(
                 self.reactor_event_weight_bits.load(Ordering::Relaxed),
             ),
+            battery_aware_penalty_emissions_total: self
+                .battery_aware_penalty_emissions_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -697,6 +715,18 @@ impl LockFreeMetrics {
     pub fn add_skill_aware_modulations(&self, n: u64) {
         self.skill_aware_modulations_total
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Phase 5.2 — Battery-aware cost penalty observability hook.
+    /// Call once per `battery_aware_cost_penalty` invocation that returned
+    /// a strictly positive penalty. Dashboards compute the "battery
+    /// suppression rate" as `battery_aware_penalty_emissions_total /
+    /// cycles` to verify the penalty fires under battery + noise and stays
+    /// at 0 on AC.
+    #[inline(always)]
+    pub fn inc_battery_aware_penalty_emission(&self) {
+        self.battery_aware_penalty_emissions_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -770,6 +800,8 @@ pub struct MetricsSnapshot {
     pub iokit_errors: u64,
     pub reactor_pulses: u64,
     pub reactor_event_weight: f64,
+    /// Phase 5.2 — Battery-aware cost penalty emissions (Sprint 8).
+    pub battery_aware_penalty_emissions_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
