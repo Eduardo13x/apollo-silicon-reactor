@@ -592,6 +592,25 @@ mod tests {
     }
 
     #[test]
+    fn skill_aware_factor_band_is_30_percent_centered_on_neutral() {
+        // Phase 3.1 invariant: width(band) = max_boost - min_damp = 0.30,
+        // centered on 1.0. This keeps the multiplier from stacking into a
+        // cascade-attenuation with SpecialistAccuracyTracker::weight() — see
+        // NotebookLM 2026-05-16 adversarial pass on commit 66e4d16. If a
+        // future refactor widens the band, this test will catch it before
+        // the cascade re-emerges in prod.
+        let max_boost = skill_aware_factor(Some(1.0));
+        let min_damp = skill_aware_factor(Some(0.0));
+        assert!((max_boost - 1.15).abs() < 1e-9, "max boost = {max_boost}");
+        assert!((min_damp - 0.85).abs() < 1e-9, "min damp = {min_damp}");
+        assert!(
+            ((max_boost - min_damp) - 0.30).abs() < 1e-9,
+            "band width = {}",
+            max_boost - min_damp
+        );
+    }
+
+    #[test]
     fn skill_aware_factor_monotone_in_signal() {
         let f_low = skill_aware_factor(Some(0.2));
         let f_mid = skill_aware_factor(Some(0.5));
