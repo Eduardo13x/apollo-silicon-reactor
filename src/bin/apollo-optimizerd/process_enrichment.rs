@@ -11,6 +11,7 @@
 //! - `ThrashState` — per-PID cooldown tracking
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use apollo_engine::engine::adaptive_governor::{GovernorDecision, ProcessDecision};
@@ -138,6 +139,47 @@ pub fn build_foreground_family(foreground_pid: Option<u32>, tree: &ProcessTree) 
         .unwrap_or_default()
 }
 
+// ── proc_taskinfo cache (Changes A+B, 2026-05-16) ──────────────────────────
+//
+// Under sustained high pressure (>0.80), Apollo's own hot path becomes a
+// noticeable contributor to thrashing: proc_taskinfo + rusage_info are two
+// kernel syscalls per enriched PID per cycle (~150 PIDs × 2 × 2.5 Hz =
+// ~750 syscalls/sec just for the enrichment stage). The data those calls
+// produce — idle_wakeups, mach msg counts, faults, pageins, CPU contention —
+// changes slowly relative to the cycle period; refreshing every 4 cycles
+// (~1.6 s) costs little signal under stress and recovers ~2-3% of Apollo's
+// own CPU footprint, which is precisely the work that was making the
+// pressure worse.
+//
+// Live RSS / cpu_usage / status still come from the cheap sysinfo refresh
+// every cycle, so the rest of the enrichment stays fresh. Only the
+// per-PID syscall payload is reused.
+
+#[derive(Default, Clone)]
+struct CachedEnrichSyscalls {
+    rusage_map: HashMap<u32, (u64, u32, u32, u32)>,
+    contention_map: HashMap<u32, f64>,
+    cycle_filled: u64,
+}
+
+fn enrich_syscall_cache() -> &'static Mutex<CachedEnrichSyscalls> {
+    static CACHE: OnceLock<Mutex<CachedEnrichSyscalls>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(CachedEnrichSyscalls::default()))
+}
+
+/// Returns true when the proc_taskinfo bulk read should be skipped this
+/// cycle in favour of the cached values. Hold on the cache: only skip
+/// when (a) pressure is high enough that Apollo's own footprint matters
+/// and (b) the cache has actually been filled at least once before, and
+/// (c) we are inside the 4-cycle reuse window.
+fn should_reuse_enrich_cache(cycle_count: u64, pressure_smooth: f64) -> bool {
+    if pressure_smooth <= 0.80 {
+        return false;
+    }
+    // Refresh every 4th cycle to bound staleness at ~1.6 s @ 1 Hz pressure-mode.
+    cycle_count % 4 != 0
+}
+
 // ── Enriched Process Data ──────────────────────────────────────────────────
 
 /// Tree-aware enriched process data builder.
@@ -155,6 +197,8 @@ pub fn build_enriched_process_data_with_tree(
     sys: &sysinfo::System,
     foreground_pid: Option<u32>,
     tree: &ProcessTree,
+    cycle_count: u64,
+    pressure_smooth: f64,
 ) -> (Vec<ProcessSnapshot>, Vec<HuntSnapshot>) {
     // Pre-compute the set of PIDs in the foreground family for O(1) lookups.
     let fg_family: HashSet<u32> = build_foreground_family(foreground_pid, tree);
@@ -169,17 +213,6 @@ pub fn build_enriched_process_data_with_tree(
     // state plus headroom without over-committing. Same for contention_map.
     // Saves ~0.1-0.3ms/cycle vs the default HashMap::new() which starts at
     // capacity 0 and grows through 4 → 8 → 16 → 32 → 64 → 128 → 256.
-    let mut rusage_map: HashMap<u32, (u64, u32, u32, u32)> = HashMap::with_capacity(256);
-    // CPU contention map: pid → ratio ∈ [0, 1] between the prev rusage
-    // sample cached in the global ContentionTracker and the one we read
-    // this cycle. None on the first cycle for a pid, or when the process
-    // was fully idle. Feeds ProcessSnapshot.cpu_contention below.
-    let mut contention_map: HashMap<u32, f64> = HashMap::with_capacity(256);
-    for &pid in &fg_family {
-        // Only enrich non-foreground in the loop below
-        let _ = pid;
-    }
-    // Build rusage map for all PIDs — O(n) syscalls, ~3µs each.
     // Phase 0d performance gate (2026-05-10): skip proc_taskinfo syscalls
     // for PIDs we'll never act on (RSS < ENRICH_MIN_RSS_BYTES). On a
     // typical Mac with 400 PIDs, ~250 are <2 MB tiny daemons we never
@@ -187,47 +220,93 @@ pub fn build_enriched_process_data_with_tree(
     // cycle, ≈ 1.5 ms saved. Foreground family bypasses the gate so we
     // never miss their state. [Hellerstein 2004 §9 sampling under load]
     const ENRICH_MIN_RSS_BYTES: u64 = 2 * 1024 * 1024;
+
+    // Changes A+B (2026-05-16): under sustained high pressure (>0.80
+    // smoothed), Apollo's own enrichment syscalls become a contributor
+    // to the very thrashing they're trying to mitigate. When we are in
+    // a stress window AND the cache has been freshly filled within the
+    // last 4 cycles, reuse the cached rusage + contention maps and skip
+    // the per-PID syscall storm + contention-tracker mutex acquire.
+    // Live RSS / CPU still refresh every cycle from sysinfo so the rest
+    // of the snapshot stays current.
+    let reuse_cache = should_reuse_enrich_cache(cycle_count, pressure_smooth);
+    let (mut rusage_map, mut contention_map): (
+        HashMap<u32, (u64, u32, u32, u32)>,
+        HashMap<u32, f64>,
+    ) = if reuse_cache {
+        let cache = enrich_syscall_cache().lock().unwrap_or_else(|e| e.into_inner());
+        // First cycle under pressure: cache may be empty. That's fine —
+        // returning empty maps produces the same behaviour as PIDs that
+        // simply had no proc_taskinfo data (wakeups_per_sec = 0).
+        (cache.rusage_map.clone(), cache.contention_map.clone())
+    } else {
+        (
+            HashMap::with_capacity(256),
+            HashMap::with_capacity(256),
+        )
+    };
+
     // Pre-allocated for ~500 live PIDs typical of a heavy session
     // (Brave 17 helpers + dev tools + system daemons).
     let mut live_pids: HashSet<u32> = HashSet::with_capacity(512);
-    for (pid, process) in sys.processes() {
-        let pid_u32 = pid.as_u32();
-        live_pids.insert(pid_u32);
-        // Gate: enrich only PIDs with meaningful RSS or in the fg family.
-        if process.memory() < ENRICH_MIN_RSS_BYTES && !fg_family.contains(&pid_u32) {
-            continue;
-        }
-        if let Some(ri) = proc_taskinfo::get_rusage_info(pid_u32) {
-            let idle_wk = ri.idle_wakeups;
-            // Observe into the global contention tracker. This returns the
-            // ratio vs the previous cached sample (None on the first cycle
-            // or when the process was idle) and stores the new sample as
-            // the next baseline. The mutex is held only for the observe
-            // call itself; no other I/O happens under it.
-            if let Ok(mut tracker) = apollo_engine::engine::contention_tracker::global().lock() {
-                if let Some(ratio) = tracker.observe(pid_u32, ri.clone()) {
-                    contention_map.insert(pid_u32, ratio);
+
+    if !reuse_cache {
+        for (pid, process) in sys.processes() {
+            let pid_u32 = pid.as_u32();
+            live_pids.insert(pid_u32);
+            // Gate: enrich only PIDs with meaningful RSS or in the fg family.
+            if process.memory() < ENRICH_MIN_RSS_BYTES && !fg_family.contains(&pid_u32) {
+                continue;
+            }
+            if let Some(ri) = proc_taskinfo::get_rusage_info(pid_u32) {
+                let idle_wk = ri.idle_wakeups;
+                // Observe into the global contention tracker. This returns the
+                // ratio vs the previous cached sample (None on the first cycle
+                // or when the process was idle) and stores the new sample as
+                // the next baseline. The mutex is held only for the observe
+                // call itself; no other I/O happens under it.
+                if let Ok(mut tracker) =
+                    apollo_engine::engine::contention_tracker::global().lock()
+                {
+                    if let Some(ratio) = tracker.observe(pid_u32, ri.clone()) {
+                        contention_map.insert(pid_u32, ratio);
+                    }
+                }
+                if let Some(ti) = proc_taskinfo::get_task_info(pid_u32) {
+                    rusage_map.insert(
+                        pid_u32,
+                        (
+                            idle_wk,
+                            ti.messages_sent + ti.messages_received,
+                            ti.faults,
+                            ti.pageins,
+                        ),
+                    );
+                } else {
+                    rusage_map.insert(pid_u32, (idle_wk, 0, 0, 0));
                 }
             }
-            if let Some(ti) = proc_taskinfo::get_task_info(pid_u32) {
-                rusage_map.insert(
-                    pid_u32,
-                    (
-                        idle_wk,
-                        ti.messages_sent + ti.messages_received,
-                        ti.faults,
-                        ti.pageins,
-                    ),
-                );
-            } else {
-                rusage_map.insert(pid_u32, (idle_wk, 0, 0, 0));
-            }
         }
-    }
-    // GC any tracker entries for pids that disappeared this cycle so the
-    // map can't grow beyond the live pid set over a long-running session.
-    if let Ok(mut tracker) = apollo_engine::engine::contention_tracker::global().lock() {
-        tracker.gc(&live_pids);
+        // GC any tracker entries for pids that disappeared this cycle so the
+        // map can't grow beyond the live pid set over a long-running session.
+        if let Ok(mut tracker) = apollo_engine::engine::contention_tracker::global().lock() {
+            tracker.gc(&live_pids);
+        }
+        // Persist this cycle's fresh maps for the next 3 cycles to reuse
+        // under continued pressure. Cheap clone — typical maps are <200
+        // entries and the inner tuples are POD.
+        if let Ok(mut cache) = enrich_syscall_cache().lock() {
+            cache.rusage_map = rusage_map.clone();
+            cache.contention_map = contention_map.clone();
+            cache.cycle_filled = cycle_count;
+        }
+    } else {
+        // Cache reuse path: still populate live_pids from the cheap
+        // sysinfo iter so downstream uses (process classification, hunt)
+        // see today's PID set, even though the syscall data is stale.
+        for (pid, _process) in sys.processes() {
+            live_pids.insert(pid.as_u32());
+        }
     }
 
     // 2026-05-12: pre-sized for typical 150 enriched processes and

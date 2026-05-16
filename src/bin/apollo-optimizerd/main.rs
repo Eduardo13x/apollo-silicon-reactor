@@ -1206,6 +1206,11 @@ fn main() -> anyhow::Result<()> {
             log_ingester.start_background();
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
+            // Prev-cycle smoothed pressure, used by the high-pressure cycle-rate
+            // gate (Change C) and the enrichment cache gate (Changes A+B) to
+            // throttle Apollo's own hot path under stress. 0.0 on first
+            // cycle = treated as low pressure (300ms floor, fresh enrich).
+            let mut prev_pressure_smooth: f64 = 0.0;
             // Batch buffer: accumulate N push messages before a single write syscall.
             // macOS Unix socket SO_SNDBUF = 8192 bytes. Batch=16×~64=~1KB stays well
             // under the 8KB limit so write_all never blocks. Empirically optimal.
@@ -1395,9 +1400,18 @@ fn main() -> anyhow::Result<()> {
                 let battery_low = !power_mgr.battery_status.is_charging
                     && power_mgr.battery_status.percentage < 20;
                 let is_fast_tick = is_fast_tick_raw && !battery_low;
+                // Change C (2026-05-16): under sustained high pressure (>0.80
+                // smoothed) the daemon's own hot path becomes a contributor
+                // to thrashing (proc_taskinfo per-PID storm × 2.5 Hz). Drop
+                // cycle rate to 1 Hz when stressed so Apollo's CPU footprint
+                // doesn't worsen the very pressure it's trying to mitigate.
+                // Fast-tick bypasses (kqueue Critical / hw_predictor events).
+                let high_pressure_throttle = prev_pressure_smooth > 0.80;
                 let min_inter_cycle_ms = if dry_run || is_fast_tick {
                     0
                 } else if battery_low {
+                    1000
+                } else if high_pressure_throttle {
                     1000
                 } else {
                     300
@@ -1717,6 +1731,8 @@ fn main() -> anyhow::Result<()> {
                         collector.system(),
                         foreground_pid,
                         &process_tree,
+                        cycle_count,
+                        prev_pressure_smooth,
                     );
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonEnrich,
@@ -5005,6 +5021,10 @@ fn main() -> anyhow::Result<()> {
                     .map(|t| Instant::now() < t)
                     .unwrap_or(false);
                 last_cycle_end = Instant::now();
+                // Cache prev-cycle pressure for the high-pressure cycle-rate
+                // gate (Change C) on the next iteration. Smoothed value to
+                // avoid one-shot spikes flipping the daemon to 1 Hz.
+                prev_pressure_smooth = signal_digest.pressure_smooth;
                 lf_metrics.set_cycle_time_us(cycle_start.elapsed().as_micros() as u64);
                 // Phase 0b stage timing: persist complete, cycle done.
                 lf_metrics.record_stage(
