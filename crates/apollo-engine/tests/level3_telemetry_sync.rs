@@ -254,3 +254,27 @@ fn phase33_companion_cross_group_inferences_reach_runtime_metrics_json() {
         json
     );
 }
+
+/// Phase 4.1 — Adaptive Drift Threshold counter round-trip.
+#[test]
+fn phase41_adaptive_drift_threshold_raises_reach_runtime_metrics_json() {
+    let lf = LockFreeMetrics::new();
+    lf.add_adaptive_drift_threshold_raises(23);
+    lf.commit();
+
+    let snap = lf.snapshot();
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+
+    assert_eq!(
+        state.metrics.adaptive_drift_threshold_raises_total, 23,
+        "counter must round-trip into RuntimeMetrics via sync_from_lockfree"
+    );
+
+    let json = serde_json::to_string(&state.metrics).expect("serialize RuntimeMetrics");
+    assert!(
+        json.contains("\"adaptive_drift_threshold_raises_total\":23"),
+        "field absent or wrong value in JSON: {}",
+        json
+    );
+}

@@ -1650,6 +1650,18 @@ pub struct RuntimeMetrics {
     /// of no-op'ing.
     #[serde(default)]
     pub companion_cross_group_inferences_total: u64,
+
+    /// Phase 4.1 — Adaptive Drift Threshold raises counter (Sprint 7,
+    /// 2026-05-16). Cumulative number of
+    /// `AdaptiveDriftThreshold::recommended_threshold` calls that
+    /// returned strictly greater than the base threshold — i.e. the
+    /// adaptive layer raised the bar based on observed noise variance.
+    /// Surfaces to `runtime_metrics.json` so operators can see whether
+    /// the noise floor is actually being measured and acted on in prod.
+    /// Flushed each cycle via `sync_from_lockfree`.
+    /// [Brown 1959]; [Welford 1962]; [Kuncheva 2004].
+    #[serde(default)]
+    pub adaptive_drift_threshold_raises_total: u64,
 }
 
 impl RuntimeMetrics {

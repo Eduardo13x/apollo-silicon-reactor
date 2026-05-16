@@ -172,6 +172,17 @@ impl MetricsState {
         // avoid a second touch on daemon_state.rs when wiring lands.
         self.metrics.companion_cross_group_inferences_total =
             lf.companion_cross_group_inferences_total;
+
+        // Phase 4.1 — Adaptive Drift Threshold raises (Sprint 7, 2026-05-16).
+        // Producers are NOT wired in this commit (OPENS: 1) — the counter
+        // remains 0 in prod until the caller in `learning_tick` invokes
+        // `AdaptiveDriftThreshold::recommended_threshold(...)` and calls
+        // `add_adaptive_drift_threshold_raises(1)` when the return value
+        // exceeds the supplied base. Plumbing the snapshot surface now
+        // keeps this in lockstep with skill_aware_modulations_total
+        // (Phase 3.1) and the rest of the Sprint 7 batch.
+        self.metrics.adaptive_drift_threshold_raises_total =
+            lf.adaptive_drift_threshold_raises_total;
     }
 }
 
