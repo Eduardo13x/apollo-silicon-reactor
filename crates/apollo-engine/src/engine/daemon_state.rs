@@ -109,6 +109,9 @@ impl MetricsState {
         self.metrics.reactor_pulses = lf.reactor_pulses;
         self.reactor_event_weight = lf.reactor_event_weight;
 
+        // Phase 3.1 — Skill-Aware Prediction observability
+        self.metrics.skill_aware_modulations_total = lf.skill_aware_modulations_total;
+
         // Reactor pulses — 2026-05-12: removed `= lf.signals_sent` overwrite.
         // The lock-free `signals_sent` field is defined in lse_counters.rs:57 but
         // is NEVER incremented anywhere in the codebase. The authoritative writers

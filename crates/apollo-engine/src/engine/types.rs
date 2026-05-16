@@ -864,6 +864,11 @@ pub struct RuntimeMetrics {
     pub dev_session_active: bool,
     pub interactive_heavy: bool,
     pub profile_floor_hits: u64,
+    /// Phase 3.1 — Skill-Aware Prediction tilt counter (Sprint 6).
+    /// Cumulative number of non-Observe specialist votes whose confidence
+    /// was multiplied by a non-neutral `skill_aware_factor`.
+    #[serde(default)]
+    pub skill_aware_modulations_total: u64,
     // Heuristic module metrics
     pub heuristic_decisions: u64,
     pub heuristic_throttles: u64,
