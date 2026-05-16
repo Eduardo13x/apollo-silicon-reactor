@@ -198,6 +198,24 @@ impl MetricsState {
         // Plumbing now mirrors 3.1/5.2 and avoids a second touch on
         // daemon_state.rs when wiring lands.
         self.metrics.journal_rationales_attached_total = lf.journal_rationales_attached_total;
+
+        // Phase 4.3.1 — Specialist accuracy purge inhibitions (Sprint 8,
+        // 2026-05-16). Mirrors the Phase 2 outcome_tracker / causal_graph
+        // post-purge inhibition pattern. Producer is wired in this commit
+        // at daemon_cognitive_tick::apply_specialist_voting; the counter
+        // increments each cycle where the 30 s purge guard skipped the
+        // EMA accuracy update.
+        self.metrics.specialist_accuracy_purge_inhibitions_total =
+            lf.specialist_accuracy_purge_inhibitions_total;
+
+        // Phase 2 god-lock decomposition (Sprint 8, 2026-05-16): migrate
+        // habituation_skips OFF the metrics mutex. Producer is the
+        // lock-free `add_habituation_skips` call in
+        // `daemon_cognitive_tick::update_habituation_state`. The legacy
+        // `RuntimeMetrics.habituation_skips` field stays in place
+        // (AIS runtime benchmark reads it via `rm_u("habituation_skips")`),
+        // populated FROM the atomic here — single source of truth.
+        self.metrics.habituation_skips = lf.habituation_skips_total;
     }
 }
 

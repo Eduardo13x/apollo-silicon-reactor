@@ -349,6 +349,33 @@ pub struct LockFreeMetrics {
     ///   coverage metric is a precondition for trust.
     /// - [Ribeiro et al. 2016] LIME — every prediction explained.
     pub journal_rationales_attached_total: AtomicU64,
+
+    /// Phase 4.3.1 — Specialist accuracy purge inhibition counter
+    /// (Sprint 8, 2026-05-16). Incremented each time the cognitive tick's
+    /// specialist voting block SKIPPED the four `specialist_accuracy.update()`
+    /// calls because a maintenance purge happened in the previous 30 s.
+    ///
+    /// A purge causes pressure to drop sharply; without this gate, hazard /
+    /// monopoly / kalman specialists that predicted a spike get graded
+    /// "wrong" — their EMA weights decay and the next genuine crisis sees a
+    /// weaker reaction. Mirrors the inhibition pattern Phase 2 added for
+    /// `outcome_tracker` and `causal_graph` post-purge. NotebookLM 2026-05-16
+    /// flagged the missing guard as GAP 6.
+    ///
+    /// [Rubin 1974] "Estimating Causal Effects of Treatments in Randomized
+    /// and Nonrandomized Studies" — distinguishing intervention from confounder.
+    pub specialist_accuracy_purge_inhibitions_total: AtomicU64,
+
+    /// Phase 2 god-lock decomposition (Sprint 8, 2026-05-16).
+    /// Cumulative count of processes skipped by habituation in
+    /// `daemon_cognitive_tick::update_habituation_state`. Migrated from
+    /// `state.metrics.lock_recover().metrics.habituation_skips += N` to remove
+    /// a god-lock contributor on the hot path. The legacy
+    /// `RuntimeMetrics.habituation_skips` field is now populated from this
+    /// atomic via `sync_from_lockfree` (no duplicate field — single source
+    /// of truth, atomic). [Hellerstein 2012] mutex avoidance for hot-path
+    /// counters.
+    pub habituation_skips_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -476,6 +503,9 @@ impl LockFreeMetrics {
             user_presence_suppressions_total: AtomicU64::new(0),
 
             journal_rationales_attached_total: AtomicU64::new(0),
+
+            specialist_accuracy_purge_inhibitions_total: AtomicU64::new(0),
+            habituation_skips_total: AtomicU64::new(0),
         }
     }
 
@@ -837,6 +867,11 @@ impl LockFreeMetrics {
             journal_rationales_attached_total: self
                 .journal_rationales_attached_total
                 .load(Ordering::Relaxed),
+
+            specialist_accuracy_purge_inhibitions_total: self
+                .specialist_accuracy_purge_inhibitions_total
+                .load(Ordering::Relaxed),
+            habituation_skips_total: self.habituation_skips_total.load(Ordering::Relaxed),
         }
     }
 
@@ -980,6 +1015,31 @@ impl LockFreeMetrics {
         self.journal_rationales_attached_total
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Phase 4.3.1 — Specialist accuracy purge inhibition observability hook.
+    /// Call once per cycle where the cognitive tick skipped the
+    /// `specialist_accuracy.update()` calls because a maintenance purge
+    /// happened in the previous 30 s. Dashboards compute the "purge
+    /// inhibition rate" as
+    /// `specialist_accuracy_purge_inhibitions_total / cycles` to verify the
+    /// guard is firing exactly once per qualifying cycle and not spuriously
+    /// out-of-window.
+    #[inline(always)]
+    pub fn inc_specialist_accuracy_purge_inhibitions(&self) {
+        self.specialist_accuracy_purge_inhibitions_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Phase 2 god-lock decomposition (2026-05-16): cumulative habituation
+    /// skips. Called once per cycle by
+    /// `daemon_cognitive_tick::update_habituation_state` with
+    /// `habituated_pids.len() as u64`. Replaces the previous
+    /// `state.metrics.lock_recover().metrics.habituation_skips += N` god-lock
+    /// write — single LSE `ldadd` instead of `mutex.lock + write + drop`.
+    #[inline(always)]
+    pub fn add_habituation_skips(&self, n: u64) {
+        self.habituation_skips_total.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 // Safe to share across threads — all fields are atomic.
@@ -1080,6 +1140,17 @@ pub struct MetricsSnapshot {
 
     /// Phase 5.3 — JournalEntry rationale attachments (Sprint 8).
     pub journal_rationales_attached_total: u64,
+
+    /// Phase 4.3.1 — Specialist accuracy purge inhibitions (Sprint 8).
+    /// Count of cycles where `apply_specialist_voting` skipped the EMA
+    /// accuracy updates because a maintenance purge happened ≤30 s ago.
+    pub specialist_accuracy_purge_inhibitions_total: u64,
+    /// Phase 2 god-lock decomposition (Sprint 8, 2026-05-16).
+    /// Cumulative habituation skips, migrated off the `state.metrics`
+    /// mutex to a lock-free atomic. Mirrors the legacy
+    /// `RuntimeMetrics.habituation_skips` field (which is now populated
+    /// FROM this atomic via `sync_from_lockfree`).
+    pub habituation_skips_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
@@ -1334,6 +1405,28 @@ mod tests {
             std::mem::align_of::<LockFreeMetrics>(),
             128,
             "metrics should be 128-byte aligned to avoid false sharing",
+        );
+    }
+
+    /// Phase 2 god-lock fix (2026-05-16): the reactor_event_weight setter must
+    /// round-trip via `snapshot()`. The daemon main loop reads the value,
+    /// decays it (×0.75), and then writes it back through this setter. If the
+    /// setter never lands in the atomic, the snapshot stays pinned at the
+    /// last `set_reactor_event_weight(1.0)` call (set by daemon_reactor.rs on
+    /// every pulse), the decay is invisible, and `reactor_event_weight` reads
+    /// "sticky 1.0" indefinitely — causing the governor to see fake reactive
+    /// pressure long after the reactor went quiet. Adversarial review
+    /// 2026-05-16.
+    #[test]
+    fn reactor_event_weight_round_trips_via_set_get() {
+        let m = LockFreeMetrics::new();
+        m.set_reactor_event_weight(0.42);
+        m.commit();
+        let snap = m.snapshot();
+        assert!(
+            (snap.reactor_event_weight - 0.42).abs() < 1e-9,
+            "expected 0.42, got {}",
+            snap.reactor_event_weight
         );
     }
 }

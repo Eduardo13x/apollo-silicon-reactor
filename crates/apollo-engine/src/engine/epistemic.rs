@@ -31,22 +31,47 @@
 //! cumulative confidence must drop. Three-Pillar Theorem (apollo_agi_paper_draft.md)
 //! requires this composition under bounded rationality.
 //!
-//! When composite > 0.70 → block aggressive freezes.
-//! When composite > 0.85 → force Observe arm only (zero side effects).
+//! When composite > 0.85 → block aggressive freezes.
+//! When composite > 0.95 → force Observe arm only (zero side effects).
+//!
+//! ## Threshold calibration (2026-05-16, NotebookLM GAP 3)
+//!
+//! Both thresholds were rebalanced from the pre-Phase 2 linear-sum era
+//! (HIGH=0.70, OBSERVE_ONLY=0.85) to the post-Phase 2 RSS-composition era
+//! (HIGH=0.85, OBSERVE_ONLY=0.95). Under linear-sum, a single input at 1.0
+//! with W=0.20 produced `composite ≈ 0.20`; under RSS, the same input
+//! produces `composite ≈ 0.45` — more than double, due to the
+//! `raw_rss / max_rss_possible` normalization that amplifies isolated
+//! strong signals. Holding the thresholds at 0.70/0.85 would have made
+//! HIGH/OBSERVE-ONLY mode trip on a single noisy source — exactly the
+//! "regression paralysis" pattern Phase 2 set out to prevent.
 //!
 //! ## References
 //! - [Lakshminarayanan 2017] "Simple and Scalable Predictive Uncertainty
-//!   Estimation using Deep Ensembles" NeurIPS §3
+//!   Estimation using Deep Ensembles" NeurIPS §3 — predictive uncertainty
+//!   calibration: an ensemble's effective threshold must scale with the
+//!   composition method, not the components.
 //! - [Guo 2017] "On Calibration of Modern Neural Networks" ICML §3
 //!   ECE > 0.20 indicates miscalibration — overconfident predictions
 
 use serde::{Deserialize, Serialize};
 
 /// Threshold for high-uncertainty mode (block aggressive freezes).
-const HIGH_UNCERTAINTY_THRESHOLD: f32 = 0.70;
+///
+/// Recalibrated 2026-05-16 from 0.70 → 0.85 to compensate for the
+/// linear→RSS composition change. Under RSS, isolated strong signals
+/// reach ~0.45 (W=0.20) where the linear sum reached only 0.20; the
+/// threshold must rise proportionally or HIGH triggers on any noisy
+/// single input.
+const HIGH_UNCERTAINTY_THRESHOLD: f32 = 0.85;
 
 /// Threshold for observe-only mode (force Observe arm, zero side effects).
-const OBSERVE_ONLY_THRESHOLD: f32 = 0.85;
+///
+/// Recalibrated 2026-05-16 from 0.85 → 0.95 in lockstep with
+/// `HIGH_UNCERTAINTY_THRESHOLD`. OBSERVE_ONLY is reserved for the
+/// degenerate "system is maximally uncertain across all six sources"
+/// regime — at composite >= 0.95, the only safe action is no action.
+const OBSERVE_ONLY_THRESHOLD: f32 = 0.95;
 
 /// Weights for composite uncertainty formula.
 /// Sum = 1.0. Tuned for Apollo's multi-agent architecture.
@@ -101,10 +126,12 @@ pub struct EpistemicUncertainty {
     /// Weighted combination of all 6 sources.
     pub composite: f32,
 
-    /// Whether high uncertainty mode is active (composite > 0.70).
+    /// Whether high uncertainty mode is active (composite > 0.85).
+    /// Threshold recalibrated 2026-05-16 from 0.70 for RSS composition.
     pub high_uncertainty_mode: bool,
 
-    /// Whether observe-only mode is active (composite > 0.85).
+    /// Whether observe-only mode is active (composite > 0.95).
+    /// Threshold recalibrated 2026-05-16 from 0.85 for RSS composition.
     pub observe_only_mode: bool,
 }
 
@@ -272,9 +299,11 @@ mod tests {
     #[test]
     fn test_high_mode_threshold() {
         let mut eu = EpistemicUncertainty::new();
-        // Composite just above 0.70 — all components elevated, including
-        // guard_overprotection so the rebalanced 6-component formula crosses HIGH.
-        eu.update(0.80, 0.80, 0.70, 0.30, 0.70, 1.0);
+        // Composite just above 0.85 — all heavy-weight components saturated
+        // so the RSS-composed 6-component formula crosses the recalibrated
+        // HIGH=0.85 threshold without also crossing OBSERVE_ONLY=0.95.
+        // (Inputs updated 2026-05-16 alongside the threshold recalibration.)
+        eu.update(1.0, 1.0, 0.50, 0.50, 1.0, 1.0);
         assert!(eu.should_block_aggressive());
         assert!(!eu.should_observe_only());
         assert_eq!(eu.level_label(), "HIGH");
@@ -283,7 +312,9 @@ mod tests {
     #[test]
     fn test_observe_only_threshold() {
         let mut eu = EpistemicUncertainty::new();
-        eu.update(0.95, 0.95, 0.90, 0.60, 0.95, 0.95);
+        // Inputs updated 2026-05-16 to cross the recalibrated
+        // OBSERVE_ONLY=0.95 threshold.
+        eu.update(1.0, 1.0, 1.0, 0.90, 1.0, 1.0);
         assert!(eu.should_observe_only());
     }
 
@@ -408,12 +439,83 @@ mod tests {
     #[test]
     fn test_mode_transitions_hysteresis() {
         let mut eu = EpistemicUncertainty::new();
-        // Enter high mode (also crank guard so 6-component composite reaches HIGH)
-        eu.update(0.9, 0.9, 0.8, 0.5, 0.5, 0.9);
+        // Enter high mode — heavy-weight components saturated to cross the
+        // recalibrated HIGH=0.85 threshold under RSS composition. Inputs
+        // updated 2026-05-16 alongside the threshold change.
+        eu.update(1.0, 1.0, 0.95, 0.80, 1.0, 1.0);
         assert!(eu.high_uncertainty_mode);
 
         // Drop below → should exit
         eu.update(0.2, 0.2, 0.1, 0.1, 0.1, 0.1);
         assert!(!eu.high_uncertainty_mode);
+    }
+
+    // ── RSS threshold recalibration (NotebookLM 2026-05-16, GAP 3) ───────────
+
+    /// Under RSS composition, a single strong input no longer dominates the
+    /// composite the way a linear-sum would: rl_q_variance=0.99 gives
+    /// `composite ≈ 0.47` (well below the new HIGH=0.85 threshold). Under the
+    /// pre-RSS HIGH=0.70 threshold this scenario would not have triggered HIGH
+    /// either, but the test enforces the post-recalibration invariant
+    /// "single strong source alone never trips HIGH" — preventing a future
+    /// regression that re-narrows the threshold back below the RSS-feasible
+    /// single-source ceiling.
+    /// [Lakshminarayanan 2017] predictive uncertainty calibration.
+    #[test]
+    fn rss_composite_single_strong_input_below_new_high_threshold() {
+        let mut eu = EpistemicUncertainty::new();
+        eu.update(0.99, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert!(
+            eu.composite < 0.85,
+            "single strong RL input should not reach HIGH=0.85 alone, got composite={}",
+            eu.composite
+        );
+        assert!(
+            !eu.high_uncertainty_mode,
+            "high_uncertainty_mode must stay false for a single strong input"
+        );
+    }
+
+    /// Genuine multi-source high uncertainty MUST still cross the
+    /// recalibrated HIGH=0.85 threshold. Four heavy-weight inputs at 1.0
+    /// (rl + linucb + calib + guard, all weight ≥0.15) produce composite
+    /// ≈ 0.90 under RSS, which exceeds 0.85 and triggers
+    /// `high_uncertainty_mode`. Without this regression test, a future
+    /// over-widening of the threshold (e.g. to 0.95 for HIGH) would silently
+    /// disable the guard for legitimate compound uncertainty.
+    #[test]
+    fn rss_composite_multiple_inputs_can_reach_new_high_threshold() {
+        let mut eu = EpistemicUncertainty::new();
+        // 4 heavy-weight components saturated; nars + drift left at 0.
+        eu.update(1.0, 1.0, 0.0, 0.0, 1.0, 1.0);
+        assert!(
+            eu.composite > 0.85,
+            "4 heavy inputs at 1.0 must exceed HIGH=0.85 under RSS, got composite={}",
+            eu.composite
+        );
+        assert!(
+            eu.high_uncertainty_mode,
+            "high_uncertainty_mode must trigger when composite > 0.85"
+        );
+    }
+
+    /// At maximum saturation across all six sources, composite is exactly the
+    /// RSS ceiling (1.0 by construction of the normalization), which must
+    /// reach the recalibrated OBSERVE-ONLY=0.95 threshold. This is the
+    /// degenerate "system is maximally uncertain" case the OBSERVE-ONLY mode
+    /// exists for: zero side effects until evidence accumulates.
+    #[test]
+    fn rss_composite_all_inputs_max_reaches_observe_only() {
+        let mut eu = EpistemicUncertainty::new();
+        eu.update(1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
+        assert!(
+            eu.composite >= 0.95,
+            "all 6 inputs at max should reach OBSERVE-ONLY=0.95, got composite={}",
+            eu.composite
+        );
+        assert!(
+            eu.observe_only_mode,
+            "observe_only_mode must trigger at composite >= 0.95"
+        );
     }
 }

@@ -254,10 +254,26 @@ pub fn is_protected_name(name: &str) -> bool {
 }
 
 /// Returns true if the binary path belongs to protected infrastructure territory.
-/// Specifically: Homebrew (/opt/homebrew) or common privileged helper locations.
+///
+/// Covers:
+/// - `/opt/homebrew/` — Apple-Silicon Homebrew root (includes `Cellar/` keg-only paths).
+/// - `/usr/local/bin/` — traditional system / Intel-Mac Homebrew binaries.
+/// - `/usr/local/sbin/` — system-service binaries (haproxy, custom daemons).
+/// - `/usr/local/Cellar/` — Intel-Mac Homebrew keg-only paths (nginx, postgresql).
+/// - `/Library/PrivilegedHelperTools/` — Apple privileged helpers.
+///
+/// 2026-05-16 (adversarial review): the original list missed `sbin` and both
+/// Cellar roots. Homebrew-managed nginx / postgresql are frequently invoked
+/// from `*/Cellar/<pkg>/<ver>/bin/...` rather than the symlink, allowing
+/// kqueue-launched processes to escape infrastructure protection.
 pub fn is_infrastructure_path(path: &str) -> bool {
+    // `/opt/homebrew/Cellar/...` is already covered by the `/opt/homebrew/`
+    // prefix; the Cellar test below is a regression guard against future
+    // narrowing of that prefix.
     path.starts_with("/opt/homebrew/")
         || path.starts_with("/usr/local/bin/")
+        || path.starts_with("/usr/local/sbin/")
+        || path.starts_with("/usr/local/Cellar/")
         || path.starts_with("/Library/PrivilegedHelperTools/")
 }
 
@@ -926,6 +942,38 @@ mod tests {
     use super::*;
 
     const RAM_8GB: u64 = 8 * 1024 * 1024 * 1024;
+
+    // ── is_infrastructure_path coverage tests (2026-05-16 adversarial review) ─
+
+    /// Homebrew-managed nginx / postgres are frequently invoked from
+    /// `/opt/homebrew/Cellar/<pkg>/<ver>/bin/...` instead of the
+    /// `/opt/homebrew/bin/<pkg>` symlink. The pre-2026-05-16 prefix list
+    /// missed the Cellar root, allowing kqueue-launched processes that
+    /// bypass the symlink to escape infrastructure protection.
+    #[test]
+    fn infrastructure_path_covers_homebrew_cellar() {
+        assert!(is_infrastructure_path(
+            "/opt/homebrew/Cellar/postgresql@16/16.2/bin/postgres"
+        ));
+    }
+
+    /// Intel-Mac Homebrew layout puts the Cellar under `/usr/local/Cellar/`.
+    /// The pre-2026-05-16 prefix list only had `/usr/local/bin/`, so any
+    /// service invoked via the keg-only path was unprotected.
+    #[test]
+    fn infrastructure_path_covers_usr_local_cellar() {
+        assert!(is_infrastructure_path(
+            "/usr/local/Cellar/nginx/1.27.4/bin/nginx"
+        ));
+    }
+
+    /// System service binaries traditionally live in `/usr/local/sbin/`
+    /// (haproxy, custom daemons), distinct from `/usr/local/bin/`. The
+    /// pre-2026-05-16 prefix list omitted this directory.
+    #[test]
+    fn infrastructure_path_covers_usr_local_sbin() {
+        assert!(is_infrastructure_path("/usr/local/sbin/foobar"));
+    }
 
     // ── List split tests ────────────────────────────────────────────────
 
