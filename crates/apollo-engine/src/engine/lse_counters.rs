@@ -278,6 +278,21 @@ pub struct LockFreeMetrics {
     /// in production rather than no-op'ing on a quiescent system.
     /// [McGaugh 2004] arousal → consolidation; [Yerkes & Dodson 1908].
     pub arousal_decay_accelerations_total: AtomicU64,
+
+    /// Phase 3.3 — Cross-Group Companion Attention propagation
+    /// observability (Sprint 6, 2026-05-16). Incremented each time
+    /// [`crate::engine::companion_graph::CompanionGraph::propagate_attention_across_groups`]
+    /// returns one or more inferred (A, B, score) triples — counter is
+    /// bumped by the number of triples returned, NOT by call count.
+    /// Dashboards verify the feature actually fires (vs the "scaffolding
+    /// without wiring" anti-pattern documented in CLAUDE.md) and that
+    /// the per-cycle cap (100) is rarely hit (which would indicate
+    /// graph-wide saturation worth investigating).
+    ///
+    /// Note: producers are NOT wired in this commit (see `OPENS: 1`); the
+    /// counter remains 0 in prod until the daemon main-loop invokes the
+    /// propagation API and calls `add_companion_cross_group_inferences()`.
+    pub companion_cross_group_inferences_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -397,6 +412,8 @@ impl LockFreeMetrics {
             policy_rollback_executions_total: AtomicU64::new(0),
 
             arousal_decay_accelerations_total: AtomicU64::new(0),
+
+            companion_cross_group_inferences_total: AtomicU64::new(0),
         }
     }
 
@@ -746,6 +763,9 @@ impl LockFreeMetrics {
             arousal_decay_accelerations_total: self
                 .arousal_decay_accelerations_total
                 .load(Ordering::Relaxed),
+            companion_cross_group_inferences_total: self
+                .companion_cross_group_inferences_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -839,6 +859,17 @@ impl LockFreeMetrics {
         self.arousal_decay_accelerations_total
             .fetch_add(n, Ordering::Relaxed);
     }
+
+    /// Phase 3.3 — Cross-Group Companion Attention observability hook.
+    /// Increment by the number of triples returned from
+    /// [`crate::engine::companion_graph::CompanionGraph::propagate_attention_across_groups`].
+    /// Bumping by N (rather than calling N times) keeps the call site a
+    /// single LSE `ldaddal` even when the propagation returns many edges.
+    #[inline(always)]
+    pub fn add_companion_cross_group_inferences(&self, n: u64) {
+        self.companion_cross_group_inferences_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 // Safe to share across threads — all fields are atomic.
@@ -925,6 +956,9 @@ pub struct MetricsSnapshot {
 
     /// Phase 3.2 — Arousal-Modulated NARS Decay counter.
     pub arousal_decay_accelerations_total: u64,
+
+    /// Phase 3.3 — Cross-Group Companion Attention inferences (Sprint 6).
+    pub companion_cross_group_inferences_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

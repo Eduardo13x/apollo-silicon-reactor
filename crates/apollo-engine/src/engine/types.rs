@@ -1640,6 +1640,16 @@ pub struct RuntimeMetrics {
     /// [McGaugh 2004]; [Yerkes & Dodson 1908].
     #[serde(default)]
     pub arousal_decay_accelerations_total: u64,
+
+    /// Phase 3.3 — Cross-Group Companion Attention inferences (Sprint 6,
+    /// 2026-05-16). Cumulative count of (A, B, score) triples returned by
+    /// [`crate::engine::companion_graph::CompanionGraph::propagate_attention_across_groups`].
+    /// Stays at 0 until the daemon main-loop wires the call site (see
+    /// `OPENS: 1` on the introducing commit). Dashboards verify the
+    /// feature is actually inferring cross-coalition companions instead
+    /// of no-op'ing.
+    #[serde(default)]
+    pub companion_cross_group_inferences_total: u64,
 }
 
 impl RuntimeMetrics {

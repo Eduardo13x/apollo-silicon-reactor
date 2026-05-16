@@ -230,3 +230,27 @@ fn batch1_phases_32_42_43_52_counters_reach_runtime_metrics_json() {
         );
     }
 }
+
+/// Phase 3.3 — Cross-Group Companion Attention counter round-trip.
+#[test]
+fn phase33_companion_cross_group_inferences_reach_runtime_metrics_json() {
+    let lf = LockFreeMetrics::new();
+    lf.add_companion_cross_group_inferences(37);
+    lf.commit();
+
+    let snap = lf.snapshot();
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+
+    assert_eq!(
+        state.metrics.companion_cross_group_inferences_total, 37,
+        "counter must round-trip into RuntimeMetrics via sync_from_lockfree"
+    );
+
+    let json = serde_json::to_string(&state.metrics).expect("serialize RuntimeMetrics");
+    assert!(
+        json.contains("\"companion_cross_group_inferences_total\":37"),
+        "field absent or wrong value in JSON: {}",
+        json
+    );
+}
