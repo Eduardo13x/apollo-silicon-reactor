@@ -244,6 +244,34 @@ pub struct LockFreeMetrics {
     /// counter remains 0 in prod until `decide_actions` invokes the
     /// penalty function and calls `inc_battery_aware_penalty_emission()`.
     pub battery_aware_penalty_emissions_total: AtomicU64,
+
+    /// Phase 5.3 — Structured-rationale observability (Sprint 8, 2026-05-16).
+    /// Incremented every time a `JournalEntry` is written with a non-`None`
+    /// `rationale` field, i.e. the action carried a machine-parseable
+    /// explanation. Dashboards compute the "rationale coverage ratio" as
+    ///
+    /// ```text
+    /// journal_rationales_attached_total
+    /// ─────────────────────────────────
+    ///   total journal entries written
+    /// ```
+    ///
+    /// Without this counter we'd have no way to verify whether the
+    /// cross-cutting wiring (deferred to a follow-up commit) ever landed in
+    /// prod — the same "tautology trap" NotebookLM flagged for Phase 3.1
+    /// (`skill_aware_modulations_total`) and Phase 5.2
+    /// (`battery_aware_penalty_emissions_total`).
+    ///
+    /// Producers are NOT wired in this commit (`OPENS: 1`); the counter
+    /// stays at 0 until a journal write-site calls
+    /// `inc_journal_rationale_attached()` alongside its
+    /// `JournalEntry::with_rationale(..)` invocation.
+    ///
+    /// References:
+    /// - [Doshi-Velez & Kim 2017] interpretable ML observability —
+    ///   coverage metric is a precondition for trust.
+    /// - [Ribeiro et al. 2016] LIME — every prediction explained.
+    pub journal_rationales_attached_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -354,6 +382,7 @@ impl LockFreeMetrics {
             reactor_pulses: AtomicU64::new(0),
             reactor_event_weight_bits: AtomicU64::new(0_f64.to_bits()),
             battery_aware_penalty_emissions_total: AtomicU64::new(0),
+            journal_rationales_attached_total: AtomicU64::new(0),
         }
     }
 
@@ -686,6 +715,9 @@ impl LockFreeMetrics {
             battery_aware_penalty_emissions_total: self
                 .battery_aware_penalty_emissions_total
                 .load(Ordering::Relaxed),
+            journal_rationales_attached_total: self
+                .journal_rationales_attached_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -726,6 +758,18 @@ impl LockFreeMetrics {
     #[inline(always)]
     pub fn inc_battery_aware_penalty_emission(&self) {
         self.battery_aware_penalty_emissions_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Phase 5.3 — Structured-rationale observability hook. Call once per
+    /// `JournalEntry` written with a non-`None` `rationale` field. Stays at
+    /// 0 in prod until the wiring follow-up lands and a journal write-site
+    /// emits both `with_rationale(..)` AND `inc_journal_rationale_attached()`.
+    ///
+    /// [Doshi-Velez & Kim 2017] — observability metric for explanation coverage.
+    #[inline(always)]
+    pub fn inc_journal_rationale_attached(&self) {
+        self.journal_rationales_attached_total
             .fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -802,6 +846,8 @@ pub struct MetricsSnapshot {
     pub reactor_event_weight: f64,
     /// Phase 5.2 — Battery-aware cost penalty emissions (Sprint 8).
     pub battery_aware_penalty_emissions_total: u64,
+    /// Phase 5.3 — JournalEntry rationale attachments (Sprint 8).
+    pub journal_rationales_attached_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

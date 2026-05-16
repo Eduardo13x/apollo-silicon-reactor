@@ -966,6 +966,12 @@ pub fn execute_actions(
             continue;
         }
 
+        // TODO(phase-5.3-wiring): this is the cycle-wide journal chokepoint.
+        // A `Rationale` constructed up-stream (in `decide_actions` or the
+        // specialist that emitted the action) should be threaded here via
+        // `.with_rationale(...)`. Doing so in one place will cover
+        // throttle/freeze/unfreeze/boost/sysctl in a single touch. Wiring is
+        // deferred per Phase 5.3 scope to keep this commit reviewable.
         pending_journal.push(JournalEntry {
             timestamp: Utc::now(),
             action,
@@ -973,6 +979,7 @@ pub fn execute_actions(
             after,
             success,
             reason: journal_reason,
+            rationale: None,
         });
     }
 

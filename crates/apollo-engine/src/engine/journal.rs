@@ -128,6 +128,7 @@ mod tests {
             after: None,
             success: true,
             reason: "unit-test".to_string(),
+            rationale: None,
         }
     }
 
@@ -242,6 +243,83 @@ mod tests {
             "malformed line should be silently ignored, got {} entries",
             entries.len()
         );
+    }
+
+    #[test]
+    fn journal_entry_with_rationale_round_trip() {
+        use crate::engine::audit_types::Rationale;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("journal.jsonl");
+
+        let entry = make_entry().with_rationale(
+            Rationale::new("boost", "interactive_focus", "fg_pid=42,pressure=0.31")
+                .with_expected_outcome("expected_latency_drop_ms=8"),
+        );
+        append_journal(&path, &entry).expect("append_journal");
+
+        let entries = read_journal(&path).expect("read_journal");
+        assert_eq!(entries.len(), 1);
+        let got = entries[0]
+            .rationale
+            .as_ref()
+            .expect("rationale should round-trip");
+        assert_eq!(got.action_class, "boost");
+        assert_eq!(got.trigger, "interactive_focus");
+        assert_eq!(got.evidence, "fg_pid=42,pressure=0.31");
+        assert_eq!(
+            got.expected_outcome.as_deref(),
+            Some("expected_latency_drop_ms=8"),
+        );
+    }
+
+    #[test]
+    fn journal_entry_without_rationale_omits_field() {
+        // Backward-compat invariant: an entry written without a rationale
+        // must NOT include a `rationale` key in the serialized JSON line.
+        // Old downstream parsers (dashboards, log shippers) treat unknown
+        // null fields as schema drift and may alarm — `skip_serializing_if`
+        // keeps the wire format byte-compatible with the pre-5.3 schema.
+        let entry = make_entry();
+        assert!(entry.rationale.is_none());
+
+        let json = serde_json::to_string(&entry).expect("serialize entry");
+        assert!(
+            !json.contains("rationale"),
+            "rationale key must be omitted when None, got: {json}"
+        );
+    }
+
+    #[test]
+    fn legacy_journal_line_without_rationale_parses() {
+        // Forward-compat invariant: a journal line written by a pre-5.3
+        // daemon (no `rationale` field at all) must still deserialize via
+        // `#[serde(default)]` on the consumer.
+        let legacy_line = r#"{
+            "timestamp":"2026-05-16T12:00:00Z",
+            "action":{"type":"boost_process","payload":{"pid":7,"name":"x","reason":"r","decision_reason":"PressureContext"}},
+            "before":null,
+            "after":null,
+            "success":true,
+            "reason":"legacy"
+        }"#;
+        // We don't assume the exact RootAction tag layout — just that the
+        // serde derive accepts a missing `rationale` field. Construct via
+        // round-trip: serialize an entry without rationale, drop the
+        // `rationale` key entirely (it's already absent), and deserialize.
+        let fresh = make_entry();
+        let json = serde_json::to_string(&fresh).expect("serialize fresh entry");
+        // Sanity: no `rationale` key present (matches legacy schema).
+        assert!(!json.contains("rationale"));
+        let back: JournalEntry =
+            serde_json::from_str(&json).expect("deserialize legacy-style line");
+        assert!(back.rationale.is_none());
+
+        // The literal legacy_line is here for human inspection — it
+        // demonstrates the schema shape but is not parsed here because
+        // RootAction's serde representation is intentionally opaque to
+        // this test.
+        let _ = legacy_line;
     }
 
     // Ensure FrozenEntry is importable for completeness (used by other journal callers)

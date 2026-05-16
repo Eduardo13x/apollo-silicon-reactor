@@ -166,3 +166,35 @@ fn fase5_all_eleven_action_counters_reach_runtime_metrics() {
         );
     }
 }
+
+#[test]
+fn phase_5_3_rationale_counter_reaches_runtime_metrics_json() {
+    // Same end-to-end chain as the Fase 5 counters above: increment on the
+    // LSE bus, snapshot, sync_from_lockfree, serialize. If any step is
+    // missing the rationale counter, the dashboard would forever see 0 and
+    // we'd believe rationale wiring never landed — exactly the
+    // "tautology trap" CLAUDE.md warns about.
+    let lf = LockFreeMetrics::new();
+    // 17 is arbitrary but uniquely distinguishable in the JSON haystack.
+    for _ in 0..17 {
+        lf.inc_journal_rationale_attached();
+    }
+    lf.commit();
+
+    let snap = lf.snapshot();
+    assert_eq!(snap.journal_rationales_attached_total, 17);
+
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+    assert_eq!(
+        state.metrics.journal_rationales_attached_total, 17,
+        "sync_from_lockfree must flush journal_rationales_attached_total",
+    );
+
+    let json = serde_json::to_string(&state.metrics).expect("serialize RuntimeMetrics");
+    assert!(
+        json.contains("\"journal_rationales_attached_total\":17"),
+        "journal_rationales_attached_total absent or wrong: {}",
+        json
+    );
+}
