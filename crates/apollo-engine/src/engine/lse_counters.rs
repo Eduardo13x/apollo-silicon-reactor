@@ -244,6 +244,22 @@ pub struct LockFreeMetrics {
     /// counter remains 0 in prod until `decide_actions` invokes the
     /// penalty function and calls `inc_battery_aware_penalty_emission()`.
     pub battery_aware_penalty_emissions_total: AtomicU64,
+
+    /// Phase 5.1 — User-presence suppression observability (Sprint 8,
+    /// 2026-05-16). Incremented each time
+    /// [`crate::engine::user_presence::user_presence_modulator`] returned a
+    /// multiplier strictly less than 1.0 (active or semi-active user, no
+    /// crisis override). Mirrors the Phase 3.1 / 5.2 design: this counter
+    /// is the only way to verify the modulator actually scaled an action
+    /// in prod, instead of no-op'ing at the idle tier.
+    ///
+    /// Note: producers (`decide_actions` cost composition / cognitive tick
+    /// specialist voting) are not wired in this commit (see `OPENS: 1` on
+    /// the introducing commit). The counter stays at 0 until the caller
+    /// invokes the modulator with real HID inputs.
+    ///
+    /// [Iqbal & Bailey 2008] "Effects of Interruptions on Task Performance".
+    pub user_presence_suppressions_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -354,6 +370,7 @@ impl LockFreeMetrics {
             reactor_pulses: AtomicU64::new(0),
             reactor_event_weight_bits: AtomicU64::new(0_f64.to_bits()),
             battery_aware_penalty_emissions_total: AtomicU64::new(0),
+            user_presence_suppressions_total: AtomicU64::new(0),
         }
     }
 
@@ -686,6 +703,9 @@ impl LockFreeMetrics {
             battery_aware_penalty_emissions_total: self
                 .battery_aware_penalty_emissions_total
                 .load(Ordering::Relaxed),
+            user_presence_suppressions_total: self
+                .user_presence_suppressions_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -727,6 +747,21 @@ impl LockFreeMetrics {
     pub fn inc_battery_aware_penalty_emission(&self) {
         self.battery_aware_penalty_emissions_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Phase 5.1 — User-presence suppression observability hook.
+    /// Call once per `user_presence_modulator` invocation that returned a
+    /// multiplier strictly less than 1.0 (active or semi-active tier).
+    /// Dashboards compute the "presence suppression rate" as
+    /// `user_presence_suppressions_total / cycles` to verify the modulator
+    /// fires while the user is at the keyboard and stays at 0 during long
+    /// idles. Mirrors `add_skill_aware_modulations` and
+    /// `inc_battery_aware_penalty_emission` shape so dashboards can group
+    /// the three Sprint-6/8 instrumentation counters uniformly.
+    #[inline(always)]
+    pub fn add_user_presence_suppressions(&self, n: u64) {
+        self.user_presence_suppressions_total
+            .fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -802,6 +837,10 @@ pub struct MetricsSnapshot {
     pub reactor_event_weight: f64,
     /// Phase 5.2 — Battery-aware cost penalty emissions (Sprint 8).
     pub battery_aware_penalty_emissions_total: u64,
+    /// Phase 5.1 — User-presence suppressions emitted (Sprint 8).
+    /// Count of `user_presence_modulator` calls that returned a
+    /// multiplier strictly less than 1.0 (active/semi-active tier).
+    pub user_presence_suppressions_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

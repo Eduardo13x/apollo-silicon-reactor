@@ -166,3 +166,53 @@ fn fase5_all_eleven_action_counters_reach_runtime_metrics() {
         );
     }
 }
+
+/// Phase 5.1 (Sprint 8, 2026-05-16) — round-trip test for the
+/// `user_presence_suppressions_total` observability counter.
+///
+/// Same shape as `fase5_counters_reach_runtime_metrics_json`: bump the
+/// lock-free counter, snapshot, sync into `RuntimeMetrics`, and prove the
+/// value survives to the serialized JSON the dashboard reads. This is the
+/// integration test that catches a missing line in `sync_from_lockfree`
+/// or a missing `#[serde(default)]` on `RuntimeMetrics`.
+#[test]
+fn phase5_1_user_presence_suppressions_round_trip() {
+    let lf = LockFreeMetrics::new();
+    // Use a distinct, non-trivial value so a default-zero default would
+    // be obvious in the failure message.
+    lf.add_user_presence_suppressions(42);
+    lf.commit();
+
+    let snap = lf.snapshot();
+    assert_eq!(
+        snap.user_presence_suppressions_total, 42,
+        "lock-free snapshot did not surface the counter"
+    );
+
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+    assert_eq!(
+        state.metrics.user_presence_suppressions_total, 42,
+        "sync_from_lockfree did not flush user_presence_suppressions_total"
+    );
+
+    let json = serde_json::to_string(&state.metrics).expect("serialize RuntimeMetrics");
+    assert!(
+        json.contains("\"user_presence_suppressions_total\":42"),
+        "user_presence_suppressions_total absent or wrong in JSON: {}",
+        json
+    );
+}
+
+/// Phase 5.1 — confirm the LSE helper actually increments the counter so
+/// `user_presence_modulator` callers see a visible side effect.
+#[test]
+fn phase5_1_add_user_presence_suppressions_increments() {
+    let lf = LockFreeMetrics::new();
+    lf.add_user_presence_suppressions(1);
+    lf.add_user_presence_suppressions(2);
+    lf.add_user_presence_suppressions(4);
+    lf.commit();
+    let snap = lf.snapshot();
+    assert_eq!(snap.user_presence_suppressions_total, 7);
+}

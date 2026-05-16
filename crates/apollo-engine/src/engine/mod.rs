@@ -133,6 +133,7 @@ pub mod types;
 pub mod unfreeze_decay;
 pub mod usage_model;
 pub mod user_context;
+pub mod user_presence;
 pub mod user_profile;
 pub mod wait_graph;
 pub mod wake_storm_detector;
