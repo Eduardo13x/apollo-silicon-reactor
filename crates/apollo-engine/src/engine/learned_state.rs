@@ -19,14 +19,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::engine::causal_graph::{CausalEdge, CausalGraph};
+use crate::engine::companion_graph::CompanionGraph;
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
 use crate::engine::maintenance_state::MaintenanceState;
 use crate::engine::meta_cognition::MetaCognition;
-use crate::engine::nars_belief::ArousalState;
+use crate::engine::nars_belief::{ArousalState, DriftDetector};
 use crate::engine::nested_learner::NestedLearner;
 use crate::engine::neuromodulator::NeuroState;
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
-use crate::engine::companion_graph::CompanionGraph;
 use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
 use crate::engine::overflow_guard::OverflowHistory;
 use crate::engine::predictive_agent::SpecialistAccuracyTracker;
@@ -749,13 +749,33 @@ impl LearnedState {
             //    have more influence, preventing stale beliefs from dominating.
             //    Factor from LearnableParams (default 0.95 → half-life ≈ 14 persist cycles).
             //    Meta-learning adjusts it: stuck→faster forgetting, converged→slower.
+            //
+            //    Phase 3.2 (Sprint 6, 2026-05-16) — Arousal-Modulated Decay.
+            //    Under high system stress (ArousalState in Stressed/Crisis zone)
+            //    the daemon flushes stale beliefs faster so post-crisis
+            //    re-learning dominates. [McGaugh 2004] amygdala-driven memory
+            //    consolidation/forgetting; [Yerkes & Dodson 1908] inverted-U
+            //    arousal vs. learning efficiency.
             if let Some(dd) = &mut ot.drift_detector {
-                let decay = self
+                let base_decay = self
                     .learnable_params
                     .as_ref()
                     .map(|lp| lp.nars_decay_factor)
                     .unwrap_or(0.95);
-                dd.decay_confidence(decay);
+                let arousal_level = self
+                    .arousal_state
+                    .as_ref()
+                    .map(|a| a.level as f64)
+                    .unwrap_or(0.0);
+                let effective =
+                    DriftDetector::arousal_modulated_decay_factor(arousal_level, base_decay as f64);
+                // Telemetry: bump the counter only when modulation actually
+                // accelerated decay (i.e. Stressed/Crisis zone). Tiny epsilon
+                // guards against floating-point equality drift.
+                if effective + 1e-9 < base_decay as f64 {
+                    crate::engine::lse_counters::LSE_COUNTERS.add_arousal_decay_accelerations(1);
+                }
+                dd.decay_confidence(effective as f32);
             }
         }
 
@@ -2024,8 +2044,8 @@ mod tests {
         }
         LearnedState::patch_companion_graph(&path, &g);
 
-        let restored = LearnedState::load_companion_graph(&path)
-            .expect("companion graph should be restored");
+        let restored =
+            LearnedState::load_companion_graph(&path).expect("companion graph should be restored");
         assert!(restored.is_companion_of("Brave", "Slack"));
         assert_eq!(restored.total_cycles(), g.total_cycles());
     }

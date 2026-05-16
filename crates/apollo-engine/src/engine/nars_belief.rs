@@ -403,15 +403,20 @@ impl DriftDetector {
         // Seed structural protection categories with strong negative priors.
         // This prevents the system from modeling them under 'generic' or 'background-noise'
         // and interpreting their lack of action as 'Inaction Noise'.
-        let protected_categories = ["apple-owned", "active-coalition", "companion-of-fg", "infrastructure-owned"];
+        let protected_categories = [
+            "apple-owned",
+            "active-coalition",
+            "companion-of-fg",
+            "infrastructure-owned",
+        ];
         for cat in protected_categories {
             let mut entry = BeliefEntry::new(0.0); // 0.0 frequency (never effective to act)
-            // 0.99 confidence: we are certain these should not be acted upon
-            entry.tv = TruthValue::new(0.0, 0.99); 
+                                                   // 0.99 confidence: we are certain these should not be acted upon
+            entry.tv = TruthValue::new(0.0, 0.99);
             // Maximum Long-Term Importance (never decay to ignorance)
-            entry.lti = 1.0; 
+            entry.lti = 1.0;
             // Strong prior weight so single observations don't sway it quickly
-            entry.observations = 100; 
+            entry.observations = 100;
             detector.beliefs.insert(cat.to_string(), entry);
         }
 
@@ -596,6 +601,58 @@ impl DriftDetector {
     ///
     /// Standard: 0.95/cycle → half-life ≈ 14 cycles.
     /// LTI-protected: 0.985/cycle → half-life ≈ 46 cycles (3× more durable).
+    ///
+    /// Phase 3.2 — Arousal-Modulated NARS Decay (Sprint 6, 2026-05-16).
+    ///
+    /// Map a global daemon arousal level ∈ [0,1] to an adjusted decay factor
+    /// for `decay_confidence(..)`. Higher arousal → smaller factor → faster
+    /// Bayesian forgetting. Bands match the spec used by `ArousalState::zone()`
+    /// but with a slightly different Optimal/Stressed cut (0.60 vs 0.65) so
+    /// the modulation engages BEFORE the dashboard label flips to "Stressed":
+    ///
+    /// - Idle/Calm   (arousal <  0.30): unchanged (`base_factor`)
+    /// - Optimal     (0.30 ≤ a < 0.60): unchanged (`base_factor`)
+    /// - Stressed    (0.60 ≤ a < 0.80): `base_factor − 0.05` (slightly faster)
+    /// - Crisis      (a ≥ 0.80):        `base_factor − 0.10` (much faster —
+    ///   stale beliefs flushed so post-crisis re-learning dominates)
+    ///
+    /// Result is clamped to `[0.50, base_factor]` to (a) prevent runaway
+    /// forgetting — total NARS amnesia would erase the seeded protections —
+    /// and (b) guarantee arousal can only ACCELERATE decay, never slow it.
+    /// Out-of-domain arousal (NaN, negative, > 1.0) is clamped before
+    /// band selection, so it always behaves as Idle (no change) or Crisis
+    /// (capped at the floor), never as a multiplier > base.
+    ///
+    /// [McGaugh 2004] amygdala-driven memory consolidation/forgetting under
+    /// stress hormones; [Yerkes & Dodson 1908] inverted-U arousal vs.
+    /// learning efficiency.
+    #[inline]
+    pub fn arousal_modulated_decay_factor(arousal_level: f64, base_factor: f64) -> f64 {
+        // Sanitise out-of-domain arousal (NaN/Inf/negative/>1) → [0, 1].
+        let a = if arousal_level.is_finite() {
+            arousal_level.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let adjusted = if a < 0.30 {
+            base_factor // Idle / Calm
+        } else if a < 0.60 {
+            base_factor // Optimal — Yerkes-Dodson peak zone
+        } else if a < 0.80 {
+            base_factor - 0.05 // Stressed
+        } else {
+            base_factor - 0.10 // Crisis
+        };
+        // Two-sided clamp: floor 0.50 (no runaway forgetting / total NARS
+        // amnesia); ceiling `base_factor` (arousal can only accelerate, never
+        // slow). When the caller passes a pathological `base_factor < 0.50`
+        // the two bounds invert — apply them sequentially instead of
+        // `f64::clamp` so we never panic. Order: cap-to-ceiling first, then
+        // raise-to-floor; this preserves the invariant "result ≥ 0.50" even
+        // when `base_factor < 0.50`.
+        adjusted.min(base_factor).max(0.50)
+    }
+
     pub fn decay_confidence(&mut self, factor: f32) {
         let factor = factor.clamp(0.0, 1.0);
         let mut to_remove = Vec::new();
@@ -1018,12 +1075,16 @@ mod tests {
             dd.observe("proc_A", true);
         }
         assert_eq!(dd.len(), 5); // 4 seeded + 1 new
-        // Decay 20 times at 0.5 factor: 0.5^20 → effectively 0
+                                 // Decay 20 times at 0.5 factor: 0.5^20 → effectively 0
         for _ in 0..20 {
             dd.decay_confidence(0.5);
         }
         // proc_A should be pruned (confidence < 0.05). The 4 seeded beliefs remain because they have LTI = 1.0.
-        assert_eq!(dd.len(), 4, "fully decayed belief should be pruned, seeded ones remain");
+        assert_eq!(
+            dd.len(),
+            4,
+            "fully decayed belief should be pruned, seeded ones remain"
+        );
     }
 
     #[test]
@@ -1600,5 +1661,142 @@ mod tests {
             "After contradictory evidence, frequency should fall below 0.8 (regime changed), got {}",
             belief_after.frequency
         );
+    }
+
+    // ── Phase 3.2 — Arousal-Modulated NARS Decay ─────────────────────────────
+    //
+    // [McGaugh 2004] emotional arousal modulates memory consolidation and
+    // forgetting via stress-hormone signalling (norepinephrine, cortisol).
+    // [Yerkes & Dodson 1908] inverted-U: extreme stress accelerates the
+    // discard of stale, low-value information so the system can adapt.
+    //
+    // Apollo mirrors this by accelerating Bayesian-forgetting decay when the
+    // daemon's global ArousalState enters Stressed/Crisis zones — stale
+    // beliefs are flushed faster so freshly-collected evidence dominates.
+
+    #[test]
+    fn arousal_modulated_decay_factor_idle_no_change() {
+        let base = 0.95_f64;
+        // Idle (< 0.30) and Calm border (just below 0.30) → no change.
+        let f_idle = DriftDetector::arousal_modulated_decay_factor(0.0, base);
+        let f_low = DriftDetector::arousal_modulated_decay_factor(0.20, base);
+        let f_calm_high = DriftDetector::arousal_modulated_decay_factor(0.29, base);
+        assert!(
+            (f_idle - base).abs() < 1e-9,
+            "arousal=0.0 should leave factor unchanged: got {f_idle}, base {base}"
+        );
+        assert!(
+            (f_low - base).abs() < 1e-9,
+            "arousal=0.20 (Idle) should leave factor unchanged: got {f_low}"
+        );
+        assert!(
+            (f_calm_high - base).abs() < 1e-9,
+            "arousal=0.29 (still Idle/Calm band per spec) should leave factor unchanged: got {f_calm_high}"
+        );
+    }
+
+    #[test]
+    fn arousal_modulated_decay_factor_optimal_no_change() {
+        let base = 0.95_f64;
+        // Optimal band [0.30, 0.60) — peak learning zone, no extra forgetting.
+        let f_lo = DriftDetector::arousal_modulated_decay_factor(0.30, base);
+        let f_mid = DriftDetector::arousal_modulated_decay_factor(0.45, base);
+        let f_hi = DriftDetector::arousal_modulated_decay_factor(0.59, base);
+        assert!((f_lo - base).abs() < 1e-9, "Optimal lo unchanged: {f_lo}");
+        assert!(
+            (f_mid - base).abs() < 1e-9,
+            "Optimal mid unchanged: {f_mid}"
+        );
+        assert!((f_hi - base).abs() < 1e-9, "Optimal hi unchanged: {f_hi}");
+    }
+
+    #[test]
+    fn arousal_modulated_decay_factor_stressed_slightly_faster() {
+        let base = 0.95_f64;
+        // Stressed band [0.60, 0.80) — base - 0.05.
+        let f = DriftDetector::arousal_modulated_decay_factor(0.70, base);
+        assert!(
+            (f - (base - 0.05)).abs() < 1e-9,
+            "Stressed should subtract 0.05 from base: got {f}, expected {}",
+            base - 0.05
+        );
+    }
+
+    #[test]
+    fn arousal_modulated_decay_factor_crisis_accelerates() {
+        let base = 0.95_f64;
+        // Crisis band [0.80, 1.0] — base - 0.10 (much faster decay).
+        let f_lo = DriftDetector::arousal_modulated_decay_factor(0.80, base);
+        let f_hi = DriftDetector::arousal_modulated_decay_factor(1.00, base);
+        assert!(
+            (f_lo - (base - 0.10)).abs() < 1e-9,
+            "Crisis lo should subtract 0.10: got {f_lo}, expected {}",
+            base - 0.10
+        );
+        assert!(
+            (f_hi - (base - 0.10)).abs() < 1e-9,
+            "Crisis hi should subtract 0.10: got {f_hi}, expected {}",
+            base - 0.10
+        );
+        // And: Crisis decay factor must be strictly < base (i.e. faster decay).
+        assert!(f_lo < base, "Crisis must decay faster than base");
+    }
+
+    #[test]
+    fn arousal_modulated_decay_factor_clamped_to_floor() {
+        // Defend against pathological base_factor that would otherwise drop
+        // below 0.50 → runaway forgetting and total NARS amnesia.
+        let very_low_base = 0.55_f64;
+        let f_crisis = DriftDetector::arousal_modulated_decay_factor(0.95, very_low_base);
+        assert!(
+            f_crisis >= 0.50,
+            "Decay factor must be clamped to floor 0.50, got {f_crisis}"
+        );
+        // Even with a degenerate base, the floor must hold.
+        let f_floor = DriftDetector::arousal_modulated_decay_factor(0.99, 0.30);
+        assert!(
+            f_floor >= 0.50,
+            "Floor must hold for tiny base: got {f_floor}"
+        );
+    }
+
+    #[test]
+    fn arousal_modulated_decay_factor_clamped_to_base_ceiling() {
+        // Ceiling: result must never EXCEED base (decay can only equal or
+        // accelerate, never slow down). Defends against out-of-domain arousal
+        // values that could otherwise raise the factor above base.
+        let base = 0.95_f64;
+        // Negative arousal is out-of-domain; treat as Idle (no change).
+        let f_neg = DriftDetector::arousal_modulated_decay_factor(-0.5, base);
+        assert!(
+            f_neg <= base + 1e-9,
+            "Negative arousal must not raise factor above base: {f_neg}"
+        );
+        // Above 1.0 is also out-of-domain; treat as Crisis cap.
+        let f_huge = DriftDetector::arousal_modulated_decay_factor(2.0, base);
+        assert!(
+            f_huge <= base,
+            "Out-of-range arousal must not raise factor above base: {f_huge}"
+        );
+    }
+
+    #[test]
+    fn arousal_modulated_decay_factor_monotone_in_arousal() {
+        // As arousal climbs from Idle → Crisis, decay factor must be
+        // non-increasing (more arousal ⇒ same-or-faster forgetting).
+        let base = 0.95_f64;
+        let levels = [
+            0.0_f64, 0.10, 0.29, 0.30, 0.45, 0.59, 0.60, 0.75, 0.80, 0.95,
+        ];
+        let mut prev = f64::INFINITY;
+        for &lvl in &levels {
+            let f = DriftDetector::arousal_modulated_decay_factor(lvl, base);
+            assert!(
+                f <= prev + 1e-9,
+                "Decay factor must be non-increasing in arousal: \
+                 at level={lvl} factor={f} but previous was {prev}"
+            );
+            prev = f;
+        }
     }
 }

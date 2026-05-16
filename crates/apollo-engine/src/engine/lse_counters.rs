@@ -230,6 +230,15 @@ pub struct LockFreeMetrics {
     pub reactor_pulses: AtomicU64,
     /// Store f64 reactor event weight as raw u64 bits.
     pub reactor_event_weight_bits: AtomicU64,
+
+    /// Phase 3.2 — Arousal-Modulated NARS Decay observability
+    /// (Sprint 6, 2026-05-16). Incremented each persist whose
+    /// `arousal_modulated_decay_factor(...)` returned a value strictly
+    /// less than the base factor (i.e. Stressed or Crisis zone, decay
+    /// accelerated). Lets dashboards verify the feature actually engages
+    /// in production rather than no-op'ing on a quiescent system.
+    /// [McGaugh 2004] arousal → consolidation; [Yerkes & Dodson 1908].
+    pub arousal_decay_accelerations_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -339,6 +348,7 @@ impl LockFreeMetrics {
             iokit_errors: AtomicU64::new(0),
             reactor_pulses: AtomicU64::new(0),
             reactor_event_weight_bits: AtomicU64::new(0_f64.to_bits()),
+            arousal_decay_accelerations_total: AtomicU64::new(0),
         }
     }
 
@@ -420,7 +430,8 @@ impl LockFreeMetrics {
 
     #[inline(always)]
     pub fn set_reactor_event_weight(&self, weight: f64) {
-        self.reactor_event_weight_bits.store(weight.to_bits(), Ordering::Relaxed);
+        self.reactor_event_weight_bits
+            .store(weight.to_bits(), Ordering::Relaxed);
     }
 
     /// Record a metrics-lock acquisition + held duration.
@@ -656,9 +667,7 @@ impl LockFreeMetrics {
             taskinfo_cache_exit_invalidations: self
                 .taskinfo_cache_exit_invalidations
                 .load(Ordering::Relaxed),
-            taskinfo_cache_cap_evictions: self
-                .taskinfo_cache_cap_evictions
-                .load(Ordering::Relaxed),
+            taskinfo_cache_cap_evictions: self.taskinfo_cache_cap_evictions.load(Ordering::Relaxed),
             skill_aware_modulations_total: self
                 .skill_aware_modulations_total
                 .load(Ordering::Relaxed),
@@ -668,6 +677,9 @@ impl LockFreeMetrics {
             reactor_event_weight: f64::from_bits(
                 self.reactor_event_weight_bits.load(Ordering::Relaxed),
             ),
+            arousal_decay_accelerations_total: self
+                .arousal_decay_accelerations_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -696,6 +708,18 @@ impl LockFreeMetrics {
     /// rather than no-op'ing on neutral signal (`None → 1.0`).
     pub fn add_skill_aware_modulations(&self, n: u64) {
         self.skill_aware_modulations_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Phase 3.2 — Arousal-Modulated NARS Decay observability hook.
+    /// Call once per persist whose
+    /// `DriftDetector::arousal_modulated_decay_factor(...)` produced a
+    /// factor strictly less than `base_factor` (i.e. Stressed or Crisis
+    /// zone, decay accelerated). Mirrors the Phase 3.1 counter design so
+    /// dashboards can verify the feature engages in prod.
+    /// [McGaugh 2004]; [Yerkes & Dodson 1908].
+    pub fn add_arousal_decay_accelerations(&self, n: u64) {
+        self.arousal_decay_accelerations_total
             .fetch_add(n, Ordering::Relaxed);
     }
 }
@@ -770,6 +794,8 @@ pub struct MetricsSnapshot {
     pub iokit_errors: u64,
     pub reactor_pulses: u64,
     pub reactor_event_weight: f64,
+    /// Phase 3.2 — Arousal-Modulated NARS Decay counter.
+    pub arousal_decay_accelerations_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

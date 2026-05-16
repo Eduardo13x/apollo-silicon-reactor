@@ -1592,6 +1592,16 @@ pub struct RuntimeMetrics {
     pub maintenance_purge_skipped_build_mode_total: u64,
     #[serde(default)]
     pub maintenance_purge_skipped_rate_limit_total: u64,
+
+    /// Phase 3.2 — Arousal-Modulated NARS Decay counter (Sprint 6,
+    /// 2026-05-16). Cumulative number of persist cycles whose
+    /// `DriftDetector::arousal_modulated_decay_factor(...)` produced a
+    /// factor strictly less than `base_factor` — i.e. the daemon was in
+    /// the Stressed/Crisis arousal zone and accelerated NARS forgetting.
+    /// Flushed from lf_metrics each cycle via sync_from_lockfree.
+    /// [McGaugh 2004]; [Yerkes & Dodson 1908].
+    #[serde(default)]
+    pub arousal_decay_accelerations_total: u64,
 }
 
 impl RuntimeMetrics {
