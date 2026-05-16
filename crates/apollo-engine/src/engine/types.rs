@@ -1662,6 +1662,23 @@ pub struct RuntimeMetrics {
     /// [Brown 1959]; [Welford 1962]; [Kuncheva 2004].
     #[serde(default)]
     pub adaptive_drift_threshold_raises_total: u64,
+
+    /// Phase 5.1 — User-presence suppression emissions (Sprint 8,
+    /// 2026-05-16). Cumulative count of action-aggressiveness multipliers
+    /// emitted by [`crate::engine::user_presence::user_presence_modulator`]
+    /// that were strictly less than 1.0 (active or semi-active tier, no
+    /// crisis override). Stays at 0 while the user is fully idle and
+    /// while the daemon is in Crisis arousal (where survival overrides UX).
+    ///
+    /// Wiring is deferred to a follow-up commit (see `OPENS: 1` on the
+    /// introducing commit). Producers will call
+    /// [`crate::engine::lse_counters::LockFreeMetrics::add_user_presence_suppressions`]
+    /// from the `decide_actions` cost-composition site or the cognitive
+    /// tick's specialist voting step.
+    ///
+    /// [Iqbal & Bailey 2008] "Effects of Interruptions on Task Performance".
+    #[serde(default)]
+    pub user_presence_suppressions_total: u64,
 }
 
 impl RuntimeMetrics {

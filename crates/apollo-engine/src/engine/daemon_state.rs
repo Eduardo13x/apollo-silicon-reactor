@@ -183,6 +183,13 @@ impl MetricsState {
         // (Phase 3.1) and the rest of the Sprint 7 batch.
         self.metrics.adaptive_drift_threshold_raises_total =
             lf.adaptive_drift_threshold_raises_total;
+
+        // Phase 5.1 — User-presence suppression (Sprint 8, 2026-05-16).
+        // Producers (decide_actions cost composition / cognitive tick
+        // specialist voting) are NOT wired in this commit (OPENS: 1).
+        // Plumb the snapshot surface now so the dashboard counter is
+        // ready the moment the modulator is invoked, mirroring 3.1/5.2.
+        self.metrics.user_presence_suppressions_total = lf.user_presence_suppressions_total;
     }
 }
 

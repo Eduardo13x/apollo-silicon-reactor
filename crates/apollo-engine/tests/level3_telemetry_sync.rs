@@ -278,3 +278,17 @@ fn phase41_adaptive_drift_threshold_raises_reach_runtime_metrics_json() {
         json
     );
 }
+
+/// Phase 5.1 — User-Presence Suppression counter round-trip.
+#[test]
+fn phase51_user_presence_suppressions_reach_runtime_metrics_json() {
+    let lf = LockFreeMetrics::new();
+    lf.add_user_presence_suppressions(19);
+    lf.commit();
+    let snap = lf.snapshot();
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+    assert_eq!(state.metrics.user_presence_suppressions_total, 19);
+    let json = serde_json::to_string(&state.metrics).unwrap();
+    assert!(json.contains("\"user_presence_suppressions_total\":19"));
+}
