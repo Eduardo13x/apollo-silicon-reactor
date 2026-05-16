@@ -464,6 +464,63 @@ fn default_decision_reason() -> crate::engine::audit_types::DecisionReason {
 }
 
 impl RootAction {
+    /// One-word action-class label used by the audit `Rationale` and any
+    /// dashboard that aggregates by action kind. Static-string return so
+    /// the rationale builder pays zero allocation per journal line.
+    ///
+    /// Phase 5.3 wiring (2026-05-16): consumed at the cycle-wide journal
+    /// chokepoint in `execute_actions.rs` to label each `JournalEntry`.
+    pub fn action_class(&self) -> &'static str {
+        match self {
+            RootAction::BoostProcess { .. } => "boost",
+            RootAction::ThrottleProcess { .. } => "throttle",
+            RootAction::FreezeProcess { .. } => "freeze",
+            RootAction::UnfreezeProcess { .. } => "unfreeze",
+            RootAction::SetSysctl(_) => "set_sysctl",
+            RootAction::SetMemorystatus { .. } => "set_memorystatus",
+            RootAction::ToggleSpotlight { .. } => "toggle_spotlight",
+            RootAction::QuarantineDaemon { .. } => "quarantine_daemon",
+            RootAction::SetThreadQoS { .. } => "set_thread_qos",
+        }
+    }
+
+    /// Borrow the `DecisionReason` carried by any variant. Single-source
+    /// accessor consumed by the Phase 5.3 rationale builder so the trigger
+    /// label always reflects the actual decision context (Specialist,
+    /// Rule, Skill, etc.) rather than a re-derived guess.
+    pub fn decision_reason(&self) -> &crate::engine::audit_types::DecisionReason {
+        use RootAction::*;
+        match self {
+            BoostProcess { decision_reason, .. }
+            | ThrottleProcess { decision_reason, .. }
+            | FreezeProcess { decision_reason, .. }
+            | UnfreezeProcess { decision_reason, .. }
+            | SetMemorystatus { decision_reason, .. }
+            | ToggleSpotlight { decision_reason, .. }
+            | QuarantineDaemon { decision_reason, .. }
+            | SetThreadQoS { decision_reason, .. } => decision_reason,
+            SetSysctl(action) => action.decision_reason(),
+        }
+    }
+
+    /// The variant's free-text `reason` field. For Phase 5.3 this becomes
+    /// the rationale's `evidence` payload — the concrete signal values
+    /// that justified the action.
+    pub fn reason(&self) -> &str {
+        use RootAction::*;
+        match self {
+            BoostProcess { reason, .. }
+            | ThrottleProcess { reason, .. }
+            | FreezeProcess { reason, .. }
+            | UnfreezeProcess { reason, .. }
+            | SetMemorystatus { reason, .. }
+            | ToggleSpotlight { reason, .. }
+            | QuarantineDaemon { reason, .. }
+            | SetThreadQoS { reason, .. } => reason,
+            SetSysctl(action) => action.reason(),
+        }
+    }
+
     /// Extract the identity tuple `(pid, name, start_sec, start_usec)` from
     /// any PID-bearing variant. Returns `None` for actions that do not act on
     /// a process (`SetSysctl`, `ToggleSpotlight`, `QuarantineDaemon`).
@@ -1918,6 +1975,59 @@ mod tests {
     use super::*;
 
     // ── OptimizationProfile roundtrip ─────────────────────────────────────────
+
+    // ── Phase 5.3 wiring helpers ─────────────────────────────────────────────
+
+    #[test]
+    fn root_action_action_class_covers_every_variant() {
+        // Spot-check one of each — if a new variant lands without an
+        // action_class arm the match expression will fail compile, but
+        // this test guards the existing labels against silent rename.
+        let throttle = RootAction::ThrottleProcess {
+            pid: 1,
+            name: "x".into(),
+            aggressive: false,
+            reason: String::new(),
+            decision_reason: crate::engine::audit_types::DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
+        };
+        assert_eq!(throttle.action_class(), "throttle");
+        let boost = RootAction::BoostProcess {
+            pid: 1,
+            name: "x".into(),
+            reason: String::new(),
+            decision_reason: crate::engine::audit_types::DecisionReason::PressureContext,
+        };
+        assert_eq!(boost.action_class(), "boost");
+        let freeze = RootAction::FreezeProcess {
+            pid: 1,
+            name: "x".into(),
+            reason: String::new(),
+            decision_reason: crate::engine::audit_types::DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
+        };
+        assert_eq!(freeze.action_class(), "freeze");
+    }
+
+    #[test]
+    fn root_action_reason_and_decision_reason_accessors_match_variant() {
+        let action = RootAction::ThrottleProcess {
+            pid: 7,
+            name: "foo".into(),
+            aggressive: false,
+            reason: "p_oom=0.62".into(),
+            decision_reason: crate::engine::audit_types::DecisionReason::CausalInference,
+            start_sec: 0,
+            start_usec: 0,
+        };
+        assert_eq!(action.reason(), "p_oom=0.62");
+        assert!(matches!(
+            action.decision_reason(),
+            crate::engine::audit_types::DecisionReason::CausalInference
+        ));
+    }
 
     #[test]
     fn optimization_profile_roundtrip() {

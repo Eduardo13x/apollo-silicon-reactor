@@ -966,12 +966,30 @@ pub fn execute_actions(
             continue;
         }
 
-        // TODO(phase-5.3-wiring): this is the cycle-wide journal chokepoint.
-        // A `Rationale` constructed up-stream (in `decide_actions` or the
-        // specialist that emitted the action) should be threaded here via
-        // `.with_rationale(...)`. Doing so in one place will cover
-        // throttle/freeze/unfreeze/boost/sysctl in a single touch. Wiring is
-        // deferred per Phase 5.3 scope to keep this commit reviewable.
+        // Phase 5.3 wiring (2026-05-16): cycle-wide journal chokepoint.
+        // Build a structured `Rationale` from the action's own
+        // (action_class, decision_reason, reason) tuple. Attach only when
+        // the action actually executed — skipped actions already carry
+        // their skip reason in `journal_reason` and a structured rationale
+        // would be misleading ("we threw a Throttle action with the
+        // following Rationale" when the system never threw it).
+        //
+        // NotebookLM 2026-05-16 monitor target:
+        //   `journal_rationales_attached_total / actions_pushed_total >= 0.90`
+        // over 1000 cycles. Lower than 0.90 means a non-skip path is
+        // bypassing this site — investigate.
+        let rationale = if success && !journal_reason.starts_with("skip:") {
+            let r = crate::engine::audit_types::Rationale::new(
+                action.action_class(),
+                format!("{:?}", action.decision_reason()),
+                action.reason().to_string(),
+            );
+            crate::engine::lse_counters::LSE_COUNTERS.inc_journal_rationale_attached();
+            Some(r)
+        } else {
+            None
+        };
+
         pending_journal.push(JournalEntry {
             timestamp: Utc::now(),
             action,
@@ -979,7 +997,7 @@ pub fn execute_actions(
             after,
             success,
             reason: journal_reason,
-            rationale: None,
+            rationale,
         });
     }
 
