@@ -292,3 +292,19 @@ fn phase51_user_presence_suppressions_reach_runtime_metrics_json() {
     let json = serde_json::to_string(&state.metrics).unwrap();
     assert!(json.contains("\"user_presence_suppressions_total\":19"));
 }
+
+/// Phase 5.3 — Journal Rationale attachment counter round-trip.
+#[test]
+fn phase53_journal_rationales_attached_reach_runtime_metrics_json() {
+    let lf = LockFreeMetrics::new();
+    for _ in 0..29 {
+        lf.inc_journal_rationale_attached();
+    }
+    lf.commit();
+    let snap = lf.snapshot();
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+    assert_eq!(state.metrics.journal_rationales_attached_total, 29);
+    let json = serde_json::to_string(&state.metrics).unwrap();
+    assert!(json.contains("\"journal_rationales_attached_total\":29"));
+}

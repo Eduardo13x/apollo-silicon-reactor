@@ -190,6 +190,14 @@ impl MetricsState {
         // Plumb the snapshot surface now so the dashboard counter is
         // ready the moment the modulator is invoked, mirroring 3.1/5.2.
         self.metrics.user_presence_suppressions_total = lf.user_presence_suppressions_total;
+
+        // Phase 5.3 — Structured-rationale attachments (Sprint 8, 2026-05-16).
+        // Producers are NOT wired in this commit (OPENS: 1) — the counter
+        // remains 0 in prod until journal write-sites start calling
+        // `JournalEntry::with_rationale(..)` and `inc_journal_rationale_attached()`.
+        // Plumbing now mirrors 3.1/5.2 and avoids a second touch on
+        // daemon_state.rs when wiring lands.
+        self.metrics.journal_rationales_attached_total = lf.journal_rationales_attached_total;
     }
 }
 

@@ -734,6 +734,35 @@ pub struct JournalEntry {
     pub after: Option<String>,
     pub success: bool,
     pub reason: String,
+    /// Phase 5.3 — structured, machine-readable explanation of *why* the
+    /// action was taken. Optional and `#[serde(default)]` so journal lines
+    /// written by older daemons (no `rationale` key) still deserialize
+    /// cleanly. See [`crate::engine::audit_types::Rationale`].
+    ///
+    /// `skip_serializing_if = "Option::is_none"` keeps unrationale'd entries
+    /// byte-compatible with the prior schema — important because journals
+    /// are tail-friendly artifacts shared with dashboards.
+    ///
+    /// TODO(phase-5.3-wiring): cross-cutting wiring of `with_rationale(..)`
+    /// at the major write sites is deliberately out of scope for this
+    /// commit. Follow-up should attach rationales at, in priority order:
+    ///   1. `execute_actions.rs::pending_journal.push(...)` — single
+    ///      chokepoint covering throttle/freeze/unfreeze/boost/sysctl.
+    ///   2. `chromium_manager` long-idle freeze path.
+    ///   3. `decide_actions` swarm-throttle and graduated-idle rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<crate::engine::audit_types::Rationale>,
+}
+
+impl JournalEntry {
+    /// Attach a rationale to this entry, consuming and returning it for
+    /// fluent-chain use at journal write sites. The rationale is
+    /// constructed once per action via `Rationale::new(...)` and threaded
+    /// through `.with_rationale(...)` so callers stay readable.
+    pub fn with_rationale(mut self, rationale: crate::engine::audit_types::Rationale) -> Self {
+        self.rationale = Some(rationale);
+        self
+    }
 }
 
 /// Cross-crate visibility: embedded in `DaemonResponse::ProfileTimeline(Vec<ProfileTransition>)`.
@@ -1679,6 +1708,33 @@ pub struct RuntimeMetrics {
     /// [Iqbal & Bailey 2008] "Effects of Interruptions on Task Performance".
     #[serde(default)]
     pub user_presence_suppressions_total: u64,
+
+    /// Phase 5.3 — Structured-rationale attachment emissions (Sprint 8,
+    /// 2026-05-16). Cumulative count of `JournalEntry` writes where the
+    /// `rationale` field was populated (i.e. the action carried a
+    /// machine-parseable explanation). Stays at 0 until the cross-cutting
+    /// wiring follow-up lands and journal write sites start emitting
+    /// [`crate::engine::audit_types::Rationale`] alongside their journal
+    /// pushes.
+    ///
+    /// Wiring is deferred to a follow-up commit (see `OPENS: 1` on the
+    /// introducing commit). Producers will call
+    /// [`crate::engine::lse_counters::LockFreeMetrics::inc_journal_rationale_attached`]
+    /// from each `JournalEntry::with_rationale(..)` site.
+    ///
+    /// Dashboards compute the "rationale coverage ratio" as
+    /// `journal_rationales_attached_total / total journal entries`. The
+    /// counter is the only way to verify (without grepping logs) that the
+    /// explainability feature actually attaches rationales in prod rather
+    /// than no-op'ing on every action — same tautology-trap mitigation
+    /// pattern as Phase 3.1 (skill_aware_modulations_total) and 5.2
+    /// (battery_aware_penalty_emissions_total).
+    ///
+    /// [Doshi-Velez & Kim 2017] "Towards a Rigorous Science of Interpretable
+    /// Machine Learning"; [Ribeiro et al. 2016] LIME — per-decision
+    /// explanations.
+    #[serde(default)]
+    pub journal_rationales_attached_total: u64,
 }
 
 impl RuntimeMetrics {
