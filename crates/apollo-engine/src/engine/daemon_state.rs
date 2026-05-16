@@ -142,6 +142,17 @@ impl MetricsState {
         // (Phase 3.1) and avoids a second touch on daemon_state.rs when wiring.
         self.metrics.battery_aware_penalty_emissions_total =
             lf.battery_aware_penalty_emissions_total;
+
+        // Phase 4.2 — External-event causal attribution (Sprint 7, 2026-05-16).
+        // Surface per-kind blame totals so runtime_metrics.json shows how
+        // many recent pressure-drop edges had their credit confounded by
+        // thermal / disk / network events. The wiring of producers
+        // (CausalGraph::record_external_event call sites) is deferred to a
+        // follow-up commit; today these counters can only increase via
+        // tests, so prod values will be 0 until producers land.
+        self.metrics.causal_external_thermal_blames_total = lf.causal_external_thermal_blames_total;
+        self.metrics.causal_external_disk_blames_total = lf.causal_external_disk_blames_total;
+        self.metrics.causal_external_net_blames_total = lf.causal_external_net_blames_total;
     }
 }
 

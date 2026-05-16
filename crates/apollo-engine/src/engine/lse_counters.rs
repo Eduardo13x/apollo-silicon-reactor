@@ -244,6 +244,19 @@ pub struct LockFreeMetrics {
     /// counter remains 0 in prod until `decide_actions` invokes the
     /// penalty function and calls `inc_battery_aware_penalty_emission()`.
     pub battery_aware_penalty_emissions_total: AtomicU64,
+
+    /// Phase 4.2 — External-event causal attribution (Sprint 7, 2026-05-16).
+    ///
+    /// Each time a `CausalEdge` is tagged with `external_blame` (because an
+    /// external event preceded the action inside `EXTERNAL_BLAME_WINDOW`),
+    /// the matching kind-specific counter is bumped. The cumulative ratio
+    /// `causal_external_*_blames_total / causal_pressure_drop_edges_total`
+    /// is the operator-facing "how much of our credit is confounded?"
+    /// metric. [Pearl 2009 §4] / [Rubin 1974] — register confounders so
+    /// they can be excluded from treatment-effect estimates.
+    pub causal_external_thermal_blames_total: AtomicU64,
+    pub causal_external_disk_blames_total: AtomicU64,
+    pub causal_external_net_blames_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -354,6 +367,10 @@ impl LockFreeMetrics {
             reactor_pulses: AtomicU64::new(0),
             reactor_event_weight_bits: AtomicU64::new(0_f64.to_bits()),
             battery_aware_penalty_emissions_total: AtomicU64::new(0),
+
+            causal_external_thermal_blames_total: AtomicU64::new(0),
+            causal_external_disk_blames_total: AtomicU64::new(0),
+            causal_external_net_blames_total: AtomicU64::new(0),
         }
     }
 
@@ -686,6 +703,15 @@ impl LockFreeMetrics {
             battery_aware_penalty_emissions_total: self
                 .battery_aware_penalty_emissions_total
                 .load(Ordering::Relaxed),
+            causal_external_thermal_blames_total: self
+                .causal_external_thermal_blames_total
+                .load(Ordering::Relaxed),
+            causal_external_disk_blames_total: self
+                .causal_external_disk_blames_total
+                .load(Ordering::Relaxed),
+            causal_external_net_blames_total: self
+                .causal_external_net_blames_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -726,6 +752,32 @@ impl LockFreeMetrics {
     #[inline(always)]
     pub fn inc_battery_aware_penalty_emission(&self) {
         self.battery_aware_penalty_emissions_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Phase 4.2 — External-event causal blame counters ──────────────
+    //
+    // Called from `CausalGraph::evaluate_with_resources` each time an
+    // edge is tagged with `external_blame`. Per-kind so dashboards can
+    // distinguish thermal-driven false credits (M1 8GB throttles a lot
+    // under sustained load) from disk-driven (Spotlight) and
+    // network-driven (Wi-Fi handoff) confounders.
+
+    #[inline(always)]
+    pub fn inc_causal_external_thermal_blame(&self) {
+        self.causal_external_thermal_blames_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn inc_causal_external_disk_blame(&self) {
+        self.causal_external_disk_blames_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn inc_causal_external_net_blame(&self) {
+        self.causal_external_net_blames_total
             .fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -802,6 +854,11 @@ pub struct MetricsSnapshot {
     pub reactor_event_weight: f64,
     /// Phase 5.2 — Battery-aware cost penalty emissions (Sprint 8).
     pub battery_aware_penalty_emissions_total: u64,
+
+    /// Phase 4.2 — External-event causal blame counters (Sprint 7).
+    pub causal_external_thermal_blames_total: u64,
+    pub causal_external_disk_blames_total: u64,
+    pub causal_external_net_blames_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
