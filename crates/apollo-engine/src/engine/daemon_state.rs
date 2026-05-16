@@ -112,6 +112,9 @@ impl MetricsState {
         // Phase 3.1 — Skill-Aware Prediction observability
         self.metrics.skill_aware_modulations_total = lf.skill_aware_modulations_total;
 
+        // Phase 3.2 — Arousal-Modulated NARS Decay observability
+        self.metrics.arousal_decay_accelerations_total = lf.arousal_decay_accelerations_total;
+
         // Reactor pulses — 2026-05-12: removed `= lf.signals_sent` overwrite.
         // The lock-free `signals_sent` field is defined in lse_counters.rs:57 but
         // is NEVER incremented anywhere in the codebase. The authoritative writers
