@@ -11,3 +11,4 @@ benchmarks/coremark/
 # Autoresearch session-local artifacts (logs, one-shot mockups)
 autoresearch/**/*.log
 autoresearch/**/*-mockup.md
+policy_clean.json
