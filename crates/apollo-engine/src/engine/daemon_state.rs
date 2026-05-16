@@ -149,6 +149,15 @@ impl MetricsState {
         // Plumb the snapshot surface now so the dashboard counter is
         // ready the moment the modulator is invoked, mirroring 3.1/5.2.
         self.metrics.user_presence_suppressions_total = lf.user_presence_suppressions_total;
+
+        // Phase 4.3.1 — Specialist accuracy purge inhibitions (Sprint 8,
+        // 2026-05-16). Mirrors the Phase 2 outcome_tracker / causal_graph
+        // post-purge inhibition pattern. Producer is wired in this commit
+        // at daemon_cognitive_tick::apply_specialist_voting; the counter
+        // increments each cycle where the 30 s purge guard skipped the
+        // EMA accuracy update.
+        self.metrics.specialist_accuracy_purge_inhibitions_total =
+            lf.specialist_accuracy_purge_inhibitions_total;
     }
 }
 

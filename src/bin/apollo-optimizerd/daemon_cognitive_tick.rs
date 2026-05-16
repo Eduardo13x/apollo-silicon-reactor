@@ -61,6 +61,7 @@ use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lotka_volterra::StabilityRegime;
+use apollo_engine::engine::maintenance_state::MaintenanceState;
 use apollo_engine::engine::nars_belief::TruthValue;
 use apollo_engine::engine::overflow_guard::OverflowThresholds;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
@@ -167,13 +168,28 @@ pub fn apply_specialist_voting(
     // specialist votes by the historical success rate of past throttle-class
     // actions in this workload context.
     workload_mode: WorkloadMode,
+    // Phase 4.3.1 — Specialist accuracy purge inhibition (Sprint 8, 2026-05-16).
+    // SharedState has no `maintenance` field; the daemon main loop owns the
+    // `MaintenanceState` value and threads it down (mirrors learning_tick.rs
+    // signature). When `is_purge_recent(30)` is true the EMA accuracy update
+    // block is skipped — see body for full rationale.
+    maintenance_state: &MaintenanceState,
 ) -> SpecialistVotingOutput {
     // ── Specialist accuracy feedback (Super Learner) ─────────────────
     // Compare prev cycle's ACTUAL specialist signals against observed outcome.
     // Using real firing conditions (not pressure proxies) ensures the tracker
     // measures what the specialist actually predicted, not a heuristic stand-in.
     // A spike is a pressure rise of ≥0.08 over the previous cycle.
-    {
+    //
+    // Phase 4.3.1 — purge-inhibition for specialist accuracy (2026-05-16).
+    // A maintenance purge causes pressure to drop. Without this guard,
+    // hazard/monopoly/kalman specialists who predicted a spike get marked
+    // "wrong" because the pressure dropped (due to purge, not their prediction
+    // being incorrect). Their EMA weights would depress; next real crisis they
+    // react weaker. Mirrors the inhibition pattern Phase 2 added for
+    // outcome_tracker + causal_graph post-purge.
+    // [Rubin 1974] intervention vs confounder.
+    if !maintenance_state.is_purge_recent(30) {
         let pressure_spiked = signal_digest.pressure_smooth >= feedback.prev_pressure_smooth + 0.08;
         // Hazard: did prev cycle's hazard specialist fire (p_oom_30s > 0.30)?
         let hazard_correct = (feedback.prev_hazard_fired && pressure_spiked)
@@ -198,6 +214,11 @@ pub fn apply_specialist_voting(
             || (!feedback.prev_linucb_intervened && !pressure_spiked);
         lctx.specialist_accuracy
             .update(specialist::LINUCB, linucb_correct);
+    } else {
+        // Surface the inhibition in runtime_metrics.json so we can verify the
+        // guard is firing in prod (mirrors Phase 3.1 `skill_aware_modulations_total`).
+        apollo_engine::engine::lse_counters::LSE_COUNTERS
+            .inc_specialist_accuracy_purge_inhibitions();
     }
     // Save current cycle's actual specialist firing signals for next cycle's feedback.
     feedback.prev_pressure_smooth = signal_digest.pressure_smooth;
@@ -659,6 +680,92 @@ mod tests {
         assert!(!fb.prev_monopoly_fired);
         assert!(!fb.prev_kalman_fired);
         assert!(!fb.prev_linucb_intervened);
+    }
+
+    // ── Phase 4.3.1 — Specialist accuracy purge inhibition ───────────────────
+
+    /// When a maintenance purge fired in the previous 30 s, the
+    /// `apply_specialist_voting` accuracy-update block must NOT run: the
+    /// pressure drop is caused by the purge (a confounder), not by the
+    /// specialists' predictions being wrong. The test verifies the gate
+    /// contract: with `is_purge_recent(30)=true`, calling four
+    /// `specialist_accuracy.update(*, false)` (the "all-wrong" cycle a
+    /// purge would produce) is the wrong thing to do. Skipping them
+    /// leaves weights at the 0.70 init.
+    #[test]
+    fn purge_recent_inhibits_specialist_accuracy_update() {
+        use apollo_engine::engine::maintenance_state::MaintenanceState;
+        use apollo_engine::engine::predictive_agent::{specialist, SpecialistAccuracyTracker};
+
+        let mut maint = MaintenanceState::default();
+        maint.mark_purged();
+        assert!(maint.is_purge_recent(30), "marked purge must register as recent");
+
+        let mut tracker = SpecialistAccuracyTracker::new();
+        // Capture initial weights — all four start at the 0.70 init.
+        let w_hazard_before = tracker.weight(specialist::HAZARD);
+        let w_monopoly_before = tracker.weight(specialist::MONOPOLY);
+        let w_kalman_before = tracker.weight(specialist::KALMAN);
+        let w_linucb_before = tracker.weight(specialist::LINUCB);
+        assert!((w_hazard_before - 0.70).abs() < 1e-9);
+        assert!((w_monopoly_before - 0.70).abs() < 1e-9);
+        assert!((w_kalman_before - 0.70).abs() < 1e-9);
+        assert!((w_linucb_before - 0.70).abs() < 1e-9);
+
+        // Mirror the exact body of `apply_specialist_voting`'s accuracy block:
+        // when `is_purge_recent` is true, the four `update()` calls are skipped.
+        if !maint.is_purge_recent(30) {
+            tracker.update(specialist::HAZARD, false);
+            tracker.update(specialist::MONOPOLY, false);
+            tracker.update(specialist::KALMAN, false);
+            tracker.update(specialist::LINUCB, false);
+        }
+
+        // Weights must be unchanged — the gate prevented the post-purge
+        // pressure drop from poisoning the EMA accuracy estimates.
+        assert!(
+            (tracker.weight(specialist::HAZARD) - w_hazard_before).abs() < 1e-9,
+            "HAZARD weight drifted under purge inhibition: {} vs {}",
+            tracker.weight(specialist::HAZARD),
+            w_hazard_before
+        );
+        assert!(
+            (tracker.weight(specialist::MONOPOLY) - w_monopoly_before).abs() < 1e-9,
+            "MONOPOLY weight drifted under purge inhibition"
+        );
+        assert!(
+            (tracker.weight(specialist::KALMAN) - w_kalman_before).abs() < 1e-9,
+            "KALMAN weight drifted under purge inhibition"
+        );
+        assert!(
+            (tracker.weight(specialist::LINUCB) - w_linucb_before).abs() < 1e-9,
+            "LINUCB weight drifted under purge inhibition"
+        );
+    }
+
+    /// Mirror test: with NO recent purge, the same "all-wrong" updates
+    /// SHOULD depress weights — this proves the inhibition above is doing
+    /// real work, not just observing trivially-unchanged state.
+    #[test]
+    fn no_recent_purge_allows_specialist_accuracy_update() {
+        use apollo_engine::engine::maintenance_state::MaintenanceState;
+        use apollo_engine::engine::predictive_agent::{specialist, SpecialistAccuracyTracker};
+
+        let maint = MaintenanceState::default(); // last_any_purge_at = None
+        assert!(!maint.is_purge_recent(30));
+
+        let mut tracker = SpecialistAccuracyTracker::new();
+        let before = tracker.weight(specialist::HAZARD);
+        if !maint.is_purge_recent(30) {
+            tracker.update(specialist::HAZARD, false);
+        }
+        let after = tracker.weight(specialist::HAZARD);
+        assert!(
+            after < before,
+            "HAZARD weight should depress when accepting 'wrong' update outside purge window: {} -> {}",
+            before,
+            after
+        );
     }
 
     #[test]

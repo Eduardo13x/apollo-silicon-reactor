@@ -216,3 +216,39 @@ fn phase5_1_add_user_presence_suppressions_increments() {
     let snap = lf.snapshot();
     assert_eq!(snap.user_presence_suppressions_total, 7);
 }
+
+/// Phase 4.3.1 (Sprint 8, 2026-05-16) — round-trip test for the
+/// `specialist_accuracy_purge_inhibitions_total` observability counter.
+///
+/// Same shape as `phase5_1_user_presence_suppressions_round_trip`: bump
+/// the lock-free counter, snapshot, sync into `RuntimeMetrics`, and
+/// prove the value survives to the serialized JSON the dashboard reads.
+#[test]
+fn phase4_3_1_specialist_accuracy_purge_inhibitions_round_trip() {
+    let lf = LockFreeMetrics::new();
+    // Bump three times so a single-increment-only bug would also fail.
+    lf.inc_specialist_accuracy_purge_inhibitions();
+    lf.inc_specialist_accuracy_purge_inhibitions();
+    lf.inc_specialist_accuracy_purge_inhibitions();
+    lf.commit();
+
+    let snap = lf.snapshot();
+    assert_eq!(
+        snap.specialist_accuracy_purge_inhibitions_total, 3,
+        "lock-free snapshot did not surface the counter"
+    );
+
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+    assert_eq!(
+        state.metrics.specialist_accuracy_purge_inhibitions_total, 3,
+        "sync_from_lockfree did not flush specialist_accuracy_purge_inhibitions_total"
+    );
+
+    let json = serde_json::to_string(&state.metrics).expect("serialize RuntimeMetrics");
+    assert!(
+        json.contains("\"specialist_accuracy_purge_inhibitions_total\":3"),
+        "specialist_accuracy_purge_inhibitions_total absent or wrong in JSON: {}",
+        json
+    );
+}

@@ -1623,6 +1623,22 @@ pub struct RuntimeMetrics {
     /// [Iqbal & Bailey 2008] "Effects of Interruptions on Task Performance".
     #[serde(default)]
     pub user_presence_suppressions_total: u64,
+
+    /// Phase 4.3.1 — Specialist accuracy purge inhibitions (Sprint 8,
+    /// 2026-05-16). Cumulative count of cycles where
+    /// `daemon_cognitive_tick::apply_specialist_voting` skipped the EMA
+    /// accuracy update block because a maintenance purge happened in the
+    /// previous 30 s. Mirrors the Phase 2 inhibition pattern for
+    /// `outcome_tracker` / `causal_graph` post-purge.
+    ///
+    /// A purge causes pressure to drop sharply, which would otherwise be
+    /// graded as "hazard wrong" / "kalman wrong" — depressing specialist
+    /// EMA weights and weakening reaction to the NEXT real crisis.
+    ///
+    /// [Rubin 1974] "Estimating Causal Effects of Treatments in Randomized
+    /// and Nonrandomized Studies" — intervention vs confounder distinction.
+    #[serde(default)]
+    pub specialist_accuracy_purge_inhibitions_total: u64,
 }
 
 impl RuntimeMetrics {

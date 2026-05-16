@@ -260,6 +260,22 @@ pub struct LockFreeMetrics {
     ///
     /// [Iqbal & Bailey 2008] "Effects of Interruptions on Task Performance".
     pub user_presence_suppressions_total: AtomicU64,
+
+    /// Phase 4.3.1 — Specialist accuracy purge inhibition counter
+    /// (Sprint 8, 2026-05-16). Incremented each time the cognitive tick's
+    /// specialist voting block SKIPPED the four `specialist_accuracy.update()`
+    /// calls because a maintenance purge happened in the previous 30 s.
+    ///
+    /// A purge causes pressure to drop sharply; without this gate, hazard /
+    /// monopoly / kalman specialists that predicted a spike get graded
+    /// "wrong" — their EMA weights decay and the next genuine crisis sees a
+    /// weaker reaction. Mirrors the inhibition pattern Phase 2 added for
+    /// `outcome_tracker` and `causal_graph` post-purge. NotebookLM 2026-05-16
+    /// flagged the missing guard as GAP 6.
+    ///
+    /// [Rubin 1974] "Estimating Causal Effects of Treatments in Randomized
+    /// and Nonrandomized Studies" — distinguishing intervention from confounder.
+    pub specialist_accuracy_purge_inhibitions_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -371,6 +387,7 @@ impl LockFreeMetrics {
             reactor_event_weight_bits: AtomicU64::new(0_f64.to_bits()),
             battery_aware_penalty_emissions_total: AtomicU64::new(0),
             user_presence_suppressions_total: AtomicU64::new(0),
+            specialist_accuracy_purge_inhibitions_total: AtomicU64::new(0),
         }
     }
 
@@ -706,6 +723,9 @@ impl LockFreeMetrics {
             user_presence_suppressions_total: self
                 .user_presence_suppressions_total
                 .load(Ordering::Relaxed),
+            specialist_accuracy_purge_inhibitions_total: self
+                .specialist_accuracy_purge_inhibitions_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -762,6 +782,20 @@ impl LockFreeMetrics {
     pub fn add_user_presence_suppressions(&self, n: u64) {
         self.user_presence_suppressions_total
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Phase 4.3.1 — Specialist accuracy purge inhibition observability hook.
+    /// Call once per cycle where the cognitive tick skipped the
+    /// `specialist_accuracy.update()` calls because a maintenance purge
+    /// happened in the previous 30 s. Dashboards compute the "purge
+    /// inhibition rate" as
+    /// `specialist_accuracy_purge_inhibitions_total / cycles` to verify the
+    /// guard is firing exactly once per qualifying cycle and not spuriously
+    /// out-of-window.
+    #[inline(always)]
+    pub fn inc_specialist_accuracy_purge_inhibitions(&self) {
+        self.specialist_accuracy_purge_inhibitions_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -841,6 +875,10 @@ pub struct MetricsSnapshot {
     /// Count of `user_presence_modulator` calls that returned a
     /// multiplier strictly less than 1.0 (active/semi-active tier).
     pub user_presence_suppressions_total: u64,
+    /// Phase 4.3.1 — Specialist accuracy purge inhibitions (Sprint 8).
+    /// Count of cycles where `apply_specialist_voting` skipped the EMA
+    /// accuracy updates because a maintenance purge happened ≤30 s ago.
+    pub specialist_accuracy_purge_inhibitions_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

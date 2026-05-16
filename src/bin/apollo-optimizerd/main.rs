@@ -2945,6 +2945,7 @@ fn main() -> anyhow::Result<()> {
                         cycle_count,
                         ode_t_sat_urgency,
                         workload_mode,
+                        &maintenance_state,
                     );
                     last_specialist_votes = voting_out.disagreement_record;
                     voting_out.intervention
