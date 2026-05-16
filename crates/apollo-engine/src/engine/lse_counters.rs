@@ -1097,4 +1097,26 @@ mod tests {
             "metrics should be 128-byte aligned to avoid false sharing",
         );
     }
+
+    /// Phase 2 god-lock fix (2026-05-16): the reactor_event_weight setter must
+    /// round-trip via `snapshot()`. The daemon main loop reads the value,
+    /// decays it (×0.75), and then writes it back through this setter. If the
+    /// setter never lands in the atomic, the snapshot stays pinned at the
+    /// last `set_reactor_event_weight(1.0)` call (set by daemon_reactor.rs on
+    /// every pulse), the decay is invisible, and `reactor_event_weight` reads
+    /// "sticky 1.0" indefinitely — causing the governor to see fake reactive
+    /// pressure long after the reactor went quiet. Adversarial review
+    /// 2026-05-16.
+    #[test]
+    fn reactor_event_weight_round_trips_via_set_get() {
+        let m = LockFreeMetrics::new();
+        m.set_reactor_event_weight(0.42);
+        m.commit();
+        let snap = m.snapshot();
+        assert!(
+            (snap.reactor_event_weight - 0.42).abs() < 1e-9,
+            "expected 0.42, got {}",
+            snap.reactor_event_weight
+        );
+    }
 }

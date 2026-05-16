@@ -2013,6 +2013,12 @@ fn main() -> anyhow::Result<()> {
 
                 let mut reactor_weight = apollo_engine::engine::lse_counters::LSE_COUNTERS.snapshot().reactor_event_weight;
                 reactor_weight = (reactor_weight * 0.75).clamp(0.0, 1.0);
+                // Persist the decayed value back so the next snapshot reads the
+                // post-decay state, not the pre-decay sticky 1.0. Without this,
+                // reactor_weight stays pinned at 1.0 after any reactor pulse until
+                // metrics_reporter overwrites it.
+                apollo_engine::engine::lse_counters::LSE_COUNTERS
+                    .set_reactor_event_weight(reactor_weight);
 
                 // kqueue: consume VM pressure events (kernel push, zero latency).
                 // Extracted to daemon_kqueue_tick::run_kqueue_tick (Wave 26).
