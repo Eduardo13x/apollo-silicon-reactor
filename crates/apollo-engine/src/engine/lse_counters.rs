@@ -61,6 +61,7 @@ pub struct LockFreeMetrics {
     pub hw_criticals: AtomicU64,
     pub vm_pressure_events: AtomicU64,
     pub survival_activations: AtomicU64,
+    pub paging_hints_applied: AtomicU64,
 
     // Process management
     pub processes_scanned: AtomicU64,
@@ -115,8 +116,9 @@ pub struct LockFreeMetrics {
     /// counters (`actions_pushed_freeze_total`, etc.) increment ONLY for
     /// typed `push_*` methods — raw pushes do NOT bump the per-variant
     /// counter. The invariant
-    ///
-    ///     Σ(typed per-variant) + actions_pushed_raw_total == total_pushed
+    /// ```text
+    /// Σ(typed per-variant) + actions_pushed_raw_total == total_pushed
+    /// ```
     ///
     /// holds. Dashboards compute "% bypassing typed shape validation" as
     /// `actions_pushed_raw_total / total_pushed`.
@@ -212,7 +214,21 @@ pub struct LockFreeMetrics {
     pub stage_reason_chromium_max_ns: AtomicU64,
     pub stage_reason_enrich_total_ns: AtomicU64,
     pub stage_reason_enrich_max_ns: AtomicU64,
+
+    /// Phase 2 lock-decomposition telemetry (Sprint 5)
+    pub profile_floor_hits: AtomicU64,
+    pub iokit_errors: AtomicU64,
+    pub reactor_pulses: AtomicU64,
+    /// Store f64 reactor event weight as raw u64 bits.
+    pub reactor_event_weight_bits: AtomicU64,
 }
+
+/// Process-wide lock-free counters. Used by code paths that cannot easily
+/// thread an `&LockFreeMetrics` through (closures, nested callbacks, places
+/// that previously locked `state.metrics`). Per-PID logic continues to use
+/// the `lf_metrics` reference passed via function arguments — this static
+/// is for fire-and-forget cycle/system counters.
+pub static LSE_COUNTERS: LockFreeMetrics = LockFreeMetrics::new();
 
 impl LockFreeMetrics {
     pub const fn new() -> Self {
@@ -229,6 +245,7 @@ impl LockFreeMetrics {
             hw_criticals: AtomicU64::new(0),
             vm_pressure_events: AtomicU64::new(0),
             survival_activations: AtomicU64::new(0),
+            paging_hints_applied: AtomicU64::new(0),
             processes_scanned: AtomicU64::new(0),
             kqueue_events: AtomicU64::new(0),
             proc_exits_detected: AtomicU64::new(0),
@@ -308,6 +325,10 @@ impl LockFreeMetrics {
             stage_reason_chromium_max_ns: AtomicU64::new(0),
             stage_reason_enrich_total_ns: AtomicU64::new(0),
             stage_reason_enrich_max_ns: AtomicU64::new(0),
+            profile_floor_hits: AtomicU64::new(0),
+            iokit_errors: AtomicU64::new(0),
+            reactor_pulses: AtomicU64::new(0),
+            reactor_event_weight_bits: AtomicU64::new(0_f64.to_bits()),
         }
     }
 
@@ -363,6 +384,33 @@ impl LockFreeMetrics {
     #[inline(always)]
     pub fn finish_stage_cycle(&self) {
         self.stage_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Phase 2: God-Lock Decomposition Counters ─────────────────────────────
+
+    #[inline(always)]
+    pub fn increment_profile_floor_hits(&self) {
+        self.profile_floor_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn increment_paging_hints_applied(&self) {
+        self.paging_hints_applied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn set_iokit_errors(&self, count: u64) {
+        self.iokit_errors.store(count, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn increment_reactor_pulses(&self) {
+        self.reactor_pulses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn set_reactor_event_weight(&self, weight: f64) {
+        self.reactor_event_weight_bits.store(weight.to_bits(), Ordering::Relaxed);
     }
 
     /// Record a metrics-lock acquisition + held duration.
@@ -516,6 +564,7 @@ impl LockFreeMetrics {
             hw_criticals: self.hw_criticals.load(Ordering::Relaxed),
             vm_pressure_events: self.vm_pressure_events.load(Ordering::Relaxed),
             survival_activations: self.survival_activations.load(Ordering::Relaxed),
+            paging_hints_applied: self.paging_hints_applied.load(Ordering::Relaxed),
             processes_scanned: self.processes_scanned.load(Ordering::Relaxed),
             kqueue_events: self.kqueue_events.load(Ordering::Relaxed),
             proc_exits_detected: self.proc_exits_detected.load(Ordering::Relaxed),
@@ -600,6 +649,12 @@ impl LockFreeMetrics {
             taskinfo_cache_cap_evictions: self
                 .taskinfo_cache_cap_evictions
                 .load(Ordering::Relaxed),
+            profile_floor_hits: self.profile_floor_hits.load(Ordering::Relaxed),
+            iokit_errors: self.iokit_errors.load(Ordering::Relaxed),
+            reactor_pulses: self.reactor_pulses.load(Ordering::Relaxed),
+            reactor_event_weight: f64::from_bits(
+                self.reactor_event_weight_bits.load(Ordering::Relaxed),
+            ),
         }
     }
 
@@ -640,6 +695,7 @@ pub struct MetricsSnapshot {
     pub hw_criticals: u64,
     pub vm_pressure_events: u64,
     pub survival_activations: u64,
+    pub paging_hints_applied: u64,
     pub processes_scanned: u64,
     pub kqueue_events: u64,
     pub proc_exits_detected: u64,
@@ -686,6 +742,10 @@ pub struct MetricsSnapshot {
     pub taskinfo_cache_misses: u64,
     pub taskinfo_cache_exit_invalidations: u64,
     pub taskinfo_cache_cap_evictions: u64,
+    pub profile_floor_hits: u64,
+    pub iokit_errors: u64,
+    pub reactor_pulses: u64,
+    pub reactor_event_weight: f64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

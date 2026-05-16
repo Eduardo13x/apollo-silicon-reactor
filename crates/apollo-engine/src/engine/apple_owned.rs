@@ -101,7 +101,7 @@ pub fn is_apple_path(path: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_pid_path(pid: u32) -> Option<String> {
+pub(crate) fn resolve_pid_path(pid: u32) -> Option<String> {
     let mut buf = [0u8; 1024];
     let ret = unsafe { proc_pidpath(pid as i32, buf.as_mut_ptr(), buf.len() as u32) };
     if ret <= 0 || ret as usize > buf.len() {

@@ -135,28 +135,36 @@ pub fn run_learning_tick<'a>(
             .max(0.01);
         let mem_pressure_now = snapshot.pressure.memory_pressure;
         let swap_gb_now = snapshot.pressure.swap_used_bytes as f64 / 1_073_741_824.0;
-        for name in throttle_names_for_outcome {
-            let proc_watts = snapshot
-                .top_processes
-                .iter()
-                .find(|p| &p.name == name)
-                .map(|p| (p.cpu_usage as f64 / total_cpu_pct) * cpu_watts)
-                .unwrap_or(0.0);
-            // Capture swap context for affective salience weighting.
-            // High swap at throttle time → high arousal → stronger NARS belief.
-            lctx.outcome_tracker.record_throttle_with_swap(
-                name,
-                mem_pressure_now,
-                proc_watts,
-                swap_gb_now,
-            );
+        // (2026-05-16): inhibit recording new actions for outcome tracking during
+        // the 30s post-purge window to avoid "success poisoning".
+        if !maintenance_state.is_purge_recent(30) {
+            for name in throttle_names_for_outcome {
+                let proc_watts = snapshot
+                    .top_processes
+                    .iter()
+                    .find(|p| &p.name == name)
+                    .map(|p| (p.cpu_usage as f64 / total_cpu_pct) * cpu_watts)
+                    .unwrap_or(0.0);
+                // Capture swap context for affective salience weighting.
+                // High swap at throttle time → high arousal → stronger NARS belief.
+                lctx.outcome_tracker.record_throttle_with_swap(
+                    name,
+                    mem_pressure_now,
+                    proc_watts,
+                    swap_gb_now,
+                );
+            }
         }
     }
 
     // ── Causal graph (Pearl 2009 + Granger 1969) ──────────────────────────────
     // Record throttle/freeze actions for causal evaluation with resource snapshots
     // for mechanism attribution. Multi-horizon eval: 3 cycles (fast) + 15 cycles (slow).
-    {
+    //
+    // 2026-05-16: Predictor Poisoning Mitigation (Fase 2).
+    // Inhibit causal learning for 30s after any purge to prevent the AI from
+    // attributing the purge-driven memory drop to recent optimization actions.
+    if !maintenance_state.is_purge_recent(30) {
         use apollo_engine::engine::causal_graph::ResourceSnapshot;
         let pressure_now = snapshot.pressure.memory_pressure as f32;
         let swap_mb_now = snapshot.pressure.swap_used_bytes as f32 / 1_048_576.0;

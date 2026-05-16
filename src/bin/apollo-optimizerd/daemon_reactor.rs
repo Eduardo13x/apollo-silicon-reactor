@@ -161,7 +161,7 @@ pub fn run_reactor(state: SharedState, stop_requested: &AtomicBool) -> anyhow::R
             // distinguish a live-but-quiet reactor from a dead one.
             {
                 let mut m = state.metrics.lock_recover();
-                m.metrics.reactor_pulses += 1;
+                apollo_engine::engine::lse_counters::LSE_COUNTERS.increment_reactor_pulses();
             }
             // Poll kernel pressure level on every iteration (~1µs sysctl read).
             // Fires memory signal on level transitions (Normal↔Warning↔Critical).
@@ -245,7 +245,7 @@ pub fn run_reactor(state: SharedState, stop_requested: &AtomicBool) -> anyhow::R
                     .store(true, Ordering::Release);
             }
 
-            state.metrics.lock_recover().reactor_event_weight = 1.0;
+            apollo_engine::engine::lse_counters::LSE_COUNTERS.set_reactor_event_weight(1.0);
             if reactor_mode.as_str() == "normal" {
                 state.metrics.lock_recover().fast_tick_until =
                     Some(Instant::now() + Duration::from_secs(REACTOR_FAST_TICK_SECS));

@@ -397,7 +397,25 @@ impl Default for DriftDetector {
 
 impl DriftDetector {
     pub fn new() -> Self {
-        Self::default()
+        let mut detector = Self::default();
+
+        // Cierre del Gap de Visibilidad de NARS (Categorías de Protección)
+        // Seed structural protection categories with strong negative priors.
+        // This prevents the system from modeling them under 'generic' or 'background-noise'
+        // and interpreting their lack of action as 'Inaction Noise'.
+        let protected_categories = ["apple-owned", "active-coalition", "companion-of-fg", "infrastructure-owned"];
+        for cat in protected_categories {
+            let mut entry = BeliefEntry::new(0.0); // 0.0 frequency (never effective to act)
+            // 0.99 confidence: we are certain these should not be acted upon
+            entry.tv = TruthValue::new(0.0, 0.99); 
+            // Maximum Long-Term Importance (never decay to ignorance)
+            entry.lti = 1.0; 
+            // Strong prior weight so single observations don't sway it quickly
+            entry.observations = 100; 
+            detector.beliefs.insert(cat.to_string(), entry);
+        }
+
+        detector
     }
 
     /// Record an observation with neutral salience (standard weight).
@@ -975,7 +993,7 @@ mod tests {
         for _ in 0..20 {
             dd.observe("proc_B", false);
         }
-        assert_eq!(dd.len(), 2);
+        assert_eq!(dd.len(), 6); // 4 seeded + 2 new
         let tv_a = dd.belief("proc_A").unwrap();
         let tv_b = dd.belief("proc_B").unwrap();
         assert!(tv_a.frequency > 0.7, "proc_A should have high frequency");
@@ -999,13 +1017,24 @@ mod tests {
         for _ in 0..5 {
             dd.observe("proc_A", true);
         }
-        assert_eq!(dd.len(), 1);
+        assert_eq!(dd.len(), 5); // 4 seeded + 1 new
         // Decay 20 times at 0.5 factor: 0.5^20 → effectively 0
         for _ in 0..20 {
             dd.decay_confidence(0.5);
         }
-        // proc_A should be pruned (confidence < 0.05)
-        assert_eq!(dd.len(), 0, "fully decayed belief should be pruned");
+        // proc_A should be pruned (confidence < 0.05). The 4 seeded beliefs remain because they have LTI = 1.0.
+        assert_eq!(dd.len(), 4, "fully decayed belief should be pruned, seeded ones remain");
+    }
+
+    #[test]
+    fn test_detector_seeding() {
+        let detector = DriftDetector::new();
+        // apple-owned, active-coalition, companion-of-fg, infrastructure-owned
+        assert_eq!(detector.beliefs.len(), 4);
+        let apple = detector.beliefs.get("apple-owned").unwrap();
+        assert!(apple.tv.confidence > 0.9);
+        assert!(apple.tv.frequency < 0.1);
+        assert!(apple.lti >= 1.0);
     }
 
     #[test]

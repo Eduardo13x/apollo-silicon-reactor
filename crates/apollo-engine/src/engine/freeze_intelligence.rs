@@ -168,10 +168,15 @@ impl FreezeIntelligence {
         if legacy != "generic" {
             return legacy;
         }
-        // Layer 2: apple-owned (path/codesign — structural).
         if let Some(p) = pid {
             if crate::engine::apple_owned::is_apple_owned(p) {
                 return "apple-owned";
+            }
+            // Layer 2.5: infrastructure-owned (homebrew/privileged — structural).
+            if let Some(path) = crate::engine::apple_owned::resolve_pid_path(p) {
+                if crate::engine::safety::is_infrastructure_path(&path) {
+                    return "infrastructure-owned";
+                }
             }
         }
         // Layer 3: companion-of-fg (statistical, name-keyed).
@@ -577,12 +582,13 @@ mod tests {
             // pid 0 = kernel_task, ensures apple-owned routing.
             fi.observe_full("kernel_task", Some(0), None, None, true, 0.5);
         }
-        // apple-owned belief now has 30 successful observations → high
-        // confidence (>= default 0.70).
+        // apple-owned belief now has 30 successful observations.
+        // It starts with a strong negative prior (0.0 freq, 0.99 conf),
+        // so the new frequency won't jump to >= 0.70, but it WILL be > 0.0.
         let apple_conf = fi.confidence_for_category("apple-owned");
         assert!(
-            apple_conf >= 0.70,
-            "apple-owned should accumulate evidence, got {apple_conf}"
+            apple_conf > 0.0 && apple_conf < 0.70,
+            "apple-owned should accumulate evidence over its 0.0 prior, got {apple_conf}"
         );
         // generic stays at default — was NOT polluted.
         let gen_conf = fi.confidence_for_category("generic");

@@ -153,7 +153,7 @@ pub fn xorshift64(mut x: u64) -> u64 {
 /// Uso típico en Apollo scheduling:
 /// ```no_run
 /// let pid = std::process::id() as u64;
-/// let entropy = apollo_optimizer::engine::silicon_probe::fast_entropy(pid);
+/// let entropy = apollo_engine::engine::silicon_probe::fast_entropy(pid);
 /// let jitter_ns = entropy % 1_000; // jitter 0-999 ns
 /// ```
 ///

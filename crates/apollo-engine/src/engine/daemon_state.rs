@@ -102,6 +102,13 @@ impl MetricsState {
         self.metrics.memory_budget_duration_ms = lf.memory_budget_duration_us as f64 / 1000.0;
         self.metrics.reactor_duration_ms = lf.reactor_duration_us as f64 / 1000.0;
 
+        // Phase 2 God-Lock Decomposition (Sprint 5)
+        self.metrics.profile_floor_hits = lf.profile_floor_hits;
+        self.metrics.paging_hints_applied = lf.paging_hints_applied;
+        self.metrics.iokit_errors = lf.iokit_errors;
+        self.metrics.reactor_pulses = lf.reactor_pulses;
+        self.reactor_event_weight = lf.reactor_event_weight;
+
         // Reactor pulses — 2026-05-12: removed `= lf.signals_sent` overwrite.
         // The lock-free `signals_sent` field is defined in lse_counters.rs:57 but
         // is NEVER incremented anywhere in the codebase. The authoritative writers

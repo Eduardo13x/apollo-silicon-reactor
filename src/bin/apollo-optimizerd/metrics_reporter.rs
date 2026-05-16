@@ -386,7 +386,9 @@ pub fn merge_cycle_metrics<'a>(
     let had_new_failures = exec_outcomes.failures > 0;
 
     metrics.metrics.cycles += 1;
-    metrics.metrics.reactor_pulses += if decision_reactor_weight > 0.2 { 1 } else { 0 };
+    if decision_reactor_weight > 0.2 {
+        apollo_engine::engine::lse_counters::LSE_COUNTERS.increment_reactor_pulses();
+    }
     metrics.metrics.last_cycle_at = Some(Utc::now());
     metrics.metrics.last_blockers = decision_blockers.to_vec();
     metrics.metrics.effective_profile = current_profile;
@@ -423,7 +425,7 @@ pub fn merge_cycle_metrics<'a>(
         compute_p95(metrics.metrics.cycle_durations_ms.make_contiguous());
 
     // reactor_weight: write back local accumulated value to MetricsState
-    metrics.reactor_event_weight = reactor_weight;
+    apollo_engine::engine::lse_counters::LSE_COUNTERS.set_reactor_event_weight(reactor_weight);
 
     let nowi = Instant::now();
     critical_failure_timestamps

@@ -1564,7 +1564,7 @@ fn main() -> anyhow::Result<()> {
                 // zero pulses after 60 s — that means the thread itself died,
                 // not just that the system has been quiet.
                 if daemon_start.elapsed() > Duration::from_secs(60) {
-                    let pulses = state.metrics.lock_recover().metrics.reactor_pulses;
+                    let pulses = apollo_engine::engine::lse_counters::LSE_COUNTERS.snapshot().reactor_pulses;
                     if pulses == 0 {
                         {
                             let mut m = state.metrics.lock_recover();
@@ -1812,8 +1812,9 @@ fn main() -> anyhow::Result<()> {
                         state.metrics.lock_recover().thermal_level_real = level_str.to_string();
                         state.hardware.lock_recover().last_hw_snapshot = Some(hw);
                     } else {
-                        state.metrics.lock_recover().metrics.iokit_errors =
-                            smc_reader.error_count();
+                        apollo_engine::engine::lse_counters::LSE_COUNTERS.set_iokit_errors(
+                            smc_reader.error_count()
+                        );
                     }
                 }
 
@@ -2010,7 +2011,7 @@ fn main() -> anyhow::Result<()> {
                     &mut arousal_state,
                 );
 
-                let mut reactor_weight = state.metrics.lock_recover().reactor_event_weight;
+                let mut reactor_weight = apollo_engine::engine::lse_counters::LSE_COUNTERS.snapshot().reactor_event_weight;
                 reactor_weight = (reactor_weight * 0.75).clamp(0.0, 1.0);
 
                 // kqueue: consume VM pressure events (kernel push, zero latency).
@@ -2686,7 +2687,7 @@ fn main() -> anyhow::Result<()> {
                     })
                 };
                 if governor_decision.transition_reason.contains("floor") {
-                    state.metrics.lock_recover().metrics.profile_floor_hits += 1;
+                    apollo_engine::engine::lse_counters::LSE_COUNTERS.increment_profile_floor_hits();
                 }
                 let current_profile = governor_decision.effective_profile;
                 {
@@ -3084,7 +3085,7 @@ fn main() -> anyhow::Result<()> {
                         post_wake_reclaim_active,
                     );
                     if freed > 0 {
-                        state.metrics.lock_recover().metrics.paging_hints_applied += 1;
+                        apollo_engine::engine::lse_counters::LSE_COUNTERS.increment_paging_hints_applied();
                     }
                 }
                 lf_metrics.record_stage(

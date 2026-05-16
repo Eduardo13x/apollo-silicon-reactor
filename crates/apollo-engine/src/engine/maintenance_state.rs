@@ -49,6 +49,10 @@ impl MaintenanceState {
         }
     }
 
+    pub fn is_purge_recent(&self, window_secs: u64) -> bool {
+        self.secs_since_any_purge() < window_secs
+    }
+
     pub fn secs_since_cli_purge(&self) -> u64 {
         match self.last_cli_purge_at {
             None => u64::MAX,

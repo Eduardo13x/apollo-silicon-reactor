@@ -253,6 +253,36 @@ pub fn is_protected_name(name: &str) -> bool {
     matches_dev_runtime(name)
 }
 
+/// Returns true if the binary path belongs to protected infrastructure territory.
+/// Specifically: Homebrew (/opt/homebrew) or common privileged helper locations.
+pub fn is_infrastructure_path(path: &str) -> bool {
+    path.starts_with("/opt/homebrew/")
+        || path.starts_with("/usr/local/bin/")
+        || path.starts_with("/Library/PrivilegedHelperTools/")
+}
+
+/// Fully-mediated protection check for a PID. Checks name, path, and signing.
+pub fn is_protected_pid(pid: u32) -> bool {
+    if let Some(name) = crate::engine::process_identity::proc_name_for_pid(pid) {
+        if is_protected_name(&name) {
+            return true;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(path) = crate::engine::apple_owned::resolve_pid_path(pid) {
+            if is_infrastructure_path(&path) {
+                return true;
+            }
+        }
+        if crate::engine::apple_owned::is_apple_owned(pid) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Returns true if a process should be treated as a user-interactive app
 /// — i.e. protection is foreground-conditional rather than unconditional.
 ///

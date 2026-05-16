@@ -137,14 +137,24 @@ impl EpistemicUncertainty {
         self.meta_calibration_error = meta_calibration_error.clamp(0.0, 1.0);
         self.guard_overprotection = guard_overprotection.clamp(0.0, 1.0);
 
-        // Composite: weighted sum [Lakshminarayanan 2017 §3 predictive entropy
-        // + Guo 2017 §3 ECE calibration + Rubin 1974 potential outcomes]
-        self.composite = W_RL * self.rl_q_variance
-            + W_LINUCB * self.linucb_exploration
-            + W_NARS * self.nars_confidence_spread
-            + W_DRIFT * self.drift_score
-            + W_CALIB * self.meta_calibration_error
-            + W_GUARD * self.guard_overprotection;
+        // Composite: Root-Sum-Square (RSS) composition to prevent regression paralysis
+        // from multiple weak noise signals, normalized to [0, 1].
+        let sq_rl = (W_RL * self.rl_q_variance).powi(2);
+        let sq_linucb = (W_LINUCB * self.linucb_exploration).powi(2);
+        let sq_nars = (W_NARS * self.nars_confidence_spread).powi(2);
+        let sq_drift = (W_DRIFT * self.drift_score).powi(2);
+        let sq_calib = (W_CALIB * self.meta_calibration_error).powi(2);
+        let sq_guard = (W_GUARD * self.guard_overprotection).powi(2);
+
+        let sum_sq = sq_rl + sq_linucb + sq_nars + sq_drift + sq_calib + sq_guard;
+        let raw_rss = sum_sq.sqrt();
+        
+        let max_rss_possible = (
+            W_RL.powi(2) + W_LINUCB.powi(2) + W_NARS.powi(2) + 
+            W_DRIFT.powi(2) + W_CALIB.powi(2) + W_GUARD.powi(2)
+        ).sqrt();
+
+        self.composite = raw_rss / max_rss_possible;
         self.composite = self.composite.clamp(0.0, 1.0);
 
         // Mode transitions
@@ -194,29 +204,33 @@ impl EpistemicUncertainty {
 
     /// Per-component breakdown as (name, value, weighted_contribution).
     pub fn breakdown(&self) -> Vec<(&'static str, f32, f32)> {
+        let sq_rl = (self.rl_q_variance * W_RL).powi(2);
+        let sq_linucb = (self.linucb_exploration * W_LINUCB).powi(2);
+        let sq_nars = (self.nars_confidence_spread * W_NARS).powi(2);
+        let sq_drift = (self.drift_score * W_DRIFT).powi(2);
+        let sq_calib = (self.meta_calibration_error * W_CALIB).powi(2);
+        let sq_guard = (self.guard_overprotection * W_GUARD).powi(2);
+
+        let sum_sq = sq_rl + sq_linucb + sq_nars + sq_drift + sq_calib + sq_guard;
+        if sum_sq == 0.0 {
+            return vec![
+                ("RL-QVar", self.rl_q_variance, 0.0),
+                ("LinUCB-Explore", self.linucb_exploration, 0.0),
+                ("NARS-Spread", self.nars_confidence_spread, 0.0),
+                ("Drift", self.drift_score, 0.0),
+                ("Calibration", self.meta_calibration_error, 0.0),
+                ("Guard-Overprotect", self.guard_overprotection, 0.0),
+            ];
+        }
+
+        let f = self.composite / sum_sq;
         vec![
-            ("RL-QVar", self.rl_q_variance, self.rl_q_variance * W_RL),
-            (
-                "LinUCB-Explore",
-                self.linucb_exploration,
-                self.linucb_exploration * W_LINUCB,
-            ),
-            (
-                "NARS-Spread",
-                self.nars_confidence_spread,
-                self.nars_confidence_spread * W_NARS,
-            ),
-            ("Drift", self.drift_score, self.drift_score * W_DRIFT),
-            (
-                "Calibration",
-                self.meta_calibration_error,
-                self.meta_calibration_error * W_CALIB,
-            ),
-            (
-                "Guard-Overprotect",
-                self.guard_overprotection,
-                self.guard_overprotection * W_GUARD,
-            ),
+            ("RL-QVar", self.rl_q_variance, sq_rl * f),
+            ("LinUCB-Explore", self.linucb_exploration, sq_linucb * f),
+            ("NARS-Spread", self.nars_confidence_spread, sq_nars * f),
+            ("Drift", self.drift_score, sq_drift * f),
+            ("Calibration", self.meta_calibration_error, sq_calib * f),
+            ("Guard-Overprotect", self.guard_overprotection, sq_guard * f),
         ]
     }
 }
