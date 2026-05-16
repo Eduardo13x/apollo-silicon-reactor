@@ -1231,6 +1231,17 @@ fn main() -> anyhow::Result<()> {
             // compute_user_context interpolate idle_secs between every-10-cycle
             // ioreg subprocess spawns. ~25 ms saved per intermediate cycle.
             let mut last_idle_sample: Option<(f64, Instant)> = None;
+            // Phase 5.1 wiring (2026-05-16) — last cycle's UserContext, carried
+            // forward so `apply_specialist_voting` can compute the
+            // user-presence multiplier BEFORE `compute_user_context` runs
+            // this cycle (the daemon's ordering invariant places
+            // specialist voting strictly *before* user_context). The
+            // one-cycle lag is acceptable: at the 80 ms cycle period a user
+            // who was typing 80 ms ago is overwhelmingly still typing now.
+            // First cycle uses the `UserContext::default()` "safe/unknown"
+            // values → no suppression, identical to pre-wiring behaviour.
+            let mut last_user_context_for_voting: apollo_engine::engine::user_context::UserContext =
+                apollo_engine::engine::user_context::UserContext::default();
                                                                                       // Track previous cycle's package_watts for RL power-reduction reward.
             let mut prev_package_watts: Option<f64> = None;
             // Track previous cycle's workload for onset detection (build-onset-proactive).
@@ -2928,6 +2939,18 @@ fn main() -> anyhow::Result<()> {
                     // during V1.1.0 Strangler Fig wave 7 — pure move, no semantic
                     // change.  Ordering: runs after LinUCB select and before the
                     // decision_stage, same as the original inline form.
+                    // Phase 5.1 wiring — build PresenceInputs from last cycle's
+                    // UserContext + current arousal. hid_events_per_minute has
+                    // no daemon-side accessor yet (TODO 2026-05-16); 0.0
+                    // means the modulator falls back on idle_seconds alone,
+                    // which is sufficient for the active/semi-active tiers.
+                    let presence_inputs = daemon_cognitive_tick::PresenceInputs {
+                        idle_seconds: last_user_context_for_voting.idle_secs,
+                        hid_events_per_minute: 0.0,
+                        current_arousal: arousal_state.level as f64,
+                        audio_active: last_user_context_for_voting.audio_active,
+                        has_sleep_assertion: last_user_context_for_voting.has_sleep_assertion,
+                    };
                     let voting_out = daemon_cognitive_tick::apply_specialist_voting(
                         &state,
                         &mut lctx,
@@ -2939,6 +2962,7 @@ fn main() -> anyhow::Result<()> {
                         cycle_count,
                         ode_t_sat_urgency,
                         workload_mode,
+                        presence_inputs,
                     );
                     last_specialist_votes = voting_out.disagreement_record;
                     voting_out.intervention
@@ -3145,6 +3169,10 @@ fn main() -> anyhow::Result<()> {
                     apollo_engine::engine::lse_counters::CycleStage::ReasonUserContext,
                     _t_uc_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
+                // Phase 5.1 wiring — carry this cycle's UserContext forward
+                // for next cycle's specialist-voting PresenceInputs. The
+                // copy is cheap (4 f64/bool fields, Clone).
+                last_user_context_for_voting = user_context.clone();
 
                 // Swap reclaim ODE: pre-emptive reactor_weight boost on saturation risk.
                 // [Denning 1968; Zhao 2009] Extracted to daemon_swap_reclaim_tick (Wave 35).

@@ -267,8 +267,16 @@ fn collect_idle_secs_inner() -> Option<f64> {
 /// Returns `(has_sleep_assertion, call_in_progress, audio_active)`.
 /// All false on error.
 ///
-/// [Apple TN3115] pmset assertions:
-///   `PreventUserIdleSleep` / `PreventUserIdleSystemSleep` → active media/call
+/// [Apple TN3115 / IOKit Power Assertions] pmset assertions:
+///   `PreventUserIdleSleep` — active user task (CPU+display)
+///   `PreventUserIdleSystemSleep` — active background task (CPU only)
+///   `PreventUserIdleDisplaySleep` — display kept awake (streaming video,
+///                                   slide-deck presenter mode, PDF/dashboard
+///                                   viewers that mute audio but keep the
+///                                   screen lit). 2026-05-16 reviewer-found
+///                                   gap: prior code only matched the two
+///                                   above, letting passive-content viewers
+///                                   fall through into aggressive throttling.
 ///   `NoIdleSleepAssertion` from coreaudiod → audio output active
 ///
 /// `audio_active` is OR'd with a CoreAudio direct query
@@ -291,7 +299,26 @@ fn collect_pmset_inner() -> Option<(bool, bool, bool)> {
         .output()
         .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(parse_pmset_assertions(&stdout))
+}
 
+/// Pure parser for `pmset -g assertions` stdout.
+///
+/// Factored out of [`collect_pmset_inner`] so the assertion-matching logic is
+/// testable without shelling out. Returns the same
+/// `(has_sleep_assertion, call_in_progress, audio_active)` tuple.
+///
+/// Recognised assertion kinds (case-sensitive match on the line):
+///   * `PreventUserIdleSleep`
+///   * `PreventUserIdleSystemSleep`
+///   * `PreventUserIdleDisplaySleep` (added 2026-05-16 — IOKit Power
+///     Assertions documentation lists this as the canonical kind for apps
+///     keeping the display awake without audio output).
+///
+/// Apollo's own assertions are skipped to avoid self-recursion (Apollo
+/// publishes `PreventUserIdleSystemSleep` during the maintenance purge gate;
+/// counting that would silence the very heuristic that gates it).
+fn parse_pmset_assertions(stdout: &str) -> (bool, bool, bool) {
     let mut has_sleep_assertion = false;
     let mut call_in_progress = false;
     let mut audio_active = false;
@@ -317,7 +344,16 @@ fn collect_pmset_inner() -> Option<(bool, bool, bool)> {
         }
 
         // Sleep-prevention assertions indicate active user task.
-        if line.contains("PreventUserIdleSleep") || line.contains("PreventUserIdleSystemSleep") {
+        // Three kinds are treated as equivalent for the user-presence signal:
+        //   - PreventUserIdleSleep         (CPU + display)
+        //   - PreventUserIdleSystemSleep   (CPU only — long background task)
+        //   - PreventUserIdleDisplaySleep  (display only — passive viewing)
+        // The third kind closes the 2026-05-16 reviewer-found gap (streaming,
+        // PDF/dashboard, presenter mode mute the audio but keep the screen lit).
+        if line.contains("PreventUserIdleSleep")
+            || line.contains("PreventUserIdleSystemSleep")
+            || line.contains("PreventUserIdleDisplaySleep")
+        {
             has_sleep_assertion = true;
             // If a conferencing app owns the assertion → call in progress.
             if CALL_APP_NAMES.iter().any(|n| line_lc.contains(n)) {
@@ -331,7 +367,50 @@ fn collect_pmset_inner() -> Option<(bool, bool, bool)> {
         }
     }
 
-    Some((has_sleep_assertion, call_in_progress, audio_active))
+    (has_sleep_assertion, call_in_progress, audio_active)
+}
+
+// Cross-platform alias so the parser test compiles on non-macOS too.
+#[cfg(not(target_os = "macos"))]
+#[cfg(test)]
+fn parse_pmset_assertions(stdout: &str) -> (bool, bool, bool) {
+    // Same body as the macOS variant — kept inline because the function above
+    // is `#[cfg(target_os = "macos")]`-gated and unavailable for tests on
+    // other hosts. The duplication is trivial; the alternative (moving the
+    // function out from under the cfg) would expose macOS-only call sites.
+    let mut has_sleep_assertion = false;
+    let mut call_in_progress = false;
+    let mut audio_active = false;
+    let mut in_process_section = false;
+    for line in stdout.lines() {
+        if line.starts_with("Listed by owning process:") {
+            in_process_section = true;
+            continue;
+        }
+        if !in_process_section || line.trim().is_empty() {
+            continue;
+        }
+        let line_lc = line.to_ascii_lowercase();
+        if line_lc.contains("apollo-optimizer") || line_lc.contains("apollo-optimizerd") {
+            continue;
+        }
+        if line.contains("PreventUserIdleSleep")
+            || line.contains("PreventUserIdleSystemSleep")
+            || line.contains("PreventUserIdleDisplaySleep")
+        {
+            has_sleep_assertion = true;
+            if ["zoom.us", "facetime", "teams"]
+                .iter()
+                .any(|n| line_lc.contains(n))
+            {
+                call_in_progress = true;
+            }
+        }
+        if line_lc.contains("coreaudiod") && line.contains("NoIdleSleepAssertion") {
+            audio_active = true;
+        }
+    }
+    (has_sleep_assertion, call_in_progress, audio_active)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -445,5 +524,75 @@ mod tests {
             ..Default::default()
         };
         assert!((neutral.pressure_gate_offset() - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ── pmset parser tests ────────────────────────────────────────────────────
+
+    /// Step 1 — Gap A regression test (reviewer 2026-05-16).
+    ///
+    /// `PreventUserIdleDisplaySleep` is the canonical IOKit Power Assertion
+    /// kind for apps that keep the display awake without audio output
+    /// (streaming video on external monitor, PDF/dashboard viewers,
+    /// presenter mode). Prior parser only matched the `CPU`/`SystemSleep`
+    /// variants and silently dropped these — a presence gap.
+    #[test]
+    fn pmset_detects_prevent_display_sleep_as_active() {
+        let stdout = "\
+Assertion status system-wide:
+   PreventUserIdleSystemSleep   0
+   PreventUserIdleDisplaySleep  1
+Listed by owning process:
+pid 4321(QuickTime Player): [0x0000000100000abc] 00:30:11 PreventUserIdleDisplaySleep named: \"com.apple.QuickTimePlayerX playback\"
+";
+        let (sleep, call, audio) = parse_pmset_assertions(stdout);
+        assert!(
+            sleep,
+            "PreventUserIdleDisplaySleep must register as a sleep assertion"
+        );
+        // No conferencing app name in the line → call_in_progress stays false.
+        assert!(!call, "no conferencing-app name → call_in_progress=false");
+        // No coreaudiod NoIdleSleepAssertion line → audio_active stays false.
+        assert!(!audio, "no coreaudiod line → audio_active=false");
+    }
+
+    /// Parser still recognises the two pre-existing kinds.
+    #[test]
+    fn pmset_detects_existing_sleep_kinds() {
+        let stdout = "\
+Listed by owning process:
+pid 100(otherApp): [0x0000000100000001] 00:01:00 PreventUserIdleSleep named: \"x\"
+pid 101(daemonish): [0x0000000100000002] 00:01:00 PreventUserIdleSystemSleep named: \"y\"
+";
+        let (sleep, _, _) = parse_pmset_assertions(stdout);
+        assert!(sleep);
+    }
+
+    /// Apollo's own assertion lines must be skipped — otherwise the parser
+    /// would self-trigger every cycle the maintenance purge gate is active.
+    #[test]
+    fn pmset_skips_apollo_own_assertions() {
+        let stdout = "\
+Listed by owning process:
+pid 1234(apollo-optimizerd): [0x0000000100000abc] 00:30:11 PreventUserIdleDisplaySleep named: \"maintenance-purge-gate\"
+";
+        let (sleep, _, _) = parse_pmset_assertions(stdout);
+        assert!(
+            !sleep,
+            "Apollo's own DisplaySleep assertion must NOT register"
+        );
+    }
+
+    /// Conferencing-app heuristic still fires for DisplaySleep — a Zoom call
+    /// that mutes audio but keeps the camera preview on shows up as
+    /// DisplaySleep + zoom.us owner.
+    #[test]
+    fn pmset_call_in_progress_fires_for_display_sleep_with_zoom_owner() {
+        let stdout = "\
+Listed by owning process:
+pid 9999(zoom.us): [0x000000010000beef] 00:05:00 PreventUserIdleDisplaySleep named: \"Zoom preview\"
+";
+        let (sleep, call, _) = parse_pmset_assertions(stdout);
+        assert!(sleep);
+        assert!(call, "zoom.us owning DisplaySleep → call_in_progress=true");
     }
 }
