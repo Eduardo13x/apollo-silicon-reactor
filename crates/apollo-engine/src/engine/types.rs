@@ -1896,6 +1896,16 @@ pub struct RuntimeMetrics {
     /// other. See LSE producer for details.
     #[serde(default)]
     pub causal_thermal_scorer_override_alignments_total: u64,
+
+    /// Sprint 12 Convergence #1 (2026-05-17). Cold-thread routing
+    /// decisions that flipped from default E-cluster to P-cluster
+    /// because the owning process is a foreground companion AND DRAM
+    /// bandwidth is below the safety floor. Stays at 0 until the user
+    /// is running a multi-process foreground workflow (e.g. Brave +
+    /// renderers, IDE + LSP). See
+    /// [`crate::engine::lse_counters::LockFreeMetrics::companion_affinity_alignments_total`].
+    #[serde(default)]
+    pub companion_affinity_alignments_total: u64,
 }
 
 impl RuntimeMetrics {

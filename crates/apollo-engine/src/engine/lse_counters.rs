@@ -453,6 +453,24 @@ pub struct LockFreeMetrics {
     /// [Pearl 2009 §3] confounder adjustment + [Sutton 2018 §11.7]
     /// model-free policy correction.
     pub causal_thermal_scorer_override_alignments_total: AtomicU64,
+
+    /// Sprint 12 Convergence #1 (2026-05-17). Counts cycles where a
+    /// cold-thread routing decision flipped from the default E-cluster
+    /// (battery friendly) to the P-cluster because the owning process
+    /// is a companion of the current foreground app AND DRAM bandwidth
+    /// is below the safety floor.
+    ///
+    /// Converges Companion Graph (logical workflow) with
+    /// THREAD_AFFINITY_POLICY (physical cluster topology) — when a
+    /// renderer/helper is keeping a foreground window's hot threads on
+    /// P-cluster L2, sending the same process's cold threads to
+    /// E-cluster forces a cluster-boundary migration the next time the
+    /// user clicks the tab. Counter ramping under low pressure proves
+    /// the bridge is firing; under high pressure (≥0.50) it falls back
+    /// to standard E-routing automatically. Producer = decide_actions
+    /// cold-thread loop. [ARM big.LITTLE 2013 §3] cluster-local
+    /// scheduling preserves L2 working set across UI interactions.
+    pub companion_affinity_alignments_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -590,6 +608,7 @@ impl LockFreeMetrics {
             scorer_disagreement_strong_accepts_total: AtomicU64::new(0),
             purge_inhibition_skips_total: AtomicU64::new(0),
             causal_thermal_scorer_override_alignments_total: AtomicU64::new(0),
+            companion_affinity_alignments_total: AtomicU64::new(0),
         }
     }
 
@@ -971,6 +990,9 @@ impl LockFreeMetrics {
             causal_thermal_scorer_override_alignments_total: self
                 .causal_thermal_scorer_override_alignments_total
                 .load(Ordering::Relaxed),
+            companion_affinity_alignments_total: self
+                .companion_affinity_alignments_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1190,6 +1212,16 @@ impl LockFreeMetrics {
         self.causal_thermal_scorer_override_alignments_total
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Sprint 12 Convergence #1: bump once per cold-thread routing
+    /// decision that flipped to P-cluster because the owning process is
+    /// a foreground companion AND DRAM bandwidth is below the safety
+    /// floor.
+    #[inline(always)]
+    pub fn inc_companion_affinity_alignment(&self) {
+        self.companion_affinity_alignments_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // Safe to share across threads — all fields are atomic.
@@ -1327,6 +1359,12 @@ pub struct MetricsSnapshot {
     /// which is high-signal evidence the learned policy needs a
     /// rollback nudge.
     pub causal_thermal_scorer_override_alignments_total: u64,
+
+    /// Sprint 12 Convergence #1 (2026-05-17). Cumulative count of cold
+    /// threads routed to P-cluster (instead of default E) because the
+    /// owning process is a foreground companion AND DRAM bandwidth is
+    /// below the safety floor. See LSE producer for routing rationale.
+    pub companion_affinity_alignments_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

@@ -250,6 +250,14 @@ impl MetricsState {
         // thermal pressure plus scorer disagreement coincide.
         self.metrics.causal_thermal_scorer_override_alignments_total =
             lf.causal_thermal_scorer_override_alignments_total;
+
+        // Sprint 12 Convergence #1 (2026-05-17). Producer is
+        // decide_actions cold-thread loop when `companion_of_fg_pids`
+        // hits AND `dram_bandwidth_pct < 0.50`. Stays at 0 until the
+        // user is running a multi-process foreground workflow with the
+        // bus below the safety floor.
+        self.metrics.companion_affinity_alignments_total =
+            lf.companion_affinity_alignments_total;
     }
 }
 
