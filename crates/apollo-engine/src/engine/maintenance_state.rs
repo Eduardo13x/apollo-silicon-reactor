@@ -12,6 +12,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+/// Window after a purge during which predictors must inhibit swap-derived
+/// updates. Per Hellerstein 2004 §9 "Feedback Control of Computing Systems"
+/// — an exogenous disturbance (here: forced `vm_purge`) must not be learned
+/// as a load improvement by closed-loop predictors. 5 seconds covers the
+/// kernel-side compressor flush + the daemon's next cycle window so the
+/// Kalman/Hazard/MPC stack sees the post-purge state once it stabilises,
+/// not the artificial dip mid-flush.
+pub const PURGE_INHIBITION_WINDOW_SECS: u64 = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MaintenanceState {
     #[serde(skip)]
@@ -51,6 +60,14 @@ impl MaintenanceState {
 
     pub fn is_purge_recent(&self, window_secs: u64) -> bool {
         self.secs_since_any_purge() < window_secs
+    }
+
+    /// Returns true while predictors should inhibit swap-derived updates
+    /// because a recent purge perturbed the swap signal. See
+    /// [`PURGE_INHIBITION_WINDOW_SECS`] for the window rationale.
+    /// [Hellerstein 2004 §9] disturbance rejection in closed-loop systems.
+    pub fn is_in_purge_inhibition_window(&self) -> bool {
+        self.is_purge_recent(PURGE_INHIBITION_WINDOW_SECS)
     }
 
     pub fn secs_since_cli_purge(&self) -> u64 {
@@ -231,5 +248,35 @@ mod tests {
         s.mark_purged();
         assert!(s.last_any_purge_at.is_some());
         assert!(s.last_cli_purge_at.is_none());
+    }
+
+    #[test]
+    fn is_in_purge_inhibition_window_false_without_purge() {
+        let s = MaintenanceState::default();
+        assert!(
+            !s.is_in_purge_inhibition_window(),
+            "no purge → never in inhibition window"
+        );
+    }
+
+    #[test]
+    fn is_in_purge_inhibition_window_true_immediately_after_purge() {
+        let mut s = MaintenanceState::default();
+        s.mark_purged();
+        assert!(
+            s.is_in_purge_inhibition_window(),
+            "fresh purge → in inhibition window"
+        );
+    }
+
+    #[test]
+    fn is_in_purge_inhibition_window_false_after_window_expires() {
+        let mut s = MaintenanceState::default();
+        let past = SystemTime::now() - Duration::from_secs(PURGE_INHIBITION_WINDOW_SECS + 1);
+        s.last_any_purge_at = Some(past);
+        assert!(
+            !s.is_in_purge_inhibition_window(),
+            "purge older than window → not inhibited"
+        );
     }
 }
