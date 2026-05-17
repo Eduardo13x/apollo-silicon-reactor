@@ -5,87 +5,87 @@
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2B-success.svg)
 ![AIS](https://img.shields.io/badge/AIS-S--tier-brightgreen.svg)
 
-**apollo-silicon-reactor** (formerly `apollo-optimizer`) is an autonomous system-optimization daemon engineered for **macOS Apple Silicon, M1 8 GB baseline**. Pure Rust, no Python, no shell scripting in the hot loop. It is not a generic process manager — it is an adaptive agent with 9 wired learning phases that redistributes CPU, RAM, and thermal headroom against actual user intent instead of XNU's "fair" scheduler defaults.
+**apollo-silicon-reactor** (antes `apollo-optimizer`) es un daemon autónomo de optimización de sistema diseñado para **macOS Apple Silicon, baseline M1 8 GB**. Rust puro, sin Python, sin shell scripting en el hot loop. No es un gestor de procesos genérico — es un agente adaptativo con 9 fases de aprendizaje cableadas que redistribuye CPU, RAM y headroom térmico según la intención real del usuario en lugar del scheduler "justo" por defecto de XNU.
 
-The reactor learns. Every cycle it observes ~400-600 live processes, scores candidate actions through a neuro-cognitive stack (NARS reasoning, causal graph, asymmetric policy scorer, RL agent, user-presence modulator), commits its rationale to an audit journal, and either reverts or reinforces its own learned parameters depending on the AIS quality score that follows.
+El reactor aprende. Cada ciclo observa ~400-600 procesos vivos, puntúa acciones candidatas a través de un stack neuro-cognitivo (razonamiento NARS, grafo causal, scorer de políticas asimétrico, agente RL, modulador de presencia de usuario), commitea su rationale a un journal auditable, y revierte o refuerza sus propios parámetros aprendidos según el score AIS de calidad que sigue.
 
-## Why this exists
+## Por qué existe
 
-macOS Apple Silicon laptops with 8 GB RAM live in a constant memory-pressure ceiling. The XNU scheduler is workload-agnostic and optimizes for fairness, not intent — when you are mid-build, Spotlight reindexing wins CPU cycles you needed for `rustc`. apollo-silicon-reactor closes that loop with an agent that knows which process you actually want responsive right now, learns from its own mistakes, and reverses any optimization it picked that turned out to hurt AIS.
+Las laptops macOS Apple Silicon con 8 GB de RAM viven en un techo constante de presión de memoria. El scheduler de XNU es agnóstico al workload y optimiza para fairness, no para intención — cuando estás a mitad de build, Spotlight reindexando le gana ciclos de CPU a `rustc`. apollo-silicon-reactor cierra ese loop con un agente que sabe qué proceso querés responsivo ahora mismo, aprende de sus propios errores, y revierte cualquier optimización que eligió y que terminó dañando AIS.
 
-## Qualities
+## Cualidades
 
-- **Adaptive, not reactive** — 22+ learned parameters auto-tuned per workload; no static thresholds in the hot path
-- **Causally honest** — discounts its own contribution by 30% when an exogenous confounder (thermal throttle, network spike) was the real cause of the observed effect (Pearl 2009)
-- **Self-reverting** — if a learned parameter shift drops AIS quality below 0.35, the policy-rollback guard restores `pre_value` automatically (Sutton & Barto 2018 §11.7)
-- **Asymmetric scorer** — the policy scorer can OVERRIDE a gate-accept (safe direction), but is never allowed to override a gate-reject (unsafe direction)
-- **User-presence aware** — three-tier modulator (idle / semi-active / active) reads HID idle, HID event rate, sleep assertions, and audio activity to decide how aggressive to be; bypasses politeness at `pressure ≥ 0.65` for survival
-- **Battery-aware** — penalizes high-wakeup actions when on battery (proxy for energy cost); silent when plugged in
-- **Lock-free hot path** — 11 ARMv8.1 atomic counters publish telemetry without mutex contention (Hellerstein 2012)
-- **Auditable** — every executed action attaches a `Rationale { action_class, trigger, evidence, expected_outcome }` to the journal for post-hoc analysis
-- **Safety-first** — 13 invariants enforced mechanically in `safety.rs`; protected processes (Antigravity, Claude, Brave, rustc, system services) can never be frozen
-- **Disciplined deploys** — 3-gate guard requires test-diff evidence + pre-snap baseline + post-90s sanity check (AIS ≥ 87) before allowing a binary swap
+- **Adaptativo, no reactivo** — 22+ parámetros aprendidos auto-tuneados por workload; sin thresholds estáticos en el hot path
+- **Causalmente honesto** — descuenta su propia contribución 30% cuando un confounder exógeno (throttle térmico, spike de red) fue la causa real del efecto observado (Pearl 2009)
+- **Auto-reversible** — si un shift de parámetro aprendido baja la calidad AIS bajo 0.35, el policy-rollback guard restaura el `pre_value` automáticamente (Sutton & Barto 2018 §11.7)
+- **Scorer asimétrico** — el policy scorer puede OVERRIDE un gate-accept (dirección segura), pero nunca tiene permitido override un gate-reject (dirección insegura)
+- **Consciente de presencia** — modulador de tres tiers (idle / semi-active / active) lee HID idle, HID event rate, sleep assertions y actividad de audio para decidir qué tan agresivo ser; bypassea la politeness a `pressure ≥ 0.65` por supervivencia
+- **Consciente de batería** — penaliza acciones con muchos wakeups cuando está en batería (proxy de costo energético); silencioso con cargador
+- **Hot path lock-free** — 11 contadores atómicos ARMv8.1 publican telemetría sin contención de mutex (Hellerstein 2012)
+- **Auditable** — cada acción ejecutada adjunta un `Rationale { action_class, trigger, evidence, expected_outcome }` al journal para análisis post-hoc
+- **Safety-first** — 13 invariantes enforced mecánicamente en `safety.rs`; procesos protegidos (Antigravity, Claude, Brave, rustc, system services) nunca pueden ser congelados
+- **Deploys disciplinados** — guard de 3 gates exige evidencia de test-diff + baseline pre-snap + sanity check post-90s (AIS ≥ 87) antes de permitir un swap de binario
 
-## Architecture
+## Arquitectura
 
-Cargo workspace, three binaries, JSON-tagged Unix-socket IPC:
+Workspace Cargo, tres binarios, IPC vía Unix socket con JSON tagueado:
 
-| Binary | Role | Lifecycle |
+| Binario | Rol | Lifecycle |
 |---|---|---|
-| `apollo-optimizerd` | Long-running root daemon | `launchd` service, `/var/lib/apollo/` state |
-| `apollo-optimizerctl` | CLI client + live TUI dashboard | Connects to `/var/run/apollo-optimizer.sock` |
-| `apollo-optimizer` | One-shot CLI (`snapshot`, `optimize`, `restore`, `llm`) | Process-per-invocation |
+| `apollo-optimizerd` | Daemon root long-running | Servicio `launchd`, estado en `/var/lib/apollo/` |
+| `apollo-optimizerctl` | Cliente CLI + dashboard TUI live | Conecta a `/var/run/apollo-optimizer.sock` |
+| `apollo-optimizer` | CLI one-shot (`snapshot`, `optimize`, `restore`, `llm`) | Proceso por invocación |
 
 ```mermaid
 graph LR
     A[apollo-optimizerctl] -- JSON IPC --> B[apollo-optimizerd]
     B -- SENSE --> C[sysinfo + IOKit + Mach FFI]
-    B -- THINK --> D[Neuro-Cognitive Stack]
+    B -- THINK --> D[Stack Neuro-Cognitivo]
     D -- DECIDE --> E[PolicyScorer + Gate Tower]
     E -- ACT --> F[SIGSTOP / sysctl / launchctl]
-    D -- persist --> G[learned_state.json]
+    D -- persiste --> G[learned_state.json]
     F -- journal --> H[journal.jsonl + audit]
 ```
 
-The daemon hot loop is decomposed into ~30 independent `tick` modules (Strangler Fig pattern). Per-cycle work is bounded; no blocking I/O on the hot path; lock guards are dropped before any syscall.
+El hot loop del daemon está descompuesto en ~30 módulos `tick` independientes (patrón Strangler Fig). Trabajo por ciclo acotado; sin I/O bloqueante en el hot path; los lock guards se sueltan antes de cualquier syscall.
 
-## Cognitive System
+## Sistema Cognitivo
 
-11 lock-free LSE counters publish end-to-end through `runtime_metrics.json`. Each counter corresponds to one wired learning phase. Counters that read 0 are not bugs — they are wired-dormant by design until their trigger fires (Crisis arousal, thermal transition, scorer/gate disagreement, etc).
+11 contadores LSE lock-free publican end-to-end vía `runtime_metrics.json`. Cada contador corresponde a una fase de aprendizaje cableada. Contadores que leen 0 no son bugs — están wired-dormant por diseño hasta que su trigger se dispare (arousal Crisis, transición térmica, disagreement scorer/gate, etc).
 
-| Phase | Counter | Purpose |
+| Fase | Contador | Propósito |
 |---|---|---|
-| Skill-Aware Prediction | `skill_aware_modulations_total` | Weights trial skills by historical success per workload |
-| Arousal-Based Decay | `arousal_decay_accelerations_total` | Crisis flushes NARS beliefs faster (McGaugh 2004) |
-| Companion Graph | `companion_cross_group_inferences_total` | Directional `P(proc \| fg_app)` via Lift normalization |
-| Adaptive Drift Threshold | `adaptive_drift_threshold_raises_total` | Welford online variance, self-calibrating drift sensitivity |
-| Causal External Blame | `causal_external_thermal_blames_total` | Discounts impact score by 0.30 when thermal confounder present |
-| Policy Rollback | `policy_rollback_evaluations_total` | Reverts learned params when AIS quality < 0.35 |
-| User Presence | `user_presence_suppressions_total` | Idle/HID/sleep-assertion 3-tier modulator with pressure≥0.65 bypass |
-| Battery-Aware Cost | `battery_aware_penalty_emissions_total` | Penalizes wakeup/ctx-switch noise on battery |
-| Journal Rationale | `journal_rationales_attached_total` | Attaches evidence-based reasoning metadata to every action |
-| Scorer Override Reject | `scorer_override_rejects_total` | Asymmetric ±0.30 cutover — scorer can BLOCK gate-accepts |
-| Scorer Disagreement | `scorer_disagreement_strong_accepts_total` | Logs gate-rejects the scorer wanted to accept (never overrides) |
+| Skill-Aware Prediction | `skill_aware_modulations_total` | Pondera skills de prueba por success rate histórico por workload |
+| Arousal-Based Decay | `arousal_decay_accelerations_total` | Crisis flushea creencias NARS más rápido (McGaugh 2004) |
+| Companion Graph | `companion_cross_group_inferences_total` | `P(proc \| fg_app)` direccional vía normalización Lift |
+| Adaptive Drift Threshold | `adaptive_drift_threshold_raises_total` | Varianza online Welford, sensibilidad a drift auto-calibrada |
+| Causal External Blame | `causal_external_thermal_blames_total` | Descuenta impact score 0.30 cuando hay confounder térmico |
+| Policy Rollback | `policy_rollback_evaluations_total` | Revierte parámetros aprendidos cuando AIS quality < 0.35 |
+| User Presence | `user_presence_suppressions_total` | Modulador 3-tier idle/HID/sleep con bypass a pressure≥0.65 |
+| Battery-Aware Cost | `battery_aware_penalty_emissions_total` | Penaliza ruido de wakeup/ctx-switch en batería |
+| Journal Rationale | `journal_rationales_attached_total` | Adjunta metadata de razonamiento basada en evidencia a cada acción |
+| Scorer Override Reject | `scorer_override_rejects_total` | Cutover asimétrico ±0.30 — scorer puede BLOQUEAR gate-accepts |
+| Scorer Disagreement | `scorer_disagreement_strong_accepts_total` | Loguea gate-rejects que el scorer quería aceptar (nunca override) |
 
-### Academic foundation
+### Fundamento académico
 
-- **Pei Wang (2013)** — Non-Axiomatic Reasoning, TruthValue revision, Bayesian forgetting
-- **Pearl (2009 §3)** — Confounder adjustment, external-blame discount geometry
-- **Sutton & Barto (2018 §11.7)** — Model-free policy correction, auto-revert on quality drop
-- **Hellerstein et al. (2012)** — Feedback control of computing systems, lock-free counter hot paths
-- **Nygard (2018)** — Release It! resilience patterns, circuit breakers, bulkhead pattern
-- **Lakshminarayanan (2017)** — Simple scalable predictive uncertainty, RSS composition
-- **McGaugh (2004)** — Emotional arousal accelerates memory consolidation/decay
-- **Welford (1962)** — Online variance for adaptive thresholding
+- **Pei Wang (2013)** — Razonamiento No-Axiomático, revisión TruthValue, forgetting Bayesiano
+- **Pearl (2009 §3)** — Confounder adjustment, geometría de descuento por external-blame
+- **Sutton & Barto (2018 §11.7)** — Corrección model-free de políticas, auto-revert por drop de calidad
+- **Hellerstein et al. (2012)** — Control por feedback de sistemas computacionales, contadores lock-free en hot paths
+- **Nygard (2018)** — Release It! patrones de resiliencia, circuit breakers, patrón bulkhead
+- **Lakshminarayanan (2017)** — Incertidumbre predictiva simple y escalable, composición RSS
+- **McGaugh (2004)** — Arousal emocional acelera consolidación/decay de memoria
+- **Welford (1962)** — Varianza online para thresholding adaptativo
 
-## Safety invariants
+## Invariantes de seguridad
 
-`safety.rs` enforces these mechanically; bypassing them is impossible from outside the module.
+`safety.rs` las enforcea mecánicamente; bypassearlas es imposible desde fuera del módulo.
 
-- **Never freeze**: `kernel_task`, `launchd`, `WindowServer`, `Spotlight (mds)`, `configd`, `Antigravity`, `Claude`, `Brave/Chromium*` (Brave IPC contract), `rustc` / `cargo` during active builds
-- **Cascade bypass**: `user_presence_modulator` returns `1.0×` (full optimization) when `memory_pressure ≥ 0.65`, regardless of HID activity or sleep assertion — survival beats UX politeness
-- **Asymmetric scorer**: PolicyScorer may BLOCK a gate-accept (safe direction) but is NEVER allowed to override a gate-reject (unsafe direction)
-- **Supervision mode** (`CLAUDE.md`): no work declared "complete" without mechanical re-verification of `runtime_metrics.json` + adversarial diff re-read + N≥500 sample size
+- **Nunca freezear**: `kernel_task`, `launchd`, `WindowServer`, `Spotlight (mds)`, `configd`, `Antigravity`, `Claude`, `Brave/Chromium*` (contrato IPC de Brave), `rustc` / `cargo` durante builds activos
+- **Cascade bypass**: `user_presence_modulator` devuelve `1.0×` (optimización total) cuando `memory_pressure ≥ 0.65`, sin importar actividad HID o sleep assertion — supervivencia le gana a politeness UX
+- **Scorer asimétrico**: PolicyScorer puede BLOQUEAR un gate-accept (dirección segura) pero NUNCA tiene permitido override un gate-reject (dirección insegura)
+- **Modo supervisión** (`CLAUDE.md`): ningún trabajo declarado "completo" sin re-verificación mecánica de `runtime_metrics.json` + re-lectura adversarial del diff + sample size N≥500
 
 ## Quick start
 
@@ -93,63 +93,63 @@ The daemon hot loop is decomposed into ~30 independent `tick` modules (Strangler
 # Build (release: target-cpu=native, LTO, panic=abort)
 cargo build --release
 
-# Install as root daemon (codesign-preserving cp to /usr/local/libexec, launchd bootstrap)
+# Instalar como daemon root (cp codesign-preserving a /usr/local/libexec, bootstrap de launchd)
 sudo ./scripts/install-root-daemon.sh
 
-# Status + cognitive health
+# Status + salud cognitiva
 apollo-optimizerctl status
 
-# Live TUI dashboard (4-10Hz differential rendering, zero flicker)
+# Dashboard TUI live (rendering diferencial 4-10Hz, zero flicker)
 apollo-optimizerctl dashboard
 
-# One-shot snapshot
+# Snapshot one-shot
 apollo-optimizer snapshot --output system_snapshot.json
 
-# Uninstall + restore
+# Desinstalar + restaurar
 sudo ./scripts/uninstall-root-daemon.sh
 ```
 
-## Deploy discipline
+## Disciplina de deploy
 
-`scripts/apollo-deploy-gate.sh` enforces three gates before any binary swap:
+`scripts/apollo-deploy-gate.sh` enforcea tres gates antes de cualquier swap de binario:
 
-1. **Gate 1 — Test evidence**: HEAD (or merged branches via `git log -3 --no-merges`) must add/modify at least one `#[test]`. The Disobedience Rule from `CLAUDE.md`: write the failing test first.
-2. **Gate 2 — Pre-snapshot**: capture `runtime_metrics.json` + cycle count + AIS before swap.
-3. **Gate 3 — Post-snapshot (90s)**: AIS ≥ 87.0 floor, failures = 0, `last_error = None`, cycles progressing. Otherwise the script alerts loudly. Rollback is suggested, never executed — the human decides (supervision rule).
+1. **Gate 1 — Evidencia de test**: HEAD (o branches mergeadas vía `git log -3 --no-merges`) debe agregar/modificar al menos un `#[test]`. La Regla de Desobediencia de `CLAUDE.md`: primero escribís el test que falla.
+2. **Gate 2 — Pre-snapshot**: captura `runtime_metrics.json` + count de ciclos + AIS antes del swap.
+3. **Gate 3 — Post-snapshot (90s)**: piso de AIS ≥ 87.0, failures = 0, `last_error = None`, ciclos progresando. Si no, el script alerta fuerte. Rollback se sugiere, nunca se ejecuta — decide el humano (regla de supervisión).
 
 ```bash
-./scripts/apollo-deploy-gate.sh --dry-run   # gates 1+2 only, no deploy
-./scripts/apollo-deploy-gate.sh             # full guarded deploy
+./scripts/apollo-deploy-gate.sh --dry-run   # solo gates 1+2, sin deploy
+./scripts/apollo-deploy-gate.sh             # deploy guarded completo
 ```
 
-Binary swap uses `sudo cp` to preserve the linker-signed flag (do NOT use `python3 open().write()` — it strips the codesign and triggers Launch Constraint Violation).
+El swap de binario usa `sudo cp` para preservar el flag linker-signed (NO usar `python3 open().write()` — strippea el codesign y dispara Launch Constraint Violation).
 
-## Repository layout
+## Layout del repo
 
 ```
-src/                         # CLI binary (apollo-optimizer)
-src/bin/apollo-optimizerd/   # Root daemon (long-running)
-src/bin/apollo-optimizerctl/ # CLI client + TUI dashboard
-crates/apollo-engine/        # Cognitive engine library
-  src/engine/                # Decision logic, NARS, causal graph, scorer
-  tests/                     # Integration tests (level3_*)
+src/                         # Binario CLI (apollo-optimizer)
+src/bin/apollo-optimizerd/   # Daemon root (long-running)
+src/bin/apollo-optimizerctl/ # Cliente CLI + dashboard TUI
+crates/apollo-engine/        # Librería del engine cognitivo
+  src/engine/                # Lógica de decisión, NARS, grafo causal, scorer
+  tests/                     # Tests de integración (level3_*)
 scripts/                     # install/uninstall/deploy-gate
 .cargo/config.toml           # target-cpu=native, LTO
-CLAUDE.md                    # Project doctrine (supervision mode, anti-patterns)
+CLAUDE.md                    # Doctrina del proyecto (modo supervisión, anti-patrones)
 ```
 
 ## Development
 
 ```bash
-cargo test                              # Full suite (~2100 lib tests)
+cargo test                              # Suite completa (~2100 tests de lib)
 cargo test --doc                        # Doctests
-cargo test engine::nars                 # Module filter
+cargo test engine::nars                 # Filtro por módulo
 cargo clippy --all-targets              # Lint
 cargo fmt --all                         # Format
 ```
 
-Avoid running multiple `cargo` commands concurrently — they contend on the shared `target/` directory.
+Evitá correr múltiples comandos `cargo` concurrentes — compiten por el directorio `target/` compartido.
 
-## License
+## Licencia
 
-See `LICENSE` (TBD).
+Ver `LICENSE` (TBD).
