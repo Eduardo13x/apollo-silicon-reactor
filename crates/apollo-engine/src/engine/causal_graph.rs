@@ -416,6 +416,29 @@ impl CausalGraph {
         None
     }
 
+    /// Sprint 12 Convergence #4 (2026-05-17). Public probe: is there a
+    /// recent external event of `kind` still within
+    /// [`EXTERNAL_BLAME_WINDOW`] of `now`?
+    ///
+    /// Used by the daemon convergence probe to correlate scorer
+    /// overrides with thermal throttling — when both fire in the same
+    /// window, the learned policy is misbehaving under thermal stress
+    /// and the rollback guard should be told to react with elevated
+    /// sensitivity. Reads, never mutates.
+    pub fn has_recent_external_event(&self, kind: ExternalEventKind, now: SystemTime) -> bool {
+        for rec in self.external_events.iter().rev() {
+            if rec.kind != kind {
+                continue;
+            }
+            match now.duration_since(rec.at) {
+                Ok(age) if age <= EXTERNAL_BLAME_WINDOW => return true,
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        false
+    }
+
     /// Phase 4.2 — Aggregate counts of external-blame tags emitted onto
     /// the last [`RECENT_EDGES_FOR_ATTRIBUTION`] tainted edges. Surfaces
     /// for runtime-metrics dashboards.

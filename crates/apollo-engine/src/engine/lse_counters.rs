@@ -436,6 +436,20 @@ pub struct LockFreeMetrics {
     ///
     /// [Hellerstein 2004 §9] disturbance rejection in closed-loop systems.
     pub purge_inhibition_skips_total: AtomicU64,
+
+    /// Sprint 12 Convergence #4 (2026-05-17). Counts cycles where:
+    ///   1. `scorer_override_rejects_total` incremented this cycle
+    ///   2. `CausalGraph::has_recent_external_event(ThermalThrottle, …)` true
+    /// The conjunction proves the policy scorer disagreed with the gate
+    /// in the same window the SoC was thermally throttled — strong
+    /// evidence the *learned* policy is misbehaving under thermal stress
+    /// (vs simple oscillation). When this counter ramps, the
+    /// PolicyRollbackGuard should respond with elevated sensitivity
+    /// (lower quality threshold) since the policy has lost authority to
+    /// physical reality. Producer = daemon main loop convergence probe.
+    /// [Pearl 2009 §3] confounder adjustment + [Sutton 2018 §11.7]
+    /// model-free policy correction.
+    pub causal_thermal_scorer_override_alignments_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -572,6 +586,7 @@ impl LockFreeMetrics {
             scorer_override_rejects_total: AtomicU64::new(0),
             scorer_disagreement_strong_accepts_total: AtomicU64::new(0),
             purge_inhibition_skips_total: AtomicU64::new(0),
+            causal_thermal_scorer_override_alignments_total: AtomicU64::new(0),
         }
     }
 
@@ -950,6 +965,9 @@ impl LockFreeMetrics {
             purge_inhibition_skips_total: self
                 .purge_inhibition_skips_total
                 .load(Ordering::Relaxed),
+            causal_thermal_scorer_override_alignments_total: self
+                .causal_thermal_scorer_override_alignments_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1158,6 +1176,17 @@ impl LockFreeMetrics {
         self.purge_inhibition_skips_total
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Sprint 12 Convergence #4: bump once per cycle where the scorer
+    /// override count grew AND the causal graph has a recent
+    /// `ThermalThrottle` blame inside `EXTERNAL_BLAME_WINDOW`. See
+    /// `LockFreeMetrics::causal_thermal_scorer_override_alignments_total`
+    /// for the convergence rationale.
+    #[inline(always)]
+    pub fn inc_causal_thermal_scorer_override_alignment(&self) {
+        self.causal_thermal_scorer_override_alignments_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // Safe to share across threads — all fields are atomic.
@@ -1287,6 +1316,14 @@ pub struct MetricsSnapshot {
     /// `vm_purge` fired in the prior 5 s. See
     /// [`crate::engine::lse_counters::LockFreeMetrics::purge_inhibition_skips_total`].
     pub purge_inhibition_skips_total: u64,
+
+    /// Sprint 12 Convergence #4 (2026-05-17). Coincidence count of
+    /// scorer overrides happening within the thermal external-blame
+    /// window. See LSE producer doc — when this ramps, the policy
+    /// scorer is consistently disagreeing during thermal pressure,
+    /// which is high-signal evidence the learned policy needs a
+    /// rollback nudge.
+    pub causal_thermal_scorer_override_alignments_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

@@ -242,6 +242,14 @@ impl MetricsState {
         // until the daemon actually triggers vm_purge — proves the loop
         // closes when the maintenance tick fires.
         self.metrics.purge_inhibition_skips_total = lf.purge_inhibition_skips_total;
+
+        // Sprint 12 Convergence #4 (2026-05-17). Producer is the daemon
+        // main-loop convergence probe (after the cycle's
+        // run_signal_tick, when both lse counters are fresh and the
+        // causal-graph has had its update). Counter stays at 0 until
+        // thermal pressure plus scorer disagreement coincide.
+        self.metrics.causal_thermal_scorer_override_alignments_total =
+            lf.causal_thermal_scorer_override_alignments_total;
     }
 }
 

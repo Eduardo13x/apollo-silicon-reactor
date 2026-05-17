@@ -1885,6 +1885,17 @@ pub struct RuntimeMetrics {
     /// [Hellerstein 2004 §9] disturbance rejection in closed-loop systems.
     #[serde(default)]
     pub purge_inhibition_skips_total: u64,
+
+    /// Sprint 12 Convergence #4 (2026-05-17). Cumulative coincidence
+    /// count: cycles in which the scorer override fired AND the causal
+    /// graph reports a recent thermal-throttle external event. Strong
+    /// signal the policy is mis-learning under thermal pressure;
+    /// dashboards should plot this against `policy_rollback_evaluations_total`
+    /// — if alignments accumulate without rollback evaluations, the
+    /// thermal sensor and the rollback guard are talking past each
+    /// other. See LSE producer for details.
+    #[serde(default)]
+    pub causal_thermal_scorer_override_alignments_total: u64,
 }
 
 impl RuntimeMetrics {
