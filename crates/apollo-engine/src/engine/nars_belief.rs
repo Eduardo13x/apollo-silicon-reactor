@@ -368,6 +368,17 @@ pub struct DriftDetector {
     /// Uses simplified run-length model [Adams & MacKay 2007].
     #[serde(default)]
     pub changepoint_posterior: f64,
+    /// Phase 4.1 — Adaptive Drift Threshold (Sprint 9 wiring, 2026-05-16).
+    /// Tracks the EMA mean+variance of |observed frequency deltas| and
+    /// publishes a `recommended_threshold(base)` that rises in noisy
+    /// regimes (up to 2×base) and stays at `base` during cold-start
+    /// (<50 samples). Wired in `observe_salient` and consumed at the
+    /// 2 `is_drifted` filter sites. Replaces a fixed `drift_threshold`
+    /// with a per-regime adaptive one without losing the operator-set
+    /// floor. [Brown 1959] EMA, [Welford 1962] online variance,
+    /// [Kuncheva 2004] drift detection.
+    #[serde(default)]
+    pub adaptive_threshold: AdaptiveDriftThreshold,
     /// Composite early warning score [0,1].
     /// early_warning = 0.6×gradient_ema + 0.4×changepoint_posterior
     #[serde(default)]
@@ -389,6 +400,7 @@ impl Default for DriftDetector {
             gradient_ema: 0.0,
             gradient_acceleration: 0.0,
             changepoint_posterior: 0.0,
+            adaptive_threshold: AdaptiveDriftThreshold::default(),
             early_warning_score: 0.0,
             run_length: 0,
         }
@@ -458,11 +470,26 @@ impl DriftDetector {
         self.drift_score = DRIFT_SCORE_ALPHA * delta as f64 * arousal_amp
             + (1.0 - DRIFT_SCORE_ALPHA) * self.drift_score;
 
-        // Recount drifted beliefs
+        // Phase 4.1 wiring (Sprint 9, 2026-05-16): feed |delta| into the
+        // adaptive noise-floor tracker so `recommended_threshold` reflects
+        // the live regime's variance. O(1) — two FP multiplies + adds per
+        // call. Cold-start (samples<50) guarantees no-op vs base threshold.
+        self.adaptive_threshold.observe((delta as f64).abs());
+
+        // Phase 4.1 wiring — consume adaptive recommendation. When the
+        // recommended threshold > base, bump the observability counter so
+        // dashboards can see the noise floor moving.
+        let base_thr = self.drift_threshold as f64;
+        let effective_thr = self.adaptive_threshold.recommended_threshold(base_thr);
+        if effective_thr > base_thr + f64::EPSILON {
+            crate::engine::lse_counters::LSE_COUNTERS
+                .add_adaptive_drift_threshold_raises(1);
+        }
+        // Recount drifted beliefs against the adaptive threshold.
         self.drifted_count = self
             .beliefs
             .values()
-            .filter(|e| e.is_drifted(self.drift_threshold))
+            .filter(|e| e.is_drifted(effective_thr as f32))
             .count();
 
         delta
@@ -668,11 +695,14 @@ impl DriftDetector {
         for key in to_remove {
             self.beliefs.remove(&key);
         }
-        // Recount drifted beliefs after pruning
+        // Recount drifted beliefs after pruning (Phase 4.1 wiring).
+        let effective_thr = self
+            .adaptive_threshold
+            .recommended_threshold(self.drift_threshold as f64) as f32;
         self.drifted_count = self
             .beliefs
             .values()
-            .filter(|e| e.is_drifted(self.drift_threshold))
+            .filter(|e| e.is_drifted(effective_thr))
             .count();
     }
 
