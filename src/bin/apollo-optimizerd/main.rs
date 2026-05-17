@@ -2827,8 +2827,23 @@ fn main() -> anyhow::Result<()> {
                 apollo_engine::engine::shadow_signals::set_is_on_battery(
                     !power_mgr.battery_status.is_charging,
                 );
-                apollo_engine::engine::shadow_signals::set_wakeups_per_sec(0.0);
-                apollo_engine::engine::shadow_signals::set_ctx_switches_per_sec(0.0);
+                // Phase 5.2 REAL producer (2026-05-16): use the already-
+                // computed 5-minute context-switch window divided by 300s
+                // for ctxsw/s, and the wake_storm aggregate rate for
+                // wakeups/s. Both quantities are bounded, non-negative,
+                // and already produced for other dashboard fields — zero
+                // extra hot-path cost.
+                let ctxsw_rate = (context_switches_5min as f64) / 300.0;
+                apollo_engine::engine::shadow_signals::set_ctx_switches_per_sec(ctxsw_rate);
+                // Sum per-process wakeup rates from detected storms (best
+                // available aggregate without adding new state). Range
+                // [0.0, ~thousands]; the cost function clamps internally.
+                let wakes_rate: f64 = wake_storm
+                    .detect_storms()
+                    .iter()
+                    .map(|p| p.wakeups_per_second as f64)
+                    .sum();
+                apollo_engine::engine::shadow_signals::set_wakeups_per_sec(wakes_rate);
 
                 // ODE swap urgency — hoisted for use in Neuromodulator AND LinUCB.
                 // Normalization owned by TsatUrgency [CyberPhysicalSignal trait].
