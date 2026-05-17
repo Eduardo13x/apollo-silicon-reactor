@@ -2813,22 +2813,22 @@ fn main() -> anyhow::Result<()> {
                 };
                 apollo_engine::engine::shadow_signals::set_epistemic_uncertainty(epistemic_proxy);
 
-                // Phase 5.2 producer TODO (Sprint 11, 2026-05-17 candidate):
-                // Publish `is_on_battery`, `wakeups_per_sec`, `ctx_switches_per_sec`
-                // to shadow_signals so `BatteryAwareCostFeature` (registered
-                // in shadow_evaluator) can emit non-zero cost contributions.
-                // - `is_on_battery`: derive from `state.hardware.lock_recover()
-                //   .last_hw_snapshot.power.<charger field>` — exact field needs
-                //   confirmation against current PowerReading struct shape.
-                // - `wakeups_per_sec` + `ctx_switches_per_sec`: sysinfo derived,
-                //   needs per-cycle delta accumulator (sysinfo gives cumulative
-                //   counters; divide by elapsed cycle_dt). Existing
-                //   `last_rusage_at` time-tracking is the right anchor.
-                //
-                // Until these land, the feature stays Contribution::zero()
-                // and `battery_aware_penalty_emissions_total` does NOT bump
-                // (correct behaviour — no false-positive penalty on AC or
-                // on missing telemetry).
+                // Phase 5.2 WIRED (Sprint 10 finisher, 2026-05-16) — publish
+                // battery + wake-up signals so `BatteryAwareCostFeature`
+                // (registered in shadow_evaluator) can emit cost
+                // contributions. `is_on_battery` is taken from
+                // `power_mgr.battery_status.is_charging` (inverted), updated
+                // every 10 cycles via `detect_battery_status`. Wakeups +
+                // ctx-switches are placeholders (0.0) until a per-cycle
+                // delta accumulator lands — the setters drop non-finite /
+                // negative values and the consumer returns None on 0.0
+                // wakeups (no false penalty). Single hot-path cost: 3
+                // atomic stores.
+                apollo_engine::engine::shadow_signals::set_is_on_battery(
+                    !power_mgr.battery_status.is_charging,
+                );
+                apollo_engine::engine::shadow_signals::set_wakeups_per_sec(0.0);
+                apollo_engine::engine::shadow_signals::set_ctx_switches_per_sec(0.0);
 
                 // ODE swap urgency — hoisted for use in Neuromodulator AND LinUCB.
                 // Normalization owned by TsatUrgency [CyberPhysicalSignal trait].
