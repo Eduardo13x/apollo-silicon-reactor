@@ -285,13 +285,13 @@ fn build_menu(status: &Option<DaemonStatus>, updated_secs_ago: u64) -> tray_icon
     let mark = |p: OptimizationProfile| if s.effective_profile == p { "* " } else { "  " };
     let _ = sub.append(&MenuItem::with_id(
         "profile-balanced",
-        &format!("{}Balanced", mark(OptimizationProfile::BalancedRoot)),
+        format!("{}Balanced", mark(OptimizationProfile::BalancedRoot)),
         true,
         None,
     ));
     let _ = sub.append(&MenuItem::with_id(
         "profile-aggressive",
-        &format!(
+        format!(
             "{}Aggressive  (20 min)",
             mark(OptimizationProfile::AggressiveRoot)
         ),
@@ -300,7 +300,7 @@ fn build_menu(status: &Option<DaemonStatus>, updated_secs_ago: u64) -> tray_icon
     ));
     let _ = sub.append(&MenuItem::with_id(
         "profile-safe",
-        &format!("{}Safe  (20 min)", mark(OptimizationProfile::SafeRoot)),
+        format!("{}Safe  (20 min)", mark(OptimizationProfile::SafeRoot)),
         true,
         None,
     ));
@@ -618,7 +618,7 @@ fn main() {
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(build_menu(&init_status, init_secs)))
-        .with_title(&bar_title(&init_status))
+        .with_title(bar_title(&init_status))
         .with_tooltip("Apollo Optimizer")
         .build()
         .expect("tray icon");
@@ -639,14 +639,14 @@ fn main() {
             let secs_ago = d.last_fetched.elapsed().as_secs();
 
             // El titulo se puede actualizar siempre — no cierra el menu
-            let _ = tray.set_title(Some(&bar_title(&d.status)));
+            tray.set_title(Some(&bar_title(&d.status)));
 
             // set_menu() cierra el popup si esta abierto; solo llamarlo cuando esta cerrado
             let menu_might_be_open = menu_opened_at
                 .map(|t| t.elapsed() < Duration::from_secs(5))
                 .unwrap_or(false);
             if !menu_might_be_open {
-                let _ = tray.set_menu(Some(Box::new(build_menu(&d.status, secs_ago))));
+                tray.set_menu(Some(Box::new(build_menu(&d.status, secs_ago))));
             }
         }
 
@@ -679,8 +679,8 @@ fn main() {
                     }
                 }
                 let d = data.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = tray.set_title(Some(&bar_title(&d.status)));
-                let _ = tray.set_menu(Some(Box::new(build_menu(&d.status, 0))));
+                tray.set_title(Some(&bar_title(&d.status)));
+                tray.set_menu(Some(Box::new(build_menu(&d.status, 0))));
             }
         }
     });

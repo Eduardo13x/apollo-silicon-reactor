@@ -281,7 +281,7 @@ pub fn apply_app_nap_scheduling(
             let is_foreground = Some(pid_u32) == foreground_pid;
             // Evaluate behavioral signals for Tier-4 interactive detection.
             let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
-            let has_gui = snap.map_or(false, |s| s.has_gui_window);
+            let has_gui = snap.is_some_and(|s| s.has_gui_window);
             let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
             let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
             let is_interactive = is_user_interactive_app(has_gui, idle_s, rss, name);

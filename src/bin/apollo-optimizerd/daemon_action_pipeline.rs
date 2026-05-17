@@ -153,7 +153,7 @@ pub fn run_filter_pipeline(
     let ode_physical_critical = matches!(swap_risk, SwapRisk::Critical | SwapRisk::Overflow)
         || raw_pressure_critical;
     let op_mode =
-        if prev_cog_decision.map_or(false, |d| d.observe_only) && op_mode == OperationMode::Full {
+        if prev_cog_decision.is_some_and(|d| d.observe_only) && op_mode == OperationMode::Full {
             if ode_physical_critical {
                 // ODE override: floor at Conservative so freeze/throttle survive.
                 tracing::debug!(
@@ -165,7 +165,7 @@ pub fn run_filter_pipeline(
                 tracing::debug!("cognitive gate: observe_only → OperationMode::Observe");
                 OperationMode::Observe
             }
-        } else if prev_cog_decision.map_or(false, |d| d.block_aggressive)
+        } else if prev_cog_decision.is_some_and(|d| d.block_aggressive)
             && op_mode == OperationMode::Full
         {
             tracing::debug!("cognitive gate: block_aggressive → OperationMode::Conservative");

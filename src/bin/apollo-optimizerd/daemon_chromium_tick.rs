@@ -179,7 +179,7 @@ pub fn run_chromium_tick(
 
     // F3: CGWindowList visibility gate — refresh at most every 10 cycles (~5s).
     // Syscall costs ~1-3ms; window ownership rarely changes faster than that.
-    if cycle_count % 10 == 0 {
+    if cycle_count.is_multiple_of(10) {
         let visible = apollo_engine::engine::cg_window::visible_pids();
         chromium_mgr.set_visible_pids(visible);
     }

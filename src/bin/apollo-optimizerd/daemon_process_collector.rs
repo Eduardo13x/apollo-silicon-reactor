@@ -123,7 +123,7 @@ pub fn run_ghost_pid_reconciliation(
     display_turbo.gc_dead_pids(live_pids);
     drop(frozen_guard);
 
-    if cycle_count % 60 == 0 {
+    if cycle_count.is_multiple_of(60) {
         state.mach_qos.lock_recover().gc_dead_pids();
     }
 }

@@ -82,7 +82,7 @@ pub fn run_markov_tick(
             }
             *last_markov_prethaw = None;
             let total = *markov_hit_count + *markov_miss_count;
-            if total > 0 && total % 50 == 0 {
+            if total > 0 && total.is_multiple_of(50) {
                 let accuracy = *markov_hit_count as f64 / total as f64;
                 apollo_engine::engine::daemon_helpers::audit_log(&serde_json::json!({
                     "event": "markov_prediction_accuracy",

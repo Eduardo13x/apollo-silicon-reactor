@@ -97,7 +97,7 @@ pub fn run_heuristic_pass(
     // reflect physical memory state. [Denning 1968] high-τ = slow WSS re-growth.
     let heuristic_decisions: Vec<ProcessDecision> = {
         let mut pg = state.policy.lock_recover();
-        pg.adaptive_governor.swap_risk = reclaim_forecast.risk.clone();
+        pg.adaptive_governor.swap_risk = reclaim_forecast.risk;
         pg.adaptive_governor.high_tau_pids = proc_snaps
             .iter()
             .filter(|s| unfreeze_decay.tau_for_app(&s.name) > HIGH_TAU_SEC)
@@ -139,7 +139,7 @@ pub fn run_heuristic_pass(
             let pid_u32 = pid.as_u32();
             let name = process.name().to_string();
             let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
-            let has_gui = snap.map_or(false, |s| s.has_gui_window);
+            let has_gui = snap.is_some_and(|s| s.has_gui_window);
             let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
             let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
             let is_interactive = is_user_interactive_app(has_gui, idle_s, rss, &name);

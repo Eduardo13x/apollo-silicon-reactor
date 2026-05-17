@@ -188,7 +188,7 @@ pub fn run_sensor_tick(
     // Evict stale entries every 60 cycles to keep the HashMap bounded.
     let jit_protected_pids: HashSet<u32> = {
         let pids: Vec<u32> = snapshot.top_processes.iter().map(|p| p.pid).collect();
-        if cycle_count % 60 == 0 {
+        if cycle_count.is_multiple_of(60) {
             syscall_classifier.evict_stale(&pids);
         }
         pids.iter()
@@ -204,7 +204,7 @@ pub fn run_sensor_tick(
     };
 
     // ── IOPMrootDomain direct thermal (every 10 cycles, aligned with HwPredictor) ──
-    let iopm_snap = if cycle_count % 10 == 0 {
+    let iopm_snap = if cycle_count.is_multiple_of(10) {
         apollo_engine::engine::thermal_iokit::read_iopm_state()
     } else {
         None

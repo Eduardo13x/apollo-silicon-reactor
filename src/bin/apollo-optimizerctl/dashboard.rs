@@ -1608,7 +1608,7 @@ fn render_verdict_band(status: &DaemonStatus) -> Vec<String> {
         lines.push(dim("Meta: HUMBLE · 2× exploration activa"));
     }
 
-    if status.frozen_processes.len() > 0 {
+    if !status.frozen_processes.is_empty() {
         lines.push(dim(&format!(
             "Frozen: {} procesos · {:.0}MB recuperados",
             status.frozen_processes.len(),

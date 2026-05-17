@@ -171,7 +171,7 @@ pub fn apply_io_shaping(
     io_shaper: &mut IoShaper,
     state: &SharedState,
 ) {
-    if cycle_count % 20 != 0 || !is_root {
+    if !cycle_count.is_multiple_of(20) || !is_root {
         return;
     }
     let fg_family_io = process_enrichment::build_foreground_family(foreground_pid, process_tree);
@@ -284,7 +284,7 @@ pub fn apply_qos_routing(
     let mut qos = state.mach_qos.lock_recover();
     // GC dead PIDs every 30 cycles to prevent unbounded growth
     // and handle PID recycling (recycled PID must be re-evaluated).
-    if cycle_count % 30 == 0 {
+    if cycle_count.is_multiple_of(30) {
         qos.gc_dead_pids();
     }
     let outcomes = qos.apply_batch(&qos_changes);
@@ -342,7 +342,7 @@ pub fn merge_cycle_metrics<'a>(
     in_sleep: bool,
 ) {
     // Compute AIS off the hot path — reads 4 state files, never holds metrics lock.
-    let ais_snapshot = if cycle_count % AIS_COMPUTE_EVERY_N_CYCLES == 0 {
+    let ais_snapshot = if cycle_count.is_multiple_of(AIS_COMPUTE_EVERY_N_CYCLES) {
         apollo_engine::engine::intelligence_score::compute_runtime_ais()
     } else {
         None
@@ -483,7 +483,7 @@ pub fn merge_cycle_metrics<'a>(
     // Also skip writes while the system is sleeping — macOS accounts disk
     // writes against the daemon even during pre-sleep, burning the daily
     // budget while the machine is idle.
-    if !in_sleep && cycle_count % METRICS_DISK_WRITE_EVERY_N_CYCLES == 0 {
+    if !in_sleep && cycle_count.is_multiple_of(METRICS_DISK_WRITE_EVERY_N_CYCLES) {
         write_metrics(metrics_path, &metrics_snapshot);
     }
 }

@@ -151,9 +151,7 @@ pub fn wire_enriched_telemetry(
     // Frozen RAM: sum of RSS of currently frozen PIDs.
     let sys = collector.system();
     let frozen_pids = state.frozen_state.lock_recover().clone();
-    m.metrics.frozen_ram_mb = frozen_pids
-        .iter()
-        .filter_map(|(pid, _)| sys.process(sysinfo::Pid::from_u32(*pid)))
+    m.metrics.frozen_ram_mb = frozen_pids.keys().filter_map(|pid| sys.process(sysinfo::Pid::from_u32(*pid)))
         .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
         .sum::<f64>()
         .max(0.0);
@@ -342,9 +340,9 @@ pub struct PeriodicStageInputs<'a> {
 ///
 /// Side effect: persists `optimization_skills.json` when the % 500
 /// gate fires and new GC work occurred.
-pub fn run_periodic_stage<'a, 'lctx>(
+pub fn run_periodic_stage<'a>(
     inputs: PeriodicStageInputs<'a>,
-    lctx: &'lctx mut LearningContext<'a>,
+    lctx: &mut LearningContext<'a>,
 ) -> PeriodicResult {
     let mut pctx = PeriodicContext {
         cycle_count: inputs.cycle_count,

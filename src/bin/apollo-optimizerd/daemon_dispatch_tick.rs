@@ -242,7 +242,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     {
         const PRED_GATE_PRESSURE: f64 = 0.80;
         const MAX_PRED_GROWTH_BYTES: u64 = 200 * 1024 * 1024; // 200 MB
-        let pressure = snapshot.pressure.memory_pressure as f64;
+        let pressure = snapshot.pressure.memory_pressure;
         if pressure > PRED_GATE_PRESSURE {
             let mut deferred = 0u32;
             filtered_actions.retain(|a| {

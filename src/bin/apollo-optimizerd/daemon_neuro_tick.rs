@@ -93,11 +93,10 @@ pub fn apply_neuromodulator(
     };
     // [Schultz 1997] DA RPE: ODE predicted high swap urgency but pressure fell → positive.
     let ode_rss_surprise =
-        (ode_swap_urgency * (-signal_digest.pressure_velocity as f64).max(0.0)).clamp(0.0, 1.0);
+        (ode_swap_urgency * (-signal_digest.pressure_velocity).max(0.0)).clamp(0.0, 1.0);
     let overflow_occurred = lctx.overflow_guard.history.total_overflows > 0;
     let neuro_signals = NeuroSignals {
-        pressure_drop: signal_digest.pressure_smooth as f64
-            * -1.0
+        pressure_drop: -signal_digest.pressure_smooth
             * signal_digest.pressure_velocity,
         ode_rss_surprise,
         // Combine outcome-tracker RL penalty with stability oracle signal.
@@ -117,15 +116,15 @@ pub fn apply_neuromodulator(
         pressure_velocity: signal_digest.pressure_velocity,
         thermal_stress,
         ode_swap_urgency,
-        pressure_smooth: signal_digest.pressure_smooth as f64,
+        pressure_smooth: signal_digest.pressure_smooth,
         regime_shift_down: signal_digest.regime_shift_down,
         process_count,
-        entropy_anomaly: signal_digest.entropy_anomaly as f64,
+        entropy_anomaly: signal_digest.entropy_anomaly,
         rl_exploring: lctx
             .overflow_guard
             .rl_agent
             .as_ref()
-            .map_or(false, |rl| rl.total_ticks() < 200),
+            .is_some_and(|rl| rl.total_ticks() < 200),
         tau_divergence,
         // G11: contention_stall_fraction from KPC stall counters when available.
         // On M1 without the private KPC entitlement, kpc_ipc returns 0 and KPC
@@ -137,7 +136,7 @@ pub fn apply_neuromodulator(
         // keeping RL in permanent exploration without physical pressure.
         // [Heil 2021 PACT §3] — workload entropy tracks last-level cache pressure.
         contention_stall_fraction: {
-            let ea = signal_digest.entropy_anomaly as f64;
+            let ea = signal_digest.entropy_anomaly;
             if ea > 2.0 {
                 ((ea - 2.0) / 2.0).clamp(0.0, 1.0) // 0 at threshold, 1 at ea≥4.0
             } else {

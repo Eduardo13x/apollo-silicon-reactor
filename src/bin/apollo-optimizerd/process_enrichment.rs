@@ -211,7 +211,7 @@ fn should_reuse_enrich_cache(cycle_count: u64, pressure_smooth: f64) -> bool {
         return false;
     }
     // Refresh every 4th cycle to bound staleness at ~1.6 s @ 1 Hz pressure-mode.
-    cycle_count % 4 != 0
+    !cycle_count.is_multiple_of(4)
 }
 
 // ── Enriched Process Data ──────────────────────────────────────────────────
@@ -375,7 +375,7 @@ pub fn build_enriched_process_data_with_tree(
         // Cache reuse path: still populate live_pids from the cheap
         // sysinfo iter so downstream uses (process classification, hunt)
         // see today's PID set, even though the syscall data is stale.
-        for (pid, _process) in sys.processes() {
+        for pid in sys.processes().keys() {
             live_pids.insert(pid.as_u32());
         }
     }

@@ -851,32 +851,29 @@ pub fn usage_learning_tick(
         let mut pg = state.policy.lock_recover();
         for (kind, pattern) in &promotions {
             match kind.as_str() {
-                "interactive" => {
+                "interactive"
                     if !pg.learned_policy.interactive_patterns.contains(pattern)
                         && !pattern_conflicts_with_protected(pattern)
-                    {
+                    => {
                         pg.learned_policy.interactive_patterns.push(pattern.clone());
                         applied += 1;
                     }
-                }
-                "noise" => {
+                "noise"
                     if !pg.learned_policy.noise_patterns.contains(pattern)
                         && !pattern_conflicts_with_protected(pattern)
-                    {
+                    => {
                         pg.learned_policy.noise_patterns.push(pattern.clone());
                         applied += 1;
                     }
-                }
-                "protected" => {
+                "protected"
                     // Protected patterns are safety labels — they bypass the daily
                     // cap and only require that the pattern isn't already present.
                     if !pg.learned_policy.protected_patterns.contains(pattern)
                         && !pattern_conflicts_with_protected(pattern)
-                    {
+                    => {
                         pg.learned_policy.protected_patterns.push(pattern.clone());
                         applied += 1;
                     }
-                }
                 _ => {}
             }
         }

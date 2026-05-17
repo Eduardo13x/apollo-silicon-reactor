@@ -145,14 +145,13 @@ pub fn run_survival_tick(
             let can_purge = local
                 .map(|t: Instant| t.elapsed() >= Duration::from_secs(600))
                 .unwrap_or(true);
-            if can_purge {
-                if std::process::Command::new("purge").spawn().is_ok() {
+            if can_purge
+                && std::process::Command::new("purge").spawn().is_ok() {
                     *local = Some(Instant::now());
                     // Write shared timestamp so maintenance_tick yields.
                     // Survival itself does NOT read this field — asymmetric.
                     maintenance_state.mark_purged();
                 }
-            }
         }
     }
 

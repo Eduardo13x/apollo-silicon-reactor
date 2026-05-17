@@ -201,7 +201,7 @@ pub fn run_signal_tick(
         // (event-triggered at OOM/urgency/latency thresholds, periodic ~10 min).
         // [Welch 1967, Tuli et al. 2022]
         telemetry_logger.record(tv);
-        if d.transformer_anomaly > 0.3 || cycle_count % 60 == 0 {
+        if d.transformer_anomaly > 0.3 || cycle_count.is_multiple_of(60) {
             audit_log(&serde_json::json!({
                 "event": "dbad_score",
                 "score": (d.transformer_anomaly * 1000.0).round() / 1000.0,

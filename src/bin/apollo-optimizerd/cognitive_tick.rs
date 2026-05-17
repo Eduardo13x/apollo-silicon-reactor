@@ -282,7 +282,7 @@ pub fn run_cognitive_tick(
         );
     }
     // Prune stale workload params every 1000 cycles
-    if cycle % 1000 == 0 {
+    if cycle.is_multiple_of(1000) {
         cog.reptile.prune_stale(cycle);
     }
 
@@ -538,7 +538,7 @@ mod tests {
         }
         let inputs = CognitiveTickInputs {
             cycle: 50,
-            drift_score: dd.score() as f64,
+            drift_score: dd.score(),
             ..Default::default()
         };
         run_cognitive_tick(&mut cog, &inputs, Some(&mut dd));

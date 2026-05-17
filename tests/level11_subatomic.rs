@@ -91,7 +91,7 @@ fn kqueue_timer_accuracy() {
     );
 
     // Check that most ticks are within 15-60ms (20ms target ± jitter)
-    let reasonable = deltas.iter().filter(|&&d| d >= 10 && d <= 80).count();
+    let reasonable = deltas.iter().filter(|&&d| (10..=80).contains(&d)).count();
     assert!(
         reasonable >= deltas.len() / 2,
         "most ticks should be near 20ms: {:?}",
@@ -119,7 +119,7 @@ fn kqueue_wait_respects_timeout() {
     let _ = reactor.wait_events(50); // 50ms timeout
     let elapsed = t0.elapsed().as_millis();
     assert!(
-        elapsed >= 30 && elapsed < 200,
+        (30..200).contains(&elapsed),
         "wait(50ms) should take ~50ms, took {}ms",
         elapsed,
     );

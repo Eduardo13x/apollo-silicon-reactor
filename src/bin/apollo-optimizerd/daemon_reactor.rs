@@ -101,7 +101,7 @@ pub fn run_reactor(state: SharedState, stop_requested: &AtomicBool) -> anyhow::R
             ident: 1, // launchd PID
             filter: libc::EVFILT_PROC,
             flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-            fflags: libc::NOTE_FORK as u32,
+            fflags: libc::NOTE_FORK,
             data: 0,
             udata: 3 as *mut libc::c_void, // ID 3 = Lifecycle
         };
@@ -160,7 +160,7 @@ pub fn run_reactor(state: SharedState, stop_requested: &AtomicBool) -> anyhow::R
             // Pulse on every iteration (event or timeout) so main loop can
             // distinguish a live-but-quiet reactor from a dead one.
             {
-                let mut m = state.metrics.lock_recover();
+                let _m = state.metrics.lock_recover();
                 apollo_engine::engine::lse_counters::LSE_COUNTERS.increment_reactor_pulses();
             }
             // Poll kernel pressure level on every iteration (~1µs sysctl read).

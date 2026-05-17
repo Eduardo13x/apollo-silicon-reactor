@@ -1251,7 +1251,7 @@ fn main() -> anyhow::Result<()> {
             // Restored from learned_state.json if available — preserves crisis context
             // across restarts. [Yerkes & Dodson 1908]
             let mut arousal_state = restored_arousal
-                .unwrap_or_else(apollo_engine::engine::nars_belief::ArousalState::default);
+                .unwrap_or_default();
             // Teacher consolidation: compiles Gemma 4 suggestions into S1
             // pattern_weights + NARS beliefs via dopamine/acetylcholine modulation.
             // [McGaugh 2004, Yerkes-Dodson 1908, Kahneman 2011]
@@ -1558,7 +1558,7 @@ fn main() -> anyhow::Result<()> {
                     lf_metrics.commit();
 
                     // Periodic sync for observability in dry-run mode.
-                    if cycle_count % 5 == 0 {
+                    if cycle_count.is_multiple_of(5) {
                         let snap = lf_metrics.snapshot();
                         state.metrics.lock_recover().sync_from_lockfree(&snap);
                     }
@@ -1599,7 +1599,7 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     // Watchdog: check background collector health every 60 cycles (starting cycle 1).
-                    if cycle_count % 60 == 0 {
+                    if cycle_count.is_multiple_of(60) {
                         let pressure_alive = pressure_collector.is_alive(120);
                         let smc_alive = smc_reader.is_alive(120);
                         {
@@ -1658,7 +1658,7 @@ fn main() -> anyhow::Result<()> {
                 // network monitor and sysctl governor read directly from sysctl/netstat.
                 // Dropping the pressure gate removes ~15-25ms of disk/net I/O at 0.70+ pressure
                 // where the old 0.40 threshold never fired anyway.
-                let use_light = cycle_count % 30 != 0;
+                let use_light = !cycle_count.is_multiple_of(30);
                 let (mut snapshot, refresh_duration) = if dry_run && use_light {
                     collector.collect_snapshot_no_process_refresh()
                 } else if use_light {
@@ -1709,7 +1709,7 @@ fn main() -> anyhow::Result<()> {
                     foreground_app.as_deref(),
                     foreground_pid,
                     last_fg_name.as_deref(),
-                    cycle_count as u64,
+                    cycle_count,
                     &mut focus_markov,
                     &mut temporal_predictor,
                     &mut last_markov_prethaw,
@@ -1750,7 +1750,7 @@ fn main() -> anyhow::Result<()> {
                         &process_tree,
                         cycle_count,
                         prev_pressure_smooth,
-                        &lf_metrics,
+                        lf_metrics,
                     );
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonEnrich,
@@ -1837,7 +1837,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Battery status: detect real battery state every 10 cycles (~30s)
                 // to avoid spawning pmset too frequently.
-                if cycle_count % 10 == 0 {
+                if cycle_count.is_multiple_of(10) {
                     if let Some(batt) = detect_battery_status() {
                         power_mgr.update_battery_status(batt);
                     }
@@ -1931,7 +1931,7 @@ fn main() -> anyhow::Result<()> {
                 // HwPredictor: sample hardware signals every 10 cycles (~5s at normal rate).
                 // Runs in <50ms (16MB cache probe + 32MB BW probe) and gives advance warning
                 // before metrics APIs catch up. 5s is sufficient — thermal buildup takes ≥10s.
-                let (hw_pressure, jitter_us, hw_features) = if cycle_count % 10 == 0 {
+                let (hw_pressure, jitter_us, hw_features) = if cycle_count.is_multiple_of(10) {
                     let snap = sample_hw_pressure();
                     if snap.is_critical() {
                         state.metrics.lock_recover().fast_tick_until =
@@ -2022,7 +2022,7 @@ fn main() -> anyhow::Result<()> {
                 // Extracted to daemon_teacher_tick::run_teacher_consolidation (Wave 34).
                 daemon_teacher_tick::run_teacher_consolidation(
                     &state,
-                    &mut lctx.outcome_tracker,
+                    lctx.outcome_tracker,
                     &mut teacher_consolidator,
                     &mut last_consolidated_at,
                     &mut arousal_state,
@@ -2045,13 +2045,13 @@ fn main() -> anyhow::Result<()> {
                     &mut reactor_weight,
                     &state,
                     &snapshot,
-                    &mut lctx.overflow_guard,
+                    lctx.overflow_guard,
                     lctx.signal_intel,
                     &mut display_turbo,
                     &frozen_state_path,
                     &learnable_params,
                     &identity_cache,
-                    Some(&lf_metrics),
+                    Some(lf_metrics),
                 );
 
                 // hw_predictor can elevate pressure before standard metrics catch up.
@@ -2446,7 +2446,7 @@ fn main() -> anyhow::Result<()> {
                         }
 
                         // GC dead PIDs every 100 cycles
-                        if cycle_count % 100 == 0 {
+                        if cycle_count.is_multiple_of(100) {
                             let alive: std::collections::HashSet<u32> =
                                 proc_snaps.iter().map(|p| p.pid).collect();
                             contention_detector.gc(&alive);
@@ -2749,7 +2749,7 @@ fn main() -> anyhow::Result<()> {
                     &mut darwin_anomaly,
                     &mut telemetry_logger,
                     &fluidity_state,
-                    cycle_count as u64,
+                    cycle_count,
                 );
                 last_pressure_velocity = new_lpv;
                 prev_entropy_anomaly = new_entropy;
@@ -3073,7 +3073,7 @@ fn main() -> anyhow::Result<()> {
                         })
                         .unwrap_or(0.0);
                     let fg_csw = foreground_pid
-                        .and_then(|pid| proc_taskinfo::get_task_info(pid))
+                        .and_then(proc_taskinfo::get_task_info)
                         .map(|ti| {
                             // Rough csw/s: divide cumulative by uptime (capped).
                             let uptime = proc_snaps
@@ -3103,7 +3103,7 @@ fn main() -> anyhow::Result<()> {
                 // Jiang & Zhang 2005 — proactive beats reactive by 20-40%.
                 // Runs every 10 cycles (~5s) to avoid vm_stat overhead every cycle.
                 let _t_pr_start = Instant::now();
-                if cycle_count % 10 == 0 && !stage_budget_exceeded {
+                if cycle_count.is_multiple_of(10) && !stage_budget_exceeded {
                     // snapshot.pressure.memory_pressure already includes battery
                     // + thermal boosts via effective_pressure::compute(). Don't add again.
                     // 2026-05-12: post-wake aggressive purge — when the wake
@@ -3332,7 +3332,7 @@ fn main() -> anyhow::Result<()> {
                         "main.rs::3102 decide+learned_policy",
                         "decide_actions+learned_policy",
                     ),
-                    &lf_metrics,
+                    lf_metrics,
                 );
 
                 // Apply learned skills + trial induced skills.
@@ -3340,7 +3340,7 @@ fn main() -> anyhow::Result<()> {
                 // [Fowler 2004] Strangler Fig — pure move, no semantic change.
                 {
                     let skill_new = daemon_skill_tick::run_skill_tick(
-                        &mut lctx.skill_registry,
+                        lctx.skill_registry,
                         &snapshot,
                         &state,
                         &collector,
@@ -3357,7 +3357,7 @@ fn main() -> anyhow::Result<()> {
                             "main.rs::3138 skill_tick",
                             "learned_skills+trial",
                         ),
-                        &lf_metrics,
+                        lf_metrics,
                     );
                 }
 
@@ -3379,7 +3379,7 @@ fn main() -> anyhow::Result<()> {
                             "main.rs::3152 cluster_actions",
                             "coordinated_freeze+spotlight",
                         ),
-                        &lf_metrics,
+                        lf_metrics,
                     );
                 }
 
@@ -3397,10 +3397,10 @@ fn main() -> anyhow::Result<()> {
                     companion_graph.observe_cycle(
                         foreground_app.as_deref(),
                         &alive,
-                        cycle_count as u64,
+                        cycle_count,
                     );
-                    if (cycle_count as u64).is_multiple_of(500) {
-                        let evicted = companion_graph.self_improve(cycle_count as u64);
+                    if cycle_count.is_multiple_of(500) {
+                        let evicted = companion_graph.self_improve(cycle_count);
                         if evicted > 0 {
                             apollo_engine::engine::daemon_helpers::audit_log(&serde_json::json!({
                                 "event": "companion_graph_gc",
@@ -3418,7 +3418,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(fpid) = foreground_pid {
                     let cid = coalition_tracker.get_coalition_id(fpid);
                     active_coalitions.record_foreground(cid);
-                    if (cycle_count as u64).is_multiple_of(60) {
+                    if cycle_count.is_multiple_of(60) {
                         active_coalitions.evict_stale();
                     }
                 }
@@ -3445,7 +3445,7 @@ fn main() -> anyhow::Result<()> {
                             "main.rs::3164 agent_actions",
                             "predictive_agent",
                         ),
-                        &lf_metrics,
+                        lf_metrics,
                     );
                 }
 
@@ -3470,7 +3470,7 @@ fn main() -> anyhow::Result<()> {
                             "main.rs::3181 paging_hints",
                             "pressure+ode_velocity",
                         ),
-                        &lf_metrics,
+                        lf_metrics,
                     );
                 }
 
@@ -3507,7 +3507,7 @@ fn main() -> anyhow::Result<()> {
                         "main.rs::3210 heuristic_pass",
                         "adaptive_governor+protection",
                     ),
-                    &lf_metrics,
+                    lf_metrics,
                 );
 
                 // Cable: stale_apps() → nominate stale background apps as freeze candidates.
@@ -3529,7 +3529,7 @@ fn main() -> anyhow::Result<()> {
                             "main.rs::3224 stale_apps",
                             "background_freeze",
                         ),
-                        &lf_metrics,
+                        lf_metrics,
                     );
                 }
 
@@ -3539,8 +3539,8 @@ fn main() -> anyhow::Result<()> {
                 daemon_survival_tick::run_survival_tick(
                     &snapshot,
                     &signal_digest,
-                    cycle_count as u64,
-                    &mut lctx.overflow_guard,
+                    cycle_count,
+                    lctx.overflow_guard,
                     lctx.signal_intel,
                     &learnable_params,
                     &mut swap_growth_streak,
@@ -3556,7 +3556,7 @@ fn main() -> anyhow::Result<()> {
                     &snapshot,
                     &user_context,
                     &mut maintenance_state,
-                    &lf_metrics,
+                    lf_metrics,
                     build_tracker.build_active,
                 );
                 if maintenance_fired {
@@ -3565,7 +3565,7 @@ fn main() -> anyhow::Result<()> {
                     lctx.causal_graph.record_action_with_resources(
                         "system_maintenance_purge",
                         snapshot.pressure.memory_pressure as f32,
-                        cycle_count as u64,
+                        cycle_count,
                         Default::default(),
                     );
                 }
@@ -3597,7 +3597,7 @@ fn main() -> anyhow::Result<()> {
                 // [Schultz 1997 RPE] — prediction error is the primary arousal driver.
                 {
                     let ode_rss_surprise = (ode_t_sat_urgency
-                        * (-signal_digest.pressure_velocity as f64).max(0.0))
+                        * (-signal_digest.pressure_velocity).max(0.0))
                     .clamp(0.0, 1.0);
                     arousal_state.inject_ode_surprise(ode_rss_surprise);
                 }
@@ -3646,7 +3646,7 @@ fn main() -> anyhow::Result<()> {
                             "main.rs::3302 proc_recovery_freeze",
                             "memory_leak_recovery",
                         ),
-                        &lf_metrics,
+                        lf_metrics,
                     );
                     proc_recovery.record_kill_attempt(target.pid);
                 }
@@ -3775,7 +3775,7 @@ fn main() -> anyhow::Result<()> {
                 {
                     let wl_str = format!("{:?}", ml_class.workload).to_lowercase();
                     let gpu_hints = gpu_mgr.optimize_for_workload(&wl_str);
-                    if !gpu_hints.is_empty() && cycle_count % 30 == 0 {
+                    if !gpu_hints.is_empty() && cycle_count.is_multiple_of(30) {
                         audit_log(&serde_json::json!({
                             "event": "gpu_workload_hint",
                             "workload": wl_str,
@@ -3809,13 +3809,13 @@ fn main() -> anyhow::Result<()> {
                         "main.rs::3446 sysctl_governor.tick",
                         "reactive_tcp+memory",
                     ),
-                    &lf_metrics,
+                    lf_metrics,
                 );
 
                 // NetworkOptimizer: profile-driven TCP tuning complements sysctl_governor.
                 // Select network profile based on optimization profile + battery state.
                 // Emits SetSysctl actions for TCP buffers, delayed_ack, window scale.
-                if is_root && cycle_count % 30 == 0 {
+                if is_root && cycle_count.is_multiple_of(30) {
                     let net_profile = if power_mgr.is_on_battery() {
                         NetworkProfile::Battery
                     } else {
@@ -3846,7 +3846,7 @@ fn main() -> anyhow::Result<()> {
                                 "main.rs::3461 network_optimizer",
                                 "profile_tcp_tune",
                             ),
-                            &lf_metrics,
+                            lf_metrics,
                         );
                     }
                 }
@@ -3966,7 +3966,7 @@ fn main() -> anyhow::Result<()> {
                         external_4k_attached: false,
                     };
                 let display_state_now = unsafe {
-                    if cycle_count % 50 == 0 {
+                    if cycle_count.is_multiple_of(50) {
                         DISPLAY_STATE_CACHE = apollo_engine::engine::cg_display::snapshot();
                     }
                     DISPLAY_STATE_CACHE
@@ -3984,7 +3984,7 @@ fn main() -> anyhow::Result<()> {
                     &fluidity_state,
                     signal_digest.pressure_smooth as f32,
                     snapshot.pressure.memory_pressure,
-                    cycle_count as u64,
+                    cycle_count,
                     signal_digest.swap_velocity_smooth as f32,
                     snapshot.pressure.thrashing_score,
                     media_active_chromium,
@@ -4022,7 +4022,7 @@ fn main() -> anyhow::Result<()> {
                             lctx.causal_graph.record_action_with_resources(
                                 &format!("purge_purgeable:{}", name),
                                 pressure_now,
-                                cycle_count as u64,
+                                cycle_count,
                                 res,
                             );
                         }
@@ -4465,7 +4465,7 @@ fn main() -> anyhow::Result<()> {
                             // Closes ~1ms snapshot→execute race. See pid_identity_still_valid
                             // helper for full semantics (mirrors verify_pid_identity).
                             // [Idempotency Pattern — 1001 patterns slide 7]
-                            if !pid_identity_still_valid(&action, &identity_cache, &lf_metrics) {
+                            if !pid_identity_still_valid(&action, &identity_cache, lf_metrics) {
                                 continue;
                             }
                             recently_applied.record(pid, kind);
@@ -4488,7 +4488,7 @@ fn main() -> anyhow::Result<()> {
                 let final_actions: Vec<RootAction> = action_queue
                     .drain_cycle()
                     .into_iter()
-                    .filter(|a| pid_identity_still_valid(a, &identity_cache, &lf_metrics))
+                    .filter(|a| pid_identity_still_valid(a, &identity_cache, lf_metrics))
                     .collect();
                 // Update backpressure metrics (observable in runtime_metrics.json).
                 {
@@ -4551,7 +4551,7 @@ fn main() -> anyhow::Result<()> {
                         unfreeze_decay: &mut unfreeze_decay,
                         collector: &collector,
                         dry_run,
-                        lf_metrics: Some(&lf_metrics),
+                        lf_metrics: Some(lf_metrics),
                         coalition_guard: Some(&cg),
                         cpu_pegged_fraction: pressure_collector
                             .latest()
@@ -4690,7 +4690,7 @@ fn main() -> anyhow::Result<()> {
                 // [Goodfellow 2016 §7: regularization via confidence-adaptive learning rate]
                 let cognitive_pause = prev_cog_decision
                     .as_ref()
-                    .map_or(false, |d| d.pause_learning);
+                    .is_some_and(|d| d.pause_learning);
                 if cognitive_pause {
                     tracing::debug!(
                         uchs = prev_cog_decision.as_ref().map_or(0.0, |d| d.uchs_composite),
@@ -4787,7 +4787,7 @@ fn main() -> anyhow::Result<()> {
                     // restarts. Without this, cog.meta_cognition cold-starts at
                     // baseline on every reboot and the system is blindly optimistic
                     // for ~50 cycles until calibration re-accumulates.
-                    if !sleep_notifier.is_sleeping() && cycle_count % 300 == 0 {
+                    if !sleep_notifier.is_sleeping() && cycle_count.is_multiple_of(300) {
                         apollo_engine::engine::learned_state::LearnedState::patch_meta_cognition(
                             ls_path,
                             cognitive_state.meta_cognition.clone(),
@@ -4814,7 +4814,7 @@ fn main() -> anyhow::Result<()> {
                 let cog_decision = daemon_neuro_tick::run_neurocognitive_tick(
                     &mut lctx,
                     &mut cognitive_state,
-                    cycle_count as u64,
+                    cycle_count,
                     &signal_digest,
                     &throttle_names_for_outcome,
                     workload_mode.as_str(),
@@ -4826,7 +4826,7 @@ fn main() -> anyhow::Result<()> {
                 prev_cog_decision = Some(cog_decision);
                 // LlmConfig live-reload: whitelisted fields only; skip if trial active
                 // to avoid corrupting GemmaTrust outcome attribution. [Gray & Reuter 1992]
-                if cycle_count % 100 == 0 && pending_trial_skill.is_none() {
+                if cycle_count.is_multiple_of(100) && pending_trial_skill.is_none() {
                     use apollo_engine::engine::pipeline::periodic_stage::maybe_reload_llm_config;
                     let current_cfg = state.llm.lock_recover().llm_cfg.clone();
                     if let Some(outcome) =
@@ -4843,10 +4843,10 @@ fn main() -> anyhow::Result<()> {
                 }
                 // Autonomous rule induction every 100 cycles.
                 // Extracted to daemon_skill_tick::run_rule_induction (Wave 22).
-                if cycle_count % 100 == 0 {
+                if cycle_count.is_multiple_of(100) {
                     daemon_skill_tick::run_rule_induction(
-                        &mut lctx.skill_registry,
-                        &lctx.outcome_tracker,
+                        lctx.skill_registry,
+                        lctx.outcome_tracker,
                         &state,
                         workload_mode.as_str(),
                         std::path::Path::new(skills_path()),
@@ -4854,7 +4854,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 // State compression (% 500) is handled by run_periodic() below.
                 // Hourly housekeeping (7200 cycles × 500ms ≈ 1 hour).
-                if cycle_count % 7200 == 0 {
+                if cycle_count.is_multiple_of(7200) {
                     // GC stale entries from cache warmer + I/O shaper.
                     cache_warmer.gc();
                     io_shaper.gc();
@@ -4954,7 +4954,7 @@ fn main() -> anyhow::Result<()> {
                         thermal_seconds_to_throttle,
                         thermal_trend_predicted: &thermal_trend_predicted,
                         active_coalitions_count: active_coalitions.len() as u32,
-                        lf_metrics: &lf_metrics,
+                        lf_metrics,
                     },
                 );
 
@@ -5089,7 +5089,7 @@ fn main() -> anyhow::Result<()> {
                 // ── recently_applied cache cleanup (SuperPlan iter 3) ──────────
                 // O(n) sweep every 60 cycles to amortize. Drops expired entries
                 // (TTL 30s default) so cache size stays bounded under sustained load.
-                if cycle_count % 60 == 0 {
+                if cycle_count.is_multiple_of(60) {
                     let drained = recently_applied.cleanup_expired();
                     if drained > 0 {
                         tracing::debug!(
@@ -5107,7 +5107,7 @@ fn main() -> anyhow::Result<()> {
                 // Phase A3 (Sprint 3 2026-05-07) — periodic IdentityCache cleanup.
                 // Lazy expiry on lookup is sufficient for correctness, but a
                 // periodic sweep keeps memory bounded under sustained load.
-                if cycle_count % 60 == 0 {
+                if cycle_count.is_multiple_of(60) {
                     let drained = identity_cache.tick_cleanup();
                     if drained > 0 {
                         tracing::debug!(
@@ -5149,7 +5149,7 @@ fn main() -> anyhow::Result<()> {
                         snapshot.pressure.memory_pressure,
                     );
                     // Run threshold check every 60 cycles to amortize cost.
-                    if cycle_count % 60 == 0 {
+                    if cycle_count.is_multiple_of(60) {
                         let alerts = self_diagnosis.check();
                         for alert in &alerts {
                             tracing::warn!(
@@ -5167,7 +5167,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Periodic sync of lock-free hot path metrics to the Mutex-protected state
                 // once every 5 cycles (~1.5s - 10s depending on load). Reduces lock contention.
-                if cycle_count % 5 == 0 {
+                if cycle_count.is_multiple_of(5) {
                     let snap = lf_metrics.snapshot();
                     state.metrics.lock_recover().sync_from_lockfree(&snap);
                 }

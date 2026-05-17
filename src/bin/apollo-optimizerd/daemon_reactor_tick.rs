@@ -115,11 +115,10 @@ pub fn run_reactor_tick(input: ReactorTickInput) -> f64 {
         BuildPhase::Starting => {
             reactor_weight = (reactor_weight + 0.15).min(1.0);
         }
-        BuildPhase::Finishing => {
-            if input.raw_pressure < 0.80 {
+        BuildPhase::Finishing
+            if input.raw_pressure < 0.80 => {
                 reactor_weight = (reactor_weight - 0.12).max(0.0);
             }
-        }
         _ => {}
     }
 

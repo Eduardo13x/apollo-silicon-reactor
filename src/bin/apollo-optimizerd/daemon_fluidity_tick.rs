@@ -19,7 +19,7 @@ pub fn run_fluidity_tick(input: FluidityTickInput) -> FluidityTickOutput {
     let fl_gpu_load = input
         .cycle_hw_snap
         .and_then(|hw| hw.power.gpu_watts)
-        .map(|w| (w / 15.0).clamp(0.0, 1.0) as f32)
+        .map(|w| (w / 15.0).clamp(0.0, 1.0))
         .unwrap_or(0.0);
 
     input.fluidity_state.update(

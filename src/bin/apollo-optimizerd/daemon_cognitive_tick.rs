@@ -363,7 +363,7 @@ pub fn apply_specialist_voting(
             * maturity_factor)
             .min(1.0);
         // Log NARS maturity horizon every 30 cycles to avoid journal spam.
-        if cycle_count % 30 == 0 {
+        if cycle_count.is_multiple_of(30) {
             if let Some(rem) = obs_remaining {
                 if rem > 0 {
                     audit_log(&serde_json::json!({
@@ -398,8 +398,8 @@ pub fn apply_specialist_voting(
     // still below the action threshold — act NOW before RAM fills up.
     // This is the key advantage over purely reactive systems:
     // the OS can only react; Apollo can predict and pre-empt.
-    let p30_trigger = overflow_thresholds.bg_pressure as f64 - 0.05;
-    let p30_clear = overflow_thresholds.bg_pressure as f64 - 0.08;
+    let p30_trigger = overflow_thresholds.bg_pressure - 0.05;
+    let p30_clear = overflow_thresholds.bg_pressure - 0.08;
     if signal_digest.pressure_predicted_30s > p30_trigger
         && signal_digest.pressure_smooth < p30_clear
     {
@@ -582,7 +582,7 @@ pub fn update_habituation_state(
             }
         }
         // GC dead PIDs every 100 cycles.
-        if cycle_count % 100 == 0 {
+        if cycle_count.is_multiple_of(100) {
             let live: HashSet<u32> = system.processes().keys().map(|p| p.as_u32()).collect();
             habituation_map.retain(|pid, _| live.contains(pid));
         }

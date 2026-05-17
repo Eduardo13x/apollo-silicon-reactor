@@ -231,7 +231,7 @@ pub fn run_memory_budget(
     for budget in budgets.iter().filter(|b| b.over_budget) {
         let last_limit = budget_state.last_applied_limits.get(&budget.pid).copied();
         let limit_delta = last_limit
-            .map(|l| (l as i64 - budget.inactive_limit_mb as i64).abs() as u64)
+            .map(|l| (l as i64 - budget.inactive_limit_mb as i64).unsigned_abs())
             .unwrap_or(u64::MAX);
 
         // Significant change: >15% change in limit AND at least 50MiB.

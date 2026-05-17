@@ -118,7 +118,7 @@ pub fn run_wake_tick(
         // Turbo PIDs also staggered.
         let turbo_pids = display_turbo.turbo_frozen_pids_snapshot();
         let turbo_count = turbo_pids.len() as u64;
-        wake_unfreeze_queue.extend(turbo_pids.into_iter());
+        wake_unfreeze_queue.extend(turbo_pids);
         display_turbo.clear_frozen();
 
         {

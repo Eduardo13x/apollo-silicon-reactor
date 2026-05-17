@@ -23,11 +23,10 @@ use apollo_engine::engine::nested_learner::NestedLearner;
 /// Returns (l1_gate_open, l1_aggregate, l2_meta_velocity).
 fn step(nl: &mut NestedLearner, signal_quality: f64, outcome: f64) -> (bool, f64, f64) {
     let gate_open = nl.tick_l0(signal_quality);
-    if gate_open {
-        if nl.tick_l1(outcome) {
+    if gate_open
+        && nl.tick_l1(outcome) {
             nl.flush_l2();
         }
-    }
     (gate_open, nl.l1_aggregate, nl.l2_meta_velocity)
 }
 

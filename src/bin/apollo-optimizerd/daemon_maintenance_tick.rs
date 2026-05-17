@@ -69,8 +69,8 @@ pub fn run_maintenance_tick(
         && !ctx.has_sleep_assertion
         && !build_active
         && state.secs_since_any_purge() >= 300;
-    if emergency {
-        if std::process::Command::new("purge").spawn().is_ok() {
+    if emergency
+        && std::process::Command::new("purge").spawn().is_ok() {
             state.mark_purged();
             lf_metrics
                 .maintenance_purge_total
@@ -82,7 +82,6 @@ pub fn run_maintenance_tick(
             );
             return true;
         }
-    }
 
     match should_fire(snap, ctx, state, build_active) {
         None => {

@@ -221,7 +221,7 @@ pub fn run_learning_tick<'a>(
 
         // Sample every 10 cycles to avoid log bloat. Always emit if
         // compaction_duration_ms exceeds the canary rollback threshold (10ms).
-        if cycle_count % 10 == 0 || compaction_duration_ms > 10.0 {
+        if cycle_count.is_multiple_of(10) || compaction_duration_ms > 10.0 {
             use apollo_engine::engine::causal_graph::HOT_PATH_EDGE_CAP;
             let cap_utilization_ratio =
                 lctx.causal_graph.edge_count() as f64 / HOT_PATH_EDGE_CAP as f64;
@@ -418,7 +418,7 @@ pub fn run_learning_tick<'a>(
             }
         }
         // Opportunistic rotation: every 100 cycles, check size and rotate if > 64 KiB.
-        if cycle_count % 100 == 0 {
+        if cycle_count.is_multiple_of(100) {
             let novel_path = apollo_engine::engine::daemon_helpers::novel_patterns_path();
             if let Ok(meta) = std::fs::metadata(novel_path) {
                 if meta.len() > 64 * 1024 {
@@ -767,7 +767,7 @@ pub fn run_learning_tick<'a>(
     // written at 33KB/s — pushing total daemon writes past macOS's 24.86KB/s
     // daily budget. 300 cycles reduces this component to ~11KB/s.
     // Also skipped while in_sleep: no point persisting while system is asleep.
-    if !in_sleep && cycle_count % 300 == 0 {
+    if !in_sleep && cycle_count.is_multiple_of(300) {
         learning_pipeline.flush_remaining(
             lctx.outcome_tracker,
             lctx.causal_graph,
