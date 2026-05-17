@@ -3285,6 +3285,29 @@ fn main() -> anyhow::Result<()> {
                     // (typically <30) and avoids holding the lock across
                     // the full decision computation.
                     let freeze_cooldown_snapshot = state.freeze_cooldown.lock_recover().clone();
+
+                    // Sprint 12 Convergence #1 (2026-05-17). Build the set
+                    // of PIDs the CompanionGraph classifies as companions
+                    // of the current foreground app. decide_actions reads
+                    // this set in the cold-thread loop to keep companions
+                    // on the same P-cluster as foreground hot threads
+                    // (preserving L2 working-set locality across user
+                    // focus switches) when DRAM bandwidth is below the
+                    // 0.50 safety floor. Empty set = disabled.
+                    // [ARM big.LITTLE 2013 §3] cluster-local scheduling.
+                    let companion_of_fg_pids: std::collections::HashSet<u32> =
+                        match foreground_app.as_deref() {
+                            Some(fg_name) if !fg_name.is_empty() => snapshot
+                                .top_processes
+                                .iter()
+                                .filter(|p| {
+                                    companion_graph.is_companion_of(fg_name, &p.name)
+                                })
+                                .map(|p| p.pid)
+                                .collect(),
+                            _ => std::collections::HashSet::new(),
+                        };
+
                     let policy = PolicyContext {
                         decide_interactive: &decide_interactive,
                         decide_noise: &decide_noise,
@@ -3303,6 +3326,7 @@ fn main() -> anyhow::Result<()> {
                         io_burst_hints: &io_burst_hints,
                         anomaly_hints: &anomaly_hints,
                         freeze_cooldown: &freeze_cooldown_snapshot,
+                        companion_of_foreground_pids: &companion_of_fg_pids,
                     };
                     decision_stage
                         .run(

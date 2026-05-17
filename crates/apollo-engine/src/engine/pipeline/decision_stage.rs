@@ -121,6 +121,12 @@ pub struct PolicyContext<'a> {
     /// in cooldown are skipped to prevent freeze→thaw→freeze oscillation.
     /// Other gates (a/b/c/d) ignore the cooldown.
     pub freeze_cooldown: &'a crate::engine::freeze_cooldown::FreezeCooldown,
+
+    /// Sprint 12 Convergence #1 (2026-05-17). PIDs the CompanionGraph
+    /// classifies as companions of the current foreground app, used by
+    /// the cold-thread router to keep them on the same P-cluster as
+    /// the foreground hot threads under low DRAM bandwidth.
+    pub companion_of_foreground_pids: &'a HashSet<u32>,
 }
 
 /// The output returned by [`DecisionStage::run`].
@@ -212,6 +218,7 @@ impl DecisionStage {
             policy.io_burst_hints,
             policy.anomaly_hints,
             policy.freeze_cooldown,
+            policy.companion_of_foreground_pids,
         );
 
         DecisionStageOutput { decision }
@@ -271,6 +278,7 @@ mod tests {
         impact: &'a HashMap<String, f32>,
         user_ctx: &'a UserContext,
         cooldown: &'a crate::engine::freeze_cooldown::FreezeCooldown,
+        companions: &'a HashSet<u32>,
     ) -> PolicyContext<'a> {
         PolicyContext {
             decide_interactive: interactive,
@@ -290,6 +298,7 @@ mod tests {
             io_burst_hints: ipc,
             anomaly_hints: ipc,
             freeze_cooldown: cooldown,
+            companion_of_foreground_pids: companions,
         }
     }
 
@@ -322,6 +331,7 @@ mod tests {
             &empty_impact,
             &user_ctx,
             &cooldown,
+            &empty_pids,
         );
 
         let output = stage.run(
@@ -370,6 +380,7 @@ mod tests {
             &empty_impact,
             &user_ctx,
             &cooldown,
+            &empty_pids,
         );
 
         let output = stage.run(

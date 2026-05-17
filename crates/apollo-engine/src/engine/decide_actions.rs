@@ -372,6 +372,14 @@ pub fn decide_actions(
     // hold-down. Other gates (a/b/c/d) ignore the cooldown — their
     // physical triggers are too urgent to bypass.
     freeze_cooldown: &crate::engine::freeze_cooldown::FreezeCooldown,
+    // Sprint 12 Convergence #1 (2026-05-17). PIDs that the CompanionGraph
+    // classifies as companions of the current foreground app. Used by
+    // the cold-thread router to keep companions on the same P-cluster as
+    // the foreground hot threads (preserving L2 working-set locality)
+    // when DRAM bandwidth is below the safety floor. Pass an empty set
+    // to disable the bridge — the default-E-cluster routing then stays
+    // intact, exactly matching pre-bridge behaviour.
+    companion_of_foreground_pids: &HashSet<u32>,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -982,6 +990,26 @@ pub fn decide_actions(
                             if thread_actions_emitted >= max_thread_actions {
                                 break;
                             }
+                            // Sprint 12 Convergence #1 (2026-05-17):
+                            // when the owning PID is a companion of the
+                            // foreground AND DRAM bandwidth is below the
+                            // 0.50 safety floor, keep the cold thread on
+                            // P-cluster (same cluster as foreground hot
+                            // threads) to preserve L2 working-set
+                            // locality across user-triggered focus
+                            // switches. Otherwise default to E-cluster
+                            // (battery-friendly).
+                            // [ARM big.LITTLE 2013 §3] cluster-local L2.
+                            let companion_bridge_active = companion_of_foreground_pids
+                                .contains(&pid_u32)
+                                && dram_bandwidth_pct < 0.50;
+                            let cold_affinity = if companion_bridge_active {
+                                crate::engine::lse_counters::LSE_COUNTERS
+                                    .inc_companion_affinity_alignment();
+                                crate::engine::mach_qos::mach_sys::AFFINITY_TAG_P_CLUSTER
+                            } else {
+                                crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER
+                            };
                             actions.push(RootAction::SetThreadQoS {
                                 pid: pid_u32,
                                 name: name.clone(),
@@ -989,10 +1017,7 @@ pub fn decide_actions(
                                 tier: "background".to_string(),
                                 reason: format!("cold thread #{} in {} (waiting)", idx, name),
                                 decision_reason: DecisionReason::ThreadQoSRouting,
-                                // Normal cold thread: E-cluster (battery-friendly).
-                                affinity_tag: Some(
-                                    crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER,
-                                ),
+                                affinity_tag: Some(cold_affinity),
                             });
                             thread_actions_emitted += 1;
                         }
@@ -1626,6 +1651,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &cooldown,
+            &HashSet::new(),
         )
     }
 
