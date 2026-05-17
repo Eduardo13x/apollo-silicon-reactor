@@ -35,6 +35,13 @@ pub enum SkipReason {
     MediaActive,
     BuildMode,
     RateLimit,
+    /// Sprint 12 Convergence #5 (2026-05-17). Unified-memory bus is
+    /// saturated (entropy_anomaly > 2.0 fallback on M1; or amc>80% with
+    /// IOReport entitlement). A vm_purge while the bus is busy contends
+    /// with whatever drives the bandwidth (usually LLM inference) and
+    /// induces user-visible jank — the gate must yield until the bus
+    /// quiets. [Hennessy & Patterson 2017 §2.2]
+    BusSaturated,
 }
 
 /// Returns true if the maintenance tick fired a purge in this cycle.
@@ -46,6 +53,7 @@ pub fn run_maintenance_tick(
     state: &mut MaintenanceState,
     lf_metrics: &LockFreeMetrics,
     build_active: bool,
+    bus_saturated: bool,
 ) -> bool {
     state.push_swap_delta(snap.pressure.swap_delta_bytes_per_sec);
 
@@ -83,7 +91,7 @@ pub fn run_maintenance_tick(
             return true;
         }
 
-    match should_fire(snap, ctx, state, build_active) {
+    match should_fire(snap, ctx, state, build_active, bus_saturated) {
         None => {
             if std::process::Command::new("purge").spawn().is_ok() {
                 state.mark_purged();
@@ -106,6 +114,9 @@ pub fn run_maintenance_tick(
                 }
                 SkipReason::BuildMode => &lf_metrics.maintenance_purge_skipped_build_mode_total,
                 SkipReason::RateLimit => &lf_metrics.maintenance_purge_skipped_rate_limit_total,
+                SkipReason::BusSaturated => {
+                    &lf_metrics.maintenance_purge_skipped_bus_saturated_total
+                }
             };
             counter.fetch_add(1, Ordering::Relaxed);
             false
@@ -118,6 +129,7 @@ pub(crate) fn should_fire(
     ctx: &UserContext,
     state: &MaintenanceState,
     build_active: bool,
+    bus_saturated: bool,
 ) -> Option<SkipReason> {
     let p = snap.pressure.memory_pressure;
     if p < 0.65 {
@@ -149,6 +161,13 @@ pub(crate) fn should_fire(
     // coreaudiod NoIdleSleep + NSPreventIdleSystemSleep + conferencing apps.
     if ctx.audio_active || ctx.call_in_progress || ctx.has_sleep_assertion {
         return Some(SkipReason::MediaActive);
+    }
+    // Sprint 12 Convergence #5 (2026-05-17): bus-saturation gate.
+    // Same "now is dangerous" cohort as MediaActive — the system is
+    // actively transferring data and a vm_purge would contend.
+    // [Hennessy & Patterson 2017 §2.2] unified memory contention.
+    if bus_saturated {
+        return Some(SkipReason::BusSaturated);
     }
     if build_active {
         return Some(SkipReason::BuildMode);
@@ -220,7 +239,7 @@ mod tests {
         let ctx = idle_ctx();
         let state = MaintenanceState::default();
         assert_eq!(
-            should_fire(&snap, &ctx, &state, false),
+            should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::PressureLow)
         );
     }
@@ -231,7 +250,7 @@ mod tests {
         let ctx = idle_ctx();
         let state = MaintenanceState::default();
         assert_eq!(
-            should_fire(&snap, &ctx, &state, false),
+            should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::PressureSurvival)
         );
     }
@@ -244,7 +263,7 @@ mod tests {
         let ctx = idle_ctx();
         let state = MaintenanceState::default();
         assert_eq!(
-            should_fire(&snap, &ctx, &state, false),
+            should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::SwapFloor)
         );
     }
@@ -255,7 +274,7 @@ mod tests {
         let ctx = idle_ctx();
         let mut state = MaintenanceState::default();
         assert_eq!(
-            should_fire(&snap, &ctx, &state, false),
+            should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::Growing)
         );
 
@@ -266,7 +285,7 @@ mod tests {
             state.swap_delta_window.push(t, 50_000.0);
         }
         assert_ne!(
-            should_fire(&snap, &ctx, &state, false),
+            should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::Growing)
         );
     }
@@ -280,7 +299,7 @@ mod tests {
         };
         let state = make_ready_state();
         assert_eq!(
-            should_fire(&snap, &ctx, &state, false),
+            should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::Idle)
         );
     }
@@ -292,7 +311,7 @@ mod tests {
         let mut state = make_ready_state();
         state.observe_wake();
         assert_eq!(
-            should_fire(&snap, &ctx, &state, false),
+            should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::PostWake)
         );
     }
@@ -307,7 +326,7 @@ mod tests {
         };
         let state = make_ready_state();
         assert_eq!(
-            should_fire(&snap, &ctx, &state, false),
+            should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::MediaActive)
         );
     }
@@ -322,7 +341,7 @@ mod tests {
         };
         let state = make_ready_state();
         assert_eq!(
-            should_fire(&snap, &ctx, &state, false),
+            should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::MediaActive)
         );
     }
@@ -337,7 +356,7 @@ mod tests {
         };
         let state = make_ready_state();
         assert_eq!(
-            should_fire(&snap, &ctx, &state, false),
+            should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::MediaActive)
         );
     }
@@ -348,8 +367,40 @@ mod tests {
         let ctx = idle_ctx();
         let state = make_ready_state();
         assert_eq!(
-            should_fire(&snap, &ctx, &state, true),
+            should_fire(&snap, &ctx, &state, true, false),
             Some(SkipReason::BuildMode)
+        );
+    }
+
+    #[test]
+    fn should_fire_bus_saturated_returns_bus_saturated() {
+        let snap = synth_snap(0.70, 3_000_000_000, 4_000_000_000);
+        let ctx = idle_ctx();
+        let state = make_ready_state();
+        assert_eq!(
+            should_fire(&snap, &ctx, &state, false, true),
+            Some(SkipReason::BusSaturated),
+            "bus_saturated=true while all other gates pass → BusSaturated"
+        );
+    }
+
+    #[test]
+    fn should_fire_bus_saturated_yields_to_media_active() {
+        // MediaActive must be checked BEFORE BusSaturated so a call-in-progress
+        // is reported as MediaActive (correct user-facing reason) even when the
+        // bus is also saturated. Verifies the gate order documented at
+        // run_maintenance_tick line ~165.
+        let snap = synth_snap(0.70, 3_000_000_000, 4_000_000_000);
+        let ctx = UserContext {
+            idle_secs: 200.0,
+            call_in_progress: true,
+            ..Default::default()
+        };
+        let state = make_ready_state();
+        assert_eq!(
+            should_fire(&snap, &ctx, &state, false, true),
+            Some(SkipReason::MediaActive),
+            "MediaActive precedence over BusSaturated"
         );
     }
 
@@ -361,7 +412,7 @@ mod tests {
         state.last_any_purge_at =
             Some(std::time::SystemTime::now() - std::time::Duration::from_secs(100));
         assert_eq!(
-            should_fire(&snap, &ctx, &state, false),
+            should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::RateLimit)
         );
     }
@@ -371,6 +422,6 @@ mod tests {
         let snap = synth_snap(0.70, 3_000_000_000, 4_000_000_000);
         let ctx = idle_ctx();
         let state = make_ready_state();
-        assert_eq!(should_fire(&snap, &ctx, &state, false), None);
+        assert_eq!(should_fire(&snap, &ctx, &state, false, false), None);
     }
 }

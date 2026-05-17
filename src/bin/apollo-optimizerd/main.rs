@@ -3665,12 +3665,25 @@ fn main() -> anyhow::Result<()> {
                     prev_thermal_throttling = thermal_throttling_now;
                 }
 
+                // Sprint 12 Convergence #5 (2026-05-17). Same formula G12 uses
+                // for action_queue DRAM backpressure (main.rs:1476): trust the
+                // entitled IOReport reading when it's alive, fall back to
+                // entropy_anomaly > 2.0 when amc_bandwidth_pct is dead on M1.
+                // Keeps both consumers in lockstep — there is no second
+                // "bus saturated" definition floating around.
+                let dram_bw_pct = last_ioreport
+                    .as_ref()
+                    .map(|ir| ir.amc_bandwidth_pct)
+                    .unwrap_or(0.0);
+                let bus_saturated =
+                    dram_bw_pct > 80.0 || (dram_bw_pct == 0.0 && prev_entropy_anomaly > 2.0);
                 let maintenance_fired = daemon_maintenance_tick::run_maintenance_tick(
                     &snapshot,
                     &user_context,
                     &mut maintenance_state,
                     lf_metrics,
                     build_tracker.build_active,
+                    bus_saturated,
                 );
                 if maintenance_fired {
                     // Record cause for observational outcome tracking via CausalGraph.
