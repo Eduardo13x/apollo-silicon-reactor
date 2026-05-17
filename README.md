@@ -3,11 +3,28 @@
 ![Rust](https://img.shields.io/badge/rust-2021-orange.svg)
 ![macOS](https://img.shields.io/badge/macOS-Tahoe-blue.svg)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2B-success.svg)
-![Status](https://img.shields.io/badge/status-Sprint%2011%20finale-brightgreen.svg)
+![AIS](https://img.shields.io/badge/AIS-S--tier-brightgreen.svg)
 
 **apollo-silicon-reactor** (formerly `apollo-optimizer`) is an autonomous system-optimization daemon engineered for **macOS Apple Silicon, M1 8 GB baseline**. Pure Rust, no Python, no shell scripting in the hot loop. It is not a generic process manager — it is an adaptive agent with 9 wired learning phases that redistributes CPU, RAM, and thermal headroom against actual user intent instead of XNU's "fair" scheduler defaults.
 
 The reactor learns. Every cycle it observes ~400-600 live processes, scores candidate actions through a neuro-cognitive stack (NARS reasoning, causal graph, asymmetric policy scorer, RL agent, user-presence modulator), commits its rationale to an audit journal, and either reverts or reinforces its own learned parameters depending on the AIS quality score that follows.
+
+## Why this exists
+
+macOS Apple Silicon laptops with 8 GB RAM live in a constant memory-pressure ceiling. The XNU scheduler is workload-agnostic and optimizes for fairness, not intent — when you are mid-build, Spotlight reindexing wins CPU cycles you needed for `rustc`. apollo-silicon-reactor closes that loop with an agent that knows which process you actually want responsive right now, learns from its own mistakes, and reverses any optimization it picked that turned out to hurt AIS.
+
+## Qualities
+
+- **Adaptive, not reactive** — 22+ learned parameters auto-tuned per workload; no static thresholds in the hot path
+- **Causally honest** — discounts its own contribution by 30% when an exogenous confounder (thermal throttle, network spike) was the real cause of the observed effect (Pearl 2009)
+- **Self-reverting** — if a learned parameter shift drops AIS quality below 0.35, the policy-rollback guard restores `pre_value` automatically (Sutton & Barto 2018 §11.7)
+- **Asymmetric scorer** — the policy scorer can OVERRIDE a gate-accept (safe direction), but is never allowed to override a gate-reject (unsafe direction)
+- **User-presence aware** — three-tier modulator (idle / semi-active / active) reads HID idle, HID event rate, sleep assertions, and audio activity to decide how aggressive to be; bypasses politeness at `pressure ≥ 0.65` for survival
+- **Battery-aware** — penalizes high-wakeup actions when on battery (proxy for energy cost); silent when plugged in
+- **Lock-free hot path** — 11 ARMv8.1 atomic counters publish telemetry without mutex contention (Hellerstein 2012)
+- **Auditable** — every executed action attaches a `Rationale { action_class, trigger, evidence, expected_outcome }` to the journal for post-hoc analysis
+- **Safety-first** — 13 invariants enforced mechanically in `safety.rs`; protected processes (Antigravity, Claude, Brave, rustc, system services) can never be frozen
+- **Disciplined deploys** — 3-gate guard requires test-diff evidence + pre-snap baseline + post-90s sanity check (AIS ≥ 87) before allowing a binary swap
 
 ## Architecture
 
@@ -34,21 +51,21 @@ The daemon hot loop is decomposed into ~30 independent `tick` modules (Strangler
 
 ## Cognitive System
 
-11 lock-free LSE counters end-to-end in `runtime_metrics.json`. Each counter corresponds to one wired learning phase. Counters that are 0 are not bugs — they are wired-dormant by design until their trigger fires (Crisis arousal, thermal transition, scorer/gate disagreement, etc).
+11 lock-free LSE counters publish end-to-end through `runtime_metrics.json`. Each counter corresponds to one wired learning phase. Counters that read 0 are not bugs — they are wired-dormant by design until their trigger fires (Crisis arousal, thermal transition, scorer/gate disagreement, etc).
 
-| # | Phase | Counter | Purpose | Live (Sprint 11) |
-|---|---|---|---|---|
-| 3.1 | Skill-Aware Prediction | `skill_aware_modulations_total` | Weights trial skills by historical success per workload | firing |
-| 3.2 | Arousal-Based Decay | `arousal_decay_accelerations_total` | Crisis flushes NARS beliefs faster (McGaugh 2004) | dormant — awaits Crisis arousal |
-| 3.3 | Companion Graph | `companion_cross_group_inferences_total` | Directional `P(proc \| fg_app)` via Lift normalization | firing |
-| 4.1 | Adaptive Drift Threshold | `adaptive_drift_threshold_raises_total` | Welford online variance, self-calibrating drift sensitivity | firing |
-| 4.2 | Causal External Blame | `causal_external_thermal_blames_total` | Discounts impact score by 0.30 when thermal confounder present | dormant — awaits thermal transition |
-| 4.3 | Policy Rollback | `policy_rollback_evaluations_total` | Reverts learned params when AIS quality < 0.35 | dormant — awaits zone_alpha mutation |
-| 5.1 | User Presence | `user_presence_suppressions_total` | Idle/HID-rate/sleep-assertion 3-tier modulator with pressure≥0.65 bypass | firing |
-| 5.2 | Battery-Aware Cost | `battery_aware_penalty_emissions_total` | Penalizes wakeup/ctx-switch noise on battery | conditional (fires on battery) |
-| 5.3 | Journal Rationale | `journal_rationales_attached_total` | Attaches `{action_class, trigger, evidence, expected_outcome}` to every journaled action | firing |
-| C-1 | Scorer Override Reject | `scorer_override_rejects_total` | Asymmetric ±0.30 cutover — scorer can BLOCK gate-accepts when composite < -0.30 | dormant — awaits high-confidence disagreement |
-| C-2 | Scorer Disagreement | `scorer_disagreement_strong_accepts_total` | Logs gate-rejects the scorer wanted to accept (NEVER overrides — Sprint 12 promotion gate) | dormant |
+| Phase | Counter | Purpose |
+|---|---|---|
+| Skill-Aware Prediction | `skill_aware_modulations_total` | Weights trial skills by historical success per workload |
+| Arousal-Based Decay | `arousal_decay_accelerations_total` | Crisis flushes NARS beliefs faster (McGaugh 2004) |
+| Companion Graph | `companion_cross_group_inferences_total` | Directional `P(proc \| fg_app)` via Lift normalization |
+| Adaptive Drift Threshold | `adaptive_drift_threshold_raises_total` | Welford online variance, self-calibrating drift sensitivity |
+| Causal External Blame | `causal_external_thermal_blames_total` | Discounts impact score by 0.30 when thermal confounder present |
+| Policy Rollback | `policy_rollback_evaluations_total` | Reverts learned params when AIS quality < 0.35 |
+| User Presence | `user_presence_suppressions_total` | Idle/HID/sleep-assertion 3-tier modulator with pressure≥0.65 bypass |
+| Battery-Aware Cost | `battery_aware_penalty_emissions_total` | Penalizes wakeup/ctx-switch noise on battery |
+| Journal Rationale | `journal_rationales_attached_total` | Attaches evidence-based reasoning metadata to every action |
+| Scorer Override Reject | `scorer_override_rejects_total` | Asymmetric ±0.30 cutover — scorer can BLOCK gate-accepts |
+| Scorer Disagreement | `scorer_disagreement_strong_accepts_total` | Logs gate-rejects the scorer wanted to accept (never overrides) |
 
 ### Academic foundation
 
@@ -67,8 +84,8 @@ The daemon hot loop is decomposed into ~30 independent `tick` modules (Strangler
 
 - **Never freeze**: `kernel_task`, `launchd`, `WindowServer`, `Spotlight (mds)`, `configd`, `Antigravity`, `Claude`, `Brave/Chromium*` (Brave IPC contract), `rustc` / `cargo` during active builds
 - **Cascade bypass**: `user_presence_modulator` returns `1.0×` (full optimization) when `memory_pressure ≥ 0.65`, regardless of HID activity or sleep assertion — survival beats UX politeness
-- **Asymmetric scorer**: PolicyScorer may BLOCK a gate-accept (safe direction) but is NEVER allowed to override a gate-reject (unsafe direction) — Sprint 12 may promote to symmetric after N≥500 disagreement events
-- **Supervision mode** (`CLAUDE.md`): no sprint declared "closed" without mechanical re-verification of `runtime_metrics.json` + adversarial diff re-read + N≥500 sample size
+- **Asymmetric scorer**: PolicyScorer may BLOCK a gate-accept (safe direction) but is NEVER allowed to override a gate-reject (unsafe direction)
+- **Supervision mode** (`CLAUDE.md`): no work declared "complete" without mechanical re-verification of `runtime_metrics.json` + adversarial diff re-read + N≥500 sample size
 
 ## Quick start
 
@@ -76,7 +93,7 @@ The daemon hot loop is decomposed into ~30 independent `tick` modules (Strangler
 # Build (release: target-cpu=native, LTO, panic=abort)
 cargo build --release
 
-# Install as root daemon (compiles, codesign-preserving cp to /usr/local/libexec, launchd bootstrap)
+# Install as root daemon (codesign-preserving cp to /usr/local/libexec, launchd bootstrap)
 sudo ./scripts/install-root-daemon.sh
 
 # Status + cognitive health
@@ -107,14 +124,6 @@ sudo ./scripts/uninstall-root-daemon.sh
 
 Binary swap uses `sudo cp` to preserve the linker-signed flag (do NOT use `python3 open().write()` — it strips the codesign and triggers Launch Constraint Violation).
 
-## Status — Sprint 11 finale
-
-- **Master HEAD**: `1d0bd02`
-- **AIS**: 94.79 S-tier (peak 95.26 post-D deploy)
-- **Reliability**: 0 failures, p95 67ms cycle latency
-- **Counters**: 11/11 propagating end-to-end through LSE → RuntimeMetrics → JSON; 5 firing live, 6 wired-dormant by design awaiting their real triggers
-- **Last delta**: Sprint 11 finale landed Phase 3.2 stress test, Phase 5.1-D HID rate real producer, and Phase C asymmetric scorer cutover (-0.30 threshold) via 3 parallel git-worktree agents with NotebookLM-mandated split deploys (E → D → C, never batched)
-
 ## Repository layout
 
 ```
@@ -144,7 +153,3 @@ Avoid running multiple `cargo` commands concurrently — they contend on the sha
 ## License
 
 See `LICENSE` (TBD).
-
----
-
-For internal architecture details and the full sprint history, see `CLAUDE.md` and the memory index at `~/.claude/projects/.../memory/MEMORY.md`.
