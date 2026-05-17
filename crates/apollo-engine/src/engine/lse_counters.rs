@@ -437,9 +437,11 @@ pub struct LockFreeMetrics {
     /// [Hellerstein 2004 §9] disturbance rejection in closed-loop systems.
     pub purge_inhibition_skips_total: AtomicU64,
 
-    /// Sprint 12 Convergence #4 (2026-05-17). Counts cycles where:
-    ///   1. `scorer_override_rejects_total` incremented this cycle
-    ///   2. `CausalGraph::has_recent_external_event(ThermalThrottle, …)` true
+    /// Sprint 12 Convergence #4 (2026-05-17). Counts cycles where
+    /// `scorer_override_rejects_total` incremented AND
+    /// `CausalGraph::has_recent_external_event(ThermalThrottle, …)`
+    /// returned true in the same iteration.
+    ///
     /// The conjunction proves the policy scorer disagreed with the gate
     /// in the same window the SoC was thermally throttled — strong
     /// evidence the *learned* policy is misbehaving under thermal stress
@@ -447,6 +449,7 @@ pub struct LockFreeMetrics {
     /// PolicyRollbackGuard should respond with elevated sensitivity
     /// (lower quality threshold) since the policy has lost authority to
     /// physical reality. Producer = daemon main loop convergence probe.
+    ///
     /// [Pearl 2009 §3] confounder adjustment + [Sutton 2018 §11.7]
     /// model-free policy correction.
     pub causal_thermal_scorer_override_alignments_total: AtomicU64,

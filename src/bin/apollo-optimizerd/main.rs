@@ -1218,6 +1218,14 @@ fn main() -> anyhow::Result<()> {
             // causal graph would see N "external events" per N cycles in
             // a sustained throttle, swamping the attribution model.
             let mut prev_thermal_throttling: bool = false;
+            // Sprint 12 Convergence #4 (2026-05-17). Per-cycle delta of
+            // `scorer_override_rejects_total`. When the delta is positive AND
+            // the causal graph has a recent ThermalThrottle blame inside
+            // EXTERNAL_BLAME_WINDOW, we bump
+            // `causal_thermal_scorer_override_alignments_total` — the
+            // unique signal that learned policy is misbehaving under
+            // thermal stress (vs benign disagreement).
+            let mut prev_scorer_override_rejects: u64 = 0;
             // Batch buffer: accumulate N push messages before a single write syscall.
             // macOS Unix socket SO_SNDBUF = 8192 bytes. Batch=16×~64=~1KB stays well
             // under the 8KB limit so write_all never blocks. Empirically optimal.
@@ -3663,6 +3671,35 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                     prev_thermal_throttling = thermal_throttling_now;
+                }
+
+                // Sprint 12 Convergence #4 (2026-05-17). Real-time
+                // architect probe: did the scorer override fire this
+                // cycle AND was a thermal-throttle event recorded inside
+                // EXTERNAL_BLAME_WINDOW? When both are true, the
+                // learned policy disagreed with the gate during the
+                // exact window the SoC was thermally throttled — the
+                // strongest evidence available that the policy itself
+                // is misbehaving (vs the gate, vs the thermal sensor).
+                // [Pearl 2009 §3] confounder adjustment; [Sutton & Barto
+                // 2018 §11.7] model-free policy correction.
+                {
+                    let cur_override_rejects = apollo_engine::engine::lse_counters::LSE_COUNTERS
+                        .scorer_override_rejects_total
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let delta = cur_override_rejects.saturating_sub(prev_scorer_override_rejects);
+                    if delta > 0
+                        && lctx.causal_graph.has_recent_external_event(
+                            apollo_engine::engine::causal_graph::ExternalEventKind::ThermalThrottle,
+                            std::time::SystemTime::now(),
+                        )
+                    {
+                        for _ in 0..delta {
+                            apollo_engine::engine::lse_counters::LSE_COUNTERS
+                                .inc_causal_thermal_scorer_override_alignment();
+                        }
+                    }
+                    prev_scorer_override_rejects = cur_override_rejects;
                 }
 
                 // Sprint 12 Convergence #5 (2026-05-17). Same formula G12 uses
