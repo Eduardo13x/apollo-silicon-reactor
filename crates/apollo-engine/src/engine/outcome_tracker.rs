@@ -1215,7 +1215,7 @@ impl OutcomeTracker {
                 )
             })
             .collect();
-        groups.sort_by(|a, b| b.2.cmp(&a.2)); // by throttle count descending
+        groups.sort_by_key(|b| std::cmp::Reverse(b.2)); // by throttle count descending
         groups
     }
 

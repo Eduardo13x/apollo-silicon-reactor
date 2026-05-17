@@ -138,7 +138,7 @@ pub fn compute_budgets(total_ram: u64, processes: &[ProcessBudgetInput]) -> Vec<
     }
 
     // Sort: most over-budget first (for priority enforcement).
-    budgets.sort_by(|a, b| b.excess_bytes.cmp(&a.excess_bytes));
+    budgets.sort_by_key(|b| std::cmp::Reverse(b.excess_bytes));
     budgets
 }
 

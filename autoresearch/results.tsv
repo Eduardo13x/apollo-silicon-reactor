@@ -1,2 +1,4 @@
 iter	commit	composite	delta	clippy	wired	tests	ais	status	change
 0	BASELINE	2747	0	278	6	2083	94	baseline	initial state
+1	eba1529	2983	236	160	6	2083	94	keep	cargo clippy --fix sweep
+2	-	2983	0	160	6	2083	94	discard	re-run clippy --fix (no change)
