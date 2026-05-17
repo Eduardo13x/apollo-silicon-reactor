@@ -66,6 +66,13 @@ else
                 || true)
   fi
   if [ -z "$TEST_DIFF" ]; then
+    # Merge commits have no diff under `git show HEAD`. Walk the last 3
+    # parent commits to surface tests added by the merged branches.
+    TEST_DIFF=$(git log -3 --unified=0 -p --no-merges -- '*.rs' 2>/dev/null \
+                | grep -E '^\+.*(#\[test\]|fn test_|#\[tokio::test\])' \
+                | head -5 || true)
+  fi
+  if [ -z "$TEST_DIFF" ]; then
     red "[gate-1] FAILED: no #[test] added/modified in HEAD or staged diff."
     red "[gate-1] The Disobedience Rule (CLAUDE.md) requires a failing test"
     red "[gate-1] before the fix. Re-run with --skip-test-check to override,"
