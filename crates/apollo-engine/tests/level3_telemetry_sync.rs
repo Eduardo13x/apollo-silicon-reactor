@@ -381,3 +381,59 @@ fn phase4_3_1_specialist_accuracy_purge_inhibitions_round_trip() {
         json
     );
 }
+
+/// Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16) — round-trip
+/// test for the asymmetric scorer/gate disagreement counters. Mirrors the
+/// Phase 5.1 / 5.3 pattern: bump the lock-free counter, snapshot, sync into
+/// `RuntimeMetrics`, and prove the value survives to the serialized JSON
+/// the operator reads.
+///
+/// Tests both counters in one #[test] (single LockFreeMetrics instance)
+/// since they share the same wiring shape and skipping one would still
+/// pass an "additive" wiring bug — interleaving here catches the case
+/// where someone copy-pasted a sync line and forgot to rename the field.
+#[test]
+fn phase_c_scorer_override_counters_reach_runtime_metrics_json() {
+    let lf = LockFreeMetrics::new();
+    // Distinct, non-trivial values so a swap or off-by-one bug fails loudly.
+    for _ in 0..7 {
+        lf.inc_scorer_override_reject();
+    }
+    for _ in 0..13 {
+        lf.inc_scorer_disagreement_strong_accept();
+    }
+    lf.commit();
+
+    let snap = lf.snapshot();
+    assert_eq!(
+        snap.scorer_override_rejects_total, 7,
+        "lock-free snapshot dropped scorer_override_rejects_total"
+    );
+    assert_eq!(
+        snap.scorer_disagreement_strong_accepts_total, 13,
+        "lock-free snapshot dropped scorer_disagreement_strong_accepts_total"
+    );
+
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+    assert_eq!(
+        state.metrics.scorer_override_rejects_total, 7,
+        "sync_from_lockfree did not flush scorer_override_rejects_total"
+    );
+    assert_eq!(
+        state.metrics.scorer_disagreement_strong_accepts_total, 13,
+        "sync_from_lockfree did not flush scorer_disagreement_strong_accepts_total"
+    );
+
+    let json = serde_json::to_string(&state.metrics).expect("serialize RuntimeMetrics");
+    assert!(
+        json.contains("\"scorer_override_rejects_total\":7"),
+        "scorer_override_rejects_total absent/wrong in JSON: {}",
+        json
+    );
+    assert!(
+        json.contains("\"scorer_disagreement_strong_accepts_total\":13"),
+        "scorer_disagreement_strong_accepts_total absent/wrong in JSON: {}",
+        json
+    );
+}

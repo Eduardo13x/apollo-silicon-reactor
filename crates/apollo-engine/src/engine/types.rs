@@ -491,14 +491,30 @@ impl RootAction {
     pub fn decision_reason(&self) -> &crate::engine::audit_types::DecisionReason {
         use RootAction::*;
         match self {
-            BoostProcess { decision_reason, .. }
-            | ThrottleProcess { decision_reason, .. }
-            | FreezeProcess { decision_reason, .. }
-            | UnfreezeProcess { decision_reason, .. }
-            | SetMemorystatus { decision_reason, .. }
-            | ToggleSpotlight { decision_reason, .. }
-            | QuarantineDaemon { decision_reason, .. }
-            | SetThreadQoS { decision_reason, .. } => decision_reason,
+            BoostProcess {
+                decision_reason, ..
+            }
+            | ThrottleProcess {
+                decision_reason, ..
+            }
+            | FreezeProcess {
+                decision_reason, ..
+            }
+            | UnfreezeProcess {
+                decision_reason, ..
+            }
+            | SetMemorystatus {
+                decision_reason, ..
+            }
+            | ToggleSpotlight {
+                decision_reason, ..
+            }
+            | QuarantineDaemon {
+                decision_reason, ..
+            }
+            | SetThreadQoS {
+                decision_reason, ..
+            } => decision_reason,
             SetSysctl(action) => action.decision_reason(),
         }
     }
@@ -1808,6 +1824,47 @@ pub struct RuntimeMetrics {
     /// and Nonrandomized Studies" — intervention vs confounder distinction.
     #[serde(default)]
     pub specialist_accuracy_purge_inhibitions_total: u64,
+
+    /// Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16).
+    /// Cumulative count of actions where the gate tower ACCEPTED a
+    /// candidate but the [`crate::engine::action_policy::PolicyScorer`]
+    /// returned a composite score strictly less than −0.30 (strong
+    /// reject) — the asymmetric partial cutover deferred to the scorer
+    /// and the action was REJECTED. A `BlockedActionEvent` is also
+    /// emitted with `BlockerKind::Other("scorer-override-accept-to-reject")`
+    /// so offline tooling can correlate the override with t+30s
+    /// outcomes (did the system regress? did pressure spike?).
+    ///
+    /// Flushed each cycle from
+    /// [`crate::engine::lse_counters::LockFreeMetrics::scorer_override_rejects_total`]
+    /// via `sync_from_lockfree`. Mirrors the Phase 3.1 / 5.2 tilt-counter
+    /// pattern so dashboards can verify the partial cutover actually
+    /// engages instead of silently no-op'ing — the "tautology trap"
+    /// mitigation CLAUDE.md flags.
+    ///
+    /// [Nygard 2018 §8.5] — adaptive capacity limits via shadowing.
+    #[serde(default)]
+    pub scorer_override_rejects_total: u64,
+
+    /// Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16).
+    /// Cumulative count of actions where the gate tower REJECTED a
+    /// candidate and the [`crate::engine::action_policy::PolicyScorer`]
+    /// returned a composite score strictly greater than +0.30 (strong
+    /// accept). Per NotebookLM 2026-05-16 Candidate-C verdict, the
+    /// asymmetric mode does NOT let the scorer beat the gate in the
+    /// unsafe direction — the action stays REJECTED and we ONLY
+    /// journal the disagreement (`BlockerKind::Other("scorer-disagreement-strong-accept")`)
+    /// so Sprint 12 can decide whether to promote to symmetric cutover
+    /// after N≥500 events of evidence.
+    ///
+    /// Flushed each cycle from
+    /// [`crate::engine::lse_counters::LockFreeMetrics::scorer_disagreement_strong_accepts_total`]
+    /// via `sync_from_lockfree`.
+    ///
+    /// [Nygard 2018 §8.5]; [Bengio 2013] — counterfactual reasoning
+    /// requires observing the rejected path.
+    #[serde(default)]
+    pub scorer_disagreement_strong_accepts_total: u64,
 }
 
 impl RuntimeMetrics {

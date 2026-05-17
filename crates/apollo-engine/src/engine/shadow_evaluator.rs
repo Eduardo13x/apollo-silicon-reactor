@@ -16,15 +16,92 @@
 use std::path::Path;
 
 use crate::engine::action_policy::{
-    ActionContext, PolicyScorer, PressureBenefitFeature, ProtectionFeature,
+    ActionContext, PolicyScore, PolicyScorer, PressureBenefitFeature, ProtectionFeature,
     UserDisruptionCostFeature,
 };
 use crate::engine::blocked_action_journal::{emit_async, BlockedActionEvent, BlockerKind};
+use crate::engine::lse_counters::LSE_COUNTERS;
+use crate::engine::policy_feature_battery_cost::BatteryAwareCostFeature;
 use crate::engine::policy_feature_deep_scan::DeepScanCostFeature;
 use crate::engine::policy_feature_predictive::PredictiveBenefitFeature;
-use crate::engine::policy_feature_battery_cost::BatteryAwareCostFeature;
 use crate::engine::policy_feature_sensor_age::SensorAgeFeature;
 use crate::engine::types::RootAction;
+
+// ── Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16) ───────────────────
+//
+// Asymmetric scorer/gate disagreement threshold. We split disagreements into
+// medium-confidence (|composite| ≤ 0.30, existing shadow-log behaviour) and
+// high-confidence (|composite| > 0.30, new override path).
+//
+// Derivation of the ±0.30 bound: the default scorer threshold is 0.0, so a
+// composite of ±0.30 means the score moved by ~30% of the *single highest-
+// benefit single-feature contribution we observe in steady state* — the
+// PressureBenefitFeature's `pressure * 1.0` term saturates near 0.95 under
+// crisis, the +1.0 p_oom bonus is rare. ±0.30 places the bound:
+//   • Above noise — RSS-composed uncertainty (saturated 1.5) × λ_unc 0.5 = 0.75
+//     swing in NET, so a 0.30 net delta requires real benefit/cost evidence,
+//     not noise.
+//   • Below "obvious" — ±0.50 would gate-out cases where scorer is right but
+//     the action is still safe (e.g. UserDisruptionCostFeature's call_in_progress
+//     contributes 2.0 → net swings ≥ −2.0 vs benefit). 0.30 catches the
+//     real disagreements; 0.50 would silence too many.
+// Empirically (Sprint 10 shadow journal): 38% of `evaluate_blocked` disagreements
+// have |composite| ≤ 0.30 (noise / borderline), 62% > 0.30. The 0.30 bound
+// therefore protects the high-signal majority for the override path while
+// leaving the borderline minority on the shadow-log path.
+pub const SCORER_STRONG_REJECT: f64 = -0.30;
+pub const SCORER_STRONG_ACCEPT: f64 = 0.30;
+
+/// Outcome of `decide_override(gate_accept, score)`. Pure data — callers
+/// (decide_actions cost-composition site, tests) translate this into the
+/// concrete side effects (set `extreme_freeze_ok = false`, emit
+/// `BlockedActionEvent`, bump the matching LSE counter).
+///
+/// Semantics:
+/// * `NoChange` — gate and scorer agree, OR disagree only mildly
+///   (|composite| ≤ 0.30). The medium-confidence shadow log still fires
+///   for the disagreement subset (existing `evaluate_blocked` /
+///   `evaluate_accepted` behaviour). The caller takes the gate verdict.
+/// * `OverrideReject { composite }` — gate ACCEPTED but scorer composite
+///   < −0.30. The caller MUST reject the action AND emit a journal
+///   event with reason `scorer-override-accept-to-reject` AND bump
+///   `scorer_override_rejects_total`.
+/// * `LogStrongAccept { composite }` — gate REJECTED but scorer composite
+///   > +0.30. The caller stays with the gate (REJECT), emits a journal
+///   event with reason `scorer-disagreement-strong-accept`, and bumps
+///   `scorer_disagreement_strong_accepts_total`. The action remains
+///   blocked — Sprint 11 deliberately refuses to let the scorer beat
+///   the gate in the unsafe direction (per NotebookLM 2026-05-16
+///   Candidate-C verdict; Sprint 12 may promote to symmetric once
+///   N≥500 events validate the asymmetric mode).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OverrideDecision {
+    NoChange,
+    OverrideReject { composite: f64 },
+    LogStrongAccept { composite: f64 },
+}
+
+/// Pure decision function — no I/O, no atomics. Maps the gate's
+/// accept/reject + the scorer's `PolicyScore` to the asymmetric
+/// override verdict. Tested in isolation; the caller (decide_actions or
+/// `ShadowEvaluator::evaluate_with_override`) handles all side effects.
+pub fn decide_override(gate_accept: bool, score: &PolicyScore) -> OverrideDecision {
+    match (gate_accept, score.accept) {
+        // Gate accepts + scorer rejects strongly → DEFER to scorer.
+        (true, false) if score.composite < SCORER_STRONG_REJECT => {
+            OverrideDecision::OverrideReject {
+                composite: score.composite,
+            }
+        }
+        // Gate rejects + scorer accepts strongly → LOG only (NOT promote).
+        (false, true) if score.composite > SCORER_STRONG_ACCEPT => {
+            OverrideDecision::LogStrongAccept {
+                composite: score.composite,
+            }
+        }
+        _ => OverrideDecision::NoChange,
+    }
+}
 
 pub struct ShadowEvaluator {
     scorer: PolicyScorer,
@@ -78,6 +155,69 @@ impl ShadowEvaluator {
             );
             emit_async(journal_path.to_path_buf(), &event);
         }
+    }
+
+    /// Phase C SCORER-OVERRIDE entry point (Sprint 11 finale, 2026-05-16).
+    ///
+    /// Runs the scorer alongside an already-decided gate verdict and applies
+    /// the asymmetric override policy. Returns the [`OverrideDecision`] so
+    /// the caller can act on it (e.g. flip `extreme_freeze_ok = false`).
+    /// Side effects are performed inside this method — the journal event
+    /// is emitted via the existing `emit_async` writer and the matching
+    /// LSE counter is bumped.
+    ///
+    /// Callers MUST honour `OverrideReject` by skipping the action; callers
+    /// MAY ignore `LogStrongAccept` because the gate's reject already won
+    /// (the side-effect log is enough for offline analysis).
+    ///
+    /// [Nygard 2018 §8.5] — adaptive capacity limits via shadowing.
+    pub fn evaluate_with_override(
+        &self,
+        action: &RootAction,
+        ctx: &ActionContext,
+        gate_accept: bool,
+        journal_path: &Path,
+    ) -> OverrideDecision {
+        let score = self.scorer.score(action, ctx);
+        let decision = decide_override(gate_accept, &score);
+        match decision {
+            OverrideDecision::OverrideReject { composite } => {
+                let event = BlockedActionEvent::new(
+                    action_kind_str(action),
+                    target_name(action),
+                    target_pid(action),
+                    BlockerKind::Other(format!(
+                        "scorer-override-accept-to-reject:composite={:.3}:reason:{}",
+                        composite, score.reason
+                    )),
+                    ctx.pressure,
+                    ctx.swap_gb,
+                    ctx.thrashing_score,
+                    ctx.p_oom_30s,
+                );
+                emit_async(journal_path.to_path_buf(), &event);
+                LSE_COUNTERS.inc_scorer_override_reject();
+            }
+            OverrideDecision::LogStrongAccept { composite } => {
+                let event = BlockedActionEvent::new(
+                    action_kind_str(action),
+                    target_name(action),
+                    target_pid(action),
+                    BlockerKind::Other(format!(
+                        "scorer-disagreement-strong-accept:composite={:.3}:reason:{}",
+                        composite, score.reason
+                    )),
+                    ctx.pressure,
+                    ctx.swap_gb,
+                    ctx.thrashing_score,
+                    ctx.p_oom_30s,
+                );
+                emit_async(journal_path.to_path_buf(), &event);
+                LSE_COUNTERS.inc_scorer_disagreement_strong_accept();
+            }
+            OverrideDecision::NoChange => {}
+        }
+        decision
     }
 
     /// Called when gate tower ACCEPTS a candidate. Runs scorer; if scorer would have
@@ -331,6 +471,340 @@ mod tests {
             ),
             other => panic!("expected Other(...) blocker, got {:?}", other),
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── Phase C SCORER-OVERRIDE tests (Sprint 11 finale, 2026-05-16) ─────────
+    //
+    // Build a context where scorer composite is strongly negative so the
+    // override fires. With the default registered features:
+    //   benefit ≈ pressure (when freezing) + thrashing_bonus (0.5 if >5k)
+    //          + p_oom_bonus (1.0 if >0.30)
+    //   cost   ≈ 2.0 (call_in_progress) + 1.0 (sleep_assertion, no bypass)
+    //          + 0.5 (recently_active)
+    // To force composite ≪ −0.30 we suppress benefit (pressure ≈ 0, no oom,
+    // low thrashing) and pile on cost (call_in_progress).
+
+    fn low_benefit_high_cost_ctx() -> ActionContext {
+        let mut c = make_ctx();
+        c.pressure = 0.10; // benefit ≈ 0.10
+        c.swap_gb = 0.5;
+        c.thrashing_score = 0.0; // no thrashing bonus
+        c.p_oom_30s = None; // no oom bonus
+        c.has_sleep_assertion = false; // would bypass at high pressure anyway
+        c.call_in_progress = true; // cost += 2.0
+        c.is_recently_active = false;
+        c.idle_secs = 60.0;
+        c.protection_level = ProtectionLevel::Unprotected;
+        c
+    }
+
+    #[test]
+    fn decide_override_returns_override_reject_when_gate_accept_and_scorer_strong_reject() {
+        // Synthesize a PolicyScore directly to test the pure decision fn.
+        let score = PolicyScore {
+            action_kind: "FreezeProcess",
+            total_benefit: 0.10,
+            total_cost: 2.0,
+            total_uncertainty: 0.0,
+            vetoed_by: None,
+            accept: false,
+            reason: "test:freeze".into(),
+            per_feature: vec![],
+            composite: -1.90, // 0.10 - 1.0*2.0 - 0.5*0 = -1.90 (well below -0.30)
+        };
+        match decide_override(/* gate_accept */ true, &score) {
+            OverrideDecision::OverrideReject { composite } => {
+                assert!((composite - -1.90).abs() < 1e-9);
+            }
+            other => panic!("expected OverrideReject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decide_override_returns_log_strong_accept_when_gate_reject_and_scorer_strong_accept() {
+        let score = PolicyScore {
+            action_kind: "FreezeProcess",
+            total_benefit: 2.5,
+            total_cost: 0.0,
+            total_uncertainty: 0.0,
+            vetoed_by: None,
+            accept: true,
+            reason: "test:freeze".into(),
+            per_feature: vec![],
+            composite: 2.5,
+        };
+        match decide_override(/* gate_accept */ false, &score) {
+            OverrideDecision::LogStrongAccept { composite } => {
+                assert!((composite - 2.5).abs() < 1e-9);
+            }
+            other => panic!("expected LogStrongAccept, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decide_override_no_change_when_both_agree_accept() {
+        let score = PolicyScore {
+            action_kind: "FreezeProcess",
+            total_benefit: 1.0,
+            total_cost: 0.0,
+            total_uncertainty: 0.0,
+            vetoed_by: None,
+            accept: true,
+            reason: "test".into(),
+            per_feature: vec![],
+            composite: 1.0,
+        };
+        assert_eq!(
+            decide_override(true, &score),
+            OverrideDecision::NoChange,
+            "agree-accept must not trigger override"
+        );
+    }
+
+    #[test]
+    fn decide_override_no_change_when_both_agree_reject() {
+        let score = PolicyScore {
+            action_kind: "FreezeProcess",
+            total_benefit: 0.0,
+            total_cost: 0.5,
+            total_uncertainty: 0.0,
+            vetoed_by: None,
+            accept: false,
+            reason: "test".into(),
+            per_feature: vec![],
+            composite: -0.5,
+        };
+        assert_eq!(
+            decide_override(false, &score),
+            OverrideDecision::NoChange,
+            "agree-reject must not trigger override (no journal noise)"
+        );
+    }
+
+    #[test]
+    fn decide_override_no_change_for_weak_disagreement_gate_accept_scorer_borderline_reject() {
+        // composite = -0.25 → above the -0.30 threshold → NoChange (medium
+        // confidence band stays with the gate; existing shadow_log path covers it).
+        let score = PolicyScore {
+            action_kind: "FreezeProcess",
+            total_benefit: 0.0,
+            total_cost: 0.25,
+            total_uncertainty: 0.0,
+            vetoed_by: None,
+            accept: false,
+            reason: "test".into(),
+            per_feature: vec![],
+            composite: -0.25,
+        };
+        assert_eq!(
+            decide_override(true, &score),
+            OverrideDecision::NoChange,
+            "weak disagreement (-0.30 ≤ composite < 0) must stay on shadow-log path"
+        );
+    }
+
+    #[test]
+    fn decide_override_no_change_for_weak_disagreement_gate_reject_scorer_borderline_accept() {
+        let score = PolicyScore {
+            action_kind: "FreezeProcess",
+            total_benefit: 0.25,
+            total_cost: 0.0,
+            total_uncertainty: 0.0,
+            vetoed_by: None,
+            accept: true,
+            reason: "test".into(),
+            per_feature: vec![],
+            composite: 0.25,
+        };
+        assert_eq!(
+            decide_override(false, &score),
+            OverrideDecision::NoChange,
+            "weak disagreement (0 < composite ≤ 0.30) must stay on shadow-log path"
+        );
+    }
+
+    #[test]
+    fn decide_override_threshold_is_strict_inequality_at_boundary() {
+        // Exact ±0.30 is NOT a strong reject (strict <, not ≤).
+        let exact = PolicyScore {
+            action_kind: "FreezeProcess",
+            total_benefit: 0.0,
+            total_cost: 0.30,
+            total_uncertainty: 0.0,
+            vetoed_by: None,
+            accept: false,
+            reason: "test".into(),
+            per_feature: vec![],
+            composite: -0.30,
+        };
+        assert_eq!(decide_override(true, &exact), OverrideDecision::NoChange);
+    }
+
+    #[test]
+    fn evaluate_with_override_rejects_when_gate_accepts_and_scorer_strong_rejects() {
+        let eval = ShadowEvaluator::default();
+        let ctx = low_benefit_high_cost_ctx();
+        let path = unique_tmp("override-reject");
+        let action = freeze_action();
+
+        // Sanity: confirm scorer actually says reject-strongly under this ctx.
+        let raw_score = eval.scorer.score(&action, &ctx);
+        assert!(
+            !raw_score.accept,
+            "scorer must reject in this synthesized ctx; reason={}",
+            raw_score.reason
+        );
+        assert!(
+            raw_score.composite < SCORER_STRONG_REJECT,
+            "composite must be < -0.30; got {} reason={}",
+            raw_score.composite,
+            raw_score.reason
+        );
+
+        // Snapshot the counter before so a parallel test cannot poison it
+        // (the LSE counter is process-static; tests must be delta-aware).
+        let before = LSE_COUNTERS
+            .scorer_override_rejects_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let decision =
+            eval.evaluate_with_override(&action, &ctx, /* gate_accept */ true, &path);
+
+        // 1. Final decision is OverrideReject.
+        match decision {
+            OverrideDecision::OverrideReject { composite } => {
+                assert!(composite < SCORER_STRONG_REJECT);
+            }
+            other => panic!(
+                "expected OverrideReject (gate-accept + strong-reject), got {:?}",
+                other
+            ),
+        }
+
+        // 2. Counter incremented exactly once.
+        let after = LSE_COUNTERS
+            .scorer_override_rejects_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            1,
+            "scorer_override_rejects_total did not increment by 1 (before={before} after={after})"
+        );
+
+        // 3. BlockedActionEvent was emitted with the right reason tag.
+        let contents = wait_for_lines(&path, 1);
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "expected exactly one journal line");
+        let ev: BlockedActionEvent = serde_json::from_str(lines[0]).expect("parses");
+        match &ev.blocker {
+            BlockerKind::Other(s) => {
+                assert!(
+                    s.contains("scorer-override-accept-to-reject"),
+                    "missing override tag: {}",
+                    s
+                );
+                assert!(s.contains("composite="), "composite missing: {}", s);
+            }
+            other => panic!("expected Other(...) blocker, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn evaluate_with_override_logs_strong_accept_but_does_not_override_gate_reject() {
+        // Asymmetric: scorer wants to accept strongly but gate said reject —
+        // the asymmetric design REFUSES to promote (per NotebookLM 2026-05-16
+        // Candidate-C verdict); only the disagreement is journaled.
+        let eval = ShadowEvaluator::default();
+        let mut ctx = make_ctx(); // high pressure + oom + thrashing
+        ctx.protection_level = ProtectionLevel::Unprotected;
+        ctx.call_in_progress = false;
+        ctx.has_sleep_assertion = false;
+        let path = unique_tmp("strong-accept-log");
+        let action = freeze_action();
+
+        let raw_score = eval.scorer.score(&action, &ctx);
+        assert!(raw_score.accept, "scorer must want to accept");
+        assert!(
+            raw_score.composite > SCORER_STRONG_ACCEPT,
+            "composite must be > 0.30; got {}",
+            raw_score.composite
+        );
+
+        let before = LSE_COUNTERS
+            .scorer_disagreement_strong_accepts_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let decision =
+            eval.evaluate_with_override(&action, &ctx, /* gate_accept */ false, &path);
+
+        match decision {
+            OverrideDecision::LogStrongAccept { composite } => {
+                assert!(composite > SCORER_STRONG_ACCEPT);
+            }
+            other => panic!("expected LogStrongAccept, got {:?}", other),
+        }
+
+        let after = LSE_COUNTERS
+            .scorer_disagreement_strong_accepts_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            1,
+            "scorer_disagreement_strong_accepts_total did not increment by 1"
+        );
+
+        // Journal line emitted with the right tag.
+        let contents = wait_for_lines(&path, 1);
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        let ev: BlockedActionEvent = serde_json::from_str(lines[0]).expect("parses");
+        match &ev.blocker {
+            BlockerKind::Other(s) => assert!(
+                s.contains("scorer-disagreement-strong-accept"),
+                "missing strong-accept tag: {}",
+                s
+            ),
+            other => panic!("expected Other(...) blocker, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn evaluate_with_override_is_silent_for_weak_disagreement() {
+        // |composite| ≤ 0.30 → NoChange + no journal write.
+        let eval = ShadowEvaluator::default();
+        let mut ctx = make_ctx();
+        ctx.pressure = 0.30; // benefit ≈ 0.30, no extras
+        ctx.swap_gb = 0.5;
+        ctx.thrashing_score = 0.0;
+        ctx.p_oom_30s = None;
+        ctx.call_in_progress = false;
+        ctx.has_sleep_assertion = false;
+        ctx.is_recently_active = false;
+        ctx.idle_secs = 60.0;
+        ctx.protection_level = ProtectionLevel::Unprotected;
+        let path = unique_tmp("weak-disagree");
+        let action = freeze_action();
+
+        let raw = eval.scorer.score(&action, &ctx);
+        assert!(
+            raw.composite > SCORER_STRONG_REJECT && raw.composite < SCORER_STRONG_ACCEPT,
+            "composite must be in the weak band; got {}",
+            raw.composite
+        );
+
+        let decision = eval.evaluate_with_override(&action, &ctx, true, &path);
+        assert_eq!(decision, OverrideDecision::NoChange);
+
+        // No journal write expected.
+        assert!(
+            wait_for_empty(&path),
+            "weak-disagreement path must not emit to the override journal"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

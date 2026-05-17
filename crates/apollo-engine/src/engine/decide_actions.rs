@@ -1230,8 +1230,90 @@ pub fn decide_actions(
                     shadow_disagreements_path(),
                 );
             }
-            let extreme_freeze_ok =
+            let mut extreme_freeze_ok =
                 (gate_a || gate_b || gate_c || gate_d || gate_e) && !freeze_skip_by_user;
+
+            // Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16):
+            // asymmetric partial cutover. When the gate tower has just
+            // ACCEPTED the freeze class (`extreme_freeze_ok = true`), let
+            // the PolicyScorer cross-check the SAME class-level probe. If
+            // it composes a strongly-negative score (< -0.30 = strong
+            // reject), DEFER to the scorer and flip the class verdict to
+            // reject — bumping `scorer_override_rejects_total` and
+            // emitting a `BlockedActionEvent` with reason
+            // `scorer-override-accept-to-reject` so offline correlation
+            // can validate the override against t+30s outcomes.
+            //
+            // Asymmetry rationale (NotebookLM 2026-05-16, Candidate-C
+            // verdict): the scorer is ALLOWED to block in the safe
+            // direction (catches gate over-aggression) but NEVER to
+            // override a gate block (which would be unsafe before the
+            // shadow-mode population threshold is met). Symmetric cutover
+            // is a Sprint 12 candidate after N≥500 events.
+            //
+            // The scorer-rejects-strongly path on `gate REJECTS` (the
+            // `freeze_skip_by_user` branch above) is covered by the
+            // existing `shadow_evaluator_cell().evaluate_blocked(...)`
+            // call site at lines 1226-1231 — the override gate here
+            // adds the gate-ACCEPT-flip path.
+            //
+            // [Nygard 2018 §8.5] adaptive capacity limits via shadowing.
+            if extreme_freeze_ok {
+                let probe = RootAction::freeze_full(
+                    0,
+                    "<scorer-override-probe>",
+                    "scorer-override-probe",
+                    0,
+                    0,
+                    DecisionReason::PressureContext,
+                );
+                let ctx = ActionContext {
+                    pressure: snapshot.pressure.memory_pressure,
+                    swap_gb: snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    thrashing_score: snapshot.pressure.thrashing_score,
+                    p_oom_30s: crate::engine::shadow_signals::get_p_oom_30s(),
+                    p_jank_60s: crate::engine::shadow_signals::get_p_jank_60s(),
+                    has_sleep_assertion: user_ctx.has_sleep_assertion,
+                    call_in_progress: user_ctx.call_in_progress,
+                    idle_secs: user_ctx.idle_secs,
+                    foreground_pid: crate::engine::shadow_signals::get_foreground_pid(),
+                    is_foreground_family: false,
+                    is_recently_active: user_ctx.is_recently_active(),
+                    thermal_emergency: crate::engine::shadow_signals::get_thermal_emergency(),
+                    interrupt_phase: crate::engine::shadow_signals::get_interrupt_phase(),
+                    protection_level: ProtectionLevel::Unprotected,
+                    hot_page_fraction: crate::engine::shadow_signals::get_max_hot_page_fraction(),
+                    wss_mb: crate::engine::shadow_signals::get_max_wss_mb(),
+                    sensor_age_ms: {
+                        let age = (chrono::Utc::now() - snapshot.timestamp).num_milliseconds();
+                        if age < 0 {
+                            Some(0u64)
+                        } else {
+                            Some(age as u64)
+                        }
+                    },
+                    epistemic_uncertainty: crate::engine::shadow_signals::get_epistemic_uncertainty(
+                    ),
+                    is_on_battery: crate::engine::shadow_signals::get_is_on_battery(),
+                    wakeups_per_sec: crate::engine::shadow_signals::get_wakeups_per_sec(),
+                    ctx_switches_per_sec: crate::engine::shadow_signals::get_ctx_switches_per_sec(),
+                };
+                let decision = shadow_evaluator_cell().evaluate_with_override(
+                    &probe,
+                    &ctx,
+                    /* gate_accept */ true,
+                    shadow_disagreements_path(),
+                );
+                if matches!(
+                    decision,
+                    crate::engine::shadow_evaluator::OverrideDecision::OverrideReject { .. }
+                ) {
+                    // Defer to scorer — flip the class verdict.
+                    extreme_freeze_ok = false;
+                    freeze_gate = "scorer-override".to_string();
+                }
+            }
+
             if extreme_freeze_ok {
                 // Severity cascade: gate_d ("swap-oom" with p_oom_30s evidence) wins
                 // over gate_e ("swap-pct" pure-physical) when both fire, preserving
