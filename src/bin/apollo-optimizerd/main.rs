@@ -2738,6 +2738,14 @@ fn main() -> anyhow::Result<()> {
                 // here) — avoids mid-loop reset bug dac6de9 that corrupted ODE models.
                 // Phase 0c sub-stage: time run_signal_tick (Kalman MV8 + CUSUM +
                 // Entropy + Hazard + LV + MPC — the 666-LoC inline block).
+                // Phase D PURGE-INHIBITION (Sprint 12 candidate #1, 2026-05-17):
+                // tell the swap predictor to skip this cycle if a vm_purge fired
+                // in the last 5s. Without this gate the post-purge artificial
+                // dip is learned as a load improvement and Kalman/Hazard/MPC
+                // cool down OOM risk artificially.
+                // [Hellerstein 2004 §9] disturbance rejection.
+                lctx.signal_intel.purge_inhibited =
+                    maintenance_state.is_in_purge_inhibition_window();
                 let _t_signal_start = Instant::now();
                 let daemon_signal_tick::SignalTickOutput {
                     signal_digest,
