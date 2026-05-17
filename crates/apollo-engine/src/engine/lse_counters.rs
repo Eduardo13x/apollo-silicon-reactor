@@ -148,6 +148,17 @@ pub struct LockFreeMetrics {
     pub maintenance_purge_skipped_idle_total: AtomicU64,
     pub maintenance_purge_skipped_build_mode_total: AtomicU64,
     pub maintenance_purge_skipped_rate_limit_total: AtomicU64,
+    /// Sprint 12 Convergence #5 (2026-05-17). Maintenance purge skipped
+    /// because the unified-memory bus is saturated. On M1 without the
+    /// IOReport private entitlement `amc_bandwidth_pct == 0.0` (dead
+    /// signal), so callers should compute saturation from the alive
+    /// fallback chain — `signal_digest.entropy_anomaly > 2.0` is the
+    /// same proxy G12 already uses for DRAM backpressure. Purging while
+    /// the bus is busy induces user-visible jank because vm_purge
+    /// contends with whatever is driving the bandwidth (typically LLM
+    /// inference traffic). [Hennessy & Patterson 2017 §2.2] unified
+    /// memory contention.
+    pub maintenance_purge_skipped_bus_saturated_total: AtomicU64,
 
     /// Phase 1 production-grade Change B (taskinfo cache, 2026-05-16).
     /// Track hit/miss/evict so dashboards can verify the 4-cycle reuse
@@ -492,6 +503,7 @@ impl LockFreeMetrics {
             maintenance_purge_skipped_idle_total: AtomicU64::new(0),
             maintenance_purge_skipped_build_mode_total: AtomicU64::new(0),
             maintenance_purge_skipped_rate_limit_total: AtomicU64::new(0),
+            maintenance_purge_skipped_bus_saturated_total: AtomicU64::new(0),
             taskinfo_cache_hits: AtomicU64::new(0),
             taskinfo_cache_misses: AtomicU64::new(0),
             taskinfo_cache_exit_invalidations: AtomicU64::new(0),
@@ -873,6 +885,9 @@ impl LockFreeMetrics {
             maintenance_purge_skipped_rate_limit_total: self
                 .maintenance_purge_skipped_rate_limit_total
                 .load(Ordering::Relaxed),
+            maintenance_purge_skipped_bus_saturated_total: self
+                .maintenance_purge_skipped_bus_saturated_total
+                .load(Ordering::Relaxed),
             taskinfo_cache_hits: self.taskinfo_cache_hits.load(Ordering::Relaxed),
             taskinfo_cache_misses: self.taskinfo_cache_misses.load(Ordering::Relaxed),
             taskinfo_cache_exit_invalidations: self
@@ -1206,6 +1221,7 @@ pub struct MetricsSnapshot {
     pub maintenance_purge_skipped_idle_total: u64,
     pub maintenance_purge_skipped_build_mode_total: u64,
     pub maintenance_purge_skipped_rate_limit_total: u64,
+    pub maintenance_purge_skipped_bus_saturated_total: u64,
     pub taskinfo_cache_hits: u64,
     pub taskinfo_cache_misses: u64,
     pub taskinfo_cache_exit_invalidations: u64,

@@ -136,6 +136,12 @@ impl MetricsState {
             lf.maintenance_purge_skipped_build_mode_total;
         self.metrics.maintenance_purge_skipped_rate_limit_total =
             lf.maintenance_purge_skipped_rate_limit_total;
+        // Sprint 12 Convergence #5 (2026-05-17). Producer = should_fire
+        // BusSaturated branch in daemon_maintenance_tick. Counter stays
+        // at 0 until the caller wires bus_saturated from the existing
+        // G12 fallback (entropy_anomaly > 2.0 OR amc_bandwidth_pct > 0.80).
+        self.metrics.maintenance_purge_skipped_bus_saturated_total =
+            lf.maintenance_purge_skipped_bus_saturated_total;
 
         // Phase 5.2 — Battery-aware cost penalty (Sprint 8, 2026-05-16).
         // Producers are NOT wired in this commit (OPENS: 1) — the counter

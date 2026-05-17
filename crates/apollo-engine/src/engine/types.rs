@@ -1694,6 +1694,14 @@ pub struct RuntimeMetrics {
     pub maintenance_purge_skipped_build_mode_total: u64,
     #[serde(default)]
     pub maintenance_purge_skipped_rate_limit_total: u64,
+    /// Sprint 12 Convergence #5 (2026-05-17). Cumulative count of
+    /// maintenance purge attempts skipped because the unified-memory
+    /// bus was saturated (entropy_anomaly fallback proxy on M1).
+    /// Stays at 0 on idle systems; ramps under sustained LLM inference
+    /// or heavy media transcode. See
+    /// [`crate::engine::lse_counters::LockFreeMetrics::maintenance_purge_skipped_bus_saturated_total`].
+    #[serde(default)]
+    pub maintenance_purge_skipped_bus_saturated_total: u64,
 
     /// Phase 5.2 — Battery-aware cost penalty emissions (Sprint 8,
     /// 2026-05-16). Cumulative count of action-cost computations where
