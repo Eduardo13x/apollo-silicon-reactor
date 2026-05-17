@@ -847,24 +847,81 @@ impl LearnedState {
             });
         }
 
-        // Phase 4.3 WIRED (Sprint 10) — evaluate policy_rollback_guard.
-        // Counter `inc_policy_rollback_evaluation` bumps inside `evaluate()`
-        // unconditionally; `inc_policy_rollback_execution` bumps only when
-        // a plan would actually fire. V1 wire: LOG the plan but do NOT
-        // auto-revert — operator visibility first, automatic correction
-        // in a follow-up after empirical validation. Quality defaults to
-        // 1.0 (no rollback) when no restore data yet.
+        // Phase 4.3 AUTO-REVERT (Sprint 11, 2026-05-16) — closes the
+        // policy-quality feedback loop. When restore-quality dropped
+        // below the safety floor AND a shift sits in the recency window
+        // AND cooldown has elapsed, ACTUALLY restore each shifted
+        // parameter to its pre-shift value. v1 (Sprint 10) only LOGGED
+        // the plan; v2 (this commit) applies it.
+        //
+        // Cooldown semantics (already in PolicyRollbackGuard):
+        //   - 5-minute recency window: only shifts within window are
+        //     considered for rollback
+        //   - 10-minute cooldown after fire: blocks repeat rollbacks
+        //     to prevent thrashing if quality stays low for unrelated
+        //     reasons (workload spike, OS event)
+        //   - safety_floor (default 0.35): hysteresis vs the
+        //     RestoreQualityMonitor's own 0.35 stale threshold.
+        //
+        // Per-shift restore: take the freshest entry per PolicyShiftKind
+        // (plan.entries is most-recent-first per evaluate impl) and
+        // assign back to the matching LearnableParams field. Validate()
+        // runs at the end and re-clamps, so an out-of-range pre_value
+        // is bounded back into the safe envelope.
+        //
+        // [Sutton & Barto 2018 §11.7] — model-free policy correction:
+        // when measured outcome contradicts predicted, undo the most
+        // recent learning step rather than waiting for the EMA to
+        // re-converge over many cycles.
         if let Some(lp) = self.learnable_params.as_mut() {
             if let Some(guard) = lp.policy_rollback_guard.as_mut() {
                 let quality = self.last_restore_quality.unwrap_or(1.0);
                 if let Some(plan) = guard.evaluate(quality, std::time::SystemTime::now()) {
                     crate::engine::lse_counters::LSE_COUNTERS
                         .inc_policy_rollback_execution();
+                    let mut restored: Vec<&'static str> = Vec::with_capacity(plan.entries.len());
+                    // Walk entries once; first-seen per kind wins (entries
+                    // are already most-recent-first from guard.evaluate).
+                    let mut zone_alpha_done = false;
+                    let mut rl_upper_done = false;
+                    let mut overflow_done = false;
+                    for entry in &plan.entries {
+                        match entry.kind {
+                            PolicyShiftKind::ZoneAlpha if !zone_alpha_done => {
+                                lp.zone_alpha = entry.pre_value;
+                                zone_alpha_done = true;
+                                restored.push("zone_alpha");
+                            }
+                            PolicyShiftKind::RlBandUpper if !rl_upper_done => {
+                                // Top band (index 2) — the only RL band
+                                // currently shift-tracked; assignment is
+                                // intentionally narrow until Sprint 12+
+                                // wires the lower bands too.
+                                lp.rl_pressure_bands[2] = entry.pre_value;
+                                rl_upper_done = true;
+                                restored.push("rl_band_upper");
+                            }
+                            PolicyShiftKind::OverflowThresholdBgPressure if !overflow_done => {
+                                // No direct field on LearnableParams for
+                                // overflow bg_pressure (lives in
+                                // OverflowGuard, owned by the daemon).
+                                // Restore is a no-op here; the OverflowGuard
+                                // accessor would have to receive the
+                                // pre_value via channel. Logged but not
+                                // applied — operator can still trace the
+                                // intent in tracing logs.
+                                overflow_done = true;
+                                restored.push("overflow_bg_pressure(deferred)");
+                            }
+                            _ => {} // duplicate kind or unhandled — skip
+                        }
+                    }
                     tracing::warn!(
                         target: "apollo.policy_rollback",
                         quality = quality,
                         entries = plan.entries.len(),
-                        "policy rollback plan returned by guard; v1 wire logs only, no auto-revert"
+                        restored = ?restored,
+                        "AUTO-REVERT fired: restored learnable params to pre-shift values"
                     );
                     guard.mark_executed(std::time::SystemTime::now());
                 }
@@ -2399,6 +2456,72 @@ mod tests {
             (oldest - 0.001 * 10.0).abs() < f64::EPSILON,
             "oldest pre_value should be from shift #10, got {}",
             oldest
+        );
+    }
+
+    /// Sprint 11 — Phase 4.3 AUTO-REVERT end-to-end. Mutate zone_alpha
+    /// in LearnableParams, drop restore quality below floor, run the
+    /// outer `LearnedState::self_improve`, assert zone_alpha was
+    /// restored to its pre-shift value. Locks the loop closure that
+    /// distinguishes Sprint 10 (log-only) from Sprint 11 (apply).
+    #[test]
+    fn auto_revert_restores_zone_alpha_after_low_quality() {
+        // Construct a LearnedState with a learnable_params + an
+        // already-populated guard with a recent ZoneAlpha shift.
+        let mut state = LearnedState {
+            version: 1,
+            signal_intelligence: None,
+            outcome_tracker: None,
+            specialist_accuracy: None,
+            persist_generations: 0,
+            last_restore_quality: None,
+            pending_trial_skill: None,
+            skill_registry: None,
+            overflow_guard_history: None,
+            frozen_pids: None,
+            effectiveness_tracker: None,
+            arousal_state: None,
+            causal_graph_edges: None,
+            process_baselines: None,
+            learnable_params: None,
+            nested_learner: None,
+            teacher_consolidator: None,
+            unfreeze_decay_tau: None,
+            neuro_state: None,
+            meta_cognition: None,
+            last_any_purge_at: None,
+            last_cli_purge_at: None,
+            companion_graph: None,
+        };
+        let mut lp = LearnableParams::default();
+        let pre = lp.zone_alpha;
+        // Simulate a mutation: bump zone_alpha up.
+        lp.zone_alpha = (pre * 1.5).min(0.025);
+        // And record the shift in a fresh guard.
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        let now = std::time::SystemTime::now();
+        guard.record_shift(PolicyShiftKind::ZoneAlpha, pre, now);
+        lp.policy_rollback_guard = Some(guard);
+        state.learnable_params = Some(lp);
+        // Quality below the safety floor — the rollback path should fire.
+        state.last_restore_quality = Some(0.20);
+
+        let post_shift_alpha = state.learnable_params.as_ref().unwrap().zone_alpha;
+        assert!(
+            (post_shift_alpha - pre).abs() > f64::EPSILON,
+            "test setup invariant: zone_alpha must have shifted from {pre} \
+             but was {post_shift_alpha} — record_shift sanity"
+        );
+
+        state.self_improve();
+
+        // After self_improve, zone_alpha must be back at the pre-shift
+        // value (modulo validate() clamp, which won't bite — `pre` came
+        // from a fresh LearnableParams::default()).
+        let restored = state.learnable_params.as_ref().unwrap().zone_alpha;
+        assert!(
+            (restored - pre).abs() < f64::EPSILON,
+            "AUTO-REVERT failed: zone_alpha={restored} expected pre={pre}"
         );
     }
 
