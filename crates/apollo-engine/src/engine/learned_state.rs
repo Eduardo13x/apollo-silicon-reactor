@@ -157,6 +157,15 @@ pub struct LearnableParams {
     /// confidence in NARS outputs when this is set.
     #[serde(default)]
     pub nars_beliefs_stale: bool,
+
+    /// Phase 4.3 WIRED (Sprint 10, 2026-05-16) — guard recording every
+    /// learnable-parameter shift produced by `self_improve`, with cooldown
+    /// + recency-window logic to decide when restore-quality justifies a
+    /// rollback. Lives next to the params it guards. Persisted so the
+    /// recent-shifts ring buffer + cooldown survive a daemon restart.
+    /// `Option<>` for backward-compat with old learned_state.json files.
+    #[serde(default)]
+    pub policy_rollback_guard: Option<PolicyRollbackGuard>,
 }
 
 // ── LearnableParams defaults (match original hardcoded values) ─────────
@@ -244,6 +253,7 @@ impl Default for LearnableParams {
             meta_learning_velocity: 0.0,
             tuning_cycles: 0,
             nars_beliefs_stale: false,
+            policy_rollback_guard: None,
         }
     }
 }
@@ -334,15 +344,37 @@ impl LearnableParams {
             // sane range.  Hard clamps: zone_alpha ≤ 0.05, hazard_lr ≤ 0.1.
             const ZONE_ALPHA_INTERIM_MAX: f64 = 0.025; // 0.05 / 2
             const HAZARD_LR_INTERIM_MAX: f64 = 0.05; // 0.1 / 2
+            // Phase 4.3 WIRED — record pre-shift value so the rollback guard
+            // can revert if the next 5 min of quality data argues this
+            // accelerated learning hurt more than it helped.
+            let prev_zone_alpha = self.zone_alpha;
             self.zone_alpha = (self.zone_alpha * 1.5).min(ZONE_ALPHA_INTERIM_MAX);
             self.hazard_lr = (self.hazard_lr * 1.5).min(HAZARD_LR_INTERIM_MAX);
+            self.policy_rollback_guard
+                .get_or_insert_with(|| PolicyRollbackGuard::new(0.35))
+                .record_shift(
+                    PolicyShiftKind::ZoneAlpha,
+                    prev_zone_alpha,
+                    std::time::SystemTime::now(),
+                );
             self.nars_decay_factor = (self.nars_decay_factor * 0.98).max(0.90); // faster forgetting (bounded by new 0.90 floor — B5)
         } else if velocity_low && effectiveness_stable {
             // Converged: slow down — multiply learning rates ×0.8
+            // Phase 4.3 WIRED — record the slow-down shift too; the
+            // rollback path doesn't discriminate between speedups and
+            // slowdowns, only "did the change hurt quality".
+            let prev_zone_alpha = self.zone_alpha;
             self.zone_alpha *= 0.8;
             self.hazard_lr *= 0.8;
             self.nars_decay_factor = (self.nars_decay_factor * 1.005).min(0.99);
             // slower forgetting
+            self.policy_rollback_guard
+                .get_or_insert_with(|| PolicyRollbackGuard::new(0.35))
+                .record_shift(
+                    PolicyShiftKind::ZoneAlpha,
+                    prev_zone_alpha,
+                    std::time::SystemTime::now(),
+                );
         }
         // High velocity → actively adapting, no change needed
 
@@ -814,6 +846,30 @@ impl LearnedState {
                 !(cold_unconverged || stale_high_evidence)
             });
         }
+
+        // Phase 4.3 WIRED (Sprint 10) — evaluate policy_rollback_guard.
+        // Counter `inc_policy_rollback_evaluation` bumps inside `evaluate()`
+        // unconditionally; `inc_policy_rollback_execution` bumps only when
+        // a plan would actually fire. V1 wire: LOG the plan but do NOT
+        // auto-revert — operator visibility first, automatic correction
+        // in a follow-up after empirical validation. Quality defaults to
+        // 1.0 (no rollback) when no restore data yet.
+        if let Some(lp) = self.learnable_params.as_mut() {
+            if let Some(guard) = lp.policy_rollback_guard.as_mut() {
+                let quality = self.last_restore_quality.unwrap_or(1.0);
+                if let Some(plan) = guard.evaluate(quality, std::time::SystemTime::now()) {
+                    crate::engine::lse_counters::LSE_COUNTERS
+                        .inc_policy_rollback_execution();
+                    tracing::warn!(
+                        target: "apollo.policy_rollback",
+                        quality = quality,
+                        entries = plan.entries.len(),
+                        "policy rollback plan returned by guard; v1 wire logs only, no auto-revert"
+                    );
+                    guard.mark_executed(std::time::SystemTime::now());
+                }
+            }
+        }
     }
 
     // ── Validation: called before apply ─────────────────────────────────
@@ -1263,7 +1319,7 @@ const POLICY_ROLLBACK_COOLDOWN: std::time::Duration = std::time::Duration::from_
 
 /// One entry in the rollback ring buffer: which parameter, what its value
 /// was BEFORE the shift, and when the shift happened.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct PolicyShiftRecord {
     at: std::time::SystemTime,
     kind: PolicyShiftKind,
@@ -1289,7 +1345,7 @@ pub struct RollbackPlanEntry {
 /// Real-time guard that decides when recent policy shifts must be
 /// reverted on the basis of `RestoreQualityMonitor::quality`. See module
 /// header for the full contract.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PolicyRollbackGuard {
     /// Bounded FIFO of recent shifts. Newest at the back, oldest at the
     /// front; evicted at `POLICY_ROLLBACK_RING_CAP`.
