@@ -1211,6 +1211,13 @@ fn main() -> anyhow::Result<()> {
             // throttle Apollo's own hot path under stress. 0.0 on first
             // cycle = treated as low pressure (300ms floor, fresh enrich).
             let mut prev_pressure_smooth: f64 = 0.0;
+            // Phase 4.2 WIRED (Sprint 10, 2026-05-16) — track thermal-state
+            // transitions across cycles so we can emit exactly one
+            // `record_external_event(ThermalThrottle, ...)` per upward
+            // crossing into Moderate+ regime. Without this debounce the
+            // causal graph would see N "external events" per N cycles in
+            // a sustained throttle, swamping the attribution model.
+            let mut prev_thermal_throttling: bool = false;
             // Batch buffer: accumulate N push messages before a single write syscall.
             // macOS Unix socket SO_SNDBUF = 8192 bytes. Batch=16×~64=~1KB stays well
             // under the 8KB limit so write_all never blocks. Empirically optimal.
@@ -3584,6 +3591,31 @@ fn main() -> anyhow::Result<()> {
                 // Maintenance Purge Gate (2026-05-10) — opportunistic non-crisis purge
                 // between survival_tick and dispatch_tick. Asymmetric cooldown: survival
                 // is sovereign and bypasses last_any_purge_at; maintenance reads+writes.
+                // Phase 4.2 WIRED (Sprint 10, 2026-05-16) — thermal external
+                // event producer. On upward crossing from Normal → any throttle
+                // tier (Moderate/Severe/Critical), record one external event.
+                // The causal graph tags any subsequent action edge with
+                // `external_blame: Some(ThermalThrottle)` for EXTERNAL_BLAME_WINDOW,
+                // so credit for the next pressure drop is attributed to the
+                // thermal event, not to Apollo's coincident intervention.
+                {
+                    let thermal_throttling_now = state
+                        .hardware
+                        .lock_recover()
+                        .last_hw_snapshot
+                        .as_ref()
+                        .map(|hw| !matches!(hw.thermal_state, ThermalState::Normal))
+                        .unwrap_or(false);
+                    if thermal_throttling_now && !prev_thermal_throttling {
+                        lctx.causal_graph.record_external_event(
+                            apollo_engine::engine::causal_graph::ExternalEventKind::ThermalThrottle,
+                            snapshot.pressure.memory_pressure,
+                            std::time::SystemTime::now(),
+                        );
+                    }
+                    prev_thermal_throttling = thermal_throttling_now;
+                }
+
                 let maintenance_fired = daemon_maintenance_tick::run_maintenance_tick(
                     &snapshot,
                     &user_context,
