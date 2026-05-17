@@ -229,6 +229,13 @@ impl MetricsState {
         self.metrics.scorer_override_rejects_total = lf.scorer_override_rejects_total;
         self.metrics.scorer_disagreement_strong_accepts_total =
             lf.scorer_disagreement_strong_accepts_total;
+
+        // Phase D PURGE-INHIBITION (Sprint 12 candidate #1, 2026-05-17).
+        // Producer is the `signal_intelligence::step` swap branch when
+        // MaintenanceState reports a recent purge. Counter stays at 0
+        // until the daemon actually triggers vm_purge — proves the loop
+        // closes when the maintenance tick fires.
+        self.metrics.purge_inhibition_skips_total = lf.purge_inhibition_skips_total;
     }
 }
 

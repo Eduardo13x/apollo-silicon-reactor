@@ -1865,6 +1865,18 @@ pub struct RuntimeMetrics {
     /// requires observing the rejected path.
     #[serde(default)]
     pub scorer_disagreement_strong_accepts_total: u64,
+
+    /// Phase D PURGE-INHIBITION (Sprint 12 candidate #1, 2026-05-17).
+    ///
+    /// Cycles where a predictor swap-update was suppressed because a
+    /// `vm_purge` fired in the prior 5 s and would have been mis-learned
+    /// as a load improvement. See
+    /// [`crate::engine::lse_counters::LockFreeMetrics::purge_inhibition_skips_total`]
+    /// for the producer. Flushed each cycle via `sync_from_lockfree`.
+    ///
+    /// [Hellerstein 2004 §9] disturbance rejection in closed-loop systems.
+    #[serde(default)]
+    pub purge_inhibition_skips_total: u64,
 }
 
 impl RuntimeMetrics {

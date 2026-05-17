@@ -411,6 +411,20 @@ pub struct LockFreeMetrics {
     /// before promoting either side.
     pub scorer_override_rejects_total: AtomicU64,
     pub scorer_disagreement_strong_accepts_total: AtomicU64,
+
+    /// Phase D PURGE-INHIBITION (Sprint 12 candidate #1, 2026-05-17).
+    ///
+    /// Counts how many times a predictor swap-derived update was inhibited
+    /// because [`MaintenanceState::is_in_purge_inhibition_window`] returned
+    /// true. Producer = `signal_intelligence::step` swap branch when
+    /// `purge_inhibited == true`. Consumer = `runtime_metrics.json` via
+    /// `sync_from_lockfree`. The counter stays at 0 unless the daemon
+    /// actually purged in the last 5 s — confirms the loop closes when
+    /// the maintenance tick fires and proves the predictor sidestepped
+    /// the exogenous shock.
+    ///
+    /// [Hellerstein 2004 §9] disturbance rejection in closed-loop systems.
+    pub purge_inhibition_skips_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -545,6 +559,7 @@ impl LockFreeMetrics {
             // Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16).
             scorer_override_rejects_total: AtomicU64::new(0),
             scorer_disagreement_strong_accepts_total: AtomicU64::new(0),
+            purge_inhibition_skips_total: AtomicU64::new(0),
         }
     }
 
@@ -917,6 +932,9 @@ impl LockFreeMetrics {
             scorer_disagreement_strong_accepts_total: self
                 .scorer_disagreement_strong_accepts_total
                 .load(Ordering::Relaxed),
+            purge_inhibition_skips_total: self
+                .purge_inhibition_skips_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1111,6 +1129,20 @@ impl LockFreeMetrics {
         self.scorer_disagreement_strong_accepts_total
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Phase D PURGE-INHIBITION: bump once per predictor swap-update gated
+    /// during the post-purge inhibition window (see
+    /// `MaintenanceState::is_in_purge_inhibition_window`). Producer lives
+    /// in `signal_intelligence::step` so a single gate per cycle yields a
+    /// single increment, even if multiple predictors share the swap input
+    /// downstream of the gate.
+    /// [Hellerstein 2004 §9] disturbance rejection — counter proves the
+    /// closed-loop system observed and refused the exogenous shock.
+    #[inline(always)]
+    pub fn inc_purge_inhibition_skip(&self) {
+        self.purge_inhibition_skips_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // Safe to share across threads — all fields are atomic.
@@ -1234,6 +1266,11 @@ pub struct MetricsSnapshot {
     /// Candidate-C verdict, the asymmetric mode does NOT let the
     /// scorer beat the gate in the unsafe direction.
     pub scorer_disagreement_strong_accepts_total: u64,
+    /// Phase D PURGE-INHIBITION (Sprint 12 candidate #1, 2026-05-17).
+    /// Cycles where predictor swap-update was suppressed because a
+    /// `vm_purge` fired in the prior 5 s. See
+    /// [`crate::engine::lse_counters::LockFreeMetrics::purge_inhibition_skips_total`].
+    pub purge_inhibition_skips_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
