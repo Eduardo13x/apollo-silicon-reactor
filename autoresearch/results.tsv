@@ -4,4 +4,4 @@ iter	commit	composite	delta	clippy	wired	tests	ais	status	change
 2	-	2983	0	160	6	2083	94	discard	re-run clippy --fix (no change)
 3	0fcbfa2	2989	6	157	6	2083	94	keep	3 sort_by_key idiom fixes
 4	-	2989	0	157	6	2083	94	discard	force clippy --fix sort_by_key (no change)
-5	-	2989	0	157	6	2083	94	discard	phase 5.2 wire out of atomic-iter scope
+5	b8230e6	3089	100	157	7	2083	94	keep	phase 4.1 wire (AdaptiveDriftThreshold consumed)

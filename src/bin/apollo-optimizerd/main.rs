@@ -3399,6 +3399,38 @@ fn main() -> anyhow::Result<()> {
                         &alive,
                         cycle_count,
                     );
+                    // Phase 3.3 WIRED (Sprint 9, 2026-05-16): cross-group
+                    // attention propagation. After per-cycle co-occurrence
+                    // accumulation, ask the graph to infer (A, B, score)
+                    // triples across the live coalition/app-group keys.
+                    // The decider returns triples but does NOT mutate the
+                    // graph — v1 wire only counts emissions for
+                    // observability. Future consumers can read them via
+                    // a separate call site.
+                    //
+                    // Cardinality bulkhead (NotebookLM 2026-05-16): cap at
+                    // 64 group keys per cycle. The propagation is O(V²);
+                    // 64² = 4096 ops fits well inside the 10 ms per-cycle
+                    // budget even on M1 8GB worst-case scheduling.
+                    {
+                        let mut group_keys: Vec<String> = process_tree
+                            .app_groups()
+                            .map(|g| g.root_name.clone())
+                            .collect();
+                        if group_keys.len() > 64 {
+                            group_keys.truncate(64);
+                        }
+                        if !group_keys.is_empty() {
+                            let triples =
+                                companion_graph.propagate_attention_across_groups(&group_keys);
+                            if !triples.is_empty() {
+                                apollo_engine::engine::lse_counters::LSE_COUNTERS
+                                    .add_companion_cross_group_inferences(
+                                        triples.len() as u64,
+                                    );
+                            }
+                        }
+                    }
                     if cycle_count.is_multiple_of(500) {
                         let evicted = companion_graph.self_improve(cycle_count);
                         if evicted > 0 {
