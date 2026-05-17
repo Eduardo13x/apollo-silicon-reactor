@@ -2991,13 +2991,16 @@ fn main() -> anyhow::Result<()> {
                     // change.  Ordering: runs after LinUCB select and before the
                     // decision_stage, same as the original inline form.
                     // Phase 5.1 wiring — build PresenceInputs from last cycle's
-                    // UserContext + current arousal. hid_events_per_minute has
-                    // no daemon-side accessor yet (TODO 2026-05-16); 0.0
-                    // means the modulator falls back on idle_seconds alone,
-                    // which is sufficient for the active/semi-active tiers.
+                    // UserContext + current arousal. Phase 5.1-D (2026-05-16)
+                    // wires `hid_events_per_minute` to a real producer that
+                    // tracks resets of HIDIdleTime across the last 30 real
+                    // samples (≈ 10 min wall-clock at the daemon's 10-cycle
+                    // sampling cadence). Returns 0.0 — the modulator's
+                    // idle-only fallback — until enough samples accumulate.
                     let presence_inputs = daemon_cognitive_tick::PresenceInputs {
                         idle_seconds: last_user_context_for_voting.idle_secs,
-                        hid_events_per_minute: 0.0,
+                        hid_events_per_minute:
+                            apollo_engine::engine::user_context::hid_events_per_minute(),
                         current_arousal: arousal_state.level as f64,
                         audio_active: last_user_context_for_voting.audio_active,
                         has_sleep_assertion: last_user_context_for_voting.has_sleep_assertion,
