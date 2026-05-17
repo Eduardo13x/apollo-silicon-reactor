@@ -66,6 +66,21 @@ pub struct ActionContext {
     pub sensor_age_ms: Option<u64>,
     /// Global epistemic uncertainty ≥ 0; features may use or add to it.
     pub epistemic_uncertainty: f64,
+
+    // ── Phase 5.2 wiring inputs (Sprint 10, 2026-05-16) ─────────────────────
+    /// True when the machine is running on battery power (no AC charger
+    /// detected via SMC). Sourced from `SmcSnapshot.charger_watts`: `Some(>0)`
+    /// → on AC; `Some(0.0)` or `None` → on battery. Optional because not
+    /// every code path constructs ActionContext from a hardware snapshot
+    /// (tests, dry-run paths). When `None`, the battery-aware penalty
+    /// returns 0.0 (no UX cost imposed without evidence).
+    pub is_on_battery: Option<bool>,
+    /// Recent wake-ups per second (sysinfo cumulative wakeups / cycle_dt).
+    /// Used by Phase 5.2 to scale the "micro-wakeup tax" when running on
+    /// battery. Optional same rationale as `is_on_battery`.
+    pub wakeups_per_sec: Option<f64>,
+    /// Recent context switches per second. Same wiring/optionality contract.
+    pub ctx_switches_per_sec: Option<f64>,
 }
 
 /// A single feature's contribution to the composite score.

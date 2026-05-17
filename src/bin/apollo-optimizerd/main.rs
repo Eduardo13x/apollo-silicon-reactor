@@ -2813,6 +2813,23 @@ fn main() -> anyhow::Result<()> {
                 };
                 apollo_engine::engine::shadow_signals::set_epistemic_uncertainty(epistemic_proxy);
 
+                // Phase 5.2 producer TODO (Sprint 11, 2026-05-17 candidate):
+                // Publish `is_on_battery`, `wakeups_per_sec`, `ctx_switches_per_sec`
+                // to shadow_signals so `BatteryAwareCostFeature` (registered
+                // in shadow_evaluator) can emit non-zero cost contributions.
+                // - `is_on_battery`: derive from `state.hardware.lock_recover()
+                //   .last_hw_snapshot.power.<charger field>` — exact field needs
+                //   confirmation against current PowerReading struct shape.
+                // - `wakeups_per_sec` + `ctx_switches_per_sec`: sysinfo derived,
+                //   needs per-cycle delta accumulator (sysinfo gives cumulative
+                //   counters; divide by elapsed cycle_dt). Existing
+                //   `last_rusage_at` time-tracking is the right anchor.
+                //
+                // Until these land, the feature stays Contribution::zero()
+                // and `battery_aware_penalty_emissions_total` does NOT bump
+                // (correct behaviour — no false-positive penalty on AC or
+                // on missing telemetry).
+
                 // ODE swap urgency — hoisted for use in Neuromodulator AND LinUCB.
                 // Normalization owned by TsatUrgency [CyberPhysicalSignal trait].
                 let ode_t_sat_urgency = {

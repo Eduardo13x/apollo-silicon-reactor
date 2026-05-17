@@ -177,6 +177,59 @@ pub fn get_epistemic_uncertainty() -> f64 {
     }
 }
 
+// ── Phase 5.2 wiring (Sprint 10, 2026-05-16) ────────────────────────────────
+// Battery-aware cost penalty inputs. Same `Option<>`-via-WRITTEN-flag pattern
+// the rest of this module uses: a producer must set the value before
+// consumers see anything; until then `get_*` returns `None`. This avoids
+// false positives in shadow / test contexts that never publish.
+
+static IS_ON_BATTERY_FLAG: AtomicBool = AtomicBool::new(false);
+static IS_ON_BATTERY_WRITTEN: AtomicBool = AtomicBool::new(false);
+static WAKEUPS_PER_SEC_BITS: AtomicU64 = AtomicU64::new(0);
+static WAKEUPS_PER_SEC_WRITTEN: AtomicBool = AtomicBool::new(false);
+static CTX_SWITCHES_PER_SEC_BITS: AtomicU64 = AtomicU64::new(0);
+static CTX_SWITCHES_PER_SEC_WRITTEN: AtomicBool = AtomicBool::new(false);
+
+pub fn set_is_on_battery(on_battery: bool) {
+    IS_ON_BATTERY_FLAG.store(on_battery, Ordering::Relaxed);
+    IS_ON_BATTERY_WRITTEN.store(true, Ordering::Relaxed);
+}
+pub fn get_is_on_battery() -> Option<bool> {
+    if IS_ON_BATTERY_WRITTEN.load(Ordering::Relaxed) {
+        Some(IS_ON_BATTERY_FLAG.load(Ordering::Relaxed))
+    } else {
+        None
+    }
+}
+
+pub fn set_wakeups_per_sec(rate: f64) {
+    if rate.is_finite() && rate >= 0.0 {
+        WAKEUPS_PER_SEC_BITS.store(rate.to_bits(), Ordering::Relaxed);
+        WAKEUPS_PER_SEC_WRITTEN.store(true, Ordering::Relaxed);
+    }
+}
+pub fn get_wakeups_per_sec() -> Option<f64> {
+    if !WAKEUPS_PER_SEC_WRITTEN.load(Ordering::Relaxed) {
+        return None;
+    }
+    let raw = f64::from_bits(WAKEUPS_PER_SEC_BITS.load(Ordering::Relaxed));
+    if raw.is_finite() { Some(raw) } else { None }
+}
+
+pub fn set_ctx_switches_per_sec(rate: f64) {
+    if rate.is_finite() && rate >= 0.0 {
+        CTX_SWITCHES_PER_SEC_BITS.store(rate.to_bits(), Ordering::Relaxed);
+        CTX_SWITCHES_PER_SEC_WRITTEN.store(true, Ordering::Relaxed);
+    }
+}
+pub fn get_ctx_switches_per_sec() -> Option<f64> {
+    if !CTX_SWITCHES_PER_SEC_WRITTEN.load(Ordering::Relaxed) {
+        return None;
+    }
+    let raw = f64::from_bits(CTX_SWITCHES_PER_SEC_BITS.load(Ordering::Relaxed));
+    if raw.is_finite() { Some(raw) } else { None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1216,6 +1216,12 @@ pub fn decide_actions(
                     },
                     epistemic_uncertainty: crate::engine::shadow_signals::get_epistemic_uncertainty(
                     ),
+                    // Phase 5.2 wiring (Sprint 10) — shadow-mode probe path:
+                    // populate from shadow_signals if main loop publishes them;
+                    // else None (no penalty, no false-positive in shadow mode).
+                    is_on_battery: crate::engine::shadow_signals::get_is_on_battery(),
+                    wakeups_per_sec: crate::engine::shadow_signals::get_wakeups_per_sec(),
+                    ctx_switches_per_sec: crate::engine::shadow_signals::get_ctx_switches_per_sec(),
                 };
                 shadow_evaluator_cell().evaluate_blocked(
                     &probe,

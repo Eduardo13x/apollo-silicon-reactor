@@ -22,6 +22,7 @@ use crate::engine::action_policy::{
 use crate::engine::blocked_action_journal::{emit_async, BlockedActionEvent, BlockerKind};
 use crate::engine::policy_feature_deep_scan::DeepScanCostFeature;
 use crate::engine::policy_feature_predictive::PredictiveBenefitFeature;
+use crate::engine::policy_feature_battery_cost::BatteryAwareCostFeature;
 use crate::engine::policy_feature_sensor_age::SensorAgeFeature;
 use crate::engine::types::RootAction;
 
@@ -38,6 +39,11 @@ impl Default for ShadowEvaluator {
             .feature(DeepScanCostFeature::default())
             .feature(PredictiveBenefitFeature::default())
             .feature(SensorAgeFeature::default())
+            // Phase 5.2 WIRED (Sprint 10, 2026-05-16) — battery-aware cost.
+            // Returns Contribution::zero() until shadow_signals publishes
+            // is_on_battery + wakeups + ctx_switches; then injects a
+            // [0.0, 0.20] cost penalty proportional to micro-wake noise.
+            .feature(BatteryAwareCostFeature)
             .build();
         Self { scorer }
     }
