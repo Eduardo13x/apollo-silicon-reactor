@@ -48,6 +48,19 @@ pub const EXTERNAL_BLAME_WINDOW: Duration = Duration::from_secs(10);
 /// retains ≈ 50s of history, comfortably > [`EXTERNAL_BLAME_WINDOW`].
 pub const EXTERNAL_RING_CAP: usize = 100;
 
+/// Phase 4.2 CONSUMER (Sprint 11) — fractional impact-score discount
+/// applied to causal edges whose formation coincided with an external
+/// event inside [`EXTERNAL_BLAME_WINDOW`]. 0.30 means 70% of the
+/// pressure-drop credit is retained for the apollo action, 30% is
+/// reassigned to the confounder. Conservative — set by NotebookLM
+/// 2026-05-16 verdict to avoid silencing legitimate effective actions
+/// that merely happened to coincide with thermal events.
+/// [Pearl 2009 §3] interventional vs observational; [Rubin 1974]
+/// potential outcomes — when treatment + confounder co-occur, the
+/// effective causal effect of treatment alone is bounded below the
+/// observed correlation.
+pub const EXTERNAL_BLAME_PENALTY: f32 = 0.30;
+
 /// Cap on how many recent edges are scanned by
 /// [`CausalGraph::recent_external_attributions`]. Matches `EXTERNAL_RING_CAP`
 /// so the accessor reports counts over the same logical horizon as the
@@ -225,12 +238,35 @@ impl CausalEdge {
     /// A solid edge with 0.80 confidence and 0.10 avg drop scores higher
     /// than one with 0.90 confidence but only 0.02 avg drop.
     /// [Granger 1969] Blends fast (3-cycle) and slow (15-cycle) horizons.
+    ///
+    /// **Phase 4.2 CONSUMER (Sprint 11, 2026-05-16)** — when `external_blame`
+    /// is `Some`, the edge formed concurrent with an external event
+    /// (ThermalThrottle / DiskIOSpike / NetworkLatencySpike) within
+    /// `EXTERNAL_BLAME_WINDOW`. The pressure drop attributed to this edge
+    /// is **confounded** by the external event: a sustained thermal
+    /// throttle reduces wall-clock work → lower CPU → lower memory churn,
+    /// matching whatever Apollo did simultaneously. Without a confounder
+    /// adjustment, the spurious correlation hardens into a "solid" edge
+    /// and biases all future action selection toward whatever Apollo
+    /// happened to do during thermal events.
+    ///
+    /// Per [Pearl 2009 §3] interventional-vs-observational distinction: we
+    /// cannot fully discount the edge (Apollo may STILL have helped), but
+    /// we DO downweight it by `EXTERNAL_BLAME_PENALTY = 0.30` (70% credit
+    /// retained, 30% attributed to the confounder). Conservative enough to
+    /// not silence legitimate effective actions; strict enough to keep
+    /// thermal-coincident actions from dominating the impact ranking.
     pub fn impact_score(&self) -> f32 {
         let fast = self.confidence * self.avg_delta;
         let slow = self.slow_confidence * self.slow_avg_delta;
         // Take the max: if slow horizon shows bigger effect, use it.
         // This captures delayed effects like memory reclaim.
-        fast.max(slow)
+        let raw = fast.max(slow);
+        if self.external_blame.is_some() {
+            raw * (1.0 - EXTERNAL_BLAME_PENALTY)
+        } else {
+            raw
+        }
     }
 
     /// Edge is solid: high confidence with sufficient evidence.
@@ -1642,6 +1678,45 @@ mod tests {
 
     /// External event fires; action recorded inside the 10s window; the
     /// resulting pressure_drop edge must be tagged.
+    #[test]
+    /// Phase 4.2 CONSUMER (Sprint 11) — verify that the impact_score
+    /// of an edge tagged with `external_blame` is reduced by exactly
+    /// the `EXTERNAL_BLAME_PENALTY` fraction. Closes the Pearl 2009
+    /// confounder loop: an action that coincided with a thermal event
+    /// gets a lower causal-effect estimate than the same action without
+    /// the confounder, so ranking favours the legitimately effective one.
+    #[test]
+    fn impact_score_discounts_externally_blamed_edge() {
+        let mut clean = CausalEdge::new("throttle:test", "pressure_drop");
+        clean.confidence = 0.80;
+        clean.avg_delta = 0.10;
+        clean.slow_confidence = 0.60;
+        clean.slow_avg_delta = 0.08;
+        assert!(clean.external_blame.is_none());
+        let clean_score = clean.impact_score();
+
+        let mut blamed = clean.clone();
+        blamed.external_blame = Some(ExternalEventKind::ThermalThrottle);
+        let blamed_score = blamed.impact_score();
+
+        // Blamed edge must score (1 - EXTERNAL_BLAME_PENALTY) × clean.
+        let expected = clean_score * (1.0 - EXTERNAL_BLAME_PENALTY);
+        assert!(
+            (blamed_score - expected).abs() < 1e-6,
+            "blamed score {} must equal clean × (1 - penalty) = {} (penalty={})",
+            blamed_score,
+            expected,
+            EXTERNAL_BLAME_PENALTY,
+        );
+        // And blamed must rank strictly lower than clean.
+        assert!(
+            blamed_score < clean_score,
+            "blamed {} must rank below clean {}",
+            blamed_score,
+            clean_score,
+        );
+    }
+
     #[test]
     fn external_event_within_window_taints_subsequent_edge() {
         let mut g = CausalGraph::new();

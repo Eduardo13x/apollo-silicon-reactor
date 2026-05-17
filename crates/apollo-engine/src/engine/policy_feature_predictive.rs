@@ -121,6 +121,9 @@ mod tests {
             wss_mb: None,
             sensor_age_ms: None,
             epistemic_uncertainty: 0.0,
+            is_on_battery: None,
+            wakeups_per_sec: None,
+            ctx_switches_per_sec: None,
         }
     }
 

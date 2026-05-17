@@ -43,7 +43,10 @@ fn adversarial_ctx() -> ActionContext {
         wss_mb: None,
         sensor_age_ms: None,
         epistemic_uncertainty: 0.0,
-    }
+            is_on_battery: None,
+            wakeups_per_sec: None,
+            ctx_switches_per_sec: None,
+        }
 }
 
 /// Full four-feature scorer used in the divergence test: the F4 starter trio
@@ -205,7 +208,10 @@ fn scorer_agrees_with_old_gate_on_pure_reactive_crisis() {
         wss_mb: None,
         sensor_age_ms: None,
         epistemic_uncertainty: 0.0,
-    };
+            is_on_battery: None,
+            wakeups_per_sec: None,
+            ctx_switches_per_sec: None,
+        };
 
     let user_ctx = UserContext {
         idle_secs: ctx.idle_secs,
