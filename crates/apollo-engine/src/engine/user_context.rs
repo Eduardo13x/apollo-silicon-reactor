@@ -16,6 +16,8 @@
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::Instant;
 
 /// App names that indicate an active video/audio call.
 #[cfg(target_os = "macos")]
@@ -23,6 +25,146 @@ const CALL_APP_NAMES: &[&str] = &[
     "zoom.us", "facetime", "teams", "webex", "skype", "discord", "meet", "slack", "whereby",
     "around", "loom",
 ];
+
+// ── HID event-rate tracker (Phase 5.1-D) ─────────────────────────────────────
+//
+// macOS exposes `HIDIdleTime` (nanoseconds since last keyboard / mouse event)
+// but does NOT expose a monotonic "events since boot" counter. We approximate
+// the event rate by observing **resets** of HIDIdleTime between consecutive
+// samples: when the new reading is *smaller* than the previous one, at least
+// one HID event fired in the interval. Each sampled cycle therefore contributes
+// a binary observation `(reset_detected, wall_clock_at_sample)`. The public
+// accessor [`hid_events_per_minute`] converts a rolling window of these
+// observations into a normalised events-per-minute estimate.
+//
+// Why 30 samples: the daemon's cognitive tick samples `UserContext::collect()`
+// once every ~10 main cycles (≈ 20 s on a healthy daemon). 30 real samples
+// therefore spans ≈ 10 min of wall-clock, long enough to smooth bursty input
+// (a user typing for 8 s in the middle of an otherwise idle minute) without
+// lagging the modulator past the 2-min "is_idle_long" threshold the gate
+// pipeline uses to swap policy tiers.
+//
+// Bounded per-cycle work: O(1) sample, O(30) for the rate read.
+// Memory: 30 × `Sample` = 30 × 16 B = 480 B + Mutex overhead.
+
+const HID_RATE_WINDOW: usize = 30;
+/// Minimum observed wall-clock span required before reporting a non-zero rate.
+/// Below this the divisor is too small (and noisy) to produce a stable rate;
+/// returning 0.0 keeps the modulator on its idle-time fallback during the
+/// daemon's first few minutes of operation.
+const HID_RATE_MIN_SPAN_SECS: f64 = 5.0;
+
+#[derive(Clone, Copy)]
+struct HidSample {
+    /// True if the HIDIdleTime reading was lower than the previous reading,
+    /// i.e. at least one keyboard / mouse event fired between samples.
+    reset: bool,
+    /// Wall-clock instant at which this sample was taken — used by
+    /// [`hid_events_per_minute`] to compute the actual window span.
+    at: Instant,
+}
+
+struct HidEventRateTracker {
+    /// Most recent HIDIdleTime reading (seconds). `None` until first sample.
+    last_idle_secs: Option<f64>,
+    /// Rolling window of binary reset observations (newest = back).
+    samples: std::collections::VecDeque<HidSample>,
+}
+
+impl HidEventRateTracker {
+    const fn new() -> Self {
+        Self {
+            last_idle_secs: None,
+            samples: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Record one HID idle sample. `O(1)`. The first sample is bootstrap-only
+    /// (no previous reading to compare against) and registers `reset = false`.
+    fn observe(&mut self, current_idle_secs: f64, now: Instant) {
+        let reset = match self.last_idle_secs {
+            // A drop of any magnitude indicates at least one HID event fired.
+            Some(prev) => current_idle_secs < prev,
+            None => false,
+        };
+        self.last_idle_secs = Some(current_idle_secs);
+        if self.samples.len() == HID_RATE_WINDOW {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(HidSample { reset, at: now });
+    }
+
+    /// Convert the window into an events-per-minute estimate. `O(window)`.
+    ///
+    /// Returns 0.0 when the window is empty, when the observed span is too
+    /// short to be meaningful (< [`HID_RATE_MIN_SPAN_SECS`]), or when the
+    /// computed span would be non-positive (clock anomaly / single sample).
+    fn events_per_minute(&self) -> f64 {
+        if self.samples.len() < 2 {
+            return 0.0;
+        }
+        let first = self.samples.front().expect("checked len >= 2").at;
+        let last = self.samples.back().expect("checked len >= 2").at;
+        // `Instant::saturating_duration_since` guarantees non-negative.
+        let span_secs = last.saturating_duration_since(first).as_secs_f64();
+        if !span_secs.is_finite() || span_secs < HID_RATE_MIN_SPAN_SECS {
+            return 0.0;
+        }
+        let resets = self.samples.iter().filter(|s| s.reset).count() as f64;
+        let per_minute = resets * 60.0 / span_secs;
+        // Defensive: NaN/inf cannot occur given the span guard above, but be
+        // explicit so the modulator never receives a poisoned input.
+        if per_minute.is_finite() {
+            per_minute
+        } else {
+            0.0
+        }
+    }
+
+    fn reset_for_tests(&mut self) {
+        self.last_idle_secs = None;
+        self.samples.clear();
+    }
+}
+
+static HID_RATE_TRACKER: Mutex<HidEventRateTracker> = Mutex::new(HidEventRateTracker::new());
+
+/// Record one HID idle observation. Called automatically by
+/// [`collect_idle_secs`] on macOS; exposed at `pub(crate)` only for the
+/// behavioural tests further down this file.
+pub(crate) fn record_hid_idle_sample(current_idle_secs: f64, now: Instant) {
+    if let Ok(mut t) = HID_RATE_TRACKER.lock() {
+        t.observe(current_idle_secs, now);
+    }
+    // Mutex poisoning: a poisoned tracker means a panic crossed the lock.
+    // Silently drop the sample — the daemon loop is best-effort and the
+    // modulator will continue on its `idle_secs`-only fallback.
+}
+
+/// Public accessor used by the daemon main loop to fill
+/// `PresenceInputs.hid_events_per_minute`. See module docs and
+/// [`HidEventRateTracker::events_per_minute`] for the calculation.
+///
+/// Returns 0.0 — a neutral "fall back to idle_seconds" signal — whenever
+/// the tracker is empty, poisoned, or has not yet observed enough span.
+///
+/// [Iqbal & Bailey 2008] "Effects of Interruptions on Task Performance":
+/// interruption cost rises with active keyboard work even when the user has
+/// briefly paused (idle_secs ≥ 5). A 30-sample reset-window catches those
+/// bursty active periods that pure idle-time misses.
+pub fn hid_events_per_minute() -> f64 {
+    HID_RATE_TRACKER
+        .lock()
+        .map(|t| t.events_per_minute())
+        .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+fn reset_hid_tracker_for_tests() {
+    if let Ok(mut t) = HID_RATE_TRACKER.lock() {
+        t.reset_for_tests();
+    }
+}
 
 /// User context snapshot — what is the user actually doing right now?
 ///
@@ -166,7 +308,12 @@ impl UserContext {
 /// safe-default under partial failure: use neutral, not worst-case assumption.
 #[cfg(target_os = "macos")]
 fn collect_idle_secs() -> f64 {
-    collect_idle_secs_inner().unwrap_or(30.0)
+    let idle = collect_idle_secs_inner().unwrap_or(30.0);
+    // Side effect: feed the HID-event-rate tracker. Recording on the
+    // fallback path (30.0) is intentional — a stuck reading produces no
+    // resets and therefore no spurious "events" in the window.
+    record_hid_idle_sample(idle, Instant::now());
+    idle
 }
 
 #[cfg(target_os = "macos")]
@@ -594,5 +741,106 @@ pid 9999(zoom.us): [0x000000010000beef] 00:05:00 PreventUserIdleDisplaySleep nam
         let (sleep, call, _) = parse_pmset_assertions(stdout);
         assert!(sleep);
         assert!(call, "zoom.us owning DisplaySleep → call_in_progress=true");
+    }
+
+    // ── HID event-rate tracker tests (Phase 5.1-D) ────────────────────────────
+    //
+    // These tests share a process-global static mutex (`HID_RATE_TRACKER`).
+    // They acquire a dedicated test-mutex first so they cannot interleave
+    // and corrupt each other's window state, then call
+    // `reset_hid_tracker_for_tests` to start from a known-empty window.
+
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+    static HID_TEST_SERIAL: StdMutex<()> = StdMutex::new(());
+
+    /// No HID resets observed → events_per_minute reports 0.0.
+    ///
+    /// Models a fully-idle laptop: HIDIdleTime monotonically grows, the
+    /// tracker observes no resets, and the modulator stays on its
+    /// `idle_seconds`-only fallback.
+    #[test]
+    fn hid_rate_zero_when_idle_constant() {
+        let _guard = HID_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_hid_tracker_for_tests();
+        let start = Instant::now();
+        // 10 samples, idle strictly increasing — zero resets.
+        for i in 0..10 {
+            let idle = 5.0 + i as f64; // 5.0, 6.0, … 14.0
+            let at = start + Duration::from_secs(i as u64 * 2); // 2-s cadence
+            record_hid_idle_sample(idle, at);
+        }
+        let rate = hid_events_per_minute();
+        assert!(
+            rate.abs() < f64::EPSILON,
+            "expected 0.0 events/min with no resets, got {rate}"
+        );
+    }
+
+    /// An idle-time reset (current < previous) → positive events_per_minute.
+    ///
+    /// Two samples with `idle_secs` dropping from 5.0 to 0.1 over a 2-s
+    /// interval mean at least one keyboard / mouse event fired between
+    /// them. Spread the same pattern over a 10-s window so the min-span
+    /// guard (5 s) passes, and assert the rate is strictly positive.
+    #[test]
+    fn hid_rate_positive_on_idle_reset() {
+        let _guard = HID_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_hid_tracker_for_tests();
+        let start = Instant::now();
+        // Three samples spread over 10 s: idle 5.0 → 0.1 → 1.0.
+        // The 5.0 → 0.1 transition counts as one reset.
+        record_hid_idle_sample(5.0, start);
+        record_hid_idle_sample(0.1, start + Duration::from_secs(5));
+        record_hid_idle_sample(1.0, start + Duration::from_secs(10));
+        let rate = hid_events_per_minute();
+        assert!(
+            rate > 0.0,
+            "expected positive events/min after idle reset, got {rate}"
+        );
+        // Sanity: 1 reset over 10 s → 6 events/min.
+        let expected = 1.0 * 60.0 / 10.0;
+        assert!(
+            (rate - expected).abs() < 1e-6,
+            "expected {expected} events/min, got {rate}"
+        );
+    }
+
+    /// Window caps at 30 samples and the rate divisor is the rolling
+    /// wall-clock span across the retained samples (NOT the lifetime of
+    /// the process). Pushing more than 30 samples must evict the oldest
+    /// and the reported rate must reflect only what is still in the window.
+    #[test]
+    fn hid_rate_window_averages_over_30_cycles() {
+        let _guard = HID_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_hid_tracker_for_tests();
+        let start = Instant::now();
+        let step = Duration::from_secs(2); // 2-s spacing per sample
+
+        // (1) Push 40 samples — 10 will be evicted, 30 retained.
+        //     Idle alternates 1.0 → 0.5 → 1.0 → 0.5 …
+        //     Every transition into 0.5 is a reset (1.0 > 0.5).
+        //     Over 40 samples that is 20 resets total, but only 30 samples
+        //     remain in the window (samples 10..40) which contain 15 resets.
+        for i in 0..40 {
+            let idle = if i % 2 == 0 { 1.0 } else { 0.5 };
+            record_hid_idle_sample(idle, start + step * (i as u32));
+        }
+        let rate = hid_events_per_minute();
+        // Window now spans samples 10..40 → 30 samples → span = 29 * 2 s = 58 s.
+        // 15 resets / 58 s * 60 s/min ≈ 15.517 events/min.
+        let expected = 15.0 * 60.0 / 58.0;
+        assert!(
+            (rate - expected).abs() < 1e-6,
+            "rolling 30-sample window: expected {expected:.3} events/min, got {rate}"
+        );
+
+        // (2) After pushing 40 samples the queue length is capped at 30:
+        //     read the tracker directly to confirm the bound is enforced.
+        let len = HID_RATE_TRACKER
+            .lock()
+            .map(|t| t.samples.len())
+            .unwrap_or(0);
+        assert_eq!(len, HID_RATE_WINDOW, "window must cap at 30 samples");
     }
 }
