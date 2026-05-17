@@ -376,6 +376,41 @@ pub struct LockFreeMetrics {
     /// of truth, atomic). [Hellerstein 2012] mutex avoidance for hot-path
     /// counters.
     pub habituation_skips_total: AtomicU64,
+
+    /// Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16).
+    /// Asymmetric scorer/gate disagreement gate. Two counters expose how
+    /// often the conservative partial cutover actually fires in prod —
+    /// both stay at 0 while shadow_signals is silent and only move once
+    /// the ActionContext is populated with rich enough signal for the
+    /// scorer to disagree confidently with the gate tower.
+    ///
+    /// * `scorer_override_rejects_total` — gate ACCEPTED a candidate
+    ///   action but the scorer's composite was strictly less than
+    ///   −0.30 (strong reject). The action was REJECTED (scorer beats
+    ///   gate in the safe direction) and a `BlockedActionEvent` was
+    ///   emitted to the shadow journal tagged
+    ///   `scorer-override-accept-to-reject`.
+    /// * `scorer_disagreement_strong_accepts_total` — gate REJECTED but
+    ///   the scorer's composite was strictly greater than +0.30 (strong
+    ///   accept). Per NotebookLM 2026-05-16 Candidate-C verdict, we
+    ///   never let the scorer beat the gate in the *unsafe* direction
+    ///   (scorer wants to act, gate said no) — we ONLY journal the
+    ///   disagreement for offline analysis. Cutover to symmetric mode
+    ///   is a Sprint 12 candidate after the asymmetric mode validates
+    ///   with N≥500 events.
+    ///
+    /// Both counters mirror the Phase 3.1 / 5.2 design: surfaced via
+    /// `MetricsSnapshot` → `RuntimeMetrics` → `runtime_metrics.json` so
+    /// operators can verify the partial cutover engages at all (the
+    /// "tautology trap" mitigation CLAUDE.md flags). Without the
+    /// counters there is no way to distinguish "scorer never disagreed
+    /// strongly" from "the override code path is dead".
+    ///
+    /// [Nygard 2018 §8.5] Adaptive capacity limits via shadowing —
+    /// observe both the taken decision and the rejected counterfactual
+    /// before promoting either side.
+    pub scorer_override_rejects_total: AtomicU64,
+    pub scorer_disagreement_strong_accepts_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -506,6 +541,10 @@ impl LockFreeMetrics {
 
             specialist_accuracy_purge_inhibitions_total: AtomicU64::new(0),
             habituation_skips_total: AtomicU64::new(0),
+
+            // Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16).
+            scorer_override_rejects_total: AtomicU64::new(0),
+            scorer_disagreement_strong_accepts_total: AtomicU64::new(0),
         }
     }
 
@@ -872,6 +911,12 @@ impl LockFreeMetrics {
                 .specialist_accuracy_purge_inhibitions_total
                 .load(Ordering::Relaxed),
             habituation_skips_total: self.habituation_skips_total.load(Ordering::Relaxed),
+            scorer_override_rejects_total: self
+                .scorer_override_rejects_total
+                .load(Ordering::Relaxed),
+            scorer_disagreement_strong_accepts_total: self
+                .scorer_disagreement_strong_accepts_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1040,6 +1085,32 @@ impl LockFreeMetrics {
     pub fn add_habituation_skips(&self, n: u64) {
         self.habituation_skips_total.fetch_add(n, Ordering::Relaxed);
     }
+
+    /// Phase C SCORER-OVERRIDE (Sprint 11 finale): bump once per action
+    /// where the PolicyScorer beat the gate tower in the SAFE direction
+    /// (gate accept → composite < −0.30 → final reject). Call from the
+    /// `decide_actions` override site only; tests bump directly to
+    /// validate the round-trip.
+    /// [Nygard 2018 §8.5] — observe the rejected counterfactual.
+    #[inline(always)]
+    pub fn inc_scorer_override_reject(&self) {
+        self.scorer_override_rejects_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Phase C SCORER-OVERRIDE (Sprint 11 finale): bump once per action
+    /// where the gate REJECTED but the scorer's composite was strictly
+    /// greater than +0.30 (strong accept). The asymmetric design refuses
+    /// to let the scorer beat the gate in the unsafe direction —
+    /// per NotebookLM 2026-05-16 Candidate-C verdict — so this counter
+    /// represents *logged disagreement only*, no action change. Used by
+    /// offline analysis (and Sprint 12 cutover gating) to verify the
+    /// scorer would have been right.
+    #[inline(always)]
+    pub fn inc_scorer_disagreement_strong_accept(&self) {
+        self.scorer_disagreement_strong_accepts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // Safe to share across threads — all fields are atomic.
@@ -1151,6 +1222,18 @@ pub struct MetricsSnapshot {
     /// `RuntimeMetrics.habituation_skips` field (which is now populated
     /// FROM this atomic via `sync_from_lockfree`).
     pub habituation_skips_total: u64,
+
+    /// Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16).
+    /// Scorer overrode a gate-ACCEPT into a final REJECT (composite <
+    /// −0.30). Surfaced through `RuntimeMetrics → runtime_metrics.json`
+    /// so the user can verify the partial cutover engages.
+    pub scorer_override_rejects_total: u64,
+    /// Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16).
+    /// Gate REJECTED but scorer wanted to ACCEPT strongly (composite >
+    /// +0.30). Logged for offline analysis only — per NotebookLM
+    /// Candidate-C verdict, the asymmetric mode does NOT let the
+    /// scorer beat the gate in the unsafe direction.
+    pub scorer_disagreement_strong_accepts_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

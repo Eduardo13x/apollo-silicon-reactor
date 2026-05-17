@@ -216,6 +216,19 @@ impl MetricsState {
         // (AIS runtime benchmark reads it via `rm_u("habituation_skips")`),
         // populated FROM the atomic here — single source of truth.
         self.metrics.habituation_skips = lf.habituation_skips_total;
+
+        // Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16).
+        // Asymmetric scorer/gate disagreement counters. Producer is the
+        // `apply_scorer_override` call site in `decide_actions` (gate
+        // tower verdict → scorer cross-check → conditional override).
+        // Both counters stay at 0 until shadow_signals publishes enough
+        // signal for the scorer to disagree strongly with the gate, at
+        // which point dashboards can verify the partial cutover is
+        // actually engaging in prod (the "tautology trap" mitigation
+        // CLAUDE.md flags). Mirrors the Phase 3.1 / 5.2 plumbing pattern.
+        self.metrics.scorer_override_rejects_total = lf.scorer_override_rejects_total;
+        self.metrics.scorer_disagreement_strong_accepts_total =
+            lf.scorer_disagreement_strong_accepts_total;
     }
 }
 

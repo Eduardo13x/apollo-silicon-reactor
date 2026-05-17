@@ -130,6 +130,16 @@ pub struct PolicyScore {
     /// Human-readable reason, for journal/dashboard.
     pub reason: String,
     pub per_feature: Vec<(&'static str, Contribution)>,
+    /// Net composite signal: `total_benefit − λ_cost·total_cost −
+    /// λ_unc·total_uncertainty`. This is the scalar that `accept` thresholds
+    /// against, exposed here so callers (Phase C scorer-override gate in
+    /// `decide_actions`) can apply *strength* thresholds without re-deriving
+    /// the math. A hard veto leaves `composite` at its raw arithmetic value;
+    /// callers must consult `vetoed_by` separately for the absolute reject
+    /// signal. Range is unbounded in principle (depends on registered
+    /// features), but in the Sprint 11 feature set composite is empirically
+    /// confined to roughly [−3.0, +3.5].
+    pub composite: f64,
 }
 
 /// Composable decision surface. Construct via [`PolicyScorer::builder`].
@@ -223,6 +233,7 @@ impl PolicyScorer {
             accept,
             reason,
             per_feature,
+            composite: net,
         }
     }
 }
