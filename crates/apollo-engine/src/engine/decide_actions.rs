@@ -335,6 +335,11 @@ pub fn decide_actions(
     // actually causes pressure to drop. Processes with confidence < 0.20
     // after ≥5 observations are skipped (causally ineffective).
     causal_confidence: &HashMap<String, f32>,
+    // Causal impact map: "throttle:ProcessName" → impact_score where
+    // impact_score = confidence × observed pressure delta, with slow-horizon
+    // and external-blame adjustments already applied by CausalGraph.
+    // Used only for action ordering; confidence remains the skip/filter signal.
+    causal_impact: &HashMap<String, f32>,
     // User context: what is the user doing right now?
     // idle_secs, sleep assertions, call detection, audio state.
     // [Riva & Mantovani 2014] idle time + media state = highest-signal contextual cues.
@@ -1462,31 +1467,8 @@ pub fn decide_actions(
         }
     }
 
-    // [Pearl 2009] Impact-prioritized ordering: sort ThrottleProcess actions by
-    // causal impact score (highest first). When the action queue has capacity limits,
-    // high-impact throttles execute first, maximizing pressure reduction per cycle.
-    // Boosts and freezes keep their original order (boosts first, freezes last).
     {
-        // Partition: boosts first, then throttles (sorted), then freezes/others.
-        let mut boosts = Vec::new();
-        let mut throttles = Vec::new();
-        let mut others = Vec::new();
-        for action in actions {
-            match &action {
-                RootAction::BoostProcess { .. } => boosts.push(action),
-                RootAction::ThrottleProcess { name, .. } => {
-                    let causal_key = format!("throttle:{}", name);
-                    let impact = causal_confidence.get(&causal_key).copied().unwrap_or(0.5); // unknown → neutral priority
-                    throttles.push((impact, action));
-                }
-                _ => others.push(action),
-            }
-        }
-        // Sort throttles by impact descending (highest impact first).
-        throttles.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let mut actions = boosts;
-        actions.extend(throttles.into_iter().map(|(_, a)| a));
-        actions.extend(others);
+        let actions = order_actions_by_causal_impact(actions, causal_confidence, causal_impact);
 
         DecisionOutput {
             // Report effective_context (the context actually used for decisions),
@@ -1505,6 +1487,45 @@ pub fn decide_actions(
             ml_throttle_source,
         }
     }
+}
+
+/// [Pearl 2009] Impact-prioritized ordering: sort ThrottleProcess actions by
+/// causal impact score (highest first). When the action queue has capacity
+/// limits, high-impact throttles execute first, maximizing pressure reduction
+/// per cycle. Boosts and freezes keep their original order.
+///
+/// `causal_confidence` is only the fallback for actions absent from
+/// `causal_impact` (for example, experience-warmed cold processes that have
+/// no measured delta yet). Known causal edges should rank by impact, not raw
+/// confidence.
+fn order_actions_by_causal_impact(
+    actions: Vec<RootAction>,
+    causal_confidence: &HashMap<String, f32>,
+    causal_impact: &HashMap<String, f32>,
+) -> Vec<RootAction> {
+    let mut boosts = Vec::new();
+    let mut throttles = Vec::new();
+    let mut others = Vec::new();
+    for action in actions {
+        match &action {
+            RootAction::BoostProcess { .. } => boosts.push(action),
+            RootAction::ThrottleProcess { name, .. } => {
+                let causal_key = format!("throttle:{}", name);
+                let impact = causal_impact
+                    .get(&causal_key)
+                    .or_else(|| causal_confidence.get(&causal_key))
+                    .copied()
+                    .unwrap_or(0.5);
+                throttles.push((impact, action));
+            }
+            _ => others.push(action),
+        }
+    }
+    throttles.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut ordered = boosts;
+    ordered.extend(throttles.into_iter().map(|(_, a)| a));
+    ordered.extend(others);
+    ordered
 }
 #[cfg(test)]
 mod tests {
@@ -1553,6 +1574,7 @@ mod tests {
         HashMap<WorkloadHop, HopGroupWeight>,
         HashSet<u32>,
         HashMap<String, f32>,
+        HashMap<String, f32>,
     ) {
         (
             Vec::new(),
@@ -1562,6 +1584,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashSet::new(),
+            HashMap::new(),
             HashMap::new(),
         )
     }
@@ -1576,7 +1599,7 @@ mod tests {
         latency: LatencyTarget,
         reactor: f64,
     ) -> DecisionOutput {
-        let (interactive, noise, weights, pids, ipc, hops, hab, causal) = empty_params();
+        let (interactive, noise, weights, pids, ipc, hops, hab, causal, impact) = empty_params();
         let cooldown = crate::engine::freeze_cooldown::FreezeCooldown::new();
         decide_actions(
             snap,
@@ -1595,6 +1618,7 @@ mod tests {
             &hops,
             &hab,
             &causal,
+            &impact,
             &UserContext::default(),
             &HashMap::new(),
             &HashMap::new(),
@@ -2179,6 +2203,51 @@ mod tests {
         assert!(dbg.contains("InteractiveFocus"));
     }
 
+    #[test]
+    fn throttle_ordering_uses_causal_impact_not_raw_confidence() {
+        let actions = vec![
+            RootAction::ThrottleProcess {
+                pid: 10,
+                name: "low-impact-high-confidence".to_string(),
+                aggressive: false,
+                reason: "test".to_string(),
+                decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
+            },
+            RootAction::ThrottleProcess {
+                pid: 20,
+                name: "high-impact-lower-confidence".to_string(),
+                aggressive: false,
+                reason: "test".to_string(),
+                decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
+            },
+        ];
+        let mut causal_confidence = HashMap::new();
+        causal_confidence.insert("throttle:low-impact-high-confidence".to_string(), 0.95);
+        causal_confidence.insert("throttle:high-impact-lower-confidence".to_string(), 0.70);
+        let mut causal_impact = HashMap::new();
+        causal_impact.insert("throttle:low-impact-high-confidence".to_string(), 0.03);
+        causal_impact.insert("throttle:high-impact-lower-confidence".to_string(), 0.12);
+
+        let ordered = order_actions_by_causal_impact(actions, &causal_confidence, &causal_impact);
+
+        let throttle_names: Vec<&str> = ordered
+            .iter()
+            .filter_map(|a| match a {
+                RootAction::ThrottleProcess { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            throttle_names,
+            vec!["high-impact-lower-confidence", "low-impact-high-confidence",],
+            "causal ranking must prefer impact_score over raw confidence"
+        );
+    }
+
     // ── Habituation bypass contract ──────────────────────────────────────────
     // These tests verify the invariant that the swap≥8GB / p_oom≥0.95 bypass
     // relies on: empty habituated_pids → process is re-evaluated every cycle.
@@ -2187,7 +2256,7 @@ mod tests {
     fn habituated_pid_is_skipped() {
         // A process in habituated_pids should produce no action.
         let _snap = make_snapshot(50.0, 0.85, 0.60);
-        let (interactive, noise, weights, behavior_pids, ipc_hints, hop_groups, _, causal) =
+        let (interactive, noise, weights, behavior_pids, ipc_hints, hop_groups, _, causal, impact) =
             empty_params();
         let mut habituated: HashSet<u32> = HashSet::new();
         habituated.insert(999); // mark PID 999 as habituated
@@ -2216,6 +2285,7 @@ mod tests {
             ipc_hints,
             hop_groups,
             causal,
+            impact,
         );
     }
 

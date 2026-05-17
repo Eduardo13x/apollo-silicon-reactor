@@ -121,6 +121,7 @@ impl HidEventRateTracker {
         }
     }
 
+    #[cfg(test)]
     fn reset_for_tests(&mut self) {
         self.last_idle_secs = None;
         self.samples.clear();
@@ -347,7 +348,7 @@ fn collect_idle_secs_inner() -> Option<f64> {
     #[link(name = "IOKit", kind = "framework")]
     extern "C" {
         static kIOMasterPortDefault: MachPortT;
-        fn IOServiceMatching(name: *const i8) -> CFDictionaryRef;
+        fn IOServiceMatching(name: *const i8) -> *mut c_void;
         fn IOServiceGetMatchingService(
             master_port: MachPortT,
             matching: CFDictionaryRef,

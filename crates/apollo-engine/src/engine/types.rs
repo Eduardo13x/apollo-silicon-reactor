@@ -1963,6 +1963,7 @@ pub struct LlmStatus {
 /// Demoted to pub(crate): no bin imports or uses this type; no pub function takes it as
 /// parameter. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct UsageStatus {
     pub(crate) entries: usize,
     pub(crate) last_updated_at: Option<DateTime<Utc>>,

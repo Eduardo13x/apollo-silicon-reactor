@@ -607,7 +607,7 @@ mod tests {
         let snap_before =
             serde_json::to_string(&g_before).expect("serialize pre-propagation graph");
 
-        let mut g_after = g_before.clone();
+        let g_after = g_before.clone();
         let groups = vec!["g1".to_string(), "g2".to_string()];
         let _ = g_after.propagate_attention_across_groups(&groups);
 

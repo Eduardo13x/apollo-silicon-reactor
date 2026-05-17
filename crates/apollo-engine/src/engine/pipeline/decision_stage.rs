@@ -90,6 +90,10 @@ pub struct PolicyContext<'a> {
     /// Processes with confidence <0.20 after ≥5 observations are skipped.
     pub causal_confidence: &'a HashMap<String, f32>,
 
+    /// Pearl-style causal impact map: `"throttle:ProcessName"` → impact_score.
+    /// Used for throttle ordering; confidence remains the skip/filter input.
+    pub causal_impact: &'a HashMap<String, f32>,
+
     /// Current user context: idle time, sleep assertions, call detection, audio.
     /// Drives freeze gating and throttle conservatism based on user activity.
     pub user_ctx: &'a UserContext,
@@ -200,6 +204,7 @@ impl DecisionStage {
             policy.hop_groups,
             policy.habituated_pids,
             policy.causal_confidence,
+            policy.causal_impact,
             policy.user_ctx,
             policy.wakeup_hints,
             policy.footprint_hints,
@@ -263,6 +268,7 @@ mod tests {
         ipc: &'a HashMap<u32, f64>,
         hops: &'a HashMap<WorkloadHop, HopGroupWeight>,
         causal: &'a HashMap<String, f32>,
+        impact: &'a HashMap<String, f32>,
         user_ctx: &'a UserContext,
         cooldown: &'a crate::engine::freeze_cooldown::FreezeCooldown,
     ) -> PolicyContext<'a> {
@@ -276,6 +282,7 @@ mod tests {
             hop_groups: hops,
             habituated_pids: pids,
             causal_confidence: causal,
+            causal_impact: impact,
             user_ctx,
             wakeup_hints: ipc, // reuse empty map (same type)
             footprint_hints: ipc,
@@ -301,6 +308,7 @@ mod tests {
         let empty_ipc: HashMap<u32, f64> = HashMap::new();
         let empty_hops: HashMap<WorkloadHop, HopGroupWeight> = HashMap::new();
         let empty_causal: HashMap<String, f32> = HashMap::new();
+        let empty_impact: HashMap<String, f32> = HashMap::new();
         let user_ctx = UserContext::default();
         let cooldown = crate::engine::freeze_cooldown::FreezeCooldown::new();
         let policy = make_policy(
@@ -311,6 +319,7 @@ mod tests {
             &empty_ipc,
             &empty_hops,
             &empty_causal,
+            &empty_impact,
             &user_ctx,
             &cooldown,
         );
@@ -347,6 +356,7 @@ mod tests {
         let empty_ipc: HashMap<u32, f64> = HashMap::new();
         let empty_hops: HashMap<WorkloadHop, HopGroupWeight> = HashMap::new();
         let empty_causal: HashMap<String, f32> = HashMap::new();
+        let empty_impact: HashMap<String, f32> = HashMap::new();
         let user_ctx = UserContext::default();
         let cooldown = crate::engine::freeze_cooldown::FreezeCooldown::new();
         let policy = make_policy(
@@ -357,6 +367,7 @@ mod tests {
             &empty_ipc,
             &empty_hops,
             &empty_causal,
+            &empty_impact,
             &user_ctx,
             &cooldown,
         );

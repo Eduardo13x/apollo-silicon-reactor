@@ -3216,6 +3216,11 @@ fn main() -> anyhow::Result<()> {
                     &mut causal_confidence,
                     &lctx.outcome_tracker.drift_detector,
                 );
+                let mut causal_impact = lctx.causal_graph.impact_map();
+                CausalGraph::apply_nars_discount(
+                    &mut causal_impact,
+                    &lctx.outcome_tracker.drift_detector,
+                );
 
                 // User context "telepathy" — extracted to
                 // `daemon_cognitive_tick::compute_user_context`.
@@ -3274,6 +3279,7 @@ fn main() -> anyhow::Result<()> {
                         hop_groups: &lctx.outcome_tracker.hop_groups,
                         habituated_pids: effective_habituated,
                         causal_confidence: &causal_confidence,
+                        causal_impact: &causal_impact,
                         user_ctx: &user_context,
                         wakeup_hints: &wakeup_hints,
                         footprint_hints: &footprint_hints,

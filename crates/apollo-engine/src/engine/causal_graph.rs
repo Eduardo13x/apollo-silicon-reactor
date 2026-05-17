@@ -1676,9 +1676,6 @@ mod tests {
     // edge represents observational correlation, not interventional
     // effect; the blame tag is what makes the distinction visible.
 
-    /// External event fires; action recorded inside the 10s window; the
-    /// resulting pressure_drop edge must be tagged.
-    #[test]
     /// Phase 4.2 CONSUMER (Sprint 11) — verify that the impact_score
     /// of an edge tagged with `external_blame` is reduced by exactly
     /// the `EXTERNAL_BLAME_PENALTY` fraction. Closes the Pearl 2009
