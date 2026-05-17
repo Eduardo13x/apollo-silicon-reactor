@@ -184,6 +184,17 @@ pub struct SignalIntelligence {
     // negative = engage more. Set by daemon from ApolloNeuromodulator.
     pub neuro_serotonin_shift: f64,
 
+    /// Phase D PURGE-INHIBITION (Sprint 12 candidate #1, 2026-05-17).
+    /// Set by daemon before `tick` when
+    /// `MaintenanceState::is_in_purge_inhibition_window()` returns true.
+    /// While true, `tick` skips `kf_swap.update(swap_delta_bps, …)` to
+    /// avoid learning the post-purge artificial swap dip as a load
+    /// improvement, and bumps `LSE_COUNTERS.purge_inhibition_skips_total`.
+    /// Auto-clears at the end of every `tick` so a missed purge signal
+    /// downstream cannot keep the predictor silenced indefinitely.
+    /// [Hellerstein 2004 §9] disturbance rejection.
+    pub purge_inhibited: bool,
+
     /// Last KPC IPC value (0 = unavailable). Set by daemon each cycle.
     kpc_ipc: f64,
     /// Last KPC IPC trend (velocity EMA). Negative = becoming memory-bound.
@@ -282,6 +293,7 @@ impl SignalIntelligence {
             learned_high_entry: 0.50,
 
             neuro_serotonin_shift: 0.0,
+            purge_inhibited: false,
 
             kpc_ipc: 0.0,
             kpc_ipc_trend: 0.0,
@@ -352,7 +364,19 @@ impl SignalIntelligence {
         );
         // ── 1. Kalman ────────────────────────────────────────────────────
         self.kf_pressure.update(memory_pressure, dt_secs);
-        self.kf_swap.update(swap_delta_bps, dt_secs);
+        // Phase D PURGE-INHIBITION (Sprint 12 candidate #1, 2026-05-17):
+        // skip the swap-derived Kalman update while a recent vm_purge is
+        // still perturbing the signal. The pressure Kalman keeps tracking
+        // (real memory_pressure observation), only swap is suppressed.
+        // Counter bumps once per gated cycle. Auto-clears below so a
+        // missed downstream clear cannot silence the swap track forever.
+        // [Hellerstein 2004 §9] disturbance rejection.
+        if self.purge_inhibited {
+            crate::engine::lse_counters::LSE_COUNTERS.inc_purge_inhibition_skip();
+            self.purge_inhibited = false;
+        } else {
+            self.kf_swap.update(swap_delta_bps, dt_secs);
+        }
 
         let pressure_smooth = self.kf_pressure.position();
         let pressure_velocity = self.kf_pressure.velocity();
