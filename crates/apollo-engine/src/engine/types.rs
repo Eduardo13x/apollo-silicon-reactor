@@ -1909,6 +1909,37 @@ pub struct RuntimeMetrics {
 }
 
 impl RuntimeMetrics {
+    /// Human-readable summary for the most recent dispatch batch.
+    ///
+    /// Keep the `last_cycle_*` prefix explicit: this field is overwritten every
+    /// cycle and must not be mistaken for cumulative action totals.
+    pub fn format_last_actions_summary(&self, actions: &[RootAction]) -> String {
+        format!(
+            "last_cycle_actions={} last_cycle_boosts={} last_cycle_throttles={} last_cycle_freezes={} last_cycle_sysctl={} invalid_sysctl_denied={} total_boosts_applied={} total_actions_pushed_raw={} total_actions_pushed_boost_typed={}",
+            actions.len(),
+            actions
+                .iter()
+                .filter(|a| matches!(a, RootAction::BoostProcess { .. }))
+                .count(),
+            actions
+                .iter()
+                .filter(|a| matches!(a, RootAction::ThrottleProcess { .. }))
+                .count(),
+            actions
+                .iter()
+                .filter(|a| matches!(a, RootAction::FreezeProcess { .. }))
+                .count(),
+            actions
+                .iter()
+                .filter(|a| matches!(a, RootAction::SetSysctl(_)))
+                .count(),
+            self.invalid_sysctl_denied,
+            self.boosts_applied,
+            self.actions_pushed_raw_total,
+            self.actions_pushed_boost_total,
+        )
+    }
+
     /// True iff survival mode was entered at least once during this session.
     ///
     /// **Cumulative semantic** — once true, stays true until daemon restart,
@@ -2246,6 +2277,34 @@ mod tests {
         assert_eq!(m.cycles, 0);
         assert_eq!(m.boosts_applied, 0);
         assert_eq!(m.failures, 0);
+    }
+
+    #[test]
+    fn last_actions_summary_distinguishes_cycle_from_totals() {
+        let mut m = RuntimeMetrics {
+            boosts_applied: 61,
+            actions_pushed_raw_total: 14_345,
+            actions_pushed_boost_total: 0,
+            invalid_sysctl_denied: 2,
+            ..RuntimeMetrics::default()
+        };
+        let summary = m.format_last_actions_summary(&[]);
+
+        assert!(summary.contains("last_cycle_actions=0"), "{summary}");
+        assert!(summary.contains("last_cycle_boosts=0"), "{summary}");
+        assert!(summary.contains("total_boosts_applied=61"), "{summary}");
+        assert!(
+            summary.contains("total_actions_pushed_raw=14345"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("total_actions_pushed_boost_typed=0"),
+            "{summary}"
+        );
+        assert!(summary.contains("invalid_sysctl_denied=2"), "{summary}");
+
+        m.last_actions_summary = summary;
+        assert!(!m.last_actions_summary.starts_with("actions=0 "));
     }
 
     // ── RootAction::identity_fields — Sprint 4 IdentityVerifier merge ─────────

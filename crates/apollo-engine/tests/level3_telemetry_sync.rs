@@ -167,6 +167,30 @@ fn fase5_all_eleven_action_counters_reach_runtime_metrics() {
     }
 }
 
+#[test]
+fn sync_from_lockfree_does_not_clobber_executor_action_totals() {
+    let lf = LockFreeMetrics::new();
+    lf.inc_cycles();
+    lf.commit();
+
+    let snap = lf.snapshot();
+    let mut state = fresh_metrics_state();
+    state.metrics.boosts_applied = 17;
+    state.metrics.throttles_applied = 11;
+    state.metrics.freezes_applied = 7;
+    state.metrics.unfreezes_applied = 5;
+    state.metrics.throttle_reverted = 3;
+
+    state.sync_from_lockfree(&snap);
+
+    assert_eq!(state.metrics.cycles, 1);
+    assert_eq!(state.metrics.boosts_applied, 17);
+    assert_eq!(state.metrics.throttles_applied, 11);
+    assert_eq!(state.metrics.freezes_applied, 7);
+    assert_eq!(state.metrics.unfreezes_applied, 5);
+    assert_eq!(state.metrics.throttle_reverted, 3);
+}
+
 /// Batch 1 (Sprint 6/7/8) telemetry round-trip: the 7 counters added by
 /// phases 3.2 / 4.2 / 4.3 / 5.2 must all survive the full chain
 /// LockFreeMetrics → snapshot → sync_from_lockfree → RuntimeMetrics → JSON.

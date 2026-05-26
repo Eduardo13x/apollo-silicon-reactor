@@ -4546,15 +4546,8 @@ fn main() -> anyhow::Result<()> {
                         &mut metrics.metrics.budgets,
                         minute_cap,
                     );
-                    metrics.metrics.last_actions_summary = format!(
-                        "actions={} boosts={} throttles={} freezes={} sysctl={} invalid_sysctl_denied={}",
-                        fa.len(),
-                        fa.iter().filter(|a| matches!(a, RootAction::BoostProcess { .. })).count(),
-                        fa.iter().filter(|a| matches!(a, RootAction::ThrottleProcess { .. })).count(),
-                        fa.iter().filter(|a| matches!(a, RootAction::FreezeProcess { .. })).count(),
-                        fa.iter().filter(|a| matches!(a, RootAction::SetSysctl(_))).count(),
-                        metrics.metrics.invalid_sysctl_denied
-                    );
+                    metrics.metrics.last_actions_summary =
+                        metrics.metrics.format_last_actions_summary(&fa);
                     fa
                     // metrics lock released here
                 };

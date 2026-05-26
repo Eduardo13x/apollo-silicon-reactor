@@ -1240,7 +1240,11 @@ fn render_sense_q(status: &DaemonStatus) -> Vec<String> {
         thermal_label(&status.thermal_state)
     ));
 
-    lines.push(format!("Pres   p={:.0}% c={:.0}%", mp * 100.0, m.compressed_memory_ratio * 100.0));
+    lines.push(format!(
+        "Pres   p={:.0}% c={:.0}%",
+        mp * 100.0,
+        m.compressed_memory_ratio * 100.0
+    ));
 
     let score = m.last_pressure_score;
     lines.push(format!(
@@ -1281,8 +1285,14 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     ));
 
     // Bayesian outcome tracker (LLM teacher patterns proxy)
-    let interactive = status.llm.as_ref().map_or(0, |l| l.learned_policy.interactive_patterns);
-    let noise = status.llm.as_ref().map_or(0, |l| l.learned_policy.noise_patterns);
+    let interactive = status
+        .llm
+        .as_ref()
+        .map_or(0, |l| l.learned_policy.interactive_patterns);
+    let noise = status
+        .llm
+        .as_ref()
+        .map_or(0, |l| l.learned_policy.noise_patterns);
     lines.push(format!("Bayes  {}int {}noise", interactive, noise));
 
     // RL Q-table
@@ -1309,7 +1319,10 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
 
     // Hazard / MPC / Markov (compact)
     lines.push("Hazard ✅ low risk".to_string());
-    lines.push(format!("Workload {}", m.current_workload.chars().take(20).collect::<String>()));
+    lines.push(format!(
+        "Workload {}",
+        m.current_workload.chars().take(20).collect::<String>()
+    ));
 
     lines
 }
@@ -1321,7 +1334,13 @@ fn render_decide_q(status: &DaemonStatus) -> Vec<String> {
 
     // MetaCognition
     let humble = m.meta_confidence < 0.40;
-    let meta_label = if humble { "HUMBLE" } else if m.meta_confidence > 0.70 { "CONFIDENT" } else { "NORMAL" };
+    let meta_label = if humble {
+        "HUMBLE"
+    } else if m.meta_confidence > 0.70 {
+        "CONFIDENT"
+    } else {
+        "NORMAL"
+    };
     let meta_emoji = if humble { "🤔" } else { "🎯" };
     lines.push(format!(
         "Meta   {} {} {:.0}%",
@@ -1332,10 +1351,7 @@ fn render_decide_q(status: &DaemonStatus) -> Vec<String> {
 
     // Arousal
     let arousal_pct = (m.arousal_level * 100.0) as i32;
-    lines.push(format!(
-        "Arousal {} {}%",
-        m.arousal_zone, arousal_pct
-    ));
+    lines.push(format!("Arousal {} {}%", m.arousal_zone, arousal_pct));
 
     // UCHS
     lines.push(format!(
@@ -1402,33 +1418,35 @@ fn render_act_q(status: &DaemonStatus) -> Vec<String> {
     // SafetyPolicy budgets — derive from profile to mirror per-profile caps.
     let pol = SafetyPolicy::for_profile(status.effective_profile);
     let bar_w = 8;
-    let boost_ratio = (m.boosts_applied as f64 / pol.max_boosts_per_cycle.max(1) as f64).min(1.0);
-    let throt_ratio = (m.throttles_applied as f64 / pol.max_throttles_per_cycle.max(1) as f64).min(1.0);
-    let frz_ratio = (m.freezes_applied as f64 / pol.max_freezes_per_cycle.max(1) as f64).min(1.0);
-    let hint_ratio = (m.paging_hints_applied as f64 / pol.max_paging_hints_per_cycle.max(1) as f64).min(1.0);
+    let b = &m.budgets;
+    let boost_ratio = (b.cycle_boosts as f64 / pol.max_boosts_per_cycle.max(1) as f64).min(1.0);
+    let throt_ratio =
+        (b.cycle_throttles as f64 / pol.max_throttles_per_cycle.max(1) as f64).min(1.0);
+    let frz_ratio = (b.cycle_freezes as f64 / pol.max_freezes_per_cycle.max(1) as f64).min(1.0);
+    let hint_ratio = (b.cycle_hints as f64 / pol.max_paging_hints_per_cycle.max(1) as f64).min(1.0);
 
     lines.push(format!(
         "Boost  {} {}/{}",
         render_bar(boost_ratio, bar_w),
-        m.boosts_applied,
+        b.cycle_boosts,
         pol.max_boosts_per_cycle
     ));
     lines.push(format!(
         "Throt  {} {}/{}",
         render_bar(throt_ratio, bar_w),
-        m.throttles_applied,
+        b.cycle_throttles,
         pol.max_throttles_per_cycle
     ));
     lines.push(format!(
         "Frz    {} {}/{}",
         render_bar(frz_ratio, bar_w),
-        m.freezes_applied,
+        b.cycle_freezes,
         pol.max_freezes_per_cycle
     ));
     lines.push(format!(
         "Hint   {} {}/{}",
         render_bar(hint_ratio, bar_w),
-        m.paging_hints_applied,
+        b.cycle_hints,
         pol.max_paging_hints_per_cycle
     ));
 
@@ -1447,7 +1465,10 @@ fn render_act_q(status: &DaemonStatus) -> Vec<String> {
         m.energy_savings_wh.unwrap_or(0.0),
         m.energy_co2_avoided_g.unwrap_or(0.0)
     ));
-    lines.push(format!("Reactor {} {}", status.reactor_mode, status.reactor_health));
+    lines.push(format!(
+        "Reactor {} {}",
+        status.reactor_mode, status.reactor_health
+    ));
 
     lines
 }
@@ -1500,22 +1521,40 @@ fn render_gates_band(status: &DaemonStatus) -> Vec<String> {
 
     let mut skip_breakdown = Vec::new();
     if m.maintenance_purge_skipped_pressure_total > 0 {
-        skip_breakdown.push(format!("pres:{}", m.maintenance_purge_skipped_pressure_total));
+        skip_breakdown.push(format!(
+            "pres:{}",
+            m.maintenance_purge_skipped_pressure_total
+        ));
     }
     if m.maintenance_purge_skipped_idle_total > 0 {
-        skip_breakdown.push(format!("idle/media:{}", m.maintenance_purge_skipped_idle_total));
+        skip_breakdown.push(format!(
+            "idle/media:{}",
+            m.maintenance_purge_skipped_idle_total
+        ));
     }
     if m.maintenance_purge_skipped_swap_floor_total > 0 {
-        skip_breakdown.push(format!("floor:{}", m.maintenance_purge_skipped_swap_floor_total));
+        skip_breakdown.push(format!(
+            "floor:{}",
+            m.maintenance_purge_skipped_swap_floor_total
+        ));
     }
     if m.maintenance_purge_skipped_growing_total > 0 {
-        skip_breakdown.push(format!("grow:{}", m.maintenance_purge_skipped_growing_total));
+        skip_breakdown.push(format!(
+            "grow:{}",
+            m.maintenance_purge_skipped_growing_total
+        ));
     }
     if m.maintenance_purge_skipped_build_mode_total > 0 {
-        skip_breakdown.push(format!("build:{}", m.maintenance_purge_skipped_build_mode_total));
+        skip_breakdown.push(format!(
+            "build:{}",
+            m.maintenance_purge_skipped_build_mode_total
+        ));
     }
     if m.maintenance_purge_skipped_rate_limit_total > 0 {
-        skip_breakdown.push(format!("rate:{}", m.maintenance_purge_skipped_rate_limit_total));
+        skip_breakdown.push(format!(
+            "rate:{}",
+            m.maintenance_purge_skipped_rate_limit_total
+        ));
     }
 
     let breakdown_str = if skip_breakdown.is_empty() {
@@ -1710,6 +1749,7 @@ pub fn render_dashboard_v2(status: &DaemonStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apollo_engine::engine::types::{LatencyTarget, RuntimeMetrics};
 
     #[test]
     fn swap_label_stable_when_low_and_no_delta() {
@@ -1747,5 +1787,54 @@ mod tests {
         let label = swap_status_label(12.7, 0.0); // delta=0 (not growing)
         assert_ne!(label, "🟢 Estable", "12.7 GB swap must NOT show Estable");
         assert_eq!(label, "🔴 Crítico");
+    }
+
+    #[test]
+    fn act_quadrant_uses_cycle_hint_budget_not_cumulative_hints() {
+        let mut metrics = RuntimeMetrics {
+            paging_hints_applied: 13,
+            ..RuntimeMetrics::default()
+        };
+        metrics.budgets.cycle_hints = 0;
+
+        let status = DaemonStatus {
+            running: true,
+            profile: OptimizationProfile::AggressiveRoot,
+            latency_target: LatencyTarget::Normal,
+            effective_profile: OptimizationProfile::AggressiveRoot,
+            kill_switch: false,
+            throttle_level: "medium".to_string(),
+            thermal_state: "nominal".to_string(),
+            last_blockers: Vec::new(),
+            auto_profile_enabled: true,
+            base_profile: OptimizationProfile::AggressiveRoot,
+            override_active: false,
+            override_expires_at: None,
+            transition_reason: String::new(),
+            post_wake_grace_active: false,
+            post_wake_grace_remaining_secs: 0,
+            last_wake_at: None,
+            post_wake_policy: String::new(),
+            reactor_mode: "normal".to_string(),
+            reactor_health: "ok".to_string(),
+            metrics,
+            llm: None,
+            frozen_processes: Vec::new(),
+        };
+
+        let lines = render_act_q(&status);
+        let hint_line = lines
+            .iter()
+            .find(|line| line.starts_with("Hint"))
+            .expect("ACT quadrant should render hint budget line");
+
+        assert!(
+            hint_line.contains("0/12"),
+            "hint budget must show current-cycle count: {hint_line}"
+        );
+        assert!(
+            !hint_line.contains("13/12"),
+            "cumulative hints must not be compared to per-cycle cap: {hint_line}"
+        );
     }
 }

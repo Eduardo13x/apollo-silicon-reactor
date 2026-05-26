@@ -59,11 +59,12 @@ impl MetricsState {
     /// Establish p95/durations based on raw microsecond counters.
     pub fn sync_from_lockfree(&mut self, lf: &crate::engine::lse_counters::MetricsSnapshot) {
         self.metrics.cycles = lf.cycles;
-        self.metrics.boosts_applied = lf.actions_applied; // map to boosts for now or split
-        self.metrics.freezes_applied = lf.freezes;
-        self.metrics.unfreezes_applied = lf.unfreezes;
-        self.metrics.throttles_applied = lf.throttles;
-        self.metrics.throttle_reverted = lf.throttle_reverted;
+        // Action outcome totals are owned by ExecuteOutcomes/metrics_reporter
+        // and direct executor side paths. The legacy LSE counters
+        // (`actions_applied`, `freezes`, `unfreezes`, `throttles`,
+        // `throttle_reverted`) are not written by the production executor;
+        // mapping them here clobbers real action totals with zero during
+        // periodic sync.
 
         // Latency durations (convert us -> ms)
         self.metrics.p95_cycle_ms = lf.cycle_time_us as f64 / 1000.0;
