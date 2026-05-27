@@ -81,38 +81,45 @@ pub trait Learner {
 
 /// A single learning event shared across all three subsystems.
 ///
-/// Produced once per throttle action, consumed coherently by all learners.
+/// Produced once per pressure-reduction action, consumed coherently by all learners.
 #[derive(Clone, Debug)]
 pub struct LearningObservation {
-    /// Name of the process that was throttled.
     pub process_name: String,
-    /// Skill name that triggered this throttle, if any.
-    /// `None` for ad-hoc heuristic throttles not yet crystallised as skills.
     pub skill_name: Option<String>,
-    /// Memory pressure immediately before the throttle action.
     pub pre_pressure: f64,
-    /// Memory pressure observed after the evaluation window (≈30s later).
     pub post_pressure: f64,
-    /// Current workload hint (e.g., "Browser", "Build", "any").
     pub workload: String,
-    /// Daemon cycle counter when the action was taken.
     pub cycle: u64,
+    pub action_type: ActionKind,
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    Throttle,
+    Freeze,
+    Memorystatus,
 }
 
 impl LearningObservation {
-    /// Pressure delta: positive means pressure went down (good).
     pub fn delta(&self) -> f64 {
         self.pre_pressure - self.post_pressure
     }
 
-    /// Whether the throttle was effective (delta ≥ 1%).
     pub fn effective(&self) -> bool {
         self.delta() >= 0.01
     }
 
-    /// Action key in CausalGraph convention: `"throttle:<process_name>"`.
     pub fn causal_action_key(&self) -> String {
-        format!("throttle:{}", self.process_name)
+        let prefix = match self.action_type {
+            ActionKind::Throttle => "throttle",
+            ActionKind::Freeze => "freeze",
+            ActionKind::Memorystatus => "memorystatus",
+        };
+        format!("{}:{}", prefix, self.process_name)
+    }
+
+    pub fn registry_key(&self) -> String {
+        self.causal_action_key()
     }
 }
 
@@ -262,10 +269,7 @@ impl LearningPipeline {
         for obs in &self.batch {
             if let Some(w) = outcome_tracker.weights.get(&obs.process_name) {
                 if w.throttle_count >= 3 && w.effectiveness() > 0.7 {
-                    // Derive the canonical skill name for this process.
-                    // CausalGraph uses "throttle:<name>" which is also what the daemon
-                    // passes to skill_registry.learn() from solid edges.
-                    let skill_key = format!("throttle:{}", obs.process_name);
+                    let skill_key = obs.registry_key();
                     let evidence_rate = w.effectiveness();
                     // Boost if skill rate lags evidence by ≥0.15 with ≥3 applications.
                     skill_registry.cross_feed_boost(&skill_key, evidence_rate, 0.15, 3);
@@ -308,7 +312,7 @@ impl LearningPipeline {
         // seed the corresponding OutcomeTracker Bayesian weight so new daemon restarts
         // benefit from crystallised skill knowledge without waiting 20+ throttle cycles.
         for obs in &self.batch {
-            let skill_key = format!("throttle:{}", obs.process_name);
+            let skill_key = obs.registry_key();
             let skill_apply_count = skill_registry.apply_count(&skill_key).unwrap_or_else(|| {
                 eprintln!(
                     "[learning_pipeline] cross-feed C: no apply_count for {:?}, defaulting to 0",
@@ -371,7 +375,7 @@ impl LearningPipeline {
                 .skill_name
                 .as_ref()
                 .map(|s| s.clone())
-                .unwrap_or_else(|| format!("throttle:{}", obs.process_name));
+                .unwrap_or_else(|| obs.registry_key());
             if let Some(rate) = skill_registry.success_rate(&skill_key) {
                 let apps = skill_registry.apply_count(&skill_key).unwrap_or_else(|| {
                     eprintln!(
@@ -435,6 +439,16 @@ mod tests {
     use super::*;
 
     fn make_obs(process: &str, pre: f64, post: f64, cycle: u64) -> LearningObservation {
+        make_obs_with_kind(process, pre, post, cycle, ActionKind::Throttle)
+    }
+
+    fn make_obs_with_kind(
+        process: &str,
+        pre: f64,
+        post: f64,
+        cycle: u64,
+        action_type: ActionKind,
+    ) -> LearningObservation {
         LearningObservation {
             process_name: process.to_string(),
             skill_name: None,
@@ -442,6 +456,7 @@ mod tests {
             post_pressure: post,
             workload: "any".to_string(),
             cycle,
+            action_type,
         }
     }
 
@@ -459,6 +474,7 @@ mod tests {
             post_pressure: post,
             workload: "any".to_string(),
             cycle,
+            action_type: ActionKind::Throttle,
         }
     }
 
@@ -479,6 +495,27 @@ mod tests {
     fn test_causal_action_key() {
         let obs = make_obs("Safari", 0.80, 0.70, 1);
         assert_eq!(obs.causal_action_key(), "throttle:Safari");
+
+        let freeze_obs = make_obs_with_kind("Safari", 0.80, 0.70, 1, ActionKind::Freeze);
+        assert_eq!(freeze_obs.causal_action_key(), "freeze:Safari");
+
+        let mem_obs = make_obs_with_kind("pid:30", 0.80, 0.70, 1, ActionKind::Memorystatus);
+        assert_eq!(mem_obs.causal_action_key(), "memorystatus:pid:30");
+    }
+
+    #[test]
+    fn non_throttle_observation_updates_matching_causal_edge_only() {
+        let mut pipeline = LearningPipeline::new().with_batch_size(1);
+        let mut ot = OutcomeTracker::new();
+        let mut cg = CausalGraph::new();
+        let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
+
+        let obs = make_obs_with_kind("Safari", 0.80, 0.72, 0, ActionKind::Freeze);
+        pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
+
+        assert!(cg.get_edge("freeze:Safari", "pressure_drop").is_some());
+        assert!(cg.get_edge("throttle:Safari", "pressure_drop").is_none());
     }
 
     #[test]

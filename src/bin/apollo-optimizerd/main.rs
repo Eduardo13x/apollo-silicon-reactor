@@ -4216,10 +4216,14 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                let policy = SafetyPolicy::for_capabilities(
+                let base_policy = SafetyPolicy::for_capabilities(
                     SafetyPolicy::for_profile(current_profile),
                     hw_cores,
                     hw_ram_gb,
+                );
+                let policy = SafetyPolicy::with_pressure_modulation(
+                    &base_policy,
+                    signal_digest.pressure_smooth,
                 );
 
                 let now = Instant::now();
@@ -4940,7 +4944,6 @@ fn main() -> anyhow::Result<()> {
                         &snapshot,
                         &cycle_hw_snap,
                         &exec_outcomes,
-                        &action_names_for_outcome,
                         &signal_digest,
                         workload_mode,
                         cycle_count,

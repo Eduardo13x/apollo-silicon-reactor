@@ -57,11 +57,9 @@ struct PendingOutcome {
     process_name: String,
     throttled_at: Instant,
     pressure_before: f64,
-    /// Watts estimados del proceso en el momento del throttle (para record_savings).
     watts_before: f64,
-    /// Swap usado en GB en el momento del throttle — para salience weighting.
-    /// 0.0 si no fue capturado (backward compatible).
     swap_gb_at_throttle: f64,
+    action_type: super::learning_pipeline::ActionKind,
 }
 
 // ── Survival-bias closure: blocked-action counterfactual learning ────────────
@@ -132,15 +130,10 @@ struct PendingBlocked {
 
 /// Resumen de la resolución de un batch de outcomes.
 pub struct OutcomeBatch {
-    /// Nombres de procesos cuyo throttle fue efectivo esta ronda.
     pub effective_names: Vec<String>,
-    /// Watts totales ahorrados por outcomes efectivos (para EnergyTracker).
     pub savings_watts: f64,
-    /// Nombres de procesos marcados como low-value (heurístico fallando).
     pub low_value_names: Vec<String>,
-    /// All resolved outcomes this tick: (process_name, pre_pressure, post_pressure).
-    /// Includes both effective and ineffective resolutions — used by LearningPipeline.
-    pub resolved_outcomes: Vec<(String, f64, f64)>,
+    pub resolved_outcomes: Vec<(String, f64, f64, super::learning_pipeline::ActionKind)>,
 }
 
 // ── Experience Memory ───────────���─────────────────────────────��───────────────
@@ -560,6 +553,23 @@ impl OutcomeTracker {
         watts_before: f64,
         swap_gb: f64,
     ) {
+        self.record_action_with_swap(
+            process_name,
+            pressure_before,
+            watts_before,
+            swap_gb,
+            super::learning_pipeline::ActionKind::Throttle,
+        );
+    }
+
+    pub fn record_action_with_swap(
+        &mut self,
+        process_name: &str,
+        pressure_before: f64,
+        watts_before: f64,
+        swap_gb: f64,
+        action_type: super::learning_pipeline::ActionKind,
+    ) {
         // Actualiza contador de throttles para el peso Bayesiano.
         let w = self.weights.entry(process_name.to_string()).or_default();
         w.throttle_count += 1;
@@ -570,6 +580,7 @@ impl OutcomeTracker {
             pressure_before,
             watts_before,
             swap_gb_at_throttle: swap_gb,
+            action_type,
         });
 
         // Cap: si la cola crece demasiado, descarta los más viejos sin resolver.
@@ -761,7 +772,8 @@ impl OutcomeTracker {
         let check_after = Duration::from_secs(wait_secs);
         let mut effective_names = Vec::new();
         let mut savings_watts = 0.0_f64;
-        let mut resolved_outcomes: Vec<(String, f64, f64)> = Vec::new();
+        let mut resolved_outcomes: Vec<(String, f64, f64, super::learning_pipeline::ActionKind)> =
+            Vec::new();
 
         while let Some(front) = self.pending.front() {
             if front.throttled_at.elapsed() < check_after {
@@ -818,11 +830,12 @@ impl OutcomeTracker {
                 workload,
             });
 
-            // Collect resolved outcome for LearningPipeline (pre/post pressure).
+            // Collect resolved outcome for LearningPipeline (pre/post pressure + action type).
             resolved_outcomes.push((
                 outcome.process_name.clone(),
                 outcome.pressure_before,
                 current_pressure,
+                outcome.action_type,
             ));
 
             // Track per-process time-to-effect for adaptive wait (Phase 7).
@@ -954,6 +967,7 @@ impl OutcomeTracker {
                 outcome.process_name,
                 outcome.pressure_before,
                 current_pressure,
+                outcome.action_type,
             ));
         }
 
@@ -1459,6 +1473,26 @@ mod tests {
     }
 
     #[test]
+    fn record_action_with_swap_preserves_non_throttle_kind() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.record_action_with_swap(
+            "language_server",
+            0.80,
+            1.5,
+            1.0,
+            crate::engine::learning_pipeline::ActionKind::Freeze,
+        );
+
+        let batch = tracker.urgency_flush(0.72);
+
+        assert_eq!(batch.resolved_outcomes.len(), 1);
+        assert_eq!(
+            batch.resolved_outcomes[0].3,
+            crate::engine::learning_pipeline::ActionKind::Freeze
+        );
+    }
+
+    #[test]
     fn tick_marks_effective_when_pressure_drops() {
         let mut tracker = OutcomeTracker::new();
         // Simulate a throttle that happened 31s ago by manipulating pending directly.
@@ -1468,6 +1502,7 @@ mod tests {
             pressure_before: 0.80,
             watts_before: 2.0,
             swap_gb_at_throttle: 0.0,
+            action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
         });
         // Also add throttle_count so weights exist.
         tracker.weights.insert(
@@ -1496,6 +1531,7 @@ mod tests {
             pressure_before: 0.80,
             watts_before: 2.0,
             swap_gb_at_throttle: 0.0,
+            action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
         });
         tracker.weights.insert(
             "Dropbox".to_string(),
@@ -1822,6 +1858,7 @@ mod tests {
             pressure_before: 0.85,
             watts_before: 2.0,
             swap_gb_at_throttle: 1.0,
+            action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
         });
         tracker.pending.push_back(super::PendingOutcome {
             process_name: "App2".into(),
@@ -1829,6 +1866,7 @@ mod tests {
             pressure_before: 0.82,
             watts_before: 1.5,
             swap_gb_at_throttle: 0.5,
+            action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
         });
         assert_eq!(tracker.pending.len(), 2);
         let batch = tracker.urgency_flush(0.70); // pressure dropped to 0.70
@@ -1851,6 +1889,7 @@ mod tests {
             pressure_before: 0.80,
             watts_before: 1.0,
             swap_gb_at_throttle: 0.0,
+            action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
         });
         tracker.urgency_flush(0.70);
         // Should have tracked effect time for SlowApp
@@ -1941,6 +1980,7 @@ mod tests {
             pressure_before: 0.75,
             watts_before: 1.0,
             swap_gb_at_throttle: 0.0,
+            action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
         });
         tracker.weights.insert(
             "test_proc".into(),
@@ -2285,6 +2325,7 @@ mod tests {
                     pressure_before: 0.75,
                     watts_before: 5.0,
                     swap_gb_at_throttle: 0.0,
+                    action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
                 });
         }
         // Use high current pressure so outcomes resolve as effective
@@ -2308,6 +2349,7 @@ mod tests {
                     pressure_before: 0.70,
                     watts_before: 5.0,
                     swap_gb_at_throttle: 0.0,
+                    action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
                 });
         }
         tracker.tick(0.70); // pressure stayed same → drop=0 → NOT effective
@@ -2474,6 +2516,7 @@ mod tests {
                     pressure_before: 0.40, // low pressure → low arousal
                     watts_before: 2.0,
                     swap_gb_at_throttle: 0.1, // minimal swap
+                    action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
                 });
         }
         routine.tick(0.40); // no drop → ineffective
@@ -2494,6 +2537,7 @@ mod tests {
                     pressure_before: 0.90, // high pressure → high arousal
                     watts_before: 2.0,
                     swap_gb_at_throttle: 7.5, // near-full swap → max arousal
+                    action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
                 });
         }
         crisis.tick(0.90); // no drop → ineffective
@@ -2536,6 +2580,7 @@ mod tests {
                     pressure_before: 0.75,
                     watts_before: 3.0,
                     swap_gb_at_throttle: 2.0,
+                    action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
                 });
         }
         tracker.tick(0.70); // 0.75→0.70 drop = effective
@@ -2554,6 +2599,7 @@ mod tests {
                     pressure_before: 0.70,
                     watts_before: 3.0,
                     swap_gb_at_throttle: 5.0,
+                    action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
                 });
         }
         tracker.tick(0.70); // no drop = ineffective

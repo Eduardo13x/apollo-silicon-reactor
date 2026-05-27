@@ -48,7 +48,6 @@
 //! caller — nothing is smuggled through globals or statics.
 
 use crate::cognitive_tick::{self, CognitiveDecision, CognitiveState, CognitiveTickInputs};
-use apollo_engine::engine::nars_belief::DriftDetector;
 use apollo_engine::engine::neuromodulator::NeuroSignals;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
 use apollo_engine::engine::signal_intelligence::SignalDigest;
@@ -99,12 +98,6 @@ pub fn apply_neuromodulator(
         pressure_drop: -signal_digest.pressure_smooth
             * signal_digest.pressure_velocity,
         ode_rss_surprise,
-        // Combine outcome-tracker RL penalty with stability oracle signal.
-        // rl_penalty ∈ [-3, 0]; instability_penalty ∈ [0, 1] scaled by 0.5
-        // → max additional penalty = -0.5, keeping the existing penalty
-        // dominant while letting stability shape policy at the margin.
-        // [Sutton & Barto 2018] §17.4 — reward shaping must preserve scale
-        // hierarchy or it inverts the optimal policy.
         outcome_penalty: lctx.outcome_tracker.rl_penalty()
             - 0.5
                 * stability_oracle.instability_penalty_attenuated(
@@ -126,19 +119,10 @@ pub fn apply_neuromodulator(
             .as_ref()
             .is_some_and(|rl| rl.total_ticks() < 200),
         tau_divergence,
-        // G11: contention_stall_fraction from KPC stall counters when available.
-        // On M1 without the private KPC entitlement, kpc_ipc returns 0 and KPC
-        // stall counters are inaccessible. Fallback: si_entropy_anomaly as proxy.
-        //
-        // NLM peer-review fix: gate behind the "true anomaly" threshold (>2.0)
-        // and scale into [0,1] from there. Raw clamp(0,1) let minor entropy
-        // spikes (ea≈0.5–1.0) fully saturate epsilon_bonus ([0.0,0.05] range)
-        // keeping RL in permanent exploration without physical pressure.
-        // [Heil 2021 PACT §3] — workload entropy tracks last-level cache pressure.
         contention_stall_fraction: {
             let ea = signal_digest.entropy_anomaly;
             if ea > 2.0 {
-                ((ea - 2.0) / 2.0).clamp(0.0, 1.0) // 0 at threshold, 1 at ea≥4.0
+                ((ea - 2.0) / 2.0).clamp(0.0, 1.0)
             } else {
                 0.0
             }
@@ -153,7 +137,7 @@ pub fn apply_neuromodulator(
         rl.neuro_alpha_mult = lctx.neuromod.alpha_multiplier;
         rl.neuro_epsilon_bonus = lctx.neuromod.epsilon_bonus;
         rl.dyna_steps = lctx.neuromod.dyna_steps;
-        rl.enforce_constraints(); // Infrastructure-locked (Hermes)
+        rl.enforce_constraints();
     }
     lctx.signal_intel.neuro_serotonin_shift = lctx.neuromod.serotonin_shift;
 }
@@ -177,8 +161,6 @@ pub fn run_neurocognitive_tick(
     workload_mode_str: &str,
 ) -> CognitiveDecision {
     // ── Derive real epistemic signals from subsystems ─────────────────
-    // [Lakshminarayanan 2017] predictive uncertainty from ensemble variance.
-    // RL Q-value variance: std-dev across arm avg-rewards → spread = uncertainty.
     let rl_q_variance = {
         let avg = lctx.predictive_agent.arm_avg_rewards();
         let n = avg.len() as f64;
@@ -186,7 +168,6 @@ pub fn run_neurocognitive_tick(
         let var = avg.iter().map(|&r| (r - mean).powi(2)).sum::<f64>() / n;
         (var.sqrt() as f32).clamp(0.0, 1.0)
     };
-    // LinUCB exploration: UCB for the most-pulled arm (lower = more exploited).
     let linucb_exploration = {
         let pulls = lctx.predictive_agent.arm_pulls();
         let total = lctx.predictive_agent.total_cycles();
@@ -194,12 +175,9 @@ pub fn run_neurocognitive_tick(
             let best = pulls.iter().copied().max().unwrap_or(1).max(1);
             ((2.0 * (total as f64).ln() / best as f64).sqrt().min(1.0) as f32).clamp(0.0, 1.0)
         } else {
-            1.0 // maximum uncertainty on cold start
+            1.0
         }
     };
-    // Full causal confidence map — lets SelfRewardingEvaluator look up
-    // any past action's confidence, not just the current one.
-    // [Yuan 2024 §3 DR-ZERO]: CausalGraph as internal oracle for JuicyScore.
     let causal_confidence_map: Vec<(String, f32)> =
         lctx.causal_graph.confidence_map().into_iter().collect();
     let top_causal = lctx
@@ -208,18 +186,6 @@ pub fn run_neurocognitive_tick(
         .first()
         .map(|e| e.confidence)
         .unwrap_or(0.0);
-    // MetaCognition CausalGraph calibration (2026-05-11 fix):
-    // Map `top_edge.avg_delta` (predicted Δpressure) and
-    // `OutcomeTracker.causal_effect(velocity_short)` (Rubin counterfactual
-    // residual: short-window observed_drop minus natural_drift_ema) onto
-    // the [0,1] interval that MetaCognition.observe() expects.
-    // Normalizer: clamp(|δ|, 0, 0.10) / 0.10 — a 10% pressure drop is the
-    // empirical ceiling for "fully effective" on M1 8GB (cf. nested-learner
-    // recalibration 2026-04-10, commit 8383eda).
-    // Warmup gate: skip observation until OutcomeTracker has accumulated
-    // enough resolved outcomes that natural_drift_ema is meaningful.
-    // Without the gate, the first ~30 cycles would feed noise into the
-    // calibration EMA and reproduce the previous lock-up.
     let causal_predicted_delta_norm = lctx
         .causal_graph
         .solid_edges_by_impact()
@@ -245,13 +211,6 @@ pub fn run_neurocognitive_tick(
         latest_action: action_names_for_outcome
             .first()
             .map(|n| n.clone()),
-        // 2026-05-12: was `.clamp(0.0, 1.0)` which collapsed signed-reward EMAs
-        // centered near zero (~0.0003) into ~0. MetaCognition then saw RlAgent
-        // predicted_ema≈0 vs actual_ema≈0.18 → gap 0.177 persistent.
-        // Map via `(tanh(reward * 5.0) + 1.0) / 2.0`: K=5 calibrated to the
-        // observed reward range (-0.5..+1.0 per pull, EMA typically -0.2..+0.3).
-        // Neutral 0.0 → 0.5; "good arm" avg 0.1 → 0.73; "bad arm" -0.2 → 0.27.
-        // Symmetric [0,1] contract for MetaCognition.observe().
         predicted_score: {
             let max_reward = lctx
                 .predictive_agent
@@ -273,6 +232,6 @@ pub fn run_neurocognitive_tick(
         causal_actual_delta_norm,
         causal_observation_ready,
     };
-    let drift: &mut DriftDetector = &mut lctx.outcome_tracker.drift_detector;
+    let drift = &mut lctx.outcome_tracker.drift_detector;
     cognitive_tick::run_cognitive_tick(cognitive_state, &cog_inputs, Some(drift))
 }

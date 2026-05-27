@@ -27,7 +27,7 @@ use apollo_engine::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_engine::engine::execute_actions::ExecuteOutcomes;
 use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
 use apollo_engine::engine::learned_state::{LearnableParams, LearnedState, RestoreQualityMonitor};
-use apollo_engine::engine::learning_pipeline::{LearningObservation, LearningPipeline};
+use apollo_engine::engine::learning_pipeline::{ActionKind, LearningObservation, LearningPipeline};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
 use apollo_engine::engine::nars_belief::{ArousalState, Salience};
@@ -36,8 +36,70 @@ use apollo_engine::engine::pipeline::learning_context::LearningContext;
 use apollo_engine::engine::predictive_agent::{Intervention, SpecialistVote};
 use apollo_engine::engine::signal_intelligence::SignalDigest;
 use apollo_engine::engine::system_log_ingester::{SystemEvent, SystemLogIngester};
-use apollo_engine::engine::types::{FrozenPidEntry, FrozenStatePersisted};
+use apollo_engine::engine::types::{FrozenPidEntry, FrozenStatePersisted, RootAction};
 use apollo_engine::engine::workload_classifier::WorkloadMode;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutcomeAction {
+    pub action_type: ActionKind,
+    pub pid: u32,
+    pub name: Option<String>,
+}
+
+impl OutcomeAction {
+    fn process_name_from_snapshot(&self, snapshot: &SystemSnapshot) -> String {
+        self.name
+            .clone()
+            .or_else(|| {
+                snapshot
+                    .top_processes
+                    .iter()
+                    .find(|p| p.pid == self.pid)
+                    .map(|p| p.name.clone())
+            })
+            .unwrap_or_else(|| format!("pid:{}", self.pid))
+    }
+}
+
+fn outcome_action_from_root_action(action: &RootAction) -> Option<OutcomeAction> {
+    match action {
+        RootAction::ThrottleProcess { pid, name, .. } => Some(OutcomeAction {
+            action_type: ActionKind::Throttle,
+            pid: *pid,
+            name: Some(name.clone()),
+        }),
+        RootAction::FreezeProcess { pid, name, .. } => Some(OutcomeAction {
+            action_type: ActionKind::Freeze,
+            pid: *pid,
+            name: Some(name.clone()),
+        }),
+        RootAction::SetMemorystatus { pid, .. } => Some(OutcomeAction {
+            action_type: ActionKind::Memorystatus,
+            pid: *pid,
+            name: None,
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn outcome_actions_from_root_actions(actions: &[RootAction]) -> Vec<OutcomeAction> {
+    actions
+        .iter()
+        .filter_map(outcome_action_from_root_action)
+        .collect()
+}
+
+pub(crate) fn outcome_actions_from_applied_traces(
+    exec_outcomes: &ExecuteOutcomes,
+) -> Vec<OutcomeAction> {
+    exec_outcomes
+        .audit_traces
+        .iter()
+        .filter(|trace| trace.applied)
+        .filter_map(|trace| outcome_action_from_root_action(&trace.intended_action))
+        .collect()
+}
 
 /// Run all per-cycle learning pipeline work.
 ///
@@ -48,7 +110,7 @@ use apollo_engine::engine::workload_classifier::WorkloadMode;
 /// - `snapshot` — current system snapshot (pressure, processes, memory stats)
 /// - `cycle_hw_snap` — hardware snapshot for this cycle (CPU/package watts)
 /// - `exec_outcomes` — execution outcomes from this cycle's action dispatch
-/// - `throttle_names_for_outcome` — names of processes throttled this cycle
+/// - pressure-reduction actions are derived from applied audit traces
 /// - `signal_digest` — current signal digest (pressure_smooth, mpc_recommendation, …)
 /// - `workload_mode` — current workload mode (idle, build, browser, …)
 /// - `cycle_count` — monotonically increasing cycle counter
@@ -73,7 +135,6 @@ pub fn run_learning_tick<'a>(
     snapshot: &SystemSnapshot,
     cycle_hw_snap: &Option<HardwareSnapshot>,
     exec_outcomes: &ExecuteOutcomes,
-    throttle_names_for_outcome: &[String],
     signal_digest: &SignalDigest,
     workload_mode: WorkloadMode,
     cycle_count: u64,
@@ -100,6 +161,8 @@ pub fn run_learning_tick<'a>(
     ode_t_sat_urgency: f64,
     maintenance_state: &MaintenanceState,
 ) {
+    let pressure_actions_for_outcome = outcome_actions_from_applied_traces(exec_outcomes);
+
     // ── Arousal EMA: update every cycle from current pressure + swap ─────────
     // p_oom_est ∈ [0,1]: proxy for OOM risk derived from pressure above 0.70.
     // [Yerkes & Dodson 1908] arousal modulates learning rate.
@@ -121,8 +184,11 @@ pub fn run_learning_tick<'a>(
         nested_learner.tick_l0(signal_quality);
     }
 
-    // ── Outcome tracking: record throttled processes ─────────────────────────
-    if exec_outcomes.throttles_applied > 0 {
+    // ── Outcome tracking: record pressure-reduction actions ──────────────────
+    if exec_outcomes.throttles_applied > 0
+        || exec_outcomes.freezes_applied > 0
+        || exec_outcomes.paging_hints_applied > 0
+    {
         let cpu_watts = cycle_hw_snap
             .as_ref()
             .and_then(|h| h.power.cpu_watts)
@@ -138,20 +204,22 @@ pub fn run_learning_tick<'a>(
         // (2026-05-16): inhibit recording new actions for outcome tracking during
         // the 30s post-purge window to avoid "success poisoning".
         if !maintenance_state.is_purge_recent(30) {
-            for name in throttle_names_for_outcome {
+            for action in &pressure_actions_for_outcome {
+                let name = action.process_name_from_snapshot(snapshot);
                 let proc_watts = snapshot
                     .top_processes
                     .iter()
-                    .find(|p| &p.name == name)
+                    .find(|p| p.pid == action.pid || p.name == name)
                     .map(|p| (p.cpu_usage as f64 / total_cpu_pct) * cpu_watts)
                     .unwrap_or(0.0);
                 // Capture swap context for affective salience weighting.
                 // High swap at throttle time → high arousal → stronger NARS belief.
-                lctx.outcome_tracker.record_throttle_with_swap(
-                    name,
+                lctx.outcome_tracker.record_action_with_swap(
+                    &name,
                     mem_pressure_now,
                     proc_watts,
                     swap_gb_now,
+                    action.action_type,
                 );
             }
         }
@@ -168,12 +236,16 @@ pub fn run_learning_tick<'a>(
         use apollo_engine::engine::causal_graph::ResourceSnapshot;
         let pressure_now = snapshot.pressure.memory_pressure as f32;
         let swap_mb_now = snapshot.pressure.swap_used_bytes as f32 / 1_048_576.0;
-        for name in throttle_names_for_outcome {
+        for action in pressure_actions_for_outcome
+            .iter()
+            .filter(|a| a.action_type == ActionKind::Throttle)
+        {
+            let name = action.process_name_from_snapshot(snapshot);
             // Build per-process resource snapshot for mechanism attribution.
             let res = snapshot
                 .top_processes
                 .iter()
-                .find(|p| &p.name == name)
+                .find(|p| p.pid == action.pid || p.name == name)
                 .map(|p| ResourceSnapshot {
                     rss_mb: p.memory_usage as f32 / 1_048_576.0,
                     cpu_pct: p.cpu_usage,
@@ -187,21 +259,39 @@ pub fn run_learning_tick<'a>(
                 res,
             );
         }
-        // Record freeze actions — only PIDs frozen THIS cycle, not all active ones.
-        for &pid in &exec_outcomes.newly_frozen_pids {
-            if let Some(process) = collector.system().process(sysinfo::Pid::from_u32(pid)) {
-                let res = ResourceSnapshot {
-                    rss_mb: process.memory() as f32 / 1_048_576.0,
-                    cpu_pct: process.cpu_usage(),
+        // Record applied freeze actions from audit traces. This preserves the
+        // verified action identity instead of relying on raw newly_frozen_pids.
+        for action in pressure_actions_for_outcome
+            .iter()
+            .filter(|a| a.action_type == ActionKind::Freeze)
+        {
+            let name = action.process_name_from_snapshot(snapshot);
+            let res = snapshot
+                .top_processes
+                .iter()
+                .find(|p| p.pid == action.pid || p.name == name)
+                .map(|p| ResourceSnapshot {
+                    rss_mb: p.memory_usage as f32 / 1_048_576.0,
+                    cpu_pct: p.cpu_usage,
                     swap_mb: swap_mb_now,
-                };
-                lctx.causal_graph.record_action_with_resources(
-                    &format!("freeze:{}", process.name()),
-                    pressure_now,
-                    cycle_count,
-                    res,
-                );
-            }
+                })
+                .or_else(|| {
+                    collector
+                        .system()
+                        .process(sysinfo::Pid::from_u32(action.pid))
+                        .map(|process| ResourceSnapshot {
+                            rss_mb: process.memory() as f32 / 1_048_576.0,
+                            cpu_pct: process.cpu_usage(),
+                            swap_mb: swap_mb_now,
+                        })
+                })
+                .unwrap_or_default();
+            lctx.causal_graph.record_action_with_resources(
+                &format!("freeze:{}", name),
+                pressure_now,
+                cycle_count,
+                res,
+            );
         }
         // Evaluate pending actions with current resource snapshot.
         // Both fast (3-cycle) and slow (15-cycle) horizons are evaluated.
@@ -283,7 +373,7 @@ pub fn run_learning_tick<'a>(
     // (what happens without action).
     lctx.outcome_tracker.observe_cycle(
         snapshot.pressure.memory_pressure,
-        !throttle_names_for_outcome.is_empty(),
+        !pressure_actions_for_outcome.is_empty(),
     );
 
     // ── Outcome tracker tick (urgency-aware, Phase 7) ────────────────────────
@@ -462,14 +552,21 @@ pub fn run_learning_tick<'a>(
         // Each resolved throttle becomes a LearningObservation with the
         // pre/post pressure captured by tick(). Cross-feeds are applied
         // at batch flush (every 8 observations or at persist time).
-        for (name, pre_pressure, post_pressure) in batch.resolved_outcomes {
+        for (name, pre_pressure, post_pressure, action_type) in batch.resolved_outcomes {
             // ── Loop 1 fix: skills observe their outcomes ───────────────
             // When a resolved outcome matches a known skill target, feed
             // the result back so the skill adapts its min_pressure and
             // success_rate from real data instead of only causal graph edges.
             let effective = post_pressure < pre_pressure - 0.01;
             {
-                let skill_name = format!("throttle:{}", name);
+                let prefix = match action_type {
+                    apollo_engine::engine::learning_pipeline::ActionKind::Throttle => "throttle",
+                    apollo_engine::engine::learning_pipeline::ActionKind::Freeze => "freeze",
+                    apollo_engine::engine::learning_pipeline::ActionKind::Memorystatus => {
+                        "memorystatus"
+                    }
+                };
+                let skill_name = format!("{}:{}", prefix, name);
                 lctx.skill_registry.record_result_with_pressure(
                     &skill_name,
                     effective,
@@ -490,11 +587,12 @@ pub fn run_learning_tick<'a>(
 
             let obs = LearningObservation {
                 process_name: name,
-                skill_name: None, // skill attribution tracked by pending_trial_skill path
+                skill_name: None,
                 pre_pressure,
                 post_pressure,
                 workload: workload_mode.as_str().to_string(),
                 cycle: cycle_count,
+                action_type,
             };
             // NestedLearner L1: tick per resolved outcome.
             // Effectiveness = normalized pressure drop (0.02 drop → 1.0 effective).
@@ -865,5 +963,99 @@ pub fn run_learning_tick<'a>(
                     .record_result(&edge.cause, edge.confidence > 0.5);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apollo_engine::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
+    use apollo_engine::engine::learning_pipeline::ActionKind;
+    use apollo_engine::engine::types::RootAction;
+    use chrono::Utc;
+
+    fn trace(action: RootAction, applied: bool) -> PolicyDecisionTrace {
+        PolicyDecisionTrace {
+            t: Utc::now(),
+            cycle: 1,
+            intended_action: action,
+            decision_reason: DecisionReason::PressureContext,
+            applied,
+            block_reason: None,
+            pressure: 0.72,
+            swap_gb: 2.0,
+            thrashing: 0.1,
+        }
+    }
+
+    #[test]
+    fn outcome_actions_from_root_actions_preserves_kind_without_prefixing_names() {
+        let actions = vec![
+            RootAction::throttle(10, "Safari", true, "test", DecisionReason::PressureContext),
+            RootAction::freeze(
+                20,
+                "language_server",
+                "test",
+                DecisionReason::PressureContext,
+            ),
+            RootAction::set_memorystatus(30, 10, "test", DecisionReason::PressureContext),
+            RootAction::BoostProcess {
+                pid: 40,
+                name: "Finder".to_string(),
+                reason: "latency".to_string(),
+                decision_reason: DecisionReason::PressureContext,
+            },
+        ];
+
+        let outcome_actions = outcome_actions_from_root_actions(&actions);
+
+        assert_eq!(outcome_actions.len(), 3);
+        assert_eq!(outcome_actions[0].action_type, ActionKind::Throttle);
+        assert_eq!(outcome_actions[0].name.as_deref(), Some("Safari"));
+        assert_eq!(outcome_actions[1].action_type, ActionKind::Freeze);
+        assert_eq!(outcome_actions[1].name.as_deref(), Some("language_server"));
+        assert_eq!(outcome_actions[2].action_type, ActionKind::Memorystatus);
+        assert_eq!(outcome_actions[2].pid, 30);
+        assert_eq!(outcome_actions[2].name, None);
+    }
+
+    #[test]
+    fn outcome_actions_from_applied_traces_ignores_blocked_actions() {
+        let exec_outcomes = ExecuteOutcomes {
+            audit_traces: vec![
+                trace(
+                    RootAction::throttle(
+                        10,
+                        "Safari",
+                        true,
+                        "test",
+                        DecisionReason::PressureContext,
+                    ),
+                    true,
+                ),
+                trace(
+                    RootAction::freeze(
+                        20,
+                        "language_server",
+                        "test",
+                        DecisionReason::PressureContext,
+                    ),
+                    false,
+                ),
+                trace(
+                    RootAction::set_memorystatus(30, 10, "test", DecisionReason::PressureContext),
+                    true,
+                ),
+            ],
+            ..ExecuteOutcomes::default()
+        };
+
+        let outcome_actions = outcome_actions_from_applied_traces(&exec_outcomes);
+
+        assert_eq!(outcome_actions.len(), 2);
+        assert_eq!(outcome_actions[0].action_type, ActionKind::Throttle);
+        assert_eq!(outcome_actions[0].name.as_deref(), Some("Safari"));
+        assert_eq!(outcome_actions[1].action_type, ActionKind::Memorystatus);
+        assert_eq!(outcome_actions[1].pid, 30);
     }
 }

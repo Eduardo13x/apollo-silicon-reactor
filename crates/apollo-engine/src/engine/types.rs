@@ -180,31 +180,67 @@ impl SafetyPolicy {
         }
     }
 
+    /// Returns a SafetyPolicy whose budgets are modulated by current memory pressure.
+    ///
+    /// When pressure > 0.70 (high): budgets increase to handle more aggressive load.
+    /// When pressure < 0.40 (low): budgets decrease to avoid unnecessary overhead.
+    /// When pressure is moderate, budgets are unchanged.
+    ///
+    /// This lets Apollo self-regulate: more headroom, more actions possible.
+    pub fn with_pressure_modulation(base: &Self, pressure: f64) -> Self {
+        let scale = if pressure > 0.70 {
+            1.25
+        } else if pressure < 0.40 {
+            0.7
+        } else {
+            1.0
+        };
+        Self {
+            max_boosts_per_cycle: ((base.max_boosts_per_cycle as f64 * scale).round() as usize)
+                .max(1),
+            max_throttles_per_cycle: ((base.max_throttles_per_cycle as f64 * scale).round()
+                as usize)
+                .max(1),
+            max_paging_hints_per_cycle: ((base.max_paging_hints_per_cycle as f64 * scale).round()
+                as usize)
+                .max(1),
+            max_freezes_per_cycle: ((base.max_freezes_per_cycle as f64 * scale).round() as usize)
+                .max(1),
+            max_sysctl_writes_per_cycle: ((base.max_sysctl_writes_per_cycle as f64 * scale).round()
+                as usize)
+                .max(1),
+            cooldown_seconds: base.cooldown_seconds,
+            max_thread_qos_per_cycle: ((base.max_thread_qos_per_cycle as f64 * scale).round()
+                as usize)
+                .max(1),
+        }
+    }
+
     pub fn for_profile(profile: OptimizationProfile) -> Self {
         match profile {
             OptimizationProfile::AggressiveRoot => Self {
                 max_boosts_per_cycle: 10,
-                max_throttles_per_cycle: 20,
-                max_paging_hints_per_cycle: 12,
-                max_freezes_per_cycle: 8,
+                max_throttles_per_cycle: 30,
+                max_paging_hints_per_cycle: 20,
+                max_freezes_per_cycle: 12,
                 max_sysctl_writes_per_cycle: 8,
                 cooldown_seconds: 10,
                 max_thread_qos_per_cycle: 20,
             },
             OptimizationProfile::SafeRoot => Self {
                 max_boosts_per_cycle: 3,
-                max_throttles_per_cycle: 6,
-                max_paging_hints_per_cycle: 3,
-                max_freezes_per_cycle: 2,
+                max_throttles_per_cycle: 8,
+                max_paging_hints_per_cycle: 5,
+                max_freezes_per_cycle: 3,
                 max_sysctl_writes_per_cycle: 2,
                 cooldown_seconds: 45,
                 max_thread_qos_per_cycle: 4,
             },
             OptimizationProfile::BalancedRoot => Self {
                 max_boosts_per_cycle: 6,
-                max_throttles_per_cycle: 12,
-                max_paging_hints_per_cycle: 6,
-                max_freezes_per_cycle: 4,
+                max_throttles_per_cycle: 18,
+                max_paging_hints_per_cycle: 15,
+                max_freezes_per_cycle: 8,
                 max_sysctl_writes_per_cycle: 4,
                 cooldown_seconds: 20,
                 max_thread_qos_per_cycle: 10,
@@ -2305,6 +2341,16 @@ mod tests {
 
         m.last_actions_summary = summary;
         assert!(!m.last_actions_summary.starts_with("actions=0 "));
+    }
+
+    #[test]
+    fn pressure_modulation_caps_high_pressure_growth_to_25_percent() {
+        let base = SafetyPolicy::for_profile(OptimizationProfile::AggressiveRoot);
+        let high = SafetyPolicy::with_pressure_modulation(&base, 0.80);
+
+        assert_eq!(high.max_throttles_per_cycle, 38);
+        assert_eq!(high.max_freezes_per_cycle, 15);
+        assert_eq!(high.max_paging_hints_per_cycle, 25);
     }
 
     // ── RootAction::identity_fields — Sprint 4 IdentityVerifier merge ─────────

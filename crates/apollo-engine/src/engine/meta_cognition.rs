@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use super::neon_ema::ema_f32;
 
 /// Calibration error threshold to trigger humble mode.
-const HUMBLE_THRESHOLD: f32 = 0.20;
+const HUMBLE_THRESHOLD: f32 = 0.25;
 
 /// Number of cycles in humble mode before re-evaluating.
 const HUMBLE_DURATION: u32 = 50;
