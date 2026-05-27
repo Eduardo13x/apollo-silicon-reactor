@@ -173,7 +173,7 @@ pub fn run_neurocognitive_tick(
     cognitive_state: &mut CognitiveState,
     cycle_count: u64,
     signal_digest: &SignalDigest,
-    throttle_names_for_outcome: &[String],
+    action_names_for_outcome: &[String],
     workload_mode_str: &str,
 ) -> CognitiveDecision {
     // ── Derive real epistemic signals from subsystems ─────────────────
@@ -242,9 +242,9 @@ pub fn run_neurocognitive_tick(
         outcome_effectiveness: lctx.outcome_tracker.overall_effectiveness(),
         causal_confidence: top_causal,
         causal_confidence_map,
-        latest_action: throttle_names_for_outcome
+        latest_action: action_names_for_outcome
             .first()
-            .map(|n| format!("throttle:{}", n)),
+            .map(|n| n.clone()),
         // 2026-05-12: was `.clamp(0.0, 1.0)` which collapsed signed-reward EMAs
         // centered near zero (~0.0003) into ~0. MetaCognition then saw RlAgent
         // predicted_ema≈0 vs actual_ema≈0.18 → gap 0.177 persistent.

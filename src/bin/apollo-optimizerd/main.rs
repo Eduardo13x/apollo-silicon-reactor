@@ -4688,15 +4688,23 @@ fn main() -> anyhow::Result<()> {
                     lctx.causal_graph.qos_preferred_names();
                 let mut causal_qos_upgrades_cycle = 0u32;
 
-                // Captura los nombres de throttles antes de mover final_actions.
-                let throttle_names_for_outcome: Vec<String> = final_actions
+                // Captura los nombres de throttles y freezes para el self-evaluator.
+                // Solo throttles y freezes se loggean porque son acciones que reducen presión.
+                // Boosts no se loggean (son de latencia/QoS, no reducen memoria).
+                // SetMemorystatus se loggea para rastrear paging hints (acción más frecuente en M1 8GB).
+                let action_names_for_outcome: Vec<String> = final_actions
                     .iter()
-                    .filter_map(|a| {
-                        if let RootAction::ThrottleProcess { name, .. } = a {
-                            Some(name.clone())
-                        } else {
-                            None
+                    .filter_map(|a| match a {
+                        RootAction::ThrottleProcess { name, .. } => {
+                            Some(format!("throttle:{}", name))
                         }
+                        RootAction::FreezeProcess { name, .. } => {
+                            Some(format!("freeze:{}", name))
+                        }
+                        RootAction::SetMemorystatus { pid, reason, .. } => {
+                            Some(format!("memorystatus:pid:{}:{}", pid, reason))
+                        }
+                        _ => None,
                     })
                     .collect();
                 // Phase 0b: hoist execute-start outside the block scope so it
@@ -4932,7 +4940,7 @@ fn main() -> anyhow::Result<()> {
                         &snapshot,
                         &cycle_hw_snap,
                         &exec_outcomes,
-                        &throttle_names_for_outcome,
+                        &action_names_for_outcome,
                         &signal_digest,
                         workload_mode,
                         cycle_count,
@@ -4996,7 +5004,7 @@ fn main() -> anyhow::Result<()> {
                     &mut cognitive_state,
                     cycle_count,
                     &signal_digest,
-                    &throttle_names_for_outcome,
+                    &action_names_for_outcome,
                     workload_mode.as_str(),
                 );
                 lf_metrics.record_stage(
