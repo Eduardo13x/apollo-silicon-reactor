@@ -197,6 +197,17 @@ All learned state persists in `learned_state.json` via `LearnedState` in `crates
 
 **Adding a new component:** Add a `#[serde(default)]` field to `LearnedState`, populate in `collect()`, restore in `apply()`.
 
+## Agent Skills
+
+These skills are available when the task matches their description:
+
+- **apollo-evolve** (`~/.claude/skills/apollo-evolve/SKILL.md`) - Darwinian systems evolution for Rust. Paper-backed architecture, measured improvements, commit-per-phase discipline. Trigger: `/apollo-evolve`
+- **diagnose** (`~/.claude/skills/diagnose/SKILL.md`) - Disciplined diagnosis loop for hard bugs and performance regressions. Trigger: `/diagnose`
+- **tdd** (`~/.claude/skills/tdd/SKILL.md`) - Test-driven development with red-green-refactor loop. Trigger: `/tdd`
+- **grill-me** (`~/.claude/skills/grill-me/SKILL.md`) - Stress-test plans and designs. Trigger: `/grill-me`
+- **improve-codebase-architecture** (`~/.claude/skills/improve-codebase-architecture/SKILL.md`) - Find refactoring opportunities. Trigger: `/improve`
+- **zoom-out** (`~/.claude/skills/zoom-out/SKILL.md`) - Get broader context or higher-level perspective. Trigger: `/zoom-out`
+
 ## LSE Counter Discipline
 
 11 lock-free counters live in `pub static LSE_COUNTERS: LockFreeMetrics`. Producer = engine module bumps via `LSE_COUNTERS.inc_*()`. Consumer = `daemon_state.rs::sync_from_lockfree` copies into `RuntimeMetrics` for `runtime_metrics.json`.
