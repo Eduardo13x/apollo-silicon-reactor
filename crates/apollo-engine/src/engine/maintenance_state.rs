@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 /// not the artificial dip mid-flush.
 pub const PURGE_INHIBITION_WINDOW_SECS: u64 = 5;
 
+/// Extended window when compressor hasn't stabilized. Covers slow flushes
+/// on high-memory-pressure systems (M1 8GB under LLM workloads).
+pub const PURGE_INHIBITION_WINDOW_MAX: u64 = 12;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MaintenanceState {
     #[serde(skip)]
@@ -41,9 +45,21 @@ pub struct MaintenanceState {
     /// Skipped from persistence — re-initializes to 0 per daemon restart.
     #[serde(skip)]
     pub consecutive_thrash_cycles: u32,
+
+    /// 2026-05-28: Tracks whether the compressor is still flushing after
+    /// a purge. When true, the inhibition window extends to MAX (12s) instead
+    /// of the base (5s) to avoid learning the artificial dip.
+    #[serde(skip)]
+    pub compressor_still_flushing: bool,
 }
 
 impl MaintenanceState {
+    /// 2026-05-28: marks compressor as actively flushing. Call this when
+    /// post-purge swap velocity is still negative (compressor feeding VM).
+    pub fn mark_compressor_flushing(&mut self, active: bool) {
+        self.compressor_still_flushing = active;
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -64,10 +80,19 @@ impl MaintenanceState {
 
     /// Returns true while predictors should inhibit swap-derived updates
     /// because a recent purge perturbed the swap signal. See
-    /// [`PURGE_INHIBITION_WINDOW_SECS`] for the window rationale.
+    /// [`PURGE_INHIBITION_WINDOW_SECS`] for the base window rationale.
+    ///
+    /// Adaptive extension: if `compressor_still_flushing` is true, extends
+    /// the window to [`PURGE_INHIBITION_WINDOW_MAX`] (12s) to cover slow
+    /// compressor flushes on high-memory-pressure systems (M1 8GB under LLM).
     /// [Hellerstein 2004 §9] disturbance rejection in closed-loop systems.
     pub fn is_in_purge_inhibition_window(&self) -> bool {
-        self.is_purge_recent(PURGE_INHIBITION_WINDOW_SECS)
+        let window = if self.compressor_still_flushing {
+            PURGE_INHIBITION_WINDOW_MAX
+        } else {
+            PURGE_INHIBITION_WINDOW_SECS
+        };
+        self.is_purge_recent(window)
     }
 
     pub fn secs_since_cli_purge(&self) -> u64 {

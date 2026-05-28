@@ -1523,6 +1523,16 @@ pub fn decide_actions(
 /// `causal_impact` (for example, experience-warmed cold processes that have
 /// no measured delta yet). Known causal edges should rank by impact, not raw
 /// confidence.
+/// [Pearl 2009] Impact-prioritized ordering: sort ThrottleProcess actions by
+/// causal impact score (highest first). When the action queue has capacity
+/// limits, high-impact throttles execute first, maximizing pressure reduction
+/// per cycle. Boosts and freezes keep their original order.
+///
+/// `causal_confidence` is only the fallback for actions absent from
+/// `causal_impact` (cold processes with no measured delta yet).
+/// Fallback uses discounted confidence (×0.6) to reflect that confidence
+/// alone is less reliable than measured impact — avoids ranking high-conf
+/// cold processes above proven lower-conf warm ones.
 fn order_actions_by_causal_impact(
     actions: Vec<RootAction>,
     causal_confidence: &HashMap<String, f32>,
@@ -1536,11 +1546,15 @@ fn order_actions_by_causal_impact(
             RootAction::BoostProcess { .. } => boosts.push(action),
             RootAction::ThrottleProcess { name, .. } => {
                 let causal_key = format!("throttle:{}", name);
-                let impact = causal_impact
-                    .get(&causal_key)
-                    .or_else(|| causal_confidence.get(&causal_key))
-                    .copied()
-                    .unwrap_or(0.5);
+                let impact = match causal_impact.get(&causal_key) {
+                    Some(&v) => v,
+                    None => {
+                        // Fallback: discount confidence by 0.6x since we have no measured impact.
+                        // A high-confidence cold process (0.9 conf, 0 observed delta) ranks below
+                        // a warm process with measured impact (0.5 impact, 3+ observations).
+                        causal_confidence.get(&causal_key).copied().unwrap_or(0.3) * 0.6
+                    }
+                };
                 throttles.push((impact, action));
             }
             _ => others.push(action),
