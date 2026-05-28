@@ -22,10 +22,17 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::rl_threshold::{RlState, RlThresholdAgent, RL_ABSOLUTE_FLOOR};
+use crate::engine::rl_threshold::{RlState, RlThresholdAgent};
 use crate::engine::workload_classifier::WorkloadMode;
 
 // ── Thresholds ────────────────────────────────────────────────────────────────
+
+pub const BASE_BG_PRESSURE: f64 = 0.65;
+pub const BASE_CRITICAL_PRESSURE: f64 = 0.73;
+pub const BASE_EXTREME_PRESSURE: f64 = 0.78;
+pub const BG_PRESSURE_FLOOR: f64 = 0.65;
+pub const CRITICAL_PRESSURE_FLOOR: f64 = 0.73;
+pub const EXTREME_PRESSURE_FLOOR: f64 = 0.78;
 
 /// Umbrales de presión de memoria que usa el sistema de decisión.
 #[derive(Debug, Clone, Copy)]
@@ -43,9 +50,9 @@ pub struct OverflowThresholds {
 impl Default for OverflowThresholds {
     fn default() -> Self {
         Self {
-            bg_pressure: 0.78,
-            critical_pressure: 0.88,
-            extreme_pressure: 0.90,
+            bg_pressure: BASE_BG_PRESSURE,
+            critical_pressure: BASE_CRITICAL_PRESSURE,
+            extreme_pressure: BASE_EXTREME_PRESSURE,
             workload_mode: WorkloadMode::Idle,
         }
     }
@@ -351,9 +358,9 @@ impl OverflowGuard {
         let total_offset = self.applied_offset(workload_mode);
 
         OverflowThresholds {
-            bg_pressure: (0.78 + total_offset).max(RL_ABSOLUTE_FLOOR),
-            critical_pressure: (0.88 + total_offset).max(0.73),
-            extreme_pressure: (0.90 + total_offset).max(0.78),
+            bg_pressure: (BASE_BG_PRESSURE + total_offset).max(BG_PRESSURE_FLOOR),
+            critical_pressure: (BASE_CRITICAL_PRESSURE + total_offset).max(CRITICAL_PRESSURE_FLOOR),
+            extreme_pressure: (BASE_EXTREME_PRESSURE + total_offset).max(EXTREME_PRESSURE_FLOOR),
             workload_mode,
         }
     }
@@ -375,9 +382,9 @@ impl OverflowGuard {
         let d_offset = -(pressure_velocity.max(0.0) * KD).min(MAX_D_OFFSET);
         let base = self.thresholds(workload_mode);
         OverflowThresholds {
-            bg_pressure: (base.bg_pressure + d_offset).max(RL_ABSOLUTE_FLOOR),
-            critical_pressure: (base.critical_pressure + d_offset).max(0.68),
-            extreme_pressure: (base.extreme_pressure + d_offset).max(0.73),
+            bg_pressure: (base.bg_pressure + d_offset).max(BG_PRESSURE_FLOOR),
+            critical_pressure: (base.critical_pressure + d_offset).max(CRITICAL_PRESSURE_FLOOR),
+            extreme_pressure: (base.extreme_pressure + d_offset).max(EXTREME_PRESSURE_FLOOR),
             workload_mode: base.workload_mode,
         }
     }
@@ -572,13 +579,13 @@ mod tests {
         let guard = make_guard_with_events(&ages);
         let t = guard.thresholds(WorkloadMode::Idle);
         assert!(
-            t.bg_pressure > 0.70,
+            t.bg_pressure > BASE_BG_PRESSURE,
             "bg_pressure debe haberse recuperado: {}",
             t.bg_pressure
         );
-        // Idle mode adds +0.03 bonus, so ceiling is 0.78 + 0.03 = 0.81.
+        // Idle mode adds +0.03 bonus, so ceiling is base + 0.03.
         assert!(
-            t.bg_pressure <= 0.81,
+            t.bg_pressure <= BASE_BG_PRESSURE + 0.03,
             "no puede superar el default + idle bonus: {}",
             t.bg_pressure
         );
@@ -662,7 +669,7 @@ mod tests {
 
     #[test]
     fn d_term_positive_velocity_tightens_thresholds() {
-        let guard = make_guard_with_device_offset(0.0);
+        let guard = make_guard_with_device_offset(0.05);
         let base = guard.thresholds(WorkloadMode::Idle);
         let d = guard.thresholds_with_d_term(WorkloadMode::Idle, 0.1);
         assert!(
@@ -679,7 +686,7 @@ mod tests {
 
     #[test]
     fn d_term_capped_at_max_offset() {
-        let guard = make_guard_with_device_offset(0.0);
+        let guard = make_guard_with_device_offset(0.05);
         let base = guard.thresholds(WorkloadMode::Idle);
         // velocity=10.0 >> kd threshold — should be capped at MAX_D_OFFSET=0.05
         let d = guard.thresholds_with_d_term(WorkloadMode::Idle, 10.0);

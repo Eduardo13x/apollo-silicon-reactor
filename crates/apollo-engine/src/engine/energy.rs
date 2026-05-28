@@ -556,9 +556,9 @@ pub fn battery_aware_cost_penalty(
     let ctx_term = 0.05 * (ctxs / 5_000.0).clamp(0.0, 1.0);
     let raw = wake_term + ctx_term;
 
-    // 4. Cap by regime. Low pressure: 0.20. High pressure: 0.05 (preserve
+    // 4. Cap by regime. Low pressure: 0.20. High pressure: 0.02 (preserve
     //    survival headroom — see [Le Sueur & Heiser 2010]).
-    let cap = if pressure >= 0.50 { 0.05 } else { 0.20 };
+    let cap = if pressure >= 0.50 { 0.02 } else { 0.20 };
     raw.min(cap).clamp(0.0, 0.20)
 }
 
@@ -1071,7 +1071,7 @@ mod tests {
     //
     // TDD red-phase tests for `battery_aware_cost_penalty`. The function must
     // never penalize actions on AC power, must scale monotonically with
-    // wakeup pressure on battery, and must cap at 0.20 (or 0.05 under high
+    // wakeup pressure on battery, and must cap at 0.20 (or 0.02 under high
     // memory pressure so survival actions are not blocked).
     //
     // [Tiwari 1994] frames CPU energy at instruction granularity; high
@@ -1148,29 +1148,29 @@ mod tests {
     }
 
     #[test]
-    fn cost_penalty_capped_at_005_under_high_pressure_on_battery() {
-        // Under high memory pressure (≥0.50), the penalty cap drops to 0.05 so
-        // it never blocks survival actions whose benefit exceeds 0.05.
-        // Even a pathological wakeup storm must not push the penalty above 0.05.
+    fn cost_penalty_capped_at_002_under_high_pressure_on_battery() {
+        // Under high memory pressure (≥0.50), the penalty cap drops to 0.02 so
+        // it does not make battery mode feel materially less responsive than AC.
+        // Even a pathological wakeup storm must not push the penalty above 0.02.
         let p_storm = battery_aware_cost_penalty(true, 10_000.0, 100_000.0, 0.80);
         assert!(
-            (p_storm - 0.05).abs() < 1e-9,
-            "high-pressure storm penalty must equal 0.05, got {}",
+            (p_storm - 0.02).abs() < 1e-9,
+            "high-pressure storm penalty must equal 0.02, got {}",
             p_storm
         );
 
         let p_mid = battery_aware_cost_penalty(true, 250.0, 2_500.0, 0.55);
         assert!(
-            p_mid <= 0.05 + 1e-9,
-            "high-pressure mid penalty must be ≤0.05, got {}",
+            p_mid <= 0.02 + 1e-9,
+            "high-pressure mid penalty must be ≤0.02, got {}",
             p_mid
         );
 
         // At the boundary (pressure == 0.50), behave as high-pressure regime.
         let p_boundary = battery_aware_cost_penalty(true, 10_000.0, 100_000.0, 0.50);
         assert!(
-            p_boundary <= 0.05 + 1e-9,
-            "boundary pressure must be ≤0.05, got {}",
+            p_boundary <= 0.02 + 1e-9,
+            "boundary pressure must be ≤0.02, got {}",
             p_boundary
         );
     }
@@ -1207,11 +1207,19 @@ mod tests {
         // Defensive guard: NaN/Inf inputs (sensor glitches) must not
         // produce NaN/Inf outputs. Sanitize to zero.
         let p_nan_w = battery_aware_cost_penalty(true, f64::NAN, 1_000.0, 0.10);
-        assert!(p_nan_w.is_finite(), "NaN wakeups must yield finite, got {}", p_nan_w);
+        assert!(
+            p_nan_w.is_finite(),
+            "NaN wakeups must yield finite, got {}",
+            p_nan_w
+        );
         assert!(p_nan_w >= 0.0 && p_nan_w <= 0.20);
 
         let p_inf_c = battery_aware_cost_penalty(true, 100.0, f64::INFINITY, 0.10);
-        assert!(p_inf_c.is_finite(), "Inf ctx must yield finite, got {}", p_inf_c);
+        assert!(
+            p_inf_c.is_finite(),
+            "Inf ctx must yield finite, got {}",
+            p_inf_c
+        );
         assert!(p_inf_c >= 0.0 && p_inf_c <= 0.20);
 
         let p_neg = battery_aware_cost_penalty(true, -50.0, -500.0, 0.10);

@@ -12,11 +12,11 @@
 /// decision-makers should use.
 ///
 /// # Threshold impact example
-/// Default `bg_pressure` threshold = 0.78, `critical_pressure` = 0.88.
-/// At raw pressure = 0.60 with moderate load (Phase1 thermal + Warning hw + battery):
-///   0.60 + 0.07 + 0.15 + 0.04 = **0.86** → BackgroundPressure, not InteractiveFocus.
+/// Default `bg_pressure` threshold = 0.65, `critical_pressure` = 0.73.
+/// At raw pressure = 0.40 with moderate load (Phase1 thermal + Warning hw + battery):
+///   0.40 + 0.07 + 0.15 + 0.04 = **0.66** → BackgroundPressure, not InteractiveFocus.
 /// Without the boosts, `decide_actions` would classify this as InteractiveFocus and
-/// skip all throttling — systemically under-aggressive in the 0.55–0.70 raw range.
+/// skip all throttling — systemically under-aggressive in the 0.40–0.60 raw range.
 
 /// All individual pressure contributions, retained for observability and debugging.
 #[derive(Debug, Clone, Default)]
@@ -181,17 +181,17 @@ mod tests {
 
     #[test]
     fn typical_moderate_scenario() {
-        // base=0.60, Phase1Gentle thermal=0.07, Warning hw=0.15, Normal battery=0.04
-        // → effective ≈ 0.86 (above bg_pressure=0.78 threshold)
-        let (eff, comp) = compute(0.60, 0.15, 0.04, 0.07, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        let expected = 0.60 + 0.15 + 0.04 + 0.07;
+        // base=0.40, Phase1Gentle thermal=0.07, Warning hw=0.15, Normal battery=0.04
+        // → effective ≈ 0.66 (above bg_pressure=0.65 threshold)
+        let (eff, comp) = compute(0.40, 0.15, 0.04, 0.07, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let expected = 0.40 + 0.15 + 0.04 + 0.07;
         assert!(
             (eff - expected).abs() < 1e-9,
             "expected {expected}, got {eff}"
         );
         assert!(
-            eff > 0.78,
-            "effective pressure should exceed bg_pressure threshold (0.78), got {eff}"
+            eff > 0.65,
+            "effective pressure should exceed bg_pressure threshold (0.65), got {eff}"
         );
         assert_eq!(comp.hardware, 0.15);
         assert_eq!(comp.thermal, 0.07);

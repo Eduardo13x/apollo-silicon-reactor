@@ -886,11 +886,11 @@ mod tests {
             .expect("ACT quadrant should render cumulative action totals");
 
         assert!(
-            hint_line.contains("0/12"),
+            hint_line.contains("0/20"),
             "hint budget must show current-cycle count: {hint_line}"
         );
         assert!(
-            !hint_line.contains("13/12"),
+            !hint_line.contains("13/20"),
             "cumulative hints must not be compared to per-cycle cap: {hint_line}"
         );
         assert!(

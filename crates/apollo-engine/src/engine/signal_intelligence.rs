@@ -802,9 +802,9 @@ impl SignalIntelligence {
         self.energy_bias = if thermal_emergency {
             -0.15 // lower thresholds → run everything → act fast
         } else if !is_charging && battery_pct < 20 {
-            0.15 // critical battery → raise thresholds → conserve CPU
-        } else if !is_charging && battery_pct < 50 {
-            0.08 // low battery → moderate conservation
+            0.10 // critical battery → conserve CPU without waiting for survival
+        } else if !is_charging && battery_pct < 30 {
+            0.04 // low battery → light conservation without visible lag
         } else {
             0.0 // plugged in or plenty of battery
         };
@@ -1529,13 +1529,14 @@ mod tests {
     #[test]
     fn test_energy_bias_low_battery_skips_more() {
         let mut si = SignalIntelligence::new();
-        // Critical battery: bias = +0.15, so mid_entry = 0.45, high_entry = 0.65.
+        // Critical battery: bias = +0.10, so mid_entry = 0.40, high_entry = 0.60.
         si.set_energy_bias(15, false, false);
+        assert!((si.energy_bias - 0.10).abs() < 1e-9);
 
-        // Warm up Kalman to 0.40 — normally mid-zone, but with bias it's LOW zone.
+        // Warm up Kalman to 0.35 — normally mid-zone, but with bias it's LOW zone.
         for _ in 0..30 {
             si.tick(
-                0.40,
+                0.35,
                 10.0,
                 0.01,
                 0.05,
@@ -1549,7 +1550,7 @@ mod tests {
             );
         }
         let d = si.tick(
-            0.40,
+            0.35,
             10.0,
             0.01,
             0.05,
@@ -1561,14 +1562,26 @@ mod tests {
             8_000_000_000,
             0.5,
         );
-        // At 0.40 with bias +0.15, we're below mid_entry (0.45) → skip all heavy.
+        // At 0.35 with bias +0.10, we're below mid_entry (0.40) → skip all heavy.
         assert_eq!(
             d.entropy_anomaly, 0.0,
-            "entropy skipped on low battery at 0.40"
+            "entropy skipped on low battery at 0.35"
         );
         assert_eq!(
             d.mpc_recommendation, 0,
-            "MPC skipped on low battery at 0.40"
+            "MPC skipped on low battery at 0.35"
+        );
+    }
+
+    #[test]
+    fn test_energy_bias_mid_battery_keeps_responsiveness() {
+        let mut si = SignalIntelligence::new();
+        si.set_energy_bias(42, false, false);
+
+        assert!(
+            si.energy_bias.abs() < f64::EPSILON,
+            "42% battery should not raise router thresholds; got {}",
+            si.energy_bias
         );
     }
 

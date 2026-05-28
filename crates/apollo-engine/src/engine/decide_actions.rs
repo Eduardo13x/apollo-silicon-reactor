@@ -1670,8 +1670,8 @@ mod tests {
 
     #[test]
     fn context_background_pressure_from_memory() {
-        // memory_pressure 0.80 > default bg_pressure 0.78
-        let snap = make_snapshot(30.0, 0.80, 0.0);
+        // memory_pressure 0.70 > default bg_pressure 0.65
+        let snap = make_snapshot(30.0, 0.70, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
         assert!(
             matches!(ctx, InteractiveContext::BackgroundPressure),
@@ -1706,8 +1706,8 @@ mod tests {
 
     #[test]
     fn context_thermal_constrained_from_memory() {
-        // memory_pressure 0.95 > default critical_pressure 0.88
-        let snap = make_snapshot(20.0, 0.95, 0.0);
+        // memory_pressure 0.75 > default critical_pressure 0.73
+        let snap = make_snapshot(20.0, 0.75, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
         assert!(
             matches!(ctx, InteractiveContext::ThermalConstrained),

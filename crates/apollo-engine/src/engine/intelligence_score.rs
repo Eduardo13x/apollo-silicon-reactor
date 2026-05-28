@@ -249,7 +249,11 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
     // D1
     let bps_protected = rm_u("bps_protected");
     let throttles = rm_u("throttles_applied");
-    let reverted = rm_u("throttle_reverted");
+    let reverted = throttle_reverts_only(
+        rm_u("throttle_reverted"),
+        rm_u("unfreezes_applied"),
+        throttles,
+    );
     let boosts = rm_u("boosts_applied");
 
     // D2: Kalman RMSE + Riccati floor (IPC-modulated).
@@ -448,7 +452,7 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
 
     let input = AisInput {
         total_decisions: throttles + boosts + bps_protected,
-        correct_decisions: throttles - reverted + boosts + bps_protected,
+        correct_decisions: throttles.saturating_sub(reverted) + boosts + bps_protected,
         protected_preserved: bps_protected,
         protected_total: bps_protected,
         noise_throttled: throttles.saturating_sub(reverted),
@@ -815,7 +819,7 @@ fn safety_compliance(input: &AisInput) -> f64 {
         101..=1000 => 0.18,  // sustained pressure (occasional crisis)
         1001..=5000 => 0.13, // chronic load (M1 8GB heavy day)
         5001..=25000 => 0.08,
-        _ => 0.0,            // degraded
+        _ => 0.0, // degraded
     };
 
     // No failures: +0.20.
@@ -927,6 +931,20 @@ fn safe_ratio_u32(num: u32, den: u32) -> f64 {
     }
 }
 
+fn throttle_reverts_only(
+    reverted_total: u64,
+    unfreezes_applied: u64,
+    throttles_applied: u64,
+) -> u64 {
+    // RuntimeMetrics::throttle_reverted is legacy-mixed: unfreeze paths
+    // increment it as "reverted freeze" while AIS needs only throttle false
+    // positives. Discount known unfreezes and cap at applied throttles so a
+    // post-wake thaw cannot poison decision precision.
+    reverted_total
+        .saturating_sub(unfreezes_applied)
+        .min(throttles_applied)
+}
+
 // ── Display ──────────────────────────────────────────────────────────────────
 impl std::fmt::Display for AisScore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -963,6 +981,13 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════════
     // RUNTIME BENCHMARK — reads real production daemon state
     // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn throttle_reverts_discount_legacy_unfreeze_counts() {
+        assert_eq!(throttle_reverts_only(9, 9, 1), 0);
+        assert_eq!(throttle_reverts_only(12, 9, 5), 3);
+        assert_eq!(throttle_reverts_only(20, 0, 5), 5);
+    }
 
     /// Production AIS benchmark. Reads live daemon state from /var/lib/apollo/.
     /// Skipped automatically when daemon is not running (CI environments).
@@ -1012,7 +1037,11 @@ mod tests {
         // protected_preserved / protected_total = 1.0 (every protected process was kept).
         let bps_protected = rm_u("bps_protected");
         let throttles = rm_u("throttles_applied");
-        let reverted = rm_u("throttle_reverted");
+        let reverted = throttle_reverts_only(
+            rm_u("throttle_reverted"),
+            rm_u("unfreezes_applied"),
+            throttles,
+        );
         let boosts = rm_u("boosts_applied");
 
         // ── D2: Signal Quality ───────────────────────────────────────────────
@@ -1263,7 +1292,7 @@ mod tests {
             // D1: protected_preserved = bps_protected (all scored-protected processes
             // were correctly kept). noise/interactive treated as fully correct.
             total_decisions: throttles + boosts + bps_protected,
-            correct_decisions: throttles - reverted + boosts + bps_protected,
+            correct_decisions: throttles.saturating_sub(reverted) + boosts + bps_protected,
             protected_preserved: bps_protected,
             protected_total: bps_protected,
             noise_throttled: throttles.saturating_sub(reverted),
@@ -1445,8 +1474,8 @@ mod tests {
             regime_shifts_total: signal.3,    // actual shifts in simulation
             hardware_cores: 8,
             hardware_memory_gb: 8,
-            rl_total_ticks: 0,        // simulation mode: use convergence_ticks
-            current_pressure: 0.0,    // simulation mode: use skip-rate formula
+            rl_total_ticks: 0,     // simulation mode: use convergence_ticks
+            current_pressure: 0.0, // simulation mode: use skip-rate formula
             causal_mechanism_count: 0,
             experience_memory_count: 0,
             novel_patterns_count: 0,

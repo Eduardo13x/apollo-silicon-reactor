@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::nars_belief::DriftDetector;
 use crate::engine::neon_ema;
-use crate::engine::overflow_guard::OverflowThresholds;
+use crate::engine::overflow_guard::{
+    OverflowThresholds, BG_PRESSURE_FLOOR, CRITICAL_PRESSURE_FLOOR, EXTREME_PRESSURE_FLOOR,
+};
 use crate::engine::swap_predictor::SwapTrend;
 use crate::engine::user_profile::WorkloadType;
 
@@ -824,9 +826,11 @@ impl PredictiveAgent {
     pub fn adjust_thresholds(&self, mut thresholds: OverflowThresholds) -> OverflowThresholds {
         let adj = self.threshold_adjustment();
         if adj != 0.0 {
-            thresholds.bg_pressure = (thresholds.bg_pressure + adj).max(0.50);
-            thresholds.critical_pressure = (thresholds.critical_pressure + adj).max(0.60);
-            thresholds.extreme_pressure = (thresholds.extreme_pressure + adj).max(0.65);
+            thresholds.bg_pressure = (thresholds.bg_pressure + adj).max(BG_PRESSURE_FLOOR);
+            thresholds.critical_pressure =
+                (thresholds.critical_pressure + adj).max(CRITICAL_PRESSURE_FLOOR);
+            thresholds.extreme_pressure =
+                (thresholds.extreme_pressure + adj).max(EXTREME_PRESSURE_FLOOR);
         }
         thresholds
     }
@@ -1036,12 +1040,21 @@ mod tests {
         let adj = agent.adjust_thresholds(base);
         assert!((adj.bg_pressure - base.bg_pressure).abs() < 1e-10);
 
-        // With TightenThresholds, thresholds lowered.
+        // With TightenThresholds, bg also retains the soft-relief floor while
+        // critical/extreme retain the panic-cycle safety floors.
         agent.last_action = Some((Intervention::TightenThresholds, ctx.features, 0.5));
         let adj = agent.adjust_thresholds(base);
-        assert!(adj.bg_pressure < base.bg_pressure);
-        assert!(adj.critical_pressure < base.critical_pressure);
-        assert!(adj.extreme_pressure < base.extreme_pressure);
+        assert_eq!(adj.bg_pressure, base.bg_pressure);
+        assert_eq!(adj.critical_pressure, base.critical_pressure);
+        assert_eq!(adj.extreme_pressure, base.extreme_pressure);
+
+        let elevated = OverflowThresholds {
+            bg_pressure: 0.70,
+            ..base
+        };
+        let adj = agent.adjust_thresholds(elevated);
+        assert!(adj.bg_pressure < elevated.bg_pressure);
+        assert!(adj.bg_pressure >= BG_PRESSURE_FLOOR);
     }
 
     #[test]

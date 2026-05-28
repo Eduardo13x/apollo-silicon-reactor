@@ -14,8 +14,9 @@
 //!
 //! ## Safety
 //! Hard floor: the RL adjustment can never push absolute thresholds below 0.45.
-//! The RL output is an additive correction on top of the existing exponential
-//! decay (compute_dynamic_offset), which provides the baseline behavior.
+//! Consumers may impose higher domain floors for specific threshold classes.
+//! The RL output is an additive correction on top of the overflow guard's
+//! base threshold and existing exponential decay (compute_dynamic_offset).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -816,10 +817,10 @@ mod tests {
     fn test_absolute_floor() {
         let mut agent = make_agent();
         agent.current_adjustment = ADJUSTMENT_FLOOR;
-        let effective = (0.78 + agent.current_adjustment).max(RL_ABSOLUTE_FLOOR);
+        let effective = (0.65 + agent.current_adjustment).max(RL_ABSOLUTE_FLOOR);
         assert!(effective >= RL_ABSOLUTE_FLOOR);
         let effective2 =
-            (0.78 + (-0.20) + (-0.08) + agent.current_adjustment).max(RL_ABSOLUTE_FLOOR);
+            (0.65 + (-0.20) + (-0.08) + agent.current_adjustment).max(RL_ABSOLUTE_FLOOR);
         assert!(effective2 >= RL_ABSOLUTE_FLOOR);
     }
 

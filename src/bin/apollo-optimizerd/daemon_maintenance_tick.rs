@@ -20,6 +20,7 @@ use std::sync::atomic::Ordering;
 use apollo_engine::collector::SystemSnapshot;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
+use apollo_engine::engine::shadow_signals;
 use apollo_engine::engine::user_context::UserContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,13 @@ pub enum SkipReason {
     BusSaturated,
 }
 
+const EMERGENCY_THRASHING_PURGE_SCORE: f64 = 25_000.0;
+const CRITICAL_THRASHING_PURGE_SCORE: f64 = 50_000.0;
+const EMERGENCY_THRASHING_STREAK_SCORE: f64 = 15_000.0;
+const EMERGENCY_THRASHING_MIN_CYCLES: u32 = 3;
+const EMERGENCY_PURGE_COOLDOWN_SECS: u64 = 300;
+const CRITICAL_THRASHING_P_OOM: f64 = 0.80;
+
 /// Returns true if the maintenance tick fired a purge in this cycle.
 /// Caller should record `system_maintenance_purge` in the CausalGraph
 /// for observational outcome tracking (≥30 samples before trusting).
@@ -66,30 +74,33 @@ pub fn run_maintenance_tick(
     //
     // Emergency path: thrashing > 25k for ≥3 cycles AND no media/call AND
     // build_active false → purge bypass with 300s cooldown (not 1800s).
+    // Critical path: thrashing > 50k for ≥3 cycles can bypass media/assertion
+    // politeness too; at that flow rate the user is already paying the stall.
     // [Camacho 2007] predictive control under sustained flow-crisis must
     // override level gates that are tuned for level thresholds.
     let thrash = snap.pressure.thrashing_score;
     state.push_thrashing(thrash);
-    let emergency = thrash > 25_000.0
-        && state.thrashing_streak_above(15_000.0, 3)
-        && !ctx.audio_active
-        && !ctx.call_in_progress
-        && !ctx.has_sleep_assertion
-        && !build_active
-        && state.secs_since_any_purge() >= 300;
-    if emergency
-        && std::process::Command::new("purge").spawn().is_ok() {
-            state.mark_purged();
-            lf_metrics
-                .maintenance_purge_total
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::info!(
-                thrashing = thrash as u64,
-                pressure = snap.pressure.memory_pressure,
-                "maintenance: emergency thrashing-bypass purge"
-            );
-            return true;
-        }
+    let p_oom_30s = shadow_signals::get_p_oom_30s().unwrap_or(0.0);
+    let emergency = emergency_thrashing_purge_allowed(
+        thrash,
+        p_oom_30s,
+        ctx,
+        state,
+        build_active,
+        bus_saturated,
+    );
+    if emergency && std::process::Command::new("purge").spawn().is_ok() {
+        state.mark_purged();
+        lf_metrics
+            .maintenance_purge_total
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            thrashing = thrash as u64,
+            pressure = snap.pressure.memory_pressure,
+            "maintenance: emergency thrashing-bypass purge"
+        );
+        return true;
+    }
 
     match should_fire(snap, ctx, state, build_active, bus_saturated) {
         None => {
@@ -122,6 +133,36 @@ pub fn run_maintenance_tick(
             false
         }
     }
+}
+
+fn emergency_thrashing_purge_allowed(
+    thrash: f64,
+    p_oom_30s: f64,
+    ctx: &UserContext,
+    state: &MaintenanceState,
+    build_active: bool,
+    bus_saturated: bool,
+) -> bool {
+    if thrash <= EMERGENCY_THRASHING_PURGE_SCORE
+        || !state.thrashing_streak_above(
+            EMERGENCY_THRASHING_STREAK_SCORE,
+            EMERGENCY_THRASHING_MIN_CYCLES,
+        )
+        || build_active
+        || state.secs_since_any_purge() < EMERGENCY_PURGE_COOLDOWN_SECS
+    {
+        return false;
+    }
+
+    let media_or_assertion = ctx.audio_active || ctx.call_in_progress || ctx.has_sleep_assertion;
+    let critical_lockup =
+        thrash > CRITICAL_THRASHING_PURGE_SCORE && p_oom_30s >= CRITICAL_THRASHING_P_OOM;
+
+    if bus_saturated && !critical_lockup {
+        return false;
+    }
+
+    !media_or_assertion || critical_lockup
 }
 
 pub(crate) fn should_fire(
@@ -358,6 +399,50 @@ mod tests {
         assert_eq!(
             should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::MediaActive)
+        );
+    }
+
+    #[test]
+    fn emergency_thrashing_respects_media_until_critical() {
+        let ctx = UserContext {
+            idle_secs: 200.0,
+            audio_active: true,
+            ..Default::default()
+        };
+        let mut state = MaintenanceState::default();
+        state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
+
+        assert!(
+            !emergency_thrashing_purge_allowed(30_000.0, 0.90, &ctx, &state, false, false),
+            "moderate emergency thrashing should still respect active media"
+        );
+        assert!(
+            !emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, false),
+            "critical thrashing without high p_oom should still respect active media"
+        );
+        assert!(
+            emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, false, false),
+            "critical sustained thrashing plus high p_oom should bypass media politeness"
+        );
+    }
+
+    #[test]
+    fn emergency_thrashing_keeps_build_and_bus_blocks() {
+        let ctx = idle_ctx();
+        let mut state = MaintenanceState::default();
+        state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
+
+        assert!(
+            !emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, true, false),
+            "build mode remains protected under critical thrashing"
+        );
+        assert!(
+            !emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, true),
+            "bus saturation remains protected without high p_oom"
+        );
+        assert!(
+            emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, false, true),
+            "high p_oom critical thrashing may bypass bus saturation to avoid lockup"
         );
     }
 
