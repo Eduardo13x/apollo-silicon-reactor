@@ -151,6 +151,9 @@ pub fn run_survival_tick(
                     // Write shared timestamp so maintenance_tick yields.
                     // Survival itself does NOT read this field — asymmetric.
                     maintenance_state.mark_purged();
+                    maintenance_state.mark_compressor_flushing(
+                        snapshot.pressure.swap_delta_bytes_per_sec < 0.0,
+                    );
                 }
         }
     }

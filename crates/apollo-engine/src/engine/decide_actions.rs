@@ -1517,12 +1517,6 @@ pub fn decide_actions(
 /// [Pearl 2009] Impact-prioritized ordering: sort ThrottleProcess actions by
 /// causal impact score (highest first). When the action queue has capacity
 /// limits, high-impact throttles execute first, maximizing pressure reduction
-/// per cycle. Boosts and freezes keep their original order.
-///
-/// `causal_confidence` is only the fallback for actions absent from
-/// `causal_impact` (for example, experience-warmed cold processes that have
-/// no measured delta yet). Known causal edges should rank by impact, not raw
-/// confidence.
 /// [Pearl 2009] Impact-prioritized ordering: sort ThrottleProcess actions by
 /// causal impact score (highest first). When the action queue has capacity
 /// limits, high-impact throttles execute first, maximizing pressure reduction
@@ -1566,6 +1560,7 @@ fn order_actions_by_causal_impact(
     ordered.extend(others);
     ordered
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

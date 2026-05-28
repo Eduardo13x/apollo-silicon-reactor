@@ -91,6 +91,7 @@ pub fn run_maintenance_tick(
     );
     if emergency && std::process::Command::new("purge").spawn().is_ok() {
         state.mark_purged();
+        state.mark_compressor_flushing(snap.pressure.swap_delta_bytes_per_sec < 0.0);
         lf_metrics
             .maintenance_purge_total
             .fetch_add(1, Ordering::Relaxed);
@@ -106,6 +107,7 @@ pub fn run_maintenance_tick(
         None => {
             if std::process::Command::new("purge").spawn().is_ok() {
                 state.mark_purged();
+                state.mark_compressor_flushing(snap.pressure.swap_delta_bytes_per_sec < 0.0);
                 lf_metrics
                     .maintenance_purge_total
                     .fetch_add(1, Ordering::Relaxed);
