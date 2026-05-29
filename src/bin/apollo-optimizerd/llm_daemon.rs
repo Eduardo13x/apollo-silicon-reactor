@@ -924,10 +924,16 @@ fn boost_dedup_cache() -> &'static std::sync::Mutex<HashMap<u32, std::time::Inst
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+fn learned_policy_boost_ttl_secs() -> u64 {
+    120
+}
+
 fn should_emit_boost(pid: u32, ttl_secs: u64) -> bool {
     let now = std::time::Instant::now();
     let ttl = std::time::Duration::from_secs(ttl_secs);
-    let mut cache = boost_dedup_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = boost_dedup_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // Prune stale entries opportunistically.
     cache.retain(|_, t| now.duration_since(*t) < ttl);
     match cache.get(&pid) {
@@ -992,7 +998,7 @@ pub fn apply_learned_policy_actions(
             .any(|pat| p.name.contains(pat))
             && !seen.contains(&(p.pid, "boost"))
             && !survival
-            && should_emit_boost(p.pid, 30)
+            && should_emit_boost(p.pid, learned_policy_boost_ttl_secs())
         {
             actions.push(RootAction::BoostProcess {
                 pid: p.pid,
@@ -1186,5 +1192,13 @@ mod tests {
             .filter(|a| matches!(a, RootAction::BoostProcess { .. }))
             .count();
         assert_eq!(boosts, 1, "must not duplicate existing boost");
+    }
+
+    #[test]
+    fn learned_policy_boost_ttl_is_longer_than_thirty_seconds() {
+        assert!(
+            learned_policy_boost_ttl_secs() >= 120,
+            "mach QoS boosts are sticky; re-emitting every 30s creates journal noise"
+        );
     }
 }

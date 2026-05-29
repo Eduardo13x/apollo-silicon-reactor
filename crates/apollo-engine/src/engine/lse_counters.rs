@@ -658,6 +658,31 @@ impl LockFreeMetrics {
         max.fetch_max(ns, Ordering::Relaxed);
     }
 
+    /// Drain the observed max for one stage since the previous drain.
+    ///
+    /// The total counters remain cumulative for long-run averages, but max
+    /// values are interval telemetry. Keeping lifetime maxes made a single
+    /// stall poison dashboards for days.
+    #[inline(always)]
+    pub fn drain_stage_max_ns(&self, stage: CycleStage) -> u64 {
+        let max = match stage {
+            CycleStage::Sense => &self.stage_sense_max_ns,
+            CycleStage::Reason => &self.stage_reason_max_ns,
+            CycleStage::Execute => &self.stage_execute_max_ns,
+            CycleStage::Learn => &self.stage_learn_max_ns,
+            CycleStage::Persist => &self.stage_persist_max_ns,
+            CycleStage::ReasonSignalTick => &self.stage_reason_signal_max_ns,
+            CycleStage::ReasonDecide => &self.stage_reason_decide_max_ns,
+            CycleStage::ReasonNeuro => &self.stage_reason_neuro_max_ns,
+            CycleStage::ReasonUserContext => &self.stage_reason_usercontext_max_ns,
+            CycleStage::ReasonHoltWinters => &self.stage_reason_holtwinters_max_ns,
+            CycleStage::ReasonPageReclaim => &self.stage_reason_pagereclaim_max_ns,
+            CycleStage::ReasonChromium => &self.stage_reason_chromium_max_ns,
+            CycleStage::ReasonEnrich => &self.stage_reason_enrich_max_ns,
+        };
+        max.swap(0, Ordering::Relaxed)
+    }
+
     /// Increment the stage_count once per cycle (after all 5 stages
     /// recorded). The count divides every stage_*_total_ns to compute
     /// per-stage avg latency.
@@ -1641,6 +1666,20 @@ mod tests {
             (snap.reactor_event_weight - 0.42).abs() < 1e-9,
             "expected 0.42, got {}",
             snap.reactor_event_weight
+        );
+    }
+
+    #[test]
+    fn stage_max_drain_does_not_keep_lifetime_outlier_sticky() {
+        let m = LockFreeMetrics::new();
+        m.record_stage(CycleStage::Reason, 180_000_000_000);
+        assert_eq!(m.drain_stage_max_ns(CycleStage::Reason), 180_000_000_000);
+
+        m.record_stage(CycleStage::Reason, 80_000_000);
+        assert_eq!(
+            m.drain_stage_max_ns(CycleStage::Reason),
+            80_000_000,
+            "stage max should reflect recent drained interval, not lifetime max"
         );
     }
 }

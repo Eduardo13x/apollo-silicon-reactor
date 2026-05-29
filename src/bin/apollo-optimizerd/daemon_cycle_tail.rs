@@ -37,6 +37,7 @@ use apollo_engine::collector::{SystemCollector, SystemSnapshot};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::fluidity::FluidityState;
 use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::lse_counters::CycleStage;
 use apollo_engine::engine::mach_qos::SchedulingTier;
 use apollo_engine::engine::overflow_guard::OverflowThresholds;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
@@ -151,7 +152,9 @@ pub fn wire_enriched_telemetry(
     // Frozen RAM: sum of RSS of currently frozen PIDs.
     let sys = collector.system();
     let frozen_pids = state.frozen_state.lock_recover().clone();
-    m.metrics.frozen_ram_mb = frozen_pids.keys().filter_map(|pid| sys.process(sysinfo::Pid::from_u32(*pid)))
+    m.metrics.frozen_ram_mb = frozen_pids
+        .keys()
+        .filter_map(|pid| sys.process(sysinfo::Pid::from_u32(*pid)))
         .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
         .sum::<f64>()
         .max(0.0);
@@ -224,75 +227,80 @@ pub fn wire_enriched_telemetry(
         }
     };
     let ns_to_ms = |ns: u64| -> f64 { ns as f64 / 1_000_000.0 };
-    m.metrics.stage_sense_avg_ms =
-        to_avg_ms(lf.stage_sense_total_ns.load(std::sync::atomic::Ordering::Relaxed));
-    m.metrics.stage_sense_max_ms =
-        ns_to_ms(lf.stage_sense_max_ns.load(std::sync::atomic::Ordering::Relaxed));
-    m.metrics.stage_reason_avg_ms =
-        to_avg_ms(lf.stage_reason_total_ns.load(std::sync::atomic::Ordering::Relaxed));
-    m.metrics.stage_reason_max_ms =
-        ns_to_ms(lf.stage_reason_max_ns.load(std::sync::atomic::Ordering::Relaxed));
-    m.metrics.stage_execute_avg_ms =
-        to_avg_ms(lf.stage_execute_total_ns.load(std::sync::atomic::Ordering::Relaxed));
-    m.metrics.stage_execute_max_ms =
-        ns_to_ms(lf.stage_execute_max_ns.load(std::sync::atomic::Ordering::Relaxed));
-    m.metrics.stage_learn_avg_ms =
-        to_avg_ms(lf.stage_learn_total_ns.load(std::sync::atomic::Ordering::Relaxed));
-    m.metrics.stage_learn_max_ms =
-        ns_to_ms(lf.stage_learn_max_ns.load(std::sync::atomic::Ordering::Relaxed));
-    m.metrics.stage_persist_avg_ms =
-        to_avg_ms(lf.stage_persist_total_ns.load(std::sync::atomic::Ordering::Relaxed));
-    m.metrics.stage_persist_max_ms =
-        ns_to_ms(lf.stage_persist_max_ns.load(std::sync::atomic::Ordering::Relaxed));
+    m.metrics.stage_sense_avg_ms = to_avg_ms(
+        lf.stage_sense_total_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_sense_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::Sense));
+    m.metrics.stage_reason_avg_ms = to_avg_ms(
+        lf.stage_reason_total_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_reason_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::Reason));
+    m.metrics.stage_execute_avg_ms = to_avg_ms(
+        lf.stage_execute_total_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_execute_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::Execute));
+    m.metrics.stage_learn_avg_ms = to_avg_ms(
+        lf.stage_learn_total_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_learn_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::Learn));
+    m.metrics.stage_persist_avg_ms = to_avg_ms(
+        lf.stage_persist_total_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_persist_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::Persist));
     // REASON sub-stages (Phase 0c).
     m.metrics.stage_reason_signal_avg_ms = to_avg_ms(
         lf.stage_reason_signal_total_ns
             .load(std::sync::atomic::Ordering::Relaxed),
     );
-    m.metrics.stage_reason_signal_max_ms = ns_to_ms(
-        lf.stage_reason_signal_max_ns
+    m.metrics.stage_reason_signal_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonSignalTick));
+    m.metrics.stage_reason_neuro_avg_ms = to_avg_ms(
+        lf.stage_reason_neuro_total_ns
             .load(std::sync::atomic::Ordering::Relaxed),
     );
+    m.metrics.stage_reason_neuro_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonNeuro));
+    m.metrics.stage_reason_neuro_avg_ms = to_avg_ms(
+        lf.stage_reason_neuro_total_ns
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    m.metrics.stage_reason_neuro_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonNeuro));
     m.metrics.stage_reason_usercontext_avg_ms = to_avg_ms(
         lf.stage_reason_usercontext_total_ns
             .load(std::sync::atomic::Ordering::Relaxed),
     );
-    m.metrics.stage_reason_usercontext_max_ms = ns_to_ms(
-        lf.stage_reason_usercontext_max_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_usercontext_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonUserContext));
     m.metrics.stage_reason_holtwinters_avg_ms = to_avg_ms(
         lf.stage_reason_holtwinters_total_ns
             .load(std::sync::atomic::Ordering::Relaxed),
     );
-    m.metrics.stage_reason_holtwinters_max_ms = ns_to_ms(
-        lf.stage_reason_holtwinters_max_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_holtwinters_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonHoltWinters));
     m.metrics.stage_reason_pagereclaim_avg_ms = to_avg_ms(
         lf.stage_reason_pagereclaim_total_ns
             .load(std::sync::atomic::Ordering::Relaxed),
     );
-    m.metrics.stage_reason_pagereclaim_max_ms = ns_to_ms(
-        lf.stage_reason_pagereclaim_max_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_pagereclaim_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonPageReclaim));
     m.metrics.stage_reason_chromium_avg_ms = to_avg_ms(
         lf.stage_reason_chromium_total_ns
             .load(std::sync::atomic::Ordering::Relaxed),
     );
-    m.metrics.stage_reason_chromium_max_ms = ns_to_ms(
-        lf.stage_reason_chromium_max_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_chromium_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonChromium));
     m.metrics.stage_reason_enrich_avg_ms = to_avg_ms(
         lf.stage_reason_enrich_total_ns
             .load(std::sync::atomic::Ordering::Relaxed),
     );
-    m.metrics.stage_reason_enrich_max_ms = ns_to_ms(
-        lf.stage_reason_enrich_max_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_enrich_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonEnrich));
     m.metrics.meta_confidence = inputs.cognitive_state.meta_cognition.meta_confidence;
     m.metrics.humble_mode = inputs.cog_decision.humble_mode;
     m.metrics.adversarial_pass_rate =
