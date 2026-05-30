@@ -249,6 +249,10 @@ pub fn wire_enriched_telemetry(
     m.metrics.stage_reason_neuro_avg_ms =
         to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonNeuro));
     m.metrics.stage_reason_neuro_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonNeuro));
+    m.metrics.stage_reason_decide_avg_ms =
+        to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonDecide));
+    m.metrics.stage_reason_decide_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonDecide));
     m.metrics.stage_reason_usercontext_avg_ms =
         to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonUserContext));
     m.metrics.stage_reason_usercontext_max_ms =

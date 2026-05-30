@@ -1623,6 +1623,10 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub stage_reason_neuro_max_ms: f64,
     #[serde(default)]
+    pub stage_reason_decide_avg_ms: f64,
+    #[serde(default)]
+    pub stage_reason_decide_max_ms: f64,
+    #[serde(default)]
     pub stage_reason_usercontext_avg_ms: f64,
     #[serde(default)]
     pub stage_reason_usercontext_max_ms: f64,
