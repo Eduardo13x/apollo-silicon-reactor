@@ -31,7 +31,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::engine::identity_cache::{IdentityCache, IdentityKey, IdentityValidation};
-use crate::engine::lse_counters::{LockFreeMetrics, LSE_COUNTERS};
+use crate::engine::lse_counters::LockFreeMetrics;
 use crate::engine::process_identity::ProcessIdentity;
 
 pub struct IdentityCacheManager {
@@ -129,34 +129,15 @@ impl IdentityCacheManager {
     /// `daemon_kqueue_tick` on `NOTE_EXIT`; any future PID-exit source
     /// (wait4 reaper, audit feed) should call this same entry point to
     /// keep the cache honest before TTL expiry catches it.
-    /// Returns the count of evicted entries. Bumps the global
-    /// `identity_cache_exit_invalidations` LSE counter by that amount
-    /// when n > 0 so dashboards can distinguish "exit-driven invalidation
-    /// healthy" from "exit-driven invalidation dead" — visibility into
-    /// the dead-PID guard fire rate (ffa0b29).
+    /// Returns the count of evicted entries.
     pub fn notify_exited(&self, pid: u32) -> usize {
-        let n = self.cache.invalidate_pid(pid);
-        if n > 0 {
-            LSE_COUNTERS
-                .identity_cache_exit_invalidations
-                .fetch_add(n as u64, Ordering::Relaxed);
-        }
-        n
+        self.cache.invalidate_pid(pid)
     }
 
     /// Periodic safety-net cleanup of expired entries. Caller decides
     /// cadence (today: every 60 cycles in main loop). Returns drained count.
-    /// Bumps the global `identity_cache_ttl_expired` LSE counter by the
-    /// drained amount when n > 0 so dashboards can distinguish "TTL
-    /// expiration healthy" from "TTL expiration dead".
     pub fn tick_cleanup(&self) -> usize {
-        let n = self.cache.cleanup_expired();
-        if n > 0 {
-            LSE_COUNTERS
-                .identity_cache_ttl_expired
-                .fetch_add(n as u64, Ordering::Relaxed);
-        }
-        n
+        self.cache.cleanup_expired()
     }
 
     pub fn len(&self) -> usize {
@@ -280,102 +261,5 @@ mod tests {
         let drained = m.tick_cleanup();
         assert_eq!(drained, 1);
         assert_eq!(m.len(), 0);
-    }
-
-    /// Round-trip test: populate cache with 3 entries, call
-    /// `notify_exited(pid)` on 1 known PID, assert the global
-    /// `LSE_COUNTERS.identity_cache_exit_invalidations` bumped by 1, then
-    /// snapshot LF and confirm the counter propagates into
-    /// `RuntimeMetrics` via `sync_from_lockfree`.
-    ///
-    /// Closes the structural-zero hole: before this fix the counter was
-    /// pinned at 0 despite 21+ freezes_applied — dashboards could not
-    /// distinguish "exit-driven invalidation healthy" from "dead".
-    #[test]
-    fn test_invalidate_cached_enrich_bumps_counter() {
-        use crate::engine::daemon_state::MetricsState;
-        use crate::engine::lse_counters::LSE_COUNTERS;
-
-        let m = IdentityCacheManager::new();
-        let lf = LockFreeMetrics::new();
-
-        // Seed 3 distinct identity entries — one to invalidate, two
-        // controls that must survive.
-        let target_pid: u32 = 4_242_001;
-        let other_pid_a: u32 = 4_242_002;
-        let other_pid_b: u32 = 4_242_003;
-        // Use unique start_sec values so we don't collide with whatever
-        // the host PID space is doing.
-        let key_target = IdentityKey {
-            pid: target_pid,
-            start_sec: 17_000_001,
-            start_usec: 1,
-        };
-        let key_a = IdentityKey {
-            pid: other_pid_a,
-            start_sec: 17_000_002,
-            start_usec: 2,
-        };
-        let key_b = IdentityKey {
-            pid: other_pid_b,
-            start_sec: 17_000_003,
-            start_usec: 3,
-        };
-        // Seed each via the same Validated path used in prod.
-        assert_eq!(
-            m.cache.validate_or_refresh(key_target, Some(0xa)),
-            IdentityValidation::Validated
-        );
-        assert_eq!(
-            m.cache.validate_or_refresh(key_a, Some(0xb)),
-            IdentityValidation::Validated
-        );
-        assert_eq!(
-            m.cache.validate_or_refresh(key_b, Some(0xc)),
-            IdentityValidation::Validated
-        );
-        assert_eq!(m.len(), 3);
-
-        // Snapshot the global LSE counter BEFORE invalidation — other
-        // tests sharing this process may have bumped it.
-        let before = LSE_COUNTERS
-            .identity_cache_exit_invalidations
-            .load(Ordering::Relaxed);
-
-        // Act: simulate NOTE_EXIT for the target PID only.
-        let evicted = m.notify_exited(target_pid);
-        assert_eq!(evicted, 1, "exactly one entry must be evicted");
-
-        // Global LSE counter must have bumped by exactly 1.
-        let after = LSE_COUNTERS
-            .identity_cache_exit_invalidations
-            .load(Ordering::Relaxed);
-        assert_eq!(
-            after - before,
-            1,
-            "identity_cache_exit_invalidations must bump by 1"
-        );
-
-        // Control entries untouched.
-        assert_eq!(m.len(), 2, "neighbour PIDs must survive");
-
-        // Round-trip: snapshot → MetricsState → RuntimeMetrics.
-        let snap = lf.snapshot();
-        let _ = snap; // local LF is empty by design; the counter is global.
-
-        // The flush path reads from a snapshot of the GLOBAL counters
-        // (that's what the daemon does in main loop). Verify propagation:
-        let global_snap = LSE_COUNTERS.snapshot();
-        let mut metrics_state = MetricsState::default();
-        metrics_state.sync_from_lockfree(&global_snap);
-        assert_eq!(
-            metrics_state.metrics.identity_cache_exit_invalidations,
-            after,
-            "RuntimeMetrics.identity_cache_exit_invalidations must mirror the global LSE counter"
-        );
-        assert!(
-            metrics_state.metrics.identity_cache_exit_invalidations >= 1,
-            "post-eviction RuntimeMetrics counter must be non-zero"
-        );
     }
 }
