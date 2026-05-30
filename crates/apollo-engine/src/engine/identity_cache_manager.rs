@@ -24,8 +24,8 @@
 //! - `tick_cleanup()` — periodic safety-net pass; caller controls cadence.
 //!
 //! Semantics-preserving over Fase 1: same TTL (180s default), same
-//! capacity (5000), same prefix-tolerance, same start_sec=0 fallback,
-//! same cache-key behavior. Only the *owner* changes.
+//! capacity (5000), same prefix-tolerance, same start_sec=0 fallback for
+//! validation, same cache-key behavior. Only the *owner* changes.
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -55,10 +55,13 @@ impl IdentityCacheManager {
     /// `pid` still matches the supplied identity tuple.
     ///
     /// Mirrors the old `pid_identity_still_valid` semantics exactly:
-    /// 1. PID-only fast path when `start_sec == 0` (legacy actions).
-    /// 2. Composite-key cache lookup.
-    /// 3. Cache miss → `ProcessIdentity::from_pid` + `matches` (Fase 1
+    /// 1. Composite-key cache lookup for actions carrying `start_sec`.
+    /// 2. Cache miss → `ProcessIdentity::from_pid` + `matches` (Fase 1
     ///    single source of truth) + insert under cacheable key.
+    ///
+    /// Actions with `start_sec == 0` must take the syscall path every time:
+    /// there is no birth timestamp to prove a cached PID still names the same
+    /// process if an exit notification was missed.
     pub fn verify(
         &self,
         pid: u32,
@@ -72,17 +75,6 @@ impl IdentityCacheManager {
             start_sec,
             start_usec,
         };
-
-        // PID-only fast path for actions without start_sec proof
-        // (SetMemorystatus, Boost, Unfreeze, SetThreadQoS).
-        if start_sec == 0 {
-            if let Some(IdentityValidation::CachedValid) = self.cache.lookup_by_pid(pid) {
-                lf_metrics
-                    .identity_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
-                return true;
-            }
-        }
 
         match self.cache.validate_or_refresh(key, None) {
             IdentityValidation::CachedValid | IdentityValidation::Validated => {
@@ -186,9 +178,9 @@ mod tests {
     }
 
     #[test]
-    fn verify_self_caches_for_subsequent_pid_only_lookup() {
+    fn verify_self_caches_for_subsequent_full_identity_lookup() {
         // Self pid is alive; first verify misses + inserts; second verify
-        // (with start_sec=0) should hit via lookup_by_pid fast path.
+        // with the full identity tuple should hit without another syscall.
         let m = IdentityCacheManager::new();
         let lf = LockFreeMetrics::new();
         let me = std::process::id();
@@ -198,15 +190,29 @@ mod tests {
         assert_eq!(lf.identity_cache_hits.load(Ordering::Relaxed), 0);
         assert_eq!(lf.identity_cache_misses.load(Ordering::Relaxed), 1);
 
-        // Second call with start_sec=0 (legacy action) — PID-only fast path
-        // must hit because the previous insert used the cacheable_key
-        // computed from the live process.
-        assert!(m.verify(me, Some(&id.name), 0, 0, &lf));
+        assert!(m.verify(me, Some(&id.name), id.start_sec, id.start_usec, &lf));
         assert_eq!(lf.identity_cache_hits.load(Ordering::Relaxed), 1);
         assert_eq!(
             lf.identity_proc_pidpath_calls.load(Ordering::Relaxed),
             1,
             "second verify must not call proc_pidpath"
+        );
+    }
+
+    #[test]
+    fn start_sec_zero_does_not_reuse_pid_only_cache_hit() {
+        let m = IdentityCacheManager::new();
+        let lf = LockFreeMetrics::new();
+        let me = std::process::id();
+        let id = ProcessIdentity::from_pid(me).unwrap();
+
+        assert!(m.verify(me, Some(&id.name), id.start_sec, id.start_usec, &lf));
+        let calls_after_seed = lf.identity_proc_pidpath_calls.load(Ordering::Relaxed);
+
+        assert!(m.verify(me, Some(&id.name), 0, 0, &lf));
+        assert!(
+            lf.identity_proc_pidpath_calls.load(Ordering::Relaxed) > calls_after_seed,
+            "start_sec=0 must not trust a cached PID-only entry"
         );
     }
 

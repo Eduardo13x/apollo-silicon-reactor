@@ -36,6 +36,7 @@ fn kqueue_watch_many_children() {
     // Spawn 20 children, watch them all, verify all exits detected
     let mut reactor = KqueuePressure::new().unwrap();
     let mut children = Vec::new();
+    let mut child_pids = Vec::new();
 
     for _ in 0..20 {
         let child = std::process::Command::new("/usr/bin/true")
@@ -43,13 +44,14 @@ fn kqueue_watch_many_children() {
             .expect("spawn");
         let pid = child.id();
         reactor.watch_pid(pid).ok(); // may fail if already exited
-        children.push(pid);
+        child_pids.push(pid);
+        children.push(child);
     }
 
     // Wait for all exits
     let mut exited = std::collections::HashSet::new();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while exited.len() < children.len() && Instant::now() < deadline {
+    while exited.len() < child_pids.len() && Instant::now() < deadline {
         let events = reactor.wait_events(100);
         for ev in events {
             if let PressureEvent::ProcessExited(pid) = ev {
@@ -57,13 +59,16 @@ fn kqueue_watch_many_children() {
             }
         }
     }
+    for mut child in children {
+        let _ = child.wait();
+    }
 
     // At least some should have been detected (race: some may exit before watch)
     assert!(
         exited.len() >= 10,
         "should detect most exits, got {}/{}",
         exited.len(),
-        children.len(),
+        child_pids.len(),
     );
 }
 

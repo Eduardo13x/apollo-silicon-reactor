@@ -193,18 +193,13 @@ pub fn wire_enriched_telemetry(
     let ws = lf
         .metrics_lock_wait_total_ns
         .load(std::sync::atomic::Ordering::Relaxed);
-    let wm = lf
-        .metrics_lock_wait_max_ns
-        .load(std::sync::atomic::Ordering::Relaxed);
     let hc = lf
         .metrics_lock_held_count
         .load(std::sync::atomic::Ordering::Relaxed);
     let hs = lf
         .metrics_lock_held_total_ns
         .load(std::sync::atomic::Ordering::Relaxed);
-    let hm = lf
-        .metrics_lock_held_max_ns
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let (wm, hm) = lf.drain_metrics_lock_max_ns();
     m.metrics.metrics_lock_wait_avg_us = if wc > 0 {
         (ws as f64 / wc as f64) / 1000.0
     } else {
@@ -263,14 +258,7 @@ pub fn wire_enriched_telemetry(
         lf.stage_reason_neuro_total_ns
             .load(std::sync::atomic::Ordering::Relaxed),
     );
-    m.metrics.stage_reason_neuro_max_ms =
-        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonNeuro));
-    m.metrics.stage_reason_neuro_avg_ms = to_avg_ms(
-        lf.stage_reason_neuro_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
-    m.metrics.stage_reason_neuro_max_ms =
-        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonNeuro));
+    m.metrics.stage_reason_neuro_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonNeuro));
     m.metrics.stage_reason_usercontext_avg_ms = to_avg_ms(
         lf.stage_reason_usercontext_total_ns
             .load(std::sync::atomic::Ordering::Relaxed),

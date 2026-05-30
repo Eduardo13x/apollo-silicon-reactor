@@ -15,6 +15,7 @@ use apollo_engine::collector::SystemCollector;
 use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified, write_frozen_state};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::display_turbo::DisplayTurbo;
+use apollo_engine::engine::identity_cache_manager::IdentityCacheManager;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::process_tree::{ProcessEntry, ProcessTree};
 use apollo_engine::engine::sleep_notifier::SleepNotifier;
@@ -106,9 +107,15 @@ pub fn run_ghost_pid_reconciliation(
     frozen_state_path: &Path,
     display_turbo: &mut DisplayTurbo,
     cycle_count: u64,
+    identity_cache: &IdentityCacheManager,
 ) {
     let mut frozen_guard = state.frozen_state.lock_recover();
     let before = frozen_guard.len();
+    let dead_pids: Vec<u32> = frozen_guard
+        .keys()
+        .copied()
+        .filter(|pid| !live_pids.contains(pid))
+        .collect();
     frozen_guard.retain(|pid, _| live_pids.contains(pid));
     let removed = before - frozen_guard.len();
     if removed > 0 {
@@ -120,10 +127,172 @@ pub fn run_ghost_pid_reconciliation(
         );
         write_frozen_state(frozen_state_path, &frozen_guard);
     }
+    for pid in dead_pids {
+        identity_cache.notify_exited(pid);
+        crate::process_enrichment::invalidate_cached_enrich(pid);
+    }
     display_turbo.gc_dead_pids(live_pids);
     drop(frozen_guard);
 
     if cycle_count.is_multiple_of(60) {
         state.mach_qos.lock_recover().gc_dead_pids();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Condvar, Mutex};
+
+    use apollo_engine::engine::adaptive_governor::AdaptiveGovernor;
+    use apollo_engine::engine::circuit_breaker::CircuitBreaker;
+    use apollo_engine::engine::daemon_helpers::WakeRuntimeState;
+    use apollo_engine::engine::daemon_state::{
+        HardwareState, LlmDomainState, MetricsState, PolicyState, ProcessState, UsageDomainState,
+    };
+    use apollo_engine::engine::degradation::DegradationController;
+    use apollo_engine::engine::display_turbo::DisplayTurbo;
+    use apollo_engine::engine::freeze_cooldown::FreezeCooldown;
+    use apollo_engine::engine::identity_cache_manager::IdentityCacheManager;
+    use apollo_engine::engine::llm::{LearnedPolicy, LlmConfig, LlmState};
+    use apollo_engine::engine::lse_counters::LockFreeMetrics;
+    use apollo_engine::engine::mach_qos::MachQoSManager;
+    use apollo_engine::engine::process_identity::ProcessIdentity;
+    use apollo_engine::engine::profile_governor::ProfileGovernor;
+    use apollo_engine::engine::sysctl_governor::SysctlGovernorStatus;
+    use apollo_engine::engine::thermal_interrupt::ResourceInterruptState;
+    use apollo_engine::engine::types::{
+        FreezeSource, FrozenEntry, LatencyTarget, OptimizationProfile, RuntimeMetrics,
+    };
+    use apollo_engine::engine::usage_model::UsageModel;
+
+    fn test_state() -> SharedState {
+        SharedState {
+            metrics: Arc::new(Mutex::new(MetricsState {
+                metrics: RuntimeMetrics::default(),
+                throttle_level: "balanced".to_string(),
+                thermal_state: "nominal".to_string(),
+                thermal_level_real: "unknown".to_string(),
+                fast_tick_until: None,
+                reactor_event_weight: 0.0,
+                reactor_status: apollo_engine::engine::daemon_state::ReactorStatus::default(),
+            })),
+            policy: Arc::new(Mutex::new(PolicyState {
+                profile: OptimizationProfile::BalancedRoot,
+                latency_target: LatencyTarget::Normal,
+                governor: ProfileGovernor::new(OptimizationProfile::BalancedRoot),
+                learned_policy: LearnedPolicy::default(),
+                adaptive_governor: AdaptiveGovernor::new(),
+                timeline: std::collections::VecDeque::new(),
+                circuit_breaker: CircuitBreaker::default(),
+                degradation: DegradationController::default(),
+            })),
+            process: Arc::new(Mutex::new(ProcessState {
+                last_blockers: Vec::new(),
+                wake_state: WakeRuntimeState {
+                    last_cycle_wallclock: chrono::Utc::now(),
+                    last_wake_at: None,
+                    post_wake_grace_until: None,
+                    post_wake_policy: "normal".to_string(),
+                    post_wake_reclaim_until: None,
+                },
+            })),
+            hardware: Arc::new(Mutex::new(HardwareState {
+                last_hw_snapshot: None,
+                sysctl_governor_status: SysctlGovernorStatus {
+                    active: false,
+                    current_values: HashMap::new(),
+                    defaults: HashMap::new(),
+                    total_writes: 0,
+                    active_tunings: 0,
+                    retransmission_rate: 0.0,
+                    listen_drop_rate: 0.0,
+                    last_tune_secs_ago: HashMap::new(),
+                    tcp_consecutive_high: 0,
+                    tcp_consecutive_low: 0,
+                    ipc_consecutive_drops: 0,
+                    ipc_consecutive_clean: 0,
+                    vm_consecutive_high: 0,
+                    vm_consecutive_low: 0,
+                    fs_consecutive_high: 0,
+                    fs_consecutive_low: 0,
+                },
+            })),
+            llm: Arc::new(Mutex::new(LlmDomainState {
+                llm_cfg: LlmConfig {
+                    enabled: None,
+                    endpoint: None,
+                    model: None,
+                    min_confidence: None,
+                    max_calls_per_hour: None,
+                    min_interval_secs: None,
+                    timeout_ms: None,
+                    force_json: None,
+                    always_on: None,
+                },
+                llm_state: LlmState::default(),
+                llm_state_path: PathBuf::from("/tmp/apollo_test_llm_state"),
+                llm_key_path: PathBuf::from("/tmp/apollo_test_llm_key"),
+                learned_policy_path: PathBuf::from("/tmp/apollo_test_lp"),
+                feedback_path: PathBuf::from("/tmp/apollo_test_feedback"),
+                suggestions_path: PathBuf::from("/tmp/apollo_test_suggestions"),
+            })),
+            usage: Arc::new(Mutex::new(UsageDomainState {
+                usage_model: UsageModel::default(),
+                usage_model_path: PathBuf::from("/tmp/apollo_test_um"),
+                usage_events_path: PathBuf::from("/tmp/apollo_test_ue"),
+                usage_tracker: apollo_engine::engine::daemon_state::UsageTrackerState::default(),
+            })),
+            frozen_state: Arc::new(Mutex::new(HashMap::new())),
+            mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
+            freeze_cooldown: Arc::new(Mutex::new(FreezeCooldown::new())),
+            stop: Arc::new(AtomicBool::new(false)),
+            revert_sysctls_requested: Arc::new(AtomicBool::new(false)),
+            cycle_condvar: Arc::new((Mutex::new(false), Condvar::new())),
+            resource_interrupt: Arc::new(ResourceInterruptState::new()),
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+            config_path: PathBuf::from("/tmp/apollo_test_config"),
+            user_profile_path: PathBuf::from("/tmp/apollo_test_user_profile"),
+        }
+    }
+
+    #[test]
+    fn ghost_reconciliation_invalidates_identity_cache_for_removed_pid() {
+        let state = test_state();
+        let identity_cache = IdentityCacheManager::new();
+        let lf = LockFreeMetrics::new();
+        let me = std::process::id();
+        let id = ProcessIdentity::from_pid(me).unwrap();
+
+        assert!(identity_cache.verify(me, Some(&id.name), id.start_sec, id.start_usec, &lf));
+        assert_eq!(identity_cache.len(), 1);
+        state.frozen_state.lock_recover().insert(
+            me,
+            FrozenEntry {
+                frozen_at: chrono::Utc::now(),
+                source: FreezeSource::MainLoop,
+                pressure_at_freeze: 0.8,
+                process_name: Some(id.name.clone()),
+                start_sec: id.start_sec,
+                original_jetsam_priority: None,
+            },
+        );
+
+        let live_pids = HashSet::new();
+        let mut display_turbo = DisplayTurbo::new();
+        run_ghost_pid_reconciliation(
+            &state,
+            &live_pids,
+            Path::new("/tmp/apollo_test_frozen_state.json"),
+            &mut display_turbo,
+            1,
+            &identity_cache,
+        );
+
+        assert_eq!(identity_cache.len(), 0);
     }
 }

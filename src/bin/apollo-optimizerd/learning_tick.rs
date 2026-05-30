@@ -101,6 +101,24 @@ pub(crate) fn outcome_actions_from_applied_traces(
         .collect()
 }
 
+pub(crate) fn outcome_action_names_from_applied_traces(
+    exec_outcomes: &ExecuteOutcomes,
+) -> Vec<String> {
+    exec_outcomes
+        .audit_traces
+        .iter()
+        .filter(|trace| trace.applied)
+        .filter_map(|trace| match &trace.intended_action {
+            RootAction::ThrottleProcess { name, .. } => Some(format!("throttle:{}", name)),
+            RootAction::FreezeProcess { name, .. } => Some(format!("freeze:{}", name)),
+            RootAction::SetMemorystatus { pid, reason, .. } => {
+                Some(format!("memorystatus:pid:{}:{}", pid, reason))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Run all per-cycle learning pipeline work.
 ///
 /// See module-level documentation for the list of operations performed.
@@ -1057,5 +1075,47 @@ mod tests {
         assert_eq!(outcome_actions[0].name.as_deref(), Some("Safari"));
         assert_eq!(outcome_actions[1].action_type, ActionKind::Memorystatus);
         assert_eq!(outcome_actions[1].pid, 30);
+    }
+
+    #[test]
+    fn outcome_action_names_from_applied_traces_ignores_blocked_actions() {
+        let exec_outcomes = ExecuteOutcomes {
+            audit_traces: vec![
+                trace(
+                    RootAction::throttle(
+                        10,
+                        "Safari",
+                        true,
+                        "test",
+                        DecisionReason::PressureContext,
+                    ),
+                    true,
+                ),
+                trace(
+                    RootAction::freeze(20, "kernel_task", "test", DecisionReason::PressureContext),
+                    false,
+                ),
+                trace(
+                    RootAction::set_memorystatus(
+                        30,
+                        10,
+                        "page-hint",
+                        DecisionReason::PressureContext,
+                    ),
+                    true,
+                ),
+            ],
+            ..ExecuteOutcomes::default()
+        };
+
+        let names = outcome_action_names_from_applied_traces(&exec_outcomes);
+
+        assert_eq!(
+            names,
+            vec![
+                "throttle:Safari".to_string(),
+                "memorystatus:pid:30:page-hint".to_string()
+            ]
+        );
     }
 }

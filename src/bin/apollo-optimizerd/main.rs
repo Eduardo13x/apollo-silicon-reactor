@@ -1788,12 +1788,22 @@ fn main() -> anyhow::Result<()> {
                 // Ghost-PID reconciliation — evict dead PIDs from frozen_state +
                 // turbo set; GC mach_qos HashMaps every 60 cycles.
                 let live_pids: HashSet<u32> = proc_snaps.iter().map(|p| p.pid).collect();
+                let recently_dead_dedup = recently_applied.invalidate_dead_pids(&live_pids);
+                if recently_dead_dedup > 0 {
+                    tracing::debug!(
+                        target: "apollo.recently_applied",
+                        removed = recently_dead_dedup,
+                        remaining = recently_applied.len(),
+                        "evicted recently-applied entries for dead PIDs"
+                    );
+                }
                 daemon_process_collector::run_ghost_pid_reconciliation(
                     &state,
                     &live_pids,
                     &frozen_state_path,
                     &mut display_turbo,
                     cycle_count,
+                    &identity_cache,
                 );
 
                 // MemoryAnalyzer profiling + WakeStormDetector per-cycle scan.
@@ -4692,25 +4702,6 @@ fn main() -> anyhow::Result<()> {
                     lctx.causal_graph.qos_preferred_names();
                 let mut causal_qos_upgrades_cycle = 0u32;
 
-                // Captura los nombres de throttles y freezes para el self-evaluator.
-                // Solo throttles y freezes se loggean porque son acciones que reducen presión.
-                // Boosts no se loggean (son de latencia/QoS, no reducen memoria).
-                // SetMemorystatus se loggea para rastrear paging hints (acción más frecuente en M1 8GB).
-                let action_names_for_outcome: Vec<String> = final_actions
-                    .iter()
-                    .filter_map(|a| match a {
-                        RootAction::ThrottleProcess { name, .. } => {
-                            Some(format!("throttle:{}", name))
-                        }
-                        RootAction::FreezeProcess { name, .. } => {
-                            Some(format!("freeze:{}", name))
-                        }
-                        RootAction::SetMemorystatus { pid, reason, .. } => {
-                            Some(format!("memorystatus:pid:{}:{}", pid, reason))
-                        }
-                        _ => None,
-                    })
-                    .collect();
                 // Phase 0b: hoist execute-start outside the block scope so it
                 // remains visible after the inner block closes (where the
                 // record_stage call lives).
@@ -4753,6 +4744,11 @@ fn main() -> anyhow::Result<()> {
                     (output.outcomes, output.causal_qos_upgrades)
                 };
                 causal_qos_upgrades_cycle += causal_qos_upgrades;
+                // Capture only applied pressure-reduction actions for the
+                // self-evaluator. Intents blocked during dispatch must not
+                // become neurocognitive "latest_action" evidence.
+                let action_names_for_outcome =
+                    learning_tick::outcome_action_names_from_applied_traces(&exec_outcomes);
 
                 // ActiveCoalition blocks → OutcomeTracker survival-bias channel.
                 // The new coalition guard skips actions silently inside

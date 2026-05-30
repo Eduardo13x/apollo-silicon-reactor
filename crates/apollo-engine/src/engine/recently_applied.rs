@@ -35,7 +35,7 @@
 //! [Hellerstein 2004 §9] state-aware feedback control — controller must
 //! remember its own actions to avoid redundant emission.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -197,6 +197,17 @@ impl RecentlyApplied {
     /// Forget entries for a specific PID — used when PID dies or is recycled.
     pub fn invalidate_pid(&mut self, pid: u32) {
         self.map.retain(|(p, _), _| *p != pid);
+    }
+
+    /// Forget entries whose PID is absent from the authoritative live snapshot.
+    ///
+    /// This closes the gap where a PID exits without an eager NOTE_EXIT hook:
+    /// stale dedup entries must not suppress actions for a future process that
+    /// reuses the same numeric PID.
+    pub fn invalidate_dead_pids(&mut self, live_pids: &HashSet<u32>) -> usize {
+        let before = self.map.len();
+        self.map.retain(|(pid, _), _| live_pids.contains(pid));
+        before - self.map.len()
     }
 
     /// Current number of entries (post-cleanup).
@@ -415,6 +426,22 @@ mod tests {
         assert!(!cache.is_recent(1, CachedActionKind::Throttle));
         assert!(!cache.is_recent(1, CachedActionKind::Freeze));
         assert!(cache.is_recent(2, CachedActionKind::Throttle));
+    }
+
+    #[test]
+    fn invalidate_dead_pids_removes_entries_not_in_live_snapshot() {
+        let mut cache = RecentlyApplied::new();
+        cache.record(1, CachedActionKind::Throttle);
+        cache.record(2, CachedActionKind::Freeze);
+        cache.record(3, CachedActionKind::SetMemorystatus);
+
+        let live = HashSet::from([2_u32]);
+        let removed = cache.invalidate_dead_pids(&live);
+
+        assert_eq!(removed, 2);
+        assert!(!cache.is_recent(1, CachedActionKind::Throttle));
+        assert!(cache.is_recent(2, CachedActionKind::Freeze));
+        assert!(!cache.is_recent(3, CachedActionKind::SetMemorystatus));
     }
 
     #[test]

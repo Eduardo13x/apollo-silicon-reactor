@@ -355,15 +355,14 @@ impl ActionAccumulator {
     /// emits sealed `SetSysctlAction` via the clamping factory). The
     /// `EmitContext` is required and recorded so the audit trail is intact.
     ///
-    /// Counter semantics (Fase 5 reviewer fix #3):
-    /// - increments **only** `actions_pushed_raw_total`,
-    /// - does **not** touch the per-variant counter,
-    ///   so the invariant Σ(typed per-variant) + raw == total_pushed holds.
+    /// Counter semantics:
+    /// - `actions_pushed_raw_total` counts escape-hatch emissions.
+    /// - per-variant counters count actual emitted variant volume, including
+    ///   actions that came through raw paths.
     ///
-    /// `actions_pushed_throttle_total` therefore counts "throttles emitted via
-    /// `push_throttle()`" (typed shape-validated path), while
-    /// `actions_pushed_raw_total` counts "any RootAction emitted via the
-    /// `push_raw` / `extend_raw` escape hatch".
+    /// This keeps runtime metrics useful: a raw `BoostProcess` should still
+    /// move the boost counter, while `raw` separately shows how much traffic
+    /// bypassed typed construction.
     pub fn push_raw(&mut self, action: RootAction, ctx: EmitContext, lf_metrics: &LockFreeMetrics) {
         let variant = action_variant_name(&action);
         tracing::debug!(
@@ -379,6 +378,62 @@ impl ActionAccumulator {
         lf_metrics
             .actions_pushed_raw_total
             .fetch_add(1, Ordering::Relaxed);
+        match &action {
+            RootAction::ThrottleProcess { .. } => {
+                self.push_count_throttle += 1;
+                lf_metrics
+                    .actions_pushed_throttle_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RootAction::FreezeProcess { .. } => {
+                self.push_count_freeze += 1;
+                lf_metrics
+                    .actions_pushed_freeze_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RootAction::UnfreezeProcess { .. } => {
+                self.push_count_unfreeze += 1;
+                lf_metrics
+                    .actions_pushed_unfreeze_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RootAction::BoostProcess { .. } => {
+                self.push_count_boost += 1;
+                lf_metrics
+                    .actions_pushed_boost_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RootAction::SetMemorystatus { .. } => {
+                self.push_count_set_memorystatus += 1;
+                lf_metrics
+                    .actions_pushed_set_memorystatus_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RootAction::SetThreadQoS { .. } => {
+                self.push_count_set_thread_qos += 1;
+                lf_metrics
+                    .actions_pushed_set_thread_qos_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RootAction::SetSysctl(_) => {
+                self.push_count_set_sysctl += 1;
+                lf_metrics
+                    .actions_pushed_set_sysctl_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RootAction::ToggleSpotlight { .. } => {
+                self.push_count_toggle_spotlight += 1;
+                lf_metrics
+                    .actions_pushed_toggle_spotlight_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RootAction::QuarantineDaemon { .. } => {
+                self.push_count_quarantine_daemon += 1;
+                lf_metrics
+                    .actions_pushed_quarantine_daemon_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.bump_phase_counter(ctx.phase);
         self.actions.push(action);
     }
@@ -636,19 +691,17 @@ mod tests {
 
         let t = acc.telemetry();
         assert_eq!(t.total_pushed, 15);
-        // Typed pushes only — push_raw no longer bumps the per-variant counter
-        // (Fase 5 reviewer fix #3). Σ(typed) + raw == total_pushed.
         assert_eq!(t.throttle, 4); // 4 push_throttle
         assert_eq!(t.freeze, 4); // 4 push_freeze
         assert_eq!(t.set_sysctl, 3); // 3 push_set_sysctl_clamped
-        assert_eq!(t.unfreeze, 0); // unfreeze went via push_raw
-        assert_eq!(t.set_memorystatus, 0); // via push_raw
-        assert_eq!(t.toggle_spotlight, 0); // via push_raw
-        assert_eq!(t.boost, 0); // via push_raw
+        assert_eq!(t.unfreeze, 1); // unfreeze went via push_raw
+        assert_eq!(t.set_memorystatus, 1); // via push_raw
+        assert_eq!(t.toggle_spotlight, 1); // via push_raw
+        assert_eq!(t.boost, 1); // via push_raw
                                 // raw count = 4 push_raw calls (unfreeze, set_memorystatus,
                                 // toggle_spotlight, boost).
         assert_eq!(t.raw, 4);
-        // Invariant: Σ(typed per-variant) + raw == total_pushed.
+        // Variant counters now represent total emitted variant volume.
         let typed_sum = t.throttle
             + t.freeze
             + t.unfreeze
@@ -658,7 +711,7 @@ mod tests {
             + t.set_sysctl
             + t.toggle_spotlight
             + t.quarantine_daemon;
-        assert_eq!(typed_sum + t.raw, t.total_pushed);
+        assert_eq!(typed_sum, t.total_pushed);
 
         let v = acc.finalize();
         let order: Vec<&'static str> = v.iter().map(variant).collect();
@@ -738,9 +791,9 @@ mod tests {
     }
 
     #[test]
-    fn push_raw_only_increments_raw_counter() {
-        // Fase 5 reviewer fix #3: push_raw must NOT touch per-variant
-        // counters. Σ(typed per-variant) + raw == total_pushed.
+    fn push_raw_increments_raw_and_variant_counters() {
+        // Raw is the escape-hatch path count; per-variant counters still
+        // represent actual emitted variant volume for runtime telemetry.
         let lf = LockFreeMetrics::new();
         let mut acc = ActionAccumulator::new();
         acc.push_raw(
@@ -760,17 +813,14 @@ mod tests {
         );
         let t = acc.telemetry();
         assert_eq!(t.raw, 2);
-        // Per-variant counters stay at 0 because nothing went via the typed
-        // push_* helpers. This is the new invariant.
-        assert_eq!(t.throttle, 0);
-        assert_eq!(t.set_sysctl, 0);
+        assert_eq!(t.throttle, 1);
+        assert_eq!(t.set_sysctl, 1);
         assert_eq!(t.total_pushed, 2);
         assert_eq!(lf.actions_pushed_raw_total.load(Ordering::Relaxed), 2);
-        // lf per-variant counters also untouched.
-        assert_eq!(lf.actions_pushed_throttle_total.load(Ordering::Relaxed), 0);
+        assert_eq!(lf.actions_pushed_throttle_total.load(Ordering::Relaxed), 1);
         assert_eq!(
             lf.actions_pushed_set_sysctl_total.load(Ordering::Relaxed),
-            0
+            1
         );
     }
 
@@ -841,13 +891,11 @@ mod tests {
         let t = acc.telemetry();
         assert_eq!(t.raw, 5);
         assert_eq!(t.total_pushed, 5);
-        // Per Fase 5 reviewer fix #3: extend_raw routes through push_raw
-        // which does NOT bump per-variant counters.
-        assert_eq!(t.throttle, 0);
-        assert_eq!(t.freeze, 0);
-        assert_eq!(t.unfreeze, 0);
-        assert_eq!(t.set_memorystatus, 0);
-        assert_eq!(t.boost, 0);
+        assert_eq!(t.throttle, 1);
+        assert_eq!(t.freeze, 1);
+        assert_eq!(t.unfreeze, 1);
+        assert_eq!(t.set_memorystatus, 1);
+        assert_eq!(t.boost, 1);
     }
 
     #[test]
@@ -1005,8 +1053,8 @@ mod tests {
 
     #[test]
     fn push_raw_increments_phase_counter() {
-        // push_raw still bumps the phase counter (audit trail) but not
-        // per-variant — proves phase counters are independent of typed/raw.
+        // push_raw bumps both the phase counter (audit trail) and the
+        // per-variant counter (runtime volume telemetry).
         let mut acc = ActionAccumulator::new();
         let lf = LockFreeMetrics::new();
         acc.push_raw(
@@ -1016,7 +1064,7 @@ mod tests {
         );
         let t = acc.telemetry();
         assert_eq!(t.raw, 1);
-        assert_eq!(t.unfreeze, 0); // raw does not touch per-variant
+        assert_eq!(t.unfreeze, 1);
         assert_eq!(t.phase_freeze_executor, 1); // raw bumps phase
         assert_eq!(t.total_pushed, 1);
     }

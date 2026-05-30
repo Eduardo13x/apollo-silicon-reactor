@@ -740,6 +740,19 @@ impl LockFreeMetrics {
             .fetch_max(held_ns, Ordering::Relaxed);
     }
 
+    /// Drain metrics-lock maxes since the previous publish.
+    ///
+    /// Average counters remain cumulative, but max values are interval
+    /// telemetry like stage maxes. Otherwise one lock stall poisons the
+    /// dashboard indefinitely.
+    #[inline(always)]
+    pub fn drain_metrics_lock_max_ns(&self) -> (u64, u64) {
+        (
+            self.metrics_lock_wait_max_ns.swap(0, Ordering::Relaxed),
+            self.metrics_lock_held_max_ns.swap(0, Ordering::Relaxed),
+        )
+    }
+
     // ── Writer methods (hot path — Relaxed ordering, single LSE instruction) ─
 
     #[inline(always)]
@@ -1009,9 +1022,7 @@ impl LockFreeMetrics {
             scorer_disagreement_strong_accepts_total: self
                 .scorer_disagreement_strong_accepts_total
                 .load(Ordering::Relaxed),
-            purge_inhibition_skips_total: self
-                .purge_inhibition_skips_total
-                .load(Ordering::Relaxed),
+            purge_inhibition_skips_total: self.purge_inhibition_skips_total.load(Ordering::Relaxed),
             causal_thermal_scorer_override_alignments_total: self
                 .causal_thermal_scorer_override_alignments_total
                 .load(Ordering::Relaxed),
@@ -1680,6 +1691,20 @@ mod tests {
             m.drain_stage_max_ns(CycleStage::Reason),
             80_000_000,
             "stage max should reflect recent drained interval, not lifetime max"
+        );
+    }
+
+    #[test]
+    fn metrics_lock_max_drain_does_not_keep_lifetime_outlier_sticky() {
+        let m = LockFreeMetrics::new();
+        m.record_metrics_lock(40_000_000, 180_000_000);
+        assert_eq!(m.drain_metrics_lock_max_ns(), (40_000_000, 180_000_000));
+
+        m.record_metrics_lock(4_000, 8_000);
+        assert_eq!(
+            m.drain_metrics_lock_max_ns(),
+            (4_000, 8_000),
+            "metrics lock max should reflect recent drained interval, not lifetime max"
         );
     }
 }
