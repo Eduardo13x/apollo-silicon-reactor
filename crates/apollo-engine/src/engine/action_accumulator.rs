@@ -544,6 +544,38 @@ fn action_variant_name(a: &RootAction) -> &'static str {
     }
 }
 
+/// Outcome-feedback label for a `RootAction`. Used by the daemon's
+/// neurocognitive tick to attribute outcome signal back to the action that
+/// caused it (Self-Reward, CausalGraph, co-occurrence graph). Returning
+/// `Option<String>` keeps the signature future-proof for variants that may
+/// not have a meaningful outcome label, but all 9 current variants produce
+/// `Some`. The exhaustive match (no `_ =>` arm) plus
+/// `#[deny(unreachable_patterns)]` enforces that adding a 10th `RootAction`
+/// variant fails the build until this function is updated — closing the
+/// silent-feedback gap that previously made Boost / SetSysctl /
+/// SetThreadQoS / ToggleSpotlight / QuarantineDaemon / UnfreezeProcess
+/// outcomes invisible to learning subsystems.
+#[deny(unreachable_patterns)]
+pub fn outcome_name(a: &RootAction) -> Option<String> {
+    match a {
+        RootAction::ThrottleProcess { name, .. } => Some(format!("throttle:{}", name)),
+        RootAction::FreezeProcess { name, .. } => Some(format!("freeze:{}", name)),
+        RootAction::UnfreezeProcess { name, .. } => Some(format!("unfreeze:{}", name)),
+        RootAction::BoostProcess { name, .. } => Some(format!("boost:{}", name)),
+        RootAction::SetMemorystatus { pid, .. } => Some(format!("memstatus:pid:{}", pid)),
+        RootAction::SetThreadQoS {
+            name, tier, ..
+        } => Some(format!("thread_qos:{}:tier{}", name, tier)),
+        RootAction::SetSysctl(action) => Some(format!("sysctl:{}", action.key())),
+        RootAction::ToggleSpotlight { enabled, .. } => {
+            Some(format!("spotlight:{}", enabled))
+        }
+        RootAction::QuarantineDaemon { daemon, .. } => {
+            Some(format!("quarantine:{}", daemon))
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1198,5 +1230,80 @@ mod tests {
         assert_eq!(t.unfreeze, 1);
         assert_eq!(t.phase_freeze_executor, 1); // raw bumps phase
         assert_eq!(t.total_pushed, 1);
+    }
+
+    #[test]
+    fn test_outcome_name_exhaustive() {
+        // Construct one instance of each of the 9 RootAction variants and
+        // assert outcome_name() returns Some for every one. Combined with
+        // the exhaustive (no `_ =>` arm) match in outcome_name + the
+        // `#[deny(unreachable_patterns)]` attribute, this guarantees a
+        // build failure if a 10th variant is added without updating the
+        // outcome-feedback path — closing the silent-feedback gap that
+        // hid Boost / SetSysctl / SetThreadQoS / ToggleSpotlight /
+        // QuarantineDaemon / UnfreezeProcess outcomes from learning.
+        let variants: [RootAction; 9] = [
+            RootAction::throttle(1, "Safari", false, "r", DecisionReason::PressureContext),
+            RootAction::freeze(2, "Chrome", "r", DecisionReason::PressureContext),
+            RootAction::unfreeze(3, "Slack", "r", DecisionReason::PressureContext),
+            RootAction::BoostProcess {
+                pid: 4,
+                name: "Brave".into(),
+                reason: "r".into(),
+                decision_reason: DecisionReason::PressureContext,
+            },
+            RootAction::set_memorystatus(5, 10, "r", DecisionReason::PressureContext),
+            RootAction::SetThreadQoS {
+                pid: 6,
+                name: "Xcode".into(),
+                thread_index: 0,
+                tier: "background".into(),
+                reason: "r".into(),
+                decision_reason: DecisionReason::PressureContext,
+                affinity_tag: Some(2),
+            },
+            RootAction::set_sysctl(
+                "kern.maxvnodes",
+                "200000",
+                "r",
+                DecisionReason::PressureContext,
+            ),
+            RootAction::toggle_spotlight(false, "r", DecisionReason::PressureContext),
+            RootAction::QuarantineDaemon {
+                daemon: "telemetryd".into(),
+                active: true,
+                reason: "r".into(),
+                decision_reason: DecisionReason::PressureContext,
+            },
+        ];
+
+        for v in &variants {
+            let label = outcome_name(v);
+            assert!(
+                label.is_some(),
+                "outcome_name returned None for variant {:?} — every RootAction must carry an outcome label so learning subsystems (Self-Reward, CausalGraph, co-occurrence graph) receive feedback",
+                v
+            );
+        }
+
+        // Sanity-check the prefix formatting per the brief.
+        assert_eq!(outcome_name(&variants[0]).unwrap(), "throttle:Safari");
+        assert_eq!(outcome_name(&variants[1]).unwrap(), "freeze:Chrome");
+        assert_eq!(outcome_name(&variants[2]).unwrap(), "unfreeze:Slack");
+        assert_eq!(outcome_name(&variants[3]).unwrap(), "boost:Brave");
+        assert_eq!(outcome_name(&variants[4]).unwrap(), "memstatus:pid:5");
+        assert_eq!(
+            outcome_name(&variants[5]).unwrap(),
+            "thread_qos:Xcode:tierbackground"
+        );
+        assert_eq!(
+            outcome_name(&variants[6]).unwrap(),
+            "sysctl:kern.maxvnodes"
+        );
+        assert_eq!(outcome_name(&variants[7]).unwrap(), "spotlight:false");
+        assert_eq!(
+            outcome_name(&variants[8]).unwrap(),
+            "quarantine:telemetryd"
+        );
     }
 }

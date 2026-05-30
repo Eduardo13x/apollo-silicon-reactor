@@ -108,13 +108,8 @@ pub(crate) fn outcome_action_names_from_applied_traces(
         .audit_traces
         .iter()
         .filter(|trace| trace.applied)
-        .filter_map(|trace| match &trace.intended_action {
-            RootAction::ThrottleProcess { name, .. } => Some(format!("throttle:{}", name)),
-            RootAction::FreezeProcess { name, .. } => Some(format!("freeze:{}", name)),
-            RootAction::SetMemorystatus { pid, reason, .. } => {
-                Some(format!("memorystatus:pid:{}:{}", pid, reason))
-            }
-            _ => None,
+        .filter_map(|trace| {
+            apollo_engine::engine::action_accumulator::outcome_name(&trace.intended_action)
         })
         .collect()
 }
@@ -1110,11 +1105,15 @@ mod tests {
 
         let names = outcome_action_names_from_applied_traces(&exec_outcomes);
 
+        // Format now sourced from `action_accumulator::outcome_name` — the
+        // shared exhaustive-match outcome label. SetMemorystatus has no
+        // `name` field on the variant, so the label uses `pid` as the
+        // closest identity proxy (see brief).
         assert_eq!(
             names,
             vec![
                 "throttle:Safari".to_string(),
-                "memorystatus:pid:30:page-hint".to_string()
+                "memstatus:pid:30".to_string()
             ]
         );
     }
