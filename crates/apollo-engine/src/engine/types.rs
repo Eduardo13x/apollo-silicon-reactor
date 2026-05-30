@@ -1952,6 +1952,17 @@ pub struct RuntimeMetrics {
     /// [`crate::engine::lse_counters::LockFreeMetrics::companion_affinity_alignments_total`].
     #[serde(default)]
     pub companion_affinity_alignments_total: u64,
+
+    /// Sprint 13 Pressure-Router Gate (2026-05-30). Cycles where the
+    /// daemon main loop skipped the per-cycle
+    /// `companion_graph.observe_cycle` + Phase 3.3 propagation block
+    /// because `memory_pressure < mid_entry` AND the modulo-4
+    /// forced-exploration fallback did not fire. Ratio against `cycles`
+    /// should approach ~0.75 on an idle laptop and drop toward 0 under
+    /// sustained pressure. See
+    /// [`crate::engine::lse_counters::LockFreeMetrics::companion_observe_router_skips_total`].
+    #[serde(default)]
+    pub companion_observe_router_skips_total: u64,
 }
 
 impl RuntimeMetrics {

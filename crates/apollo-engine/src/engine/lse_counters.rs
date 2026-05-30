@@ -479,6 +479,23 @@ pub struct LockFreeMetrics {
     /// cold-thread loop. [ARM big.LITTLE 2013 §3] cluster-local
     /// scheduling preserves L2 working set across UI interactions.
     pub companion_affinity_alignments_total: AtomicU64,
+
+    /// Sprint 13 Pressure-Router Gate (2026-05-30). Incremented every
+    /// cycle the daemon main loop SKIPPED the `companion_graph.observe_cycle`
+    /// + Phase 3.3 propagation block because `memory_pressure < mid_entry`
+    /// AND `cycle_count % 4 != 0`. Mirrors the existing 4-subsystem
+    /// adaptive router gate at signal_intelligence.rs:404-424 (MoR-style
+    /// conditional compute) and the Sprint 12 G12 `bus_saturated`
+    /// skip-with-counter telemetry shape (commit `5f1c984`).
+    ///
+    /// The modulo-4 fallback ([Sutton & Barto §2.7] forced exploration)
+    /// keeps the Lift denominator updating ~every 20 s @ 5 s/cycle so
+    /// statistics don't go stale under sustained low pressure. Ratio
+    /// `companion_observe_router_skips_total / cycles` should approach
+    /// ~0.75 on an idle laptop (pressure spends most of its time below
+    /// the mid-entry threshold) and drop toward 0 under sustained
+    /// pressure ≥ mid_entry.
+    pub companion_observe_router_skips_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -617,6 +634,7 @@ impl LockFreeMetrics {
             purge_inhibition_skips_total: AtomicU64::new(0),
             causal_thermal_scorer_override_alignments_total: AtomicU64::new(0),
             companion_affinity_alignments_total: AtomicU64::new(0),
+            companion_observe_router_skips_total: AtomicU64::new(0),
         }
     }
 
@@ -1037,6 +1055,9 @@ impl LockFreeMetrics {
             companion_affinity_alignments_total: self
                 .companion_affinity_alignments_total
                 .load(Ordering::Relaxed),
+            companion_observe_router_skips_total: self
+                .companion_observe_router_skips_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1266,6 +1287,16 @@ impl LockFreeMetrics {
         self.companion_affinity_alignments_total
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Sprint 13 Pressure-Router Gate: bump once per cycle the daemon
+    /// main loop skipped `companion_graph.observe_cycle` + the Phase 3.3
+    /// cross-group propagation because `memory_pressure < mid_entry`
+    /// AND the modulo-4 forced-exploration fallback did not fire.
+    #[inline(always)]
+    pub fn inc_companion_observe_router_skip(&self) {
+        self.companion_observe_router_skips_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // Safe to share across threads — all fields are atomic.
@@ -1409,6 +1440,12 @@ pub struct MetricsSnapshot {
     /// owning process is a foreground companion AND DRAM bandwidth is
     /// below the safety floor. See LSE producer for routing rationale.
     pub companion_affinity_alignments_total: u64,
+
+    /// Sprint 13 Pressure-Router Gate (2026-05-30). Cycles where the
+    /// daemon main loop skipped `companion_graph.observe_cycle` + Phase
+    /// 3.3 propagation under low pressure. See LSE producer for gate
+    /// semantics.
+    pub companion_observe_router_skips_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

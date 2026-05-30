@@ -259,6 +259,15 @@ impl MetricsState {
         // bus below the safety floor.
         self.metrics.companion_affinity_alignments_total =
             lf.companion_affinity_alignments_total;
+
+        // Sprint 13 Pressure-Router Gate (2026-05-30). Producer is the
+        // daemon main-loop companion-observation block that skips the
+        // observe_cycle + Phase 3.3 propagation under low pressure
+        // (pressure < mid_entry, modulo-4 fallback miss). Stays at 0
+        // when pressure stays at/above the workload mid_entry — the
+        // gate then degenerates into "always observe".
+        self.metrics.companion_observe_router_skips_total =
+            lf.companion_observe_router_skips_total;
     }
 }
 

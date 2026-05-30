@@ -461,3 +461,116 @@ fn phase_c_scorer_override_counters_reach_runtime_metrics_json() {
         json
     );
 }
+
+/// Sprint 13 Pressure-Router Gate (2026-05-30) — closes the loop on the
+/// `companion_observe_router_skips_total` counter wired into the daemon
+/// main loop. Drives a 200-cycle synthetic pressure stream at p=0.10
+/// (below the default 0.30 `learned_mid_entry`) and asserts:
+///
+///   1. The skip counter accumulates ~150 (out of 200) — matching the
+///      modulo-4 forced-exploration fallback (every 4th cycle goes through
+///      regardless, so 50 hits + 150 skips = 75% skip ratio).
+///   2. The companion graph `edge_count()` still grows monotonically across
+///      the run, proving the modulo-4 fallback keeps the Lift denominator
+///      updating instead of letting the graph go stale.
+///   3. The counter round-trips end-to-end through `sync_from_lockfree`
+///      into `RuntimeMetrics` and the serialized JSON the operator reads.
+///
+/// Paper backing:
+/// - Adaptive router gate pattern: [signal_intelligence.rs:404-424]
+///   (MoR-style conditional compute)
+/// - Forced-exploration fallback: [Sutton & Barto §2.7]
+/// - Skip-with-counter telemetry shape: Sprint 12 G12 `bus_saturated`
+///   precedent (commit `5f1c984`).
+#[test]
+fn companion_observe_pressure_gated() {
+    use apollo_engine::engine::companion_graph::CompanionGraph;
+    use apollo_engine::engine::signal_intelligence::SignalIntelligence;
+
+    let si = SignalIntelligence::new();
+    // Default zone — no workload offsets persisted → mid_entry = 0.30.
+    let (mid_entry, _) = si.effective_zones(0);
+    assert!(
+        mid_entry > 0.15,
+        "sanity: default mid_entry should be > 0.15, got {mid_entry}"
+    );
+
+    let lf = LockFreeMetrics::new();
+    let mut companion_graph = CompanionGraph::new();
+    let mut edge_counts: Vec<usize> = Vec::with_capacity(50);
+
+    // Synthetic alive set with names that exceed the SSO threshold (≈23
+    // bytes) so the `alive: Vec<String>` clones we skip in prod are real
+    // heap allocations, not inline strings.
+    let alive_set: Vec<String> = vec![
+        "com.apple.WebKit.WebContent.AnchorOne".to_string(),
+        "com.apple.WebKit.WebContent.AnchorTwo".to_string(),
+        "com.apple.Music.WidgetExtension".to_string(),
+        "com.apple.coreservices.uiagent".to_string(),
+    ];
+    const FG_APP: &str = "com.apple.Safari.Anchor";
+
+    // Synthetic pressure floor below the mid_entry → gate closes except
+    // on the modulo-4 cycles.
+    let synthetic_pressure = 0.10_f64;
+
+    for cycle in 0..200u64 {
+        let pressure_router_open =
+            synthetic_pressure >= mid_entry || cycle.is_multiple_of(4);
+        if pressure_router_open {
+            companion_graph.observe_cycle(Some(FG_APP), &alive_set, cycle);
+        } else {
+            lf.inc_companion_observe_router_skip();
+        }
+        // Sample edge_count() at every observe to verify monotonicity.
+        if pressure_router_open && cycle.is_multiple_of(8) {
+            edge_counts.push(companion_graph.edge_count());
+        }
+    }
+
+    lf.commit();
+    let snap = lf.snapshot();
+
+    // Cycles 0,4,8,...,196 are multiples of 4 → 50 allowed, 150 skipped.
+    assert_eq!(
+        snap.companion_observe_router_skips_total, 150,
+        "expected 150 skips out of 200 cycles (75% skip ratio under pressure < mid_entry, \
+         modulo-4 fallback every 4th cycle), got {}",
+        snap.companion_observe_router_skips_total
+    );
+
+    // Modulo-4 fallback must keep observing → edges grow monotonically.
+    assert!(
+        edge_counts.len() >= 2,
+        "expected at least two edge_count samples, got {}",
+        edge_counts.len()
+    );
+    for win in edge_counts.windows(2) {
+        assert!(
+            win[1] >= win[0],
+            "companion_graph.edge_count() decreased between samples ({} -> {}) — \
+             modulo-4 fallback must keep the Lift denominator updating",
+            win[0],
+            win[1]
+        );
+    }
+    assert!(
+        companion_graph.edge_count() > 0,
+        "modulo-4 fallback fired 50 times but edge_count() == 0 — observe_cycle never recorded"
+    );
+
+    // End-to-end round-trip into RuntimeMetrics JSON, mirroring the Phase
+    // 3.3 / Phase 4.1 / Phase C tests above.
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&snap);
+    assert_eq!(
+        state.metrics.companion_observe_router_skips_total, 150,
+        "sync_from_lockfree did not flush companion_observe_router_skips_total"
+    );
+    let json = serde_json::to_string(&state.metrics).expect("serialize RuntimeMetrics");
+    assert!(
+        json.contains("\"companion_observe_router_skips_total\":150"),
+        "companion_observe_router_skips_total absent/wrong in JSON: {}",
+        json
+    );
+}

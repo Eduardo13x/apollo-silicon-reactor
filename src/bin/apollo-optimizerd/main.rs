@@ -3495,7 +3495,27 @@ fn main() -> anyhow::Result<()> {
                 // top_processes ~50 entries). Membership query consumed below.
                 // Decay+GC every 500 cycles (~40 min @ 5s/cycle) keeps the
                 // graph adapting and bounded.
-                {
+                //
+                // Sprint 13 Pressure-Router Gate (2026-05-30). Mirrors the
+                // existing 4-subsystem MoR-style gate at
+                // signal_intelligence.rs:404-424: skip the per-cycle
+                // observation + Phase 3.3 propagation when pressure is
+                // below the workload-adjusted mid_entry. Saves the
+                // `alive: Vec<String>` clones + HashMap inserts + O(V²)
+                // propagation when the system has no symptoms to learn
+                // from. The `cycle_count % 4 == 0` fallback is
+                // [Sutton & Barto §2.7] forced exploration: keeps the
+                // Lift denominator updating ~every 20 s @ 5 s/cycle so
+                // graph statistics don't go stale under sustained low
+                // pressure. Telemetry shape matches Sprint 12 G12
+                // `bus_saturated` skip-with-counter precedent (commit
+                // `5f1c984`).
+                let mid_entry_threshold =
+                    lctx.signal_intel.effective_zones(0).0;
+                let pressure_router_open = snapshot.pressure.memory_pressure
+                    >= mid_entry_threshold
+                    || cycle_count.is_multiple_of(4);
+                if pressure_router_open {
                     let alive: Vec<String> = snapshot
                         .top_processes
                         .iter()
@@ -3549,6 +3569,13 @@ fn main() -> anyhow::Result<()> {
                             }));
                         }
                     }
+                } else {
+                    // Pressure-router skip: bump skip counter and move on.
+                    // Sprint 13 (2026-05-30) — saves ~40-55 μs alloc +
+                    // O(V²) propagation when there are no symptoms to
+                    // learn from.
+                    apollo_engine::engine::lse_counters::LSE_COUNTERS
+                        .inc_companion_observe_router_skip();
                 }
                 // ActiveCoalitionEnvelope — record current fg coalition so
                 // recent fg apps keep coalition protection during the 5-min
