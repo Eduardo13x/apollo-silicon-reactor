@@ -213,80 +213,60 @@ pub fn wire_enriched_telemetry(
     };
     m.metrics.metrics_lock_held_max_us = hm / 1000;
     // Phase 0b stage split.
-    let sc = lf.stage_count.load(std::sync::atomic::Ordering::Relaxed);
-    let to_avg_ms = |total: u64| -> f64 {
-        if sc > 0 {
-            (total as f64 / sc as f64) / 1_000_000.0
+    //
+    // Windowed avg + windowed max — both drained per publish so producer
+    // and consumer agree on the same time horizon. Previously the avg
+    // divided a lifetime cumulative `stage_*_total_ns` by lifetime
+    // `stage_count`, while the max was per-interval drained — this
+    // structurally produced `avg_ms > max_ms` on tail-light stages
+    // (esp. Persist) and leaked stale lifetime values into dashboards.
+    // Sprint 9 `4b13a39` rule: producer + consumer agree on horizon.
+    // [Welford 1962] online statistics windowing.
+    let sc_window = lf.drain_stage_count_window();
+    let to_avg_ms = |total_window: u64| -> f64 {
+        if sc_window > 0 {
+            (total_window as f64 / sc_window as f64) / 1_000_000.0
         } else {
             0.0
         }
     };
     let ns_to_ms = |ns: u64| -> f64 { ns as f64 / 1_000_000.0 };
-    m.metrics.stage_sense_avg_ms = to_avg_ms(
-        lf.stage_sense_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_sense_avg_ms = to_avg_ms(lf.drain_stage_total_ns(CycleStage::Sense));
     m.metrics.stage_sense_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::Sense));
-    m.metrics.stage_reason_avg_ms = to_avg_ms(
-        lf.stage_reason_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_avg_ms = to_avg_ms(lf.drain_stage_total_ns(CycleStage::Reason));
     m.metrics.stage_reason_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::Reason));
-    m.metrics.stage_execute_avg_ms = to_avg_ms(
-        lf.stage_execute_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_execute_avg_ms = to_avg_ms(lf.drain_stage_total_ns(CycleStage::Execute));
     m.metrics.stage_execute_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::Execute));
-    m.metrics.stage_learn_avg_ms = to_avg_ms(
-        lf.stage_learn_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_learn_avg_ms = to_avg_ms(lf.drain_stage_total_ns(CycleStage::Learn));
     m.metrics.stage_learn_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::Learn));
-    m.metrics.stage_persist_avg_ms = to_avg_ms(
-        lf.stage_persist_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_persist_avg_ms = to_avg_ms(lf.drain_stage_total_ns(CycleStage::Persist));
     m.metrics.stage_persist_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::Persist));
     // REASON sub-stages (Phase 0c).
-    m.metrics.stage_reason_signal_avg_ms = to_avg_ms(
-        lf.stage_reason_signal_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_signal_avg_ms =
+        to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonSignalTick));
     m.metrics.stage_reason_signal_max_ms =
         ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonSignalTick));
-    m.metrics.stage_reason_neuro_avg_ms = to_avg_ms(
-        lf.stage_reason_neuro_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_neuro_avg_ms =
+        to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonNeuro));
     m.metrics.stage_reason_neuro_max_ms = ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonNeuro));
-    m.metrics.stage_reason_usercontext_avg_ms = to_avg_ms(
-        lf.stage_reason_usercontext_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_usercontext_avg_ms =
+        to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonUserContext));
     m.metrics.stage_reason_usercontext_max_ms =
         ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonUserContext));
-    m.metrics.stage_reason_holtwinters_avg_ms = to_avg_ms(
-        lf.stage_reason_holtwinters_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_holtwinters_avg_ms =
+        to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonHoltWinters));
     m.metrics.stage_reason_holtwinters_max_ms =
         ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonHoltWinters));
-    m.metrics.stage_reason_pagereclaim_avg_ms = to_avg_ms(
-        lf.stage_reason_pagereclaim_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_pagereclaim_avg_ms =
+        to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonPageReclaim));
     m.metrics.stage_reason_pagereclaim_max_ms =
         ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonPageReclaim));
-    m.metrics.stage_reason_chromium_avg_ms = to_avg_ms(
-        lf.stage_reason_chromium_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_chromium_avg_ms =
+        to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonChromium));
     m.metrics.stage_reason_chromium_max_ms =
         ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonChromium));
-    m.metrics.stage_reason_enrich_avg_ms = to_avg_ms(
-        lf.stage_reason_enrich_total_ns
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
+    m.metrics.stage_reason_enrich_avg_ms =
+        to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonEnrich));
     m.metrics.stage_reason_enrich_max_ms =
         ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonEnrich));
     m.metrics.meta_confidence = inputs.cognitive_state.meta_cognition.meta_confidence;

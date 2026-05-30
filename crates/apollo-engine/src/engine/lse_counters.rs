@@ -695,6 +695,45 @@ impl LockFreeMetrics {
         max.fetch_max(ns, Ordering::Relaxed);
     }
 
+    /// Drain the cumulative ns for one stage since the previous drain.
+    ///
+    /// Windowed counterpart to [`drain_stage_max_ns`]. Both producer
+    /// (`record_stage`) and consumer (windowed avg in
+    /// `daemon_cycle_tail`) must agree on the same time horizon —
+    /// otherwise tail-light stages structurally exhibit avg > max
+    /// (lifetime sum / lifetime count vs drained interval max).
+    /// Sprint 9 `4b13a39` rule: producer + consumer agree on the
+    /// telemetry horizon. [Welford 1962] online statistics windowing.
+    #[inline(always)]
+    pub fn drain_stage_total_ns(&self, stage: CycleStage) -> u64 {
+        let total = match stage {
+            CycleStage::Sense => &self.stage_sense_total_ns,
+            CycleStage::Reason => &self.stage_reason_total_ns,
+            CycleStage::Execute => &self.stage_execute_total_ns,
+            CycleStage::Learn => &self.stage_learn_total_ns,
+            CycleStage::Persist => &self.stage_persist_total_ns,
+            CycleStage::ReasonSignalTick => &self.stage_reason_signal_total_ns,
+            CycleStage::ReasonDecide => &self.stage_reason_decide_total_ns,
+            CycleStage::ReasonNeuro => &self.stage_reason_neuro_total_ns,
+            CycleStage::ReasonUserContext => &self.stage_reason_usercontext_total_ns,
+            CycleStage::ReasonHoltWinters => &self.stage_reason_holtwinters_total_ns,
+            CycleStage::ReasonPageReclaim => &self.stage_reason_pagereclaim_total_ns,
+            CycleStage::ReasonChromium => &self.stage_reason_chromium_total_ns,
+            CycleStage::ReasonEnrich => &self.stage_reason_enrich_total_ns,
+        };
+        total.swap(0, Ordering::Relaxed)
+    }
+
+    /// Drain the per-cycle stage count since the previous drain.
+    ///
+    /// Mirror of [`drain_stage_max_ns`] for the divisor of the windowed
+    /// avg. Must be drained exactly once per publish, paired with one
+    /// `drain_stage_total_ns` call per stage. [Welford 1962].
+    #[inline(always)]
+    pub fn drain_stage_count_window(&self) -> u64 {
+        self.stage_count.swap(0, Ordering::Relaxed)
+    }
+
     /// Drain the observed max for one stage since the previous drain.
     ///
     /// The total counters remain cumulative for long-run averages, but max
