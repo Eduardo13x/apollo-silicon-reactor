@@ -1068,6 +1068,7 @@ impl LockFreeMetrics {
                 .load(Ordering::Relaxed),
             companion_observe_router_skips_total: self
                 .companion_observe_router_skips_total
+                .load(Ordering::Relaxed),
             companion_fg_cache_hits_total: self
                 .companion_fg_cache_hits_total
                 .load(Ordering::Relaxed),
@@ -1308,6 +1309,9 @@ impl LockFreeMetrics {
     #[inline(always)]
     pub fn inc_companion_observe_router_skip(&self) {
         self.companion_observe_router_skips_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Sprint 12 perf-fix (2026-05-30): bump once per cycle when the
     /// `companion_of_fg_pids` set was served from the memoization cache
     /// instead of being rebuilt by scanning `top_processes`. Hit ratio
