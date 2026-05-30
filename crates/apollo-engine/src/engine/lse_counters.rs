@@ -113,15 +113,23 @@ pub struct LockFreeMetrics {
     ///
     /// `actions_pushed_raw_total` increments on `push_raw` / `extend_raw`
     /// (escape hatch for revert/confirmed/decide_actions paths). Per-variant
-    /// counters (`actions_pushed_freeze_total`, etc.) increment ONLY for
-    /// typed `push_*` methods — raw pushes do NOT bump the per-variant
-    /// counter. The invariant
+    /// counters (`actions_pushed_freeze_total`, etc.) increment on BOTH the
+    /// typed `push_*` methods AND `push_raw` — every raw push also bumps the
+    /// matching per-variant counter so runtime telemetry reflects the true
+    /// emitted-variant volume.
+    ///
+    /// Invariant (post-ffa0b29):
     /// ```text
-    /// Σ(typed per-variant) + actions_pushed_raw_total == total_pushed
+    /// Σ(typed per-variant) == total_pushed
     /// ```
     ///
-    /// holds. Dashboards compute "% bypassing typed shape validation" as
+    /// `actions_pushed_raw_total` is an INDEPENDENT diagnostic of escape-hatch
+    /// volume — it is a SUBSET of the typed totals, not an addend. Dashboards
+    /// compute "% bypassing typed shape validation" as
     /// `actions_pushed_raw_total / total_pushed`.
+    ///
+    /// DO NOT compute Σ(typed) + raw — this double-counts every escape-hatch
+    /// emission and inflates dispatcher volume by the raw fraction.
     ///
     /// FOLLOW-UP (not in Fase 5): a `drop_ratio_5min` windowed alarm that
     /// fires when rejected_shape / total_pushed exceeds a threshold over a

@@ -1188,9 +1188,15 @@ pub struct RuntimeMetrics {
     /// ActionAccumulator telemetry (Sprint 4 Fase 5 — flushed from lf_metrics).
     /// Per-variant push counters published from `ActionAccumulator::telemetry()`
     /// at finalize time. Counters are cumulative across all daemon cycles.
-    /// Invariant: Σ(typed per-variant) + actions_pushed_raw_total ==
-    /// total emitted into the dispatcher (push_raw is the escape-hatch path
-    /// and does NOT increment any per-variant total).
+    ///
+    /// Invariant (post-ffa0b29): Σ(typed per-variant) == total_pushed.
+    /// `actions_pushed_raw_total` is an INDEPENDENT diagnostic of escape-hatch
+    /// volume — it is a SUBSET of the typed totals (every raw push also bumps
+    /// the matching per-variant counter so a raw BoostProcess still moves the
+    /// boost counter). Dashboards must NOT add raw to the typed sum.
+    ///
+    /// DO NOT compute Σ(typed) + raw — this double-counts every escape-hatch
+    /// emission and inflates dispatcher volume by the raw fraction.
     #[serde(default)]
     pub actions_pushed_throttle_total: u64,
     #[serde(default)]

@@ -489,6 +489,14 @@ impl ActionAccumulator {
 /// Per-cycle telemetry of accumulator activity. All counters are absolute
 /// (resets when `ActionAccumulator::new()` is called — i.e. once per
 /// daemon cycle).
+///
+/// Invariant (post-ffa0b29): Σ(typed per-variant) == total_pushed.
+/// `raw` is an INDEPENDENT diagnostic of escape-hatch volume — it is a SUBSET
+/// of the typed totals (every `push_raw` also bumps the matching per-variant
+/// counter). Dashboards must NOT add `raw` to the typed sum.
+///
+/// DO NOT compute Σ(typed) + raw — this double-counts every escape-hatch
+/// emission and inflates dispatcher volume by the raw fraction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccumulatorTelemetry {
     pub throttle: u64,
@@ -821,6 +829,129 @@ mod tests {
         assert_eq!(
             lf.actions_pushed_set_sysctl_total.load(Ordering::Relaxed),
             1
+        );
+    }
+
+    /// Invariant guard (post-ffa0b29): a single `push_raw` of a Boost bumps
+    /// the boost per-variant counter AND the raw diagnostic counter — but
+    /// `total_pushed` increments by ONE, not two. Dashboards must not add raw
+    /// to the typed sum.
+    #[test]
+    fn test_push_raw_increments_typed_and_raw() {
+        let lf = LockFreeMetrics::new();
+        let mut acc = ActionAccumulator::new();
+        acc.push_raw(
+            RootAction::BoostProcess {
+                pid: 9001,
+                name: "x".into(),
+                reason: "r".into(),
+                decision_reason: DecisionReason::PressureContext,
+            },
+            EmitContext::new(ActionPhase::Other, "test::invariant", "raw_boost"),
+            &lf,
+        );
+        let t = acc.telemetry();
+        assert_eq!(t.boost, 1, "boost per-variant counter must bump on raw");
+        assert_eq!(t.raw, 1, "raw diagnostic counter must bump");
+        assert_eq!(
+            t.total_pushed, 1,
+            "total_pushed counts dispatcher emissions, not raw+typed"
+        );
+        // lf_metrics mirrors must match.
+        assert_eq!(
+            lf.actions_pushed_boost_total.load(Ordering::Relaxed),
+            1,
+            "lf boost mirror must bump on raw"
+        );
+        assert_eq!(
+            lf.actions_pushed_raw_total.load(Ordering::Relaxed),
+            1,
+            "lf raw mirror must bump"
+        );
+    }
+
+    /// Invariant guard (post-ffa0b29): over a mixed batch of typed and raw
+    /// pushes, Σ(typed per-variant) == total_pushed. `raw` is an INDEPENDENT
+    /// diagnostic — it is a SUBSET of the typed totals, NOT an addend.
+    /// Computing Σ(typed) + raw would double-count every escape-hatch push.
+    #[test]
+    fn test_invariant_typed_sum_equals_total_pushed() {
+        let lf = LockFreeMetrics::new();
+        let mut acc = ActionAccumulator::new();
+        // 3 typed pushes.
+        acc.push_throttle(
+            11,
+            "t1",
+            false,
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_freeze(
+            12,
+            "f1",
+            "r",
+            DecisionReason::PressureContext,
+            0,
+            0,
+            ctx(),
+            &lf,
+        );
+        acc.push_set_sysctl_clamped(
+            "kern.ipc.somaxconn",
+            "256",
+            "r",
+            DecisionReason::PressureContext,
+            ctx(),
+            &lf,
+        );
+        // 3 raw pushes (cover 3 different variants).
+        acc.push_raw(
+            RootAction::unfreeze(13, "u1", "r", DecisionReason::PressureContext),
+            ctx(),
+            &lf,
+        );
+        acc.push_raw(
+            RootAction::BoostProcess {
+                pid: 14,
+                name: "b1".into(),
+                reason: "r".into(),
+                decision_reason: DecisionReason::PressureContext,
+            },
+            ctx(),
+            &lf,
+        );
+        acc.push_raw(
+            RootAction::toggle_spotlight(false, "r", DecisionReason::PressureContext),
+            ctx(),
+            &lf,
+        );
+
+        let t = acc.telemetry();
+        let typed_sum = t.throttle
+            + t.freeze
+            + t.unfreeze
+            + t.boost
+            + t.set_memorystatus
+            + t.set_thread_qos
+            + t.set_sysctl
+            + t.toggle_spotlight
+            + t.quarantine_daemon;
+
+        assert_eq!(t.total_pushed, 6, "6 total pushes (3 typed + 3 raw)");
+        assert_eq!(
+            typed_sum, t.total_pushed,
+            "Σ(typed per-variant) MUST equal total_pushed (post-ffa0b29 invariant)"
+        );
+        assert_eq!(t.raw, 3, "raw diagnostic counts escape-hatch volume");
+        // Negative guard: the wrong formula Σ(typed) + raw would inflate.
+        assert_ne!(
+            typed_sum + t.raw,
+            t.total_pushed,
+            "Σ(typed) + raw double-counts and MUST NOT match total_pushed"
         );
     }
 
