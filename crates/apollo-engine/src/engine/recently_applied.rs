@@ -128,7 +128,23 @@ pub struct RecentlyApplied {
     map: HashMap<(u32, CachedActionKind), Instant>,
     ttl: Duration,
     capacity: usize,
+    /// Sprint 13 BUG #6 (2026-05-30) — 2-strike ABA guard. Counts
+    /// consecutive cycles a PID has been absent from `live_pids` in
+    /// `invalidate_dead_pids`. Eviction only fires when the count
+    /// reaches [`MIN_ABSENCE_STRIKES`]. Without this, a single
+    /// transient sysinfo refresh gap (50-100ms on M1 8GB under load)
+    /// could drop a still-live PID's dedup, allowing a recently-emitted
+    /// action to fire again the next cycle. PID returns to live →
+    /// counter resets.
+    /// [H-1 / B011 round-2 asymmetric-state-management pattern].
+    absence_strikes: HashMap<u32, u8>,
 }
+
+/// Sprint 13 BUG #6: consecutive-absent cycles required before a PID
+/// is evicted from the dedup cache. `2` corresponds to ~10 s on the
+/// 5 s/cycle daemon — covers typical sysinfo refresh skew while still
+/// promptly evicting truly dead PIDs.
+pub const MIN_ABSENCE_STRIKES: u8 = 2;
 
 impl RecentlyApplied {
     /// New cache with default 30s TTL and 5000-entry capacity.
@@ -142,6 +158,7 @@ impl RecentlyApplied {
             map: HashMap::with_capacity(512),
             ttl,
             capacity: 5000,
+            absence_strikes: HashMap::with_capacity(64),
         }
     }
 
@@ -204,9 +221,41 @@ impl RecentlyApplied {
     /// This closes the gap where a PID exits without an eager NOTE_EXIT hook:
     /// stale dedup entries must not suppress actions for a future process that
     /// reuses the same numeric PID.
+    ///
+    /// Sprint 13 BUG #6 (2026-05-30) — 2-strike ABA guard. A PID must be
+    /// absent from `live_pids` for [`MIN_ABSENCE_STRIKES`] consecutive
+    /// invocations before its entries are evicted. Transient sysinfo
+    /// refresh skew (50-100 ms on M1 8GB under load) was causing live
+    /// PIDs to drop their dedup, then the next cycle re-fire the same
+    /// recently-emitted action. PID returning to live resets the strike.
     pub fn invalidate_dead_pids(&mut self, live_pids: &HashSet<u32>) -> usize {
+        // Compute set of PIDs referenced by the cache.
+        let cached_pids: HashSet<u32> = self.map.keys().map(|(pid, _)| *pid).collect();
+
+        // Update strike counters: bump for absent, reset for live.
+        for pid in &cached_pids {
+            if live_pids.contains(pid) {
+                self.absence_strikes.remove(pid);
+            } else {
+                let strikes = self.absence_strikes.entry(*pid).or_insert(0);
+                *strikes = strikes.saturating_add(1);
+            }
+        }
+
+        // Drop strike entries for PIDs no longer in the cache (e.g. TTL
+        // expiry removed them) to bound memory.
+        self.absence_strikes
+            .retain(|pid, _| cached_pids.contains(pid));
+
+        // Evict only entries whose PID has reached the strike threshold.
         let before = self.map.len();
-        self.map.retain(|(pid, _), _| live_pids.contains(pid));
+        let strikes = &self.absence_strikes;
+        self.map.retain(|(pid, _), _| {
+            strikes
+                .get(pid)
+                .map(|s| *s < MIN_ABSENCE_STRIKES)
+                .unwrap_or(true)
+        });
         before - self.map.len()
     }
 
@@ -436,9 +485,16 @@ mod tests {
         cache.record(3, CachedActionKind::SetMemorystatus);
 
         let live = HashSet::from([2_u32]);
-        let removed = cache.invalidate_dead_pids(&live);
+        // Sprint 13 BUG #6 — 2-strike ABA guard. Single absence is not
+        // enough; sysinfo transient gap should not evict. Second call
+        // with PIDs still absent reaches the strike threshold.
+        let first = cache.invalidate_dead_pids(&live);
+        assert_eq!(first, 0, "single absence must not evict (2-strike guard)");
+        assert!(cache.is_recent(1, CachedActionKind::Throttle));
+        assert!(cache.is_recent(3, CachedActionKind::SetMemorystatus));
 
-        assert_eq!(removed, 2);
+        let second = cache.invalidate_dead_pids(&live);
+        assert_eq!(second, 2);
         assert!(!cache.is_recent(1, CachedActionKind::Throttle));
         assert!(cache.is_recent(2, CachedActionKind::Freeze));
         assert!(!cache.is_recent(3, CachedActionKind::SetMemorystatus));
@@ -652,5 +708,53 @@ mod tests {
         let restored = cache.restore_from_records(vec![]);
         assert_eq!(restored, 0);
         assert!(cache.is_empty());
+    }
+
+    /// Sprint 13 BUG #6 — single transient sysinfo gap must NOT evict.
+    #[test]
+    fn invalidate_dead_pids_2_strike_keeps_pid_on_single_absence() {
+        let mut cache = RecentlyApplied::new();
+        cache.record(42, CachedActionKind::Throttle);
+        assert_eq!(cache.len(), 1);
+
+        // Cycle 1: PID 42 briefly missing from sysinfo.
+        let live: HashSet<u32> = HashSet::new();
+        let evicted = cache.invalidate_dead_pids(&live);
+        assert_eq!(evicted, 0, "single absence must not evict");
+        assert_eq!(cache.len(), 1, "entry must survive 1 strike");
+    }
+
+    /// Sprint 13 BUG #6 — second consecutive absence triggers eviction.
+    #[test]
+    fn invalidate_dead_pids_2_strike_evicts_on_second_absence() {
+        let mut cache = RecentlyApplied::new();
+        cache.record(42, CachedActionKind::Throttle);
+
+        let live: HashSet<u32> = HashSet::new();
+        // Cycle 1: absent (strike=1).
+        let e1 = cache.invalidate_dead_pids(&live);
+        assert_eq!(e1, 0);
+        // Cycle 2: still absent (strike=2 → eviction).
+        let e2 = cache.invalidate_dead_pids(&live);
+        assert_eq!(e2, 1, "2nd consecutive absence must evict");
+        assert!(cache.is_empty());
+    }
+
+    /// Sprint 13 BUG #6 — PID re-appearing live resets the strike streak.
+    #[test]
+    fn invalidate_dead_pids_2_strike_resets_on_reappearance() {
+        let mut cache = RecentlyApplied::new();
+        cache.record(42, CachedActionKind::Throttle);
+
+        let absent: HashSet<u32> = HashSet::new();
+        let live: HashSet<u32> = [42u32].into_iter().collect();
+
+        // strike=1
+        assert_eq!(cache.invalidate_dead_pids(&absent), 0);
+        // PID reappears — strike must reset.
+        assert_eq!(cache.invalidate_dead_pids(&live), 0);
+        // strike=1 again (not 2) — eviction must NOT happen yet.
+        assert_eq!(cache.invalidate_dead_pids(&absent), 0);
+        assert_eq!(cache.len(), 1, "reappearance must reset strike");
     }
 }
