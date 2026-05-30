@@ -268,6 +268,13 @@ impl MetricsState {
         // gate then degenerates into "always observe".
         self.metrics.companion_observe_router_skips_total =
             lf.companion_observe_router_skips_total;
+        // Sprint 12 perf-fix (2026-05-30). Producer is the main loop
+        // `companion_of_fg_pids` derivation at
+        // `apollo-optimizerd/main.rs:3317`. Bumps every cycle the
+        // memoization cache returned a hit instead of rebuilding the
+        // HashSet. In steady state (single fg app + stable
+        // top_processes) the ratio hits / cycles ≈ 1.0.
+        self.metrics.companion_fg_cache_hits_total = lf.companion_fg_cache_hits_total;
     }
 }
 

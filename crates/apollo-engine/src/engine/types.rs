@@ -1963,6 +1963,19 @@ pub struct RuntimeMetrics {
     /// [`crate::engine::lse_counters::LockFreeMetrics::companion_observe_router_skips_total`].
     #[serde(default)]
     pub companion_observe_router_skips_total: u64,
+    /// Sprint 12 perf-fix (2026-05-30). Cumulative per-cycle hits on
+    /// the `companion_of_fg_pids` memoization cache. Producer rebuilds
+    /// only when the (foreground_app, top_processes_fingerprint,
+    /// companion_graph_witness) tuple changes; every other cycle is
+    /// served from the cached HashSet and this counter bumps. Steady
+    /// state ratio (hits / cycles) approaches 1.0 because the
+    /// foreground app rarely flips and `top_processes` is stable
+    /// across consecutive 5-s ticks. Drop ratio indicates either
+    /// frequent fg switching or rapid CompanionGraph mutation under
+    /// `self_improve` decay. See
+    /// [`crate::engine::lse_counters::LockFreeMetrics::companion_fg_cache_hits_total`].
+    #[serde(default)]
+    pub companion_fg_cache_hits_total: u64,
 }
 
 impl RuntimeMetrics {

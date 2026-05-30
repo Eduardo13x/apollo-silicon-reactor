@@ -496,6 +496,16 @@ pub struct LockFreeMetrics {
     /// the mid-entry threshold) and drop toward 0 under sustained
     /// pressure ≥ mid_entry.
     pub companion_observe_router_skips_total: AtomicU64,
+    /// Sprint 12 perf-fix (2026-05-30). Cumulative count of per-cycle
+    /// companion-of-foreground-PIDs set rebuilds that hit the
+    /// LearningContext-scope memoization cache (no recomputation, no
+    /// HashSet allocation). Producer = `apollo-optimizerd` main loop
+    /// `companion_of_fg_pids` derivation. See
+    /// `RuntimeMetrics::companion_fg_cache_hits_total` for rationale.
+    /// [Saltzer & Schroeder 1975] Economy of Mechanism — single
+    /// chokepoint memoize keyed on observable mutation witness
+    /// (`CompanionGraph::total_cycles + anchor_count`), not wall clock.
+    pub companion_fg_cache_hits_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -635,6 +645,7 @@ impl LockFreeMetrics {
             causal_thermal_scorer_override_alignments_total: AtomicU64::new(0),
             companion_affinity_alignments_total: AtomicU64::new(0),
             companion_observe_router_skips_total: AtomicU64::new(0),
+            companion_fg_cache_hits_total: AtomicU64::new(0),
         }
     }
 
@@ -1057,6 +1068,8 @@ impl LockFreeMetrics {
                 .load(Ordering::Relaxed),
             companion_observe_router_skips_total: self
                 .companion_observe_router_skips_total
+            companion_fg_cache_hits_total: self
+                .companion_fg_cache_hits_total
                 .load(Ordering::Relaxed),
         }
     }
@@ -1295,6 +1308,16 @@ impl LockFreeMetrics {
     #[inline(always)]
     pub fn inc_companion_observe_router_skip(&self) {
         self.companion_observe_router_skips_total
+    /// Sprint 12 perf-fix (2026-05-30): bump once per cycle when the
+    /// `companion_of_fg_pids` set was served from the memoization cache
+    /// instead of being rebuilt by scanning `top_processes`. Hit ratio
+    /// (hits / cycles) should approach 1.0 in steady state — foreground
+    /// app rarely flips and top_processes is stable across consecutive
+    /// 5-s ticks. Drops only on fg flip OR CompanionGraph mutation.
+    /// [Saltzer & Schroeder 1975] Economy of Mechanism.
+    #[inline(always)]
+    pub fn inc_companion_fg_cache_hit(&self) {
+        self.companion_fg_cache_hits_total
             .fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -1446,6 +1469,12 @@ pub struct MetricsSnapshot {
     /// 3.3 propagation under low pressure. See LSE producer for gate
     /// semantics.
     pub companion_observe_router_skips_total: u64,
+    /// Sprint 12 perf-fix (2026-05-30). Cumulative count of per-cycle
+    /// hits on the `companion_of_fg_pids` memoization cache (no
+    /// rebuild, no HashSet alloc). See the producer doc on
+    /// [`LockFreeMetrics::companion_fg_cache_hits_total`] for the
+    /// invalidation contract.
+    pub companion_fg_cache_hits_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
