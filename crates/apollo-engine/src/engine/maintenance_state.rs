@@ -51,6 +51,18 @@ pub struct MaintenanceState {
     /// of the base (5s) to avoid learning the artificial dip.
     #[serde(skip)]
     pub compressor_still_flushing: bool,
+
+    /// 2026-05-30: Consecutive observations of non-negative swap delta
+    /// (stationary or recovering). When ≥2 (≥4s on 2s tick), the
+    /// `compressor_still_flushing` latch is auto-cleared and the
+    /// inhibition window collapses back to the 5s base. Without this
+    /// counter the latch is monotonic-set (every purge re-asserts true
+    /// when delta < 0) and never falls — pinning the window to 12s
+    /// permanently under sustained pressure.
+    /// [Hellerstein 2004 §9] disturbance settled when control signal
+    /// stationary for two consecutive samples.
+    #[serde(skip)]
+    pub positive_delta_samples: u8,
 }
 
 impl MaintenanceState {
@@ -58,6 +70,30 @@ impl MaintenanceState {
     /// post-purge swap velocity is still negative (compressor feeding VM).
     pub fn mark_compressor_flushing(&mut self, active: bool) {
         self.compressor_still_flushing = active;
+        if active {
+            // A fresh flush-start invalidates any prior streak.
+            self.positive_delta_samples = 0;
+        }
+    }
+
+    /// 2026-05-30: per-cycle tick. Counts consecutive non-negative
+    /// `swap_delta_bps` observations. Once two have been seen in a row
+    /// (≥4s on a 2s daemon tick), clears `compressor_still_flushing`
+    /// so the inhibition window collapses from MAX (12s) back to the
+    /// base (5s). A single negative delta resets the streak.
+    pub fn tick_compressor_status(&mut self, swap_delta_bps: f64) {
+        if !self.compressor_still_flushing {
+            return;
+        }
+        if swap_delta_bps >= 0.0 {
+            self.positive_delta_samples = self.positive_delta_samples.saturating_add(1);
+            if self.positive_delta_samples >= 2 {
+                self.compressor_still_flushing = false;
+                self.positive_delta_samples = 0;
+            }
+        } else {
+            self.positive_delta_samples = 0;
+        }
     }
 
     pub fn new() -> Self {
@@ -303,5 +339,79 @@ mod tests {
             !s.is_in_purge_inhibition_window(),
             "purge older than window → not inhibited"
         );
+    }
+
+    /// 2026-05-30: under two stationary positive-delta observations the
+    /// `compressor_still_flushing` latch must clear and the window
+    /// must collapse from MAX (12s) back to the 5s base. Verifies the
+    /// fix that prevents the latch becoming monotonic-set under
+    /// sustained pressure.
+    #[test]
+    fn test_compressor_flushing_clears_under_stationary_positive_delta() {
+        let mut s = MaintenanceState::default();
+        // Simulate a purge that fired between 6s and 11s ago — past the
+        // 5s base window but inside the 12s extended window.
+        let past = SystemTime::now() - Duration::from_secs(8);
+        s.last_any_purge_at = Some(past);
+        s.mark_compressor_flushing(true);
+        assert!(
+            s.is_in_purge_inhibition_window(),
+            "with latch set, 8s-old purge still inside 12s extended window"
+        );
+
+        // Two consecutive non-negative deltas should clear the latch.
+        s.tick_compressor_status(100.0);
+        s.tick_compressor_status(100.0);
+        assert!(!s.compressor_still_flushing, "latch must clear after 2 ticks");
+        assert!(
+            !s.is_in_purge_inhibition_window(),
+            "window collapses to 5s base — 8s-old purge no longer inhibited"
+        );
+    }
+
+    /// Property test: under N stationary positive-delta samples the
+    /// latch must clear within 2 ticks (≥4s on a 2s daemon cadence).
+    #[test]
+    fn tick_compressor_status_clears_within_two_ticks_under_positive_stream() {
+        for n in 2..100u32 {
+            let mut s = MaintenanceState::default();
+            s.mark_compressor_flushing(true);
+            for _ in 0..n {
+                s.tick_compressor_status(50_000.0);
+            }
+            assert!(
+                !s.compressor_still_flushing,
+                "after {} positive ticks the latch should be cleared",
+                n
+            );
+        }
+    }
+
+    /// A single negative delta inside the streak resets the counter —
+    /// the latch must remain set until two consecutive non-negative
+    /// observations are seen.
+    #[test]
+    fn tick_compressor_status_negative_delta_resets_streak() {
+        let mut s = MaintenanceState::default();
+        s.mark_compressor_flushing(true);
+        s.tick_compressor_status(100.0);
+        assert_eq!(s.positive_delta_samples, 1);
+        s.tick_compressor_status(-200.0);
+        assert_eq!(s.positive_delta_samples, 0);
+        assert!(
+            s.compressor_still_flushing,
+            "single positive sample then negative must NOT clear the latch"
+        );
+    }
+
+    /// Calling `tick_compressor_status` when the latch is already
+    /// false is a no-op (no underflow, no spurious state writes).
+    #[test]
+    fn tick_compressor_status_noop_when_latch_clear() {
+        let mut s = MaintenanceState::default();
+        s.tick_compressor_status(100.0);
+        s.tick_compressor_status(-100.0);
+        assert!(!s.compressor_still_flushing);
+        assert_eq!(s.positive_delta_samples, 0);
     }
 }

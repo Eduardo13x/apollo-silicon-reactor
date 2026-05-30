@@ -2762,6 +2762,15 @@ fn main() -> anyhow::Result<()> {
                 // dip is learned as a load improvement and Kalman/Hazard/MPC
                 // cool down OOM risk artificially.
                 // [Hellerstein 2004 §9] disturbance rejection.
+                //
+                // 2026-05-30 latch-clear: feed the current swap delta into the
+                // maintenance state so that, once the compressor settles (≥2
+                // consecutive non-negative deltas), `compressor_still_flushing`
+                // auto-clears and the inhibition window collapses from 12s
+                // back to the 5s base. Without this tick the latch was
+                // monotonic-set (re-asserted on every purge) and never fell.
+                maintenance_state
+                    .tick_compressor_status(snapshot.pressure.swap_delta_bytes_per_sec);
                 lctx.signal_intel.purge_inhibited =
                     maintenance_state.is_in_purge_inhibition_window();
                 let _t_signal_start = Instant::now();
