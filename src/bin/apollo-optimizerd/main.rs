@@ -3431,6 +3431,12 @@ fn main() -> anyhow::Result<()> {
                     .expect("companion_fg_cache populated above")
                     .pids;
 
+                // 2026-05-30: ReasonDecide stage instrumentation. Closes
+                // the 12-of-13 staging gap exposed in cycle-tail avg/max
+                // table — every declared CycleStage MUST have ≥1 producer
+                // [Hellerstein 2004 §3 observability invariant + Sprint 9
+                // silent-telemetry-death `4b13a39`].
+                let _t_decide_start = Instant::now();
                 let decision = {
                     let mut qos = state.mach_qos.lock_recover();
                     let dram_bandwidth_pct = last_ioreport
@@ -3477,6 +3483,10 @@ fn main() -> anyhow::Result<()> {
                         )
                         .decision
                 };
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::ReasonDecide,
+                    _t_decide_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
                 state.process.lock_recover().last_blockers = decision.blockers.clone();
                 state.metrics.lock_recover().thermal_state =
                     process_enrichment::context_to_thermal(decision.context);
