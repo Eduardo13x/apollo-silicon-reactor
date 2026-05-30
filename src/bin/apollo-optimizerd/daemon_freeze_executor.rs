@@ -129,7 +129,13 @@ pub fn apply_freeze_confirmation(
         && fluidity_state.fluidity_predicted_3s < 0.60
         && fluidity_state.fluidity_velocity < -0.05;
     if fluidity_preemptive {
-        tracing::info!(
+        // Sprint 13 perf: demoted INFO→DEBUG. Profile (samply 60s) showed
+        // this logger accounted for ~38% of all tracing_subscriber JSON
+        // overhead because it fires every cycle when fluidity predicts
+        // a drop AND velocity is negative — common under sustained
+        // pressure. Internal state still visible via runtime_metrics
+        // (fluidity_state fields).
+        tracing::debug!(
             predicted = fluidity_state.fluidity_predicted_3s,
             velocity = fluidity_state.fluidity_velocity,
             "fluidity: predicted drop to {:.2} — pre-emptive freeze threshold lowered",

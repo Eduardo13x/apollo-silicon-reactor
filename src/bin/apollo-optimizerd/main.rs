@@ -3178,7 +3178,12 @@ fn main() -> anyhow::Result<()> {
                 let stage_budget_exceeded =
                     _t_reason_start.elapsed().as_millis() > 150;
                 if stage_budget_exceeded {
-                    tracing::info!(
+                    // Sprint 13 perf: demoted INFO→DEBUG. ~4 k events in
+                    // 6 h — fired whenever a reason stage cycle exceeded
+                    // 150 ms. Stage_reason_max_ms in runtime_metrics
+                    // already surfaces the same signal without per-cycle
+                    // JSON formatting cost.
+                    tracing::debug!(
                         elapsed_ms = _t_reason_start.elapsed().as_millis() as u64,
                         "cycle: skipping HoltWinters/PageReclaim/Chromium (budget exceeded)"
                     );

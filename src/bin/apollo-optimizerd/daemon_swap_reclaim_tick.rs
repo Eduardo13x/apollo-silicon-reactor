@@ -26,8 +26,14 @@ pub fn apply_swap_reclaim_boost(reclaim_forecast: &SaturationForecast, reactor_w
     match reclaim_forecast.risk {
         SwapRisk::Critical => {
             *reactor_weight = (*reactor_weight + 0.25).min(1.0);
+            // Sprint 13 perf: demoted INFO→DEBUG. Profile (samply 60s)
+            // showed this single hot logger accounted for ~20% of all
+            // tracing_subscriber JSON overhead because it fired ~10 k
+            // times in 6 h on a system under sustained pressure.
+            // [Hellerstein 2004 §9] observability that costs more than
+            // the observed system is anti-control.
             if let Some(eta) = reclaim_forecast.t_sat_sec {
-                tracing::info!(
+                tracing::debug!(
                     target: "apollo.swap_reclaim",
                     eta_sec = format!("{:.1}", eta),
                     net_mbps = format!("{:.2}", reclaim_forecast.net_rate_bps / (1024.0 * 1024.0)),
