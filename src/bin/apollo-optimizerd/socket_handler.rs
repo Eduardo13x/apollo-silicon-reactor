@@ -604,8 +604,22 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 }
             } else {
                 // Validate individual pattern lengths.
+                //
+                // 2026-05-31 (post-MatchEngine refactor 29f09e0): lowered
+                // MIN_PATTERN_LEN 4→3. Previously the 4-char floor was the
+                // ONLY defense against ambiguous short patterns like "vi"
+                // substring-matching "preview"/"navigator". MatchEngine now
+                // provides tier-based runtime defense:
+                //   Exact       (conf 1.00) → only matches EXACT name
+                //   WordBoundary (conf 0.85) → \bneedle\b, ≥3 chars
+                //   Substring   (conf 0.30) → degraded fallback, below
+                //                              freeze floor 0.35
+                // With MatchEngine in place, MIN=3 is safe: 3-char tools
+                // (zed, vim, ssh, gpg) enter via Exact tier; substring
+                // ambiguity gated by confidence floor; 2-char patterns
+                // still rejected (smallest unit genuinely too broad).
                 const MAX_PATTERN_LEN: usize = 256;
-                const MIN_PATTERN_LEN: usize = 4;
+                const MIN_PATTERN_LEN: usize = 3;
                 let has_invalid_pattern = new_policy
                     .interactive_patterns
                     .iter()
