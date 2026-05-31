@@ -324,16 +324,27 @@ fn pid_identity_still_valid(
 /// Toggle Spotlight indexing via `mdutil -a -i on/off`.
 ///
 fn main() -> anyhow::Result<()> {
-    // Structured JSON logging to stderr (captured by launchd → apollo-optimizer.err.log).
+    // Compact text logging to stderr (captured by launchd → apollo-optimizer.err.log).
     // Override level at runtime: APOLLO_LOG=debug apollo-optimizerd
+    //
+    // 2026-05-31 (post-flamegraph round 2): switched from .json() to .compact().
+    // Samply (PID 93434, 6304 samples, 60 s) confirmed tracing_subscriber JSON
+    // formatter accounted for 30.7% top self-time + 12.4% drop_in_place (~47%
+    // combined) AFTER the round-1 INFO→DEBUG demotes — the residual cost was
+    // structural: JSON field escaping, RFC3339 timestamp formatting, and
+    // String allocation per event. Compact format produces 3-5× cheaper events
+    // with similar diagnostic value (no field-quoting overhead, fixed
+    // timestamp format). Audit journal (journal.jsonl) remains structured —
+    // this only changes the diagnostic stderr stream.
+    // [Pirolli & Card 1999] information foraging cost: cheap-enough logs > rich-but-expensive.
     {
         use tracing_subscriber::{fmt, EnvFilter};
         let filter =
             EnvFilter::try_from_env("APOLLO_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
         fmt()
-            .json()
+            .compact()
             .with_env_filter(filter)
-            .with_current_span(false)
+            .with_target(false)
             .init();
     }
 
