@@ -147,7 +147,20 @@ pub struct DecisionOutput {
 /// the same guard — [Saltzer & Kaashoek 2009] Complete Mediation: every path to a
 /// privileged action must pass through the same access control point.
 pub fn is_interactive_app_name(name: &str) -> bool {
-    INTERACTIVE_APPS.iter().any(|n| name.contains(n))
+    // Short names (≤4 chars, e.g., "Arc", "Code", "Zed") need word-boundary
+    // matching to prevent substring false positives like "Arc" → "Arcade" or
+    // "Code" → "Bytecode". Longer names are unambiguous via plain substring.
+    // Routed through match_engine::word_boundary_contains (lifted from
+    // safety::matches_dev_runtime, commit 5843bc0).
+    let lc = name.to_ascii_lowercase();
+    INTERACTIVE_APPS.iter().any(|n| {
+        let n_lc = n.to_ascii_lowercase();
+        if n_lc.len() <= 4 {
+            crate::engine::match_engine::word_boundary_contains(&lc, &n_lc)
+        } else {
+            lc.contains(&n_lc)
+        }
+    })
 }
 
 fn is_interactive_base(name: &str) -> bool {

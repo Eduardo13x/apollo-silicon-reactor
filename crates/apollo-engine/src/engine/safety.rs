@@ -253,6 +253,32 @@ pub fn is_protected_name(name: &str) -> bool {
     matches_dev_runtime(name)
 }
 
+/// MatchEngine-backed protected check returning `(matched, confidence)`.
+/// Layers the 3-tier MatchEngine on top of `is_protected_name` without
+/// breaking bool-only callers. Saltzer & Kaashoek 2009 §3.3 complete mediation.
+///
+/// Composition contract (peer-consult item #2, 2026-05-30): `confidence` is
+/// epistemic identification, NEVER utility. Route through
+/// `match_engine::IdentityUncertaintyFeature` for RSS composition (65f310d);
+/// do NOT multiply into PolicyScorer benefit/composite.
+pub fn is_protected_with_confidence(
+    name: &str,
+    learned_protected: &[String],
+    weights: &std::collections::HashMap<String, crate::engine::outcome_tracker::PatternWeight>,
+) -> (bool, f64) {
+    // Hard chokepoint wins: known protected → unconditional 1.0.
+    if is_protected_name(name) {
+        return (true, 1.0);
+    }
+    let res = crate::engine::match_engine::match_name(
+        name,
+        &std::collections::HashSet::new(),
+        learned_protected,
+    );
+    let conf = crate::engine::match_engine::confidence_for(res, None, weights);
+    (res.matched(), conf)
+}
+
 /// Returns true if the binary path belongs to protected infrastructure territory.
 ///
 /// Covers:

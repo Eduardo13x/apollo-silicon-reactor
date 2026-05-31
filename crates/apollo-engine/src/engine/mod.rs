@@ -71,6 +71,7 @@ pub mod lock_ext;
 pub mod lotka_volterra;
 pub mod mach_qos;
 pub mod maintenance_state;
+pub mod match_engine;
 pub mod memory_analyzer;
 pub mod memory_budget;
 pub mod meta_cognition;
