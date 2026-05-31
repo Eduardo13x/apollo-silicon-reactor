@@ -920,8 +920,15 @@ pub fn enforce_limits_with_budget(
 /// Uses bidirectional prefix/suffix matching to catch partial evasions.
 pub fn pattern_conflicts_with_protected(pattern: &str) -> bool {
     let pat = pattern.to_lowercase();
-    if pat.len() < 4 {
-        return true; // Too short patterns are dangerous
+    // 2026-05-31 (post-MatchEngine 29f09e0): removed the <4 early-reject.
+    // The MatchEngine substring tier (confidence 0.30, below freeze floor
+    // 0.35) now provides structural safety against short-pattern ambiguity
+    // at runtime. socket_handler enforces MIN_PATTERN_LEN=3 at apply time
+    // so 2-char patterns never reach this function — anything we see is
+    // ≥3 chars. The bidirectional substring + 75% overlap checks below
+    // still catch any real conflict with hardcoded protected names.
+    if pat.is_empty() {
+        return true;
     }
     // Reject non-ASCII patterns to avoid UTF-8 multibyte edge cases
     if !pat.is_ascii() {
