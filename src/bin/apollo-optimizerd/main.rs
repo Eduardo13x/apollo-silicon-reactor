@@ -440,6 +440,7 @@ fn main() -> anyhow::Result<()> {
                     fast_tick_until: None,
                     reactor_event_weight: 0.0,
                     reactor_status: DomainReactorStatus::default(),
+                    survival_window: apollo_engine::engine::survival_window::SurvivalActivationWindow::new(),
                 })),
                 frozen_state: Arc::new(Mutex::new(frozen_since_boot.clone())),
                 process: Arc::new(Mutex::new(ProcessState {

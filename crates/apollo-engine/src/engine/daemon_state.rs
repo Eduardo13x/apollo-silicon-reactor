@@ -52,6 +52,11 @@ pub struct MetricsState {
     pub fast_tick_until: Option<Instant>,
     pub reactor_event_weight: f64,
     pub reactor_status: ReactorStatus,
+    /// D5 windowed source for AIS `safety_compliance()`. See
+    /// `crate::engine::survival_window`. Written by `daemon_survival_tick`.
+    /// Not persisted across process restarts (fresh-on-restart per
+    /// design Risk 2 mitigation; future sprint may piggyback LearnedState).
+    pub survival_window: crate::engine::survival_window::SurvivalActivationWindow,
 }
 
 impl MetricsState {
@@ -288,6 +293,7 @@ impl Default for MetricsState {
             fast_tick_until: None,
             reactor_event_weight: 0.0,
             reactor_status: ReactorStatus::default(),
+            survival_window: crate::engine::survival_window::SurvivalActivationWindow::new(),
         }
     }
 }

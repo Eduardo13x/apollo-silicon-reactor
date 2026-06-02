@@ -1030,6 +1030,13 @@ pub struct RuntimeMetrics {
     /// "did we ever?" predicate, and `CLAUDE.md` for the bug history.
     #[serde(default, rename = "survival_mode_activations")]
     pub survival_mode_entry_count: u64,
+    /// 24h-windowed count of cycles observed while survival mode active.
+    /// THIS is the field AIS D5 `safety_compliance()` reads — NOT the sticky
+    /// lifetime counter above. See `survival_window.rs` and CLAUDE.md
+    /// Sprint 3 doctrine entry #5 ("sticky > 0 as live state flag"
+    /// anti-pattern). Producer: `daemon_survival_tick.rs`.
+    #[serde(default)]
+    pub survival_activations_recent_24h: u64,
     pub qos_foreground_count: u64,
     pub qos_background_count: u64,
     pub qos_errors: u64,

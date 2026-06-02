@@ -1,4 +1,5 @@
 pub mod action_accumulator;
+pub mod survival_window;
 pub mod action_policy;
 pub mod action_queue;
 pub mod activity_sensor;

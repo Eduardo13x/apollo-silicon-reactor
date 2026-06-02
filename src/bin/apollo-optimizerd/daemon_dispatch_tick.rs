@@ -455,6 +455,7 @@ mod tests {
                 fast_tick_until: None,
                 reactor_event_weight: 0.0,
                 reactor_status: apollo_engine::engine::daemon_state::ReactorStatus::default(),
+                survival_window: apollo_engine::engine::survival_window::SurvivalActivationWindow::new(),
             })),
             frozen_state: Arc::new(Mutex::new(HashMap::new())),
             process: Arc::new(Mutex::new(ProcessState {

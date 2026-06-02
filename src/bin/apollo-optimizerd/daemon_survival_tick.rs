@@ -123,11 +123,19 @@ pub fn run_survival_tick(
         snapshot.pressure.swap_total_bytes,
     );
     if survival_active {
-        state
-            .metrics
-            .lock_recover()
-            .metrics
-            .survival_mode_entry_count += 1;
+        let now = std::time::SystemTime::now();
+        let mut guard = state.metrics.lock_recover();
+        // Legacy sticky lifetime counter (preserved for backward compat —
+        // dashboards and `ever_entered_survival_mode()` still read this via
+        // the JSON key `survival_mode_activations`).
+        guard.metrics.survival_mode_entry_count += 1;
+        // D5 windowed source for AIS safety_compliance — replaces the sticky
+        // cumulative read. See CLAUDE.md Sprint 3 doctrine #5.
+        guard.survival_window.record(now);
+        guard.survival_window.prune(now);
+        guard.metrics.survival_activations_recent_24h =
+            guard.survival_window.len() as u64;
+        drop(guard);
 
         // Jetsam demotion: mark non-foreground Chromium renderers as BACKGROUND
         // so the kernel kills them first under OOM — softer than SIGSTOP.

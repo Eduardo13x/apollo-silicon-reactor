@@ -438,7 +438,11 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
 
     // D5
     let kills_applied = rm_u("kills_applied") as u32;
-    let survival_activations = rm_u("survival_mode_activations") as u32;
+    // D5 FIX: read 24h windowed count, NOT the lifetime sticky cumulative.
+    // The legacy JSON key `survival_mode_activations` is preserved for
+    // backward compat (dashboards) but is no longer the AIS source.
+    // See CLAUDE.md Sprint 3 doctrine entry #5.
+    let survival_activations = rm_u("survival_activations_recent_24h") as u32;
     let failures = rm_u("failures") as u32;
     let overflow_events_7d = rm_u("overflow_events_7d") as u32;
 
@@ -807,19 +811,19 @@ fn safety_compliance(input: &AisInput) -> f64 {
     // No kills: +0.30 (unless emergency).
     score += if input.kills_applied == 0 { 0.30 } else { 0.0 };
 
-    // Survival mode: graduated buckets, not binary all-or-nothing on the
-    // cumulative counter. The persistent counter accumulates slowly over
-    // weeks of normal M1 8GB operation; a single activation during a
-    // legitimate crisis should not zero the score for the daemon's life.
-    // 2026-05-12: [Beyer & Jones 2016 SRE Ch.3] error budgets must be scored
-    // on a gradient proportional to operational impact, not coarse binary.
+    // Survival mode: graduated buckets over a 24h ROLLING WINDOW (not
+    // cumulative since boot). D5 fix — see CLAUDE.md Sprint 3 doctrine
+    // entry #5 and `survival_window.rs`. Boundaries derived from M1 8GB
+    // 2s-cycle cadence: 300=10min, 1800=1h, 10800=6h. PRELIMINARY per
+    // supervision rule #4 — recalibrate against prod histogram once
+    // N≥500 events observed.
+    // [Beyer & Jones 2016 SRE Ch.3] graduated error budget.
     score += match input.survival_activations {
-        0 => 0.25,           // clean
-        1..=100 => 0.22,     // healthy crisis response
-        101..=1000 => 0.18,  // sustained pressure (occasional crisis)
-        1001..=5000 => 0.13, // chronic load (M1 8GB heavy day)
-        5001..=25000 => 0.08,
-        _ => 0.0, // degraded
+        0 => 0.25,             // healthy (no recent crisis)
+        1..=300 => 0.22,       // transient (~10min crisis, healthy response)
+        301..=1800 => 0.17,    // sustained (10min–1h, occasional)
+        1801..=10800 => 0.10,  // chronic (1h–6h, M1 8GB heavy load)
+        _ => 0.02,             // degraded (>6h survival in 24h window)
     };
 
     // No failures: +0.20.
@@ -1275,7 +1279,11 @@ mod tests {
 
         // ── D5: Safety ───────────────────────────────────────────────────────
         let kills_applied = rm_u("kills_applied") as u32;
-        let survival_activations = rm_u("survival_mode_activations") as u32;
+        // D5 FIX: read 24h windowed count, NOT the lifetime sticky cumulative.
+    // The legacy JSON key `survival_mode_activations` is preserved for
+    // backward compat (dashboards) but is no longer the AIS source.
+    // See CLAUDE.md Sprint 3 doctrine entry #5.
+    let survival_activations = rm_u("survival_activations_recent_24h") as u32;
         let failures = rm_u("failures") as u32;
         let overflow_events_7d = rm_u("overflow_events_7d") as u32;
 
@@ -2097,6 +2105,44 @@ mod tests {
             "zero reverts + zero overflows should max out D5: {:.3}",
             score.safety_compliance
         );
+    }
+
+    /// D5 windowed-survival fix: bucket boundary 300 (transient) → 301 (sustained).
+    /// Guards off-by-one in bucket lookup (failure class of commit 8348243).
+    /// See `survival_window.rs` and CLAUDE.md Sprint 3 doctrine entry #5.
+    #[test]
+    fn survival_window_bucket_boundary_exact_300_and_301() {
+        // Use reverts > 0 so the precision component does not saturate the
+        // clamp, exposing the bucket-step delta. The bucket contributes 0.22
+        // at 300 vs 0.17 at 301 — a 0.05 raw delta.
+        let mk = |n: u32| AisInput {
+            kills_applied: 0,
+            survival_activations: n,
+            failures: 0,
+            overflow_events_7d: 0,
+            frozen_critical: 0,
+            noise_throttled: 60, // 40% reverts → throttle_precision = 0
+            noise_total: 100,
+            ..Default::default()
+        };
+        let s_300 = compute_ais(&mk(300));
+        let s_301 = compute_ais(&mk(301));
+        assert!(
+            s_300.safety_compliance > s_301.safety_compliance,
+            "transient (300) must outscore sustained (301): {:.3} vs {:.3}",
+            s_300.safety_compliance,
+            s_301.safety_compliance,
+        );
+        // Approximately 0.05 raw delta from the bucket step.
+        let delta = s_300.safety_compliance - s_301.safety_compliance;
+        assert!(
+            (delta - 0.05).abs() < 1e-9,
+            "bucket step should be 0.05, got {:.4}",
+            delta
+        );
+        // Healthy bucket (0) must outscore transient.
+        let s_0 = compute_ais(&mk(0));
+        assert!(s_0.safety_compliance >= s_300.safety_compliance);
     }
 
     /// D5 throttle precision: 20% revert rate = 0 precision bonus.

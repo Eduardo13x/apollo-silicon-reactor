@@ -25,6 +25,7 @@ fn fresh_metrics_state() -> MetricsState {
         fast_tick_until: None,
         reactor_event_weight: 0.0,
         reactor_status: ReactorStatus::default(),
+        survival_window: apollo_engine::engine::survival_window::SurvivalActivationWindow::new(),
     }
 }
 
