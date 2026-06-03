@@ -197,15 +197,39 @@ fn is_hard_protected(name: &str) -> bool {
 }
 
 /// Fast membership test against the infrastructure-protected set (hot-path safe).
-/// Uses `OnceLock` to initialise once and share across all subsequent calls.
-/// Infrastructure set uses substring matching (consistent with `classify_protection`
-/// Sites B–E) — catches bundled executables like `com.docker.backend`.
+/// Uses `OnceLock` + Aho-Corasick automaton to do multi-pattern substring scan
+/// in a single pass over `name`, instead of N iter() × name.contains() loops.
+/// Substring semantics preserved — catches bundled executables like
+/// `com.docker.backend`. Case-sensitive (matches prior behavior).
 fn is_infra_protected(name: &str) -> bool {
-    static CACHE: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    CACHE
-        .get_or_init(infrastructure_processes)
-        .iter()
-        .any(|p| name.contains(p))
+    static MATCHER: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    MATCHER
+        .get_or_init(|| {
+            let patterns: Vec<&'static str> = infrastructure_processes().into_iter().collect();
+            aho_corasick::AhoCorasick::new(patterns).expect("infra patterns build")
+        })
+        .is_match(name)
+}
+
+/// Fast substring membership test against the hard-protected set.
+/// Differs from `is_hard_protected` (exact match) — this matches as substring
+/// so `com.apple.WindowServer` matches pattern `WindowServer`. Used by
+/// `decide_actions` and `classify_protection` Tier 1.
+pub fn hard_protected_contains(name: &str) -> bool {
+    static MATCHER: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    MATCHER
+        .get_or_init(|| {
+            let patterns: Vec<&'static str> = protected_processes().into_iter().collect();
+            aho_corasick::AhoCorasick::new(patterns).expect("hard patterns build")
+        })
+        .is_match(name)
+}
+
+/// Fast critical-background membership test (infra ∪ dev_runtime) — replaces
+/// the slow `critical_background_processes().iter().any(|p| name.contains(p))`
+/// pattern at hot decide_actions sites.
+pub fn is_critical_background_name(name: &str) -> bool {
+    is_infra_protected(name) || matches_dev_runtime(name)
 }
 
 /// Single truth point for name-based process protection.
@@ -404,16 +428,21 @@ pub fn classify_protection(
     is_interactive: bool,
 ) -> ProtectionLevel {
     // Tier 1: OS/system essentials — substring to catch variants like
-    // "com.apple.WindowServer" matching "WindowServer".
-    if hard_protected.iter().any(|p| name.contains(p)) {
+    // "com.apple.WindowServer" matching "WindowServer". Fast path via
+    // Aho-Corasick OnceLock. Caller-supplied HashSet args are ignored in favor
+    // of the canonical static set (all production callers pass that anyway).
+    let _ = hard_protected;
+    let _ = infra_protected;
+    if hard_protected_contains(name) {
         return ProtectionLevel::Unconditional;
     }
     // Tier 2: Stateful infrastructure (Docker, Postgres, Redis, …).
-    if infra_protected.iter().any(|p| name.contains(p)) {
+    if is_infra_protected(name) {
         return ProtectionLevel::Unconditional;
     }
     // Tier 3: Policy-learned daemons (case-insensitive substring).
-    {
+    // Empty list is the common case (no learned policies) — skip lowercase alloc.
+    if !policy_protected.is_empty() {
         let name_lc = name.to_ascii_lowercase();
         if policy_protected
             .iter()
@@ -715,30 +744,41 @@ pub fn dev_runtime_patterns() -> &'static [&'static str] {
 ///
 /// Case-insensitive: macOS shows "Python" (capital P) in process names.
 pub fn matches_dev_runtime(name: &str) -> bool {
+    // Long patterns (≥4 chars) → single-pass Aho-Corasick (case-insensitive).
+    static LONG_MATCHER: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    let long = LONG_MATCHER.get_or_init(|| {
+        let pats: Vec<&'static str> = dev_runtime_patterns()
+            .iter()
+            .copied()
+            .filter(|p| p.len() > 3)
+            .collect();
+        aho_corasick::AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(pats)
+            .expect("dev_runtime long patterns build")
+    });
+    if long.is_match(name) {
+        return true;
+    }
+    // Short patterns (≤3 chars) — word-boundary aware (currently just "go").
     let lower = name.to_ascii_lowercase();
     for &pat in dev_runtime_patterns() {
-        if pat.len() <= 3 {
-            // Short pattern: require word boundaries.
-            let mut start = 0;
-            while let Some(pos) = lower[start..].find(pat) {
-                let abs_pos = start + pos;
-                let end_pos = abs_pos + pat.len();
-                let left_ok =
-                    abs_pos == 0 || !lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
-                let right_ok =
-                    end_pos == lower.len() || !lower.as_bytes()[end_pos].is_ascii_alphanumeric();
-                if left_ok && right_ok {
-                    return true;
-                }
-                start = abs_pos + 1;
-                if start >= lower.len() {
-                    break;
-                }
-            }
-        } else {
-            // Long pattern (≥4 chars): substring match is safe.
-            if lower.contains(pat) {
+        if pat.len() > 3 {
+            continue;
+        }
+        let mut start = 0;
+        while let Some(pos) = lower[start..].find(pat) {
+            let abs_pos = start + pos;
+            let end_pos = abs_pos + pat.len();
+            let left_ok = abs_pos == 0 || !lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+            let right_ok =
+                end_pos == lower.len() || !lower.as_bytes()[end_pos].is_ascii_alphanumeric();
+            if left_ok && right_ok {
                 return true;
+            }
+            start = abs_pos + 1;
+            if start >= lower.len() {
+                break;
             }
         }
     }

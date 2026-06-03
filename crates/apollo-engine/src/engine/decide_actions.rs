@@ -11,7 +11,7 @@ use crate::engine::audit_types::DecisionReason;
 use crate::engine::blocked_action_journal::BlockerKind;
 use crate::engine::outcome_tracker::{HopGroupWeight, PatternWeight, WorkloadHop};
 use crate::engine::overflow_guard::OverflowThresholds;
-use crate::engine::safety::{critical_background_processes, ProtectionLevel};
+use crate::engine::safety::ProtectionLevel;
 use crate::engine::shadow_evaluator::ShadowEvaluator;
 use crate::engine::thread_selfcounts::IpcClass;
 use crate::engine::types::{
@@ -477,19 +477,19 @@ pub fn decide_actions(
     let mut ml_throttle_source = "none".to_string();
 
     // Dev-first: protect critical background workloads and their children.
-    let critical_patterns = critical_background_processes();
-    let hard_protected = crate::engine::safety::protected_processes();
+    // Uses Aho-Corasick OnceLock fast-paths: single-pass substring scan vs
+    // O(N_patterns × name.len) per .iter().any(.contains()) loop.
     let mut critical_pids: HashSet<u32> = HashSet::new();
     for (pid, process) in sys.processes() {
-        let name = process.name().to_string();
-        if critical_patterns.iter().any(|p| name.contains(p)) {
+        let name = process.name();
+        if crate::engine::safety::is_critical_background_name(name) {
             critical_pids.insert(pid.as_u32());
         }
         // Seed hard-protected PIDs into critical_pids so the child-walk below
         // also covers their forked children (XPC helpers with different names).
         // Name-substring alone misses children whose names don't inherit the
         // parent's name (common for DriverKit extensions and helper tools).
-        if hard_protected.iter().any(|p| name.contains(p)) {
+        if crate::engine::safety::hard_protected_contains(name) {
             critical_pids.insert(pid.as_u32());
         }
     }

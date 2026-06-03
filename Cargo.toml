@@ -25,6 +25,7 @@ tray-icon = "0.14"
 winit = "0.29"
 cocoa = "0.25"
 objc = "0.2"
+aho-corasick = "1"
 
 [package]
 name = "apollo-optimizer"

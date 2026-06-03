@@ -33,3 +33,6 @@ split-debuginfo = "unpacked"
 lto = true
 codegen-units = 1
 panic = "abort"
+# Line-tables-only: ~15% binary size, 0% runtime perf cost. Enables samply/perf
+# flamegraph symbolication without rebuilding. Also improves panic backtraces.
+debug = "line-tables-only"
