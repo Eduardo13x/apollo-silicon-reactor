@@ -325,11 +325,11 @@ pub struct CausalGraph {
     /// Directed edges: (cause, effect) → CausalEdge.
     edges: HashMap<(String, String), CausalEdge>,
     /// Actions waiting for fast outcome evaluation (3 cycles).
-    pending: Vec<PendingAction>,
+    pending: std::collections::VecDeque<PendingAction>,
     /// Actions waiting for slow outcome evaluation (15 cycles).
     /// [Granger 1969] Captures delayed causal effects: page decompression,
     /// swap writeback, compaction. Separate queue to avoid inflating fast eval.
-    pending_slow: Vec<PendingAction>,
+    pending_slow: std::collections::VecDeque<PendingAction>,
     /// Cycles to wait before evaluating outcome (fast horizon).
     eval_delay: u8,
     /// Counter for edges evicted due to hot-path capacity limits.
@@ -344,7 +344,7 @@ pub struct CausalGraph {
     /// accessor [`CausalGraph::recent_external_attributions`] aggregates
     /// this into per-kind counts so dashboards can answer "how many of
     /// our recent attributions are confounded?".
-    recent_external_taints: Vec<ExternalEventKind>,
+    recent_external_taints: std::collections::VecDeque<ExternalEventKind>,
 }
 
 const EFFECT_PRESSURE_DROP: &str = "pressure_drop";
@@ -356,12 +356,12 @@ impl CausalGraph {
     pub fn new() -> Self {
         Self {
             edges: HashMap::new(),
-            pending: Vec::new(),
-            pending_slow: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            pending_slow: std::collections::VecDeque::new(),
             eval_delay: 3,
             evictions_total: 0,
             external_events: Vec::new(),
-            recent_external_taints: Vec::new(),
+            recent_external_taints: std::collections::VecDeque::new(),
         }
     }
 
@@ -473,10 +473,12 @@ impl CausalGraph {
     /// Phase 4.2 — internal helper to push a taint record, bounded by
     /// [`RECENT_EDGES_FOR_ATTRIBUTION`].
     fn note_external_taint(&mut self, kind: ExternalEventKind) {
+        // INVALIDATION RULE: FIFO cap at RECENT_EDGES_FOR_ATTRIBUTION.
+        // VecDeque: O(1) pop_front replaces O(N) Vec::remove(0).
         if self.recent_external_taints.len() >= RECENT_EDGES_FOR_ATTRIBUTION {
-            self.recent_external_taints.remove(0);
+            self.recent_external_taints.pop_front();
         }
-        self.recent_external_taints.push(kind);
+        self.recent_external_taints.push_back(kind);
     }
 
     /// Record that an action was taken on a process/group.
@@ -509,9 +511,10 @@ impl CausalGraph {
             resources: resources.clone(),
             external_blame,
         };
-        self.pending.push(action.clone());
-        self.pending_slow.push(action);
-        // Cap pending queues to avoid unbounded growth.
+        self.pending.push_back(action.clone());
+        self.pending_slow.push_back(action);
+        // INVALIDATION RULE: cap at 200; drop 100 oldest on overflow.
+        // VecDeque drain(..100) is O(100) front pops vs O(N) Vec shift.
         if self.pending.len() > 200 {
             self.pending.drain(..100);
         }
@@ -549,7 +552,10 @@ impl CausalGraph {
         let mut i = 0;
         while i < self.pending.len() {
             if current_cycle.saturating_sub(self.pending[i].cycle) >= delay {
-                let pending = self.pending.swap_remove(i);
+                let pending = self
+                    .pending
+                    .swap_remove_back(i)
+                    .expect("idx in bounds (while i < len)");
                 let delta = pending.pressure_at_action - current_pressure;
                 // High-swap regime: natural pressure drift is 3-4% per cycle due
                 // to kernel compressor flushes, independent of Apollo actions.
@@ -617,7 +623,10 @@ impl CausalGraph {
         let mut j = 0;
         while j < self.pending_slow.len() {
             if current_cycle.saturating_sub(self.pending_slow[j].cycle) >= SLOW_DELAY {
-                let pending = self.pending_slow.swap_remove(j);
+                let pending = self
+                    .pending_slow
+                    .swap_remove_back(j)
+                    .expect("idx in bounds (while j < len)");
                 let delta = pending.pressure_at_action - current_pressure;
                 let was_effective = delta >= MIN_DELTA;
 

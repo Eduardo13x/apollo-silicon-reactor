@@ -18,6 +18,28 @@ use crate::engine::{
     zombie_hunter::{HuntSnapshot, ZombieAction, ZombieHunter},
 };
 
+// ── Foreground-helper table ──────────────────────────────────────────────────
+// Per-fg-app AC matchers replace the chain of `(fg == X && name.contains(Y))`
+// branches. Identical substring semantics per entry.
+fn fg_helper_table() -> &'static std::collections::HashMap<&'static str, aho_corasick::AhoCorasick> {
+    static T: std::sync::OnceLock<std::collections::HashMap<&'static str, aho_corasick::AhoCorasick>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut m = std::collections::HashMap::new();
+        m.insert("Safari", aho_corasick::AhoCorasick::new(["WebKit"]).unwrap());
+        m.insert("Google Chrome", aho_corasick::AhoCorasick::new(["Chrome"]).unwrap());
+        m.insert("Brave Browser", aho_corasick::AhoCorasick::new(["Brave"]).unwrap());
+        m.insert("Firefox", aho_corasick::AhoCorasick::new(["plugin-container"]).unwrap());
+        m
+    })
+}
+
+fn fg_helper_matches(fg: &str, name: &str) -> bool {
+    fg_helper_table()
+        .get(fg)
+        .is_some_and(|ac| ac.is_match(name))
+}
+
 // ── Decision ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -507,11 +529,7 @@ impl AdaptiveGovernor {
         // Must be checked BEFORE night mode/waste/swarm overrides — otherwise a
         // Safari WebKit helper gets throttled by those checks first.
         if let Some(fg) = foreground_app {
-            let is_fg_helper = snap.name.contains(fg)
-                || (fg == "Safari" && snap.name.contains("WebKit"))
-                || (fg == "Google Chrome" && snap.name.contains("Chrome"))
-                || (fg == "Brave Browser" && snap.name.contains("Brave"))
-                || (fg == "Firefox" && snap.name.contains("plugin-container"));
+            let is_fg_helper = snap.name.contains(fg) || fg_helper_matches(fg, &snap.name);
             if is_fg_helper && !snap.has_gui_window {
                 return pd(
                     GovernorDecision::Allow,

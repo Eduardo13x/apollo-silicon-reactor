@@ -4459,18 +4459,24 @@ fn main() -> anyhow::Result<()> {
                     // disruption when thawed). Non-freeze actions are left in original order.
                     // [Denning 1968] τ-based WSS — lower τ processes have smaller working-set
                     // reload cost and are safer to freeze/thaw first.
-                    graced_actions.sort_by(|a, b| {
-                        let tau_of = |action: &RootAction| -> f64 {
-                            if let RootAction::FreezeProcess { name, .. } = action {
+                    // Schwartzian transform: compute tau once per action, sort by key.
+                    // Halves tau_for_app() calls (O(N log N) lookups → O(N)).
+                    // [Knuth TAOCP Vol 3 §5.2] decorate-sort-undecorate.
+                    let mut keyed: Vec<(f64, RootAction)> = graced_actions
+                        .into_iter()
+                        .map(|a| {
+                            let tau = if let RootAction::FreezeProcess { ref name, .. } = a {
                                 unfreeze_decay.tau_for_app(name)
                             } else {
-                                f64::MAX // non-freeze actions sort to end
-                            }
-                        };
-                        tau_of(a)
-                            .partial_cmp(&tau_of(b))
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                                f64::MAX
+                            };
+                            (tau, a)
+                        })
+                        .collect();
+                    keyed.sort_by(|a, b| {
+                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
                     });
+                    graced_actions = keyed.into_iter().map(|(_, a)| a).collect();
 
                     // Freeze confirmation gate: 2 cycles normal, 1 pre-emptive,
                     // 0 during launch. Per-cycle dedup + decay of stale candidates.

@@ -161,6 +161,7 @@ dependencies = [
 name = "apollo-optimizer"
 version = "1.0.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "apollo-engine",
  "chrono",

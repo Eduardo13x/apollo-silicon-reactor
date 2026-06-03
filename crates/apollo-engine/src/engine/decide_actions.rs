@@ -167,12 +167,35 @@ fn is_interactive_base(name: &str) -> bool {
     is_interactive_app_name(name)
 }
 
+// Static-pattern AC bundles: single-pass substring scan per name instead of
+// N×contains over four constant arrays. Case-sensitive (matches prior semantics).
+fn noise_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    AC.get_or_init(|| aho_corasick::AhoCorasick::new(NOISE_APPS).expect("noise AC"))
+}
+fn blocker_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    AC.get_or_init(|| aho_corasick::AhoCorasick::new(BLOCKER_APPS).expect("blocker AC"))
+}
+fn display_pipeline_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    AC.get_or_init(|| {
+        const DISPLAY_PIPELINE: &[&str] =
+            &["Dock", "coreaudiod", "mediaserverd", "SystemUIServer", "ControlCenter"];
+        aho_corasick::AhoCorasick::new(DISPLAY_PIPELINE).expect("display AC")
+    })
+}
+fn deferrable_daemons_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    AC.get_or_init(|| aho_corasick::AhoCorasick::new(DEFERRABLE_DAEMONS).expect("deferrable AC"))
+}
+
 fn is_background_noise_base(name: &str) -> bool {
-    NOISE_APPS.iter().any(|n| name.contains(n))
+    noise_ac().is_match(name)
 }
 
 fn is_known_blocker(name: &str) -> bool {
-    BLOCKER_APPS.iter().any(|n| name.contains(n))
+    blocker_ac().is_match(name)
 }
 
 /// Classify system pressure into an interactive context.
@@ -808,20 +831,13 @@ pub fn decide_actions(
     // scheduler rebalance that follows background E-core routing.
     // [WWDC 2021 "Tune CPU job scheduling with QoS"; Anderson & Dahlin 2014 "OS Fundamentals"]
     {
-        const DISPLAY_PIPELINE: &[&str] = &[
-            "Dock",
-            "coreaudiod",
-            "mediaserverd",
-            "SystemUIServer",
-            "ControlCenter",
-        ];
         let swap_delta_mb = snapshot.pressure.swap_delta_bytes_per_sec / (1024.0 * 1024.0);
         // Trigger when swap grows ≥ 0.5 MB/s — early pressure signal, not crisis.
         if swap_delta_mb >= 0.5 {
             let mut display_boosts: Vec<RootAction> = Vec::new();
             for (pid, process) in sys.processes() {
                 let name = process.name().to_string();
-                if DISPLAY_PIPELINE.iter().any(|d| name.contains(d)) {
+                if display_pipeline_ac().is_match(&name) {
                     display_boosts.push(RootAction::BoostProcess {
                         pid: pid.as_u32(),
                         name,
@@ -1069,7 +1085,7 @@ pub fn decide_actions(
         };
         for (pid, process) in sys.processes() {
             let name = process.name().to_string();
-            if DEFERRABLE_DAEMONS.iter().any(|d| name.contains(d))
+            if deferrable_daemons_ac().is_match(&name)
                 && !critical_pids.contains(&pid.as_u32())
                 && !behavior_interactive_pids.contains(&pid.as_u32())
             {
@@ -1380,8 +1396,6 @@ pub fn decide_actions(
                 // Replaced hardcoded ["Slack","Discord","Spotify","Teams"]: any
                 // memory-heavy background app (zoom.us, Figma, Electron apps)
                 // now qualifies. Protection stack in execute_actions still applies.
-                let protected = crate::engine::safety::protected_processes();
-                let softly_protected = crate::engine::safety::softly_protected_processes();
                 let survival_mode = crate::engine::safety::survival_mode_active_total(
                     snapshot.pressure.memory_pressure,
                     snapshot.pressure.swap_used_bytes,
@@ -1396,21 +1410,15 @@ pub fn decide_actions(
                             return None;
                         }
                         let name = process.name().to_string();
-                        // System-critical processes must never be freeze candidates.
-                        // Bug found in production: gate_c was emitting FreezeProcess
-                        // for loginwindow (pid 466) and sharingd (pid 719) because
-                        // critical_pids only contains infrastructure (docker, postgres)
-                        // and ML workloads — NOT the OS-essential daemons from
-                        // safety::protected_processes(). execute_actions blocks
-                        // loginwindow downstream but sharingd was NOT protected and
-                        // got frozen in a 19-hour loop. AirDrop/Handoff broken.
-                        if protected.iter().any(|p| name.contains(p)) {
+                        // Single AC walk instead of HashSet alloc + N×contains.
+                        // hard_protected_contains exists since 5675527; softly mirror
+                        // added in this commit.
+                        if crate::engine::safety::hard_protected_contains(&name) {
                             return None;
                         }
-                        // Softly-protected processes (LLM servers, etc.) lose protection
-                        // only in survival mode (≥0.85 pressure + ≥2GB swap).
-                        // [Nygard 2018] Load shedding: shed non-critical services before OOM.
-                        if !survival_mode && softly_protected.iter().any(|p| name.contains(p)) {
+                        if !survival_mode
+                            && crate::engine::safety::softly_protected_contains(&name)
+                        {
                             return None;
                         }
                         if is_interactive(&name, pid_u32) {

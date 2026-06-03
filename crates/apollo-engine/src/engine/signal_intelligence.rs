@@ -222,7 +222,7 @@ pub struct SignalIntelligence {
     /// Each entry: (features [f64; 4], hours_since_last).
     /// Capped at 50 entries. When ≥10 events, `retrain_hazard_batch()` runs
     /// 10-step gradient descent to refine β weights beyond single-event updates.
-    oom_event_buffer: Vec<([f64; 4], f64)>,
+    oom_event_buffer: std::collections::VecDeque<([f64; 4], f64)>,
 
     /// Timestamp of the last recorded OOM/overflow event.
     /// Used to compute real inter-event intervals instead of hardcoded 1.0.
@@ -302,7 +302,7 @@ impl SignalIntelligence {
             zone_feedback_idx: 0,
             zone_stall_cycles: 0,
             workload_zone_offsets: HashMap::new(),
-            oom_event_buffer: Vec::new(),
+            oom_event_buffer: std::collections::VecDeque::new(),
             last_oom_instant: None,
             kf_mv: KalmanMV8::new(),
             signal_health: SignalHealthMonitor::new(),
@@ -660,16 +660,13 @@ impl SignalIntelligence {
             self.cumulative_stress,
         );
         self.hazard.record_event(&features, hours_since_last);
-        // Buffer event for batch retrain.
-        if self.oom_event_buffer.len() < 50 {
-            self.oom_event_buffer.push((features, hours_since_last));
-        } else {
-            // Ring: overwrite oldest (rotate left, push to end).
-            self.oom_event_buffer.rotate_left(1);
-            if let Some(last) = self.oom_event_buffer.last_mut() {
-                *last = (features, hours_since_last);
-            }
+        // VecDeque ring: O(1) pop_front + push_back instead of O(N) rotate_left.
+        // Cap at 50 entries; oldest is dropped on overflow.
+        // INVALIDATION RULE: FIFO eviction at cap (50); no explicit invalidate.
+        if self.oom_event_buffer.len() >= 50 {
+            self.oom_event_buffer.pop_front();
         }
+        self.oom_event_buffer.push_back((features, hours_since_last));
     }
 
     /// Mini-batch gradient retrain of the hazard model using buffered OOM events.
@@ -685,7 +682,7 @@ impl SignalIntelligence {
             return 0;
         }
         // Save original lr, use reduced lr for batch replay.
-        let events: Vec<([f64; 4], f64)> = self.oom_event_buffer.clone();
+        let events: Vec<([f64; 4], f64)> = self.oom_event_buffer.iter().copied().collect();
         let mut steps = 0;
         for _ in 0..10 {
             for &(ref features, hours) in &events {

@@ -51,6 +51,7 @@ toml.workspace = true
 ureq = { workspace = true, features = ["json"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
+aho-corasick.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

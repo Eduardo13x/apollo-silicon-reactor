@@ -225,6 +225,21 @@ pub fn hard_protected_contains(name: &str) -> bool {
         .is_match(name)
 }
 
+/// Fast substring membership test against the softly-protected set (LLM
+/// inference servers). Mirrors `hard_protected_contains` — single AC walk
+/// instead of HashSet build + N×contains. Frozen only when the alternative
+/// is OOM reboot (decide_actions checks `survival_mode` before honoring).
+pub fn softly_protected_contains(name: &str) -> bool {
+    static MATCHER: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    MATCHER
+        .get_or_init(|| {
+            let patterns: Vec<&'static str> =
+                softly_protected_processes().into_iter().collect();
+            aho_corasick::AhoCorasick::new(patterns).expect("softly patterns build")
+        })
+        .is_match(name)
+}
+
 /// Fast critical-background membership test (infra ∪ dev_runtime) — replaces
 /// the slow `critical_background_processes().iter().any(|p| name.contains(p))`
 /// pattern at hot decide_actions sites.

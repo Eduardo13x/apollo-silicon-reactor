@@ -180,12 +180,40 @@ pub fn detect_all_ml_workloads() -> Vec<(u32, MlWorkloadType)> {
 }
 
 /// Returns a HashSet of PIDs that should NEVER be throttled/frozen.
+///
+/// Cached for 1s — both `decide_actions` and `execute_actions` call this within
+/// the same cycle (~100ms apart on M1 8GB). 1s TTL is wide enough to eliminate
+/// the second full proc scan, narrow enough that newly-launched ML workloads
+/// are picked up within one optimization cycle.
+///
+/// INVALIDATION RULE: time-based only (1s TTL). Stable answer per
+/// [Lampson 1983] "Hints for Computer System Design".
 pub fn ml_protected_pids() -> HashSet<u32> {
-    detect_all_ml_workloads()
-        .into_iter()
-        .filter(|(_, wl)| wl.priority_boost() >= 0.5)
-        .map(|(pid, _)| pid)
-        .collect()
+    ml_protected_pids_cached().as_ref().clone()
+}
+
+/// Shared Arc'd handle. Callers wanting zero-clone access can use this directly.
+pub fn ml_protected_pids_cached() -> std::sync::Arc<HashSet<u32>> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static CACHE: OnceLock<Mutex<(Instant, std::sync::Arc<HashSet<u32>>)>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| {
+        Mutex::new((
+            Instant::now() - Duration::from_secs(10),
+            std::sync::Arc::new(HashSet::new()),
+        ))
+    });
+    let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if g.0.elapsed() > Duration::from_secs(1) {
+        let fresh: HashSet<u32> = detect_all_ml_workloads()
+            .into_iter()
+            .filter(|(_, wl)| wl.priority_boost() >= 0.5)
+            .map(|(pid, _)| pid)
+            .collect();
+        g.0 = Instant::now();
+        g.1 = std::sync::Arc::new(fresh);
+    }
+    g.1.clone()
 }
 
 // ── AMX hardware probing ─────────────────────────────────────────────────────

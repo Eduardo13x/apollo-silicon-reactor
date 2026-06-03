@@ -100,6 +100,13 @@ pub struct OverflowGuard {
     /// Device-level offset: shifts base thresholds down on memory-constrained devices.
     /// -0.05 for ≤8 GB, 0.0 for ≤16 GB, +0.05 for >16 GB.
     device_offset: f64,
+    /// Memoized offset: (computed_at, value). 30s TTL.
+    /// INVALIDATION RULE: cleared (set to None) whenever a new overflow event is
+    /// recorded (see `record_event` — `self.history.events.push`). [Lampson 1983]
+    /// hint: cache stable answers, invalidate on dependency change. Aging beyond
+    /// 30s already triggers recompute organically; explicit invalidation handles
+    /// sudden OOM ramps (NLM "Optimization Blindness" caveat).
+    cached_offset: std::cell::Cell<Option<(Instant, f64)>>,
 }
 
 /// Herramientas de compilación que causan picos de RAM.
@@ -118,15 +125,38 @@ pub const BUILD_TOOLS: &[&str] = &[
 ///   `contentlinkingd`, etc.
 ///
 /// Longer patterns use `contains()` as before (e.g. `"rustc"` in `"rustc-1.77"`).
-pub fn is_build_tool_name(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    BUILD_TOOLS.iter().any(|&t| {
-        if t.len() <= 4 {
-            lower == t
-        } else {
-            lower.contains(t)
-        }
+fn build_tool_exact_set() -> &'static std::collections::HashSet<&'static str> {
+    static SET: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        BUILD_TOOLS
+            .iter()
+            .copied()
+            .filter(|t| t.len() <= 4)
+            .collect()
     })
+}
+
+fn build_tool_long_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    AC.get_or_init(|| {
+        let long: Vec<&'static str> = BUILD_TOOLS.iter().copied().filter(|t| t.len() > 4).collect();
+        aho_corasick::AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(long)
+            .expect("build_tools long AC")
+    })
+}
+
+pub fn is_build_tool_name(name: &str) -> bool {
+    // Short patterns (≤4 chars) require exact match (preserves 5675527: prevents
+    // "ld" matching "triald", "linkd", "IOUserBluetoothSerialDriver").
+    // Long patterns use AC w/ ascii_case_insensitive (replaces per-call to_lowercase).
+    let lower = name.to_ascii_lowercase();
+    if build_tool_exact_set().contains(lower.as_str()) {
+        return true;
+    }
+    build_tool_long_ac().is_match(name)
 }
 
 /// Query total physical RAM in GB using `sysctl -n hw.memsize`.
@@ -175,6 +205,7 @@ impl OverflowGuard {
             last_event_at: None,
             rl_agent,
             device_offset,
+            cached_offset: std::cell::Cell::new(None),
         }
     }
 
@@ -222,6 +253,9 @@ impl OverflowGuard {
         if self.history.events.len() > 20 {
             self.history.events.remove(0);
         }
+        // INVALIDATE: new event → next compute_dynamic_offset must recompute
+        // immediately, not honor up-to-30s stale memoized value.
+        self.cached_offset.set(None);
         self.history.total_overflows += 1;
 
         // Bajar threshold: cada overflow resta 5%, piso en -20%.
@@ -274,6 +308,19 @@ impl OverflowGuard {
     /// de hace 48h, < -0.001. Así el offset se recupera naturalmente
     /// sin necesitar un tick de decay — la calma ya es su propia recompensa.
     pub fn compute_dynamic_offset(&self) -> f64 {
+        // 30s TTL memoize. Interior mutability via Cell — `&self` signature
+        // preserved (BUG-D fix at line 246 relies on this).
+        if let Some((ts, v)) = self.cached_offset.get() {
+            if ts.elapsed() < Duration::from_secs(30) {
+                return v;
+            }
+        }
+        let v = self.compute_dynamic_offset_uncached();
+        self.cached_offset.set(Some((Instant::now(), v)));
+        v
+    }
+
+    fn compute_dynamic_offset_uncached(&self) -> f64 {
         let now_secs = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -506,6 +553,7 @@ mod tests {
             last_event_at: None,
             rl_agent: None,
             device_offset: 0.0,
+            cached_offset: std::cell::Cell::new(None),
         }
     }
 
@@ -517,6 +565,7 @@ mod tests {
             last_event_at: None,
             rl_agent: None,
             device_offset: offset,
+            cached_offset: std::cell::Cell::new(None),
         }
     }
 

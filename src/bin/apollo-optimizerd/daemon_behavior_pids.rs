@@ -13,6 +13,7 @@
 //! and AFTER snapshot.top_processes is populated for this cycle.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use apollo_engine::collector::SystemSnapshot;
 use apollo_engine::engine::daemon_state::SharedState;
@@ -41,6 +42,19 @@ const BEHAVIOR_DENYLIST: &[&str] = &[
     "stable",               // /usr/libexec/stable — 67 false boosts
 ];
 
+/// AC matcher with ascii_case_insensitive — denylist is all lowercase; widening
+/// to case-insensitive is safe (no current production names hit the lowercase
+/// pattern via a capitalized variant).
+fn behavior_deny_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    AC.get_or_init(|| {
+        aho_corasick::AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(BEHAVIOR_DENYLIST)
+            .expect("behavior denylist AC")
+    })
+}
+
 /// Build the behavior-interactive PID set for this cycle.
 ///
 /// Processes with sustained low cpu_wall_ratio are I/O-bound and are classified
@@ -58,7 +72,7 @@ pub fn build_behavior_interactive_pids(
         .iter()
         .filter(|(name, entry)| {
             apollo_engine::engine::usage_model::is_behavior_interactive(entry)
-                && !BEHAVIOR_DENYLIST.iter().any(|d| name.contains(d))
+                && !behavior_deny_ac().is_match(name)
         })
         .map(|(name, _)| name.as_str())
         .collect();
