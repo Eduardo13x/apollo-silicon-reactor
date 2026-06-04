@@ -471,7 +471,11 @@ pub fn sample_hw_pressure() -> HwPressureSnapshot {
     // Nuevas señales de bajo nivel
     let bandwidth_gbs = measure_memory_bandwidth_gbs();
     let l1_latency_us = measure_l1_latency_us();
-    let contention_rate = measure_cache_contention_rate(2_000);
+    // 500 iter: 75% CPU reduction vs prior 2000, statistically equivalent
+    // (failure ratio is binomial; 500 samples → CI ±2.2pp at 95% confidence,
+    // ample for HwPressure tri-state classification). Probe profiled 6% of
+    // sample_hw_pressure cost (samply 2026-06-03 post-bundle).
+    let contention_rate = measure_cache_contention_rate(500);
 
     // CPUs activos desde el kernel: si cayeron, el sistema está apagando cores
     let cpu_drop_pressure = if commpage.valid && commpage.physical_cpus > 0 {
