@@ -658,14 +658,14 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 // Uses bidirectional prefix/suffix overlap (75% threshold)
                 // to block evasion attempts like "kernel_tas" for "kernel_task".
                 let mut sanitized = new_policy;
-                sanitized
-                    .noise_patterns
+                std::sync::Arc::make_mut(&mut sanitized
+                    .noise_patterns)
                     .retain(|pat| !pattern_conflicts_with_protected(pat));
-                sanitized
-                    .interactive_patterns
+                std::sync::Arc::make_mut(&mut sanitized
+                    .interactive_patterns)
                     .retain(|pat| !pattern_conflicts_with_protected(pat));
-                sanitized
-                    .protected_patterns
+                std::sync::Arc::make_mut(&mut sanitized
+                    .protected_patterns)
                     .retain(|pat| !pattern_conflicts_with_protected(pat));
                 let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
                 let lp_snap = {

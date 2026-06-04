@@ -650,29 +650,33 @@ pub fn battery_pressure_boost(power_mgr: &PowerManager) -> f64 {
 pub fn merge_seed_into(policy: &mut LearnedPolicy) {
     let seed: LearnedPolicy =
         serde_json::from_str(SEED_POLICY).expect("BUG: embedded policy_clean.json is invalid");
-    for pat in &seed.protected_patterns {
+    use std::sync::Arc;
+    for pat in seed.protected_patterns.iter() {
         if !policy.protected_patterns.contains(pat) {
-            policy.protected_patterns.push(pat.clone());
+            Arc::make_mut(&mut policy.protected_patterns).push(pat.clone());
         }
     }
-    for pat in &seed.interactive_patterns {
+    for pat in seed.interactive_patterns.iter() {
         if !policy.interactive_patterns.contains(pat) && !policy.protected_patterns.contains(pat) {
-            policy.interactive_patterns.push(pat.clone());
+            Arc::make_mut(&mut policy.interactive_patterns).push(pat.clone());
         }
     }
-    for pat in &seed.noise_patterns {
+    for pat in seed.noise_patterns.iter() {
         if !policy.noise_patterns.contains(pat)
             && !policy.protected_patterns.contains(pat)
             && !policy.interactive_patterns.contains(pat)
         {
-            policy.noise_patterns.push(pat.clone());
+            Arc::make_mut(&mut policy.noise_patterns).push(pat.clone());
         }
     }
-    policy
-        .interactive_patterns
-        .retain(|p| !policy.protected_patterns.contains(p));
-    policy.noise_patterns.retain(|p| {
-        !policy.protected_patterns.contains(p) && !policy.interactive_patterns.contains(p)
+    // Snapshot Arcs (refcount bump) so retain closures can read while make_mut
+    // borrows the target Arc mutably. Arc::make_mut clones the inner Vec only
+    // if shared (refcount > 1), so these snapshot Arcs trigger clone-on-write.
+    let protected_snap = policy.protected_patterns.clone();
+    Arc::make_mut(&mut policy.interactive_patterns).retain(|p| !protected_snap.contains(p));
+    let interactive_snap = policy.interactive_patterns.clone();
+    Arc::make_mut(&mut policy.noise_patterns).retain(|p| {
+        !protected_snap.contains(p) && !interactive_snap.contains(p)
     });
 }
 

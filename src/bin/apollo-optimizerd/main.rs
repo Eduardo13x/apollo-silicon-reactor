@@ -577,12 +577,12 @@ fn main() -> anyhow::Result<()> {
                     "com.apple.Safari.SafeBrowsing.Service",
                 ];
                 let before = policy.interactive_patterns.len();
-                policy
-                    .interactive_patterns
+                std::sync::Arc::make_mut(&mut policy
+                    .interactive_patterns)
                     .retain(|p| !bad_interactive.iter().any(|bad| p.contains(bad)));
                 // Add noise patterns from LLM Teacher analysis.
                 if !policy.noise_patterns.contains(&"apsd".to_string()) {
-                    policy.noise_patterns.push("apsd".to_string());
+                    std::sync::Arc::make_mut(&mut policy.noise_patterns).push("apsd".to_string());
                 }
                 let removed = before - policy.interactive_patterns.len();
                 if removed > 0 || policy.noise_patterns.len() == 1 {

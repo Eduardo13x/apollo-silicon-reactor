@@ -187,9 +187,13 @@ pub struct TeacherContext<'a> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LearnedPolicy {
-    pub interactive_patterns: Vec<String>,
-    pub noise_patterns: Vec<String>,
-    pub protected_patterns: Vec<String>,
+    /// Arc-wrapped pattern Vecs eliminate O(N) deep clone in hot daemon read
+    /// sites (main.rs:2742, daemon_dispatch_tick.rs:292). Reads = Arc refcount
+    /// bump (O(1)). Mutations via Arc::make_mut (clone-on-write semantics).
+    /// serde "rc" feature enables transparent Vec<String> round-trip on disk.
+    pub interactive_patterns: std::sync::Arc<Vec<String>>,
+    pub noise_patterns: std::sync::Arc<Vec<String>>,
+    pub protected_patterns: std::sync::Arc<Vec<String>>,
     pub learned_at: Option<DateTime<Utc>>,
     /// Pesos Bayesianos por proceso: cuántas veces se throttleó y cuántas fue efectivo.
     /// Backward-compatible: campo opcional, deserializa a HashMap vacío si ausente.

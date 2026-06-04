@@ -132,7 +132,7 @@ impl WorkloadClassifier {
         self.learned_weights.clear();
         let sigs = workload_signatures();
 
-        for pattern in &policy.interactive_patterns {
+        for pattern in policy.interactive_patterns.iter() {
             // Map pattern to a workload type by checking which signature it matches.
             let workload = sigs
                 .iter()
@@ -146,7 +146,7 @@ impl WorkloadClassifier {
             });
         }
         // Noise patterns: de-boost (negative weight toward General)
-        for pattern in &policy.noise_patterns {
+        for pattern in policy.noise_patterns.iter() {
             self.learned_weights.push(PatternWeight {
                 pattern: pattern.clone(),
                 workload: WorkloadType::General,

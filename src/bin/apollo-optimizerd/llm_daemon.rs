@@ -144,12 +144,12 @@ pub fn llm_reactive_tick(
                 let lp_snap = {
                     let mut pg = state.policy.lock_recover();
                     let before = pg.learned_policy.protected_patterns.len();
-                    pg.learned_policy
-                        .protected_patterns
+                    std::sync::Arc::make_mut(&mut pg.learned_policy
+                        .protected_patterns)
                         .retain(|p| !added_protected.contains(p));
                     let reverted = before - pg.learned_policy.protected_patterns.len();
                     if reverted > 0 {
-                        pg.learned_policy.protected_patterns.sort();
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.protected_patterns).sort();
                         pg.learned_policy.learned_at = Some(now);
                         let lp_clone = pg.learned_policy.clone();
                         pg.adaptive_governor.update_learned_policy(&lp_clone);
@@ -650,8 +650,8 @@ pub fn llm_reactive_tick(
                         && !pattern_conflicts_with_protected(p)
                     {
                         // Remove from noise if promoted to interactive.
-                        pg.learned_policy.noise_patterns.retain(|n| n != p);
-                        pg.learned_policy.interactive_patterns.push(p.clone());
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns).retain(|n| n != p);
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.interactive_patterns).push(p.clone());
                         added += 1;
                     }
                 }
@@ -666,7 +666,7 @@ pub fn llm_reactive_tick(
                         && !pg.learned_policy.protected_patterns.contains(p)
                         && !pg.learned_policy.interactive_patterns.contains(p)
                     {
-                        pg.learned_policy.noise_patterns.push(p.clone());
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns).push(p.clone());
                         added += 1;
                     }
                 }
@@ -679,15 +679,15 @@ pub fn llm_reactive_tick(
                         && !pattern_conflicts_with_protected(p)
                     {
                         // Remove from noise when promoted to protected.
-                        pg.learned_policy.noise_patterns.retain(|n| n != p);
-                        pg.learned_policy.protected_patterns.push(p.clone());
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns).retain(|n| n != p);
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.protected_patterns).push(p.clone());
                         added += 1;
                     }
                 }
                 if added > 0 {
-                    pg.learned_policy.interactive_patterns.sort();
-                    pg.learned_policy.noise_patterns.sort();
-                    pg.learned_policy.protected_patterns.sort();
+                    std::sync::Arc::make_mut(&mut pg.learned_policy.interactive_patterns).sort();
+                    std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns).sort();
+                    std::sync::Arc::make_mut(&mut pg.learned_policy.protected_patterns).sort();
                     pg.learned_policy.learned_at = Some(now);
                 }
                 let snap = pg.learned_policy.clone();
@@ -855,14 +855,14 @@ pub fn usage_learning_tick(
                     if !pg.learned_policy.interactive_patterns.contains(pattern)
                         && !pattern_conflicts_with_protected(pattern)
                     => {
-                        pg.learned_policy.interactive_patterns.push(pattern.clone());
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.interactive_patterns).push(pattern.clone());
                         applied += 1;
                     }
                 "noise"
                     if !pg.learned_policy.noise_patterns.contains(pattern)
                         && !pattern_conflicts_with_protected(pattern)
                     => {
-                        pg.learned_policy.noise_patterns.push(pattern.clone());
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns).push(pattern.clone());
                         applied += 1;
                     }
                 "protected"
@@ -871,16 +871,16 @@ pub fn usage_learning_tick(
                     if !pg.learned_policy.protected_patterns.contains(pattern)
                         && !pattern_conflicts_with_protected(pattern)
                     => {
-                        pg.learned_policy.protected_patterns.push(pattern.clone());
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.protected_patterns).push(pattern.clone());
                         applied += 1;
                     }
                 _ => {}
             }
         }
         if applied > 0 {
-            pg.learned_policy.interactive_patterns.sort();
-            pg.learned_policy.noise_patterns.sort();
-            pg.learned_policy.protected_patterns.sort();
+            std::sync::Arc::make_mut(&mut pg.learned_policy.interactive_patterns).sort();
+            std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns).sort();
+            std::sync::Arc::make_mut(&mut pg.learned_policy.protected_patterns).sort();
             pg.learned_policy.learned_at = Some(now);
         }
         let snap = pg.learned_policy.clone();
@@ -1085,9 +1085,9 @@ mod tests {
 
     fn policy(interactive: &[&str], noise: &[&str], protected: &[&str]) -> LearnedPolicy {
         LearnedPolicy {
-            interactive_patterns: interactive.iter().map(|s| s.to_string()).collect(),
-            noise_patterns: noise.iter().map(|s| s.to_string()).collect(),
-            protected_patterns: protected.iter().map(|s| s.to_string()).collect(),
+            interactive_patterns: std::sync::Arc::new(interactive.iter().map(|s| s.to_string()).collect()),
+            noise_patterns: std::sync::Arc::new(noise.iter().map(|s| s.to_string()).collect()),
+            protected_patterns: std::sync::Arc::new(protected.iter().map(|s| s.to_string()).collect()),
             learned_at: None,
             pattern_weights: HashMap::new(),
         }

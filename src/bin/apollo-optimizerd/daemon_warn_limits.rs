@@ -57,7 +57,8 @@ pub fn run_warn_limits(
                 fg_pids.insert(coalition_pid);
             }
         }
-        let interactive_pats: Vec<String> = state
+        // Arc clone (refcount bump) — eliminates O(N) Vec<String> deep clone
+        let interactive_pats: std::sync::Arc<Vec<String>> = state
             .policy
             .lock_recover()
             .learned_policy

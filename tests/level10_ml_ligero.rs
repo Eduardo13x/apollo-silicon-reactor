@@ -88,9 +88,9 @@ fn test_classifier_confidence_always_in_range() {
 fn test_classifier_llm_learned_boost_increases_confidence() {
     let mut classifier = WorkloadClassifier::new();
     let policy = LearnedPolicy {
-        interactive_patterns: vec!["Cursor".to_string(), "cargo".to_string()],
-        noise_patterns: vec![],
-        protected_patterns: vec![],
+        interactive_patterns: std::sync::Arc::new(vec!["Cursor".to_string(), "cargo".to_string()]),
+        noise_patterns: std::sync::Arc::new(vec![]),
+        protected_patterns: std::sync::Arc::new(vec![]),
         learned_at: None,
         pattern_weights: std::collections::HashMap::new(),
     };
@@ -323,9 +323,9 @@ fn test_governor_update_learned_policy_affects_classification() {
     let mut governor = AdaptiveGovernor::new();
 
     let policy = LearnedPolicy {
-        interactive_patterns: vec!["zoom.us".to_string()],
-        noise_patterns: vec![],
-        protected_patterns: vec![],
+        interactive_patterns: std::sync::Arc::new(vec!["zoom.us".to_string()]),
+        noise_patterns: std::sync::Arc::new(vec![]),
+        protected_patterns: std::sync::Arc::new(vec![]),
         learned_at: None,
         pattern_weights: std::collections::HashMap::new(),
     };
@@ -377,9 +377,9 @@ fn test_classifier_llm_noise_pattern_reduces_score() {
     // Using "analyticsd" as a noise pattern should not boost any productive workload.
     let mut classifier = WorkloadClassifier::new();
     let policy = LearnedPolicy {
-        interactive_patterns: vec![],
-        noise_patterns: vec!["analyticsd".to_string()],
-        protected_patterns: vec![],
+        interactive_patterns: std::sync::Arc::new(vec![]),
+        noise_patterns: std::sync::Arc::new(vec!["analyticsd".to_string()]),
+        protected_patterns: std::sync::Arc::new(vec![]),
         learned_at: None,
         pattern_weights: std::collections::HashMap::new(),
     };
