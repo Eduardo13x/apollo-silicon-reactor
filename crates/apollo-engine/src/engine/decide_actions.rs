@@ -480,15 +480,17 @@ pub fn decide_actions(
     // tier is the primary signal; the hardcoded list is a fallback for
     // pids whose proc_pidpath read failed (denied, kernel-only, or
     // already gone).
-    let is_interactive = |name: &str, pid: u32| -> bool {
-        let name_lc = name.to_ascii_lowercase();
+    // Closures accept precomputed name_lc to avoid repeated to_ascii_lowercase
+    // allocs in hot per-PID loop. Callers compute name_lc once after early-skip
+    // gates (critical/habituated) and reuse across is_interactive +
+    // is_background_noise checks. -50% lowercase allocs in the L588 hot path.
+    let is_interactive = |name: &str, name_lc: &str, pid: u32| -> bool {
         app_bundle_pids.contains(&pid)
             || is_interactive_base(name)
             || interactive_lc.iter().any(|p| name_lc.contains(p.as_str()))
             || behavior_interactive_pids.contains(&pid)
     };
-    let is_background_noise = |name: &str| -> bool {
-        let name_lc = name.to_ascii_lowercase();
+    let is_background_noise = |name: &str, name_lc: &str| -> bool {
         is_background_noise_base(name) || noise_lc.iter().any(|p| name_lc.contains(p.as_str()))
     };
 
@@ -586,7 +588,7 @@ pub fn decide_actions(
 
     // 2) Context-aware scheduling.
     for (pid, process) in sys.processes() {
-        let name = process.name().to_string();
+        let name = process.name();
         let pid = pid.as_u32();
 
         if critical_pids.contains(&pid) {
@@ -600,17 +602,22 @@ pub fn decide_actions(
             continue;
         }
 
-        if is_interactive(&name, pid) {
+        // Compute name_lc once after early-skips. Reused by both is_interactive
+        // and is_background_noise closures below. Owned only when needed for
+        // action push (lazy String alloc on hot path).
+        let name_lc = name.to_ascii_lowercase();
+
+        if is_interactive(name, &name_lc, pid) {
             actions.push(RootAction::BoostProcess {
                 pid,
-                name,
+                name: name.to_string(),
                 reason: "interactive focus boost".to_string(),
                 decision_reason: DecisionReason::InteractiveFocus,
             });
             continue;
         }
 
-        if is_background_noise(&name) {
+        if is_background_noise(name, &name_lc) {
             // User active at low pressure: defer background throttling — jank isn't worth it.
             if skip_bg_throttle_user_active {
                 low_value_skipped.push(format!("user-active-skip:{}", name));
@@ -621,11 +628,11 @@ pub fn decide_actions(
             // Uses calibrated threshold (90% of baseline) to avoid false positives
             // from correlated pressure drops. Requires ≥20 throttle observations.
             if pattern_weights
-                .get(&name)
+                .get(name)
                 .map(|w| w.is_low_value_vs_baseline(outcome_baseline))
                 .unwrap_or(false)
             {
-                low_value_skipped.push(name);
+                low_value_skipped.push(name.to_string());
                 continue;
             }
 
@@ -642,7 +649,7 @@ pub fn decide_actions(
             // EMA (α=0.1, ~10-sample memory) ensures fast recovery if the
             // workload changes (e.g., Brave update).
             {
-                let hop = WorkloadHop::from_process_name(&name);
+                let hop = WorkloadHop::from_process_name(name);
                 if let Some(group) = hop_groups.get(&hop) {
                     if !group.needs_exploration() {
                         // Hard skip retained for genuinely bad groups.
@@ -802,7 +809,7 @@ pub fn decide_actions(
 
             actions.push(RootAction::ThrottleProcess {
                 pid,
-                name,
+                name: name.to_string(),
                 aggressive,
                 reason,
                 decision_reason,
@@ -899,7 +906,7 @@ pub fn decide_actions(
 
             // Skip critical, interactive, and low-CPU processes.
             if critical_pids.contains(&pid_u32)
-                || is_interactive(&name, pid_u32)
+                || is_interactive(&name, &name.to_ascii_lowercase(), pid_u32)
                 || cpu < thread_cpu_threshold
             {
                 continue;
@@ -1421,7 +1428,7 @@ pub fn decide_actions(
                         {
                             return None;
                         }
-                        if is_interactive(&name, pid_u32) {
+                        if is_interactive(&name, &name.to_ascii_lowercase(), pid_u32) {
                             return None;
                         }
                         Some((
