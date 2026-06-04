@@ -218,11 +218,20 @@ impl LlmInferenceDetector {
     }
 
     fn is_llm_by_name(name: &str) -> bool {
+        // OnceLock pre-lowered exact set — O(1) lookup vs O(N) per-call lowercase chain.
+        static EXACT_LC: std::sync::OnceLock<std::collections::HashSet<String>> =
+            std::sync::OnceLock::new();
+        let exact = EXACT_LC.get_or_init(|| {
+            LLM_EXACT_NAMES
+                .iter()
+                .map(|n| n.to_ascii_lowercase())
+                .collect()
+        });
         let name_lc = name.to_ascii_lowercase();
-        LLM_EXACT_NAMES
-            .iter()
-            .any(|&n| n.to_ascii_lowercase() == name_lc)
-            || LLM_PREFIX_NAMES.iter().any(|&p| name_lc.starts_with(p))
+        if exact.contains(&name_lc) {
+            return true;
+        }
+        LLM_PREFIX_NAMES.iter().any(|&p| name_lc.starts_with(p))
     }
 }
 
