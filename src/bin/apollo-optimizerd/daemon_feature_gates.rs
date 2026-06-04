@@ -274,6 +274,9 @@ pub fn apply_app_nap_scheduling(
             .learned_policy
             .protected_patterns
             .clone();
+        // Pre-build AC once before per-PID app-nap loop.
+        let appnap_policy_ac =
+            apollo_engine::engine::safety::build_policy_protected_ac(&appnap_policy);
         let mut qos = state.mach_qos.lock_recover();
         for (pid, process) in collector.system().processes() {
             let pid_u32 = pid.as_u32();
@@ -290,6 +293,7 @@ pub fn apply_app_nap_scheduling(
                 &appnap_hard,
                 &appnap_infra,
                 &appnap_policy,
+                appnap_policy_ac.as_ref(),
                 is_interactive,
             );
             // Apollo itself is never app-napped (self-protection).

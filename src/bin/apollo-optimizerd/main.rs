@@ -4788,6 +4788,11 @@ fn main() -> anyhow::Result<()> {
                             .cloned()
                             .collect()
                     };
+                    // Pre-build Aho-Corasick once before per-action filter loop.
+                    // Tier 3 fast path in classify_protection. Amortizes over all
+                    // candidate actions (typically 50-200/cycle). [Sprint 2026-06-03]
+                    let policy_protected_ac =
+                        apollo_engine::engine::safety::build_policy_protected_ac(&policy_protected);
                     for action in raw {
                         if let Some((pid, kind)) =
                             apollo_engine::engine::recently_applied::CachedActionKind::from_root_action(&action)
@@ -4834,6 +4839,7 @@ fn main() -> anyhow::Result<()> {
                                         &hard_protected,
                                         &infra_protected,
                                         &policy_protected,
+                                        policy_protected_ac.as_ref(),
                                         false,
                                     );
                                     if level == apollo_engine::engine::safety::ProtectionLevel::Unconditional {

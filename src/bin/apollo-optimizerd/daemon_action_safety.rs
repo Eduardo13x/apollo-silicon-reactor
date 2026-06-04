@@ -127,6 +127,10 @@ pub fn run_heuristic_pass(
             .learned_policy
             .protected_patterns
             .clone();
+        // Pre-build AC once before per-PID loop — amortizes substring scan
+        // across all candidates (~400 PIDs). Tier 3 classify_protection path.
+        let policy_protected_ac =
+            apollo_engine::engine::safety::build_policy_protected_ac(&policy_protected);
         let total_ram = apollo_engine::engine::sysctl_direct::read_u64("hw.memsize")
             .unwrap_or(8 * 1024 * 1024 * 1024);
         let mut cpids: HashSet<u32> = HashSet::new();
@@ -148,6 +152,7 @@ pub fn run_heuristic_pass(
                 &protected_pats,
                 &infra_pats,
                 &policy_protected,
+                policy_protected_ac.as_ref(),
                 is_interactive,
             ) {
                 ProtectionLevel::Unconditional => {

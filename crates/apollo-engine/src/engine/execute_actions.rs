@@ -307,6 +307,11 @@ pub fn execute_actions(
         .chain(learned_interactive.iter())
         .cloned()
         .collect();
+    // Pre-build the Aho-Corasick matcher once for the entire execute_actions
+    // loop. classify_protection() called below for every candidate action;
+    // shared AC eliminates per-call `p.to_ascii_lowercase()` allocation in
+    // Tier 3 substring scan. Built once even if loop body iterates ~50-200 times.
+    let policy_all_ac = crate::engine::safety::build_policy_protected_ac(&policy_all);
     // Empty infra set — infrastructure_processes() is handled separately below
     // in ThrottleProcess (soft throttle path) and FreezeProcess (critical-bg skip path).
     let empty_infra: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
@@ -489,7 +494,7 @@ pub fn execute_actions(
                     // no foreground context is available here (see policy_all pre-computation).
                     // infra (infrastructure_processes) is intentionally excluded: critical_bg
                     // below handles infra with soft-throttle semantics, not a full skip.
-                    match classify_protection(name, &protected, &empty_infra, &policy_all, false) {
+                    match classify_protection(name, &protected, &empty_infra, &policy_all, policy_all_ac.as_ref(), false) {
                         ProtectionLevel::Unconditional => {
                             out.push_skip(format!("protected:{}", name));
                             block_reason = Some(BlockReason::ProtectedProcess);
@@ -593,7 +598,7 @@ pub fn execute_actions(
                     // FreezeProcess treats infra as a full skip (not a soft-throttle path).
                     // learned_interactive is treated as Unconditional: no foreground context
                     // at execute time (see policy_all pre-computation above).
-                    match classify_protection(name, &protected, &critical_bg, &policy_all, false) {
+                    match classify_protection(name, &protected, &critical_bg, &policy_all, policy_all_ac.as_ref(), false) {
                         ProtectionLevel::Unconditional => {
                             if critical_bg.iter().any(|p| name.contains(p)) {
                                 out.critical_background_skips += 1;

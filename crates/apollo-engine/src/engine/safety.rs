@@ -435,11 +435,32 @@ pub enum ProtectionLevel {
 /// `hard_protected` and `infra_protected` use substring matching (consistent with
 /// how Sites B–E use them: `name.contains(p)`). This catches bundled executables
 /// like `com.docker.backend` matching `"docker"`.
+/// Build an Aho-Corasick matcher for the policy_protected dynamic pattern list.
+/// Returns None if the list is empty. Callers that invoke `classify_protection`
+/// in a loop over many names should build this once before the loop and pass
+/// `Some(&ac)` to all iterations — eliminates per-call `p.to_ascii_lowercase()`
+/// allocs inside Tier 3 substring scan.
+///
+/// Case-insensitive (mirrors prior `name_lc.contains(p.to_ascii_lowercase())`
+/// semantics). Build cost is amortized over the loop iterations.
+pub fn build_policy_protected_ac(
+    policy_protected: &[String],
+) -> Option<aho_corasick::AhoCorasick> {
+    if policy_protected.is_empty() {
+        return None;
+    }
+    aho_corasick::AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .build(policy_protected)
+        .ok()
+}
+
 pub fn classify_protection(
     name: &str,
     hard_protected: &HashSet<&'static str>,
     infra_protected: &HashSet<&'static str>,
     policy_protected: &[String],
+    policy_protected_ac: Option<&aho_corasick::AhoCorasick>,
     is_interactive: bool,
 ) -> ProtectionLevel {
     // Tier 1: OS/system essentials — substring to catch variants like
@@ -456,14 +477,22 @@ pub fn classify_protection(
         return ProtectionLevel::Unconditional;
     }
     // Tier 3: Policy-learned daemons (case-insensitive substring).
-    // Empty list is the common case (no learned policies) — skip lowercase alloc.
+    // Fast path: caller-supplied AC scans all patterns in single O(name.len) pass.
+    // Slow path: per-pattern `to_ascii_lowercase()` chain — used by tests and any
+    // caller that hasn't built the AC yet. Both preserve identical semantics.
     if !policy_protected.is_empty() {
-        let name_lc = name.to_ascii_lowercase();
-        if policy_protected
-            .iter()
-            .any(|p| name_lc.contains(p.to_ascii_lowercase().as_str()))
-        {
-            return ProtectionLevel::Unconditional;
+        if let Some(ac) = policy_protected_ac {
+            if ac.is_match(name) {
+                return ProtectionLevel::Unconditional;
+            }
+        } else {
+            let name_lc = name.to_ascii_lowercase();
+            if policy_protected
+                .iter()
+                .any(|p| name_lc.contains(p.to_ascii_lowercase().as_str()))
+            {
+                return ProtectionLevel::Unconditional;
+            }
         }
     }
     // Tier 4: Behavioral interactive apps — caller evaluated is_user_interactive_app().
@@ -1343,7 +1372,7 @@ mod tests {
         let hard = protected_processes();
         let infra = infrastructure_processes();
         assert_eq!(
-            classify_protection("kernel_task", &hard, &infra, &[], false),
+            classify_protection("kernel_task", &hard, &infra, &[], None, false),
             ProtectionLevel::Unconditional,
             "kernel_task must be Unconditional"
         );
@@ -1354,7 +1383,7 @@ mod tests {
         let hard = protected_processes();
         let infra = infrastructure_processes();
         assert_eq!(
-            classify_protection("WindowServer", &hard, &infra, &[], false),
+            classify_protection("WindowServer", &hard, &infra, &[], None, false),
             ProtectionLevel::Unconditional
         );
     }
@@ -1364,7 +1393,7 @@ mod tests {
         let hard = protected_processes();
         let infra = infrastructure_processes();
         assert_eq!(
-            classify_protection("com.docker.backend", &hard, &infra, &[], false),
+            classify_protection("com.docker.backend", &hard, &infra, &[], None, false),
             ProtectionLevel::Unconditional,
             "com.docker.backend must be Unconditional via infra substring match"
         );
@@ -1375,7 +1404,7 @@ mod tests {
         let hard = protected_processes();
         let infra = infrastructure_processes();
         assert_eq!(
-            classify_protection("postgres", &hard, &infra, &[], false),
+            classify_protection("postgres", &hard, &infra, &[], None, false),
             ProtectionLevel::Unconditional
         );
     }
@@ -1386,7 +1415,7 @@ mod tests {
         let infra = infrastructure_processes();
         let policy = test_policy();
         assert_eq!(
-            classify_protection("mypostgres-wrapper", &hard, &infra, &policy, false),
+            classify_protection("mypostgres-wrapper", &hard, &infra, &policy, None, false),
             ProtectionLevel::Unconditional,
             "policy-protected process must be Unconditional"
         );
@@ -1399,13 +1428,13 @@ mod tests {
         let policy = vec!["Custom-DB".to_string()];
         // Process name in lowercase
         assert_eq!(
-            classify_protection("custom-db", &hard, &infra, &policy, false),
+            classify_protection("custom-db", &hard, &infra, &policy, None, false),
             ProtectionLevel::Unconditional
         );
         // Process name uppercase, pattern lowercase in policy
         let policy2 = vec!["custom-db".to_string()];
         assert_eq!(
-            classify_protection("Custom-DB", &hard, &infra, &policy2, false),
+            classify_protection("Custom-DB", &hard, &infra, &policy2, None, false),
             ProtectionLevel::Unconditional
         );
     }
@@ -1416,7 +1445,7 @@ mod tests {
         let infra = infrastructure_processes();
         // is_interactive=true (caller evaluated is_user_interactive_app)
         assert_eq!(
-            classify_protection("Brave Browser", &hard, &infra, &[], true),
+            classify_protection("Brave Browser", &hard, &infra, &[], None, true),
             ProtectionLevel::ConditionalForeground,
             "user interactive app must be ConditionalForeground"
         );
@@ -1427,7 +1456,7 @@ mod tests {
         let hard = protected_processes();
         let infra = infrastructure_processes();
         assert_eq!(
-            classify_protection("com.example.random-daemon", &hard, &infra, &[], false),
+            classify_protection("com.example.random-daemon", &hard, &infra, &[], None, false),
             ProtectionLevel::Unprotected
         );
     }
@@ -1441,13 +1470,13 @@ mod tests {
         let hard = protected_processes();
         let infra = infrastructure_processes();
         assert_eq!(
-            classify_protection("Dropbox", &hard, &infra, &[], false),
+            classify_protection("Dropbox", &hard, &infra, &[], None, false),
             ProtectionLevel::Unprotected,
             "Dropbox must not be Unconditional — 'box' is not a protected pattern"
         );
         // If Dropbox has a GUI window and recent interaction, caller sets is_interactive=true
         assert_eq!(
-            classify_protection("Dropbox", &hard, &infra, &[], true),
+            classify_protection("Dropbox", &hard, &infra, &[], None, true),
             ProtectionLevel::ConditionalForeground,
             "Dropbox with GUI should be ConditionalForeground"
         );
@@ -1459,7 +1488,7 @@ mod tests {
         let hard = protected_processes();
         let infra = infrastructure_processes();
         assert_eq!(
-            classify_protection("kernel_task", &hard, &infra, &[], true),
+            classify_protection("kernel_task", &hard, &infra, &[], None, true),
             ProtectionLevel::Unconditional,
             "hard protection must take precedence over is_interactive"
         );
