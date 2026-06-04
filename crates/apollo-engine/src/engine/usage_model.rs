@@ -288,7 +288,16 @@ impl UsageModel {
         // separate, intentionally-permissive heuristic over name fragments
         // like "helper", not exact OS-daemon identities.
         candidates.retain(|e| !crate::engine::safety::is_protected_name(&e.name));
-        candidates.retain(|e| !never_interactive.iter().any(|p| e.name.contains(p)));
+        // Build AC once across all candidates (substring match, case-sensitive
+        // to mirror `e.name.contains(p)` semantics). Mirrors commit e6968a1
+        // policy_protected fast-path pattern.
+        let never_interactive_ac = aho_corasick::AhoCorasick::new(never_interactive.iter().copied()).ok();
+        candidates.retain(|e| {
+            never_interactive_ac
+                .as_ref()
+                .map(|ac| !ac.is_match(&e.name))
+                .unwrap_or(true)
+        });
 
         // Conservative: require age.
         candidates.retain(|e| {
@@ -300,6 +309,8 @@ impl UsageModel {
         let mut promotions: Vec<(String, String)> = Vec::new();
 
         // Interactive promotions.
+        let existing_interactive_ac =
+            aho_corasick::AhoCorasick::new(existing_interactive.iter().map(|s| s.as_str())).ok();
         let mut interactive = candidates.clone();
         // BUG 22 fix: unwrap on partial_cmp could panic if NaN.
         interactive.sort_by(|a, b| {
@@ -320,13 +331,19 @@ impl UsageModel {
             if e.usage_score < MIN_USAGE_SCORE {
                 continue;
             }
-            if existing_interactive.iter().any(|p| e.name.contains(p)) {
+            if existing_interactive_ac
+                .as_ref()
+                .map(|ac| ac.is_match(&e.name))
+                .unwrap_or(false)
+            {
                 continue;
             }
             promotions.push(("interactive".to_string(), e.name));
         }
 
         // Noise promotions.
+        let existing_noise_ac =
+            aho_corasick::AhoCorasick::new(existing_noise.iter().map(|s| s.as_str())).ok();
         let protected_candidates = candidates.clone();
         let mut noise = candidates;
         // BUG 23 fix: unwrap on partial_cmp could panic if NaN.
@@ -348,7 +365,11 @@ impl UsageModel {
             if e.noise_score < MIN_NOISE_SCORE {
                 continue;
             }
-            if existing_noise.iter().any(|p| e.name.contains(p)) {
+            if existing_noise_ac
+                .as_ref()
+                .map(|ac| ac.is_match(&e.name))
+                .unwrap_or(false)
+            {
                 continue;
             }
             promotions.push(("noise".to_string(), e.name));
@@ -363,12 +384,16 @@ impl UsageModel {
         //
         // Thresholds are intentionally high: interactive_ema > 0.55 means the
         // app was observed as the foreground app in the majority of recent cycles.
+        let existing_protected_ac =
+            aho_corasick::AhoCorasick::new(existing_protected.iter().map(|s| s.as_str())).ok();
         for e in &protected_candidates {
+            let protected_hit = existing_protected_ac
+                .as_ref()
+                .map(|ac| ac.is_match(&e.name))
+                .unwrap_or(false);
             if e.interactive_ema > 0.55
                 && e.presence_ema > 0.40
-                && !existing_protected
-                    .iter()
-                    .any(|p| e.name.contains(p.as_str()))
+                && !protected_hit
                 && !promotions.iter().any(|(_, n)| n == &e.name)
             {
                 promotions.push(("protected".to_string(), e.name.clone()));

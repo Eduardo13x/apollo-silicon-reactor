@@ -10,7 +10,9 @@
 //! No network calls. Runs in <1 ms per classification.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
+use aho_corasick::{AhoCorasick, MatchKind};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{
@@ -18,6 +20,30 @@ use crate::engine::{
     llm::LearnedPolicy,
     user_profile::{workload_signatures, AppStats, HourProfile, WorkloadType},
 };
+
+/// Per-workload Aho-Corasick automata over `workload_signatures()`.
+///
+/// `patterns.iter().any(|p| s.contains(p))` was hot on the process-mix loop
+/// (~10 workloads × ~10–20 patterns × up to 50 procs per classify). AC reduces
+/// each membership check to a single linear pass over `s`. Order of workloads
+/// is preserved so the existing "first matching workload wins" semantics hold.
+/// Case-sensitive substring match (same as the previous `contains`).
+fn workload_ac() -> &'static [(WorkloadType, AhoCorasick)] {
+    static AC: OnceLock<Vec<(WorkloadType, AhoCorasick)>> = OnceLock::new();
+    AC.get_or_init(|| {
+        workload_signatures()
+            .into_iter()
+            .map(|(wl, patterns)| {
+                let ac = AhoCorasick::builder()
+                    .match_kind(MatchKind::LeftmostFirst)
+                    .ascii_case_insensitive(false)
+                    .build(&patterns)
+                    .expect("workload signatures build AC");
+                (wl, ac)
+            })
+            .collect()
+    })
+}
 
 use crate::engine::compressor_aware::RegionSummary;
 
@@ -191,7 +217,6 @@ impl WorkloadClassifier {
         // Score accumulator: WorkloadType → f32
         let mut scores: HashMap<WorkloadType, f32> = HashMap::new();
         let mut sources: Vec<ClassifierSource> = Vec::new();
-        let sigs = workload_signatures();
 
         // 1. Foreground app — weight 2.0 (0.8 for launcher workloads like CommandLine).
         //
@@ -202,8 +227,8 @@ impl WorkloadClassifier {
         // can override it — no hardcoded app names needed, uses existing WorkloadType.
         let mut fg_is_launcher = false;
         if let Some(fg) = foreground_app {
-            for (wl, patterns) in &sigs {
-                if patterns.iter().any(|p| fg.contains(p)) {
+            for (wl, wl_ac) in workload_ac() {
+                if wl_ac.is_match(fg) {
                     let fg_weight = if *wl == WorkloadType::CommandLine {
                         fg_is_launcher = true;
                         0.8 // launcher: low-info foreground, process mix can override
@@ -256,10 +281,11 @@ impl WorkloadClassifier {
         let proc_mix_weight = if fg_is_launcher { 0.30 } else { 0.04 };
 
         let mut mix_count = 0u32;
+        let ac = workload_ac();
         for proc in all_proc_names.iter().take(50) {
             let proc_name = *proc;
-            for (wl, patterns) in &sigs {
-                if patterns.iter().any(|p| proc_name.contains(*p)) {
+            for (wl, wl_ac) in ac {
+                if wl_ac.is_match(proc_name) {
                     *scores.entry(*wl).or_insert(0.0) += proc_mix_weight;
                     mix_count += 1;
                     break;
