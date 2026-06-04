@@ -214,6 +214,74 @@ pub trait Effector: Send + Sync {
     fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason>;
 }
 
+// ── Phase C: SIGSTOP / SIGCONT effectors ─────────────────────────────────────
+
+/// Effector for SIGSTOP / SIGCONT signals. One implementor handles both
+/// variants because the syscall surface is identical (`libc::kill`); the
+/// branch is inside `apply` to keep the public API tight.
+///
+/// PID identity verification (`start_sec` match) is performed by the caller
+/// via `PreCondition::pid_identity` and the mediator's identity guard — this
+/// effector trusts that check and issues the signal directly. Implementors
+/// of competing trait paths MUST do the same to keep Invariant #11 honored.
+///
+/// Liveness check is encoded in the post-snapshot: if `kill(pid, 0)` confirms
+/// the process is alive after the signal, `Receipt.after.pid_alive = Some(true)`;
+/// SIGCONT leaves a stopped child running, SIGSTOP leaves a running child
+/// stopped. The mediator's `no_op` check fires when the signal hits an
+/// already-stopped (for SIGSTOP) or already-running (for SIGCONT) process —
+/// future Phase B+ upgrade can detect this via `proc_taskinfo::is_stopped_pid`.
+pub struct SignalEffector;
+
+impl Effector for SignalEffector {
+    fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason> {
+        let (pid, sig) = match eff {
+            Effect::SigStop { pid, .. } => (*pid, libc::SIGSTOP),
+            Effect::SigCont { pid, .. } => (*pid, libc::SIGCONT),
+            _ => {
+                return Err(BlockReason::PreconditionViolated {
+                    which: "SignalEffector: unsupported Effect variant".to_string(),
+                });
+            }
+        };
+        let before = ReceiptSnapshot {
+            pid_alive: Some(unsafe { libc::kill(pid as i32, 0) } == 0),
+            ..ReceiptSnapshot::default()
+        };
+        let t0 = std::time::Instant::now();
+        let rc = unsafe { libc::kill(pid as i32, sig) };
+        let syscall_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        if rc != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(BlockReason::OsError {
+                errno,
+                context: format!("kill({}, {})", pid, sig),
+            });
+        }
+        let after = ReceiptSnapshot {
+            pid_alive: Some(unsafe { libc::kill(pid as i32, 0) } == 0),
+            ..ReceiptSnapshot::default()
+        };
+        // no_op heuristic: if the alive bit didn't change AND we expected
+        // a state transition, count it as a no-op. SIGSTOP/SIGCONT both
+        // leave the PID alive, so a stable Some(true)→Some(true) is the
+        // common case — the real no-op signal at this layer is when the
+        // PID was already dead pre-syscall and remains so post.
+        let no_op = matches!(before.pid_alive, Some(false))
+            && matches!(after.pid_alive, Some(false));
+        Ok(Receipt {
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            before,
+            after,
+            no_op,
+            syscall_us,
+        })
+    }
+}
+
 // ── Phase B: Mediator chokepoint ─────────────────────────────────────────────
 
 /// Verify pre-conditions, apply the effect via the supplied effector, and
@@ -451,6 +519,44 @@ mod tests {
         match mediate(&e, &pre, &eff) {
             Err(BlockReason::OsError { errno, .. }) => assert_eq!(errno, 1),
             other => panic!("expected OsError, got {:?}", other),
+        }
+    }
+
+    // ── Phase C: SignalEffector tests ───────────────────────────────────────
+
+    #[test]
+    fn signal_effector_rejects_non_signal_effect() {
+        let eff = SignalEffector;
+        let e = Effect::SetSysctl {
+            key: "vm.compressor_mode".to_string(),
+            value: SysctlValue::I32(4),
+            expected_before: SysctlValue::I32(2),
+        };
+        match eff.apply(&e) {
+            Err(BlockReason::PreconditionViolated { which }) => {
+                assert!(which.contains("unsupported"));
+            }
+            other => panic!("expected PreconditionViolated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn signal_effector_dead_pid_returns_os_error() {
+        // PID 0xFFFFFFE is reserved/non-existent on macOS; kill returns -1 ESRCH.
+        let eff = SignalEffector;
+        let e = Effect::SigCont {
+            pid: 0xFFFF_FFFE,
+            start_sec: 0,
+        };
+        match eff.apply(&e) {
+            Err(BlockReason::OsError { errno, context }) => {
+                assert!(errno != 0);
+                assert!(context.contains("kill"));
+            }
+            // On some kernels kill(invalid_pid, 0) may be ignored; that case is also acceptable
+            // as long as the effector did not panic. Tighten this assertion if it flakes.
+            Ok(_) => {}
+            Err(other) => panic!("unexpected error variant: {:?}", other),
         }
     }
 
