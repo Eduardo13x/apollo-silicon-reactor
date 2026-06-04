@@ -97,14 +97,24 @@ pub fn word_boundary_contains(haystack_lower: &str, needle_lower: &str) -> bool 
     false
 }
 
+/// OnceLock AhoCorasick over FAMILY_ROOT_PATTERNS (case-insensitive).
+/// Built once at first use; replaces `lc.contains(&root.to_ascii_lowercase())`
+/// chain (one alloc per pattern per call). Single-pass O(name.len) scan.
+fn family_root_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    AC.get_or_init(|| {
+        aho_corasick::AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(FAMILY_ROOT_PATTERNS)
+            .expect("family root patterns build")
+    })
+}
+
 /// Returns true if `name` substring-contains any FAMILY_ROOT_PATTERNS entry
 /// (case-insensitive). Exposed for callers that want to test the carve-out
 /// independent of the full `match_name` dispatch.
 pub fn is_family_root(name: &str) -> bool {
-    let lc = name.to_ascii_lowercase();
-    FAMILY_ROOT_PATTERNS
-        .iter()
-        .any(|root| lc.contains(&root.to_ascii_lowercase()))
+    family_root_ac().is_match(name)
 }
 
 /// 3-tier dispatch with FAMILY_ROOT carve-out.
