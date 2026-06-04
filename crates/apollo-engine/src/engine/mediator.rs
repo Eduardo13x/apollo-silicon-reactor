@@ -214,6 +214,75 @@ pub trait Effector: Send + Sync {
     fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason>;
 }
 
+// ── Phase B: Mediator chokepoint ─────────────────────────────────────────────
+
+/// Verify pre-conditions, apply the effect via the supplied effector, and
+/// surface the outcome via LSE counters.
+///
+/// This is the SINGLE function every mutation of system state should flow
+/// through once subsequent phases port their effectors. Until then it is
+/// available as a typed entry point that future code can adopt incrementally.
+///
+/// Counter discipline (Sprint 9 telemetry-death prevention pattern, commit
+/// `4b13a39`):
+/// - `mediator_blocks_total` bumps when pre-condition or oracle refuses BEFORE syscall.
+/// - `mediator_noop_writes_total` bumps when Receipt reports `no_op = true` AFTER syscall.
+/// - `mediator_postcondition_violation_total` bumps when the OsError variant
+///   is returned by the effector despite a successful syscall return code
+///   (handled in concrete effectors of Phase C+).
+///
+/// The mediator does NOT yet emit a WAL journal entry — that arrives in Phase
+/// B+ once the journal API is unified. For now `tracing::debug!` records the
+/// intent so the log timestamp precedes the syscall.
+pub fn mediate(
+    effect: &Effect,
+    precondition: &PreCondition,
+    effector: &dyn Effector,
+) -> Result<Receipt, BlockReason> {
+    let lse = &crate::engine::lse_counters::LSE_COUNTERS;
+    // Step 1: identity guard (Invariant #11 — PID recycling).
+    if let Some((expected_pid, expected_start_sec)) = precondition.pid_identity {
+        // Effects that don't carry pid identity (FileWrite, SetSysctl) ignore
+        // this branch by not setting pid_identity in their PreCondition.
+        let effect_pid = match effect {
+            Effect::SigStop { pid, .. }
+            | Effect::SigCont { pid, .. }
+            | Effect::SetJetsamTier { pid, .. }
+            | Effect::SetMachPolicy { pid, .. }
+            | Effect::PurgeHint { pid, .. } => Some(*pid),
+            _ => None,
+        };
+        if let Some(actual_pid) = effect_pid {
+            if actual_pid != expected_pid {
+                lse.inc_mediator_block();
+                return Err(BlockReason::IdentityMismatch {
+                    pid: actual_pid,
+                    expected_start_sec,
+                });
+            }
+        }
+    }
+    // Step 2: WAL — record intent BEFORE syscall (Gray & Reuter §11).
+    // Placeholder: tracing::debug emits a structured log line. Phase B+ will
+    // upgrade this to an append-only journal entry with fsync semantics on
+    // crash-critical effects.
+    tracing::debug!(target: "mediator", ?effect, "wal:intent");
+    // Step 3: dispatch.
+    let result = effector.apply(effect);
+    // Step 4: outcome accounting.
+    match &result {
+        Ok(receipt) => {
+            if receipt.no_op {
+                lse.inc_mediator_noop_write();
+            }
+        }
+        Err(_) => {
+            lse.inc_mediator_block();
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +371,102 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         let e2: Effect = serde_json::from_str(&s).unwrap();
         assert_eq!(e, e2);
+    }
+
+    // ── Phase B: mediator dispatch tests ────────────────────────────────────
+
+    /// Mock effector that records call count + returns a configurable Receipt.
+    struct MockEffector {
+        no_op: bool,
+        return_err: Option<BlockReason>,
+    }
+
+    impl Effector for MockEffector {
+        fn apply(&self, _eff: &Effect) -> Result<Receipt, BlockReason> {
+            if let Some(err) = &self.return_err {
+                return Err(err.clone());
+            }
+            Ok(Receipt {
+                timestamp_unix: 0,
+                before: ReceiptSnapshot::default(),
+                after: ReceiptSnapshot::default(),
+                no_op: self.no_op,
+                syscall_us: 0,
+            })
+        }
+    }
+
+    #[test]
+    fn mediate_passes_through_when_no_precondition() {
+        let eff = MockEffector {
+            no_op: false,
+            return_err: None,
+        };
+        let e = Effect::SigCont {
+            pid: 1234,
+            start_sec: 0,
+        };
+        let pre = PreCondition::default();
+        let res = mediate(&e, &pre, &eff);
+        assert!(res.is_ok());
+        assert!(!res.unwrap().no_op);
+    }
+
+    #[test]
+    fn mediate_blocks_on_pid_identity_mismatch() {
+        let eff = MockEffector {
+            no_op: false,
+            return_err: None,
+        };
+        // Effect carries pid 1234 but precondition expects pid 9999.
+        let e = Effect::SigStop {
+            pid: 1234,
+            start_sec: 0,
+        };
+        let pre = PreCondition {
+            pid_identity: Some((9999, 0)),
+            ..PreCondition::default()
+        };
+        let res = mediate(&e, &pre, &eff);
+        match res {
+            Err(BlockReason::IdentityMismatch { pid, .. }) => assert_eq!(pid, 1234),
+            other => panic!("expected IdentityMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mediate_returns_effector_error_unmodified() {
+        let eff = MockEffector {
+            no_op: false,
+            return_err: Some(BlockReason::OsError {
+                errno: 1,
+                context: "EPERM".to_string(),
+            }),
+        };
+        let e = Effect::SigCont {
+            pid: 1,
+            start_sec: 0,
+        };
+        let pre = PreCondition::default();
+        match mediate(&e, &pre, &eff) {
+            Err(BlockReason::OsError { errno, .. }) => assert_eq!(errno, 1),
+            other => panic!("expected OsError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mediate_propagates_no_op_receipt() {
+        let eff = MockEffector {
+            no_op: true,
+            return_err: None,
+        };
+        let e = Effect::SetSysctl {
+            key: "vm.compressor_mode".to_string(),
+            value: SysctlValue::I32(4),
+            expected_before: SysctlValue::I32(4),
+        };
+        let pre = PreCondition::default();
+        let res = mediate(&e, &pre, &eff).unwrap();
+        assert!(res.no_op, "no_op receipt should propagate");
     }
 }

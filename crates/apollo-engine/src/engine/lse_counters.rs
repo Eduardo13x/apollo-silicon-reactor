@@ -445,6 +445,21 @@ pub struct LockFreeMetrics {
     /// [Hellerstein 2004 §9] disturbance rejection in closed-loop systems.
     pub purge_inhibition_skips_total: AtomicU64,
 
+    /// RAM Phase B (2026-06-03). Mediator chokepoint counters per Saltzer &
+    /// Schroeder 1975 complete-mediation principle. Each tracks one failure
+    /// mode the mediator interposes on:
+    /// - `mediator_blocks_total`: pre-condition violation OR identity
+    ///   mismatch OR safety oracle veto refused the effect before syscall.
+    /// - `mediator_noop_writes_total`: Effect applied but `before == after`
+    ///   in the Receipt — the SetSysctl bug class from Sprint 3 2026-05-07.
+    /// - `mediator_postcondition_violation_total`: Effect applied AND
+    ///   syscall returned success BUT post-snapshot still failed the
+    ///   expected delta check (e.g. SIGSTOP returned 0 but process still
+    ///   shown as RUNNING in proc_taskinfo). Catches lying syscalls.
+    pub mediator_blocks_total: AtomicU64,
+    pub mediator_noop_writes_total: AtomicU64,
+    pub mediator_postcondition_violation_total: AtomicU64,
+
     /// Sprint 12 Convergence #4 (2026-05-17). Counts cycles where
     /// `scorer_override_rejects_total` incremented AND
     /// `CausalGraph::has_recent_external_event(ThermalThrottle, …)`
@@ -642,6 +657,9 @@ impl LockFreeMetrics {
             scorer_override_rejects_total: AtomicU64::new(0),
             scorer_disagreement_strong_accepts_total: AtomicU64::new(0),
             purge_inhibition_skips_total: AtomicU64::new(0),
+            mediator_blocks_total: AtomicU64::new(0),
+            mediator_noop_writes_total: AtomicU64::new(0),
+            mediator_postcondition_violation_total: AtomicU64::new(0),
             causal_thermal_scorer_override_alignments_total: AtomicU64::new(0),
             companion_affinity_alignments_total: AtomicU64::new(0),
             companion_observe_router_skips_total: AtomicU64::new(0),
@@ -1099,6 +1117,11 @@ impl LockFreeMetrics {
                 .scorer_disagreement_strong_accepts_total
                 .load(Ordering::Relaxed),
             purge_inhibition_skips_total: self.purge_inhibition_skips_total.load(Ordering::Relaxed),
+            mediator_blocks_total: self.mediator_blocks_total.load(Ordering::Relaxed),
+            mediator_noop_writes_total: self.mediator_noop_writes_total.load(Ordering::Relaxed),
+            mediator_postcondition_violation_total: self
+                .mediator_postcondition_violation_total
+                .load(Ordering::Relaxed),
             causal_thermal_scorer_override_alignments_total: self
                 .causal_thermal_scorer_override_alignments_total
                 .load(Ordering::Relaxed),
@@ -1320,6 +1343,29 @@ impl LockFreeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// RAM Phase B — mediator interposed on effect before syscall.
+    #[inline(always)]
+    pub fn inc_mediator_block(&self) {
+        self.mediator_blocks_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// RAM Phase B — Receipt showed `before == after` for the effect's target
+    /// dimension. Catches SetSysctl no-op class (Sprint 3 2026-05-07 lesson).
+    #[inline(always)]
+    pub fn inc_mediator_noop_write(&self) {
+        self.mediator_noop_writes_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// RAM Phase B — syscall returned success but post-snapshot still failed
+    /// the expected delta. Surfaces lying syscalls / kernel rejections that
+    /// pretend to succeed.
+    #[inline(always)]
+    pub fn inc_mediator_postcondition_violation(&self) {
+        self.mediator_postcondition_violation_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Sprint 12 Convergence #4: bump once per cycle where the scorer
     /// override count grew AND the causal graph has a recent
     /// `ThermalThrottle` blame inside `EXTERNAL_BLAME_WINDOW`. See
@@ -1492,6 +1538,11 @@ pub struct MetricsSnapshot {
     /// `vm_purge` fired in the prior 5 s. See
     /// [`crate::engine::lse_counters::LockFreeMetrics::purge_inhibition_skips_total`].
     pub purge_inhibition_skips_total: u64,
+
+    /// RAM Phase B mediator counters. See LSE producer docs.
+    pub mediator_blocks_total: u64,
+    pub mediator_noop_writes_total: u64,
+    pub mediator_postcondition_violation_total: u64,
 
     /// Sprint 12 Convergence #4 (2026-05-17). Coincidence count of
     /// scorer overrides happening within the thermal external-blame

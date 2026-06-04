@@ -249,6 +249,15 @@ impl MetricsState {
         // closes when the maintenance tick fires.
         self.metrics.purge_inhibition_skips_total = lf.purge_inhibition_skips_total;
 
+        // RAM Phase B (2026-06-03) — mediator chokepoint counters. Stay at
+        // 0 until Phase C+ ports actual effectors through mediate(). The
+        // wiring here proves the lock-free → runtime metrics path is live
+        // and prevents Sprint 9 silent-telemetry-death pattern (4b13a39).
+        self.metrics.mediator_blocks_total = lf.mediator_blocks_total;
+        self.metrics.mediator_noop_writes_total = lf.mediator_noop_writes_total;
+        self.metrics.mediator_postcondition_violation_total =
+            lf.mediator_postcondition_violation_total;
+
         // Sprint 12 Convergence #4 (2026-05-17). Producer is the daemon
         // main-loop convergence probe (after the cycle's
         // run_signal_tick, when both lse counters are fresh and the

@@ -1943,6 +1943,19 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub purge_inhibition_skips_total: u64,
 
+    /// RAM Phase B (2026-06-03) mediator chokepoint counters. See
+    /// [`crate::engine::lse_counters::LockFreeMetrics::mediator_blocks_total`]
+    /// (+ noop_writes_total + postcondition_violation_total) for producer
+    /// docs. Flushed each cycle via `sync_from_lockfree`. The trio of
+    /// counters lets the dashboard distinguish three classes of mediated
+    /// failure: refused-before-syscall vs no-op-write vs lying-syscall.
+    #[serde(default)]
+    pub mediator_blocks_total: u64,
+    #[serde(default)]
+    pub mediator_noop_writes_total: u64,
+    #[serde(default)]
+    pub mediator_postcondition_violation_total: u64,
+
     /// Sprint 12 Convergence #4 (2026-05-17). Cumulative coincidence
     /// count: cycles in which the scorer override fired AND the causal
     /// graph reports a recent thermal-throttle external event. Strong
