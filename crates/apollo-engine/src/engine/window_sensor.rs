@@ -391,12 +391,36 @@ impl Default for WindowSensor {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// OnceLock Aho-Corasick matchers — built once at first use, scanned in single
+// pass per name instead of N substring iter loops. Called per-PID per-cycle via
+// classify_workload + is_renderer hot paths. [Sprint 2026-06-03]
+fn renderer_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    AC.get_or_init(|| aho_corasick::AhoCorasick::new(RENDERER_PATTERNS).expect("renderer patterns"))
+}
+fn heavy_app_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    AC.get_or_init(|| aho_corasick::AhoCorasick::new(HEAVY_APP_PATTERNS).expect("heavy app patterns"))
+}
+fn build_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    AC.get_or_init(|| aho_corasick::AhoCorasick::new(BUILD_PATTERNS).expect("build patterns"))
+}
+fn ai_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    AC.get_or_init(|| aho_corasick::AhoCorasick::new(AI_PATTERNS).expect("ai patterns"))
+}
+fn media_ac() -> &'static aho_corasick::AhoCorasick {
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    AC.get_or_init(|| aho_corasick::AhoCorasick::new(MEDIA_PATTERNS).expect("media patterns"))
+}
+
 fn is_renderer(name: &str) -> bool {
-    RENDERER_PATTERNS.iter().any(|p| name.contains(p))
+    renderer_ac().is_match(name)
 }
 
 fn is_heavy_app(name: &str) -> bool {
-    HEAVY_APP_PATTERNS.iter().any(|p| name.contains(p))
+    heavy_app_ac().is_match(name)
 }
 
 /// Classify workload intent from full process list + renderer count.
@@ -405,14 +429,15 @@ fn classify_workload(procs: &[(u32, &str)], renderer_count: u32) -> WorkloadInte
     let mut has_ai = false;
     let mut has_media = false;
 
+    let (b_ac, a_ac, m_ac) = (build_ac(), ai_ac(), media_ac());
     for &(_, name) in procs {
-        if !has_build && BUILD_PATTERNS.iter().any(|p| name.contains(p)) {
+        if !has_build && b_ac.is_match(name) {
             has_build = true;
         }
-        if !has_ai && AI_PATTERNS.iter().any(|p| name.contains(p)) {
+        if !has_ai && a_ac.is_match(name) {
             has_ai = true;
         }
-        if !has_media && MEDIA_PATTERNS.iter().any(|p| name.contains(p)) {
+        if !has_media && m_ac.is_match(name) {
             has_media = true;
         }
         if has_build && has_ai && has_media {
