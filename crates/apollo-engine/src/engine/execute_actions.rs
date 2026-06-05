@@ -8,7 +8,10 @@ use crate::engine::activity_sensor::pids_with_assertions;
 use crate::engine::amx_detector;
 use crate::engine::audit_types::{BlockReason, PolicyDecisionTrace};
 use crate::engine::io_tiering::{apply_io_tier, io_tier_for_throttle};
-use crate::engine::jetsam_control::{apply_apollo_policy, JetsamClass};
+// Switch-3: jetsam_control imports retired — production path now routes
+// through mediator::JetsamEffector. Direct apply_apollo_policy/JetsamClass
+// usage remains allowed only inside the typed effector + jetsam_control
+// module itself.
 use crate::engine::journal::append_journal_batch;
 use crate::engine::mach_qos::{LatencyTier, MachQoSManager, ThreadTier, ThroughputTier};
 use crate::engine::proc_taskinfo;
@@ -682,8 +685,28 @@ pub fn execute_actions(
                         // Jetsam: marcar como BACKGROUND en el kernel antes de SIGSTOP.
                         // Así si el sistema entra en OOM mientras el proceso está frozen,
                         // el kernel lo mata primero en lugar de matar procesos interactivos.
+                        // RAM Switch-3 (2026-06-03): route through JetsamEffector via
+                        // mediator chokepoint. PreCondition identity guard mirrors
+                        // Switch-1's SIGSTOP pattern for consistency. Receipt's
+                        // jetsam priority before/after read surfaces the no_op class
+                        // when the process was already at the target tier (currently
+                        // silent — the prior `let _ = apply_apollo_policy(...)`
+                        // discarded the Result outright).
                         if caps.can_memorystatus {
-                            let _ = apply_apollo_policy(*pid, JetsamClass::Noise);
+                            let eff = crate::engine::mediator::Effect::SetJetsamTier {
+                                pid: *pid,
+                                start_sec: *start_sec,
+                                tier: crate::engine::mediator::JetsamTierKind::Background,
+                            };
+                            let pre = crate::engine::mediator::PreCondition {
+                                pid_identity: Some((*pid, *start_sec)),
+                                ..Default::default()
+                            };
+                            let _ = crate::engine::mediator::mediate(
+                                &eff,
+                                &pre,
+                                &crate::engine::mediator::JetsamEffector,
+                            );
                         }
                         // RAM Switch-1 (2026-06-03): route SIGSTOP through typed
                         // SignalEffector via mediator chokepoint. Identity guard
