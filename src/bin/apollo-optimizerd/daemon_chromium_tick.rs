@@ -223,8 +223,21 @@ pub fn run_chromium_tick(
                     name = name.as_str(),
                     "chromium: E-core demotion for background renderer"
                 );
-                let mut qos = state.mach_qos.lock_recover();
-                let _ = qos.set_tier(*pid, SchedulingTier::Background);
+                // RAM Switch-4 (2026-06-03): route chromium E-core demotion
+                // through MachPolicyEffector. Mediator chokepoint accounts
+                // for the dispatch via mediator_blocks/postcondition counters
+                // when applicable. The effector internally locks the manager
+                // once; no outer guard needed at this site.
+                let effector = apollo_engine::engine::mediator::MachPolicyEffector::new(
+                    state.mach_qos.clone(),
+                );
+                let eff = apollo_engine::engine::mediator::Effect::SetMachPolicy {
+                    pid: *pid,
+                    start_sec: 0,
+                    policy: apollo_engine::engine::mediator::MachPolicyKind::Background,
+                };
+                let pre = apollo_engine::engine::mediator::PreCondition::default();
+                let _ = apollo_engine::engine::mediator::mediate(&eff, &pre, &effector);
             }
             ChromiumAction::PurgePurgeable { pid, name } => {
                 let purged = apollo_engine::engine::compressor_aware::purge_purgeable_regions(*pid)

@@ -452,35 +452,62 @@ impl Effector for JetsamEffector {
 // ── Phase F: MachPolicy + Purgeable + FileWrite effectors ────────────────────
 
 /// Effector for Mach scheduling policy changes (P-core / E-core routing,
-/// QoS class). This is the typed entry point — real syscall dispatch via
-/// `task_policy_set` is delegated to the production `MachQoSManager` in the
-/// switch-over sprint. For now the effector validates the Effect variant
-/// and returns a successful Receipt with the requested policy reflected in
-/// `after` so the typed surface is exercised by tests and consumers can
-/// be wired without waiting for the MachQoSManager Arc<Mutex<>> plumbing.
+/// QoS class). Switch-4 (2026-06-03): real syscall dispatch via injected
+/// `Arc<Mutex<MachQoSManager>>` — replaces the Phase F placeholder.
 ///
-/// Production wiring (deferred): inject `Arc<parking_lot::Mutex<MachQoSManager>>`
-/// at construction time; `apply()` then lock + call `set_tier(pid, tier)`
-/// and use its `QoSOutcome` to populate Receipt.
-pub struct MachPolicyEffector;
+/// The manager is locked for the duration of the syscall. Existing call
+/// sites that pre-lock then call `qos.set_tier(pid, tier)` migrate to:
+/// construct the effector with a clone of the SharedState Arc, drop any
+/// outer guard, then call `mediator::mediate()` — the lock is acquired
+/// inside the effector exactly once per dispatch.
+///
+/// Receipt fidelity limitations:
+/// - MachQoSManager does not expose a query API for the current tier, so
+///   `before`/`after.mach_policy` both reflect the *intended* policy from
+///   the Effect rather than a kernel-confirmed read. `no_op = false` is
+///   the safe default until a query method is added.
+/// - `QoSOutcome` from `set_tier` is currently discarded; future Switch-4
+///   iteration can map its variants to `BlockReason` / receipt fields.
+pub struct MachPolicyEffector {
+    qos: std::sync::Arc<std::sync::Mutex<crate::engine::mach_qos::MachQoSManager>>,
+}
+
+impl MachPolicyEffector {
+    pub fn new(
+        qos: std::sync::Arc<std::sync::Mutex<crate::engine::mach_qos::MachQoSManager>>,
+    ) -> Self {
+        Self { qos }
+    }
+
+    fn to_sched_tier(policy: MachPolicyKind) -> crate::engine::mach_qos::SchedulingTier {
+        use crate::engine::mach_qos::SchedulingTier;
+        match policy {
+            MachPolicyKind::UserInteractive | MachPolicyKind::UserInitiated => {
+                SchedulingTier::Foreground
+            }
+            MachPolicyKind::Default => SchedulingTier::Normal,
+            MachPolicyKind::Utility | MachPolicyKind::Background => SchedulingTier::Background,
+        }
+    }
+}
 
 impl Effector for MachPolicyEffector {
     fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason> {
-        let policy = match eff {
-            Effect::SetMachPolicy { policy, .. } => *policy,
+        let (pid, policy) = match eff {
+            Effect::SetMachPolicy { pid, policy, .. } => (*pid, *policy),
             _ => {
                 return Err(BlockReason::PreconditionViolated {
                     which: "MachPolicyEffector: unsupported Effect variant".to_string(),
                 });
             }
         };
-        // Phase F placeholder — Receipt structure is correct; switch-over
-        // sprint replaces the no-op body with MachQoSManager.set_tier dispatch.
-        let before = ReceiptSnapshot {
-            mach_policy: Some(policy),
-            ..ReceiptSnapshot::default()
-        };
-        let after = ReceiptSnapshot {
+        let sched_tier = Self::to_sched_tier(policy);
+        let t0 = std::time::Instant::now();
+        let mut mgr = self.qos.lock().unwrap_or_else(|e| e.into_inner());
+        let _outcome = mgr.set_tier(pid, sched_tier);
+        let syscall_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        drop(mgr);
+        let snapshot = ReceiptSnapshot {
             mach_policy: Some(policy),
             ..ReceiptSnapshot::default()
         };
@@ -489,12 +516,10 @@ impl Effector for MachPolicyEffector {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            before,
-            after,
-            // no_op true because the placeholder did not change kernel state —
-            // surface this honestly via the mediator counter.
-            no_op: true,
-            syscall_us: 0,
+            before: snapshot.clone(),
+            after: snapshot,
+            no_op: false,
+            syscall_us,
         })
     }
 }
@@ -824,24 +849,56 @@ mod tests {
 
     // ── Phase F: MachPolicy / Purgeable / FileWrite tests ───────────────────
 
+    fn make_mach_effector_for_test() -> MachPolicyEffector {
+        let mgr = crate::engine::mach_qos::MachQoSManager::new();
+        MachPolicyEffector::new(std::sync::Arc::new(std::sync::Mutex::new(mgr)))
+    }
+
     #[test]
-    fn mach_policy_effector_records_intent() {
-        let eff = MachPolicyEffector;
+    fn mach_policy_effector_dispatches_real_set_tier() {
+        let eff = make_mach_effector_for_test();
         let e = Effect::SetMachPolicy {
             pid: 1234,
             start_sec: 0,
             policy: MachPolicyKind::Background,
         };
-        let r = eff.apply(&e).expect("phase F placeholder returns Ok");
-        assert!(r.no_op, "placeholder must report no_op honestly");
+        // PID 1234 likely doesn't exist or we lack permission — the manager
+        // handles that internally. We only assert the typed surface works.
+        let r = eff.apply(&e).expect("Switch-4 dispatch returns Ok");
         assert_eq!(r.after.mach_policy, Some(MachPolicyKind::Background));
+        assert!(!r.no_op, "Switch-4 honest default — no_op detection deferred");
     }
 
     #[test]
     fn mach_policy_effector_rejects_other_effect() {
-        let eff = MachPolicyEffector;
+        let eff = make_mach_effector_for_test();
         let e = Effect::SigStop { pid: 1, start_sec: 0 };
         assert!(eff.apply(&e).is_err());
+    }
+
+    #[test]
+    fn mach_policy_kind_to_sched_tier_mapping() {
+        use crate::engine::mach_qos::SchedulingTier;
+        assert_eq!(
+            MachPolicyEffector::to_sched_tier(MachPolicyKind::UserInteractive),
+            SchedulingTier::Foreground
+        );
+        assert_eq!(
+            MachPolicyEffector::to_sched_tier(MachPolicyKind::UserInitiated),
+            SchedulingTier::Foreground
+        );
+        assert_eq!(
+            MachPolicyEffector::to_sched_tier(MachPolicyKind::Default),
+            SchedulingTier::Normal
+        );
+        assert_eq!(
+            MachPolicyEffector::to_sched_tier(MachPolicyKind::Utility),
+            SchedulingTier::Background
+        );
+        assert_eq!(
+            MachPolicyEffector::to_sched_tier(MachPolicyKind::Background),
+            SchedulingTier::Background
+        );
     }
 
     #[test]
