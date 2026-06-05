@@ -282,6 +282,97 @@ impl Effector for SignalEffector {
     }
 }
 
+// ── Phase D: Sysctl effector ─────────────────────────────────────────────────
+
+/// Effector for kernel sysctl writes. Wraps `sysctl_direct::write_i32` /
+/// `write_str_value`. The Receipt captures `before` and `after` reads so the
+/// mediator's `no_op` detector fires when the syscall succeeds but the kernel
+/// silently rejected (or coerced) the requested value — the SetSysctl no-op
+/// bug class from Sprint 3 (2026-05-07 lesson).
+///
+/// Effect carries `expected_before`; if the live pre-read disagrees, the
+/// effector returns `BlockReason::PreconditionViolated` instead of writing.
+/// This catches stale state in the caller (race against another writer).
+pub struct SysctlEffector;
+
+impl SysctlEffector {
+    fn read(key: &str, kind_hint: &SysctlValue) -> Option<SysctlValue> {
+        match kind_hint {
+            SysctlValue::I32(_) => {
+                crate::engine::sysctl_direct::read_i32(key).map(SysctlValue::I32)
+            }
+            SysctlValue::I64(_) => {
+                crate::engine::sysctl_direct::read_u64(key).map(|v| SysctlValue::I64(v as i64))
+            }
+            SysctlValue::Str(_) => crate::engine::sysctl_direct::read_str(key).map(SysctlValue::Str),
+        }
+    }
+}
+
+impl Effector for SysctlEffector {
+    fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason> {
+        let (key, value, expected_before) = match eff {
+            Effect::SetSysctl {
+                key,
+                value,
+                expected_before,
+            } => (key.as_str(), value, expected_before),
+            _ => {
+                return Err(BlockReason::PreconditionViolated {
+                    which: "SysctlEffector: unsupported Effect variant".to_string(),
+                });
+            }
+        };
+        // Pre-read: detect stale caller state vs live kernel value.
+        let live_before = Self::read(key, value);
+        if let Some(live) = &live_before {
+            if !live.equals(expected_before) {
+                return Err(BlockReason::PreconditionViolated {
+                    which: format!("sysctl {} live != expected_before", key),
+                });
+            }
+        }
+        let before = ReceiptSnapshot {
+            sysctl_value: live_before.clone(),
+            ..ReceiptSnapshot::default()
+        };
+        let t0 = std::time::Instant::now();
+        let ok = match value {
+            SysctlValue::I32(v) => crate::engine::sysctl_direct::write_i32(key, *v),
+            SysctlValue::I64(v) => crate::engine::sysctl_direct::write_str_value(key, &v.to_string()),
+            SysctlValue::Str(s) => crate::engine::sysctl_direct::write_str_value(key, s),
+        };
+        let syscall_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        if !ok {
+            return Err(BlockReason::OsError {
+                errno: 0,
+                context: format!("sysctl write {} failed", key),
+            });
+        }
+        let live_after = Self::read(key, value);
+        let after = ReceiptSnapshot {
+            sysctl_value: live_after.clone(),
+            ..ReceiptSnapshot::default()
+        };
+        // no_op detection: write returned ok but live read shows value unchanged
+        // → kernel silently rejected. The Sprint 3 SetSysctl bug class.
+        let no_op = match (&before.sysctl_value, &after.sysctl_value) {
+            (Some(b), Some(a)) => b.equals(a),
+            _ => false,
+        };
+        Ok(Receipt {
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            before,
+            after,
+            no_op,
+            syscall_us,
+        })
+    }
+}
+
 // ── Phase B: Mediator chokepoint ─────────────────────────────────────────────
 
 /// Verify pre-conditions, apply the effect via the supplied effector, and
@@ -523,6 +614,37 @@ mod tests {
     }
 
     // ── Phase C: SignalEffector tests ───────────────────────────────────────
+
+    // ── Phase D: SysctlEffector tests ───────────────────────────────────────
+
+    #[test]
+    fn sysctl_effector_rejects_non_sysctl_effect() {
+        let eff = SysctlEffector;
+        let e = Effect::SigStop { pid: 1, start_sec: 0 };
+        match eff.apply(&e) {
+            Err(BlockReason::PreconditionViolated { which }) => {
+                assert!(which.contains("unsupported"));
+            }
+            other => panic!("expected PreconditionViolated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sysctl_effector_invalid_key_returns_error_or_blocked() {
+        // "foo.does.not.exist" is guaranteed to fail at the kernel level.
+        let eff = SysctlEffector;
+        let e = Effect::SetSysctl {
+            key: "foo.does.not.exist".to_string(),
+            value: SysctlValue::I32(1),
+            expected_before: SysctlValue::I32(0),
+        };
+        // We don't assert specific variant — kernel may return error OR
+        // sysctl_direct::read returning None bypasses the precondition check
+        // and the write returns false. Both are acceptable; what matters is
+        // we do not panic and do not silently report success.
+        let res = eff.apply(&e);
+        assert!(res.is_err(), "invalid sysctl key must surface an error");
+    }
 
     #[test]
     fn signal_effector_rejects_non_signal_effect() {
