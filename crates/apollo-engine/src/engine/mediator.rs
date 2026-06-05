@@ -537,19 +537,35 @@ pub struct PurgeableEffector;
 
 impl Effector for PurgeableEffector {
     fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason> {
-        let target_bytes = match eff {
-            Effect::PurgeHint { target_bytes, .. } => *target_bytes,
+        let (pid, _target_bytes) = match eff {
+            Effect::PurgeHint {
+                pid, target_bytes, ..
+            } => (*pid, *target_bytes),
             _ => {
                 return Err(BlockReason::PreconditionViolated {
                     which: "PurgeableEffector: unsupported Effect variant".to_string(),
                 });
             }
         };
-        // Cross-process madvise requires per-region address ranges that are
-        // not part of the Effect surface. Switch-over sprint will plumb the
-        // existing purgeable subsystem through. For now the effector records
-        // intent and returns no_op=true so the counter surfaces honestly.
-        let _ = target_bytes;
+        // Switch-5 (2026-06-03): real dispatch via existing
+        // `compressor_aware::purge_purgeable_regions(pid)`, which walks all
+        // purgeable VM regions for the target task and issues madvise per
+        // region internally — no address-range plumbing needed in the
+        // Effect surface.
+        //
+        // CLAUDE.md hard rule: this effector trusts the upstream gate
+        // (classify_protection + Chromium-cooperative emission path) to
+        // decide whether to fire — the single source of safety truth stays
+        // in `safety.rs`. The effector does not re-validate process kind.
+        let t0 = std::time::Instant::now();
+        let purged_regions = crate::engine::compressor_aware::purge_purgeable_regions(pid)
+            .unwrap_or(0);
+        let syscall_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        // no_op when the walker reported zero purgeable regions — the
+        // 2026-05-30 NLM corpus finding that purge_purgeable:Brave Renderer
+        // often returns pressure_no_change shows up here as a non-zero
+        // mediator_noop_writes_total signal over time.
+        let no_op = purged_regions == 0;
         Ok(Receipt {
             timestamp_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -557,8 +573,8 @@ impl Effector for PurgeableEffector {
                 .unwrap_or(0),
             before: ReceiptSnapshot::default(),
             after: ReceiptSnapshot::default(),
-            no_op: true,
-            syscall_us: 0,
+            no_op,
+            syscall_us,
         })
     }
 }

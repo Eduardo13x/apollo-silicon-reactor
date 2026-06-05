@@ -240,8 +240,28 @@ pub fn run_chromium_tick(
                 let _ = apollo_engine::engine::mediator::mediate(&eff, &pre, &effector);
             }
             ChromiumAction::PurgePurgeable { pid, name } => {
-                let purged = apollo_engine::engine::compressor_aware::purge_purgeable_regions(*pid)
-                    .unwrap_or(0);
+                // RAM Switch-5 (2026-06-03): route through PurgeableEffector
+                // via mediator chokepoint. The effector internally walks
+                // purgeable VM regions and issues madvise; the no_op signal
+                // counts hits against the NLM-confirmed Brave Renderer
+                // pressure_no_change pattern (corpus 2026-05-30).
+                //
+                // Region-count plumbing through the Receipt is deferred so
+                // we avoid double-walking. The log line below loses the
+                // exact region count; the mediator counters
+                // (mediator_noop_writes_total) are the new ground truth.
+                let effector = apollo_engine::engine::mediator::PurgeableEffector;
+                let eff = apollo_engine::engine::mediator::Effect::PurgeHint {
+                    pid: *pid,
+                    start_sec: 0,
+                    target_bytes: 0,
+                };
+                let pre = apollo_engine::engine::mediator::PreCondition::default();
+                let receipt = apollo_engine::engine::mediator::mediate(&eff, &pre, &effector);
+                let purged: u32 = match &receipt {
+                    Ok(r) if !r.no_op => 1, // 1 = "at least one region purged"
+                    _ => 0,
+                };
                 tracing::debug!(
                     pid = pid,
                     name = name.as_str(),
