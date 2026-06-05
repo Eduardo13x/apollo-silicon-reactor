@@ -373,6 +373,82 @@ impl Effector for SysctlEffector {
     }
 }
 
+// ── Phase E: Jetsam tier effector ────────────────────────────────────────────
+
+/// Effector for jetsam priority / memory-limit tier changes. Wraps
+/// `jetsam_control::apply_apollo_policy` + `get_priority` for before/after
+/// snapshots.
+///
+/// `JetsamTierKind` is mapped to the production `JetsamClass` per the table
+/// below. The 4-variant mediator enum is intentionally broader than the
+/// 3-variant production enum so future effects (e.g. Suspended/Idle splits)
+/// can be added without changing the public Effect surface.
+///
+/// | JetsamTierKind | JetsamClass     | Rationale                              |
+/// |----------------|------------------|----------------------------------------|
+/// | Foreground     | Interactive      | user-facing, never demoted             |
+/// | Background     | Noise            | normal demote candidate                |
+/// | Suspended      | Noise            | aggressive demote (no exact match yet) |
+/// | Idle           | Noise            | aggressive demote (no exact match yet) |
+pub struct JetsamEffector;
+
+impl JetsamEffector {
+    fn to_class(kind: JetsamTierKind) -> crate::engine::jetsam_control::JetsamClass {
+        use crate::engine::jetsam_control::JetsamClass;
+        match kind {
+            JetsamTierKind::Foreground => JetsamClass::Interactive,
+            JetsamTierKind::Background | JetsamTierKind::Suspended | JetsamTierKind::Idle => {
+                JetsamClass::Noise
+            }
+        }
+    }
+}
+
+impl Effector for JetsamEffector {
+    fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason> {
+        let (pid, tier) = match eff {
+            Effect::SetJetsamTier { pid, tier, .. } => (*pid, *tier),
+            _ => {
+                return Err(BlockReason::PreconditionViolated {
+                    which: "JetsamEffector: unsupported Effect variant".to_string(),
+                });
+            }
+        };
+        let before_priority = crate::engine::jetsam_control::get_priority(pid);
+        let before = ReceiptSnapshot {
+            jetsam_tier: Some(tier),
+            ..ReceiptSnapshot::default()
+        };
+        let class = Self::to_class(tier);
+        let t0 = std::time::Instant::now();
+        let result = crate::engine::jetsam_control::apply_apollo_policy(pid, class);
+        let syscall_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        if let Err(msg) = result {
+            return Err(BlockReason::OsError {
+                errno: 0,
+                context: format!("jetsam {} → {:?}: {}", pid, class, msg),
+            });
+        }
+        let after_priority = crate::engine::jetsam_control::get_priority(pid);
+        let after = ReceiptSnapshot {
+            jetsam_tier: Some(tier),
+            ..ReceiptSnapshot::default()
+        };
+        // no_op: jetsam priority value unchanged after the policy apply.
+        let no_op = matches!((before_priority, after_priority), (Some(a), Some(b)) if a == b);
+        Ok(Receipt {
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            before,
+            after,
+            no_op,
+            syscall_us,
+        })
+    }
+}
+
 // ── Phase B: Mediator chokepoint ─────────────────────────────────────────────
 
 /// Verify pre-conditions, apply the effect via the supplied effector, and
@@ -614,6 +690,41 @@ mod tests {
     }
 
     // ── Phase C: SignalEffector tests ───────────────────────────────────────
+
+    // ── Phase E: JetsamEffector tests ───────────────────────────────────────
+
+    #[test]
+    fn jetsam_effector_rejects_non_jetsam_effect() {
+        let eff = JetsamEffector;
+        let e = Effect::SigCont { pid: 1, start_sec: 0 };
+        match eff.apply(&e) {
+            Err(BlockReason::PreconditionViolated { which }) => {
+                assert!(which.contains("unsupported"));
+            }
+            other => panic!("expected PreconditionViolated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn jetsam_tier_kind_maps_to_class() {
+        use crate::engine::jetsam_control::JetsamClass;
+        assert_eq!(
+            JetsamEffector::to_class(JetsamTierKind::Foreground),
+            JetsamClass::Interactive
+        );
+        assert_eq!(
+            JetsamEffector::to_class(JetsamTierKind::Background),
+            JetsamClass::Noise
+        );
+        assert_eq!(
+            JetsamEffector::to_class(JetsamTierKind::Suspended),
+            JetsamClass::Noise
+        );
+        assert_eq!(
+            JetsamEffector::to_class(JetsamTierKind::Idle),
+            JetsamClass::Noise
+        );
+    }
 
     // ── Phase D: SysctlEffector tests ───────────────────────────────────────
 
