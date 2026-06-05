@@ -38,7 +38,7 @@ use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::fluidity::FluidityState;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lse_counters::CycleStage;
-use apollo_engine::engine::mach_qos::SchedulingTier;
+// Switch-4b: SchedulingTier no longer needed — mediator::MachPolicyKind drives dispatch
 use apollo_engine::engine::overflow_guard::OverflowThresholds;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
 use apollo_engine::engine::pipeline::periodic_stage::{
@@ -74,9 +74,22 @@ pub fn apply_fluidity_qos(
         && !thermal_action.force_ecores
     {
         if let Some(fg_pid) = foreground_pid {
-            let mut qos = state.mach_qos.lock_recover();
-            let outcome = qos.set_tier(fg_pid, SchedulingTier::Foreground);
-            if outcome.success {
+            // Switch-4b (2026-06-03): route through MachPolicyEffector.
+            let mach_effector = apollo_engine::engine::mediator::MachPolicyEffector::new(
+                state.mach_qos.clone(),
+            );
+            let mach_eff = apollo_engine::engine::mediator::Effect::SetMachPolicy {
+                pid: fg_pid,
+                start_sec: 0,
+                policy: apollo_engine::engine::mediator::MachPolicyKind::UserInteractive,
+            };
+            if apollo_engine::engine::mediator::mediate(
+                &mach_eff,
+                &apollo_engine::engine::mediator::PreCondition::default(),
+                &mach_effector,
+            )
+            .is_ok()
+            {
                 tracing::debug!(
                     pid = fg_pid,
                     window_op = fluidity_state.window_op_active(),

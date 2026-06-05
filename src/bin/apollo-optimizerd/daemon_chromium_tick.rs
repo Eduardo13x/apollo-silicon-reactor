@@ -22,7 +22,7 @@ use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::fluidity::FluidityState;
 use apollo_engine::engine::focus_markov::FocusMarkov;
 use apollo_engine::engine::lock_ext::LockRecover;
-use apollo_engine::engine::mach_qos::SchedulingTier;
+// Switch-4b: SchedulingTier no longer needed — mediator::MachPolicyKind drives dispatch
 use apollo_engine::engine::nars_belief::ArousalState;
 use apollo_engine::engine::process_classifier::ProcessSnapshot;
 use apollo_engine::engine::process_identity::ProcessIdentity;
@@ -313,10 +313,20 @@ pub fn run_chromium_tick(
                     );
                     ChromiumManager::thaw_renderer(*pid);
                     // Restore Mach scheduling to Normal (P-cores) so renderer resumes fast.
-                    {
-                        let mut qos = state.mach_qos.lock_recover();
-                        let _ = qos.set_tier(*pid, SchedulingTier::Normal);
-                    }
+                    // Switch-4b (2026-06-03): route through MachPolicyEffector.
+                    let mach_effector = apollo_engine::engine::mediator::MachPolicyEffector::new(
+                        state.mach_qos.clone(),
+                    );
+                    let mach_eff = apollo_engine::engine::mediator::Effect::SetMachPolicy {
+                        pid: *pid,
+                        start_sec: 0,
+                        policy: apollo_engine::engine::mediator::MachPolicyKind::Default,
+                    };
+                    let _ = apollo_engine::engine::mediator::mediate(
+                        &mach_eff,
+                        &apollo_engine::engine::mediator::PreCondition::default(),
+                        &mach_effector,
+                    );
                     state.frozen_state.lock_recover().remove(pid);
                     // NARS belief update: observe whether renderer survived freeze.
                     // [Pei Wang 2013] Revision rule accumulates evidence over time.

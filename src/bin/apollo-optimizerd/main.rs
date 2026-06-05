@@ -74,7 +74,7 @@ use apollo_engine::engine::background_collectors::PressureCollector;
 use apollo_engine::engine::capabilities::detect_capabilities;
 use apollo_engine::engine::causal_graph::CausalGraph;
 use apollo_engine::engine::compressor_aware::{
-    decide_enhanced, purge_purgeable_regions, query_memory_profile, sample_process_temperature,
+    decide_enhanced, query_memory_profile, sample_process_temperature,
     scan_regions, MemoryAction,
 };
 use apollo_engine::engine::daemon_helpers::{
@@ -4588,8 +4588,29 @@ fn main() -> anyhow::Result<()> {
                                             None::<RootAction>
                                         } else {
                                         // Cable: purge_purgeable_regions() → reclaim RAM without freeze.
+                                        // Switch-5b (2026-06-03): route through PurgeableEffector
+                                        // via mediator chokepoint. Receipt no_op flag accumulates
+                                        // into mediator_noop_writes_total when zero regions purged.
                                         if profile.purgeable_bytes > 10 * 1024 * 1024 {
-                                            let purged = purge_purgeable_regions(pid).unwrap_or(0);
+                                            let purge_effector =
+                                                apollo_engine::engine::mediator::PurgeableEffector;
+                                            let purge_eff =
+                                                apollo_engine::engine::mediator::Effect::PurgeHint {
+                                                    pid,
+                                                    start_sec: 0,
+                                                    target_bytes: profile.purgeable_bytes,
+                                                };
+                                            let purge_receipt =
+                                                apollo_engine::engine::mediator::mediate(
+                                                    &purge_eff,
+                                                    &apollo_engine::engine::mediator::PreCondition::default(),
+                                                    &purge_effector,
+                                                );
+                                            // Receipt doesn't carry region count; use no_op as proxy.
+                                            let purged: u32 = match &purge_receipt {
+                                                Ok(r) if !r.no_op => 1,
+                                                _ => 0,
+                                            };
                                             if purged > 0 {
                                                 audit_log(&serde_json::json!({
                                                     "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
