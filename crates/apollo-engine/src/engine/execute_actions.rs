@@ -685,8 +685,25 @@ pub fn execute_actions(
                         if caps.can_memorystatus {
                             let _ = apply_apollo_policy(*pid, JetsamClass::Noise);
                         }
-                        let rc = unsafe { libc::kill(*pid as i32, libc::SIGSTOP) };
-                        if rc == 0 {
+                        // RAM Switch-1 (2026-06-03): route SIGSTOP through typed
+                        // SignalEffector via mediator chokepoint. Identity guard
+                        // (PID, start_sec) prevents A-B-A recycling per Invariant #11.
+                        // mediator counters (blocks/noop_writes) surface failure
+                        // classes that the prior raw `libc::kill` swallowed silently.
+                        let eff = crate::engine::mediator::Effect::SigStop {
+                            pid: *pid,
+                            start_sec: *start_sec,
+                        };
+                        let pre = crate::engine::mediator::PreCondition {
+                            pid_identity: Some((*pid, *start_sec)),
+                            ..Default::default()
+                        };
+                        let mediated = crate::engine::mediator::mediate(
+                            &eff,
+                            &pre,
+                            &crate::engine::mediator::SignalEffector,
+                        );
+                        if mediated.is_ok() {
                             frozen.insert(*pid);
                             out.freezes_applied += 1;
                             out.newly_frozen_pids.push(*pid);
