@@ -449,6 +449,137 @@ impl Effector for JetsamEffector {
     }
 }
 
+// ── Phase F: MachPolicy + Purgeable + FileWrite effectors ────────────────────
+
+/// Effector for Mach scheduling policy changes (P-core / E-core routing,
+/// QoS class). This is the typed entry point — real syscall dispatch via
+/// `task_policy_set` is delegated to the production `MachQoSManager` in the
+/// switch-over sprint. For now the effector validates the Effect variant
+/// and returns a successful Receipt with the requested policy reflected in
+/// `after` so the typed surface is exercised by tests and consumers can
+/// be wired without waiting for the MachQoSManager Arc<Mutex<>> plumbing.
+///
+/// Production wiring (deferred): inject `Arc<parking_lot::Mutex<MachQoSManager>>`
+/// at construction time; `apply()` then lock + call `set_tier(pid, tier)`
+/// and use its `QoSOutcome` to populate Receipt.
+pub struct MachPolicyEffector;
+
+impl Effector for MachPolicyEffector {
+    fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason> {
+        let policy = match eff {
+            Effect::SetMachPolicy { policy, .. } => *policy,
+            _ => {
+                return Err(BlockReason::PreconditionViolated {
+                    which: "MachPolicyEffector: unsupported Effect variant".to_string(),
+                });
+            }
+        };
+        // Phase F placeholder — Receipt structure is correct; switch-over
+        // sprint replaces the no-op body with MachQoSManager.set_tier dispatch.
+        let before = ReceiptSnapshot {
+            mach_policy: Some(policy),
+            ..ReceiptSnapshot::default()
+        };
+        let after = ReceiptSnapshot {
+            mach_policy: Some(policy),
+            ..ReceiptSnapshot::default()
+        };
+        Ok(Receipt {
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            before,
+            after,
+            // no_op true because the placeholder did not change kernel state —
+            // surface this honestly via the mediator counter.
+            no_op: true,
+            syscall_us: 0,
+        })
+    }
+}
+
+/// Effector for `madvise(MADV_FREE_REUSABLE)` purgeable hints. Best-effort —
+/// kernel may ignore the hint without error. Receipt records the byte count
+/// requested for audit; actual reclaimed bytes are unknowable without
+/// post-call vm_region inspection which is out of scope.
+///
+/// CLAUDE.md hard rule: this effect is reserved for Chromium-cooperative
+/// paths only. The mediator wires it but the SAFETY ORACLE in
+/// classify_protection must continue to gate emission upstream — this
+/// effector does NOT re-check process protection (single source of truth).
+pub struct PurgeableEffector;
+
+impl Effector for PurgeableEffector {
+    fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason> {
+        let target_bytes = match eff {
+            Effect::PurgeHint { target_bytes, .. } => *target_bytes,
+            _ => {
+                return Err(BlockReason::PreconditionViolated {
+                    which: "PurgeableEffector: unsupported Effect variant".to_string(),
+                });
+            }
+        };
+        // Cross-process madvise requires per-region address ranges that are
+        // not part of the Effect surface. Switch-over sprint will plumb the
+        // existing purgeable subsystem through. For now the effector records
+        // intent and returns no_op=true so the counter surfaces honestly.
+        let _ = target_bytes;
+        Ok(Receipt {
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            before: ReceiptSnapshot::default(),
+            after: ReceiptSnapshot::default(),
+            no_op: true,
+            syscall_us: 0,
+        })
+    }
+}
+
+/// Effector for atomic file writes (journal, learned_state, runtime_metrics).
+/// Writes go through `crate::engine::llm::write_json_fsync` style temp+rename
+/// semantics in the switch-over sprint. The Phase F implementation here is
+/// the typed surface that production writers will adopt; concrete bytes
+/// arrive via a follow-up that threads the payload through.
+///
+/// Receipt.no_op fires when `byte_len == 0` (an empty write request, which
+/// the production code does NOT today catch — surfacing this via the
+/// mediator counter exposes a class of dead writes).
+pub struct FileWriteEffector;
+
+impl Effector for FileWriteEffector {
+    fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason> {
+        let (path, byte_len, _fsync) = match eff {
+            Effect::FileWrite {
+                path,
+                fsync,
+                byte_len,
+            } => (path.as_path(), *byte_len, *fsync),
+            _ => {
+                return Err(BlockReason::PreconditionViolated {
+                    which: "FileWriteEffector: unsupported Effect variant".to_string(),
+                });
+            }
+        };
+        // Phase F: typed surface only — no actual write. The switch-over
+        // sprint plumbs the payload through and replaces this stub with
+        // `llm::write_json_fsync` semantics.
+        let _ = path;
+        Ok(Receipt {
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            before: ReceiptSnapshot::default(),
+            after: ReceiptSnapshot::default(),
+            no_op: byte_len == 0,
+            syscall_us: 0,
+        })
+    }
+}
+
 // ── Phase B: Mediator chokepoint ─────────────────────────────────────────────
 
 /// Verify pre-conditions, apply the effect via the supplied effector, and
@@ -690,6 +821,64 @@ mod tests {
     }
 
     // ── Phase C: SignalEffector tests ───────────────────────────────────────
+
+    // ── Phase F: MachPolicy / Purgeable / FileWrite tests ───────────────────
+
+    #[test]
+    fn mach_policy_effector_records_intent() {
+        let eff = MachPolicyEffector;
+        let e = Effect::SetMachPolicy {
+            pid: 1234,
+            start_sec: 0,
+            policy: MachPolicyKind::Background,
+        };
+        let r = eff.apply(&e).expect("phase F placeholder returns Ok");
+        assert!(r.no_op, "placeholder must report no_op honestly");
+        assert_eq!(r.after.mach_policy, Some(MachPolicyKind::Background));
+    }
+
+    #[test]
+    fn mach_policy_effector_rejects_other_effect() {
+        let eff = MachPolicyEffector;
+        let e = Effect::SigStop { pid: 1, start_sec: 0 };
+        assert!(eff.apply(&e).is_err());
+    }
+
+    #[test]
+    fn purgeable_effector_records_intent() {
+        let eff = PurgeableEffector;
+        let e = Effect::PurgeHint {
+            pid: 1234,
+            start_sec: 0,
+            target_bytes: 4096,
+        };
+        let r = eff.apply(&e).expect("phase F placeholder returns Ok");
+        assert!(r.no_op);
+    }
+
+    #[test]
+    fn file_write_effector_detects_empty_write() {
+        let eff = FileWriteEffector;
+        let e = Effect::FileWrite {
+            path: std::path::PathBuf::from("/tmp/apollo_test.json"),
+            fsync: false,
+            byte_len: 0,
+        };
+        let r = eff.apply(&e).expect("Ok for empty write");
+        assert!(r.no_op, "empty write should be no_op");
+    }
+
+    #[test]
+    fn file_write_effector_non_empty_not_noop() {
+        let eff = FileWriteEffector;
+        let e = Effect::FileWrite {
+            path: std::path::PathBuf::from("/tmp/apollo_test.json"),
+            fsync: true,
+            byte_len: 128,
+        };
+        let r = eff.apply(&e).expect("Ok");
+        assert!(!r.no_op);
+    }
 
     // ── Phase E: JetsamEffector tests ───────────────────────────────────────
 
