@@ -190,6 +190,9 @@ impl DecisionStage {
         latency_target: LatencyTarget,
         reactor_weight: f64,
         overflow_thresholds: OverflowThresholds,
+        // TODO(S4 follow-up 2026-06-05): paired with execute_actions sig
+        // cutover to `Option<Arc<Mutex<MachQoSManager>>>`. See
+        // execute_actions.rs:281 for rationale.
         qos_mgr: Option<&mut MachQoSManager>,
         policy: &PolicyContext<'a>,
     ) -> DecisionStageOutput {

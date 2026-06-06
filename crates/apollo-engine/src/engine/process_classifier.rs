@@ -145,6 +145,21 @@ pub fn helper_name_patterns() -> &'static [&'static str] {
     ]
 }
 
+/// Sprint patch (2026-06-05). Pre-built AhoCorasick matcher for the helper
+/// name patterns. Replaces the per-classification `for pat in patterns()
+/// { snap.name.contains(pat) }` substring scan with one AC walk. Built once
+/// per daemon lifetime via `OnceLock`.
+fn helper_ac() -> &'static aho_corasick::AhoCorasick {
+    use std::sync::OnceLock;
+    static AC: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    AC.get_or_init(|| {
+        aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::Standard)
+            .build(helper_name_patterns())
+            .expect("helper_name_patterns are valid literals")
+    })
+}
+
 // ── ProcessClassifier ─────────────────────────────────────────────────────────
 
 pub struct ProcessClassifier {
@@ -190,14 +205,14 @@ impl ProcessClassifier {
         if self.telemetry.contains(snap.name.as_str()) {
             return ProcessTier::Telemetry;
         }
-        for pat in helper_name_patterns() {
-            if snap.name.contains(pat) {
-                return if snap.has_gui_window {
-                    ProcessTier::AppHelper
-                } else {
-                    ProcessTier::SilentDaemon
-                };
-            }
+        // Sprint patch (2026-06-05): pre-built AhoCorasick replaces N-pattern
+        // `snap.name.contains(pat)` walk per process.
+        if helper_ac().is_match(snap.name.as_str()) {
+            return if snap.has_gui_window {
+                ProcessTier::AppHelper
+            } else {
+                ProcessTier::SilentDaemon
+            };
         }
 
         // Foreground
@@ -377,6 +392,20 @@ mod tests {
         let c = ProcessClassifier::new();
         let s = snap("WindowServer");
         assert_eq!(c.classify(&s), ProcessTier::SystemEssential);
+    }
+
+    /// Sprint patch (2026-06-05): the AhoCorasick helper matcher must
+    /// preserve the original substring-walk semantics — every pattern in
+    /// `helper_name_patterns` should match a synthesised name embedding it.
+    #[test]
+    fn helper_ac_matches_legacy_substring() {
+        for pat in helper_name_patterns() {
+            let synth = format!("foo{pat}bar");
+            assert!(
+                helper_ac().is_match(synth.as_str()),
+                "AC must match pattern '{pat}' in synthesised name '{synth}'",
+            );
+        }
     }
 
     #[test]

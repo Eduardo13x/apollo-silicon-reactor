@@ -512,6 +512,7 @@ mod tests {
             reason: "test:freeze".into(),
             per_feature: vec![],
             composite: -1.90, // 0.10 - 1.0*2.0 - 0.5*0 = -1.90 (well below -0.30)
+            raw_uncertainty: 0.0,
         };
         match decide_override(/* gate_accept */ true, &score) {
             OverrideDecision::OverrideReject { composite } => {
@@ -533,6 +534,7 @@ mod tests {
             reason: "test:freeze".into(),
             per_feature: vec![],
             composite: 2.5,
+            raw_uncertainty: 0.0,
         };
         match decide_override(/* gate_accept */ false, &score) {
             OverrideDecision::LogStrongAccept { composite } => {
@@ -554,6 +556,7 @@ mod tests {
             reason: "test".into(),
             per_feature: vec![],
             composite: 1.0,
+            raw_uncertainty: 0.0,
         };
         assert_eq!(
             decide_override(true, &score),
@@ -574,6 +577,7 @@ mod tests {
             reason: "test".into(),
             per_feature: vec![],
             composite: -0.5,
+            raw_uncertainty: 0.0,
         };
         assert_eq!(
             decide_override(false, &score),
@@ -596,6 +600,7 @@ mod tests {
             reason: "test".into(),
             per_feature: vec![],
             composite: -0.25,
+            raw_uncertainty: 0.0,
         };
         assert_eq!(
             decide_override(true, &score),
@@ -616,6 +621,7 @@ mod tests {
             reason: "test".into(),
             per_feature: vec![],
             composite: 0.25,
+            raw_uncertainty: 0.0,
         };
         assert_eq!(
             decide_override(false, &score),
@@ -637,6 +643,7 @@ mod tests {
             reason: "test".into(),
             per_feature: vec![],
             composite: -0.30,
+            raw_uncertainty: 0.0,
         };
         assert_eq!(decide_override(true, &exact), OverrideDecision::NoChange);
     }

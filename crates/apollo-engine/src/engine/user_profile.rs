@@ -36,6 +36,33 @@ pub enum WorkloadType {
     General,
 }
 
+impl WorkloadType {
+    /// Sprint patch (2026-06-05). Canonical kebab-case wire name for any
+    /// variant. Returns the same strings the
+    /// `#[serde(rename_all = "kebab-case")]` attribute emits — paired with
+    /// [`workload_type_from_str`] this is the documented round-trip pair.
+    ///
+    /// Replaces 5 producer sites that previously emitted
+    /// `format!("{:?}", v).to_lowercase()` — which collapses the
+    /// underscore-free `Debug` ("VideoCall" → "videocall") and could not
+    /// be parsed back by [`workload_type_from_str`] (which expects
+    /// "video-call"). The legacy mismatch silently dropped serialized
+    /// VideoCall/MediaPlayback/VideoEdit/OfficeWork/CommandLine state on
+    /// restart.
+    pub fn as_kebab(&self) -> &'static str {
+        match self {
+            WorkloadType::Coding => "coding",
+            WorkloadType::VideoCall => "video-call",
+            WorkloadType::MediaPlayback => "media-playback",
+            WorkloadType::VideoEdit => "video-edit",
+            WorkloadType::OfficeWork => "office-work",
+            WorkloadType::CommandLine => "command-line",
+            WorkloadType::Idle => "idle",
+            WorkloadType::General => "general",
+        }
+    }
+}
+
 /// Heuristic signatures — list of substrings to look for in process names.
 pub fn workload_signatures() -> Vec<(WorkloadType, Vec<&'static str>)> {
     vec![
@@ -178,8 +205,15 @@ pub struct UserProfile {
     session_start: Option<Instant>,
     /// Recent session history (last 200 sessions).
     session_history: VecDeque<AppSession>,
-    /// Classifiers
+    /// Classifiers — retained for serde/persisted-shape compatibility even
+    /// though hot-path queries now use [`Self::workload_sig_acs`].
+    #[allow(dead_code)]
     workload_sigs: Vec<(WorkloadType, Vec<&'static str>)>,
+    /// Sprint patch (2026-06-05) — S6. Pre-built AhoCorasick matchers,
+    /// one per signature group. Replaces the O(P) per-name `contains` walk
+    /// in `process_relevance` and `detect_workload` with one AC pass. Built
+    /// once at construction so the hot path pays zero alloc.
+    workload_sig_acs: Vec<(WorkloadType, aho_corasick::AhoCorasick)>,
     /// Timestamp of last observe() call, for computing secs_since_last_use.
     last_observe: Option<Instant>,
 }
@@ -193,6 +227,20 @@ impl UserProfile {
             m
         });
 
+        let workload_sigs = workload_signatures();
+        // Sprint patch (2026-06-05) — S6. Pre-build the AhoCorasick matcher
+        // per signature group so `process_relevance` / `detect_workload`
+        // become one O(N) walk per name rather than O(N×P) substring scan.
+        let workload_sig_acs: Vec<(WorkloadType, aho_corasick::AhoCorasick)> = workload_sigs
+            .iter()
+            .map(|(wl, pats)| {
+                let ac = aho_corasick::AhoCorasick::builder()
+                    .match_kind(aho_corasick::MatchKind::Standard)
+                    .build(pats)
+                    .expect("workload_signatures contains valid literals");
+                (*wl, ac)
+            })
+            .collect();
         Self {
             app_stats: HashMap::new(),
             hour_model,
@@ -200,7 +248,8 @@ impl UserProfile {
             current_foreground: None,
             session_start: None,
             session_history: VecDeque::new(),
-            workload_sigs: workload_signatures(),
+            workload_sigs,
+            workload_sig_acs,
             last_observe: None,
         }
     }
@@ -354,10 +403,11 @@ impl UserProfile {
 
     /// Confidence (0.0–1.0) that a process is needed for the current workload.
     pub fn process_relevance(&self, process_name: &str) -> f32 {
-        // Check if process directly matches current workload signature
+        // Sprint patch (2026-06-05) — S6. Pre-built AC replaces the
+        // O(P) substring scan over `patterns`.
         let current = self.current_workload;
-        for (workload, patterns) in &self.workload_sigs {
-            if *workload == current && patterns.iter().any(|p| process_name.contains(p)) {
+        for (workload, ac) in &self.workload_sig_acs {
+            if *workload == current && ac.is_match(process_name) {
                 return 1.0; // Directly relevant
             }
         }
@@ -381,9 +431,11 @@ impl UserProfile {
     fn detect_workload(&self, foreground: Option<&str>, all_procs: &[&str]) -> WorkloadType {
         let mut scores: HashMap<WorkloadType, u32> = HashMap::new();
 
+        // Sprint patch (2026-06-05) — S6. Pre-built AC walk replaces the
+        // O(N×P) substring scan that previously fired per name × pattern.
         let check_target = |name: &str| {
-            for (workload, patterns) in &self.workload_sigs {
-                if patterns.iter().any(|p| name.contains(p)) {
+            for (workload, ac) in &self.workload_sig_acs {
+                if ac.is_match(name) {
                     return Some(*workload);
                 }
             }
@@ -486,12 +538,12 @@ impl UserProfile {
             .map(|hp| {
                 hp.iter()
                     .map(|(wl, count)| {
-                        // Use serde_json to get the kebab-case name, falling back to Debug.
-                        let key = serde_json::to_value(wl)
-                            .ok()
-                            .and_then(|v| v.as_str().map(|s| s.to_string()))
-                            .unwrap_or_else(|| format!("{:?}", wl).to_lowercase());
-                        (key, *count)
+                        // Sprint patch (2026-06-05): use canonical kebab — round-trips
+                        // with `workload_type_from_str`. The legacy
+                        // `format!("{:?}", wl).to_lowercase()` fallback collapsed
+                        // "VideoCall" → "videocall" which workload_type_from_str
+                        // could not parse.
+                        (wl.as_kebab().to_string(), *count)
                     })
                     .collect()
             })
@@ -532,6 +584,29 @@ impl Default for UserProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sprint patch (2026-06-05): `as_kebab` must round-trip with
+    /// `workload_type_from_str`. The legacy `format!("{:?}", v).to_lowercase()`
+    /// shape silently dropped multi-word variants because it collapsed
+    /// "VideoCall" → "videocall" which the parser does not accept.
+    #[test]
+    fn as_kebab_round_trips_with_workload_type_from_str() {
+        for wt in [
+            WorkloadType::Coding,
+            WorkloadType::VideoCall,
+            WorkloadType::MediaPlayback,
+            WorkloadType::VideoEdit,
+            WorkloadType::OfficeWork,
+            WorkloadType::CommandLine,
+            WorkloadType::Idle,
+            WorkloadType::General,
+        ] {
+            let s = wt.as_kebab();
+            let parsed = workload_type_from_str(s)
+                .unwrap_or_else(|| panic!("workload_type_from_str({s:?}) must accept kebab"));
+            assert_eq!(parsed, wt, "as_kebab → from_str round trip for {wt:?}");
+        }
+    }
 
     #[test]
     fn workload_type_roundtrip_serde() {

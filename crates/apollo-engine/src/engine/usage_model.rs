@@ -289,9 +289,14 @@ impl UsageModel {
         // like "helper", not exact OS-daemon identities.
         candidates.retain(|e| !crate::engine::safety::is_protected_name(&e.name));
         // Build AC once across all candidates (substring match, case-sensitive
-        // to mirror `e.name.contains(p)` semantics). Mirrors commit e6968a1
-        // policy_protected fast-path pattern.
-        let never_interactive_ac = aho_corasick::AhoCorasick::new(never_interactive.iter().copied()).ok();
+        // to mirror `e.name.contains(p)` semantics). Sprint patch (2026-06-05):
+        // route through the content-hash cache so identical pattern bundles
+        // share one automaton across calls.
+        let never_interactive_vec: Vec<&str> = never_interactive.iter().copied().collect();
+        let never_interactive_ac = crate::engine::ac_cache::get_or_build(
+            &never_interactive_vec,
+            aho_corasick::MatchKind::Standard,
+        );
         candidates.retain(|e| {
             never_interactive_ac
                 .as_ref()
@@ -309,8 +314,12 @@ impl UsageModel {
         let mut promotions: Vec<(String, String)> = Vec::new();
 
         // Interactive promotions.
-        let existing_interactive_ac =
-            aho_corasick::AhoCorasick::new(existing_interactive.iter().map(|s| s.as_str())).ok();
+        let existing_interactive_vec: Vec<&str> =
+            existing_interactive.iter().map(|s| s.as_str()).collect();
+        let existing_interactive_ac = crate::engine::ac_cache::get_or_build(
+            &existing_interactive_vec,
+            aho_corasick::MatchKind::Standard,
+        );
         let mut interactive = candidates.clone();
         // BUG 22 fix: unwrap on partial_cmp could panic if NaN.
         interactive.sort_by(|a, b| {
@@ -342,8 +351,12 @@ impl UsageModel {
         }
 
         // Noise promotions.
-        let existing_noise_ac =
-            aho_corasick::AhoCorasick::new(existing_noise.iter().map(|s| s.as_str())).ok();
+        let existing_noise_vec: Vec<&str> =
+            existing_noise.iter().map(|s| s.as_str()).collect();
+        let existing_noise_ac = crate::engine::ac_cache::get_or_build(
+            &existing_noise_vec,
+            aho_corasick::MatchKind::Standard,
+        );
         let protected_candidates = candidates.clone();
         let mut noise = candidates;
         // BUG 23 fix: unwrap on partial_cmp could panic if NaN.
@@ -384,8 +397,12 @@ impl UsageModel {
         //
         // Thresholds are intentionally high: interactive_ema > 0.55 means the
         // app was observed as the foreground app in the majority of recent cycles.
-        let existing_protected_ac =
-            aho_corasick::AhoCorasick::new(existing_protected.iter().map(|s| s.as_str())).ok();
+        let existing_protected_vec: Vec<&str> =
+            existing_protected.iter().map(|s| s.as_str()).collect();
+        let existing_protected_ac = crate::engine::ac_cache::get_or_build(
+            &existing_protected_vec,
+            aho_corasick::MatchKind::Standard,
+        );
         for e in &protected_candidates {
             let protected_hit = existing_protected_ac
                 .as_ref()

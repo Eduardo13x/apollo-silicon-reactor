@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod dashboard;
+mod whisper;
 
 use anyhow::Context;
 use apollo_engine::engine::llm::LearnedPolicy;
@@ -92,6 +93,13 @@ enum Commands {
     Version,
     /// Show circuit breaker and degradation health summary
     Health,
+    /// Sprint patch (2026-06-05) — S5. Single-glyph status snippet read
+    /// directly from `runtime_metrics.json`. No daemon RPC; safe to embed
+    /// in shell prompts. Silent on stale (>5s) snapshots.
+    Whisper {
+        #[arg(long)]
+        always_on: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -611,8 +619,16 @@ fn main() -> anyhow::Result<()> {
         return handle_dashboard();
     }
 
+    // Sprint patch (2026-06-05): the `whisper` snippet bypasses the daemon
+    // socket entirely — it reads `runtime_metrics.json` directly so the
+    // shell prompt never blocks on a stalled daemon.
+    if let Commands::Whisper { always_on } = cli.command {
+        return whisper::run(always_on);
+    }
+
     let response = match cli.command {
         Commands::Dashboard => unreachable!(),
+        Commands::Whisper { .. } => unreachable!(),
         Commands::Status => send_request(DaemonRequest::GetStatus),
         Commands::Metrics => send_request(DaemonRequest::GetMetrics),
         Commands::TopBlockers => send_request(DaemonRequest::GetTopBlockers),

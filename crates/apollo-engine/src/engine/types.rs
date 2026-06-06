@@ -2000,6 +2000,27 @@ pub struct RuntimeMetrics {
     /// [`crate::engine::lse_counters::LockFreeMetrics::companion_fg_cache_hits_total`].
     #[serde(default)]
     pub companion_fg_cache_hits_total: u64,
+
+    // ── Sprint follow-up (2026-06-05) — Silent-telemetry-death fix
+    // (HIGH #1 / HIGH #2). The five LSE counters below were added to
+    // `LockFreeMetrics` + `MetricsSnapshot` + `inc_*()` helpers in the
+    // parent sprint but never mirrored into `RuntimeMetrics`, which is
+    // exactly the Sprint 9 `4b13a39` regression class. Without the
+    // following fields, `sync_from_lockfree` cannot fan them out into
+    // `runtime_metrics.json`, so dashboards never see the values.
+    //
+    // Each counter's producer + dormant-state notes live on the LSE
+    // field doc-comments; see `lse_counters.rs`.
+    #[serde(default)]
+    pub ac_cache_evictions_total: u64,
+    #[serde(default)]
+    pub mediator_thread_policy_total: u64,
+    #[serde(default)]
+    pub pid_recycle_blocks_total: u64,
+    #[serde(default)]
+    pub policy_scorer_uncertainty_saturated_total: u64,
+    #[serde(default)]
+    pub effect_decay_detected_total: u64,
 }
 
 impl RuntimeMetrics {

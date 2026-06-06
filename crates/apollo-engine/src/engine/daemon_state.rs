@@ -258,6 +258,19 @@ impl MetricsState {
         self.metrics.mediator_postcondition_violation_total =
             lf.mediator_postcondition_violation_total;
 
+        // Sprint follow-up (2026-06-05) — Silent-telemetry-death fix.
+        // Mirror the five LSE counters added in this sprint into
+        // `RuntimeMetrics` so they reach `runtime_metrics.json`.
+        // Without these five lines the counters increment forever but
+        // never surface (the Sprint 9 `4b13a39` regression class). See
+        // RuntimeMetrics field doc-comments for producer notes.
+        self.metrics.ac_cache_evictions_total = lf.ac_cache_evictions_total;
+        self.metrics.mediator_thread_policy_total = lf.mediator_thread_policy_total;
+        self.metrics.pid_recycle_blocks_total = lf.pid_recycle_blocks_total;
+        self.metrics.policy_scorer_uncertainty_saturated_total =
+            lf.policy_scorer_uncertainty_saturated_total;
+        self.metrics.effect_decay_detected_total = lf.effect_decay_detected_total;
+
         // Sprint 12 Convergence #4 (2026-05-17). Producer is the daemon
         // main-loop convergence probe (after the cycle's
         // run_signal_tick, when both lse counters are fresh and the

@@ -278,6 +278,12 @@ pub fn execute_actions(
     frozen: &mut HashSet<u32>,
     learned_protected: &[String],
     learned_interactive: &[String],
+    // TODO(S4 follow-up 2026-06-05): cutover this signature to
+    // `Option<Arc<Mutex<MachQoSManager>>>` so `ThreadPolicyEffector` can
+    // own the lock arc directly via the mediator chokepoint, closing the
+    // remaining `mgr.set_thread_qos` raw call site at line ~947. Touching
+    // this signature ripples to main.rs / daemon_dispatch_tick.rs /
+    // learning_tick.rs — explicitly deferred to keep the patch additive.
     mut qos_mgr: Option<&mut MachQoSManager>,
     dry_run: bool,
     memory_pressure: f64,
@@ -438,7 +444,16 @@ pub fn execute_actions(
                         return Ok(());
                     }
                     // Validate PID identity (name-only for boost — no start-time available).
+                    // Sprint patch (2026-06-05) — S8 (SHRUNK): bump
+                    // `pid_recycle_blocks_total` so dashboards can verify
+                    // how often the name-only verify rejects a recycled
+                    // BoostProcess target. The full S8 (add start_sec to
+                    // BoostProcess/SetThreadQoS variants) is deferred —
+                    // every action emitter would have to populate the new
+                    // fields and that is more scope than a single-sprint
+                    // patch can safely land.
                     if !ProcessIdentity::verify(*pid, Some(name), 0, 0) {
+                        crate::engine::lse_counters::LSE_COUNTERS.inc_pid_recycle_block();
                         block_reason = Some(BlockReason::PidRecycled);
                         return Ok(());
                     }
@@ -944,7 +959,12 @@ pub fn execute_actions(
                         block_reason = Some(BlockReason::ActiveCoalition);
                         return Ok(());
                     }
+                    // Sprint patch (2026-06-05) — S8 (SHRUNK): bump
+                    // `pid_recycle_blocks_total` LSE counter at the SetThreadQoS
+                    // verify call site. See BoostProcess sibling above for the
+                    // full design + deferral rationale.
                     if !ProcessIdentity::verify(*pid, Some(name), 0, 0) {
+                        crate::engine::lse_counters::LSE_COUNTERS.inc_pid_recycle_block();
                         return Ok(());
                     }
                     let thread_tier = match tier.as_str() {

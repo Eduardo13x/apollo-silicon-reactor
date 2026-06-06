@@ -521,6 +521,44 @@ pub struct LockFreeMetrics {
     /// chokepoint memoize keyed on observable mutation witness
     /// (`CompanionGraph::total_cycles + anchor_count`), not wall clock.
     pub companion_fg_cache_hits_total: AtomicU64,
+
+    /// Sprint patch (2026-06-05). Number of AhoCorasick automata evicted
+    /// from the shared content-hash cache (LRU cap 32). Producer =
+    /// `crate::engine::ac_cache::get_or_build`. A persistently non-zero
+    /// rate indicates the working set exceeds the cap and the cache is
+    /// thrashing — surface to dashboards before bumping `CAP`.
+    pub ac_cache_evictions_total: AtomicU64,
+
+    /// Sprint patch (2026-06-05). Switch-3 follow-up: per-thread Mach
+    /// policy dispatches that flowed through `ThreadPolicyEffector`
+    /// rather than direct `mgr.set_thread_qos` calls. Drives the same
+    /// "is the mediator actually receiving traffic?" verification used
+    /// by the Switch-1/4/5 counters.
+    pub mediator_thread_policy_total: AtomicU64,
+
+    /// Sprint patch (2026-06-05). S8 — `ProcessIdentity::verify` rejected a
+    /// BoostProcess / SetThreadQoS dispatch because the cached name no longer
+    /// matches the live `proc_pidpath`. **NOTE (follow-up #1, MED severity):**
+    /// the producer call sites currently pass `start_sec=0, start_usec=0` to
+    /// `verify`, which means the underlying check is *name-only* (see
+    /// `matches_legacy_start_sec_zero_uses_name_only`). This counter therefore
+    /// conflates "true PID recycle" with "process renamed `argv[0]`" — a
+    /// strict superset of the ABA signal. Once the SHRUNK part of S8 lands
+    /// (BoostProcess + SetThreadQoS gain `start_sec` fields), the counter
+    /// becomes a pure ABA signal; until then, treat it as a
+    /// "name-mismatch / identity-drift" indicator.
+    pub pid_recycle_blocks_total: AtomicU64,
+
+    /// Sprint patch (2026-06-05). S11 — PolicyScorer composite uncertainty
+    /// was clamped by `uncertainty_saturation`. Non-zero is the observable
+    /// the Apr-22 backlog (Humble Mode bomb) demanded; ratio against cycle
+    /// count tells the operator whether saturation is rare or chronic.
+    pub policy_scorer_uncertainty_saturated_total: AtomicU64,
+
+    /// Sprint patch (2026-06-05). S10 — Stuck-effect decay watchdog
+    /// observed a post-settle re-read that disagrees with the applied
+    /// value. Telemetry-only; no scorer feedback in this iteration.
+    pub effect_decay_detected_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -664,6 +702,11 @@ impl LockFreeMetrics {
             companion_affinity_alignments_total: AtomicU64::new(0),
             companion_observe_router_skips_total: AtomicU64::new(0),
             companion_fg_cache_hits_total: AtomicU64::new(0),
+            ac_cache_evictions_total: AtomicU64::new(0),
+            mediator_thread_policy_total: AtomicU64::new(0),
+            pid_recycle_blocks_total: AtomicU64::new(0),
+            policy_scorer_uncertainty_saturated_total: AtomicU64::new(0),
+            effect_decay_detected_total: AtomicU64::new(0),
         }
     }
 
@@ -1134,6 +1177,17 @@ impl LockFreeMetrics {
             companion_fg_cache_hits_total: self
                 .companion_fg_cache_hits_total
                 .load(Ordering::Relaxed),
+            ac_cache_evictions_total: self.ac_cache_evictions_total.load(Ordering::Relaxed),
+            mediator_thread_policy_total: self
+                .mediator_thread_policy_total
+                .load(Ordering::Relaxed),
+            pid_recycle_blocks_total: self.pid_recycle_blocks_total.load(Ordering::Relaxed),
+            policy_scorer_uncertainty_saturated_total: self
+                .policy_scorer_uncertainty_saturated_total
+                .load(Ordering::Relaxed),
+            effect_decay_detected_total: self
+                .effect_decay_detected_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1409,6 +1463,46 @@ impl LockFreeMetrics {
         self.companion_fg_cache_hits_total
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Sprint patch (2026-06-05). S1 — AC content-hash cache evicted one
+    /// entry to make room for an incoming pattern set.
+    #[inline(always)]
+    pub fn inc_ac_cache_eviction(&self) {
+        self.ac_cache_evictions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sprint patch (2026-06-05). S3 — ThreadPolicyEffector applied a
+    /// per-thread QoS effect via the mediator chokepoint.
+    #[inline(always)]
+    pub fn inc_mediator_thread_policy(&self) {
+        self.mediator_thread_policy_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sprint patch (2026-06-05). S8 — PID-recycling guard refused an
+    /// action because `ProcessIdentity::verify` reported a mismatch.
+    #[inline(always)]
+    pub fn inc_pid_recycle_block(&self) {
+        self.pid_recycle_blocks_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sprint patch (2026-06-05). S11 — PolicyScorer aggregated raw
+    /// uncertainty exceeded `uncertainty_saturation` and was clamped.
+    #[inline(always)]
+    pub fn inc_policy_scorer_uncertainty_saturated(&self) {
+        self.policy_scorer_uncertainty_saturated_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sprint patch (2026-06-05). S10 — stuck-effect decay watchdog
+    /// detected a post-settle re-read that disagrees with the requested
+    /// value. Telemetry-only; no scorer feedback in this iteration.
+    #[inline(always)]
+    pub fn inc_effect_decay_detected(&self) {
+        self.effect_decay_detected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // Safe to share across threads — all fields are atomic.
@@ -1569,6 +1663,17 @@ pub struct MetricsSnapshot {
     /// [`LockFreeMetrics::companion_fg_cache_hits_total`] for the
     /// invalidation contract.
     pub companion_fg_cache_hits_total: u64,
+
+    /// Sprint patch (2026-06-05). S1 AC content-hash cache evictions.
+    pub ac_cache_evictions_total: u64,
+    /// Sprint patch (2026-06-05). S3 ThreadPolicyEffector dispatch count.
+    pub mediator_thread_policy_total: u64,
+    /// Sprint patch (2026-06-05). S8 PID-recycle blocks.
+    pub pid_recycle_blocks_total: u64,
+    /// Sprint patch (2026-06-05). S11 PolicyScorer uncertainty clamps.
+    pub policy_scorer_uncertainty_saturated_total: u64,
+    /// Sprint patch (2026-06-05). S10 stuck-effect decay detections.
+    pub effect_decay_detected_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

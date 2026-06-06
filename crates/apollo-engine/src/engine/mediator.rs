@@ -180,6 +180,13 @@ pub struct Receipt {
     pub no_op: bool,
     /// Microseconds spent inside the underlying syscall.
     pub syscall_us: u64,
+    /// Sprint patch (2026-06-05) — S9. Number of underlying unit-effects the
+    /// effector applied. `0` for a full no-op; `1` for atomic syscall effectors
+    /// (Signal/Sysctl/MachPolicy/Jetsam); ≥1 for batched effectors (Purgeable
+    /// reports number of regions touched). `#[serde(default)]` keeps older
+    /// journal lines deserialisable so the field is additive in production.
+    #[serde(default)]
+    pub applied_count: u32,
 }
 
 /// Effect-relevant subset of observable state captured at one instant.
@@ -269,6 +276,9 @@ impl Effector for SignalEffector {
         // PID was already dead pre-syscall and remains so post.
         let no_op = matches!(before.pid_alive, Some(false))
             && matches!(after.pid_alive, Some(false));
+        // S9: SignalEffector dispatches exactly one libc::kill on success;
+        // 0 when the syscall short-circuited to a dead-PID no_op.
+        let applied_count = if no_op { 0 } else { 1 };
         Ok(Receipt {
             timestamp_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -278,6 +288,7 @@ impl Effector for SignalEffector {
             after,
             no_op,
             syscall_us,
+            applied_count,
         })
     }
 }
@@ -360,6 +371,9 @@ impl Effector for SysctlEffector {
             (Some(b), Some(a)) => b.equals(a),
             _ => false,
         };
+        // S9: 0 when the kernel silently rejected the write (no_op), 1 when
+        // the value moved.
+        let applied_count = if no_op { 0 } else { 1 };
         Ok(Receipt {
             timestamp_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -369,6 +383,7 @@ impl Effector for SysctlEffector {
             after,
             no_op,
             syscall_us,
+            applied_count,
         })
     }
 }
@@ -436,6 +451,8 @@ impl Effector for JetsamEffector {
         };
         // no_op: jetsam priority value unchanged after the policy apply.
         let no_op = matches!((before_priority, after_priority), (Some(a), Some(b)) if a == b);
+        // S9: 0 when no_op (kernel kept the existing tier), 1 otherwise.
+        let applied_count = if no_op { 0 } else { 1 };
         Ok(Receipt {
             timestamp_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -445,6 +462,7 @@ impl Effector for JetsamEffector {
             after,
             no_op,
             syscall_us,
+            applied_count,
         })
     }
 }
@@ -520,7 +538,76 @@ impl Effector for MachPolicyEffector {
             after: snapshot,
             no_op: false,
             syscall_us,
+            // S9: MachPolicy issues exactly one task_policy_set syscall per
+            // dispatch — Receipt fidelity limitations doc note still applies,
+            // but the dispatch count is unambiguously 1.
+            applied_count: 1,
         })
+    }
+}
+
+/// Sprint patch (2026-06-05) — S3 (SHRUNK).
+///
+/// Per-thread Mach QoS effector. The full design called for a new `Effect`
+/// variant (`SetThreadPolicy { pid, start_sec, thread_index, tier,
+/// affinity_tag }`) plus rewiring the `RootAction::SetThreadQoS` handler in
+/// `execute_actions.rs:947` to flow through this effector. To keep the
+/// patch additive (no enum variant churn, no producer rewrites this
+/// iteration) the effector accepts a tightly-scoped raw API instead — the
+/// downstream Effect variant + decide_actions plumbing can land in a
+/// follow-up commit without disturbing the typed surface.
+///
+/// Counter: `mediator_thread_policy_total` (`LSE_COUNTERS`) bumps only on
+/// successful dispatch (see follow-up #3, MED severity below) so the cutover
+/// observability stays meaningful: counter = "successful mediated thread
+/// policies", not "attempted dispatches". If a future revision needs to
+/// distinguish attempts vs failures, add a parallel
+/// `mediator_thread_policy_failed_total` counter rather than mixing both
+/// signals in one number.
+///
+/// Constructor is `pub(crate)` (follow-up #3, safety finding) so callers
+/// cannot create rogue effector instances outside the central dispatch
+/// path; the complete-mediation oracle stays intact.
+pub struct ThreadPolicyEffector {
+    qos: std::sync::Arc<std::sync::Mutex<crate::engine::mach_qos::MachQoSManager>>,
+}
+
+impl ThreadPolicyEffector {
+    #[allow(dead_code)] // S3 SHRUNK foundation; consumers land in S4 follow-up
+    pub(crate) fn new(
+        qos: std::sync::Arc<std::sync::Mutex<crate::engine::mach_qos::MachQoSManager>>,
+    ) -> Self {
+        Self { qos }
+    }
+
+    /// Apply a per-thread QoS effect against the wrapped manager.
+    /// Returns `(ok, syscall_us, applied_count)`.
+    ///
+    /// **Counter semantics (follow-up #3):** the LSE counter bumps only on
+    /// `ok == true`. A failed `set_thread_qos` returns
+    /// `(false, syscall_us, 0)` without incrementing the dispatch counter,
+    /// so dashboards never confuse attempts with successful side effects.
+    pub fn apply_raw(
+        &self,
+        pid: u32,
+        thread_index: u32,
+        tier: crate::engine::mach_qos::ThreadTier,
+        affinity_tag: Option<u32>,
+    ) -> (bool, u64, u32) {
+        let t0 = std::time::Instant::now();
+        let mgr = self.qos.lock().unwrap_or_else(|e| e.into_inner());
+        let ok = mgr.set_thread_qos(pid, thread_index, tier);
+        if let Some(tag) = affinity_tag {
+            if tag != 0 {
+                let _ = mgr.set_thread_affinity_tag(pid, thread_index, tag);
+            }
+        }
+        let syscall_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        drop(mgr);
+        if ok {
+            crate::engine::lse_counters::LSE_COUNTERS.inc_mediator_thread_policy();
+        }
+        (ok, syscall_us, if ok { 1 } else { 0 })
     }
 }
 
@@ -575,6 +662,9 @@ impl Effector for PurgeableEffector {
             after: ReceiptSnapshot::default(),
             no_op,
             syscall_us,
+            // S9: batched effector — number of purgeable regions visited /
+            // madvise'd in the inner walker. 0 ⇔ no_op (no regions found).
+            applied_count: purged_regions as u32,
         })
     }
 }
@@ -617,6 +707,10 @@ impl Effector for FileWriteEffector {
             after: ReceiptSnapshot::default(),
             no_op: byte_len == 0,
             syscall_us: 0,
+            // S9: stub effector — phase-F placeholder reports the byte_len > 0
+            // intent count. Real production wiring will refine this to the
+            // actual bytes-written (or 0 on empty/no-op).
+            applied_count: if byte_len == 0 { 0 } else { 1 },
         })
     }
 }
@@ -799,6 +893,7 @@ mod tests {
                 after: ReceiptSnapshot::default(),
                 no_op: self.no_op,
                 syscall_us: 0,
+                applied_count: if self.no_op { 0 } else { 1 },
             })
         }
     }

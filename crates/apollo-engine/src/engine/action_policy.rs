@@ -140,6 +140,14 @@ pub struct PolicyScore {
     /// features), but in the Sprint 11 feature set composite is empirically
     /// confined to roughly [−3.0, +3.5].
     pub composite: f64,
+    /// Sprint patch (2026-06-05) — S11. Raw (pre-clamp) RSS uncertainty.
+    /// Equals `total_uncertainty` when no clamp fired; strictly greater
+    /// otherwise. Operators reading this alongside the new LSE counter
+    /// `policy_scorer_uncertainty_saturated_total` can quantify the gap
+    /// each scorer call introduced (was the clamp barely engaging or did
+    /// it absorb a 3× compositional bomb?). Defaults to 0.0 so any future
+    /// serde load of an old `PolicyScore` won't break.
+    pub raw_uncertainty: f64,
 }
 
 /// Composable decision surface. Construct via [`PolicyScorer::builder`].
@@ -206,7 +214,17 @@ impl PolicyScorer {
             per_feature.push((f.name(), c));
         }
 
-        let total_uncertainty = unc_ss.sqrt().min(self.uncertainty_saturation);
+        // Sprint patch (2026-06-05) — S11 telemetry. Compute the raw RSS
+        // BEFORE clamping so the Apr-22 NotebookLM concern (3-feature × 1.0
+        // bomb invisible) is observable. The LSE counter only bumps when
+        // the clamp actually fired — non-zero rate means at least one
+        // feature is reporting outsized uncertainty for some action class.
+        let raw_uncertainty = unc_ss.sqrt();
+        let total_uncertainty = raw_uncertainty.min(self.uncertainty_saturation);
+        if raw_uncertainty > self.uncertainty_saturation {
+            crate::engine::lse_counters::LSE_COUNTERS
+                .inc_policy_scorer_uncertainty_saturated();
+        }
 
         let net =
             total_benefit - self.lambda_cost * total_cost - self.lambda_unc * total_uncertainty;
@@ -234,6 +252,7 @@ impl PolicyScorer {
             reason,
             per_feature,
             composite: net,
+            raw_uncertainty,
         }
     }
 }
@@ -548,6 +567,73 @@ mod tests {
             reason: "test".into(),
             decision_reason: DecisionReason::PressureContext,
         }
+    }
+
+    /// Sprint patch (2026-06-05) — S11 telemetry: a feature reporting
+    /// outsized uncertainty causes the LSE counter to bump and the
+    /// `raw_uncertainty` field to exceed the saturated total.
+    struct FixedUncFeature(f64);
+    impl PolicyFeature for FixedUncFeature {
+        fn name(&self) -> &'static str {
+            "FixedUnc"
+        }
+        fn contribute(&self, _action: &RootAction, _ctx: &ActionContext) -> Contribution {
+            Contribution {
+                benefit: 0.0,
+                cost: 0.0,
+                uncertainty: self.0,
+                hard_veto: false,
+            }
+        }
+    }
+
+    #[test]
+    fn saturated_clamp_bumps_counter_and_preserves_raw() {
+        use std::sync::atomic::Ordering;
+        let pre = crate::engine::lse_counters::LSE_COUNTERS
+            .policy_scorer_uncertainty_saturated_total
+            .load(Ordering::Relaxed);
+        // Uncertainty 2.0 > saturation 1.5 → clamp fires + counter bumps.
+        let scorer = PolicyScorer::builder()
+            .feature(FixedUncFeature(2.0))
+            .uncertainty_saturation(1.5)
+            .build();
+        let score = scorer.score(&freeze(1), &base_ctx());
+        let post = crate::engine::lse_counters::LSE_COUNTERS
+            .policy_scorer_uncertainty_saturated_total
+            .load(Ordering::Relaxed);
+        assert!(post > pre, "saturated clamp must bump the counter");
+        assert!(
+            score.raw_uncertainty > score.total_uncertainty,
+            "raw must exceed clamped: raw={} clamp={}",
+            score.raw_uncertainty,
+            score.total_uncertainty
+        );
+        assert!(
+            (score.total_uncertainty - 1.5).abs() < 1e-9,
+            "clamp == saturation ceiling"
+        );
+    }
+
+    #[test]
+    fn unsaturated_does_not_bump_counter() {
+        use std::sync::atomic::Ordering;
+        let pre = crate::engine::lse_counters::LSE_COUNTERS
+            .policy_scorer_uncertainty_saturated_total
+            .load(Ordering::Relaxed);
+        let scorer = PolicyScorer::builder()
+            .feature(FixedUncFeature(0.5))
+            .uncertainty_saturation(1.5)
+            .build();
+        let score = scorer.score(&freeze(1), &base_ctx());
+        let post = crate::engine::lse_counters::LSE_COUNTERS
+            .policy_scorer_uncertainty_saturated_total
+            .load(Ordering::Relaxed);
+        assert_eq!(pre, post, "unsaturated must NOT bump counter");
+        assert!(
+            (score.raw_uncertainty - score.total_uncertainty).abs() < 1e-9,
+            "raw == clamped when below saturation"
+        );
     }
 
     #[test]

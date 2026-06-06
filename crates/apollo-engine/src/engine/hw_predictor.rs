@@ -275,22 +275,34 @@ pub fn measure_core_throughput() -> u64 {
 ///
 /// Usa CTR_EL0 para calibrar el buffer al tamaño real del LLC,
 /// en lugar de un valor hardcoded. Más preciso en cualquier chip M-series.
+/// 16 MB pointer-chase buffer for [`measure_cache_latency`]. Allocated once
+/// per daemon lifetime so the cache-latency probe doesn't churn ~16 MB on
+/// every call. Stride at construction time is `dcache_line_bytes()` (64 B on
+/// every Apple Silicon part), which is also stable for the daemon lifetime.
+pub(crate) static CHASE_BUF: OnceLock<Box<[u32]>> = OnceLock::new();
+
+const CACHE_LATENCY_BUF_SIZE: usize = 16 * 1024 * 1024;
+
 pub fn measure_cache_latency() -> u64 {
     let stride = dcache_line_bytes(); // 64B en todo Apple Silicon
 
     // Buffer debe exceder el L2 unificado para forzar accesos al LLC/RAM.
     // Apple Silicon M1: L2=12MB (P-cluster), usamos 16 MB para garantizar misses.
-    const BUF_SIZE: usize = 16 * 1024 * 1024;
+    const BUF_SIZE: usize = CACHE_LATENCY_BUF_SIZE;
     let steps = BUF_SIZE / stride;
 
-    let mut buf = vec![0u32; BUF_SIZE / 4];
-
-    // Pointer-chase: cada elemento apunta al siguiente en orden pseudo-aleatorio
-    // usando stride de línea de caché para maximizar misses.
-    for i in 0..steps {
-        let next = (i + 1) % steps;
-        buf[i * stride / 4] = (next * stride / 4) as u32;
-    }
+    // Sprint patch (2026-06-05): one-time alloc + chase-link initialisation.
+    // The chain layout is a function of `stride` and `BUF_SIZE` only — both
+    // stable for the daemon lifetime — so re-initialising every call wastes
+    // O(N) writes plus 16 MB of allocator churn per probe.
+    let buf: &[u32] = CHASE_BUF.get_or_init(|| {
+        let mut v = vec![0u32; BUF_SIZE / 4];
+        for i in 0..steps {
+            let next = (i + 1) % steps;
+            v[i * stride / 4] = (next * stride / 4) as u32;
+        }
+        v.into_boxed_slice()
+    });
 
     let freq = timer_freq();
     let t0 = read_vct();
@@ -635,6 +647,18 @@ impl HwPressureSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sprint patch (2026-06-05): the cache-latency probe must allocate
+    /// exactly once across the daemon lifetime — the 16 MB pointer-chase
+    /// buffer is recycled via [`CHASE_BUF`].
+    #[test]
+    fn cache_latency_buf_stable_address() {
+        let _ = measure_cache_latency();
+        let a = CHASE_BUF.get().expect("buf init on first call").as_ptr();
+        let _ = measure_cache_latency();
+        let b = CHASE_BUF.get().expect("buf still live").as_ptr();
+        assert_eq!(a, b, "chase buffer must not be reallocated per call");
+    }
 
     // ── HwPressure enum ordering ──────────────────────────────────────────────
 

@@ -4137,7 +4137,11 @@ fn main() -> anyhow::Result<()> {
                     m.metrics.current_workload = if media_override {
                         "mediaplayback".to_string()
                     } else {
-                        format!("{:?}", ml_class.workload).to_lowercase()
+                        // Sprint patch (2026-06-05): canonical kebab (round-trips
+                        // with workload_type_from_str). Legacy `Debug.to_lowercase()`
+                        // collapsed "VideoCall" → "videocall" which the parser
+                        // could not recover.
+                        ml_class.workload.as_kebab().to_string()
                     };
                     m.metrics.ml_sources = ml_class.sources_summary();
                 }
@@ -4150,8 +4154,9 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or(0.0)
                     > 2.0
                 {
-                    let wl_str = format!("{:?}", ml_class.workload).to_lowercase();
-                    let gpu_hints = gpu_mgr.optimize_for_workload(&wl_str);
+                    // Sprint patch (2026-06-05): canonical kebab name.
+                    let wl_str = ml_class.workload.as_kebab();
+                    let gpu_hints = gpu_mgr.optimize_for_workload(wl_str);
                     if !gpu_hints.is_empty() && cycle_count.is_multiple_of(30) {
                         audit_log(&serde_json::json!({
                             "event": "gpu_workload_hint",
@@ -4171,7 +4176,8 @@ fn main() -> anyhow::Result<()> {
                     net_monitor: &network_monitor,
                     swap_trend: swap_forecast.swap_trend,
                     memory_pressure: snapshot.pressure.memory_pressure,
-                    workload: &format!("{:?}", ml_class.workload).to_lowercase(),
+                    // Sprint patch (2026-06-05): canonical kebab name.
+                    workload: ml_class.workload.as_kebab(),
                     on_battery: power_mgr.is_on_battery(),
                     is_root,
                 });
