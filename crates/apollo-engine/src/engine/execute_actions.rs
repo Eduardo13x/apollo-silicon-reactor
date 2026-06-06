@@ -278,13 +278,14 @@ pub fn execute_actions(
     frozen: &mut HashSet<u32>,
     learned_protected: &[String],
     learned_interactive: &[String],
-    // TODO(S4 follow-up 2026-06-05): cutover this signature to
-    // `Option<Arc<Mutex<MachQoSManager>>>` so `ThreadPolicyEffector` can
-    // own the lock arc directly via the mediator chokepoint, closing the
-    // remaining `mgr.set_thread_qos` raw call site at line ~947. Touching
-    // this signature ripples to main.rs / daemon_dispatch_tick.rs /
-    // learning_tick.rs — explicitly deferred to keep the patch additive.
-    mut qos_mgr: Option<&mut MachQoSManager>,
+    // S4 cutover (2026-06-06): shared ownership via Arc<Mutex<_>> so
+    // ThreadPolicyEffector / MachPolicyEffector can co-own the manager
+    // through the mediator chokepoint. The 4 internal mgr.* sites below
+    // lock under the short-guard discipline (CLAUDE.md "Mutex-guarded
+    // sections must be short; drop guards before any syscall" — the
+    // set_tier / set_thread_qos calls ARE the syscall, so each guard
+    // wraps exactly 1-2 FFI calls and drops immediately).
+    qos_mgr: Option<&std::sync::Arc<std::sync::Mutex<MachQoSManager>>>,
     dry_run: bool,
     memory_pressure: f64,
     thrashing_score: f64,
@@ -463,7 +464,9 @@ pub fn execute_actions(
                     if !dry_run {
                         if caps.can_taskpolicy {
                             // Phase 2: direct Mach syscalls (~50µs vs ~5ms fork/exec).
-                            if let Some(ref mut mgr) = qos_mgr {
+                            // S4 cutover: short-guard Mutex lock per CLAUDE.md doctrine.
+                            if let Some(arc) = qos_mgr.as_ref() {
+                                let mut mgr = arc.lock().unwrap_or_else(|e| e.into_inner());
                                 mgr.set_tier(
                                     *pid,
                                     crate::engine::mach_qos::SchedulingTier::Foreground,
@@ -473,6 +476,7 @@ pub fn execute_actions(
                                     LatencyTier::Interactive,
                                     ThroughputTier::High,
                                 );
+                                drop(mgr);
                             }
                             // Boost I/O tier to Interactive.
                             apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Interactive);
@@ -551,7 +555,9 @@ pub fn execute_actions(
                     if !dry_run {
                         if caps.can_taskpolicy {
                             // Phase 2: direct Mach syscalls for CPU tier routing.
-                            if let Some(ref mut mgr) = qos_mgr {
+                            // S4 cutover: short-guard Mutex lock.
+                            if let Some(arc) = qos_mgr.as_ref() {
+                                let mut mgr = arc.lock().unwrap_or_else(|e| e.into_inner());
                                 let sched_tier = if aggressive {
                                     crate::engine::mach_qos::SchedulingTier::Background
                                 // E-cores only
@@ -571,6 +577,7 @@ pub fn execute_actions(
                                     ThroughputTier::Default
                                 };
                                 mgr.set_latency_and_throughput(*pid, lat, thr);
+                                drop(mgr);
                             }
                             // Granular I/O tiering based on aggressiveness.
                             // apply_io_tier uses PRIO_DARWIN_BG which is
@@ -782,11 +789,15 @@ pub fn execute_actions(
                                     // Next cycle re-evaluates and may demote back.
                                     // [Ousterhout 2013 "Scheduling for Reduced Tail Latency" OSDI;
                                     //  iOS app resume — foreground pulse for fast working-set reload]
-                                    if let Some(ref mut mgr) = qos_mgr {
+                                    // S4 cutover: short-guard Mutex lock.
+                                    if let Some(arc) = qos_mgr.as_ref() {
+                                        let mut mgr =
+                                            arc.lock().unwrap_or_else(|e| e.into_inner());
                                         mgr.set_tier(
                                             *pid,
                                             crate::engine::mach_qos::SchedulingTier::Foreground,
                                         );
+                                        drop(mgr);
                                     }
                                 }
                                 // A5/D1 fix (round-3): previously we blanket-set
@@ -979,7 +990,10 @@ pub fn execute_actions(
                         _ => ThreadTier::Utility,
                     };
                     if !dry_run {
-                        if let Some(ref mut mgr) = qos_mgr {
+                        // S4 cutover: short-guard Mutex lock; the FFI calls
+                        // ARE the syscalls per CLAUDE.md doctrine.
+                        if let Some(arc) = qos_mgr.as_ref() {
+                            let mgr = arc.lock().unwrap_or_else(|e| e.into_inner());
                             if mgr.set_thread_qos(*pid, *thread_index, thread_tier) {
                                 out.thread_qos_applied += 1;
                             }
@@ -991,6 +1005,7 @@ pub fn execute_actions(
                                     let _ = mgr.set_thread_affinity_tag(*pid, *thread_index, *tag);
                                 }
                             }
+                            drop(mgr);
                         }
                     }
                 }

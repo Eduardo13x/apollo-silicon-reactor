@@ -3455,7 +3455,8 @@ fn main() -> anyhow::Result<()> {
                 // silent-telemetry-death `4b13a39`].
                 let _t_decide_start = Instant::now();
                 let decision = {
-                    let mut qos = state.mach_qos.lock_recover();
+                    // S4 cutover (2026-06-06): pass shared Arc to decision_stage.
+                    let qos_arc = state.mach_qos.clone();
                     let dram_bandwidth_pct = last_ioreport
                         .as_ref()
                         .map(|ir| ir.amc_bandwidth_pct)
@@ -3495,7 +3496,7 @@ fn main() -> anyhow::Result<()> {
                             latency_target,
                             reactor_weight,
                             overflow_thresholds,
-                            Some(&mut qos),
+                            Some(&qos_arc),
                             &policy,
                         )
                         .decision

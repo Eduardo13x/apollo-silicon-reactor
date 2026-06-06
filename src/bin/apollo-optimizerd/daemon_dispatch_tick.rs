@@ -293,7 +293,11 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             pg.learned_policy.interactive_patterns.clone(),
         )
     };
-    let mut qos = state.mach_qos.lock_recover();
+    // S4 cutover (2026-06-06): pass the Arc clone directly; effectors lock
+    // inside each call site. Drop the outer prelocked guard — the old
+    // pattern was OK while execute_actions took &mut MachQoSManager but
+    // would now hold the lock across the entire cycle.
+    let qos_arc = state.mach_qos.clone();
 
     let outcomes = if cb_is_open {
         // Circuit Open: only dispatch unfreeze (always safe).
@@ -312,7 +316,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             &mut frozen_set,
             &learned_protected,
             &learned_interactive,
-            Some(&mut qos),
+            Some(&qos_arc),
             dry_run,
             snapshot.pressure.memory_pressure,
             snapshot.pressure.thrashing_score,
@@ -328,7 +332,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             &mut frozen_set,
             &learned_protected,
             &learned_interactive,
-            Some(&mut qos),
+            Some(&qos_arc),
             dry_run,
             snapshot.pressure.memory_pressure,
             snapshot.pressure.thrashing_score,

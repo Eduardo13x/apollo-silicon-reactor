@@ -344,7 +344,9 @@ pub fn decide_actions(
     learned_interactive: &[String],
     learned_noise: &[String],
     thresholds: OverflowThresholds,
-    mut qos_mgr: Option<&mut crate::engine::mach_qos::MachQoSManager>,
+    // S4 cutover (2026-06-06): shared Arc<Mutex<_>> so the manager flows
+    // through both decide + execute without re-borrowing across stages.
+    qos_mgr: Option<&std::sync::Arc<std::sync::Mutex<crate::engine::mach_qos::MachQoSManager>>>,
     // Bayesian weights from OutcomeTracker.
     pattern_weights: &HashMap<String, PatternWeight>,
     // Tasa base de caídas de presión naturales (sin acción). Calibrada por
@@ -900,7 +902,12 @@ pub fn decide_actions(
     // 4) Phase 1: Thread-level scheduling for multi-threaded processes.
     // For non-interactive, non-critical processes using >15% CPU with multiple threads,
     // route hot threads to P-cores and cold threads to E-cores.
-    if let Some(ref mut mgr) = qos_mgr {
+    // S4 cutover: lock once at the head of this read-mostly block (enumerate_threads
+    // + analyze_threads are non-mutating queries on the shared MachQoSManager).
+    // Guard drops at the close of the block (line ~1095).
+    if let Some(arc) = qos_mgr.as_ref() {
+        let mut mgr_guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+        let mgr = &mut *mgr_guard;
         let thread_cpu_threshold = 15.0;
         let mut thread_actions_emitted = 0usize;
         let max_thread_actions = match profile {
