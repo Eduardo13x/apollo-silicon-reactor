@@ -548,6 +548,25 @@ pub struct LearnedState {
     /// re-learning. Decay continues post-restore on the live graph.
     #[serde(default)]
     pub companion_graph: Option<CompanionGraph>,
+
+    /// Group C (2026-06-06) — Policy scorer aggregation mode.
+    ///
+    /// `"rss"` (default) keeps the Sprint 11 Root-Sum-Square uncertainty
+    /// composition with saturation clamp at 1.5. `"ds"` (also accepts
+    /// `"dempster"` / `"dempster_shafer"`) activates the Group C
+    /// Dempster-Shafer evidential layer documented in
+    /// [`crate::engine::action_policy::AggregatorMode`]. Unknown values
+    /// fall back to RSS — a typo in the config file cannot silently
+    /// switch on the experimental aggregator.
+    ///
+    /// Shadow-mode rollout: the field is read at scorer-build time, so
+    /// flipping it requires a daemon restart. This is intentional —
+    /// switching aggregators mid-cycle could produce inconsistent
+    /// decision rationales in the journal.
+    ///
+    /// `None` = old file format or never set → default RSS.
+    #[serde(default)]
+    pub policy_aggregator_mode: Option<String>,
 }
 
 /// Current schema version for [`LearnedState`].
@@ -671,6 +690,12 @@ impl LearnedState {
             // Filled by patch_companion_graph after persist_improved (same
             // pattern as unfreeze_decay / neuro_state); collect leaves None.
             companion_graph: None,
+            // Group C (2026-06-06) — aggregator mode is operator-set, not
+            // collected from a live subsystem. `collect()` preserves
+            // whatever was loaded from disk by reading the field-default
+            // None → callers wanting to change the mode write the JSON
+            // field directly (or use a future CLI tool).
+            policy_aggregator_mode: None,
         }
     }
 
@@ -1600,6 +1625,7 @@ mod tests {
             last_any_purge_at: None,
             last_cli_purge_at: None,
             companion_graph: None,
+            policy_aggregator_mode: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1635,6 +1661,7 @@ mod tests {
             last_any_purge_at: None,
             last_cli_purge_at: None,
             companion_graph: None,
+            policy_aggregator_mode: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1668,6 +1695,7 @@ mod tests {
             last_any_purge_at: None,
             last_cli_purge_at: None,
             companion_graph: None,
+            policy_aggregator_mode: None,
         };
         assert_eq!(
             state
@@ -1720,6 +1748,7 @@ mod tests {
             last_any_purge_at: None,
             last_cli_purge_at: None,
             companion_graph: None,
+            policy_aggregator_mode: None,
         };
         state.self_improve();
         assert_eq!(
@@ -1767,6 +1796,7 @@ mod tests {
             last_any_purge_at: None,
             last_cli_purge_at: None,
             companion_graph: None,
+            policy_aggregator_mode: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -1817,6 +1847,7 @@ mod tests {
             last_any_purge_at: None,
             last_cli_purge_at: None,
             companion_graph: None,
+            policy_aggregator_mode: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -2161,6 +2192,7 @@ mod tests {
             last_any_purge_at: None,
             last_cli_purge_at: None,
             companion_graph: None,
+            policy_aggregator_mode: None,
         };
         seed.persist(&tmp);
 
@@ -2256,6 +2288,7 @@ mod tests {
             last_any_purge_at: None,
             last_cli_purge_at: None,
             companion_graph: None,
+            policy_aggregator_mode: None,
         };
         let migrated = try_migrate(0, state);
         assert_eq!(
@@ -2296,6 +2329,7 @@ mod tests {
             last_any_purge_at: None,
             last_cli_purge_at: None,
             companion_graph: None,
+            policy_aggregator_mode: None,
         };
         let migrated = try_migrate(1, state);
         assert_eq!(migrated.version, CURRENT_SCHEMA_VERSION);
@@ -2340,6 +2374,7 @@ mod tests {
             last_any_purge_at: None,
             last_cli_purge_at: None,
             companion_graph: None,
+            policy_aggregator_mode: None,
         };
         blank.persist(&path);
 
@@ -2492,6 +2527,7 @@ mod tests {
             last_any_purge_at: None,
             last_cli_purge_at: None,
             companion_graph: None,
+            policy_aggregator_mode: None,
         };
         let mut lp = LearnableParams::default();
         let pre = lp.zone_alpha;

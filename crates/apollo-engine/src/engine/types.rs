@@ -2049,6 +2049,27 @@ pub struct RuntimeMetrics {
     pub policy_scorer_uncertainty_saturated_total: u64,
     #[serde(default)]
     pub effect_decay_detected_total: u64,
+
+    // ── Group C (2026-06-06) — Invariant #13 port-hub gate + Dempster-Shafer.
+    // Producers:
+    //   * `mediator_port_hub_blocks_total` — `MachPolicyEffector::apply`
+    //     refused a tier demote because `MachQoSManager::get_mach_port_count`
+    //     reported > `PORT_HUB_THRESHOLD` rights for the target PID.
+    //   * `mediator_port_hub_probe_unavailable_total` — same call site, but
+    //     `get_mach_port_count` returned `None` (entitlement-denied or PID
+    //     exited). Honest deferral marker: a sustained non-zero ratio means
+    //     the gate is observationally dark and must not be trusted.
+    //   * `policy_scorer_ds_high_conflict_fallback_total` — Dempster-Shafer
+    //     aggregation produced K > 0.7 (Yager 1987 §3 — incompatible
+    //     evidence) and the scorer fell back to RSS for that single call.
+    //     Only meaningful when `LearnedState::policy_aggregator_mode` is
+    //     "ds"; under the shipped default "rss" the counter stays at 0.
+    #[serde(default)]
+    pub mediator_port_hub_blocks_total: u64,
+    #[serde(default)]
+    pub mediator_port_hub_probe_unavailable_total: u64,
+    #[serde(default)]
+    pub policy_scorer_ds_high_conflict_fallback_total: u64,
 }
 
 impl RuntimeMetrics {

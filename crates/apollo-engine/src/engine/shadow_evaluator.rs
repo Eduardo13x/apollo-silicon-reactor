@@ -513,6 +513,13 @@ mod tests {
             per_feature: vec![],
             composite: -1.90, // 0.10 - 1.0*2.0 - 0.5*0 = -1.90 (well below -0.30)
             raw_uncertainty: 0.0,
+            // Group C (2026-06-06) — DS fields unused in this RSS-mode
+            // test fixture; vacuous BPA + zero conflict.
+            ds_belief: 0.0,
+            ds_disbelief: 0.0,
+            ds_uncertain: 1.0,
+            ds_conflict: 0.0,
+            ds_fallback_used: false,
         };
         match decide_override(/* gate_accept */ true, &score) {
             OverrideDecision::OverrideReject { composite } => {
@@ -535,6 +542,13 @@ mod tests {
             per_feature: vec![],
             composite: 2.5,
             raw_uncertainty: 0.0,
+            // Group C (2026-06-06) — DS fields unused in this RSS-mode
+            // test fixture; vacuous BPA + zero conflict.
+            ds_belief: 0.0,
+            ds_disbelief: 0.0,
+            ds_uncertain: 1.0,
+            ds_conflict: 0.0,
+            ds_fallback_used: false,
         };
         match decide_override(/* gate_accept */ false, &score) {
             OverrideDecision::LogStrongAccept { composite } => {
@@ -557,6 +571,13 @@ mod tests {
             per_feature: vec![],
             composite: 1.0,
             raw_uncertainty: 0.0,
+            // Group C (2026-06-06) — DS fields unused in this RSS-mode
+            // test fixture; vacuous BPA + zero conflict.
+            ds_belief: 0.0,
+            ds_disbelief: 0.0,
+            ds_uncertain: 1.0,
+            ds_conflict: 0.0,
+            ds_fallback_used: false,
         };
         assert_eq!(
             decide_override(true, &score),
@@ -578,6 +599,13 @@ mod tests {
             per_feature: vec![],
             composite: -0.5,
             raw_uncertainty: 0.0,
+            // Group C (2026-06-06) — DS fields unused in this RSS-mode
+            // test fixture; vacuous BPA + zero conflict.
+            ds_belief: 0.0,
+            ds_disbelief: 0.0,
+            ds_uncertain: 1.0,
+            ds_conflict: 0.0,
+            ds_fallback_used: false,
         };
         assert_eq!(
             decide_override(false, &score),
@@ -601,6 +629,13 @@ mod tests {
             per_feature: vec![],
             composite: -0.25,
             raw_uncertainty: 0.0,
+            // Group C (2026-06-06) — DS fields unused in this RSS-mode
+            // test fixture; vacuous BPA + zero conflict.
+            ds_belief: 0.0,
+            ds_disbelief: 0.0,
+            ds_uncertain: 1.0,
+            ds_conflict: 0.0,
+            ds_fallback_used: false,
         };
         assert_eq!(
             decide_override(true, &score),
@@ -622,6 +657,13 @@ mod tests {
             per_feature: vec![],
             composite: 0.25,
             raw_uncertainty: 0.0,
+            // Group C (2026-06-06) — DS fields unused in this RSS-mode
+            // test fixture; vacuous BPA + zero conflict.
+            ds_belief: 0.0,
+            ds_disbelief: 0.0,
+            ds_uncertain: 1.0,
+            ds_conflict: 0.0,
+            ds_fallback_used: false,
         };
         assert_eq!(
             decide_override(false, &score),
@@ -644,6 +686,13 @@ mod tests {
             per_feature: vec![],
             composite: -0.30,
             raw_uncertainty: 0.0,
+            // Group C (2026-06-06) — DS fields unused in this RSS-mode
+            // test fixture; vacuous BPA + zero conflict.
+            ds_belief: 0.0,
+            ds_disbelief: 0.0,
+            ds_uncertain: 1.0,
+            ds_conflict: 0.0,
+            ds_fallback_used: false,
         };
         assert_eq!(decide_override(true, &exact), OverrideDecision::NoChange);
     }

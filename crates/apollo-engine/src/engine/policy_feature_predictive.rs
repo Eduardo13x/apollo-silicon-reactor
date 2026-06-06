@@ -91,6 +91,7 @@ impl PolicyFeature for PredictiveBenefitFeature {
             cost: 0.0,
             uncertainty,
             hard_veto: false,
+            ..Contribution::zero()
         }
     }
 }

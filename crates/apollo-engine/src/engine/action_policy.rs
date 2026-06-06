@@ -84,7 +84,33 @@ pub struct ActionContext {
 }
 
 /// A single feature's contribution to the composite score.
+///
+/// The first four fields drive the legacy RSS aggregation path
+/// (`PolicyScorer::score`). The three `m_*` mass-assignment fields
+/// drive the parallel Dempster-Shafer evidential path. RSS is the
+/// default; DS activates only when
+/// [`LearnedState::policy_aggregator_mode`] is set to `"ds"`.
+///
+/// # Dempster-Shafer mass semantics
+///
+/// Each feature reports a basic probability assignment (BPA) over a
+/// two-element frame of discernment Ω = {accept, reject}:
+/// - `m_belief`   → mass assigned to {accept} — confident the action is correct.
+/// - `m_disbelief`→ mass assigned to {reject} — confident the action is wrong.
+/// - `m_uncertain`→ mass assigned to Ω = {accept, reject} — feature is ignorant.
+///
+/// The three must sum to 1.0 (the BPA axiom in Shafer 1976 §2.2).
+/// Features that do not opt into the DS layer leave these at the
+/// default `(0.0, 0.0, 1.0)` — full ignorance, no influence on the
+/// combined belief. The scorer accepts any normalisation issues as
+/// `policy_scorer_ds_high_conflict_fallback_total` bumps and degrades
+/// to RSS.
 #[derive(Debug, Clone, Copy)]
+// Default impl is manual (below) because `m_uncertain` must default
+// to 1.0 (full ignorance) rather than the derived 0.0 — a Contribution
+// from a feature that does not opt into DS must contribute vacuous
+// evidence, not "zero ignorance" which Dempster's rule would
+// misinterpret.
 pub struct Contribution {
     /// Expected reclaim / risk-reduction (≥0).
     pub benefit: f64,
@@ -94,6 +120,22 @@ pub struct Contribution {
     pub uncertainty: f64,
     /// If true, the scorer MUST reject regardless of aggregate score.
     pub hard_veto: bool,
+    /// Group C Dempster-Shafer (2026-06-06). Mass assigned to {accept}.
+    /// Default 0.0 — feature does not opt into DS aggregation.
+    pub m_belief: f64,
+    /// Group C Dempster-Shafer (2026-06-06). Mass assigned to {reject}.
+    /// Default 0.0 — feature does not opt into DS aggregation.
+    pub m_disbelief: f64,
+    /// Group C Dempster-Shafer (2026-06-06). Mass assigned to Ω
+    /// (ignorance / "could be either"). Default 1.0 — full ignorance,
+    /// no influence on combined belief.
+    pub m_uncertain: f64,
+}
+
+impl Default for Contribution {
+    fn default() -> Self {
+        Self::zero()
+    }
 }
 
 impl Contribution {
@@ -103,6 +145,52 @@ impl Contribution {
             cost: 0.0,
             uncertainty: 0.0,
             hard_veto: false,
+            // Default mass assignment is full ignorance — a feature
+            // that does not opt into DS contributes nothing to
+            // combined belief, in line with Shafer 1976 §2.2 vacuous
+            // BPA semantics.
+            m_belief: 0.0,
+            m_disbelief: 0.0,
+            m_uncertain: 1.0,
+        }
+    }
+
+    /// Group C (2026-06-06) — build a DS-aware contribution. Mass
+    /// arguments are renormalised if they do not sum to 1.0 within
+    /// `EPS`; legacy {benefit, cost, uncertainty, hard_veto} fields are
+    /// preserved so the same `Contribution` value drives both the RSS
+    /// and DS aggregation paths.
+    pub fn with_mass(
+        benefit: f64,
+        cost: f64,
+        uncertainty: f64,
+        hard_veto: bool,
+        m_belief: f64,
+        m_disbelief: f64,
+        m_uncertain: f64,
+    ) -> Self {
+        // Defensive renormalisation. A feature that ships `(0.6, 0.4,
+        // 0.2)` (sum 1.2) gets divided down to a valid BPA rather than
+        // breaking Dempster's rule downstream. Negative masses are
+        // clamped to 0 — they are not meaningful in the DS frame.
+        let b = m_belief.max(0.0);
+        let d = m_disbelief.max(0.0);
+        let u = m_uncertain.max(0.0);
+        let sum = b + d + u;
+        let (mb, md, mu) = if sum > f64::EPSILON {
+            (b / sum, d / sum, u / sum)
+        } else {
+            // Degenerate input → fall back to full ignorance.
+            (0.0, 0.0, 1.0)
+        };
+        Self {
+            benefit,
+            cost,
+            uncertainty,
+            hard_veto,
+            m_belief: mb,
+            m_disbelief: md,
+            m_uncertain: mu,
         }
     }
 }
@@ -148,6 +236,30 @@ pub struct PolicyScore {
     /// it absorb a 3× compositional bomb?). Defaults to 0.0 so any future
     /// serde load of an old `PolicyScore` won't break.
     pub raw_uncertainty: f64,
+    /// Group C Dempster-Shafer (2026-06-06). Aggregated belief mass on
+    /// {accept} after Dempster's rule of combination. Populated only
+    /// when [`PolicyScorer::aggregator_mode`] is `Dempster`; remains
+    /// 0.0 under the default RSS path so legacy consumers see no
+    /// behaviour change.
+    pub ds_belief: f64,
+    /// Group C Dempster-Shafer (2026-06-06). Aggregated mass on
+    /// {reject}. Same activation contract as `ds_belief`.
+    pub ds_disbelief: f64,
+    /// Group C Dempster-Shafer (2026-06-06). Residual mass on Ω
+    /// (combined ignorance). `ds_belief + ds_disbelief + ds_uncertain
+    /// = 1.0` within float tolerance whenever DS aggregation actually
+    /// ran (i.e. `ds_fallback_used == false`).
+    pub ds_uncertain: f64,
+    /// Group C Dempster-Shafer (2026-06-06). Yager conflict mass K
+    /// from Dempster's rule. `K > ds_conflict_fallback_threshold`
+    /// triggers RSS fallback (and bumps
+    /// `policy_scorer_ds_high_conflict_fallback_total`).
+    pub ds_conflict: f64,
+    /// Group C Dempster-Shafer (2026-06-06). True iff DS aggregation
+    /// produced K above the fallback threshold and the scorer used the
+    /// RSS path instead. Operators can split metrics by this flag to
+    /// see how often DS would have changed the decision.
+    pub ds_fallback_used: bool,
 }
 
 /// Composable decision surface. Construct via [`PolicyScorer::builder`].
@@ -173,6 +285,50 @@ pub struct PolicyScore {
 /// - [Lakshminarayanan 2017] Simple and Scalable Predictive Uncertainty
 ///   Estimation using Deep Ensembles — RSS aggregation of ensemble
 ///   uncertainty.
+/// Group C Dempster-Shafer (2026-06-06). Aggregation strategy for
+/// composing per-feature contributions into a single decision signal.
+///
+/// `Rss` (the shipped default) sums benefit/cost linearly and combines
+/// uncertainty via root-sum-square with a saturation clamp — the
+/// Sprint 11 design documented at the top of this module. `Dempster`
+/// uses Dempster's rule of combination (Shafer 1976 §3) on the
+/// per-feature mass assignments to compute belief / disbelief /
+/// ignorance, then falls back to RSS when Yager conflict mass K
+/// exceeds [`PolicyScorer::ds_conflict_fallback_threshold`] (default
+/// 0.7 — see Yager 1987 §3 on incompatible evidence).
+///
+/// The mode is selected per-scorer at build time and is intended to
+/// be controlled by [`crate::engine::learned_state::LearnedState::policy_aggregator_mode`]
+/// so operators can flip strategies via the persisted config without
+/// recompiling. The default keeps behaviour byte-equivalent to the
+/// pre-Group-C scorer until the operator explicitly opts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregatorMode {
+    /// Root-Sum-Square uncertainty composition (Sprint 11 default).
+    Rss,
+    /// Dempster's rule of combination over per-feature BPAs, with RSS
+    /// fallback on high conflict.
+    Dempster,
+}
+
+impl Default for AggregatorMode {
+    fn default() -> Self {
+        Self::Rss
+    }
+}
+
+impl AggregatorMode {
+    /// Parse the persisted [`LearnedState::policy_aggregator_mode`]
+    /// string. Unknown strings default to RSS so a typo in the config
+    /// file cannot silently switch on the experimental aggregator.
+    pub fn from_persisted(s: &str) -> Self {
+        match s {
+            "ds" | "dempster" | "dempster_shafer" => Self::Dempster,
+            _ => Self::Rss,
+        }
+    }
+}
+
 pub struct PolicyScorer {
     features: Vec<Box<dyn PolicyFeature>>,
     /// Accept threshold: accept iff
@@ -182,6 +338,14 @@ pub struct PolicyScorer {
     lambda_unc: f64,
     /// Ceiling for aggregated uncertainty (post-RSS). Default 1.5.
     uncertainty_saturation: f64,
+    /// Group C (2026-06-06). Aggregation strategy. Default `Rss`.
+    aggregator_mode: AggregatorMode,
+    /// Group C (2026-06-06). Yager conflict mass K above which the DS
+    /// aggregator falls back to RSS. Default 0.7 — high enough to let
+    /// disagreement between two features pass through (K can reach 0.5
+    /// with two opposed singleton BPAs), low enough to catch three or
+    /// more features in mutual conflict.
+    ds_conflict_fallback_threshold: f64,
 }
 
 impl PolicyScorer {
@@ -226,8 +390,48 @@ impl PolicyScorer {
                 .inc_policy_scorer_uncertainty_saturated();
         }
 
-        let net =
+        // Group C (2026-06-06) — Dempster-Shafer evidential aggregation,
+        // shadow-mode by default. The classical RSS path above is always
+        // computed (cheap, deterministic) so the DS path can fall back
+        // without recomputing. DS activation is per-call: any feature
+        // that opted into DS (m_belief + m_disbelief > 0) participates;
+        // pure-RSS features contribute vacuous BPAs (full ignorance) so
+        // the mixed regime is well-defined.
+        let (ds_belief, ds_disbelief, ds_uncertain, ds_conflict, ds_fallback_used) =
+            if self.aggregator_mode == AggregatorMode::Dempster {
+                aggregate_dempster_shafer(
+                    &per_feature,
+                    self.ds_conflict_fallback_threshold,
+                )
+            } else {
+                // RSS mode — leave DS fields at neutral defaults so
+                // legacy consumers see no change.
+                (0.0, 0.0, 1.0, 0.0, false)
+            };
+
+        // Net composite: when DS aggregation succeeded (no fallback) we
+        // use the DS belief-minus-disbelief signal scaled into the same
+        // unit range as the legacy benefit-cost score, then add an
+        // ignorance penalty proportional to `lambda_unc`. When DS fell
+        // back to RSS — or RSS mode is selected — use the legacy net.
+        // This keeps the threshold semantics stable across modes:
+        // `accept iff composite >= threshold AND no veto`.
+        let rss_net =
             total_benefit - self.lambda_cost * total_cost - self.lambda_unc * total_uncertainty;
+        let net = if self.aggregator_mode == AggregatorMode::Dempster && !ds_fallback_used {
+            // Map DS singleton masses to the same scale as RSS so the
+            // shipped threshold (0.0) keeps its calibration. The
+            // belief / disbelief delta plays the role of `benefit -
+            // cost`; we scale by the RSS magnitude so a DS-confident
+            // accept of an action with high RSS benefit stays high,
+            // while a DS-confident reject of the same action goes
+            // negative. The ignorance term inherits `lambda_unc`.
+            let ds_signal = (ds_belief - ds_disbelief)
+                * (total_benefit + self.lambda_cost * total_cost).max(1.0);
+            ds_signal - self.lambda_unc * ds_uncertain
+        } else {
+            rss_net
+        };
         let accept = vetoed_by.is_none() && net >= self.threshold;
 
         let reason = build_reason(
@@ -253,8 +457,102 @@ impl PolicyScorer {
             per_feature,
             composite: net,
             raw_uncertainty,
+            ds_belief,
+            ds_disbelief,
+            ds_uncertain,
+            ds_conflict,
+            ds_fallback_used,
         }
     }
+}
+
+/// Group C (2026-06-06) — Dempster's rule of combination for the
+/// two-element frame Ω = {accept, reject}.
+///
+/// Returns `(belief, disbelief, uncertain, conflict_K, fell_back)`.
+/// `fell_back == true` means K exceeded `conflict_fallback_threshold`
+/// — the caller treats this scorer call as RSS-mode for the net
+/// computation. The mass triple is still returned so audits can
+/// observe what DS *would* have said had it been trusted.
+///
+/// # Algorithm
+///
+/// For each pair of features the orthogonal sum is:
+///
+/// ```text
+/// m₁₂({A}) = (m₁(A)·m₂(A) + m₁(A)·m₂(Ω) + m₁(Ω)·m₂(A)) / (1 - K)
+/// m₁₂({R}) = (m₁(R)·m₂(R) + m₁(R)·m₂(Ω) + m₁(Ω)·m₂(R)) / (1 - K)
+/// m₁₂(Ω)   = m₁(Ω)·m₂(Ω) / (1 - K)
+/// K        = m₁(A)·m₂(R) + m₁(R)·m₂(A)
+/// ```
+///
+/// We accumulate over all features. K accumulates additively as the
+/// running conflict mass *of the combination so far*; whenever a step
+/// would divide by < `EPS` (total conflict, undefined Dempster's
+/// rule), or the cumulative K exceeds the threshold, we abort and
+/// return the fallback signal.
+///
+/// # References
+/// - [Shafer 1976] A Mathematical Theory of Evidence §3 — orthogonal sum.
+/// - [Yager 1987] On the Dempster-Shafer framework and new combination
+///   rules — conflict mass interpretation.
+/// - [Dezert 2002] An introduction to the DSm theory — discussion of
+///   counter-intuitive results under high conflict (Zadeh counter-example).
+fn aggregate_dempster_shafer(
+    per_feature: &[(&'static str, Contribution)],
+    conflict_fallback_threshold: f64,
+) -> (f64, f64, f64, f64, bool) {
+    // Start from the vacuous BPA: total ignorance, zero conflict.
+    let mut m_a = 0.0f64; // mass on {accept}
+    let mut m_r = 0.0f64; // mass on {reject}
+    let mut m_o = 1.0f64; // mass on Ω
+    let mut cumulative_k = 0.0f64;
+
+    for (_, c) in per_feature {
+        // Sanitise the feature's BPA: clamp negatives, renormalise if
+        // the sum drifted. A feature that ships a degenerate BPA
+        // contributes vacuous evidence — never poisons the combined
+        // belief.
+        let b = c.m_belief.max(0.0);
+        let d = c.m_disbelief.max(0.0);
+        let u = c.m_uncertain.max(0.0);
+        let sum = b + d + u;
+        let (fb, fd, fu) = if sum > f64::EPSILON {
+            (b / sum, d / sum, u / sum)
+        } else {
+            (0.0, 0.0, 1.0)
+        };
+
+        // Conflict mass of this single combination step.
+        let step_k = m_a * fd + m_r * fb;
+        let norm = 1.0 - step_k;
+
+        if norm < f64::EPSILON {
+            // Total conflict — Dempster's rule is undefined. Bump the
+            // fallback counter and return the pre-step state with a
+            // saturated K signal so the caller treats this as RSS.
+            crate::engine::lse_counters::LSE_COUNTERS
+                .inc_policy_scorer_ds_high_conflict_fallback();
+            return (m_a, m_r, m_o, 1.0, true);
+        }
+
+        let new_a = (m_a * fb + m_a * fu + m_o * fb) / norm;
+        let new_r = (m_r * fd + m_r * fu + m_o * fd) / norm;
+        let new_o = m_o * fu / norm;
+
+        m_a = new_a;
+        m_r = new_r;
+        m_o = new_o;
+        cumulative_k += step_k;
+    }
+
+    if cumulative_k > conflict_fallback_threshold {
+        crate::engine::lse_counters::LSE_COUNTERS
+            .inc_policy_scorer_ds_high_conflict_fallback();
+        return (m_a, m_r, m_o, cumulative_k, true);
+    }
+
+    (m_a, m_r, m_o, cumulative_k, false)
 }
 
 /// Builder for [`PolicyScorer`].
@@ -265,6 +563,10 @@ pub struct PolicyScorerBuilder {
     lambda_cost: Option<f64>,
     lambda_unc: Option<f64>,
     uncertainty_saturation: Option<f64>,
+    /// Group C (2026-06-06). DS aggregator mode. Default `Rss`.
+    aggregator_mode: Option<AggregatorMode>,
+    /// Group C (2026-06-06). DS conflict fallback threshold. Default 0.7.
+    ds_conflict_fallback_threshold: Option<f64>,
 }
 
 impl PolicyScorerBuilder {
@@ -299,6 +601,21 @@ impl PolicyScorerBuilder {
         self
     }
 
+    /// Group C (2026-06-06) — select the aggregation strategy. Default
+    /// is RSS; pass `AggregatorMode::Dempster` to activate the
+    /// evidential layer.
+    pub fn aggregator_mode(mut self, m: AggregatorMode) -> Self {
+        self.aggregator_mode = Some(m);
+        self
+    }
+
+    /// Group C (2026-06-06) — Yager conflict mass K above which DS
+    /// falls back to RSS for a single scorer call. Default 0.7.
+    pub fn ds_conflict_fallback_threshold(mut self, k: f64) -> Self {
+        self.ds_conflict_fallback_threshold = Some(k);
+        self
+    }
+
     pub fn build(self) -> PolicyScorer {
         PolicyScorer {
             features: self.features,
@@ -306,6 +623,10 @@ impl PolicyScorerBuilder {
             lambda_cost: self.lambda_cost.unwrap_or(1.0),
             lambda_unc: self.lambda_unc.unwrap_or(0.5),
             uncertainty_saturation: self.uncertainty_saturation.unwrap_or(1.5),
+            aggregator_mode: self.aggregator_mode.unwrap_or(AggregatorMode::Rss),
+            ds_conflict_fallback_threshold: self
+                .ds_conflict_fallback_threshold
+                .unwrap_or(0.7),
         }
     }
 }
@@ -400,11 +721,18 @@ impl PolicyFeature for ProtectionFeature {
 
     fn contribute(&self, action: &RootAction, ctx: &ActionContext) -> Contribution {
         match ctx.protection_level {
+            // Group C (2026-06-06) — under DS the protection feature is
+            // the canonical singleton-reject BPA: m_disbelief=1.0 says
+            // "this feature is certain the action is wrong" without
+            // touching the legacy RSS scalars.
             ProtectionLevel::Unconditional => Contribution {
                 benefit: 0.0,
                 cost: 0.0,
                 uncertainty: 0.0,
                 hard_veto: true,
+                m_belief: 0.0,
+                m_disbelief: 1.0,
+                m_uncertain: 0.0,
             },
             ProtectionLevel::ConditionalForeground => {
                 if is_freeze_or_throttle(action) && ctx.is_foreground_family {
@@ -413,6 +741,9 @@ impl PolicyFeature for ProtectionFeature {
                         cost: 0.0,
                         uncertainty: 0.0,
                         hard_veto: true,
+                        m_belief: 0.0,
+                        m_disbelief: 1.0,
+                        m_uncertain: 0.0,
                     }
                 } else {
                     Contribution::zero()
@@ -447,6 +778,7 @@ impl PolicyFeature for PressureBenefitFeature {
                     cost: 0.0,
                     uncertainty: 0.0,
                     hard_veto: false,
+                    ..Contribution::zero()
                 }
             }
             RootAction::BoostProcess { .. } => Contribution {
@@ -454,6 +786,7 @@ impl PolicyFeature for PressureBenefitFeature {
                 cost: 0.0,
                 uncertainty: 0.0,
                 hard_veto: false,
+                ..Contribution::zero()
             },
             _ => Contribution::zero(),
         }
@@ -498,6 +831,7 @@ impl PolicyFeature for UserDisruptionCostFeature {
                     cost,
                     uncertainty,
                     hard_veto: false,
+                    ..Contribution::zero()
                 }
             }
             RootAction::BoostProcess { .. } => Contribution::zero(),
@@ -585,6 +919,7 @@ mod tests {
                 cost: 0.0,
                 uncertainty: self.0,
                 hard_veto: false,
+                ..Contribution::zero()
             }
         }
     }
@@ -873,6 +1208,7 @@ mod tests {
                 cost: 0.0,
                 uncertainty: self.uncertainty,
                 hard_veto: false,
+                ..Contribution::zero()
             }
         }
     }

@@ -74,6 +74,7 @@ impl PolicyFeature for SensorAgeFeature {
             cost: 0.0,
             uncertainty,
             hard_veto: false,
+            ..Contribution::zero()
         }
     }
 }

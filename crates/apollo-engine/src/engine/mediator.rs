@@ -522,6 +522,40 @@ impl MachPolicyEffector {
     }
 }
 
+/// Group C (2026-06-06) — Invariant #13 port-hub threshold.
+///
+/// Processes holding more Mach port-rights than this are treated as IPC
+/// hubs (mediators between many clients). Demoting their scheduling
+/// tier risks cascading priority inversion: every client blocked on the
+/// hub now waits at the hub's reduced QoS. 5000 picks the upper bound
+/// of "legitimately busy app" — browsers, Electron, system extensions —
+/// per `mach_qos.rs::get_mach_port_count` doc-comment (50-500 healthy,
+/// 2000-3000 browser, >5000 suspicious).
+///
+/// Asymmetric per CLAUDE.md scorer doctrine: this is a REJECT-only
+/// gate, never an accept. Only tier *demotions* are checked; promotions
+/// (Background → Normal / Foreground) bypass.
+///
+/// Theory:
+/// - [Saltzer & Schroeder 1975 §3] Complete mediation — the runtime
+///   check survives bypasses the upstream classifier may have missed.
+/// - [Bovet & Cesati 2005 §5] Priority inversion via shared IPC.
+pub const PORT_HUB_THRESHOLD: u32 = 5000;
+
+/// Group C (2026-06-06) — Invariant #13 gate decision.
+///
+/// Returns `true` when the target tier is "demote-class". Without a
+/// `task_policy_get` FFI we cannot read the current tier, so we treat
+/// any request for `Background` as a demotion candidate (the most
+/// common case in `decide_actions` since it is the only tier produced
+/// by the four "demote" MachPolicyKind variants — Utility/Background).
+/// `Normal` and `Foreground` requests are NOT gated; if the upstream
+/// classifier asked for them it is either a promotion or a side-grade,
+/// neither of which can cause IPC-cascade harm.
+fn is_demote_target(target: crate::engine::mach_qos::SchedulingTier) -> bool {
+    matches!(target, crate::engine::mach_qos::SchedulingTier::Background)
+}
+
 impl Effector for MachPolicyEffector {
     fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason> {
         let (pid, policy) = match eff {
@@ -535,6 +569,57 @@ impl Effector for MachPolicyEffector {
         let sched_tier = Self::to_sched_tier(policy);
         let t0 = std::time::Instant::now();
         let mut mgr = self.qos.lock().unwrap_or_else(|e| e.into_inner());
+
+        // ── Group C Invariant #13: port-hub protection (complete mediation). ──
+        //
+        // Probe Mach port-right count BEFORE the tier mutation. Three
+        // outcomes:
+        //   1. `Some(n)` with `n > PORT_HUB_THRESHOLD` and the requested
+        //      change is a strict demotion → REJECT with PreconditionViolated.
+        //      Bump `mediator_port_hub_blocks_total`. The mediator's
+        //      universal block counter is bumped by the caller, this
+        //      bumps the gate-specific signal so dashboards can split
+        //      blocks by reason.
+        //   2. `Some(n)` with `n <= threshold` OR not a demotion → pass.
+        //   3. `None` → probe unavailable (entitlement-denied
+        //      task_for_pid, or PID exited). Honest deferral: bump
+        //      `mediator_port_hub_probe_unavailable_total` and fall
+        //      through. This is NOT a silent failure — operators see
+        //      the unavailable ratio rise alongside (or instead of)
+        //      block counts and know the gate is dark.
+        //
+        // Probe cost is one task_for_pid + mach_port_names; same syscall
+        // budget as the actual tier mutation, so net 2× cost on the
+        // mediated path. The asymmetric reject means promotions stay
+        // single-syscall.
+        if is_demote_target(sched_tier) {
+            match mgr.get_mach_port_count(pid) {
+                Some(n) if n > PORT_HUB_THRESHOLD => {
+                    crate::engine::lse_counters::LSE_COUNTERS
+                        .inc_mediator_port_hub_block();
+                    drop(mgr);
+                    return Err(BlockReason::PreconditionViolated {
+                        which: format!(
+                            "PortHubProtection: pid {} holds {} mach-port rights (> {}); refusing demote to {:?}",
+                            pid, n, PORT_HUB_THRESHOLD, sched_tier
+                        ),
+                    });
+                }
+                Some(_) => {
+                    // Within threshold — proceed.
+                }
+                None => {
+                    // Probe failed — likely no entitlement on macOS ≥11
+                    // for non-root targets, or PID exited mid-call.
+                    // Bump observability counter and proceed: a runtime
+                    // gate that silently fails open is worse than one
+                    // that fails open with a counter.
+                    crate::engine::lse_counters::LSE_COUNTERS
+                        .inc_mediator_port_hub_probe_unavailable();
+                }
+            }
+        }
+
         let _outcome = mgr.set_tier(pid, sched_tier);
         let syscall_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
         drop(mgr);
@@ -838,6 +923,7 @@ pub fn mediate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::lse_counters::LSE_COUNTERS;
 
     #[test]
     fn sysctl_value_equality_detects_noop() {
@@ -1036,6 +1122,90 @@ mod tests {
         let eff = make_mach_effector_for_test();
         let e = Effect::SigStop { pid: 1, start_sec: 0 };
         assert!(eff.apply(&e).is_err());
+    }
+
+    // Group C (2026-06-06) — Invariant #13 unit tests.
+
+    #[test]
+    fn invariant_13_is_demote_target_only_matches_background() {
+        use crate::engine::mach_qos::SchedulingTier;
+        assert!(is_demote_target(SchedulingTier::Background));
+        assert!(!is_demote_target(SchedulingTier::Foreground));
+        assert!(!is_demote_target(SchedulingTier::Normal));
+    }
+
+    #[test]
+    fn invariant_13_demote_request_with_probe_unavailable_bumps_counter_and_proceeds() {
+        // PID 0 (the kernel) always denies `task_for_pid`, so
+        // `get_mach_port_count` returns None on every platform without
+        // root + a real victim. This exercises the "probe unavailable"
+        // honest-deferral branch end-to-end.
+        //
+        // `LSE_COUNTERS` is a shared global static; other tests in the
+        // same binary run in parallel and may also touch the counter.
+        // We assert delta-greater-than-pre rather than equality so the
+        // test is robust under concurrent execution.
+        let pre = LSE_COUNTERS
+            .mediator_port_hub_probe_unavailable_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let eff = make_mach_effector_for_test();
+        let e = Effect::SetMachPolicy {
+            pid: 0,
+            start_sec: 0,
+            policy: MachPolicyKind::Background,
+        };
+        // Must NOT return PreconditionViolated for "probe unavailable" —
+        // honest deferral falls through to the underlying set_tier.
+        let r = eff.apply(&e).expect("probe-unavailable must fall through");
+        assert_eq!(r.after.mach_policy, Some(MachPolicyKind::Background));
+        let post = LSE_COUNTERS
+            .mediator_port_hub_probe_unavailable_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            post >= pre + 1,
+            "probe-unavailable counter must bump at least once for PID 0 demote: pre={} post={}",
+            pre,
+            post
+        );
+    }
+
+    #[test]
+    fn invariant_13_promotion_request_returns_ok_without_gate_consultation() {
+        // Promotions (target Foreground / Normal) must not engage the
+        // port-hub gate. We verify the structural contract: target tier
+        // is NOT in the demote set, so the gate code path is statically
+        // unreachable for this request. Counter-delta assertions are
+        // unreliable here because `LSE_COUNTERS` is a shared global and
+        // other tests in the same binary may bump it concurrently
+        // (Rust test runner runs in parallel by default).
+        assert!(!is_demote_target(
+            MachPolicyEffector::to_sched_tier(MachPolicyKind::UserInteractive)
+        ));
+        assert!(!is_demote_target(
+            MachPolicyEffector::to_sched_tier(MachPolicyKind::UserInitiated)
+        ));
+        assert!(!is_demote_target(
+            MachPolicyEffector::to_sched_tier(MachPolicyKind::Default)
+        ));
+
+        let eff = make_mach_effector_for_test();
+        let e = Effect::SetMachPolicy {
+            pid: 0,
+            start_sec: 0,
+            policy: MachPolicyKind::UserInteractive,
+        };
+        let r = eff.apply(&e).expect("promotion path stays Ok");
+        assert_eq!(
+            r.after.mach_policy,
+            Some(MachPolicyKind::UserInteractive)
+        );
+    }
+
+    #[test]
+    fn invariant_13_port_hub_threshold_is_5000() {
+        // Doctrine-locked constant — changing this without an
+        // accompanying CLAUDE.md update is a regression.
+        assert_eq!(PORT_HUB_THRESHOLD, 5000);
     }
 
     #[test]

@@ -271,6 +271,19 @@ impl MetricsState {
             lf.policy_scorer_uncertainty_saturated_total;
         self.metrics.effect_decay_detected_total = lf.effect_decay_detected_total;
 
+        // Group C (2026-06-06) — Invariant #13 port-hub gate observability.
+        // `port_hub_blocks_total` must rise non-zero before this gate can
+        // be claimed to do anything in prod; `probe_unavailable_total`
+        // distinguishes "no demote candidates exceeded threshold" from
+        // "gate observationally dark" (entitlement-denied task_for_pid).
+        // The third counter belongs to the parallel Dempster-Shafer
+        // aggregator and stays at 0 until `policy_aggregator_mode = "ds"`.
+        self.metrics.mediator_port_hub_blocks_total = lf.mediator_port_hub_blocks_total;
+        self.metrics.mediator_port_hub_probe_unavailable_total =
+            lf.mediator_port_hub_probe_unavailable_total;
+        self.metrics.policy_scorer_ds_high_conflict_fallback_total =
+            lf.policy_scorer_ds_high_conflict_fallback_total;
+
         // Sprint 12 Convergence #4 (2026-05-17). Producer is the daemon
         // main-loop convergence probe (after the cycle's
         // run_signal_tick, when both lse counters are fresh and the

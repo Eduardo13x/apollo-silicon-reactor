@@ -92,6 +92,7 @@ impl PolicyFeature for DeepScanCostFeature {
                     cost: cost.max(0.0),
                     uncertainty: 0.0,
                     hard_veto: false,
+                    ..Contribution::zero()
                 }
             }
             _ => Contribution {
@@ -99,6 +100,7 @@ impl PolicyFeature for DeepScanCostFeature {
                 cost: 0.0,
                 uncertainty: self.missing_uncertainty.max(0.0),
                 hard_veto: false,
+                ..Contribution::zero()
             },
         }
     }

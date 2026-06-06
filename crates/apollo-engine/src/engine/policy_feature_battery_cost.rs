@@ -73,6 +73,8 @@ impl PolicyFeature for BatteryAwareCostFeature {
             cost: penalty,
             uncertainty: 0.0,
             hard_veto: false,
+            // Group C (2026-06-06) — RSS-only feature: vacuous BPA.
+            ..Contribution::zero()
         }
     }
 }

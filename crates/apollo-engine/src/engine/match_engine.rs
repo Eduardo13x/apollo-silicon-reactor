@@ -214,6 +214,7 @@ impl PolicyFeature for IdentityUncertaintyFeature {
             cost: 0.0,
             uncertainty: 1.0 - self.match_confidence,
             hard_veto: false,
+            ..Contribution::zero()
         }
     }
 }

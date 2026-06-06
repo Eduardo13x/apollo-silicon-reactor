@@ -559,6 +559,36 @@ pub struct LockFreeMetrics {
     /// observed a post-settle re-read that disagrees with the applied
     /// value. Telemetry-only; no scorer feedback in this iteration.
     pub effect_decay_detected_total: AtomicU64,
+
+    /// Sprint patch (2026-06-05). Group C Invariant #13 — port-hub
+    /// protection: `MachPolicyEffector::apply` refused to demote a
+    /// process whose Mach port-right count exceeded `PORT_HUB_THRESHOLD`
+    /// (5000). Demoting such a process risks IPC-mediated cascade
+    /// (e.g. WindowServer-adjacent helpers, system_extension hubs).
+    /// Non-zero means the runtime safety oracle caught a target the
+    /// upstream classifier missed. Pure REJECT-only side; promotions
+    /// bypass the gate (CLAUDE.md asymmetric scorer doctrine).
+    pub mediator_port_hub_blocks_total: AtomicU64,
+
+    /// Sprint patch (2026-06-05). Group C Invariant #13 — the port-hub
+    /// probe returned `None` (typically `task_for_pid` denied without
+    /// hardened entitlement, or the PID exited mid-probe). Tracked so
+    /// dashboards can distinguish "gate fired" (`port_hub_blocks`) from
+    /// "gate unavailable" (this counter). Honest deferral, not a TODO
+    /// breadcrumb: a high ratio against `mediator_thread_policy_total`
+    /// is empirical evidence that the entitlement question must be
+    /// revisited before relying on this gate in production.
+    pub mediator_port_hub_probe_unavailable_total: AtomicU64,
+
+    /// Sprint patch (2026-06-05). Group C Dempster-Shafer fallback —
+    /// the evidential aggregation rule produced a conflict mass K > 0.7
+    /// (Yager 1987 §3 — incompatible evidence). When this fires the
+    /// scorer falls back to the legacy RSS path for this single call,
+    /// so the decision surface degrades gracefully instead of returning
+    /// a normalised lie. Non-zero rate means the feature contributions
+    /// disagree about action validity often enough that DS aggregation
+    /// is not the right tool for the current feature set.
+    pub policy_scorer_ds_high_conflict_fallback_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -707,6 +737,9 @@ impl LockFreeMetrics {
             pid_recycle_blocks_total: AtomicU64::new(0),
             policy_scorer_uncertainty_saturated_total: AtomicU64::new(0),
             effect_decay_detected_total: AtomicU64::new(0),
+            mediator_port_hub_blocks_total: AtomicU64::new(0),
+            mediator_port_hub_probe_unavailable_total: AtomicU64::new(0),
+            policy_scorer_ds_high_conflict_fallback_total: AtomicU64::new(0),
         }
     }
 
@@ -1188,6 +1221,15 @@ impl LockFreeMetrics {
             effect_decay_detected_total: self
                 .effect_decay_detected_total
                 .load(Ordering::Relaxed),
+            mediator_port_hub_blocks_total: self
+                .mediator_port_hub_blocks_total
+                .load(Ordering::Relaxed),
+            mediator_port_hub_probe_unavailable_total: self
+                .mediator_port_hub_probe_unavailable_total
+                .load(Ordering::Relaxed),
+            policy_scorer_ds_high_conflict_fallback_total: self
+                .policy_scorer_ds_high_conflict_fallback_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1503,6 +1545,31 @@ impl LockFreeMetrics {
         self.effect_decay_detected_total
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Sprint patch (2026-06-05). Group C Invariant #13 — port-hub gate
+    /// vetoed a tier demote on a process with >5000 Mach port rights.
+    #[inline(always)]
+    pub fn inc_mediator_port_hub_block(&self) {
+        self.mediator_port_hub_blocks_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sprint patch (2026-06-05). Group C Invariant #13 — port-hub
+    /// probe could not enumerate (no entitlement, or PID exited).
+    #[inline(always)]
+    pub fn inc_mediator_port_hub_probe_unavailable(&self) {
+        self.mediator_port_hub_probe_unavailable_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sprint patch (2026-06-05). Group C Dempster-Shafer — conflict
+    /// mass K > 0.7 forced a fallback to the legacy RSS path for one
+    /// scorer call (Yager 1987 §3 — incompatible evidence).
+    #[inline(always)]
+    pub fn inc_policy_scorer_ds_high_conflict_fallback(&self) {
+        self.policy_scorer_ds_high_conflict_fallback_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // Safe to share across threads — all fields are atomic.
@@ -1674,6 +1741,12 @@ pub struct MetricsSnapshot {
     pub policy_scorer_uncertainty_saturated_total: u64,
     /// Sprint patch (2026-06-05). S10 stuck-effect decay detections.
     pub effect_decay_detected_total: u64,
+    /// Sprint patch (2026-06-05). Group C Invariant #13 port-hub blocks.
+    pub mediator_port_hub_blocks_total: u64,
+    /// Sprint patch (2026-06-05). Group C Invariant #13 port-hub probe unavailable.
+    pub mediator_port_hub_probe_unavailable_total: u64,
+    /// Sprint patch (2026-06-05). Group C Dempster-Shafer high-conflict fallback.
+    pub policy_scorer_ds_high_conflict_fallback_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────
