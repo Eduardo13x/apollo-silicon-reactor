@@ -727,11 +727,32 @@ pub fn execute_actions(
                                 pid_identity: Some((*pid, *start_sec)),
                                 ..Default::default()
                             };
-                            let _ = crate::engine::mediator::mediate(
+                            let mediate_res = crate::engine::mediator::mediate(
                                 &eff,
                                 &pre,
                                 &crate::engine::mediator::JetsamEffector,
                             );
+                            // S10 producer: enroll post-Receipt observation
+                            // when mediator accepted the effect. The recorded
+                            // post-value is the BACKGROUND jetsam priority
+                            // (2 per jetsam_control::priority::BACKGROUND);
+                            // consumer re-reads via
+                            // jetsam_control::get_priority() after the 5 s
+                            // settling window.
+                            if mediate_res.is_ok() {
+                                crate::engine::effect_decay::record_global(
+                                    crate::engine::effect_decay::PendingObservation {
+                                        effect_id: 0,
+                                        pid: *pid,
+                                        kind:
+                                            crate::engine::effect_decay::ObsKind::JetsamTier,
+                                        key: None,
+                                        value_post: crate::engine::jetsam_control::priority::BACKGROUND as i64,
+                                        deadline: std::time::Instant::now()
+                                            + crate::engine::effect_decay::DecayWatchdog::settle_window(),
+                                    },
+                                );
+                            }
                         }
                         // RAM Switch-1 (2026-06-03): route SIGSTOP through typed
                         // SignalEffector via mediator chokepoint. Identity guard
@@ -878,6 +899,28 @@ pub fn execute_actions(
                     if !dry_run {
                         run_sysctl_write(key, value)?;
                         after = sysctl_read_with_timeout(key);
+                        // S10 producer: enroll post-Receipt observation when
+                        // the after-read parsed as i64. Consumer re-reads
+                        // sysctl_direct::read_i32(key) after the 5 s settle
+                        // window and bumps effect_decay_detected_total on
+                        // mismatch (kernel reverted, sysctl saturated to a
+                        // different value, etc).
+                        if let Some(post_str) = after.as_ref() {
+                            if let Ok(post_val) = post_str.parse::<i64>() {
+                                crate::engine::effect_decay::record_global(
+                                    crate::engine::effect_decay::PendingObservation {
+                                        effect_id: 0,
+                                        pid: 0,
+                                        kind:
+                                            crate::engine::effect_decay::ObsKind::Sysctl,
+                                        key: Some(key.to_string()),
+                                        value_post: post_val,
+                                        deadline: std::time::Instant::now()
+                                            + crate::engine::effect_decay::DecayWatchdog::settle_window(),
+                                    },
+                                );
+                            }
+                        }
                     }
                     out.sysctl_applied += 1;
                 }

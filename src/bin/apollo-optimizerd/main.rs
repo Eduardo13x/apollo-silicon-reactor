@@ -472,6 +472,9 @@ fn main() -> anyhow::Result<()> {
                 freeze_cooldown: Arc::new(Mutex::new(
                     apollo_engine::engine::freeze_cooldown::FreezeCooldown::new(),
                 )),
+                effect_decay: Arc::new(Mutex::new(
+                    apollo_engine::engine::effect_decay::DecayWatchdog::new(),
+                )),
                 hardware: Arc::new(Mutex::new(HardwareState {
                     last_hw_snapshot: None,
                     sysctl_governor_status: SysctlGovernorStatus {
@@ -506,6 +509,13 @@ fn main() -> anyhow::Result<()> {
 
                 subscribers: Arc::new(Mutex::new(Vec::new())),
             };
+
+            // S10 (2026-06-06): install the shared effect_decay handle so
+            // producer call sites in `execute_actions.rs` can enroll
+            // observations without threading a new parameter. Idempotent.
+            apollo_engine::engine::effect_decay::install_global(
+                state.effect_decay.clone(),
+            );
 
             // Load persisted UserProfile (learning survives daemon restarts).
             if let Some(persisted) = read_json::<UserProfilePersisted>(&state.user_profile_path) {
@@ -5364,6 +5374,17 @@ fn main() -> anyhow::Result<()> {
                         lf_metrics,
                     },
                 );
+
+                // ── S10 effect-decay drain (Hellerstein 2004 §9.3) ──
+                // Drain expired post-Receipt observations and re-read each
+                // observable; bump effect_decay_detected_total on mismatch.
+                // Wake-grace: skip drain on the first 6 cycles after daemon
+                // startup (~30 s) since immediately after wake the kernel
+                // may not have reapplied tier hints — false-positive
+                // disagreements would inflate the counter.
+                if cycle_count > 6 {
+                    daemon_cycle_tail::drain_effect_decay(&state);
+                }
 
                 // ── Periodic stage: GC and observability (% 100 / % 500 / % 7200 gates) ──
                 // Extracted to daemon_cycle_tail::run_periodic_stage (Wave 10).

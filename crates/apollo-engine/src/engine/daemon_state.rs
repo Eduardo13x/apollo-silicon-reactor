@@ -526,6 +526,14 @@ pub struct SharedState {
     /// that was just thawed by the TTL path. See `freeze_cooldown` module.
     pub freeze_cooldown: Arc<Mutex<crate::engine::freeze_cooldown::FreezeCooldown>>,
 
+    /// S10 cutover (2026-06-06): Hellerstein settling-time observer.
+    /// Producers in `execute_actions.rs` record post-Receipt; consumer
+    /// in `daemon_cycle_tail.rs::drain_effect_decay` drains once per
+    /// cycle, re-reads the observable, and bumps
+    /// `effect_decay_detected_total` on mismatch. Mutex guards a short
+    /// VecDeque push/pop — no syscall under guard.
+    pub effect_decay: Arc<Mutex<crate::engine::effect_decay::DecayWatchdog>>,
+
     // Infrastructure (lock-free or low-frequency)
     pub stop: Arc<AtomicBool>,
     /// Set by socket handler when a `RevertSysctls` RPC is received.

@@ -352,3 +352,46 @@ pub fn run_periodic_stage<'a>(
     };
     run_periodic(&mut pctx)
 }
+
+/// S10 consumer: drain expired effect-decay observations, re-read each
+/// observable, bump `effect_decay_detected_total` on disagreement.
+///
+/// Called once per main-loop cycle from the daemon tail. Bounded by
+/// RING_CAP=64 (effect_decay module-level constant).
+///
+/// Wake-grace: callers MUST pass a `seconds_since_wake` value > 30
+/// (or skip the call entirely) since immediately after wake the
+/// kernel may not have reapplied tier hints — false-positive
+/// disagreements would inflate the counter. The daemon's wake
+/// tracking is in main.rs; this function trusts the caller.
+pub fn drain_effect_decay(state: &SharedState) {
+    let expired = {
+        let mut w = state.effect_decay.lock_recover();
+        w.drain_expired(std::time::Instant::now())
+    };
+    if expired.is_empty() {
+        return;
+    }
+    let watchdog = state.effect_decay.lock_recover();
+    for obs in expired {
+        use apollo_engine::engine::effect_decay::ObsKind;
+        let live = match obs.kind {
+            ObsKind::JetsamTier => {
+                apollo_engine::engine::jetsam_control::get_priority(obs.pid)
+                    .map(|p| p as i64)
+            }
+            ObsKind::Sysctl => obs
+                .key
+                .as_deref()
+                .and_then(apollo_engine::engine::sysctl_direct::read_i32)
+                .map(|v| v as i64),
+            ObsKind::MachPolicy => None, // producer deferred — see banner
+        };
+        if let Some(actual) = live {
+            if actual != obs.value_post {
+                watchdog.report_disagreement();
+            }
+        }
+    }
+    drop(watchdog);
+}

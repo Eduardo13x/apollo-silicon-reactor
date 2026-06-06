@@ -1,36 +1,63 @@
 //! Stuck-Effect decay watchdog — Hellerstein 2004 §9.3 settling-time
 //! observer.
 //!
-//! **STATUS — UNWIRED (follow-up #4, MED severity).** Module exists, has
-//! unit tests, but NO producer wires it into the daemon main loop. The
-//! counter `effect_decay_detected_total` reads 0 in
-//! `/var/lib/apollo/runtime_metrics.json` and will continue to read 0 until
-//! a follow-up commit threads sysctl re-reads and `memorystatus_control(GET)`
-//! lookups into the post-settle path. Per CLAUDE.md Sprint 9 doctrine, a
-//! dormant counter is indistinguishable from a broken one — DO NOT advertise
-//! this as "wired MVP" until the producers land.
+//! **STATUS — WIRED** (S10 follow-up, 2026-06-06). The detector is owned
+//! by `SharedState.effect_decay`. Producer call sites in
+//! `execute_actions.rs` record Jetsam + Sysctl effects post-Receipt; the
+//! drain consumer in `daemon_cycle_tail.rs::drain_effect_decay` re-reads
+//! the observable via `jetsam_control::get_priority` /
+//! `sysctl_direct::read_i32` and bumps `effect_decay_detected_total` on
+//! mismatch. MachPolicy producer is deferred — `MachQoSManager` exposes
+//! no `get_policy(pid)` query API and adding one requires unverified
+//! `thread_policy_get` FFI work outside the S10 budget.
 //!
-//! Sprint patch (2026-06-05). Telemetry-only MVP — records observations
-//! when an effect is applied with a known post-snapshot value, drains
-//! expired observations on tick, and bumps an LSE counter when the
-//! post-settle re-read returned by the caller disagrees with the recorded
-//! value. The watchdog is NOT wired into the daemon main loop in this
-//! patch — that follow-up has to thread sysctl re-reads and
-//! `memorystatus_control(GET)` lookups, which are out of scope for a
-//! type-level introduction.
+//! Once Jetsam/Sysctl observations start arriving the counter is the
+//! "lying syscall" alarm described in the Sprint 9 telemetry-death
+//! lesson — `kill(SIGSTOP)` succeeds but the process is observed
+//! RUNNING 30 s later, etc.
 //!
-//! The counter (`effect_decay_detected_total`) stays at 0 until the wiring
-//! lands; once it does, a ramping counter is the "lying syscall" alarm
-//! described in the Sprint 9 telemetry-death lesson — `kill(SIGSTOP)`
-//! succeeds but the process is observed RUNNING 30 s later, etc.
-//!
-//! Wake-grace: `record` accepts a `now: Instant` and the caller may guard
-//! against false positives via the [`crate::engine::wake_state`] 30-s
-//! post-wake grace, since immediately after wake the kernel may not have
-//! reapplied tier hints.
+//! Wake-grace: the consumer guards the drain with a 30-s post-wake
+//! grace; immediately after wake the kernel may not have reapplied
+//! tier hints — false-positive disagreements would inflate the
+//! counter.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// S10 cutover (2026-06-06): global handle so producer call sites in
+/// `execute_actions.rs` can record observations without threading a new
+/// parameter through the entire signature chain (mirrors the
+/// LSE_COUNTERS / shadow_signals pattern). Initialised once at daemon
+/// startup by `daemon_state::SharedState` construction; tests may use
+/// `install_global_for_tests`. When uninitialised the producer helpers
+/// no-op (test harnesses that don't bring up SharedState observe no
+/// telemetry side-effect).
+static GLOBAL_WATCHDOG: OnceLock<Arc<Mutex<DecayWatchdog>>> = OnceLock::new();
+
+/// Install the shared watchdog handle. Idempotent: first call wins.
+pub fn install_global(w: Arc<Mutex<DecayWatchdog>>) {
+    let _ = GLOBAL_WATCHDOG.set(w);
+}
+
+/// Producer helper: enroll an observation against the global watchdog.
+/// No-op when no global handle has been installed (test paths,
+/// lib-only callers).
+pub fn record_global(obs: PendingObservation) {
+    if let Some(w) = GLOBAL_WATCHDOG.get() {
+        let mut guard = w.lock().unwrap_or_else(|e| e.into_inner());
+        guard.record(obs);
+    }
+}
+
+/// Test-only: replace the global with a fresh watchdog. Unsafe under
+/// concurrent test execution; gated behind cfg(test) on the caller.
+pub fn install_global_for_tests(w: Arc<Mutex<DecayWatchdog>>) {
+    // OnceLock has no public replace; tolerate the first-wins limitation
+    // by ignoring duplicate installs. Tests that need isolation should
+    // serialize via #[serial] or a test mutex.
+    let _ = GLOBAL_WATCHDOG.set(w);
+}
 
 /// Type of observation a watchdog entry carries. Each kind has its own
 /// post-settle re-read mechanism in the (future) consumer.
@@ -47,6 +74,10 @@ pub struct PendingObservation {
     pub effect_id: u64,
     pub pid: u32,
     pub kind: ObsKind,
+    /// Sysctl key, populated only when `kind == ObsKind::Sysctl`. Required
+    /// for the consumer's `sysctl_direct::read_i32(key)` re-read call.
+    /// `None` for other kinds.
+    pub key: Option<String>,
     /// Encoded post-syscall value (interpretation depends on `kind`):
     /// jetsam priority for `JetsamTier`, scheduling tier ord for
     /// `MachPolicy`, sysctl integer for `Sysctl`.
@@ -128,6 +159,7 @@ mod tests {
             effect_id: 1,
             pid: std::process::id(),
             kind: ObsKind::JetsamTier,
+            key: None,
             value_post: 9,
             deadline,
         }
