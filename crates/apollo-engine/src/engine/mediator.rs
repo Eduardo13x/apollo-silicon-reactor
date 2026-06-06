@@ -64,6 +64,19 @@ pub enum Effect {
         start_sec: u64,
         policy: MachPolicyKind,
     },
+    /// `thread_policy_set` — per-thread QoS routing (P-core vs E-core).
+    /// Inv#11: `start_sec` carries PID identity; identity-mismatch → block.
+    /// `affinity_tag` Some(1)=P-cluster, Some(2)=E-cluster, Some(0)/None=no hint.
+    /// Sprint S3 (2026-06-06): activates `mediator_thread_policy_total` —
+    /// rewires the `RootAction::SetThreadQoS` arm in `execute_actions.rs`
+    /// to flow through `ThreadPolicyEffector::apply_raw`.
+    SetThreadPolicy {
+        pid: u32,
+        start_sec: u64,
+        thread_index: u32,
+        tier: crate::engine::mach_qos::ThreadTier,
+        affinity_tag: Option<u32>,
+    },
     /// `madvise(MADV_FREE_REUSABLE)` — hint pages purgeable.
     /// Per the 2026-05-30 NLM corpus finding (`purge_purgeable:Brave Renderer
     /// → pressure_no_change` at 6650 evidence / 0.982 confidence), this effect
@@ -573,7 +586,6 @@ pub struct ThreadPolicyEffector {
 }
 
 impl ThreadPolicyEffector {
-    #[allow(dead_code)] // S3 SHRUNK foundation; consumers land in S4 follow-up
     pub(crate) fn new(
         qos: std::sync::Arc<std::sync::Mutex<crate::engine::mach_qos::MachQoSManager>>,
     ) -> Self {
@@ -608,6 +620,44 @@ impl ThreadPolicyEffector {
             crate::engine::lse_counters::LSE_COUNTERS.inc_mediator_thread_policy();
         }
         (ok, syscall_us, if ok { 1 } else { 0 })
+    }
+}
+
+impl Effector for ThreadPolicyEffector {
+    fn apply(&self, eff: &Effect) -> Result<Receipt, BlockReason> {
+        let (pid, thread_index, tier, affinity_tag) = match eff {
+            Effect::SetThreadPolicy {
+                pid,
+                thread_index,
+                tier,
+                affinity_tag,
+                ..
+            } => (*pid, *thread_index, *tier, *affinity_tag),
+            _ => {
+                return Err(BlockReason::PreconditionViolated {
+                    which: "ThreadPolicyEffector: unsupported Effect variant".to_string(),
+                });
+            }
+        };
+        let (ok, syscall_us, applied_count) =
+            self.apply_raw(pid, thread_index, tier, affinity_tag);
+        if !ok {
+            return Err(BlockReason::PreconditionViolated {
+                which: "ThreadPolicyEffector: set_thread_qos returned false (pid invalid or task_for_pid failed)".to_string(),
+            });
+        }
+        let snapshot = ReceiptSnapshot::default();
+        Ok(Receipt {
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            before: snapshot.clone(),
+            after: snapshot,
+            no_op: false,
+            syscall_us,
+            applied_count,
+        })
     }
 }
 
@@ -750,6 +800,7 @@ pub fn mediate(
             | Effect::SigCont { pid, .. }
             | Effect::SetJetsamTier { pid, .. }
             | Effect::SetMachPolicy { pid, .. }
+            | Effect::SetThreadPolicy { pid, .. }
             | Effect::PurgeHint { pid, .. } => Some(*pid),
             _ => None,
         };

@@ -310,7 +310,7 @@ pub struct ThreadAnalysis {
 }
 
 /// Per-thread QoS tier for big.LITTLE thread-level scheduling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThreadTier {
     /// Hot thread → P-core routing (low latency, high throughput).
     Interactive,
