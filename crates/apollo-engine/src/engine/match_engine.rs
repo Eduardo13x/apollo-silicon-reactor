@@ -338,6 +338,7 @@ mod tests {
         let action = RootAction::BoostProcess {
             pid: 1, name: "x".into(), reason: "u".into(),
             decision_reason: DecisionReason::PressureContext,
+            start_sec: 0, start_usec: 0,
         };
         let c = IdentityUncertaintyFeature::new(0.30).contribute(&action, &ctx);
         assert!((c.uncertainty - 0.70).abs() < 1e-9);

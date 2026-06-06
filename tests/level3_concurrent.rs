@@ -86,6 +86,8 @@ fn concurrent_budget_enforcement_no_overflow() {
                         name: format!("app-{}-{}", t, pid),
                         reason: "stress".into(),
                         decision_reason: DecisionReason::PressureContext,
+                        start_sec: 0,
+                        start_usec: 0,
                     })
                     .collect();
 
@@ -163,6 +165,8 @@ fn three_phase_cycles_all_complete_with_correct_totals() {
                             name: format!("fake-{}-{}", t, pid),
                             reason: "concurrent".into(),
                             decision_reason: DecisionReason::PressureContext,
+                            start_sec: 0,
+                            start_usec: 0,
                         })
                         .collect::<Vec<_>>()
                 }; // metrics lock released
@@ -345,6 +349,8 @@ fn shared_budget_invariant_holds_under_max_contention() {
                         name: format!("stress-{}-{}", t, i),
                         reason: "stress".into(),
                         decision_reason: DecisionReason::PressureContext,
+                        start_sec: 0,
+                        start_usec: 0,
                     })
                     .collect();
 

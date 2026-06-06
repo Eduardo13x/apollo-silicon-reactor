@@ -22,6 +22,8 @@ fn make_boosts(n: usize) -> Vec<RootAction> {
             name: format!("app-{}", i),
             reason: "test boost".into(),
             decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
         })
         .collect()
 }

@@ -152,6 +152,8 @@ mod tests {
             name: format!("p{pid}"),
             reason: "test".into(),
             decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
         }
     }
 

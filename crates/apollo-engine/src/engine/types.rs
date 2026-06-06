@@ -406,6 +406,13 @@ pub enum RootAction {
         reason: String,
         #[serde(default = "default_decision_reason")]
         decision_reason: crate::engine::audit_types::DecisionReason,
+        /// Kernel start-time for PID identity validation (prevents A-B-A recycling).
+        /// Sprint Inv#11 (2026-06-06): closes the no-op tautology at
+        /// `execute_actions.rs` Boost arm (was verifying with `0,0` legacy fallback).
+        #[serde(default)]
+        start_sec: u64,
+        #[serde(default)]
+        start_usec: u64,
     },
     ThrottleProcess {
         pid: u32,
@@ -492,6 +499,13 @@ pub enum RootAction {
         /// cost when threads cooperate on shared data within a cluster.
         #[serde(default)]
         affinity_tag: Option<u32>,
+        /// Kernel start-time for PID identity validation (prevents A-B-A recycling).
+        /// Sprint Inv#11 (2026-06-06): closes the no-op tautology at the
+        /// `execute_actions.rs` SetThreadQoS arm.
+        #[serde(default)]
+        start_sec: u64,
+        #[serde(default)]
+        start_usec: u64,
     },
 }
 
@@ -602,9 +616,23 @@ impl RootAction {
                 start_usec,
                 ..
             } => Some((*pid, Some(name.as_str()), *start_sec, *start_usec)),
-            RootAction::BoostProcess { pid, name, .. }
-            | RootAction::UnfreezeProcess { pid, name, .. }
-            | RootAction::SetThreadQoS { pid, name, .. } => Some((*pid, Some(name.as_str()), 0, 0)),
+            RootAction::BoostProcess {
+                pid,
+                name,
+                start_sec,
+                start_usec,
+                ..
+            }
+            | RootAction::SetThreadQoS {
+                pid,
+                name,
+                start_sec,
+                start_usec,
+                ..
+            } => Some((*pid, Some(name.as_str()), *start_sec, *start_usec)),
+            RootAction::UnfreezeProcess { pid, name, .. } => {
+                Some((*pid, Some(name.as_str()), 0, 0))
+            }
             RootAction::SetMemorystatus { pid, .. } => Some((*pid, None, 0, 0)),
             RootAction::SetSysctl(_)
             | RootAction::ToggleSpotlight { .. }
@@ -2243,6 +2271,8 @@ mod tests {
             name: "x".into(),
             reason: String::new(),
             decision_reason: crate::engine::audit_types::DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
         };
         assert_eq!(boost.action_class(), "boost");
         let freeze = RootAction::FreezeProcess {
@@ -2470,16 +2500,20 @@ mod tests {
     }
 
     #[test]
-    fn identity_fields_boost_has_no_start_sec() {
+    fn identity_fields_boost_surfaces_start_sec() {
+        // Inv#11 (2026-06-06): Boost now carries start_sec; identity_fields
+        // returns the real value rather than the legacy `0,0` fallback.
         let a = RootAction::BoostProcess {
             pid: 300,
             name: "Alacritty".into(),
             reason: "fg".into(),
             decision_reason: DecisionReason::InteractiveFocus,
+            start_sec: 12345,
+            start_usec: 6789,
         };
         assert_eq!(
             a.identity_fields(),
-            Some((300u32, Some("Alacritty"), 0u64, 0u64))
+            Some((300u32, Some("Alacritty"), 12345u64, 6789u64))
         );
     }
 
@@ -2518,6 +2552,8 @@ mod tests {
             reason: "demote".into(),
             decision_reason: DecisionReason::ThreadQoSRouting,
             affinity_tag: None,
+            start_sec: 0,
+            start_usec: 0,
         };
         assert_eq!(
             a.identity_fields(),

@@ -53,6 +53,8 @@ fn execute_boost_dead_pid_is_skipped() {
         name: "ghost-app".into(),
         reason: "test".into(),
         decision_reason: DecisionReason::PressureContext,
+        start_sec: 0,
+        start_usec: 0,
     }];
     let mut frozen = HashSet::new();
     let outcomes = execute_actions(
@@ -267,12 +269,16 @@ fn execute_outcomes_all_zero_for_dead_pids() {
             name: "dead1".into(),
             reason: "test".into(),
             decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
         },
         RootAction::BoostProcess {
             pid: dead + 1,
             name: "dead2".into(),
             reason: "test".into(),
             decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
         },
         RootAction::ThrottleProcess {
             pid: dead + 2,
@@ -340,6 +346,8 @@ fn full_pipeline_respects_all_caps() {
                 name: format!("app-{}", i),
                 reason: "focus".into(),
                 decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
             },
             1 => RootAction::ThrottleProcess {
                 pid: (2000 + i) as u32,
@@ -455,6 +463,8 @@ fn budget_cycle_counters_reset_but_minute_counter_persists() {
             name: format!("app-{}", i),
             reason: "test".into(),
             decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
         })
         .collect();
     enforce_limits_with_budget(actions1, &policy, &mut budget, 100);
@@ -503,6 +513,8 @@ fn execute_actions_skips_protected_name_regardless_of_pid() {
         name: "kernel_task".into(),
         reason: "test".into(),
         decision_reason: DecisionReason::PressureContext,
+        start_sec: 0,
+        start_usec: 0,
     }];
     let mut frozen = HashSet::new();
     let outcomes = execute_actions(

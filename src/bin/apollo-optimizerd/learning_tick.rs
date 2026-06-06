@@ -1017,6 +1017,8 @@ mod tests {
                 name: "Finder".to_string(),
                 reason: "latency".to_string(),
                 decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
             },
         ];
 

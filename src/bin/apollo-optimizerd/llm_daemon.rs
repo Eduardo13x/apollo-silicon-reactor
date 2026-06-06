@@ -1000,11 +1000,14 @@ pub fn apply_learned_policy_actions(
             && !survival
             && should_emit_boost(p.pid, learned_policy_boost_ttl_secs())
         {
+            let (ss, su) = pid_start_time(p.pid);
             actions.push(RootAction::BoostProcess {
                 pid: p.pid,
                 name: p.name.clone(),
                 reason: "learned-policy interactive".to_string(),
                 decision_reason: DecisionReason::PressureContext,
+                start_sec: ss,
+                start_usec: su,
             });
             seen.insert((p.pid, "boost"));
         }
@@ -1128,6 +1131,8 @@ mod tests {
             name: "app".into(),
             reason: "r".into(),
             decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
         }];
         let result = apply_learned_policy_actions(&snap, &policy(&[], &[], &[]), actions);
         assert_eq!(result.len(), 1);
@@ -1185,6 +1190,8 @@ mod tests {
             name: "Xcode".into(),
             reason: "existing".into(),
             decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
         }];
         let result = apply_learned_policy_actions(&snap, &policy(&["Xcode"], &[], &[]), existing);
         let boosts = result

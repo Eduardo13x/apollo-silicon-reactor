@@ -135,6 +135,8 @@ mod tests {
             name: "testproc".into(),
             reason: "unit-test".into(),
             decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
         }
     }
 

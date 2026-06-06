@@ -578,11 +578,16 @@ pub fn decide_actions(
         LatencyTarget::Normal => 2,
     };
     for blocker in blockers.iter().take(blocker_boost_count) {
+        // Inv#11: PID-only context here; look up start_sec via daemon_helpers.
+        let (start_sec, start_usec) =
+            crate::engine::daemon_helpers::pid_start_time(blocker.pid);
         actions.push(RootAction::BoostProcess {
             pid: blocker.pid,
             name: blocker.name.clone(),
             reason: format!("wait-graph blocker score {:.2}", blocker.score),
             decision_reason: DecisionReason::WaitGraphBlocker,
+            start_sec,
+            start_usec,
         });
     }
 
@@ -613,6 +618,8 @@ pub fn decide_actions(
                 name: name.to_string(),
                 reason: "interactive focus boost".to_string(),
                 decision_reason: DecisionReason::InteractiveFocus,
+                start_sec: process.start_time(),
+                start_usec: 0,
             });
             continue;
         }
@@ -828,6 +835,8 @@ pub fn decide_actions(
                 name: process.name().to_string(),
                 reason: "ML/AMX workload — P-core routing".to_string(),
                 decision_reason: DecisionReason::MLWorkload,
+                start_sec: process.start_time(),
+                start_usec: 0,
             });
         }
     }
@@ -850,6 +859,8 @@ pub fn decide_actions(
                         name,
                         reason: format!("display pipeline — swap +{:.1} MB/s", swap_delta_mb),
                         decision_reason: DecisionReason::DisplayPipeline,
+                        start_sec: process.start_time(),
+                        start_usec: 0,
                     });
                 }
             }
@@ -878,6 +889,8 @@ pub fn decide_actions(
                         process.cpu_usage()
                     ),
                     decision_reason: DecisionReason::CompositorPriority,
+                    start_sec: process.start_time(),
+                    start_usec: 0,
                 });
                 break; // Only one WindowServer process
             }
@@ -920,6 +933,12 @@ pub fn decide_actions(
 
                 let analysis = mgr.analyze_threads(pid_u32, &threads);
 
+                // Inv#11 (2026-06-06): hoist start_sec/start_usec once for all 5
+                // SetThreadQoS emit sites below — closes the A-B-A window at
+                // execute_actions.rs SetThreadQoS arm.
+                let start_sec = process.start_time();
+                let start_usec: u64 = 0;
+
                 // Pattern-aware scheduling:
                 match analysis.pattern {
                     crate::engine::mach_qos::ThreadPattern::Runaway => {
@@ -943,6 +962,8 @@ pub fn decide_actions(
                                 affinity_tag: Some(
                                     crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER,
                                 ),
+                                start_sec,
+                                start_usec,
                             });
                             thread_actions_emitted += 1;
                         }
@@ -968,6 +989,8 @@ pub fn decide_actions(
                                 affinity_tag: Some(
                                     crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER,
                                 ),
+                                start_sec,
+                                start_usec,
                             });
                             thread_actions_emitted += 1;
                         }
@@ -995,6 +1018,8 @@ pub fn decide_actions(
                                 // I/O-bound: kernel handles I/O wait better than user-space hint.
                                 // Leave tag=None to let kernel keep default scheduling.
                                 affinity_tag: None,
+                                start_sec,
+                                start_usec,
                             });
                             thread_actions_emitted += 1;
                         }
@@ -1019,6 +1044,8 @@ pub fn decide_actions(
                                 affinity_tag: Some(
                                     crate::engine::mach_qos::mach_sys::AFFINITY_TAG_P_CLUSTER,
                                 ),
+                                start_sec,
+                                start_usec,
                             });
                             thread_actions_emitted += 1;
                         }
@@ -1054,6 +1081,8 @@ pub fn decide_actions(
                                 reason: format!("cold thread #{} in {} (waiting)", idx, name),
                                 decision_reason: DecisionReason::ThreadQoSRouting,
                                 affinity_tag: Some(cold_affinity),
+                                start_sec,
+                                start_usec,
                             });
                             thread_actions_emitted += 1;
                         }
@@ -2467,6 +2496,8 @@ mod tests {
                 name: "test".to_string(),
                 reason: "testing".to_string(),
                 decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
             }],
             low_value_skipped: vec!["skipped".to_string()],
             display_boosts_emitted: 0,

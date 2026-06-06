@@ -86,12 +86,16 @@ fn fixture_sequence() -> Vec<RootAction> {
             name: "interactive".into(),
             reason: "skill:focus".into(),
             decision_reason: DecisionReason::InteractiveFocus,
+            start_sec: 0,
+            start_usec: 0,
         },
         RootAction::BoostProcess {
             pid: 2002,
             name: "interactive2".into(),
             reason: "skill:focus".into(),
             decision_reason: DecisionReason::InteractiveFocus,
+            start_sec: 0,
+            start_usec: 0,
         },
         // (3) cluster_actions adds 1 freeze + 1 spotlight toggle.
         RootAction::freeze_full(

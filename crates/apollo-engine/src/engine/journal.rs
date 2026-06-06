@@ -123,6 +123,8 @@ mod tests {
                 name: "test-proc".to_string(),
                 reason: "test".to_string(),
                 decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
             },
             before: None,
             after: None,

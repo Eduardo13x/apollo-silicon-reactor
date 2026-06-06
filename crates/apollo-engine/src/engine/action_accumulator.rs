@@ -695,6 +695,8 @@ mod tests {
                 name: "h".into(),
                 reason: "r".into(),
                 decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
             },
             ctx(),
             &lf,
@@ -878,6 +880,8 @@ mod tests {
                 name: "x".into(),
                 reason: "r".into(),
                 decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
             },
             EmitContext::new(ActionPhase::Other, "test::invariant", "raw_boost"),
             &lf,
@@ -952,6 +956,8 @@ mod tests {
                 name: "b1".into(),
                 reason: "r".into(),
                 decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
             },
             ctx(),
             &lf,
@@ -1044,6 +1050,8 @@ mod tests {
                 name: "w".into(),
                 reason: "r".into(),
                 decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
             },
         ];
         acc.extend_raw(
@@ -1251,6 +1259,8 @@ mod tests {
                 name: "Brave".into(),
                 reason: "r".into(),
                 decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
             },
             RootAction::set_memorystatus(5, 10, "r", DecisionReason::PressureContext),
             RootAction::SetThreadQoS {
@@ -1261,6 +1271,8 @@ mod tests {
                 reason: "r".into(),
                 decision_reason: DecisionReason::PressureContext,
                 affinity_tag: Some(2),
+                start_sec: 0,
+                start_usec: 0,
             },
             RootAction::set_sysctl(
                 "kern.maxvnodes",
