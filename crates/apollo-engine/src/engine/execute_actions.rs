@@ -1033,22 +1033,31 @@ pub fn execute_actions(
                         _ => ThreadTier::Utility,
                     };
                     if !dry_run {
-                        // S4 cutover: short-guard Mutex lock; the FFI calls
-                        // ARE the syscalls per CLAUDE.md doctrine.
+                        // S4 cutover (2026-06-06 cont.): route through
+                        // ThreadPolicyEffector::apply_raw so the typed
+                        // chokepoint is the SOLE writer of thread QoS state.
+                        // Counter `mediator_thread_policy_total` increments
+                        // only on syscall success — see effector counter
+                        // semantics doc-comment for the attempts-vs-applies
+                        // distinction. Identity guard already verified
+                        // above (Inv#11 early-return); apply_raw is the
+                        // post-verification dispatch path.
                         if let Some(arc) = qos_mgr.as_ref() {
-                            let mgr = arc.lock().unwrap_or_else(|e| e.into_inner());
-                            if mgr.set_thread_qos(*pid, *thread_index, thread_tier) {
-                                out.thread_qos_applied += 1;
+                            let effector = crate::engine::mediator::ThreadPolicyEffector::new(
+                                std::sync::Arc::clone(arc),
+                            );
+                            let (ok, _syscall_us, applied) = effector.apply_raw(
+                                *pid,
+                                *thread_index,
+                                thread_tier,
+                                *affinity_tag,
+                            );
+                            if ok {
+                                out.thread_qos_applied += applied as u64;
                             }
-                            // Phase B (2026-05-06): emit P/E cluster affinity hint
-                            // alongside QoS tier when caller specified one.
-                            // tag=None or Some(0) → no hint; kernel default.
-                            if let Some(tag) = affinity_tag {
-                                if *tag != 0 {
-                                    let _ = mgr.set_thread_affinity_tag(*pid, *thread_index, *tag);
-                                }
-                            }
-                            drop(mgr);
+                            // affinity_tag fallback handled inside
+                            // ThreadPolicyEffector::apply_raw — caller no
+                            // longer needs to drive it separately.
                         }
                     }
                 }
