@@ -435,7 +435,13 @@ pub fn execute_actions(
 
         let result: anyhow::Result<()> = (|| {
             match &action {
-                RootAction::BoostProcess { pid, name, .. } => {
+                RootAction::BoostProcess {
+                    pid,
+                    name,
+                    start_sec,
+                    start_usec,
+                    ..
+                } => {
                     // Self-protection only — display-critical daemons (coreaudiod, Dock,
                     // mediaserverd) are in protected_processes for freeze/throttle safety, but
                     // must be BOOSTABLE. True OS-kernel processes (WindowServer, kernel_task)
@@ -443,16 +449,13 @@ pub fn execute_actions(
                     if *pid == my_pid || name.contains("apollo-optimizer") {
                         return Ok(());
                     }
-                    // Validate PID identity (name-only for boost — no start-time available).
-                    // Sprint patch (2026-06-05) — S8 (SHRUNK): bump
-                    // `pid_recycle_blocks_total` so dashboards can verify
-                    // how often the name-only verify rejects a recycled
-                    // BoostProcess target. The full S8 (add start_sec to
-                    // BoostProcess/SetThreadQoS variants) is deferred —
-                    // every action emitter would have to populate the new
-                    // fields and that is more scope than a single-sprint
-                    // patch can safely land.
-                    if !ProcessIdentity::verify(*pid, Some(name), 0, 0) {
+                    // Inv#11 (2026-06-06): real start_sec verify closes the
+                    // A-B-A window — previous `0,0` legacy fallback was a
+                    // no-op tautology (verify always accepted, counter was
+                    // perma-zero across 59 675 cycles). Producers populate
+                    // start_sec at all Boost emit sites — see
+                    // decide_actions.rs / llm_daemon.rs sweep.
+                    if !ProcessIdentity::verify(*pid, Some(name), *start_sec, *start_usec) {
                         crate::engine::lse_counters::LSE_COUNTERS.inc_pid_recycle_block();
                         block_reason = Some(BlockReason::PidRecycled);
                         return Ok(());
@@ -944,6 +947,8 @@ pub fn execute_actions(
                     thread_index,
                     tier,
                     affinity_tag,
+                    start_sec,
+                    start_usec,
                     ..
                 } => {
                     if protected.iter().any(|p| name.contains(p)) {
@@ -959,12 +964,13 @@ pub fn execute_actions(
                         block_reason = Some(BlockReason::ActiveCoalition);
                         return Ok(());
                     }
-                    // Sprint patch (2026-06-05) — S8 (SHRUNK): bump
-                    // `pid_recycle_blocks_total` LSE counter at the SetThreadQoS
-                    // verify call site. See BoostProcess sibling above for the
-                    // full design + deferral rationale.
-                    if !ProcessIdentity::verify(*pid, Some(name), 0, 0) {
+                    // Inv#11 (2026-06-06): real start_sec verify; previously
+                    // `0,0` legacy fallback. Adds explicit
+                    // BlockReason::PidRecycled (was silent skip before this
+                    // sprint — see audit trace consumers in dashboards).
+                    if !ProcessIdentity::verify(*pid, Some(name), *start_sec, *start_usec) {
                         crate::engine::lse_counters::LSE_COUNTERS.inc_pid_recycle_block();
+                        block_reason = Some(BlockReason::PidRecycled);
                         return Ok(());
                     }
                     let thread_tier = match tier.as_str() {
