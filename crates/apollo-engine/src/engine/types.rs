@@ -2050,6 +2050,25 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub effect_decay_detected_total: u64,
 
+    /// Round-4 (2026-06-07). FIX-3-v2 HP MachPolicy attempts (no re-read).
+    /// Separated from `effect_decay_detected_total` so the Jetsam/Sysctl
+    /// re-read-disagreement baseline 27 stays comparable post-deploy.
+    #[serde(default)]
+    pub effect_decay_hp_mach_attempts_total: u64,
+
+    // ── Approach 2 (2026-06-07) — OutcomeTracker class-reclassification HP exclusion.
+    // Producer: `PatternWeight::effectiveness_for_classification(name)` returns
+    // `None` when `safety::hard_protected_contains(name)` is true. Mirrors the
+    // LSE counter so `runtime_metrics.json` exposes the per-cycle suppression
+    // count for operator review. Sustained non-zero values mean the prod
+    // Brave/Chromium Boost-loop is being correctly suppressed at the signal
+    // layer (CLAUDE.md "Chromium SIGSTOP never" + soft-throttle structurally-
+    // degraded effectiveness). `#[serde(default)]` preserves backwards
+    // compatibility with pre-fix `runtime_metrics.json` snapshots — legacy
+    // files deserialize this field as 0.
+    #[serde(default)]
+    pub hard_protected_reclassify_excluded_total: u64,
+
     // ── Group C (2026-06-06) — Invariant #13 port-hub gate + Dempster-Shafer.
     // Producers:
     //   * `mediator_port_hub_blocks_total` — `MachPolicyEffector::apply`
@@ -2070,6 +2089,42 @@ pub struct RuntimeMetrics {
     pub mediator_port_hub_probe_unavailable_total: u64,
     #[serde(default)]
     pub policy_scorer_ds_high_conflict_fallback_total: u64,
+
+    // ── Brave-Boost feedback loop fix (2026-06-07, APPROACH 1). ──────────────
+    // Producer: `decide_actions::decide_actions` at the wait-graph blocker,
+    // interactive-focus, and ML/AMX BOOST emission arms. Increments when the
+    // target name hits `safety::hard_protected_contains` and the would-be
+    // BoostProcess is suppressed. Stays at 0 until a hard-protected name
+    // (e.g. "Brave Browser Helper", "WindowServer" outside the display-
+    // pipeline carve-out) tries to take a Boost path. See LSE field doc.
+    #[serde(default)]
+    pub hard_protected_boost_skipped_total: u64,
+
+    // ── Approach-3 wire (2026-06-07). ────────────────────────────────────────
+    // Producer: `learned_state::poke_rollback_guard_via_decay`. Increments
+    // exactly once per successful `PolicyRollbackGuard::evaluate_from_decay`
+    // application — the decay-driven complement of
+    // `policy_rollback_executions_total`. Stays at 0 unless ≥5 hard-protected
+    // disagreements (per the effect-decay sliding window) land inside the
+    // 5-min rollback-recency window AND the guard's cooldown has elapsed.
+    // Compare against `effect_decay_detected_total` (raw HP+free disagreements)
+    // to verify the wire fires only when hard-protected targets dominate.
+    #[serde(default)]
+    pub policy_rollback_triggered_by_decay_total: u64,
+
+    // ── FIX-4-v2 (2026-06-07). Phantom-enrollment guard. ─────────────────────
+    // Producer: `execute_actions::execute_actions` Boost + SetThreadQoS arms.
+    // Increments every time the pre-syscall capability chain (caps.can_taskpolicy
+    // && qos_mgr.is_some() && syscall_success) failed so the
+    // `effect_decay::record_global` call was correctly suppressed. Under the
+    // Round-2 unconditional design those calls would have enrolled
+    // PendingObservations against a tier the kernel never actually applied,
+    // skewing `effect_decay_detected_total` with false-positive HP
+    // disagreements. Stays at 0 on a fully-capable daemon with healthy
+    // syscall returns; a sustained non-zero ratio against
+    // `boosts_applied + thread_qos_applied` quantifies the capability gap.
+    #[serde(default)]
+    pub effect_decay_phantom_enroll_skipped_total: u64,
 }
 
 impl RuntimeMetrics {

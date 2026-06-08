@@ -560,6 +560,27 @@ pub struct LockFreeMetrics {
     /// value. Telemetry-only; no scorer feedback in this iteration.
     pub effect_decay_detected_total: AtomicU64,
 
+    /// Round-4 (2026-06-07). FIX-3-v2 unconditional HP forward path:
+    /// MachPolicy attempts on hard-protected processes recorded into the
+    /// 5-min HP window WITHOUT re-read. Tracked separately from
+    /// `effect_decay_detected_total` (which keeps Jetsam/Sysctl
+    /// re-read-disagreement semantics — baseline 27 at 2026-06-07).
+    /// Bumped exclusively by `DecayWatchdog::record_hp_mach_attempt`.
+    pub effect_decay_hp_mach_attempts_total: AtomicU64,
+
+    /// Sprint patch (2026-06-07). Approach 2 — OutcomeTracker class-
+    /// reclassification gate excluded a hard-protected entry from the
+    /// `low_value_names` signal because its low effectiveness is a
+    /// property of the structurally-degraded soft-throttle path
+    /// (PRIO_DARWIN_BG + jetsam BACKGROUND demote), NOT a signal that
+    /// the process does not cause pressure. Bumps whenever
+    /// `PatternWeight::effectiveness_for_classification(name)` returns
+    /// `None` because `safety::hard_protected_contains(name)` is true.
+    /// A sustained non-zero ratio means the prod-observed Brave/Chromium
+    /// Boost-loop (110 of 200 actions targeting hard-protected RAM
+    /// hogs) is being correctly suppressed at the signal layer.
+    pub hard_protected_reclassify_excluded_total: AtomicU64,
+
     /// Sprint patch (2026-06-05). Group C Invariant #13 — port-hub
     /// protection: `MachPolicyEffector::apply` refused to demote a
     /// process whose Mach port-right count exceeded `PORT_HUB_THRESHOLD`
@@ -589,6 +610,46 @@ pub struct LockFreeMetrics {
     /// disagree about action validity often enough that DS aggregation
     /// is not the right tool for the current feature set.
     pub policy_scorer_ds_high_conflict_fallback_total: AtomicU64,
+
+    /// Sprint patch (2026-06-07). Brave-Boost feedback loop fix
+    /// (APPROACH 1). Counts the number of times `decide_actions` short-
+    /// circuited a BoostProcess emission because the target name hit
+    /// `safety::hard_protected_contains`. Closes the asymmetry between
+    /// the FREEZE path (which has had this guard since the early gate
+    /// tower) and the BOOST path, which was emitting Boost for hard-
+    /// protected names like "Brave Browser Helper" — the wrong-action
+    /// vector documented at 2026-06-07T19:35Z (PID 16105: 110/200 boosts
+    /// on Brave under sustained pressure).
+    /// [Saltzer & Kaashoek 2009 §3.3] complete mediation invariant.
+    pub hard_protected_boost_skipped_total: AtomicU64,
+
+    /// Approach-3 wire (2026-06-07). Hellerstein settling-time observer
+    /// → `PolicyRollbackGuard` link. Bumps once per successful
+    /// `PolicyRollbackGuard::evaluate_from_decay` application
+    /// (zone_alpha / rl_pressure_bands[2] reverted because ≥5
+    /// hard-protected disagreements landed in the 5-min window).
+    /// Distinct from `policy_rollback_executions_total` so the
+    /// dashboard can attribute auto-reverts to their trigger:
+    /// quality-driven (existing) vs decay-driven (new). Stays at 0 in
+    /// systems where no hard-protected target accumulates settling
+    /// disagreements — exactly the regression-quiet state we want.
+    pub policy_rollback_triggered_by_decay_total: AtomicU64,
+
+    /// FIX-4-v2 (2026-06-07). Phantom-enrollment guard on the
+    /// effect-decay watchdog. Bumps every time `execute_actions` Boost
+    /// or SetThreadQoS arm declined to enroll a `PendingObservation`
+    /// because the Mach mutation precondition chain failed:
+    ///   - dry_run mode (not counted — by design)
+    ///   - caps.can_taskpolicy = false
+    ///   - qos_mgr = None
+    ///   - set_tier / apply_raw returned success = false
+    /// Stays at 0 on a fully-capable production daemon when every
+    /// emitted Boost completes its syscall. A non-zero value signals
+    /// either a degraded capability surface (build/host config) or a
+    /// burst of failing syscalls — the latter would have driven
+    /// false-positive `effect_decay_detected_total` ticks under the
+    /// Round-2 unconditional-record_global design.
+    pub effect_decay_phantom_enroll_skipped_total: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -737,9 +798,14 @@ impl LockFreeMetrics {
             pid_recycle_blocks_total: AtomicU64::new(0),
             policy_scorer_uncertainty_saturated_total: AtomicU64::new(0),
             effect_decay_detected_total: AtomicU64::new(0),
+            effect_decay_hp_mach_attempts_total: AtomicU64::new(0),
+            hard_protected_reclassify_excluded_total: AtomicU64::new(0),
             mediator_port_hub_blocks_total: AtomicU64::new(0),
             mediator_port_hub_probe_unavailable_total: AtomicU64::new(0),
             policy_scorer_ds_high_conflict_fallback_total: AtomicU64::new(0),
+            hard_protected_boost_skipped_total: AtomicU64::new(0),
+            policy_rollback_triggered_by_decay_total: AtomicU64::new(0),
+            effect_decay_phantom_enroll_skipped_total: AtomicU64::new(0),
         }
     }
 
@@ -1221,6 +1287,12 @@ impl LockFreeMetrics {
             effect_decay_detected_total: self
                 .effect_decay_detected_total
                 .load(Ordering::Relaxed),
+            effect_decay_hp_mach_attempts_total: self
+                .effect_decay_hp_mach_attempts_total
+                .load(Ordering::Relaxed),
+            hard_protected_reclassify_excluded_total: self
+                .hard_protected_reclassify_excluded_total
+                .load(Ordering::Relaxed),
             mediator_port_hub_blocks_total: self
                 .mediator_port_hub_blocks_total
                 .load(Ordering::Relaxed),
@@ -1229,6 +1301,15 @@ impl LockFreeMetrics {
                 .load(Ordering::Relaxed),
             policy_scorer_ds_high_conflict_fallback_total: self
                 .policy_scorer_ds_high_conflict_fallback_total
+                .load(Ordering::Relaxed),
+            hard_protected_boost_skipped_total: self
+                .hard_protected_boost_skipped_total
+                .load(Ordering::Relaxed),
+            policy_rollback_triggered_by_decay_total: self
+                .policy_rollback_triggered_by_decay_total
+                .load(Ordering::Relaxed),
+            effect_decay_phantom_enroll_skipped_total: self
+                .effect_decay_phantom_enroll_skipped_total
                 .load(Ordering::Relaxed),
         }
     }
@@ -1546,6 +1627,30 @@ impl LockFreeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Round-4 (2026-06-07). FIX-3-v2 unconditional HP forward.
+    /// Producer: `DecayWatchdog::record_hp_mach_attempt`. Separated
+    /// from `effect_decay_detected_total` to preserve the baseline-27
+    /// Jetsam/Sysctl re-read-disagreement semantics that drives the
+    /// regression watchdog in metrics_to_watch.
+    #[inline(always)]
+    pub fn inc_effect_decay_hp_mach_attempt(&self) {
+        self.effect_decay_hp_mach_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sprint patch (2026-06-07). Approach 2 — OutcomeTracker class-
+    /// reclassification gate excluded a hard-protected entry from the
+    /// `low_value_names` signal. Producer: `PatternWeight::
+    /// effectiveness_for_classification`. Counts every read, not unique
+    /// entries — a sustained non-zero ratio against `low_value_names.len()`
+    /// quantifies how much of the structurally-degraded throttle waste
+    /// would have driven a misclassification without the gate.
+    #[inline(always)]
+    pub fn inc_hard_protected_reclassify_excluded(&self) {
+        self.hard_protected_reclassify_excluded_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Sprint patch (2026-06-05). Group C Invariant #13 — port-hub gate
     /// vetoed a tier demote on a process with >5000 Mach port rights.
     #[inline(always)]
@@ -1568,6 +1673,41 @@ impl LockFreeMetrics {
     #[inline(always)]
     pub fn inc_policy_scorer_ds_high_conflict_fallback(&self) {
         self.policy_scorer_ds_high_conflict_fallback_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sprint patch (2026-06-07). APPROACH 1 — `decide_actions` BOOST
+    /// arm caught a hard-protected target name and short-circuited the
+    /// emission. Producers: `decide_actions::decide_actions` at the
+    /// wait-graph blocker, interactive-focus, and ML/AMX boost sites.
+    #[inline(always)]
+    pub fn inc_hard_protected_boost_skipped(&self) {
+        self.hard_protected_boost_skipped_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Approach-3 wire (2026-06-07). One increment per successful
+    /// `PolicyRollbackGuard::evaluate_from_decay` application — the
+    /// decay-driven complement of `inc_policy_rollback_execution`.
+    /// Producer: `learned_state::poke_rollback_guard_via_decay`.
+    #[inline(always)]
+    pub fn inc_policy_rollback_triggered_by_decay(&self) {
+        self.policy_rollback_triggered_by_decay_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// FIX-4-v2 (2026-06-07). Phantom-enrollment guard.
+    /// Producers: `execute_actions::execute_actions` Boost + SetThreadQoS
+    /// arms, when the pre-syscall capability chain (caps.can_taskpolicy +
+    /// qos_mgr.is_some()) fails OR the Mach syscall itself returned
+    /// success = false. Each increment corresponds to one would-be
+    /// `effect_decay::record_global` call that the Round-2 design would
+    /// have emitted unconditionally and that the v2 guard now correctly
+    /// suppresses. Use the counter delta to verify the guard is firing
+    /// without re-enabling the phantom path.
+    #[inline(always)]
+    pub fn inc_effect_decay_phantom_enroll_skipped(&self) {
+        self.effect_decay_phantom_enroll_skipped_total
             .fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -1741,12 +1881,31 @@ pub struct MetricsSnapshot {
     pub policy_scorer_uncertainty_saturated_total: u64,
     /// Sprint patch (2026-06-05). S10 stuck-effect decay detections.
     pub effect_decay_detected_total: u64,
+    /// Round-4 (2026-06-07). FIX-3-v2 HP MachPolicy attempts (no re-read).
+    pub effect_decay_hp_mach_attempts_total: u64,
+    /// Sprint patch (2026-06-07). Approach 2 — class-reclassification HP exclusion.
+    pub hard_protected_reclassify_excluded_total: u64,
     /// Sprint patch (2026-06-05). Group C Invariant #13 port-hub blocks.
     pub mediator_port_hub_blocks_total: u64,
     /// Sprint patch (2026-06-05). Group C Invariant #13 port-hub probe unavailable.
     pub mediator_port_hub_probe_unavailable_total: u64,
     /// Sprint patch (2026-06-05). Group C Dempster-Shafer high-conflict fallback.
     pub policy_scorer_ds_high_conflict_fallback_total: u64,
+    /// Sprint patch (2026-06-07). APPROACH 1 — BOOST-path hard-protected guard.
+    pub hard_protected_boost_skipped_total: u64,
+    /// Approach-3 wire (2026-06-07). Cumulative count of
+    /// `PolicyRollbackGuard` reverts triggered by the
+    /// effect-decay watchdog rather than by
+    /// `RestoreQualityMonitor`. Each increment corresponds to one
+    /// successful application of a `RollbackPlan` produced by
+    /// `PolicyRollbackGuard::evaluate_from_decay`.
+    pub policy_rollback_triggered_by_decay_total: u64,
+    /// FIX-4-v2 (2026-06-07). Phantom-enrollment guard hits on the
+    /// effect-decay watchdog (Boost + SetThreadQoS execute arms).
+    /// Counts every time the pre-syscall capability chain failed
+    /// (caps.can_taskpolicy = false, qos_mgr = None, or syscall
+    /// returned false) so `record_global` was correctly suppressed.
+    pub effect_decay_phantom_enroll_skipped_total: u64,
 }
 
 // ── ARM64 LSE verification ───────────────────────────────────────────────────

@@ -270,6 +270,17 @@ impl MetricsState {
         self.metrics.policy_scorer_uncertainty_saturated_total =
             lf.policy_scorer_uncertainty_saturated_total;
         self.metrics.effect_decay_detected_total = lf.effect_decay_detected_total;
+        self.metrics.effect_decay_hp_mach_attempts_total = lf.effect_decay_hp_mach_attempts_total;
+
+        // Approach 2 (2026-06-07). OutcomeTracker class-reclassification gate
+        // excluded a hard-protected entry from the `low_value_names` signal
+        // because `safety::hard_protected_contains(name)` is true. Producer:
+        // `PatternWeight::effectiveness_for_classification` in outcome_tracker.
+        // Mirroring here closes the silent-telemetry-death pattern (Sprint 9
+        // `4b13a39`) — without this line the counter increments forever but
+        // never reaches `runtime_metrics.json`.
+        self.metrics.hard_protected_reclassify_excluded_total =
+            lf.hard_protected_reclassify_excluded_total;
 
         // Group C (2026-06-06) — Invariant #13 port-hub gate observability.
         // `port_hub_blocks_total` must rise non-zero before this gate can
@@ -283,6 +294,36 @@ impl MetricsState {
             lf.mediator_port_hub_probe_unavailable_total;
         self.metrics.policy_scorer_ds_high_conflict_fallback_total =
             lf.policy_scorer_ds_high_conflict_fallback_total;
+
+        // Brave-Boost feedback loop fix (2026-06-07, APPROACH 1).
+        // Producer = `decide_actions` BOOST arm guard. Stays at 0 unless a
+        // hard-protected name reaches an unguarded Boost emit site. The
+        // explicit copy here is the silent-telemetry-death guard (Sprint 9
+        // `4b13a39`): without it the LSE counter increments forever but
+        // never surfaces in `runtime_metrics.json`.
+        self.metrics.hard_protected_boost_skipped_total =
+            lf.hard_protected_boost_skipped_total;
+
+        // Approach-3 wire (2026-06-07). Producer =
+        // `learned_state::poke_rollback_guard_via_decay`. Increments only
+        // when ≥5 hard-protected disagreements land in the 5-min effect-
+        // decay sliding window AND the rollback guard's cooldown is clear.
+        // Same silent-telemetry-death discipline (Sprint 9 `4b13a39`):
+        // without this explicit copy the counter would never reach
+        // `runtime_metrics.json` even when the rollback fires.
+        self.metrics.policy_rollback_triggered_by_decay_total =
+            lf.policy_rollback_triggered_by_decay_total;
+
+        // FIX-4-v2 (2026-06-07). Producer = `execute_actions` Boost +
+        // SetThreadQoS arms when the pre-syscall capability chain fails
+        // (caps.can_taskpolicy = false, qos_mgr = None, or the Mach
+        // syscall returned success = false). Silent-telemetry-death
+        // discipline (Sprint 9 `4b13a39`) requires this explicit copy
+        // — without it the counter increments forever on a degraded
+        // capability surface but never surfaces in `runtime_metrics.json`,
+        // hiding the very pathology the counter exists to expose.
+        self.metrics.effect_decay_phantom_enroll_skipped_total =
+            lf.effect_decay_phantom_enroll_skipped_total;
 
         // Sprint 12 Convergence #4 (2026-05-17). Producer is the daemon
         // main-loop convergence probe (after the cycle's
