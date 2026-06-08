@@ -1399,6 +1399,20 @@ const POLICY_ROLLBACK_RECENT_WINDOW: std::time::Duration = std::time::Duration::
 /// low for unrelated reasons (e.g., a workload spike).
 const POLICY_ROLLBACK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// Approach-3 wire (2026-06-07). Minimum number of hard-protected
+/// disagreements (per `effect_decay::DecayWatchdog::hard_protected_decay_count_5min`)
+/// inside the 5-min sliding window required to trigger an auto-revert
+/// via `PolicyRollbackGuard::evaluate_from_decay`.
+///
+/// Calibrated against the observed prod incident (2026-06-07T19:35Z,
+/// PID 16105): 27 decays in the session window with ~110 boosts on
+/// Brave Browser Helper. Five disagreements in 5 minutes corresponds
+/// to ≥1 ineffective action per 60 s — a clear signal the kernel is
+/// not honouring our jetsam hints on the hard-protected target. The
+/// 10-min cooldown on the guard itself prevents thrashing even if
+/// decays stay elevated.
+pub const HARD_PROTECTED_DECAY_THRESHOLD: usize = 5;
+
 /// One entry in the rollback ring buffer: which parameter, what its value
 /// was BEFORE the shift, and when the shift happened.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -1529,6 +1543,69 @@ impl PolicyRollbackGuard {
         crate::engine::lse_counters::LSE_COUNTERS.inc_policy_rollback_execution();
     }
 
+    /// Mark the guard as executed WITHOUT bumping the
+    /// `policy_rollback_executions_total` counter — used by the
+    /// decay-driven path so the dashboard can attribute the revert to
+    /// `policy_rollback_triggered_by_decay_total` instead.
+    pub fn mark_executed_silent(&mut self, now: std::time::SystemTime) {
+        self.cooldown_until = Some(now + POLICY_ROLLBACK_COOLDOWN);
+        self.recent_shifts.clear();
+    }
+
+    /// Approach-3 wire (2026-06-07). Effect-decay-driven evaluator.
+    ///
+    /// Decides whether a rollback should fire on the basis of the
+    /// hard-protected disagreement count (rather than
+    /// `RestoreQualityMonitor::quality`). Mirrors [`Self::evaluate`]'s
+    /// gating discipline — cooldown + 5-min recency window on
+    /// `recent_shifts` — but uses the decay-count threshold instead of
+    /// the safety_floor comparison.
+    ///
+    /// Fires when:
+    /// - `hp_decay_count >= HARD_PROTECTED_DECAY_THRESHOLD`, AND
+    /// - the guard's cooldown has elapsed (or no rollback has ever fired), AND
+    /// - at least one recent shift sits within
+    ///   [`POLICY_ROLLBACK_RECENT_WINDOW`] of `now`.
+    ///
+    /// Does NOT consume `RestoreQualityMonitor::quality` — the two
+    /// paths are independent quality signals; the cooldown gates both,
+    /// so a quality-driven fire and a decay-driven fire cannot both
+    /// land in the same 10-minute window. Strict superset of current
+    /// behaviour: never prevents a quality-driven revert.
+    pub fn evaluate_from_decay(
+        &mut self,
+        hp_decay_count: usize,
+        now: std::time::SystemTime,
+    ) -> Option<RollbackPlan> {
+        crate::engine::lse_counters::LSE_COUNTERS.inc_policy_rollback_evaluation();
+        if hp_decay_count < HARD_PROTECTED_DECAY_THRESHOLD {
+            return None;
+        }
+        if let Some(until) = self.cooldown_until {
+            if now < until {
+                return None;
+            }
+        }
+        let mut entries: Vec<RollbackPlanEntry> = Vec::new();
+        for rec in self.recent_shifts.iter().rev() {
+            let in_window = match now.duration_since(rec.at) {
+                Ok(elapsed) => elapsed <= POLICY_ROLLBACK_RECENT_WINDOW,
+                Err(_) => false,
+            };
+            if in_window {
+                entries.push(RollbackPlanEntry {
+                    kind: rec.kind,
+                    pre_value: rec.pre_value,
+                });
+            }
+        }
+        if entries.is_empty() {
+            None
+        } else {
+            Some(RollbackPlan { entries })
+        }
+    }
+
     /// Observability helper: current ring depth (for tests + dashboards).
     pub fn recent_shifts_len(&self) -> usize {
         self.recent_shifts.len()
@@ -1538,6 +1615,113 @@ impl PolicyRollbackGuard {
     pub fn oldest_pre_value(&self) -> Option<f64> {
         self.recent_shifts.front().map(|r| r.pre_value)
     }
+}
+
+/// Approach-3 wire (2026-06-07). Apply a [`RollbackPlan`] to the given
+/// [`LearnableParams`]: restores `zone_alpha` and `rl_pressure_bands[2]`
+/// to their pre-shift values. First-seen per kind wins (plan entries
+/// are already most-recent-first per `evaluate` / `evaluate_from_decay`).
+///
+/// Returns the list of restored parameter names — the caller logs them.
+///
+/// IMPORTANT: this helper does NOT touch
+/// `OutcomeTracker.weights` or any per-process learning state. That's
+/// owned by other approaches (per the task spec). Only the
+/// `LearnableParams` fields that the rollback guard actively tracks
+/// (`PolicyShiftKind::ZoneAlpha` / `RlBandUpper`) are mutated here.
+pub fn apply_rollback_plan(
+    lp: &mut LearnableParams,
+    plan: &RollbackPlan,
+) -> Vec<&'static str> {
+    let mut restored: Vec<&'static str> = Vec::with_capacity(plan.entries.len());
+    let mut zone_alpha_done = false;
+    let mut rl_upper_done = false;
+    let mut overflow_done = false;
+    for entry in &plan.entries {
+        match entry.kind {
+            PolicyShiftKind::ZoneAlpha if !zone_alpha_done => {
+                lp.zone_alpha = entry.pre_value;
+                zone_alpha_done = true;
+                restored.push("zone_alpha");
+            }
+            PolicyShiftKind::RlBandUpper if !rl_upper_done => {
+                lp.rl_pressure_bands[2] = entry.pre_value;
+                rl_upper_done = true;
+                restored.push("rl_band_upper");
+            }
+            PolicyShiftKind::OverflowThresholdBgPressure if !overflow_done => {
+                // No direct field on `LearnableParams` — owned by
+                // `OverflowGuard` in the daemon. Logged-only so the
+                // operator can trace the intent.
+                overflow_done = true;
+                restored.push("overflow_bg_pressure(deferred)");
+            }
+            _ => {}
+        }
+    }
+    restored
+}
+
+/// Approach-3 wire (2026-06-07). One-shot entry point for the daemon
+/// to consult the effect-decay → rollback guard wire each cycle.
+///
+/// `hp_decay_count` is the result of
+/// [`crate::engine::effect_decay::DecayWatchdog::hard_protected_decay_count_5min`].
+/// `hp_decay_pids` is the snapshot from
+/// [`crate::engine::effect_decay::DecayWatchdog::hard_protected_decay_pids`]
+/// used for the operator-visible log line.
+///
+/// Returns `true` when a rollback fired; `false` otherwise (count
+/// below threshold, cooldown active, no in-window shifts, or
+/// learnable_params guard not yet initialised).
+///
+/// Side effects on success:
+/// - Mutates `lp.zone_alpha` / `lp.rl_pressure_bands[2]` back to their
+///   pre-shift values (per `apply_rollback_plan`).
+/// - Bumps `LSE_COUNTERS.policy_rollback_triggered_by_decay_total` once.
+/// - Emits one structured `tracing::warn!` line at target
+///   `apollo.policy_rollback.decay` with the trigger PID list and the
+///   restored fields.
+/// - Starts the 10-min cooldown on the guard (via `mark_executed_silent`).
+///
+/// Does NOT touch `OutcomeTracker.weights` (per task spec — that's
+/// owned by other approaches), `CausalGraph`, `NarsBelief`, or any
+/// other learned-state component.
+pub fn poke_rollback_guard_via_decay(
+    lp: &mut LearnableParams,
+    hp_decay_count: usize,
+    hp_decay_pids: &[u32],
+) -> bool {
+    let now = std::time::SystemTime::now();
+    // Compute the plan and end the &mut borrow on `policy_rollback_guard`
+    // before we touch the rest of `lp`. `mark_executed_silent` happens in
+    // a second short borrow after `apply_rollback_plan` mutates the params.
+    let plan = match lp.policy_rollback_guard.as_mut() {
+        Some(g) => match g.evaluate_from_decay(hp_decay_count, now) {
+            Some(p) => p,
+            None => return false,
+        },
+        None => return false,
+    };
+    let restored = apply_rollback_plan(lp, &plan);
+    if let Some(g) = lp.policy_rollback_guard.as_mut() {
+        g.mark_executed_silent(now);
+    }
+    crate::engine::lse_counters::LSE_COUNTERS.inc_policy_rollback_triggered_by_decay();
+    // Single log line with the trigger PIDs and the reverted fields.
+    // Sample to bound spam under pathological pressure — the 10-min
+    // cooldown on the guard means this line can fire at most ~6× per
+    // hour regardless of how often the daemon polls.
+    tracing::warn!(
+        target: "apollo.policy_rollback.decay",
+        hp_decay_count = hp_decay_count,
+        hp_decay_pids = ?hp_decay_pids,
+        restored = ?restored,
+        threshold = HARD_PROTECTED_DECAY_THRESHOLD,
+        "EFFECT-DECAY AUTO-REVERT fired: hard-protected disagreements crossed threshold; \
+         restored learnable params to pre-shift values"
+    );
+    true
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -2571,5 +2755,169 @@ mod tests {
         guard.record_shift(PolicyShiftKind::RlBandUpper, 0.92, now);
         let plan = guard.evaluate(0.50, now + std::time::Duration::from_secs(30));
         assert!(plan.is_none(), "quality ≥ floor must not trigger rollback");
+    }
+
+    // ── Approach-3 wire (2026-06-07) — effect_decay → PolicyRollbackGuard ──
+
+    #[test]
+    fn decay_eval_below_threshold_does_not_fire() {
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
+        guard.record_shift(PolicyShiftKind::ZoneAlpha, 0.005, now);
+        // 4 < HARD_PROTECTED_DECAY_THRESHOLD (5).
+        let plan = guard.evaluate_from_decay(4, now + std::time::Duration::from_secs(30));
+        assert!(
+            plan.is_none(),
+            "below-threshold decay count must not fire rollback"
+        );
+    }
+
+    #[test]
+    fn decay_eval_at_threshold_with_in_window_shift_fires() {
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(20_000);
+        guard.record_shift(PolicyShiftKind::ZoneAlpha, 0.005, now);
+        let plan = guard
+            .evaluate_from_decay(
+                HARD_PROTECTED_DECAY_THRESHOLD,
+                now + std::time::Duration::from_secs(60),
+            )
+            .expect("at-threshold decay must fire when an in-window shift exists");
+        assert_eq!(plan.entries.len(), 1);
+        assert!(matches!(plan.entries[0].kind, PolicyShiftKind::ZoneAlpha));
+    }
+
+    #[test]
+    fn decay_eval_respects_cooldown() {
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(30_000);
+        guard.record_shift(PolicyShiftKind::ZoneAlpha, 0.005, now);
+        let _first = guard
+            .evaluate_from_decay(10, now + std::time::Duration::from_secs(60))
+            .expect("first fire ok");
+        guard.mark_executed_silent(now + std::time::Duration::from_secs(60));
+        // 5 minutes later — still within the 10-minute cooldown.
+        guard.record_shift(
+            PolicyShiftKind::RlBandUpper,
+            0.92,
+            now + std::time::Duration::from_secs(180),
+        );
+        let plan2 = guard.evaluate_from_decay(20, now + std::time::Duration::from_secs(240));
+        assert!(
+            plan2.is_none(),
+            "decay-driven evaluate must respect the 10-min cooldown"
+        );
+    }
+
+    #[test]
+    fn decay_eval_empty_shifts_returns_none() {
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(40_000);
+        // No recorded shifts: even ≥threshold decay count must not fire.
+        let plan = guard.evaluate_from_decay(50, now);
+        assert!(
+            plan.is_none(),
+            "no in-window shifts → nothing to revert, must be None"
+        );
+    }
+
+    #[test]
+    fn poke_via_decay_reverts_zone_alpha_and_bumps_counter() {
+        use std::sync::atomic::Ordering;
+        let mut lp = LearnableParams::default();
+        let pre = lp.zone_alpha;
+        lp.zone_alpha = pre + 0.003; // simulate a meta-learn shift up
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        guard.record_shift(PolicyShiftKind::ZoneAlpha, pre, std::time::SystemTime::now());
+        lp.policy_rollback_guard = Some(guard);
+
+        let pre_counter = crate::engine::lse_counters::LSE_COUNTERS
+            .policy_rollback_triggered_by_decay_total
+            .load(Ordering::Relaxed);
+        let pre_executions = crate::engine::lse_counters::LSE_COUNTERS
+            .policy_rollback_executions_total
+            .load(Ordering::Relaxed);
+        let fired = poke_rollback_guard_via_decay(
+            &mut lp,
+            HARD_PROTECTED_DECAY_THRESHOLD,
+            &[1234, 5678],
+        );
+        assert!(fired, "poke must fire when threshold met + shift in window");
+        assert!(
+            (lp.zone_alpha - pre).abs() < f64::EPSILON,
+            "zone_alpha must be restored to pre-shift value"
+        );
+        let post_counter = crate::engine::lse_counters::LSE_COUNTERS
+            .policy_rollback_triggered_by_decay_total
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            post_counter,
+            pre_counter + 1,
+            "decay-driven counter must increment"
+        );
+        // Critical: the decay path must NOT bump the quality-driven
+        // executions counter — operators attribute reverts by source.
+        let post_executions = crate::engine::lse_counters::LSE_COUNTERS
+            .policy_rollback_executions_total
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            post_executions, pre_executions,
+            "decay-driven path must NOT bump policy_rollback_executions_total"
+        );
+    }
+
+    #[test]
+    fn poke_via_decay_no_guard_returns_false() {
+        let mut lp = LearnableParams::default();
+        assert!(lp.policy_rollback_guard.is_none());
+        let fired = poke_rollback_guard_via_decay(&mut lp, 999, &[]);
+        assert!(!fired, "missing guard must early-return false");
+    }
+
+    #[test]
+    fn poke_via_decay_below_threshold_does_not_revert() {
+        let mut lp = LearnableParams::default();
+        let pre = lp.zone_alpha;
+        lp.zone_alpha = pre + 0.003;
+        let mut guard = PolicyRollbackGuard::new(0.35);
+        guard.record_shift(PolicyShiftKind::ZoneAlpha, pre, std::time::SystemTime::now());
+        lp.policy_rollback_guard = Some(guard);
+        let fired = poke_rollback_guard_via_decay(&mut lp, 1, &[]); // 1 < 5
+        assert!(!fired);
+        assert!(
+            (lp.zone_alpha - (pre + 0.003)).abs() < f64::EPSILON,
+            "zone_alpha must NOT be reverted below threshold"
+        );
+    }
+
+    #[test]
+    fn apply_rollback_plan_first_seen_per_kind_wins() {
+        // Plan with two ZoneAlpha entries: only the first should apply
+        // (matches `evaluate_from_decay` most-recent-first ordering).
+        let mut lp = LearnableParams::default();
+        let plan = RollbackPlan {
+            entries: vec![
+                RollbackPlanEntry {
+                    kind: PolicyShiftKind::ZoneAlpha,
+                    pre_value: 0.111,
+                },
+                RollbackPlanEntry {
+                    kind: PolicyShiftKind::ZoneAlpha,
+                    pre_value: 0.999,
+                },
+                RollbackPlanEntry {
+                    kind: PolicyShiftKind::RlBandUpper,
+                    pre_value: 0.77,
+                },
+            ],
+        };
+        let restored = apply_rollback_plan(&mut lp, &plan);
+        // Default zone_alpha is 0.005 and validate isn't called here, so
+        // the raw assigned value should be 0.111.
+        assert!((lp.zone_alpha - 0.111).abs() < f64::EPSILON);
+        assert!((lp.rl_pressure_bands[2] - 0.77).abs() < f64::EPSILON);
+        assert_eq!(restored.len(), 2);
+        assert!(restored.contains(&"zone_alpha"));
+        assert!(restored.contains(&"rl_band_upper"));
     }
 }

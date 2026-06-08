@@ -5383,7 +5383,7 @@ fn main() -> anyhow::Result<()> {
                 // may not have reapplied tier hints — false-positive
                 // disagreements would inflate the counter.
                 if cycle_count > 6 {
-                    daemon_cycle_tail::drain_effect_decay(&state);
+                    daemon_cycle_tail::drain_effect_decay(&state, &mut learnable_params);
                 }
 
                 // ── Periodic stage: GC and observability (% 100 / % 500 / % 7200 gates) ──

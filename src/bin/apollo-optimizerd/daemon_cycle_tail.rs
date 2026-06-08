@@ -364,34 +364,97 @@ pub fn run_periodic_stage<'a>(
 /// kernel may not have reapplied tier hints — false-positive
 /// disagreements would inflate the counter. The daemon's wake
 /// tracking is in main.rs; this function trusts the caller.
-pub fn drain_effect_decay(state: &SharedState) {
+///
+/// FIX-3 wire (2026-06-07): forwards the observation into
+/// `report_disagreement_with` so hard-protected disagreements feed
+/// the 5-minute sliding window, then consults
+/// `poke_rollback_guard_via_decay` once per cycle. When the window
+/// crosses `HARD_PROTECTED_DECAY_THRESHOLD` and the rollback guard
+/// has eligible shifts + no active cooldown, this is the path that
+/// auto-reverts `zone_alpha` / `rl_pressure_bands[2]` to their
+/// pre-shift values. Without this caller, the wire was dormant —
+/// `poke_rollback_guard_via_decay` had zero invocations in the daemon.
+pub fn drain_effect_decay(
+    state: &SharedState,
+    lp: &mut apollo_engine::engine::learned_state::LearnableParams,
+) {
     let expired = {
         let mut w = state.effect_decay.lock_recover();
         w.drain_expired(std::time::Instant::now())
     };
     if expired.is_empty() {
+        // Still consult the rollback guard — a previously-recorded
+        // hard-protected disagreement window may have just crossed the
+        // threshold even on a cycle with no new expirations.
+        let (hp_count, hp_pids) = {
+            let mut w = state.effect_decay.lock_recover();
+            let now = std::time::Instant::now();
+            (
+                w.hard_protected_decay_count_5min(now),
+                w.hard_protected_decay_pids(now),
+            )
+        };
+        apollo_engine::engine::learned_state::poke_rollback_guard_via_decay(
+            lp, hp_count, &hp_pids,
+        );
         return;
     }
-    let watchdog = state.effect_decay.lock_recover();
-    for obs in expired {
-        use apollo_engine::engine::effect_decay::ObsKind;
-        let live = match obs.kind {
-            ObsKind::JetsamTier => {
-                apollo_engine::engine::jetsam_control::get_priority(obs.pid)
-                    .map(|p| p as i64)
+    {
+        let mut watchdog = state.effect_decay.lock_recover();
+        for obs in expired {
+            use apollo_engine::engine::effect_decay::ObsKind;
+            // FIX-3-v2 (Round 3, Option B): MachPolicy attempts on
+            // hard-protected processes ARE the disagreement signal — Apollo
+            // trying to mutate a Chromium-protected process under pressure is
+            // itself anomalous; no Mach FFI re-read needed.
+            //
+            // Round-4 (2026-06-07): route through `record_hp_mach_attempt`
+            // (NOT report_disagreement_with) so the HP MachPolicy path bumps
+            // its dedicated counter `effect_decay_hp_mach_attempts_total`,
+            // leaving `effect_decay_detected_total` reserved for the
+            // Jetsam/Sysctl re-read-disagreement baseline 27. Without the
+            // split, baseline comparisons in metrics_to_watch are invalidated
+            // because the same counter would mix two distinct signals.
+            if matches!(obs.kind, ObsKind::MachPolicy) {
+                if obs.hard_protected {
+                    watchdog.record_hp_mach_attempt(&obs);
+                }
+                // Non-hard-protected MachPolicy: producer-side re-read
+                // deferred — see banner. Skip.
+                continue;
             }
-            ObsKind::Sysctl => obs
-                .key
-                .as_deref()
-                .and_then(apollo_engine::engine::sysctl_direct::read_i32)
-                .map(|v| v as i64),
-            ObsKind::MachPolicy => None, // producer deferred — see banner
-        };
-        if let Some(actual) = live {
-            if actual != obs.value_post {
-                watchdog.report_disagreement();
+            let live = match obs.kind {
+                ObsKind::JetsamTier => {
+                    apollo_engine::engine::jetsam_control::get_priority(obs.pid)
+                        .map(|p| p as i64)
+                }
+                ObsKind::Sysctl => obs
+                    .key
+                    .as_deref()
+                    .and_then(apollo_engine::engine::sysctl_direct::read_i32)
+                    .map(|v| v as i64),
+                ObsKind::MachPolicy => unreachable!("handled above"),
+            };
+            if let Some(actual) = live {
+                if actual != obs.value_post {
+                    watchdog.report_disagreement_with(&obs);
+                }
             }
         }
     }
-    drop(watchdog);
+    // FIX-3 wire: consult the rollback guard once per cycle AFTER the
+    // drain loop has updated the hard-protected sliding window. The
+    // watchdog borrow is released above so we can re-lock it here for
+    // the count/pids snapshot without deadlock.
+    let (hp_count, hp_pids) = {
+        let mut w = state.effect_decay.lock_recover();
+        let now = std::time::Instant::now();
+        (
+            w.hard_protected_decay_count_5min(now),
+            w.hard_protected_decay_pids(now),
+        )
+    };
+    apollo_engine::engine::learned_state::poke_rollback_guard_via_decay(
+        lp, hp_count, &hp_pids,
+    );
 }
