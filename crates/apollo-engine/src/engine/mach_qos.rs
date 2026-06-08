@@ -343,11 +343,18 @@ pub enum ThroughputTier {
 }
 
 /// Result of applying a QoS policy change.
+///
+/// `success` reflects no-error outcomes including silent skips (cache-hit,
+/// SIP-blocked, permanently-blocked) where NO syscall ran. `mutated` is true
+/// only when `apply_task_policy` actually executed task_policy_set and got
+/// KERN_SUCCESS. Use `mutated` for effect_decay enrollment to avoid phantom
+/// observations.
 #[derive(Debug, Clone)]
 pub struct QoSOutcome {
     pub pid: u32,
     pub tier: SchedulingTier,
     pub success: bool,
+    pub mutated: bool,
     pub error: Option<String>,
 }
 
@@ -419,6 +426,7 @@ impl MachQoSManager {
                 pid,
                 tier,
                 success: true,
+                mutated: false,
                 error: None,
             };
         }
@@ -439,6 +447,7 @@ impl MachQoSManager {
                     pid,
                     tier,
                     success: true,
+                    mutated: false,
                     error: None,
                 };
             }
@@ -454,6 +463,7 @@ impl MachQoSManager {
                     pid,
                     tier,
                     success: true,
+                    mutated: false,
                     error: None,
                 };
             }
@@ -469,6 +479,7 @@ impl MachQoSManager {
                 pid,
                 tier,
                 success: true,
+                mutated: false,
                 error: None,
             };
         }
@@ -485,6 +496,7 @@ impl MachQoSManager {
                 pid,
                 tier,
                 success: true,
+                mutated: false,
                 error: None,
             };
         }
@@ -922,6 +934,7 @@ impl MachQoSManager {
                 pid,
                 tier: SchedulingTier::Normal,
                 success: true,
+                mutated: false,
                 error: None,
             };
         }
@@ -939,6 +952,7 @@ impl MachQoSManager {
                     pid,
                     tier: SchedulingTier::Normal,
                     success: true,
+                    mutated: false,
                     error: None,
                 };
             }
@@ -973,6 +987,7 @@ impl MachQoSManager {
                     pid,
                     tier: SchedulingTier::Normal,
                     success: false,
+                    mutated: false,
                     error: Some(format!("task_policy_set(QOS) failed: kern_return={}", kr2)),
                 };
             }
@@ -982,6 +997,7 @@ impl MachQoSManager {
             pid,
             tier: SchedulingTier::Normal,
             success: true,
+            mutated: true,
             error: None,
         }
     }
@@ -1327,6 +1343,7 @@ impl MachQoSManager {
                     pid,
                     tier,
                     success: false,
+                    mutated: false,
                     error: Some(format!("task_for_pid failed: kern_return={}", kr)),
                 };
             }
@@ -1346,6 +1363,7 @@ impl MachQoSManager {
                     pid,
                     tier,
                     success: false,
+                    mutated: false,
                     error: Some(format!("task_policy_set failed: kern_return={}", kr2)),
                 };
             }
@@ -1355,6 +1373,7 @@ impl MachQoSManager {
             pid,
             tier,
             success: true,
+            mutated: true,
             error: None,
         }
     }
@@ -1365,6 +1384,7 @@ impl MachQoSManager {
             pid,
             tier,
             success: false,
+            mutated: false,
             error: Some("task_policy_set only available on macOS".into()),
         }
     }

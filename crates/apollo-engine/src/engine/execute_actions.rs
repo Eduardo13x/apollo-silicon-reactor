@@ -461,13 +461,25 @@ pub fn execute_actions(
                         block_reason = Some(BlockReason::PidRecycled);
                         return Ok(());
                     }
+                    // FIX-4-v2 (2026-06-07): track whether the Mach
+                    // `set_tier` syscall actually mutated state. The Round-2
+                    // unconditional `record_global` call enrolled a
+                    // PendingObservation even when caps.can_taskpolicy was
+                    // false OR qos_mgr was None — a phantom-enrollment
+                    // pathway that would assert
+                    // SchedulingTier::Foreground post-state without any
+                    // syscall having run. The consumer would then re-read
+                    // the live tier, observe disagreement against a value
+                    // we never set, and feed false-positive HP
+                    // disagreements into the rollback trigger window.
+                    let mut tier_syscall_ok = false;
                     if !dry_run {
                         if caps.can_taskpolicy {
                             // Phase 2: direct Mach syscalls (~50µs vs ~5ms fork/exec).
                             // S4 cutover: short-guard Mutex lock per CLAUDE.md doctrine.
                             if let Some(arc) = qos_mgr.as_ref() {
                                 let mut mgr = arc.lock().unwrap_or_else(|e| e.into_inner());
-                                mgr.set_tier(
+                                let outcome = mgr.set_tier(
                                     *pid,
                                     crate::engine::mach_qos::SchedulingTier::Foreground,
                                 );
@@ -477,6 +489,16 @@ pub fn execute_actions(
                                     ThroughputTier::High,
                                 );
                                 drop(mgr);
+                                // Round-4 (2026-06-07): use `mutated` not
+                                // `success`. set_tier returns success=true on
+                                // cache-hit, permanently-blocked, sip-skip
+                                // paths where NO task_policy_set syscall ran.
+                                // Phantom enrollment of cached Brave Boosts
+                                // would feed FIX-3-v2 unconditional HP forward
+                                // and spurious-rollback zone_alpha during
+                                // crisis. `mutated` is true only after
+                                // KERN_SUCCESS from apply_task_policy.
+                                tier_syscall_ok = outcome.mutated;
                             }
                             // Boost I/O tier to Interactive.
                             apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Interactive);
@@ -484,6 +506,68 @@ pub fn execute_actions(
                         let _ = set_nice(*pid, -10);
                     }
                     out.boosts_applied += 1;
+                    // FIX-4-v2 (2026-06-07): phantom-enrollment guard.
+                    // Only enroll a PendingObservation for the Hellerstein
+                    // 2004 §9.3 effect-decay watchdog when the Mach
+                    // mutation actually ran. Guard chain:
+                    //   1. !dry_run               — no enrollment during simulate
+                    //   2. caps.can_taskpolicy    — kernel API surface live
+                    //   3. qos_mgr.is_some()      — manager wired into this path
+                    //   4. tier_syscall_ok        — `set_tier` returned success
+                    // Without (1-4) the consumer would re-read a tier we
+                    // never set and emit a spurious effect_decay event,
+                    // polluting the HP disagreement window that drives
+                    // poke_rollback_guard_via_decay. The
+                    // `effect_decay_phantom_enroll_skipped_total` counter
+                    // surfaces every rejected enrollment so dashboards can
+                    // separate "no signal because we didn't mutate" from
+                    // "signal observed and accepted".
+                    let phantom_guards_pass =
+                        !dry_run && caps.can_taskpolicy && qos_mgr.is_some() && tier_syscall_ok;
+                    if phantom_guards_pass {
+                        // Round-4 (2026-06-07): gate `is_hp` on the carve-out
+                        // DecisionReason. decide_actions has TWO intentional
+                        // BoostProcess emissions targeting hard-protected
+                        // names (DisplayPipeline → WindowServer/Dock/
+                        // SystemUIServer; CompositorPriority → WindowServer
+                        // high-CPU). These are NOT policy failures — they're
+                        // cooperative carve-outs that the safety doctrine
+                        // explicitly permits (see decide_actions.rs:888-891
+                        // and :924-927). Marking them hard_protected would
+                        // make FIX-3-v2 forward them to PolicyRollbackGuard
+                        // as disagreements, inverting the signal: a
+                        // successful intentional carve-out boost would log
+                        // as "policy failure → revert zone_alpha".
+                        let is_carveout = matches!(
+                            decision_reason,
+                            crate::engine::audit_types::DecisionReason::DisplayPipeline
+                                | crate::engine::audit_types::DecisionReason::CompositorPriority
+                        );
+                        let is_hp = !is_carveout
+                            && crate::engine::safety::is_boost_forbidden(name);
+                        crate::engine::effect_decay::record_global(
+                            crate::engine::effect_decay::PendingObservation {
+                                effect_id: 0,
+                                pid: *pid,
+                                kind: crate::engine::effect_decay::ObsKind::MachPolicy,
+                                key: None,
+                                // SchedulingTier::Foreground == 0 (first
+                                // variant, see mach_qos.rs:271). Stable
+                                // post-syscall encoding for the consumer's
+                                // re-read via `MachQoSManager::current_tier`.
+                                value_post: 0,
+                                deadline: std::time::Instant::now()
+                                    + crate::engine::effect_decay::DecayWatchdog::settle_window(),
+                                hard_protected: is_hp,
+                            },
+                        );
+                    } else if !dry_run {
+                        // Only bump the skip counter for real (non-dry-run)
+                        // cycles — dry-run skips are by-design and would
+                        // otherwise saturate the counter.
+                        crate::engine::lse_counters::LSE_COUNTERS
+                            .inc_effect_decay_phantom_enroll_skipped();
+                    }
                 }
                 RootAction::ThrottleProcess {
                     pid,
@@ -740,6 +824,17 @@ pub fn execute_actions(
                             // jetsam_control::get_priority() after the 5 s
                             // settling window.
                             if mediate_res.is_ok() {
+                                // Approach-3 wire (2026-06-07): mark this
+                                // observation as targeting a hard-protected
+                                // process so the consumer can accumulate
+                                // hard-protected disagreements into the
+                                // PolicyRollbackGuard trigger window. Brave
+                                // / Chromium / WindowServer fall here —
+                                // matches the "soft-throttle structurally
+                                // ineffective" pathology documented in the
+                                // Approach-3 root-cause analysis.
+                                let is_hp =
+                                    crate::engine::safety::hard_protected_contains(name);
                                 crate::engine::effect_decay::record_global(
                                     crate::engine::effect_decay::PendingObservation {
                                         effect_id: 0,
@@ -750,6 +845,7 @@ pub fn execute_actions(
                                         value_post: crate::engine::jetsam_control::priority::BACKGROUND as i64,
                                         deadline: std::time::Instant::now()
                                             + crate::engine::effect_decay::DecayWatchdog::settle_window(),
+                                        hard_protected: is_hp,
                                     },
                                 );
                             }
@@ -917,6 +1013,10 @@ pub fn execute_actions(
                                         value_post: post_val,
                                         deadline: std::time::Instant::now()
                                             + crate::engine::effect_decay::DecayWatchdog::settle_window(),
+                                        // Build-shim (see jetsam site above). SetSysctl has
+                                        // no per-process name in scope; defaulting to false
+                                        // is correct — sysctl keys are global, not per-PID.
+                                        hard_protected: false,
                                     },
                                 );
                             }
@@ -1033,31 +1133,108 @@ pub fn execute_actions(
                         _ => ThreadTier::Utility,
                     };
                     if !dry_run {
-                        // S4 cutover (2026-06-06 cont.): route through
-                        // ThreadPolicyEffector::apply_raw so the typed
-                        // chokepoint is the SOLE writer of thread QoS state.
-                        // Counter `mediator_thread_policy_total` increments
-                        // only on syscall success — see effector counter
-                        // semantics doc-comment for the attempts-vs-applies
-                        // distinction. Identity guard already verified
-                        // above (Inv#11 early-return); apply_raw is the
-                        // post-verification dispatch path.
-                        if let Some(arc) = qos_mgr.as_ref() {
-                            let effector = crate::engine::mediator::ThreadPolicyEffector::new(
-                                std::sync::Arc::clone(arc),
-                            );
-                            let (ok, _syscall_us, applied) = effector.apply_raw(
-                                *pid,
-                                *thread_index,
-                                thread_tier,
-                                *affinity_tag,
-                            );
-                            if ok {
-                                out.thread_qos_applied += applied as u64;
+                        // FIX-4-v2 (2026-06-07): phantom-enrollment guard
+                        // chain mirrors the Boost arm. Pre-syscall checks
+                        // (caps.can_taskpolicy + qos_mgr.is_some()) are
+                        // load-bearing because the Round-2 enrollment was
+                        // gated only on the `ok` boolean returned by
+                        // apply_raw — but on a system where the qos_mgr is
+                        // None we never even entered the inner block, so
+                        // no enrollment could happen and the counter would
+                        // skew. Explicitly bump the skip counter when the
+                        // outer caps/qos_mgr guards fail so the metric
+                        // captures BOTH "no manager" and "syscall failed"
+                        // pathways.
+                        if caps.can_taskpolicy {
+                            if let Some(arc) = qos_mgr.as_ref() {
+                                // S4 cutover (2026-06-06 cont.): route through
+                                // ThreadPolicyEffector::apply_raw so the typed
+                                // chokepoint is the SOLE writer of thread QoS state.
+                                // Counter `mediator_thread_policy_total` increments
+                                // only on syscall success — see effector counter
+                                // semantics doc-comment for the attempts-vs-applies
+                                // distinction. Identity guard already verified
+                                // above (Inv#11 early-return); apply_raw is the
+                                // post-verification dispatch path.
+                                let effector = crate::engine::mediator::ThreadPolicyEffector::new(
+                                    std::sync::Arc::clone(arc),
+                                );
+                                let (ok, _syscall_us, applied) = effector.apply_raw(
+                                    *pid,
+                                    *thread_index,
+                                    thread_tier,
+                                    *affinity_tag,
+                                );
+                                if ok {
+                                    out.thread_qos_applied += applied as u64;
+                                    // FIX-4-v2 (2026-06-07): enrollment
+                                    // strictly post-syscall — `ok=true`
+                                    // means ThreadPolicyEffector observed
+                                    // a successful set_thread_qos return.
+                                    // The four-part guard chain
+                                    // (!dry_run + caps.can_taskpolicy +
+                                    // qos_mgr.is_some() + ok) is enforced
+                                    // by the surrounding `if` ladder; no
+                                    // PendingObservation is recorded for
+                                    // would-be no-op or failed mutations.
+                                    // is_hp routes through
+                                    // `safety::is_boost_forbidden` so
+                                    // family-root demotions/promotions on
+                                    // structurally-misclassified targets
+                                    // (Brave/Chromium) feed the HP
+                                    // disagreement window. value_post
+                                    // encodes the post-syscall ThreadTier
+                                    // discriminant
+                                    // (Interactive=0/Utility=1/Background=2
+                                    // by declaration order, see
+                                    // mach_qos.rs:314).
+                                    let is_hp =
+                                        crate::engine::safety::is_boost_forbidden(name);
+                                    let tier_post: i64 = match thread_tier {
+                                        ThreadTier::Interactive => 0,
+                                        ThreadTier::Utility => 1,
+                                        ThreadTier::Background => 2,
+                                    };
+                                    crate::engine::effect_decay::record_global(
+                                        crate::engine::effect_decay::PendingObservation {
+                                            effect_id: 0,
+                                            pid: *pid,
+                                            kind:
+                                                crate::engine::effect_decay::ObsKind::MachPolicy,
+                                            key: None,
+                                            value_post: tier_post,
+                                            deadline: std::time::Instant::now()
+                                                + crate::engine::effect_decay::DecayWatchdog::settle_window(),
+                                            hard_protected: is_hp,
+                                        },
+                                    );
+                                } else {
+                                    // Syscall failed — apply_raw already
+                                    // refused to bump
+                                    // mediator_thread_policy_total. Bump
+                                    // the phantom-skip counter so the
+                                    // delta between "would have enrolled
+                                    // pre-fix" and "did not enroll
+                                    // post-fix" is visible in
+                                    // runtime_metrics.json.
+                                    crate::engine::lse_counters::LSE_COUNTERS
+                                        .inc_effect_decay_phantom_enroll_skipped();
+                                }
+                                // affinity_tag fallback handled inside
+                                // ThreadPolicyEffector::apply_raw — caller no
+                                // longer needs to drive it separately.
+                            } else {
+                                // qos_mgr unwired — surface the missed
+                                // enrollment opportunity.
+                                crate::engine::lse_counters::LSE_COUNTERS
+                                    .inc_effect_decay_phantom_enroll_skipped();
                             }
-                            // affinity_tag fallback handled inside
-                            // ThreadPolicyEffector::apply_raw — caller no
-                            // longer needs to drive it separately.
+                        } else {
+                            // task_policy unavailable on this build/host
+                            // — same skip semantics as the qos_mgr=None
+                            // branch.
+                            crate::engine::lse_counters::LSE_COUNTERS
+                                .inc_effect_decay_phantom_enroll_skipped();
                         }
                     }
                 }
