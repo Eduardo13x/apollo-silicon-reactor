@@ -225,6 +225,17 @@ pub fn hard_protected_contains(name: &str) -> bool {
         .is_match(name)
 }
 
+/// Single source of truth for the BOOST veto. Apollo must never BOOST these
+/// — Chromium IPC contract + structural-low-effectiveness misclassification trap.
+///
+/// Returns true when `name` is either hard-protected (kernel/WindowServer/…) OR
+/// a Chromium family-root (Brave / Google Chrome / Microsoft Edge / …). Production
+/// matches Brave via `match_engine::is_family_root`, NOT `hard_protected_contains`,
+/// so the latter alone leaves the Brave Boost guard as dead code (FIX-1).
+pub fn is_boost_forbidden(name: &str) -> bool {
+    hard_protected_contains(name) || crate::engine::match_engine::is_family_root(name)
+}
+
 /// Fast substring membership test against the softly-protected set (LLM
 /// inference servers). Mirrors `hard_protected_contains` — single AC walk
 /// instead of HashSet build + N×contains. Frozen only when the alternative
