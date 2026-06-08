@@ -50,6 +50,60 @@ impl PatternWeight {
     pub fn is_high_value(&self) -> bool {
         self.throttle_count >= 3 && self.effectiveness() > 0.75
     }
+
+    // ── Hard-protected exclusion for class-reclassification ─────────────────
+    //
+    // Bug observed in prod (2026-06-07, daemon PID 16105, Brave Browser Helper
+    // @ throttle_count=63, effective_count=2): hard-protected processes route
+    // throttle through PRIO_DARWIN_BG + jetsam BACKGROUND demote (Chromium-
+    // cooperative). SIGSTOP is forbidden by `safety.rs` per CLAUDE.md
+    // "Chromium SIGSTOP never" — 3 regression cycles.
+    //
+    // The soft throttle is structurally weak: Chromium's renderer scheduler
+    // often keeps allocating regardless. Brave's 3.2% effectiveness is a
+    // property of the ACTION TYPE on a hard-protected process, NOT a property
+    // of the PROCESS's pressure-driver role.
+    //
+    // Applying the legacy heuristic "effectiveness < 0.30 → process does NOT
+    // cause pressure → reclassify as interactive → Boost" is therefore
+    // circular for hard-protected entries — it closed an infinite Boost loop
+    // in prod (110 boosts targeted Brave Browser Helper out of 200 actions).
+    //
+    // Honest reads for class-reclassification consumers: return `None` (or
+    // `false`) for hard-protected processes so downstream code never promotes
+    // them based on the structurally-degraded throttle signal. RL penalty,
+    // skip-future-throttles, and LLM-struggling consumers retain the raw
+    // `effectiveness()` / `is_low_value*` semantics — the waste signal is
+    // genuinely informative for those paths.
+
+    /// Honest effectiveness for class-reclassification consumers. Returns
+    /// `None` when the entry refers to a process whose throttle path is
+    /// structurally degraded (hard-protected PRIO_DARWIN_BG-only, OR
+    /// family-root like Brave/Chrome/Edge matched via `match_engine::
+    /// is_family_root`). Production matches Brave via `is_family_root`,
+    /// NOT `hard_protected_contains` — the legacy predicate let Brave
+    /// renderers escape the reclassification gate (FIX-2, 2026-06-07).
+    ///
+    /// Callers that interpret low effectiveness as "process does not cause
+    /// pressure" MUST use this variant.
+    pub fn effectiveness_for_classification(&self, name: &str) -> Option<f64> {
+        if crate::engine::safety::is_boost_forbidden(name) {
+            crate::engine::lse_counters::LSE_COUNTERS
+                .inc_hard_protected_reclassify_excluded();
+            return None;
+        }
+        Some(self.effectiveness())
+    }
+
+    /// Calibrated low-value check that respects hard-protected exclusion.
+    /// Use this at every class-reclassification gate. Returns `false` for
+    /// hard-protected entries regardless of effectiveness floor.
+    pub fn is_low_value_for_reclassification(&self, name: &str, baseline: f64) -> bool {
+        match self.effectiveness_for_classification(name) {
+            None => false, // never reclassify HP entries
+            Some(eff) => self.throttle_count >= 20 && eff < baseline * 0.90,
+        }
+    }
 }
 
 /// Throttle pendiente de resolución de outcome.
@@ -876,11 +930,21 @@ impl OutcomeTracker {
 
         // Detecta patrones que ya tienen suficientes datos y están por debajo
         // del baseline calibrado — throttlearlos no aporta más que la fluctuación natural.
+        //
+        // HARD-PROTECTED EXCLUSION (2026-06-07): hard-protected processes
+        // (Chromium, Brave Browser Helper, …) route throttles through the
+        // soft PRIO_DARWIN_BG + jetsam BACKGROUND demote path. Their low
+        // effectiveness is a property of the structurally-degraded throttle
+        // action, NOT a signal that they don't cause pressure. Excluding
+        // them from the `low_value_names` reclassification signal prevents
+        // the documented Boost-loop (110 boosts on Brave per 200 actions).
+        // RL penalty + LLM-struggling continue to consume the raw
+        // `is_low_value_vs_baseline` signal — they want to see the waste.
         let threshold = self.calibrated_threshold();
         let low_value_names: Vec<String> = self
             .weights
             .iter()
-            .filter(|(_, w)| w.is_low_value_vs_baseline(threshold))
+            .filter(|(name, w)| w.is_low_value_for_reclassification(name, threshold))
             .map(|(name, _)| name.clone())
             .collect();
 
@@ -1488,6 +1552,51 @@ mod tests {
         };
         // (15+1)/(100+2) ≈ 0.157 < 0.225
         assert!(w_confirmed.is_low_value_vs_baseline(baseline));
+    }
+
+    // FIX-2 (2026-06-07): Reclassify-exclusion predicate must route through
+    // `safety::is_boost_forbidden`, not the legacy `hard_protected_contains`
+    // path. Production matches Brave via `match_engine::is_family_root`, so
+    // the old check left Brave renderers exposed to the reclassification
+    // loop that triggered the infinite Boost trap (PID 16105 prod incident).
+    #[test]
+    fn effectiveness_for_classification_excludes_brave_family_root() {
+        // Brave Browser Helper — matched via match_engine::is_family_root in
+        // production (NOT hard_protected_contains). With the legacy predicate
+        // this returned Some(eff), which fed the reclassification gate.
+        let w = PatternWeight {
+            throttle_count: 63,
+            effective_count: 2,
+        };
+        assert_eq!(
+            w.effectiveness_for_classification("Brave Browser Helper"),
+            None,
+            "boost-forbidden family-root names must be excluded from reclassification",
+        );
+        // is_low_value_for_reclassification must agree (returns false for None).
+        assert!(
+            !w.is_low_value_for_reclassification("Brave Browser Helper", 0.25),
+            "family-root entries must never be flagged as low-value-for-reclassification",
+        );
+    }
+
+    #[test]
+    fn effectiveness_for_classification_passes_through_control_process() {
+        // alacritty — neither hard-protected nor family-root → predicate returns
+        // Some(effectiveness()), the raw Laplace-smoothed estimate.
+        let w = PatternWeight {
+            throttle_count: 10,
+            effective_count: 3,
+        };
+        let got = w.effectiveness_for_classification("alacritty");
+        // (3+1)/(10+2) ≈ 0.333
+        assert!(got.is_some(), "non-forbidden control name must return Some(_)");
+        let eff = got.unwrap();
+        assert!(
+            (eff - 0.3333).abs() < 1e-3,
+            "expected ≈0.333 Laplace-smoothed effectiveness, got {}",
+            eff,
+        );
     }
 
     #[test]

@@ -1000,6 +1000,21 @@ pub fn apply_learned_policy_actions(
             && !survival
             && should_emit_boost(p.pid, learned_policy_boost_ttl_secs())
         {
+            // Round-4 hotfix (2026-06-07): the FIX-1 guard at
+            // decide_actions.rs:597/644/871 protected the rule-based
+            // boost paths but missed this LLM-daemon emit site, which
+            // applies the LEARNED policy classification (the very
+            // signal corrupted by the Brave loop). Without this guard,
+            // 4 Brave boosts/cycle slipped through post-deploy despite
+            // 36 hard_protected_boost_skipped_total bumps elsewhere.
+            // Apply complete-mediation here too — `is_boost_forbidden`
+            // returns true for hard-protected names + Chromium
+            // family-roots.
+            if apollo_engine::engine::safety::is_boost_forbidden(&p.name) {
+                apollo_engine::engine::lse_counters::LSE_COUNTERS
+                    .inc_hard_protected_boost_skipped();
+                continue;
+            }
             let (ss, su) = pid_start_time(p.pid);
             actions.push(RootAction::BoostProcess {
                 pid: p.pid,

@@ -580,6 +580,17 @@ pub fn decide_actions(
         LatencyTarget::Normal => 2,
     };
     for blocker in blockers.iter().take(blocker_boost_count) {
+        // APPROACH 1 — BOOST-path complete-mediation guard. Hard-protected
+        // names (Brave/Chromium, WindowServer outside the display-pipeline
+        // carve-out, configd, …) take cooperative paths in execute_actions
+        // (PRIO_DARWIN_BG + jetsam BACKGROUND demote). Emitting a wait-graph
+        // Boost for them feeds the Brave RAM loop documented 2026-06-07.
+        // [Saltzer & Kaashoek 2009 §3.3] complete mediation invariant.
+        if crate::engine::safety::is_boost_forbidden(&blocker.name) {
+            crate::engine::lse_counters::LSE_COUNTERS.inc_hard_protected_boost_skipped();
+            low_value_skipped.push(format!("hard-protected-boost-skip:{}", blocker.name));
+            continue;
+        }
         // Inv#11: PID-only context here; look up start_sec via daemon_helpers.
         let (start_sec, start_usec) =
             crate::engine::daemon_helpers::pid_start_time(blocker.pid);
@@ -615,6 +626,21 @@ pub fn decide_actions(
         let name_lc = name.to_ascii_lowercase();
 
         if is_interactive(name, &name_lc, pid) {
+            // APPROACH 1 — primary BOOST-path guard. INTERACTIVE_APPS
+            // contains "Brave" (line 79) which is *also* hard-protected
+            // against SIGSTOP (CLAUDE.md "Chromium SIGSTOP never"). Before
+            // this guard, a Brave Browser Helper hitting pressure 0.74
+            // was promoted via is_interactive → BoostProcess, raising QoS
+            // and feeding the very pressure the daemon was trying to
+            // relieve (2026-06-07T19:35Z prod loop: 110/200 boosts on
+            // Brave). Cooperative throttle paths in execute_actions
+            // remain the right answer for these names; `continue` here
+            // routes them to the next decision arm without a Boost.
+            if crate::engine::safety::is_boost_forbidden(name) {
+                crate::engine::lse_counters::LSE_COUNTERS.inc_hard_protected_boost_skipped();
+                low_value_skipped.push(format!("hard-protected-boost-skip:{}", name));
+                continue;
+            }
             actions.push(RootAction::BoostProcess {
                 pid,
                 name: name.to_string(),
@@ -832,9 +858,19 @@ pub fn decide_actions(
     // These are user-initiated, expensive to restart, and need maximum bandwidth.
     for &ml_pid in &ml_protected {
         if let Some(process) = sys.process(sysinfo::Pid::from_u32(ml_pid)) {
+            let name = process.name();
+            // APPROACH 1 — same complete-mediation guard. AMX detection is
+            // name-derived; a hard-protected ML adjacent process (e.g. a
+            // language server doing ML inference) must still route via the
+            // cooperative path, not gain P-core priority via Boost.
+            if crate::engine::safety::is_boost_forbidden(name) {
+                crate::engine::lse_counters::LSE_COUNTERS.inc_hard_protected_boost_skipped();
+                low_value_skipped.push(format!("hard-protected-boost-skip:{}", name));
+                continue;
+            }
             actions.push(RootAction::BoostProcess {
                 pid: ml_pid,
-                name: process.name().to_string(),
+                name: name.to_string(),
                 reason: "ML/AMX workload — P-core routing".to_string(),
                 decision_reason: DecisionReason::MLWorkload,
                 start_sec: process.start_time(),
@@ -848,6 +884,11 @@ pub fn decide_actions(
     // This prevents the display pipeline from losing P-core access during the
     // scheduler rebalance that follows background E-core routing.
     // [WWDC 2021 "Tune CPU job scheduling with QoS"; Anderson & Dahlin 2014 "OS Fundamentals"]
+    //
+    // APPROACH 1 carve-out: WindowServer/Dock/SystemUIServer ARE hard-protected
+    // but the display-pipeline boost IS the cooperative path for them. Do NOT
+    // add a `hard_protected_contains` guard here — the AC matcher at
+    // `display_pipeline_ac()` is the intended chokepoint for this site.
     {
         let swap_delta_mb = snapshot.pressure.swap_delta_bytes_per_sec / (1024.0 * 1024.0);
         // Trigger when swap grows ≥ 0.5 MB/s — early pressure signal, not crisis.
@@ -879,6 +920,11 @@ pub fn decide_actions(
     // but a proactive BoostProcess ensures the scheduler keeps it on a P-core.
     // [WWDC 2021] "Tune CPU job scheduling with QoS" — compositor must stay on P-cores
     // under load; explicit QoS boost guarantees scheduling priority.
+    //
+    // APPROACH 1 carve-out: WindowServer is hard-protected AND we explicitly
+    // WANT to boost it under high CPU. Do NOT add a `hard_protected_contains`
+    // guard here; the exact-name `== "WindowServer"` predicate is the
+    // intended chokepoint and overlaps with hard-protected by design.
     {
         const WS_CPU_BOOST_THRESHOLD: f32 = 20.0;
         for (pid, process) in sys.processes() {
