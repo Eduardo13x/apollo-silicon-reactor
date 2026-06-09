@@ -2056,6 +2056,17 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub effect_decay_hp_mach_attempts_total: u64,
 
+    /// WebRTC guard (2026-06-09 prod incident). Bumped by
+    /// `SysctlGovernor::tick_tcp` for each TCP scale-down or delayed_ack
+    /// branch suppressed because `realtime_call_active == true`. Producer:
+    /// `coreaudio_active::is_realtime_call_active` (default-output AND
+    /// default-input both running). Mirrors the LSE counter so
+    /// `runtime_metrics.json` surfaces the gate-fires count for operator
+    /// review. Non-zero rate during prod calls = guard is intercepting
+    /// the path that froze the Meet audio on 2026-06-09T17:12 PT.
+    #[serde(default)]
+    pub sysctl_governor_realtime_call_inhibit_total: u64,
+
     // ── Approach 2 (2026-06-07) — OutcomeTracker class-reclassification HP exclusion.
     // Producer: `PatternWeight::effectiveness_for_classification(name)` returns
     // `None` when `safety::hard_protected_contains(name)` is true. Mirrors the

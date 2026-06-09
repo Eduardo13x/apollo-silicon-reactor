@@ -4191,6 +4191,12 @@ fn main() -> anyhow::Result<()> {
                     workload: ml_class.workload.as_kebab(),
                     on_battery: power_mgr.is_on_battery(),
                     is_root,
+                    // WebRTC guard (2026-06-09 prod incident): both default
+                    // audio devices running = full-duplex realtime call.
+                    // Inhibits TCP buffer scale-down and delayed_ack=3.
+                    // See `coreaudio_active::is_realtime_call_active` doc.
+                    realtime_call_active:
+                        apollo_engine::engine::coreaudio_active::is_realtime_call_active(),
                 });
                 // sysctl_governor.tick() returns sealed `SetSysctlAction` values
                 // already constructed via the clamping factory (Fase 4 seal). They

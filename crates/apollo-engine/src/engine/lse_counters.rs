@@ -568,6 +568,18 @@ pub struct LockFreeMetrics {
     /// Bumped exclusively by `DecayWatchdog::record_hp_mach_attempt`.
     pub effect_decay_hp_mach_attempts_total: AtomicU64,
 
+    /// WebRTC guard (2026-06-09 prod incident). Bumped each time
+    /// `SysctlGovernor::tick_tcp` skips a TCP buffer scale-down branch OR
+    /// overrides the delayed_ack ladder because
+    /// `realtime_call_active == true`. Producer:
+    /// `coreaudio_active::is_realtime_call_active` returns true when both
+    /// default-output and default-input devices are running (full-duplex
+    /// audio = Meet/Zoom/FaceTime/Discord). Sustained non-zero ratio
+    /// against governor writes proves the gate is reaching the path that
+    /// broke the user's Meet call at 2026-06-09T17:12 PT (sendspace/recvspace
+    /// scaled -25%, delayed_ack=3 on battery).
+    pub sysctl_governor_realtime_call_inhibit_total: AtomicU64,
+
     /// Sprint patch (2026-06-07). Approach 2 — OutcomeTracker class-
     /// reclassification gate excluded a hard-protected entry from the
     /// `low_value_names` signal because its low effectiveness is a
@@ -799,6 +811,7 @@ impl LockFreeMetrics {
             policy_scorer_uncertainty_saturated_total: AtomicU64::new(0),
             effect_decay_detected_total: AtomicU64::new(0),
             effect_decay_hp_mach_attempts_total: AtomicU64::new(0),
+            sysctl_governor_realtime_call_inhibit_total: AtomicU64::new(0),
             hard_protected_reclassify_excluded_total: AtomicU64::new(0),
             mediator_port_hub_blocks_total: AtomicU64::new(0),
             mediator_port_hub_probe_unavailable_total: AtomicU64::new(0),
@@ -1290,6 +1303,9 @@ impl LockFreeMetrics {
             effect_decay_hp_mach_attempts_total: self
                 .effect_decay_hp_mach_attempts_total
                 .load(Ordering::Relaxed),
+            sysctl_governor_realtime_call_inhibit_total: self
+                .sysctl_governor_realtime_call_inhibit_total
+                .load(Ordering::Relaxed),
             hard_protected_reclassify_excluded_total: self
                 .hard_protected_reclassify_excluded_total
                 .load(Ordering::Relaxed),
@@ -1638,6 +1654,16 @@ impl LockFreeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// WebRTC guard (2026-06-09). Bumped by `SysctlGovernor::tick_tcp` for
+    /// each scale-down or delayed_ack branch suppressed because
+    /// `realtime_call_active == true`. Sustained non-zero ratio in prod
+    /// = WebRTC gate is reaching the path that broke the user's Meet.
+    #[inline(always)]
+    pub fn inc_sysctl_governor_realtime_call_inhibit(&self) {
+        self.sysctl_governor_realtime_call_inhibit_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Sprint patch (2026-06-07). Approach 2 — OutcomeTracker class-
     /// reclassification gate excluded a hard-protected entry from the
     /// `low_value_names` signal. Producer: `PatternWeight::
@@ -1883,6 +1909,10 @@ pub struct MetricsSnapshot {
     pub effect_decay_detected_total: u64,
     /// Round-4 (2026-06-07). FIX-3-v2 HP MachPolicy attempts (no re-read).
     pub effect_decay_hp_mach_attempts_total: u64,
+    /// WebRTC guard (2026-06-09 prod incident). Realtime-call inhibits in
+    /// SysctlGovernor TCP path. Sustained non-zero ratio proves the gate
+    /// catches mid-call buffer scale-downs and ACK coalescing branches.
+    pub sysctl_governor_realtime_call_inhibit_total: u64,
     /// Sprint patch (2026-06-07). Approach 2 — class-reclassification HP exclusion.
     pub hard_protected_reclassify_excluded_total: u64,
     /// Sprint patch (2026-06-05). Group C Invariant #13 port-hub blocks.

@@ -27,6 +27,9 @@ const K_AUDIO_OBJECT_SYSTEM_OBJECT: AudioObjectID = 1;
 // 'dOut' = default output device selector
 #[cfg(target_os = "macos")]
 const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE: u32 = 0x644F_7574;
+// 'dIn ' = default input device selector (note trailing space, big-endian: 'd','I','n',' ')
+#[cfg(target_os = "macos")]
+const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_INPUT_DEVICE: u32 = 0x6449_6E20;
 // 'gone' = device-is-running-somewhere selector
 #[cfg(target_os = "macos")]
 const K_AUDIO_DEVICE_PROPERTY_DEVICE_IS_RUNNING_SOMEWHERE: u32 = 0x676F_6E65;
@@ -113,6 +116,91 @@ pub fn is_audio_running_somewhere() -> bool {
     false
 }
 
+/// True when the default INPUT device (microphone) is actively capturing.
+///
+/// Same FFI shape as `is_audio_running_somewhere` but selecting the default
+/// input device. Mirrors the output-side detection so callers can build a
+/// realtime-call gate (`output_active AND input_active = full-duplex call`).
+///
+/// Returns `false` on any error path. The signal is composed with other media
+/// indicators — a missed detection only weakens the inhibit, never fires it
+/// spuriously.
+///
+/// WebRTC ROOT-CAUSE (2026-06-09 prod incident): Apollo's sysctl_governor
+/// scaled down TCP send/recv buffers by 25% mid-Meet (sysctl_governor.rs:641
+/// path: "low retransmissions + low throughput") and set `delayed_ack=3` on
+/// battery (sysctl_governor.rs:669), which dropped audio frames and froze
+/// video on the user's call. `is_realtime_call_active()` gates both branches
+/// from re-firing during a live full-duplex call.
+#[cfg(target_os = "macos")]
+pub fn is_audio_input_active() -> bool {
+    unsafe {
+        // Step 1: resolve default input device id.
+        let default_in_addr = AudioObjectPropertyAddress {
+            selector: K_AUDIO_HARDWARE_PROPERTY_DEFAULT_INPUT_DEVICE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let mut device_id: AudioObjectID = 0;
+        let mut size: u32 = mem::size_of::<AudioObjectID>() as u32;
+        let status = AudioObjectGetPropertyData(
+            K_AUDIO_OBJECT_SYSTEM_OBJECT,
+            &default_in_addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut device_id as *mut _ as *mut std::ffi::c_void,
+        );
+        if status != 0 || device_id == 0 {
+            return false;
+        }
+
+        // Step 2: query is-running-somewhere on that input device.
+        let running_addr = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_DEVICE_IS_RUNNING_SOMEWHERE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let mut running: u32 = 0;
+        let mut size2: u32 = mem::size_of::<u32>() as u32;
+        let status2 = AudioObjectGetPropertyData(
+            device_id,
+            &running_addr,
+            0,
+            std::ptr::null(),
+            &mut size2,
+            &mut running as *mut _ as *mut std::ffi::c_void,
+        );
+        if status2 != 0 {
+            return false;
+        }
+        running != 0
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_audio_input_active() -> bool {
+    false
+}
+
+/// True when BOTH default output AND default input devices are running.
+///
+/// Full-duplex audio = realtime call (Google Meet / Zoom / FaceTime / Discord /
+/// Teams). Apollo MUST NOT mutate network sysctls or apply Battery network
+/// profile during this state — buffer reductions and ACK coalescing degrade
+/// WebRTC quality (jitter, audio cutouts, video freezes).
+///
+/// Cost: ~100µs (two CoreAudio round-trips, one per device). Caller is expected
+/// to cache at the same cadence as other media probes (≥3 cycles).
+///
+/// Composed signal (not "and"-of-noisy): both APIs must positively report
+/// running — eliminates false positives from output-only playback (YouTube)
+/// or input-only background ASR.
+#[inline]
+pub fn is_realtime_call_active() -> bool {
+    is_audio_running_somewhere() && is_audio_input_active()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +210,26 @@ mod tests {
         // On macOS: returns true or false depending on current playback state.
         // On other OSes: always false. Either way, must not panic.
         let _ = is_audio_running_somewhere();
+    }
+
+    #[test]
+    fn input_query_does_not_panic() {
+        let _ = is_audio_input_active();
+    }
+
+    #[test]
+    fn realtime_call_does_not_panic() {
+        let _ = is_realtime_call_active();
+    }
+
+    #[test]
+    fn realtime_call_implies_both_branches() {
+        // Logical invariant — if realtime fires, both individual probes must agree.
+        // Cannot fail spuriously: when both probes are false, composite is false.
+        let composite = is_realtime_call_active();
+        if composite {
+            assert!(is_audio_running_somewhere(), "realtime requires output");
+            assert!(is_audio_input_active(), "realtime requires input");
+        }
     }
 }

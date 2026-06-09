@@ -271,6 +271,8 @@ impl MetricsState {
             lf.policy_scorer_uncertainty_saturated_total;
         self.metrics.effect_decay_detected_total = lf.effect_decay_detected_total;
         self.metrics.effect_decay_hp_mach_attempts_total = lf.effect_decay_hp_mach_attempts_total;
+        self.metrics.sysctl_governor_realtime_call_inhibit_total =
+            lf.sysctl_governor_realtime_call_inhibit_total;
 
         // Approach 2 (2026-06-07). OutcomeTracker class-reclassification gate
         // excluded a hard-protected entry from the `low_value_names` signal

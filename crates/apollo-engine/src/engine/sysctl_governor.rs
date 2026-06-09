@@ -52,6 +52,13 @@ pub struct SysctlGovernorInput<'a> {
     pub on_battery: bool,
     /// Whether the daemon is running as root.
     pub is_root: bool,
+    /// True when default-output AND default-input audio devices are both
+    /// running — i.e. user is in a full-duplex realtime call (Meet / Zoom /
+    /// FaceTime / Discord). When set, the governor MUST skip TCP buffer
+    /// scale-down and force `delayed_ack = 0` regardless of battery state —
+    /// WebRTC jitter and audio cutouts otherwise. See
+    /// `coreaudio_active::is_realtime_call_active`.
+    pub realtime_call_active: bool,
 }
 
 // ── Observability ────────────────────────────────────────────────────────────
@@ -638,7 +645,16 @@ impl SysctlGovernor {
         // This avoids the ratchet effect where buffers grow but never shrink.
         let buffer_threshold = (self.tcp.sendspace / 100).max(65_536); // at least 64KB/s
         let throughput_low = send_bps < buffer_threshold;
-        if self.tcp.consecutive_low >= 6 && throughput_low {
+        // 2026-06-09 prod incident: this branch fired mid-Meet because a
+        // healthy WebRTC connection looks like "low retransmissions + low
+        // average TCP throughput" (the bulk of media is on UDP). Scaling
+        // send/recv buffers -25% broke signaling + STUN/TURN fallback,
+        // freezing audio/video. Inhibit during realtime full-duplex audio.
+        if inputs.realtime_call_active {
+            crate::engine::lse_counters::LSE_COUNTERS
+                .inc_sysctl_governor_realtime_call_inhibit();
+            self.tcp.consecutive_low = 0; // forget the streak so resume is clean
+        } else if self.tcp.consecutive_low >= 6 && throughput_low {
             let new_send = ((self.tcp.sendspace as f64 * 0.75) as u64).max(TCP_BUFFER_MIN);
             let new_recv = ((self.tcp.recvspace as f64 * 0.75) as u64).max(TCP_BUFFER_MIN);
 
@@ -666,7 +682,15 @@ impl SysctlGovernor {
         }
 
         // -- delayed_ack: workload-aware --
-        let desired_ack = if inputs.on_battery {
+        // 2026-06-09 prod incident: with `on_battery=true` mid-Meet, this
+        // selector picked `delayed_ack=3` (combined ACKs ≈ +200ms latency),
+        // which is catastrophic for WebRTC. Realtime-call gate overrides the
+        // entire ladder and forces 0 (immediate ACK).
+        let desired_ack = if inputs.realtime_call_active {
+            crate::engine::lse_counters::LSE_COUNTERS
+                .inc_sysctl_governor_realtime_call_inhibit();
+            0 // Realtime full-duplex audio: every ACK must dispatch immediately.
+        } else if inputs.on_battery {
             3 // Combine ACKs to reduce CPU wakes.
         } else if inputs.workload == "coding" || inputs.workload == "commandline" {
             0 // No delayed ACKs for interactive work.
@@ -1315,6 +1339,7 @@ mod tests {
             workload: "General",
             on_battery: false,
             is_root: true,
+            realtime_call_active: false,
         }
     }
 
@@ -1329,6 +1354,7 @@ mod tests {
             workload: "General",
             on_battery: false,
             is_root: false,
+            realtime_call_active: false,
         };
         let actions = gov.tick(&inputs);
         assert!(actions.is_empty());
@@ -1500,6 +1526,103 @@ mod tests {
                 if s.key() == "net.inet.tcp.delayed_ack" && s.value() == "3")
         });
         assert!(has_ack_change, "expected delayed_ack=3 on battery");
+    }
+
+    // ── WebRTC guard (2026-06-09 prod incident) ──────────────────────────────
+
+    /// Reproduces the 2026-06-09T17:12 PT failure mode: with
+    /// `on_battery = true` mid-Meet, the delayed_ack ladder picked 3
+    /// (combined ACK ≈ +200 ms latency), choking WebRTC. The realtime-call
+    /// gate now overrides the battery branch and forces 0.
+    #[test]
+    fn realtime_call_overrides_battery_delayed_ack() {
+        let mut gov = SysctlGovernor::new(true);
+        gov.tcp.delayed_ack = 3;
+        gov.current_values
+            .insert("net.inet.tcp.delayed_ack".into(), "3".into());
+
+        let monitor = test_monitor(0.0, 0.0, 0);
+        let mut inputs = default_inputs(&monitor);
+        inputs.on_battery = true;
+        inputs.realtime_call_active = true;
+
+        let actions = gov.tick(&inputs);
+        let forced_low_latency = actions.iter().any(|a| {
+            matches!(a, RootAction::SetSysctl(s)
+                if s.key() == "net.inet.tcp.delayed_ack" && s.value() == "0")
+        });
+        assert!(
+            forced_low_latency,
+            "realtime call must force delayed_ack=0 even on battery"
+        );
+        // No delayed_ack=3 may slip through.
+        let any_combined = actions.iter().any(|a| {
+            matches!(a, RootAction::SetSysctl(s)
+                if s.key() == "net.inet.tcp.delayed_ack" && s.value() == "3")
+        });
+        assert!(!any_combined, "realtime call must NOT emit delayed_ack=3");
+    }
+
+    /// Reproduces the buffer scale-down branch (sysctl_governor.rs:641).
+    /// A healthy Meet looks like "low retransmissions + low avg TCP
+    /// throughput" (UDP carries the media). Apollo previously scaled
+    /// send/recv buffers -25%, dropping signaling + STUN/TURN fallback.
+    /// The realtime gate must inhibit the scale-down and reset the
+    /// `consecutive_low` streak so resume is clean.
+    #[test]
+    fn realtime_call_inhibits_buffer_scale_down() {
+        let mut gov = SysctlGovernor::new(true);
+        gov.tcp.sendspace = 524_288;
+        gov.tcp.recvspace = 524_288;
+        gov.tcp.consecutive_low = 6; // already at the threshold
+        gov.current_values
+            .insert("net.inet.tcp.sendspace".into(), "524288".into());
+        gov.current_values
+            .insert("net.inet.tcp.recvspace".into(), "524288".into());
+
+        // Zero traffic = throughput_low = true; absent the gate this would
+        // emit -25% scale-down on both send and recv buffers.
+        let monitor = test_monitor(0.0, 0.0, 0);
+        let mut inputs = default_inputs(&monitor);
+        inputs.realtime_call_active = true;
+
+        let actions = gov.tick(&inputs);
+        let any_scale_down = actions.iter().any(|a| {
+            matches!(a, RootAction::SetSysctl(s)
+                if (s.key() == "net.inet.tcp.sendspace" || s.key() == "net.inet.tcp.recvspace")
+                && s.reason().contains("scaling"))
+        });
+        assert!(!any_scale_down, "scale-down must be inhibited mid-call");
+        assert_eq!(
+            gov.tcp.consecutive_low, 0,
+            "streak must reset so resume is clean once call ends"
+        );
+    }
+
+    /// Sanity: when `realtime_call_active == false`, all prior behavior
+    /// continues unchanged. This pins the gate as a pure inhibitor — it
+    /// cannot accidentally suppress non-call sysctl writes.
+    #[test]
+    fn realtime_gate_off_preserves_battery_delayed_ack() {
+        let mut gov = SysctlGovernor::new(true);
+        gov.tcp.delayed_ack = 0;
+        gov.current_values
+            .insert("net.inet.tcp.delayed_ack".into(), "0".into());
+
+        let monitor = test_monitor(0.0, 0.0, 0);
+        let mut inputs = default_inputs(&monitor);
+        inputs.on_battery = true;
+        inputs.realtime_call_active = false; // gate disengaged
+
+        let actions = gov.tick(&inputs);
+        let battery_combined = actions.iter().any(|a| {
+            matches!(a, RootAction::SetSysctl(s)
+                if s.key() == "net.inet.tcp.delayed_ack" && s.value() == "3")
+        });
+        assert!(
+            battery_combined,
+            "with gate off, battery branch must still emit delayed_ack=3"
+        );
     }
 
     // Unit tests for `clamp_to_allowed_range` live with the helper in
