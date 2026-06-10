@@ -771,6 +771,12 @@ pub fn decide_actions(
                 continue;
             }
 
+            // B.6 Chromium non-invasive containment: never hard-throttle Chromium family.
+            if !crate::engine::safety::can_hard_throttle(name) {
+                low_value_skipped.push(format!("chromium-no-throttle:{}", name));
+                continue;
+            }
+
             let aggressive = match effective_context {
                 InteractiveContext::ThermalConstrained => true,
                 InteractiveContext::BackgroundPressure => {
@@ -1511,6 +1517,12 @@ pub fn decide_actions(
                         }
                         if !survival_mode && crate::engine::safety::softly_protected_contains(&name)
                         {
+                            return None;
+                        }
+                        // B.6 Chromium non-invasive containment: Chromium family
+                        // processes are never frozen — SIGSTOP breaks their IPC
+                        // async message loop (Permanent Scar #1 / 26eac06).
+                        if !crate::engine::safety::can_freeze(&name) {
                             return None;
                         }
                         if is_interactive(&name, &name.to_ascii_lowercase(), pid_u32) {

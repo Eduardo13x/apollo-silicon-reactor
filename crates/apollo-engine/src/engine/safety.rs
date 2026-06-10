@@ -257,6 +257,171 @@ pub fn is_critical_background_name(name: &str) -> bool {
     is_infra_protected(name) || matches_dev_runtime(name)
 }
 
+// ── B.6 Chromium Non-Invasive Containment ─────────────────────────────────────
+
+/// Process intervention class — determines which actions Apollo may take
+/// against a process. Single source of truth replacing scattered `contains("Brave")`
+/// and `is_family_root` checks scattered across action decision code.
+///
+/// # Memory Safety Notes
+/// Chromium-family processes are treated as memory-toxic but alive: Apollo
+/// must not interrupt their IPC contract (SIGSTOP breaks Brave WebContents
+/// async communication — observed 2026-04-14 in prod). The strategy is
+/// non-invasive containment: observe, attribute, demote, hint — never freeze,
+/// boost, or hard-throttle.
+///
+/// See: B.6 Chromium Non-Invasive Containment (CLAUDE.md)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessInterventionClass {
+    /// Standard process — Apollo may apply any permitted action.
+    Normal,
+    /// Chromium family (Brave/Chrome/Chromium/Electron/Safari/Firefox).
+    /// SIGSTOP blocks the async IPC message loop. Apollo must NOT freeze,
+    /// boost, or hard-throttle these — only non-invasive containment.
+    ChromiumFamily,
+    /// OS/system essentials — kernel, WindowServer, launchd, etc.
+    /// No interventions whatsoever.
+    ProtectedSystem,
+    /// Media-critical: audio/video playback. Hard-throttle causes dropouts.
+    MediaCritical,
+    /// Build tools: rustc, cargo, node, etc. Throttle during active builds.
+    BuildTool,
+}
+
+impl ProcessInterventionClass {
+    /// Classify a process by name into its intervention class.
+    pub fn for_name(name: &str) -> Self {
+        if is_hard_protected(name) {
+            return ProcessInterventionClass::ProtectedSystem;
+        }
+        if crate::engine::match_engine::is_family_root(name) {
+            return ProcessInterventionClass::ChromiumFamily;
+        }
+        if matches_dev_runtime(name) {
+            return ProcessInterventionClass::BuildTool;
+        }
+        ProcessInterventionClass::Normal
+    }
+}
+
+/// What Apollo is allowed to do to a process in a given intervention class.
+/// All fields are `bool` for clarity at callsites — `true` = allowed, `false` = forbidden.
+///
+/// # Example
+/// ```
+/// let policy = InterventionPolicy::for_class(ProcessInterventionClass::ChromiumFamily);
+/// assert!(!policy.allow_freeze);
+/// assert!(!policy.allow_boost);
+/// assert!(policy.allow_ecore_demote);
+/// assert!(policy.allow_purge_hint);
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InterventionPolicy {
+    pub allow_freeze: bool,
+    pub allow_boost: bool,
+    pub allow_hard_throttle: bool,
+    pub allow_ecore_demote: bool,
+    pub allow_purge_hint: bool,
+    pub allow_priority_demote: bool,
+    pub allow_memory_budget_pressure: bool,
+}
+
+impl InterventionPolicy {
+    /// Return the policy for a given intervention class.
+    pub fn for_class(class: ProcessInterventionClass) -> Self {
+        match class {
+            ProcessInterventionClass::Normal => Self {
+                allow_freeze: true,
+                allow_boost: true,
+                allow_hard_throttle: true,
+                allow_ecore_demote: true,
+                allow_purge_hint: true,
+                allow_priority_demote: true,
+                allow_memory_budget_pressure: true,
+            },
+            ProcessInterventionClass::ChromiumFamily => Self {
+                allow_freeze: false,
+                allow_boost: false,
+                allow_hard_throttle: false,
+                allow_ecore_demote: true,
+                allow_purge_hint: true,
+                allow_priority_demote: true,
+                allow_memory_budget_pressure: true,
+            },
+            ProcessInterventionClass::ProtectedSystem => Self {
+                allow_freeze: false,
+                allow_boost: false,
+                allow_hard_throttle: false,
+                allow_ecore_demote: false,
+                allow_purge_hint: false,
+                allow_priority_demote: false,
+                allow_memory_budget_pressure: false,
+            },
+            ProcessInterventionClass::MediaCritical => Self {
+                allow_freeze: false,
+                allow_boost: true,
+                allow_hard_throttle: false,
+                allow_ecore_demote: true,
+                allow_purge_hint: true,
+                allow_priority_demote: true,
+                allow_memory_budget_pressure: true,
+            },
+            ProcessInterventionClass::BuildTool => Self {
+                allow_freeze: true,
+                allow_boost: true,
+                allow_hard_throttle: true,
+                allow_ecore_demote: true,
+                allow_purge_hint: true,
+                allow_priority_demote: true,
+                allow_memory_budget_pressure: true,
+            },
+        }
+    }
+
+    /// Shortcut: get the policy directly from a process name.
+    pub fn for_name(name: &str) -> Self {
+        Self::for_class(ProcessInterventionClass::for_name(name))
+    }
+}
+
+/// Returns true if the named process is a Chromium family member.
+/// This is the single point of truth for B.6 Chromium non-invasive containment —
+/// freeze/throttle/boost code should call this, not `is_family_root` directly.
+///
+/// Use `InterventionPolicy::for_name(name).allow_freeze` when you need the
+/// full policy; use this only when you need a fast boolean skip.
+pub fn is_chromium_family(name: &str) -> bool {
+    crate::engine::match_engine::is_family_root(name)
+}
+
+/// Returns true if Apollo MAY freeze this process.
+/// Shortcut for `InterventionPolicy::for_name(name).allow_freeze`.
+pub fn can_freeze(name: &str) -> bool {
+    InterventionPolicy::for_name(name).allow_freeze
+}
+
+/// Returns true if Apollo MAY boost this process.
+/// Shortcut for `InterventionPolicy::for_name(name).allow_boost`.
+pub fn can_boost(name: &str) -> bool {
+    InterventionPolicy::for_name(name).allow_boost
+}
+
+/// Returns true if Apollo MAY hard-throttle this process.
+/// Shortcut for `InterventionPolicy::for_name(name).allow_hard_throttle`.
+pub fn can_hard_throttle(name: &str) -> bool {
+    InterventionPolicy::for_name(name).allow_hard_throttle
+}
+
+/// Returns true if Apollo MAY apply E-core demotion to this process.
+pub fn can_ecore_demote(name: &str) -> bool {
+    InterventionPolicy::for_name(name).allow_ecore_demote
+}
+
+/// Returns true if Apollo MAY send purgeable memory hints to this process.
+pub fn can_purge_hint(name: &str) -> bool {
+    InterventionPolicy::for_name(name).allow_purge_hint
+}
+
 /// Single truth point for name-based process protection.
 ///
 /// Returns `true` if the process should NEVER receive a Freeze, Throttle, or Kill
