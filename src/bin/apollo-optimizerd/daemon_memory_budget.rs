@@ -377,6 +377,9 @@ mod tests {
             freeze_cooldown: Arc::new(Mutex::new(
                 apollo_engine::engine::freeze_cooldown::FreezeCooldown::new(),
             )),
+            effect_decay: Arc::new(Mutex::new(
+                apollo_engine::engine::effect_decay::DecayWatchdog::new(),
+            )),
             stop: Arc::new(AtomicBool::new(false)),
             revert_sysctls_requested: Arc::new(AtomicBool::new(false)),
             cycle_condvar: Arc::new((Mutex::new(false), Condvar::new())),

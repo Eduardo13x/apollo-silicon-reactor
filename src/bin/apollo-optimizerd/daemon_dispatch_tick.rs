@@ -505,6 +505,9 @@ mod tests {
             freeze_cooldown: Arc::new(Mutex::new(
                 apollo_engine::engine::freeze_cooldown::FreezeCooldown::new(),
             )),
+            effect_decay: Arc::new(Mutex::new(
+                apollo_engine::engine::effect_decay::DecayWatchdog::new(),
+            )),
             hardware: Arc::new(Mutex::new(HardwareState {
                 last_hw_snapshot: None,
                 sysctl_governor_status: SysctlGovernorStatus {

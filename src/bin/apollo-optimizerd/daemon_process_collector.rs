@@ -253,6 +253,9 @@ mod tests {
             frozen_state: Arc::new(Mutex::new(HashMap::new())),
             mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
             freeze_cooldown: Arc::new(Mutex::new(FreezeCooldown::new())),
+            effect_decay: Arc::new(Mutex::new(
+                apollo_engine::engine::effect_decay::DecayWatchdog::new(),
+            )),
             stop: Arc::new(AtomicBool::new(false)),
             revert_sysctls_requested: Arc::new(AtomicBool::new(false)),
             cycle_condvar: Arc::new((Mutex::new(false), Condvar::new())),
