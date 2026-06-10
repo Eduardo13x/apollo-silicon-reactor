@@ -26,9 +26,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use apollo_engine::engine::lse_counters::LSE_COUNTERS;
-use apollo_engine::engine::maintenance_state::{
-    MaintenanceState, PURGE_INHIBITION_WINDOW_SECS,
-};
+use apollo_engine::engine::maintenance_state::{MaintenanceState, PURGE_INHIBITION_WINDOW_SECS};
 use apollo_engine::engine::signal_intelligence::SignalIntelligence;
 
 /// `LSE_COUNTERS` is process-static; serialise across this file's tests
@@ -41,10 +39,10 @@ fn run_one_tick(signal_intel: &mut SignalIntelligence, dt: f64) {
     let cpu_vals: Vec<f64> = vec![10.0, 5.0];
     let mem_vals: Vec<f64> = vec![1_000_000.0, 500_000.0];
     let _digest = signal_intel.tick(
-        0.55,          // memory_pressure (mid)
-        500_000.0,     // swap_delta_bps (some flow)
-        0.20,          // swap_ratio
-        0.55,          // compressor proxy
+        0.55,      // memory_pressure (mid)
+        500_000.0, // swap_delta_bps (some flow)
+        0.20,      // swap_ratio
+        0.55,      // compressor proxy
         &cpu_vals,
         &mem_vals,
         "dominant",

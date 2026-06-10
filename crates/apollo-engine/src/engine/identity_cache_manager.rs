@@ -369,8 +369,7 @@ mod tests {
         let mut metrics_state = MetricsState::default();
         metrics_state.sync_from_lockfree(&global_snap);
         assert_eq!(
-            metrics_state.metrics.identity_cache_exit_invalidations,
-            after,
+            metrics_state.metrics.identity_cache_exit_invalidations, after,
             "RuntimeMetrics.identity_cache_exit_invalidations must mirror the global LSE counter"
         );
         assert!(

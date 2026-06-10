@@ -114,12 +114,17 @@ pub fn run_signal_tick(
             const EVICT_AFTER_SECS: u64 = 90 * 86_400; // 90 days
             const DECAY_FACTOR: f32 = 0.5;
             const HIGH_USAGE_GRACE_SECS: u64 = 50 * 3_600; // 50 hours lifetime
-            let evicted = state.policy.lock_recover().adaptive_governor.user_profile.prune_stale(
-                DECAY_AFTER_SECS,
-                EVICT_AFTER_SECS,
-                DECAY_FACTOR,
-                HIGH_USAGE_GRACE_SECS,
-            );
+            let evicted = state
+                .policy
+                .lock_recover()
+                .adaptive_governor
+                .user_profile
+                .prune_stale(
+                    DECAY_AFTER_SECS,
+                    EVICT_AFTER_SECS,
+                    DECAY_FACTOR,
+                    HIGH_USAGE_GRACE_SECS,
+                );
             if evicted > 0 {
                 audit_log(&serde_json::json!({
                     "event": "user_profile_prune",

@@ -274,16 +274,15 @@ pub fn build_enriched_process_data_with_tree(
         HashMap<u32, (u64, u32, u32, u32)>,
         HashMap<u32, f64>,
     ) = if reuse_cache {
-        let cache = enrich_syscall_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let cache = enrich_syscall_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // First cycle under pressure: cache may be empty. That's fine —
         // returning empty maps produces the same behaviour as PIDs that
         // simply had no proc_taskinfo data (wakeups_per_sec = 0).
         (cache.rusage_map.clone(), cache.contention_map.clone())
     } else {
-        (
-            HashMap::with_capacity(256),
-            HashMap::with_capacity(256),
-        )
+        (HashMap::with_capacity(256), HashMap::with_capacity(256))
     };
 
     // Pre-allocated for ~500 live PIDs typical of a heavy session
@@ -305,8 +304,7 @@ pub fn build_enriched_process_data_with_tree(
                 // or when the process was idle) and stores the new sample as
                 // the next baseline. The mutex is held only for the observe
                 // call itself; no other I/O happens under it.
-                if let Ok(mut tracker) =
-                    apollo_engine::engine::contention_tracker::global().lock()
+                if let Ok(mut tracker) = apollo_engine::engine::contention_tracker::global().lock()
                 {
                     if let Some(ratio) = tracker.observe(pid_u32, ri.clone()) {
                         contention_map.insert(pid_u32, ratio);

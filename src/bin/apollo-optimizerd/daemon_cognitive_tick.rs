@@ -426,7 +426,8 @@ pub fn apply_specialist_voting(
     // feedback loop where the system can't recover its own confidence after
     // a bad run. Only positive-action votes are graded against skill history.
     let skill_factor = skill_aware_factor(
-        lctx.skill_registry.workload_success_signal(workload_mode.as_str()),
+        lctx.skill_registry
+            .workload_success_signal(workload_mode.as_str()),
     );
     if (skill_factor - 1.0).abs() > f64::EPSILON {
         let mut modulated = 0_u64;
@@ -734,14 +735,15 @@ mod tests {
     /// multiply each non-Observe vote's confidence by 0.7.
     #[test]
     fn apply_specialist_voting_presence_factor_modulates_votes() {
-        let factor = apollo_engine::engine::user_presence::user_presence_modulator_narrowed_no_counter(
-            2.0,    // user_idle
-            60.0,   // hid_per_min
-            0.3,    // arousal (sub-crisis)
-            false,  // audio_active
-            false,  // has_sleep_assertion
-            0.0,    // memory_pressure (sub-critical — test the original suppression path)
-        );
+        let factor =
+            apollo_engine::engine::user_presence::user_presence_modulator_narrowed_no_counter(
+                2.0,   // user_idle
+                60.0,  // hid_per_min
+                0.3,   // arousal (sub-crisis)
+                false, // audio_active
+                false, // has_sleep_assertion
+                0.0,   // memory_pressure (sub-critical — test the original suppression path)
+            );
         // Sanity: this input combo MUST land in the active tier.
         assert!(
             (factor - 0.7).abs() < 1e-9,
@@ -912,7 +914,10 @@ mod tests {
 
         let mut maint = MaintenanceState::default();
         maint.mark_purged();
-        assert!(maint.is_purge_recent(30), "marked purge must register as recent");
+        assert!(
+            maint.is_purge_recent(30),
+            "marked purge must register as recent"
+        );
 
         let mut tracker = SpecialistAccuracyTracker::new();
         // Capture initial weights — all four start at the 0.70 init.
@@ -986,7 +991,8 @@ mod tests {
         // cycle 1: not a sample cycle (10%) and not assertion cycle (15%).
         // Expect both carry-forwards: assertions from last_user, idle from cache.
         let mut last = (true, true, false);
-        let mut last_idle: Option<(f64, std::time::Instant)> = Some((50.0, std::time::Instant::now()));
+        let mut last_idle: Option<(f64, std::time::Instant)> =
+            Some((50.0, std::time::Instant::now()));
         let ctx = compute_user_context(1, &mut last, &mut last_idle, None);
         assert!(ctx.has_sleep_assertion);
         assert!(ctx.call_in_progress);

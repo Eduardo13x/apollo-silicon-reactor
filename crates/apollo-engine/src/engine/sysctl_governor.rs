@@ -52,12 +52,15 @@ pub struct SysctlGovernorInput<'a> {
     pub on_battery: bool,
     /// Whether the daemon is running as root.
     pub is_root: bool,
-    /// True when default-output AND default-input audio devices are both
-    /// running — i.e. user is in a full-duplex realtime call (Meet / Zoom /
-    /// FaceTime / Discord). When set, the governor MUST skip TCP buffer
-    /// scale-down and force `delayed_ack = 0` regardless of battery state —
-    /// WebRTC jitter and audio cutouts otherwise. See
-    /// `coreaudio_active::is_realtime_call_active`.
+    /// True when the user is in a full-duplex realtime call OR an active
+    /// screen capture session. Composed at the daemon as
+    /// `coreaudio_active::is_realtime_call_active()` (default-output AND
+    /// default-input both running — Meet / Zoom / FaceTime / Discord) OR
+    /// `realtime_signals::ScreenCaptureCache::check()` (replayd /
+    /// screencaptureui / ScreenSharingAgent in the proc table — B.2,
+    /// 2026-06-09 post-screen-share whipsaw). When set, the governor MUST
+    /// skip TCP buffer scale-down and force `delayed_ack = 0` regardless of
+    /// battery state — WebRTC jitter and audio cutouts otherwise.
     pub realtime_call_active: bool,
 }
 
@@ -86,6 +89,10 @@ pub struct SysctlGovernorStatus {
     /// TCP domain hysteresis state.
     pub tcp_consecutive_high: u32,
     pub tcp_consecutive_low: u32,
+    /// Seconds since the last TCP buffer scale-UP (None = never).
+    /// Scale-DOWN is dwell-gated until this reaches `TCP_SCALE_DOWN_DWELL`.
+    #[serde(default)]
+    pub tcp_last_scale_up_secs_ago: Option<u64>,
     /// IPC domain hysteresis state.
     pub ipc_consecutive_drops: u32,
     pub ipc_consecutive_clean: u32,
@@ -111,6 +118,15 @@ struct TcpTuningState {
     recvspace: u64,
     /// Current delayed_ack value.
     delayed_ack: u32,
+    /// Wall-clock timestamp of the last buffer scale-UP. `SystemTime` (not
+    /// `Instant`) for the same sleep-correctness reason as `last_tuning` —
+    /// see the rationale on that field. Used by the scale-down dwell gate:
+    /// 2026-06-09 prod whipsaw ("high retransmissions scaling UP" followed
+    /// immediately post-screen-share by "low retransmissions -25%
+    /// scale-down") oscillated buffers within minutes. Scale-down is now
+    /// forbidden until `TCP_SCALE_DOWN_DWELL` has elapsed since the last
+    /// scale-up.
+    last_scale_up_at: Option<SystemTime>,
 }
 
 /// IPC (somaxconn) tuning state.
@@ -159,6 +175,11 @@ const SOMAXCONN_MAX: u64 = 8_192;
 const MAXVNODES_MIN: u64 = 100_000;
 const MAXVNODES_MAX: u64 = 500_000;
 const COOLDOWN: Duration = Duration::from_secs(60);
+/// Minimum wall-clock dwell after a TCP buffer scale-UP before any
+/// scale-DOWN may fire. Asymmetric on purpose: growing buffers under
+/// retransmission stress is cheap; shrinking them right after the stress
+/// subsides (e.g. screen-share ends) caused the 2026-06-09 whipsaw.
+const TCP_SCALE_DOWN_DWELL: Duration = Duration::from_secs(300);
 
 // ── SysctlGovernor ───────────────────────────────────────────────────────────
 
@@ -284,6 +305,7 @@ impl SysctlGovernor {
                 sendspace,
                 recvspace,
                 delayed_ack,
+                last_scale_up_at: None,
             },
             vm: VmTuningState {
                 consecutive_high: 0,
@@ -577,6 +599,11 @@ impl SysctlGovernor {
             last_tune_secs_ago,
             tcp_consecutive_high: self.tcp.consecutive_high,
             tcp_consecutive_low: self.tcp.consecutive_low,
+            tcp_last_scale_up_secs_ago: self.tcp.last_scale_up_at.map(|at| {
+                now.duration_since(at)
+                    .unwrap_or(Duration::from_secs(0))
+                    .as_secs()
+            }),
             ipc_consecutive_drops: self.ipc.consecutive_drops,
             ipc_consecutive_clean: self.ipc.consecutive_clean,
             vm_consecutive_high: self.vm.consecutive_high,
@@ -638,6 +665,9 @@ impl SysctlGovernor {
                 self.tcp.recvspace = new_recv;
             }
             self.tcp.consecutive_high = 0; // Reset after action.
+                                           // Arm the scale-down dwell even if cooldown swallowed the emit:
+                                           // the *intent* to scale up is the whipsaw signal.
+            self.tcp.last_scale_up_at = Some(SystemTime::now());
         }
 
         // -- Scale DOWN: retransmission_rate < 0.5% for 6 cycles AND throughput low --
@@ -651,10 +681,16 @@ impl SysctlGovernor {
         // send/recv buffers -25% broke signaling + STUN/TURN fallback,
         // freezing audio/video. Inhibit during realtime full-duplex audio.
         if inputs.realtime_call_active {
-            crate::engine::lse_counters::LSE_COUNTERS
-                .inc_sysctl_governor_realtime_call_inhibit();
+            crate::engine::lse_counters::LSE_COUNTERS.inc_sysctl_governor_realtime_call_inhibit();
             self.tcp.consecutive_low = 0; // forget the streak so resume is clean
-        } else if self.tcp.consecutive_low >= 6 && throughput_low {
+        } else if self.tcp.consecutive_low >= 6
+            && throughput_low
+            && self.tcp_scale_down_dwell_elapsed()
+        {
+            // NOTE: when the dwell gate blocks, this branch simply does not
+            // run — `consecutive_low` is deliberately NOT reset (unlike the
+            // realtime gate above), so the streak stays armed and scale-down
+            // fires on the first tick after the dwell expires.
             let new_send = ((self.tcp.sendspace as f64 * 0.75) as u64).max(TCP_BUFFER_MIN);
             let new_recv = ((self.tcp.recvspace as f64 * 0.75) as u64).max(TCP_BUFFER_MIN);
 
@@ -687,8 +723,7 @@ impl SysctlGovernor {
         // which is catastrophic for WebRTC. Realtime-call gate overrides the
         // entire ladder and forces 0 (immediate ACK).
         let desired_ack = if inputs.realtime_call_active {
-            crate::engine::lse_counters::LSE_COUNTERS
-                .inc_sysctl_governor_realtime_call_inhibit();
+            crate::engine::lse_counters::LSE_COUNTERS.inc_sysctl_governor_realtime_call_inhibit();
             0 // Realtime full-duplex audio: every ACK must dispatch immediately.
         } else if inputs.on_battery {
             3 // Combine ACKs to reduce CPU wakes.
@@ -1038,6 +1073,22 @@ impl SysctlGovernor {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /// True when the post-scale-UP dwell has elapsed (or no scale-up has
+    /// ever happened), allowing a TCP buffer scale-DOWN. Wall-clock
+    /// (`SystemTime`) so sleep duration counts toward the dwell — same
+    /// rationale as `last_tuning`.
+    fn tcp_scale_down_dwell_elapsed(&self) -> bool {
+        match self.tcp.last_scale_up_at {
+            Some(at) => {
+                SystemTime::now()
+                    .duration_since(at)
+                    .unwrap_or(Duration::from_secs(0))
+                    >= TCP_SCALE_DOWN_DWELL
+            }
+            None => true,
+        }
+    }
 
     /// Check whether the cooldown period has elapsed for a given key.
     /// Uses wall-clock (`SystemTime`) so sleep duration counts toward cooldown.
@@ -1623,6 +1674,115 @@ mod tests {
             battery_combined,
             "with gate off, battery branch must still emit delayed_ack=3"
         );
+    }
+
+    // ── Scale-down dwell (2026-06-09 whipsaw fix) ────────────────────────────
+
+    /// Detect a TCP buffer scale-DOWN write among emitted actions.
+    fn has_buffer_scale_down(actions: &[RootAction]) -> bool {
+        actions.iter().any(|a| {
+            matches!(a, RootAction::SetSysctl(s)
+                if (s.key() == "net.inet.tcp.sendspace" || s.key() == "net.inet.tcp.recvspace")
+                && s.reason().contains("low retransmissions"))
+        })
+    }
+
+    #[test]
+    fn scale_down_blocked_within_dwell_after_scale_up() {
+        let mut gov = SysctlGovernor::new(true);
+
+        // Phase 1: three high-retransmission cycles trigger a scale-UP,
+        // arming `last_scale_up_at`.
+        let high = test_monitor(60.0, 0.0, 1000);
+        let inputs = default_inputs(&high);
+        tick_ok(&mut gov, &inputs);
+        tick_ok(&mut gov, &inputs);
+        assert!(!tick_ok(&mut gov, &inputs).is_empty(), "scale-up expected");
+        assert!(gov.tcp.last_scale_up_at.is_some(), "dwell must be armed");
+
+        // Neutralize the 60s per-key cooldown so only the dwell can block.
+        gov.last_tuning.clear();
+
+        // Phase 2: quiet network, streak already at the threshold.
+        let low = test_monitor(0.0, 0.0, 0);
+        let inputs = default_inputs(&low);
+        gov.tcp.consecutive_low = 6;
+        let actions = tick_ok(&mut gov, &inputs);
+        assert!(
+            !has_buffer_scale_down(&actions),
+            "scale-down must be dwell-blocked right after a scale-up"
+        );
+        // Unlike the realtime gate, a dwell block keeps the streak armed.
+        assert!(
+            gov.tcp.consecutive_low > 0,
+            "dwell block must NOT reset consecutive_low"
+        );
+    }
+
+    #[test]
+    fn scale_down_allowed_after_dwell() {
+        let mut gov = SysctlGovernor::new(true);
+        gov.tcp.sendspace = 524_288;
+        gov.tcp.recvspace = 524_288;
+        gov.tcp.consecutive_low = 6;
+        // Backdate the scale-up past the 300s dwell window.
+        gov.tcp.last_scale_up_at = Some(SystemTime::now() - Duration::from_secs(301));
+
+        let monitor = test_monitor(0.0, 0.0, 0);
+        let inputs = default_inputs(&monitor);
+        let actions = tick_ok(&mut gov, &inputs);
+        assert!(
+            has_buffer_scale_down(&actions),
+            "scale-down must fire once the dwell has elapsed"
+        );
+    }
+
+    #[test]
+    fn scale_down_allowed_when_never_scaled_up() {
+        let mut gov = SysctlGovernor::new(true);
+        gov.tcp.sendspace = 524_288;
+        gov.tcp.recvspace = 524_288;
+        gov.tcp.consecutive_low = 6;
+        assert!(gov.tcp.last_scale_up_at.is_none());
+
+        let monitor = test_monitor(0.0, 0.0, 0);
+        let inputs = default_inputs(&monitor);
+        let actions = tick_ok(&mut gov, &inputs);
+        assert!(
+            has_buffer_scale_down(&actions),
+            "no prior scale-up means no dwell — scale-down must fire"
+        );
+    }
+
+    /// Replays the 2026-06-09 post-screen-share whipsaw: retransmission
+    /// stress drives a scale-UP, then the share ends and the network goes
+    /// quiet for 6+ cycles. Pre-fix this emitted an immediate -25%
+    /// scale-down; the dwell must hold the line at zero down-writes.
+    #[test]
+    fn whipsaw_scenario_share_then_idle() {
+        let mut gov = SysctlGovernor::new(true);
+
+        let high = test_monitor(60.0, 0.0, 1000);
+        let inputs = default_inputs(&high);
+        tick_ok(&mut gov, &inputs);
+        tick_ok(&mut gov, &inputs);
+        assert!(!tick_ok(&mut gov, &inputs).is_empty(), "scale-up expected");
+
+        // Isolate the dwell: the 60s cooldown alone must not be the reason
+        // the test passes.
+        gov.last_tuning.clear();
+
+        let idle = test_monitor(0.0, 0.0, 0);
+        let inputs = default_inputs(&idle);
+        for cycle in 1..=6 {
+            let actions = tick_ok(&mut gov, &inputs);
+            assert!(
+                !has_buffer_scale_down(&actions),
+                "cycle {cycle}: dwell must block scale-down right after the share"
+            );
+        }
+        // The streak kept accumulating, ready for when the dwell expires.
+        assert!(gov.tcp.consecutive_low >= 6);
     }
 
     // Unit tests for `clamp_to_allowed_range` live with the helper in

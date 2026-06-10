@@ -482,8 +482,7 @@ impl DriftDetector {
         let base_thr = self.drift_threshold as f64;
         let effective_thr = self.adaptive_threshold.recommended_threshold(base_thr);
         if effective_thr > base_thr + f64::EPSILON {
-            crate::engine::lse_counters::LSE_COUNTERS
-                .add_adaptive_drift_threshold_raises(1);
+            crate::engine::lse_counters::LSE_COUNTERS.add_adaptive_drift_threshold_raises(1);
         }
         // Recount drifted beliefs against the adaptive threshold.
         self.drifted_count = self

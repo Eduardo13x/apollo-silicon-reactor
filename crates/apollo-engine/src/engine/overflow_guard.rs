@@ -140,7 +140,11 @@ fn build_tool_exact_set() -> &'static std::collections::HashSet<&'static str> {
 fn build_tool_long_ac() -> &'static aho_corasick::AhoCorasick {
     static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
     AC.get_or_init(|| {
-        let long: Vec<&'static str> = BUILD_TOOLS.iter().copied().filter(|t| t.len() > 4).collect();
+        let long: Vec<&'static str> = BUILD_TOOLS
+            .iter()
+            .copied()
+            .filter(|t| t.len() > 4)
+            .collect();
         aho_corasick::AhoCorasickBuilder::new()
             .ascii_case_insensitive(true)
             .build(long)

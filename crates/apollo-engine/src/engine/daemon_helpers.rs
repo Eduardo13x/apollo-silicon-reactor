@@ -675,9 +675,8 @@ pub fn merge_seed_into(policy: &mut LearnedPolicy) {
     let protected_snap = policy.protected_patterns.clone();
     Arc::make_mut(&mut policy.interactive_patterns).retain(|p| !protected_snap.contains(p));
     let interactive_snap = policy.interactive_patterns.clone();
-    Arc::make_mut(&mut policy.noise_patterns).retain(|p| {
-        !protected_snap.contains(p) && !interactive_snap.contains(p)
-    });
+    Arc::make_mut(&mut policy.noise_patterns)
+        .retain(|p| !protected_snap.contains(p) && !interactive_snap.contains(p));
 }
 
 pub fn pid_start_time(pid: u32) -> (u64, u64) {

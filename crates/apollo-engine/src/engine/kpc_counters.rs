@@ -125,12 +125,8 @@ impl KpcReader {
     pub fn new() -> Self {
         #[cfg(target_os = "macos")]
         {
-            let handle = unsafe {
-                libc::dlopen(
-                    c"/usr/lib/libkpc.dylib".as_ptr(),
-                    libc::RTLD_LAZY,
-                )
-            };
+            let handle =
+                unsafe { libc::dlopen(c"/usr/lib/libkpc.dylib".as_ptr(), libc::RTLD_LAZY) };
 
             if handle.is_null() {
                 return Self::unavailable();

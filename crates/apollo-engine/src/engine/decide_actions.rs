@@ -180,8 +180,13 @@ fn blocker_ac() -> &'static aho_corasick::AhoCorasick {
 fn display_pipeline_ac() -> &'static aho_corasick::AhoCorasick {
     static AC: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
     AC.get_or_init(|| {
-        const DISPLAY_PIPELINE: &[&str] =
-            &["Dock", "coreaudiod", "mediaserverd", "SystemUIServer", "ControlCenter"];
+        const DISPLAY_PIPELINE: &[&str] = &[
+            "Dock",
+            "coreaudiod",
+            "mediaserverd",
+            "SystemUIServer",
+            "ControlCenter",
+        ];
         aho_corasick::AhoCorasick::new(DISPLAY_PIPELINE).expect("display AC")
     })
 }
@@ -592,8 +597,7 @@ pub fn decide_actions(
             continue;
         }
         // Inv#11: PID-only context here; look up start_sec via daemon_helpers.
-        let (start_sec, start_usec) =
-            crate::engine::daemon_helpers::pid_start_time(blocker.pid);
+        let (start_sec, start_usec) = crate::engine::daemon_helpers::pid_start_time(blocker.pid);
         actions.push(RootAction::BoostProcess {
             pid: blocker.pid,
             name: blocker.name.clone(),
@@ -1505,8 +1509,7 @@ pub fn decide_actions(
                         if crate::engine::safety::hard_protected_contains(&name) {
                             return None;
                         }
-                        if !survival_mode
-                            && crate::engine::safety::softly_protected_contains(&name)
+                        if !survival_mode && crate::engine::safety::softly_protected_contains(&name)
                         {
                             return None;
                         }

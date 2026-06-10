@@ -459,7 +459,8 @@ mod tests {
                 fast_tick_until: None,
                 reactor_event_weight: 0.0,
                 reactor_status: apollo_engine::engine::daemon_state::ReactorStatus::default(),
-                survival_window: apollo_engine::engine::survival_window::SurvivalActivationWindow::new(),
+                survival_window:
+                    apollo_engine::engine::survival_window::SurvivalActivationWindow::new(),
             })),
             frozen_state: Arc::new(Mutex::new(HashMap::new())),
             process: Arc::new(Mutex::new(ProcessState {
@@ -517,6 +518,7 @@ mod tests {
                     last_tune_secs_ago: HashMap::new(),
                     tcp_consecutive_high: 0,
                     tcp_consecutive_low: 0,
+                    tcp_last_scale_up_secs_ago: None,
                     ipc_consecutive_drops: 0,
                     ipc_consecutive_clean: 0,
                     vm_consecutive_high: 0,

@@ -95,8 +95,7 @@ pub fn apply_neuromodulator(
         (ode_swap_urgency * (-signal_digest.pressure_velocity).max(0.0)).clamp(0.0, 1.0);
     let overflow_occurred = lctx.overflow_guard.history.total_overflows > 0;
     let neuro_signals = NeuroSignals {
-        pressure_drop: -signal_digest.pressure_smooth
-            * signal_digest.pressure_velocity,
+        pressure_drop: -signal_digest.pressure_smooth * signal_digest.pressure_velocity,
         ode_rss_surprise,
         outcome_penalty: lctx.outcome_tracker.rl_penalty()
             - 0.5
@@ -194,10 +193,9 @@ pub fn run_neurocognitive_tick(
         .unwrap_or(0.0);
     let observed_drop = lctx.outcome_tracker.pressure_velocity_short();
     let actual_residual = lctx.outcome_tracker.causal_effect(observed_drop);
-    let causal_actual_delta_norm =
-        ((actual_residual.abs() / 0.10).clamp(0.0, 1.0)) as f32;
-    let causal_observation_ready = lctx.outcome_tracker.total_resolved >= 10
-        && causal_predicted_delta_norm > 0.0;
+    let causal_actual_delta_norm = ((actual_residual.abs() / 0.10).clamp(0.0, 1.0)) as f32;
+    let causal_observation_ready =
+        lctx.outcome_tracker.total_resolved >= 10 && causal_predicted_delta_norm > 0.0;
     let cog_inputs = CognitiveTickInputs {
         cycle: cycle_count,
         pressure: signal_digest.pressure_smooth,
@@ -208,9 +206,7 @@ pub fn run_neurocognitive_tick(
         outcome_effectiveness: lctx.outcome_tracker.overall_effectiveness(),
         causal_confidence: top_causal,
         causal_confidence_map,
-        latest_action: action_names_for_outcome
-            .first()
-            .map(|n| n.clone()),
+        latest_action: action_names_for_outcome.first().map(|n| n.clone()),
         predicted_score: {
             let max_reward = lctx
                 .predictive_agent

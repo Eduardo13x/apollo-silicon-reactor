@@ -133,8 +133,7 @@ pub fn run_survival_tick(
         // cumulative read. See CLAUDE.md Sprint 3 doctrine #5.
         guard.survival_window.record(now);
         guard.survival_window.prune(now);
-        guard.metrics.survival_activations_recent_24h =
-            guard.survival_window.len() as u64;
+        guard.metrics.survival_activations_recent_24h = guard.survival_window.len() as u64;
         drop(guard);
 
         // Jetsam demotion: mark non-foreground Chromium renderers as BACKGROUND
@@ -153,16 +152,14 @@ pub fn run_survival_tick(
             let can_purge = local
                 .map(|t: Instant| t.elapsed() >= Duration::from_secs(600))
                 .unwrap_or(true);
-            if can_purge
-                && std::process::Command::new("purge").spawn().is_ok() {
-                    *local = Some(Instant::now());
-                    // Write shared timestamp so maintenance_tick yields.
-                    // Survival itself does NOT read this field — asymmetric.
-                    maintenance_state.mark_purged();
-                    maintenance_state.mark_compressor_flushing(
-                        snapshot.pressure.swap_delta_bytes_per_sec < 0.0,
-                    );
-                }
+            if can_purge && std::process::Command::new("purge").spawn().is_ok() {
+                *local = Some(Instant::now());
+                // Write shared timestamp so maintenance_tick yields.
+                // Survival itself does NOT read this field — asymmetric.
+                maintenance_state.mark_purged();
+                maintenance_state
+                    .mark_compressor_flushing(snapshot.pressure.swap_delta_bytes_per_sec < 0.0);
+            }
         }
     }
 

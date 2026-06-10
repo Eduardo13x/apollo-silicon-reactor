@@ -84,7 +84,11 @@ impl ActiveCoalitionEnvelope {
             return;
         }
         let now = SystemTime::now();
-        if let Some(e) = self.entries.iter_mut().find(|e| e.coalition_id == coalition_id) {
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.coalition_id == coalition_id)
+        {
             e.last_seen = now;
             return;
         }
@@ -163,8 +167,7 @@ impl<'a> CoalitionGuard<'a> {
     /// last grace window. Use to skip destructive actions against
     /// subprocesses of the user's active workflow.
     pub fn is_protected(&self, pid: u32) -> bool {
-        self.envelope
-            .is_active(self.tracker.get_coalition_id(pid))
+        self.envelope.is_active(self.tracker.get_coalition_id(pid))
     }
 }
 

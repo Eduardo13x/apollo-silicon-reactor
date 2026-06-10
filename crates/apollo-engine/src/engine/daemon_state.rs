@@ -273,6 +273,12 @@ impl MetricsState {
         self.metrics.effect_decay_hp_mach_attempts_total = lf.effect_decay_hp_mach_attempts_total;
         self.metrics.sysctl_governor_realtime_call_inhibit_total =
             lf.sysctl_governor_realtime_call_inhibit_total;
+        // B.2 replayd gate (2026-06-09). Screen-capture-deciding realtime
+        // inhibits — mirrored here to avoid the silent-telemetry-death
+        // pattern (Sprint 9 `4b13a39`): without this line the counter
+        // increments forever but never reaches `runtime_metrics.json`.
+        self.metrics.sysctl_governor_screen_capture_inhibit_total =
+            lf.sysctl_governor_screen_capture_inhibit_total;
 
         // Approach 2 (2026-06-07). OutcomeTracker class-reclassification gate
         // excluded a hard-protected entry from the `low_value_names` signal
@@ -303,8 +309,7 @@ impl MetricsState {
         // explicit copy here is the silent-telemetry-death guard (Sprint 9
         // `4b13a39`): without it the LSE counter increments forever but
         // never surfaces in `runtime_metrics.json`.
-        self.metrics.hard_protected_boost_skipped_total =
-            lf.hard_protected_boost_skipped_total;
+        self.metrics.hard_protected_boost_skipped_total = lf.hard_protected_boost_skipped_total;
 
         // Approach-3 wire (2026-06-07). Producer =
         // `learned_state::poke_rollback_guard_via_decay`. Increments only
@@ -340,8 +345,7 @@ impl MetricsState {
         // hits AND `dram_bandwidth_pct < 0.50`. Stays at 0 until the
         // user is running a multi-process foreground workflow with the
         // bus below the safety floor.
-        self.metrics.companion_affinity_alignments_total =
-            lf.companion_affinity_alignments_total;
+        self.metrics.companion_affinity_alignments_total = lf.companion_affinity_alignments_total;
 
         // Sprint 13 Pressure-Router Gate (2026-05-30). Producer is the
         // daemon main-loop companion-observation block that skips the
@@ -349,8 +353,7 @@ impl MetricsState {
         // (pressure < mid_entry, modulo-4 fallback miss). Stays at 0
         // when pressure stays at/above the workload mid_entry — the
         // gate then degenerates into "always observe".
-        self.metrics.companion_observe_router_skips_total =
-            lf.companion_observe_router_skips_total;
+        self.metrics.companion_observe_router_skips_total = lf.companion_observe_router_skips_total;
         // Sprint 12 perf-fix (2026-05-30). Producer is the main loop
         // `companion_of_fg_pids` derivation at
         // `apollo-optimizerd/main.rs:3317`. Bumps every cycle the

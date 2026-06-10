@@ -45,9 +45,9 @@ fn impossible_future_start_sec() -> u64 {
 
 #[test]
 fn boost_blocks_on_mismatched_start_sec_and_bumps_counter() {
-    let before = LSE_COUNTERS.pid_recycle_blocks_total.load(
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let before = LSE_COUNTERS
+        .pid_recycle_blocks_total
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     // PID 1 = launchd; very real and reachable. Mismatched start_sec → block.
     let action = RootAction::BoostProcess {
@@ -74,9 +74,9 @@ fn boost_blocks_on_mismatched_start_sec_and_bumps_counter() {
         None,
         0.0,
     );
-    let after = LSE_COUNTERS.pid_recycle_blocks_total.load(
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let after = LSE_COUNTERS
+        .pid_recycle_blocks_total
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     assert!(after >= before + 1, "pid_recycle_blocks_total must bump");
     assert_eq!(
@@ -94,9 +94,9 @@ fn boost_blocks_on_mismatched_start_sec_and_bumps_counter() {
 
 #[test]
 fn set_thread_qos_blocks_on_mismatched_start_sec_and_bumps_counter() {
-    let before = LSE_COUNTERS.pid_recycle_blocks_total.load(
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let before = LSE_COUNTERS
+        .pid_recycle_blocks_total
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     // Use a non-protected name so the protected-filter doesn't short-circuit
     // before the identity check. PID 1 (launchd) still satisfies the
@@ -129,15 +129,12 @@ fn set_thread_qos_blocks_on_mismatched_start_sec_and_bumps_counter() {
         None,
         0.0,
     );
-    let after = LSE_COUNTERS.pid_recycle_blocks_total.load(
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let after = LSE_COUNTERS
+        .pid_recycle_blocks_total
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     assert!(after >= before + 1, "pid_recycle_blocks_total must bump");
-    assert_eq!(
-        outcomes.thread_qos_applied, 0,
-        "thread QoS must NOT apply"
-    );
+    assert_eq!(outcomes.thread_qos_applied, 0, "thread QoS must NOT apply");
     assert!(
         outcomes.audit_traces.iter().any(|t| matches!(
             t.block_reason,

@@ -75,9 +75,8 @@ pub fn apply_fluidity_qos(
     {
         if let Some(fg_pid) = foreground_pid {
             // Switch-4b (2026-06-03): route through MachPolicyEffector.
-            let mach_effector = apollo_engine::engine::mediator::MachPolicyEffector::new(
-                state.mach_qos.clone(),
-            );
+            let mach_effector =
+                apollo_engine::engine::mediator::MachPolicyEffector::new(state.mach_qos.clone());
             let mach_eff = apollo_engine::engine::mediator::Effect::SetMachPolicy {
                 pid: fg_pid,
                 start_sec: 0,
@@ -394,9 +393,7 @@ pub fn drain_effect_decay(
                 w.hard_protected_decay_pids(now),
             )
         };
-        apollo_engine::engine::learned_state::poke_rollback_guard_via_decay(
-            lp, hp_count, &hp_pids,
-        );
+        apollo_engine::engine::learned_state::poke_rollback_guard_via_decay(lp, hp_count, &hp_pids);
         return;
     }
     {
@@ -425,8 +422,7 @@ pub fn drain_effect_decay(
             }
             let live = match obs.kind {
                 ObsKind::JetsamTier => {
-                    apollo_engine::engine::jetsam_control::get_priority(obs.pid)
-                        .map(|p| p as i64)
+                    apollo_engine::engine::jetsam_control::get_priority(obs.pid).map(|p| p as i64)
                 }
                 ObsKind::Sysctl => obs
                     .key
@@ -454,7 +450,5 @@ pub fn drain_effect_decay(
             w.hard_protected_decay_pids(now),
         )
     };
-    apollo_engine::engine::learned_state::poke_rollback_guard_via_decay(
-        lp, hp_count, &hp_pids,
-    );
+    apollo_engine::engine::learned_state::poke_rollback_guard_via_decay(lp, hp_count, &hp_pids);
 }

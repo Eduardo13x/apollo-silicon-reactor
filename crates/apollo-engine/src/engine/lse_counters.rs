@@ -580,6 +580,18 @@ pub struct LockFreeMetrics {
     /// scaled -25%, delayed_ack=3 on battery).
     pub sysctl_governor_realtime_call_inhibit_total: AtomicU64,
 
+    /// B.2 replayd gate (2026-06-09 incident follow-up). Bumped at the
+    /// daemon composition point in main.rs each cycle where the screen-
+    /// capture probe (`realtime_signals::ScreenCaptureCache`) is the
+    /// DECIDING signal for `realtime_call_active` — i.e. the CoreAudio
+    /// full-duplex gate said false but an active screen-capture process
+    /// (`replayd` / `screencaptureui` / `ScreenSharingAgent`) said true.
+    /// Distinguishes screen-share-only inhibitions from full-duplex-call
+    /// inhibitions (`sysctl_governor_realtime_call_inhibit_total`): the
+    /// post-screen-share buffer whipsaw observed 2026-06-09 fired with no
+    /// audio devices running, which the audio-only gate could never catch.
+    pub sysctl_governor_screen_capture_inhibit_total: AtomicU64,
+
     /// Sprint patch (2026-06-07). Approach 2 — OutcomeTracker class-
     /// reclassification gate excluded a hard-protected entry from the
     /// `low_value_names` signal because its low effectiveness is a
@@ -812,6 +824,7 @@ impl LockFreeMetrics {
             effect_decay_detected_total: AtomicU64::new(0),
             effect_decay_hp_mach_attempts_total: AtomicU64::new(0),
             sysctl_governor_realtime_call_inhibit_total: AtomicU64::new(0),
+            sysctl_governor_screen_capture_inhibit_total: AtomicU64::new(0),
             hard_protected_reclassify_excluded_total: AtomicU64::new(0),
             mediator_port_hub_blocks_total: AtomicU64::new(0),
             mediator_port_hub_probe_unavailable_total: AtomicU64::new(0),
@@ -1290,21 +1303,20 @@ impl LockFreeMetrics {
                 .companion_fg_cache_hits_total
                 .load(Ordering::Relaxed),
             ac_cache_evictions_total: self.ac_cache_evictions_total.load(Ordering::Relaxed),
-            mediator_thread_policy_total: self
-                .mediator_thread_policy_total
-                .load(Ordering::Relaxed),
+            mediator_thread_policy_total: self.mediator_thread_policy_total.load(Ordering::Relaxed),
             pid_recycle_blocks_total: self.pid_recycle_blocks_total.load(Ordering::Relaxed),
             policy_scorer_uncertainty_saturated_total: self
                 .policy_scorer_uncertainty_saturated_total
                 .load(Ordering::Relaxed),
-            effect_decay_detected_total: self
-                .effect_decay_detected_total
-                .load(Ordering::Relaxed),
+            effect_decay_detected_total: self.effect_decay_detected_total.load(Ordering::Relaxed),
             effect_decay_hp_mach_attempts_total: self
                 .effect_decay_hp_mach_attempts_total
                 .load(Ordering::Relaxed),
             sysctl_governor_realtime_call_inhibit_total: self
                 .sysctl_governor_realtime_call_inhibit_total
+                .load(Ordering::Relaxed),
+            sysctl_governor_screen_capture_inhibit_total: self
+                .sysctl_governor_screen_capture_inhibit_total
                 .load(Ordering::Relaxed),
             hard_protected_reclassify_excluded_total: self
                 .hard_protected_reclassify_excluded_total
@@ -1607,7 +1619,8 @@ impl LockFreeMetrics {
     /// entry to make room for an incoming pattern set.
     #[inline(always)]
     pub fn inc_ac_cache_eviction(&self) {
-        self.ac_cache_evictions_total.fetch_add(1, Ordering::Relaxed);
+        self.ac_cache_evictions_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Sprint patch (2026-06-05). S3 — ThreadPolicyEffector applied a
@@ -1661,6 +1674,17 @@ impl LockFreeMetrics {
     #[inline(always)]
     pub fn inc_sysctl_governor_realtime_call_inhibit(&self) {
         self.sysctl_governor_realtime_call_inhibit_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// B.2 replayd gate (2026-06-09). Bumped by the daemon composition
+    /// point ONLY when the screen-capture probe is the deciding signal
+    /// (audio full-duplex gate false, screen-capture scan true). Sustained
+    /// non-zero values during screen shares prove the gate covers the
+    /// post-screen-share whipsaw the audio-only guard missed.
+    #[inline(always)]
+    pub fn inc_sysctl_governor_screen_capture_inhibit(&self) {
+        self.sysctl_governor_screen_capture_inhibit_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1913,6 +1937,8 @@ pub struct MetricsSnapshot {
     /// SysctlGovernor TCP path. Sustained non-zero ratio proves the gate
     /// catches mid-call buffer scale-downs and ACK coalescing branches.
     pub sysctl_governor_realtime_call_inhibit_total: u64,
+    /// B.2 replayd gate (2026-06-09). Screen-capture-deciding realtime inhibits.
+    pub sysctl_governor_screen_capture_inhibit_total: u64,
     /// Sprint patch (2026-06-07). Approach 2 — class-reclassification HP exclusion.
     pub hard_protected_reclassify_excluded_total: u64,
     /// Sprint patch (2026-06-05). Group C Invariant #13 port-hub blocks.

@@ -130,14 +130,20 @@ pub fn run_chromium_tick(
     // if a non-SIGSTOP "freeze" mechanism becomes available (e.g.,
     // browser cooperation via CDP, Accessibility API).
     let _regime_history = (
-        ("call",        0.55, 25_000.0),
-        ("llm",         0.60, 30_000.0),
-        ("media",       0.60, 30_000.0),
-        ("build",       0.65, 35_000.0),
+        ("call", 0.55, 25_000.0),
+        ("llm", 0.60, 30_000.0),
+        ("media", 0.60, 30_000.0),
+        ("build", 0.65, 35_000.0),
         ("external_4k", 0.65, 35_000.0),
-        ("default",     0.75, 50_000.0),
+        ("default", 0.75, 50_000.0),
     );
-    let _ = (call_in_progress, llm_active, media_active, build_active, external_4k_attached);
+    let _ = (
+        call_in_progress,
+        llm_active,
+        media_active,
+        build_active,
+        external_4k_attached,
+    );
     // Effective: chromium SIGSTOP unconditionally disabled.
     let (pressure_gate, thrashing_gate, regime): (f64, f64, &str) =
         (f64::INFINITY, f64::INFINITY, "disabled");

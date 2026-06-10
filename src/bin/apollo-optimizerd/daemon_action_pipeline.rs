@@ -150,8 +150,8 @@ pub fn run_filter_pipeline(
     // scenario can't lock the system into pure-observation mode.
     // [Garcia & Fernandez 2015] safe RL — constraint violations bypass uncertainty gates.
     let raw_pressure_critical = snapshot.pressure.memory_pressure >= 0.80;
-    let ode_physical_critical = matches!(swap_risk, SwapRisk::Critical | SwapRisk::Overflow)
-        || raw_pressure_critical;
+    let ode_physical_critical =
+        matches!(swap_risk, SwapRisk::Critical | SwapRisk::Overflow) || raw_pressure_critical;
     let op_mode =
         if prev_cog_decision.is_some_and(|d| d.observe_only) && op_mode == OperationMode::Full {
             if ode_physical_critical {

@@ -90,10 +90,7 @@ pub fn run_agent_actions(
             // process; firing it on WindowServer or audio helpers during media
             // produces visible/audible stutter. Symmetric with the maintenance
             // purge gate in daemon_maintenance_tick.rs::should_fire.
-            if user_ctx.audio_active
-                || user_ctx.call_in_progress
-                || user_ctx.has_sleep_assertion
-            {
+            if user_ctx.audio_active || user_ctx.call_in_progress || user_ctx.has_sleep_assertion {
                 return new_actions;
             }
             // Send paging hints to top 3 background processes by RSS.
@@ -110,11 +107,11 @@ pub fn run_agent_actions(
             // cost is ≤ 10µs. Strictly subsumes the older single-fg
             // `family_of` call.
             let _ = foreground_pid; // not needed here; envelope already updated upstream
-            //
-            // Lock policy once and run the entire filter inside the guard so
-            // process_relevance(name) can be queried without per-iteration
-            // re-locking. top_processes is bounded (~50), so the critical
-            // section stays short.
+                                    //
+                                    // Lock policy once and run the entire filter inside the guard so
+                                    // process_relevance(name) can be queried without per-iteration
+                                    // re-locking. top_processes is bounded (~50), so the critical
+                                    // section stays short.
             let policy = state.policy.lock_recover();
             let protected_pats = &policy.learned_policy.protected_patterns;
             let user_profile = &policy.adaptive_governor.user_profile;

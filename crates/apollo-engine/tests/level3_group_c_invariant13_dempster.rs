@@ -204,9 +204,7 @@ fn dempster_shafer_default_mode_leaves_ds_fields_neutral() {
     // Default builder is RSS mode — verify the new DS fields are at
     // their neutral defaults so legacy consumers see byte-equivalent
     // behaviour to pre-Group-C.
-    let scorer = PolicyScorer::builder()
-        .feature(StrongBeliefFeature)
-        .build();
+    let scorer = PolicyScorer::builder().feature(StrongBeliefFeature).build();
     let score = scorer.score(&freeze_action(), &neutral_ctx());
 
     assert_eq!(score.ds_belief, 0.0, "RSS default → ds_belief must be 0.0");

@@ -33,11 +33,7 @@ const STALE_THRESHOLD: Duration = Duration::from_secs(5);
 /// Decide the glyph + optional suffix based on a parsed metrics JSON.
 /// Returns `None` for "say nothing" cases (stale, unhealthy parse,
 /// healthy + not always_on).
-pub fn decide_line(
-    json: &serde_json::Value,
-    always_on: bool,
-    age: Duration,
-) -> Option<String> {
+pub fn decide_line(json: &serde_json::Value, always_on: bool, age: Duration) -> Option<String> {
     if age > STALE_THRESHOLD {
         return None;
     }

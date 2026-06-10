@@ -326,20 +326,35 @@ mod tests {
         use crate::engine::safety::ProtectionLevel;
         // Minimal ActionContext — only the type matters for this feature.
         let ctx = ActionContext {
-            pressure: 0.0, swap_gb: 0.0, thrashing_score: 0.0,
-            p_oom_30s: None, p_jank_60s: None,
-            has_sleep_assertion: false, call_in_progress: false, idle_secs: 0.0,
-            foreground_pid: None, is_foreground_family: false,
-            is_recently_active: false, thermal_emergency: false,
-            interrupt_phase: 0, protection_level: ProtectionLevel::Unprotected,
-            hot_page_fraction: None, wss_mb: None, sensor_age_ms: None,
+            pressure: 0.0,
+            swap_gb: 0.0,
+            thrashing_score: 0.0,
+            p_oom_30s: None,
+            p_jank_60s: None,
+            has_sleep_assertion: false,
+            call_in_progress: false,
+            idle_secs: 0.0,
+            foreground_pid: None,
+            is_foreground_family: false,
+            is_recently_active: false,
+            thermal_emergency: false,
+            interrupt_phase: 0,
+            protection_level: ProtectionLevel::Unprotected,
+            hot_page_fraction: None,
+            wss_mb: None,
+            sensor_age_ms: None,
             epistemic_uncertainty: 0.0,
-            is_on_battery: None, wakeups_per_sec: None, ctx_switches_per_sec: None,
+            is_on_battery: None,
+            wakeups_per_sec: None,
+            ctx_switches_per_sec: None,
         };
         let action = RootAction::BoostProcess {
-            pid: 1, name: "x".into(), reason: "u".into(),
+            pid: 1,
+            name: "x".into(),
+            reason: "u".into(),
             decision_reason: DecisionReason::PressureContext,
-            start_sec: 0, start_usec: 0,
+            start_sec: 0,
+            start_usec: 0,
         };
         let c = IdentityUncertaintyFeature::new(0.30).contribute(&action, &ctx);
         assert!((c.uncertainty - 0.70).abs() < 1e-9);

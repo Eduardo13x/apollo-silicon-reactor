@@ -158,8 +158,8 @@ fn codesign_authority_is_apple(path: &str) -> bool {
         Err(_) => return false,
     };
     // codesign writes signature info to stderr.
-    let combined = String::from_utf8_lossy(&out.stderr).to_string()
-        + &String::from_utf8_lossy(&out.stdout);
+    let combined =
+        String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
     // Apple's signing chain: Authority=Apple Code Signing Certification Authority,
     // Authority=Apple Root CA, or Authority=Software Signing for first-party
     // built-ins. TeamIdentifier=not set (Apple uses the special value).
@@ -180,20 +180,28 @@ mod tests {
 
     #[test]
     fn path_prefix_classifies_system_binaries() {
-        assert!(is_apple_path("/System/Library/Frameworks/Foo.framework/Foo"));
+        assert!(is_apple_path(
+            "/System/Library/Frameworks/Foo.framework/Foo"
+        ));
         assert!(is_apple_path("/usr/libexec/coreaudiod"));
         assert!(is_apple_path("/usr/sbin/spindump"));
         assert!(is_apple_path("/sbin/launchd"));
         assert!(is_apple_path("/usr/bin/codesign"));
-        assert!(is_apple_path("/Library/Apple/System/Library/Extensions/Foo.kext"));
+        assert!(is_apple_path(
+            "/Library/Apple/System/Library/Extensions/Foo.kext"
+        ));
     }
 
     #[test]
     fn path_prefix_rejects_user_binaries() {
-        assert!(!is_apple_path("/Applications/Brave Browser.app/Contents/MacOS/Brave"));
+        assert!(!is_apple_path(
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave"
+        ));
         assert!(!is_apple_path("/usr/local/bin/cargo"));
         assert!(!is_apple_path("/opt/homebrew/bin/git"));
-        assert!(!is_apple_path("/Users/eduardo/projects/foo/target/release/foo"));
+        assert!(!is_apple_path(
+            "/Users/eduardo/projects/foo/target/release/foo"
+        ));
     }
 
     #[test]

@@ -344,9 +344,9 @@ impl LearnableParams {
             // sane range.  Hard clamps: zone_alpha ≤ 0.05, hazard_lr ≤ 0.1.
             const ZONE_ALPHA_INTERIM_MAX: f64 = 0.025; // 0.05 / 2
             const HAZARD_LR_INTERIM_MAX: f64 = 0.05; // 0.1 / 2
-            // Phase 4.3 WIRED — record pre-shift value so the rollback guard
-            // can revert if the next 5 min of quality data argues this
-            // accelerated learning hurt more than it helped.
+                                                     // Phase 4.3 WIRED — record pre-shift value so the rollback guard
+                                                     // can revert if the next 5 min of quality data argues this
+                                                     // accelerated learning hurt more than it helped.
             let prev_zone_alpha = self.zone_alpha;
             self.zone_alpha = (self.zone_alpha * 1.5).min(ZONE_ALPHA_INTERIM_MAX);
             self.hazard_lr = (self.hazard_lr * 1.5).min(HAZARD_LR_INTERIM_MAX);
@@ -902,8 +902,7 @@ impl LearnedState {
             if let Some(guard) = lp.policy_rollback_guard.as_mut() {
                 let quality = self.last_restore_quality.unwrap_or(1.0);
                 if let Some(plan) = guard.evaluate(quality, std::time::SystemTime::now()) {
-                    crate::engine::lse_counters::LSE_COUNTERS
-                        .inc_policy_rollback_execution();
+                    crate::engine::lse_counters::LSE_COUNTERS.inc_policy_rollback_execution();
                     let mut restored: Vec<&'static str> = Vec::with_capacity(plan.entries.len());
                     // Walk entries once; first-seen per kind wins (entries
                     // are already most-recent-first from guard.evaluate).
@@ -1629,10 +1628,7 @@ impl PolicyRollbackGuard {
 /// owned by other approaches (per the task spec). Only the
 /// `LearnableParams` fields that the rollback guard actively tracks
 /// (`PolicyShiftKind::ZoneAlpha` / `RlBandUpper`) are mutated here.
-pub fn apply_rollback_plan(
-    lp: &mut LearnableParams,
-    plan: &RollbackPlan,
-) -> Vec<&'static str> {
+pub fn apply_rollback_plan(lp: &mut LearnableParams, plan: &RollbackPlan) -> Vec<&'static str> {
     let mut restored: Vec<&'static str> = Vec::with_capacity(plan.entries.len());
     let mut zone_alpha_done = false;
     let mut rl_upper_done = false;
@@ -2828,7 +2824,11 @@ mod tests {
         let pre = lp.zone_alpha;
         lp.zone_alpha = pre + 0.003; // simulate a meta-learn shift up
         let mut guard = PolicyRollbackGuard::new(0.35);
-        guard.record_shift(PolicyShiftKind::ZoneAlpha, pre, std::time::SystemTime::now());
+        guard.record_shift(
+            PolicyShiftKind::ZoneAlpha,
+            pre,
+            std::time::SystemTime::now(),
+        );
         lp.policy_rollback_guard = Some(guard);
 
         let pre_counter = crate::engine::lse_counters::LSE_COUNTERS
@@ -2837,11 +2837,8 @@ mod tests {
         let pre_executions = crate::engine::lse_counters::LSE_COUNTERS
             .policy_rollback_executions_total
             .load(Ordering::Relaxed);
-        let fired = poke_rollback_guard_via_decay(
-            &mut lp,
-            HARD_PROTECTED_DECAY_THRESHOLD,
-            &[1234, 5678],
-        );
+        let fired =
+            poke_rollback_guard_via_decay(&mut lp, HARD_PROTECTED_DECAY_THRESHOLD, &[1234, 5678]);
         assert!(fired, "poke must fire when threshold met + shift in window");
         assert!(
             (lp.zone_alpha - pre).abs() < f64::EPSILON,
@@ -2880,7 +2877,11 @@ mod tests {
         let pre = lp.zone_alpha;
         lp.zone_alpha = pre + 0.003;
         let mut guard = PolicyRollbackGuard::new(0.35);
-        guard.record_shift(PolicyShiftKind::ZoneAlpha, pre, std::time::SystemTime::now());
+        guard.record_shift(
+            PolicyShiftKind::ZoneAlpha,
+            pre,
+            std::time::SystemTime::now(),
+        );
         lp.policy_rollback_guard = Some(guard);
         let fired = poke_rollback_guard_via_decay(&mut lp, 1, &[]); // 1 < 5
         assert!(!fired);

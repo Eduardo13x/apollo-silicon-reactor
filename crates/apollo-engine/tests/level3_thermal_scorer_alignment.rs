@@ -20,8 +20,8 @@
 //! [Pearl 2009 §3] Causality — confounder adjustment via co-occurrence.
 //! [Sutton & Barto 2018 §11.7] Off-policy correction via meta-signal.
 
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use apollo_engine::engine::causal_graph::{CausalGraph, ExternalEventKind};

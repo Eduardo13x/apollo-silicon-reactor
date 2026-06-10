@@ -244,8 +244,7 @@ pub fn softly_protected_contains(name: &str) -> bool {
     static MATCHER: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
     MATCHER
         .get_or_init(|| {
-            let patterns: Vec<&'static str> =
-                softly_protected_processes().into_iter().collect();
+            let patterns: Vec<&'static str> = softly_protected_processes().into_iter().collect();
             aho_corasick::AhoCorasick::new(patterns).expect("softly patterns build")
         })
         .is_match(name)
@@ -454,9 +453,7 @@ pub enum ProtectionLevel {
 ///
 /// Case-insensitive (mirrors prior `name_lc.contains(p.to_ascii_lowercase())`
 /// semantics). Build cost is amortized over the loop iterations.
-pub fn build_policy_protected_ac(
-    policy_protected: &[String],
-) -> Option<aho_corasick::AhoCorasick> {
+pub fn build_policy_protected_ac(policy_protected: &[String]) -> Option<aho_corasick::AhoCorasick> {
     if policy_protected.is_empty() {
         return None;
     }
@@ -632,20 +629,20 @@ pub fn infrastructure_processes() -> HashSet<&'static str> {
         // pre-2024 name list ("podman", "qemu-system", "lima") missed the
         // basename returned by sysinfo. NotebookLM peer review expanded the
         // missing-helper set; all named here.
-        "vfkit",         // Virtualization.framework wrapper (Podman 5.x default)
-        "gvproxy",       // gvisor-tap-vsock networking helper (Podman/Lima)
-        "krunkit",       // libkrun-based microVM (alt Podman backend)
-        "vmapple",       // Tart VM helper (Virtualization.framework child)
-        "vmnetd",        // macOS vmnet daemon (bridge networking for Lima/Podman)
-        "slirp4netns",   // user-mode networking for rootless Podman
+        "vfkit",           // Virtualization.framework wrapper (Podman 5.x default)
+        "gvproxy",         // gvisor-tap-vsock networking helper (Podman/Lima)
+        "krunkit",         // libkrun-based microVM (alt Podman backend)
+        "vmapple",         // Tart VM helper (Virtualization.framework child)
+        "vmnetd",          // macOS vmnet daemon (bridge networking for Lima/Podman)
+        "slirp4netns",     // user-mode networking for rootless Podman
         "containerd-shim", // Docker / containerd process shim — frozen = stuck container
-        "runc",          // OCI runtime — frozen mid-spawn = orphaned container
-        "orbstack",      // OrbStack main process
+        "runc",            // OCI runtime — frozen mid-spawn = orphaned container
+        "orbstack",        // OrbStack main process
         "orbstack-helper",
-        "orbstack-node", // OrbStack VM node
+        "orbstack-node",   // OrbStack VM node
         "lima-guestagent", // Lima guest agent helper
-        "dockerd",       // Docker daemon (not just "com.docker.backend")
-        "containerd",    // Standalone containerd
+        "dockerd",         // Docker daemon (not just "com.docker.backend")
+        "containerd",      // Standalone containerd
         // Databases / caches — freezing causes data corruption or client timeouts
         "postgres",
         "mysqld",

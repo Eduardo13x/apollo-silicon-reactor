@@ -453,11 +453,7 @@ mod tests {
     #[test]
     fn presence_passive_sleep_assertion_overrides_no_suppression() {
         let m = user_presence_modulator_with_passive(
-            1.5,
-            60.0,
-            0.3,
-            false,
-            true, // has_sleep_assertion
+            1.5, 60.0, 0.3, false, true, // has_sleep_assertion
         );
         assert!(
             (m - IDLE_MULTIPLIER).abs() < f64::EPSILON,
@@ -477,9 +473,7 @@ mod tests {
     #[test]
     fn presence_crisis_still_overrides_passive_content() {
         let m = user_presence_modulator_with_passive(
-            1.5,
-            60.0,
-            0.90, // crisis
+            1.5, 60.0, 0.90, // crisis
             true, // also passive
             true,
         );
@@ -516,15 +510,14 @@ mod tests {
         // Sample the active, semi-active, and idle tiers and the crisis
         // override path of the base modulator and check identity.
         let cases: &[(f64, f64, f64)] = &[
-            (1.5, 60.0, 0.3),   // tier 2 (active)
-            (20.0, 2.0, 0.3),   // tier 3 (semi-active)
-            (120.0, 0.0, 0.3),  // tier 4 (idle)
-            (1.0, 80.0, 0.85),  // tier 1 (crisis)
+            (1.5, 60.0, 0.3),  // tier 2 (active)
+            (20.0, 2.0, 0.3),  // tier 3 (semi-active)
+            (120.0, 0.0, 0.3), // tier 4 (idle)
+            (1.0, 80.0, 0.85), // tier 1 (crisis)
         ];
         for &(idle, hid, arousal) in cases {
             let base = user_presence_modulator(idle, hid, arousal);
-            let extended =
-                user_presence_modulator_with_passive(idle, hid, arousal, false, false);
+            let extended = user_presence_modulator_with_passive(idle, hid, arousal, false, false);
             assert!(
                 (extended - base).abs() < f64::EPSILON,
                 "no-passive delegation must match base: idle={idle}, hid={hid}, \
@@ -561,17 +554,16 @@ mod tests {
     #[test]
     fn presence_narrowed_no_counter_matches_counter_variant() {
         let cases: &[(f64, f64, f64, bool, bool, f64)] = &[
-            (1.5, 60.0, 0.3, false, false, 0.0), // active
-            (20.0, 2.0, 0.3, false, false, 0.0), // semi-active
+            (1.5, 60.0, 0.3, false, false, 0.0),  // active
+            (20.0, 2.0, 0.3, false, false, 0.0),  // semi-active
             (120.0, 0.0, 0.2, false, false, 0.0), // idle
             (1.0, 80.0, 0.85, false, false, 0.0), // crisis
             (1.0, 80.0, 0.3, true, false, 0.0),   // passive audio
             (1.0, 80.0, 0.3, false, true, 0.0),   // passive sleep assertion
         ];
         for &(idle, hid, arousal, audio, assertion, pressure) in cases {
-            let with_counter = user_presence_modulator_narrowed(
-                idle, hid, arousal, audio, assertion, pressure,
-            );
+            let with_counter =
+                user_presence_modulator_narrowed(idle, hid, arousal, audio, assertion, pressure);
             let no_counter = user_presence_modulator_narrowed_no_counter(
                 idle, hid, arousal, audio, assertion, pressure,
             );
@@ -587,9 +579,7 @@ mod tests {
     /// even when the user is actively typing. Cascade-paralysis defuse.
     #[test]
     fn presence_narrowed_critical_pressure_bypasses_active_user() {
-        let m = user_presence_modulator_narrowed_no_counter(
-            1.0, 60.0, 0.3, false, false, 0.65,
-        );
+        let m = user_presence_modulator_narrowed_no_counter(1.0, 60.0, 0.3, false, false, 0.65);
         assert!(
             (m - IDLE_MULTIPLIER).abs() < f64::EPSILON,
             "critical pressure must defuse cascade, got {m}"
@@ -598,9 +588,7 @@ mod tests {
 
     #[test]
     fn presence_narrowed_subcritical_pressure_keeps_suppression() {
-        let m = user_presence_modulator_narrowed_no_counter(
-            1.0, 60.0, 0.3, false, false, 0.64,
-        );
+        let m = user_presence_modulator_narrowed_no_counter(1.0, 60.0, 0.3, false, false, 0.64);
         assert!(
             (m - ACTIVE_MULTIPLIER_NARROWED).abs() < f64::EPSILON,
             "subcritical pressure must retain suppression, got {m}"

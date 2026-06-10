@@ -351,8 +351,7 @@ impl UsageModel {
         }
 
         // Noise promotions.
-        let existing_noise_vec: Vec<&str> =
-            existing_noise.iter().map(|s| s.as_str()).collect();
+        let existing_noise_vec: Vec<&str> = existing_noise.iter().map(|s| s.as_str()).collect();
         let existing_noise_ac = crate::engine::ac_cache::get_or_build(
             &existing_noise_vec,
             aho_corasick::MatchKind::Standard,

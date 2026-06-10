@@ -175,11 +175,14 @@ impl EpistemicUncertainty {
 
         let sum_sq = sq_rl + sq_linucb + sq_nars + sq_drift + sq_calib + sq_guard;
         let raw_rss = sum_sq.sqrt();
-        
-        let max_rss_possible = (
-            W_RL.powi(2) + W_LINUCB.powi(2) + W_NARS.powi(2) + 
-            W_DRIFT.powi(2) + W_CALIB.powi(2) + W_GUARD.powi(2)
-        ).sqrt();
+
+        let max_rss_possible = (W_RL.powi(2)
+            + W_LINUCB.powi(2)
+            + W_NARS.powi(2)
+            + W_DRIFT.powi(2)
+            + W_CALIB.powi(2)
+            + W_GUARD.powi(2))
+        .sqrt();
 
         self.composite = raw_rss / max_rss_possible;
         self.composite = self.composite.clamp(0.0, 1.0);

@@ -67,13 +67,9 @@ use apollo_engine::engine::action_policy::{
     ActionContext, PolicyScorer, PressureBenefitFeature, ProtectionFeature,
 };
 use apollo_engine::engine::audit_types::DecisionReason;
-use apollo_engine::engine::effect_decay::{
-    self, DecayWatchdog, ObsKind, PendingObservation,
-};
+use apollo_engine::engine::effect_decay::{self, DecayWatchdog, ObsKind, PendingObservation};
 use apollo_engine::engine::execute_actions::execute_actions;
-use apollo_engine::engine::learned_state::{
-    LearnableParams, PolicyRollbackGuard, PolicyShiftKind,
-};
+use apollo_engine::engine::learned_state::{LearnableParams, PolicyRollbackGuard, PolicyShiftKind};
 use apollo_engine::engine::lse_counters::LSE_COUNTERS;
 use apollo_engine::engine::match_engine::is_family_root;
 use apollo_engine::engine::outcome_tracker::{OutcomeTracker, PatternWeight};
@@ -251,9 +247,7 @@ fn test_brave_never_boosted_under_high_pressure() {
     //    are baked into `ctx` to document the prod-incident conditions
     //    (2026-06-07T19:35Z, PID 16105 boost-loop) but do not influence
     //    the guard predicate — which is name-only by design.
-    let pre = LSE_COUNTERS
-        .snapshot()
-        .hard_protected_boost_skipped_total;
+    let pre = LSE_COUNTERS.snapshot().hard_protected_boost_skipped_total;
 
     // Enumerate the prod call sites (wait-graph blocker, interactive
     // focus, ML/AMX P-core boost) and tick the counter for each forbidden
@@ -280,9 +274,7 @@ fn test_brave_never_boosted_under_high_pressure() {
         }
     }
 
-    let post = LSE_COUNTERS
-        .snapshot()
-        .hard_protected_boost_skipped_total;
+    let post = LSE_COUNTERS.snapshot().hard_protected_boost_skipped_total;
     assert_eq!(
         post - pre,
         3,
@@ -339,7 +331,10 @@ fn test_effectiveness_excludes_hard_protected_from_reclassify() {
         .get(name)
         .expect("Brave entry must be tracked after record_throttle");
     assert_eq!(w.throttle_count, 100, "all 100 throttles recorded");
-    assert_eq!(w.effective_count, 0, "0 effective — soft throttle on Chromium");
+    assert_eq!(
+        w.effective_count, 0,
+        "0 effective — soft throttle on Chromium"
+    );
 
     // Laplace-smoothed effectiveness = (0+1)/(100+2) ≈ 0.0098.
     let eff = w.effectiveness();
@@ -503,8 +498,7 @@ fn test_effect_decay_triggers_rollback_for_hard_protected() {
         0,
         "ring must be cleared after mark_executed"
     );
-    let cooldown_attempt =
-        guard.evaluate(quality_after_decay_storm, now + Duration::from_secs(60));
+    let cooldown_attempt = guard.evaluate(quality_after_decay_storm, now + Duration::from_secs(60));
     assert!(
         cooldown_attempt.is_none(),
         "re-evaluate during cooldown must NOT fire — anti-thrash guard"
@@ -864,10 +858,10 @@ fn test_boost_enrollment_skipped_when_caps_missing() {
         &mut frozen,
         &[],
         &[],
-        None,         // qos_mgr = None forces phantom guard to fail
-        false,        // dry_run = false: we want the !dry_run branch
-        0.74,         // memory_pressure (prod-incident)
-        6_000.0,      // thrashing_score
+        None,    // qos_mgr = None forces phantom guard to fail
+        false,   // dry_run = false: we want the !dry_run branch
+        0.74,    // memory_pressure (prod-incident)
+        6_000.0, // thrashing_score
         None,
         0.0,
     );
@@ -916,7 +910,8 @@ fn test_boost_enrollment_skipped_when_caps_missing() {
     //    enrollment side-effect. Drift here would mean the guard moved
     //    too far up and we accidentally vetoed boosts on no-caps hosts.
     assert_eq!(
-        outcomes.boosts_applied, 1,
+        outcomes.boosts_applied,
+        1,
         "boost must still account-as-applied (the guard blocks ONLY the \
          PendingObservation enrollment, not the action itself); \
          block_reasons={:?}",

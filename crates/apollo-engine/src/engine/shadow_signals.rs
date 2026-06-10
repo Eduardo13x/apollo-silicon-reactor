@@ -213,7 +213,11 @@ pub fn get_wakeups_per_sec() -> Option<f64> {
         return None;
     }
     let raw = f64::from_bits(WAKEUPS_PER_SEC_BITS.load(Ordering::Relaxed));
-    if raw.is_finite() { Some(raw) } else { None }
+    if raw.is_finite() {
+        Some(raw)
+    } else {
+        None
+    }
 }
 
 pub fn set_ctx_switches_per_sec(rate: f64) {
@@ -227,7 +231,11 @@ pub fn get_ctx_switches_per_sec() -> Option<f64> {
         return None;
     }
     let raw = f64::from_bits(CTX_SWITCHES_PER_SEC_BITS.load(Ordering::Relaxed));
-    if raw.is_finite() { Some(raw) } else { None }
+    if raw.is_finite() {
+        Some(raw)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

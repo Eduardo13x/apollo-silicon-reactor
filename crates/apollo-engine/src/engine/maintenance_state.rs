@@ -46,6 +46,14 @@ pub struct MaintenanceState {
     #[serde(skip)]
     pub consecutive_thrash_cycles: u32,
 
+    /// 2026-06-09 Gate F bypass: count of consecutive cycles with thrashing_score
+    /// above CRITICAL_THRASHING_PURGE_SCORE (50k). Used to bypass the
+    /// MediaActive gate when thrashing is sustained — a 10-cycle streak at 50k+
+    /// means the system is in a real flow crisis, not a transient audio glitch.
+    /// Skipped from persistence — re-initializes to 0 per daemon restart.
+    #[serde(skip)]
+    pub consecutive_thrash_50k_cycles: u32,
+
     /// 2026-05-28: Tracks whether the compressor is still flushing after
     /// a purge. When true, the inhibition window extends to MAX (12s) instead
     /// of the base (5s) to avoid learning the artificial dip.
@@ -156,10 +164,14 @@ impl MaintenanceState {
     /// streak (matches the "≥3 cycles" gating in run_maintenance_tick).
     pub fn push_thrashing(&mut self, thrash: f64) {
         if thrash > 15_000.0 {
-            self.consecutive_thrash_cycles =
-                self.consecutive_thrash_cycles.saturating_add(1);
+            self.consecutive_thrash_cycles = self.consecutive_thrash_cycles.saturating_add(1);
         } else {
             self.consecutive_thrash_cycles = 0;
+        }
+        if thrash > 50_000.0 {
+            self.consecutive_thrash_50k_cycles = self.consecutive_thrash_50k_cycles.saturating_add(1);
+        } else {
+            self.consecutive_thrash_50k_cycles = 0;
         }
     }
 
@@ -362,7 +374,10 @@ mod tests {
         // Two consecutive non-negative deltas should clear the latch.
         s.tick_compressor_status(100.0);
         s.tick_compressor_status(100.0);
-        assert!(!s.compressor_still_flushing, "latch must clear after 2 ticks");
+        assert!(
+            !s.compressor_still_flushing,
+            "latch must clear after 2 ticks"
+        );
         assert!(
             !s.is_in_purge_inhibition_window(),
             "window collapses to 5s base — 8s-old purge no longer inhibited"

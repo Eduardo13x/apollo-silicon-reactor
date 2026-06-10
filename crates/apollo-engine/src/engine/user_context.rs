@@ -365,11 +365,7 @@ fn collect_idle_secs_inner() -> Option<f64> {
             cstr: *const i8,
             encoding: u32,
         ) -> CFStringRef;
-        fn CFNumberGetValue(
-            num: CFTypeRef,
-            ty: CFNumberType,
-            value_ptr: *mut c_void,
-        ) -> bool;
+        fn CFNumberGetValue(num: CFTypeRef, ty: CFNumberType, value_ptr: *mut c_void) -> bool;
         fn CFRelease(cf: CFTypeRef);
     }
 

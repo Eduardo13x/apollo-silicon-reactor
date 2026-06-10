@@ -666,7 +666,8 @@ impl SignalIntelligence {
         if self.oom_event_buffer.len() >= 50 {
             self.oom_event_buffer.pop_front();
         }
-        self.oom_event_buffer.push_back((features, hours_since_last));
+        self.oom_event_buffer
+            .push_back((features, hours_since_last));
     }
 
     /// Mini-batch gradient retrain of the hazard model using buffered OOM events.

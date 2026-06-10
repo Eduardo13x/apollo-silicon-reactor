@@ -1,6 +1,17 @@
-//! Network I/O Optimization for macOS
+//! Network profile advisory for macOS — ADVISORY ONLY.
 //!
-//! Optimizes network parameters using macOS-specific sysctl names.
+//! This module computes network profile recommendations using
+//! macOS-specific sysctl names, but it MUST NOT be wired to a write
+//! path. `SysctlGovernor` is the single TCP sysctl owner.
+//!
+//! History (2026-06-09 incident): when this module's recommendations
+//! were emitted as `SetSysctl` actions from the daemon, it fought
+//! `SysctlGovernor` over the same TCP keys (12x "Battery profile"
+//! writes vs 14x "reverting to default" in 300 actions) and performed
+//! an ungated buffer write mid-call during a Meet session — the
+//! realtime-call gate (257baea) only covered the SysctlGovernor path.
+//! The daemon write path was deleted; this library remains for
+//! diagnostics (`detect_issues`, `recommend_profile`) and tests.
 
 #[derive(Debug, Clone)]
 pub struct NetworkStats {
@@ -155,6 +166,10 @@ impl NetworkOptimizer {
 
     /// Get macOS sysctl recommendations for network tuning.
     /// Only emits keys on the safety allowlist.
+    #[deprecated(
+        note = "advisory only — do NOT wire to a write path; SysctlGovernor is the \
+                single TCP sysctl owner (2026-06-09 tug-of-war incident)"
+    )]
     pub fn get_sysctl_recommendations(&self, profile: NetworkProfile) -> Vec<(String, String)> {
         let opt = self.get_optimization(profile);
         vec![
@@ -185,6 +200,9 @@ impl Default for NetworkOptimizer {
 }
 
 #[cfg(test)]
+// Tests exercise the deprecated advisory API on purpose — the deprecation
+// guards against re-wiring a write path, not against testing the library.
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

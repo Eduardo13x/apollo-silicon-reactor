@@ -391,6 +391,10 @@ fn legacy_vec_and_accumulator_produce_byte_equivalent_sequences() {
 /// This test feeds the same `NetworkOptimizer::get_sysctl_recommendations`
 /// output through both paths and asserts every (key, value) pair lines up.
 #[test]
+// `get_sysctl_recommendations` is deprecated (2026-06-09 single-writer fix:
+// the prod write path was deleted) but this golden test still exercises it
+// as a fixture generator for accumulator equivalence — not as a write path.
+#[allow(deprecated)]
 fn golden_network_optimizer_emit_path_equivalent() {
     for profile in [
         NetworkProfile::HighThroughput,

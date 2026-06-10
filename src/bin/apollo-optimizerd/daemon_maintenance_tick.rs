@@ -157,14 +157,19 @@ fn emergency_thrashing_purge_allowed(
     }
 
     let media_or_assertion = ctx.audio_active || ctx.call_in_progress || ctx.has_sleep_assertion;
-    let critical_lockup =
-        thrash > CRITICAL_THRASHING_PURGE_SCORE && p_oom_30s >= CRITICAL_THRASHING_P_OOM;
+    let critical_lockup = thrash > CRITICAL_THRASHING_PURGE_SCORE
+        && (p_oom_30s >= CRITICAL_THRASHING_P_OOM
+            || state.consecutive_thrash_50k_cycles >= 10);
 
     if bus_saturated && !critical_lockup {
         return false;
     }
 
-    !media_or_assertion || critical_lockup
+    // B.5 (2026-06-09): sustained 50k+ thrashing (≥10 cycles) bypasses the
+    // MediaActive gate — a streak at this level is a flow crisis, not a
+    // transient audio glitch. Without this, Meet/streaming/audio sessions
+    // permanently block purge while thrashing climbs toward 62k+.
+    !media_or_assertion || critical_lockup || state.consecutive_thrash_50k_cycles >= 10
 }
 
 pub(crate) fn should_fire(

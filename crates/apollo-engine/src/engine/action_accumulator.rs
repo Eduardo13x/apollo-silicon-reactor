@@ -45,6 +45,9 @@ pub enum ActionPhase {
     Survival,
     FreezeExecutor,
     SysctlGovernor,
+    /// Kept only for journal back-compat. INVARIANT: must pin to 0 in prod
+    /// post 2026-06-09 — the NetworkOptimizer write path was deleted
+    /// (SysctlGovernor is the single TCP sysctl owner).
     NetworkOptimizer,
     DispatchTick,
     Reactor,
@@ -563,16 +566,12 @@ pub fn outcome_name(a: &RootAction) -> Option<String> {
         RootAction::UnfreezeProcess { name, .. } => Some(format!("unfreeze:{}", name)),
         RootAction::BoostProcess { name, .. } => Some(format!("boost:{}", name)),
         RootAction::SetMemorystatus { pid, .. } => Some(format!("memstatus:pid:{}", pid)),
-        RootAction::SetThreadQoS {
-            name, tier, ..
-        } => Some(format!("thread_qos:{}:tier{}", name, tier)),
+        RootAction::SetThreadQoS { name, tier, .. } => {
+            Some(format!("thread_qos:{}:tier{}", name, tier))
+        }
         RootAction::SetSysctl(action) => Some(format!("sysctl:{}", action.key())),
-        RootAction::ToggleSpotlight { enabled, .. } => {
-            Some(format!("spotlight:{}", enabled))
-        }
-        RootAction::QuarantineDaemon { daemon, .. } => {
-            Some(format!("quarantine:{}", daemon))
-        }
+        RootAction::ToggleSpotlight { enabled, .. } => Some(format!("spotlight:{}", enabled)),
+        RootAction::QuarantineDaemon { daemon, .. } => Some(format!("quarantine:{}", daemon)),
     }
 }
 
@@ -1308,14 +1307,8 @@ mod tests {
             outcome_name(&variants[5]).unwrap(),
             "thread_qos:Xcode:tierbackground"
         );
-        assert_eq!(
-            outcome_name(&variants[6]).unwrap(),
-            "sysctl:kern.maxvnodes"
-        );
+        assert_eq!(outcome_name(&variants[6]).unwrap(), "sysctl:kern.maxvnodes");
         assert_eq!(outcome_name(&variants[7]).unwrap(), "spotlight:false");
-        assert_eq!(
-            outcome_name(&variants[8]).unwrap(),
-            "quarantine:telemetryd"
-        );
+        assert_eq!(outcome_name(&variants[8]).unwrap(), "quarantine:telemetryd");
     }
 }

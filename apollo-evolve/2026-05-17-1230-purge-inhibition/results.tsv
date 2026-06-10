@@ -1,0 +1,6 @@
+iter	commit	scope	tests_delta	loc_delta	clippy	build	status	paper
+1	1390d09	maintenance_state.rs	+3	+47	164	green	KEEP	Hellerstein 2004 §9
+2	c7b1412	lse_counters+types+daemon_state	0	+56	164	green	KEEP	Hellerstein 2004 §9
+3	c0f307d	signal_intelligence.rs	0	+25	164	green	KEEP	Hellerstein 2004 §9
+4	7ee1aec	main.rs daemon wire	0	+8	164	green	KEEP	Hellerstein 2004 §9
+5	003f6e8	tests/level3_purge_inhibition.rs	+3	+140	164	green	KEEP	Hellerstein 2004 §9

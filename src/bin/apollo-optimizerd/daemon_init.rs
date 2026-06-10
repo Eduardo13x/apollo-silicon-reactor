@@ -19,7 +19,6 @@ use apollo_engine::engine::ioreport::IOReportReader;
 use apollo_engine::engine::learning_pipeline::LearningPipeline;
 use apollo_engine::engine::memory_analyzer::MemoryAnalyzer;
 use apollo_engine::engine::network_monitor::NetworkMonitor;
-use apollo_engine::engine::network_optimizer::NetworkOptimizer;
 use apollo_engine::engine::neuromodulator::ApolloNeuromodulator;
 use apollo_engine::engine::optimization_skills::SkillRegistry;
 use apollo_engine::engine::outcome_tracker::OutcomeTracker;
@@ -50,7 +49,6 @@ pub(super) struct DaemonSubsystems {
     pub thermal_mgr: ThermalManager,
     pub wake_storm: WakeStormDetector,
     pub darwin_anomaly: EvolvedAnomalyDetector,
-    pub net_optimizer: NetworkOptimizer,
     pub energy_tracker: EnergyTracker,
     pub outcome_tracker: OutcomeTracker,
     pub causal_graph: CausalGraph,
@@ -147,7 +145,6 @@ impl DaemonSubsystems {
             thermal_mgr: ThermalManager::new(),
             wake_storm: WakeStormDetector::new(),
             darwin_anomaly: EvolvedAnomalyDetector::new(),
-            net_optimizer: NetworkOptimizer::new(),
             energy_tracker: EnergyTracker::new(),
             outcome_tracker,
             causal_graph: CausalGraph::new(),

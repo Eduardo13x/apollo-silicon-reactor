@@ -400,7 +400,9 @@ fn renderer_ac() -> &'static aho_corasick::AhoCorasick {
 }
 fn heavy_app_ac() -> &'static aho_corasick::AhoCorasick {
     static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
-    AC.get_or_init(|| aho_corasick::AhoCorasick::new(HEAVY_APP_PATTERNS).expect("heavy app patterns"))
+    AC.get_or_init(|| {
+        aho_corasick::AhoCorasick::new(HEAVY_APP_PATTERNS).expect("heavy app patterns")
+    })
 }
 fn build_ac() -> &'static aho_corasick::AhoCorasick {
     static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();

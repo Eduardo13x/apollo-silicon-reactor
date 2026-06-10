@@ -1,0 +1,6 @@
+[marketplaces.claude-plugins-official]
+source_type = "git"
+source = "https://github.com/anthropics/claude-plugins-official.git"
+
+[plugins."superpowers@claude-plugins-official"]
+enabled = true

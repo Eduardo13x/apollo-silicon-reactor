@@ -3,9 +3,7 @@
 //! Renders a visual summary of daemon status using Unicode box-drawing,
 //! ANSI colors, and emoji indicators.
 
-use apollo_engine::engine::types::{
-    BlockerScore, DaemonStatus, OptimizationProfile, SafetyPolicy,
-};
+use apollo_engine::engine::types::{BlockerScore, DaemonStatus, OptimizationProfile, SafetyPolicy};
 
 const CW: usize = 66; // content width (visible columns between ║ padding)
 

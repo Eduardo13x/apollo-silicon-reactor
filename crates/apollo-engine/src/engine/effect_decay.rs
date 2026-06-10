@@ -94,11 +94,8 @@ pub const N_OBS_KINDS: usize = 3;
 
 /// All variants in stable-index order. Used by drain loops that need to
 /// iterate every per-kind ring.
-pub const ALL_OBS_KINDS: [ObsKind; N_OBS_KINDS] = [
-    ObsKind::JetsamTier,
-    ObsKind::MachPolicy,
-    ObsKind::Sysctl,
-];
+pub const ALL_OBS_KINDS: [ObsKind; N_OBS_KINDS] =
+    [ObsKind::JetsamTier, ObsKind::MachPolicy, ObsKind::Sysctl];
 
 /// A single pending settle-time observation.
 #[derive(Debug, Clone)]
@@ -334,11 +331,7 @@ impl DecayWatchdog {
     /// [`Self::hard_protected_decay_count_5min`].
     pub fn hard_protected_decay_pids(&mut self, now: Instant) -> Vec<u32> {
         self.prune_hp_decays(now);
-        self.hp_decay_pids
-            .iter()
-            .rev()
-            .map(|(_, p)| *p)
-            .collect()
+        self.hp_decay_pids.iter().rev().map(|(_, p)| *p).collect()
     }
 
     /// Drop entries older than [`HP_DECAY_WINDOW`] from both

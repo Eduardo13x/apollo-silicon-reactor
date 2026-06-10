@@ -88,8 +88,7 @@ impl PatternWeight {
     /// pressure" MUST use this variant.
     pub fn effectiveness_for_classification(&self, name: &str) -> Option<f64> {
         if crate::engine::safety::is_boost_forbidden(name) {
-            crate::engine::lse_counters::LSE_COUNTERS
-                .inc_hard_protected_reclassify_excluded();
+            crate::engine::lse_counters::LSE_COUNTERS.inc_hard_protected_reclassify_excluded();
             return None;
         }
         Some(self.effectiveness())
@@ -387,8 +386,7 @@ const HOP_PATTERNS: &[&str] = &[
     // Build group (idx 6-11)
     "rustc", "cargo", "clang", "swift", "make", "ninja",
     // CloudSync group (idx 12-16)
-    "cloud", "dropbox", "drive", "sync", "bird",
-    // Media group (idx 17-20)
+    "cloud", "dropbox", "drive", "sync", "bird", // Media group (idx 17-20)
     "audio", "video", "avconf", "camera",
 ];
 
@@ -429,9 +427,7 @@ impl WorkloadHop {
         let bytes = name.as_bytes();
         if bytes.len() > 3
             && !bytes.contains(&b' ')
-            && bytes
-                .last()
-                .is_some_and(|b| b.eq_ignore_ascii_case(&b'd'))
+            && bytes.last().is_some_and(|b| b.eq_ignore_ascii_case(&b'd'))
         {
             return WorkloadHop::SystemDaemon;
         }
@@ -1429,58 +1425,121 @@ mod tests {
 
     #[test]
     fn workload_hop_browser_variants() {
-        assert_eq!(WorkloadHop::from_process_name("Brave Browser"), WorkloadHop::Browser);
-        assert_eq!(WorkloadHop::from_process_name("Brave Browser Helper (Renderer)"), WorkloadHop::Browser);
-        assert_eq!(WorkloadHop::from_process_name("Google Chrome"), WorkloadHop::Browser);
-        assert_eq!(WorkloadHop::from_process_name("Safari"), WorkloadHop::Browser);
-        assert_eq!(WorkloadHop::from_process_name("Firefox"), WorkloadHop::Browser);
-        assert_eq!(WorkloadHop::from_process_name("com.apple.WebKit.GPU"), WorkloadHop::Browser);
-        assert_eq!(WorkloadHop::from_process_name("WebContent"), WorkloadHop::General); // no match
+        assert_eq!(
+            WorkloadHop::from_process_name("Brave Browser"),
+            WorkloadHop::Browser
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("Brave Browser Helper (Renderer)"),
+            WorkloadHop::Browser
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("Google Chrome"),
+            WorkloadHop::Browser
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("Safari"),
+            WorkloadHop::Browser
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("Firefox"),
+            WorkloadHop::Browser
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("com.apple.WebKit.GPU"),
+            WorkloadHop::Browser
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("WebContent"),
+            WorkloadHop::General
+        ); // no match
     }
 
     #[test]
     fn workload_hop_build_variants() {
         assert_eq!(WorkloadHop::from_process_name("rustc"), WorkloadHop::Build);
         assert_eq!(WorkloadHop::from_process_name("cargo"), WorkloadHop::Build);
-        assert_eq!(WorkloadHop::from_process_name("clang-17"), WorkloadHop::Build);
-        assert_eq!(WorkloadHop::from_process_name("cc"), WorkloadHop::Build);   // exact-match
-        assert_eq!(WorkloadHop::from_process_name("CC"), WorkloadHop::Build);   // case-insensitive exact
+        assert_eq!(
+            WorkloadHop::from_process_name("clang-17"),
+            WorkloadHop::Build
+        );
+        assert_eq!(WorkloadHop::from_process_name("cc"), WorkloadHop::Build); // exact-match
+        assert_eq!(WorkloadHop::from_process_name("CC"), WorkloadHop::Build); // case-insensitive exact
         assert_eq!(WorkloadHop::from_process_name("make"), WorkloadHop::Build);
         assert_eq!(WorkloadHop::from_process_name("ninja"), WorkloadHop::Build);
     }
 
     #[test]
     fn workload_hop_cloudsync_variants() {
-        assert_eq!(WorkloadHop::from_process_name("Dropbox"), WorkloadHop::CloudSync);
-        assert_eq!(WorkloadHop::from_process_name("Google Drive"), WorkloadHop::CloudSync);
-        assert_eq!(WorkloadHop::from_process_name("iCloud"), WorkloadHop::CloudSync);
-        assert_eq!(WorkloadHop::from_process_name("bird"), WorkloadHop::CloudSync);  // iCloud daemon
+        assert_eq!(
+            WorkloadHop::from_process_name("Dropbox"),
+            WorkloadHop::CloudSync
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("Google Drive"),
+            WorkloadHop::CloudSync
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("iCloud"),
+            WorkloadHop::CloudSync
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("bird"),
+            WorkloadHop::CloudSync
+        ); // iCloud daemon
     }
 
     #[test]
     fn workload_hop_media_variants() {
         // Order: substring (AC) before daemon fallback → coreaudiod matches "audio" → Media
         // (NOT SystemDaemon despite ending 'd'). Mirrors prior to_lowercase().contains chain.
-        assert_eq!(WorkloadHop::from_process_name("coreaudiod"), WorkloadHop::Media);
-        assert_eq!(WorkloadHop::from_process_name("VideoTool"), WorkloadHop::Media);
-        assert_eq!(WorkloadHop::from_process_name("camerad"), WorkloadHop::Media);
+        assert_eq!(
+            WorkloadHop::from_process_name("coreaudiod"),
+            WorkloadHop::Media
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("VideoTool"),
+            WorkloadHop::Media
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("camerad"),
+            WorkloadHop::Media
+        );
     }
 
     #[test]
     fn workload_hop_daemon_fallback() {
-        assert_eq!(WorkloadHop::from_process_name("powerd"), WorkloadHop::SystemDaemon);
-        assert_eq!(WorkloadHop::from_process_name("launchd"), WorkloadHop::SystemDaemon);
-        assert_eq!(WorkloadHop::from_process_name("Powerd"), WorkloadHop::SystemDaemon); // case-insensitive
-        // Edge: ends in 'd' but len <= 3 → General
+        assert_eq!(
+            WorkloadHop::from_process_name("powerd"),
+            WorkloadHop::SystemDaemon
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("launchd"),
+            WorkloadHop::SystemDaemon
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("Powerd"),
+            WorkloadHop::SystemDaemon
+        ); // case-insensitive
+           // Edge: ends in 'd' but len <= 3 → General
         assert_eq!(WorkloadHop::from_process_name("ad"), WorkloadHop::General);
         // Edge: contains space → General
-        assert_eq!(WorkloadHop::from_process_name("foo d"), WorkloadHop::General);
+        assert_eq!(
+            WorkloadHop::from_process_name("foo d"),
+            WorkloadHop::General
+        );
     }
 
     #[test]
     fn workload_hop_general_fallback() {
-        assert_eq!(WorkloadHop::from_process_name("Finder"), WorkloadHop::General);
-        assert_eq!(WorkloadHop::from_process_name("Terminal"), WorkloadHop::General);
+        assert_eq!(
+            WorkloadHop::from_process_name("Finder"),
+            WorkloadHop::General
+        );
+        assert_eq!(
+            WorkloadHop::from_process_name("Terminal"),
+            WorkloadHop::General
+        );
         assert_eq!(WorkloadHop::from_process_name(""), WorkloadHop::General);
     }
 
@@ -1590,7 +1649,10 @@ mod tests {
         };
         let got = w.effectiveness_for_classification("alacritty");
         // (3+1)/(10+2) ≈ 0.333
-        assert!(got.is_some(), "non-forbidden control name must return Some(_)");
+        assert!(
+            got.is_some(),
+            "non-forbidden control name must return Some(_)"
+        );
         let eff = got.unwrap();
         assert!(
             (eff - 0.3333).abs() < 1e-3,

@@ -193,11 +193,7 @@ impl PageReclaim {
         // the stall is less harmful than continued swap thrashing, OR within
         // the post-wake window (user not yet interacting).
         let critical_override = memory_pressure >= PRESSURE_CRITICAL_OVERRIDE;
-        if !display_off
-            && !foreground_idle
-            && !critical_override
-            && !post_wake_reclaim
-        {
+        if !display_off && !foreground_idle && !critical_override && !post_wake_reclaim {
             return 0;
         }
 

@@ -21,15 +21,29 @@ use crate::engine::{
 // ── Foreground-helper table ──────────────────────────────────────────────────
 // Per-fg-app AC matchers replace the chain of `(fg == X && name.contains(Y))`
 // branches. Identical substring semantics per entry.
-fn fg_helper_table() -> &'static std::collections::HashMap<&'static str, aho_corasick::AhoCorasick> {
-    static T: std::sync::OnceLock<std::collections::HashMap<&'static str, aho_corasick::AhoCorasick>> =
-        std::sync::OnceLock::new();
+fn fg_helper_table() -> &'static std::collections::HashMap<&'static str, aho_corasick::AhoCorasick>
+{
+    static T: std::sync::OnceLock<
+        std::collections::HashMap<&'static str, aho_corasick::AhoCorasick>,
+    > = std::sync::OnceLock::new();
     T.get_or_init(|| {
         let mut m = std::collections::HashMap::new();
-        m.insert("Safari", aho_corasick::AhoCorasick::new(["WebKit"]).unwrap());
-        m.insert("Google Chrome", aho_corasick::AhoCorasick::new(["Chrome"]).unwrap());
-        m.insert("Brave Browser", aho_corasick::AhoCorasick::new(["Brave"]).unwrap());
-        m.insert("Firefox", aho_corasick::AhoCorasick::new(["plugin-container"]).unwrap());
+        m.insert(
+            "Safari",
+            aho_corasick::AhoCorasick::new(["WebKit"]).unwrap(),
+        );
+        m.insert(
+            "Google Chrome",
+            aho_corasick::AhoCorasick::new(["Chrome"]).unwrap(),
+        );
+        m.insert(
+            "Brave Browser",
+            aho_corasick::AhoCorasick::new(["Brave"]).unwrap(),
+        );
+        m.insert(
+            "Firefox",
+            aho_corasick::AhoCorasick::new(["plugin-container"]).unwrap(),
+        );
         m
     })
 }

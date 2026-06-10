@@ -402,7 +402,10 @@ mod tests {
         // P(kernel_task|Brave) = 1.0 but P(kernel_task) global = 1.0 → lift = 1.0.
         assert!(!g.is_companion_of("Brave", "kernel_task"));
         let lift = g.lift("Brave", "kernel_task").expect("lift");
-        assert!((lift - 1.0).abs() < 0.05, "lift should be ≈1.0 for always-on, got {lift}");
+        assert!(
+            (lift - 1.0).abs() < 0.05,
+            "lift should be ≈1.0 for always-on, got {lift}"
+        );
     }
 
     #[test]
@@ -425,7 +428,10 @@ mod tests {
         let before = g.edge_count();
         // Run self_improve far in the future — edges should be evicted by age.
         let evicted = g.self_improve(10_000);
-        assert!(evicted >= before, "expected ≥{before} evictions, got {evicted}");
+        assert!(
+            evicted >= before,
+            "expected ≥{before} evictions, got {evicted}"
+        );
     }
 
     #[test]
@@ -556,8 +562,14 @@ mod tests {
         let edge_ba = inferred
             .iter()
             .find(|(a, b, _)| a == "AnchorB" && b == "AnchorA");
-        assert!(edge_ab.is_some(), "expected A→B inference, got {inferred:?}");
-        assert!(edge_ba.is_some(), "expected B→A inference, got {inferred:?}");
+        assert!(
+            edge_ab.is_some(),
+            "expected A→B inference, got {inferred:?}"
+        );
+        assert!(
+            edge_ba.is_some(),
+            "expected B→A inference, got {inferred:?}"
+        );
 
         let score = edge_ab.unwrap().2;
         // conf_AP and conf_BP are Laplace-smoothed: (250+1)/(250+2) ≈ 0.996.
@@ -611,8 +623,7 @@ mod tests {
         let groups = vec!["g1".to_string(), "g2".to_string()];
         let _ = g_after.propagate_attention_across_groups(&groups);
 
-        let snap_after =
-            serde_json::to_string(&g_after).expect("serialize post-propagation graph");
+        let snap_after = serde_json::to_string(&g_after).expect("serialize post-propagation graph");
         assert_eq!(
             snap_before, snap_after,
             "propagate_attention_across_groups must NOT mutate the graph"

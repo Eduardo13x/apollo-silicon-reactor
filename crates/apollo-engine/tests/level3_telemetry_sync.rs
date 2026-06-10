@@ -516,8 +516,7 @@ fn companion_observe_pressure_gated() {
     let synthetic_pressure = 0.10_f64;
 
     for cycle in 0..200u64 {
-        let pressure_router_open =
-            synthetic_pressure >= mid_entry || cycle.is_multiple_of(4);
+        let pressure_router_open = synthetic_pressure >= mid_entry || cycle.is_multiple_of(4);
         if pressure_router_open {
             companion_graph.observe_cycle(Some(FG_APP), &alive_set, cycle);
         } else {

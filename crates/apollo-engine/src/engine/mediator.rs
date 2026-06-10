@@ -287,8 +287,8 @@ impl Effector for SignalEffector {
         // leave the PID alive, so a stable Some(true)→Some(true) is the
         // common case — the real no-op signal at this layer is when the
         // PID was already dead pre-syscall and remains so post.
-        let no_op = matches!(before.pid_alive, Some(false))
-            && matches!(after.pid_alive, Some(false));
+        let no_op =
+            matches!(before.pid_alive, Some(false)) && matches!(after.pid_alive, Some(false));
         // S9: SignalEffector dispatches exactly one libc::kill on success;
         // 0 when the syscall short-circuited to a dead-PID no_op.
         let applied_count = if no_op { 0 } else { 1 };
@@ -328,7 +328,9 @@ impl SysctlEffector {
             SysctlValue::I64(_) => {
                 crate::engine::sysctl_direct::read_u64(key).map(|v| SysctlValue::I64(v as i64))
             }
-            SysctlValue::Str(_) => crate::engine::sysctl_direct::read_str(key).map(SysctlValue::Str),
+            SysctlValue::Str(_) => {
+                crate::engine::sysctl_direct::read_str(key).map(SysctlValue::Str)
+            }
         }
     }
 }
@@ -363,7 +365,9 @@ impl Effector for SysctlEffector {
         let t0 = std::time::Instant::now();
         let ok = match value {
             SysctlValue::I32(v) => crate::engine::sysctl_direct::write_i32(key, *v),
-            SysctlValue::I64(v) => crate::engine::sysctl_direct::write_str_value(key, &v.to_string()),
+            SysctlValue::I64(v) => {
+                crate::engine::sysctl_direct::write_str_value(key, &v.to_string())
+            }
             SysctlValue::Str(s) => crate::engine::sysctl_direct::write_str_value(key, s),
         };
         let syscall_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
@@ -595,8 +599,7 @@ impl Effector for MachPolicyEffector {
         if is_demote_target(sched_tier) {
             match mgr.get_mach_port_count(pid) {
                 Some(n) if n > PORT_HUB_THRESHOLD => {
-                    crate::engine::lse_counters::LSE_COUNTERS
-                        .inc_mediator_port_hub_block();
+                    crate::engine::lse_counters::LSE_COUNTERS.inc_mediator_port_hub_block();
                     drop(mgr);
                     return Err(BlockReason::PreconditionViolated {
                         which: format!(
@@ -724,8 +727,7 @@ impl Effector for ThreadPolicyEffector {
                 });
             }
         };
-        let (ok, syscall_us, applied_count) =
-            self.apply_raw(pid, thread_index, tier, affinity_tag);
+        let (ok, syscall_us, applied_count) = self.apply_raw(pid, thread_index, tier, affinity_tag);
         if !ok {
             return Err(BlockReason::PreconditionViolated {
                 which: "ThreadPolicyEffector: set_thread_qos returned false (pid invalid or task_for_pid failed)".to_string(),
@@ -780,8 +782,8 @@ impl Effector for PurgeableEffector {
         // decide whether to fire — the single source of safety truth stays
         // in `safety.rs`. The effector does not re-validate process kind.
         let t0 = std::time::Instant::now();
-        let purged_regions = crate::engine::compressor_aware::purge_purgeable_regions(pid)
-            .unwrap_or(0);
+        let purged_regions =
+            crate::engine::compressor_aware::purge_purgeable_regions(pid).unwrap_or(0);
         let syscall_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
         // no_op when the walker reported zero purgeable regions — the
         // 2026-05-30 NLM corpus finding that purge_purgeable:Brave Renderer
@@ -1114,13 +1116,19 @@ mod tests {
         // handles that internally. We only assert the typed surface works.
         let r = eff.apply(&e).expect("Switch-4 dispatch returns Ok");
         assert_eq!(r.after.mach_policy, Some(MachPolicyKind::Background));
-        assert!(!r.no_op, "Switch-4 honest default — no_op detection deferred");
+        assert!(
+            !r.no_op,
+            "Switch-4 honest default — no_op detection deferred"
+        );
     }
 
     #[test]
     fn mach_policy_effector_rejects_other_effect() {
         let eff = make_mach_effector_for_test();
-        let e = Effect::SigStop { pid: 1, start_sec: 0 };
+        let e = Effect::SigStop {
+            pid: 1,
+            start_sec: 0,
+        };
         assert!(eff.apply(&e).is_err());
     }
 
@@ -1178,15 +1186,15 @@ mod tests {
         // unreliable here because `LSE_COUNTERS` is a shared global and
         // other tests in the same binary may bump it concurrently
         // (Rust test runner runs in parallel by default).
-        assert!(!is_demote_target(
-            MachPolicyEffector::to_sched_tier(MachPolicyKind::UserInteractive)
-        ));
-        assert!(!is_demote_target(
-            MachPolicyEffector::to_sched_tier(MachPolicyKind::UserInitiated)
-        ));
-        assert!(!is_demote_target(
-            MachPolicyEffector::to_sched_tier(MachPolicyKind::Default)
-        ));
+        assert!(!is_demote_target(MachPolicyEffector::to_sched_tier(
+            MachPolicyKind::UserInteractive
+        )));
+        assert!(!is_demote_target(MachPolicyEffector::to_sched_tier(
+            MachPolicyKind::UserInitiated
+        )));
+        assert!(!is_demote_target(MachPolicyEffector::to_sched_tier(
+            MachPolicyKind::Default
+        )));
 
         let eff = make_mach_effector_for_test();
         let e = Effect::SetMachPolicy {
@@ -1195,10 +1203,7 @@ mod tests {
             policy: MachPolicyKind::UserInteractive,
         };
         let r = eff.apply(&e).expect("promotion path stays Ok");
-        assert_eq!(
-            r.after.mach_policy,
-            Some(MachPolicyKind::UserInteractive)
-        );
+        assert_eq!(r.after.mach_policy, Some(MachPolicyKind::UserInteractive));
     }
 
     #[test]
@@ -1274,7 +1279,10 @@ mod tests {
     #[test]
     fn jetsam_effector_rejects_non_jetsam_effect() {
         let eff = JetsamEffector;
-        let e = Effect::SigCont { pid: 1, start_sec: 0 };
+        let e = Effect::SigCont {
+            pid: 1,
+            start_sec: 0,
+        };
         match eff.apply(&e) {
             Err(BlockReason::PreconditionViolated { which }) => {
                 assert!(which.contains("unsupported"));
@@ -1309,7 +1317,10 @@ mod tests {
     #[test]
     fn sysctl_effector_rejects_non_sysctl_effect() {
         let eff = SysctlEffector;
-        let e = Effect::SigStop { pid: 1, start_sec: 0 };
+        let e = Effect::SigStop {
+            pid: 1,
+            start_sec: 0,
+        };
         match eff.apply(&e) {
             Err(BlockReason::PreconditionViolated { which }) => {
                 assert!(which.contains("unsupported"));

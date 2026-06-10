@@ -543,8 +543,7 @@ pub fn execute_actions(
                             crate::engine::audit_types::DecisionReason::DisplayPipeline
                                 | crate::engine::audit_types::DecisionReason::CompositorPriority
                         );
-                        let is_hp = !is_carveout
-                            && crate::engine::safety::is_boost_forbidden(name);
+                        let is_hp = !is_carveout && crate::engine::safety::is_boost_forbidden(name);
                         crate::engine::effect_decay::record_global(
                             crate::engine::effect_decay::PendingObservation {
                                 effect_id: 0,
@@ -584,7 +583,10 @@ pub fn execute_actions(
                     // is in the active fg envelope (current + 5-min grace).
                     // Subprocesses of the user's active workflow stay
                     // unthrottled even when names drift across versions.
-                    if coalition_guard.map(|g| g.is_protected(*pid)).unwrap_or(false) {
+                    if coalition_guard
+                        .map(|g| g.is_protected(*pid))
+                        .unwrap_or(false)
+                    {
                         block_reason = Some(BlockReason::ActiveCoalition);
                         return Ok(());
                     }
@@ -603,7 +605,14 @@ pub fn execute_actions(
                     // no foreground context is available here (see policy_all pre-computation).
                     // infra (infrastructure_processes) is intentionally excluded: critical_bg
                     // below handles infra with soft-throttle semantics, not a full skip.
-                    match classify_protection(name, &protected, &empty_infra, &policy_all, policy_all_ac.as_ref(), false) {
+                    match classify_protection(
+                        name,
+                        &protected,
+                        &empty_infra,
+                        &policy_all,
+                        policy_all_ac.as_ref(),
+                        false,
+                    ) {
                         ProtectionLevel::Unconditional => {
                             out.push_skip(format!("protected:{}", name));
                             block_reason = Some(BlockReason::ProtectedProcess);
@@ -688,7 +697,10 @@ pub fn execute_actions(
                     // in the active fg envelope. Tabbing momentarily away
                     // from Antigravity to run `git status` does not strip
                     // its renderers of freeze immunity.
-                    if coalition_guard.map(|g| g.is_protected(*pid)).unwrap_or(false) {
+                    if coalition_guard
+                        .map(|g| g.is_protected(*pid))
+                        .unwrap_or(false)
+                    {
                         out.push_skip(format!("active-coalition:{}", name));
                         block_reason = Some(BlockReason::ActiveCoalition);
                         return Ok(());
@@ -710,7 +722,14 @@ pub fn execute_actions(
                     // FreezeProcess treats infra as a full skip (not a soft-throttle path).
                     // learned_interactive is treated as Unconditional: no foreground context
                     // at execute time (see policy_all pre-computation above).
-                    match classify_protection(name, &protected, &critical_bg, &policy_all, policy_all_ac.as_ref(), false) {
+                    match classify_protection(
+                        name,
+                        &protected,
+                        &critical_bg,
+                        &policy_all,
+                        policy_all_ac.as_ref(),
+                        false,
+                    ) {
                         ProtectionLevel::Unconditional => {
                             if critical_bg.iter().any(|p| name.contains(p)) {
                                 out.critical_background_skips += 1;
@@ -833,8 +852,7 @@ pub fn execute_actions(
                                 // matches the "soft-throttle structurally
                                 // ineffective" pathology documented in the
                                 // Approach-3 root-cause analysis.
-                                let is_hp =
-                                    crate::engine::safety::hard_protected_contains(name);
+                                let is_hp = crate::engine::safety::hard_protected_contains(name);
                                 crate::engine::effect_decay::record_global(
                                     crate::engine::effect_decay::PendingObservation {
                                         effect_id: 0,
@@ -908,8 +926,7 @@ pub fn execute_actions(
                                     //  iOS app resume — foreground pulse for fast working-set reload]
                                     // S4 cutover: short-guard Mutex lock.
                                     if let Some(arc) = qos_mgr.as_ref() {
-                                        let mut mgr =
-                                            arc.lock().unwrap_or_else(|e| e.into_inner());
+                                        let mut mgr = arc.lock().unwrap_or_else(|e| e.into_inner());
                                         mgr.set_tier(
                                             *pid,
                                             crate::engine::mach_qos::SchedulingTier::Foreground,
@@ -1029,7 +1046,10 @@ pub fn execute_actions(
                     // is in the active fg envelope. memorystatus_vm_pressure_send
                     // forces the target to drop caches; doing this to a
                     // helper of the user's active app produces stutter.
-                    if coalition_guard.map(|g| g.is_protected(*pid)).unwrap_or(false) {
+                    if coalition_guard
+                        .map(|g| g.is_protected(*pid))
+                        .unwrap_or(false)
+                    {
                         out.push_skip(format!("active-coalition:pid={}", *pid));
                         block_reason = Some(BlockReason::ActiveCoalition);
                         return Ok(());
@@ -1113,7 +1133,9 @@ pub fn execute_actions(
                     // toward an active-coalition helper is desirable.
                     let demotes = !matches!(tier.as_str(), "interactive");
                     if demotes
-                        && coalition_guard.map(|g| g.is_protected(*pid)).unwrap_or(false)
+                        && coalition_guard
+                            .map(|g| g.is_protected(*pid))
+                            .unwrap_or(false)
                     {
                         block_reason = Some(BlockReason::ActiveCoalition);
                         return Ok(());
@@ -1188,8 +1210,7 @@ pub fn execute_actions(
                                     // (Interactive=0/Utility=1/Background=2
                                     // by declaration order, see
                                     // mach_qos.rs:314).
-                                    let is_hp =
-                                        crate::engine::safety::is_boost_forbidden(name);
+                                    let is_hp = crate::engine::safety::is_boost_forbidden(name);
                                     let tier_post: i64 = match thread_tier {
                                         ThreadTier::Interactive => 0,
                                         ThreadTier::Utility => 1,

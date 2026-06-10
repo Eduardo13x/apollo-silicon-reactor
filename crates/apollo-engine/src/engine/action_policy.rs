@@ -386,8 +386,7 @@ impl PolicyScorer {
         let raw_uncertainty = unc_ss.sqrt();
         let total_uncertainty = raw_uncertainty.min(self.uncertainty_saturation);
         if raw_uncertainty > self.uncertainty_saturation {
-            crate::engine::lse_counters::LSE_COUNTERS
-                .inc_policy_scorer_uncertainty_saturated();
+            crate::engine::lse_counters::LSE_COUNTERS.inc_policy_scorer_uncertainty_saturated();
         }
 
         // Group C (2026-06-06) — Dempster-Shafer evidential aggregation,
@@ -399,10 +398,7 @@ impl PolicyScorer {
         // the mixed regime is well-defined.
         let (ds_belief, ds_disbelief, ds_uncertain, ds_conflict, ds_fallback_used) =
             if self.aggregator_mode == AggregatorMode::Dempster {
-                aggregate_dempster_shafer(
-                    &per_feature,
-                    self.ds_conflict_fallback_threshold,
-                )
+                aggregate_dempster_shafer(&per_feature, self.ds_conflict_fallback_threshold)
             } else {
                 // RSS mode — leave DS fields at neutral defaults so
                 // legacy consumers see no change.
@@ -531,8 +527,7 @@ fn aggregate_dempster_shafer(
             // Total conflict — Dempster's rule is undefined. Bump the
             // fallback counter and return the pre-step state with a
             // saturated K signal so the caller treats this as RSS.
-            crate::engine::lse_counters::LSE_COUNTERS
-                .inc_policy_scorer_ds_high_conflict_fallback();
+            crate::engine::lse_counters::LSE_COUNTERS.inc_policy_scorer_ds_high_conflict_fallback();
             return (m_a, m_r, m_o, 1.0, true);
         }
 
@@ -547,8 +542,7 @@ fn aggregate_dempster_shafer(
     }
 
     if cumulative_k > conflict_fallback_threshold {
-        crate::engine::lse_counters::LSE_COUNTERS
-            .inc_policy_scorer_ds_high_conflict_fallback();
+        crate::engine::lse_counters::LSE_COUNTERS.inc_policy_scorer_ds_high_conflict_fallback();
         return (m_a, m_r, m_o, cumulative_k, true);
     }
 
@@ -624,9 +618,7 @@ impl PolicyScorerBuilder {
             lambda_unc: self.lambda_unc.unwrap_or(0.5),
             uncertainty_saturation: self.uncertainty_saturation.unwrap_or(1.5),
             aggregator_mode: self.aggregator_mode.unwrap_or(AggregatorMode::Rss),
-            ds_conflict_fallback_threshold: self
-                .ds_conflict_fallback_threshold
-                .unwrap_or(0.7),
+            ds_conflict_fallback_threshold: self.ds_conflict_fallback_threshold.unwrap_or(0.7),
         }
     }
 }

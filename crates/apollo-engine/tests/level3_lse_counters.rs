@@ -153,7 +153,11 @@ fn stage_avg_never_exceeds_stage_max_in_window() {
 
     for i in 0..N_CYCLES {
         for s in &stages {
-            let ns = if i == N_CYCLES - 1 { OUTLIER_NS } else { SHORT_NS };
+            let ns = if i == N_CYCLES - 1 {
+                OUTLIER_NS
+            } else {
+                SHORT_NS
+            };
             lf.record_stage(*s, ns);
         }
         lf.finish_stage_cycle();

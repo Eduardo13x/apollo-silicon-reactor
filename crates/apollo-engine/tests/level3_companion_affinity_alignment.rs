@@ -16,8 +16,8 @@
 //! the counter will be observable in `runtime_metrics.json` once the
 //! production branch fires on real foreground companions.
 
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
 use apollo_engine::engine::lse_counters::LSE_COUNTERS;
 use apollo_engine::engine::types::RuntimeMetrics;
@@ -75,8 +75,7 @@ fn companion_affinity_alignment_field_defaults_to_zero_on_missing() {
         !stripped.contains("companion_affinity_alignments_total"),
         "strip-step must remove the key entirely"
     );
-    let m: RuntimeMetrics =
-        serde_json::from_str(&stripped).expect("deserialize stripped");
+    let m: RuntimeMetrics = serde_json::from_str(&stripped).expect("deserialize stripped");
     assert_eq!(
         m.companion_affinity_alignments_total, 0,
         "missing field defaults to 0 (serde default)"

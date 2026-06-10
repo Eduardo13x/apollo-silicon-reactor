@@ -144,8 +144,7 @@ pub fn llm_reactive_tick(
                 let lp_snap = {
                     let mut pg = state.policy.lock_recover();
                     let before = pg.learned_policy.protected_patterns.len();
-                    std::sync::Arc::make_mut(&mut pg.learned_policy
-                        .protected_patterns)
+                    std::sync::Arc::make_mut(&mut pg.learned_policy.protected_patterns)
                         .retain(|p| !added_protected.contains(p));
                     let reverted = before - pg.learned_policy.protected_patterns.len();
                     if reverted > 0 {
@@ -650,8 +649,10 @@ pub fn llm_reactive_tick(
                         && !pattern_conflicts_with_protected(p)
                     {
                         // Remove from noise if promoted to interactive.
-                        std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns).retain(|n| n != p);
-                        std::sync::Arc::make_mut(&mut pg.learned_policy.interactive_patterns).push(p.clone());
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns)
+                            .retain(|n| n != p);
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.interactive_patterns)
+                            .push(p.clone());
                         added += 1;
                     }
                 }
@@ -666,7 +667,8 @@ pub fn llm_reactive_tick(
                         && !pg.learned_policy.protected_patterns.contains(p)
                         && !pg.learned_policy.interactive_patterns.contains(p)
                     {
-                        std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns).push(p.clone());
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns)
+                            .push(p.clone());
                         added += 1;
                     }
                 }
@@ -679,8 +681,10 @@ pub fn llm_reactive_tick(
                         && !pattern_conflicts_with_protected(p)
                     {
                         // Remove from noise when promoted to protected.
-                        std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns).retain(|n| n != p);
-                        std::sync::Arc::make_mut(&mut pg.learned_policy.protected_patterns).push(p.clone());
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns)
+                            .retain(|n| n != p);
+                        std::sync::Arc::make_mut(&mut pg.learned_policy.protected_patterns)
+                            .push(p.clone());
                         added += 1;
                     }
                 }
@@ -1103,9 +1107,13 @@ mod tests {
 
     fn policy(interactive: &[&str], noise: &[&str], protected: &[&str]) -> LearnedPolicy {
         LearnedPolicy {
-            interactive_patterns: std::sync::Arc::new(interactive.iter().map(|s| s.to_string()).collect()),
+            interactive_patterns: std::sync::Arc::new(
+                interactive.iter().map(|s| s.to_string()).collect(),
+            ),
             noise_patterns: std::sync::Arc::new(noise.iter().map(|s| s.to_string()).collect()),
-            protected_patterns: std::sync::Arc::new(protected.iter().map(|s| s.to_string()).collect()),
+            protected_patterns: std::sync::Arc::new(
+                protected.iter().map(|s| s.to_string()).collect(),
+            ),
             learned_at: None,
             pattern_weights: HashMap::new(),
         }

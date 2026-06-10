@@ -2067,6 +2067,18 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub sysctl_governor_realtime_call_inhibit_total: u64,
 
+    /// B.2 replayd gate (2026-06-09 incident follow-up). Bumped at the
+    /// daemon composition point each cycle where the screen-capture probe
+    /// (`realtime_signals::ScreenCaptureCache` — replayd /
+    /// screencaptureui / ScreenSharingAgent in the proc table) is the
+    /// DECIDING signal for `realtime_call_active` (audio full-duplex gate
+    /// false, screen-capture true). Mirrors the LSE counter so
+    /// `runtime_metrics.json` separates screen-share-only inhibitions from
+    /// full-duplex-call inhibitions. `#[serde(default)]` keeps legacy
+    /// snapshots deserializing as 0.
+    #[serde(default)]
+    pub sysctl_governor_screen_capture_inhibit_total: u64,
+
     // ── Approach 2 (2026-06-07) — OutcomeTracker class-reclassification HP exclusion.
     // Producer: `PatternWeight::effectiveness_for_classification(name)` returns
     // `None` when `safety::hard_protected_contains(name)` is true. Mirrors the

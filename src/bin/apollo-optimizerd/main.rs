@@ -74,8 +74,7 @@ use apollo_engine::engine::background_collectors::PressureCollector;
 use apollo_engine::engine::capabilities::detect_capabilities;
 use apollo_engine::engine::causal_graph::CausalGraph;
 use apollo_engine::engine::compressor_aware::{
-    decide_enhanced, query_memory_profile, sample_process_temperature,
-    scan_regions, MemoryAction,
+    decide_enhanced, query_memory_profile, sample_process_temperature, scan_regions, MemoryAction,
 };
 use apollo_engine::engine::daemon_helpers::{
     audit_log, battery_pressure_boost, detect_prior_crash, frozen_state_path, governor_state_path,
@@ -105,7 +104,6 @@ use apollo_engine::engine::llm::{
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::mach_qos::{MachQoSManager, SchedulingTier};
-use apollo_engine::engine::network_optimizer::NetworkProfile;
 use apollo_engine::engine::overflow_guard::{is_build_tool_name, OverflowGuard};
 use apollo_engine::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
@@ -128,8 +126,7 @@ use apollo_engine::engine::thermal_interrupt::{
 };
 use apollo_engine::engine::types::{
     EnergyConsumerInfo, ForegroundAppInfo, FreezeSource, FrozenEntry, FrozenPidEntry,
-    FrozenStatePersisted, LatencyTarget, OptimizationProfile, RootAction, RuntimeMetrics,
-    SafetyPolicy,
+    FrozenStatePersisted, LatencyTarget, RootAction, RuntimeMetrics, SafetyPolicy,
 };
 use apollo_engine::engine::usage_model::{usage_model_path_root, UsageModel};
 use apollo_engine::engine::user_profile::{UserProfile, UserProfilePersisted};
@@ -251,9 +248,7 @@ enum Commands {
 /// hash is sufficient — the alternative `epoch`-keyed witness loses
 /// independence from snapshot identity and would invalidate even when the
 /// top-process projection is unchanged.
-fn fingerprint_top_processes(
-    top: &[apollo_engine::collector::ProcessStats],
-) -> u64 {
+fn fingerprint_top_processes(top: &[apollo_engine::collector::ProcessStats]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -440,7 +435,8 @@ fn main() -> anyhow::Result<()> {
                     fast_tick_until: None,
                     reactor_event_weight: 0.0,
                     reactor_status: DomainReactorStatus::default(),
-                    survival_window: apollo_engine::engine::survival_window::SurvivalActivationWindow::new(),
+                    survival_window:
+                        apollo_engine::engine::survival_window::SurvivalActivationWindow::new(),
                 })),
                 frozen_state: Arc::new(Mutex::new(frozen_since_boot.clone())),
                 process: Arc::new(Mutex::new(ProcessState {
@@ -488,6 +484,7 @@ fn main() -> anyhow::Result<()> {
                         last_tune_secs_ago: HashMap::new(),
                         tcp_consecutive_high: 0,
                         tcp_consecutive_low: 0,
+                        tcp_last_scale_up_secs_ago: None,
                         ipc_consecutive_drops: 0,
                         ipc_consecutive_clean: 0,
                         vm_consecutive_high: 0,
@@ -513,9 +510,7 @@ fn main() -> anyhow::Result<()> {
             // S10 (2026-06-06): install the shared effect_decay handle so
             // producer call sites in `execute_actions.rs` can enroll
             // observations without threading a new parameter. Idempotent.
-            apollo_engine::engine::effect_decay::install_global(
-                state.effect_decay.clone(),
-            );
+            apollo_engine::engine::effect_decay::install_global(state.effect_decay.clone());
 
             // Load persisted UserProfile (learning survives daemon restarts).
             if let Some(persisted) = read_json::<UserProfilePersisted>(&state.user_profile_path) {
@@ -587,8 +582,7 @@ fn main() -> anyhow::Result<()> {
                     "com.apple.Safari.SafeBrowsing.Service",
                 ];
                 let before = policy.interactive_patterns.len();
-                std::sync::Arc::make_mut(&mut policy
-                    .interactive_patterns)
+                std::sync::Arc::make_mut(&mut policy.interactive_patterns)
                     .retain(|p| !bad_interactive.iter().any(|bad| p.contains(bad)));
                 // Add noise patterns from LLM Teacher analysis.
                 if !policy.noise_patterns.contains(&"apsd".to_string()) {
@@ -756,7 +750,6 @@ fn main() -> anyhow::Result<()> {
                 mut thermal_mgr,
                 mut wake_storm,
                 mut darwin_anomaly,
-                net_optimizer,
                 mut energy_tracker,
                 mut outcome_tracker,
                 mut causal_graph,
@@ -1323,6 +1316,13 @@ fn main() -> anyhow::Result<()> {
             const DRY_RUN_BATCH_SIZE: u32 = 16;
             // Gate network_monitor.tick() to every ~10s since netstat is blocking.
             let mut last_netstat_tick = Instant::now() - Duration::from_secs(10);
+            // B.2 replayd gate (2026-06-09): TTL-cached (6s) proc-table scan
+            // for active screen capture (replayd / screencaptureui /
+            // ScreenSharingAgent). Feeds the SysctlGovernor realtime gate so
+            // screen shares without full-duplex audio still inhibit TCP
+            // buffer scale-downs (post-screen-share whipsaw fix).
+            let mut screen_capture_cache =
+                apollo_engine::engine::realtime_signals::ScreenCaptureCache::new();
             // Context-switch burst detector (TDA-aware).
             let mut ctx_switch_times: VecDeque<Instant> = VecDeque::new();
             let mut last_fg_name: Option<String> = None;
@@ -1331,9 +1331,9 @@ fn main() -> anyhow::Result<()> {
             // forward to prevent the freeze gate from flickering on/off every cycle.
             // [Cook et al. 2019] "Caching volatile state in reactive systems"
             let mut last_user_assertions: (bool, bool, bool) = (false, false, false); // (sleep_assert, call, audio)
-            // Phase 0c cache: last ioreg HIDIdleTime sample + when. Lets
-            // compute_user_context interpolate idle_secs between every-10-cycle
-            // ioreg subprocess spawns. ~25 ms saved per intermediate cycle.
+                                                                                      // Phase 0c cache: last ioreg HIDIdleTime sample + when. Lets
+                                                                                      // compute_user_context interpolate idle_secs between every-10-cycle
+                                                                                      // ioreg subprocess spawns. ~25 ms saved per intermediate cycle.
             let mut last_idle_sample: Option<(f64, Instant)> = None;
             // Phase 5.1 wiring (2026-05-16) — last cycle's UserContext, carried
             // forward so `apply_specialist_voting` can compute the
@@ -1346,7 +1346,7 @@ fn main() -> anyhow::Result<()> {
             // values → no suppression, identical to pre-wiring behaviour.
             let mut last_user_context_for_voting: apollo_engine::engine::user_context::UserContext =
                 apollo_engine::engine::user_context::UserContext::default();
-                                                                                      // Track previous cycle's package_watts for RL power-reduction reward.
+            // Track previous cycle's package_watts for RL power-reduction reward.
             let mut prev_package_watts: Option<f64> = None;
             // Track previous cycle's workload for onset detection (build-onset-proactive).
             let mut prev_workload_mode: WorkloadMode = WorkloadMode::Idle;
@@ -1354,8 +1354,7 @@ fn main() -> anyhow::Result<()> {
             // Drives Yerkes-Dodson adaptive recalibration threshold in learning_tick.
             // Restored from learned_state.json if available — preserves crisis context
             // across restarts. [Yerkes & Dodson 1908]
-            let mut arousal_state = restored_arousal
-                .unwrap_or_default();
+            let mut arousal_state = restored_arousal.unwrap_or_default();
             // Teacher consolidation: compiles Gemma 4 suggestions into S1
             // pattern_weights + NARS beliefs via dopamine/acetylcholine modulation.
             // [McGaugh 2004, Yerkes-Dodson 1908, Kahneman 2011]
@@ -1692,7 +1691,9 @@ fn main() -> anyhow::Result<()> {
                 // zero pulses after 60 s — that means the thread itself died,
                 // not just that the system has been quiet.
                 if daemon_start.elapsed() > Duration::from_secs(60) {
-                    let pulses = apollo_engine::engine::lse_counters::LSE_COUNTERS.snapshot().reactor_pulses;
+                    let pulses = apollo_engine::engine::lse_counters::LSE_COUNTERS
+                        .snapshot()
+                        .reactor_pulses;
                     if pulses == 0 {
                         {
                             let mut m = state.metrics.lock_recover();
@@ -1950,9 +1951,8 @@ fn main() -> anyhow::Result<()> {
                         state.metrics.lock_recover().thermal_level_real = level_str.to_string();
                         state.hardware.lock_recover().last_hw_snapshot = Some(hw);
                     } else {
-                        apollo_engine::engine::lse_counters::LSE_COUNTERS.set_iokit_errors(
-                            smc_reader.error_count()
-                        );
+                        apollo_engine::engine::lse_counters::LSE_COUNTERS
+                            .set_iokit_errors(smc_reader.error_count());
                     }
                 }
 
@@ -2149,7 +2149,9 @@ fn main() -> anyhow::Result<()> {
                     &mut arousal_state,
                 );
 
-                let mut reactor_weight = apollo_engine::engine::lse_counters::LSE_COUNTERS.snapshot().reactor_event_weight;
+                let mut reactor_weight = apollo_engine::engine::lse_counters::LSE_COUNTERS
+                    .snapshot()
+                    .reactor_event_weight;
                 reactor_weight = (reactor_weight * 0.75).clamp(0.0, 1.0);
                 // Persist the decayed value back so the next snapshot reads the
                 // post-decay state, not the pre-decay sticky 1.0. Without this,
@@ -2831,7 +2833,8 @@ fn main() -> anyhow::Result<()> {
                     })
                 };
                 if governor_decision.transition_reason.contains("floor") {
-                    apollo_engine::engine::lse_counters::LSE_COUNTERS.increment_profile_floor_hits();
+                    apollo_engine::engine::lse_counters::LSE_COUNTERS
+                        .increment_profile_floor_hits();
                 }
                 let current_profile = governor_decision.effective_profile;
                 {
@@ -3197,8 +3200,7 @@ fn main() -> anyhow::Result<()> {
                 // Execute → Learn → Persist) always runs. [Hellerstein 2004 §9
                 // — saturation requires graceful degradation, not unbounded
                 // cycle latency that itself becomes a stressor].
-                let stage_budget_exceeded =
-                    _t_reason_start.elapsed().as_millis() > 150;
+                let stage_budget_exceeded = _t_reason_start.elapsed().as_millis() > 150;
                 if stage_budget_exceeded {
                     // Sprint 13 perf: demoted INFO→DEBUG. ~4 k events in
                     // 6 h — fired whenever a reason stage cycle exceeded
@@ -3213,15 +3215,15 @@ fn main() -> anyhow::Result<()> {
                 let _t_hw_start = Instant::now();
                 if !stage_budget_exceeded {
                     daemon_holt_winters_tick::run_holt_winters_tick(
-                    snapshot.pressure.memory_pressure,
-                    hour_of_day,
-                    &mut holt_winters,
-                    &mut hw_pressure_accum,
-                    &mut hw_pressure_count,
-                    &mut hw_last_hour,
-                    &state,
-                    &mut overflow_thresholds,
-                );
+                        snapshot.pressure.memory_pressure,
+                        hour_of_day,
+                        &mut holt_winters,
+                        &mut hw_pressure_accum,
+                        &mut hw_pressure_count,
+                        &mut hw_last_hour,
+                        &state,
+                        &mut overflow_thresholds,
+                    );
                 }
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonHoltWinters,
@@ -3308,7 +3310,8 @@ fn main() -> anyhow::Result<()> {
                         post_wake_reclaim_active,
                     );
                     if freed > 0 {
-                        apollo_engine::engine::lse_counters::LSE_COUNTERS.increment_paging_hints_applied();
+                        apollo_engine::engine::lse_counters::LSE_COUNTERS
+                            .increment_paging_hints_applied();
                     }
                 }
                 lf_metrics.record_stage(
@@ -3414,23 +3417,18 @@ fn main() -> anyhow::Result<()> {
                 // mutation, or CompanionGraph mutation witness
                 // (`total_cycles`, `anchor_count`). [Saltzer & Schroeder
                 // 1975] Economy of Mechanism. See `CompanionFgCache`.
-                let fg_app_opt: Option<&str> = foreground_app
-                    .as_deref()
-                    .filter(|s| !s.is_empty());
+                let fg_app_opt: Option<&str> = foreground_app.as_deref().filter(|s| !s.is_empty());
                 let top_proc_fingerprint = fingerprint_top_processes(&snapshot.top_processes);
                 let graph_total_cycles = companion_graph.total_cycles();
                 let graph_anchor_count = companion_graph.anchor_count();
-                if companion_fg_cache
-                    .as_ref()
-                    .is_some_and(|c| {
-                        c.is_valid(
-                            fg_app_opt,
-                            top_proc_fingerprint,
-                            graph_total_cycles,
-                            graph_anchor_count,
-                        )
-                    })
-                {
+                if companion_fg_cache.as_ref().is_some_and(|c| {
+                    c.is_valid(
+                        fg_app_opt,
+                        top_proc_fingerprint,
+                        graph_total_cycles,
+                        graph_anchor_count,
+                    )
+                }) {
                     lf_metrics.inc_companion_fg_cache_hit();
                 } else {
                     let pids: HashSet<u32> = match fg_app_opt {
@@ -3665,10 +3663,8 @@ fn main() -> anyhow::Result<()> {
                 // pressure. Telemetry shape matches Sprint 12 G12
                 // `bus_saturated` skip-with-counter precedent (commit
                 // `5f1c984`).
-                let mid_entry_threshold =
-                    lctx.signal_intel.effective_zones(0).0;
-                let pressure_router_open = snapshot.pressure.memory_pressure
-                    >= mid_entry_threshold
+                let mid_entry_threshold = lctx.signal_intel.effective_zones(0).0;
+                let pressure_router_open = snapshot.pressure.memory_pressure >= mid_entry_threshold
                     || cycle_count.is_multiple_of(4);
                 if pressure_router_open {
                     let alive: Vec<String> = snapshot
@@ -3676,11 +3672,7 @@ fn main() -> anyhow::Result<()> {
                         .iter()
                         .map(|p| p.name.clone())
                         .collect();
-                    companion_graph.observe_cycle(
-                        foreground_app.as_deref(),
-                        &alive,
-                        cycle_count,
-                    );
+                    companion_graph.observe_cycle(foreground_app.as_deref(), &alive, cycle_count);
                     // Phase 3.3 WIRED (Sprint 9, 2026-05-16): cross-group
                     // attention propagation. After per-cycle co-occurrence
                     // accumulation, ask the graph to infer (A, B, score)
@@ -3707,9 +3699,7 @@ fn main() -> anyhow::Result<()> {
                                 companion_graph.propagate_attention_across_groups(&group_keys);
                             if !triples.is_empty() {
                                 apollo_engine::engine::lse_counters::LSE_COUNTERS
-                                    .add_companion_cross_group_inferences(
-                                        triples.len() as u64,
-                                    );
+                                    .add_companion_cross_group_inferences(triples.len() as u64);
                             }
                         }
                     }
@@ -4183,6 +4173,23 @@ fn main() -> anyhow::Result<()> {
                     let _ = network_monitor.tick();
                     last_netstat_tick = Instant::now();
                 }
+                // WebRTC guard (2026-06-09 prod incident): both default
+                // audio devices running = full-duplex realtime call.
+                // Inhibits TCP buffer scale-down and delayed_ack=3.
+                // See `coreaudio_active::is_realtime_call_active` doc.
+                let audio_call_active =
+                    apollo_engine::engine::coreaudio_active::is_realtime_call_active();
+                // B.2 replayd gate (2026-06-09): screen capture without
+                // full-duplex audio (screen share leg of a call, recording)
+                // must ALSO inhibit the governor — the post-screen-share
+                // whipsaw ("high retransmissions scaling UP" then "-25%
+                // scale-down") fired with the audio gate dark.
+                let screen_capture_active = screen_capture_cache.check();
+                if !audio_call_active && screen_capture_active {
+                    // Count only when the screen probe is the DECIDING
+                    // signal — keeps the two inhibit counters disjoint.
+                    lf_metrics.inc_sysctl_governor_screen_capture_inhibit();
+                }
                 let sysctl_actions = sysctl_governor.tick(&SysctlGovernorInput {
                     net_monitor: &network_monitor,
                     swap_trend: swap_forecast.swap_trend,
@@ -4191,12 +4198,7 @@ fn main() -> anyhow::Result<()> {
                     workload: ml_class.workload.as_kebab(),
                     on_battery: power_mgr.is_on_battery(),
                     is_root,
-                    // WebRTC guard (2026-06-09 prod incident): both default
-                    // audio devices running = full-duplex realtime call.
-                    // Inhibits TCP buffer scale-down and delayed_ack=3.
-                    // See `coreaudio_active::is_realtime_call_active` doc.
-                    realtime_call_active:
-                        apollo_engine::engine::coreaudio_active::is_realtime_call_active(),
+                    realtime_call_active: audio_call_active || screen_capture_active,
                 });
                 // sysctl_governor.tick() returns sealed `SetSysctlAction` values
                 // already constructed via the clamping factory (Fase 4 seal). They
@@ -4212,44 +4214,15 @@ fn main() -> anyhow::Result<()> {
                     lf_metrics,
                 );
 
-                // NetworkOptimizer: profile-driven TCP tuning complements sysctl_governor.
-                // Select network profile based on optimization profile + battery state.
-                // Emits SetSysctl actions for TCP buffers, delayed_ack, window scale.
-                if is_root && cycle_count.is_multiple_of(30) {
-                    let net_profile = if power_mgr.is_on_battery() {
-                        NetworkProfile::Battery
-                    } else {
-                        match current_profile {
-                            OptimizationProfile::AggressiveRoot => NetworkProfile::HighThroughput,
-                            OptimizationProfile::BalancedRoot => NetworkProfile::Balanced,
-                            OptimizationProfile::SafeRoot => NetworkProfile::LowLatency,
-                        }
-                    };
-                    for (key, value) in net_optimizer.get_sysctl_recommendations(net_profile) {
-                        // Sprint 4 Phase 4 seal: `RootAction::set_sysctl` is the
-                        // only public construction path and clamps internally
-                        // via `sysctl_limits::clamp_to_allowed_range`. The
-                        // inline pre-clamp that fixed Bug 6 (commit 0a8c319) is
-                        // now redundant — it's enforced at the type level.
-                        //
-                        // Sprint 4 Phase 5 (2026-05-07): typed accumulator emit.
-                        // `push_set_sysctl_clamped` wraps the Fase 4 sealed
-                        // factory and emits a per-variant counter +
-                        // structured tracing event with full EmitContext.
-                        acc.push_set_sysctl_clamped(
-                            key,
-                            value,
-                            format!("network-optimizer: {:?} profile", net_profile),
-                            DecisionReason::PressureContext,
-                            EmitContext::new(
-                                ActionPhase::NetworkOptimizer,
-                                "main.rs::3461 network_optimizer",
-                                "profile_tcp_tune",
-                            ),
-                            lf_metrics,
-                        );
-                    }
-                }
+                // TOMBSTONE (2026-06-09): NetworkOptimizer write path DELETED.
+                // Two writers on the same TCP sysctls caused a tug-of-war flap
+                // (12x "Battery profile" writes vs 14x "reverting to default"
+                // in 300 actions) and an ungated mid-call write during the
+                // 2026-06-09T17:12 Meet incident — 257baea only gated the
+                // SysctlGovernor path, not this one. SysctlGovernor is the
+                // SOLE owner of TCP sysctl writes. network_optimizer.rs stays
+                // as an advisory-only library; do NOT re-wire it to a write
+                // path.
 
                 // Update SharedState with latest sysctl governor status for ctl queries.
                 {
@@ -4335,68 +4308,68 @@ fn main() -> anyhow::Result<()> {
                 // observability cost of skipping it. Watchdog still applies to
                 // HoltWinters + PageReclaim where the cost-benefit favors skip.
                 {
-                // Workload-aware chromium gates. Three independent signals
-                // feed the priority-strict-max chain inside run_chromium_tick:
-                //   media : any audio flowing (CoreAudio).
-                //   build : BuildPhase != Idle (cargo+rustc detected).
-                //   call  : pmset PreventUserIdleSleep + call_app_name match.
-                // The chain in daemon_chromium_tick.rs picks ONE regime —
-                // never additive — so freeze_protected invariants hold.
-                let media_active_chromium = user_context.audio_active;
-                let build_active_chromium = build_tracker.phase
-                    != apollo_engine::engine::build_tracker::BuildPhase::Idle;
-                let call_active_chromium = user_context.call_in_progress;
-                // 2026-05-12: LLM inference also relaxes the chromium gate.
-                // llama-server / ollama hold 4GB resident; their detection
-                // already adds +0.20 pressure boost via aggregator, but that
-                // path is dampened by smoothing/clamps. A direct chromium gate
-                // entry at parity with media (0.60, 5000) is more immediate.
-                // `softly_protected_processes()` keeps llama-server itself
-                // safe from being frozen at sub-survival pressure.
-                let llm_active_chromium = llm_active;
-                // 2026-05-12: cached external-display snapshot. cg_display
-                // FFI costs ~50µs but topology changes rarely — sample every
-                // 50 cycles (~5 s @ 10 Hz). The cached value lives in a
-                // function-level static since DisplayState is Copy and the
-                // daemon loop is single-threaded for chromium tick.
-                static mut DISPLAY_STATE_CACHE:
-                    apollo_engine::engine::cg_display::DisplayState =
-                    apollo_engine::engine::cg_display::DisplayState {
-                        display_count: 0,
-                        external_4k_attached: false,
+                    // Workload-aware chromium gates. Three independent signals
+                    // feed the priority-strict-max chain inside run_chromium_tick:
+                    //   media : any audio flowing (CoreAudio).
+                    //   build : BuildPhase != Idle (cargo+rustc detected).
+                    //   call  : pmset PreventUserIdleSleep + call_app_name match.
+                    // The chain in daemon_chromium_tick.rs picks ONE regime —
+                    // never additive — so freeze_protected invariants hold.
+                    let media_active_chromium = user_context.audio_active;
+                    let build_active_chromium = build_tracker.phase
+                        != apollo_engine::engine::build_tracker::BuildPhase::Idle;
+                    let call_active_chromium = user_context.call_in_progress;
+                    // 2026-05-12: LLM inference also relaxes the chromium gate.
+                    // llama-server / ollama hold 4GB resident; their detection
+                    // already adds +0.20 pressure boost via aggregator, but that
+                    // path is dampened by smoothing/clamps. A direct chromium gate
+                    // entry at parity with media (0.60, 5000) is more immediate.
+                    // `softly_protected_processes()` keeps llama-server itself
+                    // safe from being frozen at sub-survival pressure.
+                    let llm_active_chromium = llm_active;
+                    // 2026-05-12: cached external-display snapshot. cg_display
+                    // FFI costs ~50µs but topology changes rarely — sample every
+                    // 50 cycles (~5 s @ 10 Hz). The cached value lives in a
+                    // function-level static since DisplayState is Copy and the
+                    // daemon loop is single-threaded for chromium tick.
+                    static mut DISPLAY_STATE_CACHE:
+                        apollo_engine::engine::cg_display::DisplayState =
+                        apollo_engine::engine::cg_display::DisplayState {
+                            display_count: 0,
+                            external_4k_attached: false,
+                        };
+                    let display_state_now = unsafe {
+                        if cycle_count.is_multiple_of(50) {
+                            DISPLAY_STATE_CACHE = apollo_engine::engine::cg_display::snapshot();
+                        }
+                        DISPLAY_STATE_CACHE
                     };
-                let display_state_now = unsafe {
-                    if cycle_count.is_multiple_of(50) {
-                        DISPLAY_STATE_CACHE = apollo_engine::engine::cg_display::snapshot();
-                    }
-                    DISPLAY_STATE_CACHE
-                };
-                let external_4k_attached = display_state_now.external_4k_attached;
-                daemon_chromium_tick::run_chromium_tick(
-                    &mut chromium_mgr,
-                    &focus_markov,
-                    foreground_app.as_deref(),
-                    foreground_pid,
-                    &proc_snaps,
-                    &state,
-                    win_workload_intent,
-                    &arousal_state,
-                    &fluidity_state,
-                    signal_digest.pressure_smooth as f32,
-                    snapshot.pressure.memory_pressure,
-                    cycle_count,
-                    signal_digest.swap_velocity_smooth as f32,
-                    snapshot.pressure.thrashing_score,
-                    media_active_chromium,
-                    build_active_chromium,
-                    call_active_chromium,
-                    llm_active_chromium,
-                    external_4k_attached,
-                );
-                lf_metrics.record_stage(
-                    apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
-                    _t_chrom_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                );
+                    let external_4k_attached = display_state_now.external_4k_attached;
+                    daemon_chromium_tick::run_chromium_tick(
+                        &mut chromium_mgr,
+                        &focus_markov,
+                        foreground_app.as_deref(),
+                        foreground_pid,
+                        &proc_snaps,
+                        &state,
+                        win_workload_intent,
+                        &arousal_state,
+                        &fluidity_state,
+                        signal_digest.pressure_smooth as f32,
+                        snapshot.pressure.memory_pressure,
+                        cycle_count,
+                        signal_digest.swap_velocity_smooth as f32,
+                        snapshot.pressure.thrashing_score,
+                        media_active_chromium,
+                        build_active_chromium,
+                        call_active_chromium,
+                        llm_active_chromium,
+                        external_4k_attached,
+                    );
+                    lf_metrics.record_stage(
+                        apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
+                        _t_chrom_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    );
                 } // close `else` from stage budget watchdog (chromium tick)
 
                 // F1: Causal attribution for velocity-anticipatory purges
@@ -4496,9 +4469,8 @@ fn main() -> anyhow::Result<()> {
                             (tau, a)
                         })
                         .collect();
-                    keyed.sort_by(|a, b| {
-                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    keyed
+                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                     graced_actions = keyed.into_iter().map(|(_, a)| a).collect();
 
                     // Freeze confirmation gate: 2 cycles normal, 1 pre-emptive,
@@ -5112,9 +5084,7 @@ fn main() -> anyhow::Result<()> {
                 // UCHS < 0.40 (recovery mode) → skip weight updates this cycle.
                 // Arousal EMA and causal graph still update (safe, no Bayesian corruption).
                 // [Goodfellow 2016 §7: regularization via confidence-adaptive learning rate]
-                let cognitive_pause = prev_cog_decision
-                    .as_ref()
-                    .is_some_and(|d| d.pause_learning);
+                let cognitive_pause = prev_cog_decision.as_ref().is_some_and(|d| d.pause_learning);
                 if cognitive_pause {
                     tracing::debug!(
                         uchs = prev_cog_decision.as_ref().map_or(0.0, |d| d.uchs_composite),
@@ -5163,7 +5133,10 @@ fn main() -> anyhow::Result<()> {
                 // Phase 0b stage timing: execute complete, learn starts.
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::Execute,
-                    _t_execute_start_outer.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    _t_execute_start_outer
+                        .elapsed()
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64,
                 );
                 let _t_learn_start = Instant::now();
 
@@ -5230,9 +5203,9 @@ fn main() -> anyhow::Result<()> {
                   // fresh. Feeds 8 cognitive modules. Result stored in prev_cog_decision
                   // for gating next-cycle learning and current-cycle metrics.
                   // Extracted to daemon_neuro_tick::run_neurocognitive_tick (Wave 8).
-                // 2026-05-12: ReasonNeuro stage instrumentation. Was the
-                // largest unmeasured chunk of REASON — blind spot when
-                // p95 spikes under stress.
+                  // 2026-05-12: ReasonNeuro stage instrumentation. Was the
+                  // largest unmeasured chunk of REASON — blind spot when
+                  // p95 spikes under stress.
                 let _t_neuro_start = Instant::now();
                 let cog_decision = daemon_neuro_tick::run_neurocognitive_tick(
                     &mut lctx,
@@ -5922,7 +5895,11 @@ mod tests {
         let mut rebuilds: u64 = 0;
 
         for cycle in 0..10 {
-            let fg_app: Option<&str> = if cycle < 5 { Some("Brave") } else { Some("Code") };
+            let fg_app: Option<&str> = if cycle < 5 {
+                Some("Brave")
+            } else {
+                Some("Code")
+            };
             if !cache.as_ref().is_some_and(|c| {
                 c.is_valid(fg_app, fingerprint, graph.total_cycles, graph.anchor_count)
             }) {
@@ -5944,7 +5921,10 @@ mod tests {
                 });
             }
         }
-        assert_eq!(rebuilds, 2, "fg flip at cycle 5 must trigger one extra rebuild");
+        assert_eq!(
+            rebuilds, 2,
+            "fg flip at cycle 5 must trigger one extra rebuild"
+        );
     }
 
     /// CompanionGraph `total_cycles` advance invalidates the cache.
