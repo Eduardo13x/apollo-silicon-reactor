@@ -375,9 +375,21 @@ pub struct ThreadSnapshot {
 
 // ── Manager ───────────────────────────────────────────────────────────────────
 
+/// Staleness window for the `current_tier` cache. Within it a same-tier
+/// request is a true no-op skip; past it Apollo re-applies to reconcile
+/// with external mutations (app self-QoS, runningboard).
+const CURRENT_TIER_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct MachQoSManager {
     /// Current tier per PID — we only issue a syscall when it changes.
-    current_tier: HashMap<u32, SchedulingTier>,
+    /// pid → (last tier Apollo applied, when). Fight-hunt fix (2026-06-10):
+    /// the cache previously had no timestamps — a hit skipped the syscall
+    /// FOREVER, but apps re-set their own QoS and runningboard re-stomps
+    /// priorities on app state transitions, so Apollo's belief went stale
+    /// and needed re-applies were silently skipped. Hits older than
+    /// CURRENT_TIER_TTL now fall through to a real re-apply (~50µs, at
+    /// most one per pid per TTL window).
+    current_tier: HashMap<u32, (SchedulingTier, std::time::Instant)>,
     /// PIDs permanently skipped (SIP, hardened runtime, or entitlement-protected).
     ///
     /// A7 fix (round-3): paired with `permanently_blocked_since` so GC can
@@ -441,8 +453,8 @@ impl MachQoSManager {
         //
         // [Hennessy & Patterson 2017] §2.1 — "make the common case fast";
         // the common case during unfreeze is a pid already classified.
-        if let Some(&cached) = self.current_tier.get(&pid) {
-            if cached == tier {
+        if let Some(&(cached, stamped_at)) = self.current_tier.get(&pid) {
+            if cached == tier && stamped_at.elapsed() < CURRENT_TIER_TTL {
                 return QoSOutcome {
                     pid,
                     tier,
@@ -451,11 +463,13 @@ impl MachQoSManager {
                     error: None,
                 };
             }
+            // Same tier but stale stamp: fall through to a real re-apply —
+            // external writers may have changed the live policy underneath us.
             // Cached with a different tier — skip is_sip_protected (already
             // proven non-SIP) and go straight to apply_task_policy below.
             let result = self.apply_task_policy(pid, tier);
             if result.success {
-                self.current_tier.insert(pid, tier);
+                self.current_tier.insert(pid, (tier, std::time::Instant::now()));
             } else {
                 self.mark_blocked(pid);
                 self.current_tier.remove(&pid);
@@ -487,7 +501,7 @@ impl MachQoSManager {
         let result = self.apply_task_policy(pid, tier);
 
         if result.success {
-            self.current_tier.insert(pid, tier);
+            self.current_tier.insert(pid, (tier, std::time::Instant::now()));
         } else {
             // task_for_pid failed — block permanently and report as silent skip.
             self.mark_blocked(pid);
@@ -559,19 +573,19 @@ impl MachQoSManager {
 
     /// Current tier for a PID, or None if not tracked.
     pub fn current_tier(&self, pid: u32) -> Option<SchedulingTier> {
-        self.current_tier.get(&pid).copied()
+        self.current_tier.get(&pid).map(|(t, _)| *t)
     }
 
     /// Return all currently tracked (pid, tier) pairs.
     pub fn current_tier_keys(&self) -> Vec<(u32, SchedulingTier)> {
-        self.current_tier.iter().map(|(k, v)| (*k, *v)).collect()
+        self.current_tier.iter().map(|(k, (t, _))| (*k, *t)).collect()
     }
 
     /// Count of processes currently pushed to E-Cores.
     pub fn background_count(&self) -> usize {
         self.current_tier
             .values()
-            .filter(|&&t| t == SchedulingTier::Background)
+            .filter(|(t, _)| *t == SchedulingTier::Background)
             .count()
     }
 
@@ -1653,6 +1667,42 @@ pub fn batch_mach_port_counts() -> Vec<(i32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn current_tier_cache_ttl_falls_through_when_stale() {
+        // Fight-hunt fix (2026-06-10): a fresh same-tier hit skips the
+        // syscall and leaves the cache entry intact; a STALE hit must fall
+        // through to a real re-apply. We can't run task_policy_set in
+        // unprivileged tests, but the fall-through is observable: the
+        // apply fails (no privileges) → mark_blocked removes the cache
+        // entry. A fresh skip would never touch the cache.
+        let mut mgr = MachQoSManager::new();
+        let pid = std::process::id(); // self — alive, but task_for_pid fails unprivileged
+
+        // Fresh entry → same-tier call is a pure cache skip.
+        mgr.current_tier
+            .insert(pid, (SchedulingTier::Normal, std::time::Instant::now()));
+        let out = mgr.set_tier(pid, SchedulingTier::Normal);
+        assert!(!out.mutated, "fresh same-tier hit must not claim mutation");
+        assert!(
+            mgr.current_tier.contains_key(&pid),
+            "fresh skip must leave the cache entry intact"
+        );
+
+        // Backdate past TTL → same-tier call must fall through (re-apply).
+        mgr.current_tier.insert(
+            pid,
+            (
+                SchedulingTier::Normal,
+                std::time::Instant::now() - CURRENT_TIER_TTL - std::time::Duration::from_secs(1),
+            ),
+        );
+        let _ = mgr.set_tier(pid, SchedulingTier::Normal);
+        assert!(
+            !mgr.current_tier.contains_key(&pid),
+            "stale hit must fall through to a real apply (observable via              the unprivileged-failure cleanup path)"
+        );
+    }
+
     use super::*;
 
     #[test]
