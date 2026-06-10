@@ -598,6 +598,15 @@ pub struct LockFreeMetrics {
     /// kills — kernel keeps kill authority.
     pub zombie_actions_emitted_total: AtomicU64,
 
+    /// B.4 purge band split (2026-06-10). Pressure-skip disambiguation:
+    /// the legacy aggregate maintenance_purge_skipped_pressure_total keeps
+    /// the sum; these three say WHY. low = below 0.55 band entry;
+    /// survival = at/above 0.75 hard skip; rising_edge = entered
+    /// [0.70, 0.75) without Schmitt eligibility from the safe band.
+    pub maintenance_purge_skipped_pressure_low_total: AtomicU64,
+    pub maintenance_purge_skipped_pressure_survival_total: AtomicU64,
+    pub maintenance_purge_skipped_rising_edge_total: AtomicU64,
+
     /// B.2 replayd gate (2026-06-09 incident follow-up). Bumped at the
     /// daemon composition point in main.rs each cycle where the screen-
     /// capture probe (`realtime_signals::ScreenCaptureCache`) is the
@@ -845,6 +854,9 @@ impl LockFreeMetrics {
             cooperation_jetsam_hints_total: AtomicU64::new(0),
             zombie_dead_weight_detected_total: AtomicU64::new(0),
             zombie_actions_emitted_total: AtomicU64::new(0),
+            maintenance_purge_skipped_pressure_low_total: AtomicU64::new(0),
+            maintenance_purge_skipped_pressure_survival_total: AtomicU64::new(0),
+            maintenance_purge_skipped_rising_edge_total: AtomicU64::new(0),
             sysctl_governor_screen_capture_inhibit_total: AtomicU64::new(0),
             hard_protected_reclassify_excluded_total: AtomicU64::new(0),
             mediator_port_hub_blocks_total: AtomicU64::new(0),
@@ -1344,6 +1356,15 @@ impl LockFreeMetrics {
                 .load(Ordering::Relaxed),
             zombie_actions_emitted_total: self
                 .zombie_actions_emitted_total
+                .load(Ordering::Relaxed),
+            maintenance_purge_skipped_pressure_low_total: self
+                .maintenance_purge_skipped_pressure_low_total
+                .load(Ordering::Relaxed),
+            maintenance_purge_skipped_pressure_survival_total: self
+                .maintenance_purge_skipped_pressure_survival_total
+                .load(Ordering::Relaxed),
+            maintenance_purge_skipped_rising_edge_total: self
+                .maintenance_purge_skipped_rising_edge_total
                 .load(Ordering::Relaxed),
             sysctl_governor_screen_capture_inhibit_total: self
                 .sysctl_governor_screen_capture_inhibit_total
@@ -1994,6 +2015,10 @@ pub struct MetricsSnapshot {
     pub zombie_dead_weight_detected_total: u64,
     /// B.6 gap fix (2026-06-10). Conservative zombie actions emitted.
     pub zombie_actions_emitted_total: u64,
+    /// B.4 purge band split (2026-06-10).
+    pub maintenance_purge_skipped_pressure_low_total: u64,
+    pub maintenance_purge_skipped_pressure_survival_total: u64,
+    pub maintenance_purge_skipped_rising_edge_total: u64,
     /// B.2 replayd gate (2026-06-09). Screen-capture-deciding realtime inhibits.
     pub sysctl_governor_screen_capture_inhibit_total: u64,
     /// Sprint patch (2026-06-07). Approach 2 — class-reclassification HP exclusion.

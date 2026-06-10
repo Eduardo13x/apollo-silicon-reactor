@@ -276,6 +276,12 @@ impl MetricsState {
         self.metrics.cooperation_jetsam_hints_total = lf.cooperation_jetsam_hints_total;
         self.metrics.zombie_dead_weight_detected_total = lf.zombie_dead_weight_detected_total;
         self.metrics.zombie_actions_emitted_total = lf.zombie_actions_emitted_total;
+        self.metrics.maintenance_purge_skipped_pressure_low_total =
+            lf.maintenance_purge_skipped_pressure_low_total;
+        self.metrics.maintenance_purge_skipped_pressure_survival_total =
+            lf.maintenance_purge_skipped_pressure_survival_total;
+        self.metrics.maintenance_purge_skipped_rising_edge_total =
+            lf.maintenance_purge_skipped_rising_edge_total;
         // B.2 replayd gate (2026-06-09). Screen-capture-deciding realtime
         // inhibits — mirrored here to avoid the silent-telemetry-death
         // pattern (Sprint 9 `4b13a39`): without this line the counter

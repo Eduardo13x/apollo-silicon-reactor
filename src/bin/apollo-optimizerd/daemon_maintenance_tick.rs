@@ -27,6 +27,10 @@ use apollo_engine::engine::user_context::UserContext;
 pub enum SkipReason {
     PressureLow,
     PressureSurvival,
+    /// B.4 purge band (2026-06-10): pressure entered [0.70, 0.75) without
+    /// prior eligibility in the safe band — likely a fast ramp toward
+    /// crisis; purging now would add jank to the ramp.
+    PressureRisingEdge,
     SwapFloor,
     Growing,
     Idle,
@@ -44,6 +48,15 @@ pub enum SkipReason {
     /// quiets. [Hennessy & Patterson 2017 §2.2]
     BusSaturated,
 }
+
+// B.4 purge band (2026-06-10): widened + hysteresis. Old gate [0.65, 0.85)
+// left purge nearly unreachable in practice (3882 pressure skips vs 4-7
+// fires); the band starts earlier (0.55) so reclaim happens BEFORE the
+// compressor is saturated, and hard-skips earlier (0.75) because purging
+// inside a crisis ramp adds I/O jank — survival tick (>=0.85) and the
+// Gate-F thrashing bypass remain the crisis paths.
+const PURGE_BAND_ENTRY_LOW: f64 = 0.55;
+const PURGE_HARD_SKIP: f64 = 0.75;
 
 const EMERGENCY_THRASHING_PURGE_SCORE: f64 = 25_000.0;
 const CRITICAL_THRASHING_PURGE_SCORE: f64 = 50_000.0;
@@ -64,6 +77,8 @@ pub fn run_maintenance_tick(
     bus_saturated: bool,
 ) -> bool {
     state.push_swap_delta(snap.pressure.swap_delta_bytes_per_sec);
+    // B.4: advance the Schmitt trigger before should_fire reads it.
+    state.tick_pressure_band(snap.pressure.memory_pressure);
 
     // Gate F (2026-05-12): emergency thrashing-triggered purge bypass.
     // The normal maintenance gate requires idle_long + 1800s rate-limit,
@@ -116,8 +131,30 @@ pub fn run_maintenance_tick(
             false
         }
         Some(reason) => {
+            // B.4: split counters disambiguate the legacy aggregate (which
+            // keeps incrementing as the sum for dashboard continuity).
+            match reason {
+                SkipReason::PressureLow => {
+                    lf_metrics
+                        .maintenance_purge_skipped_pressure_low_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                SkipReason::PressureSurvival => {
+                    lf_metrics
+                        .maintenance_purge_skipped_pressure_survival_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                SkipReason::PressureRisingEdge => {
+                    lf_metrics
+                        .maintenance_purge_skipped_rising_edge_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
             let counter = match reason {
-                SkipReason::PressureLow | SkipReason::PressureSurvival => {
+                SkipReason::PressureLow
+                | SkipReason::PressureSurvival
+                | SkipReason::PressureRisingEdge => {
                     &lf_metrics.maintenance_purge_skipped_pressure_total
                 }
                 SkipReason::SwapFloor => &lf_metrics.maintenance_purge_skipped_swap_floor_total,
@@ -180,11 +217,17 @@ pub(crate) fn should_fire(
     bus_saturated: bool,
 ) -> Option<SkipReason> {
     let p = snap.pressure.memory_pressure;
-    if p < 0.65 {
+    if p < PURGE_BAND_ENTRY_LOW {
         return Some(SkipReason::PressureLow);
     }
-    if p >= 0.85 {
+    if p >= PURGE_HARD_SKIP {
         return Some(SkipReason::PressureSurvival);
+    }
+    // [0.70, 0.75): only proceed when the Schmitt trigger was armed in the
+    // safe band — fresh entry here is a fast ramp; skip and let the crisis
+    // paths (survival >=0.85, Gate-F thrashing) own it. [Hellerstein 2004 §9]
+    if p >= 0.70 && !state.purge_band_eligible {
+        return Some(SkipReason::PressureRisingEdge);
     }
 
     let swap_used = snap.pressure.swap_used_bytes;
@@ -278,12 +321,73 @@ mod tests {
                 now - std::time::Duration::from_secs(89) + std::time::Duration::from_secs(i * 2);
             state.swap_delta_window.push(t, 50_000.0);
         }
+        // B.4: arm the Schmitt trigger — fixtures at 0.70 model a system
+        // that was already in the safe band (eligibility carried forward).
+        state.purge_band_eligible = true;
         state
     }
 
     #[test]
+    fn band_pressure_058_fires_in_new_band() {
+        // The paradox fix: 0.58 was PressureLow under the old 0.65 gate.
+        let state = make_ready_state();
+        let snap = synth_snap(0.58, 3_000_000_000, 4_000_000_000);
+        let ctx = idle_ctx();
+        assert_eq!(should_fire(&snap, &ctx, &state, false, false), None);
+    }
+
+    #[test]
+    fn band_pressure_072_skips_on_fresh_entry() {
+        let mut state = make_ready_state();
+        state.purge_band_eligible = false; // fresh ramp, never in safe band
+        let snap = synth_snap(0.72, 3_000_000_000, 4_000_000_000);
+        let ctx = idle_ctx();
+        assert_eq!(
+            should_fire(&snap, &ctx, &state, false, false),
+            Some(SkipReason::PressureRisingEdge)
+        );
+    }
+
+    #[test]
+    fn band_pressure_072_fires_when_band_eligible() {
+        let state = make_ready_state(); // eligible = true
+        let snap = synth_snap(0.72, 3_000_000_000, 4_000_000_000);
+        let ctx = idle_ctx();
+        assert_eq!(should_fire(&snap, &ctx, &state, false, false), None);
+    }
+
+    #[test]
+    fn band_pressure_076_hard_skips_even_when_eligible() {
+        let state = make_ready_state();
+        let snap = synth_snap(0.76, 3_000_000_000, 4_000_000_000);
+        let ctx = idle_ctx();
+        assert_eq!(
+            should_fire(&snap, &ctx, &state, false, false),
+            Some(SkipReason::PressureSurvival)
+        );
+    }
+
+    #[test]
+    fn band_schmitt_trigger_state_machine() {
+        let mut state = MaintenanceState::default();
+        assert!(!state.purge_band_eligible);
+        state.tick_pressure_band(0.60); // safe band → arm
+        assert!(state.purge_band_eligible);
+        state.tick_pressure_band(0.72); // hysteresis hold
+        assert!(state.purge_band_eligible);
+        state.tick_pressure_band(0.76); // crisis ramp → clear
+        assert!(!state.purge_band_eligible);
+        state.tick_pressure_band(0.72); // hold (still not eligible)
+        assert!(!state.purge_band_eligible);
+        state.tick_pressure_band(0.60); // re-arm
+        assert!(state.purge_band_eligible);
+        state.tick_pressure_band(0.45); // calm → clear
+        assert!(!state.purge_band_eligible);
+    }
+
+    #[test]
     fn should_fire_pressure_below_returns_pressure_low() {
-        let snap = synth_snap(0.55, 3_000_000_000, 4_000_000_000);
+        let snap = synth_snap(0.50, 3_000_000_000, 4_000_000_000);
         let ctx = idle_ctx();
         let state = MaintenanceState::default();
         assert_eq!(
@@ -309,7 +413,8 @@ mod tests {
         // 1.5 GB absolute floor MUST kick in to skip.
         let snap = synth_snap(0.70, 500 * 1024 * 1024, 800 * 1024 * 1024);
         let ctx = idle_ctx();
-        let state = MaintenanceState::default();
+        let mut state = MaintenanceState::default();
+        state.purge_band_eligible = true; // B.4: bypass rising-edge, test swap floor
         assert_eq!(
             should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::SwapFloor)
@@ -321,6 +426,7 @@ mod tests {
         let snap = synth_snap(0.70, 3_000_000_000, 4_000_000_000);
         let ctx = idle_ctx();
         let mut state = MaintenanceState::default();
+        state.purge_band_eligible = true; // B.4: bypass rising-edge, test growing
         assert_eq!(
             should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::Growing)

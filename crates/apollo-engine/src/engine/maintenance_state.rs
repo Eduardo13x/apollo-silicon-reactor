@@ -71,9 +71,34 @@ pub struct MaintenanceState {
     /// stationary for two consecutive samples.
     #[serde(skip)]
     pub positive_delta_samples: u8,
+
+    /// B.4 purge band (2026-06-10): Schmitt-trigger eligibility for the
+    /// rising-edge zone [0.70, 0.75). Set while pressure sits in the safe
+    /// band [0.55, 0.70); cleared at ≥0.75 (crisis ramp) or <0.50 (calm).
+    /// A purge at 0.70-0.75 is allowed only when we were ALREADY eligible
+    /// below 0.70 — fresh entry at the top of the band is likely a fast
+    /// ramp toward crisis where purge would add jank. [Hellerstein 2004
+    /// §9 hysteresis bands over binary thresholds.]
+    ///
+    /// serde(skip): re-initializes false on daemon restart. If pressure is
+    /// already in [0.70, 0.75) at boot the rising-edge skip holds until
+    /// one dip below 0.70 — acceptable cold-start conservatism.
+    #[serde(skip)]
+    pub purge_band_eligible: bool,
 }
 
 impl MaintenanceState {
+    /// B.4 purge band (2026-06-10): advance the Schmitt trigger. Call once
+    /// per maintenance tick BEFORE should_fire reads the flag.
+    pub fn tick_pressure_band(&mut self, pressure: f64) {
+        if (0.55..0.70).contains(&pressure) {
+            self.purge_band_eligible = true;
+        } else if pressure >= 0.75 || pressure < 0.50 {
+            self.purge_band_eligible = false;
+        }
+        // [0.70, 0.75) and [0.50, 0.55): hold previous state (hysteresis).
+    }
+
     /// 2026-05-28: marks compressor as actively flushing. Call this when
     /// post-purge swap velocity is still negative (compressor feeding VM).
     pub fn mark_compressor_flushing(&mut self, active: bool) {
