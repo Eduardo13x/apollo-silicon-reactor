@@ -495,13 +495,17 @@ impl SysctlGovernor {
             // IPC
             ("kern.ipc.somaxconn", "2048", "listen backlog"),
             ("kern.ipc.maxsockbuf", "4194304", "max socket buffer 4 MB"),
-            // GPU VRAM
-            ("iogpu.wired_limit_mb", "12288", "GPU wired memory limit"),
-            (
-                "debug.iogpu.wired_limit",
-                "12288",
-                "GPU wired limit (Ventura)",
-            ),
+            // GPU VRAM: REMOVED (2026-06-10 fight-hunt finding). Apollo wrote
+            // iogpu.wired_limit_mb=12288 (12GB on an 8GB machine) at startup;
+            // worse, the revert path clamped the true macOS default (0 = auto,
+            // ~2/3 RAM) to the range floor 256, then a later restart captured
+            // the strangled 256 as "the default" and persisted it — GPU wired
+            // limit pinned to 256MB permanently (caused Metal OOM for MLX
+            // loads, Meet compositor jank, Brave GPU process starvation).
+            // The kernel manages GPU wired ceilings fine on its own; Apollo
+            // MUST NOT own this surface. Keys also removed from MANAGED_KEYS —
+            // the stale-key filter purges them from sysctl_defaults.json on
+            // next daemon start.
         ];
 
         tunings
@@ -1170,8 +1174,6 @@ const MANAGED_KEYS: &[&str] = &[
     "kern.maxfilesperproc",
     "kern.maxvnodes",
     "debug.lowpri_throttle_enabled",
-    "iogpu.wired_limit_mb",
-    "debug.iogpu.wired_limit",
     #[cfg(target_os = "macos")]
     "vm.compressor_eval_period_in_msecs",
     #[cfg(target_os = "macos")]
@@ -1482,6 +1484,24 @@ mod tests {
         assert!(
             has_aggressive,
             "expected aggressive VM tuning on high pressure + swap"
+        );
+    }
+
+    #[test]
+    fn initial_tuning_never_touches_gpu_wired_limit() {
+        // 2026-06-10 fight-hunt: Apollo pinned iogpu.wired_limit_mb to 256MB
+        // (revert clamped the true default 0 to the range floor, then a
+        // restart captured the strangled value as baseline). Apollo must
+        // never own this surface again.
+        let gov = SysctlGovernor::new(true);
+        let actions = gov.apply_initial_tuning();
+        let touches_gpu = actions.iter().any(|a| {
+            matches!(a, RootAction::SetSysctl(s) if s.key().contains("iogpu"))
+        });
+        assert!(!touches_gpu, "initial tuning must not write iogpu.* keys");
+        assert!(
+            !MANAGED_KEYS.iter().any(|k| k.contains("iogpu")),
+            "iogpu keys must not be managed (revert would clamp 0 -> 256)"
         );
     }
 
