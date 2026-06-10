@@ -9,7 +9,6 @@
 //! `interrupt_frozen_pids` which uses a Mutex accessed with `try_lock` from the
 //! main loop.
 
-use crate::engine::sysctl_direct;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -899,15 +898,19 @@ fn send_memory_pressure_hint() {
     // Per-process hints are emitted by execute_actions.rs with explicit target PIDs.
 }
 
-/// Enable I/O throttle sysctl during SuperEmergency.
-fn enable_io_throttle() {
-    sysctl_direct::write_i32("debug.lowpri_throttle_enabled", 1);
-}
+/// Intentionally a no-op (2026-06-10 fight-hunt). The old body raw-wrote
+/// `debug.lowpri_throttle_enabled=1` via sysctl_direct — bypassing the
+/// mediator/journal/clamps (complete-mediation violation) AND dual-writing
+/// a key the governor's initial tuning also owned. With the governor's
+/// 0-write removed, the kernel default (1 = throttle ON) reigns always and
+/// SuperEmergency needs no write: the kernel is already polite.
+fn enable_io_throttle() {}
 
-/// Disable I/O throttle sysctl on recovery.
-fn disable_io_throttle() {
-    sysctl_direct::write_i32("debug.lowpri_throttle_enabled", 0);
-}
+/// Intentionally a no-op (2026-06-10). The old body wrote 0 on recovery —
+/// re-DISABLING the kernel's low-priority I/O throttle after every
+/// emergency, leaving Time Machine/Spotlight competing unthrottled with
+/// foreground I/O until the next emergency. Kernel default stands.
+fn disable_io_throttle() {}
 
 /// Recover: SIGCONT all interrupt-frozen PIDs, disable I/O throttle, remove from tracking.
 fn recover(

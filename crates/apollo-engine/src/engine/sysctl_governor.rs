@@ -433,8 +433,14 @@ impl SysctlGovernor {
         }
 
         let tunings: &[(&str, &str, &str)] = &[
-            // I/O throttling — disable to allow full SSD speed
-            ("debug.lowpri_throttle_enabled", "0", "disable I/O throttle"),
+            // I/O throttling: REMOVED (2026-06-10 fight-hunt). Writing 0
+            // disabled the kernel's low-priority I/O throttle — the mechanism
+            // that keeps Time Machine / Spotlight / cloudd from competing with
+            // foreground I/O. With it off, background daemons ran unthrottled
+            // against the user's tabs/streaming. cargo builds are foreground
+            // I/O and were never affected by the throttle. Kernel default (1)
+            // is correct; Apollo exits this surface (also removed from
+            // MANAGED_KEYS; thermal_interrupt's raw writes gutted same day).
             // TCP buffers — 1 MB
             ("net.inet.tcp.sendspace", "1048576", "TCP send buffer 1 MB"),
             ("net.inet.tcp.recvspace", "1048576", "TCP recv buffer 1 MB"),
@@ -1173,7 +1179,6 @@ const MANAGED_KEYS: &[&str] = &[
     "kern.maxfiles",
     "kern.maxfilesperproc",
     "kern.maxvnodes",
-    "debug.lowpri_throttle_enabled",
     #[cfg(target_os = "macos")]
     "vm.compressor_eval_period_in_msecs",
     #[cfg(target_os = "macos")]
@@ -1502,6 +1507,17 @@ mod tests {
         assert!(
             !MANAGED_KEYS.iter().any(|k| k.contains("iogpu")),
             "iogpu keys must not be managed (revert would clamp 0 -> 256)"
+        );
+        // 2026-06-10 same hunt: Apollo disabled the kernel's low-pri I/O
+        // throttle at startup (background daemons ran unthrottled against
+        // user I/O). Apollo must not own this surface either.
+        let touches_lowpri = actions.iter().any(|a| {
+            matches!(a, RootAction::SetSysctl(s) if s.key().contains("lowpri_throttle"))
+        });
+        assert!(!touches_lowpri, "initial tuning must not write lowpri_throttle");
+        assert!(
+            !MANAGED_KEYS.iter().any(|k| k.contains("lowpri_throttle")),
+            "lowpri_throttle must not be managed"
         );
     }
 
