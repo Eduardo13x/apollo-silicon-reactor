@@ -1286,6 +1286,14 @@ fn main() -> anyhow::Result<()> {
             let mut log_ingester =
                 apollo_engine::engine::system_log_ingester::SystemLogIngester::new();
             log_ingester.start_background();
+            // B.6 gap fix (2026-06-10): zombie/dead-weight hunter. Classifies
+            // GhostHelper / MemoryHoarder / WakeupBurner / TrueZombie / Orphan
+            // from the per-cycle hunt_snaps and emits CONSERVATIVE actions
+            // (jetsam idle-band hints + non-aggressive throttles — never kills;
+            // the kernel keeps kill authority). Evaluated every 30 cycles —
+            // dead weight accumulates over minutes, not milliseconds.
+            // Persistent across cycles for its 3-cycle confirmation history.
+            let mut zombie_hunter = apollo_engine::engine::zombie_hunter::ZombieHunter::new();
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
             // Prev-cycle smoothed pressure, used by the high-pressure cycle-rate
@@ -3842,6 +3850,96 @@ fn main() -> anyhow::Result<()> {
                         ),
                         lf_metrics,
                     );
+                }
+
+                // B.6 gap fix (2026-06-10): zombie/dead-weight consumer. The
+                // hunter classifies — this block ACTS. Conservative mapping:
+                //   GhostHelper / MemoryHoarder → jetsam idle-band hint (-1):
+                //     the kernel keeps kill authority, Apollo only marks
+                //     sacrificable dead weight (host app gone >24h / >256MB
+                //     RSS with no UI and no interaction >30min).
+                //   WakeupBurner → non-aggressive throttle (PRIO_DARWIN_BG).
+                //   TrueZombie / Orphan → telemetry only: SIGKILL on a Z-state
+                //     process is a no-op (parent must wait()) and orphan kills
+                //     are too risky without lineage proof.
+                // Every 30 cycles — dead weight accumulates over minutes.
+                // Hunter has its own 3-cycle confirmation before classifying.
+                if cycle_count % 30 == 0 && !hunt_snaps.is_empty() {
+                    let dead_weight = zombie_hunter.evaluate_all(&hunt_snaps);
+                    if !dead_weight.is_empty() {
+                        let reclaimable_mb =
+                            apollo_engine::engine::zombie_hunter::ZombieHunter::total_reclaimable_bytes(
+                                &dead_weight,
+                            ) / 1024
+                                / 1024;
+                        let mut zombie_actions: Vec<RootAction> = Vec::new();
+                        for dw in &dead_weight {
+                            lf_metrics.inc_zombie_dead_weight_detected();
+                            if apollo_engine::engine::safety::hard_protected_contains(&dw.name) {
+                                continue;
+                            }
+                            use apollo_engine::engine::zombie_hunter::ZombieClass;
+                            match dw.zombie_class {
+                                ZombieClass::GhostHelper | ZombieClass::MemoryHoarder => {
+                                    zombie_actions.push(RootAction::set_memorystatus(
+                                        dw.pid,
+                                        -1,
+                                        format!(
+                                            "zombie-hunter {:?}: {} ({}MB) — {}",
+                                            dw.zombie_class,
+                                            dw.name,
+                                            dw.wasted_rss_bytes / 1024 / 1024,
+                                            dw.reason,
+                                        ),
+                                        apollo_engine::engine::audit_types::DecisionReason::PressureContext,
+                                    ));
+                                }
+                                ZombieClass::WakeupBurner => {
+                                    let (ss, su) =
+                                        apollo_engine::engine::daemon_helpers::pid_start_time(dw.pid);
+                                    zombie_actions.push(RootAction::ThrottleProcess {
+                                        pid: dw.pid,
+                                        name: dw.name.clone(),
+                                        aggressive: false,
+                                        reason: format!(
+                                            "zombie-hunter WakeupBurner ({:.0} wakeups/s): {}",
+                                            dw.wakeups_per_sec, dw.reason,
+                                        ),
+                                        start_sec: ss,
+                                        start_usec: su,
+                                        decision_reason:
+                                            apollo_engine::engine::audit_types::DecisionReason::PressureContext,
+                                    });
+                                }
+                                ZombieClass::TrueZombie | ZombieClass::Orphan => {
+                                    // Telemetry-only v1: no safe signal-based remedy.
+                                }
+                            }
+                        }
+                        if !zombie_actions.is_empty() {
+                            tracing::info!(
+                                detected = dead_weight.len(),
+                                actions = zombie_actions.len(),
+                                reclaimable_mb,
+                                "zombie-hunter: dead weight marked for kernel reclaim"
+                            );
+                            for _ in 0..zombie_actions.len() {
+                                lf_metrics.inc_zombie_action_emitted();
+                            }
+                            acc.extend_raw(
+                                zombie_actions,
+                                EmitContext::new(
+                                    ActionPhase::StaleApps,
+                                    "main.rs zombie_hunter consumer",
+                                    "dead_weight_reclaim",
+                                ),
+                                lf_metrics,
+                            );
+                        }
+                    }
+                    // Drop confirmation history for PIDs that exited.
+                    let live: Vec<u32> = hunt_snaps.iter().map(|h| h.pid).collect();
+                    zombie_hunter.cleanup(&live);
                 }
 
                 // Survival mode: overflow recording, swap streak, purge, threshold decay.

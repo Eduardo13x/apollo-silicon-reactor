@@ -115,6 +115,19 @@ yellow "[gate-3] sleeping 90s for daemon to stabilize before health check..."
 sleep 90
 POST_SNAP="/tmp/apollo_post_snap_$$.json"
 sudo cat /var/lib/apollo/runtime_metrics.json > "$POST_SNAP" 2>/dev/null || echo '{}' > "$POST_SNAP"
+# B.6 fix (2026-06-10): ais_score may not exist yet at 90s — the daemon's
+# first AIS computation needs warmup cycles. Poll up to 120s more for the
+# key to APPEAR (presence, not value) before judging. Prevents the false
+# negative where AIS=0.0 means "not computed yet", not "score is zero".
+AIS_PRESENT=$(python3 -c "import json; print(1 if 'ais_score' in json.load(open('$POST_SNAP')) else 0)")
+WAITED=0
+while [ "$AIS_PRESENT" = "0" ] && [ "$WAITED" -lt 120 ]; do
+  yellow "[gate-3] ais_score not yet computed — waiting 15s (waited ${WAITED}s)..."
+  sleep 15
+  WAITED=$((WAITED + 15))
+  sudo cat /var/lib/apollo/runtime_metrics.json > "$POST_SNAP" 2>/dev/null || echo '{}' > "$POST_SNAP"
+  AIS_PRESENT=$(python3 -c "import json; print(1 if 'ais_score' in json.load(open('$POST_SNAP')) else 0)")
+done
 POST_AIS=$(python3 -c "import json; print(json.load(open('$POST_SNAP')).get('ais_score', 0))")
 POST_FAILS=$(python3 -c "import json; print(json.load(open('$POST_SNAP')).get('failures', 0))")
 POST_ERR=$(python3 -c "import json; print(json.load(open('$POST_SNAP')).get('last_error', None))")

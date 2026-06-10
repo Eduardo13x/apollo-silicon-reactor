@@ -704,6 +704,11 @@ pub fn run_learning_tick<'a>(
         for event in &log_events {
             match event {
                 SystemEvent::OomKill { process_name, .. } => {
+                    // B.6 gap fix (2026-06-10): mark the kill so decide_actions'
+                    // MacOSCooperationMode enters JetsamFired (observation mode)
+                    // for 300s — the kernel just made hard decisions; Apollo
+                    // must not pile interventions on top of them.
+                    apollo_engine::engine::shadow_signals::set_last_jetsam_kill_now();
                     // Feed hazard model only when swap is actively growing.
                     // Jetsam kills at moderate pressure with stable swap are
                     // macOS memory tiering, not imminent OOM — same velocity

@@ -273,6 +273,9 @@ impl MetricsState {
         self.metrics.effect_decay_hp_mach_attempts_total = lf.effect_decay_hp_mach_attempts_total;
         self.metrics.sysctl_governor_realtime_call_inhibit_total =
             lf.sysctl_governor_realtime_call_inhibit_total;
+        self.metrics.cooperation_jetsam_hints_total = lf.cooperation_jetsam_hints_total;
+        self.metrics.zombie_dead_weight_detected_total = lf.zombie_dead_weight_detected_total;
+        self.metrics.zombie_actions_emitted_total = lf.zombie_actions_emitted_total;
         // B.2 replayd gate (2026-06-09). Screen-capture-deciding realtime
         // inhibits — mirrored here to avoid the silent-telemetry-death
         // pattern (Sprint 9 `4b13a39`): without this line the counter

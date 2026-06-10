@@ -2067,6 +2067,18 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub sysctl_governor_realtime_call_inhibit_total: u64,
 
+    /// B.6 gap fix (2026-06-10). Jetsam hints emitted while in macOS
+    /// cooperation step-back mode (previously-dead should_emit_jetsam_hints
+    /// surface, now wired). Mirrors the LSE counter.
+    #[serde(default)]
+    pub cooperation_jetsam_hints_total: u64,
+
+    /// B.6 gap fix (2026-06-10). ZombieHunter classifications + actions.
+    #[serde(default)]
+    pub zombie_dead_weight_detected_total: u64,
+    #[serde(default)]
+    pub zombie_actions_emitted_total: u64,
+
     /// B.2 replayd gate (2026-06-09 incident follow-up). Bumped at the
     /// daemon composition point each cycle where the screen-capture probe
     /// (`realtime_signals::ScreenCaptureCache` — replayd /

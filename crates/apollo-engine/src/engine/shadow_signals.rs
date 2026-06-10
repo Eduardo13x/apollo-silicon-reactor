@@ -238,6 +238,38 @@ pub fn get_ctx_switches_per_sec() -> Option<f64> {
     }
 }
 
+// B.6 gap fix (2026-06-10): epoch-secs of the most recent jetsam/OOM kill
+// observed by SystemLogIngester. Producer: learning_tick OomKill arm.
+// Consumer: decide_actions MacOSCooperationMode — JetsamFired mode holds
+// for JETSAM_FIRED_WINDOW_SECS after a kill so Apollo observes instead of
+// piling actions onto a kernel that just made hard decisions.
+static LAST_JETSAM_KILL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Window during which `recent_jetsam_kills()` reports 1 after a kill.
+pub const JETSAM_FIRED_WINDOW_SECS: u64 = 300;
+
+pub fn set_last_jetsam_kill_now() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    LAST_JETSAM_KILL_EPOCH.store(now, Ordering::Relaxed);
+}
+
+/// 1 when a jetsam/OOM kill happened within the window, else 0. Feeds
+/// `MacOSCooperationMode::from_pressure_signals` jetsam_kill_count.
+pub fn recent_jetsam_kills() -> u32 {
+    let last = LAST_JETSAM_KILL_EPOCH.load(Ordering::Relaxed);
+    if last == 0 {
+        return 0;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    u32::from(now.saturating_sub(last) <= JETSAM_FIRED_WINDOW_SECS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +337,18 @@ mod tests {
         assert_eq!(get_max_wss_mb(), Some(512.5));
         set_max_wss_mb(-1.0); // invalid, None
         assert_eq!(get_max_wss_mb(), None);
+    }
+
+    #[test]
+    fn jetsam_kill_signal_roundtrip() {
+        // Before any kill: 0 (epoch sentinel 0 = never).
+        // NOTE: other tests share the static — only assert the set path.
+        set_last_jetsam_kill_now();
+        assert_eq!(
+            recent_jetsam_kills(),
+            1,
+            "kill stamped now must report 1 within the 300s window"
+        );
     }
 
     #[test]

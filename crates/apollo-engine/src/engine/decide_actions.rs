@@ -1246,7 +1246,11 @@ pub fn decide_actions(
     let cooperation = crate::engine::safety::MacOSCooperationMode::from_pressure_signals(
         snapshot.pressure.compressor_pressure,
         snapshot.pressure.swap_delta_bytes_per_sec,
-        0, // jetsam_kill_count not available in this scope
+        // B.6 gap fix (2026-06-10): real signal via shadow_signals. Producer
+        // is learning_tick's OomKill arm (SystemLogIngester poll). Holds 1
+        // for 300s after a kernel kill so JetsamFired observation mode
+        // actually engages instead of being permanently unreachable.
+        crate::engine::shadow_signals::recent_jetsam_kills(),
     );
     let macos_is_handling = cooperation.should_step_back();
     match context {
@@ -1419,13 +1423,26 @@ pub fn decide_actions(
                     shadow_disagreements_path(),
                 );
             }
-            let mut extreme_freeze_ok =
-                (gate_a || gate_b || gate_c || gate_d || gate_e) && !freeze_skip_by_user;
+            let gates_fired = gate_a || gate_b || gate_c || gate_d || gate_e;
+            let mut extreme_freeze_ok = gates_fired && !freeze_skip_by_user;
 
             // B.6 macOS cooperation: when the kernel is already handling memory
             // pressure (compressor active, swap growing), Apollo steps back from
             // direct freeze interventions. The kernel is already compressing pages —
             // Apollo freezing adds latency without reducing compressor load.
+            //
+            // B.6 gap fix (2026-06-10): stepping back is NOT going silent. When
+            // the gates fired but cooperation says hands-off, Apollo emits jetsam
+            // tier HINTS (SetMemorystatus priority -1 = idle band) for the same
+            // candidates it would have frozen — marking them sacrificable so the
+            // kernel's own jetsam picks the right victims. Previously this block
+            // zeroed extreme_freeze_ok and emitted NOTHING, leaving
+            // should_emit_jetsam_hints() as dead code and the kernel without
+            // Apollo's candidate knowledge.
+            let emit_jetsam_hints_instead = macos_is_handling
+                && cooperation.should_emit_jetsam_hints()
+                && gates_fired
+                && !freeze_skip_by_user;
             if macos_is_handling {
                 extreme_freeze_ok = false;
             }
@@ -1511,7 +1528,7 @@ pub fn decide_actions(
                 }
             }
 
-            if extreme_freeze_ok {
+            if extreme_freeze_ok || emit_jetsam_hints_instead {
                 // Severity cascade: gate_d ("swap-oom" with p_oom_30s evidence) wins
                 // over gate_e ("swap-pct" pure-physical) when both fire, preserving
                 // existing journal semantics. gate_e fires only when gate_d zombified.
@@ -1603,7 +1620,30 @@ pub fn decide_actions(
                     });
                 }
                 // Cap at 3 per cycle — avoid SIGSTOP burst overhead on display pipeline.
-                for (pid, name, _rss, cpu, start_sec) in freeze_candidates.into_iter().take(3) {
+                for (pid, name, rss, cpu, start_sec) in freeze_candidates.into_iter().take(3) {
+                    // B.6 cooperation hints: kernel is handling pressure — mark
+                    // the candidate sacrificable (jetsam idle band, priority -1)
+                    // and let the kernel's jetsam decide. No freeze, no throttle:
+                    // Apollo contributes its candidate ranking, macOS keeps the
+                    // kill authority. [Saltzer & Kaashoek 2009 §3.3 — cooperate
+                    // through the kernel's own mechanism, don't duplicate it.]
+                    if emit_jetsam_hints_instead {
+                        crate::engine::lse_counters::LSE_COUNTERS
+                            .inc_cooperation_jetsam_hint();
+                        actions.push(RootAction::set_memorystatus(
+                            pid,
+                            -1,
+                            format!(
+                                "B.6 cooperation hint ({:?}, gate={}): {} ({}MB)",
+                                cooperation,
+                                freeze_gate,
+                                name,
+                                rss / 1024 / 1024,
+                            ),
+                            DecisionReason::PressureContext,
+                        ));
+                        continue;
+                    }
                     // CPU-active guard: under gate_a / gate_b (pressure-based) the
                     // pressure is often transient and we'd rather throttle than
                     // drop in-flight work. Under gate_c (flow-based, sustained

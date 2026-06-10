@@ -580,6 +580,24 @@ pub struct LockFreeMetrics {
     /// scaled -25%, delayed_ack=3 on battery).
     pub sysctl_governor_realtime_call_inhibit_total: AtomicU64,
 
+    /// B.6 gap fix (2026-06-10). Jetsam tier HINT emitted instead of a
+    /// freeze because MacOSCooperationMode said step-back while the freeze
+    /// gates had fired. Producer: decide_actions freeze-candidate loop
+    /// (emit_jetsam_hints_instead branch). Each hint = SetMemorystatus
+    /// priority -1 (idle band) — kernel keeps kill authority, Apollo
+    /// contributes candidate ranking. Wires the previously-dead
+    /// `should_emit_jetsam_hints()` surface.
+    pub cooperation_jetsam_hints_total: AtomicU64,
+
+    /// B.6 gap fix (2026-06-10). Dead-weight process classified by
+    /// ZombieHunter after its 3-cycle confirmation. Producer: main-loop
+    /// zombie consumer (every 30 cycles).
+    pub zombie_dead_weight_detected_total: AtomicU64,
+    /// B.6 gap fix (2026-06-10). Conservative action emitted for dead
+    /// weight: jetsam idle-band hint or non-aggressive throttle. Never
+    /// kills — kernel keeps kill authority.
+    pub zombie_actions_emitted_total: AtomicU64,
+
     /// B.2 replayd gate (2026-06-09 incident follow-up). Bumped at the
     /// daemon composition point in main.rs each cycle where the screen-
     /// capture probe (`realtime_signals::ScreenCaptureCache`) is the
@@ -824,6 +842,9 @@ impl LockFreeMetrics {
             effect_decay_detected_total: AtomicU64::new(0),
             effect_decay_hp_mach_attempts_total: AtomicU64::new(0),
             sysctl_governor_realtime_call_inhibit_total: AtomicU64::new(0),
+            cooperation_jetsam_hints_total: AtomicU64::new(0),
+            zombie_dead_weight_detected_total: AtomicU64::new(0),
+            zombie_actions_emitted_total: AtomicU64::new(0),
             sysctl_governor_screen_capture_inhibit_total: AtomicU64::new(0),
             hard_protected_reclassify_excluded_total: AtomicU64::new(0),
             mediator_port_hub_blocks_total: AtomicU64::new(0),
@@ -1315,6 +1336,15 @@ impl LockFreeMetrics {
             sysctl_governor_realtime_call_inhibit_total: self
                 .sysctl_governor_realtime_call_inhibit_total
                 .load(Ordering::Relaxed),
+            cooperation_jetsam_hints_total: self
+                .cooperation_jetsam_hints_total
+                .load(Ordering::Relaxed),
+            zombie_dead_weight_detected_total: self
+                .zombie_dead_weight_detected_total
+                .load(Ordering::Relaxed),
+            zombie_actions_emitted_total: self
+                .zombie_actions_emitted_total
+                .load(Ordering::Relaxed),
             sysctl_governor_screen_capture_inhibit_total: self
                 .sysctl_governor_screen_capture_inhibit_total
                 .load(Ordering::Relaxed),
@@ -1677,6 +1707,27 @@ impl LockFreeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// B.6 gap fix (2026-06-10). Jetsam hint emitted in cooperation mode.
+    #[inline(always)]
+    pub fn inc_cooperation_jetsam_hint(&self) {
+        self.cooperation_jetsam_hints_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// B.6 gap fix (2026-06-10). ZombieHunter classification confirmed.
+    #[inline(always)]
+    pub fn inc_zombie_dead_weight_detected(&self) {
+        self.zombie_dead_weight_detected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// B.6 gap fix (2026-06-10). Conservative zombie action emitted.
+    #[inline(always)]
+    pub fn inc_zombie_action_emitted(&self) {
+        self.zombie_actions_emitted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// B.2 replayd gate (2026-06-09). Bumped by the daemon composition
     /// point ONLY when the screen-capture probe is the deciding signal
     /// (audio full-duplex gate false, screen-capture scan true). Sustained
@@ -1937,6 +1988,12 @@ pub struct MetricsSnapshot {
     /// SysctlGovernor TCP path. Sustained non-zero ratio proves the gate
     /// catches mid-call buffer scale-downs and ACK coalescing branches.
     pub sysctl_governor_realtime_call_inhibit_total: u64,
+    /// B.6 gap fix (2026-06-10). Cooperation-mode jetsam hints emitted.
+    pub cooperation_jetsam_hints_total: u64,
+    /// B.6 gap fix (2026-06-10). ZombieHunter dead-weight classifications.
+    pub zombie_dead_weight_detected_total: u64,
+    /// B.6 gap fix (2026-06-10). Conservative zombie actions emitted.
+    pub zombie_actions_emitted_total: u64,
     /// B.2 replayd gate (2026-06-09). Screen-capture-deciding realtime inhibits.
     pub sysctl_governor_screen_capture_inhibit_total: u64,
     /// Sprint patch (2026-06-07). Approach 2 — class-reclassification HP exclusion.
