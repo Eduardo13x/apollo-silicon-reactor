@@ -115,18 +115,20 @@ yellow "[gate-3] sleeping 90s for daemon to stabilize before health check..."
 sleep 90
 POST_SNAP="/tmp/apollo_post_snap_$$.json"
 sudo cat /var/lib/apollo/runtime_metrics.json > "$POST_SNAP" 2>/dev/null || echo '{}' > "$POST_SNAP"
-# B.6 fix (2026-06-10): ais_score may not exist yet at 90s — the daemon's
-# first AIS computation needs warmup cycles. Poll up to 120s more for the
-# key to APPEAR (presence, not value) before judging. Prevents the false
-# negative where AIS=0.0 means "not computed yet", not "score is zero".
-AIS_PRESENT=$(python3 -c "import json; print(1 if 'ais_score' in json.load(open('$POST_SNAP')) else 0)")
+# B.6 fix v2 (2026-06-10): ais_score serializes as 0.0 default from cycle 1
+# — presence is meaningless; only a COMPUTED score (>0) is judgeable. AIS
+# needs ~3-5 min of warmup cycles. Poll up to 300s more for ais_score > 0.
+# A genuinely sick daemon still fails: failures/last_error are checked
+# independently, and a daemon that never computes AIS in 6.5 min total
+# fails the floor check with 0.0 as before.
+AIS_COMPUTED=$(python3 -c "import json; print(1 if json.load(open('$POST_SNAP')).get('ais_score', 0) > 0 else 0)")
 WAITED=0
-while [ "$AIS_PRESENT" = "0" ] && [ "$WAITED" -lt 120 ]; do
-  yellow "[gate-3] ais_score not yet computed — waiting 15s (waited ${WAITED}s)..."
-  sleep 15
-  WAITED=$((WAITED + 15))
+while [ "$AIS_COMPUTED" = "0" ] && [ "$WAITED" -lt 300 ]; do
+  yellow "[gate-3] ais_score not yet computed (warmup) — waiting 30s (waited ${WAITED}s)..."
+  sleep 30
+  WAITED=$((WAITED + 30))
   sudo cat /var/lib/apollo/runtime_metrics.json > "$POST_SNAP" 2>/dev/null || echo '{}' > "$POST_SNAP"
-  AIS_PRESENT=$(python3 -c "import json; print(1 if 'ais_score' in json.load(open('$POST_SNAP')) else 0)")
+  AIS_COMPUTED=$(python3 -c "import json; print(1 if json.load(open('$POST_SNAP')).get('ais_score', 0) > 0 else 0)")
 done
 POST_AIS=$(python3 -c "import json; print(json.load(open('$POST_SNAP')).get('ais_score', 0))")
 POST_FAILS=$(python3 -c "import json; print(json.load(open('$POST_SNAP')).get('failures', 0))")

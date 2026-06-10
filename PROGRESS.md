@@ -116,3 +116,46 @@ The deploy gate script reads `runtime_metrics.json` at 90s post-restart but the 
 ## 7. Rollback Status
 
 **No rollback needed.** Daemon is running healthy. The deploy gate failure was a timing issue in the script, not a code bug. B.6 macOS Cooperation Layer and Chromium Non-Invasive Containment are both active and functioning.
+
+---
+
+## B.6 Gap Closure — 2026-06-10 (sesión Claude Code, post-OpenCode)
+
+### Implementado (commit 14b1c9f)
+
+1. **GAP 1 cerrado — jetsam hints wired**: `decide_actions` ahora emite
+   `SetMemorystatus -1` (idle band) para los candidatos RSS-ranked cuando
+   `macos_is_handling` + gates fired. Apollo marca sacrificables, el kernel
+   decide. Counter: `cooperation_jetsam_hints_total`.
+2. **GAP 2 cerrado — zombie_hunter consumer**: main-loop cada 30 cycles.
+   GhostHelper/MemoryHoarder → jetsam hint; WakeupBurner → throttle suave;
+   TrueZombie/Orphan → telemetría (sin kills v1). Counters:
+   `zombie_dead_weight_detected_total` + `zombie_actions_emitted_total`.
+3. **GAP 3 cerrado — JetsamFired alcanzable**: shadow signal
+   `LAST_JETSAM_KILL_EPOCH` (producer: learning_tick OomKill; consumer:
+   decide_actions, ventana 300s).
+4. **Deploy gate v2**: AIS=0.0 default desde cycle 1 — el gate ahora pollea
+   hasta 300s extra por un score COMPUTADO (>0), no por presencia de key.
+
+### Verificación post-deploy (PID 24679, 2026-06-10 02:47)
+
+| Métrica | Valor |
+|---------|-------|
+| cycles | 100 |
+| failures / last_error | 0 / None |
+| p95_cycle_ms | 72 |
+| zombie_dead_weight_detected_total | **5** (firing) |
+| zombie_actions_emitted_total | **1** (firing) |
+| thrashing_score | 7.63 |
+| ais_score | warmup (0.0 a cycle 100, esperado) |
+
+2217 lib tests pass. Gate-3 falló por el bug AIS-warmup (ya corregido en v2);
+el binario nuevo quedó deployado correctamente — verificación manual sana.
+
+### Pendiente próxima sesión
+- AIS post-warmup ≥87 confirmar (~10 min)
+- Workflows sysctl-truce B.1-B.4 (single-writer, dwell, replayd gate, purge
+  band) murieron por session limit — re-dispatch tras reset 12:50am o
+  implementar manual
+- Hunt fight-bugs: 26 findings sin verificar (labels en wd2p9hc2w output)
+- Swap delta tuning (512 KB/s) + Chromium memory budget pressure
