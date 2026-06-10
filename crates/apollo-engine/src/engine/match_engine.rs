@@ -45,6 +45,25 @@ const FAMILY_ROOT_PATTERNS: &[&str] = &[
     "Electron",
     "Safari",
     "Firefox",
+    // Fight-hunt fix (2026-06-10): BRANDED Electron/CEF helpers carry the
+    // app's name, not "Electron" — "Code Helper (Renderer)" (VS Code),
+    // "Discord Helper", "Slack Helper", "Spotify Helper"… all ran as class
+    // Normal with allow_freeze=true, re-exposing the exact SIGSTOP-breaks-
+    // async-IPC scar that cost 3 regression cycles with Brave (26eac06).
+    // " Helper" (leading space) is the universal Chromium-embedder naming
+    // convention for renderer/GPU/utility children; over-matching is the
+    // SAFE direction (no freeze/boost — cooperative demote still allowed).
+    " Helper",
+    // Big Electron/CEF parents whose MAIN process is the IPC broker —
+    // freezing the broker orphans every child the same way.
+    "Discord",
+    "Slack",
+    "Spotify",
+    "Notion",
+    "Obsidian",
+    "Figma",
+    "WhatsApp",
+    "Signal",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +247,27 @@ mod tests {
     }
 
     // Peer-consult item #1: word-boundary arc/arcade + 2-char rejection.
+    #[test]
+    fn branded_electron_helpers_are_family_root() {
+        // Fight-hunt fix (2026-06-10): the SIGSTOP-breaks-IPC protection
+        // must cover BRANDED Electron/CEF helpers, not just literal
+        // "Electron". These were all class-Normal (freezable) before.
+        for n in [
+            "Code Helper (Renderer)",
+            "Code Helper (GPU)",
+            "Discord Helper",
+            "Slack Helper (Renderer)",
+            "Spotify Helper",
+            "Notion Helper (Renderer)",
+        ] {
+            assert!(is_family_root(n), "{n} must be Chromium-family");
+        }
+        // Non-embedder names stay Normal.
+        for n in ["rustc", "alacritty", "mds_stores", "zsh"] {
+            assert!(!is_family_root(n), "{n} must NOT be family root");
+        }
+    }
+
     #[test]
     fn word_boundary_semantics() {
         assert!(!word_boundary_contains("arcade", "arc"));
