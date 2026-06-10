@@ -46,6 +46,16 @@ pub struct PressureStats {
     /// 70% pressure system from a thrashing 70% pressure system.
     #[serde(default)]
     pub thrashing_score: f64,
+    /// Fight-hunt fix (2026-06-10): PHYSICAL memory pressure, preserved
+    /// before the daemon's per-cycle aggregation overwrites
+    /// `memory_pressure` with the EFFECTIVE value (raw + battery/thermal/
+    /// hw/llm boosts). Learning (signal_intel/Kalman/hazard) and the
+    /// maintenance purge gate must consume THIS field — purge cannot fix
+    /// thermal pressure, and models trained on boosted values learn wrong
+    /// baselines (higher on battery). 0.0 = not yet populated this cycle;
+    /// consumers fall back to `memory_pressure`.
+    #[serde(default)]
+    pub memory_pressure_raw: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -251,6 +261,9 @@ impl SystemCollector {
                 },
                 pressure: PressureStats {
                     memory_pressure: mem_pressure,
+                    // Pre-aggregation: raw == measured (the daemon overwrites memory_pressure
+                    // with the effective value each cycle; this field keeps the physical one).
+                    memory_pressure_raw: mem_pressure,
                     swap_used_bytes,
                     swap_total_bytes,
                     swap_delta_bytes_per_sec: swap_delta_bps,
@@ -352,6 +365,9 @@ impl SystemCollector {
                 },
                 pressure: PressureStats {
                     memory_pressure: mem_pressure,
+                    // Pre-aggregation: raw == measured (the daemon overwrites memory_pressure
+                    // with the effective value each cycle; this field keeps the physical one).
+                    memory_pressure_raw: mem_pressure,
                     swap_used_bytes,
                     swap_total_bytes,
                     swap_delta_bytes_per_sec: swap_delta_bps,
@@ -431,6 +447,9 @@ impl SystemCollector {
                 },
                 pressure: PressureStats {
                     memory_pressure: mem_pressure,
+                    // Pre-aggregation: raw == measured (the daemon overwrites memory_pressure
+                    // with the effective value each cycle; this field keeps the physical one).
+                    memory_pressure_raw: mem_pressure,
                     swap_used_bytes,
                     swap_total_bytes,
                     swap_delta_bytes_per_sec: swap_delta_bps,
@@ -637,6 +656,9 @@ mod tests {
             },
             pressure: PressureStats {
                 memory_pressure: 0.45,
+                // Pre-aggregation: raw == measured (the daemon overwrites memory_pressure
+                // with the effective value each cycle; this field keeps the physical one).
+                memory_pressure_raw: 0.45,
                 swap_used_bytes: 512 * 1024 * 1024,
                 swap_total_bytes: 2 * 1024 * 1024 * 1024,
                 swap_delta_bytes_per_sec: 1_000_000.0,

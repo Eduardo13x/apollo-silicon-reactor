@@ -132,11 +132,21 @@ pub fn run_signal_tick(
                 }));
             }
         }
+        // Fight-hunt fix (2026-06-10): learn from PHYSICAL pressure, not the
+        // effective (battery/thermal-boosted) value the aggregator wrote back
+        // into `memory_pressure`. Boosted inputs taught the Kalman/hazard
+        // models that "battery = high memory pressure" — false baselines.
+        // Fallback to effective when raw is unset (cold-start / tests).
+        let physical_pressure = if snapshot.pressure.memory_pressure_raw > 0.0 {
+            snapshot.pressure.memory_pressure_raw
+        } else {
+            snapshot.pressure.memory_pressure
+        };
         signal_intel.tick(
-            snapshot.pressure.memory_pressure,
+            physical_pressure,
             snapshot.pressure.swap_delta_bytes_per_sec,
             swap_ratio,
-            snapshot.pressure.memory_pressure, // compressor proxy
+            physical_pressure, // compressor proxy
             &cpu_vals,
             &mem_vals,
             dom_name,

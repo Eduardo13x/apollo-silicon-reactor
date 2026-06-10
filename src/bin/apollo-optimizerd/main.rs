@@ -2275,6 +2275,13 @@ fn main() -> anyhow::Result<()> {
                 );
                 let pressure_ram = pressure_aggregation.effective_pressure;
                 let pressure_components = pressure_aggregation.components;
+                // Fight-hunt fix (2026-06-10): preserve the PHYSICAL pressure
+                // before overwriting with the effective (boosted) value.
+                // signal_intel learning + the maintenance purge gate read the
+                // raw field — purge can't fix thermal/battery boosts, and
+                // models trained on boosted values learn battery-skewed
+                // baselines.
+                snapshot.pressure.memory_pressure_raw = snapshot.pressure.memory_pressure;
                 snapshot.pressure.memory_pressure = pressure_ram;
                 cautious_cycles_remaining = pressure_aggregation.cautious.remaining;
                 if pressure_aggregation.cautious.ended {

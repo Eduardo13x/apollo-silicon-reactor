@@ -216,7 +216,18 @@ pub(crate) fn should_fire(
     build_active: bool,
     bus_saturated: bool,
 ) -> Option<SkipReason> {
-    let p = snap.pressure.memory_pressure;
+    // Fight-hunt fix (2026-06-10): the purge gate judges PHYSICAL pressure.
+    // The 2026-05-10 design spec mandated raw ("purge addresses memory
+    // pressure only; effective includes thermal/hw/llm/battery boosts that
+    // purge cannot fix" — Skeptic verdict), but the per-cycle aggregator
+    // overwrites memory_pressure with effective BEFORE this tick runs.
+    // Fallback to effective when raw is unset (tests build snapshots
+    // without the aggregation pass).
+    let p = if snap.pressure.memory_pressure_raw > 0.0 {
+        snap.pressure.memory_pressure_raw
+    } else {
+        snap.pressure.memory_pressure
+    };
     if p < PURGE_BAND_ENTRY_LOW {
         return Some(SkipReason::PressureLow);
     }
@@ -299,6 +310,7 @@ mod tests {
                 thermal_level: "nominal".into(),
                 compressor_pressure: 0.0,
                 thrashing_score: 0.0,
+                memory_pressure_raw: 0.0,
             },
             disks: vec![],
             networks: vec![],
@@ -325,6 +337,29 @@ mod tests {
         // that was already in the safe band (eligibility carried forward).
         state.purge_band_eligible = true;
         state
+    }
+
+    #[test]
+    fn purge_gate_follows_raw_pressure_not_effective() {
+        // Fight-hunt fix (2026-06-10): effective pressure (battery/thermal
+        // boosted) reads 0.80 — old code would hard-skip (PressureSurvival).
+        // Physical pressure is 0.58 (in band) — purge is exactly what helps.
+        let state = make_ready_state();
+        let mut snap = synth_snap(0.80, 3_000_000_000, 4_000_000_000);
+        snap.pressure.memory_pressure_raw = 0.58;
+        let ctx = idle_ctx();
+        assert_eq!(
+            should_fire(&snap, &ctx, &state, false, false),
+            None,
+            "gate must judge physical pressure, not boosted effective"
+        );
+        // And the inverse: raw says crisis (0.80) even if effective were low.
+        let mut snap2 = synth_snap(0.60, 3_000_000_000, 4_000_000_000);
+        snap2.pressure.memory_pressure_raw = 0.80;
+        assert_eq!(
+            should_fire(&snap2, &ctx, &state, false, false),
+            Some(SkipReason::PressureSurvival)
+        );
     }
 
     #[test]
