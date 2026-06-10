@@ -2079,6 +2079,10 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub zombie_actions_emitted_total: u64,
 
+    /// Anti-ratchet (2026-06-10). Boost decay reverts (nice/tier restored).
+    #[serde(default)]
+    pub boost_reverts_total: u64,
+
     /// B.4 purge band split (2026-06-10). Legacy aggregate keeps the sum.
     #[serde(default)]
     pub maintenance_purge_skipped_pressure_low_total: u64,

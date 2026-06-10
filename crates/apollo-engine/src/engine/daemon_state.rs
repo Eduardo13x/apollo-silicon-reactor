@@ -276,6 +276,7 @@ impl MetricsState {
         self.metrics.cooperation_jetsam_hints_total = lf.cooperation_jetsam_hints_total;
         self.metrics.zombie_dead_weight_detected_total = lf.zombie_dead_weight_detected_total;
         self.metrics.zombie_actions_emitted_total = lf.zombie_actions_emitted_total;
+        self.metrics.boost_reverts_total = lf.boost_reverts_total;
         self.metrics.maintenance_purge_skipped_pressure_low_total =
             lf.maintenance_purge_skipped_pressure_low_total;
         self.metrics.maintenance_purge_skipped_pressure_survival_total =

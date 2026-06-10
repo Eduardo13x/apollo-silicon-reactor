@@ -597,6 +597,10 @@ pub struct LockFreeMetrics {
     /// weight: jetsam idle-band hint or non-aggressive throttle. Never
     /// kills — kernel keeps kill authority.
     pub zombie_actions_emitted_total: AtomicU64,
+    /// Anti-ratchet (2026-06-10). Boost side-effects (nice -10 + Foreground
+    /// tier) reverted by the periodic decay sweep after BOOST_TTL with the
+    /// process no longer foreground. Producer: main-loop boost-decay block.
+    pub boost_reverts_total: AtomicU64,
 
     /// B.4 purge band split (2026-06-10). Pressure-skip disambiguation:
     /// the legacy aggregate maintenance_purge_skipped_pressure_total keeps
@@ -854,6 +858,7 @@ impl LockFreeMetrics {
             cooperation_jetsam_hints_total: AtomicU64::new(0),
             zombie_dead_weight_detected_total: AtomicU64::new(0),
             zombie_actions_emitted_total: AtomicU64::new(0),
+            boost_reverts_total: AtomicU64::new(0),
             maintenance_purge_skipped_pressure_low_total: AtomicU64::new(0),
             maintenance_purge_skipped_pressure_survival_total: AtomicU64::new(0),
             maintenance_purge_skipped_rising_edge_total: AtomicU64::new(0),
@@ -1357,6 +1362,7 @@ impl LockFreeMetrics {
             zombie_actions_emitted_total: self
                 .zombie_actions_emitted_total
                 .load(Ordering::Relaxed),
+            boost_reverts_total: self.boost_reverts_total.load(Ordering::Relaxed),
             maintenance_purge_skipped_pressure_low_total: self
                 .maintenance_purge_skipped_pressure_low_total
                 .load(Ordering::Relaxed),
@@ -1749,6 +1755,12 @@ impl LockFreeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Anti-ratchet (2026-06-10). Boost decay revert applied.
+    #[inline(always)]
+    pub fn inc_boost_revert(&self) {
+        self.boost_reverts_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// B.2 replayd gate (2026-06-09). Bumped by the daemon composition
     /// point ONLY when the screen-capture probe is the deciding signal
     /// (audio full-duplex gate false, screen-capture scan true). Sustained
@@ -2015,6 +2027,8 @@ pub struct MetricsSnapshot {
     pub zombie_dead_weight_detected_total: u64,
     /// B.6 gap fix (2026-06-10). Conservative zombie actions emitted.
     pub zombie_actions_emitted_total: u64,
+    /// Anti-ratchet (2026-06-10). Boost decay reverts applied.
+    pub boost_reverts_total: u64,
     /// B.4 purge band split (2026-06-10).
     pub maintenance_purge_skipped_pressure_low_total: u64,
     pub maintenance_purge_skipped_pressure_survival_total: u64,

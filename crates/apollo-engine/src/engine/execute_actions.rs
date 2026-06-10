@@ -504,6 +504,13 @@ pub fn execute_actions(
                             apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Interactive);
                         }
                         let _ = set_nice(*pid, -10);
+                        // Anti-ratchet (2026-06-10): enroll in the boost
+                        // ledger so the periodic sweep reverts nice/tier
+                        // once the process stops qualifying. Without this,
+                        // -10 persisted forever and propagated to children
+                        // via fork inheritance (observed: user's shell and
+                        // all its children at -10).
+                        crate::engine::boost_ledger::record_boost(*pid, *start_sec);
                     }
                     out.boosts_applied += 1;
                     // FIX-4-v2 (2026-06-07): phantom-enrollment guard.
