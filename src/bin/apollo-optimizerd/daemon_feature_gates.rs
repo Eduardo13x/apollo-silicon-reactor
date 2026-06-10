@@ -319,11 +319,13 @@ pub fn apply_app_nap_scheduling(
         // aren't also wake-storm offenders.
         let storm_pids: HashSet<u32> = storms.iter().map(|s| s.pid).collect();
         let mut qos = state.mach_qos.lock_recover();
+        // Fight-hunt fix (2026-06-10): iterate the nap set itself, not
+        // current_tier_keys() — napped pids without a tier entry were
+        // invisible to this sweep and stayed App-Napped forever.
         let app_napped: Vec<u32> = qos
-            .current_tier_keys()
-            .iter()
-            .filter(|(pid, _)| qos.is_app_napped(*pid) && !storm_pids.contains(pid))
-            .map(|(pid, _)| *pid)
+            .app_napped_pids()
+            .into_iter()
+            .filter(|pid| !storm_pids.contains(pid))
             .collect();
         for pid in app_napped {
             qos.set_app_nap(pid, false);

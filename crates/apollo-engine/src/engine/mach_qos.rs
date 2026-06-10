@@ -581,6 +581,15 @@ impl MachQoSManager {
         self.current_tier.iter().map(|(k, (t, _))| (*k, *t)).collect()
     }
 
+    /// All PIDs currently App-Napped by Apollo. Fight-hunt fix
+    /// (2026-06-10): the release sweep previously iterated
+    /// `current_tier_keys()` and filtered by nap state — but `app_napped`
+    /// is an independent set; a napped pid with no tier entry was
+    /// invisible to the sweep and stayed throttled forever.
+    pub fn app_napped_pids(&self) -> Vec<u32> {
+        self.app_napped.iter().copied().collect()
+    }
+
     /// Count of processes currently pushed to E-Cores.
     pub fn background_count(&self) -> usize {
         self.current_tier
@@ -1667,6 +1676,20 @@ pub fn batch_mach_port_counts() -> Vec<(i32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn app_napped_pids_visible_without_tier_entry() {
+        // Fight-hunt fix (2026-06-10): a napped pid with NO current_tier
+        // entry must still be visible to the release sweep.
+        let mut mgr = MachQoSManager::new();
+        let pid = std::process::id();
+        mgr.app_napped.insert(pid);
+        assert!(!mgr.current_tier.contains_key(&pid));
+        assert!(
+            mgr.app_napped_pids().contains(&pid),
+            "nap set must be sweepable independently of tier cache"
+        );
+    }
+
     #[test]
     fn current_tier_cache_ttl_falls_through_when_stale() {
         // Fight-hunt fix (2026-06-10): a fresh same-tier hit skips the
