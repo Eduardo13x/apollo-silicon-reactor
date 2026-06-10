@@ -944,7 +944,7 @@ fn main() -> anyhow::Result<()> {
             // On the next cycle, if foreground != predicted, count as a miss.
             // [Sutton & Barto 1998 §6 — temporal difference: credit assignment requires
             // knowing when a prediction was wrong, not just when it was right.]
-            let mut last_markov_prethaw: Option<(String, u64)> = None;
+            let mut last_markov_prethaw: Option<(String, u64, u32, i32)> = None;
             let mut markov_hit_count: u32 = 0;
             let mut markov_miss_count: u32 = 0;
             // Restored pending trial skill from the previous run (if daemon crashed mid-trial).

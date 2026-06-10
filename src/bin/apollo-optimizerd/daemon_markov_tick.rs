@@ -56,7 +56,7 @@ pub fn run_markov_tick(
     cycle_count: u64,
     focus_markov: &mut FocusMarkov,
     temporal_predictor: &mut TemporalPredictor,
-    last_markov_prethaw: &mut Option<(String, u64)>,
+    last_markov_prethaw: &mut Option<(String, u64, u32, i32)>,
     markov_hit_count: &mut u32,
     markov_miss_count: &mut u32,
     state: &SharedState,
@@ -66,7 +66,7 @@ pub fn run_markov_tick(
 ) -> MarkovTickOutput {
     // ── FocusMarkov miss check ───────────────────────────────────────────────
     // [Sutton & Barto 1998 §6 — temporal difference credit assignment]
-    if let Some((ref predicted, pred_cycle)) = *last_markov_prethaw {
+    if let Some((ref predicted, pred_cycle, warmed_pid, prior_jetsam)) = *last_markov_prethaw {
         let cycles_elapsed = cycle_count.saturating_sub(pred_cycle);
         if cycles_elapsed >= 1 {
             let hit = foreground_app
@@ -79,6 +79,24 @@ pub fn run_markov_tick(
                 *markov_hit_count += 1;
             } else {
                 *markov_miss_count += 1;
+                // Anti-ratchet (2026-06-10 fight-hunt): a missed prediction
+                // left the pre-warmed process at jetsam FOREGROUND (immune
+                // to kernel kills) + Mach Foreground tier FOREVER. Revert
+                // both on miss — restore the jetsam priority we captured
+                // before the pre-warm and drop the tier back to Normal.
+                // (On HIT runningboard owns the app's lifecycle priorities;
+                // no Apollo cleanup needed.)
+                if let Some(restore) = prewarm_jetsam_restore(prior_jetsam) {
+                    let _ = jetsam_control::set_priority(warmed_pid, restore);
+                }
+                let mut qos = state.mach_qos.lock_recover();
+                qos.set_tier(warmed_pid, SchedulingTier::Normal);
+                drop(qos);
+                tracing::debug!(
+                    pid = warmed_pid,
+                    predicted = %predicted,
+                    "markov-miss: reverted pre-warm jetsam/tier"
+                );
             }
             *last_markov_prethaw = None;
             let total = *markov_hit_count + *markov_miss_count;
@@ -115,6 +133,10 @@ pub fn run_markov_tick(
             drop(frozen_guard);
 
             if pred.probability >= 0.50 {
+                // Anti-ratchet: capture the prior jetsam priority so a missed
+                // prediction can restore it (-1 sentinel = unreadable, skip
+                // the jetsam revert but still drop the tier).
+                let prior_jetsam = jetsam_control::get_priority(pid).unwrap_or(-1);
                 let _ = jetsam_control::set_priority(pid, jetsam_control::priority::FOREGROUND);
                 // Cable C: Proactive QoS — route predicted app to P-cores BEFORE switch.
                 {
@@ -122,7 +144,8 @@ pub fn run_markov_tick(
                     qos.set_tier(pid, SchedulingTier::Foreground);
                 }
                 cache_warmer.warm_pid(pid);
-                *last_markov_prethaw = Some((pred.app_name.clone(), cycle_count));
+                *last_markov_prethaw =
+                    Some((pred.app_name.clone(), cycle_count, pid, prior_jetsam));
             }
         }
     }
@@ -218,5 +241,28 @@ pub fn run_markov_tick(
     MarkovTickOutput {
         temporal_hour,
         temporal_weekday,
+    }
+}
+
+/// Anti-ratchet (2026-06-10): what jetsam priority to restore after a
+/// missed pre-warm prediction. `-1` is the "prior unreadable" sentinel —
+/// in that case we skip the jetsam revert (writing a guessed band could
+/// fight runningboard) and rely on the tier drop alone.
+fn prewarm_jetsam_restore(prior_jetsam: i32) -> Option<i32> {
+    (prior_jetsam >= 0).then_some(prior_jetsam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prewarm_restore_sentinel_semantics() {
+        // Unreadable prior → no jetsam write on miss.
+        assert_eq!(prewarm_jetsam_restore(-1), None);
+        // Captured priors restore verbatim, including IDLE (0).
+        assert_eq!(prewarm_jetsam_restore(0), Some(0));
+        assert_eq!(prewarm_jetsam_restore(2), Some(2));
+        assert_eq!(prewarm_jetsam_restore(9), Some(9));
     }
 }
