@@ -777,6 +777,19 @@ pub fn decide_actions(
                 continue;
             }
 
+            // B.6 macOS cooperation: when the kernel is already handling pressure
+            // (compressor active, swap growing), Apollo steps back from throttle.
+            // Throttling adds latency to processes already under kernel pressure.
+            let macos_coop = crate::engine::safety::MacOSCooperationMode::from_pressure_signals(
+                snapshot.pressure.compressor_pressure,
+                snapshot.pressure.swap_delta_bytes_per_sec,
+                0,
+            );
+            if macos_coop.should_step_back() {
+                low_value_skipped.push(format!("macos-handling-skip:{}", name));
+                continue;
+            }
+
             let aggressive = match effective_context {
                 InteractiveContext::ThermalConstrained => true,
                 InteractiveContext::BackgroundPressure => {
@@ -1225,9 +1238,27 @@ pub fn decide_actions(
     );
     let gate_offset = user_ctx.pressure_gate_offset();
 
+
+    // macOS cooperation: when the kernel is already handling memory pressure
+    // (compressor active, swap growing, jetsam fired), Apollo should step back
+    // from direct interventions and let macOS manage. Apollo supplements with
+    // hints (jetsam tier, purgeable hints) rather than overriding the kernel.
+    let cooperation = crate::engine::safety::MacOSCooperationMode::from_pressure_signals(
+        snapshot.pressure.compressor_pressure,
+        snapshot.pressure.swap_delta_bytes_per_sec,
+        0, // jetsam_kill_count not available in this scope
+    );
+    let macos_is_handling = cooperation.should_step_back();
     match context {
         InteractiveContext::BackgroundPressure | InteractiveContext::ThermalConstrained => {
             // Dev-first: no-freeze by default. Only consider freeze under extreme memory pressure
+
+            // B.6 macOS cooperation: when the kernel is already handling pressure,
+            // Apollo steps back from freeze/throttle and focuses on hints only.
+            if macos_is_handling {
+                // Still emit jetsam tier hints and purgeable hints, but skip freeze/throttle.
+                // Apollo is a cooperator, not a director.
+            }
             // AND swap growth, and never for protected/critical workloads.
             // Secondary gate: on memory-constrained systems (≥1.5 GB swap in use) the classic
             // swap_delta trigger fires too late — RAM is already thrashing before delta rises.
@@ -1390,6 +1421,14 @@ pub fn decide_actions(
             }
             let mut extreme_freeze_ok =
                 (gate_a || gate_b || gate_c || gate_d || gate_e) && !freeze_skip_by_user;
+
+            // B.6 macOS cooperation: when the kernel is already handling memory
+            // pressure (compressor active, swap growing), Apollo steps back from
+            // direct freeze interventions. The kernel is already compressing pages —
+            // Apollo freezing adds latency without reducing compressor load.
+            if macos_is_handling {
+                extreme_freeze_ok = false;
+            }
 
             // Phase C SCORER-OVERRIDE (Sprint 11 finale, 2026-05-16):
             // asymmetric partial cutover. When the gate tower has just

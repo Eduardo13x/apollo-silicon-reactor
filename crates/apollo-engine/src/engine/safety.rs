@@ -422,6 +422,96 @@ pub fn can_purge_hint(name: &str) -> bool {
     InterventionPolicy::for_name(name).allow_purge_hint
 }
 
+// ── macOS Cooperation Layer ────────────────────────────────────────────────────
+
+/// How aggressively Apollo should act, based on what macOS is already doing.
+///
+/// Apollo is a **cooperator**, not a director. It observes what macOS kernel
+/// is already handling (compressor, jetsam, purgeable memory) and supplements
+/// with hints — it does not override or duplicate what the kernel is doing.
+///
+/// Design principle: when macOS is already acting, Apollo steps back and
+/// helps via hints rather than taking direct intervention actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacOSCooperationMode {
+    /// macOS memory subsystem is calm. Apollo may act normally.
+    Normal,
+    /// macOS compressor is actively compressing pages. Apollo should step back
+    /// from freeze/throttle and focus on purgeable hints and jetsam tier hints.
+    /// The compressor is already handling memory compression — Apollo would be
+    /// duplicating work and causing extra latency.
+    CompressorActive,
+    /// macOS is actively swapping to disk. Apollo should be conservative —
+    /// only send jetsam tier hints and purgeable hints. Heavy interventions
+    /// will only add more I/O pressure to an already stressed system.
+    SwapActive,
+    /// macOS jetsam has fired (processes killed). Apollo should be in
+    /// observation mode — the kernel just made hard decisions, Apollo should
+    /// not override them. Just track and learn.
+    JetsamFired,
+}
+
+impl MacOSCooperationMode {
+    /// Determine the cooperation mode from system pressure signals.
+    ///
+    /// Priority: JetsamFired > CompressorActive > SwapActive > Normal
+    ///
+    /// When jetsam has fired, Apollo must not act — the kernel just made
+    /// hard decisions. When compressor is active, Apollo should step back
+    /// from freeze/throttle since macOS is already compressing.
+    pub fn from_pressure_signals(
+        compressor_pressure: f64,
+        swap_delta_bytes_per_sec: f64,
+        jetsam_kill_count: u32,
+    ) -> Self {
+        if jetsam_kill_count > 0 {
+            return MacOSCooperationMode::JetsamFired;
+        }
+        if compressor_pressure > 0.50 {
+            return MacOSCooperationMode::CompressorActive;
+        }
+        if swap_delta_bytes_per_sec > 524_288.0 {
+            return MacOSCooperationMode::SwapActive;
+        }
+        MacOSCooperationMode::Normal
+    }
+
+    /// Returns true if Apollo should step back from direct interventions
+    /// (freeze, hard-throttle) and focus only on cooperative hints.
+    ///
+    /// When macOS is already handling memory pressure, Apollo adding more
+    /// interventions creates contention and can make things worse.
+    pub fn should_step_back(self) -> bool {
+        matches!(
+            self,
+            MacOSCooperationMode::CompressorActive
+                | MacOSCooperationMode::SwapActive
+                | MacOSCooperationMode::JetsamFired
+        )
+    }
+
+    /// Returns true if Apollo should emit jetsam tier hints (mark process
+    /// as sacrificable) rather than direct interventions.
+    pub fn should_emit_jetsam_hints(self) -> bool {
+        matches!(
+            self,
+            MacOSCooperationMode::CompressorActive
+                | MacOSCooperationMode::SwapActive
+                | MacOSCooperationMode::JetsamFired
+        )
+    }
+}
+
+/// Returns true if Apollo should step back from direct interventions
+/// (freeze, hard-throttle) because macOS is already handling memory pressure.
+///
+/// When the compressor is active or macOS is swapping, Apollo should not
+/// add more pressure — just send hints and let the kernel manage.
+pub fn apollo_should_step_back(compressor_pressure: f64, swap_delta_bps: f64) -> bool {
+    MacOSCooperationMode::from_pressure_signals(compressor_pressure, swap_delta_bps, 0)
+        .should_step_back()
+}
+
 /// Single truth point for name-based process protection.
 ///
 /// Returns `true` if the process should NEVER receive a Freeze, Throttle, or Kill
