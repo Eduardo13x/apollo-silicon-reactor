@@ -276,6 +276,43 @@ pub fn run_memory_budget(
             );
         }
     }
+
+    // Fight-hunt fix (2026-06-10): clear limits for RECOVERED processes.
+    // The loop above only touches over-budget pids; a process that shrank
+    // back under budget kept its kernel memlimit forever. When its
+    // legitimate workload later grew (user opens a big project), the stale
+    // inactive limit had jetsam kill it in the background (EXC_RESOURCE) —
+    // mysterious app deaths. 0/0 = unlimited (kernel default semantics).
+    let over_budget_pids: std::collections::HashSet<u32> = budgets
+        .iter()
+        .filter(|b| b.over_budget)
+        .map(|b| b.pid)
+        .collect();
+    let recovered = recovered_pids(&budget_state.last_applied_limits, &over_budget_pids);
+    for pid in recovered {
+        if jetsam_control::set_memlimit(pid, 0, 0).is_ok() {
+            budget_state.last_applied_limits.remove(&pid);
+            tracing::info!(
+                target: "apollo.memory_budget",
+                pid,
+                "memlimit_cleared_recovered"
+            );
+        }
+    }
+}
+
+/// Fight-hunt fix (2026-06-10): pids holding a kernel memlimit that are no
+/// longer over budget this evaluation — their limit must be cleared or a
+/// later legitimate growth gets jetsam-killed in the background.
+fn recovered_pids(
+    last_applied: &std::collections::HashMap<u32, u64>,
+    over_budget: &std::collections::HashSet<u32>,
+) -> Vec<u32> {
+    last_applied
+        .keys()
+        .copied()
+        .filter(|pid| !over_budget.contains(pid))
+        .collect()
 }
 
 #[cfg(test)]
@@ -388,6 +425,18 @@ mod tests {
             config_path: PathBuf::from("/tmp/apollo_mock_config"),
             user_profile_path: PathBuf::from("/tmp/apollo_mock_user_profile"),
         }
+    }
+
+    #[test]
+    fn recovered_pids_excludes_still_over_budget() {
+        use std::collections::{HashMap, HashSet};
+        let mut applied = HashMap::new();
+        applied.insert(100u32, 600u64); // recovered
+        applied.insert(200u32, 800u64); // still over budget
+        let over: HashSet<u32> = [200u32].into_iter().collect();
+        let rec = recovered_pids(&applied, &over);
+        assert!(rec.contains(&100), "shrunk process must be cleared");
+        assert!(!rec.contains(&200), "still-over-budget keeps its limit");
     }
 
     #[test]
