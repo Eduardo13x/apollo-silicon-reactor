@@ -97,6 +97,11 @@ pub mod mach_sys {
     // Real-time thread scheduling
     pub const THREAD_TIME_CONSTRAINT_POLICY: i32 = 2;
     pub const THREAD_TIME_CONSTRAINT_POLICY_COUNT: u32 = 4;
+    /// mach/thread_policy.h: THREAD_EXTENDED_POLICY (flavor 1) with
+    /// timeshare=1 is the canonical "leave the realtime band, return to
+    /// timeshare scheduling" revert (used by Chromium/WebKit audio code).
+    pub const THREAD_EXTENDED_POLICY: i32 = 1;
+    pub const THREAD_EXTENDED_POLICY_COUNT: u32 = 1;
 
     // Thread info flavors
     pub const THREAD_BASIC_INFO: u32 = 3;
@@ -184,6 +189,11 @@ mod ffi {
     /// thread_time_constraint_policy for real-time UI thread scheduling.
     /// COUNT = 4 (4 × uint32_t).
     #[repr(C)]
+    #[repr(C)]
+    pub struct ThreadExtendedPolicy {
+        pub timeshare: u32, // boolean_t
+    }
+
     pub struct ThreadTimeConstraintPolicy {
         pub period: u32,              // nanoseconds between periods
         pub computation: u32,         // nanoseconds of CPU per period
@@ -1291,19 +1301,20 @@ impl MachQoSManager {
                 return false;
             }
 
-            // Clear RT constraint on thread 0: zero period resets to default.
+            // Fight-hunt fix (2026-06-10): the old body wrote a zero-period
+            // TIME_CONSTRAINT policy as the "reset" — XNU rejects degenerate
+            // constraint params (KERN_INVALID_ARGUMENT), so the clear FAILED
+            // silently and the thread stayed in the realtime band after the
+            // app lost focus. The de-focused app then competed in RT against
+            // the newly-focused app's UI thread — visible jank on every app
+            // switch. Canonical revert: THREAD_EXTENDED_POLICY timeshare=1.
             let main_thread = *thread_list;
-            let policy = ThreadTimeConstraintPolicy {
-                period: 0,
-                computation: 0,
-                constraint: 0,
-                preemptible: 1,
-            };
+            let policy = ThreadExtendedPolicy { timeshare: 1 };
             let kr3 = thread_policy_set(
                 main_thread,
-                THREAD_TIME_CONSTRAINT_POLICY,
+                THREAD_EXTENDED_POLICY,
                 &policy as *const _ as *const std::ffi::c_void,
-                THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+                THREAD_EXTENDED_POLICY_COUNT,
             );
 
             for i in 0..thread_count {
@@ -1676,6 +1687,16 @@ pub fn batch_mach_port_counts() -> Vec<(i32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extended_policy_abi_contract() {
+        // Fight-hunt fix (2026-06-10): clear_realtime_boost reverts via
+        // THREAD_EXTENDED_POLICY timeshare=1. Pin the ABI so a refactor
+        // can't silently reintroduce the zero-period TIME_CONSTRAINT
+        // "reset" that XNU rejects (thread stayed RT after focus loss).
+        assert_eq!(super::mach_sys::THREAD_EXTENDED_POLICY, 1);
+        assert_eq!(super::mach_sys::THREAD_EXTENDED_POLICY_COUNT, 1);
+    }
+
     #[test]
     fn app_napped_pids_visible_without_tier_entry() {
         // Fight-hunt fix (2026-06-10): a napped pid with NO current_tier
