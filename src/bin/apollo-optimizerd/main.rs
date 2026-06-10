@@ -3781,6 +3781,8 @@ fn main() -> anyhow::Result<()> {
                         acc.view(),
                         memory_budget.recovering_from_critical(),
                         &mut recently_applied,
+                        user_context.call_in_progress,
+                        user_context.audio_active,
                     );
                     acc.extend_raw(
                         hint_new,

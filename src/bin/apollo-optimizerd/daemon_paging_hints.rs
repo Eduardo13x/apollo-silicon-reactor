@@ -43,8 +43,18 @@ pub fn run_paging_hints(
     current_actions: &[RootAction],
     recovering_from_critical: bool,
     recently_applied: &mut RecentlyApplied,
+    call_in_progress: bool,
+    audio_active: bool,
 ) -> Vec<RootAction> {
     let mut new_actions: Vec<RootAction> = Vec::new();
+
+    // ── Media safety guard ──────────────────────────────────────────────────
+    // Never send paging hints during calls or audio playback — purging
+    // audio buffers causes glitches. [Jiang & Zhang 2005] proactive beats
+    // reactive, but not at the cost of audio dropouts.
+    if call_in_progress || audio_active {
+        return new_actions;
+    }
 
     // ── Direct pressure hints ────────────────────────────────────────────────
     // When pressure > 0.60, hint top 3 background memory consumers to release
