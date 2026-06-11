@@ -309,6 +309,7 @@ impl ProcessInterventionClass {
 ///
 /// # Example
 /// ```
+/// use apollo_engine::engine::safety::{InterventionPolicy, ProcessInterventionClass};
 /// let policy = InterventionPolicy::for_class(ProcessInterventionClass::ChromiumFamily);
 /// assert!(!policy.allow_freeze);
 /// assert!(!policy.allow_boost);
