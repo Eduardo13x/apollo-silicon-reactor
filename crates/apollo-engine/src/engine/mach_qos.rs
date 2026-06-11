@@ -1177,10 +1177,25 @@ impl MachQoSManager {
             mach_port_deallocate(mach_task_self(), task_port);
 
             if kr2 == KERN_SUCCESS {
+                // EffectLedger phase-2: this is the single chokepoint where
+                // App-Nap suppression flips, so register/drop the TTL-bounded
+                // reversal backstop here. reconcile_global re-calls
+                // set_app_nap(pid,false) for any entry that outlives its TTL
+                // (e.g. the daemon restarted while a pid stayed napped), and
+                // forget_global on release keeps the two paths from racing.
+                let effect = crate::engine::effect_ledger::AppliedEffect::AppNap { pid };
                 if suppressed {
                     self.app_napped.insert(pid);
+                    let (start_sec, _) = crate::engine::daemon_helpers::pid_start_time(pid);
+                    crate::engine::effect_ledger::record_global(
+                        effect,
+                        crate::engine::effect_ledger::DEFAULT_TTL,
+                        start_sec,
+                        "wake-storm/llm: app-nap suppression",
+                    );
                 } else {
                     self.app_napped.remove(&pid);
+                    crate::engine::effect_ledger::forget_global(&effect);
                 }
                 true
             } else {

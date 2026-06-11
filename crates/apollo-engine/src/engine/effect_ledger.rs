@@ -386,6 +386,45 @@ mod tests {
         assert_eq!(l.len(), 2, "Memlimit and Nice for same pid are distinct keys");
     }
 
+    /// Strangler-fig phase-2 (cont.): App-Nap and the thermal E-core
+    /// migration (MachTier / DarwinBg) now register a TTL backstop via the
+    /// same chokepoints (mach_qos::set_app_nap, thermal_interrupt::
+    /// migrate_to_ecores). Prove each variant round-trips — record →
+    /// drain (reconcile slow path) → gone, and record → forget (the explicit
+    /// per-cycle release / thermal-clear fast path) → gone. A miss leaks an
+    /// App-Nap suppression or an E-core demotion across a daemon restart.
+    #[test]
+    fn appnap_and_thermal_migration_round_trip() {
+        let mut l = EffectLedger::new();
+        let nap = AppliedEffect::AppNap { pid: 901_011 };
+        let tier = AppliedEffect::MachTier { pid: 901_011 };
+        let bg = AppliedEffect::DarwinBg { pid: 901_012 };
+        assert_eq!(nap.pid(), 901_011);
+
+        // Slow path: zero-TTL record drains for the reconcile undo.
+        l.record(nap, Duration::from_secs(0), 77, "wake-storm/llm: app-nap suppression");
+        let drained = l.drain_expired(None);
+        assert_eq!(drained.len(), 1, "expired app-nap drains for release");
+        assert!(matches!(drained[0].effect, AppliedEffect::AppNap { pid: 901_011 }));
+        assert!(l.is_empty(), "drained entry removed — no double release");
+
+        // Fast path: record then forget (set_app_nap(false) / thermal recover).
+        l.record(nap, DEFAULT_TTL, 77, "x");
+        l.forget(&nap);
+        assert!(l.is_empty(), "forget drops app-nap without a second release");
+
+        // App-Nap and a thermal MachTier demotion of the SAME pid are
+        // distinct ledger keys (different effect kinds) — both must survive.
+        l.record(nap, DEFAULT_TTL, 77, "nap");
+        l.record(tier, DEFAULT_TTL, 77, "thermal: E-core migration");
+        l.record(bg, DEFAULT_TTL, 88, "thermal: E-core migration");
+        assert_eq!(l.len(), 3, "AppNap + MachTier (same pid) + DarwinBg are distinct");
+        // Thermal recover() forgets BOTH possible migration kinds per pid.
+        l.forget(&tier);
+        l.forget(&AppliedEffect::DarwinBg { pid: 901_011 }); // no-op: absent
+        assert_eq!(l.len(), 2, "MachTier dropped; AppNap + the other DarwinBg remain");
+    }
+
     /// Silent-telemetry-death guard: the reconcile undo bumps
     /// `effect_ledger_reverts_total`, mirrored onto RuntimeMetrics with
     /// `#[serde(default)]`. Prove the counter survives a JSON round trip from

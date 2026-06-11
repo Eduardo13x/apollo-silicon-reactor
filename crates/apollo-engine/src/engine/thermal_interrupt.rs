@@ -740,8 +740,9 @@ fn migrate_to_ecores(
             continue;
         }
         // Phase 2: direct Mach syscall for E-core migration.
-        if let Some(ref mut mgr) = qos_guard {
+        let applied_effect = if let Some(ref mut mgr) = qos_guard {
             mgr.set_tier(pid_u32, SchedulingTier::Background);
+            crate::engine::effect_ledger::AppliedEffect::MachTier { pid: pid_u32 }
         } else {
             // Fallback: PRIO_DARWIN_BG (turnstile-compatible background QoS).
             // Do NOT use PRIO_PROCESS+nice=20 — that breaks the Mach
@@ -750,12 +751,26 @@ fn migrate_to_ecores(
             unsafe {
                 libc::setpriority(PRIO_DARWIN_BG, pid_u32, 1);
             }
-        }
-        // Anti-ratchet: remember the demotion so recover() can undo it.
+            crate::engine::effect_ledger::AppliedEffect::DarwinBg { pid: pid_u32 }
+        };
+        // Anti-ratchet: remember the demotion so recover() can undo it
+        // (fast, explicit thermal-clear path).
         state
             .interrupt_migrated_pids
             .lock_recover()
             .insert(pid_u32);
+        // EffectLedger phase-2: ALSO register a TTL-bounded backstop so a
+        // daemon restart — or a thermal-clear that never fires — still gets
+        // this migration reverted by reconcile_global. The bespoke set above
+        // remains the source of truth for recover(); recover() forget_global's
+        // the matching entry on drain so the two paths never double-undo.
+        let (start_sec, _) = crate::engine::daemon_helpers::pid_start_time(pid_u32);
+        crate::engine::effect_ledger::record_global(
+            applied_effect,
+            crate::engine::effect_ledger::DEFAULT_TTL,
+            start_sec,
+            "thermal: E-core migration",
+        );
         migrated += 1;
     }
 
@@ -954,6 +969,15 @@ fn recover(
                 unsafe {
                     libc::setpriority(PRIO_DARWIN_BG, *pid, 0);
                 }
+                // EffectLedger phase-2: explicit thermal-clear reverted this
+                // pid — drop its TTL backstop (both possible kinds; forget is a
+                // no-op when absent) so reconcile_global never double-undoes.
+                crate::engine::effect_ledger::forget_global(
+                    &crate::engine::effect_ledger::AppliedEffect::MachTier { pid: *pid },
+                );
+                crate::engine::effect_ledger::forget_global(
+                    &crate::engine::effect_ledger::AppliedEffect::DarwinBg { pid: *pid },
+                );
             }
             tracing::info!(
                 count = migrated.len(),
