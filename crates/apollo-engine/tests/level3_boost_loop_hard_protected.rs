@@ -91,7 +91,6 @@ fn ctx_under_pressure(level: ProtectionLevel) -> ActionContext {
         pressure: 0.74,
         swap_gb: 2.5,
         thrashing_score: 6_000.0,
-        memory_pressure_raw: 0.0,
         p_oom_30s: Some(0.40),
         p_jank_60s: Some(0.25),
         has_sleep_assertion: false,
