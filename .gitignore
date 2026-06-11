@@ -12,3 +12,9 @@ benchmarks/coremark/
 autoresearch/**/*.log
 autoresearch/**/*-mockup.md
 policy_clean.json
+
+# Evolve loop TSV logs (transient)
+evolve/
+.DS_Store
+librust_out.rlib
+.codex/
