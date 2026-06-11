@@ -2083,6 +2083,10 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub boost_reverts_total: u64,
 
+    /// Evolve iter-3 (2026-06-10). EffectLedger unified anti-ratchet reverts.
+    #[serde(default)]
+    pub effect_ledger_reverts_total: u64,
+
     /// B.4 purge band split (2026-06-10). Legacy aggregate keeps the sum.
     #[serde(default)]
     pub maintenance_purge_skipped_pressure_low_total: u64,

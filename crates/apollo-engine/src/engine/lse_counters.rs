@@ -601,6 +601,9 @@ pub struct LockFreeMetrics {
     /// tier) reverted by the periodic decay sweep after BOOST_TTL with the
     /// process no longer foreground. Producer: main-loop boost-decay block.
     pub boost_reverts_total: AtomicU64,
+    /// Evolve iter-3 (2026-06-10). EffectLedger reconcile reverted an
+    /// expired kernel mutation (the unified anti-ratchet chokepoint).
+    pub effect_ledger_reverts_total: AtomicU64,
 
     /// B.4 purge band split (2026-06-10). Pressure-skip disambiguation:
     /// the legacy aggregate maintenance_purge_skipped_pressure_total keeps
@@ -859,6 +862,7 @@ impl LockFreeMetrics {
             zombie_dead_weight_detected_total: AtomicU64::new(0),
             zombie_actions_emitted_total: AtomicU64::new(0),
             boost_reverts_total: AtomicU64::new(0),
+            effect_ledger_reverts_total: AtomicU64::new(0),
             maintenance_purge_skipped_pressure_low_total: AtomicU64::new(0),
             maintenance_purge_skipped_pressure_survival_total: AtomicU64::new(0),
             maintenance_purge_skipped_rising_edge_total: AtomicU64::new(0),
@@ -1363,6 +1367,9 @@ impl LockFreeMetrics {
                 .zombie_actions_emitted_total
                 .load(Ordering::Relaxed),
             boost_reverts_total: self.boost_reverts_total.load(Ordering::Relaxed),
+            effect_ledger_reverts_total: self
+                .effect_ledger_reverts_total
+                .load(Ordering::Relaxed),
             maintenance_purge_skipped_pressure_low_total: self
                 .maintenance_purge_skipped_pressure_low_total
                 .load(Ordering::Relaxed),
@@ -1761,6 +1768,13 @@ impl LockFreeMetrics {
         self.boost_reverts_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Evolve iter-3 (2026-06-10). EffectLedger reconcile revert.
+    #[inline(always)]
+    pub fn inc_effect_ledger_revert(&self) {
+        self.effect_ledger_reverts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// B.2 replayd gate (2026-06-09). Bumped by the daemon composition
     /// point ONLY when the screen-capture probe is the deciding signal
     /// (audio full-duplex gate false, screen-capture scan true). Sustained
@@ -2029,6 +2043,8 @@ pub struct MetricsSnapshot {
     pub zombie_actions_emitted_total: u64,
     /// Anti-ratchet (2026-06-10). Boost decay reverts applied.
     pub boost_reverts_total: u64,
+    /// Evolve iter-3 (2026-06-10). EffectLedger unified reverts.
+    pub effect_ledger_reverts_total: u64,
     /// B.4 purge band split (2026-06-10).
     pub maintenance_purge_skipped_pressure_low_total: u64,
     pub maintenance_purge_skipped_pressure_survival_total: u64,
