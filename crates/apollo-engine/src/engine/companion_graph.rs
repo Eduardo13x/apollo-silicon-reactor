@@ -289,14 +289,15 @@ impl CompanionGraph {
     /// pair-loop is at most 64×63=4032 iterations; the cap-at-100 short-
     /// circuit prevents pathological emission. Safe to call per-cycle.
     ///
-    /// # Wiring (TODO — `OPENS: 1`)
+    /// # Wiring (WIRED — Sprint 9, 2026-05-16)
     ///
-    /// Caller is NOT wired in this commit. The intended call site is the
-    /// daemon main-loop "reason" stage (see
-    /// `apollo-optimizerd/src/main.rs` cycle layout — after coalition
-    /// enrichment), passing the live coalition_id set. Until wired the
-    /// counter [`crate::engine::lse_counters::LockFreeMetrics::companion_cross_group_inferences_total`]
-    /// stays at 0.
+    /// Caller is the daemon main-loop CompanionGraph observation stage in
+    /// `apollo-optimizerd/src/main.rs` (after `observe_cycle`, gated by the
+    /// Sprint 13 pressure-router). It passes the live `process_tree`
+    /// app-group root names (capped at 64) and bumps
+    /// [`crate::engine::lse_counters::LockFreeMetrics::companion_cross_group_inferences_total`]
+    /// by `triples.len()` on each non-empty emission. The counter is no
+    /// longer perma-0 once mature anchors share a pivot under ≥2 groups.
     pub fn propagate_attention_across_groups(
         &self,
         group_keys: &[String],
@@ -627,6 +628,23 @@ mod tests {
         assert_eq!(
             snap_before, snap_after,
             "propagate_attention_across_groups must NOT mutate the graph"
+        );
+    }
+
+    #[test]
+    fn cross_group_inference_fires_for_wired_counter_path() {
+        // Mirrors the daemon main-loop wire: two mature anchors share a
+        // pivot, ≥2 group_keys are supplied. The wire bumps
+        // companion_cross_group_inferences_total by `triples.len()`, so this
+        // asserts the count the daemon would feed the counter is > 0 — i.e.
+        // the telemetry is NOT perma-0 once the graph has matured.
+        let g = build_two_anchor_session("Pivot");
+        let groups = vec!["g1".to_string(), "g2".to_string()];
+        let triples = g.propagate_attention_across_groups(&groups);
+        let bumped = triples.len() as u64;
+        assert!(
+            bumped > 0,
+            "wired counter path must emit ≥1 inference for a mature companion set, got {triples:?}"
         );
     }
 
