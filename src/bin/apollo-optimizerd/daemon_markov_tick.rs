@@ -64,6 +64,15 @@ pub fn run_markov_tick(
     cache_warmer: &mut CacheWarmer,
     frozen_state_path: &Path,
 ) -> MarkovTickOutput {
+    // Fight-hunt fix (2026-06-10): prefetch is a luxury. Under pressure the
+    // maintenance/survival paths are EVICTING file cache while these
+    // warm_pid calls fault pages back in — Apollo fighting itself,
+    // amplifying thrashing. Gate all speculative cache warming on pressure.
+    let cache_warm_allowed = {
+        let m = state.metrics.lock_recover();
+        cache_warm_allowed_at(m.metrics.memory_pressure)
+    };
+
     // ── FocusMarkov miss check ───────────────────────────────────────────────
     // [Sutton & Barto 1998 §6 — temporal difference credit assignment]
     if let Some((ref predicted, pred_cycle, warmed_pid, prior_jetsam)) = *last_markov_prethaw {
@@ -143,7 +152,9 @@ pub fn run_markov_tick(
                     let mut qos = state.mach_qos.lock_recover();
                     qos.set_tier(pid, SchedulingTier::Foreground);
                 }
-                cache_warmer.warm_pid(pid);
+                if cache_warm_allowed {
+                    cache_warmer.warm_pid(pid);
+                }
                 *last_markov_prethaw =
                     Some((pred.app_name.clone(), cycle_count, pid, prior_jetsam));
             }
@@ -229,7 +240,9 @@ pub fn run_markov_tick(
                     .find(|(_, p)| p.name().to_ascii_lowercase() == pred_lc)
                     .map(|(pid, _)| pid.as_u32())
                 {
-                    cache_warmer.warm_pid(pid);
+                    if cache_warm_allowed {
+                        cache_warmer.warm_pid(pid);
+                    }
                 }
             }
         }
@@ -252,9 +265,24 @@ fn prewarm_jetsam_restore(prior_jetsam: i32) -> Option<i32> {
     (prior_jetsam >= 0).then_some(prior_jetsam)
 }
 
+/// Fight-hunt fix (2026-06-10): speculative cache warming is allowed only
+/// below this pressure — above it, the purge paths are evicting the same
+/// cache the warmer would fill (self-fight, thrash amplification).
+fn cache_warm_allowed_at(pressure: f64) -> bool {
+    pressure < 0.60
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_warm_gated_above_060() {
+        assert!(cache_warm_allowed_at(0.45));
+        assert!(cache_warm_allowed_at(0.59));
+        assert!(!cache_warm_allowed_at(0.60));
+        assert!(!cache_warm_allowed_at(0.75));
+    }
 
     #[test]
     fn prewarm_restore_sentinel_semantics() {
