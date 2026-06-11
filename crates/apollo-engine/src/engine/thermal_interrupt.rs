@@ -72,6 +72,14 @@ pub struct ResourceInterruptState {
 
     /// PIDs frozen by the interrupt handler (separate from main loop freezes).
     pub interrupt_frozen_pids: Mutex<HashSet<u32>>,
+    /// Fight-hunt fix (2026-06-10): PIDs the sentinel migrated to
+    /// E-cores/Darwin-BG during Moderate/Emergency phases. recover()
+    /// previously only SIGCONT'd the frozen set — every migrated process
+    /// stayed pinned to Background tier AFTER the thermal event ended
+    /// (a Meet call heats the M1 → mass demotion → call ends → system
+    /// permanently sluggish until reboot). recover() now restores these
+    /// to Normal and clears the set.
+    pub interrupt_migrated_pids: Mutex<HashSet<u32>>,
 
     // Observability counters.
     pub total_fires: AtomicU64,
@@ -92,6 +100,7 @@ impl ResourceInterruptState {
             memory_signal: AtomicBool::new(false),
             power_signal: AtomicBool::new(false),
             interrupt_frozen_pids: Mutex::new(HashSet::new()),
+            interrupt_migrated_pids: Mutex::new(HashSet::new()),
             total_fires: AtomicU64::new(0),
             total_frozen: AtomicU64::new(0),
             total_migrated: AtomicU64::new(0),
@@ -543,7 +552,7 @@ fn sentinel_loop(
             } else {
                 // De-escalation → recovery.
                 if debounced_phase == InterruptPhase::Idle {
-                    recover(&state, &main_frozen, &mut bufs);
+                    recover(&state, &main_frozen, &mut bufs, &qos_mgr);
                     state.active.store(false, Ordering::Release);
                 }
             }
@@ -742,6 +751,11 @@ fn migrate_to_ecores(
                 libc::setpriority(PRIO_DARWIN_BG, pid_u32, 1);
             }
         }
+        // Anti-ratchet: remember the demotion so recover() can undo it.
+        state
+            .interrupt_migrated_pids
+            .lock_recover()
+            .insert(pid_u32);
         migrated += 1;
     }
 
@@ -917,9 +931,36 @@ fn recover(
     state: &ResourceInterruptState,
     main_frozen: &Arc<Mutex<HashMap<u32, FrozenEntry>>>,
     _bufs: &mut SentinelBuffers,
+    qos_mgr: &Option<Arc<Mutex<MachQoSManager>>>,
 ) {
     // Disable I/O throttle if it was enabled during SuperEmergency.
     disable_io_throttle();
+
+    // Fight-hunt fix (2026-06-10): undo the Moderate/Emergency E-core
+    // migrations. Restore Normal tier (the kernel/runningboard will
+    // re-elevate genuinely-foreground work) and clear the Darwin-BG flag
+    // for fallback-path victims. Runs BEFORE the frozen-set early-return —
+    // Moderate phases migrate without freezing anything.
+    {
+        let migrated: Vec<u32> = state.interrupt_migrated_pids.lock_recover().drain().collect();
+        if !migrated.is_empty() {
+            const PRIO_DARWIN_BG: libc::c_int = 0x1000;
+            let mut qos_guard = qos_mgr.as_ref().and_then(|m| m.try_lock().ok());
+            for pid in &migrated {
+                // Process may have exited — all calls are no-ops then.
+                if let Some(ref mut mgr) = qos_guard {
+                    mgr.set_tier(*pid, SchedulingTier::Normal);
+                }
+                unsafe {
+                    libc::setpriority(PRIO_DARWIN_BG, *pid, 0);
+                }
+            }
+            tracing::info!(
+                count = migrated.len(),
+                "thermal-recover: restored E-core-migrated processes to normal"
+            );
+        }
+    }
 
     let pids_to_resume: Vec<u32> = state.interrupt_frozen_pids.lock_recover().drain().collect();
 
@@ -978,6 +1019,22 @@ impl Ord for InterruptPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrated_set_records_and_drains() {
+        // Fight-hunt fix (2026-06-10): migrations must be tracked so
+        // recover() can undo them. Pin the set's record/drain contract.
+        let state = ResourceInterruptState::new();
+        state.interrupt_migrated_pids.lock_recover().insert(4242);
+        assert!(state.interrupt_migrated_pids.lock_recover().contains(&4242));
+        let drained: Vec<u32> = state
+            .interrupt_migrated_pids
+            .lock_recover()
+            .drain()
+            .collect();
+        assert_eq!(drained, vec![4242]);
+        assert!(state.interrupt_migrated_pids.lock_recover().is_empty());
+    }
 
     #[test]
     fn phase_ordering() {
