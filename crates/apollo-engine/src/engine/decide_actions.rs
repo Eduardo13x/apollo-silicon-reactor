@@ -223,7 +223,20 @@ pub fn context_from_pressure(
         >= crate::engine::safety::swap_exhaustion_threshold_bytes(
             snapshot.pressure.swap_total_bytes,
         );
-    if cpu_pressure > 88.0 || ram_pressure > thresholds.critical_pressure {
+    // Evolve iter-2 (2026-06-10): high CPU alone is NOT a thermal
+    // constraint — an M1 runs builds/exports/calls at 90-100% global CPU
+    // while cool; that is healthy full utilization. Escalating to
+    // ThermalConstrained on bare utilization made Apollo intervene
+    // against healthy load (the "multi-tab + streaming goes crazy"
+    // signal-misread class). ThermalConstrained now requires the REAL
+    // thermal-emergency signal from the sensor pipeline; high CPU
+    // without heat falls through to BackgroundPressure (mild posture).
+    // [Hellerstein 2004 §9] actuate on the constrained resource, not a
+    // proxy for it.
+    let thermal_emergency = crate::engine::shadow_signals::get_thermal_emergency();
+    if (cpu_pressure > 88.0 && thermal_emergency)
+        || ram_pressure > thresholds.critical_pressure
+    {
         InteractiveContext::ThermalConstrained
     } else if cpu_pressure > 72.0 || ram_pressure > thresholds.bg_pressure || swap_exhausted {
         InteractiveContext::BackgroundPressure
@@ -1908,13 +1921,25 @@ mod tests {
 
     #[test]
     fn context_thermal_constrained_from_cpu() {
-        // CPU 92% > 88.0 threshold
+        // Evolve iter-2 (2026-06-10): bare CPU 92% with NO thermal signal is
+        // healthy full utilization — BackgroundPressure (mild), NOT
+        // ThermalConstrained. With the real thermal-emergency signal set,
+        // the same CPU escalates. [Hellerstein 2004 §9]
+        crate::engine::shadow_signals::set_thermal_emergency(false);
         let snap = make_snapshot(92.0, 0.10, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
         assert!(
-            matches!(ctx, InteractiveContext::ThermalConstrained),
-            "CPU > 88% should yield ThermalConstrained, got {:?}",
+            matches!(ctx, InteractiveContext::BackgroundPressure),
+            "CPU>88 without heat must be BackgroundPressure, got {:?}",
             ctx
+        );
+        crate::engine::shadow_signals::set_thermal_emergency(true);
+        let ctx2 = context_from_pressure(&snap, &OverflowThresholds::default());
+        crate::engine::shadow_signals::set_thermal_emergency(false); // cleanup
+        assert!(
+            matches!(ctx2, InteractiveContext::ThermalConstrained),
+            "CPU>88 WITH thermal emergency must escalate, got {:?}",
+            ctx2
         );
     }
 
@@ -2359,7 +2384,11 @@ mod tests {
             InteractiveContext::BackgroundPressure
         ));
 
-        // High pressure (CPU > 88)
+        // High pressure (CPU > 88): evolve iter-2 — without the thermal
+        // signal this stays BackgroundPressure (healthy utilization);
+        // escalation now requires real heat (see
+        // context_thermal_constrained_from_cpu for the gated pair).
+        crate::engine::shadow_signals::set_thermal_emergency(false);
         let out_high = call_decide(
             &make_snapshot(92.0, 0.10, 0.0),
             &sys,
@@ -2369,7 +2398,7 @@ mod tests {
         );
         assert!(matches!(
             out_high.context,
-            InteractiveContext::ThermalConstrained
+            InteractiveContext::BackgroundPressure
         ));
     }
 
