@@ -691,7 +691,17 @@ impl SysctlGovernor {
         // send/recv buffers -25% broke signaling + STUN/TURN fallback,
         // freezing audio/video. Inhibit during realtime full-duplex audio.
         if inputs.realtime_call_active {
-            crate::engine::lse_counters::LSE_COUNTERS.inc_sysctl_governor_realtime_call_inhibit();
+            // Evolve iter-5 (2026-06-10): count only REAL suppressions. The
+            // counter previously bumped every tick the gate was true (even
+            // when no scale-down would have fired) — 996 over 1550 cycles
+            // looked "stuck" but was per-tick over-counting. The gate's
+            // conservative looseness (audio + warm-mic ⇒ inhibit) is
+            // intentional: skipping TCP tuning during ambiguous audio is
+            // far cheaper than the 2026-06-09 broke-the-Meet incident.
+            if self.tcp.consecutive_low >= 6 && throughput_low {
+                crate::engine::lse_counters::LSE_COUNTERS
+                    .inc_sysctl_governor_realtime_call_inhibit();
+            }
             self.tcp.consecutive_low = 0; // forget the streak so resume is clean
         } else if self.tcp.consecutive_low >= 6
             && throughput_low
@@ -733,7 +743,13 @@ impl SysctlGovernor {
         // which is catastrophic for WebRTC. Realtime-call gate overrides the
         // entire ladder and forces 0 (immediate ACK).
         let desired_ack = if inputs.realtime_call_active {
-            crate::engine::lse_counters::LSE_COUNTERS.inc_sysctl_governor_realtime_call_inhibit();
+            // Evolve iter-5: count only when we actually override a non-zero
+            // ack (a real suppressed write); forcing 0 when already 0 is a
+            // no-op and must not inflate the metric.
+            if self.tcp.delayed_ack != 0 {
+                crate::engine::lse_counters::LSE_COUNTERS
+                    .inc_sysctl_governor_realtime_call_inhibit();
+            }
             0 // Realtime full-duplex audio: every ACK must dispatch immediately.
         } else if inputs.on_battery {
             3 // Combine ACKs to reduce CPU wakes.
@@ -1621,6 +1637,27 @@ mod tests {
     /// `on_battery = true` mid-Meet, the delayed_ack ladder picked 3
     /// (combined ACK ≈ +200 ms latency), choking WebRTC. The realtime-call
     /// gate now overrides the battery branch and forces 0.
+    #[test]
+    fn realtime_inhibit_counter_counts_only_real_suppressions() {
+        // Evolve iter-5: ack already 0 + no scale-down pending ⇒ the gate
+        // suppresses NOTHING, so the inhibit counter must not climb. (The
+        // old code bumped per-tick, making the gate look stuck at ~1/cycle.)
+        let before = crate::engine::lse_counters::LSE_COUNTERS
+            .snapshot()
+            .sysctl_governor_realtime_call_inhibit_total;
+        let mut gov = SysctlGovernor::new(true);
+        gov.tcp.delayed_ack = 0; // already immediate
+        gov.tcp.consecutive_low = 0; // no scale-down pending
+        let monitor = test_monitor(0.0, 0.0, 0);
+        let mut inputs = default_inputs(&monitor);
+        inputs.realtime_call_active = true;
+        let _ = gov.tick(&inputs);
+        let after = crate::engine::lse_counters::LSE_COUNTERS
+            .snapshot()
+            .sysctl_governor_realtime_call_inhibit_total;
+        assert_eq!(after, before, "no real suppression ⇒ counter must not move");
+    }
+
     #[test]
     fn realtime_call_overrides_battery_delayed_ack() {
         let mut gov = SysctlGovernor::new(true);

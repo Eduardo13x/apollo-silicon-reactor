@@ -57,6 +57,19 @@ const DRIFT_SCORE_ALPHA: f64 = 0.01;
 /// [McGaugh 2004] amygdala modulation: arousal boosts memory consolidation.
 const MAX_SALIENT_OBS: u32 = 4;
 
+/// Hard capacity cap on the belief store. Without it, ephemeral
+/// event-keyed beliefs (`oom:PID:hash`, `crash:PID:hash` — encoding a
+/// specific recycled PID + payload hash that never recurs) accumulate
+/// unbounded: production hit 17,659 beliefs = 2.5 MB = 40% of
+/// learned_state.json (6.4 MB), persisted to SSD every 300 cycles.
+/// The confidence-floor prune (<0.05) is too slow — these start at
+/// 0.12-0.18 and decay only per-persist-cycle. NARS models bounded
+/// memory: under capacity pressure, forget the weakest beliefs first.
+/// [Wang 2013 "Non-Axiomatic Logic" §forgetting — finite resources force
+/// relevance-ranked eviction.] Cap at 3000: ample for real per-app
+/// beliefs (~500-1000 distinct apps/contexts) while bounding the file.
+const MAX_BELIEFS: usize = 3000;
+
 /// LTI decay protection: high-arousal beliefs decay at this slower rate.
 /// Standard decay = 0.95; LTI-protected decay = 0.985 (3× slower fading).
 /// Equivalent to long-term potentiation (LTP) in neuroscience: strong stimuli
@@ -703,6 +716,25 @@ impl DriftDetector {
             .values()
             .filter(|e| e.is_drifted(effective_thr))
             .count();
+
+        // Capacity cap (2026-06-10): evict the weakest beliefs beyond
+        // MAX_BELIEFS. Relevance = confidence × (1 + lti) so crisis-formed
+        // (high-LTI) beliefs survive eviction even at moderate confidence,
+        // while ephemeral event beliefs (low lti, decaying confidence) go
+        // first. [Wang 2013 §forgetting]
+        if self.beliefs.len() > MAX_BELIEFS {
+            let mut ranked: Vec<(String, f32)> = self
+                .beliefs
+                .iter()
+                .map(|(k, e)| (k.clone(), e.tv.confidence * (1.0 + e.lti)))
+                .collect();
+            // Ascending by relevance — weakest first.
+            ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let evict = self.beliefs.len() - MAX_BELIEFS;
+            for (key, _) in ranked.into_iter().take(evict) {
+                self.beliefs.remove(&key);
+            }
+        }
     }
 
     /// Number of tracked beliefs.
@@ -1025,6 +1057,22 @@ mod tests {
     use super::*;
 
     // ── TruthValue ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn belief_store_respects_capacity_cap() {
+        let mut d = DriftDetector::new();
+        // Insert well over the cap with ephemeral-style beliefs.
+        for i in 0..(MAX_BELIEFS + 500) {
+            d.observe(&format!("oom:{i}:hash{i}"), false);
+        }
+        // One decay pass applies the capacity cap.
+        d.decay_confidence(0.95);
+        assert!(
+            d.len() <= MAX_BELIEFS,
+            "belief store must be capped at {MAX_BELIEFS}, got {}",
+            d.len()
+        );
+    }
 
     #[test]
     fn observations_to_reach_inverts_confidence_from_count() {
