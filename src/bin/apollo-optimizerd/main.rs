@@ -811,7 +811,7 @@ fn main() -> anyhow::Result<()> {
                 mut active_coalitions,
             } = daemon_init::DaemonSubsystems::new();
             {
-                let mut m_guard = state.metrics.lock().unwrap();
+                let mut m_guard = state.metrics.lock_recover();
                 m_guard.metrics.recently_applied_restore_status =
                     Some(recently_applied_restore_status);
             }
