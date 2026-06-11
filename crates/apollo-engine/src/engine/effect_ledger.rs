@@ -270,12 +270,32 @@ pub fn reconcile_global(
     reverted
 }
 
+/// Evolve iter-5 (2026-06-10): does this process carry Apollo's boost
+/// signature (nice exactly -10) and is it safe to revert at startup?
+/// Apollo is the only thing that sets nice=-10 (the boost path); the
+/// kernel uses -20 for kernel_task and other values for its own daemons.
+/// Hard-protected names are never touched. Used by the daemon's
+/// startup orphan-adoption sweep to clean cross-restart ratchets the
+/// in-memory ledger can't see.
+pub fn is_orphan_boost_signature(nice: i32, hard_protected: bool) -> bool {
+    nice == -10 && !hard_protected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn nice(pid: u32) -> AppliedEffect {
         AppliedEffect::Nice { pid }
+    }
+
+    #[test]
+    fn orphan_boost_signature_only_matches_minus_ten_unprotected() {
+        assert!(is_orphan_boost_signature(-10, false), "Apollo signature");
+        assert!(!is_orphan_boost_signature(-10, true), "hard-protected exempt");
+        assert!(!is_orphan_boost_signature(-20, false), "kernel_task -20 not ours");
+        assert!(!is_orphan_boost_signature(0, false), "default nice");
+        assert!(!is_orphan_boost_signature(-5, false), "other negative not ours");
     }
 
     #[test]

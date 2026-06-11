@@ -677,6 +677,38 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Evolve iter-5 (2026-06-10): adopt orphan boosts. The EffectLedger
+            // is in-memory and resets on restart, so nice=-10 boosts applied
+            // by a PREVIOUS daemon instance are orphaned — the fresh ledger
+            // never reverts them, and they propagate to children via fork
+            // inheritance (observed: 10 processes at -10 across a restart,
+            // including a shell and all its children). nice EXACTLY -10 is
+            // Apollo's boost signature (the kernel uses -20 for kernel_task,
+            // other negative values for its own daemons); reset those on the
+            // non-hard-protected set. The current foreground app, if any, is
+            // re-boosted within one cycle by the normal loop.
+            {
+                use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+                let sys = System::new_with_specifics(
+                    RefreshKind::new().with_processes(ProcessRefreshKind::new()),
+                );
+                let mut adopted = 0u64;
+                for (pid, proc) in sys.processes() {
+                    let pid_u32 = pid.as_u32();
+                    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid_u32) };
+                    let hp = apollo_engine::engine::safety::hard_protected_contains(proc.name());
+                    if apollo_engine::engine::effect_ledger::is_orphan_boost_signature(nice, hp) {
+                        unsafe {
+                            libc::setpriority(libc::PRIO_PROCESS, pid_u32, 0);
+                        }
+                        adopted += 1;
+                    }
+                }
+                if adopted > 0 {
+                    tracing::info!(adopted, "startup: reverted orphan nice=-10 boosts from prior daemon");
+                }
+            }
+
             // Crash detection: if the sentinel file from the previous session still exists,
             // the daemon did not shut down cleanly (SIGKILL, kernel panic, OOM).
             // Enter cautious mode: raise freeze/throttle thresholds for the first 50 cycles
