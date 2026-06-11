@@ -134,15 +134,17 @@ pub fn aggregate_cycle_pressure(
     // to [0.0, 1.0].
     let (pressure_after_boosts, components) = effective_pressure::compute(
         base_pressure,
-        hw_boost,
-        batt_boost,
-        thermal_pressure_boost,
-        llm_boost,
-        charging_stress_boost,
-        battery_low_boost,
-        mem_bw_boost,
-        smc_thermal_boost,
-        battery_overheat_boost,
+        effective_pressure::PressureBoosts {
+            hardware: hw_boost,
+            battery: batt_boost,
+            thermal: thermal_pressure_boost,
+            llm_workload: llm_boost,
+            charging_stress: charging_stress_boost,
+            battery_low: battery_low_boost,
+            memory_bandwidth: mem_bw_boost,
+            smc_thermal: smc_thermal_boost,
+            battery_overheat: battery_overheat_boost,
+        },
     );
 
     // Cautious mode: during the first 50 cycles after a crash, lower the

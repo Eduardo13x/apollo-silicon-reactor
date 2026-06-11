@@ -583,16 +583,16 @@ impl SignalIntelligence {
         };
 
         // ── 8. Urgency score compuesto (includes Lyapunov chaos) ─────────
-        let urgency = compute_urgency(
-            pressure_smooth,
-            pressure_velocity,
-            regime_shift_up,
-            p_oom_30s,
+        let urgency = compute_urgency(UrgencyInputs {
+            pressure: pressure_smooth,
+            velocity: pressure_velocity,
+            regime_shift: regime_shift_up,
+            p_oom: p_oom_30s,
             monopoly_risk,
             stability_regime,
             entropy_anomaly,
-            lyapunov_exponent,
-        );
+            lyapunov: lyapunov_exponent,
+        });
 
         // ── 9. Cumulative stress index ────────────────────────────────────
         // [Yerkes & Dodson 1908] slow EMA (α=0.05) of urgency — "running temperature".
@@ -1173,8 +1173,11 @@ fn default_utility() -> f64 {
     0.5
 }
 
-/// Score compuesto de urgencia, combinación ponderada de todas las señales.
-fn compute_urgency(
+/// Grouped inputs for [`compute_urgency`]. Bundles the eight weighted signals
+/// that feed the composite urgency score so the call site reads as a labelled
+/// record instead of a long positional argument list.
+#[derive(Debug, Clone)]
+struct UrgencyInputs {
     pressure: f64,
     velocity: f64,
     regime_shift: bool,
@@ -1183,7 +1186,20 @@ fn compute_urgency(
     stability_regime: StabilityRegime,
     entropy_anomaly: f64,
     lyapunov: f64,
-) -> f64 {
+}
+
+/// Score compuesto de urgencia, combinación ponderada de todas las señales.
+fn compute_urgency(inputs: UrgencyInputs) -> f64 {
+    let UrgencyInputs {
+        pressure,
+        velocity,
+        regime_shift,
+        p_oom,
+        monopoly_risk,
+        stability_regime,
+        entropy_anomaly,
+        lyapunov,
+    } = inputs;
     let mut score = 0.0;
     score += pressure * 0.30;
     if velocity > 0.0 {
@@ -2083,16 +2099,16 @@ mod tests {
         let pressures = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
         let mut prev_urgency = -1.0;
         for &p in &pressures {
-            let u = compute_urgency(
-                p,
-                0.0,
-                false,
-                0.0,
-                0.0,
-                StabilityRegime::Degenerate,
-                0.0,
-                0.0,
-            );
+            let u = compute_urgency(UrgencyInputs {
+                pressure: p,
+                velocity: 0.0,
+                regime_shift: false,
+                p_oom: 0.0,
+                monopoly_risk: 0.0,
+                stability_regime: StabilityRegime::Degenerate,
+                entropy_anomaly: 0.0,
+                lyapunov: 0.0,
+            });
             assert!(
                 u >= prev_urgency,
                 "urgency not monotonic: p={}, urgency={}, prev={}",
@@ -2107,28 +2123,79 @@ mod tests {
     /// compute_urgency must be bounded [0, 1] even with extreme inputs.
     #[test]
     fn test_urgency_bounded_extreme_inputs() {
-        let u = compute_urgency(
-            1.0,
-            1.0,
-            true,
-            1.0,
-            1.0,
-            StabilityRegime::Unstable,
-            5.0,
-            2.0,
-        );
+        let u = compute_urgency(UrgencyInputs {
+            pressure: 1.0,
+            velocity: 1.0,
+            regime_shift: true,
+            p_oom: 1.0,
+            monopoly_risk: 1.0,
+            stability_regime: StabilityRegime::Unstable,
+            entropy_anomaly: 5.0,
+            lyapunov: 2.0,
+        });
         assert!(u >= 0.0 && u <= 1.0, "urgency {} out of bounds", u);
-        let u_zero = compute_urgency(
-            0.0,
-            0.0,
-            false,
-            0.0,
-            0.0,
-            StabilityRegime::Degenerate,
-            0.0,
-            0.0,
-        );
+        let u_zero = compute_urgency(UrgencyInputs {
+            pressure: 0.0,
+            velocity: 0.0,
+            regime_shift: false,
+            p_oom: 0.0,
+            monopoly_risk: 0.0,
+            stability_regime: StabilityRegime::Degenerate,
+            entropy_anomaly: 0.0,
+            lyapunov: 0.0,
+        });
         assert!(u_zero >= 0.0 && u_zero <= 1.0);
+    }
+
+    /// Constructing [`UrgencyInputs`] explicitly and passing it must yield the
+    /// same score as the documented weighted formula. Guards the positional →
+    /// struct refactor against field-mismatch regressions.
+    #[test]
+    fn test_urgency_inputs_struct_field_mapping() {
+        // Only `pressure` non-zero → score == pressure * 0.30 exactly.
+        let only_pressure = compute_urgency(UrgencyInputs {
+            pressure: 0.50,
+            velocity: 0.0,
+            regime_shift: false,
+            p_oom: 0.0,
+            monopoly_risk: 0.0,
+            stability_regime: StabilityRegime::Degenerate,
+            entropy_anomaly: 0.0,
+            lyapunov: 0.0,
+        });
+        assert!(
+            (only_pressure - 0.15).abs() < 1e-9,
+            "expected 0.15 (0.50 * 0.30), got {only_pressure}"
+        );
+
+        // Only `regime_shift` true → flat +0.15 contribution.
+        let only_regime = compute_urgency(UrgencyInputs {
+            pressure: 0.0,
+            velocity: 0.0,
+            regime_shift: true,
+            p_oom: 0.0,
+            monopoly_risk: 0.0,
+            stability_regime: StabilityRegime::Degenerate,
+            entropy_anomaly: 0.0,
+            lyapunov: 0.0,
+        });
+        assert!(
+            (only_regime - 0.15).abs() < 1e-9,
+            "expected 0.15 (regime_shift flat), got {only_regime}"
+        );
+
+        // Clone is derived — ensure it round-trips and stays equal.
+        let inputs = UrgencyInputs {
+            pressure: 0.50,
+            velocity: 0.0,
+            regime_shift: false,
+            p_oom: 0.0,
+            monopoly_risk: 0.0,
+            stability_regime: StabilityRegime::Degenerate,
+            entropy_anomaly: 0.0,
+            lyapunov: 0.0,
+        };
+        assert_eq!(compute_urgency(inputs.clone()), compute_urgency(inputs));
     }
 
     // ── Hazard batch retrain (Phase 3, Loop 2) ──────────────────────────
