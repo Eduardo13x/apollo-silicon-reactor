@@ -1455,6 +1455,87 @@ mod tests {
         assert_eq!(outcomes.failures, 0);
     }
 
+    /// Phase 5.3 wiring proof (TODO closeout 2026-06-11): a successful action
+    /// carried through `execute_actions` must end up journaled WITH a
+    /// structured `Rationale` attached at the cycle-wide chokepoint. We use
+    /// `dry_run=true` so a ghost PID counts as a clean success without
+    /// touching any real process, then read the journal back and assert the
+    /// rationale is present and reflects the action's own metadata.
+    #[test]
+    fn successful_action_journals_a_rationale() {
+        use crate::engine::journal::read_journal;
+
+        let journal = std::env::temp_dir().join("apollo-test-rationale-wiring.jsonl");
+        // Start from a clean slate so we only observe this cycle's entries.
+        let _ = std::fs::remove_file(&journal);
+
+        let attached_before = crate::engine::lse_counters::LSE_COUNTERS
+            .journal_rationales_attached_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let mut frozen: HashSet<u32> = [GHOST_PID].into_iter().collect();
+        let outcomes = execute_actions(
+            vec![RootAction::UnfreezeProcess {
+                pid: GHOST_PID,
+                name: "ghost-rationale".to_string(),
+                reason: "pressure=0.81,swap_gb=2.1".to_string(),
+                decision_reason: DecisionReason::CriticalBypass,
+            }],
+            &make_caps(),
+            &journal,
+            &mut frozen,
+            &[],
+            &[],
+            None,
+            true, // dry_run → ghost PID succeeds without a real process
+            0.0,
+            0.0,
+            None,
+            0.0,
+        );
+        assert_eq!(outcomes.failures, 0, "dry-run unfreeze must not fail");
+
+        let entries = read_journal(&journal).expect("read back journal");
+        let entry = entries
+            .iter()
+            .find(|e| matches!(e.action, RootAction::UnfreezeProcess { .. }))
+            .expect("the unfreeze action must be journaled");
+
+        assert!(entry.success, "dry-run unfreeze must be recorded as success");
+        let rationale = entry
+            .rationale
+            .as_ref()
+            .expect("successful action must carry a Rationale (Phase 5.3 wiring)");
+
+        // The rationale's fields are built from the action's own metadata at
+        // the chokepoint — verify the wiring threads them through faithfully.
+        assert_eq!(
+            rationale.action_class, "unfreeze",
+            "action_class must match RootAction::action_class()"
+        );
+        assert!(
+            rationale.trigger.contains("CriticalBypass"),
+            "trigger must reflect the action's DecisionReason, got: {}",
+            rationale.trigger
+        );
+        assert_eq!(
+            rationale.evidence, "pressure=0.81,swap_gb=2.1",
+            "evidence must be the action's reason payload"
+        );
+
+        // The LSE counter must have advanced for the attachment so telemetry
+        // stays observable in runtime_metrics.json (silent-telemetry-death guard).
+        let attached_after = crate::engine::lse_counters::LSE_COUNTERS
+            .journal_rationales_attached_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            attached_after > attached_before,
+            "journal_rationale_attached_total must increment on a rationale'd entry"
+        );
+
+        let _ = std::fs::remove_file(&journal);
+    }
+
     // ── learned_interactive skips (BUG-07) ────────────────────────────────────
 
     #[test]

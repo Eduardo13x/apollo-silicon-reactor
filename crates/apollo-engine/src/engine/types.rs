@@ -874,13 +874,20 @@ pub struct JournalEntry {
     /// byte-compatible with the prior schema — important because journals
     /// are tail-friendly artifacts shared with dashboards.
     ///
-    /// TODO(phase-5.3-wiring): cross-cutting wiring of `with_rationale(..)`
-    /// at the major write sites is deliberately out of scope for this
-    /// commit. Follow-up should attach rationales at, in priority order:
-    ///   1. `execute_actions.rs::pending_journal.push(...)` — single
-    ///      chokepoint covering throttle/freeze/unfreeze/boost/sysctl.
-    ///   2. `chromium_manager` long-idle freeze path.
-    ///   3. `decide_actions` swarm-throttle and graduated-idle rules.
+    /// Phase 5.3 wiring CLOSED (2026-05-16, verified 2026-06-11): the
+    /// cross-cutting wiring promised by the original TODO is done. Every
+    /// `JournalEntry` is constructed at exactly ONE site —
+    /// `execute_actions.rs` cycle-wide chokepoint (the `pending_journal.push`
+    /// at ~line 1345). That chokepoint builds a `Rationale` from the action's
+    /// own `(action_class, decision_reason, reason)` tuple for every
+    /// successful, non-skip action and bumps
+    /// `LSE_COUNTERS.inc_journal_rationale_attached()`. The original
+    /// follow-up items #2 (`chromium_manager` long-idle freeze) and #3
+    /// (`decide_actions` swarm/graduated-idle rules) are subsumed: those
+    /// paths do NOT write journals directly — they emit `RootAction`s that
+    /// flow through `execute_actions`, so they inherit the chokepoint's
+    /// rationale automatically. A repo-wide audit confirms the chokepoint is
+    /// the only non-test `JournalEntry { .. }` construction in the tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rationale: Option<crate::engine::audit_types::Rationale>,
 }
