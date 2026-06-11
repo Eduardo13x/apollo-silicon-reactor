@@ -330,35 +330,40 @@ fn legacy_vec_and_accumulator_produce_byte_equivalent_sequences() {
         .collect();
     assert_eq!(legacy_pids, acc_pids, "pid extraction must match");
 
-    // 4. Per-variant accumulator telemetry — Fase 5 reviewer fix #3 changed
-    //    the semantics: typed `push_*` increments per-variant counters,
-    //    `push_raw` / `extend_raw` increments only `raw`. The invariant is:
-    //    Σ(typed per-variant) + raw == total_pushed.
+    // 4. Per-variant accumulator telemetry — post-ffa0b29 semantics.
+    //    The per-variant counters represent ACTUAL emitted variant volume:
+    //    a `push_raw` / `extend_raw` bumps BOTH the per-variant counter AND
+    //    the `raw` diagnostic counter (escape-hatch path count), while a
+    //    typed `push_*` bumps ONLY the per-variant counter. In all cases
+    //    `total_pushed` advances by exactly one per action.
+    //    Source of truth: action_accumulator.rs unit tests
+    //    `push_raw_increments_raw_and_variant_counters` and
+    //    `test_push_raw_increments_typed_and_raw` ("Dashboards must not add
+    //    raw to the typed sum"). The correct invariant is therefore
+    //    Σ(typed per-variant) == total_pushed; `raw` is a SEPARATE diagnostic.
     //
-    //    In this fixture only proc_recovery (1 freeze) and network_optimizer
-    //    (1 set_sysctl) go through typed pushes. Everything else goes via
-    //    extend_raw and stays in `raw` only.
-    assert_eq!(
-        acc_telemetry.freeze, 1,
-        "only proc_recovery typed-pushes a freeze"
-    );
-    assert_eq!(
-        acc_telemetry.set_sysctl, 1,
-        "only network_optimizer typed-pushes a set_sysctl"
-    );
-    assert_eq!(acc_telemetry.throttle, 0);
+    //    Fixture variant volumes (raw + typed combined):
+    //      throttle 3 (idx0/7/11), freeze 4 (idx1/5/12 + idx13 typed),
+    //      boost 2 (idx3/4), set_memorystatus 4 (idx2/8/9/10),
+    //      toggle_spotlight 1 (idx6), set_sysctl 3 (idx14/15 + idx16 typed).
+    assert_eq!(acc_telemetry.throttle, 3);
+    assert_eq!(acc_telemetry.freeze, 4);
     assert_eq!(acc_telemetry.unfreeze, 0);
-    assert_eq!(acc_telemetry.boost, 0);
-    assert_eq!(acc_telemetry.set_memorystatus, 0);
+    assert_eq!(acc_telemetry.boost, 2);
+    assert_eq!(acc_telemetry.set_memorystatus, 4);
     assert_eq!(acc_telemetry.set_thread_qos, 0);
-    assert_eq!(acc_telemetry.toggle_spotlight, 0);
+    assert_eq!(acc_telemetry.set_sysctl, 3);
+    assert_eq!(acc_telemetry.toggle_spotlight, 1);
     assert_eq!(acc_telemetry.quarantine_daemon, 0);
     assert_eq!(acc_telemetry.total_pushed, legacy.len() as u64);
     // No shape rejections expected from a well-formed fixture.
     assert_eq!(acc_telemetry.rejected_shape, 0);
-    // raw count: everything except the two typed pushes (proc_recovery + netopt).
+    // raw count: every action EXCEPT the two typed pushes (proc_recovery
+    // freeze + netopt sysctl) went through extend_raw → raw == total - 2.
     assert_eq!(acc_telemetry.raw, (legacy.len() as u64) - 2);
-    // Telemetry invariant.
+    // Telemetry invariant (post-ffa0b29): each action lands in exactly one
+    // per-variant bucket, so Σ(typed per-variant) == total_pushed. `raw` is
+    // a diagnostic overlay and must NOT be added to the typed sum.
     let typed_sum = acc_telemetry.throttle
         + acc_telemetry.freeze
         + acc_telemetry.unfreeze
@@ -368,7 +373,7 @@ fn legacy_vec_and_accumulator_produce_byte_equivalent_sequences() {
         + acc_telemetry.set_sysctl
         + acc_telemetry.toggle_spotlight
         + acc_telemetry.quarantine_daemon;
-    assert_eq!(typed_sum + acc_telemetry.raw, acc_telemetry.total_pushed);
+    assert_eq!(typed_sum, acc_telemetry.total_pushed);
 }
 
 /// Fase 5 reviewer fix #4 — strengthened golden: prove that the accumulator's
