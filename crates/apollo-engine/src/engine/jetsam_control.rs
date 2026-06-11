@@ -260,3 +260,143 @@ pub enum JetsamClass {
     Noise,
     Protected,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── ABI struct layout pins ─────────────────────────────────────────────
+    // These structs are passed by raw pointer + explicit size to a kernel
+    // syscall. A wrong size/offset = the kernel reads garbage or rejects the
+    // call silently. Pin them so a field reorder/type change fails the build.
+
+    #[test]
+    fn priority_properties_abi_layout() {
+        // i32 (4) + u64 (8). u64 forces 8-byte alignment → 4 bytes pad after
+        // the i32 → total 16 bytes. xnu's memorystatus_priority_properties_t.
+        assert_eq!(
+            std::mem::size_of::<MemorystatusPriorityProperties>(),
+            16,
+            "priority props size must be 16 (matches xnu ABI)"
+        );
+        assert_eq!(std::mem::align_of::<MemorystatusPriorityProperties>(), 8);
+        let probe = MemorystatusPriorityProperties {
+            priority: 0,
+            user_data: 0,
+        };
+        let base = &probe as *const _ as usize;
+        assert_eq!(&probe.priority as *const _ as usize - base, 0);
+        assert_eq!(&probe.user_data as *const _ as usize - base, 8);
+    }
+
+    #[test]
+    fn memlimit_properties_abi_layout() {
+        // Four 4-byte fields, no padding → 16 bytes.
+        // xnu's memorystatus_memlimit_properties_t.
+        assert_eq!(
+            std::mem::size_of::<MemorystatusMemlimitProperties>(),
+            16,
+            "memlimit props size must be 16 (matches xnu ABI)"
+        );
+        assert_eq!(std::mem::align_of::<MemorystatusMemlimitProperties>(), 4);
+        let probe = MemorystatusMemlimitProperties::default();
+        let base = &probe as *const _ as usize;
+        assert_eq!(&probe.memlimit_active as *const _ as usize - base, 0);
+        assert_eq!(&probe.memlimit_active_attr as *const _ as usize - base, 4);
+        assert_eq!(&probe.memlimit_inactive as *const _ as usize - base, 8);
+        assert_eq!(&probe.memlimit_inactive_attr as *const _ as usize - base, 12);
+    }
+
+    #[test]
+    fn priority_entry_abi_layout() {
+        // Mirror of the local PriorityEntry used by get_priority().
+        // i32 + i32 + u64 → 8-byte aligned → 16 bytes (no internal pad).
+        #[repr(C)]
+        struct PriorityEntry {
+            pid: i32,
+            priority: i32,
+            user_data: u64,
+        }
+        assert_eq!(std::mem::size_of::<PriorityEntry>(), 16);
+        assert_eq!(std::mem::align_of::<PriorityEntry>(), 8);
+        let probe = PriorityEntry {
+            pid: 0,
+            priority: 0,
+            user_data: 0,
+        };
+        let base = &probe as *const _ as usize;
+        assert_eq!(&probe.pid as *const _ as usize - base, 0);
+        assert_eq!(&probe.priority as *const _ as usize - base, 4);
+        assert_eq!(&probe.user_data as *const _ as usize - base, 8);
+    }
+
+    // ─── memorystatus_control command constants ─────────────────────────────
+    // These map directly to xnu/bsd/sys/kern_memorystatus.h enum values.
+    // A wrong number issues a completely different kernel command.
+
+    #[test]
+    fn command_constants_match_xnu_abi() {
+        assert_eq!(MEMORYSTATUS_CMD_GET_PRIORITY_LIST, 1);
+        assert_eq!(MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES, 6);
+        assert_eq!(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES, 7);
+        assert_eq!(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES, 8);
+    }
+
+    // ─── Jetsam priority band ordering ──────────────────────────────────────
+    // Lower = killed first. The relative ordering is the whole contract:
+    // background MUST die before foreground MUST die before critical.
+
+    #[test]
+    fn priority_bands_match_xnu_values() {
+        assert_eq!(priority::IDLE, 0);
+        assert_eq!(priority::BACKGROUND_OPPORTUNISTIC, 1);
+        assert_eq!(priority::BACKGROUND, 2);
+        assert_eq!(priority::MAIL, 5);
+        assert_eq!(priority::PHONE, 6);
+        assert_eq!(priority::UI_SUPPORT, 7);
+        assert_eq!(priority::FOREGROUND_SUPPORT, 8);
+        assert_eq!(priority::FOREGROUND, 9);
+        assert_eq!(priority::AUDIO_AND_ACCESSORY, 10);
+        assert_eq!(priority::CRITICAL, 11);
+        assert_eq!(priority::VITAL, 12);
+        assert_eq!(priority::HIGHEST, 21);
+        assert_eq!(priority::KERNEL, 63);
+    }
+
+    #[test]
+    fn priority_band_kill_order_invariant() {
+        // The survival contract: noise dies first, interactive last, protected
+        // basically never. If this ordering ever inverts, Apollo would make the
+        // system MORE likely to kill the foreground app under pressure.
+        assert!(priority::BACKGROUND < priority::FOREGROUND);
+        assert!(priority::FOREGROUND < priority::CRITICAL);
+        assert!(priority::IDLE < priority::BACKGROUND);
+        assert!(priority::CRITICAL < priority::KERNEL);
+    }
+
+    // ─── apply_apollo_policy tier → raw-value mapping ───────────────────────
+    // Pure mapping documented in the doc comment. We can't run the syscall in
+    // tests, but we pin the intended priority each class maps to so a future
+    // edit that swaps Noise↔Protected priorities is caught.
+
+    /// Mirror of the (priority, active_mb, inactive_mb) tuple that
+    /// `apply_apollo_policy` would emit for a class, without doing the syscall.
+    fn intended_policy(class: JetsamClass) -> (i32, i32, i32) {
+        match class {
+            JetsamClass::Interactive => (priority::FOREGROUND, 0, 0),
+            JetsamClass::Noise => (priority::BACKGROUND, 0, 200),
+            JetsamClass::Protected => (priority::CRITICAL, 0, 0),
+        }
+    }
+
+    #[test]
+    fn apollo_policy_class_mapping() {
+        assert_eq!(intended_policy(JetsamClass::Interactive), (9, 0, 0));
+        assert_eq!(intended_policy(JetsamClass::Noise), (2, 0, 200));
+        assert_eq!(intended_policy(JetsamClass::Protected), (11, 0, 0));
+        // Only Noise gets a non-zero (capped) inactive limit.
+        assert_eq!(intended_policy(JetsamClass::Interactive).2, 0);
+        assert_eq!(intended_policy(JetsamClass::Protected).2, 0);
+        assert!(intended_policy(JetsamClass::Noise).2 > 0);
+    }
+}

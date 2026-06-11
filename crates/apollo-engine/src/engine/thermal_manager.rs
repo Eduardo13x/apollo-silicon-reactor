@@ -251,3 +251,125 @@ impl Default for ThermalManager {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── Threshold constants (must stay aligned w/ thermal_interrupt sentinel) ──
+    #[test]
+    fn thresholds_match_sentinel_phases() {
+        let m = ThermalManager::new();
+        assert_eq!(m.throttle_threshold, 90.0, "Moderate sentinel phase");
+        assert_eq!(m.shutdown_threshold, 100.0, "SuperEmergency sentinel phase");
+        assert_eq!(m.max_history, 60, "60 samples = 1 minute at 1Hz");
+    }
+
+    // ─── jitter_us → effective-temp boost mapping (hw_predictor pre-sensor) ──────
+    // This is the assembly-jitter early-warning: it shifts the effective CPU temp
+    // forward so the predictor acts before the sensor confirms. A wrong boundary
+    // or value = either no early warning or a false thermal panic.
+    #[test]
+    fn jitter_boost_band_mapping() {
+        let probe = |jitter: u64| -> f32 {
+            let mut m = ThermalManager::new();
+            // cpu_temp_eff is recorded as the first snapshot's cpu_temp.
+            m.update(50.0, 40.0, 40.0, 0, jitter);
+            m.history.back().unwrap().cpu_temp - 50.0
+        };
+        assert_eq!(probe(0), 0.0, "no jitter → no boost");
+        assert_eq!(probe(200), 0.0, "upper edge of calm band → no boost");
+        assert_eq!(probe(201), 3.0, "warning band lower edge → +3C");
+        assert_eq!(probe(600), 3.0, "warning band upper edge → +3C");
+        assert_eq!(probe(601), 7.0, "critical band → +7C");
+        assert_eq!(probe(100_000), 7.0, "saturates at +7C");
+    }
+
+    // ─── Trend classification ───────────────────────────────────────────────────
+    #[test]
+    fn trend_stable_when_insufficient_history() {
+        let mut m = ThermalManager::new();
+        m.update(50.0, 50.0, 50.0, 0, 0);
+        m.update(50.0, 50.0, 50.0, 0, 0);
+        // <3 samples → forced Stable.
+        assert_eq!(m.calculate_trend(), ThermalTrend::Stable);
+    }
+
+    #[test]
+    fn trend_cooling_detected() {
+        let mut m = ThermalManager::new();
+        for t in [80.0_f32, 75.0, 70.0, 65.0, 60.0] {
+            m.update(t, t, t, 0, 0);
+        }
+        assert_eq!(m.calculate_trend(), ThermalTrend::Cooling);
+    }
+
+    #[test]
+    fn trend_critical_on_rapid_sustained_rise() {
+        let mut m = ThermalManager::new();
+        for t in [50.0_f32, 55.0, 60.0, 65.0, 70.0, 75.0] {
+            m.update(t, t, t, 0, 0);
+        }
+        // avg_delta = 5.0 (>0.3) and every step rises (ratio 1.0 > 0.6).
+        assert_eq!(m.calculate_trend(), ThermalTrend::Critical);
+    }
+
+    // ─── Throttle prediction clamping (u8 0..=100, no overflow/underflow) ────────
+    #[test]
+    fn predict_throttle_clamps_to_100() {
+        let mut m = ThermalManager::new();
+        // Well above shutdown threshold + rising → base 100 + trend → must clamp.
+        for t in [95.0_f32, 100.0, 105.0, 110.0, 115.0] {
+            m.update(t, t, t, 100, 0);
+        }
+        let p = m.predict_throttle_level(ThermalTrend::Critical);
+        assert!(p <= 100, "predicted throttle must never exceed 100, got {p}");
+    }
+
+    #[test]
+    fn predict_throttle_no_underflow_when_cooling_cold() {
+        let mut m = ThermalManager::new();
+        // Cold + cooling: base_throttle 0, trend_adjustment -5 → max(0) guards it.
+        m.update(40.0, 40.0, 40.0, 0, 0);
+        let p = m.predict_throttle_level(ThermalTrend::Cooling);
+        assert_eq!(p, 0, "cold+cooling must floor at 0, not wrap u8");
+    }
+
+    #[test]
+    fn predict_zero_with_empty_history() {
+        let m = ThermalManager::new();
+        assert_eq!(m.predict_throttle_level(ThermalTrend::Warming), 0);
+    }
+
+    // ─── time_to_throttle forecasting ───────────────────────────────────────────
+    #[test]
+    fn time_to_throttle_zero_when_already_hot() {
+        let m = ThermalManager::new();
+        assert_eq!(m.time_to_throttle(90.0), Some(0));
+        assert_eq!(m.time_to_throttle(95.0), Some(0));
+    }
+
+    #[test]
+    fn time_to_throttle_none_when_cooling() {
+        let mut m = ThermalManager::new();
+        for t in [80.0_f32, 75.0, 70.0] {
+            m.update(t, t, t, 0, 0);
+        }
+        // Falling temps → no throttle forecast.
+        assert_eq!(m.time_to_throttle(70.0), None);
+    }
+
+    #[test]
+    fn state_fields_passthrough_raw_temps() {
+        // update() must report the *raw* (un-jitter-boosted) temps in ThermalState
+        // even though the snapshot stores the boosted cpu_temp.
+        let mut m = ThermalManager::new();
+        let st = m.update(50.0, 60.0, 55.0, 30, 700);
+        assert_eq!(st.cpu_temp, 50.0, "ThermalState reports raw cpu_temp");
+        assert_eq!(st.gpu_temp, 60.0);
+        assert_eq!(st.mem_temp, 55.0);
+        assert_eq!(st.current_throttle_level, 30);
+        // But the snapshot kept the boosted value (+7 for jitter 700).
+        assert_eq!(m.history.back().unwrap().cpu_temp, 57.0);
+    }
+}
