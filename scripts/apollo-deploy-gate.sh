@@ -121,18 +121,18 @@ sudo cat /var/lib/apollo/runtime_metrics.json > "$POST_SNAP" 2>/dev/null || echo
 # A genuinely sick daemon still fails: failures/last_error are checked
 # independently, and a daemon that never computes AIS in 6.5 min total
 # fails the floor check with 0.0 as before.
-# Gate calibration v3 (2026-06-10): two consecutive false-FAILs showed the
-# pattern — ais_resource is unstable below ~400 cycles (gate saw 84-85 at
-# cycle 150; same daemon read 92+ S at cycle 450 both times). Judge only
-# once BOTH ais_score > 0 AND cycles >= 400, waiting up to 480s extra.
-AIS_READY=$(python3 -c "import json; m=json.load(open('$POST_SNAP')); print(1 if m.get('ais_score', 0) > 0 and m.get('cycles', 0) >= 400 else 0)")
+# Gate calibration v4 (2026-06-10): v3's cycles>=400 still false-FAILed —
+# the windowed AIS components (signal, adaptability) need ~800 cycles to
+# fill, not 400 (gate saw 84-85 at cycle 425; same daemon read 92+ S at
+# cycle 825). Judge only once score>0 AND cycles>=800, up to 720s extra.
+AIS_READY=$(python3 -c "import json; m=json.load(open('$POST_SNAP')); print(1 if m.get('ais_score', 0) > 0 and m.get('cycles', 0) >= 800 else 0)")
 WAITED=0
-while [ "$AIS_READY" = "0" ] && [ "$WAITED" -lt 480 ]; do
-  yellow "[gate-3] AIS warming (need score>0 and cycles>=400) — waiting 30s (waited ${WAITED}s)..."
+while [ "$AIS_READY" = "0" ] && [ "$WAITED" -lt 720 ]; do
+  yellow "[gate-3] AIS warming (need score>0 and cycles>=800) — waiting 30s (waited ${WAITED}s)..."
   sleep 30
   WAITED=$((WAITED + 30))
   sudo cat /var/lib/apollo/runtime_metrics.json > "$POST_SNAP" 2>/dev/null || echo '{}' > "$POST_SNAP"
-  AIS_READY=$(python3 -c "import json; m=json.load(open('$POST_SNAP')); print(1 if m.get('ais_score', 0) > 0 and m.get('cycles', 0) >= 400 else 0)")
+  AIS_READY=$(python3 -c "import json; m=json.load(open('$POST_SNAP')); print(1 if m.get('ais_score', 0) > 0 and m.get('cycles', 0) >= 800 else 0)")
 done
 POST_AIS=$(python3 -c "import json; print(json.load(open('$POST_SNAP')).get('ais_score', 0))")
 POST_FAILS=$(python3 -c "import json; print(json.load(open('$POST_SNAP')).get('failures', 0))")
