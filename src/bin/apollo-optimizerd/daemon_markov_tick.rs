@@ -86,6 +86,19 @@ pub fn run_markov_tick(
                 .unwrap_or(false);
             if hit {
                 *markov_hit_count += 1;
+                // Evolve iter-4: prediction landed — runningboard owns the
+                // now-foreground app's priorities; drop the ledger backstop.
+                apollo_engine::engine::effect_ledger::forget_global(
+                    &apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
+                        pid: warmed_pid,
+                        prior: 0,
+                    },
+                );
+                apollo_engine::engine::effect_ledger::forget_global(
+                    &apollo_engine::engine::effect_ledger::AppliedEffect::MachTier {
+                        pid: warmed_pid,
+                    },
+                );
             } else {
                 *markov_miss_count += 1;
                 // Anti-ratchet (2026-06-10 fight-hunt): a missed prediction
@@ -105,6 +118,18 @@ pub fn run_markov_tick(
                     pid = warmed_pid,
                     predicted = %predicted,
                     "markov-miss: reverted pre-warm jetsam/tier"
+                );
+                // Evolve iter-4: already reverted — drop the ledger backstop.
+                apollo_engine::engine::effect_ledger::forget_global(
+                    &apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
+                        pid: warmed_pid,
+                        prior: 0,
+                    },
+                );
+                apollo_engine::engine::effect_ledger::forget_global(
+                    &apollo_engine::engine::effect_ledger::AppliedEffect::MachTier {
+                        pid: warmed_pid,
+                    },
                 );
             }
             *last_markov_prethaw = None;
@@ -152,6 +177,25 @@ pub fn run_markov_tick(
                     let mut qos = state.mach_qos.lock_recover();
                     qos.set_tier(pid, SchedulingTier::Foreground);
                 }
+                // Evolve iter-4: ledger backstop. The miss-check 1 cycle later
+                // is the fast revert; the ledger catches the slow paths (miss
+                // check never ran — daemon restart, prediction window skipped).
+                let (warm_sec, _) = apollo_engine::engine::daemon_helpers::pid_start_time(pid);
+                apollo_engine::engine::effect_ledger::record_global(
+                    apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
+                        pid,
+                        prior: prior_jetsam,
+                    },
+                    apollo_engine::engine::effect_ledger::DEFAULT_TTL,
+                    warm_sec,
+                    "markov pre-warm: jetsam FOREGROUND",
+                );
+                apollo_engine::engine::effect_ledger::record_global(
+                    apollo_engine::engine::effect_ledger::AppliedEffect::MachTier { pid },
+                    apollo_engine::engine::effect_ledger::DEFAULT_TTL,
+                    warm_sec,
+                    "markov pre-warm: Foreground tier",
+                );
                 if cache_warm_allowed {
                     cache_warmer.warm_pid(pid);
                 }

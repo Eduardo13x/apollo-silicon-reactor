@@ -27,7 +27,6 @@ pub mod compressor_aware;
 pub mod config_reloader;
 pub mod contention_detector;
 pub mod contention_tracker;
-pub mod boost_ledger;
 pub mod effect_ledger;
 pub mod coreaudio_active;
 pub mod cpu_saturation;

@@ -3951,41 +3951,22 @@ fn main() -> anyhow::Result<()> {
                     zombie_hunter.cleanup(&live);
                 }
 
-                // Anti-ratchet boost decay (2026-06-10 fight-hunt): revert
-                // nice/-10 + Foreground tier for boosts older than 10 min
-                // whose process is no longer foreground. Without this the
-                // boost side-effects persisted forever and propagated to
-                // children via fork inheritance (observed: 13 processes at
-                // nice -10 including the user's shell and a Photos widget).
-                // Re-boosts refresh the ledger, so an actively-qualifying
-                // interactive app never decays while in use.
+                // Evolve iter-4 (2026-06-10): unified EffectLedger reconcile
+                // replaces the ad-hoc boost-decay sweep. ALL recorded kernel
+                // mutations (nice, tier, jetsam band, App Nap, memlimit,
+                // Darwin-BG) revert here once their justification expires —
+                // identity-guarded, foreground-exempt. One chokepoint instead
+                // of five bespoke trackers. [Saltzer & Schroeder 1975]
                 if cycle_count % 30 == 0 {
-                    let expired = apollo_engine::engine::boost_ledger::drain_expired(
+                    let reverted = apollo_engine::engine::effect_ledger::reconcile_global(
                         foreground_pid,
+                        &state.mach_qos,
                     );
-                    for (pid, recorded_start_sec) in expired {
-                        // PID-recycle guard: only revert the same process
-                        // we boosted. A recycled PID keeps its fresh state.
-                        let (live_sec, _) =
-                            apollo_engine::engine::daemon_helpers::pid_start_time(pid);
-                        if live_sec != recorded_start_sec || live_sec == 0 {
-                            continue;
-                        }
-                        unsafe {
-                            libc::setpriority(libc::PRIO_PROCESS, pid, 0);
-                        }
-                        {
-                            let mut qos = state.mach_qos.lock_recover();
-                            qos.set_tier(
-                                pid,
-                                apollo_engine::engine::mach_qos::SchedulingTier::Normal,
-                            );
-                        }
-                        lf_metrics.inc_boost_revert();
-                        tracing::debug!(pid, "boost-decay: reverted nice/tier to normal");
+                    if reverted > 0 {
+                        tracing::info!(reverted, "effect-ledger: reconcile pass");
                     }
                     let live: Vec<u32> = hunt_snaps.iter().map(|h| h.pid).collect();
-                    apollo_engine::engine::boost_ledger::cleanup(&live);
+                    apollo_engine::engine::effect_ledger::cleanup_global(&live);
                 }
 
                 // Survival mode: overflow recording, swap streak, purge, threshold decay.

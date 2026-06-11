@@ -504,13 +504,23 @@ pub fn execute_actions(
                             apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Interactive);
                         }
                         let _ = set_nice(*pid, -10);
-                        // Anti-ratchet (2026-06-10): enroll in the boost
-                        // ledger so the periodic sweep reverts nice/tier
-                        // once the process stops qualifying. Without this,
-                        // -10 persisted forever and propagated to children
-                        // via fork inheritance (observed: user's shell and
-                        // all its children at -10).
-                        crate::engine::boost_ledger::record_boost(*pid, *start_sec);
+                        // Evolve iter-4 (2026-06-10): unified EffectLedger
+                        // replaces the ad-hoc boost_ledger. Both side-effects
+                        // of a boost (nice -10 + Foreground tier) are now
+                        // recorded with their undo; reconcile_global reverts
+                        // them once the process stops qualifying.
+                        crate::engine::effect_ledger::record_global(
+                            crate::engine::effect_ledger::AppliedEffect::Nice { pid: *pid },
+                            crate::engine::effect_ledger::DEFAULT_TTL,
+                            *start_sec,
+                            "boost: renice -10",
+                        );
+                        crate::engine::effect_ledger::record_global(
+                            crate::engine::effect_ledger::AppliedEffect::MachTier { pid: *pid },
+                            crate::engine::effect_ledger::DEFAULT_TTL,
+                            *start_sec,
+                            "boost: Foreground tier",
+                        );
                     }
                     out.boosts_applied += 1;
                     // FIX-4-v2 (2026-06-07): phantom-enrollment guard.
