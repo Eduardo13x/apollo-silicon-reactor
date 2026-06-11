@@ -1574,14 +1574,25 @@ fn main() -> anyhow::Result<()> {
                 // doesn't worsen the very pressure it's trying to mitigate.
                 // Fast-tick bypasses (kqueue Critical / hw_predictor events).
                 let high_pressure_throttle = prev_pressure_smooth > 0.80;
+                // Evolve 2026-06-10 (battery footprint): idle-aware cadence.
+                // When the user has been idle for minutes on battery, drop
+                // the daemon from 3.3 Hz to 0.2-0.33 Hz — the per-PID
+                // enrichment storm + ioreg poll were pure energy drain with
+                // no responsiveness benefit while away. Crises still preempt:
+                // is_fast_tick forces 0 here, and the reactor condvar wakes
+                // the loop immediately on kqueue Critical regardless of floor.
                 let min_inter_cycle_ms = if dry_run || is_fast_tick {
                     0
-                } else if battery_low {
-                    1000
-                } else if high_pressure_throttle {
-                    1000
                 } else {
-                    300
+                    apollo_engine::engine::power_management::adaptive_cycle_floor_ms(
+                        apollo_engine::engine::power_management::CadenceInputs {
+                            on_battery: power_mgr.is_on_battery(),
+                            battery_low,
+                            pressure_smooth: prev_pressure_smooth,
+                            idle_secs: last_user_context_for_voting.idle_secs.max(0.0) as u64,
+                            high_pressure: high_pressure_throttle,
+                        },
+                    )
                 };
                 let since_last = last_cycle_end.elapsed();
                 if min_inter_cycle_ms > 0 && since_last < Duration::from_millis(min_inter_cycle_ms)

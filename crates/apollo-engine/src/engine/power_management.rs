@@ -638,9 +638,120 @@ impl Default for PowerManager {
     }
 }
 
+/// Inputs to the adaptive daemon-cadence floor decision. Cheap, copyable
+/// snapshot of the signals the main loop already has in scope.
+#[derive(Debug, Clone, Copy)]
+pub struct CadenceInputs {
+    /// On battery power (any charge level), not on AC.
+    pub on_battery: bool,
+    /// Battery low (<20%) and discharging — the existing aggressive tier.
+    pub battery_low: bool,
+    /// Smoothed memory pressure [0,1] from the previous cycle.
+    pub pressure_smooth: f64,
+    /// HID idle seconds from the previous cycle's user context.
+    pub idle_secs: u64,
+    /// Sustained high pressure (>0.80) — daemon throttles its own footprint.
+    pub high_pressure: bool,
+}
+
+/// Minimum inter-cycle floor (ms) for the daemon main loop, BEFORE the
+/// fast-tick / dry-run bypass (those force 0 upstream).
+///
+/// Evolve 2026-06-10 (battery footprint). The daemon polled at 3.3 Hz
+/// (300 ms floor) whenever it wasn't battery-critical or thrashing — even
+/// when the user had been idle for minutes on battery. At 3.3 Hz each
+/// cycle spawns the per-PID enrichment storm + ioreg HID poll: pure
+/// energy drain with zero responsiveness benefit while the user is away.
+///
+/// Real crises still preempt the floor: the reactor thread signals
+/// `cycle_condvar` on kqueue Critical / hw_predictor events, waking the
+/// loop immediately regardless of this value (and `is_fast_tick` forces
+/// the floor to 0 upstream). Memory pressure that builds DURING idle is
+/// slow — 0.2-0.33 Hz samples it with ample margin.
+///
+/// Tiers (first match wins; crisis tiers keep priority over idle tiers):
+/// - high pressure (>0.80) OR battery-low → 1000 ms (existing aggressive)
+/// - on battery + deep idle (≥10 min) + calm (<0.55) → 5000 ms (0.2 Hz)
+/// - on battery + idle (≥2 min) + calm (<0.55)        → 3000 ms (0.33 Hz)
+/// - AC + deep idle (≥10 min) + calm (<0.45)          → 1000 ms (mild —
+///   fewer background wakeups leave headroom for foreground even plugged in)
+/// - else → 300 ms (responsive default)
+///
+/// [Hellerstein 2004 §9] adaptive control: sample rate must reflect the
+/// operating regime. Idle is the lowest-urgency regime.
+pub fn adaptive_cycle_floor_ms(i: CadenceInputs) -> u64 {
+    const IDLE_SECS: u64 = 120;
+    const DEEP_IDLE_SECS: u64 = 600;
+    const CALM: f64 = 0.55;
+    const AC_CALM: f64 = 0.45;
+
+    if i.high_pressure || i.battery_low {
+        return 1000;
+    }
+    if i.on_battery && i.pressure_smooth < CALM {
+        if i.idle_secs >= DEEP_IDLE_SECS {
+            return 5000;
+        }
+        if i.idle_secs >= IDLE_SECS {
+            return 3000;
+        }
+    }
+    if !i.on_battery && i.idle_secs >= DEEP_IDLE_SECS && i.pressure_smooth < AC_CALM {
+        return 1000;
+    }
+    300
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ci(on_battery: bool, idle: u64, p: f64) -> CadenceInputs {
+        CadenceInputs {
+            on_battery,
+            battery_low: false,
+            pressure_smooth: p,
+            idle_secs: idle,
+            high_pressure: false,
+        }
+    }
+
+    #[test]
+    fn adaptive_cadence_idle_on_battery_slows_dramatically() {
+        // Active on battery → responsive default.
+        assert_eq!(adaptive_cycle_floor_ms(ci(true, 0, 0.30)), 300);
+        // Idle 2 min on battery, calm → 0.33 Hz.
+        assert_eq!(adaptive_cycle_floor_ms(ci(true, 120, 0.30)), 3000);
+        // Deep idle 10 min on battery, calm → 0.2 Hz.
+        assert_eq!(adaptive_cycle_floor_ms(ci(true, 600, 0.30)), 5000);
+    }
+
+    #[test]
+    fn adaptive_cadence_crisis_overrides_idle() {
+        // High pressure beats idle — full speed even if idle.
+        let mut c = ci(true, 600, 0.90);
+        c.high_pressure = true;
+        assert_eq!(adaptive_cycle_floor_ms(c), 1000);
+        // Battery-low beats idle.
+        let mut c2 = ci(true, 600, 0.30);
+        c2.battery_low = true;
+        assert_eq!(adaptive_cycle_floor_ms(c2), 1000);
+        // Idle but NOT calm (pressure ≥0.55) → stays responsive (pressure
+        // could climb; don't under-sample).
+        assert_eq!(adaptive_cycle_floor_ms(ci(true, 600, 0.60)), 300);
+    }
+
+    #[test]
+    fn adaptive_cadence_ac_idle_mild_only() {
+        // On AC active → default.
+        assert_eq!(adaptive_cycle_floor_ms(ci(false, 0, 0.30)), 300);
+        // On AC idle 2 min → still default (no battery to save).
+        assert_eq!(adaptive_cycle_floor_ms(ci(false, 120, 0.30)), 300);
+        // On AC deep idle + very calm → mild 1 Hz (background headroom).
+        assert_eq!(adaptive_cycle_floor_ms(ci(false, 600, 0.30)), 1000);
+        // On AC deep idle but pressure ≥0.45 → default.
+        assert_eq!(adaptive_cycle_floor_ms(ci(false, 600, 0.50)), 300);
+    }
 
     #[test]
     fn test_detect_power_state_returns_real_values() {
