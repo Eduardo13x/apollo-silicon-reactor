@@ -96,6 +96,13 @@ pub fn run_maintenance_tick(
     let thrash = snap.pressure.thrashing_score;
     state.push_thrashing(thrash);
     let p_oom_30s = shadow_signals::get_p_oom_30s().unwrap_or(0.0);
+    // Fresh full-duplex call probe (~100µs, two CoreAudio round-trips). This
+    // is the robust call signal: it reads the live mic+output device state, so
+    // it catches browser-based Meet (whose pmset assertion owner is "Brave",
+    // not a CALL_APP_NAME) and is immune to the pmset poll TTL that lets
+    // ctx.audio_active go stale between samples — the exact gap that let
+    // mid-call purges through.
+    let realtime_call = apollo_engine::engine::coreaudio_active::is_realtime_call_active();
     let emergency = emergency_thrashing_purge_allowed(
         thrash,
         p_oom_30s,
@@ -103,6 +110,7 @@ pub fn run_maintenance_tick(
         state,
         build_active,
         bus_saturated,
+        realtime_call,
     );
     if emergency && std::process::Command::new("purge").spawn().is_ok() {
         state.mark_purged();
@@ -116,6 +124,17 @@ pub fn run_maintenance_tick(
             "maintenance: emergency thrashing-bypass purge"
         );
         return true;
+    }
+
+    // Normal-path hard guard: a live full-duplex call blocks the background
+    // purge regardless of the (possibly stale) pmset audio_active flag. The
+    // normal path is "background maintenance" — it has no business stalling a
+    // call. Counted under the idle aggregate, same as the MediaActive skip.
+    if realtime_call {
+        lf_metrics
+            .maintenance_purge_skipped_idle_total
+            .fetch_add(1, Ordering::Relaxed);
+        return false;
     }
 
     match should_fire(snap, ctx, state, build_active, bus_saturated) {
@@ -181,6 +200,7 @@ fn emergency_thrashing_purge_allowed(
     state: &MaintenanceState,
     build_active: bool,
     bus_saturated: bool,
+    realtime_call: bool,
 ) -> bool {
     if thrash <= EMERGENCY_THRASHING_PURGE_SCORE
         || !state.thrashing_streak_above(
@@ -200,6 +220,22 @@ fn emergency_thrashing_purge_allowed(
 
     if bus_saturated && !critical_lockup {
         return false;
+    }
+
+    // 2026-06-11 fight-hunt fix — "se purgea mucho en llamadas / ruido raro":
+    // a `purge` stalls the whole system for tens of ms → CoreAudio buffer
+    // underrun (audible crackle) on a live call. The B.5 bypass below was too
+    // aggressive: a thrash STREAK alone (consecutive_thrash_50k_cycles >= 10,
+    // which also flips critical_lockup) bypassed the media gate, firing purges
+    // mid-Meet. During a GENUINE full-duplex call (mic+output both running —
+    // a fresh CoreAudio probe, robust where the pmset audio_active flag is
+    // stale or a browser owns the assertion), ONLY a genuinely PREDICTED OOM
+    // (p_oom_30s past the critical bar) may eat the stall. The streak
+    // heuristic does not qualify: a flow-crisis is survivable, a mid-call
+    // glitch is certain. An imminent OOM kill would drop the call anyway, so
+    // there the stall is the lesser evil.
+    if realtime_call {
+        return thrash > CRITICAL_THRASHING_PURGE_SCORE && p_oom_30s >= CRITICAL_THRASHING_P_OOM;
     }
 
     // B.5 (2026-06-09): sustained 50k+ thrashing (≥10 cycles) bypasses the
@@ -561,16 +597,44 @@ mod tests {
         state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
 
         assert!(
-            !emergency_thrashing_purge_allowed(30_000.0, 0.90, &ctx, &state, false, false),
+            !emergency_thrashing_purge_allowed(30_000.0, 0.90, &ctx, &state, false, false, false),
             "moderate emergency thrashing should still respect active media"
         );
         assert!(
-            !emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, false),
+            !emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, false, false),
             "critical thrashing without high p_oom should still respect active media"
         );
         assert!(
-            emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, false, false),
+            emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, false, false, false),
             "critical sustained thrashing plus high p_oom should bypass media politeness"
+        );
+    }
+
+    #[test]
+    fn emergency_thrashing_realtime_call_blocks_streak_bypass() {
+        // 2026-06-11: a live full-duplex call must NOT be interrupted by the
+        // B.5 thrash-streak bypass — only true OOM imminence (critical_lockup)
+        // may eat the purge stall. Reproduces "se purgea mucho en llamadas".
+        let ctx = idle_ctx(); // no pmset media flag — the call is browser-based
+        let mut state = MaintenanceState::default();
+        state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
+        state.consecutive_thrash_50k_cycles = 12; // would trip the B.5 streak bypass
+
+        // Without a realtime call, the 50k streak bypasses → purge allowed.
+        assert!(
+            emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, false, false),
+            "50k streak bypasses media politeness when NO realtime call"
+        );
+        // With a realtime call but p_oom below critical → blocked (the fix).
+        assert!(
+            !emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, false, true),
+            "live call + sub-critical p_oom must NOT purge (audio-glitch guard)"
+        );
+        // But genuine OOM imminence (high p_oom) still bypasses even a call —
+        // an OOM kill would drop the call anyway; the stall is the lesser evil.
+        assert!(
+            emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, false, false, true),
+            "critical_lockup (high p_oom) overrides the realtime-call guard"
         );
     }
 
@@ -581,15 +645,15 @@ mod tests {
         state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
 
         assert!(
-            !emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, true, false),
+            !emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, true, false, false),
             "build mode remains protected under critical thrashing"
         );
         assert!(
-            !emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, true),
+            !emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, true, false),
             "bus saturation remains protected without high p_oom"
         );
         assert!(
-            emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, false, true),
+            emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, false, true, false),
             "high p_oom critical thrashing may bypass bus saturation to avoid lockup"
         );
     }
