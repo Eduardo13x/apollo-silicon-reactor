@@ -352,6 +352,12 @@ const EFFECT_PRESSURE_UNCHANGED: &str = "pressure_no_change";
 /// Minimum pressure delta to count as a "drop".
 const MIN_DELTA: f32 = 0.02;
 
+impl Default for CausalGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CausalGraph {
     pub fn new() -> Self {
         Self {

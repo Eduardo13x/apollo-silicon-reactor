@@ -118,7 +118,7 @@ impl HoltWinters {
     ///   - forecast: predicted pressure [0.0, 1.0]
     ///   - confidence: [0.0, 1.0] based on observations (needs ~48h for full confidence)
     pub fn forecast(&self, current_hour: u8, hours_ahead: u8) -> (f64, f64) {
-        let target_hour = ((current_hour as usize + hours_ahead as usize) % PERIOD) as usize;
+        let target_hour = ((current_hour as usize + hours_ahead as usize) % PERIOD);
         let seasonal = self.state.seasonal[target_hour];
 
         let forecast = (self.state.level + self.state.trend * hours_ahead as f64) * seasonal;
@@ -131,7 +131,7 @@ impl HoltWinters {
 
     /// Get the seasonal factor for a given hour (1.0 = average).
     /// >1.0 = pressure typically higher than average at this hour.
-    /// <1.0 = pressure typically lower.
+    /// > <1.0 = pressure typically lower.
     pub fn seasonal_factor(&self, hour: u8) -> f64 {
         self.state.seasonal[(hour as usize) % PERIOD]
     }

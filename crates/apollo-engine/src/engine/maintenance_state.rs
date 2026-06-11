@@ -42,7 +42,7 @@ pub struct MaintenanceState {
     /// 2026-05-12 Gate F: count of consecutive cycles with thrashing_score
     /// above the "sustained flow crisis" threshold. Increments when thrash
     /// > 15_000, resets to 0 below. Reaches ≥3 → emergency purge bypass.
-    /// Skipped from persistence — re-initializes to 0 per daemon restart.
+    /// > Skipped from persistence — re-initializes to 0 per daemon restart.
     #[serde(skip)]
     pub consecutive_thrash_cycles: u32,
 
@@ -93,7 +93,7 @@ impl MaintenanceState {
     pub fn tick_pressure_band(&mut self, pressure: f64) {
         if (0.55..0.70).contains(&pressure) {
             self.purge_band_eligible = true;
-        } else if pressure >= 0.75 || pressure < 0.50 {
+        } else if !(0.50..0.75).contains(&pressure) {
             self.purge_band_eligible = false;
         }
         // [0.70, 0.75) and [0.50, 0.55): hold previous state (hysteresis).

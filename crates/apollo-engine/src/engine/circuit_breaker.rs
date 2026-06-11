@@ -114,7 +114,7 @@ impl CircuitBreaker {
         match self.state {
             CircuitState::Open => {
                 self.rejected_total += 1;
-                return Err(CircuitError::Open);
+                Err(CircuitError::Open)
             }
             CircuitState::Closed | CircuitState::HalfOpen => match f() {
                 Ok(v) => {

@@ -717,6 +717,12 @@ pub struct LockFreeMetrics {
 /// is for fire-and-forget cycle/system counters.
 pub static LSE_COUNTERS: LockFreeMetrics = LockFreeMetrics::new();
 
+impl Default for LockFreeMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LockFreeMetrics {
     pub const fn new() -> Self {
         Self {

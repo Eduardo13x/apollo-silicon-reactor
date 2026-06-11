@@ -801,7 +801,7 @@ impl Effector for PurgeableEffector {
             syscall_us,
             // S9: batched effector — number of purgeable regions visited /
             // madvise'd in the inner walker. 0 ⇔ no_op (no regions found).
-            applied_count: purged_regions as u32,
+            applied_count: purged_regions,
         })
     }
 }

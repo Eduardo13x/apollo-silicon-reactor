@@ -226,13 +226,12 @@ impl ThermalManager {
                 recommendations
                     .push("🔴 CRITICAL: Applying emergency thermal throttling".to_string());
             }
-            ThermalTrend::Warming => {
-                if state > 75.0 {
+            ThermalTrend::Warming
+                if state > 75.0 => {
                     recommendations.push(
                         "🟡 Temperature rising: Consider reducing background load".to_string(),
                     );
                 }
-            }
             _ => {}
         }
 

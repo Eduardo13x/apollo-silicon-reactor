@@ -178,6 +178,12 @@ pub struct DisplayTurbo {
     dwell_secs: u64,
 }
 
+impl Default for DisplayTurbo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DisplayTurbo {
     pub fn new() -> Self {
         Self {

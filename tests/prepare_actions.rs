@@ -44,6 +44,7 @@ mod scenarios {
                 thermal_level: "nominal".to_string(),
                 compressor_pressure: 0.0,
                 thrashing_score: 0.0,
+                memory_pressure_raw: 0.0,
             },
             disks: vec![],
             networks: vec![],
@@ -85,12 +86,25 @@ mod scenarios {
     /// A03: High CPU (90%) → ThermalConstrained.
     #[test]
     fn a03_high_cpu_is_thermal() {
+        // Evolve iter-2 (2026-06-10): bare CPU 90% with NO thermal signal is
+        // healthy full utilization → BackgroundPressure, not
+        // ThermalConstrained. With the real thermal-emergency signal set,
+        // the same CPU escalates. [Hellerstein 2004 §9]
+        apollo_engine::engine::shadow_signals::set_thermal_emergency(false);
         let snap = make_snapshot(90.0, 0.40, 0.0);
         let ctx = context_from_pressure(&snap, &OverflowThresholds::default());
         assert!(
-            matches!(ctx, InteractiveContext::ThermalConstrained),
-            "CPU 90% > 88% → ThermalConstrained. Got {:?}",
+            matches!(ctx, InteractiveContext::BackgroundPressure),
+            "CPU 90% without heat → BackgroundPressure. Got {:?}",
             ctx
+        );
+        apollo_engine::engine::shadow_signals::set_thermal_emergency(true);
+        let ctx2 = context_from_pressure(&snap, &OverflowThresholds::default());
+        apollo_engine::engine::shadow_signals::set_thermal_emergency(false);
+        assert!(
+            matches!(ctx2, InteractiveContext::ThermalConstrained),
+            "CPU 90% WITH thermal emergency → ThermalConstrained. Got {:?}",
+            ctx2
         );
     }
 

@@ -533,6 +533,12 @@ pub struct OutcomeTracker {
     pub blocked_patterns: HashMap<String, BlockedPattern>,
 }
 
+impl Default for OutcomeTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OutcomeTracker {
     pub fn new() -> Self {
         Self {

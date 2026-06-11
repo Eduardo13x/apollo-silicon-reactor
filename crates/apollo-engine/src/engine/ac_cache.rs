@@ -44,7 +44,7 @@ fn cache() -> &'static Mutex<Inner> {
 }
 
 fn hash_patterns(pats: &[&str], kind: MatchKind) -> u64 {
-    let mut v: Vec<&str> = pats.iter().copied().collect();
+    let mut v: Vec<&str> = pats.to_vec();
     v.sort_unstable();
     v.dedup();
     let mut h = DefaultHasher::new();

@@ -111,6 +111,12 @@ pub struct ApolloNeuromodulator {
     last_process_count: usize,
 }
 
+impl Default for ApolloNeuromodulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ApolloNeuromodulator {
     pub fn new() -> Self {
         Self {

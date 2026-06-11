@@ -65,6 +65,7 @@ fn neutral_ctx() -> ActionContext {
         pressure: 0.5,
         swap_gb: 1.0,
         thrashing_score: 0.0,
+        memory_pressure_raw: 0.0,
         p_oom_30s: Some(0.0),
         p_jank_60s: Some(0.0),
         has_sleep_assertion: false,

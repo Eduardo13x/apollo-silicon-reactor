@@ -1160,7 +1160,7 @@ pub fn behavioral_protection_score(
     // Recency: exponential decay over 10 minutes (600s).
     // At 0s → 1.0, at 300s → 0.61, at 600s → 0.37, at 1200s → 0.14.
     // e^(-t/600) is the natural decay — no threshold, just diminishing relevance.
-    let recency_signal = (-1.0 * secs_idle as f64 / 600.0).exp();
+    let recency_signal = (-(secs_idle as f64) / 600.0).exp();
 
     // Aggregate: max of all (any sign of life suffices).
     let activity = cpu_signal

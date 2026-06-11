@@ -688,7 +688,7 @@ impl PredictiveAgent {
         // No external deps — use total_cycles as a cheap deterministic rotator.
         // Forced pulls are marked with 0.0 confidence so callers can weight them.
         const EXPLORE_PERIOD: u64 = 20; // ~5% exploration rate
-        if self.total_cycles > 0 && self.total_cycles % EXPLORE_PERIOD == 0 && K > 1 {
+        if self.total_cycles > 0 && self.total_cycles.is_multiple_of(EXPLORE_PERIOD) && K > 1 {
             // Rotate through arms 1..K-1 (never force arm 0 = Observe).
             let forced_arm = ((self.total_cycles / EXPLORE_PERIOD) % (K as u64 - 1)) as usize + 1;
             let intervention = Intervention::from_index(forced_arm);

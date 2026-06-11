@@ -197,6 +197,12 @@ struct TierAssignment {
     applied_at: Instant,
 }
 
+impl Default for IoShaper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IoShaper {
     pub fn new() -> Self {
         Self {

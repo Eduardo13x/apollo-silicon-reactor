@@ -117,6 +117,12 @@ pub struct SkillRegistry {
     skills: HashMap<String, OptimizationSkill>,
 }
 
+impl Default for SkillRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SkillRegistry {
     pub fn new() -> Self {
         Self {

@@ -662,8 +662,8 @@ pub fn execute_actions(
                         out.push_skip(format!("critical-bg:{}", name));
                         block_reason = Some(BlockReason::CriticalBackground);
                     }
-                    if !dry_run {
-                        if caps.can_taskpolicy {
+                    if !dry_run
+                        && caps.can_taskpolicy {
                             // Phase 2: direct Mach syscalls for CPU tier routing.
                             // S4 cutover: short-guard Mutex lock.
                             if let Some(arc) = qos_mgr.as_ref() {
@@ -697,7 +697,6 @@ pub fn execute_actions(
                             let io_tier = io_tier_for_throttle(aggressive);
                             apply_io_tier(*pid, io_tier);
                         }
-                    }
                     out.throttles_applied += 1;
                 }
                 RootAction::FreezeProcess {

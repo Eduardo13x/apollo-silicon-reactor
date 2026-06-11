@@ -303,19 +303,16 @@ pub struct PolicyScore {
 /// recompiling. The default keeps behaviour byte-equivalent to the
 /// pre-Group-C scorer until the operator explicitly opts in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum AggregatorMode {
     /// Root-Sum-Square uncertainty composition (Sprint 11 default).
+    #[default]
     Rss,
     /// Dempster's rule of combination over per-feature BPAs, with RSS
     /// fallback on high conflict.
     Dempster,
 }
 
-impl Default for AggregatorMode {
-    fn default() -> Self {
-        Self::Rss
-    }
-}
 
 impl AggregatorMode {
     /// Parse the persisted [`LearnedState::policy_aggregator_mode`]

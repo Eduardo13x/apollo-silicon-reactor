@@ -620,6 +620,12 @@ pub struct EvolvedAnomalyDetector {
     recent_pressure: f32,
 }
 
+impl Default for EvolvedAnomalyDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EvolvedAnomalyDetector {
     pub fn new() -> Self {
         let mut rng = Rng::new(0xDEAD_BEEF_CAFE_1337);

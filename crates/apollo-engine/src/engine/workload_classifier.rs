@@ -421,10 +421,12 @@ impl Default for WorkloadClassifier {
 /// Coarse workload mode for threshold tuning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum WorkloadMode {
     Build,
     LlmInference,
     Browsing,
+    #[default]
     Idle,
 }
 
@@ -449,11 +451,6 @@ impl WorkloadMode {
     }
 }
 
-impl Default for WorkloadMode {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 /// Feature vector for nearest-centroid classification.
 pub struct WorkloadFeatures {

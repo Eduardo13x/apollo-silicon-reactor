@@ -372,9 +372,7 @@ impl LearningPipeline {
 
             // 3. Skill signal
             let skill_key = obs
-                .skill_name
-                .as_ref()
-                .map(|s| s.clone())
+                .skill_name.clone()
                 .unwrap_or_else(|| obs.registry_key());
             if let Some(rate) = skill_registry.success_rate(&skill_key) {
                 let apps = skill_registry.apply_count(&skill_key).unwrap_or_else(|| {

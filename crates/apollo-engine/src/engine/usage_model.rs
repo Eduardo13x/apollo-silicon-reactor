@@ -292,7 +292,7 @@ impl UsageModel {
         // to mirror `e.name.contains(p)` semantics). Sprint patch (2026-06-05):
         // route through the content-hash cache so identical pattern bundles
         // share one automaton across calls.
-        let never_interactive_vec: Vec<&str> = never_interactive.iter().copied().collect();
+        let never_interactive_vec: Vec<&str> = never_interactive.to_vec();
         let never_interactive_ac = crate::engine::ac_cache::get_or_build(
             &never_interactive_vec,
             aho_corasick::MatchKind::Standard,

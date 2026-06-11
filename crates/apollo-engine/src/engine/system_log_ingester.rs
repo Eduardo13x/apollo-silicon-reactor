@@ -84,6 +84,12 @@ pub struct SystemLogIngester {
     platform_unhealthy: bool,
 }
 
+impl Default for SystemLogIngester {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SystemLogIngester {
     pub fn new() -> Self {
         Self {
@@ -231,16 +237,13 @@ impl SystemLogIngester {
                 return None;
             }
         }
-        let output = match child.stdout.take().and_then(|out| {
+        let output = child.stdout.take().and_then(|out| {
             use std::io::Read;
             let mut buf = String::new();
             let mut reader = out;
             reader.read_to_string(&mut buf).ok()?;
             Some(buf)
-        }) {
-            Some(s) => s,
-            None => return None,
-        };
+        })?;
         Some(Self::parse_log_output(&output))
     }
 

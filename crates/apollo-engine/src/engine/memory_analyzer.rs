@@ -280,7 +280,7 @@ impl MemoryAnalyzer {
     pub fn major_fault_rate(&self, pid: u32) -> f64 {
         self.process_history
             .get(&pid)
-            .map(|h| Self::calculate_pagein_rate(h))
+            .map(Self::calculate_pagein_rate)
             .unwrap_or(0.0)
     }
 

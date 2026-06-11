@@ -298,7 +298,7 @@ impl ProfileGovernor {
         if input.context_switch_burst
             && !input.thermal_constrained
             && input.ram_pressure < 0.70
-            && self.balanced_lock_until.map_or(true, |t| t <= now)
+            && self.balanced_lock_until.is_none_or(|t| t <= now)
             && target != OptimizationProfile::AggressiveRoot
         {
             target = OptimizationProfile::AggressiveRoot;

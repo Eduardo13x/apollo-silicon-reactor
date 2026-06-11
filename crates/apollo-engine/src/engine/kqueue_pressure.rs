@@ -132,7 +132,7 @@ impl KqueuePressure {
             ident: pid as usize,
             filter: libc::EVFILT_PROC,
             flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
-            fflags: libc::NOTE_EXIT as u32,
+            fflags: libc::NOTE_EXIT,
             data: 0,
             udata: std::ptr::null_mut(),
         };

@@ -106,7 +106,7 @@ fn madvise_raw(ptr: *const u8, len: usize, advice: libc::c_int) -> io::Result<()
 ///   physical RAM and freezing it is pointless.
 pub fn check_resident(ptr: *const u8, len: usize) -> io::Result<Vec<bool>> {
     let ps = page_size();
-    let n_pages = (len + ps - 1) / ps;
+    let n_pages = len.div_ceil(ps);
     if n_pages == 0 {
         return Ok(vec![]);
     }
@@ -114,7 +114,7 @@ pub fn check_resident(ptr: *const u8, len: usize) -> io::Result<Vec<bool>> {
     // mincore wants page-aligned address
     let aligned = (ptr as usize) & !(ps - 1);
     let adjusted_len = (ptr as usize + len) - aligned;
-    let n_pages_adj = (adjusted_len + ps - 1) / ps;
+    let n_pages_adj = adjusted_len.div_ceil(ps);
 
     let mut vec = vec![0u8; n_pages_adj];
     let rc = unsafe {

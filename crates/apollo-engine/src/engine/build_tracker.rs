@@ -134,8 +134,8 @@ impl BuildTracker {
         }
 
         // Fallback: time-based estimate normalized to EXPECTED_BUILD_CYCLES.
-        let time_estimate = (self.build_cycles as f32 / EXPECTED_BUILD_CYCLES as f32).min(0.90);
-        time_estimate
+        
+        (self.build_cycles as f32 / EXPECTED_BUILD_CYCLES as f32).min(0.90)
     }
 
     fn classify_phase(&self) -> BuildPhase {

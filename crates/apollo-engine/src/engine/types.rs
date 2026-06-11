@@ -83,17 +83,14 @@ impl HardPath {
 /// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum OptimizationProfile {
+    #[default]
     BalancedRoot,
     AggressiveRoot,
     SafeRoot,
 }
 
-impl Default for OptimizationProfile {
-    fn default() -> Self {
-        Self::BalancedRoot
-    }
-}
 
 impl OptimizationProfile {
     pub fn as_str(self) -> &'static str {
@@ -110,17 +107,14 @@ impl OptimizationProfile {
 /// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum LatencyTarget {
     Low,
+    #[default]
     Normal,
     Max,
 }
 
-impl Default for LatencyTarget {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
 
 /// Cross-crate visibility: used by apollo-menubar (policy display), apollo-optimizerd
 /// (process_enrichment.rs, main.rs safety validation). Audited 2026-05-09 during Sprint 5
@@ -1479,7 +1473,7 @@ pub struct RuntimeMetrics {
     /// NARS concept drift score [0.0, 1.0].
     /// EMA of per-process belief frequency shifts after Revision rule.
     /// > 0.05: notable drift. > 0.08: recalibration triggered.
-    /// [Pei Wang 2013] Non-Axiomatic Reasoning System, §3.3.3
+    /// > [Pei Wang 2013] Non-Axiomatic Reasoning System, §3.3.3
     #[serde(default)]
     pub nars_drift_score: f64,
     /// Number of process beliefs currently in drifted state (freq shift >= 20pp).
@@ -2333,17 +2327,14 @@ pub struct LearnedPolicyStatus {
 /// over IPC to monitoring clients. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum LlmRunMode {
+    #[default]
     Sensitive,
     Strict,
     Off,
 }
 
-impl Default for LlmRunMode {
-    fn default() -> Self {
-        Self::Sensitive
-    }
-}
 
 /// Summary of circuit breaker and degradation state, returned by `GetHealth`.
 ///

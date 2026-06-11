@@ -268,13 +268,13 @@ impl SmcDirectReader {
             battery_temp_celsius: battery_temp,
             p_cluster_watts: self
                 .read_numeric(KEY_PCPC)
-                .filter(|&v| v >= 0.0 && v < 50.0),
+                .filter(|&v| (0.0..50.0).contains(&v)),
             gpu_watts: self
                 .read_numeric(KEY_PCPG)
-                .filter(|&v| v >= 0.0 && v < 50.0),
+                .filter(|&v| (0.0..50.0).contains(&v)),
             dc_in_current_amps: self
                 .read_numeric(KEY_ID0R)
-                .filter(|&v| v >= 0.0 && v < 10.0),
+                .filter(|&v| (0.0..10.0).contains(&v)),
             cpu_voltage: self.read_numeric(KEY_VC0C).filter(|&v| v > 0.0 && v < 2.0),
         })
     }

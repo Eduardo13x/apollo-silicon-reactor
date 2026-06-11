@@ -251,17 +251,15 @@ impl FluidityState {
             let name_ref = name.as_ref();
 
             // Launch detection (if not already active)
-            if self.initialized && !self.launch_active && !launch_found {
-                if !self.prev_pids.contains(&pid) && !is_renderer_or_helper(name_ref) {
-                    if is_launchable_app(name_ref) {
+            if self.initialized && !self.launch_active && !launch_found
+                && !self.prev_pids.contains(&pid) && !is_renderer_or_helper(name_ref)
+                    && is_launchable_app(name_ref) {
                         self.launch_active = true;
                         self.launch_pid = Some(pid);
                         self.launch_name = name_ref.to_string();
                         self.launch_cycles_remaining = LAUNCH_PROTECTION_CYCLES;
                         launch_found = true;
                     }
-                }
-            }
 
             // Offender tracking [Pearl 2009]
             if self.fluidity_degraded

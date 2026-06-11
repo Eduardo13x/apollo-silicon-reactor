@@ -945,7 +945,7 @@ pub fn decide_actions(
             }
             // Prepend so display boosts run before any throttle/freeze actions.
             display_boosts_emitted = display_boosts.len();
-            display_boosts.extend(actions.drain(..));
+            display_boosts.append(&mut actions);
             actions = display_boosts;
         }
     }

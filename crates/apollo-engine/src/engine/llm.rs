@@ -241,11 +241,10 @@ pub fn write_json_fsync(path: &Path, value: &impl Serialize, mode: Option<u32>, 
             {
                 let wrote = f.write_all(json.as_bytes()).is_ok();
                 let synced = !fsync || f.sync_all().is_ok();
-                if wrote && synced {
-                    if fs::rename(&tmp_path, path).is_ok() {
+                if wrote && synced
+                    && fs::rename(&tmp_path, path).is_ok() {
                         return;
                     }
-                }
                 // Cleanup temp on failure.
                 let _ = fs::remove_file(&tmp_path);
             }

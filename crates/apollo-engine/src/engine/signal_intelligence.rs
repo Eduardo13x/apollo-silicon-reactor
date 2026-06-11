@@ -123,7 +123,7 @@ pub struct SignalDigest {
     /// How far above the seasonal expectation current pressure is.
     /// [Holt 1957, Winters 1960] ratio: actual / (level * seasonal_factor).
     /// >1.0 = above seasonal norm. >1.5 at quiet hours = structural problem.
-    /// Wired from HoltWinters after each hourly update cycle.
+    /// > Wired from HoltWinters after each hourly update cycle.
     pub hw_seasonal_anomaly: f64,
 }
 

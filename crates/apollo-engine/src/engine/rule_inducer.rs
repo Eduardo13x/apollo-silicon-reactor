@@ -96,7 +96,7 @@ pub fn induce(
     // Used by group skill a_ok/b_ok individual evidence check.
     let mut by_process: HashMap<&str, ProcessStats> = HashMap::new();
     for rec in experience.records() {
-        if (rec.pressure_at_action as f64) < MIN_PRESSURE_AT_ACTION {
+        if rec.pressure_at_action < MIN_PRESSURE_AT_ACTION {
             continue;
         }
         let e = by_process.entry(rec.process_name.as_str()).or_default();
@@ -104,7 +104,7 @@ pub fn induce(
         if rec.pressure_drop > 0.0 {
             e.positive_drops += 1;
         }
-        e.sum_pressure += rec.pressure_at_action as f64;
+        e.sum_pressure += rec.pressure_at_action;
     }
 
     // ── 1. Group skills from co-occurrence pairs ──────────────────────────────
@@ -129,10 +129,10 @@ pub fn induce(
         // check — the co-spike frequency alone is sufficient evidence.
         // Otherwise require at least one process to have some positive signal.
         if *count < HIGH_COOCCUR_BYPASS {
-            let a_ok = by_process.get(a).map_or(false, |s| {
+            let a_ok = by_process.get(a).is_some_and(|s| {
                 s.total >= 3 && s.positive_drops as f64 / s.total as f64 >= 0.40
             });
-            let b_ok = by_process.get(b).map_or(false, |s| {
+            let b_ok = by_process.get(b).is_some_and(|s| {
                 s.total >= 3 && s.positive_drops as f64 / s.total as f64 >= 0.40
             });
             if !a_ok && !b_ok {
@@ -168,10 +168,10 @@ pub fn induce(
     {
         let mut buckets: HashMap<(i32, i32), Vec<&str>> = HashMap::new();
         for rec in experience.records() {
-            if (rec.pressure_drop as f64) < BATCH_MIN_DROP {
+            if rec.pressure_drop < BATCH_MIN_DROP {
                 continue;
             }
-            if (rec.pressure_at_action as f64) < MIN_PRESSURE_AT_ACTION {
+            if rec.pressure_at_action < MIN_PRESSURE_AT_ACTION {
                 continue;
             }
             if is_protected(rec.process_name.as_str(), protected) {

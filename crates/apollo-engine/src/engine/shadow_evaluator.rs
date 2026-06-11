@@ -68,12 +68,12 @@ pub const SCORER_STRONG_ACCEPT: f64 = 0.30;
 ///   `scorer_override_rejects_total`.
 /// * `LogStrongAccept { composite }` — gate REJECTED but scorer composite
 ///   > +0.30. The caller stays with the gate (REJECT), emits a journal
-///   event with reason `scorer-disagreement-strong-accept`, and bumps
-///   `scorer_disagreement_strong_accepts_total`. The action remains
-///   blocked — Sprint 11 deliberately refuses to let the scorer beat
-///   the gate in the unsafe direction (per NotebookLM 2026-05-16
-///   Candidate-C verdict; Sprint 12 may promote to symmetric once
-///   N≥500 events validate the asymmetric mode).
+///   > event with reason `scorer-disagreement-strong-accept`, and bumps
+///   > `scorer_disagreement_strong_accepts_total`. The action remains
+///   > blocked — Sprint 11 deliberately refuses to let the scorer beat
+///   > the gate in the unsafe direction (per NotebookLM 2026-05-16
+///   > Candidate-C verdict; Sprint 12 may promote to symmetric once
+///   > N≥500 events validate the asymmetric mode).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OverrideDecision {
     NoChange,

@@ -116,6 +116,12 @@ pub struct CacheWarmer {
     last_warmed: HashMap<u32, Instant>,
 }
 
+impl Default for CacheWarmer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CacheWarmer {
     pub fn new() -> Self {
         Self {

@@ -73,6 +73,12 @@ pub struct ContentionDetector {
     prev_heavy_pids: Vec<u32>,
 }
 
+impl Default for ContentionDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContentionDetector {
     pub fn new() -> Self {
         Self {

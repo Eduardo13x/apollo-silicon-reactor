@@ -63,6 +63,12 @@ pub struct EnergyPidTracker {
     pub baseline: ProcessBaselineMap,
 }
 
+impl Default for EnergyPidTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EnergyPidTracker {
     pub fn new() -> Self {
         Self {

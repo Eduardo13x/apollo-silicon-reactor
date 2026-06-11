@@ -89,25 +89,18 @@ impl SuggestionCategory {
 /// trust ∈ [0.0, 1.0]
 ///   0.5 = neutral (default)
 ///   >0.7 = reliable (Apollo trusts this class of advice)
-///   <0.3 = unreliable (Apollo should skip or double-check)
+/// > <0.3 = unreliable (Apollo should skip or double-check)
 ///
 /// Updated by EMA: trust_new = α·observation + (1-α)·trust_old
 ///   observation = 1.0 if outcome IMPROVED, 0.0 if WORSENED, 0.5 if NO_EFFECT
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct GemmaTrust {
     scores: HashMap<String, f32>,
     /// Count of observations per category (for evidence-based weighting).
     counts: HashMap<String, u32>,
 }
 
-impl Default for GemmaTrust {
-    fn default() -> Self {
-        Self {
-            scores: HashMap::new(),
-            counts: HashMap::new(),
-        }
-    }
-}
 
 impl GemmaTrust {
     /// Current trust for a category. Returns 0.5 (neutral) if never observed.
