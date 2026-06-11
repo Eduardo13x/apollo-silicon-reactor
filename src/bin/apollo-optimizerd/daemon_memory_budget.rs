@@ -249,6 +249,24 @@ pub fn run_memory_budget(
                 .insert(budget.pid, budget.inactive_limit_mb as u64);
             budget_state.last_applied_at = Some(now);
 
+            // Strangler-fig (phase-2): also record the memlimit in the
+            // unified EffectLedger so the periodic reconcile pass provides a
+            // TTL-based safety-net reversal (set_memlimit(pid, 0, 0)). The
+            // bespoke recovered-pid sweep below is the fast revert; the
+            // ledger catches the slow path where it never runs (daemon
+            // restart, the pid never re-evaluated under budget). Re-applying
+            // refreshes the TTL, so a continuously-over-budget process is
+            // never spuriously cleared. last_applied_limits stays the source
+            // of truth for the significant-change dedup above.
+            let (start_sec, _) =
+                apollo_engine::engine::daemon_helpers::pid_start_time(budget.pid);
+            apollo_engine::engine::effect_ledger::record_global(
+                apollo_engine::engine::effect_ledger::AppliedEffect::Memlimit { pid: budget.pid },
+                apollo_engine::engine::effect_ledger::DEFAULT_TTL,
+                start_sec,
+                "memory-budget: jetsam inactive limit",
+            );
+
             tracing::info!(
                 target: "apollo.memory_budget",
                 pid = budget.pid,
@@ -292,6 +310,11 @@ pub fn run_memory_budget(
     for pid in recovered {
         if jetsam_control::set_memlimit(pid, 0, 0).is_ok() {
             budget_state.last_applied_limits.remove(&pid);
+            // We reverted it ourselves — drop the ledger entry without a
+            // second (redundant) undo on the next reconcile.
+            apollo_engine::engine::effect_ledger::forget_global(
+                &apollo_engine::engine::effect_ledger::AppliedEffect::Memlimit { pid },
+            );
             tracing::info!(
                 target: "apollo.memory_budget",
                 pid,

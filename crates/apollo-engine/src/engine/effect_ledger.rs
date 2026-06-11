@@ -352,4 +352,65 @@ mod tests {
         l.forget(&e);
         assert!(l.is_empty());
     }
+
+    /// Strangler-fig phase-2: the memory-budget tracker migrated its memlimit
+    /// reversal into the ledger. Prove the Memlimit variant survives a full
+    /// round trip — record → expire/drain (the reconcile slow path) → gone,
+    /// and record → forget (the bespoke recovered-pid fast revert) → gone.
+    /// A miss here would leak a kernel memlimit that jetsam later enforces as a
+    /// background EXC_RESOURCE kill (the exact ratchet the migration closes).
+    #[test]
+    fn memlimit_records_and_reconciles_round_trip() {
+        let mut l = EffectLedger::new();
+        let e = AppliedEffect::Memlimit { pid: 901_007 };
+        assert_eq!(e.pid(), 901_007);
+
+        // Slow path: record with zero TTL, drain (the reconcile undo source).
+        l.record(e, Duration::from_secs(0), 55, "memory-budget: jetsam inactive limit");
+        assert_eq!(l.len(), 1, "memlimit recorded");
+        let drained = l.drain_expired(None);
+        assert_eq!(drained.len(), 1, "expired memlimit drains for undo");
+        assert!(matches!(drained[0].effect, AppliedEffect::Memlimit { pid: 901_007 }));
+        assert_eq!(drained[0].start_sec, 55, "PID-identity guard preserved");
+        assert!(l.is_empty(), "drained entry removed — no double undo");
+
+        // Fast path: record, then forget (producer reverted it itself).
+        l.record(e, DEFAULT_TTL, 55, "memory-budget: jetsam inactive limit");
+        assert_eq!(l.len(), 1);
+        l.forget(&e);
+        assert!(l.is_empty(), "forget drops the entry without a second undo");
+
+        // Memlimit coexists with other kinds for the same pid (upsert key).
+        l.record(e, DEFAULT_TTL, 55, "m");
+        l.record(nice(901_007), DEFAULT_TTL, 55, "n");
+        assert_eq!(l.len(), 2, "Memlimit and Nice for same pid are distinct keys");
+    }
+
+    /// Silent-telemetry-death guard: the reconcile undo bumps
+    /// `effect_ledger_reverts_total`, mirrored onto RuntimeMetrics with
+    /// `#[serde(default)]`. Prove the counter survives a JSON round trip from
+    /// an OLDER payload that lacks the field (deserializes to 0, not an error).
+    #[test]
+    fn effect_ledger_revert_counter_serde_default_survives_old_payload() {
+        // Serialize a full default, then STRIP the migration counter to emulate
+        // an older runtime_metrics.json written before the field existed.
+        let mut v = serde_json::to_value(crate::engine::types::RuntimeMetrics::default())
+            .expect("serialize default");
+        let obj = v.as_object_mut().expect("object");
+        assert!(
+            obj.remove("effect_ledger_reverts_total").is_some(),
+            "field must be present pre-strip (renamed/dropped = telemetry death)"
+        );
+        let m: crate::engine::types::RuntimeMetrics =
+            serde_json::from_value(v).expect("old payload missing the field must default, not fail");
+        assert_eq!(m.effect_ledger_reverts_total, 0, "absent field defaults to 0");
+
+        // And a populated value survives a full re-serialize round trip.
+        let mut m2 = crate::engine::types::RuntimeMetrics::default();
+        m2.effect_ledger_reverts_total = 7;
+        let json = serde_json::to_string(&m2).expect("serialize");
+        let back: crate::engine::types::RuntimeMetrics =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.effect_ledger_reverts_total, 7);
+    }
 }
