@@ -208,11 +208,6 @@ impl MpcController {
         self.effects[action] = self.effects[action].clamp(-0.10, 0.02);
     }
 
-    /// Plan actual (para diagnóstico).
-    pub fn last_plan(&self) -> &[usize; MAX_HORIZON] {
-        &self.last_plan
-    }
-
     /// Costo del plan actual.
     pub fn last_cost(&self) -> f64 {
         self.last_cost

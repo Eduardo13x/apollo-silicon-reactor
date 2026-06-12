@@ -327,11 +327,6 @@ impl PowerManager {
     pub fn update_power_draw(&mut self, watts: f32) {
         self.power_state.power_draw_watts = watts;
     }
-
-    /// Update idle percentage from system metrics.
-    pub fn update_idle_percentage(&mut self, idle: f32) {
-        self.power_state.idle_percentage = idle;
-    }
 }
 
 /// Detect real battery status from the system using IOKit power source APIs.

@@ -323,13 +323,6 @@ impl FluidityState {
         // Proportional to degradation: fluidity 0.5 → backoff 0.5
         (1.0 - self.fluidity_ema).max(0.0)
     }
-
-    /// Returns the top offender (highest hurt_score) if any.
-    pub fn top_offender(&self) -> Option<&(u32, String, f32)> {
-        self.fluidity_offenders
-            .iter()
-            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
-    }
 }
 
 // ── Signal snapshot (send-safe summary for daemon main loop) ─────────────────

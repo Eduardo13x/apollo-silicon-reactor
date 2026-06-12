@@ -287,11 +287,6 @@ impl SpecialistAccuracyTracker {
         }
     }
 
-    /// Return all accuracy weights as a slice.
-    pub fn weights(&self) -> &[f64; specialist::COUNT] {
-        &self.accuracy
-    }
-
     /// Mutable access to all accuracy weights (for validation/clamping on restore).
     pub fn weights_mut(&mut self) -> &mut [f64; specialist::COUNT] {
         &mut self.accuracy

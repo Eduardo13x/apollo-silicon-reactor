@@ -176,12 +176,6 @@ impl ForegroundDetector {
         self
     }
 
-    /// Create a detector with custom command timeout.
-    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
-        self.command_timeout = timeout;
-        self
-    }
-
     /// Detect the current foreground application.
     ///
     /// Returns a cached result if the cache is still valid. Otherwise,

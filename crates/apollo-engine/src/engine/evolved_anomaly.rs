@@ -828,14 +828,6 @@ impl EvolvedAnomalyDetector {
     pub fn alpha(&self) -> f32 {
         self.alpha
     }
-
-    /// Best fitness across the population.
-    pub fn best_fitness(&self) -> f32 {
-        self.population
-            .iter()
-            .map(|p| p.fitness)
-            .fold(0.0f32, f32::max)
-    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

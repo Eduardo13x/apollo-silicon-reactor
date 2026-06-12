@@ -212,11 +212,6 @@ impl LlmInferenceDetector {
             .unwrap_or(0.0)
     }
 
-    /// PID of the primary inference process, if active.
-    pub fn primary_pid(&self) -> Option<u32> {
-        self.active.as_ref().map(|s| s.primary.pid)
-    }
-
     fn is_llm_by_name(name: &str) -> bool {
         // OnceLock pre-lowered exact set — O(1) lookup vs O(N) per-call lowercase chain.
         static EXACT_LC: std::sync::OnceLock<std::collections::HashSet<String>> =

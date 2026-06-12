@@ -493,22 +493,6 @@ impl OverflowGuard {
             .count()
     }
 
-    /// ¿Se parece la carga actual a una que causó overflow antes?
-    pub fn resembles_past_overflow(&self, proc_names: &[&str]) -> bool {
-        for event in &self.history.events {
-            let matches = event
-                .heavy_apps
-                .iter()
-                .filter(|app| proc_names.iter().any(|n| n.contains(app.as_str())))
-                .count();
-            if matches >= 3 && !event.heavy_apps.is_empty() && matches * 2 >= event.heavy_apps.len()
-            {
-                return true;
-            }
-        }
-        false
-    }
-
     fn persist(&self) {
         if let Ok(json) = serde_json::to_string_pretty(&self.history) {
             let _ = std::fs::write(&self.path, json);
