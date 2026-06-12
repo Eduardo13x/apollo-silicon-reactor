@@ -3417,6 +3417,13 @@ fn main() -> anyhow::Result<()> {
                     &lctx.outcome_tracker.drift_detector,
                 );
                 let mut causal_impact = lctx.causal_graph.impact_map();
+                // World-model Mode-2 snapshot (2026-06-11): freeze predictions
+                // + Rubin do-nothing drift, queried by decide_actions before
+                // emitting freezes. [LeCun 2022 §4.2; Sutton Dyna 1991]
+                let world_model = apollo_engine::engine::world_model::WorldModel::from_parts(
+                    &lctx.causal_graph,
+                    &lctx.outcome_tracker,
+                );
                 CausalGraph::apply_nars_discount(
                     &mut causal_impact,
                     &lctx.outcome_tracker.drift_detector,
@@ -3556,6 +3563,7 @@ fn main() -> anyhow::Result<()> {
                         anomaly_hints: &anomaly_hints,
                         freeze_cooldown: &freeze_cooldown_snapshot,
                         companion_of_foreground_pids: companion_of_fg_pids,
+                        world_model: &world_model,
                     };
                     decision_stage
                         .run(

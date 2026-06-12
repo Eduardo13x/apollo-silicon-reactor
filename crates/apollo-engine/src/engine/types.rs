@@ -1637,6 +1637,11 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub prediction_debias_applied_total: u64,
 
+    /// World-model Mode-2 gate (2026-06-11) [LeCun 2022]. Freeze candidates
+    /// skipped because the learned model predicts do-nothing dominates.
+    #[serde(default)]
+    pub world_model_dominance_skips_total: u64,
+
     /// B.4 purge band split (2026-06-10). Legacy aggregate keeps the sum.
     #[serde(default)]
     pub maintenance_purge_skipped_pressure_low_total: u64,

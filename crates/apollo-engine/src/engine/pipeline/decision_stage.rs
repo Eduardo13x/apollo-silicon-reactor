@@ -127,6 +127,12 @@ pub struct PolicyContext<'a> {
     /// the cold-thread router to keep them on the same P-cluster as
     /// the foreground hot threads under low DRAM bandwidth.
     pub companion_of_foreground_pids: &'a HashSet<u32>,
+
+    /// World-model Mode-2 snapshot (2026-06-11) [LeCun 2022; Sutton Dyna
+    /// 1991]: per-cycle learned action→Δpressure predictions + the Rubin
+    /// do-nothing drift. Freeze candidates whose imagined outcome loses to
+    /// doing nothing are skipped (`world-model-skip` in low_value_skipped).
+    pub world_model: &'a crate::engine::world_model::WorldModel,
 }
 
 /// The output returned by [`DecisionStage::run`].
@@ -221,6 +227,7 @@ impl DecisionStage {
             policy.anomaly_hints,
             policy.freeze_cooldown,
             policy.companion_of_foreground_pids,
+            policy.world_model,
         );
 
         DecisionStageOutput { decision }
@@ -282,6 +289,7 @@ mod tests {
         user_ctx: &'a UserContext,
         cooldown: &'a crate::engine::freeze_cooldown::FreezeCooldown,
         companions: &'a HashSet<u32>,
+        world_model: &'a crate::engine::world_model::WorldModel,
     ) -> PolicyContext<'a> {
         PolicyContext {
             decide_interactive: interactive,
@@ -302,6 +310,7 @@ mod tests {
             anomaly_hints: ipc,
             freeze_cooldown: cooldown,
             companion_of_foreground_pids: companions,
+            world_model,
         }
     }
 
@@ -323,6 +332,7 @@ mod tests {
         let empty_impact: HashMap<String, f32> = HashMap::new();
         let user_ctx = UserContext::default();
         let cooldown = crate::engine::freeze_cooldown::FreezeCooldown::new();
+        let world_model = crate::engine::world_model::WorldModel::default();
         let policy = make_policy(
             &empty_interactive,
             &empty_noise,
@@ -335,6 +345,7 @@ mod tests {
             &user_ctx,
             &cooldown,
             &empty_pids,
+            &world_model,
         );
 
         let output = stage.run(
@@ -372,6 +383,7 @@ mod tests {
         let empty_impact: HashMap<String, f32> = HashMap::new();
         let user_ctx = UserContext::default();
         let cooldown = crate::engine::freeze_cooldown::FreezeCooldown::new();
+        let world_model = crate::engine::world_model::WorldModel::default();
         let policy = make_policy(
             &empty_interactive,
             &empty_noise,
@@ -384,6 +396,7 @@ mod tests {
             &user_ctx,
             &cooldown,
             &empty_pids,
+            &world_model,
         );
 
         let output = stage.run(

@@ -434,6 +434,7 @@ pub fn decide_actions(
     // to disable the bridge — the default-E-cluster routing then stays
     // intact, exactly matching pre-bridge behaviour.
     companion_of_foreground_pids: &HashSet<u32>,
+    world_model: &crate::engine::world_model::WorldModel,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -1611,6 +1612,25 @@ pub fn decide_actions(
                                     return None;
                                 }
                             }
+                            // World-model Mode-2 gate (2026-06-11): imagine the
+                            // freeze through the learned causal model BEFORE
+                            // emitting it. If the model has solid evidence
+                            // (>=10 obs, conf >=0.30) that this action's
+                            // predicted pressure drop loses to the do-nothing
+                            // drift, skip — acting would be side-effects for
+                            // nothing. Unknown/immature predictions admit
+                            // (exploration produces the evidence). Survival
+                            // bypasses the whole block. [LeCun 2022 §4.2;
+                            // Sutton Dyna 1991; Rubin 1974]
+                            if let crate::engine::world_model::Imagined::DoNothingDominates {
+                                ..
+                            } = world_model.imagine(&format!("freeze:{}", name))
+                            {
+                                crate::engine::lse_counters::LSE_COUNTERS
+                                    .inc_world_model_dominance_skip();
+                                low_value_skipped.push(format!("world-model-skip:{}", name));
+                                return None;
+                            }
                         }
                         Some((
                             pid_u32,
@@ -1867,6 +1887,9 @@ mod tests {
     ) -> DecisionOutput {
         let (interactive, noise, weights, pids, ipc, hops, hab, causal, impact) = empty_params();
         let cooldown = crate::engine::freeze_cooldown::FreezeCooldown::new();
+        // Default world model: empty predictions -> imagine() == Unknown ->
+        // admits everything (no behavior change for legacy tests).
+        let world_model = crate::engine::world_model::WorldModel::default();
         decide_actions(
             snap,
             sys,
@@ -1893,6 +1916,7 @@ mod tests {
             &HashMap::new(),
             &cooldown,
             &HashSet::new(),
+            &world_model,
         )
     }
 

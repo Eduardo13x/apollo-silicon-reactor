@@ -610,6 +610,11 @@ pub struct LockFreeMetrics {
     /// CausalGraph raw predictions before fanning out to consumers.
     pub prediction_debias_applied_total: AtomicU64,
 
+    /// World-model Mode-2 gate (2026-06-11) [LeCun 2022; Sutton Dyna 1991].
+    /// Freeze candidates skipped because the learned model predicts doing
+    /// nothing beats the action (Rubin do-nothing dominance).
+    pub world_model_dominance_skips_total: AtomicU64,
+
     /// B.4 purge band split (2026-06-10). Pressure-skip disambiguation:
     /// the legacy aggregate maintenance_purge_skipped_pressure_total keeps
     /// the sum; these three say WHY. low = below 0.55 band entry;
@@ -875,6 +880,7 @@ impl LockFreeMetrics {
             boost_reverts_total: AtomicU64::new(0),
             effect_ledger_reverts_total: AtomicU64::new(0),
             prediction_debias_applied_total: AtomicU64::new(0),
+            world_model_dominance_skips_total: AtomicU64::new(0),
             maintenance_purge_skipped_pressure_low_total: AtomicU64::new(0),
             maintenance_purge_skipped_pressure_survival_total: AtomicU64::new(0),
             maintenance_purge_skipped_rising_edge_total: AtomicU64::new(0),
@@ -1381,6 +1387,9 @@ impl LockFreeMetrics {
             prediction_debias_applied_total: self
                 .prediction_debias_applied_total
                 .load(Ordering::Relaxed),
+            world_model_dominance_skips_total: self
+                .world_model_dominance_skips_total
+                .load(Ordering::Relaxed),
             maintenance_purge_skipped_pressure_low_total: self
                 .maintenance_purge_skipped_pressure_low_total
                 .load(Ordering::Relaxed),
@@ -1793,6 +1802,13 @@ impl LockFreeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// World-model dominance skip (2026-06-11).
+    #[inline(always)]
+    pub fn inc_world_model_dominance_skip(&self) {
+        self.world_model_dominance_skips_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// B.2 replayd gate (2026-06-09). Bumped by the daemon composition
     /// point ONLY when the screen-capture probe is the deciding signal
     /// (audio full-duplex gate false, screen-capture scan true). Sustained
@@ -2065,6 +2081,8 @@ pub struct MetricsSnapshot {
     pub effect_ledger_reverts_total: u64,
     /// Calibration loop-closure (2026-06-11). Non-identity debias cycles.
     pub prediction_debias_applied_total: u64,
+    /// World-model Mode-2 dominance skips (2026-06-11).
+    pub world_model_dominance_skips_total: u64,
     /// B.4 purge band split (2026-06-10).
     pub maintenance_purge_skipped_pressure_low_total: u64,
     pub maintenance_purge_skipped_pressure_survival_total: u64,

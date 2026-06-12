@@ -229,6 +229,7 @@ fn prediction_debias_counter_round_trips_and_survives_old_payload() {
     let lf = LockFreeMetrics::new();
     lf.inc_prediction_debias_applied();
     lf.inc_prediction_debias_applied();
+    lf.inc_world_model_dominance_skip();
     lf.commit();
 
     let snap = lf.snapshot();
@@ -247,6 +248,10 @@ fn prediction_debias_counter_round_trips_and_survives_old_payload() {
     assert!(
         json.contains("\"prediction_debias_applied_total\":2"),
         "counter absent or wrong in runtime_metrics JSON: {json}"
+    );
+    assert!(
+        json.contains("\"world_model_dominance_skips_total\":1"),
+        "world-model counter absent or wrong: {json}"
     );
 
     // Older payload without the field must deserialize to 0, not error.
