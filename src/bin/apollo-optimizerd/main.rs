@@ -3445,9 +3445,16 @@ fn main() -> anyhow::Result<()> {
                 // World-model Mode-2 snapshot (2026-06-11): freeze predictions
                 // + Rubin do-nothing drift, queried by decide_actions before
                 // emitting freezes. [LeCun 2022 §4.2; Sutton Dyna 1991]
+                // Calibrated imagination: the same MetaCognition debias that
+                // corrects the CausalGraph's meta-observe (87c342f) scales the
+                // world model's predicted deltas — calibration and imagination
+                // share one belief about causal over-promising.
                 let world_model = apollo_engine::engine::world_model::WorldModel::from_parts(
                     &lctx.causal_graph,
                     &lctx.outcome_tracker,
+                    cognitive_state.meta_cognition.subsystem_debias_multiplier(
+                        apollo_engine::engine::meta_cognition::SubsystemId::CausalGraph,
+                    ),
                 );
                 CausalGraph::apply_nars_discount(
                     &mut causal_impact,

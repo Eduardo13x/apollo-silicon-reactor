@@ -82,14 +82,37 @@ pub struct WorldModel {
 
 impl WorldModel {
     /// Snapshot the live learned state into a query-cheap model.
-    pub fn from_parts(causal: &CausalGraph, tracker: &OutcomeTracker) -> Self {
+    ///
+    /// `prediction_debias` is the MetaCognition multiplier for the
+    /// CausalGraph subsystem (`subsystem_debias_multiplier`, clamped
+    /// [0.25, 1.5] at source) — the calibration loop-closure (87c342f)
+    /// and the imagination layer MUST share one belief about how much
+    /// the causal predictions over-promise. Without it the world model
+    /// imagines through raw avg_delta values the system itself has
+    /// measured as ~3x inflated (gap 0.256), making ActWins verdicts
+    /// systematically optimistic. Pass 1.0 when meta-cognition is
+    /// cold-starting.
+    pub fn from_parts(
+        causal: &CausalGraph,
+        tracker: &OutcomeTracker,
+        prediction_debias: f32,
+    ) -> Self {
+        let debias = if prediction_debias.is_finite() && prediction_debias > 0.0 {
+            prediction_debias as f64
+        } else {
+            1.0
+        };
         let mut predicted = HashMap::new();
         for edge in causal.solid_edges() {
             // Only pressure-drop edges are action→relief predictions.
             if edge.effect == "pressure_drop" {
                 predicted.insert(
                     edge.cause.clone(),
-                    (edge.avg_delta as f64, edge.confidence, edge.evidence_count),
+                    (
+                        edge.avg_delta as f64 * debias,
+                        edge.confidence,
+                        edge.evidence_count,
+                    ),
                 );
             }
         }
@@ -201,6 +224,26 @@ mod tests {
         assert!(matches!(
             m.imagine("throttle:Hog"),
             Imagined::ActWins { .. }
+        ));
+    }
+
+    #[test]
+    fn debias_deflates_inflated_imagination() {
+        // Build through from_parts with a synthetic causal graph is heavy;
+        // pin the semantics directly: an edge predicting 0.02 drop against
+        // 0.012 drift wins raw, but at the prod CausalGraph debias (0.25x,
+        // gap 0.256 regime) the calibrated prediction 0.005 loses — the
+        // imagination must share the calibration layer's honesty.
+        let raw = model_with("freeze:Inflated", 0.02, 0.8, 30, 0.012);
+        assert!(matches!(
+            raw.imagine("freeze:Inflated"),
+            Imagined::ActWins { .. }
+        ));
+
+        let calibrated = model_with("freeze:Inflated", 0.02 * 0.25, 0.8, 30, 0.012);
+        assert!(matches!(
+            calibrated.imagine("freeze:Inflated"),
+            Imagined::DoNothingDominates { .. }
         ));
     }
 }
