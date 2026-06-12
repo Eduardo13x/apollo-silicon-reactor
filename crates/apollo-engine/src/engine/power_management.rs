@@ -647,6 +647,11 @@ pub struct CadenceInputs {
     pub idle_secs: u64,
     /// Sustained high pressure (>0.80) — daemon throttles its own footprint.
     pub high_pressure: bool,
+    /// Hierarchical planner predicts a pressure spike / thrashing onset
+    /// within <=120s (fresh, confident hint). Pre-arm: never relax the
+    /// cadence while a storm is forecast — preparation beats reaction.
+    /// (planner.rs Phase 1 consumer, 2026-06-11.)
+    pub planner_spike_imminent: bool,
 }
 
 /// Minimum inter-cycle floor (ms) for the daemon main loop, BEFORE the
@@ -683,6 +688,13 @@ pub fn adaptive_cycle_floor_ms(i: CadenceInputs) -> u64 {
     if i.high_pressure || i.battery_low {
         return 1000;
     }
+    // Planner pre-arm: a forecast spike pins the fast floor BEFORE the
+    // crisis arrives, overriding every idle slowdown tier below. Cost of
+    // a false positive: ~60s of 3.3Hz sampling. Cost of a miss: the
+    // daemon meets the spike asleep at 5000ms.
+    if i.planner_spike_imminent {
+        return 300;
+    }
     if i.on_battery && i.pressure_smooth < CALM {
         if i.idle_secs >= DEEP_IDLE_SECS {
             return 5000;
@@ -708,6 +720,7 @@ mod tests {
             pressure_smooth: p,
             idle_secs: idle,
             high_pressure: false,
+            planner_spike_imminent: false,
         }
     }
 
@@ -841,5 +854,18 @@ mod tests {
         let ttc = manager.time_to_critical();
         // (60 - 20) / 15.0 * 60 = 160 minutes
         assert_eq!(ttc, 160);
+    }
+
+    #[test]
+    fn planner_prearm_pins_fast_floor_over_idle_tiers() {
+        // Deep idle on battery would normally relax to 5000ms…
+        let mut i = ci(true, 700, 0.30);
+        assert_eq!(adaptive_cycle_floor_ms(i.clone()), 5000);
+        // …but a forecast spike pins 300ms: prepare BEFORE the storm.
+        i.planner_spike_imminent = true;
+        assert_eq!(adaptive_cycle_floor_ms(i.clone()), 300);
+        // Crisis-now tiers still outrank the pre-arm (already throttling).
+        i.high_pressure = true;
+        assert_eq!(adaptive_cycle_floor_ms(i), 1000);
     }
 }

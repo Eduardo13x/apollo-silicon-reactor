@@ -210,6 +210,39 @@ pub struct PlannerHintFile {
     pub hints: Vec<PlannerHint>,
 }
 
+/// Phase 1 consumer entry point (2026-06-11) — the FIRST reader of the
+/// hints this planner has produced into the void since Phase 0. Returns
+/// `true` when a fresh, confident, near-horizon pressure/thrashing hint
+/// is on file: the daemon main loop uses it to pre-arm its sampling
+/// cadence (exit idle slowdown BEFORE the predicted spike arrives —
+/// preparation, not reaction). Strangler-fig discipline: the consumer
+/// with the smallest possible blast radius (the daemon only wakes its
+/// own sampling; no process is touched on a false positive).
+///
+/// Freshness gate: the planner emits every 30s; a file older than
+/// `max_age_secs` (caller passes ~90s) means the planner thread is dead
+/// or wedged — stale plans must never drive behavior. Parse failures
+/// and missing files return `false` (no hint, no pre-arm).
+pub fn read_spike_imminent(path: &Path, max_age_secs: i64, now: DateTime<Utc>) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(file) = serde_json::from_str::<PlannerHintFile>(&raw) else {
+        return false;
+    };
+    if (now - file.generated_at).num_seconds() > max_age_secs {
+        return false;
+    }
+    file.hints.iter().any(|h| {
+        h.confidence >= 0.60
+            && h.horizon_secs <= 120
+            && matches!(
+                h.kind,
+                HintKind::PressureSpike { .. } | HintKind::ThrashingOnset { .. }
+            )
+    })
+}
+
 /// Bounded ring buffer of recent observations used for trend detection.
 #[derive(Debug, Clone, Default)]
 struct TrendWindow {
@@ -507,6 +540,64 @@ impl Planner {
 
 #[cfg(test)]
 mod tests {
+    // ── Phase 1 consumer: read_spike_imminent (2026-06-11) ──────────────
+
+    #[test]
+    fn spike_imminent_reads_fresh_confident_near_hint() {
+        let dir = std::env::temp_dir().join(format!("planner_t_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("hints.json");
+        let now = Utc::now();
+
+        // Missing file → false.
+        assert!(!read_spike_imminent(&p, 90, now));
+
+        // Fresh + confident + near horizon → true.
+        let file = PlannerHintFile {
+            generated_at: now,
+            planner_version: 0,
+            hints: vec![PlannerHint {
+                horizon_secs: 60,
+                confidence: 0.8,
+                emitted_at: now,
+                kind: HintKind::PressureSpike { peak: 0.85 },
+            }],
+        };
+        std::fs::write(&p, serde_json::to_string(&file).unwrap()).unwrap();
+        assert!(read_spike_imminent(&p, 90, now));
+
+        // Stale file (generated 5 min ago) → false: dead planner must not drive.
+        let stale = PlannerHintFile {
+            generated_at: now - chrono::Duration::seconds(300),
+            ..file.clone()
+        };
+        std::fs::write(&p, serde_json::to_string(&stale).unwrap()).unwrap();
+        assert!(!read_spike_imminent(&p, 90, now));
+
+        // Low confidence → false.
+        let mut weak = file.clone();
+        weak.hints[0].confidence = 0.4;
+        std::fs::write(&p, serde_json::to_string(&weak).unwrap()).unwrap();
+        assert!(!read_spike_imminent(&p, 90, now));
+
+        // Far horizon (>120s) → false: pre-arm is for IMMINENT spikes only.
+        let mut far = file.clone();
+        far.hints[0].horizon_secs = 240;
+        std::fs::write(&p, serde_json::to_string(&far).unwrap()).unwrap();
+        assert!(!read_spike_imminent(&p, 90, now));
+
+        // CpuSaturation alone → false (cadence pre-arm targets memory storms).
+        let mut cpu = file.clone();
+        cpu.hints[0].kind = HintKind::CpuSaturation { fraction: 0.9 };
+        std::fs::write(&p, serde_json::to_string(&cpu).unwrap()).unwrap();
+        assert!(!read_spike_imminent(&p, 90, now));
+
+        // Corrupt JSON → false, never panics.
+        std::fs::write(&p, "{not json").unwrap();
+        assert!(!read_spike_imminent(&p, 90, now));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use chrono::Duration as ChronoDuration;
 

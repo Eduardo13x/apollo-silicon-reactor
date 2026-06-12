@@ -280,6 +280,7 @@ impl MetricsState {
         self.metrics.effect_ledger_reverts_total = lf.effect_ledger_reverts_total;
         self.metrics.prediction_debias_applied_total = lf.prediction_debias_applied_total;
         self.metrics.world_model_dominance_skips_total = lf.world_model_dominance_skips_total;
+        self.metrics.planner_prearm_total = lf.planner_prearm_total;
         self.metrics.maintenance_purge_skipped_pressure_low_total =
             lf.maintenance_purge_skipped_pressure_low_total;
         self.metrics

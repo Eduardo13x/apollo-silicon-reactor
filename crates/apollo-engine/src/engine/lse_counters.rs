@@ -615,6 +615,11 @@ pub struct LockFreeMetrics {
     /// nothing beats the action (Rubin do-nothing dominance).
     pub world_model_dominance_skips_total: AtomicU64,
 
+    /// Planner Phase-1 pre-arm (2026-06-11). Rising edges of "fresh
+    /// confident spike hint on file" — the cadence pinned 300ms BEFORE a
+    /// forecast pressure spike. First-ever consumer of planner_hints.json.
+    pub planner_prearm_total: AtomicU64,
+
     /// B.4 purge band split (2026-06-10). Pressure-skip disambiguation:
     /// the legacy aggregate maintenance_purge_skipped_pressure_total keeps
     /// the sum; these three say WHY. low = below 0.55 band entry;
@@ -881,6 +886,7 @@ impl LockFreeMetrics {
             effect_ledger_reverts_total: AtomicU64::new(0),
             prediction_debias_applied_total: AtomicU64::new(0),
             world_model_dominance_skips_total: AtomicU64::new(0),
+            planner_prearm_total: AtomicU64::new(0),
             maintenance_purge_skipped_pressure_low_total: AtomicU64::new(0),
             maintenance_purge_skipped_pressure_survival_total: AtomicU64::new(0),
             maintenance_purge_skipped_rising_edge_total: AtomicU64::new(0),
@@ -1390,6 +1396,7 @@ impl LockFreeMetrics {
             world_model_dominance_skips_total: self
                 .world_model_dominance_skips_total
                 .load(Ordering::Relaxed),
+            planner_prearm_total: self.planner_prearm_total.load(Ordering::Relaxed),
             maintenance_purge_skipped_pressure_low_total: self
                 .maintenance_purge_skipped_pressure_low_total
                 .load(Ordering::Relaxed),
@@ -1809,6 +1816,12 @@ impl LockFreeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Planner Phase-1 pre-arm rising edge (2026-06-11).
+    #[inline(always)]
+    pub fn inc_planner_prearm(&self) {
+        self.planner_prearm_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// B.2 replayd gate (2026-06-09). Bumped by the daemon composition
     /// point ONLY when the screen-capture probe is the deciding signal
     /// (audio full-duplex gate false, screen-capture scan true). Sustained
@@ -2083,6 +2096,8 @@ pub struct MetricsSnapshot {
     pub prediction_debias_applied_total: u64,
     /// World-model Mode-2 dominance skips (2026-06-11).
     pub world_model_dominance_skips_total: u64,
+    /// Planner Phase-1 pre-arm rising edges (2026-06-11).
+    pub planner_prearm_total: u64,
     /// B.4 purge band split (2026-06-10).
     pub maintenance_purge_skipped_pressure_low_total: u64,
     pub maintenance_purge_skipped_pressure_survival_total: u64,

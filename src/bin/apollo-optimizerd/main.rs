@@ -878,6 +878,10 @@ fn main() -> anyhow::Result<()> {
             //
             // [Fowler 2004] StranglerFigApplication — produce in parallel,
             // wire consumers only after validation. See engine/planner.rs.
+            // Phase 1 consumer (2026-06-11): the cadence pre-arm reads the
+            // planner's hint file every ~15 cycles. Path mirrors the
+            // producer's root/non-root selection above.
+            let mut planner_hints_path_for_cadence = std::path::PathBuf::new();
             {
                 // The local `metrics_path` PathBuf is bound much later
                 // (line 795). Use the helper function directly here so
@@ -890,6 +894,7 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     std::path::PathBuf::from("/tmp/apollo-planner_hints.json")
                 };
+                planner_hints_path_for_cadence = hints_pb.clone();
                 let calibration_pb = if is_root_for_planner {
                     std::path::PathBuf::from("/var/lib/apollo/calibration.jsonl")
                 } else {
@@ -1336,6 +1341,10 @@ fn main() -> anyhow::Result<()> {
             // throttle Apollo's own hot path under stress. 0.0 on first
             // cycle = treated as low pressure (300ms floor, fresh enrich).
             let mut prev_pressure_smooth: f64 = 0.0;
+            // Planner Phase-1 pre-arm cache: re-read planner_hints.json only
+            // every 15 cycles (~5-45s depending on cadence) — never file I/O
+            // on every loop iteration. Stale/missing file reads as false.
+            let mut planner_spike_imminent_cached = false;
             // Phase 4.2 WIRED (Sprint 10, 2026-05-16) — track thermal-state
             // transitions across cycles so we can emit exactly one
             // `record_external_event(ThermalThrottle, ...)` per upward
@@ -1584,6 +1593,21 @@ fn main() -> anyhow::Result<()> {
                 // no responsiveness benefit while away. Crises still preempt:
                 // is_fast_tick forces 0 here, and the reactor condvar wakes
                 // the loop immediately on kqueue Critical regardless of floor.
+                if cycle_count % 15 == 0 {
+                    let was = planner_spike_imminent_cached;
+                    planner_spike_imminent_cached =
+                        apollo_engine::engine::planner::read_spike_imminent(
+                            &planner_hints_path_for_cadence,
+                            90,
+                            chrono::Utc::now(),
+                        );
+                    if planner_spike_imminent_cached && !was {
+                        apollo_engine::engine::lse_counters::LSE_COUNTERS.inc_planner_prearm();
+                        tracing::info!(
+                            "planner-prearm: forecast spike <=120s — pinning 300ms cadence"
+                        );
+                    }
+                }
                 let min_inter_cycle_ms = if dry_run || is_fast_tick {
                     0
                 } else {
@@ -1594,6 +1618,7 @@ fn main() -> anyhow::Result<()> {
                             pressure_smooth: prev_pressure_smooth,
                             idle_secs: last_user_context_for_voting.idle_secs.max(0.0) as u64,
                             high_pressure: high_pressure_throttle,
+                            planner_spike_imminent: planner_spike_imminent_cached,
                         },
                     )
                 };

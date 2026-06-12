@@ -1642,6 +1642,11 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub world_model_dominance_skips_total: u64,
 
+    /// Planner Phase-1 pre-arm (2026-06-11). Rising edges of the cadence
+    /// pinning 300ms on a fresh forecast spike hint.
+    #[serde(default)]
+    pub planner_prearm_total: u64,
+
     /// B.4 purge band split (2026-06-10). Legacy aggregate keeps the sum.
     #[serde(default)]
     pub maintenance_purge_skipped_pressure_low_total: u64,
