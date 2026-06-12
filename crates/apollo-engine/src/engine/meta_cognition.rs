@@ -31,6 +31,12 @@ const ACCURACY_EMA_ALPHA: f32 = 0.05;
 /// Minimum observations before ECE is meaningful.
 const MIN_OBS_FOR_ECE: u32 = 10;
 
+/// Min observations before the debias multiplier may deviate from 1.0.
+/// Far stricter than MIN_OBS_FOR_ECE: rescaling live predictions on a
+/// noisy EMA ratio is worse than not rescaling at all. 500 ≈ 25 min of
+/// per-cycle observations at 3Hz — prod trackers sit at 30k+.
+const DEBIAS_MIN_OBS: u32 = 500;
+
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 /// Subsystem identity for metacognitive tracking.
@@ -81,6 +87,32 @@ impl AccuracyEma {
     /// Direction of miscalibration: positive = overconfident, negative = underconfident.
     pub fn miscalibration_direction(&self) -> f32 {
         self.predicted_ema - self.actual_ema
+    }
+
+    /// Online debias multiplier — the multiplicative form of temperature
+    /// scaling [Guo et al. 2017 §4; Platt 1999]. A systematically
+    /// overconfident predictor (predicted_ema ≫ actual_ema) gets its raw
+    /// predictions scaled DOWN by `actual/predicted`; an underconfident one
+    /// scaled UP (capped). This closes the loop MetaCognition previously
+    /// left open: it measured the bias but never corrected it — its only
+    /// output was the blunt global humble_mode damper.
+    ///
+    /// Gates:
+    /// - `observations < DEBIAS_MIN_OBS` → 1.0 (identity; cold-start EMAs lie)
+    /// - `predicted_ema < 0.05` → 1.0 (ratio of near-zero is noise)
+    /// - otherwise → `clamp(actual_ema / predicted_ema, 0.25, 1.5)`
+    ///
+    /// The lower clamp (0.25) bounds the correction at "trust a quarter of
+    /// the claim" — a predictor worse than that needs retraining, not
+    /// rescaling. The asymmetric upper clamp (1.5) is deliberately tight:
+    /// inflating predictions is riskier than deflating them (an action taken
+    /// on an inflated benefit fires; one skipped on a deflated benefit is
+    /// merely conservative).
+    pub fn debias_multiplier(&self) -> f32 {
+        if self.observations < DEBIAS_MIN_OBS || self.predicted_ema < 0.05 {
+            return 1.0;
+        }
+        (self.actual_ema / self.predicted_ema).clamp(0.25, 1.5)
     }
 }
 
@@ -258,6 +290,17 @@ impl MetaCognition {
             .find(|(id, _)| *id == subsystem)
             .map(|(_, tracker)| tracker.miscalibration_direction())
     }
+
+    /// Online debias multiplier for a subsystem's raw predictions
+    /// (see [`AccuracyEma::debias_multiplier`]). 1.0 when the subsystem
+    /// is untracked or still in cold-start.
+    pub fn subsystem_debias_multiplier(&self, subsystem: SubsystemId) -> f32 {
+        self.subsystems
+            .iter()
+            .find(|(id, _)| *id == subsystem)
+            .map(|(_, tracker)| tracker.debias_multiplier())
+            .unwrap_or(1.0)
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -265,6 +308,44 @@ impl MetaCognition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debias_multiplier_corrects_overconfidence_and_gates_cold_start() {
+        // Cold start: identity regardless of ratio.
+        let mut e = AccuracyEma {
+            predicted_ema: 0.50,
+            actual_ema: 0.18,
+            calibration_gap: 0.32,
+            observations: DEBIAS_MIN_OBS - 1,
+        };
+        assert_eq!(e.debias_multiplier(), 1.0, "below DEBIAS_MIN_OBS → identity");
+
+        // Prod RlAgent regime (2026-06-11): predicted 0.503, actual 0.178 →
+        // multiplier ≈ 0.354 — "trust roughly a third of the claim".
+        e.observations = DEBIAS_MIN_OBS;
+        let m = e.debias_multiplier();
+        assert!((m - 0.36).abs() < 0.05, "overconfident → scale down, got {m}");
+
+        // Pathologically overconfident: lower clamp holds at 0.25.
+        e.actual_ema = 0.01;
+        assert_eq!(e.debias_multiplier(), 0.25, "lower clamp");
+
+        // Underconfident: scale up but capped at 1.5 (asymmetric — inflating
+        // predictions is riskier than deflating).
+        e.predicted_ema = 0.10;
+        e.actual_ema = 0.90;
+        assert_eq!(e.debias_multiplier(), 1.5, "upper clamp");
+
+        // Near-zero predicted EMA: ratio is noise → identity.
+        e.predicted_ema = 0.01;
+        assert_eq!(e.debias_multiplier(), 1.0, "predicted_ema < 0.05 → identity");
+    }
+
+    #[test]
+    fn subsystem_debias_multiplier_untracked_is_identity() {
+        let m = MetaCognition::new();
+        assert_eq!(m.subsystem_debias_multiplier(SubsystemId::RlAgent), 1.0);
+    }
 
     #[test]
     fn test_new_meta_defaults() {

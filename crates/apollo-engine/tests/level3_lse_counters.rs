@@ -216,3 +216,44 @@ fn drain_helpers_swap_to_zero_on_read() {
     assert_eq!(lf.drain_stage_total_ns(CycleStage::Sense), 700_000);
     assert_eq!(lf.drain_stage_total_ns(CycleStage::Sense), 0);
 }
+
+/// Calibration loop-closure (2026-06-11): silent-telemetry-death guard for
+/// `prediction_debias_applied_total`. Producer bump → snapshot →
+/// sync_from_lockfree → serialized RuntimeMetrics JSON, plus serde-default
+/// survival when deserializing an older payload missing the field.
+#[test]
+fn prediction_debias_counter_round_trips_and_survives_old_payload() {
+    use apollo_engine::engine::daemon_state::{MetricsState, ReactorStatus};
+    use apollo_engine::engine::types::RuntimeMetrics;
+
+    let lf = LockFreeMetrics::new();
+    lf.inc_prediction_debias_applied();
+    lf.inc_prediction_debias_applied();
+    lf.commit();
+
+    let snap = lf.snapshot();
+    let mut state = MetricsState {
+        metrics: RuntimeMetrics::default(),
+        throttle_level: "balanced".to_string(),
+        thermal_state: "nominal".to_string(),
+        thermal_level_real: "unknown".to_string(),
+        fast_tick_until: None,
+        reactor_event_weight: 0.0,
+        reactor_status: ReactorStatus::default(),
+        survival_window: apollo_engine::engine::survival_window::SurvivalActivationWindow::new(),
+    };
+    state.sync_from_lockfree(&snap);
+    let json = serde_json::to_string(&state.metrics).expect("serialize");
+    assert!(
+        json.contains("\"prediction_debias_applied_total\":2"),
+        "counter absent or wrong in runtime_metrics JSON: {json}"
+    );
+
+    // Older payload without the field must deserialize to 0, not error.
+    let mut v = serde_json::to_value(RuntimeMetrics::default()).expect("to_value");
+    v.as_object_mut()
+        .expect("object")
+        .remove("prediction_debias_applied_total");
+    let old: RuntimeMetrics = serde_json::from_value(v).expect("old payload deserializes");
+    assert_eq!(old.prediction_debias_applied_total, 0);
+}

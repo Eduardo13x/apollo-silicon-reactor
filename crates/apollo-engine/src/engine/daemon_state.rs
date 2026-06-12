@@ -278,6 +278,7 @@ impl MetricsState {
         self.metrics.zombie_actions_emitted_total = lf.zombie_actions_emitted_total;
         self.metrics.boost_reverts_total = lf.boost_reverts_total;
         self.metrics.effect_ledger_reverts_total = lf.effect_ledger_reverts_total;
+        self.metrics.prediction_debias_applied_total = lf.prediction_debias_applied_total;
         self.metrics.maintenance_purge_skipped_pressure_low_total =
             lf.maintenance_purge_skipped_pressure_low_total;
         self.metrics.maintenance_purge_skipped_pressure_survival_total =

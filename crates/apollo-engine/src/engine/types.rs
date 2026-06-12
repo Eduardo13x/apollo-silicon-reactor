@@ -2088,6 +2088,11 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub effect_ledger_reverts_total: u64,
 
+    /// Calibration loop-closure (2026-06-11) [Guo 2017; Platt 1999]. Cycles
+    /// where the meta-cognition debias multiplier rescaled raw predictions.
+    #[serde(default)]
+    pub prediction_debias_applied_total: u64,
+
     /// B.4 purge band split (2026-06-10). Legacy aggregate keeps the sum.
     #[serde(default)]
     pub maintenance_purge_skipped_pressure_low_total: u64,

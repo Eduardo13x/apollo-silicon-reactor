@@ -48,6 +48,7 @@
 //! caller — nothing is smuggled through globals or statics.
 
 use crate::cognitive_tick::{self, CognitiveDecision, CognitiveState, CognitiveTickInputs};
+use apollo_engine::engine::meta_cognition::SubsystemId;
 use apollo_engine::engine::neuromodulator::NeuroSignals;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
 use apollo_engine::engine::signal_intelligence::SignalDigest;
@@ -185,11 +186,31 @@ pub fn run_neurocognitive_tick(
         .first()
         .map(|e| e.confidence)
         .unwrap_or(0.0);
+    // Calibration loop-closure (2026-06-11) [Guo et al. 2017 §4; Platt 1999]:
+    // MetaCognition measured per-subsystem bias for months but never fed the
+    // correction back — RlAgent claimed 0.503 effectiveness while delivering
+    // 0.178 (gap 0.326), CausalGraph 0.282 vs 0.063 (gap 0.256), and the only
+    // consequence was the blunt global humble_mode damper. Rescale both raw
+    // predictions by the learned actual/predicted ratio BEFORE they fan out
+    // to the self-evaluator, reward bus, epistemic composite, and the
+    // meta-observe itself. The gap then measures the RESIDUAL error of the
+    // corrected predictor, so humble_mode exits only if the correction
+    // genuinely works — this cannot game the metric, because the debiased
+    // value is also what every consumer now acts on.
+    let rl_debias = cognitive_state
+        .meta_cognition
+        .subsystem_debias_multiplier(SubsystemId::RlAgent);
+    let causal_debias = cognitive_state
+        .meta_cognition
+        .subsystem_debias_multiplier(SubsystemId::CausalGraph);
+    if rl_debias != 1.0 || causal_debias != 1.0 {
+        apollo_engine::engine::lse_counters::LSE_COUNTERS.inc_prediction_debias_applied();
+    }
     let causal_predicted_delta_norm = lctx
         .causal_graph
         .solid_edges_by_impact()
         .first()
-        .map(|e| (e.avg_delta.abs() / 0.10).clamp(0.0, 1.0))
+        .map(|e| (e.avg_delta.abs() / 0.10).clamp(0.0, 1.0) * causal_debias)
         .unwrap_or(0.0);
     let observed_drop = lctx.outcome_tracker.pressure_velocity_short();
     let actual_residual = lctx.outcome_tracker.causal_effect(observed_drop);
@@ -214,7 +235,9 @@ pub fn run_neurocognitive_tick(
                 .iter()
                 .cloned()
                 .fold(f64::NEG_INFINITY, f64::max);
-            (((max_reward * 5.0).tanh() + 1.0) / 2.0) as f32
+            // Debiased by the learned RlAgent actual/predicted ratio (see
+            // calibration loop-closure note above). Clamp keeps [0,1].
+            ((((max_reward * 5.0).tanh() + 1.0) / 2.0) as f32 * rl_debias).clamp(0.0, 1.0)
         },
         workload_fingerprint: workload_mode_str
             .bytes()

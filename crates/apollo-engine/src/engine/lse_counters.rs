@@ -605,6 +605,11 @@ pub struct LockFreeMetrics {
     /// expired kernel mutation (the unified anti-ratchet chokepoint).
     pub effect_ledger_reverts_total: AtomicU64,
 
+    /// Calibration loop-closure (2026-06-11) [Guo 2017 §4; Platt 1999].
+    /// Cycles where a non-identity debias multiplier rescaled RlAgent /
+    /// CausalGraph raw predictions before fanning out to consumers.
+    pub prediction_debias_applied_total: AtomicU64,
+
     /// B.4 purge band split (2026-06-10). Pressure-skip disambiguation:
     /// the legacy aggregate maintenance_purge_skipped_pressure_total keeps
     /// the sum; these three say WHY. low = below 0.55 band entry;
@@ -869,6 +874,7 @@ impl LockFreeMetrics {
             zombie_actions_emitted_total: AtomicU64::new(0),
             boost_reverts_total: AtomicU64::new(0),
             effect_ledger_reverts_total: AtomicU64::new(0),
+            prediction_debias_applied_total: AtomicU64::new(0),
             maintenance_purge_skipped_pressure_low_total: AtomicU64::new(0),
             maintenance_purge_skipped_pressure_survival_total: AtomicU64::new(0),
             maintenance_purge_skipped_rising_edge_total: AtomicU64::new(0),
@@ -1376,6 +1382,9 @@ impl LockFreeMetrics {
             effect_ledger_reverts_total: self
                 .effect_ledger_reverts_total
                 .load(Ordering::Relaxed),
+            prediction_debias_applied_total: self
+                .prediction_debias_applied_total
+                .load(Ordering::Relaxed),
             maintenance_purge_skipped_pressure_low_total: self
                 .maintenance_purge_skipped_pressure_low_total
                 .load(Ordering::Relaxed),
@@ -1781,6 +1790,13 @@ impl LockFreeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Calibration loop-closure (2026-06-11). Non-identity debias applied.
+    #[inline(always)]
+    pub fn inc_prediction_debias_applied(&self) {
+        self.prediction_debias_applied_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// B.2 replayd gate (2026-06-09). Bumped by the daemon composition
     /// point ONLY when the screen-capture probe is the deciding signal
     /// (audio full-duplex gate false, screen-capture scan true). Sustained
@@ -2051,6 +2067,8 @@ pub struct MetricsSnapshot {
     pub boost_reverts_total: u64,
     /// Evolve iter-3 (2026-06-10). EffectLedger unified reverts.
     pub effect_ledger_reverts_total: u64,
+    /// Calibration loop-closure (2026-06-11). Non-identity debias cycles.
+    pub prediction_debias_applied_total: u64,
     /// B.4 purge band split (2026-06-10).
     pub maintenance_purge_skipped_pressure_low_total: u64,
     pub maintenance_purge_skipped_pressure_survival_total: u64,
