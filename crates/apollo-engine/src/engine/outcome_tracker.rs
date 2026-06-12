@@ -470,6 +470,45 @@ impl HopGroupWeight {
     pub fn needs_exploration(&self) -> bool {
         self.throttle_count >= 5 && self.prediction_error_ema > 0.3
     }
+
+    /// Learned-yield admission for an action candidate of this group
+    /// (2026-06-11). Universalizes the HRPO gate that previously lived
+    /// inline in the THROTTLE path only (decide_actions hard-skip <12% /
+    /// graded 0.50-floor) so the FREEZE path can consult the same evidence
+    /// — the group stats aggregate Throttle + Freeze + Memorystatus
+    /// outcomes (record_action_with_swap → resolve → record), so this is
+    /// the same causal pool, not a cross-class guess. The 2026-06-07 Brave
+    /// boost-loop was exactly an action path acting blind to yield the
+    /// tracker already knew. [Sutton & Barto 2018 §2.6] ε-greedy floor.
+    ///
+    /// Returns `false` = skip this candidate (demonstrably low yield),
+    /// `true` = admit. Callers MUST bypass this under survival/thermal
+    /// emergencies — yield politeness never outranks survival.
+    pub fn yield_admits(&self, name: &str) -> bool {
+        // Exploration override: high prediction error → always test.
+        if self.needs_exploration() {
+            return true;
+        }
+        // Cold start: under 15 observations the stats are noise — admit.
+        if self.throttle_count < 15 {
+            return true;
+        }
+        // Hard skip: genuinely bad groups (matches throttle-path constants).
+        if self.effectiveness() < 0.12 {
+            return false;
+        }
+        // Graded fractional admission, floor 0.50 (anti subnormal-lockout,
+        // NotebookLM 2026-05-12 + user "se siente como que hace nada").
+        let mult =
+            (0.5 * self.effectiveness() + 0.5 * self.predicted_effectiveness).clamp(0.50, 1.0);
+        if mult >= 1.0 {
+            return true;
+        }
+        let hash = name
+            .bytes()
+            .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+        (hash % 1024) < (mult * 1024.0) as u32
+    }
 }
 
 pub struct OutcomeTracker {
@@ -1426,6 +1465,88 @@ pub struct OutcomeTrackerPersisted {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Learned-yield admission (freeze-path universalization, 2026-06-11) ──
+
+    #[test]
+    fn yield_admits_cold_start_and_exploration_always_admit() {
+        // Cold start: <15 observations → stats are noise, admit everything.
+        let cold = HopGroupWeight {
+            throttle_count: 14,
+            effective_count: 0,
+            ..Default::default()
+        };
+        assert!(cold.yield_admits("AnyProcess"), "cold start must admit");
+
+        // Exploration override: high prediction error → test regardless of
+        // terrible effectiveness (curriculum signal beats exploitation).
+        let exploring = HopGroupWeight {
+            throttle_count: 50,
+            effective_count: 0,
+            prediction_error_ema: 0.5,
+            ..Default::default()
+        };
+        assert!(
+            exploring.yield_admits("AnyProcess"),
+            "exploration must admit"
+        );
+    }
+
+    #[test]
+    fn yield_admits_hard_skips_demonstrably_bad_groups() {
+        // 20 actions, 1 effective → effectiveness (1+1)/(20+2) ≈ 0.09 < 0.12.
+        let bad = HopGroupWeight {
+            throttle_count: 20,
+            effective_count: 1,
+            prediction_error_ema: 0.0,
+            ..Default::default()
+        };
+        assert!(!bad.yield_admits("FutileTarget"), "eff<0.12 must hard-skip");
+    }
+
+    #[test]
+    fn yield_admits_graded_band_admits_roughly_half_at_floor() {
+        // Browser-like group: eff ≈ 0.19, predicted low → mult clamps to the
+        // 0.50 floor. Deterministic name-hash admission must land near 50%
+        // across distinct names (anti subnormal-lockout floor).
+        let browserish = HopGroupWeight {
+            throttle_count: 60,
+            effective_count: 11, // (11+1)/(60+2) ≈ 0.194
+            predicted_effectiveness: 0.15,
+            prediction_error_ema: 0.0,
+            ..Default::default()
+        };
+        let admitted = (0..200)
+            .filter(|i| browserish.yield_admits(&format!("proc-{i}")))
+            .count();
+        assert!(
+            (60..=140).contains(&admitted),
+            "graded floor should admit ~50% of names, got {admitted}/200"
+        );
+
+        // Healthy group: eff≈0.90, predicted 0.90 → mult ≈ 0.90 — fractional
+        // admission near 90% (same semantics as the throttle path: only a
+        // mathematically perfect group reaches mult 1.0).
+        let healthy = HopGroupWeight {
+            throttle_count: 60,
+            effective_count: 55,
+            predicted_effectiveness: 0.9,
+            prediction_error_ema: 0.0,
+            ..Default::default()
+        };
+        let healthy_admitted = (0..200)
+            .filter(|i| healthy.yield_admits(&format!("proc-{i}")))
+            .count();
+        // The ×31 string hash is not uniform mod 1024 over similar short
+        // names, so pin the RELATIVE property (healthy admits clearly more
+        // than the floor group) plus a loose absolute sanity bound — the
+        // exact percentage is distribution noise, the ordering is the
+        // contract.
+        assert!(
+            healthy_admitted > admitted + 20 && healthy_admitted >= 130,
+            "healthy ({healthy_admitted}/200) must clearly exceed floor group ({admitted}/200)"
+        );
+    }
 
     // ── WorkloadHop classification (Aho-Corasick) ────────────────────────────
 

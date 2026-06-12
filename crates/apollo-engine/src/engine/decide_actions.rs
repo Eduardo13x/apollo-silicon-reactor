@@ -1594,6 +1594,24 @@ pub fn decide_actions(
                         if is_interactive(&name, &name.to_ascii_lowercase(), pid_u32) {
                             return None;
                         }
+                        // Learned-yield gate (2026-06-11): the THROTTLE path has
+                        // consulted HRPO group effectiveness since 2026-05-12;
+                        // the FREEZE path ranked by RSS alone, blind to the
+                        // tracker's evidence that actions on some process
+                        // classes barely move pressure (prod: Browser 0.27,
+                        // Media 0.20 vs General 0.89). Same yield_admits gate,
+                        // same evidence pool (freeze outcomes enroll in the
+                        // same hop_groups). Survival mode bypasses — yield
+                        // politeness never outranks survival.
+                        if !survival_mode {
+                            let hop = WorkloadHop::from_process_name(&name);
+                            if let Some(group) = hop_groups.get(&hop) {
+                                if !group.yield_admits(&name) {
+                                    low_value_skipped.push(format!("hrpo-freeze-skip:{}", name));
+                                    return None;
+                                }
+                            }
+                        }
                         Some((
                             pid_u32,
                             name,
