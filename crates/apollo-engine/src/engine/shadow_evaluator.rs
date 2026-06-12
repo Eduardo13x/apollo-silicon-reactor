@@ -121,6 +121,12 @@ impl Default for ShadowEvaluator {
             // is_on_battery + wakeups + ctx_switches; then injects a
             // [0.0, 0.20] cost penalty proportional to micro-wake noise.
             .feature(BatteryAwareCostFeature)
+            // Unification scaffold (2026-06-11): the inline yield +
+            // world-model gates as composable evidence. SHADOW phase —
+            // per-candidate disagreements journal toward the N>=500
+            // cutover mandate; inline gates keep authority.
+            .feature(crate::engine::policy_feature_learned::LearnedYieldFeature)
+            .feature(crate::engine::policy_feature_learned::WorldModelFeature)
             .build();
         Self { scorer }
     }
@@ -222,7 +228,6 @@ impl ShadowEvaluator {
 
     /// Called when gate tower ACCEPTS a candidate. Runs scorer; if scorer would have
     /// rejected, emits a disagreement event. Offline analysis correlates with outcomes.
-    #[allow(dead_code)] // wiring for accepted-case follows in a later commit
     pub fn evaluate_accepted(&self, action: &RootAction, ctx: &ActionContext, journal_path: &Path) {
         let score = self.scorer.score(action, ctx);
         if !score.accept {
@@ -296,6 +301,8 @@ mod tests {
         ActionContext {
             pressure: 0.85,
             swap_gb: 2.0,
+            learned_yield: None,
+            imagined_margin: None,
             thrashing_score: 12_000.0,
             p_oom_30s: Some(0.50),
             p_jank_60s: None,

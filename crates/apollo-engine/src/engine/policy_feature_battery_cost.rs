@@ -94,6 +94,8 @@ mod tests {
         ActionContext {
             pressure,
             swap_gb: 0.0,
+            learned_yield: None,
+            imagined_margin: None,
             thrashing_score: 0.0,
             p_oom_30s: None,
             p_jank_60s: None,

@@ -759,6 +759,18 @@ pub fn decide_actions(
                         continue;
                     }
                 }
+                // World-model Mode-2 gate (2026-06-11, extended from the
+                // freeze path same day): imagine the throttle through the
+                // calibrated causal model. Solid evidence that the predicted
+                // drop loses to the do-nothing drift → skip. Unknown admits;
+                // thermal emergencies bypass (same exemption as above).
+                if let crate::engine::world_model::Imagined::DoNothingDominates { .. } =
+                    world_model.imagine(&causal_key)
+                {
+                    crate::engine::lse_counters::LSE_COUNTERS.inc_world_model_dominance_skip();
+                    low_value_skipped.push(format!("world-model-skip:{}", name));
+                    continue;
+                }
             }
 
             // IPC-aware throttling: use per-process IPC to modulate aggressiveness.
@@ -1423,6 +1435,8 @@ pub fn decide_actions(
                     // Phase 5.2 wiring (Sprint 10) — shadow-mode probe path:
                     // populate from shadow_signals if main loop publishes them;
                     // else None (no penalty, no false-positive in shadow mode).
+                    learned_yield: None,
+                    imagined_margin: None,
                     is_on_battery: crate::engine::shadow_signals::get_is_on_battery(),
                     wakeups_per_sec: crate::engine::shadow_signals::get_wakeups_per_sec(),
                     ctx_switches_per_sec: crate::engine::shadow_signals::get_ctx_switches_per_sec(),
@@ -1483,6 +1497,42 @@ pub fn decide_actions(
             // adds the gate-ACCEPT-flip path.
             //
             // [Nygard 2018 §8.5] adaptive capacity limits via shadowing.
+            // Class-level probe context, shared by the Phase C override
+            // below and the per-candidate shadow scoring in the freeze
+            // candidate loop (clone + per-candidate overrides). All reads
+            // are atomic getters — negligible per-cycle cost.
+            let ctx_probe = ActionContext {
+                pressure: snapshot.pressure.memory_pressure,
+                swap_gb: snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                thrashing_score: snapshot.pressure.thrashing_score,
+                p_oom_30s: crate::engine::shadow_signals::get_p_oom_30s(),
+                p_jank_60s: crate::engine::shadow_signals::get_p_jank_60s(),
+                has_sleep_assertion: user_ctx.has_sleep_assertion,
+                call_in_progress: user_ctx.call_in_progress,
+                idle_secs: user_ctx.idle_secs,
+                foreground_pid: crate::engine::shadow_signals::get_foreground_pid(),
+                is_foreground_family: false,
+                is_recently_active: user_ctx.is_recently_active(),
+                thermal_emergency: crate::engine::shadow_signals::get_thermal_emergency(),
+                interrupt_phase: crate::engine::shadow_signals::get_interrupt_phase(),
+                protection_level: ProtectionLevel::Unprotected,
+                hot_page_fraction: crate::engine::shadow_signals::get_max_hot_page_fraction(),
+                wss_mb: crate::engine::shadow_signals::get_max_wss_mb(),
+                sensor_age_ms: {
+                    let age = (chrono::Utc::now() - snapshot.timestamp).num_milliseconds();
+                    if age < 0 {
+                        Some(0u64)
+                    } else {
+                        Some(age as u64)
+                    }
+                },
+                epistemic_uncertainty: crate::engine::shadow_signals::get_epistemic_uncertainty(),
+                learned_yield: None,
+                imagined_margin: None,
+                is_on_battery: crate::engine::shadow_signals::get_is_on_battery(),
+                wakeups_per_sec: crate::engine::shadow_signals::get_wakeups_per_sec(),
+                ctx_switches_per_sec: crate::engine::shadow_signals::get_ctx_switches_per_sec(),
+            };
             if extreme_freeze_ok {
                 let probe = RootAction::freeze_full(
                     0,
@@ -1492,40 +1542,9 @@ pub fn decide_actions(
                     0,
                     DecisionReason::PressureContext,
                 );
-                let ctx = ActionContext {
-                    pressure: snapshot.pressure.memory_pressure,
-                    swap_gb: snapshot.pressure.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                    thrashing_score: snapshot.pressure.thrashing_score,
-                    p_oom_30s: crate::engine::shadow_signals::get_p_oom_30s(),
-                    p_jank_60s: crate::engine::shadow_signals::get_p_jank_60s(),
-                    has_sleep_assertion: user_ctx.has_sleep_assertion,
-                    call_in_progress: user_ctx.call_in_progress,
-                    idle_secs: user_ctx.idle_secs,
-                    foreground_pid: crate::engine::shadow_signals::get_foreground_pid(),
-                    is_foreground_family: false,
-                    is_recently_active: user_ctx.is_recently_active(),
-                    thermal_emergency: crate::engine::shadow_signals::get_thermal_emergency(),
-                    interrupt_phase: crate::engine::shadow_signals::get_interrupt_phase(),
-                    protection_level: ProtectionLevel::Unprotected,
-                    hot_page_fraction: crate::engine::shadow_signals::get_max_hot_page_fraction(),
-                    wss_mb: crate::engine::shadow_signals::get_max_wss_mb(),
-                    sensor_age_ms: {
-                        let age = (chrono::Utc::now() - snapshot.timestamp).num_milliseconds();
-                        if age < 0 {
-                            Some(0u64)
-                        } else {
-                            Some(age as u64)
-                        }
-                    },
-                    epistemic_uncertainty: crate::engine::shadow_signals::get_epistemic_uncertainty(
-                    ),
-                    is_on_battery: crate::engine::shadow_signals::get_is_on_battery(),
-                    wakeups_per_sec: crate::engine::shadow_signals::get_wakeups_per_sec(),
-                    ctx_switches_per_sec: crate::engine::shadow_signals::get_ctx_switches_per_sec(),
-                };
                 let decision = shadow_evaluator_cell().evaluate_with_override(
                     &probe,
-                    &ctx,
+                    &ctx_probe,
                     /* gate_accept */ true,
                     shadow_disagreements_path(),
                 );
@@ -1690,6 +1709,44 @@ pub fn decide_actions(
                             DecisionReason::PressureContext,
                         ));
                         continue;
+                    }
+                    // Unification scaffold SHADOW (2026-06-11): run the
+                    // per-candidate scorer with the SAME yield + imagination
+                    // evidence the inline gates consult, via the long-waiting
+                    // evaluate_accepted hook. Log-only — disagreements stream
+                    // to the shadow journal and build the N>=500 evidence the
+                    // per-candidate cutover mandate requires. Bounded: <=3
+                    // candidates per cycle.
+                    {
+                        let mut cctx = ctx_probe.clone();
+                        let hop = WorkloadHop::from_process_name(&name);
+                        cctx.learned_yield = hop_groups
+                            .get(&hop)
+                            .map(|g| 0.5 * g.effectiveness() + 0.5 * g.predicted_effectiveness);
+                        cctx.imagined_margin =
+                            match world_model.imagine(&format!("freeze:{}", name)) {
+                                crate::engine::world_model::Imagined::ActWins { margin } => {
+                                    Some(margin)
+                                }
+                                crate::engine::world_model::Imagined::DoNothingDominates {
+                                    predicted_drop,
+                                    natural_drift,
+                                } => Some(predicted_drop - natural_drift),
+                                crate::engine::world_model::Imagined::Unknown => None,
+                            };
+                        let probe = RootAction::freeze_full(
+                            pid,
+                            &name,
+                            "shadow-candidate",
+                            start_sec,
+                            0,
+                            DecisionReason::PressureContext,
+                        );
+                        shadow_evaluator_cell().evaluate_accepted(
+                            &probe,
+                            &cctx,
+                            shadow_disagreements_path(),
+                        );
                     }
                     // CPU-active guard: under gate_a / gate_b (pressure-based) the
                     // pressure is often transient and we'd rather throttle than

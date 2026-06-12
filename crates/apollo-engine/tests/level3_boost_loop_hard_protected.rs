@@ -90,6 +90,8 @@ fn ctx_under_pressure(level: ProtectionLevel) -> ActionContext {
     ActionContext {
         pressure: 0.74,
         swap_gb: 2.5,
+        learned_yield: None,
+        imagined_margin: None,
         thrashing_score: 6_000.0,
         p_oom_30s: Some(0.40),
         p_jank_60s: Some(0.25),

@@ -74,6 +74,15 @@ pub struct ActionContext {
     /// every code path constructs ActionContext from a hardware snapshot
     /// (tests, dry-run paths). When `None`, the battery-aware penalty
     /// returns 0.0 (no UX cost imposed without evidence).
+    /// Per-candidate learned yield for this action's process group
+    /// (HopGroupWeight blend of effectiveness + predicted_effectiveness).
+    /// None = class-level probe or no group data — feature contributes zero.
+    /// Unification scaffold (2026-06-11): scorer features read the same
+    /// evidence the inline gates use, starting the N>=500 shadow clock.
+    pub learned_yield: Option<f64>,
+    /// Per-candidate world-model verdict: Some(margin>0) = ActWins by
+    /// margin; Some(margin<=0) = DoNothingDominates; None = Unknown/probe.
+    pub imagined_margin: Option<f64>,
     pub is_on_battery: Option<bool>,
     /// Recent wake-ups per second (sysinfo cumulative wakeups / cycle_dt).
     /// Used by Phase 5.2 to scale the "micro-wakeup tax" when running on
@@ -840,6 +849,8 @@ mod tests {
         ActionContext {
             pressure: 0.40,
             swap_gb: 0.5,
+            learned_yield: None,
+            imagined_margin: None,
             thrashing_score: 0.0,
             p_oom_30s: None,
             p_jank_60s: None,
