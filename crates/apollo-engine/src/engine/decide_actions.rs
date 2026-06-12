@@ -435,6 +435,7 @@ pub fn decide_actions(
     // intact, exactly matching pre-bridge behaviour.
     companion_of_foreground_pids: &HashSet<u32>,
     world_model: &crate::engine::world_model::WorldModel,
+    effectiveness: &crate::engine::effectiveness_tracker::EffectivenessTracker,
 ) -> DecisionOutput {
     // Pre-lowercase learned patterns once (avoids per-process allocations).
     let interactive_lc: Vec<String> = learned_interactive
@@ -1947,6 +1948,7 @@ mod tests {
         // Default world model: empty predictions -> imagine() == Unknown ->
         // admits everything (no behavior change for legacy tests).
         let world_model = crate::engine::world_model::WorldModel::default();
+        let effectiveness = crate::engine::effectiveness_tracker::EffectivenessTracker::new();
         decide_actions(
             snap,
             sys,
@@ -1974,6 +1976,7 @@ mod tests {
             &cooldown,
             &HashSet::new(),
             &world_model,
+            &effectiveness,
         )
     }
 

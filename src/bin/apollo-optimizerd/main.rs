@@ -3596,6 +3596,7 @@ fn main() -> anyhow::Result<()> {
                         freeze_cooldown: &freeze_cooldown_snapshot,
                         companion_of_foreground_pids: companion_of_fg_pids,
                         world_model: &world_model,
+                        effectiveness: &effectiveness_tracker,
                     };
                     decision_stage
                         .run(
@@ -3710,6 +3711,7 @@ fn main() -> anyhow::Result<()> {
                         is_root,
                         acc.view(),
                         &mut pending_trial_skill,
+                        &world_model,
                     );
                     acc.extend_raw(
                         skill_new,

@@ -133,6 +133,12 @@ pub struct PolicyContext<'a> {
     /// do-nothing drift. Freeze candidates whose imagined outcome loses to
     /// doing nothing are skipped (`world-model-skip` in low_value_skipped).
     pub world_model: &'a crate::engine::world_model::WorldModel,
+
+    /// Per-app effectiveness fusion (bayesian + causal + skill →
+    /// blended_score). Richer per-candidate yield source than the
+    /// hop-group class blend; the shadow scorer prefers it when the app
+    /// has >=10 observations (2026-06-11 unification slice b).
+    pub effectiveness: &'a crate::engine::effectiveness_tracker::EffectivenessTracker,
 }
 
 /// The output returned by [`DecisionStage::run`].
@@ -228,6 +234,7 @@ impl DecisionStage {
             policy.freeze_cooldown,
             policy.companion_of_foreground_pids,
             policy.world_model,
+            policy.effectiveness,
         );
 
         DecisionStageOutput { decision }
@@ -290,6 +297,7 @@ mod tests {
         cooldown: &'a crate::engine::freeze_cooldown::FreezeCooldown,
         companions: &'a HashSet<u32>,
         world_model: &'a crate::engine::world_model::WorldModel,
+        effectiveness: &'a crate::engine::effectiveness_tracker::EffectivenessTracker,
     ) -> PolicyContext<'a> {
         PolicyContext {
             decide_interactive: interactive,
@@ -311,6 +319,7 @@ mod tests {
             freeze_cooldown: cooldown,
             companion_of_foreground_pids: companions,
             world_model,
+            effectiveness,
         }
     }
 
@@ -333,6 +342,7 @@ mod tests {
         let user_ctx = UserContext::default();
         let cooldown = crate::engine::freeze_cooldown::FreezeCooldown::new();
         let world_model = crate::engine::world_model::WorldModel::default();
+        let effectiveness = crate::engine::effectiveness_tracker::EffectivenessTracker::new();
         let policy = make_policy(
             &empty_interactive,
             &empty_noise,
@@ -346,6 +356,7 @@ mod tests {
             &cooldown,
             &empty_pids,
             &world_model,
+            &effectiveness,
         );
 
         let output = stage.run(
@@ -384,6 +395,7 @@ mod tests {
         let user_ctx = UserContext::default();
         let cooldown = crate::engine::freeze_cooldown::FreezeCooldown::new();
         let world_model = crate::engine::world_model::WorldModel::default();
+        let effectiveness = crate::engine::effectiveness_tracker::EffectivenessTracker::new();
         let policy = make_policy(
             &empty_interactive,
             &empty_noise,
@@ -397,6 +409,7 @@ mod tests {
             &cooldown,
             &empty_pids,
             &world_model,
+            &effectiveness,
         );
 
         let output = stage.run(

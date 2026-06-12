@@ -27,6 +27,8 @@ fn adversarial_ctx() -> ActionContext {
     ActionContext {
         pressure: 0.66,
         swap_gb: 1.1,
+        learned_yield: None,
+        imagined_margin: None,
         thrashing_score: 9_000.0,
         p_oom_30s: Some(0.35),
         p_jank_60s: Some(0.15),
@@ -192,6 +194,8 @@ fn scorer_agrees_with_old_gate_on_pure_reactive_crisis() {
     let ctx = ActionContext {
         pressure: 0.85,
         swap_gb: 2.0,
+        learned_yield: None,
+        imagined_margin: None,
         thrashing_score: 15_000.0,
         p_oom_30s: Some(0.60),
         p_jank_60s: Some(0.40),

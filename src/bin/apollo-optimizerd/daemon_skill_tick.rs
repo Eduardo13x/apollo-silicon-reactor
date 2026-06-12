@@ -57,6 +57,7 @@ pub fn run_skill_tick(
     is_root: bool,
     current_actions: &[RootAction],
     pending_trial_skill: &mut Option<(String, f64)>,
+    world_model: &apollo_engine::engine::world_model::WorldModel,
 ) -> Vec<RootAction> {
     let mut new_actions: Vec<RootAction> = Vec::new();
 
@@ -98,6 +99,22 @@ pub fn run_skill_tick(
                     continue;
                 }
                 if skill_targets.contains(&name) && !already_actioned.contains(&name) {
+                    // World-model gate (2026-06-11): skill emissions were the
+                    // last action path bypassing imagination. A learned skill
+                    // whose throttle the calibrated causal model says loses to
+                    // do-nothing is skipped. TRIAL emissions below stay
+                    // exempt — trials are exploration by design (the Gemma
+                    // teacher loop needs their outcomes), and the model must
+                    // never block exploration.
+                    if let apollo_engine::engine::world_model::Imagined::DoNothingDominates {
+                        ..
+                    } = world_model.imagine(&format!("throttle:{}", name))
+                    {
+                        apollo_engine::engine::lse_counters::LSE_COUNTERS
+                            .inc_world_model_dominance_skip();
+                        tracing::debug!(target_name = %name, "skill-tick: world-model-skip");
+                        continue;
+                    }
                     let skill_name = skill_matches
                         .iter()
                         .find(|s| s.throttle_targets.contains(&name))
