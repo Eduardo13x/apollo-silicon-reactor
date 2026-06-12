@@ -93,14 +93,12 @@ impl SuggestionCategory {
 ///
 /// Updated by EMA: trust_new = α·observation + (1-α)·trust_old
 ///   observation = 1.0 if outcome IMPROVED, 0.0 if WORSENED, 0.5 if NO_EFFECT
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GemmaTrust {
     scores: HashMap<String, f32>,
     /// Count of observations per category (for evidence-based weighting).
     counts: HashMap<String, u32>,
 }
-
 
 impl GemmaTrust {
     /// Current trust for a category. Returns 0.5 (neutral) if never observed.

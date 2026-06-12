@@ -281,7 +281,8 @@ impl MetricsState {
         self.metrics.prediction_debias_applied_total = lf.prediction_debias_applied_total;
         self.metrics.maintenance_purge_skipped_pressure_low_total =
             lf.maintenance_purge_skipped_pressure_low_total;
-        self.metrics.maintenance_purge_skipped_pressure_survival_total =
+        self.metrics
+            .maintenance_purge_skipped_pressure_survival_total =
             lf.maintenance_purge_skipped_pressure_survival_total;
         self.metrics.maintenance_purge_skipped_rising_edge_total =
             lf.maintenance_purge_skipped_rising_edge_total;

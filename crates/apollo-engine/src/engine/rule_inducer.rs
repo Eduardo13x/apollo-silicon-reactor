@@ -129,12 +129,12 @@ pub fn induce(
         // check — the co-spike frequency alone is sufficient evidence.
         // Otherwise require at least one process to have some positive signal.
         if *count < HIGH_COOCCUR_BYPASS {
-            let a_ok = by_process.get(a).is_some_and(|s| {
-                s.total >= 3 && s.positive_drops as f64 / s.total as f64 >= 0.40
-            });
-            let b_ok = by_process.get(b).is_some_and(|s| {
-                s.total >= 3 && s.positive_drops as f64 / s.total as f64 >= 0.40
-            });
+            let a_ok = by_process
+                .get(a)
+                .is_some_and(|s| s.total >= 3 && s.positive_drops as f64 / s.total as f64 >= 0.40);
+            let b_ok = by_process
+                .get(b)
+                .is_some_and(|s| s.total >= 3 && s.positive_drops as f64 / s.total as f64 >= 0.40);
             if !a_ok && !b_ok {
                 continue;
             }

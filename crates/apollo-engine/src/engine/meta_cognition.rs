@@ -318,13 +318,20 @@ mod tests {
             calibration_gap: 0.32,
             observations: DEBIAS_MIN_OBS - 1,
         };
-        assert_eq!(e.debias_multiplier(), 1.0, "below DEBIAS_MIN_OBS → identity");
+        assert_eq!(
+            e.debias_multiplier(),
+            1.0,
+            "below DEBIAS_MIN_OBS → identity"
+        );
 
         // Prod RlAgent regime (2026-06-11): predicted 0.503, actual 0.178 →
         // multiplier ≈ 0.354 — "trust roughly a third of the claim".
         e.observations = DEBIAS_MIN_OBS;
         let m = e.debias_multiplier();
-        assert!((m - 0.36).abs() < 0.05, "overconfident → scale down, got {m}");
+        assert!(
+            (m - 0.36).abs() < 0.05,
+            "overconfident → scale down, got {m}"
+        );
 
         // Pathologically overconfident: lower clamp holds at 0.25.
         e.actual_ema = 0.01;
@@ -338,7 +345,11 @@ mod tests {
 
         // Near-zero predicted EMA: ratio is noise → identity.
         e.predicted_ema = 0.01;
-        assert_eq!(e.debias_multiplier(), 1.0, "predicted_ema < 0.05 → identity");
+        assert_eq!(
+            e.debias_multiplier(),
+            1.0,
+            "predicted_ema < 0.05 → identity"
+        );
     }
 
     #[test]

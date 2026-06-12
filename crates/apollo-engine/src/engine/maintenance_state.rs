@@ -194,7 +194,8 @@ impl MaintenanceState {
             self.consecutive_thrash_cycles = 0;
         }
         if thrash > 50_000.0 {
-            self.consecutive_thrash_50k_cycles = self.consecutive_thrash_50k_cycles.saturating_add(1);
+            self.consecutive_thrash_50k_cycles =
+                self.consecutive_thrash_50k_cycles.saturating_add(1);
         } else {
             self.consecutive_thrash_50k_cycles = 0;
         }

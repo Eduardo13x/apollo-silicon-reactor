@@ -451,7 +451,6 @@ impl WorkloadMode {
     }
 }
 
-
 /// Feature vector for nearest-centroid classification.
 pub struct WorkloadFeatures {
     /// Mean cpu_wall_ratio across all processes (0.0–1.0).

@@ -115,7 +115,9 @@ pub struct EffectLedger {
 
 impl EffectLedger {
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
     /// Upsert an applied effect. Re-applying refreshes the TTL clock —
@@ -129,7 +131,13 @@ impl EffectLedger {
     ) {
         self.entries.insert(
             (effect.pid(), effect.kind()),
-            LedgerEntry { effect, applied_at: Instant::now(), ttl, start_sec, justification },
+            LedgerEntry {
+                effect,
+                applied_at: Instant::now(),
+                ttl,
+                start_sec,
+                justification,
+            },
         );
     }
 
@@ -152,7 +160,10 @@ impl EffectLedger {
             })
             .map(|(k, _)| *k)
             .collect();
-        expired.into_iter().filter_map(|k| self.entries.remove(&k)).collect()
+        expired
+            .into_iter()
+            .filter_map(|k| self.entries.remove(&k))
+            .collect()
     }
 
     /// Drop entries for PIDs that exited.
@@ -217,10 +228,7 @@ pub fn cleanup_global(live_pids: &[u32]) {
 /// accumulates over minutes, not milliseconds — same cadence as the
 /// zombie sweep). Cost is bounded: undo syscalls only for entries that
 /// actually expired this window.
-pub fn reconcile_global(
-    foreground_pid: Option<u32>,
-    qos_mgr: &Arc<Mutex<MachQoSManager>>,
-) -> u64 {
+pub fn reconcile_global(foreground_pid: Option<u32>, qos_mgr: &Arc<Mutex<MachQoSManager>>) -> u64 {
     let expired = with_global(|l| l.drain_expired(foreground_pid));
     if expired.is_empty() {
         return 0;
@@ -292,10 +300,19 @@ mod tests {
     #[test]
     fn orphan_boost_signature_only_matches_minus_ten_unprotected() {
         assert!(is_orphan_boost_signature(-10, false), "Apollo signature");
-        assert!(!is_orphan_boost_signature(-10, true), "hard-protected exempt");
-        assert!(!is_orphan_boost_signature(-20, false), "kernel_task -20 not ours");
+        assert!(
+            !is_orphan_boost_signature(-10, true),
+            "hard-protected exempt"
+        );
+        assert!(
+            !is_orphan_boost_signature(-20, false),
+            "kernel_task -20 not ours"
+        );
         assert!(!is_orphan_boost_signature(0, false), "default nice");
-        assert!(!is_orphan_boost_signature(-5, false), "other negative not ours");
+        assert!(
+            !is_orphan_boost_signature(-5, false),
+            "other negative not ours"
+        );
     }
 
     #[test]
@@ -329,7 +346,12 @@ mod tests {
     fn upsert_key_is_pid_plus_kind() {
         let mut l = EffectLedger::new();
         l.record(nice(901_003), DEFAULT_TTL, 1, "a");
-        l.record(AppliedEffect::MachTier { pid: 901_003 }, DEFAULT_TTL, 1, "b");
+        l.record(
+            AppliedEffect::MachTier { pid: 901_003 },
+            DEFAULT_TTL,
+            1,
+            "b",
+        );
         assert_eq!(l.len(), 2, "different kinds for same pid coexist");
         l.record(nice(901_003), DEFAULT_TTL, 1, "a2");
         assert_eq!(l.len(), 2, "same (pid, kind) upserts");
@@ -366,11 +388,19 @@ mod tests {
         assert_eq!(e.pid(), 901_007);
 
         // Slow path: record with zero TTL, drain (the reconcile undo source).
-        l.record(e, Duration::from_secs(0), 55, "memory-budget: jetsam inactive limit");
+        l.record(
+            e,
+            Duration::from_secs(0),
+            55,
+            "memory-budget: jetsam inactive limit",
+        );
         assert_eq!(l.len(), 1, "memlimit recorded");
         let drained = l.drain_expired(None);
         assert_eq!(drained.len(), 1, "expired memlimit drains for undo");
-        assert!(matches!(drained[0].effect, AppliedEffect::Memlimit { pid: 901_007 }));
+        assert!(matches!(
+            drained[0].effect,
+            AppliedEffect::Memlimit { pid: 901_007 }
+        ));
         assert_eq!(drained[0].start_sec, 55, "PID-identity guard preserved");
         assert!(l.is_empty(), "drained entry removed — no double undo");
 
@@ -383,7 +413,11 @@ mod tests {
         // Memlimit coexists with other kinds for the same pid (upsert key).
         l.record(e, DEFAULT_TTL, 55, "m");
         l.record(nice(901_007), DEFAULT_TTL, 55, "n");
-        assert_eq!(l.len(), 2, "Memlimit and Nice for same pid are distinct keys");
+        assert_eq!(
+            l.len(),
+            2,
+            "Memlimit and Nice for same pid are distinct keys"
+        );
     }
 
     /// Strangler-fig phase-2 (cont.): App-Nap and the thermal E-core
@@ -402,27 +436,46 @@ mod tests {
         assert_eq!(nap.pid(), 901_011);
 
         // Slow path: zero-TTL record drains for the reconcile undo.
-        l.record(nap, Duration::from_secs(0), 77, "wake-storm/llm: app-nap suppression");
+        l.record(
+            nap,
+            Duration::from_secs(0),
+            77,
+            "wake-storm/llm: app-nap suppression",
+        );
         let drained = l.drain_expired(None);
         assert_eq!(drained.len(), 1, "expired app-nap drains for release");
-        assert!(matches!(drained[0].effect, AppliedEffect::AppNap { pid: 901_011 }));
+        assert!(matches!(
+            drained[0].effect,
+            AppliedEffect::AppNap { pid: 901_011 }
+        ));
         assert!(l.is_empty(), "drained entry removed — no double release");
 
         // Fast path: record then forget (set_app_nap(false) / thermal recover).
         l.record(nap, DEFAULT_TTL, 77, "x");
         l.forget(&nap);
-        assert!(l.is_empty(), "forget drops app-nap without a second release");
+        assert!(
+            l.is_empty(),
+            "forget drops app-nap without a second release"
+        );
 
         // App-Nap and a thermal MachTier demotion of the SAME pid are
         // distinct ledger keys (different effect kinds) — both must survive.
         l.record(nap, DEFAULT_TTL, 77, "nap");
         l.record(tier, DEFAULT_TTL, 77, "thermal: E-core migration");
         l.record(bg, DEFAULT_TTL, 88, "thermal: E-core migration");
-        assert_eq!(l.len(), 3, "AppNap + MachTier (same pid) + DarwinBg are distinct");
+        assert_eq!(
+            l.len(),
+            3,
+            "AppNap + MachTier (same pid) + DarwinBg are distinct"
+        );
         // Thermal recover() forgets BOTH possible migration kinds per pid.
         l.forget(&tier);
         l.forget(&AppliedEffect::DarwinBg { pid: 901_011 }); // no-op: absent
-        assert_eq!(l.len(), 2, "MachTier dropped; AppNap + the other DarwinBg remain");
+        assert_eq!(
+            l.len(),
+            2,
+            "MachTier dropped; AppNap + the other DarwinBg remain"
+        );
     }
 
     /// Silent-telemetry-death guard: the reconcile undo bumps
@@ -440,9 +493,12 @@ mod tests {
             obj.remove("effect_ledger_reverts_total").is_some(),
             "field must be present pre-strip (renamed/dropped = telemetry death)"
         );
-        let m: crate::engine::types::RuntimeMetrics =
-            serde_json::from_value(v).expect("old payload missing the field must default, not fail");
-        assert_eq!(m.effect_ledger_reverts_total, 0, "absent field defaults to 0");
+        let m: crate::engine::types::RuntimeMetrics = serde_json::from_value(v)
+            .expect("old payload missing the field must default, not fail");
+        assert_eq!(
+            m.effect_ledger_reverts_total, 0,
+            "absent field defaults to 0"
+        );
 
         // And a populated value survives a full re-serialize round trip.
         let mut m2 = crate::engine::types::RuntimeMetrics::default();

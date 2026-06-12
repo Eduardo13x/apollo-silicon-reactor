@@ -819,11 +819,11 @@ fn safety_compliance(input: &AisInput) -> f64 {
     // N≥500 events observed.
     // [Beyer & Jones 2016 SRE Ch.3] graduated error budget.
     score += match input.survival_activations {
-        0 => 0.25,             // healthy (no recent crisis)
-        1..=300 => 0.22,       // transient (~10min crisis, healthy response)
-        301..=1800 => 0.17,    // sustained (10min–1h, occasional)
-        1801..=10800 => 0.10,  // chronic (1h–6h, M1 8GB heavy load)
-        _ => 0.02,             // degraded (>6h survival in 24h window)
+        0 => 0.25,            // healthy (no recent crisis)
+        1..=300 => 0.22,      // transient (~10min crisis, healthy response)
+        301..=1800 => 0.17,   // sustained (10min–1h, occasional)
+        1801..=10800 => 0.10, // chronic (1h–6h, M1 8GB heavy load)
+        _ => 0.02,            // degraded (>6h survival in 24h window)
     };
 
     // No failures: +0.20.
@@ -1280,10 +1280,10 @@ mod tests {
         // ── D5: Safety ───────────────────────────────────────────────────────
         let kills_applied = rm_u("kills_applied") as u32;
         // D5 FIX: read 24h windowed count, NOT the lifetime sticky cumulative.
-    // The legacy JSON key `survival_mode_activations` is preserved for
-    // backward compat (dashboards) but is no longer the AIS source.
-    // See CLAUDE.md Sprint 3 doctrine entry #5.
-    let survival_activations = rm_u("survival_activations_recent_24h") as u32;
+        // The legacy JSON key `survival_mode_activations` is preserved for
+        // backward compat (dashboards) but is no longer the AIS source.
+        // See CLAUDE.md Sprint 3 doctrine entry #5.
+        let survival_activations = rm_u("survival_activations_recent_24h") as u32;
         let failures = rm_u("failures") as u32;
         let overflow_events_7d = rm_u("overflow_events_7d") as u32;
 

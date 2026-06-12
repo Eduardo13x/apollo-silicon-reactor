@@ -662,41 +662,40 @@ pub fn execute_actions(
                         out.push_skip(format!("critical-bg:{}", name));
                         block_reason = Some(BlockReason::CriticalBackground);
                     }
-                    if !dry_run
-                        && caps.can_taskpolicy {
-                            // Phase 2: direct Mach syscalls for CPU tier routing.
-                            // S4 cutover: short-guard Mutex lock.
-                            if let Some(arc) = qos_mgr.as_ref() {
-                                let mut mgr = arc.lock().unwrap_or_else(|e| e.into_inner());
-                                let sched_tier = if aggressive {
-                                    crate::engine::mach_qos::SchedulingTier::Background
-                                // E-cores only
-                                } else {
-                                    crate::engine::mach_qos::SchedulingTier::Normal
-                                    // scheduler decides, less invasive than E-cores-only
-                                };
-                                mgr.set_tier(*pid, sched_tier);
-                                let lat = if aggressive {
-                                    LatencyTier::Background
-                                } else {
-                                    LatencyTier::Default
-                                };
-                                let thr = if aggressive {
-                                    ThroughputTier::Low
-                                } else {
-                                    ThroughputTier::Default
-                                };
-                                mgr.set_latency_and_throughput(*pid, lat, thr);
-                                drop(mgr);
-                            }
-                            // Granular I/O tiering based on aggressiveness.
-                            // apply_io_tier uses PRIO_DARWIN_BG which is
-                            // turnstile-compatible — do NOT also set nice=20
-                            // via PRIO_PROCESS, as that breaks the Mach
-                            // priority-inheritance chain (Finder/Settings hangs).
-                            let io_tier = io_tier_for_throttle(aggressive);
-                            apply_io_tier(*pid, io_tier);
+                    if !dry_run && caps.can_taskpolicy {
+                        // Phase 2: direct Mach syscalls for CPU tier routing.
+                        // S4 cutover: short-guard Mutex lock.
+                        if let Some(arc) = qos_mgr.as_ref() {
+                            let mut mgr = arc.lock().unwrap_or_else(|e| e.into_inner());
+                            let sched_tier = if aggressive {
+                                crate::engine::mach_qos::SchedulingTier::Background
+                            // E-cores only
+                            } else {
+                                crate::engine::mach_qos::SchedulingTier::Normal
+                                // scheduler decides, less invasive than E-cores-only
+                            };
+                            mgr.set_tier(*pid, sched_tier);
+                            let lat = if aggressive {
+                                LatencyTier::Background
+                            } else {
+                                LatencyTier::Default
+                            };
+                            let thr = if aggressive {
+                                ThroughputTier::Low
+                            } else {
+                                ThroughputTier::Default
+                            };
+                            mgr.set_latency_and_throughput(*pid, lat, thr);
+                            drop(mgr);
                         }
+                        // Granular I/O tiering based on aggressiveness.
+                        // apply_io_tier uses PRIO_DARWIN_BG which is
+                        // turnstile-compatible — do NOT also set nice=20
+                        // via PRIO_PROCESS, as that breaks the Mach
+                        // priority-inheritance chain (Finder/Settings hangs).
+                        let io_tier = io_tier_for_throttle(aggressive);
+                        apply_io_tier(*pid, io_tier);
+                    }
                     out.throttles_applied += 1;
                 }
                 RootAction::FreezeProcess {
@@ -1501,7 +1500,10 @@ mod tests {
             .find(|e| matches!(e.action, RootAction::UnfreezeProcess { .. }))
             .expect("the unfreeze action must be journaled");
 
-        assert!(entry.success, "dry-run unfreeze must be recorded as success");
+        assert!(
+            entry.success,
+            "dry-run unfreeze must be recorded as success"
+        );
         let rationale = entry
             .rationale
             .as_ref()

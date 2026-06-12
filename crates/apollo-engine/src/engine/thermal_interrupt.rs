@@ -755,10 +755,7 @@ fn migrate_to_ecores(
         };
         // Anti-ratchet: remember the demotion so recover() can undo it
         // (fast, explicit thermal-clear path).
-        state
-            .interrupt_migrated_pids
-            .lock_recover()
-            .insert(pid_u32);
+        state.interrupt_migrated_pids.lock_recover().insert(pid_u32);
         // EffectLedger phase-2: ALSO register a TTL-bounded backstop so a
         // daemon restart — or a thermal-clear that never fires — still gets
         // this migration reverted by reconcile_global. The bespoke set above
@@ -957,7 +954,11 @@ fn recover(
     // for fallback-path victims. Runs BEFORE the frozen-set early-return —
     // Moderate phases migrate without freezing anything.
     {
-        let migrated: Vec<u32> = state.interrupt_migrated_pids.lock_recover().drain().collect();
+        let migrated: Vec<u32> = state
+            .interrupt_migrated_pids
+            .lock_recover()
+            .drain()
+            .collect();
         if !migrated.is_empty() {
             const PRIO_DARWIN_BG: libc::c_int = 0x1000;
             let mut qos_guard = qos_mgr.as_ref().and_then(|m| m.try_lock().ok());

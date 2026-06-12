@@ -234,9 +234,7 @@ pub fn context_from_pressure(
     // [Hellerstein 2004 §9] actuate on the constrained resource, not a
     // proxy for it.
     let thermal_emergency = crate::engine::shadow_signals::get_thermal_emergency();
-    if (cpu_pressure > 88.0 && thermal_emergency)
-        || ram_pressure > thresholds.critical_pressure
-    {
+    if (cpu_pressure > 88.0 && thermal_emergency) || ram_pressure > thresholds.critical_pressure {
         InteractiveContext::ThermalConstrained
     } else if cpu_pressure > 72.0 || ram_pressure > thresholds.bg_pressure || swap_exhausted {
         InteractiveContext::BackgroundPressure
@@ -1251,7 +1249,6 @@ pub fn decide_actions(
     );
     let gate_offset = user_ctx.pressure_gate_offset();
 
-
     // macOS cooperation: when the kernel is already handling memory pressure
     // (compressor active, swap growing, jetsam fired), Apollo should step back
     // from direct interventions and let macOS manage. Apollo supplements with
@@ -1641,8 +1638,7 @@ pub fn decide_actions(
                     // kill authority. [Saltzer & Kaashoek 2009 §3.3 — cooperate
                     // through the kernel's own mechanism, don't duplicate it.]
                     if emit_jetsam_hints_instead {
-                        crate::engine::lse_counters::LSE_COUNTERS
-                            .inc_cooperation_jetsam_hint();
+                        crate::engine::lse_counters::LSE_COUNTERS.inc_cooperation_jetsam_hint();
                         actions.push(RootAction::set_memorystatus(
                             pid,
                             -1,

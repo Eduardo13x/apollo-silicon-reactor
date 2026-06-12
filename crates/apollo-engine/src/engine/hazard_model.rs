@@ -198,7 +198,10 @@ impl HazardModel {
         // base_rate update above runs every tick (correct — it's time-based).
         const SURVIVAL_BETA_STRIDE: u32 = 10;
         self.survival_tick_count = self.survival_tick_count.wrapping_add(1);
-        if self.survival_tick_count.is_multiple_of(SURVIVAL_BETA_STRIDE) {
+        if self
+            .survival_tick_count
+            .is_multiple_of(SURVIVAL_BETA_STRIDE)
+        {
             // neg_lr × 0.05 keeps OOM events (lr=0.01) 20× more impactful per event.
             // Combined with stride=10, effective asymmetry is 200× — OOM events
             // dominate on a per-event basis while survival ticks still converge over hours.

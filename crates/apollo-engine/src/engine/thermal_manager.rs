@@ -226,12 +226,10 @@ impl ThermalManager {
                 recommendations
                     .push("🔴 CRITICAL: Applying emergency thermal throttling".to_string());
             }
-            ThermalTrend::Warming
-                if state > 75.0 => {
-                    recommendations.push(
-                        "🟡 Temperature rising: Consider reducing background load".to_string(),
-                    );
-                }
+            ThermalTrend::Warming if state > 75.0 => {
+                recommendations
+                    .push("🟡 Temperature rising: Consider reducing background load".to_string());
+            }
             _ => {}
         }
 
@@ -323,7 +321,10 @@ mod tests {
             m.update(t, t, t, 100, 0);
         }
         let p = m.predict_throttle_level(ThermalTrend::Critical);
-        assert!(p <= 100, "predicted throttle must never exceed 100, got {p}");
+        assert!(
+            p <= 100,
+            "predicted throttle must never exceed 100, got {p}"
+        );
     }
 
     #[test]

@@ -479,7 +479,8 @@ impl MachQoSManager {
             // proven non-SIP) and go straight to apply_task_policy below.
             let result = self.apply_task_policy(pid, tier);
             if result.success {
-                self.current_tier.insert(pid, (tier, std::time::Instant::now()));
+                self.current_tier
+                    .insert(pid, (tier, std::time::Instant::now()));
             } else {
                 self.mark_blocked(pid);
                 self.current_tier.remove(&pid);
@@ -511,7 +512,8 @@ impl MachQoSManager {
         let result = self.apply_task_policy(pid, tier);
 
         if result.success {
-            self.current_tier.insert(pid, (tier, std::time::Instant::now()));
+            self.current_tier
+                .insert(pid, (tier, std::time::Instant::now()));
         } else {
             // task_for_pid failed — block permanently and report as silent skip.
             self.mark_blocked(pid);
@@ -588,7 +590,10 @@ impl MachQoSManager {
 
     /// Return all currently tracked (pid, tier) pairs.
     pub fn current_tier_keys(&self) -> Vec<(u32, SchedulingTier)> {
-        self.current_tier.iter().map(|(k, (t, _))| (*k, *t)).collect()
+        self.current_tier
+            .iter()
+            .map(|(k, (t, _))| (*k, *t))
+            .collect()
     }
 
     /// All PIDs currently App-Napped by Apollo. Fight-hunt fix

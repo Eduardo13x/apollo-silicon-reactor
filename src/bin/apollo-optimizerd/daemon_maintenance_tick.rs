@@ -215,8 +215,7 @@ fn emergency_thrashing_purge_allowed(
 
     let media_or_assertion = ctx.audio_active || ctx.call_in_progress || ctx.has_sleep_assertion;
     let critical_lockup = thrash > CRITICAL_THRASHING_PURGE_SCORE
-        && (p_oom_30s >= CRITICAL_THRASHING_P_OOM
-            || state.consecutive_thrash_50k_cycles >= 10);
+        && (p_oom_30s >= CRITICAL_THRASHING_P_OOM || state.consecutive_thrash_50k_cycles >= 10);
 
     if bus_saturated && !critical_lockup {
         return false;

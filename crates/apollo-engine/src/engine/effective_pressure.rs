@@ -214,7 +214,10 @@ mod tests {
     #[test]
     fn all_boosts_maxed_caps_at_030_delta() {
         // Total boost sum = 1.74 but capped at 0.30 → effective = 0.60 + 0.30 = 0.90
-        let (eff, comp) = compute(0.60, b(0.30, 0.18, 0.40, 0.20, 0.06, 0.08, 0.10, 0.30, 0.12));
+        let (eff, comp) = compute(
+            0.60,
+            b(0.30, 0.18, 0.40, 0.20, 0.06, 0.08, 0.10, 0.30, 0.12),
+        );
         assert!(
             (eff - 0.90).abs() < 1e-9,
             "expected 0.90 (base 0.60 + cap 0.30), got {eff}"
@@ -254,7 +257,10 @@ mod tests {
 
     #[test]
     fn components_boost_sum_matches_manual() {
-        let (_, comp) = compute(0.50, b(0.15, 0.10, 0.25, 0.15, 0.06, 0.08, 0.10, 0.15, 0.12));
+        let (_, comp) = compute(
+            0.50,
+            b(0.15, 0.10, 0.25, 0.15, 0.06, 0.08, 0.10, 0.15, 0.12),
+        );
         let manual_sum = 0.15 + 0.10 + 0.25 + 0.15 + 0.06 + 0.08 + 0.10 + 0.15 + 0.12;
         assert!(
             (comp.total_boost() - manual_sum).abs() < 1e-9,
@@ -326,7 +332,10 @@ mod tests {
     #[test]
     fn base_preserved_in_components_when_clamped() {
         let base = 0.70;
-        let (eff, comp) = compute(base, b(0.30, 0.18, 0.40, 0.20, 0.06, 0.08, 0.10, 0.30, 0.12));
+        let (eff, comp) = compute(
+            base,
+            b(0.30, 0.18, 0.40, 0.20, 0.06, 0.08, 0.10, 0.30, 0.12),
+        );
         assert_eq!(eff, 1.0, "should be clamped");
         assert_eq!(comp.base, base, "base must be preserved in components");
     }

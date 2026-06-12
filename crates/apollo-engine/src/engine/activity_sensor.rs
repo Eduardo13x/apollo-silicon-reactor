@@ -29,8 +29,7 @@ pub fn pids_with_assertions() -> HashSet<u32> {
         std::thread::spawn(move || {
             let _ = tx.send(pids_with_assertions_inner());
         });
-        rx
-            .recv_timeout(std::time::Duration::from_millis(500))
+        rx.recv_timeout(std::time::Duration::from_millis(500))
             .unwrap_or_default()
     }
 }
@@ -106,9 +105,10 @@ fn pids_with_assertions_inner() -> HashSet<u32> {
 
                 let mut pid: i32 = 0;
                 if CFNumberGetValue(key, K_CF_NUMBER_SINT32_TYPE, &mut pid as *mut _ as *mut _)
-                    && pid > 0 {
-                        pids.insert(pid as u32);
-                    }
+                    && pid > 0
+                {
+                    pids.insert(pid as u32);
+                }
             }
 
             CFRelease(dict_ref);

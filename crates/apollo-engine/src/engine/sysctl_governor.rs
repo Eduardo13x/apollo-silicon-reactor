@@ -1516,9 +1516,9 @@ mod tests {
         // never own this surface again.
         let gov = SysctlGovernor::new(true);
         let actions = gov.apply_initial_tuning();
-        let touches_gpu = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl(s) if s.key().contains("iogpu"))
-        });
+        let touches_gpu = actions
+            .iter()
+            .any(|a| matches!(a, RootAction::SetSysctl(s) if s.key().contains("iogpu")));
         assert!(!touches_gpu, "initial tuning must not write iogpu.* keys");
         assert!(
             !MANAGED_KEYS.iter().any(|k| k.contains("iogpu")),
@@ -1527,10 +1527,13 @@ mod tests {
         // 2026-06-10 same hunt: Apollo disabled the kernel's low-pri I/O
         // throttle at startup (background daemons ran unthrottled against
         // user I/O). Apollo must not own this surface either.
-        let touches_lowpri = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl(s) if s.key().contains("lowpri_throttle"))
-        });
-        assert!(!touches_lowpri, "initial tuning must not write lowpri_throttle");
+        let touches_lowpri = actions
+            .iter()
+            .any(|a| matches!(a, RootAction::SetSysctl(s) if s.key().contains("lowpri_throttle")));
+        assert!(
+            !touches_lowpri,
+            "initial tuning must not write lowpri_throttle"
+        );
         assert!(
             !MANAGED_KEYS.iter().any(|k| k.contains("lowpri_throttle")),
             "lowpri_throttle must not be managed"

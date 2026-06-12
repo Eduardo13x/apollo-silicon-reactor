@@ -258,8 +258,7 @@ pub fn run_memory_budget(
             // refreshes the TTL, so a continuously-over-budget process is
             // never spuriously cleared. last_applied_limits stays the source
             // of truth for the significant-change dedup above.
-            let (start_sec, _) =
-                apollo_engine::engine::daemon_helpers::pid_start_time(budget.pid);
+            let (start_sec, _) = apollo_engine::engine::daemon_helpers::pid_start_time(budget.pid);
             apollo_engine::engine::effect_ledger::record_global(
                 apollo_engine::engine::effect_ledger::AppliedEffect::Memlimit { pid: budget.pid },
                 apollo_engine::engine::effect_ledger::DEFAULT_TTL,

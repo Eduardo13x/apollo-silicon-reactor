@@ -134,7 +134,7 @@ impl BuildTracker {
         }
 
         // Fallback: time-based estimate normalized to EXPECTED_BUILD_CYCLES.
-        
+
         (self.build_cycles as f32 / EXPECTED_BUILD_CYCLES as f32).min(0.90)
     }
 

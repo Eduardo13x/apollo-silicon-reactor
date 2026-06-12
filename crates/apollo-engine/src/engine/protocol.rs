@@ -113,14 +113,12 @@ impl DaemonRequest {
 
     pub fn sanitize(&mut self) {
         match self {
-            Self::LlmSetKey { api_key, .. }
-                if api_key.len() > 1024 => {
-                    api_key.truncate(1024);
-                }
-            Self::UsageExplain { name }
-                if name.len() > 256 => {
-                    name.truncate(256);
-                }
+            Self::LlmSetKey { api_key, .. } if api_key.len() > 1024 => {
+                api_key.truncate(1024);
+            }
+            Self::UsageExplain { name } if name.len() > 256 => {
+                name.truncate(256);
+            }
             Self::Feedback { rating, note } => {
                 if rating.len() > 32 {
                     rating.truncate(32);

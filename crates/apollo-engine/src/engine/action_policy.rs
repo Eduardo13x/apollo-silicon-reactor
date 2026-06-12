@@ -302,8 +302,7 @@ pub struct PolicyScore {
 /// so operators can flip strategies via the persisted config without
 /// recompiling. The default keeps behaviour byte-equivalent to the
 /// pre-Group-C scorer until the operator explicitly opts in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AggregatorMode {
     /// Root-Sum-Square uncertainty composition (Sprint 11 default).
     #[default]
@@ -312,7 +311,6 @@ pub enum AggregatorMode {
     /// fallback on high conflict.
     Dempster,
 }
-
 
 impl AggregatorMode {
     /// Parse the persisted [`LearnedState::policy_aggregator_mode`]

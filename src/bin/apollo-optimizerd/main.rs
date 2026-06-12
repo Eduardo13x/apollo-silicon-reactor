@@ -705,7 +705,10 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 if adopted > 0 {
-                    tracing::info!(adopted, "startup: reverted orphan nice=-10 boosts from prior daemon");
+                    tracing::info!(
+                        adopted,
+                        "startup: reverted orphan nice=-10 boosts from prior daemon"
+                    );
                 }
             }
 
@@ -3948,7 +3951,9 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 ZombieClass::WakeupBurner => {
                                     let (ss, su) =
-                                        apollo_engine::engine::daemon_helpers::pid_start_time(dw.pid);
+                                        apollo_engine::engine::daemon_helpers::pid_start_time(
+                                            dw.pid,
+                                        );
                                     zombie_actions.push(RootAction::ThrottleProcess {
                                         pid: dw.pid,
                                         name: dw.name.clone(),

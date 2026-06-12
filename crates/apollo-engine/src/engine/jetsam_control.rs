@@ -304,7 +304,10 @@ mod tests {
         assert_eq!(&probe.memlimit_active as *const _ as usize - base, 0);
         assert_eq!(&probe.memlimit_active_attr as *const _ as usize - base, 4);
         assert_eq!(&probe.memlimit_inactive as *const _ as usize - base, 8);
-        assert_eq!(&probe.memlimit_inactive_attr as *const _ as usize - base, 12);
+        assert_eq!(
+            &probe.memlimit_inactive_attr as *const _ as usize - base,
+            12
+        );
     }
 
     #[test]

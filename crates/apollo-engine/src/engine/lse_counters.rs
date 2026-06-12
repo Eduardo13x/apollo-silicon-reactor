@@ -1375,13 +1375,9 @@ impl LockFreeMetrics {
             zombie_dead_weight_detected_total: self
                 .zombie_dead_weight_detected_total
                 .load(Ordering::Relaxed),
-            zombie_actions_emitted_total: self
-                .zombie_actions_emitted_total
-                .load(Ordering::Relaxed),
+            zombie_actions_emitted_total: self.zombie_actions_emitted_total.load(Ordering::Relaxed),
             boost_reverts_total: self.boost_reverts_total.load(Ordering::Relaxed),
-            effect_ledger_reverts_total: self
-                .effect_ledger_reverts_total
-                .load(Ordering::Relaxed),
+            effect_ledger_reverts_total: self.effect_ledger_reverts_total.load(Ordering::Relaxed),
             prediction_debias_applied_total: self
                 .prediction_debias_applied_total
                 .load(Ordering::Relaxed),
