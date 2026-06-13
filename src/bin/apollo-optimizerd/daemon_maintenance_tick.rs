@@ -60,6 +60,15 @@ const PURGE_HARD_SKIP: f64 = 0.75;
 
 const EMERGENCY_THRASHING_PURGE_SCORE: f64 = 25_000.0;
 const CRITICAL_THRASHING_PURGE_SCORE: f64 = 50_000.0;
+/// Memory-pressure floor for the emergency thrashing-bypass purge
+/// (2026-06-13). A high thrashing_score with LOW physical pressure is
+/// almost always benign page-cache churn from a cooperative app — prod
+/// caught 12 emergency purges firing at pressure 0.51-0.66 with Brave
+/// renderers spiking thrash to 50k-260k while swap stayed flat. Purging
+/// then is a pure ~tens-of-ms stall: the "stutter at random moments" the
+/// user reported. Below this floor, only a genuinely predicted OOM may
+/// purge; the streak heuristic alone does not.
+const EMERGENCY_PURGE_PRESSURE_FLOOR: f64 = 0.70;
 const EMERGENCY_THRASHING_STREAK_SCORE: f64 = 15_000.0;
 const EMERGENCY_THRASHING_MIN_CYCLES: u32 = 3;
 const EMERGENCY_PURGE_COOLDOWN_SECS: u64 = 300;
@@ -103,9 +112,15 @@ pub fn run_maintenance_tick(
     // ctx.audio_active go stale between samples — the exact gap that let
     // mid-call purges through.
     let realtime_call = apollo_engine::engine::coreaudio_active::is_realtime_call_active();
+    let physical_pressure = if snap.pressure.memory_pressure_raw > 0.0 {
+        snap.pressure.memory_pressure_raw
+    } else {
+        snap.pressure.memory_pressure
+    };
     let emergency = emergency_thrashing_purge_allowed(
         thrash,
         p_oom_30s,
+        physical_pressure,
         ctx,
         state,
         build_active,
@@ -196,6 +211,7 @@ pub fn run_maintenance_tick(
 fn emergency_thrashing_purge_allowed(
     thrash: f64,
     p_oom_30s: f64,
+    pressure: f64,
     ctx: &UserContext,
     state: &MaintenanceState,
     build_active: bool,
@@ -235,6 +251,20 @@ fn emergency_thrashing_purge_allowed(
     // there the stall is the lesser evil.
     if realtime_call {
         return thrash > CRITICAL_THRASHING_PURGE_SCORE && p_oom_30s >= CRITICAL_THRASHING_P_OOM;
+    }
+
+    // 2026-06-13 pressure-floor fix — "stutter at random moments": a thrash
+    // STREAK with low physical pressure is benign page-cache churn from a
+    // cooperative app (Brave renderers spike thrashing_score to 50k-260k
+    // while pressure stays ~0.52 and swap is flat). Purging then is a pure
+    // stall, not relief — purge frees page-cache, but at 0.52 pressure there
+    // is no scarcity to relieve. Below the floor, ONLY a genuinely predicted
+    // OOM (the same critical bar used for live calls) justifies the emergency
+    // purge; real escalating scarcity (pressure >= 0.70) still purges.
+    let genuine_oom =
+        thrash > CRITICAL_THRASHING_PURGE_SCORE && p_oom_30s >= CRITICAL_THRASHING_P_OOM;
+    if pressure < EMERGENCY_PURGE_PRESSURE_FLOOR && !genuine_oom {
+        return false;
     }
 
     // B.5 (2026-06-09): sustained 50k+ thrashing (≥10 cycles) bypasses the
@@ -596,15 +626,21 @@ mod tests {
         state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
 
         assert!(
-            !emergency_thrashing_purge_allowed(30_000.0, 0.90, &ctx, &state, false, false, false),
+            !emergency_thrashing_purge_allowed(
+                30_000.0, 0.90, 0.80, &ctx, &state, false, false, false
+            ),
             "moderate emergency thrashing should still respect active media"
         );
         assert!(
-            !emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, false, false),
+            !emergency_thrashing_purge_allowed(
+                60_000.0, 0.40, 0.80, &ctx, &state, false, false, false
+            ),
             "critical thrashing without high p_oom should still respect active media"
         );
         assert!(
-            emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, false, false, false),
+            emergency_thrashing_purge_allowed(
+                60_000.0, 0.90, 0.80, &ctx, &state, false, false, false
+            ),
             "critical sustained thrashing plus high p_oom should bypass media politeness"
         );
     }
@@ -621,19 +657,62 @@ mod tests {
 
         // Without a realtime call, the 50k streak bypasses → purge allowed.
         assert!(
-            emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, false, false),
+            emergency_thrashing_purge_allowed(
+                60_000.0, 0.40, 0.80, &ctx, &state, false, false, false
+            ),
             "50k streak bypasses media politeness when NO realtime call"
         );
         // With a realtime call but p_oom below critical → blocked (the fix).
         assert!(
-            !emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, false, true),
+            !emergency_thrashing_purge_allowed(
+                60_000.0, 0.40, 0.80, &ctx, &state, false, false, true
+            ),
             "live call + sub-critical p_oom must NOT purge (audio-glitch guard)"
         );
         // But genuine OOM imminence (high p_oom) still bypasses even a call —
         // an OOM kill would drop the call anyway; the stall is the lesser evil.
         assert!(
-            emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, false, false, true),
+            emergency_thrashing_purge_allowed(
+                60_000.0, 0.90, 0.80, &ctx, &state, false, false, true
+            ),
             "critical_lockup (high p_oom) overrides the realtime-call guard"
+        );
+    }
+
+    #[test]
+    fn emergency_thrashing_pressure_floor_blocks_benign_browser_churn() {
+        // 2026-06-13: prod caught 12 emergency purges firing at pressure
+        // 0.51-0.66 with Brave renderers spiking thrash to 50k-260k while
+        // swap stayed flat — benign page-cache churn, not scarcity. The
+        // purge stall was the user's "stutter at random moments".
+        let ctx = idle_ctx();
+        let mut state = MaintenanceState::default();
+        state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
+        state.consecutive_thrash_50k_cycles = 12; // streak that used to bypass
+
+        // Low pressure (0.55) + sub-critical p_oom → the streak no longer
+        // purges: it's browser churn, not memory scarcity.
+        assert!(
+            !emergency_thrashing_purge_allowed(
+                70_000.0, 0.30, 0.55, &ctx, &state, false, false, false
+            ),
+            "thrash streak with LOW pressure must NOT purge (benign churn)"
+        );
+        // Same streak but pressure now genuinely elevated (0.75) → real
+        // escalating scarcity, purge proceeds.
+        assert!(
+            emergency_thrashing_purge_allowed(
+                70_000.0, 0.30, 0.75, &ctx, &state, false, false, false
+            ),
+            "elevated pressure + thrash streak still purges (real scarcity)"
+        );
+        // Low pressure but a genuinely predicted OOM (high p_oom + critical
+        // thrash) → purge overrides the floor (imminent kill is worse).
+        assert!(
+            emergency_thrashing_purge_allowed(
+                60_000.0, 0.90, 0.55, &ctx, &state, false, false, false
+            ),
+            "predicted OOM overrides the pressure floor"
         );
     }
 
@@ -644,15 +723,21 @@ mod tests {
         state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
 
         assert!(
-            !emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, true, false, false),
+            !emergency_thrashing_purge_allowed(
+                60_000.0, 0.90, 0.80, &ctx, &state, true, false, false
+            ),
             "build mode remains protected under critical thrashing"
         );
         assert!(
-            !emergency_thrashing_purge_allowed(60_000.0, 0.40, &ctx, &state, false, true, false),
+            !emergency_thrashing_purge_allowed(
+                60_000.0, 0.40, 0.80, &ctx, &state, false, true, false
+            ),
             "bus saturation remains protected without high p_oom"
         );
         assert!(
-            emergency_thrashing_purge_allowed(60_000.0, 0.90, &ctx, &state, false, true, false),
+            emergency_thrashing_purge_allowed(
+                60_000.0, 0.90, 0.80, &ctx, &state, false, true, false
+            ),
             "high p_oom critical thrashing may bypass bus saturation to avoid lockup"
         );
     }
