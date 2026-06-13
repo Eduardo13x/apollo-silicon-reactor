@@ -131,6 +131,7 @@ use apollo_engine::engine::types::{
 use apollo_engine::engine::usage_model::{usage_model_path_root, UsageModel};
 use apollo_engine::engine::user_profile::{UserProfile, UserProfilePersisted};
 use apollo_engine::engine::wait_graph;
+use apollo_engine::engine::work_session::WorkSession;
 use apollo_engine::engine::workload_classifier::classify_by_memory;
 use apollo_engine::engine::workload_classifier::{
     classify_workload_mode, WorkloadFeatures, WorkloadMode,
@@ -314,6 +315,29 @@ fn pid_identity_still_valid(
         }
         None => true,
     }
+}
+
+/// Case-insensitive substring match of a foreground app name against a small
+/// allowlist of known dev tools. Used only to feed the work-session hysteresis
+/// latch ("is this a dev session?"). Reuses the already-detected foreground app
+/// name — no new process scan. Substring match handles macOS 15-char name
+/// truncation (e.g. `language_server`) and bundle suffixes.
+fn is_dev_tool_name(name: &str) -> bool {
+    const DEV_TOOLS: &[&str] = &[
+        "cargo",
+        "rustc",
+        "node",
+        "zed",
+        "claude",
+        "alacritty",
+        "esbuild",
+        "language_server",
+        "code",
+        "iterm2",
+        "warp",
+    ];
+    let lc = name.to_ascii_lowercase();
+    DEV_TOOLS.iter().any(|tool| lc.contains(tool))
 }
 
 /// Toggle Spotlight indexing via `mdutil -a -i on/off`.
@@ -1402,6 +1426,13 @@ fn main() -> anyhow::Result<()> {
             let mut prev_package_watts: Option<f64> = None;
             // Track previous cycle's workload for onset detection (build-onset-proactive).
             let mut prev_workload_mode: WorkloadMode = WorkloadMode::Idle;
+            // Work-session hysteresis: latch "work mode" through the user's dev
+            // session so the profile governor stays AggressiveRoot for a grace
+            // window after the last dev activity, decaying gracefully instead of
+            // snapping back to Idle the instant a build finishes / Claude Code
+            // closes. Per-cycle in-memory state (not persisted), like
+            // prev_workload_mode above. See engine::work_session.
+            let mut work_session = WorkSession::new();
             // Affective arousal EMA: global system-wide stress level ∈ [0,1].
             // Drives Yerkes-Dodson adaptive recalibration threshold in learning_tick.
             // Restored from learned_state.json if available — preserves crisis context
@@ -2896,8 +2927,31 @@ fn main() -> anyhow::Result<()> {
                 // Workload-onset: fired once when transitioning INTO Build mode.
                 // Lets the governor proactively switch to AggressiveRoot before
                 // pressure builds, rather than waiting for the reactive threshold.
-                let workload_onset = workload_mode == WorkloadMode::Build
+                let raw_workload_onset = workload_mode == WorkloadMode::Build
                     && prev_workload_mode != WorkloadMode::Build;
+
+                // Work-session hysteresis (ADDITIVE — can only turn workload_onset
+                // ON, never off). "is_dev_active" reuses signals already computed
+                // this cycle (no new process scans): the workload classifier sees
+                // a Build, OR dev_session_active (critical_background_processes =
+                // dev-runtime + infra patterns: cargo/rustc/node/...), OR the
+                // foreground app is a known dev tool. note_activity refreshes the
+                // grace window; is_active reports whether we are still within it.
+                // battery_low forces is_active=false inside WorkSession (survival
+                // of the battery beats feel). We modulate ONLY the governor's
+                // workload_onset input — NOT the WorkloadMode enum that other
+                // consumers read. See profile_governor.rs:272.
+                let fg_is_dev_tool = foreground_app
+                    .as_deref()
+                    .map(is_dev_tool_name)
+                    .unwrap_or(false);
+                let is_dev_active =
+                    workload_mode == WorkloadMode::Build || dev_session_active || fg_is_dev_tool;
+                let now_instant = std::time::Instant::now();
+                work_session.note_activity(is_dev_active, now_instant);
+                let work_session_active =
+                    work_session.is_active(power_mgr.is_on_battery(), battery_low, now_instant);
+                let workload_onset = raw_workload_onset || work_session_active;
 
                 let governor_decision = {
                     let mut pg = state.policy.lock_recover();
@@ -5974,10 +6028,28 @@ mod tests {
     //! `companion_fg_cache_hits_total >= 990` and `is_companion_of`
     //! call count `< 30` (one per fg-burst or graph mutation).
 
-    use super::{fingerprint_top_processes, CompanionFgCache};
+    use super::{fingerprint_top_processes, is_dev_tool_name, CompanionFgCache};
     use apollo_engine::collector::ProcessStats;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn dev_tool_name_matches_known_tools_case_insensitively() {
+        // Known dev tools (incl. macOS 15-char-truncated language_server and
+        // bundle/suffix variants) classify as dev-active.
+        assert!(is_dev_tool_name("cargo"));
+        assert!(is_dev_tool_name("Claude"));
+        assert!(is_dev_tool_name("zed"));
+        assert!(is_dev_tool_name("language_server")); // truncated
+        assert!(is_dev_tool_name("language_server_macos_arm")); // full
+        assert!(is_dev_tool_name("Code Helper"));
+        assert!(is_dev_tool_name("iTerm2"));
+        assert!(is_dev_tool_name("Warp"));
+        // Non-dev foreground apps must NOT latch work mode.
+        assert!(!is_dev_tool_name("Spotify"));
+        assert!(!is_dev_tool_name("WindowServer"));
+        assert!(!is_dev_tool_name(""));
+    }
 
     fn mk_proc(pid: u32, name: &str) -> ProcessStats {
         ProcessStats {
