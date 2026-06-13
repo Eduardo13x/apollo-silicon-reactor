@@ -215,6 +215,17 @@ impl LearningPipeline {
 
         // ── Step 1: Fan-out to each subsystem ────────────────────────────────
 
+        // Read the natural-drift counterfactual ONCE before the loop (the
+        // values are Copy f32, so no borrow conflict with the &mut
+        // outcome_tracker uses inside the loop). The CausalGraph now subtracts
+        // this drift before updating avg_delta, so avg_delta represents the NET
+        // causal effect (Rubin 1974), matching the drift-adjusted "actual"
+        // MetaCognition measures instead of the inflated raw drop.
+        let drift_fast = outcome_tracker.pressure_velocity_short() as f32;
+        // natural_drift() is a 60-tick cumulative drop; scale to the 15-cycle
+        // slow window (per-cycle drift × 15 cycles).
+        let drift_slow = (outcome_tracker.natural_drift() / 60.0 * 15.0) as f32;
+
         for obs in &self.batch {
             // OutcomeTracker: record each action+outcome directly (post-evaluation path).
             // Note: record_throttle() + tick() is the live path; here we update the
@@ -242,9 +253,12 @@ impl LearningPipeline {
             // This bypasses the normal eval_delay but is correct since we supply the
             // resolved outcome directly. We call evaluate() with a cycle offset of
             // eval_delay so the pending entry is eligible.
-            causal_graph.evaluate(
+            causal_graph.evaluate_with_resources(
                 obs.post_pressure as f32,
                 synthetic_cycle + causal_graph_eval_delay(),
+                &crate::engine::causal_graph::ResourceSnapshot::default(),
+                drift_fast,
+                drift_slow,
             );
 
             // SkillRegistry: record result for the named skill, if any.

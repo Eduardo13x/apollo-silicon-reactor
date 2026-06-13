@@ -535,10 +535,14 @@ impl CausalGraph {
     /// Called each cycle — checks actions that are old enough for evaluation.
     /// Now also accepts current resource snapshot for mechanism attribution.
     pub fn evaluate(&mut self, current_pressure: f32, current_cycle: u64) {
+        // drift_fast = drift_slow = 0.0 ⇒ identical to pre-drift-adjustment
+        // behavior, so all 2-arg `evaluate(...)` call sites stay unchanged.
         self.evaluate_with_resources(
             current_pressure,
             current_cycle,
             &ResourceSnapshot::default(),
+            0.0,
+            0.0,
         );
     }
 
@@ -549,6 +553,8 @@ impl CausalGraph {
         current_pressure: f32,
         current_cycle: u64,
         current_resources: &ResourceSnapshot,
+        drift_fast: f32, // pressure_velocity_short() — per-sample natural drop
+        drift_slow: f32, // natural_drift() scaled to the 15-cycle slow window
     ) {
         // Phase 4.2 — collect blame tags here, apply after the borrow ends.
         // We can't call `&mut self.note_external_taint(...)` while a
@@ -590,7 +596,12 @@ impl CausalGraph {
                     .edges
                     .entry(key)
                     .or_insert_with(|| CausalEdge::new(&pending.action_key, effect));
-                edge.update_with_delta(true, delta.max(0.0));
+                // Drift-adjust the magnitude: avg_delta becomes the NET causal
+                // effect (raw drop minus the do-nothing counterfactual), matching
+                // the Rubin 1974 drift-adjusted "actual" MetaCognition measures.
+                // was_effective above stays on RAW delta — confidence semantics
+                // unchanged; only the magnitude EMA is corrected.
+                edge.update_with_delta(true, (delta - drift_fast).max(0.0));
 
                 // Mechanism attribution: what resource channel changed?
                 if was_effective {
@@ -644,7 +655,9 @@ impl CausalGraph {
                     .edges
                     .entry(drop_key)
                     .or_insert_with(|| CausalEdge::new(&pending.action_key, EFFECT_PRESSURE_DROP));
-                edge.update_slow(was_effective, delta.max(0.0));
+                // Drift-adjust the slow magnitude too — net causal effect over
+                // the 15-cycle window. was_effective (slow) stays on RAW delta.
+                edge.update_slow(was_effective, (delta - drift_slow).max(0.0));
 
                 // Phase 4.2 — slow-horizon edges inherit blame too. The
                 // 15-cycle (~7.5s) drop is just as confounded as the fast
@@ -1295,7 +1308,7 @@ mod tests {
                 cpu_pct: 10.0,
                 swap_mb: 900.0,
             };
-            g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after);
+            g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after, 0.0, 0.0);
         }
         let mech = g.mechanism("throttle:Chrome");
         assert!(
@@ -1325,6 +1338,104 @@ mod tests {
             e.impact_score() > 0.05,
             "should use slow: {}",
             e.impact_score()
+        );
+    }
+
+    // ── Drift-adjusted avg_delta tests (net causal effect, Rubin 1974) ───
+    //
+    // avg_delta must store the NET causal effect (raw drop minus the
+    // do-nothing natural drift), in the same units as the drift-adjusted
+    // "actual" MetaCognition measures — not the inflated raw drop.
+
+    /// Drift adjustment shrinks avg_delta: same raw observations, one graph
+    /// fed drift 0.0, the other fed drift 0.03. The drift-adjusted graph's
+    /// edge avg_delta must be strictly smaller and converge near net 0.07.
+    #[test]
+    fn drift_adjustment_shrinks_avg_delta() {
+        // Raw delta per eval ≈ 0.80 - 0.70 = 0.10.
+        let mut g0 = CausalGraph::new(); // drift 0.0
+        let mut g3 = CausalGraph::new(); // drift 0.03
+        for cycle in 0..40u64 {
+            g0.record_action("throttle:Chrome", 0.80, cycle * 4);
+            g0.evaluate_with_resources(
+                0.70,
+                cycle * 4 + 3,
+                &ResourceSnapshot::default(),
+                0.0,
+                0.0,
+            );
+
+            g3.record_action("throttle:Chrome", 0.80, cycle * 4);
+            g3.evaluate_with_resources(
+                0.70,
+                cycle * 4 + 3,
+                &ResourceSnapshot::default(),
+                0.03,
+                0.0,
+            );
+        }
+        let d0 = g0.get_edge("throttle:Chrome", EFFECT_PRESSURE_DROP).unwrap().avg_delta;
+        let d3 = g3.get_edge("throttle:Chrome", EFFECT_PRESSURE_DROP).unwrap().avg_delta;
+        assert!(d3 < d0, "drift-adjusted avg_delta {} must be < raw {}", d3, d0);
+        // Net target = 0.10 - 0.03 = 0.07.
+        assert!(
+            (d3 - 0.07).abs() < 0.02,
+            "drift-adjusted avg_delta should converge near net 0.07, got {}",
+            d3
+        );
+    }
+
+    /// drift = 0.0 is a no-op: avg_delta converges toward the raw 0.10.
+    /// Proves zero regression for the 2-arg evaluate() forwarding path.
+    #[test]
+    fn drift_zero_is_noop() {
+        let mut g = CausalGraph::new();
+        for cycle in 0..40u64 {
+            g.record_action("throttle:X", 0.80, cycle * 4);
+            g.evaluate_with_resources(
+                0.70,
+                cycle * 4 + 3,
+                &ResourceSnapshot::default(),
+                0.0,
+                0.0,
+            );
+        }
+        let d = g.get_edge("throttle:X", EFFECT_PRESSURE_DROP).unwrap().avg_delta;
+        assert!(
+            (d - 0.10).abs() < 0.01,
+            "drift=0 must converge to raw 0.10, got {}",
+            d
+        );
+    }
+
+    /// Net clamps at 0 when the action underperforms drift: raw 0.05, drift
+    /// 0.12 → net negative → clamped to 0. avg_delta ~0 and impact_score low.
+    #[test]
+    fn drift_net_negative_clamps_to_zero() {
+        let mut g = CausalGraph::new();
+        for cycle in 0..40u64 {
+            // Raw delta = 0.80 - 0.75 = 0.05.
+            g.record_action("throttle:Weak", 0.80, cycle * 4);
+            // Drift exceeds raw drop on BOTH horizons → net negative → both
+            // avg_delta and slow_avg_delta clamp to 0.
+            g.evaluate_with_resources(
+                0.75,
+                cycle * 4 + 3,
+                &ResourceSnapshot::default(),
+                0.12,
+                0.12,
+            );
+        }
+        let edge = g.get_edge("throttle:Weak", EFFECT_PRESSURE_DROP).unwrap();
+        assert!(
+            edge.avg_delta < 1e-3,
+            "net-negative effect must clamp avg_delta to ~0, got {}",
+            edge.avg_delta
+        );
+        assert!(
+            edge.impact_score() < 0.01,
+            "clamped edge impact_score should be ~0, got {}",
+            edge.impact_score()
         );
     }
 
@@ -1439,7 +1550,7 @@ mod tests {
                 cpu_pct: 10.0,
                 swap_mb: 50.0,
             };
-            g.evaluate_with_resources(0.60, i * 4 + 3, &after);
+            g.evaluate_with_resources(0.60, i * 4 + 3, &after, 0.0, 0.0);
         }
         assert!(g.mechanism_count() > 0);
     }
@@ -1468,7 +1579,7 @@ mod tests {
         };
         for i in 0..5u64 {
             g.record_action_with_resources("throttle:Rss", 0.80, i * 10, before.clone());
-            g.evaluate_with_resources(0.60, i * 10 + 3, &after);
+            g.evaluate_with_resources(0.60, i * 10 + 3, &after, 0.0, 0.0);
         }
 
         // Edge 2: CPU-dominant (80% → 10% vs small rss/swap delta).
@@ -1484,7 +1595,7 @@ mod tests {
         };
         for i in 0..5u64 {
             g.record_action_with_resources("throttle:Cpu", 0.80, 100 + i * 10, before.clone());
-            g.evaluate_with_resources(0.60, 100 + i * 10 + 3, &after);
+            g.evaluate_with_resources(0.60, 100 + i * 10 + 3, &after, 0.0, 0.0);
         }
 
         // Edge 3: no observations yet → unknown.
@@ -1667,7 +1778,7 @@ mod tests {
                 cpu_pct: 15.0,  // 25% CPU freed — dominant
                 swap_mb: 498.0, // ~0.4% swap — negligible
             };
-            g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after);
+            g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after, 0.0, 0.0);
         }
         assert!(
             g.prefer_qos_over_sigstop("electron_bg"),
@@ -1698,7 +1809,7 @@ mod tests {
                 cpu_pct: 12.0,  // 3% CPU — minor
                 swap_mb: 490.0, // 10MB swap — minor
             };
-            g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after);
+            g.evaluate_with_resources(0.70, cycle * 4 + 3, &res_after, 0.0, 0.0);
         }
         assert!(
             !g.prefer_qos_over_sigstop("chrome_renderer"),
