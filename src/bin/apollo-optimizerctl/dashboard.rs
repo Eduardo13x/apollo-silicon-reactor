@@ -320,9 +320,11 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     } else {
         "🔴"
     };
+    // Show drifted/total so "0/3000" reads as "0 of 3000 beliefs in drift",
+    // not the old ambiguous "0 bel" (which looked like zero beliefs total).
     lines.push(format!(
-        "NARS   {} bel d={:.2} {}",
-        m.nars_drifted_beliefs, m.nars_drift_score, drift_emoji
+        "NARS   {}/{} drift d={:.2} {}",
+        m.nars_drifted_beliefs, m.nars_beliefs_total, m.nars_drift_score, drift_emoji
     ));
 
     // Bayesian outcome tracker (LLM teacher patterns proxy)

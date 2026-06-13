@@ -262,3 +262,25 @@ fn prediction_debias_counter_round_trips_and_survives_old_payload() {
     let old: RuntimeMetrics = serde_json::from_value(v).expect("old payload deserializes");
     assert_eq!(old.prediction_debias_applied_total, 0);
 }
+
+/// Dashboard clarity (2026-06-13): nars_beliefs_total added so the NARS
+/// line shows drifted/total ("0/3000") instead of the ambiguous "0 bel".
+/// Serde-default guard: an older runtime_metrics.json missing the field
+/// must deserialize to 0, never error.
+#[test]
+fn nars_beliefs_total_serde_default_survives_old_payload() {
+    use apollo_engine::engine::types::RuntimeMetrics;
+    let mut m = RuntimeMetrics::default();
+    m.nars_beliefs_total = 3000;
+    m.nars_drifted_beliefs = 0;
+    let json = serde_json::to_string(&m).expect("serialize");
+    assert!(
+        json.contains("\"nars_beliefs_total\":3000"),
+        "field absent: {json}"
+    );
+
+    let mut v = serde_json::to_value(RuntimeMetrics::default()).expect("to_value");
+    v.as_object_mut().unwrap().remove("nars_beliefs_total");
+    let old: RuntimeMetrics = serde_json::from_value(v).expect("old payload deserializes");
+    assert_eq!(old.nars_beliefs_total, 0);
+}

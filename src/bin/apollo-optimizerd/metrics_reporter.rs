@@ -88,6 +88,7 @@ pub fn update_learning_metrics<'a>(
     m.metrics.short_drift_velocity = lctx.outcome_tracker.pressure_velocity_short();
     m.metrics.nars_drift_score = lctx.outcome_tracker.nars_drift_score();
     m.metrics.nars_drifted_beliefs = lctx.outcome_tracker.drift_detector.drifted_count;
+    m.metrics.nars_beliefs_total = lctx.outcome_tracker.drift_detector.len();
     m.metrics.arousal_level = arousal_state.level;
     m.metrics.arousal_zone = arousal_state.zone().to_string();
     m.metrics.experience_memory_size = lctx.outcome_tracker.experience.len();

@@ -1030,6 +1030,10 @@ pub struct RuntimeMetrics {
     /// Number of process beliefs currently in drifted state (freq shift >= 20pp).
     #[serde(default)]
     pub nars_drifted_beliefs: usize,
+    /// Total NARS process beliefs held (capacity-capped). The dashboard shows
+    /// drifted/total so "0" reads as "0 of N in drift", not "0 beliefs".
+    #[serde(default)]
+    pub nars_beliefs_total: usize,
     /// Global arousal EMA level ∈ [0,1]. Computed from memory pressure + swap.
     /// [Yerkes & Dodson 1908] arousal modulates learning rate.
     #[serde(default)]
