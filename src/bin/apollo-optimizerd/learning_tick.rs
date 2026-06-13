@@ -317,9 +317,22 @@ pub fn run_learning_tick<'a>(
             cpu_pct: snapshot.top_processes.iter().map(|p| p.cpu_usage).sum(),
             swap_mb: swap_mb_now,
         };
+        // Drift-adjust avg_delta (2026-06-13): subtract the do-nothing
+        // counterfactual so the causal edge magnitude is the NET effect
+        // (Rubin), the same units MetaCognition's "actual" measures.
+        // pressure_velocity_short = per-sample drift (fast 3-cycle horizon);
+        // natural_drift (60-tick cumulative) scaled to the 15-cycle slow
+        // horizon. f32 Copy locals taken before the &mut causal_graph call.
+        let drift_fast = lctx.outcome_tracker.pressure_velocity_short() as f32;
+        let drift_slow = (lctx.outcome_tracker.natural_drift() / 60.0 * 15.0) as f32;
         let eval_start = std::time::Instant::now();
-        lctx.causal_graph
-            .evaluate_with_resources(pressure_now, cycle_count, &current_res);
+        lctx.causal_graph.evaluate_with_resources(
+            pressure_now,
+            cycle_count,
+            &current_res,
+            drift_fast,
+            drift_slow,
+        );
         let compaction_duration_ms = eval_start.elapsed().as_secs_f64() * 1000.0;
 
         // Sample every 10 cycles to avoid log bloat. Always emit if

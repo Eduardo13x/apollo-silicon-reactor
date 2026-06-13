@@ -1357,13 +1357,7 @@ mod tests {
         let mut g3 = CausalGraph::new(); // drift 0.03
         for cycle in 0..40u64 {
             g0.record_action("throttle:Chrome", 0.80, cycle * 4);
-            g0.evaluate_with_resources(
-                0.70,
-                cycle * 4 + 3,
-                &ResourceSnapshot::default(),
-                0.0,
-                0.0,
-            );
+            g0.evaluate_with_resources(0.70, cycle * 4 + 3, &ResourceSnapshot::default(), 0.0, 0.0);
 
             g3.record_action("throttle:Chrome", 0.80, cycle * 4);
             g3.evaluate_with_resources(
@@ -1374,9 +1368,20 @@ mod tests {
                 0.0,
             );
         }
-        let d0 = g0.get_edge("throttle:Chrome", EFFECT_PRESSURE_DROP).unwrap().avg_delta;
-        let d3 = g3.get_edge("throttle:Chrome", EFFECT_PRESSURE_DROP).unwrap().avg_delta;
-        assert!(d3 < d0, "drift-adjusted avg_delta {} must be < raw {}", d3, d0);
+        let d0 = g0
+            .get_edge("throttle:Chrome", EFFECT_PRESSURE_DROP)
+            .unwrap()
+            .avg_delta;
+        let d3 = g3
+            .get_edge("throttle:Chrome", EFFECT_PRESSURE_DROP)
+            .unwrap()
+            .avg_delta;
+        assert!(
+            d3 < d0,
+            "drift-adjusted avg_delta {} must be < raw {}",
+            d3,
+            d0
+        );
         // Net target = 0.10 - 0.03 = 0.07.
         assert!(
             (d3 - 0.07).abs() < 0.02,
@@ -1392,15 +1397,12 @@ mod tests {
         let mut g = CausalGraph::new();
         for cycle in 0..40u64 {
             g.record_action("throttle:X", 0.80, cycle * 4);
-            g.evaluate_with_resources(
-                0.70,
-                cycle * 4 + 3,
-                &ResourceSnapshot::default(),
-                0.0,
-                0.0,
-            );
+            g.evaluate_with_resources(0.70, cycle * 4 + 3, &ResourceSnapshot::default(), 0.0, 0.0);
         }
-        let d = g.get_edge("throttle:X", EFFECT_PRESSURE_DROP).unwrap().avg_delta;
+        let d = g
+            .get_edge("throttle:X", EFFECT_PRESSURE_DROP)
+            .unwrap()
+            .avg_delta;
         assert!(
             (d - 0.10).abs() < 0.01,
             "drift=0 must converge to raw 0.10, got {}",
