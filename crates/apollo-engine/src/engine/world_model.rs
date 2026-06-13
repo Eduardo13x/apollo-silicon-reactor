@@ -103,18 +103,21 @@ impl WorldModel {
             1.0
         };
         let mut predicted = HashMap::new();
-        for edge in causal.solid_edges() {
-            // Only pressure-drop edges are action→relief predictions.
-            if edge.effect == "pressure_drop" {
-                predicted.insert(
-                    edge.cause.clone(),
-                    (
-                        edge.avg_delta as f64 * debias,
-                        edge.confidence,
-                        edge.evidence_count,
-                    ),
-                );
-            }
+        // ALL pressure-drop edges, not just is_solid() ones (2026-06-12 fix):
+        // solid_edges() pre-filters at confidence > 0.7, which silently
+        // reduced the model to the rare super-solid edges and made
+        // imagine()'s own MIN_CONFIDENCE = 0.30 gate dead code. Prod had 5
+        // imaginable actions; the model saw 1. imagine() applies the real
+        // admission thresholds.
+        for edge in causal.pressure_drop_edges() {
+            predicted.insert(
+                edge.cause.clone(),
+                (
+                    edge.avg_delta as f64 * debias,
+                    edge.confidence,
+                    edge.evidence_count,
+                ),
+            );
         }
         Self {
             predicted,
@@ -245,5 +248,48 @@ mod tests {
             calibrated.imagine("freeze:Inflated"),
             Imagined::DoNothingDominates { .. }
         ));
+    }
+
+    #[test]
+    fn from_parts_includes_sub_solid_edges_for_imagination() {
+        // Prod 2026-06-12 finding: solid_edges() pre-filtered at conf>0.7,
+        // starving the model to 1 of 5 imaginable actions and making the
+        // MIN_CONFIDENCE=0.30 gate dead code. Pin the fix: a conf-0.39
+        // edge with 338 obs (the live freeze:Hermes case) MUST enter the
+        // model and be judged by imagine()'s own gates, while a conf-0.20
+        // edge still abstains.
+        let mut g = crate::engine::causal_graph::CausalGraph::new();
+        let mut hermes =
+            crate::engine::causal_graph::CausalEdge::new("freeze:Hermes", "pressure_drop");
+        hermes.confidence = 0.39;
+        hermes.evidence_count = 338;
+        hermes.avg_delta = 0.0232;
+        let mut weak = crate::engine::causal_graph::CausalEdge::new("freeze:Weak", "pressure_drop");
+        weak.confidence = 0.20;
+        weak.evidence_count = 50;
+        weak.avg_delta = 0.09;
+        g.restore(vec![
+            (
+                ("freeze:Hermes".to_string(), "pressure_drop".to_string()),
+                hermes,
+            ),
+            (
+                ("freeze:Weak".to_string(), "pressure_drop".to_string()),
+                weak,
+            ),
+        ]);
+
+        let tracker = crate::engine::outcome_tracker::OutcomeTracker::new();
+        let m = WorldModel::from_parts(&g, &tracker, 1.0);
+        assert_eq!(m.known_actions(), 2, "both pressure_drop edges enter");
+        assert!(
+            !matches!(m.imagine("freeze:Hermes"), Imagined::Unknown),
+            "conf 0.39 >= 0.30 gate must be judged, not starved"
+        );
+        assert_eq!(
+            m.imagine("freeze:Weak"),
+            Imagined::Unknown,
+            "conf 0.20 < 0.30 still abstains via imagine()'s own gate"
+        );
     }
 }

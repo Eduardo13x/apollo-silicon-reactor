@@ -184,7 +184,9 @@ impl MechanismAttribution {
 }
 
 impl CausalEdge {
-    fn new(cause: &str, effect: &str) -> Self {
+    /// pub(crate) since 2026-06-12: world_model tests construct edges
+    /// directly to pin the from_parts admission contract.
+    pub(crate) fn new(cause: &str, effect: &str) -> Self {
         Self {
             cause: cause.to_string(),
             effect: effect.to_string(),
@@ -720,6 +722,18 @@ impl CausalGraph {
     }
 
     /// Get all solid edges (high confidence, sufficient evidence).
+    /// All pressure-drop edges regardless of maturity (2026-06-12).
+    /// Consumer: WorldModel::from_parts — its `imagine()` gates apply
+    /// their OWN evidence/confidence thresholds (>=10 obs, >=0.30 conf),
+    /// so pre-filtering here at the is_solid() 0.7 bar silently starved
+    /// the model down to the rare super-solid edges and made the 0.30
+    /// gate dead code.
+    pub fn pressure_drop_edges(&self) -> impl Iterator<Item = &CausalEdge> {
+        self.edges
+            .values()
+            .filter(|e| e.effect == EFFECT_PRESSURE_DROP)
+    }
+
     pub fn solid_edges(&self) -> Vec<&CausalEdge> {
         self.edges.values().filter(|e| e.is_solid()).collect()
     }
