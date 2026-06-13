@@ -167,6 +167,23 @@ fn is_interactive_base(name: &str) -> bool {
     is_interactive_app_name(name)
 }
 
+/// Match a learned-policy pattern against a (possibly macOS-truncated)
+/// process name, both lowercased. macOS `comm` names cap at 15 chars
+/// (MAXCOMLEN) while the learned policy stores FULL names (from
+/// proc_pidpath / teach export). So a truncated runtime name like
+/// `language_server` is a PREFIX of the learned pattern
+/// `language_server_macos_arm`. Without the prefix case the protection
+/// silently misses every long-named process — observed in prod 2026-06-13
+/// as Apollo freezing the user's LSP (`language_server`, classified
+/// interactive but unmatched, causal-proven futile) → editor stalls.
+/// The `>= 8`-char guard on the runtime name prevents short-prefix false
+/// positives (e.g. a 4-char name spuriously prefixing an unrelated long
+/// pattern). Used by every learned-interactive match site — complete
+/// mediation [Saltzer & Kaashoek 2009].
+fn learned_pattern_matches(name_lc: &str, pattern_lc: &str) -> bool {
+    name_lc.contains(pattern_lc) || (name_lc.len() >= 8 && pattern_lc.starts_with(name_lc))
+}
+
 // Static-pattern AC bundles: single-pass substring scan per name instead of
 // N×contains over four constant arrays. Case-sensitive (matches prior semantics).
 fn noise_ac() -> &'static aho_corasick::AhoCorasick {
@@ -282,7 +299,9 @@ fn top_blockers(
         .filter(|p| {
             let lc = p.name.to_ascii_lowercase();
             (is_interactive_base(&p.name)
-                || interactive_lc.iter().any(|pat| lc.contains(pat.as_str())))
+                || interactive_lc
+                    .iter()
+                    .any(|pat| learned_pattern_matches(&lc, pat)))
                 && p.cpu_usage < 8.0
                 && p.memory_usage > 100 * 1024 * 1024
         })
@@ -507,7 +526,9 @@ pub fn decide_actions(
     let is_interactive = |name: &str, name_lc: &str, pid: u32| -> bool {
         app_bundle_pids.contains(&pid)
             || is_interactive_base(name)
-            || interactive_lc.iter().any(|p| name_lc.contains(p.as_str()))
+            || interactive_lc
+                .iter()
+                .any(|p| learned_pattern_matches(name_lc, p))
             || behavior_interactive_pids.contains(&pid)
     };
     let is_background_noise = |name: &str, name_lc: &str| -> bool {
@@ -1876,6 +1897,37 @@ mod tests {
     use crate::collector::{CpuStats, MemoryStats, PressureStats, SystemSnapshot};
     use crate::engine::overflow_guard::OverflowThresholds;
     use crate::engine::types::{LatencyTarget, OptimizationProfile};
+
+    #[test]
+    fn learned_pattern_matches_handles_macos_truncation() {
+        // The 2026-06-13 bug: macOS reports the LSP as the 15-char comm name
+        // "language_server", but the learned policy stored the full
+        // "language_server_macos_arm" (from proc_pidpath). The old
+        // name.contains(pattern) failed (name shorter than pattern) → the
+        // interactive guard missed it → Apollo froze the user's LSP.
+        assert!(
+            learned_pattern_matches("language_server", "language_server_macos_arm"),
+            "truncated runtime name must match its full learned pattern (prefix)"
+        );
+        // Normal substring case still works (runtime name longer than pattern).
+        assert!(learned_pattern_matches(
+            "brave browser helper",
+            "brave browser"
+        ));
+        // Exact match works.
+        assert!(learned_pattern_matches("node", "node") == "node".contains("node"));
+        // Short-prefix false-positive guard: a <8-char name must NOT match an
+        // unrelated long pattern just because it's a prefix.
+        assert!(
+            !learned_pattern_matches("lang", "language_server_macos_arm"),
+            "short (<8) prefix must not spuriously match"
+        );
+        // Non-match stays non-match.
+        assert!(!learned_pattern_matches(
+            "Finder",
+            "language_server_macos_arm"
+        ));
+    }
 
     /// Build a minimal SystemSnapshot with configurable pressure values.
     fn make_snapshot(cpu_usage: f32, mem_pressure: f64, compressor: f64) -> SystemSnapshot {
