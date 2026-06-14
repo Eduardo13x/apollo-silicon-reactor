@@ -15,10 +15,17 @@ always_on  = true
 # Gemma 4 via llama.cpp no soporta response_format: json_object — usar extracción manual.
 force_json = false
 
+# La respuesta es un JSON chico (perfil + listas + confianza + rationale).
+# Capar la generación evita que el modelo divague hasta EOS y desperdicie
+# segundos + RAM en M1 8GB. Default en código es 320 si se omite; explícito aquí.
+max_tokens = 320
+
 # Timeouts más holgados para inferencia local en M1 8GB.
 timeout_ms          = 180000
-min_interval_secs   = 3600    # 1 hora mínimo entre llamadas
-max_calls_per_hour  = 1
+# E2B es local/gratis — 1 llamada/hora desperdiciaba el teacher. Subido a 4/h
+# con piso de 15 min: más señal de aprendizaje, gateada por world-model/scorer.
+min_interval_secs   = 900     # 15 min mínimo entre llamadas
+max_calls_per_hour  = 4
 
 # Umbral de confianza más bajo para modelo local (menor calibración que GPT).
 min_confidence = 0.60
