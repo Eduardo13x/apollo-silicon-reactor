@@ -1953,6 +1953,7 @@ mod tests {
                 compressor_pressure: compressor,
                 thrashing_score: 0.0,
                 memory_pressure_raw: 0.0,
+                refault_delta_per_sec: 0.0,
             },
             disks: vec![],
             networks: vec![],

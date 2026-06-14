@@ -538,6 +538,15 @@ pub struct RuntimeMetrics {
     /// 0 ≈ quiet, 5_000+ ≈ actively thrashing the compressor.
     #[serde(default)]
     pub thrashing_score: f64,
+    /// Fault-in rate (pageins+swapins+decompressions pages/sec) — the STALL
+    /// side of VM flow, where the microstutter lives. [Phase 0 telemetry]
+    #[serde(default)]
+    pub refault_delta_per_sec: f64,
+    /// Session peak of `refault_delta_per_sec`. A transient storm between
+    /// metric flushes would be invisible in the instantaneous field; this
+    /// max-since-start captures the worst storm for baseline. [Phase 0]
+    #[serde(default)]
+    pub refault_peak_per_sec: f64,
     /// System-wide CPU stall fraction from
     /// `ContentionTracker::stall_fraction(0.85)` — fraction of tracked pids
     /// whose PSI "some" contention ratio crossed 85% in the last cycle.

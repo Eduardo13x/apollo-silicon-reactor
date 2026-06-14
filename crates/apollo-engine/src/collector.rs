@@ -56,6 +56,16 @@ pub struct PressureStats {
     /// consumers fall back to `memory_pressure`.
     #[serde(default)]
     pub memory_pressure_raw: f64,
+    /// Fault-in rate: (pageins + swapins + decompressions) pages/sec, signed.
+    /// This is the STALL side of VM flow — the cost paid when a process must
+    /// fault its working set back from swap/compressor (e.g. switching to an
+    /// app backgrounded under a high-volume workload). Distinct from
+    /// `thrashing_score` (compression churn) and `swap_delta` (swap size). A
+    /// transient spike here on a foreground switch is the microstutter signal.
+    /// 0.0 until the second sample. [Phase 0 telemetry — no decision consumes
+    /// it yet; baseline first, threshold in Phase 1.]
+    #[serde(default)]
+    pub refault_delta_per_sec: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -90,6 +100,10 @@ pub struct SystemCollector {
     sys: System,
     prev_swap_used_bytes: Option<u64>,
     prev_swap_at: Option<Instant>,
+    /// Previous cumulative fault-in counter (pageins+swapins+decompressions)
+    /// for the per-cycle `refault_delta_per_sec` derivative. Shares the
+    /// `prev_swap_at` timestamp (same cycle).
+    prev_refault: Option<u64>,
     /// Number of process refresh cycles skipped (startup grace).
     pub process_refresh_skip_count: u32,
     /// Light call count (cycles since creation, for startup grace period).
@@ -133,6 +147,7 @@ impl SystemCollector {
             sys,
             prev_swap_used_bytes: None,
             prev_swap_at: None,
+            prev_refault: None,
             process_refresh_skip_count: 0,
             light_call_count: 0,
             compressor_ema: 0.0,
@@ -208,8 +223,14 @@ impl SystemCollector {
         let used_swap = self.sys.used_swap();
 
         // Pressure (public commands, no private APIs)
-        let (_, swap_used_bytes, swap_total_bytes, compressor_pressure_raw, kernel_pressure) =
-            collect_pressure_facts();
+        let (
+            _,
+            swap_used_bytes,
+            swap_total_bytes,
+            compressor_pressure_raw,
+            kernel_pressure,
+            refault_cumulative,
+        ) = collect_pressure_facts();
         // EMA smoothing on compressor_pressure (α=0.25) to remove single-sample noise
         // before MAX fusion. Kalman in signal_intelligence still smooths the fused value,
         // but pre-smoothing here reduces the noise it has to compensate for (less lag).
@@ -228,6 +249,14 @@ impl SystemCollector {
             }
             _ => 0.0,
         };
+        let refault_delta_bps = {
+            let dt = self
+                .prev_swap_at
+                .map(|p| nowi.duration_since(p).as_secs_f64())
+                .unwrap_or(0.0);
+            refault_rate(refault_cumulative, self.prev_refault, dt)
+        };
+        self.prev_refault = Some(refault_cumulative);
         self.prev_swap_used_bytes = Some(swap_used_bytes);
         self.prev_swap_at = Some(nowi);
 
@@ -270,6 +299,7 @@ impl SystemCollector {
                     thermal_level: "unknown".to_string(),
                     compressor_pressure,
                     thrashing_score: 0.0, // populated by daemon from pressure collector
+                    refault_delta_per_sec: refault_delta_bps,
                 },
                 disks,
                 networks,
@@ -320,8 +350,14 @@ impl SystemCollector {
         let total_swap = self.sys.total_swap();
         let used_swap = self.sys.used_swap();
 
-        let (_, swap_used_bytes, swap_total_bytes, compressor_pressure_raw, kernel_pressure) =
-            collect_pressure_facts();
+        let (
+            _,
+            swap_used_bytes,
+            swap_total_bytes,
+            compressor_pressure_raw,
+            kernel_pressure,
+            refault_cumulative,
+        ) = collect_pressure_facts();
         let alpha = 0.25f64;
         let compressor_pressure =
             self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
@@ -337,6 +373,14 @@ impl SystemCollector {
             }
             _ => 0.0,
         };
+        let refault_delta_bps = {
+            let dt = self
+                .prev_swap_at
+                .map(|p| nowi.duration_since(p).as_secs_f64())
+                .unwrap_or(0.0);
+            refault_rate(refault_cumulative, self.prev_refault, dt)
+        };
+        self.prev_refault = Some(refault_cumulative);
         self.prev_swap_used_bytes = Some(swap_used_bytes);
         self.prev_swap_at = Some(nowi);
 
@@ -374,6 +418,7 @@ impl SystemCollector {
                     thermal_level: "unknown".to_string(),
                     compressor_pressure,
                     thrashing_score: 0.0, // populated by daemon from pressure collector
+                    refault_delta_per_sec: refault_delta_bps,
                 },
                 disks: vec![],    // skipped in light mode
                 networks: vec![], // skipped in light mode
@@ -405,8 +450,14 @@ impl SystemCollector {
         let total_swap = self.sys.total_swap();
         let used_swap = self.sys.used_swap();
 
-        let (_, swap_used_bytes, swap_total_bytes, compressor_pressure_raw, kernel_pressure) =
-            collect_pressure_facts();
+        let (
+            _,
+            swap_used_bytes,
+            swap_total_bytes,
+            compressor_pressure_raw,
+            kernel_pressure,
+            refault_cumulative,
+        ) = collect_pressure_facts();
         let alpha = 0.25f64;
         let compressor_pressure =
             self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
@@ -420,6 +471,14 @@ impl SystemCollector {
             }
             _ => 0.0,
         };
+        let refault_delta_bps = {
+            let dt = self
+                .prev_swap_at
+                .map(|p| nowi.duration_since(p).as_secs_f64())
+                .unwrap_or(0.0);
+            refault_rate(refault_cumulative, self.prev_refault, dt)
+        };
+        self.prev_refault = Some(refault_cumulative);
         self.prev_swap_used_bytes = Some(swap_used_bytes);
         self.prev_swap_at = Some(nowi);
 
@@ -456,6 +515,7 @@ impl SystemCollector {
                     thermal_level: "unknown".to_string(),
                     compressor_pressure,
                     thrashing_score: 0.0,
+                    refault_delta_per_sec: refault_delta_bps,
                 },
                 disks: vec![],
                 networks: vec![],
@@ -489,7 +549,11 @@ pub(crate) fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
 /// Returns (memory_pressure_fused, swap_used_bytes, swap_total_bytes, compressor_pressure_raw, kernel_pressure).
 /// `memory_pressure_fused` = MAX(kernel_pressure, compressor_pressure_raw) — callers that want
 /// EMA-smoothed compressor should recompute the fusion with the smoothed value.
-fn collect_pressure_facts() -> (f64, u64, u64, f64, f64) {
+fn collect_pressure_facts() -> (f64, u64, u64, f64, f64, u64) {
+    // Cumulative fault-in counter (pageins+swapins+decompressions). Filled from
+    // the same host_statistics64 read used for compressor pressure. Pure: the
+    // per-cycle derivative is computed by the stateful collector.
+    let mut refault_cumulative: u64 = 0;
     // kern.memorystatus_level: 0–100 (% memory available).
     // Faster than spawning /usr/bin/memory_pressure — direct kernel read.
     let kernel_pressure = sysctl_u64(c"kern.memorystatus_level")
@@ -565,6 +629,10 @@ fn collect_pressure_facts() -> (f64, u64, u64, f64, f64) {
         };
         if kr == 0 {
             let s = unsafe { stats.assume_init() };
+            refault_cumulative = s
+                .pageins
+                .wrapping_add(s.swapins)
+                .wrapping_add(s.decompressions);
             let total_pages = sysctl_u64(c"hw.memsize")
                 .map(|b| b / 16384)
                 .unwrap_or(1)
@@ -630,7 +698,18 @@ fn collect_pressure_facts() -> (f64, u64, u64, f64, f64) {
         swap_total_bytes,
         compressor_pressure,
         kernel_pressure,
+        refault_cumulative,
     )
+}
+
+/// Per-cycle fault-in rate from a cumulative counter + previous sample.
+/// Signed (negative is impossible for a monotonic counter, but a wrap or
+/// counter reset yields 0 rather than a bogus huge spike). [Phase 0]
+fn refault_rate(cumulative: u64, prev: Option<u64>, dt_secs: f64) -> f64 {
+    match prev {
+        Some(p) if cumulative >= p => (cumulative - p) as f64 / dt_secs.max(0.001),
+        _ => 0.0,
+    }
 }
 
 #[cfg(test)]
@@ -665,6 +744,7 @@ mod tests {
                 thermal_level: "nominal".to_string(),
                 compressor_pressure: 0.30,
                 thrashing_score: 0.0,
+                refault_delta_per_sec: 0.0,
             },
             disks: vec![],
             networks: vec![],
@@ -752,7 +832,21 @@ mod tests {
 
     #[test]
     fn collect_pressure_facts_returns_valid_range() {
-        let (fused, swap_used, swap_total, comp_raw, kernel) = collect_pressure_facts();
+        let (fused, swap_used, swap_total, comp_raw, kernel, refault) = collect_pressure_facts();
+        assert!(refault < u64::MAX, "refault cumulative sane: {refault}");
+        // refault_rate: monotonic delta / dt; counter reset or no-prev → 0.
+        assert_eq!(refault_rate(1000, Some(900), 1.0), 100.0);
+        assert_eq!(refault_rate(1000, None, 1.0), 0.0, "no prev → 0");
+        assert_eq!(
+            refault_rate(500, Some(900), 1.0),
+            0.0,
+            "counter reset/wrap → 0, never a bogus negative or huge spike"
+        );
+        assert_eq!(
+            refault_rate(2000, Some(1000), 0.5),
+            2000.0,
+            "rate scales with 1/dt"
+        );
         // All pressure values must be in [0, 1].
         assert!((0.0..=1.0).contains(&fused), "fused={fused}");
         assert!((0.0..=1.0).contains(&comp_raw), "comp_raw={comp_raw}");

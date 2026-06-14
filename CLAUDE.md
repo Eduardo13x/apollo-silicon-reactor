@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Ponytail — lazy senior dev mode (2026-06-14)
+
+Lazy means efficient, not careless. Best code is code never written. Before writing code, stop at the first rung that holds: (1) does this need to exist? — no: skip it (YAGNI); (2) stdlib does it? — use it; (3) native platform feature? — use it; (4) installed dependency? — use it; (5) one line? — one line; (6) only then: the minimum that works. Deletion over addition, boring over clever, fewest files. No abstraction/dependency/boilerplate nobody asked for. Mark intentional simplifications with a `ponytail:` comment naming the ceiling + upgrade path.
+
+**Never lazy about** (these WIN over minimalism): the Key Safety Constraints below, complete mediation through `safety.rs`, conservative daemon behavior, trust-boundary validation, error handling that prevents data loss, security. Apollo's defensive guards are the carve-out, never the chopping block. On any conflict, this project's safety/supervision rules override ponytail.
+
 ## Critical lesson — NotebookLM is NOT a final gatekeeper (2026-05-07)
 
 NotebookLM peer-review (notebook `8344b94c-a014-4803-abea-076a55753cfd`) is a research librarian, not a senior engineer. It paraphrases and elaborates with confidence; it does NOT catch logic gaps in your diff, calibrate severity honestly, or push back when you're wrong.

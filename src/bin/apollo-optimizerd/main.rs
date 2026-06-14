@@ -2435,6 +2435,12 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.swap_used_bytes = snapshot.pressure.swap_used_bytes;
                     metrics.metrics.swap_total_bytes = snapshot.pressure.swap_total_bytes;
                     metrics.metrics.swap_delta_bps = snapshot.pressure.swap_delta_bytes_per_sec;
+                    // Fault-in rate (the stall side) + session peak. [Phase 0
+                    // telemetry — no decision consumes this yet; baseline first.]
+                    let refault = snapshot.pressure.refault_delta_per_sec;
+                    metrics.metrics.refault_delta_per_sec = refault;
+                    metrics.metrics.refault_peak_per_sec =
+                        metrics.metrics.refault_peak_per_sec.max(refault);
                     metrics.metrics.memory_pressure = snapshot.pressure.memory_pressure;
                     metrics.metrics.thermal_level = snapshot.pressure.thermal_level.clone();
                     // Expose pressure boost breakdown so the dashboard shows WHY effective
