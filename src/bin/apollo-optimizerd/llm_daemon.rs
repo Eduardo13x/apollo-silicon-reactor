@@ -44,6 +44,17 @@ pub fn windowserver_cpu(snapshot: &apollo_engine::collector::SystemSnapshot) -> 
         .unwrap_or(0.0)
 }
 
+/// Swap ceiling above which the local Metal/MLX teacher inference is skipped.
+/// 6 GB: MLX runs cleanly through normal 4-5 GB swap on this 8 GB box (measured
+/// 2026-06-14); only a >6 GB thrash crisis warrants bailing.
+const METAL_OOM_SWAP_THRESHOLD: u64 = 6 * 1024 * 1024 * 1024;
+
+/// True when current swap is high enough that we should skip the GPU teacher
+/// call this trigger. Pure predicate so the threshold is unit-testable.
+fn metal_oom_would_skip(swap_used_bytes: u64) -> bool {
+    swap_used_bytes > METAL_OOM_SWAP_THRESHOLD
+}
+
 // ── LLM Reactive Tick ──────────────────────────────────────────────────────
 
 pub fn llm_reactive_tick(
@@ -433,12 +444,18 @@ pub fn llm_reactive_tick(
         return;
     }
 
-    // Metal OOM guard: high swap means unified memory is fragmented — Gemma's
-    // 99-layer Metal inference will fail with kIOGPUCommandBufferCallbackErrorOutOfMemory.
-    // Skip the call and let Apollo reduce pressure first; retry next trigger.
-    // 2 GB threshold: observed OOMs at ~2.5-3 GB swap on M1 8 GB.
-    const METAL_OOM_SWAP_THRESHOLD: u64 = 2 * 1024 * 1024 * 1024;
-    if snapshot.pressure.swap_used_bytes > METAL_OOM_SWAP_THRESHOLD {
+    // Metal OOM guard: an extreme-swap crisis means a ~2 GB GPU inference would
+    // both risk failure and steal memory/GPU from the user mid-thrash. Skip and
+    // let Apollo reduce pressure first; retry next trigger.
+    //
+    // Threshold history: the old 2 GB value was sized for llama.cpp's Metal path
+    // (and was effectively permanent on this box, which idles at 4-5 GB swap — so
+    // the teacher had not actually run since 2026-06-03). The runtime is now MLX,
+    // whose lazy unified-memory eval is far more graceful: measured 2026-06-14, a
+    // live inference completed cleanly at 4.6 GB swap and macOS reclaimed swap to
+    // 2.1 GB right after. Raise to 6 GB so the teacher runs during normal pressure
+    // (its whole purpose) and only bails in a genuine >6 GB/8 GB thrash crisis.
+    if metal_oom_would_skip(snapshot.pressure.swap_used_bytes) {
         let mut guard = state.llm.lock_recover();
         guard.llm_state.last_error = Some(format!(
             "metal-oom-risk swap={:.1}GB — skipped",
@@ -1065,6 +1082,20 @@ mod tests {
     use apollo_engine::collector::{
         CpuStats, MemoryStats, PressureStats, ProcessStats, SystemSnapshot,
     };
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    /// The teacher must actually run during the normal 4-5 GB swap this 8 GB box
+    /// idles at (the 2 GB ceiling left it skipped permanently); it should bail
+    /// only in a genuine >6 GB thrash crisis.
+    #[test]
+    fn metal_oom_guard_runs_under_normal_swap_skips_in_crisis() {
+        assert!(!metal_oom_would_skip(0));
+        assert!(!metal_oom_would_skip(4 * GB + GB / 2)); // 4.5 GB — measured-OK
+        assert!(!metal_oom_would_skip(6 * GB)); // exactly at ceiling: still runs
+        assert!(metal_oom_would_skip(6 * GB + 1)); // just over: skip
+        assert!(metal_oom_would_skip(8 * GB)); // crisis
+    }
 
     fn snapshot_with(processes: Vec<ProcessStats>) -> SystemSnapshot {
         SystemSnapshot {
