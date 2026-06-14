@@ -29,6 +29,9 @@ pub struct LlmConfig {
     pub force_json: Option<bool>,
     /// If true, bypass the training-TTL gate and auto-enable for local endpoints (Gemma 4, Ollama).
     pub always_on: Option<bool>,
+    /// Max generation tokens for the teacher reply (default 320). The JSON
+    /// advice is small; capping it cuts latency + RAM on local models.
+    pub max_tokens: Option<u32>,
 }
 
 impl LlmConfig {
@@ -64,6 +67,13 @@ impl LlmConfig {
 
     pub fn force_json(&self) -> bool {
         self.force_json.unwrap_or(true)
+    }
+
+    /// Cap on teacher-reply generation length. 320 covers the JSON advice
+    /// (profile + lists + confidence + rationale) with headroom; clamped to
+    /// a sane [64, 2048] so a bad config can't disable the cap or starve it.
+    pub fn max_tokens(&self) -> u32 {
+        self.max_tokens.unwrap_or(320).clamp(64, 2048)
     }
 }
 
@@ -385,6 +395,13 @@ struct OpenAiChatRequest {
     model: String,
     messages: Vec<OpenAiMessage>,
     temperature: f32,
+    /// Cap generation length (2026-06-13). The teacher reply is a small
+    /// JSON object (suggest_profile + lists + confidence + rationale) — it
+    /// fits well under ~320 tokens. Without a cap a local model can ramble
+    /// to EOS or the context limit, wasting seconds + RAM on an M1 8GB
+    /// where the model competes with the user's work. Both OpenAI-style
+    /// servers and llama.cpp/MLX OpenAI shims honor `max_tokens`.
+    max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<OpenAiResponseFormat>,
 }
@@ -548,6 +565,7 @@ GUIDANCE:
                 },
             ],
             temperature: 0.1,
+            max_tokens: self.cfg.max_tokens(),
             response_format: if self.cfg.force_json() {
                 Some(OpenAiResponseFormat {
                     kind: "json_object".to_string(),
@@ -841,6 +859,32 @@ fn build_summary(snapshot: &SystemSnapshot, teacher: Option<&TeacherContext<'_>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_tokens_defaults_and_clamps() {
+        // Default cap covers the small JSON teacher reply.
+        assert_eq!(LlmConfig::default().max_tokens(), 320);
+        // Clamp protects against a config that disables (0) or over-inflates the cap.
+        let zero = LlmConfig {
+            max_tokens: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(zero.max_tokens(), 64, "0 must clamp up to the 64 floor");
+        let huge = LlmConfig {
+            max_tokens: Some(100_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            huge.max_tokens(),
+            2048,
+            "huge must clamp to the 2048 ceiling"
+        );
+        let ok = LlmConfig {
+            max_tokens: Some(256),
+            ..Default::default()
+        };
+        assert_eq!(ok.max_tokens(), 256);
+    }
 
     fn parse(toml_src: &str) -> LlmConfig {
         let cfg: RepoConfig = toml::from_str(toml_src).expect("test fixture must be valid TOML");
