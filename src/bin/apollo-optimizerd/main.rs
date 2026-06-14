@@ -3999,6 +3999,7 @@ fn main() -> anyhow::Result<()> {
                         foreground_pid,
                         &heuristic_critical_pids,
                         acc.view(),
+                        snapshot.pressure.refault_delta_per_sec,
                     );
                     acc.extend_raw(
                         stale_new,

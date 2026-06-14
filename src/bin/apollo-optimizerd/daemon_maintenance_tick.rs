@@ -111,7 +111,13 @@ pub fn run_maintenance_tick(
     // not a CALL_APP_NAME) and is immune to the pmset poll TTL that lets
     // ctx.audio_active go stale between samples — the exact gap that let
     // mid-call purges through.
-    let realtime_call = apollo_engine::engine::coreaudio_active::is_realtime_call_active();
+    // Phase 1: generalized from "a call" to ANY high-volume workload (call,
+    // media playback, or a fault-in storm from builds/LLM/data). During such a
+    // window Apollo must not add faults via purge — the real-OOM escape inside
+    // emergency_thrashing_purge_allowed still fires when genuinely needed.
+    let high_bw_workload = apollo_engine::engine::coreaudio_active::is_high_bw_workload_active(
+        snap.pressure.refault_delta_per_sec,
+    );
     let physical_pressure = if snap.pressure.memory_pressure_raw > 0.0 {
         snap.pressure.memory_pressure_raw
     } else {
@@ -125,7 +131,7 @@ pub fn run_maintenance_tick(
         state,
         build_active,
         bus_saturated,
-        realtime_call,
+        high_bw_workload,
     );
     if emergency && std::process::Command::new("purge").spawn().is_ok() {
         state.mark_purged();
@@ -145,7 +151,7 @@ pub fn run_maintenance_tick(
     // purge regardless of the (possibly stale) pmset audio_active flag. The
     // normal path is "background maintenance" — it has no business stalling a
     // call. Counted under the idle aggregate, same as the MediaActive skip.
-    if realtime_call {
+    if high_bw_workload {
         lf_metrics
             .maintenance_purge_skipped_idle_total
             .fetch_add(1, Ordering::Relaxed);

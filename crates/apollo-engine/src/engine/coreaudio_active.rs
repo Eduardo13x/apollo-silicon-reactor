@@ -201,6 +201,31 @@ pub fn is_realtime_call_active() -> bool {
     is_audio_running_somewhere() && is_audio_input_active()
 }
 
+/// Provisional fault-in storm threshold (pages/sec). Phase 0 baseline on M1
+/// 8GB measured typical ~4-6k pages/s under load and a peak of ~150k
+/// (≈2.46 GB/s). 30k (~0.5 GB/s) sits well above typical and below the storm
+/// peak — a conservative "genuine storm in progress" line. Tunable as more
+/// baseline accumulates. [Phase 1]
+pub const STORM_REFAULT_PAGES_PER_SEC: f64 = 30_000.0;
+
+/// True when the system is under a high-volume workload that makes Apollo's
+/// own memory churn (purge, stale-freeze, jetsam-demote) costly — generalized
+/// beyond "a call" to ANY heavy load that drives the compressor/swap:
+/// - a realtime call (output AND input), OR
+/// - media playback (output running — the 4K-video case), OR
+/// - a fault-in storm above [`STORM_REFAULT_PAGES_PER_SEC`] (builds, LLM
+///   inference, data crunch — workloads with no audio at all).
+///
+/// During such a window, adding faults (freezing the app the user switches to,
+/// purging, demoting recent apps) turns a busy system into a stuttering one.
+/// [Hellerstein 2004 §9 disturbance rejection]
+#[inline]
+pub fn is_high_bw_workload_active(refault_pages_per_sec: f64) -> bool {
+    is_realtime_call_active()
+        || is_audio_running_somewhere()
+        || refault_pages_per_sec > STORM_REFAULT_PAGES_PER_SEC
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +245,25 @@ mod tests {
     #[test]
     fn realtime_call_does_not_panic() {
         let _ = is_realtime_call_active();
+    }
+
+    #[test]
+    fn high_bw_workload_fires_on_storm_regardless_of_audio() {
+        // The refault-storm branch is deterministic (audio branches are
+        // environment-dependent). A rate above the threshold must report a
+        // high-bw workload even with no audio; a quiet rate must not force it.
+        assert!(
+            is_high_bw_workload_active(STORM_REFAULT_PAGES_PER_SEC + 1.0),
+            "above storm threshold → high-bw workload"
+        );
+        // At/below threshold, the result is whatever the audio probes say —
+        // it must at least not PANIC and not be forced true by a quiet rate.
+        let quiet = is_high_bw_workload_active(0.0);
+        let audio = is_realtime_call_active() || is_audio_running_somewhere();
+        assert_eq!(
+            quiet, audio,
+            "quiet rate → result is purely the audio state"
+        );
     }
 
     #[test]

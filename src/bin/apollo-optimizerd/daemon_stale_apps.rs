@@ -40,10 +40,20 @@ pub fn run_stale_app_freeze(
     foreground_pid: Option<u32>,
     heuristic_critical_pids: &HashSet<u32>,
     current_actions: &[RootAction],
+    refault_pages_per_sec: f64,
 ) -> Vec<RootAction> {
     let mut new_actions: Vec<RootAction> = Vec::new();
 
     if pressure_smooth < 0.50 {
+        return new_actions;
+    }
+
+    // Phase 1: during a high-volume workload (call, media playback, or a
+    // fault-in storm from builds/LLM/data), freezing a stale background app is
+    // exactly what produces the switch microstutter — the user is about to
+    // touch one of these, and freezing it adds a SIGCONT + refault on top of
+    // the storm. Hold off; the app stays warm. [Hellerstein 2004 §9]
+    if apollo_engine::engine::coreaudio_active::is_high_bw_workload_active(refault_pages_per_sec) {
         return new_actions;
     }
 
