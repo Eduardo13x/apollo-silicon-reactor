@@ -32,6 +32,11 @@ pub struct LlmConfig {
     /// Max generation tokens for the teacher reply (default 320). The JSON
     /// advice is small; capping it cuts latency + RAM on local models.
     pub max_tokens: Option<u32>,
+    /// Disable a reasoning model's thinking trace (sends
+    /// `chat_template_kwargs: {"enable_thinking": false}`). Needed for Gemma 4
+    /// via MLX, whose 700+-token thinking otherwise eats the whole budget and
+    /// truncates the JSON. Default false (cloud endpoints reject the param).
+    pub disable_thinking: Option<bool>,
 }
 
 impl LlmConfig {
@@ -74,6 +79,11 @@ impl LlmConfig {
     /// a sane [64, 2048] so a bad config can't disable the cap or starve it.
     pub fn max_tokens(&self) -> u32 {
         self.max_tokens.unwrap_or(320).clamp(64, 2048)
+    }
+
+    /// When true, suppress the model's thinking trace via chat_template_kwargs.
+    pub fn disable_thinking(&self) -> bool {
+        self.disable_thinking.unwrap_or(false)
     }
 }
 
@@ -404,6 +414,14 @@ struct OpenAiChatRequest {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<OpenAiResponseFormat>,
+    /// Passthrough to the server's chat-template renderer (MLX / llama.cpp).
+    /// Used to set `{"enable_thinking": false}` so a reasoning model (Gemma 4)
+    /// emits the JSON directly instead of burning the whole token budget on a
+    /// thinking trace and truncating before the answer. Omitted entirely for
+    /// endpoints that don't support it (e.g. OpenAI cloud rejects unknown
+    /// params) — only sent when `disable_thinking` is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,6 +596,11 @@ GUIDANCE:
                 Some(OpenAiResponseFormat {
                     kind: "json_object".to_string(),
                 })
+            } else {
+                None
+            },
+            chat_template_kwargs: if self.cfg.disable_thinking() {
+                Some(serde_json::json!({ "enable_thinking": false }))
             } else {
                 None
             },
@@ -898,6 +921,42 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(ok.max_tokens(), 256);
+    }
+
+    #[test]
+    fn disable_thinking_controls_chat_template_kwargs() {
+        // Default off → field omitted entirely (cloud endpoints reject unknown
+        // params), so the serialized request must NOT contain the key.
+        assert!(!LlmConfig::default().disable_thinking());
+        let req_off = OpenAiChatRequest {
+            model: "m".into(),
+            messages: vec![],
+            temperature: 0.1,
+            max_tokens: 320,
+            response_format: None,
+            chat_template_kwargs: None,
+        };
+        let json_off = serde_json::to_string(&req_off).unwrap();
+        assert!(!json_off.contains("chat_template_kwargs"));
+        assert!(!json_off.contains("enable_thinking"));
+
+        // On → sends {"enable_thinking": false} so a reasoning model emits the
+        // JSON directly instead of truncating inside its thinking trace.
+        let cfg_on = LlmConfig {
+            disable_thinking: Some(true),
+            ..Default::default()
+        };
+        assert!(cfg_on.disable_thinking());
+        let req_on = OpenAiChatRequest {
+            model: "m".into(),
+            messages: vec![],
+            temperature: 0.1,
+            max_tokens: 320,
+            response_format: None,
+            chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": false })),
+        };
+        let json_on = serde_json::to_string(&req_on).unwrap();
+        assert!(json_on.contains("\"enable_thinking\":false"));
     }
 
     #[test]

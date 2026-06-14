@@ -21,11 +21,14 @@ always_on  = true
 # cualquiera de los dos. response_format json_object no garantizado — manual.
 force_json = false
 
-# La respuesta es un JSON chico, pero este es un modelo de RAZONAMIENTO: el
-# trace de thinking consume tokens ANTES del JSON. 320 truncaría el content;
-# 768 deja holgura para reasoning (~300-450 tok) + el objeto JSON. Aún capa
-# la divagación hasta EOS. Default en código es 320 si se omite; explícito.
-max_tokens = 768
+# Gemma 4 es modelo de RAZONAMIENTO: con thinking ON gasta 700+ tokens en el
+# trace y trunca ANTES del JSON (medido 2026-06-14: finish=length, content
+# vacío, parse falla). Apagar el thinking → emite el JSON directo en ~116 tok,
+# 9s (vs 76s y truncado). Manda chat_template_kwargs:{enable_thinking:false}.
+disable_thinking = true
+
+# Con thinking apagado el JSON cabe de sobra en 320. (Default en código 320.)
+max_tokens = 320
 
 # Timeouts más holgados para inferencia local en M1 8GB.
 timeout_ms          = 180000
