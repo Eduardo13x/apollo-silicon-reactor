@@ -393,6 +393,7 @@ fn main() -> anyhow::Result<()> {
                 force_json: None,
                 always_on: None,
                 max_tokens: None,
+                disable_thinking: None,
             });
 
             let (llm_state_path, llm_key_path) = state_paths_root(is_root);
