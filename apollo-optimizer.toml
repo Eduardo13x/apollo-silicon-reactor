@@ -4,21 +4,28 @@
 #   sudo cp apollo-optimizer.toml /etc/apollo-optimizer/config.toml
 
 [llm]
-# ── Conexión a Gemma 4 local via llama-server ─────────────────────────────
+# ── Conexión a Gemma 4 local via MLX (mlx_lm.server, Metal/GPU) ────────────
+# Servido por LaunchAgent com.eduardocortez.gemma4 → mlx_lm server en :8080.
+# MLX corre en la GPU (Metal) y libera la CPU; el llama-server previo corría
+# CPU-only (--n-gpu-layers 0). Modelo QAT-4bit oficial de Google: mejor
+# calidad a 4bit que el Q4_K_M genérico anterior.
 enabled    = true
 endpoint   = "http://127.0.0.1:8080/v1/chat/completions"
-model      = "gemma-4-E2B-it-Q4_K_M"
+model      = "mlx-community/gemma-4-E2B-it-qat-4bit"
 
 # Sin gate de training TTL — Gemma 4 es local, sin costo por llamada.
 always_on  = true
 
-# Gemma 4 via llama.cpp no soporta response_format: json_object — usar extracción manual.
+# Modelo de razonamiento: emite thinking en `reasoning` y el JSON en `content`
+# (a veces en fence ```json). El parser extrae el primer objeto {…} de
+# cualquiera de los dos. response_format json_object no garantizado — manual.
 force_json = false
 
-# La respuesta es un JSON chico (perfil + listas + confianza + rationale).
-# Capar la generación evita que el modelo divague hasta EOS y desperdicie
-# segundos + RAM en M1 8GB. Default en código es 320 si se omite; explícito aquí.
-max_tokens = 320
+# La respuesta es un JSON chico, pero este es un modelo de RAZONAMIENTO: el
+# trace de thinking consume tokens ANTES del JSON. 320 truncaría el content;
+# 768 deja holgura para reasoning (~300-450 tok) + el objeto JSON. Aún capa
+# la divagación hasta EOS. Default en código es 320 si se omite; explícito.
+max_tokens = 768
 
 # Timeouts más holgados para inferencia local en M1 8GB.
 timeout_ms          = 180000

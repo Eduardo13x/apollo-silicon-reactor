@@ -430,7 +430,15 @@ struct OpenAiChoice {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OpenAiChoiceMessage {
+    // Reasoning models (e.g. Gemma 4 served via MLX) may stream the thinking
+    // trace into `reasoning` and only emit `content` once they conclude. If
+    // max_tokens truncates mid-thought the server can omit `content` entirely
+    // — default it so deserialization never hard-fails, and keep `reasoning`
+    // as a fallback source for the JSON object.
+    #[serde(default)]
     content: String,
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -620,16 +628,22 @@ GUIDANCE:
 
         let parsed: OpenAiChatResponse = serde_json::from_str(&response_text)
             .map_err(|e| LlmCallError::Parse(format!("chat response parse: {}", e)))?;
-        let content = parsed
+        let message = &parsed
             .choices
             .first()
             .ok_or_else(|| LlmCallError::Parse("no choices".to_string()))?
-            .message
-            .content
-            .trim()
-            .to_string();
+            .message;
+        let content = message.content.trim();
 
-        let json = extract_first_json_object(&content)
+        // Prefer the JSON in `content`; fall back to the `reasoning` trace for
+        // reasoning models that may inline (or only emit) the object there.
+        let json = extract_first_json_object(content)
+            .or_else(|| {
+                message
+                    .reasoning
+                    .as_deref()
+                    .and_then(extract_first_json_object)
+            })
             .ok_or_else(|| LlmCallError::Parse("no json object in model content".to_string()))?;
 
         let wire: LlmWireResponse = serde_json::from_str(&json)
@@ -884,6 +898,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(ok.max_tokens(), 256);
+    }
+
+    #[test]
+    fn reasoning_model_response_parses() {
+        // Reasoning models (Gemma 4 via MLX) emit the thinking trace in
+        // `reasoning` and the JSON (often fenced) in `content`. Deserialize
+        // must tolerate the extra field and the fence; a missing `content`
+        // (truncated mid-thought) must default rather than hard-fail.
+        let with_content = r#"{"choices":[{"message":{"reasoning":"Thinking...","content":"```json\n{\"suggest_profile\":\"balanced\"}\n```"}}]}"#;
+        let parsed: OpenAiChatResponse = serde_json::from_str(with_content).unwrap();
+        let msg = &parsed.choices[0].message;
+        assert_eq!(
+            extract_first_json_object(msg.content.trim()).as_deref(),
+            Some("{\"suggest_profile\":\"balanced\"}")
+        );
+
+        // Content omitted entirely (server dropped it) — must not panic on
+        // deserialize, and the JSON falls back to the reasoning trace.
+        let only_reasoning =
+            r#"{"choices":[{"message":{"reasoning":"answer {\"suggest_profile\":\"turbo\"}"}}]}"#;
+        let parsed2: OpenAiChatResponse = serde_json::from_str(only_reasoning).unwrap();
+        let msg2 = &parsed2.choices[0].message;
+        assert_eq!(msg2.content, "");
+        let json = extract_first_json_object(msg2.content.trim()).or_else(|| {
+            msg2.reasoning
+                .as_deref()
+                .and_then(extract_first_json_object)
+        });
+        assert_eq!(json.as_deref(), Some("{\"suggest_profile\":\"turbo\"}"));
     }
 
     fn parse(toml_src: &str) -> LlmConfig {
