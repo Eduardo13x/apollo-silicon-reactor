@@ -485,6 +485,7 @@ mod tests {
                     timeout_ms: None,
                     force_json: None,
                     always_on: None,
+                    max_tokens: None,
                 },
                 llm_state: LlmState::default(),
                 llm_state_path: PathBuf::from("/tmp/apollo_test_llm_state"),

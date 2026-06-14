@@ -180,7 +180,7 @@ fn is_interactive_base(name: &str) -> bool {
 /// positives (e.g. a 4-char name spuriously prefixing an unrelated long
 /// pattern). Used by every learned-interactive match site — complete
 /// mediation [Saltzer & Kaashoek 2009].
-fn learned_pattern_matches(name_lc: &str, pattern_lc: &str) -> bool {
+pub fn learned_pattern_matches(name_lc: &str, pattern_lc: &str) -> bool {
     name_lc.contains(pattern_lc) || (name_lc.len() >= 8 && pattern_lc.starts_with(name_lc))
 }
 
