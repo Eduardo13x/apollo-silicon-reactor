@@ -267,6 +267,19 @@ mod tests {
     }
 
     #[test]
+    fn storm_threshold_is_strict_greater_than() {
+        // Phase 2 (jetsam-demote) and Phase 1 (purge/freeze) both gate on this
+        // boundary, so pin the `>` semantics: exactly AT the threshold the
+        // storm branch must NOT fire (only the audio state decides).
+        let at = is_high_bw_workload_active(STORM_REFAULT_PAGES_PER_SEC);
+        let audio = is_realtime_call_active() || is_audio_running_somewhere();
+        assert_eq!(at, audio, "at-threshold → storm branch off, audio decides");
+        assert!(is_high_bw_workload_active(
+            STORM_REFAULT_PAGES_PER_SEC * 2.0
+        ));
+    }
+
+    #[test]
     fn realtime_call_implies_both_branches() {
         // Logical invariant — if realtime fires, both individual probes must agree.
         // Cannot fail spuriously: when both probes are false, composite is false.

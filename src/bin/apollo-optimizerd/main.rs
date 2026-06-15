@@ -4026,6 +4026,15 @@ fn main() -> anyhow::Result<()> {
                 // Hunter has its own 3-cycle confirmation before classifying.
                 if cycle_count % 30 == 0 && !hunt_snaps.is_empty() {
                     let dead_weight = zombie_hunter.evaluate_all(&hunt_snaps);
+                    // Phase 2: during a high-volume workload (call, media, or a
+                    // fault-in storm), do not jetsam-demote apps. A demote makes
+                    // the target more compressible/kill-prone — so demoting right
+                    // before the user switches to it deepens the refault on
+                    // switch (the microstutter). Throttles (gentler) still run.
+                    let high_bw_workload =
+                        apollo_engine::engine::coreaudio_active::is_high_bw_workload_active(
+                            snapshot.pressure.refault_delta_per_sec,
+                        );
                     if !dead_weight.is_empty() {
                         let reclaimable_mb =
                             apollo_engine::engine::zombie_hunter::ZombieHunter::total_reclaimable_bytes(
@@ -4040,6 +4049,16 @@ fn main() -> anyhow::Result<()> {
                             }
                             use apollo_engine::engine::zombie_hunter::ZombieClass;
                             match dw.zombie_class {
+                                ZombieClass::GhostHelper | ZombieClass::MemoryHoarder
+                                    if high_bw_workload =>
+                                {
+                                    // Hold the demote off during the workload.
+                                    tracing::debug!(
+                                        pid = dw.pid,
+                                        name = %dw.name,
+                                        "phase2: jetsam-demote suppressed (high-bw workload)"
+                                    );
+                                }
                                 ZombieClass::GhostHelper | ZombieClass::MemoryHoarder => {
                                     zombie_actions.push(RootAction::set_memorystatus(
                                         dw.pid,
