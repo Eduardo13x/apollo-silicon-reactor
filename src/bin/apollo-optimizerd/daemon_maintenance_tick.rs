@@ -116,15 +116,13 @@ pub fn run_maintenance_tick(
     } else {
         snap.pressure.memory_pressure
     };
-    // Phase 1 (fixed 2026-06-15): hold off purge during a TRANSIENT high-volume
-    // workload (call or fault-in storm) — but the survival escape inside
-    // is_high_bw_workload_active returns false once physical pressure crosses
-    // the floor, so relief always wins when memory drowns. The real-OOM escape
-    // inside emergency_thrashing_purge_allowed is a second backstop.
-    let high_bw_workload = apollo_engine::engine::coreaudio_active::is_high_bw_workload_active(
-        snap.pressure.refault_delta_per_sec,
-        physical_pressure,
-    );
+    // The EMERGENCY purge gets the ACTUAL call signal, not high_bw. Its
+    // internal logic already handles storms correctly: a genuine call gets
+    // glitch protection (purge only on predicted OOM), while a non-call thrash
+    // STREAK (consecutive_thrash_50k_cycles >= 10) still purges for relief.
+    // Passing high_bw here (the 2026-06-15 regression) gave storms the call
+    // treatment — blocking the streak relief → thrash strangled to 69k.
+    let realtime_call = apollo_engine::engine::coreaudio_active::is_realtime_call_active();
     let emergency = emergency_thrashing_purge_allowed(
         thrash,
         p_oom_30s,
@@ -133,7 +131,16 @@ pub fn run_maintenance_tick(
         state,
         build_active,
         bus_saturated,
-        high_bw_workload,
+        realtime_call,
+    );
+    // Phase 1 (fixed 2026-06-15): the gentler NORMAL purge holds off during a
+    // TRANSIENT high-volume workload (call or fault-in storm). The survival
+    // escape inside is_high_bw_workload_active yields once physical pressure
+    // crosses the floor, and the emergency streak path above is the relief
+    // backstop, so this can no longer strangle.
+    let high_bw_workload = apollo_engine::engine::coreaudio_active::is_high_bw_workload_active(
+        snap.pressure.refault_delta_per_sec,
+        physical_pressure,
     );
     if emergency && std::process::Command::new("purge").spawn().is_ok() {
         state.mark_purged();
