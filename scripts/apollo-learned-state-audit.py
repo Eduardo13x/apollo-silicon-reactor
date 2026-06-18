@@ -115,6 +115,26 @@ def audit(state, metrics, policy, llm):
         if 0 < ais < 80:
             findings.append(("HIGH", "ais-degraded", f"ais_score={ais:.1f} (<80)"))
 
+        # ── P7: purge strangled (2026-06-15 regression blind spot) ──────────
+        # That incident — Apollo suppressing the maintenance purge 127,959× vs
+        # 147 fired, thrashing climbing to 69k with no relief — was invisible to
+        # BOTH ais (read 93) and this auditor. Catch the exact shape: crisis-
+        # level thrashing WHILE purge is being suppressed (skips dominate). Each
+        # signal alone is benign (a brief storm spikes thrashing; idle systems
+        # skip purge), so require BOTH. Counters are cumulative-since-start, so
+        # this fires on a sustained pattern, not a transient spike.
+        thrash = metrics.get("thrashing_score", 0)
+        skipped = metrics.get("maintenance_purge_skipped_idle_total", 0)
+        purged = metrics.get("maintenance_purge_total", 0)
+        skip_ratio = skipped / (skipped + purged) if (skipped + purged) > 0 else 0.0
+        if thrash >= 50000 and skip_ratio > 0.9 and skipped > 1000:
+            findings.append((
+                "HIGH", "purge-strangled",
+                f"thrashing={thrash:.0f} (crisis) but purge suppressed "
+                f"{skipped}/{skipped + purged} ({skip_ratio:.0%} skip) — relief "
+                f"is being strangled; check is_high_bw_workload_active survival "
+                f"escape (see feedback_suppression_survival_first)"))
+
     # ── P0: file unreadable / corrupt ─────────────────────────────────────
     if "__error__" in state:
         findings.append(("HIGH", "state-unreadable", state["__error__"]))

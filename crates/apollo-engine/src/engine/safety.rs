@@ -71,6 +71,12 @@ pub fn protected_processes() -> HashSet<&'static str> {
         // [CoreAudio documentation] audiod manages audio device policy and routing
         // decisions above coreaudiod's real-time mixing layer.
         "audiod",
+        // Apple GPU/Metal shader-compiler server. Apollo throttled it 69× at
+        // 4.2% effectiveness (2026-06 audit `weight-futile`) — pure wasted
+        // budget, and throttling the shader compiler risks graphics jank.
+        // It IS Apple-owned but slipped the is_protected_pid path; pin it by
+        // name. [2026-06-18 audit finding]
+        "CVMServer",
         // Power management — freeze → sleep/wake state machine stalls, fans uncontrolled.
         // [IOKit Power Management] powerd manages assertion tracking, thermal policy,
         // and display sleep. SIGSTOP causes indefinite wake-lock or uncontrolled fan spin.
