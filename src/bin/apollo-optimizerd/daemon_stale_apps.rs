@@ -53,7 +53,10 @@ pub fn run_stale_app_freeze(
     // exactly what produces the switch microstutter — the user is about to
     // touch one of these, and freezing it adds a SIGCONT + refault on top of
     // the storm. Hold off; the app stays warm. [Hellerstein 2004 §9]
-    if apollo_engine::engine::coreaudio_active::is_high_bw_workload_active(refault_pages_per_sec) {
+    if apollo_engine::engine::coreaudio_active::is_high_bw_workload_active(
+        refault_pages_per_sec,
+        pressure_smooth,
+    ) {
         return new_actions;
     }
 

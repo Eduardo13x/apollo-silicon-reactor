@@ -208,22 +208,40 @@ pub fn is_realtime_call_active() -> bool {
 /// baseline accumulates. [Phase 1]
 pub const STORM_REFAULT_PAGES_PER_SEC: f64 = 30_000.0;
 
-/// True when the system is under a high-volume workload that makes Apollo's
-/// own memory churn (purge, stale-freeze, jetsam-demote) costly — generalized
-/// beyond "a call" to ANY heavy load that drives the compressor/swap:
-/// - a realtime call (output AND input), OR
-/// - media playback (output running — the 4K-video case), OR
-/// - a fault-in storm above [`STORM_REFAULT_PAGES_PER_SEC`] (builds, LLM
-///   inference, data crunch — workloads with no audio at all).
+/// Physical-pressure floor above which memory RELIEF always wins over
+/// anti-stutter suppression. Survival beats UX politeness — Apollo must never
+/// strangle its own relief (purge/freeze/demote) while memory drowns.
 ///
-/// During such a window, adding faults (freezing the app the user switches to,
-/// purging, demoting recent apps) turns a busy system into a stuttering one.
-/// [Hellerstein 2004 §9 disturbance rejection]
+/// REGRESSION SCAR (2026-06-15): the first cut of this gate OR'd in plain
+/// `is_audio_running_somewhere()`, so with background music it was permanently
+/// true and suppressed the maintenance purge 127,959× (vs 147 fired) → no
+/// cache flush → thrashing 69k, refault peaks of 22 GB/s, system "horrible"
+/// until the user killed the daemon. Two fixes: (1) drop plain audio so the
+/// signal is TRANSIENT (storm/call only); (2) this survival escape, mirroring
+/// `user_presence::CRITICAL_PRESSURE_BYPASS`.
+pub const SURVIVAL_PRESSURE_FLOOR: f64 = 0.70;
+
+/// True when Apollo should hold off its own memory churn (purge, stale-freeze,
+/// jetsam-demote) because a TRANSIENT high-volume workload is in progress and
+/// memory is NOT in danger. Suppressing churn here avoids adding faults to the
+/// app the user is switching to (the microstutter).
+///
+/// Two guards make this safe:
+/// - **Survival escape**: if `physical_pressure >= SURVIVAL_PRESSURE_FLOOR`,
+///   returns `false` — relief wins, no matter the workload. Never strangle.
+/// - **Transient only**: a realtime call (output AND input) OR a fault-in
+///   storm above [`STORM_REFAULT_PAGES_PER_SEC`]. Plain background audio is
+///   deliberately EXCLUDED — including it made the gate permanent (the scar).
+///
+/// Pass the PHYSICAL pressure (`memory_pressure_raw`, falling back to
+/// `memory_pressure`) — purge cannot fix thermal/battery boost.
+/// [Hellerstein 2004 §9 disturbance rejection; project survival doctrine]
 #[inline]
-pub fn is_high_bw_workload_active(refault_pages_per_sec: f64) -> bool {
-    is_realtime_call_active()
-        || is_audio_running_somewhere()
-        || refault_pages_per_sec > STORM_REFAULT_PAGES_PER_SEC
+pub fn is_high_bw_workload_active(refault_pages_per_sec: f64, physical_pressure: f64) -> bool {
+    if physical_pressure >= SURVIVAL_PRESSURE_FLOOR {
+        return false; // drowning — relief wins, never suppress.
+    }
+    is_realtime_call_active() || refault_pages_per_sec > STORM_REFAULT_PAGES_PER_SEC
 }
 
 #[cfg(test)]
@@ -248,34 +266,49 @@ mod tests {
     }
 
     #[test]
-    fn high_bw_workload_fires_on_storm_regardless_of_audio() {
-        // The refault-storm branch is deterministic (audio branches are
-        // environment-dependent). A rate above the threshold must report a
-        // high-bw workload even with no audio; a quiet rate must not force it.
+    fn high_bw_workload_fires_on_storm_when_memory_safe() {
+        // A storm above threshold, with memory safe (low pressure), suppresses.
         assert!(
-            is_high_bw_workload_active(STORM_REFAULT_PAGES_PER_SEC + 1.0),
-            "above storm threshold → high-bw workload"
+            is_high_bw_workload_active(STORM_REFAULT_PAGES_PER_SEC + 1.0, 0.40),
+            "storm + safe memory → suppress churn"
         );
-        // At/below threshold, the result is whatever the audio probes say —
-        // it must at least not PANIC and not be forced true by a quiet rate.
-        let quiet = is_high_bw_workload_active(0.0);
-        let audio = is_realtime_call_active() || is_audio_running_somewhere();
+        // Quiet rate, low pressure → no storm, no call: do not suppress.
+        let quiet = is_high_bw_workload_active(0.0, 0.40);
         assert_eq!(
-            quiet, audio,
-            "quiet rate → result is purely the audio state"
+            quiet,
+            is_realtime_call_active(),
+            "quiet → only a call counts"
+        );
+    }
+
+    #[test]
+    fn survival_escape_beats_any_workload() {
+        // THE regression guard (2026-06-15): even a massive storm must NOT
+        // suppress relief once physical pressure reaches the survival floor.
+        // Suppressing purge while memory drowns is the bug that strangled
+        // Apollo (127,959 skipped purges, thrashing 69k).
+        assert!(
+            !is_high_bw_workload_active(
+                STORM_REFAULT_PAGES_PER_SEC * 100.0,
+                SURVIVAL_PRESSURE_FLOOR
+            ),
+            "at the survival floor, relief wins regardless of the storm"
+        );
+        assert!(
+            !is_high_bw_workload_active(1_000_000.0, 0.95),
+            "drowning → never suppress"
         );
     }
 
     #[test]
     fn storm_threshold_is_strict_greater_than() {
-        // Phase 2 (jetsam-demote) and Phase 1 (purge/freeze) both gate on this
-        // boundary, so pin the `>` semantics: exactly AT the threshold the
-        // storm branch must NOT fire (only the audio state decides).
-        let at = is_high_bw_workload_active(STORM_REFAULT_PAGES_PER_SEC);
-        let audio = is_realtime_call_active() || is_audio_running_somewhere();
-        assert_eq!(at, audio, "at-threshold → storm branch off, audio decides");
+        // Pin the `>` semantics at safe pressure: exactly AT the threshold the
+        // storm branch must NOT fire (only a call would).
+        let at = is_high_bw_workload_active(STORM_REFAULT_PAGES_PER_SEC, 0.40);
+        assert_eq!(at, is_realtime_call_active(), "at-threshold → storm off");
         assert!(is_high_bw_workload_active(
-            STORM_REFAULT_PAGES_PER_SEC * 2.0
+            STORM_REFAULT_PAGES_PER_SEC * 2.0,
+            0.40
         ));
     }
 

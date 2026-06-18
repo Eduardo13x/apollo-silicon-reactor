@@ -111,18 +111,20 @@ pub fn run_maintenance_tick(
     // not a CALL_APP_NAME) and is immune to the pmset poll TTL that lets
     // ctx.audio_active go stale between samples — the exact gap that let
     // mid-call purges through.
-    // Phase 1: generalized from "a call" to ANY high-volume workload (call,
-    // media playback, or a fault-in storm from builds/LLM/data). During such a
-    // window Apollo must not add faults via purge — the real-OOM escape inside
-    // emergency_thrashing_purge_allowed still fires when genuinely needed.
-    let high_bw_workload = apollo_engine::engine::coreaudio_active::is_high_bw_workload_active(
-        snap.pressure.refault_delta_per_sec,
-    );
     let physical_pressure = if snap.pressure.memory_pressure_raw > 0.0 {
         snap.pressure.memory_pressure_raw
     } else {
         snap.pressure.memory_pressure
     };
+    // Phase 1 (fixed 2026-06-15): hold off purge during a TRANSIENT high-volume
+    // workload (call or fault-in storm) — but the survival escape inside
+    // is_high_bw_workload_active returns false once physical pressure crosses
+    // the floor, so relief always wins when memory drowns. The real-OOM escape
+    // inside emergency_thrashing_purge_allowed is a second backstop.
+    let high_bw_workload = apollo_engine::engine::coreaudio_active::is_high_bw_workload_active(
+        snap.pressure.refault_delta_per_sec,
+        physical_pressure,
+    );
     let emergency = emergency_thrashing_purge_allowed(
         thrash,
         p_oom_30s,

@@ -4031,9 +4031,15 @@ fn main() -> anyhow::Result<()> {
                     // the target more compressible/kill-prone — so demoting right
                     // before the user switches to it deepens the refault on
                     // switch (the microstutter). Throttles (gentler) still run.
+                    let high_bw_physical_pressure = if snapshot.pressure.memory_pressure_raw > 0.0 {
+                        snapshot.pressure.memory_pressure_raw
+                    } else {
+                        snapshot.pressure.memory_pressure
+                    };
                     let high_bw_workload =
                         apollo_engine::engine::coreaudio_active::is_high_bw_workload_active(
                             snapshot.pressure.refault_delta_per_sec,
+                            high_bw_physical_pressure,
                         );
                     if !dead_weight.is_empty() {
                         let reclaimable_mb =
