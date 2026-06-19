@@ -504,6 +504,9 @@ impl DriftDetector {
             .filter(|e| e.is_drifted(effective_thr as f32))
             .count();
 
+        // Enforce the cap at the mutation point — independent of decay timing.
+        self.enforce_capacity();
+
         delta
     }
 
@@ -717,11 +720,24 @@ impl DriftDetector {
             .filter(|e| e.is_drifted(effective_thr))
             .count();
 
-        // Capacity cap (2026-06-10): evict the weakest beliefs beyond
-        // MAX_BELIEFS. Relevance = confidence × (1 + lti) so crisis-formed
-        // (high-LTI) beliefs survive eviction even at moderate confidence,
-        // while ephemeral event beliefs (low lti, decaying confidence) go
-        // first. [Wang 2013 §forgetting]
+        self.enforce_capacity();
+    }
+
+    /// Hard cap on the belief store — evict the weakest beliefs beyond
+    /// MAX_BELIEFS. Relevance = confidence × (1 + lti) so crisis-formed
+    /// (high-LTI) beliefs survive eviction even at moderate confidence, while
+    /// ephemeral event beliefs (low lti, decaying confidence) go first.
+    /// [Wang 2013 §forgetting]
+    ///
+    /// MUST be called at every mutation that can grow the store. 2026-06-18
+    /// scar: this lived only at the tail of `decay_confidence`, which is gated
+    /// (skipped when learned_policy is absent and under persist-skipping
+    /// stress), so beliefs reached 22,113 (7× the cap) — bloating
+    /// learned_state.json to ~5.7 MB and making every persist slower until the
+    /// daemon degraded around ~100k cycles ("a partir de 100k empieza a valer
+    /// verga"). The cap is now an invariant of the store, not a decay side
+    /// effect.
+    fn enforce_capacity(&mut self) {
         if self.beliefs.len() > MAX_BELIEFS {
             let mut ranked: Vec<(String, f32)> = self
                 .beliefs
@@ -1070,6 +1086,25 @@ mod tests {
         assert!(
             d.len() <= MAX_BELIEFS,
             "belief store must be capped at {MAX_BELIEFS}, got {}",
+            d.len()
+        );
+    }
+
+    /// 2026-06-18 regression: beliefs reached 22,113 (7× the cap) because the
+    /// cap was only enforced inside decay_confidence (gated/skipped under
+    /// stress). The cap must now hold from inserts ALONE, with NO decay call —
+    /// otherwise learned_state.json bloats and persists slow until the daemon
+    /// degrades around ~100k cycles.
+    #[test]
+    fn belief_cap_holds_without_decay() {
+        let mut d = DriftDetector::new();
+        for i in 0..(MAX_BELIEFS + 5000) {
+            d.observe(&format!("oom:{i}:hash{i}"), false);
+        }
+        // NO decay_confidence() call — the insert path alone must hold the cap.
+        assert!(
+            d.len() <= MAX_BELIEFS,
+            "insert path must enforce the cap on its own, got {}",
             d.len()
         );
     }

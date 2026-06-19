@@ -1498,14 +1498,26 @@ mod tests {
             "net.inet.tcp.delayed_ack",
             "kern.ipc.somaxconn",
         ] {
-            gov.emit_sysctl(key, "999", "test-should-be-blocked", &mut actions, Instant::now());
+            gov.emit_sysctl(
+                key,
+                "999",
+                "test-should-be-blocked",
+                &mut actions,
+                Instant::now(),
+            );
         }
         assert!(
             actions.is_empty(),
             "call-affecting network sysctls must never reach actions"
         );
         // A memory/VM sysctl is unaffected — the block is selective.
-        gov.emit_sysctl("kern.maxvnodes", "100000", "test", &mut actions, Instant::now());
+        gov.emit_sysctl(
+            "kern.maxvnodes",
+            "100000",
+            "test",
+            &mut actions,
+            Instant::now(),
+        );
         assert!(
             actions
                 .iter()
