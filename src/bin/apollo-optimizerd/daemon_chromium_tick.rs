@@ -29,6 +29,14 @@ use apollo_engine::engine::process_identity::ProcessIdentity;
 use apollo_engine::engine::types::{FreezeSource, FrozenEntry};
 use apollo_engine::engine::window_sensor::WorkloadIntent;
 
+/// True when Apollo should hold off Chromium E-core demotion to protect a live
+/// Meet/call: audio is actively flowing AND memory is not in genuine crisis.
+/// Above the crisis floor (0.75) RAM placement wins over a smooth call.
+/// [2026-06-18 call-safety — scheduler axis]
+pub(crate) fn ecore_demote_suppressed_for_call(audio_flowing: bool, pressure_smooth: f32) -> bool {
+    audio_flowing && pressure_smooth < 0.75
+}
+
 /// Per-cycle Chromium renderer management tick.
 ///
 /// Set `CHROMIUM_FREEZE_DISABLED = false` to re-enable renderer SIGSTOP/SIGCONT.
@@ -217,6 +225,19 @@ pub fn run_chromium_tick(
         m.metrics.chromium_browsers_managed = cm.browsers_managed;
     }
 
+    // Call/media safety (2026-06-18): E-core demotion moves a Chromium renderer
+    // onto the slow efficiency cores. Meet's GPU / audio / WebRTC helper
+    // processes have no window, so the visibility gate reads them as
+    // "background" — demoting them mid-call slows video encode/decode and
+    // glitches audio. While audio is actively flowing, hold the demotion off.
+    // Survival escape: a genuine memory crisis (pressure >= 0.75, the same
+    // floor the SIGSTOP path uses) still demotes — RAM placement then matters
+    // more than a smooth call. Fresh CoreAudio probe (not the stale pmset
+    // flag) — but unlike the network gate, this is harmless if it over-fires
+    // (skipping a scheduling hint never strangles anything).
+    let audio_flowing = apollo_engine::engine::coreaudio_active::is_audio_running_somewhere();
+    let demote_unsafe_for_call = ecore_demote_suppressed_for_call(audio_flowing, pressure_smooth);
+
     // Non-SIGSTOP actions run UNCONDITIONALLY. DemoteToEcores uses
     // PRIO_DARWIN_BG (turnstile-compatible, commit 97410cd) and PurgePurgeable
     // marks pages volatile via mach_vm_purgable_control — neither triggers the
@@ -224,6 +245,14 @@ pub fn run_chromium_tick(
     for action in &chromium_actions {
         match action {
             ChromiumAction::DemoteToEcores { pid, name } => {
+                if demote_unsafe_for_call {
+                    tracing::debug!(
+                        pid = pid,
+                        name = name.as_str(),
+                        "chromium: E-core demotion suppressed (audio active — protect Meet)"
+                    );
+                    continue;
+                }
                 tracing::debug!(
                     pid = pid,
                     name = name.as_str(),
@@ -348,5 +377,22 @@ pub fn run_chromium_tick(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ecore_demote_suppressed_for_call;
+
+    #[test]
+    fn ecore_demote_protects_call_unless_crisis() {
+        // Audio flowing + non-crisis pressure → suppress demotion (protect Meet).
+        assert!(ecore_demote_suppressed_for_call(true, 0.50));
+        assert!(ecore_demote_suppressed_for_call(true, 0.74));
+        // Survival escape: at/above the crisis floor, demote anyway.
+        assert!(!ecore_demote_suppressed_for_call(true, 0.75));
+        assert!(!ecore_demote_suppressed_for_call(true, 0.90));
+        // No audio → never suppressed (normal behavior).
+        assert!(!ecore_demote_suppressed_for_call(false, 0.50));
     }
 }
