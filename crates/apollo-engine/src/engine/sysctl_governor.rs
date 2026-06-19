@@ -1485,6 +1485,35 @@ mod tests {
         }
     }
 
+    /// Direct chokepoint test (2026-06-18 call-safety): emit_sysctl drops the
+    /// four call-affecting network keys but still passes non-network keys.
+    #[test]
+    fn emit_sysctl_blocks_call_affecting_network_keys() {
+        let mut gov = SysctlGovernor::new(true);
+        gov.unavailable_keys.clear();
+        let mut actions = Vec::new();
+        for key in [
+            "net.inet.tcp.sendspace",
+            "net.inet.tcp.recvspace",
+            "net.inet.tcp.delayed_ack",
+            "kern.ipc.somaxconn",
+        ] {
+            gov.emit_sysctl(key, "999", "test-should-be-blocked", &mut actions, Instant::now());
+        }
+        assert!(
+            actions.is_empty(),
+            "call-affecting network sysctls must never reach actions"
+        );
+        // A memory/VM sysctl is unaffected — the block is selective.
+        gov.emit_sysctl("kern.maxvnodes", "100000", "test", &mut actions, Instant::now());
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, RootAction::SetSysctl(s) if s.key() == "kern.maxvnodes")),
+            "non-network sysctls must still emit"
+        );
+    }
+
     #[test]
     fn vm_aggressive_on_high_pressure_and_swap() {
         let mut gov = SysctlGovernor::new(true);
