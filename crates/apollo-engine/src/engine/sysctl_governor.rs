@@ -1145,6 +1145,25 @@ impl SysctlGovernor {
         if self.unavailable_keys.iter().any(|k| k == key) {
             return;
         }
+        // CALL-SAFETY HARD BLOCK (2026-06-18): Apollo must NEVER write the TCP /
+        // IPC network sysctls. They are the only sysctls that affect a realtime
+        // call, and tuning them has now broken a user's Meet TWICE (2026-06-09
+        // WebRTC freeze; 2026-06-18 choppy mic). The realtime-call gate is
+        // unreliable — it disengages whenever the mic probe reads false (e.g.
+        // while muted), and the resulting write/revert churn ("martillaba en
+        // kernel") degrades audio. The feature's value (tuning TCP buffers on a
+        // personal laptop) is marginal; stock macOS networking carries Meet
+        // fine. Complete mediation at the single emit chokepoint — no code path
+        // can write these. Memory/VM sysctls (maxvnodes, etc.) are unaffected.
+        const CALL_AFFECTING_SYSCTLS: [&str; 4] = [
+            "net.inet.tcp.sendspace",
+            "net.inet.tcp.recvspace",
+            "net.inet.tcp.delayed_ack",
+            "kern.ipc.somaxconn",
+        ];
+        if CALL_AFFECTING_SYSCTLS.contains(&key) {
+            return;
+        }
         // Sprint 4 Phase 4 seal: the factory clamps the value internally
         // (single source of truth in `sysctl_limits::clamp_to_allowed_range`).
         // We re-read the post-clamp value via the accessor to keep
@@ -1434,47 +1453,36 @@ mod tests {
         assert!(actions.is_empty());
     }
 
+    /// Call-safety block (2026-06-18): the TCP buffer sysctls are never emitted
+    /// regardless of the scaling conditions — they break realtime calls.
     #[test]
-    fn tcp_scale_up_after_3_high_cycles() {
+    fn tcp_buffer_tuning_blocked_for_call_safety() {
         let mut gov = SysctlGovernor::new(true);
-        // retx_rate > 50 (= 5%) triggers high counter.
         let monitor = test_monitor(60.0, 0.0, 1000);
-
         let inputs = default_inputs(&monitor);
-
-        // Cycles 1 and 2: no actions yet.
-        assert!(tick_ok(&mut gov, &inputs).is_empty());
-        assert!(tick_ok(&mut gov, &inputs).is_empty());
-        // Cycle 3: should emit scale-up actions.
-        let actions = tick_ok(&mut gov, &inputs);
-        assert!(
-            !actions.is_empty(),
-            "expected TCP scale-up actions on cycle 3"
-        );
-        // Verify at least one SetSysctl for sendspace or recvspace.
-        let has_buffer_tune = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl(s)
-                if s.key() == "net.inet.tcp.sendspace" || s.key() == "net.inet.tcp.recvspace")
-        });
-        assert!(has_buffer_tune, "expected buffer scaling action");
+        for _ in 0..5 {
+            let actions = tick_ok(&mut gov, &inputs);
+            let has_buffer_tune = actions.iter().any(|a| {
+                matches!(a, RootAction::SetSysctl(s)
+                    if s.key() == "net.inet.tcp.sendspace" || s.key() == "net.inet.tcp.recvspace")
+            });
+            assert!(!has_buffer_tune, "TCP buffer sysctls must never be emitted");
+        }
     }
 
+    /// Call-safety block: kern.ipc.somaxconn is never emitted.
     #[test]
-    fn ipc_scale_up_after_2_drop_cycles() {
+    fn ipc_tuning_blocked_for_call_safety() {
         let mut gov = SysctlGovernor::new(true);
-        // drop_rate > 0 triggers consecutive_drops counter.
         let monitor = test_monitor(0.0, 1.0, 0);
-
         let inputs = default_inputs(&monitor);
-
-        // Cycle 1: no action.
-        assert!(tick_ok(&mut gov, &inputs).is_empty());
-        // Cycle 2: should emit somaxconn scale-up.
-        let actions = tick_ok(&mut gov, &inputs);
-        let has_somaxconn = actions
-            .iter()
-            .any(|a| matches!(a, RootAction::SetSysctl(s) if s.key() == "kern.ipc.somaxconn"));
-        assert!(has_somaxconn, "expected somaxconn scale-up on cycle 2");
+        for _ in 0..4 {
+            let actions = tick_ok(&mut gov, &inputs);
+            let has_somaxconn = actions
+                .iter()
+                .any(|a| matches!(a, RootAction::SetSysctl(s) if s.key() == "kern.ipc.somaxconn"));
+            assert!(!has_somaxconn, "somaxconn must never be emitted");
+        }
     }
 
     #[test]
@@ -1607,11 +1615,11 @@ mod tests {
         inputs.workload = "coding";
 
         let actions = gov.tick(&inputs);
-        let has_ack_change = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl(s)
-                if s.key() == "net.inet.tcp.delayed_ack" && s.value() == "0")
-        });
-        assert!(has_ack_change, "expected delayed_ack=0 for coding workload");
+        // Call-safety block: delayed_ack is never emitted, any workload.
+        let any_ack = actions.iter().any(
+            |a| matches!(a, RootAction::SetSysctl(s) if s.key() == "net.inet.tcp.delayed_ack"),
+        );
+        assert!(!any_ack, "delayed_ack must never be emitted (call safety)");
     }
 
     #[test]
@@ -1627,11 +1635,12 @@ mod tests {
         inputs.on_battery = true;
 
         let actions = gov.tick(&inputs);
-        let has_ack_change = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl(s)
-                if s.key() == "net.inet.tcp.delayed_ack" && s.value() == "3")
-        });
-        assert!(has_ack_change, "expected delayed_ack=3 on battery");
+        // Call-safety block: delayed_ack is never emitted, even on battery —
+        // the OS default carries WebRTC fine and tuning it broke calls.
+        let any_ack = actions.iter().any(
+            |a| matches!(a, RootAction::SetSysctl(s) if s.key() == "net.inet.tcp.delayed_ack"),
+        );
+        assert!(!any_ack, "delayed_ack must never be emitted (call safety)");
     }
 
     // ── WebRTC guard (2026-06-09 prod incident) ──────────────────────────────
@@ -1674,20 +1683,12 @@ mod tests {
         inputs.realtime_call_active = true;
 
         let actions = gov.tick(&inputs);
-        let forced_low_latency = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl(s)
-                if s.key() == "net.inet.tcp.delayed_ack" && s.value() == "0")
-        });
-        assert!(
-            forced_low_latency,
-            "realtime call must force delayed_ack=0 even on battery"
+        // Call-safety block makes this stronger than the old gate: delayed_ack
+        // is never emitted at all, so no value (0 OR 3) can reach a live call.
+        let any_ack = actions.iter().any(
+            |a| matches!(a, RootAction::SetSysctl(s) if s.key() == "net.inet.tcp.delayed_ack"),
         );
-        // No delayed_ack=3 may slip through.
-        let any_combined = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl(s)
-                if s.key() == "net.inet.tcp.delayed_ack" && s.value() == "3")
-        });
-        assert!(!any_combined, "realtime call must NOT emit delayed_ack=3");
+        assert!(!any_ack, "no delayed_ack write may reach a realtime call");
     }
 
     /// Reproduces the buffer scale-down branch (sysctl_governor.rs:641).
@@ -1742,14 +1743,11 @@ mod tests {
         inputs.realtime_call_active = false; // gate disengaged
 
         let actions = gov.tick(&inputs);
-        let battery_combined = actions.iter().any(|a| {
-            matches!(a, RootAction::SetSysctl(s)
-                if s.key() == "net.inet.tcp.delayed_ack" && s.value() == "3")
-        });
-        assert!(
-            battery_combined,
-            "with gate off, battery branch must still emit delayed_ack=3"
+        // Call-safety block: even gate-off + battery emits NO delayed_ack now.
+        let any_ack = actions.iter().any(
+            |a| matches!(a, RootAction::SetSysctl(s) if s.key() == "net.inet.tcp.delayed_ack"),
         );
+        assert!(!any_ack, "delayed_ack must never be emitted (call safety)");
     }
 
     // ── Scale-down dwell (2026-06-09 whipsaw fix) ────────────────────────────
@@ -1807,9 +1805,10 @@ mod tests {
         let monitor = test_monitor(0.0, 0.0, 0);
         let inputs = default_inputs(&monitor);
         let actions = tick_ok(&mut gov, &inputs);
+        // Call-safety block: buffer scale-down is never emitted now, dwell or no.
         assert!(
-            has_buffer_scale_down(&actions),
-            "scale-down must fire once the dwell has elapsed"
+            !has_buffer_scale_down(&actions),
+            "TCP buffer scale-down must never emit (call safety)"
         );
     }
 
@@ -1824,9 +1823,10 @@ mod tests {
         let monitor = test_monitor(0.0, 0.0, 0);
         let inputs = default_inputs(&monitor);
         let actions = tick_ok(&mut gov, &inputs);
+        // Call-safety block: never emit scale-down regardless of dwell state.
         assert!(
-            has_buffer_scale_down(&actions),
-            "no prior scale-up means no dwell — scale-down must fire"
+            !has_buffer_scale_down(&actions),
+            "TCP buffer scale-down must never emit (call safety)"
         );
     }
 
