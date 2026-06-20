@@ -924,6 +924,7 @@ def print_trend_table(n):
 # ── main ──────────────────────────────────────────────────────────────────────
 def main(argv):
     quiet = "--quiet" in argv
+    as_json = "--json" in argv
     if "--trend" in argv:
         i = argv.index("--trend")
         try:
@@ -963,6 +964,15 @@ def main(argv):
     if rt.get("__error__"):
         findings.insert(0, ("HIGH", "metrics-unreadable", rt["__error__"]))
         high = [f for f in findings if f[0] == "HIGH"]
+
+    # --json: structured output for the fix-loop (Layer 2) to consume.
+    if as_json:
+        print(json.dumps({
+            "timestamp": ts,
+            "findings": [{"severity": s, "code": c, "detail": d} for s, c, d in findings],
+            "metrics": metrics,
+        }, indent=1))
+        return 2 if high else (1 if findings else 0)
     if findings:
         verdict = "{} finding(s)".format(len(findings)) + (
             " — {} HIGH".format(len(high)) if high else "")
