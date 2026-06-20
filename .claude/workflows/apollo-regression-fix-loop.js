@@ -101,7 +101,7 @@ phase('Plan')
 const plan = await agent(
   `${DOCTRINE}\n\nProduce a tight remediation plan from these diagnoses. Sections:\n` +
   `1. STALE/TRANSIENT/INHERENT (still_present=false) — list briefly so the maintainer knows the probe fired on residue/load, not a real regression. These are also signals the PROBE may need a detector refinement (note which).\n` +
-  `2. SAFE quick-wins — ordered; for each: root cause (file:line), the exact patch, the test, and the one-line deploy-gate command (./scripts/apollo-deploy-gate.sh). These may be applied then deploy-gated (AIS>=87 keeps, else reverts).\n` +
+  `2. SAFE quick-wins — ordered; for each: root cause (file:line), the exact patch, the test, and the verification commands. Verification is TWO-STAGE: (i) ./scripts/apollo-deploy-gate.sh deploys + keeps/reverts on its own AIS>=87 baseline; (ii) THEN sudo bash scripts/apollo-accept-gate.sh (the brutal acceptance gate: hard SLOs H1-H5 + no-regression-vs-rolling-baseline R1/R3 + composite S) as an ADVISORY check — if it REJECTs (exit nonzero), the change is SURFACED with the failing criteria and a revert recommended (human pulls the trigger; auto-revert is OFF). A SAFE change is only confirmed-kept when BOTH the deploy-gate keeps AND apollo-accept-gate.sh ACCEPTs.\n` +
   `3. RISKY — surfaced for human design ONLY. For each: root cause, why it is risky, and the validation required (>=500 obs, watch which probe metric / cron detector). DO NOT present these as ready-to-apply.\n` +
   `4. Single highest-value next action and why.\n\nDIAGNOSES:\n${JSON.stringify(diagnoses, null, 1)}`,
   { label: 'remediation-plan', phase: 'Plan' }
