@@ -200,6 +200,27 @@ def fresh_entries(journal_tail, minutes):
 FRESH_WINDOW_MIN = 30
 
 
+def teacher_config_disabled():
+    """True iff the [llm] config explicitly sets enabled=false. Stdlib line
+    parse (no tomllib on python 3.9). Conservative: returns False on any read
+    failure so a genuinely-dead teacher is never masked."""
+    try:
+        with open("/etc/apollo-optimizer/config.toml") as f:
+            in_llm = False
+            for line in f:
+                s = line.strip()
+                if s.startswith("#"):
+                    continue
+                if s.startswith("[") and s.endswith("]"):
+                    in_llm = s == "[llm]"
+                    continue
+                if in_llm and s.replace(" ", "").startswith("enabled="):
+                    return "false" in s.lower()
+    except Exception:
+        pass
+    return False
+
+
 def read_sysctls():
     """Read the 4 critical sysctls via subprocess. Returns a dict
     {key: int-value}; a key maps to None on read/parse failure. Never raises."""
@@ -633,6 +654,12 @@ def detect_llm_stale(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, tre
     if not isinstance(llm, dict) or "__error__" in llm:
         return findings
     if not llm.get("enabled"):
+        return findings
+    # The teacher can be turned off via config without the persisted
+    # llm_state.enabled flipping (2026-06-20: disabled because it was a net
+    # wash-with-overhead). A deliberately-off teacher is NOT "silently dead" —
+    # respect the config so this detector doesn't false-flag it.
+    if teacher_config_disabled():
         return findings
 
     cf = llm.get("consecutive_failures", 0)
