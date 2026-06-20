@@ -564,6 +564,11 @@ HARD RULES (violation = rejected):
 2. NEVER put the same process in both noise and protected in the same response. Pick one.
 3. NEVER suggest Spotlight stack (mds/mdworker/mds_stores/Spotlight).
 4. Keep pattern strings as short substrings, no regex.
+5. NEVER classify as NOISE a process that is interactive or user-facing:
+   language servers / LSPs (e.g. language_server), editors, terminals,
+   IDEs, or any app the user interacts with. Throttling these stalls the
+   user's work. If such a process shows high CPU, it is the user WORKING,
+   not noise — leave it in interactive, never move it to noise.
 
 GUIDANCE:
 - If PatternEffectiveness shows effectiveness < 0.30 → that process does NOT cause pressure. Suggest it for protected (not noise).

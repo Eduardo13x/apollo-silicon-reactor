@@ -421,6 +421,35 @@ fn main() -> anyhow::Result<()> {
                 }
                 let mut p = disk_policy.unwrap_or_default();
                 merge_seed_into(&mut p);
+                // Sanitize (2026-06-20): drop any NOISE pattern that shadows an
+                // interactive or safety-protected process. The teacher
+                // noise-classified `language_server` (the LSP) — a noise+
+                // interactive conflict that could throttle a protected process.
+                // Truncation-aware. Self-heals on every daemon start.
+                {
+                    let interactive: Vec<String> = p.interactive_patterns.to_vec();
+                    let lpm = apollo_engine::engine::decide_actions::learned_pattern_matches;
+                    let conflicts = |n: &String| -> bool {
+                        if apollo_engine::engine::safety::is_protected_name(n) {
+                            return true;
+                        }
+                        let nl = n.to_lowercase();
+                        interactive.iter().any(|ip| {
+                            let il = ip.to_lowercase();
+                            lpm(&nl, &il) || lpm(&il, &nl)
+                        })
+                    };
+                    let removed: Vec<String> =
+                        p.noise_patterns.iter().filter(|n| conflicts(n)).cloned().collect();
+                    if !removed.is_empty() {
+                        std::sync::Arc::make_mut(&mut p.noise_patterns)
+                            .retain(|n| !removed.contains(n));
+                        tracing::warn!(
+                            ?removed,
+                            "learned-policy sanitize: dropped noise patterns shadowing interactive/protected"
+                        );
+                    }
+                }
                 p
             };
 

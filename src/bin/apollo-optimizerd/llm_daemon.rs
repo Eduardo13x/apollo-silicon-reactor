@@ -678,11 +678,13 @@ pub fn llm_reactive_tick(
                     .iter()
                     .take(remaining.saturating_sub(added) as usize)
                 {
-                    // Skip if already protected or interactive — cannot downgrade.
+                    // Skip if already protected/interactive — cannot downgrade.
+                    // Truncation-aware interactive conflict (exact .contains
+                    // missed the LSP) + safety-protected names. [2026-06-20]
                     if !pg.learned_policy.noise_patterns.contains(p)
                         && !pattern_conflicts_with_protected(p)
                         && !pg.learned_policy.protected_patterns.contains(p)
-                        && !pg.learned_policy.interactive_patterns.contains(p)
+                        && !noise_pattern_conflicts(p, &pg.learned_policy.interactive_patterns)
                     {
                         std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns)
                             .push(p.clone());
@@ -882,6 +884,10 @@ pub fn usage_learning_tick(
                 "noise"
                     if !pg.learned_policy.noise_patterns.contains(pattern)
                         && !pattern_conflicts_with_protected(pattern)
+                        && !noise_pattern_conflicts(
+                            pattern,
+                            &pg.learned_policy.interactive_patterns,
+                        )
                     => {
                         std::sync::Arc::make_mut(&mut pg.learned_policy.noise_patterns).push(pattern.clone());
                         applied += 1;
@@ -956,6 +962,25 @@ fn learned_policy_boost_ttl_secs() -> u64 {
 /// P-core scheduling from the foreground app / a live call. [2026-06-18]
 fn boost_visibility_ok(pid: u32, fg_pid: Option<u32>, visible_pids: &HashSet<u32>) -> bool {
     Some(pid) == fg_pid || visible_pids.contains(&pid)
+}
+
+/// A teacher-suggested NOISE pattern conflicts (must be rejected) if it would
+/// shadow an interactive/protected process. The teacher does not know Apollo's
+/// protected set — 2026-06-20 it moved `language_server` (the LSP) to noise.
+/// The prior guard used exact `.contains()`, which missed `language_server` vs
+/// the stored interactive `language_server_macos_arm`. Reject if the pattern is
+/// a safety-protected name OR matches an existing interactive pattern
+/// (truncation-aware, both directions).
+fn noise_pattern_conflicts(pattern: &str, interactive: &[String]) -> bool {
+    if apollo_engine::engine::safety::is_protected_name(pattern) {
+        return true;
+    }
+    let pl = pattern.to_lowercase();
+    let lpm = apollo_engine::engine::decide_actions::learned_pattern_matches;
+    interactive.iter().any(|ip| {
+        let il = ip.to_lowercase();
+        lpm(&pl, &il) || lpm(&il, &pl)
+    })
 }
 
 fn should_emit_boost(pid: u32, ttl_secs: u64) -> bool {
@@ -1089,6 +1114,17 @@ pub fn apply_learned_policy_actions(
             // throttle a protected name or the Chromium family on a name match.
             && !apollo_engine::engine::safety::is_protected_name(&p.name)
             && !apollo_engine::engine::safety::is_chromium_family(&p.name)
+            // 2026-06-20: the teacher noise-classified `language_server` (the
+            // LSP) even though it is interactive — a name-match conflict the
+            // exact-contains add-guard missed. NEVER throttle a process that is
+            // also interactive-classified, regardless of how it got into noise.
+            // Truncation-aware (language_server vs language_server_macos_arm).
+            && !policy.interactive_patterns.iter().any(|ip| {
+                let nl = p.name.to_lowercase();
+                let il = ip.to_lowercase();
+                apollo_engine::engine::decide_actions::learned_pattern_matches(&nl, &il)
+                    || apollo_engine::engine::decide_actions::learned_pattern_matches(&il, &nl)
+            })
         {
             let (ss, su) = pid_start_time(p.pid);
             // Under survival mode, upgrade to aggressive throttle. Non-aggressive
@@ -1124,6 +1160,27 @@ mod tests {
     };
 
     const GB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn noise_add_rejects_interactive_and_protected() {
+        // The teacher noise-classified the LSP. A noise pattern that shadows an
+        // interactive entry (truncation-aware) or a protected name must be
+        // rejected — exact .contains() missed language_server vs the stored
+        // language_server_macos_arm.
+        let interactive = vec!["language_server_macos_arm".to_string(), "Brave".to_string()];
+        assert!(
+            noise_pattern_conflicts("language_server", &interactive),
+            "truncated LSP name must conflict with the full interactive pattern"
+        );
+        assert!(
+            noise_pattern_conflicts("WindowServer", &interactive),
+            "a safety-protected name must conflict"
+        );
+        assert!(
+            !noise_pattern_conflicts("GoogleUpdater", &interactive),
+            "a genuine noise process must NOT conflict"
+        );
+    }
 
     #[test]
     fn boost_only_foreground_or_visible() {
