@@ -23,13 +23,10 @@
 //! disproportionate UX cost; the rational policy is to defer non-survival
 //! optimization while the user is actively typing/clicking.
 //!
-//! NOTE: this module is **not** yet wired to any caller. The intended
-//! injection site is in `decide_actions.rs` cost composition (multiply the
-//! computed action cost by `1.0 / modulator` so non-survival actions become
-//! "more expensive" relative to the gate threshold during active work), or
-//! equivalently inside `daemon_cognitive_tick.rs::apply_specialist_voting`
-//! where specialist confidence is already being modulated by the Phase 3.1
-//! skill-aware factor. See `OPENS: 1` on the introducing commit.
+//! WIRED (2026-06-18 audit corrected a stale "not yet wired" note): the
+//! modulator is live via `user_presence_modulator_narrowed_no_counter` in
+//! `daemon_cognitive_tick.rs:469` and `:739`, modulating specialist voting.
+//! The HID-rate clause is the only part still pending a producer.
 
 use crate::engine::lse_counters::LSE_COUNTERS;
 

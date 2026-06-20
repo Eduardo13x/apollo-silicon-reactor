@@ -106,11 +106,12 @@ pub const HABITUATION_THRESHOLD: u32 = 5;
 /// `IDLE_MULTIPLIER` from `user_presence_modulator_narrowed_no_counter` and
 /// does not modulate votes. Subsequent cycles use real values.
 ///
-/// `hid_events_per_minute` currently always 0.0 — no daemon-side accessor
-/// exists yet (TODO 2026-05-16). The 0.0 value cannot trigger the
-/// HID-rate clause; the modulator still operates correctly off `idle_seconds`
-/// alone. When a future activity-sensor lands, this field will pick up the
-/// real rate automatically.
+/// This tick intentionally uses the `*_narrowed_no_counter` modulator variant,
+/// which operates off `idle_seconds` alone. The daemon-side accessor
+/// `user_context::hid_events_per_minute()` DOES exist (wired at main.rs:3285)
+/// — the prior "no accessor yet (TODO 2026-05-16)" note was stale (2026-06-18
+/// audit). When the HID-rate clause is adopted in this tick, feed that
+/// accessor into `hid_events_per_minute`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PresenceInputs {
     pub idle_seconds: f64,

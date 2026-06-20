@@ -1541,6 +1541,18 @@ pub struct RuntimeMetrics {
     pub mediator_noop_writes_total: u64,
     #[serde(default)]
     pub mediator_postcondition_violation_total: u64,
+    /// Per-action-kind dedup drops (2026-06-18 audit: was silent telemetry
+    /// death — producer `record_dedup_drops` fired live but the counters
+    /// never reached runtime_metrics.json). How many duplicate actions the
+    /// recently-applied cache suppressed before emit.
+    #[serde(default)]
+    pub dedup_drops_setmemorystatus: u64,
+    #[serde(default)]
+    pub dedup_drops_throttle: u64,
+    #[serde(default)]
+    pub dedup_drops_freeze: u64,
+    #[serde(default)]
+    pub dedup_drops_unfreeze: u64,
 
     /// Sprint 12 Convergence #4 (2026-05-17). Cumulative coincidence
     /// count: cycles in which the scorer override fired AND the causal
@@ -1942,6 +1954,27 @@ pub struct HealthReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Telemetry-death guard (2026-06-18 audit): the dedup_drops_* counters had
+    /// a live producer but no RuntimeMetrics field, so they never reached
+    /// runtime_metrics.json. Pin that the fields exist and survive serde — if a
+    /// future edit drops them, this fails instead of silently losing telemetry.
+    #[test]
+    fn dedup_drops_survive_serde_roundtrip() {
+        let m = RuntimeMetrics {
+            dedup_drops_setmemorystatus: 11,
+            dedup_drops_throttle: 22,
+            dedup_drops_freeze: 33,
+            dedup_drops_unfreeze: 44,
+            ..RuntimeMetrics::default()
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: RuntimeMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dedup_drops_setmemorystatus, 11);
+        assert_eq!(back.dedup_drops_throttle, 22);
+        assert_eq!(back.dedup_drops_freeze, 33);
+        assert_eq!(back.dedup_drops_unfreeze, 44);
+    }
 
     // ── OptimizationProfile roundtrip ─────────────────────────────────────────
 

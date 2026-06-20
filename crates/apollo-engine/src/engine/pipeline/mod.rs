@@ -113,13 +113,11 @@
 //!
 //! ### Stage 5 — PeriodicStage (`periodic_stage.rs`)
 //!
-//! **Status: DEFINED in `periodic_stage.rs`** but not yet wired to main loop.
-//!
-//! The `PeriodicContext` and `run_periodic()` function are defined. Main loop
-//! wiring is blocked by the same parameter-grouping pre-conditions:
-//! `outcome_tracker`, `signal_intel`, `specialist_accuracy`, and `skill_registry`
-//! are separate unrelated `mut` borrows that cannot be cleanly packed without
-//! a grouping struct.
+//! **Status: WIRED** (2026-06-18 audit corrected a stale "not yet wired" note).
+//! `run_periodic()` is called from `daemon_cycle_tail.rs:352`, fed by the
+//! `PeriodicStageInputs` grouping struct (main.rs:5677) — the very grouping
+//! struct the old note said was missing. `maybe_reload_llm_config` is also
+//! live at main.rs:5532.
 //!
 //! See `periodic_stage.rs` for the full interface.
 

@@ -821,6 +821,13 @@ fn freeze_non_critical(
         if bufs.is_essential(name) || bufs.is_protected(name) {
             continue;
         }
+        // Complete mediation (2026-06-18 audit): the local is_essential/is_protected
+        // lists drift out of sync with safety.rs — they omitted CVMServer, powerd,
+        // sharingd (sharingd has a 173×-freeze production scar). Defer to the single
+        // source of truth so no protected daemon can be SIGSTOP'd in a thermal spike.
+        if crate::engine::safety::is_protected_name(name) {
+            continue;
+        }
         // Behavioural app-bundle detection: any binary inside a .app bundle
         // is a user-facing application (or its helper). Skip it from thermal
         // freeze — the user's apps must not be paused by a temperature spike.
@@ -867,6 +874,11 @@ fn freeze_non_critical(
                 .unwrap_or(false); // process no longer exists → do not signal
             if !name_matches {
                 // PID recycled or process exited between snapshot and now.
+                continue;
+            }
+            // Re-check safety against the freshly verified name (names can change
+            // between snapshots) — central source of truth, not the local lists.
+            if crate::engine::safety::is_protected_name(expected_name) {
                 continue;
             }
             // Apple platform check: skip CS_PLATFORM_BINARY processes even in

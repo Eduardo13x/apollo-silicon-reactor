@@ -257,6 +257,12 @@ impl MetricsState {
         self.metrics.mediator_noop_writes_total = lf.mediator_noop_writes_total;
         self.metrics.mediator_postcondition_violation_total =
             lf.mediator_postcondition_violation_total;
+        // dedup drops (2026-06-18 audit: fix silent telemetry death — live
+        // producer record_dedup_drops, no RuntimeMetrics field, no sync).
+        self.metrics.dedup_drops_setmemorystatus = lf.dedup_drops_setmemorystatus;
+        self.metrics.dedup_drops_throttle = lf.dedup_drops_throttle;
+        self.metrics.dedup_drops_freeze = lf.dedup_drops_freeze;
+        self.metrics.dedup_drops_unfreeze = lf.dedup_drops_unfreeze;
 
         // Sprint follow-up (2026-06-05) — Silent-telemetry-death fix.
         // Mirror the five LSE counters added in this sprint into
