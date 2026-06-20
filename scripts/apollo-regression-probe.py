@@ -982,6 +982,10 @@ def main(argv):
 
     # Build + append the metrics row (the cycle-over-cycle history).
     metrics = build_metrics(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls)
+    # Record this run's finding codes so the NEXT run can detect persistence:
+    # a MED present across 2 consecutive runs is actionable (the loop escalates
+    # it), whereas a one-shot MED (e.g. pre-deploy residue) self-clears.
+    metrics["finding_codes"] = sorted({c for (_s, c, _d) in findings})
     try:
         with open(TREND, "a") as f:
             f.write(json.dumps(metrics) + "\n")
@@ -995,11 +999,21 @@ def main(argv):
         findings.insert(0, ("HIGH", "metrics-unreadable", rt["__error__"]))
         high = [f for f in findings if f[0] == "HIGH"]
 
+    # Persisted-actionable: a MED present in BOTH this run and the previous
+    # trend row (2 consecutive runs) — no longer transient, the loop escalates
+    # it. `trend[-1]` is the prior run; this run's row (appended above) is not
+    # in `trend`, which was read before the append.
+    prev_codes = set(trend[-1].get("finding_codes", [])) if trend else set()
+    persistent_med = sorted(
+        {c for (s, c, _d) in findings if s == "MED"} & prev_codes
+    )
+
     # --json: structured output for the fix-loop (Layer 2) to consume.
     if as_json:
         print(json.dumps({
             "timestamp": ts,
             "findings": [{"severity": s, "code": c, "detail": d} for s, c, d in findings],
+            "persistent_med": persistent_med,
             "metrics": metrics,
         }, indent=1))
         return 2 if high else (1 if findings else 0)
@@ -1021,11 +1035,15 @@ def main(argv):
     except Exception:
         pass
 
-    # HIGH raises the flag; clean (no HIGH) clears it.
+    # Flag wakes the Layer-2 Monitor → fix-loop. Raise on HIGH (immediate) OR
+    # on a MED that persisted 2 runs (event-driven escalation ~30min vs the
+    # hourly heartbeat). Clear only when neither is present. The flag is the
+    # single cross-process signal; the tier line tells the woken agent which.
     try:
-        if high:
+        if high or persistent_med:
+            tier = "HIGH" if high else "PERSISTENT-MED"
             with open(FLAG, "w") as f:
-                f.write(line)
+                f.write("[{}] {}\n{}".format(tier, ts, line))
         elif os.path.exists(FLAG):
             os.remove(FLAG)
     except Exception:
