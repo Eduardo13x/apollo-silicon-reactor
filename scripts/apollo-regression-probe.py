@@ -346,6 +346,27 @@ def detect_purge_strangled(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctl
     total = skipped + purged
     skip_ratio = skipped / total if total > 0 else 0.0
 
+    # Scarcity discrimination (scar 533bad6 + accept-gate H4, 2026-06-20):
+    # purge-strangulation is only REAL when memory is genuinely scarce — purge
+    # SHOULD be firing but is suppressed. When pressure is low AND swap is flat,
+    # suppressed-purge is CORRECT (EMERGENCY_PURGE_PRESSURE_FLOOR=0.70 means
+    # Apollo rightly does not purge below ~0.70) and high thrashing is benign
+    # Brave page-cache churn, NOT strangulation. Without this gate the detector
+    # false-fired persistently (diagnosed by the loop 2026-06-20: thrash 42k at
+    # pressure 0.57, swap_delta_bps 0 — benign — escalated as PERSISTENT-MED).
+    pressure = rt.get("memory_pressure", 0.0)
+    if not isinstance(pressure, (int, float)):
+        pressure = 0.0
+    swap_delta = rt.get("swap_delta_bps", 0.0)
+    if not isinstance(swap_delta, (int, float)):
+        swap_delta = 0.0
+    p_oom = rt.get("si_p_oom_30s", 0.0)
+    if not isinstance(p_oom, (int, float)):
+        p_oom = 0.0
+    scarcity = pressure >= 0.65 or swap_delta > 0.0 or p_oom >= 0.80
+    if not scarcity:
+        return findings  # benign churn: purge correctly suppressed, not strangled
+
     thrash_crisis = thrash >= 50_000.0
     thrash_elevated = thrash >= 30_000.0  # approaching crisis
     ratio_strangled = skip_ratio > 0.9
