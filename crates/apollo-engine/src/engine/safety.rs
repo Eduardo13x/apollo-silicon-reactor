@@ -1982,6 +1982,27 @@ mod tests {
 
     /// Tier 3: Dev runtime patterns must be protected (compiler toolchain bypass fix).
     #[test]
+    fn zombie_demote_guard_contract_is_protected_name_not_hard_only() {
+        // 2026-06-20: the zombie-hunter jetsam-demote guard was broadened from
+        // hard_protected_contains to is_protected_name after the regression
+        // probe caught `node` nominated 3x. Pin the two tiers the hard-only
+        // check missed: dev-runtime (node) and infra (docker). Both MUST be
+        // is_protected_name=true but are NOT in the hard-protected set.
+        assert!(
+            is_protected_name("node"),
+            "dev-runtime node must be protected"
+        );
+        assert!(
+            is_protected_name("com.docker.backend"),
+            "infra (docker) must be protected by is_protected_name"
+        );
+        assert!(
+            !hard_protected_contains("node"),
+            "node is NOT hard-protected — proves the old guard let it through"
+        );
+    }
+
+    #[test]
     fn is_protected_name_covers_dev_runtimes() {
         // Bug 3 / Bypass class 3: rustc and clippy-driver were frozen because the
         // freeze guard only checked INTERACTIVE_APPS, not dev_runtime_patterns.

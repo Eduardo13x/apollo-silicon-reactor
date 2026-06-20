@@ -439,8 +439,12 @@ fn main() -> anyhow::Result<()> {
                             lpm(&nl, &il) || lpm(&il, &nl)
                         })
                     };
-                    let removed: Vec<String> =
-                        p.noise_patterns.iter().filter(|n| conflicts(n)).cloned().collect();
+                    let removed: Vec<String> = p
+                        .noise_patterns
+                        .iter()
+                        .filter(|n| conflicts(n))
+                        .cloned()
+                        .collect();
                     if !removed.is_empty() {
                         std::sync::Arc::make_mut(&mut p.noise_patterns)
                             .retain(|n| !removed.contains(n));
@@ -4079,7 +4083,13 @@ fn main() -> anyhow::Result<()> {
                         let mut zombie_actions: Vec<RootAction> = Vec::new();
                         for dw in &dead_weight {
                             lf_metrics.inc_zombie_dead_weight_detected();
-                            if apollo_engine::engine::safety::hard_protected_contains(&dw.name) {
+                            // 2026-06-20 (regression probe caught live: node
+                            // nominated 3x): hard_protected_contains only covers
+                            // the hard list — a dev-runtime (node/rustc) or infra
+                            // (docker/postgres) zombie slipped through and got
+                            // jetsam-demoted. is_protected_name covers all three
+                            // tiers. Additive — only adds protection.
+                            if apollo_engine::engine::safety::is_protected_name(&dw.name) {
                                 continue;
                             }
                             use apollo_engine::engine::zombie_hunter::ZombieClass;

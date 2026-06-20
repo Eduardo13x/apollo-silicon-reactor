@@ -347,11 +347,11 @@ def detect_purge_strangled(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctl
     skip_ratio = skipped / total if total > 0 else 0.0
 
     thrash_crisis = thrash >= 50_000.0
+    thrash_elevated = thrash >= 30_000.0  # approaching crisis
     ratio_strangled = skip_ratio > 0.9
     count_sustained = skipped > 1_000
-    conditions_met = sum([thrash_crisis, ratio_strangled, count_sustained])
 
-    if conditions_met == 3:
+    if thrash_crisis and ratio_strangled and count_sustained:
         findings.append((
             "HIGH", "purge-strangled",
             "thrashing_score={:.0f} (crisis) AND purge suppressed {}/{} "
@@ -359,19 +359,22 @@ def detect_purge_strangled(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctl
             "check feedback_suppression_survival_first gate and "
             "is_high_bw_workload_active false-negative (2026-06-15 shape)".format(
                 thrash, skipped, total, skip_ratio, skipped)))
-    elif conditions_met == 2:
-        sig = []
-        if thrash_crisis:
-            sig.append("thrashing={:.0f}".format(thrash))
+    elif thrash_elevated and (ratio_strangled or count_sustained):
+        # Thrashing is MANDATORY for the partial: high skip + LOW thrashing is
+        # benign idle (nothing to purge), not strangulation. Diagnosed
+        # 2026-06-20 by the loop — skip 99.9% at thrashing=172 was healthy and
+        # over-fired here. Now the partial requires thrashing genuinely climbing
+        # (>=30k) WHILE relief is suppressed — the real pre-regression drift.
+        sig = ["thrashing={:.0f}".format(thrash)]
         if ratio_strangled:
             sig.append("skip_ratio={:.1%}".format(skip_ratio))
         if count_sustained:
             sig.append("sustained_skips={}".format(skipped))
         findings.append((
             "MED", "purge-strangled-partial",
-            "two of three purge-strangled signals present: {} — monitor for "
-            "escalation; one signal drifting may precede the full regression".format(
-                ", ".join(sig))))
+            "thrashing climbing ({:.0f}) WHILE relief suppressed: {} — monitor; "
+            "may precede the full strangulation regression".format(
+                thrash, ", ".join(sig))))
     return findings
 
 
