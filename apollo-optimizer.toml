@@ -9,12 +9,18 @@
 # MLX corre en la GPU (Metal) y libera la CPU; el llama-server previo corría
 # CPU-only (--n-gpu-layers 0). Modelo QAT-4bit oficial de Google: mejor
 # calidad a 4bit que el Q4_K_M genérico anterior.
-enabled    = true
+# DISABLED 2026-06-20: the teacher did not earn its keep — measured outcomes
+# within noise (best delta ~-0.003), one real regression (+0.346 aggressive-
+# root), only ~6% of actions, and it imposed a "defend against its mistakes"
+# tax (boost-loop, noise-shadow guards). Net wash-with-overhead. Apollo's S1
+# heuristics drive 94% of behavior. Flip back to true (+ re-bootstrap the
+# com.eduardocortez.gemma4 MLX LaunchAgent) to re-run as a measured experiment.
+enabled    = false
 endpoint   = "http://127.0.0.1:8080/v1/chat/completions"
 model      = "mlx-community/gemma-4-E2B-it-qat-4bit"
 
 # Sin gate de training TTL — Gemma 4 es local, sin costo por llamada.
-always_on  = true
+always_on  = false
 
 # Modelo de razonamiento: emite thinking en `reasoning` y el JSON en `content`
 # (a veces en fence ```json). El parser extrae el primer objeto {…} de
