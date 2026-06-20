@@ -949,6 +949,15 @@ fn learned_policy_boost_ttl_secs() -> u64 {
     120
 }
 
+/// A boost may only target a process the user is actually using: the
+/// foreground app or one with a visible window. Blocks headless background
+/// processes (e.g. a `node` dev server matching the bare "node" interactive
+/// pattern) from being boosted on a name match alone — boosting them steals
+/// P-core scheduling from the foreground app / a live call. [2026-06-18]
+fn boost_visibility_ok(pid: u32, fg_pid: Option<u32>, visible_pids: &HashSet<u32>) -> bool {
+    Some(pid) == fg_pid || visible_pids.contains(&pid)
+}
+
 fn should_emit_boost(pid: u32, ttl_secs: u64) -> bool {
     let now = std::time::Instant::now();
     let ttl = std::time::Duration::from_secs(ttl_secs);
@@ -1012,6 +1021,29 @@ pub fn apply_learned_policy_actions(
         snapshot.pressure.swap_total_bytes,
     );
 
+    // ROOT FIX (2026-06-18 node boost-loop): a BOOST raises QoS to make the app
+    // the user is actually using snappier. Firing it on a NAME match alone
+    // boosts headless background processes — a `node` dev server matching the
+    // bare "node" interactive pattern got boosted 54×, stealing P-core
+    // scheduling from Meet's video (microstutter). Same class as Brave-0607.
+    // Gate on real foreground / visible-window state: only the foreground app
+    // or a process with a visible window may be boosted. The visible-pid
+    // syscall (~1-3ms) is computed only when an interactive-name candidate
+    // actually exists, so most cycles pay nothing.
+    let fg_pid = apollo_engine::engine::shadow_signals::get_foreground_pid();
+    let any_interactive_candidate = snapshot.top_processes.iter().any(|p| {
+        !seen.contains(&(p.pid, "boost"))
+            && policy
+                .interactive_patterns
+                .iter()
+                .any(|pat| p.name.contains(pat))
+    });
+    let visible_pids = if any_interactive_candidate {
+        apollo_engine::engine::cg_window::visible_pids()
+    } else {
+        HashSet::new()
+    };
+
     for p in &snapshot.top_processes {
         if policy
             .interactive_patterns
@@ -1019,6 +1051,7 @@ pub fn apply_learned_policy_actions(
             .any(|pat| p.name.contains(pat))
             && !seen.contains(&(p.pid, "boost"))
             && !survival
+            && boost_visibility_ok(p.pid, fg_pid, &visible_pids)
             && should_emit_boost(p.pid, learned_policy_boost_ttl_secs())
         {
             // Round-4 hotfix (2026-06-07): the FIX-1 guard at
@@ -1049,6 +1082,13 @@ pub fn apply_learned_policy_actions(
         }
         if policy.noise_patterns.iter().any(|pat| p.name.contains(pat))
             && !seen.contains(&(p.pid, "throttle"))
+            // Complete mediation (2026-06-18 bug-class sweep): a noise pattern
+            // can match a protected/Apple/dev process or a Chromium helper. The
+            // survival-mode upgrade makes this an AGGRESSIVE throttle (SIGSTOP
+            // pulses) — on Chromium that breaks Brave's IPC contract. Never
+            // throttle a protected name or the Chromium family on a name match.
+            && !apollo_engine::engine::safety::is_protected_name(&p.name)
+            && !apollo_engine::engine::safety::is_chromium_family(&p.name)
         {
             let (ss, su) = pid_start_time(p.pid);
             // Under survival mode, upgrade to aggressive throttle. Non-aggressive
@@ -1084,6 +1124,20 @@ mod tests {
     };
 
     const GB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn boost_only_foreground_or_visible() {
+        let mut visible = HashSet::new();
+        visible.insert(42u32); // a process with a visible window
+                               // Foreground app → boostable.
+        assert!(boost_visibility_ok(7, Some(7), &visible));
+        // Visible window → boostable.
+        assert!(boost_visibility_ok(42, Some(7), &visible));
+        // Headless background (e.g. a node dev server): not foreground, no
+        // window → MUST NOT be boosted on a name match alone.
+        assert!(!boost_visibility_ok(999, Some(7), &visible));
+        assert!(!boost_visibility_ok(999, None, &HashSet::new()));
+    }
 
     /// The teacher must actually run during the normal 4-5 GB swap this 8 GB box
     /// idles at (the 2 GB ceiling left it skipped permanently); it should bail

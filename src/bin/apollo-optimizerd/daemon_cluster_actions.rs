@@ -68,6 +68,14 @@ pub fn run_cluster_actions(
             let partner = if a_acted { pa } else { pb };
             for (pid, proc) in collector.system().processes() {
                 let proc_name = proc.name().to_string();
+                // Complete mediation (2026-06-18 bug-class sweep): this path
+                // threw a coordinated throttle on a NAME match with no
+                // protection check — a causal partner pattern matching an
+                // Apple/system/dev-runtime process (e.g. "node") would be
+                // throttled blind. Honor safety.rs before emitting.
+                if apollo_engine::engine::safety::is_protected_name(&proc_name) {
+                    continue;
+                }
                 if proc_name.contains(missing) && !actioned.iter().any(|n| n.contains(missing)) {
                     new_actions.push(RootAction::throttle(
                         pid.as_u32(),
