@@ -3779,7 +3779,12 @@ fn main() -> anyhow::Result<()> {
                 };
                 let initial_filtered = {
                     let policy = state.policy.lock_recover().learned_policy.clone();
-                    llm_daemon::apply_learned_policy_actions(&snapshot, &policy, initial_filtered)
+                    llm_daemon::apply_learned_policy_actions(
+                        &snapshot,
+                        &policy,
+                        initial_filtered,
+                        foreground_app.as_deref(),
+                    )
                 };
                 let mut acc = ActionAccumulator::with_capacity(initial_filtered.len() + 16);
                 acc.extend_raw(

@@ -960,8 +960,28 @@ fn learned_policy_boost_ttl_secs() -> u64 {
 /// processes (e.g. a `node` dev server matching the bare "node" interactive
 /// pattern) from being boosted on a name match alone — boosting them steals
 /// P-core scheduling from the foreground app / a live call. [2026-06-18]
-fn boost_visibility_ok(pid: u32, fg_pid: Option<u32>, visible_pids: &HashSet<u32>) -> bool {
-    Some(pid) == fg_pid || visible_pids.contains(&pid)
+///
+/// 2026-06-21 — yield to frontmost media: when the FRONTMOST app is actively
+/// playing media (`frontmost_media_active`), a visible-but-NOT-frontmost
+/// candidate is refused. A boost marks the target TASK_FOREGROUND_APPLICATION +
+/// QOS_TIER_0 + nice -10, lying to CLPC about P-core contention; doing that to a
+/// background-but-visible terminal steals compositing timeshare from the
+/// frontmost 4K app → occasional frame drop (node-54x class). The frontmost app
+/// itself is ALWAYS boostable (never yields). Survival bypasses this entirely
+/// (the caller gates on `!survival` before this). Subtractive — only ever adds a
+/// skip; over-yielding merely leaves a non-frontmost app at its correct default
+/// QoS.
+fn boost_visibility_ok(
+    pid: u32,
+    fg_pid: Option<u32>,
+    visible_pids: &HashSet<u32>,
+    frontmost_media_active: bool,
+) -> bool {
+    if Some(pid) == fg_pid {
+        return true; // the frontmost app is always boostable — never yields
+    }
+    // visible-but-not-frontmost: yield to the frontmost media app
+    visible_pids.contains(&pid) && !frontmost_media_active
 }
 
 /// A teacher-suggested NOISE pattern conflicts (must be rejected) if it would
@@ -1004,6 +1024,10 @@ pub fn apply_learned_policy_actions(
     snapshot: &apollo_engine::collector::SystemSnapshot,
     policy: &LearnedPolicy,
     mut actions: Vec<RootAction>,
+    // 2026-06-21: frontmost app NAME, for the boost yield-to-media gate. The
+    // frontmost PID arrives via shadow_signals; the name is only known to the
+    // caller (main.rs foreground_app). None = unknown → never yields (safe).
+    foreground_app: Option<&str>,
 ) -> Vec<RootAction> {
     // Filter: never act on protected patterns (case-insensitive).
     if !policy.protected_patterns.is_empty() {
@@ -1068,6 +1092,16 @@ pub fn apply_learned_policy_actions(
     } else {
         HashSet::new()
     };
+    // 2026-06-21 — yield-to-frontmost-media: true iff the frontmost app is a
+    // media host (browser/player, NOT chat/call) AND audio is live now. Only
+    // then do visible-but-not-frontmost boosts yield. Computed once/cycle,
+    // gated on a candidate existing so quiet cycles pay nothing. is_audio*
+    // is ~50µs and fail-false. None foreground name → false (never yields).
+    let frontmost_media_active = any_interactive_candidate
+        && foreground_app
+            .map(apollo_engine::engine::window_sensor::is_media_host)
+            .unwrap_or(false)
+        && apollo_engine::engine::coreaudio_active::is_audio_running_somewhere();
 
     for p in &snapshot.top_processes {
         if policy
@@ -1076,7 +1110,7 @@ pub fn apply_learned_policy_actions(
             .any(|pat| p.name.contains(pat))
             && !seen.contains(&(p.pid, "boost"))
             && !survival
-            && boost_visibility_ok(p.pid, fg_pid, &visible_pids)
+            && boost_visibility_ok(p.pid, fg_pid, &visible_pids, frontmost_media_active)
             && should_emit_boost(p.pid, learned_policy_boost_ttl_secs())
         {
             // Round-4 hotfix (2026-06-07): the FIX-1 guard at
@@ -1186,14 +1220,66 @@ mod tests {
     fn boost_only_foreground_or_visible() {
         let mut visible = HashSet::new();
         visible.insert(42u32); // a process with a visible window
-                               // Foreground app → boostable.
-        assert!(boost_visibility_ok(7, Some(7), &visible));
+        let no_media = false; // frontmost is not an active media host
+                              // Foreground app → boostable.
+        assert!(boost_visibility_ok(7, Some(7), &visible, no_media));
         // Visible window → boostable.
-        assert!(boost_visibility_ok(42, Some(7), &visible));
+        assert!(boost_visibility_ok(42, Some(7), &visible, no_media));
         // Headless background (e.g. a node dev server): not foreground, no
         // window → MUST NOT be boosted on a name match alone.
-        assert!(!boost_visibility_ok(999, Some(7), &visible));
-        assert!(!boost_visibility_ok(999, None, &HashSet::new()));
+        assert!(!boost_visibility_ok(999, Some(7), &visible, no_media));
+        assert!(!boost_visibility_ok(999, None, &HashSet::new(), no_media));
+    }
+
+    #[test]
+    fn boost_yields_to_frontmost_media() {
+        // 2026-06-21: a visible-but-NOT-frontmost interactive process (e.g. a
+        // terminal at pid 42) must YIELD its boost while the FRONTMOST app is an
+        // active media host (Brave playing 4K) — the boost would steal P-core
+        // compositing timeshare → occasional frame drop (node-54x class).
+        let mut visible = HashSet::new();
+        visible.insert(42u32); // the visible-but-background terminal
+        let fg = Some(7u32); // frontmost app is pid 7 (the browser)
+
+        // media active in the frontmost app:
+        // (a) the FRONTMOST app itself is ALWAYS boostable — never yields.
+        assert!(
+            boost_visibility_ok(7, fg, &visible, true),
+            "frontmost app must always be boostable, even during its own media"
+        );
+        // (b) the visible-but-not-frontmost terminal YIELDS.
+        assert!(
+            !boost_visibility_ok(42, fg, &visible, true),
+            "visible non-frontmost boost must yield to the frontmost media app"
+        );
+
+        // media NOT active (or frontmost is not a media host) → unchanged:
+        // (c) the same terminal is boosted as before.
+        assert!(
+            boost_visibility_ok(42, fg, &visible, false),
+            "without frontmost media, a visible process is boosted as before"
+        );
+    }
+
+    #[test]
+    fn is_media_host_matches_players_not_chat() {
+        use apollo_engine::engine::window_sensor::is_media_host;
+        // Browsers + dedicated players → media hosts (yield).
+        assert!(is_media_host("Brave Browser"));
+        assert!(is_media_host("Google Chrome"));
+        assert!(is_media_host("Safari"));
+        assert!(is_media_host("Spotify"));
+        assert!(is_media_host("VLC"));
+        assert!(is_media_host("IINA"));
+        // Chat/call apps → NOT media hosts (a Slack ping must not starve the
+        // terminal; calls are handled by is_realtime_call_active).
+        assert!(!is_media_host("Slack"));
+        assert!(!is_media_host("Discord"));
+        assert!(!is_media_host("zoom.us"));
+        assert!(!is_media_host("Microsoft Teams"));
+        // A terminal/editor → not a media host.
+        assert!(!is_media_host("alacritty"));
+        assert!(!is_media_host("Code"));
     }
 
     /// The teacher must actually run during the normal 4-5 GB swap this 8 GB box
@@ -1301,7 +1387,7 @@ mod tests {
             start_sec: 0,
             start_usec: 0,
         }];
-        let result = apply_learned_policy_actions(&snap, &policy(&[], &[], &[]), actions);
+        let result = apply_learned_policy_actions(&snap, &policy(&[], &[], &[]), actions, None);
         assert_eq!(result.len(), 1);
     }
 
@@ -1316,7 +1402,8 @@ mod tests {
             start_usec: 0,
             decision_reason: DecisionReason::PressureContext,
         }];
-        let result = apply_learned_policy_actions(&snap, &policy(&[], &[], &["claude"]), actions);
+        let result =
+            apply_learned_policy_actions(&snap, &policy(&[], &[], &["claude"]), actions, None);
         assert!(result.is_empty(), "claude must be protected");
     }
 
@@ -1331,14 +1418,15 @@ mod tests {
             start_usec: 0,
             decision_reason: DecisionReason::PressureContext,
         }];
-        let result = apply_learned_policy_actions(&snap, &policy(&[], &[], &["claude"]), actions);
+        let result =
+            apply_learned_policy_actions(&snap, &policy(&[], &[], &["claude"]), actions, None);
         assert_eq!(result.len(), 1);
     }
 
     #[test]
     fn apply_interactive_pattern_adds_boost() {
         let snap = snapshot_with(vec![proc(42, "Xcode", 20.0)]);
-        let result = apply_learned_policy_actions(&snap, &policy(&["Xcode"], &[], &[]), vec![]);
+        let result = apply_learned_policy_actions(&snap, &policy(&["Xcode"], &[], &[]), vec![], None);
         assert_eq!(result.len(), 1);
         match &result[0] {
             RootAction::BoostProcess { pid, name, .. } => {
@@ -1360,7 +1448,8 @@ mod tests {
             start_sec: 0,
             start_usec: 0,
         }];
-        let result = apply_learned_policy_actions(&snap, &policy(&["Xcode"], &[], &[]), existing);
+        let result =
+            apply_learned_policy_actions(&snap, &policy(&["Xcode"], &[], &[]), existing, None);
         let boosts = result
             .iter()
             .filter(|a| matches!(a, RootAction::BoostProcess { .. }))

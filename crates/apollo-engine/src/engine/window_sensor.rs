@@ -86,6 +86,32 @@ const MEDIA_PATTERNS: &[&str] = &[
     "Podcasts",
 ];
 
+/// Browsers that host high-quality video playback (4K in a tab). Listed
+/// explicitly and NOT via `HEAVY_APP_PATTERNS` — that list mixes in chat/call
+/// apps (Slack/Discord/Zoom/Teams) which must NEVER trigger a media yield
+/// (a chat notification ping would otherwise starve the user's terminal; calls
+/// are already handled by `is_realtime_call_active`).
+const MEDIA_BROWSER_HOSTS: &[&str] = &[
+    "Brave Browser",
+    "Google Chrome",
+    "Firefox",
+    "Safari",
+    "Arc",
+];
+
+/// True iff `name` is a frontmost-app media host (a browser that plays 4K in a
+/// tab, or a dedicated media player). Used by the boost path: a boost on a
+/// visible-but-not-frontmost interactive process (e.g. a terminal) steals
+/// P-core timeshare from the frontmost media host's compositing/present path →
+/// occasional 4K frame drop (node-54x class, 4ae0f27). When the frontmost app
+/// is a media host with audio live, such non-frontmost boosts YIELD.
+/// Deliberately EXCLUDES chat/call apps — conflating them re-opens a different
+/// scar (those are call-gated, not playback-gated).
+pub fn is_media_host(name: &str) -> bool {
+    MEDIA_BROWSER_HOSTS.iter().any(|h| name.contains(h))
+        || MEDIA_PATTERNS.iter().any(|m| name.contains(m))
+}
+
 /// EMA alpha for tab_velocity smoothing. α=0.3 → ~3-cycle memory.
 const TAB_VELOCITY_ALPHA: f64 = 0.3;
 
