@@ -212,9 +212,21 @@ pub fn run_neurocognitive_tick(
         .first()
         .map(|e| (e.avg_delta.abs() / 0.10).clamp(0.0, 1.0) * causal_debias)
         .unwrap_or(0.0);
-    let observed_drop = lctx.outcome_tracker.pressure_velocity_short();
-    let actual_residual = lctx.outcome_tracker.causal_effect(observed_drop);
-    let causal_actual_delta_norm = ((actual_residual.abs() / 0.10).clamp(0.0, 1.0)) as f32;
+    // Calibration consistency fix (2026-06-20, R2): the "actual" must measure
+    // the realized post-action net on the SAME population/estimator as predicted
+    // (avg_delta), not the no-action drift residual. The old
+    // `causal_effect(pressure_velocity_short())` read a quantity that is zeroed
+    // on acted cycles (outcome_tracker.rs:1275) → it never observed any
+    // post-action outcome → the debias was pinned at floor 0.25 (phantom ~16x
+    // over-promise). Same /0.10 normalization + .abs() + clamp as the predicted
+    // side (line ~213) so the ratio is a unit-free magnitude calibration.
+    // Cold-start (<10 obs) → 0.0, identical to the old residual's cold behavior;
+    // the readiness gate below already requires predicted>0 to observe.
+    let causal_actual_delta_norm = lctx
+        .causal_graph
+        .realized_net_delta_ema(10)
+        .map(|net| (net.abs() / 0.10).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
     let causal_observation_ready =
         lctx.outcome_tracker.total_resolved >= 10 && causal_predicted_delta_norm > 0.0;
     let cog_inputs = CognitiveTickInputs {

@@ -347,6 +347,21 @@ pub struct CausalGraph {
     /// this into per-kind counts so dashboards can answer "how many of
     /// our recent attributions are confounded?".
     recent_external_taints: std::collections::VecDeque<ExternalEventKind>,
+    /// Calibration-only (2026-06-20): signed EMA of the realized post-action
+    /// net pressure delta `(delta - drift_fast)` for resolved fast-horizon
+    /// edges — the SAME population/estimator that feeds `avg_delta`, but NOT
+    /// rectified to ≥0. This is the honest "actual" for MetaCognition's debias.
+    /// The old actual (`causal_effect(pressure_velocity_short())`) measured
+    /// NO-ACTION drift residual (`pressure_velocity_short` is zeroed on acted
+    /// cycles, outcome_tracker.rs:1275) → comparing it to `avg_delta` was
+    /// apples-to-oranges → the debias pinned at floor 0.25 / phantom ~16x
+    /// over-promise. Read ONLY by `realized_net_delta_ema()` → the neuro-tick
+    /// actual side. NEVER feeds avg_delta, impact_score, world_model.imagine,
+    /// or any freeze/throttle gate. Runtime-only (CausalGraph is not serde —
+    /// edges persist via learned_state); re-warms in ~tens of action cycles.
+    realized_net_delta_ema: f32,
+    /// Observation count for the calibration accumulator (gates cold-start).
+    realized_net_obs: u32,
 }
 
 const EFFECT_PRESSURE_DROP: &str = "pressure_drop";
@@ -370,7 +385,18 @@ impl CausalGraph {
             evictions_total: 0,
             external_events: Vec::new(),
             recent_external_taints: std::collections::VecDeque::new(),
+            realized_net_delta_ema: 0.0,
+            realized_net_obs: 0,
         }
+    }
+
+    /// Calibration-only: signed EMA of realized post-action net pressure delta,
+    /// gated on `min_obs` so cold-start noise does not poison the debias actual.
+    /// Read by daemon_neuro_tick as the "actual" for MetaCognition's CausalGraph
+    /// debias — the matched estimator/population for `avg_delta`'s "predicted".
+    /// Returns `None` until warm. NEVER feeds a decision path.
+    pub fn realized_net_delta_ema(&self, min_obs: u32) -> Option<f32> {
+        (self.realized_net_obs >= min_obs).then_some(self.realized_net_delta_ema)
     }
 
     /// Phase 4.2 — Record an external systemic event (thermal throttle,
@@ -584,6 +610,21 @@ impl CausalGraph {
                     MIN_DELTA
                 };
                 let was_effective = delta >= effective_min_delta;
+
+                // Calibration mirror (2026-06-20, R2 fix): record the SIGNED net
+                // `(delta - drift_fast)` on the SAME (action) population that
+                // feeds `avg_delta`, so MetaCognition's debias compares like with
+                // like. Rectification stays on `avg_delta` (decisions, line ~620);
+                // the signed net is the honest realized outcome for calibration
+                // only. Placed before the `self.edges` borrow below to avoid a
+                // borrow conflict; reads only locals `delta`/`drift_fast`.
+                {
+                    const NET_ALPHA: f32 = 0.15; // matches the avg_delta EMA weight
+                    let net = delta - drift_fast; // signed: <0 means pressure rose
+                    self.realized_net_delta_ema =
+                        self.realized_net_delta_ema * (1.0 - NET_ALPHA) + net * NET_ALPHA;
+                    self.realized_net_obs = self.realized_net_obs.saturating_add(1);
+                }
 
                 let (effect, anti_effect) = if was_effective {
                     (EFFECT_PRESSURE_DROP, EFFECT_PRESSURE_UNCHANGED)
@@ -1407,6 +1448,57 @@ mod tests {
             (d - 0.10).abs() < 0.01,
             "drift=0 must converge to raw 0.10, got {}",
             d
+        );
+    }
+
+    /// R2 calibration fix (2026-06-20): the signed-net accumulator — the honest
+    /// "actual" for MetaCognition's CausalGraph debias — must track the SIGNED
+    /// mean of post-action net deltas, NOT the rectified `avg_delta` that feeds
+    /// decisions. Feed a symmetric +0.1/-0.1 stream: the action does nothing net
+    /// (signed mean ~0), but `avg_delta` is E[max(0,net)] (~+0.1 on the drop
+    /// edge). The OLD debias compared this rectified predicted against a
+    /// no-action drift residual (~0) → ratio ~0.06 → pinned at the 0.25 floor.
+    /// This proves the calibration mirror sees the signed truth on the matched
+    /// population (fails before the fix: the field/accessor did not exist).
+    #[test]
+    fn realized_net_calibration_tracks_signed_mean_not_rectified() {
+        let mut g = CausalGraph::new();
+        let mut cycle = 0u64;
+        for i in 0..400 {
+            let net = if i % 2 == 0 { 0.1_f32 } else { -0.1_f32 };
+            let p_action = 0.50_f32;
+            let p_after = p_action - net; // delta = p_action - p_after = net
+            g.record_action("FreezeProcess:test", p_action, cycle);
+            cycle += 3; // == eval_delay (fast horizon)
+            g.evaluate_with_resources(p_after, cycle, &ResourceSnapshot::default(), 0.0, 0.0);
+            cycle += 1;
+        }
+        // (b) THE FIX: calibration accumulator = signed mean ~0 (no net effect).
+        let net_ema = g
+            .realized_net_delta_ema(10)
+            .expect("warm after 400 action observations");
+        assert!(
+            net_ema.abs() < 0.03,
+            "signed net EMA should converge to ~0.0 (action does nothing net), got {}",
+            net_ema
+        );
+        // (a) the decision-feeding avg_delta on the drop edge stays RECTIFIED-
+        //     positive — the fix does NOT touch it.
+        let rectified = g
+            .get_edge("FreezeProcess:test", EFFECT_PRESSURE_DROP)
+            .expect("drop edge exists")
+            .avg_delta;
+        assert!(
+            rectified > 0.03,
+            "rectified avg_delta should be positive E[max(0,net)], got {}",
+            rectified
+        );
+        // (c) the gap rectified − signed is the phantom over-promise the OLD
+        //     comparison mis-attributed to a no-action ~0 residual.
+        assert!(
+            rectified - net_ema > 0.03,
+            "rectified avg_delta must exceed signed net by the rectification bias, gap {}",
+            rectified - net_ema
         );
     }
 
