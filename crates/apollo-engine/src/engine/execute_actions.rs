@@ -1080,6 +1080,14 @@ pub fn execute_actions(
                                     || critical_bg
                                         .iter()
                                         .any(|c| nl.contains(&c.to_ascii_lowercase()))
+                                    // 2026-06-21 (P2, playback-easing Wave 1):
+                                    // complete-mediation chokepoint — never send
+                                    // memorystatus pressure to a Chromium/Brave
+                                    // helper. A live 4K renderer dropping caches
+                                    // mid-decode = frame drop. Last line of
+                                    // defense; do not trust the upstream nominate
+                                    // guard (03472d7/a98b33a rule).
+                                    || crate::engine::safety::is_chromium_family(&name)
                             })
                             .unwrap_or(false);
                         if !is_protected {

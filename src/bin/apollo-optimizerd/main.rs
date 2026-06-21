@@ -4089,7 +4089,16 @@ fn main() -> anyhow::Result<()> {
                             // (docker/postgres) zombie slipped through and got
                             // jetsam-demoted. is_protected_name covers all three
                             // tiers. Additive — only adds protection.
-                            if apollo_engine::engine::safety::is_protected_name(&dw.name) {
+                            // 2026-06-21 (P1, playback-easing Wave 1): also never
+                            // nominate Chromium/Brave helpers — a live 4K renderer
+                            // helper has no window of its own so it looks like an
+                            // "idle MemoryHoarder", but demoting it under jetsam
+                            // during playback = frame drop. is_chromium_family
+                            // matches "Brave Browser Helper*". Was firing 974x
+                            // (always failing) on a live renderer — additive.
+                            if apollo_engine::engine::safety::is_protected_name(&dw.name)
+                                || apollo_engine::engine::safety::is_chromium_family(&dw.name)
+                            {
                                 continue;
                             }
                             use apollo_engine::engine::zombie_hunter::ZombieClass;

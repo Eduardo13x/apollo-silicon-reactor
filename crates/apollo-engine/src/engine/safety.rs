@@ -58,6 +58,9 @@ pub fn protected_processes() -> HashSet<&'static str> {
         "Dock",           // Dock, Exposé, Mission Control animations
         "coreaudiod",     // Real-time audio I/O loop — latency-critical
         "mediaserverd",   // AVFoundation / CoreMedia pipeline
+        "mediaplaybackd", // 2026-06-21 (P3): video playback daemon — acting on it
+        // during 4K = decode stall / frame drop. Was only PID-protected via the
+        // apple_owned path, which the name-keyed SetMemorystatus guard never hits.
         "displaypolicyd", // Display power-state transitions — freeze → flicker
         "runningboardd",  // Process lifecycle manager — freeze → broken app launches
         "SystemUIServer", // Menu bar / status bar rendering
@@ -1999,6 +2002,36 @@ mod tests {
         assert!(
             !hard_protected_contains("node"),
             "node is NOT hard-protected — proves the old guard let it through"
+        );
+    }
+
+    #[test]
+    fn playback_working_set_protection_contract_p1_p2_p3() {
+        // 2026-06-21 (playback-easing Wave 1): the zombie-hunter jetsam-demote
+        // and the SetMemorystatus execute chokepoint must never act on the 4K
+        // playback working set. Two protections, two mechanisms:
+        // P3 — mediaplaybackd is now hard-listed → is_protected_name covers it.
+        assert!(
+            is_protected_name("mediaplaybackd"),
+            "P3: mediaplaybackd (video playback daemon) must be protected"
+        );
+        // P1/P2 — Chromium/Brave renderers are NOT in is_protected_name (verified
+        // here), which is exactly why P1 (zombie guard) and P2 (execute
+        // chokepoint) add an explicit is_chromium_family check. If this ever
+        // becomes true, the explicit guards become redundant — but until then
+        // they are load-bearing.
+        assert!(
+            is_chromium_family("Brave Browser Helper (GPU)"),
+            "P1/P2: a Brave GPU/renderer helper must match is_chromium_family"
+        );
+        assert!(
+            is_chromium_family("Brave Browser Helper (Renderer)"),
+            "P1/P2: a Brave Renderer helper must match is_chromium_family"
+        );
+        assert!(
+            !is_protected_name("Brave Browser Helper (GPU)"),
+            "is_protected_name does NOT cover chromium — proves P1/P2's explicit \
+             is_chromium_family guard is necessary, not redundant"
         );
     }
 
