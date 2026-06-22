@@ -34,6 +34,31 @@ def load(path):
         return {"__error__": str(e)}
 
 
+def teacher_config_disabled():
+    """True iff the [llm] config explicitly sets enabled=false. Mirrors the
+    regression probe's check (de1a2cd): the llm_state.json `enabled` flag can be
+    stale-true after the teacher is deliberately disabled in config, so the
+    llm-stale detector must consult the config (the source of truth the daemon
+    reads per-tick), not just the runtime state. Stdlib line parse (no tomllib on
+    py3.9). Conservative: returns False on any read failure so a genuinely-dead
+    teacher is never masked."""
+    try:
+        with open("/etc/apollo-optimizer/config.toml") as f:
+            in_llm = False
+            for line in f:
+                s = line.strip()
+                if s.startswith("#"):
+                    continue
+                if s.startswith("[") and s.endswith("]"):
+                    in_llm = s == "[llm]"
+                    continue
+                if in_llm and s.replace(" ", "").startswith("enabled="):
+                    return "false" in s.lower()
+    except Exception:
+        pass
+    return False
+
+
 def audit(state, metrics, policy, llm):
     findings = []  # (severity, code, detail)
 
@@ -145,7 +170,7 @@ def audit(state, metrics, policy, llm):
     # JSON), yet `calls_today` / `trigger_events` kept advancing on every
     # attempt — so it LOOKED alive. Trust only ground truth: `last_call_at`
     # (set sole­ly on success) and `consecutive_failures`. Never `calls_today`.
-    if "__error__" not in llm and llm.get("enabled"):
+    if "__error__" not in llm and llm.get("enabled") and not teacher_config_disabled():
         cf = llm.get("consecutive_failures", 0)
         last_call = llm.get("last_call_at")
         age_days = None
