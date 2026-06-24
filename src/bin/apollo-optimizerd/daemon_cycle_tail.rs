@@ -285,6 +285,19 @@ pub fn wire_enriched_telemetry(
         to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonEnrich));
     m.metrics.stage_reason_enrich_max_ms =
         ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonEnrich));
+    // Additive instrumentation (2026-06-23): untimed enrich→decide ops.
+    m.metrics.stage_reason_procscan_avg_ms =
+        to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonProcScan));
+    m.metrics.stage_reason_procscan_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonProcScan));
+    m.metrics.stage_reason_rusage_avg_ms =
+        to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonRusage));
+    m.metrics.stage_reason_rusage_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonRusage));
+    m.metrics.stage_reason_signalintel_avg_ms =
+        to_avg_ms(lf.drain_stage_total_ns(CycleStage::ReasonSignalIntel));
+    m.metrics.stage_reason_signalintel_max_ms =
+        ns_to_ms(lf.drain_stage_max_ns(CycleStage::ReasonSignalIntel));
     m.metrics.meta_confidence = inputs.cognitive_state.meta_cognition.meta_confidence;
     m.metrics.humble_mode = inputs.cog_decision.humble_mode;
     m.metrics.adversarial_pass_rate =

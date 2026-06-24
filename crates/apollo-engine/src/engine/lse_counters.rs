@@ -35,6 +35,12 @@ pub enum CycleStage {
     ReasonPageReclaim,
     ReasonChromium,
     ReasonEnrich,
+    /// Additive instrumentation (2026-06-23): attribute the large untimed
+    /// region between enrich-end and decide-start. Method of Logical Effort —
+    /// rebalance the dominant pipeline stage. Zero behavior change.
+    ReasonProcScan,
+    ReasonRusage,
+    ReasonSignalIntel,
 }
 
 // ── Lock-free metrics ────────────────────────────────────────────────────────
@@ -242,6 +248,17 @@ pub struct LockFreeMetrics {
     pub stage_reason_chromium_max_ns: AtomicU64,
     pub stage_reason_enrich_total_ns: AtomicU64,
     pub stage_reason_enrich_max_ns: AtomicU64,
+    /// Additive instrumentation (2026-06-23): 3 untimed heavy ops in the
+    /// enrich→decide gap. proc-scan (MemoryAnalyzer + WakeStorm full scan),
+    /// rusage (per-pid cpu_wall deltas), signal-intel (Kalman/CUSUM/Entropy/
+    /// Hazard/LV/MPC block). ReasonSignalIntel wraps ReasonSignalTick — they
+    /// are independent counters, nesting is intentional.
+    pub stage_reason_procscan_total_ns: AtomicU64,
+    pub stage_reason_procscan_max_ns: AtomicU64,
+    pub stage_reason_rusage_total_ns: AtomicU64,
+    pub stage_reason_rusage_max_ns: AtomicU64,
+    pub stage_reason_signalintel_total_ns: AtomicU64,
+    pub stage_reason_signalintel_max_ns: AtomicU64,
 
     /// Phase 2 lock-decomposition telemetry (Sprint 5)
     pub profile_floor_hits: AtomicU64,
@@ -835,6 +852,12 @@ impl LockFreeMetrics {
             stage_reason_chromium_max_ns: AtomicU64::new(0),
             stage_reason_enrich_total_ns: AtomicU64::new(0),
             stage_reason_enrich_max_ns: AtomicU64::new(0),
+            stage_reason_procscan_total_ns: AtomicU64::new(0),
+            stage_reason_procscan_max_ns: AtomicU64::new(0),
+            stage_reason_rusage_total_ns: AtomicU64::new(0),
+            stage_reason_rusage_max_ns: AtomicU64::new(0),
+            stage_reason_signalintel_total_ns: AtomicU64::new(0),
+            stage_reason_signalintel_max_ns: AtomicU64::new(0),
             profile_floor_hits: AtomicU64::new(0),
             iokit_errors: AtomicU64::new(0),
             reactor_pulses: AtomicU64::new(0),
@@ -942,6 +965,18 @@ impl LockFreeMetrics {
                 &self.stage_reason_enrich_total_ns,
                 &self.stage_reason_enrich_max_ns,
             ),
+            CycleStage::ReasonProcScan => (
+                &self.stage_reason_procscan_total_ns,
+                &self.stage_reason_procscan_max_ns,
+            ),
+            CycleStage::ReasonRusage => (
+                &self.stage_reason_rusage_total_ns,
+                &self.stage_reason_rusage_max_ns,
+            ),
+            CycleStage::ReasonSignalIntel => (
+                &self.stage_reason_signalintel_total_ns,
+                &self.stage_reason_signalintel_max_ns,
+            ),
         };
         total.fetch_add(ns, Ordering::Relaxed);
         max.fetch_max(ns, Ordering::Relaxed);
@@ -972,6 +1007,9 @@ impl LockFreeMetrics {
             CycleStage::ReasonPageReclaim => &self.stage_reason_pagereclaim_total_ns,
             CycleStage::ReasonChromium => &self.stage_reason_chromium_total_ns,
             CycleStage::ReasonEnrich => &self.stage_reason_enrich_total_ns,
+            CycleStage::ReasonProcScan => &self.stage_reason_procscan_total_ns,
+            CycleStage::ReasonRusage => &self.stage_reason_rusage_total_ns,
+            CycleStage::ReasonSignalIntel => &self.stage_reason_signalintel_total_ns,
         };
         total.swap(0, Ordering::Relaxed)
     }
@@ -1007,6 +1045,9 @@ impl LockFreeMetrics {
             CycleStage::ReasonPageReclaim => &self.stage_reason_pagereclaim_max_ns,
             CycleStage::ReasonChromium => &self.stage_reason_chromium_max_ns,
             CycleStage::ReasonEnrich => &self.stage_reason_enrich_max_ns,
+            CycleStage::ReasonProcScan => &self.stage_reason_procscan_max_ns,
+            CycleStage::ReasonRusage => &self.stage_reason_rusage_max_ns,
+            CycleStage::ReasonSignalIntel => &self.stage_reason_signalintel_max_ns,
         };
         max.swap(0, Ordering::Relaxed)
     }

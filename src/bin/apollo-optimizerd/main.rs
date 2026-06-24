@@ -2050,11 +2050,16 @@ fn main() -> anyhow::Result<()> {
 
                 // MemoryAnalyzer profiling + WakeStormDetector per-cycle scan.
                 // Extracted to daemon_proc_scan_tick::run_proc_scan_tick (Wave 32).
+                let _t_procscan_start = Instant::now();
                 daemon_proc_scan_tick::run_proc_scan_tick(
                     &proc_snaps,
                     &mut mem_analyzer,
                     &mut proc_recovery,
                     &mut wake_storm,
+                );
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::ReasonProcScan,
+                    _t_procscan_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
 
                 // Memory budgets: jetsam inactive limits for over-budget processes.
@@ -2248,10 +2253,15 @@ fn main() -> anyhow::Result<()> {
 
                 // EMA interactivity classifier: cpu_wall_ratio per PID from rusage deltas.
                 // Extracted to daemon_rusage_tick::compute_cpu_wall_ratios (Wave 33).
+                let _t_rusage_start = Instant::now();
                 let cpu_wall_ratios = daemon_rusage_tick::compute_cpu_wall_ratios(
                     &snapshot,
                     &mut last_rusage_at,
                     &mut rusage_cpu_prev,
+                );
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::ReasonRusage,
+                    _t_rusage_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
 
                 // Online usage learning (root-only, no UI sensors): infer frequently-used apps
@@ -3049,6 +3059,11 @@ fn main() -> anyhow::Result<()> {
                 // auto-clears and the inhibition window collapses from 12s
                 // back to the 5s base. Without this tick the latch was
                 // monotonic-set (re-asserted on every purge) and never fell.
+                // Additive instrumentation (2026-06-23): wrap the whole
+                // signal-intelligence block (Kalman/CUSUM/Entropy/Hazard/LV/MPC
+                // + ODE + downstream forecasting). Nests the existing tiny
+                // ReasonSignalTick span — independent counter, intentional.
+                let _t_signalintel_start = Instant::now();
                 maintenance_state
                     .tick_compressor_status(snapshot.pressure.swap_delta_bytes_per_sec);
                 lctx.signal_intel.purge_inhibited =
@@ -3650,6 +3665,13 @@ fn main() -> anyhow::Result<()> {
                     .as_ref()
                     .expect("companion_fg_cache populated above")
                     .pids;
+                // Additive instrumentation (2026-06-23): close the
+                // ReasonSignalIntel span — wraps the entire untimed
+                // enrich→decide signal-intelligence region.
+                lf_metrics.record_stage(
+                    apollo_engine::engine::lse_counters::CycleStage::ReasonSignalIntel,
+                    _t_signalintel_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
 
                 // 2026-05-30: ReasonDecide stage instrumentation. Closes
                 // the 12-of-13 staging gap exposed in cycle-tail avg/max

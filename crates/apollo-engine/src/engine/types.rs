@@ -1239,6 +1239,19 @@ pub struct RuntimeMetrics {
     pub stage_reason_enrich_avg_ms: f64,
     #[serde(default)]
     pub stage_reason_enrich_max_ms: f64,
+    /// Additive instrumentation (2026-06-23): untimed enrich→decide ops.
+    #[serde(default)]
+    pub stage_reason_procscan_avg_ms: f64,
+    #[serde(default)]
+    pub stage_reason_procscan_max_ms: f64,
+    #[serde(default)]
+    pub stage_reason_rusage_avg_ms: f64,
+    #[serde(default)]
+    pub stage_reason_rusage_max_ms: f64,
+    #[serde(default)]
+    pub stage_reason_signalintel_avg_ms: f64,
+    #[serde(default)]
+    pub stage_reason_signalintel_max_ms: f64,
     /// MetaCognition meta_confidence [0,1].
     #[serde(default)]
     pub meta_confidence: f32,
