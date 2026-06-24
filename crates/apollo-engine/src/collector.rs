@@ -1,7 +1,20 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use sysinfo::System;
+use sysinfo::{ProcessRefreshKind, System};
+
+/// Per-cycle process refresh kind: ONLY cpu + memory (the dynamic fields Apollo
+/// consumes via `.cpu_usage()` / `.memory()`). 2026-06-23 perf: the default
+/// `refresh_processes()` also re-fetches the expensive STATIC fields
+/// (cmd/exe/cwd/environ via `proc_pidpath` + `KERN_PROCARGS` per process) —
+/// which Apollo NEVER reads (verified: zero `.cmd()/.exe()/.cwd()` call sites).
+/// `process.name()` comes from the basic proc listing (kinfo_proc), not
+/// KERN_PROCARGS, so it survives this minimal kind — names stay populated for
+/// safety/interactive matching. `stage_sense` (the p95 hotspot at ~27ms) is
+/// dominated by this refresh; skipping the wasted static fetches cuts it.
+fn proc_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::new().with_cpu().with_memory()
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SystemSnapshot {
@@ -207,7 +220,7 @@ impl SystemCollector {
             // CacheDelete framework logging subsystem (→ logd spam, wasted power).
             self.sys.refresh_cpu();
             self.sys.refresh_memory();
-            self.sys.refresh_processes();
+            self.sys.refresh_processes_specifics(proc_refresh_kind());
             true
         };
 
@@ -332,7 +345,7 @@ impl SystemCollector {
         };
 
         let refreshed_processes = if self.light_call_count.is_multiple_of(refresh_interval) {
-            self.sys.refresh_processes();
+            self.sys.refresh_processes_specifics(proc_refresh_kind());
             true
         } else {
             false
@@ -1002,6 +1015,36 @@ mod tests {
             snap.timestamp,
             before,
             after
+        );
+    }
+
+    #[test]
+    fn light_refresh_specifics_preserves_process_names() {
+        // 2026-06-23 perf: the per-cycle process refresh switched to a
+        // cpu+memory-only ProcessRefreshKind (skips the expensive cmd/exe/cwd
+        // static refetch Apollo never reads — the stage_sense p95 hotspot).
+        // process.name() comes from the basic proc listing (kinfo_proc), NOT
+        // KERN_PROCARGS, so it MUST survive — empty names would break every
+        // safety/interactive name match catastrophically. Exercises the real
+        // refresh on the test host.
+        let mut c = SystemCollector::new();
+        // pressure >= 0.80 → refresh_interval = 1, so the specifics refresh fires.
+        let _ = c.collect_snapshot_light(0.90);
+        let (snap, _) = c.collect_snapshot_light(0.90);
+        assert!(
+            !snap.top_processes.is_empty(),
+            "should observe processes on the test host"
+        );
+        let named = snap
+            .top_processes
+            .iter()
+            .filter(|p| !p.name.is_empty())
+            .count();
+        assert!(
+            named > 0,
+            "process names must survive the cpu+memory-only refresh — {} of {} had names",
+            named,
+            snap.top_processes.len()
         );
     }
 
