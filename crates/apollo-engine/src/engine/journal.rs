@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::engine::types::{HardPath, JournalEntry};
 
-/// Maximum journal size before rotation (10 MB).
+/// Maximum journal size before rotation (2 MB).
 // Tightened 2026-05-08 from 10 MB after macOS Resource Coalition flagged
 // the daemon for sustained-write rate >4x the 99 KB/s limit. Smaller cap +
 // faster rotation = less SSD page churn + bounded disk usage at ~4 MB total.

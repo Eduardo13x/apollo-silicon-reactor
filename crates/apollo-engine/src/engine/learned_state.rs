@@ -1078,10 +1078,15 @@ impl LearnedState {
         // writes but NOT power loss after rename — the renamed inode could
         // hold partial data if the kernel buffer hadn't flushed.
         // `write_json_critical` opens with O_WRONLY|O_CREAT|O_TRUNC, writes,
-        // fsyncs the tmp file AND the parent directory, then renames.
-        // Adds ~1-3ms per persist (already amortized: persist cadence is
-        // every ~30s in steady state). Worth the cost — learned_state is
-        // the most valuable file Apollo writes.
+        // fsyncs the tmp file (`sync_all` = `fsync(2)`, not `F_FULLFSYNC`; the
+        // parent directory is NOT separately fsync'd), then atomic-renames.
+        // Net guarantee: old-or-new committed state, never a torn file — a
+        // power-loss right after rename may revert to the prior persist but
+        // cannot corrupt. Adds ~1-3ms per persist (amortized: cadence ~30s in
+        // steady state). Worth the cost — learned_state is the most valuable
+        // file Apollo writes. Full platter durability (F_FULLFSYNC + parent-dir
+        // fsync) is deferred: worst case avoided is ~30s of EMA loss on a hard
+        // power-yank, never corruption.
         // [Gray & Reuter 1992 §10 — durability requires fsync, not just
         // atomic rename].
         crate::engine::llm::write_json_critical(path, self, Some(0o600));

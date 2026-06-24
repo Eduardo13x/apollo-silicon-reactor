@@ -229,7 +229,12 @@ pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 
 /// Write JSON atomically (temp → rename). `fsync` controls whether to call
 /// `sync_all()` before rename. Use `true` only for crash-critical files
-/// (journal, learned_state) — it adds ~5-30ms per write via F_FULLFSYNC.
+/// (journal, learned_state). NOTE: `sync_all()` is `fsync(2)`, NOT macOS
+/// `F_FULLFSYNC` — it flushes to the drive cache but does not force a platter
+/// write, and the parent directory is not separately fsync'd. Guarantee:
+/// old-or-new committed state via the atomic rename, never a torn file; a
+/// power-loss right after rename may revert to the prior state but cannot
+/// corrupt. Adds ~1-30ms per write.
 pub fn write_json_fsync(path: &Path, value: &impl Serialize, mode: Option<u32>, fsync: bool) {
     let _ = HardPath::verify_no_symlink(path);
 
