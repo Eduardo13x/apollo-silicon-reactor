@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.eduardocortez.apollo-liveness-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/usr/local/libexec/apollo-liveness-watchdog.sh</string>
+    </array>
+
+    <!-- Every 60s: external liveness check on apollo-optimizerd's main cycle.
+         Detects a hung-but-alive daemon (which launchd KeepAlive misses) via the
+         staleness of runtime_metrics.json and force-restarts it. Budget-capped to
+         never become a restart-storm under sustained pressure. -->
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardErrorPath</key>
+    <string>/var/lib/apollo/watchdog.err.log</string>
+
+    <!-- The watchdog itself must stay schedulable under memory pressure -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
