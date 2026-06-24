@@ -135,6 +135,170 @@ pub fn tally_votes(votes: &[SpecialistVote]) -> VotingResult {
     }
 }
 
+/// MoCaE-calibrated tally (C2): fuse votes by `confidence ×
+/// reliability(specialist, confidence-bucket)` instead of raw `confidence`.
+/// This decouples "how loud a specialist votes" from "how often it is RIGHT at
+/// that loudness" — a chronically overconfident specialist is down-weighted in
+/// the buckets where it is unreliable. Returns the winning intervention.
+///
+/// 2026-06-23 SHADOW phase: computed alongside `tally_votes` for measurement
+/// (does its winner differ from the raw winner?). NOT yet the live decision.
+/// When the calibration is cold (all buckets neutral 0.5) this returns the SAME
+/// winner as `tally_votes` (every score scaled by ~0.5), so it only diverges
+/// once evidence shows real per-bucket miscalibration.
+pub fn tally_votes_calibrated(
+    votes: &[SpecialistVote],
+    calibration: &ConfidenceCalibration,
+) -> Intervention {
+    let mut scores = [0.0_f64; K];
+    for v in votes {
+        let rel = specialist::index_of(v.name)
+            .map(|sp| calibration.reliability(sp, v.confidence))
+            .unwrap_or(0.5);
+        scores[v.intervention.index()] += v.confidence * rel;
+    }
+    let mut best_idx = 0;
+    let mut best_score = scores[0];
+    for (i, &s) in scores.iter().enumerate().skip(1) {
+        if s > best_score {
+            best_score = s;
+            best_idx = i;
+        }
+    }
+    Intervention::from_index(best_idx)
+}
+
+// ── Confidence calibration (MoCaE, C2) ──────────────────────────────────────
+
+/// Number of confidence buckets for per-(specialist, confidence-level)
+/// reliability tracking.
+pub const N_CONF_BUCKETS: usize = 3;
+
+/// Map a confidence in [0,1] to a bucket: 0 = low (<0.4), 1 = mid [0.4,0.7),
+/// 2 = high (>=0.7). Bucket boundaries chosen so the daemon's typical
+/// accuracy-weighted confidences (~0.3-0.9) spread across all three.
+#[inline]
+pub fn conf_bucket(confidence: f64) -> usize {
+    if confidence < 0.4 {
+        0
+    } else if confidence < 0.7 {
+        1
+    } else {
+        2
+    }
+}
+
+/// Per-(specialist, confidence-bucket) empirical reliability — the MoCaE fix
+/// (Oksuz et al. TMLR 2024, arXiv:2309.14976). The legacy [`SpecialistAccuracyTracker`]
+/// keeps ONE flat accuracy scalar per specialist, so `tally_votes` fusing by raw
+/// confidence is dominated by the loudest specialist, NOT the most accurate
+/// (MoCaE's central finding). This table records the hit-rate of each specialist
+/// SEPARATELY per confidence level — a specialist that is reliable when it votes
+/// softly but overconfident when it votes loudly will show a low high-bucket
+/// reliability, which the flat scalar hides.
+///
+/// 2026-06-23 SHADOW phase: this table is POPULATED from outcomes but does NOT
+/// yet drive the live decision (`tally_votes` is unchanged). It is the
+/// measurement for whether loud-over-accurate is actually biting before any
+/// gated cutover. Read `bucket_spread()` after ≥500 obs: a large spread on any
+/// specialist = the flat accuracy is hiding miscalibration → cutover justified.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfidenceCalibration {
+    /// hits[specialist][bucket] — times this specialist was CORRECT voting in
+    /// that confidence bucket.
+    hits: [[u32; N_CONF_BUCKETS]; specialist::COUNT],
+    /// total[specialist][bucket] — times this specialist voted in that bucket.
+    total: [[u32; N_CONF_BUCKETS]; specialist::COUNT],
+    /// SHADOW measurement: decisions where the calibrated fusion winner would
+    /// DIFFER from the raw-confidence fusion winner. Ratio over `shadow_decisions`
+    /// = how often C2 would change the call. High + large `bucket_spread` =
+    /// loud-over-accurate is biting → cutover justified.
+    #[serde(default)]
+    pub shadow_disagreements: u64,
+    /// SHADOW measurement: total decisions compared.
+    #[serde(default)]
+    pub shadow_decisions: u64,
+}
+
+impl Default for ConfidenceCalibration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConfidenceCalibration {
+    pub fn new() -> Self {
+        Self {
+            hits: [[0; N_CONF_BUCKETS]; specialist::COUNT],
+            total: [[0; N_CONF_BUCKETS]; specialist::COUNT],
+            shadow_disagreements: 0,
+            shadow_decisions: 0,
+        }
+    }
+
+    /// SHADOW: record whether the calibrated fusion would have picked a different
+    /// winner than the raw fusion this decision. Pure measurement.
+    pub fn record_shadow(&mut self, raw_winner: Intervention, calibrated_winner: Intervention) {
+        self.shadow_decisions = self.shadow_decisions.saturating_add(1);
+        if raw_winner != calibrated_winner {
+            self.shadow_disagreements = self.shadow_disagreements.saturating_add(1);
+        }
+    }
+
+    /// Record one outcome: specialist `sp` voted with `confidence` and was
+    /// `correct`. Bucketed by the confidence level.
+    pub fn update(&mut self, sp: usize, confidence: f64, correct: bool) {
+        if sp >= specialist::COUNT {
+            return;
+        }
+        let b = conf_bucket(confidence);
+        self.total[sp][b] = self.total[sp][b].saturating_add(1);
+        if correct {
+            self.hits[sp][b] = self.hits[sp][b].saturating_add(1);
+        }
+    }
+
+    /// Laplace-smoothed reliability of specialist `sp` at a given `confidence`
+    /// level: (hits+1)/(total+2). Cold buckets → 0.5 (neutral), so the calibrated
+    /// fusion equals the raw fusion until evidence accumulates (self-warming).
+    pub fn reliability(&self, sp: usize, confidence: f64) -> f64 {
+        if sp >= specialist::COUNT {
+            return 0.5;
+        }
+        let b = conf_bucket(confidence);
+        (self.hits[sp][b] as f64 + 1.0) / (self.total[sp][b] as f64 + 2.0)
+    }
+
+    /// Reliability spread for a specialist = max-min reliability across its
+    /// buckets that have evidence. A LARGE spread means the flat per-specialist
+    /// accuracy is hiding bucket-level miscalibration (loud-over-accurate) — the
+    /// measurement that justifies the C2 cutover. Returns 0.0 if <2 warm buckets.
+    pub fn bucket_spread(&self, sp: usize) -> f64 {
+        if sp >= specialist::COUNT {
+            return 0.0;
+        }
+        let warm: Vec<f64> = (0..N_CONF_BUCKETS)
+            .filter(|&b| self.total[sp][b] >= 10)
+            .map(|b| (self.hits[sp][b] as f64 + 1.0) / (self.total[sp][b] as f64 + 2.0))
+            .collect();
+        if warm.len() < 2 {
+            return 0.0;
+        }
+        let mx = warm.iter().cloned().fold(f64::MIN, f64::max);
+        let mn = warm.iter().cloned().fold(f64::MAX, f64::min);
+        mx - mn
+    }
+
+    /// Total observations recorded (warmup gate for the measurement).
+    pub fn total_obs(&self) -> u64 {
+        self.total
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|&t| t as u64)
+            .sum()
+    }
+}
+
 // ── Specialist accuracy tracker ─────────────────────────────────────────────
 
 /// Specialist indices used by [`SpecialistAccuracyTracker`].
@@ -178,6 +342,11 @@ pub struct SpecialistAccuracyTracker {
     /// [Kuncheva 2004] "Changing Classifiers in Non-Stationary Environments"
     #[serde(default)]
     pub drift_detector: DriftDetector,
+    /// MoCaE per-(specialist, confidence-bucket) reliability (C2, 2026-06-23).
+    /// SHADOW phase: populated from outcomes, does NOT yet drive `tally_votes`.
+    /// `#[serde(default)]` so old persisted trackers load with an empty table.
+    #[serde(default)]
+    pub calibration: ConfidenceCalibration,
 }
 
 impl Default for SpecialistAccuracyTracker {
@@ -196,6 +365,7 @@ impl SpecialistAccuracyTracker {
             accuracy: [Self::INIT_ACCURACY; specialist::COUNT],
             updates: 0,
             drift_detector: DriftDetector::new(),
+            calibration: ConfidenceCalibration::new(),
         }
     }
 
@@ -325,8 +495,25 @@ impl SpecialistAccuracyTracker {
             };
             if let Some(idx) = specialist::index_of(vote.name) {
                 self.update(idx, correct);
+                // C2 SHADOW: record per-(specialist, confidence-bucket) reliability.
+                // vote.confidence is the accuracy-weighted confidence the
+                // specialist fused with — bucketing on it measures whether this
+                // specialist is reliable at the level it actually votes.
+                self.calibration.update(idx, vote.confidence, correct);
             }
         }
+        // C2 SHADOW: would the calibrated fusion have picked a different winner
+        // than the raw fusion? Pure measurement (does not change `chosen`/the
+        // live decision). Uses the just-updated calibration.
+        let raw_winner = tally_votes(votes).intervention;
+        let calibrated_winner = tally_votes_calibrated(votes, &self.calibration);
+        self.calibration.record_shadow(raw_winner, calibrated_winner);
+    }
+
+    /// Read-only access to the confidence calibration table (C2 shadow
+    /// measurement + the Phase-3 calibrated fusion).
+    pub fn calibration(&self) -> &ConfidenceCalibration {
+        &self.calibration
     }
 }
 
@@ -885,6 +1072,103 @@ impl PredictiveAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── C2 confidence calibration (MoCaE) ────────────────────────────────────
+    fn sv(name: &'static str, iv: Intervention, conf: f64) -> SpecialistVote {
+        SpecialistVote { name, intervention: iv, confidence: conf }
+    }
+
+    #[test]
+    fn conf_bucket_boundaries() {
+        assert_eq!(conf_bucket(0.0), 0);
+        assert_eq!(conf_bucket(0.39), 0);
+        assert_eq!(conf_bucket(0.40), 1);
+        assert_eq!(conf_bucket(0.69), 1);
+        assert_eq!(conf_bucket(0.70), 2);
+        assert_eq!(conf_bucket(1.0), 2);
+    }
+
+    #[test]
+    fn calibration_exposes_per_bucket_miscalibration_the_flat_accuracy_hides() {
+        // LinUCB is reliable when it votes SOFTLY but overconfident-and-WRONG when
+        // it votes LOUDLY. A flat per-specialist accuracy (~0.5 here) hides this;
+        // the per-bucket table exposes it.
+        let mut c = ConfidenceCalibration::new();
+        for _ in 0..50 {
+            c.update(specialist::LINUCB, 0.2, true); // low bucket: right
+        }
+        for _ in 0..50 {
+            c.update(specialist::LINUCB, 0.9, false); // high bucket: wrong
+        }
+        assert!(c.reliability(specialist::LINUCB, 0.2) > 0.9);
+        assert!(c.reliability(specialist::LINUCB, 0.9) < 0.1);
+        assert!(
+            c.bucket_spread(specialist::LINUCB) > 0.8,
+            "spread must expose the miscalibration the flat accuracy hides, got {}",
+            c.bucket_spread(specialist::LINUCB)
+        );
+        assert_eq!(c.total_obs(), 100);
+    }
+
+    #[test]
+    fn calibrated_fusion_downweights_the_loud_but_wrong_specialist() {
+        // LinUCB (idx 0, lower) is loud-but-wrong; Kalman (idx 3) is loud-and-right.
+        // Both vote with confidence 0.8 for DIFFERENT interventions.
+        let mut c = ConfidenceCalibration::new();
+        for _ in 0..50 {
+            c.update(specialist::LINUCB, 0.8, false);
+            c.update(specialist::KALMAN, 0.8, true);
+        }
+        let votes = vec![
+            sv("linucb", Intervention::TightenThresholds, 0.8),
+            sv("kalman", Intervention::ProactivePurge, 0.8),
+        ];
+        // Raw fusion: 0.8 == 0.8 tie → lower-index intervention wins (Tighten=1).
+        assert_eq!(tally_votes(&votes).intervention, Intervention::TightenThresholds);
+        // Calibrated: LinUCB down-weighted (unreliable), Kalman up → Purge wins.
+        assert_eq!(
+            tally_votes_calibrated(&votes, &c),
+            Intervention::ProactivePurge,
+            "calibration must favor the reliable Kalman over the loud-but-wrong LinUCB"
+        );
+    }
+
+    #[test]
+    fn cold_calibration_never_changes_the_decision() {
+        let c = ConfidenceCalibration::new();
+        let votes = vec![
+            sv("linucb", Intervention::TightenThresholds, 0.6),
+            sv("kalman", Intervention::ProactivePurge, 0.9),
+        ];
+        assert_eq!(
+            tally_votes(&votes).intervention,
+            tally_votes_calibrated(&votes, &c),
+            "cold (neutral) calibration must equal the raw fusion — safe to ship in shadow"
+        );
+    }
+
+    #[test]
+    fn record_disagreement_outcome_populates_calibration_and_shadow_counters() {
+        let mut t = SpecialistAccuracyTracker::new();
+        let votes = vec![
+            sv("linucb", Intervention::TightenThresholds, 0.8),
+            sv("kalman", Intervention::ProactivePurge, 0.8),
+        ];
+        // The chosen action (Tighten) is repeatedly NOT effective → LinUCB (voted
+        // Tighten) is wrong, Kalman (voted Purge) is right.
+        for _ in 0..40 {
+            t.record_disagreement_outcome(&votes, Intervention::TightenThresholds, false);
+        }
+        let c = t.calibration();
+        assert!(c.total_obs() >= 80, "both specialists' votes recorded");
+        assert!(c.reliability(specialist::LINUCB, 0.8) < 0.3, "LinUCB unreliable at 0.8");
+        assert!(c.reliability(specialist::KALMAN, 0.8) > 0.7, "Kalman reliable at 0.8");
+        assert!(c.shadow_decisions >= 40, "shadow decisions counted");
+        assert!(
+            c.shadow_disagreements > 0,
+            "once warm, the calibrated fusion picks Kalman's Purge over the raw Tighten"
+        );
+    }
 
     fn test_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
