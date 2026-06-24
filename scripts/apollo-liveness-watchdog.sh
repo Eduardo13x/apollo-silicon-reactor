@@ -63,7 +63,7 @@ log "metrics stale: age=${age}s consec=${consec}/${CONSEC_NEEDED}"
 
 # ── Confirmed stall. Only act if the daemon is actually loaded+running (don't
 # fight launchd if it is already restarting a crashed process).
-if ! sudo launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+if ! launchctl print "system/${LABEL}" >/dev/null 2>&1; then
     log "daemon not loaded — leaving to launchd KeepAlive, not intervening"
     echo 0 > "$CONSEC_FILE" 2>/dev/null
     exit 0
@@ -90,9 +90,9 @@ fi
 # ── Within budget: force-restart via clean bootout + bootstrap (handles the
 # I/O-error-5 tombstone gotcha; bootout may say "No such process" — fine).
 log "STALL CONFIRMED (age=${age}s) — restarting daemon (restart ${count}+1/${MAX_RESTARTS} in window)"
-sudo launchctl bootout "system/${LABEL}" 2>>"$LOG"
+launchctl bootout "system/${LABEL}" 2>>"$LOG"
 sleep 2
-if sudo launchctl bootstrap system "$PLIST" 2>>"$LOG"; then
+if launchctl bootstrap system "$PLIST" 2>>"$LOG"; then
     log "bootstrap OK — daemon restarted"
 else
     log "bootstrap FAILED — will retry next cycle"
