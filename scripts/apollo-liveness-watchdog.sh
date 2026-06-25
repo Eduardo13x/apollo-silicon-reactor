@@ -29,15 +29,33 @@ STATE_DIR="/var/run"
 CONSEC_FILE="${STATE_DIR}/apollo-watchdog-consec"      # consecutive stale checks
 RESTARTS_FILE="${STATE_DIR}/apollo-watchdog-restarts"  # "epoch epoch ..." recent restarts
 ALERT_FLAG="${STATE_DIR}/apollo-watchdog-alert"        # presence = budget exhausted, needs human
+LASTRUN_FILE="${STATE_DIR}/apollo-watchdog-lastrun"    # watchdog's own last-run epoch (sleep detector)
 
 STALE_SEC=180          # metrics file older than this = candidate stall (healthy writes ~15s)
 CONSEC_NEEDED=2        # require 2 consecutive stale checks (~stall persisted >180s across 2 runs)
 MAX_RESTARTS=2         # at most this many restarts ...
 WINDOW_SEC=1800        # ... per 30 min, then alert-only
+SLEEP_GAP_SEC=240      # if the watchdog itself didn't run for >4x its 60s cadence, the machine
+                       # was asleep/suspended — metrics staleness is then from sleep, NOT a hang.
 
 now=$(date +%s)
 
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >> "$LOG" 2>/dev/null; }
+
+# ── Sleep guard (fix for the 2026-06-25 false positive). On battery the lid-close /
+# maintenance sleep suspends the WHOLE machine: neither the daemon nor this watchdog
+# run, so on wake the metrics file legitimately looks stale by the sleep duration.
+# Restarting then is a needless churn. Detect it by OUR OWN gap: if the watchdog
+# hasn't run in far longer than its 60s cadence, the system slept — skip this check,
+# reset the stale counter, let the next (post-wake) run judge a freshly-resumed daemon.
+wd_last=$(cat "$LASTRUN_FILE" 2>/dev/null || echo "$now")
+echo "$now" > "$LASTRUN_FILE" 2>/dev/null
+wd_gap=$(( now - wd_last ))
+if [ "$wd_gap" -gt "$SLEEP_GAP_SEC" ]; then
+    log "watchdog gap=${wd_gap}s (machine slept/suspended) — skipping stall check; staleness is from sleep, not a hang"
+    echo 0 > "$CONSEC_FILE" 2>/dev/null
+    exit 0
+fi
 
 # ── Liveness signal: age of the metrics file the main loop writes (~every 15s).
 if [ ! -f "$METRICS" ]; then
