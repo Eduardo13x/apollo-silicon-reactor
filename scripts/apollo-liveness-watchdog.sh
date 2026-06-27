@@ -31,12 +31,21 @@ RESTARTS_FILE="${STATE_DIR}/apollo-watchdog-restarts"  # "epoch epoch ..." recen
 ALERT_FLAG="${STATE_DIR}/apollo-watchdog-alert"        # presence = budget exhausted, needs human
 LASTRUN_FILE="${STATE_DIR}/apollo-watchdog-lastrun"    # watchdog's own last-run epoch (sleep detector)
 
-STALE_SEC=180          # metrics file older than this = candidate stall (healthy writes ~15s)
-CONSEC_NEEDED=2        # require 2 consecutive stale checks (~stall persisted >180s across 2 runs)
+STALE_SEC=90           # metrics file older than this = candidate stall (healthy writes ~15s;
+                       # 90s = 6× cadence; tight enough to catch stalls faster than the
+                       # previous 180s, loose enough to absorb a single missed cycle).
+CONSEC_NEEDED=2        # require 2 consecutive stale checks (~stall persisted >90s across 2 runs)
 MAX_RESTARTS=2         # at most this many restarts ...
 WINDOW_SEC=1800        # ... per 30 min, then alert-only
 SLEEP_GAP_SEC=240      # if the watchdog itself didn't run for >4x its 60s cadence, the machine
                        # was asleep/suspended — metrics staleness is then from sleep, NOT a hang.
+# Early-stall detection: if age GREW >= GROWTH_THRESHOLD_SEC since the last check,
+# the daemon is falling behind its 15s write cadence (precursor to the 06-24 + 06-27
+# stalls — both showed monotonic age growth before going fully stale). On this
+# signal, lower the effective stale threshold for this run only (early warning),
+# WITHOUT triggering a restart — the existing consec/age path is the restart gate.
+GROWTH_THRESHOLD_SEC=30
+EARLY_STALE_SEC=60
 
 now=$(date +%s)
 
@@ -64,10 +73,26 @@ if [ ! -f "$METRICS" ]; then
 fi
 mtime=$(stat -f %m "$METRICS" 2>/dev/null || echo "$now")
 age=$(( now - mtime ))
+# Track previous age to detect INCREASING-staleness (early warning of a stall:
+# even before the file is "fully stale", seeing age GROW fast across checks
+# means the daemon is falling behind its write cadence — exact precursor to the
+# 06-24 + 06-27 stalls). If age grew >=30s since the last check, escalate
+# (lower the per-check stale threshold for this run). Pure measurement, never
+# triggers a restart on its own.
+prev_age=$(cat "${STATE_DIR}/apollo-watchdog-prev-age" 2>/dev/null || echo 0)
+echo "$age" > "${STATE_DIR}/apollo-watchdog-prev-age" 2>/dev/null
+age_growth=$(( age - prev_age ))
 
 if [ "$age" -le "$STALE_SEC" ]; then
     # Healthy — reset the consecutive-stale counter.
     echo 0 > "$CONSEC_FILE" 2>/dev/null
+    # Early-stall warning (logged but does NOT change state): age growing fast
+    # between checks is the precursor pattern observed in 06-24 + 06-27 stalls.
+    # Loud only on growing-then-near-stale to avoid log spam from the normal
+    # 15s-cadence drift (each check grows ~15s; we ignore growth < threshold).
+    if [ "$age_growth" -ge "$GROWTH_THRESHOLD_SEC" ] && [ "$age" -ge "$EARLY_STALE_SEC" ]; then
+        log "EARLY-WARNING: age growing fast (prev=${prev_age}s now=${age}s, growth=${age_growth}s/${WINDOW_SEC}s-run) — daemon falling behind write cadence; will restart at age>${STALE_SEC} if it persists"
+    fi
     exit 0
 fi
 
