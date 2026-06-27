@@ -1751,6 +1751,15 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.thermal_state = metrics.thermal_state.clone();
                     }
                     last_cycle_end = Instant::now();
+                    // Phase-1 stall-candidate F1 (audit 2026-06-24): emit a warn
+                    // BEFORE the 5s sleep so we can correlate with the watchdog's
+                    // EARLY-WARNING / STALL events. Zero behavior change — only
+                    // log emission. [F1 HIGH] per /Users/eduardocortez/hardening-audit-2026-06-24/main-loop-stall-candidates.md
+                    tracing::warn!(
+                        target: "apollo.stall_candidate",
+                        cycle_count,
+                        "stall_candidate_F1: 5s sleep in cycle loop (kill-switch pause branch)"
+                    );
                     thread::sleep(Duration::from_secs(5));
                     continue;
                 }

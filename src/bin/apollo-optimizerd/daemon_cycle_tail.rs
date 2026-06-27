@@ -314,6 +314,23 @@ pub fn wire_enriched_telemetry(
     m.metrics.thermal_predicted_throttle = inputs.thermal_predicted_throttle;
     m.metrics.thermal_seconds_to_throttle = inputs.thermal_seconds_to_throttle;
     m.metrics.thermal_trend_predicted = inputs.thermal_trend_predicted.to_string();
+    // Phase-1 stall-candidate F2 (audit 2026-06-24): the metrics god-lock
+    // covers a `sysinfo::System` walk for frozen-PID RSS lookups (~150us in
+    // steady state, scales nonlinearly under pressure). Steady-state
+    // `metrics_lock_held_max_us` is ~452us; firing only when it crosses
+    // 5000us (10x headroom) keeps noise out of prod logs. Zero behavior
+    // change — only log emission. [F2 MED-HIGH] per
+    // /Users/eduardocortez/hardening-audit-2026-06-24/main-loop-stall-candidates.md
+    //
+    // Reading the freshly-stored field on `m` before drop is safe; this
+    // value is the per-cycle peak (drained from lock-free atomics above).
+    if m.metrics.metrics_lock_held_max_us > 5000 {
+        tracing::warn!(
+            target: "apollo.stall_candidate",
+            held_max_us = m.metrics.metrics_lock_held_max_us,
+            "stall_candidate_F2: metrics lock held >5ms this cycle (sysinfo walk under lock?)"
+        );
+    }
 }
 
 /// Context bundle for [`run_periodic_stage`].
