@@ -5720,9 +5720,16 @@ fn main() -> anyhow::Result<()> {
                 // ── Enriched telemetry + UCHS neurocognitive metrics ────────────────────
                 // Extracted to daemon_cycle_tail::wire_enriched_telemetry (Wave 10).
                 // Combines the two original blocks under a single state.metrics lock guard.
+                //
+                // Phase-2a (2026-06-27): compute_frozen_ram_mb runs OUTSIDE the
+                // metrics god-lock. The sysinfo walk can spike to 30ms under load
+                // (Phase-1 stall_candidate_F2 trace) — keeping it outside the lock
+                // shrinks `metrics_lock_held_max_us` back to steady-state.
+                let frozen_ram_mb =
+                    daemon_cycle_tail::compute_frozen_ram_mb(&state, &collector);
                 daemon_cycle_tail::wire_enriched_telemetry(
                     &state,
-                    &collector,
+                    frozen_ram_mb,
                     &daemon_cycle_tail::EnrichedTelemetryInputs {
                         snapshot: &snapshot,
                         swap_forecast: &swap_forecast,

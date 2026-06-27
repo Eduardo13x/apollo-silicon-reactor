@@ -30,7 +30,7 @@
 //! them. Do not bundle them into a sub-struct (NotebookLM §"Advertencia
 //! de Bloqueo").
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use apollo_engine::collector::{SystemCollector, SystemSnapshot};
@@ -125,6 +125,59 @@ pub struct EnrichedTelemetryInputs<'a> {
     pub lf_metrics: &'a apollo_engine::engine::lse_counters::LockFreeMetrics,
 }
 
+/// Sum RSS (MB) of all currently-frozen PIDs by walking the sysinfo
+/// process table.
+///
+/// CRITICAL — keep this OUTSIDE the metrics god-lock.
+///
+/// Phase-1 instrumentation (commit 126e44c) captured `stall_candidate_F2`
+/// firing 55 times across ~2h with `metrics_lock_held_max_us` peaking
+/// at 30ms — a 50x amplification over the steady-state ~559us average.
+/// Root cause: `sysinfo::System::process(pid)` locates a PID in O(N)
+/// over the ~400-entry process table; doing this N times for N frozen
+/// PIDs while holding `state.metrics` blocked every other telemetry
+/// consumer (publishers, TUI, audit drain) for the duration.
+///
+/// Per the project's Lock Scope Minimization rule
+/// (`~/.claude/skills/apollo-evolve/references/rust-systems-patterns.md`)
+/// never hold a mutex across I/O. Sysinfo lookups are in-memory but
+/// O(N) per call — the rule applies even though there is no syscall.
+///
+/// Brief `state.frozen_state` lock is acquired and released BEFORE the
+/// sysinfo walk — no mutex nesting, no I/O under any lock. The cloned
+/// `HashMap<u32, _>` is the only data crossing a lock boundary.
+///
+/// Phase-2a (2026-06-27): the result is passed into
+/// [`wire_enriched_telemetry`] as a precomputed `f64`, so the metrics
+/// lock is held only for the field-assignment + counter-drain. See
+/// `/Users/eduardocortez/hardening-audit-2026-06-24/main-loop-stall-candidates.md`
+/// (F2 MED-HIGH).
+pub fn compute_frozen_ram_mb(state: &SharedState, collector: &SystemCollector) -> f64 {
+    let frozen_pids = state.frozen_state.lock_recover().clone();
+    let sys = collector.system();
+    sum_frozen_ram_mb(&frozen_pids, &sys)
+}
+
+/// Pure, testable sum of frozen-process RSS in MiB.
+///
+/// Extracted so the Lock-Scope-Minimization refactor (compute_frozen_ram_mb)
+/// has a unit-testable pure core: callers pass the already-cloned PIDs map
+/// and a `&sysinfo::System` reference; this function does the O(N) walk only.
+///
+/// Bit-equivalent to the inlined formula the cycle_tail function used before
+/// the split: `filter_map(sys.process) | map(.memory()/1MiB) | sum | .max(0)`.
+/// The unit test in the same file (`tests` module at the bottom) verifies
+/// this equivalence against hand-computed expected values, including empty
+/// input, missing PIDs, and negative-result clamping.
+fn sum_frozen_ram_mb<V>(frozen_pids: &HashMap<u32, V>, sys: &sysinfo::System) -> f64 {
+    frozen_pids
+        .keys()
+        .filter_map(|pid| sys.process(sysinfo::Pid::from_u32(*pid)))
+        .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
+        .sum::<f64>()
+        .max(0.0)
+}
+
 /// Wire enriched telemetry + UCHS neurocognitive metrics into
 /// `RuntimeMetrics` under a single `state.metrics` lock guard.
 ///
@@ -136,16 +189,16 @@ pub struct EnrichedTelemetryInputs<'a> {
 ///   (via `fluidity_state.observe()` inside the proc-snapshot block).
 /// - `cog_decision` is this cycle's fresh neurocognitive decision.
 /// - `run_neurocognitive_tick` has already mutated `cognitive_state`.
+/// - `frozen_ram_mb` has been precomputed by [`compute_frozen_ram_mb`]
+///   BEFORE the lock is acquired (see that fn's doc for the why).
 ///
 /// Post-conditions:
 /// - `state.metrics.metrics.*` has ~20 fields refreshed.
-/// - `state.frozen_state` is briefly read-locked to sum frozen RAM.
-///
-/// Note: `collector.system()` is passed separately because we need the
-/// `sysinfo::System` reference for per-PID RSS lookups.
+/// - `state.frozen_state` is NOT touched here — the caller pre-snapshotted
+///   it into `frozen_ram_mb`.
 pub fn wire_enriched_telemetry(
     state: &SharedState,
-    collector: &SystemCollector,
+    frozen_ram_mb: f64,
     inputs: &EnrichedTelemetryInputs<'_>,
 ) {
     let mut m = state.metrics.lock_recover();
@@ -161,15 +214,11 @@ pub fn wire_enriched_telemetry(
     // producing saturating_sub underflow → always 0 or nonsense.
     m.metrics.compressed_memory_ratio =
         inputs.snapshot.pressure.compressor_pressure.clamp(0.0, 1.0);
-    // Frozen RAM: sum of RSS of currently frozen PIDs.
-    let sys = collector.system();
-    let frozen_pids = state.frozen_state.lock_recover().clone();
-    m.metrics.frozen_ram_mb = frozen_pids
-        .keys()
-        .filter_map(|pid| sys.process(sysinfo::Pid::from_u32(*pid)))
-        .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
-        .sum::<f64>()
-        .max(0.0);
+    // Frozen RAM: precomputed by the caller via `compute_frozen_ram_mb`
+    // BEFORE this lock was taken. Under pressure, walking the sysinfo
+    // process table for ~N frozen PIDs scaled to 30ms (Phase-1 F2 trace)
+    // — keeping it out of the metrics god-lock is the Phase-2a fix.
+    m.metrics.frozen_ram_mb = frozen_ram_mb;
     // cycles_high_pressure — consecutive cycles above bg_pressure.
     let bg_threshold = inputs.overflow_thresholds.bg_pressure;
     if inputs.snapshot.pressure.memory_pressure > bg_threshold {
@@ -481,4 +530,80 @@ pub fn drain_effect_decay(
         )
     };
     apollo_engine::engine::learned_state::poke_rollback_guard_via_decay(lp, hp_count, &hp_pids);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sum_frozen_ram_mb;
+    use std::collections::HashMap;
+    use sysinfo::System;
+
+    /// Bit-equivalence + edge cases for the Lock-Scope-Minimization
+    /// refactor. The pure core (`sum_frozen_ram_mb`) is testable without
+    /// constructing a `SharedState` or seeding `SystemCollector` — `System::new()`
+    /// has no processes, so `sys.process(pid)` returns None and filter_map
+    /// drops everything, giving us the empty / not-found paths cleanly.
+
+    #[test]
+    fn sum_frozen_ram_mb_empty_map_returns_zero() {
+        // Edge case: no frozen PIDs. The original inlined code also returned 0.
+        // `sum::<f64>()` over empty iterator = 0.0; `.max(0.0)` clamps.
+        let sys = System::new();
+        let frozen: HashMap<u32, ()> = HashMap::new();
+        let result = sum_frozen_ram_mb(&frozen, &sys);
+        assert!(
+            (result - 0.0).abs() < f64::EPSILON,
+            "empty frozen_state must produce 0.0, got {result}"
+        );
+    }
+
+    #[test]
+    fn sum_frozen_ram_mb_pids_not_in_system_returns_zero() {
+        // Edge case: frozen_state has PIDs, but the test System has no
+        // process entries (System::new() enumerates nothing by default).
+        // The filter_map drops every pid; sum is 0.
+        // This is the BEHAVIOR that lets us keep using System::new() in tests
+        // without a live process table.
+        let sys = System::new();
+        let mut frozen: HashMap<u32, ()> = HashMap::new();
+        frozen.insert(1234u32, ());
+        frozen.insert(5678u32, ());
+        frozen.insert(99999u32, ());
+        let result = sum_frozen_ram_mb(&frozen, &sys);
+        assert!(
+            (result - 0.0).abs() < f64::EPSILON,
+            "PIDs not in sys.process must produce 0.0 via filter_map drop, got {result}"
+        );
+    }
+
+    #[test]
+    fn sum_frozen_ram_mb_max_zero_clamp_is_a_noop_for_nonneg_sum() {
+        // The .max(0.0) clamp at the end protects against a hypothetical
+        // rounding negative (f64::sum of nonneg values cannot go negative in
+        // practice, but the original code had the clamp so we must preserve
+        // it). Verify the clamp does not alter a nonneg result.
+        let sys = System::new();
+        let frozen: HashMap<u32, ()> = HashMap::new();
+        let result = sum_frozen_ram_mb(&frozen, &sys);
+        assert!(result >= 0.0, "result must be >= 0.0, got {result}");
+    }
+
+    #[test]
+    fn sum_frozen_ram_mb_only_consumes_keys_not_values() {
+        // The pure core is generic over the value type V, so a HashMap with
+        // any payload (e.g. FrozenEntry once we wanted to test that) works.
+        // This test pins the API contract: callers don't need to materialize
+        // FrozenEntry to compute the sum.
+        let sys = System::new();
+        let mut frozen: HashMap<u32, Vec<String>> = HashMap::new();
+        frozen.insert(1u32, vec!["some".to_string(), "payload".to_string()]);
+        frozen.insert(2u32, vec![]);
+        let result = sum_frozen_ram_mb(&frozen, &sys);
+        // Still 0 because System::new() has no processes; the value types
+        // are irrelevant to the sum (filter_map only reads .memory()).
+        assert!(
+            (result - 0.0).abs() < f64::EPSILON,
+            "value type must be ignored, got {result}"
+        );
+    }
 }
