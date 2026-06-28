@@ -825,6 +825,12 @@ fn main() -> anyhow::Result<()> {
             let mut llm_counters = llm_daemon::LlmReactiveCounters::default();
             let journal_path = PathBuf::from(journal_path());
             let metrics_path = PathBuf::from(metrics_path());
+            // Phase 1.5a — per-cycle telemetry archive (MLP router unblock).
+            let metrics_history_path =
+                PathBuf::from(apollo_engine::engine::daemon_helpers::metrics_history_path());
+            let history_cfg = repo_cfg
+                .history
+                .unwrap_or_default();
             let mut critical_failure_timestamps: Vec<Instant> = Vec::new();
             let mut override_was_active = false;
             let daemon_start = Instant::now();
@@ -5745,6 +5751,27 @@ fn main() -> anyhow::Result<()> {
                         thermal_trend_predicted: &thermal_trend_predicted,
                         active_coalitions_count: active_coalitions.len() as u32,
                         lf_metrics,
+                        // Phase 1.5a — wire the per-cycle telemetry archive.
+                        // Reads from the same `world_model` constructed at
+                        // line 3586 (post-NARS-discount). Causal debias is
+                        // precomputed here (caller scope has cognitive_state
+                        // + MetaCognition in scope; pass through the f32 to
+                        // keep the lib-side writer free of MetaCognition dep).
+                        metrics_history: Some(
+                            daemon_cycle_tail::MetricsHistoryInputs {
+                                path: &metrics_history_path,
+                                cfg: &history_cfg,
+                                cycle: cycle_count,
+                                world_model: &world_model,
+                                drift_detector: &lctx.outcome_tracker.drift_detector,
+                                learnable_params: &learnable_params,
+                                causal_subsystem_debias: cognitive_state
+                                    .meta_cognition
+                                    .subsystem_debias_multiplier(
+                                        apollo_engine::engine::meta_cognition::SubsystemId::CausalGraph,
+                                    ),
+                            },
+                        ),
                     },
                 );
 

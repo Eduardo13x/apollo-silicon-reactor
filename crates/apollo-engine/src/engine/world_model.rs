@@ -154,6 +154,20 @@ impl WorldModel {
     pub fn known_actions(&self) -> usize {
         self.predicted.len()
     }
+
+    /// Maximum predicted pressure-drop advantage over the natural drift,
+    /// across all action keys the model can currently imagine. Empty model
+    /// returns 0.0. Used by the per-cycle telemetry archive (Phase 1.5a,
+    /// MLP router unblock) to expose f[12] in the 16-d feature vector.
+    /// [LeCun 2022 §4.2] — the regime-level "max predicted gain" the
+    /// offline trainer correlates against actual intervention outcomes.
+    pub fn max_predicted_margin(&self) -> f64 {
+        let baseline = self.natural_drift.max(0.0);
+        self.predicted
+            .values()
+            .map(|(avg_delta, _conf, _ev)| (avg_delta - baseline).max(0.0))
+            .fold(0.0_f64, f64::max)
+    }
 }
 
 #[cfg(test)]

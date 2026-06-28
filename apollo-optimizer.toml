@@ -3,6 +3,21 @@
 #   sudo mkdir -p /etc/apollo-optimizer
 #   sudo cp apollo-optimizer.toml /etc/apollo-optimizer/config.toml
 
+[history]
+# ── Per-cycle telemetry archive (Phase 1.5a, 2026-06-27) ────────────────────
+# Writes /var/lib/apollo/runtime_metrics_history.jsonl — one compact JSON
+# line per daemon cycle containing a 16-d feature vector + world-model
+# snapshot + NARS belief + learned-policy hash. Unblocks the MLP router PR
+# (Phase 1 CV collapsed to 0.4990 because runtime_metrics.json is a single
+# snapshot, not a time series). See .plan/PR-feature-MLP-router.md §4a.
+enabled              = true
+# Rotate the live file to runtime_metrics_history.jsonl.1 once it exceeds
+# this size. Default 100 MB. At ~22 MB/day steady state this rotates ~1×/day.
+rotation_max_bytes   = 104857600
+# Keep at most this many rotated files (current + N-1 rotated). Default 2.
+# 2 × 100 MB = 200 MB worst-case disk usage; bounded no matter the daemon lifetime.
+rotation_max_files   = 2
+
 [llm]
 # ── Conexión a Gemma 4 local via MLX (mlx_lm.server, Metal/GPU) ────────────
 # Servido por LaunchAgent com.eduardocortez.gemma4 → mlx_lm server en :8080.

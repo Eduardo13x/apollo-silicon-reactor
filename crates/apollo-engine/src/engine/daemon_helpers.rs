@@ -95,6 +95,17 @@ pub fn metrics_path() -> &'static str {
     }
 }
 
+/// Per-cycle telemetry archive (Phase 1.5a — MLP router unblock).
+/// Distinct file from `runtime_metrics.json` (which is the current snapshot).
+/// Mirrors the root-vs-non-root split of every other state file.
+pub fn metrics_history_path() -> &'static str {
+    if is_root() {
+        "/var/lib/apollo/runtime_metrics_history.jsonl"
+    } else {
+        "/tmp/apollo-runtime_metrics_history.jsonl"
+    }
+}
+
 pub fn governor_state_path() -> &'static str {
     if is_root() {
         "/var/lib/apollo/governor_state.json"

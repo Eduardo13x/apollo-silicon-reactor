@@ -32,6 +32,7 @@ pub mod coreaudio_active;
 pub mod cpu_saturation;
 pub mod cusum;
 pub mod daemon_helpers;
+pub mod daemon_metrics_history;
 pub mod daemon_state;
 pub mod decide_actions;
 pub mod degradation;

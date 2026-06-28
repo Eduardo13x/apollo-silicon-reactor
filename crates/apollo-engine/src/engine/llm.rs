@@ -12,6 +12,12 @@ use crate::engine::types::{HardPath, LatencyTarget, LlmRunMode, OptimizationProf
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RepoConfig {
     pub llm: Option<LlmConfig>,
+    /// Per-cycle telemetry archive (Phase 1.5a unblock for the MLP router PR).
+    /// Mirrors `[history]` in `apollo-optimizer.toml`; missing section falls
+    /// back to `HistoryConfig::default()` (rotation at 100 MB, cap at 1 GB).
+    /// See `daemon_metrics_history` module for the wire format.
+    #[serde(default)]
+    pub history: Option<crate::engine::daemon_metrics_history::HistoryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

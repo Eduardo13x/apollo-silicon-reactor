@@ -123,6 +123,29 @@ pub struct EnrichedTelemetryInputs<'a> {
     pub active_coalitions_count: u32,
     /// Lock-free metrics for Phase 0 lock-decomp instrumentation.
     pub lf_metrics: &'a apollo_engine::engine::lse_counters::LockFreeMetrics,
+    /// Phase 1.5a (MLP router unblock, 2026-06-27): per-cycle telemetry
+    /// archive inputs. None disables the archive for this cycle.
+    /// The snapshot append runs AFTER all `m.metrics` assignments in
+    /// [`wire_enriched_telemetry`] so the line reflects the same state the
+    /// rest of the cycle saw (atomic with the rest of cycle_tail).
+    pub metrics_history: Option<MetricsHistoryInputs<'a>>,
+}
+
+/// Phase 1.5a per-cycle archive inputs (forwarded to
+/// [`apollo_engine::engine::daemon_metrics_history::append_history_snapshot`]).
+///
+/// `causal_subsystem_debias` is precomputed by the caller
+/// (`cognitive_state.meta_cognition.subsystem_debias_multiplier(CausalGraph)`)
+/// to keep the archive writer free of MetaCognition dep so it can be unit
+/// tested without a live cognitive stack.
+pub struct MetricsHistoryInputs<'a> {
+    pub path: &'a Path,
+    pub cfg: &'a apollo_engine::engine::daemon_metrics_history::HistoryConfig,
+    pub cycle: u64,
+    pub world_model: &'a apollo_engine::engine::world_model::WorldModel,
+    pub drift_detector: &'a apollo_engine::engine::nars_belief::DriftDetector,
+    pub learnable_params: &'a apollo_engine::engine::learned_state::LearnableParams,
+    pub causal_subsystem_debias: f32,
 }
 
 /// Sum RSS (MB) of all currently-frozen PIDs by walking the sysinfo
@@ -379,6 +402,47 @@ pub fn wire_enriched_telemetry(
             held_max_us = m.metrics.metrics_lock_held_max_us,
             "stall_candidate_F2: metrics lock held >5ms this cycle (sysinfo walk under lock?)"
         );
+    }
+
+    // ── Phase 1.5a per-cycle telemetry archive (2026-06-27) ──────────────
+    // Append a JSONL line to /var/lib/apollo/runtime_metrics_history.jsonl
+    // AFTER all m.metrics assignments above. The 16-d feature vector is
+    // built from the freshly-stored RuntimeMetrics + the caller's
+    // world_model / drift_detector / learnable_params. Failure is
+    // best-effort: log + return Err (the caller decides). Cycle is never
+    // blocked — `append_history_snapshot` does its own fsync budget and
+    // bails out on I/O error without panicking. Unblocks the MLP router
+    // PR (Phase 1 CV collapsed to majority-class baseline because
+    // runtime_metrics.json is a single snapshot, not a time series).
+    // ponytail: minimum that works, no decision-path mutation.
+    //
+    // Snapshot the freshly-stored `RuntimeMetrics` BEFORE releasing the
+    // lock — avoids a second lock acquisition + a race where another
+    // writer could land between drop and re-lock.
+    let snapshot_metrics = m.metrics.clone();
+    drop(m); // release the metrics lock before any I/O (Lock Scope Minimization)
+    if let Some(ref mh) = inputs.metrics_history {
+        if let Err(e) = apollo_engine::engine::daemon_metrics_history::append_history_snapshot(
+            mh.path,
+            mh.cfg,
+            &snapshot_metrics,
+            mh.cycle,
+            mh.world_model,
+            mh.drift_detector,
+            mh.learnable_params,
+            mh.causal_subsystem_debias,
+        ) {
+            // Mirror the append_failure path inside append_history_snapshot:
+            // the function has ALREADY bumped FAILED_WRITES + emitted warn.
+            // Surface here only for diagnosability; cycle continues.
+            tracing::debug!(
+                target: "apollo.metrics_history",
+                path = %mh.path.display(),
+                cycle = mh.cycle,
+                error = %e,
+                "cycle_tail: metrics_history append surfaced Err (already counted)"
+            );
+        }
     }
 }
 
