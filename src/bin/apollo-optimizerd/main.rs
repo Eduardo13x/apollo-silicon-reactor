@@ -2191,13 +2191,27 @@ fn main() -> anyhow::Result<()> {
                 // so page_reclaim + io_shaper + governor act before hardware throttles.
                 // M1 Air has no fan — acting 5-10°C before the hardware ceiling prevents
                 // visible stutter caused by hardware-level frequency reduction.
-                let thermal_pressure_boost = match thermal_action.phase {
+                //
+                // WarmBand (2026-06-28 heat-aware throttle scheduling): pre-stage
+                // pressure boost triggered on temperature trend OR absolute temp in
+                // 75-80°C band, before Phase1Gentle fires. This is read-only: only
+                // adds to effective_pressure via thermal_pressure_boost. The trend
+                // analysis lives in ThermalBailout::compute_warm_boost and is
+                // already in the `thermal_action.warm_pressure_boost` field. We
+                // add it on top of the phase-derived base.
+                let mut thermal_pressure_boost = match thermal_action.phase {
                     apollo_engine::engine::thermal_bailout::CoolingPhase::Normal => 0.0,
+                    apollo_engine::engine::thermal_bailout::CoolingPhase::WarmBand => 0.0,
                     apollo_engine::engine::thermal_bailout::CoolingPhase::Phase1Gentle => 0.07,
                     apollo_engine::engine::thermal_bailout::CoolingPhase::Phase2Moderate => 0.15,
                     apollo_engine::engine::thermal_bailout::CoolingPhase::Phase3Aggressive => 0.25,
                     apollo_engine::engine::thermal_bailout::CoolingPhase::Phase4Emergency => 0.40,
                 };
+                // Heat-aware pre-stage boost (2026-06-28). Capped at 0.05 in the
+                // thermal_bailout module; ONLY added, never overrides. Independent
+                // of the main phase ladder — can coexist with any phase.
+                thermal_pressure_boost +=
+                    (thermal_action.warm_pressure_boost as f64).clamp(0.0, 0.05);
 
                 // Thermal pre-throttle freeze/unfreeze.
                 // Extracted to daemon_thermal_freeze::run_thermal_freeze (Wave 20).
