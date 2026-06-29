@@ -116,20 +116,22 @@ impl HistoryConfig {
     }
 }
 
-// ── Failed-write counter (lock-free, exposed for diagnostics) ────────────────
+use crate::engine::lse_counters::LSE_COUNTERS;
 
-static FAILED_WRITES: AtomicU64 = AtomicU64::new(0);
-
-/// Total failed append attempts (lock-free). Visible via `runtime_metrics.json`
-/// only if a future PR adds a `#[serde(default)]` mirror; today it lives in
-/// the daemon log + this counter for unit tests.
+/// Total failed append attempts (lock-free). Visible via `runtime_metrics.json`.
 pub fn failed_writes_total() -> u64 {
-    FAILED_WRITES.load(Ordering::Relaxed)
+    LSE_COUNTERS.snapshot().failed_history_writes
 }
 
 #[cfg(test)]
 pub(crate) fn reset_failed_writes_for_test() {
-    FAILED_WRITES.store(0, Ordering::Relaxed);
+    // There is no reset method for LSE_COUNTERS in production;
+    // tests usually rely on starting with 0 or keeping track of deltas.
+    // However, since atomic counters are global across tests, they might
+    // need a reset in test mode. We will subtract the current value:
+    LSE_COUNTERS
+        .failed_history_writes
+        .store(0, Ordering::Relaxed);
 }
 
 // ── 16-d feature extraction (per SPEC §4a) ───────────────────────────────────
@@ -168,8 +170,8 @@ pub fn extract_features(
     drift_detector: &DriftDetector,
 ) -> [f32; 16] {
     // f[1]: swap GB normalised to 4 GB ceiling. swap_used_bytes is u64.
-    let swap_gb_norm = (metrics.swap_used_bytes as f32 / (4.0 * 1024.0 * 1024.0 * 1024.0))
-        .clamp(0.0, 1.0);
+    let swap_gb_norm =
+        (metrics.swap_used_bytes as f32 / (4.0 * 1024.0 * 1024.0 * 1024.0)).clamp(0.0, 1.0);
     // f[2]: swap delta bytes-per-second / 524288 (one 512 KiB write/sec).
     let swap_delta_norm = (metrics.swap_delta_bps as f32 / 524_288.0).clamp(0.0, 1.0);
     // f[3]: thrashing score / 10000. Scale matches `decide_actions.rs:1362`.
@@ -210,7 +212,11 @@ pub fn extract_features(
         / metrics.cycles.max(1) as f32)
         .clamp(0.0, 1.0);
     // f[15]: realtime call is a 0/1 signal.
-    let call_active = if metrics.user_call_in_progress { 1.0 } else { 0.0 };
+    let call_active = if metrics.user_call_in_progress {
+        1.0
+    } else {
+        0.0
+    };
 
     [
         metrics.memory_pressure as f32,
@@ -334,7 +340,7 @@ pub fn append_history_snapshot(
             }
         }
         if let Err(e) = fs::rename(path, &rotated_path) {
-            FAILED_WRITES.fetch_add(1, Ordering::Relaxed);
+            LSE_COUNTERS.inc_failed_history_writes();
             tracing::warn!(
                 target: "apollo.metrics_history",
                 path = %path.display(),
@@ -347,7 +353,12 @@ pub fn append_history_snapshot(
     }
 
     // Build the line.
-    let features = extract_features(metrics, causal_subsystem_debias, world_model, drift_detector);
+    let features = extract_features(
+        metrics,
+        causal_subsystem_debias,
+        world_model,
+        drift_detector,
+    );
     let line = HistoryLine {
         t: chrono::Utc::now().timestamp(),
         c: cycle,
@@ -367,17 +378,14 @@ pub fn append_history_snapshot(
     buf.push(b'\n');
 
     let result = (|| -> std::io::Result<()> {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut f = OpenOptions::new().create(true).append(true).open(path)?;
         f.write_all(&buf)?;
         f.sync_all()?;
         Ok(())
     })();
 
     if let Err(e) = result {
-        FAILED_WRITES.fetch_add(1, Ordering::Relaxed);
+        LSE_COUNTERS.inc_failed_history_writes();
         tracing::warn!(
             target: "apollo.metrics_history",
             path = %path.display(),
@@ -454,8 +462,8 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).expect("read");
         assert_eq!(content.lines().count(), 1, "exactly one line written");
-        let v: serde_json::Value = serde_json::from_str(content.trim_end())
-            .expect("valid JSON line");
+        let v: serde_json::Value =
+            serde_json::from_str(content.trim_end()).expect("valid JSON line");
         assert!(v.get("t").is_some(), "key 't' present");
         assert!(v.get("c").is_some(), "key 'c' present");
         assert!(v.get("f").is_some(), "key 'f' present");
@@ -466,13 +474,34 @@ mod tests {
         assert_eq!(f.len(), 16, "16-d feature vector");
         assert_eq!(v.get("c").and_then(|x| x.as_u64()), Some(4242));
         // Spot-check a few features against the input values.
-        assert!((f[0].as_f64().unwrap() - 0.5).abs() < 1e-6, "f[0] = memory_pressure");
-        assert!((f[1].as_f64().unwrap() - 0.5).abs() < 1e-6, "f[1] = swap GB / 4");
-        assert!((f[4].as_f64().unwrap() - 0.7).abs() < 1e-6, "f[4] = cpu_max_busy");
-        assert!((f[9].as_f64().unwrap() - 0.0).abs() < 1e-6, "f[9] = humble_mode");
-        assert!((f[10].as_f64().unwrap() - 1.0).abs() < 1e-6, "f[10] = debias");
-        assert!((f[11].as_f64().unwrap() - 0.5).abs() < 1e-6, "f[11] = disagreement");
-        assert!((f[15].as_f64().unwrap() - 0.0).abs() < 1e-6, "f[15] = call_inactive");
+        assert!(
+            (f[0].as_f64().unwrap() - 0.5).abs() < 1e-6,
+            "f[0] = memory_pressure"
+        );
+        assert!(
+            (f[1].as_f64().unwrap() - 0.5).abs() < 1e-6,
+            "f[1] = swap GB / 4"
+        );
+        assert!(
+            (f[4].as_f64().unwrap() - 0.7).abs() < 1e-6,
+            "f[4] = cpu_max_busy"
+        );
+        assert!(
+            (f[9].as_f64().unwrap() - 0.0).abs() < 1e-6,
+            "f[9] = humble_mode"
+        );
+        assert!(
+            (f[10].as_f64().unwrap() - 1.0).abs() < 1e-6,
+            "f[10] = debias"
+        );
+        assert!(
+            (f[11].as_f64().unwrap() - 0.5).abs() < 1e-6,
+            "f[11] = disagreement"
+        );
+        assert!(
+            (f[15].as_f64().unwrap() - 0.0).abs() < 1e-6,
+            "f[15] = call_inactive"
+        );
     }
 
     #[test]
@@ -490,24 +519,21 @@ mod tests {
         let dd = DriftDetector::default();
         let lp = LearnableParams::default();
 
-        append_history_snapshot(
-            &path,
-            &tiny_cfg(),
-            &metrics,
-            1,
-            &wm,
-            &dd,
-            &lp,
-            1.0,
-        )
-        .expect("append after rotation");
+        append_history_snapshot(&path, &tiny_cfg(), &metrics, 1, &wm, &dd, &lp, 1.0)
+            .expect("append after rotation");
 
         let rotated = path.with_extension("jsonl.1");
         assert!(rotated.exists(), "rotated file .jsonl.1 exists");
         // Live file should now contain exactly the new JSON line, not the seed.
         let content = std::fs::read_to_string(&path).expect("read live");
-        assert!(!content.starts_with("xxxx"), "live file is the new line, not seed");
-        assert!(content.contains("\"c\":1"), "live file has the new cycle's line");
+        assert!(
+            !content.starts_with("xxxx"),
+            "live file is the new line, not seed"
+        );
+        assert!(
+            content.contains("\"c\":1"),
+            "live file has the new cycle's line"
+        );
     }
 
     #[test]
@@ -516,7 +542,10 @@ mod tests {
         // Path whose parent directory does NOT exist. OpenOptions::create(true)
         // creates the file but not the parent → open() fails. We expect Err,
         // NO panic, and the failed-writes counter increments.
-        let path = dir.path().join("nonexistent_subdir_xyz").join("history.jsonl");
+        let path = dir
+            .path()
+            .join("nonexistent_subdir_xyz")
+            .join("history.jsonl");
         reset_failed_writes_for_test();
 
         let metrics = tiny_metrics();
@@ -524,16 +553,7 @@ mod tests {
         let dd = DriftDetector::default();
         let lp = LearnableParams::default();
 
-        let result = append_history_snapshot(
-            &path,
-            &tiny_cfg(),
-            &metrics,
-            1,
-            &wm,
-            &dd,
-            &lp,
-            1.0,
-        );
+        let result = append_history_snapshot(&path, &tiny_cfg(), &metrics, 1, &wm, &dd, &lp, 1.0);
         assert!(result.is_err(), "write to non-existent parent must fail");
         let msg = format!("{}", result.unwrap_err());
         // We don't pin the exact error kind (EACCES vs ENOENT varies by
@@ -560,17 +580,8 @@ mod tests {
         let dd = DriftDetector::default();
         let lp = LearnableParams::default();
 
-        append_history_snapshot(
-            &path,
-            &tiny_cfg(),
-            &metrics,
-            99,
-            &wm,
-            &dd,
-            &lp,
-            1.0,
-        )
-        .expect("no-op return Ok");
+        append_history_snapshot(&path, &tiny_cfg(), &metrics, 99, &wm, &dd, &lp, 1.0)
+            .expect("no-op return Ok");
 
         // Live file is unchanged — the no-op must not have written.
         let content = std::fs::read_to_string(&path).expect("read");

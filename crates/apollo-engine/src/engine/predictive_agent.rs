@@ -507,7 +507,8 @@ impl SpecialistAccuracyTracker {
         // live decision). Uses the just-updated calibration.
         let raw_winner = tally_votes(votes).intervention;
         let calibrated_winner = tally_votes_calibrated(votes, &self.calibration);
-        self.calibration.record_shadow(raw_winner, calibrated_winner);
+        self.calibration
+            .record_shadow(raw_winner, calibrated_winner);
     }
 
     /// Read-only access to the confidence calibration table (C2 shadow
@@ -1075,7 +1076,11 @@ mod tests {
 
     // ── C2 confidence calibration (MoCaE) ────────────────────────────────────
     fn sv(name: &'static str, iv: Intervention, conf: f64) -> SpecialistVote {
-        SpecialistVote { name, intervention: iv, confidence: conf }
+        SpecialistVote {
+            name,
+            intervention: iv,
+            confidence: conf,
+        }
     }
 
     #[test]
@@ -1124,7 +1129,10 @@ mod tests {
             sv("kalman", Intervention::ProactivePurge, 0.8),
         ];
         // Raw fusion: 0.8 == 0.8 tie → lower-index intervention wins (Tighten=1).
-        assert_eq!(tally_votes(&votes).intervention, Intervention::TightenThresholds);
+        assert_eq!(
+            tally_votes(&votes).intervention,
+            Intervention::TightenThresholds
+        );
         // Calibrated: LinUCB down-weighted (unreliable), Kalman up → Purge wins.
         assert_eq!(
             tally_votes_calibrated(&votes, &c),
@@ -1161,8 +1169,14 @@ mod tests {
         }
         let c = t.calibration();
         assert!(c.total_obs() >= 80, "both specialists' votes recorded");
-        assert!(c.reliability(specialist::LINUCB, 0.8) < 0.3, "LinUCB unreliable at 0.8");
-        assert!(c.reliability(specialist::KALMAN, 0.8) > 0.7, "Kalman reliable at 0.8");
+        assert!(
+            c.reliability(specialist::LINUCB, 0.8) < 0.3,
+            "LinUCB unreliable at 0.8"
+        );
+        assert!(
+            c.reliability(specialist::KALMAN, 0.8) > 0.7,
+            "Kalman reliable at 0.8"
+        );
         assert!(c.shadow_decisions >= 40, "shadow decisions counted");
         assert!(
             c.shadow_disagreements > 0,

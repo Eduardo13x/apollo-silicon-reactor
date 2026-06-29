@@ -1425,8 +1425,10 @@ mod tests {
 
     #[test]
     fn apply_interactive_pattern_adds_boost() {
+        apollo_engine::engine::shadow_signals::set_foreground_pid(Some(42));
         let snap = snapshot_with(vec![proc(42, "Xcode", 20.0)]);
-        let result = apply_learned_policy_actions(&snap, &policy(&["Xcode"], &[], &[]), vec![], None);
+        let result =
+            apply_learned_policy_actions(&snap, &policy(&["Xcode"], &[], &[]), vec![], None);
         assert_eq!(result.len(), 1);
         match &result[0] {
             RootAction::BoostProcess { pid, name, .. } => {
@@ -1435,10 +1437,12 @@ mod tests {
             }
             _ => panic!("expected BoostProcess"),
         }
+        apollo_engine::engine::shadow_signals::set_foreground_pid(None);
     }
 
     #[test]
     fn apply_no_duplicate_boost_when_already_present() {
+        apollo_engine::engine::shadow_signals::set_foreground_pid(Some(42));
         let snap = snapshot_with(vec![proc(42, "Xcode", 20.0)]);
         let existing = vec![RootAction::BoostProcess {
             pid: 42,
@@ -1455,6 +1459,7 @@ mod tests {
             .filter(|a| matches!(a, RootAction::BoostProcess { .. }))
             .count();
         assert_eq!(boosts, 1, "must not duplicate existing boost");
+        apollo_engine::engine::shadow_signals::set_foreground_pid(None);
     }
 
     #[test]

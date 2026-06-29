@@ -828,9 +828,7 @@ fn main() -> anyhow::Result<()> {
             // Phase 1.5a — per-cycle telemetry archive (MLP router unblock).
             let metrics_history_path =
                 PathBuf::from(apollo_engine::engine::daemon_helpers::metrics_history_path());
-            let history_cfg = repo_cfg
-                .history
-                .unwrap_or_default();
+            let history_cfg = repo_cfg.history.unwrap_or_default();
             let mut critical_failure_timestamps: Vec<Instant> = Vec::new();
             let mut override_was_active = false;
             let daemon_start = Instant::now();
@@ -3699,7 +3697,10 @@ fn main() -> anyhow::Result<()> {
                 // enrich→decide signal-intelligence region.
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonSignalIntel,
-                    _t_signalintel_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    _t_signalintel_start
+                        .elapsed()
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64,
                 );
 
                 // 2026-05-30: ReasonDecide stage instrumentation. Closes
@@ -5745,8 +5746,7 @@ fn main() -> anyhow::Result<()> {
                 // metrics god-lock. The sysinfo walk can spike to 30ms under load
                 // (Phase-1 stall_candidate_F2 trace) — keeping it outside the lock
                 // shrinks `metrics_lock_held_max_us` back to steady-state.
-                let frozen_ram_mb =
-                    daemon_cycle_tail::compute_frozen_ram_mb(&state, &collector);
+                let frozen_ram_mb = daemon_cycle_tail::compute_frozen_ram_mb(&state, &collector);
                 daemon_cycle_tail::wire_enriched_telemetry(
                     &state,
                     frozen_ram_mb,
@@ -5771,21 +5771,19 @@ fn main() -> anyhow::Result<()> {
                         // precomputed here (caller scope has cognitive_state
                         // + MetaCognition in scope; pass through the f32 to
                         // keep the lib-side writer free of MetaCognition dep).
-                        metrics_history: Some(
-                            daemon_cycle_tail::MetricsHistoryInputs {
-                                path: &metrics_history_path,
-                                cfg: &history_cfg,
-                                cycle: cycle_count,
-                                world_model: &world_model,
-                                drift_detector: &lctx.outcome_tracker.drift_detector,
-                                learnable_params: &learnable_params,
-                                causal_subsystem_debias: cognitive_state
-                                    .meta_cognition
-                                    .subsystem_debias_multiplier(
-                                        apollo_engine::engine::meta_cognition::SubsystemId::CausalGraph,
-                                    ),
-                            },
-                        ),
+                        metrics_history: Some(daemon_cycle_tail::MetricsHistoryInputs {
+                            path: &metrics_history_path,
+                            cfg: &history_cfg,
+                            cycle: cycle_count,
+                            world_model: &world_model,
+                            drift_detector: &lctx.outcome_tracker.drift_detector,
+                            learnable_params: &learnable_params,
+                            causal_subsystem_debias: cognitive_state
+                                .meta_cognition
+                                .subsystem_debias_multiplier(
+                                    apollo_engine::engine::meta_cognition::SubsystemId::CausalGraph,
+                                ),
+                        }),
                     },
                 );
 

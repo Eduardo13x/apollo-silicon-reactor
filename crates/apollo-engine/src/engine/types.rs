@@ -597,6 +597,9 @@ pub struct RuntimeMetrics {
     pub zombies_detected: u64,
     #[serde(default)]
     pub kills_applied: u64,
+    /// Metrics history append failures.
+    #[serde(default)]
+    pub failed_history_writes: u64,
     /// Cumulative number of times survival mode was *entered* this session.
     /// Sticky counter — never decrements, even after recovery. Persists in
     /// JSON under the legacy key `survival_mode_activations` for backward

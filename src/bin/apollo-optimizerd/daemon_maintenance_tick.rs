@@ -529,8 +529,10 @@ mod tests {
         // 1.5 GB absolute floor MUST kick in to skip.
         let snap = synth_snap(0.70, 500 * 1024 * 1024, 800 * 1024 * 1024);
         let ctx = idle_ctx();
-        let mut state = MaintenanceState::default();
-        state.purge_band_eligible = true; // B.4: bypass rising-edge, test swap floor
+        let mut state = MaintenanceState {
+            purge_band_eligible: true, // B.4: bypass rising-edge, test swap floor
+            ..Default::default()
+        };
         assert_eq!(
             should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::SwapFloor)
@@ -541,8 +543,10 @@ mod tests {
     fn should_fire_growing_swap_returns_growing() {
         let snap = synth_snap(0.70, 3_000_000_000, 4_000_000_000);
         let ctx = idle_ctx();
-        let mut state = MaintenanceState::default();
-        state.purge_band_eligible = true; // B.4: bypass rising-edge, test growing
+        let mut state = MaintenanceState {
+            purge_band_eligible: true, // B.4: bypass rising-edge, test growing
+            ..Default::default()
+        };
         assert_eq!(
             should_fire(&snap, &ctx, &state, false, false),
             Some(SkipReason::Growing)
@@ -638,8 +642,10 @@ mod tests {
             audio_active: true,
             ..Default::default()
         };
-        let mut state = MaintenanceState::default();
-        state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
+        let mut state = MaintenanceState {
+            consecutive_thrash_cycles: EMERGENCY_THRASHING_MIN_CYCLES,
+            ..Default::default()
+        };
 
         assert!(
             !emergency_thrashing_purge_allowed(
@@ -667,8 +673,10 @@ mod tests {
         // B.5 thrash-streak bypass — only true OOM imminence (critical_lockup)
         // may eat the purge stall. Reproduces "se purgea mucho en llamadas".
         let ctx = idle_ctx(); // no pmset media flag — the call is browser-based
-        let mut state = MaintenanceState::default();
-        state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
+        let mut state = MaintenanceState {
+            consecutive_thrash_cycles: EMERGENCY_THRASHING_MIN_CYCLES,
+            ..Default::default()
+        };
         state.consecutive_thrash_50k_cycles = 12; // would trip the B.5 streak bypass
 
         // Without a realtime call, the 50k streak bypasses → purge allowed.
@@ -702,8 +710,10 @@ mod tests {
         // swap stayed flat — benign page-cache churn, not scarcity. The
         // purge stall was the user's "stutter at random moments".
         let ctx = idle_ctx();
-        let mut state = MaintenanceState::default();
-        state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
+        let mut state = MaintenanceState {
+            consecutive_thrash_cycles: EMERGENCY_THRASHING_MIN_CYCLES,
+            ..Default::default()
+        };
         state.consecutive_thrash_50k_cycles = 12; // streak that used to bypass
 
         // Low pressure (0.55) + sub-critical p_oom → the streak no longer
@@ -735,8 +745,10 @@ mod tests {
     #[test]
     fn emergency_thrashing_keeps_build_and_bus_blocks() {
         let ctx = idle_ctx();
-        let mut state = MaintenanceState::default();
-        state.consecutive_thrash_cycles = EMERGENCY_THRASHING_MIN_CYCLES;
+        let mut state = MaintenanceState {
+            consecutive_thrash_cycles: EMERGENCY_THRASHING_MIN_CYCLES,
+            ..Default::default()
+        };
 
         assert!(
             !emergency_thrashing_purge_allowed(

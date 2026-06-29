@@ -91,13 +91,8 @@ const MEDIA_PATTERNS: &[&str] = &[
 /// apps (Slack/Discord/Zoom/Teams) which must NEVER trigger a media yield
 /// (a chat notification ping would otherwise starve the user's terminal; calls
 /// are already handled by `is_realtime_call_active`).
-const MEDIA_BROWSER_HOSTS: &[&str] = &[
-    "Brave Browser",
-    "Google Chrome",
-    "Firefox",
-    "Safari",
-    "Arc",
-];
+const MEDIA_BROWSER_HOSTS: &[&str] =
+    &["Brave Browser", "Google Chrome", "Firefox", "Safari", "Arc"];
 
 /// True iff `name` is a frontmost-app media host (a browser that plays 4K in a
 /// tab, or a dedicated media player). Used by the boost path: a boost on a

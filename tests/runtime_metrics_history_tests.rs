@@ -15,8 +15,8 @@ use apollo_engine::engine::daemon_metrics_history::{
 };
 use apollo_engine::engine::learned_state::LearnableParams;
 use apollo_engine::engine::nars_belief::DriftDetector;
-use apollo_engine::engine::world_model::WorldModel;
 use apollo_engine::engine::types::RuntimeMetrics;
+use apollo_engine::engine::world_model::WorldModel;
 
 /// Make a unique tempdir under /tmp so the test never collides with real
 /// `/var/lib/apollo/runtime_metrics_history.jsonl`.
@@ -57,9 +57,14 @@ fn single_write_produces_16_features_and_required_keys() {
     let cfg = HistoryConfig::default();
 
     append_history_snapshot(
-        &path, &cfg, &empty_metrics(), 4242,
-        &empty_world_model(), &empty_drift_detector(),
-        &empty_learnable(), 0.5,
+        &path,
+        &cfg,
+        &empty_metrics(),
+        4242,
+        &empty_world_model(),
+        &empty_drift_detector(),
+        &empty_learnable(),
+        0.5,
     )
     .expect("append should succeed on first write");
 
@@ -77,7 +82,10 @@ fn single_write_produces_16_features_and_required_keys() {
     let f_end = line[f_start..].find("]").unwrap() + f_start;
     let f_array = &line[f_start..f_end];
     let n_features = f_array.split(',').count();
-    assert_eq!(n_features, 16, "feature vector must be 16-d, got {n_features}");
+    assert_eq!(
+        n_features, 16,
+        "feature vector must be 16-d, got {n_features}"
+    );
 
     // Per-cycle invariants per SPEC.
     assert!(line.contains("\"w\":"), "world-model drift missing");
@@ -95,20 +103,39 @@ fn multiple_writes_append_one_line_each_no_overwrite() {
 
     for c in 0u64..5 {
         append_history_snapshot(
-            &path, &cfg, &empty_metrics(), c,
-            &empty_world_model(), &empty_drift_detector(),
-            &empty_learnable(), 0.0,
+            &path,
+            &cfg,
+            &empty_metrics(),
+            c,
+            &empty_world_model(),
+            &empty_drift_detector(),
+            &empty_learnable(),
+            0.0,
         )
         .expect("append succeeds");
     }
 
     let body = fs::read_to_string(&path).expect("read");
     let lines: Vec<&str> = body.lines().collect();
-    assert_eq!(lines.len(), 5, "must append one line per cycle, got {}", lines.len());
+    assert_eq!(
+        lines.len(),
+        5,
+        "must append one line per cycle, got {}",
+        lines.len()
+    );
     // Cycle counts must be strictly increasing.
     let cycles: Vec<u64> = lines
         .iter()
-        .map(|l| l.split("\"c\":").nth(1).unwrap().split(',').next().unwrap().parse().unwrap())
+        .map(|l| {
+            l.split("\"c\":")
+                .nth(1)
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
         .collect();
     assert_eq!(cycles, vec![0, 1, 2, 3, 4], "cycles must be 0..4 in order");
 
@@ -125,9 +152,14 @@ fn disabled_config_makes_writer_a_noop() {
     };
 
     append_history_snapshot(
-        &path, &cfg, &empty_metrics(), 0,
-        &empty_world_model(), &empty_drift_detector(),
-        &empty_learnable(), 0.0,
+        &path,
+        &cfg,
+        &empty_metrics(),
+        0,
+        &empty_world_model(),
+        &empty_drift_detector(),
+        &empty_learnable(),
+        0.0,
     )
     .expect("no-op returns Ok");
 
@@ -149,13 +181,21 @@ fn write_failure_does_not_panic_caller() {
 
     let result = std::panic::catch_unwind(|| {
         append_history_snapshot(
-            &bad_path, &cfg, &empty_metrics(), 0,
-            &empty_world_model(), &empty_drift_detector(),
-            &empty_learnable(), 0.0,
+            &bad_path,
+            &cfg,
+            &empty_metrics(),
+            0,
+            &empty_world_model(),
+            &empty_drift_detector(),
+            &empty_learnable(),
+            0.0,
         )
     });
     let outcome = result.expect("append_history_snapshot must not panic on a bad path");
-    assert!(outcome.is_err(), "bad path must return Err, got {outcome:?}");
+    assert!(
+        outcome.is_err(),
+        "bad path must return Err, got {outcome:?}"
+    );
 
     fs::remove_dir_all(blocker.parent().unwrap()).ok();
 }
@@ -176,9 +216,14 @@ fn startup_cap_makes_writer_a_noop_after_first_write() {
     // First write: cap check sees live_size=0, allows, writes one ~250 byte
     // line.
     append_history_snapshot(
-        &path, &cfg, &empty_metrics(), 0,
-        &empty_world_model(), &empty_drift_detector(),
-        &empty_learnable(), 0.0,
+        &path,
+        &cfg,
+        &empty_metrics(),
+        0,
+        &empty_world_model(),
+        &empty_drift_detector(),
+        &empty_learnable(),
+        0.0,
     )
     .expect("first append succeeds");
     let size_after_first = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -190,9 +235,14 @@ fn startup_cap_makes_writer_a_noop_after_first_write() {
     // Second write: cap check sees live_size > 1, no-op, file size
     // unchanged.
     append_history_snapshot(
-        &path, &cfg, &empty_metrics(), 1,
-        &empty_world_model(), &empty_drift_detector(),
-        &empty_learnable(), 0.0,
+        &path,
+        &cfg,
+        &empty_metrics(),
+        1,
+        &empty_world_model(),
+        &empty_drift_detector(),
+        &empty_learnable(),
+        0.0,
     )
     .expect("cap-noop returns Ok");
     let size_after_second = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);

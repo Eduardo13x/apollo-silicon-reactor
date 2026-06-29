@@ -191,8 +191,10 @@ impl TeacherConsolidator {
         // credit for 0.02.
         let causal_effect = observed_drop - natural_drift_ema;
 
-        let mut report = ConsolidationReport::default();
-        report.natural_drift_subtracted = natural_drift_ema;
+        let mut report = ConsolidationReport {
+            natural_drift_subtracted: natural_drift_ema,
+            ..Default::default()
+        };
         report.causal_effect = causal_effect;
 
         // Deadband: too small to be signal. Skip update entirely.

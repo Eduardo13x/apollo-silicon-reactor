@@ -105,6 +105,7 @@ impl MetricsState {
             lf.actions_pushed_quarantine_daemon_total;
         self.metrics.actions_pushed_raw_total = lf.actions_pushed_raw_total;
         self.metrics.actions_rejected_shape_total = lf.actions_rejected_shape_total;
+        self.metrics.failed_history_writes = lf.failed_history_writes;
         self.metrics.memory_budget_duration_ms = lf.memory_budget_duration_us as f64 / 1000.0;
         self.metrics.reactor_duration_ms = lf.reactor_duration_us as f64 / 1000.0;
 

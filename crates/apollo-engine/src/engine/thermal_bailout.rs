@@ -105,10 +105,10 @@ pub struct ThermalBailout {
     recover_ticks: u32,
     /// WarmBand temperature ring buffer (last 8 samples, ~4s at 500ms cadence).
     /// Used to compute the rate-of-rise that triggers the pre-Phase1 band.
-    warm_temps: [f32; 8],
+    warm_temps: [f32; WARM_BUFFER_SIZE],
     /// Next write index in the warm_temps ring (wraps).
     warm_idx: usize,
-    /// Number of valid samples currently in the buffer (0..=8).
+    /// Number of valid samples currently in the buffer (0..=WARM_BUFFER_SIZE).
     warm_filled: usize,
 }
 
@@ -117,6 +117,7 @@ pub struct ThermalBailout {
 // trend_c_per_min >= WARM_TREND_RATE_C_PER_MIN). The intent: act on the
 // trend, not just the absolute level, so Apollo raises effective pressure
 // during a 4K-decoder session before Phase1Gentle fires at 80°C.
+const WARM_BUFFER_SIZE: usize = 8;
 const WARM_ABS_ENTER_C: f32 = 75.0;
 const WARM_TREND_FLOOR_C: f32 = 60.0;
 const WARM_TREND_RATE_C_PER_MIN: f32 = 0.5;
@@ -136,7 +137,7 @@ impl ThermalBailout {
             recover_ticks: 0,
             // WarmBand trend buffer: keeps the last 8 temp samples (~4s at
             // 500ms cadence) to compute rate-of-rise. Empty on startup.
-            warm_temps: [0.0; 8],
+            warm_temps: [0.0; WARM_BUFFER_SIZE],
             warm_idx: 0,
             warm_filled: 0,
         }
@@ -203,7 +204,7 @@ impl ThermalBailout {
         let (current, oldest) = self.warm_trend_endpoints();
         let rate_per_cycle = (current - oldest) / ((self.warm_filled - 1) as f32).max(1.0);
         // Approximate cycles-per-minute from a typical 250-300ms cadence.
-        // We use 250ms (2.4 Hz) for a slightly-conservative rate; actual
+        // We use 250ms (4.0 Hz) for a slightly-conservative rate; actual
         // cadence is at least that.
         let rate_c_per_min = rate_per_cycle * 240.0_f32;
 
