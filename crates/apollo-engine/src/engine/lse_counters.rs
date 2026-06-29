@@ -743,6 +743,15 @@ pub struct LockFreeMetrics {
     /// false-positive `effect_decay_detected_total` ticks under the
     /// Round-2 unconditional-record_global design.
     pub effect_decay_phantom_enroll_skipped_total: AtomicU64,
+    /// WarmBand pre-stage observability (commit 5346513 + audit F-03):
+    /// `warm_band_fires` counts cycles where compute_warm_boost() returned
+    /// > 0.0 (i.e. the trend or absolute-temp trigger fired). `warm_boost_sum_x1000`
+    /// accumulates the boost values (×1000 so we can publish f32 in an integer
+    /// counter without float atomics) — divide by 1000 at the consumer to
+    /// recover the f32 average. If these stay 0 over thousands of cycles
+    /// under load, F-06 is confirmed — WarmBand is dead in practice.
+    pub warm_band_fires: AtomicU64,
+    pub warm_boost_sum_x1000: AtomicU64,
 }
 
 /// Process-wide lock-free counters. Used by code paths that cannot easily
@@ -788,6 +797,8 @@ impl LockFreeMetrics {
             dedup_drops_freeze: AtomicU64::new(0),
             dedup_drops_unfreeze: AtomicU64::new(0),
             failed_history_writes: AtomicU64::new(0),
+            warm_band_fires: AtomicU64::new(0),
+            warm_boost_sum_x1000: AtomicU64::new(0),
             restore_status_missing: AtomicU64::new(0),
             restore_status_restored_n: AtomicU64::new(0),
             restore_status_discarded_corrupt: AtomicU64::new(0),
@@ -1276,6 +1287,8 @@ impl LockFreeMetrics {
             dedup_drops_freeze: self.dedup_drops_freeze.load(Ordering::Relaxed),
             dedup_drops_unfreeze: self.dedup_drops_unfreeze.load(Ordering::Relaxed),
             failed_history_writes: self.failed_history_writes.load(Ordering::Relaxed),
+            warm_band_fires: self.warm_band_fires.load(Ordering::Relaxed),
+            warm_boost_sum_x1000: self.warm_boost_sum_x1000.load(Ordering::Relaxed),
             restore_status_missing: self.restore_status_missing.load(Ordering::Relaxed),
             restore_status_restored_n: self.restore_status_restored_n.load(Ordering::Relaxed),
             restore_status_discarded_corrupt: self
@@ -1991,6 +2004,10 @@ pub struct MetricsSnapshot {
     pub dedup_drops_freeze: u64,
     pub dedup_drops_unfreeze: u64,
     pub failed_history_writes: u64,
+    pub warm_band_fires: u64,
+    /// Sum of warm_pressure_boost values scaled by 1000 (avoids float atomics).
+    /// Compute mean = `warm_boost_sum_x1000 / 1000 / warm_band_fires`.
+    pub warm_boost_sum_x1000: u64,
     pub restore_status_missing: u64,
     pub restore_status_restored_n: u64,
     pub restore_status_discarded_corrupt: u64,

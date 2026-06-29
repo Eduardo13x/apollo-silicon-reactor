@@ -600,6 +600,18 @@ pub struct RuntimeMetrics {
     /// Metrics history append failures.
     #[serde(default)]
     pub failed_history_writes: u64,
+    /// WarmBand pre-stage fires: how many cycles since-daemon-start had a
+    /// `warm_pressure_boost > 0.0`. Lets the audit-cron / dashboard verify
+    /// that F-06 (sensor-noise / trend-detection reliability) holds in
+    /// production: a long stretch of 1000+ cycles with this == 0 means
+    /// WarmBand is dead in practice and the commit claim was wrong.
+    #[serde(default)]
+    pub warm_band_fires: u64,
+    /// Cumulative `warm_pressure_boost` × 1000 (avoids f32 atomics). Divide
+    /// by 1000 for a per-cycle average; together with `warm_band_fires`
+    /// gives the operator a live view of "how hard is the band firing".
+    #[serde(default)]
+    pub warm_boost_sum_x1000: u64,
     /// Cumulative number of times survival mode was *entered* this session.
     /// Sticky counter — never decrements, even after recovery. Persists in
     /// JSON under the legacy key `survival_mode_activations` for backward

@@ -106,6 +106,11 @@ impl MetricsState {
         self.metrics.actions_pushed_raw_total = lf.actions_pushed_raw_total;
         self.metrics.actions_rejected_shape_total = lf.actions_rejected_shape_total;
         self.metrics.failed_history_writes = lf.failed_history_writes;
+        // WarmBand observability mirror (audit F-03): if these stay 0
+        // over thousands of cycles under load, F-06 is confirmed — WarmBand
+        // is dead in practice and the trend signal is unusable.
+        self.metrics.warm_band_fires = lf.warm_band_fires;
+        self.metrics.warm_boost_sum_x1000 = lf.warm_boost_sum_x1000;
         self.metrics.memory_budget_duration_ms = lf.memory_budget_duration_us as f64 / 1000.0;
         self.metrics.reactor_duration_ms = lf.reactor_duration_us as f64 / 1000.0;
 

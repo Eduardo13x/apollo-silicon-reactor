@@ -183,6 +183,19 @@ impl ThermalBailout {
         // WarmBand pre-stage pressure boost is independent of the main
         // phase ladder. It only adds; it never overrides.
         action.warm_pressure_boost = warm_boost;
+        // Observability: bump LSE counters when the WarmBand trigger fires
+        // (warm_boost > 0.0). Lets runtime_metrics.json + audit-cron see
+        // the band firing in production, per the audit's F-03 finding.
+        if warm_boost > 0.0 {
+            use std::sync::atomic::Ordering;
+            crate::engine::lse_counters::LSE_COUNTERS.warm_band_fires
+                .fetch_add(1, Ordering::Relaxed);
+            // Multiply by 1000 to avoid float atomics (snap to nearest
+            // 0.001). The dashboard divides by 1000.
+            let boost_x1000 = (warm_boost * 1000.0).round() as u64;
+            crate::engine::lse_counters::LSE_COUNTERS.warm_boost_sum_x1000
+                .fetch_add(boost_x1000, Ordering::Relaxed);
+        }
         action
     }
 
