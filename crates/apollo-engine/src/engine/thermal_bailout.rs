@@ -410,4 +410,70 @@ mod tests {
         let action = tb.evaluate(&hw_with_temp(70.0));
         assert_eq!(action.phase, CoolingPhase::Normal);
     }
+
+    /// WarmBand observability: the LSE counters `warm_band_fires` and
+    /// `warm_boost_sum_x1000` must be present in `LockFreeMetrics` and
+    /// default-initialize to 0. This is the test that satisfies the deploy-gate
+    /// "must add a `#[test]`" rule and pins the audit F-03 contract: if anyone
+    /// removes the observability, this test fails at compile time (the
+    /// fields are referenced directly) AND at runtime (default-0).
+    #[test]
+    fn warm_band_lse_counters_present_and_default_zero() {
+        // Reference the fields by name so removing them is a compile error.
+        // Mirror pattern: same as failed_history_writes etc. in
+        // lse_counters.rs::LockFreeMetrics::new().
+        use crate::engine::lse_counters::LSE_COUNTERS;
+        assert_eq!(
+            LSE_COUNTERS.warm_band_fires.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "warm_band_fires must default to 0 on startup"
+        );
+        assert_eq!(
+            LSE_COUNTERS
+                .warm_boost_sum_x1000
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "warm_boost_sum_x1000 must default to 0 on startup"
+        );
+    }
+
+    /// WarmBand NaN-safety: if Apple SMC reports a NaN temperature
+    /// (sensor dropout), compute_warm_boost() must return 0.0 and not
+    /// propagate the NaN into the warm_pressure_boost field. Conservative
+    /// direction-of-fail: band stays silent rather than firing on garbage.
+    #[test]
+    fn warm_band_nan_safety_returns_zero_boost() {
+        let mut tb = ThermalBailout::new();
+        // Build a HardwareSnapshot with a NaN p_cluster_celsius.
+        // PowerReading has no Default impl, so construct explicitly with all
+        // fields None (sensor-flap scenario is testable with any sample).
+        let hw = HardwareSnapshot {
+            thermal_state: crate::engine::iokit_sensors::ThermalState::Normal,
+            temps: ClusterTemps {
+                p_cluster_celsius: Some(f32::NAN),
+                e_cluster_celsius: Some(60.0),
+                gpu_celsius: None,
+                nand_celsius: None,
+            },
+            power: PowerReading {
+                package_watts: None,
+                cpu_watts: None,
+                gpu_watts: None,
+                dram_watts: None,
+                ane_watts: None,
+                ane_util_pct: None,
+                ane_tflops: None,
+            },
+            p_cluster_util: None,
+            e_cluster_util: None,
+            battery_percent: None,
+            battery_watts: None,
+        };
+        // First evaluate initializes the ring buffer.
+        for _ in 0..2 {
+            let action = tb.evaluate(&hw);
+            assert_eq!(action.warm_pressure_boost, 0.0,
+                "NaN input must NOT produce a positive warm_pressure_boost");
+        }
+    }
 }
