@@ -614,12 +614,16 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 //   WordBoundary (conf 0.85) → \bneedle\b, ≥3 chars
                 //   Substring   (conf 0.30) → degraded fallback, below
                 //                              freeze floor 0.35
-                // With MatchEngine in place, MIN=3 is safe: 3-char tools
-                // (zed, vim, ssh, gpg) enter via Exact tier; substring
-                // ambiguity gated by confidence floor; 2-char patterns
-                // still rejected (smallest unit genuinely too broad).
+                // 2026-07-04: lowered MIN 3→2. The hardcoded safety.rs
+                // protected list already names "TV" (a 2-char process).
+                // Keeping MIN=3 means the apply path rejects the same
+                // pattern that safety.rs accepts — pointless friction.
+                // MatchEngine's tier-based runtime defense still applies
+                // (any 2-char pattern is 1 typo away from matching a real
+                // process; the high-confidence floor + hardcoded protection
+                // list are the real defenses, not the validator).
                 const MAX_PATTERN_LEN: usize = 256;
-                const MIN_PATTERN_LEN: usize = 3;
+                const MIN_PATTERN_LEN: usize = 2;
                 let has_invalid_pattern = new_policy
                     .interactive_patterns
                     .iter()
