@@ -261,6 +261,14 @@ fn fingerprint_top_processes(top: &[apollo_engine::collector::ProcessStats]) -> 
     })
 }
 
+fn swap_reclaim_bypass_active(swap_used_bytes: u64, swap_total_bytes: u64, p_oom_30s: f64) -> bool {
+    apollo_engine::engine::safety::survival_mode_active_total(
+        0.0,
+        swap_used_bytes,
+        swap_total_bytes,
+    ) || p_oom_30s >= 0.95
+}
+
 /// Sprint 12 perf-fix (2026-05-30). Single-slot cache for the
 /// `companion_of_fg_pids` HashSet that decide_actions reads on every
 /// cycle. The set is derived from
@@ -3624,10 +3632,13 @@ fn main() -> anyhow::Result<()> {
                     &mut reactor_weight,
                 );
 
-                let swap_critical = snapshot.pressure.swap_used_bytes >= 8 * 1_073_741_824;
-                let oom_critical = signal_digest.p_oom_30s >= 0.95;
+                let reclaim_bypass = swap_reclaim_bypass_active(
+                    snapshot.pressure.swap_used_bytes,
+                    snapshot.pressure.swap_total_bytes,
+                    signal_digest.p_oom_30s,
+                );
                 let empty_hab: HashSet<u32> = HashSet::new();
-                let effective_habituated: &HashSet<u32> = if swap_critical || oom_critical {
+                let effective_habituated: &HashSet<u32> = if reclaim_bypass {
                     &empty_hab // bypass: re-evaluate all processes
                 } else {
                     &habituated_pids
@@ -6192,7 +6203,9 @@ mod tests {
     //! `companion_fg_cache_hits_total >= 990` and `is_companion_of`
     //! call count `< 30` (one per fg-burst or graph mutation).
 
-    use super::{fingerprint_top_processes, is_dev_tool_name, CompanionFgCache};
+    use super::{
+        fingerprint_top_processes, is_dev_tool_name, swap_reclaim_bypass_active, CompanionFgCache,
+    };
     use apollo_engine::collector::ProcessStats;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -6445,5 +6458,27 @@ mod tests {
             fingerprint_top_processes(&d),
             "name mutation must alter fingerprint"
         );
+    }
+
+    #[test]
+    fn swap_reclaim_bypass_scales_with_swap_total() {
+        let gib = 1024u64 * 1024 * 1024;
+        assert!(!swap_reclaim_bypass_active(
+            (4.5 * gib as f64) as u64,
+            16 * gib,
+            0.0,
+        ));
+        assert!(swap_reclaim_bypass_active(6 * gib, 16 * gib, 0.0));
+        assert!(swap_reclaim_bypass_active(
+            (4.5 * gib as f64) as u64,
+            8 * gib,
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn swap_reclaim_bypass_still_honors_oom_probability() {
+        assert!(swap_reclaim_bypass_active(0, 0, 0.95));
+        assert!(!swap_reclaim_bypass_active(0, 0, 0.94));
     }
 }

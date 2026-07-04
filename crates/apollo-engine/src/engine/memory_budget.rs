@@ -1,4 +1,4 @@
-//! Memory Budget Allocator — per-process memory quotas for 8GB systems.
+//! Memory Budget Allocator — per-process memory quotas for unified-memory Macs.
 //!
 //! Instead of reacting to global pressure, proactively assign each process
 //! a memory budget based on its importance and behavior.  When a process
@@ -9,7 +9,7 @@
 //!   - Foreground app gets the largest share (up to 40% of available)
 //!   - Build tools (rustc/cargo) get a temporary large allocation
 //!   - Background apps get proportional shares based on usage_model EMAs
-//!   - System reserve: 2.0 GB always untouched (kernel, WindowServer, etc.)
+//!   - System reserve: scales from the 8GB baseline so larger machines keep OS headroom
 //!
 //! Enforcement is soft: exceeding budget ≠ immediate kill.  The kernel's
 //! jetsam inactive limit triggers reclamation when the process backgrounds,
@@ -18,6 +18,15 @@
 /// System reserve that is never allocated to user processes (bytes).
 /// On 8GB: kernel_task + WindowServer + coreaudiod + system daemons ≈ 2.0 GB.
 const SYSTEM_RESERVE_BYTES: u64 = 2_000_000_000;
+
+const BASELINE_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const EXTRA_RAM_RESERVE_RATIO: f64 = 0.125;
+
+pub fn system_reserve_bytes(total_ram: u64) -> u64 {
+    let extra_ram = total_ram.saturating_sub(BASELINE_RAM_BYTES);
+    let extra_reserve = (extra_ram as f64 * EXTRA_RAM_RESERVE_RATIO) as u64;
+    SYSTEM_RESERVE_BYTES.saturating_add(extra_reserve)
+}
 
 /// Minimum budget for any tracked process (bytes).  Below this, jetsam
 /// limits are too tight and cause constant reclamation churn.
@@ -70,7 +79,7 @@ pub struct ProcessBudgetInput {
 ///
 /// Returns budgets sorted by excess (most over-budget first).
 pub fn compute_budgets(total_ram: u64, processes: &[ProcessBudgetInput]) -> Vec<ProcessBudget> {
-    let allocatable = total_ram.saturating_sub(SYSTEM_RESERVE_BYTES);
+    let allocatable = total_ram.saturating_sub(system_reserve_bytes(total_ram));
 
     // Phase 1: Compute raw weights for each process.
     let mut weights: Vec<(usize, f64)> = Vec::with_capacity(processes.len());
@@ -149,6 +158,7 @@ mod tests {
     use super::*;
 
     const RAM_8GB: u64 = 8 * 1024 * 1024 * 1024;
+    const RAM_16GB: u64 = 16 * 1024 * 1024 * 1024;
 
     fn make_input(
         name: &str,
@@ -260,6 +270,30 @@ mod tests {
             "inactive_limit {}MB should be > budget {}MB",
             budgets[0].inactive_limit_mb,
             budget_mb
+        );
+    }
+
+    #[test]
+    fn system_reserve_keeps_8gb_baseline() {
+        assert_eq!(system_reserve_bytes(RAM_8GB), SYSTEM_RESERVE_BYTES);
+    }
+
+    #[test]
+    fn system_reserve_scales_above_8gb() {
+        let reserve_8 = system_reserve_bytes(RAM_8GB);
+        let reserve_16 = system_reserve_bytes(RAM_16GB);
+        assert!(reserve_16 > reserve_8);
+        assert!(reserve_16 < 4 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn sixteen_gb_machine_gets_larger_process_budget() {
+        let inputs = vec![make_input("Xcode", 1800, true, false, 0.9, 0.9)];
+        let budget_8 = compute_budgets(RAM_8GB, &inputs)[0].budget_bytes;
+        let budget_16 = compute_budgets(RAM_16GB, &inputs)[0].budget_bytes;
+        assert!(
+            budget_16 > budget_8,
+            "16GB budget should exceed 8GB budget: {budget_16} <= {budget_8}"
         );
     }
 }

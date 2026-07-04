@@ -1627,7 +1627,14 @@ mod tests {
         tick_ok(&mut gov, &inputs);
         tick_ok(&mut gov, &inputs);
         let first_actions = tick_ok(&mut gov, &inputs);
-        assert!(!first_actions.is_empty());
+        assert!(
+            first_actions.is_empty(),
+            "TCP buffer sysctls are call-affecting and must not emit"
+        );
+        assert!(
+            gov.tcp.last_scale_up_at.is_some(),
+            "blocked network write should still arm scale-up dwell"
+        );
 
         // Immediately try again: should be blocked by cooldown.
         gov.tcp.consecutive_high = 3; // Force counter.
@@ -1812,7 +1819,11 @@ mod tests {
         let inputs = default_inputs(&high);
         tick_ok(&mut gov, &inputs);
         tick_ok(&mut gov, &inputs);
-        assert!(!tick_ok(&mut gov, &inputs).is_empty(), "scale-up expected");
+        let scale_up_actions = tick_ok(&mut gov, &inputs);
+        assert!(
+            scale_up_actions.is_empty(),
+            "TCP buffer sysctls are call-affecting and must not emit"
+        );
         assert!(gov.tcp.last_scale_up_at.is_some(), "dwell must be armed");
 
         // Neutralize the 60s per-key cooldown so only the dwell can block.
@@ -1883,7 +1894,12 @@ mod tests {
         let inputs = default_inputs(&high);
         tick_ok(&mut gov, &inputs);
         tick_ok(&mut gov, &inputs);
-        assert!(!tick_ok(&mut gov, &inputs).is_empty(), "scale-up expected");
+        let scale_up_actions = tick_ok(&mut gov, &inputs);
+        assert!(
+            scale_up_actions.is_empty(),
+            "TCP buffer sysctls are call-affecting and must not emit"
+        );
+        assert!(gov.tcp.last_scale_up_at.is_some(), "dwell must be armed");
 
         // Isolate the dwell: the 60s cooldown alone must not be the reason
         // the test passes.

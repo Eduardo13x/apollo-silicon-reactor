@@ -111,18 +111,33 @@ fn render_bar(ratio: f64, width: usize) -> String {
 ///
 /// Priority: rate signal (growing/falling) > absolute amount.
 /// A swap growing rapidly is more urgent than static large swap.
+#[cfg(test)]
 fn swap_status_label(swap_gb: f64, delta_bps: f64) -> &'static str {
+    swap_status_label_for_total(swap_gb, 8.0, delta_bps)
+}
+
+fn swap_status_label_for_total(swap_gb: f64, swap_total_gb: f64, delta_bps: f64) -> &'static str {
     if delta_bps > 100.0 {
         "📈 Creciendo"
     } else if delta_bps < -100.0 {
         "📉 Bajando"
-    } else if swap_gb >= 8.0 {
+    } else if swap_total_gb > 0.0 && swap_gb / swap_total_gb >= 0.85 {
         "🔴 Crítico"
-    } else if swap_gb >= 4.0 {
+    } else if swap_total_gb > 0.0 && swap_gb / swap_total_gb >= 0.50 {
         "🟠 Alto"
     } else {
         "🟢 Estable"
     }
+}
+
+fn swap_visual_ratio(swap_used_bytes: u64, swap_total_bytes: u64) -> f64 {
+    let fallback_capacity = 8.0 * 1_073_741_824.0;
+    let capacity = if swap_total_bytes > 0 {
+        swap_total_bytes as f64
+    } else {
+        fallback_capacity
+    };
+    (swap_used_bytes as f64 / capacity).clamp(0.0, 1.0)
 }
 
 fn score_emoji(score: f64) -> &'static str {
@@ -262,12 +277,12 @@ fn render_sense_q(status: &DaemonStatus) -> Vec<String> {
         mp * 100.0
     ));
 
-    // Swap: bar normalized vs 8 GB headroom (M1 dynamic swap typical max),
-    // not vs swap_total which macOS resizes dynamically. Avoids alarming "80%"
-    // readings when the underlying file is small but auto-growing.
+    // Swap: normalize against the daemon-reported dynamic swap capacity when
+    // available, with the historical 8GB visual fallback for old metrics.
     let swap_gb = m.swap_used_bytes as f64 / 1_073_741_824.0;
-    let swap_visual_ratio = (swap_gb / 8.0).clamp(0.0, 1.0);
-    let swap_label = swap_status_label(swap_gb, m.swap_delta_bps);
+    let swap_total_gb = m.swap_total_bytes as f64 / 1_073_741_824.0;
+    let swap_visual_ratio = swap_visual_ratio(m.swap_used_bytes, m.swap_total_bytes);
+    let swap_label = swap_status_label_for_total(swap_gb, swap_total_gb.max(8.0), m.swap_delta_bps);
     lines.push(format!(
         "Swap   {} {:.1}GB",
         render_bar(swap_visual_ratio, 8),
@@ -810,7 +825,7 @@ mod tests {
     #[test]
     fn swap_label_alto_when_between_4_and_8gb() {
         assert_eq!(swap_status_label(4.0, 0.0), "🟠 Alto");
-        assert_eq!(swap_status_label(7.9, 0.0), "🟠 Alto");
+        assert_eq!(swap_status_label(6.7, 0.0), "🟠 Alto");
     }
 
     #[test]
@@ -837,6 +852,24 @@ mod tests {
         let label = swap_status_label(12.7, 0.0); // delta=0 (not growing)
         assert_ne!(label, "🟢 Estable", "12.7 GB swap must NOT show Estable");
         assert_eq!(label, "🔴 Crítico");
+    }
+
+    #[test]
+    fn swap_visual_ratio_uses_reported_total_when_available() {
+        let gib = 1_073_741_824u64;
+        assert!((swap_visual_ratio(8 * gib, 16 * gib) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn swap_visual_ratio_falls_back_to_8gb_when_total_missing() {
+        let gib = 1_073_741_824u64;
+        assert!((swap_visual_ratio(4 * gib, 0) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn swap_label_uses_relative_capacity_on_16gb_swap() {
+        assert_eq!(swap_status_label_for_total(8.0, 16.0, 0.0), "🟠 Alto");
+        assert_eq!(swap_status_label_for_total(14.0, 16.0, 0.0), "🔴 Crítico");
     }
 
     #[test]
