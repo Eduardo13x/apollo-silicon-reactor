@@ -125,6 +125,10 @@ const WARM_TREND_RATE_C_PER_MIN: f32 = 0.5;
 // only added to effective_pressure before the existing battery/sleep
 // boosts. No freezing, no throttling, NEVER_FREEZE list untouched.
 const WARM_MAX_BOOST: f32 = 0.05;
+// Absolute-temp path starts gently at the 75C boundary and reaches the
+// full WarmBand boost by the Phase1 threshold (80C). This keeps the pre-stage
+// visible under stable heat without jumping straight to the max at 75C.
+const WARM_ABS_MIN_BOOST_RATIO: f32 = 0.20;
 // Scaling: 0.0 boost below WARM_TREND_RATE, full WARM_MAX_BOOST at
 // WARM_TREND_RATE * 2 (i.e. 1.0°C/min) or above.
 const WARM_BOOST_FULL_RATIO: f32 = 2.0;
@@ -188,12 +192,14 @@ impl ThermalBailout {
         // the band firing in production, per the audit's F-03 finding.
         if warm_boost > 0.0 {
             use std::sync::atomic::Ordering;
-            crate::engine::lse_counters::LSE_COUNTERS.warm_band_fires
+            crate::engine::lse_counters::LSE_COUNTERS
+                .warm_band_fires
                 .fetch_add(1, Ordering::Relaxed);
             // Multiply by 1000 to avoid float atomics (snap to nearest
             // 0.001). The dashboard divides by 1000.
             let boost_x1000 = (warm_boost * 1000.0).round() as u64;
-            crate::engine::lse_counters::LSE_COUNTERS.warm_boost_sum_x1000
+            crate::engine::lse_counters::LSE_COUNTERS
+                .warm_boost_sum_x1000
                 .fetch_add(boost_x1000, Ordering::Relaxed);
         }
         action
@@ -227,10 +233,21 @@ impl ThermalBailout {
             return 0.0;
         }
 
+        let absolute_boost = if current >= WARM_ABS_ENTER_C {
+            let span = (PHASE1_ENTER - WARM_ABS_ENTER_C).max(f32::EPSILON);
+            let progress = ((current - WARM_ABS_ENTER_C) / span).clamp(0.0, 1.0);
+            let ratio = WARM_ABS_MIN_BOOST_RATIO + ((1.0 - WARM_ABS_MIN_BOOST_RATIO) * progress);
+            ratio * WARM_MAX_BOOST
+        } else {
+            0.0
+        };
+
         // Linear ramp: 0 at threshold, full at 2x threshold rate (1.0°C/min).
         let ratio = (rate_c_per_min / WARM_TREND_RATE_C_PER_MIN).min(WARM_BOOST_FULL_RATIO);
         let scaled = (ratio - 1.0).max(0.0) / (WARM_BOOST_FULL_RATIO - 1.0);
-        (scaled * WARM_MAX_BOOST).clamp(0.0, WARM_MAX_BOOST)
+        let trend_boost = scaled * WARM_MAX_BOOST;
+
+        absolute_boost.max(trend_boost).clamp(0.0, WARM_MAX_BOOST)
     }
 
     /// Returns (newest, oldest) sample in the ring buffer.
@@ -411,6 +428,34 @@ mod tests {
         assert_eq!(action.phase, CoolingPhase::Normal);
     }
 
+    #[test]
+    fn warm_band_absolute_temp_stable_returns_positive_boost() {
+        let before = crate::engine::lse_counters::LSE_COUNTERS
+            .warm_band_fires
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut tb = ThermalBailout::new();
+        for _ in 0..WARM_BUFFER_SIZE {
+            tb.evaluate(&hw_with_temp(76.0));
+        }
+
+        let action = tb.evaluate(&hw_with_temp(76.0));
+
+        assert_eq!(action.phase, CoolingPhase::Normal);
+        assert!(
+            action.warm_pressure_boost > 0.0,
+            "stable 76C is inside the absolute WarmBand and must pre-stage pressure"
+        );
+        assert!(action.warm_pressure_boost <= WARM_MAX_BOOST);
+
+        let after = crate::engine::lse_counters::LSE_COUNTERS
+            .warm_band_fires
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after >= before + 1,
+            "positive WarmBand boost must be visible in LSE telemetry"
+        );
+    }
+
     /// WarmBand observability: the LSE counters `warm_band_fires` and
     /// `warm_boost_sum_x1000` must be present in `LockFreeMetrics` and
     /// default-initialize to 0. This is the test that satisfies the deploy-gate
@@ -422,14 +467,16 @@ mod tests {
         // Reference the fields by name so removing them is a compile error.
         // Mirror pattern: same as failed_history_writes etc. in
         // lse_counters.rs::LockFreeMetrics::new().
-        use crate::engine::lse_counters::LSE_COUNTERS;
+        let counters = crate::engine::lse_counters::LockFreeMetrics::new();
         assert_eq!(
-            LSE_COUNTERS.warm_band_fires.load(std::sync::atomic::Ordering::Relaxed),
+            counters
+                .warm_band_fires
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "warm_band_fires must default to 0 on startup"
         );
         assert_eq!(
-            LSE_COUNTERS
+            counters
                 .warm_boost_sum_x1000
                 .load(std::sync::atomic::Ordering::Relaxed),
             0,
@@ -472,8 +519,10 @@ mod tests {
         // First evaluate initializes the ring buffer.
         for _ in 0..2 {
             let action = tb.evaluate(&hw);
-            assert_eq!(action.warm_pressure_boost, 0.0,
-                "NaN input must NOT produce a positive warm_pressure_boost");
+            assert_eq!(
+                action.warm_pressure_boost, 0.0,
+                "NaN input must NOT produce a positive warm_pressure_boost"
+            );
         }
     }
 }
