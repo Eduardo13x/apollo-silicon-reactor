@@ -147,6 +147,11 @@ impl ZombieHunter {
             });
         }
 
+        if is_platform_workload(&snap.name) {
+            self.suspicious_history.remove(&snap.pid);
+            return None;
+        }
+
         // ── Soft rules: build candidate if any rule fires, then confirm ────
         // We check all soft rules first, pick the best match, then confirm
         // ONCE per evaluation cycle (counter +1 per cycle, not per rule).
@@ -267,6 +272,10 @@ impl Default for ZombieHunter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn is_platform_workload(name: &str) -> bool {
+    name.contains("Virtualization.VirtualMachine")
 }
 
 #[cfg(test)]
@@ -471,6 +480,25 @@ mod tests {
         let dw = result.unwrap();
         assert_eq!(dw.zombie_class, ZombieClass::MemoryHoarder);
         assert_eq!(dw.recommended_action, ZombieAction::Suspend);
+    }
+
+    #[test]
+    fn virtualization_vm_is_not_memory_hoarder() {
+        let mut hunter = ZombieHunter::new();
+        let snap = HuntSnapshot {
+            name: "com.apple.Virtualization.VirtualMachine".to_string(),
+            rss_bytes: 512 * 1024 * 1024,
+            has_gui_window: false,
+            secs_since_user_interaction: 3600,
+            ..base_snap()
+        };
+
+        for _ in 0..5 {
+            assert!(
+                hunter.evaluate(&snap).is_none(),
+                "Virtualization.framework VM is kernel-managed platform work, not dead weight"
+            );
+        }
     }
 
     #[test]
