@@ -820,6 +820,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_no_batteries_available_desktop() {
+        let output = "Now drawing from 'AC Power'\nNo batteries are currently available.\n";
+        let status = parse_pmset_battery(output);
+        assert!(status.is_none());
+    }
+
+    #[test]
     fn test_parse_no_estimate() {
         let output = "Now drawing from 'Battery Power'\n \
             -InternalBattery-0 (id=12345678)\t55%; discharging; (no estimate) present: true\n";
