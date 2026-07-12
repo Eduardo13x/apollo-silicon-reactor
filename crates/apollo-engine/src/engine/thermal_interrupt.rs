@@ -449,10 +449,11 @@ fn sentinel_loop(
         let tick_start = Instant::now();
 
         // Read caches (lock-free reads via try_lock to never block).
-        let hw_temp = hw_cache
-            .try_lock()
-            .ok()
-            .and_then(|g| g.as_ref().and_then(|hw| hw.temps.p_cluster_celsius));
+        let hw_temp = hw_cache.try_lock().ok().and_then(|g| {
+            g.as_ref()
+                .filter(|hw| !hw.temps_estimated)
+                .and_then(|hw| hw.temps.p_cluster_celsius)
+        });
 
         let pressure = pressure_cache
             .try_lock()

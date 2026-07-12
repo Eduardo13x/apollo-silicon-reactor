@@ -195,6 +195,24 @@ impl AisInput {
     }
 }
 
+/// Detect runtime hardware for AIS normalization.
+///
+/// AIS is computed from the daemon process, not from `daemon_init`, so keep the
+/// probe local and cheap. Unknown values fall back to the M1 8GB baseline via
+/// `AisInput` helpers.
+fn detect_runtime_hardware_context() -> (u32, u32) {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu();
+    sys.refresh_memory();
+
+    let cores = sys.cpus().len().max(1) as u32;
+    let ram_gb = (sys.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0))
+        .round()
+        .max(1.0) as u32;
+
+    (cores, ram_gb)
+}
+
 /// AIS result with per-dimension breakdown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AisScore {
@@ -348,7 +366,12 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         }
     };
     let rl_total_ticks = rl["total_ticks"].as_u64().unwrap_or(0);
-    let rl_max_ticks = 500u64;
+    let (hardware_cores, hardware_memory_gb) = detect_runtime_hardware_context();
+    let rl_max_ticks = AisInput {
+        hardware_memory_gb,
+        ..Default::default()
+    }
+    .recommended_rl_max_ticks();
 
     // Causal edges with Bernardo&Smith 3/4 ambiguous credit.
     let (causal_solid, causal_weak, causal_total) = {
@@ -508,8 +531,8 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         experience_memory_count,
         novel_patterns_count,
 
-        hardware_cores: 8,
-        hardware_memory_gb: 8,
+        hardware_cores,
+        hardware_memory_gb,
         kalman_riccati_rmse: kalman_riccati_floor,
     };
 
@@ -781,7 +804,21 @@ fn resource_efficiency(input: &AisInput) -> f64 {
         // Optimal skip rate: ~30-50%. Real daemon 3-zone router produces ~40%.
         // Too low = wasting compute, too high = missing signals.
         // Bell curve centered at 0.40: score = exp(-((rate - 0.40) / 0.25)^2)
-        (-((skip_rate - 0.40) / 0.25).powi(2)).exp()
+        let skip_score = (-((skip_rate - 0.40) / 0.25).powi(2)).exp();
+        // Apple Silicon machines with real headroom (e.g. M4 10c/16GB+) can
+        // afford extra sensing while pressure is low and cycle time is cheap.
+        // Do not score them as M1-8GB inefficient merely because they choose to
+        // observe more often; the cycle score still caps truly expensive loops.
+        let headroom_floor = if input.hardware_cores >= 10
+            && input.effective_ram_gb() >= 16
+            && input.current_pressure < 0.45
+            && cycle_score >= 0.80
+        {
+            0.55
+        } else {
+            0.0
+        };
+        skip_score.max(headroom_floor)
     } else {
         0.3
     };
@@ -910,12 +947,33 @@ fn wisdom(input: &AisInput) -> f64 {
     let skills_reliable = log_sat(input.reliable_skills as u64, 8.0);
     let causal_edges = log_sat(input.causal_solid_edges as u64, 30.0);
 
-    (0.25 * causal
+    let learned_wisdom = (0.25 * causal
         + 0.20 * experience
         + 0.15 * novel
         + 0.20 * skills_reliable
         + 0.20 * causal_edges)
-        .clamp(0.0, 1.0)
+        .clamp(0.0, 1.0);
+
+    // Cold-start bridge: a careful daemon can run for a long time without
+    // applying disruptive actions, especially on a well-provisioned machine.
+    // Treat that as limited operational evidence, never as causal knowledge.
+    // The cap prevents a quiet daemon from reaching a mature/SS score without
+    // resolved outcomes, skills, or causal mechanisms.
+    const STABLE_RUNTIME_WISDOM_CAP: f64 = 0.35;
+    const STABLE_RUNTIME_TARGET_TICKS: f64 = 50_000.0;
+    let stable_runtime = input.rl_total_ticks > 0
+        && input.failures == 0
+        && input.kills_applied == 0
+        && input.survival_activations == 0
+        && input.current_pressure.is_finite()
+        && input.current_pressure < 0.50;
+    let provisional_stability_wisdom = if stable_runtime {
+        STABLE_RUNTIME_WISDOM_CAP * log_sat(input.rl_total_ticks, STABLE_RUNTIME_TARGET_TICKS)
+    } else {
+        0.0
+    };
+
+    learned_wisdom.max(provisional_stability_wisdom)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -2018,6 +2076,37 @@ mod tests {
     }
 
     #[test]
+    fn resource_efficiency_respects_apple_silicon_headroom() {
+        let base = AisInput {
+            p95_cycle_ms: 45.0,
+            target_cycle_ms: 100.0,
+            subsystem_skips: 0,
+            subsystem_evals: 100,
+            habituation_skips: 30,
+            process_evals: 100,
+            current_pressure: 0.35,
+            hardware_cores: 8,
+            hardware_memory_gb: 8,
+            ..Default::default()
+        };
+
+        let m4_headroom = AisInput {
+            hardware_cores: 10,
+            hardware_memory_gb: 16,
+            ..base.clone()
+        };
+
+        let base_score = compute_ais(&base).resource_efficiency;
+        let m4_score = compute_ais(&m4_headroom).resource_efficiency;
+
+        assert!(
+            m4_score > base_score + 0.10,
+            "M4-class low-pressure sensing headroom should not be scored like M1 8GB: \
+             base={base_score:.3} m4={m4_score:.3}"
+        );
+    }
+
+    #[test]
     fn test_weights_sum_to_one() {
         let sum = W_DECISION + W_SIGNAL + W_LEARNING + W_RESOURCE + W_SAFETY + W_ADAPT + W_WISDOM;
         assert!(
@@ -2352,6 +2441,32 @@ mod tests {
             score.safety_compliance,
             score.adaptability
         );
+    }
+
+    #[test]
+    fn stable_runtime_earns_limited_provisional_wisdom() {
+        let input = AisInput {
+            rl_total_ticks: 10_000,
+            current_pressure: 0.30,
+            ..Default::default()
+        };
+        let score = wisdom(&input);
+        assert!(
+            score > 0.0,
+            "stable runtime should earn some provisional wisdom"
+        );
+        assert!(score <= 0.35, "stability must not bypass the wisdom cap");
+    }
+
+    #[test]
+    fn unstable_runtime_cannot_earn_provisional_wisdom() {
+        let input = AisInput {
+            rl_total_ticks: 100_000,
+            current_pressure: 0.30,
+            failures: 1,
+            ..Default::default()
+        };
+        assert_eq!(wisdom(&input), 0.0);
     }
 
     #[test]

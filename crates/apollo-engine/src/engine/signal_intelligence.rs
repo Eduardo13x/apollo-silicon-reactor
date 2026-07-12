@@ -246,6 +246,12 @@ pub struct SignalIntelligence {
     cumulative_stress: f64,
 }
 
+/// Capability-scaled package power envelope. Core count is available on every
+/// supported Mac and remains meaningful across SoC generations and form factors.
+fn package_power_reference_watts(hardware_cores: u32) -> f32 {
+    (hardware_cores.max(4) as f32 * 2.5).clamp(15.0, 80.0)
+}
+
 impl Default for SignalIntelligence {
     fn default() -> Self {
         Self::new()
@@ -826,15 +832,19 @@ impl SignalIntelligence {
 
     /// Nudge energy_bias downward when real package watts are high.
     ///
-    /// Called after `set_energy_bias`. M1 Air TDP ~15W:
-    /// - >12W: stressed load → engage optimizer 5pp earlier
-    /// - >8W: active load  → engage optimizer 2pp earlier
+    /// Called after `set_energy_bias`. The power envelope scales with detected
+    /// core count, avoiding a fixed M1 watt threshold on newer SoCs.
     ///
     /// Clamps combined bias to -0.15 to prevent over-engagement.
-    pub fn adjust_bias_for_power(&mut self, package_watts: f32) {
-        let power_nudge = if package_watts > 12.0 {
+    pub fn adjust_bias_for_power(&mut self, package_watts: f32, hardware_cores: u32) {
+        if !package_watts.is_finite() || package_watts <= 0.0 {
+            return;
+        }
+        let reference_watts = package_power_reference_watts(hardware_cores);
+        let load_ratio = package_watts / reference_watts;
+        let power_nudge = if load_ratio > 0.90 {
             -0.05
-        } else if package_watts > 8.0 {
+        } else if load_ratio > 0.65 {
             -0.02
         } else {
             0.0
@@ -1648,6 +1658,18 @@ mod tests {
         let mut si = SignalIntelligence::new();
         si.set_energy_bias(50, true, false); // charging, no thermal
         assert!((si.energy_bias).abs() < 1e-9, "plugged in = no bias");
+    }
+
+    #[test]
+    fn power_bias_scales_with_hardware_capacity() {
+        let mut m1_class = SignalIntelligence::new();
+        let mut m4_class = SignalIntelligence::new();
+        m1_class.adjust_bias_for_power(14.0, 8);
+        m4_class.adjust_bias_for_power(14.0, 10);
+
+        assert!(m1_class.energy_bias < m4_class.energy_bias);
+        assert_eq!(m4_class.energy_bias, 0.0);
+        assert_eq!(package_power_reference_watts(10), 25.0);
     }
 
     // ── Lifelong zone learning tests ────────────────────────────────────────

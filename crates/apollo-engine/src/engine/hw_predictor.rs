@@ -153,7 +153,8 @@ unsafe fn read_commpage_u64(offset: usize) -> u64 {
 // NIVEL 3 — Registros EL0 (ampliados)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Read the ARM virtual counter. Monotonic, ~1 ns, no privilege required.
+/// Read the ARM virtual counter. Monotonic, no privilege required. Its tick
+/// period is defined by `CNTFRQ_EL0` and may be virtualized by the host.
 #[inline(always)]
 pub fn read_vct() -> u64 {
     let v: u64;
@@ -168,7 +169,7 @@ pub fn read_vct() -> u64 {
     v
 }
 
-/// Timer frequency (typically 24_000_000 Hz on Apple Silicon).
+/// Timer frequency reported by the current hardware or virtualization layer.
 #[inline(always)]
 pub fn timer_freq() -> u64 {
     let f: u64;
@@ -798,7 +799,15 @@ mod tests {
         let t1 = read_vct();
         let elapsed_us = ticks_to_us(t1 - t0, freq);
         println!("cntfrq_el0={}Hz  10ms medidos={}us", freq, elapsed_us);
-        assert_eq!(freq, 24_000_000, "Apple Silicon timer = 24 MHz");
+        // Physical Apple Silicon commonly reports 24 MHz, while newer hosts
+        // and virtualized M4 environments may expose a 1 GHz counter. The
+        // conversion code is frequency-aware, so validate the architectural
+        // contract and measured duration instead of pinning one chip value.
+        assert!(
+            (1_000_000..=10_000_000_000).contains(&freq),
+            "CNTFRQ_EL0 fuera de rango razonable: {}Hz",
+            freq
+        );
         // Allow wide range: OS scheduling jitter under load (especially during
         // concurrent test execution) can inflate sleep durations significantly.
         assert!(

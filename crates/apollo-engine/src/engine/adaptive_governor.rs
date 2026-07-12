@@ -179,6 +179,34 @@ impl AdaptiveGovernor {
         hour_of_day: u8,
         hw: Option<HwFeatures>,
     ) -> Vec<ProcessDecision> {
+        self.decide_all_with_hw_and_protected(
+            proc_snaps,
+            hunt_snaps,
+            foreground_app,
+            all_proc_names,
+            hour_of_day,
+            hw,
+            &std::collections::HashSet::new(),
+        )
+    }
+
+    /// Hardware-aware decision pass with an already-mediated PID set.
+    ///
+    /// The caller has completed name/policy protection for these PIDs, so
+    /// scoring an action that will later be discarded is wasted work. They
+    /// still receive an `Allow` decision with their classified tier because
+    /// downstream QoS and I/O routing consume the complete decision list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_all_with_hw_and_protected(
+        &mut self,
+        proc_snaps: &[ProcessSnapshot],
+        hunt_snaps: &[HuntSnapshot],
+        foreground_app: Option<&str>,
+        all_proc_names: &[&str],
+        hour_of_day: u8,
+        hw: Option<HwFeatures>,
+        protected_pids: &std::collections::HashSet<u32>,
+    ) -> Vec<ProcessDecision> {
         // 1. Update user profile
         self.user_profile
             .observe(foreground_app, all_proc_names, hour_of_day);
@@ -231,6 +259,19 @@ impl AdaptiveGovernor {
         for (snap, tier, waste) in &classified {
             if zombie_pids.contains(&snap.pid) {
                 continue; // Will be handled below
+            }
+
+            if protected_pids.contains(&snap.pid) {
+                decisions.push(ProcessDecision {
+                    pid: snap.pid,
+                    name: snap.name.clone(),
+                    decision: GovernorDecision::Allow,
+                    tier: *tier,
+                    utility_score: 1.0,
+                    waste_score: *waste,
+                    reason: "Protected before governor action scoring".into(),
+                });
+                continue;
             }
 
             let utility = score_utility(snap);
@@ -890,6 +931,30 @@ mod tests {
         let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].decision, GovernorDecision::Allow);
+    }
+
+    #[test]
+    fn preprotected_pid_short_circuits_action_scoring_but_keeps_decision() {
+        let mut gov = governor();
+        let snap = base_proc(77, "background-worker");
+        let protected = std::collections::HashSet::from([77]);
+        let decisions = gov.decide_all_with_hw_and_protected(
+            &[snap],
+            &no_hunts(),
+            None,
+            &["background-worker"],
+            12,
+            None,
+            &protected,
+        );
+
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].pid, 77);
+        assert_eq!(decisions[0].decision, GovernorDecision::Allow);
+        assert_eq!(
+            decisions[0].reason,
+            "Protected before governor action scoring"
+        );
     }
 
     #[test]

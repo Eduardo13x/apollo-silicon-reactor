@@ -386,23 +386,16 @@ pub fn wire_enriched_telemetry(
     m.metrics.thermal_predicted_throttle = inputs.thermal_predicted_throttle;
     m.metrics.thermal_seconds_to_throttle = inputs.thermal_seconds_to_throttle;
     m.metrics.thermal_trend_predicted = inputs.thermal_trend_predicted.to_string();
-    // Phase-1 stall-candidate F2 (audit 2026-06-24): the metrics god-lock
-    // covers a `sysinfo::System` walk for frozen-PID RSS lookups (~150us in
-    // steady state, scales nonlinearly under pressure). Steady-state
-    // `metrics_lock_held_max_us` is ~452us; firing only when it crosses
-    // 5000us (10x headroom) keeps noise out of prod logs. Zero behavior
-    // change — only log emission. [F2 MED-HIGH] per
+    // Phase-1 stall-candidate F2 (audit 2026-06-24): the original sysinfo
+    // walk is now outside this lock. Later spikes exposed two remaining
+    // amplifiers below: cloning all RuntimeMetrics and logging the warning
+    // before releasing the guard. The compact snapshot + post-unlock warning
+    // keep this threshold useful without contributing to it. [F2 MED-HIGH] per
     // /Users/eduardocortez/hardening-audit-2026-06-24/main-loop-stall-candidates.md
     //
-    // Reading the freshly-stored field on `m` before drop is safe; this
-    // value is the per-cycle peak (drained from lock-free atomics above).
-    if m.metrics.metrics_lock_held_max_us > 5000 {
-        tracing::warn!(
-            target: "apollo.stall_candidate",
-            held_max_us = m.metrics.metrics_lock_held_max_us,
-            "stall_candidate_F2: metrics lock held >5ms this cycle (sysinfo walk under lock?)"
-        );
-    }
+    // Capture for post-unlock logging. Emitting the warning while holding the
+    // very lock it diagnoses can amplify one slow acquisition into another.
+    let metrics_lock_held_max_us = m.metrics.metrics_lock_held_max_us;
 
     // ── Phase 1.5a per-cycle telemetry archive (2026-06-27) ──────────────
     // Append a JSONL line to /var/lib/apollo/runtime_metrics_history.jsonl
@@ -416,22 +409,35 @@ pub fn wire_enriched_telemetry(
     // runtime_metrics.json is a single snapshot, not a time series).
     // ponytail: minimum that works, no decision-path mutation.
     //
-    // Snapshot the freshly-stored `RuntimeMetrics` BEFORE releasing the
-    // lock — avoids a second lock acquisition + a race where another
-    // writer could land between drop and re-lock.
-    let snapshot_metrics = m.metrics.clone();
-    drop(m); // release the metrics lock before any I/O (Lock Scope Minimization)
-    if let Some(ref mh) = inputs.metrics_history {
-        if let Err(e) = apollo_engine::engine::daemon_metrics_history::append_history_snapshot(
-            mh.path,
-            mh.cfg,
-            &snapshot_metrics,
-            mh.cycle,
+    // Prepare only the compact 16-d history payload while the snapshot is
+    // consistent. Cloning all of RuntimeMetrics here copied large vectors and
+    // strings under the global lock even though the archive never uses them.
+    let prepared_history = inputs.metrics_history.as_ref().map(|mh| {
+        apollo_engine::engine::daemon_metrics_history::prepare_history_snapshot(
+            &m.metrics,
+            mh.causal_subsystem_debias,
             mh.world_model,
             mh.drift_detector,
             mh.learnable_params,
-            mh.causal_subsystem_debias,
-        ) {
+        )
+    });
+    drop(m); // release the metrics lock before any I/O (Lock Scope Minimization)
+
+    if metrics_lock_held_max_us > 5000 {
+        tracing::warn!(
+            target: "apollo.stall_candidate",
+            held_max_us = metrics_lock_held_max_us,
+            "stall_candidate_F2: metrics lock held >5ms this cycle"
+        );
+    }
+
+    if let (Some(mh), Some(snapshot)) = (inputs.metrics_history.as_ref(), prepared_history.as_ref())
+    {
+        if let Err(e) =
+            apollo_engine::engine::daemon_metrics_history::append_prepared_history_snapshot(
+                mh.path, mh.cfg, mh.cycle, snapshot,
+            )
+        {
             // Mirror the append_failure path inside append_history_snapshot:
             // the function has ALREADY bumped FAILED_WRITES + emitted warn.
             // Surface here only for diagnosability; cycle continues.

@@ -39,6 +39,7 @@ pub struct SignalTickOutput {
 /// - `battery_percentage` / `battery_is_charging` — from power_mgr.battery_status
 /// - `thermal_emergency` — from thermal_action.force_ecores
 /// - `package_watts` — from cycle_hw_snap (None if IOKit unavailable)
+/// - `hardware_cores` — startup capability detection for power normalization
 /// - `hour_of_day` — for workload-aware bias
 /// - `state` — SharedState (policy lock for workload bias)
 /// - `darwin_anomaly` — Darwin-Boltzmann anomaly detector (mutable)
@@ -54,6 +55,7 @@ pub fn run_signal_tick(
     battery_is_charging: bool,
     thermal_emergency: bool,
     package_watts: Option<f32>,
+    hardware_cores: u32,
     hour_of_day: u8,
     state: &SharedState,
     darwin_anomaly: &mut EvolvedAnomalyDetector,
@@ -88,10 +90,9 @@ pub fn run_signal_tick(
         };
         // Energy-aware routing: shift subsystem thresholds by battery/thermal.
         signal_intel.set_energy_bias(battery_percentage, battery_is_charging, thermal_emergency);
-        // Power-aware bias: when real watts are high, engage optimizer earlier.
-        // M1 Air TDP ~15W; >8W = active load, >12W = stressed.
+        // Power-aware bias scales against the detected hardware envelope.
         if let Some(pkg_w) = package_watts {
-            signal_intel.adjust_bias_for_power(pkg_w);
+            signal_intel.adjust_bias_for_power(pkg_w, hardware_cores);
         }
         // Workload-aware bias: heavy workloads (Coding/VideoEdit) spike pressure
         // fast — engage optimizer 2pp earlier during those hours.

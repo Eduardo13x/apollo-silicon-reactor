@@ -261,6 +261,20 @@ pub enum JetsamClass {
     Protected,
 }
 
+/// Probe that memorystatus_control WRITE actually works.
+///
+/// Reads current memory limits then writes back the same values — a no-op
+/// that proves the kernel accepted the write without changing any behaviour.
+/// Uses `get_memlimit`/`set_memlimit` because those commands work for any
+/// process (including daemons with jetsam priority >21).
+pub fn probe_write() -> Result<(), String> {
+    let pid = std::process::id();
+    let current = get_memlimit(pid).map_err(|e| format!("get_memlimit: {}", e))?;
+    set_memlimit(pid, current.memlimit_active, current.memlimit_inactive)
+        .map_err(|e| format!("set_memlimit: {}", e))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

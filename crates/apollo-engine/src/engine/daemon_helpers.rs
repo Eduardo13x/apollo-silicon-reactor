@@ -353,6 +353,17 @@ pub fn remove_crash_sentinel() {
 
 /// Append a JSON line to the audit log (best-effort, never fails the caller).
 pub fn audit_log(entry: &serde_json::Value) {
+    audit_log_batch(std::slice::from_ref(entry));
+}
+
+/// Append several audit records with one metadata check and one file open.
+/// High-cardinality evaluators use this to avoid turning diagnostics into a
+/// per-process filesystem hot path.
+pub fn audit_log_batch(entries: &[serde_json::Value]) {
+    if entries.is_empty() {
+        return;
+    }
+
     use std::fs::OpenOptions;
     let path = audit_log_path();
     // Rotate at 2MB (tightened 2026-05-08 from 5MB after macOS flagged the
@@ -366,8 +377,11 @@ pub fn audit_log(entry: &serde_json::Value) {
             let _ = fs::rename(path, &rotated);
         }
     }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{}", entry);
+    if let Ok(f) = OpenOptions::new().create(true).append(true).open(path) {
+        let mut writer = std::io::BufWriter::new(f);
+        for entry in entries {
+            let _ = writeln!(writer, "{}", entry);
+        }
     }
 }
 

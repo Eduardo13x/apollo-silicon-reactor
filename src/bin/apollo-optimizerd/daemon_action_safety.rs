@@ -13,12 +13,12 @@
 //! Must run AFTER `signal_digest`, `reclaim_forecast`, and `behavior_interactive_pids`
 //! are computed for this cycle, and AFTER `decide_actions` has produced `actions`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use apollo_engine::collector::SystemCollector;
 use apollo_engine::engine::adaptive_governor::ProcessDecision;
-use apollo_engine::engine::daemon_helpers::audit_log;
+use apollo_engine::engine::daemon_helpers::audit_log_batch;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::foreground::ForegroundDetector;
 use apollo_engine::engine::hw_bayes::HwFeatures;
@@ -50,6 +50,18 @@ pub struct HeuristicPassOutput {
     pub heuristic_critical_pids: HashSet<u32>,
     pub heuristic_stats: HeuristicStats,
     pub additional_actions: Vec<RootAction>,
+}
+
+struct BehavioralCandidate {
+    pid: u32,
+    name: String,
+    cpu: f32,
+    wakeups: f32,
+    net: bool,
+    gui: bool,
+    idle_s: u64,
+    rss: u64,
+    raw_score: f64,
 }
 
 /// Heuristic protection pass — runs AdaptiveGovernor, scores behavioral protection,
@@ -92,9 +104,93 @@ pub fn run_heuristic_pass(
 ) -> HeuristicPassOutput {
     const HIGH_TAU_SEC: f64 = 300.0;
 
+    // ── heuristic_critical_pids: behavioral protection scoring ───────────────
+    // [Saltzer & Kaashoek 2009] Complete Mediation — single callsite for all
+    // protection decisions. Infrastructure always protected; dev runtimes earn
+    // protection by behavioral activity score ≥ current pressure.
+    let sys = collector.system();
+    let snap_by_pid: HashMap<u32, &ProcessSnapshot> =
+        proc_snaps.iter().map(|snap| (snap.pid, snap)).collect();
+    let infra_pats = infrastructure_processes();
+    let protected_pats = protected_processes();
+    let policy_protected = state
+        .policy
+        .lock_recover()
+        .learned_policy
+        .protected_patterns
+        .clone();
+    let policy_protected_ac =
+        apollo_engine::engine::safety::build_policy_protected_ac(&policy_protected);
+    let total_ram = apollo_engine::engine::sysctl_direct::read_u64("hw.memsize")
+        .unwrap_or(8 * 1024 * 1024 * 1024);
+    let mut heuristic_critical_pids: HashSet<u32> = HashSet::new();
+    let mut behavioral_candidates = Vec::new();
+
+    // One linear pass over sysinfo. The previous `iter().find()` made this
+    // O(processes^2) and allocated a String for every process.
+    for (pid, process) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        let name = process.name();
+        let snap = snap_by_pid.get(&pid_u32).copied();
+        let has_gui = snap.is_some_and(|s| s.has_gui_window);
+        let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
+        let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
+        let is_interactive = is_user_interactive_app(has_gui, idle_s, rss, name);
+
+        match classify_protection(
+            name,
+            &protected_pats,
+            &infra_pats,
+            &policy_protected,
+            policy_protected_ac.as_ref(),
+            is_interactive,
+        ) {
+            ProtectionLevel::Unconditional => {
+                heuristic_critical_pids.insert(pid_u32);
+                continue;
+            }
+            ProtectionLevel::ConditionalForeground => {
+                if Some(pid_u32) == foreground_pid {
+                    heuristic_critical_pids.insert(pid_u32);
+                }
+                continue;
+            }
+            ProtectionLevel::Unprotected => {}
+        }
+
+        if matches_dev_runtime(name) {
+            let (cpu, wakeups, net, gui) = snap.map_or_else(
+                || (process.cpu_usage(), 0.0, false, false),
+                |s| {
+                    (
+                        s.cpu_percent,
+                        s.wakeups_per_sec,
+                        s.has_network,
+                        s.has_gui_window,
+                    )
+                },
+            );
+            behavioral_candidates.push(BehavioralCandidate {
+                pid: pid_u32,
+                name: name.to_string(),
+                cpu,
+                wakeups,
+                net,
+                gui,
+                idle_s,
+                rss,
+                raw_score: behavioral_protection_score(
+                    cpu, wakeups, net, gui, idle_s, rss, total_ram,
+                ),
+            });
+        }
+    }
+    heuristic_critical_pids.extend(amx_detector::ml_protected_pids());
+
     // ── AdaptiveGovernor heuristic pass ─────────────────────────────────────
-    // Wire ODE swap risk + high-τ PIDs so idle thresholds and freeze decisions
-    // reflect physical memory state. [Denning 1968] high-τ = slow WSS re-growth.
+    // Name/policy-protected PIDs are mediated before action scoring. Learned
+    // behavioral candidates are finalized immediately afterwards, once this
+    // cycle's user-profile observation has been applied by the governor.
     let heuristic_decisions: Vec<ProcessDecision> = {
         let mut pg = state.policy.lock_recover();
         pg.adaptive_governor.swap_risk = reclaim_forecast.risk;
@@ -103,134 +199,77 @@ pub fn run_heuristic_pass(
             .filter(|s| unfreeze_decay.tau_for_app(&s.name) > HIGH_TAU_SEC)
             .map(|s| s.pid)
             .collect();
-        pg.adaptive_governor.decide_all_with_hw(
+        pg.adaptive_governor.decide_all_with_hw_and_protected(
             proc_snaps,
             hunt_snaps,
             foreground_app,
             all_proc_names,
             hour_of_day,
             hw_features,
+            &heuristic_critical_pids,
         )
     };
 
-    // ── heuristic_critical_pids: behavioral protection scoring ───────────────
-    // [Saltzer & Kaashoek 2009] Complete Mediation — single callsite for all
-    // protection decisions. Infrastructure always protected; dev runtimes earn
-    // protection by behavioral activity score ≥ current pressure.
-    let heuristic_critical_pids: HashSet<u32> = {
-        let sys = collector.system();
-        let infra_pats = infrastructure_processes();
-        let protected_pats = protected_processes();
-        let policy_protected = state
-            .policy
-            .lock_recover()
-            .learned_policy
-            .protected_patterns
-            .clone();
-        // Pre-build AC once before per-PID loop — amortizes substring scan
-        // across all candidates (~400 PIDs). Tier 3 classify_protection path.
-        let policy_protected_ac =
-            apollo_engine::engine::safety::build_policy_protected_ac(&policy_protected);
-        let total_ram = apollo_engine::engine::sysctl_direct::read_u64("hw.memsize")
-            .unwrap_or(8 * 1024 * 1024 * 1024);
-        let mut cpids: HashSet<u32> = HashSet::new();
-        let mut bps_eval = 0u64;
-        let mut bps_prot = 0u64;
-        let mut bps_dem = 0u64;
-        let mut bps_min = f64::MAX;
-        let mut bps_min_name = String::new();
-        for (pid, process) in sys.processes() {
-            let pid_u32 = pid.as_u32();
-            let name = process.name().to_string();
-            let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
-            let has_gui = snap.is_some_and(|s| s.has_gui_window);
-            let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
-            let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
-            let is_interactive = is_user_interactive_app(has_gui, idle_s, rss, &name);
-            match classify_protection(
-                &name,
-                &protected_pats,
-                &infra_pats,
-                &policy_protected,
-                policy_protected_ac.as_ref(),
-                is_interactive,
-            ) {
-                ProtectionLevel::Unconditional => {
-                    cpids.insert(pid_u32);
-                    continue;
-                }
-                ProtectionLevel::ConditionalForeground => {
-                    if Some(pid_u32) == foreground_pid {
-                        cpids.insert(pid_u32);
-                    }
-                    continue;
-                }
-                ProtectionLevel::Unprotected => {}
-            }
-            if matches_dev_runtime(&name) {
-                let (cpu, wakeups, net, gui) = if let Some(s) = snap {
-                    (
-                        s.cpu_percent,
-                        s.wakeups_per_sec,
-                        s.has_network,
-                        s.has_gui_window,
-                    )
-                } else {
-                    (process.cpu_usage(), 0.0, false, false)
-                };
-                let raw_score =
-                    behavioral_protection_score(cpu, wakeups, net, gui, idle_s, rss, total_ram);
-                let relevance = state
-                    .policy
-                    .lock_recover()
-                    .adaptive_governor
+    let relevances: Vec<f32> = {
+        let pg = state.policy.lock_recover();
+        behavioral_candidates
+            .iter()
+            .map(|candidate| {
+                pg.adaptive_governor
                     .user_profile
-                    .process_relevance(&name);
-                let score = raw_score + (relevance as f64 * 0.15);
-                bps_eval += 1;
-                let protected = score >= pressure_smooth;
-                if score < bps_min {
-                    bps_min = score;
-                    bps_min_name = format!("{}({})", name, pid_u32);
-                }
-                audit_log(&serde_json::json!({
-                    "t": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    "event": "bps_eval",
-                    "pid": pid_u32,
-                    "name": name,
-                    "score": (score * 10000.0).round() / 10000.0,
-                    "raw_score": (raw_score * 10000.0).round() / 10000.0,
-                    "relevance": (relevance * 100.0).round() / 100.0,
-                    "pressure": (pressure_smooth * 1000.0).round() / 1000.0,
-                    "protected": protected,
-                    "cpu": cpu,
-                    "wakeups": wakeups,
-                    "net": net,
-                    "gui": gui,
-                    "idle_s": idle_s,
-                    "rss_mb": rss / 1024 / 1024,
-                }));
-                if protected {
-                    bps_prot += 1;
-                    cpids.insert(pid_u32);
-                } else {
-                    bps_dem += 1;
-                }
-            }
-        }
-        {
-            let mut m = state.metrics.lock_recover();
-            m.metrics.bps_evaluated += bps_eval;
-            m.metrics.bps_protected += bps_prot;
-            m.metrics.bps_demoted += bps_dem;
-            if bps_min < f64::MAX {
-                m.metrics.bps_min_score = bps_min;
-                m.metrics.bps_min_score_name = bps_min_name;
-            }
-        }
-        cpids.extend(amx_detector::ml_protected_pids());
-        cpids
+                    .process_relevance(&candidate.name)
+            })
+            .collect()
     };
+    let mut bps_prot = 0u64;
+    let mut bps_dem = 0u64;
+    let mut bps_min = f64::MAX;
+    let mut bps_min_name = String::new();
+    let audit_timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut audit_entries = Vec::with_capacity(behavioral_candidates.len());
+
+    for (candidate, relevance) in behavioral_candidates.iter().zip(relevances) {
+        let score = candidate.raw_score + (relevance as f64 * 0.15);
+        let protected = score >= pressure_smooth;
+        if score < bps_min {
+            bps_min = score;
+            bps_min_name = format!("{}({})", candidate.name, candidate.pid);
+        }
+        audit_entries.push(serde_json::json!({
+            "t": audit_timestamp.as_str(),
+            "event": "bps_eval",
+            "pid": candidate.pid,
+            "name": candidate.name.as_str(),
+            "score": (score * 10000.0).round() / 10000.0,
+            "raw_score": (candidate.raw_score * 10000.0).round() / 10000.0,
+            "relevance": (relevance * 100.0).round() / 100.0,
+            "pressure": (pressure_smooth * 1000.0).round() / 1000.0,
+            "protected": protected,
+            "cpu": candidate.cpu,
+            "wakeups": candidate.wakeups,
+            "net": candidate.net,
+            "gui": candidate.gui,
+            "idle_s": candidate.idle_s,
+            "rss_mb": candidate.rss / 1024 / 1024,
+        }));
+        if protected {
+            bps_prot += 1;
+            heuristic_critical_pids.insert(candidate.pid);
+        } else {
+            bps_dem += 1;
+        }
+    }
+    audit_log_batch(&audit_entries);
+    {
+        let mut m = state.metrics.lock_recover();
+        m.metrics.bps_evaluated += behavioral_candidates.len() as u64;
+        m.metrics.bps_protected += bps_prot;
+        m.metrics.bps_demoted += bps_dem;
+        if bps_min < f64::MAX {
+            m.metrics.bps_min_score = bps_min;
+            m.metrics.bps_min_score_name = bps_min_name;
+        }
+    }
 
     // ── Merge + Cable 2 experience gate ─────────────────────────────────────
     // Cable 2: skip throttles that experience shows never reduce pressure.

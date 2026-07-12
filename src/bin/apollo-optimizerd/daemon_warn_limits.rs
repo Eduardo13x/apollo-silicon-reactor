@@ -23,6 +23,18 @@ use apollo_engine::engine::process_tree::ProcessTree;
 
 use crate::process_enrichment;
 
+/// A non-fatal warn limit that the kernel accepted for an idle process.
+///
+/// The daemon uses these results to feed the same outcome-learning path as
+/// other applied memory-pressure interventions.  This is deliberately emitted
+/// only after `memorystatus_control` succeeds.
+#[derive(Debug, Clone)]
+pub(crate) struct AppliedWarnLimit {
+    pub pid: u32,
+    pub name: String,
+    pub warn_mb: i32,
+}
+
 /// Apply targeted warn-limit paging hints to idle hoarders and port leakers.
 ///
 /// # Parameters
@@ -47,7 +59,8 @@ pub fn run_warn_limits(
     state: &SharedState,
     heuristic_critical_pids: &HashSet<u32>,
     warn_limit_pids: &mut HashMap<u32, u8>,
-) {
+) -> Vec<AppliedWarnLimit> {
+    let mut applied = Vec::new();
     let swap_active = swap_used_bytes > 256 * 1024 * 1024;
     if memory_pressure > 0.45 && swap_active && is_root {
         let mut fg_pids = process_enrichment::build_foreground_family(foreground_pid, process_tree);
@@ -103,6 +116,11 @@ pub fn run_warn_limits(
                 let warn_mb = warn_mb.max(32);
                 if jetsam_control::set_warn_limit(snap.pid, warn_mb).is_ok() {
                     warn_limit_pids.insert(snap.pid, 3);
+                    applied.push(AppliedWarnLimit {
+                        pid: snap.pid,
+                        name: snap.name.clone(),
+                        warn_mb,
+                    });
                 }
             }
         }
@@ -118,4 +136,6 @@ pub fn run_warn_limits(
             true
         }
     });
+
+    applied
 }

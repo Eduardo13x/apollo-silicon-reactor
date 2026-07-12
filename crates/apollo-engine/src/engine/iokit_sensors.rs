@@ -16,12 +16,15 @@
 //! `snapshot()` reads thermal state directly from IOPMrootDomain via
 //! `thermal_iokit::read_iopm_state()` (~20 us, no subprocess).
 //! Power and utilisation are provided by `IOReportReader` and `SmcDirect`
-//! in the daemon, so `snapshot()` only fills thermal + estimated temps.
+//! in the daemon. When macOS hides temperatures, the snapshot marks its
+//! compatibility estimates explicitly so decision code can use the normalized
+//! thermal state instead of treating estimates as physical sensors.
 //!
 //! `parse_powermetrics()` is retained for backwards compatibility and
 //! diagnostic use (parsing raw `powermetrics` text output).
 
 use crate::engine::thermal_iokit;
+use std::time::Instant;
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -71,6 +74,10 @@ pub struct PowerReading {
 pub struct HardwareSnapshot {
     pub thermal_state: ThermalState,
     pub temps: ClusterTemps,
+    /// True when `temps` were inferred from `thermal_state`, not measured.
+    pub temps_estimated: bool,
+    /// Monotonic timestamp for the underlying sensor sample.
+    pub sampled_at: Instant,
     pub power: PowerReading,
     /// P-Core utilisation 0.0–100.0 (from powermetrics).
     pub p_cluster_util: Option<f32>,
@@ -128,6 +135,8 @@ impl IOKitSensorReader {
                 gpu_celsius: None,
                 nand_celsius: None,
             },
+            temps_estimated: true,
+            sampled_at: Instant::now(),
             power: PowerReading {
                 package_watts: None,
                 cpu_watts: None,
@@ -253,9 +262,12 @@ impl IOKitSensorReader {
             }
         }
 
-        // Infer temps from thermal_state if not explicitly available.
+        // Keep compatibility estimates for non-decision consumers, but mark
+        // their provenance. Modern macOS commonly exposes only the normalized
+        // IOPM thermal state, which must not be presented as a measured degree.
+        let temps_estimated = p_temp.is_none() && e_temp.is_none();
         // Modern macOS hides core temps; we estimate based on pressure level + utilisation.
-        if p_temp.is_none() && e_temp.is_none() {
+        if temps_estimated {
             let (est_p, est_e) = match thermal_state {
                 ThermalState::Normal => (60.0, 45.0),    // Cool idle
                 ThermalState::Moderate => (80.0, 65.0),  // Warm, some activity
@@ -274,6 +286,8 @@ impl IOKitSensorReader {
                 gpu_celsius: gpu_temp,
                 nand_celsius: None,
             },
+            temps_estimated,
+            sampled_at: Instant::now(),
             power: PowerReading {
                 package_watts: pkg_watts,
                 cpu_watts,

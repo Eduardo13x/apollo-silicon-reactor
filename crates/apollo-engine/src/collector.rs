@@ -247,9 +247,8 @@ impl SystemCollector {
         // EMA smoothing on compressor_pressure (α=0.25) to remove single-sample noise
         // before MAX fusion. Kalman in signal_intelligence still smooths the fused value,
         // but pre-smoothing here reduces the noise it has to compensate for (less lag).
-        let alpha = 0.25f64;
         let compressor_pressure =
-            self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
+            smooth_compressor_pressure(self.compressor_ema, compressor_pressure_raw);
         self.compressor_ema = compressor_pressure;
         let mem_pressure = kernel_pressure.max(compressor_pressure);
         let nowi = Instant::now();
@@ -371,9 +370,8 @@ impl SystemCollector {
             kernel_pressure,
             refault_cumulative,
         ) = collect_pressure_facts();
-        let alpha = 0.25f64;
         let compressor_pressure =
-            self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
+            smooth_compressor_pressure(self.compressor_ema, compressor_pressure_raw);
         self.compressor_ema = compressor_pressure;
         let mem_pressure = kernel_pressure.max(compressor_pressure);
         let nowi = Instant::now();
@@ -471,9 +469,8 @@ impl SystemCollector {
             kernel_pressure,
             refault_cumulative,
         ) = collect_pressure_facts();
-        let alpha = 0.25f64;
         let compressor_pressure =
-            self.compressor_ema * (1.0 - alpha) + compressor_pressure_raw * alpha;
+            smooth_compressor_pressure(self.compressor_ema, compressor_pressure_raw);
         self.compressor_ema = compressor_pressure;
         let mem_pressure = kernel_pressure.max(compressor_pressure);
         let nowi = Instant::now();
@@ -556,6 +553,15 @@ pub(crate) fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
         Some(val)
     } else {
         None
+    }
+}
+
+fn smooth_compressor_pressure(previous: f64, raw: f64) -> f64 {
+    let smoothed = previous * 0.75 + raw.clamp(0.0, 1.0) * 0.25;
+    if smoothed < 1e-12 {
+        0.0
+    } else {
+        smoothed
     }
 }
 
@@ -782,6 +788,12 @@ mod tests {
     }
 
     // ── EMA math (mirrors collect_snapshot EMA logic) ────────────────────────
+
+    #[test]
+    fn compressor_ema_flushes_operational_zero() {
+        assert_eq!(smooth_compressor_pressure(1e-323, 0.0), 0.0);
+        assert!((smooth_compressor_pressure(0.4, 0.2) - 0.35).abs() < 1e-12);
+    }
 
     #[test]
     fn ema_converges_to_target() {

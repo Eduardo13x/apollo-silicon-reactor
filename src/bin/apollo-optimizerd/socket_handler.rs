@@ -341,22 +341,59 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
         }
         DaemonRequest::Doctor => {
             let caps = detect_capabilities();
+            // Doctor runs live write probes for memorystatus_control and
+            // task_for_pid to confirm the kernel API write paths actually work.
+            // Read-only checks (sysctl, swap, VM stats) remain passive.
+            let (
+                reactor_mode,
+                reactor_health,
+                reactor_pulses,
+                iokit_snapshots,
+                iokit_errors,
+                qos_foreground,
+                qos_background,
+                qos_errors,
+            ) = {
+                let m = state.metrics.lock_recover();
+                (
+                    m.reactor_status.mode.clone(),
+                    m.reactor_status.health.clone(),
+                    m.metrics.reactor_pulses,
+                    m.metrics.iokit_snapshots,
+                    m.metrics.iokit_errors,
+                    m.metrics.qos_foreground_count,
+                    m.metrics.qos_background_count,
+                    m.metrics.qos_errors,
+                )
+            };
             let checks = vec![
                 format!("is_root: {}", caps.is_root),
                 format!("taskpolicy: {}", caps.can_taskpolicy),
                 format!("sysctl: {}", caps.can_sysctl),
+                format!(
+                    "kernel_pressure_level_readable: {}",
+                    apollo_engine::engine::sysctl_direct::read_i32(
+                        "kern.memorystatus_vm_pressure_level"
+                    )
+                    .is_some()
+                ),
+                format!(
+                    "memorystatus_write: {}",
+                    caps.memorystatus_probe
+                        .as_deref()
+                        .unwrap_or("skipped (not root)")
+                ),
+                format!(
+                    "task_for_pid: {}",
+                    caps.task_for_pid_probe.as_deref().unwrap_or("unknown")
+                ),
                 format!("mdutil: {}", caps.can_mdutil),
                 format!("tmutil: {}", caps.can_tmutil),
                 format!("socket_exists: {}", Path::new(socket_path()).exists()),
                 format!("kill_switch: {}", Path::new(kill_switch_path()).exists()),
-                {
-                    let m = state.metrics.lock_recover();
-                    format!("reactor_mode: {}", m.reactor_status.mode)
-                },
-                {
-                    let m = state.metrics.lock_recover();
-                    format!("reactor_health: {}", m.reactor_status.health)
-                },
+                format!("reactor_mode: {}", reactor_mode),
+                format!("reactor_health: {}", reactor_health),
+                format!("reactor_pulses: {}", reactor_pulses),
                 format!(
                     "swapusage_readable: {}",
                     apollo_engine::engine::sysctl_direct::read_swap_usage().is_some()
@@ -364,6 +401,14 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 format!(
                     "memory_pressure_readable: {}",
                     apollo_engine::engine::host_vm_info::read_vm_stats().is_some()
+                ),
+                format!(
+                    "iokit_observed: snapshots={} errors={}",
+                    iokit_snapshots, iokit_errors
+                ),
+                format!(
+                    "qos_observed: foreground={} background={} errors={}",
+                    qos_foreground, qos_background, qos_errors
                 ),
             ];
             DaemonResponse::Doctor { checks }

@@ -41,9 +41,9 @@
 //!
 //! ## Hint shapes
 //!
-//! - `PressureSpike { peak }` — memory pressure has been rising at
-//!   ≥ 0.5 %/sec for the last 60 seconds; expect to cross `peak`
-//!   within `horizon_secs`.
+//! - `PressureSpike { peak }` — memory pressure is rising steadily from
+//!   the warm band and is projected to cross the intervention band within
+//!   `horizon_secs`.
 //! - `ThrashingOnset { score }` — thrashing_score has climbed past
 //!   1500 with positive slope; expect to cross 5_000 (gate_c) soon.
 //! - `CpuSaturation { fraction }` — cpu_pegged_fraction has exceeded
@@ -346,6 +346,12 @@ impl Planner {
     /// transitions without being so long that stale data drowns the
     /// signal.
     pub const WINDOW_SAMPLES: usize = 10;
+    /// Planner pre-arm should wake the fast loop before the reactive memory
+    /// band starts at 0.55, not only after the system is already there.
+    const PREARM_SOURCE_PRESSURE_FLOOR: f64 = 0.40;
+    const PREARM_TARGET_PRESSURE: f64 = 0.55;
+    const PREARM_MIN_RISE_PER_SEC: f64 = 0.0015;
+    const PREARM_MAX_HORIZON_SECS: u64 = 120;
 
     pub fn new(cadence: Duration, metrics_path: PathBuf, output_path: PathBuf) -> Self {
         Self {
@@ -434,19 +440,28 @@ impl Planner {
             None => return out,
         };
 
-        // Pressure rule: rising at ≥ 0.005/sec for the window AND
-        // current level ≥ 0.55. Predicted peak at horizon_secs based on
-        // linear extrapolation, capped at 0.95.
+        // Pressure rule: while still in the warm band, pre-arm if a steady
+        // rise projects into Apollo's 0.55 intervention band within two
+        // minutes. The previous 0.55 source floor only emitted after the
+        // reactor had already reached the reactive threshold.
         let p_slope = self.window.slope(|o| o.memory_pressure);
-        if p_slope >= 0.005 && latest.memory_pressure >= 0.55 {
-            let horizon = 60u64;
+        if p_slope >= Self::PREARM_MIN_RISE_PER_SEC
+            && latest.memory_pressure >= Self::PREARM_SOURCE_PRESSURE_FLOOR
+        {
+            let secs_to_target =
+                (Self::PREARM_TARGET_PRESSURE - latest.memory_pressure).max(0.0) / p_slope;
+            let horizon = secs_to_target
+                .ceil()
+                .clamp(15.0, Self::PREARM_MAX_HORIZON_SECS as f64) as u64;
             let predicted = (latest.memory_pressure + p_slope * horizon as f64).min(0.95);
-            out.push(PlannerHint {
-                horizon_secs: horizon,
-                confidence: self.window.steadiness(|o| o.memory_pressure),
-                emitted_at: now,
-                kind: HintKind::PressureSpike { peak: predicted },
-            });
+            if predicted >= Self::PREARM_TARGET_PRESSURE {
+                out.push(PlannerHint {
+                    horizon_secs: horizon,
+                    confidence: self.window.steadiness(|o| o.memory_pressure),
+                    emitted_at: now,
+                    kind: HintKind::PressureSpike { peak: predicted },
+                });
+            }
         }
 
         // Thrashing rule: thrashing_score climbing past 1500 with
@@ -680,14 +695,14 @@ mod tests {
         let mut p = make_planner_with_window();
         let t0 = Utc::now();
         // Climbing from 0.55 → 0.70 over 5 minutes (0.0005/sec).
-        // 0.0005 < 0.005 threshold → should NOT emit at this slope.
+        // 0.0005 < pre-arm slope threshold → should NOT emit.
         for i in 0..6 {
             p.window.push(
                 t0 + ChronoDuration::seconds(i * 30),
                 obs(0.55 + i as f64 * 0.025, 0.0, 0.0),
             );
         }
-        // 0.025 per 30s = 0.000833/s — still below 0.005/s threshold.
+        // 0.025 per 30s = 0.000833/s — still below the threshold.
         let hints = p.derive_hints();
         assert!(
             !hints
@@ -695,6 +710,30 @@ mod tests {
                 .any(|h| matches!(h.kind, HintKind::PressureSpike { .. })),
             "0.000833/s slope should NOT emit pressure spike"
         );
+    }
+
+    #[test]
+    fn pressure_spike_prearms_before_reactive_pressure_band() {
+        let mut p = make_planner_with_window();
+        let t0 = Utc::now();
+        // Rise from 0.40 to 0.50 in a minute. The planner should forecast
+        // the 0.55 reactive band before the current sample reaches it.
+        for i in 0..3 {
+            p.window.push(
+                t0 + ChronoDuration::seconds(i * 30),
+                obs(0.40 + i as f64 * 0.05, 0.0, 0.0),
+            );
+        }
+
+        let spike = p
+            .derive_hints()
+            .into_iter()
+            .find(|h| matches!(h.kind, HintKind::PressureSpike { .. }))
+            .expect("rising warm-band pressure should produce a pre-arm hint");
+
+        assert!(spike.horizon_secs <= 120);
+        assert!(spike.confidence >= 0.60);
+        assert!(matches!(spike.kind, HintKind::PressureSpike { peak } if peak >= 0.55));
     }
 
     #[test]

@@ -28,7 +28,7 @@
 //!   Ch.2 — memory hierarchy effects on IPC.
 //! - Apple "Optimizing for Apple Silicon" WWDC21 — P-core / E-core semantics.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A pair of processes detected as likely competing for the same L2 cache cluster.
 #[derive(Debug, Clone)]
@@ -125,8 +125,14 @@ impl ContentionDetector {
         // Update co-execution counters.
         // A pair increments only if BOTH processes were heavy in the *previous* cycle too
         // (stability requirement — avoids counting a single-cycle spike as contention).
-        let prev_set: std::collections::HashSet<u32> =
-            self.prev_heavy_pids.iter().copied().collect();
+        let prev_set: HashSet<u32> = self.prev_heavy_pids.iter().copied().collect();
+
+        // Keep the first entry for duplicate PIDs, matching the old linear
+        // `find()` behavior exactly while making pair metadata lookup O(1).
+        let mut heavy_by_pid: HashMap<u32, (&str, f32)> = HashMap::with_capacity(heavy.len());
+        for (pid, name, cpu) in &heavy {
+            heavy_by_pid.entry(*pid).or_insert((name.as_str(), *cpu));
+        }
 
         let mut active_pairs: Vec<(u32, u32)> = Vec::new();
         for i in 0..heavy.len() {
@@ -140,9 +146,11 @@ impl ContentionDetector {
             }
         }
 
+        let active_pair_set: HashSet<(u32, u32)> = active_pairs.iter().copied().collect();
+
         // Decay counts for pairs no longer co-executing.
         self.co_exec_cycles.retain(|(a, b), count| {
-            if !active_pairs.contains(&(*a, *b)) {
+            if !active_pair_set.contains(&(*a, *b)) {
                 *count = count.saturating_sub(1);
                 *count > 0
             } else {
@@ -161,31 +169,19 @@ impl ContentionDetector {
                     .unwrap_or(0);
                 if cycles >= 3 {
                     // heavy_pid = whichever has higher CPU (keep on P-cores).
-                    let cpu_a = heavy
-                        .iter()
-                        .find(|(p, _, _)| *p == pid_a)
-                        .map(|(_, _, c)| *c)
-                        .unwrap_or(0.0);
-                    let cpu_b = heavy
-                        .iter()
-                        .find(|(p, _, _)| *p == pid_b)
-                        .map(|(_, _, c)| *c)
-                        .unwrap_or(0.0);
+                    let cpu_a = heavy_by_pid.get(&pid_a).map_or(0.0, |(_, cpu)| *cpu);
+                    let cpu_b = heavy_by_pid.get(&pid_b).map_or(0.0, |(_, cpu)| *cpu);
                     let (heavy_pid, light_pid) = if cpu_a >= cpu_b {
                         (pid_a, pid_b)
                     } else {
                         (pid_b, pid_a)
                     };
-                    let heavy_name = heavy
-                        .iter()
-                        .find(|(p, _, _)| *p == heavy_pid)
-                        .map(|(_, n, _)| n.clone())
-                        .unwrap_or_default();
-                    let light_name = heavy
-                        .iter()
-                        .find(|(p, _, _)| *p == light_pid)
-                        .map(|(_, n, _)| n.clone())
-                        .unwrap_or_default();
+                    let heavy_name = heavy_by_pid
+                        .get(&heavy_pid)
+                        .map_or_else(String::new, |(name, _)| (*name).to_owned());
+                    let light_name = heavy_by_pid
+                        .get(&light_pid)
+                        .map_or_else(String::new, |(name, _)| (*name).to_owned());
                     pairs.push(ContentionPair {
                         heavy_pid,
                         heavy_name,

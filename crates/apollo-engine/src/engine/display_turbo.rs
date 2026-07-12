@@ -65,7 +65,7 @@ const MAX_TURBO_FREEZE: usize = 60;
 ///
 /// Returns `true` if display is on, `false` if off.
 /// On error, assumes display is on (conservative default).
-fn is_display_on() -> bool {
+fn is_display_on(service_cache: &mut Option<u32>) -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         return true;
@@ -102,25 +102,14 @@ fn is_display_on() -> bool {
         const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
         const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
 
-        unsafe {
-            let matching = IOServiceMatching(c"IODisplayWrangler".as_ptr());
-            if matching.is_null() {
-                return true;
-            }
-
-            let service = IOServiceGetMatchingService(0, matching);
-            if service == 0 {
-                return true;
-            }
-
+        unsafe fn read_power_state(service: u32) -> Option<bool> {
             let key = CFStringCreateWithCString(
                 std::ptr::null(),
                 c"DevicePowerState".as_ptr(),
                 K_CF_STRING_ENCODING_UTF8,
             );
             if key.is_null() {
-                IOObjectRelease(service);
-                return true;
+                return None;
             }
 
             let prop = IORegistryEntryCreateCFProperty(service, key, std::ptr::null(), 0);
@@ -130,8 +119,7 @@ fn is_display_on() -> bool {
                 if !prop.is_null() {
                     CFRelease(prop);
                 }
-                IOObjectRelease(service);
-                return true;
+                return None;
             }
 
             let mut power_state: i32 = 0;
@@ -141,10 +129,51 @@ fn is_display_on() -> bool {
                 &mut power_state as *mut _ as *mut _,
             );
             CFRelease(prop);
-            IOObjectRelease(service);
-
-            power_state >= 4
+            Some(power_state >= 4)
         }
+
+        unsafe fn open_service() -> Option<u32> {
+            let matching = IOServiceMatching(c"IODisplayWrangler".as_ptr());
+            if matching.is_null() {
+                return None;
+            }
+            let service = IOServiceGetMatchingService(0, matching);
+            (service != 0).then_some(service)
+        }
+
+        unsafe {
+            let service = match *service_cache {
+                Some(service) => service,
+                None => match open_service() {
+                    Some(service) => {
+                        *service_cache = Some(service);
+                        service
+                    }
+                    None => return true,
+                },
+            };
+            if let Some(display_on) = read_power_state(service) {
+                return display_on;
+            }
+
+            // Sleep/wake can invalidate an IORegistry handle. Reacquire once;
+            // failure keeps the existing conservative display-on default.
+            IOObjectRelease(service);
+            *service_cache = open_service();
+            service_cache
+                .and_then(|fresh| read_power_state(fresh))
+                .unwrap_or(true)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn release_display_service(service: u32) {
+    extern "C" {
+        fn IOObjectRelease(object: u32) -> i32;
+    }
+    unsafe {
+        IOObjectRelease(service);
     }
 }
 
@@ -174,6 +203,8 @@ pub struct DisplayTurbo {
     activation_count: u64,
     /// Last time we polled display state (rate-limit ioreg calls).
     last_poll: Option<Instant>,
+    /// Cached IODisplayWrangler registry handle. Reopened after invalidation.
+    display_service: Option<u32>,
     /// Dwell time before activating turbo.  Shorter on battery.
     dwell_secs: u64,
 }
@@ -192,6 +223,7 @@ impl DisplayTurbo {
             turbo_frozen_pids: HashSet::new(),
             activation_count: 0,
             last_poll: None,
+            display_service: None,
             dwell_secs: DWELL_BEFORE_TURBO_SECS,
         }
     }
@@ -216,7 +248,7 @@ impl DisplayTurbo {
         }
         self.last_poll = Some(now);
 
-        let display_on = is_display_on();
+        let display_on = is_display_on(&mut self.display_service);
 
         match self.state {
             TurboState::DisplayOn => {
@@ -315,6 +347,15 @@ impl DisplayTurbo {
     }
 }
 
+impl Drop for DisplayTurbo {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(service) = self.display_service.take() {
+            release_display_service(service);
+        }
+    }
+}
+
 /// Action returned by `DisplayTurbo::tick()`.
 #[derive(Debug)]
 pub enum TurboAction {
@@ -360,6 +401,10 @@ mod tests {
     #[test]
     fn display_detection_does_not_crash() {
         // Just verify the IOKit-based detection doesn't panic.
-        let _on = is_display_on();
+        let mut service = None;
+        let _on = is_display_on(&mut service);
+        if let Some(service) = service {
+            release_display_service(service);
+        }
     }
 }

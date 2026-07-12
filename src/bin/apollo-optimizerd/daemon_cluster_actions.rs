@@ -24,6 +24,16 @@ pub struct ClusterActionsOutput {
     pub new_actions: Vec<RootAction>,
 }
 
+fn first_matching_process<'a>(
+    eligible_processes: &'a [(u32, String)],
+    pattern: &str,
+) -> Option<(u32, &'a str)> {
+    eligible_processes
+        .iter()
+        .find(|(_, name)| name.contains(pattern))
+        .map(|(pid, name)| (*pid, name.as_str()))
+}
+
 /// Run coordinated cluster freezing for this cycle.
 ///
 /// # Parameters
@@ -55,6 +65,19 @@ pub fn run_cluster_actions(
                 _ => None,
             })
             .collect();
+        // Preserve collector iteration order and protection semantics while
+        // paying name allocation and safety classification only once per
+        // cycle, rather than once per causal pair.
+        let eligible_processes: Vec<(u32, String)> = collector
+            .system()
+            .processes()
+            .iter()
+            .filter_map(|(pid, proc)| {
+                let name = proc.name().to_string();
+                (!apollo_engine::engine::safety::is_protected_name(&name))
+                    .then(|| (pid.as_u32(), name))
+            })
+            .collect();
         for (pa, pb, count) in causal_pairs {
             if *count < 8 {
                 continue;
@@ -66,29 +89,20 @@ pub fn run_cluster_actions(
             }
             let missing = if a_acted { pb } else { pa };
             let partner = if a_acted { pa } else { pb };
-            for (pid, proc) in collector.system().processes() {
-                let proc_name = proc.name().to_string();
-                // Complete mediation (2026-06-18 bug-class sweep): this path
-                // threw a coordinated throttle on a NAME match with no
-                // protection check — a causal partner pattern matching an
-                // Apple/system/dev-runtime process (e.g. "node") would be
-                // throttled blind. Honor safety.rs before emitting.
-                if apollo_engine::engine::safety::is_protected_name(&proc_name) {
-                    continue;
-                }
-                if proc_name.contains(missing) && !actioned.iter().any(|n| n.contains(missing)) {
-                    new_actions.push(RootAction::throttle(
-                        pid.as_u32(),
-                        proc_name,
-                        false,
-                        format!(
-                            "coordinated-cluster: co-occurs with {} (n={})",
-                            partner, count
-                        ),
-                        DecisionReason::PressureContext,
-                    ));
-                    break;
-                }
+            if actioned.iter().any(|n| n.contains(missing)) {
+                continue;
+            }
+            if let Some((pid, proc_name)) = first_matching_process(&eligible_processes, missing) {
+                new_actions.push(RootAction::throttle(
+                    pid,
+                    proc_name.to_owned(),
+                    false,
+                    format!(
+                        "coordinated-cluster: co-occurs with {} (n={})",
+                        partner, count
+                    ),
+                    DecisionReason::PressureContext,
+                ));
             }
         }
     }
@@ -109,4 +123,27 @@ pub fn run_cluster_actions(
     // genuinely spikes, jetsam handles mds_stores natively.
 
     ClusterActionsOutput { new_actions }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_preserves_collector_order() {
+        let processes = vec![
+            (7, "worker helper".to_owned()),
+            (3, "worker renderer".to_owned()),
+        ];
+        assert_eq!(
+            first_matching_process(&processes, "worker"),
+            Some((7, "worker helper"))
+        );
+    }
+
+    #[test]
+    fn matching_returns_none_without_name_hit() {
+        let processes = vec![(7, "worker helper".to_owned())];
+        assert_eq!(first_matching_process(&processes, "browser"), None);
+    }
 }

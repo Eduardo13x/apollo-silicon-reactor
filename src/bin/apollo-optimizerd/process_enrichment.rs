@@ -159,16 +159,27 @@ pub fn build_foreground_family(foreground_pid: Option<u32>, tree: &ProcessTree) 
 struct CachedEnrichSyscalls {
     rusage_map: HashMap<u32, (u64, u32, u32, u32)>,
     contention_map: HashMap<u32, f64>,
+    identity_map: HashMap<u32, CachedProcessIdentity>,
     cycle_filled: u64,
+    initialized: bool,
 }
 
-/// Hard cap on cached PID entries. M1 8GB typically has 400 PIDs, of
-/// which ~150 are enrich-eligible. 512 = ample headroom while bounding
-/// the worst case if a PID-spawn storm (e.g. a build with many short-
-/// lived subprocesses) hits during a high-pressure window. When the
-/// cap fires we drop the half whose entries are most likely stale —
-/// see `cap_512_lru` for the eviction strategy.
-const ENRICH_CACHE_HARD_CAP: usize = 512;
+#[derive(Clone, Copy)]
+struct CachedProcessIdentity {
+    start_time: u64,
+    is_app_bundle: bool,
+    is_translated: bool,
+}
+
+/// Scale task-counter cache capacity with the live process table instead of a
+/// chip-specific seat assumption, while retaining hard memory bounds.
+const ENRICH_CACHE_MIN_CAP: usize = 512;
+const ENRICH_CACHE_MAX_CAP: usize = 2048;
+
+/// Identity fields are stable for a process lifetime, so cache them by
+/// PID plus start time. This cap covers large Apple Silicon sessions while
+/// still bounding a PID-spawn storm.
+const IDENTITY_CACHE_HARD_CAP: usize = 2048;
 
 fn enrich_syscall_cache() -> &'static Mutex<CachedEnrichSyscalls> {
     static CACHE: OnceLock<Mutex<CachedEnrichSyscalls>> = OnceLock::new();
@@ -185,6 +196,7 @@ pub fn invalidate_cached_enrich(pid: u32) {
     if let Ok(mut cache) = enrich_syscall_cache().lock() {
         cache.rusage_map.remove(&pid);
         cache.contention_map.remove(&pid);
+        cache.identity_map.remove(&pid);
     }
 }
 
@@ -197,21 +209,33 @@ pub fn reset_enrich_cache_for_test() {
     if let Ok(mut cache) = enrich_syscall_cache().lock() {
         cache.rusage_map.clear();
         cache.contention_map.clear();
+        cache.identity_map.clear();
         cache.cycle_filled = 0;
+        cache.initialized = false;
     }
 }
 
 /// Returns true when the proc_taskinfo bulk read should be skipped this
 /// cycle in favour of the cached values. Hold on the cache: only skip
-/// when (a) pressure is high enough that Apollo's own footprint matters
-/// and (b) the cache has actually been filled at least once before, and
-/// (c) we are inside the 4-cycle reuse window.
-fn should_reuse_enrich_cache(cycle_count: u64, pressure_smooth: f64) -> bool {
-    if pressure_smooth <= 0.80 {
+/// when the cache has been filled and this cycle is off the adaptive refresh
+/// cadence. Stable and severe-pressure regimes refresh every fourth cycle;
+/// the transition band refreshes every second cycle for faster response.
+fn should_reuse_enrich_cache(
+    cycle_count: u64,
+    pressure_smooth: f64,
+    cache_initialized: bool,
+    last_refresh_cycle: u64,
+) -> bool {
+    if !cache_initialized {
         return false;
     }
-    // Refresh every 4th cycle to bound staleness at ~1.6 s @ 1 Hz pressure-mode.
-    !cycle_count.is_multiple_of(4)
+
+    let refresh_every = if pressure_smooth <= 0.50 || pressure_smooth > 0.80 {
+        4
+    } else {
+        2
+    };
+    cycle_count.saturating_sub(last_refresh_cycle) < refresh_every
 }
 
 // ── Enriched Process Data ──────────────────────────────────────────────────
@@ -256,40 +280,45 @@ pub fn build_enriched_process_data_with_tree(
     // never miss their state. [Hellerstein 2004 §9 sampling under load]
     const ENRICH_MIN_RSS_BYTES: u64 = 2 * 1024 * 1024;
 
-    // Changes A+B (2026-05-16): under sustained high pressure (>0.80
-    // smoothed), Apollo's own enrichment syscalls become a contributor
-    // to the very thrashing they're trying to mitigate. When we are in
-    // a stress window AND the cache has been freshly filled within the
-    // last 4 cycles, reuse the cached rusage + contention maps and skip
-    // the per-PID syscall storm + contention-tracker mutex acquire.
-    // Live RSS / CPU still refresh every cycle from sysinfo so the rest
-    // of the snapshot stays current.
-    let reuse_cache = should_reuse_enrich_cache(cycle_count, pressure_smooth);
+    // Kernel task counters move much more slowly than sysinfo's live RSS/CPU.
+    // Reuse them on an adaptive cadence in both stable and stressed regimes;
+    // the transition band refreshes more often so pressure changes remain
+    // responsive. Identity fields are lifetime-stable and are cached by
+    // (PID, start_time), independently of the task-counter cadence.
+    let process_count = sys.processes().len();
+    let enrich_cache_capacity = process_count.clamp(ENRICH_CACHE_MIN_CAP, ENRICH_CACHE_MAX_CAP);
+    let (reuse_cache, mut rusage_map, mut contention_map, mut identity_map) = {
+        let cache = enrich_syscall_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let reuse = should_reuse_enrich_cache(
+            cycle_count,
+            pressure_smooth,
+            cache.initialized,
+            cache.cycle_filled,
+        );
+        let rusage = if reuse {
+            cache.rusage_map.clone()
+        } else {
+            HashMap::with_capacity(enrich_cache_capacity)
+        };
+        let contention = if reuse {
+            cache.contention_map.clone()
+        } else {
+            HashMap::with_capacity(enrich_cache_capacity)
+        };
+        (reuse, rusage, contention, cache.identity_map.clone())
+    };
     if reuse_cache {
         lf_metrics.inc_taskinfo_cache_hit();
     } else {
         lf_metrics.inc_taskinfo_cache_miss();
     }
-    let (mut rusage_map, mut contention_map): (
-        HashMap<u32, (u64, u32, u32, u32)>,
-        HashMap<u32, f64>,
-    ) = if reuse_cache {
-        let cache = enrich_syscall_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // First cycle under pressure: cache may be empty. That's fine —
-        // returning empty maps produces the same behaviour as PIDs that
-        // simply had no proc_taskinfo data (wakeups_per_sec = 0).
-        (cache.rusage_map.clone(), cache.contention_map.clone())
-    } else {
-        (HashMap::with_capacity(256), HashMap::with_capacity(256))
-    };
 
-    // Pre-allocated for ~500 live PIDs typical of a heavy session
-    // (Brave 17 helpers + dev tools + system daemons).
-    let mut live_pids: HashSet<u32> = HashSet::with_capacity(512);
+    let mut live_pids: HashSet<u32> = HashSet::with_capacity(process_count);
 
     if !reuse_cache {
+        let mut rusage_samples = Vec::with_capacity(enrich_cache_capacity);
         for (pid, process) in sys.processes() {
             let pid_u32 = pid.as_u32();
             live_pids.insert(pid_u32);
@@ -298,76 +327,35 @@ pub fn build_enriched_process_data_with_tree(
                 continue;
             }
             if let Some(ri) = proc_taskinfo::get_rusage_info(pid_u32) {
-                let idle_wk = ri.idle_wakeups;
-                // Observe into the global contention tracker. This returns the
-                // ratio vs the previous cached sample (None on the first cycle
-                // or when the process was idle) and stores the new sample as
-                // the next baseline. The mutex is held only for the observe
-                // call itself; no other I/O happens under it.
-                if let Ok(mut tracker) = apollo_engine::engine::contention_tracker::global().lock()
-                {
-                    if let Some(ratio) = tracker.observe(pid_u32, ri.clone()) {
-                        contention_map.insert(pid_u32, ratio);
-                    }
-                }
-                if let Some(ti) = proc_taskinfo::get_task_info(pid_u32) {
-                    rusage_map.insert(
-                        pid_u32,
-                        (
-                            idle_wk,
-                            ti.messages_sent + ti.messages_received,
-                            ti.faults,
-                            ti.pageins,
-                        ),
-                    );
-                } else {
-                    rusage_map.insert(pid_u32, (idle_wk, 0, 0, 0));
-                }
+                rusage_samples.push((pid_u32, ri));
             }
         }
-        // GC any tracker entries for pids that disappeared this cycle so the
-        // map can't grow beyond the live pid set over a long-running session.
+
+        // Finish all kernel reads before taking the contention lock, then
+        // observe the batch under one acquisition instead of one per PID.
+        for (pid_u32, ri) in &rusage_samples {
+            let idle_wk = ri.idle_wakeups;
+            if let Some(ti) = proc_taskinfo::get_task_info(*pid_u32) {
+                rusage_map.insert(
+                    *pid_u32,
+                    (
+                        idle_wk,
+                        ti.messages_sent + ti.messages_received,
+                        ti.faults,
+                        ti.pageins,
+                    ),
+                );
+            } else {
+                rusage_map.insert(*pid_u32, (idle_wk, 0, 0, 0));
+            }
+        }
         if let Ok(mut tracker) = apollo_engine::engine::contention_tracker::global().lock() {
-            tracker.gc(&live_pids);
-        }
-        // Persist this cycle's fresh maps for the next 3 cycles to reuse
-        // under continued pressure. Cheap clone — typical maps are <200
-        // entries and the inner tuples are POD.
-        //
-        // Two safety nets layered on top of the clone:
-        //
-        // 1. live-PID retain: we already iterated `sys.processes()` to
-        //    build `live_pids` above, so passing it into the cache
-        //    keeps it tied to the current pid set. Entries for PIDs
-        //    that disappeared this cycle won't survive into the next
-        //    reuse window — closing the same staleness hazard that
-        //    NOTE_EXIT closes synchronously.
-        // 2. hard cap 512: if a PID-spawn storm pushes the map past
-        //    the cap before live_pids retention catches up, drop the
-        //    extra entries. We don't track an LRU order here on
-        //    purpose — the cache is refreshed every 4 cycles, so any
-        //    spurious eviction is corrected within ~1.6 s.
-        if let Ok(mut cache) = enrich_syscall_cache().lock() {
-            let mut next_rusage = rusage_map.clone();
-            let mut next_contention = contention_map.clone();
-            next_rusage.retain(|pid, _| live_pids.contains(pid));
-            next_contention.retain(|pid, _| live_pids.contains(pid));
-            if next_rusage.len() > ENRICH_CACHE_HARD_CAP {
-                let drop: Vec<u32> = next_rusage
-                    .keys()
-                    .copied()
-                    .skip(ENRICH_CACHE_HARD_CAP)
-                    .collect();
-                let evicted = drop.len() as u64;
-                for pid in &drop {
-                    next_rusage.remove(pid);
-                    next_contention.remove(pid);
+            for (pid_u32, ri) in rusage_samples {
+                if let Some(ratio) = tracker.observe(pid_u32, ri) {
+                    contention_map.insert(pid_u32, ratio);
                 }
-                lf_metrics.add_taskinfo_cache_cap_evictions(evicted);
             }
-            cache.rusage_map = next_rusage;
-            cache.contention_map = next_contention;
-            cache.cycle_filled = cycle_count;
+            tracker.gc(&live_pids);
         }
     } else {
         // Cache reuse path: still populate live_pids from the cheap
@@ -378,10 +366,10 @@ pub fn build_enriched_process_data_with_tree(
         }
     }
 
-    // 2026-05-12: pre-sized for typical 150 enriched processes and
-    // 50 "hunt" candidates. Avoids the Vec doubling pattern on every cycle.
-    let mut proc_snaps = Vec::with_capacity(256);
-    let mut hunt_snaps = Vec::with_capacity(64);
+    // Both vectors receive one entry per live process, so size them from the
+    // actual table instead of repeatedly growing from historical M1 guesses.
+    let mut proc_snaps = Vec::with_capacity(process_count);
+    let mut hunt_snaps = Vec::with_capacity(process_count);
 
     let now_unix_secs: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -398,10 +386,10 @@ pub fn build_enriched_process_data_with_tree(
         let rss = process.memory();
         let cpu = process.cpu_usage();
         // process.start_time() → seconds since Unix epoch; 0 if unknown.
+        let process_start_time = process.start_time();
         let process_uptime_secs = {
-            let start = process.start_time();
-            if start > 0 {
-                now_unix_secs.saturating_sub(start)
+            if process_start_time > 0 {
+                now_unix_secs.saturating_sub(process_start_time)
             } else {
                 u64::MAX // unknown start → treat as long-lived
             }
@@ -435,12 +423,19 @@ pub fn build_enriched_process_data_with_tree(
                 None => (0.0, false, 0, 0),
             };
 
-        // Behavioural app-bundle detection: one extra proc_pidpath syscall
-        // (~3 µs on M1) per pid, only here in enrichment. The result is
-        // cached on ProcessSnapshot so downstream consumers don't repeat
-        // the syscall.
-        let is_app_bundle =
-            apollo_engine::engine::proc_taskinfo::is_user_app_bundle(pid_u32).unwrap_or(false);
+        // Bundle membership and Rosetta translation cannot change during a
+        // process lifetime. Re-probe only for a new PID/start-time identity.
+        let identity = identity_map
+            .get(&pid_u32)
+            .copied()
+            .filter(|cached| process_start_time > 0 && cached.start_time == process_start_time)
+            .unwrap_or_else(|| CachedProcessIdentity {
+                start_time: process_start_time,
+                is_app_bundle: apollo_engine::engine::proc_taskinfo::is_user_app_bundle(pid_u32)
+                    .unwrap_or(false),
+                is_translated: apollo_engine::engine::process_identity::is_translated(pid_u32),
+            });
+        identity_map.insert(pid_u32, identity);
 
         proc_snaps.push(ProcessSnapshot {
             pid: pid_u32,
@@ -457,10 +452,10 @@ pub fn build_enriched_process_data_with_tree(
             process_uptime_secs,
             faults_total,
             pageins_total,
-            is_translated: apollo_engine::engine::process_identity::is_translated(pid_u32),
+            is_translated: identity.is_translated,
             mach_port_count: 0, // populated lazily for hoarder candidates only
             cpu_contention: contention_map.get(&pid_u32).copied(),
-            is_app_bundle,
+            is_app_bundle: identity.is_app_bundle,
         });
 
         hunt_snaps.push(HuntSnapshot {
@@ -478,6 +473,50 @@ pub fn build_enriched_process_data_with_tree(
             host_app_running: parent_alive,
             host_app_absent_secs: if parent_alive { 0 } else { 3600 },
         });
+    }
+
+    // Keep all enrichment caches tied to the current process table. The
+    // start-time identity check also prevents PID reuse from inheriting stale
+    // bundle or translation state if an exit notification races this cycle.
+    rusage_map.retain(|pid, _| live_pids.contains(pid));
+    contention_map.retain(|pid, _| live_pids.contains(pid));
+    identity_map.retain(|pid, _| live_pids.contains(pid));
+
+    if rusage_map.len() > enrich_cache_capacity {
+        let drop: Vec<u32> = rusage_map
+            .keys()
+            .copied()
+            .skip(enrich_cache_capacity)
+            .collect();
+        let evicted = drop.len() as u64;
+        for pid in &drop {
+            rusage_map.remove(pid);
+            contention_map.remove(pid);
+        }
+        lf_metrics.add_taskinfo_cache_cap_evictions(evicted);
+    }
+    if identity_map.len() > IDENTITY_CACHE_HARD_CAP {
+        let drop: Vec<u32> = identity_map
+            .keys()
+            .copied()
+            .skip(IDENTITY_CACHE_HARD_CAP)
+            .collect();
+        for pid in drop {
+            identity_map.remove(&pid);
+        }
+    }
+
+    {
+        let mut cache = enrich_syscall_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.rusage_map = rusage_map;
+        cache.contention_map = contention_map;
+        cache.identity_map = identity_map;
+        if !reuse_cache {
+            cache.cycle_filled = cycle_count;
+            cache.initialized = true;
+        }
     }
 
     (proc_snaps, hunt_snaps)
@@ -651,6 +690,13 @@ pub fn classify_governor_reason(reason: &str) -> DecisionReason {
 mod tests {
     use super::*;
     use apollo_engine::engine::process_tree::ProcessEntry;
+
+    fn cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     // ── context_to_thermal ────────────────────────────────────────────────────
 
@@ -955,13 +1001,22 @@ mod tests {
     // mechanical verification step (CLAUDE.md 2026-05-07).
 
     #[test]
-    fn invalidate_cached_enrich_purges_pid_from_both_maps() {
+    fn invalidate_cached_enrich_purges_pid_from_all_maps() {
+        let _guard = cache_test_guard();
         reset_enrich_cache_for_test();
-        // Seed both maps with PID 4242.
+        // Seed all maps with PID 4242.
         {
             let mut cache = enrich_syscall_cache().lock().unwrap();
             cache.rusage_map.insert(4242, (1, 2, 3, 4));
             cache.contention_map.insert(4242, 0.75);
+            cache.identity_map.insert(
+                4242,
+                CachedProcessIdentity {
+                    start_time: 100,
+                    is_app_bundle: true,
+                    is_translated: false,
+                },
+            );
             cache.rusage_map.insert(4243, (5, 6, 7, 8));
         }
         invalidate_cached_enrich(4242);
@@ -975,6 +1030,10 @@ mod tests {
             "contention entry for 4242 must be purged"
         );
         assert!(
+            !cache.identity_map.contains_key(&4242),
+            "identity entry for 4242 must be purged"
+        );
+        assert!(
             cache.rusage_map.contains_key(&4243),
             "neighbouring PID 4243 must NOT be touched"
         );
@@ -982,27 +1041,89 @@ mod tests {
 
     #[test]
     fn invalidate_cached_enrich_on_missing_pid_is_noop() {
+        let _guard = cache_test_guard();
         reset_enrich_cache_for_test();
         // No panic, no error, cache stays empty.
         invalidate_cached_enrich(9999);
         let cache = enrich_syscall_cache().lock().unwrap();
         assert!(cache.rusage_map.is_empty());
         assert!(cache.contention_map.is_empty());
+        assert!(cache.identity_map.is_empty());
     }
 
     #[test]
-    fn should_reuse_enrich_cache_pressure_gate() {
-        // Below threshold: never reuse, even off-cadence.
-        assert!(!should_reuse_enrich_cache(1, 0.50));
-        assert!(!should_reuse_enrich_cache(3, 0.79));
-        // Exactly threshold: not above, no reuse.
-        assert!(!should_reuse_enrich_cache(1, 0.80));
-        // Above threshold + on-cadence boundary cycle: refresh, no reuse.
-        assert!(!should_reuse_enrich_cache(4, 0.85));
-        assert!(!should_reuse_enrich_cache(8, 0.85));
-        // Above threshold + off-cadence: reuse cache.
-        assert!(should_reuse_enrich_cache(1, 0.85));
-        assert!(should_reuse_enrich_cache(2, 0.85));
-        assert!(should_reuse_enrich_cache(3, 0.85));
+    fn warm_enrichment_cache_preserves_live_snapshot_shape() {
+        let _guard = cache_test_guard();
+        reset_enrich_cache_for_test();
+
+        let sys = sysinfo::System::new_all();
+        let tree = ProcessTree::build(&[]);
+        let metrics = apollo_engine::engine::lse_counters::LockFreeMetrics::default();
+
+        let cold_started = Instant::now();
+        let (cold_processes, cold_hunts) =
+            build_enriched_process_data_with_tree(&sys, None, &tree, 0, 0.30, &metrics);
+        let cold_elapsed = cold_started.elapsed();
+        let identities_after_cold = enrich_syscall_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .identity_map
+            .len();
+
+        let warm_started = Instant::now();
+        let (warm_processes, warm_hunts) =
+            build_enriched_process_data_with_tree(&sys, None, &tree, 1, 0.30, &metrics);
+        let warm_elapsed = warm_started.elapsed();
+        let identities_after_warm = enrich_syscall_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .identity_map
+            .len();
+
+        assert_eq!(cold_processes.len(), sys.processes().len());
+        assert_eq!(cold_hunts.len(), cold_processes.len());
+        assert_eq!(warm_processes.len(), cold_processes.len());
+        assert_eq!(warm_hunts.len(), cold_hunts.len());
+        assert_eq!(identities_after_warm, identities_after_cold);
+        assert!(identities_after_cold > 0);
+        assert_eq!(
+            metrics
+                .taskinfo_cache_misses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .taskinfo_cache_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        eprintln!(
+            "enrichment cold={:?} warm={:?} processes={}",
+            cold_elapsed,
+            warm_elapsed,
+            cold_processes.len()
+        );
+    }
+
+    #[test]
+    fn should_reuse_enrich_cache_uses_adaptive_cadence() {
+        // An empty cache always refreshes, regardless of cadence.
+        assert!(!should_reuse_enrich_cache(1, 0.30, false, 0));
+        assert!(!should_reuse_enrich_cache(3, 0.90, false, 0));
+
+        // Stable pressure: one refresh followed by three reuse cycles.
+        assert!(should_reuse_enrich_cache(1, 0.30, true, 0));
+        assert!(should_reuse_enrich_cache(3, 0.50, true, 0));
+        assert!(!should_reuse_enrich_cache(4, 0.30, true, 0));
+
+        // Transition band: refresh every second cycle for responsiveness.
+        assert!(should_reuse_enrich_cache(11, 0.65, true, 10));
+        assert!(!should_reuse_enrich_cache(12, 0.65, true, 10));
+        assert!(!should_reuse_enrich_cache(14, 0.80, true, 12));
+
+        // Severe pressure returns to a four-cycle cadence to reduce self-load.
+        assert!(should_reuse_enrich_cache(22, 0.85, true, 20));
+        assert!(!should_reuse_enrich_cache(24, 0.85, true, 20));
     }
 }

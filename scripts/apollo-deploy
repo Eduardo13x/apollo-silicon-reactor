@@ -1,0 +1,47 @@
+#!/bin/sh
+# Root-owned fixed deployer for Apollo release binaries staged in /private/tmp.
+set -eu
+
+if [ "$#" -ne 0 ]; then
+    echo "usage: apollo-deploy" >&2
+    exit 64
+fi
+
+DAEMON_CANDIDATE=/private/tmp/apollo-optimizerd-candidate
+CTL_CANDIDATE=/private/tmp/apollo-optimizerctl-candidate
+DAEMON_DEST=/usr/local/libexec/apollo-optimizerd
+CTL_DEST=/usr/local/bin/apollo-optimizerctl
+LABEL=system/com.eduardocortez.systemoptimizerd
+PLIST=/Library/LaunchDaemons/com.eduardocortez.systemoptimizerd.plist
+BACKUP_DIR="/var/lib/apollo/backups/deploy-$(/bin/date +%Y%m%dT%H%M%SZ)"
+
+for candidate in "$DAEMON_CANDIDATE" "$CTL_CANDIDATE"; do
+    if [ ! -f "$candidate" ] || [ -L "$candidate" ] || [ ! -x "$candidate" ]; then
+        echo "invalid candidate: $candidate" >&2
+        exit 65
+    fi
+    /usr/bin/codesign --verify --strict "$candidate"
+done
+
+/bin/mkdir -p "$BACKUP_DIR"
+/bin/cp "$DAEMON_DEST" "$BACKUP_DIR/apollo-optimizerd.pre-deploy"
+/bin/cp "$CTL_DEST" "$BACKUP_DIR/apollo-optimizerctl.pre-deploy"
+
+/bin/launchctl bootout "$LABEL" 2>/dev/null || true
+/bin/sleep 2
+/usr/bin/install -o root -g wheel -m 0755 "$DAEMON_CANDIDATE" "$DAEMON_DEST"
+/usr/bin/install -o root -g wheel -m 0755 "$CTL_CANDIDATE" "$CTL_DEST"
+
+# launchd can retain the old service briefly after bootout. Retrying avoids
+# a false deployment failure from Bootstrap error 5 while the teardown ends.
+attempt=1
+while ! /bin/launchctl bootstrap system "$PLIST"; do
+    if [ "$attempt" -ge 3 ]; then
+        echo "Apollo binaries installed, but launchd bootstrap failed" >&2
+        exit 70
+    fi
+    attempt=$((attempt + 1))
+    /bin/sleep 2
+done
+
+echo "Apollo deployed; backup: $BACKUP_DIR"

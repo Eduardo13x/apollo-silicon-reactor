@@ -35,6 +35,24 @@ pub fn detect_capabilities() -> CapabilityReport {
     let p_core_count = crate::engine::sysctl_direct::read_u32_val("hw.perflevel0.logicalcpu");
     let e_core_count = crate::engine::sysctl_direct::read_u32_val("hw.perflevel1.logicalcpu");
 
+    // ── Live write probes ────────────────────────────────────────────────────
+    // These actually call the kernel API to prove the write path works,
+    // rather than inferring capability from euid or binary existence.
+
+    let memorystatus_probe = if is_root {
+        match crate::engine::jetsam_control::probe_write() {
+            Ok(()) => Some("ok".to_string()),
+            Err(e) => Some(format!("fail: {}", e)),
+        }
+    } else {
+        None
+    };
+
+    let task_for_pid_probe = match probe_task_for_pid() {
+        Ok(()) => Some("ok".to_string()),
+        Err(e) => Some(format!("fail: {}", e)),
+    };
+
     CapabilityReport {
         can_taskpolicy,
         can_sysctl,
@@ -45,7 +63,37 @@ pub fn detect_capabilities() -> CapabilityReport {
         p_core_count,
         e_core_count,
         unavailable,
+        memorystatus_probe,
+        task_for_pid_probe,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn probe_task_for_pid() -> Result<(), String> {
+    type MachPortT = libc::c_uint;
+    const KERN_SUCCESS: i32 = 0;
+
+    extern "C" {
+        fn mach_task_self() -> MachPortT;
+        fn task_for_pid(target_tport: MachPortT, pid: libc::pid_t, t: *mut MachPortT) -> i32;
+        fn mach_port_deallocate(target_task: MachPortT, name: MachPortT) -> i32;
+    }
+
+    let pid = std::process::id() as libc::pid_t;
+    let mut task_port: MachPortT = 0;
+    let kr = unsafe { task_for_pid(mach_task_self(), pid, &mut task_port) };
+    if kr != KERN_SUCCESS {
+        return Err(format!("kern_return={}", kr));
+    }
+    unsafe {
+        mach_port_deallocate(mach_task_self(), task_port);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn probe_task_for_pid() -> Result<(), String> {
+    Err("not macOS".to_string())
 }
 
 #[cfg(test)]

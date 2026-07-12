@@ -669,7 +669,10 @@ pub fn compute_user_context(
     // If P-cluster temp > 75°C, treat as if more active (raise pressure gate)
     // so Apollo conserves thermal headroom for the user's workload.
     if let Some(hw) = cycle_hw_snap {
-        if let Some(p_temp) = hw.temps.p_cluster_celsius {
+        if let Some(p_temp) = (!hw.temps_estimated)
+            .then_some(hw.temps.p_cluster_celsius)
+            .flatten()
+        {
             if p_temp > 75.0 && !ctx.is_idle_long() {
                 // Simulate "recently active" to raise freeze gates and
                 // protect thermal headroom — overrides any idle signal.

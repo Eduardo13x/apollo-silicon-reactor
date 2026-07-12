@@ -69,7 +69,7 @@ use apollo_engine::collector::SystemCollector;
 use apollo_engine::engine::action_accumulator::{ActionAccumulator, ActionPhase, EmitContext};
 use apollo_engine::engine::adaptive_governor::AdaptiveGovernor;
 use apollo_engine::engine::amx_detector;
-use apollo_engine::engine::audit_types::DecisionReason;
+use apollo_engine::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
 use apollo_engine::engine::background_collectors::PressureCollector;
 use apollo_engine::engine::capabilities::detect_capabilities;
 use apollo_engine::engine::causal_graph::CausalGraph;
@@ -149,7 +149,7 @@ use apollo_engine::engine::daemon_state::{
 
 /// Battery-aware pressure boost: on battery, effective pressure is raised so
 /// all decision gates trigger sooner.  This proactively freezes backgrounds
-/// before hardware thermal throttling kicks in (critical on fanless M1 Air).
+/// before hardware thermal throttling kicks in.
 ///
 /// Returns a value to ADD to the raw memory_pressure reading:
 ///   AC power  → 0.00  (no change)
@@ -1756,8 +1756,12 @@ fn main() -> anyhow::Result<()> {
                             metrics.metrics.swap_delta_bps = cached.swap_delta_bps;
                         }
                         if let Some(hw) = smc_reader.latest() {
-                            metrics.metrics.iokit_p_cluster_temp = hw.temps.p_cluster_celsius;
-                            metrics.metrics.iokit_e_cluster_temp = hw.temps.e_cluster_celsius;
+                            metrics.metrics.iokit_p_cluster_temp = (!hw.temps_estimated)
+                                .then_some(hw.temps.p_cluster_celsius)
+                                .flatten();
+                            metrics.metrics.iokit_e_cluster_temp = (!hw.temps_estimated)
+                                .then_some(hw.temps.e_cluster_celsius)
+                                .flatten();
                             metrics.metrics.iokit_package_watts = hw.power.package_watts;
                         }
                         metrics.metrics.thermal_state = metrics.thermal_state.clone();
@@ -2106,8 +2110,12 @@ fn main() -> anyhow::Result<()> {
                             let mut m = state.metrics.lock_recover();
                             m.metrics.iokit_snapshots = smc_reader.success_count();
                             m.metrics.iokit_errors = smc_reader.error_count();
-                            m.metrics.iokit_p_cluster_temp = hw.temps.p_cluster_celsius;
-                            m.metrics.iokit_e_cluster_temp = hw.temps.e_cluster_celsius;
+                            m.metrics.iokit_p_cluster_temp = (!hw.temps_estimated)
+                                .then_some(hw.temps.p_cluster_celsius)
+                                .flatten();
+                            m.metrics.iokit_e_cluster_temp = (!hw.temps_estimated)
+                                .then_some(hw.temps.e_cluster_celsius)
+                                .flatten();
                             m.metrics.iokit_package_watts = hw.power.package_watts;
                         }
                         // Fix: wire SMC thermal_state → thermal_level_real every cycle.
@@ -2176,6 +2184,8 @@ fn main() -> anyhow::Result<()> {
                                 gpu_celsius: None,
                                 nand_celsius: None,
                             },
+                            temps_estimated: false,
+                            sampled_at: Instant::now(),
                             power: apollo_engine::engine::iokit_sensors::PowerReading {
                                 package_watts: None,
                                 cpu_watts: None,
@@ -2193,14 +2203,13 @@ fn main() -> anyhow::Result<()> {
                     }
                 };
                 let thermal_emergency = thermal_action.force_ecores;
-                // Thermal pre-throttle boost: raise effective pressure early (Phase1=80°C)
+                // Thermal pre-throttle boost: normalized OS state first, with a
+                // conservative measured-temperature fallback when available.
                 // so page_reclaim + io_shaper + governor act before hardware throttles.
-                // M1 Air has no fan — acting 5-10°C before the hardware ceiling prevents
-                // visible stutter caused by hardware-level frequency reduction.
                 //
                 // WarmBand (2026-06-28 heat-aware throttle scheduling): pre-stage
                 // pressure boost triggered on temperature trend OR absolute temp in
-                // 75-80°C band, before Phase1Gentle fires. This is read-only: only
+                // 75°C-to-Phase1 band, before Phase1Gentle fires. This is read-only: only
                 // adds to effective_pressure via thermal_pressure_boost. The trend
                 // analysis lives in ThermalBailout::compute_warm_boost and is
                 // already in the `thermal_action.warm_pressure_boost` field. We
@@ -2221,7 +2230,6 @@ fn main() -> anyhow::Result<()> {
 
                 // Thermal pre-throttle freeze/unfreeze.
                 // Extracted to daemon_thermal_freeze::run_thermal_freeze (Wave 20).
-                // M1 Air has no fan — acting 5-10°C ahead of the hardware ceiling.
                 // Passes &mut outcome_tracker (via LearningContext) so blocked
                 // freezes feed the survival-bias closure (shadow-mode-only).
                 daemon_thermal_freeze::run_thermal_freeze(
@@ -2275,6 +2283,7 @@ fn main() -> anyhow::Result<()> {
                     &mut gpu_mgr,
                     &state,
                     jitter_us,
+                    hw_cores,
                 );
 
                 // SwapPredictor: update trend forecast every cycle.
@@ -2655,10 +2664,9 @@ fn main() -> anyhow::Result<()> {
                     // IOReport hardware telemetry — DEPRECATED on macOS 26+
                     // (requires Apple-private entitlements unavailable to
                     // third-party binaries). When subscription is None, fall
-                    // back to sysinfo aggregate CPU% + SMC power for schema
-                    // stability; P/E cluster split is lost but downstream
-                    // consumers (`dram_bw_pct`, AMC bandwidth fallback) all
-                    // already document this regression class.
+                    // expose cluster fields as unavailable zeros and preserve
+                    // package power from the public powermetrics path. Do not
+                    // relabel aggregate CPU as P-cluster activity.
                     if let Some(ref ir) = last_ioreport {
                         metrics.metrics.ioreport_p_cluster_pct = ir.p_cluster_pct;
                         metrics.metrics.ioreport_e_cluster_pct = ir.e_cluster_pct;
@@ -2667,11 +2675,14 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.ioreport_cpu_mw = ir.cpu_mw;
                         metrics.metrics.ioreport_total_watts = ir.total_watts();
                     } else {
-                        let cpu_frac = (metrics.metrics.cpu_mean_busy).clamp(0.0, 1.0);
-                        metrics.metrics.ioreport_p_cluster_pct = cpu_frac;
-                        metrics.metrics.ioreport_total_watts = last_smc
+                        metrics.metrics.ioreport_p_cluster_pct = 0.0;
+                        metrics.metrics.ioreport_e_cluster_pct = 0.0;
+                        metrics.metrics.ioreport_gpu_pct = 0.0;
+                        metrics.metrics.ioreport_total_watts = cycle_hw_snap
                             .as_ref()
-                            .and_then(|s| s.system_power_watts)
+                            .and_then(|h| h.power.package_watts)
+                            .map(f64::from)
+                            .or_else(|| last_smc.as_ref().and_then(|s| s.system_power_watts))
                             .unwrap_or(0.0);
                     }
 
@@ -3116,6 +3127,7 @@ fn main() -> anyhow::Result<()> {
                     power_mgr.battery_status.is_charging,
                     thermal_emergency,
                     cycle_hw_snap.as_ref().and_then(|h| h.power.package_watts),
+                    hw_cores,
                     hour_of_day,
                     &state,
                     &mut darwin_anomaly,
@@ -4369,13 +4381,15 @@ fn main() -> anyhow::Result<()> {
 
                 // ── Neuromodulator: bio-inspired parameter modulation ────────
                 // Extracted to daemon_neuro_tick::apply_neuromodulator (Wave 8).
-                // Best-available CPU temperature: SMC direct first, then IOKit estimate.
+                // Best-available measured CPU temperature. Normalized IOPM
+                // thermal states are handled separately and are not degrees.
                 let cpu_temp_celsius: Option<f64> = last_smc
                     .as_ref()
                     .and_then(|s| s.cpu_temp_celsius)
                     .or_else(|| {
                         cycle_hw_snap
                             .as_ref()
+                            .filter(|h| !h.temps_estimated)
                             .and_then(|h| h.temps.p_cluster_celsius)
                             .map(|t| t as f64)
                     });
@@ -4475,7 +4489,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Targeted warn-limit paging + expiry.
                 // Extracted to daemon_warn_limits::run_warn_limits (Wave 23).
-                daemon_warn_limits::run_warn_limits(
+                let applied_warn_limits = daemon_warn_limits::run_warn_limits(
                     snapshot.pressure.memory_pressure,
                     snapshot.pressure.swap_used_bytes,
                     is_root,
@@ -5333,7 +5347,7 @@ fn main() -> anyhow::Result<()> {
                 // remains visible after the inner block closes (where the
                 // record_stage call lives).
                 let _t_execute_start_outer;
-                let (exec_outcomes, causal_qos_upgrades) = {
+                let (mut exec_outcomes, causal_qos_upgrades) = {
                     use daemon_dispatch_tick::{run_dispatch_tick, DispatchTickInput};
                     // Build the coalition guard: tracker + envelope are owned
                     // long-lived in this scope; the guard is a thin borrow
@@ -5371,6 +5385,35 @@ fn main() -> anyhow::Result<()> {
                     (output.outcomes, output.causal_qos_upgrades)
                 };
                 causal_qos_upgrades_cycle += causal_qos_upgrades;
+
+                // Warn limits are already a real, non-fatal kernel intervention.
+                // Until now they bypassed the execution audit, so OutcomeTracker
+                // never learned whether an accepted warn limit reduced pressure.
+                // Record only successful calls; proposals and failed kernel calls
+                // remain excluded from the learning signal.
+                for applied in applied_warn_limits {
+                    exec_outcomes.paging_hints_applied += 1;
+                    exec_outcomes.audit_traces.push(PolicyDecisionTrace {
+                        t: Utc::now(),
+                        cycle: cycle_count,
+                        intended_action: RootAction::set_memorystatus(
+                            applied.pid,
+                            -1,
+                            format!(
+                                "warn-limit paging: {} ({}MB inactive limit)",
+                                applied.name, applied.warn_mb
+                            ),
+                            DecisionReason::MemoryBudget,
+                        ),
+                        decision_reason: DecisionReason::MemoryBudget,
+                        applied: true,
+                        block_reason: None,
+                        pressure: snapshot.pressure.memory_pressure as f32,
+                        swap_gb: (snapshot.pressure.swap_used_bytes as f32)
+                            / (1024.0 * 1024.0 * 1024.0),
+                        thrashing: snapshot.pressure.thrashing_score as f32,
+                    });
+                }
                 // Capture only applied pressure-reduction actions for the
                 // self-evaluator. Intents blocked during dispatch must not
                 // become neurocognitive "latest_action" evidence.
@@ -5887,6 +5930,7 @@ fn main() -> anyhow::Result<()> {
                         .lock_recover()
                         .last_hw_snapshot
                         .as_ref()
+                        .filter(|h| !h.temps_estimated)
                         .and_then(|h| h.temps.p_cluster_celsius)
                         .unwrap_or(0.0);
                     analytics.record_optimization(

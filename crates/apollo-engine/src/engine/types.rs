@@ -295,6 +295,14 @@ pub struct CapabilityReport {
     pub p_core_count: Option<u32>,
     pub e_core_count: Option<u32>,
     pub unavailable: Vec<String>,
+    /// Result of a live memorystatus_control write probe: `Some("ok")`,
+    /// `Some("fail: ...")`, or `None` when skipped (not root).
+    #[serde(default)]
+    pub memorystatus_probe: Option<String>,
+    /// Result of a live task_for_pid probe on the daemon's own PID:
+    /// `Some("ok")`, `Some("fail: ...")`, or `None` when skipped.
+    #[serde(default)]
+    pub task_for_pid_probe: Option<String>,
 }
 
 // Action surface (`RootAction`, `SetSysctlAction`) lives in

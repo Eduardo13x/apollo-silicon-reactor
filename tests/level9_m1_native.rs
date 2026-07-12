@@ -229,6 +229,8 @@ fn test_is_throttled_normal_is_false() {
             gpu_celsius: None,
             nand_celsius: None,
         },
+        temps_estimated: false,
+        sampled_at: std::time::Instant::now(),
         power: PowerReading {
             package_watts: None,
             cpu_watts: None,
@@ -256,6 +258,8 @@ fn test_is_throttled_moderate_is_true() {
             gpu_celsius: None,
             nand_celsius: None,
         },
+        temps_estimated: false,
+        sampled_at: std::time::Instant::now(),
         power: PowerReading {
             package_watts: None,
             cpu_watts: None,
@@ -283,6 +287,8 @@ fn test_battery_critical_detection() {
             gpu_celsius: None,
             nand_celsius: None,
         },
+        temps_estimated: false,
+        sampled_at: std::time::Instant::now(),
         power: PowerReading {
             package_watts: None,
             cpu_watts: None,
@@ -310,6 +316,8 @@ fn test_battery_not_critical_when_charging() {
             gpu_celsius: None,
             nand_celsius: None,
         },
+        temps_estimated: false,
+        sampled_at: std::time::Instant::now(),
         power: PowerReading {
             package_watts: None,
             cpu_watts: None,
@@ -337,6 +345,8 @@ fn test_should_push_to_ecores_when_throttled() {
             gpu_celsius: None,
             nand_celsius: None,
         },
+        temps_estimated: false,
+        sampled_at: std::time::Instant::now(),
         power: PowerReading {
             package_watts: None,
             cpu_watts: None,
@@ -364,6 +374,8 @@ fn test_should_push_to_ecores_when_battery_critical() {
             gpu_celsius: None,
             nand_celsius: None,
         },
+        temps_estimated: false,
+        sampled_at: std::time::Instant::now(),
         power: PowerReading {
             package_watts: None,
             cpu_watts: None,

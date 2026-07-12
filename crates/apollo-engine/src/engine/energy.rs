@@ -579,6 +579,8 @@ mod tests {
                 gpu_celsius: None,
                 nand_celsius: None,
             },
+            temps_estimated: false,
+            sampled_at: std::time::Instant::now(),
             power: PowerReading {
                 package_watts: pkg_w,
                 cpu_watts: cpu_w,

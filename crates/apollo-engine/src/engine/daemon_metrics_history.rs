@@ -75,6 +75,16 @@ pub const DEFAULT_STARTUP_CAP_BYTES: u64 = 1024 * 1024 * 1024;
 /// Default file count cap: 2 (current + 1 rotated).
 pub const DEFAULT_ROTATION_MAX_FILES: u32 = 2;
 
+/// Force history data to stable storage periodically rather than on every
+/// cycle. Every line is still appended immediately; only the expensive APFS
+/// flush is batched. A power loss can drop at most one short telemetry window,
+/// never policy or learned-state files.
+const HISTORY_SYNC_EVERY_CYCLES: u64 = 30;
+
+fn should_sync_history(cycle: u64) -> bool {
+    cycle <= 1 || cycle.is_multiple_of(HISTORY_SYNC_EVERY_CYCLES)
+}
+
 // ── HistoryConfig ────────────────────────────────────────────────────────────
 
 /// Mirrors the `[history]` section in `apollo-optimizer.toml`. All fields
@@ -266,7 +276,68 @@ struct HistoryLine {
     l: u64,
 }
 
+/// Allocation-free history payload prepared while the metrics snapshot is
+/// consistent. Keeping only the compact wire fields avoids cloning the large
+/// `RuntimeMetrics` structure under the daemon's metrics lock.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedHistorySnapshot {
+    features: [f32; 16],
+    natural_drift: f32,
+    nars_compile_confidence: f32,
+    learned_hash: u64,
+}
+
+pub fn prepare_history_snapshot(
+    metrics: &RuntimeMetrics,
+    causal_subsystem_debias: f32,
+    world_model: &WorldModel,
+    drift_detector: &DriftDetector,
+    learnable_params: &LearnableParams,
+) -> PreparedHistorySnapshot {
+    PreparedHistorySnapshot {
+        features: extract_features(
+            metrics,
+            causal_subsystem_debias,
+            world_model,
+            drift_detector,
+        ),
+        natural_drift: world_model.natural_drift as f32,
+        nars_compile_confidence: drift_detector
+            .belief("compile")
+            .map(|tv| tv.confidence)
+            .unwrap_or(0.5),
+        learned_hash: learned_hash(learnable_params),
+    }
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
+
+/// Backward-compatible convenience API for callers that do not hold a metrics
+/// lock. Daemon hot paths should prepare the compact snapshot first and append
+/// it after releasing their lock.
+#[allow(clippy::too_many_arguments)]
+pub fn append_history_snapshot(
+    path: &Path,
+    cfg: &HistoryConfig,
+    metrics: &RuntimeMetrics,
+    cycle: u64,
+    world_model: &WorldModel,
+    drift_detector: &DriftDetector,
+    learnable_params: &LearnableParams,
+    causal_subsystem_debias: f32,
+) -> anyhow::Result<()> {
+    if !cfg.enabled() {
+        return Ok(());
+    }
+    let snapshot = prepare_history_snapshot(
+        metrics,
+        causal_subsystem_debias,
+        world_model,
+        drift_detector,
+        learnable_params,
+    );
+    append_prepared_history_snapshot(path, cfg, cycle, &snapshot)
+}
 
 /// Append ONE compact JSON line per cycle.
 ///
@@ -281,16 +352,11 @@ struct HistoryLine {
 /// The daemon's main loop calls this function at the END of
 /// `wire_enriched_telemetry`; a failed append cannot influence any
 /// decision in the current cycle (the function is post-decision).
-#[allow(clippy::too_many_arguments)] // path + cfg + 6 engine refs is the SPEC signature.
-pub fn append_history_snapshot(
+pub fn append_prepared_history_snapshot(
     path: &Path,
     cfg: &HistoryConfig,
-    metrics: &RuntimeMetrics,
     cycle: u64,
-    world_model: &WorldModel,
-    drift_detector: &DriftDetector,
-    learnable_params: &LearnableParams,
-    causal_subsystem_debias: f32,
+    snapshot: &PreparedHistorySnapshot,
 ) -> anyhow::Result<()> {
     if !cfg.enabled() {
         return Ok(());
@@ -325,6 +391,7 @@ pub fn append_history_snapshot(
     // Rotation: if the live file exceeds rotation_max_bytes, rename it to
     // .jsonl.1 and start fresh. If the rotated file already exists, remove
     // it first (we keep at most `rotation_max_files` generations).
+    let mut rotated = false;
     if live_size > cfg.rotation_max_bytes() {
         // Best-effort: removing the rotated file is fine if it doesn't
         // exist or is owned by us. Errors here are logged but do not
@@ -350,37 +417,32 @@ pub fn append_history_snapshot(
             );
             return Err(e.into());
         }
+        rotated = true;
     }
 
     // Build the line.
-    let features = extract_features(
-        metrics,
-        causal_subsystem_debias,
-        world_model,
-        drift_detector,
-    );
     let line = HistoryLine {
         t: chrono::Utc::now().timestamp(),
         c: cycle,
-        f: features,
-        w: world_model.natural_drift as f32,
-        n: drift_detector
-            .belief("compile")
-            .map(|tv| tv.confidence)
-            .unwrap_or(0.5),
-        l: learned_hash(learnable_params),
+        f: snapshot.features,
+        w: snapshot.natural_drift,
+        n: snapshot.nars_compile_confidence,
+        l: snapshot.learned_hash,
     };
 
-    // Atomic append + fsync. OpenOptions::append(true) positions at EOF
-    // under POSIX; multiple writers on the same file would interleave, but
-    // Apollo is the only writer (no other process touches this path).
+    // Atomic append. OpenOptions::append(true) positions at EOF under POSIX;
+    // Apollo is the only writer. APFS durability is batched because syncing a
+    // training sample every cycle costs several milliseconds and does not
+    // improve operational-state safety.
     let mut buf = serde_json::to_vec(&line)?;
     buf.push(b'\n');
 
     let result = (|| -> std::io::Result<()> {
         let mut f = OpenOptions::new().create(true).append(true).open(path)?;
         f.write_all(&buf)?;
-        f.sync_all()?;
+        if rotated || should_sync_history(cycle) {
+            f.sync_data()?;
+        }
         Ok(())
     })();
 
@@ -505,6 +567,33 @@ mod tests {
     }
 
     #[test]
+    fn prepared_snapshot_preserves_feature_vector_and_wire_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("prepared-history.jsonl");
+        let metrics = tiny_metrics();
+        let wm = WorldModel::default();
+        let dd = DriftDetector::default();
+        let lp = LearnableParams::default();
+
+        let prepared = prepare_history_snapshot(&metrics, 1.0, &wm, &dd, &lp);
+        assert_eq!(prepared.features, extract_features(&metrics, 1.0, &wm, &dd));
+
+        append_prepared_history_snapshot(&path, &tiny_cfg(), 77, &prepared)
+            .expect("prepared append ok");
+        let content = std::fs::read_to_string(path).expect("read prepared line");
+        let value: serde_json::Value = serde_json::from_str(content.trim()).expect("valid JSON");
+
+        assert_eq!(value.get("c").and_then(|v| v.as_u64()), Some(77));
+        assert_eq!(
+            value.get("f").and_then(|v| v.as_array()).map(|v| v.len()),
+            Some(16)
+        );
+        assert!(value.get("w").is_some());
+        assert!(value.get("n").is_some());
+        assert!(value.get("l").is_some());
+    }
+
+    #[test]
     fn rotation_triggers_when_file_exceeds_max_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("history.jsonl");
@@ -602,6 +691,17 @@ mod tests {
         assert_eq!(cfg.rotation_max_bytes(), DEFAULT_ROTATION_MAX_BYTES);
         assert_eq!(cfg.rotation_max_files(), DEFAULT_ROTATION_MAX_FILES);
         assert_eq!(cfg.startup_cap_bytes(), DEFAULT_STARTUP_CAP_BYTES);
+    }
+
+    #[test]
+    fn history_sync_cadence_batches_apfs_flushes() {
+        assert!(should_sync_history(0));
+        assert!(should_sync_history(1));
+        assert!(!should_sync_history(2));
+        assert!(!should_sync_history(29));
+        assert!(should_sync_history(30));
+        assert!(should_sync_history(60));
+        assert!(!should_sync_history(61));
     }
 
     #[test]

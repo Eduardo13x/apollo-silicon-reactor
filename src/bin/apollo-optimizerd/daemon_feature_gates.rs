@@ -39,7 +39,7 @@
 //!   suppression is active, we release every App-Nap *except* PIDs still in
 //!   a wake storm — prevents F5's work from being undone by F2+F4.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use apollo_engine::collector::{SystemCollector, SystemSnapshot};
@@ -277,13 +277,20 @@ pub fn apply_app_nap_scheduling(
         // Pre-build AC once before per-PID app-nap loop.
         let appnap_policy_ac =
             apollo_engine::engine::safety::build_policy_protected_ac(&appnap_policy);
+        // Preserve `iter().find()` semantics for the unlikely duplicate-PID case
+        // while avoiding one full snapshot scan per live process.
+        let mut snaps_by_pid: HashMap<u32, &ProcessSnapshot> =
+            HashMap::with_capacity(proc_snaps.len());
+        for snap in proc_snaps {
+            snaps_by_pid.entry(snap.pid).or_insert(snap);
+        }
         let mut qos = state.mach_qos.lock_recover();
         for (pid, process) in collector.system().processes() {
             let pid_u32 = pid.as_u32();
             let name = process.name();
             let is_foreground = Some(pid_u32) == foreground_pid;
             // Evaluate behavioral signals for Tier-4 interactive detection.
-            let snap = proc_snaps.iter().find(|s| s.pid == pid_u32);
+            let snap = snaps_by_pid.get(&pid_u32).copied();
             let has_gui = snap.is_some_and(|s| s.has_gui_window);
             let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
             let rss = snap.map_or(process.memory(), |s| s.rss_bytes);

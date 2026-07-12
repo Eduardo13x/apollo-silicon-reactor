@@ -649,6 +649,8 @@ fn no_caps_taskpolicy_off() -> CapabilityReport {
         p_core_count: Some(8),
         e_core_count: Some(4),
         unavailable: vec![],
+        memorystatus_probe: None,
+        task_for_pid_probe: None,
     }
 }
 

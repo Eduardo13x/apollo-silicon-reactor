@@ -563,6 +563,8 @@ mod tests {
             p_core_count: Some(8),
             e_core_count: Some(4),
             unavailable: Vec::new(),
+            memorystatus_probe: None,
+            task_for_pid_probe: None,
         };
 
         let mut unfreeze_decay = UnfreezeDecayModel::new();

@@ -3,24 +3,25 @@
 //! Instead of a binary "thermal emergency" flag, this module provides
 //! 4 progressive cooling phases triggered at escalating temperature thresholds.
 //!
-//! M1 Air has no fan — acting 5-10°C before the hardware ceiling prevents visible
-//! stutter caused by hardware-level frequency reduction at ~95°C.
+//! Normalized IOPM thermal states are the primary cross-generation signal.
+//! Measured temperatures, when available, provide a conservative absolute
+//! fallback and WarmBand trend signal.
 //!
 //! Phases:
-//!   Normal      (<80°C)   — no action
-//!   Phase1Gentle (80-85°C) — soft hints, raise effective pressure +7%
-//!   Phase2Moderate (85-90°C) — throttle SilentDaemons, raise pressure +15%
-//!   Phase3Aggressive (90-95°C) — freeze background, E-core routing, raise +25%
-//!   Phase4Emergency (>95°C)  — freeze all non-critical, force E-cores, raise +40%
+//!   Normal      (<85°C)    — no action
+//!   Phase1Gentle (85-90°C) — soft hints, raise effective pressure +7%
+//!   Phase2Moderate (90-95°C) — throttle SilentDaemons, raise pressure +15%
+//!   Phase3Aggressive (95-100°C) — freeze background, E-core routing, raise +25%
+//!   Phase4Emergency (>100°C) — freeze all non-critical, force E-cores, raise +40%
 //!
 //! ## WarmBand pre-stage (2026-06-28) — heat-aware throttle scheduling
 //!
 //! Heat-aware throttle scheduling pre-stage. Triggers BEFORE Phase1Gentle when
 //! temperature is rising fast (trend > 0.5°C/min) OR absolute temp is in the
-//! 60-80°C band with load elevated. The intent: act on the **trend**, not just
+//! 60-85°C band with load elevated. The intent: act on the **trend**, not just
 //! the absolute level, so Apollo starts raising effective pressure during a
-//! 4K-decoder session before the M1 hits 80°C. This compresses the reactive
-//! window of Phase1Gentle (which only fires at 80°C) and reduces the
+//! sustained decoder session before Phase1Gentle. This compresses the reactive
+//! window without assuming a particular SoC generation or cooling design.
 //! micro-shutter storms under sustained thermal load.
 //!
 //! Action: `pressure_boost` (0.0 to 0.05) is added to `effective_pressure`
@@ -29,6 +30,9 @@
 //! the existing decision logic. NEVER_FREEZE list is untouched.
 
 use crate::engine::iokit_sensors::HardwareSnapshot;
+use crate::engine::iokit_sensors::ThermalState;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 // ── CoolingPhase ──────────────────────────────────────────────────────────────
 
@@ -36,7 +40,7 @@ use crate::engine::iokit_sensors::HardwareSnapshot;
 pub enum CoolingPhase {
     Normal,
     /// Pre-Phase1 heat-aware band. Triggers on trend OR on absolute temp in
-    /// 60-80°C with load pressure. Read-only pressure boost, no freezing.
+    /// 60-85°C with load pressure. Read-only pressure boost, no freezing.
     WarmBand,
     Phase1Gentle,
     Phase2Moderate,
@@ -76,11 +80,12 @@ impl ThermalAction {
     }
 }
 
-// Temperature thresholds (°C) — tuned for M1 Air (fanless).
-const PHASE1_ENTER: f32 = 80.0;
-const PHASE2_ENTER: f32 = 85.0;
-const PHASE3_ENTER: f32 = 90.0;
-const PHASE4_ENTER: f32 = 95.0;
+// Conservative absolute fallback when real temperatures are available. The
+// normalized OS thermal state remains the primary hardware-agnostic signal.
+const PHASE1_ENTER: f32 = 85.0;
+const PHASE2_ENTER: f32 = 90.0;
+const PHASE3_ENTER: f32 = 95.0;
+const PHASE4_ENTER: f32 = 100.0;
 
 // Hysteresis: de-escalate only when temp drops 3°C below the enter threshold.
 const HYSTERESIS: f32 = 3.0;
@@ -93,7 +98,7 @@ const TICKS_TO_RECOVER: u32 = 4;
 // Trigger: absolute temp >= WARM_ABS_ENTER_C OR (temp >= WARM_TREND_FLOOR_C AND
 // trend_c_per_min >= WARM_TREND_RATE_C_PER_MIN). The intent: act on the
 // trend, not just the absolute level, so Apollo raises effective pressure
-// during a 4K-decoder session before Phase1Gentle fires at 80°C.
+// during sustained load before Phase1Gentle fires.
 
 /// Stateful thermal monitor with hysteresis to prevent rapid phase oscillation.
 pub struct ThermalBailout {
@@ -103,21 +108,20 @@ pub struct ThermalBailout {
     escalate_ticks: u32,
     /// Consecutive cycles below recovery threshold before de-escalating.
     recover_ticks: u32,
-    /// WarmBand temperature ring buffer (last 8 samples, ~4s at 500ms cadence).
-    /// Used to compute the rate-of-rise that triggers the pre-Phase1 band.
-    warm_temps: [f32; WARM_BUFFER_SIZE],
-    /// Next write index in the warm_temps ring (wraps).
-    warm_idx: usize,
-    /// Number of valid samples currently in the buffer (0..=WARM_BUFFER_SIZE).
-    warm_filled: usize,
+    /// Real temperature samples with their original sensor timestamps.
+    warm_samples: VecDeque<(Instant, f32)>,
+    /// Prevents the main loop from counting a cached 3-second sensor sample as
+    /// dozens of fresh 250ms observations.
+    last_sample_at: Option<Instant>,
 }
 
 // WarmBand pre-stage (2026-06-28 heat-aware throttle scheduling).
 // Trigger: absolute temp >= WARM_ABS_ENTER_C OR (temp >= WARM_TREND_FLOOR_C AND
 // trend_c_per_min >= WARM_TREND_RATE_C_PER_MIN). The intent: act on the
 // trend, not just the absolute level, so Apollo raises effective pressure
-// during a 4K-decoder session before Phase1Gentle fires at 80°C.
+// during sustained load before Phase1Gentle fires.
 const WARM_BUFFER_SIZE: usize = 8;
+const WARM_MIN_TREND_SPAN: Duration = Duration::from_secs(3);
 const WARM_ABS_ENTER_C: f32 = 75.0;
 const WARM_TREND_FLOOR_C: f32 = 60.0;
 const WARM_TREND_RATE_C_PER_MIN: f32 = 0.5;
@@ -126,7 +130,7 @@ const WARM_TREND_RATE_C_PER_MIN: f32 = 0.5;
 // boosts. No freezing, no throttling, NEVER_FREEZE list untouched.
 const WARM_MAX_BOOST: f32 = 0.05;
 // Absolute-temp path starts gently at the 75C boundary and reaches the
-// full WarmBand boost by the Phase1 threshold (80C). This keeps the pre-stage
+// full WarmBand boost by the Phase1 threshold. This keeps the pre-stage
 // visible under stable heat without jumping straight to the max at 75C.
 const WARM_ABS_MIN_BOOST_RATIO: f32 = 0.20;
 // Scaling: 0.0 boost below WARM_TREND_RATE, full WARM_MAX_BOOST at
@@ -139,30 +143,30 @@ impl ThermalBailout {
             current_phase: CoolingPhase::Normal,
             escalate_ticks: 0,
             recover_ticks: 0,
-            // WarmBand trend buffer: keeps the last 8 temp samples (~4s at
-            // 500ms cadence) to compute rate-of-rise. Empty on startup.
-            warm_temps: [0.0; WARM_BUFFER_SIZE],
-            warm_idx: 0,
-            warm_filled: 0,
+            warm_samples: VecDeque::with_capacity(WARM_BUFFER_SIZE),
+            last_sample_at: None,
         }
     }
 
     /// Evaluate current hardware snapshot and return the action to take.
     pub fn evaluate(&mut self, hw: &HardwareSnapshot) -> ThermalAction {
-        // Use the maximum of P-cluster and GPU temperature.
-        let temp = self.peak_temp(hw);
-
-        // Update the WarmBand temperature ring buffer.
-        self.warm_temps[self.warm_idx] = temp;
-        self.warm_idx = (self.warm_idx + 1) % self.warm_temps.len();
-        if self.warm_filled < self.warm_temps.len() {
-            self.warm_filled += 1;
+        // Estimated temperatures are compatibility display values, not sensors.
+        // For those snapshots use macOS' hardware-normalized thermal state.
+        let measured_temp = (!hw.temps_estimated).then(|| self.peak_temp(hw)).flatten();
+        if let Some(temp) = measured_temp {
+            self.record_temperature(hw.sampled_at, temp);
         }
 
-        let target_phase = self.classify_temp(temp);
+        let target_phase = measured_temp
+            .map(|temp| self.classify_temp(temp))
+            .unwrap_or_else(|| self.classify_state(hw.thermal_state));
         // WarmBand is not part of the main phase ladder; it can coexist
         // with any phase (including Normal) as a read-only pressure boost.
-        let warm_boost = self.compute_warm_boost();
+        let warm_boost = if measured_temp.is_some() {
+            self.compute_warm_boost()
+        } else {
+            0.0
+        };
 
         if target_phase > self.current_phase {
             self.escalate_ticks += 1;
@@ -205,11 +209,27 @@ impl ThermalBailout {
         action
     }
 
-    fn peak_temp(&self, hw: &HardwareSnapshot) -> f32 {
-        let p = hw.temps.p_cluster_celsius.unwrap_or(0.0);
-        let e = hw.temps.e_cluster_celsius.unwrap_or(0.0);
-        let g = hw.temps.gpu_celsius.unwrap_or(0.0);
-        p.max(e).max(g)
+    fn peak_temp(&self, hw: &HardwareSnapshot) -> Option<f32> {
+        [
+            hw.temps.p_cluster_celsius,
+            hw.temps.e_cluster_celsius,
+            hw.temps.gpu_celsius,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|v| v.is_finite())
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    fn record_temperature(&mut self, sampled_at: Instant, temp: f32) {
+        if !temp.is_finite() || self.last_sample_at.is_some_and(|last| sampled_at <= last) {
+            return;
+        }
+        self.last_sample_at = Some(sampled_at);
+        self.warm_samples.push_back((sampled_at, temp));
+        while self.warm_samples.len() > WARM_BUFFER_SIZE {
+            self.warm_samples.pop_front();
+        }
     }
 
     /// Compute the WarmBand pre-stage pressure boost in [0.0, WARM_MAX_BOOST].
@@ -217,15 +237,17 @@ impl ThermalBailout {
     /// AND rate-of-rise >= WARM_TREND_RATE). Returns 0.0 if not enough
     /// samples to compute a rate, or if neither condition is met.
     fn compute_warm_boost(&self) -> f32 {
-        if self.warm_filled < 2 {
+        if self.warm_samples.len() < 2 {
             return 0.0;
         }
-        let (current, oldest) = self.warm_trend_endpoints();
-        let rate_per_cycle = (current - oldest) / ((self.warm_filled - 1) as f32).max(1.0);
-        // Approximate cycles-per-minute from a typical 250-300ms cadence.
-        // We use 250ms (4.0 Hz) for a slightly-conservative rate; actual
-        // cadence is at least that.
-        let rate_c_per_min = rate_per_cycle * 240.0_f32;
+        let (oldest_at, oldest) = self.warm_samples.front().copied().unwrap();
+        let (current_at, current) = self.warm_samples.back().copied().unwrap();
+        let elapsed = current_at.saturating_duration_since(oldest_at);
+        let rate_c_per_min = if elapsed >= WARM_MIN_TREND_SPAN {
+            (current - oldest) / (elapsed.as_secs_f32() / 60.0)
+        } else {
+            0.0
+        };
 
         let triggered = current >= WARM_ABS_ENTER_C
             || (current >= WARM_TREND_FLOOR_C && rate_c_per_min >= WARM_TREND_RATE_C_PER_MIN);
@@ -250,15 +272,13 @@ impl ThermalBailout {
         absolute_boost.max(trend_boost).clamp(0.0, WARM_MAX_BOOST)
     }
 
-    /// Returns (newest, oldest) sample in the ring buffer.
-    fn warm_trend_endpoints(&self) -> (f32, f32) {
-        // Newest = slot BEFORE the next write index (warm_idx points to the
-        // slot to overwrite next). Oldest = slot warm_filled steps back from
-        // warm_idx.
-        let n = self.warm_temps.len();
-        let newest_idx = (self.warm_idx + n - 1) % n;
-        let oldest_idx = (self.warm_idx + n - self.warm_filled) % n;
-        (self.warm_temps[newest_idx], self.warm_temps[oldest_idx])
+    fn classify_state(&self, state: ThermalState) -> CoolingPhase {
+        match state {
+            ThermalState::Normal => CoolingPhase::Normal,
+            ThermalState::Moderate => CoolingPhase::Phase1Gentle,
+            ThermalState::Severe => CoolingPhase::Phase3Aggressive,
+            ThermalState::Critical => CoolingPhase::Phase4Emergency,
+        }
     }
 
     fn classify_temp(&self, temp: f32) -> CoolingPhase {
@@ -343,6 +363,8 @@ mod tests {
                 gpu_celsius: None,
                 nand_celsius: None,
             },
+            temps_estimated: false,
+            sampled_at: Instant::now(),
             power: PowerReading {
                 package_watts: None,
                 cpu_watts: None,
@@ -372,9 +394,9 @@ mod tests {
         let mut tb = ThermalBailout::new();
         // Need TICKS_TO_ESCALATE cycles to escalate
         for _ in 0..TICKS_TO_ESCALATE {
-            tb.evaluate(&hw_with_temp(97.0));
+            tb.evaluate(&hw_with_temp(102.0));
         }
-        let action = tb.evaluate(&hw_with_temp(97.0));
+        let action = tb.evaluate(&hw_with_temp(102.0));
         assert_eq!(action.phase, CoolingPhase::Phase4Emergency);
         assert!(action.force_ecores);
         assert!(action.freeze_all_non_critical);
@@ -384,9 +406,9 @@ mod tests {
     fn phase3_aggressive_90_to_95() {
         let mut tb = ThermalBailout::new();
         for _ in 0..TICKS_TO_ESCALATE {
-            tb.evaluate(&hw_with_temp(92.0));
+            tb.evaluate(&hw_with_temp(97.0));
         }
-        let action = tb.evaluate(&hw_with_temp(92.0));
+        let action = tb.evaluate(&hw_with_temp(97.0));
         assert_eq!(action.phase, CoolingPhase::Phase3Aggressive);
         assert!(action.force_ecores);
         assert!(action.freeze_background);
@@ -406,11 +428,11 @@ mod tests {
         let mut tb = ThermalBailout::new();
         // Escalate to Phase1
         for _ in 0..TICKS_TO_ESCALATE {
-            tb.evaluate(&hw_with_temp(82.0));
+            tb.evaluate(&hw_with_temp(87.0));
         }
         assert_eq!(tb.current_phase, CoolingPhase::Phase1Gentle);
         // Drop just below enter threshold — should NOT recover immediately
-        let action = tb.evaluate(&hw_with_temp(79.5));
+        let action = tb.evaluate(&hw_with_temp(84.5));
         assert_eq!(action.phase, CoolingPhase::Phase1Gentle); // still in phase
     }
 
@@ -418,7 +440,7 @@ mod tests {
     fn recovery_after_enough_cool_ticks() {
         let mut tb = ThermalBailout::new();
         for _ in 0..TICKS_TO_ESCALATE {
-            tb.evaluate(&hw_with_temp(82.0));
+            tb.evaluate(&hw_with_temp(87.0));
         }
         // Cool down well below threshold + hysteresis
         for _ in 0..TICKS_TO_RECOVER {
@@ -502,6 +524,8 @@ mod tests {
                 gpu_celsius: None,
                 nand_celsius: None,
             },
+            temps_estimated: false,
+            sampled_at: Instant::now(),
             power: PowerReading {
                 package_watts: None,
                 cpu_watts: None,
@@ -524,5 +548,34 @@ mod tests {
                 "NaN input must NOT produce a positive warm_pressure_boost"
             );
         }
+    }
+
+    #[test]
+    fn estimated_temperature_uses_normalized_thermal_state() {
+        let mut tb = ThermalBailout::new();
+        let mut hw = hw_with_temp(95.0);
+        hw.temps_estimated = true;
+        hw.thermal_state = ThermalState::Normal;
+
+        for _ in 0..=TICKS_TO_ESCALATE {
+            let action = tb.evaluate(&hw);
+            assert_eq!(action.phase, CoolingPhase::Normal);
+            assert_eq!(action.warm_pressure_boost, 0.0);
+        }
+    }
+
+    #[test]
+    fn severe_normalized_state_does_not_become_phase4() {
+        let mut tb = ThermalBailout::new();
+        let mut hw = hw_with_temp(95.0);
+        hw.temps_estimated = true;
+        hw.thermal_state = ThermalState::Severe;
+
+        for _ in 0..TICKS_TO_ESCALATE {
+            tb.evaluate(&hw);
+        }
+        let action = tb.evaluate(&hw);
+        assert_eq!(action.phase, CoolingPhase::Phase3Aggressive);
+        assert!(!action.freeze_all_non_critical);
     }
 }

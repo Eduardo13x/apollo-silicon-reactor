@@ -15,13 +15,32 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
-use apollo_engine::engine::daemon_helpers::write_wake_state;
+use apollo_engine::engine::daemon_helpers::{write_wake_state, WakeRuntimeState};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::display_turbo::DisplayTurbo;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::outcome_tracker::OutcomeTracker;
 use apollo_engine::engine::signal_intelligence::SignalIntelligence;
 use chrono::{Duration as ChronoDuration, Utc};
+
+fn clear_expired_windows(state: &mut WakeRuntimeState, now: chrono::DateTime<Utc>) -> bool {
+    let grace_expired = state
+        .post_wake_grace_until
+        .as_ref()
+        .is_some_and(|deadline| deadline <= &now);
+    let reclaim_expired = state
+        .post_wake_reclaim_until
+        .as_ref()
+        .is_some_and(|deadline| deadline <= &now);
+
+    if grace_expired {
+        state.post_wake_grace_until = None;
+    }
+    if reclaim_expired {
+        state.post_wake_reclaim_until = None;
+    }
+    grace_expired || reclaim_expired
+}
 
 /// Run one wake-detection tick.
 ///
@@ -50,15 +69,12 @@ pub fn run_wake_tick(
     let mut wake_just_detected = false;
     let mut process_guard = state.process.lock_recover();
     let wake_jump = now_wall - process_guard.wake_state.last_cycle_wallclock;
+    let mut wake_state_changed = clear_expired_windows(&mut process_guard.wake_state, now_wall);
     let mut grace_active = process_guard
         .wake_state
         .post_wake_grace_until
         .map(|t| t > now_wall)
         .unwrap_or(false);
-    // Clear expired grace so it doesn't carry across unrelated wakes.
-    if !grace_active {
-        process_guard.wake_state.post_wake_grace_until = None;
-    }
     if wake_jump > ChronoDuration::seconds(90) {
         // Treat as wake: engage grace window and queue all frozen PIDs.
         wake_just_detected = true;
@@ -75,6 +91,7 @@ pub fn run_wake_tick(
         process_guard.wake_state.post_wake_reclaim_until =
             Some(now_wall + ChronoDuration::seconds(90));
         grace_active = true;
+        wake_state_changed = true;
 
         // Reset volatile filter state. Pre-sleep Kalman position +
         // OutcomeTracker short-window deltas reflect a system that was
@@ -131,8 +148,54 @@ pub fn run_wake_tick(
         }
     }
     process_guard.wake_state.last_cycle_wallclock = now_wall;
-    write_wake_state(wake_state_path, &process_guard.wake_state);
+    // `last_cycle_wallclock` is intentionally runtime-only and is not part of
+    // WakeStatePersisted. Persisting every cycle therefore rewrote identical
+    // JSON and dominated the Sense stage. Snapshot only semantic changes and
+    // perform disk I/O after releasing the process lock.
+    let wake_state_to_persist = wake_state_changed.then(|| process_guard.wake_state.clone());
     drop(process_guard);
+    if let Some(wake_state) = wake_state_to_persist {
+        write_wake_state(wake_state_path, &wake_state);
+    }
 
     (grace_active, wake_just_detected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wake_state(now: chrono::DateTime<Utc>) -> WakeRuntimeState {
+        WakeRuntimeState {
+            last_cycle_wallclock: now,
+            last_wake_at: None,
+            post_wake_grace_until: None,
+            post_wake_reclaim_until: None,
+            post_wake_policy: "grace-60s".to_string(),
+        }
+    }
+
+    #[test]
+    fn clear_expired_windows_clears_both_and_requests_persist() {
+        let now = Utc::now();
+        let mut state = wake_state(now);
+        state.post_wake_grace_until = Some(now - ChronoDuration::seconds(1));
+        state.post_wake_reclaim_until = Some(now - ChronoDuration::seconds(2));
+
+        assert!(clear_expired_windows(&mut state, now));
+        assert!(state.post_wake_grace_until.is_none());
+        assert!(state.post_wake_reclaim_until.is_none());
+    }
+
+    #[test]
+    fn clear_expired_windows_preserves_active_deadlines() {
+        let now = Utc::now();
+        let mut state = wake_state(now);
+        state.post_wake_grace_until = Some(now + ChronoDuration::seconds(60));
+        state.post_wake_reclaim_until = Some(now + ChronoDuration::seconds(90));
+
+        assert!(!clear_expired_windows(&mut state, now));
+        assert!(state.post_wake_grace_until.is_some());
+        assert!(state.post_wake_reclaim_until.is_some());
+    }
 }
