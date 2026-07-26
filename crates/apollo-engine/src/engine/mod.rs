@@ -34,6 +34,7 @@ pub mod cusum;
 pub mod daemon_helpers;
 pub mod daemon_metrics_history;
 pub mod daemon_state;
+pub mod data_medallion;
 pub mod decide_actions;
 pub mod degradation;
 pub mod display_turbo;

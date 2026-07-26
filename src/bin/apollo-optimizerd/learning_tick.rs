@@ -423,15 +423,37 @@ pub fn run_learning_tick<'a>(
             WorkloadMode::Browsing => 3,
             WorkloadMode::Idle => 0,
         };
+        let workload_name = workload_mode.as_str();
         let batch = if snapshot.pressure.memory_pressure > 0.80 {
-            lctx.outcome_tracker
-                .urgency_flush(snapshot.pressure.memory_pressure)
+            lctx.outcome_tracker.urgency_flush_curated(
+                snapshot.pressure.memory_pressure,
+                |name, pre, post, action_type| {
+                    learning_pipeline.curate_resolved(
+                        name,
+                        workload_name,
+                        pre,
+                        post,
+                        cycle_count,
+                        action_type,
+                    )
+                },
+            )
         } else {
-            lctx.outcome_tracker.tick_with_params(
+            lctx.outcome_tracker.tick_with_params_curated(
                 snapshot.pressure.memory_pressure,
                 learnable_params.outcome_wait_secs,
                 learnable_params.outcome_effective_threshold,
                 wl_id,
+                |name, pre, post, action_type| {
+                    learning_pipeline.curate_resolved(
+                        name,
+                        workload_name,
+                        pre,
+                        post,
+                        cycle_count,
+                        action_type,
+                    )
+                },
             )
         };
         if batch.savings_watts > 0.0 {
@@ -584,73 +606,57 @@ pub fn run_learning_tick<'a>(
             }
         }
 
-        // LearningPipeline: fan out resolved outcomes to all three learners.
-        // Each resolved throttle becomes a LearningObservation with the
-        // pre/post pressure captured by tick(). Cross-feeds are applied
-        // at batch flush (every 8 observations or at persist time).
-        for (name, pre_pressure, post_pressure, action_type) in batch.resolved_outcomes {
-            // ── Loop 1 fix: skills observe their outcomes ───────────────
-            // When a resolved outcome matches a known skill target, feed
-            // the result back so the skill adapts its min_pressure and
-            // success_rate from real data instead of only causal graph edges.
+        // Gold-only fan-out. Curation already ran inside OutcomeTracker before
+        // it updated any outcome-derived state, so this path reuses the issued
+        // label instead of counting the record twice.
+        for resolved in batch.curated_outcomes {
+            let name = resolved.process_name;
+            let pre_pressure = resolved.pre_pressure;
+            let post_pressure = resolved.post_pressure;
+            let action_type = resolved.action_type;
             let effective = post_pressure < pre_pressure - 0.01;
-            {
-                let prefix = match action_type {
-                    apollo_engine::engine::learning_pipeline::ActionKind::Throttle => "throttle",
-                    apollo_engine::engine::learning_pipeline::ActionKind::Freeze => "freeze",
-                    apollo_engine::engine::learning_pipeline::ActionKind::Memorystatus => {
-                        "memorystatus"
-                    }
-                };
-                let skill_name = format!("{}:{}", prefix, name);
-                lctx.skill_registry.record_result_with_pressure(
-                    &skill_name,
-                    effective,
-                    pre_pressure as f32,
-                );
-            }
-            // Also match pending_trial_skill: induced skills (group:/batch:)
-            // that were trialed get outcome feedback through their skill name.
-            if let Some((ref trial_name, _)) = pending_trial_skill {
-                // Check if this process is a target of the trialed skill.
-                // The trial skill targets may include this process name.
-                lctx.skill_registry.record_result_with_pressure(
-                    trial_name,
-                    effective,
-                    pre_pressure as f32,
-                );
-            }
+            let prefix = match action_type {
+                ActionKind::Throttle => "throttle",
+                ActionKind::Freeze => "freeze",
+                ActionKind::Memorystatus => "memorystatus",
+            };
+            let skill_name = format!("{}:{}", prefix, name);
 
             let obs = LearningObservation {
                 process_name: name,
-                skill_name: None,
+                skill_name: Some(skill_name),
                 pre_pressure,
                 post_pressure,
                 workload: workload_mode.as_str().to_string(),
                 cycle: cycle_count,
                 action_type,
             };
-            // NestedLearner L1: tick per resolved outcome.
-            // Effectiveness = normalized pressure drop (0.02 drop → 1.0 effective).
-            // Recalibrated from 0.05: production data shows typical single-throttle drops
-            // of 1-2pp, so the old 0.05 denominator caused effectiveness→0 after 35k
-            // updates (l1_aggregate=0.00076 observed), degrading l2_context and meta_learn.
-            // 0.02 maps a 2pp drop to 1.0, a 1pp drop to 0.5 — matches real macOS behavior.
-            // Context flow: L0 quality weights how much this outcome shifts L1 aggregate.
-            {
-                let effectiveness = ((pre_pressure - post_pressure) / 0.02).clamp(0.0, 1.0);
-                if nested_learner.tick_l1(effectiveness) {
-                    nested_learner.flush_l2();
-                }
-            }
 
-            learning_pipeline.push(
+            let label = learning_pipeline.push_curated(
                 obs,
+                resolved.label,
                 lctx.outcome_tracker,
                 lctx.causal_graph,
                 lctx.skill_registry,
                 effectiveness_tracker,
             );
+            if label.is_gold() {
+                // Induced trial skills share the same Gold trust boundary.
+                if let Some((ref trial_name, _)) = pending_trial_skill {
+                    lctx.skill_registry.record_result_with_pressure(
+                        trial_name,
+                        effective,
+                        pre_pressure as f32,
+                    );
+                }
+
+                // NestedLearner L1 consumes only curated outcomes. A 2pp drop
+                // maps to 1.0 and a 1pp drop to 0.5 for real macOS behavior.
+                let effectiveness = ((pre_pressure - post_pressure) / 0.02).clamp(0.0, 1.0);
+                if nested_learner.tick_l1(effectiveness) {
+                    nested_learner.flush_l2();
+                }
+            }
         }
     }
 

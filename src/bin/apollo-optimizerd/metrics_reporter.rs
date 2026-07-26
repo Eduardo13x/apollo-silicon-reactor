@@ -35,6 +35,7 @@ use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::execute_actions::ExecuteOutcomes;
 use apollo_engine::engine::intelligence_score::AisScore;
 use apollo_engine::engine::io_tiering::IoShaper;
+use apollo_engine::engine::learning_pipeline::LearningPipeline;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::mach_qos::SchedulingTier;
 use apollo_engine::engine::nars_belief::ArousalState;
@@ -63,6 +64,7 @@ pub fn update_learning_metrics<'a>(
     signal_digest: &SignalDigest,
     agent_intervention: &Intervention,
     arousal_state: &ArousalState,
+    learning_pipeline: &LearningPipeline,
 ) {
     let mut m = state.metrics.lock_recover();
     m.metrics.predictive_agent_active = lctx.predictive_agent.is_active();
@@ -72,6 +74,15 @@ pub fn update_learning_metrics<'a>(
     m.metrics.predictive_agent_last_intervention = format!("{:?}", agent_intervention);
     m.metrics.predictive_agent_pending_outcomes = lctx.predictive_agent.pending_outcome_count();
     m.metrics.predictive_agent_resolved_outcomes = lctx.predictive_agent.resolved_outcomes();
+    let medallion = learning_pipeline.medallion_metrics();
+    m.metrics.learning_bronze_total = medallion.bronze_total;
+    m.metrics.learning_silver_total = medallion.silver_total;
+    m.metrics.learning_gold_total = medallion.gold_total;
+    m.metrics.learning_rejected_total = medallion.rejected_total;
+    m.metrics.learning_invalid_total = medallion.invalid_total;
+    m.metrics.learning_duplicate_total = medallion.duplicate_total;
+    m.metrics.learning_data_quality = medallion.mean_quality;
+    m.metrics.learning_gold_rate = medallion.gold_rate;
     m.metrics.si_pressure_smooth = signal_digest.pressure_smooth;
     m.metrics.si_pressure_velocity = signal_digest.pressure_velocity;
     m.metrics.si_p_oom_30s = signal_digest.p_oom_30s;

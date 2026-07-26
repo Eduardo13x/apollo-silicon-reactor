@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::data_medallion::CuratedLabel;
 use crate::engine::nars_belief::{DriftDetector, Salience};
 
 // ── Tipos públicos ────────────────────────────────────────────────────────────
@@ -242,7 +243,20 @@ pub struct OutcomeBatch {
     pub effective_names: Vec<String>,
     pub savings_watts: f64,
     pub low_value_names: Vec<String>,
+    /// Every operational resolution, including records retained only in
+    /// Bronze/Silver for quality telemetry and restore monitoring.
     pub resolved_outcomes: Vec<(String, f64, f64, super::learning_pipeline::ActionKind)>,
+    /// Gold-only records that may fan out to long-lived learners.
+    pub curated_outcomes: Vec<CuratedResolvedOutcome>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CuratedResolvedOutcome {
+    pub process_name: String,
+    pub pre_pressure: f64,
+    pub post_pressure: f64,
+    pub action_type: super::learning_pipeline::ActionKind,
+    pub label: CuratedLabel,
 }
 
 // ── Experience Memory ───────────���─────────────────────────────��───────────────
@@ -939,12 +953,35 @@ impl OutcomeTracker {
         effective_threshold: f64,
         workload: u8,
     ) -> OutcomeBatch {
+        self.tick_with_params_curated(
+            current_pressure,
+            wait_secs,
+            effective_threshold,
+            workload,
+            |_, _, _, _| CuratedLabel::trusted_legacy(),
+        )
+    }
+
+    /// Production resolution path. Curation runs before any outcome-derived
+    /// Bayesian, NARS, HRPO, experience, or timing update.
+    pub fn tick_with_params_curated<F>(
+        &mut self,
+        current_pressure: f64,
+        wait_secs: u64,
+        effective_threshold: f64,
+        workload: u8,
+        mut curate: F,
+    ) -> OutcomeBatch
+    where
+        F: FnMut(&str, f64, f64, super::learning_pipeline::ActionKind) -> CuratedLabel,
+    {
         const BASELINE_ALPHA: f64 = 0.01; // half-life ≈ 69 observaciones
         let check_after = Duration::from_secs(wait_secs);
         let mut effective_names = Vec::new();
         let mut savings_watts = 0.0_f64;
         let mut resolved_outcomes: Vec<(String, f64, f64, super::learning_pipeline::ActionKind)> =
             Vec::new();
+        let mut curated_outcomes = Vec::new();
 
         while let Some(front) = self.pending.front() {
             if front.throttled_at.elapsed() < check_after {
@@ -952,6 +989,29 @@ impl OutcomeTracker {
             }
             let outcome = self.pending.pop_front().unwrap();
             let pressure_drop = outcome.pressure_before - current_pressure;
+            let label = curate(
+                &outcome.process_name,
+                outcome.pressure_before,
+                current_pressure,
+                outcome.action_type,
+            );
+            resolved_outcomes.push((
+                outcome.process_name.clone(),
+                outcome.pressure_before,
+                current_pressure,
+                outcome.action_type,
+            ));
+            if !label.is_gold() {
+                self.rollback_uncurated_attempt(&outcome.process_name);
+                continue;
+            }
+            curated_outcomes.push(CuratedResolvedOutcome {
+                process_name: outcome.process_name.clone(),
+                pre_pressure: outcome.pressure_before,
+                post_pressure: current_pressure,
+                action_type: outcome.action_type,
+                label,
+            });
             // Lowered from 0.02 to 0.01: on an 8GB M1 with 2-3GB swap, 2% absolute
             // is too strict a bar — many legitimate throttles produce 1-1.5% relief
             // that compounds across multiple actions. 1% catches these while still
@@ -1001,14 +1061,6 @@ impl OutcomeTracker {
                 workload,
             });
 
-            // Collect resolved outcome for LearningPipeline (pre/post pressure + action type).
-            resolved_outcomes.push((
-                outcome.process_name.clone(),
-                outcome.pressure_before,
-                current_pressure,
-                outcome.action_type,
-            ));
-
             // Track per-process time-to-effect for adaptive wait (Phase 7).
             let elapsed_secs = outcome.throttled_at.elapsed().as_secs_f64();
             let effect_entry = self
@@ -1055,6 +1107,17 @@ impl OutcomeTracker {
             savings_watts,
             low_value_names,
             resolved_outcomes,
+            curated_outcomes,
+        }
+    }
+
+    fn rollback_uncurated_attempt(&mut self, process_name: &str) {
+        let remove = self.weights.get_mut(process_name).is_some_and(|weight| {
+            weight.throttle_count = weight.throttle_count.saturating_sub(1);
+            weight.throttle_count == 0 && weight.effective_count == 0
+        });
+        if remove {
+            self.weights.remove(process_name);
         }
     }
 
@@ -1105,15 +1168,50 @@ impl OutcomeTracker {
     /// Used when pressure > 0.80 — we need the feedback loop NOW.
     /// Returns an OutcomeBatch with all resolutions.
     pub fn urgency_flush(&mut self, current_pressure: f64) -> OutcomeBatch {
+        self.urgency_flush_curated(current_pressure, |_, _, _, _| {
+            CuratedLabel::trusted_legacy()
+        })
+    }
+
+    /// Urgent production path with the same pre-learning trust boundary as
+    /// delayed resolution.
+    pub fn urgency_flush_curated<F>(&mut self, current_pressure: f64, mut curate: F) -> OutcomeBatch
+    where
+        F: FnMut(&str, f64, f64, super::learning_pipeline::ActionKind) -> CuratedLabel,
+    {
         let mut effective_names = Vec::new();
         let mut savings_watts = 0.0_f64;
         let mut low_value_names = Vec::new();
         let mut resolved_outcomes = Vec::new();
+        let mut curated_outcomes = Vec::new();
 
         while let Some(outcome) = self.pending.pop_front() {
             let pressure_drop = outcome.pressure_before - current_pressure;
             let effective = pressure_drop > 0.01;
             let elapsed_secs = outcome.throttled_at.elapsed().as_secs_f64();
+            let label = curate(
+                &outcome.process_name,
+                outcome.pressure_before,
+                current_pressure,
+                outcome.action_type,
+            );
+            resolved_outcomes.push((
+                outcome.process_name.clone(),
+                outcome.pressure_before,
+                current_pressure,
+                outcome.action_type,
+            ));
+            if !label.is_gold() {
+                self.rollback_uncurated_attempt(&outcome.process_name);
+                continue;
+            }
+            curated_outcomes.push(CuratedResolvedOutcome {
+                process_name: outcome.process_name.clone(),
+                pre_pressure: outcome.pressure_before,
+                post_pressure: current_pressure,
+                action_type: outcome.action_type,
+                label,
+            });
 
             self.total_resolved += 1;
             if effective {
@@ -1150,13 +1248,6 @@ impl OutcomeTracker {
                     });
                 }
             }
-
-            resolved_outcomes.push((
-                outcome.process_name,
-                outcome.pressure_before,
-                current_pressure,
-                outcome.action_type,
-            ));
         }
 
         OutcomeBatch {
@@ -1164,6 +1255,7 @@ impl OutcomeTracker {
             savings_watts,
             low_value_names,
             resolved_outcomes,
+            curated_outcomes,
         }
     }
 
@@ -2342,6 +2434,42 @@ mod tests {
         let weight = &tracker.weights["worker"];
         assert_eq!(weight.throttle_count, 1);
         assert_eq!(weight.effective_count, 1);
+    }
+
+    #[test]
+    fn curated_resolution_blocks_silver_before_outcome_learning() {
+        use crate::engine::data_medallion::{DataMedallion, MedallionObservation};
+
+        let mut tracker = OutcomeTracker::new();
+        tracker.record_action_with_swap(
+            "pid:321",
+            0.85,
+            1.0,
+            0.5,
+            crate::engine::learning_pipeline::ActionKind::Throttle,
+        );
+        let mut medallion = DataMedallion::new();
+
+        let batch = tracker.urgency_flush_curated(0.82, |name, pre, post, action_type| {
+            medallion.curate(MedallionObservation {
+                process_name: name,
+                workload: "idle",
+                pre_pressure: pre,
+                post_pressure: post,
+                cycle: 10,
+                action_code: action_type.code(),
+            })
+        });
+
+        assert_eq!(batch.resolved_outcomes.len(), 1);
+        assert!(batch.curated_outcomes.is_empty());
+        assert!(!tracker.weights.contains_key("pid:321"));
+        assert_eq!(tracker.total_resolved, 0);
+        assert_eq!(tracker.experience.len(), 0);
+        let metrics = medallion.metrics();
+        assert_eq!(metrics.bronze_total, 1);
+        assert_eq!(metrics.silver_total, 1);
+        assert_eq!(metrics.gold_total, 0);
     }
 
     #[test]

@@ -45,6 +45,9 @@
 //!   gives the same results, switch via `with_batch_size(1)`.
 
 use crate::engine::causal_graph::CausalGraph;
+use crate::engine::data_medallion::{
+    CuratedLabel, DataMedallion, MedallionMetrics, MedallionObservation,
+};
 use crate::engine::effectiveness_tracker::EffectivenessTracker;
 use crate::engine::optimization_skills::SkillRegistry;
 use crate::engine::outcome_tracker::OutcomeTracker;
@@ -100,6 +103,16 @@ pub enum ActionKind {
     Memorystatus,
 }
 
+impl ActionKind {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Throttle => 0,
+            Self::Freeze => 1,
+            Self::Memorystatus => 2,
+        }
+    }
+}
+
 impl LearningObservation {
     pub fn delta(&self) -> f64 {
         self.pre_pressure - self.post_pressure
@@ -136,6 +149,12 @@ pub struct LearningPipeline {
     batch_size: usize,
     /// Feature flag: when false, `push()` is a no-op (fall back to legacy paths).
     pub enabled: bool,
+    /// Bronze/Silver/Gold trust boundary before any long-lived learner.
+    medallion: DataMedallion,
+    /// All records in a batch share one ownership mode. Production outcomes
+    /// have already updated OutcomeTracker at resolution; standalone pipeline
+    /// inputs have not.
+    outcome_preapplied: Option<bool>,
 }
 
 impl LearningPipeline {
@@ -145,6 +164,8 @@ impl LearningPipeline {
             batch: Vec::with_capacity(8),
             batch_size: 8,
             enabled: true,
+            medallion: DataMedallion::new(),
+            outcome_preapplied: None,
         }
     }
 
@@ -155,6 +176,8 @@ impl LearningPipeline {
             batch: Vec::new(),
             batch_size: 8,
             enabled: false,
+            medallion: DataMedallion::new(),
+            outcome_preapplied: None,
         }
     }
 
@@ -176,10 +199,107 @@ impl LearningPipeline {
         causal_graph: &mut CausalGraph,
         skill_registry: &mut SkillRegistry,
         effectiveness_tracker: &mut EffectivenessTracker,
-    ) {
+    ) -> CuratedLabel {
         if !self.enabled {
-            return;
+            return CuratedLabel::pipeline_disabled();
         }
+        let label = self.curate_resolved(
+            &obs.process_name,
+            &obs.workload,
+            obs.pre_pressure,
+            obs.post_pressure,
+            obs.cycle,
+            obs.action_type,
+        );
+        self.enqueue_curated(
+            obs,
+            label,
+            false,
+            outcome_tracker,
+            causal_graph,
+            skill_registry,
+            effectiveness_tracker,
+        )
+    }
+
+    /// Label a resolved outcome before its owner updates any learned state.
+    pub fn curate_resolved(
+        &mut self,
+        process_name: &str,
+        workload: &str,
+        pre_pressure: f64,
+        post_pressure: f64,
+        cycle: u64,
+        action_type: ActionKind,
+    ) -> CuratedLabel {
+        if !self.enabled {
+            // Preserve the pre-pipeline owner path: disabling unified fan-out
+            // must not suppress OutcomeTracker's own resolution learning.
+            return CuratedLabel::trusted_legacy();
+        }
+        self.medallion.curate(MedallionObservation {
+            process_name,
+            workload,
+            pre_pressure,
+            post_pressure,
+            cycle,
+            action_code: action_type.code(),
+        })
+    }
+
+    /// Fan out a label already issued by this pipeline at outcome resolution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_curated(
+        &mut self,
+        obs: LearningObservation,
+        label: CuratedLabel,
+        outcome_tracker: &mut OutcomeTracker,
+        causal_graph: &mut CausalGraph,
+        skill_registry: &mut SkillRegistry,
+        effectiveness_tracker: &mut EffectivenessTracker,
+    ) -> CuratedLabel {
+        self.enqueue_curated(
+            obs,
+            label,
+            true,
+            outcome_tracker,
+            causal_graph,
+            skill_registry,
+            effectiveness_tracker,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_curated(
+        &mut self,
+        obs: LearningObservation,
+        label: CuratedLabel,
+        outcome_preapplied: bool,
+        outcome_tracker: &mut OutcomeTracker,
+        causal_graph: &mut CausalGraph,
+        skill_registry: &mut SkillRegistry,
+        effectiveness_tracker: &mut EffectivenessTracker,
+    ) -> CuratedLabel {
+        if !self.enabled {
+            return CuratedLabel::pipeline_disabled();
+        }
+        if !label.is_gold() {
+            return label;
+        }
+
+        if self
+            .outcome_preapplied
+            .is_some_and(|current| current != outcome_preapplied)
+        {
+            self.flush(
+                outcome_tracker,
+                causal_graph,
+                skill_registry,
+                effectiveness_tracker,
+            );
+        }
+        self.outcome_preapplied = Some(outcome_preapplied);
+
         self.batch.push(obs);
         if self.batch.len() >= self.batch_size {
             self.flush(
@@ -189,6 +309,7 @@ impl LearningPipeline {
                 effectiveness_tracker,
             );
         }
+        label
     }
 
     /// Flush pending observations to all subsystems.
@@ -225,12 +346,13 @@ impl LearningPipeline {
         // natural_drift() is a 60-tick cumulative drop; scale to the 15-cycle
         // slow window (per-cycle drift × 15 cycles).
         let drift_slow = (outcome_tracker.natural_drift() / 60.0 * 15.0) as f32;
+        let update_outcome_tracker = !self.outcome_preapplied.unwrap_or(false);
 
         for obs in &self.batch {
             // OutcomeTracker: record each action+outcome directly (post-evaluation path).
             // Note: record_throttle() + tick() is the live path; here we update the
             // Bayesian weight directly for observations that already have post_pressure.
-            {
+            if update_outcome_tracker {
                 let w = outcome_tracker
                     .weights
                     .entry(obs.process_name.clone())
@@ -405,11 +527,17 @@ impl LearningPipeline {
 
         // ── Step 4: Clear batch ───────────────────────────────────────────────
         self.batch.clear();
+        self.outcome_preapplied = None;
     }
 
     /// Number of observations currently buffered (not yet flushed).
     pub fn pending_count(&self) -> usize {
         self.batch.len()
+    }
+
+    /// Cumulative curation telemetry for dashboard and AIS evidence quality.
+    pub fn medallion_metrics(&self) -> MedallionMetrics {
+        self.medallion.metrics()
     }
 
     /// Force-flush any remaining observations (call at daemon shutdown or persist time).
@@ -544,6 +672,21 @@ mod tests {
             ot.weights.is_empty(),
             "disabled pipeline should not update OutcomeTracker"
         );
+    }
+
+    #[test]
+    fn disabled_pipeline_preserves_legacy_outcome_owner() {
+        let mut pipeline = LearningPipeline::disabled();
+        let mut ot = OutcomeTracker::new();
+        ot.record_action_with_swap("Safari", 0.75, 0.0, 0.0, ActionKind::Throttle);
+
+        let batch = ot.urgency_flush_curated(0.70, |name, pre, post, action_type| {
+            pipeline.curate_resolved(name, "browsing", pre, post, 1, action_type)
+        });
+
+        assert_eq!(batch.curated_outcomes.len(), 1);
+        assert_eq!(ot.total_resolved, 1);
+        assert_eq!(pipeline.medallion_metrics().bronze_total, 0);
     }
 
     #[test]
@@ -916,5 +1059,79 @@ mod tests {
         pipeline.flush_remaining(&mut ot, &mut cg, &mut sr, &mut eff);
         assert_eq!(pipeline.pending_count(), 0);
         assert!(ot.weights.is_empty());
+    }
+
+    #[test]
+    fn non_finite_bronze_data_never_reaches_learners() {
+        let mut pipeline = LearningPipeline::new().with_batch_size(1);
+        let mut ot = OutcomeTracker::new();
+        let mut cg = CausalGraph::new();
+        let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
+        let mut obs = make_obs("Safari", 0.75, 0.70, 1);
+        obs.post_pressure = f64::NAN;
+
+        let label = pipeline.push(obs, &mut ot, &mut cg, &mut sr, &mut eff);
+
+        assert!(!label.is_gold());
+        assert!(ot.weights.is_empty());
+        assert_eq!(cg.edge_count(), 0);
+        assert_eq!(pipeline.medallion_metrics().invalid_total, 1);
+    }
+
+    #[test]
+    fn duplicate_gold_data_updates_learners_only_once() {
+        let mut pipeline = LearningPipeline::new().with_batch_size(1);
+        let mut ot = OutcomeTracker::new();
+        let mut cg = CausalGraph::new();
+        let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
+        let obs = make_obs("Safari", 0.75, 0.70, 1);
+
+        assert!(pipeline
+            .push(obs.clone(), &mut ot, &mut cg, &mut sr, &mut eff)
+            .is_gold());
+        assert!(!pipeline
+            .push(obs, &mut ot, &mut cg, &mut sr, &mut eff)
+            .is_gold());
+
+        let weight = ot.weights.get("Safari").unwrap();
+        assert_eq!(weight.throttle_count, 1);
+        let metrics = pipeline.medallion_metrics();
+        assert_eq!(metrics.bronze_total, 2);
+        assert_eq!(metrics.gold_total, 1);
+        assert_eq!(metrics.duplicate_total, 1);
+    }
+
+    #[test]
+    fn production_gold_fanout_does_not_double_count_outcome_tracker() {
+        let mut pipeline = LearningPipeline::new().with_batch_size(1);
+        let mut ot = OutcomeTracker::new();
+        let mut cg = CausalGraph::new();
+        let mut sr = SkillRegistry::new();
+        let mut eff = EffectivenessTracker::new();
+        ot.weights.insert(
+            "Safari".to_string(),
+            crate::engine::outcome_tracker::PatternWeight {
+                throttle_count: 1,
+                effective_count: 1,
+            },
+        );
+        let obs = make_obs("Safari", 0.75, 0.70, 1);
+        let label = pipeline.curate_resolved(
+            &obs.process_name,
+            &obs.workload,
+            obs.pre_pressure,
+            obs.post_pressure,
+            obs.cycle,
+            obs.action_type,
+        );
+
+        pipeline.push_curated(obs, label, &mut ot, &mut cg, &mut sr, &mut eff);
+
+        let weight = ot.weights.get("Safari").unwrap();
+        assert_eq!(weight.throttle_count, 1);
+        assert_eq!(weight.effective_count, 1);
+        assert!(cg.get_edge("throttle:Safari", "pressure_drop").is_some());
     }
 }

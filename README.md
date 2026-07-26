@@ -49,6 +49,18 @@ graph LR
 
 El hot loop del daemon está descompuesto en ~30 módulos `tick` independientes (patrón Strangler Fig). Trabajo por ciclo acotado; sin I/O bloqueante en el hot path; los lock guards se sueltan antes de cualquier syscall.
 
+### Calidad de datos de aprendizaje
+
+Los outcomes resueltos cruzan un medallón de confianza antes de modificar Bayes, NARS, HRPO, memoria de experiencias, skills o el grafo causal:
+
+| Nivel | Contrato | Uso |
+|---|---|---|
+| Bronze | Todo outcome crudo observado | Conteo operativo y auditoría de calidad |
+| Silver | Mediciones finitas/acotadas e identidad válida | Diagnóstico; todavía no entrena |
+| Gold | Identidad estable, workload conocido, delta plausible y registro único | Único nivel admitido a learners persistentes |
+
+La curación no hace I/O y usa una ventana fija de fingerprints, por lo que su costo y memoria permanecen acotados. `runtime_metrics.json` publica totales Bronze/Silver/Gold, rechazos, inválidos, duplicados, calidad media y tasa Gold; el dashboard muestra `Data G <gold>/<bronze> q<quality>%`. AIS incorpora esta evidencia solo después de observar datos reales: calidad alta mejora D3, mientras volumen contaminado la penaliza.
+
 ## Sistema Cognitivo
 
 11 contadores LSE lock-free publican end-to-end vía `runtime_metrics.json`. Cada contador corresponde a una fase de aprendizaje cableada. Contadores que leen 0 no son bugs — están wired-dormant por diseño hasta que su trigger se dispare (arousal Crisis, transición térmica, disagreement scorer/gate, etc).

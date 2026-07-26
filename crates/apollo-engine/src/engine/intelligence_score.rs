@@ -96,6 +96,15 @@ pub struct AisInput {
     pub experience_records: u32,
     /// Dyna-Q simulated transitions.
     pub dyna_transitions: u64,
+    /// Raw resolved outcomes observed by the Bronze medallion layer.
+    #[serde(default)]
+    pub learning_raw_observations: u64,
+    /// Curated Gold outcomes admitted to long-lived learners.
+    #[serde(default)]
+    pub learning_gold_observations: u64,
+    /// Mean structural/context quality of Bronze observations [0,1].
+    #[serde(default)]
+    pub learning_data_quality: f64,
 
     // ── Resource efficiency ──────────────────────────────────────────────
     /// p95 cycle time in milliseconds.
@@ -453,6 +462,9 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         .map(|a| a.len())
         .unwrap_or(0) as u32;
     let dyna_transitions = rm_f("predictive_agent_cycles") as u64;
+    let learning_raw_observations = rm_u("learning_bronze_total");
+    let learning_gold_observations = rm_u("learning_gold_total");
+    let learning_data_quality = rm_f("learning_data_quality").clamp(0.0, 1.0);
 
     // D7 Wisdom signals — read from live runtime + file system.
     let causal_mechanism_count = rm_u("causal_mechanism_count") as u32;
@@ -569,6 +581,9 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         total_skills,
         experience_records,
         dyna_transitions,
+        learning_raw_observations,
+        learning_gold_observations,
+        learning_data_quality,
 
         p95_cycle_ms,
         target_cycle_ms: 100.0,
@@ -822,12 +837,29 @@ fn learning_velocity(input: &AisInput) -> f64 {
             input.dyna_transitions as f64 / 500.0
         };
 
-    (0.20 * rl_speed
+    let core_learning = (0.20 * rl_speed
         + 0.20 * rl_stability
         + 0.25 * causal_depth
         + 0.20 * skill_score
         + 0.15 * dyna_score.min(1.0))
-    .clamp(0.0, 1.0)
+    .clamp(0.0, 1.0);
+
+    // Curated evidence is an observed quality stream, not a free activity
+    // bonus. It is absent for legacy/simulation inputs, matures over 20 raw
+    // outcomes, and rewards both structural quality and Gold admission rate.
+    if input.learning_raw_observations > 0 {
+        let maturity = sample_strength(input.learning_raw_observations, 20);
+        let gold_rate = safe_ratio(
+            input.learning_gold_observations,
+            input.learning_raw_observations,
+        );
+        let observed_quality =
+            0.60 * input.learning_data_quality.clamp(0.0, 1.0) + 0.40 * gold_rate;
+        let curation_score = 0.50 * (1.0 - maturity) + observed_quality * maturity;
+        (0.85 * core_learning + 0.15 * curation_score).clamp(0.0, 1.0)
+    } else {
+        core_learning
+    }
 }
 
 // ── Dimension 4: Resource Efficiency ─────────────────────────────────────────
@@ -1042,7 +1074,7 @@ fn wisdom(input: &AisInput) -> f64 {
     let phase_learning = log_sat(input.phase_duration_observations, 50.0);
     let verified_adaptation = log_sat(input.verified_adaptations_total as u64, 100.0);
 
-    let learned_wisdom = (0.20 * causal
+    let base_learned_wisdom = (0.20 * causal
         + 0.20 * experience
         + 0.10 * novel
         + 0.15 * skills_reliable
@@ -1050,6 +1082,13 @@ fn wisdom(input: &AisInput) -> f64 {
         + 0.10 * phase_learning
         + 0.10 * verified_adaptation)
         .clamp(0.0, 1.0);
+    let learned_wisdom = if input.learning_raw_observations > 0 {
+        let curated = log_sat(input.learning_gold_observations, 200.0)
+            * input.learning_data_quality.clamp(0.0, 1.0);
+        0.90 * base_learned_wisdom + 0.10 * curated
+    } else {
+        base_learned_wisdom
+    };
 
     // Cold-start bridge: a careful daemon can run for a long time without
     // applying disruptive actions, especially on a well-provisioned machine.
@@ -1123,6 +1162,11 @@ fn ais_evidence_coverage(input: &AisInput) -> f64 {
         + 0.20 * (input.total_skills > 0) as u8 as f64
         + 0.15 * (input.dyna_transitions > 0) as u8 as f64
         + 0.20 * (input.experience_records > 0) as u8 as f64;
+    let learning = if input.learning_raw_observations > 0 {
+        0.90 * learning + 0.10
+    } else {
+        learning
+    };
     let resource = 0.45 * (input.p95_cycle_ms > 0.0) as u8 as f64
         + 0.30
             * if input.current_pressure >= 0.55 {
@@ -1557,6 +1601,9 @@ mod tests {
             total_skills,
             experience_records,
             dyna_transitions,
+            learning_raw_observations: rm_u("learning_bronze_total"),
+            learning_gold_observations: rm_u("learning_gold_total"),
+            learning_data_quality: rm_f("learning_data_quality").clamp(0.0, 1.0),
 
             // D4
             p95_cycle_ms,
@@ -1677,6 +1724,9 @@ mod tests {
             total_skills: learning.7,
             experience_records: learning.8,
             dyna_transitions: learning.9,
+            learning_raw_observations: 200,
+            learning_gold_observations: 198,
+            learning_data_quality: 0.99,
             // overflow_count from RL sim available as learning.10
 
             // Resource: LIVE from measured computation time
@@ -2308,6 +2358,53 @@ mod tests {
     }
 
     #[test]
+    fn curated_gold_evidence_improves_learning_benchmark() {
+        let legacy = AisInput {
+            rl_q_variance: 1.0,
+            rl_convergence_ticks: 250,
+            rl_max_ticks: 500,
+            causal_solid_edges: 4,
+            causal_weak_edges: 1,
+            causal_total_edges: 10,
+            reliable_skills: 3,
+            total_skills: 5,
+            dyna_transitions: 50,
+            ..Default::default()
+        };
+        let clean = AisInput {
+            learning_raw_observations: 200,
+            learning_gold_observations: 198,
+            learning_data_quality: 0.99,
+            ..legacy.clone()
+        };
+        let polluted = AisInput {
+            learning_raw_observations: 200,
+            learning_gold_observations: 20,
+            learning_data_quality: 0.30,
+            ..legacy.clone()
+        };
+
+        let legacy_result = compute_ais(&legacy);
+        let clean_result = compute_ais(&clean);
+        let polluted_result = compute_ais(&polluted);
+        let legacy_score = legacy_result.learning_velocity;
+        let clean_score = clean_result.learning_velocity;
+        let polluted_score = polluted_result.learning_velocity;
+        println!(
+            "medallion_ais_benchmark: D3 legacy={legacy_score:.3} clean={clean_score:.3} polluted={polluted_score:.3}; AIS legacy={:.2} clean={:.2} polluted={:.2}",
+            legacy_result.total, clean_result.total, polluted_result.total
+        );
+        assert!(
+            clean_score > legacy_score,
+            "clean curated evidence must improve D3: {legacy_score:.3} -> {clean_score:.3}"
+        );
+        assert!(
+            polluted_score < legacy_score,
+            "low-quality volume must not game D3: {legacy_score:.3} -> {polluted_score:.3}"
+        );
+    }
+
+    #[test]
     fn test_safety_violation_zeroes_dimension() {
         let input = AisInput {
             total_decisions: 100,
@@ -2334,6 +2431,9 @@ mod tests {
             total_skills: 3,
             experience_records: 100,
             dyna_transitions: 500,
+            learning_raw_observations: 0,
+            learning_gold_observations: 0,
+            learning_data_quality: 0.0,
             p95_cycle_ms: 30.0,
             target_cycle_ms: 50.0,
             subsystem_skips: 50,
@@ -2581,6 +2681,9 @@ mod tests {
             total_skills: 5,
             experience_records: 50,
             dyna_transitions: 200,
+            learning_raw_observations: 100,
+            learning_gold_observations: 99,
+            learning_data_quality: 0.99,
 
             // D4: efficient resource use — fast cycles, good budget
             p95_cycle_ms: 60.0,
@@ -2827,6 +2930,9 @@ mod tests {
             total_skills: 3,
             experience_records: 5,
             dyna_transitions: 0,
+            learning_raw_observations: 100,
+            learning_gold_observations: 20,
+            learning_data_quality: 0.40,
 
             // D4: poor efficiency — slow cycles, poor budget
             p95_cycle_ms: 200.0,

@@ -1419,6 +1419,25 @@ pub struct RuntimeMetrics {
     pub ais_evidence_coverage: f64,
     #[serde(default)]
     pub ais_operational_health: f64,
+    /// Medallion learning telemetry. Bronze counts raw resolved outcomes;
+    /// Silver passed structural validation; Gold is the only tier admitted to
+    /// long-lived learners.
+    #[serde(default)]
+    pub learning_bronze_total: u64,
+    #[serde(default)]
+    pub learning_silver_total: u64,
+    #[serde(default)]
+    pub learning_gold_total: u64,
+    #[serde(default)]
+    pub learning_rejected_total: u64,
+    #[serde(default)]
+    pub learning_invalid_total: u64,
+    #[serde(default)]
+    pub learning_duplicate_total: u64,
+    #[serde(default)]
+    pub learning_data_quality: f64,
+    #[serde(default)]
+    pub learning_gold_rate: f64,
     /// 2026-05-12 — Active regime selected by the chromium Step 2 gate's
     /// priority chain in daemon_chromium_tick.rs. One of: "default",
     /// "media", "build", "call", "llm". Surfaces silently-failing regime

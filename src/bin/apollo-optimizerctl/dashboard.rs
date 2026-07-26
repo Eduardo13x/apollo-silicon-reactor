@@ -376,6 +376,23 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         .map_or(0, |l| l.learned_policy.noise_patterns);
     lines.push(format!("Bayes  {}int {}noise", interactive, noise));
 
+    if m.ais_score > 0.0 {
+        lines.push(format!(
+            "AIS    {:.1} {} · L {:.0}%",
+            m.ais_score,
+            m.ais_grade,
+            m.ais_learning * 100.0
+        ));
+    }
+    if m.learning_bronze_total > 0 {
+        lines.push(format!(
+            "Data   G {}/{} q{:.0}%",
+            format_number(m.learning_gold_total),
+            format_number(m.learning_bronze_total),
+            m.learning_data_quality * 100.0
+        ));
+    }
+
     // RL Q-table
     if m.rl_total_ticks > 0 {
         lines.push(format!(
@@ -904,6 +921,23 @@ mod tests {
         status.metrics.context_switch_burst = true;
 
         assert_eq!(profile_activity_reason(&status), "Override manual");
+    }
+
+    #[test]
+    fn think_quadrant_surfaces_medallion_quality_and_ais_learning() {
+        let mut status = dashboard_status();
+        status.metrics.ais_score = 92.4;
+        status.metrics.ais_grade = "S".to_string();
+        status.metrics.ais_learning = 0.88;
+        status.metrics.learning_bronze_total = 200;
+        status.metrics.learning_gold_total = 198;
+        status.metrics.learning_data_quality = 0.99;
+
+        let think = render_think_q(&status);
+
+        assert!(think.iter().any(|line| line == "AIS    92.4 S · L 88%"));
+        assert!(think.iter().any(|line| line == "Data   G 198/200 q99%"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
     #[test]

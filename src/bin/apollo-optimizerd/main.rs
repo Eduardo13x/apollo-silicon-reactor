@@ -5777,6 +5777,7 @@ fn main() -> anyhow::Result<()> {
                     &signal_digest,
                     &agent_intervention,
                     &arousal_state,
+                    &learning_pipeline,
                 );
                 metrics_reporter::apply_io_shaping(
                     cycle_count,
