@@ -27,7 +27,9 @@ use crate::engine::nars_belief::{ArousalState, DriftDetector};
 use crate::engine::nested_learner::NestedLearner;
 use crate::engine::neuromodulator::NeuroState;
 use crate::engine::optimization_skills::{OptimizationSkill, SkillRegistry};
-use crate::engine::outcome_tracker::{OutcomeTracker, OutcomeTrackerPersisted};
+use crate::engine::outcome_tracker::{
+    sanitize_pattern_weights, OutcomeTracker, OutcomeTrackerPersisted,
+};
 use crate::engine::overflow_guard::OverflowHistory;
 use crate::engine::predictive_agent::SpecialistAccuracyTracker;
 use crate::engine::process_baseline::ProcessBaselineMap;
@@ -645,6 +647,21 @@ const CO_OCC_PRUNE_THRESHOLD: u32 = 2;
 const WEIGHT_MIN_THROTTLES: u32 = 3;
 /// Experience records cap after compression.
 const EXPERIENCE_CAP: usize = 300;
+/// Aggregate history remains useful as a prior, but must not permanently
+/// dominate the feedback loop after a machine or workload change.
+const OUTCOME_TOTAL_EVIDENCE_CAP: u32 = 256;
+
+fn bound_outcome_totals(ot: &mut OutcomeTrackerPersisted) {
+    if ot.total_resolved <= OUTCOME_TOTAL_EVIDENCE_CAP {
+        return;
+    }
+    let old_total = u64::from(ot.total_resolved);
+    ot.total_effective = ((u64::from(ot.total_effective) * u64::from(OUTCOME_TOTAL_EVIDENCE_CAP)
+        + old_total / 2)
+        / old_total)
+        .min(u64::from(u32::MAX)) as u32;
+    ot.total_resolved = OUTCOME_TOTAL_EVIDENCE_CAP;
+}
 
 impl LearnedState {
     /// Collect snapshots from all live components into a single struct.
@@ -790,6 +807,8 @@ impl LearnedState {
             //    are noise — discard them to keep the file lean.
             ot.weights
                 .retain(|_, w| w.throttle_count >= WEIGHT_MIN_THROTTLES || w.effective_count > 0);
+            sanitize_pattern_weights(&mut ot.weights);
+            bound_outcome_totals(ot);
 
             // 3. Compress experience memory: keep last EXPERIENCE_CAP records.
             //    Older records are less relevant as workload patterns shift.
@@ -981,6 +1000,8 @@ impl LearnedState {
         }
 
         if let Some(ot) = &mut self.outcome_tracker {
+            sanitize_pattern_weights(&mut ot.weights);
+            bound_outcome_totals(ot);
             // natural_drift_ema should be small (typical: -0.05 to +0.05).
             ot.natural_drift_ema = ot.natural_drift_ema.clamp(-0.2, 0.2);
             // baseline_drop_ema is a probability-like value in [0, 1].
@@ -1782,6 +1803,19 @@ mod tests {
             drift_detector: None,
             blocked_patterns: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn aggregate_outcome_history_is_bounded_without_changing_its_rate() {
+        let mut outcomes = make_ot_persisted();
+        outcomes.total_resolved = 10_000;
+        outcomes.total_effective = 6_250;
+
+        bound_outcome_totals(&mut outcomes);
+
+        assert_eq!(outcomes.total_resolved, OUTCOME_TOTAL_EVIDENCE_CAP);
+        let rate = outcomes.total_effective as f64 / outcomes.total_resolved as f64;
+        assert!((rate - 0.625).abs() < 0.005);
     }
 
     #[test]

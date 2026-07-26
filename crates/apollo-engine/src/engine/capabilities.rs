@@ -1,6 +1,23 @@
 use crate::engine::types::CapabilityReport;
+use std::sync::OnceLock;
 
 pub fn detect_capabilities() -> CapabilityReport {
+    static PASSIVE_CAPABILITIES: OnceLock<CapabilityReport> = OnceLock::new();
+    PASSIVE_CAPABILITIES
+        .get_or_init(|| detect_capabilities_inner(false))
+        .clone()
+}
+
+/// Detect capabilities and execute the explicit write probes used by `doctor`.
+///
+/// Keep this out of daemon hot paths: the memorystatus probe writes the
+/// daemon's current limit back to the kernel and `task_for_pid` acquires a Mach
+/// task port. Normal action dispatch only needs the passive capability flags.
+pub fn detect_capabilities_with_write_probes() -> CapabilityReport {
+    detect_capabilities_inner(true)
+}
+
+fn detect_capabilities_inner(run_write_probes: bool) -> CapabilityReport {
     let mut unavailable = Vec::new();
 
     // taskpolicy: check if setpriority works (always available on macOS).
@@ -28,6 +45,8 @@ pub fn detect_capabilities() -> CapabilityReport {
     }
 
     let is_root = unsafe { libc::geteuid() == 0 };
+    let can_memory_pressure_send =
+        is_root && crate::engine::sysctl_direct::exists("kern.memorystatus_vm_pressure_send");
 
     // Core counts (Apple Silicon clusters)
     // perflevel0 = P-cores (Firestorm/Avalanche/etc.)
@@ -39,7 +58,7 @@ pub fn detect_capabilities() -> CapabilityReport {
     // These actually call the kernel API to prove the write path works,
     // rather than inferring capability from euid or binary existence.
 
-    let memorystatus_probe = if is_root {
+    let memorystatus_probe = if is_root && run_write_probes {
         match crate::engine::jetsam_control::probe_write() {
             Ok(()) => Some("ok".to_string()),
             Err(e) => Some(format!("fail: {}", e)),
@@ -48,15 +67,20 @@ pub fn detect_capabilities() -> CapabilityReport {
         None
     };
 
-    let task_for_pid_probe = match probe_task_for_pid() {
-        Ok(()) => Some("ok".to_string()),
-        Err(e) => Some(format!("fail: {}", e)),
+    let task_for_pid_probe = if run_write_probes {
+        match probe_task_for_pid() {
+            Ok(()) => Some("ok".to_string()),
+            Err(e) => Some(format!("fail: {}", e)),
+        }
+    } else {
+        None
     };
 
     CapabilityReport {
         can_taskpolicy,
         can_sysctl,
         can_memorystatus: is_root,
+        can_memory_pressure_send,
         can_mdutil,
         can_tmutil,
         is_root,
@@ -137,8 +161,16 @@ mod tests {
         let _ = cap.can_taskpolicy as u8;
         let _ = cap.can_sysctl as u8;
         let _ = cap.can_memorystatus as u8;
+        let _ = cap.can_memory_pressure_send as u8;
         let _ = cap.can_mdutil as u8;
         let _ = cap.can_tmutil as u8;
         let _ = cap.is_root as u8;
+    }
+
+    #[test]
+    fn passive_detection_never_runs_write_probes() {
+        let cap = detect_capabilities();
+        assert!(cap.memorystatus_probe.is_none());
+        assert!(cap.task_for_pid_probe.is_none());
     }
 }

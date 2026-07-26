@@ -12,12 +12,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use apollo_engine::collector::{SystemCollector, SystemSnapshot};
+use apollo_engine::engine::audit_types::PolicyDecisionTrace;
 use apollo_engine::engine::daemon_helpers::write_frozen_state;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::degradation::DegradationInputs;
 use apollo_engine::engine::execute_actions::{execute_actions, ExecuteOutcomes};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
+use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
 use apollo_engine::engine::swap_reclaim::SwapRisk;
 use apollo_engine::engine::types::{FreezeSource, FrozenEntry, RootAction};
 use apollo_engine::engine::unfreeze_decay::UnfreezeDecayModel;
@@ -60,10 +62,8 @@ impl DedupStats {
 /// Extract `(pid, kind)` for actions targeting a specific process. Returns
 /// `None` for actions without a PID target (sysctl, spotlight, quarantine).
 ///
-/// SetThreadQoS uses `(pid, thread_index)`-aware key by encoding thread_index
-/// into the kind via secondary discriminator — but because all SetThreadQoS
-/// for the same pid+thread are equivalent for dedup purposes, we treat
-/// `(pid, SetThreadQoS, thread_index)` as the key.
+/// SetThreadQoS uses a `(pid, thread_index)`-aware key. Conflicting tiers are
+/// resolved separately so an interactive promotion wins over a stale demotion.
 fn dedup_key(action: &RootAction) -> Option<(u32, DedupKind, u32)> {
     match action {
         RootAction::SetMemorystatus { pid, .. } => Some((*pid, DedupKind::SetMemorystatus, 0)),
@@ -77,6 +77,15 @@ fn dedup_key(action: &RootAction) -> Option<(u32, DedupKind, u32)> {
         RootAction::SetSysctl(_)
         | RootAction::ToggleSpotlight { .. }
         | RootAction::QuarantineDaemon { .. } => None,
+    }
+}
+
+fn thread_qos_rank(action: &RootAction) -> u8 {
+    match action {
+        RootAction::SetThreadQoS { tier, .. } if tier == "interactive" => 3,
+        RootAction::SetThreadQoS { tier, .. } if tier == "background" => 1,
+        RootAction::SetThreadQoS { .. } => 2,
+        _ => 0,
     }
 }
 
@@ -94,14 +103,15 @@ fn dedup_key(action: &RootAction) -> Option<(u32, DedupKind, u32)> {
 /// before execute_actions eliminates the bug class without touching
 /// every emission site.
 pub fn consolidate_actions_per_pid(actions: Vec<RootAction>) -> (Vec<RootAction>, DedupStats) {
-    let mut seen: HashSet<(u32, DedupKind, u32)> = HashSet::with_capacity(actions.len());
+    let mut seen: HashMap<(u32, DedupKind, u32), usize> = HashMap::with_capacity(actions.len());
     let mut stats = DedupStats::default();
     let mut out: Vec<RootAction> = Vec::with_capacity(actions.len());
 
     for action in actions {
         match dedup_key(&action) {
             Some(key) => {
-                if seen.insert(key) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = seen.entry(key) {
+                    entry.insert(out.len());
                     out.push(action);
                 } else {
                     match key.1 {
@@ -111,6 +121,12 @@ pub fn consolidate_actions_per_pid(actions: Vec<RootAction>) -> (Vec<RootAction>
                         DedupKind::Unfreeze => stats.unfreeze += 1,
                         DedupKind::Boost => stats.boost += 1,
                         DedupKind::SetThreadQoS => stats.set_thread_qos += 1,
+                    }
+                    if key.1 == DedupKind::SetThreadQoS {
+                        let existing_idx = seen[&key];
+                        if thread_qos_rank(&action) > thread_qos_rank(&out[existing_idx]) {
+                            out[existing_idx] = action;
+                        }
                     }
                 }
             }
@@ -135,6 +151,31 @@ pub fn record_dedup_drops(lf: &LockFreeMetrics, stats: &DedupStats) {
     if stats.unfreeze > 0 {
         lf.add_dedup_drops_unfreeze(stats.unfreeze);
     }
+    if stats.boost > 0 {
+        lf.add_dedup_drops_boost(stats.boost);
+    }
+    if stats.set_thread_qos > 0 {
+        lf.add_dedup_drops_thread_qos(stats.set_thread_qos);
+    }
+}
+
+/// Commit only confirmed system mutations to the cross-cycle cache. Queue
+/// admission, cognitive filtering, dry-run simulation and failed syscalls are
+/// intentionally excluded so a blocked action can be retried next cycle.
+pub fn record_applied_actions(
+    traces: &[PolicyDecisionTrace],
+    recently_applied: &mut RecentlyApplied,
+) -> usize {
+    let mut recorded = 0;
+    for trace in traces.iter().filter(|trace| trace.applied) {
+        if let Some((pid, kind, discriminator)) =
+            CachedActionKind::from_root_action(&trace.intended_action)
+        {
+            recently_applied.record_scoped(pid, kind, discriminator);
+            recorded += 1;
+        }
+    }
+    recorded
 }
 
 use crate::{cognitive_tick, daemon_action_pipeline};
@@ -232,6 +273,8 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             throttle = dedup_stats.throttle,
             freeze = dedup_stats.freeze,
             unfreeze = dedup_stats.unfreeze,
+            boost = dedup_stats.boost,
+            thread_qos = dedup_stats.set_thread_qos,
             "consolidate_actions_per_pid: collapsed duplicates"
         );
     }
@@ -557,6 +600,7 @@ mod tests {
             can_taskpolicy: true,
             can_sysctl: true,
             can_memorystatus: true,
+            can_memory_pressure_send: true,
             can_mdutil: true,
             can_tmutil: true,
             is_root: true,
@@ -666,6 +710,31 @@ mod tests {
         }
     }
 
+    fn boost(pid: u32) -> RootAction {
+        RootAction::BoostProcess {
+            pid,
+            name: format!("p{}", pid),
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
+        }
+    }
+
+    fn thread_qos(pid: u32, thread_index: u32) -> RootAction {
+        RootAction::SetThreadQoS {
+            pid,
+            name: format!("p{}", pid),
+            thread_index,
+            tier: "interactive".to_string(),
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::ThreadQoSRouting,
+            affinity_tag: None,
+            start_sec: 0,
+            start_usec: 0,
+        }
+    }
+
     #[test]
     fn consolidate_drops_4x_setmemorystatus_same_pid() {
         // Reproduces prod observation: pid 65808 SetMemorystatus 4× per cycle.
@@ -762,5 +831,97 @@ mod tests {
         let (out, stats) = consolidate_actions_per_pid(actions);
         assert_eq!(out.len(), 2, "non-PID actions pass through");
         assert_eq!(stats.total_dropped(), 0);
+    }
+
+    #[test]
+    fn consolidate_scopes_thread_qos_by_thread_index() {
+        let actions = vec![thread_qos(100, 1), thread_qos(100, 2), thread_qos(100, 1)];
+        let (out, stats) = consolidate_actions_per_pid(actions);
+        assert_eq!(out.len(), 2, "distinct threads must both survive");
+        assert_eq!(stats.set_thread_qos, 1);
+    }
+
+    #[test]
+    fn consolidate_prefers_interactive_thread_qos_regardless_of_input_order() {
+        for actions in [
+            vec![thread_qos(100, 1), {
+                let mut action = thread_qos(100, 1);
+                if let RootAction::SetThreadQoS { tier, .. } = &mut action {
+                    *tier = "background".to_string();
+                }
+                action
+            }],
+            vec![
+                {
+                    let mut action = thread_qos(100, 1);
+                    if let RootAction::SetThreadQoS { tier, .. } = &mut action {
+                        *tier = "background".to_string();
+                    }
+                    action
+                },
+                thread_qos(100, 1),
+            ],
+        ] {
+            let (out, stats) = consolidate_actions_per_pid(actions);
+            assert_eq!(out.len(), 1);
+            assert_eq!(stats.set_thread_qos, 1);
+            assert!(matches!(
+                &out[0],
+                RootAction::SetThreadQoS { tier, .. } if tier == "interactive"
+            ));
+        }
+    }
+
+    #[test]
+    fn record_dedup_drops_publishes_boost_and_thread_qos() {
+        let lf = LockFreeMetrics::new();
+        let (_, stats) = consolidate_actions_per_pid(vec![
+            boost(100),
+            boost(100),
+            thread_qos(200, 1),
+            thread_qos(200, 1),
+        ]);
+
+        record_dedup_drops(&lf, &stats);
+        let snapshot = lf.snapshot();
+        assert_eq!(snapshot.dedup_drops_boost, 1);
+        assert_eq!(snapshot.dedup_drops_thread_qos, 1);
+    }
+
+    #[test]
+    fn recently_applied_records_only_confirmed_mutations() {
+        let applied = throttle(100);
+        let blocked = boost(200);
+        let traces = vec![
+            PolicyDecisionTrace {
+                t: Utc::now(),
+                cycle: 1,
+                intended_action: applied,
+                decision_reason: DecisionReason::PressureContext,
+                applied: true,
+                block_reason: None,
+                pressure: 0.5,
+                swap_gb: 0.0,
+                thrashing: 0.0,
+            },
+            PolicyDecisionTrace {
+                t: Utc::now(),
+                cycle: 1,
+                intended_action: blocked,
+                decision_reason: DecisionReason::PressureContext,
+                applied: false,
+                block_reason: Some(
+                    apollo_engine::engine::audit_types::BlockReason::CircuitBreakerActive,
+                ),
+                pressure: 0.5,
+                swap_gb: 0.0,
+                thrashing: 0.0,
+            },
+        ];
+        let mut cache = RecentlyApplied::new();
+
+        assert_eq!(record_applied_actions(&traces, &mut cache), 1);
+        assert!(cache.is_recent(100, CachedActionKind::Throttle));
+        assert!(!cache.is_recent(200, CachedActionKind::Boost));
     }
 }

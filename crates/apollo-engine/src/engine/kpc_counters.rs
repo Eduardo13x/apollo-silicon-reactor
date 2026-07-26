@@ -101,6 +101,8 @@ pub struct KpcReader {
     fn_get_config: Option<unsafe extern "C" fn(u32, *mut u64) -> i32>,
     /// Number of fixed counters.
     counter_count: u32,
+    /// Number of logical CPUs written by an all-CPU KPC sample.
+    cpu_count: usize,
     /// Previous raw counter values for delta computation.
     prev_counters: Option<Vec<u64>>,
     /// Whether KPC is operational.
@@ -125,6 +127,7 @@ impl KpcReader {
     pub fn new() -> Self {
         #[cfg(target_os = "macos")]
         {
+            let cpu_count = detected_logical_cpu_count();
             let handle =
                 unsafe { libc::dlopen(c"/usr/lib/libkpc.dylib".as_ptr(), libc::RTLD_LAZY) };
 
@@ -165,6 +168,7 @@ impl KpcReader {
                     fn_get_counter_count: Some(fn_get_counter_count),
                     fn_get_cpu_counters: Some(fn_get_cpu_counters),
                     counter_count: 0,
+                    cpu_count,
                     prev_counters: None,
                     available: false,
                     ipc_ema: 0.0,
@@ -186,6 +190,7 @@ impl KpcReader {
                     fn_get_counter_count: Some(fn_get_counter_count),
                     fn_get_cpu_counters: Some(fn_get_cpu_counters),
                     counter_count: 0,
+                    cpu_count,
                     prev_counters: None,
                     available: false,
                     ipc_ema: 0.0,
@@ -206,6 +211,7 @@ impl KpcReader {
                     fn_get_counter_count: Some(fn_get_counter_count),
                     fn_get_cpu_counters: Some(fn_get_cpu_counters),
                     counter_count: 0,
+                    cpu_count,
                     prev_counters: None,
                     available: false,
                     ipc_ema: 0.0,
@@ -245,6 +251,7 @@ impl KpcReader {
                 fn_set_config,
                 fn_get_config,
                 counter_count,
+                cpu_count,
                 prev_counters: None,
                 available: true,
                 ipc_ema: 0.0,
@@ -270,12 +277,10 @@ impl KpcReader {
             let fn_get = self.fn_get_cpu_counters?;
             let n = self.counter_count as usize;
 
-            // Allocate buffer for all CPU counters.
-            // kpc_get_cpu_counters returns counters for all CPUs × counter_count.
-            // We read with cupcnt = counter_count which gives per-logical-cpu values.
-            // Total buffer size = ncpus * counter_count, but the API with
-            // cupcnt_buf = NULL returns the total across all CPUs into counter_count slots.
-            let mut buf = vec![0u64; n];
+            // `all_cpus=1` writes one counter block per logical CPU. The old
+            // n-element allocation only had room for one block, allowing KPC
+            // to overrun the Vec on multi-core Apple Silicon.
+            let mut buf = vec![0u64; n.saturating_mul(self.cpu_count)];
             let mut cupcnt: i32 = 0;
 
             let ret = unsafe {
@@ -291,30 +296,10 @@ impl KpcReader {
                 return None;
             }
 
-            // Fixed counters: index 0 = cycles, index 1 = instructions (on Apple Silicon).
-            let cycles = buf.first().copied().unwrap_or(0);
-            let instructions = buf.get(1).copied().unwrap_or(0);
-
             let (delta_cycles, delta_instructions, ipc) = if let Some(ref prev) = self.prev_counters
             {
-                let prev_cycles = prev.first().copied().unwrap_or(0);
-                let prev_instr = prev.get(1).copied().unwrap_or(0);
-
-                // Handle 48-bit counter overflow.
-                let mask_48 = (1u64 << 48) - 1;
-                let dc = if cycles >= prev_cycles {
-                    cycles - prev_cycles
-                } else {
-                    (cycles + mask_48) - prev_cycles
-                };
-                let di = if instructions >= prev_instr {
-                    instructions - prev_instr
-                } else {
-                    (instructions + mask_48) - prev_instr
-                };
-
+                let (dc, di) = aggregate_fixed_counter_deltas(&buf, prev, n)?;
                 let ipc = if dc > 0 { di as f64 / dc as f64 } else { 0.0 };
-
                 (dc, di, ipc)
             } else {
                 (0, 0, 0.0)
@@ -379,6 +364,7 @@ impl KpcReader {
             fn_set_config: None,
             fn_get_config: None,
             counter_count: 0,
+            cpu_count: 1,
             prev_counters: None,
             available: false,
             ipc_ema: 0.0,
@@ -392,6 +378,46 @@ impl KpcReader {
     fn load_sym(handle: *mut c_void, name: &[u8]) -> *mut c_void {
         unsafe { libc::dlsym(handle, name.as_ptr() as *const i8) }
     }
+}
+
+fn detected_logical_cpu_count() -> usize {
+    crate::engine::sysctl_direct::read_i32("hw.logicalcpu_max")
+        .filter(|count| *count > 0)
+        .map(|count| count as usize)
+        .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
+        .unwrap_or(1)
+        .min(256)
+}
+
+fn aggregate_fixed_counter_deltas(
+    current: &[u64],
+    previous: &[u64],
+    counters_per_cpu: usize,
+) -> Option<(u64, u64)> {
+    if counters_per_cpu < 2
+        || current.len() != previous.len()
+        || !current.len().is_multiple_of(counters_per_cpu)
+    {
+        return None;
+    }
+    let mask_48 = (1_u64 << 48) - 1;
+    let mut cycles = 0_u64;
+    let mut instructions = 0_u64;
+    for (now, before) in current
+        .chunks_exact(counters_per_cpu)
+        .zip(previous.chunks_exact(counters_per_cpu))
+    {
+        let delta = |value: u64, old: u64| {
+            if value >= old {
+                value - old
+            } else {
+                value.saturating_add(mask_48).saturating_sub(old)
+            }
+        };
+        cycles = cycles.saturating_add(delta(now[0], before[0]));
+        instructions = instructions.saturating_add(delta(now[1], before[1]));
+    }
+    Some((cycles, instructions))
 }
 
 #[cfg(test)]
@@ -456,6 +482,26 @@ mod tests {
 
         // Should be 50 + 100 = 150 (wrapped correctly).
         assert_eq!(delta, 150);
+    }
+
+    #[test]
+    fn all_cpu_fixed_counters_are_aggregated() {
+        let mut previous = Vec::new();
+        let mut current = Vec::new();
+        for cpu in 0..10_u64 {
+            previous.extend_from_slice(&[1000 + cpu, 2000 + cpu]);
+            current.extend_from_slice(&[1100 + cpu, 2250 + cpu]);
+        }
+        assert_eq!(
+            aggregate_fixed_counter_deltas(&current, &previous, 2),
+            Some((1000, 2500))
+        );
+    }
+
+    #[test]
+    fn logical_cpu_count_is_bounded_and_nonzero() {
+        let count = detected_logical_cpu_count();
+        assert!((1..=256).contains(&count));
     }
 
     #[test]

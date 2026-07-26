@@ -1,5 +1,5 @@
 use crate::engine::sysctl_direct;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 
@@ -17,23 +17,39 @@ use crate::engine::mach_qos::{LatencyTier, MachQoSManager, ThreadTier, Throughpu
 use crate::engine::proc_taskinfo;
 use crate::engine::process_identity::{self, ProcessIdentity};
 use crate::engine::safety::{
-    allowlisted_sysctls, allowlisted_sysctls_with_ranges, classify_protection,
-    infrastructure_processes, protected_processes, ProtectionLevel,
+    allowlisted_sysctls, allowlisted_sysctls_with_ranges, infrastructure_processes_cached,
+    protected_processes_cached, ProtectionLevel,
 };
 use crate::engine::types::{CapabilityReport, JournalEntry, RootAction};
 
 /// Set the nice value for a process via `setpriority(2)`.
-/// Returns `Ok(())` on success, or an error if the call failed.
-fn set_nice(pid: u32, nice: i32) -> anyhow::Result<()> {
+/// Returns the prior nice value when the process priority actually changed.
+/// `Ok(None)` means the target value was already present.
+fn set_nice(pid: u32, nice: i32) -> anyhow::Result<Option<i32>> {
     // A2 fix (round-3): skip zombies before setpriority. setpriority on a
     // zombie returns ESRCH which was previously silenced but still wasted a
     // syscall and polluted the error log path.
     if proc_taskinfo::is_zombie_pid(pid) {
-        return Ok(());
+        anyhow::bail!("setpriority({}, {}) skipped: zombie", pid, nice);
     }
-    // errno must be cleared before setpriority — a return of -1 is ambiguous
-    // because -1 is a valid priority.  We use the errno convention instead.
+    let current;
     unsafe {
+        // getpriority may legitimately return -1; errno disambiguates it.
+        *libc::__error() = 0;
+        current = libc::getpriority(libc::PRIO_PROCESS, pid);
+        if current == -1 && *libc::__error() != 0 {
+            anyhow::bail!(
+                "getpriority({}) failed: {}",
+                pid,
+                std::io::Error::last_os_error()
+            );
+        }
+        if current == nice {
+            return Ok(None);
+        }
+
+        // errno must be cleared before setpriority — a return of -1 is
+        // ambiguous because -1 is a valid priority.
         *libc::__error() = 0;
         let rc = libc::setpriority(libc::PRIO_PROCESS, pid, nice);
         if rc == -1 && *libc::__error() != 0 {
@@ -45,7 +61,7 @@ fn set_nice(pid: u32, nice: i32) -> anyhow::Result<()> {
             );
         }
     }
-    Ok(())
+    Ok(Some(current))
 }
 
 /// Send a signal to all processes whose name matches `daemon` exactly.
@@ -77,7 +93,7 @@ fn killall_by_name(daemon: &str, signal: i32) -> anyhow::Result<()> {
 /// `let _ = spawn()` left the Child to drop without `wait()`, accumulating
 /// zombies across the daemon's lifetime (xnu does NOT auto-reap dropped
 /// Child handles — Drop on `std::process::Child` is a no-op by design).
-fn spotlight_set_indexing(enabled: bool) {
+fn spotlight_set_indexing(enabled: bool) -> bool {
     let flag = if enabled { "on" } else { "off" };
     std::thread::Builder::new()
         .name("apollo-mdutil".to_string())
@@ -91,7 +107,7 @@ fn spotlight_set_indexing(enabled: bool) {
                 eprintln!("[spotlight] mdutil -i {} spawn failed: {}", flag, e);
             }
         })
-        .ok();
+        .is_ok()
 }
 
 fn run_sysctl_write(key: &str, value: &str) -> anyhow::Result<()> {
@@ -233,6 +249,10 @@ pub struct ExecuteOutcomes {
     pub top_skipped: Vec<String>,
     pub throttle_reverted: u64,
     pub thread_qos_applied: u64,
+    pub thread_qos_hot_routes: u64,
+    pub thread_qos_cold_routes: u64,
+    pub journal_rotations: u64,
+    pub journal_rotation_failures: u64,
     /// PIDs that were successfully frozen (SIGSTOP sent) this cycle.
     /// Used by causal graph to record only new freeze actions, not all active frozen PIDs.
     pub newly_frozen_pids: Vec<u32>,
@@ -264,6 +284,47 @@ impl ExecuteOutcomes {
     }
 }
 
+#[derive(Debug)]
+enum FastUnfreezeResult {
+    Applied,
+    Stale(BlockReason),
+    Failed(crate::engine::mediator::BlockReason),
+}
+
+/// Coordinate the two mandatory ordering points of a freeze without heap
+/// allocation: optional reversible preparation, then the authoritative
+/// SIGSTOP. A failed stop compensates preparation before returning.
+#[inline]
+fn run_freeze_saga<Prepare, Stop, Restore>(
+    mut prepare: Prepare,
+    mut stop: Stop,
+    mut restore: Restore,
+) -> crate::engine::mediator::SagaReport<String>
+where
+    Prepare: FnMut() -> Result<bool, String>,
+    Stop: FnMut() -> Result<(), String>,
+    Restore: FnMut() -> Result<(), String>,
+{
+    crate::engine::mediator::run_saga(
+        2,
+        |step| match step {
+            0 => prepare().map(|applied| {
+                if applied {
+                    crate::engine::mediator::SagaStep::Applied
+                } else {
+                    crate::engine::mediator::SagaStep::NoOp
+                }
+            }),
+            1 => stop().map(|()| crate::engine::mediator::SagaStep::Applied),
+            _ => unreachable!("freeze saga has exactly two steps"),
+        },
+        |step| match step {
+            0 => restore(),
+            _ => Ok(()),
+        },
+    )
+}
+
 /// Execute a list of actions. Returns an [ExecuteOutcomes] accumulator that
 /// the caller can merge into RuntimeMetrics **after** releasing any locks,
 /// eliminating the need to hold locks across blocking I/O.
@@ -292,12 +353,12 @@ pub fn execute_actions(
     coalition_guard: Option<&CoalitionGuard<'_>>,
     cpu_pegged_fraction: f64,
 ) -> ExecuteOutcomes {
-    let protected = protected_processes();
+    let protected = protected_processes_cached();
     // Only infrastructure (docker, postgres, redis, etc.) gets unconditional protection
     // at execution time. Dev runtimes (python, node, etc.) are filtered upstream by
     // behavioral_protection_score in the daemon — if they reach execute_actions,
     // they've already lost their behavioral gate.
-    let critical_bg = infrastructure_processes();
+    let critical_bg = infrastructure_processes_cached();
     let allowlist = allowlisted_sysctls();
     // Self-protection: never freeze/throttle/kill the daemon itself.
     let my_pid = std::process::id();
@@ -321,10 +382,7 @@ pub fn execute_actions(
     // loop. classify_protection() called below for every candidate action;
     // shared AC eliminates per-call `p.to_ascii_lowercase()` allocation in
     // Tier 3 substring scan. Built once even if loop body iterates ~50-200 times.
-    let policy_all_ac = crate::engine::safety::build_policy_protected_ac(&policy_all);
-    // Empty infra set — infrastructure_processes() is handled separately below
-    // in ThrottleProcess (soft throttle path) and FreezeProcess (critical-bg skip path).
-    let empty_infra: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let policy_all_ac = crate::engine::safety::cached_policy_protected_ac(&policy_all);
 
     let mut out = ExecuteOutcomes::default();
     // Batched journal buffer: entries are flushed in a single open/write/close
@@ -341,17 +399,11 @@ pub fn execute_actions(
     // LATER pids in the list as "still frozen" — the browser grey-tabs a
     // renderer long after SIGCONT would have resumed it.
     //
-    // Fix: deliver SIGCONT to every UnfreezeProcess action in a tight loop
-    // BEFORE entering the main loop. SIGCONT is idempotent (~5 µs per
-    // syscall) so re-sending it later in the main loop is harmless; we
-    // simply pay O(N × 5 µs) extra for O(N × 10 ms) less user-visible
-    // latency. The taskpolicy / mach_qos / memorystatus / journal
-    // bookkeeping still runs afterwards at its normal pace — but the
-    // kernel has already resumed the processes.
-    //
-    // Dead pids: `kill(pid, SIGCONT)` on a dead pid returns ESRCH and is a
-    // no-op, so we don't bother with a per-pid alive check here. The main
-    // loop's `kill(pid, 0)` alive check still gates the slower cleanup work.
+    // Deliver one verified SIGCONT to every UnfreezeProcess action before
+    // slower restoration/bookkeeping. The old pre-pass used a name-only
+    // check, ignored the syscall result, then sent SIGCONT a second time in
+    // the main loop. Carry the receipt forward instead: this preserves low
+    // tail latency while closing PID-reuse and double-signal races.
     //
     // References:
     // - [Dean & Barroso 2013] "The Tail at Scale" CACM §3 — keep
@@ -362,24 +414,53 @@ pub fn execute_actions(
     // - [Gray & Reuter 1992] §10 — journaling must not gate user-visible
     //   state transitions; log-after-apply is correct here because the
     //   kernel already owns the authoritative frozen state.
-    for action in &actions {
-        if let RootAction::UnfreezeProcess { pid, name, .. } = action {
-            // PID recycling guard: verify the process at this PID still has
-            // the expected name before sending SIGCONT.
-            let name_matches = process_identity::proc_name_for_pid(*pid)
-                .map(|current_name| {
-                    current_name == *name
-                        || (current_name.len() >= 6 && name.starts_with(&current_name))
-                        || (name.len() >= 6 && current_name.starts_with(name))
-                })
-                .unwrap_or(false);
-            if !name_matches {
+    let mut fast_unfreezes = HashMap::new();
+    if !dry_run {
+        for action in &actions {
+            let RootAction::UnfreezeProcess {
+                pid,
+                name,
+                start_sec,
+                start_usec,
+                ..
+            } = action
+            else {
                 continue;
-            }
-            if dry_run {
-                continue;
-            }
-            unsafe { libc::kill(*pid as i32, libc::SIGCONT) };
+            };
+
+            let result = if proc_taskinfo::is_zombie_pid(*pid) {
+                FastUnfreezeResult::Stale(BlockReason::Zombie)
+            } else if !ProcessIdentity::verify(*pid, Some(name), *start_sec, *start_usec) {
+                crate::engine::lse_counters::LSE_COUNTERS.inc_pid_recycle_block();
+                FastUnfreezeResult::Stale(BlockReason::PidRecycled)
+            } else {
+                let effect = crate::engine::mediator::Effect::SigCont {
+                    pid: *pid,
+                    start_sec: *start_sec,
+                };
+                let precondition = crate::engine::mediator::PreCondition {
+                    pid_identity: Some((*pid, *start_sec)),
+                    ..Default::default()
+                };
+                match crate::engine::mediator::mediate(
+                    &effect,
+                    &precondition,
+                    &crate::engine::mediator::SignalEffector,
+                ) {
+                    Ok(receipt) if receipt.applied_count > 0 => FastUnfreezeResult::Applied,
+                    Ok(_) => FastUnfreezeResult::Stale(BlockReason::PidRecycled),
+                    Err(crate::engine::mediator::BlockReason::IdentityMismatch { .. }) => {
+                        FastUnfreezeResult::Stale(BlockReason::PidRecycled)
+                    }
+                    Err(crate::engine::mediator::BlockReason::OsError { errno, .. })
+                        if errno == libc::ESRCH =>
+                    {
+                        FastUnfreezeResult::Stale(BlockReason::PidRecycled)
+                    }
+                    Err(error) => FastUnfreezeResult::Failed(error),
+                }
+            };
+            fast_unfreezes.insert(*pid, result);
         }
     }
 
@@ -388,6 +469,10 @@ pub fn execute_actions(
         out.last_skip = None;
         let mut before = None;
         let mut after = None;
+        // Separate real kernel mutation from policy/journal acceptance. Dry-run
+        // remains a successful simulation in the journal, but it must not feed
+        // learning or the cross-cycle recently-applied cache.
+        let mut action_applied = false;
 
         let decision_reason = match &action {
             RootAction::BoostProcess {
@@ -473,6 +558,7 @@ pub fn execute_actions(
                     // we never set, and feed false-positive HP
                     // disagreements into the rollback trigger window.
                     let mut tier_syscall_ok = false;
+                    let mut latency_syscall_ok = false;
                     if !dry_run {
                         if caps.can_taskpolicy {
                             // Phase 2: direct Mach syscalls (~50µs vs ~5ms fork/exec).
@@ -483,11 +569,12 @@ pub fn execute_actions(
                                     *pid,
                                     crate::engine::mach_qos::SchedulingTier::Foreground,
                                 );
-                                mgr.set_latency_and_throughput(
+                                let latency_outcome = mgr.set_latency_and_throughput(
                                     *pid,
                                     LatencyTier::Interactive,
                                     ThroughputTier::High,
                                 );
+                                latency_syscall_ok = latency_outcome.mutated;
                                 drop(mgr);
                                 // Round-4 (2026-06-07): use `mutated` not
                                 // `success`. set_tier returns success=true on
@@ -501,28 +588,44 @@ pub fn execute_actions(
                                 tier_syscall_ok = outcome.mutated;
                             }
                             // Boost I/O tier to Interactive.
-                            apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Interactive);
+                            action_applied |=
+                                apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Interactive);
                         }
-                        let _ = set_nice(*pid, -10);
+                        let nice_prior = set_nice(*pid, -10).ok().flatten();
+                        let nice_applied = nice_prior.is_some();
+                        if nice_prior.is_none() {
+                            crate::engine::effect_ledger::refresh_nice_global(
+                                *pid,
+                                crate::engine::effect_ledger::DEFAULT_TTL,
+                            );
+                        }
+                        action_applied |= tier_syscall_ok || latency_syscall_ok || nice_applied;
                         // Evolve iter-4 (2026-06-10): unified EffectLedger
                         // replaces the ad-hoc boost_ledger. Both side-effects
                         // of a boost (nice -10 + Foreground tier) are now
                         // recorded with their undo; reconcile_global reverts
                         // them once the process stops qualifying.
-                        crate::engine::effect_ledger::record_global(
-                            crate::engine::effect_ledger::AppliedEffect::Nice { pid: *pid },
-                            crate::engine::effect_ledger::DEFAULT_TTL,
-                            *start_sec,
-                            "boost: renice -10",
-                        );
-                        crate::engine::effect_ledger::record_global(
-                            crate::engine::effect_ledger::AppliedEffect::MachTier { pid: *pid },
-                            crate::engine::effect_ledger::DEFAULT_TTL,
-                            *start_sec,
-                            "boost: Foreground tier",
-                        );
+                        if let Some(prior) = nice_prior {
+                            crate::engine::effect_ledger::record_global(
+                                crate::engine::effect_ledger::AppliedEffect::Nice {
+                                    pid: *pid,
+                                    prior,
+                                },
+                                crate::engine::effect_ledger::DEFAULT_TTL,
+                                *start_sec,
+                                "boost: renice -10",
+                            );
+                        }
+                        if tier_syscall_ok {
+                            crate::engine::effect_ledger::record_global(
+                                crate::engine::effect_ledger::AppliedEffect::MachTier { pid: *pid },
+                                crate::engine::effect_ledger::DEFAULT_TTL,
+                                *start_sec,
+                                "boost: Foreground tier",
+                            );
+                        }
                     }
-                    out.boosts_applied += 1;
+                    out.boosts_applied += (action_applied || dry_run) as u64;
                     // FIX-4-v2 (2026-06-07): phantom-enrollment guard.
                     // Only enroll a PendingObservation for the Hellerstein
                     // 2004 §9.3 effect-decay watchdog when the Mach
@@ -622,12 +725,10 @@ pub fn execute_actions(
                     // no foreground context is available here (see policy_all pre-computation).
                     // infra (infrastructure_processes) is intentionally excluded: critical_bg
                     // below handles infra with soft-throttle semantics, not a full skip.
-                    match classify_protection(
+                    match crate::engine::safety::classify_protection_canonical(
                         name,
-                        &protected,
-                        &empty_infra,
                         &policy_all,
-                        policy_all_ac.as_ref(),
+                        policy_all_ac.as_deref(),
                         false,
                     ) {
                         ProtectionLevel::Unconditional => {
@@ -674,7 +775,7 @@ pub fn execute_actions(
                                 crate::engine::mach_qos::SchedulingTier::Normal
                                 // scheduler decides, less invasive than E-cores-only
                             };
-                            mgr.set_tier(*pid, sched_tier);
+                            let tier_outcome = mgr.set_tier(*pid, sched_tier);
                             let lat = if aggressive {
                                 LatencyTier::Background
                             } else {
@@ -685,7 +786,8 @@ pub fn execute_actions(
                             } else {
                                 ThroughputTier::Default
                             };
-                            mgr.set_latency_and_throughput(*pid, lat, thr);
+                            let latency_outcome = mgr.set_latency_and_throughput(*pid, lat, thr);
+                            action_applied |= tier_outcome.mutated || latency_outcome.mutated;
                             drop(mgr);
                         }
                         // Granular I/O tiering based on aggressiveness.
@@ -694,9 +796,9 @@ pub fn execute_actions(
                         // via PRIO_PROCESS, as that breaks the Mach
                         // priority-inheritance chain (Finder/Settings hangs).
                         let io_tier = io_tier_for_throttle(aggressive);
-                        apply_io_tier(*pid, io_tier);
+                        action_applied |= apply_io_tier(*pid, io_tier);
                     }
-                    out.throttles_applied += 1;
+                    out.throttles_applied += (action_applied || dry_run) as u64;
                 }
                 RootAction::FreezeProcess {
                     pid,
@@ -737,12 +839,10 @@ pub fn execute_actions(
                     // FreezeProcess treats infra as a full skip (not a soft-throttle path).
                     // learned_interactive is treated as Unconditional: no foreground context
                     // at execute time (see policy_all pre-computation above).
-                    match classify_protection(
+                    match crate::engine::safety::classify_protection_canonical(
                         name,
-                        &protected,
-                        &critical_bg,
                         &policy_all,
-                        policy_all_ac.as_ref(),
+                        policy_all_ac.as_deref(),
                         false,
                     ) {
                         ProtectionLevel::Unconditional => {
@@ -810,11 +910,6 @@ pub fn execute_actions(
                             block_reason = Some(BlockReason::Zombie);
                             return Ok(());
                         }
-                        // Demote disk I/O to Passive before SIGSTOP.
-                        // This prevents the process from hoarding SSD bandwidth on resume.
-                        if caps.can_taskpolicy {
-                            apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Passive);
-                        }
                         // A5/D1: capture the original jetsam priority BEFORE we demote
                         // the PID to BACKGROUND.  Saved on the FrozenEntry (propagated
                         // via ExecuteOutcomes::newly_frozen_identity) so unfreeze can
@@ -825,55 +920,144 @@ pub fn execute_actions(
                         } else {
                             None
                         };
-                        // Jetsam: marcar como BACKGROUND en el kernel antes de SIGSTOP.
-                        // Así si el sistema entra en OOM mientras el proceso está frozen,
-                        // el kernel lo mata primero en lugar de matar procesos interactivos.
-                        // RAM Switch-3 (2026-06-03): route through JetsamEffector via
-                        // mediator chokepoint. PreCondition identity guard mirrors
-                        // Switch-1's SIGSTOP pattern for consistency. Receipt's
-                        // jetsam priority before/after read surfaces the no_op class
-                        // when the process was already at the target tier (currently
-                        // silent — the prior `let _ = apply_apollo_policy(...)`
-                        // discarded the Result outright).
-                        if caps.can_memorystatus {
-                            let eff = crate::engine::mediator::Effect::SetJetsamTier {
-                                pid: *pid,
-                                start_sec: *start_sec,
-                                tier: crate::engine::mediator::JetsamTierKind::Background,
-                            };
-                            let pre = crate::engine::mediator::PreCondition {
-                                pid_identity: Some((*pid, *start_sec)),
-                                ..Default::default()
-                            };
-                            let mediate_res = crate::engine::mediator::mediate(
-                                &eff,
-                                &pre,
-                                &crate::engine::mediator::JetsamEffector,
+                        // Freeze is Apollo's only destructive multi-step action:
+                        // prepare the jetsam tier, then issue SIGSTOP. Run both
+                        // through the mediator's allocation-free saga harness so
+                        // a failed SIGSTOP restores the exact prior jetsam value.
+                        // Advisory I/O demotion happens only after commit and
+                        // therefore cannot leave a partial action behind.
+                        let freeze_saga = run_freeze_saga(
+                            || -> Result<bool, String> {
+                                // Without an exact prior value there is no safe
+                                // compensation, so leave this optional step a no-op.
+                                if !caps.can_memorystatus || captured_priority.is_none() {
+                                    return Ok(false);
+                                }
+                                let effect = crate::engine::mediator::Effect::SetJetsamTier {
+                                    pid: *pid,
+                                    start_sec: *start_sec,
+                                    tier: crate::engine::mediator::JetsamTierKind::Background,
+                                };
+                                let precondition = crate::engine::mediator::PreCondition {
+                                    pid_identity: Some((*pid, *start_sec)),
+                                    ..Default::default()
+                                };
+                                match crate::engine::mediator::mediate(
+                                    &effect,
+                                    &precondition,
+                                    &crate::engine::mediator::JetsamEffector,
+                                ) {
+                                    Ok(receipt) => Ok(receipt.applied_count > 0),
+                                    // Jetsam preparation is opportunistic. A
+                                    // blocked preparation must not prevent the
+                                    // independently-safe SIGSTOP operation.
+                                    Err(_) => Ok(false),
+                                }
+                            },
+                            || -> Result<(), String> {
+                                let effect = crate::engine::mediator::Effect::SigStop {
+                                    pid: *pid,
+                                    start_sec: *start_sec,
+                                };
+                                let precondition = crate::engine::mediator::PreCondition {
+                                    pid_identity: Some((*pid, *start_sec)),
+                                    ..Default::default()
+                                };
+                                match crate::engine::mediator::mediate(
+                                    &effect,
+                                    &precondition,
+                                    &crate::engine::mediator::SignalEffector,
+                                ) {
+                                    Ok(receipt) if receipt.applied_count > 0 => Ok(()),
+                                    Ok(_) => {
+                                        Err(format!("SIGSTOP produced no mutation for pid {}", pid))
+                                    }
+                                    Err(error) => {
+                                        Err(format!("SIGSTOP failed for pid {}: {:?}", pid, error))
+                                    }
+                                }
+                            },
+                            || -> Result<(), String> {
+                                if let Some(priority) = captured_priority {
+                                    let effect = crate::engine::mediator::Effect::SetJetsamTier {
+                                        pid: *pid,
+                                        start_sec: *start_sec,
+                                        tier: crate::engine::mediator::JetsamTierKind::Exact(
+                                            priority,
+                                        ),
+                                    };
+                                    let precondition = crate::engine::mediator::PreCondition {
+                                        pid_identity: Some((*pid, *start_sec)),
+                                        ..Default::default()
+                                    };
+                                    crate::engine::mediator::mediate(
+                                        &effect,
+                                        &precondition,
+                                        &crate::engine::mediator::JetsamEffector,
+                                    )
+                                    .map(|_| ())
+                                    .map_err(|error| {
+                                        format!(
+                                            "restore jetsam priority {} for pid {} failed: {:?}",
+                                            priority, pid, error
+                                        )
+                                    })
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        );
+
+                        if !freeze_saga.committed() {
+                            let (failed_step, apply_error) = freeze_saga
+                                .apply_failure()
+                                .map(|(step, error)| (step, error.as_str()))
+                                .unwrap_or((usize::MAX, "invalid saga configuration"));
+                            if let Some((compensation_step, compensation_error)) =
+                                freeze_saga.compensation_failure()
+                            {
+                                if let Some(prior) = captured_priority {
+                                    crate::engine::effect_ledger::record_global(
+                                        crate::engine::effect_ledger::AppliedEffect::JetsamPriority {
+                                            pid: *pid,
+                                            prior,
+                                        },
+                                        std::time::Duration::ZERO,
+                                        *start_sec,
+                                        "freeze-saga: retry jetsam compensation",
+                                    );
+                                }
+                                anyhow::bail!(
+                                    "freeze saga {:?}: step {} failed: {}; compensation step {} failed: {}",
+                                    freeze_saga.state(),
+                                    failed_step,
+                                    apply_error,
+                                    compensation_step,
+                                    compensation_error
+                                );
+                            }
+                            anyhow::bail!(
+                                "freeze saga {:?}: step {} failed: {}",
+                                freeze_saga.state(),
+                                failed_step,
+                                apply_error
                             );
-                            // S10 producer: enroll post-Receipt observation
-                            // when mediator accepted the effect. The recorded
-                            // post-value is the BACKGROUND jetsam priority
-                            // (2 per jetsam_control::priority::BACKGROUND);
-                            // consumer re-reads via
-                            // jetsam_control::get_priority() after the 5 s
-                            // settling window.
-                            if mediate_res.is_ok() {
-                                // Approach-3 wire (2026-06-07): mark this
-                                // observation as targeting a hard-protected
-                                // process so the consumer can accumulate
-                                // hard-protected disagreements into the
-                                // PolicyRollbackGuard trigger window. Brave
-                                // / Chromium / WindowServer fall here —
-                                // matches the "soft-throttle structurally
-                                // ineffective" pathology documented in the
-                                // Approach-3 root-cause analysis.
+                        }
+
+                        action_applied = freeze_saga.applied_step(1);
+                        if action_applied {
+                            // Post-commit advisory: this affects only resume
+                            // behavior and is safe to retry or omit.
+                            if caps.can_taskpolicy {
+                                apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Passive);
+                            }
+                            if freeze_saga.applied_step(0) {
                                 let is_hp = crate::engine::safety::hard_protected_contains(name);
                                 crate::engine::effect_decay::record_global(
                                     crate::engine::effect_decay::PendingObservation {
                                         effect_id: 0,
                                         pid: *pid,
-                                        kind:
-                                            crate::engine::effect_decay::ObsKind::JetsamTier,
+                                        kind: crate::engine::effect_decay::ObsKind::JetsamTier,
                                         key: None,
                                         value_post: crate::engine::jetsam_control::priority::BACKGROUND as i64,
                                         deadline: std::time::Instant::now()
@@ -882,26 +1066,6 @@ pub fn execute_actions(
                                     },
                                 );
                             }
-                        }
-                        // RAM Switch-1 (2026-06-03): route SIGSTOP through typed
-                        // SignalEffector via mediator chokepoint. Identity guard
-                        // (PID, start_sec) prevents A-B-A recycling per Invariant #11.
-                        // mediator counters (blocks/noop_writes) surface failure
-                        // classes that the prior raw `libc::kill` swallowed silently.
-                        let eff = crate::engine::mediator::Effect::SigStop {
-                            pid: *pid,
-                            start_sec: *start_sec,
-                        };
-                        let pre = crate::engine::mediator::PreCondition {
-                            pid_identity: Some((*pid, *start_sec)),
-                            ..Default::default()
-                        };
-                        let mediated = crate::engine::mediator::mediate(
-                            &eff,
-                            &pre,
-                            &crate::engine::mediator::SignalEffector,
-                        );
-                        if mediated.is_ok() {
                             frozen.insert(*pid);
                             out.freezes_applied += 1;
                             out.newly_frozen_pids.push(*pid);
@@ -918,56 +1082,59 @@ pub fn execute_actions(
                         out.throttle_reverted += 1;
                         out.newly_unfrozen_pids.push(*pid);
                     } else {
-                        // A2 fix (round-3): skip zombies — SIGCONT is a no-op on them.
-                        if proc_taskinfo::is_zombie_pid(*pid) {
-                            frozen.remove(pid);
-                            block_reason = Some(BlockReason::Zombie);
-                            return Ok(());
-                        }
-                        let alive = unsafe { libc::kill(*pid as i32, 0) } == 0;
-                        if alive {
-                            let rc = unsafe { libc::kill(*pid as i32, libc::SIGCONT) };
-                            if rc == 0 {
-                                // Restore I/O tier to Standard on unfreeze.
-                                if caps.can_taskpolicy {
-                                    apply_io_tier(
-                                        *pid,
-                                        crate::engine::io_tiering::IOTier::Standard,
-                                    );
-                                    // Warmup boost: temporary Foreground QoS burst accelerates
-                                    // working-set reload from the compressor on resume.
-                                    // Next cycle re-evaluates and may demote back.
-                                    // [Ousterhout 2013 "Scheduling for Reduced Tail Latency" OSDI;
-                                    //  iOS app resume — foreground pulse for fast working-set reload]
-                                    // S4 cutover: short-guard Mutex lock.
-                                    if let Some(arc) = qos_mgr.as_ref() {
-                                        let mut mgr = arc.lock().unwrap_or_else(|e| e.into_inner());
-                                        mgr.set_tier(
-                                            *pid,
-                                            crate::engine::mach_qos::SchedulingTier::Foreground,
-                                        );
-                                        drop(mgr);
-                                    }
-                                }
-                                // A5/D1 fix (round-3): previously we blanket-set
-                                // JetsamClass::Interactive (FOREGROUND=9), which clobbered
-                                // AUDIO (18), AUDIO_AND_ACCESSORY (10), VITAL (12), etc.
-                                // The correct restoration path runs from
-                                // daemon_helpers::unfreeze_pids_verified(), which has
-                                // access to `FrozenEntry::original_jetsam_priority`.  Here
-                                // we leave jetsam priority untouched when we don't know
-                                // the original value.
+                        match fast_unfreezes.remove(pid) {
+                            Some(FastUnfreezeResult::Applied) => {}
+                            Some(FastUnfreezeResult::Stale(reason)) => {
+                                // The frozen entry belongs to a process that exited
+                                // or a prior occupant of this numeric PID. Remove the
+                                // stale ownership without signalling the live process.
                                 frozen.remove(pid);
-                                out.unfreezes_applied += 1;
-                                out.throttle_reverted += 1;
-                                out.newly_unfrozen_pids.push(*pid);
+                                block_reason = Some(reason);
+                                return Ok(());
                             }
-                            // If SIGCONT failed (e.g. permission denied), keep in frozen set
-                            // so the TTL or next cycle can retry.
-                        } else {
-                            // Process is dead — safe to remove from frozen set.
-                            frozen.remove(pid);
+                            Some(FastUnfreezeResult::Failed(error)) => {
+                                anyhow::bail!(
+                                    "verified SIGCONT failed for pid {}: {:?}",
+                                    pid,
+                                    error
+                                )
+                            }
+                            None => {
+                                anyhow::bail!("missing fast-unfreeze receipt for pid {}", pid)
+                            }
                         }
+
+                        action_applied = true;
+                        // Restore I/O tier to Standard on unfreeze.
+                        if caps.can_taskpolicy {
+                            apply_io_tier(*pid, crate::engine::io_tiering::IOTier::Standard);
+                            // Warmup boost: temporary Foreground QoS burst accelerates
+                            // working-set reload from the compressor on resume.
+                            // Next cycle re-evaluates and may demote back.
+                            // [Ousterhout 2013 "Scheduling for Reduced Tail Latency" OSDI;
+                            //  iOS app resume — foreground pulse for fast working-set reload]
+                            // S4 cutover: short-guard Mutex lock.
+                            if let Some(arc) = qos_mgr.as_ref() {
+                                let mut mgr = arc.lock().unwrap_or_else(|e| e.into_inner());
+                                mgr.set_tier(
+                                    *pid,
+                                    crate::engine::mach_qos::SchedulingTier::Foreground,
+                                );
+                                drop(mgr);
+                            }
+                        }
+                        // A5/D1 fix (round-3): previously we blanket-set
+                        // JetsamClass::Interactive (FOREGROUND=9), which clobbered
+                        // AUDIO (18), AUDIO_AND_ACCESSORY (10), VITAL (12), etc.
+                        // The correct restoration path runs from
+                        // daemon_helpers::unfreeze_pids_verified(), which has
+                        // access to `FrozenEntry::original_jetsam_priority`. Here
+                        // we leave jetsam priority untouched when we don't know
+                        // the original value.
+                        frozen.remove(pid);
+                        out.unfreezes_applied += 1;
+                        out.throttle_reverted += 1;
+                        out.newly_unfrozen_pids.push(*pid);
                     }
                 }
                 RootAction::SetSysctl(s) => {
@@ -1026,6 +1193,7 @@ pub fn execute_actions(
                     }
                     if !dry_run {
                         run_sysctl_write(key, value)?;
+                        action_applied = true;
                         after = sysctl_read_with_timeout(key);
                         // S10 producer: enroll post-Receipt observation when
                         // the after-read parsed as i64. Consumer re-reads
@@ -1069,7 +1237,12 @@ pub fn execute_actions(
                         block_reason = Some(BlockReason::ActiveCoalition);
                         return Ok(());
                     }
-                    if !dry_run && caps.can_memorystatus {
+                    if !dry_run && !caps.can_memory_pressure_send {
+                        out.push_skip(format!("memorystatus-send-unsupported:pid={}", *pid));
+                        block_reason = Some(BlockReason::MemorystatusFailed);
+                        return Ok(());
+                    }
+                    if !dry_run {
                         // Guard: never send memory pressure to protected/critical processes.
                         let is_protected = crate::engine::process_identity::proc_name_for_pid(*pid)
                             .map(|name| {
@@ -1101,6 +1274,7 @@ pub fn execute_actions(
                                 *pid as i32,
                             );
                             if ok {
+                                action_applied = true;
                                 out.paging_hints_applied += 1;
                             } else {
                                 out.push_skip(format!("memorystatus-send-failed:pid={}", *pid));
@@ -1111,7 +1285,7 @@ pub fn execute_actions(
                 }
                 RootAction::ToggleSpotlight { enabled, .. } => {
                     if !dry_run && caps.can_mdutil {
-                        spotlight_set_indexing(*enabled);
+                        action_applied = spotlight_set_indexing(*enabled);
                     }
                 }
                 RootAction::QuarantineDaemon { daemon, active, .. } => {
@@ -1135,7 +1309,7 @@ pub fn execute_actions(
                         } else {
                             libc::SIGCONT
                         };
-                        let _ = killall_by_name(daemon, signal);
+                        action_applied = killall_by_name(daemon, signal).is_ok();
                     }
                 }
                 RootAction::SetThreadQoS {
@@ -1211,7 +1385,15 @@ pub fn execute_actions(
                                     *affinity_tag,
                                 );
                                 if ok {
+                                    action_applied = applied > 0;
                                     out.thread_qos_applied += applied as u64;
+                                    if applied > 0 {
+                                        if tier == "background" {
+                                            out.thread_qos_cold_routes += applied as u64;
+                                        } else {
+                                            out.thread_qos_hot_routes += applied as u64;
+                                        }
+                                    }
                                     // FIX-4-v2 (2026-06-07): enrollment
                                     // strictly post-syscall — `ok=true`
                                     // means ThreadPolicyEffector observed
@@ -1286,17 +1468,17 @@ pub fn execute_actions(
             Ok(())
         })();
 
-        // Skip paths set `out.last_skip`; drain it so the journal entry
-        // records success=false with the skip reason (not the original
-        // action reason). Without this, every skipped freeze/throttle logs
-        let success = result.is_ok() && out.last_skip.is_none();
+        // Journal success preserves dry-run simulation semantics. The audit
+        // trace below deliberately uses `action_applied` instead: learning and
+        // cross-cycle suppression require a confirmed system mutation.
+        let success = result.is_ok() && out.last_skip.is_none() && (dry_run || action_applied);
 
         out.audit_traces.push(PolicyDecisionTrace {
             t: Utc::now(),
             cycle: 0, // Filled by caller
             intended_action: action.clone(),
             decision_reason,
-            applied: success,
+            applied: action_applied,
             block_reason,
             pressure: memory_pressure as f32,
             swap_gb: (crate::engine::host_vm_info::get_swap_used_bytes() as f32
@@ -1364,8 +1546,12 @@ pub fn execute_actions(
     // here are logged via eprintln! (diagnostic-only) and never affect the
     // outcomes counters — the kernel already owns the authoritative state.
     if !pending_journal.is_empty() {
-        if let Err(e) = append_journal_batch(journal_path, &pending_journal) {
-            eprintln!("[execute_actions] batched journal append failed: {e}");
+        match append_journal_batch(journal_path, &pending_journal) {
+            Ok(journal_outcome) => {
+                out.journal_rotations += journal_outcome.rotated as u64;
+                out.journal_rotation_failures += journal_outcome.rotation_failed as u64;
+            }
+            Err(e) => eprintln!("[execute_actions] batched journal append failed: {e}"),
         }
     }
 
@@ -1376,13 +1562,85 @@ pub fn execute_actions(
 mod tests {
     use super::*;
     use crate::engine::audit_types::DecisionReason;
+    use std::cell::Cell;
     use std::collections::HashSet;
+
+    #[test]
+    fn freeze_saga_restores_preparation_when_stop_fails() {
+        let restore_called = Cell::new(false);
+        let report = run_freeze_saga(
+            || Ok(true),
+            || Err("stop failed".to_string()),
+            || {
+                restore_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            report.state(),
+            crate::engine::mediator::SagaState::Compensated
+        );
+        assert!(report.applied_step(0));
+        assert!(report.compensated_step(0));
+        assert!(restore_called.get());
+    }
+
+    #[test]
+    fn freeze_saga_commit_never_runs_restore() {
+        let report = run_freeze_saga(
+            || Ok(true),
+            || Ok(()),
+            || -> Result<(), String> { panic!("committed freeze must not restore") },
+        );
+
+        assert!(report.committed());
+        assert!(report.applied_step(0));
+        assert!(report.applied_step(1));
+    }
+
+    #[test]
+    fn freeze_saga_skips_restore_when_preparation_was_a_noop() {
+        let report = run_freeze_saga(
+            || Ok(false),
+            || Err("stop failed".to_string()),
+            || -> Result<(), String> { panic!("no-op preparation has nothing to restore") },
+        );
+
+        assert_eq!(
+            report.state(),
+            crate::engine::mediator::SagaState::Compensated
+        );
+        assert!(!report.applied_step(0));
+        assert!(!report.compensated_step(0));
+    }
+
+    #[test]
+    fn freeze_saga_marks_recovery_when_restore_fails() {
+        let report = run_freeze_saga(
+            || Ok(true),
+            || Err("stop failed".to_string()),
+            || Err("restore failed".to_string()),
+        );
+
+        assert_eq!(
+            report.state(),
+            crate::engine::mediator::SagaState::RecoveryRequired
+        );
+        assert_eq!(
+            report
+                .compensation_failure()
+                .map(|(step, error)| (step, error.as_str())),
+            Some((0, "restore failed"))
+        );
+    }
 
     fn make_caps() -> CapabilityReport {
         CapabilityReport {
             can_taskpolicy: false,
             can_sysctl: false,
             can_memorystatus: false,
+            can_memory_pressure_send: false,
             can_mdutil: false,
             can_tmutil: false,
             is_root: false,
@@ -1423,6 +1681,42 @@ mod tests {
     const GHOST_PID: u32 = 9_999_999;
 
     #[test]
+    fn set_nice_reports_noop_at_existing_priority() {
+        let pid = std::process::id();
+        let current = unsafe {
+            *libc::__error() = 0;
+            libc::getpriority(libc::PRIO_PROCESS, pid)
+        };
+        assert_eq!(
+            set_nice(pid, current).expect("same-priority set must be readable"),
+            None
+        );
+    }
+
+    #[test]
+    fn unsupported_memory_pressure_channel_is_not_counted_as_applied() {
+        let pid = std::process::id();
+        let outcomes = run(
+            vec![RootAction::SetMemorystatus {
+                pid,
+                priority: -1,
+                reason: "test unsupported kernel channel".to_string(),
+                decision_reason: DecisionReason::PressureContext,
+            }],
+            &[],
+            &[],
+        );
+        assert_eq!(outcomes.paging_hints_applied, 0);
+        assert!(
+            outcomes
+                .top_skipped
+                .iter()
+                .any(|reason| reason.starts_with("memorystatus-send-unsupported:")),
+            "unsupported channel must be visible as a blocked action"
+        );
+    }
+
+    #[test]
     fn batched_unfreeze_removes_dead_pids_from_frozen_set() {
         // Regression test for the fast-path unfreeze pre-pass: even with the
         // pre-pass sending SIGCONT first, the main loop must still run and
@@ -1436,6 +1730,8 @@ mod tests {
                 name: format!("ghost-{pid}"),
                 reason: "test".to_string(),
                 decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
             })
             .collect();
         let outcomes = execute_actions(
@@ -1464,6 +1760,58 @@ mod tests {
         assert_eq!(outcomes.failures, 0);
     }
 
+    #[test]
+    fn unfreeze_with_recycled_identity_never_counts_as_applied() {
+        let pid = std::process::id();
+        let identity = ProcessIdentity::from_pid(pid).expect("test process identity");
+        let name = process_identity::proc_name_for_pid(pid).expect("test process name");
+        let journal = std::env::temp_dir().join("apollo-test-unfreeze-pid-recycle.jsonl");
+        let _ = std::fs::remove_file(&journal);
+        let mut frozen = HashSet::from([pid]);
+        let wrong_start = identity.start_sec.saturating_add(1).max(1);
+
+        let outcomes = execute_actions(
+            vec![RootAction::unfreeze_full(
+                pid,
+                name,
+                "recycled identity regression",
+                wrong_start,
+                identity.start_usec,
+                DecisionReason::CriticalBypass,
+            )],
+            &make_caps(),
+            &journal,
+            &mut frozen,
+            &[],
+            &[],
+            None,
+            false,
+            0.0,
+            0.0,
+            None,
+            0.0,
+        );
+
+        assert!(frozen.is_empty(), "stale frozen ownership must be removed");
+        assert_eq!(outcomes.unfreezes_applied, 0);
+        assert_eq!(outcomes.failures, 0);
+        assert!(matches!(
+            outcomes.audit_traces.as_slice(),
+            [PolicyDecisionTrace {
+                applied: false,
+                block_reason: Some(BlockReason::PidRecycled),
+                ..
+            }]
+        ));
+        let entries = crate::engine::journal::read_journal(&journal).expect("read journal");
+        let entry = entries.last().expect("stale unfreeze journal entry");
+        assert!(
+            !entry.success,
+            "blocked thaw must not be journaled as success"
+        );
+        assert!(entry.rationale.is_none());
+    }
+
     /// Phase 5.3 wiring proof (TODO closeout 2026-06-11): a successful action
     /// carried through `execute_actions` must end up journaled WITH a
     /// structured `Rationale` attached at the cycle-wide chokepoint. We use
@@ -1489,6 +1837,8 @@ mod tests {
                 name: "ghost-rationale".to_string(),
                 reason: "pressure=0.81,swap_gb=2.1".to_string(),
                 decision_reason: DecisionReason::CriticalBypass,
+                start_sec: 0,
+                start_usec: 0,
             }],
             &make_caps(),
             &journal,
@@ -1503,6 +1853,10 @@ mod tests {
             0.0,
         );
         assert_eq!(outcomes.failures, 0, "dry-run unfreeze must not fail");
+        assert!(
+            outcomes.audit_traces.iter().all(|trace| !trace.applied),
+            "dry-run journal success must not masquerade as a real mutation"
+        );
 
         let entries = read_journal(&journal).expect("read back journal");
         let entry = entries

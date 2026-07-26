@@ -10,6 +10,7 @@
 //! main loop.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,10 +18,14 @@ use std::time::{Duration, Instant};
 
 use crate::engine::activity_sensor::active_pids;
 use crate::engine::background_collectors::PressureData;
+use crate::engine::daemon_helpers::{
+    unfreeze_pids_outcome, unfreeze_pids_verified_outcome, write_frozen_state,
+};
 use crate::engine::foreground::ForegroundDetector;
 use crate::engine::iokit_sensors::HardwareSnapshot;
 use crate::engine::lock_ext::LockRecover;
 use crate::engine::mach_qos::{MachQoSManager, SchedulingTier};
+use crate::engine::process_identity::ProcessIdentity;
 use crate::engine::types::{FreezeSource, FrozenEntry};
 use chrono::Utc;
 
@@ -389,6 +394,7 @@ pub fn spawn_resource_sentinel(
     config: SentinelConfig,
     fg_detector: Arc<ForegroundDetector>,
     qos_mgr: Option<Arc<Mutex<MachQoSManager>>>,
+    frozen_state_path: PathBuf,
 ) {
     if let Err(e) = thread::Builder::new()
         .name("resource-sentinel".into())
@@ -406,6 +412,7 @@ pub fn spawn_resource_sentinel(
                 config,
                 fg_detector,
                 qos_mgr,
+                frozen_state_path,
             );
         })
     {
@@ -439,6 +446,7 @@ fn sentinel_loop(
     config: SentinelConfig,
     fg_detector: Arc<ForegroundDetector>,
     qos_mgr: Option<Arc<Mutex<MachQoSManager>>>,
+    frozen_state_path: PathBuf,
 ) {
     let mut bufs = SentinelBuffers::new(fg_detector);
     let mut last_escalation = Instant::now() - config.debounce;
@@ -549,11 +557,24 @@ fn sentinel_loop(
                 // Escalation.
                 state.active.store(true, Ordering::Release);
                 state.total_fires.fetch_add(1, Ordering::Relaxed);
-                respond_to_phase(debounced_phase, &state, &main_frozen, &mut bufs, &qos_mgr);
+                respond_to_phase(
+                    debounced_phase,
+                    &state,
+                    &main_frozen,
+                    &frozen_state_path,
+                    &mut bufs,
+                    &qos_mgr,
+                );
             } else {
                 // De-escalation → recovery.
                 if debounced_phase == InterruptPhase::Idle {
-                    recover(&state, &main_frozen, &mut bufs, &qos_mgr);
+                    recover(
+                        &state,
+                        &main_frozen,
+                        &frozen_state_path,
+                        &mut bufs,
+                        &qos_mgr,
+                    );
                     state.active.store(false, Ordering::Release);
                 }
             }
@@ -572,18 +593,34 @@ fn sentinel_loop(
         let fg_pid = bufs.fg_detector.detect().pid();
         if fg_pid != last_fg_pid {
             if let Some(pid) = fg_pid {
-                // Descongelar del frozen principal y del sentinel.
-                if let Ok(mut mf) = main_frozen.try_lock() {
-                    if mf.remove(&pid).is_some() {
-                        unsafe {
-                            libc::kill(pid as i32, libc::SIGCONT);
+                let entry = main_frozen
+                    .try_lock()
+                    .ok()
+                    .and_then(|mf| mf.get(&pid).cloned());
+                let sentinel_owned = state
+                    .interrupt_frozen_pids
+                    .try_lock()
+                    .ok()
+                    .is_some_and(|sf| sf.contains(&pid));
+                if entry.is_some() || sentinel_owned {
+                    let outcome = if let Some(entry) = entry {
+                        unfreeze_pids_verified_outcome(&HashMap::from([(pid, entry)]))
+                    } else {
+                        unfreeze_pids_outcome(std::iter::once(pid))
+                    };
+                    let forgettable: Vec<u32> = outcome.forgettable_pids().collect();
+                    let mut persisted_changed = false;
+                    if let Ok(mut mf) = main_frozen.try_lock() {
+                        for resumed_pid in &forgettable {
+                            persisted_changed |= mf.remove(resumed_pid).is_some();
+                        }
+                        if persisted_changed {
+                            write_frozen_state(&frozen_state_path, &mf);
                         }
                     }
-                }
-                if let Ok(mut sf) = state.interrupt_frozen_pids.lock() {
-                    if sf.remove(&pid) {
-                        unsafe {
-                            libc::kill(pid as i32, libc::SIGCONT);
+                    if let Ok(mut sf) = state.interrupt_frozen_pids.lock() {
+                        for resumed_pid in forgettable {
+                            sf.remove(&resumed_pid);
                         }
                     }
                 }
@@ -660,6 +697,7 @@ fn respond_to_phase(
     phase: InterruptPhase,
     state: &ResourceInterruptState,
     main_frozen: &Arc<Mutex<HashMap<u32, FrozenEntry>>>,
+    frozen_state_path: &Path,
     bufs: &mut SentinelBuffers,
     qos_mgr: &Option<Arc<Mutex<MachQoSManager>>>,
 ) {
@@ -670,13 +708,13 @@ fn respond_to_phase(
         }
         InterruptPhase::Emergency => {
             // SIGSTOP non-critical + E-core migration + memory pressure hint.
-            freeze_non_critical(state, main_frozen, bufs);
+            freeze_non_critical(state, main_frozen, frozen_state_path, bufs);
             migrate_to_ecores(state, main_frozen, bufs, qos_mgr);
             send_memory_pressure_hint();
         }
         InterruptPhase::SuperEmergency => {
             // Everything above + I/O throttle.
-            freeze_non_critical(state, main_frozen, bufs);
+            freeze_non_critical(state, main_frozen, frozen_state_path, bufs);
             migrate_to_ecores(state, main_frozen, bufs, qos_mgr);
             send_memory_pressure_hint();
             enable_io_throttle();
@@ -742,17 +780,19 @@ fn migrate_to_ecores(
         }
         // Phase 2: direct Mach syscall for E-core migration.
         let applied_effect = if let Some(ref mut mgr) = qos_guard {
-            mgr.set_tier(pid_u32, SchedulingTier::Background);
-            crate::engine::effect_ledger::AppliedEffect::MachTier { pid: pid_u32 }
+            mgr.set_tier(pid_u32, SchedulingTier::Background)
+                .mutated
+                .then_some(crate::engine::effect_ledger::AppliedEffect::MachTier { pid: pid_u32 })
         } else {
             // Fallback: PRIO_DARWIN_BG (turnstile-compatible background QoS).
             // Do NOT use PRIO_PROCESS+nice=20 — that breaks the Mach
             // priority-inheritance chain and causes WindowServer IPC hangs.
             const PRIO_DARWIN_BG: libc::c_int = 0x1000;
-            unsafe {
-                libc::setpriority(PRIO_DARWIN_BG, pid_u32, 1);
-            }
-            crate::engine::effect_ledger::AppliedEffect::DarwinBg { pid: pid_u32 }
+            ((unsafe { libc::setpriority(PRIO_DARWIN_BG, pid_u32, 1) }) == 0)
+                .then_some(crate::engine::effect_ledger::AppliedEffect::DarwinBg { pid: pid_u32 })
+        };
+        let Some(applied_effect) = applied_effect else {
+            continue;
         };
         // Anti-ratchet: remember the demotion so recover() can undo it
         // (fast, explicit thermal-clear path).
@@ -779,6 +819,7 @@ fn migrate_to_ecores(
 fn freeze_non_critical(
     state: &ResourceInterruptState,
     main_frozen: &Arc<Mutex<HashMap<u32, FrozenEntry>>>,
+    frozen_state_path: &Path,
     bufs: &SentinelBuffers,
 ) {
     let main_frozen_pids: HashSet<u32> = main_frozen
@@ -862,7 +903,7 @@ fn freeze_non_critical(
     // Avoids PID recycling between the filter snapshot and the actual SIGSTOP.
     // One System refresh is O(N) shared; doing it per-process would be O(N²).
     // [Chen et al. 2002] — TOCTTOU: verify identity before acting on a PID.
-    let mut confirmed_frozen: Vec<u32> = Vec::new();
+    let mut confirmed_frozen: Vec<(u32, String, u64)> = Vec::new();
     if !newly_frozen.is_empty() {
         let verify_sys = sysinfo::System::new_with_specifics(
             sysinfo::RefreshKind::new().with_processes(sysinfo::ProcessRefreshKind::new()),
@@ -887,33 +928,37 @@ fn freeze_non_critical(
             if crate::engine::process_identity::is_apple_platform_process(*pid_u32) {
                 continue;
             }
-            unsafe {
-                libc::kill(*pid_u32 as i32, libc::SIGSTOP);
+            if unsafe { libc::kill(*pid_u32 as i32, libc::SIGSTOP) } == 0 {
+                let start_sec = ProcessIdentity::from_pid(*pid_u32)
+                    .map(|identity| identity.start_sec)
+                    .unwrap_or(0);
+                confirmed_frozen.push((*pid_u32, expected_name.clone(), start_sec));
             }
-            confirmed_frozen.push(*pid_u32);
         }
     }
 
     if !confirmed_frozen.is_empty() {
         if let Ok(mut guard) = state.interrupt_frozen_pids.lock() {
-            for &pid in &confirmed_frozen {
-                guard.insert(pid);
+            for (pid, _, _) in &confirmed_frozen {
+                guard.insert(*pid);
             }
         }
-        // Sync into main_frozen so frozen_state.json captures sentinel freezes.
+        // Sync into the shared WAL and persist before returning from the
+        // emergency response. A daemon crash must not orphan SIGSTOP state.
         {
             let mut mf = main_frozen.lock_recover();
             let now = Utc::now();
-            for pid in &confirmed_frozen {
+            for (pid, name, start_sec) in &confirmed_frozen {
                 mf.entry(*pid).or_insert_with(|| FrozenEntry {
                     frozen_at: now,
                     source: FreezeSource::Sentinel,
                     pressure_at_freeze: 1.0,
-                    process_name: None,
-                    start_sec: 0,
+                    process_name: Some(name.clone()),
+                    start_sec: *start_sec,
                     original_jetsam_priority: None,
                 });
             }
+            write_frozen_state(frozen_state_path, &mf);
         }
     }
 
@@ -955,6 +1000,7 @@ fn disable_io_throttle() {}
 fn recover(
     state: &ResourceInterruptState,
     main_frozen: &Arc<Mutex<HashMap<u32, FrozenEntry>>>,
+    frozen_state_path: &Path,
     _bufs: &mut SentinelBuffers,
     qos_mgr: &Option<Arc<Mutex<MachQoSManager>>>,
 ) {
@@ -970,69 +1016,126 @@ fn recover(
         let migrated: Vec<u32> = state
             .interrupt_migrated_pids
             .lock_recover()
-            .drain()
+            .iter()
+            .copied()
             .collect();
         if !migrated.is_empty() {
             const PRIO_DARWIN_BG: libc::c_int = 0x1000;
             let mut qos_guard = qos_mgr.as_ref().and_then(|m| m.try_lock().ok());
+            let mut resolved = Vec::new();
             for pid in &migrated {
-                // Process may have exited — all calls are no-ops then.
-                if let Some(ref mut mgr) = qos_guard {
-                    mgr.set_tier(*pid, SchedulingTier::Normal);
+                let mach_effect =
+                    crate::engine::effect_ledger::AppliedEffect::MachTier { pid: *pid };
+                let darwin_effect =
+                    crate::engine::effect_ledger::AppliedEffect::DarwinBg { pid: *pid };
+                const OWNER: &str = "thermal: E-core migration";
+                let mach_owned = crate::engine::effect_ledger::is_global_owner(&mach_effect, OWNER);
+                let darwin_owned =
+                    crate::engine::effect_ledger::is_global_owner(&darwin_effect, OWNER);
+
+                let restored = if mach_owned {
+                    qos_guard.as_mut().is_some_and(|mgr| {
+                        let outcome = mgr.set_tier(*pid, SchedulingTier::Normal);
+                        outcome.mutated || mgr.current_tier(*pid) == Some(SchedulingTier::Normal)
+                    })
+                } else if darwin_owned {
+                    (unsafe { libc::setpriority(PRIO_DARWIN_BG, *pid, 0) }) == 0
+                } else {
+                    // The TTL ledger already resolved it, or a newer producer
+                    // owns the same effect kind. Do not undo the newer owner.
+                    true
+                };
+                if !restored {
+                    continue;
                 }
-                unsafe {
-                    libc::setpriority(PRIO_DARWIN_BG, *pid, 0);
+                if mach_owned {
+                    crate::engine::effect_ledger::forget_global_if_justification(
+                        &mach_effect,
+                        OWNER,
+                    );
                 }
-                // EffectLedger phase-2: explicit thermal-clear reverted this
-                // pid — drop its TTL backstop (both possible kinds; forget is a
-                // no-op when absent) so reconcile_global never double-undoes.
-                crate::engine::effect_ledger::forget_global(
-                    &crate::engine::effect_ledger::AppliedEffect::MachTier { pid: *pid },
-                );
-                crate::engine::effect_ledger::forget_global(
-                    &crate::engine::effect_ledger::AppliedEffect::DarwinBg { pid: *pid },
-                );
+                if darwin_owned {
+                    crate::engine::effect_ledger::forget_global_if_justification(
+                        &darwin_effect,
+                        OWNER,
+                    );
+                }
+                resolved.push(*pid);
+            }
+            if !resolved.is_empty() {
+                let mut tracked = state.interrupt_migrated_pids.lock_recover();
+                for pid in &resolved {
+                    tracked.remove(pid);
+                }
             }
             tracing::info!(
-                count = migrated.len(),
+                count = resolved.len(),
+                pending = migrated.len().saturating_sub(resolved.len()),
                 "thermal-recover: restored E-core-migrated processes to normal"
             );
         }
     }
 
-    let pids_to_resume: Vec<u32> = state.interrupt_frozen_pids.lock_recover().drain().collect();
-
-    if pids_to_resume.is_empty() {
-        // Still clean up sentinel entries in main_frozen even if nothing to resume.
-        main_frozen
-            .lock_recover()
-            .retain(|_, entry| entry.source != FreezeSource::Sentinel);
-        return;
-    }
-
-    // Consolidate retain + snapshot into ONE lock acquisition to eliminate TOCTOU.
-    // The original code acquired main_frozen twice: once for retain(), once for the
-    // keys snapshot. Between the two releases the main loop could insert a new
-    // FreezeSource::Apollo entry for a PID we just cleaned, causing the snapshot
-    // to show that PID as "main-loop frozen" and skip SIGCONT — leaving the process
-    // permanently stuck in SIGSTOP with no SIGCONT planned.
-    // [Herlihy & Shavit 2012] — check-then-act on shared state must be atomic.
-    let main_frozen_pids: HashSet<u32> = {
-        let mut mf = main_frozen.lock_recover();
-        mf.retain(|_, entry| entry.source != FreezeSource::Sentinel);
-        mf.keys().copied().collect()
+    let mut tracked: HashSet<u32> = state
+        .interrupt_frozen_pids
+        .lock_recover()
+        .iter()
+        .copied()
+        .collect();
+    let (verified_entries, missing_entries, transferred): (
+        HashMap<u32, FrozenEntry>,
+        Vec<u32>,
+        Vec<u32>,
+    ) = {
+        let mf = main_frozen.lock_recover();
+        tracked.extend(
+            mf.iter()
+                .filter(|(_, entry)| entry.source == FreezeSource::Sentinel)
+                .map(|(pid, _)| *pid),
+        );
+        let mut verified = HashMap::new();
+        let mut missing = Vec::new();
+        let mut transferred = Vec::new();
+        for pid in &tracked {
+            match mf.get(pid) {
+                Some(entry) if entry.source == FreezeSource::Sentinel => {
+                    verified.insert(*pid, entry.clone());
+                }
+                Some(_) => transferred.push(*pid),
+                None => missing.push(*pid),
+            }
+        }
+        (verified, missing, transferred)
     };
 
-    let mut recovered = 0_u64;
-    for pid in pids_to_resume {
-        // Don't SIGCONT if the main loop also froze this PID.
-        if main_frozen_pids.contains(&pid) {
-            continue;
+    let verified_outcome = unfreeze_pids_verified_outcome(&verified_entries);
+    let missing_outcome = unfreeze_pids_outcome(missing_entries.into_iter());
+    let forgettable: HashSet<u32> = verified_outcome
+        .forgettable_pids()
+        .chain(missing_outcome.forgettable_pids())
+        .collect();
+    let recovered = verified_outcome.applied_count() + missing_outcome.applied_count();
+
+    if !forgettable.is_empty() {
+        let mut mf = main_frozen.lock_recover();
+        let mut persisted_changed = false;
+        for pid in &forgettable {
+            if mf
+                .get(pid)
+                .is_some_and(|entry| entry.source == FreezeSource::Sentinel)
+            {
+                persisted_changed |= mf.remove(pid).is_some();
+            }
         }
-        unsafe {
-            libc::kill(pid as i32, libc::SIGCONT);
+        if persisted_changed {
+            write_frozen_state(frozen_state_path, &mf);
         }
-        recovered += 1;
+    }
+    {
+        let mut sentinel_frozen = state.interrupt_frozen_pids.lock_recover();
+        for pid in transferred.iter().chain(forgettable.iter()) {
+            sentinel_frozen.remove(pid);
+        }
     }
 
     state

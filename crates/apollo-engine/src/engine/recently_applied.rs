@@ -58,6 +58,10 @@ use crate::engine::types::RootAction;
 pub struct PersistRecord {
     pub pid: u32,
     pub kind: CachedActionKind,
+    /// Per-kind discriminator. Thread QoS packs thread index + target tier;
+    /// legacy records and every process-wide action deserialize as zero.
+    #[serde(default)]
+    pub discriminator: u32,
     /// Unix wall-clock seconds at write time.
     pub wall_unix_sec: u64,
 }
@@ -97,6 +101,17 @@ pub enum CachedActionKind {
 }
 
 impl CachedActionKind {
+    /// Scope thread QoS by both thread and target tier. A recent background
+    /// demotion must never suppress a later interactive promotion.
+    pub fn thread_qos_discriminator(thread_index: u32, tier: &str) -> u32 {
+        let tier_code = match tier {
+            "interactive" => 3,
+            "background" => 1,
+            _ => 2, // utility/default
+        };
+        (thread_index << 2) | tier_code
+    }
+
     /// Map a `GovernorDecision` to a cache kind.
     /// `Allow` returns None (no action emitted, nothing to cache).
     /// `Kill` maps to Freeze (Apollo's safety downgrade).
@@ -110,22 +125,31 @@ impl CachedActionKind {
 
     /// Map a `RootAction` to its cache kind, if it's a per-PID action.
     /// Non-PID actions (SetSysctl, ToggleSpotlight, QuarantineDaemon) → None.
-    pub fn from_root_action(action: &RootAction) -> Option<(u32, Self)> {
+    pub fn from_root_action(action: &RootAction) -> Option<(u32, Self, u32)> {
         match action {
-            RootAction::ThrottleProcess { pid, .. } => Some((*pid, Self::Throttle)),
-            RootAction::FreezeProcess { pid, .. } => Some((*pid, Self::Freeze)),
-            RootAction::UnfreezeProcess { pid, .. } => Some((*pid, Self::Unfreeze)),
-            RootAction::BoostProcess { pid, .. } => Some((*pid, Self::Boost)),
-            RootAction::SetMemorystatus { pid, .. } => Some((*pid, Self::SetMemorystatus)),
-            RootAction::SetThreadQoS { pid, .. } => Some((*pid, Self::SetThreadQoS)),
+            RootAction::ThrottleProcess { pid, .. } => Some((*pid, Self::Throttle, 0)),
+            RootAction::FreezeProcess { pid, .. } => Some((*pid, Self::Freeze, 0)),
+            RootAction::UnfreezeProcess { pid, .. } => Some((*pid, Self::Unfreeze, 0)),
+            RootAction::BoostProcess { pid, .. } => Some((*pid, Self::Boost, 0)),
+            RootAction::SetMemorystatus { pid, .. } => Some((*pid, Self::SetMemorystatus, 0)),
+            RootAction::SetThreadQoS {
+                pid,
+                thread_index,
+                tier,
+                ..
+            } => Some((
+                *pid,
+                Self::SetThreadQoS,
+                Self::thread_qos_discriminator(*thread_index, tier),
+            )),
             _ => None,
         }
     }
 }
 
-/// Recently-applied decisions per (PID, kind) with TTL.
+/// Recently-applied decisions per (PID, kind, discriminator) with TTL.
 pub struct RecentlyApplied {
-    map: HashMap<(u32, CachedActionKind), Instant>,
+    map: HashMap<(u32, CachedActionKind, u32), Instant>,
     ttl: Duration,
     capacity: usize,
     /// Sprint 13 BUG #6 (2026-05-30) — 2-strike ABA guard. Counts
@@ -165,17 +189,28 @@ impl RecentlyApplied {
     /// Record that `kind` was just applied to `pid`.
     /// Caller invokes this AFTER a successful action emission.
     pub fn record(&mut self, pid: u32, kind: CachedActionKind) {
+        self.record_scoped(pid, kind, 0);
+    }
+
+    /// Record a sub-resource action. Thread QoS passes `thread_index`; all
+    /// process-wide actions use discriminator zero through [`Self::record`].
+    pub fn record_scoped(&mut self, pid: u32, kind: CachedActionKind, discriminator: u32) {
         // Evict oldest if at capacity (cheap O(n) sweep, only when full).
         if self.map.len() >= self.capacity {
             self.evict_oldest();
         }
-        self.map.insert((pid, kind), Instant::now());
+        self.map.insert((pid, kind, discriminator), Instant::now());
     }
 
     /// Returns true if this PID had `kind` applied within the TTL window.
     /// Caller skips emitting when this returns true.
     pub fn is_recent(&self, pid: u32, kind: CachedActionKind) -> bool {
-        match self.map.get(&(pid, kind)) {
+        self.is_recent_scoped(pid, kind, 0)
+    }
+
+    /// Scoped counterpart to [`Self::is_recent`].
+    pub fn is_recent_scoped(&self, pid: u32, kind: CachedActionKind, discriminator: u32) -> bool {
+        match self.map.get(&(pid, kind, discriminator)) {
             Some(t) => t.elapsed() <= self.ttl,
             None => false,
         }
@@ -213,7 +248,7 @@ impl RecentlyApplied {
 
     /// Forget entries for a specific PID — used when PID dies or is recycled.
     pub fn invalidate_pid(&mut self, pid: u32) {
-        self.map.retain(|(p, _), _| *p != pid);
+        self.map.retain(|(p, _, _), _| *p != pid);
     }
 
     /// Forget entries whose PID is absent from the authoritative live snapshot.
@@ -230,7 +265,7 @@ impl RecentlyApplied {
     /// recently-emitted action. PID returning to live resets the strike.
     pub fn invalidate_dead_pids(&mut self, live_pids: &HashSet<u32>) -> usize {
         // Compute set of PIDs referenced by the cache.
-        let cached_pids: HashSet<u32> = self.map.keys().map(|(pid, _)| *pid).collect();
+        let cached_pids: HashSet<u32> = self.map.keys().map(|(pid, _, _)| *pid).collect();
 
         // Update strike counters: bump for absent, reset for live.
         for pid in &cached_pids {
@@ -250,7 +285,7 @@ impl RecentlyApplied {
         // Evict only entries whose PID has reached the strike threshold.
         let before = self.map.len();
         let strikes = &self.absence_strikes;
-        self.map.retain(|(pid, _), _| {
+        self.map.retain(|(pid, _, _), _| {
             strikes
                 .get(pid)
                 .map(|s| *s < MIN_ABSENCE_STRIKES)
@@ -290,12 +325,13 @@ impl RecentlyApplied {
         let now_instant = Instant::now();
         self.map
             .iter()
-            .map(|((pid, kind), instant)| {
+            .map(|((pid, kind, discriminator), instant)| {
                 // Map Instant elapsed → wall-clock seconds ago.
                 let age_secs = now_instant.duration_since(*instant).as_secs();
                 PersistRecord {
                     pid: *pid,
                     kind: *kind,
+                    discriminator: *discriminator,
                     wall_unix_sec: now_unix.saturating_sub(age_secs),
                 }
             })
@@ -326,7 +362,8 @@ impl RecentlyApplied {
             let entry_instant = now_instant
                 .checked_sub(std::time::Duration::from_secs(age))
                 .unwrap_or(now_instant);
-            self.map.insert((r.pid, r.kind), entry_instant);
+            self.map
+                .insert((r.pid, r.kind, r.discriminator), entry_instant);
             restored += 1;
         }
         restored
@@ -552,7 +589,7 @@ mod tests {
         };
         assert_eq!(
             CachedActionKind::from_root_action(&throttle),
-            Some((100, CachedActionKind::Throttle))
+            Some((100, CachedActionKind::Throttle, 0))
         );
 
         let setmem = RootAction::SetMemorystatus {
@@ -563,7 +600,7 @@ mod tests {
         };
         assert_eq!(
             CachedActionKind::from_root_action(&setmem),
-            Some((200, CachedActionKind::SetMemorystatus))
+            Some((200, CachedActionKind::SetMemorystatus, 0))
         );
 
         // Non-PID action → None.
@@ -573,6 +610,37 @@ mod tests {
             decision_reason: DecisionReason::PressureContext,
         };
         assert_eq!(CachedActionKind::from_root_action(&toggle), None);
+    }
+
+    #[test]
+    fn thread_qos_cache_is_scoped_per_thread() {
+        let mut cache = RecentlyApplied::new();
+        cache.record_scoped(700, CachedActionKind::SetThreadQoS, 3);
+
+        assert!(cache.is_recent_scoped(700, CachedActionKind::SetThreadQoS, 3));
+        assert!(!cache.is_recent_scoped(700, CachedActionKind::SetThreadQoS, 4));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn thread_qos_discriminator_includes_target_tier() {
+        let interactive = CachedActionKind::thread_qos_discriminator(3, "interactive");
+        let utility = CachedActionKind::thread_qos_discriminator(3, "utility");
+        let background = CachedActionKind::thread_qos_discriminator(3, "background");
+        assert_ne!(interactive, utility);
+        assert_ne!(interactive, background);
+        assert_ne!(utility, background);
+        assert_ne!(
+            interactive,
+            CachedActionKind::thread_qos_discriminator(4, "interactive")
+        );
+    }
+
+    #[test]
+    fn legacy_persist_record_defaults_discriminator_to_zero() {
+        let json = r#"{"pid":42,"kind":"SetThreadQoS","wall_unix_sec":1}"#;
+        let record: PersistRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.discriminator, 0);
     }
 
     #[test]
@@ -639,6 +707,7 @@ mod tests {
         let records = vec![PersistRecord {
             pid: 123,
             kind: CachedActionKind::Throttle,
+            discriminator: 0,
             wall_unix_sec: stale_unix,
         }];
         fs::write(path, serde_json::to_string(&records).unwrap()).unwrap();
@@ -669,11 +738,13 @@ mod tests {
             PersistRecord {
                 pid: 1,
                 kind: CachedActionKind::Throttle,
+                discriminator: 0,
                 wall_unix_sec: now_unix - 10,
             }, // fresh
             PersistRecord {
                 pid: 2,
                 kind: CachedActionKind::Throttle,
+                discriminator: 0,
                 wall_unix_sec: now_unix - 60,
             }, // stale
         ];

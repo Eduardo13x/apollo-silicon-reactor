@@ -16,8 +16,12 @@
 //! [NotebookLM peer review — 2026-04-22]
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use apollo_engine::engine::chromium_manager::{ChromiumAction, ChromiumManager};
+use apollo_engine::engine::daemon_helpers::{
+    apply_reversible_background_jetsam, write_frozen_state, ReversibleJetsamOutcome,
+};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::fluidity::FluidityState;
 use apollo_engine::engine::focus_markov::FocusMarkov;
@@ -66,6 +70,7 @@ pub fn run_chromium_tick(
     foreground_pid: Option<u32>,
     proc_snaps: &[ProcessSnapshot],
     state: &SharedState,
+    frozen_state_path: &Path,
     win_workload_intent: WorkloadIntent,
     arousal_state: &ArousalState,
     fluidity_state: &FluidityState,
@@ -213,18 +218,6 @@ pub fn run_chromium_tick(
         &main_frozen_set,
     );
 
-    // Metrics always populated — renderer count visible even with freeze off.
-    // [Jones 2011] observability must not be gated behind actuation flags.
-    {
-        let cm = chromium_mgr.metrics();
-        let mut m = state.metrics.lock_recover();
-        m.metrics.chromium_renderers_total = cm.total_renderers;
-        m.metrics.chromium_renderers_frozen = cm.frozen_renderers;
-        m.metrics.chromium_renderers_ecore = cm.ecore_renderers;
-        m.metrics.chromium_freed_mb = cm.estimated_freed_mb;
-        m.metrics.chromium_browsers_managed = cm.browsers_managed;
-    }
-
     // Call/media safety (2026-06-18): E-core demotion moves a Chromium renderer
     // onto the slow efficiency cores. Meet's GPU / audio / WebRTC helper
     // processes have no window, so the visibility gate reads them as
@@ -274,6 +267,35 @@ pub fn run_chromium_tick(
                 let pre = apollo_engine::engine::mediator::PreCondition::default();
                 let _ = apollo_engine::engine::mediator::mediate(&eff, &pre, &effector);
             }
+            ChromiumAction::DemoteJetsam { pid, name } => {
+                const OWNER: &str = "chromium visible background: jetsam BACKGROUND";
+                const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+                match apply_reversible_background_jetsam(*pid, Some(name), TTL, OWNER) {
+                    Ok(ReversibleJetsamOutcome::Applied) => {
+                        state
+                            .metrics
+                            .lock_recover()
+                            .metrics
+                            .chromium_jetsam_demotions_total += 1;
+                        tracing::debug!(
+                            pid,
+                            name = name.as_str(),
+                            "chromium: temporary reversible Jetsam demotion applied"
+                        );
+                    }
+                    Ok(
+                        ReversibleJetsamOutcome::Refreshed
+                        | ReversibleJetsamOutcome::Unchanged
+                        | ReversibleJetsamOutcome::Stale,
+                    ) => {}
+                    Err(error) => tracing::debug!(
+                        pid,
+                        name = name.as_str(),
+                        error = error.as_str(),
+                        "chromium: reversible Jetsam demotion skipped"
+                    ),
+                }
+            }
             ChromiumAction::PurgePurgeable { pid, name } => {
                 // RAM Switch-5 (2026-06-03): route through PurgeableEffector
                 // via mediator chokepoint. The effector internally walks
@@ -308,6 +330,7 @@ pub fn run_chromium_tick(
         }
     }
 
+    let mut frozen_state_changed = false;
     if !chromium_freeze_disabled {
         for action in &chromium_actions {
             match action {
@@ -328,16 +351,19 @@ pub fn run_chromium_tick(
                     chromium_mgr.confirm_freeze(*pid, ok);
                     if ok {
                         let mut fs = state.frozen_state.lock_recover();
-                        fs.entry(*pid).or_insert(FrozenEntry {
-                            frozen_at: chrono::Utc::now(),
-                            source: FreezeSource::ChromiumManager,
-                            pressure_at_freeze: memory_pressure_at_freeze,
-                            process_name: Some(name.clone()),
-                            start_sec: ProcessIdentity::from_pid(*pid)
-                                .map(|pi| pi.start_sec)
-                                .unwrap_or(0),
-                            original_jetsam_priority: None,
-                        });
+                        if let std::collections::hash_map::Entry::Vacant(slot) = fs.entry(*pid) {
+                            slot.insert(FrozenEntry {
+                                frozen_at: chrono::Utc::now(),
+                                source: FreezeSource::ChromiumManager,
+                                pressure_at_freeze: memory_pressure_at_freeze,
+                                process_name: Some(name.clone()),
+                                start_sec: ProcessIdentity::from_pid(*pid)
+                                    .map(|pi| pi.start_sec)
+                                    .unwrap_or(0),
+                                original_jetsam_priority: None,
+                            });
+                            frozen_state_changed = true;
+                        }
                     }
                 }
                 ChromiumAction::ThawRenderer { pid, name } => {
@@ -346,37 +372,61 @@ pub fn run_chromium_tick(
                         name = name.as_str(),
                         "chromium: thawing renderer (became active)"
                     );
-                    ChromiumManager::thaw_renderer(*pid);
-                    // Restore Mach scheduling to Normal (P-cores) so renderer resumes fast.
-                    // Switch-4b (2026-06-03): route through MachPolicyEffector.
-                    let mach_effector = apollo_engine::engine::mediator::MachPolicyEffector::new(
-                        state.mach_qos.clone(),
-                    );
-                    let mach_eff = apollo_engine::engine::mediator::Effect::SetMachPolicy {
-                        pid: *pid,
-                        start_sec: 0,
-                        policy: apollo_engine::engine::mediator::MachPolicyKind::Default,
-                    };
-                    let _ = apollo_engine::engine::mediator::mediate(
-                        &mach_eff,
-                        &apollo_engine::engine::mediator::PreCondition::default(),
-                        &mach_effector,
-                    );
-                    state.frozen_state.lock_recover().remove(pid);
-                    // NARS belief update: observe whether renderer survived freeze.
-                    // [Pei Wang 2013] Revision rule accumulates evidence over time.
-                    let alive = proc_snaps.iter().any(|p| p.pid == *pid);
-                    chromium_mgr.observe_freeze_outcome(
-                        name.as_str(),
-                        alive,
-                        if alive { 0.3 } else { 0.8 },
-                    );
+                    let ok = ChromiumManager::thaw_renderer(*pid);
+                    chromium_mgr.confirm_thaw(*pid, ok);
+                    if ok {
+                        // Restore Mach scheduling to Normal (P-cores) so renderer resumes fast.
+                        // Switch-4b (2026-06-03): route through MachPolicyEffector.
+                        let mach_effector =
+                            apollo_engine::engine::mediator::MachPolicyEffector::new(
+                                state.mach_qos.clone(),
+                            );
+                        let mach_eff = apollo_engine::engine::mediator::Effect::SetMachPolicy {
+                            pid: *pid,
+                            start_sec: 0,
+                            policy: apollo_engine::engine::mediator::MachPolicyKind::Default,
+                        };
+                        let _ = apollo_engine::engine::mediator::mediate(
+                            &mach_eff,
+                            &apollo_engine::engine::mediator::PreCondition::default(),
+                            &mach_effector,
+                        );
+                        frozen_state_changed |=
+                            state.frozen_state.lock_recover().remove(pid).is_some();
+                        // NARS belief update: observe whether renderer survived freeze.
+                        // [Pei Wang 2013] Revision rule accumulates evidence over time.
+                        let alive = proc_snaps.iter().any(|p| p.pid == *pid);
+                        chromium_mgr.observe_freeze_outcome(
+                            name.as_str(),
+                            alive,
+                            if alive { 0.3 } else { 0.8 },
+                        );
+                    }
                 }
-                ChromiumAction::DemoteToEcores { .. } | ChromiumAction::PurgePurgeable { .. } => {
+                ChromiumAction::DemoteToEcores { .. }
+                | ChromiumAction::DemoteJetsam { .. }
+                | ChromiumAction::PurgePurgeable { .. } => {
                     // Already handled in the unconditional block above.
                 }
             }
         }
+    }
+
+    if frozen_state_changed {
+        let frozen_state = state.frozen_state.lock_recover();
+        write_frozen_state(frozen_state_path, &frozen_state);
+    }
+
+    // Publish after syscall confirmation so telemetry never exposes the
+    // optimistic pre-actuation state from ChromiumManager::update().
+    {
+        let cm = chromium_mgr.metrics();
+        let mut m = state.metrics.lock_recover();
+        m.metrics.chromium_renderers_total = cm.total_renderers;
+        m.metrics.chromium_renderers_frozen = cm.frozen_renderers;
+        m.metrics.chromium_renderers_ecore = cm.ecore_renderers;
+        m.metrics.chromium_freed_mb = cm.estimated_freed_mb;
+        m.metrics.chromium_browsers_managed = cm.browsers_managed;
     }
 }
 

@@ -10,9 +10,9 @@
 //!    a 5-minute rolling window means upstream paths are emitting duplicate
 //!    actions. The Phase 1 chokepoint catches them, but the *signal* says
 //!    a new emission path was added without per-PID dedup awareness.
-//! 2. **Refresh duration regression** — `lf_metrics.refresh_duration_us`
-//!    median > 30ms in Normal pressure zone means staggered cadence is
-//!    degrading (cache miss, code change defeating the staggering, etc.).
+//! 2. **Refresh duration regression** — median duration of cycles that really
+//!    refreshed the process census exceeds a hardware-adaptive baseline in
+//!    Normal pressure (cache miss, cadence regression, etc.).
 //! 3. **Reactor weight saturation time** — placeholder (Phase 4 deferred);
 //!    when stress test infrastructure is added, time-to-saturation > 15s
 //!    will trigger a "weights too damped" alert.
@@ -52,7 +52,10 @@ struct CycleObservation {
     dedup_drops_throttle: u64,
     dedup_drops_freeze: u64,
     dedup_drops_unfreeze: u64,
+    dedup_drops_boost: u64,
+    dedup_drops_thread_qos: u64,
     refresh_duration_us: u64,
+    process_refresh_performed: bool,
     /// Coarse pressure zone discrimination via memory_pressure value.
     /// Avoids depending on `MemoryBudgetState::current_zone` which would
     /// pull in daemon binary types into a library module.
@@ -65,6 +68,8 @@ impl CycleObservation {
             + self.dedup_drops_throttle
             + self.dedup_drops_freeze
             + self.dedup_drops_unfreeze
+            + self.dedup_drops_boost
+            + self.dedup_drops_thread_qos
     }
 }
 
@@ -98,6 +103,10 @@ pub struct SelfDiagnosis {
     last_alert_at: std::collections::HashMap<&'static str, Instant>,
     cooldown: Duration,
     persist_path: PathBuf,
+    /// Startup baseline from the first real process-refresh samples. It stays
+    /// fixed for the session so a gradual regression cannot teach the detector
+    /// to accept its own slowdown.
+    refresh_baseline_us: Option<u64>,
 }
 
 impl SelfDiagnosis {
@@ -112,6 +121,7 @@ impl SelfDiagnosis {
             last_alert_at: std::collections::HashMap::new(),
             cooldown: Duration::from_secs(300),
             persist_path,
+            refresh_baseline_us: None,
         }
     }
 
@@ -123,7 +133,10 @@ impl SelfDiagnosis {
         dedup_drops_throttle: u64,
         dedup_drops_freeze: u64,
         dedup_drops_unfreeze: u64,
+        dedup_drops_boost: u64,
+        dedup_drops_thread_qos: u64,
         refresh_duration_us: u64,
+        process_refresh_performed: bool,
         memory_pressure: f64,
     ) {
         if self.window.len() >= self.window_capacity {
@@ -135,7 +148,10 @@ impl SelfDiagnosis {
             dedup_drops_throttle,
             dedup_drops_freeze,
             dedup_drops_unfreeze,
+            dedup_drops_boost,
+            dedup_drops_thread_qos,
             refresh_duration_us,
+            process_refresh_performed,
             in_normal_zone: memory_pressure < 0.65,
         });
     }
@@ -170,6 +186,8 @@ impl SelfDiagnosis {
             .sum();
         let freeze_drops: u64 = self.window.iter().map(|o| o.dedup_drops_freeze).sum();
         let unfreeze_drops: u64 = self.window.iter().map(|o| o.dedup_drops_unfreeze).sum();
+        let boost_drops: u64 = self.window.iter().map(|o| o.dedup_drops_boost).sum();
+        let thread_qos_drops: u64 = self.window.iter().map(|o| o.dedup_drops_thread_qos).sum();
         let n = self.window.len() as f64;
         let avg_drops_per_cycle = total_drops as f64 / n;
 
@@ -180,42 +198,56 @@ impl SelfDiagnosis {
                 kind: "dedup_regression".to_string(),
                 severity: DiagnosisSeverity::Medium,
                 summary: format!(
-                    "dedup chokepoint dropping {:.2}/cycle (throttle={:.2}, setmem={:.2}, freeze={:.2}, unfreeze={:.2}; window={} cycles, threshold=3.0)",
+                    "dedup chokepoint dropping {:.2}/cycle (throttle={:.2}, setmem={:.2}, freeze={:.2}, unfreeze={:.2}, boost={:.2}, thread_qos={:.2}; window={} cycles, threshold=3.0)",
                     avg_drops_per_cycle,
                     throttle_drops as f64 / n,
                     setmem_drops as f64 / n,
                     freeze_drops as f64 / n,
                     unfreeze_drops as f64 / n,
+                    boost_drops as f64 / n,
+                    thread_qos_drops as f64 / n,
                     self.window.len()
                 ),
-                recommended_action: "audit emission paths for the dominant kind: ThrottleProcess most often = process_enrichment + decide_actions heuristic-pass producing parallel decisions for same PID; SetMemorystatus = daemon_paging_hints + main.rs deep-scan + daemon_agent_actions; Freeze = process_enrichment GovernorDecision::Freeze + Kill→Freeze downgrade".to_string(),
+                recommended_action: "audit emission paths for the dominant kind: ThrottleProcess most often = process_enrichment + decide_actions; SetMemorystatus = paging/deep-scan/agent; Freeze = GovernorDecision downgrade; Boost = focus/ML/display; ThreadQoS = thread analyzer identity or cadence regression".to_string(),
             });
         }
 
         // ── Signal 2: refresh_duration regression in Normal zone ─────────────
         // Foundation commit added staggered refresh (Normal=8c, Elev=4c, Crit=1c).
-        // Median refresh in Normal should be ≤30ms (measured 20-29ms post-deploy).
-        // If median climbs > 30ms in Normal, staggering is degrading.
+        // Only process-refresh cycles belong in this distribution. Including the
+        // seven cached cycles made the old median nearly zero and masked even a
+        // catastrophic census regression.
         let normal_samples: Vec<u64> = self
             .window
             .iter()
-            .filter(|o| o.in_normal_zone)
+            .filter(|o| o.in_normal_zone && o.process_refresh_performed)
             .map(|o| o.refresh_duration_us)
             .collect();
 
-        if normal_samples.len() >= 30 {
-            let mut sorted = normal_samples.clone();
-            sorted.sort_unstable();
-            let median_us = sorted[sorted.len() / 2];
-            if median_us > 30_000 && self.cooldown_ok("sysinfo_regression", now) {
+        const BASELINE_SAMPLES: usize = 12;
+        const ADAPTIVE_FLOOR_US: u64 = 15_000;
+        const LEGACY_M1_CEILING_US: u64 = 30_000;
+        if normal_samples.len() >= BASELINE_SAMPLES {
+            let baseline_us = *self
+                .refresh_baseline_us
+                .get_or_insert_with(|| median(&normal_samples[..BASELINE_SAMPLES]));
+            let recent_start = normal_samples.len().saturating_sub(BASELINE_SAMPLES);
+            let median_us = median(&normal_samples[recent_start..]);
+            let threshold_us = baseline_us
+                .saturating_mul(2)
+                .max(ADAPTIVE_FLOOR_US)
+                .min(LEGACY_M1_CEILING_US);
+            if median_us > threshold_us && self.cooldown_ok("sysinfo_regression", now) {
                 self.last_alert_at.insert("sysinfo_regression", now);
                 alerts.push(DiagnosisAlert {
                     at: Utc::now(),
                     kind: "sysinfo_regression".to_string(),
                     severity: DiagnosisSeverity::Medium,
                     summary: format!(
-                        "sysinfo refresh median in Normal zone = {:.1}ms (target ≤30ms; staggered cadence likely defeated); n={}",
+                        "process refresh median in Normal zone = {:.1}ms (baseline={:.1}ms, threshold={:.1}ms); n={}",
                         median_us as f64 / 1000.0,
+                        baseline_us as f64 / 1000.0,
+                        threshold_us as f64 / 1000.0,
                         normal_samples.len()
                     ),
                     recommended_action: "verify collect_snapshot_light is being called when use_light=true (main.rs:1505 area); sample lf_metrics.refresh_duration_us by zone with /tmp/measure_phase2.sh".to_string(),
@@ -257,6 +289,12 @@ impl SelfDiagnosis {
     }
 }
 
+fn median(samples: &[u64]) -> u64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,7 +315,7 @@ mod tests {
         let mut sd = SelfDiagnosis::new(temp_path());
         for _ in 0..30 {
             // throttle=10 well above threshold but below cycle quorum.
-            sd.record_cycle(0, 10, 0, 0, 50_000, 0.5);
+            sd.record_cycle(0, 10, 0, 0, 0, 0, 50_000, true, 0.5);
         }
         let alerts = sd.check();
         assert!(alerts.is_empty(), "below window-min threshold");
@@ -288,7 +326,7 @@ mod tests {
         let mut sd = SelfDiagnosis::new(temp_path());
         // 100 cycles each with 4 throttle drops = 4.0/cycle (above 3.0 threshold).
         for _ in 0..100 {
-            sd.record_cycle(0, 4, 0, 0, 10_000, 0.5);
+            sd.record_cycle(0, 4, 0, 0, 0, 0, 10_000, true, 0.5);
         }
         let alerts = sd.check();
         assert_eq!(alerts.len(), 1);
@@ -302,12 +340,27 @@ mod tests {
     }
 
     #[test]
+    fn thread_qos_dedup_regression_is_visible() {
+        let mut sd = SelfDiagnosis::new(temp_path());
+        for _ in 0..100 {
+            sd.record_cycle(0, 0, 0, 0, 0, 4, 10_000, true, 0.5);
+        }
+
+        let alerts = sd.check();
+        let alert = alerts
+            .iter()
+            .find(|alert| alert.kind == "dedup_regression")
+            .expect("thread QoS drops must participate in diagnosis");
+        assert!(alert.summary.contains("thread_qos=4.00"));
+    }
+
+    #[test]
     fn dedup_drops_steady_state_no_alert() {
         let mut sd = SelfDiagnosis::new(temp_path());
         // 100 cycles each with 2 throttle drops = 2.0/cycle (steady state, below 3.0).
         // Mirrors prod baseline ~7.6/cycle but well below regression threshold.
         for _ in 0..100 {
-            sd.record_cycle(0, 2, 0, 0, 10_000, 0.5);
+            sd.record_cycle(0, 2, 0, 0, 0, 0, 10_000, true, 0.5);
         }
         let alerts = sd.check();
         assert!(
@@ -320,7 +373,7 @@ mod tests {
     fn dedup_drops_zero_emits_no_alert() {
         let mut sd = SelfDiagnosis::new(temp_path());
         for _ in 0..100 {
-            sd.record_cycle(0, 0, 0, 0, 10_000, 0.5);
+            sd.record_cycle(0, 0, 0, 0, 0, 0, 10_000, true, 0.5);
         }
         let alerts = sd.check();
         assert!(alerts.iter().all(|a| a.kind != "dedup_regression"));
@@ -330,7 +383,7 @@ mod tests {
     fn cooldown_suppresses_repeated_alerts() {
         let mut sd = SelfDiagnosis::new(temp_path());
         for _ in 0..100 {
-            sd.record_cycle(0, 4, 0, 0, 10_000, 0.5);
+            sd.record_cycle(0, 4, 0, 0, 0, 0, 10_000, true, 0.5);
         }
         let first = sd.check();
         assert_eq!(first.len(), 1);
@@ -344,7 +397,7 @@ mod tests {
         let mut sd = SelfDiagnosis::new(temp_path());
         // 100 cycles in Normal zone with refresh 50ms — above 30ms threshold.
         for _ in 0..100 {
-            sd.record_cycle(0, 0, 0, 0, 50_000, 0.5);
+            sd.record_cycle(0, 0, 0, 0, 0, 0, 50_000, true, 0.5);
         }
         let alerts = sd.check();
         assert!(alerts.iter().any(|a| a.kind == "sysinfo_regression"));
@@ -356,7 +409,7 @@ mod tests {
         // 100 cycles in Elevated zone with refresh 50ms — should NOT alert
         // (only Normal zone has the staggered-refresh expectation).
         for _ in 0..100 {
-            sd.record_cycle(0, 0, 0, 0, 50_000, 0.70);
+            sd.record_cycle(0, 0, 0, 0, 0, 0, 50_000, true, 0.70);
         }
         let alerts = sd.check();
         assert!(
@@ -366,10 +419,46 @@ mod tests {
     }
 
     #[test]
+    fn staggered_light_cycles_cannot_mask_process_refresh_regression() {
+        let mut sd = SelfDiagnosis::new(temp_path());
+        for cycle in 0..480 {
+            let refreshed = cycle % 8 == 0;
+            let duration_us = if refreshed { 50_000 } else { 100 };
+            sd.record_cycle(0, 0, 0, 0, 0, 0, duration_us, refreshed, 0.5);
+        }
+
+        let alerts = sd.check();
+        assert!(alerts.iter().any(|a| a.kind == "sysinfo_regression"));
+    }
+
+    #[test]
+    fn adaptive_refresh_threshold_catches_m4_regression_below_30ms() {
+        let mut sd = SelfDiagnosis::new(temp_path());
+        for sample in 0..24 {
+            for light in 0..8 {
+                let refreshed = light == 0;
+                let duration_us = if refreshed {
+                    if sample < 12 {
+                        8_000
+                    } else {
+                        20_000
+                    }
+                } else {
+                    100
+                };
+                sd.record_cycle(0, 0, 0, 0, 0, 0, duration_us, refreshed, 0.5);
+            }
+        }
+
+        let alerts = sd.check();
+        assert!(alerts.iter().any(|a| a.kind == "sysinfo_regression"));
+    }
+
+    #[test]
     fn rolling_window_bounded() {
         let mut sd = SelfDiagnosis::new(temp_path());
         for _ in 0..1000 {
-            sd.record_cycle(0, 0, 0, 0, 10_000, 0.5);
+            sd.record_cycle(0, 0, 0, 0, 0, 0, 10_000, true, 0.5);
         }
         assert!(sd.window.len() <= sd.window_capacity);
     }

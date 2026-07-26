@@ -140,6 +140,10 @@ pub struct SystemCollector {
     /// [Bhatt 2009 "Reducing overhead of application tracing"] — recompute
     /// only when source data has changed.
     cached_top_processes: Vec<ProcessStats>,
+    /// Whether the most recent snapshot call refreshed the process census.
+    /// Consumers must not infer this from duration because light and full
+    /// refresh timings overlap across Apple Silicon generations.
+    last_process_refresh_performed: bool,
 }
 
 #[allow(clippy::new_without_default, dead_code)]
@@ -165,7 +169,12 @@ impl SystemCollector {
             light_call_count: 0,
             compressor_ema: 0.0,
             cached_top_processes: Vec::with_capacity(10),
+            last_process_refresh_performed: false,
         }
+    }
+
+    pub fn last_process_refresh_performed(&self) -> bool {
+        self.last_process_refresh_performed
     }
 
     /// Rebuild the top_processes cache from current sysinfo state.
@@ -183,12 +192,16 @@ impl SystemCollector {
                 cpu_wall_ratio: None,
             })
             .collect();
-        processes.sort_by(|a, b| {
+        let by_cpu = |a: &ProcessStats, b: &ProcessStats| {
             b.cpu_usage
                 .partial_cmp(&a.cpu_usage)
                 .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        processes.truncate(10);
+        };
+        if processes.len() > 10 {
+            processes.select_nth_unstable_by(10, by_cpu);
+            processes.truncate(10);
+        }
+        processes.sort_by(by_cpu);
         self.cached_top_processes = processes;
     }
 
@@ -223,6 +236,7 @@ impl SystemCollector {
             self.sys.refresh_processes_specifics(proc_refresh_kind());
             true
         };
+        self.last_process_refresh_performed = refreshed_processes;
 
         // CPU
         let global_cpu = self.sys.global_cpu_info().cpu_usage();
@@ -349,6 +363,7 @@ impl SystemCollector {
         } else {
             false
         };
+        self.last_process_refresh_performed = refreshed_processes;
         self.light_call_count = self.light_call_count.wrapping_add(1);
 
         let refresh_duration = start.elapsed();
@@ -451,6 +466,7 @@ impl SystemCollector {
         self.sys.refresh_cpu();
         self.sys.refresh_memory();
         // Intentionally no refresh_processes() — reuse cached list.
+        self.last_process_refresh_performed = false;
 
         let global_cpu = self.sys.global_cpu_info().cpu_usage();
         let core_count = self.sys.cpus().len();
@@ -918,6 +934,21 @@ mod tests {
         assert_eq!(collector.light_call_count, 1);
         let _ = collector.collect_snapshot_light(0.5);
         assert_eq!(collector.light_call_count, 2);
+    }
+
+    #[test]
+    fn collector_reports_whether_process_refresh_ran() {
+        let mut collector = SystemCollector::new();
+        assert!(!collector.last_process_refresh_performed());
+
+        let _ = collector.collect_snapshot_light(0.5);
+        assert!(collector.last_process_refresh_performed());
+
+        let _ = collector.collect_snapshot_light(0.5);
+        assert!(!collector.last_process_refresh_performed());
+
+        let _ = collector.collect_snapshot_no_process_refresh();
+        assert!(!collector.last_process_refresh_performed());
     }
 
     #[test]

@@ -3,9 +3,9 @@
 //! When a user runs Ollama, llama.cpp, MLX, LM Studio, or similar, the system
 //! needs a fundamentally different resource allocation strategy:
 //!
-//! 1. **Dedicate P-Cores**: The inference process is the highest-value compute
-//!    on the system — route its threads to Firestorm cores, push everything
-//!    else to Icestorm.
+//! 1. **Prefer P-Cores**: The inference process is the highest-value compute
+//!    on the system. Express that intent through Mach QoS while macOS retains
+//!    final P/E-core placement authority.
 //! 2. **Maximize unified memory headroom**: LLM weights can be 4–8 GB on an
 //!    8 GB M1. File cache, inactive pages, and compressed memory all compete
 //!    for the same pool. Aggressive reclaim during inference is critical.
@@ -17,10 +17,10 @@
 //!
 //! # Detection strategy
 //!
-//! We detect by process name (exact + prefix) since inference servers tend to
-//! have stable names.  A `python`/`python3` process is only considered if it
-//! has been consuming ≥15% CPU for multiple cycles (avoids false positives from
-//! short-lived scripts).
+//! We detect confirmed inference by process name (exact + prefix) since servers
+//! tend to have stable names. A generic `python`/`python3` process can receive a
+//! short QoS preference after sustained CPU, but never activates the global LLM
+//! pressure/App-Nap mode without a stronger identity signal.
 //!
 //! # References
 //!
@@ -58,8 +58,8 @@ const LLM_PREFIX_NAMES: &[&str] = &[
     "mlx_",    // Apple MLX variants
 ];
 
-/// Minimum sustained CPU% for python/python3 to count as LLM inference.
-const PYTHON_LLM_CPU_THRESHOLD: f32 = 15.0;
+/// Minimum sustained CPU% for python/python3 to receive a local QoS preference.
+const PYTHON_ML_QOS_CPU_THRESHOLD: f32 = 50.0;
 
 /// Number of consecutive cycles python must exceed the threshold.
 const PYTHON_SUSTAINED_CYCLES: u32 = 3;
@@ -99,6 +99,9 @@ pub struct LlmInferenceDetector {
     cooldown: Duration,
     /// When the last LLM process was seen.
     last_seen: Option<Instant>,
+    /// Process positively observed in the current cycle. Unlike `active`, this
+    /// is cleared during the cooldown so callers never steer a stale PID.
+    observed_primary: Option<LlmProcess>,
 }
 
 impl LlmInferenceDetector {
@@ -108,6 +111,7 @@ impl LlmInferenceDetector {
             active: None,
             cooldown: Duration::from_secs(30),
             last_seen: None,
+            observed_primary: None,
         }
     }
 
@@ -120,15 +124,24 @@ impl LlmInferenceDetector {
         processes: impl Iterator<Item = (u32, &'a str, f32)>,
     ) -> Option<&LlmInferenceState> {
         let mut best: Option<LlmProcess> = None;
-        let mut python_high = false;
+        let mut hottest_python: Option<LlmProcess> = None;
 
         for (pid, name, cpu) in processes {
             let is_llm = Self::is_llm_by_name(name);
 
             // Python heuristic: sustained high CPU.
             let is_python = name == "python" || name == "python3" || name.starts_with("python3.");
-            if is_python && cpu >= PYTHON_LLM_CPU_THRESHOLD {
-                python_high = true;
+            if is_python && cpu >= PYTHON_ML_QOS_CPU_THRESHOLD {
+                if hottest_python
+                    .as_ref()
+                    .is_none_or(|current| cpu > current.cpu_usage)
+                {
+                    hottest_python = Some(LlmProcess {
+                        pid,
+                        name: name.to_string(),
+                        cpu_usage: cpu,
+                    });
+                }
             }
 
             if is_llm {
@@ -153,16 +166,15 @@ impl LlmInferenceDetector {
         }
 
         // Python sustained-CPU heuristic.
-        if python_high {
+        if hottest_python.is_some() {
             self.python_high_cycles = self.python_high_cycles.saturating_add(1);
         } else {
             self.python_high_cycles = 0;
         }
-        if self.python_high_cycles >= PYTHON_SUSTAINED_CYCLES && best.is_none() {
-            // No named LLM process but python has been hot — treat as LLM.
-            // We don't have the PID here anymore, so skip this cycle for python.
-            // (python with PID is tracked in the next pass if needed)
-        }
+        let python_qos_candidate = (self.python_high_cycles >= PYTHON_SUSTAINED_CYCLES)
+            .then_some(hottest_python)
+            .flatten();
+        self.observed_primary = best.clone().or(python_qos_candidate);
 
         // Update state.
         if let Some(proc) = best {
@@ -210,6 +222,13 @@ impl LlmInferenceDetector {
             .as_ref()
             .map(|s| s.pressure_boost)
             .unwrap_or(0.0)
+    }
+
+    /// Current-cycle inference process. This deliberately excludes the
+    /// detector's cooldown-only state so kernel actuation never follows a PID
+    /// that has disappeared or been recycled.
+    pub fn observed_primary(&self) -> Option<&LlmProcess> {
+        self.observed_primary.as_ref()
     }
 
     fn is_llm_by_name(name: &str) -> bool {
@@ -274,6 +293,37 @@ mod tests {
         let procs = vec![(100u32, "python3", 0.5f32)];
         let state = d.observe(procs.iter().map(|(p, n, c)| (*p, *n, *c)));
         assert!(state.is_none());
+    }
+
+    #[test]
+    fn sustained_hot_python_selects_qos_target_without_global_llm_mode() {
+        let mut d = LlmInferenceDetector::new();
+        for _ in 0..(PYTHON_SUSTAINED_CYCLES - 1) {
+            let state = d.observe(std::iter::once((7331, "python3", 75.0)));
+            assert!(state.is_none());
+            assert!(d.observed_primary().is_none());
+        }
+
+        let state = d.observe(std::iter::once((7331, "python3", 75.0)));
+        assert!(
+            state.is_none(),
+            "generic Python must not trigger global LLM mode"
+        );
+        assert_eq!(d.observed_primary().map(|p| p.pid), Some(7331));
+    }
+
+    #[test]
+    fn cooldown_state_does_not_expose_a_stale_primary_for_actuation() {
+        let mut d = LlmInferenceDetector::new();
+        d.observe(std::iter::once((4444, "ollama", 30.0)));
+        assert_eq!(d.observed_primary().map(|p| p.pid), Some(4444));
+
+        d.observe(std::iter::empty());
+        assert!(d.is_active(), "cooldown keeps the behavioral mode active");
+        assert!(
+            d.observed_primary().is_none(),
+            "cooldown must not keep a kernel-actuation target"
+        );
     }
 
     #[test]

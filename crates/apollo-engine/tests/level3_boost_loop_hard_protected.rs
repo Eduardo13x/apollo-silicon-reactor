@@ -643,6 +643,7 @@ fn no_caps_taskpolicy_off() -> CapabilityReport {
         can_taskpolicy: false,
         can_sysctl: false,
         can_memorystatus: false,
+        can_memory_pressure_send: false,
         can_mdutil: false,
         can_tmutil: false,
         is_root: false,
@@ -907,23 +908,24 @@ fn test_boost_enrollment_skipped_when_caps_missing() {
         pre_detected, post_detected
     );
 
-    // 3) The Boost still "applies" from the accounting perspective —
-    //    boosts_applied bumps unconditionally at execute_actions.rs:499,
-    //    before the phantom guard. This pins the architecture: the
-    //    phantom guard does NOT block the action; it blocks the
-    //    enrollment side-effect. Drift here would mean the guard moved
-    //    too far up and we accidentally vetoed boosts on no-caps hosts.
+    // 3) No effector mutated state: taskpolicy is unavailable and an
+    //    unprivileged test process cannot lower a child's nice value to -10.
+    //    Accounting and audit must reflect the real outcome instead of the
+    //    old unconditional "applied" claim.
     assert_eq!(
         outcomes.boosts_applied,
-        1,
-        "boost must still account-as-applied (the guard blocks ONLY the \
-         PendingObservation enrollment, not the action itself); \
+        0,
+        "boost must not account as applied when every effector failed or was unavailable; \
          block_reasons={:?}",
         outcomes
             .audit_traces
             .iter()
             .map(|t| t.block_reason.clone())
             .collect::<Vec<_>>()
+    );
+    assert!(
+        outcomes.audit_traces.iter().all(|trace| !trace.applied),
+        "audit must not turn a no-mutation boost into learning evidence"
     );
 
     // 4) Global watchdog MachPolicy ring length unchanged — no

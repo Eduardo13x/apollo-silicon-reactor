@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use apollo_engine::engine::daemon_helpers::{
-    should_rotate_oldest, should_unfreeze, unfreeze_pids, write_frozen_state,
+    should_rotate_oldest, should_unfreeze, unfreeze_pids_outcome, write_frozen_state,
 };
 use apollo_engine::engine::daemon_state::{MetricsState, SharedState};
 use apollo_engine::engine::fluidity::FluidityState;
@@ -73,11 +73,12 @@ pub fn run_ttl_unfreeze_sweep(
         }
     }
     if !expired.is_empty() {
-        let count = unfreeze_pids(expired.iter().copied());
-        for pid in &expired {
-            frozen_state.remove(pid);
+        let outcome = unfreeze_pids_outcome(expired.iter().copied());
+        for pid in outcome.forgettable_pids() {
+            frozen_state.remove(&pid);
         }
         write_frozen_state(frozen_state_path, &frozen_state);
+        let count = outcome.applied_count();
         metrics.metrics.post_wake_defensive_unfreezes += count;
         metrics.metrics.unfreezes_applied += count;
         metrics.metrics.throttle_reverted += count;

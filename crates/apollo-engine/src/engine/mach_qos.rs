@@ -55,12 +55,10 @@ pub mod mach_sys {
     pub const THREAD_LATENCY_QOS_POLICY_COUNT: u32 = 1;
     pub const THREAD_THROUGHPUT_QOS_POLICY_COUNT: u32 = 1;
 
-    // Thread affinity (P/E cluster routing on Apple Silicon).
-    // Threads with the same nonzero affinity_tag are clustered together;
-    // tag=0 means "no preference". macOS treats this as a hint, not a hard binding.
-    // Convention used in Apollo:
-    //   AFFINITY_TAG_P_CLUSTER (1) — latency-sensitive, route to Firestorm/Avalanche.
-    //   AFFINITY_TAG_E_CLUSTER (2) — battery/throughput, route to Icestorm/Blizzard.
+    // Thread affinity groups. Equal nonzero tags ask XNU to co-locate related
+    // threads for cache locality; numeric values do NOT name P/E clusters.
+    // QoS latency/throughput tiers are the supported heterogeneous-scheduler
+    // signal. Keep the old aliases for persisted action compatibility only.
     pub const THREAD_AFFINITY_POLICY: i32 = 4;
     pub const THREAD_AFFINITY_POLICY_COUNT: u32 = 1;
     pub const AFFINITY_TAG_NONE: u32 = 0;
@@ -188,7 +186,6 @@ mod ffi {
 
     /// thread_time_constraint_policy for real-time UI thread scheduling.
     /// COUNT = 4 (4 × uint32_t).
-    #[repr(C)]
     #[repr(C)]
     pub struct ThreadExtendedPolicy {
         pub timeshare: u32, // boolean_t
@@ -861,24 +858,19 @@ impl MachQoSManager {
         false
     }
 
-    /// Hint a thread's preferred cluster (P-core or E-core) on Apple Silicon.
+    /// Assign a thread to a scheduler affinity group on Apple Silicon.
     ///
     /// Uses THREAD_AFFINITY_POLICY which the macOS scheduler treats as a hint.
-    /// `tag` should be one of `mach_sys::AFFINITY_TAG_P_CLUSTER`,
-    /// `AFFINITY_TAG_E_CLUSTER`, or `AFFINITY_TAG_NONE`. Threads sharing the
-    /// same nonzero tag are coalesced onto the same cluster best-effort.
+    /// Threads sharing the same nonzero tag may be coalesced for cache
+    /// locality. A tag does not request a performance or efficiency core.
     ///
     /// Returns true on successful policy application; false if the thread or
     /// process is unavailable (e.g., PID died mid-call). On non-macOS targets
     /// this is a no-op that returns false.
     ///
-    /// **Downstream wiring**: callers should consume `p_core_count` /
-    /// `e_core_count` from `CapabilityReport` to skip affinity hints when the
-    /// hardware lacks heterogeneous clusters (i.e., return early if either
-    /// count is None or 0).
-    ///
-    /// [ARM big.LITTLE 2013 §3] thread-level affinity hints reduce migration
-    /// cost when threads cooperate on shared data within a cluster.
+    /// Producers should normally prefer `set_thread_qos`; affinity is useful
+    /// only when they can prove that a set of cooperating threads should share
+    /// cache locality.
     #[cfg(target_os = "macos")]
     pub fn set_thread_affinity_tag(&self, pid: u32, thread_idx: u32, tag: u32) -> bool {
         if self.permanently_blocked.contains(&pid) {
@@ -1775,14 +1767,14 @@ mod tests {
         assert_eq!(mach_sys::THREAD_AFFINITY_POLICY, 4);
         assert_eq!(mach_sys::THREAD_AFFINITY_POLICY_COUNT, 1);
         assert_eq!(mach_sys::AFFINITY_TAG_NONE, 0);
-        // Convention: nonzero tags map to clusters; semantics enforced by Apollo,
-        // not the kernel (kernel only requires "same tag = same cluster" hint).
+        // Legacy aliases remain distinct for persisted-action compatibility.
+        // They are affinity groups, not hardware P/E cluster identifiers.
         assert_ne!(mach_sys::AFFINITY_TAG_P_CLUSTER, 0);
         assert_ne!(mach_sys::AFFINITY_TAG_E_CLUSTER, 0);
         assert_ne!(
             mach_sys::AFFINITY_TAG_P_CLUSTER,
             mach_sys::AFFINITY_TAG_E_CLUSTER,
-            "P and E cluster tags must differ"
+            "legacy affinity aliases must remain distinct"
         );
     }
 

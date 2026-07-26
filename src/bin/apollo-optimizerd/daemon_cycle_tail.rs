@@ -32,13 +32,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use apollo_engine::collector::{SystemCollector, SystemSnapshot};
+use apollo_engine::engine::build_tracker::BuildPhase;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::fluidity::FluidityState;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lse_counters::CycleStage;
-// Switch-4b: SchedulingTier no longer needed — mediator::MachPolicyKind drives dispatch
+use apollo_engine::engine::mach_qos::{LatencyTier, SchedulingTier, ThroughputTier};
 use apollo_engine::engine::overflow_guard::OverflowThresholds;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
 use apollo_engine::engine::pipeline::periodic_stage::{
@@ -49,54 +51,255 @@ use apollo_engine::engine::thermal_bailout::ThermalAction;
 
 use crate::cognitive_tick::{CognitiveDecision, CognitiveState};
 
-/// Elevate the foreground app to Foreground (P-Core) tier when a
-/// window operation or app launch is in progress.
-///
-/// Skipped during thermal emergency (`force_ecores = true`) — the
-/// P-cluster is already parked for survival.
-///
-/// Pre-conditions:
-/// - `fluidity_state` has been updated this cycle.
-/// - `thermal_action` has been evaluated this cycle.
-///
-/// Post-conditions:
-/// - `state.mach_qos` may have one new Foreground-tier entry.
-///
-/// [Apple QoS Programming Guide 2014] user-interactive QoS =
-/// render-frame priority on P-Cores (Firestorm).
-pub fn apply_fluidity_qos(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionReason {
+    Input,
+    WindowOperation,
+    BuildStart,
+    AppLaunch,
+}
+
+impl InteractionReason {
+    fn ttl(self) -> Duration {
+        match self {
+            Self::Input => Duration::from_millis(1_600),
+            Self::WindowOperation => Duration::from_millis(1_200),
+            Self::BuildStart => Duration::from_secs(3),
+            Self::AppLaunch => Duration::from_secs(5),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::WindowOperation => "window",
+            Self::BuildStart => "build_start",
+            Self::AppLaunch => "app_launch",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ActiveInteractionLease {
+    pid: u32,
+    prior_tier: SchedulingTier,
+    expires_at: Instant,
+    reason: InteractionReason,
+    tier_mutated: bool,
+    task_qos_mutated: bool,
+}
+
+/// Short-lived QoS ownership for direct user interaction. Keeping the input
+/// history in the controller lets us detect HID idle-time resets without an
+/// additional IOKit query.
+#[derive(Debug, Default)]
+pub struct InteractionQoSController {
+    active: Option<ActiveInteractionLease>,
+    last_idle_secs: Option<f64>,
+    build_was_active: bool,
+}
+
+impl InteractionQoSController {
+    fn select_reason(
+        &mut self,
+        fluidity_state: &FluidityState,
+        build_phase: BuildPhase,
+        idle_secs: f64,
+    ) -> Option<InteractionReason> {
+        let input_reset = self
+            .last_idle_secs
+            .is_some_and(|previous| idle_secs + 0.05 < previous && idle_secs <= 2.5);
+        self.last_idle_secs = idle_secs.is_finite().then_some(idle_secs.max(0.0));
+
+        let build_active = build_phase != BuildPhase::Idle;
+        let build_started = build_active && !self.build_was_active;
+        self.build_was_active = build_active;
+
+        if fluidity_state.app_launching() {
+            Some(InteractionReason::AppLaunch)
+        } else if fluidity_state.window_op_active() {
+            Some(InteractionReason::WindowOperation)
+        } else if build_started {
+            Some(InteractionReason::BuildStart)
+        } else if input_reset {
+            Some(InteractionReason::Input)
+        } else {
+            None
+        }
+    }
+}
+
+/// Apply a bounded user-interaction QoS lease and restore the previous tier as
+/// soon as its signal expires. QoS is a scheduler hint on Apple Silicon; it is
+/// deliberately not described as physical P/E-core affinity.
+pub fn update_interaction_qos(
     state: &SharedState,
+    controller: &mut InteractionQoSController,
     fluidity_state: &FluidityState,
     thermal_action: &ThermalAction,
     foreground_pid: Option<u32>,
+    build_phase: BuildPhase,
+    idle_secs: f64,
 ) {
-    if (fluidity_state.window_op_active() || fluidity_state.app_launching())
-        && !thermal_action.force_ecores
-    {
-        if let Some(fg_pid) = foreground_pid {
-            // Switch-4b (2026-06-03): route through MachPolicyEffector.
-            let mach_effector =
-                apollo_engine::engine::mediator::MachPolicyEffector::new(state.mach_qos.clone());
-            let mach_eff = apollo_engine::engine::mediator::Effect::SetMachPolicy {
-                pid: fg_pid,
-                start_sec: 0,
-                policy: apollo_engine::engine::mediator::MachPolicyKind::UserInteractive,
-            };
-            if apollo_engine::engine::mediator::mediate(
-                &mach_eff,
-                &apollo_engine::engine::mediator::PreCondition::default(),
-                &mach_effector,
-            )
-            .is_ok()
-            {
-                tracing::debug!(
-                    pid = fg_pid,
-                    window_op = fluidity_state.window_op_active(),
-                    launching = fluidity_state.launch_active,
-                    "fluidity: elevated foreground to P-Core (Foreground QoS)"
-                );
+    let now = Instant::now();
+    let reason = controller.select_reason(fluidity_state, build_phase, idle_secs);
+    let target_pid = if matches!(reason, Some(InteractionReason::AppLaunch)) {
+        fluidity_state.launch_pid.or(foreground_pid)
+    } else {
+        foreground_pid
+    };
+
+    let must_release = thermal_action.force_ecores
+        || controller.active.as_ref().is_some_and(|lease| {
+            now >= lease.expires_at || target_pid.is_some_and(|pid| pid != lease.pid)
+        });
+    if must_release {
+        release_interaction_qos(controller, state);
+    }
+
+    if thermal_action.force_ecores {
+        return;
+    }
+
+    if let (Some(reason), Some(pid)) = (reason, target_pid) {
+        if let Some(active) = controller.active.as_mut() {
+            if active.pid == pid {
+                active.expires_at = now + reason.ttl();
+                active.reason = reason;
+                let mut metrics = state.metrics.lock_recover();
+                metrics.metrics.interaction_qos_reason = reason.as_str().to_string();
+                return;
             }
         }
+
+        let mut qos = state.mach_qos.lock_recover();
+        let prior_tier = qos.current_tier(pid).unwrap_or(SchedulingTier::Normal);
+        let tier_mutated = qos.set_tier(pid, SchedulingTier::Foreground).mutated;
+        let task_qos_mutated = qos
+            .set_latency_and_throughput(pid, LatencyTier::Interactive, ThroughputTier::High)
+            .mutated;
+        drop(qos);
+
+        if tier_mutated || task_qos_mutated {
+            controller.active = Some(ActiveInteractionLease {
+                pid,
+                prior_tier,
+                expires_at: now + reason.ttl(),
+                reason,
+                tier_mutated,
+                task_qos_mutated,
+            });
+            let mut metrics = state.metrics.lock_recover();
+            metrics.metrics.interaction_qos_activations = metrics
+                .metrics
+                .interaction_qos_activations
+                .saturating_add(1);
+            metrics.metrics.interaction_qos_active = true;
+            metrics.metrics.interaction_qos_reason = reason.as_str().to_string();
+            tracing::debug!(
+                pid,
+                reason = reason.as_str(),
+                "interaction QoS lease acquired"
+            );
+        }
+    }
+}
+
+pub fn release_interaction_qos(controller: &mut InteractionQoSController, state: &SharedState) {
+    let Some(lease) = controller.active.take() else {
+        return;
+    };
+    let mut qos = state.mach_qos.lock_recover();
+    if lease.tier_mutated {
+        qos.set_tier(lease.pid, lease.prior_tier);
+    }
+    if lease.task_qos_mutated {
+        qos.set_latency_and_throughput(lease.pid, LatencyTier::Default, ThroughputTier::Default);
+    }
+    drop(qos);
+
+    let mut metrics = state.metrics.lock_recover();
+    metrics.metrics.interaction_qos_reverts =
+        metrics.metrics.interaction_qos_reverts.saturating_add(1);
+    metrics.metrics.interaction_qos_active = false;
+    metrics.metrics.interaction_qos_reason.clear();
+    tracing::debug!(
+        pid = lease.pid,
+        reason = lease.reason.as_str(),
+        "interaction QoS lease released"
+    );
+}
+
+#[cfg(test)]
+mod interaction_qos_tests {
+    use super::*;
+
+    #[test]
+    fn hid_reset_emits_one_short_input_signal() {
+        let fluidity = FluidityState::new();
+        let mut controller = InteractionQoSController::default();
+
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Idle, 8.0),
+            None
+        );
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Idle, 0.2),
+            Some(InteractionReason::Input)
+        );
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Idle, 0.5),
+            None
+        );
+    }
+
+    #[test]
+    fn build_only_signals_on_starting_edge() {
+        let fluidity = FluidityState::new();
+        let mut controller = InteractionQoSController::default();
+
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Starting, 0.0),
+            Some(InteractionReason::BuildStart)
+        );
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Active, 0.1),
+            None
+        );
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Finishing, 0.2),
+            None
+        );
+    }
+
+    #[test]
+    fn launch_has_priority_over_window_and_input() {
+        let mut fluidity = FluidityState::new();
+        let mut controller = InteractionQoSController::default();
+        controller.select_reason(&fluidity, BuildPhase::Idle, 9.0);
+        fluidity.windowserver_cpu_spike = true;
+        fluidity.launch_active = true;
+
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Starting, 0.0),
+            Some(InteractionReason::AppLaunch)
+        );
+    }
+
+    #[test]
+    fn invalid_idle_sample_does_not_poison_reset_detection() {
+        let fluidity = FluidityState::new();
+        let mut controller = InteractionQoSController::default();
+        controller.select_reason(&fluidity, BuildPhase::Idle, 7.0);
+
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Idle, f64::NAN),
+            None
+        );
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Idle, 0.0),
+            None
+        );
     }
 }
 
@@ -201,6 +404,11 @@ fn sum_frozen_ram_mb<V>(frozen_pids: &HashMap<u32, V>, sys: &sysinfo::System) ->
         .max(0.0)
 }
 
+#[inline]
+fn ns_to_ceil_us(ns: u64) -> u64 {
+    ns.div_ceil(1_000)
+}
+
 /// Wire enriched telemetry + UCHS neurocognitive metrics into
 /// `RuntimeMetrics` under a single `state.metrics` lock guard.
 ///
@@ -265,37 +473,23 @@ pub fn wire_enriched_telemetry(
     // commits a381c6b..1ab6bdb is actually firing in production.
     m.metrics.guard_overprotection = inputs.cognitive_state.epistemic.guard_overprotection;
     m.metrics.active_coalitions_count = inputs.active_coalitions_count;
-    // Phase 0 lock-decomp baseline (2026-05-10). Average over all
-    // record_metrics_lock() observations since daemon start; max is
-    // monotonic. If avg_wait << avg_held in steady state, the metrics
-    // god-lock is held-time-bound not contention-bound, so
-    // lock-decomposition would shift the bottleneck rather than eliminate it.
+    // Phase 0 lock-decomp baseline (2026-05-10). Average and max use the
+    // same publish window; mixing a lifetime average with an interval max
+    // can produce avg > max and misdiagnose contention.
     let lf = inputs.lf_metrics;
-    let wc = lf
-        .metrics_lock_wait_count
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let ws = lf
-        .metrics_lock_wait_total_ns
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let hc = lf
-        .metrics_lock_held_count
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let hs = lf
-        .metrics_lock_held_total_ns
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let (wm, hm) = lf.drain_metrics_lock_max_ns();
+    let ((wc, ws, wm), (hc, hs, hm)) = lf.drain_metrics_lock_window_ns();
     m.metrics.metrics_lock_wait_avg_us = if wc > 0 {
         (ws as f64 / wc as f64) / 1000.0
     } else {
         0.0
     };
-    m.metrics.metrics_lock_wait_max_us = wm / 1000;
+    m.metrics.metrics_lock_wait_max_us = ns_to_ceil_us(wm);
     m.metrics.metrics_lock_held_avg_us = if hc > 0 {
         (hs as f64 / hc as f64) / 1000.0
     } else {
         0.0
     };
-    m.metrics.metrics_lock_held_max_us = hm / 1000;
+    m.metrics.metrics_lock_held_max_us = ns_to_ceil_us(hm);
     // Phase 0b stage split.
     //
     // Windowed avg + windowed max — both drained per publish so producer
@@ -604,9 +798,17 @@ pub fn drain_effect_decay(
 
 #[cfg(test)]
 mod tests {
-    use super::sum_frozen_ram_mb;
+    use super::{ns_to_ceil_us, sum_frozen_ram_mb};
     use std::collections::HashMap;
     use sysinfo::System;
+
+    #[test]
+    fn lock_max_rounds_sub_microsecond_samples_up() {
+        assert_eq!(ns_to_ceil_us(0), 0);
+        assert_eq!(ns_to_ceil_us(1), 1);
+        assert_eq!(ns_to_ceil_us(1_000), 1);
+        assert_eq!(ns_to_ceil_us(1_001), 2);
+    }
 
     /// Bit-equivalence + edge cases for the Lock-Scope-Minimization
     /// refactor. The pure core (`sum_frozen_ram_mb`) is testable without

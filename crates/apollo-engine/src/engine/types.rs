@@ -289,6 +289,9 @@ pub struct CapabilityReport {
     pub can_taskpolicy: bool,
     pub can_sysctl: bool,
     pub can_memorystatus: bool,
+    /// Whether the legacy per-PID memory-pressure sysctl exists on this kernel.
+    #[serde(default)]
+    pub can_memory_pressure_send: bool,
     pub can_mdutil: bool,
     pub can_tmutil: bool,
     pub is_root: bool,
@@ -602,6 +605,10 @@ pub struct RuntimeMetrics {
     pub heuristic_throttles: u64,
     pub heuristic_freezes: u64,
     pub heuristic_kills_downgraded: u64,
+    /// Apple platform PIDs short-circuited before AdaptiveGovernor action
+    /// scoring. These would be rejected by SIP at dispatch time.
+    #[serde(default)]
+    pub heuristic_apple_platform_protected: u64,
     pub zombies_detected: u64,
     #[serde(default)]
     pub kills_applied: u64,
@@ -645,12 +652,30 @@ pub struct RuntimeMetrics {
     pub qos_foreground_count: u64,
     pub qos_background_count: u64,
     pub qos_errors: u64,
+    /// Direct user-interaction QoS leases. These counters make it possible to
+    /// verify that boosts both activate and return to their prior tier.
+    #[serde(default)]
+    pub interaction_qos_activations: u64,
+    #[serde(default)]
+    pub interaction_qos_reverts: u64,
+    #[serde(default)]
+    pub interaction_qos_active: bool,
+    #[serde(default)]
+    pub interaction_qos_reason: String,
     pub iokit_snapshots: u64,
     pub iokit_errors: u64,
     pub iokit_p_cluster_temp: Option<f32>,
     pub iokit_e_cluster_temp: Option<f32>,
     pub iokit_package_watts: Option<f32>,
     pub current_workload: String,
+    /// Hardware-local phase timing. This starts fresh on each daemon launch so
+    /// imported M1 state cannot bias M4 duration estimates.
+    #[serde(default)]
+    pub workload_phase: String,
+    #[serde(default)]
+    pub workload_phase_expected_duration_secs: f64,
+    #[serde(default)]
+    pub workload_phase_duration_observations: u64,
     #[serde(default)]
     pub ml_confidence: f32, // 0.0–1.0; 0.0 until first classification
     #[serde(default)]
@@ -699,7 +724,8 @@ pub struct RuntimeMetrics {
     pub sysctl_governor_active_tunings: usize,
     #[serde(default)]
     pub sysctl_governor_total_writes: u64,
-    // Network monitor metrics
+    // Network monitor metrics. The compatibility field name says "ratio",
+    // but its unit is retransmissions per 1,000 TCP segments.
     #[serde(default)]
     pub network_retransmit_ratio: f64,
     #[serde(default)]
@@ -725,9 +751,15 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub collector_smc_alive: bool,
     #[serde(default)]
+    pub parallel_runtime_enabled: bool,
+    #[serde(default)]
+    pub parallel_worker_threads: usize,
+    #[serde(default)]
     pub invalid_sysctl_value_denied: u64,
     #[serde(default)]
     pub journal_rotations: u64,
+    #[serde(default)]
+    pub journal_rotation_failures: u64,
     // 2026-05-14: removed dead security counters (symlink_attacks_blocked,
     // policy_patterns_rejected, request_size_exceeded) — declared but no
     // writer in production code. `serde(default)` makes runtime_metrics.json
@@ -751,7 +783,13 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub predictive_agent_arm_pulls: [u64; 5],
     #[serde(default)]
+    pub predictive_agent_arm_avg_rewards: [f64; 5],
+    #[serde(default)]
     pub predictive_agent_last_intervention: String,
+    #[serde(default)]
+    pub predictive_agent_pending_outcomes: usize,
+    #[serde(default)]
+    pub predictive_agent_resolved_outcomes: u64,
     // Signal intelligence metrics
     #[serde(default)]
     pub si_pressure_smooth: f64,
@@ -759,6 +797,8 @@ pub struct RuntimeMetrics {
     pub si_pressure_velocity: f64,
     #[serde(default)]
     pub si_p_oom_30s: f64,
+    #[serde(default)]
+    pub si_p_jank_60s: f64,
     #[serde(default)]
     pub si_urgency: f64,
     #[serde(default)]
@@ -831,6 +871,23 @@ pub struct RuntimeMetrics {
     pub actions_pushed_raw_total: u64,
     #[serde(default)]
     pub actions_rejected_shape_total: u64,
+    /// Final dispatch prefilter telemetry. These counters sit immediately
+    /// before action budgeting so rejected Apple/protected/stale candidates
+    /// cannot consume the minute budget and starve executable work.
+    #[serde(default)]
+    pub dispatch_prefilter_input_total: u64,
+    #[serde(default)]
+    pub dispatch_prefilter_recent_drops: u64,
+    #[serde(default)]
+    pub dispatch_prefilter_apple_drops: u64,
+    #[serde(default)]
+    pub dispatch_prefilter_protected_drops: u64,
+    #[serde(default)]
+    pub dispatch_prefilter_identity_drops: u64,
+    #[serde(default)]
+    pub dispatch_prefilter_unsupported_drops: u64,
+    #[serde(default)]
+    pub dispatch_prefilter_survivors_total: u64,
     /// Lotka-Volterra Jacobian stability class: 0=Degenerate 1=StableNode 2=StableSpiral 3=UnstableSaddle 4=Unstable
     #[serde(default)]
     pub si_stability_regime: u8,
@@ -879,10 +936,11 @@ pub struct RuntimeMetrics {
     pub smc_diagnostic: String,
     // KPC hardware performance counters
     #[serde(default)]
+    pub kpc_available: bool,
+    #[serde(default)]
     pub kpc_ipc: f64,
-    /// Fraction of CPU cycles stalled on memory (0.0=compute-bound, 1.0=memory-stalled).
-    /// Derived from KPC IPC vs Apple M1 P-core peak IPC (~5.0).
-    /// >0.7 = system >70% memory-bound → freeze decisions are lower risk.
+    /// Heuristic memory-bound proxy derived from achieved IPC.
+    /// This is not a hardware stall counter and remains telemetry-only.
     #[serde(default)]
     pub kpc_memory_bound_score: f64,
     /// Top 3 wakeup vampire processes: "name(rate/s)" strings.
@@ -1033,6 +1091,12 @@ pub struct RuntimeMetrics {
     /// High values mean actions are accumulating faster than they are executed.
     #[serde(default)]
     pub action_queue_backpressure: f64,
+    /// Non-urgent actions rejected because the bounded action queue was full.
+    #[serde(default)]
+    pub action_queue_capacity_drops: u64,
+    /// Background actions displaced to admit higher-priority normal work.
+    #[serde(default)]
+    pub action_queue_background_evictions: u64,
     /// Pending unresolved outcome observations in OutcomeTracker [0, 300].
     /// High depth = throttles are being applied faster than outcomes resolve (30s window).
     #[serde(default)]
@@ -1165,6 +1229,9 @@ pub struct RuntimeMetrics {
     /// Estimated RAM freed (MB) by frozen renderers.
     #[serde(default)]
     pub chromium_freed_mb: f64,
+    /// Successful temporary Jetsam demotions of visible background renderers.
+    #[serde(default)]
+    pub chromium_jetsam_demotions_total: u64,
     /// Names of browsers/apps with managed renderers.
     #[serde(default)]
     pub chromium_browsers_managed: Vec<String>,
@@ -1348,6 +1415,10 @@ pub struct RuntimeMetrics {
     pub ais_adaptability: f64,
     #[serde(default)]
     pub ais_wisdom: f64,
+    #[serde(default)]
+    pub ais_evidence_coverage: f64,
+    #[serde(default)]
+    pub ais_operational_health: f64,
     /// 2026-05-12 — Active regime selected by the chromium Step 2 gate's
     /// priority chain in daemon_chromium_tick.rs. One of: "default",
     /// "media", "build", "call", "llm". Surfaces silently-failing regime
@@ -1589,6 +1660,10 @@ pub struct RuntimeMetrics {
     pub dedup_drops_freeze: u64,
     #[serde(default)]
     pub dedup_drops_unfreeze: u64,
+    #[serde(default)]
+    pub dedup_drops_boost: u64,
+    #[serde(default)]
+    pub dedup_drops_thread_qos: u64,
 
     /// Sprint 12 Convergence #4 (2026-05-17). Cumulative coincidence
     /// count: cycles in which the scorer override fired AND the causal
@@ -1707,6 +1782,49 @@ pub struct RuntimeMetrics {
     /// pinning 300ms on a fresh forecast spike hint.
     #[serde(default)]
     pub planner_prearm_total: u64,
+
+    /// Focus prediction accelerator. Attempts count one lease acquisition,
+    /// not every daemon cycle; applied counts leases that changed at least
+    /// one kernel/cache state. Hits and misses are resolved on an actual
+    /// foreground transition or lease expiry.
+    #[serde(default)]
+    pub markov_prewarm_attempts: u64,
+    #[serde(default)]
+    pub markov_prewarm_applied: u64,
+    #[serde(default)]
+    pub markov_prewarm_hits: u64,
+    #[serde(default)]
+    pub markov_prewarm_misses: u64,
+    #[serde(default)]
+    pub markov_prewarm_reverts: u64,
+    #[serde(default)]
+    pub markov_prewarm_active: bool,
+    /// Number of same-coalition members held by the active predictive lease.
+    #[serde(default)]
+    pub markov_prewarm_members: u32,
+    /// Cumulative members whose cache or reversible kernel state was changed.
+    #[serde(default)]
+    pub markov_prewarm_members_applied: u64,
+    /// Cumulative executable bytes submitted to F_RDADVISE by predictive leases.
+    #[serde(default)]
+    pub markov_prewarm_cache_bytes: u64,
+    /// Milliseconds of advance notice from lease acquisition to a prediction hit.
+    #[serde(default)]
+    pub markov_prewarm_last_lead_ms: u64,
+    /// Milliseconds from prediction hit until launch protection is clear and
+    /// fluidity is no longer degraded. Zero is a valid immediate settle.
+    #[serde(default)]
+    pub markov_prewarm_last_settle_ms: u64,
+    #[serde(default)]
+    pub markov_prewarm_settle_observations: u64,
+    #[serde(default)]
+    pub markov_prediction_app: String,
+    #[serde(default)]
+    pub markov_prediction_confidence: f64,
+    #[serde(default)]
+    pub markov_prediction_eta_secs: f64,
+    #[serde(default)]
+    pub markov_prewarm_eligible: bool,
 
     /// B.4 purge band split (2026-06-10). Legacy aggregate keeps the sum.
     #[serde(default)]
@@ -1996,12 +2114,22 @@ mod tests {
     /// runtime_metrics.json. Pin that the fields exist and survive serde — if a
     /// future edit drops them, this fails instead of silently losing telemetry.
     #[test]
-    fn dedup_drops_survive_serde_roundtrip() {
+    fn dispatch_diagnostics_survive_serde_roundtrip() {
         let m = RuntimeMetrics {
             dedup_drops_setmemorystatus: 11,
             dedup_drops_throttle: 22,
             dedup_drops_freeze: 33,
             dedup_drops_unfreeze: 44,
+            dedup_drops_boost: 55,
+            dedup_drops_thread_qos: 66,
+            dispatch_prefilter_input_total: 101,
+            dispatch_prefilter_recent_drops: 12,
+            dispatch_prefilter_apple_drops: 23,
+            dispatch_prefilter_protected_drops: 34,
+            dispatch_prefilter_identity_drops: 4,
+            dispatch_prefilter_unsupported_drops: 5,
+            dispatch_prefilter_survivors_total: 23,
+            heuristic_apple_platform_protected: 707,
             ..RuntimeMetrics::default()
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -2010,6 +2138,16 @@ mod tests {
         assert_eq!(back.dedup_drops_throttle, 22);
         assert_eq!(back.dedup_drops_freeze, 33);
         assert_eq!(back.dedup_drops_unfreeze, 44);
+        assert_eq!(back.dedup_drops_boost, 55);
+        assert_eq!(back.dedup_drops_thread_qos, 66);
+        assert_eq!(back.dispatch_prefilter_input_total, 101);
+        assert_eq!(back.dispatch_prefilter_recent_drops, 12);
+        assert_eq!(back.dispatch_prefilter_apple_drops, 23);
+        assert_eq!(back.dispatch_prefilter_protected_drops, 34);
+        assert_eq!(back.dispatch_prefilter_identity_drops, 4);
+        assert_eq!(back.dispatch_prefilter_unsupported_drops, 5);
+        assert_eq!(back.dispatch_prefilter_survivors_total, 23);
+        assert_eq!(back.heuristic_apple_platform_protected, 707);
     }
 
     // ── OptimizationProfile roundtrip ─────────────────────────────────────────
@@ -2283,16 +2421,18 @@ mod tests {
     }
 
     #[test]
-    fn identity_fields_unfreeze_has_no_start_sec() {
+    fn identity_fields_unfreeze_surfaces_start_time() {
         let a = RootAction::UnfreezeProcess {
             pid: 400,
             name: "Code Helper".into(),
             reason: "thaw".into(),
             decision_reason: DecisionReason::PressureContext,
+            start_sec: 12_345,
+            start_usec: 678,
         };
         assert_eq!(
             a.identity_fields(),
-            Some((400u32, Some("Code Helper"), 0u64, 0u64))
+            Some((400u32, Some("Code Helper"), 12_345u64, 678u64))
         );
     }
 

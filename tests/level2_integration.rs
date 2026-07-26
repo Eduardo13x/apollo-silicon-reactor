@@ -24,6 +24,7 @@ fn no_caps() -> CapabilityReport {
         can_taskpolicy: false,
         can_sysctl: false,
         can_memorystatus: false,
+        can_memory_pressure_send: false,
         can_mdutil: false,
         can_tmutil: false,
         is_root: false,
@@ -159,6 +160,8 @@ fn execute_unfreeze_dead_pid_is_safe() {
         name: "ghost-app".into(),
         reason: "test".to_string(),
         decision_reason: DecisionReason::PressureContext,
+        start_sec: 0,
+        start_usec: 0,
     }];
     let mut frozen = HashSet::new();
     frozen.insert(dead_pid());

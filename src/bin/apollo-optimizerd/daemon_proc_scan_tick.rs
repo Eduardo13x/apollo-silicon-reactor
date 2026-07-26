@@ -32,7 +32,10 @@ pub fn run_proc_scan_tick(
     mem_analyzer: &mut MemoryAnalyzer,
     proc_recovery: &mut ProcessRecoveryManager,
     wake_storm: &mut WakeStormDetector,
+    cycle: u64,
+    memory_pressure: f64,
 ) {
+    let refine_wss = wss_refresh_due(cycle, memory_pressure);
     for (i, snap) in proc_snaps.iter().take(50).enumerate() {
         let mut profile = mem_analyzer.analyze_process(
             snap.pid,
@@ -41,7 +44,7 @@ pub fn run_proc_scan_tick(
             snap.rss_bytes,
             snap.pageins_total as u64,
         );
-        if i < 10 {
+        if refine_wss && i < 10 {
             if let Some(mem_profile) = query_memory_profile(snap.pid) {
                 MemoryAnalyzer::refine_wss(&mut profile, mem_profile.working_set_bytes);
             }
@@ -63,4 +66,32 @@ pub fn run_proc_scan_tick(
         }
     }
     wake_storm.cleanup_stale(Duration::from_secs(300));
+}
+
+/// TASK_VM_INFO refinement is useful but not a per-cycle signal. RSS and fault
+/// history remain live every cycle; only the expensive Mach round trips are
+/// sampled adaptively.
+fn wss_refresh_due(cycle: u64, memory_pressure: f64) -> bool {
+    let cadence = if memory_pressure >= 0.80 {
+        2
+    } else if memory_pressure >= 0.65 {
+        5
+    } else {
+        10
+    };
+    cycle.is_multiple_of(cadence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wss_refresh_due;
+
+    #[test]
+    fn wss_refinement_cadence_tracks_pressure() {
+        assert!(!wss_refresh_due(9, 0.40));
+        assert!(wss_refresh_due(10, 0.40));
+        assert!(wss_refresh_due(5, 0.70));
+        assert!(wss_refresh_due(2, 0.85));
+        assert!(!wss_refresh_due(3, 0.85));
+    }
 }

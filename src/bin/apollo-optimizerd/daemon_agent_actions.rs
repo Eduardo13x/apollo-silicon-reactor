@@ -53,6 +53,7 @@ pub fn run_agent_actions(
     companion_graph: &CompanionGraph,
     coalition_tracker: &CoalitionTracker,
     active_coalitions: &ActiveCoalitionEnvelope,
+    pressure_send_supported: bool,
 ) -> Vec<RootAction> {
     let mut new_actions: Vec<RootAction> = Vec::new();
 
@@ -69,12 +70,17 @@ pub fn run_agent_actions(
                 .iter()
                 .filter(|p| noise_pats.iter().any(|pat| p.name.contains(pat.as_str())))
                 .collect();
-            noise_procs.sort_by(|a, b| {
+            let by_cpu = |a: &&ProcessStats, b: &&ProcessStats| {
                 b.cpu_usage
                     .partial_cmp(&a.cpu_usage)
                     .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for proc in noise_procs.iter().take(3) {
+            };
+            if noise_procs.len() > 3 {
+                noise_procs.select_nth_unstable_by(3, by_cpu);
+                noise_procs.truncate(3);
+            }
+            noise_procs.sort_by(by_cpu);
+            for proc in &noise_procs {
                 new_actions.push(RootAction::throttle(
                     proc.pid,
                     proc.name.clone(),
@@ -85,6 +91,9 @@ pub fn run_agent_actions(
             }
         }
         Intervention::ProactivePurge => {
+            if !pressure_send_supported {
+                return new_actions;
+            }
             // Media-active gate: suppress proactive paging hints during audio /
             // video / call playback. SetMemorystatus drops caches in the target
             // process; firing it on WindowServer or audio helpers during media
@@ -184,8 +193,12 @@ pub fn run_agent_actions(
                         && p.memory_usage > 50 * 1024 * 1024
                 })
                 .collect();
+            if bg_procs.len() > 3 {
+                bg_procs.select_nth_unstable_by(3, |a, b| b.memory_usage.cmp(&a.memory_usage));
+                bg_procs.truncate(3);
+            }
             bg_procs.sort_by(|a, b| b.memory_usage.cmp(&a.memory_usage));
-            for proc in bg_procs.iter().take(3) {
+            for proc in &bg_procs {
                 new_actions.push(RootAction::SetMemorystatus {
                     pid: proc.pid,
                     priority: -1,

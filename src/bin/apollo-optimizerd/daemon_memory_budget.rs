@@ -37,6 +37,9 @@ pub enum PressureZone {
 pub struct MemoryBudgetState {
     /// PID -> last applied inactive limit in MiB.
     pub last_applied_limits: HashMap<u32, u64>,
+    /// Last time working sets and budgets were evaluated, including passes
+    /// that correctly found no over-budget process.
+    pub last_evaluated_at: Option<Instant>,
     /// Last time any limit was applied.
     pub last_applied_at: Option<Instant>,
     /// Current operating regime for hysteresis.
@@ -65,6 +68,7 @@ impl Default for MemoryBudgetState {
     fn default() -> Self {
         Self {
             last_applied_limits: HashMap::new(),
+            last_evaluated_at: None,
             last_applied_at: None,
             current_zone: PressureZone::Normal,
             last_critical_bypass_at: None,
@@ -155,7 +159,7 @@ pub fn run_memory_budget(
     // 2. Decide if we should evaluate budgets this cycle.
     let now = Instant::now();
     let time_since_last = budget_state
-        .last_applied_at
+        .last_evaluated_at
         .map(|t| now.duration_since(t))
         .unwrap_or(Duration::from_secs(u64::MAX));
 
@@ -178,6 +182,15 @@ pub fn run_memory_budget(
     if entering_critical && bypass_cooldown_ok {
         budget_state.last_critical_bypass_at = Some(now);
     }
+
+    // TASK_VM_INFO is one Mach round trip per process. Respect the zone
+    // interval before building inputs so an elevated but stable machine does
+    // not issue up to 30 calls on every daemon cycle. A zone edge still
+    // evaluates immediately, including Critical transitions.
+    if !force_eval {
+        return;
+    }
+    budget_state.last_evaluated_at = Some(now);
 
     let usage_guard = state.usage.lock_recover();
     let budget_inputs: Vec<ProcessBudgetInput> = proc_snaps
@@ -497,6 +510,23 @@ mod tests {
             memory_budget_enforcement_interval(PressureZone::Critical),
             Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn stable_zone_rate_limits_working_set_evaluation_even_without_actions() {
+        let mut budget = MemoryBudgetState::default();
+        let shared = mock_state();
+        let analyzer = MemoryAnalyzer::new();
+
+        run_memory_budget(0.65, 16 << 30, &shared, &[], &analyzer, &mut budget);
+        let first = budget
+            .last_evaluated_at
+            .expect("zone entry evaluates immediately");
+        assert!(budget.last_applied_at.is_none());
+
+        run_memory_budget(0.66, 16 << 30, &shared, &[], &analyzer, &mut budget);
+        assert_eq!(budget.last_evaluated_at, Some(first));
+        assert!(budget.last_applied_at.is_none());
     }
 
     #[test]

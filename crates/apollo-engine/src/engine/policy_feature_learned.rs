@@ -13,10 +13,10 @@
 use crate::engine::action_policy::{ActionContext, Contribution, PolicyFeature};
 use crate::engine::types::RootAction;
 
-/// Cost from demonstrably low learned yield for this candidate's process
-/// group. `ctx.learned_yield` = blend `0.5·effectiveness +
-/// 0.5·predicted_effectiveness` (same blend as the inline graded gate).
-/// None (class-level probe / no group data) → zero contribution.
+/// Cost from demonstrably low learned yield for this candidate. Mature
+/// process-level evidence blends Bayesian, causal, and skill outcomes; cold
+/// processes fall back to the HopGroupWeight blend used by the inline gate.
+/// None (class-level probe / no evidence) → zero contribution.
 pub struct LearnedYieldFeature;
 
 impl PolicyFeature for LearnedYieldFeature {

@@ -12,14 +12,17 @@
 //!
 //! | Dimensión              | Peso | Qué mide                                          |
 //! |------------------------|------|---------------------------------------------------|
-//! | Decision Precision     | 0.25 | Correctness of throttle/freeze/boost decisions     |
-//! | Signal Quality         | 0.20 | Kalman/CUSUM/Hazard accuracy & convergence         |
-//! | Learning Velocity      | 0.20 | RL convergence + causal graph + skill emergence    |
-//! | Resource Efficiency    | 0.15 | Cycle speed + cognitive budget effectiveness       |
-//! | Safety Compliance      | 0.12 | Adherence to safety invariants                     |
+//! | Decision Precision     | 0.22 | Correctness of throttle/freeze/boost decisions     |
+//! | Signal Quality         | 0.18 | Kalman/CUSUM/Hazard accuracy & convergence         |
+//! | Learning Velocity      | 0.18 | RL convergence + causal graph + skill emergence    |
+//! | Resource Efficiency    | 0.13 | Cycle speed + cognitive budget effectiveness       |
+//! | Safety Compliance      | 0.11 | Adherence to safety invariants                     |
 //! | Adaptability           | 0.08 | Regime detection + workload classification         |
+//! | Wisdom                 | 0.10 | Accumulated and verified knowledge                 |
 //!
-//! Score final: AIS ∈ [0, 100]
+//! Score final: AIS ∈ [0, 100]. Opportunity-dependent observations are
+//! normalized over the evidence that exists; missing opportunities lower
+//! `evidence_coverage` instead of being counted as failed behavior.
 
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +136,13 @@ pub struct AisInput {
     pub regime_shifts_detected: u32,
     /// Total actual regime shifts.
     pub regime_shifts_total: u32,
+    /// Reversible adaptation outcomes with an observable resolution. Runtime
+    /// sources include completed interaction-QoS leases and resolved focus
+    /// predictions; unresolved/in-flight attempts are excluded.
+    #[serde(default)]
+    pub verified_adaptations_correct: u32,
+    #[serde(default)]
+    pub verified_adaptations_total: u32,
 
     // ── Dimension 7: Wisdom (knowledge accumulation) ─────────────────────
     /// CausalGraph mechanism count (Pearl 2009 causal edges learned).
@@ -144,6 +154,9 @@ pub struct AisInput {
     /// Novel patterns logged via Phase 4 self-healing (Simon 1955).
     #[serde(default)]
     pub novel_patterns_count: u32,
+    /// Completed workload-phase transitions used to learn local durations.
+    #[serde(default)]
+    pub phase_duration_observations: u64,
 
     // ── Hardware context (for normalization portability) ──────────────────
     /// Number of CPU cores on this machine. 0 = unknown (defaults to 8).
@@ -201,16 +214,19 @@ impl AisInput {
 /// probe local and cheap. Unknown values fall back to the M1 8GB baseline via
 /// `AisInput` helpers.
 fn detect_runtime_hardware_context() -> (u32, u32) {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_cpu();
-    sys.refresh_memory();
+    static HARDWARE_CONTEXT: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    *HARDWARE_CONTEXT.get_or_init(|| {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu();
+        sys.refresh_memory();
 
-    let cores = sys.cpus().len().max(1) as u32;
-    let ram_gb = (sys.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0))
-        .round()
-        .max(1.0) as u32;
+        let cores = sys.cpus().len().max(1) as u32;
+        let ram_gb = (sys.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0))
+            .round()
+            .max(1.0) as u32;
 
-    (cores, ram_gb)
+        (cores, ram_gb)
+    })
 }
 
 /// AIS result with per-dimension breakdown.
@@ -230,6 +246,13 @@ pub struct AisScore {
     /// novel patterns, reliable skills, and solid causal edges.
     #[serde(default)]
     pub wisdom: f64,
+    /// Fraction of the weighted AIS measurement surface backed by actual
+    /// observations. Unknown opportunities lower coverage, not capability.
+    #[serde(default)]
+    pub evidence_coverage: f64,
+    /// Operational health separated from learned capability.
+    #[serde(default)]
+    pub operational_health: f64,
     /// Pareto frontier check: true if no dimension is below 0.30.
     pub pareto_balanced: bool,
     /// Grade: ✦ (SS, wisdom-gated singularity), S (≥90), A (≥80), B (≥70),
@@ -247,7 +270,7 @@ pub struct AisScore {
 /// yet (first boot, CI, or non-daemon tests). Never panics.
 pub fn compute_runtime_ais() -> Option<AisScore> {
     use crate::engine::daemon_helpers::{
-        learned_state_path, metrics_path, rl_threshold_path, skills_path,
+        frozen_state_path, learned_state_path, metrics_path, rl_threshold_path, skills_path,
     };
 
     let rm_raw = std::fs::read_to_string(metrics_path()).ok()?;
@@ -265,13 +288,6 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
     let rm_f = |key: &str| rm[key].as_f64().unwrap_or(0.0);
 
     // D1
-    let bps_protected = rm_u("bps_protected");
-    let throttles = rm_u("throttles_applied");
-    let reverted = throttle_reverts_only(
-        rm_u("throttle_reverted"),
-        rm_u("unfreezes_applied"),
-        throttles,
-    );
     let boosts = rm_u("boosts_applied");
 
     // D2: Kalman RMSE + Riccati floor (IPC-modulated).
@@ -298,8 +314,6 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         let p_star = (-q + (q * q + 4.0 * q * r).sqrt()) / 2.0;
         p_star.sqrt().max(0.01)
     };
-
-    let regime_shifts = rm_u("si_regime_shifts") as u32;
 
     // Hazard monotonic ordering (pressure-correlated features).
     let hazard_err = {
@@ -350,16 +364,23 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
     // D3: RL Q-variance from live q_table.
     let rl_q_variance = {
         if let Some(arr) = rl["q_table"].as_array() {
-            let nz: Vec<f64> = arr
+            let mut count = 0_u64;
+            let mut mean = 0.0;
+            let mut sum_squared_deviation = 0.0;
+            for value in arr
                 .iter()
-                .filter_map(|v| v.as_f64())
-                .filter(|&x| x != 0.0)
-                .collect();
-            if nz.is_empty() {
+                .filter_map(|value| value.as_f64())
+                .filter(|value| *value != 0.0)
+            {
+                count += 1;
+                let delta = value - mean;
+                mean += delta / count as f64;
+                sum_squared_deviation += delta * (value - mean);
+            }
+            if count == 0 {
                 0.0
             } else {
-                let mean = nz.iter().sum::<f64>() / nz.len() as f64;
-                nz.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / nz.len() as f64
+                sum_squared_deviation / count as f64
             }
         } else {
             0.0
@@ -374,16 +395,20 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
     .recommended_rl_max_ticks();
 
     // Causal edges with Bernardo&Smith 3/4 ambiguous credit.
-    let (causal_solid, causal_weak, causal_total) = {
+    let (causal_solid, causal_weak, causal_total, resolved_effective, resolved_total) = {
         let weights = &ls["outcome_tracker"]["weights"];
         if let Some(obj) = weights.as_object() {
             let mut solid = 0u32;
             let mut weak = 0u32;
             let mut ambiguous = 0u32;
             let mut total = 0u32;
+            let mut effective_outcomes = 0u64;
+            let mut resolved_outcomes = 0u64;
             for v in obj.values() {
                 let tc = v["throttle_count"].as_u64().unwrap_or(0);
                 let ec = v["effective_count"].as_u64().unwrap_or(0);
+                resolved_outcomes = resolved_outcomes.saturating_add(tc);
+                effective_outcomes = effective_outcomes.saturating_add(ec.min(tc));
                 if tc > 0 {
                     total += 1;
                     let ratio = ec as f64 / tc as f64;
@@ -396,9 +421,15 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
                     }
                 }
             }
-            (solid + 3 * ambiguous / 4, weak, total)
+            (
+                solid + 3 * ambiguous / 4,
+                weak,
+                total,
+                effective_outcomes,
+                resolved_outcomes,
+            )
         } else {
-            (0, 0, 0)
+            (0, 0, 0, 0, 0)
         }
     };
 
@@ -428,31 +459,25 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
     let experience_memory_count = rm_u("experience_memory_size") as u32;
     let novel_patterns_count = {
         // File lives next to runtime_metrics.json — derive sibling path.
-        let p = metrics_path();
-        let sibling = std::path::Path::new(p)
+        let sibling = std::path::Path::new(metrics_path())
             .parent()
             .unwrap_or_else(|| std::path::Path::new("/var/lib/apollo"))
             .join("novel_patterns.jsonl");
-        std::fs::read_to_string(&sibling)
-            .map(|s| s.lines().count() as u32)
-            .unwrap_or(0)
+        let rotated = std::path::PathBuf::from(format!("{}.old", sibling.display()));
+        [&sibling, &rotated]
+            .into_iter()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .map(|s| s.lines().count() as u32)
+                    .unwrap_or(0)
+            })
+            .sum()
     };
 
-    // D4: P50 cycle time from ring buffer.
-    let p95_cycle_ms = {
-        if let Some(arr) = rm["cycle_durations_ms"].as_array() {
-            let mut durations: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
-            if durations.len() >= 4 {
-                durations.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let idx = ((durations.len() as f64 * 0.50) as usize).min(durations.len() - 1);
-                durations[idx]
-            } else {
-                rm_f("p95_cycle_ms")
-            }
-        } else {
-            rm_f("p95_cycle_ms")
-        }
-    };
+    // D4: consume the daemon's real p95. The previous implementation sorted
+    // the ring and selected index 0.50 while storing it in a p95 field, which
+    // systematically overstated resource efficiency.
+    let p95_cycle_ms = rm_f("p95_cycle_ms");
     let subsystem_skips = rm_u("deep_scan_skip");
     let subsystem_evals = rm_u("deep_scan_count") + subsystem_skips;
     let habituation_skips = rm_u("habituation_skips");
@@ -468,29 +493,68 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
     let survival_activations = rm_u("survival_activations_recent_24h") as u32;
     let failures = rm_u("failures") as u32;
     let overflow_events_7d = rm_u("overflow_events_7d") as u32;
+    let frozen_critical =
+        crate::engine::daemon_helpers::load_frozen_state(std::path::Path::new(frozen_state_path()))
+            .values()
+            .filter(|entry| {
+                entry
+                    .process_name
+                    .as_deref()
+                    .is_some_and(crate::engine::safety::is_protected_name)
+            })
+            .count() as u32;
 
     // D6
-    let profile_switches = rm_u("profile_switches") as u32;
-    let workload_correct = if rm["current_workload"].is_string() {
-        1u32
+    // Runtime has no independent labels for profile switches or regime shifts,
+    // so leave those streams unknown instead of declaring every self-issued
+    // decision correct. ML confidence is calibrated evidence, not ground truth,
+    // but it provides an honest graded workload signal.
+    let workload_has_evidence = rm["current_workload"].is_string() && rm_f("ml_confidence") > 0.0;
+    let workload_total = if workload_has_evidence { 1000 } else { 0 };
+    let workload_correct = if workload_has_evidence {
+        (rm_f("ml_confidence").clamp(0.0, 1.0) * workload_total as f64).round() as u32
     } else {
-        0u32
+        0
     };
 
+    let preservation_events = rm_u("critical_background_skips")
+        .saturating_add(rm_u("critical_background_tree_protected"))
+        .saturating_add(rm_u("hard_protected_boost_skipped_total"));
+    let boost_reverts = rm_u("boost_reverts_total").min(boosts);
+    let interaction_activations = rm_u("interaction_qos_activations");
+    let interaction_reverts = rm_u("interaction_qos_reverts").min(interaction_activations);
+    let interaction_in_flight = rm["interaction_qos_active"].as_bool().unwrap_or(false) as u64;
+    let interaction_failed = interaction_activations
+        .saturating_sub(interaction_reverts)
+        .saturating_sub(interaction_in_flight);
+    let prediction_hits = rm_u("markov_prewarm_hits");
+    let prediction_misses = rm_u("markov_prewarm_misses");
+    let verified_adaptations_correct = interaction_reverts.saturating_add(prediction_hits);
+    let verified_adaptations_total = interaction_reverts
+        .saturating_add(interaction_failed)
+        .saturating_add(prediction_hits)
+        .saturating_add(prediction_misses);
+
     let input = AisInput {
-        total_decisions: throttles + boosts + bps_protected,
-        correct_decisions: throttles.saturating_sub(reverted) + boosts + bps_protected,
-        protected_preserved: bps_protected,
-        protected_total: bps_protected,
-        noise_throttled: throttles.saturating_sub(reverted),
-        noise_total: throttles,
-        interactive_boosted: boosts,
-        interactive_total: boosts,
+        total_decisions: resolved_total + boosts + preservation_events,
+        correct_decisions: resolved_effective
+            .saturating_add(boosts.saturating_sub(boost_reverts))
+            .saturating_add(preservation_events),
+        protected_preserved: preservation_events,
+        protected_total: preservation_events,
+        noise_throttled: resolved_effective,
+        noise_total: resolved_total,
+        interactive_boosted: boosts
+            .saturating_sub(boost_reverts)
+            .saturating_add(interaction_reverts),
+        interactive_total: boosts
+            .saturating_add(interaction_reverts)
+            .saturating_add(interaction_failed),
 
         kalman_rmse,
-        cusum_true_positives: regime_shifts,
+        cusum_true_positives: 0,
         cusum_false_positives: 0,
-        cusum_actual_shifts: (regime_shifts.saturating_add(regime_shifts / 20)).max(1),
+        cusum_actual_shifts: 0,
         hazard_calibration_error: hazard_err,
         entropy_tpr,
 
@@ -518,18 +582,21 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         survival_activations,
         overflow_events_7d,
         failures,
-        frozen_critical: 0,
+        frozen_critical,
 
-        correct_profile_switches: profile_switches,
-        total_profile_switches: profile_switches,
+        correct_profile_switches: 0,
+        total_profile_switches: 0,
         correct_workload_class: workload_correct,
-        total_workload_class: 1,
-        regime_shifts_detected: regime_shifts,
-        regime_shifts_total: (regime_shifts.saturating_add(regime_shifts / 20)).max(1),
+        total_workload_class: workload_total,
+        regime_shifts_detected: 0,
+        regime_shifts_total: 0,
+        verified_adaptations_correct: verified_adaptations_correct.min(u32::MAX as u64) as u32,
+        verified_adaptations_total: verified_adaptations_total.min(u32::MAX as u64) as u32,
 
         causal_mechanism_count,
         experience_memory_count,
         novel_patterns_count,
+        phase_duration_observations: rm_u("workload_phase_duration_observations"),
 
         hardware_cores,
         hardware_memory_gb,
@@ -551,6 +618,8 @@ pub fn compute_ais(input: &AisInput) -> AisScore {
     let d5 = safety_compliance(input);
     let d6 = adaptability(input);
     let d7 = wisdom(input);
+    let evidence_coverage = ais_evidence_coverage(input);
+    let operational_health = (0.60 * d5 + 0.40 * d4).clamp(0.0, 1.0);
 
     let total = (W_DECISION * d1
         + W_SIGNAL * d2
@@ -589,6 +658,8 @@ pub fn compute_ais(input: &AisInput) -> AisScore {
         safety_compliance: d5,
         adaptability: d6,
         wisdom: d7,
+        evidence_coverage,
+        operational_health,
         pareto_balanced,
         grade,
     }
@@ -600,37 +671,26 @@ pub fn compute_ais(input: &AisInput) -> AisScore {
 // - 30% noise throttling (precision)
 // - 30% interactive boosting (recall)
 fn decision_precision(input: &AisInput) -> f64 {
-    // When no process was elevated to "protected" by BPS, the system correctly
-    // determined that zero processes needed priority preservation — recall is
-    // vacuously perfect (universal quantification over the empty set is true).
-    // [Laplace 1812] "Théorie analytique des probabilités" — empty-set events
-    // satisfy all preservation constraints; safe_ratio(0,0)=0.5 is wrong here
-    // because 0 eligible = 0 wrongly discarded = perfect recall.
-    let protected_rate = if input.protected_total == 0 {
-        1.0
-    } else {
-        safe_ratio(input.protected_preserved, input.protected_total)
-    };
-    // 2026-05-12: harmonize "vacuous truth" treatment across all three rates.
-    // Previously noise/interactive used `safe_ratio(0,0) = 0.5` (neutral-half)
-    // while protected used 1.0 — asymmetric. Under low-pressure operation
-    // Apollo correctly emits zero throttles + zero boosts; the old formula
-    // then scored decision_precision ≤ 0.70 ("I have no idea") for a daemon
-    // doing exactly what its policy demands. The correct semantics are
-    // vacuous-truth: when no action was *required*, zero actions taken = full
-    // recall over the empty set [Laplace 1812].
-    let noise_rate = if input.noise_total == 0 {
-        1.0
-    } else {
-        safe_ratio(input.noise_throttled, input.noise_total)
-    };
-    let interactive_rate = if input.interactive_total == 0 {
-        1.0
-    } else {
-        safe_ratio(input.interactive_boosted, input.interactive_total)
-    };
-
-    (0.40 * protected_rate + 0.30 * noise_rate + 0.30 * interactive_rate).clamp(0.0, 1.0)
+    weighted_observed(
+        &[
+            (
+                0.40,
+                (input.protected_total > 0)
+                    .then(|| safe_ratio(input.protected_preserved, input.protected_total)),
+            ),
+            (
+                0.30,
+                (input.noise_total > 0)
+                    .then(|| safe_ratio(input.noise_throttled, input.noise_total)),
+            ),
+            (
+                0.30,
+                (input.interactive_total > 0)
+                    .then(|| safe_ratio(input.interactive_boosted, input.interactive_total)),
+            ),
+        ],
+        0.5,
+    )
 }
 
 // ── Dimension 2: Signal Quality ──────────────────────────────────────────────
@@ -700,8 +760,15 @@ fn signal_quality(input: &AisInput) -> f64 {
     // Entropy TPR directly.
     let entropy_score = input.entropy_tpr.clamp(0.0, 1.0);
 
-    (0.30 * kalman_score + 0.30 * cusum_fbeta + 0.25 * hazard_score + 0.15 * entropy_score)
-        .clamp(0.0, 1.0)
+    weighted_observed(
+        &[
+            (0.30, Some(kalman_score)),
+            (0.30, (input.cusum_actual_shifts > 0).then_some(cusum_fbeta)),
+            (0.25, Some(hazard_score)),
+            (0.15, Some(entropy_score)),
+        ],
+        0.5,
+    )
 }
 
 // ── Dimension 3: Learning Velocity ───────────────────────────────────────────
@@ -798,7 +865,7 @@ fn resource_efficiency(input: &AisInput) -> f64 {
     // At high pressure (≥0.55): all heavy subsystems MUST run — full score for
     // correct all-run behavior. At lower pressure: skip rate optimality matters.
     let budget_score = if input.current_pressure >= 0.55 {
-        1.0 // High-pressure zone: running all subsystems is the correct behavior
+        Some(1.0) // High-pressure zone: running all subsystems is the correct behavior
     } else if input.subsystem_evals > 0 {
         let skip_rate = input.subsystem_skips as f64 / input.subsystem_evals as f64;
         // Optimal skip rate: ~30-50%. Real daemon 3-zone router produces ~40%.
@@ -818,9 +885,17 @@ fn resource_efficiency(input: &AisInput) -> f64 {
         } else {
             0.0
         };
-        skip_score.max(headroom_floor)
+        Some(skip_score.max(headroom_floor))
     } else {
-        0.3
+        None
+    };
+    // A handful of routed evaluations is not enough to characterize the
+    // cognitive budget. Ramp this stream in gradually so the first deep scan
+    // cannot create a discontinuous resource-efficiency drop.
+    let budget_weight = if input.current_pressure >= 0.55 {
+        0.30
+    } else {
+        0.30 * sample_strength(input.subsystem_evals, 20)
     };
 
     // Habituation: what fraction of stable processes we skip.
@@ -832,7 +907,14 @@ fn resource_efficiency(input: &AisInput) -> f64 {
         0.0
     };
 
-    (0.45 * cycle_score + 0.30 * budget_score + 0.25 * habituation_score).clamp(0.0, 1.0)
+    weighted_observed(
+        &[
+            (0.45, (input.p95_cycle_ms > 0.0).then_some(cycle_score)),
+            (budget_weight, budget_score),
+            (0.25, (input.process_evals > 0).then_some(habituation_score)),
+        ],
+        0.5,
+    )
 }
 
 // ── Dimension 5: Safety Compliance ───────────────────────────────────────────
@@ -904,28 +986,38 @@ fn safety_compliance(input: &AisInput) -> f64 {
 // ── Dimension 6: Adaptability ────────────────────────────────────────────────
 // How well the system responds to changing conditions.
 fn adaptability(input: &AisInput) -> f64 {
-    // 2026-05-12: same vacuous-truth treatment as decision_precision.
-    // Under low-pressure operation Apollo may see zero profile switches or
-    // regime shifts in a measurement window — that should score 1.0 ("the
-    // daemon correctly judged that no adaptation was required"), not 0.5
-    // ("no data"). [Laplace 1812] over the empty set.
-    let profile_accuracy = if input.total_profile_switches == 0 {
-        1.0
-    } else {
-        safe_ratio_u32(input.correct_profile_switches, input.total_profile_switches)
-    };
-    let workload_accuracy = if input.total_workload_class == 0 {
-        1.0
-    } else {
-        safe_ratio_u32(input.correct_workload_class, input.total_workload_class)
-    };
-    let regime_detection = if input.regime_shifts_total == 0 {
-        1.0
-    } else {
-        safe_ratio_u32(input.regime_shifts_detected, input.regime_shifts_total)
-    };
-
-    (0.30 * profile_accuracy + 0.40 * workload_accuracy + 0.30 * regime_detection).clamp(0.0, 1.0)
+    weighted_observed(
+        &[
+            (
+                0.20 * sample_strength(input.total_profile_switches as u64, 20),
+                (input.total_profile_switches > 0).then(|| {
+                    safe_ratio_u32(input.correct_profile_switches, input.total_profile_switches)
+                }),
+            ),
+            (
+                0.30 * sample_strength(input.total_workload_class as u64, 20),
+                (input.total_workload_class > 0).then(|| {
+                    safe_ratio_u32(input.correct_workload_class, input.total_workload_class)
+                }),
+            ),
+            (
+                0.25 * sample_strength(input.regime_shifts_total as u64, 20),
+                (input.regime_shifts_total > 0).then(|| {
+                    safe_ratio_u32(input.regime_shifts_detected, input.regime_shifts_total)
+                }),
+            ),
+            (
+                0.25 * sample_strength(input.verified_adaptations_total as u64, 20),
+                (input.verified_adaptations_total > 0).then(|| {
+                    safe_ratio_u32(
+                        input.verified_adaptations_correct,
+                        input.verified_adaptations_total,
+                    )
+                }),
+            ),
+        ],
+        0.5,
+    )
 }
 
 // ── Dimension 7: Wisdom (knowledge accumulation) ────────────────────────────
@@ -947,11 +1039,16 @@ fn wisdom(input: &AisInput) -> f64 {
     let skills_reliable = log_sat(input.reliable_skills as u64, 8.0);
     let causal_edges = log_sat(input.causal_solid_edges as u64, 30.0);
 
-    let learned_wisdom = (0.25 * causal
+    let phase_learning = log_sat(input.phase_duration_observations, 50.0);
+    let verified_adaptation = log_sat(input.verified_adaptations_total as u64, 100.0);
+
+    let learned_wisdom = (0.20 * causal
         + 0.20 * experience
-        + 0.15 * novel
-        + 0.20 * skills_reliable
-        + 0.20 * causal_edges)
+        + 0.10 * novel
+        + 0.15 * skills_reliable
+        + 0.15 * causal_edges
+        + 0.10 * phase_learning
+        + 0.10 * verified_adaptation)
         .clamp(0.0, 1.0);
 
     // Cold-start bridge: a careful daemon can run for a long time without
@@ -991,6 +1088,69 @@ fn safe_ratio_u32(num: u32, den: u32) -> f64 {
     } else {
         (num as f64 / den as f64).clamp(0.0, 1.0)
     }
+}
+
+fn weighted_observed(streams: &[(f64, Option<f64>)], unknown_prior: f64) -> f64 {
+    let (weighted, weight) = streams.iter().fold((0.0, 0.0), |(sum, total), (w, value)| {
+        if let Some(value) = value.filter(|v| v.is_finite()) {
+            (sum + w * value.clamp(0.0, 1.0), total + w)
+        } else {
+            (sum, total)
+        }
+    });
+    if weight > 0.0 {
+        (weighted / weight).clamp(0.0, 1.0)
+    } else {
+        unknown_prior.clamp(0.0, 1.0)
+    }
+}
+
+fn sample_strength(observations: u64, mature_at: u64) -> f64 {
+    if mature_at == 0 {
+        1.0
+    } else {
+        (observations as f64 / mature_at as f64).clamp(0.0, 1.0)
+    }
+}
+
+fn ais_evidence_coverage(input: &AisInput) -> f64 {
+    let decision = 0.40 * (input.protected_total > 0) as u8 as f64
+        + 0.30 * (input.noise_total > 0) as u8 as f64
+        + 0.30 * (input.interactive_total > 0) as u8 as f64;
+    let signal = 0.70 + 0.30 * (input.cusum_actual_shifts > 0) as u8 as f64;
+    let learning = 0.20 * (input.rl_total_ticks > 0 || input.rl_max_ticks > 0) as u8 as f64
+        + 0.25 * (input.causal_total_edges > 0) as u8 as f64
+        + 0.20 * (input.total_skills > 0) as u8 as f64
+        + 0.15 * (input.dyna_transitions > 0) as u8 as f64
+        + 0.20 * (input.experience_records > 0) as u8 as f64;
+    let resource = 0.45 * (input.p95_cycle_ms > 0.0) as u8 as f64
+        + 0.30
+            * if input.current_pressure >= 0.55 {
+                1.0
+            } else {
+                sample_strength(input.subsystem_evals, 20)
+            }
+        + 0.25 * (input.process_evals > 0) as u8 as f64;
+    let adapt = 0.20 * sample_strength(input.total_profile_switches as u64, 20)
+        + 0.30 * sample_strength(input.total_workload_class as u64, 20)
+        + 0.25 * sample_strength(input.regime_shifts_total as u64, 20)
+        + 0.25 * sample_strength(input.verified_adaptations_total as u64, 20);
+    let wisdom = (input.causal_mechanism_count > 0
+        || input.experience_memory_count > 0
+        || input.novel_patterns_count > 0
+        || input.reliable_skills > 0
+        || input.causal_solid_edges > 0
+        || input.phase_duration_observations > 0
+        || input.verified_adaptations_total > 0) as u8 as f64;
+
+    (W_DECISION * decision
+        + W_SIGNAL * signal
+        + W_LEARNING * learning
+        + W_RESOURCE * resource
+        + W_SAFETY
+        + W_ADAPT * adapt
+        + W_WISDOM * wisdom)
+        .clamp(0.0, 1.0)
 }
 
 fn throttle_reverts_only(
@@ -1423,6 +1583,8 @@ mod tests {
             // 5% miss buffer: consistent with CUSUM buffer (recalibrated, see D2 comment).
             // [Kenett & Thyregod 2006] SPC §7.3 — buffer = 95th pct detection lag boundary.
             regime_shifts_total: (regime_shifts.saturating_add(regime_shifts / 20)).max(1),
+            verified_adaptations_correct: 0,
+            verified_adaptations_total: 0,
 
             hardware_cores: 8,
             hardware_memory_gb: 8,
@@ -1431,13 +1593,16 @@ mod tests {
             causal_mechanism_count: 0,
             experience_memory_count: 0,
             novel_patterns_count: 0,
+            phase_duration_observations: 0,
             kalman_riccati_rmse: kalman_riccati_floor,
         };
 
         let score = compute_ais(&input);
         println!(
-            "AIS: {:.1} | D={:.0}% S={:.0}% L={:.0}% R={:.0}% Sf={:.0}% A={:.0}%",
+            "AIS: {:.1} | health={:.0}% evidence={:.0}% | D={:.0}% S={:.0}% L={:.0}% R={:.0}% Sf={:.0}% A={:.0}%",
             score.total,
+            score.operational_health * 100.0,
+            score.evidence_coverage * 100.0,
             score.decision_precision * 100.0,
             score.signal_quality * 100.0,
             score.learning_velocity * 100.0,
@@ -1445,21 +1610,19 @@ mod tests {
             score.safety_compliance * 100.0,
             score.adaptability * 100.0,
         );
-        // Floor = 90.0 (locks in 7-iteration Darwinian evolution gains post-process_baseline).
-        // Calibration: adaptive D1/D2/D4/D5 formulas; 90+ S-tier under nominal+thermal load.
-        // ±3pt noise tolerance for Kalman RMSE variance and fresh-restart warmup lag.
+        // A benchmark must protect operational contracts, not force a vanity score.
+        // Nominal production state needs healthy execution, substantial evidence,
+        // intact safety, and a useful aggregate score without requiring S-tier.
+        assert!(score.safety_compliance >= 0.80, "unsafe runtime: {score:?}");
         assert!(
-            score.total >= 90.0,
-            "AIS runtime {:.1} < 90.0 — regression detected (S-tier floor after evolution). \
-             Dims: D={:.0}% S={:.0}% L={:.0}% R={:.0}% Sf={:.0}% A={:.0}%",
-            score.total,
-            score.decision_precision * 100.0,
-            score.signal_quality * 100.0,
-            score.learning_velocity * 100.0,
-            score.resource_efficiency * 100.0,
-            score.safety_compliance * 100.0,
-            score.adaptability * 100.0,
+            score.operational_health >= 0.75,
+            "unhealthy runtime: {score:?}"
         );
+        assert!(
+            score.evidence_coverage >= 0.50,
+            "insufficient runtime evidence: {score:?}"
+        );
+        assert!(score.total >= 70.0, "AIS runtime regression: {score:?}");
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1538,6 +1701,8 @@ mod tests {
             total_workload_class: workload.1,
             regime_shifts_detected: signal.1, // CUSUM TP = live regime detections
             regime_shifts_total: signal.3,    // actual shifts in simulation
+            verified_adaptations_correct: 0,
+            verified_adaptations_total: 0,
             hardware_cores: 8,
             hardware_memory_gb: 8,
             rl_total_ticks: 0,     // simulation mode: use convergence_ticks
@@ -1545,6 +1710,7 @@ mod tests {
             causal_mechanism_count: 0,
             experience_memory_count: 0,
             novel_patterns_count: 0,
+            phase_duration_observations: 0,
             kalman_riccati_rmse: 0.0, // simulation mode: use fixed pressure-based thresholds
         };
 
@@ -2107,6 +2273,31 @@ mod tests {
     }
 
     #[test]
+    fn tiny_deep_scan_sample_does_not_create_resource_cliff() {
+        let baseline = AisInput {
+            p95_cycle_ms: 54.0,
+            target_cycle_ms: 100.0,
+            habituation_skips: 100,
+            process_evals: 100,
+            current_pressure: 0.38,
+            hardware_cores: 10,
+            hardware_memory_gb: 16,
+            ..Default::default()
+        };
+        let two_observations = AisInput {
+            subsystem_evals: 2,
+            ..baseline.clone()
+        };
+
+        let before = resource_efficiency(&baseline);
+        let after = resource_efficiency(&two_observations);
+        assert!(
+            (before - after).abs() < 0.03,
+            "two observations must not move a mature dimension abruptly: {before:.3} -> {after:.3}"
+        );
+    }
+
+    #[test]
     fn test_weights_sum_to_one() {
         let sum = W_DECISION + W_SIGNAL + W_LEARNING + W_RESOURCE + W_SAFETY + W_ADAPT + W_WISDOM;
         assert!(
@@ -2160,6 +2351,8 @@ mod tests {
             total_workload_class: 10,
             regime_shifts_detected: 3,
             regime_shifts_total: 3,
+            verified_adaptations_correct: 0,
+            verified_adaptations_total: 0,
             hardware_cores: 8,
             hardware_memory_gb: 8,
             rl_total_ticks: 0,
@@ -2167,6 +2360,7 @@ mod tests {
             causal_mechanism_count: 0,
             experience_memory_count: 0,
             novel_patterns_count: 0,
+            phase_duration_observations: 0,
             kalman_riccati_rmse: 0.0, // simulation mode: use fixed threshold
         };
         let score = compute_ais(&input);
@@ -2411,12 +2605,15 @@ mod tests {
             total_workload_class: 10,
             regime_shifts_detected: 4,
             regime_shifts_total: 4,
+            verified_adaptations_correct: 4,
+            verified_adaptations_total: 4,
 
             hardware_cores: 8,
             hardware_memory_gb: 8,
             causal_mechanism_count: 0,
             experience_memory_count: 0,
             novel_patterns_count: 0,
+            phase_duration_observations: 0,
             kalman_riccati_rmse: 0.0, // simulation mode
         }
     }
@@ -2456,6 +2653,132 @@ mod tests {
             "stable runtime should earn some provisional wisdom"
         );
         assert!(score <= 0.35, "stability must not bypass the wisdom cap");
+    }
+
+    #[test]
+    fn absent_opportunity_does_not_dilute_observed_precision() {
+        let input = AisInput {
+            interactive_boosted: 12,
+            interactive_total: 12,
+            ..Default::default()
+        };
+        assert_eq!(decision_precision(&input), 1.0);
+
+        let adapt = AisInput {
+            verified_adaptations_correct: 12,
+            verified_adaptations_total: 12,
+            ..Default::default()
+        };
+        assert_eq!(adaptability(&adapt), 1.0);
+    }
+
+    #[test]
+    fn verified_failures_still_reduce_adaptability() {
+        let healthy = AisInput {
+            correct_workload_class: 710,
+            total_workload_class: 1000,
+            verified_adaptations_correct: 18,
+            verified_adaptations_total: 18,
+            ..Default::default()
+        };
+        let degraded = AisInput {
+            verified_adaptations_correct: 9,
+            ..healthy.clone()
+        };
+        assert!(adaptability(&healthy) > adaptability(&degraded) + 0.20);
+    }
+
+    #[test]
+    fn small_verified_sample_cannot_dominate_adaptability() {
+        let one_miss = AisInput {
+            correct_workload_class: 800,
+            total_workload_class: 1000,
+            verified_adaptations_correct: 0,
+            verified_adaptations_total: 1,
+            ..Default::default()
+        };
+        let mature_misses = AisInput {
+            verified_adaptations_total: 20,
+            ..one_miss.clone()
+        };
+
+        assert!(adaptability(&one_miss) > 0.70);
+        assert!(adaptability(&mature_misses) < 0.55);
+    }
+
+    #[test]
+    fn quiet_m4_reports_health_and_evidence_separately() {
+        let input = AisInput {
+            interactive_boosted: 12,
+            interactive_total: 12,
+            kalman_rmse: 0.08,
+            kalman_riccati_rmse: 0.09,
+            hazard_calibration_error: 0.0,
+            entropy_tpr: 0.835,
+            rl_q_variance: 20.0,
+            rl_max_ticks: 1000,
+            rl_total_ticks: 200_000,
+            causal_solid_edges: 2,
+            causal_weak_edges: 1,
+            causal_total_edges: 4,
+            experience_records: 100,
+            dyna_transitions: 100_000,
+            p95_cycle_ms: 54.0,
+            habituation_skips: 2_000,
+            process_evals: 3_000,
+            current_pressure: 0.35,
+            failures: 0,
+            correct_workload_class: 710,
+            total_workload_class: 1000,
+            verified_adaptations_correct: 15,
+            verified_adaptations_total: 18,
+            causal_mechanism_count: 2,
+            experience_memory_count: 103,
+            phase_duration_observations: 9,
+            hardware_cores: 10,
+            hardware_memory_gb: 16,
+            ..Default::default()
+        };
+        let score = compute_ais(&input);
+        assert!(score.operational_health >= 0.85, "{score:?}");
+        assert!(score.evidence_coverage > 0.60 && score.evidence_coverage < 1.0);
+        assert!(score.adaptability > 0.70, "{score:?}");
+        assert!(score.total >= 75.0, "{score:?}");
+    }
+
+    #[test]
+    fn real_failures_reduce_operational_health() {
+        let healthy = AisInput {
+            p95_cycle_ms: 45.0,
+            target_cycle_ms: 100.0,
+            current_pressure: 0.35,
+            ..Default::default()
+        };
+        let failed = AisInput {
+            failures: 1,
+            ..healthy.clone()
+        };
+
+        let healthy_score = compute_ais(&healthy);
+        let failed_score = compute_ais(&failed);
+        assert!(failed_score.safety_compliance < healthy_score.safety_compliance);
+        assert!(failed_score.operational_health < healthy_score.operational_health);
+    }
+
+    #[test]
+    fn phase_and_verified_outcomes_add_bounded_wisdom() {
+        let base = AisInput {
+            causal_mechanism_count: 2,
+            experience_memory_count: 50,
+            ..Default::default()
+        };
+        let experienced = AisInput {
+            phase_duration_observations: 25,
+            verified_adaptations_total: 50,
+            ..base.clone()
+        };
+        assert!(wisdom(&experienced) > wisdom(&base));
+        assert!(wisdom(&experienced) < 0.85);
     }
 
     #[test]
@@ -2528,12 +2851,15 @@ mod tests {
             total_workload_class: 10,
             regime_shifts_detected: 1,
             regime_shifts_total: 8,
+            verified_adaptations_correct: 1,
+            verified_adaptations_total: 8,
 
             hardware_cores: 8,
             hardware_memory_gb: 8,
             causal_mechanism_count: 0,
             experience_memory_count: 0,
             novel_patterns_count: 0,
+            phase_duration_observations: 0,
             kalman_riccati_rmse: 0.0,
         };
         let score = compute_ais(&input);

@@ -1195,6 +1195,19 @@ mod tests {
 
     const GB: u64 = 1024 * 1024 * 1024;
 
+    fn foreground_signal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct ForegroundSignalReset;
+
+    impl Drop for ForegroundSignalReset {
+        fn drop(&mut self) {
+            apollo_engine::engine::shadow_signals::set_foreground_pid(None);
+        }
+    }
+
     #[test]
     fn noise_add_rejects_interactive_and_protected() {
         // The teacher noise-classified the LSP. A noise pattern that shadows an
@@ -1425,6 +1438,12 @@ mod tests {
 
     #[test]
     fn apply_interactive_pattern_adds_boost() {
+        let _serial = foreground_signal_test_lock();
+        let _reset = ForegroundSignalReset;
+        boost_dedup_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         apollo_engine::engine::shadow_signals::set_foreground_pid(Some(42));
         let snap = snapshot_with(vec![proc(42, "Xcode", 20.0)]);
         let result =
@@ -1437,11 +1456,12 @@ mod tests {
             }
             _ => panic!("expected BoostProcess"),
         }
-        apollo_engine::engine::shadow_signals::set_foreground_pid(None);
     }
 
     #[test]
     fn apply_no_duplicate_boost_when_already_present() {
+        let _serial = foreground_signal_test_lock();
+        let _reset = ForegroundSignalReset;
         apollo_engine::engine::shadow_signals::set_foreground_pid(Some(42));
         let snap = snapshot_with(vec![proc(42, "Xcode", 20.0)]);
         let existing = vec![RootAction::BoostProcess {
@@ -1459,7 +1479,6 @@ mod tests {
             .filter(|a| matches!(a, RootAction::BoostProcess { .. }))
             .count();
         assert_eq!(boosts, 1, "must not duplicate existing boost");
-        apollo_engine::engine::shadow_signals::set_foreground_pid(None);
     }
 
     #[test]

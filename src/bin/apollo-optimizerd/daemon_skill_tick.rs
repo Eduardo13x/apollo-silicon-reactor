@@ -13,7 +13,7 @@
 //! signal_digest is available (pressure threshold gating). Returns new throttle actions
 //! to append; caller merges into the main actions vec.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use std::path::Path;
 
@@ -82,10 +82,16 @@ pub fn run_skill_tick(
                 .flat_map(|s| s.throttle_targets.iter().cloned())
                 .collect();
             for (pid, process) in collector.system().processes() {
-                let name = process.name().to_string();
+                let name = process.name();
+                // Cheap hash lookups first. The previous order paid the
+                // Apple-platform identity syscall for every live process even
+                // though only a handful of names belonged to the skill.
+                if !skill_targets.contains(name) || already_actioned.contains(name) {
+                    continue;
+                }
                 // [Saltzer & Kaashoek 2009] never throttle protected daemons via skills
                 // even if the registry learned them as "effective" (stale correlation).
-                if is_protected_name(&name) {
+                if is_protected_name(name) {
                     continue;
                 }
                 let pid_u32 = pid.as_u32();
@@ -98,36 +104,33 @@ pub fn run_skill_tick(
                 if is_apple_platform_process(pid_u32) {
                     continue;
                 }
-                if skill_targets.contains(&name) && !already_actioned.contains(&name) {
-                    // World-model gate (2026-06-11): skill emissions were the
-                    // last action path bypassing imagination. A learned skill
-                    // whose throttle the calibrated causal model says loses to
-                    // do-nothing is skipped. TRIAL emissions below stay
-                    // exempt — trials are exploration by design (the Gemma
-                    // teacher loop needs their outcomes), and the model must
-                    // never block exploration.
-                    if let apollo_engine::engine::world_model::Imagined::DoNothingDominates {
-                        ..
-                    } = world_model.imagine(&format!("throttle:{}", name))
-                    {
-                        apollo_engine::engine::lse_counters::LSE_COUNTERS
-                            .inc_world_model_dominance_skip();
-                        tracing::debug!(target_name = %name, "skill-tick: world-model-skip");
-                        continue;
-                    }
-                    let skill_name = skill_matches
-                        .iter()
-                        .find(|s| s.throttle_targets.contains(&name))
-                        .map(|s| s.name.as_str())
-                        .unwrap_or("skill");
-                    new_actions.push(RootAction::throttle(
-                        pid_u32,
-                        name,
-                        false,
-                        format!("skill:{}", skill_name),
-                        DecisionReason::MLWorkload,
-                    ));
+                // World-model gate (2026-06-11): skill emissions were the
+                // last action path bypassing imagination. A learned skill
+                // whose throttle the calibrated causal model says loses to
+                // do-nothing is skipped. TRIAL emissions below stay
+                // exempt — trials are exploration by design (the Gemma
+                // teacher loop needs their outcomes), and the model must
+                // never block exploration.
+                if let apollo_engine::engine::world_model::Imagined::DoNothingDominates { .. } =
+                    world_model.imagine(&format!("throttle:{}", name))
+                {
+                    apollo_engine::engine::lse_counters::LSE_COUNTERS
+                        .inc_world_model_dominance_skip();
+                    tracing::debug!(target_name = %name, "skill-tick: world-model-skip");
+                    continue;
                 }
+                let skill_name = skill_matches
+                    .iter()
+                    .find(|s| s.throttle_targets.iter().any(|target| target == name))
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("skill");
+                new_actions.push(RootAction::throttle(
+                    pid_u32,
+                    name.to_string(),
+                    false,
+                    format!("skill:{}", skill_name),
+                    DecisionReason::MLWorkload,
+                ));
             }
         }
     }
@@ -170,38 +173,42 @@ pub fn run_skill_tick(
             let mut trialed = false;
             // "Foreground-blocked" ≠ "ineffective": skill couldn't run this cycle.
             let mut targets_found_but_skipped = false;
-            for target in &skill.throttle_targets.clone() {
+            // Index the process table once. The previous target×process nested
+            // scan was an N+1 path whenever an induced skill had several targets.
+            let running_by_name: HashMap<&str, u32> = collector
+                .system()
+                .processes()
+                .iter()
+                .map(|(pid, process)| (process.name(), pid.as_u32()))
+                .collect();
+            for target in &skill.throttle_targets {
                 // [Saltzer & Kaashoek 2009] is_protected_name is the single truth point.
                 if is_protected_name(target)
                     || policy_prot.iter().any(|p| target.contains(p.as_str()))
                 {
                     continue;
                 }
-                for (pid, process) in collector.system().processes() {
-                    if process.name() == target {
-                        let pid_u32 = pid.as_u32();
-                        // ApplePlatform pre-filter (also applies to trial skills).
-                        if is_apple_platform_process(pid_u32) {
-                            // Mark trial as not-runnable so skill_registry doesn't
-                            // penalize the skill for SIP-blocked targets.
-                            targets_found_but_skipped = true;
-                            break;
+                if let Some(&pid_u32) = running_by_name.get(target.as_str()) {
+                    // ApplePlatform pre-filter (also applies to trial skills).
+                    if is_apple_platform_process(pid_u32) {
+                        // Mark trial as not-runnable so skill_registry doesn't
+                        // penalize the skill for SIP-blocked targets.
+                        targets_found_but_skipped = true;
+                        continue;
+                    }
+                    if Some(pid_u32) == foreground_pid {
+                        targets_found_but_skipped = true;
+                    } else {
+                        if !already_actioned.contains(target) {
+                            new_actions.push(RootAction::throttle(
+                                pid_u32,
+                                target.clone(),
+                                false,
+                                format!("trial:{}", skill_name),
+                                DecisionReason::MLWorkload,
+                            ));
                         }
-                        if Some(pid_u32) == foreground_pid {
-                            targets_found_but_skipped = true;
-                        } else {
-                            if !already_actioned.contains(target) {
-                                new_actions.push(RootAction::throttle(
-                                    pid_u32,
-                                    target.clone(),
-                                    false,
-                                    format!("trial:{}", skill_name),
-                                    DecisionReason::MLWorkload,
-                                ));
-                            }
-                            trialed = true;
-                        }
-                        break;
+                        trialed = true;
                     }
                 }
             }

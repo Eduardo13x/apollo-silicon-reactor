@@ -47,8 +47,8 @@ if [ -z "$PYTHON" ]; then
     exit 0
 fi
 
-if ! "$PYTHON" -c "import torch" 2>/dev/null; then
-    log "PyTorch not installed (pip install torch), skipping"
+if ! "$PYTHON" -c "import numpy, torch" 2>/dev/null; then
+    log "PyTorch or NumPy not installed (pip install torch numpy), skipping"
     exit 0
 fi
 

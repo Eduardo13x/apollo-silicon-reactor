@@ -120,7 +120,6 @@ pub fn run_kqueue_tick(
                 let mut frozen_state = state.frozen_state.lock_recover();
                 if frozen_state.remove(&pid).is_some() {
                     write_frozen_state(frozen_state_path, &frozen_state);
-                    state.metrics.lock_recover().metrics.unfreezes_applied += 1;
                 }
                 // Also clean up display turbo's set — prevents unbounded
                 // growth if many processes die while frozen during turbo.

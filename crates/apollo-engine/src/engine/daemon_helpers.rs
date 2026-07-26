@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::process::Child;
+use std::sync::mpsc::{self, Sender};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -573,20 +576,58 @@ pub fn load_frozen_state(path: &Path) -> HashMap<u32, FrozenEntry> {
 
 // ── Freeze Logic ────────────────────────────────────────────────────────────
 
-pub fn unfreeze_pids(pids: impl Iterator<Item = u32>) -> u64 {
-    let mut count = 0_u64;
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UnfreezeOutcome {
+    pub applied_pids: Vec<u32>,
+    pub stale_pids: Vec<u32>,
+    pub failed_pids: Vec<u32>,
+}
+
+impl UnfreezeOutcome {
+    pub fn applied_count(&self) -> u64 {
+        self.applied_pids.len() as u64
+    }
+
+    pub fn forgettable_pids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.applied_pids
+            .iter()
+            .chain(self.stale_pids.iter())
+            .copied()
+    }
+}
+
+fn send_sigcont(pid: u32, outcome: &mut UnfreezeOutcome) {
+    let rc = unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+    if rc == 0 {
+        outcome.applied_pids.push(pid);
+        return;
+    }
+
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    if errno == Some(libc::ESRCH) {
+        outcome.stale_pids.push(pid);
+    } else {
+        tracing::warn!(pid, ?errno, "SIGCONT failed; retaining frozen-state entry");
+        outcome.failed_pids.push(pid);
+    }
+}
+
+pub fn unfreeze_pids_outcome(pids: impl Iterator<Item = u32>) -> UnfreezeOutcome {
+    let mut outcome = UnfreezeOutcome::default();
     for pid in pids {
         // A2 fix (round-3): skip zombies — SIGCONT to a zombie is a no-op
-        // that still burns a syscall and inflates error counters.
+        // that still burns a syscall. The old frozen-state entry is stale.
         if crate::engine::proc_taskinfo::is_zombie_pid(pid) {
+            outcome.stale_pids.push(pid);
             continue;
         }
-        unsafe {
-            libc::kill(pid as i32, libc::SIGCONT);
-        }
-        count += 1;
+        send_sigcont(pid, &mut outcome);
     }
-    count
+    outcome
+}
+
+pub fn unfreeze_pids(pids: impl Iterator<Item = u32>) -> u64 {
+    unfreeze_pids_outcome(pids).applied_count()
 }
 
 /// Unfreeze variant that verifies kernel start-time before signalling.
@@ -599,36 +640,44 @@ pub fn unfreeze_pids(pids: impl Iterator<Item = u32>) -> u64 {
 ///
 /// Entries without `start_sec` (legacy, or capture failed) fall through
 /// to the plain name-based behaviour.
-pub fn unfreeze_pids_verified(entries: &HashMap<u32, FrozenEntry>) -> u64 {
-    let mut count = 0_u64;
+pub fn unfreeze_pids_verified_outcome(entries: &HashMap<u32, FrozenEntry>) -> UnfreezeOutcome {
+    let mut outcome = UnfreezeOutcome::default();
     for (&pid, entry) in entries.iter() {
         if crate::engine::proc_taskinfo::is_zombie_pid(pid) {
+            outcome.stale_pids.push(pid);
             continue;
         }
-        if entry.start_sec > 0 {
-            if let Some(current) = ProcessIdentity::from_pid(pid) {
-                if current.start_sec != entry.start_sec {
-                    // PID was recycled — the frozen process is gone, and
-                    // the new occupant must not receive our SIGCONT.
-                    continue;
-                }
-            } else {
-                // process gone
+
+        // Legacy entries may lack start_sec, but usually retain the process
+        // name. Validate whichever identity fields are available so PID reuse
+        // cannot resume an unrelated process.
+        if entry.start_sec > 0 || entry.process_name.is_some() {
+            let Some(current) = ProcessIdentity::from_pid(pid) else {
+                outcome.stale_pids.push(pid);
+                continue;
+            };
+            if !current.matches(entry.process_name.as_deref(), entry.start_sec, 0) {
+                outcome.stale_pids.push(pid);
                 continue;
             }
         }
-        unsafe {
-            libc::kill(pid as i32, libc::SIGCONT);
-        }
+
+        let applied_before = outcome.applied_pids.len();
+        send_sigcont(pid, &mut outcome);
         // A5/D1 restoration: if we captured a jetsam priority at freeze
         // time, restore it verbatim instead of letting the caller clobber
         // it with a blanket FOREGROUND.
-        if let Some(prio) = entry.original_jetsam_priority {
-            let _ = crate::engine::jetsam_control::set_priority(pid, prio);
+        if outcome.applied_pids.len() > applied_before {
+            if let Some(prio) = entry.original_jetsam_priority {
+                let _ = crate::engine::jetsam_control::set_priority(pid, prio);
+            }
         }
-        count += 1;
     }
-    count
+    outcome
+}
+
+pub fn unfreeze_pids_verified(entries: &HashMap<u32, FrozenEntry>) -> u64 {
+    unfreeze_pids_verified_outcome(entries).applied_count()
 }
 
 /// Returns true when a frozen process should be thawed.
@@ -710,6 +759,78 @@ pub fn pid_start_time(pid: u32) -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReversibleJetsamOutcome {
+    Applied,
+    Refreshed,
+    Unchanged,
+    Stale,
+}
+
+/// Temporarily move one process to the background Jetsam band while retaining
+/// the exact prior band for TTL-based restoration. The live process identity
+/// is checked before the read and again by the mediator immediately before the
+/// write, so a recycled PID cannot inherit Apollo's mutation or ledger lease.
+pub fn apply_reversible_background_jetsam(
+    pid: u32,
+    expected_name: Option<&str>,
+    ttl: Duration,
+    owner: &'static str,
+) -> Result<ReversibleJetsamOutcome, String> {
+    use crate::engine::effect_ledger::{
+        record_global, refresh_global_if_justification, AppliedEffect,
+    };
+    use crate::engine::jetsam_control::{self, priority};
+    use crate::engine::mediator::{mediate, Effect, JetsamEffector, JetsamTierKind, PreCondition};
+
+    let Some(identity) = ProcessIdentity::from_pid(pid) else {
+        return Ok(ReversibleJetsamOutcome::Stale);
+    };
+    if !identity.matches(expected_name, identity.start_sec, identity.start_usec) {
+        return Ok(ReversibleJetsamOutcome::Stale);
+    }
+
+    let prior = jetsam_control::get_priority(pid)
+        .ok_or_else(|| format!("jetsam priority unreadable for pid {pid}"))?;
+    if !identity.is_still_valid() {
+        return Ok(ReversibleJetsamOutcome::Stale);
+    }
+
+    let effect_key = AppliedEffect::JetsamPriority { pid, prior: 0 };
+    if prior == priority::BACKGROUND {
+        return Ok(
+            if refresh_global_if_justification(&effect_key, ttl, identity.start_sec, owner) {
+                ReversibleJetsamOutcome::Refreshed
+            } else {
+                ReversibleJetsamOutcome::Unchanged
+            },
+        );
+    }
+
+    let effect = Effect::SetJetsamTier {
+        pid,
+        start_sec: identity.start_sec,
+        tier: JetsamTierKind::Background,
+    };
+    let precondition = PreCondition {
+        pid_identity: Some((pid, identity.start_sec)),
+        ..Default::default()
+    };
+    match mediate(&effect, &precondition, &JetsamEffector) {
+        Ok(receipt) if receipt.applied_count > 0 => {
+            record_global(
+                AppliedEffect::JetsamPriority { pid, prior },
+                ttl,
+                identity.start_sec,
+                owner,
+            );
+            Ok(ReversibleJetsamOutcome::Applied)
+        }
+        Ok(_) => Ok(ReversibleJetsamOutcome::Unchanged),
+        Err(error) => Err(format!("{error:?}")),
+    }
+}
+
 pub fn parse_profile(input: &str) -> OptimizationProfile {
     match input {
         "aggressive-root" => OptimizationProfile::AggressiveRoot,
@@ -723,9 +844,86 @@ pub fn compute_p95(samples: &[u64]) -> f64 {
         return 0.0;
     }
     let mut sorted = samples.to_vec();
-    sorted.sort_unstable();
     let idx = (((sorted.len() - 1) as f64) * 0.95).round() as usize;
-    sorted[idx] as f64
+    *sorted.select_nth_unstable(idx).1 as f64
+}
+
+type ReapJob = (Child, &'static str);
+
+#[cfg(test)]
+static REAPED_CHILD_PIDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+    std::sync::OnceLock::new();
+
+fn child_reaper_sender() -> std::io::Result<&'static Sender<ReapJob>> {
+    static REAPER: std::sync::OnceLock<Option<Sender<ReapJob>>> = std::sync::OnceLock::new();
+
+    REAPER
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<ReapJob>();
+            std::thread::Builder::new()
+                .name("apollo-child-reaper".to_string())
+                .spawn(move || {
+                    while let Ok((mut child, label)) = rx.recv() {
+                        let pid = child.id();
+                        match child.wait() {
+                            Ok(status) if !status.success() => tracing::warn!(
+                                child_pid = pid,
+                                command = label,
+                                ?status,
+                                "asynchronous child exited unsuccessfully"
+                            ),
+                            Err(error) => tracing::warn!(
+                                child_pid = pid,
+                                command = label,
+                                %error,
+                                "failed to reap asynchronous child"
+                            ),
+                            _ => {}
+                        }
+                        #[cfg(test)]
+                        REAPED_CHILD_PIDS
+                            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(pid);
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("Apollo child reaper thread failed to start"))
+}
+
+/// Spawn a command without blocking the daemon and transfer its `Child` to a
+/// dedicated waiter. Dropping `std::process::Child` does not reap it, so every
+/// fire-and-forget command must use this helper (or wait explicitly).
+pub fn spawn_reaped_command(
+    program: &str,
+    args: &[&str],
+    label: &'static str,
+) -> std::io::Result<u32> {
+    // Start the waiter first: if thread creation fails, no unmanaged child is
+    // launched. A disconnected sender is handled below by killing and waiting.
+    let sender = child_reaper_sender()?;
+    let child = std::process::Command::new(program).args(args).spawn()?;
+    let pid = child.id();
+
+    if let Err(error) = sender.send((child, label)) {
+        let (mut orphan, _) = error.0;
+        let _ = orphan.kill();
+        let _ = orphan.wait();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "Apollo child reaper stopped",
+        ));
+    }
+
+    Ok(pid)
+}
+
+pub fn spawn_reaped_purge() -> bool {
+    spawn_reaped_command("purge", &[], "purge").is_ok()
 }
 
 /// mdutil communicates with the Spotlight server via XPC (com.apple.spotlightserver).
@@ -743,6 +941,41 @@ pub fn spotlight_set_indexing(enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_p95_matches_full_sort_reference() {
+        let samples = [91, 4, 77, 12, 55, 55, 3, 99, 42, 88, 65, 21, 73];
+        for len in 1..=samples.len() {
+            let mut reference = samples[..len].to_vec();
+            reference.sort_unstable();
+            let idx = (((len - 1) as f64) * 0.95).round() as usize;
+            assert_eq!(compute_p95(&samples[..len]), reference[idx] as f64);
+        }
+        assert_eq!(compute_p95(&[]), 0.0);
+    }
+
+    #[test]
+    fn reaped_command_does_not_leave_a_waitable_child() {
+        let pid = spawn_reaped_command("/usr/bin/true", &[], "test-true")
+            .expect("spawn true through child reaper");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+
+        loop {
+            let was_reaped = REAPED_CHILD_PIDS
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&pid);
+            if was_reaped {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child reaper did not collect /usr/bin/true within 2s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn test_should_unfreeze_ttl_path() {
@@ -816,11 +1049,57 @@ mod tests {
                 original_jetsam_priority: None,
             },
         );
-        let count = unfreeze_pids_verified(&entries);
+        let outcome = unfreeze_pids_verified_outcome(&entries);
         assert_eq!(
-            count, 0,
+            outcome.applied_count(),
+            0,
             "unfreeze_pids_verified must skip dead/recycled PIDs (no SIGCONT sent)"
         );
+        assert_eq!(outcome.stale_pids, vec![999_999]);
+        assert!(outcome.failed_pids.is_empty());
+    }
+
+    #[test]
+    fn legacy_unfreeze_entry_rejects_recycled_pid_by_name() {
+        use crate::engine::types::{FreezeSource, FrozenEntry};
+        let pid = std::process::id();
+        let mut entries = HashMap::new();
+        entries.insert(
+            pid,
+            FrozenEntry {
+                frozen_at: chrono::Utc::now(),
+                source: FreezeSource::MainLoop,
+                pressure_at_freeze: 0.8,
+                process_name: Some("definitely-not-this-test-process".to_string()),
+                start_sec: 0,
+                original_jetsam_priority: None,
+            },
+        );
+
+        let outcome = unfreeze_pids_verified_outcome(&entries);
+        assert_eq!(outcome.applied_count(), 0);
+        assert_eq!(outcome.stale_pids, vec![pid]);
+    }
+
+    #[test]
+    fn unfreeze_outcome_counts_only_successful_signal() {
+        let pid = std::process::id();
+        let outcome = unfreeze_pids_outcome(std::iter::once(pid));
+        assert_eq!(outcome.applied_pids, vec![pid]);
+        assert!(outcome.stale_pids.is_empty());
+        assert!(outcome.failed_pids.is_empty());
+    }
+
+    #[test]
+    fn reversible_jetsam_rejects_wrong_process_name_before_kernel_write() {
+        let outcome = apply_reversible_background_jetsam(
+            std::process::id(),
+            Some("definitely-not-this-test-process"),
+            Duration::from_secs(1),
+            "test: wrong process identity",
+        )
+        .expect("identity rejection is a normal stale outcome");
+        assert_eq!(outcome, ReversibleJetsamOutcome::Stale);
     }
 
     /// Serialize sentinel tests — they share a global file path.

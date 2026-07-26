@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 
 use apollo_engine::collector::SystemSnapshot;
 use apollo_engine::engine::chromium_manager::ChromiumManager;
+use apollo_engine::engine::daemon_helpers::{
+    apply_reversible_background_jetsam, spawn_reaped_purge, ReversibleJetsamOutcome,
+};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::learned_state::LearnableParams;
 use apollo_engine::engine::lock_ext::LockRecover;
@@ -32,6 +35,37 @@ use apollo_engine::engine::signal_intelligence::SignalIntelligence;
 /// survival writes the shared timestamp but NEVER reads it, so a recent
 /// maintenance purge cannot block a real OOM-imminent purge.
 static SURVIVAL_LOCAL_COOLDOWN: Mutex<Option<Instant>> = Mutex::new(None);
+
+const SURVIVAL_JETSAM_OWNER: &str = "survival: chromium jetsam BACKGROUND";
+const SURVIVAL_JETSAM_TTL: Duration = Duration::from_secs(90);
+
+fn apply_survival_jetsam_demotions(chromium_mgr: &ChromiumManager) -> u64 {
+    let mut applied = 0u64;
+    for (pid, name) in chromium_mgr.survival_jetsam_candidates() {
+        match apply_reversible_background_jetsam(
+            pid,
+            Some(&name),
+            SURVIVAL_JETSAM_TTL,
+            SURVIVAL_JETSAM_OWNER,
+        ) {
+            Ok(ReversibleJetsamOutcome::Applied) => {
+                applied = applied.saturating_add(1);
+            }
+            Ok(
+                ReversibleJetsamOutcome::Refreshed
+                | ReversibleJetsamOutcome::Unchanged
+                | ReversibleJetsamOutcome::Stale,
+            ) => {}
+            Err(error) => tracing::debug!(
+                pid,
+                process = name.as_str(),
+                error = error.as_str(),
+                "survival: reversible Chromium Jetsam demotion skipped"
+            ),
+        }
+    }
+    applied
+}
 
 /// Run survival-mode detection, overflow recording, and threshold decay.
 ///
@@ -137,8 +171,16 @@ pub fn run_survival_tick(
         drop(guard);
 
         // Jetsam demotion: mark non-foreground Chromium renderers as BACKGROUND
-        // so the kernel kills them first under OOM — softer than SIGSTOP.
-        let _ = chromium_mgr.demote_background_renderers();
+        // with an exact-prior ledger entry. The 90s lease is refreshed while
+        // survival remains active and automatically restores afterward.
+        let demoted = apply_survival_jetsam_demotions(chromium_mgr);
+        if demoted > 0 {
+            state
+                .metrics
+                .lock_recover()
+                .metrics
+                .chromium_jetsam_demotions_total += demoted;
+        }
 
         // Last-resort page reclaim: spawn `purge` when swap crosses 80% of
         // exhaustion threshold. Survival reads its OWN local cooldown only —
@@ -152,7 +194,7 @@ pub fn run_survival_tick(
             let can_purge = local
                 .map(|t: Instant| t.elapsed() >= Duration::from_secs(600))
                 .unwrap_or(true);
-            if can_purge && std::process::Command::new("purge").spawn().is_ok() {
+            if can_purge && spawn_reaped_purge() {
                 *local = Some(Instant::now());
                 // Write shared timestamp so maintenance_tick yields.
                 // Survival itself does NOT read this field — asymmetric.

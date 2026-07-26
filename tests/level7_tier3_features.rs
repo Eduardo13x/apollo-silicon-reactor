@@ -481,6 +481,7 @@ fn test_power_analytics_integration() {
         1,
     );
 
-    assert!(rec.target_frequency > 0);
+    assert!(rec.active_cores > 0);
+    assert_eq!(rec.target_frequency, power.power_state.cpu_frequency_mhz);
     assert!(analytics.calculate_analytics().total_optimizations > 0);
 }

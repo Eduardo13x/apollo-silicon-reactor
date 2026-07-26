@@ -164,6 +164,28 @@ impl FluidityState {
         self.fluidity_degraded_threshold = degraded.clamp(0.30, 0.90);
     }
 
+    /// Conservative probability proxy for visible jank within 60 seconds.
+    ///
+    /// The Kalman state predicts fluidity about three seconds ahead. Extend its
+    /// velocity over the remaining horizon, then measure only the deficit below
+    /// the learned degraded threshold. Healthy headroom therefore reports zero;
+    /// falling fluidity rises smoothly and a projected collapse approaches one.
+    pub fn predicted_jank_probability_60s(&self) -> f64 {
+        const REMAINING_HORIZON_SECS: f64 = 57.0;
+        const DEGRADED_RISK_FLOOR: f64 = 0.15;
+
+        let threshold = self.fluidity_degraded_threshold as f64;
+        let predicted_3s = self.fluidity_predicted_3s as f64;
+        let projected_60s =
+            (predicted_3s + self.fluidity_velocity as f64 * REMAINING_HORIZON_SECS).clamp(0.0, 1.0);
+        let deficit = |fluidity: f64| ((threshold - fluidity) / threshold).clamp(0.0, 1.0);
+        let mut probability = deficit(predicted_3s).max(deficit(projected_60s));
+        if self.fluidity_degraded {
+            probability = probability.max(DEGRADED_RISK_FLOOR);
+        }
+        probability
+    }
+
     /// Update fluidity state from a new daemon cycle snapshot.
     ///
     /// `processes`: Iterator of (pid, name, cpu_pct) from sysinfo snapshot.
@@ -577,6 +599,30 @@ mod tests {
             "prediction out of range: {}",
             state.fluidity_predicted_3s
         );
+    }
+
+    #[test]
+    fn jank_probability_is_zero_with_healthy_headroom() {
+        let state = FluidityState::new();
+        assert_eq!(state.predicted_jank_probability_60s(), 0.0);
+    }
+
+    #[test]
+    fn jank_probability_uses_degraded_floor() {
+        let mut state = FluidityState::new();
+        state.fluidity_predicted_3s = 0.64;
+        state.fluidity_velocity = 0.0;
+        state.fluidity_degraded = true;
+        assert!((state.predicted_jank_probability_60s() - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn jank_probability_anticipates_falling_fluidity() {
+        let mut state = FluidityState::new();
+        state.fluidity_predicted_3s = 0.80;
+        state.fluidity_velocity = -0.02;
+        let probability = state.predicted_jank_probability_60s();
+        assert!(probability > 0.9, "probability={probability}");
     }
 
     // ── Micro-benchmarks ─────────────────────────────────────────────────────

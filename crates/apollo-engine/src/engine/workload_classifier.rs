@@ -461,30 +461,40 @@ pub struct WorkloadFeatures {
     pub gpu_active: f64,
     /// Total RSS of all processes in GB.
     pub total_rss_gb: f64,
+    /// Physical RAM in GB. Used to normalize resident memory so classifier
+    /// behavior transfers between 8, 16, and 32+ GB Apple Silicon systems.
+    pub total_ram_gb: f64,
     /// Count of behavior-interactive PIDs (Phase 2).
     pub interactive_count: f64,
 }
 
-/// Pre-defined centroids tuned for M1 8GB MacBook Air.
-/// Dimensions: [avg_cpu_wall_ratio, build_tool_count, gpu_active, total_rss_gb, interactive_count]
+/// Hardware-normalized centroids. The memory dimension is resident-RAM
+/// fraction rather than absolute GB, removing the original M1 8GB bias.
+/// Dimensions: [avg_cpu_wall_ratio, build_tool_count, gpu_active, rss_fraction, interactive_count]
 const CENTROIDS: [(WorkloadMode, [f64; 5]); 4] = [
-    (WorkloadMode::Build, [0.75, 3.0, 0.0, 5.0, 2.0]),
-    (WorkloadMode::LlmInference, [0.60, 0.0, 1.0, 4.0, 1.0]),
-    (WorkloadMode::Browsing, [0.03, 0.0, 0.3, 3.0, 5.0]),
-    (WorkloadMode::Idle, [0.01, 0.0, 0.0, 1.0, 0.0]),
+    (WorkloadMode::Build, [0.75, 3.0, 0.0, 0.625, 2.0]),
+    (WorkloadMode::LlmInference, [0.60, 0.0, 1.0, 0.500, 1.0]),
+    (WorkloadMode::Browsing, [0.03, 0.0, 0.3, 0.375, 5.0]),
+    (WorkloadMode::Idle, [0.01, 0.0, 0.0, 0.125, 0.0]),
 ];
 
 /// Normalization ranges per feature dimension (prevents scale bias).
-const FEATURE_RANGES: [f64; 5] = [1.0, 4.0, 1.0, 6.0, 6.0];
+const FEATURE_RANGES: [f64; 5] = [1.0, 4.0, 1.0, 0.75, 6.0];
 
 /// Classify the current system state into one of 4 workload modes.
 /// Returns (mode, confidence) where confidence ∈ [0, 1].
 pub fn classify_workload_mode(features: &WorkloadFeatures) -> (WorkloadMode, f64) {
+    let rss_fraction = if features.total_ram_gb.is_finite() && features.total_ram_gb > 0.0 {
+        (features.total_rss_gb / features.total_ram_gb).clamp(0.0, 2.0)
+    } else {
+        // Preserve the old 8 GB calibration if hardware discovery is absent.
+        (features.total_rss_gb / 8.0).clamp(0.0, 2.0)
+    };
     let fv = [
         features.avg_cpu_wall_ratio,
         features.build_tool_count,
         features.gpu_active,
-        features.total_rss_gb,
+        rss_fraction,
         features.interactive_count,
     ];
 
@@ -602,6 +612,7 @@ mod feature_tests {
             build_tool_count: 4.0,
             gpu_active: 0.0,
             total_rss_gb: 5.5,
+            total_ram_gb: 8.0,
             interactive_count: 1.0,
         });
         assert_eq!(mode, WorkloadMode::Build);
@@ -615,6 +626,7 @@ mod feature_tests {
             build_tool_count: 0.0,
             gpu_active: 0.0,
             total_rss_gb: 0.8,
+            total_ram_gb: 8.0,
             interactive_count: 0.0,
         });
         assert_eq!(mode, WorkloadMode::Idle);
@@ -627,6 +639,7 @@ mod feature_tests {
             build_tool_count: 0.0,
             gpu_active: 0.2,
             total_rss_gb: 3.5,
+            total_ram_gb: 8.0,
             interactive_count: 6.0,
         });
         assert_eq!(mode, WorkloadMode::Browsing);
@@ -639,9 +652,27 @@ mod feature_tests {
             build_tool_count: 0.0,
             gpu_active: 1.0,
             total_rss_gb: 4.5,
+            total_ram_gb: 8.0,
             interactive_count: 1.0,
         });
         assert_eq!(mode, WorkloadMode::LlmInference);
+    }
+
+    #[test]
+    fn browsing_classification_scales_from_8gb_to_16gb() {
+        let classify = |rss, ram| {
+            classify_workload_mode(&WorkloadFeatures {
+                avg_cpu_wall_ratio: 0.02,
+                build_tool_count: 0.0,
+                gpu_active: 0.2,
+                total_rss_gb: rss,
+                total_ram_gb: ram,
+                interactive_count: 6.0,
+            })
+            .0
+        };
+        assert_eq!(classify(3.5, 8.0), WorkloadMode::Browsing);
+        assert_eq!(classify(7.0, 16.0), WorkloadMode::Browsing);
     }
 
     #[test]

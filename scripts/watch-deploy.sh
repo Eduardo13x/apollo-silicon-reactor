@@ -16,6 +16,7 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
+source scripts/hardware-build-profile.sh
 REPORT="/tmp/apollo-pipeline-report.txt"
 TRIGGER="/tmp/apollo-trigger"
 OBSERVE="/tmp/apollo-observe"
@@ -371,7 +372,7 @@ while true; do
         # Build
         write_report ""
         write_report "── BUILD ──"
-        BUILD_OUT=$(cargo build --release 2>&1)
+        BUILD_OUT=$(cargo build --release ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} 2>&1)
         BUILD_RC=$?
         write_report "$BUILD_OUT"
         if [ $BUILD_RC -ne 0 ]; then

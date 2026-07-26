@@ -223,7 +223,10 @@ fn test_zombie_hunter_detects_true_zombie() {
     let mut hunter = ZombieHunter::new();
     let snap = make_hunt("crashed_app", true, true);
 
-    // True zombie should be detected immediately (no confirmation needed)
+    // A normal child briefly enters SZOMB before its parent waits. Require
+    // persistence so that healthy hand-off is not reported as instability.
+    assert!(hunter.evaluate(&snap).is_none());
+    assert!(hunter.evaluate(&snap).is_none());
     let result = hunter.evaluate(&snap);
     assert!(result.is_some());
     let dw = result.unwrap();
@@ -237,11 +240,13 @@ fn test_zombie_hunter_detects_orphan() {
     let mut snap = make_hunt("orphan", false, false);
     snap.ppid = 999; // Non-launchd parent
 
+    assert!(hunter.evaluate(&snap).is_none());
+    assert!(hunter.evaluate(&snap).is_none());
     let result = hunter.evaluate(&snap);
     assert!(result.is_some());
     let dw = result.unwrap();
     assert_eq!(dw.zombie_class, ZombieClass::Orphan);
-    assert_eq!(dw.recommended_action, ZombieAction::Kill);
+    assert_eq!(dw.recommended_action, ZombieAction::Suspend);
 }
 
 #[test]
@@ -459,6 +464,8 @@ fn test_governor_kills_true_zombie() {
     hunt.pid = 9999;
     let hunts = vec![hunt];
 
+    assert!(gov.decide_all(&procs, &hunts, None, &[], 10).is_empty());
+    assert!(gov.decide_all(&procs, &hunts, None, &[], 10).is_empty());
     let decisions = gov.decide_all(&procs, &hunts, None, &[], 10);
 
     let zombie = decisions.iter().find(|d| d.name == "crashed_app");

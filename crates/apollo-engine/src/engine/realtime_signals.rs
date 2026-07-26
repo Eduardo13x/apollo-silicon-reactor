@@ -17,7 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::engine::proc_taskinfo::{get_proc_path, list_all_pids};
+use crate::engine::proc_taskinfo::{get_proc_path, get_rusage_info, list_all_pids};
 
 /// How long a scan result stays valid before the proc table is re-scanned.
 /// 6s balances detection latency (screen shares last minutes) against the
@@ -28,10 +28,54 @@ const SCREEN_CAPTURE_TTL: Duration = Duration::from_secs(6);
 /// Matched against the *full* proc_pidpath so a user binary named e.g.
 /// `myreplayd-tool` cannot spoof the gate — the path must end with the
 /// exact `/name` component.
-fn is_screen_capture_path(path: &str) -> bool {
+fn is_strong_screen_capture_path(path: &str) -> bool {
+    path.ends_with("/screencaptureui") || path.ends_with("/ScreenSharingAgent")
+}
+
+fn is_replayd_path(path: &str) -> bool {
     path.ends_with("/replayd")
-        || path.ends_with("/screencaptureui")
-        || path.ends_with("/ScreenSharingAgent")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReplaydSample {
+    pid: u32,
+    proc_start_abstime: u64,
+    cpu_ns: u64,
+    io_bytes: u64,
+    sampled_at: Instant,
+}
+
+impl ReplaydSample {
+    fn read(pid: u32) -> Option<Self> {
+        let usage = get_rusage_info(pid)?;
+        Some(Self {
+            pid,
+            proc_start_abstime: usage.proc_start_abstime,
+            cpu_ns: usage.on_cpu_ns(),
+            io_bytes: usage.disk_read_bytes.saturating_add(usage.disk_write_bytes),
+            sampled_at: Instant::now(),
+        })
+    }
+}
+
+fn replayd_is_actively_capturing(previous: ReplaydSample, current: ReplaydSample) -> bool {
+    if previous.pid != current.pid || previous.proc_start_abstime != current.proc_start_abstime {
+        return false;
+    }
+    let elapsed_ns = current
+        .sampled_at
+        .saturating_duration_since(previous.sampled_at)
+        .as_nanos() as u64;
+    if elapsed_ns == 0 {
+        return false;
+    }
+
+    // A resident replayd is normal on modern macOS. Require measurable work:
+    // at least 0.5% of one core, or sustained 64 KiB/s of I/O, over the TTL.
+    let cpu_delta = current.cpu_ns.saturating_sub(previous.cpu_ns);
+    let io_delta = current.io_bytes.saturating_sub(previous.io_bytes);
+    cpu_delta.saturating_mul(200) >= elapsed_ns
+        || io_delta.saturating_mul(1_000_000_000) >= elapsed_ns.saturating_mul(64 * 1024)
 }
 
 /// TTL-cached detector for active screen capture (replayd et al.).
@@ -42,6 +86,7 @@ fn is_screen_capture_path(path: &str) -> bool {
 pub struct ScreenCaptureCache {
     last_check: Option<Instant>,
     cached: bool,
+    replayd_sample: Option<ReplaydSample>,
 }
 
 impl Default for ScreenCaptureCache {
@@ -55,6 +100,7 @@ impl ScreenCaptureCache {
         Self {
             last_check: None,
             cached: false,
+            replayd_sample: None,
         }
     }
 
@@ -69,24 +115,42 @@ impl ScreenCaptureCache {
                 return self.cached;
             }
         }
-        self.cached = scan_for_screen_capture();
+        let scan = scan_for_screen_capture();
+        self.cached = scan.strong_capture
+            || scan
+                .replayd
+                .zip(self.replayd_sample)
+                .is_some_and(|(current, previous)| {
+                    replayd_is_actively_capturing(previous, current)
+                });
+        self.replayd_sample = scan.replayd;
         self.last_check = Some(Instant::now());
         self.cached
     }
 }
 
-/// One full proc-table pass: ~2-4ms over ~600 pids. Early-returns true on
-/// the first screen-capture binary found. Pids that vanish mid-scan (or
-/// deny proc_pidpath) are skipped — best-effort per daemon discipline.
-fn scan_for_screen_capture() -> bool {
+#[derive(Default)]
+struct CaptureScan {
+    strong_capture: bool,
+    replayd: Option<ReplaydSample>,
+}
+
+/// One full proc-table pass: ~2-4ms over ~600 pids. A resident `replayd`
+/// alone is not a capture signal; its activity is compared across scans.
+fn scan_for_screen_capture() -> CaptureScan {
+    let mut scan = CaptureScan::default();
     for pid in list_all_pids() {
         if let Some(path) = get_proc_path(pid) {
-            if is_screen_capture_path(&path) {
-                return true;
+            if is_strong_screen_capture_path(&path) {
+                scan.strong_capture = true;
+                break;
+            }
+            if scan.replayd.is_none() && is_replayd_path(&path) {
+                scan.replayd = ReplaydSample::read(pid);
             }
         }
     }
-    false
+    scan
 }
 
 #[cfg(test)]
@@ -95,11 +159,11 @@ mod tests {
 
     #[test]
     fn screen_capture_path_matches_exact_suffixes() {
-        assert!(is_screen_capture_path("/usr/libexec/replayd"));
-        assert!(is_screen_capture_path(
+        assert!(is_replayd_path("/usr/libexec/replayd"));
+        assert!(is_strong_screen_capture_path(
             "/System/Library/CoreServices/screencaptureui"
         ));
-        assert!(is_screen_capture_path(
+        assert!(is_strong_screen_capture_path(
             "/System/Library/CoreServices/RemoteManagement/ScreenSharingAgent"
         ));
     }
@@ -107,11 +171,11 @@ mod tests {
     #[test]
     fn screen_capture_path_rejects_lookalikes_and_substrings() {
         // Suffix match must require the exact `/name` component.
-        assert!(!is_screen_capture_path("/usr/local/bin/myreplayd-tool"));
-        assert!(!is_screen_capture_path("/usr/local/bin/notreplayd"));
-        assert!(!is_screen_capture_path("/usr/libexec/replayd/helper"));
-        assert!(!is_screen_capture_path(""));
-        assert!(!is_screen_capture_path("/usr/sbin/cfprefsd"));
+        assert!(!is_replayd_path("/usr/local/bin/myreplayd-tool"));
+        assert!(!is_replayd_path("/usr/local/bin/notreplayd"));
+        assert!(!is_replayd_path("/usr/libexec/replayd/helper"));
+        assert!(!is_strong_screen_capture_path(""));
+        assert!(!is_strong_screen_capture_path("/usr/sbin/cfprefsd"));
     }
 
     #[test]
@@ -133,6 +197,7 @@ mod tests {
         let mut cache = ScreenCaptureCache {
             last_check: Some(Instant::now()),
             cached: true,
+            replayd_sample: None,
         };
         assert!(cache.check(), "fresh TTL must return cached value");
 
@@ -141,6 +206,7 @@ mod tests {
         let mut cache = ScreenCaptureCache {
             last_check: Some(Instant::now()),
             cached: false,
+            replayd_sample: None,
         };
         assert!(!cache.check(), "fresh TTL must return cached value");
     }
@@ -151,6 +217,7 @@ mod tests {
         let mut cache = ScreenCaptureCache {
             last_check: Some(stale),
             cached: true,
+            replayd_sample: None,
         };
         let _ = cache.check();
         // The rescan must refresh the timestamp regardless of verdict.
@@ -158,5 +225,38 @@ mod tests {
             cache.last_check.expect("timestamp refreshed").elapsed() < Duration::from_secs(2),
             "expired TTL must trigger a rescan and refresh last_check"
         );
+    }
+
+    #[test]
+    fn idle_replayd_does_not_count_as_screen_capture() {
+        let previous = ReplaydSample {
+            pid: 42,
+            proc_start_abstime: 7,
+            cpu_ns: 1_000_000,
+            io_bytes: 4096,
+            sampled_at: Instant::now() - Duration::from_secs(6),
+        };
+        let current = ReplaydSample {
+            sampled_at: Instant::now(),
+            ..previous
+        };
+        assert!(!replayd_is_actively_capturing(previous, current));
+    }
+
+    #[test]
+    fn active_replayd_counts_as_screen_capture() {
+        let previous = ReplaydSample {
+            pid: 42,
+            proc_start_abstime: 7,
+            cpu_ns: 1_000_000,
+            io_bytes: 4096,
+            sampled_at: Instant::now() - Duration::from_secs(6),
+        };
+        let current = ReplaydSample {
+            cpu_ns: previous.cpu_ns + 60_000_000,
+            sampled_at: Instant::now(),
+            ..previous
+        };
+        assert!(replayd_is_actively_capturing(previous, current));
     }
 }

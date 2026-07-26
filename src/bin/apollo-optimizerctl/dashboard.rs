@@ -186,6 +186,29 @@ fn profile_emoji(p: OptimizationProfile) -> &'static str {
     }
 }
 
+/// Short, current explanation for a profile that differs from its configured
+/// base. `transition_reason` is historical state, so it can be stale after an
+/// override expires; the dashboard should describe live signals instead.
+fn profile_activity_reason(status: &DaemonStatus) -> &'static str {
+    if status.override_active {
+        "Override manual"
+    } else if status.effective_profile == status.base_profile {
+        "Base estable"
+    } else if status.metrics.context_switch_burst {
+        "Auto: cambios de app"
+    } else if status.metrics.dev_session_active {
+        "Auto: desarrollo"
+    } else if status.metrics.interactive_heavy {
+        "Auto: interacción"
+    } else if status.metrics.memory_pressure >= 0.60 || status.metrics.si_p_oom_30s >= 0.30 {
+        "Auto: memoria"
+    } else if matches!(status.thermal_state.as_str(), "serious" | "critical") {
+        "Auto: térmico"
+    } else {
+        "Auto: transición"
+    }
+}
+
 fn format_number(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -428,13 +451,19 @@ fn render_decide_q(status: &DaemonStatus) -> Vec<String> {
         lines.push(format!("FG     {} {}", active, name));
     }
 
-    // Profile
-    let prof_emoji = profile_emoji(status.effective_profile);
+    // Profile: distinguish the configured baseline from the profile currently
+    // in force, and never show a stale transition reason as a live cause.
     lines.push(format!(
-        "Profile {} {}",
-        prof_emoji,
+        "Activo  {} {}",
+        profile_emoji(status.effective_profile),
         status.effective_profile.as_str()
     ));
+    lines.push(format!(
+        "Base    {} {}",
+        profile_emoji(status.base_profile),
+        status.base_profile.as_str()
+    ));
+    lines.push(format!("Motivo  {}", profile_activity_reason(status)));
 
     // Teacher (Gemma 4 local LLM) — daily teach-call budget
     if let Some(l) = &status.llm {
@@ -734,12 +763,12 @@ fn render_header_v2(status: &DaemonStatus) -> Vec<String> {
         red("Detenido")
     };
     let profile = format!(
-        "{} {}",
+        "activo {} {}",
         profile_emoji(status.effective_profile),
         status.effective_profile.as_str()
     );
     let mut lines = vec![bold(&format!(
-        "🚀 APOLLO {} │ {} │ ciclos: {} │ p95 {:.0}ms",
+        "🚀 APOLLO {} │ {} │ c:{} │ p95 {:.0}ms",
         state,
         profile,
         format_number(m.cycles),
@@ -815,6 +844,67 @@ pub fn render_dashboard_v2(status: &DaemonStatus) -> String {
 mod tests {
     use super::*;
     use apollo_engine::engine::types::{LatencyTarget, RuntimeMetrics};
+
+    fn dashboard_status() -> DaemonStatus {
+        DaemonStatus {
+            running: true,
+            profile: OptimizationProfile::BalancedRoot,
+            latency_target: LatencyTarget::Normal,
+            effective_profile: OptimizationProfile::BalancedRoot,
+            kill_switch: false,
+            throttle_level: "low".to_string(),
+            thermal_state: "nominal".to_string(),
+            last_blockers: Vec::new(),
+            auto_profile_enabled: true,
+            base_profile: OptimizationProfile::BalancedRoot,
+            override_active: false,
+            override_expires_at: None,
+            transition_reason: String::new(),
+            post_wake_grace_active: false,
+            post_wake_grace_remaining_secs: 0,
+            last_wake_at: None,
+            post_wake_policy: String::new(),
+            reactor_mode: "normal".to_string(),
+            reactor_health: "ok".to_string(),
+            metrics: RuntimeMetrics::default(),
+            llm: None,
+            frozen_processes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dashboard_explains_an_automatic_active_profile_with_live_signals() {
+        let mut status = dashboard_status();
+        status.effective_profile = OptimizationProfile::AggressiveRoot;
+        status.metrics.context_switch_burst = true;
+        status.transition_reason = "manual-override-cleared".to_string();
+
+        assert_eq!(profile_activity_reason(&status), "Auto: cambios de app");
+
+        let decide = render_decide_q(&status);
+        assert!(decide
+            .iter()
+            .any(|line| line == "Activo  ⚡ aggressive-root"));
+        assert!(decide.iter().any(|line| line == "Base    🔵 balanced-root"));
+        assert!(decide
+            .iter()
+            .any(|line| line == "Motivo  Auto: cambios de app"));
+        assert!(decide.iter().all(|line| display_width(line) <= QW));
+
+        let header = render_header_v2(&status);
+        assert!(header[0].contains("activo ⚡ aggressive-root"));
+        assert!(header.iter().all(|line| display_width(line) <= CW));
+    }
+
+    #[test]
+    fn dashboard_marks_manual_overrides_explicitly() {
+        let mut status = dashboard_status();
+        status.effective_profile = OptimizationProfile::AggressiveRoot;
+        status.override_active = true;
+        status.metrics.context_switch_burst = true;
+
+        assert_eq!(profile_activity_reason(&status), "Override manual");
+    }
 
     #[test]
     fn swap_label_stable_when_low_and_no_delta() {

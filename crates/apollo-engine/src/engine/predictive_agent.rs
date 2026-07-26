@@ -17,6 +17,7 @@
 //! No external dependencies — pure f64 arithmetic.
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use crate::engine::nars_belief::DriftDetector;
@@ -35,6 +36,9 @@ const WARMUP_CYCLES: u32 = 200;
 const SEEDED_WARMUP_CYCLES: u32 = 50;
 const PERSIST_INTERVAL: u32 = 100;
 const TIGHTEN_OFFSET: f64 = -0.03; // 3pp tighter thresholds
+const AGENT_STATE_VERSION: u32 = 2;
+const OUTCOME_DELAY_CYCLES: u64 = 5;
+const MAX_CARRIED_PULLS_PER_ARM: u64 = 200;
 
 // ── Intervention (arm) ───────────────────────────────────────────────────────
 
@@ -770,9 +774,38 @@ impl LinUCBArm {
         self.pull_count += 1;
         self.reward_sum += reward;
     }
+
+    /// Compress stale evidence while preserving the learned mean and geometry.
+    /// A = I + Σxx', so scale only the evidence part around identity.
+    fn cap_effective_history(&mut self, max_pulls: u64) {
+        if self.pull_count <= max_pulls || max_pulls == 0 {
+            return;
+        }
+        let scale = max_pulls as f64 / self.pull_count as f64;
+        for row in 0..D {
+            for col in 0..D {
+                let index = row * D + col;
+                let identity = if row == col { 1.0 } else { 0.0 };
+                self.a.data[index] = identity + (self.a.data[index] - identity) * scale;
+            }
+        }
+        for value in &mut self.b {
+            *value *= scale;
+        }
+        self.reward_sum *= scale;
+        self.pull_count = max_pulls;
+    }
 }
 
 // ── Persisted state ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingOutcome {
+    intervention: Intervention,
+    features: [f64; D],
+    pressure_at_action: f64,
+    due_cycle: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PredictiveAgentState {
@@ -781,6 +814,10 @@ struct PredictiveAgentState {
     alpha: f64,
     total_cycles: u64,
     warmup_remaining: u32,
+    #[serde(default)]
+    pending_outcomes: VecDeque<PendingOutcome>,
+    #[serde(default)]
+    resolved_outcomes: u64,
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -796,6 +833,8 @@ pub struct PredictiveAgent {
     /// Cycles since last persist.
     cycles_since_persist: u32,
     path: PathBuf,
+    pending_outcomes: VecDeque<PendingOutcome>,
+    resolved_outcomes: u64,
 }
 
 impl PredictiveAgent {
@@ -809,6 +848,8 @@ impl PredictiveAgent {
             last_action: None,
             cycles_since_persist: 0,
             path: path.to_path_buf(),
+            pending_outcomes: VecDeque::with_capacity(OUTCOME_DELAY_CYCLES as usize + 1),
+            resolved_outcomes: 0,
         };
 
         let loaded = std::fs::read_to_string(path)
@@ -816,16 +857,25 @@ impl PredictiveAgent {
             .and_then(|s| serde_json::from_str::<PredictiveAgentState>(&s).ok());
 
         match loaded {
-            Some(state) if state.version == 1 && state.arms.len() == K => {
+            Some(state)
+                if (1..=AGENT_STATE_VERSION).contains(&state.version) && state.arms.len() == K =>
+            {
+                let migrating_same_cycle_rewards = state.version < AGENT_STATE_VERSION;
                 let mut arms: [LinUCBArm; K] = std::array::from_fn(|_| LinUCBArm::new());
                 for (i, arm) in state.arms.into_iter().enumerate() {
                     if arm.b.len() == D && arm.a.data.len() == D * D {
                         arms[i] = arm;
+                        if migrating_same_cycle_rewards {
+                            arms[i].cap_effective_history(MAX_CARRIED_PULLS_PER_ARM);
+                        }
                     }
                 }
                 eprintln!(
-                    "predictive-agent: loaded — {} cycles trained, warmup={}",
-                    state.total_cycles, state.warmup_remaining
+                    "predictive-agent: loaded — {} cycles trained, warmup={}, delayed_rewards={}, migrated={}",
+                    state.total_cycles,
+                    state.warmup_remaining,
+                    state.resolved_outcomes,
+                    migrating_same_cycle_rewards
                 );
                 Self {
                     arms,
@@ -835,6 +885,8 @@ impl PredictiveAgent {
                     last_action: None,
                     cycles_since_persist: 0,
                     path: path.to_path_buf(),
+                    pending_outcomes: state.pending_outcomes,
+                    resolved_outcomes: state.resolved_outcomes,
                 }
             }
             _ => {
@@ -903,19 +955,44 @@ impl PredictiveAgent {
         (intervention, confidence)
     }
 
-    /// Observe the outcome: current pressure after the intervention had time to act.
-    /// Call this after execute_actions + outcome_tracker.tick().
+    /// Observe current pressure and resolve interventions whose effect horizon elapsed.
+    /// A five-cycle delay prevents training against the same snapshot used to choose
+    /// the action, which always produced a zero delta in the old implementation.
     pub fn observe_outcome(&mut self, current_pressure: f64) {
         self.total_cycles += 1;
 
-        let (intervention, features, pressure_at_action) = match self.last_action.take() {
-            Some(v) => v,
-            None => return,
-        };
+        while self
+            .pending_outcomes
+            .front()
+            .is_some_and(|pending| pending.due_cycle <= self.total_cycles)
+        {
+            let pending = self.pending_outcomes.pop_front().expect("front checked");
+            let reward = Self::reward_for(
+                pending.intervention,
+                pending.pressure_at_action,
+                current_pressure,
+            );
+            self.arms[pending.intervention.index()].update(&pending.features, reward);
+            self.resolved_outcomes = self.resolved_outcomes.saturating_add(1);
+        }
 
-        let delta = pressure_at_action - current_pressure; // positive = pressure dropped
+        if let Some((intervention, features, pressure_at_action)) = self.last_action.take() {
+            self.pending_outcomes.push_back(PendingOutcome {
+                intervention,
+                features,
+                pressure_at_action,
+                due_cycle: self.total_cycles.saturating_add(OUTCOME_DELAY_CYCLES),
+            });
+        }
+    }
 
-        let reward = if intervention == Intervention::Observe {
+    fn reward_for(
+        intervention: Intervention,
+        pressure_at_action: f64,
+        current_pressure: f64,
+    ) -> f64 {
+        let delta = pressure_at_action - current_pressure;
+        if intervention == Intervention::Observe {
             // Observe: penalize only if pressure spiked while we did nothing.
             if delta < -0.05 {
                 -0.3
@@ -924,12 +1001,6 @@ impl PredictiveAgent {
             }
         } else {
             // Active intervention.
-            // NOTE: interventions take 3-10 cycles to show pressure impact.
-            // Measuring 1 cycle after action almost never captures the full drop,
-            // so the old -0.1 "unnecessary action" penalty was applied in ~95% of
-            // active pulls, causing the bandit to converge permanently to Observe.
-            // Fix: no penalty when pressure is stable — we don't know yet whether
-            // the action was useful. Only penalize when pressure actively worsened.
             if delta > 0.05 {
                 (delta * 5.0).clamp(0.0, 1.0) // clear improvement
             } else if delta < -0.03 {
@@ -937,9 +1008,7 @@ impl PredictiveAgent {
             } else {
                 0.0 // neutral: too early to judge
             }
-        };
-
-        self.arms[intervention.index()].update(&features, reward);
+        }
     }
 
     /// Returns the threshold adjustment if TightenThresholds was chosen, else 0.
@@ -967,11 +1036,13 @@ impl PredictiveAgent {
 
     fn persist(&self) {
         let state = PredictiveAgentState {
-            version: 1,
+            version: AGENT_STATE_VERSION,
             arms: self.arms.to_vec(),
             alpha: self.alpha,
             total_cycles: self.total_cycles,
             warmup_remaining: self.warmup_remaining,
+            pending_outcomes: self.pending_outcomes.clone(),
+            resolved_outcomes: self.resolved_outcomes,
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = std::fs::write(&self.path, json);
@@ -1002,6 +1073,14 @@ impl PredictiveAgent {
                 self.arms[i].reward_sum / self.arms[i].pull_count as f64
             }
         })
+    }
+
+    pub fn pending_outcome_count(&self) -> usize {
+        self.pending_outcomes.len()
+    }
+
+    pub fn resolved_outcomes(&self) -> u64 {
+        self.resolved_outcomes
     }
 
     /// Apply the chosen intervention's threshold adjustments to existing thresholds.
@@ -1263,7 +1342,16 @@ mod tests {
         let _action = agent.select_action(&ctx);
         // Force the last_action to TightenThresholds for testing.
         agent.last_action = Some((Intervention::TightenThresholds, ctx.features, 0.8));
-        agent.observe_outcome(0.7); // delta = 0.1 > 0.05 → positive reward
+        agent.observe_outcome(0.8);
+        assert_eq!(
+            agent.arm_pulls()[1],
+            0,
+            "reward must not use the same snapshot"
+        );
+        for _ in 0..4 {
+            agent.observe_outcome(0.8);
+        }
+        agent.observe_outcome(0.7); // five-cycle delta = 0.1 → positive reward
 
         let pulls = agent.arm_pulls();
         assert_eq!(pulls[1], 1, "TightenThresholds should have 1 pull");
@@ -1311,12 +1399,37 @@ mod tests {
 
         // Reload and verify state was preserved.
         {
-            let agent = PredictiveAgent::load_or_default(&path);
+            let mut agent = PredictiveAgent::load_or_default(&path);
             assert_eq!(agent.warmup_remaining, 0);
             assert_eq!(agent.total_cycles, 20);
             let pulls: u64 = agent.arm_pulls().iter().sum();
+            assert_eq!(pulls, 15);
+            assert_eq!(agent.pending_outcome_count(), 5);
+
+            for _ in 0..5 {
+                agent.observe_outcome(0.5);
+            }
+            let pulls: u64 = agent.arm_pulls().iter().sum();
             assert_eq!(pulls, 20);
+            assert_eq!(agent.pending_outcome_count(), 0);
         }
+    }
+
+    #[test]
+    fn test_history_cap_preserves_average_reward() {
+        let mut arm = LinUCBArm::new();
+        let features = dummy_context(0.7).features;
+        for _ in 0..500 {
+            arm.update(&features, 0.25);
+        }
+        let average_before = arm.reward_sum / arm.pull_count as f64;
+
+        arm.cap_effective_history(200);
+
+        assert_eq!(arm.pull_count, 200);
+        assert!((arm.reward_sum / arm.pull_count as f64 - average_before).abs() < 1e-12);
+        assert!(arm.a.data.iter().all(|value| value.is_finite()));
+        assert!(arm.b.iter().all(|value| value.is_finite()));
     }
 
     #[test]
@@ -2068,7 +2181,11 @@ mod tests {
 
         let ctx = dummy_context(0.5);
         agent.last_action = Some((Intervention::Observe, ctx.features, 0.5));
-        // pressure rose from 0.5 to 0.6: delta = 0.5 - 0.6 = -0.1 < -0.05 → penalty -0.3
+        agent.observe_outcome(0.5);
+        for _ in 0..4 {
+            agent.observe_outcome(0.5);
+        }
+        // Five cycles later pressure rose by 0.1, so Observe receives a penalty.
         agent.observe_outcome(0.6);
 
         let pulls = agent.arm_pulls();

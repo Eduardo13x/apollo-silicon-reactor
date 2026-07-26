@@ -247,6 +247,33 @@ fn budget_zero_cap_denies_all_actions() {
     assert_eq!(budget.minute_actions, 0);
 }
 
+#[test]
+fn unfreeze_bypasses_exhausted_minute_budget_even_after_denied_work() {
+    let policy = SafetyPolicy::for_profile(OptimizationProfile::AggressiveRoot);
+    let mut budget = ActionBudgetState {
+        minute_actions: 1,
+        ..ActionBudgetState::default()
+    };
+    let actions = vec![
+        make_boosts(1).remove(0),
+        RootAction::UnfreezeProcess {
+            pid: 4242,
+            name: "paused-app".into(),
+            reason: "pressure recovered".into(),
+            decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
+        },
+    ];
+
+    let filtered = enforce_limits_with_budget(actions, &policy, &mut budget, 1);
+
+    assert_eq!(filtered.len(), 1);
+    assert!(matches!(filtered[0], RootAction::UnfreezeProcess { .. }));
+    assert_eq!(budget.minute_actions, 1, "unfreeze must not spend budget");
+    assert_eq!(budget.boost_denied_cooldown, 1);
+}
+
 // ── allowlisted_sysctls ───────────────────────────────────────────────────────
 
 #[test]

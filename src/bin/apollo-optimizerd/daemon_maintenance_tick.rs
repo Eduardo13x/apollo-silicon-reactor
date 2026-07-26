@@ -18,6 +18,7 @@
 use std::sync::atomic::Ordering;
 
 use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::daemon_helpers::spawn_reaped_purge;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
 use apollo_engine::engine::shadow_signals;
@@ -142,7 +143,7 @@ pub fn run_maintenance_tick(
         snap.pressure.refault_delta_per_sec,
         physical_pressure,
     );
-    if emergency && std::process::Command::new("purge").spawn().is_ok() {
+    if emergency && spawn_reaped_purge() {
         state.mark_purged();
         state.mark_compressor_flushing(snap.pressure.swap_delta_bytes_per_sec < 0.0);
         lf_metrics
@@ -169,7 +170,7 @@ pub fn run_maintenance_tick(
 
     match should_fire(snap, ctx, state, build_active, bus_saturated) {
         None => {
-            if std::process::Command::new("purge").spawn().is_ok() {
+            if spawn_reaped_purge() {
                 state.mark_purged();
                 state.mark_compressor_flushing(snap.pressure.swap_delta_bytes_per_sec < 0.0);
                 lf_metrics

@@ -192,6 +192,32 @@ fn sync_from_lockfree_does_not_clobber_executor_action_totals() {
     assert_eq!(state.metrics.throttle_reverted, 3);
 }
 
+#[test]
+fn sync_from_lockfree_preserves_rolling_p95_when_history_exists() {
+    let lf = LockFreeMetrics::new();
+    lf.set_cycle_time_us(4_639);
+    lf.commit();
+
+    let mut state = fresh_metrics_state();
+    state.metrics.cycle_durations_ms.extend([12, 39, 45, 66]);
+    state.metrics.p95_cycle_ms = 66.0;
+    state.sync_from_lockfree(&lf.snapshot());
+
+    assert_eq!(state.metrics.p95_cycle_ms, 66.0);
+}
+
+#[test]
+fn sync_from_lockfree_uses_latest_cycle_when_history_is_absent() {
+    let lf = LockFreeMetrics::new();
+    lf.set_cycle_time_us(4_639);
+    lf.commit();
+
+    let mut state = fresh_metrics_state();
+    state.sync_from_lockfree(&lf.snapshot());
+
+    assert_eq!(state.metrics.p95_cycle_ms, 4.639);
+}
+
 /// Batch 1 (Sprint 6/7/8) telemetry round-trip: the 7 counters added by
 /// phases 3.2 / 4.2 / 4.3 / 5.2 must all survive the full chain
 /// LockFreeMetrics → snapshot → sync_from_lockfree → RuntimeMetrics → JSON.

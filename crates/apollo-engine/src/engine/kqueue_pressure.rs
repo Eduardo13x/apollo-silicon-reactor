@@ -318,7 +318,7 @@ mod tests {
     fn watch_child_exit() {
         let mut reactor = KqueuePressure::new().unwrap();
 
-        let child = std::process::Command::new("/usr/bin/true")
+        let mut child = std::process::Command::new("/usr/bin/true")
             .spawn()
             .expect("spawn true");
         let pid = child.id();
@@ -335,6 +335,7 @@ mod tests {
             events,
         );
         assert_eq!(reactor.watched_pid_count(), 0, "pid should auto-remove");
+        child.wait().expect("test child should be reaped");
     }
 
     #[test]

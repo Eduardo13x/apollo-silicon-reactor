@@ -738,17 +738,25 @@ impl DriftDetector {
     /// verga"). The cap is now an invariant of the store, not a decay side
     /// effect.
     fn enforce_capacity(&mut self) {
-        if self.beliefs.len() > MAX_BELIEFS {
-            let mut ranked: Vec<(String, f32)> = self
+        while self.beliefs.len() > MAX_BELIEFS {
+            // Mutations normally exceed the cap by one. Selecting only the
+            // weakest key keeps the exact eviction policy while avoiding a
+            // clone and O(n log n) full sort of all 3,001 beliefs.
+            let weakest = self
                 .beliefs
                 .iter()
-                .map(|(k, e)| (k.clone(), e.tv.confidence * (1.0 + e.lti)))
-                .collect();
-            // Ascending by relevance — weakest first.
-            ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            let evict = self.beliefs.len() - MAX_BELIEFS;
-            for (key, _) in ranked.into_iter().take(evict) {
+                .min_by(|(_, a), (_, b)| {
+                    let a_relevance = a.tv.confidence * (1.0 + a.lti);
+                    let b_relevance = b.tv.confidence * (1.0 + b.lti);
+                    a_relevance
+                        .partial_cmp(&b_relevance)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(key, _)| key.clone());
+            if let Some(key) = weakest {
                 self.beliefs.remove(&key);
+            } else {
+                break;
             }
         }
     }

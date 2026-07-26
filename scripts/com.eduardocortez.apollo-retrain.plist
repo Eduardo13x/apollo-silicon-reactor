@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/apollo-retrain.sh</string>
+        <string>/usr/local/libexec/apollo/retrain-transformer.sh</string>
     </array>
 
     <!-- Run every 6 hours (21600 seconds).
@@ -23,6 +23,8 @@
     <true/>
     <key>LowPriorityBackgroundIO</key>
     <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
 
     <!-- Timeout: kill if running more than 30 minutes -->
     <key>TimeOut</key>

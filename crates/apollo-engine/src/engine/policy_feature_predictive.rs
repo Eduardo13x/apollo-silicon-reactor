@@ -294,6 +294,8 @@ mod tests {
                     name: format!("p{i}"),
                     reason: "test".to_string(),
                     decision_reason: DecisionReason::PressureContext,
+                    start_sec: 0,
+                    start_usec: 0,
                 },
             };
             let c = f.contribute(&action, &ctx);

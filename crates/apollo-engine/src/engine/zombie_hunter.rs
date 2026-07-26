@@ -120,9 +120,11 @@ impl ZombieHunter {
     /// Classify a single snapshot into `Option<DeadWeightProcess>`.
     /// Returns `None` when the process appears legitimate.
     pub fn evaluate(&mut self, snap: &HuntSnapshot) -> Option<DeadWeightProcess> {
-        // ── Rule 1: true zombie — immediate, no confirmation needed ────────
-        if snap.is_kernel_zombie {
-            return Some(DeadWeightProcess {
+        // Kernel children normally spend a very short interval in SZOMB
+        // between exit() and their parent's wait(). Requiring persistence
+        // keeps that healthy hand-off out of stability metrics and RL reward.
+        let candidate = if snap.is_kernel_zombie {
+            Some(DeadWeightProcess {
                 pid: snap.pid,
                 name: snap.name.clone(),
                 zombie_class: ZombieClass::TrueZombie,
@@ -130,35 +132,28 @@ impl ZombieHunter {
                 wakeups_per_sec: 0.0,
                 recommended_action: ZombieAction::Kill,
                 reason: "Process in kernel ZOMBIE state; parent must call wait()".into(),
-            });
-        }
-
-        // ── Rule 2: orphan — immediate, no confirmation needed ─────────────
-        if !snap.parent_alive && snap.ppid != 1 {
-            // ppid==1 means launchd adopted it (legitimate re-parent)
-            return Some(DeadWeightProcess {
+            })
+        } else if snap.pid > 1 && snap.ppid > 1 && !snap.parent_alive {
+            // ppid 0 is a process-tree root and ppid 1 means launchd adopted
+            // it. Neither is evidence of an orphan, even if a process-table
+            // refresh cannot resolve a parent row.
+            Some(DeadWeightProcess {
                 pid: snap.pid,
                 name: snap.name.clone(),
                 zombie_class: ZombieClass::Orphan,
                 wasted_rss_bytes: snap.rss_bytes,
                 wakeups_per_sec: snap.wakeups_per_sec,
-                recommended_action: ZombieAction::Kill,
+                recommended_action: ZombieAction::Suspend,
                 reason: "Parent process is dead and process was not re-parented to launchd".into(),
-            });
-        }
-
-        if is_platform_workload(&snap.name) {
+            })
+        } else if is_platform_workload(&snap.name) {
             self.suspicious_history.remove(&snap.pid);
             return None;
-        }
+        } else {
+            self.check_soft_rules(snap)
+        };
 
-        // ── Soft rules: build candidate if any rule fires, then confirm ────
-        // We check all soft rules first, pick the best match, then confirm
-        // ONCE per evaluation cycle (counter +1 per cycle, not per rule).
-
-        let candidate = self.check_soft_rules(snap);
-
-        if candidate.is_some() {
+        if let Some(candidate) = candidate {
             // This process is suspicious — bump confirmation counter once
             let entry = self
                 .suspicious_history
@@ -167,7 +162,7 @@ impl ZombieHunter {
             entry.1 += 1;
 
             if entry.1 >= self.confirmation_cycles {
-                return candidate;
+                return Some(candidate);
             }
             // Not yet confirmed — keep counter, return nothing this cycle
         } else {
@@ -303,12 +298,14 @@ mod tests {
     // ── Rule 1: True zombie ───────────────────────────────────────────────────
 
     #[test]
-    fn true_zombie_detected_immediately() {
+    fn true_zombie_is_reported_only_after_confirmation() {
         let mut hunter = ZombieHunter::new();
         let snap = HuntSnapshot {
             is_kernel_zombie: true,
             ..base_snap()
         };
+        assert!(hunter.evaluate(&snap).is_none());
+        assert!(hunter.evaluate(&snap).is_none());
         let result = hunter.evaluate(&snap);
         assert!(result.is_some());
         let dw = result.unwrap();
@@ -317,31 +314,37 @@ mod tests {
     }
 
     #[test]
-    fn true_zombie_fires_on_first_cycle_no_confirmation_needed() {
+    fn transient_true_zombie_does_not_survive_confirmation() {
         let mut hunter = ZombieHunter::new();
-        let snap = HuntSnapshot {
+        let zombie = HuntSnapshot {
             is_kernel_zombie: true,
             ..base_snap()
         };
-        // Should fire immediately — no need for 3 confirmation cycles.
-        assert!(hunter.evaluate(&snap).is_some());
+        assert!(hunter.evaluate(&zombie).is_none());
+
+        let healthy = base_snap();
+        for _ in 0..3 {
+            assert!(hunter.evaluate(&healthy).is_none());
+        }
     }
 
     // ── Rule 2: Orphan ────────────────────────────────────────────────────────
 
     #[test]
-    fn orphan_with_dead_parent_non_launchd_is_killed() {
+    fn orphan_with_dead_parent_non_launchd_is_suspended() {
         let mut hunter = ZombieHunter::new();
         let snap = HuntSnapshot {
             parent_alive: false,
             ppid: 500,
             ..base_snap()
         };
+        assert!(hunter.evaluate(&snap).is_none());
+        assert!(hunter.evaluate(&snap).is_none());
         let result = hunter.evaluate(&snap);
         assert!(result.is_some());
         let dw = result.unwrap();
         assert_eq!(dw.zombie_class, ZombieClass::Orphan);
-        assert_eq!(dw.recommended_action, ZombieAction::Kill);
+        assert_eq!(dw.recommended_action, ZombieAction::Suspend);
     }
 
     #[test]
@@ -360,6 +363,23 @@ mod tests {
             assert!(
                 result.is_none(),
                 "launchd-adopted process should not be flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn process_tree_roots_are_not_orphans() {
+        let mut hunter = ZombieHunter::new();
+        for pid in [0, 1] {
+            let snap = HuntSnapshot {
+                pid,
+                ppid: 0,
+                parent_alive: false,
+                ..base_snap()
+            };
+            assert!(
+                hunter.evaluate(&snap).is_none(),
+                "process-tree root pid {pid} must not be classified as an orphan"
             );
         }
     }
@@ -562,6 +582,8 @@ mod tests {
                 ..base_snap()
             },
         ];
+        assert!(hunter.evaluate_all(&snaps).is_empty());
+        assert!(hunter.evaluate_all(&snaps).is_empty());
         let dead_weight = hunter.evaluate_all(&snaps);
         assert_eq!(dead_weight.len(), 2);
         assert!(

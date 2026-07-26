@@ -106,7 +106,6 @@ pub fn run_wake_tick(
         // Priority: interactive PIDs first (user notices their latency).
         // [Nygard 2018 — bulkhead: bound blast radius of state transitions]
         let frozen_state = state.frozen_state.lock_recover();
-        let total_queued = frozen_state.len() as u64;
         let interactive_pats = state
             .policy
             .lock_recover()
@@ -132,19 +131,14 @@ pub fn run_wake_tick(
         wake_unfreeze_queue.extend(interactive_pids);
         wake_unfreeze_queue.extend(other_pids);
 
-        // Turbo PIDs also staggered.
-        let turbo_pids = display_turbo.turbo_frozen_pids_snapshot();
-        let turbo_count = turbo_pids.len() as u64;
-        wake_unfreeze_queue.extend(turbo_pids);
+        // Turbo PIDs are already represented in frozen_state; only clear the
+        // display-specific ownership after the shared queue has captured them.
         display_turbo.clear_frozen();
 
         {
             let mut metrics = state.metrics.lock_recover();
             metrics.metrics.wake_events += 1;
             metrics.metrics.post_wake_grace_entries += 1;
-            metrics.metrics.post_wake_defensive_unfreezes += total_queued + turbo_count;
-            metrics.metrics.unfreezes_applied += total_queued + turbo_count;
-            metrics.metrics.throttle_reverted += total_queued + turbo_count;
         }
     }
     process_guard.wake_state.last_cycle_wallclock = now_wall;

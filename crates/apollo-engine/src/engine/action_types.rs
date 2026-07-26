@@ -149,6 +149,12 @@ pub enum RootAction {
         reason: String,
         #[serde(default = "default_decision_reason")]
         decision_reason: crate::engine::audit_types::DecisionReason,
+        /// Identity captured when the thaw was requested. Defaults preserve
+        /// compatibility with journals written before this field existed.
+        #[serde(default)]
+        start_sec: u64,
+        #[serde(default)]
+        start_usec: u64,
     },
     /// Sealed sysctl action — the only construction path is
     /// `SetSysctlAction::new_clamped(...)` (or its public delegate
@@ -294,8 +300,7 @@ impl RootAction {
     /// any PID-bearing variant. Returns `None` for actions that do not act on
     /// a process (`SetSysctl`, `ToggleSpotlight`, `QuarantineDaemon`).
     ///
-    /// Variants without process birth timestamps (`BoostProcess`,
-    /// `UnfreezeProcess`, `SetMemorystatus`, `SetThreadQoS`) report
+    /// Variants without process birth timestamps (`SetMemorystatus`) report
     /// `start_sec = start_usec = 0` — see `ProcessIdentity::matches` for the
     /// legacy-fallback semantics. `SetMemorystatus` carries no name field in
     /// the action variant and reports `name = None`.
@@ -333,9 +338,13 @@ impl RootAction {
                 start_usec,
                 ..
             } => Some((*pid, Some(name.as_str()), *start_sec, *start_usec)),
-            RootAction::UnfreezeProcess { pid, name, .. } => {
-                Some((*pid, Some(name.as_str()), 0, 0))
-            }
+            RootAction::UnfreezeProcess {
+                pid,
+                name,
+                start_sec,
+                start_usec,
+                ..
+            } => Some((*pid, Some(name.as_str()), *start_sec, *start_usec)),
             RootAction::SetMemorystatus { pid, .. } => Some((*pid, None, 0, 0)),
             RootAction::SetSysctl(_)
             | RootAction::ToggleSpotlight { .. }
@@ -458,11 +467,28 @@ impl RootAction {
         reason: impl Into<String>,
         decision_reason: crate::engine::audit_types::DecisionReason,
     ) -> Self {
+        let (start_sec, start_usec) =
+            crate::engine::process_identity::ProcessIdentity::from_pid(pid)
+                .map(|identity| (identity.start_sec, identity.start_usec))
+                .unwrap_or((0, 0));
+        Self::unfreeze_full(pid, name, reason, start_sec, start_usec, decision_reason)
+    }
+
+    pub fn unfreeze_full(
+        pid: u32,
+        name: impl Into<String>,
+        reason: impl Into<String>,
+        start_sec: u64,
+        start_usec: u64,
+        decision_reason: crate::engine::audit_types::DecisionReason,
+    ) -> Self {
         RootAction::UnfreezeProcess {
             pid,
             name: name.into(),
             reason: reason.into(),
             decision_reason,
+            start_sec,
+            start_usec,
         }
     }
 }
@@ -481,6 +507,8 @@ mod extraction_tests {
                 name: "x".into(),
                 reason: "r".into(),
                 decision_reason: crate::engine::audit_types::DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
             };
         let json = serde_json::to_string(&a).expect("serialize");
         assert!(
@@ -490,5 +518,13 @@ mod extraction_tests {
         let back: crate::engine::types::RootAction =
             serde_json::from_str(&json).expect("roundtrip");
         assert_eq!(format!("{back:?}"), format!("{a:?}"));
+    }
+
+    #[test]
+    fn legacy_unfreeze_without_identity_fields_still_deserializes() {
+        let legacy = r#"{"UnfreezeProcess":{"pid":42,"name":"x","reason":"r","decision_reason":"PressureContext"}}"#;
+        let action: crate::engine::types::RootAction =
+            serde_json::from_str(legacy).expect("legacy journal action");
+        assert_eq!(action.identity_fields(), Some((42, Some("x"), 0, 0)));
     }
 }

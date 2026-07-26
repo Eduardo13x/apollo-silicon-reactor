@@ -11,6 +11,7 @@
 //!
 //! Todo en este módulo funciona sin entitlements ni root.
 
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -612,6 +613,77 @@ pub fn sample_hw_pressure() -> HwPressureSnapshot {
     }
 }
 
+/// Runs the destructive cache/bandwidth probes away from the daemon control
+/// loop. A capacity-one request channel provides backpressure: if a probe ever
+/// takes longer than its cadence, Apollo skips duplicate work instead of
+/// building a queue of stale hardware samples.
+pub struct HwPredictorWorker {
+    request_tx: SyncSender<()>,
+    result_rx: Receiver<Option<HwPressureSnapshot>>,
+    request_in_flight: bool,
+}
+
+impl HwPredictorWorker {
+    pub fn spawn() -> Self {
+        Self::spawn_with(sample_hw_pressure)
+    }
+
+    fn spawn_with<F>(sample: F) -> Self
+    where
+        F: Fn() -> HwPressureSnapshot + Send + 'static,
+    {
+        let (request_tx, request_rx) = mpsc::sync_channel::<()>(1);
+        let (result_tx, result_rx) = mpsc::channel::<Option<HwPressureSnapshot>>();
+        std::thread::Builder::new()
+            .name("apollo-hw-probe".to_string())
+            .spawn(move || {
+                while request_rx.recv().is_ok() {
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(&sample)).ok();
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn hardware predictor worker");
+
+        Self {
+            request_tx,
+            result_rx,
+            request_in_flight: false,
+        }
+    }
+
+    /// Poll a completed sample without blocking and request a new probe on the
+    /// established ten-cycle cadence.
+    pub fn poll_and_schedule(&mut self, cycle_count: u64) -> Option<HwPressureSnapshot> {
+        let mut latest = None;
+        loop {
+            match self.result_rx.try_recv() {
+                Ok(result) => {
+                    self.request_in_flight = false;
+                    if result.is_some() {
+                        latest = result;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.request_in_flight = false;
+                    break;
+                }
+            }
+        }
+
+        if cycle_count.is_multiple_of(10) && !self.request_in_flight {
+            match self.request_tx.try_send(()) {
+                Ok(()) | Err(TrySendError::Full(())) => self.request_in_flight = true,
+                Err(TrySendError::Disconnected(())) => self.request_in_flight = false,
+            }
+        }
+        latest
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HwPressureSnapshot {
     pub overall: HwPressure,
@@ -702,6 +774,31 @@ mod tests {
             commpage_valid: true,
             sampled_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn hardware_worker_keeps_probes_off_the_control_loop() {
+        let mut worker = HwPredictorWorker::spawn_with(|| {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            make_snapshot(HwPressure::Warning)
+        });
+
+        let started = Instant::now();
+        assert!(worker.poll_and_schedule(10).is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "scheduling a hardware probe must not block the caller"
+        );
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let result = loop {
+            if let Some(snapshot) = worker.poll_and_schedule(11) {
+                break snapshot;
+            }
+            assert!(Instant::now() < deadline, "worker result timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(result.overall, HwPressure::Warning);
     }
 
     #[test]

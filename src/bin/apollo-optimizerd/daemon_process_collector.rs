@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use apollo_engine::collector::SystemCollector;
-use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified, write_frozen_state};
+use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::display_turbo::DisplayTurbo;
 use apollo_engine::engine::identity_cache_manager::IdentityCacheManager;
@@ -62,17 +62,18 @@ pub fn run_pre_sleep_unfreeze(
     }
     let mut frozen_guard = state.frozen_state.lock_recover();
     // Turbo PIDs live in frozen_guard too, so this covers both regular + turbo.
-    let count = unfreeze_pids_verified(&frozen_guard);
-    if count > 0 {
-        // Snapshot thawed PIDs before clearing for cooldown bookkeeping.
-        let thawed_pids: Vec<u32> = frozen_guard.keys().copied().collect();
+    let outcome = unfreeze_pids_verified_outcome(&frozen_guard);
+    let count = outcome.applied_count();
+    if !outcome.applied_pids.is_empty() || !outcome.stale_pids.is_empty() {
         tracing::info!(
             count,
             "pre-sleep: released {} frozen PID(s) — \
              handing back to macOS memory manager",
             count
         );
-        frozen_guard.clear();
+        for pid in outcome.forgettable_pids() {
+            frozen_guard.remove(&pid);
+        }
         write_frozen_state(frozen_state_path, &frozen_guard);
         drop(frozen_guard);
         state.metrics.lock_recover().metrics.unfreezes_applied += count;
@@ -80,13 +81,15 @@ pub fn run_pre_sleep_unfreeze(
         // [Nygard 2018] §8.5 — circuit breaker hold-down after recovery.
         {
             let mut cooldown = state.freeze_cooldown.lock_recover();
-            for pid in &thawed_pids {
+            for pid in &outcome.applied_pids {
                 cooldown.mark_thawed(*pid);
             }
         }
     }
     display_turbo.clear_frozen();
-    sleep_notifier.acknowledge();
+    if outcome.failed_pids.is_empty() {
+        sleep_notifier.acknowledge();
+    }
 }
 
 /// Ghost-PID reconciliation — evict frozen_state entries whose PID is dead.

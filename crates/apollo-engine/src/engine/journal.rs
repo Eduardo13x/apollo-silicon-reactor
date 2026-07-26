@@ -10,8 +10,14 @@ use crate::engine::types::{HardPath, JournalEntry};
 // faster rotation = less SSD page churn + bounded disk usage at ~4 MB total.
 const MAX_JOURNAL_BYTES: u64 = 2 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalAppendOutcome {
+    pub rotated: bool,
+    pub rotation_failed: bool,
+}
+
 pub fn append_journal(path: &Path, entry: &JournalEntry) -> anyhow::Result<()> {
-    append_journal_batch(path, std::slice::from_ref(entry))
+    append_journal_batch(path, std::slice::from_ref(entry)).map(|_| ())
 }
 
 /// Append a batch of journal entries in a single open/write/close.
@@ -35,10 +41,15 @@ pub fn append_journal(path: &Path, entry: &JournalEntry) -> anyhow::Result<()> {
 /// [Mohan et al. 1992] "ARIES" — log records can be buffered in memory and
 /// written to the log in batches without loss of correctness for WAL
 /// workloads where the in-memory write ordering matches the disk order.
-pub fn append_journal_batch(path: &Path, entries: &[JournalEntry]) -> anyhow::Result<()> {
+pub fn append_journal_batch(
+    path: &Path,
+    entries: &[JournalEntry],
+) -> anyhow::Result<JournalAppendOutcome> {
     if entries.is_empty() {
-        return Ok(());
+        return Ok(JournalAppendOutcome::default());
     }
+
+    let mut outcome = JournalAppendOutcome::default();
 
     // Symlink protection: refuse to write through symlinks (TOCTOU guard).
     // [Lampson 1974] "Use the centralized security utility rather than
@@ -65,10 +76,13 @@ pub fn append_journal_batch(path: &Path, entries: &[JournalEntry]) -> anyhow::Re
     if let Ok(meta) = fs::symlink_metadata(path) {
         if !meta.file_type().is_symlink() && meta.len() > MAX_JOURNAL_BYTES {
             let rotated = path.with_extension("jsonl.1");
-            // Remove old rotation if it exists.
-            let _ = fs::remove_file(&rotated);
-            // Rotate current journal to .1
-            let _ = fs::rename(path, &rotated);
+            // On Unix rename atomically replaces an existing regular file, so
+            // no remove-then-rename window is needed. If rotation fails, keep
+            // appending to the live journal and surface the failure to metrics.
+            match fs::rename(path, &rotated) {
+                Ok(()) => outcome.rotated = true,
+                Err(_) => outcome.rotation_failed = true,
+            }
         }
     }
 
@@ -85,7 +99,7 @@ pub fn append_journal_batch(path: &Path, entries: &[JournalEntry]) -> anyhow::Re
 
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     f.write_all(buf.as_bytes())?;
-    Ok(())
+    Ok(outcome)
 }
 
 pub fn read_journal(path: &Path) -> anyhow::Result<Vec<JournalEntry>> {
@@ -170,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn rotation_when_file_exceeds_10mb() {
+    fn rotation_when_file_exceeds_limit() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("journal.jsonl");
 
@@ -185,14 +199,37 @@ mod tests {
             f.write_all(&big_chunk).expect("write chunk");
         }
 
-        // Appending should trigger rotation
-        append_journal(&path, &make_entry()).expect("append after large file");
+        // Appending should trigger rotation and publish it to the caller.
+        let outcome =
+            append_journal_batch(&path, &[make_entry()]).expect("append after large file");
+        assert!(outcome.rotated);
+        assert!(!outcome.rotation_failed);
 
         let rotated = path.with_extension("jsonl.1");
         assert!(
             rotated.exists(),
             "rotated file .jsonl.1 should exist after size limit exceeded"
         );
+    }
+
+    #[test]
+    fn rotation_failure_is_reported_without_losing_new_entries() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("journal.jsonl");
+        std::fs::write(&path, vec![b'x'; (MAX_JOURNAL_BYTES + 1) as usize])
+            .expect("pre-grow journal");
+
+        // A directory cannot be atomically replaced by the journal file.
+        let rotated = path.with_extension("jsonl.1");
+        std::fs::create_dir(&rotated).expect("create rotation blocker");
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        let outcome = append_journal_batch(&path, &[make_entry()])
+            .expect("append must continue after rotation failure");
+
+        assert!(!outcome.rotated);
+        assert!(outcome.rotation_failed);
+        assert!(std::fs::metadata(&path).unwrap().len() > size_before);
     }
 
     #[test]

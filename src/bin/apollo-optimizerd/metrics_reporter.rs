@@ -21,6 +21,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::Instant;
 
 use chrono::Utc;
@@ -32,6 +33,7 @@ use apollo_engine::engine::daemon_helpers::{
 };
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::execute_actions::ExecuteOutcomes;
+use apollo_engine::engine::intelligence_score::AisScore;
 use apollo_engine::engine::io_tiering::IoShaper;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::mach_qos::SchedulingTier;
@@ -66,7 +68,10 @@ pub fn update_learning_metrics<'a>(
     m.metrics.predictive_agent_active = lctx.predictive_agent.is_active();
     m.metrics.predictive_agent_cycles = lctx.predictive_agent.total_cycles();
     m.metrics.predictive_agent_arm_pulls = lctx.predictive_agent.arm_pulls();
+    m.metrics.predictive_agent_arm_avg_rewards = lctx.predictive_agent.arm_avg_rewards();
     m.metrics.predictive_agent_last_intervention = format!("{:?}", agent_intervention);
+    m.metrics.predictive_agent_pending_outcomes = lctx.predictive_agent.pending_outcome_count();
+    m.metrics.predictive_agent_resolved_outcomes = lctx.predictive_agent.resolved_outcomes();
     m.metrics.si_pressure_smooth = signal_digest.pressure_smooth;
     m.metrics.si_pressure_velocity = signal_digest.pressure_velocity;
     m.metrics.si_p_oom_30s = signal_digest.p_oom_30s;
@@ -159,6 +164,17 @@ pub fn update_learning_metrics<'a>(
 /// Based on Iyer & Druschel 2001 — anticipatory scheduling + I/O priority classes
 /// reduce foreground I/O latency by 50-70% under concurrent background load.
 /// MIN_REAPPLY_SECS=60 means nothing actually reapplies within 60s anyway.
+fn actionable_io_tiers(
+    heuristic_decisions: &[ProcessDecision],
+    heuristic_critical_pids: &HashSet<u32>,
+) -> Vec<(u32, ProcessTier)> {
+    heuristic_decisions
+        .iter()
+        .filter(|d| !heuristic_critical_pids.contains(&d.pid))
+        .map(|d| (d.pid, d.tier))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn apply_io_shaping(
     cycle_count: u64,
@@ -167,6 +183,7 @@ pub fn apply_io_shaping(
     foreground_pid: Option<u32>,
     process_tree: &ProcessTree,
     heuristic_decisions: &[ProcessDecision],
+    heuristic_critical_pids: &HashSet<u32>,
     power_mgr: &PowerManager,
     thermal_pressure_boost: f64,
     io_shaper: &mut IoShaper,
@@ -177,10 +194,7 @@ pub fn apply_io_shaping(
     }
     let fg_family_io = process_enrichment::build_foreground_family(foreground_pid, process_tree);
     let fg_pids: Vec<u32> = fg_family_io.iter().copied().collect();
-    let process_tiers: Vec<(u32, ProcessTier)> = heuristic_decisions
-        .iter()
-        .map(|d| (d.pid, d.tier))
-        .collect();
+    let process_tiers = actionable_io_tiers(heuristic_decisions, heuristic_critical_pids);
     let under_pressure = snapshot.pressure.memory_pressure
         + battery_pressure_boost(power_mgr)
         + thermal_pressure_boost
@@ -309,10 +323,80 @@ pub fn apply_qos_routing(
 /// Writing every 25 cycles (~7.5s) reduces disk I/O by 25x.
 const METRICS_DISK_WRITE_EVERY_N_CYCLES: u64 = 25;
 
-/// How often to recompute the Apollo Intelligence Score. 120 cycles ≈ 60s
-/// at the 500ms daemon cadence — cheap (reads 4 state files, no compute)
-/// but not tight enough to dominate I/O.
+/// How often to recompute the Apollo Intelligence Score. The computation reads
+/// and parses several persisted learning files, so it runs on a dedicated
+/// worker instead of extending the control-loop tail.
 const AIS_COMPUTE_EVERY_N_CYCLES: u64 = 120;
+
+pub struct AisRuntimeWorker {
+    request_tx: SyncSender<()>,
+    result_rx: Receiver<Option<AisScore>>,
+    request_in_flight: bool,
+}
+
+impl AisRuntimeWorker {
+    pub fn spawn() -> Self {
+        Self::spawn_with(apollo_engine::engine::intelligence_score::compute_runtime_ais)
+    }
+
+    fn spawn_with<F>(compute: F) -> Self
+    where
+        F: Fn() -> Option<AisScore> + Send + 'static,
+    {
+        let (request_tx, request_rx) = mpsc::sync_channel::<()>(1);
+        let (result_tx, result_rx) = mpsc::channel::<Option<AisScore>>();
+        std::thread::Builder::new()
+            .name("apollo-ais".to_string())
+            .spawn(move || {
+                while request_rx.recv().is_ok() {
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute()))
+                            .ok()
+                            .flatten();
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn AIS runtime worker");
+
+        Self {
+            request_tx,
+            result_rx,
+            request_in_flight: false,
+        }
+    }
+
+    /// Poll a completed score without blocking and schedule the next refresh.
+    /// Cycle 1 gives the dashboard a fast warm start from persisted evidence.
+    fn poll_and_schedule(&mut self, cycle_count: u64) -> Option<AisScore> {
+        let mut latest = None;
+        loop {
+            match self.result_rx.try_recv() {
+                Ok(result) => {
+                    self.request_in_flight = false;
+                    if result.is_some() {
+                        latest = result;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.request_in_flight = false;
+                    break;
+                }
+            }
+        }
+
+        let due = cycle_count == 1 || cycle_count.is_multiple_of(AIS_COMPUTE_EVERY_N_CYCLES);
+        if due && !self.request_in_flight {
+            match self.request_tx.try_send(()) {
+                Ok(()) | Err(TrySendError::Full(())) => self.request_in_flight = true,
+                Err(TrySendError::Disconnected(())) => self.request_in_flight = false,
+            }
+        }
+        latest
+    }
+}
 
 /// Phase 3: Merge execution outcomes into metrics, update cycle timing, write to disk.
 ///
@@ -332,6 +416,7 @@ pub fn merge_cycle_metrics<'a>(
     current_profile: OptimizationProfile,
     governor_decision: &GovernorDecision,
     lctx: &LearningContext<'a>,
+    ais_worker: &mut AisRuntimeWorker,
     overflow_thresholds: &OverflowThresholds,
     cycle_start: &Instant,
     reactor_weight: f64,
@@ -342,12 +427,8 @@ pub fn merge_cycle_metrics<'a>(
     cycle_count: u64,
     in_sleep: bool,
 ) {
-    // Compute AIS off the hot path — reads 4 state files, never holds metrics lock.
-    let ais_snapshot = if cycle_count.is_multiple_of(AIS_COMPUTE_EVERY_N_CYCLES) {
-        apollo_engine::engine::intelligence_score::compute_runtime_ais()
-    } else {
-        None
-    };
+    // File parsing happens on the AIS worker; this poll is non-blocking.
+    let ais_snapshot = ais_worker.poll_and_schedule(cycle_count);
 
     let mut metrics = state.metrics.lock_recover();
     metrics.metrics.boosts_applied += exec_outcomes.boosts_applied;
@@ -373,6 +454,10 @@ pub fn merge_cycle_metrics<'a>(
     metrics.metrics.top_skipped_processes.truncate(12);
     metrics.metrics.throttle_reverted += exec_outcomes.throttle_reverted;
     metrics.metrics.thread_qos_applied += exec_outcomes.thread_qos_applied;
+    metrics.metrics.thread_qos_hot_routes += exec_outcomes.thread_qos_hot_routes;
+    metrics.metrics.thread_qos_cold_routes += exec_outcomes.thread_qos_cold_routes;
+    metrics.metrics.journal_rotations += exec_outcomes.journal_rotations;
+    metrics.metrics.journal_rotation_failures += exec_outcomes.journal_rotation_failures;
 
     // SysctlGovernor + NetworkMonitor metrics.
     metrics.metrics.sysctl_reactive_writes += exec_outcomes.sysctl_applied;
@@ -471,6 +556,8 @@ pub fn merge_cycle_metrics<'a>(
         metrics.metrics.ais_safety = s.safety_compliance;
         metrics.metrics.ais_adaptability = s.adaptability;
         metrics.metrics.ais_wisdom = s.wisdom;
+        metrics.metrics.ais_evidence_coverage = s.evidence_coverage;
+        metrics.metrics.ais_operational_health = s.operational_health;
         metrics.metrics.ais_pareto_balanced = s.pareto_balanced;
     }
 
@@ -493,6 +580,8 @@ pub fn merge_cycle_metrics<'a>(
 mod tests {
     use super::*;
     use apollo_engine::engine::adaptive_governor::GovernorDecision as GovDecision;
+    use apollo_engine::engine::intelligence_score::{compute_ais, AisInput};
+    use std::time::Duration;
 
     fn decision(pid: u32, dec: GovDecision, tier: ProcessTier) -> ProcessDecision {
         ProcessDecision {
@@ -507,6 +596,43 @@ mod tests {
     }
 
     #[test]
+    fn ais_worker_keeps_file_parsing_off_the_control_loop() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut worker = AisRuntimeWorker::spawn_with(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Some(compute_ais(&AisInput::default()))
+        });
+
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            release_tx.send(()).unwrap();
+        });
+        let started = Instant::now();
+        assert!(worker.poll_and_schedule(1).is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "AIS scheduling blocked on the worker computation"
+        );
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        watchdog.join().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result = loop {
+            if let Some(score) = worker.poll_and_schedule(2) {
+                break score;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "AIS worker did not publish a result"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(result.total.is_finite());
+    }
+
+    #[test]
     fn thermal_force_ecores_routes_non_fg_to_background() {
         let fg: HashSet<u32> = HashSet::new();
         let d = decision(42, GovDecision::Allow, ProcessTier::ActiveForeground);
@@ -515,6 +641,20 @@ mod tests {
         assert_eq!(
             decide_qos_tier(&d, &fg, true),
             Some(SchedulingTier::Background)
+        );
+    }
+
+    #[test]
+    fn io_tiering_excludes_preprotected_pids() {
+        let decisions = vec![
+            decision(42, GovDecision::Allow, ProcessTier::SystemEssential),
+            decision(43, GovDecision::Throttle, ProcessTier::SilentDaemon),
+        ];
+        let critical = HashSet::from([42]);
+
+        assert_eq!(
+            actionable_io_tiers(&decisions, &critical),
+            vec![(43, ProcessTier::SilentDaemon)]
         );
     }
 

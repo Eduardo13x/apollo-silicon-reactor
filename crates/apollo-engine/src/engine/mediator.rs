@@ -66,7 +66,7 @@ pub enum Effect {
     },
     /// `thread_policy_set` — per-thread QoS routing (P-core vs E-core).
     /// Inv#11: `start_sec` carries PID identity; identity-mismatch → block.
-    /// `affinity_tag` Some(1)=P-cluster, Some(2)=E-cluster, Some(0)/None=no hint.
+    /// `affinity_tag` is an optional co-location group, not a P/E selector.
     /// Sprint S3 (2026-06-06): activates `mediator_thread_policy_total` —
     /// rewires the `RootAction::SetThreadQoS` arm in `execute_actions.rs`
     /// to flow through `ThreadPolicyEffector::apply_raw`.
@@ -121,6 +121,10 @@ pub enum JetsamTierKind {
     Background,
     Suspended,
     Idle,
+    /// Restore an exact kernel priority captured before a reversible action.
+    /// Used only by compensation paths so AUDIO/VITAL bands are not flattened
+    /// to the coarse foreground/background vocabulary.
+    Exact(i32),
 }
 
 /// Mach QoS / scheduling policy tier — mapped from `engine::mach_qos`
@@ -407,31 +411,21 @@ impl Effector for SysctlEffector {
 
 // ── Phase E: Jetsam tier effector ────────────────────────────────────────────
 
-/// Effector for jetsam priority / memory-limit tier changes. Wraps
-/// `jetsam_control::apply_apollo_policy` + `get_priority` for before/after
-/// snapshots.
-///
-/// `JetsamTierKind` is mapped to the production `JetsamClass` per the table
-/// below. The 4-variant mediator enum is intentionally broader than the
-/// 3-variant production enum so future effects (e.g. Suspended/Idle splits)
-/// can be added without changing the public Effect surface.
-///
-/// | JetsamTierKind | JetsamClass     | Rationale                              |
-/// |----------------|------------------|----------------------------------------|
-/// | Foreground     | Interactive      | user-facing, never demoted             |
-/// | Background     | Noise            | normal demote candidate                |
-/// | Suspended      | Noise            | aggressive demote (no exact match yet) |
-/// | Idle           | Noise            | aggressive demote (no exact match yet) |
+/// Effector for jetsam priority changes. Memory limits are deliberately not
+/// part of this effect: they have separate state, ownership, and undo semantics.
+/// The previous `apply_apollo_policy(Noise)` call silently added a 200 MB
+/// inactive limit that priority-only callers never recorded or reverted.
 pub struct JetsamEffector;
 
 impl JetsamEffector {
-    fn to_class(kind: JetsamTierKind) -> crate::engine::jetsam_control::JetsamClass {
-        use crate::engine::jetsam_control::JetsamClass;
+    fn to_priority(kind: JetsamTierKind) -> i32 {
+        use crate::engine::jetsam_control::priority;
         match kind {
-            JetsamTierKind::Foreground => JetsamClass::Interactive,
+            JetsamTierKind::Foreground => priority::FOREGROUND,
             JetsamTierKind::Background | JetsamTierKind::Suspended | JetsamTierKind::Idle => {
-                JetsamClass::Noise
+                priority::BACKGROUND
             }
+            JetsamTierKind::Exact(priority) => priority,
         }
     }
 }
@@ -451,14 +445,14 @@ impl Effector for JetsamEffector {
             jetsam_tier: Some(tier),
             ..ReceiptSnapshot::default()
         };
-        let class = Self::to_class(tier);
+        let priority = Self::to_priority(tier);
         let t0 = std::time::Instant::now();
-        let result = crate::engine::jetsam_control::apply_apollo_policy(pid, class);
+        let result = crate::engine::jetsam_control::set_priority(pid, priority);
         let syscall_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
         if let Err(msg) = result {
             return Err(BlockReason::OsError {
                 errno: 0,
-                context: format!("jetsam {} → {:?}: {}", pid, class, msg),
+                context: format!("jetsam priority {} -> {}: {}", pid, priority, msg),
             });
         }
         let after_priority = crate::engine::jetsam_control::get_priority(pid);
@@ -522,6 +516,15 @@ impl MachPolicyEffector {
             }
             MachPolicyKind::Default => SchedulingTier::Normal,
             MachPolicyKind::Utility | MachPolicyKind::Background => SchedulingTier::Background,
+        }
+    }
+
+    fn from_sched_tier(tier: crate::engine::mach_qos::SchedulingTier) -> MachPolicyKind {
+        use crate::engine::mach_qos::SchedulingTier;
+        match tier {
+            SchedulingTier::Foreground => MachPolicyKind::UserInitiated,
+            SchedulingTier::Normal => MachPolicyKind::Default,
+            SchedulingTier::Background => MachPolicyKind::Background,
         }
     }
 }
@@ -623,11 +626,17 @@ impl Effector for MachPolicyEffector {
             }
         }
 
-        let _outcome = mgr.set_tier(pid, sched_tier);
+        let before_policy = mgr.current_tier(pid).map(Self::from_sched_tier);
+        let outcome = mgr.set_tier(pid, sched_tier);
+        let after_policy = mgr.current_tier(pid).map(Self::from_sched_tier);
         let syscall_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
         drop(mgr);
-        let snapshot = ReceiptSnapshot {
-            mach_policy: Some(policy),
+        let before = ReceiptSnapshot {
+            mach_policy: before_policy,
+            ..ReceiptSnapshot::default()
+        };
+        let after = ReceiptSnapshot {
+            mach_policy: after_policy,
             ..ReceiptSnapshot::default()
         };
         Ok(Receipt {
@@ -635,14 +644,11 @@ impl Effector for MachPolicyEffector {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            before: snapshot.clone(),
-            after: snapshot,
-            no_op: false,
+            before,
+            after,
+            no_op: !outcome.mutated,
             syscall_us,
-            // S9: MachPolicy issues exactly one task_policy_set syscall per
-            // dispatch — Receipt fidelity limitations doc note still applies,
-            // but the dispatch count is unambiguously 1.
-            applied_count: 1,
+            applied_count: u32::from(outcome.mutated),
         })
     }
 }
@@ -854,6 +860,177 @@ impl Effector for FileWriteEffector {
 
 // ── Phase B: Mediator chokepoint ─────────────────────────────────────────────
 
+/// Maximum number of steps in one mediated saga. The bitset keeps the hot
+/// path allocation-free; Apollo's privileged actions currently need at most
+/// three steps.
+pub const MAX_SAGA_STEPS: usize = u64::BITS as usize;
+
+/// Lifecycle of one privileged, multi-step action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SagaState {
+    Ready,
+    Applying {
+        step: usize,
+    },
+    Compensating {
+        failed_step: usize,
+    },
+    Committed,
+    Compensated,
+    /// A compensation failed after a step had already mutated the host. The
+    /// caller must surface this as an execution failure and arrange recovery.
+    RecoveryRequired,
+    Rejected {
+        step_count: usize,
+    },
+}
+
+/// Result of one saga step. No-op steps do not need compensation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SagaStep {
+    Applied,
+    NoOp,
+}
+
+/// Terminal report from [`run_saga`]. Two bitsets replace per-action vectors,
+/// so the coordinator adds no heap allocation and no persistence I/O.
+#[derive(Debug)]
+pub struct SagaReport<E> {
+    state: SagaState,
+    applied_steps: u64,
+    compensated_steps: u64,
+    apply_failure: Option<(usize, E)>,
+    compensation_failure: Option<(usize, E)>,
+}
+
+impl<E> SagaReport<E> {
+    pub fn state(&self) -> SagaState {
+        self.state
+    }
+
+    pub fn committed(&self) -> bool {
+        self.state == SagaState::Committed
+    }
+
+    pub fn applied_step(&self, step: usize) -> bool {
+        step < MAX_SAGA_STEPS && self.applied_steps & (1_u64 << step) != 0
+    }
+
+    pub fn compensated_step(&self, step: usize) -> bool {
+        step < MAX_SAGA_STEPS && self.compensated_steps & (1_u64 << step) != 0
+    }
+
+    pub fn apply_failure(&self) -> Option<(usize, &E)> {
+        self.apply_failure
+            .as_ref()
+            .map(|(step, error)| (*step, error))
+    }
+
+    pub fn compensation_failure(&self) -> Option<(usize, &E)> {
+        self.compensation_failure
+            .as_ref()
+            .map(|(step, error)| (*step, error))
+    }
+}
+
+/// Run every step in order, or compensate every previously-applied step in
+/// reverse order after the first failure. Compensation continues even when an
+/// earlier compensation fails; the report retains the first such error and
+/// enters [`SagaState::RecoveryRequired`].
+///
+/// This is intentionally an in-process coordinator. Durability belongs to the
+/// domain state owned by the caller (for example `frozen_state.json`), while
+/// this hot-path harness contributes only O(steps) branches and two `u64`s.
+pub fn run_saga<E, Apply, Compensate>(
+    step_count: usize,
+    apply: Apply,
+    compensate: Compensate,
+) -> SagaReport<E>
+where
+    Apply: FnMut(usize) -> Result<SagaStep, E>,
+    Compensate: FnMut(usize) -> Result<(), E>,
+{
+    run_saga_observed(step_count, apply, compensate, |_| {})
+}
+
+#[inline]
+fn run_saga_observed<E, Apply, Compensate, Observe>(
+    step_count: usize,
+    mut apply: Apply,
+    mut compensate: Compensate,
+    mut observe: Observe,
+) -> SagaReport<E>
+where
+    Apply: FnMut(usize) -> Result<SagaStep, E>,
+    Compensate: FnMut(usize) -> Result<(), E>,
+    Observe: FnMut(SagaState),
+{
+    observe(SagaState::Ready);
+    if step_count > MAX_SAGA_STEPS {
+        let terminal = SagaState::Rejected { step_count };
+        observe(terminal);
+        return SagaReport {
+            state: terminal,
+            applied_steps: 0,
+            compensated_steps: 0,
+            apply_failure: None,
+            compensation_failure: None,
+        };
+    }
+
+    let mut applied_steps = 0_u64;
+
+    for step in 0..step_count {
+        observe(SagaState::Applying { step });
+        match apply(step) {
+            Ok(SagaStep::Applied) => applied_steps |= 1_u64 << step,
+            Ok(SagaStep::NoOp) => {}
+            Err(apply_error) => {
+                observe(SagaState::Compensating { failed_step: step });
+                let mut compensated_steps = 0_u64;
+                let mut compensation_failure = None;
+
+                for prior_step in (0..step).rev() {
+                    let bit = 1_u64 << prior_step;
+                    if applied_steps & bit == 0 {
+                        continue;
+                    }
+                    match compensate(prior_step) {
+                        Ok(()) => compensated_steps |= bit,
+                        Err(error) if compensation_failure.is_none() => {
+                            compensation_failure = Some((prior_step, error));
+                        }
+                        Err(_) => {}
+                    }
+                }
+
+                let terminal = if compensation_failure.is_none() {
+                    SagaState::Compensated
+                } else {
+                    SagaState::RecoveryRequired
+                };
+                observe(terminal);
+                return SagaReport {
+                    state: terminal,
+                    applied_steps,
+                    compensated_steps,
+                    apply_failure: Some((step, apply_error)),
+                    compensation_failure,
+                };
+            }
+        }
+    }
+
+    observe(SagaState::Committed);
+    SagaReport {
+        state: SagaState::Committed,
+        applied_steps,
+        compensated_steps: 0,
+        apply_failure: None,
+        compensation_failure: None,
+    }
+}
+
 /// Verify pre-conditions, apply the effect via the supplied effector, and
 /// surface the outcome via LSE counters.
 ///
@@ -892,8 +1069,16 @@ pub fn mediate(
             _ => None,
         };
         if let Some(actual_pid) = effect_pid {
-            if actual_pid != expected_pid {
+            let live_identity_matches = actual_pid == expected_pid
+                && crate::engine::process_identity::ProcessIdentity::verify(
+                    actual_pid,
+                    None,
+                    expected_start_sec,
+                    0,
+                );
+            if !live_identity_matches {
                 lse.inc_mediator_block();
+                lse.inc_pid_recycle_block();
                 return Err(BlockReason::IdentityMismatch {
                     pid: actual_pid,
                     expected_start_sec,
@@ -926,6 +1111,122 @@ pub fn mediate(
 mod tests {
     use super::*;
     use crate::engine::lse_counters::LSE_COUNTERS;
+
+    #[test]
+    fn saga_commits_every_step_in_order_without_compensation() {
+        let mut applied = Vec::new();
+        let report = run_saga(
+            3,
+            |step| {
+                applied.push(step);
+                Ok::<SagaStep, &'static str>(SagaStep::Applied)
+            },
+            |_| -> Result<(), &'static str> { panic!("committed saga must not compensate") },
+        );
+
+        assert_eq!(applied, vec![0, 1, 2]);
+        assert_eq!(report.state(), SagaState::Committed);
+        assert!(report.committed());
+        assert!((0..3).all(|step| report.applied_step(step)));
+    }
+
+    #[test]
+    fn saga_exposes_the_complete_failure_transition_sequence() {
+        let mut transitions = Vec::new();
+        let report = run_saga_observed(
+            2,
+            |step| {
+                if step == 0 {
+                    Ok::<SagaStep, &'static str>(SagaStep::Applied)
+                } else {
+                    Err("apply failed")
+                }
+            },
+            |_| Ok::<(), &'static str>(()),
+            |state| transitions.push(state),
+        );
+
+        assert_eq!(
+            transitions,
+            vec![
+                SagaState::Ready,
+                SagaState::Applying { step: 0 },
+                SagaState::Applying { step: 1 },
+                SagaState::Compensating { failed_step: 1 },
+                SagaState::Compensated,
+            ]
+        );
+        assert_eq!(report.state(), SagaState::Compensated);
+    }
+
+    #[test]
+    fn saga_compensates_only_applied_steps_in_reverse_order() {
+        let mut compensated = Vec::new();
+        let report = run_saga(
+            4,
+            |step| match step {
+                0 | 2 => Ok::<SagaStep, &'static str>(SagaStep::Applied),
+                1 => Ok(SagaStep::NoOp),
+                _ => Err("apply failed"),
+            },
+            |step| {
+                compensated.push(step);
+                Ok::<(), &'static str>(())
+            },
+        );
+
+        assert_eq!(compensated, vec![2, 0]);
+        assert_eq!(report.state(), SagaState::Compensated);
+        assert_eq!(report.apply_failure(), Some((3, &"apply failed")));
+        assert!(report.compensated_step(0));
+        assert!(!report.compensated_step(1));
+        assert!(report.compensated_step(2));
+    }
+
+    #[test]
+    fn saga_attempts_remaining_compensations_after_one_fails() {
+        let mut attempts = Vec::new();
+        let report = run_saga(
+            3,
+            |step| {
+                if step < 2 {
+                    Ok::<SagaStep, &'static str>(SagaStep::Applied)
+                } else {
+                    Err("apply failed")
+                }
+            },
+            |step| {
+                attempts.push(step);
+                if step == 1 {
+                    Err("undo failed")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(attempts, vec![1, 0]);
+        assert_eq!(report.state(), SagaState::RecoveryRequired);
+        assert_eq!(report.compensation_failure(), Some((1, &"undo failed")));
+        assert!(report.compensated_step(0));
+        assert!(!report.compensated_step(1));
+    }
+
+    #[test]
+    fn saga_rejects_step_counts_larger_than_its_fixed_bitset() {
+        let report = run_saga(
+            MAX_SAGA_STEPS + 1,
+            |_| -> Result<SagaStep, &'static str> { panic!("must not apply") },
+            |_| -> Result<(), &'static str> { panic!("must not compensate") },
+        );
+
+        assert_eq!(
+            report.state(),
+            SagaState::Rejected {
+                step_count: MAX_SAGA_STEPS + 1
+            }
+        );
+    }
 
     #[test]
     fn sysctl_value_equality_detects_noop() {
@@ -1076,6 +1377,28 @@ mod tests {
     }
 
     #[test]
+    fn mediate_blocks_when_numeric_pid_matches_but_live_identity_does_not() {
+        let eff = MockEffector {
+            no_op: false,
+            return_err: None,
+        };
+        let ghost_pid = 0xFFFF_FFFE;
+        let e = Effect::SigCont {
+            pid: ghost_pid,
+            start_sec: 123,
+        };
+        let pre = PreCondition {
+            pid_identity: Some((ghost_pid, 123)),
+            ..PreCondition::default()
+        };
+
+        assert!(matches!(
+            mediate(&e, &pre, &eff),
+            Err(BlockReason::IdentityMismatch { pid, .. }) if pid == ghost_pid
+        ));
+    }
+
+    #[test]
     fn mediate_returns_effector_error_unmodified() {
         let eff = MockEffector {
             no_op: false,
@@ -1105,21 +1428,20 @@ mod tests {
     }
 
     #[test]
-    fn mach_policy_effector_dispatches_real_set_tier() {
+    fn mach_policy_effector_reports_unwritable_pid_as_noop() {
         let eff = make_mach_effector_for_test();
         let e = Effect::SetMachPolicy {
             pid: 1234,
             start_sec: 0,
             policy: MachPolicyKind::Background,
         };
-        // PID 1234 likely doesn't exist or we lack permission — the manager
-        // handles that internally. We only assert the typed surface works.
+        // A dead/unwritable PID is a deliberate silent skip in MachQoSManager.
+        // The mediator must not turn that skip into a claimed mutation.
         let r = eff.apply(&e).expect("Switch-4 dispatch returns Ok");
-        assert_eq!(r.after.mach_policy, Some(MachPolicyKind::Background));
-        assert!(
-            !r.no_op,
-            "Switch-4 honest default — no_op detection deferred"
-        );
+        assert_eq!(r.before.mach_policy, None);
+        assert_eq!(r.after.mach_policy, None);
+        assert!(r.no_op);
+        assert_eq!(r.applied_count, 0);
     }
 
     #[test]
@@ -1165,7 +1487,8 @@ mod tests {
         // Must NOT return PreconditionViolated for "probe unavailable" —
         // honest deferral falls through to the underlying set_tier.
         let r = eff.apply(&e).expect("probe-unavailable must fall through");
-        assert_eq!(r.after.mach_policy, Some(MachPolicyKind::Background));
+        assert!(r.no_op);
+        assert_eq!(r.applied_count, 0);
         let post = LSE_COUNTERS
             .mediator_port_hub_probe_unavailable_total
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1203,7 +1526,8 @@ mod tests {
             policy: MachPolicyKind::UserInteractive,
         };
         let r = eff.apply(&e).expect("promotion path stays Ok");
-        assert_eq!(r.after.mach_policy, Some(MachPolicyKind::UserInteractive));
+        assert!(r.no_op);
+        assert_eq!(r.applied_count, 0);
     }
 
     #[test]
@@ -1292,24 +1616,25 @@ mod tests {
     }
 
     #[test]
-    fn jetsam_tier_kind_maps_to_class() {
-        use crate::engine::jetsam_control::JetsamClass;
+    fn jetsam_tier_kind_maps_to_priority_without_memlimit_policy() {
+        use crate::engine::jetsam_control::priority;
         assert_eq!(
-            JetsamEffector::to_class(JetsamTierKind::Foreground),
-            JetsamClass::Interactive
+            JetsamEffector::to_priority(JetsamTierKind::Foreground),
+            priority::FOREGROUND
         );
         assert_eq!(
-            JetsamEffector::to_class(JetsamTierKind::Background),
-            JetsamClass::Noise
+            JetsamEffector::to_priority(JetsamTierKind::Background),
+            priority::BACKGROUND
         );
         assert_eq!(
-            JetsamEffector::to_class(JetsamTierKind::Suspended),
-            JetsamClass::Noise
+            JetsamEffector::to_priority(JetsamTierKind::Suspended),
+            priority::BACKGROUND
         );
         assert_eq!(
-            JetsamEffector::to_class(JetsamTierKind::Idle),
-            JetsamClass::Noise
+            JetsamEffector::to_priority(JetsamTierKind::Idle),
+            priority::BACKGROUND
         );
+        assert_eq!(JetsamEffector::to_priority(JetsamTierKind::Exact(18)), 18);
     }
 
     // ── Phase D: SysctlEffector tests ───────────────────────────────────────

@@ -43,15 +43,15 @@ use crate::engine::mach_qos::{MachQoSManager, SchedulingTier};
 /// kernel-default rest state (documented per variant).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppliedEffect {
-    /// `setpriority(PRIO_PROCESS, pid, -N)` boost. Undo: restore 0
-    /// (default). Prior nice is not captured — Apollo only ever boosts
-    /// FROM the default, and a non-default prior means an external
-    /// writer owns it (we still restore 0: the safe, kernel-default
-    /// rest state).
-    Nice { pid: u32 },
+    /// `setpriority(PRIO_PROCESS, pid, -N)` boost. Undo: restore the exact
+    /// prior nice value so Apollo never overwrites another scheduler owner.
+    Nice { pid: u32, prior: i32 },
     /// Mach task scheduling tier (set_tier). Undo: Normal — the kernel /
     /// runningboard re-elevates genuinely-foreground work from there.
     MachTier { pid: u32 },
+    /// Explicit task latency/throughput QoS. Undo: both dimensions return
+    /// to Default so the scheduler and runningboard regain full ownership.
+    TaskQoS { pid: u32 },
     /// Jetsam band override (memorystatus priority). Undo: restore the
     /// captured prior band verbatim. `prior < 0` = unreadable at apply
     /// time → undo skips the jetsam write (guessing a band would fight
@@ -69,8 +69,9 @@ pub enum AppliedEffect {
 impl AppliedEffect {
     pub fn pid(&self) -> u32 {
         match *self {
-            AppliedEffect::Nice { pid }
+            AppliedEffect::Nice { pid, .. }
             | AppliedEffect::MachTier { pid }
+            | AppliedEffect::TaskQoS { pid }
             | AppliedEffect::JetsamPriority { pid, .. }
             | AppliedEffect::AppNap { pid }
             | AppliedEffect::Memlimit { pid }
@@ -84,10 +85,11 @@ impl AppliedEffect {
         match self {
             AppliedEffect::Nice { .. } => 0,
             AppliedEffect::MachTier { .. } => 1,
-            AppliedEffect::JetsamPriority { .. } => 2,
-            AppliedEffect::AppNap { .. } => 3,
-            AppliedEffect::Memlimit { .. } => 4,
-            AppliedEffect::DarwinBg { .. } => 5,
+            AppliedEffect::TaskQoS { .. } => 2,
+            AppliedEffect::JetsamPriority { .. } => 3,
+            AppliedEffect::AppNap { .. } => 4,
+            AppliedEffect::Memlimit { .. } => 5,
+            AppliedEffect::DarwinBg { .. } => 6,
         }
     }
 }
@@ -108,6 +110,13 @@ struct LedgerEntry {
 /// actively-justified effect is refreshed many times over, short enough
 /// that stale state never survives a session phase change.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(600);
+const REVERT_RETRY_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileOutcome {
+    pub reverted: u64,
+    pub failed: u64,
+}
 
 pub struct EffectLedger {
     entries: HashMap<(u32, u8), LedgerEntry>,
@@ -147,6 +156,48 @@ impl EffectLedger {
         self.entries.remove(&(effect.pid(), effect.kind()));
     }
 
+    fn forget_if_justification(
+        &mut self,
+        effect: &AppliedEffect,
+        justification: &'static str,
+    ) -> bool {
+        let key = (effect.pid(), effect.kind());
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.justification == justification)
+        {
+            self.entries.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_owned_by(&self, effect: &AppliedEffect, justification: &'static str) -> bool {
+        self.entries
+            .get(&(effect.pid(), effect.kind()))
+            .is_some_and(|entry| entry.justification == justification)
+    }
+
+    fn refresh_if_justification(
+        &mut self,
+        effect: &AppliedEffect,
+        ttl: Duration,
+        start_sec: u64,
+        justification: &'static str,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(&(effect.pid(), effect.kind())) else {
+            return false;
+        };
+        if entry.justification != justification || entry.start_sec != start_sec {
+            return false;
+        }
+        entry.applied_at = Instant::now();
+        entry.ttl = ttl;
+        true
+    }
+
     /// Entries past TTL, excluding the foreground pid. Returned entries
     /// are removed — the caller MUST execute the undo (or the effect is
     /// orphaned again). Use [`reconcile_global`] for the full loop.
@@ -179,6 +230,15 @@ impl EffectLedger {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    fn refresh_nice(&mut self, pid: u32, ttl: Duration) -> bool {
+        let Some(entry) = self.entries.get_mut(&(pid, 0)) else {
+            return false;
+        };
+        entry.applied_at = Instant::now();
+        entry.ttl = ttl;
+        true
+    }
 }
 
 impl Default for EffectLedger {
@@ -206,9 +266,34 @@ pub fn record_global(
     with_global(|l| l.record(effect, ttl, start_sec, justification));
 }
 
+/// Refresh a nice effect already owned by Apollo without replacing its saved
+/// prior value. Returns false when no owned nice effect exists.
+pub fn refresh_nice_global(pid: u32, ttl: Duration) -> bool {
+    with_global(|ledger| ledger.refresh_nice(pid, ttl))
+}
+
 /// Producer API: forget without undo (producer reverted it itself).
 pub fn forget_global(effect: &AppliedEffect) {
     with_global(|l| l.forget(effect));
+}
+
+/// Forget only when the current ledger owner matches the caller. This avoids
+/// an older lease deleting a newer producer's reversal backstop.
+pub fn forget_global_if_justification(effect: &AppliedEffect, justification: &'static str) -> bool {
+    with_global(|ledger| ledger.forget_if_justification(effect, justification))
+}
+
+pub fn is_global_owner(effect: &AppliedEffect, justification: &'static str) -> bool {
+    with_global(|ledger| ledger.is_owned_by(effect, justification))
+}
+
+pub fn refresh_global_if_justification(
+    effect: &AppliedEffect,
+    ttl: Duration,
+    start_sec: u64,
+    justification: &'static str,
+) -> bool {
+    with_global(|ledger| ledger.refresh_if_justification(effect, ttl, start_sec, justification))
 }
 
 /// Observability: current ledger size.
@@ -228,13 +313,17 @@ pub fn cleanup_global(live_pids: &[u32]) {
 /// accumulates over minutes, not milliseconds — same cadence as the
 /// zombie sweep). Cost is bounded: undo syscalls only for entries that
 /// actually expired this window.
-pub fn reconcile_global(foreground_pid: Option<u32>, qos_mgr: &Arc<Mutex<MachQoSManager>>) -> u64 {
+pub fn reconcile_global(
+    foreground_pid: Option<u32>,
+    qos_mgr: &Arc<Mutex<MachQoSManager>>,
+) -> ReconcileOutcome {
     let expired = with_global(|l| l.drain_expired(foreground_pid));
     if expired.is_empty() {
-        return 0;
+        return ReconcileOutcome::default();
     }
     const PRIO_DARWIN_BG: libc::c_int = 0x1000;
-    let mut reverted = 0u64;
+    let mut outcome = ReconcileOutcome::default();
+    let mut retry = Vec::new();
     for entry in expired {
         let pid = entry.effect.pid();
         // PID-identity guard: only undo on the same process we mutated.
@@ -242,29 +331,52 @@ pub fn reconcile_global(foreground_pid: Option<u32>, qos_mgr: &Arc<Mutex<MachQoS
         if live_sec == 0 || live_sec != entry.start_sec {
             continue;
         }
-        match entry.effect {
-            AppliedEffect::Nice { pid } => unsafe {
-                libc::setpriority(libc::PRIO_PROCESS, pid, 0);
-            },
+        let reverted = match entry.effect {
+            AppliedEffect::Nice { pid, prior } => {
+                (unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, prior) }) == 0
+            }
             AppliedEffect::MachTier { pid } => {
                 let mut qos = qos_mgr.lock_recover();
-                qos.set_tier(pid, SchedulingTier::Normal);
+                let result = qos.set_tier(pid, SchedulingTier::Normal);
+                result.mutated || qos.current_tier(pid) == Some(SchedulingTier::Normal)
+            }
+            AppliedEffect::TaskQoS { pid } => {
+                let mut qos = qos_mgr.lock_recover();
+                qos.set_latency_and_throughput(
+                    pid,
+                    crate::engine::mach_qos::LatencyTier::Default,
+                    crate::engine::mach_qos::ThroughputTier::Default,
+                )
+                .mutated
             }
             AppliedEffect::JetsamPriority { pid, prior } => {
                 if prior >= 0 {
-                    let _ = crate::engine::jetsam_control::set_priority(pid, prior);
+                    crate::engine::jetsam_control::set_priority(pid, prior).is_ok()
+                } else {
+                    true
                 }
             }
             AppliedEffect::AppNap { pid } => {
                 let mut qos = qos_mgr.lock_recover();
-                qos.set_app_nap(pid, false);
+                qos.set_app_nap(pid, false)
             }
             AppliedEffect::Memlimit { pid } => {
-                let _ = crate::engine::jetsam_control::set_memlimit(pid, 0, 0);
+                crate::engine::jetsam_control::set_memlimit(pid, 0, 0).is_ok()
             }
-            AppliedEffect::DarwinBg { pid } => unsafe {
-                libc::setpriority(PRIO_DARWIN_BG, pid, 0);
-            },
+            AppliedEffect::DarwinBg { pid } => {
+                (unsafe { libc::setpriority(PRIO_DARWIN_BG, pid, 0) }) == 0
+            }
+        };
+        if !reverted {
+            outcome.failed += 1;
+            tracing::warn!(
+                pid,
+                effect = ?entry.effect,
+                justification = entry.justification,
+                "effect-ledger: revert failed; retry scheduled"
+            );
+            retry.push(entry);
+            continue;
         }
         crate::engine::lse_counters::LSE_COUNTERS.inc_effect_ledger_revert();
         tracing::debug!(
@@ -273,9 +385,21 @@ pub fn reconcile_global(foreground_pid: Option<u32>, qos_mgr: &Arc<Mutex<MachQoS
             justification = entry.justification,
             "effect-ledger: reverted expired effect"
         );
-        reverted += 1;
+        outcome.reverted += 1;
     }
-    reverted
+    if !retry.is_empty() {
+        with_global(|ledger| {
+            for entry in retry {
+                ledger.record(
+                    entry.effect,
+                    REVERT_RETRY_TTL,
+                    entry.start_sec,
+                    entry.justification,
+                );
+            }
+        });
+    }
+    outcome
 }
 
 /// Evolve iter-5 (2026-06-10): does this process carry Apollo's boost
@@ -294,7 +418,7 @@ mod tests {
     use super::*;
 
     fn nice(pid: u32) -> AppliedEffect {
-        AppliedEffect::Nice { pid }
+        AppliedEffect::Nice { pid, prior: 0 }
     }
 
     #[test]
@@ -330,6 +454,31 @@ mod tests {
     }
 
     #[test]
+    fn refresh_nice_preserves_original_prior_value() {
+        let mut ledger = EffectLedger::new();
+        ledger.record(
+            AppliedEffect::Nice {
+                pid: 901_007,
+                prior: 5,
+            },
+            Duration::from_secs(1),
+            42,
+            "test",
+        );
+
+        assert!(ledger.refresh_nice(901_007, Duration::from_secs(60)));
+        let entry = ledger.entries.get(&(901_007, 0)).expect("nice entry");
+        assert_eq!(
+            entry.effect,
+            AppliedEffect::Nice {
+                pid: 901_007,
+                prior: 5
+            }
+        );
+        assert_eq!(entry.ttl, Duration::from_secs(60));
+    }
+
+    #[test]
     fn drain_respects_ttl_and_foreground() {
         let mut l = EffectLedger::new();
         l.record(nice(901_002), Duration::from_secs(0), 7, "test");
@@ -352,9 +501,10 @@ mod tests {
             1,
             "b",
         );
-        assert_eq!(l.len(), 2, "different kinds for same pid coexist");
+        l.record(AppliedEffect::TaskQoS { pid: 901_003 }, DEFAULT_TTL, 1, "c");
+        assert_eq!(l.len(), 3, "different kinds for same pid coexist");
         l.record(nice(901_003), DEFAULT_TTL, 1, "a2");
-        assert_eq!(l.len(), 2, "same (pid, kind) upserts");
+        assert_eq!(l.len(), 3, "same (pid, kind) upserts");
     }
 
     #[test]
@@ -373,6 +523,23 @@ mod tests {
         l.record(e, DEFAULT_TTL, 1, "t");
         l.forget(&e);
         assert!(l.is_empty());
+    }
+
+    #[test]
+    fn conditional_forget_preserves_newer_owner() {
+        let mut ledger = EffectLedger::new();
+        let effect = AppliedEffect::MachTier { pid: 901_008 };
+        ledger.record(effect, DEFAULT_TTL, 1, "new-owner");
+
+        assert!(!ledger.forget_if_justification(&effect, "old-owner"));
+        assert!(!ledger.is_owned_by(&effect, "old-owner"));
+        assert_eq!(ledger.len(), 1);
+        assert!(ledger.is_owned_by(&effect, "new-owner"));
+        assert!(!ledger.refresh_if_justification(&effect, Duration::from_secs(1), 1, "old-owner"));
+        assert!(!ledger.refresh_if_justification(&effect, Duration::from_secs(1), 2, "new-owner"));
+        assert!(ledger.refresh_if_justification(&effect, Duration::from_secs(1), 1, "new-owner"));
+        assert!(ledger.forget_if_justification(&effect, "new-owner"));
+        assert!(ledger.is_empty());
     }
 
     /// Strangler-fig phase-2: the memory-budget tracker migrated its memlimit

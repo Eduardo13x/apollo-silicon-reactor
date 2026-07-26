@@ -339,12 +339,16 @@ fn top_blockers(
         }
     }
 
-    blockers.sort_by(|a, b| {
+    let by_score = |a: &BlockerScore, b: &BlockerScore| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    blockers.truncate(8);
+    };
+    if blockers.len() > 8 {
+        blockers.select_nth_unstable_by(8, by_score);
+        blockers.truncate(8);
+    }
+    blockers.sort_by(by_score);
     blockers
 }
 
@@ -367,6 +371,26 @@ pub(crate) fn evaluate_gate_e(
         0.0
     };
     swap_pct >= 0.85 && memory_pressure >= 0.70
+}
+
+const MIN_PROCESS_EFFECTIVENESS_OBSERVATIONS: u32 = 10;
+
+fn learned_yield_for_candidate(
+    name: &str,
+    effectiveness: &crate::engine::effectiveness_tracker::EffectivenessTracker,
+    hop_groups: &HashMap<WorkloadHop, HopGroupWeight>,
+) -> Option<f64> {
+    if let Some(process) = effectiveness
+        .get(name)
+        .filter(|entry| entry.observation_count >= MIN_PROCESS_EFFECTIVENESS_OBSERVATIONS)
+    {
+        return Some(process.blended_score);
+    }
+
+    let hop = WorkloadHop::from_process_name(name);
+    hop_groups
+        .get(&hop)
+        .map(|group| 0.5 * group.effectiveness() + 0.5 * group.predicted_effectiveness)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -392,6 +416,10 @@ pub fn decide_actions(
     // These are I/O-bound processes (low CPU/wall ratio) that behave like
     // interactive apps regardless of their name.
     behavior_interactive_pids: &HashSet<u32>,
+    // PIDs whose executable lives in a macOS .app bundle. Process enrichment
+    // caches this immutable identity by PID + start time, so decision-making
+    // can protect user apps without repeating proc_pidpath for every process.
+    app_bundle_pids: &HashSet<u32>,
     // Per-process IPC hints from energy_pid tracker (ri_instructions/ri_cycles).
     // Used for IPC-aware throttling: low IPC = memory-bound (safe to throttle),
     // high IPC = compute-bound (throttling hurts throughput).
@@ -445,14 +473,10 @@ pub fn decide_actions(
     // hold-down. Other gates (a/b/c/d) ignore the cooldown — their
     // physical triggers are too urgent to bypass.
     freeze_cooldown: &crate::engine::freeze_cooldown::FreezeCooldown,
-    // Sprint 12 Convergence #1 (2026-05-17). PIDs that the CompanionGraph
-    // classifies as companions of the current foreground app. Used by
-    // the cold-thread router to keep companions on the same P-cluster as
-    // the foreground hot threads (preserving L2 working-set locality)
-    // when DRAM bandwidth is below the safety floor. Pass an empty set
-    // to disable the bridge — the default-E-cluster routing then stays
-    // intact, exactly matching pre-bridge behaviour.
-    companion_of_foreground_pids: &HashSet<u32>,
+    // Retained for call-site compatibility. The old companion-affinity bridge
+    // treated numeric Mach affinity tags as P/E selectors; XNU only uses them
+    // as co-location groups. Thread QoS now carries scheduler intent.
+    _companion_of_foreground_pids: &HashSet<u32>,
     world_model: &crate::engine::world_model::WorldModel,
     effectiveness: &crate::engine::effectiveness_tracker::EffectivenessTracker,
 ) -> DecisionOutput {
@@ -464,30 +488,6 @@ pub fn decide_actions(
     let noise_lc: Vec<String> = learned_noise
         .iter()
         .map(|s| s.to_ascii_lowercase())
-        .collect();
-
-    // Behavioural app-bundle detection: build a set of pids whose binary
-    // lives in a macOS .app bundle. ANY .app binary is by definition a
-    // user-facing app or its helper (Apple Bundle Programming Guide), so
-    // it must be protected from throttling regardless of whether its name
-    // appears in the hardcoded INTERACTIVE_APPS list. This is the
-    // behavioural detection that eliminates the drift hazard observed in
-    // the 2026-04-08 graph audit (INTERACTIVE_APPS had drifted from
-    // thermal_interrupt::protected by 10+ entries).
-    //
-    // Cost: one proc_pidpath syscall (~3 µs on M1) per pid, called once
-    // per cycle here. Cached in the local HashSet for O(1) lookup by the
-    // is_interactive closure below. The lookup is name+pid based so the
-    // closure does not need to be aware of the path itself.
-    let app_bundle_pids: std::collections::HashSet<u32> = sys
-        .processes()
-        .keys()
-        .filter_map(|pid| {
-            let pid_u32 = pid.as_u32();
-            crate::engine::proc_taskinfo::is_user_app_bundle(pid_u32)
-                .filter(|&is_bundle| is_bundle)
-                .map(|_| pid_u32)
-        })
         .collect();
 
     // System-wide CPU stall signal: when more than half of the tracked
@@ -561,7 +561,7 @@ pub fn decide_actions(
     }
     // AMX/ML protection: ML inference workloads must NEVER be throttled or frozen.
     // They run on P-cores, are expensive to restart, and are user-initiated.
-    let ml_protected = amx_detector::ml_protected_pids();
+    let ml_protected = amx_detector::ml_protected_pids_for_system(sys);
     for &ml_pid in &ml_protected {
         critical_pids.insert(ml_pid);
     }
@@ -1036,14 +1036,16 @@ pub fn decide_actions(
                 break;
             }
             let pid_u32 = pid.as_u32();
-            let name = process.name().to_string();
             let cpu = process.cpu_usage();
 
-            // Skip critical, interactive, and low-CPU processes.
-            if critical_pids.contains(&pid_u32)
-                || is_interactive(&name, &name.to_ascii_lowercase(), pid_u32)
-                || cpu < thread_cpu_threshold
-            {
+            // Most processes are below the CPU threshold. Reject them before
+            // allocating and lowercasing their names for interactive matching.
+            if critical_pids.contains(&pid_u32) || cpu < thread_cpu_threshold {
+                continue;
+            }
+            let name = process.name().to_string();
+            let name_lc = name.to_ascii_lowercase();
+            if is_interactive(&name, &name_lc, pid_u32) {
                 continue;
             }
 
@@ -1080,10 +1082,10 @@ pub fn decide_actions(
                                     idx, name, analysis.thread_count
                                 ),
                                 decision_reason: DecisionReason::AnomalyDetected,
-                                // Runaway: route hot thread to E-cluster (penalize).
-                                affinity_tag: Some(
-                                    crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER,
-                                ),
+                                // Utility QoS is the scheduler-supported demotion.
+                                // Mach affinity tags group related threads; they do
+                                // not select an E-core cluster.
+                                affinity_tag: None,
                                 start_sec,
                                 start_usec,
                             });
@@ -1108,9 +1110,7 @@ pub fn decide_actions(
                                     idx, name, analysis.active_count, analysis.thread_count
                                 ),
                                 decision_reason: DecisionReason::ThreadQoSRouting,
-                                affinity_tag: Some(
-                                    crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER,
-                                ),
+                                affinity_tag: None,
                                 start_sec,
                                 start_usec,
                             });
@@ -1162,10 +1162,9 @@ pub fn decide_actions(
                                     idx, name, cpu
                                 ),
                                 decision_reason: DecisionReason::ThreadQoSRouting,
-                                // Normal hot thread: P-cluster preference (latency-sensitive).
-                                affinity_tag: Some(
-                                    crate::engine::mach_qos::mach_sys::AFFINITY_TAG_P_CLUSTER,
-                                ),
+                                // Interactive QoS communicates latency intent to
+                                // the heterogeneous scheduler directly.
+                                affinity_tag: None,
                                 start_sec,
                                 start_usec,
                             });
@@ -1175,26 +1174,6 @@ pub fn decide_actions(
                             if thread_actions_emitted >= max_thread_actions {
                                 break;
                             }
-                            // Sprint 12 Convergence #1 (2026-05-17):
-                            // when the owning PID is a companion of the
-                            // foreground AND DRAM bandwidth is below the
-                            // 0.50 safety floor, keep the cold thread on
-                            // P-cluster (same cluster as foreground hot
-                            // threads) to preserve L2 working-set
-                            // locality across user-triggered focus
-                            // switches. Otherwise default to E-cluster
-                            // (battery-friendly).
-                            // [ARM big.LITTLE 2013 §3] cluster-local L2.
-                            let companion_bridge_active = companion_of_foreground_pids
-                                .contains(&pid_u32)
-                                && dram_bandwidth_pct < 0.50;
-                            let cold_affinity = if companion_bridge_active {
-                                crate::engine::lse_counters::LSE_COUNTERS
-                                    .inc_companion_affinity_alignment();
-                                crate::engine::mach_qos::mach_sys::AFFINITY_TAG_P_CLUSTER
-                            } else {
-                                crate::engine::mach_qos::mach_sys::AFFINITY_TAG_E_CLUSTER
-                            };
                             actions.push(RootAction::SetThreadQoS {
                                 pid: pid_u32,
                                 name: name.clone(),
@@ -1202,7 +1181,7 @@ pub fn decide_actions(
                                 tier: "background".to_string(),
                                 reason: format!("cold thread #{} in {} (waiting)", idx, name),
                                 decision_reason: DecisionReason::ThreadQoSRouting,
-                                affinity_tag: Some(cold_affinity),
+                                affinity_tag: None,
                                 start_sec,
                                 start_usec,
                             });
@@ -1741,10 +1720,8 @@ pub fn decide_actions(
                     // candidates per cycle.
                     {
                         let mut cctx = ctx_probe.clone();
-                        let hop = WorkloadHop::from_process_name(&name);
-                        cctx.learned_yield = hop_groups
-                            .get(&hop)
-                            .map(|g| 0.5 * g.effectiveness() + 0.5 * g.predicted_effectiveness);
+                        cctx.learned_yield =
+                            learned_yield_for_candidate(&name, effectiveness, hop_groups);
                         cctx.imagined_margin =
                             match world_model.imagine(&format!("freeze:{}", name)) {
                                 crate::engine::world_model::Imagined::ActWins { margin } => {
@@ -1899,6 +1876,43 @@ mod tests {
     use crate::engine::types::{LatencyTarget, OptimizationProfile};
 
     #[test]
+    fn candidate_yield_prefers_mature_process_blend() {
+        let mut effectiveness = crate::engine::effectiveness_tracker::EffectivenessTracker::new();
+        effectiveness.update_from_outcome("worker", 0.86, 10, 1);
+
+        let group = HopGroupWeight {
+            throttle_count: 20,
+            effective_count: 2,
+            predicted_effectiveness: 0.10,
+            ..HopGroupWeight::default()
+        };
+        let hop_groups = HashMap::from([(WorkloadHop::General, group)]);
+
+        let yield_score = learned_yield_for_candidate("worker", &effectiveness, &hop_groups)
+            .expect("mature process blend");
+        assert!((yield_score - 0.86).abs() < 1e-9);
+    }
+
+    #[test]
+    fn candidate_yield_falls_back_to_group_until_process_is_mature() {
+        let mut effectiveness = crate::engine::effectiveness_tracker::EffectivenessTracker::new();
+        effectiveness.update_from_outcome("worker", 0.90, 9, 1);
+
+        let group = HopGroupWeight {
+            throttle_count: 18,
+            effective_count: 8,
+            predicted_effectiveness: 0.40,
+            ..HopGroupWeight::default()
+        };
+        let expected = 0.5 * group.effectiveness() + 0.5 * group.predicted_effectiveness;
+        let hop_groups = HashMap::from([(WorkloadHop::General, group)]);
+
+        let yield_score = learned_yield_for_candidate("worker", &effectiveness, &hop_groups)
+            .expect("group fallback");
+        assert!((yield_score - expected).abs() < 1e-9);
+    }
+
+    #[test]
     fn learned_pattern_matches_handles_macos_truncation() {
         // The 2026-06-13 bug: macOS reports the LSP as the 15-char comm name
         // "language_server", but the learned policy stored the full
@@ -2015,6 +2029,7 @@ mod tests {
             &weights,
             0.0,
             &pids,
+            &HashSet::new(),
             &ipc,
             &hops,
             &hab,

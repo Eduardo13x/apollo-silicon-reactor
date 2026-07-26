@@ -283,9 +283,13 @@ pub fn sample_process_temperature(pid: u32) -> Option<TempProfile> {
         }
     }
 
-    // Sort by size descending, take top 8.
-    regions.sort_by_key(|b| std::cmp::Reverse(b.1));
-    regions.truncate(8);
+    // Select by size in O(n), then sort only the eight regions we probe.
+    let by_size = |b: &(u64, u64)| std::cmp::Reverse(b.1);
+    if regions.len() > 8 {
+        regions.select_nth_unstable_by_key(8, by_size);
+        regions.truncate(8);
+    }
+    regions.sort_by_key(by_size);
 
     // Probe each region and record latency.
     let mut timings: Vec<u64> = Vec::new();

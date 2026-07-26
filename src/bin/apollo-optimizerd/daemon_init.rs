@@ -121,6 +121,73 @@ pub(super) fn detect_hw_caps() -> (u32, f64) {
     (hw_cores, hw_ram_gb)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ParallelRuntimeConfig {
+    pub enabled: bool,
+    pub worker_threads: usize,
+}
+
+fn choose_parallel_workers(total_cores: usize, p_cores: usize, e_cores: usize) -> usize {
+    if total_cores < 10 || p_cores < 4 || e_cores < 4 {
+        return 1;
+    }
+    // The live M4 A/B favored 4 workers over 6 and 10 for ~675 processes.
+    // Cap the shared pool so sensing cannot occupy every CPU during contention.
+    p_cores.clamp(2, 4)
+}
+
+/// Configure sysinfo's persistent Rayon pool before the first process refresh.
+pub(super) fn configure_parallel_runtime() -> ParallelRuntimeConfig {
+    let caps = apollo_engine::engine::capabilities::detect_capabilities();
+    let fallback_total = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let p_cores = caps.p_core_count.unwrap_or(0) as usize;
+    let e_cores = caps.e_core_count.unwrap_or(0) as usize;
+    let total_cores = (p_cores + e_cores).max(fallback_total);
+    let worker_threads = choose_parallel_workers(total_cores, p_cores, e_cores);
+
+    #[cfg(feature = "adaptive-multicore")]
+    {
+        let built = rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_threads)
+            .thread_name(|index| format!("apollo-sense-{index}"))
+            .start_handler(|_| set_parallel_worker_qos())
+            .build_global()
+            .is_ok();
+        return ParallelRuntimeConfig {
+            enabled: built && worker_threads > 1,
+            worker_threads,
+        };
+    }
+
+    #[cfg(not(feature = "adaptive-multicore"))]
+    {
+        let _ = worker_threads;
+        ParallelRuntimeConfig {
+            enabled: false,
+            worker_threads: 1,
+        }
+    }
+}
+
+#[cfg(all(feature = "adaptive-multicore", target_os = "macos"))]
+fn set_parallel_worker_qos() {
+    const QOS_CLASS_USER_INITIATED: libc::c_uint = 0x19;
+    unsafe {
+        extern "C" {
+            fn pthread_set_qos_class_self_np(
+                qos_class: libc::c_uint,
+                relative_priority: libc::c_int,
+            ) -> libc::c_int;
+        }
+        let _ = pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    }
+}
+
+#[cfg(all(feature = "adaptive-multicore", not(target_os = "macos")))]
+fn set_parallel_worker_qos() {}
+
 impl DaemonSubsystems {
     pub(super) fn new() -> Self {
         let mut outcome_tracker = OutcomeTracker::new();
@@ -193,6 +260,14 @@ mod tests {
         let (cores, ram_gb) = detect_hw_caps();
         assert!(cores >= 1, "cores must be >= 1, got {cores}");
         assert!(ram_gb >= 1.0, "ram_gb must be >= 1.0, got {ram_gb}");
+    }
+
+    #[test]
+    fn parallel_workers_follow_heterogeneous_capacity() {
+        assert_eq!(choose_parallel_workers(8, 4, 4), 1);
+        assert_eq!(choose_parallel_workers(10, 4, 6), 4);
+        assert_eq!(choose_parallel_workers(14, 10, 4), 4);
+        assert_eq!(choose_parallel_workers(10, 0, 0), 1);
     }
 
     #[test]

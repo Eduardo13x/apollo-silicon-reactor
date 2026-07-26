@@ -4,9 +4,10 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+source scripts/hardware-build-profile.sh
 
 echo "── Build release..."
-cargo build --release 2>&1 | tail -3
+cargo build --release ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} 2>&1 | tail -3
 
 echo "── Kill old daemon..."
 killall apollo-optimizerd 2>/dev/null || true

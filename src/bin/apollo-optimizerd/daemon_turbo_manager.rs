@@ -14,7 +14,7 @@ use std::path::Path;
 
 use apollo_engine::collector::SystemCollector;
 use apollo_engine::engine::background_collectors::PressureCollector;
-use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified, write_frozen_state};
+use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::display_turbo::{DisplayTurbo, TurboAction};
 use apollo_engine::engine::foreground::ForegroundDetector;
@@ -124,9 +124,9 @@ pub fn run_turbo_tick(
                 .iter()
                 .filter_map(|&pid| frozen_guard.get(&pid).map(|e| (pid, e.clone())))
                 .collect();
-            let unfreeze_count = unfreeze_pids_verified(&entries_to_unfreeze);
-            for pid in &pids {
-                frozen_guard.remove(pid);
+            let outcome = unfreeze_pids_verified_outcome(&entries_to_unfreeze);
+            for pid in outcome.forgettable_pids() {
+                frozen_guard.remove(&pid);
             }
             write_frozen_state(frozen_state_path, &frozen_guard);
             drop(frozen_guard);
@@ -134,13 +134,14 @@ pub fn run_turbo_tick(
             // [Nygard 2018] §8.5 — circuit breaker hold-down after recovery.
             {
                 let mut cooldown = state.freeze_cooldown.lock_recover();
-                for pid in &pids {
+                for pid in &outcome.applied_pids {
                     cooldown.mark_thawed(*pid);
                 }
             }
             // Clear turbo internal state so stale PIDs don't block re-freeze on
             // the next display-off cycle.
             display_turbo.clear_frozen();
+            let unfreeze_count = outcome.applied_count();
             state.metrics.lock_recover().metrics.unfreezes_applied += unfreeze_count;
             // Jank is recorded only when we ACTUALLY froze processes during turbo.
             // Pure display on/off cycles with zero freezes are normal user behavior.

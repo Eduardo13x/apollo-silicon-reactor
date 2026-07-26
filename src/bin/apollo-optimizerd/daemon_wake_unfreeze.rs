@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 
 use apollo_engine::engine::background_collectors::PressureCollector;
-use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified, write_frozen_state};
+use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::mach_qos::SchedulingTier;
@@ -70,25 +70,36 @@ pub fn run_wake_unfreeze(
     // (start_sec) before signalling. Crash before SIGCONT leaves
     // PIDs in frozen_state for recovery on restart (WAL semantics).
     // [Saltzer & Kaashoek 2009] §3.3 Complete Mediation.
-    {
+    let outcome = {
         let mut frozen_guard = state.frozen_state.lock_recover();
         let entries: std::collections::HashMap<u32, apollo_engine::engine::types::FrozenEntry> =
             batch
                 .iter()
                 .filter_map(|&pid| frozen_guard.get(&pid).map(|e| (pid, e.clone())))
                 .collect();
-        unfreeze_pids_verified(&entries);
-        for pid in &batch {
-            frozen_guard.remove(pid);
+        let outcome = unfreeze_pids_verified_outcome(&entries);
+        for pid in outcome.forgettable_pids() {
+            frozen_guard.remove(&pid);
         }
         write_frozen_state(frozen_state_path, &frozen_guard);
+        outcome
+    };
+    for pid in outcome.failed_pids.iter().rev() {
+        wake_unfreeze_queue.push_front(*pid);
+    }
+    let applied = outcome.applied_count();
+    if applied > 0 {
+        let mut metrics = state.metrics.lock_recover();
+        metrics.metrics.post_wake_defensive_unfreezes += applied;
+        metrics.metrics.unfreezes_applied += applied;
+        metrics.metrics.throttle_reverted += applied;
     }
 
     // Mark thawed PIDs in cooldown to prevent gate_e re-freeze oscillation.
     // [Nygard 2018] §8.5 — circuit breaker hold-down after recovery.
     {
         let mut cooldown = state.freeze_cooldown.lock_recover();
-        for pid in &batch {
+        for pid in &outcome.applied_pids {
             cooldown.mark_thawed(*pid);
         }
     }
@@ -99,11 +110,11 @@ pub fn run_wake_unfreeze(
     // routing is critical for perceived responsiveness.
     {
         let mut qos = state.mach_qos.lock_recover();
-        for pid in &batch {
+        for pid in &outcome.applied_pids {
             let _ = qos.set_tier(*pid, SchedulingTier::Normal);
         }
     }
 
     // Record actual-SIGCONT T0 for unfreeze_decay ODE τ learning.
-    wake_thaw_pids.extend_from_slice(&batch);
+    wake_thaw_pids.extend_from_slice(&outcome.applied_pids);
 }

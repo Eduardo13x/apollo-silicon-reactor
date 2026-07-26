@@ -20,6 +20,7 @@ use apollo_engine::collector::SystemCollector;
 use apollo_engine::engine::adaptive_governor::ProcessDecision;
 use apollo_engine::engine::daemon_helpers::audit_log_batch;
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decide_actions::is_interactive_app_name;
 use apollo_engine::engine::foreground::ForegroundDetector;
 use apollo_engine::engine::hw_bayes::HwFeatures;
 use apollo_engine::engine::lock_ext::LockRecover;
@@ -32,8 +33,9 @@ use apollo_engine::engine::zombie_hunter::HuntSnapshot;
 use apollo_engine::engine::{
     amx_detector,
     safety::{
-        behavioral_protection_score, classify_protection, infrastructure_processes,
-        is_user_interactive_app, matches_dev_runtime, protected_processes, ProtectionLevel,
+        behavioral_protection_score, cached_policy_protected_ac, classify_protection_canonical,
+        is_chromium_family, is_protected_name, is_user_interactive_app, matches_dev_runtime,
+        ProtectionLevel,
     },
 };
 use chrono::Utc;
@@ -43,7 +45,7 @@ use apollo_engine::engine::process_tree::ProcessTree;
 use crate::process_enrichment::{
     build_foreground_family, convert_and_merge_heuristic_decisions, HeuristicStats,
 };
-use apollo_engine::engine::recently_applied::RecentlyApplied;
+use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
 
 pub struct HeuristicPassOutput {
     pub heuristic_decisions: Vec<ProcessDecision>,
@@ -62,6 +64,20 @@ struct BehavioralCandidate {
     idle_s: u64,
     rss: u64,
     raw_score: f64,
+}
+
+/// Reuse the complete heuristic protection envelope before a secondary
+/// producer emits a per-process action. The final dispatcher remains the
+/// authority, but rejecting here avoids doomed proposals and polluted learning.
+pub fn is_protected_action_candidate(
+    pid: u32,
+    name: &str,
+    heuristic_critical_pids: &HashSet<u32>,
+) -> bool {
+    heuristic_critical_pids.contains(&pid)
+        || is_protected_name(name)
+        || is_interactive_app_name(name)
+        || is_chromium_family(name)
 }
 
 /// Heuristic protection pass — runs AdaptiveGovernor, scores behavioral protection,
@@ -100,7 +116,9 @@ pub fn run_heuristic_pass(
     experience: &ExperienceMemory,
     experience_pressure_band: f64,
     current_pressure: f64,
-    recently_applied: &mut RecentlyApplied,
+    total_ram_bytes: u64,
+    recently_applied: &RecentlyApplied,
+    apple_platform_pids: &HashSet<u32>,
 ) -> HeuristicPassOutput {
     const HIGH_TAU_SEC: f64 = 300.0;
 
@@ -111,38 +129,39 @@ pub fn run_heuristic_pass(
     let sys = collector.system();
     let snap_by_pid: HashMap<u32, &ProcessSnapshot> =
         proc_snaps.iter().map(|snap| (snap.pid, snap)).collect();
-    let infra_pats = infrastructure_processes();
-    let protected_pats = protected_processes();
     let policy_protected = state
         .policy
         .lock_recover()
         .learned_policy
         .protected_patterns
         .clone();
-    let policy_protected_ac =
-        apollo_engine::engine::safety::build_policy_protected_ac(&policy_protected);
-    let total_ram = apollo_engine::engine::sysctl_direct::read_u64("hw.memsize")
-        .unwrap_or(8 * 1024 * 1024 * 1024);
-    let mut heuristic_critical_pids: HashSet<u32> = HashSet::new();
+    let policy_protected_ac = cached_policy_protected_ac(&policy_protected);
+    let mut heuristic_critical_pids = apple_platform_pids.clone();
     let mut behavioral_candidates = Vec::new();
+    let apple_platform_protected = apple_platform_pids.len() as u64;
 
     // One linear pass over sysinfo. The previous `iter().find()` made this
     // O(processes^2) and allocated a String for every process.
     for (pid, process) in sys.processes() {
         let pid_u32 = pid.as_u32();
         let name = process.name();
+        // The kernel will reject Apollo's throttle/freeze actuators for Apple
+        // platform binaries under SIP. Mark them protected before governor
+        // scoring so we do not manufacture hundreds of doomed actions and
+        // discard them again at the final dispatch filter.
+        if apple_platform_pids.contains(&pid_u32) {
+            continue;
+        }
         let snap = snap_by_pid.get(&pid_u32).copied();
         let has_gui = snap.is_some_and(|s| s.has_gui_window);
         let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
         let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
         let is_interactive = is_user_interactive_app(has_gui, idle_s, rss, name);
 
-        match classify_protection(
+        match classify_protection_canonical(
             name,
-            &protected_pats,
-            &infra_pats,
             &policy_protected,
-            policy_protected_ac.as_ref(),
+            policy_protected_ac.as_deref(),
             is_interactive,
         ) {
             ProtectionLevel::Unconditional => {
@@ -180,12 +199,18 @@ pub fn run_heuristic_pass(
                 idle_s,
                 rss,
                 raw_score: behavioral_protection_score(
-                    cpu, wakeups, net, gui, idle_s, rss, total_ram,
+                    cpu,
+                    wakeups,
+                    net,
+                    gui,
+                    idle_s,
+                    rss,
+                    total_ram_bytes,
                 ),
             });
         }
     }
-    heuristic_critical_pids.extend(amx_detector::ml_protected_pids());
+    heuristic_critical_pids.extend(amx_detector::ml_protected_pids_cached().iter().copied());
 
     // ── AdaptiveGovernor heuristic pass ─────────────────────────────────────
     // Name/policy-protected PIDs are mediated before action scoring. Learned
@@ -199,15 +224,16 @@ pub fn run_heuristic_pass(
             .filter(|s| unfreeze_decay.tau_for_app(&s.name) > HIGH_TAU_SEC)
             .map(|s| s.pid)
             .collect();
-        pg.adaptive_governor.decide_all_with_hw_and_protected(
-            proc_snaps,
-            hunt_snaps,
-            foreground_app,
-            all_proc_names,
-            hour_of_day,
-            hw_features,
-            &heuristic_critical_pids,
-        )
+        pg.adaptive_governor
+            .decide_actionable_with_hw_and_protected(
+                proc_snaps,
+                hunt_snaps,
+                foreground_app,
+                all_proc_names,
+                hour_of_day,
+                hw_features,
+                &heuristic_critical_pids,
+            )
     };
 
     let relevances: Vec<f32> = {
@@ -265,6 +291,7 @@ pub fn run_heuristic_pass(
         m.metrics.bps_evaluated += behavioral_candidates.len() as u64;
         m.metrics.bps_protected += bps_prot;
         m.metrics.bps_demoted += bps_dem;
+        m.metrics.heuristic_apple_platform_protected += apple_platform_protected;
         if bps_min < f64::MAX {
             m.metrics.bps_min_score = bps_min;
             m.metrics.bps_min_score_name = bps_min_name;
@@ -353,5 +380,191 @@ pub fn apply_pre_exec_safety_filters(
     let interrupt_phase = state.resource_interrupt.phase.load(Ordering::Acquire);
     if thermal_emergency || interrupt_phase >= 2 {
         actions.retain(|a| !matches!(a, RootAction::BoostProcess { .. }));
+    }
+}
+
+/// Breakdown of the universal pre-budget dispatch filter.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchPrefilterStats {
+    pub input: u64,
+    pub recent_drops: u64,
+    pub apple_drops: u64,
+    pub protected_drops: u64,
+    pub identity_drops: u64,
+    pub survivors: u64,
+}
+
+/// Remove actions that cannot safely reach the kernel before they consume the
+/// per-cycle or per-minute action budget. The two closures keep platform and
+/// identity probes injectable so the ordering invariant is unit-testable.
+pub fn filter_dispatch_candidates<FApple, FIdentity>(
+    actions: Vec<RootAction>,
+    policy_protected: &[String],
+    recently_applied: &RecentlyApplied,
+    mut is_apple_platform: FApple,
+    mut identity_valid: FIdentity,
+) -> (Vec<RootAction>, DispatchPrefilterStats)
+where
+    FApple: FnMut(u32) -> bool,
+    FIdentity: FnMut(&RootAction) -> bool,
+{
+    let mut stats = DispatchPrefilterStats {
+        input: actions.len() as u64,
+        ..DispatchPrefilterStats::default()
+    };
+    let mut filtered = Vec::with_capacity(actions.len());
+    let policy_protected_ac = cached_policy_protected_ac(policy_protected);
+
+    for action in actions {
+        if let Some((pid, kind, discriminator)) = CachedActionKind::from_root_action(&action) {
+            if recently_applied.is_recent_scoped(pid, kind, discriminator) {
+                stats.recent_drops += 1;
+                continue;
+            }
+
+            let blocks_under_sip = matches!(
+                kind,
+                CachedActionKind::Throttle
+                    | CachedActionKind::Freeze
+                    | CachedActionKind::Unfreeze
+                    | CachedActionKind::SetThreadQoS
+            );
+            if blocks_under_sip && is_apple_platform(pid) {
+                stats.apple_drops += 1;
+                continue;
+            }
+
+            let blocks_for_protected =
+                !matches!(kind, CachedActionKind::Boost | CachedActionKind::Unfreeze);
+            if blocks_for_protected {
+                let action_name = match &action {
+                    RootAction::ThrottleProcess { name, .. }
+                    | RootAction::FreezeProcess { name, .. }
+                    | RootAction::SetThreadQoS { name, .. }
+                    | RootAction::BoostProcess { name, .. }
+                    | RootAction::UnfreezeProcess { name, .. } => Some(name.as_str()),
+                    _ => None,
+                };
+                if action_name.is_some_and(|name| {
+                    classify_protection_canonical(
+                        name,
+                        policy_protected,
+                        policy_protected_ac.as_deref(),
+                        false,
+                    ) == ProtectionLevel::Unconditional
+                }) {
+                    stats.protected_drops += 1;
+                    continue;
+                }
+            }
+
+            if !identity_valid(&action) {
+                stats.identity_drops += 1;
+                continue;
+            }
+        }
+
+        stats.survivors += 1;
+        filtered.push(action);
+    }
+
+    (filtered, stats)
+}
+
+#[cfg(test)]
+mod dispatch_prefilter_tests {
+    use super::*;
+    use apollo_engine::engine::audit_types::DecisionReason;
+    use apollo_engine::engine::safety::enforce_limits_with_budget;
+    use apollo_engine::engine::types::{ActionBudgetState, OptimizationProfile, SafetyPolicy};
+
+    fn throttle(pid: u32, name: impl Into<String>) -> RootAction {
+        RootAction::ThrottleProcess {
+            pid,
+            name: name.into(),
+            aggressive: false,
+            reason: "test".to_string(),
+            start_sec: 1,
+            start_usec: 0,
+            decision_reason: DecisionReason::PressureContext,
+        }
+    }
+
+    #[test]
+    fn secondary_producers_reuse_the_complete_protection_envelope() {
+        let critical = HashSet::from([77]);
+
+        assert!(is_protected_action_candidate(
+            77,
+            "new-macos-daemon",
+            &critical
+        ));
+        assert!(is_protected_action_candidate(78, "trustd", &HashSet::new()));
+        assert!(is_protected_action_candidate(
+            79,
+            "Brave Browser Helper (Renderer)",
+            &HashSet::new(),
+        ));
+        assert!(!is_protected_action_candidate(
+            80,
+            "thirdparty-idle-worker",
+            &HashSet::new(),
+        ));
+    }
+
+    #[test]
+    fn kernel_rejected_prefix_cannot_starve_later_executable_action() {
+        let mut actions = Vec::new();
+        for pid in 1_000..1_080 {
+            actions.push(throttle(pid, format!("platform-job-{pid}")));
+        }
+        actions.push(throttle(9_999, "thirdparty-batch-worker"));
+
+        let recent = RecentlyApplied::new();
+        let (filtered, stats) = filter_dispatch_candidates(
+            actions,
+            &[],
+            &recent,
+            |pid| (1_000..1_080).contains(&pid),
+            |_| true,
+        );
+
+        assert_eq!(stats.input, 81);
+        assert_eq!(stats.apple_drops, 80);
+        assert_eq!(stats.survivors, 1);
+        let policy = SafetyPolicy::for_profile(OptimizationProfile::BalancedRoot);
+        let admitted =
+            enforce_limits_with_budget(filtered, &policy, &mut ActionBudgetState::default(), 80);
+        assert_eq!(admitted.len(), 1);
+        assert!(matches!(
+            &admitted[0],
+            RootAction::ThrottleProcess { pid: 9_999, .. }
+        ));
+    }
+
+    #[test]
+    fn reports_recent_protected_and_identity_rejections_separately() {
+        let mut recent = RecentlyApplied::new();
+        recent.record(10, CachedActionKind::Throttle);
+        let actions = vec![
+            throttle(10, "recent-thirdparty-job"),
+            throttle(11, "WindowServer"),
+            throttle(12, "identity-mismatch-job"),
+            throttle(13, "surviving-thirdparty-job"),
+        ];
+
+        let (filtered, stats) = filter_dispatch_candidates(
+            actions,
+            &[],
+            &recent,
+            |_| false,
+            |action| !matches!(action, RootAction::ThrottleProcess { pid: 12, .. }),
+        );
+
+        assert_eq!(stats.recent_drops, 1);
+        assert_eq!(stats.protected_drops, 1);
+        assert_eq!(stats.identity_drops, 1);
+        assert_eq!(stats.survivors, 1);
+        assert_eq!(filtered.len(), 1);
     }
 }

@@ -46,12 +46,12 @@ use apollo_engine::collector::{SystemCollector, SystemSnapshot};
 // spotlight_set_indexing import removed 2026-05-08: Apollo no longer
 // touches mdutil automatically (user-reported Finder beachball regression).
 use apollo_engine::engine::daemon_state::SharedState;
-use apollo_engine::engine::llm_inference_mode::LlmInferenceDetector;
+use apollo_engine::engine::llm_inference_mode::{LlmInferenceDetector, LlmProcess};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::mach_qos::SchedulingTier;
 use apollo_engine::engine::process_classifier::ProcessSnapshot;
 use apollo_engine::engine::safety::{
-    classify_protection, infrastructure_processes, is_user_interactive_app, protected_processes,
+    cached_policy_protected_ac, classify_protection_canonical, is_user_interactive_app,
     ProtectionLevel,
 };
 use apollo_engine::engine::thermal_bailout::{CoolingPhase, ThermalAction};
@@ -65,20 +65,90 @@ pub struct LlmInferenceOutcome {
     pub llm_active: bool,
 }
 
+const LLM_PCORE_OWNER: &str = "llm inference: UserInitiated P-core preference";
+const LLM_PCORE_TTL: Duration = Duration::from_secs(5);
+
+fn llm_pcore_preference_allowed(
+    process_pid: u32,
+    foreground_pid: Option<u32>,
+    thermal_action: &ThermalAction,
+) -> bool {
+    Some(process_pid) != foreground_pid && thermal_action.phase < CoolingPhase::Phase3Aggressive
+}
+
+/// Prefer P-cores for the current inference feeder without pinning threads or
+/// fighting macOS scheduling. The lease is refreshed only while the exact PID
+/// identity is observed; it restores to Normal automatically after five seconds.
+fn apply_llm_pcore_preference(state: &SharedState, process: &LlmProcess) {
+    use apollo_engine::engine::effect_ledger::{
+        record_global, refresh_global_if_justification, AppliedEffect,
+    };
+    use apollo_engine::engine::mediator::{
+        mediate, Effect, MachPolicyEffector, MachPolicyKind, PreCondition,
+    };
+    use apollo_engine::engine::process_identity::ProcessIdentity;
+
+    let Some(identity) = ProcessIdentity::from_pid(process.pid) else {
+        return;
+    };
+    if !identity.matches(Some(&process.name), identity.start_sec, identity.start_usec) {
+        return;
+    }
+
+    let key = AppliedEffect::MachTier { pid: process.pid };
+    let current_tier = state.mach_qos.lock_recover().current_tier(process.pid);
+    if current_tier == Some(SchedulingTier::Foreground) {
+        refresh_global_if_justification(&key, LLM_PCORE_TTL, identity.start_sec, LLM_PCORE_OWNER);
+        return;
+    }
+
+    let effect = Effect::SetMachPolicy {
+        pid: process.pid,
+        start_sec: identity.start_sec,
+        policy: MachPolicyKind::UserInitiated,
+    };
+    let precondition = PreCondition {
+        pid_identity: Some((process.pid, identity.start_sec)),
+        ..Default::default()
+    };
+    let effector = MachPolicyEffector::new(state.mach_qos.clone());
+    match mediate(&effect, &precondition, &effector) {
+        Ok(receipt) if receipt.applied_count > 0 => {
+            record_global(key, LLM_PCORE_TTL, identity.start_sec, LLM_PCORE_OWNER);
+            tracing::debug!(
+                pid = process.pid,
+                process = process.name.as_str(),
+                cpu_pct = process.cpu_usage,
+                "llm-mode: reversible UserInitiated preference applied"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::debug!(
+            pid = process.pid,
+            process = process.name.as_str(),
+            ?error,
+            "llm-mode: P-core preference skipped"
+        ),
+    }
+}
+
 /// Feature 1: LLM Inference Mode tick.
 ///
 /// Feeds the top-process iterator into `LlmInferenceDetector::observe`,
-/// toggles Spotlight indexing when the active→inactive edge is crossed,
-/// and returns the pressure boost + active flag for the aggregator.
+/// applies a short reversible UserInitiated lease to the observed feeder, and
+/// returns the pressure boost + active flag for the aggregator.
 ///
 /// ## Ordering
 /// Runs AFTER the sensor tick (needs `snapshot.top_processes`) and BEFORE
 /// `daemon_pressure_aggregator` (consumes `llm_boost`).
 pub fn run_llm_inference_mode_tick(
     snapshot: &SystemSnapshot,
+    state: &SharedState,
     llm_detector: &mut LlmInferenceDetector,
     llm_spotlight_disabled: &mut bool,
     is_root: bool,
+    foreground_pid: Option<u32>,
+    thermal_action: &ThermalAction,
 ) -> LlmInferenceOutcome {
     let llm_boost = {
         let proc_iter = snapshot
@@ -89,6 +159,12 @@ pub fn run_llm_inference_mode_tick(
         llm_detector.pressure_boost()
     };
     let llm_active = llm_detector.is_active();
+    if let Some(process) = llm_detector
+        .observed_primary()
+        .filter(|process| llm_pcore_preference_allowed(process.pid, foreground_pid, thermal_action))
+    {
+        apply_llm_pcore_preference(state, process);
+    }
 
     // Spotlight toggle disabled (2026-05-08): user reported Finder beachball
     // when Apollo flipped mdutil during LLM bursts. The off→on edge invalidates
@@ -266,8 +342,6 @@ pub fn apply_app_nap_scheduling(
     storms: &[WakePattern],
 ) {
     if llm_active || in_wake_suppression {
-        let appnap_hard = protected_processes();
-        let appnap_infra = infrastructure_processes();
         let appnap_policy = state
             .policy
             .lock_recover()
@@ -275,8 +349,7 @@ pub fn apply_app_nap_scheduling(
             .protected_patterns
             .clone();
         // Pre-build AC once before per-PID app-nap loop.
-        let appnap_policy_ac =
-            apollo_engine::engine::safety::build_policy_protected_ac(&appnap_policy);
+        let appnap_policy_ac = cached_policy_protected_ac(&appnap_policy);
         // Preserve `iter().find()` semantics for the unlikely duplicate-PID case
         // while avoiding one full snapshot scan per live process.
         let mut snaps_by_pid: HashMap<u32, &ProcessSnapshot> =
@@ -295,12 +368,10 @@ pub fn apply_app_nap_scheduling(
             let idle_s = snap.map_or(3600, |s| s.secs_since_user_interaction);
             let rss = snap.map_or(process.memory(), |s| s.rss_bytes);
             let is_interactive = is_user_interactive_app(has_gui, idle_s, rss, name);
-            let protection = classify_protection(
+            let protection = classify_protection_canonical(
                 name,
-                &appnap_hard,
-                &appnap_infra,
                 &appnap_policy,
-                appnap_policy_ac.as_ref(),
+                appnap_policy_ac.as_deref(),
                 is_interactive,
             );
             // Apollo itself is never app-napped (self-protection).
@@ -337,5 +408,39 @@ pub fn apply_app_nap_scheduling(
         for pid in app_napped {
             qos.set_app_nap(pid, false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn thermal(phase: CoolingPhase) -> ThermalAction {
+        ThermalAction {
+            phase,
+            force_ecores: phase >= CoolingPhase::Phase3Aggressive,
+            freeze_background: false,
+            freeze_all_non_critical: false,
+            warm_pressure_boost: 0.0,
+        }
+    }
+
+    #[test]
+    fn llm_pcore_preference_skips_foreground_and_thermal_crisis() {
+        assert!(!llm_pcore_preference_allowed(
+            42,
+            Some(42),
+            &thermal(CoolingPhase::Normal)
+        ));
+        assert!(!llm_pcore_preference_allowed(
+            42,
+            None,
+            &thermal(CoolingPhase::Phase3Aggressive)
+        ));
+        assert!(llm_pcore_preference_allowed(
+            42,
+            None,
+            &thermal(CoolingPhase::Phase2Moderate)
+        ));
     }
 }

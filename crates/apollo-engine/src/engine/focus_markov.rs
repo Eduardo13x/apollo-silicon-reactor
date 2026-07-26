@@ -233,6 +233,9 @@ impl FocusMarkov {
 
     /// Get top-N predictions for the current app (for observability/logging).
     pub fn predict_top_n(&self, current_app: &str, n: usize) -> Vec<FocusPrediction> {
+        if n == 0 {
+            return Vec::new();
+        }
         let targets = match self.state.transitions.get(current_app) {
             Some(t) => t,
             None => return vec![],
@@ -253,12 +256,16 @@ impl FocusMarkov {
             })
             .collect();
 
-        predictions.sort_by(|a, b| {
+        let by_probability = |a: &FocusPrediction, b: &FocusPrediction| {
             b.probability
                 .partial_cmp(&a.probability)
                 .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        predictions.truncate(n);
+        };
+        if predictions.len() > n {
+            predictions.select_nth_unstable_by(n, by_probability);
+            predictions.truncate(n);
+        }
+        predictions.sort_by(by_probability);
         predictions
     }
 
@@ -488,6 +495,15 @@ mod tests {
         let m = test_markov();
         let top = m.predict_top_n("Claude", 5);
         assert!(top.is_empty(), "should return empty when no transitions");
+    }
+
+    #[test]
+    fn predict_top_zero_is_empty() {
+        let mut m = test_markov();
+        for app in ["A", "B", "A", "B", "A", "B", "A", "B", "A", "B", "A"] {
+            m.observe(Some(app));
+        }
+        assert!(m.predict_top_n("A", 0).is_empty());
     }
 
     #[test]

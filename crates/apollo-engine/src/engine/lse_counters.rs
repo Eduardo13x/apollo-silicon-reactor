@@ -89,6 +89,8 @@ pub struct LockFreeMetrics {
     pub dedup_drops_throttle: AtomicU64,
     pub dedup_drops_freeze: AtomicU64,
     pub dedup_drops_unfreeze: AtomicU64,
+    pub dedup_drops_boost: AtomicU64,
+    pub dedup_drops_thread_qos: AtomicU64,
 
     /// Metrics history append failures.
     pub failed_history_writes: AtomicU64,
@@ -796,6 +798,8 @@ impl LockFreeMetrics {
             dedup_drops_throttle: AtomicU64::new(0),
             dedup_drops_freeze: AtomicU64::new(0),
             dedup_drops_unfreeze: AtomicU64::new(0),
+            dedup_drops_boost: AtomicU64::new(0),
+            dedup_drops_thread_qos: AtomicU64::new(0),
             failed_history_writes: AtomicU64::new(0),
             warm_band_fires: AtomicU64::new(0),
             warm_boost_sum_x1000: AtomicU64::new(0),
@@ -1124,16 +1128,26 @@ impl LockFreeMetrics {
             .fetch_max(held_ns, Ordering::Relaxed);
     }
 
-    /// Drain metrics-lock maxes since the previous publish.
+    /// Drain metrics-lock observations since the previous publish.
     ///
-    /// Average counters remain cumulative, but max values are interval
-    /// telemetry like stage maxes. Otherwise one lock stall poisons the
-    /// dashboard indefinitely.
+    /// Count, total, and max must share one reporting horizon. Mixing a
+    /// lifetime average with an interval max can report the impossible
+    /// `average > max` after an early slow acquisition ages out.
+    /// Returns `((wait_count, wait_total_ns, wait_max_ns),
+    /// (held_count, held_total_ns, held_max_ns))`.
     #[inline(always)]
-    pub fn drain_metrics_lock_max_ns(&self) -> (u64, u64) {
+    pub fn drain_metrics_lock_window_ns(&self) -> ((u64, u64, u64), (u64, u64, u64)) {
         (
-            self.metrics_lock_wait_max_ns.swap(0, Ordering::Relaxed),
-            self.metrics_lock_held_max_ns.swap(0, Ordering::Relaxed),
+            (
+                self.metrics_lock_wait_count.swap(0, Ordering::Relaxed),
+                self.metrics_lock_wait_total_ns.swap(0, Ordering::Relaxed),
+                self.metrics_lock_wait_max_ns.swap(0, Ordering::Relaxed),
+            ),
+            (
+                self.metrics_lock_held_count.swap(0, Ordering::Relaxed),
+                self.metrics_lock_held_total_ns.swap(0, Ordering::Relaxed),
+                self.metrics_lock_held_max_ns.swap(0, Ordering::Relaxed),
+            ),
         )
     }
 
@@ -1241,6 +1255,16 @@ impl LockFreeMetrics {
     }
 
     #[inline(always)]
+    pub fn add_dedup_drops_boost(&self, n: u64) {
+        self.dedup_drops_boost.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn add_dedup_drops_thread_qos(&self, n: u64) {
+        self.dedup_drops_thread_qos.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
     pub fn inc_failed_history_writes(&self) {
         self.failed_history_writes.fetch_add(1, Ordering::Relaxed);
     }
@@ -1286,6 +1310,8 @@ impl LockFreeMetrics {
             dedup_drops_throttle: self.dedup_drops_throttle.load(Ordering::Relaxed),
             dedup_drops_freeze: self.dedup_drops_freeze.load(Ordering::Relaxed),
             dedup_drops_unfreeze: self.dedup_drops_unfreeze.load(Ordering::Relaxed),
+            dedup_drops_boost: self.dedup_drops_boost.load(Ordering::Relaxed),
+            dedup_drops_thread_qos: self.dedup_drops_thread_qos.load(Ordering::Relaxed),
             failed_history_writes: self.failed_history_writes.load(Ordering::Relaxed),
             warm_band_fires: self.warm_band_fires.load(Ordering::Relaxed),
             warm_boost_sum_x1000: self.warm_boost_sum_x1000.load(Ordering::Relaxed),
@@ -2003,6 +2029,8 @@ pub struct MetricsSnapshot {
     pub dedup_drops_throttle: u64,
     pub dedup_drops_freeze: u64,
     pub dedup_drops_unfreeze: u64,
+    pub dedup_drops_boost: u64,
+    pub dedup_drops_thread_qos: u64,
     pub failed_history_writes: u64,
     pub warm_band_fires: u64,
     /// Sum of warm_pressure_boost values scaled by 1000 (avoids float atomics).
@@ -2490,16 +2518,19 @@ mod tests {
     }
 
     #[test]
-    fn metrics_lock_max_drain_does_not_keep_lifetime_outlier_sticky() {
+    fn metrics_lock_window_drain_keeps_average_and_max_on_same_horizon() {
         let m = LockFreeMetrics::new();
         m.record_metrics_lock(40_000_000, 180_000_000);
-        assert_eq!(m.drain_metrics_lock_max_ns(), (40_000_000, 180_000_000));
+        assert_eq!(
+            m.drain_metrics_lock_window_ns(),
+            ((1, 40_000_000, 40_000_000), (1, 180_000_000, 180_000_000))
+        );
 
         m.record_metrics_lock(4_000, 8_000);
         assert_eq!(
-            m.drain_metrics_lock_max_ns(),
-            (4_000, 8_000),
-            "metrics lock max should reflect recent drained interval, not lifetime max"
+            m.drain_metrics_lock_window_ns(),
+            ((1, 4_000, 4_000), (1, 8_000, 8_000)),
+            "metrics lock window should not retain a lifetime outlier"
         );
     }
 }

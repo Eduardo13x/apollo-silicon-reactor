@@ -29,11 +29,12 @@ METRICS_FILE="/var/lib/apollo/runtime_metrics.json"
 BASELINE_FILE="/var/lib/apollo/accept-baseline.json"
 BASELINE_K=7          # rolling window: median of last K accepted runs
 DRY_RUN=0
+METRICS_EXPLICIT=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)  DRY_RUN=1; shift ;;
-    --metrics)  METRICS_FILE="${2:?--metrics needs a path}"; shift 2 ;;
+    --metrics)  METRICS_FILE="${2:?--metrics needs a path}"; METRICS_EXPLICIT=1; shift 2 ;;
     --baseline) BASELINE_FILE="${2:?--baseline needs a path}"; shift 2 ;;
     -h|--help)
       grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'
@@ -42,13 +43,28 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Read metrics. If root-owned, `sudo cat` it into a temp the python can read.
+# Read metrics. If root-owned, try non-interactive sudo first. The scoped
+# production sudoers policy intentionally does not grant arbitrary `cat`, so
+# the default live path falls back to the daemon's read-only status socket.
 SNAP="$(mktemp -t apollo_accept_snap.XXXXXX)"
 trap 'rm -f "$SNAP"' EXIT
 if [ -r "$METRICS_FILE" ]; then
   cat "$METRICS_FILE" > "$SNAP" 2>/dev/null || true
 else
-  sudo cat "$METRICS_FILE" > "$SNAP" 2>/dev/null || true
+  sudo -n cat "$METRICS_FILE" > "$SNAP" 2>/dev/null || true
+fi
+if [ ! -s "$SNAP" ] && [ "$METRICS_EXPLICIT" -eq 0 ]; then
+  APOLLO_CTL="${APOLLO_CTL:-/usr/local/bin/apollo-optimizerctl}"
+  if [ -x "$APOLLO_CTL" ]; then
+    "$APOLLO_CTL" status 2>/dev/null | python3 -c '
+import json, sys
+status = json.load(sys.stdin)
+metrics = status.get("metrics")
+if not isinstance(metrics, dict):
+    raise SystemExit(1)
+json.dump(metrics, sys.stdout)
+' > "$SNAP" 2>/dev/null || true
+  fi
 fi
 # Empty snap (unreadable) → leave a sentinel so python fails closed.
 [ -s "$SNAP" ] || printf '{"__unreadable__":true}' > "$SNAP"
@@ -108,19 +124,15 @@ def add(name, value_str, thr_str, passed, hard=True):
 # ─────────────────────────────────────────────────────────────────────
 #  TIER 1a — ABSOLUTE HARD GATES (calibrated from steady-state n=31)
 # ─────────────────────────────────────────────────────────────────────
-# H1 AIS floor ≥ 90.0  (CRASH-FLOOR, not p25).
-# Recalibrated 2026-06-20: p25=92.46 as a floor rejects ~25% of normal healthy
-# operation (live 91.89 FAILed it — a floor at p25 cries wolf by construction).
-# The absolute floor is a SAFETY NET set just below the normal steady band
-# (steady min ~91.4); the BRUTAL continuous-improvement work lives in R1
-# (no-regression -3pp vs rolling baseline) + the composite S, which catch a
-# 95→88 drop (-7pp fails R1) without rejecting jitter. floor 90 = real ~2pt
-# degradation from the low end of normal.
+# H1 AIS floor ≥ 75.0. AIS now treats streams without independent outcomes as
+# unknown instead of awarding tautological perfect scores. The absolute gate is
+# therefore only a safety floor; R1 and the rolling composite enforce real
+# no-regression against this machine's own honest baseline.
 ais = num("ais_score")
 add("H1 ais_score floor",
     f"{ais:.2f}" if ais is not None else "MISSING",
-    ">= 90.0",
-    ais is not None and ais >= 90.0)
+    ">= 75.0",
+    ais is not None and ais >= 75.0)
 
 # H2 crash/error: failures==0 AND last_error==null AND cycles advancing(>0)
 failures   = num("failures")

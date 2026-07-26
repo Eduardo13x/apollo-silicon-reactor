@@ -10,7 +10,7 @@
 //! consumer (the shadow evaluator's ActionContext builder). A lock-free
 //! global is the minimal-touch wire.
 //!
-//! Writers: main-loop tick (after `signal_intel.tick()` and thermal eval).
+//! Writers: main-loop tick (after fluidity/signal-intelligence and thermal eval).
 //! Readers: `decide_actions` when building the shadow `ActionContext`.
 //!
 //! All atomics are `Relaxed` — these are best-effort observability inputs,
@@ -298,6 +298,19 @@ mod tests {
 
         // Restore a known value for other tests.
         set_p_oom_30s(0.0);
+    }
+
+    #[test]
+    fn p_jank_roundtrip_clamp_and_invalidates_nan() {
+        set_p_jank_60s(0.42);
+        assert_eq!(get_p_jank_60s(), Some(0.42));
+        set_p_jank_60s(1.5);
+        assert_eq!(get_p_jank_60s(), Some(1.0));
+        set_p_jank_60s(-0.3);
+        assert_eq!(get_p_jank_60s(), Some(0.0));
+        set_p_jank_60s(f64::NAN);
+        assert_eq!(get_p_jank_60s(), None);
+        set_p_jank_60s(0.0);
     }
 
     #[test]

@@ -74,6 +74,10 @@ pub struct PolicyContext<'a> {
     /// PIDs detected as behaviorally interactive via cpu_wall_ratio EMA (<0.05).
     pub behavior_interactive_pids: &'a HashSet<u32>,
 
+    /// PIDs whose immutable executable identity is inside a macOS app bundle.
+    /// Produced by process enrichment and reused here without another kernel query.
+    pub app_bundle_pids: &'a HashSet<u32>,
+
     /// Per-process IPC hints (ri_instructions/ri_cycles).
     /// Low IPC → memory-bound (safe to throttle); high IPC → compute-bound (avoid).
     pub ipc_hints: &'a HashMap<u32, f64>,
@@ -220,6 +224,7 @@ impl DecisionStage {
             policy.decide_weights,
             policy.outcome_baseline,
             policy.behavior_interactive_pids,
+            policy.app_bundle_pids,
             policy.ipc_hints,
             policy.hop_groups,
             policy.habituated_pids,
@@ -306,6 +311,7 @@ mod tests {
             decide_weights: weights,
             outcome_baseline: 0.0,
             behavior_interactive_pids: pids,
+            app_bundle_pids: pids,
             ipc_hints: ipc,
             hop_groups: hops,
             habituated_pids: pids,

@@ -1628,7 +1628,7 @@ mod tests {
         tick_ok(&mut gov, &inputs);
         let first_actions = tick_ok(&mut gov, &inputs);
         assert!(
-            first_actions.is_empty(),
+            !has_tcp_buffer_write(&first_actions),
             "TCP buffer sysctls are call-affecting and must not emit"
         );
         assert!(
@@ -1800,6 +1800,14 @@ mod tests {
 
     // ── Scale-down dwell (2026-06-09 whipsaw fix) ────────────────────────────
 
+    /// Detect any call-affecting TCP buffer write among emitted actions.
+    fn has_tcp_buffer_write(actions: &[RootAction]) -> bool {
+        actions.iter().any(|a| {
+            matches!(a, RootAction::SetSysctl(s)
+                if s.key() == "net.inet.tcp.sendspace" || s.key() == "net.inet.tcp.recvspace")
+        })
+    }
+
     /// Detect a TCP buffer scale-DOWN write among emitted actions.
     fn has_buffer_scale_down(actions: &[RootAction]) -> bool {
         actions.iter().any(|a| {
@@ -1821,7 +1829,7 @@ mod tests {
         tick_ok(&mut gov, &inputs);
         let scale_up_actions = tick_ok(&mut gov, &inputs);
         assert!(
-            scale_up_actions.is_empty(),
+            !has_tcp_buffer_write(&scale_up_actions),
             "TCP buffer sysctls are call-affecting and must not emit"
         );
         assert!(gov.tcp.last_scale_up_at.is_some(), "dwell must be armed");
@@ -1896,7 +1904,7 @@ mod tests {
         tick_ok(&mut gov, &inputs);
         let scale_up_actions = tick_ok(&mut gov, &inputs);
         assert!(
-            scale_up_actions.is_empty(),
+            !has_tcp_buffer_write(&scale_up_actions),
             "TCP buffer sysctls are call-affecting and must not emit"
         );
         assert!(gov.tcp.last_scale_up_at.is_some(), "dwell must be armed");

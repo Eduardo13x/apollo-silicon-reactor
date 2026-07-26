@@ -47,7 +47,7 @@ pub(crate) struct OutcomeAction {
 }
 
 impl OutcomeAction {
-    fn process_name_from_snapshot(&self, snapshot: &SystemSnapshot) -> String {
+    fn process_name_from_snapshot(&self, snapshot: &SystemSnapshot) -> Option<String> {
         self.name
             .clone()
             .or_else(|| {
@@ -57,7 +57,7 @@ impl OutcomeAction {
                     .find(|p| p.pid == self.pid)
                     .map(|p| p.name.clone())
             })
-            .unwrap_or_else(|| format!("pid:{}", self.pid))
+            .or_else(|| apollo_engine::engine::process_identity::proc_name_for_pid(self.pid))
     }
 }
 
@@ -218,7 +218,13 @@ pub fn run_learning_tick<'a>(
         // the 30s post-purge window to avoid "success poisoning".
         if !maintenance_state.is_purge_recent(30) {
             for action in &pressure_actions_for_outcome {
-                let name = action.process_name_from_snapshot(snapshot);
+                let Some(name) = action.process_name_from_snapshot(snapshot) else {
+                    tracing::debug!(
+                        pid = action.pid,
+                        "outcome learning skipped: no stable process identity"
+                    );
+                    continue;
+                };
                 let proc_watts = snapshot
                     .top_processes
                     .iter()
@@ -253,7 +259,9 @@ pub fn run_learning_tick<'a>(
             .iter()
             .filter(|a| a.action_type == ActionKind::Throttle)
         {
-            let name = action.process_name_from_snapshot(snapshot);
+            let Some(name) = action.process_name_from_snapshot(snapshot) else {
+                continue;
+            };
             // Build per-process resource snapshot for mechanism attribution.
             let res = snapshot
                 .top_processes
@@ -278,7 +286,9 @@ pub fn run_learning_tick<'a>(
             .iter()
             .filter(|a| a.action_type == ActionKind::Freeze)
         {
-            let name = action.process_name_from_snapshot(snapshot);
+            let Some(name) = action.process_name_from_snapshot(snapshot) else {
+                continue;
+            };
             let res = snapshot
                 .top_processes
                 .iter()

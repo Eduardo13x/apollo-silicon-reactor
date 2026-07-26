@@ -252,6 +252,9 @@ pub enum ChromiumAction {
     ThawRenderer { pid: u32, name: String },
     /// Demote renderer/GPU helper to E-cores via Mach QoS.
     DemoteToEcores { pid: u32, name: String },
+    /// Temporarily lower a visible background renderer's Jetsam priority.
+    /// The daemon captures and restores the exact prior band via EffectLedger.
+    DemoteJetsam { pid: u32, name: String },
     /// Hint the kernel to reclaim purgeable VM regions of an invisible
     /// renderer (mach_vm_purgable_control marks pages volatile). Emitted
     /// alongside DemoteToEcores under sustained swap-velocity escalation.
@@ -1098,10 +1101,10 @@ impl ChromiumManager {
                 // Demote via jetsam instead — the tab stays live but becomes
                 // kill-prone under OOM pressure. Safer user experience.
                 if self.visible_pids.contains(pid) {
-                    let _ = crate::engine::jetsam_control::set_priority(
-                        *pid,
-                        crate::engine::jetsam_control::priority::BACKGROUND,
-                    );
+                    actions.push(ChromiumAction::DemoteJetsam {
+                        pid: *pid,
+                        name: info.name.clone(),
+                    });
                     continue;
                 }
 
@@ -1246,6 +1249,10 @@ impl ChromiumManager {
                     self.ecore_demotions += 1;
                     self.ecore_demoted.insert(*pid);
                 }
+                ChromiumAction::DemoteJetsam { .. } => {
+                    // Kernel ownership and reversal are managed by the daemon's
+                    // EffectLedger after it captures the live prior band.
+                }
                 ChromiumAction::PurgePurgeable { .. } => {
                     // Internal accounting for the purge hint is the
                     // `velocity_purged` set, already updated at emission time.
@@ -1311,19 +1318,12 @@ impl ChromiumManager {
         }
     }
 
-    /// Demote background (non-foreground, non-frozen) renderers to jetsam
-    /// BACKGROUND priority so the kernel kills them first under OOM instead
-    /// of interactive apps (Claude, Antigravity, Terminal).
-    ///
-    /// Called from the daemon when survival mode is active. Safer than SIGSTOP:
-    /// the renderer stays responsive for user input until the kernel actually
-    /// reclaims it. Idempotent — the kernel no-ops if priority is unchanged.
-    ///
-    /// Returns the number of demotion calls that succeeded.
-    pub fn demote_background_renderers(&self) -> u32 {
-        use crate::engine::jetsam_control;
+    /// Return background, non-frozen renderers eligible for a survival-mode
+    /// Jetsam demotion. Kernel mutation belongs to the daemon so it can capture
+    /// the exact prior band and register the reversible effect.
+    pub fn survival_jetsam_candidates(&self) -> Vec<(u32, String)> {
         let fg = self.prev_fg_browser.as_deref();
-        let mut demoted = 0u32;
+        let mut candidates = Vec::new();
         for info in self.renderers.values() {
             if info.frozen {
                 continue;
@@ -1331,12 +1331,10 @@ impl ChromiumManager {
             if Some(info.browser.as_str()) == fg {
                 continue;
             }
-            if jetsam_control::set_priority(info.pid, jetsam_control::priority::BACKGROUND).is_ok()
-            {
-                demoted = demoted.saturating_add(1);
-            }
+            candidates.push((info.pid, info.name.clone()));
         }
-        demoted
+        candidates.sort_unstable_by_key(|(pid, _)| *pid);
+        candidates
     }
 
     /// SIGCONT all frozen renderers on daemon shutdown.
@@ -1496,8 +1494,24 @@ impl ChromiumManager {
     pub fn confirm_freeze(&mut self, pid: u32, ok: bool) {
         if !ok {
             self.frozen_pids.remove(&pid);
+            self.freezes_applied = self.freezes_applied.saturating_sub(1);
             if let Some(info) = self.renderers.get_mut(&pid) {
+                self.total_freed_mb =
+                    (self.total_freed_mb - info.frozen_rss_baseline as f64 / 1_048_576.0).max(0.0);
                 info.frozen = false;
+                info.frozen_rss_baseline = 0;
+            }
+        }
+    }
+
+    /// Roll back optimistic thaw state if SIGCONT failed.
+    pub fn confirm_thaw(&mut self, pid: u32, ok: bool) {
+        if !ok {
+            self.frozen_pids.insert(pid);
+            self.recoveries_applied = self.recoveries_applied.saturating_sub(1);
+            if let Some(info) = self.renderers.get_mut(&pid) {
+                info.frozen = true;
+                info.thaw_cooldown_cycles = 0;
             }
         }
     }
@@ -1782,6 +1796,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn visible_background_renderer_emits_typed_jetsam_demotion() {
+        let mut mgr = ChromiumManager::new();
+        mgr.set_freeze_globally_disabled(false);
+        mgr.set_pressure_context(0.85);
+        let pid = 250u32;
+        mgr.set_visible_pids(HashSet::from([pid]));
+        let none_set = HashSet::new();
+        let procs = vec![(pid, "Brave Browser Helper (Renderer)", 0.0, 80_000_000)];
+        let mut emitted = false;
+
+        for _ in 0..11 {
+            emitted |= mgr
+                .update(&procs, None, None, &none_set, &none_set)
+                .iter()
+                .any(|action| matches!(action, ChromiumAction::DemoteJetsam { pid: 250, .. }));
+        }
+
+        assert!(
+            emitted,
+            "visible renderer must use the reversible typed path"
+        );
+        assert!(!mgr.frozen_pids.contains(&pid));
+    }
+
     // ── main_frozen PIDs must not be touched ───────────────────────────────────
 
     #[test]
@@ -1925,6 +1964,30 @@ mod tests {
     }
 
     // ── Shutdown cleanup ───────────────────────────────────────────────────────
+
+    #[test]
+    fn survival_candidates_exclude_foreground_browser_and_frozen_renderer() {
+        let mut mgr = ChromiumManager::new();
+        let none_set = HashSet::new();
+        let procs = vec![
+            (910, "Brave Browser Helper (Renderer)", 0.0, 50_000_000),
+            (911, "Slack Helper (Renderer)", 0.0, 50_000_000),
+            (912, "Code Helper (Renderer)", 0.0, 50_000_000),
+        ];
+        mgr.update(
+            &procs,
+            Some(910),
+            Some("Brave Browser"),
+            &none_set,
+            &none_set,
+        );
+        mgr.renderers.get_mut(&912).expect("Code renderer").frozen = true;
+
+        assert_eq!(
+            mgr.survival_jetsam_candidates(),
+            vec![(911, "Slack Helper (Renderer)".to_string())]
+        );
+    }
 
     #[test]
     fn shutdown_cleanup_drains_frozen_pids() {
@@ -2506,6 +2569,26 @@ mod tests {
             thawed,
             "predictive pre-thaw must fire when switch is 8s away (< 10s window)"
         );
+    }
+
+    #[test]
+    fn failed_thaw_rolls_back_optimistic_renderer_state() {
+        let (mut mgr, none_set) = brave_mgr_with_frozen_renderer(505);
+        mgr.set_markov_context(&[("Brave Browser".to_string(), 0.80, 50.0)], 42.0);
+        let procs = vec![(505, "Brave Browser Helper (Renderer)", 0.0, 50_000_000)];
+
+        let actions = mgr.update(&procs, None, None, &none_set, &none_set);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, ChromiumAction::ThawRenderer { pid: 505, .. })));
+        assert!(!mgr.frozen_pids.contains(&505));
+        assert_eq!(mgr.recoveries_applied, 1);
+
+        mgr.confirm_thaw(505, false);
+
+        assert!(mgr.frozen_pids.contains(&505));
+        assert!(mgr.renderers.get(&505).is_some_and(|info| info.frozen));
+        assert_eq!(mgr.recoveries_applied, 0);
     }
 
     /// A: pre-thaw does NOT fire when switch is far away (> 10s).

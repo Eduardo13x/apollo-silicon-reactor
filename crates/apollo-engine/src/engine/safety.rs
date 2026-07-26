@@ -1,5 +1,6 @@
-use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::collections::{hash_map::DefaultHasher, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::engine::types::{ActionBudgetState, RootAction, SafetyPolicy};
 
@@ -195,14 +196,19 @@ pub fn protected_processes() -> HashSet<&'static str> {
     .collect()
 }
 
+/// Canonical hard-protection set initialized once for allocation-free hot paths.
+pub fn protected_processes_cached() -> &'static HashSet<&'static str> {
+    static CACHE: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    CACHE.get_or_init(protected_processes)
+}
+
 /// Fast membership test against the hard-protected set (hot-path safe).
 /// Uses `OnceLock` to initialise once and share across all subsequent calls,
 /// avoiding the ~300 HashSet allocations per cycle that `protected_processes()`
 /// would otherwise produce when called inside process-enumeration loops.
 /// [GoF 1994] Flyweight pattern — share expensive read-only objects.
 fn is_hard_protected(name: &str) -> bool {
-    static CACHE: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    CACHE.get_or_init(protected_processes).contains(name)
+    protected_processes_cached().contains(name)
 }
 
 /// Fast membership test against the infrastructure-protected set (hot-path safe).
@@ -728,31 +734,77 @@ pub fn build_policy_protected_ac(policy_protected: &[String]) -> Option<aho_cora
         .ok()
 }
 
-pub fn classify_protection(
+struct CachedPolicyMatcher {
+    fingerprint: u64,
+    patterns: Arc<[String]>,
+    matcher: Arc<aho_corasick::AhoCorasick>,
+}
+
+/// Reuse compiled policy matchers across daemon stages and optimization cycles.
+///
+/// Learned policy normally changes far less often than the 300ms daemon cycle.
+/// Keeping a few distinct entries covers the protected-only and
+/// protected+interactive policy views without rebuilding either automaton.
+pub fn cached_policy_protected_ac(
+    policy_protected: &[String],
+) -> Option<Arc<aho_corasick::AhoCorasick>> {
+    const CACHE_CAPACITY: usize = 8;
+    static CACHE: OnceLock<Mutex<VecDeque<CachedPolicyMatcher>>> = OnceLock::new();
+
+    if policy_protected.is_empty() {
+        return None;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    policy_protected.hash(&mut hasher);
+    let fingerprint = hasher.finish();
+    let cache = CACHE.get_or_init(|| Mutex::new(VecDeque::with_capacity(CACHE_CAPACITY)));
+
+    {
+        let entries = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry.fingerprint == fingerprint && entry.patterns.as_ref() == policy_protected
+        }) {
+            return Some(Arc::clone(&entry.matcher));
+        }
+    }
+
+    let matcher = Arc::new(build_policy_protected_ac(policy_protected)?);
+    let patterns: Arc<[String]> = Arc::from(policy_protected.to_vec());
+    let mut entries = cache.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Another thread may have populated the same entry while this one built.
+    if let Some(entry) = entries.iter().find(|entry| {
+        entry.fingerprint == fingerprint && entry.patterns.as_ref() == policy_protected
+    }) {
+        return Some(Arc::clone(&entry.matcher));
+    }
+
+    entries.push_front(CachedPolicyMatcher {
+        fingerprint,
+        patterns,
+        matcher: Arc::clone(&matcher),
+    });
+    entries.truncate(CACHE_CAPACITY);
+    Some(matcher)
+}
+
+/// Classify against Apollo's canonical hard and infrastructure protection sets.
+///
+/// This is the allocation-free production path. The legacy
+/// `classify_protection` signature remains as a compatibility wrapper.
+pub fn classify_protection_canonical(
     name: &str,
-    hard_protected: &HashSet<&'static str>,
-    infra_protected: &HashSet<&'static str>,
     policy_protected: &[String],
     policy_protected_ac: Option<&aho_corasick::AhoCorasick>,
     is_interactive: bool,
 ) -> ProtectionLevel {
-    // Tier 1: OS/system essentials — substring to catch variants like
-    // "com.apple.WindowServer" matching "WindowServer". Fast path via
-    // Aho-Corasick OnceLock. Caller-supplied HashSet args are ignored in favor
-    // of the canonical static set (all production callers pass that anyway).
-    let _ = hard_protected;
-    let _ = infra_protected;
     if hard_protected_contains(name) {
         return ProtectionLevel::Unconditional;
     }
-    // Tier 2: Stateful infrastructure (Docker, Postgres, Redis, …).
     if is_infra_protected(name) {
         return ProtectionLevel::Unconditional;
     }
-    // Tier 3: Policy-learned daemons (case-insensitive substring).
-    // Fast path: caller-supplied AC scans all patterns in single O(name.len) pass.
-    // Slow path: per-pattern `to_ascii_lowercase()` chain — used by tests and any
-    // caller that hasn't built the AC yet. Both preserve identical semantics.
     if !policy_protected.is_empty() {
         if let Some(ac) = policy_protected_ac {
             if ac.is_match(name) {
@@ -768,11 +820,27 @@ pub fn classify_protection(
             }
         }
     }
-    // Tier 4: Behavioral interactive apps — caller evaluated is_user_interactive_app().
     if is_interactive {
         return ProtectionLevel::ConditionalForeground;
     }
     ProtectionLevel::Unprotected
+}
+
+pub fn classify_protection(
+    name: &str,
+    hard_protected: &HashSet<&'static str>,
+    infra_protected: &HashSet<&'static str>,
+    policy_protected: &[String],
+    policy_protected_ac: Option<&aho_corasick::AhoCorasick>,
+    is_interactive: bool,
+) -> ProtectionLevel {
+    // Tier 1: OS/system essentials — substring to catch variants like
+    // "com.apple.WindowServer" matching "WindowServer". Fast path via
+    // Aho-Corasick OnceLock. Caller-supplied HashSet args are ignored in favor
+    // of the canonical static set (all production callers pass that anyway).
+    let _ = hard_protected;
+    let _ = infra_protected;
+    classify_protection_canonical(name, policy_protected, policy_protected_ac, is_interactive)
 }
 
 pub fn allowlisted_sysctls_with_ranges() -> Vec<SysctlRange> {
@@ -924,6 +992,12 @@ pub fn infrastructure_processes() -> HashSet<&'static str> {
     ]
     .into_iter()
     .collect()
+}
+
+/// Canonical infrastructure-protection set initialized once for hot paths.
+pub fn infrastructure_processes_cached() -> &'static HashSet<&'static str> {
+    static CACHE: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    CACHE.get_or_init(infrastructure_processes)
 }
 
 /// Processes protected at NORMAL pressure but expendable at survival pressure
@@ -1251,22 +1325,29 @@ pub fn enforce_limits_with_budget(
     let mut out = Vec::new();
 
     for action in enforce_limits(actions, policy) {
-        if budget.minute_actions >= minute_budget_cap {
+        // Releasing a process is a safety action, not optimization work.  It
+        // must remain reachable even after the normal minute budget is spent,
+        // and must not consume that budget itself.  Keep scanning after a
+        // denial so a later UnfreezeProcess cannot be hidden behind it.
+        let bypasses_minute_budget = matches!(action, RootAction::UnfreezeProcess { .. });
+        if !bypasses_minute_budget && budget.minute_actions >= minute_budget_cap {
             budget.boost_denied_cooldown += 1;
-            break;
+            continue;
         }
 
-        match &action {
-            RootAction::BoostProcess { .. } => budget.cycle_boosts += 1,
-            RootAction::ThrottleProcess { .. } => budget.cycle_throttles += 1,
-            RootAction::SetMemorystatus { .. } => budget.cycle_hints += 1,
-            RootAction::FreezeProcess { .. } => budget.cycle_freezes += 1,
-            RootAction::SetSysctl(_) => budget.cycle_sysctl_writes += 1,
-            RootAction::SetThreadQoS { .. } => budget.cycle_thread_qos += 1,
-            _ => {}
-        }
+        if !bypasses_minute_budget {
+            match &action {
+                RootAction::BoostProcess { .. } => budget.cycle_boosts += 1,
+                RootAction::ThrottleProcess { .. } => budget.cycle_throttles += 1,
+                RootAction::SetMemorystatus { .. } => budget.cycle_hints += 1,
+                RootAction::FreezeProcess { .. } => budget.cycle_freezes += 1,
+                RootAction::SetSysctl(_) => budget.cycle_sysctl_writes += 1,
+                RootAction::SetThreadQoS { .. } => budget.cycle_thread_qos += 1,
+                _ => {}
+            }
 
-        budget.minute_actions += 1;
+            budget.minute_actions += 1;
+        }
         out.push(action);
     }
 
@@ -1638,6 +1719,29 @@ mod tests {
 
     fn test_policy() -> Vec<String> {
         vec!["mypostgres-wrapper".to_string(), "custom-db".to_string()]
+    }
+
+    #[test]
+    fn cached_policy_matcher_reuses_unchanged_policy() {
+        let policy = test_policy();
+        let first = cached_policy_protected_ac(&policy).expect("matcher");
+        let second = cached_policy_protected_ac(&policy).expect("cached matcher");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(second.is_match("CUSTOM-DB-worker"));
+    }
+
+    #[test]
+    fn cached_policy_matcher_invalidates_on_policy_change() {
+        let first_policy = vec!["alpha-service".to_string()];
+        let second_policy = vec!["beta-service".to_string()];
+        let first = cached_policy_protected_ac(&first_policy).expect("first matcher");
+        let second = cached_policy_protected_ac(&second_policy).expect("second matcher");
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(first.is_match("alpha-service-helper"));
+        assert!(!first.is_match("beta-service-helper"));
+        assert!(second.is_match("beta-service-helper"));
     }
 
     #[test]

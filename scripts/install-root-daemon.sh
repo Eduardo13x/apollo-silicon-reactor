@@ -9,9 +9,10 @@ CTL_DST="/usr/local/bin/apollo-optimizerctl"
 LABEL="com.eduardocortez.systemoptimizerd"
 
 cd "$ROOT_DIR"
+source scripts/hardware-build-profile.sh
 
 echo "── Building release..."
-cargo build --release
+cargo build --release ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"}
 
 # ── Code signing ────────────────────────────────────────────────────────────
 # Apple Silicon requires valid code signature. cp invalidates cargo's ad-hoc

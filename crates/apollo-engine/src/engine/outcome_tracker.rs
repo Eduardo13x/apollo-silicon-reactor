@@ -51,6 +51,24 @@ impl PatternWeight {
         self.throttle_count >= 3 && self.effectiveness() > 0.75
     }
 
+    /// Bound the amount of historical evidence while preserving its learned
+    /// success ratio. This keeps old observations useful as a prior without
+    /// making a process effectively impossible to relearn after a hardware or
+    /// workload change.
+    pub fn bound_evidence(&mut self, max_observations: u32) -> bool {
+        if max_observations == 0 || self.throttle_count <= max_observations {
+            return false;
+        }
+
+        let old_total = u64::from(self.throttle_count);
+        let scaled_effective = (u64::from(self.effective_count) * u64::from(max_observations)
+            + old_total / 2)
+            / old_total;
+        self.throttle_count = max_observations;
+        self.effective_count = scaled_effective.min(u64::from(u32::MAX)) as u32;
+        true
+    }
+
     // ── Hard-protected exclusion for class-reclassification ─────────────────
     //
     // Bug observed in prod (2026-06-07, daemon PID 16105, Brave Browser Helper
@@ -102,6 +120,44 @@ impl PatternWeight {
             None => false, // never reclassify HP entries
             Some(eff) => self.throttle_count >= 20 && eff < baseline * 0.90,
         }
+    }
+}
+
+/// Maximum historical sample mass retained per process. Sixty-four samples
+/// still provide a useful prior while allowing fresh outcomes to move it.
+pub const MAX_PATTERN_EVIDENCE: u32 = 64;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PatternWeightSanitizeReport {
+    pub removed_ephemeral: usize,
+    pub bounded: usize,
+}
+
+impl PatternWeightSanitizeReport {
+    pub fn changed(self) -> bool {
+        self.removed_ephemeral > 0 || self.bounded > 0
+    }
+}
+
+/// Remove process identities that cannot survive a reboot and bound historical
+/// evidence so imported knowledge remains a prior instead of a permanent vote.
+pub fn sanitize_pattern_weights(
+    weights: &mut HashMap<String, PatternWeight>,
+) -> PatternWeightSanitizeReport {
+    let before = weights.len();
+    weights.retain(|name, _| {
+        !name
+            .strip_prefix("pid:")
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+    });
+
+    let bounded = weights
+        .values_mut()
+        .map(|weight| usize::from(weight.bound_evidence(MAX_PATTERN_EVIDENCE)))
+        .sum();
+    PatternWeightSanitizeReport {
+        removed_ephemeral: before - weights.len(),
+        bounded,
     }
 }
 
@@ -1075,17 +1131,24 @@ impl OutcomeTracker {
                 .or_insert(30.0);
             *entry = *entry * 0.8 + elapsed_secs * 0.2;
 
-            // Update weights
-            let weight =
-                self.weights
-                    .entry(outcome.process_name.clone())
-                    .or_insert(PatternWeight {
-                        throttle_count: 0,
-                        effective_count: 0,
+            // The attempt was counted when the action entered `pending`, just
+            // like the normal delayed-resolution path. Only add the outcome
+            // here; incrementing throttle_count again biases urgent episodes
+            // toward failure. The vacant case is defensive for old/tests that
+            // construct pending records without using record_action_with_swap.
+            match self.weights.entry(outcome.process_name.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if effective {
+                        entry.get_mut().effective_count =
+                            entry.get().effective_count.saturating_add(1);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PatternWeight {
+                        throttle_count: 1,
+                        effective_count: u32::from(effective),
                     });
-            weight.throttle_count += 1;
-            if effective {
-                weight.effective_count += 1;
+                }
             }
 
             resolved_outcomes.push((
@@ -1190,8 +1253,8 @@ impl OutcomeTracker {
         // GC: keep only top 100 pairs by count.
         if self.co_occurrence.len() > 150 {
             let mut counts: Vec<_> = self.co_occurrence.values().copied().collect();
-            counts.sort_unstable();
-            let cutoff = counts[counts.len().saturating_sub(100)];
+            let cutoff_idx = counts.len().saturating_sub(100);
+            let cutoff = *counts.select_nth_unstable(cutoff_idx).1;
             let would_retain = self.co_occurrence.values().filter(|&&v| v > cutoff).count();
             if would_retain >= 50 {
                 // Normal case: clear differentiation — keep strictly above cutoff.
@@ -1214,13 +1277,19 @@ impl OutcomeTracker {
     /// Query the causal graph: top N co-occurring process pairs.
     /// Returns pairs sorted by co-occurrence count (most frequent first).
     pub fn top_causal_pairs(&self, n: usize) -> Vec<(&str, &str, u32)> {
+        if n == 0 {
+            return Vec::new();
+        }
         let mut pairs: Vec<_> = self
             .co_occurrence
             .iter()
             .map(|((a, b), &count)| (a.as_str(), b.as_str(), count))
             .collect();
-        pairs.sort_by_key(|p| std::cmp::Reverse(p.2));
-        pairs.truncate(n);
+        if pairs.len() > n {
+            pairs.select_nth_unstable_by(n, |a, b| b.2.cmp(&a.2));
+            pairs.truncate(n);
+        }
+        pairs.sort_unstable_by(|a, b| b.2.cmp(&a.2));
         pairs
     }
 
@@ -2258,6 +2327,64 @@ mod tests {
     }
 
     #[test]
+    fn urgency_flush_does_not_count_a_recorded_action_twice() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.record_action_with_swap(
+            "worker",
+            0.85,
+            1.0,
+            0.5,
+            crate::engine::learning_pipeline::ActionKind::Throttle,
+        );
+
+        tracker.urgency_flush(0.70);
+
+        let weight = &tracker.weights["worker"];
+        assert_eq!(weight.throttle_count, 1);
+        assert_eq!(weight.effective_count, 1);
+    }
+
+    #[test]
+    fn pattern_weight_sanitize_removes_pid_keys_and_bounds_inertia() {
+        let mut weights = HashMap::from([
+            (
+                "GoogleUpdater".to_string(),
+                PatternWeight {
+                    throttle_count: 1_098,
+                    effective_count: 723,
+                },
+            ),
+            (
+                "pid:646".to_string(),
+                PatternWeight {
+                    throttle_count: 888,
+                    effective_count: 236,
+                },
+            ),
+            (
+                "pid:service".to_string(),
+                PatternWeight {
+                    throttle_count: 8,
+                    effective_count: 3,
+                },
+            ),
+        ]);
+        let before = weights["GoogleUpdater"].effectiveness();
+
+        let report = sanitize_pattern_weights(&mut weights);
+
+        assert_eq!(report.removed_ephemeral, 1);
+        assert_eq!(report.bounded, 1);
+        assert!(!weights.contains_key("pid:646"));
+        assert!(weights.contains_key("pid:service"));
+        assert_eq!(
+            weights["GoogleUpdater"].throttle_count,
+            MAX_PATTERN_EVIDENCE
+        );
+        assert!((weights["GoogleUpdater"].effectiveness() - before).abs() < 0.02);
+    }
+
+    #[test]
     fn urgency_flush_updates_effect_time() {
         let mut tracker = OutcomeTracker::new();
         tracker.pending.push_back(super::PendingOutcome {
@@ -2414,6 +2541,7 @@ mod tests {
         assert_eq!(top[0].0, "A");
         assert_eq!(top[0].1, "B");
         assert_eq!(top[0].2, 10);
+        assert!(tracker.top_causal_pairs(0).is_empty());
     }
 
     #[test]

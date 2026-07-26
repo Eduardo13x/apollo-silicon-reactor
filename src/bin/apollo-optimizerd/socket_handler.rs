@@ -24,9 +24,12 @@ use anyhow::Context;
 use chrono::{Duration as ChronoDuration, Local, Utc};
 
 use apollo_engine::collector::SystemCollector;
-use apollo_engine::engine::capabilities::detect_capabilities;
+use apollo_engine::engine::capabilities::{
+    detect_capabilities, detect_capabilities_with_write_probes,
+};
 use apollo_engine::engine::daemon_helpers::{
-    kill_switch_path, merge_seed_into, metrics_path, socket_path, unfreeze_pids_verified,
+    frozen_state_path, kill_switch_path, merge_seed_into, metrics_path, socket_path,
+    unfreeze_pids_verified_outcome, write_frozen_state,
 };
 use apollo_engine::engine::llm::{
     append_jsonl, delete_file_best_effort, load_repo_config, write_json, write_secret,
@@ -147,6 +150,25 @@ pub fn broadcast_current_status(state: &SharedState) {
 }
 
 // ── Request Dispatcher ─────────────────────────────────────────────────────
+
+fn restore_frozen_processes(state: &SharedState) -> Result<u64, String> {
+    let mut frozen_state = state.frozen_state.lock_recover();
+    let outcome = unfreeze_pids_verified_outcome(&frozen_state);
+    for pid in outcome.forgettable_pids() {
+        frozen_state.remove(&pid);
+    }
+    write_frozen_state(Path::new(frozen_state_path()), &frozen_state);
+    let applied = outcome.applied_count();
+    let failed = outcome.failed_pids.clone();
+    drop(frozen_state);
+
+    state.metrics.lock_recover().metrics.unfreezes_applied += applied;
+    if failed.is_empty() {
+        Ok(applied)
+    } else {
+        Err(format!("SIGCONT failed for PIDs: {failed:?}"))
+    }
+}
 
 pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonResponse {
     match req {
@@ -303,14 +325,14 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             // SIGCONT. `unfreeze_pids_verified` re-reads each current PID's
             // kernel start-time and skips mismatches (or gone PIDs) silently.
             // [Gray & Reuter 1992 §11] crash recovery identity invariants.
-            let mut frozen_state = state.frozen_state.lock_recover();
-            unfreeze_pids_verified(&frozen_state);
-            frozen_state.clear();
             // NOTE: kill switch (/var/run/apollo.disable) is intentionally NOT
             // cleared here. Restore reverts Apollo's mutations (frozen PIDs,
             // sysctls) but does not override a manual operator pause.
             // PanicRestore is the correct path to toggle the kill switch.
-            DaemonResponse::Ok
+            match restore_frozen_processes(state) {
+                Ok(_) => DaemonResponse::Ok,
+                Err(message) => DaemonResponse::Error { message },
+            }
         }
         DaemonRequest::PanicRestore => {
             // Symlink protection: open with O_NOFOLLOW so the check and create
@@ -334,13 +356,13 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             // frozen PIDs having died + been recycled. `unfreeze_pids_verified`
             // skips any PID whose (name, start_sec) no longer matches.
             // [Gray & Reuter 1992 §11] crash recovery identity invariants.
-            let mut frozen_state = state.frozen_state.lock_recover();
-            unfreeze_pids_verified(&frozen_state);
-            frozen_state.clear();
-            DaemonResponse::Ok
+            match restore_frozen_processes(state) {
+                Ok(_) => DaemonResponse::Ok,
+                Err(message) => DaemonResponse::Error { message },
+            }
         }
         DaemonRequest::Doctor => {
-            let caps = detect_capabilities();
+            let caps = detect_capabilities_with_write_probes();
             // Doctor runs live write probes for memorystatus_control and
             // task_for_pid to confirm the kernel API write paths actually work.
             // Read-only checks (sysctl, swap, VM stats) remain passive.
@@ -353,6 +375,10 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 qos_foreground,
                 qos_background,
                 qos_errors,
+                kpc_available,
+                kpc_ipc,
+                kpc_memory_bound,
+                memorystatus_runtime_failed,
             ) = {
                 let m = state.metrics.lock_recover();
                 (
@@ -364,6 +390,13 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                     m.metrics.qos_foreground_count,
                     m.metrics.qos_background_count,
                     m.metrics.qos_errors,
+                    m.metrics.kpc_available,
+                    m.metrics.kpc_ipc,
+                    m.metrics.kpc_memory_bound_score,
+                    m.metrics.top_skipped_processes.iter().any(|s| {
+                        s.starts_with("memorystatus-send-failed:")
+                            || s.starts_with("memorystatus-send-unsupported:")
+                    }),
                 )
             };
             let checks = vec![
@@ -378,10 +411,20 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                     .is_some()
                 ),
                 format!(
-                    "memorystatus_write: {}",
+                    "memorystatus_control_write: {}",
                     caps.memorystatus_probe
                         .as_deref()
                         .unwrap_or("skipped (not root)")
+                ),
+                format!(
+                    "memorystatus_pressure_send_runtime: {}",
+                    if !caps.can_memory_pressure_send {
+                        "unsupported by this kernel (disabled safely)"
+                    } else if memorystatus_runtime_failed {
+                        "degraded (runtime failures observed)"
+                    } else {
+                        "no failures observed"
+                    }
                 ),
                 format!(
                     "task_for_pid: {}",
@@ -409,6 +452,10 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 format!(
                     "qos_observed: foreground={} background={} errors={}",
                     qos_foreground, qos_background, qos_errors
+                ),
+                format!(
+                    "kpc_observed: available={} ipc={:.3} memory_bound_proxy={:.3}",
+                    kpc_available, kpc_ipc, kpc_memory_bound
                 ),
             ];
             DaemonResponse::Doctor { checks }

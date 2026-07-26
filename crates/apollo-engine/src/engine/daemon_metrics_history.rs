@@ -54,7 +54,6 @@ use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -131,17 +130,6 @@ use crate::engine::lse_counters::LSE_COUNTERS;
 /// Total failed append attempts (lock-free). Visible via `runtime_metrics.json`.
 pub fn failed_writes_total() -> u64 {
     LSE_COUNTERS.snapshot().failed_history_writes
-}
-
-#[cfg(test)]
-pub(crate) fn reset_failed_writes_for_test() {
-    // There is no reset method for LSE_COUNTERS in production;
-    // tests usually rely on starting with 0 or keeping track of deltas.
-    // However, since atomic counters are global across tests, they might
-    // need a reset in test mode. We will subtract the current value:
-    LSE_COUNTERS
-        .failed_history_writes
-        .store(0, Ordering::Relaxed);
 }
 
 // ── 16-d feature extraction (per SPEC §4a) ───────────────────────────────────
@@ -503,8 +491,6 @@ mod tests {
     fn single_write_produces_line_with_all_16_features_and_expected_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("history.jsonl");
-        reset_failed_writes_for_test();
-
         let metrics = tiny_metrics();
         let wm = WorldModel::default();
         let dd = DriftDetector::default();
@@ -597,8 +583,6 @@ mod tests {
     fn rotation_triggers_when_file_exceeds_max_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("history.jsonl");
-        reset_failed_writes_for_test();
-
         // Pre-grow the live file past the rotation threshold (200 B).
         let pre = vec![b'x'; 250];
         std::fs::write(&path, &pre).expect("write seed");
@@ -635,7 +619,7 @@ mod tests {
             .path()
             .join("nonexistent_subdir_xyz")
             .join("history.jsonl");
-        reset_failed_writes_for_test();
+        let failures_before = failed_writes_total();
 
         let metrics = tiny_metrics();
         let wm = WorldModel::default();
@@ -649,8 +633,9 @@ mod tests {
         // platform) — only that we surfaced a non-empty error chain.
         assert!(!msg.is_empty(), "error chain is non-empty");
         assert!(
-            failed_writes_total() >= 1,
-            "FAILED_WRITES counter incremented (got {})",
+            failed_writes_total() > failures_before,
+            "FAILED_WRITES counter did not increment (before={}, after={})",
+            failures_before,
             failed_writes_total()
         );
     }
@@ -659,7 +644,6 @@ mod tests {
     fn startup_cap_makes_writer_noop_above_threshold() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("history.jsonl");
-        reset_failed_writes_for_test();
 
         // tiny_cfg cap = 200 * 2 * 2 = 800 B. Pre-grow live file past that.
         std::fs::write(&path, vec![b'y'; 900]).expect("write oversized");
@@ -675,13 +659,8 @@ mod tests {
         // Live file is unchanged — the no-op must not have written.
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.starts_with("yyyy"), "live file untouched above cap");
-        // No-op is NOT a failure; counter stays at 0.
-        assert_eq!(
-            failed_writes_total(),
-            0,
-            "no-op must not bump FAILED_WRITES (got {})",
-            failed_writes_total()
-        );
+        // The process-global failure counter may be changed by another test;
+        // unchanged file contents are the direct, race-free no-op proof.
     }
 
     #[test]

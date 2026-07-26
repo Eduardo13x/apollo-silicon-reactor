@@ -82,8 +82,9 @@ use apollo_engine::engine::daemon_helpers::{
     load_frozen_state, load_governor_state, load_wake_state, markov_path, merge_seed_into,
     metrics_path, overflow_history_path, parse_profile, pid_start_time, predictive_agent_path,
     remove_crash_sentinel, rl_threshold_path, signal_intelligence_path, skills_path, socket_path,
-    telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_pids, wake_state_path,
-    write_frozen_state, write_governor_state,
+    spawn_reaped_purge, telemetry_output_dir, temporal_histograms_path, timeline_path,
+    unfreeze_pids, unfreeze_pids_verified_outcome, wake_state_path, write_frozen_state,
+    write_governor_state,
 };
 use apollo_engine::engine::execute_actions::execute_actions;
 use apollo_engine::engine::focus_markov::FocusMarkov;
@@ -91,7 +92,7 @@ use apollo_engine::engine::foreground::{ForegroundDetector, ForegroundState};
 use apollo_engine::engine::gpu_manager::GPUManager;
 use apollo_engine::engine::holt_winters::HoltWinters;
 use apollo_engine::engine::hw_bayes::HwFeatures;
-use apollo_engine::engine::hw_predictor::{sample_hw_pressure, HwPressure};
+use apollo_engine::engine::hw_predictor::{HwPredictorWorker, HwPressure};
 use apollo_engine::engine::iokit_sensors::{HardwareSnapshot, ThermalState};
 use apollo_engine::engine::kqueue_pressure;
 use apollo_engine::engine::latency_monitor::{self, LatencySignals};
@@ -379,8 +380,12 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Daemon { profile, dry_run } => {
+            // sysinfo initializes Rayon's global pool on its first process census.
+            // Configure it before startup recovery performs any such census.
+            let parallel_runtime = daemon_init::configure_parallel_runtime();
             let profile = parse_profile(&profile);
             let is_root = unsafe { libc::geteuid() } == 0;
+            let caps = detect_capabilities();
 
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -429,6 +434,18 @@ fn main() -> anyhow::Result<()> {
                 }
                 let mut p = disk_policy.unwrap_or_default();
                 merge_seed_into(&mut p);
+                let weight_report =
+                    apollo_engine::engine::outcome_tracker::sanitize_pattern_weights(
+                        &mut p.pattern_weights,
+                    );
+                let mut policy_changed = weight_report.changed();
+                if policy_changed {
+                    tracing::info!(
+                        removed_ephemeral = weight_report.removed_ephemeral,
+                        bounded = weight_report.bounded,
+                        "learned-policy sanitize: bounded portable evidence"
+                    );
+                }
                 // Sanitize (2026-06-20): drop any NOISE pattern that shadows an
                 // interactive or safety-protected process. The teacher
                 // noise-classified `language_server` (the LSP) — a noise+
@@ -456,11 +473,15 @@ fn main() -> anyhow::Result<()> {
                     if !removed.is_empty() {
                         std::sync::Arc::make_mut(&mut p.noise_patterns)
                             .retain(|n| !removed.contains(n));
+                        policy_changed = true;
                         tracing::warn!(
                             ?removed,
                             "learned-policy sanitize: dropped noise patterns shadowing interactive/protected"
                         );
                     }
+                }
+                if policy_changed {
+                    write_json(&learned_policy_path, &p, Some(0o600));
                 }
                 p
             };
@@ -705,36 +726,12 @@ fn main() -> anyhow::Result<()> {
             {
                 let mut frozen_state = state.frozen_state.lock_recover();
                 if !frozen_state.is_empty() {
-                    // Build a lightweight set of live process names for PID-reuse detection.
-                    // We spin up sysinfo only if there are frozen entries to check.
-                    use sysinfo::{ProcessRefreshKind, RefreshKind, System};
-                    let mut sys = System::new_with_specifics(
-                        RefreshKind::new().with_processes(ProcessRefreshKind::new()),
-                    );
-                    sys.refresh_processes_specifics(ProcessRefreshKind::new());
-
-                    let safe_pids: Vec<u32> = frozen_state
-                        .iter()
-                        .filter(|(pid, entry)| {
-                            if let Some(ref expected_name) = entry.process_name {
-                                // A name was recorded: verify the current process still matches.
-                                let pid_sysinfo = sysinfo::Pid::from_u32(**pid);
-                                match sys.process(pid_sysinfo) {
-                                    Some(proc) => proc.name() == expected_name.as_str(),
-                                    None => false, // process is gone — no SIGCONT needed
-                                }
-                            } else {
-                                // No name recorded (legacy entry): send SIGCONT unconditionally.
-                                // SIGCONT to a non-stopped process is a kernel no-op.
-                                true
-                            }
-                        })
-                        .map(|(pid, _)| *pid)
-                        .collect();
-
-                    let count = unfreeze_pids(safe_pids.into_iter());
-                    frozen_state.clear();
+                    let outcome = unfreeze_pids_verified_outcome(&frozen_state);
+                    for pid in outcome.forgettable_pids() {
+                        frozen_state.remove(&pid);
+                    }
                     write_frozen_state(&frozen_state_path, &frozen_state);
+                    let count = outcome.applied_count();
                     {
                         let mut metrics = state.metrics.lock_recover();
                         metrics.metrics.post_wake_defensive_unfreezes += count;
@@ -828,6 +825,16 @@ fn main() -> anyhow::Result<()> {
                 libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
             }
 
+            {
+                let mut metrics = state.metrics.lock_recover();
+                metrics.metrics.parallel_runtime_enabled = parallel_runtime.enabled;
+                metrics.metrics.parallel_worker_threads = parallel_runtime.worker_threads;
+            }
+            tracing::info!(
+                enabled = parallel_runtime.enabled,
+                workers = parallel_runtime.worker_threads,
+                "adaptive parallel sensing runtime configured"
+            );
             let mut collector = SystemCollector::new();
             let mut thrash = process_enrichment::ThrashState::default();
             let mut llm_counters = llm_daemon::LlmReactiveCounters::default();
@@ -895,6 +902,8 @@ fn main() -> anyhow::Result<()> {
             let mut last_dedup_throttle: u64 = 0;
             let mut last_dedup_freeze: u64 = 0;
             let mut last_dedup_unfreeze: u64 = 0;
+            let mut last_dedup_boost: u64 = 0;
+            let mut last_dedup_thread_qos: u64 = 0;
             let mut nested_learner = apollo_engine::engine::nested_learner::NestedLearner::new();
             let mut focus_markov = FocusMarkov::new(PathBuf::from(markov_path()));
             // TelemetryLogger: ring-buffer collection for time-series training data.
@@ -915,6 +924,7 @@ fn main() -> anyhow::Result<()> {
             let mut hw_last_hour: Option<u8> = None;
             let mut hw_pressure_accum: f64 = 0.0;
             let mut hw_pressure_count: u32 = 0;
+            let mut hw_predictor_worker = HwPredictorWorker::spawn();
             let mut sysctl_governor = SysctlGovernor::new(is_root);
             // Hardware capability scaling for SafetyPolicy::for_capabilities().
             // Detected once at startup via detect_hw_caps() (~1ms sysinfo query).
@@ -990,6 +1000,7 @@ fn main() -> anyhow::Result<()> {
                 SentinelConfig::default(),
                 fg_detector.clone(),
                 Some(state.mach_qos.clone()),
+                frozen_state_path.clone(),
             );
             // Overflow guard: aprende de eventos OOM y ajusta thresholds adaptativamente.
             // SleepNotifier: IOKit pre-sleep callback — fires kIOMessageSystemWillSleep
@@ -1051,13 +1062,13 @@ fn main() -> anyhow::Result<()> {
             let mut persist_generations: u32 = 0;
             let mut last_restore_quality: Option<f64> = None;
             let mut restore_monitor = RestoreQualityMonitor::new();
-            // FocusMarkov prediction miss tracking: (predicted_app, cycle_when_predicted).
-            // On the next cycle, if foreground != predicted, count as a miss.
-            // [Sutton & Barto 1998 §6 — temporal difference: credit assignment requires
-            // knowing when a prediction was wrong, not just when it was right.]
-            let mut last_markov_prethaw: Option<(String, u64, u32, i32)> = None;
+            // FocusMarkov acceleration lease. Resolution follows an actual
+            // foreground transition or a wall-clock deadline, never the next
+            // daemon cycle alone.
+            let mut last_markov_prethaw: Option<daemon_markov_tick::MarkovPrewarmLease> = None;
             let mut markov_hit_count: u32 = 0;
             let mut markov_miss_count: u32 = 0;
+            let mut interaction_qos = daemon_cycle_tail::InteractionQoSController::default();
             // Restored pending trial skill from the previous run (if daemon crashed mid-trial).
             let mut restored_trial_skill: Option<(String, f64)> = None;
             // Restored arousal state — applied after arousal_state is declared below.
@@ -1299,10 +1310,13 @@ fn main() -> anyhow::Result<()> {
             // ── KPC Hardware Performance Counters ────────────────────────────
             // Per-core IPC via libkpc.dylib (fixed counters: cycles + instructions).
             let mut kpc_reader = apollo_engine::engine::kpc_counters::KpcReader::new();
+            state.metrics.lock_recover().metrics.kpc_available = kpc_reader.available;
             if kpc_reader.available {
                 println!("[kpc] Hardware performance counters active");
             } else {
-                println!("[kpc] KPC counters unavailable (SIP or not root)");
+                println!(
+                    "[kpc] KPC counters unavailable (kernel policy, entitlement, or counter owner)"
+                );
             }
 
             // ── AMX Coprocessor Probe (one-time, at startup) ─────────────────
@@ -1480,6 +1494,8 @@ fn main() -> anyhow::Result<()> {
             // closes. Per-cycle in-memory state (not persisted), like
             // prev_workload_mode above. See engine::work_session.
             let mut work_session = WorkSession::new();
+            let mut workload_phase_tracker =
+                apollo_engine::engine::workload_phase::WorkloadPhaseTracker::new(Instant::now());
             // Affective arousal EMA: global system-wide stress level ∈ [0,1].
             // Drives Yerkes-Dodson adaptive recalibration threshold in learning_tick.
             // Restored from learned_state.json if available — preserves crisis context
@@ -1594,6 +1610,7 @@ fn main() -> anyhow::Result<()> {
                 };
 
             let mut decision_stage = DecisionStage::new();
+            let mut ais_worker = metrics_reporter::AisRuntimeWorker::spawn();
             // LlmConfig live-reload: polls /etc/apollo-optimizer/config.toml every 100
             // cycles for mtime changes, applies whitelisted diffs only.
             // Guard: only reload when pending_trial_skill.is_none() to prevent
@@ -1981,6 +1998,13 @@ fn main() -> anyhow::Result<()> {
                 let foreground_pid = fg_state.pid();
                 let foreground_idle = fg_state.is_idle();
 
+                // Build once before prediction so the Markov accelerator can
+                // bound coalition work to the predicted app's process family.
+                // The same immutable tree is reused throughout the cycle.
+                let _t_tree_start = Instant::now();
+                let process_tree = daemon_process_collector::build_process_tree(&collector);
+                let process_tree_nanos = _t_tree_start.elapsed().as_nanos();
+
                 // FocusMarkov miss check, Markov observe+pre-warm, universal pre-thaw, temporal predictor.
                 // Extracted to daemon_markov_tick::run_markov_tick (Wave 29).
                 // [Fowler 2004] Strangler Fig — pure move, no semantic change.
@@ -1999,6 +2023,8 @@ fn main() -> anyhow::Result<()> {
                     &mut markov_miss_count,
                     &state,
                     &collector,
+                    &process_tree,
+                    &coalition_tracker,
                     &mut cache_warmer,
                     &frozen_state_path,
                 );
@@ -2016,27 +2042,26 @@ fn main() -> anyhow::Result<()> {
                     &frozen_state_path,
                 );
 
-                // Process tree: build from the full process table for child grouping.
-                // Extracted to daemon_process_collector::build_process_tree().
-                let _t_enrich_start = Instant::now();
-                let process_tree = daemon_process_collector::build_process_tree(&collector);
-
                 // Build enriched process data using foreground detector + process tree.
                 // A process is considered foreground if it IS the foreground app or a
                 // descendant of it (via process tree), giving accurate foreground family
                 // detection for multi-process apps like Chrome, Electron, etc.
-                let (proc_snaps, hunt_snaps) =
+                let _t_enrich_start = Instant::now();
+                let (proc_snaps, hunt_snaps, apple_platform_pids) =
                     process_enrichment::build_enriched_process_data_with_tree(
                         collector.system(),
                         foreground_pid,
                         &process_tree,
                         cycle_count,
                         prev_pressure_smooth,
+                        hw_cores,
                         lf_metrics,
                     );
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonEnrich,
-                    _t_enrich_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    process_tree_nanos
+                        .saturating_add(_t_enrich_start.elapsed().as_nanos())
+                        .min(u64::MAX as u128) as u64,
                 );
                 let all_proc_names: Vec<&str> =
                     proc_snaps.iter().map(|p| p.name.as_str()).collect();
@@ -2054,7 +2079,18 @@ fn main() -> anyhow::Result<()> {
 
                 // Ghost-PID reconciliation — evict dead PIDs from frozen_state +
                 // turbo set; GC mach_qos HashMaps every 60 cycles.
-                let live_pids: HashSet<u32> = proc_snaps.iter().map(|p| p.pid).collect();
+                // Reuse the immutable identity classification produced by
+                // process_enrichment. Building both sets in one in-memory pass
+                // avoids repeating proc_pidpath for every process in the
+                // decision stage while preserving the same protection policy.
+                let mut live_pids = HashSet::with_capacity(proc_snaps.len());
+                let mut app_bundle_pids = HashSet::with_capacity(proc_snaps.len() / 4);
+                for process in &proc_snaps {
+                    live_pids.insert(process.pid);
+                    if process.is_app_bundle {
+                        app_bundle_pids.insert(process.pid);
+                    }
+                }
                 let recently_dead_dedup = recently_applied.invalidate_dead_pids(&live_pids);
                 if recently_dead_dedup > 0 {
                     tracing::debug!(
@@ -2081,6 +2117,8 @@ fn main() -> anyhow::Result<()> {
                     &mut mem_analyzer,
                     &mut proc_recovery,
                     &mut wake_storm,
+                    cycle_count,
+                    snapshot.pressure.memory_pressure,
                 );
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonProcScan,
@@ -2242,11 +2280,12 @@ fn main() -> anyhow::Result<()> {
                     lctx.outcome_tracker,
                 );
 
-                // HwPredictor: sample hardware signals every 10 cycles (~5s at normal rate).
-                // Runs in <50ms (16MB cache probe + 32MB BW probe) and gives advance warning
-                // before metrics APIs catch up. 5s is sufficient — thermal buildup takes ≥10s.
-                let (hw_pressure, jitter_us, hw_features) = if cycle_count.is_multiple_of(10) {
-                    let snap = sample_hw_pressure();
+                // HwPredictor: schedule hardware signals every 10 cycles (~5s at normal rate).
+                // Cache and bandwidth probes run on a dedicated worker; completed samples
+                // provide advance warning before metrics APIs catch up.
+                let (hw_pressure, jitter_us, hw_features) = if let Some(snap) =
+                    hw_predictor_worker.poll_and_schedule(cycle_count)
+                {
                     if snap.is_critical() {
                         state.metrics.lock_recover().fast_tick_until =
                             Some(Instant::now() + Duration::from_secs(15));
@@ -2429,9 +2468,12 @@ fn main() -> anyhow::Result<()> {
                     llm_active,
                 } = daemon_feature_gates::run_llm_inference_mode_tick(
                     &snapshot,
+                    &state,
                     &mut llm_detector,
                     &mut llm_spotlight_disabled,
                     is_root,
+                    foreground_pid,
+                    &thermal_action,
                 );
 
                 // ── Feature 3: RT Boost for Foreground ────────────────────────
@@ -2858,6 +2900,9 @@ fn main() -> anyhow::Result<()> {
                         // Kalman prediction for pre-emptive response
                         metrics.metrics.fluidity_predicted_3s = fl_sig.fluidity_predicted_3s;
                         metrics.metrics.fluidity_velocity = fl_sig.fluidity_velocity;
+                        let p_jank_60s = fluidity_state.predicted_jank_probability_60s();
+                        apollo_engine::engine::shadow_signals::set_p_jank_60s(p_jank_60s);
+                        metrics.metrics.si_p_jank_60s = p_jank_60s;
                         // Also update windowserver_cpu_pct (existing field)
                         metrics.metrics.windowserver_cpu_pct = fl_sig.windowserver_cpu_ema;
                     }
@@ -2919,6 +2964,14 @@ fn main() -> anyhow::Result<()> {
                         .iter()
                         .filter(|e| e.wakeup_rate >= 50.0)
                         .collect();
+                    if wakeup_sorted.len() > 3 {
+                        wakeup_sorted.select_nth_unstable_by(3, |a, b| {
+                            b.wakeup_rate
+                                .partial_cmp(&a.wakeup_rate)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        wakeup_sorted.truncate(3);
+                    }
                     wakeup_sorted.sort_by(|a, b| {
                         b.wakeup_rate
                             .partial_cmp(&a.wakeup_rate)
@@ -2940,12 +2993,21 @@ fn main() -> anyhow::Result<()> {
                         .iter()
                         .filter(|e| e.anomaly_score >= anomaly_thresh)
                         .collect();
+                    let anomaly_process_count = anomaly_sorted.len();
+                    if anomaly_sorted.len() > 3 {
+                        anomaly_sorted.select_nth_unstable_by(3, |a, b| {
+                            b.anomaly_score
+                                .partial_cmp(&a.anomaly_score)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        anomaly_sorted.truncate(3);
+                    }
                     anomaly_sorted.sort_by(|a, b| {
                         b.anomaly_score
                             .partial_cmp(&a.anomaly_score)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
-                    metrics.metrics.anomaly_process_count = anomaly_sorted.len();
+                    metrics.metrics.anomaly_process_count = anomaly_process_count;
                     metrics.metrics.anomaly_processes = anomaly_sorted
                         .iter()
                         .take(3)
@@ -3015,6 +3077,7 @@ fn main() -> anyhow::Result<()> {
                         build_tool_count,
                         gpu_active,
                         total_rss_gb,
+                        total_ram_gb: snapshot.memory.total_ram as f64 / (1024.0 * 1024.0 * 1024.0),
                         interactive_count,
                     };
                     let (mode, _confidence) = classify_workload_mode(&features);
@@ -3637,6 +3700,23 @@ fn main() -> anyhow::Result<()> {
                 // copy is cheap (4 f64/bool fields, Clone).
                 last_user_context_for_voting = user_context.clone();
 
+                let phase_observation = workload_phase_tracker.observe(
+                    apollo_engine::engine::workload_phase::classify_phase(
+                        workload_mode,
+                        user_context.call_in_progress || user_context.audio_active,
+                        context_switch_burst,
+                    ),
+                    Instant::now(),
+                );
+                {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.workload_phase = phase_observation.phase.as_str().to_string();
+                    metrics.metrics.workload_phase_expected_duration_secs =
+                        phase_observation.expected_duration_secs;
+                    metrics.metrics.workload_phase_duration_observations =
+                        phase_observation.duration_observations;
+                }
+
                 // Swap reclaim ODE: pre-emptive reactor_weight boost on saturation risk.
                 // [Denning 1968; Zhao 2009] Extracted to daemon_swap_reclaim_tick (Wave 35).
                 daemon_swap_reclaim_tick::apply_swap_reclaim_boost(
@@ -3752,6 +3832,7 @@ fn main() -> anyhow::Result<()> {
                         decide_weights: &decide_weights,
                         outcome_baseline,
                         behavior_interactive_pids: &behavior_interactive_pids,
+                        app_bundle_pids: &app_bundle_pids,
                         ipc_hints: &ipc_hints,
                         hop_groups: &lctx.outcome_tracker.hop_groups,
                         habituated_pids: effective_habituated,
@@ -3821,7 +3902,10 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // Apply any locally learned policy patterns (and keep them even after LLM is disabled).
-                // Cross-cycle state-memory filter (SuperPlan Iter 8 2026-05-06):
+                // Read-only cross-cycle state-memory filter. The final dispatch
+                // chokepoint is the sole writer; recording here made every
+                // admitted decision look duplicate when it reached that second
+                // filter later in the same cycle.
                 // decide_actions has ~14 emission sites (multi-thread QoS, freeze
                 // gates, swarm throttle, predictive policy etc.) without per-site
                 // cross-cycle dedup. Single chokepoint here filters ALL of them
@@ -3840,13 +3924,12 @@ fn main() -> anyhow::Result<()> {
                     let raw = decision.actions;
                     let mut filtered = Vec::with_capacity(raw.len());
                     for action in raw {
-                        if let Some((pid, kind)) =
+                        if let Some((pid, kind, discriminator)) =
                             apollo_engine::engine::recently_applied::CachedActionKind::from_root_action(&action)
                         {
-                            if recently_applied.is_recent(pid, kind) {
+                            if recently_applied.is_recent_scoped(pid, kind, discriminator) {
                                 continue;
                             }
-                            recently_applied.record(pid, kind);
                         }
                         filtered.push(action);
                     }
@@ -4014,6 +4097,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Predictive agent: inject soft actions for PreThrottleNoise / ProactivePurge.
                 // Extracted to daemon_agent_actions::run_agent_actions (Wave 19).
+                let pressure_send_supported = caps.can_memory_pressure_send;
                 {
                     let agent_new = daemon_agent_actions::run_agent_actions(
                         &agent_intervention,
@@ -4026,6 +4110,7 @@ fn main() -> anyhow::Result<()> {
                         &companion_graph,
                         &coalition_tracker,
                         &active_coalitions,
+                        pressure_send_supported,
                     );
                     acc.extend_raw(
                         agent_new,
@@ -4050,9 +4135,10 @@ fn main() -> anyhow::Result<()> {
                         foreground_app.as_deref(),
                         acc.view(),
                         memory_budget.recovering_from_critical(),
-                        &mut recently_applied,
+                        &recently_applied,
                         user_context.call_in_progress,
                         user_context.audio_active,
+                        pressure_send_supported,
                     );
                     acc.extend_raw(
                         hint_new,
@@ -4086,7 +4172,9 @@ fn main() -> anyhow::Result<()> {
                     &lctx.outcome_tracker.experience,
                     learnable_params.experience_pressure_band,
                     snapshot.pressure.memory_pressure,
-                    &mut recently_applied,
+                    (hw_ram_gb * 1024.0 * 1024.0 * 1024.0) as u64,
+                    &recently_applied,
+                    &apple_platform_pids,
                 );
                 let heuristic_decisions = heuristic_pass.heuristic_decisions;
                 let heuristic_critical_pids = heuristic_pass.heuristic_critical_pids;
@@ -4162,7 +4250,6 @@ fn main() -> anyhow::Result<()> {
                                 / 1024;
                         let mut zombie_actions: Vec<RootAction> = Vec::new();
                         for dw in &dead_weight {
-                            lf_metrics.inc_zombie_dead_weight_detected();
                             // 2026-06-20 (regression probe caught live: node
                             // nominated 3x): hard_protected_contains only covers
                             // the hard list — a dev-runtime (node/rustc) or infra
@@ -4176,11 +4263,17 @@ fn main() -> anyhow::Result<()> {
                             // during playback = frame drop. is_chromium_family
                             // matches "Brave Browser Helper*". Was firing 974x
                             // (always failing) on a live renderer — additive.
-                            if apollo_engine::engine::safety::is_protected_name(&dw.name)
-                                || apollo_engine::engine::safety::is_chromium_family(&dw.name)
-                            {
+                            // Reuse the full per-cycle envelope. It includes
+                            // Apple platform ownership and dynamic behavioral
+                            // protection, which name-only checks cannot see.
+                            if daemon_action_safety::is_protected_action_candidate(
+                                dw.pid,
+                                &dw.name,
+                                &heuristic_critical_pids,
+                            ) {
                                 continue;
                             }
+                            lf_metrics.inc_zombie_dead_weight_detected();
                             use apollo_engine::engine::zombie_hunter::ZombieClass;
                             match dw.zombie_class {
                                 ZombieClass::GhostHelper | ZombieClass::MemoryHoarder
@@ -4264,12 +4357,19 @@ fn main() -> anyhow::Result<()> {
                 // identity-guarded, foreground-exempt. One chokepoint instead
                 // of five bespoke trackers. [Saltzer & Schroeder 1975]
                 if cycle_count % 30 == 0 {
-                    let reverted = apollo_engine::engine::effect_ledger::reconcile_global(
+                    let reconcile = apollo_engine::engine::effect_ledger::reconcile_global(
                         foreground_pid,
                         &state.mach_qos,
                     );
-                    if reverted > 0 {
-                        tracing::info!(reverted, "effect-ledger: reconcile pass");
+                    if reconcile.reverted > 0 || reconcile.failed > 0 {
+                        tracing::info!(
+                            reverted = reconcile.reverted,
+                            failed = reconcile.failed,
+                            "effect-ledger: reconcile pass"
+                        );
+                        let mut metrics = state.metrics.lock_recover();
+                        metrics.metrics.reverts_applied += reconcile.reverted;
+                        metrics.metrics.reverts_failed += reconcile.failed;
                     }
                     let live: Vec<u32> = hunt_snaps.iter().map(|h| h.pid).collect();
                     apollo_engine::engine::effect_ledger::cleanup_global(&live);
@@ -4668,7 +4768,6 @@ fn main() -> anyhow::Result<()> {
                     tracing::info!("RevertSysctls RPC: reverting sysctl changes to defaults");
                     let revert_actions = sysctl_governor.revert_to_defaults();
                     if !revert_actions.is_empty() {
-                        let caps = detect_capabilities();
                         let mut frozen_dummy = std::collections::HashSet::new();
                         let outcomes = execute_actions(
                             revert_actions,
@@ -4785,6 +4884,7 @@ fn main() -> anyhow::Result<()> {
                         foreground_pid,
                         &proc_snaps,
                         &state,
+                        &frozen_state_path,
                         win_workload_intent,
                         &arousal_state,
                         &fluidity_state,
@@ -4855,12 +4955,10 @@ fn main() -> anyhow::Result<()> {
                     state.metrics.lock_recover().metrics.budgets.minute_actions = 0;
                 }
 
-                let caps = detect_capabilities();
-
                 // Phase 1: Compute budget-filtered actions (metrics lock held briefly).
                 // BUG 5 fix: split into three phases so the metrics mutex is never held
                 // across the blocking I/O inside execute_actions.
-                let final_actions = {
+                let prebudget_actions = {
                     let mut metrics = state.metrics.lock_recover();
                     // TTL unfreeze + FIFO rotation.
                     // Extracted to daemon_freeze_executor::run_ttl_unfreeze_sweep().
@@ -4891,20 +4989,21 @@ fn main() -> anyhow::Result<()> {
                     // Schwartzian transform: compute tau once per action, sort by key.
                     // Halves tau_for_app() calls (O(N log N) lookups → O(N)).
                     // [Knuth TAOCP Vol 3 §5.2] decorate-sort-undecorate.
-                    let mut keyed: Vec<(f64, RootAction)> = graced_actions
-                        .into_iter()
-                        .map(|a| {
-                            let tau = if let RootAction::FreezeProcess { ref name, .. } = a {
-                                unfreeze_decay.tau_for_app(name)
-                            } else {
-                                f64::MAX
-                            };
-                            (tau, a)
-                        })
-                        .collect();
-                    keyed
+                    let total_actions = graced_actions.len();
+                    let mut keyed_freezes: Vec<(f64, RootAction)> = Vec::new();
+                    let mut non_freezes: Vec<RootAction> = Vec::new();
+                    for action in graced_actions {
+                        if let RootAction::FreezeProcess { ref name, .. } = action {
+                            keyed_freezes.push((unfreeze_decay.tau_for_app(name), action));
+                        } else {
+                            non_freezes.push(action);
+                        }
+                    }
+                    keyed_freezes
                         .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                    graced_actions = keyed.into_iter().map(|(_, a)| a).collect();
+                    graced_actions = Vec::with_capacity(total_actions);
+                    graced_actions.extend(keyed_freezes.into_iter().map(|(_, action)| action));
+                    graced_actions.extend(non_freezes);
 
                     // Freeze confirmation gate: 2 cycles normal, 1 pre-emptive,
                     // 0 during launch. Per-cycle dedup + decay of stale candidates.
@@ -5007,8 +5106,9 @@ fn main() -> anyhow::Result<()> {
                                     MemoryAction::PressureHint => {
                                         ds_hint += 1;
                                         // Cross-cycle dedup (SuperPlan Iter 7):
-                                        // deep-scan path emits SetMemorystatus -1 every cycle for
-                                        // stale apps. Skip if same hint within 30s TTL.
+                        // deep-scan path emits SetMemorystatus -1 every cycle for
+                        // stale apps. Check prior-cycle state here; the final
+                        // dispatch chokepoint records survivors.
                                         if recently_applied.is_recent(
                                             pid,
                                             apollo_engine::engine::recently_applied::CachedActionKind::SetMemorystatus
@@ -5050,10 +5150,6 @@ fn main() -> anyhow::Result<()> {
                                                 }));
                                             }
                                         }
-                                        recently_applied.record(
-                                            pid,
-                                            apollo_engine::engine::recently_applied::CachedActionKind::SetMemorystatus
-                                        );
                                         Some(RootAction::SetMemorystatus {
                                             pid,
                                             priority: -1,
@@ -5164,19 +5260,16 @@ fn main() -> anyhow::Result<()> {
 
                     // Audit fix #4b: Unfreeze stuck frozen processes (IPC deadlock recovery).
                     let stuck_pids = wait_graph::find_stuck_frozen(&frozen_pids);
-                    for stuck_pid in &stuck_pids {
-                        if unsafe { libc::kill(*stuck_pid as i32, 0) } == 0 {
-                            unsafe {
-                                libc::kill(*stuck_pid as i32, libc::SIGCONT);
-                            }
-                        }
-                    }
                     if !stuck_pids.is_empty() {
+                        let outcome = apollo_engine::engine::daemon_helpers::unfreeze_pids_outcome(
+                            stuck_pids.iter().copied(),
+                        );
                         let mut frozen_map = state.frozen_state.lock_recover();
-                        for pid in &stuck_pids {
-                            frozen_map.remove(pid);
+                        for pid in outcome.forgettable_pids() {
+                            frozen_map.remove(&pid);
                         }
-                        metrics.metrics.unfreezes_applied += stuck_pids.len() as u64;
+                        write_frozen_state(&frozen_state_path, &frozen_map);
+                        metrics.metrics.unfreezes_applied += outcome.applied_count();
                     }
 
                     let filtered = process_enrichment::filter_boost_cooldown(
@@ -5184,135 +5277,76 @@ fn main() -> anyhow::Result<()> {
                         &policy,
                         &mut thrash,
                     );
-                    let minute_cap = match latency_target {
-                        LatencyTarget::Max => 120,
-                        LatencyTarget::Low => 50,
-                        LatencyTarget::Normal => 80,
-                    };
-                    let fa = enforce_limits_with_budget(
-                        filtered,
+                    filtered
+                    // metrics lock released here
+                };
+
+                // Universal safety filter runs BEFORE budget accounting. Previously
+                // Apple/protected candidates consumed the complete minute budget and
+                // were then discarded here, starving valid third-party work behind
+                // them. Preserve the exact safety rules while charging only actions
+                // that can actually reach dispatch.
+                let policy_protected: Vec<String> = {
+                    let pg = state.policy.lock_recover();
+                    pg.learned_policy
+                        .protected_patterns
+                        .iter()
+                        .chain(pg.learned_policy.interactive_patterns.iter())
+                        .cloned()
+                        .collect()
+                };
+                let (mut budget_candidates, prefilter_stats) =
+                    daemon_action_safety::filter_dispatch_candidates(
+                        prebudget_actions,
+                        &policy_protected,
+                        &recently_applied,
+                        apollo_engine::engine::process_identity::is_apple_platform_process,
+                        |action| pid_identity_still_valid(action, &identity_cache, lf_metrics),
+                    );
+
+                // Modern macOS kernels may omit the legacy per-PID pressure
+                // sysctl. Drop those hints before budgeting so an unsupported
+                // actuator cannot consume budget, create backpressure, or fake work.
+                let before_capability_filter = budget_candidates.len();
+                if !caps.can_memory_pressure_send {
+                    budget_candidates
+                        .retain(|action| !matches!(action, RootAction::SetMemorystatus { .. }));
+                }
+                let unsupported_drops =
+                    before_capability_filter.saturating_sub(budget_candidates.len()) as u64;
+
+                let minute_cap = match latency_target {
+                    LatencyTarget::Max => 120,
+                    LatencyTarget::Low => 50,
+                    LatencyTarget::Normal => 80,
+                };
+                let final_actions = {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.dispatch_prefilter_input_total += prefilter_stats.input;
+                    metrics.metrics.dispatch_prefilter_recent_drops += prefilter_stats.recent_drops;
+                    metrics.metrics.dispatch_prefilter_apple_drops += prefilter_stats.apple_drops;
+                    metrics.metrics.dispatch_prefilter_protected_drops +=
+                        prefilter_stats.protected_drops;
+                    metrics.metrics.dispatch_prefilter_identity_drops +=
+                        prefilter_stats.identity_drops;
+                    metrics.metrics.dispatch_prefilter_unsupported_drops += unsupported_drops;
+                    metrics.metrics.dispatch_prefilter_survivors_total +=
+                        prefilter_stats.survivors.saturating_sub(unsupported_drops);
+                    let admitted = enforce_limits_with_budget(
+                        budget_candidates,
                         &policy,
                         &mut metrics.metrics.budgets,
                         minute_cap,
                     );
                     metrics.metrics.last_actions_summary =
-                        metrics.metrics.format_last_actions_summary(&fa);
-                    fa
-                    // metrics lock released here
-                };
-
-                // Phase 2: Execute actions WITHOUT holding the metrics lock.
-                //
-                // SuperPlan Iter 9 — universal cross-cycle filter at FINAL chokepoint.
-                // Earlier per-path wires (process_enrichment, paging_hints, deep-scan,
-                // decide_actions Iter 8) cover most emitters but llm_daemon's
-                // apply_learned_policy_actions, skill_tick, agent_actions add later.
-                // This single filter catches any remaining cross-cycle re-emissions
-                // and records them so subsequent cycles see the cache state.
-                //
-                // SuperPlan post-debrief (2026-05-06): also filters ApplePlatform
-                // procs at emit time. SIP-protected Apple binaries reject task_for_pid
-                // so Throttle/Freeze/SetThreadQoS for them are guaranteed to fail —
-                // no point emitting at all (was 271/500 = 54% of journal `success: false`).
-                // [Saltzer & Schroeder 1975] Economy of Mechanism — single filter
-                // beats per-site fixes.
-                let final_actions: Vec<RootAction> = {
-                    let raw = final_actions;
-                    let mut filtered = Vec::with_capacity(raw.len());
-                    // Snapshot protection state ONCE per cycle (not per action).
-                    // [Saltzer & Kaashoek 2009 §3.3] Complete Mediation — single check
-                    // path matches what execute_actions safety layer will do.
-                    let hard_protected = apollo_engine::engine::safety::protected_processes();
-                    let infra_protected = apollo_engine::engine::safety::infrastructure_processes();
-                    // Match execute_actions safety layer EXACTLY: policy_all is the
-                    // UNION of learned_protected + learned_interactive (both are treated
-                    // as Unconditional at execute time when no foreground context is
-                    // available). See execute_actions.rs `let policy_all = ...`.
-                    let policy_protected: Vec<String> = {
-                        let pg = state.policy.lock_recover();
-                        pg.learned_policy
-                            .protected_patterns
-                            .iter()
-                            .chain(pg.learned_policy.interactive_patterns.iter())
-                            .cloned()
-                            .collect()
-                    };
-                    // Pre-build Aho-Corasick once before per-action filter loop.
-                    // Tier 3 fast path in classify_protection. Amortizes over all
-                    // candidate actions (typically 50-200/cycle). [Sprint 2026-06-03]
-                    let policy_protected_ac =
-                        apollo_engine::engine::safety::build_policy_protected_ac(&policy_protected);
-                    for action in raw {
-                        if let Some((pid, kind)) =
-                            apollo_engine::engine::recently_applied::CachedActionKind::from_root_action(&action)
-                        {
-                            // Cross-cycle dedup.
-                            if recently_applied.is_recent(pid, kind) {
-                                continue;
-                            }
-                            // ApplePlatform pre-filter for actions kernel will reject.
-                            let blocks_under_sip = matches!(
-                                kind,
-                                apollo_engine::engine::recently_applied::CachedActionKind::Throttle
-                                    | apollo_engine::engine::recently_applied::CachedActionKind::Freeze
-                                    | apollo_engine::engine::recently_applied::CachedActionKind::Unfreeze
-                                    | apollo_engine::engine::recently_applied::CachedActionKind::SetThreadQoS
-                            );
-                            if blocks_under_sip
-                                && apollo_engine::engine::process_identity::is_apple_platform_process(pid)
-                            {
-                                continue;
-                            }
-                            // ProtectedProcess pre-filter via classify_protection():
-                            // mirrors execute_actions safety layer logic. Covers Tier 1
-                            // (hardcoded), Tier 2 (infra: docker/postgres/redis), and
-                            // Tier 3 (learned policy substring case-insensitive).
-                            // Skip Boost + Unfreeze: those are CORRECTIVE on protected.
-                            let blocks_for_protected = !matches!(
-                                kind,
-                                apollo_engine::engine::recently_applied::CachedActionKind::Boost
-                                    | apollo_engine::engine::recently_applied::CachedActionKind::Unfreeze
-                            );
-                            if blocks_for_protected {
-                                let action_name = match &action {
-                                    apollo_engine::engine::types::RootAction::ThrottleProcess { name, .. }
-                                    | apollo_engine::engine::types::RootAction::FreezeProcess { name, .. }
-                                    | apollo_engine::engine::types::RootAction::SetThreadQoS { name, .. }
-                                    | apollo_engine::engine::types::RootAction::BoostProcess { name, .. }
-                                    | apollo_engine::engine::types::RootAction::UnfreezeProcess { name, .. } => Some(name.as_str()),
-                                    _ => None,
-                                };
-                                if let Some(name) = action_name {
-                                    let level = apollo_engine::engine::safety::classify_protection(
-                                        name,
-                                        &hard_protected,
-                                        &infra_protected,
-                                        &policy_protected,
-                                        policy_protected_ac.as_ref(),
-                                        false,
-                                    );
-                                    if level == apollo_engine::engine::safety::ProtectionLevel::Unconditional {
-                                        continue;
-                                    }
-                                }
-                            }
-                            // Phase A1 (Sprint 2 2026-05-07) — pre-emit identity re-verify.
-                            // Closes ~1ms snapshot→execute race. See pid_identity_still_valid
-                            // helper for full semantics (mirrors verify_pid_identity).
-                            // [Idempotency Pattern — 1001 patterns slide 7]
-                            if !pid_identity_still_valid(&action, &identity_cache, lf_metrics) {
-                                continue;
-                            }
-                            recently_applied.record(pid, kind);
-                        }
-                        filtered.push(action);
-                    }
-                    filtered
+                        metrics.metrics.format_last_actions_summary(&admitted);
+                    admitted
                 };
 
                 // Priority action queue: buffer this cycle's decided actions and
                 // dispatch at most max_per_cycle per cycle. Urgent (Unfreeze) actions
-                // bypass the cap. Any overflow stays in the queue for the next cycle.
+                // bypass the cap. Any overflow stays in the queue for the next cycle;
+                // the queue owns pending dedup until an action is drained.
                 action_queue.push_all(final_actions);
                 // Phase A2 (Sprint 2 2026-05-07) — post-drain identity re-verify.
                 // Actions queued cycle N may dispatch cycle N+1 due to priority
@@ -5331,6 +5365,9 @@ fn main() -> anyhow::Result<()> {
                     let pending_depth = lctx.outcome_tracker.pending_depth();
                     let mut metrics = state.metrics.lock_recover();
                     metrics.metrics.action_queue_backpressure = bp;
+                    metrics.metrics.action_queue_capacity_drops = action_queue.capacity_drops();
+                    metrics.metrics.action_queue_background_evictions =
+                        action_queue.background_evictions();
                     metrics.metrics.outcome_pending_depth = pending_depth;
                 }
 
@@ -5414,6 +5451,13 @@ fn main() -> anyhow::Result<()> {
                         thrashing: snapshot.pressure.thrashing_score as f32,
                     });
                 }
+                // Commit cross-cycle suppression only after the actuator confirms
+                // a real mutation. Admission, dry-run simulation, cognitive drops
+                // and failed kernel calls remain retryable.
+                daemon_dispatch_tick::record_applied_actions(
+                    &exec_outcomes.audit_traces,
+                    &mut recently_applied,
+                );
                 // Capture only applied pressure-reduction actions for the
                 // self-evaluator. Intents blocked during dispatch must not
                 // become neurocognitive "latest_action" evidence.
@@ -5741,6 +5785,7 @@ fn main() -> anyhow::Result<()> {
                     foreground_pid,
                     &process_tree,
                     &heuristic_decisions,
+                    &heuristic_critical_pids,
                     &power_mgr,
                     thermal_pressure_boost,
                     &mut io_shaper,
@@ -5758,11 +5803,14 @@ fn main() -> anyhow::Result<()> {
 
                 // ── Fluidity QoS elevation ───────────────────────────────────
                 // Extracted to daemon_cycle_tail::apply_fluidity_qos (Wave 10).
-                daemon_cycle_tail::apply_fluidity_qos(
+                daemon_cycle_tail::update_interaction_qos(
                     &state,
+                    &mut interaction_qos,
                     &fluidity_state,
                     &thermal_action,
                     foreground_pid,
+                    build_tracker.phase,
+                    user_context.idle_secs,
                 );
 
                 metrics_reporter::merge_cycle_metrics(
@@ -5774,6 +5822,7 @@ fn main() -> anyhow::Result<()> {
                     current_profile,
                     &governor_decision,
                     &lctx,
+                    &mut ais_worker,
                     &overflow_thresholds,
                     &cycle_start,
                     reactor_weight,
@@ -5900,7 +5949,7 @@ fn main() -> anyhow::Result<()> {
                                     fired: false,
                                     reason: "media_active — audio/video/call running; pause media or use `sudo purge` to bypass".into(),
                                 }
-                            } else if std::process::Command::new("purge").spawn().is_ok() {
+                            } else if spawn_reaped_purge() {
                                 maintenance_state.mark_cli_purged();
                                 lf_metrics
                                     .maintenance_purge_total
@@ -6027,20 +6076,29 @@ fn main() -> anyhow::Result<()> {
                     let cur_throttle = snap.dedup_drops_throttle;
                     let cur_freeze = snap.dedup_drops_freeze;
                     let cur_unfreeze = snap.dedup_drops_unfreeze;
+                    let cur_boost = snap.dedup_drops_boost;
+                    let cur_thread_qos = snap.dedup_drops_thread_qos;
                     let delta_setmem = cur_setmem.saturating_sub(last_dedup_setmem);
                     let delta_throttle = cur_throttle.saturating_sub(last_dedup_throttle);
                     let delta_freeze = cur_freeze.saturating_sub(last_dedup_freeze);
                     let delta_unfreeze = cur_unfreeze.saturating_sub(last_dedup_unfreeze);
+                    let delta_boost = cur_boost.saturating_sub(last_dedup_boost);
+                    let delta_thread_qos = cur_thread_qos.saturating_sub(last_dedup_thread_qos);
                     last_dedup_setmem = cur_setmem;
                     last_dedup_throttle = cur_throttle;
                     last_dedup_freeze = cur_freeze;
                     last_dedup_unfreeze = cur_unfreeze;
+                    last_dedup_boost = cur_boost;
+                    last_dedup_thread_qos = cur_thread_qos;
                     self_diagnosis.record_cycle(
                         delta_setmem,
                         delta_throttle,
                         delta_freeze,
                         delta_unfreeze,
+                        delta_boost,
+                        delta_thread_qos,
                         snap.refresh_duration_us,
+                        collector.last_process_refresh_performed(),
                         snapshot.pressure.memory_pressure,
                     );
                     // Run threshold check every 60 cycles to amortize cost.
@@ -6095,6 +6153,11 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Release speculative kernel state before persisting on shutdown.
+            if let Some(lease) = last_markov_prethaw.take() {
+                daemon_markov_tick::release_markov_prewarm(lease, &state);
+            }
+            daemon_cycle_tail::release_interaction_qos(&mut interaction_qos, &state);
             // Persist Markov chain + Holt-Winters + SignalIntelligence state on shutdown.
             focus_markov.persist();
             holt_winters.persist(&hw_path);
@@ -6148,7 +6211,6 @@ fn main() -> anyhow::Result<()> {
             {
                 let revert_actions = sysctl_governor.revert_to_defaults();
                 if !revert_actions.is_empty() {
-                    let caps = detect_capabilities();
                     let mut frozen_dummy = HashSet::new();
                     let outcomes = execute_actions(
                         revert_actions,

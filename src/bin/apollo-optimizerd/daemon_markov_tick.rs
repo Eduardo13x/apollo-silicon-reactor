@@ -14,22 +14,58 @@
 //! the context-switch burst detector (which updates last_fg_name).
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use apollo_engine::collector::SystemCollector;
 use apollo_engine::engine::cache_warmer::CacheWarmer;
-use apollo_engine::engine::daemon_helpers::{unfreeze_pids, write_frozen_state};
+use apollo_engine::engine::coalition::CoalitionTracker;
+use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::focus_markov::FocusMarkov;
 use apollo_engine::engine::freeze_intelligence::FreezeIntelligence;
 use apollo_engine::engine::jetsam_control;
 use apollo_engine::engine::lock_ext::LockRecover;
-use apollo_engine::engine::mach_qos::SchedulingTier;
+use apollo_engine::engine::mach_qos::{LatencyTier, SchedulingTier, ThroughputTier};
+use apollo_engine::engine::process_tree::ProcessTree;
 use apollo_engine::engine::temporal_predictor::TemporalPredictor;
 use chrono::{Timelike, Utc};
 
 pub struct MarkovTickOutput {
     pub temporal_hour: u8,
     pub temporal_weekday: u8,
+}
+
+/// One speculative acceleration lease. A prediction is evaluated on an
+/// actual foreground transition or a wall-clock deadline, never merely on
+/// the next daemon cycle.
+#[derive(Debug)]
+pub struct MarkovPrewarmLease {
+    source_app: String,
+    predicted_app: String,
+    acquired_at: Instant,
+    members: Vec<PrewarmedMember>,
+    cache_bytes: u64,
+    expires_at: Instant,
+    activated: bool,
+    activated_at: Option<Instant>,
+    settle_recorded: bool,
+}
+
+#[derive(Debug)]
+struct PrewarmedMember {
+    pid: u32,
+    prior_jetsam: i32,
+    jetsam_applied: bool,
+    tier_applied: bool,
+    task_qos_applied: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseResolution {
+    Pending,
+    Hit,
+    Completed,
+    Miss,
 }
 
 /// Run FocusMarkov + temporal predictor for this cycle.
@@ -41,11 +77,13 @@ pub struct MarkovTickOutput {
 /// - `cycle_count` — current cycle index
 /// - `focus_markov` — mutable FocusMarkov (observe + predict)
 /// - `temporal_predictor` — mutable TemporalPredictor (observe + predict)
-/// - `last_markov_prethaw` — pending prediction being tracked for miss detection
+/// - `markov_prewarm` — active prediction lease being tracked for resolution
 /// - `markov_hit_count` — cumulative hit counter for accuracy audit
 /// - `markov_miss_count` — cumulative miss counter for accuracy audit
 /// - `state` — SharedState (frozen_state, mach_qos, metrics)
 /// - `collector` — SystemCollector (process table for PID lookup)
+/// - `process_tree` — current-cycle hierarchy used to bound coalition candidates
+/// - `coalition_tracker` — XNU resource-coalition identity verifier
 /// - `cache_warmer` — for cache pre-warming predicted apps
 /// - `frozen_state_path` — for write_frozen_state after pre-thaw
 #[allow(clippy::too_many_arguments)]
@@ -56,11 +94,13 @@ pub fn run_markov_tick(
     cycle_count: u64,
     focus_markov: &mut FocusMarkov,
     temporal_predictor: &mut TemporalPredictor,
-    last_markov_prethaw: &mut Option<(String, u64, u32, i32)>,
+    markov_prewarm: &mut Option<MarkovPrewarmLease>,
     markov_hit_count: &mut u32,
     markov_miss_count: &mut u32,
     state: &SharedState,
     collector: &SystemCollector,
+    process_tree: &ProcessTree,
+    coalition_tracker: &CoalitionTracker,
     cache_warmer: &mut CacheWarmer,
     frozen_state_path: &Path,
 ) -> MarkovTickOutput {
@@ -68,141 +108,163 @@ pub fn run_markov_tick(
     // maintenance/survival paths are EVICTING file cache while these
     // warm_pid calls fault pages back in — Apollo fighting itself,
     // amplifying thrashing. Gate all speculative cache warming on pressure.
-    let cache_warm_allowed = {
+    let now = Instant::now();
+    let (cache_warm_allowed, fluidity_degraded, app_launching) = {
         let m = state.metrics.lock_recover();
-        cache_warm_allowed_at(m.metrics.memory_pressure)
+        (
+            cache_warm_allowed_at(m.metrics.memory_pressure),
+            m.metrics.fluidity_degraded,
+            m.metrics.app_launching,
+        )
     };
 
-    // ── FocusMarkov miss check ───────────────────────────────────────────────
-    // [Sutton & Barto 1998 §6 — temporal difference credit assignment]
-    if let Some((ref predicted, pred_cycle, warmed_pid, prior_jetsam)) = *last_markov_prethaw {
-        let cycles_elapsed = cycle_count.saturating_sub(pred_cycle);
-        if cycles_elapsed >= 1 {
-            let hit = foreground_app
-                .map(|fa| {
-                    fa.to_ascii_lowercase()
-                        .contains(&predicted.to_ascii_lowercase())
-                })
-                .unwrap_or(false);
-            if hit {
+    if let Some(lease) = markov_prewarm.as_mut() {
+        let target_is_foreground = foreground_app
+            .map(|app| app_names_match(app, &lease.predicted_app))
+            .unwrap_or(false);
+        if maybe_record_settle(
+            lease,
+            target_is_foreground,
+            fluidity_degraded,
+            app_launching,
+            now,
+        ) {
+            let settle_ms = lease
+                .activated_at
+                .map(|started| now.duration_since(started).as_millis() as u64)
+                .unwrap_or(0);
+            let mut metrics = state.metrics.lock_recover();
+            metrics.metrics.markov_prewarm_last_settle_ms = settle_ms;
+            metrics.metrics.markov_prewarm_settle_observations += 1;
+        }
+    }
+
+    // ── Resolve the existing lease ──────────────────────────────────────────
+    // The old implementation scored every prediction one daemon cycle later.
+    // A user who simply stayed in the same app for two seconds produced a
+    // false miss, followed by another identical kernel pre-warm. Resolve on
+    // actual focus transitions or the prediction's wall-clock deadline.
+    let resolution = markov_prewarm
+        .as_ref()
+        .map(|lease| lease_resolution(lease, foreground_app, now))
+        .unwrap_or(LeaseResolution::Pending);
+    match resolution {
+        LeaseResolution::Hit => {
+            if let Some(lease) = markov_prewarm.as_mut() {
+                lease.activated = true;
+                lease.activated_at = Some(now);
                 *markov_hit_count += 1;
-                // Evolve iter-4: prediction landed — runningboard owns the
-                // now-foreground app's priorities; drop the ledger backstop.
-                apollo_engine::engine::effect_ledger::forget_global(
-                    &apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
-                        pid: warmed_pid,
-                        prior: 0,
-                    },
-                );
-                apollo_engine::engine::effect_ledger::forget_global(
-                    &apollo_engine::engine::effect_ledger::AppliedEffect::MachTier {
-                        pid: warmed_pid,
-                    },
-                );
-            } else {
-                *markov_miss_count += 1;
-                // Anti-ratchet (2026-06-10 fight-hunt): a missed prediction
-                // left the pre-warmed process at jetsam FOREGROUND (immune
-                // to kernel kills) + Mach Foreground tier FOREVER. Revert
-                // both on miss — restore the jetsam priority we captured
-                // before the pre-warm and drop the tier back to Normal.
-                // (On HIT runningboard owns the app's lifecycle priorities;
-                // no Apollo cleanup needed.)
-                if let Some(restore) = prewarm_jetsam_restore(prior_jetsam) {
-                    let _ = jetsam_control::set_priority(warmed_pid, restore);
-                }
-                let mut qos = state.mach_qos.lock_recover();
-                qos.set_tier(warmed_pid, SchedulingTier::Normal);
-                drop(qos);
-                tracing::debug!(
-                    pid = warmed_pid,
-                    predicted = %predicted,
-                    "markov-miss: reverted pre-warm jetsam/tier"
-                );
-                // Evolve iter-4: already reverted — drop the ledger backstop.
-                apollo_engine::engine::effect_ledger::forget_global(
-                    &apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
-                        pid: warmed_pid,
-                        prior: 0,
-                    },
-                );
-                apollo_engine::engine::effect_ledger::forget_global(
-                    &apollo_engine::engine::effect_ledger::AppliedEffect::MachTier {
-                        pid: warmed_pid,
-                    },
-                );
-            }
-            *last_markov_prethaw = None;
-            let total = *markov_hit_count + *markov_miss_count;
-            if total > 0 && total.is_multiple_of(50) {
-                let accuracy = *markov_hit_count as f64 / total as f64;
-                apollo_engine::engine::daemon_helpers::audit_log(&serde_json::json!({
-                    "event": "markov_prediction_accuracy",
-                    "hits": markov_hit_count,
-                    "misses": markov_miss_count,
-                    "accuracy": (accuracy * 1000.0).round() / 1000.0,
-                }));
+                let mut metrics = state.metrics.lock_recover();
+                metrics.metrics.markov_prewarm_hits += 1;
+                metrics.metrics.markov_prewarm_last_lead_ms =
+                    now.duration_since(lease.acquired_at).as_millis() as u64;
             }
         }
+        LeaseResolution::Completed | LeaseResolution::Miss => {
+            if resolution == LeaseResolution::Miss {
+                *markov_miss_count += 1;
+                state.metrics.lock_recover().metrics.markov_prewarm_misses += 1;
+            }
+            if let Some(lease) = markov_prewarm.take() {
+                release_markov_prewarm(lease, state);
+            }
+        }
+        LeaseResolution::Pending => {}
+    }
+
+    let total = *markov_hit_count + *markov_miss_count;
+    if matches!(resolution, LeaseResolution::Hit | LeaseResolution::Miss)
+        && total > 0
+        && total.is_multiple_of(50)
+    {
+        let accuracy = *markov_hit_count as f64 / total as f64;
+        apollo_engine::engine::daemon_helpers::audit_log(&serde_json::json!({
+            "event": "markov_prediction_accuracy",
+            "hits": markov_hit_count,
+            "misses": markov_miss_count,
+            "accuracy": (accuracy * 1000.0).round() / 1000.0,
+        }));
     }
 
     // ── Markov observe + predicted-app pre-warm ──────────────────────────────
     let markov_prediction = focus_markov.observe(foreground_app);
     if let Some(ref pred) = markov_prediction {
-        let pred_name_lc = pred.app_name.to_ascii_lowercase();
-        let predicted_pid: Option<u32> = collector
-            .system()
-            .processes()
-            .iter()
-            .find(|(_, p)| p.name().to_ascii_lowercase() == pred_name_lc)
-            .map(|(pid, _)| pid.as_u32());
+        let elapsed = focus_markov.elapsed_dwell_secs();
+        let time_to_switch = pred.avg_dwell_secs - elapsed;
+        let prewarm_eligible =
+            prewarm_window_open(pred.probability, time_to_switch, cache_warm_allowed);
+        {
+            let mut metrics = state.metrics.lock_recover();
+            metrics.metrics.markov_prediction_app = pred.app_name.clone();
+            metrics.metrics.markov_prediction_confidence = pred.probability;
+            metrics.metrics.markov_prediction_eta_secs = time_to_switch;
+            metrics.metrics.markov_prewarm_eligible = prewarm_eligible;
+        }
 
-        if let Some(pid) = predicted_pid {
-            let mut frozen_guard = state.frozen_state.lock_recover();
-            if frozen_guard.remove(&pid).is_some() {
-                unfreeze_pids(std::iter::once(pid));
-                write_frozen_state(frozen_state_path, &frozen_guard);
-                state.metrics.lock_recover().metrics.unfreezes_applied += 1;
-            }
-            drop(frozen_guard);
+        if markov_prewarm.is_none() && prewarm_eligible {
+            let predicted_pid = find_running_pid(collector, &pred.app_name);
+            if let Some(pid) = predicted_pid {
+                let (members, cache_bytes, unfrozen_count) = acquire_coalition_prewarm(
+                    pid,
+                    state,
+                    collector,
+                    process_tree,
+                    coalition_tracker,
+                    cache_warmer,
+                    frozen_state_path,
+                );
+                let members_applied = members.len() as u64;
+                let kernel_members = members
+                    .iter()
+                    .filter(|member| {
+                        member.jetsam_applied || member.tier_applied || member.task_qos_applied
+                    })
+                    .count();
+                let applied = !members.is_empty();
 
-            if pred.probability >= 0.50 {
-                // Anti-ratchet: capture the prior jetsam priority so a missed
-                // prediction can restore it (-1 sentinel = unreadable, skip
-                // the jetsam revert but still drop the tier).
-                let prior_jetsam = jetsam_control::get_priority(pid).unwrap_or(-1);
-                let _ = jetsam_control::set_priority(pid, jetsam_control::priority::FOREGROUND);
-                // Cable C: Proactive QoS — route predicted app to P-cores BEFORE switch.
-                {
-                    let mut qos = state.mach_qos.lock_recover();
-                    qos.set_tier(pid, SchedulingTier::Foreground);
-                }
-                // Evolve iter-4: ledger backstop. The miss-check 1 cycle later
-                // is the fast revert; the ledger catches the slow paths (miss
-                // check never ran — daemon restart, prediction window skipped).
-                let (warm_sec, _) = apollo_engine::engine::daemon_helpers::pid_start_time(pid);
-                apollo_engine::engine::effect_ledger::record_global(
-                    apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
-                        pid,
-                        prior: prior_jetsam,
-                    },
-                    apollo_engine::engine::effect_ledger::DEFAULT_TTL,
-                    warm_sec,
-                    "markov pre-warm: jetsam FOREGROUND",
+                let lease_secs = (time_to_switch.max(0.0) + 5.0).clamp(5.0, 20.0);
+                let acquired_at = Instant::now();
+                *markov_prewarm = Some(MarkovPrewarmLease {
+                    source_app: foreground_app.unwrap_or_default().to_string(),
+                    predicted_app: pred.app_name.clone(),
+                    acquired_at,
+                    members,
+                    cache_bytes,
+                    expires_at: acquired_at + Duration::from_secs_f64(lease_secs),
+                    activated: false,
+                    activated_at: None,
+                    settle_recorded: false,
+                });
+                let mut metrics = state.metrics.lock_recover();
+                metrics.metrics.markov_prewarm_attempts += 1;
+                metrics.metrics.markov_prewarm_applied += u64::from(applied);
+                metrics.metrics.markov_prewarm_active = true;
+                metrics.metrics.markov_prewarm_members = members_applied as u32;
+                metrics.metrics.markov_prewarm_members_applied += members_applied;
+                metrics.metrics.markov_prewarm_cache_bytes = metrics
+                    .metrics
+                    .markov_prewarm_cache_bytes
+                    .saturating_add(cache_bytes);
+                metrics.metrics.unfreezes_applied += unfrozen_count;
+                tracing::debug!(
+                    cycle = cycle_count,
+                    pid,
+                    app = pred.app_name.as_str(),
+                    confidence = pred.probability,
+                    time_to_switch,
+                    cache_bytes,
+                    members = members_applied,
+                    kernel_members,
+                    "markov: acquired predictive coalition acceleration lease"
                 );
-                apollo_engine::engine::effect_ledger::record_global(
-                    apollo_engine::engine::effect_ledger::AppliedEffect::MachTier { pid },
-                    apollo_engine::engine::effect_ledger::DEFAULT_TTL,
-                    warm_sec,
-                    "markov pre-warm: Foreground tier",
-                );
-                if cache_warm_allowed {
-                    cache_warmer.warm_pid(pid);
-                }
-                *last_markov_prethaw =
-                    Some((pred.app_name.clone(), cycle_count, pid, prior_jetsam));
             }
         }
+    } else {
+        let mut metrics = state.metrics.lock_recover();
+        metrics.metrics.markov_prediction_app.clear();
+        metrics.metrics.markov_prediction_confidence = 0.0;
+        metrics.metrics.markov_prediction_eta_secs = 0.0;
+        metrics.metrics.markov_prewarm_eligible = false;
     }
 
     // ── Universal pre-thaw: FocusMarkov → pre-thaw ALL frozen processes ──────
@@ -215,32 +277,40 @@ pub fn run_markov_tick(
             if time_to_switch > -5.0 && time_to_switch < 10.0 {
                 let hint_categories = FreezeIntelligence::pre_thaw_hint(&pred.app_name);
                 let mut frozen_guard = state.frozen_state.lock_recover();
-                let candidates: Vec<(u32, String)> = frozen_guard
+                let candidates: std::collections::HashMap<
+                    u32,
+                    apollo_engine::engine::types::FrozenEntry,
+                > = frozen_guard
                     .iter()
                     .filter_map(|(&pid, entry)| {
                         let pname = entry.process_name.as_deref().unwrap_or("");
                         if !pname.is_empty() {
                             let cat = FreezeIntelligence::classify(pname);
                             if hint_categories.contains(&cat) {
-                                return Some((pid, pname.to_string()));
+                                return Some((pid, entry.clone()));
                             }
                         }
                         None
                     })
                     .collect();
                 if !candidates.is_empty() {
-                    for (pid, pname) in &candidates {
-                        if frozen_guard.remove(pid).is_some() {
-                            unfreeze_pids(std::iter::once(*pid));
-                            tracing::info!(
-                                pid = pid,
-                                process = pname.as_str(),
-                                predicted_app = pred.app_name.as_str(),
-                                prob = pred.probability,
-                                time_to_switch = time_to_switch,
-                                "freeze_intelligence: universal pre-thaw — switch imminent"
-                            );
-                        }
+                    let outcome = unfreeze_pids_verified_outcome(&candidates);
+                    for pid in outcome.forgettable_pids() {
+                        frozen_guard.remove(&pid);
+                    }
+                    for pid in &outcome.applied_pids {
+                        let pname = candidates
+                            .get(pid)
+                            .and_then(|entry| entry.process_name.as_deref())
+                            .unwrap_or("");
+                        tracing::info!(
+                            pid,
+                            process = pname,
+                            predicted_app = pred.app_name.as_str(),
+                            prob = pred.probability,
+                            time_to_switch = time_to_switch,
+                            "freeze_intelligence: universal pre-thaw — switch imminent"
+                        );
                     }
                     write_frozen_state(frozen_state_path, &frozen_guard);
                 }
@@ -274,19 +344,15 @@ pub fn run_markov_tick(
             .collect();
         let temporal_preds = temporal_predictor.predict(hour, weekday, &markov_probs);
 
-        for tpred in &temporal_preds {
-            if tpred.temporal_score > 0.3 && tpred.probability > 0.15 && tpred.markov_score < 0.30 {
-                let pred_lc = tpred.app_name.to_ascii_lowercase();
-                if let Some(pid) = collector
-                    .system()
-                    .processes()
-                    .iter()
-                    .find(|(_, p)| p.name().to_ascii_lowercase() == pred_lc)
-                    .map(|(pid, _)| pid.as_u32())
-                {
-                    if cache_warm_allowed {
-                        cache_warmer.warm_pid(pid);
-                    }
+        // At most one temporal-only candidate is useful per cycle. The old
+        // loop rescanned the entire process table up to five times (N+1) and
+        // could speculatively fault several unrelated executables into cache.
+        if cache_warm_allowed {
+            if let Some(tpred) = temporal_preds.iter().find(|tpred| {
+                tpred.temporal_score > 0.3 && tpred.probability > 0.15 && tpred.markov_score < 0.30
+            }) {
+                if let Some(pid) = find_running_pid(collector, &tpred.app_name) {
+                    cache_warmer.warm_pid(pid);
                 }
             }
         }
@@ -299,6 +365,348 @@ pub fn run_markov_tick(
         temporal_hour,
         temporal_weekday,
     }
+}
+
+fn app_names_match(actual: &str, predicted: &str) -> bool {
+    actual.eq_ignore_ascii_case(predicted)
+}
+
+fn find_running_pid(collector: &SystemCollector, app_name: &str) -> Option<u32> {
+    collector
+        .system()
+        .processes()
+        .iter()
+        .find(|(_, process)| process.name().eq_ignore_ascii_case(app_name))
+        .map(|(pid, _)| pid.as_u32())
+}
+
+const MAX_PREWARM_MEMBERS: usize = 6;
+
+/// Select a bounded process-tree family and confirm each child against the
+/// root's XNU resource coalition. This keeps selection O(k) in the predicted
+/// app's family rather than rescanning/probing every process on the host.
+fn coalition_candidates(
+    root_pid: u32,
+    collector: &SystemCollector,
+    process_tree: &ProcessTree,
+    coalition_tracker: &CoalitionTracker,
+) -> Vec<(u32, String, f32)> {
+    let root_coalition = coalition_tracker.get_coalition_id(root_pid);
+    let mut pids = process_tree.cascade_pids(root_pid);
+    if !pids.contains(&root_pid) {
+        pids.push(root_pid);
+    }
+
+    let candidates: Vec<(u32, String, f32)> = pids
+        .into_iter()
+        .filter(|pid| {
+            *pid == root_pid
+                || root_coalition == 0
+                || coalition_tracker.get_coalition_id(*pid) == root_coalition
+        })
+        .filter_map(|pid| {
+            collector
+                .system()
+                .process(sysinfo::Pid::from_u32(pid))
+                .map(|process| (pid, process.name().to_string(), process.cpu_usage()))
+        })
+        .collect();
+
+    rank_and_cap_candidates(candidates, root_pid)
+}
+
+fn rank_and_cap_candidates(
+    mut candidates: Vec<(u32, String, f32)>,
+    root_pid: u32,
+) -> Vec<(u32, String, f32)> {
+    // Root first for lifecycle/coordination, then hottest helpers. The fixed
+    // cap bounds Mach calls and speculative cache footprint for large browsers.
+    candidates.sort_by(|a, b| {
+        let a_root = a.0 == root_pid;
+        let b_root = b.0 == root_pid;
+        b_root
+            .cmp(&a_root)
+            .then_with(|| b.2.total_cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    candidates.truncate(MAX_PREWARM_MEMBERS);
+    candidates
+}
+
+#[allow(clippy::too_many_arguments)]
+fn acquire_coalition_prewarm(
+    root_pid: u32,
+    state: &SharedState,
+    collector: &SystemCollector,
+    process_tree: &ProcessTree,
+    coalition_tracker: &CoalitionTracker,
+    cache_warmer: &mut CacheWarmer,
+    frozen_state_path: &Path,
+) -> (Vec<PrewarmedMember>, u64, u64) {
+    let candidates = coalition_candidates(root_pid, collector, process_tree, coalition_tracker);
+    let eligible: Vec<(u32, String, bool)> = candidates
+        .into_iter()
+        .filter_map(|(pid, name, _)| {
+            let (user_target, kernel_boost_allowed) = prewarm_target_modes(
+                pid,
+                std::process::id(),
+                apollo_engine::engine::process_identity::is_apple_platform_process(pid),
+                apollo_engine::engine::safety::is_boost_forbidden(&name),
+            );
+            user_target.then_some((pid, name, kernel_boost_allowed))
+        })
+        .collect();
+
+    // Remove every selected member under one lock and persist once. This avoids
+    // one lock + JSON rewrite per helper in a multi-process application.
+    let thawed = {
+        let mut frozen_guard = state.frozen_state.lock_recover();
+        let entries: std::collections::HashMap<u32, apollo_engine::engine::types::FrozenEntry> =
+            eligible
+                .iter()
+                .filter_map(|(pid, _, _)| frozen_guard.get(pid).map(|entry| (*pid, entry.clone())))
+                .collect();
+        let outcome = unfreeze_pids_verified_outcome(&entries);
+        for pid in outcome.forgettable_pids() {
+            frozen_guard.remove(&pid);
+        }
+        if !entries.is_empty() {
+            write_frozen_state(frozen_state_path, &frozen_guard);
+        }
+        outcome
+            .applied_pids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+    };
+
+    let mut members = Vec::with_capacity(eligible.len());
+    let mut total_cache_bytes = 0u64;
+    for (pid, _name, kernel_boost_allowed) in eligible {
+        let prior_jetsam = kernel_boost_allowed
+            .then(|| jetsam_control::get_priority(pid).unwrap_or(-1))
+            .unwrap_or(-1);
+        let jetsam_applied = kernel_boost_allowed
+            && jetsam_control::set_priority(pid, jetsam_control::priority::FOREGROUND).is_ok();
+        let (tier_applied, task_qos_applied) = if kernel_boost_allowed {
+            let mut qos = state.mach_qos.lock_recover();
+            let tier = qos.set_tier(pid, SchedulingTier::Foreground);
+            let task_qos =
+                qos.set_latency_and_throughput(pid, LatencyTier::Interactive, ThroughputTier::High);
+            (tier.mutated, task_qos.mutated)
+        } else {
+            (false, false)
+        };
+        let cache_bytes = cache_warmer.warm_pid(pid);
+        total_cache_bytes = total_cache_bytes.saturating_add(cache_bytes);
+        let unfrozen = thawed.contains(&pid);
+
+        let (warm_sec, _) = apollo_engine::engine::daemon_helpers::pid_start_time(pid);
+        if jetsam_applied {
+            apollo_engine::engine::effect_ledger::record_global(
+                apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
+                    pid,
+                    prior: prior_jetsam,
+                },
+                apollo_engine::engine::effect_ledger::DEFAULT_TTL,
+                warm_sec,
+                "markov coalition pre-warm: jetsam FOREGROUND",
+            );
+        }
+        if tier_applied {
+            apollo_engine::engine::effect_ledger::record_global(
+                apollo_engine::engine::effect_ledger::AppliedEffect::MachTier { pid },
+                apollo_engine::engine::effect_ledger::DEFAULT_TTL,
+                warm_sec,
+                "markov coalition pre-warm: Foreground tier",
+            );
+        }
+        if task_qos_applied {
+            apollo_engine::engine::effect_ledger::record_global(
+                apollo_engine::engine::effect_ledger::AppliedEffect::TaskQoS { pid },
+                apollo_engine::engine::effect_ledger::DEFAULT_TTL,
+                warm_sec,
+                "markov coalition pre-warm: interactive task QoS",
+            );
+        }
+
+        if unfrozen || jetsam_applied || tier_applied || task_qos_applied || cache_bytes > 0 {
+            members.push(PrewarmedMember {
+                pid,
+                prior_jetsam,
+                jetsam_applied,
+                tier_applied,
+                task_qos_applied,
+            });
+        }
+    }
+
+    (members, total_cache_bytes, thawed.len() as u64)
+}
+
+fn prewarm_window_open(probability: f64, time_to_switch: f64, resources_healthy: bool) -> bool {
+    resources_healthy
+        && probability >= 0.50
+        && time_to_switch.is_finite()
+        && (-2.0..=12.0).contains(&time_to_switch)
+}
+
+fn maybe_record_settle(
+    lease: &mut MarkovPrewarmLease,
+    target_is_foreground: bool,
+    fluidity_degraded: bool,
+    app_launching: bool,
+    now: Instant,
+) -> bool {
+    if !lease.activated
+        || !target_is_foreground
+        || lease.settle_recorded
+        || lease.activated_at == Some(now)
+    {
+        return false;
+    }
+    if !fluidity_degraded && !app_launching {
+        lease.settle_recorded = true;
+        return true;
+    }
+    false
+}
+
+fn prewarm_target_modes(
+    pid: u32,
+    own_pid: u32,
+    apple_platform: bool,
+    boost_forbidden: bool,
+) -> (bool, bool) {
+    let user_target = pid != own_pid && !apple_platform;
+    (user_target, user_target && !boost_forbidden)
+}
+
+fn lease_resolution(
+    lease: &MarkovPrewarmLease,
+    foreground_app: Option<&str>,
+    now: Instant,
+) -> LeaseResolution {
+    let target_is_foreground = foreground_app
+        .map(|app| app_names_match(app, &lease.predicted_app))
+        .unwrap_or(false);
+    if lease.activated {
+        // A hit does not turn a speculative lease into permanent priority.
+        // Keep only the short launch/transition window, then restore every
+        // reversible kernel mutation even if the app remains foreground.
+        if now >= lease.expires_at {
+            LeaseResolution::Completed
+        } else if target_is_foreground || foreground_app.is_none() {
+            LeaseResolution::Pending
+        } else {
+            LeaseResolution::Completed
+        }
+    } else if target_is_foreground {
+        LeaseResolution::Hit
+    } else if foreground_app
+        .map(|app| !app_names_match(app, &lease.source_app))
+        .unwrap_or(false)
+    {
+        // A next-app prediction is disproven as soon as a different app wins
+        // focus. Do not hold speculative priority until the timer expires.
+        LeaseResolution::Miss
+    } else if now >= lease.expires_at {
+        LeaseResolution::Miss
+    } else {
+        LeaseResolution::Pending
+    }
+}
+
+/// Release all reversible kernel state associated with one prediction.
+/// Also used on clean daemon shutdown so a pre-warm cannot ratchet across a
+/// service restart.
+pub fn release_markov_prewarm(lease: MarkovPrewarmLease, state: &SharedState) {
+    let mut reverted = false;
+    let mut reverted_effects = 0u64;
+    let mut failed_effects = 0u64;
+    let member_count = lease.members.len();
+    let cache_bytes = lease.cache_bytes;
+    for member in lease.members {
+        if member.jetsam_applied {
+            let effect = apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
+                pid: member.pid,
+                prior: member.prior_jetsam,
+            };
+            const OWNER: &str = "markov coalition pre-warm: jetsam FOREGROUND";
+            if apollo_engine::engine::effect_ledger::is_global_owner(&effect, OWNER) {
+                let ok = prewarm_jetsam_restore(member.prior_jetsam).is_none_or(|restore| {
+                    jetsam_control::set_priority(member.pid, restore).is_ok()
+                });
+                if ok {
+                    apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                        &effect, OWNER,
+                    );
+                    reverted_effects += 1;
+                    reverted = true;
+                } else {
+                    failed_effects += 1;
+                }
+            }
+        }
+        if member.tier_applied || member.task_qos_applied {
+            let mut qos = state.mach_qos.lock_recover();
+            if member.tier_applied {
+                let effect = apollo_engine::engine::effect_ledger::AppliedEffect::MachTier {
+                    pid: member.pid,
+                };
+                const OWNER: &str = "markov coalition pre-warm: Foreground tier";
+                if apollo_engine::engine::effect_ledger::is_global_owner(&effect, OWNER) {
+                    let outcome = qos.set_tier(member.pid, SchedulingTier::Normal);
+                    let ok = outcome.mutated
+                        || qos.current_tier(member.pid) == Some(SchedulingTier::Normal);
+                    if ok {
+                        apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                            &effect, OWNER,
+                        );
+                        reverted_effects += 1;
+                        reverted = true;
+                    } else {
+                        failed_effects += 1;
+                    }
+                }
+            }
+            if member.task_qos_applied {
+                let effect = apollo_engine::engine::effect_ledger::AppliedEffect::TaskQoS {
+                    pid: member.pid,
+                };
+                const OWNER: &str = "markov coalition pre-warm: interactive task QoS";
+                if apollo_engine::engine::effect_ledger::is_global_owner(&effect, OWNER) {
+                    let ok = qos
+                        .set_latency_and_throughput(
+                            member.pid,
+                            LatencyTier::Default,
+                            ThroughputTier::Default,
+                        )
+                        .mutated;
+                    if ok {
+                        apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                            &effect, OWNER,
+                        );
+                        reverted_effects += 1;
+                        reverted = true;
+                    } else {
+                        failed_effects += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut metrics = state.metrics.lock_recover();
+    metrics.metrics.markov_prewarm_active = false;
+    metrics.metrics.markov_prewarm_members = 0;
+    metrics.metrics.markov_prewarm_reverts += u64::from(reverted);
+    metrics.metrics.reverts_applied += reverted_effects;
+    metrics.metrics.reverts_failed += failed_effects;
+    tracing::debug!(
+        member_count,
+        cache_bytes,
+        reverted,
+        "markov: released coalition lease"
+    );
 }
 
 /// Anti-ratchet (2026-06-10): what jetsam priority to restore after a
@@ -320,6 +728,26 @@ fn cache_warm_allowed_at(pressure: f64) -> bool {
 mod tests {
     use super::*;
 
+    fn lease(expires_at: Instant, activated: bool) -> MarkovPrewarmLease {
+        MarkovPrewarmLease {
+            source_app: "Finder".to_string(),
+            predicted_app: "Terminal".to_string(),
+            acquired_at: Instant::now(),
+            members: vec![PrewarmedMember {
+                pid: 42,
+                prior_jetsam: 2,
+                jetsam_applied: true,
+                tier_applied: true,
+                task_qos_applied: true,
+            }],
+            cache_bytes: 4096,
+            expires_at,
+            activated,
+            activated_at: activated.then(Instant::now),
+            settle_recorded: false,
+        }
+    }
+
     #[test]
     fn cache_warm_gated_above_060() {
         assert!(cache_warm_allowed_at(0.45));
@@ -336,5 +764,119 @@ mod tests {
         assert_eq!(prewarm_jetsam_restore(0), Some(0));
         assert_eq!(prewarm_jetsam_restore(2), Some(2));
         assert_eq!(prewarm_jetsam_restore(9), Some(9));
+    }
+
+    #[test]
+    fn prewarm_window_is_confident_imminent_and_pressure_safe() {
+        assert!(prewarm_window_open(0.70, 8.0, true));
+        assert!(prewarm_window_open(0.50, -2.0, true));
+        assert!(!prewarm_window_open(0.49, 2.0, true));
+        assert!(!prewarm_window_open(0.90, 13.0, true));
+        assert!(!prewarm_window_open(0.90, 2.0, false));
+    }
+
+    #[test]
+    fn family_roots_get_non_invasive_warming_only() {
+        assert_eq!(prewarm_target_modes(42, 7, false, true), (true, false));
+        assert_eq!(prewarm_target_modes(42, 7, false, false), (true, true));
+        assert_eq!(prewarm_target_modes(7, 7, false, false), (false, false));
+        assert_eq!(prewarm_target_modes(42, 7, true, false), (false, false));
+    }
+
+    #[test]
+    fn coalition_member_selection_is_root_first_hot_and_bounded() {
+        let candidates = vec![
+            (10, "root".to_string(), 1.0),
+            (11, "cold".to_string(), 0.1),
+            (12, "hottest".to_string(), 90.0),
+            (13, "hot".to_string(), 50.0),
+            (14, "warm".to_string(), 30.0),
+            (15, "mild".to_string(), 10.0),
+            (16, "cool".to_string(), 5.0),
+            (17, "colder".to_string(), 0.5),
+        ];
+        let ranked = rank_and_cap_candidates(candidates, 10);
+        assert_eq!(ranked.len(), MAX_PREWARM_MEMBERS);
+        assert_eq!(ranked[0].0, 10);
+        assert_eq!(ranked[1].0, 12);
+        assert_eq!(ranked[2].0, 13);
+        assert!(!ranked.iter().any(|member| member.0 == 11));
+    }
+
+    #[test]
+    fn settle_is_recorded_once_after_hit_when_fluidity_recovers() {
+        let now = Instant::now();
+        let mut l = lease(now + Duration::from_secs(10), true);
+        l.activated_at = Some(now - Duration::from_millis(250));
+        assert!(!maybe_record_settle(&mut l, false, false, false, now));
+        assert!(!maybe_record_settle(&mut l, true, true, false, now));
+        assert!(!maybe_record_settle(&mut l, true, false, true, now));
+        assert!(maybe_record_settle(&mut l, true, false, false, now));
+        assert!(!maybe_record_settle(&mut l, true, false, false, now));
+    }
+
+    #[test]
+    fn pending_prediction_is_not_a_false_miss_next_cycle() {
+        let now = Instant::now();
+        let l = lease(now + Duration::from_secs(10), false);
+        assert_eq!(
+            lease_resolution(&l, Some("Finder"), now + Duration::from_secs(2)),
+            LeaseResolution::Pending
+        );
+    }
+
+    #[test]
+    fn lease_hits_on_target_then_completes_when_target_loses_focus() {
+        let now = Instant::now();
+        let mut l = lease(now + Duration::from_secs(10), false);
+        assert_eq!(
+            lease_resolution(&l, Some("terminal"), now),
+            LeaseResolution::Hit
+        );
+        l.activated = true;
+        assert_eq!(
+            lease_resolution(&l, Some("Terminal"), now),
+            LeaseResolution::Pending
+        );
+        assert_eq!(
+            lease_resolution(&l, Some("Finder"), now),
+            LeaseResolution::Completed
+        );
+    }
+
+    #[test]
+    fn hit_lease_expires_even_while_target_stays_foreground() {
+        let now = Instant::now();
+        let l = lease(now, true);
+        assert_eq!(
+            lease_resolution(&l, Some("Terminal"), now),
+            LeaseResolution::Completed
+        );
+    }
+
+    #[test]
+    fn unresolved_lease_misses_only_after_deadline() {
+        let now = Instant::now();
+        let l = lease(now, false);
+        assert_eq!(
+            lease_resolution(&l, Some("Finder"), now),
+            LeaseResolution::Miss
+        );
+    }
+
+    #[test]
+    fn wrong_foreground_transition_resolves_miss_immediately() {
+        let now = Instant::now();
+        let l = lease(now + Duration::from_secs(10), false);
+        assert_eq!(
+            lease_resolution(&l, Some("Safari"), now),
+            LeaseResolution::Miss
+        );
+    }
+
+    #[test]
+    fn app_match_does_not_accept_substring_false_positive() {
+        assert!(app_names_match("Xcode", "xcode"));
+        assert!(!app_names_match("Xcode", "Code"));
     }
 }

@@ -80,7 +80,8 @@ pub struct PowerManager {
 ///
 /// - `core_count_active`: from `sysctl hw.ncpu` (logical CPUs available).
 /// - `cpu_frequency_mhz`: from `sysctl hw.cpufrequency_max` (Hz, divided by 1_000_000).
-///   Falls back to `sysctl hw.tbfrequency` if cpufrequency_max is unavailable.
+///   Remains 0 when heterogeneous Apple Silicon does not expose a CPU maximum;
+///   `hw.tbfrequency` is a timebase clock and must not be reported as CPU MHz.
 /// - `power_draw_watts`: 0.0 (must be provided externally from IOKit/powermetrics).
 /// - `thermal_headroom`: 100.0 (must be updated externally from IOKit thermal data).
 /// - `idle_percentage`: 50.0 (must be updated externally from system metrics).
@@ -89,7 +90,6 @@ pub fn detect_power_state() -> PowerState {
 
     let cpu_freq_mhz = read_sysctl_u64("hw.cpufrequency_max")
         .map(|hz| (hz / 1_000_000) as u32)
-        .or_else(|| read_sysctl_u64("hw.tbfrequency").map(|hz| (hz / 1_000_000) as u32))
         .unwrap_or(0);
 
     PowerState {
@@ -102,7 +102,11 @@ pub fn detect_power_state() -> PowerState {
 }
 
 fn read_sysctl_u64(key: &str) -> Option<u64> {
-    sysctl_direct::read_u64(key)
+    sysctl_direct::read_u64(key).or_else(|| {
+        sysctl_direct::read_i32(key)
+            .filter(|value| *value >= 0)
+            .map(|value| value as u64)
+    })
 }
 
 impl PowerManager {

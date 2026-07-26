@@ -61,7 +61,8 @@ pub struct MetricsState {
 
 impl MetricsState {
     /// Synchronize metrics from the lock-free hot path buffer into this Mutex-protected state.
-    /// Establish p95/durations based on raw microsecond counters.
+    /// The rolling cycle history owns p95 in production; the lock-free last-cycle
+    /// sample is only a fallback for dry-run mode, which has no history.
     pub fn sync_from_lockfree(&mut self, lf: &crate::engine::lse_counters::MetricsSnapshot) {
         self.metrics.cycles = lf.cycles;
         // Action outcome totals are owned by ExecuteOutcomes/metrics_reporter
@@ -71,8 +72,11 @@ impl MetricsState {
         // mapping them here clobbers real action totals with zero during
         // periodic sync.
 
-        // Latency durations (convert us -> ms)
-        self.metrics.p95_cycle_ms = lf.cycle_time_us as f64 / 1000.0;
+        // `metrics_reporter` computes the real p95 from a 120-cycle window.
+        // Do not overwrite it every fifth cycle with this single latest sample.
+        if self.metrics.cycle_durations_ms.is_empty() {
+            self.metrics.p95_cycle_ms = lf.cycle_time_us as f64 / 1000.0;
+        }
         self.metrics.refresh_duration_ms = lf.refresh_duration_us as f64 / 1000.0;
         // Sprint 3 Phase B — flush restore_status_* counters from lf to runtime metrics.
         self.metrics.restore_status_missing = lf.restore_status_missing;
@@ -269,6 +273,8 @@ impl MetricsState {
         self.metrics.dedup_drops_throttle = lf.dedup_drops_throttle;
         self.metrics.dedup_drops_freeze = lf.dedup_drops_freeze;
         self.metrics.dedup_drops_unfreeze = lf.dedup_drops_unfreeze;
+        self.metrics.dedup_drops_boost = lf.dedup_drops_boost;
+        self.metrics.dedup_drops_thread_qos = lf.dedup_drops_thread_qos;
 
         // Sprint follow-up (2026-06-05) — Silent-telemetry-death fix.
         // Mirror the five LSE counters added in this sprint into

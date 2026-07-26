@@ -15,10 +15,11 @@ LABEL="com.eduardocortez.systemoptimizerd"
 ENTITLEMENTS="$ROOT_DIR/scripts/apollo-optimizerd.entitlements"
 
 cd "$ROOT_DIR"
+source scripts/hardware-build-profile.sh
 
 # ── Build ──────────────────────────────────────────────────────────────────
 echo "── Building release..."
-cargo build --release
+cargo build --release ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"}
 
 # ── Sign & install (same logic as install-root-daemon.sh) ──────────────────
 sign_binary() {

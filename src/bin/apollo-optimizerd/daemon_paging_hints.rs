@@ -46,11 +46,19 @@ pub fn run_paging_hints(
     foreground_app: Option<&str>,
     current_actions: &[RootAction],
     recovering_from_critical: bool,
-    recently_applied: &mut RecentlyApplied,
+    recently_applied: &RecentlyApplied,
     call_in_progress: bool,
     audio_active: bool,
+    pressure_send_supported: bool,
 ) -> Vec<RootAction> {
     let mut new_actions: Vec<RootAction> = Vec::new();
+
+    // Modern XNU builds may omit the legacy per-PID pressure-send sysctl.
+    // Stop at the source instead of scanning/sorting processes and dropping
+    // every generated action at the final dispatch chokepoint.
+    if !pressure_send_supported {
+        return new_actions;
+    }
 
     // ── Media safety guard ──────────────────────────────────────────────────
     // Never send paging hints during calls or audio playback — purging
@@ -108,6 +116,10 @@ pub fn run_paging_hints(
                     && !rejects_memorystatus_hint_by_name(&p.name)
             })
             .collect();
+        if bg_procs.len() > 3 {
+            bg_procs.select_nth_unstable_by(3, |a, b| b.rss_bytes.cmp(&a.rss_bytes));
+            bg_procs.truncate(3);
+        }
         bg_procs.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
         let mut added = 0usize;
         for proc in bg_procs.iter() {
@@ -120,7 +132,8 @@ pub fn run_paging_hints(
             // Cross-cycle state memory (SuperPlan Iter 6 2026-05-06):
             // SetMemorystatus -1 is a hint to the kernel — repeat hints for the
             // same PID across cycles get no-op'd at the syscall layer. Skip if
-            // we already hinted this PID within the TTL window.
+            // final dispatch admitted this PID within the TTL window. This
+            // producer does not record before the action survives all gates.
             if recently_applied.is_recent(proc.pid, CachedActionKind::SetMemorystatus) {
                 continue;
             }
@@ -141,7 +154,6 @@ pub fn run_paging_hints(
                     DecisionReason::MemoryBudget
                 },
             ));
-            recently_applied.record(proc.pid, CachedActionKind::SetMemorystatus);
             added += 1;
         }
     }
@@ -194,6 +206,10 @@ pub fn run_paging_hints(
                     && !rejects_memorystatus_hint_by_name(&p.name)
             })
             .collect();
+        if bg_procs.len() > 2 {
+            bg_procs.select_nth_unstable_by(2, |a, b| b.rss_bytes.cmp(&a.rss_bytes));
+            bg_procs.truncate(2);
+        }
         bg_procs.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
         let mut added = 0usize;
         for proc in bg_procs.iter() {
@@ -203,7 +219,7 @@ pub fn run_paging_hints(
             if hinted_pids_ode.contains(&proc.pid) {
                 continue;
             }
-            // Cross-cycle dedup (SuperPlan Iter 6).
+            // Read-only cross-cycle dedup; final dispatch owns recording.
             if recently_applied.is_recent(proc.pid, CachedActionKind::SetMemorystatus) {
                 continue;
             }
@@ -218,7 +234,6 @@ pub fn run_paging_hints(
                 ),
                 DecisionReason::MemoryBudget,
             ));
-            recently_applied.record(proc.pid, CachedActionKind::SetMemorystatus);
             added += 1;
         }
     }
@@ -388,11 +403,33 @@ mod tests {
             &mut recently_applied,
             false,
             false,
+            true,
         );
 
         assert!(
             actions.is_empty(),
             "Virtualization.framework VMs reject memorystatus; ODE hints must skip them"
         );
+    }
+
+    #[test]
+    fn unsupported_pressure_send_skips_hint_generation() {
+        let state = test_state();
+        let mut recently_applied = RecentlyApplied::new();
+        let procs = vec![proc_snapshot(1051, "background-worker", 1024)];
+        let actions = run_paging_hints(
+            &procs,
+            &state,
+            0.95,
+            500_000_000.0,
+            None,
+            &[],
+            false,
+            &mut recently_applied,
+            false,
+            false,
+            false,
+        );
+        assert!(actions.is_empty());
     }
 }

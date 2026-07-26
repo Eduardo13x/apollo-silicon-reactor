@@ -10,7 +10,9 @@
 use crate::engine::{
     hw_bayes::HwFeatures,
     llm::LearnedPolicy,
-    process_classifier::{score_utility, ProcessClassifier, ProcessSnapshot, ProcessTier},
+    process_classifier::{
+        score_utility, waste_score, ProcessClassifier, ProcessSnapshot, ProcessTier,
+    },
     silicon_probe::SiliconInfo,
     swap_reclaim::SwapRisk,
     user_profile::{UserProfile, WorkloadType},
@@ -207,6 +209,57 @@ impl AdaptiveGovernor {
         hw: Option<HwFeatures>,
         protected_pids: &std::collections::HashSet<u32>,
     ) -> Vec<ProcessDecision> {
+        self.decide_with_hw_and_protected_mode(
+            proc_snaps,
+            hunt_snaps,
+            foreground_app,
+            all_proc_names,
+            hour_of_day,
+            hw,
+            protected_pids,
+            true,
+        )
+    }
+
+    /// Production action pass. Protected PIDs have already been mediated by
+    /// the caller, so omit their no-op `Allow` records and their classifier
+    /// work. Use `decide_all_with_hw_and_protected` when a complete observable
+    /// list is required by diagnostics or external callers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_actionable_with_hw_and_protected(
+        &mut self,
+        proc_snaps: &[ProcessSnapshot],
+        hunt_snaps: &[HuntSnapshot],
+        foreground_app: Option<&str>,
+        all_proc_names: &[&str],
+        hour_of_day: u8,
+        hw: Option<HwFeatures>,
+        protected_pids: &std::collections::HashSet<u32>,
+    ) -> Vec<ProcessDecision> {
+        self.decide_with_hw_and_protected_mode(
+            proc_snaps,
+            hunt_snaps,
+            foreground_app,
+            all_proc_names,
+            hour_of_day,
+            hw,
+            protected_pids,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decide_with_hw_and_protected_mode(
+        &mut self,
+        proc_snaps: &[ProcessSnapshot],
+        hunt_snaps: &[HuntSnapshot],
+        foreground_app: Option<&str>,
+        all_proc_names: &[&str],
+        hour_of_day: u8,
+        hw: Option<HwFeatures>,
+        protected_pids: &std::collections::HashSet<u32>,
+        include_protected_observations: bool,
+    ) -> Vec<ProcessDecision> {
         // 1. Update user profile
         self.user_profile
             .observe(foreground_app, all_proc_names, hour_of_day);
@@ -245,22 +298,27 @@ impl AdaptiveGovernor {
         let workload = self.user_profile.current_workload();
 
         // 2. Find zombies first — they always get Kill/Suspend regardless of profile
-        let dead_weight = self.zombie_hunter.evaluate_all(hunt_snaps);
+        let mut dead_weight = self.zombie_hunter.evaluate_all(hunt_snaps);
+        dead_weight.retain(|candidate| !protected_pids.contains(&candidate.pid));
 
         // Build a set of PIDs that have already been sentenced by zombie hunter
         let zombie_pids: std::collections::HashSet<u32> =
             dead_weight.iter().map(|d| d.pid).collect();
 
         // 3. Classify & decide everything else
-        let classified = self.classifier.classify_all(proc_snaps);
+        let classified: Vec<(&ProcessSnapshot, ProcessTier, f32)> = proc_snaps
+            .iter()
+            .filter(|snap| include_protected_observations || !protected_pids.contains(&snap.pid))
+            .map(|snap| {
+                let tier = self.classifier.classify(snap);
+                let waste = waste_score(snap, tier);
+                (snap, tier, waste)
+            })
+            .collect();
 
         let mut decisions: Vec<ProcessDecision> = Vec::new();
 
         for (snap, tier, waste) in &classified {
-            if zombie_pids.contains(&snap.pid) {
-                continue; // Will be handled below
-            }
-
             if protected_pids.contains(&snap.pid) {
                 decisions.push(ProcessDecision {
                     pid: snap.pid,
@@ -274,6 +332,20 @@ impl AdaptiveGovernor {
                 continue;
             }
 
+            if zombie_pids.contains(&snap.pid) {
+                continue; // Will be handled below
+            }
+
+            // ProcessClassifier is stateless and can observe the normal,
+            // transient SZOMB interval between child exit and parent wait().
+            // ZombieHunter owns persistence confirmation; until it confirms
+            // this PID, do not act on or publish the provisional tier.
+            if *tier == ProcessTier::ZombieOrphan
+                && hunt_snaps.iter().any(|hunt| hunt.pid == snap.pid)
+            {
+                continue;
+            }
+
             let utility = score_utility(snap);
             let decision = self.decide_one(
                 snap,
@@ -281,7 +353,7 @@ impl AdaptiveGovernor {
                 utility,
                 *waste,
                 workload,
-                classified.len(),
+                proc_snaps.len(),
                 foreground_app,
                 hour_of_day,
             );
@@ -423,9 +495,12 @@ impl AdaptiveGovernor {
             return pd(d, utility, "Known telemetry/analytics process".into());
         }
 
-        // IPC hub protection: daemons with many Mach ports are serving other
-        // processes via XPC/MIG. Throttling them cascades into beachballs.
-        if snap.mach_port_count > 80 {
+        // IPC hub protection. GUI apps commonly own 50-500 Mach ports, while
+        // the same count on a headless daemon is a strong XPC/MIG service
+        // signal. Class-aware thresholds preserve service hubs without making
+        // every ordinary M4 application immune once the sensor is live.
+        let ipc_hub_threshold = if snap.has_gui_window { 500 } else { 80 };
+        if snap.mach_port_count > ipc_hub_threshold {
             return pd(
                 GovernorDecision::Allow,
                 utility,
@@ -668,7 +743,9 @@ impl AdaptiveGovernor {
         // ones degrade foreground responsiveness.
         // Swarm exemptions: high faults = active memory work (GPU, mmap I/O),
         // significant Mach ports (40+) = serving other processes via XPC.
-        let swarm_exempt = snap.faults_total > 500000 || snap.mach_port_count > 40;
+        let swarm_port_threshold = if snap.has_gui_window { 250 } else { 40 };
+        let swarm_exempt =
+            snap.faults_total > 500000 || snap.mach_port_count > swarm_port_threshold;
         if process_count > 30
             && waste >= 0.30
             && adjusted_utility < 0.55
@@ -958,6 +1035,77 @@ mod tests {
     }
 
     #[test]
+    fn actionable_pass_omits_preprotected_noop_records() {
+        let mut gov = governor();
+        let protected = std::collections::HashSet::from([77]);
+        let snaps = vec![
+            base_proc(77, "platform-worker"),
+            base_proc(78, "thirdparty-worker"),
+        ];
+        let decisions = gov.decide_actionable_with_hw_and_protected(
+            &snaps,
+            &no_hunts(),
+            None,
+            &["platform-worker", "thirdparty-worker"],
+            12,
+            None,
+            &protected,
+        );
+
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].pid, 78);
+    }
+
+    #[test]
+    fn protected_persistent_zombie_remains_allow_only_in_complete_view() {
+        let mut gov = governor();
+        let protected = std::collections::HashSet::from([77]);
+        let snap = ProcessSnapshot {
+            is_zombie: true,
+            ..base_proc(77, "platform-worker")
+        };
+        let hunt = HuntSnapshot {
+            pid: 77,
+            ppid: 1,
+            name: "platform-worker".into(),
+            is_kernel_zombie: true,
+            parent_alive: true,
+            has_gui_window: false,
+            rss_bytes: 10 * 1024 * 1024,
+            cpu_percent: 0.0,
+            wakeups_per_sec: 0.0,
+            secs_since_user_interaction: 0,
+            host_app_pid: None,
+            host_app_running: false,
+            host_app_absent_secs: 0,
+        };
+
+        for _ in 0..2 {
+            let _ = gov.decide_all_with_hw_and_protected(
+                std::slice::from_ref(&snap),
+                std::slice::from_ref(&hunt),
+                None,
+                &["platform-worker"],
+                12,
+                None,
+                &protected,
+            );
+        }
+        let decisions = gov.decide_all_with_hw_and_protected(
+            &[snap],
+            &[hunt],
+            None,
+            &["platform-worker"],
+            12,
+            None,
+            &protected,
+        );
+
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, GovernorDecision::Allow);
+    }
+
+    #[test]
     fn foreground_app_is_allowed() {
         let mut gov = governor();
         // When Safari is foreground, its process should be protected.
@@ -1031,7 +1179,7 @@ mod tests {
     fn high_mach_port_count_is_protected() {
         let mut gov = governor();
         let snap = ProcessSnapshot {
-            mach_port_count: 100, // > 80 threshold
+            mach_port_count: 600, // > 500 threshold
             secs_since_foreground: 5000,
             ..base_proc(400, "ipc-hub-daemon")
         };
@@ -1244,7 +1392,40 @@ mod tests {
             pid: 999,
             ..base_proc(999, "orphaned-helper")
         };
-        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 14);
+        let hunt = HuntSnapshot {
+            pid: 999,
+            ppid: 500,
+            name: "orphaned-helper".into(),
+            is_kernel_zombie: false,
+            parent_alive: false,
+            has_gui_window: false,
+            rss_bytes: 10 * 1024 * 1024,
+            cpu_percent: 0.0,
+            wakeups_per_sec: 0.0,
+            secs_since_user_interaction: 0,
+            host_app_pid: None,
+            host_app_running: false,
+            host_app_absent_secs: 0,
+        };
+        assert!(gov
+            .decide_all(
+                std::slice::from_ref(&snap),
+                std::slice::from_ref(&hunt),
+                None,
+                &[],
+                14
+            )
+            .is_empty());
+        assert!(gov
+            .decide_all(
+                std::slice::from_ref(&snap),
+                std::slice::from_ref(&hunt),
+                None,
+                &[],
+                14
+            )
+            .is_empty());
+        let decisions = gov.decide_all(&[snap], &[hunt], None, &[], 14);
         assert_eq!(decisions.len(), 1);
         assert_eq!(
             decisions[0].decision,

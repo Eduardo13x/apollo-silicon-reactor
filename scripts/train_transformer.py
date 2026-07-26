@@ -7,17 +7,17 @@ Trains a small self-supervised Transformer on telemetry data collected by
 Apollo's TelemetryLogger.  The model learns to predict the next system
 state vector given the previous 120 observations (60 seconds at 500ms/cycle).
 
-At inference time (inside the Rust daemon via tract-onnx), high reconstruction
-error signals anomalous system behaviour that none of Apollo's existing
-univariate models captured.
+The exported model is intended for a future CoreML/ONNX daemon runtime. The
+current Rust daemon does not load it yet, so the retraining LaunchDaemon must
+not be enabled until that consumer and its health metrics are wired.
 
 The script uses a **data maturity system** that adapts training strategy
 based on how much diverse, quality data is available:
 
   - Immature  (< 7 days):  don't train — not enough diversity
   - Juvenile  (7–14 days): train with high regularisation, provisional model
-  - Stable    (14–28 days): full training, reliable model
-  - Mature    (28+ days):   full training, skip if < 20% new data since last run
+  - Stable    (~14–70 days): full training, provisional temporal model
+  - Mature    (~70+ days):   10x sample/parameter target, skip if <20% new data
 
 Architecture
 ------------
@@ -76,13 +76,14 @@ FEATURE_NAMES = [
 # Based on ~144 periodic dumps/day + event dumps.
 # Bishop 2006 10x rule: 120K params → need ≥1.2M training samples.
 # With sliding window over 240-vector dumps:
-#   1000 dumps × 240 vectors = 240K vectors → 240K - 120 = ~240K sequences
-#   5000 dumps × 240 vectors = 1.2M vectors → 1.2M sequences (10x rule met)
+#   Each independent 240-vector dump yields 120 valid 120-step windows.
+#   1000 dumps → 120K sequences (roughly one sequence per parameter)
+#   10000 dumps → 1.2M sequences (10x rule met, about 70 active days)
 
 # Periodic dumps = 6/hour × 24h = 144/day.  Plus event dumps.
 MATURITY_IMMATURE_FILES = 400       # ~3 days of active use
 MATURITY_JUVENILE_FILES = 1000      # ~7 days of active use — train with caution
-MATURITY_STABLE_FILES   = 2500      # ~18 days of active use — reliable training
+MATURITY_STABLE_FILES   = 10000     # ~70 days of active use — 10x sample/parameter maturity
 MATURITY_SKIP_NEW_PCT   = 0.20      # mature: skip if < 20% new data
 
 
@@ -119,8 +120,13 @@ def load_bin_file(path: Path) -> tuple[np.ndarray | None, dict]:
     return arr, meta
 
 
-def load_dataset(data_dir: Path) -> tuple[np.ndarray, list[dict]]:
-    """Load all .bin files, return (data_array, metadata_list)."""
+def load_dataset(data_dir: Path) -> tuple[np.ndarray, list[dict], list[np.ndarray]]:
+    """Load telemetry dumps and retain their file boundaries.
+
+    Dumps are independent ring-buffer snapshots separated by minutes. Keeping
+    them separate prevents a training window from joining the tail of one dump
+    to the head of another and inventing a system transition that never occurred.
+    """
     arrays = []
     metas = []
     bin_files = sorted(data_dir.glob("*.bin"))
@@ -140,11 +146,15 @@ def load_dataset(data_dir: Path) -> tuple[np.ndarray, list[dict]]:
 
     combined = np.concatenate(arrays, axis=0)
     print(f"Loaded {len(arrays)} files, {len(combined):,} total vectors")
-    return combined, metas
+    return combined, metas, arrays
 
 
 def make_sequences(data: np.ndarray, seq_len: int = SEQ_LEN) -> tuple:
-    """Slide a window over the data to create (input, target) pairs."""
+    """Materialize windows for small tests and diagnostics only.
+
+    Production training uses a lazy Dataset below. Materializing all windows
+    scales as O(vectors * seq_len) memory and can exceed RAM on a mature model.
+    """
     n = len(data) - seq_len
     if n <= 0:
         print("[ERROR] not enough data for even one sequence", file=sys.stderr)
@@ -158,6 +168,11 @@ def make_sequences(data: np.ndarray, seq_len: int = SEQ_LEN) -> tuple:
         Y[i] = data[i + 1 : i + seq_len + 1]
 
     return X, Y
+
+
+def sequence_count(arrays: list[np.ndarray], seq_len: int = SEQ_LEN) -> int:
+    """Number of valid next-state windows without crossing dump boundaries."""
+    return sum(max(0, len(array) - seq_len) for array in arrays)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -268,12 +283,19 @@ def build_model(n_features: int = N_FEATURES, d_model: int = 64,
             )
             self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
             self.head = nn.Linear(d_model, n_features)
+            causal_mask = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf")), diagonal=1
+            )
+            self.register_buffer("causal_mask", causal_mask, persistent=False)
 
         def forward(self, x):
             seq_len_actual = x.shape[1]
             pos_ids = torch.arange(seq_len_actual, device=x.device)
             h = self.embed(x) + self.pos(pos_ids)
-            h = self.encoder(h)
+            # Predict x[t+1] using only x[:t+1]. Without this mask the target
+            # is already visible at position t+1 and anomaly error collapses.
+            mask = self.causal_mask[:seq_len_actual, :seq_len_actual]
+            h = self.encoder(h, mask=mask)
             return self.head(h)
 
     model = ApolloTransformer()
@@ -282,11 +304,40 @@ def build_model(n_features: int = N_FEATURES, d_model: int = 64,
     return model
 
 
-def train(model, X: np.ndarray, Y: np.ndarray, epochs: int = 50,
+def train(model, arrays: list[np.ndarray], seq_len: int = SEQ_LEN, epochs: int = 50,
           batch_size: int = 64, lr: float = 1e-3, val_split: float = 0.2):
-    """Train with AdamW + cosine annealing on MPS/CPU."""
+    """Train with AdamW + cosine annealing on MPS/CPU.
+
+    Windows are sliced lazily per batch. This keeps memory proportional to the
+    raw telemetry plus one batch instead of allocating two multi-gigabyte
+    [samples, sequence, features] tensors.
+    """
+    import bisect
     import torch
-    from torch.utils.data import TensorDataset, DataLoader
+    from torch.utils.data import DataLoader, Dataset, Subset
+
+    class TelemetryWindowDataset(Dataset):
+        def __init__(self, source_arrays):
+            self.arrays = [a for a in source_arrays if len(a) > seq_len]
+            self.ends = []
+            total = 0
+            for array in self.arrays:
+                total += len(array) - seq_len
+                self.ends.append(total)
+
+        def __len__(self):
+            return self.ends[-1] if self.ends else 0
+
+        def __getitem__(self, index):
+            file_index = bisect.bisect_right(self.ends, index)
+            previous_end = 0 if file_index == 0 else self.ends[file_index - 1]
+            offset = index - previous_end
+            array = self.arrays[file_index]
+            # Copies are batch-bounded and make the tensors writable for
+            # PyTorch without retaining the complete source buffer.
+            x = np.array(array[offset : offset + seq_len], copy=True)
+            y = np.array(array[offset + 1 : offset + seq_len + 1], copy=True)
+            return torch.from_numpy(x), torch.from_numpy(y)
 
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -297,14 +348,27 @@ def train(model, X: np.ndarray, Y: np.ndarray, epochs: int = 50,
 
     model = model.to(device)
 
-    # Temporal train/val split (no shuffling across time).
-    n_val = int(len(X) * val_split)
-    n_train = len(X) - n_val
-    X_train, Y_train = X[:n_train], Y[:n_train]
-    X_val, Y_val = X[n_train:], Y[n_train:]
+    # Split by whole dump files so validation cannot share overlapping ring
+    # windows with training. A one-file manual run falls back to an ordered
+    # sequence split while automatic mode always has hundreds of files.
+    if len(arrays) >= 2:
+        split_file = max(1, min(len(arrays) - 1, int(len(arrays) * (1.0 - val_split))))
+        train_ds = TelemetryWindowDataset(arrays[:split_file])
+        val_ds = TelemetryWindowDataset(arrays[split_file:])
+    else:
+        full_ds = TelemetryWindowDataset(arrays)
+        n_val = max(1, int(len(full_ds) * val_split))
+        n_train = len(full_ds) - n_val
+        train_ds = Subset(full_ds, range(n_train))
+        val_ds = Subset(full_ds, range(n_train, len(full_ds)))
 
-    train_ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(Y_train))
-    val_ds = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(Y_val))
+    n_train = len(train_ds)
+    n_val = len(val_ds)
+    if n_train == 0 or n_val == 0:
+        raise ValueError(
+            f"not enough within-dump windows for train/validation: "
+            f"train={n_train}, val={n_val}, seq_len={seq_len}"
+        )
 
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
@@ -465,7 +529,7 @@ def main():
         print("[AUTO] No telemetry data yet, exiting")
         sys.exit(0)
 
-    data, metas = load_dataset(args.data_dir)
+    data, metas, arrays = load_dataset(args.data_dir)
     quality = assess_data_quality(data, metas)
     print_quality_report(quality)
 
@@ -524,10 +588,10 @@ def main():
     mean = data.mean(axis=0)
     std = data.std(axis=0)
     std[std < 1e-8] = 1.0
-    data_norm = (data - mean) / std
+    arrays_norm = [((array - mean) / std).astype(np.float32, copy=False) for array in arrays]
 
-    X, Y = make_sequences(data_norm, seq_len=args.seq_len)
-    print(f"Sequences: {len(X):,} samples of length {args.seq_len}")
+    n_sequences = sequence_count(arrays_norm, seq_len=args.seq_len)
+    print(f"Sequences: {n_sequences:,} within-dump samples of length {args.seq_len}")
 
     # ── Build model + warm-start ─────────────────────────────────────────
     import torch
@@ -550,7 +614,7 @@ def main():
             print(f"[WARN] Could not load checkpoint: {e}, training from scratch")
 
     # ── Train ────────────────────────────────────────────────────────────
-    model, best_val_loss = train(model, X, Y, epochs=epochs,
+    model, best_val_loss = train(model, arrays_norm, seq_len=args.seq_len, epochs=epochs,
                                  batch_size=args.batch_size, lr=lr)
 
     # ── Save checkpoint ──────────────────────────────────────────────────
@@ -576,7 +640,7 @@ def main():
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "n_files": quality["n_files"],
             "n_vectors": quality["n_vectors"],
-            "n_sequences": len(X),
+            "n_sequences": n_sequences,
             "maturity": maturity,
             "warm_start": warm_started,
             "epochs_used": epochs,

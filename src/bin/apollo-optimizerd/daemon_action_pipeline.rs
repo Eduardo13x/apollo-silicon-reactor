@@ -23,11 +23,12 @@
 //!    Evaluated in this order (observe_only takes precedence).
 //! 4. **Mode filter** — `Emergency`/`Observe`/`Conservative`/`Full`
 //!    each keep a specific allowed-action set.
-//! 5. **Throttle dedup** — skip `ThrottleProcess` for PIDs already
-//!    throttled last cycle (prevents journal I/O saturation).
-//! 6. **Causal QoS upgrade** — [Pearl 2009 §3] FreezeProcess →
+//! 5. **Causal QoS upgrade** — [Pearl 2009 §3] FreezeProcess →
 //!    ThrottleProcess(aggressive) for CPU-dominant processes evidenced
 //!    by the causal graph.
+//! 6. **Throttle dedup** — skip `ThrottleProcess` for PIDs already
+//!    throttled last cycle (prevents journal I/O saturation). This runs
+//!    after causal upgrades so rewritten freezes cannot bypass it.
 //!
 //! ## Lock invariant
 //!
@@ -79,6 +80,63 @@ pub struct FilterOutcome {
 /// hot loop, so there's no contention — the Mutex is just for
 /// static-init safety.
 static PREV_THROTTLED: std::sync::Mutex<Option<HashSet<u32>>> = std::sync::Mutex::new(None);
+
+fn upgrade_causal_qos_actions(
+    actions: Vec<RootAction>,
+    causal_qos_names: &HashSet<String>,
+) -> (Vec<RootAction>, u32) {
+    if causal_qos_names.is_empty() {
+        return (actions, 0);
+    }
+
+    let mut upgrades = 0u32;
+    let actions = actions
+        .into_iter()
+        .map(|action| match action {
+            RootAction::FreezeProcess {
+                pid,
+                name,
+                reason,
+                start_sec,
+                start_usec,
+                decision_reason,
+            } if causal_qos_names.contains(name.as_str()) => {
+                upgrades += 1;
+                RootAction::ThrottleProcess {
+                    pid,
+                    name,
+                    aggressive: true,
+                    reason: format!("{} [causal:qos]", reason),
+                    start_sec,
+                    start_usec,
+                    decision_reason,
+                }
+            }
+            other => other,
+        })
+        .collect();
+
+    (actions, upgrades)
+}
+
+fn dedup_throttle_actions(
+    actions: Vec<RootAction>,
+    previous: &HashSet<u32>,
+) -> (Vec<RootAction>, HashSet<u32>) {
+    let mut this_cycle = HashSet::new();
+    let actions = actions
+        .into_iter()
+        .filter(|action| {
+            if let RootAction::ThrottleProcess { pid, .. } = action {
+                this_cycle.insert(*pid);
+                !previous.contains(pid)
+            } else {
+                true
+            }
+        })
+        .collect();
+    (actions, this_cycle)
+}
 
 /// Run the filter pipeline.
 ///
@@ -202,64 +260,28 @@ pub fn run_filter_pipeline(
         final_actions
     };
 
-    // ── ThrottleProcess dedup ────────────────────────────────────
-    // Without this, decide_actions re-throttles 30+ PIDs every cycle,
-    // each producing a journal write → I/O saturation → system freeze.
-    let filtered_actions = {
-        let prev = PREV_THROTTLED.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_set = prev.clone().unwrap_or_default();
-        drop(prev);
-        let mut this_cycle = HashSet::new();
-        let deduped: Vec<RootAction> = filtered_actions
-            .into_iter()
-            .filter(|a| {
-                if let RootAction::ThrottleProcess { pid, .. } = a {
-                    this_cycle.insert(*pid);
-                    !prev_set.contains(pid)
-                } else {
-                    true
-                }
-            })
-            .collect();
-        *PREV_THROTTLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(this_cycle);
-        deduped
-    };
-
     // ── Causal QoS upgrade ───────────────────────────────────────
     // FreezeProcess → ThrottleProcess for CPU-dominant processes.
+    // This must precede throttle dedup: otherwise every converted freeze is
+    // invisible to PREV_THROTTLED and repeats its Mach calls and journal entry.
     // No-op when `causal_qos_names` is empty (cold start or no
     // CPU-dominant evidence yet — defaults to the safe SIGSTOP path).
     // [Pearl 2009 §3] mediation analysis
     // [Nygard 2018] bulkhead: least-invasive first
-    let mut causal_qos_upgrades: u32 = 0;
-    let filtered_actions: Vec<RootAction> = if !causal_qos_names.is_empty() {
-        filtered_actions
-            .into_iter()
-            .map(|a| match a {
-                RootAction::FreezeProcess {
-                    pid,
-                    name,
-                    reason,
-                    start_sec,
-                    start_usec,
-                    decision_reason,
-                } if causal_qos_names.contains(name.as_str()) => {
-                    causal_qos_upgrades += 1;
-                    RootAction::ThrottleProcess {
-                        pid,
-                        name,
-                        aggressive: true,
-                        reason: format!("{} [causal:qos]", reason),
-                        start_sec,
-                        start_usec,
-                        decision_reason,
-                    }
-                }
-                other => other,
-            })
-            .collect()
-    } else {
-        filtered_actions
+    let (filtered_actions, causal_qos_upgrades) =
+        upgrade_causal_qos_actions(filtered_actions, causal_qos_names);
+
+    // Throttle dedup must see both native and causally upgraded throttles.
+    // Without this, recurring proposals repeat Mach calls and journal writes.
+    let filtered_actions = {
+        let previous = PREV_THROTTLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default();
+        let (deduped, this_cycle) = dedup_throttle_actions(filtered_actions, &previous);
+        *PREV_THROTTLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(this_cycle);
+        deduped
     };
 
     FilterOutcome {
@@ -267,5 +289,60 @@ pub fn run_filter_pipeline(
         cb_is_open,
         op_mode,
         causal_qos_upgrades,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apollo_engine::engine::audit_types::DecisionReason;
+
+    fn freeze(pid: u32, name: &str) -> RootAction {
+        RootAction::freeze_full(
+            pid,
+            name.to_string(),
+            "pressure candidate",
+            10,
+            20,
+            DecisionReason::PressureContext,
+        )
+    }
+
+    #[test]
+    fn causal_qos_upgrade_runs_before_throttle_dedup() {
+        let names = HashSet::from(["background-worker".to_string()]);
+        let (upgraded, count) =
+            upgrade_causal_qos_actions(vec![freeze(42, "background-worker")], &names);
+
+        assert_eq!(count, 1);
+        assert!(matches!(
+            upgraded.as_slice(),
+            [RootAction::ThrottleProcess {
+                pid: 42,
+                aggressive: true,
+                ..
+            }]
+        ));
+
+        let previous = HashSet::from([42]);
+        let (deduped, proposed_this_cycle) = dedup_throttle_actions(upgraded, &previous);
+        assert!(deduped.is_empty(), "converted throttle must respect dedup");
+        assert!(
+            proposed_this_cycle.contains(&42),
+            "dedup state must remember recurring proposals"
+        );
+    }
+
+    #[test]
+    fn causal_qos_upgrade_leaves_unmatched_freeze_unchanged() {
+        let names = HashSet::from(["other-worker".to_string()]);
+        let (actions, count) =
+            upgrade_causal_qos_actions(vec![freeze(7, "background-worker")], &names);
+
+        assert_eq!(count, 0);
+        assert!(matches!(
+            actions.as_slice(),
+            [RootAction::FreezeProcess { pid: 7, .. }]
+        ));
     }
 }

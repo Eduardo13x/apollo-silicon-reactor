@@ -306,13 +306,17 @@ impl EnergyTracker {
             })
             .collect();
 
-        entries.sort_by(|a, b| {
+        let by_current_watts = |a: &AppEnergy, b: &AppEnergy| {
             b.current_watts
                 .partial_cmp(&a.current_watts)
                 .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        };
 
-        entries.truncate(n);
+        if entries.len() > n {
+            entries.select_nth_unstable_by(n, by_current_watts);
+            entries.truncate(n);
+        }
+        entries.sort_by(by_current_watts);
         entries
     }
 
@@ -983,6 +987,11 @@ mod tests {
 
         let top5 = tracker.top_consumers(5);
         assert_eq!(top5.len(), 5);
+        assert!(top5
+            .windows(2)
+            .all(|pair| pair[0].current_watts >= pair[1].current_watts));
+
+        assert!(tracker.top_consumers(0).is_empty());
 
         let top100 = tracker.top_consumers(100);
         assert_eq!(top100.len(), 20);

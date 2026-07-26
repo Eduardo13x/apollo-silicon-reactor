@@ -2,8 +2,8 @@
 //!
 //! Actions are classified into three priority tiers:
 //!  - **Urgent**: Unfreeze / emergency — always execute first, no cap.
-//!  - **Normal**: Freeze / Throttle / Boost — execute up to `max_per_cycle`.
-//!  - **Background**: QoS hints, Sysctl, Spotlight — best-effort remainder.
+//!  - **Normal**: Freeze / Throttle / Boost and latency/anomaly thread QoS.
+//!  - **Background**: background-thread QoS, Sysctl, Spotlight.
 //!
 //! `drain_cycle()` returns at most `max_per_cycle` actions per call, draining
 //! urgent first, then filling from normal, then background. This prevents a
@@ -12,9 +12,30 @@
 //! `backpressure_ratio()` reports queue saturation [0.0, 1.0] for runtime
 //! observability and adaptive aggressiveness decisions.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
+use crate::engine::recently_applied::CachedActionKind;
 use crate::engine::types::RootAction;
+
+type PendingPidKey = (u32, CachedActionKind, u32);
+
+fn pending_pid_key(action: &RootAction) -> Option<PendingPidKey> {
+    match action {
+        RootAction::SetThreadQoS {
+            pid, thread_index, ..
+        } => Some((*pid, CachedActionKind::SetThreadQoS, *thread_index)),
+        _ => CachedActionKind::from_root_action(action),
+    }
+}
+
+fn thread_qos_rank(action: &RootAction) -> u8 {
+    match action {
+        RootAction::SetThreadQoS { tier, .. } if tier == "interactive" => 3,
+        RootAction::SetThreadQoS { tier, .. } if tier == "background" => 1,
+        RootAction::SetThreadQoS { .. } => 2,
+        _ => 0,
+    }
+}
 
 // ── Priority classification ────────────────────────────────────────────────
 
@@ -35,6 +56,10 @@ pub fn action_priority(action: &RootAction) -> ActionPriority {
         RootAction::FreezeProcess { .. }
         | RootAction::ThrottleProcess { .. }
         | RootAction::BoostProcess { .. } => ActionPriority::Normal,
+        // Interactive promotions and runaway-thread utility demotions are
+        // latency/anomaly control, not maintenance hints. Keeping all thread
+        // QoS in Background let a sustained normal-action stream starve them.
+        RootAction::SetThreadQoS { tier, .. } if tier != "background" => ActionPriority::Normal,
         RootAction::SetSysctl(_)
         | RootAction::SetMemorystatus { .. }
         | RootAction::ToggleSpotlight { .. }
@@ -62,25 +87,36 @@ pub struct ActionQueue {
     normal: VecDeque<RootAction>,
     /// Background tier: QoS hints, sysctl, spotlight.
     background: VecDeque<RootAction>,
+    /// Per-PID actions already waiting in any tier. Cross-cycle dedup belongs
+    /// here: an admitted action is not "recently applied" until its syscall
+    /// succeeds, but repeated producers must not fill the queue meanwhile.
+    pending_pid_keys: HashMap<PendingPidKey, u8>,
     /// Maximum actions dispatched per cycle (backpressure gate).
     /// Urgent actions are *not* counted against this limit.
     max_per_cycle: usize,
-    /// Capacity for normal + background combined (soft cap for backpressure_ratio).
+    /// Hard capacity for normal + background combined. Urgent actions bypass it.
     capacity: usize,
+    /// Non-urgent actions rejected because no queue slot was available.
+    capacity_drops: u64,
+    /// Background actions evicted to admit higher-priority normal work.
+    background_evictions: u64,
 }
 
 impl ActionQueue {
     /// Create a new queue with the given per-cycle dispatch limit.
     ///
     /// `max_per_cycle`: typical value 10–20 for a 30s daemon cycle.
-    /// `capacity`: soft cap used to compute `backpressure_ratio` (e.g. 100).
+    /// `capacity`: hard cap for delayed normal/background work (e.g. 100).
     pub fn new(max_per_cycle: usize, capacity: usize) -> Self {
         Self {
             urgent: VecDeque::new(),
             normal: VecDeque::new(),
             background: VecDeque::new(),
+            pending_pid_keys: HashMap::with_capacity(capacity.min(512)),
             max_per_cycle,
             capacity,
+            capacity_drops: 0,
+            background_evictions: 0,
         }
     }
 
@@ -97,18 +133,65 @@ impl ActionQueue {
     }
 
     /// Push a single action into the appropriate priority tier.
-    pub fn push(&mut self, action: RootAction) {
-        match action_priority(&action) {
+    pub fn push(&mut self, action: RootAction) -> bool {
+        let pending_key = pending_pid_key(&action);
+        if let Some(key) = pending_key {
+            let new_rank = thread_qos_rank(&action);
+            if let Some(existing_rank) = self.pending_pid_keys.get(&key).copied() {
+                if key.1 != CachedActionKind::SetThreadQoS || new_rank <= existing_rank {
+                    return false;
+                }
+                // A latency-sensitive promotion supersedes a queued demotion
+                // for the same thread, regardless of which tier held it.
+                self.urgent
+                    .retain(|queued| pending_pid_key(queued) != Some(key));
+                self.normal
+                    .retain(|queued| pending_pid_key(queued) != Some(key));
+                self.background
+                    .retain(|queued| pending_pid_key(queued) != Some(key));
+                self.pending_pid_keys.remove(&key);
+            }
+        }
+
+        let priority = action_priority(&action);
+        if priority != ActionPriority::Urgent
+            && self.normal.len() + self.background.len() >= self.capacity
+        {
+            if priority == ActionPriority::Normal {
+                if let Some(evicted) = self.background.pop_back() {
+                    self.release_pending_key(&evicted);
+                    self.background_evictions = self.background_evictions.saturating_add(1);
+                } else {
+                    self.capacity_drops = self.capacity_drops.saturating_add(1);
+                    return false;
+                }
+            } else {
+                self.capacity_drops = self.capacity_drops.saturating_add(1);
+                return false;
+            }
+        }
+
+        if let Some(key) = pending_key {
+            self.pending_pid_keys.insert(key, thread_qos_rank(&action));
+        }
+        match priority {
             ActionPriority::Urgent => self.urgent.push_back(action),
             ActionPriority::Normal => self.normal.push_back(action),
             ActionPriority::Background => self.background.push_back(action),
         }
+        true
     }
 
     /// Push all actions from a `Vec` into the queue in order.
     pub fn push_all(&mut self, actions: Vec<RootAction>) {
         for a in actions {
-            self.push(a);
+            let _ = self.push(a);
+        }
+    }
+
+    fn release_pending_key(&mut self, action: &RootAction) {
+        if let Some(key) = pending_pid_key(action) {
+            self.pending_pid_keys.remove(&key);
         }
     }
 
@@ -125,6 +208,7 @@ impl ActionQueue {
 
         // 1. Drain all urgent actions unconditionally.
         while let Some(a) = self.urgent.pop_front() {
+            self.release_pending_key(&a);
             out.push(a);
         }
 
@@ -133,6 +217,7 @@ impl ActionQueue {
         while budget > 0 {
             match self.normal.pop_front() {
                 Some(a) => {
+                    self.release_pending_key(&a);
                     out.push(a);
                     budget -= 1;
                 }
@@ -144,6 +229,7 @@ impl ActionQueue {
         while budget > 0 {
             match self.background.pop_front() {
                 Some(a) => {
+                    self.release_pending_key(&a);
                     out.push(a);
                     budget -= 1;
                 }
@@ -192,6 +278,16 @@ impl ActionQueue {
     pub fn background_len(&self) -> usize {
         self.background.len()
     }
+
+    /// Cumulative non-urgent actions rejected at the hard capacity limit.
+    pub fn capacity_drops(&self) -> u64 {
+        self.capacity_drops
+    }
+
+    /// Cumulative background actions displaced by normal-priority work.
+    pub fn background_evictions(&self) -> u64 {
+        self.background_evictions
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -207,6 +303,8 @@ mod tests {
             name: format!("proc{}", pid),
             reason: "test".to_string(),
             decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
         }
     }
 
@@ -239,6 +337,20 @@ mod tests {
             start_sec: 0,
             start_usec: 0,
             decision_reason: DecisionReason::PressureContext,
+        }
+    }
+
+    fn make_thread_qos(pid: u32, tier: &str) -> RootAction {
+        RootAction::SetThreadQoS {
+            pid,
+            name: format!("proc{}", pid),
+            thread_index: 1,
+            tier: tier.to_string(),
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::ThreadQoSRouting,
+            affinity_tag: None,
+            start_sec: 0,
+            start_usec: 0,
         }
     }
 
@@ -279,12 +391,14 @@ mod tests {
     }
 
     #[test]
-    fn backpressure_ratio_caps_at_one() {
+    fn backpressure_ratio_reaches_one_at_hard_capacity() {
         let mut q = ActionQueue::new(2, 3);
         for i in 0..10 {
             q.push(make_throttle(i));
         }
         assert_eq!(q.backpressure_ratio(), 1.0);
+        assert_eq!(q.normal_len(), 3);
+        assert_eq!(q.capacity_drops(), 7);
     }
 
     #[test]
@@ -339,8 +453,118 @@ mod tests {
     }
 
     #[test]
+    fn latency_and_anomaly_thread_qos_cannot_starve_in_background() {
+        assert_eq!(
+            action_priority(&make_thread_qos(1, "interactive")),
+            ActionPriority::Normal
+        );
+        assert_eq!(
+            action_priority(&make_thread_qos(2, "utility")),
+            ActionPriority::Normal
+        );
+        assert_eq!(
+            action_priority(&make_thread_qos(3, "background")),
+            ActionPriority::Background
+        );
+    }
+
+    #[test]
     fn empty_drain_returns_empty_vec() {
         let mut q = ActionQueue::new(10, 100);
         assert!(q.drain_cycle().is_empty());
+    }
+
+    #[test]
+    fn duplicate_pid_action_is_not_queued_twice() {
+        let mut q = ActionQueue::new(10, 100);
+        assert!(q.push(make_throttle(42)));
+        assert!(!q.push(make_throttle(42)));
+        assert_eq!(q.normal_len(), 1);
+    }
+
+    #[test]
+    fn drained_pid_action_can_be_queued_again() {
+        let mut q = ActionQueue::new(10, 100);
+        assert!(q.push(make_throttle(42)));
+        assert_eq!(q.drain_cycle().len(), 1);
+        assert!(q.push(make_throttle(42)));
+        assert_eq!(q.normal_len(), 1);
+    }
+
+    #[test]
+    fn thread_qos_dedup_is_scoped_to_thread_index() {
+        let mut first = make_thread_qos(42, "interactive");
+        let mut second = make_thread_qos(42, "interactive");
+        if let RootAction::SetThreadQoS { thread_index, .. } = &mut first {
+            *thread_index = 1;
+        }
+        if let RootAction::SetThreadQoS { thread_index, .. } = &mut second {
+            *thread_index = 2;
+        }
+
+        let mut q = ActionQueue::new(10, 100);
+        assert!(q.push(first));
+        assert!(q.push(second));
+        assert_eq!(q.normal_len(), 2);
+    }
+
+    #[test]
+    fn interactive_thread_qos_replaces_pending_background_route() {
+        let mut q = ActionQueue::new(10, 100);
+        assert!(q.push(make_thread_qos(42, "background")));
+        assert!(q.push(make_thread_qos(42, "interactive")));
+        assert_eq!(q.background_len(), 0);
+        assert_eq!(q.normal_len(), 1);
+
+        let drained = q.drain_cycle();
+        assert!(matches!(
+            &drained[0],
+            RootAction::SetThreadQoS { tier, .. } if tier == "interactive"
+        ));
+    }
+
+    #[test]
+    fn background_thread_qos_cannot_replace_pending_interactive_route() {
+        let mut q = ActionQueue::new(10, 100);
+        assert!(q.push(make_thread_qos(42, "interactive")));
+        assert!(!q.push(make_thread_qos(42, "background")));
+        assert_eq!(q.normal_len(), 1);
+        assert_eq!(q.background_len(), 0);
+    }
+
+    #[test]
+    fn normal_work_evicts_background_at_capacity() {
+        let mut q = ActionQueue::new(10, 2);
+        assert!(q.push(make_sysctl("first")));
+        assert!(q.push(make_sysctl("second")));
+        assert!(q.push(make_throttle(42)));
+
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.normal_len(), 1);
+        assert_eq!(q.background_len(), 1);
+        assert_eq!(q.background_evictions(), 1);
+        assert_eq!(q.capacity_drops(), 0);
+    }
+
+    #[test]
+    fn evicted_pid_key_can_be_queued_again() {
+        let mut q = ActionQueue::new(10, 1);
+        assert!(q.push(make_thread_qos(42, "background")));
+        assert!(q.push(make_throttle(7)));
+        assert_eq!(q.drain_cycle().len(), 1);
+        assert!(q.push(make_thread_qos(42, "interactive")));
+
+        assert_eq!(q.normal_len(), 1);
+        assert_eq!(q.background_len(), 0);
+        assert_eq!(q.background_evictions(), 1);
+    }
+
+    #[test]
+    fn urgent_work_bypasses_zero_capacity() {
+        let mut q = ActionQueue::new(10, 0);
+        assert!(!q.push(make_throttle(1)));
+        assert!(q.push(make_unfreeze(1)));
+        assert_eq!(q.urgent_len(), 1);
+        assert_eq!(q.capacity_drops(), 1);
     }
 }

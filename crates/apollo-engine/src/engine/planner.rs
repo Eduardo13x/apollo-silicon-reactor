@@ -301,10 +301,9 @@ impl TrendWindow {
         }
         let mut agreements = 0usize;
         let mut transitions = 0usize;
-        // Note: f64::signum returns ±1.0 even for 0.0 (not 0). Use abs
-        // against epsilon to detect zero-slope before computing the
-        // sign — otherwise oscillating series with net-zero slope are
-        // mis-classified as having a meaningful direction.
+        // `f64::signum()` reports +1.0 for +0.0. Guard both the overall
+        // slope and each local delta so flat intervals cannot inflate only
+        // positive-trend confidence.
         let overall = self.slope(&field);
         if overall.abs() < f64::EPSILON {
             return 0.0;
@@ -314,7 +313,7 @@ impl TrendWindow {
         for w in pairs.windows(2) {
             let local = field(&w[1].1) - field(&w[0].1);
             transitions += 1;
-            if local.signum() == overall_sign {
+            if local.abs() >= f64::EPSILON && local.signum() == overall_sign {
                 agreements += 1;
             }
         }
@@ -671,6 +670,26 @@ mod tests {
         let s = w.steadiness(|o| o.memory_pressure);
         // Overall slope is exactly 0 → steadiness returns 0 by contract.
         assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn flat_intervals_do_not_inflate_positive_trend_confidence() {
+        let t0 = Utc::now();
+        let mut rising = TrendWindow::new(10);
+        let mut falling = TrendWindow::new(10);
+        for (i, (up, down)) in [(0.4, 0.5), (0.4, 0.5), (0.4, 0.5), (0.5, 0.4)]
+            .into_iter()
+            .enumerate()
+        {
+            let ts = t0 + ChronoDuration::seconds(i as i64 * 30);
+            rising.push(ts, obs(up, 0.0, 0.0));
+            falling.push(ts, obs(down, 0.0, 0.0));
+        }
+
+        let rising_confidence = rising.steadiness(|o| o.memory_pressure);
+        let falling_confidence = falling.steadiness(|o| o.memory_pressure);
+        assert!((rising_confidence - 1.0 / 3.0).abs() < f32::EPSILON);
+        assert!((falling_confidence - 1.0 / 3.0).abs() < f32::EPSILON);
     }
 
     fn make_planner_with_window() -> Planner {

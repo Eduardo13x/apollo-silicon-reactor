@@ -21,6 +21,8 @@
 //! - Reduce competing processes' priority to give the ML workload memory bandwidth
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use super::proc_taskinfo;
 
@@ -111,6 +113,24 @@ pub enum MlWorkloadType {
     AccelerateUser,
 }
 
+fn detect_ml_binary_name(binary_name: &str) -> MlWorkloadType {
+    if ML_BINARY_NAMES
+        .iter()
+        .any(|name| binary_name.eq_ignore_ascii_case(name))
+    {
+        return MlWorkloadType::InferenceEngine;
+    }
+
+    if PYTHON_NAMES
+        .iter()
+        .any(|python_name| binary_name.starts_with(python_name))
+    {
+        return MlWorkloadType::PythonMl;
+    }
+
+    MlWorkloadType::None
+}
+
 impl MlWorkloadType {
     pub fn is_ml(&self) -> bool {
         !matches!(self, MlWorkloadType::None)
@@ -139,18 +159,9 @@ pub fn detect_ml_workload(pid: u32) -> MlWorkloadType {
     // Extract binary name from path
     let binary_name = path.rsplit('/').next().unwrap_or(&path);
 
-    // Check against known ML engines first (most specific)
-    for &name in ML_BINARY_NAMES {
-        if binary_name.eq_ignore_ascii_case(name) {
-            return MlWorkloadType::InferenceEngine;
-        }
-    }
-
-    // Check if it's a Python process (common ML runtime)
-    for &py_name in PYTHON_NAMES {
-        if binary_name.starts_with(py_name) {
-            return MlWorkloadType::PythonMl;
-        }
+    let binary_match = detect_ml_binary_name(binary_name);
+    if binary_match.is_ml() {
+        return binary_match;
     }
 
     // Check path for Accelerate framework components
@@ -192,18 +203,44 @@ pub fn ml_protected_pids() -> HashSet<u32> {
     ml_protected_pids_cached().as_ref().clone()
 }
 
-/// Shared Arc'd handle. Callers wanting zero-clone access can use this directly.
-pub fn ml_protected_pids_cached() -> std::sync::Arc<HashSet<u32>> {
-    use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
-    static CACHE: OnceLock<Mutex<(Instant, std::sync::Arc<HashSet<u32>>)>> = OnceLock::new();
-    let cell = CACHE.get_or_init(|| {
+type MlPidCache = Mutex<(Instant, Arc<HashSet<u32>>)>;
+
+fn ml_pid_cache() -> &'static MlPidCache {
+    static CACHE: OnceLock<MlPidCache> = OnceLock::new();
+    CACHE.get_or_init(|| {
         Mutex::new((
             Instant::now() - Duration::from_secs(10),
-            std::sync::Arc::new(HashSet::new()),
+            Arc::new(HashSet::new()),
         ))
-    });
-    let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+    })
+}
+
+/// Refresh ML protection from the daemon's existing sysinfo census.
+///
+/// The protected classes (known inference binaries and Python runtimes) depend
+/// only on the executable name, so calling `proc_pidpath` for every PID adds no
+/// information. Reusing this census removes an N+1 kernel-query pass while the
+/// fallback below remains available to standalone callers without a `System`.
+pub fn ml_protected_pids_for_system(sys: &sysinfo::System) -> HashSet<u32> {
+    let mut cache = ml_pid_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.0.elapsed() > Duration::from_secs(1) {
+        let fresh = sys
+            .processes()
+            .iter()
+            .filter_map(|(pid, process)| {
+                (detect_ml_binary_name(process.name()).priority_boost() >= 0.5)
+                    .then_some(pid.as_u32())
+            })
+            .collect();
+        cache.0 = Instant::now();
+        cache.1 = Arc::new(fresh);
+    }
+    cache.1.as_ref().clone()
+}
+
+/// Shared Arc'd handle. Callers wanting zero-clone access can use this directly.
+pub fn ml_protected_pids_cached() -> std::sync::Arc<HashSet<u32>> {
+    let mut g = ml_pid_cache().lock().unwrap_or_else(|e| e.into_inner());
     if g.0.elapsed() > Duration::from_secs(1) {
         let fresh: HashSet<u32> = detect_all_ml_workloads()
             .into_iter()
@@ -211,7 +248,7 @@ pub fn ml_protected_pids_cached() -> std::sync::Arc<HashSet<u32>> {
             .map(|(pid, _)| pid)
             .collect();
         g.0 = Instant::now();
-        g.1 = std::sync::Arc::new(fresh);
+        g.1 = Arc::new(fresh);
     }
     g.1.clone()
 }
@@ -328,33 +365,20 @@ mod tests {
 
     #[test]
     fn detect_known_ml_names() {
-        // Test the name matching logic with fake paths
-        let test_cases = vec![
-            ("/usr/local/bin/ollama", MlWorkloadType::InferenceEngine),
-            ("/opt/homebrew/bin/python3", MlWorkloadType::PythonMl),
-            ("/usr/bin/python3.12", MlWorkloadType::PythonMl),
+        let test_cases = [
+            ("ollama", MlWorkloadType::InferenceEngine),
+            ("OLLAMA", MlWorkloadType::InferenceEngine),
+            ("python3", MlWorkloadType::PythonMl),
+            ("python3.12", MlWorkloadType::PythonMl),
+            ("cargo", MlWorkloadType::None),
         ];
 
-        for (path, expected_type) in test_cases {
-            let binary_name = path.rsplit('/').next().unwrap();
-            let mut detected = MlWorkloadType::None;
-
-            for &name in ML_BINARY_NAMES {
-                if binary_name.eq_ignore_ascii_case(name) {
-                    detected = MlWorkloadType::InferenceEngine;
-                    break;
-                }
-            }
-            if detected == MlWorkloadType::None {
-                for &py_name in PYTHON_NAMES {
-                    if binary_name.starts_with(py_name) {
-                        detected = MlWorkloadType::PythonMl;
-                        break;
-                    }
-                }
-            }
-
-            assert_eq!(detected, expected_type, "path={}", path);
+        for (binary_name, expected_type) in test_cases {
+            assert_eq!(
+                detect_ml_binary_name(binary_name),
+                expected_type,
+                "binary={binary_name}"
+            );
         }
     }
 

@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use apollo_engine::engine::daemon_helpers::{unfreeze_pids, write_frozen_state};
+use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::lock_ext::LockRecover;
 
@@ -47,11 +47,15 @@ pub fn run_ctx_switch_tick(
 
     if let Some(fg_pid) = foreground_pid {
         let mut frozen_guard = state.frozen_state.lock_recover();
-        if frozen_guard.remove(&fg_pid).is_some() {
-            unfreeze_pids(std::iter::once(fg_pid));
+        if let Some(entry) = frozen_guard.get(&fg_pid).cloned() {
+            let entries = std::collections::HashMap::from([(fg_pid, entry)]);
+            let outcome = unfreeze_pids_verified_outcome(&entries);
+            for pid in outcome.forgettable_pids() {
+                frozen_guard.remove(&pid);
+            }
             write_frozen_state(frozen_state_path, &frozen_guard);
             drop(frozen_guard);
-            state.metrics.lock_recover().metrics.unfreezes_applied += 1;
+            state.metrics.lock_recover().metrics.unfreezes_applied += outcome.applied_count();
         }
     }
 

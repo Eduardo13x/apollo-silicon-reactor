@@ -81,6 +81,13 @@ const MONOPOLY_BELIEF_CONFIDENCE_TARGET: f32 = 0.80;
 /// vote weight so pathological monopoly_risk > 0.5 never gets silenced
 /// completely [Gray & Reuter 1992 §11, evidence-gated decisions].
 const MONOPOLY_MATURITY_FLOOR: f64 = 0.4;
+
+/// A predictive recommendation alone must not pin the daemon to an
+/// aggressive profile. Require both meaningful present pressure and an
+/// independent imminent-risk signal before installing an automatic override.
+const AGGRESSIVE_OVERRIDE_PRESSURE_FLOOR: f64 = 0.50;
+const AGGRESSIVE_OVERRIDE_OOM_RISK_FLOOR: f64 = 0.30;
+const AGGRESSIVE_OVERRIDE_ODE_URGENCY_FLOOR: f64 = 0.75;
 use apollo_engine::engine::user_context::UserContext;
 
 /// Per-process habituation bucket window size: unchanged ≥ this many cycles
@@ -187,6 +194,28 @@ pub fn apply_presence_factor(votes: &mut [SpecialistVote], factor: f64) -> u64 {
     modulated
 }
 
+/// Decides whether a `SuggestAggressive` recommendation may temporarily
+/// override the automatic profile controller. The predictor may recommend an
+/// intervention while the machine is calm; that recommendation must remain
+/// advisory until the physical signals corroborate it.
+#[inline]
+fn should_apply_aggressive_override(
+    pressure_smooth: f64,
+    pressure_velocity: f64,
+    pressure_predicted_30s: f64,
+    p_oom_30s: f64,
+    ode_t_sat_urgency: f64,
+    background_pressure_threshold: f64,
+) -> bool {
+    if pressure_smooth < AGGRESSIVE_OVERRIDE_PRESSURE_FLOOR {
+        return false;
+    }
+
+    p_oom_30s >= AGGRESSIVE_OVERRIDE_OOM_RISK_FLOOR
+        || ode_t_sat_urgency >= AGGRESSIVE_OVERRIDE_ODE_URGENCY_FLOOR
+        || (pressure_velocity > 0.0 && pressure_predicted_30s >= background_pressure_threshold)
+}
+
 /// Phase 3.1 — Skill-Aware Prediction confidence multiplier.
 ///
 /// Maps the workload-conditional skill success signal `s ∈ [0, 1]` into a
@@ -220,8 +249,8 @@ fn skill_aware_factor(signal: Option<f32>) -> f64 {
 /// read back the actual firing signals.
 ///
 /// Side effects: on disagreement, emits a `specialist_disagreement` audit
-/// line; on `SuggestAggressive`, sets a 5-minute governor override via
-/// `state.policy`.
+/// line; on `SuggestAggressive`, may set a 5-minute governor override only
+/// when current pressure and an independent risk signal corroborate it.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_specialist_voting(
     state: &SharedState,
@@ -519,8 +548,19 @@ pub fn apply_specialist_voting(
         .predictive_agent
         .adjust_thresholds(*overflow_thresholds);
 
-    // SuggestAggressive: set a 5-minute manual override to aggressive profile.
-    if intervention == Intervention::SuggestAggressive {
+    // A learned recommendation is advisory while the machine is calm. Only
+    // let it take over the profile controller when physical telemetry confirms
+    // an imminent memory-risk condition.
+    if intervention == Intervention::SuggestAggressive
+        && should_apply_aggressive_override(
+            signal_digest.pressure_smooth,
+            signal_digest.pressure_velocity,
+            signal_digest.pressure_predicted_30s,
+            signal_digest.p_oom_30s,
+            ode_t_sat_urgency,
+            overflow_thresholds.bg_pressure,
+        )
+    {
         let mut pg = state.policy.lock_recover();
         if pg.governor.manual_override.is_none() {
             pg.governor.set_manual_override(
@@ -716,6 +756,37 @@ mod tests {
     #[test]
     fn habituation_threshold_is_five() {
         assert_eq!(HABITUATION_THRESHOLD, 5);
+    }
+
+    #[test]
+    fn suggest_aggressive_stays_advisory_when_the_machine_is_calm() {
+        assert!(
+            !should_apply_aggressive_override(
+                0.32, // current pressure on the M4 when the bug reproduced
+                0.01, 0.38, 0.0, 0.0, 0.65,
+            ),
+            "a learned recommendation must not override a calm profile"
+        );
+    }
+
+    #[test]
+    fn suggest_aggressive_requires_current_pressure_plus_risk_evidence() {
+        // Even severe-looking forecasts cannot pin an idle machine to
+        // aggressive mode without meaningful current pressure.
+        assert!(!should_apply_aggressive_override(
+            0.49, 0.10, 0.90, 0.90, 0.90, 0.65,
+        ));
+
+        // Any corroborating risk source may escalate once pressure is real.
+        assert!(should_apply_aggressive_override(
+            0.50, 0.01, 0.70, 0.0, 0.0, 0.65,
+        ));
+        assert!(should_apply_aggressive_override(
+            0.50, 0.0, 0.40, 0.30, 0.0, 0.65,
+        ));
+        assert!(should_apply_aggressive_override(
+            0.50, 0.0, 0.40, 0.0, 0.75, 0.65,
+        ));
     }
 
     // ── Phase 5.1 wiring — `apply_presence_factor` helper ────────────────────

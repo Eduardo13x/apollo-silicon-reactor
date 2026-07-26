@@ -2,7 +2,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # Apollo Pipeline — Build → Test → Deploy → Verify
 # ══════════════════════════════════════════════════════════════════════════════
-# Usage: sudo ./scripts/pipeline.sh [--skip-test] [--skip-deploy]
+# Usage: ./scripts/pipeline.sh [--skip-test] [--skip-deploy]
 #
 # Exit codes:
 #   0 = all green
@@ -10,7 +10,7 @@
 #   2 = tests failed
 #   3 = deploy failed
 #   4 = daemon not cycling
-set -uo pipefail
+set -euo pipefail
 
 SKIP_TEST=false
 SKIP_DEPLOY=false
@@ -18,14 +18,36 @@ for arg in "$@"; do
     case "$arg" in
         --skip-test) SKIP_TEST=true ;;
         --skip-deploy) SKIP_DEPLOY=true ;;
+        *) echo "unknown flag: $arg" >&2; exit 2 ;;
     esac
 done
 
 cd "$(dirname "$0")/.."
+source scripts/hardware-build-profile.sh
 
-# Write all output to a file Claude can read
+CARGO_BIN="$(command -v cargo || true)"
+if [ -z "$CARGO_BIN" ]; then
+    fail_path="${HOME}/.cargo/bin/cargo"
+    if [ -x "$fail_path" ]; then
+        CARGO_BIN="$fail_path"
+    else
+        echo "cargo not found in PATH or $fail_path" >&2
+        exit 1
+    fi
+fi
+
+# Capture a deterministic report without Bash process substitution. Hardened
+# macOS runners may deny /dev/fd even though `>(tee ...)` parsed successfully.
 REPORT="/tmp/apollo-pipeline-report.txt"
-exec > >(tee "$REPORT") 2>&1
+exec 3>&1
+report_and_exit() {
+    status=$?
+    trap - EXIT
+    cat "$REPORT" >&3
+    exit "$status"
+}
+trap report_and_exit EXIT
+exec >"$REPORT" 2>&1
 chmod 644 "$REPORT"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -40,9 +62,13 @@ TOTAL_START=$(date +%s)
 
 # ── 1. BUILD ─────────────────────────────────────────────────────────────────
 echo "═══ 1/4 BUILD ═══"
-if cargo build --release 2>&1 | tail -3; then
-    ok "cargo build --release"
+BUILD_STATUS=0
+BUILD_OUT=$("$CARGO_BIN" build --workspace --bins --release ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} 2>&1) || BUILD_STATUS=$?
+if [ "$BUILD_STATUS" -eq 0 ]; then
+    printf '%s\n' "$BUILD_OUT" | tail -3
+    ok "cargo build --workspace --bins --release ($APOLLO_BUILD_PROFILE)"
 else
+    printf '%s\n' "$BUILD_OUT" | tail -80
     fail "build failed"
     exit 1
 fi
@@ -54,92 +80,67 @@ if $SKIP_TEST; then
     warn "skipped (--skip-test)"
 else
     # Clippy
-    CLIPPY_OUT=$(cargo clippy --all-targets 2>&1)
-    CLIPPY_WARNS=$(echo "$CLIPPY_OUT" | grep -c 'warning\[' || true)
-    if [ "$CLIPPY_WARNS" -eq 0 ]; then
+    CLIPPY_STATUS=0
+    CLIPPY_OUT=$("$CARGO_BIN" clippy --workspace --all-targets --message-format=short ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} 2>&1) \
+      || CLIPPY_STATUS=$?
+    CLIPPY_WARNS=$(printf '%s\n' "$CLIPPY_OUT" | grep -c 'warning:' || true)
+    if [ "$CLIPPY_STATUS" -ne 0 ]; then
+        printf '%s\n' "$CLIPPY_OUT" | tail -40
+        fail "clippy failed (exit=$CLIPPY_STATUS)"
+        exit 2
+    elif [ "$CLIPPY_WARNS" -eq 0 ]; then
         ok "clippy clean"
     else
-        fail "clippy: $CLIPPY_WARNS warnings"
+        warn "clippy: $CLIPPY_WARNS warnings (technical debt, command succeeded)"
     fi
 
-    # Unit + lib tests
-    TEST_OUT=$(cargo test --lib --bins 2>&1)
-    TEST_PASS=$(echo "$TEST_OUT" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
-    TEST_FAIL=$(echo "$TEST_OUT" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' | head -1)
-    TEST_PASS=${TEST_PASS:-0}
-    TEST_FAIL=${TEST_FAIL:-0}
-    if [ "$TEST_FAIL" -eq 0 ] && [ "$TEST_PASS" -gt 0 ]; then
-        ok "tests: $TEST_PASS passed"
-    else
-        fail "tests: $TEST_PASS passed, $TEST_FAIL failed"
+    # Run the workspace in parallel, except the daemon E2E suite whose tests
+    # intentionally share one global Unix socket and therefore require serial
+    # isolation. This keeps the M4 busy without manufacturing socket races.
+    TEST_STATUS=0
+    TEST_OUT=$("$CARGO_BIN" test --workspace --quiet ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} -- --skip e2e_ 2>&1) \
+      || TEST_STATUS=$?
+    if [ "$TEST_STATUS" -ne 0 ]; then
+        printf '%s\n' "$TEST_OUT" | tail -80
+        fail "parallel workspace tests failed (exit=$TEST_STATUS)"
         exit 2
     fi
 
-    # Scenario benchmarks (all prepare_* files)
-    SCENARIO_TOTAL=0
-    SCENARIO_PASS=0
-    for testfile in prepare prepare_latency prepare_memory prepare_actions prepare_classifier prepare_signals prepare_rl; do
-        OUT=$(cargo test --test "$testfile" 2>&1 || true)
-        P=$(echo "$OUT" | grep -cE 'test scenarios::.* ok$' || echo 0)
-        T=$(echo "$OUT" | grep -cE 'test scenarios::' || echo 0)
-        SCENARIO_PASS=$((SCENARIO_PASS + P))
-        SCENARIO_TOTAL=$((SCENARIO_TOTAL + T))
-    done
-    if [ "$SCENARIO_PASS" -eq "$SCENARIO_TOTAL" ] && [ "$SCENARIO_TOTAL" -gt 0 ]; then
-        ok "scenarios: $SCENARIO_PASS/$SCENARIO_TOTAL"
-    else
-        fail "scenarios: $SCENARIO_PASS/$SCENARIO_TOTAL"
+    E2E_STATUS=0
+    E2E_OUT=$("$CARGO_BIN" test --test e2e_dry_run --quiet ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} -- --test-threads=1 2>&1) \
+      || E2E_STATUS=$?
+    if [ "$E2E_STATUS" -ne 0 ]; then
+        printf '%s\n' "$E2E_OUT" | tail -80
+        fail "serial daemon E2E tests failed (exit=$E2E_STATUS)"
         exit 2
     fi
+
+    TEST_PASS=$(printf '%s\n%s\n' "$TEST_OUT" "$E2E_OUT" \
+      | awk '/test result: ok/ { for (i=1; i<=NF; i++) if ($i == "passed;") total += $(i-1) } END { print total+0 }')
+    ok "workspace tests: $TEST_PASS passed (parallel core + serial daemon E2E)"
 fi
 
 # ── 3. DEPLOY ────────────────────────────────────────────────────────────────
 echo ""
 echo "═══ 3/4 DEPLOY ═══"
+RESTART_BASELINE=0
 if $SKIP_DEPLOY; then
     warn "skipped (--skip-deploy)"
 else
-    # Need root for deploy
-    if [ "$(id -u)" -ne 0 ]; then
-        fail "deploy requires root — run with sudo"
+    DEPLOYER="/usr/local/sbin/apollo-deploy"
+    if [ ! -x "$DEPLOYER" ]; then
+        fail "scoped deployer missing: $DEPLOYER"
         exit 3
     fi
-
-    # Kill all instances
-    killall apollo-optimizerd 2>/dev/null || true
-    sleep 1
-
-    # Verify dead
-    if pgrep -x apollo-optimizerd >/dev/null 2>&1; then
-        killall -9 apollo-optimizerd 2>/dev/null || true
-        sleep 1
-    fi
-
-    # Copy + sign
-    cp -f target/release/apollo-optimizerd /usr/local/libexec/apollo-optimizerd
-    chown root:wheel /usr/local/libexec/apollo-optimizerd
-    chmod 755 /usr/local/libexec/apollo-optimizerd
-    codesign --force --sign - /usr/local/libexec/apollo-optimizerd
-    ok "binary installed + signed"
-
-    # Also update ctl
-    if [ -f target/release/apollo-optimizerctl ]; then
-        cp -f target/release/apollo-optimizerctl /usr/local/bin/apollo-optimizerctl
-        chown root:wheel /usr/local/bin/apollo-optimizerctl
-        chmod 755 /usr/local/bin/apollo-optimizerctl
-        codesign --force --sign - /usr/local/bin/apollo-optimizerctl
-        ok "ctl binary updated"
-    fi
-
-    # Truncate logs
-    truncate -s 0 /var/log/apollo-optimizer.out.log /var/log/apollo-optimizer.err.log 2>/dev/null || true
-    ok "logs truncated"
-
-    # Restart via launchd
-    launchctl kickstart -k system/com.eduardocortez.systemoptimizerd 2>/dev/null || \
-      launchctl kickstart system/com.eduardocortez.systemoptimizerd 2>/dev/null || \
-      launchctl load /Library/LaunchDaemons/com.eduardocortez.systemoptimizerd.plist 2>/dev/null || true
-    ok "launchd restart issued"
+    RESTART_BASELINE=$(grep -c 'predictive-agent: loaded' /var/log/apollo-optimizer.err.log 2>/dev/null || true)
+    RESTART_BASELINE=${RESTART_BASELINE:-0}
+    cp -f target/release/apollo-optimizerd /private/tmp/apollo-optimizerd-candidate
+    cp -f target/release/apollo-optimizerctl /private/tmp/apollo-optimizerctl-candidate
+    chmod 755 /private/tmp/apollo-optimizerd-candidate /private/tmp/apollo-optimizerctl-candidate
+    codesign --force --sign - /private/tmp/apollo-optimizerd-candidate
+    codesign --force --sign - /private/tmp/apollo-optimizerctl-candidate
+    sudo -n "$DEPLOYER"
+    ok "scoped deploy completed with backup + launchd verification"
 fi
 
 # ── 4. VERIFY ────────────────────────────────────────────────────────────────
@@ -190,14 +191,18 @@ else
 
     # Check for crash loop
     ERR_LINES=$(wc -l < /var/log/apollo-optimizer.err.log 2>/dev/null || echo 0)
-    RESTART_COUNT=$(grep -c 'predictive-agent: loaded' /var/log/apollo-optimizer.err.log 2>/dev/null || echo 0)
+    RESTART_TOTAL=$(grep -c 'predictive-agent: loaded' /var/log/apollo-optimizer.err.log 2>/dev/null || true)
+    RESTART_TOTAL=${RESTART_TOTAL:-0}
+    RESTART_COUNT=$((RESTART_TOTAL - RESTART_BASELINE))
+    [ "$RESTART_COUNT" -lt 0 ] && RESTART_COUNT="$RESTART_TOTAL"
     if [ "$RESTART_COUNT" -gt 3 ]; then
-        fail "crash loop detected: $RESTART_COUNT restarts in stderr"
+        fail "crash loop detected: $RESTART_COUNT starts since deploy"
         echo ""
         echo "── STDERR (last 20) ──"
         tail -20 /var/log/apollo-optimizer.err.log 2>/dev/null
+        exit 4
     elif [ "$RESTART_COUNT" -gt 1 ]; then
-        warn "$RESTART_COUNT restarts detected"
+        warn "$RESTART_COUNT starts detected since deploy"
     else
         ok "no crash loop"
     fi

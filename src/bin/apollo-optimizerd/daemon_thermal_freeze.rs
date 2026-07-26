@@ -18,7 +18,7 @@
 use std::path::Path;
 
 use apollo_engine::collector::SystemCollector;
-use apollo_engine::engine::daemon_helpers::{unfreeze_pids, write_frozen_state};
+use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::outcome_tracker::OutcomeTracker;
@@ -128,22 +128,23 @@ pub fn run_thermal_freeze(
         drop(frozen_guard);
     } else {
         // Temperature dropped back to Phase2 or below — unfreeze any thermally-frozen PIDs.
-        let thermal_frozen_pids: Vec<u32> = {
+        let thermal_frozen_entries: std::collections::HashMap<u32, FrozenEntry> = {
             let frozen_guard = state.frozen_state.lock_recover();
             frozen_guard
                 .iter()
                 .filter(|(_, e)| e.source == FreezeSource::ThermalPreThrottle)
-                .map(|(&pid, _)| pid)
+                .map(|(&pid, entry)| (pid, entry.clone()))
                 .collect()
         };
-        if !thermal_frozen_pids.is_empty() {
-            let n = unfreeze_pids(thermal_frozen_pids.iter().copied());
+        if !thermal_frozen_entries.is_empty() {
+            let outcome = unfreeze_pids_verified_outcome(&thermal_frozen_entries);
             let mut frozen_guard = state.frozen_state.lock_recover();
-            for pid in &thermal_frozen_pids {
-                frozen_guard.remove(pid);
+            for pid in outcome.forgettable_pids() {
+                frozen_guard.remove(&pid);
             }
             write_frozen_state(frozen_state_path, &frozen_guard);
             drop(frozen_guard);
+            let n = outcome.applied_count();
             state.metrics.lock_recover().metrics.unfreezes_applied += n;
             println!("[thermal] Cooled: unfroze {} pre-throttled processes", n);
         }

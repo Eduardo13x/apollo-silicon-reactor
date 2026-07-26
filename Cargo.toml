@@ -26,11 +26,18 @@ winit = "0.29"
 cocoa = "0.25"
 objc = "0.2"
 aho-corasick = "1"
+rayon = "1.12"
 
 [package]
 name = "apollo-optimizer"
 version = "1.0.0"
 edition = "2021"
+
+[features]
+default = []
+# Enabled by the hardware-aware build scripts on 10+ core Apple Silicon.
+# Keeps the measured sequential path for M1-class systems.
+adaptive-multicore = ["sysinfo/multithread", "dep:rayon"]
 
 [lib]
 path = "src/lib.rs"
@@ -52,6 +59,7 @@ ureq = { workspace = true, features = ["json"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
 aho-corasick.workspace = true
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

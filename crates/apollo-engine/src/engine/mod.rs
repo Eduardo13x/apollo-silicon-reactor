@@ -151,6 +151,7 @@ pub mod wake_storm_detector;
 pub mod window_sensor;
 pub mod work_session;
 pub mod workload_classifier;
+pub mod workload_phase;
 pub mod world_model;
 pub mod zombie_hunter;
 

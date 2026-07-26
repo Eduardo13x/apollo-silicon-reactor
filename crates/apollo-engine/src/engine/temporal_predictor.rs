@@ -269,12 +269,16 @@ impl TemporalPredictor {
             }
         }
 
-        predictions.sort_by(|a, b| {
+        let by_probability = |a: &TemporalPrediction, b: &TemporalPrediction| {
             b.probability
                 .partial_cmp(&a.probability)
                 .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        predictions.truncate(TOP_N);
+        };
+        if predictions.len() > TOP_N {
+            predictions.select_nth_unstable_by(TOP_N, by_probability);
+            predictions.truncate(TOP_N);
+        }
+        predictions.sort_by(by_probability);
         predictions
     }
 

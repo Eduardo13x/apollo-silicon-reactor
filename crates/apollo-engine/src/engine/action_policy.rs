@@ -44,9 +44,10 @@ pub struct ActionContext {
     pub pressure: f64,
     pub swap_gb: f64,
     pub thrashing_score: f64,
-    /// Predicted probability of OOM kill within the next 30s. F6 will wire.
+    /// Predicted probability of OOM kill within the next 30s.
     pub p_oom_30s: Option<f64>,
-    /// Predicted probability of jank within the next 60s. F6 will wire.
+    /// Predicted probability of jank within the next 60s, published from the
+    /// fluidity Kalman state by the daemon main loop.
     pub p_jank_60s: Option<f64>,
     pub has_sleep_assertion: bool,
     pub call_in_progress: bool,
@@ -74,9 +75,9 @@ pub struct ActionContext {
     /// every code path constructs ActionContext from a hardware snapshot
     /// (tests, dry-run paths). When `None`, the battery-aware penalty
     /// returns 0.0 (no UX cost imposed without evidence).
-    /// Per-candidate learned yield for this action's process group
-    /// (HopGroupWeight blend of effectiveness + predicted_effectiveness).
-    /// None = class-level probe or no group data — feature contributes zero.
+    /// Per-candidate learned yield. A mature process-level blend (Bayesian +
+    /// causal + skill evidence) takes precedence; otherwise the process-group
+    /// HopGroupWeight blend is used. None = class-level probe or no evidence.
     /// Unification scaffold (2026-06-11): scorer features read the same
     /// evidence the inline gates use, starting the N>=500 shadow clock.
     pub learned_yield: Option<f64>,

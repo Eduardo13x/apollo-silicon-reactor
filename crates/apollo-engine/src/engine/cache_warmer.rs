@@ -110,10 +110,12 @@ fn advise_prefetch(_path: &std::path::Path, _max_bytes: u64) -> std::io::Result<
     Ok(0)
 }
 
-/// Tracks recently warmed PIDs to avoid redundant prefetches.
+/// Tracks recently warmed executable paths to avoid redundant prefetches.
 pub struct CacheWarmer {
-    /// PID → last warm time.
-    last_warmed: HashMap<u32, Instant>,
+    /// Executable path → last warm time. Chromium/Electron helpers often use
+    /// the same binary under many PIDs; path-level dedup avoids issuing the
+    /// same F_RDADVISE once per member of a predicted app coalition.
+    last_warmed: HashMap<PathBuf, Instant>,
 }
 
 impl Default for CacheWarmer {
@@ -132,23 +134,24 @@ impl CacheWarmer {
     /// Pre-warm the file cache for a process's executable.
     ///
     /// Returns the number of bytes prefetched, or 0 if skipped/failed.
-    /// Skips if the same PID was warmed less than `MIN_WARM_INTERVAL_SECS` ago.
+    /// Skips if the same executable path was warmed less than
+    /// `MIN_WARM_INTERVAL_SECS` ago, even through another helper PID.
     pub fn warm_pid(&mut self, pid: u32) -> u64 {
+        let Some(exe_path) = pid_exe_path(pid) else {
+            return 0;
+        };
+
         // Dedup: skip if recently warmed.
         let now = Instant::now();
-        if let Some(&last) = self.last_warmed.get(&pid) {
+        if let Some(&last) = self.last_warmed.get(&exe_path) {
             if now.duration_since(last).as_secs() < MIN_WARM_INTERVAL_SECS {
                 return 0;
             }
         }
 
-        let Some(exe_path) = pid_exe_path(pid) else {
-            return 0;
-        };
-
         match advise_prefetch(&exe_path, MAX_PREFETCH_BYTES) {
             Ok(bytes) => {
-                self.last_warmed.insert(pid, now);
+                self.last_warmed.insert(exe_path, now);
                 bytes
             }
             Err(_) => 0,
@@ -206,10 +209,11 @@ mod tests {
     #[test]
     fn warmer_gc() {
         let mut warmer = CacheWarmer::new();
-        warmer.last_warmed.insert(99999, Instant::now());
+        let path = PathBuf::from("/tmp/apollo-cache-warmer-test");
+        warmer.last_warmed.insert(path.clone(), Instant::now());
         warmer.gc();
         // Recent entry should survive GC.
-        assert!(warmer.last_warmed.contains_key(&99999));
+        assert!(warmer.last_warmed.contains_key(&path));
     }
 
     #[cfg(target_os = "macos")]

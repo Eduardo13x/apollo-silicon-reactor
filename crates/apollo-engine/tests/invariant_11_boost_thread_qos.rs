@@ -20,6 +20,7 @@ fn no_caps() -> CapabilityReport {
         can_taskpolicy: false,
         can_sysctl: false,
         can_memorystatus: false,
+        can_memory_pressure_send: false,
         can_mdutil: false,
         can_tmutil: false,
         is_root: false,

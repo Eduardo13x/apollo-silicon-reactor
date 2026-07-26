@@ -146,3 +146,23 @@ fn raw_sysctlbyname_only_in_allowlisted_files() {
         &["crates/apollo-engine/src", "src/bin"],
     );
 }
+
+#[test]
+fn purge_commands_must_transfer_child_ownership_to_the_reaper() {
+    check_needle(
+        "Command::new(\"purge\")",
+        &[],
+        &["crates/apollo-engine/src", "src/bin"],
+    );
+}
+
+#[test]
+fn jetsam_priority_effector_does_not_smuggle_a_memlimit_policy() {
+    let source =
+        fs::read_to_string(repo_root().join("crates/apollo-engine/src/engine/mediator.rs"))
+            .expect("read mediator source");
+    assert!(
+        !source.contains("jetsam_control::apply_apollo_policy"),
+        "JetsamEffector must mutate priority only; memlimit has separate ownership and undo"
+    );
+}
