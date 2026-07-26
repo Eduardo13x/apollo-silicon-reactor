@@ -1634,8 +1634,8 @@ pub fn decide_actions(
                             }
                             // World-model Mode-2 gate (2026-06-11): imagine the
                             // freeze through the learned causal model BEFORE
-                            // emitting it. If the model has solid evidence
-                            // (>=10 obs, conf >=0.30) that this action's
+                            // emitting it. If the model has mature Gold evidence
+                            // (>=10 outcomes, medallion quality >=0.90) that this action's
                             // predicted pressure drop loses to the do-nothing
                             // drift, skip — acting would be side-effects for
                             // nothing. Unknown/immature predictions admit

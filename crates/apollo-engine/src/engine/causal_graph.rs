@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
+use crate::engine::data_medallion::CuratedLabel;
+
 /// Hard cap for in-cycle edge count. Raised from 500 → 1500 after canary
 /// telemetry showed the graph was saturating immediately, causing edges to be
 /// evicted before they could accumulate the 3-15 cycles of evidence needed for
@@ -67,6 +69,12 @@ pub const EXTERNAL_BLAME_PENALTY: f32 = 0.30;
 /// blame window.
 const RECENT_EDGES_FOR_ATTRIBUTION: usize = 100;
 
+const CURATED_EMA_ALPHA: f32 = 0.15;
+const CURATED_EFFECTIVE_DELTA: f32 = 0.01;
+const MAX_CURATED_PRESSURE_DELTA: f32 = 0.35;
+const CURATED_RETENTION_WEIGHT: f32 = 0.05;
+const CURATED_MATURE_EVIDENCE: f32 = 10.0;
+
 /// Phase 4.2 — Class of external systemic event that can confound Apollo's
 /// causal attribution. These are NOT Apollo actions; they are environmental
 /// observables that drive pressure independently of any decision the daemon
@@ -92,6 +100,121 @@ pub enum ExternalEventKind {
     /// with a real pressure drop driven by Brave/Chromium tab swap.
     /// Wiring point: `network_optimizer` (deferred).
     NetworkLatencySpike,
+}
+
+/// Gold-only outcome statistics used by the world model. These values are
+/// deliberately separate from the graph's fast/slow observational edges:
+/// only outcomes admitted by the medallion trust boundary may update them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CuratedPredictionStats {
+    pub observations: u32,
+    pub effective_observations: u32,
+    pub avg_pressure_drop: f32,
+    pub data_quality: f32,
+    pub last_cycle: u64,
+}
+
+impl CuratedPredictionStats {
+    fn observe(&mut self, pressure_drop: f32, quality: f32, cycle: u64) {
+        let target = pressure_drop.clamp(-MAX_CURATED_PRESSURE_DELTA, MAX_CURATED_PRESSURE_DELTA);
+        let predicted_drop = target.max(0.0);
+        let quality = quality.clamp(0.0, 1.0);
+        if self.observations == 0 {
+            self.avg_pressure_drop = predicted_drop;
+            self.data_quality = quality;
+        } else {
+            self.avg_pressure_drop = self.avg_pressure_drop * (1.0 - CURATED_EMA_ALPHA)
+                + predicted_drop * CURATED_EMA_ALPHA;
+            self.data_quality =
+                self.data_quality * (1.0 - CURATED_EMA_ALPHA) + quality * CURATED_EMA_ALPHA;
+        }
+        self.observations = self.observations.saturating_add(1);
+        if target >= CURATED_EFFECTIVE_DELTA {
+            self.effective_observations = self.effective_observations.saturating_add(1);
+        }
+        self.last_cycle = cycle;
+    }
+
+    fn sanitize(&mut self) {
+        self.effective_observations = self.effective_observations.min(self.observations);
+        self.avg_pressure_drop = if self.avg_pressure_drop.is_finite() {
+            self.avg_pressure_drop
+                .clamp(0.0, MAX_CURATED_PRESSURE_DELTA)
+        } else {
+            0.0
+        };
+        self.data_quality = if self.data_quality.is_finite() {
+            self.data_quality.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if self.observations == 0 {
+            self.effective_observations = 0;
+            self.avg_pressure_drop = 0.0;
+            self.data_quality = 0.0;
+            self.last_cycle = 0;
+        }
+    }
+
+    fn impact_score(self) -> f32 {
+        let maturity = (self.observations as f32 / CURATED_MATURE_EVIDENCE).min(1.0);
+        self.data_quality * (self.avg_pressure_drop + CURATED_RETENTION_WEIGHT * maturity)
+    }
+}
+
+/// Aggregate and contextual Gold evidence for one action-conditioned edge.
+/// Fixed fields keep memory bounded and avoid a per-edge workload HashMap.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct CuratedCausalEvidence {
+    aggregate: CuratedPredictionStats,
+    idle: CuratedPredictionStats,
+    browsing: CuratedPredictionStats,
+    build: CuratedPredictionStats,
+    llm_inference: CuratedPredictionStats,
+}
+
+impl CuratedCausalEvidence {
+    fn observe(&mut self, workload: &str, pressure_drop: f32, quality: f32, cycle: u64) {
+        self.aggregate.observe(pressure_drop, quality, cycle);
+        let contextual = match workload {
+            "idle" => Some(&mut self.idle),
+            "browsing" => Some(&mut self.browsing),
+            "build" => Some(&mut self.build),
+            "llm-inference" => Some(&mut self.llm_inference),
+            "any" => None,
+            _ => None,
+        };
+        if let Some(stats) = contextual {
+            stats.observe(pressure_drop, quality, cycle);
+        }
+    }
+
+    fn contextual(&self, workload: &str) -> Option<CuratedPredictionStats> {
+        let stats = match workload {
+            "idle" => &self.idle,
+            "browsing" => &self.browsing,
+            "build" => &self.build,
+            "llm-inference" => &self.llm_inference,
+            _ => return None,
+        };
+        (stats.observations > 0).then_some(*stats)
+    }
+
+    fn sanitize(&mut self) {
+        self.aggregate.sanitize();
+        self.idle.sanitize();
+        self.browsing.sanitize();
+        self.build.sanitize();
+        self.llm_inference.sanitize();
+    }
+}
+
+/// Read-only projection exposed to the world model. `contextual` contains
+/// same-workload Gold evidence when available; `aggregate` is its fallback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CuratedPredictionEvidence {
+    pub aggregate: CuratedPredictionStats,
+    pub contextual: Option<CuratedPredictionStats>,
 }
 
 /// A causal edge: action X caused outcome Y with measured confidence.
@@ -138,6 +261,10 @@ pub struct CausalEdge {
     /// treatment effects.
     #[serde(default)]
     pub external_blame: Option<ExternalEventKind>,
+    /// Private Gold-only stream. Raw graph evaluators cannot mutate it;
+    /// admission is mediated by `CausalGraph::observe_curated_outcome`.
+    #[serde(default)]
+    curated: CuratedCausalEvidence,
 }
 
 /// Tracks WHICH resource changed when an action was effective.
@@ -198,7 +325,25 @@ impl CausalEdge {
             slow_avg_delta: 0.0,
             mechanism: MechanismAttribution::default(),
             external_blame: None,
+            curated: CuratedCausalEvidence::default(),
         }
+    }
+
+    fn observe_curated(&mut self, workload: &str, pressure_drop: f32, quality: f32, cycle: u64) {
+        self.curated
+            .observe(workload, pressure_drop, quality, cycle);
+    }
+
+    pub(crate) fn sanitize_curated(&mut self) {
+        self.curated.sanitize();
+    }
+
+    pub(crate) fn has_curated_evidence(&self) -> bool {
+        self.curated.aggregate.observations > 0
+    }
+
+    fn curated_impact_score(&self) -> f32 {
+        self.curated.aggregate.impact_score()
     }
 
     /// Bayesian update: blend new evidence into confidence.
@@ -521,6 +666,50 @@ impl CausalGraph {
         self.record_action_with_resources(action_key, pressure, cycle, ResourceSnapshot::default());
     }
 
+    /// Admit one resolved action outcome into the Gold-only causal stream.
+    /// Returns false without mutation unless the medallion label is Gold and
+    /// all remaining inputs satisfy this module's structural contract.
+    pub fn observe_curated_outcome(
+        &mut self,
+        action_key: &str,
+        workload: &str,
+        pressure_drop: f64,
+        cycle: u64,
+        label: CuratedLabel,
+    ) -> bool {
+        let known_workload = matches!(
+            workload,
+            "idle" | "browsing" | "build" | "llm-inference" | "any"
+        );
+        if !label.is_gold()
+            || label.rejection.is_some()
+            || action_key.is_empty()
+            || !known_workload
+            || !pressure_drop.is_finite()
+            || pressure_drop.abs() > MAX_CURATED_PRESSURE_DELTA as f64
+            || !label.quality_score.is_finite()
+            || !(0.0..=1.0).contains(&label.quality_score)
+        {
+            return false;
+        }
+
+        let key = (action_key.to_string(), EFFECT_PRESSURE_DROP.to_string());
+        {
+            let edge = self
+                .edges
+                .entry(key)
+                .or_insert_with(|| CausalEdge::new(action_key, EFFECT_PRESSURE_DROP));
+            edge.observe_curated(
+                workload,
+                pressure_drop as f32,
+                label.quality_score as f32,
+                cycle,
+            );
+        }
+        self.compact_edges_if_needed();
+        true
+    }
+
     /// Record action with resource snapshot for mechanism attribution.
     /// [Pearl 2009] Ch.3 mediation: track resource channels (RSS, CPU, swap)
     /// to learn WHY an action was effective, not just WHETHER.
@@ -733,21 +922,24 @@ impl CausalGraph {
             }
         }
 
-        // In-cycle cap: persist-time prune in LearnedState::self_improve runs
-        // every ~300 cycles (~150s). Within that window the edges HashMap can
-        // grow with every unique (process_name, effect) pair the daemon sees,
-        // and lookups in solid_edges_by_impact / effectiveness become O(N).
-        // Hard cap at 500 entries; on overflow, evict the lowest-impact edge.
-        // The persist-time decay-and-retain still runs and does the principled
-        // GC; this is just a safety valve to keep hot-path lookups bounded.
-        // [Cormen et al. 2009] §11 — bounded-size HashMap keeps O(1) amortised.
+        self.compact_edges_if_needed();
+    }
+
+    /// Shared cap for raw evaluations and direct Gold admissions. Persist-time
+    /// pruning still performs the principled GC; this bounds hot-path scans
+    /// between maintenance passes. Mature curated evidence receives retention
+    /// credit even when it proves an action ineffective, because that negative
+    /// result is useful to the world model's do-nothing veto.
+    fn compact_edges_if_needed(&mut self) {
         if self.edges.len() > HOT_PATH_EDGE_CAP {
             // Score = impact_score (higher = more useful). Evict lowest.
             // Multiply by 1000 + cast to i32 for stable Ord.
             if let Some(weakest) = self
                 .edges
                 .iter()
-                .min_by_key(|(_, e)| (e.impact_score() * 1000.0) as i32)
+                .min_by_key(|(_, e)| {
+                    (e.impact_score().max(e.curated_impact_score()) * 1000.0) as i32
+                })
                 .map(|(k, _)| k.clone())
             {
                 self.edges.remove(&weakest);
@@ -775,17 +967,48 @@ impl CausalGraph {
         })
     }
 
-    /// Get all solid edges (high confidence, sufficient evidence).
-    /// All pressure-drop edges regardless of maturity (2026-06-12).
-    /// Consumer: WorldModel::from_parts — its `imagine()` gates apply
-    /// their OWN evidence/confidence thresholds (>=10 obs, >=0.30 conf),
-    /// so pre-filtering here at the is_solid() 0.7 bar silently starved
-    /// the model down to the rare super-solid edges and made the 0.30
-    /// gate dead code.
+    /// Raw pressure-drop edges regardless of maturity. This accessor preserves
+    /// observational graph consumers; world-model consumers must use
+    /// [`Self::curated_prediction_evidence`] instead.
     pub fn pressure_drop_edges(&self) -> impl Iterator<Item = &CausalEdge> {
         self.edges
             .values()
             .filter(|e| e.effect == EFFECT_PRESSURE_DROP)
+    }
+
+    /// Gold-only action predictions projected for the active workload.
+    /// Raw fast/slow causal observations are intentionally invisible here.
+    pub fn curated_prediction_evidence<'a>(
+        &'a self,
+        workload: &'a str,
+    ) -> impl Iterator<Item = (&'a str, CuratedPredictionEvidence)> + 'a {
+        self.edges.values().filter_map(move |edge| {
+            if edge.effect != EFFECT_PRESSURE_DROP || !edge.has_curated_evidence() {
+                return None;
+            }
+            Some((
+                edge.cause.as_str(),
+                CuratedPredictionEvidence {
+                    aggregate: edge.curated.aggregate,
+                    contextual: edge.curated.contextual(workload),
+                },
+            ))
+        })
+    }
+
+    pub fn curated_action_count(&self) -> usize {
+        self.edges
+            .values()
+            .filter(|edge| edge.effect == EFFECT_PRESSURE_DROP && edge.has_curated_evidence())
+            .count()
+    }
+
+    pub fn curated_gold_evidence_total(&self) -> u64 {
+        self.edges
+            .values()
+            .filter(|edge| edge.effect == EFFECT_PRESSURE_DROP)
+            .map(|edge| edge.curated.aggregate.observations as u64)
+            .sum()
     }
 
     pub fn solid_edges(&self) -> Vec<&CausalEdge> {
@@ -987,12 +1210,12 @@ impl CausalGraph {
             .count()
     }
 
-    /// Snapshot edges for persistence. Only persists edges with ≥ 3 evidence
-    /// (skip noise from very early observations).
+    /// Snapshot edges for persistence. Raw edges need at least three samples;
+    /// one Gold outcome is already valuable and must survive restart.
     pub fn to_persisted(&self) -> Vec<((String, String), CausalEdge)> {
         self.edges
             .iter()
-            .filter(|(_, e)| e.evidence_count >= 3)
+            .filter(|(_, e)| e.evidence_count >= 3 || e.has_curated_evidence())
             .map(|(k, e)| (k.clone(), e.clone()))
             .collect()
     }
@@ -1000,10 +1223,18 @@ impl CausalGraph {
     /// Restore edges from persisted snapshot. Merges with any existing edges.
     pub fn restore(&mut self, persisted: Vec<((String, String), CausalEdge)>) {
         for (key, edge) in persisted {
-            // Only restore if we don't already have fresher data.
+            // Raw and curated streams can advance independently. Preserve the
+            // fresher stream from each side instead of replacing one whole edge
+            // and accidentally discarding newer evidence from the other.
             let entry = self.edges.entry(key).or_insert_with(|| edge.clone());
+            let existing_curated = entry.curated.clone();
             if entry.evidence_count < edge.evidence_count {
                 *entry = edge;
+                if existing_curated.aggregate.observations > entry.curated.aggregate.observations {
+                    entry.curated = existing_curated;
+                }
+            } else if entry.curated.aggregate.observations < edge.curated.aggregate.observations {
+                entry.curated = edge.curated;
             }
         }
     }
@@ -1177,6 +1408,7 @@ impl CausalGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::data_medallion::{DataMedallion, MedallionObservation, MedallionTier};
 
     #[test]
     fn test_new_edge_uninformed() {
@@ -1184,6 +1416,150 @@ mod tests {
         assert_eq!(e.confidence, 0.5);
         assert_eq!(e.evidence_count, 0);
         assert!(!e.is_solid());
+    }
+
+    #[test]
+    fn curated_stream_accepts_only_gold_and_tracks_workload() {
+        let mut graph = CausalGraph::new();
+        assert!(!graph.observe_curated_outcome(
+            "freeze:Editor",
+            "build",
+            0.08,
+            1,
+            CuratedLabel::pipeline_disabled(),
+        ));
+        assert_eq!(graph.curated_action_count(), 0);
+
+        let mut medallion = DataMedallion::new();
+        let silver = medallion.curate(MedallionObservation {
+            process_name: "pid:42",
+            workload: "build",
+            pre_pressure: 0.80,
+            post_pressure: 0.72,
+            cycle: 2,
+            action_code: 1,
+        });
+        assert_eq!(silver.tier, MedallionTier::Silver);
+        assert!(!graph.observe_curated_outcome("freeze:Editor", "build", 0.08, 2, silver,));
+
+        let gold = medallion.curate(MedallionObservation {
+            process_name: "Editor",
+            workload: "build",
+            pre_pressure: 0.80,
+            post_pressure: 0.72,
+            cycle: 3,
+            action_code: 1,
+        });
+        assert!(gold.is_gold());
+        assert!(graph.observe_curated_outcome("freeze:Editor", "build", 0.08, 3, gold,));
+
+        let (_, evidence) = graph
+            .curated_prediction_evidence("build")
+            .next()
+            .expect("Gold evidence must be visible to the world model");
+        assert_eq!(evidence.aggregate.observations, 1);
+        assert_eq!(evidence.aggregate.effective_observations, 1);
+        assert_eq!(evidence.aggregate.avg_pressure_drop, 0.08);
+        assert_eq!(evidence.contextual.unwrap().observations, 1);
+        assert_eq!(graph.curated_action_count(), 1);
+        assert_eq!(graph.curated_gold_evidence_total(), 1);
+    }
+
+    #[test]
+    fn curated_only_edge_survives_persistence_and_legacy_json_defaults_clean() {
+        let mut graph = CausalGraph::new();
+        assert!(graph.observe_curated_outcome(
+            "throttle:Compiler",
+            "build",
+            0.04,
+            9,
+            CuratedLabel::trusted_legacy(),
+        ));
+
+        let persisted = graph.to_persisted();
+        assert_eq!(persisted.len(), 1, "one Gold sample must survive restart");
+        let mut restored = CausalGraph::new();
+        restored.restore(persisted);
+        assert_eq!(restored.curated_gold_evidence_total(), 1);
+
+        let edge = CausalEdge::new("throttle:Legacy", EFFECT_PRESSURE_DROP);
+        let mut legacy = serde_json::to_value(edge).unwrap();
+        legacy.as_object_mut().unwrap().remove("curated");
+        let restored_legacy: CausalEdge = serde_json::from_value(legacy).unwrap();
+        assert!(!restored_legacy.has_curated_evidence());
+    }
+
+    #[test]
+    fn restore_merges_raw_and_curated_freshness_without_losing_either() {
+        let mut raw_newer = CausalEdge::new("throttle:Compiler", EFFECT_PRESSURE_DROP);
+        raw_newer.evidence_count = 20;
+        raw_newer.confidence = 0.80;
+        let key = (
+            "throttle:Compiler".to_string(),
+            EFFECT_PRESSURE_DROP.to_string(),
+        );
+        let mut graph = CausalGraph::new();
+        graph.restore(vec![(key.clone(), raw_newer)]);
+
+        let mut curated_newer = CausalGraph::new();
+        for cycle in 0..10 {
+            assert!(curated_newer.observe_curated_outcome(
+                "throttle:Compiler",
+                "build",
+                0.04,
+                cycle,
+                CuratedLabel::trusted_legacy(),
+            ));
+        }
+        graph.restore(curated_newer.to_persisted());
+        let merged = graph
+            .get_edge("throttle:Compiler", EFFECT_PRESSURE_DROP)
+            .unwrap();
+        assert_eq!(merged.evidence_count, 20);
+        assert_eq!(graph.curated_gold_evidence_total(), 10);
+
+        let mut even_newer_raw = CausalEdge::new("throttle:Compiler", EFFECT_PRESSURE_DROP);
+        even_newer_raw.evidence_count = 30;
+        even_newer_raw.confidence = 0.90;
+        graph.restore(vec![(key, even_newer_raw)]);
+        let merged = graph
+            .get_edge("throttle:Compiler", EFFECT_PRESSURE_DROP)
+            .unwrap();
+        assert_eq!(merged.evidence_count, 30);
+        assert_eq!(graph.curated_gold_evidence_total(), 10);
+    }
+
+    #[test]
+    fn curated_admission_enforces_cap_and_retains_mature_negative_evidence() {
+        let mut graph = CausalGraph::new();
+        let gold = CuratedLabel::trusted_legacy();
+        for cycle in 0..10 {
+            assert!(graph.observe_curated_outcome(
+                "throttle:KnownFutile",
+                "build",
+                0.0,
+                cycle,
+                gold,
+            ));
+        }
+        for action in 0..HOT_PATH_EDGE_CAP {
+            assert!(graph.observe_curated_outcome(
+                &format!("throttle:Noisy-{action}"),
+                "build",
+                0.04,
+                (action + 10) as u64,
+                gold,
+            ));
+        }
+
+        assert_eq!(graph.edge_count(), HOT_PATH_EDGE_CAP);
+        assert_eq!(graph.evictions_total(), 1);
+        assert!(
+            graph
+                .get_edge("throttle:KnownFutile", EFFECT_PRESSURE_DROP)
+                .is_some(),
+            "mature negative evidence is useful for a do-nothing veto"
+        );
     }
 
     #[test]

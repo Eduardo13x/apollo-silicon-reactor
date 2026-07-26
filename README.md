@@ -59,7 +59,9 @@ Los outcomes resueltos cruzan un medallón de confianza antes de modificar Bayes
 | Silver | Mediciones finitas/acotadas e identidad válida | Diagnóstico; todavía no entrena |
 | Gold | Identidad estable, workload conocido, delta plausible y registro único | Único nivel admitido a learners persistentes |
 
-La curación no hace I/O y usa una ventana fija de fingerprints, por lo que su costo y memoria permanecen acotados. `runtime_metrics.json` publica totales Bronze/Silver/Gold, rechazos, inválidos, duplicados, calidad media y tasa Gold; el dashboard muestra `Data G <gold>/<bronze> q<quality>%`. AIS incorpora esta evidencia solo después de observar datos reales: calidad alta mejora D3, mientras volumen contaminado la penaliza.
+La curación no hace I/O y usa una ventana fija de fingerprints, por lo que su costo y memoria permanecen acotados. Solo Gold actualiza el canal causal privado que sirve de insumo al `WorldModel`; las observaciones crudas del grafo causal no pueden entrar a sus predicciones. El modelo prefiere evidencia Gold del workload activo cuando madura y usa el agregado como respaldo durante el arranque en frío. Si todavía no reúne 10 resultados Gold con calidad mínima de 90%, se abstiene y permite exploración en vez de bloquear acciones.
+
+`runtime_metrics.json` publica totales Bronze/Silver/Gold, rechazos, inválidos, duplicados, calidad media y tasa Gold, además de acciones conocidas/listas y evidencia Gold persistida del `WorldModel`. El dashboard muestra `Data G <gold>/<bronze> q<quality>%` y `World <ready>/<known> ready G<evidence> q<quality>%`. AIS incorpora esta evidencia solo después de observar datos reales: calidad alta mejora D3, mientras volumen contaminado la penaliza.
 
 ## Sistema Cognitivo
 

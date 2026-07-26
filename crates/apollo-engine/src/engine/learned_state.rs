@@ -868,6 +868,7 @@ impl LearnedState {
                 // Decay both fast and slow confidence toward uninformed prior (0.5).
                 edge.confidence = 0.5 + (edge.confidence - 0.5) * 0.97;
                 edge.slow_confidence = 0.5 + (edge.slow_confidence - 0.5) * 0.97;
+                edge.sanitize_curated();
                 // Decay mechanism attribution EMAs.
                 edge.mechanism.rss_delta_mb *= 0.95;
                 edge.mechanism.cpu_delta_pct *= 0.95;
@@ -887,7 +888,7 @@ impl LearnedState {
                     && e.mechanism.swap_delta_mb.abs() < 0.5;
                 let cold_unconverged = near_prior && e.evidence_count < 10;
                 let stale_high_evidence = near_prior && mech_dead;
-                !(cold_unconverged || stale_high_evidence)
+                e.has_curated_evidence() || !(cold_unconverged || stale_high_evidence)
             });
         }
 
@@ -1022,6 +1023,7 @@ impl LearnedState {
                 edge.slow_confidence = edge.slow_confidence.clamp(0.0, 1.0);
                 edge.avg_delta = edge.avg_delta.clamp(0.0, 1.0);
                 edge.slow_avg_delta = edge.slow_avg_delta.clamp(0.0, 1.0);
+                edge.sanitize_curated();
             }
         }
 

@@ -1438,6 +1438,19 @@ pub struct RuntimeMetrics {
     pub learning_data_quality: f64,
     #[serde(default)]
     pub learning_gold_rate: f64,
+    /// Gold-only world-model telemetry. Unlike process-local medallion totals,
+    /// these counters describe the persisted evidence currently available for
+    /// action imagination and vetoes.
+    #[serde(default)]
+    pub world_model_curated_actions: u64,
+    #[serde(default)]
+    pub world_model_ready_actions: u64,
+    #[serde(default)]
+    pub world_model_gold_evidence: u64,
+    #[serde(default)]
+    pub world_model_contextual_actions: u64,
+    #[serde(default)]
+    pub world_model_data_quality: f64,
     /// 2026-05-12 — Active regime selected by the chromium Step 2 gate's
     /// priority chain in daemon_chromium_tick.rs. One of: "default",
     /// "media", "build", "call", "llm". Surfaces silently-failing regime

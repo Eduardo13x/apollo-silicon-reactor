@@ -287,6 +287,22 @@ impl LearningPipeline {
             return label;
         }
 
+        // The world model's treatment predictions have one writer: Gold
+        // outcomes admitted here. Raw fast/slow CausalGraph observations remain
+        // useful elsewhere but cannot cross this trust boundary.
+        let causal_key = obs.causal_action_key();
+        let curated_recorded = causal_graph.observe_curated_outcome(
+            &causal_key,
+            &obs.workload,
+            obs.delta(),
+            obs.cycle,
+            label,
+        );
+        debug_assert!(
+            curated_recorded,
+            "Gold observation must satisfy causal contract"
+        );
+
         if self
             .outcome_preapplied
             .is_some_and(|current| current != outcome_preapplied)
@@ -1133,5 +1149,7 @@ mod tests {
         assert_eq!(weight.throttle_count, 1);
         assert_eq!(weight.effective_count, 1);
         assert!(cg.get_edge("throttle:Safari", "pressure_drop").is_some());
+        assert_eq!(cg.curated_action_count(), 1);
+        assert_eq!(cg.curated_gold_evidence_total(), 1);
     }
 }

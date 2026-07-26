@@ -51,6 +51,7 @@ use apollo_engine::engine::signal_intelligence::SignalDigest;
 use apollo_engine::engine::thermal_bailout::ThermalAction;
 use apollo_engine::engine::types::BlockerScore;
 use apollo_engine::engine::types::OptimizationProfile;
+use apollo_engine::engine::world_model::WorldModel;
 
 use crate::process_enrichment;
 
@@ -65,6 +66,7 @@ pub fn update_learning_metrics<'a>(
     agent_intervention: &Intervention,
     arousal_state: &ArousalState,
     learning_pipeline: &LearningPipeline,
+    world_model: &WorldModel,
 ) {
     let mut m = state.metrics.lock_recover();
     m.metrics.predictive_agent_active = lctx.predictive_agent.is_active();
@@ -83,6 +85,11 @@ pub fn update_learning_metrics<'a>(
     m.metrics.learning_duplicate_total = medallion.duplicate_total;
     m.metrics.learning_data_quality = medallion.mean_quality;
     m.metrics.learning_gold_rate = medallion.gold_rate;
+    m.metrics.world_model_curated_actions = world_model.known_actions() as u64;
+    m.metrics.world_model_ready_actions = world_model.ready_actions() as u64;
+    m.metrics.world_model_gold_evidence = world_model.curated_observations();
+    m.metrics.world_model_contextual_actions = world_model.contextual_actions() as u64;
+    m.metrics.world_model_data_quality = world_model.mean_data_quality();
     m.metrics.si_pressure_smooth = signal_digest.pressure_smooth;
     m.metrics.si_pressure_velocity = signal_digest.pressure_velocity;
     m.metrics.si_p_oom_30s = signal_digest.p_oom_30s;

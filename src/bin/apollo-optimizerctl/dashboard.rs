@@ -392,6 +392,13 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             m.learning_data_quality * 100.0
         ));
     }
+    lines.push(format!(
+        "World  {}/{} ready G{} q{:.0}%",
+        format_number(m.world_model_ready_actions),
+        format_number(m.world_model_curated_actions),
+        format_number(m.world_model_gold_evidence),
+        m.world_model_data_quality * 100.0
+    ));
 
     // RL Q-table
     if m.rl_total_ticks > 0 {
@@ -932,11 +939,19 @@ mod tests {
         status.metrics.learning_bronze_total = 200;
         status.metrics.learning_gold_total = 198;
         status.metrics.learning_data_quality = 0.99;
+        status.metrics.world_model_curated_actions = 3;
+        status.metrics.world_model_ready_actions = 2;
+        status.metrics.world_model_gold_evidence = 127;
+        status.metrics.world_model_contextual_actions = 1;
+        status.metrics.world_model_data_quality = 1.0;
 
         let think = render_think_q(&status);
 
         assert!(think.iter().any(|line| line == "AIS    92.4 S · L 88%"));
         assert!(think.iter().any(|line| line == "Data   G 198/200 q99%"));
+        assert!(think
+            .iter()
+            .any(|line| line == "World  2/3 ready G127 q100%"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 

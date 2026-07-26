@@ -3662,20 +3662,22 @@ fn main() -> anyhow::Result<()> {
                     &lctx.outcome_tracker.drift_detector,
                 );
                 let mut causal_impact = lctx.causal_graph.impact_map();
-                // World-model Mode-2 snapshot (2026-06-11): freeze predictions
-                // + Rubin do-nothing drift, queried by decide_actions before
-                // emitting freezes. [LeCun 2022 §4.2; Sutton Dyna 1991]
+                // World-model Mode-2 snapshot (2026-06-11): Gold-only action
+                // predictions + Rubin do-nothing drift, queried before actions.
+                // [LeCun 2022 §4.2; Sutton Dyna 1991]
                 // Calibrated imagination: the same MetaCognition debias that
                 // corrects the CausalGraph's meta-observe (87c342f) scales the
                 // world model's predicted deltas — calibration and imagination
                 // share one belief about causal over-promising.
-                let world_model = apollo_engine::engine::world_model::WorldModel::from_parts(
-                    &lctx.causal_graph,
-                    &lctx.outcome_tracker,
-                    cognitive_state.meta_cognition.subsystem_debias_multiplier(
-                        apollo_engine::engine::meta_cognition::SubsystemId::CausalGraph,
-                    ),
-                );
+                let world_model =
+                    apollo_engine::engine::world_model::WorldModel::from_parts_for_workload(
+                        lctx.causal_graph,
+                        lctx.outcome_tracker,
+                        cognitive_state.meta_cognition.subsystem_debias_multiplier(
+                            apollo_engine::engine::meta_cognition::SubsystemId::CausalGraph,
+                        ),
+                        workload_mode.as_str(),
+                    );
                 CausalGraph::apply_nars_discount(
                     &mut causal_impact,
                     &lctx.outcome_tracker.drift_detector,
@@ -5778,6 +5780,7 @@ fn main() -> anyhow::Result<()> {
                     &agent_intervention,
                     &arousal_state,
                     &learning_pipeline,
+                    &world_model,
                 );
                 metrics_reporter::apply_io_shaping(
                     cycle_count,
