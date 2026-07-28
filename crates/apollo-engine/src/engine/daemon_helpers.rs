@@ -205,6 +205,14 @@ pub fn learned_state_path() -> &'static str {
     }
 }
 
+pub fn installation_id_path() -> &'static str {
+    if is_root() {
+        "/var/lib/apollo/installation_id"
+    } else {
+        "/tmp/apollo-installation-id"
+    }
+}
+
 pub fn skills_path() -> &'static str {
     if is_root() {
         "/var/lib/apollo/optimization_skills.json"

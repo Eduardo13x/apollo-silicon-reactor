@@ -61,6 +61,7 @@ pub mod hw_bayes;
 pub mod hw_predictor;
 pub mod identity_cache;
 pub mod identity_cache_manager;
+pub mod installation_identity;
 pub mod intelligence_score;
 pub mod io_tiering;
 pub mod iokit_sensors;
