@@ -909,7 +909,14 @@ fn main() -> anyhow::Result<()> {
             } = daemon_init::DaemonSubsystems::new();
             let installation_id = apollo_engine::engine::installation_identity::load_or_create(
                 Path::new(installation_id_path()),
-            )?;
+            )
+            .unwrap_or_else(|error| {
+                tracing::error!(
+                    %error,
+                    "installation identity unavailable; World Model authority is protected"
+                );
+                apollo_engine::engine::installation_identity::InstallationId::UNKNOWN
+            });
             let mut telemetry_medallion =
                 apollo_engine::engine::telemetry_medallion::TelemetryMedallion::new(
                     installation_id,
