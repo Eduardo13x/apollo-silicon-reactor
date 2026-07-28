@@ -29,10 +29,13 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::engine::causal_graph::CausalGraph;
+use crate::engine::installation_identity::InstallationId;
 use crate::engine::outcome_tracker::OutcomeTracker;
 use crate::engine::telemetry_medallion::{
-    ActionModelStats, TelemetryContextSummary, TelemetryMedallion,
+    ActionModelStats, TelemetryContextSummary, TrustedTelemetryView,
 };
 
 /// Minimum causal-edge evidence before a prediction is trusted enough to
@@ -86,6 +89,16 @@ pub enum UtilityImagined {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAuthorityPhase {
+    #[default]
+    Protected,
+    Calibrating,
+    Trusted,
+    Suspended,
+}
+
 /// Per-cycle snapshot of the learned action-conditioned predictions plus
 /// the do-nothing baseline. Built once per decision cycle from the live
 /// CausalGraph + OutcomeTracker (O(edges), no allocation per query).
@@ -105,6 +118,8 @@ pub struct WorldModel {
     context_gold: u64,
     context_quality: f64,
     latest_context: Option<TelemetryContextSummary>,
+    current_installation_id: InstallationId,
+    authority_phase: ModelAuthorityPhase,
     /// Action key -> (counterfactual-adjusted utility EMA, data quality,
     /// Gold observations). Populated from the universal actuator medallion.
     utility_predicted: HashMap<String, ActionModelStats>,
@@ -273,27 +288,37 @@ impl WorldModel {
     /// Attach the current live-system context to the model facade. Context is
     /// available for future sequence imagination, but never changes the
     /// action-causal prediction map or its safety thresholds.
-    pub fn attach_context(&mut self, telemetry: &TelemetryMedallion) {
-        let metrics = telemetry.metrics();
-        self.context_bronze = metrics.bronze_total;
-        self.context_silver = metrics.silver_total;
-        self.context_gold = metrics.gold_total;
-        self.context_quality = metrics.mean_quality;
-        self.latest_context = telemetry.latest().cloned();
-        let revision = telemetry.action_models_revision();
-        if self.utility_revision == Some(revision) {
+    pub fn attach_context(&mut self, view: TrustedTelemetryView<'_>) {
+        let local_gold_total = view.metrics.local_gold_total;
+        self.context_bronze = view.metrics.bronze_total;
+        self.context_silver = view.metrics.silver_total;
+        self.context_gold = view.metrics.gold_total;
+        self.context_quality = view.metrics.mean_quality;
+        self.latest_context = view.current.cloned();
+        self.current_installation_id = view.installation_id;
+        if self.utility_revision == Some(view.action_models_revision) {
             self.utility_cache_hits = self.utility_cache_hits.saturating_add(1);
-            return;
+        } else {
+            self.utility_predicted.clear();
+            self.utility_predicted.extend(
+                view.action_models
+                    .iter()
+                    .map(|(key, stats)| (key.clone(), stats.clone())),
+            );
+            self.utility_revision = Some(view.action_models_revision);
+            self.utility_refreshes = self.utility_refreshes.saturating_add(1);
         }
-        self.utility_predicted.clear();
-        self.utility_predicted.extend(
-            telemetry
-                .action_models()
-                .iter()
-                .map(|(key, stats)| (key.clone(), stats.clone())),
-        );
-        self.utility_revision = Some(revision);
-        self.utility_refreshes = self.utility_refreshes.saturating_add(1);
+        self.authority_phase = if self.latest_context.is_none() {
+            if local_gold_total == 0 {
+                ModelAuthorityPhase::Protected
+            } else {
+                ModelAuthorityPhase::Suspended
+            }
+        } else if self.utility_ready_actions() == 0 {
+            ModelAuthorityPhase::Calibrating
+        } else {
+            ModelAuthorityPhase::Trusted
+        };
     }
 
     pub fn cache_stats(&self) -> (u64, u64, u64, u64) {
@@ -322,7 +347,14 @@ impl WorldModel {
         ]
         .into_iter()
         .flatten()
-        .find(|stats| utility_model_ready(stats, now_unix, self.latest_context.as_ref()));
+        .find(|stats| {
+            utility_model_ready(
+                stats,
+                now_unix,
+                self.latest_context.as_ref(),
+                self.current_installation_id,
+            )
+        });
         let Some(stats) = selected else {
             return UtilityImagined::Unknown;
         };
@@ -335,7 +367,7 @@ impl WorldModel {
             UtilityImagined::ActWins {
                 margin: lower - DOMINANCE_MARGIN,
             }
-        } else if upper <= DOMINANCE_MARGIN {
+        } else if upper <= 0.0 {
             UtilityImagined::DoNothingDominates {
                 predicted_utility: stats.utility_ema,
             }
@@ -359,7 +391,12 @@ impl WorldModel {
             .iter()
             .filter(|(key, stats)| {
                 actionable_utility_key(key)
-                    && utility_model_ready(stats, now_unix, self.latest_context.as_ref())
+                    && utility_model_ready(
+                        stats,
+                        now_unix,
+                        self.latest_context.as_ref(),
+                        self.current_installation_id,
+                    )
             })
             .count()
     }
@@ -382,6 +419,10 @@ impl WorldModel {
 
     pub fn latest_context(&self) -> Option<&TelemetryContextSummary> {
         self.latest_context.as_ref()
+    }
+
+    pub fn authority_phase(&self) -> ModelAuthorityPhase {
+        self.authority_phase
     }
 
     /// Maximum predicted pressure-drop advantage over the natural drift,
@@ -410,19 +451,152 @@ fn utility_model_ready(
     stats: &ActionModelStats,
     now_unix: i64,
     context: Option<&TelemetryContextSummary>,
+    installation_id: InstallationId,
 ) -> bool {
-    stats.quality_ema >= MIN_UTILITY_DATA_QUALITY
+    let base_ready = stats.quality_ema >= MIN_UTILITY_DATA_QUALITY
         && stats.last_observed_unix > 0
         && now_unix >= stats.last_observed_unix
         && now_unix - stats.last_observed_unix <= UTILITY_MAX_AGE_SECS
         && stats.effective_evidence_at(now_unix) >= MIN_UTILITY_EVIDENCE
-        && context.is_none_or(|context| stats.hardware_regime.matches_context(context))
+        && context.is_some_and(|context| stats.hardware_regime.matches_context(context))
+        && installation_id.is_known()
+        && stats.installation_id == installation_id;
+    if !base_ready {
+        return false;
+    }
+    let evidence = stats.effective_evidence_at(now_unix);
+    let standard_error = (stats.utility_variance_ema.max(UTILITY_VARIANCE_FLOOR) / evidence).sqrt();
+    let lower = stats.utility_ema - UTILITY_CONFIDENCE_Z * standard_error;
+    let upper = stats.utility_ema + UTILITY_CONFIDENCE_Z * standard_error;
+    lower > DOMINANCE_MARGIN || upper <= 0.0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::installation_identity::InstallationId;
+    use crate::engine::telemetry_medallion::{
+        HardwareRegime, TelemetryMedallion, TelemetryMedallionMetrics, TrustedTelemetryView,
+    };
+    use chrono::Utc;
+    use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
+
+    const LOCAL_ID: InstallationId = InstallationId(0x1020_3040_5060_7080);
+
+    fn m4_context(now_unix: i64) -> TelemetryContextSummary {
+        TelemetryContextSummary {
+            cycle: 100,
+            timestamp_unix: now_unix,
+            workload: "build".to_string(),
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            cpu_core_count: 10,
+            p_core_count: 4,
+            e_core_count: 6,
+            reactor_healthy: true,
+            collector_pressure_alive: true,
+            ..TelemetryContextSummary::default()
+        }
+    }
+
+    fn mature_model(now_unix: i64, installation_id: InstallationId) -> ActionModelStats {
+        ActionModelStats {
+            observations: 20,
+            effective_observations: 18,
+            utility_ema: 0.08,
+            evidence_mass: 20.0,
+            utility_variance_ema: 0.0001,
+            quality_ema: 0.95,
+            last_cycle: 100,
+            last_observed_unix: now_unix,
+            hardware_regime: HardwareRegime {
+                p_core_count: 4,
+                e_core_count: 6,
+                ram_gib: 16,
+            },
+            installation_id,
+        }
+    }
+
+    fn attach_view(
+        model: &mut WorldModel,
+        context: Option<&TelemetryContextSummary>,
+        models: &BTreeMap<String, ActionModelStats>,
+        local_gold_total: u64,
+    ) {
+        model.attach_context(TrustedTelemetryView {
+            current: context,
+            installation_id: LOCAL_ID,
+            action_models: models,
+            action_models_revision: 1,
+            metrics: TelemetryMedallionMetrics {
+                bronze_total: local_gold_total,
+                gold_total: local_gold_total,
+                local_gold_total,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+    }
+
+    #[test]
+    fn world_model_abstains_without_current_gold_even_with_mature_models() {
+        let now = Utc::now().timestamp();
+        let models = BTreeMap::from([("boost:Editor".to_string(), mature_model(now, LOCAL_ID))]);
+        let mut model = WorldModel::default();
+        attach_view(&mut model, None, &models, 1);
+        assert_eq!(model.authority_phase(), ModelAuthorityPhase::Suspended);
+        assert_eq!(model.utility_ready_actions(), 0);
+        assert_eq!(
+            model.imagine_utility("boost:Editor", "build"),
+            UtilityImagined::Unknown
+        );
+    }
+
+    #[test]
+    fn authority_progresses_from_protected_to_calibrating_to_trusted() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let empty = BTreeMap::new();
+        let mut model = WorldModel::default();
+        attach_view(&mut model, None, &empty, 0);
+        assert_eq!(model.authority_phase(), ModelAuthorityPhase::Protected);
+
+        attach_view(&mut model, Some(&context), &empty, 1);
+        assert_eq!(model.authority_phase(), ModelAuthorityPhase::Calibrating);
+
+        let models = BTreeMap::from([("boost:Editor".to_string(), mature_model(now, LOCAL_ID))]);
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id: LOCAL_ID,
+            action_models: &models,
+            action_models_revision: 2,
+            metrics: TelemetryMedallionMetrics {
+                bronze_total: 1,
+                gold_total: 1,
+                local_gold_total: 1,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+        assert_eq!(model.authority_phase(), ModelAuthorityPhase::Trusted);
+    }
+
+    #[test]
+    fn stale_variance_and_origin_change_revoke_trust() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let mut stale = mature_model(now, LOCAL_ID);
+        stale.last_observed_unix = now - UTILITY_MAX_AGE_SECS - 1;
+        let mut uncertain = mature_model(now, LOCAL_ID);
+        uncertain.utility_variance_ema = 1.0;
+        let foreign = mature_model(now, InstallationId(99));
+        for stats in [stale, uncertain, foreign] {
+            let models = BTreeMap::from([("boost:Editor".to_string(), stats)]);
+            let mut model = WorldModel::default();
+            attach_view(&mut model, Some(&context), &models, 1);
+            assert_ne!(model.authority_phase(), ModelAuthorityPhase::Trusted);
+            assert_eq!(model.utility_ready_actions(), 0);
+        }
+    }
 
     fn model_with(key: &str, delta: f64, quality: f32, evidence: u32, drift: f64) -> WorldModel {
         let mut predicted = HashMap::new();
@@ -570,20 +744,12 @@ mod tests {
 
     #[test]
     fn universal_gold_actuator_models_drive_utility_imagination() {
-        let mut telemetry =
-            TelemetryMedallion::new(crate::engine::installation_identity::InstallationId(1));
-        let mut persisted =
-            crate::engine::telemetry_medallion::TelemetryMedallionPersisted::default();
-        persisted.actuator_evidence_schema_version = 2;
-        let now_unix = 1_000_000;
-        persisted.latest = Some(TelemetryContextSummary {
-            timestamp_unix: now_unix,
-            ..TelemetryContextSummary::default()
-        });
-        persisted.action_models = [
+        let now_unix = Utc::now().timestamp();
+        let context = m4_context(now_unix);
+        let models = [
             (
                 "build|boost:Editor".to_string(),
-                crate::engine::telemetry_medallion::ActionModelStats {
+                ActionModelStats {
                     observations: 12,
                     effective_observations: 10,
                     utility_ema: 0.08,
@@ -592,13 +758,17 @@ mod tests {
                     quality_ema: 0.95,
                     last_cycle: 100,
                     last_observed_unix: now_unix,
-                    hardware_regime: Default::default(),
-                    installation_id: crate::engine::installation_identity::InstallationId(1),
+                    hardware_regime: HardwareRegime {
+                        p_core_count: 4,
+                        e_core_count: 6,
+                        ram_gib: 16,
+                    },
+                    installation_id: LOCAL_ID,
                 },
             ),
             (
                 "thread_qos:Worker:background".to_string(),
-                crate::engine::telemetry_medallion::ActionModelStats {
+                ActionModelStats {
                     observations: 15,
                     effective_observations: 2,
                     utility_ema: -0.03,
@@ -607,16 +777,19 @@ mod tests {
                     quality_ema: 0.93,
                     last_cycle: 101,
                     last_observed_unix: now_unix,
-                    hardware_regime: Default::default(),
-                    installation_id: crate::engine::installation_identity::InstallationId(1),
+                    hardware_regime: HardwareRegime {
+                        p_core_count: 4,
+                        e_core_count: 6,
+                        ram_gib: 16,
+                    },
+                    installation_id: LOCAL_ID,
                 },
             ),
         ]
         .into_iter()
         .collect();
-        telemetry.restore(persisted);
         let mut model = WorldModel::default();
-        model.attach_context(&telemetry);
+        attach_view(&mut model, Some(&context), &models, 1);
 
         assert!(matches!(
             model.imagine_utility("boost:Editor", "build"),
@@ -675,7 +848,7 @@ mod tests {
         .collect();
         telemetry.restore(persisted);
         let mut model = WorldModel::default();
-        model.attach_context(&telemetry);
+        model.attach_context(telemetry.trusted_view());
 
         assert_eq!(
             model.imagine_utility("boost:Stale", "idle"),
@@ -723,7 +896,7 @@ mod tests {
         );
         telemetry.restore(persisted);
         let mut model = WorldModel::default();
-        model.attach_context(&telemetry);
+        model.attach_context(telemetry.trusted_view());
 
         assert_eq!(model.utility_known_actions(), 1);
         assert_eq!(model.utility_ready_actions(), 0);
@@ -735,16 +908,8 @@ mod tests {
 
     #[test]
     fn immature_workload_bucket_falls_back_to_mature_aggregate() {
-        let now_unix = 3_000_000;
-        let mut telemetry =
-            TelemetryMedallion::new(crate::engine::installation_identity::InstallationId(1));
-        let mut persisted =
-            crate::engine::telemetry_medallion::TelemetryMedallionPersisted::default();
-        persisted.actuator_evidence_schema_version = 2;
-        persisted.latest = Some(TelemetryContextSummary {
-            timestamp_unix: now_unix,
-            ..TelemetryContextSummary::default()
-        });
+        let now_unix = Utc::now().timestamp();
+        let context = m4_context(now_unix);
         let mature = ActionModelStats {
             observations: 20,
             evidence_mass: 20.0,
@@ -752,6 +917,12 @@ mod tests {
             utility_variance_ema: 0.0001,
             quality_ema: 0.95,
             last_observed_unix: now_unix,
+            hardware_regime: HardwareRegime {
+                p_core_count: 4,
+                e_core_count: 6,
+                ram_gib: 16,
+            },
+            installation_id: LOCAL_ID,
             ..ActionModelStats::default()
         };
         let immature = ActionModelStats {
@@ -761,17 +932,20 @@ mod tests {
             utility_variance_ema: 0.0001,
             quality_ema: 0.95,
             last_observed_unix: now_unix,
+            hardware_regime: HardwareRegime {
+                p_core_count: 4,
+                e_core_count: 6,
+                ram_gib: 16,
+            },
+            installation_id: LOCAL_ID,
             ..ActionModelStats::default()
         };
-        persisted
-            .action_models
-            .insert("boost:Editor".to_string(), mature);
-        persisted
-            .action_models
-            .insert("build|boost:Editor".to_string(), immature);
-        telemetry.restore(persisted);
+        let models = BTreeMap::from([
+            ("boost:Editor".to_string(), mature),
+            ("build|boost:Editor".to_string(), immature),
+        ]);
         let mut model = WorldModel::default();
-        model.attach_context(&telemetry);
+        attach_view(&mut model, Some(&context), &models, 1);
 
         assert!(matches!(
             model.imagine_utility("boost:Editor", "build"),
@@ -788,9 +962,9 @@ mod tests {
         let mut model = WorldModel::default();
 
         model.refresh_from_parts_for_workload(&graph, &tracker, 1.0, "build");
-        model.attach_context(&telemetry);
+        model.attach_context(telemetry.trusted_view());
         model.refresh_from_parts_for_workload(&graph, &tracker, 1.0, "build");
-        model.attach_context(&telemetry);
+        model.attach_context(telemetry.trusted_view());
         assert_eq!(model.cache_stats(), (1, 1, 1, 1));
 
         let gold = crate::engine::data_medallion::CuratedLabel::trusted_legacy();

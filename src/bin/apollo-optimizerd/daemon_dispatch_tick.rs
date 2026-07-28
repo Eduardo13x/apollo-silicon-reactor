@@ -1045,23 +1045,22 @@ mod tests {
     #[test]
     fn mature_negative_utility_vetoes_only_discretionary_actions() {
         use apollo_engine::engine::telemetry_medallion::{
-            ActionModelStats, TelemetryMedallion, TelemetryMedallionPersisted,
+            ActionModelStats, HardwareRegime, TelemetryContextSummary, TelemetryMedallionMetrics,
+            TrustedTelemetryView,
         };
         use apollo_engine::engine::world_model::WorldModel;
 
-        let mut telemetry = TelemetryMedallion::new(
-            apollo_engine::engine::installation_identity::InstallationId(1),
-        );
-        let mut persisted = TelemetryMedallionPersisted::default();
-        persisted.actuator_evidence_schema_version = 2;
-        let now_unix = 1_000_000;
-        persisted.latest = Some(
-            apollo_engine::engine::telemetry_medallion::TelemetryContextSummary {
-                timestamp_unix: now_unix,
-                ..Default::default()
-            },
-        );
-        persisted.action_models = [(
+        let installation_id = apollo_engine::engine::installation_identity::InstallationId(1);
+        let now_unix = chrono::Utc::now().timestamp();
+        let context = TelemetryContextSummary {
+            timestamp_unix: now_unix,
+            cpu_core_count: 10,
+            p_core_count: 4,
+            e_core_count: 6,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let action_models = [(
             "idle|boost:p100".to_string(),
             ActionModelStats {
                 observations: 12,
@@ -1072,14 +1071,29 @@ mod tests {
                 quality_ema: 0.95,
                 last_cycle: 100,
                 last_observed_unix: now_unix,
-                hardware_regime: Default::default(),
+                hardware_regime: HardwareRegime {
+                    p_core_count: 4,
+                    e_core_count: 6,
+                    ram_gib: 16,
+                },
+                installation_id,
             },
         )]
         .into_iter()
         .collect();
-        telemetry.restore(persisted);
         let mut model = WorldModel::default();
-        model.attach_context(&telemetry);
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id,
+            action_models: &action_models,
+            action_models_revision: 1,
+            metrics: TelemetryMedallionMetrics {
+                bronze_total: 1,
+                gold_total: 1,
+                local_gold_total: 1,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
 
         assert_eq!(
             utility_model_vetoes(&boost(100), &model, "idle").as_deref(),
@@ -1092,23 +1106,22 @@ mod tests {
     #[test]
     fn mature_positive_utility_advances_only_accelerator_slots() {
         use apollo_engine::engine::telemetry_medallion::{
-            ActionModelStats, TelemetryMedallion, TelemetryMedallionPersisted,
+            ActionModelStats, HardwareRegime, TelemetryContextSummary, TelemetryMedallionMetrics,
+            TrustedTelemetryView,
         };
         use apollo_engine::engine::world_model::WorldModel;
 
-        let mut telemetry = TelemetryMedallion::new(
-            apollo_engine::engine::installation_identity::InstallationId(1),
-        );
-        let mut persisted = TelemetryMedallionPersisted::default();
-        persisted.actuator_evidence_schema_version = 2;
-        let now_unix = 1_000_000;
-        persisted.latest = Some(
-            apollo_engine::engine::telemetry_medallion::TelemetryContextSummary {
-                timestamp_unix: now_unix,
-                ..Default::default()
-            },
-        );
-        persisted.action_models = [(
+        let installation_id = apollo_engine::engine::installation_identity::InstallationId(1);
+        let now_unix = chrono::Utc::now().timestamp();
+        let context = TelemetryContextSummary {
+            timestamp_unix: now_unix,
+            cpu_core_count: 10,
+            p_core_count: 4,
+            e_core_count: 6,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let action_models = [(
             "build|boost:p200".to_string(),
             ActionModelStats {
                 observations: 12,
@@ -1119,14 +1132,29 @@ mod tests {
                 quality_ema: 0.95,
                 last_cycle: 100,
                 last_observed_unix: now_unix,
-                hardware_regime: Default::default(),
+                hardware_regime: HardwareRegime {
+                    p_core_count: 4,
+                    e_core_count: 6,
+                    ram_gib: 16,
+                },
+                installation_id,
             },
         )]
         .into_iter()
         .collect();
-        telemetry.restore(persisted);
         let mut model = WorldModel::default();
-        model.attach_context(&telemetry);
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id,
+            action_models: &action_models,
+            action_models_revision: 1,
+            metrics: TelemetryMedallionMetrics {
+                bronze_total: 1,
+                gold_total: 1,
+                local_gold_total: 1,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
 
         let (actions, promoted) = prioritize_world_model_accelerators(
             vec![boost(100), freeze(900), boost(200)],

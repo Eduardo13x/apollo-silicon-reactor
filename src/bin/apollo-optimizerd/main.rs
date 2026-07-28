@@ -3727,7 +3727,7 @@ fn main() -> anyhow::Result<()> {
                     ),
                     workload_mode.as_str(),
                 );
-                world_model.attach_context(&telemetry_medallion);
+                world_model.attach_context(telemetry_medallion.trusted_view());
                 CausalGraph::apply_nars_discount(
                     &mut causal_impact,
                     &lctx.outcome_tracker.drift_detector,
@@ -5696,7 +5696,7 @@ fn main() -> anyhow::Result<()> {
                 // Refresh the facade after observation so metrics history and
                 // dashboard consume this cycle's context and any outcomes that
                 // just matured. Dispatch already used the prior-cycle model.
-                world_model.attach_context(&telemetry_medallion);
+                world_model.attach_context(telemetry_medallion.trusted_view());
 
                 // NARS belief routing for newly-frozen non-chromium PIDs
                 // (Sprint A 2026-05-10). chromium_mgr already routes its own
