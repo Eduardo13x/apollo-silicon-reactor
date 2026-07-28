@@ -44,8 +44,8 @@ confident for the wrong reasons.
    it can influence any learning or decision path.
 2. Preserve useful but incomplete observations as diagnostics without granting
    them decision authority.
-3. Require local, hardware-compatible evidence before imported state can affect
-   World Model decisions.
+3. Require local, installation-bound and hardware-compatible evidence before
+   imported state can affect World Model decisions.
 4. Let reversible acceleration become more assertive only when confidence and
    measured user benefit improve on this machine.
 5. Fall back to the existing stable policy or no-op whenever context or outcome
@@ -59,6 +59,8 @@ confident for the wrong reasons.
 ## Non-Goals
 
 - Apollo will not modify the XNU kernel or invent new privileged actuators.
+- Apollo will not read, persist, or expose a hardware serial number for model
+  identity.
 - The World Model will not bypass the existing action safety, capability,
   thermal, memory-pressure, cooldown, audit, or rollback gates.
 - The design will not hard-code thresholds for one marketing chip name.
@@ -96,6 +98,8 @@ will return a `ContextAdmission` containing:
 - `quality`: finite value in `[0, 1]`;
 - `reasons`: a bounded bitset of stable reason codes;
 - `hardware_regime`: capability-derived P-core, E-core, and RAM class;
+- `installation_id`: a random, nonzero identifier stored separately from
+  portable learned state;
 - `local_epoch`: whether the context was observed in the current daemon epoch.
 
 The validator receives the candidate summary, the last admitted live summary,
@@ -171,6 +175,9 @@ evidence instead of manufacturing a low-quality label.
 The persisted telemetry schema version will advance. Restore is audit-only
 until the daemon observes the first local Gold context:
 
+- a random installation identifier is created once in Apollo's state directory
+  with owner-only permissions; it is not derived from a serial number and is
+  not part of portable model exports;
 - persisted `latest` never becomes live decision context;
 - pending actions are discarded because their endpoint continuity cannot
   survive restart or machine transfer;
@@ -179,7 +186,8 @@ until the daemon observes the first local Gold context:
 - action-model observations may remain for audit, but effective evidence is
   zero when schema, freshness, wall clock, or hardware regime is unknown or
   incompatible;
-- imported M1 models cannot define the current M4 hardware regime;
+- imported M1 or same-class foreign models cannot define the current M4
+  hardware regime or installation identity;
 - the first local Gold sample establishes the live regime, after which matching
   fresh priors may be evaluated under existing confidence rules.
 
@@ -323,8 +331,9 @@ Implementation follows strict TDD. Each behavior begins with a failing test.
    authority.
 2. Rejected and Silver samples produce zero changes to the no-action baseline,
    pending evidence endpoints, action models, and World Model trusted context.
-3. No restored state can create a ready M4 action model before at least one
-   compatible local Gold context and sufficient fresh local Gold outcomes.
+3. No restored state with a missing or foreign installation identifier can
+   create a ready M4 action model before compatible local Gold context and
+   sufficient fresh local Gold outcomes exist.
 4. Clean M4 fixtures covering optional collector combinations are admitted
    without requiring unavailable optional sensors.
 5. Authority increases only from fresh local Gold evidence with positive
@@ -344,4 +353,3 @@ binaries and `/var/lib/apollo` learned state, stop the LaunchDaemon, atomically
 install the verified release artifacts, restart it, and run the canary. If
 health, failures, admission, p95, or fluidity violate acceptance thresholds,
 restore the previous binaries and learned state and restart the prior daemon.
-
