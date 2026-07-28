@@ -462,9 +462,21 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         .map(|a| a.len())
         .unwrap_or(0) as u32;
     let dyna_transitions = rm_f("predictive_agent_cycles") as u64;
-    let learning_raw_observations = rm_u("learning_bronze_total");
-    let learning_gold_observations = rm_u("learning_gold_total");
-    let learning_data_quality = rm_f("learning_data_quality").clamp(0.0, 1.0);
+    let pressure_learning_raw = rm_u("learning_bronze_total");
+    let pressure_learning_gold = rm_u("learning_gold_total");
+    let pressure_learning_quality = rm_f("learning_data_quality").clamp(0.0, 1.0);
+    let actuator_learning_raw = rm_u("world_model_actuator_bronze_total");
+    let actuator_learning_gold = rm_u("world_model_actuator_gold_total");
+    let actuator_learning_quality = rm_f("world_model_actuator_quality").clamp(0.0, 1.0);
+    let (learning_raw_observations, learning_gold_observations, learning_data_quality) =
+        merge_learning_evidence(
+            pressure_learning_raw,
+            pressure_learning_gold,
+            pressure_learning_quality,
+            actuator_learning_raw,
+            actuator_learning_gold,
+            actuator_learning_quality,
+        );
 
     // D7 Wisdom signals — read from live runtime + file system.
     let causal_mechanism_count = rm_u("causal_mechanism_count") as u32;
@@ -1121,6 +1133,31 @@ fn safe_ratio(num: u64, den: u64) -> f64 {
     }
 }
 
+fn merge_learning_evidence(
+    pressure_raw: u64,
+    pressure_gold: u64,
+    pressure_quality: f64,
+    actuator_raw: u64,
+    actuator_gold: u64,
+    actuator_quality: f64,
+) -> (u64, u64, f64) {
+    // The universal stream contains the pressure actions too. `max` expands
+    // coverage without counting throttle/freeze/memorystatus twice.
+    let raw = pressure_raw.max(actuator_raw);
+    let gold = pressure_gold.max(actuator_gold).min(raw);
+    let quality = match (pressure_raw, actuator_raw) {
+        (0, 0) => 0.0,
+        (_, 0) => pressure_quality,
+        (0, _) => actuator_quality,
+        (pressure, actuator) => {
+            let total = pressure.saturating_add(actuator).max(1) as f64;
+            (pressure_quality * pressure as f64 + actuator_quality * actuator as f64) / total
+        }
+    }
+    .clamp(0.0, 1.0);
+    (raw, gold, quality)
+}
+
 fn safe_ratio_u32(num: u32, den: u32) -> f64 {
     if den == 0 {
         0.5
@@ -1253,6 +1290,17 @@ mod tests {
         assert_eq!(throttle_reverts_only(9, 9, 1), 0);
         assert_eq!(throttle_reverts_only(12, 9, 5), 3);
         assert_eq!(throttle_reverts_only(20, 0, 5), 5);
+    }
+
+    #[test]
+    fn universal_actuator_learning_expands_ais_without_double_counting_pressure() {
+        let (raw, gold, quality) = merge_learning_evidence(20, 18, 0.90, 35, 24, 0.96);
+        assert_eq!(raw, 35);
+        assert_eq!(gold, 24);
+        assert!((quality - ((0.90 * 20.0 + 0.96 * 35.0) / 55.0)).abs() < 1e-12);
+
+        let legacy_only = merge_learning_evidence(20, 18, 0.90, 0, 0, 0.0);
+        assert_eq!(legacy_only, (20, 18, 0.90));
     }
 
     /// Production AIS benchmark. Reads live daemon state from /var/lib/apollo/.
@@ -1556,6 +1604,15 @@ mod tests {
         } else {
             0u32
         };
+        let (learning_raw_observations, learning_gold_observations, learning_data_quality) =
+            merge_learning_evidence(
+                rm_u("learning_bronze_total"),
+                rm_u("learning_gold_total"),
+                rm_f("learning_data_quality"),
+                rm_u("world_model_actuator_bronze_total"),
+                rm_u("world_model_actuator_gold_total"),
+                rm_f("world_model_actuator_quality"),
+            );
 
         // ── Build AisInput ───────────────────────────────────────────────────
         let input = AisInput {
@@ -1601,9 +1658,9 @@ mod tests {
             total_skills,
             experience_records,
             dyna_transitions,
-            learning_raw_observations: rm_u("learning_bronze_total"),
-            learning_gold_observations: rm_u("learning_gold_total"),
-            learning_data_quality: rm_f("learning_data_quality").clamp(0.0, 1.0),
+            learning_raw_observations,
+            learning_gold_observations,
+            learning_data_quality,
 
             // D4
             p95_cycle_ms,

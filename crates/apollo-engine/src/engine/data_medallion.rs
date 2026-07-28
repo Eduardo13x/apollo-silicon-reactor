@@ -5,6 +5,8 @@
 //! are safe to fan out to Apollo's long-lived learners. The curator performs
 //! no I/O and keeps a fixed-size duplicate window so its cost stays bounded.
 
+use serde::{Deserialize, Serialize};
+
 const RECENT_FINGERPRINTS: usize = 64;
 const MAX_IDENTITY_BYTES: usize = 256;
 const MAX_PLAUSIBLE_PRESSURE_DELTA: f64 = 0.35;
@@ -111,6 +113,29 @@ pub struct MedallionMetrics {
     pub duplicate_total: u64,
     pub mean_quality: f64,
     pub gold_rate: f64,
+}
+
+/// Crash-safe snapshot of the medallion trust boundary. Keeping the duplicate
+/// window preserves the guarantee that a daemon restart cannot admit the same
+/// resolved outcome twice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DataMedallionPersisted {
+    #[serde(default)]
+    pub recent_fingerprints: Vec<u64>,
+    #[serde(default)]
+    pub recent_cursor: usize,
+    #[serde(default)]
+    pub bronze_total: u64,
+    #[serde(default)]
+    pub silver_total: u64,
+    #[serde(default)]
+    pub gold_total: u64,
+    #[serde(default)]
+    pub invalid_total: u64,
+    #[serde(default)]
+    pub duplicate_total: u64,
+    #[serde(default)]
+    pub quality_sum: f64,
 }
 
 pub struct MedallionObservation<'a> {
@@ -258,6 +283,46 @@ impl DataMedallion {
             },
         }
     }
+
+    pub fn snapshot(&self) -> DataMedallionPersisted {
+        DataMedallionPersisted {
+            recent_fingerprints: self.recent_fingerprints.to_vec(),
+            recent_cursor: self.recent_cursor,
+            bronze_total: self.bronze_total,
+            silver_total: self.silver_total,
+            gold_total: self.gold_total,
+            invalid_total: self.invalid_total,
+            duplicate_total: self.duplicate_total,
+            quality_sum: self.quality_sum,
+        }
+    }
+
+    /// Restore a validated snapshot. Malformed or stale fields are bounded so
+    /// persistence can never manufacture a Gold outcome or poison curation.
+    pub fn restore(&mut self, state: DataMedallionPersisted) {
+        self.recent_fingerprints = [0; RECENT_FINGERPRINTS];
+        for (slot, fingerprint) in state
+            .recent_fingerprints
+            .into_iter()
+            .take(RECENT_FINGERPRINTS)
+            .enumerate()
+        {
+            self.recent_fingerprints[slot] = fingerprint;
+        }
+        self.recent_cursor = state.recent_cursor % RECENT_FINGERPRINTS;
+        self.bronze_total = state.bronze_total;
+        self.silver_total = state.silver_total.min(self.bronze_total);
+        self.gold_total = state.gold_total.min(self.silver_total);
+        self.invalid_total = state.invalid_total.min(self.bronze_total);
+        self.duplicate_total = state
+            .duplicate_total
+            .min(self.silver_total.saturating_sub(self.gold_total));
+        self.quality_sum = if state.quality_sum.is_finite() {
+            state.quality_sum.clamp(0.0, self.bronze_total as f64)
+        } else {
+            0.0
+        };
+    }
 }
 
 impl Default for DataMedallion {
@@ -361,6 +426,47 @@ mod tests {
         assert_eq!(metrics.bronze_total, 2);
         assert_eq!(metrics.gold_total, 1);
         assert_eq!(metrics.duplicate_total, 1);
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_metrics_and_duplicate_window() {
+        let mut original = DataMedallion::new();
+        assert!(original
+            .curate(observation("Safari", "browsing", 10))
+            .is_gold());
+        let expected = original.metrics();
+        let encoded = serde_json::to_string(&original.snapshot()).expect("snapshot serializes");
+        let persisted = serde_json::from_str(&encoded).expect("snapshot deserializes");
+
+        let mut restored = DataMedallion::new();
+        restored.restore(persisted);
+        assert_eq!(restored.metrics(), expected);
+
+        let duplicate = restored.curate(observation("Safari", "browsing", 10));
+        assert_eq!(duplicate.rejection, Some(CurationRejection::Duplicate));
+    }
+
+    #[test]
+    fn restore_never_inflates_invalid_persisted_counts() {
+        let mut medallion = DataMedallion::new();
+        medallion.restore(DataMedallionPersisted {
+            recent_fingerprints: vec![1; RECENT_FINGERPRINTS + 1],
+            recent_cursor: RECENT_FINGERPRINTS + 5,
+            bronze_total: 3,
+            silver_total: 99,
+            gold_total: 99,
+            invalid_total: 99,
+            duplicate_total: 99,
+            quality_sum: f64::NAN,
+        });
+
+        let metrics = medallion.metrics();
+        assert_eq!(metrics.bronze_total, 3);
+        assert_eq!(metrics.silver_total, 3);
+        assert_eq!(metrics.gold_total, 3);
+        assert_eq!(metrics.invalid_total, 3);
+        assert_eq!(metrics.duplicate_total, 0);
+        assert_eq!(metrics.mean_quality, 0.0);
     }
 
     #[test]

@@ -103,6 +103,9 @@ struct LedgerEntry {
     start_sec: u64,
     /// Why the effect was applied — for the revert log line.
     justification: &'static str,
+    /// Number of consecutive undo failures for this applied effect. Retries
+    /// remain enabled, but repeated attempts are not reported as new failures.
+    revert_failures: u8,
 }
 
 /// Default TTL when a producer has no domain-specific lifetime. 10 min
@@ -111,6 +114,19 @@ struct LedgerEntry {
 /// that stale state never survives a session phase change.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(600);
 const REVERT_RETRY_TTL: Duration = Duration::from_secs(30);
+const REVERT_SLOW_RETRY_TTL: Duration = Duration::from_secs(300);
+
+fn schedule_revert_retry(entry: &mut LedgerEntry) -> bool {
+    let first_failure = entry.revert_failures == 0;
+    entry.revert_failures = entry.revert_failures.saturating_add(1);
+    entry.applied_at = Instant::now();
+    entry.ttl = if entry.revert_failures < 3 {
+        REVERT_RETRY_TTL
+    } else {
+        REVERT_SLOW_RETRY_TTL
+    };
+    first_failure
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileOutcome {
@@ -146,6 +162,7 @@ impl EffectLedger {
                 ttl,
                 start_sec,
                 justification,
+                revert_failures: 0,
             },
         );
     }
@@ -324,7 +341,7 @@ pub fn reconcile_global(
     const PRIO_DARWIN_BG: libc::c_int = 0x1000;
     let mut outcome = ReconcileOutcome::default();
     let mut retry = Vec::new();
-    for entry in expired {
+    for mut entry in expired {
         let pid = entry.effect.pid();
         // PID-identity guard: only undo on the same process we mutated.
         let (live_sec, _) = crate::engine::daemon_helpers::pid_start_time(pid);
@@ -368,11 +385,14 @@ pub fn reconcile_global(
             }
         };
         if !reverted {
-            outcome.failed += 1;
+            let first_failure = schedule_revert_retry(&mut entry);
+            outcome.failed += u64::from(first_failure);
             tracing::warn!(
                 pid,
                 effect = ?entry.effect,
                 justification = entry.justification,
+                retry_attempt = entry.revert_failures,
+                retry_after_secs = entry.ttl.as_secs(),
                 "effect-ledger: revert failed; retry scheduled"
             );
             retry.push(entry);
@@ -390,12 +410,9 @@ pub fn reconcile_global(
     if !retry.is_empty() {
         with_global(|ledger| {
             for entry in retry {
-                ledger.record(
-                    entry.effect,
-                    REVERT_RETRY_TTL,
-                    entry.start_sec,
-                    entry.justification,
-                );
+                ledger
+                    .entries
+                    .insert((entry.effect.pid(), entry.effect.kind()), entry);
             }
         });
     }
@@ -451,6 +468,25 @@ mod tests {
         let drained = l.drain_expired(None);
         assert!(drained.is_empty(), "refreshed entry must not expire");
         assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn revert_retry_counts_once_and_backs_off_after_three_attempts() {
+        let mut entry = LedgerEntry {
+            effect: nice(901_009),
+            applied_at: Instant::now(),
+            ttl: DEFAULT_TTL,
+            start_sec: 42,
+            justification: "test",
+            revert_failures: 0,
+        };
+
+        assert!(schedule_revert_retry(&mut entry));
+        assert_eq!(entry.ttl, REVERT_RETRY_TTL);
+        assert!(!schedule_revert_retry(&mut entry));
+        assert_eq!(entry.ttl, REVERT_RETRY_TTL);
+        assert!(!schedule_revert_retry(&mut entry));
+        assert_eq!(entry.ttl, REVERT_SLOW_RETRY_TTL);
     }
 
     #[test]

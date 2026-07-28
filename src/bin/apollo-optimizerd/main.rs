@@ -415,7 +415,15 @@ fn main() -> anyhow::Result<()> {
             let suggestions_path = suggestions_path_root(is_root);
 
             let usage_model_path = usage_model_path_root(is_root);
-            let usage_model = UsageModel::load(&usage_model_path);
+            let mut usage_model = UsageModel::load(&usage_model_path);
+            let stale_usage_entries = usage_model.prune_stale(Utc::now());
+            if stale_usage_entries > 0 {
+                usage_model.persist(&usage_model_path);
+                tracing::info!(
+                    stale_usage_entries,
+                    "usage-model calibration: discarded stale process identities"
+                );
+            }
             let usage_events_path = if is_root {
                 PathBuf::from("/var/lib/apollo/learn/usage_events.jsonl")
             } else {
@@ -456,6 +464,9 @@ fn main() -> anyhow::Result<()> {
                     let lpm = apollo_engine::engine::decide_actions::learned_pattern_matches;
                     let conflicts = |n: &String| -> bool {
                         if apollo_engine::engine::safety::is_protected_name(n) {
+                            return true;
+                        }
+                        if !apollo_engine::engine::usage_model::is_noise_candidate_name(n) {
                             return true;
                         }
                         let nl = n.to_lowercase();
@@ -844,6 +855,11 @@ fn main() -> anyhow::Result<()> {
             let metrics_history_path =
                 PathBuf::from(apollo_engine::engine::daemon_helpers::metrics_history_path());
             let history_cfg = repo_cfg.history.unwrap_or_default();
+            let mut metrics_history_writer =
+                apollo_engine::engine::daemon_metrics_history::MetricsHistoryWriter::new(
+                    metrics_history_path,
+                    history_cfg,
+                );
             let mut critical_failure_timestamps: Vec<Instant> = Vec::new();
             let mut override_was_active = false;
             let daemon_start = Instant::now();
@@ -891,6 +907,8 @@ fn main() -> anyhow::Result<()> {
                 mut companion_graph,
                 mut active_coalitions,
             } = daemon_init::DaemonSubsystems::new();
+            let mut telemetry_medallion =
+                apollo_engine::engine::telemetry_medallion::TelemetryMedallion::new();
             {
                 let mut m_guard = state.metrics.lock_recover();
                 m_guard.metrics.recently_applied_restore_status =
@@ -1085,6 +1103,30 @@ fn main() -> anyhow::Result<()> {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
                 restored_trial_skill = learned.pending_trial_skill.clone();
+                if let Some(medallion_state) = learned.medallion_state.clone() {
+                    let bronze_total = medallion_state.bronze_total;
+                    let gold_total = medallion_state.gold_total;
+                    learning_pipeline.restore_medallion(medallion_state);
+                    tracing::info!(
+                        bronze_total,
+                        gold_total,
+                        "restored medallion curation telemetry"
+                    );
+                }
+                if let Some(telemetry_state) = learned.telemetry_medallion_state.clone() {
+                    let bronze_total = telemetry_state.bronze_total;
+                    let gold_total = telemetry_state.gold_total;
+                    let actuator_bronze_total = telemetry_state.actuator_resolved_total;
+                    let actuator_gold_total = telemetry_state.actuator_gold_total;
+                    telemetry_medallion.restore(telemetry_state);
+                    tracing::info!(
+                        bronze_total,
+                        gold_total,
+                        actuator_bronze_total,
+                        actuator_gold_total,
+                        "restored World Model context telemetry"
+                    );
+                }
                 // BUG-01: WAL fallback — if LearnedState didn't carry a pending trial
                 // (e.g., daemon crashed before periodic persist), recover from WAL file.
                 if restored_trial_skill.is_none() {
@@ -1372,6 +1414,9 @@ fn main() -> anyhow::Result<()> {
             // filtering out short-lived transients that die before execute_actions.
             let mut freeze_candidates: HashMap<u32, u8> = HashMap::new();
             let mut cycle_count: u64 = 0;
+            // Reused across cycles. Its internal revisions avoid rebuilding
+            // unchanged causal and actuator maps on the daemon hot path.
+            let mut world_model = apollo_engine::engine::world_model::WorldModel::default();
             // Feed-forward pressure relief counter [Hellerstein 2004].
             // Set to N when tabs close / heavy app terminates; decrements each cycle.
             // While > 0, reactor_weight is reduced (anticipate pressure drop).
@@ -3317,7 +3362,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Predictive agent: build context from existing signals and select intervention.
                 // Feed Kalman-smoothed pressure instead of raw — cleaner signal for LinUCB.
-                let agent_intervention = {
+                let (agent_intervention, applied_predictive_intervention) = {
                     let prev_workload = state
                         .policy
                         .lock_recover()
@@ -3467,7 +3512,7 @@ fn main() -> anyhow::Result<()> {
                         &maintenance_state,
                     );
                     last_specialist_votes = voting_out.disagreement_record;
-                    voting_out.intervention
+                    (voting_out.intervention, voting_out.applied_intervention)
                 };
 
                 // Build behavior-interactive PID set from usage model EMA data.
@@ -3669,15 +3714,15 @@ fn main() -> anyhow::Result<()> {
                 // corrects the CausalGraph's meta-observe (87c342f) scales the
                 // world model's predicted deltas — calibration and imagination
                 // share one belief about causal over-promising.
-                let world_model =
-                    apollo_engine::engine::world_model::WorldModel::from_parts_for_workload(
-                        lctx.causal_graph,
-                        lctx.outcome_tracker,
-                        cognitive_state.meta_cognition.subsystem_debias_multiplier(
-                            apollo_engine::engine::meta_cognition::SubsystemId::CausalGraph,
-                        ),
-                        workload_mode.as_str(),
-                    );
+                world_model.refresh_from_parts_for_workload(
+                    lctx.causal_graph,
+                    lctx.outcome_tracker,
+                    cognitive_state.meta_cognition.subsystem_debias_multiplier(
+                        apollo_engine::engine::meta_cognition::SubsystemId::CausalGraph,
+                    ),
+                    workload_mode.as_str(),
+                );
+                world_model.attach_context(&telemetry_medallion);
                 CausalGraph::apply_nars_discount(
                     &mut causal_impact,
                     &lctx.outcome_tracker.drift_detector,
@@ -5345,6 +5390,23 @@ fn main() -> anyhow::Result<()> {
                     admitted
                 };
 
+                // Let mature workload-specific evidence advance proven response
+                // accelerators inside their own queue slots. This is ordering
+                // only: the WorldModel cannot manufacture or strengthen actions.
+                let (final_actions, world_model_promotions) =
+                    daemon_dispatch_tick::prioritize_world_model_accelerators(
+                        final_actions,
+                        &world_model,
+                        workload_mode.as_str(),
+                    );
+                if world_model_promotions > 0 {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.world_model_utility_promotions_total = metrics
+                        .metrics
+                        .world_model_utility_promotions_total
+                        .saturating_add(world_model_promotions);
+                }
+
                 // Priority action queue: buffer this cycle's decided actions and
                 // dispatch at most max_per_cycle per cycle. Urgent (Unfreeze) actions
                 // bypass the cap. Any overflow stays in the queue for the next cycle;
@@ -5420,6 +5482,8 @@ fn main() -> anyhow::Result<()> {
                             .latest()
                             .cpu_saturation
                             .pegged_fraction,
+                        world_model: &world_model,
+                        workload: workload_mode.as_str(),
                     });
                     (output.outcomes, output.causal_qos_upgrades)
                 };
@@ -5600,6 +5664,35 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
 
+                // Record the complete live context and every confirmed
+                // actuator independently of the cognitive learning gate.
+                // A recovery-mode pause must not erase what Apollo or macOS
+                // did; it only pauses downstream parameter updates.
+                let causal_runtime_context = state.metrics.lock_recover().metrics.clone();
+                telemetry_medallion.observe(
+                    apollo_engine::engine::telemetry_medallion::TelemetryObservation {
+                        snapshot: &snapshot,
+                        hardware: cycle_hw_snap.as_ref(),
+                        runtime: &causal_runtime_context,
+                        capabilities: Some(&caps),
+                        signal: &signal_digest,
+                        workload: workload_mode.as_str(),
+                        cycle: cycle_count,
+                        outcomes: &exec_outcomes,
+                        intervention: agent_intervention,
+                        applied_intervention: applied_predictive_intervention,
+                        purge_recent: maintenance_state.is_purge_recent(30),
+                        nars_drift_score: lctx.outcome_tracker.nars_drift_score(),
+                        nars_beliefs_total: lctx.outcome_tracker.drift_detector.len() as u64,
+                        natural_drift: lctx.outcome_tracker.natural_drift(),
+                        arousal_level: arousal_state.level as f64,
+                    },
+                );
+                // Refresh the facade after observation so metrics history and
+                // dashboard consume this cycle's context and any outcomes that
+                // just matured. Dispatch already used the prior-cycle model.
+                world_model.attach_context(&telemetry_medallion);
+
                 // NARS belief routing for newly-frozen non-chromium PIDs
                 // (Sprint A 2026-05-10). chromium_mgr already routes its own
                 // renderer freezes via observe_freeze_outcome → classify(name)
@@ -5664,6 +5757,7 @@ fn main() -> anyhow::Result<()> {
                         &collector,
                         &mut lctx,
                         &mut learning_pipeline,
+                        &mut telemetry_medallion,
                         &mut effectiveness_tracker,
                         &mut restore_monitor,
                         &mut last_restore_quality,
@@ -5683,20 +5777,8 @@ fn main() -> anyhow::Result<()> {
                         sleep_notifier.is_sleeping(),
                         ode_t_sat_urgency,
                         &maintenance_state,
+                        &cognitive_state.meta_cognition,
                     );
-                    // Patch MetaCognition into the freshly-persisted learned_state.
-                    // run_learning_tick triggers persist_improved every 300 cycles;
-                    // mirror that cadence so calibration history (per-subsystem
-                    // accuracy EMAs, humble_mode flag, observation count) survives
-                    // restarts. Without this, cog.meta_cognition cold-starts at
-                    // baseline on every reboot and the system is blindly optimistic
-                    // for ~50 cycles until calibration re-accumulates.
-                    if !sleep_notifier.is_sleeping() && cycle_count.is_multiple_of(300) {
-                        apollo_engine::engine::learned_state::LearnedState::patch_meta_cognition(
-                            ls_path,
-                            cognitive_state.meta_cognition.clone(),
-                        );
-                    }
                     // Apply ws_spike_threshold / fluidity_degraded_threshold from LearnableParams.
                     // Keeps fluidity detection calibrated with learned values.
                     if persist_generations % 100 == 50 {
@@ -5780,6 +5862,7 @@ fn main() -> anyhow::Result<()> {
                     &agent_intervention,
                     &arousal_state,
                     &learning_pipeline,
+                    &telemetry_medallion,
                     &world_model,
                 );
                 metrics_reporter::apply_io_shaping(
@@ -5857,7 +5940,7 @@ fn main() -> anyhow::Result<()> {
                 daemon_cycle_tail::wire_enriched_telemetry(
                     &state,
                     frozen_ram_mb,
-                    &daemon_cycle_tail::EnrichedTelemetryInputs {
+                    &mut daemon_cycle_tail::EnrichedTelemetryInputs {
                         snapshot: &snapshot,
                         swap_forecast: &swap_forecast,
                         fluidity_state: &fluidity_state,
@@ -5879,8 +5962,7 @@ fn main() -> anyhow::Result<()> {
                         // + MetaCognition in scope; pass through the f32 to
                         // keep the lib-side writer free of MetaCognition dep).
                         metrics_history: Some(daemon_cycle_tail::MetricsHistoryInputs {
-                            path: &metrics_history_path,
-                            cfg: &history_cfg,
+                            writer: &mut metrics_history_writer,
                             cycle: cycle_count,
                             world_model: &world_model,
                             drift_detector: &lctx.outcome_tracker.drift_detector,
@@ -6199,17 +6281,15 @@ fn main() -> anyhow::Result<()> {
                 Some(learnable_params.clone()),
                 Some(nested_learner.clone()),
                 &maintenance_state,
+                apollo_engine::engine::learned_state::LearnedStateSupplement {
+                    unfreeze_decay_tau: Some(unfreeze_decay.tau_snapshot()),
+                    neuro_state: Some(neuromod.snapshot()),
+                    meta_cognition: Some(cognitive_state.meta_cognition.clone()),
+                    companion_graph: Some(companion_graph.clone()),
+                    medallion_state: Some(learning_pipeline.medallion_snapshot()),
+                    telemetry_medallion_state: Some(telemetry_medallion.snapshot()),
+                },
             );
-            // Patch unfreeze-decay τ snapshot after the main persist so a crash
-            // mid-persist leaves the previous learned-τ file intact.
-            LearnedState::patch_unfreeze_decay(ls_path, unfreeze_decay.tau_snapshot());
-            // Persist neuromodulator signal levels so DA/ACh/NA/5-HT survive restart.
-            // [Schultz 1997] — reward prediction error signals require continuity.
-            LearnedState::patch_neuro_state(ls_path, neuromod.snapshot());
-            // Persist companion graph so workflow context survives restarts.
-            // Counters only — query-time thresholds (lift, conf, N) re-applied
-            // on load, so changing thresholds takes effect retroactively.
-            LearnedState::patch_companion_graph(ls_path, &companion_graph);
 
             // Revert sysctls to defaults on shutdown.
             {

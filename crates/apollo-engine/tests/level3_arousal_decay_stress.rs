@@ -108,6 +108,8 @@ fn fresh_state(ot: OutcomeTrackerPersisted, arousal: Option<ArousalState>) -> Le
         effectiveness_tracker: None,
         arousal_state: arousal,
         causal_graph_edges: None,
+        medallion_state: None,
+        telemetry_medallion_state: None,
         process_baselines: None,
         // Explicitly Some(default) so `learnable_params.as_ref().map(...)`
         // in self_improve takes the real-prod branch (base=0.95) rather

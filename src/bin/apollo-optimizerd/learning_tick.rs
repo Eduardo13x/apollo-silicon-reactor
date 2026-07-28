@@ -26,16 +26,20 @@ use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_engine::engine::execute_actions::ExecuteOutcomes;
 use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
-use apollo_engine::engine::learned_state::{LearnableParams, LearnedState, RestoreQualityMonitor};
+use apollo_engine::engine::learned_state::{
+    LearnableParams, LearnedState, LearnedStateSupplement, RestoreQualityMonitor,
+};
 use apollo_engine::engine::learning_pipeline::{ActionKind, LearningObservation, LearningPipeline};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
+use apollo_engine::engine::meta_cognition::MetaCognition;
 use apollo_engine::engine::nars_belief::{ArousalState, Salience};
 use apollo_engine::engine::nested_learner::NestedLearner;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
 use apollo_engine::engine::predictive_agent::{Intervention, SpecialistVote};
 use apollo_engine::engine::signal_intelligence::SignalDigest;
 use apollo_engine::engine::system_log_ingester::{SystemEvent, SystemLogIngester};
+use apollo_engine::engine::telemetry_medallion::TelemetryMedallion;
 use apollo_engine::engine::types::{FrozenPidEntry, FrozenStatePersisted, RootAction};
 use apollo_engine::engine::workload_classifier::WorkloadMode;
 
@@ -155,6 +159,7 @@ pub fn run_learning_tick<'a>(
     collector: &SystemCollector,
     lctx: &mut LearningContext<'a>,
     learning_pipeline: &mut LearningPipeline,
+    telemetry_medallion: &mut TelemetryMedallion,
     effectiveness_tracker: &mut EffectivenessTracker,
     restore_monitor: &mut RestoreQualityMonitor,
     last_restore_quality: &mut Option<f64>,
@@ -173,7 +178,11 @@ pub fn run_learning_tick<'a>(
     // ODE swap saturation urgency [0,1] for T_sat penalty (Cable E).
     ode_t_sat_urgency: f64,
     maintenance_state: &MaintenanceState,
+    meta_cognition: &MetaCognition,
 ) {
+    // Live context and universal actuator evidence are observed by the daemon
+    // before this function so cognitive learning pauses cannot create holes in
+    // the machine timeline. This reference remains the persistence owner.
     let pressure_actions_for_outcome = outcome_actions_from_applied_traces(exec_outcomes);
 
     // ── Arousal EMA: update every cycle from current pressure + swap ─────────
@@ -955,11 +964,14 @@ pub fn run_learning_tick<'a>(
             Some(learnable_params.clone()),
             Some(nested_learner.clone()),
             maintenance_state,
+            LearnedStateSupplement {
+                neuro_state: Some(lctx.neuromod.snapshot()),
+                meta_cognition: Some(meta_cognition.clone()),
+                medallion_state: Some(learning_pipeline.medallion_snapshot()),
+                telemetry_medallion_state: Some(telemetry_medallion.snapshot()),
+                ..LearnedStateSupplement::default()
+            },
         );
-        // Patch neuromodulator warm-start state after the main persist so a crash
-        // mid-persist leaves the previous neurotransmitter snapshot intact.
-        // [Schultz 1997] — DA/ACh/NA/5-HT signals require continuity across restarts.
-        LearnedState::patch_neuro_state(std::path::Path::new(ls_path), lctx.neuromod.snapshot());
         // Causal graph observability: log solid/weak links discovered.
         let solid = lctx.causal_graph.solid_count();
         let total = lctx.causal_graph.edge_count();

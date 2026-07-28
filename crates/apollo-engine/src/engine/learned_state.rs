@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 use crate::engine::causal_graph::{CausalEdge, CausalGraph};
 use crate::engine::companion_graph::CompanionGraph;
+use crate::engine::data_medallion::DataMedallionPersisted;
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
 use crate::engine::maintenance_state::MaintenanceState;
 use crate::engine::meta_cognition::MetaCognition;
@@ -35,6 +36,7 @@ use crate::engine::predictive_agent::SpecialistAccuracyTracker;
 use crate::engine::process_baseline::ProcessBaselineMap;
 use crate::engine::signal_intelligence::{SignalIntelligence, SignalIntelligencePersisted};
 use crate::engine::teacher_consolidation::TeacherConsolidator;
+use crate::engine::telemetry_medallion::TelemetryMedallionPersisted;
 use crate::engine::types::FrozenStatePersisted;
 use crate::engine::unfreeze_decay::TauEstimate;
 
@@ -468,6 +470,16 @@ pub struct LearnedState {
     #[serde(default)]
     pub causal_graph_edges: Option<Vec<((String, String), CausalEdge)>>,
 
+    /// Cumulative medallion telemetry plus its bounded duplicate window. This
+    /// keeps dashboard learning evidence truthful across daemon restarts.
+    #[serde(default)]
+    pub medallion_state: Option<DataMedallionPersisted>,
+
+    /// Cumulative live-context observations for the World Model. This is
+    /// descriptive telemetry, separate from action-causal evidence.
+    #[serde(default)]
+    pub telemetry_medallion_state: Option<TelemetryMedallionPersisted>,
+
     /// Per-process hardware counter baselines for behavioral anomaly detection.
     /// EMA + EMA-MAD per {ipc, wakeup_rate, disk_mbps} per process name.
     /// Persisted so warm baselines (≥ 5 obs) survive daemon restarts — without this,
@@ -571,6 +583,20 @@ pub struct LearnedState {
     pub policy_aggregator_mode: Option<String>,
 }
 
+/// Live snapshots that are owned outside the core learning context but belong
+/// in the same learned-state checkpoint. Supplying them up front lets the
+/// daemon commit one atomic file instead of repeatedly reading, parsing,
+/// rewriting, and fsyncing the complete state for each field.
+#[derive(Debug, Clone, Default)]
+pub struct LearnedStateSupplement {
+    pub unfreeze_decay_tau: Option<HashMap<String, TauEstimate>>,
+    pub neuro_state: Option<NeuroState>,
+    pub meta_cognition: Option<MetaCognition>,
+    pub companion_graph: Option<CompanionGraph>,
+    pub medallion_state: Option<DataMedallionPersisted>,
+    pub telemetry_medallion_state: Option<TelemetryMedallionPersisted>,
+}
+
 /// Current schema version for [`LearnedState`].
 ///
 /// Bump this constant whenever a structural change is made to `LearnedState`
@@ -664,6 +690,36 @@ fn bound_outcome_totals(ot: &mut OutcomeTrackerPersisted) {
 }
 
 impl LearnedState {
+    fn preserve_uncollected_fields(&mut self, previous: Self) {
+        if self.process_baselines.is_none() {
+            self.process_baselines = previous.process_baselines;
+        }
+        if self.teacher_consolidator.is_none() {
+            self.teacher_consolidator = previous.teacher_consolidator;
+        }
+        if self.unfreeze_decay_tau.is_none() {
+            self.unfreeze_decay_tau = previous.unfreeze_decay_tau;
+        }
+        if self.neuro_state.is_none() {
+            self.neuro_state = previous.neuro_state;
+        }
+        if self.meta_cognition.is_none() {
+            self.meta_cognition = previous.meta_cognition;
+        }
+        if self.companion_graph.is_none() {
+            self.companion_graph = previous.companion_graph;
+        }
+        if self.medallion_state.is_none() {
+            self.medallion_state = previous.medallion_state;
+        }
+        if self.telemetry_medallion_state.is_none() {
+            self.telemetry_medallion_state = previous.telemetry_medallion_state;
+        }
+        if self.policy_aggregator_mode.is_none() {
+            self.policy_aggregator_mode = previous.policy_aggregator_mode;
+        }
+    }
+
     /// Collect snapshots from all live components into a single struct.
     #[allow(clippy::too_many_arguments)]
     pub fn collect(
@@ -695,6 +751,8 @@ impl LearnedState {
             frozen_pids: frozen_state,
             arousal_state,
             causal_graph_edges: causal_graph.map(|cg| cg.to_persisted()),
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines,
             learnable_params,
             nested_learner,
@@ -1056,6 +1114,7 @@ impl LearnedState {
         learnable_params: Option<LearnableParams>,
         nested_learner: Option<NestedLearner>,
         maintenance_state: &MaintenanceState,
+        supplement: LearnedStateSupplement,
     ) {
         let mut state = Self::collect(
             signal_intel,
@@ -1075,10 +1134,16 @@ impl LearnedState {
         state.persist_generations = prev_generations.saturating_add(1);
         state.last_restore_quality = last_quality;
         state.pending_trial_skill = pending_trial_skill;
-        // If no baselines were passed (periodic persist), preserve the previously
-        // persisted baselines so we don't erase them on every cycle persist.
-        if state.process_baselines.is_none() {
-            state.process_baselines = Self::load(path).and_then(|old| old.process_baselines);
+        state.unfreeze_decay_tau = supplement.unfreeze_decay_tau;
+        state.neuro_state = supplement.neuro_state;
+        state.meta_cognition = supplement.meta_cognition;
+        state.companion_graph = supplement.companion_graph;
+        state.medallion_state = supplement.medallion_state;
+        state.telemetry_medallion_state = supplement.telemetry_medallion_state;
+        // Components not owned by this checkpoint keep their last committed
+        // snapshot. Load and parse once, then merge all such fields in memory.
+        if let Some(previous) = Self::load(path) {
+            state.preserve_uncollected_fields(previous);
         }
         state.self_improve();
         state.persist(path);
@@ -1836,6 +1901,8 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
@@ -1872,6 +1939,8 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
@@ -1906,6 +1975,8 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
@@ -1959,6 +2030,8 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
@@ -2007,6 +2080,8 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
@@ -2058,6 +2133,8 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
@@ -2385,6 +2462,40 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_merge_preserves_unowned_fields_and_prefers_live_snapshots() {
+        use crate::engine::effectiveness_tracker::EffectivenessTracker;
+        use crate::engine::optimization_skills::SkillRegistry;
+        use crate::engine::outcome_tracker::OutcomeTracker;
+        use crate::engine::predictive_agent::SpecialistAccuracyTracker;
+        use crate::engine::signal_intelligence::SignalIntelligence;
+
+        let si = SignalIntelligence::new();
+        let ot = OutcomeTracker::new();
+        let sa = SpecialistAccuracyTracker::new();
+        let sr = SkillRegistry::new();
+        let et = EffectivenessTracker::new();
+        let maint = MaintenanceState::default();
+        let mut previous = LearnedState::collect(
+            &si, &ot, &sa, &sr, &et, None, None, None, None, None, None, None, &maint,
+        );
+        previous.teacher_consolidator = Some(TeacherConsolidator::new());
+        previous.policy_aggregator_mode = Some("ds".to_string());
+        previous.meta_cognition = Some(MetaCognition::new());
+
+        let mut checkpoint = LearnedState::collect(
+            &si, &ot, &sa, &sr, &et, None, None, None, None, None, None, None, &maint,
+        );
+        let mut live_meta = MetaCognition::new();
+        live_meta.humble_mode = true;
+        checkpoint.meta_cognition = Some(live_meta);
+        checkpoint.preserve_uncollected_fields(previous);
+
+        assert!(checkpoint.teacher_consolidator.is_some());
+        assert_eq!(checkpoint.policy_aggregator_mode.as_deref(), Some("ds"));
+        assert!(checkpoint.meta_cognition.unwrap().humble_mode);
+    }
+
+    #[test]
     fn patch_teacher_consolidator_roundtrip() {
         use crate::engine::teacher_consolidation::{SuggestionCategory, TeacherConsolidator};
         let tmp = std::env::temp_dir().join(format!("apollo_tc_patch_{}.json", std::process::id()));
@@ -2403,6 +2514,8 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
@@ -2499,6 +2612,8 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
@@ -2540,6 +2655,8 @@ mod tests {
             frozen_pids: None,
             arousal_state: None,
             causal_graph_edges: None,
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
@@ -2585,6 +2702,8 @@ mod tests {
             frozen_pids: None,
             arousal_state: None,
             causal_graph_edges: None,
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
@@ -2738,6 +2857,8 @@ mod tests {
             effectiveness_tracker: None,
             arousal_state: None,
             causal_graph_edges: None,
+            medallion_state: None,
+            telemetry_medallion_state: None,
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,

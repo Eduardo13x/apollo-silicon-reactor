@@ -33,7 +33,8 @@
 //!   Time Series Representation Learning" — self-supervised pre-training with
 //!   periodic + event-triggered sampling to address class imbalance.
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// Number of features per telemetry vector.
@@ -57,6 +58,25 @@ const MAGIC: u32 = 0x41504F4C;
 
 /// Header size in bytes.
 const HEADER_SIZE: usize = 32;
+
+fn select_most_recent(
+    files: impl IntoIterator<Item = (std::time::SystemTime, PathBuf)>,
+    max_files: usize,
+) -> Vec<(std::time::SystemTime, PathBuf)> {
+    if max_files == 0 {
+        return Vec::new();
+    }
+    let mut newest = BinaryHeap::with_capacity(max_files.saturating_add(1));
+    for file in files {
+        newest.push(Reverse(file));
+        if newest.len() > max_files {
+            newest.pop();
+        }
+    }
+    let mut selected: Vec<_> = newest.into_iter().map(|Reverse(file)| file).collect();
+    selected.sort_unstable();
+    selected
+}
 
 /// Classification of why a dump was triggered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,7 +297,7 @@ impl TelemetryLogger {
             Err(_) => return,
         };
         let now = std::time::SystemTime::now();
-        let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = read_dir
+        let files = read_dir
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("bin"))
             .filter_map(|e| {
@@ -287,14 +307,11 @@ impl TelemetryLogger {
                     return None;
                 }
                 Some((mtime, e.path()))
-            })
-            .collect();
+            });
 
-        // Sort newest first, take max_files, then reverse to oldest-first order
-        // so the ring ends up in chronological order.
-        files.sort_by(|a, b| b.0.cmp(&a.0));
-        files.truncate(max_files);
-        files.reverse();
+        // Keep only the newest k while scanning, then order that bounded set
+        // oldest-first so the restored ring remains chronological.
+        let files = select_most_recent(files, max_files);
 
         let mut loaded = 0usize;
         for (_mtime, path) in &files {
@@ -604,6 +621,26 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recent_file_selection_is_bounded_and_chronological() {
+        let base = std::time::UNIX_EPOCH;
+        let candidates = (0..100)
+            .map(|n| {
+                (
+                    base + std::time::Duration::from_secs(n),
+                    PathBuf::from(format!("dump-{n:03}.bin")),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let selected = select_most_recent(candidates, 3);
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[0].1, PathBuf::from("dump-097.bin"));
+        assert_eq!(selected[1].1, PathBuf::from("dump-098.bin"));
+        assert_eq!(selected[2].1, PathBuf::from("dump-099.bin"));
+        assert!(select_most_recent(Vec::new(), 0).is_empty());
     }
 
     #[test]

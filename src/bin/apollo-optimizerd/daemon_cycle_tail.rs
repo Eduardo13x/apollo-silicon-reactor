@@ -342,8 +342,7 @@ pub struct EnrichedTelemetryInputs<'a> {
 /// to keep the archive writer free of MetaCognition dep so it can be unit
 /// tested without a live cognitive stack.
 pub struct MetricsHistoryInputs<'a> {
-    pub path: &'a Path,
-    pub cfg: &'a apollo_engine::engine::daemon_metrics_history::HistoryConfig,
+    pub writer: &'a mut apollo_engine::engine::daemon_metrics_history::MetricsHistoryWriter,
     pub cycle: u64,
     pub world_model: &'a apollo_engine::engine::world_model::WorldModel,
     pub drift_detector: &'a apollo_engine::engine::nars_belief::DriftDetector,
@@ -430,7 +429,7 @@ fn ns_to_ceil_us(ns: u64) -> u64 {
 pub fn wire_enriched_telemetry(
     state: &SharedState,
     frozen_ram_mb: f64,
-    inputs: &EnrichedTelemetryInputs<'_>,
+    inputs: &mut EnrichedTelemetryInputs<'_>,
 ) {
     let mut m = state.metrics.lock_recover();
     // SwapTrend — previously computed but never exposed.
@@ -625,19 +624,14 @@ pub fn wire_enriched_telemetry(
         );
     }
 
-    if let (Some(mh), Some(snapshot)) = (inputs.metrics_history.as_ref(), prepared_history.as_ref())
+    if let (Some(mh), Some(snapshot)) = (inputs.metrics_history.as_mut(), prepared_history.as_ref())
     {
-        if let Err(e) =
-            apollo_engine::engine::daemon_metrics_history::append_prepared_history_snapshot(
-                mh.path, mh.cfg, mh.cycle, snapshot,
-            )
-        {
+        if let Err(e) = mh.writer.append(mh.cycle, snapshot) {
             // Mirror the append_failure path inside append_history_snapshot:
             // the function has ALREADY bumped FAILED_WRITES + emitted warn.
             // Surface here only for diagnosability; cycle continues.
             tracing::debug!(
                 target: "apollo.metrics_history",
-                path = %mh.path.display(),
                 cycle = mh.cycle,
                 error = %e,
                 "cycle_tail: metrics_history append surfaced Err (already counted)"

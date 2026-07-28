@@ -159,6 +159,9 @@ pub struct SpecialistVotingOutput {
     /// tuple for the daemon to store in `last_specialist_votes` so Loop 3 can
     /// issue outcome feedback next cycle.  `None` when consensus.
     pub disagreement_record: Option<(Vec<SpecialistVote>, Intervention)>,
+    /// Predictive recommendation that produced a real threshold/profile
+    /// change this cycle. This is consumed by the causal telemetry lane.
+    pub applied_intervention: Option<Intervention>,
 }
 
 /// Phase 5.1 wiring — apply `presence_factor` to a vote bundle in place.
@@ -543,10 +546,22 @@ pub fn apply_specialist_voting(
         intervention
     };
 
-    // Apply threshold tightening if selected.
+    // Apply the ensemble winner, not the earlier LinUCB proposal.  The
+    // distinction matters: telemetry may only claim a threshold treatment
+    // when the final voted intervention actually changed policy.
+    let thresholds_before = *overflow_thresholds;
     *overflow_thresholds = lctx
         .predictive_agent
-        .adjust_thresholds(*overflow_thresholds);
+        .adjust_thresholds_for(intervention, *overflow_thresholds);
+    let mut applied_intervention = if intervention == Intervention::TightenThresholds
+        && (thresholds_before.bg_pressure != overflow_thresholds.bg_pressure
+            || thresholds_before.critical_pressure != overflow_thresholds.critical_pressure
+            || thresholds_before.extreme_pressure != overflow_thresholds.extreme_pressure)
+    {
+        Some(Intervention::TightenThresholds)
+    } else {
+        None
+    };
 
     // A learned recommendation is advisory while the machine is calm. Only
     // let it take over the profile controller when physical telemetry confirms
@@ -568,12 +583,14 @@ pub fn apply_specialist_voting(
                 5,
                 "predictive-agent: proactive pressure mitigation".to_string(),
             );
+            applied_intervention = Some(Intervention::SuggestAggressive);
         }
     }
 
     SpecialistVotingOutput {
         intervention,
         disagreement_record,
+        applied_intervention,
     }
 }
 

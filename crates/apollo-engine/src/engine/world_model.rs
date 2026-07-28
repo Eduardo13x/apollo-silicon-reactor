@@ -31,6 +31,9 @@ use std::collections::HashMap;
 
 use crate::engine::causal_graph::CausalGraph;
 use crate::engine::outcome_tracker::OutcomeTracker;
+use crate::engine::telemetry_medallion::{
+    ActionModelStats, TelemetryContextSummary, TelemetryMedallion,
+};
 
 /// Minimum causal-edge evidence before a prediction is trusted enough to
 /// VETO an action. Below this the model abstains ([`Imagined::Unknown`])
@@ -48,6 +51,11 @@ const MIN_DATA_QUALITY: f32 = 0.90;
 /// 0.005 ≈ half a percent of pressure — below that the action is noise
 /// relative to what the system does on its own.
 const DOMINANCE_MARGIN: f64 = 0.005;
+const MIN_UTILITY_EVIDENCE: f64 = 10.0;
+const MIN_UTILITY_DATA_QUALITY: f64 = 0.85;
+const UTILITY_CONFIDENCE_Z: f64 = 1.96;
+const UTILITY_VARIANCE_FLOOR: f64 = 0.0001;
+const UTILITY_MAX_AGE_SECS: i64 = 14 * 24 * 60 * 60;
 
 /// The model's verdict for a candidate action.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,6 +77,15 @@ pub enum Imagined {
     Unknown,
 }
 
+/// Utility-space verdict for actuators whose goal is not solely pressure
+/// reduction (boost, QoS, prewarm, sysctl, recovery, and policy actions).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UtilityImagined {
+    ActWins { margin: f64 },
+    DoNothingDominates { predicted_utility: f64 },
+    Unknown,
+}
+
 /// Per-cycle snapshot of the learned action-conditioned predictions plus
 /// the do-nothing baseline. Built once per decision cycle from the live
 /// CausalGraph + OutcomeTracker (O(edges), no allocation per query).
@@ -83,6 +100,22 @@ pub struct WorldModel {
     curated_observations: u64,
     contextual_actions: usize,
     mean_data_quality: f64,
+    context_bronze: u64,
+    context_silver: u64,
+    context_gold: u64,
+    context_quality: f64,
+    latest_context: Option<TelemetryContextSummary>,
+    /// Action key -> (counterfactual-adjusted utility EMA, data quality,
+    /// Gold observations). Populated from the universal actuator medallion.
+    utility_predicted: HashMap<String, ActionModelStats>,
+    causal_revision: Option<u64>,
+    causal_workload: String,
+    causal_debias_bits: u32,
+    utility_revision: Option<u64>,
+    causal_refreshes: u64,
+    causal_cache_hits: u64,
+    utility_refreshes: u64,
+    utility_cache_hits: u64,
 }
 
 impl WorldModel {
@@ -114,12 +147,37 @@ impl WorldModel {
         prediction_debias: f32,
         workload: &str,
     ) -> Self {
+        let mut model = Self::default();
+        model.refresh_from_parts_for_workload(causal, tracker, prediction_debias, workload);
+        model
+    }
+
+    /// Refresh the causal facade in place. Rebuild only when Gold evidence,
+    /// workload, or calibration changed; natural drift remains live every cycle.
+    pub fn refresh_from_parts_for_workload(
+        &mut self,
+        causal: &CausalGraph,
+        tracker: &OutcomeTracker,
+        prediction_debias: f32,
+        workload: &str,
+    ) {
         let debias = if prediction_debias.is_finite() && prediction_debias > 0.0 {
             prediction_debias as f64
         } else {
             1.0
         };
-        let mut predicted = HashMap::new();
+        self.natural_drift = tracker.natural_drift();
+        let revision = causal.curated_revision();
+        let debias_bits = (debias as f32).to_bits();
+        if self.causal_revision == Some(revision)
+            && self.causal_workload == workload
+            && self.causal_debias_bits == debias_bits
+        {
+            self.causal_cache_hits = self.causal_cache_hits.saturating_add(1);
+            return;
+        }
+
+        self.predicted.clear();
         let mut curated_observations = 0_u64;
         let mut contextual_actions = 0_usize;
         let mut quality_weighted_sum = 0.0_f64;
@@ -138,7 +196,7 @@ impl WorldModel {
             {
                 contextual_actions += 1;
             }
-            predicted.insert(
+            self.predicted.insert(
                 action_key.to_string(),
                 (
                     selected.avg_pressure_drop as f64 * debias,
@@ -147,17 +205,18 @@ impl WorldModel {
                 ),
             );
         }
-        Self {
-            predicted,
-            natural_drift: tracker.natural_drift(),
-            curated_observations,
-            contextual_actions,
-            mean_data_quality: if curated_observations == 0 {
-                0.0
-            } else {
-                (quality_weighted_sum / curated_observations as f64).clamp(0.0, 1.0)
-            },
-        }
+        self.curated_observations = curated_observations;
+        self.contextual_actions = contextual_actions;
+        self.mean_data_quality = if curated_observations == 0 {
+            0.0
+        } else {
+            (quality_weighted_sum / curated_observations as f64).clamp(0.0, 1.0)
+        };
+        self.causal_revision = Some(revision);
+        self.causal_workload.clear();
+        self.causal_workload.push_str(workload);
+        self.causal_debias_bits = debias_bits;
+        self.causal_refreshes = self.causal_refreshes.saturating_add(1);
     }
 
     /// Mode-2 step: imagine the action through the learned model and
@@ -211,6 +270,120 @@ impl WorldModel {
         self.mean_data_quality
     }
 
+    /// Attach the current live-system context to the model facade. Context is
+    /// available for future sequence imagination, but never changes the
+    /// action-causal prediction map or its safety thresholds.
+    pub fn attach_context(&mut self, telemetry: &TelemetryMedallion) {
+        let metrics = telemetry.metrics();
+        self.context_bronze = metrics.bronze_total;
+        self.context_silver = metrics.silver_total;
+        self.context_gold = metrics.gold_total;
+        self.context_quality = metrics.mean_quality;
+        self.latest_context = telemetry.latest().cloned();
+        let revision = telemetry.action_models_revision();
+        if self.utility_revision == Some(revision) {
+            self.utility_cache_hits = self.utility_cache_hits.saturating_add(1);
+            return;
+        }
+        self.utility_predicted.clear();
+        self.utility_predicted.extend(
+            telemetry
+                .action_models()
+                .iter()
+                .map(|(key, stats)| (key.clone(), stats.clone())),
+        );
+        self.utility_revision = Some(revision);
+        self.utility_refreshes = self.utility_refreshes.saturating_add(1);
+    }
+
+    pub fn cache_stats(&self) -> (u64, u64, u64, u64) {
+        (
+            self.causal_refreshes,
+            self.causal_cache_hits,
+            self.utility_refreshes,
+            self.utility_cache_hits,
+        )
+    }
+
+    /// Imagine a non-pressure actuator in its own utility space. Workload-
+    /// specific evidence wins when mature, then action-specific evidence is
+    /// used. Family aggregates are deliberately not allowed to veto an unseen
+    /// target: a new app or thread must retain an exploration path.
+    pub fn imagine_utility(&self, action_key: &str, workload: &str) -> UtilityImagined {
+        let Some(now_unix) = self.latest_context.as_ref().map(|ctx| ctx.timestamp_unix) else {
+            return UtilityImagined::Unknown;
+        };
+        let workload_key = format!("{workload}|{action_key}");
+        // Prefer same-workload evidence only when it is mature. An immature
+        // contextual bucket must not hide a mature aggregate model.
+        let selected = [
+            self.utility_predicted.get(&workload_key),
+            self.utility_predicted.get(action_key),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|stats| utility_model_ready(stats, now_unix, self.latest_context.as_ref()));
+        let Some(stats) = selected else {
+            return UtilityImagined::Unknown;
+        };
+        let effective_evidence = stats.effective_evidence_at(now_unix);
+        let standard_error =
+            (stats.utility_variance_ema.max(UTILITY_VARIANCE_FLOOR) / effective_evidence).sqrt();
+        let lower = stats.utility_ema - UTILITY_CONFIDENCE_Z * standard_error;
+        let upper = stats.utility_ema + UTILITY_CONFIDENCE_Z * standard_error;
+        if lower > DOMINANCE_MARGIN {
+            UtilityImagined::ActWins {
+                margin: lower - DOMINANCE_MARGIN,
+            }
+        } else if upper <= DOMINANCE_MARGIN {
+            UtilityImagined::DoNothingDominates {
+                predicted_utility: stats.utility_ema,
+            }
+        } else {
+            UtilityImagined::Unknown
+        }
+    }
+
+    pub fn utility_known_actions(&self) -> usize {
+        self.utility_predicted
+            .keys()
+            .filter(|key| actionable_utility_key(key))
+            .count()
+    }
+
+    pub fn utility_ready_actions(&self) -> usize {
+        let Some(now_unix) = self.latest_context.as_ref().map(|ctx| ctx.timestamp_unix) else {
+            return 0;
+        };
+        self.utility_predicted
+            .iter()
+            .filter(|(key, stats)| {
+                actionable_utility_key(key)
+                    && utility_model_ready(stats, now_unix, self.latest_context.as_ref())
+            })
+            .count()
+    }
+
+    pub fn context_bronze(&self) -> u64 {
+        self.context_bronze
+    }
+
+    pub fn context_silver(&self) -> u64 {
+        self.context_silver
+    }
+
+    pub fn context_gold(&self) -> u64 {
+        self.context_gold
+    }
+
+    pub fn context_quality(&self) -> f64 {
+        self.context_quality
+    }
+
+    pub fn latest_context(&self) -> Option<&TelemetryContextSummary> {
+        self.latest_context.as_ref()
+    }
+
     /// Maximum predicted pressure-drop advantage over the natural drift,
     /// across all action keys the model can currently imagine. Empty model
     /// returns 0.0. Used by the per-cycle telemetry archive (Phase 1.5a,
@@ -227,6 +400,23 @@ impl WorldModel {
             .map(|(avg_delta, _, _)| (avg_delta - baseline).max(0.0))
             .fold(0.0_f64, f64::max)
     }
+}
+
+fn actionable_utility_key(key: &str) -> bool {
+    !key.ends_with(":*")
+}
+
+fn utility_model_ready(
+    stats: &ActionModelStats,
+    now_unix: i64,
+    context: Option<&TelemetryContextSummary>,
+) -> bool {
+    stats.quality_ema >= MIN_UTILITY_DATA_QUALITY
+        && stats.last_observed_unix > 0
+        && now_unix >= stats.last_observed_unix
+        && now_unix - stats.last_observed_unix <= UTILITY_MAX_AGE_SECS
+        && stats.effective_evidence_at(now_unix) >= MIN_UTILITY_EVIDENCE
+        && context.is_none_or(|context| stats.hardware_regime.matches_context(context))
 }
 
 #[cfg(test)]
@@ -376,6 +566,231 @@ mod tests {
     fn max_margin_ignores_immature_predictions() {
         let immature = model_with("freeze:Young", 0.30, 1.0, MIN_EVIDENCE - 1, 0.0);
         assert_eq!(immature.max_predicted_margin(), 0.0);
+    }
+
+    #[test]
+    fn universal_gold_actuator_models_drive_utility_imagination() {
+        let mut telemetry = TelemetryMedallion::new();
+        let mut persisted =
+            crate::engine::telemetry_medallion::TelemetryMedallionPersisted::default();
+        persisted.actuator_evidence_schema_version = 2;
+        let now_unix = 1_000_000;
+        persisted.latest = Some(TelemetryContextSummary {
+            timestamp_unix: now_unix,
+            ..TelemetryContextSummary::default()
+        });
+        persisted.action_models = [
+            (
+                "build|boost:Editor".to_string(),
+                crate::engine::telemetry_medallion::ActionModelStats {
+                    observations: 12,
+                    effective_observations: 10,
+                    utility_ema: 0.08,
+                    evidence_mass: 12.0,
+                    utility_variance_ema: 0.0001,
+                    quality_ema: 0.95,
+                    last_cycle: 100,
+                    last_observed_unix: now_unix,
+                    hardware_regime: Default::default(),
+                },
+            ),
+            (
+                "thread_qos:Worker:background".to_string(),
+                crate::engine::telemetry_medallion::ActionModelStats {
+                    observations: 15,
+                    effective_observations: 2,
+                    utility_ema: -0.03,
+                    evidence_mass: 15.0,
+                    utility_variance_ema: 0.0001,
+                    quality_ema: 0.93,
+                    last_cycle: 101,
+                    last_observed_unix: now_unix,
+                    hardware_regime: Default::default(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        telemetry.restore(persisted);
+        let mut model = WorldModel::default();
+        model.attach_context(&telemetry);
+
+        assert!(matches!(
+            model.imagine_utility("boost:Editor", "build"),
+            UtilityImagined::ActWins { .. }
+        ));
+        assert!(matches!(
+            model.imagine_utility("thread_qos:Worker:background", "idle"),
+            UtilityImagined::DoNothingDominates { .. }
+        ));
+        assert_eq!(model.utility_ready_actions(), 2);
+        assert_eq!(
+            model.imagine_utility("boost:Unknown", "build"),
+            UtilityImagined::Unknown
+        );
+    }
+
+    #[test]
+    fn stale_or_uncertain_utility_models_abstain() {
+        let now_unix = 2_000_000;
+        let mut telemetry = TelemetryMedallion::new();
+        let mut persisted =
+            crate::engine::telemetry_medallion::TelemetryMedallionPersisted::default();
+        persisted.actuator_evidence_schema_version = 2;
+        persisted.latest = Some(TelemetryContextSummary {
+            timestamp_unix: now_unix,
+            ..TelemetryContextSummary::default()
+        });
+        persisted.action_models = [
+            (
+                "boost:Stale".to_string(),
+                ActionModelStats {
+                    observations: 100,
+                    evidence_mass: 64.0,
+                    utility_ema: 0.30,
+                    utility_variance_ema: 0.0001,
+                    quality_ema: 1.0,
+                    last_observed_unix: now_unix - UTILITY_MAX_AGE_SECS - 1,
+                    ..ActionModelStats::default()
+                },
+            ),
+            (
+                "boost:Uncertain".to_string(),
+                ActionModelStats {
+                    observations: 20,
+                    evidence_mass: 20.0,
+                    utility_ema: 0.01,
+                    utility_variance_ema: 0.04,
+                    quality_ema: 1.0,
+                    last_observed_unix: now_unix,
+                    ..ActionModelStats::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        telemetry.restore(persisted);
+        let mut model = WorldModel::default();
+        model.attach_context(&telemetry);
+
+        assert_eq!(
+            model.imagine_utility("boost:Stale", "idle"),
+            UtilityImagined::Unknown
+        );
+        assert_eq!(
+            model.imagine_utility("boost:Uncertain", "idle"),
+            UtilityImagined::Unknown
+        );
+    }
+
+    #[test]
+    fn foreign_hardware_model_abstains_even_when_statistically_mature() {
+        use crate::engine::telemetry_medallion::HardwareRegime;
+
+        let now_unix = 2_500_000;
+        let mut telemetry = TelemetryMedallion::new();
+        let mut persisted =
+            crate::engine::telemetry_medallion::TelemetryMedallionPersisted::default();
+        persisted.actuator_evidence_schema_version = 2;
+        persisted.latest = Some(TelemetryContextSummary {
+            timestamp_unix: now_unix,
+            p_core_count: 4,
+            e_core_count: 6,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            ..TelemetryContextSummary::default()
+        });
+        persisted.action_models.insert(
+            "boost:Editor".to_string(),
+            ActionModelStats {
+                observations: 64,
+                evidence_mass: 64.0,
+                utility_ema: 0.30,
+                utility_variance_ema: 0.0001,
+                quality_ema: 1.0,
+                last_observed_unix: now_unix,
+                hardware_regime: HardwareRegime {
+                    p_core_count: 4,
+                    e_core_count: 4,
+                    ram_gib: 8,
+                },
+                ..ActionModelStats::default()
+            },
+        );
+        telemetry.restore(persisted);
+        let mut model = WorldModel::default();
+        model.attach_context(&telemetry);
+
+        assert_eq!(model.utility_known_actions(), 1);
+        assert_eq!(model.utility_ready_actions(), 0);
+        assert_eq!(
+            model.imagine_utility("boost:Editor", "idle"),
+            UtilityImagined::Unknown
+        );
+    }
+
+    #[test]
+    fn immature_workload_bucket_falls_back_to_mature_aggregate() {
+        let now_unix = 3_000_000;
+        let mut telemetry = TelemetryMedallion::new();
+        let mut persisted =
+            crate::engine::telemetry_medallion::TelemetryMedallionPersisted::default();
+        persisted.actuator_evidence_schema_version = 2;
+        persisted.latest = Some(TelemetryContextSummary {
+            timestamp_unix: now_unix,
+            ..TelemetryContextSummary::default()
+        });
+        let mature = ActionModelStats {
+            observations: 20,
+            evidence_mass: 20.0,
+            utility_ema: 0.08,
+            utility_variance_ema: 0.0001,
+            quality_ema: 0.95,
+            last_observed_unix: now_unix,
+            ..ActionModelStats::default()
+        };
+        let immature = ActionModelStats {
+            observations: 2,
+            evidence_mass: 2.0,
+            utility_ema: -0.50,
+            utility_variance_ema: 0.0001,
+            quality_ema: 0.95,
+            last_observed_unix: now_unix,
+            ..ActionModelStats::default()
+        };
+        persisted
+            .action_models
+            .insert("boost:Editor".to_string(), mature);
+        persisted
+            .action_models
+            .insert("build|boost:Editor".to_string(), immature);
+        telemetry.restore(persisted);
+        let mut model = WorldModel::default();
+        model.attach_context(&telemetry);
+
+        assert!(matches!(
+            model.imagine_utility("boost:Editor", "build"),
+            UtilityImagined::ActWins { .. }
+        ));
+    }
+
+    #[test]
+    fn incremental_refresh_skips_unchanged_models_and_invalidates_on_gold() {
+        let mut graph = crate::engine::causal_graph::CausalGraph::new();
+        let tracker = crate::engine::outcome_tracker::OutcomeTracker::new();
+        let telemetry = TelemetryMedallion::new();
+        let mut model = WorldModel::default();
+
+        model.refresh_from_parts_for_workload(&graph, &tracker, 1.0, "build");
+        model.attach_context(&telemetry);
+        model.refresh_from_parts_for_workload(&graph, &tracker, 1.0, "build");
+        model.attach_context(&telemetry);
+        assert_eq!(model.cache_stats(), (1, 1, 1, 1));
+
+        let gold = crate::engine::data_medallion::CuratedLabel::trusted_legacy();
+        assert!(graph.observe_curated_outcome("freeze:Editor", "build", 0.08, 10, gold,));
+        model.refresh_from_parts_for_workload(&graph, &tracker, 1.0, "build");
+        assert_eq!(model.known_actions(), 1);
+        assert_eq!(model.cache_stats(), (2, 1, 1, 1));
     }
 
     #[test]

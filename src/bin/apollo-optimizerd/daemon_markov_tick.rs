@@ -622,7 +622,7 @@ fn lease_resolution(
 pub fn release_markov_prewarm(lease: MarkovPrewarmLease, state: &SharedState) {
     let mut reverted = false;
     let mut reverted_effects = 0u64;
-    let mut failed_effects = 0u64;
+    let mut deferred_effects = 0u64;
     let member_count = lease.members.len();
     let cache_bytes = lease.cache_bytes;
     for member in lease.members {
@@ -643,7 +643,7 @@ pub fn release_markov_prewarm(lease: MarkovPrewarmLease, state: &SharedState) {
                     reverted_effects += 1;
                     reverted = true;
                 } else {
-                    failed_effects += 1;
+                    deferred_effects += 1;
                 }
             }
         }
@@ -665,7 +665,7 @@ pub fn release_markov_prewarm(lease: MarkovPrewarmLease, state: &SharedState) {
                         reverted_effects += 1;
                         reverted = true;
                     } else {
-                        failed_effects += 1;
+                        deferred_effects += 1;
                     }
                 }
             }
@@ -689,7 +689,7 @@ pub fn release_markov_prewarm(lease: MarkovPrewarmLease, state: &SharedState) {
                         reverted_effects += 1;
                         reverted = true;
                     } else {
-                        failed_effects += 1;
+                        deferred_effects += 1;
                     }
                 }
             }
@@ -700,11 +700,11 @@ pub fn release_markov_prewarm(lease: MarkovPrewarmLease, state: &SharedState) {
     metrics.metrics.markov_prewarm_members = 0;
     metrics.metrics.markov_prewarm_reverts += u64::from(reverted);
     metrics.metrics.reverts_applied += reverted_effects;
-    metrics.metrics.reverts_failed += failed_effects;
     tracing::debug!(
         member_count,
         cache_bytes,
         reverted,
+        deferred_effects,
         "markov: released coalition lease"
     );
 }

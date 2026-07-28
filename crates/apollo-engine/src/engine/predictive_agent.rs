@@ -1085,8 +1085,26 @@ impl PredictiveAgent {
 
     /// Apply the chosen intervention's threshold adjustments to existing thresholds.
     /// Returns adjusted thresholds (only modifies if TightenThresholds was selected).
-    pub fn adjust_thresholds(&self, mut thresholds: OverflowThresholds) -> OverflowThresholds {
-        let adj = self.threshold_adjustment();
+    pub fn adjust_thresholds(&self, thresholds: OverflowThresholds) -> OverflowThresholds {
+        self.adjust_thresholds_for(
+            self.last_intervention().unwrap_or(Intervention::Observe),
+            thresholds,
+        )
+    }
+
+    /// Apply the intervention that survived ensemble voting, rather than the
+    /// LinUCB proposal that preceded it. This keeps the observed intervention
+    /// and the operating-system policy change causally aligned.
+    pub fn adjust_thresholds_for(
+        &self,
+        intervention: Intervention,
+        mut thresholds: OverflowThresholds,
+    ) -> OverflowThresholds {
+        let adj = if intervention == Intervention::TightenThresholds {
+            TIGHTEN_OFFSET
+        } else {
+            0.0
+        };
         if adj != 0.0 {
             thresholds.bg_pressure = (thresholds.bg_pressure + adj).max(BG_PRESSURE_FLOOR);
             thresholds.critical_pressure =
@@ -1461,6 +1479,23 @@ mod tests {
         let adj = agent.adjust_thresholds(elevated);
         assert!(adj.bg_pressure < elevated.bg_pressure);
         assert!(adj.bg_pressure >= BG_PRESSURE_FLOOR);
+    }
+
+    #[test]
+    fn final_ensemble_intervention_controls_threshold_adjustment() {
+        let path = test_path("final_intervention_adjustment");
+        let agent = PredictiveAgent::load_or_default(&path);
+        let elevated = OverflowThresholds {
+            bg_pressure: 0.70,
+            ..OverflowThresholds::default()
+        };
+
+        let untouched = agent.adjust_thresholds_for(Intervention::Observe, elevated);
+        assert_eq!(untouched.bg_pressure, elevated.bg_pressure);
+
+        let tightened = agent.adjust_thresholds_for(Intervention::TightenThresholds, elevated);
+        assert!(tightened.bg_pressure < elevated.bg_pressure);
+        assert!(tightened.bg_pressure >= BG_PRESSURE_FLOOR);
     }
 
     #[test]

@@ -1438,6 +1438,54 @@ pub struct RuntimeMetrics {
     pub learning_data_quality: f64,
     #[serde(default)]
     pub learning_gold_rate: f64,
+    /// Context-only medallion. Unlike `learning_*`, these samples describe
+    /// live system state and do not claim an action caused an outcome.
+    #[serde(default)]
+    pub world_model_context_bronze_total: u64,
+    #[serde(default)]
+    pub world_model_context_silver_total: u64,
+    #[serde(default)]
+    pub world_model_context_gold_total: u64,
+    #[serde(default)]
+    pub world_model_context_quality: f64,
+    /// Universal actuator-evidence lane. Bronze is a resolved applied action,
+    /// Silver is structurally valid, and Gold is low-confounding evidence.
+    #[serde(default)]
+    pub world_model_actuator_issued_total: u64,
+    #[serde(default)]
+    pub world_model_actuator_pending_total: u64,
+    #[serde(default)]
+    pub world_model_actuator_bronze_total: u64,
+    #[serde(default)]
+    pub world_model_actuator_silver_total: u64,
+    #[serde(default)]
+    pub world_model_actuator_gold_total: u64,
+    #[serde(default)]
+    pub world_model_actuator_effective_total: u64,
+    #[serde(default)]
+    pub world_model_actuator_rejected_total: u64,
+    #[serde(default)]
+    pub world_model_actuator_expired_total: u64,
+    #[serde(default)]
+    pub world_model_actuator_quality: f64,
+    #[serde(default)]
+    pub world_model_actuator_mean_utility: f64,
+    /// Action/workload utility models retained for observation, excluding
+    /// family-only aggregates. They may be stale or belong to another machine.
+    #[serde(default)]
+    pub world_model_actuator_known_models: u64,
+    /// Known utility models currently fresh, sufficiently sampled, and
+    /// compatible with this machine's hardware regime.
+    #[serde(default)]
+    pub world_model_actuator_ready_models: u64,
+    #[serde(default)]
+    pub world_model_actuator_families: Vec<ActuatorEvidenceStatus>,
+    #[serde(default)]
+    pub world_model_utility_vetoes_total: u64,
+    /// Mature positive utility predictions promoted ahead of exploratory
+    /// responsiveness actions in the bounded dispatch queue.
+    #[serde(default)]
+    pub world_model_utility_promotions_total: u64,
     /// Gold-only world-model telemetry. Unlike process-local medallion totals,
     /// these counters describe the persisted evidence currently available for
     /// action imagination and vetoes.
@@ -1451,6 +1499,14 @@ pub struct RuntimeMetrics {
     pub world_model_contextual_actions: u64,
     #[serde(default)]
     pub world_model_data_quality: f64,
+    #[serde(default)]
+    pub world_model_causal_refreshes: u64,
+    #[serde(default)]
+    pub world_model_causal_cache_hits: u64,
+    #[serde(default)]
+    pub world_model_utility_refreshes: u64,
+    #[serde(default)]
+    pub world_model_utility_cache_hits: u64,
     /// 2026-05-12 — Active regime selected by the chromium Step 2 gate's
     /// priority chain in daemon_chromium_tick.rs. One of: "default",
     /// "media", "build", "call", "llm". Surfaces silently-failing regime
@@ -1947,6 +2003,19 @@ pub struct RuntimeMetrics {
     // `boosts_applied + thread_qos_applied` quantifies the capability gap.
     #[serde(default)]
     pub effect_decay_phantom_enroll_skipped_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ActuatorEvidenceStatus {
+    pub family: String,
+    pub issued: u64,
+    pub resolved: u64,
+    pub gold: u64,
+    pub effective: u64,
+    pub rejected: u64,
+    pub expired: u64,
+    pub mean_quality: f64,
+    pub mean_utility: f64,
 }
 
 impl RuntimeMetrics {

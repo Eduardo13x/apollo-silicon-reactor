@@ -227,6 +227,9 @@ impl ProfileGovernor {
         let swap_gb_input = input.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         let mem_thrash_crisis = input.ram_pressure >= 0.60 && swap_gb_input >= 2.0;
 
+        let balanced_lock_active = self
+            .balanced_lock_until
+            .is_some_and(|lock_until| lock_until > now);
         if let Some(lock_until) = self.balanced_lock_until {
             if lock_until > now && !mem_thrash_crisis {
                 // Anti-thrash lock active — hold balanced unless the machine is genuinely
@@ -234,6 +237,7 @@ impl ProfileGovernor {
                 // was protecting against oscillation, not against a sustained emergency.
                 target = OptimizationProfile::BalancedRoot;
                 reason = "anti-thrash-balanced-lock".to_string();
+                self.transition_reason = reason.clone();
             } else {
                 self.balanced_lock_until = None;
             }
@@ -271,6 +275,7 @@ impl ProfileGovernor {
         // the RAM rather than reacting after swap starts. Skip if thermal is constrained.
         if input.workload_onset
             && !input.thermal_constrained
+            && (!balanced_lock_active || mem_thrash_crisis)
             && target != OptimizationProfile::AggressiveRoot
         {
             target = OptimizationProfile::AggressiveRoot;
@@ -315,21 +320,28 @@ impl ProfileGovernor {
                 pressure_score,
             };
             self.transition_times.push(now);
-            self.state.effective_profile = target;
-            self.transition_reason = reason.clone();
 
             if self.transition_times.len() > 4 {
                 self.balanced_lock_until = Some(now + Duration::minutes(5));
+                // Start a fresh observation window after the lock. Keeping the
+                // triggering timestamps made the governor immediately relock
+                // when the five-minute hold expired.
+                self.transition_times.clear();
                 self.state.effective_profile = OptimizationProfile::BalancedRoot;
                 self.transition_reason = "anti-thrash-balanced-lock".to_string();
-                Some(ProfileTransition {
-                    from: target,
+                // If Balanced was already effective, the proposed escalation
+                // was suppressed; reporting target -> Balanced fabricated a
+                // switch on every cycle even though the machine never moved.
+                (current != OptimizationProfile::BalancedRoot).then_some(ProfileTransition {
+                    from: current,
                     to: OptimizationProfile::BalancedRoot,
                     at: now,
                     reason: "anti-thrash-balanced-lock".to_string(),
                     pressure_score,
                 })
             } else {
+                self.state.effective_profile = target;
+                self.transition_reason = reason.clone();
                 Some(entry)
             }
         } else {
@@ -570,10 +582,8 @@ mod tests {
         // Even if balanced_lock is active, a genuine memory crisis should be able
         // to escalate to AggressiveRoot.
         let mut gov = make_governor(OptimizationProfile::BalancedRoot);
-        // Trigger anti-thrash lock by making 5 rapid transitions
-        for _ in 0..5 {
-            gov.evaluate(low_pressure_input(true));
-        }
+        gov.balanced_lock_until = Some(Utc::now() + Duration::minutes(5));
+        gov.state.consecutive_high = 2;
         // Now evaluate with memory crisis — should break the lock
         let crisis_input = GovernorInput {
             cpu_pressure: 0.05,
@@ -596,5 +606,36 @@ mod tests {
             decision.effective_profile,
             decision.transition_reason
         );
+    }
+
+    #[test]
+    fn anti_thrash_lock_blocks_latched_onset_without_fake_transition() {
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        gov.balanced_lock_until = Some(Utc::now() + Duration::minutes(5));
+
+        let decision = gov.evaluate(low_pressure_input(true));
+
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::BalancedRoot
+        );
+        assert!(decision.transition.is_none());
+        assert_eq!(decision.transition_reason, "anti-thrash-balanced-lock");
+    }
+
+    #[test]
+    fn anti_thrash_activation_does_not_report_suppressed_target_as_switch() {
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        gov.transition_times = vec![Utc::now(); 4];
+
+        let decision = gov.evaluate(low_pressure_input(true));
+
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::BalancedRoot
+        );
+        assert!(decision.transition.is_none());
+        assert!(gov.transition_times.is_empty());
+        assert!(gov.balanced_lock_until.is_some());
     }
 }

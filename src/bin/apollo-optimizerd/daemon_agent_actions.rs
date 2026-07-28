@@ -23,6 +23,7 @@ use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::predictive_agent::Intervention;
 use apollo_engine::engine::safety::is_protected_name;
 use apollo_engine::engine::types::RootAction;
+use apollo_engine::engine::usage_model::is_noise_candidate_name;
 use apollo_engine::engine::user_context::UserContext;
 
 /// Inject predictive-agent soft actions for this cycle.
@@ -68,7 +69,19 @@ pub fn run_agent_actions(
                 .clone();
             let mut noise_procs: Vec<_> = top_processes
                 .iter()
-                .filter(|p| noise_pats.iter().any(|pat| p.name.contains(pat.as_str())))
+                .filter(|p| {
+                    // Learned labels are fallible. Apply the same process-origin
+                    // and role checks at the actuator boundary, where a bad
+                    // historical label would otherwise become a real throttle.
+                    !is_apple_owned(p.pid)
+                        && !is_protected_name(&p.name)
+                        && is_noise_candidate_name(&p.name)
+                        && !is_interactive_app_name(&p.name)
+                        && !decide_interactive
+                            .iter()
+                            .any(|pat| p.name.contains(pat.as_str()))
+                        && noise_pats.iter().any(|pat| p.name.contains(pat.as_str()))
+                })
                 .collect();
             let by_cpu = |a: &&ProcessStats, b: &&ProcessStats| {
                 b.cpu_usage

@@ -46,7 +46,7 @@
 
 use crate::engine::causal_graph::CausalGraph;
 use crate::engine::data_medallion::{
-    CuratedLabel, DataMedallion, MedallionMetrics, MedallionObservation,
+    CuratedLabel, DataMedallion, DataMedallionPersisted, MedallionMetrics, MedallionObservation,
 };
 use crate::engine::effectiveness_tracker::EffectivenessTracker;
 use crate::engine::optimization_skills::SkillRegistry;
@@ -554,6 +554,16 @@ impl LearningPipeline {
     /// Cumulative curation telemetry for dashboard and AIS evidence quality.
     pub fn medallion_metrics(&self) -> MedallionMetrics {
         self.medallion.metrics()
+    }
+
+    /// Snapshot the curation boundary for unified learned-state persistence.
+    pub fn medallion_snapshot(&self) -> DataMedallionPersisted {
+        self.medallion.snapshot()
+    }
+
+    /// Restore cumulative curation telemetry and the bounded duplicate window.
+    pub fn restore_medallion(&mut self, state: DataMedallionPersisted) {
+        self.medallion.restore(state);
     }
 
     /// Force-flush any remaining observations (call at daemon shutdown or persist time).

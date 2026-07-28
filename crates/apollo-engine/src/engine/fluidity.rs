@@ -235,10 +235,26 @@ impl FluidityState {
             }
         }
 
-        // Penalty computation [Jain 1991]
+        // Penalty computation [Jain 1991]. A busy compositor is not itself
+        // evidence of jank: a stable 40-50% WindowServer load is normal while
+        // animating or playing media. Keep the window-operation safety gate
+        // above, but reserve the large score penalty for an actual CPU burst.
+        let prior_ws_mean = if self.windowserver_cpu_history.len() > 1 {
+            self.windowserver_cpu_history
+                .iter()
+                .take(self.windowserver_cpu_history.len() - 1)
+                .sum::<f32>()
+                / (self.windowserver_cpu_history.len() - 1) as f32
+        } else {
+            ws_cpu
+        };
+        let compositor_burst = self.windowserver_cpu_spike
+            && (self.windowserver_cpu_history.len() == 1 || ws_cpu > prior_ws_mean + 12.0);
         let ws_penalty = (self.windowserver_cpu_ema / 100.0 * 0.4).min(0.4);
-        let spike_penalty = if self.windowserver_cpu_spike {
+        let spike_penalty = if compositor_burst {
             0.2
+        } else if self.windowserver_cpu_spike {
+            0.05
         } else {
             0.0
         };
@@ -461,6 +477,23 @@ mod tests {
         assert!(
             state.fluidity_score < 0.75,
             "score should drop during spike, got {}",
+            state.fluidity_score
+        );
+    }
+
+    #[test]
+    fn sustained_compositor_work_is_not_scored_as_a_jank_burst() {
+        let mut state = FluidityState::new();
+        for _ in 0..10 {
+            state.update(vec![(1, "WindowServer", 45.0_f32)], 0.0, 0.5);
+        }
+        assert!(
+            state.windowserver_cpu_spike,
+            "window operation gate remains active"
+        );
+        assert!(
+            state.fluidity_score > 0.70,
+            "stable compositor work should not incur a burst penalty: {}",
             state.fluidity_score
         );
     }

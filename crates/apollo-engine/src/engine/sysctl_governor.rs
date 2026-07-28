@@ -181,6 +181,39 @@ const COOLDOWN: Duration = Duration::from_secs(60);
 /// subsides (e.g. screen-share ends) caused the 2026-06-09 whipsaw.
 const TCP_SCALE_DOWN_DWELL: Duration = Duration::from_secs(300);
 
+/// Hardware-calibrated VM gates. The generic values remain the safe fallback;
+/// M4/16GB reacts earlier to a real swap ramp without treating normal cache
+/// pressure as a reason to churn compressor sysctls.
+#[derive(Debug, Clone, Copy)]
+struct VmTuningProfile {
+    high_pressure: f64,
+    low_pressure: f64,
+    high_cycles: u32,
+    low_cycles: u32,
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+fn vm_tuning_profile_for(chip: Option<&str>, memory_bytes: Option<u64>) -> VmTuningProfile {
+    let is_m4 = chip.is_some_and(|name| name.contains("Apple M4"));
+    let ram_gib = memory_bytes.unwrap_or_default() / GIB;
+    if is_m4 && (12..=20).contains(&ram_gib) {
+        VmTuningProfile {
+            high_pressure: 0.68,
+            low_pressure: 0.32,
+            high_cycles: 2,
+            low_cycles: 8,
+        }
+    } else {
+        VmTuningProfile {
+            high_pressure: 0.75,
+            low_pressure: 0.40,
+            high_cycles: 3,
+            low_cycles: 6,
+        }
+    }
+}
+
 // ── SysctlGovernor ───────────────────────────────────────────────────────────
 
 /// Reactive sysctl tuning engine.
@@ -213,6 +246,7 @@ pub struct SysctlGovernor {
     /// Sysctl keys that could not be read during `capture_defaults()`.
     /// The governor will skip emitting actions for these keys.
     unavailable_keys: Vec<String>,
+    vm_profile: VmTuningProfile,
     /// Timestamp of the last successful `tick()` execution, used to guard
     /// against double-tick from reactor fast-tick.
     last_tick: Option<Instant>,
@@ -224,6 +258,10 @@ impl SysctlGovernor {
     /// If `is_root` is false the governor will be inactive and `tick()` will
     /// always return an empty vec.
     pub fn new(is_root: bool) -> Self {
+        let vm_profile = vm_tuning_profile_for(
+            sysctl_direct::read_str("machdep.cpu.brand_string").as_deref(),
+            sysctl_direct::read_u64("hw.memsize"),
+        );
         let (defaults, unavailable_keys) = if is_root {
             capture_defaults(is_root)
         } else {
@@ -331,6 +369,7 @@ impl SysctlGovernor {
             is_root,
             total_writes: 0,
             unavailable_keys,
+            vm_profile,
             last_tick: None,
         }
     }
@@ -843,10 +882,10 @@ impl SysctlGovernor {
             inputs.memory_pressure.clamp(0.0, 1.0)
         };
 
-        if pressure > 0.75 {
+        if pressure > self.vm_profile.high_pressure {
             self.vm.consecutive_high += 1;
             self.vm.consecutive_low = 0;
-        } else if pressure < 0.40 {
+        } else if pressure < self.vm_profile.low_pressure {
             self.vm.consecutive_low += 1;
             self.vm.consecutive_high = 0;
         } else {
@@ -882,7 +921,7 @@ impl SysctlGovernor {
         }
 
         // High pressure + swap growing for 3 cycles: aggressive compressor.
-        if self.vm.consecutive_high >= 3 && swap_growing {
+        if self.vm.consecutive_high >= self.vm_profile.high_cycles && swap_growing {
             #[cfg(target_os = "macos")]
             {
                 if self.vm.poll_interval != 100
@@ -937,7 +976,7 @@ impl SysctlGovernor {
         }
 
         // Low pressure for 6 cycles: relaxed compressor.
-        if self.vm.consecutive_low >= 6 {
+        if self.vm.consecutive_low >= self.vm_profile.low_cycles {
             #[cfg(target_os = "macos")]
             {
                 if self.vm.poll_interval != 500
@@ -991,10 +1030,10 @@ impl SysctlGovernor {
             self.vm.consecutive_low = 0;
         }
 
-        // Default range (0.40 <= pressure <= 0.75): moderate settings.
+        // Default range between calibrated low/high gates: moderate settings.
         if self.vm.consecutive_high == 0
             && self.vm.consecutive_low == 0
-            && (0.40..=0.75).contains(&pressure)
+            && (self.vm_profile.low_pressure..=self.vm_profile.high_pressure).contains(&pressure)
         {
             #[cfg(target_os = "macos")]
             {
@@ -1437,6 +1476,20 @@ mod tests {
     }
 
     #[test]
+    fn m4_16gb_vm_profile_avoids_normal_pressure_churn() {
+        let profile = vm_tuning_profile_for(Some("Apple M4"), Some(16 * GIB));
+        assert_eq!(profile.high_pressure, 0.68);
+        assert_eq!(profile.low_pressure, 0.32);
+        assert_eq!(profile.high_cycles, 2);
+        assert_eq!(profile.low_cycles, 8);
+        assert!(0.35 > profile.low_pressure && 0.35 < profile.high_pressure);
+
+        let generic = vm_tuning_profile_for(Some("Apple M1"), Some(8 * GIB));
+        assert_eq!(generic.high_pressure, 0.75);
+        assert_eq!(generic.low_pressure, 0.40);
+    }
+
+    #[test]
     fn inactive_when_not_root() {
         let mut gov = SysctlGovernor::new(false);
         let monitor = NetworkMonitor::new();
@@ -1538,10 +1591,13 @@ mod tests {
         inputs.memory_pressure = 0.85;
         inputs.swap_trend = SwapTrend::Increasing;
 
-        // 3 cycles needed.
-        tick_ok(&mut gov, &inputs);
-        tick_ok(&mut gov, &inputs);
-        let actions = tick_ok(&mut gov, &inputs);
+        // Generic hardware needs three observations; M4/16GB responds on
+        // the second. Accumulate both paths without coupling this safety
+        // test to the machine running it.
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            actions.extend(tick_ok(&mut gov, &inputs));
+        }
 
         // On macOS the governor uses the _in_msecs variants; on other platforms the legacy names.
         let has_aggressive = actions.iter().any(|a| {

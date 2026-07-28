@@ -507,6 +507,9 @@ pub struct CausalGraph {
     realized_net_delta_ema: f32,
     /// Observation count for the calibration accumulator (gates cold-start).
     realized_net_obs: u32,
+    /// Runtime generation for the Gold-only stream consumed by WorldModel.
+    /// Raw causal updates intentionally do not invalidate that snapshot.
+    curated_revision: u64,
 }
 
 const EFFECT_PRESSURE_DROP: &str = "pressure_drop";
@@ -532,6 +535,7 @@ impl CausalGraph {
             recent_external_taints: std::collections::VecDeque::new(),
             realized_net_delta_ema: 0.0,
             realized_net_obs: 0,
+            curated_revision: 0,
         }
     }
 
@@ -707,7 +711,12 @@ impl CausalGraph {
             );
         }
         self.compact_edges_if_needed();
+        self.curated_revision = self.curated_revision.wrapping_add(1);
         true
+    }
+
+    pub fn curated_revision(&self) -> u64 {
+        self.curated_revision
     }
 
     /// Record action with resource snapshot for mechanism attribution.
@@ -1222,6 +1231,7 @@ impl CausalGraph {
 
     /// Restore edges from persisted snapshot. Merges with any existing edges.
     pub fn restore(&mut self, persisted: Vec<((String, String), CausalEdge)>) {
+        let had_edges = !persisted.is_empty();
         for (key, edge) in persisted {
             // Raw and curated streams can advance independently. Preserve the
             // fresher stream from each side instead of replacing one whole edge
@@ -1236,6 +1246,9 @@ impl CausalGraph {
             } else if entry.curated.aggregate.observations < edge.curated.aggregate.observations {
                 entry.curated = edge.curated;
             }
+        }
+        if had_edges {
+            self.curated_revision = self.curated_revision.wrapping_add(1);
         }
     }
 

@@ -48,6 +48,7 @@ use apollo_engine::engine::process_classifier::ProcessTier;
 use apollo_engine::engine::process_tree::ProcessTree;
 use apollo_engine::engine::profile_governor::GovernorDecision;
 use apollo_engine::engine::signal_intelligence::SignalDigest;
+use apollo_engine::engine::telemetry_medallion::TelemetryMedallion;
 use apollo_engine::engine::thermal_bailout::ThermalAction;
 use apollo_engine::engine::types::BlockerScore;
 use apollo_engine::engine::types::OptimizationProfile;
@@ -66,6 +67,7 @@ pub fn update_learning_metrics<'a>(
     agent_intervention: &Intervention,
     arousal_state: &ArousalState,
     learning_pipeline: &LearningPipeline,
+    telemetry_medallion: &TelemetryMedallion,
     world_model: &WorldModel,
 ) {
     let mut m = state.metrics.lock_recover();
@@ -85,11 +87,59 @@ pub fn update_learning_metrics<'a>(
     m.metrics.learning_duplicate_total = medallion.duplicate_total;
     m.metrics.learning_data_quality = medallion.mean_quality;
     m.metrics.learning_gold_rate = medallion.gold_rate;
+    let context = telemetry_medallion.metrics();
+    m.metrics.world_model_context_bronze_total = context.bronze_total;
+    m.metrics.world_model_context_silver_total = context.silver_total;
+    m.metrics.world_model_context_gold_total = context.gold_total;
+    m.metrics.world_model_context_quality = context.mean_quality;
+    m.metrics.world_model_actuator_issued_total = context.actuator_issued_total;
+    m.metrics.world_model_actuator_pending_total = context.actuator_pending_total;
+    m.metrics.world_model_actuator_bronze_total = context.actuator_bronze_total;
+    m.metrics.world_model_actuator_silver_total = context.actuator_silver_total;
+    m.metrics.world_model_actuator_gold_total = context.actuator_gold_total;
+    m.metrics.world_model_actuator_effective_total = context.actuator_effective_total;
+    m.metrics.world_model_actuator_rejected_total = context.actuator_rejected_total;
+    m.metrics.world_model_actuator_expired_total = context.actuator_expired_total;
+    m.metrics.world_model_actuator_quality = context.actuator_mean_quality;
+    m.metrics.world_model_actuator_mean_utility = context.actuator_mean_utility;
+    m.metrics.world_model_actuator_known_models = world_model.utility_known_actions() as u64;
+    m.metrics.world_model_actuator_ready_models = world_model.utility_ready_actions() as u64;
+    m.metrics.world_model_actuator_families = telemetry_medallion
+        .family_stats()
+        .iter()
+        .map(
+            |(family, stats)| apollo_engine::engine::types::ActuatorEvidenceStatus {
+                family: family.as_str().to_string(),
+                issued: stats.issued_total,
+                resolved: stats.resolved_total,
+                gold: stats.gold_total,
+                effective: stats.effective_total,
+                rejected: stats.rejected_total,
+                expired: stats.expired_total,
+                mean_quality: if stats.resolved_total == 0 {
+                    0.0
+                } else {
+                    (stats.quality_sum / stats.resolved_total as f64).clamp(0.0, 1.0)
+                },
+                mean_utility: if stats.resolved_total == 0 {
+                    0.0
+                } else {
+                    (stats.utility_sum / stats.resolved_total as f64).clamp(-1.0, 1.0)
+                },
+            },
+        )
+        .collect();
     m.metrics.world_model_curated_actions = world_model.known_actions() as u64;
     m.metrics.world_model_ready_actions = world_model.ready_actions() as u64;
     m.metrics.world_model_gold_evidence = world_model.curated_observations();
     m.metrics.world_model_contextual_actions = world_model.contextual_actions() as u64;
     m.metrics.world_model_data_quality = world_model.mean_data_quality();
+    let (causal_refreshes, causal_hits, utility_refreshes, utility_hits) =
+        world_model.cache_stats();
+    m.metrics.world_model_causal_refreshes = causal_refreshes;
+    m.metrics.world_model_causal_cache_hits = causal_hits;
+    m.metrics.world_model_utility_refreshes = utility_refreshes;
+    m.metrics.world_model_utility_cache_hits = utility_hits;
     m.metrics.si_pressure_smooth = signal_digest.pressure_smooth;
     m.metrics.si_pressure_velocity = signal_digest.pressure_velocity;
     m.metrics.si_p_oom_30s = signal_digest.p_oom_30s;

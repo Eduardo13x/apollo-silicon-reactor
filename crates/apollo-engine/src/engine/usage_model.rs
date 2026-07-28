@@ -16,6 +16,9 @@ const PROMOTIONS_PER_DAY_BOOTCAMP: u32 = 3;
 const PROMOTIONS_PER_DAY_STABLE: u32 = 1;
 
 const MIN_AGE_HOURS_FOR_PROMOTION: i64 = 12;
+const MAX_RECENCY_DAYS_FOR_PROMOTION: i64 = 7;
+const STALE_ENTRY_RETENTION_DAYS: i64 = 30;
+const MIN_OBSERVATIONS_FOR_PROMOTION: u64 = 24;
 
 // These thresholds assume EMA values in [0, 1].
 const MIN_PRESENCE_FOR_INTERACTIVE: f64 = 0.18;
@@ -25,6 +28,18 @@ const MIN_USAGE_SCORE: f64 = 0.22;
 const MIN_JANK_EMA: f64 = 0.10;
 const MAX_INTERACTIVE_FOR_NOISE: f64 = 0.10;
 const MIN_NOISE_SCORE: f64 = 0.18;
+
+/// A global "the user is active" sample is context, not proof that every
+/// process in the sample is interactive. Require local scheduling evidence
+/// before it can influence a process label.
+const INTERACTIVE_RATIO_MAX: f64 = 0.15;
+const INTERACTIVE_MIN_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Attribute a global jank sample only to a process that materially consumed
+/// CPU or memory in that sample. This prevents co-running helpers and daemons
+/// from inheriting the foreground app's jank label.
+const JANK_MIN_CPU_FRACTION: f64 = 0.08;
+const JANK_MIN_MEMORY_FRACTION: f64 = 0.25;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UsageModelPersisted {
@@ -73,6 +88,7 @@ pub struct UsageEntrySummary {
     pub cpu_ema: f64,
     pub mem_ema: f64,
     pub cpu_wall_ratio_ema: f64,
+    pub seen_count_total: u64,
     pub first_seen_at: Option<DateTime<Utc>>,
     pub last_seen_at: Option<DateTime<Utc>>,
 }
@@ -135,6 +151,17 @@ impl UsageModel {
         top_n: usize,
         cpu_wall_ratios: &HashMap<String, f32>,
     ) {
+        // Imported and one-off process identities must not become permanent
+        // priors. Sweep infrequently so the hot path remains bounded.
+        let should_prune = self
+            .persisted
+            .updated_at
+            .map(|updated| now - updated >= ChronoDuration::hours(6))
+            .unwrap_or(true);
+        if should_prune {
+            self.prune_stale_at(now);
+        }
+
         if self.persisted.started_at.is_none() {
             self.persisted.started_at = Some(now);
         }
@@ -175,14 +202,25 @@ impl UsageModel {
             entry.cpu_ema = ema_update(entry.cpu_ema, cpu_norm, decay_presence);
             entry.mem_ema = ema_update(entry.mem_ema, mem_norm, decay_presence);
 
-            if interactive_proxy {
+            let observed_ratio = cpu_wall_ratios
+                .get(&p.name)
+                .copied()
+                .map(|ratio| (ratio as f64).clamp(0.0, 1.0));
+            let direct_interaction_evidence = observed_ratio
+                .map(|ratio| {
+                    ratio <= INTERACTIVE_RATIO_MAX && p.memory_usage >= INTERACTIVE_MIN_MEMORY_BYTES
+                })
+                .unwrap_or(false);
+            if interactive_proxy && direct_interaction_evidence {
                 entry.seen_interactive_total += 1;
                 entry.interactive_ema = ema_update(entry.interactive_ema, 1.0, decay_presence);
             } else {
                 entry.interactive_ema = ema_update(entry.interactive_ema, 0.0, decay_presence);
             }
 
-            if jank_proxy {
+            let materially_contributed =
+                cpu_norm >= JANK_MIN_CPU_FRACTION || mem_norm >= JANK_MIN_MEMORY_FRACTION;
+            if jank_proxy && materially_contributed {
                 entry.seen_jank_total += 1;
                 entry.jank_ema = ema_update(entry.jank_ema, 1.0, decay_jank);
             } else {
@@ -191,12 +229,30 @@ impl UsageModel {
 
             // EMA-update cpu_wall_ratio if we have a measurement for this process.
             // This is a PARALLEL signal to interactive_ema — does NOT replace it.
-            if let Some(&ratio) = cpu_wall_ratios.get(&p.name) {
-                let ratio_f64 = (ratio as f64).clamp(0.0, 1.0);
+            if let Some(ratio_f64) = observed_ratio {
                 entry.cpu_wall_ratio_ema =
                     ema_update(entry.cpu_wall_ratio_ema, ratio_f64, decay_presence);
             }
         }
+    }
+
+    /// Discard identities that have not been observed on this Mac recently.
+    /// This is deliberately based on `last_seen_at`, not model age: a machine
+    /// can keep useful long-running knowledge while an imported M1 history
+    /// naturally disappears after a bounded grace period.
+    pub fn prune_stale(&mut self, now: DateTime<Utc>) -> usize {
+        self.prune_stale_at(now)
+    }
+
+    fn prune_stale_at(&mut self, now: DateTime<Utc>) -> usize {
+        let before = self.persisted.entries.len();
+        self.persisted.entries.retain(|_, entry| {
+            entry
+                .last_seen_at
+                .map(|seen| now - seen <= ChronoDuration::days(STALE_ENTRY_RETENTION_DAYS))
+                .unwrap_or(false)
+        });
+        before - self.persisted.entries.len()
     }
 
     pub fn entry_summary(&self, name: &str) -> Option<UsageEntrySummary> {
@@ -219,7 +275,10 @@ impl UsageModel {
         // wrongly excluded because it contained "WindowServer"). is_protected_name()
         // is the single authoritative classifier (Tier 1 exact / Tier 2 infra /
         // Tier 3 dev runtime) — Saltzer & Kaashoek 2009 §3.3 Complete Mediation.
-        entries.retain(|e| !crate::engine::safety::is_protected_name(&e.name));
+        entries.retain(|e| {
+            !crate::engine::safety::is_protected_name(&e.name)
+                && is_recent(e, Utc::now(), MAX_RECENCY_DAYS_FOR_PROMOTION)
+        });
 
         let mut interactive = entries.clone();
         // BUG 20 fix: unwrap on partial_cmp could panic if NaN. Use unwrap_or(Equal).
@@ -288,6 +347,10 @@ impl UsageModel {
         // separate, intentionally-permissive heuristic over name fragments
         // like "helper", not exact OS-daemon identities.
         candidates.retain(|e| !crate::engine::safety::is_protected_name(&e.name));
+        candidates.retain(|e| {
+            e.seen_count_total >= MIN_OBSERVATIONS_FOR_PROMOTION
+                && is_recent(e, now, MAX_RECENCY_DAYS_FOR_PROMOTION)
+        });
         // Build AC once across all candidates (substring match, case-sensitive
         // to mirror `e.name.contains(p)` semantics). Sprint patch (2026-06-05):
         // route through the content-hash cache so identical pattern bundles
@@ -377,6 +440,9 @@ impl UsageModel {
             if e.noise_score < MIN_NOISE_SCORE {
                 continue;
             }
+            if !is_noise_candidate_name(&e.name) {
+                continue;
+            }
             if existing_noise_ac
                 .as_ref()
                 .map(|ac| ac.is_match(&e.name))
@@ -419,6 +485,49 @@ impl UsageModel {
 
         promotions
     }
+}
+
+fn is_recent(entry: &UsageEntrySummary, now: DateTime<Utc>, max_age_days: i64) -> bool {
+    entry
+        .last_seen_at
+        .map(|seen| now - seen <= ChronoDuration::days(max_age_days))
+        .unwrap_or(false)
+}
+
+/// Conservative role gate for automatic noise learning. These are process
+/// roles rather than app names: a helper/renderer/LSP can be part of the
+/// user's active workflow even when the parent app is not foreground.
+///
+/// The action path has stronger PID/Apple-signing guards; this classifier keeps
+/// weak correlational telemetry from ever creating a durable noise prior.
+pub fn is_noise_candidate_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let user_facing_role = [
+        " helper",
+        "helper (",
+        "renderer",
+        "gpu process",
+        "web content",
+        "language_server",
+        "language server",
+        "lsp",
+        "accessibility",
+        "extension",
+        "plugin",
+    ];
+    let system_role = [
+        "com.apple.",
+        "mobileasset",
+        "softwareupdate",
+        "remotemanagement",
+        "corelocation",
+        "findmy",
+        "speech",
+        "siri",
+        "xprotect",
+    ];
+    !user_facing_role.iter().any(|role| name.contains(role))
+        && !system_role.iter().any(|role| name.contains(role))
 }
 
 /// Processes that must never be promoted to interactive patterns.
@@ -560,6 +669,7 @@ fn summarize_entry(e: &UsageEntry) -> UsageEntrySummary {
         cpu_ema: e.cpu_ema,
         mem_ema: e.mem_ema,
         cpu_wall_ratio_ema: e.cpu_wall_ratio_ema,
+        seen_count_total: e.seen_count_total,
         first_seen_at: e.first_seen_at,
         last_seen_at: e.last_seen_at,
     }
@@ -734,5 +844,34 @@ mod tests {
             (summary.cpu_wall_ratio_ema - 0.03).abs() < f64::EPSILON,
             "summary should include cpu_wall_ratio_ema"
         );
+    }
+
+    #[test]
+    fn stale_imported_entries_are_pruned_but_recent_entries_remain() {
+        let now = Utc::now();
+        let mut model = UsageModel::default();
+        let mut stale = make_entry(0.5, 0.5, 100);
+        stale.raw_name = "OldM1Process".to_string();
+        stale.last_seen_at = Some(now - ChronoDuration::days(STALE_ENTRY_RETENTION_DAYS + 1));
+        let mut recent = make_entry(0.5, 0.5, 100);
+        recent.raw_name = "CurrentProcess".to_string();
+        recent.last_seen_at = Some(now - ChronoDuration::days(1));
+        model.persisted.entries.insert("old".to_string(), stale);
+        model
+            .persisted
+            .entries
+            .insert("current".to_string(), recent);
+
+        assert_eq!(model.prune_stale(now), 1);
+        assert!(!model.persisted.entries.contains_key("old"));
+        assert!(model.persisted.entries.contains_key("current"));
+    }
+
+    #[test]
+    fn noise_role_gate_rejects_helpers_and_system_services() {
+        assert!(!is_noise_candidate_name("LM Studio Helper (Renderer)"));
+        assert!(!is_noise_candidate_name("language_server"));
+        assert!(!is_noise_candidate_name("com.apple.siri.embeddedspeech"));
+        assert!(is_noise_candidate_name("GoogleUpdater"));
     }
 }

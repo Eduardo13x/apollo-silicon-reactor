@@ -180,6 +180,94 @@ pub fn record_applied_actions(
 
 use crate::{cognitive_tick, daemon_action_pipeline};
 
+fn utility_model_vetoes(
+    action: &RootAction,
+    world_model: &apollo_engine::engine::world_model::WorldModel,
+    workload: &str,
+) -> Option<String> {
+    if !apollo_engine::engine::telemetry_medallion::utility_veto_eligible(action) {
+        return None;
+    }
+    let key = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)?;
+    matches!(
+        world_model.imagine_utility(&key, workload),
+        apollo_engine::engine::world_model::UtilityImagined::DoNothingDominates { .. }
+    )
+    .then_some(key)
+}
+
+/// Move proven responsiveness actions ahead of exploratory accelerators before
+/// they enter the bounded action queue. This never creates or changes an
+/// action: it only reorders existing Boost and interactive thread-QoS hints
+/// when their own workload-conditioned utility model is mature and positive.
+///
+/// Pressure protection stays untouched because only accelerator slots are
+/// rewritten. That keeps freeze, throttle, recovery, and kernel guardrails in
+/// their original order while letting demonstrated low-latency wins dispatch
+/// first when the normal queue is busy.
+pub fn prioritize_world_model_accelerators(
+    mut actions: Vec<RootAction>,
+    world_model: &apollo_engine::engine::world_model::WorldModel,
+    workload: &str,
+) -> (Vec<RootAction>, u64) {
+    let mut ranked: Vec<(usize, f64)> = actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| {
+            if !is_responsiveness_accelerator(action) {
+                return None;
+            }
+            let key = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)?;
+            match world_model.imagine_utility(&key, workload) {
+                apollo_engine::engine::world_model::UtilityImagined::ActWins { margin } => {
+                    Some((index, margin))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+
+    if ranked.is_empty() {
+        return (actions, 0);
+    }
+
+    // Keep the candidate set small and stable: only the existing accelerator
+    // positions are permuted, descending by the measured utility margin.
+    let accelerator_slots: Vec<usize> = actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| is_responsiveness_accelerator(action).then_some(index))
+        .collect();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    let mut ordered_accelerators: Vec<RootAction> = ranked
+        .iter()
+        .map(|(index, _)| actions[*index].clone())
+        .collect();
+    let proven_indexes: HashSet<usize> = ranked.iter().map(|(index, _)| *index).collect();
+    ordered_accelerators.extend(
+        accelerator_slots
+            .iter()
+            .filter(|index| !proven_indexes.contains(index))
+            .map(|index| actions[*index].clone()),
+    );
+    for (slot, action) in accelerator_slots.into_iter().zip(ordered_accelerators) {
+        actions[slot] = action;
+    }
+
+    (actions, ranked.len() as u64)
+}
+
+fn is_responsiveness_accelerator(action: &RootAction) -> bool {
+    matches!(action, RootAction::BoostProcess { .. })
+        || matches!(action, RootAction::SetThreadQoS { tier, .. } if tier == "interactive")
+}
+
 /// Input dependencies for the dispatch tick.
 pub struct DispatchTickInput<'a> {
     pub state: &'a SharedState,
@@ -206,6 +294,9 @@ pub struct DispatchTickInput<'a> {
     /// rises above 0.80 with memory pressure <0.75, freeze/throttle are
     /// gated as `BlockReason::CpuSaturated`.
     pub cpu_pegged_fraction: f64,
+    /// Mature Gold-only utility predictions for discretionary actuators.
+    pub world_model: &'a apollo_engine::engine::world_model::WorldModel,
+    pub workload: &'a str,
 }
 
 /// Output results from the dispatch tick.
@@ -237,6 +328,8 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         lf_metrics,
         coalition_guard,
         cpu_pegged_fraction,
+        world_model,
+        workload,
     } = input;
 
     // ── Filter pipeline ──────────────────────────────────────────────────────
@@ -252,6 +345,27 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     let op_mode = filter_outcome.op_mode;
     let mut filtered_actions = filter_outcome.filtered_actions;
     let causal_qos_upgrades = filter_outcome.causal_qos_upgrades;
+
+    // Universal world-model gate for discretionary actions. Pressure relief
+    // and recovery remain governed by their specialist safety paths. An
+    // immature model always abstains, so this cannot starve exploration.
+    let mut utility_vetoes = 0_u64;
+    filtered_actions.retain(|action| {
+        if let Some(key) = utility_model_vetoes(action, world_model, workload) {
+            utility_vetoes = utility_vetoes.saturating_add(1);
+            tracing::debug!(action_key = %key, workload, "world model vetoed low-utility action");
+            false
+        } else {
+            true
+        }
+    });
+    if utility_vetoes > 0 {
+        let mut metrics = state.metrics.lock_recover();
+        metrics.metrics.world_model_utility_vetoes_total = metrics
+            .metrics
+            .world_model_utility_vetoes_total
+            .saturating_add(utility_vetoes);
+    }
 
     // ── Per-PID dedup chokepoint ─────────────────────────────────────────────
     // Single consolidation pass before execute_actions. 14 upstream emission
@@ -642,6 +756,7 @@ mod tests {
             top_processes: Vec::new(),
         };
         let causal_qos = HashSet::new();
+        let world_model = apollo_engine::engine::world_model::WorldModel::default();
 
         let input = DispatchTickInput {
             state: &state,
@@ -667,6 +782,8 @@ mod tests {
             lf_metrics: None,
             coalition_guard: None,
             cpu_pegged_fraction: 0.0,
+            world_model: &world_model,
+            workload: "idle",
         };
 
         let output = run_dispatch_tick(input);
@@ -923,5 +1040,108 @@ mod tests {
         assert_eq!(record_applied_actions(&traces, &mut cache), 1);
         assert!(cache.is_recent(100, CachedActionKind::Throttle));
         assert!(!cache.is_recent(200, CachedActionKind::Boost));
+    }
+
+    #[test]
+    fn mature_negative_utility_vetoes_only_discretionary_actions() {
+        use apollo_engine::engine::telemetry_medallion::{
+            ActionModelStats, TelemetryMedallion, TelemetryMedallionPersisted,
+        };
+        use apollo_engine::engine::world_model::WorldModel;
+
+        let mut telemetry = TelemetryMedallion::new();
+        let mut persisted = TelemetryMedallionPersisted::default();
+        persisted.actuator_evidence_schema_version = 2;
+        let now_unix = 1_000_000;
+        persisted.latest = Some(
+            apollo_engine::engine::telemetry_medallion::TelemetryContextSummary {
+                timestamp_unix: now_unix,
+                ..Default::default()
+            },
+        );
+        persisted.action_models = [(
+            "idle|boost:p100".to_string(),
+            ActionModelStats {
+                observations: 12,
+                effective_observations: 1,
+                utility_ema: -0.04,
+                evidence_mass: 12.0,
+                utility_variance_ema: 0.0001,
+                quality_ema: 0.95,
+                last_cycle: 100,
+                last_observed_unix: now_unix,
+                hardware_regime: Default::default(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        telemetry.restore(persisted);
+        let mut model = WorldModel::default();
+        model.attach_context(&telemetry);
+
+        assert_eq!(
+            utility_model_vetoes(&boost(100), &model, "idle").as_deref(),
+            Some("boost:p100")
+        );
+        assert!(utility_model_vetoes(&throttle(100), &model, "idle").is_none());
+        assert!(utility_model_vetoes(&boost(200), &model, "idle").is_none());
+    }
+
+    #[test]
+    fn mature_positive_utility_advances_only_accelerator_slots() {
+        use apollo_engine::engine::telemetry_medallion::{
+            ActionModelStats, TelemetryMedallion, TelemetryMedallionPersisted,
+        };
+        use apollo_engine::engine::world_model::WorldModel;
+
+        let mut telemetry = TelemetryMedallion::new();
+        let mut persisted = TelemetryMedallionPersisted::default();
+        persisted.actuator_evidence_schema_version = 2;
+        let now_unix = 1_000_000;
+        persisted.latest = Some(
+            apollo_engine::engine::telemetry_medallion::TelemetryContextSummary {
+                timestamp_unix: now_unix,
+                ..Default::default()
+            },
+        );
+        persisted.action_models = [(
+            "build|boost:p200".to_string(),
+            ActionModelStats {
+                observations: 12,
+                effective_observations: 10,
+                utility_ema: 0.08,
+                evidence_mass: 12.0,
+                utility_variance_ema: 0.0001,
+                quality_ema: 0.95,
+                last_cycle: 100,
+                last_observed_unix: now_unix,
+                hardware_regime: Default::default(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        telemetry.restore(persisted);
+        let mut model = WorldModel::default();
+        model.attach_context(&telemetry);
+
+        let (actions, promoted) = prioritize_world_model_accelerators(
+            vec![boost(100), freeze(900), boost(200)],
+            &model,
+            "build",
+        );
+
+        assert_eq!(promoted, 1);
+        assert!(matches!(
+            actions[0],
+            RootAction::BoostProcess { pid: 200, .. }
+        ));
+        assert!(matches!(
+            actions[1],
+            RootAction::FreezeProcess { pid: 900, .. }
+        ));
+        assert!(matches!(
+            actions[2],
+            RootAction::BoostProcess { pid: 100, .. }
+        ));
     }
 }

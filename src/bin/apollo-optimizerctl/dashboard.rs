@@ -392,12 +392,59 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             m.learning_data_quality * 100.0
         ));
     }
+    if m.world_model_context_bronze_total > 0 {
+        lines.push(format!(
+            "Ctx    G {}/{} q{:.0}%",
+            format_number(m.world_model_context_gold_total),
+            format_number(m.world_model_context_bronze_total),
+            m.world_model_context_quality * 100.0
+        ));
+    }
+    if m.world_model_actuator_issued_total > 0 {
+        lines.push(format!(
+            "Act    G {}/{} P{} q{:.0}%",
+            format_number(m.world_model_actuator_gold_total),
+            format_number(m.world_model_actuator_bronze_total),
+            format_number(m.world_model_actuator_pending_total),
+            m.world_model_actuator_quality * 100.0
+        ));
+        if let Some(family) = m
+            .world_model_actuator_families
+            .iter()
+            .filter(|family| family.resolved > 0)
+            .max_by_key(|family| family.resolved)
+        {
+            let short_family: String = family.family.chars().take(8).collect();
+            lines.push(format!(
+                "Act+   {} G{}/{}",
+                short_family,
+                format_number(family.gold),
+                format_number(family.resolved)
+            ));
+            lines.push(format!(
+                "       eff {}/{} u{:+.0}%",
+                format_number(family.effective),
+                format_number(family.resolved),
+                family.mean_utility * 100.0
+            ));
+        }
+        lines.push(format!(
+            "WM-U   ready {}/{} V{} P{}",
+            format_number(m.world_model_actuator_ready_models),
+            format_number(m.world_model_actuator_known_models),
+            format_number(m.world_model_utility_vetoes_total),
+            format_number(m.world_model_utility_promotions_total)
+        ));
+    }
     lines.push(format!(
-        "World  {}/{} ready G{} q{:.0}%",
+        // This is the pressure-causal imagination model, not the universal
+        // actuator-learning stream shown above as `Act` / `Act+`.
+        "Causal {}/{} ready G{} q{:.0}% P{}",
         format_number(m.world_model_ready_actions),
         format_number(m.world_model_curated_actions),
         format_number(m.world_model_gold_evidence),
-        m.world_model_data_quality * 100.0
+        m.world_model_data_quality * 100.0,
+        format_number(m.world_model_utility_promotions_total)
     ));
 
     // RL Q-table
@@ -941,9 +988,32 @@ mod tests {
         status.metrics.learning_data_quality = 0.99;
         status.metrics.world_model_curated_actions = 3;
         status.metrics.world_model_ready_actions = 2;
+        status.metrics.world_model_utility_promotions_total = 3;
         status.metrics.world_model_gold_evidence = 127;
         status.metrics.world_model_contextual_actions = 1;
         status.metrics.world_model_data_quality = 1.0;
+        status.metrics.world_model_context_bronze_total = 500;
+        status.metrics.world_model_context_gold_total = 498;
+        status.metrics.world_model_context_quality = 0.996;
+        status.metrics.world_model_actuator_issued_total = 12;
+        status.metrics.world_model_actuator_pending_total = 2;
+        status.metrics.world_model_actuator_bronze_total = 10;
+        status.metrics.world_model_actuator_gold_total = 8;
+        status.metrics.world_model_actuator_quality = 0.94;
+        status.metrics.world_model_actuator_known_models = 7;
+        status.metrics.world_model_actuator_ready_models = 2;
+        status.metrics.world_model_actuator_families =
+            vec![apollo_engine::engine::types::ActuatorEvidenceStatus {
+                family: "boost".to_string(),
+                issued: 7,
+                resolved: 6,
+                gold: 5,
+                effective: 4,
+                rejected: 0,
+                expired: 0,
+                mean_quality: 0.95,
+                mean_utility: 0.03,
+            }];
 
         let think = render_think_q(&status);
 
@@ -951,7 +1021,12 @@ mod tests {
         assert!(think.iter().any(|line| line == "Data   G 198/200 q99%"));
         assert!(think
             .iter()
-            .any(|line| line == "World  2/3 ready G127 q100%"));
+            .any(|line| line == "Causal 2/3 ready G127 q100% P3"));
+        assert!(think.iter().any(|line| line == "Ctx    G 498/500 q100%"));
+        assert!(think.iter().any(|line| line == "Act    G 8/10 P2 q94%"));
+        assert!(think.iter().any(|line| line == "Act+   boost G5/6"));
+        assert!(think.iter().any(|line| line == "       eff 4/6 u+3%"));
+        assert!(think.iter().any(|line| line == "WM-U   ready 2/7 V0 P3"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
