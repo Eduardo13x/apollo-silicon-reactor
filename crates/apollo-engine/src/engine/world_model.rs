@@ -593,6 +593,7 @@ mod tests {
                     last_cycle: 100,
                     last_observed_unix: now_unix,
                     hardware_regime: Default::default(),
+                    installation_id: crate::engine::installation_identity::InstallationId(1),
                 },
             ),
             (
@@ -607,6 +608,7 @@ mod tests {
                     last_cycle: 101,
                     last_observed_unix: now_unix,
                     hardware_regime: Default::default(),
+                    installation_id: crate::engine::installation_identity::InstallationId(1),
                 },
             ),
         ]

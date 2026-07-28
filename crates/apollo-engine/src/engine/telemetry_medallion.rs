@@ -32,15 +32,10 @@ const MAX_ACTION_MODELS: usize = 256;
 const ACTION_MODEL_EMA_ALPHA: f64 = 0.20;
 const ACTION_MODEL_EVIDENCE_HALF_LIFE_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
 const ACTION_MODEL_EVIDENCE_CAP: f64 = 64.0;
-const LEGACY_PRIOR_EVIDENCE_CAP: f64 = 3.0;
-/// Only legacy records from the current daemon epoch may seed confidence.
-/// At the normal 2 Hz cadence this is a two-hour window; at slower cadence it
-/// remains conservative and bounded. Imported M1 cycle numbers are normally
-/// ahead of a freshly started M4 daemon and are rejected by the epoch check.
-const LEGACY_RECENT_MIGRATION_CYCLES: u64 = 14_400;
 // Version 1 enrolled predictive recommendations before confirming that their
 // operating-system side effect occurred. Do not carry that bias forward.
 const ACTUATOR_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+const TELEMETRY_CONTEXT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
@@ -196,6 +191,8 @@ pub struct ActionModelStats {
     /// regime uses capabilities rather than a chip-name allowlist so future
     /// Apple Silicon generations remain supported without code changes.
     pub hardware_regime: HardwareRegime,
+    /// Decision authority is local to one private Apollo installation.
+    pub installation_id: InstallationId,
 }
 
 impl ActionModelStats {
@@ -223,6 +220,8 @@ pub struct ResolvedActuatorEvidence {
     pub resolved_timestamp_unix: i64,
     #[serde(default)]
     pub hardware_regime: HardwareRegime,
+    #[serde(default)]
+    pub installation_id: InstallationId,
     pub horizon_cycles: u64,
     pub tier: EvidenceTier,
     pub quality: f64,
@@ -473,6 +472,10 @@ pub struct TelemetryMedallionMetrics {
 pub struct TelemetryMedallionPersisted {
     #[serde(default)]
     pub actuator_evidence_schema_version: u32,
+    #[serde(default)]
+    pub context_schema_version: u32,
+    #[serde(default)]
+    pub installation_id: InstallationId,
     #[serde(default)]
     pub bronze_total: u64,
     #[serde(default)]
@@ -1001,6 +1004,7 @@ impl TelemetryMedallion {
             resolved_cycle: cycle,
             resolved_timestamp_unix: after.timestamp_unix,
             hardware_regime: HardwareRegime::from_context(after),
+            installation_id: self.installation_id,
             horizon_cycles: pending.horizon_cycles,
             tier,
             quality,
@@ -1077,9 +1081,12 @@ impl TelemetryMedallion {
             let same_hardware = !evidence.hardware_regime.is_known()
                 || (model.hardware_regime.is_known()
                     && model.hardware_regime == evidence.hardware_regime);
+            let same_installation = model.installation_id.is_known()
+                && model.installation_id == evidence.installation_id;
             let has_local_epoch = model.last_observed_unix > 0
                 && evidence.resolved_timestamp_unix >= model.last_observed_unix
-                && same_hardware;
+                && same_hardware
+                && same_installation;
             let previous_mass = if has_local_epoch {
                 model.effective_evidence_at(evidence.resolved_timestamp_unix)
             } else {
@@ -1106,6 +1113,7 @@ impl TelemetryMedallion {
             model.last_cycle = evidence.resolved_cycle;
             model.last_observed_unix = evidence.resolved_timestamp_unix;
             model.hardware_regime = evidence.hardware_regime;
+            model.installation_id = evidence.installation_id;
         }
         self.action_models_revision = self.action_models_revision.wrapping_add(1);
     }
@@ -1153,6 +1161,9 @@ impl TelemetryMedallion {
                 .iter()
                 .filter(|(key, model)| {
                     !key.ends_with(":*")
+                        && self.current_tier == ContextTier::Gold
+                        && self.local_gold_total > 0
+                        && model.installation_id == self.installation_id
                         && self.latest.as_ref().is_some_and(|latest| {
                             model.effective_evidence_at(latest.timestamp_unix) >= 10.0
                                 && model.quality_ema >= 0.85
@@ -1198,6 +1209,8 @@ impl TelemetryMedallion {
     pub fn snapshot(&self) -> TelemetryMedallionPersisted {
         TelemetryMedallionPersisted {
             actuator_evidence_schema_version: ACTUATOR_EVIDENCE_SCHEMA_VERSION,
+            context_schema_version: TELEMETRY_CONTEXT_SCHEMA_VERSION,
+            installation_id: self.installation_id,
             bronze_total: self.bronze_total,
             silver_total: self.silver_total,
             gold_total: self.gold_total,
@@ -1226,6 +1239,12 @@ impl TelemetryMedallion {
     }
 
     pub fn restore(&mut self, state: TelemetryMedallionPersisted) {
+        let same_origin = state.context_schema_version == TELEMETRY_CONTEXT_SCHEMA_VERSION
+            && state.installation_id.is_known()
+            && state.installation_id == self.installation_id;
+        let reset_actuator_evidence =
+            state.actuator_evidence_schema_version < ACTUATOR_EVIDENCE_SCHEMA_VERSION;
+
         self.bronze_total = state.bronze_total;
         self.silver_total = state.silver_total.min(self.bronze_total);
         self.gold_total = state.gold_total.min(self.silver_total);
@@ -1237,15 +1256,12 @@ impl TelemetryMedallion {
             0.0
         };
         self.last_cycle = state.last_cycle;
-        self.latest = state.latest;
-        let reset_actuator_evidence =
-            state.actuator_evidence_schema_version < ACTUATOR_EVIDENCE_SCHEMA_VERSION;
-        self.pending_actions = state
-            .pending_actions
-            .into_iter()
-            .filter(|pending| pending.action_key.len() <= 256 && pending.target.len() <= 256)
-            .take(MAX_PENDING_ACTIONS)
-            .collect();
+        self.current_tier = ContextTier::Rejected;
+        self.last_admitted_live = None;
+        self.latest = None;
+        self.consecutive_gold = 0;
+        self.local_gold_total = 0;
+        self.pending_actions.clear();
         self.family_stats = state.family_stats;
         self.action_models = state
             .action_models
@@ -1262,11 +1278,10 @@ impl TelemetryMedallion {
                 model.utility_ema = model.utility_ema.clamp(-1.0, 1.0);
                 model.utility_variance_ema = model.utility_variance_ema.clamp(0.0, 1.0);
                 model.quality_ema = model.quality_ema.clamp(0.0, 1.0);
-                if model.evidence_mass <= 0.0 && model.observations > 0 {
-                    model.evidence_mass =
-                        (model.observations as f64).min(LEGACY_PRIOR_EVIDENCE_CAP);
-                } else {
+                if same_origin && model.installation_id == self.installation_id {
                     model.evidence_mass = model.evidence_mass.clamp(0.0, ACTION_MODEL_EVIDENCE_CAP);
+                } else {
+                    model.evidence_mass = 0.0;
                 }
                 Some((key, model))
             })
@@ -1275,9 +1290,18 @@ impl TelemetryMedallion {
         self.recent_evidence = state
             .recent_evidence
             .into_iter()
+            .filter(|evidence| {
+                evidence.action_key.len() <= 320
+                    && evidence.target.len() <= 256
+                    && evidence.workload.len() <= 64
+                    && evidence.quality.is_finite()
+                    && evidence.raw_utility_delta.is_finite()
+                    && evidence.counterfactual_delta.is_finite()
+                    && evidence.net_utility_delta.is_finite()
+            })
             .take(MAX_RECENT_EVIDENCE)
             .collect();
-        self.external_counters = state.external_counters;
+        self.external_counters = ExternalActuatorCounters::default();
         self.next_action_id = state.next_action_id;
         self.actuator_issued_total = state.actuator_issued_total;
         self.actuator_resolved_total = state.actuator_resolved_total;
@@ -1298,19 +1322,20 @@ impl TelemetryMedallion {
             -(self.actuator_resolved_total as f64),
             self.actuator_resolved_total as f64,
         );
-        self.no_action_delta_ema = state
-            .no_action_delta_ema
-            .into_iter()
-            .filter(|(_, value)| value.is_finite())
-            .map(|(key, value)| (key, value.clamp(-0.05, 0.05)))
-            .collect();
-        let legacy_models_need_confidence = !self.action_models.is_empty()
-            && self
-                .action_models
-                .values()
-                .all(|model| model.last_observed_unix == 0);
-        if !reset_actuator_evidence && legacy_models_need_confidence {
-            self.rebuild_legacy_models_from_recent_gold();
+        self.no_action_delta_ema = if same_origin {
+            state
+                .no_action_delta_ema
+                .into_iter()
+                .filter(|(_, value)| value.is_finite())
+                .map(|(key, value)| (key, value.clamp(-0.05, 0.05)))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        if !same_origin {
+            for evidence in &mut self.recent_evidence {
+                evidence.installation_id = state.installation_id;
+            }
         }
         if reset_actuator_evidence {
             self.pending_actions.clear();
@@ -1330,37 +1355,6 @@ impl TelemetryMedallion {
             self.actuator_utility_sum = 0.0;
         }
         self.action_models_revision = self.action_models_revision.wrapping_add(1);
-    }
-
-    fn rebuild_legacy_models_from_recent_gold(&mut self) {
-        let Some(latest_timestamp) = self.latest.as_ref().map(|latest| latest.timestamp_unix)
-        else {
-            self.action_models.clear();
-            return;
-        };
-        let recent: Vec<ResolvedActuatorEvidence> = self
-            .recent_evidence
-            .iter()
-            .filter(|evidence| {
-                evidence.tier == EvidenceTier::Gold
-                    && evidence.resolved_cycle <= self.last_cycle
-                    && self.last_cycle - evidence.resolved_cycle <= LEGACY_RECENT_MIGRATION_CYCLES
-            })
-            .cloned()
-            .map(|mut evidence| {
-                let age_cycles = self.last_cycle - evidence.resolved_cycle;
-                evidence.resolved_timestamp_unix =
-                    latest_timestamp.saturating_sub(age_cycles.min(i64::MAX as u64) as i64);
-                if let Some(latest) = self.latest.as_ref() {
-                    evidence.hardware_regime = HardwareRegime::from_context(latest);
-                }
-                evidence
-            })
-            .collect();
-        self.action_models.clear();
-        for evidence in recent {
-            self.update_action_model(&evidence);
-        }
     }
 }
 
@@ -2007,6 +2001,7 @@ mod tests {
             resolved_cycle: 100,
             resolved_timestamp_unix: timestamp_unix,
             hardware_regime,
+            installation_id: LOCAL_ID,
             horizon_cycles: 3,
             tier: EvidenceTier::Gold,
             quality: 0.95,
@@ -2573,7 +2568,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_models_rebuild_only_from_recent_current_epoch_gold() {
+    fn legacy_models_remain_audit_only_without_installation_origin() {
         let now_unix = 20_000_000;
         let mut persisted = TelemetryMedallionPersisted {
             actuator_evidence_schema_version: ACTUATOR_EVIDENCE_SCHEMA_VERSION,
@@ -2606,6 +2601,7 @@ mod tests {
                 resolved_cycle: 1_000,
                 resolved_timestamp_unix: 0,
                 hardware_regime: HardwareRegime::default(),
+                installation_id: InstallationId::UNKNOWN,
                 horizon_cycles: 3,
                 tier: EvidenceTier::Gold,
                 quality: 0.95,
@@ -2630,6 +2626,7 @@ mod tests {
             resolved_cycle: 500_000,
             resolved_timestamp_unix: 0,
             hardware_regime: HardwareRegime::default(),
+            installation_id: InstallationId::UNKNOWN,
             horizon_cycles: 3,
             tier: EvidenceTier::Gold,
             quality: 1.0,
@@ -2643,15 +2640,17 @@ mod tests {
 
         let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         medallion.restore(persisted);
-        let rebuilt = medallion.action_models().get("boost:Editor").unwrap();
-        assert_eq!(rebuilt.observations, 11);
-        assert!((rebuilt.utility_ema - 0.08).abs() < 1e-9);
-        assert!(rebuilt.effective_evidence_at(now_unix) >= 10.0);
+        let legacy = medallion.action_models().get("boost:Editor").unwrap();
+        assert_eq!(legacy.observations, 500);
+        assert_eq!(legacy.evidence_mass, 0.0);
+        assert_eq!(legacy.effective_evidence_at(now_unix), 0.0);
         assert!(!medallion.action_models().contains_key("boost:ImportedM1"));
+        assert!(medallion.trusted_view().current.is_none());
+        assert_eq!(medallion.metrics().actuator_ready_models, 0);
     }
 
     #[test]
-    fn pending_action_survives_state_roundtrip_and_resolves_once() {
+    fn restore_discards_pending_action_endpoint_continuity() {
         let reason = DecisionReason::PressureContext;
         let outcomes = ExecuteOutcomes {
             audit_traces: vec![trace(
@@ -2675,11 +2674,96 @@ mod tests {
             serde_json::from_slice(&wire).expect("deserialize state");
         let mut restored = TelemetryMedallion::new(LOCAL_ID);
         restored.restore(persisted);
-        for cycle in 2..=4 {
-            observe(&mut restored, cycle, &ExecuteOutcomes::default(), &runtime);
-        }
-        assert_eq!(restored.metrics().actuator_bronze_total, 1);
-        observe(&mut restored, 5, &ExecuteOutcomes::default(), &runtime);
-        assert_eq!(restored.metrics().actuator_bronze_total, 1);
+        assert!(restored.trusted_view().current.is_none());
+        assert_eq!(restored.metrics().actuator_pending_total, 0);
+        assert_eq!(restored.metrics().actuator_bronze_total, 0);
+    }
+
+    fn persisted_with_ready_model(installation_id: InstallationId) -> TelemetryMedallionPersisted {
+        let now_unix = Utc::now().timestamp();
+        let mut persisted = TelemetryMedallionPersisted {
+            actuator_evidence_schema_version: ACTUATOR_EVIDENCE_SCHEMA_VERSION,
+            context_schema_version: TELEMETRY_CONTEXT_SCHEMA_VERSION,
+            installation_id,
+            latest: Some(TelemetryContextSummary {
+                timestamp_unix: now_unix,
+                p_core_count: 4,
+                e_core_count: 6,
+                total_ram_bytes: 16 * 1024 * 1024 * 1024,
+                ..TelemetryContextSummary::default()
+            }),
+            ..TelemetryMedallionPersisted::default()
+        };
+        persisted.action_models.insert(
+            "boost:Editor".to_string(),
+            ActionModelStats {
+                observations: 20,
+                effective_observations: 18,
+                utility_ema: 0.08,
+                evidence_mass: 20.0,
+                utility_variance_ema: 0.0001,
+                quality_ema: 0.95,
+                last_cycle: 1,
+                last_observed_unix: now_unix,
+                hardware_regime: HardwareRegime {
+                    p_core_count: 4,
+                    e_core_count: 6,
+                    ram_gib: 16,
+                },
+                installation_id,
+            },
+        );
+        persisted
+    }
+
+    #[test]
+    fn restore_never_restores_live_context_or_pending_endpoints() {
+        let mut persisted = persisted_with_ready_model(LOCAL_ID);
+        persisted.pending_actions.push(PendingActuatorEvidence {
+            id: 1,
+            family: ActuatorFamily::Boost,
+            objective: ActuatorObjective::Responsiveness,
+            action_key: "boost:Editor".to_string(),
+            target: "Editor".to_string(),
+            target_pid: Some(300),
+            workload: "idle".to_string(),
+            issued_cycle: 1,
+            horizon_cycles: 3,
+            cohort_size: 1,
+            issued_total_at_start: 1,
+            purge_recent: false,
+            event_resolved: false,
+            before: TelemetryContextSummary::default(),
+        });
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        medallion.restore(persisted);
+        assert!(medallion.trusted_view().current.is_none());
+        assert_eq!(medallion.metrics().actuator_pending_total, 0);
+        assert_eq!(medallion.metrics().actuator_ready_models, 0);
+    }
+
+    #[test]
+    fn foreign_installation_cannot_regain_authority_from_one_local_context() {
+        let persisted = persisted_with_ready_model(InstallationId(99));
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        medallion.restore(persisted);
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
+        assert_eq!(medallion.metrics().actuator_ready_models, 0);
+        assert!(medallion
+            .action_models()
+            .values()
+            .all(|model| model.installation_id != LOCAL_ID || model.evidence_mass == 0.0));
+    }
+
+    #[test]
+    fn same_installation_fresh_evidence_survives_after_new_local_gold() {
+        let persisted = persisted_with_ready_model(LOCAL_ID);
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        medallion.restore(persisted);
+        assert_eq!(medallion.metrics().actuator_ready_models, 0);
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
+        assert_eq!(medallion.metrics().actuator_ready_models, 1);
     }
 }
