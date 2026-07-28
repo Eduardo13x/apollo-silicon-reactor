@@ -136,6 +136,7 @@ pub mod sysctl_governor;
 pub mod sysctl_limits;
 pub mod system_log_ingester;
 pub mod teacher_consolidation;
+pub mod telemetry_context_admission;
 pub mod telemetry_logger;
 pub mod telemetry_medallion;
 pub mod temporal_predictor;
