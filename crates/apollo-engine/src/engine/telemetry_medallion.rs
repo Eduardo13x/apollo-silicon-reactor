@@ -1714,6 +1714,7 @@ fn summarize(observation: &TelemetryObservation<'_>) -> TelemetryContextSummary 
             / process_count as f64
     };
     let total_ram = snapshot.memory.total_ram.max(1) as f64;
+    let process_cpu_capacity_pct = snapshot.cpu.core_count.max(1) as f64 * 100.0;
     TelemetryContextSummary {
         cycle: *cycle,
         timestamp_unix: snapshot.timestamp.timestamp(),
@@ -1748,7 +1749,9 @@ fn summarize(observation: &TelemetryObservation<'_>) -> TelemetryContextSummary 
             .max(snapshot.memory.total_swap),
         process_count,
         total_process_rss_bytes,
-        top_process_cpu: top.map_or(0.0, |p| p.cpu_usage as f64 / 100.0),
+        top_process_cpu: top.map_or(0.0, |p| {
+            (p.cpu_usage as f64 / process_cpu_capacity_pct).clamp(0.0, 1.0)
+        }),
         top_process_rss_bytes: top.map_or(0, |p| p.memory_usage),
         disk_count: snapshot.disks.len() as u32,
         disk_total_bytes: snapshot.disks.iter().map(|d| d.total_space).sum(),
@@ -1877,7 +1880,7 @@ fn context_quality(summary: &TelemetryContextSummary) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collector::{CpuStats, MemoryStats, PressureStats};
+    use crate::collector::{CpuStats, MemoryStats, PressureStats, ProcessStats};
     use crate::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
     use crate::engine::lotka_volterra::StabilityRegime;
     use chrono::Utc;
@@ -2084,6 +2087,43 @@ mod tests {
         let admission = observe(&mut medallion, 1, &outcomes, &runtime);
 
         assert_eq!(admission.tier, ContextTier::Gold);
+    }
+
+    #[test]
+    fn multicore_process_cpu_is_normalized_by_machine_capacity() {
+        let mut snapshot = snapshot();
+        snapshot.top_processes.push(ProcessStats {
+            pid: 42,
+            name: "rustc".to_string(),
+            cpu_usage: 350.0,
+            memory_usage: 512 * 1024 * 1024,
+            cpu_wall_ratio: Some(1.0),
+        });
+        let runtime = healthy_runtime();
+        let signal = signal();
+        let capabilities = m4_capabilities();
+        let outcomes = ExecuteOutcomes::default();
+        let observation = TelemetryObservation {
+            snapshot: &snapshot,
+            hardware: None,
+            runtime: &runtime,
+            capabilities: Some(&capabilities),
+            signal: &signal,
+            workload: "build",
+            cycle: 1,
+            outcomes: &outcomes,
+            intervention: Intervention::Observe,
+            applied_intervention: None,
+            purge_recent: false,
+            nars_drift_score: 0.0,
+            nars_beliefs_total: 1,
+            natural_drift: 0.0,
+            arousal_level: 0.5,
+        };
+
+        let summary = summarize(&observation);
+
+        assert!((summary.top_process_cpu - 0.35).abs() < 1e-6);
     }
 
     #[test]
