@@ -1843,7 +1843,7 @@ fn summarize(observation: &TelemetryObservation<'_>) -> TelemetryContextSummary 
         unfreezes_applied: outcomes.unfreezes_applied,
         thread_qos_applied: outcomes.thread_qos_applied,
         markov_prediction_confidence: runtime.markov_prediction_confidence,
-        markov_prediction_eta_secs: runtime.markov_prediction_eta_secs,
+        markov_prediction_eta_secs: runtime.markov_prediction_eta_secs.max(0.0),
         markov_prewarm_active: runtime.markov_prewarm_active,
         predictive_agent_active: runtime.predictive_agent_active,
         predictive_intervention: format!("{intervention:?}"),
@@ -2072,6 +2072,18 @@ mod tests {
         assert_eq!(metrics.silver_total, 0);
         assert_eq!(metrics.gold_total, 1);
         assert!(medallion.latest().is_some());
+    }
+
+    #[test]
+    fn expired_markov_eta_is_normalized_before_context_admission() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let outcomes = ExecuteOutcomes::default();
+        let mut runtime = healthy_runtime();
+        runtime.markov_prediction_eta_secs = -148.25;
+
+        let admission = observe(&mut medallion, 1, &outcomes, &runtime);
+
+        assert_eq!(admission.tier, ContextTier::Gold);
     }
 
     #[test]
